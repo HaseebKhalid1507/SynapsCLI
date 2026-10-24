@@ -111,6 +111,18 @@ impl WorkerDrive {
         marks: &mut ResponseMarks,
         totals: &mut Totals,
     ) -> Flow {
+        // Everything the worker shows, for clients watching its thread.
+        self.state
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .watch
+            .record(&event);
+        // Hosted web_search is egress: show worker searches in the parent.
+        crate::runtime::openai::codex_wire::forward_worker_web_search(
+            &self.label,
+            &event,
+            self.tx_events.as_ref(),
+        );
         match event {
             StreamEvent::Llm(LlmEvent::Thinking(_)) => {
                 self.update("💭 thinking...".to_string(), *tool_count)
@@ -192,7 +204,11 @@ impl WorkerDrive {
                 crate::core::rpc_dispatch::merge_split(&mut totals.cache_1h, cache_creation_1h);
             }
             StreamEvent::Session(SessionEvent::Error(e)) => {
-                return Flow::Failed(format!("provider request failed [{}]", e.category_label()))
+                return Flow::Failed(format!(
+                    "provider request failed [{}]: {}",
+                    e.category_label(),
+                    e.message
+                ))
             }
             StreamEvent::Session(SessionEvent::Done) => return Flow::Done,
             _ => {}
@@ -212,11 +228,10 @@ impl WorkerDrive {
         self.cancel.cancel();
         let _ = tokio::time::timeout(CANCEL_DRAIN, async {
             while let Some(event) = stream.next().await {
+                let mut s = self.state.write().unwrap_or_else(|p| p.into_inner());
+                s.watch.record(&event);
                 if let StreamEvent::Session(SessionEvent::MessageHistory(history)) = event {
-                    self.state
-                        .write()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .history = Some(history);
+                    s.history = Some(history);
                 }
             }
         })
@@ -382,6 +397,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn worker_web_search_notices_reach_the_parent() {
+        let (mut d, _state, _) = drive(60);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        d.tx_events = Some(tx);
+        let events = vec![
+            StreamEvent::Session(SessionEvent::Notice(
+                "🔎 Codex web_search (search, completed): rust tokio".into(),
+            )),
+            StreamEvent::Session(SessionEvent::Notice("retry: upstream body".into())),
+            StreamEvent::Session(SessionEvent::Done),
+        ];
+        d.run(Box::pin(futures::stream::iter(events)))
+            .await
+            .unwrap();
+        let mut notices = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let StreamEvent::Session(SessionEvent::Notice(t)) = ev {
+                notices.push(t);
+            }
+        }
+        assert_eq!(
+            notices,
+            vec!["🔎 [worker inline] Codex web_search (search, completed): rust tokio".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_watch_journal_records_what_the_worker_showed() {
+        use crate::runtime::subagent_watch::WatchEvent as W;
+        let (d, state, _) = drive(60);
+        let events = vec![
+            StreamEvent::Llm(LlmEvent::ResponseStart),
+            StreamEvent::Llm(LlmEvent::Thinking("plan".into())),
+            text("Look"),
+            text("ing."),
+            StreamEvent::Llm(LlmEvent::ToolUse {
+                tool_name: "bash".into(),
+                tool_id: "t1".into(),
+                input: json!({"command": "ls"}),
+            }),
+            StreamEvent::Llm(LlmEvent::ToolResult { tool_id: "t1".into(), result: "a".into() }),
+            StreamEvent::Session(SessionEvent::Notice("retry: upstream body".into())),
+            history(2),
+            StreamEvent::Session(SessionEvent::Done),
+        ];
+        d.run(Box::pin(futures::stream::iter(events))).await.unwrap();
+        let page = state.write().unwrap().watch.read(0);
+        assert_eq!(
+            page.events,
+            vec![
+                W::ResponseStart,
+                W::Thinking { text: "plan".into() },
+                W::Text { text: "Looking.".into() },
+                W::ToolUse {
+                    tool_id: "t1".into(),
+                    tool_name: "bash".into(),
+                    input: json!({"command": "ls"}),
+                },
+                W::ToolResult { tool_id: "t1".into(), result: "a".into() },
+                W::Done,
+            ],
+            "notices and history are not journaled; deltas coalesce"
+        );
+    }
+
+    #[tokio::test]
     async fn progress_is_kept_in_state_for_background_clients() {
         let (d, state, _) = drive(60);
         let events = vec![
@@ -468,6 +549,51 @@ mod tests {
             state.read().unwrap().history.as_ref().map(Vec::len),
             Some(3)
         );
+    }
+
+    #[tokio::test]
+    async fn human_error_survives_completion_and_archive() {
+        let (drive, state, _) = drive(600);
+        let error = crate::runtime::helpers::turn_error_for(
+            &crate::RuntimeError::NetworkTimeout("waiting for response headers"),
+            "turn-test",
+        );
+        let reason = drive
+            .run(Box::pin(futures::stream::iter(vec![StreamEvent::Session(
+                SessionEvent::Error(error),
+            )])))
+            .await
+            .unwrap_err();
+        assert!(reason.contains("network_error"));
+        assert!(reason.contains("waiting for response headers"));
+        let status = SubagentStatus::Failed(reason.clone());
+        let event = super::super::finalize::build_completion_event(
+            "sa_test", 1, "test", &status, "", 1.0, None,
+        );
+        assert_eq!(event.content.data.unwrap()["error"], reason);
+        {
+            let mut s = state.write().unwrap();
+            s.status = status;
+            s.archive_meta = Some(crate::runtime::subagent::SubagentArchiveMeta {
+                agent_name: "test".into(),
+                model: "anthropic/claude-opus-5-5".into(),
+                system_prompt: "test".into(),
+                timeout_secs: 600,
+            });
+        }
+        let dir = tempfile::tempdir().unwrap();
+        super::super::archive::archive_finished_worker(&state, "sa_test", dir.path());
+        let path = state.read().unwrap().archive_path.clone().unwrap();
+        let archive = super::super::archive::read_archive(&path).unwrap();
+        assert_eq!(archive.error.as_deref(), Some(reason.as_str()));
+        let mut legacy: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        legacy.as_object_mut().unwrap().remove("error");
+        std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert!(super::super::archive::read_archive(&path)
+            .unwrap()
+            .error
+            .is_none());
     }
 
     #[tokio::test(start_paused = true)]

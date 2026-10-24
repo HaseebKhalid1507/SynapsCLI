@@ -20,8 +20,8 @@ pub mod writer;
 
 pub use writer::{
     default_telemetry_log_path, default_trace_log_path, ShutdownOutcome, TelemetryWriter,
-    WriterOptions, WriterStats, WriterTraceSink, DEFAULT_MAX_FILE_BYTES, DEFAULT_QUEUE_CAPACITY,
-    DEFAULT_SHUTDOWN_FLUSH_TIMEOUT,
+    WriteGate, WriterOptions, WriterStats, WriterTraceSink, DEFAULT_MAX_FILE_BYTES,
+    DEFAULT_QUEUE_CAPACITY, DEFAULT_SHUTDOWN_FLUSH_TIMEOUT,
 };
 
 /// Telemetry verbosity level, parsed from the `telemetry` config key.
@@ -524,5 +524,23 @@ mod retry_delay_tests {
             d
         );
         assert!(from_hdr);
+    }
+}
+
+/// Headerless network retry delay. Bounded even for arbitrarily large config
+/// values; matches the streaming error path's 64-second ceiling.
+pub(super) fn network_retry_delay(attempt: u32) -> Duration {
+    Duration::from_secs(1u64 << attempt.saturating_sub(1).min(6))
+}
+
+#[cfg(test)]
+mod network_backoff_tests {
+    #[test]
+    fn configured_large_retry_counts_never_overflow() {
+        let seconds: Vec<_> = [0, 1, 2, 3, 7, 8, u32::MAX]
+            .into_iter()
+            .map(|n| super::network_retry_delay(n).as_secs())
+            .collect();
+        assert_eq!(seconds, [1, 1, 2, 4, 64, 64, 64]);
     }
 }

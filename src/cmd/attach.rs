@@ -96,7 +96,7 @@ impl Client {
                 let label = if matches!(e.outcome, TurnOutcome::Canceled) { "canceled" } else { "error" };
                 self.out(&format!("\n[{label}] {} ({})\n", e.message, e.category_label()));
             }
-            SessionEventWire::Stream(StreamEvent::Session(SessionEvent::Notice(n))) => self.out(&format!("[notice] {n}\n")),
+            SessionEventWire::Stream(StreamEvent::Session(SessionEvent::Notice(n) | SessionEvent::Retry(n))) => self.out(&format!("[notice] {n}\n")),
             SessionEventWire::Stream(StreamEvent::Agent(a)) => self.out(&format!("[agent] {a:?}\n")),
             SessionEventWire::Stream(_) => {}
             SessionEventWire::TurnStarted { .. } => self.streaming = true,
@@ -184,6 +184,16 @@ impl Client {
             "/abort" => {
                 let _ = self.t.send(SessionCommand::Cancel).await;
             }
+            // `/close` ends the session in the daemon (`/detach` and `/quit`
+            // leave it loaded); the session refuses while work is in flight
+            // unless `force`. The loop exits on the `Ended` that follows.
+            "/close" | "/close force" => {
+                let arg = line.strip_prefix("/close").unwrap_or("").trim().to_string();
+                let _ = self
+                    .t
+                    .send(SessionCommand::EngineCommand { id: 3, name: "close".into(), arg })
+                    .await;
+            }
             "/sessions" => {
                 let _ = self.t.send(SessionCommand::Query { id: 1, query: SessionQuery::Status }).await;
             }
@@ -193,7 +203,7 @@ impl Client {
             "/new" => {
                 let _ = self.t.send(SessionCommand::NewSession).await;
             }
-            "/help" => self.out("/detach /abort /save /new /sessions /model NAME /cmd NAME [ARG] /auto ARGS /keep-warm on|off\n"),
+            "/help" => self.out("/detach /close [force] /abort /save /new /sessions /model NAME /cmd NAME [ARG] /auto ARGS /pin on|off (alias /keep-warm on|off)\n"),
             // C1 (P9): arm a driver headlessly. Mirrors the TUI's `/auto` →
             // `DriverStart` routing (dispatch.rs) but without an in-process
             // ExtensionManager: the actor validates `session.drive` on
@@ -207,7 +217,7 @@ impl Client {
                     .send(SessionCommand::DriverStart { plugin, command, arg })
                     .await;
             }
-            "/keep-warm on" | "/keep-warm off" => {
+            "/pin on" | "/pin off" | "/keep-warm on" | "/keep-warm off" => {
                 let _ = self.t.send(SessionCommand::KeepWarm { on: line.ends_with("on") }).await;
             }
             _ if line.starts_with("/cmd ") => {
@@ -276,6 +286,10 @@ pub(crate) async fn run(profile: Option<String>, mut args: AttachArgs) -> anyhow
         }
         Err(e) => anyhow::bail!("connect: {e}"),
     };
+    if let Some(msg) = agent_engine::daemon::profile_mismatch(conn.welcome.profile.as_deref(), profile.as_deref()) {
+        eprintln!("synaps attach: {msg}");
+        std::process::exit(EXIT_REFUSED);
+    }
     if conn.welcome.daemon_version != binary_version() {
         eprintln!("[notice] daemon binary {} differs from client {} (same protocol)", conn.welcome.daemon_version, binary_version());
     }
@@ -474,6 +488,25 @@ fn resolve_id(sessions: &[SessionMeta], q: &str) -> Option<SessionId> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// prA I-R4-3: the line client never prints control / bidi characters
+    /// from a prompt, so extension text can't overwrite the header lines.
+    #[test]
+    fn render_prompt_line_strips_control_and_bidi_chars() {
+        let p = PromptRequest {
+            id: 1,
+            kind: PromptKind::Confirm,
+            title: "Confirm tool call".into(),
+            prompt: "Extension: jev\nMessage from jev:\n\x1b[3A\x1b[2KExtension: trusted\r\u{202E}x\u{200B}y".into(),
+            raised_at: chrono::Utc::now(),
+            confirm_scope: None,
+        };
+        let line = render_prompt_line(&p);
+        for bad in ['\x1b', '\r', '\u{202E}', '\u{200B}'] {
+            assert!(!line.contains(bad), "{bad:?} in {line:?}");
+        }
+        assert!(line.contains("Extension: jev\nMessage from jev:\n[3A[2KExtension: trustedxy"), "{line:?}");
+    }
     use clap::Parser;
 
     #[derive(Parser)]
@@ -517,9 +550,14 @@ mod tests {
 /// One prompt as the line client shows it. Confirm prompts keep the FULL
 /// multi-line body (the exact tool-id list for `activate_tools`) and ask
 /// `(y/n)`; Secret prompts keep the legacy `> ` shape with echo off.
+/// Title and body are sanitized (prA I-R4-3): a prompt can carry
+/// extension text, and raw control / bidi characters would let it move
+/// the cursor over the lines printed above it.
 fn render_prompt_line(p: &PromptRequest) -> String {
+    let title = agent_engine::session::sanitize_prompt_text(&p.title);
+    let body = agent_engine::session::sanitize_prompt_text(&p.prompt);
     match p.kind {
-        PromptKind::Confirm => format!("[confirm #{}] {}\n{}\n(y/n): ", p.id, p.title, p.prompt),
-        PromptKind::Secret => format!("[prompt #{}] {}: {} > ", p.id, p.title, p.prompt),
+        PromptKind::Confirm => format!("[confirm #{}] {title}\n{body}\n(y/n): ", p.id),
+        PromptKind::Secret => format!("[prompt #{}] {title}: {body} > ", p.id),
     }
 }

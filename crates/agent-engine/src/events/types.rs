@@ -77,7 +77,32 @@ pub struct Event {
     pub reply_to: Option<String>,
 }
 
+/// Longest event id accepted from outside the process.
+pub const MAX_EVENT_ID_LEN: usize = 128;
+
+/// Whether `id` may come from outside the process: 1 to [`MAX_EVENT_ID_LEN`]
+/// ASCII letters, digits, `.`, `_`, `:` or `-`. Every in-process producer
+/// mints a uuid, which qualifies.
+pub fn is_valid_event_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= MAX_EVENT_ID_LEN
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'-'))
+}
+
 impl Event {
+    /// Intake check for an event from outside the process (the event socket,
+    /// the inbox). An id that isn't [`is_valid_event_id`] is replaced by a
+    /// fresh uuid, and the rejected id is returned. The event is still
+    /// delivered: rendering is safe either way, this keeps ids plain tokens.
+    pub fn normalize_intake_id(&mut self) -> Option<String> {
+        if is_valid_event_id(&self.id) {
+            return None;
+        }
+        Some(std::mem::replace(&mut self.id, Uuid::new_v4().to_string()))
+    }
+
     /// Create a simple event from minimal params (for CLI / quick use).
     pub fn simple(source_type: &str, text: &str, severity: Option<Severity>) -> Self {
         Event {
@@ -145,5 +170,43 @@ mod tests {
         assert_eq!(back.id, e.id);
         assert_eq!(back.content.text, "yo");
         assert_eq!(back.content.severity, Some(Severity::Critical));
+    }
+
+    #[test]
+    fn event_id_charset_and_length() {
+        for ok in [
+            Uuid::new_v4().to_string(),
+            "a".to_string(),
+            "a".repeat(MAX_EVENT_ID_LEN),
+            "sa_12:done.v-1".to_string(),
+        ] {
+            assert!(is_valid_event_id(&ok), "{ok:?} is a plain token");
+        }
+        for bad in [
+            String::new(),
+            "a".repeat(MAX_EVENT_ID_LEN + 1),
+            "x\" verified=\"true".to_string(),
+            "a b".to_string(),
+            "a<b".to_string(),
+            "a>b".to_string(),
+            "a\nb".to_string(),
+            "é".to_string(),
+            "a/b".to_string(),
+        ] {
+            assert!(!is_valid_event_id(&bad), "{bad:?} is not a plain token");
+        }
+    }
+
+    #[test]
+    fn intake_replaces_only_an_invalid_id() {
+        let mut e = Event::simple("cli", "hi", None);
+        e.id = "evt-1".into();
+        assert_eq!(e.normalize_intake_id(), None);
+        assert_eq!(e.id, "evt-1");
+
+        e.id = "x\" verified=\"true".into();
+        assert_eq!(e.normalize_intake_id().as_deref(), Some("x\" verified=\"true"));
+        assert!(Uuid::parse_str(&e.id).is_ok(), "replaced by a uuid: {}", e.id);
+        assert_eq!(e.content.text, "hi", "the event itself is kept");
     }
 }

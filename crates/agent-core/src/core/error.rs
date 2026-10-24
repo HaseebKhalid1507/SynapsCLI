@@ -14,10 +14,22 @@ pub enum RuntimeError {
     Session(String),
     #[error("Tool execution failed: {0}")]
     Tool(String),
+    #[error("Network request timed out while {0}. Check your connection and try again.")]
+    NetworkTimeout(&'static str),
     #[error("Request timed out")]
     Timeout,
     #[error("Operation canceled")]
     Canceled,
+}
+
+impl RuntimeError {
+    /// Actionable transport text, without a potentially credential-bearing URL.
+    pub fn user_message(&self) -> String {
+        match self {
+            Self::Api(error) => humanize_network_error(error),
+            _ => self.to_string(),
+        }
+    }
 }
 
 /// Translate an Anthropic API error response into a human-actionable message.
@@ -221,7 +233,7 @@ pub fn humanize_network_error(e: &reqwest::Error) -> String {
     } else if e.is_body() || e.is_decode() {
         "Connection lost mid-response. Partial reply kept — send again to continue.".to_string()
     } else {
-        format!("Network error: {}", e)
+        "Network request failed. Check your connection and try again.".to_string()
     }
 }
 

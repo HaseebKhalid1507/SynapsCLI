@@ -17,12 +17,11 @@ fn harness_boots_and_renders_nonempty_frame() {
     assert_eq!(buf.area().width, 80);
     assert_eq!(buf.area().height, 24);
 
-    // The frame is non-empty: header chrome ("SynapsCLI") and the ready
-    // status must be present on a fresh boot.
+    // The frame is non-empty: the header's wordmark must be present
+    // on a fresh boot.
     let frame = h.snapshot();
     assert!(!frame.trim().is_empty(), "rendered frame is blank");
-    assert!(frame.contains("Synaps"), "header missing:\n{frame}");
-    assert!(frame.contains("ready"), "ready status missing:\n{frame}");
+    assert!(frame.contains("SynapsCLI"), "header missing:\n{frame}");
 
     // Input goes through the production dispatch surface and lands in the
     // input box, both in state and on screen.

@@ -9,7 +9,9 @@ use std::sync::{Arc, Mutex};
 
 // ── Module declarations ──────────────────────────────────────────────────────────
 
+#[cfg(feature = "command-exec")]
 mod bash;
+mod confirm_latch;
 pub(crate) mod context_checkpoint;
 mod edit;
 mod extension;
@@ -19,10 +21,12 @@ mod grep;
 mod ls;
 pub mod memory;
 mod memory_context;
+#[cfg(feature = "command-exec")]
 mod powershell;
 pub(crate) mod read;
 mod secret_prompt;
 mod subagent;
+pub(crate) use subagent::finalize::build_reload_carry_event;
 #[doc(hidden)]
 pub use subagent::{legacy_fresh_runtime, spawn_runtime};
 mod write;
@@ -39,6 +43,7 @@ pub mod respond;
 pub mod send_channel;
 pub mod shell;
 pub(crate) mod util;
+pub(crate) mod utf8_stream;
 pub(crate) use util::expand_path;
 pub mod watcher_exit;
 
@@ -49,6 +54,7 @@ pub use crate::runtime::subagent::{
     SubagentStatus,
 };
 pub use agent::resolve_agent_prompt;
+#[cfg(feature = "command-exec")]
 pub use bash::{bash_intermediary_snapshot, BashIntermediarySnapshot, BashTool};
 pub use discovery::{ActivateToolsTool, SearchToolsTool};
 pub use edit::EditTool;
@@ -57,25 +63,32 @@ pub use find::FindTool;
 pub use grep::GrepTool;
 pub use ls::LsTool;
 pub use memory_context::MemoryContextTool;
+#[cfg(feature = "command-exec")]
 pub use powershell::PowerShellTool;
 pub use read::ReadTool;
 pub use registry::{
     DeferredToolSplit, DroppedSessionMember, SessionSchemaProjection, ToolRegistry,
 };
 pub use respond::RespondTool;
+pub use confirm_latch::{latch_keys, LatchKey, SessionConfirmLatch};
 pub use secret_prompt::SecretPromptQueue;
-pub use secret_prompt::{PromptKind, SecretPromptHandle, SecretPromptRequest};
+pub use secret_prompt::{
+    ConfirmChoice, ConfirmScope, PromptKind, SecretPromptHandle, SecretPromptRequest,
+    CONFIRM_ANSWER_ALLOW_ALL,
+};
 pub use send_channel::SendChannelTool;
 pub use shell::{ShellEndTool, ShellSendTool, ShellStartTool};
 pub use subagent::{
     SubagentCollectTool, SubagentModelAuthorizeTool, SubagentModelsTool, SubagentResumeTool,
     SubagentStartTool, SubagentStatusTool, SubagentSteerTool, SubagentTool,
 };
-pub use watcher_exit::WatcherExitTool;
+pub use watcher_exit::{WatcherExitTool, WATCHER_EXIT_ACK};
 pub use write::WriteTool;
 
 // Re-export util items used by sibling tool modules via `super::`
-pub(crate) use util::{resolve_path_in, strip_ansi, NEXT_SUBAGENT_ID};
+pub(crate) use util::{
+    peek_next_subagent_id, resolve_path_in, seed_next_subagent_id, strip_ansi, NEXT_SUBAGENT_ID,
+};
 
 // Facade: expose finalize internals for integration tests without making the
 // subagent module pub. Tests import `agent_engine::tools::{build_completion_event, finalize_subagent}`.
@@ -97,6 +110,12 @@ pub struct ToolChannels {
 
 /// Runtime capability handles — shared services a tool may require.
 pub struct ToolCapabilities {
+    /// Parent-session extension Confirm latch: the set of extension ids the
+    /// user chose "Allow all" for. Workers share the Arc (including live
+    /// updates and revokes), never a snapshot or host-global approval. This
+    /// grants no `activate_tools` authority. None is for contexts without a
+    /// parent session.
+    pub session_allow_all: Option<Arc<SessionConfirmLatch>>,
     /// Host-owned note storage binding. Runtime contexts always provide the
     /// same binding; `None` is reserved for manually constructed contexts.
     /// A present binding is exclusive: errors never permit legacy fallback.
@@ -157,6 +176,12 @@ pub struct ToolCapabilities {
     /// set survives across tool calls (caps are rebuilt per call in
     /// stream.rs). Poisoned-mutex recovery via `into_inner`.
     pub env_warned: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    /// Owning conversation id of the tool call, as carried on hook events.
+    /// `None` for workers/subagents and for host contexts with no
+    /// conversation. Forwarded to extension `tool.call` as
+    /// `params.session_id` so a daemon-shared plugin knows its caller.
+    /// Not the lease scope (`tool_session_id`, a random runtime id).
+    pub session_id: Option<String>,
 }
 
 /// Configuration limits and timeouts.
@@ -297,6 +322,14 @@ pub trait Tool: Send + Sync {
 
     /// Owning extension id for tools registered by an extension. Built-in tools return `None`.
     fn extension_id(&self) -> Option<&str> {
+        None
+    }
+
+    /// The operation name this tool was registered under by its source (an
+    /// extension's own tool name, before the `<extension>:` runtime prefix),
+    /// when that differs from [`Tool::name`]. Typed metadata for policy that
+    /// must not depend on the exposed name alone; `None` when not declared.
+    fn source_operation(&self) -> Option<&str> {
         None
     }
 

@@ -12,6 +12,7 @@ mod neon_rain;
 mod night_city;
 mod nord;
 mod ocean;
+mod paper;
 mod phosphor;
 mod rose_pine;
 mod solarized_dark;

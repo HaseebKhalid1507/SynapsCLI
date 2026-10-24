@@ -7,7 +7,7 @@ use tokio::sync::oneshot;
 use super::{
     generate_code_challenge, generate_code_verifier, generate_state, open_browser,
     save_provider_auth, start_callback_server_at, CallbackOutcome, CallbackResult,
-    OAuthCredentials, CALLBACK_HOST,
+    OAuthCredentials, RefreshFailure, CALLBACK_HOST,
 };
 
 const PROVIDER: &str = "openai-codex";
@@ -25,13 +25,21 @@ const SCOPE: &str = "openid profile email offline_access";
 const JWT_CLAIM_PATH: &str = "https://api.openai.com/auth";
 
 #[derive(Debug, Deserialize)]
-struct CodexTokenResponse {
+pub(crate) struct CodexTokenResponse {
     access_token: String,
     refresh_token: String,
     expires_in: u64,
 }
 
 pub async fn login() -> std::result::Result<OAuthCredentials, String> {
+    login_into(Some(PROVIDER)).await
+}
+
+/// Login; `Some(key)` persists ONLY into that slot (`openai-codex` or
+/// `openai-codex@<label>`), `None` returns the credential unsaved.
+pub async fn login_into(
+    persist_key: Option<&str>,
+) -> std::result::Result<OAuthCredentials, String> {
     let verifier = generate_code_verifier();
     let challenge = generate_code_challenge(&verifier);
     let state = generate_state();
@@ -95,21 +103,23 @@ pub async fn login() -> std::result::Result<OAuthCredentials, String> {
 
     eprintln!("\n\x1b[1mExchanging code for tokens...\x1b[0m");
     let creds = exchange_code_for_tokens(&result.code, &verifier).await?;
-    save_provider_auth(PROVIDER, &creds)?;
+    if let Some(key) = persist_key {
+        save_provider_auth(key, &creds)?;
+    }
     Ok(creds)
 }
 
 pub async fn refresh_token(
     client: &Client,
     refresh: &str,
-) -> std::result::Result<OAuthCredentials, String> {
+) -> std::result::Result<OAuthCredentials, RefreshFailure> {
     let params = [
         ("grant_type", "refresh_token"),
         ("client_id", CLIENT_ID),
         ("refresh_token", refresh),
     ];
-    let token = token_request(client, &params).await?;
-    credentials_from_token(token)
+    let token = token_request_at(client, TOKEN_URL, &params).await?;
+    credentials_from_token(token).map_err(RefreshFailure::other)
 }
 
 async fn exchange_code_for_tokens(
@@ -138,23 +148,44 @@ async fn token_request(
     client: &Client,
     params: &[(&str, &str)],
 ) -> std::result::Result<CodexTokenResponse, String> {
+    token_request_at(client, TOKEN_URL, params)
+        .await
+        .map_err(String::from)
+}
+
+/// Token-endpoint POST, failures typed at the source (no response or an
+/// unusable success body is transient; a status goes by `status_kind`).
+pub(crate) async fn token_request_at(
+    client: &Client,
+    url: &str,
+    params: &[(&str, &str)],
+) -> std::result::Result<CodexTokenResponse, RefreshFailure> {
     let resp = client
-        .post(TOKEN_URL)
+        .post(url)
         .header("Content-Type", "application/x-www-form-urlencoded")
         .form(&params)
         .send()
         .await
-        .map_err(|e| format!("Token request failed: {}", e))?;
+        .map_err(|e| RefreshFailure::transport(format!("Token request failed: {}", e)))?;
 
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        return Err(format!("Token request failed ({}): {}", status, text));
+        return Err(RefreshFailure::status(
+            status.as_u16(),
+            // Only the RFC 6749 error fields: a proxy may echo the request,
+            // which carries the refresh token / code verifier.
+            format!(
+                "Token request failed ({}): {}",
+                status,
+                super::token::sanitize_oauth_error_body(&text)
+            ),
+        ));
     }
 
     resp.json()
         .await
-        .map_err(|e| format!("Failed to parse token response: {}", e))
+        .map_err(|e| RefreshFailure::bad_response(format!("Failed to parse token response: {}", e)))
 }
 
 fn credentials_from_token(
@@ -233,6 +264,20 @@ fn manual_paste_to_callback(input: &str) -> Option<CallbackResult> {
         code,
         state: state?,
     })
+}
+
+/// Display-only identity (email claim) carried by a Codex access token, if
+/// present. Never a secret; used to label accounts in listings.
+pub fn extract_email(access_token: &str) -> Option<String> {
+    let payload = access_token.split('.').nth(1)?;
+    let decoded = URL_SAFE_NO_PAD.decode(payload).ok()?;
+    let json: Value = serde_json::from_slice(&decoded).ok()?;
+    json.get("https://api.openai.com/profile")?
+        .get("email")?
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && s.len() <= 254)
+        .map(ToString::to_string)
 }
 
 pub fn extract_account_id(access_token: &str) -> Option<String> {

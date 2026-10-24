@@ -8,9 +8,11 @@
 //! NEVER stubbed: the flock liveness oracle, the ready-fd pipe, socket
 //! perms 0700/0600, the spawn lock (one spawner per registry dir).
 
+pub mod close;
 pub mod conn;
 pub mod lifecycle;
 pub mod listener;
+pub mod pin;
 pub mod registry;
 pub mod reload;
 
@@ -81,6 +83,34 @@ pub fn autospawn_enabled() -> bool {
 /// One-line reason used by every attach path when the flag is off.
 pub const DISABLED_NOTICE: &str = "daemon disabled by SYNAPS_DAEMON=0";
 
+/// A client running `client` profile must never drive a daemon that serves
+/// another one: its sessions, model and config writes would land in the
+/// wrong profile. The socket is per profile, but its stem is sanitised
+/// (`a.b` and `a_b` share `daemon-a_b.sock`), so the handshake's
+/// `Welcome.profile` is the authority. `None` and `Some("")` both mean the
+/// default profile. Returns the refusal message on a mismatch.
+pub fn profile_mismatch(daemon: Option<&str>, client: Option<&str>) -> Option<String> {
+    let norm = |p: Option<&str>| p.filter(|s| !s.is_empty()).map(str::to_owned);
+    let (daemon, client) = (norm(daemon), norm(client));
+    if daemon == client {
+        return None;
+    }
+    let name = |p: &Option<String>| match p {
+        Some(p) => format!("profile `{p}`"),
+        None => "the default profile".to_string(),
+    };
+    let stop = match &daemon {
+        Some(p) => format!("synaps --profile {p} daemon stop"),
+        None => "synaps daemon stop".to_string(),
+    };
+    Some(format!(
+        "refusing to attach: this daemon serves {}, but this client runs {} — \
+         stop it ({stop}) or use the matching --profile",
+        name(&daemon),
+        name(&client),
+    ))
+}
+
 /// Builds a session for `Attach::Create`: `host_factory` (real actor) or
 /// `echo_factory` (tests).
 pub type SessionFactory = Arc<
@@ -121,9 +151,10 @@ pub struct DaemonOpts {
     /// Override the socket path (the lock/json/pid stay under `registry_dir()`).
     pub socket: Option<PathBuf>,
     pub profile: Option<String>,
-    /// Exit after this long with zero connections and no session running a
-    /// turn (idle, client-less sessions are saved on exit; `--continue`
-    /// brings them back). A turn in flight always blocks the exit.
+    /// Exit after this long with zero connections, no pinned session and no
+    /// session running a turn (idle, client-less sessions are saved on exit;
+    /// `--continue` brings them back). A turn in flight or a pin always
+    /// blocks the exit.
     pub idle_exit: Option<Duration>,
     /// Deprecated, ignored: legacy MCP was removed (every mode uses
     /// per-session MCP leases). Still forwarded so an older client can spawn
@@ -175,6 +206,10 @@ pub struct DaemonState {
     /// `old id → new id` for one generation (ids differ only if a
     /// LinkedSuccessor compaction happened since boot).
     pub reload_aliases: Mutex<HashMap<String, String>>,
+    /// The `daemon.json` record this image wrote, and its writes. A Ping
+    /// that finds the file missing or naming another pid puts it back
+    /// ([`Self::heal_daemon_json`]); reload takes its recorded exe from here.
+    pub meta: registry::Metadata,
 }
 
 impl DaemonState {
@@ -198,6 +233,42 @@ impl DaemonState {
     /// Exec failed: arm a fresh token so new connections are served again.
     pub fn reset_announce(&self) {
         *self.reload_announce.lock().unwrap_or_else(|e| e.into_inner()) = CancellationToken::new();
+    }
+
+    /// The `daemon.json` record this image holds (a copy).
+    pub fn daemon_info(&self) -> DaemonInfo {
+        self.meta.info()
+    }
+
+    /// Ping: if `daemon.json` is missing or names another pid, write this
+    /// image's record back. Only while this image holds the flock and has
+    /// not begun to shut down; the record comes from memory, never from
+    /// disk. One INFO line per [`JSON_HEAL_LOG_EVERY`].
+    ///
+    /// The shutdown check runs under the `lock_fd` mutex: [`Daemon::wait`]
+    /// cancels `shutdown` before it takes that mutex to unlink the files, so
+    /// a Ping still in flight at shutdown can't write the file back after
+    /// the unlink. During a reload's hand-off the record already names the
+    /// new generation and exe, so a heal there writes what the reload wrote.
+    pub fn heal_daemon_json(&self) {
+        let lock = self.lock_fd.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(lock) = lock.as_ref() else {
+            return;
+        };
+        if self.shutdown.is_cancelled() {
+            return;
+        }
+        match self.meta.heal(lock) {
+            Ok(registry::Healed::Yes { info, log: Some(heals) }) => tracing::info!(
+                path = %self.paths.json.display(),
+                pid = info.pid,
+                generation = info.generation,
+                heals,
+                "daemon: daemon.json rewritten (it was missing or named another pid)"
+            ),
+            Ok(_) => {}
+            Err(e) => tracing::debug!(error = %e, "daemon: daemon.json heal failed"),
+        }
     }
 
     /// B4: ONE session map — `EngineHost` owns it; these delegate.
@@ -328,6 +399,18 @@ impl Daemon {
         let generation = reload_state.as_ref().map_or(1, |rs| rs.generation);
         let listener = listener::bind(&paths.sock)?;
 
+        let info = DaemonInfo {
+            pid: std::process::id(),
+            protocol_version: crate::session::wire::PROTOCOL_VERSION,
+            daemon_version: crate::session::wire::binary_version(),
+            profile: opts.profile.clone(),
+            started_at: chrono::Utc::now(),
+            socket: paths.sock.to_string_lossy().into_owned(),
+            exe: registry::read_daemon_json(&paths).and_then(|i| i.exe).or_else(|| Some(reload::resolve_exe())),
+            generation,
+        };
+        let meta = registry::Metadata::start(paths.clone(), info.clone())?;
+
         let factory = opts.factory.clone().unwrap_or_else(|| host_factory(&host));
         let state = Arc::new(DaemonState {
             host,
@@ -344,19 +427,8 @@ impl Daemon {
             reload_announce: Mutex::new(CancellationToken::new()),
             lock_fd: Mutex::new(Some(lock)),
             reload_aliases: Mutex::new(HashMap::new()),
+            meta,
         });
-
-        let info = DaemonInfo {
-            pid: std::process::id(),
-            protocol_version: crate::session::wire::PROTOCOL_VERSION,
-            daemon_version: crate::session::wire::binary_version(),
-            profile: opts.profile.clone(),
-            started_at: chrono::Utc::now(),
-            socket: paths.sock.to_string_lossy().into_owned(),
-            exe: registry::read_daemon_json(&paths).and_then(|i| i.exe).or_else(|| Some(reload::resolve_exe())),
-            generation,
-        };
-        registry::write_daemon_json(&paths, &info)?;
 
         // Before any session of this image registers: drop registrations no
         // running session owns (dead owner pid). After a reload, also every
@@ -401,7 +473,7 @@ impl Daemon {
         {
             let lock = self.state.lock_fd.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(lock) = lock.as_ref() {
-                registry::cleanup_metadata(&self.paths, lock);
+                self.state.meta.cleanup(lock);
             }
         }
         tracing::info!("daemon: stopped");
@@ -451,14 +523,19 @@ pub async fn session_is_idle(handle: &SessionHandle) -> bool {
     tokio::time::timeout(IDLE_PROBE_TIMEOUT, probe).await.unwrap_or(false)
 }
 
-/// Idle = zero connections AND every live session between turns, held for
-/// `idle` continuously. Clients count first so a probe is never sent while
-/// someone is attached.
+/// Idle = zero connections, no pinned session AND every live session
+/// between turns, held for `idle` continuously. Clients and pins count
+/// first so a probe is never sent while someone is attached. A pin holds
+/// the exit because exiting would end the session the user asked to keep.
 pub async fn daemon_is_idle(state: &DaemonState) -> bool {
     if state.connections.load(Ordering::SeqCst) > 0 {
         return false;
     }
-    for h in state.live_sessions() {
+    let sessions = state.live_sessions();
+    if sessions.iter().any(|h| h.pinned() && h.is_alive()) {
+        return false;
+    }
+    for h in sessions {
         if !session_is_idle(&h).await {
             return false;
         }
@@ -784,6 +861,7 @@ pub async fn run_foreground(opts: DaemonOpts) -> anyhow::Result<()> {
         mcp_discovery: crate::McpDiscovery::Background,
     })
     .await?;
+    host.report_config_warnings();
     // Sidecars spawn once per daemon: discover before accepting (bounded by
     // EXTENSION_DISCOVERY_WAIT, which SPAWN_READY_TIMEOUT outwaits).
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -876,6 +954,23 @@ mod flag_tests {
         for off in ["0", "false", "off", "no", "FALSE", " 0 ", "Off"] {
             assert!(!enabled_from(Some(off)), "{off:?} → off");
         }
+    }
+
+    #[test]
+    fn profile_mismatch_refuses_a_daemon_of_another_profile() {
+        assert_eq!(profile_mismatch(None, None), None);
+        assert_eq!(profile_mismatch(Some("axon"), Some("axon")), None);
+        // empty == default
+        assert_eq!(profile_mismatch(Some(""), None), None);
+        assert_eq!(profile_mismatch(None, Some("")), None);
+        // a profile client on the default daemon (the 0.10.1 clobber) and back
+        let m = profile_mismatch(None, Some("axon")).expect("mismatch");
+        assert!(m.contains("the default profile") && m.contains("profile `axon`"), "{m}");
+        assert!(m.contains("synaps daemon stop"), "{m}");
+        let m = profile_mismatch(Some("axon"), None).expect("mismatch");
+        assert!(m.contains("synaps --profile axon daemon stop"), "{m}");
+        // sanitised socket stems collide; the profile names do not
+        assert!(profile_mismatch(Some("a.b"), Some("a_b")).is_some());
     }
 
     #[test]

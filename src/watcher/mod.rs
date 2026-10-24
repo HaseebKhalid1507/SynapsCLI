@@ -272,10 +272,8 @@ pub async fn run(command: String, args: Vec<String>) {
                     .map(|s| s.elapsed().as_secs_f64())
                     .unwrap_or(0.0);
                 log(&format!("[{}] exited with code {}", name, code));
-                if agent.config.hooks.notify_inbox {
-                    log(&format!("[{}] notify_inbox hook firing", name));
-                    supervisor::notify_inbox_completion(name, agent.session_count, elapsed, code);
-                }
+                supervisor::notify_completion(&agent.config.hooks, name, agent.session_count, elapsed, code)
+                    .await;
                 std::process::exit(code);
             }
         }

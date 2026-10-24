@@ -24,6 +24,10 @@ pub struct EngineOpts {
 pub struct BackgroundTasks {
     watcher_shutdown: Arc<std::sync::atomic::AtomicBool>,
     watcher_task: tokio::task::JoinHandle<()>,
+    /// Whether the inbox watcher may take shared-inbox files now. A daemon
+    /// session holds it open only while a client owns its input; living here,
+    /// it survives park/unpark with the watcher it gates.
+    inbox_gate: Arc<std::sync::atomic::AtomicBool>,
     endpoint: crate::events::registry::SessionEndpoint,
     session_id: String,
     /// Hook bus the session's `on_session_start` injection lives on; cleared
@@ -44,6 +48,12 @@ impl BackgroundTasks {
         name: Option<&str>,
     ) -> std::result::Result<(), String> {
         self.endpoint.update_name(name)
+    }
+
+    /// Open or close the inbox watcher's gate (see [`spawn_session_background_gated`]).
+    pub(crate) fn set_inbox_accepting(&self, accepting: bool) {
+        self.inbox_gate
+            .store(accepting, std::sync::atomic::Ordering::Release);
     }
 
     /// Signal all tasks to stop and unregister the session.
@@ -271,10 +281,26 @@ pub(crate) fn resolve_session_and_prompt(
 }
 
 /// Inbox watcher + per-session UDS listener + registry registration (code
-/// motion from `boot()`). Fails loudly when registration fails.
+/// motion from `boot()`). Fails loudly when registration fails. The inbox
+/// gate starts open: an in-process session always has its user at hand.
 pub(crate) fn spawn_session_background(
     runtime: &Runtime,
     session: &Session,
+) -> Result<BackgroundTasks> {
+    spawn_session_background_gated(
+        runtime,
+        session,
+        Arc::new(std::sync::atomic::AtomicBool::new(true)),
+    )
+}
+
+/// [`spawn_session_background`] whose inbox watcher takes shared-inbox files
+/// only while `inbox_gate` is true. The per-session socket is not gated:
+/// events addressed to this session always arrive.
+pub(crate) fn spawn_session_background_gated(
+    runtime: &Runtime,
+    session: &Session,
+    inbox_gate: Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<BackgroundTasks> {
     // Start inbox watcher
     let watcher_shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -282,8 +308,16 @@ pub(crate) fn spawn_session_background(
         let inbox_dir = crate::config::base_dir().join("inbox");
         let event_queue = runtime.event_queue().clone();
         let shutdown = watcher_shutdown.clone();
+        let gate = Arc::clone(&inbox_gate);
         tokio::spawn(async move {
-            crate::events::watch_inbox(inbox_dir, event_queue, shutdown).await;
+            crate::events::watch_inbox_gated(
+                inbox_dir,
+                event_queue,
+                shutdown,
+                crate::events::ingest::accept_all,
+                gate,
+            )
+            .await;
         })
     };
 
@@ -309,6 +343,7 @@ pub(crate) fn spawn_session_background(
     Ok(BackgroundTasks {
         watcher_shutdown,
         watcher_task,
+        inbox_gate,
         endpoint,
         session_id: session.id.clone(),
         hook_bus: Arc::clone(runtime.hook_bus()),

@@ -597,6 +597,7 @@ fn budget_dimension_tag(dimension: BudgetDimension) -> u8 {
         BudgetDimension::ProviderRounds => 4,
         BudgetDimension::ToolResultBytes => 5,
         BudgetDimension::CostUsd => 6,
+        BudgetDimension::TotalTokens => 7,
     }
 }
 

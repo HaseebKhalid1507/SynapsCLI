@@ -687,7 +687,7 @@ pub(crate) async fn handle_animation_tick(
         theme::transition::advance(&mut app.theme_transition, std::time::Instant::now())
     {
         theme::set_theme(frame);
-        app.invalidate();
+        app.invalidate_theme();
     }
     // P7.8: activation/deactivation happen OUTSIDE any input event
     // (async queue + auto-chaining); reconcile the stack to the
@@ -755,12 +755,11 @@ pub(crate) async fn handle_animation_tick(
         }
         app.request_redraw();
     }
-    if app.advance_animations() {
-        // Spinner ticks only affect the tail message (THINKING_PLACEHOLDER,
-        // active tool animation). Mark just the last slot dirty instead of
-        // full invalidation — O(1) instead of O(n) per frame.
-        app.invalidate_last();
+    if app.spinner_frame % 3 == 0 && app.header_animating() {
+        // Header block sweep + spinner (~20 fps; wall-clock speed).
+        app.request_redraw();
     }
+    app.tick_message_animations();
     if let Some(msg) = app.check_gamba_exited() {
         // check_gamba_exited() already called restore_terminal();
         // resume the render thread now that we own the terminal again.
@@ -776,10 +775,13 @@ pub(crate) async fn handle_animation_tick(
     false
 }
 
-/// Live-MXC (myx theme) boot: start the subscriber iff the configured theme
-/// is "myx". Later /theme switches reconcile via `App::sync_myx_live`.
+/// Live-MXC (myx theme) boot: start the subscriber iff the theme this
+/// process starts with is "myx": `SYNAPS_THEME` if it names a theme, else
+/// the configured one. Later /theme switches reconcile via
+/// `App::sync_myx_live`.
 pub(crate) fn boot_myx_live(app: &mut App) {
-    if theme::configured_theme_name().as_deref() == Some("myx") {
+    let boot = theme::env_theme_name().or_else(theme::configured_theme_name);
+    if boot.as_deref() == Some("myx") {
         app.sync_myx_live("myx");
     }
 }

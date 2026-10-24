@@ -320,6 +320,7 @@ mod tests {
                 tx_events: None,
             },
             capabilities: crate::tools::ToolCapabilities {
+                session_allow_all: None,
                 launch_cancel: None,
                 memory_backend: None,
                 watcher_exit_path: None,
@@ -339,6 +340,7 @@ mod tests {
                 env: None,
                 env_stripped: Vec::new(),
                 env_warned: Default::default(),
+                session_id: None,
             },
             limits: crate::tools::ToolLimits {
                 max_tool_output: 30000,

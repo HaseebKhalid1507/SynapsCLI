@@ -314,6 +314,18 @@ impl TraceContext {
         self
     }
 
+    /// The logical request just failed pre-inference and is being resent
+    /// with a different body (Codex dropping a rejected hosted tool). Let the
+    /// resend's `begin` through an armed one-shot gate so `/trace next` still
+    /// records it. Call only when this request got a tracer (held the
+    /// gate); an untraced continuation must stay untraced. No-op on ungated
+    /// contexts.
+    pub fn reopen_one_shot_for_resend(&self) {
+        if let Some(gate) = &self.one_shot_gate {
+            gate.store(false, Ordering::SeqCst);
+        }
+    }
+
     /// Pass (consume) the one-shot gate. `true` for ungated contexts and
     /// for the first caller on a gated context; `false` afterwards.
     fn pass_one_shot_gate(&self) -> bool {
@@ -668,6 +680,9 @@ impl RequestTracer {
             },
         };
         self.emit_record(outcome);
+        // The verdict belongs to this attempt: the next one starts without
+        // it, even if it fails before streaming.
+        self.structure.cache.server_diagnosis = None;
         self.retries.push(RetryMeta {
             attempt: self.attempt,
             class,
@@ -706,6 +721,13 @@ impl RequestTracer {
             code: code.to_string(),
             correlation_id: self.request_id.as_str().to_string(),
         }
+    }
+
+    /// Attach (or clear) the provider's cache diagnosis for the attempt
+    /// that is about to finish. Set per attempt so a retry never inherits
+    /// the previous attempt's verdict.
+    pub fn set_server_diagnosis(&mut self, diagnosis: Option<super::ServerCacheDiagnosis>) {
+        self.structure.cache.server_diagnosis = diagnosis;
     }
 
     fn emit_record(&self, outcome: TransportOutcome) {

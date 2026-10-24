@@ -6,6 +6,9 @@
 //! a fixture extension responds to the RPC, and the manager wrapper
 //! decodes the typed `SidecarSpawnArgs`.
 
+#[path = "support/hermetic_base_dir.rs"]
+mod hermetic_base_dir;
+
 use std::sync::Arc;
 
 use synaps_cli::extensions::hooks::HookBus;
@@ -49,6 +52,7 @@ fn manifest_with_mode(mode: Option<&str>) -> ExtensionManifest {
 
 #[tokio::test(flavor = "current_thread")]
 async fn manager_returns_plugin_supplied_spawn_args() {
+    hermetic_base_dir::pin();
     let mut manager = ExtensionManager::new(Arc::new(HookBus::new()));
 
     manager
@@ -77,6 +81,7 @@ async fn manager_returns_plugin_supplied_spawn_args() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn manager_propagates_method_not_found_error() {
+    hermetic_base_dir::pin();
     let mut manager = ExtensionManager::new(Arc::new(HookBus::new()));
 
     manager
@@ -95,6 +100,7 @@ async fn manager_propagates_method_not_found_error() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn manager_rejects_invalid_response_payload() {
+    hermetic_base_dir::pin();
     let mut manager = ExtensionManager::new(Arc::new(HookBus::new()));
 
     manager
@@ -113,6 +119,7 @@ async fn manager_rejects_invalid_response_payload() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn manager_accepts_empty_object_as_defaults() {
+    hermetic_base_dir::pin();
     let mut manager = ExtensionManager::new(Arc::new(HookBus::new()));
 
     manager
@@ -129,6 +136,7 @@ async fn manager_accepts_empty_object_as_defaults() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn manager_returns_unknown_extension_for_missing_id() {
+    hermetic_base_dir::pin();
     let manager = ExtensionManager::new(Arc::new(HookBus::new()));
     let err = manager
         .sidecar_spawn_args("does-not-exist")

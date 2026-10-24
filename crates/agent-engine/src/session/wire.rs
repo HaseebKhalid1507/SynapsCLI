@@ -34,6 +34,14 @@ use crate::{AgentEvent, LlmEvent, SessionEvent, StreamEvent, TurnError, TurnOutc
 /// `DriverTurnOutcome`); old clients skip unknown via `#[serde(other)]`.
 /// Protocol stays exact-match; only *binary* versions compare directionally
 /// (reload, §2.8).
+/// `Close`/`Closed` were added without a bump: an older daemon answers the
+/// unknown `ClientFrame` with `Error{"malformed frame: unknown variant
+/// `close`…"}` (the client maps that to "daemon too old"), whereas a bump
+/// would refuse every older TUI that reconnects after a `daemon reload`.
+/// Additive `ClientFrame` variants that only a new client sends follow this
+/// rule; `Closed` only ever answers `Close`, so old clients never see it.
+/// `Pin`/`Pinned` (`synaps daemon pin`) follow the same rule, and so does
+/// `SessionMeta.pinned` (`#[serde(default)]`: an older daemon omits it).
 pub const PROTOCOL_VERSION: u32 = 3;
 /// Exact-match policy today (`min == max == PROTOCOL_VERSION`).
 pub const PROTOCOL_MIN: u32 = PROTOCOL_VERSION;
@@ -55,10 +63,33 @@ pub const IDLE_PROBE_QUERY_ID: u64 = RESERVED_QUERY_ID_BASE + 1;
 /// `Checkpoint` replies `QueryResult{id: CHECKPOINT_QUERY_ID, {ok:true}}`
 /// so `reload.rs` can await it per session.
 pub const CHECKPOINT_QUERY_ID: u64 = RESERVED_QUERY_ID_BASE + 2;
+/// `synaps daemon close` sends the engine command `close` under a fresh id
+/// at or above this one per request (`daemon/close.rs`) and awaits that id's
+/// `QueryResult`, so concurrent closes never take each other's reply.
+/// Attached clients never see these.
+pub const CLOSE_QUERY_ID_BASE: u64 = RESERVED_QUERY_ID_BASE + (1 << 32);
 
 /// The binary version the daemon/client report in the handshake.
 pub fn binary_version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
+}
+
+static BUILD_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Record this process's build id. The `synaps` binary calls it first thing
+/// in `main` with the id its build script baked in (the short commit,
+/// `-dirty` with uncommitted changes, or `SYNAPS_BUILD_ID` from the build
+/// environment). It lives in the root crate, not here, so a new commit does
+/// not recompile the engine. First call wins; later calls are ignored.
+pub fn set_build_id(id: &str) {
+    let _ = BUILD_ID.set(id.trim().to_string());
+}
+
+/// Which build of [`binary_version`] this is, as set by [`set_build_id`];
+/// empty when unknown (never set: library embedders, tests, packaged builds
+/// without git). Two builds of one release share the version, not this.
+pub fn build_id() -> &'static str {
+    BUILD_ID.get().map(String::as_str).unwrap_or("")
 }
 
 // ── client → daemon ───────────────────────────────────────────────────────────
@@ -95,6 +126,34 @@ pub enum ClientFrame {
     /// Control fast path: `memstat::purge_arenas()` in the daemon (bench
     /// hygiene). Reply: `Pong`. (C2)
     Purge,
+    /// Control fast path: end one session as `/close [force]` would, with
+    /// host authority (no attach, never unparks). A session with clients
+    /// attached is refused unless `attached` (`--attached`); `force` only
+    /// overrides work in flight. Reply: `Closed`, or
+    /// `Refused{Busy|UnknownSession}`. Not accepted on an attached
+    /// connection (that client has `/close`).
+    Close {
+        session_id: SessionId,
+        #[serde(default)]
+        force: bool,
+        #[serde(default)]
+        attached: bool,
+    },
+    /// Control fast path: pin (`on`) or unpin one session, as `/pin on|off`
+    /// would, with host authority. `on` is required so a frame always says
+    /// which way it goes. Pinning a parked session unparks it; unpinning one
+    /// leaves it parked. Reply: `Pinned`, or `Refused{Busy|UnknownSession}`.
+    /// Not accepted on an attached connection (that client has `/pin`).
+    Pin {
+        session_id: SessionId,
+        on: bool,
+    },
+    /// Control fast path (no session): the in-memory account state of the
+    /// broker every session of this daemon shares (`synaps auth state`),
+    /// cleared first when `clear` is set. Reply: `AuthState`. A daemon that
+    /// predates this frame answers `Error` "malformed frame: unknown variant
+    /// `auth_state`, ..." and keeps the connection usable.
+    AuthState(agent_core::auth::AuthStateQuery),
     Bye,
 }
 
@@ -118,6 +177,18 @@ impl std::fmt::Debug for ClientFrame {
                 .field("exe", exe)
                 .finish(),
             Self::Purge => f.write_str("Purge"),
+            Self::Close { session_id, force, attached } => f
+                .debug_struct("Close")
+                .field("session_id", session_id)
+                .field("force", force)
+                .field("attached", attached)
+                .finish(),
+            Self::Pin { session_id, on } => f
+                .debug_struct("Pin")
+                .field("session_id", session_id)
+                .field("on", on)
+                .finish(),
+            Self::AuthState(query) => f.debug_tuple("AuthState").field(query).finish(),
             Self::Bye => f.write_str("Bye"),
         }
     }
@@ -229,10 +300,26 @@ pub enum DaemonFrame {
         session_id: Option<SessionId>,
         message: String,
     },
+    /// Reply to `Close`: the session ended; `text` is the actor's `/close`
+    /// reply (how to continue it).
+    Closed {
+        session_id: SessionId,
+        text: String,
+    },
+    /// Reply to `Pin`: the session's pin is now `on`.
+    Pinned {
+        session_id: SessionId,
+        on: bool,
+    },
     /// `Some(Reloading{..})` before exec; `None` otherwise (today).
     Bye {
         #[serde(default)]
         reason: Option<ByeReason>,
+    },
+    /// Reply to `ClientFrame::AuthState`. Labels, kinds and times only:
+    /// never token material, emails, account ids or identity hashes.
+    AuthState {
+        report: agent_core::auth::AuthStateReport,
     },
 }
 
@@ -272,6 +359,11 @@ pub struct Welcome {
     /// Reload counter (starts at 1).
     #[serde(default = "one")]
     pub generation: u64,
+    /// The daemon's [`build_id`]: tells two builds of one version apart.
+    /// Empty from older daemons (unknown). `daemon_version` stays the plain
+    /// semver the reload gate parses.
+    #[serde(default)]
+    pub daemon_build: String,
 }
 
 fn one() -> u64 {
@@ -552,6 +644,12 @@ pub enum WireLlmEvent {
     ToolResultDelta { tool_id: String, delta: String },
     ResponseStart,
     ResponseReset,
+    /// Opt-in (`ClientCapabilities::tool_queue`): this enum has no
+    /// `#[serde(other)]`, so an older client fails the WHOLE frame on an
+    /// unknown variant — the daemon never sends these two to a client that
+    /// did not declare it can decode them (`daemon/conn.rs`).
+    ToolQueued { tool_id: String },
+    ToolStarted { tool_id: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -569,7 +667,14 @@ pub enum WireSessionStreamEvent {
     },
     Done,
     Error { message: String, outcome: TurnOutcome },
-    Notice { text: String },
+    /// `retry`: a `SessionEvent::Retry`. Omitted when false, so a plain
+    /// notice's frame is unchanged and peers that predate the flag read a
+    /// retry as a plain notice.
+    Notice {
+        text: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        retry: bool,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -655,6 +760,8 @@ impl From<StreamEvent> for WireStreamEvent {
                 LlmEvent::ToolResultDelta { tool_id, delta } => WireLlmEvent::ToolResultDelta { tool_id, delta },
                 LlmEvent::ResponseStart => WireLlmEvent::ResponseStart,
                 LlmEvent::ResponseReset => WireLlmEvent::ResponseReset,
+                LlmEvent::ToolQueued { tool_id } => WireLlmEvent::ToolQueued { tool_id },
+                LlmEvent::ToolStarted { tool_id } => WireLlmEvent::ToolStarted { tool_id },
             }),
             StreamEvent::Session(s) => Self::Session(match s {
                 SessionEvent::MessageHistory(messages) => WireSessionStreamEvent::MessageHistory { messages },
@@ -677,7 +784,8 @@ impl From<StreamEvent> for WireStreamEvent {
                 },
                 SessionEvent::Done => WireSessionStreamEvent::Done,
                 SessionEvent::Error(TurnError { message, outcome }) => WireSessionStreamEvent::Error { message, outcome },
-                SessionEvent::Notice(text) => WireSessionStreamEvent::Notice { text },
+                SessionEvent::Notice(text) => WireSessionStreamEvent::Notice { text, retry: false },
+                SessionEvent::Retry(text) => WireSessionStreamEvent::Notice { text, retry: true },
                 // merge(112): ContextHeadCheckpoint is actor-internal (Wall 1); never crosses the wire.
                 // Drop it silently — the actor handles persistence before forwarding.
                 SessionEvent::ContextHeadCheckpoint { .. } => WireSessionStreamEvent::Done,
@@ -711,6 +819,8 @@ impl From<WireStreamEvent> for StreamEvent {
                 WireLlmEvent::ToolResultDelta { tool_id, delta } => LlmEvent::ToolResultDelta { tool_id, delta },
                 WireLlmEvent::ResponseStart => LlmEvent::ResponseStart,
                 WireLlmEvent::ResponseReset => LlmEvent::ResponseReset,
+                WireLlmEvent::ToolQueued { tool_id } => LlmEvent::ToolQueued { tool_id },
+                WireLlmEvent::ToolStarted { tool_id } => LlmEvent::ToolStarted { tool_id },
             }),
             WireStreamEvent::Session(s) => Self::Session(match s {
                 WireSessionStreamEvent::MessageHistory { messages } => SessionEvent::MessageHistory(messages),
@@ -733,7 +843,8 @@ impl From<WireStreamEvent> for StreamEvent {
                 },
                 WireSessionStreamEvent::Done => SessionEvent::Done,
                 WireSessionStreamEvent::Error { message, outcome } => SessionEvent::Error(TurnError { message, outcome }),
-                WireSessionStreamEvent::Notice { text } => SessionEvent::Notice(text),
+                WireSessionStreamEvent::Notice { text, retry: false } => SessionEvent::Notice(text),
+                WireSessionStreamEvent::Notice { text, retry: true } => SessionEvent::Retry(text),
             }),
             WireStreamEvent::Agent(a) => Self::Agent(match a {
                 WireAgentEvent::SubagentStart { subagent_id, agent_name, task_preview } => {
@@ -877,6 +988,25 @@ impl From<WireSessionEvent> for SessionEventWire {
     }
 }
 
+// ── per-client decode gate ────────────────────────────────────────────────────
+
+/// Whether a client that declared `caps` can decode `event` once it is a
+/// wire frame. The enums nested under `Stream` have no `#[serde(other)]`,
+/// so an older client does not skip an unknown nested variant: the whole
+/// frame fails to decode, `SocketTransport::next_event` treats that as a
+/// dead socket and the TUI drops into reconnect — whose `Attached` replay
+/// may carry the very same event and fail again. The daemon therefore
+/// drops, per connection, every event the client did not opt into
+/// (`daemon/conn.rs`, live pump and attach replay alike).
+pub fn client_decodes(caps: ClientCapabilities, event: &SessionEventWire) -> bool {
+    match event {
+        SessionEventWire::Stream(StreamEvent::Llm(LlmEvent::ToolQueued { .. } | LlmEvent::ToolStarted { .. })) => {
+            caps.tool_queue
+        }
+        _ => true,
+    }
+}
+
 // ── framing helpers ───────────────────────────────────────────────────────────
 
 /// Human-readable form of the cap for error frames.
@@ -913,6 +1043,53 @@ mod tests {
         crate::session::handle::echo::view_for()
     }
 
+    /// An `AuthState` reply with every nested type present.
+    fn auth_state_report() -> agent_core::auth::AuthStateReport {
+        use agent_core::auth::auth_state::{AccountState, CooldownReason, CooldownState, IdentityKind, ObservedOutcome, SelectionState};
+        use agent_core::auth::quota_policy::{
+            AccountFailure, AccountFailureKind, ObservationFailure, SelectionFailure, SelectionFailureKind,
+        };
+        let usage_429 = ObservationFailure { kind: AccountFailureKind::UsageRateLimited, http_status: Some(429), retry_after_s: Some(120) };
+        agent_core::auth::AuthStateReport {
+            schema_version: agent_core::auth::AUTH_STATE_SCHEMA_VERSION,
+            live: true,
+            broker_active: true,
+            generated_at_ms: 1_800_000_000_000,
+            store: "/scratch/auth.json".into(),
+            accounts: vec![AccountState {
+                provider: "anthropic".into(),
+                label: "a".into(),
+                identity: IdentityKind::Stable,
+                access_expires_ms: Some(1_800_000_600_000),
+                cooldown: Some(CooldownState { until_ms: 1_800_003_600_000, reason: CooldownReason::AnthropicQuotaExhausted }),
+                last_usage: Some(ObservedOutcome { at_ms: 1_799_999_990_000, failure: Some(usage_429.clone()) }),
+                last_usage_ok_ms: Some(1_799_999_000_000),
+                last_refresh: Some(ObservedOutcome { at_ms: 1_799_999_500_000, failure: None }),
+            }],
+            selections: vec![SelectionState {
+                provider: "anthropic".into(),
+                model: Some("claude-x".into()),
+                at_ms: 1_799_999_990_000,
+                chosen: None,
+                failure: Some(SelectionFailure {
+                    kind: SelectionFailureKind::UsageReadFailed,
+                    accounts: vec![AccountFailure {
+                        account: "a".into(),
+                        kind: AccountFailureKind::UsageRateLimited,
+                        http_status: Some(429),
+                        retry_after_s: Some(120),
+                        until_ms: None,
+                        cooling_down: false,
+                    }],
+                    earliest_reset_ms: None,
+                    usage_read_retry_ms: None,
+                }),
+                vend_failure: None,
+            }],
+            cleared: vec!["anthropic:b".into()],
+        }
+    }
+
     fn meta() -> SessionMeta {
         crate::session::handle::echo::meta_for(&SessionId::from("wire-1"))
     }
@@ -924,6 +1101,7 @@ mod tests {
             title: "sudo".into(),
             prompt: "password".into(),
             raised_at: chrono::Utc::now(),
+            confirm_scope: None,
         }
     }
 
@@ -995,6 +1173,8 @@ mod tests {
             }),
             StreamEvent::Llm(LlmEvent::ToolResult { tool_id: "id1".into(), result: "/tmp".into() }),
             StreamEvent::Llm(LlmEvent::ToolResultDelta { tool_id: "id1".into(), delta: "/t".into() }),
+            StreamEvent::Llm(LlmEvent::ToolQueued { tool_id: "id2".into() }),
+            StreamEvent::Llm(LlmEvent::ToolStarted { tool_id: "id2".into() }),
             StreamEvent::Session(SessionEvent::MessageHistory(vec![Arc::new(serde_json::json!({"role":"user","content":"a"}))])),
             StreamEvent::Session(SessionEvent::Usage {
                 input_tokens: 1,
@@ -1010,6 +1190,7 @@ mod tests {
             StreamEvent::Session(SessionEvent::Error(TurnError::budget(BudgetDimension::ToolCalls))),
             StreamEvent::Session(SessionEvent::Error(TurnError { message: "c".into(), outcome: TurnOutcome::Canceled })),
             StreamEvent::Session(SessionEvent::Notice("n".into())),
+            StreamEvent::Session(SessionEvent::Retry("r".into())),
             StreamEvent::Agent(AgentEvent::SubagentStart { subagent_id: 1, agent_name: "a".into(), task_preview: "p".into() }),
             StreamEvent::Agent(AgentEvent::SubagentUpdate { subagent_id: 1, agent_name: "a".into(), status: "s".into() }),
             StreamEvent::Agent(AgentEvent::SubagentDone {
@@ -1020,6 +1201,29 @@ mod tests {
             }),
             StreamEvent::Agent(AgentEvent::SteeringDelivered { message: "m".into() }),
         ]
+    }
+
+    /// 04-tui I4: a retry rides on the existing `notice` frame with a flag,
+    /// so a peer that predates it decodes it as a plain notice (it never
+    /// becomes a malformed frame), and a plain notice's bytes are unchanged.
+    #[test]
+    fn a_retry_is_a_flagged_notice_on_the_wire() {
+        let retry = StreamEvent::Session(SessionEvent::Retry("⚠ Rate limited — retrying (1/5)".into()));
+        let json = serde_json::to_value(WireStreamEvent::from(retry)).unwrap();
+        assert_eq!(json["session"], "notice", "{json}");
+        assert_eq!(json["retry"], true, "{json}");
+        let back: WireStreamEvent = serde_json::from_value(json).unwrap();
+        assert!(
+            matches!(StreamEvent::from(back), StreamEvent::Session(SessionEvent::Retry(t)) if t.starts_with("⚠ Rate limited")),
+            "a retry stays a retry"
+        );
+        let plain = StreamEvent::Session(SessionEvent::Notice("n".into()));
+        let json = serde_json::to_value(WireStreamEvent::from(plain)).unwrap();
+        assert!(json.get("retry").is_none(), "a plain notice is unchanged: {json}");
+        // An older daemon's notice has no flag: a plain notice.
+        let old: WireStreamEvent =
+            serde_json::from_value(serde_json::json!({"kind": "session", "session": "notice", "text": "x"})).unwrap();
+        assert!(matches!(StreamEvent::from(old), StreamEvent::Session(SessionEvent::Notice(t)) if t == "x"));
     }
 
     fn fixtures() -> Vec<SessionEventWire> {
@@ -1096,6 +1300,8 @@ mod tests {
                 finished_elapsed: Some(std::time::Duration::from_millis(1250)),
                 step: "$ cargo test".into(),
                 tools: 3,
+                handle_id: "sa_1".into(),
+                model: "provider/model-a".into(),
             }]),
             S::Resumed { id: 2, old_id: "o".into(), new_id: "n".into(), via: Some("name".into()), clamp_notice: None },
             S::InputOwnerChanged { from: Some(ClientId(1)), to: Some(ClientId(2)), reason: OwnerChangeReason::Takeover },
@@ -1124,11 +1330,126 @@ mod tests {
         v
     }
 
+    fn queued_frame() -> String {
+        let ev = env(SessionEventWire::Stream(StreamEvent::Llm(LlmEvent::ToolQueued { tool_id: "toolu_2".into() })));
+        encode_line(&DaemonFrame::Event(ev.into())).unwrap()
+    }
+
+    /// What an OLDER client does with a new nested `llm` variant: its
+    /// `WireLlmEvent` lacks the tag, so serde fails the WHOLE frame (no
+    /// `#[serde(other)]` down there) — `SocketTransport::next_event` then
+    /// ends the stream as if the socket closed. Simulated the way the
+    /// driver-event test does: rename the tag to one this build lacks.
+    /// Only the top level (`ev`) has an `Unknown` fallback, and that one
+    /// shows the user a notice.
+    #[test]
+    fn an_unknown_nested_llm_variant_fails_the_whole_frame() {
+        let line = queued_frame();
+        assert!(line.contains(r#""llm":"tool_queued""#), "{line}");
+        let as_old = line.replace(r#""llm":"tool_queued""#, r#""llm":"tool_from_the_future""#);
+        let err = decode_line::<DaemonFrame>(as_old.trim_end()).unwrap_err();
+        assert!(err.contains("unknown variant `tool_from_the_future`"), "{err}");
+        // The same inside an attach replay sinks the whole `Attached`.
+        let attached = AttachedWire::new(
+            ClientId(1),
+            AttachSnapshot {
+                meta: meta(),
+                view: view(),
+                conversation: conv(),
+                streaming: true,
+                replay: vec![env(SessionEventWire::Stream(StreamEvent::Llm(LlmEvent::ToolQueued { tool_id: "toolu_2".into() })))],
+                pending_prompts: vec![],
+                clients: vec![],
+                input_owner: None,
+                display_tail: None,
+            },
+        );
+        let line = encode_line(&DaemonFrame::Attached(attached)).unwrap();
+        let as_old = line.replace(r#""llm":"tool_queued""#, r#""llm":"tool_from_the_future""#);
+        assert!(decode_line::<DaemonFrame>(as_old.trim_end()).is_err());
+        // Whereas an unknown TOP-level event decodes, as a user-visible notice.
+        let top_frame = queued_frame().replace(r#""ev":"stream""#, r#""ev":"zz_new""#);
+        match decode_line::<DaemonFrame>(top_frame.trim_end()).unwrap() {
+            DaemonFrame::Event(w) => match Envelope::from(w).event {
+                SessionEventWire::SystemNotice(t) => assert!(t.contains("newer daemon"), "{t}"),
+                other => panic!("{other:?}"),
+            },
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// The gate: a client that did not declare `tool_queue` (every client
+    /// that predates it) is never sent the queue signals; everything else
+    /// it decodes exactly as before. A current client gets them.
+    #[test]
+    fn queue_signals_reach_only_clients_that_opted_in() {
+        let old = ClientCapabilities::default();
+        let new = ClientCapabilities::current();
+        for ev in fixtures() {
+            let queue = matches!(
+                ev,
+                SessionEventWire::Stream(StreamEvent::Llm(LlmEvent::ToolQueued { .. } | LlmEvent::ToolStarted { .. }))
+            );
+            assert_eq!(client_decodes(old, &ev), !queue, "old client: {ev:?}");
+            assert!(client_decodes(new, &ev), "new client: {ev:?}");
+        }
+    }
+
+    /// Hello compat both ways: an older client's meta has no capabilities
+    /// (decodes as none), a current one declares `tool_queue`, and an older
+    /// daemon's `ClientMeta` (no such field) still decodes the new frame.
+    #[test]
+    fn client_capabilities_default_off_and_old_daemons_ignore_them() {
+        let legacy = r#"{"kind":"tui","terminal":null,"instance":"i"}"#;
+        let m: ClientMeta = serde_json::from_str(legacy).unwrap();
+        assert_eq!(m.capabilities, ClientCapabilities::default());
+        assert!(!m.capabilities.tool_queue);
+
+        let h = Hello::new(ClientKind::Tui);
+        assert!(h.client.capabilities.tool_queue);
+        let line = encode_line(&ClientFrame::Hello(h)).unwrap();
+        assert!(line.contains(r#""capabilities":{"tool_queue":true}"#), "{line}");
+        match decode_line::<ClientFrame>(line.trim_end()).unwrap() {
+            ClientFrame::Hello(h) => assert!(h.client.capabilities.tool_queue),
+            other => panic!("{other:?}"),
+        }
+
+        // The ClientMeta an older daemon decodes (as of da1eb372).
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        struct OldClientMeta {
+            kind: ClientKind,
+            terminal: Option<String>,
+            instance: String,
+            #[serde(default)]
+            history: HistoryMode,
+            #[serde(default)]
+            tail_items: usize,
+        }
+        let json = serde_json::to_string(&ClientMeta::new(ClientKind::Tui)).unwrap();
+        let old: OldClientMeta = serde_json::from_str(&json).unwrap();
+        assert_eq!(old.kind, ClientKind::Tui);
+    }
+
+    /// The watch query's opt-in: an older client's query omits it (off), an
+    /// off flag is not serialized (an older daemon sees the old bytes).
+    #[test]
+    fn the_watch_queries_tool_queue_flag_defaults_off() {
+        let old: SessionQuery =
+            serde_json::from_str(r#"{"query":"subagent_watch","handle_id":"sa_1","since":4}"#).unwrap();
+        assert!(matches!(old, SessionQuery::SubagentWatch { tool_queue: false, since: 4, .. }));
+        let off = SessionQuery::SubagentWatch { handle_id: "sa_1".into(), since: 4, tool_queue: false };
+        assert!(!serde_json::to_string(&off).unwrap().contains("tool_queue"));
+        let on = SessionQuery::SubagentWatch { handle_id: "sa_1".into(), since: 4, tool_queue: true };
+        let back: SessionQuery = serde_json::from_str(&serde_json::to_string(&on).unwrap()).unwrap();
+        assert!(matches!(back, SessionQuery::SubagentWatch { tool_queue: true, .. }));
+    }
+
     #[test]
     fn wire_roundtrip_every_variant() {
         let all = fixtures();
-        // 36 non-Stream variants (TurnStarted thrice = 3; +3 driver events) + 18 StreamEvent leaves.
-        assert_eq!(all.len(), 36 + 18);
+        // 36 non-Stream variants (TurnStarted thrice = 3; +3 driver events) + 21 StreamEvent leaves.
+        assert_eq!(all.len(), 36 + 21);
         for ev in all {
             let is_conv = matches!(ev, SessionEventWire::Conversation(_));
             let e = env(ev);
@@ -1198,6 +1519,42 @@ mod tests {
         let v: WireSessionEvent = serde_json::from_str(r#"{"ev":"from_the_future","x":1}"#).unwrap();
         assert!(matches!(v, WireSessionEvent::Unknown));
         assert!(matches!(SessionEventWire::from(v), SessionEventWire::SystemNotice(_)));
+    }
+
+    /// An older daemon cannot decode a newer client's command; serde names
+    /// the unknown tag in backticks. The TUI keys on exactly that
+    /// (`tui::watch::absorb_notice`, "malformed frame: unknown variant
+    /// `subagent_watch`") to tell the user to reload the daemon.
+    #[test]
+    fn an_unknown_command_or_query_names_its_tag_in_the_decode_error() {
+        let frames = [
+            (
+                ClientFrame::Cmd {
+                    session_id: "s".into(),
+                    cmd: SessionCommand::Query {
+                        id: 1,
+                        query: SessionQuery::SubagentWatch { handle_id: "sa_1".into(), since: 0, tool_queue: false },
+                    },
+                },
+                "subagent_watch",
+            ),
+            (
+                ClientFrame::Cmd {
+                    session_id: "s".into(),
+                    cmd: SessionCommand::SubagentSteer { handle_id: "sa_1".into(), text: "x".into() },
+                },
+                "subagent_steer",
+            ),
+        ];
+        for (frame, tag) in frames {
+            let json = serde_json::to_string(&frame).unwrap();
+            assert!(decode_line::<ClientFrame>(&json).is_ok());
+            // What an older daemon sees: a tag it does not know.
+            let old = json.replace(&format!("\"{tag}\""), "\"zz_from_the_future\"");
+            assert_ne!(old, json, "{tag} is serialized as a quoted tag");
+            let err = decode_line::<ClientFrame>(&old).unwrap_err();
+            assert!(err.contains("unknown variant `zz_from_the_future`"), "{err}");
+        }
     }
 
     #[test]
@@ -1275,6 +1632,16 @@ mod tests {
             }},
             ClientFrame::Reload { now: true, drain_secs: Some(3), exe: Some(PathBuf::from("/bin/synaps")) },
             ClientFrame::Purge,
+            ClientFrame::Close { session_id: "s".into(), force: true, attached: true },
+            ClientFrame::Close { session_id: "s".into(), force: false, attached: false },
+            ClientFrame::Pin { session_id: "s".into(), on: true },
+            ClientFrame::Pin { session_id: "s".into(), on: false },
+            ClientFrame::AuthState(agent_core::auth::AuthStateQuery::default()),
+            ClientFrame::AuthState(agent_core::auth::AuthStateQuery {
+                provider: Some("anthropic".into()),
+                account: Some("b".into()),
+                clear: true,
+            }),
             ClientFrame::Bye,
         ];
         for f in frames {
@@ -1291,6 +1658,7 @@ mod tests {
                 sessions: vec![meta()],
                 progressive_tool_disclosure: true,
                 generation: 1,
+                daemon_build: "abc1234".into(),
             }),
             DaemonFrame::Refused { reason: RefuseReason::Version { daemon_version: 2, min: 2, max: 2 }, message: "no".into() },
             DaemonFrame::Refused { reason: RefuseReason::ReloadRefused { why: "older".into() }, message: "no".into() },
@@ -1312,9 +1680,13 @@ mod tests {
             )),
             DaemonFrame::Event(env(SessionEventWire::SystemNotice("x".into())).into()),
             DaemonFrame::Error { session_id: None, message: "e".into() },
+            DaemonFrame::Closed { session_id: "s".into(), text: "closed".into() },
+            DaemonFrame::Pinned { session_id: "s".into(), on: true },
+            DaemonFrame::Pinned { session_id: "s".into(), on: false },
             DaemonFrame::Bye { reason: None },
             DaemonFrame::Bye { reason: Some(ByeReason::Reloading { generation: 2, retry_after_ms: 500 }) },
             DaemonFrame::Bye { reason: Some(ByeReason::Shutdown) },
+            DaemonFrame::AuthState { report: auth_state_report() },
         ];
         for f in frames {
             let line = encode_line(&f).unwrap();
@@ -1347,6 +1719,49 @@ mod tests {
     }
 
     #[test]
+    fn close_defaults_force_off_and_older_daemons_reject_it_as_an_unknown_variant() {
+        let f: ClientFrame = decode_line(r#"{"type":"close","session_id":"s"}"#).unwrap();
+        assert!(matches!(f, ClientFrame::Close { ref session_id, force: false, attached: false } if session_id.as_str() == "s"));
+        // A daemon built before `Close` decodes into an enum without it; the
+        // client keys "daemon too old" on this exact serde wording.
+        #[derive(Debug, Deserialize)]
+        #[serde(tag = "type", rename_all = "snake_case")]
+        enum OldClientFrame {
+            Ping,
+            Purge,
+        }
+        let err = decode_line::<OldClientFrame>(r#"{"type":"close","session_id":"s","force":true}"#).unwrap_err();
+        assert!(err.contains("unknown variant `close`"), "{err}");
+    }
+
+    #[test]
+    fn pin_requires_on_and_older_daemons_reject_it_as_an_unknown_variant() {
+        let f: ClientFrame = decode_line(r#"{"type":"pin","session_id":"s","on":false}"#).unwrap();
+        assert!(matches!(f, ClientFrame::Pin { ref session_id, on: false } if session_id.as_str() == "s"));
+        assert!(decode_line::<ClientFrame>(r#"{"type":"pin","session_id":"s"}"#).is_err());
+        #[derive(Debug, Deserialize)]
+        #[serde(tag = "type", rename_all = "snake_case")]
+        enum OldClientFrame {
+            Ping,
+            Purge,
+        }
+        let err = decode_line::<OldClientFrame>(r#"{"type":"pin","session_id":"s","on":true}"#).unwrap_err();
+        assert!(err.contains("unknown variant `pin`"), "{err}");
+    }
+
+    #[test]
+    fn a_session_meta_without_pinned_decodes_as_not_pinned() {
+        let mut v = serde_json::to_value(meta()).unwrap();
+        v.as_object_mut().unwrap().remove("pinned");
+        let m: SessionMeta = serde_json::from_value(v).unwrap();
+        assert!(!m.pinned);
+        let mut pinned = meta();
+        pinned.pinned = true;
+        let back: SessionMeta = serde_json::from_value(serde_json::to_value(&pinned).unwrap()).unwrap();
+        assert!(back.pinned);
+    }
+
+    #[test]
     fn debug_redacts_answer_and_submit_bodies() {
         let secret = "hunter2-very-secret";
         let f = ClientFrame::Cmd {
@@ -1372,9 +1787,11 @@ mod tests {
 
     #[test]
     fn oversize_frame_rejected_both_directions() {
-        assert!(DAEMON_MAX_FRAME_BYTES > RPC_MAX_FRAME_BYTES);
+        const { assert!(DAEMON_MAX_FRAME_BYTES > RPC_MAX_FRAME_BYTES) };
         let big = "x".repeat(DAEMON_MAX_FRAME_BYTES + 1);
-        assert!(decode_line::<ClientFrame>(&big).unwrap_err().contains("64 MiB"));
+        assert!(decode_line::<ClientFrame>(&big)
+            .unwrap_err()
+            .contains("64 MiB"));
         // encode side: a frame that would serialise past the cap is refused
         let f = DaemonFrame::Error { session_id: None, message: big };
         assert!(encode_line(&f).unwrap_err().contains("64 MiB"));
@@ -1382,6 +1799,15 @@ mod tests {
         let f = DaemonFrame::Error { session_id: None, message: "y".repeat(RPC_MAX_FRAME_BYTES * 2) };
         let line = encode_line(&f).unwrap();
         assert!(decode_line::<DaemonFrame>(line.trim_end()).is_ok());
+    }
+
+    #[test]
+    fn build_id_is_set_once_by_the_binary() {
+        // The only caller in this test binary; `main` is the only one in `synaps`.
+        set_build_id(" abc1234-dirty \n");
+        assert_eq!(build_id(), "abc1234-dirty");
+        set_build_id("later");
+        assert_eq!(build_id(), "abc1234-dirty", "first call wins");
     }
 
     #[test]
@@ -1395,6 +1821,7 @@ mod tests {
             sessions: vec![meta()],
             progressive_tool_disclosure: false,
             generation: 1,
+            daemon_build: String::new(),
         })
         .unwrap()
         .to_lowercase();

@@ -29,13 +29,16 @@ type Reader = BufReader<OwnedReadHalf>;
 /// is 0600 same-uid, so this is a footgun guard, not an auth boundary:
 /// anything that drives the actor's *own* bookkeeping (`Attach`, `Detach`
 /// for another client, `Resync`, `HostEvent`) or ends the session for every
-/// other client (`End`) is refused with an `Error` frame. Ending a session
-/// is `daemon stop`'s job today.
+/// other client with a host reason (`End`) is refused with an `Error` frame.
+/// The owner ends a session with `/close` (an engine command, checked by the
+/// actor); `daemon close` does it from a control connection
+/// (`ClientFrame::Close`), `daemon stop` for every session.
 fn client_may_send(cmd: &SessionCommand, own: ClientId) -> Result<(), &'static str> {
     use SessionCommand as C;
     match cmd {
         C::Submit { .. }
         | C::Steer { .. }
+        | C::SubagentSteer { .. }
         | C::Cancel
         | C::Answer { .. }
         | C::Set { .. }
@@ -47,8 +50,13 @@ fn client_may_send(cmd: &SessionCommand, own: ClientId) -> Result<(), &'static s
         | C::SubmitPrepared { .. }
         | C::PluginCommand { .. }
         | C::Resume { .. }
-        | C::Checkpoint { .. }
         | C::KeepWarm { .. } => Ok(()),
+        // A reload checkpoint stops every worker and fences the session
+        // for the exec that follows: only the daemon's own reload sends it.
+        C::Checkpoint { reason: crate::session::CheckpointReason::Reload } => {
+            Err("checkpoint(reload): host-only (use `synaps daemon reload`)")
+        }
+        C::Checkpoint { .. } => Ok(()),
         C::Detach { client } if *client == own => Ok(()),
         C::Detach { .. } => Err("detach: not your client id"),
         C::Attach { .. } => Err("attach: already attached (one session per connection)"),
@@ -58,9 +66,27 @@ fn client_may_send(cmd: &SessionCommand, own: ClientId) -> Result<(), &'static s
         C::End { .. } => Err("end: only ClientQuit may come from a client (host reasons are the daemon's)"),
         C::Resync { .. } => Err("resync: not a client command"),
         C::Park => Err("park: not a client command"),
+        C::AdoptWorkers { .. } => Err("adopt_workers: not a client command"),
+        C::RestoreToolActivations { .. } => Err("restore_tool_activations: not a client command"),
+        C::ReloadAborted => Err("reload_aborted: not a client command"),
         C::HostEvent(_) => Err("host_event: not a client command"),
         C::DriverStart { .. } => Ok(()),
     }
+}
+
+/// Refused at the connection while a reload is in progress — from the drain
+/// on, before the session is even checkpointed. `SessionCommand::
+/// refused_while_reloading` minus what the drain must still allow: a
+/// `Steer`, `Set` or engine command for the turn the drain is waiting to
+/// finish. The actor's reload fence refuses those once it has checkpointed
+/// (it alone knows whether a `Steer` would start a turn).
+fn refused_while_draining(cmd: &SessionCommand) -> bool {
+    use SessionCommand as C;
+    cmd.refused_while_reloading()
+        && !matches!(
+            cmd,
+            C::Steer { .. } | C::SubagentSteer { .. } | C::Set { .. } | C::EngineCommand { .. } | C::KeepWarm { .. }
+        )
 }
 
 enum Read {
@@ -182,6 +208,7 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
         sessions: state.session_metas(),
         progressive_tool_disclosure: state.host.parts().progressive_tool_disclosure,
         generation: state.generation,
+        daemon_build: crate::session::wire::build_id().to_string(),
     };
     if tx.send(DaemonFrame::Welcome(welcome)).await.is_err() {
         return;
@@ -202,6 +229,8 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
         };
         match frame {
             Ok(Read::Frame(ClientFrame::Ping)) => {
+                // `daemon status` and `daemon reload` read daemon.json after a Ping.
+                state.heal_daemon_json();
                 let _ = tx
                     .send(DaemonFrame::Pong { pid: std::process::id(), uptime_s: state.uptime_s(), sessions: state.live_sessions().len() })
                     .await;
@@ -245,12 +274,30 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
                         // Tell the requester, flush, close — then exec.
                         let _ = tx.send(DaemonFrame::Bye { reason: Some(reload_bye(&state)) }).await;
                         drop(tx);
-                        let _ = tokio::time::timeout(Duration::from_secs(1), writer).await;
-                        let e = super::reload::exec(&state, &state.paths, prepared).await;
+                        let _ = tokio::time::timeout(
+                            Duration::from_secs(crate::session::budgets::RELOAD_BYE_FLUSH_SECS),
+                            writer,
+                        )
+                        .await;
+                        let e = super::reload::exec(&state, prepared).await;
                         tracing::error!(error = %e, "daemon: reload did not exec");
                         return;
                     }
                 }
+            }
+            // `daemon close`: end one session with host authority. A
+            // refusal is terminal (the writer closes after `Refused`).
+            Ok(Read::Frame(ClientFrame::Close { session_id, force, attached })) => {
+                tracing::info!(session = %session_id, force, attached, "daemon: close requested over the socket");
+                let reply = super::close::close_session(&state, &session_id, force, attached).await;
+                let _ = tx.send(reply).await;
+            }
+            // `daemon pin`: pin/unpin one session with host authority. A
+            // refusal is terminal, like `Close`.
+            Ok(Read::Frame(ClientFrame::Pin { session_id, on })) => {
+                tracing::info!(session = %session_id, on, "daemon: pin requested over the socket");
+                let reply = super::pin::pin_session(&state, &session_id, on).await;
+                let _ = tx.send(reply).await;
             }
             // C2: jemalloc purge in the daemon (bench hygiene); reply Pong.
             Ok(Read::Frame(ClientFrame::Purge)) => {
@@ -258,6 +305,10 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
                 let _ = tx
                     .send(DaemonFrame::Pong { pid: std::process::id(), uptime_s: state.uptime_s(), sessions: state.live_sessions().len() })
                     .await;
+            }
+            // `synaps auth state`: the host broker's in-memory account state.
+            Ok(Read::Frame(ClientFrame::AuthState(query))) => {
+                let _ = tx.send(auth_state_reply(&state, &query)).await;
             }
             Ok(Read::Frame(ClientFrame::Hello(_))) => {
                 let _ = tx.send(DaemonFrame::Error { session_id: None, message: "duplicate hello".into() }).await;
@@ -295,6 +346,10 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
             }
         },
         Attach::Create { mut config, mode } => {
+            // Recorded by the actor from `/memory` (and carried by reload's
+            // rehydrate, which does not come through here); a client turns
+            // memory on or off with `/memory`, not by create config.
+            config.memory_mode = None;
             if config.cwd.is_none() {
                 config.cwd = Some(hello.cwd.clone());
             }
@@ -380,6 +435,7 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
             return;
         }
     };
+    let snapshot = replay_for(hello.client.capabilities, snapshot);
     if tx.send(DaemonFrame::Attached(AttachedWire::new(client, snapshot))).await.is_err() {
         let _ = handle.send(SessionCommand::Detach { client }).await;
         return;
@@ -406,14 +462,8 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
     // Phase 4 §2.3: Digest clients never receive the per-round full history;
     // the `Conversation` digest the actor emits right after is what they key on.
     let history = hello.client.history;
-    let skip = move |env: &Envelope| -> bool {
-        matches!(env.event, SessionEventWire::Attached { .. })
-            || (history == HistoryMode::Digest
-                && matches!(
-                    env.event,
-                    SessionEventWire::Stream(StreamEvent::Session(SessionEvent::MessageHistory(_)))
-                ))
-    };
+    let caps = hello.client.capabilities;
+    let skip = move |env: &Envelope| -> bool { !forwarded(history, caps, env) };
     // Not tied to `shutdown`: on daemon stop the client must still see `Ended`.
     let mut forward = tokio::spawn(async move {
         loop {
@@ -487,10 +537,8 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
                     let _ = tx.send(DaemonFrame::Error { session_id: Some(sid.clone()), message: format!("refused: {why}") }).await;
                     continue;
                 }
-                if state.reloading.load(Ordering::SeqCst)
-                    && matches!(cmd, SessionCommand::Submit { .. } | SessionCommand::SubmitPrepared { .. } | SessionCommand::Compact { .. })
-                {
-                    let _ = tx.send(DaemonFrame::Error { session_id: Some(sid.clone()), message: "daemon reloading; retry in a moment".into() }).await;
+                if state.reloading.load(Ordering::SeqCst) && refused_while_draining(&cmd) {
+                    let _ = tx.send(DaemonFrame::Error { session_id: Some(sid.clone()), message: crate::session::RELOADING_REFUSAL.into() }).await;
                     continue;
                 }
                 match handle.send_from(client, cmd).await {
@@ -508,6 +556,8 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
                 }
             }
             Ok(Read::Frame(ClientFrame::Ping)) => {
+                // `daemon status` and `daemon reload` read daemon.json after a Ping.
+                state.heal_daemon_json();
                 let _ = tx
                     .send(DaemonFrame::Pong { pid: std::process::id(), uptime_s: state.uptime_s(), sessions: state.live_sessions().len() })
                     .await;
@@ -523,7 +573,13 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
             Ok(Read::Frame(ClientFrame::Attach(_))) | Ok(Read::Frame(ClientFrame::Hello(_))) => {
                 let _ = tx.send(DaemonFrame::Error { session_id: Some(sid.clone()), message: "already attached".into() }).await;
             }
-            Ok(Read::Frame(ClientFrame::Reload { .. })) | Ok(Read::Frame(ClientFrame::Purge)) => {
+            // An attached client closes its session with `/close` and pins
+            // it with `/pin`; `synaps auth state` is a control connection.
+            Ok(Read::Frame(ClientFrame::Reload { .. }))
+            | Ok(Read::Frame(ClientFrame::Purge))
+            | Ok(Read::Frame(ClientFrame::Close { .. }))
+            | Ok(Read::Frame(ClientFrame::Pin { .. }))
+            | Ok(Read::Frame(ClientFrame::AuthState(_))) => {
                 let _ = tx.send(DaemonFrame::Error { session_id: Some(sid.clone()), message: "control frames are not accepted on an attached connection".into() }).await;
             }
             Ok(Read::Frame(ClientFrame::Bye)) | Ok(Read::Eof) | Err(_) => break,
@@ -571,6 +627,15 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
                 let _ = forward.await;
             }
         }
+    } else if ended {
+        // The actor broadcast `Ended` before it dropped its queue, so it is
+        // in the forwarder's receiver: let it go out before the `Bye`, or the
+        // client sees EOF and never learns the session ended (`/close` from
+        // another client, `daemon close`, eviction).
+        if tokio::time::timeout(Duration::from_secs(1), &mut forward).await.is_err() {
+            forward.abort();
+            let _ = forward.await;
+        }
     } else {
         forward.abort();
         let _ = forward.await;
@@ -587,9 +652,132 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
     tracing::debug!(session = %sid, client = client.0, "daemon: client detached");
 }
 
+/// Whether the pump forwards `env` to this connection's client. Never the
+/// actor's `Attached` (the conn sends its own). Digest clients never get the
+/// per-round full history; the `Conversation` digest the actor emits right
+/// after is what they key on (phase 4 §2.3). And never an event the client
+/// cannot decode ([`client_decodes`]: an older client fails the whole frame).
+fn forwarded(history: HistoryMode, caps: ClientCapabilities, env: &Envelope) -> bool {
+    !(matches!(env.event, SessionEventWire::Attached { .. })
+        || (history == HistoryMode::Digest
+            && matches!(
+                env.event,
+                SessionEventWire::Stream(StreamEvent::Session(SessionEvent::MessageHistory(_)))
+            ))
+        || !client_decodes(caps, &env.event))
+}
+
+/// The attach snapshot as this client may receive it: its turn replay
+/// without events it cannot decode — one would sink the whole `Attached`
+/// frame, and with it every reconnect.
+fn replay_for(caps: ClientCapabilities, mut snapshot: AttachSnapshot) -> AttachSnapshot {
+    snapshot.replay.retain(|env| client_decodes(caps, &env.event));
+    snapshot
+}
+
 fn reload_bye(state: &DaemonState) -> ByeReason {
     ByeReason::Reloading {
         generation: state.reload_generation.load(Ordering::SeqCst),
         retry_after_ms: super::reload::RETRY_AFTER_MS,
+    }
+}
+
+/// `AuthState`: the in-memory account state of the broker on the host's
+/// token cache, which every session of this daemon uses. Same trust as the
+/// other control frames (the socket is the user's own). No network request,
+/// no refresh; a clear never writes the credential store.
+fn auth_state_reply(state: &DaemonState, query: &agent_core::auth::AuthStateQuery) -> DaemonFrame {
+    match agent_core::auth::local_auth_state(&state.host.parts().token_cache, query, true) {
+        Ok(report) => DaemonFrame::AuthState { report },
+        Err(e) => DaemonFrame::Error { session_id: None, message: format!("auth state: {e}") },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::CheckpointReason;
+
+    /// A reload checkpoint stops every worker and fences the session until
+    /// an exec that only the daemon's own reload performs: no client may
+    /// send one. A host-request checkpoint stays a client command.
+    #[test]
+    fn a_reload_checkpoint_is_host_only() {
+        let own = ClientId(1);
+        let reload = SessionCommand::Checkpoint { reason: CheckpointReason::Reload };
+        assert!(client_may_send(&reload, own).is_err());
+        let host = SessionCommand::Checkpoint { reason: CheckpointReason::HostRequest };
+        assert!(client_may_send(&host, own).is_ok());
+    }
+
+    fn stream_env(ev: StreamEvent) -> Envelope {
+        Envelope {
+            session_id: SessionId::from("s"),
+            seq: 1,
+            ts: chrono::Utc::now(),
+            event: SessionEventWire::Stream(ev),
+        }
+    }
+
+    /// An older client (no `tool_queue` capability) is never sent the queue
+    /// signals — live or in the attach replay — and still gets every other
+    /// event; a current client gets them all.
+    #[test]
+    fn queue_signals_are_only_forwarded_to_clients_that_opted_in() {
+        use crate::LlmEvent;
+        let queued = stream_env(StreamEvent::Llm(LlmEvent::ToolQueued { tool_id: "t2".into() }));
+        let started = stream_env(StreamEvent::Llm(LlmEvent::ToolStarted { tool_id: "t2".into() }));
+        let result = stream_env(StreamEvent::Llm(LlmEvent::ToolResult {
+            tool_id: "t1".into(),
+            result: "ok".into(),
+        }));
+        let old = ClientCapabilities::default();
+        let new = ClientCapabilities::current();
+        for history in [HistoryMode::Full, HistoryMode::Digest] {
+            assert!(!forwarded(history, old, &queued));
+            assert!(!forwarded(history, old, &started));
+            assert!(forwarded(history, old, &result));
+            assert!(forwarded(history, new, &queued));
+            assert!(forwarded(history, new, &started));
+            assert!(forwarded(history, new, &result));
+        }
+
+        let session = crate::session::handle::echo::meta_for(&SessionId::from("s"));
+        let snapshot = AttachSnapshot {
+            meta: session,
+            view: crate::session::handle::echo::view_for(),
+            conversation: Default::default(),
+            streaming: true,
+            replay: vec![queued.clone(), result.clone(), started.clone()],
+            pending_prompts: vec![],
+            clients: vec![],
+            input_owner: None,
+            display_tail: None,
+        };
+        let kinds = |s: &AttachSnapshot| -> Vec<String> {
+            s.replay
+                .iter()
+                .map(|e| match &e.event {
+                    SessionEventWire::Stream(StreamEvent::Llm(LlmEvent::ToolQueued { .. })) => "queued",
+                    SessionEventWire::Stream(StreamEvent::Llm(LlmEvent::ToolStarted { .. })) => "started",
+                    _ => "other",
+                })
+                .map(str::to_string)
+                .collect()
+        };
+        assert_eq!(kinds(&replay_for(old, snapshot.clone())), vec!["other"]);
+        assert_eq!(kinds(&replay_for(new, snapshot)), vec!["queued", "other", "started"]);
+    }
+
+    /// The drain gate refuses work that would start after the record, and
+    /// leaves what the turn being drained still needs.
+    #[test]
+    fn the_drain_gate_keeps_steering_the_running_turn() {
+        let submit = SessionCommand::Submit { text: "x".into(), attachments: vec![] };
+        assert!(refused_while_draining(&submit));
+        assert!(refused_while_draining(&SessionCommand::NewSession));
+        assert!(refused_while_draining(&SessionCommand::Resume { id: 1, query: "q".into() }));
+        assert!(!refused_while_draining(&SessionCommand::Steer { text: "x".into() }));
+        assert!(!refused_while_draining(&SessionCommand::Cancel));
     }
 }

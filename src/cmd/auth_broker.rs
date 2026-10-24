@@ -20,17 +20,34 @@
 //!
 //! TLS is served via `axum-server` (tls-rustls feature, rustls 0.23).
 //!
+//! ## Machine auth (#147 C1)
+//!
+//! Every credential endpoint requires `Authorization: Bearer <machine token>`.
+//! The token comes from `--machine-token-file` or `SYNAPS_BROKER_TOKEN`. A
+//! loopback bind with neither generates one into `<base_dir>/auth-broker.token`
+//! (0600, next to `auth.json`; reused on restart), and a local client whose
+//! endpoint is a loopback URL reads that file when it has no
+//! `auth.machine_token` / `SYNAPS_MACHINE_TOKEN`. A loopback broker also
+//! refuses any `Host` other than `127.0.0.1:<port>`, `localhost:<port>` or
+//! `[::1]:<port>` (DNS rebinding). Only a non-loopback bind with
+//! `--insecure-no-auth` runs without a token.
+//!
 //! Clients run `synaps` with `auth.remote_endpoint` pointed here; they fetch a
 //! token per request and never store the credential on their own disk.
 //!
 //! Endpoints:
-//!   GET  /healthz            -> { status }                 (no secret, non-200 if cred missing)
-//!   GET  /token?provider=X   -> { access_token, expires }  (machine-auth, OAuth providers ONLY)
-//!   POST /proxy              -> typed broker proxy         (machine-auth, static-key providers;
-//!                               the key is applied broker-side and never vended)
-//!   GET  /usage              -> Anthropic usage JSON       (machine-auth, typed operation; the
-//!                               OAuth token is resolved broker-side and never vended)
-//!   GET  /capabilities       -> provider status list       (machine-auth, no secret values)
+//!   GET  /healthz                         -> { status }   (no secret; 503 until ANY OAuth slot exists)
+//!   GET  /token?provider=X[&account=Y]    -> { access_token, expires, ttl_ms, account }
+//!                                            (machine-auth, OAuth providers ONLY, never Muse
+//!                                            (proxy-only, #216 I2); `account` is a
+//!                                            label, `default`, or `auto`; unknown → 404, malformed
+//!                                            → 400, no capacity → 503; never a fallback)
+//!   POST /proxy                           -> typed broker proxy (machine-auth; OAuth providers may
+//!                                            pin a slot as `provider@label`; keys never vended)
+//!   GET  /usage                           -> legacy raw Anthropic usage JSON (machine-auth)
+//!   GET  /usage/snapshot?provider&account -> normalized UsageSnapshot (machine-auth)
+//!   POST /accounts/cooldown               -> { provider, account, until_ms?, reason } (machine-auth)
+//!   GET  /capabilities                    -> provider status list incl. account rows (no secrets)
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -56,6 +73,16 @@ fn broker_provider(value: &str) -> Option<auth::OAuthProviderId> {
     let id: auth::OAuthProviderId = value.try_into().ok()?;
     let descriptor = auth::provider::registry().get(id).copied()?;
     (descriptor.broker_strategy == auth::BrokerCredentialStrategy::OAuthAccessToken).then_some(id)
+}
+
+/// Providers `/token` may vend an access token for: [`broker_provider`]
+/// minus Meta Muse (#216 I2). Muse is routed `BrokerProxy` and its stored
+/// `access` is a minted Model API key that is valid until it 401s, not a
+/// short-lived OAuth access token, so it never leaves the broker. `/proxy`
+/// (which does not consult this list) keeps serving Muse, and usage /
+/// cooldown endpoints keep using `broker_provider`.
+fn token_vending_provider(value: &str) -> Option<auth::OAuthProviderId> {
+    broker_provider(value).filter(|id| *id != auth::OAuthProviderId::Muse)
 }
 
 // ── TLS config types ─────────────────────────────────────────────────────────
@@ -158,13 +185,228 @@ pub fn validate_pem_pair(cert_pem: &[u8], key_pem: &[u8]) -> anyhow::Result<()> 
 #[derive(Clone)]
 struct BrokerState {
     /// Token clients must present as `Authorization: Bearer <token>`. `None`
-    /// disables auth (only safe on loopback or with explicit `--insecure-no-auth`).
+    /// disables auth: only a non-loopback bind with explicit
+    /// `--insecure-no-auth`. A loopback broker always has one (#147 C1).
     machine_token: Option<String>,
-    /// HTTP client used for the (central, single) token refresh to the provider.
-    client: reqwest::Client,
-    /// The in-process broker that owns static keys and executes proxied
-    /// requests. Raw keys never leave this boundary.
+    /// Loopback binds only: the hostnames a `Host` header may name
+    /// (`localhost`, `127.0.0.1`, `[::1]` and the bound IP), any port.
+    /// Anything else is refused before routing, so a DNS-rebinding page
+    /// (`Host: attacker.example`) cannot talk to the broker through the
+    /// victim's browser. The port is deliberately not checked: it adds no
+    /// protection and would break `ssh -L <other-port>:127.0.0.1:<port>`.
+    allowed_hosts: Option<Arc<[String]>>,
+    /// Where the expected machine token comes from, for actionable denial
+    /// logs (a path or an env var name; never the token).
+    token_source: Arc<str>,
+    /// The in-process broker that owns every credential (all providers and
+    /// account slots), refreshes them, and executes proxied requests. Raw
+    /// keys and refresh tokens never leave this boundary.
     local: Arc<auth::LocalBroker>,
+}
+
+/// Hostnames a loopback broker bound to `bind_ip` accepts in `Host`
+/// (compared without the port).
+fn loopback_allowed_hostnames(bind_ip: std::net::IpAddr) -> Vec<String> {
+    let mut names: Vec<String> = ["localhost", "127.0.0.1", "[::1]"]
+        .iter()
+        .map(|n| n.to_string())
+        .collect();
+    let bound = match bind_ip {
+        std::net::IpAddr::V4(ip) => ip.to_string(),
+        std::net::IpAddr::V6(ip) => format!("[{ip}]"),
+    };
+    if !names.contains(&bound) {
+        names.push(bound);
+    }
+    names
+}
+
+/// The hostname part of a `Host` / `:authority` value, if well-formed.
+fn host_header_hostname(value: &str) -> Option<String> {
+    let authority: axum::http::uri::Authority = value.parse().ok()?;
+    if authority.as_str().contains('@') {
+        return None; // userinfo has no place in a Host header
+    }
+    Some(authority.host().to_string())
+}
+
+/// Refuse any request whose `Host` (or HTTP/2 `:authority`) is not on the
+/// loopback allowlist. No-op for non-loopback binds.
+async fn host_guard(
+    State(st): State<BrokerState>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    if let Some(allowed) = st.allowed_hosts.as_deref() {
+        let host = req
+            .headers()
+            .get(axum::http::header::HOST)
+            .and_then(|v| v.to_str().ok())
+            .or_else(|| req.uri().authority().map(|a| a.as_str()))
+            .unwrap_or("");
+        let hostname = host_header_hostname(host);
+        if !hostname
+            .as_deref()
+            .is_some_and(|h| allowed.iter().any(|a| a.eq_ignore_ascii_case(h)))
+        {
+            eprintln!(
+                "[auth-broker] DENIED request with non-loopback Host ({} chars)",
+                host.len()
+            );
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({ "error": "host not allowed" })),
+            )
+                .into_response();
+        }
+    }
+    next.run(req).await
+}
+
+/// The machine token this broker will require. An explicit token (file or
+/// env) wins. A loopback bind with none uses (creating on first start) the
+/// 0600 token file at `token_path`, which local clients read automatically;
+/// `--insecure-no-auth` does not turn auth off on loopback. A non-loopback
+/// bind with none is refused unless `insecure_no_auth`.
+fn resolve_machine_token(
+    explicit: Option<String>,
+    is_loopback: bool,
+    insecure_no_auth: bool,
+    token_path: &std::path::Path,
+) -> anyhow::Result<Option<String>> {
+    if explicit.is_some() {
+        return Ok(explicit);
+    }
+    if is_loopback {
+        if insecure_no_auth {
+            eprintln!(
+                "[auth-broker] WARNING: --insecure-no-auth is ignored on a loopback bind; \
+                 a loopback broker always requires a machine token"
+            );
+        }
+        let (token, origin) = auth::load_or_create_broker_token(token_path).map_err(|e| {
+            anyhow::anyhow!("broker token file {}: {e}", token_path.display())
+        })?;
+        match origin {
+            auth::BrokerTokenOrigin::Rotated => eprintln!(
+                "[auth-broker] WARNING: {} was readable by other users, so its token may have \
+                 leaked. Generated a NEW token (0600). Restart or reload every client that \
+                 used the old one.",
+                token_path.display()
+            ),
+            auth::BrokerTokenOrigin::Created | auth::BrokerTokenOrigin::Loaded => eprintln!(
+                "[auth-broker] loopback machine token {} {} (0600; local clients read it automatically)",
+                if origin == auth::BrokerTokenOrigin::Created {
+                    "generated at"
+                } else {
+                    "loaded from"
+                },
+                token_path.display()
+            ),
+        }
+        return Ok(Some(token));
+    }
+    if !insecure_no_auth {
+        anyhow::bail!(
+            "refusing to start: no machine token (set --machine-token-file / \
+             SYNAPS_BROKER_TOKEN) while bound to a non-loopback address. That would serve \
+             credentials unauthenticated to the network. Pass --insecure-no-auth to override, \
+             or bind 127.0.0.1."
+        );
+    }
+    Ok(None)
+}
+
+/// 401 for a request that failed machine auth, with an actionable log line
+/// (prA I2): old clients can't explain a bare 401, so the broker does. The
+/// token itself is never logged or echoed.
+fn deny_machine_auth(
+    st: &BrokerState,
+    headers: &HeaderMap,
+    route: &str,
+    peer: Option<std::net::IpAddr>,
+) -> axum::response::Response {
+    let presented = headers.get("authorization").is_some();
+    let peer_label = peer.map_or_else(|| "a client".to_string(), |ip| ip.to_string());
+    // Rate-limited (prA R2-m6) per (reason, route, peer): a retrying old
+    // client can't flood the log, and each route still names its peer.
+    let key = denial_key(presented, route, peer);
+    if let Some(suppressed) = denial_advisory_due(&DENIAL_LOG, &key, std::time::Instant::now(), DENIAL_LOG_EVERY) {
+        let also = if suppressed > 0 {
+            format!(" ({suppressed} similar denials suppressed in the last minute)")
+        } else {
+            String::new()
+        };
+        if presented {
+            eprintln!(
+                "[auth-broker] DENIED {route} from {peer_label} (wrong machine token){also}. The \
+                 expected token is {}; if it was regenerated, restart or reload the client.",
+                st.token_source
+            );
+        } else {
+            eprintln!(
+                "[auth-broker] DENIED {route} from {peer_label} (no machine token presented){also}. \
+                 Clients must set auth.machine_token or SYNAPS_MACHINE_TOKEN to the token in {}. \
+                 Clients older than this broker, or running as another user or base dir, do not \
+                 pick it up automatically; restart or reload clients after it changes.",
+                st.token_source
+            );
+        }
+    }
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(json!({
+            "error": "bad machine auth",
+            "hint": "set auth.machine_token or SYNAPS_MACHINE_TOKEN to the broker's machine token \
+                     (a loopback broker writes it to auth-broker.token in its base dir); restart \
+                     or reload the client after it changes",
+        })),
+    )
+        .into_response()
+}
+
+/// Rate-limit key for a 401 advisory: (missing|wrong token, route, peer).
+fn denial_key(presented: bool, route: &str, peer: Option<std::net::IpAddr>) -> String {
+    let reason = if presented { "wrong" } else { "missing" };
+    let peer = peer.map_or_else(|| "-".to_string(), |ip| ip.to_string());
+    format!("{reason}|{route}|{peer}")
+}
+
+/// One advisory per (reason, route, peer) per this interval.
+const DENIAL_LOG_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
+
+type DenialLog = std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, u64)>>;
+
+static DENIAL_LOG: std::sync::LazyLock<DenialLog> = std::sync::LazyLock::new(Default::default);
+
+/// Whether the advisory for `key` should be logged now. `Some(n)`: log it,
+/// `n` similar denials were suppressed since the last one; `None`: suppress.
+fn denial_advisory_due(
+    log: &DenialLog,
+    key: &str,
+    now: std::time::Instant,
+    every: std::time::Duration,
+) -> Option<u64> {
+    let mut log = log.lock().unwrap_or_else(|e| e.into_inner());
+    if log.len() > 1024 {
+        log.retain(|_, (at, _)| now.duration_since(*at) < every);
+    }
+    match log.get_mut(key) {
+        Some((at, suppressed)) if now.duration_since(*at) < every => {
+            *suppressed += 1;
+            None
+        }
+        Some((at, suppressed)) => {
+            let n = *suppressed;
+            *at = now;
+            *suppressed = 0;
+            Some(n)
+        }
+        None => {
+            log.insert(key.to_string(), (now, 0));
+            Some(0)
+        }
+    }
 }
 
 /// Constant-time machine-auth check shared by every credential endpoint.
@@ -183,6 +425,26 @@ fn machine_auth_ok(st: &BrokerState, headers: &HeaderMap) -> bool {
 #[derive(Deserialize)]
 struct TokenQuery {
     provider: Option<String>,
+    /// `default`, a label, or `auto`. Absent → the broker host's policy.
+    account: Option<String>,
+    /// Model hint for capacity-aware `auto` selection.
+    model: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct UsageSnapshotQuery {
+    provider: Option<String>,
+    account: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct CooldownReport {
+    provider: String,
+    account: String,
+    #[serde(default)]
+    until_ms: Option<u64>,
+    #[serde(default)]
+    reason: Option<String>,
 }
 
 /// Constant-time byte comparison — avoids a timing oracle on the machine token.
@@ -280,21 +542,29 @@ pub async fn run(
         BindDecision::Http { warn: false } | BindDecision::Tls => {}
     }
 
-    // B2: refuse to start unauthenticated on a non-loopback bind unless the
-    // operator explicitly opts in.
-    if machine_token.is_none() && !addr.ip().is_loopback() && !insecure_no_auth {
-        anyhow::bail!(
-            "refusing to start: no machine token (set --machine-token-file / \
-             SYNAPS_BROKER_TOKEN) while bound to non-loopback {addr}. That would serve credentials \
-             unauthenticated to the network. Pass --insecure-no-auth to override, or bind 127.0.0.1."
-        );
-    }
+    // B2 + #147 C1: a loopback broker always requires a machine token
+    // (auto-generated next to auth.json when none is configured); a
+    // non-loopback bind without one is refused unless explicitly opted in.
+    let local_token_path = auth::local_broker_token_path();
+    let token_source: Arc<str> = match (&machine_token_file, machine_token.is_some()) {
+        (Some(path), _) => format!("the --machine-token-file {}", path.display()).into(),
+        (None, true) => "SYNAPS_BROKER_TOKEN on the broker host".into(),
+        (None, false) => format!("{} on the broker host", local_token_path.display()).into(),
+    };
+    let machine_token = resolve_machine_token(
+        machine_token,
+        addr.ip().is_loopback(),
+        insecure_no_auth,
+        &local_token_path,
+    )?;
 
-    // D1: fail fast if the credential isn't present/readable.
-    match auth::load_auth() {
-        Ok(Some(_)) => {}
-        Ok(None) => anyhow::bail!(
-            "no credential at {}. Run `synaps login` on the broker host first.",
+    // D1: fail fast if no OAuth credential of ANY provider/account is
+    // present or the store is unreadable. Codex-only, Kimi-only, or
+    // named-slot-only installations are valid broker hosts.
+    match auth::any_oauth_credential_present() {
+        Ok(true) => {}
+        Ok(false) => anyhow::bail!(
+            "no OAuth credential at {}. Run `synaps login --provider <id> [--account <label>]` on the broker host first.",
             auth::auth_file_path().display()
         ),
         Err(e) => anyhow::bail!("credential unreadable/corrupt: {e}"),
@@ -309,19 +579,37 @@ pub async fn run(
 
     let state = BrokerState {
         machine_token: machine_token.clone(),
-        client: client.clone(),
+        allowed_hosts: addr
+            .ip()
+            .is_loopback()
+            .then(|| Arc::from(loopback_allowed_hostnames(addr.ip()))),
+        token_source,
         local: Arc::new(auth::LocalBroker::new(client.clone())),
     };
 
-    // Proactive refresh, SUPERVISED.
+    // Proactive refresh of EVERY stored OAuth slot, SUPERVISED. Each slot
+    // refreshes independently (own gate + cross-process lock); one failing
+    // account never blocks the others. Log lines carry labels only.
     {
         let refresh_client = client;
         let handle = tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(60));
             loop {
                 tick.tick().await;
-                if let Err(e) = auth::ensure_fresh_token(&refresh_client).await {
-                    eprintln!("[auth-broker] proactive refresh failed: {e}");
+                let accounts = match auth::list_all_accounts() {
+                    Ok(list) => list,
+                    Err(e) => {
+                        eprintln!("[auth-broker] proactive refresh: cannot list accounts: {e}");
+                        continue;
+                    }
+                };
+                for summary in accounts {
+                    let Some(cred) = summary.credential_ref() else {
+                        continue;
+                    };
+                    if let Err(e) = auth::ensure_fresh_credential(&refresh_client, &cred).await {
+                        eprintln!("[auth-broker] proactive refresh failed for {cred}: {e}");
+                    }
                 }
             }
         });
@@ -341,7 +629,7 @@ pub async fn run(
                 if machine_token.is_some() {
                     "ON"
                 } else {
-                    "OFF — loopback/insecure only!"
+                    "OFF — --insecure-no-auth!"
                 }
             );
             let tls_cfg = tls.expect("Tls decision requires tls config");
@@ -374,7 +662,7 @@ pub async fn run(
                 if machine_token.is_some() {
                     "ON"
                 } else {
-                    "OFF — loopback/insecure only!"
+                    "OFF — --insecure-no-auth!"
                 }
             );
             let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -399,11 +687,11 @@ fn build_router_with_cloud_backend(
     machine_token: Option<String>,
     backend: Arc<dyn auth::broker::CloudBackend>,
 ) -> Router {
-    let client = reqwest::Client::new();
-    let local = auth::LocalBroker::new(client.clone()).with_cloud_backend(backend);
+    let local = auth::LocalBroker::new(reqwest::Client::new()).with_cloud_backend(backend);
     build_router(BrokerState {
         machine_token,
-        client,
+        allowed_hosts: None,
+        token_source: Arc::from("test"),
         local: Arc::new(local),
     })
 }
@@ -415,6 +703,8 @@ fn build_router(state: BrokerState) -> Router {
         .route("/token", get(token))
         .route("/proxy", post(proxy))
         .route("/usage", get(usage))
+        .route("/usage/snapshot", get(usage_snapshot))
+        .route("/accounts/cooldown", post(accounts_cooldown))
         .route("/cloud/catalog", post(cloud_catalog))
         .route("/cloud/invoke", post(cloud_invoke))
         .route("/capabilities", get(capabilities))
@@ -424,6 +714,8 @@ fn build_router(state: BrokerState) -> Router {
         ))
         // B7: cap concurrent in-flight requests.
         .layer(tower::limit::ConcurrencyLimitLayer::new(64))
+        // #147 C1: loopback Host allowlist runs before every route.
+        .layer(axum::middleware::from_fn_with_state(state.clone(), host_guard))
         .with_state(state)
 }
 
@@ -454,9 +746,9 @@ async fn shutdown_signal() {
 /// Liveness + credential readiness. Returns non-200 when the credential is
 /// missing/corrupt so monitors actually catch it.
 async fn healthz() -> impl IntoResponse {
-    match auth::load_auth() {
-        Ok(Some(_)) => (StatusCode::OK, Json(json!({ "status": "ok" }))),
-        Ok(None) => (
+    match auth::any_oauth_credential_present() {
+        Ok(true) => (StatusCode::OK, Json(json!({ "status": "ok" }))),
+        Ok(false) => (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({ "status": "no_credential" })),
         ),
@@ -476,17 +768,12 @@ async fn token(
 ) -> impl IntoResponse {
     // ── machine auth (constant-time) ──
     if !machine_auth_ok(&st, &headers) {
-        eprintln!("[auth-broker] DENIED from {} (bad machine auth)", peer.ip());
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({ "error": "bad machine auth" })),
-        )
-            .into_response();
+        return deny_machine_auth(&st, &headers, "/token", Some(peer.ip()));
     }
 
     // ── provider allowlist ──
     let provider = q.provider.unwrap_or_else(|| "anthropic".to_string());
-    let Some(provider_id) = broker_provider(&provider) else {
+    let Some(provider_id) = token_vending_provider(&provider) else {
         eprintln!(
             "[auth-broker] DENIED from {} (provider not allowed, {} chars)",
             peer.ip(),
@@ -499,41 +786,84 @@ async fn token(
             .into_response();
     };
 
-    let creds = if provider_id == auth::OAuthProviderId::Anthropic {
-        auth::ensure_fresh_token(&st.client).await
-    } else {
-        auth::ensure_fresh_provider_token(&st.client, provider_id).await
+    // ── account selection ──
+    // Absent → this host's policy. `auto` → capacity selection here (the
+    // client's own policy said auto). Anything else must be `default` or a
+    // valid label; an unknown slot is 404 — never served from another slot.
+    use synaps_cli::auth::CredentialBroker;
+    let model = q.model.as_deref().filter(|m| !m.trim().is_empty());
+    let pinned = match q.account.as_deref() {
+        None => st.local.access_token_pinned_for(provider_id, model).await,
+        Some(auth::AUTO_ACCOUNT_NAME) => st.local.access_token_auto(provider_id, model).await,
+        Some(raw) => match auth::Account::parse(raw) {
+            Ok(account) => {
+                let cred = auth::CredentialRef::new(provider_id, account);
+                st.local
+                    .access_token_for(&cred)
+                    .await
+                    .map(|token| auth::PinnedToken {
+                        credential: cred,
+                        token,
+                    })
+            }
+            Err(e) => Err(auth::BrokerError::InvalidAccount(e)),
+        },
     };
 
-    match creds {
-        Ok(c) => {
+    match pinned {
+        Ok(p) => {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0);
-            let ttl_ms = c.expires.saturating_sub(now);
+            let ttl_ms = p.token.expires.saturating_sub(now);
             eprintln!(
-                "[auth-broker] issued {provider} token to {} (expires {})",
+                "[auth-broker] issued {} token to {} (expires {})",
+                p.credential,
                 peer.ip(),
-                c.expires
+                p.token.expires
             );
             (
                 StatusCode::OK,
-                Json(json!({ "access_token": c.access, "expires": c.expires, "ttl_ms": ttl_ms })),
+                Json(json!({
+                    "access_token": p.token.token,
+                    "expires": p.token.expires,
+                    "ttl_ms": ttl_ms,
+                    "account": p.credential.account.label_str(),
+                })),
             )
                 .into_response()
         }
         Err(e) => {
+            // BrokerError Display is secret-free by contract; the wire body
+            // stays generic for credential failures.
             eprintln!(
-                "[auth-broker] refresh failed for {provider} from {}: {}",
+                "[auth-broker] token request for {provider} from {} failed: {}",
                 peer.ip(),
                 e
             );
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": "token refresh failed" })),
-            )
-                .into_response()
+            match e {
+                auth::BrokerError::InvalidAccount(_) | auth::BrokerError::UnsupportedAccount { .. } => (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": "invalid account" })),
+                )
+                    .into_response(),
+                auth::BrokerError::UnknownAccount { .. } => (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({ "error": "unknown account" })),
+                )
+                    .into_response(),
+                auth::BrokerError::NoAccountAvailable { .. } => (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({ "error": "no account available" })),
+                )
+                    .into_response(),
+                _ => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": "token refresh failed" })),
+                )
+                    .into_response(),
+            }
         }
     }
 }
@@ -545,15 +875,12 @@ async fn token(
 /// static key ever appears in a response — the broker attaches it upstream.
 async fn proxy(
     State(st): State<BrokerState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(request): Json<auth::ProxyRequest>,
 ) -> axum::response::Response {
     if !machine_auth_ok(&st, &headers) {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({ "error": "bad machine auth" })),
-        )
-            .into_response();
+        return deny_machine_auth(&st, &headers, "/proxy", Some(peer.ip()));
     }
     if let Err(e) = request.validate() {
         // BrokerError Display is secret-free by contract.
@@ -591,17 +918,104 @@ async fn proxy(
 /// behind the boundary and calls the pinned usage URL; clients receive usage
 /// JSON only. No token, refresh token, or URL choice ever crosses this
 /// endpoint — it is deliberately not a general OAuth proxy.
-async fn usage(State(st): State<BrokerState>, headers: HeaderMap) -> axum::response::Response {
+async fn usage(
+    State(st): State<BrokerState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> axum::response::Response {
     if !machine_auth_ok(&st, &headers) {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({ "error": "bad machine auth" })),
-        )
-            .into_response();
+        return deny_machine_auth(&st, &headers, "/usage", Some(peer.ip()));
     }
     use synaps_cli::auth::CredentialBroker;
     match st.local.anthropic_usage().await {
         Ok(value) => (StatusCode::OK, Json(value)).into_response(),
+        Err(e) => broker_error_response(e),
+    }
+}
+
+/// Normalized, secret-free usage snapshot for one `(provider, account)`.
+/// The token is resolved broker-side. `account` absent → this host's
+/// explicit policy selection (an `auto` policy is not a snapshot target).
+async fn usage_snapshot(
+    State(st): State<BrokerState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Query(q): Query<UsageSnapshotQuery>,
+) -> axum::response::Response {
+    if !machine_auth_ok(&st, &headers) {
+        return deny_machine_auth(&st, &headers, "/usage/snapshot", Some(peer.ip()));
+    }
+    use synaps_cli::auth::CredentialBroker;
+    let provider = q.provider.unwrap_or_else(|| "anthropic".to_string());
+    let Some(provider_id) = broker_provider(&provider) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "unknown provider" })),
+        )
+            .into_response();
+    };
+    let account = match q.account.as_deref() {
+        Some(raw) => match auth::Account::parse(raw) {
+            Ok(account) => account,
+            Err(_) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": "invalid account" })),
+                )
+                    .into_response()
+            }
+        },
+        None => match st.local.account_selector(provider_id) {
+            auth::AccountSelector::Account(account) => account,
+            _ => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": "account required" })),
+                )
+                    .into_response()
+            }
+        },
+    };
+    let cred = auth::CredentialRef::new(provider_id, account);
+    match st.local.usage(&cred).await {
+        Ok(snapshot) => (StatusCode::OK, Json(snapshot)).into_response(),
+        Err(e) => broker_error_response(e),
+    }
+}
+
+/// A client reports a provider limit for one account so `auto` selection on
+/// this host stops advertising it. Machine-auth; labels only.
+async fn accounts_cooldown(
+    State(st): State<BrokerState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(report): Json<CooldownReport>,
+) -> axum::response::Response {
+    if !machine_auth_ok(&st, &headers) {
+        return deny_machine_auth(&st, &headers, "/accounts/cooldown", Some(peer.ip()));
+    }
+    use synaps_cli::auth::CredentialBroker;
+    let Some(provider_id) = broker_provider(&report.provider) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "unknown provider" })),
+        )
+            .into_response();
+    };
+    let account = match auth::Account::parse(&report.account) {
+        Ok(account) => account,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "invalid account" })),
+            )
+                .into_response()
+        }
+    };
+    let cred = auth::CredentialRef::new(provider_id, account);
+    let reason = report.reason.as_deref().unwrap_or("client_report");
+    match st.local.report_cooldown(&cred, report.until_ms, reason).await {
+        Ok(()) => (StatusCode::OK, Json(json!({ "status": "ok" }))).into_response(),
         Err(e) => broker_error_response(e),
     }
 }
@@ -616,15 +1030,12 @@ struct CloudCatalogRequest {
 
 async fn cloud_catalog(
     State(st): State<BrokerState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(request): Json<CloudCatalogRequest>,
 ) -> axum::response::Response {
     if !machine_auth_ok(&st, &headers) {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({"error":"bad machine auth"})),
-        )
-            .into_response();
+        return deny_machine_auth(&st, &headers, "/cloud/catalog", Some(peer.ip()));
     }
     use synaps_cli::auth::CredentialBroker;
     match st
@@ -647,15 +1058,12 @@ struct CloudInvokeRequest {
 
 async fn cloud_invoke(
     State(st): State<BrokerState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(request): Json<CloudInvokeRequest>,
 ) -> axum::response::Response {
     if !machine_auth_ok(&st, &headers) {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({"error":"bad machine auth"})),
-        )
-            .into_response();
+        return deny_machine_auth(&st, &headers, "/cloud/invoke", Some(peer.ip()));
     }
     use synaps_cli::auth::CredentialBroker;
     match st
@@ -696,14 +1104,11 @@ async fn cloud_invoke(
 /// Non-secret provider capability/status list.
 async fn capabilities(
     State(st): State<BrokerState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> axum::response::Response {
     if !machine_auth_ok(&st, &headers) {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({ "error": "bad machine auth" })),
-        )
-            .into_response();
+        return deny_machine_auth(&st, &headers, "/capabilities", Some(peer.ip()));
     }
     use synaps_cli::auth::CredentialBroker;
     match st.local.capabilities().await {
@@ -717,8 +1122,12 @@ fn broker_error_response(e: auth::BrokerError) -> axum::response::Response {
     let status = match e {
         auth::BrokerError::UnknownProvider(_)
         | auth::BrokerError::Denied(_)
+        | auth::BrokerError::InvalidAccount(_)
+        | auth::BrokerError::UnsupportedAccount { .. }
         | auth::BrokerError::UnsupportedCapability { .. } => StatusCode::BAD_REQUEST,
         auth::BrokerError::NotConfigured(_) => StatusCode::FORBIDDEN,
+        auth::BrokerError::UnknownAccount { .. } => StatusCode::NOT_FOUND,
+        auth::BrokerError::NoAccountAvailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
         auth::BrokerError::Unauthorized => StatusCode::UNAUTHORIZED,
         _ => StatusCode::BAD_GATEWAY,
     };
@@ -1199,19 +1608,31 @@ mod tests {
         machine_token: Option<String>,
         local_upstream: Option<String>,
     ) -> String {
+        spawn_broker_service_with(machine_token, local_upstream, true).await
+    }
+
+    /// `loopback_host_check`: run the production loopback Host allowlist
+    /// for the bound port (what `run` installs for a loopback bind).
+    async fn spawn_broker_service_with(
+        machine_token: Option<String>,
+        local_upstream: Option<String>,
+        loopback_host_check: bool,
+    ) -> String {
         let client = reqwest::Client::new();
         let local = match local_upstream {
             Some(url) => auth::LocalBroker::with_local_base_url(client.clone(), url),
             None => auth::LocalBroker::new(client.clone()),
         };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
         let state = BrokerState {
             machine_token,
-            client,
+            allowed_hosts: loopback_host_check
+                .then(|| Arc::from(loopback_allowed_hostnames(addr.ip()))),
+            token_source: Arc::from("test"),
             local: Arc::new(local),
         };
         let app = build_router(state);
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             axum::serve(
                 listener,
@@ -1339,14 +1760,46 @@ mod tests {
         let caps: serde_json::Value = resp.json().await.unwrap();
         for row in caps.as_array().expect("array") {
             let obj = row.as_object().unwrap();
-            let mut fields: Vec<&str> = obj.keys().map(String::as_str).collect();
-            fields.sort_unstable();
-            assert_eq!(
-                fields,
-                vec!["configured", "key", "kind", "name"],
-                "capability rows carry status only — no credential fields"
-            );
+            for field in obj.keys() {
+                assert!(
+                    matches!(
+                        field.as_str(),
+                        "configured" | "key" | "kind" | "name" | "accounts"
+                    ),
+                    "capability rows carry status only — unexpected field {field}"
+                );
+            }
             assert!(obj["configured"].is_boolean());
+            // Account rows (OAuth providers only) are non-secret listing rows.
+            if let Some(accounts) = obj.get("accounts").and_then(|a| a.as_array()) {
+                for account in accounts {
+                    for field in account.as_object().unwrap().keys() {
+                        assert!(
+                            matches!(
+                                field.as_str(),
+                                "provider"
+                                    | "label"
+                                    | "identity"
+                                    | "account_id_prefix"
+                                    // Opaque SHA-256 over the provider account id
+                                    // (never token material); lets a client pin
+                                    // spending to exactly one listed seat.
+                                    | "seat_fingerprint"
+                                    | "expires"
+                                    | "added_at"
+                                    | "selected"
+                                    | "cooldown_until"
+                            ),
+                            "account rows must never carry credential fields: {field}"
+                        );
+                    }
+                    let prefix = account
+                        .get("account_id_prefix")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    assert!(prefix.len() <= 8, "account id must be a short prefix");
+                }
+            }
         }
     }
 
@@ -1376,6 +1829,372 @@ mod tests {
                 "no token material for {provider}"
             );
         }
+    }
+
+    // ── Loopback Host allowlist (DNS rebinding, #147 C1) ─────────────────────
+
+    async fn capabilities_with_host(base: &str, host: &str) -> u16 {
+        reqwest::Client::new()
+            .get(format!("{base}/capabilities"))
+            .header(reqwest::header::HOST, host)
+            .bearer_auth("machine-secret")
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16()
+    }
+
+    /// prA I4: the hostname is checked, the port is not (DNS rebinding sends
+    /// a foreign hostname; an `ssh -L 9000:127.0.0.1:<port>` forward sends
+    /// `Host: 127.0.0.1:9000` and must work).
+    #[tokio::test]
+    async fn loopback_broker_rejects_foreign_hostnames_but_not_other_ports() {
+        let base = spawn_broker_service(Some("machine-secret".into()), None).await;
+        let port = base.rsplit(':').next().unwrap().to_string();
+        for host in [
+            format!("127.0.0.1:{port}"),
+            format!("localhost:{port}"),
+            format!("LOCALHOST:{port}"),
+            format!("[::1]:{port}"),
+            "127.0.0.1:9000".to_string(),
+            "localhost:1".to_string(),
+            "localhost".to_string(),
+            "[::1]".to_string(),
+        ] {
+            assert_eq!(capabilities_with_host(&base, &host).await, 200, "{host}");
+        }
+        for host in [
+            format!("evil.example:{port}"),
+            "evil.example".to_string(),
+            format!("localhost.evil.example:{port}"),
+            format!("127.0.0.1.evil.example:{port}"),
+            format!("user@127.0.0.1:{port}"),
+            "127.0.0.2".to_string(),
+            String::new(),
+        ] {
+            assert_eq!(
+                capabilities_with_host(&base, &host).await,
+                403,
+                "rebinding Host {host:?} must be refused even with a valid token"
+            );
+        }
+        // Every route is covered, including the unauthenticated /healthz.
+        let resp = reqwest::Client::new()
+            .get(format!("{base}/healthz"))
+            .header(reqwest::header::HOST, "evil.example")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 403);
+        let body = resp.text().await.unwrap();
+        assert!(!body.contains("machine-secret"));
+    }
+
+    /// An HTTP/1.0 request with no Host header at all is refused.
+    #[tokio::test]
+    async fn loopback_broker_refuses_a_missing_host_header() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let base = spawn_broker_service(Some("machine-secret".into()), None).await;
+        let addr = base.trim_start_matches("http://");
+        let mut conn = tokio::net::TcpStream::connect(addr).await.unwrap();
+        conn.write_all(b"GET /healthz HTTP/1.0\r\n\r\n").await.unwrap();
+        let mut reply = String::new();
+        conn.read_to_string(&mut reply).await.unwrap();
+        assert!(
+            reply.starts_with("HTTP/1.0 403") || reply.starts_with("HTTP/1.1 403"),
+            "{reply}"
+        );
+    }
+
+    /// prA m6: a broker bound to another 127.x address accepts its own IP.
+    #[tokio::test]
+    async fn loopback_broker_on_another_127_address_accepts_its_bind_ip() {
+        let listener = match tokio::net::TcpListener::bind("127.0.0.2:0").await {
+            Ok(l) => l,
+            Err(_) => return, // platform without 127/8 aliasing (macOS)
+        };
+        let addr = listener.local_addr().unwrap();
+        let state = BrokerState {
+            machine_token: Some("machine-secret".into()),
+            allowed_hosts: Some(Arc::from(loopback_allowed_hostnames(addr.ip()))),
+            token_source: Arc::from("test"),
+            local: Arc::new(auth::LocalBroker::new(reqwest::Client::new())),
+        };
+        let app = build_router(state);
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+        let base = format!("http://{addr}");
+        assert_eq!(capabilities_with_host(&base, &addr.to_string()).await, 200);
+        assert_eq!(capabilities_with_host(&base, "127.0.0.3:1").await, 403);
+    }
+
+    #[tokio::test]
+    async fn host_allowlist_is_only_applied_to_loopback_binds() {
+        let base = spawn_broker_service_with(Some("machine-secret".into()), None, false).await;
+        assert_eq!(capabilities_with_host(&base, "broker.example:8181").await, 200);
+    }
+
+    #[test]
+    fn loopback_allowed_hostnames_cover_the_loopback_names_and_bind_ip() {
+        let v4: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        assert_eq!(
+            loopback_allowed_hostnames(v4),
+            vec!["localhost", "127.0.0.1", "[::1]"]
+        );
+        let other: std::net::IpAddr = "127.0.0.2".parse().unwrap();
+        assert!(loopback_allowed_hostnames(other).contains(&"127.0.0.2".to_string()));
+        assert_eq!(host_header_hostname("[::1]:8181").as_deref(), Some("[::1]"));
+        assert_eq!(host_header_hostname("LOCALHOST").as_deref(), Some("LOCALHOST"));
+        assert_eq!(host_header_hostname(""), None);
+    }
+
+    #[test]
+    fn denial_key_is_per_reason_route_and_peer() {
+        let a: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        let b: std::net::IpAddr = "10.0.0.2".parse().unwrap();
+        let k = denial_key(false, "/usage", Some(a));
+        assert_eq!(k, "missing|/usage|127.0.0.1");
+        assert_ne!(k, denial_key(false, "/capabilities", Some(a)), "per route");
+        assert_ne!(k, denial_key(false, "/usage", Some(b)), "per peer");
+        assert_ne!(k, denial_key(true, "/usage", Some(a)), "per reason");
+    }
+
+    #[test]
+    fn denial_advisory_is_rate_limited_per_reason_and_peer() {
+        let log = DenialLog::default();
+        let t0 = std::time::Instant::now();
+        let every = Duration::from_secs(60);
+        assert_eq!(denial_advisory_due(&log, "missing|127.0.0.1", t0, every), Some(0));
+        for i in 1..=50 {
+            let t = t0 + Duration::from_millis(i * 100);
+            assert_eq!(denial_advisory_due(&log, "missing|127.0.0.1", t, every), None);
+        }
+        // A different reason or peer is its own stream.
+        assert_eq!(denial_advisory_due(&log, "wrong|127.0.0.1", t0, every), Some(0));
+        assert_eq!(denial_advisory_due(&log, "missing|10.0.0.2", t0, every), Some(0));
+        // After the interval: logged again, with the suppressed count.
+        let later = t0 + Duration::from_secs(61);
+        assert_eq!(denial_advisory_due(&log, "missing|127.0.0.1", later, every), Some(50));
+        assert_eq!(denial_advisory_due(&log, "missing|127.0.0.1", later, every), None);
+    }
+
+    /// prA I2: a denied request gets an actionable hint and never the token.
+    #[tokio::test]
+    async fn machine_auth_denial_carries_a_hint_and_no_token() {
+        let base = spawn_broker_service(Some("machine-secret".into()), None).await;
+        let resp = reqwest::Client::new()
+            .get(format!("{base}/capabilities"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["error"], "bad machine auth");
+        let hint = body["hint"].as_str().unwrap();
+        assert!(
+            hint.contains("auth.machine_token") && hint.contains("SYNAPS_MACHINE_TOKEN"),
+            "{hint}"
+        );
+        assert!(hint.contains("auth-broker.token") && hint.contains("restart"), "{hint}");
+        assert!(!body.to_string().contains("machine-secret"));
+    }
+
+    // ── Loopback machine-token bootstrap (#147 C1) ───────────────────────────
+
+    #[test]
+    fn loopback_without_token_generates_one_and_remote_needs_explicit_opt_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth-broker.token");
+        let tok = resolve_machine_token(None, true, false, &path).unwrap();
+        let tok = tok.expect("loopback always has a machine token");
+        assert_eq!(std::fs::read_to_string(&path).unwrap().trim(), tok);
+        assert_eq!(
+            resolve_machine_token(None, true, false, &path).unwrap().as_deref(),
+            Some(tok.as_str()),
+            "restart reuses the token clients already read"
+        );
+        // --insecure-no-auth never turns auth off on loopback.
+        assert_eq!(
+            resolve_machine_token(None, true, true, &path).unwrap().as_deref(),
+            Some(tok.as_str())
+        );
+        // An explicit token wins and no file is consulted.
+        let other = dir.path().join("unused.token");
+        assert_eq!(
+            resolve_machine_token(Some("explicit".into()), true, false, &other)
+                .unwrap()
+                .as_deref(),
+            Some("explicit")
+        );
+        assert!(!other.exists());
+        // Non-loopback: unchanged — no token is refused unless opted out.
+        assert!(resolve_machine_token(None, false, false, &other).is_err());
+        assert_eq!(resolve_machine_token(None, false, true, &other).unwrap(), None);
+        assert!(!other.exists(), "never auto-generated for a network bind");
+    }
+
+    // ── /usage/snapshot and /accounts/cooldown machine auth (#147 I5) ───────
+    //
+    // With the right bearer the request reaches the handler's own validation
+    // (400 for a bad provider / account), which needs no credential store;
+    // without it, or with a wrong one, it is 401 before anything else runs.
+
+    async fn snapshot_status(base: &str, bearer: Option<&str>, query: &[(&str, &str)]) -> (u16, String) {
+        let mut req = reqwest::Client::new()
+            .get(format!("{base}/usage/snapshot"))
+            .query(query);
+        if let Some(b) = bearer {
+            req = req.bearer_auth(b);
+        }
+        let resp = req.send().await.unwrap();
+        (resp.status().as_u16(), resp.text().await.unwrap())
+    }
+
+    async fn cooldown_status(base: &str, bearer: Option<&str>, body: serde_json::Value) -> (u16, String) {
+        let mut req = reqwest::Client::new()
+            .post(format!("{base}/accounts/cooldown"))
+            .json(&body);
+        if let Some(b) = bearer {
+            req = req.bearer_auth(b);
+        }
+        let resp = req.send().await.unwrap();
+        (resp.status().as_u16(), resp.text().await.unwrap())
+    }
+
+    #[tokio::test]
+    async fn usage_snapshot_requires_machine_auth() {
+        let base = spawn_broker_service(Some("machine-secret".into()), None).await;
+        let q = [("provider", "anthropic"), ("account", "../bad")];
+        for bearer in [None, Some("wrong-token"), Some("machine-secret-but-longer")] {
+            let (status, body) = snapshot_status(&base, bearer, &q).await;
+            assert_eq!(status, 401, "{bearer:?}");
+            assert!(!body.contains("machine-secret"), "{body}");
+        }
+        let (status, body) = snapshot_status(&base, Some("machine-secret"), &q).await;
+        assert_eq!(status, 400, "authorized request reaches validation: {body}");
+        assert!(body.contains("invalid account"), "{body}");
+        let (status, _) = snapshot_status(
+            &base,
+            Some("machine-secret"),
+            &[("provider", "groq"), ("account", "default")],
+        )
+        .await;
+        assert_eq!(status, 400, "static-key provider is not a snapshot target");
+    }
+
+    #[tokio::test]
+    async fn accounts_cooldown_requires_machine_auth() {
+        let base = spawn_broker_service(Some("machine-secret".into()), None).await;
+        let body = json!({"provider": "anthropic", "account": "../bad", "reason": "t"});
+        for bearer in [None, Some("wrong-token")] {
+            let (status, text) = cooldown_status(&base, bearer, body.clone()).await;
+            assert_eq!(status, 401, "{bearer:?}");
+            assert!(!text.contains("machine-secret"), "{text}");
+        }
+        let (status, text) = cooldown_status(&base, Some("machine-secret"), body).await;
+        assert_eq!(status, 400, "authorized request reaches validation: {text}");
+        assert!(text.contains("invalid account"), "{text}");
+        let (status, text) = cooldown_status(
+            &base,
+            Some("machine-secret"),
+            json!({"provider": "groq", "account": "default"}),
+        )
+        .await;
+        assert_eq!(status, 400, "{text}");
+        assert!(text.contains("unknown provider"), "{text}");
+    }
+
+    /// Malformed `account` on `/token` is 400 from the real handler before
+    /// any credential lookup (unknown → 404 and auto → 503 need a store;
+    /// see tests/multi_account_cli.rs, which runs the production binary).
+    #[tokio::test]
+    async fn token_malformed_account_is_400() {
+        let base = spawn_broker_service(Some("machine-secret".into()), None).await;
+        for account in ["../bad", "Bad Label", "", "a/b"] {
+            let resp = reqwest::Client::new()
+                .get(format!("{base}/token"))
+                .query(&[("provider", "anthropic"), ("account", account)])
+                .bearer_auth("machine-secret")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 400, "{account:?}");
+            let body = resp.text().await.unwrap();
+            assert!(body.contains("invalid account") && !body.contains("access_token"), "{body}");
+        }
+    }
+
+    // ── Muse is proxy-only (#216 I2) ────────────────────────────────────────
+
+    /// The minted Muse Model API key never expires on its own and Muse is
+    /// routed BrokerProxy, so `/token` must never vend it — for any slot.
+    #[tokio::test]
+    async fn token_endpoint_never_vends_muse() {
+        let base = spawn_broker_service(Some("machine-secret".into()), None).await;
+        let client = reqwest::Client::new();
+        for query in [
+            vec![("provider", "muse")],
+            vec![("provider", "muse"), ("account", "default")],
+            vec![("provider", "muse"), ("account", "work")],
+            vec![("provider", "muse"), ("account", "auto")],
+        ] {
+            let resp = client
+                .get(format!("{base}/token"))
+                .query(&query)
+                .bearer_auth("machine-secret")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 400, "{query:?}");
+            let body = resp.text().await.unwrap();
+            assert!(!body.contains("access_token"), "{query:?}: {body}");
+        }
+    }
+
+    /// `/proxy` is unaffected: a Muse proxy request still reaches the Muse
+    /// endpoint policy (here: its allowlist refusing the key-mint path,
+    /// checked before any credential or network access).
+    #[tokio::test]
+    async fn proxy_still_routes_muse_requests() {
+        let base = spawn_broker_service(Some("machine-secret".into()), None).await;
+        let resp = reqwest::Client::new()
+            .post(format!("{base}/proxy"))
+            .bearer_auth("machine-secret")
+            .json(&json!({
+                "provider": "muse",
+                "method": "post",
+                "path": "/muse-code/key",
+                "body": {},
+                "stream": false,
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+        let body = resp.text().await.unwrap();
+        assert!(
+            !body.contains("unknown provider"),
+            "muse is still a proxy provider: {body}"
+        );
+        assert!(body.contains("allow"), "the Muse path allowlist answered: {body}");
+    }
+
+    #[test]
+    fn muse_is_excluded_from_token_vending_only() {
+        assert_eq!(token_vending_provider("muse"), None);
+        // Usage snapshots / cooldown reports keep their provider check.
+        assert_eq!(broker_provider("muse"), Some(auth::OAuthProviderId::Muse));
+        assert_eq!(
+            token_vending_provider("anthropic"),
+            Some(auth::OAuthProviderId::Anthropic)
+        );
     }
 
     #[test]

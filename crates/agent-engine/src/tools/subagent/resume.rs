@@ -124,6 +124,15 @@ fn prior_run(
         })?),
         None => None,
     };
+    // A startup-failure archive holds no conversation: resuming it would
+    // start the worker blank under a preamble claiming earlier work.
+    if let Some(a) = archive.as_ref().filter(|a| a.history.is_empty()) {
+        return Err(RuntimeError::Tool(format!(
+            "Subagent '{prior_handle_id}' has no conversation to resume: it exited before its \
+             first history checkpoint ({}). Start a new subagent instead.",
+            a.error.as_deref().unwrap_or(&a.status)
+        )));
+    }
     let (agent_name, model, system_prompt, timeout_secs) = match (live, &archive) {
         (Some(live), _) => live,
         (None, Some(a)) => (
@@ -199,7 +208,7 @@ impl Tool for SubagentResumeTool {
                 "timeout": {
                     "type": "integer",
                     "description": "Optional wall-clock limit in seconds for the resumed run \
-                                    (default: the prior run's); 0 = no limit."
+                                    (default: the prior run's); 0 = no limit. Positive values below 300s emit a warning; prefer at least 600s for API retries."
                 }
             },
             "required": ["handle_id", "instructions"]
@@ -236,6 +245,10 @@ impl Tool for SubagentResumeTool {
             prior.messages,
         );
         let timeout_secs = params["timeout"].as_u64().unwrap_or(prior.timeout_secs);
+        let timeout_warning = short_timeout_warning(timeout_secs);
+        if let Some(warning) = timeout_warning {
+            tracing::warn!(timeout_secs, warning, "short subagent resume timeout");
+        }
 
         // The inherited prior model is still re-authorized as an explicit exact
         // identity; a stale handle cannot bypass current session policy.
@@ -264,6 +277,7 @@ impl Tool for SubagentResumeTool {
         let model = decision.model.as_str().to_owned();
         let codex_parent_plan = ctx.capabilities.codex_parent_plan.clone();
         let memory_backend = ctx.capabilities.memory_backend.clone();
+        let session_allow_all = ctx.capabilities.session_allow_all.clone();
 
         tracing::info!(
             "subagent_resume: dispatching '{}' (id={}, resumed_from={}) model={}",
@@ -383,6 +397,7 @@ impl Tool for SubagentResumeTool {
                             &mut runtime,
                             &crate::config::load_config(),
                             memory_backend.as_ref(),
+                            session_allow_all.as_ref(),
                         );
                         runtime.set_system_prompt(super::compose_system_prompt(
                             system_prompt,
@@ -472,6 +487,13 @@ impl Tool for SubagentResumeTool {
                 start_time,
                 Some(&prior_handle_for_finalizer),
             );
+            // A cancelled worker publishes no wake, so nothing would ever
+            // prompt a collect: retire it before any terminal publication.
+            super::finalize::retire_if_cancelled(
+                &state_for_finalizer,
+                &orchestration_for_worker,
+                &handle_id_inner,
+            );
             // All terminal publications follow the recovery/finalization barrier.
             if let Some(ref tx) = tx_events_inner {
                 let s = state_for_finalizer
@@ -515,10 +537,14 @@ impl Tool for SubagentResumeTool {
                 .release_delegation(&handle_id, ctx.capabilities.delegation_parent.as_deref());
             return Err(RuntimeError::Tool(error));
         }
+        // The thread may have been cancelled and finalized before it was
+        // marked running; its own retire attempt was then too early.
+        super::finalize::retire_if_cancelled(&state, orchestration, &handle_id);
 
         Ok(json!({
             "handle_id":    handle_id,
             "resumed_from": prior_handle_id,
+            "warning": timeout_warning,
             "agent_name":   label,
             "status":       "running"
         })
@@ -582,8 +608,16 @@ mod tests {
                 {"type": "tool_result", "tool_use_id": "t1", "content": "rendered 300 frames"}
             ]})),
         ];
-        super::super::archive::write_archive(dir, id, &meta, "timed_out", "report", &history)
-            .unwrap()
+        super::super::archive::write_archive(
+            dir,
+            id,
+            &meta,
+            "timed_out",
+            Some("worker timed out"),
+            "report",
+            &history,
+        )
+        .unwrap()
     }
 
     fn assert_continues_archive(prior: &PriorRun, instructions: &str) {
@@ -731,6 +765,46 @@ mod tests {
     }
 
     #[test]
+    fn empty_history_archive_is_refused_not_resumed_blank() {
+        // A startup-failure archive (worker exited before its first
+        // checkpoint) is written with no history; resuming it would start
+        // the worker with nothing but a preamble claiming earlier work.
+        let dir = tempfile::tempdir().unwrap();
+        let meta = crate::runtime::subagent::SubagentArchiveMeta {
+            agent_name: "archived-label".into(),
+            model: "anthropic/claude-opus-5-5".into(),
+            system_prompt: "archived system".into(),
+            timeout_secs: 30,
+        };
+        let path = super::super::archive::write_archive(
+            dir.path(),
+            "sa_empty",
+            &meta,
+            "failed",
+            Some("provider refused the model"),
+            "",
+            &[],
+        )
+        .unwrap();
+        let registry = Mutex::new(SubagentRegistry::new());
+        let err = match prior_run(&registry, "sa_empty", Some(path.clone()), "go on") {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("empty archive resumed"),
+        };
+        assert!(err.contains("no conversation to resume"), "{err}");
+        assert!(err.contains("provider refused the model"), "{err}");
+        // Same through the registry (reaped handle, archive on record).
+        {
+            let mut reg = registry.lock().unwrap();
+            let mut h = finished_handle("sa_empty", SubagentStatus::Failed("x".into()), Some(path));
+            h.mark_collected();
+            reg.register(h);
+            reg.cleanup_finished_with_ttl(Duration::ZERO);
+        }
+        assert!(prior_run(&registry, "sa_empty", None, "go on").is_err());
+    }
+
+    #[test]
     fn legacy_handle_without_archive_pastes_prior_text() {
         let registry = Mutex::new(SubagentRegistry::new());
         registry.lock().unwrap().register(finished_handle(
@@ -813,5 +887,28 @@ mod tests {
         assert!(!error.contains("No subagent found"));
         assert_eq!(registry.lock().unwrap().list_active().len(), count_before);
         assert_eq!(orchestration.completion_gate(), gate_before);
+    }
+}
+
+/// Warn, never silently extend an explicitly requested wall-clock limit.
+fn short_timeout_warning(seconds: u64) -> Option<&'static str> {
+    (seconds > 0 && seconds < 300).then_some(
+        "Resume timeout is below 300s and may expire during upload or API retries; prefer at least 600s (0 disables the limit)."
+    )
+}
+
+#[cfg(test)]
+mod short_timeout_tests {
+    #[test]
+    fn only_short_positive_effective_limits_warn() {
+        for (seconds, warns) in [
+            (0, false),
+            (60, true),
+            (299, true),
+            (300, false),
+            (600, false),
+        ] {
+            assert_eq!(super::short_timeout_warning(seconds).is_some(), warns);
+        }
     }
 }

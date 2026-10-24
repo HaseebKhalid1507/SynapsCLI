@@ -13,6 +13,15 @@ exclude = [".github/", "docs/", "tests/fixtures/", "examples/"]
 rust-version = "1.80"
 
 [features]
+# Default build is unchanged (command execution enabled).
+# `cargo build --release --no-default-features` compiles the `bash`/`powershell`
+# tools out of the binary and never registers the interactive `shell_*` tools.
+# That is ALL it does; it is not a sandbox. The binary can still start
+# processes: `write`/`edit` can change shell rc files, `mcp.json`, plugin
+# manifests or watcher configs; watcher `wake_if` runs through `sh -c`; and
+# extensions, MCP servers and plugin commands all spawn processes.
+default = ["command-exec"]
+command-exec = ["agent-engine/command-exec"]
 testing = ["agent-tui/testing", "agent-engine/testing"]
 # Pre-actor inline `synaps chat` loop (A2 kill-switch, with SYNAPS_CHAT_INLINE=1). Deleted on day 3.
 legacy_inline = []
@@ -135,5 +144,8 @@ version = "0.10.2"
 
 [workspace.dependencies]
 agent-core   = { path = "crates/agent-core",   version = "0.10.2", package = "synaps-core" }
-agent-engine = { path = "crates/agent-engine", version = "0.10.2", package = "synaps-engine" }
+# default-features = false: the hardened gate. The root `synaps` package re-enables
+# `command-exec` through its own default feature; `--no-default-features` drops it
+# for EVERY member (workspace inheritance cannot re-enable defaults per member).
+agent-engine = { path = "crates/agent-engine", version = "0.10.2", package = "synaps-engine", default-features = false }
 agent-tui    = { path = "crates/agent-tui",    version = "0.10.2", package = "synaps-tui" }

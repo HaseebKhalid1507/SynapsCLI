@@ -30,11 +30,33 @@ use super::text_metrics::char_width;
 use super::theme::Theme;
 
 /// Most agent rows the tray shows; the rest collapse into one "+N more" row.
-const MAX_ROWS: usize = 6;
+pub(crate) const MAX_ROWS: usize = 6;
+
+/// The HUD entry (index into `App::subagents`) whose tray row is at screen
+/// row `y`, for a tray last painted over `tray` with `n` agents. Row 0 is
+/// the top rim; agent rows follow in order.
+pub(crate) fn row_at(tray: Rect, n: usize, x: u16, y: u16) -> Option<usize> {
+    if tray.height == 0 || x < tray.x || x >= tray.right() || y <= tray.y || y >= tray.bottom() {
+        return None;
+    }
+    let i = usize::from(y - tray.y - 1);
+    (i < n.min(MAX_ROWS)).then_some(i)
+}
 
 /// How far the tray sits from the chrome toward the slab body: recessed, so
 /// the input line stays the brightest surface in the band.
 const TRAY_DEPTH: f32 = 0.55;
+
+/// The row of the worker whose view is open (ctrl+↑/↓): the tray surface
+/// tinted toward the prompt's `❯` colour. While that view is open the input
+/// steers that worker, so the row takes the prompt's accent.
+const WATCHED_TINT: f32 = 0.14;
+
+/// The watched row's background over a tray `surface`.
+fn watched_bg(t: &Theme, surface: Rgb) -> Rgb {
+    let d = Theme::default();
+    mix(surface, rgb(t.prompt_fg, d.prompt_fg), WATCHED_TINT)
+}
 
 /// Rows the tray adds above the prompt for `n` agents: its top rim, then one
 /// row per agent (capped, plus "+N more"). Its bottom padding is the upper
@@ -49,7 +71,7 @@ pub(crate) fn tray_height(n: usize) -> u16 {
 // ───────────────────────────── colour ──────────────────────────────────────
 
 /// `c` pushed toward `toward` just until it reads at `target` on `bg`.
-fn legible(c: Rgb, toward: Rgb, bg: Rgb, target: f32) -> Rgb {
+pub(super) fn legible(c: Rgb, toward: Rgb, bg: Rgb, target: f32) -> Rgb {
     let mut t = 0.0;
     loop {
         let out = mix(c, toward, t);
@@ -58,6 +80,22 @@ fn legible(c: Rgb, toward: Rgb, bg: Rgb, target: f32) -> Rgb {
         }
         t += 0.04;
     }
+}
+
+/// `c` lifted toward `text` until it reads at `target` on `bg`; if even
+/// `text` falls short (a bright surface on a low-contrast palette), then on
+/// toward white or black, whichever the surface is darker or lighter than.
+fn readable(c: Rgb, text: Rgb, bg: Rgb, target: f32) -> Rgb {
+    let out = legible(c, text, bg, target);
+    if contrast(out, bg) >= target {
+        return out;
+    }
+    let extreme = if contrast((255, 255, 255), bg) >= contrast((0, 0, 0), bg) {
+        (255, 255, 255)
+    } else {
+        (0, 0, 0)
+    };
+    legible(out, extreme, bg, target)
 }
 
 /// The tray's colours, resolved against its surface.
@@ -77,10 +115,10 @@ impl Ink {
         let d = Theme::default();
         let text = rgb(t.claude_text, d.claude_text);
         let muted = rgb(t.muted, d.muted);
-        let dim = legible(muted, text, bg, 4.5);
+        let dim = readable(muted, text, bg, 4.5);
         Self {
-            name: legible(rgb(t.subagent_name, d.subagent_name), text, bg, 4.5),
-            step: mix(dim, text, 0.45),
+            name: readable(rgb(t.subagent_name, d.subagent_name), text, bg, 4.5),
+            step: readable(mix(dim, text, 0.45), text, bg, 4.5),
             dim,
             count: legible(mix(bg, muted, 0.55), dim, bg, 3.0),
             run: legible(rgb(t.status_streaming, d.status_streaming), text, bg, 3.0),
@@ -370,12 +408,49 @@ pub(crate) fn paint_tray(
         .max()
         .unwrap_or(4)
         .clamp(4, 16);
+    // The watched worker's row: a band across the tray, its ink resolved
+    // against the band so every word still reads. On the first row it also
+    // fills the tray's top half-cell of padding, and on the last (no "+N
+    // more" under it) the bottom half-cell, which runs into the input.
+    let sel_at = |rx: u16| watched_bg(theme, tray_at(rx));
+    let sel = sel_at(tray.width / 2);
+    let sel_ink = Ink::on(theme, sel);
+    let shown = snaps.len().min(MAX_ROWS);
     let mut y = top + 1;
-    for s in snaps.iter().take(MAX_ROWS) {
+    for (i, s) in snaps.iter().take(MAX_ROWS).enumerate() {
         if y >= tray.bottom() {
             return;
         }
-        row(buf, x, right, y, s, name_w, spinner_frame, &ink, bg);
+        if s.watched {
+            row(
+                buf,
+                x,
+                right,
+                y,
+                s,
+                name_w,
+                spinner_frame,
+                &sel_ink,
+                color(sel),
+            );
+            for rx in l..=r {
+                if let Some(cell) = buf.cell_mut((tray.x + rx, y)) {
+                    cell.set_bg(color(sel_at(rx)));
+                }
+            }
+            if i == 0 {
+                for rx in l..=r {
+                    put(buf, tray.x + rx, top, "\u{2584}", sel_at(rx), slab.halo_at(rx));
+                }
+            }
+            if i + 1 == shown && snaps.len() <= MAX_ROWS {
+                for rx in l..=r {
+                    put(buf, input.x + rx, input.y, "\u{2584}", slab.fill_at(rx), sel_at(rx));
+                }
+            }
+        } else {
+            row(buf, x, right, y, s, name_w, spinner_frame, &ink, bg);
+        }
         y += 1;
     }
     if snaps.len() > MAX_ROWS && y < tray.bottom() {
@@ -397,7 +472,19 @@ mod tests {
             done,
             tools: 0,
             result: None,
+            watched: false,
         }
+    }
+
+    #[test]
+    fn rows_are_found_under_the_rim_and_not_past_the_shown_ones() {
+        let tray = Rect::new(0, 10, 80, tray_height(8));
+        assert_eq!(row_at(tray, 8, 5, 10), None, "the rim");
+        assert_eq!(row_at(tray, 8, 5, 11), Some(0));
+        assert_eq!(row_at(tray, 8, 5, 16), Some(5));
+        assert_eq!(row_at(tray, 8, 5, 17), None, "the +N more row");
+        assert_eq!(row_at(tray, 2, 5, 13), None, "past the last agent");
+        assert_eq!(row_at(Rect::default(), 2, 5, 11), None, "no tray");
     }
 
     #[test]
@@ -457,6 +544,7 @@ mod tests {
         "ice",
         "forest",
         "lavender",
+        "paper",
     ];
 
     #[test]
@@ -476,6 +564,22 @@ mod tests {
                 lb.min(lo) <= lt && lt <= lb.max(lo),
                 "{name}: tray between chrome and body"
             );
+            // The watched row stands off the tray and is still legible.
+            let sel = watched_bg(&theme, tray);
+            assert!(
+                contrast(sel, tray) > 1.08,
+                "{name}: the watched row stands out ({:.2})",
+                contrast(sel, tray)
+            );
+            let sel_ink = Ink::on(&theme, sel);
+            for (what, c, min) in [
+                ("name", sel_ink.name, 4.5),
+                ("step", sel_ink.step, 4.5),
+                ("dim", sel_ink.dim, 4.5),
+            ] {
+                let got = contrast(c, sel);
+                assert!(got >= min - 0.01, "{name}: watched {what} {got:.2} < {min}");
+            }
             let ink = Ink::on(&theme, tray);
             for (what, c, min) in [
                 ("name", ink.name, 4.5),
@@ -499,6 +603,9 @@ mod tests {
 mod render_tests {
     use crate::tui::app::SPINNER_FRAMES;
     use crate::tui::testing::TestHarness;
+    use super::{watched_bg, Theme};
+    use crate::tui::neon_prompt::{contrast, rgb};
+    use crate::tui::theme::THEME;
     use agent_engine::session::SessionEventWire;
     use ratatui::buffer::Buffer;
     use synaps_cli::{AgentEvent, StreamEvent};
@@ -620,6 +727,95 @@ mod render_tests {
             for glyph in ['\u{256d}', '\u{256e}', '\u{2570}', '\u{256f}', '\u{2502}'] {
                 assert!(!line.contains(glyph), "box glyph {glyph:?} in {line:?}");
             }
+        }
+    }
+
+    /// ctrl+↑ opens a worker's view: its tray row becomes a band in the
+    /// prompt's accent across the whole tray (no bar, no underline); the
+    /// others stay as they are. The band fills the tray's half-cell padding
+    /// on its open side: under the last row (running into the input), over
+    /// the first.
+    #[test]
+    fn the_watched_worker_row_is_a_band_in_the_prompt_accent() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut h = TestHarness::boot_with_size(W, H);
+        start(&mut h, 1, "chrollo");
+        start(&mut h, 2, "spike");
+        let before = h.render().clone();
+        let (top, _) = tray_rows(&before).expect("a tray");
+        let tray_bg = before[(2, top + 1)].bg;
+        assert_eq!(
+            before[(2, top + 2)].bg,
+            tray_bg,
+            "nothing watched: one surface"
+        );
+
+        h.key(KeyCode::Up, KeyModifiers::CONTROL);
+        let buf = h.render().clone();
+        let y = (top + 1..=top + 2)
+            .find(|&y| row(&buf, y).contains("spike"))
+            .expect("spike's row");
+        let other = if y == top + 1 { top + 2 } else { top + 1 };
+        let band = buf[(2, y)].bg;
+        assert_ne!(band, tray_bg, "the watched row is a band");
+        for x in [2, W / 2, W - 3] {
+            assert_eq!(buf[(x, y)].bg, band, "across the tray at x={x}");
+        }
+        assert_eq!(buf[(2, other)].bg, tray_bg, "the other row is unchanged");
+        let rgb_of = |c: ratatui::style::Color| match c {
+            ratatui::style::Color::Rgb(r, g, b) => (r, g, b),
+            other => panic!("not rgb: {other:?}"),
+        };
+        assert!(
+            contrast(rgb_of(band), rgb_of(tray_bg)) > 1.08,
+            "the band stands off the tray"
+        );
+        let accent = rgb(
+            THEME.load().prompt_fg,
+            Theme::default().prompt_fg,
+        );
+        assert_eq!(
+            rgb_of(band),
+            watched_bg(&THEME.load(), rgb_of(tray_bg)),
+            "the tray tinted toward ❯ ({accent:?})"
+        );
+        assert_ne!(
+            buf[(2, y)].symbol(),
+            "\u{2503}",
+            "no selection bar"
+        );
+        let x = (0..W)
+            .find(|&x| buf[(x, y)].symbol() == "s" && buf[(x + 1, y)].symbol() == "p")
+            .unwrap();
+        assert_eq!(buf[(x, y)].bg, band, "the name sits on the band");
+        assert!(
+            !buf[(x, y)]
+                .modifier
+                .contains(ratatui::style::Modifier::UNDERLINED),
+            "the band marks it; no underline"
+        );
+
+        // spike is the last row: the band runs down into the input's rim
+        // (the upper half of that row), and the top padding stays the tray.
+        let rim = prompt_row(&buf) - 1;
+        assert_eq!(y, rim - 1, "spike is the last row");
+        for x in [2, W / 2, W - 3] {
+            assert_eq!(buf[(x, rim)].symbol(), "\u{2584}");
+            assert_eq!(buf[(x, rim)].bg, buf[(x, y)].bg, "bottom padding at x={x}");
+            assert_eq!(buf[(x, top)].fg, before[(x, top)].fg, "top padding unchanged");
+        }
+
+        // chrollo is the first row: the band fills the top padding instead.
+        h.key(KeyCode::Up, KeyModifiers::CONTROL);
+        let buf = h.render().clone();
+        let first = top + 1;
+        assert!(row(&buf, first).contains("chrollo"));
+        assert_ne!(buf[(2, first)].bg, tray_bg, "chrollo is watched");
+        for x in [2, W / 2, W - 3] {
+            assert_eq!(buf[(x, top)].symbol(), "\u{2584}");
+            assert_eq!(buf[(x, top)].fg, buf[(x, first)].bg, "top padding at x={x}");
+            assert_eq!(buf[(x, top)].bg, before[(x, top)].bg, "above it is unchanged");
+            assert_eq!(buf[(x, rim)].bg, before[(x, rim)].bg, "bottom padding back to the tray");
         }
     }
 
@@ -752,6 +948,93 @@ mod render_tests {
         );
     }
 
+    fn rows_named(buf: &Buffer, needle: &str) -> Vec<String> {
+        (0..buf.area().height)
+            .map(|y| row(buf, y))
+            .filter(|l| l.contains(needle))
+            .collect()
+    }
+
+    /// `daemon reload` re-execs the daemon and its workers die with it: the
+    /// tray must not keep ticking them as running (2026-10-14: two ghost
+    /// rows looked like live duplicates of the resumed workers).
+    #[test]
+    fn a_daemon_reload_ends_running_rows_as_stopped() {
+        let mut h = TestHarness::boot_with_size(W, H);
+        start(&mut h, 1, "integrator");
+        start(&mut h, 2, "qwen3-builder");
+        update(&mut h, 2, "$ sleep 290");
+        h.feed_event(SessionEventWire::Reloading {
+            generation: 10,
+            retry_after_ms: 500,
+        });
+        let buf = h.render().clone();
+        for name in ["integrator", "qwen3-builder"] {
+            let line = rows_named(&buf, name)
+                .pop()
+                .unwrap_or_else(|| panic!("{name} missing"));
+            assert!(line.contains("stopped by daemon reload"), "{line:?}");
+            assert!(
+                !line.contains("sleep 290"),
+                "no longer shown as working: {line:?}"
+            );
+        }
+    }
+
+    /// The marked rows are finished rows: reconcile drops them once their
+    /// flash is over, though the registry never lists them again.
+    #[test]
+    fn rows_stopped_by_a_reload_flash_out() {
+        use super::super::app::SubagentState;
+        use super::super::stream_handler::{
+            mark_workers_stopped_by_reload, reconcile_subagents, SUBAGENT_DONE_FLASH_SECS,
+        };
+        let t0 = std::time::Instant::now();
+        let row = |id: u64, done: bool| SubagentState {
+            id,
+            name: format!("w{id}"),
+            status: "$ sleep 290".into(),
+            start_time: t0,
+            done,
+            duration_secs: done.then_some(1.0),
+            done_at: done.then_some(t0),
+            tools: 1,
+            result: None,
+        };
+        let mut hud = vec![row(1, false), row(2, true)];
+        assert!(mark_workers_stopped_by_reload(&mut hud, t0));
+        assert!(hud[0].done && hud[0].status.contains("stopped by daemon reload"));
+        assert_eq!(
+            hud[1].status, "$ sleep 290",
+            "a finished row keeps its ending"
+        );
+        assert!(!mark_workers_stopped_by_reload(&mut hud, t0), "idempotent");
+        let later = t0 + std::time::Duration::from_secs_f64(SUBAGENT_DONE_FLASH_SECS + 1.0);
+        reconcile_subagents(&mut hud, &[], later);
+        assert!(
+            hud.is_empty(),
+            "{:?}",
+            hud.iter().map(|s| &s.status).collect::<Vec<_>>()
+        );
+    }
+
+    /// An older daemon restarts handle ids at 1 after a reload: a new worker
+    /// under a reused id replaces the stale row instead of adding a twin.
+    #[test]
+    fn a_reused_worker_id_replaces_its_row() {
+        let mut h = TestHarness::boot_with_size(W, H);
+        start(&mut h, 1, "integrator");
+        h.feed_event(SessionEventWire::Reloading {
+            generation: 10,
+            retry_after_ms: 500,
+        });
+        start(&mut h, 1, "integrator");
+        let buf = h.render().clone();
+        let lines = rows_named(&buf, "integrator");
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("starting"), "{lines:?}");
+    }
+
     /// A background worker outlives the turn that started it: its progress
     /// reaches the tray through the registry rows, not the ended stream.
     #[test]
@@ -781,6 +1064,8 @@ mod render_tests {
                 finished_elapsed: None,
                 step: step.into(),
                 tools,
+                handle_id: "sa_37".into(),
+                model: String::new(),
             }])
         };
         h.feed_event(rows("$ date +%T; sleep 20; date +%T", 1));
@@ -788,5 +1073,95 @@ mod render_tests {
         assert!(line.contains("$ date +%T; sleep 20"), "{line:?}");
         assert!(line.contains("1 tool"), "{line:?}");
         assert!(!line.contains("starting"), "{line:?}");
+    }
+
+    /// One registry row, as the daemon's 1 Hz `SubagentRows` carries it.
+    fn registry_row(
+        id: u64,
+        name: &str,
+        status: synaps_cli::runtime::subagent::SubagentStatus,
+        cancel_requested: bool,
+    ) -> synaps_cli::tools::SubagentDisplayRow {
+        synaps_cli::tools::SubagentDisplayRow {
+            subagent_id: id,
+            agent_name: name.into(),
+            status,
+            cancel_requested,
+            elapsed_secs: 42.0,
+            finished_elapsed: None,
+            step: "$ cargo test -p synaps-tui".into(),
+            tools: 3,
+            handle_id: format!("sa_{id}"),
+            model: String::new(),
+        }
+    }
+
+    fn line_with(buf: &Buffer, needle: &str) -> Option<String> {
+        (0..buf.area().height)
+            .map(|y| row(buf, y))
+            .find(|l| l.contains(needle))
+    }
+
+    /// Reattaching (`--attach`, or the client reconnecting after a daemon
+    /// reload): workers started before kept running, and the client's only
+    /// news of them is the registry rows. They show from the first rows, with
+    /// their step and tool count, without waiting for the agent to start
+    /// another worker.
+    #[test]
+    fn reattaching_shows_the_workers_that_kept_running() {
+        use synaps_cli::runtime::subagent::SubagentStatus::Running;
+        let mut h = TestHarness::boot_with_size(W, H);
+        assert!(tray_rows(&h.render().clone()).is_none(), "fresh client");
+
+        h.feed_event(SessionEventWire::SubagentRows(vec![
+            registry_row(7, "chrollo", Running, false),
+            registry_row(8, "spike", Running, false),
+        ]));
+        let buf = h.render().clone();
+        assert!(tray_rows(&buf).is_some(), "the tray is back");
+        for name in ["chrollo", "spike"] {
+            let line = line_with(&buf, name).unwrap_or_else(|| panic!("{name} missing"));
+            assert!(line.contains("$ cargo test -p synaps-tui"), "{line:?}");
+            assert!(line.contains("3 tools"), "{line:?}");
+        }
+    }
+
+    /// Esc clears the tray, but a `subagent_start` worker outlives the turn
+    /// it was started in: the next rows bring it back.
+    #[test]
+    fn an_abort_does_not_hide_a_background_worker() {
+        use synaps_cli::runtime::subagent::SubagentStatus::Running;
+        let mut h = TestHarness::boot_with_size(W, H);
+        start(&mut h, 37, "sleeper-1");
+        assert!(line_with(&h.render().clone(), "sleeper-1").is_some());
+
+        h.feed_event(SessionEventWire::Aborted {
+            context_saved: true,
+        });
+        h.feed_event(SessionEventWire::SubagentRows(vec![registry_row(
+            37,
+            "sleeper-1",
+            Running,
+            false,
+        )]));
+        let buf = h.render().clone();
+        let line = line_with(&buf, "sleeper-1").expect("the worker survives the abort");
+        assert!(line.contains("$ cargo test -p synaps-tui"), "{line:?}");
+    }
+
+    /// Only running workers come back: a finished one, or one being
+    /// cancelled, isn't added to an empty tray.
+    #[test]
+    fn rows_do_not_bring_back_finished_or_cancelling_workers() {
+        use synaps_cli::runtime::subagent::SubagentStatus::{Completed, Running};
+        let mut h = TestHarness::boot_with_size(W, H);
+        h.feed_event(SessionEventWire::SubagentRows(vec![
+            registry_row(1, "finished-one", Completed, false),
+            registry_row(2, "cancelling-one", Running, true),
+        ]));
+        let buf = h.render().clone();
+        assert!(tray_rows(&buf).is_none(), "nothing to show");
+        assert!(line_with(&buf, "finished-one").is_none());
+        assert!(line_with(&buf, "cancelling-one").is_none());
     }
 }

@@ -15,8 +15,10 @@
 //! policy, auto-compact, …), its keep-warm pin, its lifecycle (a Parked
 //! session comes back Parked), the non-persisted runtime knobs
 //! (`settings_replay`: context window, compaction model, retries,
-//! timeouts, tool-output cap, worker grants, `/system`), and the CURRENT
-//! model/thinking (`/model` mid-session survives).
+//! timeouts, tool-output cap, worker grants, `/system`), the CURRENT
+//! model/thinking (`/model` mid-session survives), and the session's exact
+//! tool activations (pins only, re-validated by the new runtime at its first
+//! turn start — `SessionToolSet::restore_carried`).
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
@@ -37,17 +39,19 @@ use crate::session::{
 pub const RELOAD_STATE_ENV: &str = "SYNAPS_DAEMON_RELOAD_STATE";
 /// Env: inherited `daemon.lock` fd (mandatory when `RELOAD_STATE_ENV` is set).
 pub const LOCK_FD_ENV: &str = "SYNAPS_DAEMON_LOCK_FD";
+/// Env: the subagent handle counter read at the `execv` itself, later than
+/// `ReloadState::next_subagent_id` (written after the checkpoints): a worker
+/// that ignored its stop could still dispatch in between.
+pub const SUBAGENT_ID_FLOOR_ENV: &str = "SYNAPS_DAEMON_SUBAGENT_ID_FLOOR";
 /// Env: default drain budget in seconds.
 pub const DRAIN_SECS_ENV: &str = "SYNAPS_DAEMON_RELOAD_DRAIN_SECS";
 const DEFAULT_DRAIN: Duration = Duration::from_secs(30);
 const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Per-session `Checkpoint{Reload}` wait: `cancel_turn` (the drain + its
-/// bounded save) + the checkpoint's own bounded save + 1 s margin.
-const CHECKPOINT_BUDGET: Duration = Duration::from_secs(
-    crate::session::budgets::CANCEL_TURN_TIMEOUT_SECS
-        + crate::session::budgets::SAVE_TIMEOUT_SECS
-        + 1,
-);
+/// bounded save) + stopping the session's workers + the checkpoint's own
+/// bounded save + 1 s margin.
+const CHECKPOINT_BUDGET: Duration =
+    Duration::from_secs(crate::session::budgets::RELOAD_CHECKPOINT_BUDGET_SECS);
 /// What clients are told to wait before reconnecting.
 pub const RETRY_AFTER_MS: u64 = 500;
 
@@ -117,6 +121,15 @@ pub struct ReloadSession {
     #[serde(default)]
     pub cache_keepwarm: Option<String>,
     pub input_owner_kind: Option<crate::session::ClientKind>,
+    /// Workers the checkpoint stopped (or that still owed the parent a
+    /// completion wake), handed to the new image (`AdoptWorkers`).
+    #[serde(default)]
+    pub workers: Vec<crate::runtime::subagent::CarriedWorker>,
+    /// The session's exact tool activations, restored into the new image's
+    /// runtime (re-validated there; see `SessionToolSet::restore_carried`).
+    /// Empty from an older image or a checkpoint that did not confirm.
+    #[serde(default)]
+    pub tool_activations: Vec<crate::tools::activation::CarriedActivation>,
 }
 
 /// `registry_dir()/daemon[-P].reload.json` body.
@@ -126,6 +139,27 @@ pub struct ReloadState {
     pub written_at: chrono::DateTime<chrono::Utc>,
     pub sessions: Vec<ReloadSession>,
     pub expected_clients: usize,
+    /// The subagent handle counter (`sa_N`) at the exec. The new image never
+    /// hands out a lower id, so a model's remembered handles keep meaning
+    /// the worker they named. `0` (older reload-state): derived from the
+    /// carried workers only.
+    #[serde(default)]
+    pub next_subagent_id: u64,
+}
+
+impl ReloadState {
+    /// The first handle number the new image may use: past the old image's
+    /// counter and every carried worker id.
+    pub fn subagent_id_floor(&self) -> u64 {
+        let carried = self
+            .sessions
+            .iter()
+            .flat_map(|s| &s.workers)
+            .filter_map(|w| crate::runtime::subagent::handle_number(&w.id))
+            .max()
+            .map_or(0, |n| n + 1);
+        self.next_subagent_id.max(carried)
+    }
 }
 
 pub fn reload_state_path(paths: &DaemonPaths) -> PathBuf {
@@ -287,7 +321,14 @@ async fn checkpoint_one(handle: SessionHandle) -> Option<SessionReloadRecord> {
 fn record(handle: &SessionHandle, rec: Option<SessionReloadRecord>) -> ReloadSession {
     let meta = handle.meta();
     let journal_id = handle.journal_id();
-    let (config, keep_warm, lifecycle, settings_replay, cache_keepwarm, model) = match rec {
+    if rec.is_none() {
+        tracing::warn!(
+            session = %handle.id,
+            "reload: no checkpoint reply in time — this session's workers are not carried: \
+             no archive is guaranteed and their parent will not be woken"
+        );
+    }
+    let (config, keep_warm, lifecycle, settings_replay, cache_keepwarm, model, workers, tool_activations) = match rec {
         Some(r) => (
             r.config,
             r.keep_warm,
@@ -295,21 +336,33 @@ fn record(handle: &SessionHandle, rec: Option<SessionReloadRecord>) -> ReloadSes
             r.settings_replay,
             r.cache_keepwarm,
             r.model,
+            r.workers,
+            r.tool_activations,
         ),
         None => (
             SessionConfig {
                 cwd: meta.cwd.clone(),
+                // Like `/keepwarm`: the user's `/memory` choice survives a
+                // reload whose checkpoint did not confirm.
+                memory_mode: handle.memory_mode(),
                 env: None,
             env_stripped: Vec::new(),
                 ..SessionConfig::default()
             },
-            false,
+            // The pin is on the handle too, so it survives a reload whose
+            // checkpoint did not confirm.
+            handle.pinned(),
             handle.lifecycle(),
             Vec::new(),
             // Persisted independently of the checkpoint: an explicit
             // `/keepwarm` choice must survive a reload that timed out.
             handle.cache_keepwarm_override(),
             handle.view().model.clone(),
+            // No checkpoint reply: whatever workers ran are lost to the exec
+            // without a record (the actor never answered).
+            Vec::new(),
+            // Nor are its tool activations known.
+            Vec::new(),
         ),
     };
     ReloadSession {
@@ -329,6 +382,8 @@ fn record(handle: &SessionHandle, rec: Option<SessionReloadRecord>) -> ReloadSes
         settings_replay,
         cache_keepwarm,
         input_owner_kind: None,
+        workers,
+        tool_activations,
     }
 }
 
@@ -348,11 +403,9 @@ pub async fn prepare(
     req: ReloadRequest,
 ) -> Result<Prepared, ReloadError> {
     // 1. version gate — before anything is disturbed.
-    let exe = req.exe.clone().unwrap_or_else(|| {
-        registry::read_daemon_json(paths)
-            .and_then(|i| i.exe)
-            .unwrap_or_else(resolve_exe)
-    });
+    // The recorded exe from this image's own record (not daemon.json, which
+    // can be lost while the daemon runs).
+    let exe = req.exe.clone().unwrap_or_else(|| state.daemon_info().exe.unwrap_or_else(resolve_exe));
     let exe = validate_exe(&exe).map_err(ReloadError::Refused)?;
     let new = probe_version(&exe).await.map_err(ReloadError::Refused)?;
     version_gate(&PrintVersion::current(), &new).map_err(ReloadError::Refused)?;
@@ -401,27 +454,31 @@ pub async fn prepare(
         written_at: chrono::Utc::now(),
         sessions,
         expected_clients: state.connections.load(Ordering::SeqCst),
+        // After every checkpoint: no session can launch a worker any more.
+        next_subagent_id: crate::tools::peek_next_subagent_id(),
     };
     let rs_path = reload_state_path(paths);
     // If either write fails we early-return WITHOUT reaching exec() (which is the
     // only other place `reloading` is cleared), so reset the drain flag here —
     // otherwise a failed reload-state write bricks the daemon (it refuses every
     // new Create/Submit/Compact until restart).
-    let body = serde_json::to_vec_pretty(&rs).map_err(|e| {
+    let written = serde_json::to_vec_pretty(&rs)
+        .map_err(|e| e.to_string())
+        .and_then(|body| registry::write_private_atomic(&rs_path, &body).map_err(|e| e.to_string()));
+    if let Err(e) = written {
+        // No exec will follow: every checkpointed session lifts its fence
+        // and hears about the workers its checkpoint stopped.
+        abort_checkpoints(state).await;
         state.reloading.store(false, Ordering::SeqCst);
-        ReloadError::ExecFailed(e.to_string())
-    })?;
-    registry::write_private_atomic(&rs_path, &body).map_err(|e| {
-        state.reloading.store(false, Ordering::SeqCst);
-        ReloadError::ExecFailed(e.to_string())
-    })?;
+        return Err(ReloadError::ExecFailed(e));
+    }
 
     // 4. announce — every OTHER conn selects on `reload_announce` and sends
     //    Event(Reloading) + Bye{Reloading}; give their writers ≤ 1 s.
     state.reload_generation.store(generation, Ordering::SeqCst);
     state.fire_announce();
     let t1 = std::time::Instant::now();
-    while state.connections.load(Ordering::SeqCst) > 1 && t1.elapsed() < Duration::from_secs(1) {
+    while state.connections.load(Ordering::SeqCst) > 1 && t1.elapsed() < Duration::from_secs(crate::session::budgets::RELOAD_ANNOUNCE_WAIT_SECS) {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     Ok(Prepared { exe, rs_path, generation })
@@ -435,32 +492,39 @@ pub async fn prepare(
 /// checkpointed but alive; clients that got `Bye` reconnect to THIS image
 /// — a `reconnect_of.generation` mismatch is tolerated, the daemon answers
 /// with its own generation).
-pub async fn exec(state: &Arc<DaemonState>, paths: &DaemonPaths, p: Prepared) -> ReloadError {
-    let mut info = registry::read_daemon_json(paths).unwrap_or_else(|| registry::DaemonInfo {
-        pid: std::process::id(),
-        protocol_version: PROTOCOL_VERSION,
-        daemon_version: crate::session::wire::binary_version(),
-        profile: state.profile.clone(),
+pub async fn exec(state: &Arc<DaemonState>, p: Prepared) -> ReloadError {
+    // From this image's own record, not daemon.json (which can be lost while
+    // the daemon runs). The record is held and written under the metadata
+    // lock, so a heal in the hand-off window writes the same.
+    // `previous` stays untouched: a failed exec puts it back whole.
+    let previous = state.daemon_info();
+    let prev_generation = previous.generation;
+    let info = registry::DaemonInfo {
+        generation: p.generation,
         started_at: chrono::Utc::now(),
-        socket: paths.sock.to_string_lossy().into_owned(),
-        exe: None,
-        generation: 1,
-    });
-    let prev_generation = info.generation;
-    info.generation = p.generation;
-    info.started_at = chrono::Utc::now();
-    info.exe = Some(p.exe.clone());
-    let _ = registry::write_daemon_json(paths, &info);
+        exe: Some(p.exe.clone()),
+        ..previous.clone()
+    };
+    if let Err(e) = state.meta.publish(info) {
+        tracing::warn!(path = %state.paths.json.display(), error = %e, "daemon: daemon.json write failed at reload");
+    }
     let _ = tokio::time::timeout(
-        Duration::from_secs(5),
+        Duration::from_secs(crate::session::budgets::RELOAD_EXT_SHUTDOWN_SECS),
         async { state.host.ext_manager().write().await.shutdown_all().await },
     )
     .await;
 
     let err = exec_self(&p.exe, &p.rs_path, state);
     tracing::error!(error = %err, "daemon: reload exec failed; continuing on the old image");
-    info.generation = prev_generation;
-    let _ = registry::write_daemon_json(paths, &info);
+    // The record before this attempt, whole: exe and started_at too, so the
+    // next default reload uses the old exe, not the one that failed.
+    if let Err(e) = state.meta.publish(previous) {
+        tracing::warn!(
+            path = %state.paths.json.display(),
+            error = %e,
+            "daemon: daemon.json write failed after the failed reload exec"
+        );
+    }
     let _ = std::fs::remove_file(&p.rs_path);
     state.reload_generation.store(prev_generation, Ordering::SeqCst);
     state.reset_announce();
@@ -480,9 +544,19 @@ pub async fn exec(state: &Arc<DaemonState>, paths: &DaemonPaths, p: Prepared) ->
             }
         }
     };
-    if tokio::time::timeout(Duration::from_secs(10), wait).await.is_err() {
-        tracing::warn!("daemon: extension re-discovery still running after 10 s");
+    if tokio::time::timeout(
+        Duration::from_secs(crate::session::budgets::RELOAD_EXT_REDISCOVERY_SECS),
+        wait,
+    )
+    .await
+    .is_err()
+    {
+        tracing::warn!("daemon: extension re-discovery still running; resuming the sessions");
     }
+    // The checkpoint fenced every session and stopped its workers for an
+    // exec that did not happen: their parents are still here and still
+    // waiting — lift the fences and tell them.
+    abort_checkpoints(state).await;
     state.reloading.store(false, Ordering::SeqCst);
     ReloadError::ExecFailed(err)
 }
@@ -511,7 +585,8 @@ fn exec_self(exe: &Path, rs_path: &Path, state: &DaemonState) -> String {
     cmd.args(&args)
         .env("SYNAPS_DAEMON", "1")
         .env(LOCK_FD_ENV, lock_fd.to_string())
-        .env(RELOAD_STATE_ENV, rs_path);
+        .env(RELOAD_STATE_ENV, rs_path)
+        .env(SUBAGENT_ID_FLOOR_ENV, crate::tools::peek_next_subagent_id().to_string());
     let e = cmd.exec();
     // Only reached on failure: restore CLOEXEC.
     // SAFETY: as above.
@@ -543,9 +618,14 @@ pub fn adopt_from_env() -> anyhow::Result<Option<(DaemonLock, ReloadState, PathB
         .and_then(|s| s.parse().ok())
         .ok_or_else(|| anyhow::anyhow!("{RELOAD_STATE_ENV} set without {LOCK_FD_ENV}: refusing to start (the flock is the liveness oracle)"))?;
     std::env::remove_var(LOCK_FD_ENV);
+    let id_floor = std::env::var(SUBAGENT_ID_FLOOR_ENV).ok().and_then(|s| s.parse::<u64>().ok());
+    std::env::remove_var(SUBAGENT_ID_FLOOR_ENV);
     let lock = DaemonLock::adopt(fd)?;
     let body = std::fs::read_to_string(&rs_path)?;
-    let rs: ReloadState = serde_json::from_str(&body)?;
+    let mut rs: ReloadState = serde_json::from_str(&body)?;
+    if let Some(floor) = id_floor {
+        rs.next_subagent_id = rs.next_subagent_id.max(floor);
+    }
     Ok(Some((lock, rs, rs_path)))
 }
 
@@ -576,9 +656,65 @@ fn parse_holder_from_error(e: &str) -> String {
     "unknown holder".to_string()
 }
 
+/// No exec after the checkpoints (it failed, or the reload stopped before
+/// it): every live session lifts its reload fence and is handed back the
+/// workers its checkpoint stopped (`ReloadAborted`, a no-op for a session
+/// that never checkpointed). The actor re-announces from its own record,
+/// so a checkpoint that answered too late for the reload record is covered.
+async fn abort_checkpoints(state: &Arc<DaemonState>) {
+    let budget = Duration::from_secs(crate::session::budgets::RELOAD_ABORT_SEND_SECS);
+    let sends = state
+        .live_sessions()
+        .into_iter()
+        .map(|h| async move { send_reload_aborted(&h, budget).await });
+    futures::future::join_all(sends).await;
+}
+
+/// `ReloadAborted` must arrive: dropped, the session would wait out the
+/// fence's backstop. `SessionHandle::send` never waits for queue room, so
+/// retry a full queue (the actor drains it) for up to `budget`.
+pub(crate) async fn send_reload_aborted(h: &SessionHandle, budget: Duration) -> bool {
+    use crate::session::TransportError;
+    let deadline = tokio::time::Instant::now() + budget;
+    loop {
+        match h.send(SessionCommand::ReloadAborted).await {
+            Ok(()) => return true,
+            Err(TransportError::Backpressure) if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    session = %h.id,
+                    error = %e,
+                    "reload: could not tell the session the exec failed; its reload fence lifts at the backstop"
+                );
+                return false;
+            }
+        }
+    }
+}
+
+/// The config a session is restored with: as saved, except that the
+/// restore never waits on `on_session_start`. Each restored session runs
+/// the hook in the background (the deferred path quick-start sessions
+/// use), so the restore of N sessions does not take N hook round trips
+/// while the socket waits. A session restored Parked runs it only once it
+/// is unparked.
+fn restore_config(saved: &SessionConfig, lifecycle: SessionLifecycle) -> SessionConfig {
+    SessionConfig {
+        await_extensions: false,
+        restore_parked: matches!(lifecycle, SessionLifecycle::Parked | SessionLifecycle::Parking),
+        ..saved.clone()
+    }
+}
+
 pub async fn rehydrate(state: &Arc<DaemonState>, rs: &ReloadState) {
+    // Before any session can dispatch: ids continue where the old image
+    // stopped, so `sa_1` never names two different workers.
+    crate::tools::seed_next_subagent_id(rs.subagent_id_floor());
     for s in &rs.sessions {
-        let created = match state.create(s.config.clone()).await {
+        let config = restore_config(&s.config, s.lifecycle);
+        let created = match state.create(config.clone()).await {
             Ok(h) => Ok(h),
             // F23: journal locked by another process — register a Parked
             // placeholder under the SAME id. No alias, no fresh session.
@@ -602,7 +738,7 @@ pub async fn rehydrate(state: &Arc<DaemonState>, rs: &ReloadState) {
                 state
                     .create(SessionConfig {
                         continue_session: None,
-                        ..s.config.clone()
+                        ..config.clone()
                     })
                     .await
             }
@@ -611,6 +747,19 @@ pub async fn rehydrate(state: &Arc<DaemonState>, rs: &ReloadState) {
         match created {
             Ok(h) => {
                 let new_id = h.id.as_str().to_string();
+                // First, before anything can start a turn: the same
+                // conversation continues in this image, so the grants it
+                // held come with it (re-validated by the new runtime at its
+                // first turn start). A session recreated fresh (journal not
+                // continuable) is a new conversation and inherits none.
+                let continued = h.meta().continued;
+                if continued && !s.tool_activations.is_empty() {
+                    let _ = h
+                        .send(SessionCommand::RestoreToolActivations {
+                            activations: s.tool_activations.clone(),
+                        })
+                        .await;
+                }
                 if new_id != s.id {
                     state
                         .reload_aliases
@@ -639,6 +788,13 @@ pub async fn rehydrate(state: &Arc<DaemonState>, rs: &ReloadState) {
                         })
                         .await;
                 }
+                // Before any Park: re-register the stopped workers and wake
+                // their parent (it was waiting on completions the exec ate).
+                if !s.workers.is_empty() {
+                    let _ = h
+                        .send(SessionCommand::AdoptWorkers { workers: s.workers.clone() })
+                        .await;
+                }
                 if matches!(s.lifecycle, SessionLifecycle::Parked | SessionLifecycle::Parking) {
                     let _ = h.send(SessionCommand::Park).await;
                 }
@@ -652,6 +808,99 @@ pub async fn rehydrate(state: &Arc<DaemonState>, rs: &ReloadState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The session's tool activations ride the reload-state file; a file
+    /// from an older image (no field) reads as none.
+    #[test]
+    fn reload_session_carries_tool_activations() {
+        use crate::tools::activation::{CarriedActivation, CarriedProvenance};
+        let carried = vec![CarriedActivation {
+            tool_id: "builtin:subagent_start".into(),
+            schema_digest: "cd".repeat(32),
+            provenance: CarriedProvenance::BuiltinRuntime,
+        }];
+        let s = ReloadSession {
+            id: "s".into(),
+            journal_id: "j".into(),
+            config: SessionConfig::default(),
+            keep_warm: false,
+            lifecycle: SessionLifecycle::Live,
+            settings_replay: Vec::new(),
+            cache_keepwarm: None,
+            input_owner_kind: None,
+            workers: Vec::new(),
+            tool_activations: carried.clone(),
+        };
+        let v = serde_json::to_value(&s).unwrap();
+        let back: ReloadSession = serde_json::from_value(v.clone()).unwrap();
+        assert_eq!(back.tool_activations, carried);
+        // Never via the create config's wire form.
+        assert!(v["config"].get("restore_tool_activations").is_none());
+
+        let mut older = v;
+        older.as_object_mut().unwrap().remove("tool_activations");
+        let back: ReloadSession = serde_json::from_value(older).unwrap();
+        assert!(back.tool_activations.is_empty());
+    }
+
+    /// Reload-state written by an older image (no workers, no counter)
+    /// still parses: the new fields default.
+    #[test]
+    fn reload_state_from_an_older_image_parses() {
+        let rs: ReloadState = serde_json::from_value(serde_json::json!({
+            "generation": 9,
+            "written_at": "2026-10-14T18:17:03Z",
+            "sessions": [],
+            "expected_clients": 1
+        }))
+        .unwrap();
+        assert_eq!(rs.next_subagent_id, 0);
+        assert_eq!(rs.subagent_id_floor(), 0);
+    }
+
+    /// The new image's first handle is past the old counter AND past every
+    /// carried id (an older writer that only carried workers still works).
+    #[test]
+    fn subagent_id_floor_covers_the_counter_and_every_carried_id() {
+        let worker = |id: &str| crate::runtime::subagent::CarriedWorker {
+            id: id.into(),
+            subagent_id: 0,
+            agent: String::new(),
+            status: "cancelled".into(),
+            archive_path: None,
+            stopped_by_reload: true,
+            wake_lost: false,
+            wake: true,
+            elapsed_secs: 0,
+            preview: String::new(),
+        };
+        let session = |workers| ReloadSession {
+            id: "s".into(),
+            journal_id: "j".into(),
+            config: SessionConfig::default(),
+            keep_warm: false,
+            lifecycle: SessionLifecycle::Live,
+            settings_replay: Vec::new(),
+            cache_keepwarm: None,
+            input_owner_kind: None,
+            workers,
+            tool_activations: Vec::new(),
+        };
+        let mut rs = ReloadState {
+            generation: 10,
+            written_at: chrono::Utc::now(),
+            sessions: vec![session(vec![worker("sa_288"), worker("sa_286")]), session(vec![])],
+            expected_clients: 0,
+            next_subagent_id: 0,
+        };
+        assert_eq!(rs.subagent_id_floor(), 289);
+        rs.next_subagent_id = 300;
+        assert_eq!(rs.subagent_id_floor(), 300);
+        // Round trip keeps both.
+        let back: ReloadState = serde_json::from_slice(&serde_json::to_vec(&rs).unwrap()).unwrap();
+        assert_eq!(back.subagent_id_floor(), 300);
+        assert_eq!(back.sessions[0].workers.len(), 2);
+    }
 
     fn pv(b: &str, p: u32) -> PrintVersion {
         PrintVersion { binary_version: b.into(), protocol_version: p }
@@ -699,6 +948,37 @@ mod tests {
         assert_eq!(validate_exe(&l).unwrap(), f.canonicalize().unwrap());
     }
 
+    /// A restored session never waits on `on_session_start` at create; the
+    /// rest of its saved config is kept. One restored Parked defers the hook
+    /// to its unpark, and that flag never goes on the wire.
+    #[test]
+    fn a_restore_does_not_wait_on_the_session_start_hook() {
+        let saved = SessionConfig {
+            model_override: Some("claude-sonnet-4-5".into()),
+            keep_warm: true,
+            await_extensions: true,
+            ..Default::default()
+        };
+        let restored = restore_config(&saved, SessionLifecycle::Live);
+        assert!(!restored.await_extensions);
+        assert!(!restored.restore_parked);
+        let as_saved = SessionConfig {
+            await_extensions: true,
+            ..restored
+        };
+        assert_eq!(
+            serde_json::to_value(&as_saved).unwrap(),
+            serde_json::to_value(&saved).unwrap()
+        );
+        for parked in [SessionLifecycle::Parked, SessionLifecycle::Parking] {
+            let restored = restore_config(&saved, parked);
+            assert!(restored.restore_parked, "{parked:?}");
+            assert!(!restored.await_extensions);
+            let wire = serde_json::to_value(&restored).unwrap();
+            assert!(wire.get("restore_parked").is_none(), "never on the wire");
+        }
+    }
+
     #[test]
     fn reload_state_path_follows_profile() {
         let d = tempfile::tempdir().unwrap();
@@ -723,5 +1003,132 @@ mod tests {
         assert_eq!(record(&handle, None).cache_keepwarm.as_deref(), Some("off"));
         *ep.cache_keepwarm.lock().unwrap() = Some(CacheKeepWarm::Hours(6));
         assert_eq!(record(&handle, None).cache_keepwarm.as_deref(), Some("6h"));
+    }
+
+    /// Likewise the pin: an unconfirmed checkpoint must not unpin a
+    /// session (it would park, and stop holding the daemon's idle exit).
+    #[test]
+    fn the_pin_survives_an_unconfirmed_checkpoint() {
+        use crate::session::handle::echo::{meta_for, view_for};
+        let id = crate::session::SessionId("pin-reload".into());
+        let (handle, ep) = SessionHandle::new(meta_for(&id), view_for());
+        assert!(!record(&handle, None).keep_warm);
+        ep.keep_warm.store(true, std::sync::atomic::Ordering::Release);
+        let r = record(&handle, None);
+        assert!(r.keep_warm && r.config.keep_warm);
+    }
+
+    /// A `memory_mode` this image does not know (written by a newer one)
+    /// reads as `Off` — the consent-safe reading — instead of failing the
+    /// session's config and with it the whole reload state, so no session
+    /// would be rehydrated. A missing or null value stays no choice.
+    #[test]
+    fn an_unknown_memory_mode_reads_as_off() {
+        use crate::session::SessionMemoryMode;
+        let cfg = |v: serde_json::Value| {
+            serde_json::from_value::<SessionConfig>(serde_json::json!({ "memory_mode": v }))
+        };
+        assert_eq!(cfg(serde_json::json!("off")).unwrap().memory_mode, Some(SessionMemoryMode::Off));
+        assert_eq!(
+            cfg(serde_json::json!("capture_and_recall")).unwrap().memory_mode,
+            Some(SessionMemoryMode::CaptureAndRecall)
+        );
+        assert_eq!(
+            cfg(serde_json::json!("recall_forever")).unwrap().memory_mode,
+            Some(SessionMemoryMode::Off)
+        );
+        assert_eq!(cfg(serde_json::json!(7)).unwrap().memory_mode, Some(SessionMemoryMode::Off));
+        assert_eq!(cfg(serde_json::Value::Null).unwrap().memory_mode, None);
+        let missing = serde_json::from_value::<SessionConfig>(serde_json::json!({})).unwrap();
+        assert_eq!(missing.memory_mode, None);
+        let rs: ReloadState = serde_json::from_value(serde_json::json!({
+            "generation": 2,
+            "written_at": "2026-10-14T18:17:03Z",
+            "sessions": [{
+                "id": "s1", "journal_id": "s1", "keep_warm": false, "lifecycle": "live",
+                "config": { "memory_mode": "recall_forever" }
+            }],
+            "expected_clients": 0
+        }))
+        .expect("the reload state still parses");
+        assert_eq!(rs.sessions[0].config.memory_mode, Some(SessionMemoryMode::Off));
+    }
+
+    /// The restore without the hook wait keeps #255's `/memory` carry: the
+    /// session's recorded choice rides in the saved config, Parked or not.
+    #[test]
+    fn a_restore_keeps_the_sessions_memory_choice() {
+        use crate::session::SessionMemoryMode;
+        for mode in [Some(SessionMemoryMode::Off), Some(SessionMemoryMode::CaptureOnly), None] {
+            let saved = SessionConfig {
+                memory_mode: mode,
+                await_extensions: true,
+                ..Default::default()
+            };
+            for lifecycle in [SessionLifecycle::Live, SessionLifecycle::Parked, SessionLifecycle::Parking] {
+                let restored = restore_config(&saved, lifecycle);
+                assert_eq!(restored.memory_mode, mode, "{lifecycle:?}");
+                assert!(!restored.await_extensions, "{lifecycle:?}");
+            }
+        }
+    }
+
+    /// Likewise the session's `/memory` choice: a reload without a
+    /// checkpoint reply must not re-grant memory the user turned off.
+    #[test]
+    fn memory_choice_survives_an_unconfirmed_checkpoint() {
+        use crate::session::handle::echo::{meta_for, view_for};
+        use crate::session::SessionMemoryMode;
+        let id = crate::session::SessionId("mem-reload".into());
+        let (handle, ep) = SessionHandle::new(meta_for(&id), view_for());
+        assert_eq!(record(&handle, None).config.memory_mode, None);
+        *ep.memory_mode.lock().unwrap() = Some(SessionMemoryMode::Off);
+        assert_eq!(record(&handle, None).config.memory_mode, Some(SessionMemoryMode::Off));
+    }
+
+    /// A lock-held placeholder (F23) never answers a checkpoint, so the
+    /// next reload records it from its handle: its memory choice must ride
+    /// along, or a session reloaded twice comes back in the default.
+    #[tokio::test]
+    async fn a_locked_placeholder_keeps_its_memory_choice() {
+        use crate::session::SessionMemoryMode;
+        let sid = crate::session::SessionId("locked-mem".into());
+        let config = SessionConfig {
+            memory_mode: Some(SessionMemoryMode::Off),
+            ..SessionConfig::default()
+        };
+        let (handle, task) =
+            crate::session::handle::locked_placeholder::spawn(sid, config, "pid 1 (tui)".into());
+        assert_eq!(record(&handle, None).config.memory_mode, Some(SessionMemoryMode::Off));
+        task.abort();
+    }
+
+    /// `ReloadAborted` reaches a session whose command queue is full (the
+    /// actor drains it) instead of being dropped, which would leave the
+    /// session fenced until the backstop.
+    #[tokio::test]
+    async fn reload_aborted_waits_for_room_in_a_full_queue() {
+        use crate::session::handle::echo::{meta_for, view_for};
+        let id = crate::session::SessionId("abort-full".into());
+        let (handle, mut ep) = SessionHandle::new(meta_for(&id), view_for());
+        while handle.send(SessionCommand::Save).await.is_ok() {}
+        let drain = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let mut got_abort = false;
+            while let Some(a) = ep.cmd_rx.recv().await {
+                if matches!(a.cmd, SessionCommand::ReloadAborted) {
+                    got_abort = true;
+                    break;
+                }
+            }
+            got_abort
+        });
+        assert!(send_reload_aborted(&handle, Duration::from_secs(5)).await);
+        assert!(drain.await.unwrap(), "delivered");
+        // No room ever: gives up within its budget, reporting it.
+        let id = crate::session::SessionId("abort-stuck".into());
+        let (stuck, _ep) = SessionHandle::new(meta_for(&id), view_for());
+        while stuck.send(SessionCommand::Save).await.is_ok() {}
+        assert!(!send_reload_aborted(&stuck, Duration::from_millis(100)).await);
     }
 }

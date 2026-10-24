@@ -143,6 +143,7 @@ async fn time_extension_continues_for_non_message_hooks() {
 
 static BASE_DIR_TEST_LOCK: Mutex<()> = Mutex::new(());
 
+#[cfg(feature = "command-exec")]
 #[tokio::test(flavor = "current_thread")]
 async fn modify_hook_replaces_tool_input_and_after_hook_sees_modified_input() {
     let fixture = std::env::current_dir()
@@ -192,6 +193,7 @@ async fn modify_hook_replaces_tool_input_and_after_hook_sees_modified_input() {
         before,
         None,
         false,
+        None,
     )
     .await;
     let input = match decision {
@@ -211,6 +213,7 @@ async fn modify_hook_replaces_tool_input_and_after_hook_sees_modified_input() {
                     tx_events: None,
                 },
                 capabilities: synaps_cli::tools::ToolCapabilities {
+                    session_allow_all: None,
                     launch_cancel: None,
                     memory_backend: None,
                     watcher_exit_path: None,
@@ -230,6 +233,7 @@ async fn modify_hook_replaces_tool_input_and_after_hook_sees_modified_input() {
                     env: None,
                     env_stripped: Vec::new(),
                     env_warned: Default::default(),
+                    session_id: None,
                 },
                 limits: synaps_cli::tools::ToolLimits {
                     max_tool_output: 30_000,
@@ -384,6 +388,7 @@ async fn extension_tools_are_registered_in_tool_registry() {
                     tx_events: None,
                 },
                 capabilities: synaps_cli::tools::ToolCapabilities {
+                    session_allow_all: None,
                     launch_cancel: None,
                     memory_backend: None,
                     watcher_exit_path: None,
@@ -403,6 +408,7 @@ async fn extension_tools_are_registered_in_tool_registry() {
                     env: None,
                     env_stripped: Vec::new(),
                     env_warned: Default::default(),
+                    session_id: None,
                 },
                 limits: synaps_cli::tools::ToolLimits {
                     max_tool_output: 30_000,
@@ -424,6 +430,111 @@ async fn extension_tools_are_registered_in_tool_registry() {
         registered.is_some(),
         "extension tool should appear in API schema: {schema:?}"
     );
+    drop(registry);
+
+    manager.shutdown_all().await;
+}
+
+fn whoami_ctx(session_id: Option<&str>) -> ToolContext {
+    ToolContext {
+        channels: synaps_cli::tools::ToolChannels {
+            tx_delta: None,
+            tx_events: None,
+        },
+        capabilities: synaps_cli::tools::ToolCapabilities {
+            session_allow_all: None,
+            launch_cancel: None,
+            memory_backend: None,
+            watcher_exit_path: None,
+            tool_register_tx: None,
+            session_manager: None,
+            subagent_registry: None,
+            event_queue: None,
+            delegation_parent: None,
+            codex_parent_plan: None,
+            secret_prompt: None,
+            orchestration: None,
+            tool_activation: None,
+            mcp_leases: None,
+            extension_leases: None,
+            memory_context: None,
+            cwd: None,
+            env: None,
+            env_stripped: Vec::new(),
+            env_warned: Default::default(),
+            session_id: session_id.map(str::to_string),
+        },
+        limits: synaps_cli::tools::ToolLimits {
+            max_tool_output: 30_000,
+            max_tool_buffer: 256 * 1024,
+            bash_timeout: 30,
+            bash_max_timeout: 300,
+            subagent_timeout: 300,
+        },
+    }
+}
+
+/// A daemon-shared plugin must learn which conversation invoked its tool:
+/// `tool.call` params carry the caller's `session_id` (the value hook events
+/// already carry), `null` for workers. The key is always present.
+#[tokio::test]
+async fn extension_tool_call_carries_caller_session_id() {
+    // Serialise with hook_json_carries_session_id, which flips the
+    // SYNAPS_HOOK_SESSION_ID kill switch process-wide.
+    let _guard = BASE_DIR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let fixture = std::env::current_dir()
+        .unwrap()
+        .join("tests/fixtures/whoami_tool_extension.py")
+        .to_string_lossy()
+        .to_string();
+    let hook_bus = Arc::new(HookBus::new());
+    let tools = Arc::new(tokio::sync::RwLock::new(
+        synaps_cli::ToolRegistry::without_subagent(),
+    ));
+    let mut manager = ExtensionManager::new_with_tools(hook_bus, tools.clone());
+    let manifest = synaps_cli::extensions::manifest::ExtensionManifest {
+        theme_tokens: Default::default(),
+        deferred: None,
+        protocol_version: synaps_cli::extensions::manifest::CURRENT_EXTENSION_PROTOCOL_VERSION,
+        runtime: synaps_cli::extensions::manifest::ExtensionRuntime::Process,
+        command: "python3".to_string(),
+        setup: None,
+        prebuilt: ::std::collections::HashMap::new(),
+        args: vec![fixture],
+        permissions: vec!["tools.register".to_string()],
+        hooks: vec![],
+        config: vec![],
+    };
+    manager.load("whoami-test", &manifest).await.unwrap();
+
+    let registry = tools.read().await;
+    let tool = registry
+        .get("whoami-test:whoami")
+        .expect("whoami tool registered");
+
+    // Two sessions sharing one plugin process → each call names its caller.
+    for caller in [Some("sess-A"), Some("sess-B"), None] {
+        let output = tool
+            .execute(json!({"k": 1}), whoami_ctx(caller))
+            .await
+            .unwrap();
+        let seen: Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(
+            seen["has_key"],
+            json!(true),
+            "session_id key must be present: {seen}"
+        );
+        assert_eq!(
+            seen["session_id"],
+            json!(caller),
+            "caller {caller:?}: {seen}"
+        );
+        assert_eq!(
+            seen["input"],
+            json!({"k": 1}),
+            "input must be unchanged: {seen}"
+        );
+    }
     drop(registry);
 
     manager.shutdown_all().await;
@@ -1286,6 +1397,51 @@ async fn on_message_complete_is_observe_only() {
         "on_message_complete should ignore non-continue actions, got {result:?}"
     );
 
+    // Advisory context_phase: with only privacy.llm_content the report is
+    // ignored (two-key gate) ...
+    let context_management = serde_json::json!({
+        "enabled": true, "band": "normal", "phase": "unknown"
+    });
+    let event = HookEvent::on_message_complete(
+        "Report phase",
+        serde_json::json!({"context_management": context_management}),
+    );
+    let result = bus.emit(&event).await;
+    assert!(
+        matches!(result, HookResult::Continue),
+        "context_phase without session.lifecycle must be ignored, got {result:?}"
+    );
+
+    // ... and with session.lifecycle as well, the report is accepted while
+    // a Block on the same hook is still ignored.
+    let bus = HookBus::new();
+    let mut perms = PermissionSet::new();
+    perms.grant(Permission::LlmContent);
+    perms.grant(Permission::SessionLifecycle);
+    bus.subscribe(
+        HookKind::OnMessageComplete,
+        handler.clone(),
+        None,
+        None,
+        perms,
+    )
+    .await
+    .expect("subscribe on_message_complete");
+    let result = bus.emit(&event).await;
+    assert_eq!(
+        result,
+        HookResult::ContextPhase {
+            phase: "new_task".into()
+        },
+        "context_phase with both keys must be returned (and the fixture must have seen data.context_management)"
+    );
+    let event = HookEvent::on_message_complete("Block me", serde_json::json!({}));
+    let result = bus.emit(&event).await;
+    assert!(
+        matches!(result, HookResult::Continue),
+        "block is still ignored on on_message_complete, got {result:?}"
+    );
+
     handler.shutdown().await;
 }
 
@@ -1381,7 +1537,7 @@ async fn discovery_failures_include_plugin_manifest_path_reason_and_hint() {
         failure.reason.contains("Invalid plugin manifest JSON"),
         "{failure:?}"
     );
-    assert!(failure.hint.contains("plugin validate"), "{failure:?}");
+    assert!(failure.hint.contains("plugin.json"), "{failure:?}");
 }
 
 #[tokio::test(flavor = "current_thread")]

@@ -556,7 +556,7 @@ impl McpRuntimeManager {
         fingerprint: &str,
         config: &McpServerConfig,
     ) -> Result<Arc<LeaseInner>, String> {
-        let mut conn = McpConnection::start(config).await?;
+        let mut conn = McpConnection::start(server, config).await?;
         let defs = match conn.list_tools().await {
             Ok(defs) => defs,
             Err(e) => {

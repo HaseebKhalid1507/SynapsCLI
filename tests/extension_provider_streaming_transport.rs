@@ -4,6 +4,9 @@
 //! during a request/response are dispatched to a registered notification
 //! subscriber, while the response is still delivered to the caller.
 
+#[path = "support/hermetic_base_dir.rs"]
+mod hermetic_base_dir;
+
 use std::path::PathBuf;
 
 use synaps_cli::extensions::runtime::process::{NotificationFrame, ProcessExtension};
@@ -17,6 +20,7 @@ fn fixture_path(name: &str) -> PathBuf {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn process_extension_dispatches_notifications_to_subscriber() {
+    hermetic_base_dir::pin();
     let fixture = fixture_path("notify_then_respond_extension.py");
     assert!(fixture.exists(), "fixture missing: {:?}", fixture);
 
@@ -76,6 +80,7 @@ async fn process_extension_dispatches_notifications_to_subscriber() {
 /// consumer progress.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn notification_flood_is_backpressured_not_retained() {
+    hermetic_base_dir::pin();
     let fixture = fixture_path("flood_notifications_extension.py");
     assert!(fixture.exists(), "fixture missing: {:?}", fixture);
 

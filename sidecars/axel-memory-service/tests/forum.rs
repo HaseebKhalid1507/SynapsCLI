@@ -11,7 +11,8 @@ use synaps_axel_memory_service::{contract::SCHEMA, forum_contract as forum};
 const A: &str = "p0123456789abcdef";
 const B: &str = "pfedcba9876543210";
 fn temp() -> (tempfile::TempDir, PathBuf) {
-    let d = tempfile::tempdir().unwrap();
+    // Symlink-free base: macOS temp dirs live under the /var symlink.
+    let d = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
     fs::set_permissions(d.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let p = d.path().join("forum.r8");
     (d, p)

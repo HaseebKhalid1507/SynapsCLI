@@ -24,6 +24,9 @@
 //! `invoke_output.rs` and by rerunning this file's flood test against
 //! the mutations during review.
 
+#[path = "support/hermetic_base_dir.rs"]
+mod hermetic_base_dir;
+
 use std::path::PathBuf;
 
 use synaps_cli::extensions::invoke_output::{
@@ -96,6 +99,7 @@ fn assert_exact_accounting(report: &InvokeOutputReport) {
 /// be exact.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn hostile_command_output_flood_is_bounded_when_invoke_resolves() {
+    hermetic_base_dir::pin();
     use synaps_cli::extensions::commands::CommandOutputEvent;
     use synaps_cli::extensions::runtime::InvokeCommandEvent;
 
@@ -180,6 +184,7 @@ async fn hostile_command_output_flood_is_bounded_when_invoke_resolves() {
 /// hang behind a producer blocked on a full channel.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancelling_invoke_mid_flood_releases_collector_and_producers() {
+    hermetic_base_dir::pin();
     let handler = std::sync::Arc::new(spawn_flood_fixture("flood-cmd-cancel").await);
 
     let (sink, collector) = invoke_event_channel(InvokeOutputBudget::default());
@@ -221,6 +226,7 @@ async fn cancelling_invoke_mid_flood_releases_collector_and_producers() {
 /// truncation and produced == consumed == retained.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn bounded_command_output_is_preserved_verbatim() {
+    hermetic_base_dir::pin();
     use synaps_cli::extensions::commands::CommandOutputEvent;
     use synaps_cli::extensions::runtime::InvokeCommandEvent;
     use synaps_cli::extensions::tasks::{TaskEvent, TaskKind};

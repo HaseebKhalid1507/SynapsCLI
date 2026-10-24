@@ -91,6 +91,12 @@ pub struct EngineHost {
     /// MCP discovery deferred by [`McpDiscovery::Background`]; taken (once)
     /// by [`Self::spawn_background_mcp_discovery`].
     pending_mcp_discovery: std::sync::Mutex<Option<crate::mcp::PendingMcpDiscovery>>,
+    /// One `on_session_start` at a time on this host, a hook that a turn
+    /// waits for first. A reload restores every session at once; their
+    /// hooks, all fired together, would queue in each single-process
+    /// extension and the tail would pass the handler timeout and lose its
+    /// injection for the whole session.
+    session_start_gate: crate::session::session_start::SessionStartGate,
 }
 
 /// (E-P2) Returned by [`EngineHost::claim_driver`] when another live session
@@ -212,6 +218,7 @@ impl EngineHost {
             extensions_ready: tokio::sync::watch::channel(false).0,
             extensions_loading: std::sync::atomic::AtomicBool::new(false),
             pending_mcp_discovery: std::sync::Mutex::new(pending_mcp_discovery),
+            session_start_gate: crate::session::session_start::SessionStartGate::new(),
         }))
     }
 
@@ -302,6 +309,18 @@ impl EngineHost {
         self.config.load()
     }
 
+    /// Headless hosts (`synaps chat`, `rpc`, daemon) have no startup notice
+    /// area: print config warnings (unknown keys, bad or deprecated values)
+    /// to stderr and the log. The TUI shows them as notices instead.
+    pub fn report_config_warnings(&self) {
+        report_config_warnings(&self.config());
+    }
+
+    /// The host's `on_session_start` gate (one hook at a time).
+    pub(crate) fn session_start_gate(&self) -> &crate::session::session_start::SessionStartGate {
+        &self.session_start_gate
+    }
+
     pub fn ext_manager(&self) -> &Arc<RwLock<crate::extensions::manager::ExtensionManager>> {
         &self.ext_manager
     }
@@ -336,9 +355,28 @@ impl EngineHost {
     /// session's project, not the daemon's — A-engine-merge §4. `None` =
     /// process cwd, byte-identical to `foreground_runtime()`.
     pub async fn foreground_runtime_for(&self, cwd: Option<std::path::PathBuf>) -> Result<Runtime> {
+        self.foreground_runtime_with(cwd, true).await
+    }
+
+    /// `foreground_runtime_for`, applying the operator's `memory.default_mode`
+    /// only when `memory_default` — a session runtime rebuilt for a session
+    /// that made its own `/memory` choice passes `false` and restores that
+    /// choice instead (`SessionConfig::memory_mode`).
+    pub(crate) async fn foreground_runtime_with(
+        &self,
+        cwd: Option<std::path::PathBuf>,
+        memory_default: bool,
+    ) -> Result<Runtime> {
         let mut runtime = Runtime::from_parts(RuntimeParts::with_reaper(self.parts.clone()));
         runtime.set_cwd(cwd);
-        runtime.apply_config_keep_tools(&self.config());
+        let config = self.config();
+        runtime.apply_config_keep_tools(&config);
+        // Every interactive session starts in the operator's confirmed
+        // `memory.default_mode` (after the backend binding above). A failed
+        // grant is logged and leaves memory off; it never fails the session.
+        if memory_default {
+            let _ = runtime.apply_memory_default_mode(&config.memory);
+        }
         Ok(runtime)
     }
 
@@ -366,7 +404,9 @@ impl EngineHost {
         // tools, so a projected schema would silently drop every extension
         // tool.
         host.progressive_tool_disclosure = false;
-        Ok(Runtime::from_parts(RuntimeParts::with_reaper(host)))
+        let mut runtime = Runtime::from_parts(RuntimeParts::with_reaper(host));
+        runtime.apply_retry_config(&self.config());
+        Ok(runtime)
     }
 
     /// Cached-or-rebuilt worker registry: `without_subagent_with_extensions`
@@ -445,6 +485,20 @@ impl EngineHost {
             host.remove_session(&id);
         });
         Ok(handle)
+    }
+
+    /// Test seam: [`Self::create_session`] without spawning the actor, so a
+    /// test can seed session state (e.g. a fake worker in the subagent
+    /// registry) before `task.run()`. The handle is registered; the caller
+    /// spawns the task.
+    #[cfg(any(test, feature = "testing"))]
+    pub async fn create_session_unspawned(
+        self: &Arc<Self>,
+        cfg: SessionConfig,
+    ) -> Result<(SessionHandle, crate::session::SessionTask)> {
+        let (handle, task) = SessionActor::create(self, cfg).await?;
+        self.adopt_session(handle.clone());
+        Ok((handle, task))
     }
 
     /// Register a handle built elsewhere (daemon test factories). The
@@ -716,30 +770,17 @@ impl EngineHost {
     }
 }
 
+/// Print `config.warnings` to stderr and the log (headless hosts).
+pub fn report_config_warnings(config: &crate::SynapsConfig) {
+    for warning in &config.warnings {
+        tracing::warn!(%warning, "config warning");
+        eprintln!("synaps: config warning: {warning}");
+    }
+}
+
 #[cfg(test)]
 mod driver_grant_tests {
     use super::*;
-
-    /// Build a minimal EngineHost for unit testing driver grants.
-    /// Only the driver_grants, sessions, and adjacent fields are initialized;
-    /// nothing boots a runtime or loads extensions.
-    fn test_host() -> Arc<EngineHost> {
-        // Use the real boot path's struct literal so the test fails to compile
-        // if a field is added and not initialised here — belt and suspenders.
-        // We can't call boot() without full config, so we manufacture one.
-        // Instead, reach into the same fields and just test the grant logic.
-        Arc::new_cyclic(|_| {
-            // Minimal construction: only the fields we touch. Others are default.
-            // This is intentionally a helper, not the full EngineHost::boot path.
-            use std::collections::HashMap;
-            use std::sync::Mutex;
-
-            // We cannot construct EngineHost without private fields, so we
-            // test the grant logic via standalone functions that mirror the
-            // Mutex<HashMap> pattern.
-            unreachable!()
-        })
-    }
 
     // Since EngineHost has many private fields we cannot construct in a unit
     // test without the full boot path, test the grant logic on a standalone

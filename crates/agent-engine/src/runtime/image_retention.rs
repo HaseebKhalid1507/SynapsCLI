@@ -211,7 +211,7 @@ mod tests {
     fn low_water_is_soft_and_only_applies_after_hard_overflow() {
         // Synthetic serialized sizes: intentionally not valid per-item media.
         let protected = batch(1, 13 * 1024 * 1024);
-        assert_eq!(plan(&[protected.clone()]).unwrap(), 0);
+        assert_eq!(plan(std::slice::from_ref(&protected)).unwrap(), 0);
         let older = batch(1, 8 * 1024 * 1024);
         assert_eq!(plan(&[older, protected]).unwrap(), 1);
         // The protected 13 MiB batch cannot meet 12 MiB or a 40-image chunk;

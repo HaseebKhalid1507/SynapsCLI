@@ -205,10 +205,22 @@ Called when the model invokes an extension-provided tool declared during
   "method": "tool.call",
   "params": {
     "name": "echo",
-    "input": { "text": "hello" }
+    "input": { "text": "hello" },
+    "session_id": "20261014-050933-a06f"
   }
 }
 ```
+
+| Field        | Type           | Description |
+|--------------|----------------|-------------|
+| `name`       | string         | The extension's own tool name, as declared in `capabilities.tools` (not the `plugin-id:name` runtime name). |
+| `input`      | object         | The arguments the model supplied. |
+| `session_id` | string \| null | The conversation that invoked the tool: the same value the hook events carry. `null` for workers/subagents, the extension-provider tool route, contexts with no conversation, and when `SYNAPS_HOOK_SESSION_ID=0`. Always present. |
+
+In daemon mode one extension process serves every session, so key any
+per-caller tool state on `params.session_id` (see
+[session-id.md](session-id.md)). Older hosts omit the field; treat a
+missing key like `null`.
 
 **Response:**
 
@@ -352,10 +364,11 @@ messages compacted.
 ### `on_message_complete`
 
 `on_message_complete` is emitted after an assistant response is completed and
-added to session history. It requires `privacy.llm_content` and supports only
-`continue`. `message` contains concatenated assistant text blocks when present;
-tool-use blocks are summarized in `data` instead of being serialized into
-`message`.
+added to session history. It requires `privacy.llm_content` and supports
+`continue` plus the advisory [`context_phase`](#context_phase) result. It can
+never block, modify, or inject. `message` contains concatenated assistant text
+blocks when present; tool-use blocks are summarized in `data` instead of being
+serialized into `message`.
 
 ```json
 {
@@ -369,10 +382,27 @@ tool-use blocks are summarized in `data` instead of being serialized into
   "transcript": null,
   "data": {
     "content_block_count": 1,
-    "has_tool_use": false
+    "has_tool_use": false,
+    "context_management": {
+      "enabled": true,
+      "band": "normal",
+      "phase": "execute"
+    }
   }
 }
 ```
+
+`data.context_management` (additive, protocol version 1) describes the host's
+automatic context management at the time the response completed:
+
+| Field     | Type            | Description                                                                                       |
+|-----------|-----------------|---------------------------------------------------------------------------------------------------|
+| `enabled` | boolean         | Whether automatic context management (`/context auto`) is on for this session                    |
+| `band`    | string \| null  | Latest admission band: `"normal"`, `"pressure"`, `"rollover"`, or `"hard_limit"`; `null` when disabled or not yet assessed |
+| `phase`   | string          | Current advisory work phase: `"unknown"`, `"plan"`, `"execute"`, `"wrap_up"`, or `"new_task"` (`"unknown"` when disabled) |
+
+The model's checkpoint note is never included. When context management is
+disabled the object is `{"enabled": false, "band": null, "phase": "unknown"}`.
 
 ---
 
@@ -420,9 +450,15 @@ Ask SynapsCLI to get explicit user confirmation before proceeding. Only valid on
 |-----------|--------|----------|--------------------------------------------------|
 | `message` | string | yes      | Human-readable confirmation prompt for the user  |
 
+The host shows your extension id and the tool name above `message`; an extension cannot set or spoof them. The dialog offers **Allow** (this call), **Allow all from `<your-extension>` this session**, and **Deny**. "Allow all" auto-approves later `confirm` results from *your loaded extension only* (any tool) until `/new` or `/confirms reset`; reloading or reinstalling your extension clears it, confirms from other extensions still prompt, and `block` is never overridden. Subagent tool calls do not run extension `before_tool_call` hooks today, so neither `confirm` nor `block` applies to them. A long `message` is cut to 12 lines / 1200 characters. If an earlier extension's `modify` rewrote the input, the host adds "Input rewritten by: <ids>" and a capped, credential-redacted preview (6 lines / 400 characters; secret-named fields, `Authorization`/`Bearer` headers, `api_key=`/`token=`-style parameters, `sk-…` keys and JWTs become `[REDACTED]`) of the input that will actually run above your `message`, which is shown under "Message from <your-extension>:" (your `message` is credential-redacted the same way, and control, bidi and zero-width characters are stripped from it), and when the user approves, every attached client gets a transcript line saying the call ran rewritten input. Assume any `confirm` you return may be auto-approved once the user has chosen "Allow all" for your extension.
+
+### Handler chain order
+
+On `before_tool_call`, only `block` stops the handler chain. A `modify` rewrites the input and the chain continues: every later handler sees the modified input, a later `block` still wins, and a later `confirm` still prompts (approving runs the modified input). A `confirm` is recorded and the chain continues: a later `block` still wins, confirms from several extensions are merged into one prompt that names all of them, and a `modify` that arrives after a `confirm` is ignored and logged (the user confirms the input as it was when they were asked). Later handlers therefore run, with any side effects, before the user answers a `confirm`, and they are not told whether the user approved.
+
 ### `modify`
 
-Replace the tool input before execution. Only valid on `before_tool_call`; on other hooks, `modify` is treated as `continue` and logged as an unsupported action. The first `modify`, `confirm`, or `block` result stops the handler chain. Trace logs record `action=modify` but do not log the replacement input.
+Replace the tool input before execution. Only valid on `before_tool_call`; on other hooks, `modify` is treated as `continue` and logged as an unsupported action. Trace logs record `action=modify` but do not log the replacement input.
 
 ```json
 {
@@ -475,6 +511,50 @@ live in the system prompt):
 
 - **`on_session_start`** — content is **appended to the system prompt** once
   and carried unchanged for the whole session. Session-stable, cache-safe.
+  A session that does not wait for extensions when it is created (quick
+  start, and every session a daemon reload restores) runs the hook in the
+  background, one session at a time per host. No turn and no keep-warm
+  request of that session goes out before its hook has run: a turn that
+  comes first waits for it (and goes ahead of other sessions' background
+  hooks), while Cancel and End still act at once; a due keep-warm ping
+  waits with its timer off and goes out once the hook has run. Unlike a
+  turn, a due ping does not move its hook ahead of other sessions'
+  background hooks: the one behaviour change from when each source checked
+  the hook on its own. Production does not reach that state: a keep-warm
+  period starts only with an accepted request, and that request already
+  waited for the hook (only a test seam builds a due ping with the hook
+  pending). A manual `/compact` builds its own prompt and does not wait.
+  This is the first turn of every in-process TUI session, and of every
+  daemon TUI session with Quick Start (`startup.quick_start`, on by
+  default): the turn starts at once, but its request waits for
+  extension discovery (up to
+  `startup.extensions_ready_timeout_secs`, 30 s by default) and then for
+  the hook (each subscribed handler up to 5 s, in turn). Clients get a
+  `SystemNotice` ("waiting for extensions to start …") while it waits. A
+  `/clear` (`NewSession`) during that wait cancels the waiting turn first;
+  its request is never sent.
+  A session restored Parked runs the hook once it is unparked; a park
+  takes a hook not yet called out of line, a park that does not happen
+  (held by running or uncollected workers) leaves it in place. While a
+  daemon reload has checkpointed the session (until the exec, until the
+  daemon reports that it failed, or until the fence's backstop timeout of
+  120 s), no queued event, keep-warm ping, park or driver tick starts
+  work, and commands that would are refused; a hook already in line may
+  still run. Work that waited for both the reload and the hook starts
+  once both have cleared. The order is strict: a hook
+  that a turn or a session's creation waits for goes before background
+  ones, which run in arrival order only while no such hook waits, so the
+  background hooks of idle sessions can be held back for as long as others
+  keep arriving. `startup.extensions_ready_timeout_secs` bounds extension
+  discovery only, not this wait: a session created with
+  `await_extensions = true` waits for the hook that is running and for any
+  older foreground ones, each bounded by the handler timeout. A hook call
+  already sent is not abandoned when its session ends or parks: the next
+  session's hook goes out only once that call has returned, so these hooks
+  do not queue inside one extension process (an ended session's injection
+  is dropped). The exception is a handler that runs past its timeout: the
+  host fails open for that session, and the extension may still be working
+  on the call when the next session's hook arrives.
 - **`before_message`** — content is re-evaluated per turn and **attached to
   the newest user message** as a trailing text block on the outgoing request,
   positioned **after** the conversational cache breakpoint: the cache marker
@@ -503,6 +583,44 @@ context]`) before the model sees it.
 | Field     | Type   | Required | Description                                                       |
 |-----------|--------|----------|-------------------------------------------------------------------|
 | `content` | string | yes      | Markdown-formatted text to inject (placement per the hook, above) |
+
+### `context_phase`
+
+Report an **advisory work phase** to the host's automatic context management.
+Only valid on `on_message_complete`; on other hooks it is treated as
+`continue` and logged as an unsupported action.
+
+The semantics are **identical** to the model calling its own
+`context_checkpoint` tool with this phase and no note: the host records the
+phase in its context policy and may roll the context window over at the next
+task boundary (for example after `"new_task"`, or after `"execute"` following
+a `"plan"`). It is a lower-authority report, never capacity or permission
+authority: it cannot force a rollover, replenish any budget, authorize tools,
+or mutate session history, and it never sets a checkpoint note. When context
+management is disabled the report is ignored.
+
+Requires the **`session.lifecycle`** permission *in addition to*
+`privacy.llm_content` (two-key gate). A `context_phase` from an extension
+lacking it is ignored with a warning and treated as `continue`. Unknown
+`phase` strings are ignored with a warning.
+
+Unlike `block`/`modify`/`replace`, a `context_phase` does **not** stop the
+handler chain: every other `on_message_complete` observer still runs. When
+several extensions report in the same event, the first accepted report (in
+registration order) wins. The `data.context_management` field on the event
+tells the extension whether management is enabled and the current band/phase,
+so it can avoid redundant reports.
+
+```json
+{
+  "action": "context_phase",
+  "phase": "new_task"
+}
+```
+
+| Field   | Type   | Required | Description                                                                 |
+|---------|--------|----------|-----------------------------------------------------------------------------|
+| `phase` | string | yes      | One of `"unknown"`, `"plan"`, `"execute"`, `"wrap_up"`, `"new_task"` (case-insensitive; `wrapup`/`wrap-up` and `newtask`/`new-task` accepted) |
 
 ---
 
@@ -646,7 +764,7 @@ Relative command paths and local argument paths are resolved from the plugin dir
 |----------------------|--------------------------------------------------------------------------------------------|
 | `tools.intercept`    | Allows subscription to `before_tool_call` and `after_tool_call`.                           |
 | `privacy.llm_content`| Allows subscription to message-content hooks such as `before_message`.                     |
-| `session.lifecycle`  | Enables receipt of `on_session_start` and `on_session_end` events.                         |
+| `session.lifecycle`  | Enables receipt of `on_session_start` and `on_session_end` events; also the second key for the advisory `context_phase` result on `on_message_complete`. |
 | `tools.register`    | Register extension-provided tools during initialization.                                    |
 | `providers.register`| Register extension-provided provider metadata during initialization. Chat routing is not wired yet. |
 

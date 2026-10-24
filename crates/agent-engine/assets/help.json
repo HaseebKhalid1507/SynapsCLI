@@ -558,14 +558,54 @@
     "common": true,
     "aliases": ["/exit"],
     "keywords": ["quit", "exit"],
-    "lines": ["/quit or /exit leaves SynapsCLI."],
-    "related": ["/help"]
+    "lines": [
+      "/quit or /exit leaves SynapsCLI.",
+      "Attached to a daemon session, it only detaches: the session stays loaded in the daemon (and a running turn keeps running). /close ends it."
+    ],
+    "related": ["/close", "/help"]
+  },
+  {
+    "id": "close-command",
+    "command": "/close",
+    "title": "Close this session",
+    "summary": "End this session in the daemon instead of only detaching from it; it can be continued later.",
+    "category": "Sessions",
+    "topic": "Command",
+    "protected": true,
+    "common": false,
+    "aliases": [],
+    "keywords": ["close", "end", "session", "daemon", "detach", "quit", "unload", "idle"],
+    "lines": [
+      "/close saves this session and ends it in the daemon: it leaves `synaps daemon sessions`, every attached client exits, and nothing wakes it again. Resume it with `synaps --attach --continue <id>`.",
+      "It refuses while closing would stop work in flight: a running turn or compaction, a running worker, or an armed /auto run. /close force closes anyway; it cancels the running workers first and notes each one in the conversation, for whoever continues it.",
+      "Only the client that owns input can close the session. In-process (no daemon), /close is /quit with the same checks."
+    ],
+    "related": ["/quit", "/workers", "/keepwarm"]
+  },
+  {
+    "id": "watch-command",
+    "command": "/watch",
+    "title": "Watch and steer a subagent",
+    "summary": "Open a running subagent in its own thread view; Enter there steers it. Alt-Up/Alt-Down (or Ctrl-Up/Ctrl-Down) switch views.",
+    "category": "Sessions",
+    "topic": "Command",
+    "protected": true,
+    "common": false,
+    "aliases": [],
+    "keywords": ["watch", "subagent", "worker", "agent", "thread", "steer", "observe", "ctrl-up", "ctrl-down", "alt-up", "alt-down", "mission control"],
+    "lines": [
+      "Alt-Up (or Ctrl-Up) from the main thread opens the newest subagent (the tray's bottom row) in its own view; more Up walk to older ones. Alt-Down (or Ctrl-Down) walks back down, and past the newest returns to the main thread. Esc also returns to main (it never cancels the main turn there). On macOS, Ctrl-Up/Down are taken by Mission Control by default: use Alt (Option; in Terminal.app turn on \"Use Option as Meta key\") or /watch.",
+      "/watch lists the subagents you can watch (or opens the only one). /watch <name>, /watch sa_N or /watch N opens one; /watch main goes back.",
+      "A subagent's view shows what it streams: text, thinking, tool calls and results, live. Scrolling, selection and Ctrl-O act on the view you are in, and the main thread keeps its own scroll position.",
+      "Enter with text in a running subagent's view steers that subagent (input owner only); slash commands still run as usual. The steer is also noted in the main conversation, so the main agent knows you redirected its worker. A finished subagent's view is read-only and stays watchable for 15 minutes."
+    ],
+    "related": ["/keybinds"]
   },
   {
     "id": "keepwarm-command",
     "command": "/keepwarm",
     "title": "Prompt-cache keep-warm",
-    "summary": "Show or override idle prompt-cache keep-warm for this session: off, auto, or <N>h.",
+    "summary": "Show or override idle prompt-cache keep-warm for this session: off, auto, or <N>h (pings the API; not /pin).",
     "category": "Sessions",
     "topic": "Command",
     "protected": true,
@@ -578,9 +618,29 @@
       "/keepwarm 6h applies the same bound and stops 6 hours after the session went idle instead of the auto cap (N = 1–48). /keepwarm off stops it for this session; the choice survives park and daemon reload.",
       "Nothing is pinged when nothing is cached (a prompt below the model's cache minimum), when the next turn would roll the context over first, or when one worst-case ping costs more than the rewrite (budgeted thinking on a small prompt).",
       "Pings stop by themselves when the next request would differ (/model, /thinking, /system, tool activation, /compact, /clear); read-only commands do not affect them. A new message ends the idle period.",
-      "Keep-warm spend and tokens are part of the session cost and token totals and labelled separately in the footer and /stats; each ping's spend is saved as soon as it is booked (the labels with the session snapshot). The default comes from cache_keepwarm in config (off unless set)."
+      "Keep-warm spend and tokens are part of the session cost and token totals and labelled separately in the footer and /stats; each ping's spend is saved as soon as it is booked (the labels with the session snapshot). The default comes from cache_keepwarm in config (off unless set).",
+      "This is the prompt cache, not the session: /pin keeps a daemon session loaded and costs nothing."
     ],
-    "related": ["/stats", "/context"]
+    "related": ["/stats", "/context", "/pin"]
+  },
+  {
+    "id": "pin-command",
+    "command": "/pin",
+    "title": "Pin this session",
+    "summary": "Keep this daemon session loaded: never parked or idle-ended, and the daemon does not idle-exit while it is pinned.",
+    "category": "Sessions",
+    "topic": "Command",
+    "protected": true,
+    "common": false,
+    "aliases": ["/keep-warm"],
+    "keywords": ["pin", "unpin", "keep-warm", "park", "idle", "daemon", "loaded", "idle-exit"],
+    "lines": [
+      "/pin (or /pin status) shows whether this session is pinned. /pin on pins it, /pin off unpins it; only the client that owns input can change it. /keep-warm on|off is the same command, and synaps --attach --keep-warm pins at attach.",
+      "A pinned session is never parked, idle-ended or evicted, and the daemon does not idle-exit while any session is pinned. It survives daemon reload, but not /close, synaps daemon close, synaps daemon stop or a crash.",
+      "From another shell: synaps daemon pin <ID|NAME> [--off]. synaps daemon sessions marks pinned sessions.",
+      "Not /keepwarm (no dash), which keeps the prompt cache warm by pinging the API and costs money. In-process (no daemon), /pin does nothing: the session ends with the TUI."
+    ],
+    "related": ["/close", "/keepwarm", "/sessions"]
   },
   {
     "id": "budget-command",
@@ -602,6 +662,24 @@
       "Local /auto turns use this foreground runtime's budget; /budget is an explicit control command and revokes an active autonomous driver grant. Reauthorize /auto start if needed. With an opted-in driver, wall-clock exhaustion continues retained work on the same model; other budget failures still stop. It never triggers provider fallback."
     ],
     "related": ["/context", "/help sessions"]
+  },
+  {
+    "id": "confirms-command",
+    "command": "/confirms",
+    "title": "Extension confirm approvals",
+    "summary": "Show or revoke the extensions you chose \"Allow all\" for in this session.",
+    "category": "Extensions",
+    "topic": "Command",
+    "protected": true,
+    "common": false,
+    "aliases": [],
+    "keywords": ["confirm", "allow all", "approve", "revoke", "consent", "extension"],
+    "lines": [
+      "When an extension asks you to confirm a tool call, the dialog names the extension and the tool. \"Allow all from <ext> this session\" auto-approves later confirms from that loaded extension only (any tool), until /new or /confirms reset; reloading or reinstalling the extension clears it. Other extensions still ask, and a block from any extension still wins. Note: subagent tool calls do not run extension before_tool_call hooks today, so extension confirms and blocks do not apply to them at all.",
+      "/confirms (or /confirms status) lists the extensions with \"Allow all\" armed. /confirms reset revokes them all at once.",
+      "/new and resuming a session also start with nothing armed. Only the input owner can choose \"Allow all\" (focus the button with Tab or the arrow keys, press Enter, then Enter again to confirm); every attached client is told when it is armed."
+    ],
+    "related": ["/extensions"]
   },
   {
     "id": "context-command",

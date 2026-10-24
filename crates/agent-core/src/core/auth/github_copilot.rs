@@ -27,7 +27,7 @@ use reqwest::Client;
 use serde::Deserialize;
 use url::Url;
 
-use super::{now_millis, open_browser, save_provider_auth, OAuthCredentials};
+use super::{now_millis, open_browser, OAuthCredentials};
 
 // ── Public constants (evidence-isolated) ─────────────────────────────────────
 
@@ -107,10 +107,21 @@ pub enum CopilotAuthError {
     Transport,
     ResponseTooLarge,
     Persist,
+    /// The credential store is corrupt; carries our own repair text
+    /// (path + `mv` command, no secrets).
+    CorruptStore(String),
     Other(&'static str),
 }
 
 impl CopilotAuthError {
+    /// Login persistence failure: a corrupt store keeps its actionable text.
+    pub(crate) fn from_store(e: super::storage::StoreError) -> Self {
+        match e {
+            super::storage::StoreError::Corrupt(msg) => Self::CorruptStore(msg),
+            _ => Self::Persist,
+        }
+    }
+
     fn label(&self) -> &'static str {
         match self {
             Self::UntrustedEndpoint => "untrusted endpoint",
@@ -129,6 +140,7 @@ impl CopilotAuthError {
             Self::Transport => "transport error",
             Self::ResponseTooLarge => "response body too large",
             Self::Persist => "credential persistence failed",
+            Self::CorruptStore(_) => "credential store is corrupt",
             Self::Other(msg) => msg,
         }
     }
@@ -138,6 +150,7 @@ impl fmt::Display for CopilotAuthError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::HttpStatus(code) => write!(f, "HTTP error {code}"),
+            Self::CorruptStore(msg) => f.write_str(msg),
             Self::SessionMintRejected(code) => {
                 write!(f, "Copilot session mint rejected (HTTP {code})")
             }
@@ -149,6 +162,27 @@ impl fmt::Display for CopilotAuthError {
 impl fmt::Debug for CopilotAuthError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "CopilotAuthError({self})")
+    }
+}
+
+impl CopilotAuthError {
+    /// Typed refresh (session re-mint) failure.
+    pub fn refresh_failure(&self) -> super::RefreshFailure {
+        use super::token::RefreshFailureKind as K;
+        let kind = match self {
+            Self::HttpStatus(code) => super::token::status_kind(*code),
+            Self::SessionMintRejected(_)
+            | Self::EmptyGitHubToken
+            | Self::AccessDenied
+            | Self::Expired => K::Credential,
+            Self::Transport
+            | Self::ResponseTooLarge
+            | Self::InvalidSessionResponse
+            | Self::InvalidTokenResponse
+            | Self::EmptySessionToken => K::Transient,
+            _ => K::Other,
+        };
+        super::RefreshFailure::new(kind, self.to_string())
     }
 }
 
@@ -701,13 +735,31 @@ pub struct LoginHooks<'a, B> {
     pub on_user_code: Option<UserCodeHook<'a>>,
 }
 
-/// Device start → user prompt → poll → mint → atomic persist.
+/// Device start → user prompt → poll → mint → atomic persist (default slot).
 pub async fn login_with<H, C, B, X>(
     http: &H,
     clock: &C,
     hooks: LoginHooks<'_, B>,
     cancel: &X,
     persist: bool,
+) -> Result<OAuthCredentials, CopilotAuthError>
+where
+    H: CopilotHttp,
+    C: CopilotClock,
+    B: CopilotBrowser,
+    X: CopilotCancel + ?Sized,
+{
+    login_with_into(http, clock, hooks, cancel, persist.then_some(PROVIDER)).await
+}
+
+/// Like [`login_with`] but persists ONLY into `persist_key` when given
+/// (`github-copilot` or `github-copilot@<label>`).
+pub async fn login_with_into<H, C, B, X>(
+    http: &H,
+    clock: &C,
+    hooks: LoginHooks<'_, B>,
+    cancel: &X,
+    persist_key: Option<&str>,
 ) -> Result<OAuthCredentials, CopilotAuthError>
 where
     H: CopilotHttp,
@@ -729,19 +781,25 @@ where
 
     let github_token = wait_for_device_authorization(http, clock, &authz, cancel).await?;
     let creds = mint_credentials(http, clock, &github_token).await?;
-    if persist {
-        save_provider_auth(PROVIDER, &creds).map_err(|_| CopilotAuthError::Persist)?;
+    if let Some(key) = persist_key {
+        super::storage::save_provider_auth_typed(key, &creds).map_err(CopilotAuthError::from_store)?;
     }
     Ok(creds)
 }
 
 /// Production login entry (real network + system browser + auth.json).
 pub async fn login() -> Result<OAuthCredentials, String> {
+    login_into(Some(PROVIDER)).await
+}
+
+/// Production login; `Some(key)` persists ONLY into that slot, `None`
+/// returns the credential unsaved.
+pub async fn login_into(persist_key: Option<&str>) -> Result<OAuthCredentials, String> {
     let http = ProductionHttp::new().map_err(|e| e.to_string())?;
     let clock = ProductionClock;
     let browser = ProductionBrowser;
     let cancel = AtomicBool::new(false);
-    login_with(
+    login_with_into(
         &http,
         &clock,
         LoginHooks {
@@ -749,7 +807,7 @@ pub async fn login() -> Result<OAuthCredentials, String> {
             on_user_code: None,
         },
         &cancel,
-        true,
+        persist_key,
     )
     .await
     .map_err(|e| e.to_string())
@@ -759,12 +817,12 @@ pub async fn login() -> Result<OAuthCredentials, String> {
 pub async fn refresh_token(
     _client: &Client,
     github_token: &str,
-) -> Result<OAuthCredentials, String> {
-    let http = ProductionHttp::new().map_err(|e| e.to_string())?;
+) -> Result<OAuthCredentials, super::RefreshFailure> {
+    let http = ProductionHttp::new().map_err(|e| e.refresh_failure())?;
     let clock = ProductionClock;
     mint_credentials(&http, &clock, github_token)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.refresh_failure())
 }
 
 // ── Production adapters ──────────────────────────────────────────────────────
@@ -960,13 +1018,16 @@ pub mod testutil {
         Status(u16, String),
     }
 
+    type RecordedPost = (String, Vec<(String, String)>);
+    type RecordedGet = (String, String, Vec<(String, String)>);
+
     #[derive(Default)]
     pub struct FakeHttp {
         pub post_queue: Mutex<Vec<ScriptedResponse>>,
         pub get_queue: Mutex<Vec<ScriptedResponse>>,
-        pub posts: Mutex<Vec<(String, Vec<(String, String)>)>>,
+        pub posts: Mutex<Vec<RecordedPost>>,
         /// (url, bearer, headers)
-        pub gets: Mutex<Vec<(String, String, Vec<(String, String)>)>>,
+        pub gets: Mutex<Vec<RecordedGet>>,
     }
 
     impl FakeHttp {
@@ -1085,6 +1146,20 @@ pub mod testutil {
 mod tests {
     use super::testutil::*;
     use super::*;
+
+    /// Round-2 I2: a corrupt store at login is reported with its repair
+    /// command, not as "credential persistence failed".
+    #[test]
+    fn login_save_on_a_corrupt_store_says_how_to_fix_it() {
+        use super::super::storage::StoreError;
+        let msg = "/x/auth.json is not valid JSON; mv '/x/auth.json' '/x/auth.json.broken-1'";
+        let err = CopilotAuthError::from_store(StoreError::Corrupt(msg.into()));
+        assert_eq!(err.to_string(), msg);
+        assert_eq!(
+            CopilotAuthError::from_store(StoreError::Failed("disk full".into())).to_string(),
+            "credential persistence failed"
+        );
+    }
     use std::sync::Mutex;
 
     #[test]
@@ -1108,7 +1183,7 @@ mod tests {
         validate_verification_uri(DEFAULT_VERIFICATION_URI).unwrap();
         assert!(CONNECT_TIMEOUT.as_secs() > 0);
         assert!(REQUEST_TIMEOUT.as_secs() > 0);
-        assert!(MAX_RESPONSE_BODY_BYTES >= 1024);
+        const { assert!(MAX_RESPONSE_BODY_BYTES >= 1024) };
     }
 
     #[test]

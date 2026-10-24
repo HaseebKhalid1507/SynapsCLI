@@ -668,6 +668,7 @@ impl ExtensionRuntimeManager {
 
     /// Execute one EXACT already-gate-authorized extension tool call. See
     /// module docs for the lease/single-flight/validation contract.
+    /// Host-originated: the wire `session_id` is `null`.
     pub async fn call_exact(
         &self,
         session: &SessionId,
@@ -675,6 +676,22 @@ impl ExtensionRuntimeManager {
         tool_name: &str,
         expected_digest: &SchemaDigest,
         params: Value,
+    ) -> Result<Value, ExtensionLeaseError> {
+        self.call_exact_for(session, plugin, tool_name, expected_digest, params, None)
+            .await
+    }
+
+    /// [`Self::call_exact`] on behalf of a conversation: `conversation_id`
+    /// is forwarded as `tool.call` `params.session_id` (the owning
+    /// conversation, not the lease scope `session`).
+    pub async fn call_exact_for(
+        &self,
+        session: &SessionId,
+        plugin: &str,
+        tool_name: &str,
+        expected_digest: &SchemaDigest,
+        params: Value,
+        conversation_id: Option<&str>,
     ) -> Result<Value, ExtensionLeaseError> {
         // 1.-2. Record re-read + manifest re-validation (pure local).
         let (record, validated) = self.record_and_validate(session, plugin)?;
@@ -730,7 +747,7 @@ impl ExtensionRuntimeManager {
         }
         let result = inner
             .handler
-            .call_tool_once_no_spawn(tool_name, params)
+            .call_tool_once_no_spawn(tool_name, params, conversation_id)
             .await;
         if inner.cancelled() {
             // Revoked while this already-started call ran: shut the child
@@ -902,6 +919,28 @@ impl ExtensionLeaseCapability {
     ) -> Result<Value, ExtensionLeaseError> {
         self.manager
             .call_exact(&self.session, plugin, tool_name, expected_digest, params)
+            .await
+    }
+
+    /// [`Self::call_exact`] on behalf of a conversation; see
+    /// [`ExtensionRuntimeManager::call_exact_for`].
+    pub async fn call_exact_for(
+        &self,
+        plugin: &str,
+        tool_name: &str,
+        expected_digest: &SchemaDigest,
+        params: Value,
+        conversation_id: Option<&str>,
+    ) -> Result<Value, ExtensionLeaseError> {
+        self.manager
+            .call_exact_for(
+                &self.session,
+                plugin,
+                tool_name,
+                expected_digest,
+                params,
+                conversation_id,
+            )
             .await
     }
 }

@@ -246,6 +246,7 @@ async fn run_inline(
                 // ── Slash commands ──
                 if let Some((cmd, arg)) = commands::parse_command(trimmed) {
                     // Try engine-level command first
+                    commands::prepare_engine_command(cmd, arg, &runtime).await;
                     if let Some(result) = commands::handle_engine_command(cmd, arg, &mut runtime) {
                         match result {
                             CommandResult::Quit => break,
@@ -328,6 +329,7 @@ async fn run_inline(
                     match cmd {
                         "clear" => {
                             conv.clear(&runtime).await;
+                            runtime.begin_conversation(Some(conv.session.id.clone()));
                             eprintln!("session cleared → {}", &conv.session.id[..8]);
                         }
                         "sessions" => match synaps_cli::list_recent_sessions(20) {
@@ -764,7 +766,12 @@ mod actor {
                         // Confirm (e.g. `activate_tools`): show the FULL body
                         // and take one y/n line. Anything but y/yes denies.
                         self.end_thinking();
-                        eprint!("\n[confirm] {}\n{}\n(y/n): ", pr.title, pr.prompt);
+                        // Sanitized (prA I-R4-3): no cursor moves or bidi tricks.
+                        eprint!(
+                            "\n[confirm] {}\n{}\n(y/n): ",
+                            agent_engine::session::sanitize_prompt_text(&pr.title),
+                            agent_engine::session::sanitize_prompt_text(&pr.prompt)
+                        );
                         io::stderr().flush().ok();
                         self.pending_confirm = Some(pr);
                         return;
@@ -895,7 +902,7 @@ mod actor {
                 StreamEvent::Agent(AgentEvent::SteeringDelivered { message }) => {
                     eprintln!("\x1b[33m→ [steering] {}\x1b[0m", message);
                 }
-                StreamEvent::Session(SessionEvent::Notice(text)) => {
+                StreamEvent::Session(SessionEvent::Notice(text) | SessionEvent::Retry(text)) => {
                     eprintln!("\x1b[2m{}\x1b[0m", text);
                 }
                 StreamEvent::Session(SessionEvent::Done) => {
@@ -960,6 +967,7 @@ mod actor {
             mcp_discovery: agent_engine::McpDiscovery::Inline,
         })
         .await?;
+        host.report_config_warnings();
         // Extension discovery completes BEFORE the session exists, so
         // `on_session_start` reaches subscribers and the first API call sees
         // extension-registered tools (piped stdin is ready immediately).

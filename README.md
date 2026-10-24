@@ -73,6 +73,13 @@ cargo build --release && ./target/release/synaps
 
 Linux and macOS. Windows is not supported.
 
+`cargo build --release --no-default-features` drops the `command-exec` feature:
+the `bash` tool is compiled out and the `shell_*` tools are never registered.
+That is all it removes. It is not a sandbox. The agent can still start
+processes indirectly: `write`/`edit` can change shell rc files, `mcp.json`,
+plugin manifests or watcher configs; a watcher's `wake_if` runs through `sh -c`;
+and extensions, MCP servers and plugin commands all spawn processes.
+
 *New to agents? Start with the [ELI5](ELI5.md). Want the full tour? The [Wiki](https://github.com/HaseebKhalid1507/SynapsCLI/wiki) has 36 pages.*
 
 ---
@@ -130,7 +137,7 @@ Synaps auto-targets `http://localhost:11434/v1`, which is Ollama's default, so a
 - **Any model.** Claude, Codex, Grok, Copilot, Gemini, Kimi, Azure, Bedrock, Vertex, any OpenAI-compatible endpoint, or the Ollama on your box. Starts with zero credentials. Routes that can't work fail closed.
 - **Build on it.** Process-isolated extensions in any language, MCP servers, custom tools. A small core with enough hooks to bolt on whatever you want and glue it to whatever you've got.
 - **Lean is fast.** One 25MB binary, ~10 ms to first frame on a warm daemon, ~3 MB per extra session. No framework tax, no interpreter warming up.
-- **20 themes.** `catppuccin`, `gruvbox`, `nord`, `tokyo-night`, plus originals like `neon-rain` and `night-city`. Hot-swap with `/theme`.
+- **21 themes.** `catppuccin`, `gruvbox`, `nord`, `tokyo-night`, plus originals like `neon-rain` and `night-city`, and one light theme, `paper`. Hot-swap with `/theme`, or set `SYNAPS_THEME=<name>` for a single run without changing your config.
 
 ## Benchmarks
 

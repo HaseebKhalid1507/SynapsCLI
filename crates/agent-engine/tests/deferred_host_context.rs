@@ -15,6 +15,9 @@
 //!   * the sibling tool is never activated or called;
 //!   * no hook traffic and no first-turn body ever reach the child.
 
+#[path = "support/hermetic_base_dir.rs"]
+mod hermetic_base_dir;
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -96,6 +99,7 @@ fn ctx(cap: ExtensionLeaseCapability) -> ToolContext {
             tx_events: None,
         },
         capabilities: ToolCapabilities {
+            session_allow_all: None,
             launch_cancel: None,
             memory_backend: None,
             watcher_exit_path: None,
@@ -115,6 +119,7 @@ fn ctx(cap: ExtensionLeaseCapability) -> ToolContext {
             env: None,
             env_stripped: Vec::new(),
             env_warned: Default::default(),
+            session_id: None,
         },
         limits: ToolLimits {
             max_tool_output: 30000,
@@ -128,6 +133,7 @@ fn ctx(cap: ExtensionLeaseCapability) -> ToolContext {
 
 #[tokio::test]
 async fn legacy_alias_manifest_defers_spawns_once_and_receives_host_project_root() {
+    hermetic_base_dir::pin();
     let dir = tmp_dir("legacy");
     let spy = dir.join("spy.log");
     let tools_json = dir.join("tools.json");
@@ -234,6 +240,7 @@ async fn legacy_alias_manifest_defers_spawns_once_and_receives_host_project_root
 
 #[tokio::test]
 async fn unknown_activation_value_fails_closed_instead_of_eager() {
+    hermetic_base_dir::pin();
     let err = serde_json::from_value::<ExtensionManifest>(json!({
         "runtime": "process",
         "command": "true",
@@ -250,6 +257,7 @@ async fn unknown_activation_value_fails_closed_instead_of_eager() {
 
 #[tokio::test]
 async fn native_deferred_plus_legacy_aliases_is_ambiguous_and_rejected() {
+    hermetic_base_dir::pin();
     let err = serde_json::from_value::<ExtensionManifest>(json!({
         "runtime": "process",
         "command": "true",
@@ -267,6 +275,7 @@ async fn native_deferred_plus_legacy_aliases_is_ambiguous_and_rejected() {
 
 #[tokio::test]
 async fn legacy_tools_without_activation_still_fold_to_deferred() {
+    hermetic_base_dir::pin();
     // Passive declarations are deferral claims either way: a legacy
     // manifest listing tools must never silently load eager.
     let manifest: ExtensionManifest = serde_json::from_value(json!({

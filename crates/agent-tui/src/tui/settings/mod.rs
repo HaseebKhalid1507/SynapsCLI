@@ -33,6 +33,7 @@ const BUILTIN_THEMES: &[&str] = &[
     "ice",
     "forest",
     "lavender",
+    "paper",
 ];
 
 /// Compute the thinking level options for `model_runtime_id`.
@@ -43,6 +44,40 @@ const BUILTIN_THEMES: &[&str] = &[
 /// `openai-codex/<id>`, `anthropic/<id>` (and bare `claude-*`), and
 /// `xai-auth/<id>`. Providers without authoritative metadata keep the
 /// conservative set and NEVER gain max/ultra. No substring inference.
+/// Open the `/settings` modal: fresh state plus the matching ModalStack
+/// push (P7.7), stack sync asserted on the spot.
+pub(crate) fn open_modal(app: &mut super::app::App) {
+    app.settings = Some(SettingsState::new());
+    app.modal_stack.push(super::focus::PaneId::Settings);
+    #[cfg(debug_assertions)]
+    super::focus::debug_assert_stack_sync(app);
+}
+
+/// Settings that can't safely change while a turn runs, as the row note
+/// `(row key, reason)`; `None` = allowed mid-turn. Provider keys and the
+/// local URL are read by the running turn's next request, and plugin
+/// toggles, installs and plugin-owned settings can reload the registry or
+/// call into a plugin the turn may be using — so a change would land
+/// halfway through the turn. They are refused and left unchanged (an open
+/// key editor keeps its text: Enter again once the turn ends).
+pub(crate) fn mid_turn_refusal(outcome: &InputOutcome) -> Option<(String, String)> {
+    const AFTER: &str = "can't change while a turn is running — try again when it ends";
+    let (key, what) = match outcome {
+        InputOutcome::SetProviderKey { provider_id, .. } => {
+            (format!("provider.{provider_id}"), "provider settings")
+        }
+        InputOutcome::TogglePlugin { .. } | InputOutcome::OpenPluginsMarketplace => {
+            ("plugins".to_string(), "plugins")
+        }
+        InputOutcome::PluginApply { plugin_id, key, .. }
+        | InputOutcome::PluginCustomOpen { plugin_id, key, .. } => {
+            (format!("plugin.{plugin_id}.{key}"), "plugin settings")
+        }
+        _ => return None,
+    };
+    Some((key, format!("{what} {AFTER}")))
+}
+
 pub(crate) fn thinking_options_for_model(model: &str) -> Vec<String> {
     agent_engine::runtime::openai::catalog::validation::thinking_options_for_model(model)
 }
@@ -748,5 +783,50 @@ mod thinking_options_tests {
         );
         assert!(opts.contains(&"low".to_string()));
         assert!(opts.contains(&"medium".to_string()));
+    }
+}
+
+#[cfg(test)]
+mod mid_turn_tests {
+    use super::{mid_turn_refusal, InputOutcome};
+
+    #[test]
+    fn providers_and_plugins_are_refused_mid_turn_on_their_own_row() {
+        let cases = [
+            (
+                InputOutcome::SetProviderKey { provider_id: "groq".into(), value: "k".into() },
+                "provider.groq",
+            ),
+            (InputOutcome::TogglePlugin { name: "x".into(), enabled: true }, "plugins"),
+            (InputOutcome::OpenPluginsMarketplace, "plugins"),
+            (
+                InputOutcome::PluginApply { plugin_id: "p".into(), key: "k".into(), value: "v".into() },
+                "plugin.p.k",
+            ),
+            (
+                InputOutcome::PluginCustomOpen { plugin_id: "p".into(), category: "c".into(), key: "k".into() },
+                "plugin.p.k",
+            ),
+        ];
+        for (outcome, row) in cases {
+            let (key, msg) = mid_turn_refusal(&outcome).expect("refused mid-turn");
+            assert_eq!(key, row);
+            assert!(msg.contains("while a turn is running"), "{msg}");
+        }
+    }
+
+    #[test]
+    fn local_session_and_config_rows_are_allowed_mid_turn() {
+        for outcome in [
+            InputOutcome::Apply { key: "model", value: "m".into() },
+            InputOutcome::Apply { key: "theme", value: "t".into() },
+            InputOutcome::PreviewTheme { name: "t".into() },
+            InputOutcome::RevertTheme,
+            InputOutcome::PingModels,
+            InputOutcome::Close,
+            InputOutcome::None,
+        ] {
+            assert!(mid_turn_refusal(&outcome).is_none());
+        }
     }
 }

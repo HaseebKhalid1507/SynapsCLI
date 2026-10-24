@@ -1,5 +1,4 @@
 //! Shared test helpers for tool unit tests.
-#![cfg(test)]
 
 use super::{ToolCapabilities, ToolChannels, ToolContext, ToolLimits};
 
@@ -12,6 +11,7 @@ pub(crate) fn create_tool_context() -> ToolContext {
             tx_events: None,
         },
         capabilities: ToolCapabilities {
+            session_allow_all: None,
             launch_cancel: None,
             memory_backend: None,
             watcher_exit_path: None,
@@ -34,6 +34,7 @@ pub(crate) fn create_tool_context() -> ToolContext {
             env: None,
             env_stripped: Vec::new(),
             env_warned: Default::default(),
+            session_id: None,
         },
         limits: ToolLimits {
             max_tool_output: 30000,
@@ -43,4 +44,28 @@ pub(crate) fn create_tool_context() -> ToolContext {
             subagent_timeout: 300,
         },
     }
+}
+
+/// A memory binding of `kind` whose paths all lie in `dir`. Building it
+/// starts no service and writes nothing; an Axel binding is exclusive.
+pub(crate) fn memory_binding(
+    kind: agent_core::config::MemoryBackendKind,
+    dir: &std::path::Path,
+) -> crate::memory_backend::MemoryBinding {
+    crate::memory_backend::MemoryBinding::from_config_with_cwd(
+        &agent_core::config::MemoryBackendConfig {
+            kind,
+            executable: Some(dir.join("missing-service")),
+            brain: Some(dir.join("brain.r8")),
+            user_scope: false,
+        },
+        Some(dir.to_path_buf()),
+    )
+}
+
+/// A tool context carrying `binding` as its memory backend.
+pub(crate) fn context_with_memory(binding: crate::memory_backend::MemoryBinding) -> ToolContext {
+    let mut ctx = create_tool_context();
+    ctx.capabilities.memory_backend = Some(binding);
+    ctx
 }

@@ -109,6 +109,7 @@ impl Tool for SubagentTool {
         let model = decision.model.as_str().to_owned();
         let codex_parent_plan = ctx.capabilities.codex_parent_plan.clone();
         let memory_backend = ctx.capabilities.memory_backend.clone();
+        let session_allow_all = ctx.capabilities.session_allow_all.clone();
         let timeout_secs = params["timeout"]
             .as_u64()
             .unwrap_or(ctx.limits.subagent_timeout);
@@ -173,7 +174,7 @@ impl Tool for SubagentTool {
                     // turn budget. Subagents are short-lived one-shots — paying the 1h
                     // write premium (~2× input price) on them is unrecoverable waste
                     // (~$0.23 per 10-spawn fan-out). (#110)
-                    super::apply_subagent_runtime_policy(&mut runtime, &crate::config::load_config(), memory_backend.as_ref());
+                    super::apply_subagent_runtime_policy(&mut runtime, &crate::config::load_config(), memory_backend.as_ref(), session_allow_all.as_ref());
                     runtime.set_system_prompt(super::compose_system_prompt(system_prompt, runtime.memory_backend_is_axel()));
                     runtime.set_model(model);
                     super::apply_codex_worker_reasoning(&mut runtime, codex_parent_plan.as_ref());
@@ -212,6 +213,11 @@ impl Tool for SubagentTool {
                     tokio::select! {
                         event = stream.next() => {
                             let Some(event) = event else { break };
+                            crate::runtime::openai::codex_wire::forward_worker_web_search(
+                                &label_inner,
+                                &event,
+                                tx_events_inner.as_ref(),
+                            );
                             match event {
                                 crate::StreamEvent::Llm(LlmEvent::Thinking(_)) => {
                                     if let Some(ref tx) = tx_events_inner {
@@ -523,8 +529,15 @@ mod tests {
         assert!(params["required"].is_array());
     }
 
+    // Runs a real worker: pin an empty base dir so it never reads the real
+    // auth.json or writes its error log under the real ~/.synaps-cli, and
+    // clear the environment's provider credentials/endpoints, so it fails
+    // at auth, offline.
     #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
     async fn test_subagent_blank_agent_uses_system_prompt() {
+        let _base = crate::test_env::BaseDirGuard::new();
+        let _offline = crate::test_env::OfflineProviderEnv::new();
         let tool = SubagentTool;
         let ctx = create_tool_context();
         let params = json!({

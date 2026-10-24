@@ -11,6 +11,11 @@ async fn host() -> Arc<EngineHost> {
         let home = std::env::temp_dir().join(format!("synaps-engine-host-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
         std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(
+            home.join("config"),
+            "api_retries = 8\nrefusal_retries = 5\n",
+        )
+        .unwrap();
         config::set_base_dir_for_tests(home);
         let h = EngineHost::boot(HostOpts {
             profile: None,
@@ -81,13 +86,16 @@ async fn foreground_runtime_shares_tools_and_hookbus() {
 async fn worker_runtime_fresh_hookbus_and_private_registry() {
     let h = host().await;
     let w = h.worker_runtime().await.unwrap();
+    assert_eq!(w.api_retries(), 8);
+    assert_eq!(w.refusal_retries(), 5);
     assert!(!Arc::ptr_eq(w.hook_bus(), &h.parts().hook_bus));
     assert!(!Arc::ptr_eq(&w.tools_shared(), &h.parts().tools));
     // Worker registry excludes the recursive subagent tools.
     let reg = w.tools_shared();
     let reg = reg.read().await;
     assert!(reg.get("subagent").is_none());
-    assert!(reg.get("bash").is_some());
+    // `bash` exists only when the command-exec feature is compiled in.
+    assert_eq!(reg.get("bash").is_some(), cfg!(feature = "command-exec"));
 }
 
 #[tokio::test]

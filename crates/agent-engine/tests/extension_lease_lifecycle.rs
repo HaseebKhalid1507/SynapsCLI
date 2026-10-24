@@ -5,6 +5,9 @@
 //! invariant is observed via the fixture spy log, weak liveness tokens,
 //! and typed errors.
 
+#[path = "support/hermetic_base_dir.rs"]
+mod hermetic_base_dir;
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -124,6 +127,7 @@ fn ctx_with(cap: Option<ExtensionLeaseCapability>) -> ToolContext {
             tx_events: None,
         },
         capabilities: ToolCapabilities {
+            session_allow_all: None,
             launch_cancel: None,
             memory_backend: None,
             watcher_exit_path: None,
@@ -143,6 +147,7 @@ fn ctx_with(cap: Option<ExtensionLeaseCapability>) -> ToolContext {
             env: None,
             env_stripped: Vec::new(),
             env_warned: Default::default(),
+            session_id: None,
         },
         limits: ToolLimits {
             max_tool_output: 30000,
@@ -207,6 +212,7 @@ async fn wait_until(mut f: impl FnMut() -> bool) -> bool {
 
 #[tokio::test]
 async fn zero_spawn_during_load_search_and_exact_activation() {
+    hermetic_base_dir::pin();
     let fx = fixture("zero-spawn", "ok", advertised_tools());
     let (mgr, registry) = deferred_manager(&fx).await;
     let runtime = mgr.extension_runtime();
@@ -241,6 +247,7 @@ async fn zero_spawn_during_load_search_and_exact_activation() {
 
 #[tokio::test]
 async fn exact_execute_starts_once_reuses_and_calls_only_exact_tool() {
+    hermetic_base_dir::pin();
     let fx = fixture("exact-once", "ok", advertised_tools());
     let (mgr, _registry) = deferred_manager(&fx).await;
     let runtime = mgr.extension_runtime();
@@ -274,6 +281,7 @@ async fn exact_execute_starts_once_reuses_and_calls_only_exact_tool() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn concurrent_first_calls_are_single_flight() {
+    hermetic_base_dir::pin();
     let fx = fixture("single-flight", "ok", advertised_tools());
     let (mgr, _registry) = deferred_manager(&fx).await;
     let runtime = mgr.extension_runtime();
@@ -296,6 +304,7 @@ async fn concurrent_first_calls_are_single_flight() {
 
 #[tokio::test]
 async fn sibling_stays_gate_denied_and_is_never_called() {
+    hermetic_base_dir::pin();
     let fx = fixture("sibling", "ok", advertised_tools());
     let (mgr, registry) = deferred_manager(&fx).await;
     let runtime = mgr.extension_runtime();
@@ -334,6 +343,7 @@ async fn sibling_stays_gate_denied_and_is_never_called() {
 
 #[tokio::test]
 async fn runtime_declaration_mismatch_terminates_without_call_and_revokes_exact_grant() {
+    hermetic_base_dir::pin();
     // Runtime advertises a DIFFERENT schema for `search` than the manifest
     // declared: initialize-time validation must shut the child down before
     // any call, and the exact grant must fall.
@@ -392,6 +402,7 @@ async fn runtime_declaration_mismatch_terminates_without_call_and_revokes_exact_
 
 #[tokio::test]
 async fn permission_drift_fails_closed_before_spawn_and_revokes_grant() {
+    hermetic_base_dir::pin();
     let fx = fixture("perm-drift", "ok", advertised_tools());
     let (mgr, registry) = deferred_manager(&fx).await;
     let runtime = mgr.extension_runtime();
@@ -433,6 +444,7 @@ async fn permission_drift_fails_closed_before_spawn_and_revokes_grant() {
 
 #[tokio::test]
 async fn config_drift_invalidates_live_lease_and_revokes_grant() {
+    hermetic_base_dir::pin();
     let fx = fixture("config-drift", "ok", advertised_tools());
     let (mgr, registry) = deferred_manager(&fx).await;
     let runtime = mgr.extension_runtime();
@@ -497,6 +509,7 @@ async fn config_drift_invalidates_live_lease_and_revokes_grant() {
 
 #[tokio::test]
 async fn extension_reported_errors_are_withheld_and_do_not_revoke() {
+    hermetic_base_dir::pin();
     let fx = fixture("hostile-err", "hostile-error", advertised_tools());
     let (mgr, registry) = deferred_manager(&fx).await;
     let runtime = mgr.extension_runtime();
@@ -535,6 +548,7 @@ async fn extension_reported_errors_are_withheld_and_do_not_revoke() {
 
 #[tokio::test]
 async fn bounded_stderr_flood_does_not_break_leased_calls() {
+    hermetic_base_dir::pin();
     let fx = fixture("stderr-flood", "huge-stderr", advertised_tools());
     let (mgr, _registry) = deferred_manager(&fx).await;
     let runtime = mgr.extension_runtime();
@@ -557,6 +571,7 @@ async fn bounded_stderr_flood_does_not_break_leased_calls() {
 
 #[tokio::test]
 async fn session_end_guard_revocation_and_idle_reap_kill_children() {
+    hermetic_base_dir::pin();
     let fx = fixture("teardown", "ok", advertised_tools());
     let registry = Arc::new(tokio::sync::RwLock::new(ToolRegistry::new()));
     let mut mgr = ExtensionManager::new_with_tools(Arc::new(HookBus::new()), Arc::clone(&registry));
@@ -613,6 +628,7 @@ async fn session_end_guard_revocation_and_idle_reap_kill_children() {
 
 #[tokio::test]
 async fn unload_removes_record_dormant_batch_and_live_lease() {
+    hermetic_base_dir::pin();
     let fx = fixture("unload", "ok", advertised_tools());
     let (mut mgr, registry) = deferred_manager(&fx).await;
     let runtime = mgr.extension_runtime();
@@ -666,6 +682,7 @@ async fn unload_removes_record_dormant_batch_and_live_lease() {
 
 #[tokio::test]
 async fn flag_off_eager_load_of_the_same_manifest_is_unchanged() {
+    hermetic_base_dir::pin();
     let fx = fixture("eager", "ok", advertised_tools());
     let registry = Arc::new(tokio::sync::RwLock::new(ToolRegistry::new()));
     let mut mgr = ExtensionManager::new_with_tools(Arc::new(HookBus::new()), Arc::clone(&registry));
@@ -686,6 +703,7 @@ async fn flag_off_eager_load_of_the_same_manifest_is_unchanged() {
 
 #[tokio::test]
 async fn lease_lifecycle_never_mutates_the_catalog() {
+    hermetic_base_dir::pin();
     let fx = fixture("no-catalog-drift", "ok", advertised_tools());
     let (mgr, registry) = deferred_manager(&fx).await;
     let runtime = mgr.extension_runtime();
@@ -713,6 +731,7 @@ async fn lease_lifecycle_never_mutates_the_catalog() {
 
 #[tokio::test]
 async fn durable_shared_scope_survives_turns_and_only_last_owner_terminates() {
+    hermetic_base_dir::pin();
     let fx = fixture("durable-scope", "ok", advertised_tools());
     let (mgr, _registry) = deferred_manager(&fx).await;
     let runtime = mgr.extension_runtime();
@@ -826,6 +845,7 @@ fn provider_params() -> agent_engine::extensions::runtime::process::ProviderComp
 
 #[tokio::test]
 async fn provider_class_registers_metadata_and_first_selection_starts_once() {
+    hermetic_base_dir::pin();
     let fx = fixture_with(
         "provider-class",
         "ok",
@@ -866,6 +886,7 @@ async fn provider_class_registers_metadata_and_first_selection_starts_once() {
 
 #[tokio::test]
 async fn provider_runtime_mismatch_fails_before_route_and_terminates() {
+    hermetic_base_dir::pin();
     // Runtime registers a DIFFERENT display_name than declared: strict
     // declaration matching terminates the child before any provider call.
     let mut drifted = registered_provider_json();
@@ -905,6 +926,7 @@ async fn provider_runtime_mismatch_fails_before_route_and_terminates() {
 
 #[tokio::test]
 async fn hook_class_first_authorized_matching_event_starts_once() {
+    hermetic_base_dir::pin();
     use agent_engine::extensions::hooks::events::{HookEvent, HookResult};
 
     let fx = fixture_with(
@@ -955,6 +977,7 @@ async fn hook_class_first_authorized_matching_event_starts_once() {
 
 #[tokio::test]
 async fn sidecar_class_stays_user_triggered() {
+    hermetic_base_dir::pin();
     let fx = fixture_with(
         "sidecar-class",
         "ok",
@@ -983,6 +1006,7 @@ async fn sidecar_class_stays_user_triggered() {
 
 #[tokio::test]
 async fn mixed_class_shares_one_process_and_tool_search_never_triggers() {
+    hermetic_base_dir::pin();
     let fx = fixture_with(
         "mixed-class",
         "ok",
@@ -1049,6 +1073,7 @@ async fn mixed_class_shares_one_process_and_tool_search_never_triggers() {
 
 #[tokio::test]
 async fn legacy_manifest_without_deferred_stays_eager_under_progressive_flag() {
+    hermetic_base_dir::pin();
     let fx = fixture_with(
         "legacy-eager",
         "ok",

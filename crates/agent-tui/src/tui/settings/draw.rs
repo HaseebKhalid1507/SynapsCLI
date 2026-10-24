@@ -741,7 +741,9 @@ pub(crate) fn config_row_display(key: &str) -> Option<String> {
             .unwrap_or_default()
             .as_str()
             .to_string(),
-        "context_management.pressure_tokens" | "context_management.rollover_tokens" => {
+        "context_management.pressure_tokens"
+        | "context_management.rollover_tokens"
+        | "context_management.target_tokens" => {
             match raw_config(key).and_then(|v| v.parse::<u64>().ok()) {
                 Some(n) => n.to_string(),
                 None => "auto".to_string(),
@@ -805,6 +807,25 @@ pub(crate) fn config_row_display(key: &str) -> Option<String> {
         "max_fps" => ranged_config_display(key, 1..=1000, 60),
         "scroll_lines" => ranged_config_display(key, 1..=20, 3),
         // Memory
+        // The effective mode: a non-off value without the hand-set consent
+        // latch reverts to off in the parser, so it displays as off here.
+        "memory.default_mode" => {
+            let confirmed = bool_config_display("memory.default_mode_confirmed", false) == "on";
+            checked_config_display(
+                key,
+                |v| {
+                    confirmed
+                        && matches!(
+                            v,
+                            "recall_once"
+                                | "recall_each_prompt"
+                                | "capture_only"
+                                | "capture_and_recall"
+                        )
+                },
+                "off",
+            )
+        }
         "memory.backend" => checked_config_display(key, |v| v == "axel", "legacy"),
         "memory.user_scope" => checked_config_display(key, |v| v == "true", "false"),
         "memory.axel.executable" | "memory.axel.brain" => {

@@ -511,13 +511,13 @@ fn rss_anon_bytes() -> u64 {
     #[cfg(target_os = "linux")]
     {
         let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
-        return status
+        status
             .lines()
             .find_map(|line| line.strip_prefix("RssAnon:"))
             .and_then(|value| value.split_whitespace().next())
             .and_then(|value| value.parse::<u64>().ok())
             .unwrap_or(0)
-            .saturating_mul(1024);
+            .saturating_mul(1024)
     }
     #[cfg(not(target_os = "linux"))]
     {

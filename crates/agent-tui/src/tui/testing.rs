@@ -111,6 +111,8 @@ pub struct TestHarness {
     /// Structured queue of dispatched slash commands awaiting the P6.3
     /// bounded async drive ([`Self::drive_slash_commands`]).
     pending_slash: Vec<(String, String)>,
+    /// Lines typed while streaming, awaiting [`Self::drive_streaming_input`].
+    pending_streaming: Vec<String>,
     quit_requested: bool,
 }
 
@@ -145,6 +147,15 @@ fn block_on_bounded<F: std::future::Future>(what: &str, fut: F) -> F::Output {
     })
 }
 
+impl Drop for TestHarness {
+    fn drop(&mut self) {
+        // `set_build_id` is per harness, not per thread.
+        super::header::set_build_id_for_thread(None);
+        // Same for the injected terminal default bg.
+        super::theme::set_terminal_default_bg_for_thread(None);
+    }
+}
+
 impl TestHarness {
     /// Boot a headless App at the default 80x24 geometry.
     pub fn boot() -> Self {
@@ -158,6 +169,12 @@ impl TestHarness {
         // Determinism: `App::new` resolves agent_name from the user config —
         // pin it so snapshots don't vary per machine.
         app.agent_name = "agent".to_string();
+        // Determinism: a fresh session's id is a timestamp plus a random
+        // suffix, and the header shows it when the session has no name or
+        // title — pin it so replays are byte-identical across boots.
+        app.session.id = "test-session".to_string();
+        // Determinism: the header shows the working folder.
+        app.header_folder = "~/Projects/SynapsCLI".to_string();
         // Skip the boot animation; a fixed frame beats a time-parametric one.
         app.logo_build_t = None;
 
@@ -187,6 +204,7 @@ impl TestHarness {
             size: Size::new(cols, rows),
             actions: Vec::new(),
             pending_slash: Vec::new(),
+            pending_streaming: Vec::new(),
             quit_requested: false,
         }
     }
@@ -244,6 +262,14 @@ impl TestHarness {
     }
 
     // ── Render / assertion surface ───────────────────────────────────────────
+
+    /// Pretend the terminal answered OSC 11 with `bg` (or, with `None`, that
+    /// it never answered). Per thread, like [`TestHarness::set_build_id`], so
+    /// the process-global detected bg is never written by tests.
+    pub fn set_terminal_bg(&mut self, bg: Option<(u8, u8, u8)>) -> &mut Self {
+        super::theme::set_terminal_default_bg_for_thread(Some(bg));
+        self
+    }
 
     /// Advance to steady state and render one frame into the [`TestBackend`].
     ///
@@ -499,6 +525,37 @@ impl TestHarness {
         title: &str,
         prompt: &str,
     ) -> tokio::sync::oneshot::Receiver<Option<String>> {
+        self.activate_prompt_scoped(kind, title, prompt, None)
+    }
+
+    /// Inject an extension tool-call confirm (`Confirm tool call`) raised by
+    /// `extension` for `tool`, exactly as the runtime builds it: the scope
+    /// is what makes "Allow all from <ext>" available.
+    pub fn activate_tool_call_confirm(
+        &mut self,
+        extension: &str,
+        tool: &str,
+        prompt: &str,
+    ) -> tokio::sync::oneshot::Receiver<Option<String>> {
+        self.activate_prompt_scoped(
+            synaps_cli::tools::PromptKind::Confirm,
+            agent_engine::session::CONFIRM_PROMPT_TITLE,
+            prompt,
+            Some(agent_engine::session::ConfirmScope {
+                extensions: vec![extension.to_string()],
+                tool: Some(tool.to_string()),
+                rewritten_by: vec![],
+            }),
+        )
+    }
+
+    fn activate_prompt_scoped(
+        &mut self,
+        kind: synaps_cli::tools::PromptKind,
+        title: &str,
+        prompt: &str,
+        confirm_scope: Option<agent_engine::session::ConfirmScope>,
+    ) -> tokio::sync::oneshot::Receiver<Option<String>> {
         use synaps_cli::tools::SecretPromptRequest;
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
@@ -506,6 +563,39 @@ impl TestHarness {
             kind,
             title: title.to_string(),
             prompt: prompt.to_string(),
+            confirm_scope,
+            response_tx,
+        })
+        .expect("prompt request send is infallible on a fresh channel");
+        let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
+        self.app.secret_prompts.poll_requests(&rx);
+        input::reconcile_secret_prompt(&mut self.app);
+        // Scenarios answer right away; the 400 ms confirm arming delay is
+        // exercised explicitly by `activate_tool_call_confirm_unarmed`.
+        self.app.secret_prompts.arm_now_for_tests();
+        response_rx
+    }
+
+    /// Like [`Self::activate_tool_call_confirm`] but WITHOUT skipping the
+    /// confirm arming delay: keys sent right away must be ignored.
+    pub fn activate_tool_call_confirm_unarmed(
+        &mut self,
+        extension: &str,
+        tool: &str,
+        prompt: &str,
+    ) -> tokio::sync::oneshot::Receiver<Option<String>> {
+        use synaps_cli::tools::SecretPromptRequest;
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        tx.send(SecretPromptRequest {
+            kind: synaps_cli::tools::PromptKind::Confirm,
+            title: agent_engine::session::CONFIRM_PROMPT_TITLE.to_string(),
+            prompt: prompt.to_string(),
+            confirm_scope: Some(agent_engine::session::ConfirmScope {
+                extensions: vec![extension.to_string()],
+                tool: Some(tool.to_string()),
+                rewritten_by: vec![],
+            }),
             response_tx,
         })
         .expect("prompt request send is infallible on a fresh channel");
@@ -513,6 +603,18 @@ impl TestHarness {
         self.app.secret_prompts.poll_requests(&rx);
         input::reconcile_secret_prompt(&mut self.app);
         response_rx
+    }
+
+    /// Let the active confirm's arming delay elapse (without sleeping).
+    pub fn arm_confirm_now(&mut self) {
+        self.app.secret_prompts.arm_now_for_tests();
+    }
+
+    /// Pretend `ms` milliseconds passed for the active confirm's input guard.
+    pub fn age_confirm_guard(&mut self, ms: u64) {
+        self.app
+            .secret_prompts
+            .age_input_guard_for_tests(std::time::Duration::from_millis(ms));
     }
 
     /// Inject and activate a `Confirm` prompt (the `activate_tools` y/yes
@@ -523,6 +625,11 @@ impl TestHarness {
         prompt: &str,
     ) -> tokio::sync::oneshot::Receiver<Option<String>> {
         self.activate_prompt_with_kind(synaps_cli::tools::PromptKind::Confirm, title, prompt)
+    }
+
+    /// `Confirm` dialog: the focused button (`Deny` when none is active).
+    pub fn confirm_focus(&self) -> synaps_cli::tools::ConfirmChoice {
+        self.app.secret_prompts.confirm_focus()
     }
 
     /// Whether a secret prompt is currently active (mirrors the SecretPrompt
@@ -690,6 +797,17 @@ impl TestHarness {
         self
     }
 
+    /// Run `frames` animation ticks exactly as the run loop's tick arm
+    /// does for the message area (spinner advance + tail invalidation).
+    /// Pair with [`Self::advance_clock_ms`] to let a running tool's clock
+    /// move between frames.
+    pub fn tick_animations(&mut self, frames: usize) -> &mut Self {
+        for _ in 0..frames {
+            self.app.tick_message_animations();
+        }
+        self
+    }
+
     /// Publish a toast with an explicit TTL (seconds) through the same
     /// provider the app uses. Expiry is governed by the frozen clock.
     pub fn push_toast_with_ttl_secs(&mut self, id: &str, text: &str, ttl_secs: u64) -> &mut Self {
@@ -722,10 +840,52 @@ impl TestHarness {
         self.app.toasts.visible().count()
     }
 
+    /// Run as `--attach --no-confirm-answers` does: confirm prompts are
+    /// never opened or answered, only listed as waiting.
+    pub fn no_confirm_answers(&mut self) -> &mut Self {
+        self.prompt_bridge
+            .set_confirm_policy(super::session_link::ConfirmPolicy::ViewOnly);
+        self
+    }
+
     /// Force the app's streaming flag — lets scenarios exercise the
     /// streaming-input command refusal path without a live engine stream.
     pub fn set_streaming(&mut self, streaming: bool) -> &mut Self {
         self.app.streaming = streaming;
+        self
+    }
+
+    /// Pin the build id the header shows (`""` = no id: `v<version>` alone),
+    /// so header layout tests don't depend on the id the binary was built
+    /// with (a baked git hash, or none). For this harness only; cleared on
+    /// drop.
+    pub fn set_build_id(&mut self, id: &str) -> &mut Self {
+        super::header::set_build_id_for_thread(Some(id));
+        self
+    }
+
+    /// Pin the working folder the header shows.
+    pub fn set_folder(&mut self, folder: &str) -> &mut Self {
+        self.app.header_folder = folder.to_string();
+        self
+    }
+
+    /// Mark this client as attached read-only (`--observe`).
+    pub fn set_observing(&mut self, observing: bool) -> &mut Self {
+        self.app.observing = observing;
+        self
+    }
+
+    /// Name the session (the header's session label).
+    pub fn set_session_name(&mut self, name: &str) -> &mut Self {
+        self.app.session.name = Some(name.to_string());
+        self
+    }
+
+    /// Force the transient status line (`connecting…`, `reconnecting… (…)`,
+    /// …) the run loop sets around daemon reconnects.
+    pub fn set_status_text(&mut self, text: Option<&str>) -> &mut Self {
+        self.app.status_text = text.map(str::to_string);
         self
     }
 
@@ -772,7 +932,57 @@ impl TestHarness {
         }
         self.app.secret_prompts.poll_requests(&self.secret_prompt_rx);
         input::reconcile_secret_prompt(&mut self.app);
+        self.app.secret_prompts.arm_now_for_tests();
         self
+    }
+
+    /// Fire the subagent watch poll arm once (as `run()` does when its
+    /// deadline passes) and return the query id it sent, if any.
+    pub fn drive_watch_poll(&mut self) -> Option<u64> {
+        let now = std::time::Instant::now();
+        block_on_bounded(
+            "watch::poll",
+            super::watch::poll(&mut self.app, &mut self.link, now),
+        );
+        super::watch::pending_poll(&self.app).map(|(id, _)| id)
+    }
+
+    /// Whether the watch poll arm is armed (a worker view is focused and
+    /// still has something to read).
+    pub fn watch_poll_due(&self) -> bool {
+        super::watch::poll_due_at(&self.app).is_some()
+    }
+
+    /// The focused worker view's handle id (`None` on the main thread).
+    pub fn watched(&self) -> Option<String> {
+        super::watch::focused(&self.app).map(str::to_string)
+    }
+
+    /// Plain text of the main thread's transcript.
+    pub fn main_transcript_text(&self) -> String {
+        self.app
+            .transcript
+            .messages()
+            .iter()
+            .map(|m| describe(&m.msg))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Plain text of a worker view's transcript (empty if not open).
+    pub fn worker_transcript_text(&self, handle_id: &str) -> String {
+        self.app
+            .threads
+            .worker(handle_id)
+            .map(|w| {
+                w.store
+                    .messages()
+                    .iter()
+                    .map(|m| describe(&m.msg))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default()
     }
 
     /// Stage the engine-side history the scripted session answers
@@ -833,6 +1043,63 @@ impl TestHarness {
         self
     }
 
+    /// Resolve every line typed while streaming through the production
+    /// `commands::resolve_streaming_input`, then apply the result the way
+    /// the dispatch `StreamingInput` arm does. Steers and refusals are
+    /// recorded as `streaming-steer:<text>` / `streaming-refused:<text>`.
+    pub fn drive_streaming_input(&mut self) -> &mut Self {
+        use super::commands::{CommandAction, StreamingSlash};
+        for text in std::mem::take(&mut self.pending_streaming) {
+            match super::commands::resolve_streaming_input(&text, &mut self.app, &self.registry) {
+                StreamingSlash::Steer => self.actions.push(format!("streaming-steer:{text}")),
+                StreamingSlash::Refused => {
+                    self.actions.push(format!("streaming-refused:{text}"))
+                }
+                StreamingSlash::Ran(CommandAction::OpenSettings) => {
+                    super::settings::open_modal(&mut self.app);
+                }
+                StreamingSlash::Ran(CommandAction::Quit) => self.quit_requested = true,
+                StreamingSlash::Ran(_) => {}
+            }
+        }
+        #[cfg(debug_assertions)]
+        super::focus::debug_assert_stack_sync(&self.app);
+        self
+    }
+
+    /// Run one `/settings` apply through the production
+    /// `helpers::apply_setting` against the scripted session (what the
+    /// dispatch `SettingsApply` arm does). Writes the config file under
+    /// whatever `SYNAPS_BASE_DIR` the test pinned.
+    pub fn apply_setting(&mut self, key: &'static str, value: &str) -> &mut Self {
+        let what = format!("apply_setting({key}={value})");
+        block_on_bounded(
+            &what,
+            super::helpers::apply_setting(key, value, &mut self.app, &mut self.link),
+        );
+        self
+    }
+
+    /// Whether the app believes a turn is streaming.
+    pub fn is_streaming(&self) -> bool {
+        self.app.streaming
+    }
+
+    /// The settings modal's row note / error (`(row key, text)`), if any.
+    pub fn settings_row_note(&self) -> Option<(String, String)> {
+        self.app.settings.as_ref().and_then(|s| s.row_error.clone())
+    }
+
+    /// Whether a theme cross-fade is in flight.
+    pub fn theme_transition_active(&self) -> bool {
+        self.app.theme_transition.is_some()
+    }
+
+    /// The model the session view reports.
+    pub fn view_model(&self) -> String {
+        self.link.view().model.clone()
+    }
+
     /// Apply a resolved [`super::commands::CommandAction`], mirroring the
     /// production `SlashCommand` arm in `mod.rs` for the sync-safe subset —
     /// including the ModalStack pushes, so `debug_assert_stack_sync` holds
@@ -873,10 +1140,7 @@ impl TestHarness {
                 self.app.models = Some(super::models::ModelsModalState::new());
                 self.app.modal_stack.push(super::focus::PaneId::Models);
             }
-            CommandAction::OpenSettings => {
-                self.app.settings = Some(super::settings::SettingsState::new());
-                self.app.modal_stack.push(super::focus::PaneId::Settings);
-            }
+            CommandAction::OpenSettings => super::settings::open_modal(&mut self.app),
             CommandAction::OpenPlugins => {
                 // Production loads plugins.json from disk; the harness opens
                 // the deterministic default state instead of touching $HOME.
@@ -930,7 +1194,15 @@ impl TestHarness {
                 self.pending_slash.push((cmd, arg));
                 desc
             }
-            InputAction::StreamingInput(text) => format!("streaming-input:{text}"),
+            InputAction::StreamingInput(text) => {
+                self.pending_streaming.push(text.clone());
+                format!("streaming-input:{text}")
+            }
+            InputAction::SubagentSteer { handle_id, text } => {
+                // The dispatch arm's App-side half (its send is not run).
+                super::watch::steer_sent(&mut self.app, &handle_id, &text);
+                format!("subagent-steer:{handle_id}:{text}")
+            }
             InputAction::Abort => "abort".to_string(),
             InputAction::SettingsApply(key, value) => format!("settings-apply:{key}={value}"),
             InputAction::ModelsApply(model) => format!("models-apply:{model}"),
@@ -956,6 +1228,23 @@ impl TestHarness {
         };
         self.actions.push(desc);
     }
+}
+
+/// `kind: text` for one transcript message (the transcript-text helpers).
+fn describe(msg: &super::transcript::ChatMessage) -> String {
+    use super::transcript::ChatMessage as M;
+    let kind = match msg {
+        M::User(_) => "user",
+        M::Thinking(_) => "thinking",
+        M::Text(_) => "text",
+        M::ToolUseStart { .. } => "tool-start",
+        M::ToolUse { .. } => "tool",
+        M::ToolResult { .. } => "tool-result",
+        M::Error(_) => "error",
+        M::System(_) => "system",
+        M::Event { .. } => "event",
+    };
+    format!("{kind}: {}", msg.source_text())
 }
 
 /// Cloneable in-memory `Write` sink for [`TestHarness::render_ansi`].

@@ -106,7 +106,7 @@ fn sidecar_pill_segment(
     Span::styled(text, Style::default().fg(color).add_modifier(modifier))
 }
 
-/// Pure helper for [`sidecar_pill_spans`] — given a set of (plugin_id, display_name?)
+/// Pure helper — given a set of (plugin_id, display_name?)
 /// pairs and the registry's lifecycle claims, return the plugin ids in
 /// display order: importance desc, then display_name alphabetical, then
 /// plugin id. Pulled out so the ordering can be unit-tested without
@@ -138,7 +138,7 @@ pub(crate) fn order_sidecar_pills(
     keys.into_iter().map(|(p, _)| p.clone()).collect()
 }
 
-/// Pure helper backing [`sidecar_pill_span`] — returns the rendered
+/// Pure helper backing the sidecar pill text — returns the rendered
 /// text only. Lives separately so tests can exercise the label logic
 /// without spawning a real sidecar process or mounting the full App.
 pub(crate) fn sidecar_pill_text(
@@ -566,8 +566,9 @@ pub(crate) fn build_render_model(
         width: term_size.width,
         height: term_size.height,
     };
-    let msg_area =
-        AppAreas::from_heights(area, subagent_height, download_height, input_height).body;
+    let areas = AppAreas::from_heights(area, subagent_height, download_height, input_height);
+    let msg_area = areas.body;
+    let tray_area = areas.subagent;
 
     // ── 3. Transcript visible window ──────────────────────────────────────────
     // One call folds the old §3–§6 block: cache sync → scroll growth/clamp
@@ -577,8 +578,8 @@ pub(crate) fn build_render_model(
     let vw = {
         let ctx = super::transcript::RenderCtx {
             spinner_frame: inputs.spinner_frame,
-            streaming: inputs.streaming,
-            agent_name: inputs.agent_name,
+            streaming: inputs.thread_streaming,
+            agent_name: &inputs.agent_name,
         };
         inputs.transcript.visible_window(msg_area, &ctx)
     };
@@ -596,6 +597,7 @@ pub(crate) fn build_render_model(
             done: sa.done,
             tools: sa.tools,
             result: sa.result.clone(),
+            watched: inputs.watched_subagent == Some(sa.id),
         })
         .collect();
 
@@ -688,7 +690,10 @@ pub(crate) fn build_render_model(
     // write-back byte-for-byte) and returned in the RenderPatch for the
     // caller to apply to the authoritative App state.  The builder itself no
     // longer mutates App.
-    let mut patch = RenderPatch::default();
+    let mut patch = RenderPatch {
+        tray_area: Some(tray_area),
+        ..RenderPatch::default()
+    };
     let mut help_find = inputs.help_find.clone();
     if let Some(ref mut hf) = help_find {
         let area_w = term_size.width;
@@ -710,6 +715,10 @@ pub(crate) fn build_render_model(
         title: p.title.clone(),
         prompt: p.prompt.clone(),
         masked_buffer_chars: p.buffer.chars().count(),
+        confirm_focus: p.confirm_focus,
+        confirm_offers_allow_all: p.offers_allow_all(),
+        confirm_scope: p.confirm_scope.clone(),
+        confirm_allow_all_pending: p.allow_all_pending,
     });
 
     // ── 13. Runtime strings ───────────────────────────────────────────────────
@@ -718,9 +727,11 @@ pub(crate) fn build_render_model(
 
     // ── 14. Assemble ──────────────────────────────────────────────────────────
     let model = std::sync::Arc::new(RenderModel {
+        header: inputs.header.clone(),
         status_text: inputs.status_text.clone(),
         streaming: inputs.streaming,
         spinner_frame: inputs.spinner_frame,
+        watch_banner: inputs.watch_banner.clone(),
         sidecar_pills,
         runtime_model,
         runtime_thinking,
@@ -838,7 +849,12 @@ pub(crate) fn render_frame(
                 terminal,
                 caps,
                 model.protected_bottom_rows,
-                Style::default().bg(THEME.load().message_background()),
+                // The scrub paints straight to the backend, outside the
+                // buffer the opaque guard steers — steer its bg here too.
+                Style::default().bg(super::theme::steer_off_terminal_bg(
+                    THEME.load().message_background(),
+                    super::theme::opaque_guard_target(),
+                )),
             )?;
         }
 
@@ -879,7 +895,6 @@ pub(crate) fn render_frame_into(
     }
 
     // ── Layout ────────────────────────────────────────────────────────────
-    let has_subagents = !model.subagents.is_empty();
     let subagent_height = super::subagent_tray::tray_height(model.subagents.len());
     let input_inner_width = frame
         .area()
@@ -900,136 +915,18 @@ pub(crate) fn render_frame_into(
         footer: footer_area,
     } = AppAreas::from_heights(frame.area(), subagent_height, download_height, input_height);
 
-    // ── Header ────────────────────────────────────────────────────────────
-    let spinner_idx = (model.spinner_frame / 3) % SPINNER_FRAMES.len();
-    let status_span = if let Some(ref status) = model.status_text {
-        Span::styled(
-            format!(" {} {} ", SPINNER_FRAMES[spinner_idx], status),
-            Style::default().fg(THEME.load().status_streaming),
-        )
-    } else if has_subagents {
-        let active = model.subagents.iter().filter(|s| !s.done).count();
-        let done = model.subagents.iter().filter(|s| s.done).count();
-        let spinner = if active > 0 {
-            SPINNER_FRAMES[spinner_idx]
-        } else {
-            "\u{2714}"
-        };
-        Span::styled(
-            format!(
-                " {} {} agent{} ({} done) ",
-                spinner,
-                active,
-                if active != 1 { "s" } else { "" },
-                done
-            ),
-            Style::default().fg(THEME.load().subagent_name),
-        )
-    } else if model.streaming {
-        let pulse = ((model.spinner_frame as f64 / 20.0).sin() * 0.3 + 0.7).max(0.4);
-        let (sr, sg, sb) = match THEME.load().status_streaming {
-            Color::Rgb(r, g, b) => (r, g, b),
-            _ => (128, 128, 128),
-        };
-        Span::styled(
-            " \u{25cf} streaming ",
-            Style::default().fg(Color::Rgb(
-                (sr as f64 * pulse) as u8,
-                (sg as f64 * pulse) as u8,
-                (sb as f64 * pulse) as u8,
-            )),
-        )
-    } else {
-        Span::styled(
-            " \u{25cb} ready ",
-            Style::default().fg(THEME.load().status_ready),
-        )
-    };
-    let version_span = Span::styled(
-        concat!("v", env!("CARGO_PKG_VERSION"), " · ", env!("GIT_HASH"), " "),
-        Style::default().fg(THEME.load().muted),
-    );
-    let header = Paragraph::new(Line::from({
-        let mut spans = vec![
-            Span::styled(
-                "  Synaps",
-                Style::default()
-                    .fg(THEME.load().header_fg)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled("CLI ", Style::default().fg(THEME.load().muted)),
-            Span::styled("\u{2502}", Style::default().fg(THEME.load().border)),
-            status_span,
-        ];
-        // Sidecar pills from snapshot
-        for pill in &model.sidecar_pills {
-            spans.push(Span::styled(
-                "\u{2502}",
-                Style::default().fg(THEME.load().border),
-            ));
-            let label = pill.display_name.as_deref().unwrap_or("sidecar");
-            let text = sidecar_pill_text(label, &pill.status, pill.armed, model.spinner_frame);
-            let color = match &pill.status {
-                super::sidecar::SidecarUiStatus::Idle => {
-                    if pill.armed {
-                        let pulse =
-                            ((model.spinner_frame as f64 / 18.0).sin() * 0.3 + 0.7).max(0.4);
-                        let base = match THEME.load().status_streaming {
-                            Color::Rgb(r, g, b) => (r, g, b),
-                            _ => (220, 80, 80),
-                        };
-                        Color::Rgb(
-                            (base.0 as f64 * pulse) as u8,
-                            (base.1 as f64 * pulse) as u8,
-                            (base.2 as f64 * pulse) as u8,
-                        )
-                    } else {
-                        THEME.load().muted
-                    }
-                }
-                super::sidecar::SidecarUiStatus::Active { .. } => {
-                    let pulse = ((model.spinner_frame as f64 / 18.0).sin() * 0.3 + 0.7).max(0.4);
-                    let base = match THEME.load().status_streaming {
-                        Color::Rgb(r, g, b) => (r, g, b),
-                        _ => (220, 80, 80),
-                    };
-                    Color::Rgb(
-                        (base.0 as f64 * pulse) as u8,
-                        (base.1 as f64 * pulse) as u8,
-                        (base.2 as f64 * pulse) as u8,
-                    )
-                }
-                super::sidecar::SidecarUiStatus::Loading => THEME.load().muted,
-                super::sidecar::SidecarUiStatus::Error(_) => Color::Red,
-            };
-            spans.push(Span::styled(
-                text,
-                Style::default().fg(color).add_modifier(Modifier::BOLD),
-            ));
-        }
-        let used: usize = spans.iter().map(|s| s.content.len()).sum();
-        let total_w = header_area.width as usize;
-        if total_w > used + version_span.content.len() {
-            let pad = total_w - used - version_span.content.len();
-            spans.push(Span::raw(" ".repeat(pad)));
-        }
-        spans.push(version_span);
-        spans
-    }))
-    .style(Style::default().bg(THEME.load().bg));
-    frame.render_widget(header, header_area);
-
     // ── Messages ──────────────────────────────────────────────────────────
     let msg_area = body;
     // model.lines IS the visible window (sliced on the main side) — render the whole arc.
     let visible: Vec<ratatui::text::Line> = model.lines.to_vec();
     let visible_is_empty = visible.is_empty();
 
-    let msg_block = Block::default()
-        .borders(Borders::TOP)
-        .border_type(BorderType::Plain)
-        .border_style(Style::default().fg(THEME.load().border))
-        .padding(Padding::horizontal(1));
+    let msg_block = super::header::style_top_edge(
+        Block::default()
+            .borders(Borders::TOP)
+            .border_type(BorderType::Plain),
+    )
+    .padding(Padding::horizontal(1));
     let msg_inner = msg_block.inner(msg_area);
     let messages_widget = Paragraph::new(visible).block(msg_block.clone());
     // The conversation canvas is the ONLY surface the background toggle owns.
@@ -1256,22 +1153,22 @@ pub(crate) fn render_frame_into(
         }
     }
 
-    // Scroll indicator
-    if model.scroll_back > 0 {
-        let indicator = format!(" \u{2191}{} ", model.scroll_back);
-        let indicator_widget = Paragraph::new(Span::styled(
-            indicator,
-            Style::default().fg(THEME.load().muted),
-        ))
-        .alignment(Alignment::Right);
-        let indicator_area = ratatui::layout::Rect {
-            x: msg_area.x,
-            y: msg_area.y,
-            width: msg_area.width,
-            height: 1,
-        };
-        frame.render_widget(indicator_widget, indicator_area);
-    }
+    // ── Header ────────────────────────────────────────────────────────────
+    // The neon prompt's slab hung from the top (header.rs). Its bottom rim
+    // is the message pane's top edge row, so it paints after the pane; the
+    // scrolled-back tab hangs off that rim. Same sweep as the prompt's.
+    let glow = (model.streaming && super::neon_prompt::streaming_glow_enabled()).then(|| {
+        context_bar_color(
+            &THEME.load(),
+            model.last_turn_context,
+            model.last_turn_context_window,
+        )
+    });
+    let header_rows = ratatui::layout::Rect {
+        height: header_area.height + u16::from(body.height > 0),
+        ..header_area
+    };
+    super::header::render(frame, header_rows, model, glow);
 
     // ── Input ─────────────────────────────────────────────────────────────
     // Neon prompt (neon_prompt.rs): a soft-edged slab of light with no drawn
@@ -1286,13 +1183,6 @@ pub(crate) fn render_frame_into(
         let theme = THEME.load();
         // Optional streaming glow (Settings → Streaming glow): it wears the
         // context bar's colour, so it shifts with the bar as the window fills.
-        let glow = (model.streaming && neon::streaming_glow_enabled()).then(|| {
-            context_bar_color(
-                &theme,
-                model.last_turn_context,
-                model.last_turn_context_window,
-            )
-        });
         let slab = neon::Slab::new(&theme, model.prompt_fx, input_area.width, glow);
         let text_area = ratatui::layout::Rect {
             x: input_area.x.saturating_add(inset),
@@ -1513,20 +1403,43 @@ pub(crate) fn render_frame_into(
 
     let key_style = Style::default().fg(theme.claude_text);
     let label_style = Style::default().fg(dim);
-    let hints: [(&str, &str); 5] = [
-        ("ctrl+c", "quit"),
-        ("esc", "abort"),
-        ("shift+\u{2191}\u{2193}", "scroll"),
-        (
-            "ctrl+o",
-            if model.show_full_output {
-                "full"
-            } else {
-                "compact"
-            },
-        ),
-        ("enter", "send"),
-    ];
+    // Hints drop whole from the end when narrow, so order is priority. In
+    // a worker view Esc goes back and Enter steers; Alt-↑↓ shows up
+    // whenever there is a subagent view to switch to (last on main, so it
+    // never pushes the long-standing hints out). It advertises Alt, not
+    // Ctrl: macOS takes Ctrl-↑/↓ for Mission Control; both work.
+    let compact = if model.show_full_output {
+        "full"
+    } else {
+        "compact"
+    };
+    let arrows = "alt+\u{2191}\u{2193}";
+    let scroll = "shift+\u{2191}\u{2193}";
+    let hints: Vec<(&str, &str)> = match model.watch_banner.as_ref() {
+        Some(b) => {
+            let mut h = vec![("ctrl+c", "quit"), ("esc", "back")];
+            if b.steerable {
+                h.push(("enter", "steer"));
+            }
+            h.extend([(arrows, "agents"), (scroll, "scroll"), ("ctrl+o", compact)]);
+            h.push(("/watch", "list"));
+            h
+        }
+        None => {
+            let mut h = vec![
+                ("ctrl+c", "quit"),
+                ("esc", "abort"),
+                (scroll, "scroll"),
+                ("ctrl+o", compact),
+                ("enter", "send"),
+            ];
+            if !model.subagents.is_empty() {
+                // `/watch` too: the way in when the terminal eats both chords.
+                h.extend([(arrows, "agents"), ("/watch", "list")]);
+            }
+            h
+        }
+    };
     // One cell of air before the info block.
     let room = usize::from(keybinds_area.width).saturating_sub(1);
     let mut spans = vec![Span::raw(" ")];
@@ -1619,6 +1532,16 @@ pub(crate) fn render_frame_into(
             super::focus::PaneId::PluginEditor | super::focus::PaneId::Chat => {}
         }
     }
+
+    // ── Opaque guard (LAST: after effects, toasts and modals) ─────────────
+    // Terminals with background opacity (kitty `background_opacity`) make
+    // every cell whose bg EQUALS the terminal's default bg see-through, so a
+    // theme whose canvas matches the user's terminal colour (ocean on a
+    // #030810 kitty) rendered see-through even in opaque mode. One pass over
+    // the finished frame catches every painter, including derived/animated
+    // mixes (slab shimmer, boot fx fades, selection inversion, transitions).
+    // No-op in invisible mode or when the terminal bg is unknown.
+    super::theme::guard_opaque_frame(frame.buffer_mut());
 }
 
 /// Number of terminal rows `text` occupies when word-wrapped at `width`
@@ -1644,17 +1567,20 @@ fn wrapped_line_count(text: &str, width: u16) -> usize {
 /// the stack-order modal loop in [`render_frame_into`].
 fn render_secret_prompt(frame: &mut ratatui::Frame<'_>, prompt: &SecretPromptSnap) {
     use synaps_cli::tools::PromptKind;
+    if prompt.kind == PromptKind::Confirm {
+        render_confirm_prompt(frame, prompt);
+        return;
+    }
     let area = frame.area();
-    let is_confirm = prompt.kind == PromptKind::Confirm;
-    // Cap to available width; prefer 30-62 (72 for confirm — tool ids are
-    // long) but never overflow (#tui-safety fix 3).
-    let width = area.width.min(if is_confirm { 72 } else { 62 });
+    // Cap to available width; prefer 30-62 but never overflow (#tui-safety
+    // fix 3).
+    let width = area.width.min(62);
     let inner_w = width.saturating_sub(2);
     let body_lines = wrapped_line_count(&prompt.prompt, inner_w);
-    // body + blank + (field | nothing) + footer, plus 2 border rows. Floor
-    // at the legacy fixed 7 so single-line secret prompts render exactly as
-    // before (reference-binary differential); grow only for longer bodies.
-    let content_rows = body_lines + 1 + if is_confirm { 0 } else { 1 } + 1;
+    // body + blank + field + footer, plus 2 border rows. Floor at the legacy
+    // fixed 7 so single-line secret prompts render exactly as before
+    // (reference-binary differential); grow only for longer bodies.
+    let content_rows = body_lines + 3;
     let height = (content_rows as u16 + 2).max(7).min(area.height).max(3);
     let x = area.x + area.width.saturating_sub(width) / 2;
     let y = area.y + area.height.saturating_sub(height) / 2;
@@ -1668,18 +1594,11 @@ fn render_secret_prompt(frame: &mut ratatui::Frame<'_>, prompt: &SecretPromptSna
     // surface with a heavy warning-coloured bar down its left edge; the
     // title leads the text. The border rows/columns become padding.
     let theme = THEME.load();
-    let surface = theme.raised_surface(1.32);
+    let surface = theme.prompt_surface();
     let warn = theme.warning_color;
     super::modal_kit::dim_backdrop(frame.buffer_mut(), area, modal_area);
     frame.render_widget(Clear, modal_area);
-    let block = Block::default()
-        .padding(ratatui::widgets::Padding {
-            left: 2,
-            right: 1,
-            top: 1,
-            bottom: 0,
-        })
-        .style(Style::default().bg(surface));
+    let block = prompt_block(surface);
     let mut text: Vec<ratatui::text::Line<'_>> = vec![ratatui::text::Line::from(Span::styled(
         prompt.title.clone(),
         Style::default().fg(warn).add_modifier(Modifier::BOLD),
@@ -1690,28 +1609,16 @@ fn render_secret_prompt(frame: &mut ratatui::Frame<'_>, prompt: &SecretPromptSna
             Style::default().fg(theme.claude_text),
         ))
     }));
-    if text.is_empty() {
-        text.push(ratatui::text::Line::from(""));
-    }
     text.push(ratatui::text::Line::from(""));
     let p = super::modal_kit::Palette::for_modal(&theme, None);
     let hint = |h: &str| super::modal_kit::hint_line(&p, h, modal_area.width.saturating_sub(3));
-    if is_confirm {
-        let mut l = hint("y allow  n/esc deny");
-        l.spans.push(Span::styled(
-            "   server.auto_approve_confirms=true skips this",
-            Style::default().fg(p.dim),
-        ));
-        text.push(l);
-    } else {
-        let masked = "\u{2022}".repeat(prompt.masked_buffer_chars);
-        text.push(ratatui::text::Line::from(vec![
-            Span::styled("password: ", Style::default().fg(p.dim)),
-            Span::styled(masked, Style::default().fg(theme.input_fg)),
-            Span::styled("\u{2588}", Style::default().fg(warn)),
-        ]));
-        text.push(hint("enter submit  esc cancel"));
-    }
+    let masked = "\u{2022}".repeat(prompt.masked_buffer_chars);
+    text.push(ratatui::text::Line::from(vec![
+        Span::styled("password: ", Style::default().fg(p.dim)),
+        Span::styled(masked, Style::default().fg(theme.input_fg)),
+        Span::styled("\u{2588}", Style::default().fg(warn)),
+    ]));
+    text.push(hint("enter submit  esc cancel"));
     frame.render_widget(
         Paragraph::new(text)
             .block(block)
@@ -1719,11 +1626,282 @@ fn render_secret_prompt(frame: &mut ratatui::Frame<'_>, prompt: &SecretPromptSna
             .wrap(ratatui::widgets::Wrap { trim: false }),
         modal_area,
     );
+    paint_prompt_bar(frame, modal_area, warn, surface);
+}
+
+fn prompt_block(surface: ratatui::style::Color) -> Block<'static> {
+    Block::default()
+        .padding(ratatui::widgets::Padding {
+            left: 2,
+            right: 1,
+            top: 1,
+            bottom: 0,
+        })
+        .style(Style::default().bg(surface))
+}
+
+fn paint_prompt_bar(
+    frame: &mut ratatui::Frame<'_>,
+    modal_area: ratatui::layout::Rect,
+    warn: ratatui::style::Color,
+    surface: ratatui::style::Color,
+) {
     for y in modal_area.top()..modal_area.bottom() {
         if let Some(cell) = frame.buffer_mut().cell_mut((modal_area.x, y)) {
             cell.set_symbol("\u{2503}").set_fg(warn).set_bg(surface);
         }
     }
+}
+
+/// Rows `text` takes when greedily word-wrapped at `width` display cells
+/// (ratatui's `Wrap { trim: false }` is greedy too). Words wider than the
+/// row are hard-split. Every source line takes at least one row.
+fn word_wrapped_rows(text: &str, width: u16) -> usize {
+    let w = usize::from(width.max(1));
+    text.split('\n')
+        .map(|line| {
+            let mut rows = 1usize;
+            let mut cur = 0usize;
+            for word in line.split(' ') {
+                let ww = display_width(word);
+                let need = if cur == 0 { ww } else { cur + 1 + ww };
+                if need <= w {
+                    cur = need;
+                    continue;
+                }
+                if cur > 0 {
+                    rows += 1;
+                }
+                // Hard-split an over-long word.
+                rows += ww.saturating_sub(1) / w;
+                cur = if ww == 0 { 0 } else { (ww - 1) % w + 1 };
+            }
+            rows
+        })
+        .sum::<usize>()
+        .max(1)
+}
+
+/// The Confirm lightbox (#148 C1, 04-tui C1/I5/I6).
+///
+/// Laid out bottom-up: the decision controls — buttons, the "Allow all"
+/// scope line and the key hints — are measured at the real text width and
+/// get their rows first, in their own rect; the body (host header + the
+/// extension's message) gets what remains and is cut with a marker when it
+/// doesn't fit. On a narrow pane the button labels switch to a compact form.
+/// The buttons and scope line are therefore never pushed off-screen by a
+/// long message or a small terminal.
+fn render_confirm_prompt(frame: &mut ratatui::Frame<'_>, prompt: &SecretPromptSnap) {
+    use ratatui::layout::Rect;
+    use ratatui::text::Line;
+    use synaps_cli::tools::ConfirmChoice;
+    let area = frame.area();
+    let scope = prompt
+        .confirm_scope
+        .as_ref()
+        .filter(|_| prompt.confirm_offers_allow_all);
+    let width = area.width.min(if scope.is_some() { 88 } else { 72 });
+    // Padding: left 2 (incl. the bar), right 1.
+    let tw = width.saturating_sub(3).max(1);
+
+    // ── Buttons: full labels when they fit on one row, else compact ──
+    let full: (String, Option<String>, String, &str) = (
+        "[ Allow (y) ]".into(),
+        scope.map(|s| format!("[ {} ]", s.allow_all_label())),
+        "[ Deny (n) ]".into(),
+        "   ",
+    );
+    let row_text = |b: &(String, Option<String>, String, &str)| {
+        let mut t = b.0.clone();
+        if let Some(all) = &b.1 {
+            t.push_str(b.3);
+            t.push_str(all);
+        }
+        t.push_str(b.3);
+        t.push_str(&b.2);
+        t
+    };
+    let buttons = if display_width(&row_text(&full)) <= usize::from(tw) {
+        full
+    } else {
+        (
+            "[Allow y]".into(),
+            scope.map(|s| format!("[Allow all: {}]", s.extensions_label())),
+            "[Deny n]".into(),
+            "  ",
+        )
+    };
+    let button_rows = word_wrapped_rows(&row_text(&buttons), tw);
+
+    // ── Scope line and key hints ──
+    let scope_text = scope.map(|s| s.allow_all_scope());
+    let scope_rows = scope_text
+        .as_deref()
+        .map_or(0, |t| word_wrapped_rows(t, tw));
+    let wide_hint = if scope.is_some() {
+        "y allow · n/Esc deny · Tab/←/→ select · Enter presses the selected button · \
+         Allow all: select it, Enter, then Enter again"
+    } else {
+        "y allow · n/Esc deny · Tab/←/→ select · Enter presses the selected button"
+    };
+    let narrow_hint = if scope.is_some() {
+        "y allow · n deny · Tab select · Enter press · Allow all: select + Enter twice"
+    } else {
+        "y allow · n deny · Tab select · Enter press"
+    };
+    let pending_text = scope.filter(|_| prompt.confirm_allow_all_pending).map(|s| {
+        format!(
+            "Press Enter again to allow all from {} for this session · Esc cancels",
+            s.extensions_label()
+        )
+    });
+    let hint_text: String = match &pending_text {
+        Some(t) => t.clone(),
+        None if word_wrapped_rows(wide_hint, tw) <= 2 => wide_hint.to_string(),
+        None => narrow_hint.to_string(),
+    };
+    let hint_rows = word_wrapped_rows(&hint_text, tw);
+
+    // ── Vertical budget ──
+    let max_h = usize::from(area.height);
+    let footer_tight = button_rows + scope_rows + hint_rows;
+    let gaps = if scope.is_some() { 3 } else { 2 }; // body|buttons|scope|hint
+    let body_rows = word_wrapped_rows(&prompt.prompt, tw);
+    // 1 top padding + 1 title.
+    let roomy = 2 + body_rows + gaps + footer_tight <= max_h;
+    let gap_rows = if roomy { gaps } else { 0 };
+    let body_avail = max_h.saturating_sub(2 + gap_rows + footer_tight);
+    let body_shown = body_rows.min(body_avail);
+    let truncated = body_shown < body_rows;
+    let height = (2 + body_shown + gap_rows + footer_tight).min(max_h).max(1) as u16;
+
+    let x = area.x + area.width.saturating_sub(width) / 2;
+    let y = area.y + area.height.saturating_sub(height) / 2;
+    let modal_area = Rect {
+        x,
+        y,
+        width,
+        height,
+    };
+    let theme = THEME.load();
+    let surface = theme.prompt_surface();
+    let warn = theme.warning_color;
+    let p = super::modal_kit::Palette::for_modal(&theme, None);
+    super::modal_kit::dim_backdrop(frame.buffer_mut(), area, modal_area);
+    frame.render_widget(Clear, modal_area);
+    let block = prompt_block(surface);
+    let inner = block.inner(modal_area);
+    frame.render_widget(block, modal_area);
+    let wrap = ratatui::widgets::Wrap { trim: false };
+    let mut row = inner.y;
+    let bottom = inner.bottom();
+    let mut take = |rows: usize| -> Rect {
+        let h = (rows as u16).min(bottom.saturating_sub(row));
+        let r = Rect {
+            x: inner.x,
+            y: row,
+            width: inner.width,
+            height: h,
+        };
+        row += h;
+        r
+    };
+
+    // Title.
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            prompt.title.clone(),
+            Style::default().fg(warn).add_modifier(Modifier::BOLD),
+        ))),
+        take(1),
+    );
+    // Body (cut, never the controls).
+    if body_shown > 0 {
+        let body_area = take(body_shown);
+        let (text_area, marker_area) = if truncated {
+            (
+                Rect {
+                    height: body_area.height.saturating_sub(1),
+                    ..body_area
+                },
+                Some(Rect {
+                    y: body_area.bottom().saturating_sub(1),
+                    height: 1.min(body_area.height),
+                    ..body_area
+                }),
+            )
+        } else {
+            (body_area, None)
+        };
+        frame.render_widget(
+            Paragraph::new(
+                prompt
+                    .prompt
+                    .lines()
+                    .map(|l| {
+                        Line::from(Span::styled(
+                            l.to_string(),
+                            Style::default().fg(theme.claude_text),
+                        ))
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .wrap(wrap),
+            text_area,
+        );
+        if let Some(marker) = marker_area {
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    "… message cut to fit",
+                    Style::default().fg(p.dim),
+                ))),
+                marker,
+            );
+        }
+    }
+    if gap_rows > 0 {
+        take(1);
+    }
+    // Buttons. The focused one renders as a filled pill; Deny is focused by
+    // default so a bare Enter stays fail-closed.
+    let (idle_fg, focus_fg, focus_bg) = theme.confirm_button_colors();
+    let focused = Style::default()
+        .fg(focus_fg)
+        .bg(focus_bg)
+        .add_modifier(Modifier::BOLD);
+    let idle = Style::default().fg(idle_fg);
+    let style_for = |c: ConfirmChoice| if prompt.confirm_focus == c { focused } else { idle };
+    let mut spans: Vec<Span<'_>> = vec![Span::styled(buttons.0.clone(), style_for(ConfirmChoice::Allow))];
+    if let Some(all) = &buttons.1 {
+        spans.push(Span::raw(buttons.3));
+        spans.push(Span::styled(all.clone(), style_for(ConfirmChoice::AllowAll)));
+    }
+    spans.push(Span::raw(buttons.3));
+    spans.push(Span::styled(buttons.2.clone(), style_for(ConfirmChoice::Deny)));
+    frame.render_widget(Paragraph::new(Line::from(spans)).wrap(wrap), take(button_rows));
+    if let Some(text) = scope_text {
+        if gap_rows > 0 {
+            take(1);
+        }
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(text, Style::default().fg(idle_fg))))
+                .wrap(wrap),
+            take(scope_rows),
+        );
+    }
+    if gap_rows > 0 {
+        take(1);
+    }
+    let hint_style = if pending_text.is_some() {
+        Style::default().fg(warn).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(p.dim)
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(hint_text, hint_style))).wrap(wrap),
+        take(hint_rows),
+    );
+    paint_prompt_bar(frame, modal_area, warn, surface);
 }
 
 /// Toast box dimensions, clamped so they ALWAYS fit a terminal of any size.
@@ -1787,6 +1965,106 @@ fn render_toasts_from_snap(frame: &mut ratatui::Frame<'_>, toasts: &[super::toas
             if let Some(cell) = frame.buffer_mut().cell_mut((rect.x, y)) {
                 cell.set_symbol("\u{2503}").set_fg(accent).set_bg(surface);
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod opaque_terminal_bg_tests {
+    //! End-to-end through the production frame body: with opaque mode on and
+    //! a detected terminal bg equal to the active theme's canvas, no painted
+    //! cell may carry that exact bg. The terminal bg is injected per thread
+    //! (`TestHarness::set_terminal_bg`); the global theme is never replaced.
+    use super::super::testing::TestHarness;
+    use super::super::theme::{background_is_opaque, set_background_opaque, Rgb8, THEME};
+    use ratatui::buffer::Buffer;
+    use ratatui::style::Color;
+    use serial_test::serial;
+
+    fn rgb(c: Color) -> Option<Rgb8> {
+        match c {
+            Color::Rgb(r, g, b) => Some((r, g, b)),
+            _ => None,
+        }
+    }
+
+    fn frame(h: &mut TestHarness) -> Buffer {
+        h.push_user_message("hello")
+            .push_text_message("some `code` and text");
+        h.render().clone()
+    }
+
+    fn count_bg(buf: &Buffer, c: Rgb8) -> usize {
+        let c = Color::Rgb(c.0, c.1, c.2);
+        buf.content.iter().filter(|cell| cell.bg == c).count()
+    }
+
+    /// The bug: opaque + terminal bg == theme canvas/chrome ⇒ see-through.
+    #[test]
+    #[serial]
+    fn opaque_never_paints_the_detected_terminal_bg() {
+        let prior = background_is_opaque();
+        set_background_opaque(true);
+        let theme = THEME.load_full();
+        for target in [theme.bg, theme.message_background()] {
+            let Some(target) = rgb(target) else { continue };
+            let mut h = TestHarness::boot_with_size(80, 24);
+            let unguarded = frame(&mut h);
+            assert!(
+                count_bg(&unguarded, target) > 0,
+                "fixture: the frame must paint {target:?} before the guard"
+            );
+            let mut h = TestHarness::boot_with_size(80, 24);
+            h.set_terminal_bg(Some(target));
+            let guarded = frame(&mut h);
+            assert_eq!(
+                count_bg(&guarded, target),
+                0,
+                "opaque frame still paints the terminal default bg {target:?}"
+            );
+            // Glyphs and fg are untouched; only the matching bgs moved.
+            for (a, b) in unguarded.content.iter().zip(guarded.content.iter()) {
+                assert_eq!(a.symbol(), b.symbol());
+                assert_eq!(a.fg, b.fg);
+            }
+        }
+        set_background_opaque(prior);
+    }
+
+    /// Invisible mode: see-through is intended, the frame is byte-identical.
+    #[test]
+    #[serial]
+    fn invisible_is_unchanged_by_a_detected_terminal_bg() {
+        let prior = background_is_opaque();
+        set_background_opaque(false);
+        let Some(target) = rgb(THEME.load().bg) else {
+            set_background_opaque(prior);
+            return;
+        };
+        let mut h = TestHarness::boot_with_size(80, 24);
+        let before = frame(&mut h);
+        let mut h = TestHarness::boot_with_size(80, 24);
+        h.set_terminal_bg(Some(target));
+        let after = frame(&mut h);
+        set_background_opaque(prior);
+        assert_eq!(before, after, "invisible mode must not be steered");
+    }
+
+    /// Unknown terminal bg (no OSC 11 reply / timeout): opaque frame unchanged.
+    #[test]
+    #[serial]
+    fn unknown_terminal_bg_leaves_the_opaque_frame_unchanged() {
+        let prior = background_is_opaque();
+        set_background_opaque(true);
+        let mut h = TestHarness::boot_with_size(80, 24);
+        let baseline = frame(&mut h);
+        let mut h = TestHarness::boot_with_size(80, 24);
+        h.set_terminal_bg(None);
+        let unknown = frame(&mut h);
+        set_background_opaque(prior);
+        assert_eq!(baseline, unknown);
+        if let Some(bg) = rgb(THEME.load().bg) {
+            assert!(count_bg(&unknown, bg) > 0, "theme bg still painted as-is");
         }
     }
 }

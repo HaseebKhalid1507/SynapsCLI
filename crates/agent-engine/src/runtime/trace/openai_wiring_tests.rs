@@ -10,7 +10,7 @@ use crate::runtime::openai::stream::{
     call_codex_stream_inner, call_oai_stream_inner, call_xai_responses_stream_inner,
 };
 use crate::runtime::openai::types::ProviderConfig;
-use crate::StreamEvent;
+use crate::{LlmEvent, StreamEvent};
 use agent_core::auth::{
     AccessToken, BrokerError, CredentialBroker, LocalBroker, ProxyByteStream, ProxyRequest,
     ProxyResponse, RemoteBroker, TokenCache,
@@ -95,6 +95,60 @@ fn assert_exact_wire(r: &RequestTrace, key_path: &std::path::Path, received: &[u
     );
 }
 
+/// Event channel whose receiver cancels `cancel` once the client has
+/// forwarded its first model text delta. Cancel tests key off this observed
+/// mid-stream point, never a wall-clock timer: a timer can fire before or
+/// during the send on a loaded runner, where no record is (correctly)
+/// emitted, so "mid-stream" would not be what the test exercised.
+fn cancel_on_first_text(cancel: &CancellationToken) -> mpsc::UnboundedSender<StreamEvent> {
+    let (tx, mut rx) = mpsc::unbounded_channel::<StreamEvent>();
+    let canceler = cancel.clone();
+    tokio::spawn(async move {
+        while let Some(event) = rx.recv().await {
+            if matches!(event, StreamEvent::Llm(LlmEvent::Text(_))) {
+                canceler.cancel();
+                break;
+            }
+        }
+    });
+    tx
+}
+
+/// Hang guard for the endless-stream cancel fixtures: if the trigger event
+/// never arrives the test fails instead of blocking forever.
+async fn within_deadline<T>(fut: impl std::future::Future<Output = T>) -> T {
+    tokio::time::timeout(Duration::from_secs(30), fut)
+        .await
+        .expect("trigger event never observed: stream did not reach mid-stream")
+}
+
+/// Loopback upstream that records the full request body arrived (the send
+/// happened), then never answers: the client is left awaiting headers.
+async fn spawn_headerless_stub(path: &str) -> (String, Arc<tokio::sync::Notify>) {
+    let received = Arc::new(tokio::sync::Notify::new());
+    let received_c = Arc::clone(&received);
+    let app = Router::new().route(
+        path,
+        axum_post(move |_body: Bytes| {
+            let received = Arc::clone(&received_c);
+            async move {
+                received.notify_one();
+                std::future::pending::<()>().await;
+                StatusCode::OK
+            }
+        }),
+    );
+    (serve(app).await, received)
+}
+
+fn cancel_on(received: Arc<tokio::sync::Notify>, cancel: &CancellationToken) {
+    let canceler = cancel.clone();
+    tokio::spawn(async move {
+        received.notified().await;
+        canceler.cancel();
+    });
+}
+
 // ═══ Chat Completions (broker-proxied) ══════════════════════════════════════
 
 const CHAT_SSE_SUCCESS: &str = concat!(
@@ -142,12 +196,24 @@ async fn drive_chat(
     exact: bool,
     cancel: &CancellationToken,
 ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+    let (tx, _rx) = mpsc::unbounded_channel::<StreamEvent>();
+    drive_chat_with_events(upstream, broker, trace, exact, cancel, tx).await
+}
+
+/// `drive_chat` with a caller-owned event channel.
+async fn drive_chat_with_events(
+    upstream: &str,
+    broker: Arc<dyn CredentialBroker>,
+    trace: &TraceContext,
+    exact: bool,
+    cancel: &CancellationToken,
+    tx: mpsc::UnboundedSender<StreamEvent>,
+) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
     let cfg = ProviderConfig {
         base_url: upstream.to_string(),
         model: "test-model".to_string(),
         provider: "local".to_string(),
     };
-    let (tx, _rx) = mpsc::unbounded_channel::<StreamEvent>();
     call_oai_stream_inner(
         &cfg,
         &broker,
@@ -275,15 +341,13 @@ async fn chat_cancel_mid_stream_emits_one_canceled_record() {
         upstream.clone(),
     ));
     let cancel = CancellationToken::new();
-    let canceler = cancel.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(80)).await;
-        canceler.cancel();
-    });
+    let tx = cancel_on_first_text(&cancel);
 
-    let err = drive_chat(&upstream, broker, &h.trace, true, &cancel)
-        .await
-        .expect_err("cancellation surfaces as request canceled");
+    let err = within_deadline(drive_chat_with_events(
+        &upstream, broker, &h.trace, true, &cancel, tx,
+    ))
+    .await
+    .expect_err("cancellation surfaces as request canceled");
     assert!(err.to_string().contains("canceled"));
 
     let records = h.sink.records();
@@ -294,6 +358,31 @@ async fn chat_cancel_mid_stream_emits_one_canceled_record() {
     assert_eq!(r.attempt, 1);
     assert!(r.outcome.timings.stream_end_ms.is_some());
     assert!(r.outcome.stop_reason.is_none(), "unobserved must stay None");
+}
+
+/// Follow-up evidence, not fixed here: the broker chat path awaits
+/// `proxy_stream` under `await_or_cancel` and maps a cancel to an error
+/// without finishing the attempt, so a send canceled before headers leaves
+/// no record despite `trace::emit`'s one-record-per-send rule.
+#[tokio::test]
+#[ignore = "known gap: cancel while awaiting headers emits no record (follow-up)"]
+async fn chat_cancel_while_awaiting_headers_emits_one_canceled_record() {
+    let (upstream, received) = spawn_headerless_stub("/chat/completions").await;
+    let h = harness();
+    let broker: Arc<dyn CredentialBroker> = Arc::new(LocalBroker::with_local_base_url(
+        reqwest::Client::new(),
+        upstream.clone(),
+    ));
+    let cancel = CancellationToken::new();
+    cancel_on(received, &cancel);
+
+    let err = within_deadline(drive_chat(&upstream, broker, &h.trace, true, &cancel))
+        .await
+        .expect_err("cancellation surfaces as request canceled");
+    assert!(err.to_string().contains("canceled"), "{err}");
+    let records = h.sink.records();
+    assert_eq!(records.len(), 1, "a sent attempt must still be recorded");
+    assert_eq!(records[0].outcome.terminal, TurnOutcome::Canceled);
 }
 
 #[tokio::test]
@@ -722,13 +811,24 @@ async fn drive_codex(
     max_retries: u32,
     cancel: &CancellationToken,
 ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+    let (tx, _rx) = mpsc::unbounded_channel::<StreamEvent>();
+    drive_codex_with_events(base_url, trace, max_retries, cancel, tx).await
+}
+
+/// `drive_codex` with a caller-owned event channel.
+async fn drive_codex_with_events(
+    base_url: &str,
+    trace: &TraceContext,
+    max_retries: u32,
+    cancel: &CancellationToken,
+    tx: mpsc::UnboundedSender<StreamEvent>,
+) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
     let cfg = ProviderConfig {
         base_url: base_url.to_string(),
         model: "gpt-5.6-sol".to_string(),
         provider: "openai-codex".to_string(),
     };
     let broker: Arc<dyn CredentialBroker> = Arc::new(TokenOnlyBroker);
-    let (tx, _rx) = mpsc::unbounded_channel::<StreamEvent>();
     call_codex_stream_inner(
         &cfg,
         &reqwest::Client::new(),
@@ -983,13 +1083,9 @@ async fn codex_cancel_mid_stream_emits_one_canceled_record() {
     let upstream = serve(app).await;
     let h = harness();
     let cancel = CancellationToken::new();
-    let canceler = cancel.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(80)).await;
-        canceler.cancel();
-    });
+    let tx = cancel_on_first_text(&cancel);
 
-    drive_codex(&upstream, &h.trace, 0, &cancel)
+    within_deadline(drive_codex_with_events(&upstream, &h.trace, 0, &cancel, tx))
         .await
         .expect_err("cancellation surfaces as request canceled");
 
@@ -998,6 +1094,25 @@ async fn codex_cancel_mid_stream_emits_one_canceled_record() {
     assert_schema_valid_and_content_free(&records);
     assert_eq!(records[0].outcome.terminal, TurnOutcome::Canceled);
     assert_eq!(records[0].outcome.http_status, Some(200));
+}
+
+/// Contrast with the Anthropic and broker-chat gaps: Codex's
+/// `send_with_retries` finishes the attempt as canceled when the cancel
+/// lands during the send, so the one-record-per-send rule holds here.
+#[tokio::test]
+async fn codex_cancel_while_awaiting_headers_emits_one_canceled_record() {
+    let (upstream, received) = spawn_headerless_stub("/codex/responses").await;
+    let h = harness();
+    let cancel = CancellationToken::new();
+    cancel_on(received, &cancel);
+
+    within_deadline(drive_codex(&upstream, &h.trace, 0, &cancel))
+        .await
+        .expect_err("cancellation surfaces as request canceled");
+    let records = h.sink.records();
+    assert_eq!(records.len(), 1, "a sent attempt must still be recorded");
+    assert_eq!(records[0].outcome.terminal, TurnOutcome::Canceled);
+    assert_eq!(records[0].outcome.http_status, None, "no headers observed");
 }
 
 // ═══ Unit coverage for the new helpers ══════════════════════════════════════
@@ -1183,4 +1298,468 @@ async fn astra_ultra_live_smoke() {
             role.as_str()
         );
     }
+}
+
+// ═══ Codex 4xx diagnosis + hosted web_search visibility (07 I2 / M2, 01 I4) ═══
+
+/// Every POST answers `status` with `body`. Loopback only.
+async fn spawn_codex_body_stub(
+    status: u16,
+    content_type: &'static str,
+    body: String,
+) -> (String, Arc<AtomicUsize>) {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let hits_c = Arc::clone(&hits);
+    let app = Router::new().route(
+        "/codex/responses",
+        axum_post(move || {
+            let hits = Arc::clone(&hits_c);
+            let body = body.clone();
+            async move {
+                hits.fetch_add(1, Ordering::SeqCst);
+                (
+                    StatusCode::from_u16(status).unwrap(),
+                    [("content-type", content_type)],
+                    body,
+                )
+                    .into_response()
+            }
+        }),
+    );
+    (serve(app).await, hits)
+}
+
+async fn drive_codex_collect(
+    base_url: &str,
+    trace: &TraceContext,
+) -> (
+    Result<Value, Box<dyn std::error::Error + Send + Sync>>,
+    Vec<StreamEvent>,
+) {
+    drive_codex_model(
+        base_url,
+        trace,
+        "gpt-5.6-sol",
+        agent_core::reasoning::ReasoningLevel::Medium,
+    )
+    .await
+}
+
+async fn drive_codex_model(
+    base_url: &str,
+    trace: &TraceContext,
+    model: &str,
+    level: agent_core::reasoning::ReasoningLevel,
+) -> (
+    Result<Value, Box<dyn std::error::Error + Send + Sync>>,
+    Vec<StreamEvent>,
+) {
+    drive_codex_model_tools(base_url, trace, model, level, &[]).await
+}
+
+async fn drive_codex_model_tools(
+    base_url: &str,
+    trace: &TraceContext,
+    model: &str,
+    level: agent_core::reasoning::ReasoningLevel,
+    tools: &[Value],
+) -> (
+    Result<Value, Box<dyn std::error::Error + Send + Sync>>,
+    Vec<StreamEvent>,
+) {
+    let cfg = ProviderConfig {
+        base_url: base_url.to_string(),
+        model: model.to_string(),
+        provider: "openai-codex".to_string(),
+    };
+    let broker: Arc<dyn CredentialBroker> = Arc::new(TokenOnlyBroker);
+    let (tx, mut rx) = mpsc::unbounded_channel::<StreamEvent>();
+    let result = call_codex_stream_inner(
+        &cfg,
+        &reqwest::Client::new(),
+        &broker,
+        tools,
+        &Some(format!("system {SENTINEL}")),
+        &messages(),
+        &tx,
+        None,
+        None,
+        level,
+        crate::runtime::openai::catalog::CodexRequestRole::Foreground,
+        &CancellationToken::new(),
+        3,
+        trace,
+    )
+    .await;
+    drop(tx);
+    let mut events = Vec::new();
+    while let Ok(ev) = rx.try_recv() {
+        events.push(ev);
+    }
+    (result, events)
+}
+
+#[tokio::test]
+async fn codex_400_surfaces_sanitized_provider_error_in_message_and_trace() {
+    let cases = [
+        (
+            // Unsupported reasoning effort.
+            r#"{"error":{"message":"Unsupported value: 'reasoning.effort' does not support 'max' with this model.","type":"invalid_request_error","param":"reasoning.effort","code":"unsupported_value"}}"#.to_string(),
+            "[invalid_request_error/unsupported_value, param reasoning.effort] — this model rejected the requested reasoning setting",
+            "http_400:invalid_request_error:unsupported_value",
+        ),
+        (
+            // Model not entitled on this ChatGPT seat (FastAPI `detail`).
+            r#"{"detail":"The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account."}"#.to_string(),
+            "400 Bad Request — this model isn't available on the selected ChatGPT account",
+            "http_400",
+        ),
+        (
+            // Hosted tool not allowed for the model.
+            r#"{"error":{"message":"Tool 'web_search' is not supported with gpt-5.6-sol.","type":"invalid_request_error","param":"tools","code":null}}"#.to_string(),
+            "[invalid_request_error, param tools] — the backend rejected a request tool definition",
+            "http_400:invalid_request_error",
+        ),
+        (
+            // A body that echoes request content: the echo never surfaces.
+            format!(r#"{{"error":{{"message":"Invalid 'input[0].content': '{SENTINEL} hello and a lot more prompt text here'","type":"invalid_request_error","code":"invalid_value"}}}}"#),
+            "400 Bad Request [invalid_request_error/invalid_value]",
+            "http_400:invalid_request_error:invalid_value",
+        ),
+    ];
+    for (body, expected_detail, expected_code) in cases {
+        let (upstream, hits) = spawn_codex_body_stub(400, "application/json", body).await;
+        let h = harness();
+        let (result, _events) = drive_codex_collect(&upstream, &h.trace).await;
+        let err = result.expect_err("400 must fail").to_string();
+        assert!(
+            err.starts_with("codex request failed: 400 Bad Request"),
+            "{err}"
+        );
+        assert!(
+            err.contains(expected_detail),
+            "missing {expected_detail:?} in {err}"
+        );
+        assert!(!err.contains(SENTINEL), "body leak: {err}");
+        assert!(!err.contains("acct_test"), "account id leak: {err}");
+        // Identifiers and Synaps text only: no provider prose at all.
+        for prose in [
+            "Unsupported value",
+            "is not supported",
+            "Invalid '",
+            "hello",
+        ] {
+            assert!(
+                !err.contains(prose),
+                "provider prose {prose:?} leaked: {err}"
+            );
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "400 is not retried");
+        let records = h.sink.records();
+        assert_eq!(records.len(), 1);
+        assert_schema_valid_and_content_free(&records);
+        match &records[0].outcome.terminal {
+            TurnOutcome::ProviderFailed { code, .. } => assert_eq!(code, expected_code),
+            other => panic!("expected ProviderFailed, got {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn codex_hosted_web_search_call_is_announced_with_query() {
+    let sse = concat!(
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"web_search_call\",\"id\":\"ws_1\",\"status\":\"in_progress\"}}\n\n",
+        "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"web_search_call\",\"id\":\"ws_1\",\"status\":\"completed\",\"action\":{\"type\":\"search\",\"query\":\"rust reqwest read_timeout\"}}}\n\n",
+        "data: {\"type\":\"response.output_text.delta\",\"output_index\":1,\"delta\":\"done\"}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":5,\"output_tokens\":1}}}\n\n",
+    );
+    let (upstream, _hits) = spawn_codex_body_stub(200, "text/event-stream", sse.to_string()).await;
+    let h = harness();
+    let (result, events) = drive_codex_collect(&upstream, &h.trace).await;
+    result.expect("stream completes");
+    let notices: Vec<&str> = events
+        .iter()
+        .filter_map(|e| match e {
+            StreamEvent::Session(crate::SessionEvent::Notice(t)) => Some(t.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        notices,
+        vec!["🔎 Codex web_search (search, completed): rust reqwest read_timeout"],
+        "exactly one notice, on the completed item"
+    );
+}
+
+// ═══ Hosted web_search: learned rejection (prE round 3, I1 option b) ═══
+
+const TOOLS_400: &str = r#"{"error":{"message":"Tool 'web_search' is not supported with this model.","type":"invalid_request_error","param":"tools","code":null}}"#;
+
+/// `/codex/responses` stub: answers a tools-400 to any body carrying the
+/// hosted web_search tool (or to every body when `always_reject`), SSE
+/// success otherwise. Records every body.
+async fn spawn_web_search_rejecting_stub(always_reject: bool) -> (String, CapturedBodies) {
+    spawn_rejecting_stub_with(always_reject, TOOLS_400).await
+}
+
+async fn spawn_rejecting_stub_with(
+    always_reject: bool,
+    reject_body: &'static str,
+) -> (String, CapturedBodies) {
+    let bodies: CapturedBodies = Arc::new(Mutex::new(Vec::new()));
+    let bodies_c = Arc::clone(&bodies);
+    let app = Router::new().route(
+        "/codex/responses",
+        axum_post(move |body: Bytes| {
+            let bodies = Arc::clone(&bodies_c);
+            async move {
+                let has_search = body_has_web_search(&body);
+                bodies.lock().unwrap().push(body.to_vec());
+                if always_reject || has_search {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        [("content-type", "application/json")],
+                        reject_body.to_string(),
+                    )
+                        .into_response()
+                } else {
+                    (
+                        StatusCode::OK,
+                        [("content-type", "text/event-stream")],
+                        CODEX_SSE_SUCCESS.to_string(),
+                    )
+                        .into_response()
+                }
+            }
+        }),
+    );
+    (serve(app).await, bodies)
+}
+
+fn body_has_web_search(body: &[u8]) -> bool {
+    let v: Value = serde_json::from_slice(body).unwrap_or_default();
+    v["tools"]
+        .as_array()
+        .is_some_and(|t| t.iter().any(|t| t["type"] == "web_search"))
+}
+
+fn notice_texts(events: &[StreamEvent]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            StreamEvent::Session(crate::SessionEvent::Notice(t)) => Some(t.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn web_search_on() -> crate::runtime::openai::codex_wire::EnvOverrideGuard {
+    crate::runtime::openai::codex_wire::override_env_for_test(&[(
+        "SYNAPS_CODEX_WEB_SEARCH",
+        "live",
+    )])
+}
+
+#[tokio::test]
+async fn codex_tools_400_is_remembered_per_model_and_retried_once_without_search() {
+    let _env = web_search_on();
+    let (upstream, bodies) = spawn_web_search_rejecting_stub(false).await;
+    let h = harness();
+    let model = "gpt-zz-ws-retry";
+    let level = agent_core::reasoning::ReasoningLevel::Adaptive;
+
+    let (result, events) = drive_codex_model(&upstream, &h.trace, model, level).await;
+    result.expect("the retry without web_search succeeds");
+    {
+        let sent = bodies.lock().unwrap();
+        assert_eq!(sent.len(), 2, "one rejected send, one retry");
+        assert!(body_has_web_search(&sent[0]));
+        assert!(!body_has_web_search(&sent[1]), "retry drops web_search");
+    }
+    let notices = notice_texts(&events);
+    assert_eq!(
+        notices
+            .iter()
+            .filter(|n| n.contains("web_search (rejected by gpt-zz-ws-retry)"))
+            .count(),
+        1,
+        "{notices:?}"
+    );
+    // Trace: the rejected attempt and the retry are both recorded.
+    let records = h.sink.records();
+    assert_schema_valid_and_content_free(&records);
+    assert_eq!(records.len(), 2);
+
+    // Remembered for this process: the next request never attaches it.
+    let (result, events) = drive_codex_model(&upstream, &h.trace, model, level).await;
+    result.expect("second request succeeds");
+    let sent = bodies.lock().unwrap();
+    assert_eq!(sent.len(), 3, "no rejected send the second time");
+    assert!(!body_has_web_search(&sent[2]));
+    assert!(
+        notice_texts(&events)
+            .iter()
+            .all(|n| !n.contains("rejected")),
+        "the rejection notice is one-time"
+    );
+}
+
+#[tokio::test]
+async fn codex_tools_400_is_never_retried_twice() {
+    let _env = web_search_on();
+    let (upstream, bodies) = spawn_web_search_rejecting_stub(true).await;
+    let h = harness();
+    let (result, _events) = drive_codex_model(
+        &upstream,
+        &h.trace,
+        "gpt-zz-ws-loop",
+        agent_core::reasoning::ReasoningLevel::Adaptive,
+    )
+    .await;
+    let err = result
+        .expect_err("a tools-400 without web_search is terminal")
+        .to_string();
+    assert_eq!(bodies.lock().unwrap().len(), 2, "exactly one retry");
+    assert!(
+        err.starts_with("codex request failed: 400 Bad Request"),
+        "{err}"
+    );
+    // web_search was not attached on the failing send, so it isn't blamed.
+    assert!(!err.contains("web_search"), "{err}");
+    // The resend failed the same way: web_search wasn't the cause, so
+    // nothing is learned and nothing is announced.
+    assert_eq!(
+        crate::runtime::openai::codex_wire::codex_web_search_unsupported_reason("gpt-zz-ws-loop"),
+        None
+    );
+    assert!(
+        notice_texts(&_events)
+            .iter()
+            .all(|n| !n.contains("rejected")),
+        "{:?}",
+        notice_texts(&_events)
+    );
+}
+
+#[tokio::test]
+async fn codex_bad_user_tool_schema_400_is_not_blamed_on_web_search() {
+    let _env = web_search_on();
+    const BAD_SCHEMA_400: &str = r#"{"error":{"message":"Invalid schema for function 'mcp_tool'.","type":"invalid_request_error","param":"tools[0].parameters","code":"invalid_function_parameters"}}"#;
+    let (upstream, bodies) = spawn_rejecting_stub_with(true, BAD_SCHEMA_400).await;
+    let h = harness();
+    let user_tool = json!({
+        "name": "mcp_tool",
+        "description": "an MCP tool",
+        "input_schema": {"type": "object", "properties": {}}
+    });
+    let (result, events) = drive_codex_model_tools(
+        &upstream,
+        &h.trace,
+        "gpt-zz-ws-badschema",
+        agent_core::reasoning::ReasoningLevel::Adaptive,
+        &[user_tool],
+    )
+    .await;
+    let err = result.expect_err("the schema 400 surfaces").to_string();
+    {
+        let sent = bodies.lock().unwrap();
+        assert_eq!(sent.len(), 1, "no resend for a user-tool rejection");
+        assert!(
+            body_has_web_search(&sent[0]),
+            "web_search was attached at tools[1]"
+        );
+    }
+    assert!(err.contains("param tools[0].parameters"), "{err}");
+    assert_eq!(
+        crate::runtime::openai::codex_wire::codex_web_search_unsupported_reason(
+            "gpt-zz-ws-badschema"
+        ),
+        None
+    );
+    assert!(notice_texts(&events)
+        .iter()
+        .all(|n| !n.contains("rejected")));
+}
+
+#[tokio::test]
+async fn codex_web_search_resend_is_traced_under_an_armed_one_shot_gate() {
+    let _env = web_search_on();
+    let (upstream, _bodies) = spawn_web_search_rejecting_stub(false).await;
+    let h = harness();
+    let armed = h.trace.clone().with_one_shot_request_gate();
+    let (result, _) = drive_codex_model(
+        &upstream,
+        &armed,
+        "gpt-zz-ws-oneshot",
+        agent_core::reasoning::ReasoningLevel::Adaptive,
+    )
+    .await;
+    result.expect("resend succeeds");
+    let records = h.sink.records();
+    assert_schema_valid_and_content_free(&records);
+    assert_eq!(records.len(), 2, "rejected send and resend are both traced");
+}
+
+#[tokio::test]
+async fn codex_spark_never_gets_web_search_and_lite_rows_still_do() {
+    let _env = web_search_on();
+    let (upstream, bodies) = spawn_web_search_rejecting_stub(false).await;
+    let h = harness();
+    let (result, _) = drive_codex_model(
+        &upstream,
+        &h.trace,
+        "gpt-5.3-codex-spark",
+        agent_core::reasoning::ReasoningLevel::Medium,
+    )
+    .await;
+    result.expect("spark request succeeds");
+    assert_eq!(bodies.lock().unwrap().len(), 1);
+    assert!(!body_has_web_search(&bodies.lock().unwrap()[0]));
+
+    // A Responses-Lite flagship (upstream use_responses_lite: true) still
+    // gets the hosted tool: Synaps sends full Responses requests.
+    let (upstream, bodies, _hits) = spawn_codex_stub(vec![]).await;
+    let _ = drive_codex_model(
+        &upstream,
+        &h.trace,
+        "gpt-5.6-terra",
+        agent_core::reasoning::ReasoningLevel::Medium,
+    )
+    .await;
+    assert!(body_has_web_search(&bodies.lock().unwrap()[0]));
+}
+
+#[tokio::test]
+async fn codex_untraced_continuation_resend_stays_untraced_under_one_shot_gate() {
+    let _env = web_search_on();
+    let (upstream, bodies) = spawn_web_search_rejecting_stub(false).await;
+    let h = harness();
+    let armed = h.trace.clone().with_one_shot_request_gate();
+    // Request 1 (spark: no web_search) holds the one-shot gate.
+    let (result, _) = drive_codex_model(
+        &upstream,
+        &armed,
+        "gpt-5.3-codex-spark",
+        agent_core::reasoning::ReasoningLevel::Medium,
+    )
+    .await;
+    result.expect("first request succeeds");
+    // Request 2 is an untraced continuation that hits a web_search 400 and
+    // resends; the resend must not borrow the spent gate.
+    let (result, _) = drive_codex_model(
+        &upstream,
+        &armed,
+        "gpt-zz-ws-untraced",
+        agent_core::reasoning::ReasoningLevel::Adaptive,
+    )
+    .await;
+    result.expect("resend succeeds");
+    assert_eq!(
+        bodies.lock().unwrap().len(),
+        3,
+        "1 + rejected send + resend"
+    );
+    let records = h.sink.records();
+    assert_schema_valid_and_content_free(&records);
+    assert_eq!(records.len(), 1, "only the gate-holding request is traced");
 }

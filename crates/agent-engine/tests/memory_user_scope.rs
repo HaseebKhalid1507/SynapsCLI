@@ -46,6 +46,7 @@ fn context(binding: &MemoryBinding) -> ToolContext {
             tx_events: None,
         },
         capabilities: ToolCapabilities {
+            session_allow_all: None,
             launch_cancel: None,
             memory_backend: Some(binding.clone()),
             watcher_exit_path: None,
@@ -65,6 +66,7 @@ fn context(binding: &MemoryBinding) -> ToolContext {
             env: None,
             env_stripped: Vec::new(),
             env_warned: Default::default(),
+            session_id: None,
         },
         limits: ToolLimits {
             max_tool_output: 30_000,

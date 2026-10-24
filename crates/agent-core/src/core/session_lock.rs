@@ -163,7 +163,11 @@ impl std::fmt::Display for SessionLockError {
 
 impl std::error::Error for SessionLockError {}
 
+// Locks are non-blocking: a concurrently spawned test process can briefly
+// hold an inherited lock descriptor until it executes, see memory::repository
+// tests.
 #[cfg(test)]
+#[serial_test::parallel(process_spawn)]
 mod tests {
     use super::*;
 

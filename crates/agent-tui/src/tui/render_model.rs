@@ -17,9 +17,13 @@ use super::sidecar::SidecarUiStatus;
 /// The per-frame snapshot shipped to the render side.
 pub(crate) struct RenderModel {
     // ── Header / status ──────────────────────────────────────────────────────
+    /// Header inputs: activity, session label, folder, attach mode, clocks.
+    pub(crate) header: super::header::HeaderSnap,
     pub(crate) status_text: Option<String>,
     pub(crate) streaming: bool,
     pub(crate) spinner_frame: usize,
+    /// The focused worker view's banner (header), `None` on the main thread.
+    pub(crate) watch_banner: Option<super::watch::Banner>,
 
     /// Sidecar pills projected out of the live `HashMap<String, SidecarUiState>`.
     /// Ordered by importance desc then display_name asc, as computed on the
@@ -133,6 +137,8 @@ pub(crate) struct SubagentSnap {
     pub(crate) tools: u32,
     /// First line of the result once done.
     pub(crate) result: Option<String>,
+    /// This worker's view is the one in focus.
+    pub(crate) watched: bool,
 }
 
 /// Pre-computed ghost-hint for slash-command completion in the input box.
@@ -156,4 +162,12 @@ pub(crate) struct SecretPromptSnap {
     pub(crate) title: String,
     pub(crate) prompt: String,
     pub(crate) masked_buffer_chars: usize,
+    /// `Confirm` only: the focused button.
+    pub(crate) confirm_focus: synaps_cli::tools::ConfirmChoice,
+    /// `Confirm` only: whether the "Allow all from <ext>" button is offered.
+    pub(crate) confirm_offers_allow_all: bool,
+    /// `Confirm` only: source extension(s) and tool of a tool-call confirm.
+    pub(crate) confirm_scope: Option<synaps_cli::tools::ConfirmScope>,
+    /// `Confirm` only: "Allow all" awaits its second Enter.
+    pub(crate) confirm_allow_all_pending: bool,
 }

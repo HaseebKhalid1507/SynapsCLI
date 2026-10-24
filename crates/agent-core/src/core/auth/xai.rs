@@ -1,6 +1,7 @@
 use super::{
     generate_code_challenge, generate_code_verifier, generate_state, now_millis, open_browser,
     save_provider_auth, start_callback_server_at, CallbackOutcome, OAuthCredentials,
+    RefreshFailure,
 };
 use reqwest::Client;
 use serde::Deserialize;
@@ -45,6 +46,13 @@ fn validate_endpoint(value: &str) -> Result<(), String> {
     Ok(())
 }
 pub async fn discover(_client: &Client) -> Result<Discovery, String> {
+    discover_at(DISCOVERY_URL).await.map_err(String::from)
+}
+
+/// Discovery is a precondition of the refresh, not part of the login: any
+/// failure to fetch or read it is transient; only an untrusted endpoint is
+/// not.
+pub(crate) async fn discover_at(url: &str) -> Result<Discovery, RefreshFailure> {
     let client = Client::builder()
         .redirect(reqwest::redirect::Policy::custom(|attempt| {
             if validate_endpoint(attempt.url().as_str()).is_ok() && attempt.previous().len() < 3 {
@@ -54,22 +62,24 @@ pub async fn discover(_client: &Client) -> Result<Discovery, String> {
             }
         }))
         .build()
-        .map_err(|e| format!("xAI HTTP client failed: {e}"))?;
+        .map_err(|e| RefreshFailure::other(format!("xAI HTTP client failed: {e}")))?;
     let response = client
-        .get(DISCOVERY_URL)
+        .get(url)
         .send()
         .await
-        .map_err(|e| format!("xAI discovery failed: {e}"))?;
-    validate_endpoint(response.url().as_str())?;
+        .map_err(|e| RefreshFailure::transport(format!("xAI discovery failed: {e}")))?;
+    validate_endpoint(response.url().as_str()).map_err(RefreshFailure::other)?;
     if !response.status().is_success() {
-        return Err(format!("xAI discovery failed: HTTP {}", response.status()));
+        return Err(RefreshFailure::transport(format!(
+            "xAI discovery failed: HTTP {}",
+            response.status()
+        )));
     }
-    validate_discovery(
-        response
-            .json()
-            .await
-            .map_err(|e| format!("invalid xAI discovery: {e}"))?,
-    )
+    let discovery = response
+        .json()
+        .await
+        .map_err(|e| RefreshFailure::bad_response(format!("invalid xAI discovery: {e}")))?;
+    validate_discovery(discovery).map_err(RefreshFailure::other)
 }
 pub fn authorize_url(
     endpoint: &str,
@@ -122,36 +132,38 @@ async fn token_post(
     form: &[(&str, &str)],
     previous: Option<&str>,
     require: bool,
-) -> Result<OAuthCredentials, String> {
-    validate_endpoint(endpoint)?;
+) -> Result<OAuthCredentials, RefreshFailure> {
+    validate_endpoint(endpoint).map_err(RefreshFailure::other)?;
     // OAuth secrets must never be replayed to a redirect target.
     let no_redirect_client = Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()
-        .map_err(|e| format!("xAI HTTP client failed: {e}"))?;
+        .map_err(|e| RefreshFailure::other(format!("xAI HTTP client failed: {e}")))?;
     let response = no_redirect_client
         .post(endpoint)
         .form(form)
         .send()
         .await
-        .map_err(|e| format!("xAI token request failed: {e}"))?;
-    if !response.status().is_success() {
-        return Err(format!(
-            "xAI token request failed: HTTP {}",
-            response.status()
+        .map_err(|e| RefreshFailure::transport(format!("xAI token request failed: {e}")))?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(RefreshFailure::status(
+            status.as_u16(),
+            format!("xAI token request failed: HTTP {status}"),
         ));
     }
-    credentials(
-        response
-            .json()
-            .await
-            .map_err(|e| format!("invalid xAI token response: {e}"))?,
-        previous,
-        require,
-    )
+    let token = response
+        .json()
+        .await
+        .map_err(|e| RefreshFailure::bad_response(format!("invalid xAI token response: {e}")))?;
+    credentials(token, previous, require).map_err(RefreshFailure::bad_response)
 }
-pub async fn refresh_token(client: &Client, refresh: &str) -> Result<OAuthCredentials, String> {
-    let d = discover(client).await?;
+pub async fn refresh_token(
+    client: &Client,
+    refresh: &str,
+) -> Result<OAuthCredentials, RefreshFailure> {
+    let _ = client;
+    let d = discover_at(DISCOVERY_URL).await?;
     token_post(
         client,
         &d.token_endpoint,
@@ -216,6 +228,12 @@ where
 }
 
 pub async fn login() -> Result<OAuthCredentials, String> {
+    login_into(Some("xai-auth")).await
+}
+
+/// Login; `Some(key)` persists ONLY into that slot (`xai-auth` or
+/// `xai-auth@<label>`), `None` returns the credential unsaved.
+pub async fn login_into(persist_key: Option<&str>) -> Result<OAuthCredentials, String> {
     let client = Client::new();
     let d = discover(&client).await?;
     let verifier = generate_code_verifier();
@@ -260,7 +278,9 @@ pub async fn login() -> Result<OAuthCredentials, String> {
         true,
     )
     .await?;
-    save_provider_auth("xai-auth", &creds)?;
+    if let Some(key) = persist_key {
+        save_provider_auth(key, &creds)?;
+    }
     Ok(creds)
 }
 

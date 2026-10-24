@@ -10,14 +10,45 @@ static IDENTITY: OnceLock<String> = OnceLock::new();
 pub const DEFAULT_IDENTITY: &str =
     "You are an AI assistant running in SynapsCLI, an open-source agent runtime.";
 
+thread_local! {
+    /// [`with_identity_for_tests`]'s pin; `None` everywhere else.
+    static IDENTITY_OVERRIDE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
 /// Returns the configured identity string for the system prompt preamble.
 /// Falls back to `DEFAULT_IDENTITY` (the SynapsCLI identity above) if not set
 /// in config. Initialized by `load_config()` — safe to call anytime after boot.
 pub fn get_identity() -> String {
+    if let Some(pinned) = IDENTITY_OVERRIDE.with(|o| o.borrow().clone()) {
+        return pinned;
+    }
     IDENTITY
         .get()
         .cloned()
         .unwrap_or_else(|| DEFAULT_IDENTITY.to_string())
+}
+
+/// Run `f` with [`get_identity`] pinned to `identity` on this thread.
+///
+/// `IDENTITY` is a process-wide `OnceLock` latched by whichever test first
+/// calls `load_config()`, against whatever config is ambient then (on a
+/// developer machine, the real `~/.synaps-cli/config`). A test that asserts
+/// on the identity pins it here instead, so the result does not depend on
+/// test order or on HOME. Thread-scoped, so concurrent tests don't see each
+/// other's pin; code `f` hands to another thread does not see it either.
+/// Restored on unwind.
+#[doc(hidden)]
+pub fn with_identity_for_tests<R>(identity: &str, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<String>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let prev = self.0.take();
+            IDENTITY_OVERRIDE.with(|o| *o.borrow_mut() = prev);
+        }
+    }
+    let prev = IDENTITY_OVERRIDE.with(|o| o.borrow_mut().replace(identity.to_string()));
+    let _restore = Restore(prev);
+    f()
 }
 
 /// Provider API keys parsed from `provider.<name> = ...` lines in config.
@@ -150,6 +181,10 @@ pub struct ContextManagementConfig {
     /// Maximum extra Plan/WrapUp rounds after rollover becomes due. Default: 2.
     /// Zero disables extensions; phase reports cannot renew this allowance.
     pub finish_rounds: u32,
+    /// Footprint a rollover successor aims for (system prompt + tool schemas +
+    /// retained messages). `None`/`auto` = min(100,000, 2/3 of pressure).
+    /// An explicit value must be positive and below the pressure threshold.
+    pub target_tokens: Option<u64>,
 }
 
 impl Default for ContextManagementConfig {
@@ -160,6 +195,7 @@ impl Default for ContextManagementConfig {
             rollover_tokens: None,
             reserve_tokens: 16_000,
             finish_rounds: 2,
+            target_tokens: None,
         }
     }
 }
@@ -180,6 +216,14 @@ impl ContextManagementConfig {
         if let (Some(pressure), Some(rollover)) = (self.pressure_tokens, self.rollover_tokens) {
             if pressure >= rollover {
                 return Err("pressure_tokens must be below rollover_tokens");
+            }
+        }
+        if self.target_tokens == Some(0) {
+            return Err("target_tokens must be positive");
+        }
+        if let (Some(target), Some(pressure)) = (self.target_tokens, self.pressure_tokens) {
+            if target >= pressure {
+                return Err("target_tokens must be below pressure_tokens");
             }
         }
         if !(1..=Self::MAX_RESERVE_TOKENS).contains(&self.reserve_tokens) {
@@ -210,6 +254,13 @@ impl ContextManagementConfig {
         {
             return Err("rollover_tokens must not exceed the context window");
         }
+        if let Some(target) = self.target_tokens {
+            let (pressure, _) =
+                crate::core::context_policy::ContextThresholds::bands(self, context_window_tokens);
+            if target >= pressure {
+                return Err("target_tokens must be below pressure_tokens");
+            }
+        }
         Ok(())
     }
 }
@@ -225,7 +276,9 @@ fn parse_context_management_config_key(
         "context_management.mode" => {
             config.mode = ContextManagementMode::parse(value).ok_or("expected off or auto")?;
         }
-        "context_management.pressure_tokens" | "context_management.rollover_tokens" => {
+        "context_management.pressure_tokens"
+        | "context_management.rollover_tokens"
+        | "context_management.target_tokens" => {
             let tokens = if value.eq_ignore_ascii_case("auto") {
                 None
             } else {
@@ -235,10 +288,10 @@ fn parse_context_management_config_key(
                         .map_err(|_| "expected auto or an unsigned token count")?,
                 )
             };
-            if key == "context_management.pressure_tokens" {
-                config.pressure_tokens = tokens;
-            } else {
-                config.rollover_tokens = tokens;
+            match key {
+                "context_management.pressure_tokens" => config.pressure_tokens = tokens,
+                "context_management.rollover_tokens" => config.rollover_tokens = tokens,
+                _ => config.target_tokens = tokens,
             }
         }
         "context_management.reserve_tokens" => {
@@ -260,11 +313,19 @@ fn parse_context_management_config_key(
 /// take effect at the next launch, never mid-session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StartupConfig {
-    /// Skip blocking on extension discovery before the first turn. When true
-    /// the attach path sets `await_extensions=false` (fast cold start; a tool
-    /// from a slow extension may be unavailable on turn 1). Default: true.
+    /// Create the session without waiting for extensions. When true the
+    /// attach path sets `await_extensions=false`: the session (and the TUI)
+    /// comes up at once, and `on_session_start` runs in the background. The
+    /// first turn starts at once too, but its model request waits until the
+    /// hook has run: for extension discovery (up to
+    /// `extensions_ready_timeout_secs`, default 30 s), then for the hook
+    /// (each handler up to 5 s). Clients are told while it waits. Default: true.
     pub quick_start: bool,
-    /// Max seconds to wait for extensions when Quick Start is off. Default: 30.
+    /// Max seconds to wait for extension discovery before a session's
+    /// `on_session_start`: at create when Quick Start is off, before the
+    /// first turn's request when it is on. Default: 30. It does not bound
+    /// the `on_session_start` call itself, which then waits its turn at the
+    /// host's one-at-a-time gate.
     pub extensions_ready_timeout_secs: u64,
 }
 
@@ -456,12 +517,41 @@ pub struct AuthConfig {
     /// Per-machine bearer presented to the broker (or `SYNAPS_MACHINE_TOKEN`).
     /// This is the machine's own identity, never the provider credential.
     pub machine_token: Option<String>,
+    /// Selected OAuth account per provider from `auth.account.<provider> =
+    /// <label|default|auto>`. Keys are the raw provider ids as written;
+    /// validation (and fail-closed handling of bad labels) happens in
+    /// [`AccountPolicy::from_config_map`](crate::core::auth::AccountPolicy::from_config_map).
+    pub accounts: BTreeMap<String, String>,
+    /// Raw automatic chooser settings, relative to auth.auto.
+    pub auto: BTreeMap<String, String>,
 }
 
 impl AuthConfig {
+    /// Account policy from config only (no env overlay). Invalid entries fail
+    /// closed for their provider; see `AccountPolicy::from_config_map`.
+    pub fn account_policy(&self) -> crate::core::auth::AccountPolicy {
+        crate::core::auth::AccountPolicy::from_config_map(&self.accounts).0
+    }
+
+    /// Effective selector for one provider (env > config > default).
+    pub fn account_selector(
+        &self,
+        provider: crate::core::auth::OAuthProviderId,
+    ) -> crate::core::auth::AccountSelector {
+        self.account_policy().with_env_overlay().selector(provider)
+    }
+
     /// Resolve the credential source. Environment variables take precedence over
     /// config-file values: `SYNAPS_AUTH_ENDPOINT` / `SYNAPS_MACHINE_TOKEN`.
     /// Returns `Remote` iff an endpoint is set (env or config), else `Local`.
+    ///
+    /// The machine token here is only ever the EXPLICIT one (env or config).
+    /// When none is configured it stays empty, and that emptiness is the
+    /// provenance record: the broker client ([`crate::core::auth::MachineToken`])
+    /// then uses — and may re-read after a 401 — the local broker's
+    /// auto-generated `<base_dir>/auth-broker.token`, but only for a loopback
+    /// endpoint (#147 C1, prA N1). An explicit token is never replaced by,
+    /// or sent alongside, the file token.
     pub fn credential_source(&self) -> crate::core::auth::CredentialSource {
         let endpoint = std::env::var("SYNAPS_AUTH_ENDPOINT")
             .ok()
@@ -470,7 +560,7 @@ impl AuthConfig {
         let machine_token = std::env::var("SYNAPS_MACHINE_TOKEN")
             .ok()
             .filter(|s| !s.trim().is_empty())
-            .or_else(|| self.machine_token.clone());
+            .or_else(|| self.machine_token.clone().filter(|s| !s.trim().is_empty()));
         crate::core::auth::CredentialSource::from_parts(endpoint, machine_token)
     }
 }
@@ -734,17 +824,55 @@ fn parse_events_config_key(cfg: &mut EventsConfig, key: &str, val: &str) -> Resu
     Ok(())
 }
 
+/// A configured per-turn count limit: a number, or `unlimited`.
+///
+/// Used for `turn_budget.<role>.max_provider_rounds`, `max_tool_calls` and
+/// `max_accumulated_tool_result_bytes`. `Max(0)` means "none allowed" (the
+/// 0.10.2 meaning of `0`); the parser still accepts `0` for one release, with
+/// a deprecation warning, and will reject it later.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnLimit<T> {
+    Max(T),
+    Unlimited,
+}
+
+impl<T> TurnLimit<T> {
+    /// The limit, or `None` for no limit.
+    pub fn limit(self) -> Option<T> {
+        match self {
+            TurnLimit::Max(v) => Some(v),
+            TurnLimit::Unlimited => None,
+        }
+    }
+
+    /// Convert the limit value, keeping `Unlimited`.
+    pub fn map<U>(self, f: impl FnOnce(T) -> U) -> TurnLimit<U> {
+        match self {
+            TurnLimit::Max(v) => TurnLimit::Max(f(v)),
+            TurnLimit::Unlimited => TurnLimit::Unlimited,
+        }
+    }
+}
+
 /// Typed per-role turn-budget overrides (Task 23, spec §8.1). Every field
 /// is optional: unset fields keep the role's compiled default. Values are
 /// parsed from `turn_budget.<role>.<field>` config keys.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct TurnBudgetOverrides {
-    pub max_provider_rounds: Option<u32>,
-    pub max_tool_calls: Option<u32>,
+    /// Provider rounds per turn: N or `unlimited`. Unset = the role default
+    /// (foreground unlimited, autonomous 24, worker 64 per allowance). `0` =
+    /// none allowed (deprecated).
+    pub max_provider_rounds: Option<TurnLimit<u32>>,
+    /// Tool calls per turn: N or `unlimited`. Unset = the role default
+    /// (autonomous 96, otherwise unlimited). `0` = none allowed (deprecated).
+    pub max_tool_calls: Option<TurnLimit<u32>>,
     /// Wall-clock limit for one turn, in seconds. Unset = no limit (the
     /// default for every role); `0` also means no limit.
     pub max_elapsed_secs: Option<u64>,
-    pub max_accumulated_tool_result_bytes: Option<usize>,
+    /// Accumulated tool-result bytes per turn: N or `unlimited`. Unset = the
+    /// role default (autonomous 8 MiB, otherwise unlimited). `0` = none
+    /// allowed (deprecated).
+    pub max_accumulated_tool_result_bytes: Option<TurnLimit<usize>>,
     pub max_context_tokens: Option<u64>,
     pub max_cost_usd: Option<f64>,
     /// Bounded auto-renewals of the provider-round allowance after it is
@@ -759,19 +887,23 @@ pub struct TurnBudgetOverrides {
 pub struct TurnBudgetsConfig {
     pub foreground: TurnBudgetOverrides,
     pub autonomous: TurnBudgetOverrides,
+    /// Turns a session starts by itself because events arrived.
+    pub event: TurnBudgetOverrides,
     pub worker: TurnBudgetOverrides,
 }
 
 /// Parse `turn_budget.<role>.<field>` keys. Invalid values warn and keep
-/// the default (parity with shell.* parsing). `Err` carries the diagnostic
-/// the caller prints.
+/// the default (parity with shell.* parsing). `Err` carries the stderr
+/// diagnostic. `Ok(Some(warning))`: applied, with a deprecation warning for
+/// `config.warnings` (shown at TUI startup, in watcher logs and on stderr
+/// for headless hosts).
 fn parse_turn_budget_config_key(
     budgets: &mut TurnBudgetsConfig,
     key: &str,
     val: &str,
-) -> Result<(), String> {
+) -> Result<Option<String>, String> {
     let Some(rest) = key.strip_prefix("turn_budget.") else {
-        return Ok(());
+        return Ok(None);
     };
     let Some((role, field)) = rest.split_once('.') else {
         return Err(format!(
@@ -781,10 +913,11 @@ fn parse_turn_budget_config_key(
     let overrides = match role {
         "foreground" => &mut budgets.foreground,
         "autonomous" => &mut budgets.autonomous,
+        "event" => &mut budgets.event,
         "worker" => &mut budgets.worker,
         other => {
             return Err(format!(
-                "Warning: unknown turn_budget role '{other}' (expected foreground|autonomous|worker)"
+                "Warning: unknown turn_budget role '{other}' (expected foreground|autonomous|event|worker)"
             ));
         }
     };
@@ -793,24 +926,55 @@ fn parse_turn_budget_config_key(
             match val.parse::<$ty>() {
                 Ok(parsed) => $slot = Some(parsed),
                 Err(_) => {
-                    return Err(format!("Warning: invalid value for {key}: '{val}', using default"))
+                    return Err(format!(
+                        "Warning: invalid value for {key}: '{val}', using default"
+                    ))
+                }
+            }
+        };
+    }
+    // Count limits: a number or `unlimited`. `0` keeps its 0.10.2 meaning
+    // ("none allowed") for one release, with a deprecation warning.
+    let mut deprecation = None;
+    macro_rules! set_limit {
+        ($slot:expr, $ty:ty) => {
+            if val.trim_matches('"').eq_ignore_ascii_case("unlimited") {
+                $slot = Some(TurnLimit::Unlimited);
+            } else {
+                match val.parse::<$ty>() {
+                    Ok(0) => {
+                        $slot = Some(TurnLimit::Max(0));
+                        deprecation = Some(format!(
+                            "{key} = 0 means \"none allowed\". `0` will be rejected in a \
+                             future release; use `unlimited` for no limit, or a positive number"
+                        ));
+                    }
+                    Ok(parsed) => $slot = Some(TurnLimit::Max(parsed)),
+                    Err(_) => {
+                        return Err(format!(
+                            "Warning: invalid value for {key}: '{val}' (expected a positive \
+                             number or unlimited), using default"
+                        ))
+                    }
                 }
             }
         };
     }
     match field {
-        "max_provider_rounds" => set!(overrides.max_provider_rounds, u32),
-        "max_tool_calls" => set!(overrides.max_tool_calls, u32),
+        "max_provider_rounds" => set_limit!(overrides.max_provider_rounds, u32),
+        "max_tool_calls" => set_limit!(overrides.max_tool_calls, u32),
         "max_elapsed_secs" => set!(overrides.max_elapsed_secs, u64),
         "max_accumulated_tool_result_bytes" => {
-            set!(overrides.max_accumulated_tool_result_bytes, usize)
+            set_limit!(overrides.max_accumulated_tool_result_bytes, usize)
         }
         "max_context_tokens" => set!(overrides.max_context_tokens, u64),
         "max_cost_usd" => set!(overrides.max_cost_usd, f64),
         "max_round_renewals" => set!(overrides.max_round_renewals, u32),
-        other => return Err(format!("Warning: unknown turn_budget field '{other}'")),
+        other => {
+            return Err(format!("Warning: unknown turn_budget field '{other}'"))
+        }
     }
-    Ok(())
+    Ok(deprecation)
 }
 
 /// Continuous-memory settings surface (Task A2, spec §12). Every field is
@@ -1154,6 +1318,7 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "context_management.rollover_tokens",
     "context_management.reserve_tokens",
     "context_management.finish_rounds",
+    "context_management.target_tokens",
     "startup.quick_start",
     "startup.extensions_ready_timeout_secs",
     "daemon.idle_exit_secs",
@@ -1166,6 +1331,9 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "subagent.max_concurrent",
     "subagent.max_total",
     "subagent.max_depth",
+    // Legacy flat spellings of `subagent.max_concurrent` / `subagent.max_total`.
+    "subagent_max_concurrent",
+    "subagent_max_total",
     "api_retries",
     "refusal_retries",
     "telemetry",
@@ -1227,6 +1395,13 @@ pub const FAMILY_CONFIG_KEYS: &[&str] = &[
     "turn_budget.autonomous.max_context_tokens",
     "turn_budget.autonomous.max_cost_usd",
     "turn_budget.autonomous.max_round_renewals",
+    "turn_budget.event.max_provider_rounds",
+    "turn_budget.event.max_tool_calls",
+    "turn_budget.event.max_elapsed_secs",
+    "turn_budget.event.max_accumulated_tool_result_bytes",
+    "turn_budget.event.max_context_tokens",
+    "turn_budget.event.max_cost_usd",
+    "turn_budget.event.max_round_renewals",
     "turn_budget.worker.max_provider_rounds",
     "turn_budget.worker.max_tool_calls",
     "turn_budget.worker.max_elapsed_secs",
@@ -1411,6 +1586,50 @@ fn parse_bridge_config_key(bridge_config: &mut BridgeConfig, key: &str, val: &st
     }
 }
 
+/// Warning for an `auth.*` key no parser reads (a typo would otherwise
+/// silently leave traffic on the default account), with a did-you-mean.
+fn unknown_auth_key_warning(key: &str) -> Option<String> {
+    const EXACT: [&str; 2] = ["auth.remote_endpoint", "auth.machine_token"];
+    const FAMILIES: [&str; 2] = ["auth.account", "auth.auto"];
+    const PLACEHOLDERS: [&str; 2] = ["<provider>", "<key>"];
+    if EXACT.contains(&key) {
+        return None;
+    }
+    for (family, placeholder) in FAMILIES.iter().zip(PLACEHOLDERS) {
+        match key.strip_prefix(family) {
+            // `auth.account` or `auth.account.` (no provider): name the shape.
+            Some("") | Some(".") => {
+                return Some(format!(
+                    "unknown key '{key}' (did you mean '{family}.{placeholder}'?)"
+                ))
+            }
+            Some(rest) if rest.starts_with('.') && !rest[1..].trim().is_empty() => return None,
+            _ => {}
+        }
+    }
+    // A family typo keeps its suffix: `auth.acount.x` → `auth.account.x`.
+    let (head, rest) = match key.match_indices('.').nth(1) {
+        Some((i, _)) => key.split_at(i),
+        None => (key, ""),
+    };
+    let suggestion = EXACT
+        .iter()
+        .map(|k| (levenshtein(key, k), k.to_string()))
+        .chain(
+            FAMILIES
+                .iter()
+                .filter(|_| !rest.is_empty())
+                .map(|f| (levenshtein(head, f), format!("{f}{rest}"))),
+        )
+        .filter(|(d, _)| *d <= 2)
+        .min_by_key(|(d, _)| *d)
+        .map(|(_, k)| k);
+    Some(match suggestion {
+        Some(s) => format!("unknown key '{key}' (did you mean '{s}'?)"),
+        None => format!("unknown key '{key}' — ignored"),
+    })
+}
+
 /// Parse auth.* configuration keys and update the AuthConfig.
 fn parse_auth_config_key(auth_config: &mut AuthConfig, key: &str, val: &str) {
     let v = val.trim();
@@ -1430,7 +1649,19 @@ fn parse_auth_config_key(auth_config: &mut AuthConfig, key: &str, val: &str) {
             };
         }
         _ => {
-            // Unknown auth.* keys preserved (not rejected)
+            if let Some(provider) = key.strip_prefix("auth.account.") {
+                let provider = provider.trim();
+                if !provider.is_empty() {
+                    // Raw value; validated (fail closed) by AccountPolicy.
+                    auth_config
+                        .accounts
+                        .insert(provider.to_string(), v.to_string());
+                }
+            }
+            if let Some(key) = key.strip_prefix("auth.auto.").filter(|k| !k.trim().is_empty()) {
+                auth_config.auto.insert(key.to_string(), v.to_string());
+            }
+            // Other unknown auth.* keys preserved (not rejected)
         }
     }
 }
@@ -1633,6 +1864,15 @@ fn apply_config_content_with(
                     config.subagent_timeout = timeout;
                 }
             }
+            // Legacy flat spellings (pre-`subagent.*`): same parser, same limits.
+            "subagent_max_concurrent" | "subagent_max_total" => {
+                let dotted = key.replacen("subagent_", "subagent.", 1);
+                if let Err(reason) =
+                    parse_subagent_config_key(&mut config.subagent, &dotted, val)
+                {
+                    config.warnings.push(format!("{key} — {reason}"));
+                }
+            }
             "api_retries" => {
                 if let Ok(retries) = val.parse::<u32>() {
                     config.api_retries = retries;
@@ -1815,16 +2055,33 @@ fn apply_config_content_with(
                     parse_bridge_config_key(&mut config.bridge, key, val);
                 } else if key.starts_with("auth.") {
                     parse_auth_config_key(&mut config.auth, key, val);
+                    if let Some(key) = key.strip_prefix("auth.auto.").filter(|k| !k.trim().is_empty()) {
+                        let (_, warnings) = crate::auth::AutoSelectionPolicy::from_config_map(
+                            &BTreeMap::from([(key.to_string(), val.trim().to_string())]));
+                        config.warnings.extend(warnings);
+                    }
+                    if let Some(provider) =
+                        key.strip_prefix("auth.account.").filter(|p| !p.trim().is_empty())
+                    {
+                        let mut one = BTreeMap::new();
+                        one.insert(provider.trim().to_string(), val.trim().to_string());
+                        let (_, warnings) =
+                            crate::core::auth::AccountPolicy::from_config_map(&one);
+                        config.warnings.extend(warnings);
+                    }
+                    if let Some(warning) = unknown_auth_key_warning(key) {
+                        config.warnings.push(warning);
+                    }
                 } else if key.starts_with("events.") {
                     if let Err(diagnostic) = parse_events_config_key(&mut config.events, key, val)
                     {
                         family_diagnostic(diagnostic);
                     }
                 } else if key.starts_with("turn_budget.") {
-                    if let Err(diagnostic) =
-                        parse_turn_budget_config_key(&mut config.turn_budgets, key, val)
-                    {
-                        family_diagnostic(diagnostic);
+                    match parse_turn_budget_config_key(&mut config.turn_budgets, key, val) {
+                        Ok(None) => {}
+                        Ok(Some(warning)) => config.warnings.push(warning),
+                        Err(diagnostic) => family_diagnostic(diagnostic),
                     }
                 } else if key.starts_with("memory.") {
                     if let Err(diagnostic) = parse_memory_config_key(&mut config.memory, key, val)
@@ -2306,6 +2563,20 @@ mod tests {
     }
 
     #[test]
+    fn legacy_flat_subagent_limit_keys_alias_the_dotted_keys() {
+        let c = super::load_config_from_str(concat!(
+            "subagent_max_concurrent = 256\n",
+            "subagent_max_total = 1024\n",
+        ));
+        assert_eq!(c.subagent.max_concurrent, 256);
+        assert_eq!(c.subagent.max_total, 1024);
+        assert!(c.warnings.is_empty(), "warnings: {:?}", c.warnings);
+        let c = super::load_config_from_str("subagent_max_concurrent = 0\n");
+        assert_eq!(c.subagent, super::SubagentLimits::default());
+        assert!(c.warnings.iter().any(|w| w.starts_with("subagent_max_concurrent")));
+    }
+
+    #[test]
     fn subagent_limits_reject_zero_and_junk_and_keep_defaults() {
         let c = super::load_config_from_str(concat!(
             "subagent.max_concurrent = 0\n",
@@ -2418,6 +2689,7 @@ mod tests {
                 rollover_tokens: Some(400_000),
                 reserve_tokens: 24_000,
                 finish_rounds: 3,
+                target_tokens: None,
             }
         );
         assert!(parsed.warnings.is_empty(), "{:?}", parsed.warnings);
@@ -2482,6 +2754,41 @@ mod tests {
             duplicate.context_management,
             super::ContextManagementConfig::default()
         );
+    }
+
+    #[test]
+    fn context_management_target_tokens_parses_and_validates() {
+        assert_eq!(
+            super::load_config_from_str("")
+                .context_management
+                .target_tokens,
+            None
+        );
+        let parsed = super::load_config_from_str(
+            "context_management.mode = auto\ncontext_management.target_tokens = 120000\ncontext_window = 1m\n",
+        );
+        assert!(parsed.warnings.is_empty(), "{:?}", parsed.warnings);
+        assert_eq!(parsed.context_management.target_tokens, Some(120_000));
+        let auto = super::load_config_from_str(
+            "context_management.target_tokens = 5000\ncontext_management.target_tokens = auto\n",
+        );
+        assert_eq!(auto.context_management.target_tokens, None);
+        for fields in [
+            "target_tokens = 0",
+            "target_tokens = nope",
+            "target_tokens = 250000",
+            "pressure_tokens = 200000\ncontext_management.target_tokens = 200000",
+        ] {
+            let parsed = super::load_config_from_str(&format!(
+                "context_management.mode = auto\ncontext_management.{fields}\ncontext_window = 1m\n"
+            ));
+            assert_eq!(
+                parsed.context_management,
+                super::ContextManagementConfig::default(),
+                "{fields}"
+            );
+            assert!(!parsed.warnings.is_empty(), "{fields}");
+        }
     }
 
     #[test]
@@ -2639,16 +2946,81 @@ mod tests {
              turn_budget.worker.max_provider_rounds_bogus = 1\n\
              turn_budget.nosuchrole.max_tool_calls = 1\n",
         );
-        assert_eq!(config.turn_budgets.worker.max_provider_rounds, Some(3));
+        assert_eq!(
+            config.turn_budgets.worker.max_provider_rounds,
+            Some(super::TurnLimit::Max(3))
+        );
         assert_eq!(config.turn_budgets.worker.max_cost_usd, Some(0.25));
         assert_eq!(config.turn_budgets.autonomous.max_elapsed_secs, Some(90));
-        assert_eq!(config.turn_budgets.foreground.max_tool_calls, Some(7));
+        assert_eq!(
+            config.turn_budgets.foreground.max_tool_calls,
+            Some(super::TurnLimit::Max(7))
+        );
         assert_eq!(config.turn_budgets.foreground.max_round_renewals, Some(12));
         // Unknown fields/roles warn and change nothing.
         assert_eq!(config.turn_budgets.worker.max_tool_calls, None);
         // Invalid values keep the default (None).
         let bad = super::load_config_from_str("turn_budget.worker.max_provider_rounds = nope\n");
         assert_eq!(bad.turn_budgets.worker.max_provider_rounds, None);
+    }
+
+    #[test]
+    fn turn_budget_count_limits_accept_unlimited() {
+        let config = super::load_config_from_str(
+            "turn_budget.autonomous.max_provider_rounds = unlimited\n\
+             turn_budget.autonomous.max_tool_calls = \"unlimited\"\n\
+             turn_budget.worker.max_accumulated_tool_result_bytes = Unlimited\n",
+        );
+        assert!(config.warnings.is_empty(), "{:?}", config.warnings);
+        let unlimited = Some(super::TurnLimit::Unlimited);
+        assert_eq!(config.turn_budgets.autonomous.max_provider_rounds, unlimited);
+        assert_eq!(config.turn_budgets.autonomous.max_tool_calls, unlimited);
+        assert_eq!(
+            config.turn_budgets.worker.max_accumulated_tool_result_bytes,
+            Some(super::TurnLimit::Unlimited)
+        );
+        let bad = super::load_config_from_str("turn_budget.worker.max_tool_calls = lots\n");
+        assert_eq!(bad.turn_budgets.worker.max_tool_calls, None);
+    }
+
+    #[test]
+    fn turn_budget_zero_count_limits_keep_none_allowed_with_a_deprecation_warning() {
+        // 0.10.2 read `0` as "none allowed". For one release it keeps that
+        // meaning in every role (also where the default is unlimited), and
+        // says it will be rejected later.
+        for role in ["foreground", "autonomous", "event", "worker"] {
+            for field in [
+                "max_provider_rounds",
+                "max_tool_calls",
+                "max_accumulated_tool_result_bytes",
+            ] {
+                let key = format!("turn_budget.{role}.{field}");
+                let content = format!("{key} = 0\n");
+                let config = super::load_config_from_str(&content);
+                let overrides = match role {
+                    "foreground" => &config.turn_budgets.foreground,
+                    "autonomous" => &config.turn_budgets.autonomous,
+                    "event" => &config.turn_budgets.event,
+                    _ => &config.turn_budgets.worker,
+                };
+                let parsed = match field {
+                    "max_provider_rounds" => overrides.max_provider_rounds.map(|l| l.map(|v| v as usize)),
+                    "max_tool_calls" => overrides.max_tool_calls.map(|l| l.map(|v| v as usize)),
+                    _ => overrides.max_accumulated_tool_result_bytes,
+                };
+                assert_eq!(parsed, Some(super::TurnLimit::Max(0)), "{key}");
+                assert!(
+                    config.warnings.iter().any(|w| w.contains(&key)
+                        && w.contains("none allowed")
+                        && w.contains(
+                            "`0` will be rejected in a future release; use `unlimited` for no limit, or a positive number"
+                        )),
+                    "{key}: {:?}",
+                    config.warnings
+                );
+                assert!(!super::config_content_problems(&content).is_empty());
+            }
+        }
     }
 
     #[test]
@@ -3894,6 +4266,8 @@ api_retries = 5
         let auth = AuthConfig {
             remote_endpoint: Some("https://b".into()),
             machine_token: Some("m".into()),
+            accounts: BTreeMap::new(),
+            auto: BTreeMap::new(),
         };
         assert_eq!(
             auth.credential_source(),
@@ -3905,11 +4279,69 @@ api_retries = 5
     }
 
     #[test]
+    fn auth_account_keys_parse_and_invalid_fail_closed_with_warning() {
+        let config = load_config_from_str(
+            "auth.account.openai-codex = astra2\nauth.account.anthropic = auto\nauth.account.kimi-code = Bad Label\nauth.account.groq = x\n",
+        );
+        assert_eq!(
+            config.auth.accounts.get("openai-codex").map(String::as_str),
+            Some("astra2")
+        );
+        assert_eq!(
+            config.auth.accounts.get("anthropic").map(String::as_str),
+            Some("auto")
+        );
+        let policy = config.auth.account_policy();
+        use crate::core::auth::{AccountSelector, OAuthProviderId};
+        assert!(matches!(
+            policy.selector(OAuthProviderId::OpenAiCodex),
+            AccountSelector::Account(_)
+        ));
+        assert_eq!(
+            policy.selector(OAuthProviderId::Anthropic),
+            AccountSelector::Auto
+        );
+        assert!(
+            matches!(
+                policy.selector(OAuthProviderId::KimiCode),
+                AccountSelector::Invalid { .. }
+            ),
+            "malformed label must fail closed"
+        );
+        assert!(
+            config
+                .warnings
+                .iter()
+                .any(|w| w.contains("auth.account.kimi-code")),
+            "{:?}",
+            config.warnings
+        );
+        assert!(
+            config
+                .warnings
+                .iter()
+                .any(|w| w.contains("auth.account.groq")),
+            "{:?}",
+            config.warnings
+        );
+        assert!(
+            !config
+                .warnings
+                .iter()
+                .any(|w| w.contains("auth.account.openai-codex")),
+            "{:?}",
+            config.warnings
+        );
+    }
+
+    #[test]
     #[serial]
     fn test_credential_source_env_overrides_config() {
         let auth = AuthConfig {
             remote_endpoint: Some("https://config-host".into()),
             machine_token: Some("config-tok".into()),
+            accounts: BTreeMap::new(),
+            auto: BTreeMap::new(),
         };
         std::env::set_var("SYNAPS_AUTH_ENDPOINT", "https://env-host");
         std::env::set_var("SYNAPS_MACHINE_TOKEN", "env-tok");
@@ -3924,6 +4356,51 @@ api_retries = 5
             }
         );
     }
+    /// #147 C1 / prA N1: only an explicit token travels in the source; the
+    /// local file is resolved by the client, for loopback + none configured.
+    #[test]
+    #[serial]
+    fn test_credential_source_records_token_provenance_and_file_is_resolved_lazily() {
+        use crate::core::auth::MachineToken;
+        let dir = tempfile::tempdir().unwrap();
+        let prev = std::env::var_os("SYNAPS_BASE_DIR");
+        std::env::set_var("SYNAPS_BASE_DIR", dir.path());
+        std::env::remove_var("SYNAPS_AUTH_ENDPOINT");
+        std::env::remove_var("SYNAPS_MACHINE_TOKEN");
+        std::fs::write(dir.path().join("auth-broker.token"), "local-file-tok\n").unwrap();
+        let source = |endpoint: &str, token: Option<&str>| {
+            AuthConfig {
+                remote_endpoint: Some(endpoint.into()),
+                machine_token: token.map(str::to_string),
+                accounts: BTreeMap::new(),
+                auto: BTreeMap::new(),
+            }
+            .credential_source()
+        };
+        let remote_tok = |s: crate::core::auth::CredentialSource| match s {
+            crate::core::auth::CredentialSource::Remote { machine_token, .. } => machine_token,
+            other => panic!("{other:?}"),
+        };
+        // The source carries only the explicit token: empty = "none configured".
+        let loopback = remote_tok(source("http://127.0.0.1:8181", None));
+        let explicit = remote_tok(source("http://127.0.0.1:8181", Some("cfg-tok")));
+        let remote = remote_tok(source("https://jade.jade:8181", None));
+        assert_eq!(loopback, "");
+        assert_eq!(explicit, "cfg-tok");
+        assert_eq!(remote, "");
+        // The client resolves the file only for "none configured" + loopback.
+        let auto = MachineToken::for_endpoint("http://localhost:8181", &loopback);
+        let fixed = MachineToken::for_endpoint("http://127.0.0.1:8181", &explicit);
+        let far = MachineToken::for_endpoint("https://jade.jade:8181", &remote);
+        match prev {
+            Some(v) => std::env::set_var("SYNAPS_BASE_DIR", v),
+            None => std::env::remove_var("SYNAPS_BASE_DIR"),
+        }
+        assert_eq!(auto.get(), "local-file-tok");
+        assert_eq!(fixed.get(), "cfg-tok", "explicit token is never replaced");
+        assert_eq!(far.get(), "", "never read for a non-loopback broker");
+    }
+
     #[test]
     fn config_parses_ultracode_as_distinct_canonical_level() {
         let cfg = load_config_from_str("thinking = ultracode\n");
@@ -4015,6 +4492,48 @@ api_retries = 5
         let cfg = load_config_from_str("shell.max_sessions = 8\nevents.auto_turn = maybe\n");
         assert_eq!(cfg.shell.max_sessions, 8);
         assert!(!cfg.events.auto_turn, "unrecognised auto_turn still fails safe to false");
+    }
+
+    #[test]
+    fn bare_or_empty_auth_family_keys_warn() {
+        let cfg = load_config_from_str(
+            "auth.account = work\nauth.account. = work\nauth.auto = on\nauth.auto. = 1\n",
+        );
+        let w = &cfg.warnings;
+        for key in ["auth.account", "auth.account."] {
+            assert!(
+                w.contains(&format!("unknown key '{key}' (did you mean 'auth.account.<provider>'?)")),
+                "{key}: {w:?}"
+            );
+        }
+        for key in ["auth.auto", "auth.auto."] {
+            assert!(
+                w.contains(&format!("unknown key '{key}' (did you mean 'auth.auto.<key>'?)")),
+                "{key}: {w:?}"
+            );
+        }
+        assert!(cfg.auth.accounts.is_empty() && cfg.auth.auto.is_empty());
+    }
+
+    #[test]
+    fn unknown_auth_keys_warn_with_a_suggestion() {
+        let cfg = load_config_from_str(
+            "auth.acount.anthropic = work\nauth.remote_endpont = x\nauth.bogus = 1\n\
+             auth.account.anthropic = work\nauth.machine_token = t\n",
+        );
+        let w = &cfg.warnings;
+        assert!(
+            w.contains(&"unknown key 'auth.acount.anthropic' (did you mean 'auth.account.anthropic'?)".into()),
+            "{w:?}"
+        );
+        assert!(
+            w.contains(&"unknown key 'auth.remote_endpont' (did you mean 'auth.remote_endpoint'?)".into()),
+            "{w:?}"
+        );
+        assert!(w.contains(&"unknown key 'auth.bogus' — ignored".into()), "{w:?}");
+        assert_eq!(w.iter().filter(|w| w.contains("auth.")).count(), 3, "{w:?}");
+        assert_eq!(cfg.auth.accounts.get("anthropic").map(String::as_str), Some("work"));
+        assert!(!cfg.auth.accounts.contains_key("acount.anthropic"));
     }
 
     /// Every listed family key is accepted by its parser for some value

@@ -293,7 +293,13 @@ async fn linked_successor_updates_journal_id_and_continue_target() {
     end(&mut a).await;
     let succ = agent_engine::core::session::Session::load(&new).unwrap();
     assert_eq!(succ.api_messages.len(), n);
-    assert_eq!(host.sessions().len(), 0);
+    // `Ended` precedes the actor task's exit (and its removal from the host
+    // map); wait for the exit instead of racing it.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !host.sessions().is_empty() {
+        assert!(tokio::time::Instant::now() < deadline, "actor never exited");
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

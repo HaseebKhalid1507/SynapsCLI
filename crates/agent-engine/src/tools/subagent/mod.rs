@@ -107,7 +107,11 @@ pub(crate) fn apply_subagent_runtime_policy(
     runtime: &mut crate::Runtime,
     config: &crate::config::SynapsConfig,
     memory_backend: Option<&crate::memory_backend::MemoryBinding>,
+    session_allow_all: Option<&std::sync::Arc<crate::tools::SessionConfirmLatch>>,
 ) {
+    runtime.inherit_session_allow_all(session_allow_all);
+    runtime.apply_retry_config(config);
+
     // Credential source / token cache: host-built workers already share the
     // process-wide broker (`spawn_runtime`); only the legacy fresh-runtime
     // path re-applies auth config there. (#158 A3 → engine-host B2)
@@ -286,7 +290,7 @@ mod cache_ttl_policy_tests {
         );
 
         // Apply the subagent runtime policy — this is what the spawn paths call.
-        apply_subagent_runtime_policy(&mut runtime, &parent_config, None);
+        apply_subagent_runtime_policy(&mut runtime, &parent_config, None, None);
 
         // Post-condition: TTL must be FiveMinutes regardless of parent config.
         assert_eq!(
@@ -317,7 +321,7 @@ mod cache_ttl_policy_tests {
             "pre-condition: must be Hybrid"
         );
 
-        apply_subagent_runtime_policy(&mut runtime, &parent_config, None);
+        apply_subagent_runtime_policy(&mut runtime, &parent_config, None, None);
 
         assert_eq!(
             runtime.cache_ttl(),
@@ -341,7 +345,7 @@ mod cache_ttl_policy_tests {
             "pre-condition: Runtime::new() must default to 5m"
         );
 
-        apply_subagent_runtime_policy(&mut runtime, &parent_config, None);
+        apply_subagent_runtime_policy(&mut runtime, &parent_config, None, None);
 
         assert_eq!(
             runtime.cache_ttl(),
@@ -357,7 +361,7 @@ mod cache_ttl_policy_tests {
             .await
             .expect("Runtime::new() must succeed in test environment");
 
-        apply_subagent_runtime_policy(&mut runtime, &config, None);
+        apply_subagent_runtime_policy(&mut runtime, &config, None, None);
 
         assert_eq!(
             runtime.codex_request_role(),
@@ -443,7 +447,7 @@ mod cache_ttl_policy_tests {
 
         // ...and STAYS Off/no-lease after the subagent runtime policy runs.
         let config = crate::config::SynapsConfig::default();
-        apply_subagent_runtime_policy(&mut subagent, &config, None);
+        apply_subagent_runtime_policy(&mut subagent, &config, None, None);
         let after_policy = subagent.memory_context_status();
         assert_eq!(
             after_policy.durable,
@@ -524,7 +528,7 @@ mod codex_ultra_worker_tests {
         let parent = parent("openai-codex/gpt-6-astra", ReasoningLevel::Ultra).unwrap();
         assert_eq!(parent.wire_effort, Some(CodexWireEffort::XHigh));
         let mut runtime = crate::Runtime::new_headless();
-        apply_subagent_runtime_policy(&mut runtime, &Default::default(), None);
+        apply_subagent_runtime_policy(&mut runtime, &Default::default(), None, None);
         runtime.set_model(parent.qualified_model.clone());
         assert_eq!(runtime.reasoning_level(), ReasoningLevel::Medium);
         apply_codex_worker_reasoning(&mut runtime, Some(&parent));
@@ -555,7 +559,7 @@ mod codex_ultra_worker_tests {
             "openrouter/openai/gpt-6-astra",
         ] {
             let mut runtime = crate::Runtime::new_headless();
-            apply_subagent_runtime_policy(&mut runtime, &Default::default(), None);
+            apply_subagent_runtime_policy(&mut runtime, &Default::default(), None, None);
             runtime.set_model(model.into());
             let default = runtime.reasoning_level();
             apply_codex_worker_reasoning(&mut runtime, Some(&parent));
@@ -596,10 +600,125 @@ mod codex_ultra_worker_tests {
             .is_none());
         }
         let mut runtime = crate::Runtime::new_headless();
-        apply_subagent_runtime_policy(&mut runtime, &Default::default(), None);
+        apply_subagent_runtime_policy(&mut runtime, &Default::default(), None, None);
         runtime.set_model("openai-codex/gpt-6-astra".into());
         apply_codex_worker_reasoning(&mut runtime, None);
         assert_eq!(runtime.reasoning_level(), ReasoningLevel::Medium);
+    }
+
+    #[tokio::test]
+    async fn session_allow_all_worker_policy_shares_live_parent_latch() {
+        use crate::extensions::hooks::events::HookResult;
+        use std::sync::Arc;
+
+        let jev = vec![("jev".to_string(), 0u64)];
+        let confirm_from = |source: &str| HookResult::Confirm {
+            message: "worker action".into(),
+            sources: vec![source.to_string()],
+            tool: Some("bash".into()),
+            generations: vec![],
+            modified_input: None,
+            modified_by: vec![],
+        };
+        let parent = crate::Runtime::new_headless();
+        let mut independent = crate::Runtime::new_headless();
+        apply_subagent_runtime_policy(&mut independent, &Default::default(), None, None);
+        let mut worker = crate::Runtime::new_headless();
+        apply_subagent_runtime_policy(
+            &mut worker,
+            &Default::default(),
+            None,
+            Some(parent.session_allow_all()),
+        );
+        assert!(Arc::ptr_eq(
+            parent.session_allow_all(),
+            worker.session_allow_all()
+        ));
+        assert!(worker.session_allow_all().is_empty());
+
+        // Consent arriving AFTER worker creation must reach its headless hooks
+        // — but only for the extension the user allowed.
+        parent.session_allow_all().allow(&jev);
+        assert!(independent.session_allow_all().is_empty());
+        let approved = crate::runtime::resolve_before_tool_call_decision(
+            serde_json::json!({}),
+            confirm_from("jev"),
+            None,
+            false,
+            Some(worker.session_allow_all()),
+        )
+        .await;
+        assert!(matches!(
+            approved,
+            crate::runtime::BeforeToolCallDecision::Continue { .. }
+        ));
+        let other = crate::runtime::resolve_before_tool_call_decision(
+            serde_json::json!({}),
+            confirm_from("other"),
+            None,
+            false,
+            Some(worker.session_allow_all()),
+        )
+        .await;
+        assert!(
+            matches!(other, crate::runtime::BeforeToolCallDecision::Block { .. }),
+            "a headless worker still fails closed for an extension the user did not allow"
+        );
+        let blocked = crate::runtime::resolve_before_tool_call_decision(
+            serde_json::json!({}),
+            HookResult::Block {
+                reason: "policy veto".into(),
+            },
+            None,
+            false,
+            Some(worker.session_allow_all()),
+        )
+        .await;
+        assert!(
+            matches!(blocked, crate::runtime::BeforeToolCallDecision::Block { reason } if reason == "policy veto")
+        );
+
+        // A worker spawned after consent inherits the same live set too.
+        let mut later = crate::Runtime::new_headless();
+        apply_subagent_runtime_policy(
+            &mut later,
+            &Default::default(),
+            None,
+            Some(parent.session_allow_all()),
+        );
+        assert!(later.session_allow_all().allows_all(&jev));
+        worker.session_allow_all().clear();
+        assert!(later.session_allow_all().is_empty());
+    }
+
+    #[test]
+    fn session_allow_all_all_real_worker_paths_pass_parent_before_streaming() {
+        // Both serial and parallel streaming dispatch must supply the parent
+        // capability; worker-policy tests alone would miss a disconnected wire.
+        let dispatch = include_str!("../../runtime/stream.rs");
+        assert!(dispatch.contains("session_allow_all: Some(session_allow_all.clone())"));
+        assert!(dispatch.contains("session_allow_all: Some(session_allow_all_inner.clone())"));
+        for (name, source) in [
+            ("oneshot", include_str!("oneshot.rs")),
+            ("start", include_str!("start.rs")),
+            ("resume", include_str!("resume.rs")),
+        ] {
+            let capture = source
+                .find("let session_allow_all = ctx.capabilities.session_allow_all.clone();")
+                .unwrap();
+            let spawn = source.find("super::spawn_runtime().await").unwrap();
+            let memory = source.find("memory_backend.as_ref()").unwrap();
+            // Formatting-agnostic: the call may be wrapped across lines.
+            let inherit = memory
+                + source[memory..]
+                    .find("session_allow_all.as_ref()")
+                    .unwrap();
+            let stream = source.find("runtime.run_stream").unwrap();
+            assert!(
+                capture < spawn && spawn < inherit && inherit < stream,
+                "{name}"
+            );
+        }
     }
 
     #[test]
@@ -633,33 +752,6 @@ mod codex_ultra_worker_tests {
 #[cfg(test)]
 mod forum_worker_tests {
     use super::{apply_subagent_runtime_policy, subagent_tools};
-    use crate::tools::Tool;
-    use std::sync::Arc;
-
-    struct ExtensionProbe(&'static str);
-    #[async_trait::async_trait]
-    impl Tool for ExtensionProbe {
-        fn name(&self) -> &str {
-            self.0
-        }
-        fn description(&self) -> &str {
-            "registry-only fixture"
-        }
-        fn parameters(&self) -> serde_json::Value {
-            serde_json::json!({"type": "object"})
-        }
-        fn extension_id(&self) -> Option<&str> {
-            Some("forum-test")
-        }
-        async fn execute(
-            &self,
-            _: serde_json::Value,
-            _: crate::ToolContext,
-        ) -> crate::Result<String> {
-            panic!("registry construction must not execute tools")
-        }
-    }
-
     #[test]
     fn common_worker_policy_forks_author_without_mutating_parent() {
         let parent = crate::Runtime::new_headless();
@@ -668,7 +760,7 @@ mod forum_worker_tests {
         let mut actors = std::collections::HashSet::new();
         for _ in 0..3 {
             let mut worker = crate::Runtime::new_headless();
-            apply_subagent_runtime_policy(&mut worker, &Default::default(), Some(&binding));
+            apply_subagent_runtime_policy(&mut worker, &Default::default(), Some(&binding), None);
             let inherited = worker.memory_backend_for_test();
             assert_eq!(inherited.forum_author().group, author.group);
             assert_eq!(
@@ -720,7 +812,7 @@ mod forum_worker_tests {
             "openai-codex/gpt-6-astra",
         ] {
             let mut runtime = crate::Runtime::new_headless();
-            apply_subagent_runtime_policy(&mut runtime, &Default::default(), None);
+            apply_subagent_runtime_policy(&mut runtime, &Default::default(), None, None);
             runtime.set_model(model.into());
             let before = runtime.reasoning_level();
             apply_anthropic_worker_reasoning(&mut runtime);
@@ -740,10 +832,10 @@ mod forum_worker_tests {
         let parent = crate::Runtime::new_headless();
         let parent_binding = parent.memory_backend_for_test();
         let mut worker = crate::Runtime::new_headless();
-        apply_subagent_runtime_policy(&mut worker, &Default::default(), Some(&parent_binding));
+        apply_subagent_runtime_policy(&mut worker, &Default::default(), Some(&parent_binding), None);
         assert!(!worker.memory_backend_for_test().exclusive());
         let mut worker_none = crate::Runtime::new_headless();
-        apply_subagent_runtime_policy(&mut worker_none, &Default::default(), None);
+        apply_subagent_runtime_policy(&mut worker_none, &Default::default(), None, None);
         assert!(!worker_none.memory_backend_for_test().exclusive());
     }
 }
@@ -826,5 +918,29 @@ mod label_tests {
         // A cut that lands on a separator leaves no trailing dash.
         let cut = subagent_label(None, Some(&format!("{} tail", "y".repeat(31))));
         assert_eq!(cut, "y".repeat(31));
+    }
+}
+
+#[cfg(test)]
+mod retry_inheritance_tests {
+    #[test]
+    fn worker_policy_inherits_retry_counts_without_foreground_policy() {
+        for (api, refusal) in [(8, 5), (0, 0), (u32::MAX, 7)] {
+            let mut worker = crate::Runtime::new_headless();
+            let config = crate::SynapsConfig {
+                api_retries: api,
+                refusal_retries: refusal,
+                cache_ttl: crate::config::CacheTtl::OneHour,
+                ..Default::default()
+            };
+            super::apply_subagent_runtime_policy(&mut worker, &config, None, None);
+            assert_eq!(worker.api_retries(), api);
+            assert_eq!(worker.refusal_retries(), refusal);
+            assert_eq!(worker.cache_ttl(), crate::config::CacheTtl::FiveMinutes);
+            assert_eq!(
+                worker.codex_request_role(),
+                crate::runtime::openai::catalog::CodexRequestRole::Worker
+            );
+        }
     }
 }

@@ -1,5 +1,8 @@
 //! Integration tests for extension info.get capability advertisement RPC.
 
+#[path = "support/hermetic_base_dir.rs"]
+mod hermetic_base_dir;
+
 use std::sync::Arc;
 
 use synaps_cli::extensions::hooks::HookBus;
@@ -40,6 +43,7 @@ fn manifest_with_args(extra_args: Vec<&str>) -> ExtensionManifest {
 
 #[tokio::test(flavor = "current_thread")]
 async fn manager_caches_plugin_info_after_initialize() {
+    hermetic_base_dir::pin();
     std::env::set_var("INFO_FIXTURE_DISABLE", "0");
     let mut manager = ExtensionManager::new(Arc::new(HookBus::new()));
 
@@ -66,6 +70,7 @@ async fn manager_caches_plugin_info_after_initialize() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn info_get_is_best_effort_and_missing_method_does_not_fail_load() {
+    hermetic_base_dir::pin();
     let mut manager = ExtensionManager::new(Arc::new(HookBus::new()));
 
     manager

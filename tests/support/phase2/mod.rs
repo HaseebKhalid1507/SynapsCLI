@@ -571,6 +571,7 @@ pub struct HomeGuard {
 
 const GUARDED_VARS: &[&str] = &[
     "HOME",
+    "USERPROFILE",
     "SYNAPS_BASE_DIR",
     "SYNAPS_ANTHROPIC_BASE_URL",
     "SYNAPS_AUTH_ENDPOINT",
@@ -588,15 +589,24 @@ impl HomeGuard {
             .iter()
             .map(|k| (*k, std::env::var(k).ok()))
             .collect();
-        for k in GUARDED_VARS {
-            std::env::remove_var(k);
-        }
         let base = home.path().join(".synaps-cli");
         std::fs::create_dir_all(&base).unwrap();
         std::fs::write(base.join("config"), "").unwrap();
         std::fs::write(base.join("auth.json"), synthetic_auth_json()).unwrap();
-        std::env::set_var("HOME", home.path());
+        // Overwrite the base-dir variables in place, never remove-then-set:
+        // tests without a guard run in parallel and resolve
+        // `SYNAPS_BASE_DIR`, else `HOME`, else `USERPROFILE`. Removing all
+        // three first left a window where that fell through to the
+        // process's real USERPROFILE (dirty-home.sh sets it to the seeded
+        // HOME), and a host booted in that window opened synaps.log there.
         std::env::set_var("SYNAPS_BASE_DIR", &base);
+        std::env::set_var("HOME", home.path());
+        std::env::set_var("USERPROFILE", home.path());
+        for k in GUARDED_VARS {
+            if !matches!(*k, "HOME" | "USERPROFILE" | "SYNAPS_BASE_DIR") {
+                std::env::remove_var(k);
+            }
+        }
         Self { home, saved }
     }
 
@@ -764,7 +774,7 @@ pub fn surfaced_error_strings(events: &[StreamEvent]) -> Vec<String> {
         .iter()
         .filter_map(|e| match e {
             StreamEvent::Session(SessionEvent::Error(err)) => Some(err.message.clone()),
-            StreamEvent::Session(SessionEvent::Notice(n)) => Some(n.clone()),
+            StreamEvent::Session(SessionEvent::Notice(n) | SessionEvent::Retry(n)) => Some(n.clone()),
             _ => None,
         })
         .collect()

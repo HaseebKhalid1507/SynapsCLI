@@ -43,12 +43,30 @@ const LOGIN_BANNER: &[&str] = &[
 ];
 const LOGIN_PICKER_PADDING: &str = "  ";
 
-pub async fn run(profile: Option<String>, provider_key: Option<String>) -> Result<(), String> {
+pub async fn run(
+    profile: Option<String>,
+    provider_key: Option<String>,
+    account: Option<String>,
+) -> Result<(), String> {
     if let Some(ref prof) = profile {
         synaps_cli::config::set_profile(Some(prof.clone()));
     }
 
     let _log_guard = synaps_cli::logging::init_logging();
+
+    // Validate the account label at the CLI boundary, before any provider
+    // flow starts. `--account` only applies to OAuth providers.
+    let account = match account.as_deref() {
+        None => None,
+        Some(raw) => Some(auth::Account::parse(raw).map_err(|e| {
+            eprintln!("error: invalid --account: {e}");
+            format!("invalid --account: {e}")
+        })?),
+    };
+    if account.is_some() && provider_key.is_none() {
+        eprintln!("error: --account requires --provider <oauth-provider>");
+        return Err("--account requires --provider".into());
+    }
 
     let providers = login_providers();
     let selected = if let Some(ref key) = provider_key {
@@ -74,58 +92,193 @@ pub async fn run(profile: Option<String>, provider_key: Option<String>) -> Resul
     };
 
     match selected.target {
-        LoginTarget::OAuth(id) => run_oauth_login(selected, id, profile).await,
-        LoginTarget::Cloud(id) => run_cloud_login(selected, id, profile).await,
-        LoginTarget::Static(_) => run_api_key_login(selected, profile),
+        LoginTarget::OAuth(id) => {
+            let cred = auth::CredentialRef::new(id, account.unwrap_or_default());
+            run_oauth_login(selected, cred, profile).await
+        }
+        LoginTarget::Cloud(id) if account.is_none() => run_cloud_login(selected, id, profile).await,
+        LoginTarget::Static(_) if account.is_none() => run_api_key_login(selected, profile),
+        LoginTarget::Cloud(_) | LoginTarget::Static(_) => {
+            eprintln!(
+                "error: --account applies to OAuth providers only ({} is not one)",
+                selected.key()
+            );
+            Err("--account applies to OAuth providers only".into())
+        }
     }
+}
+
+/// Interior width of the login banner box (between the `║` borders).
+const BANNER_INNER: usize = 38;
+
+/// Box rows for `prefix` + `text`, word-wrapped to the banner interior with
+/// continuation lines aligned under the text, so long provider names or
+/// descriptions never break the right border. Over-long single words are
+/// hard-split.
+fn banner_lines(prefix: &str, text: &str) -> Vec<String> {
+    let indent = 2 + prefix.chars().count();
+    let width = BANNER_INNER.saturating_sub(indent).max(1);
+    let mut rows: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let push_word = |word: &str, current: &mut String, rows: &mut Vec<String>| {
+        let mut word: Vec<char> = word.chars().collect();
+        loop {
+            let used = current.chars().count();
+            let sep = usize::from(used > 0);
+            if used + sep + word.len() <= width {
+                if sep == 1 {
+                    current.push(' ');
+                }
+                current.extend(word.iter());
+                return;
+            }
+            if used > 0 {
+                rows.push(std::mem::take(current));
+                continue;
+            }
+            let rest = word.split_off(width);
+            rows.push(word.iter().collect());
+            word = rest;
+            if word.is_empty() {
+                return;
+            }
+        }
+    };
+    for word in text.split_whitespace() {
+        push_word(word, &mut current, &mut rows);
+    }
+    if !current.is_empty() || rows.is_empty() {
+        rows.push(current);
+    }
+    rows.into_iter()
+        .enumerate()
+        .map(|(i, row)| {
+            let lead = if i == 0 {
+                format!("  {prefix}")
+            } else {
+                " ".repeat(indent)
+            };
+            format!("║{lead}{row:<width$}║")
+        })
+        .collect()
 }
 
 async fn run_oauth_login(
     provider: LoginProvider,
-    id: auth::OAuthProviderId,
+    cred: auth::CredentialRef,
     profile: Option<String>,
 ) -> Result<(), String> {
     eprintln!("╔══════════════════════════════════════╗");
     eprintln!("║        SynapsCLI — Login             ║");
     eprintln!("╠══════════════════════════════════════╣");
-    eprintln!("║  Sign in with {:<20}║", provider.name);
-    eprintln!("║  {:<36}║", provider.description);
+    for line in banner_lines("Sign in with ", provider.name)
+        .into_iter()
+        .chain(banner_lines("", provider.description))
+        .chain(banner_lines("Account: ", cred.account.label_str()))
+    {
+        eprintln!("{line}");
+    }
     eprintln!("╚══════════════════════════════════════╝");
 
-    if let Ok(Some(existing)) = auth::load_provider_auth(oauth_storage_key(provider)) {
+    if let Ok(Some(existing)) = auth::load_credential(&cred) {
         if !auth::is_token_expired(&existing) {
-            eprintln!("\n\x1b[33m⚠ Already logged in with a valid token.\x1b[0m");
+            eprintln!("\n\x1b[33m⚠ Already logged in ({cred}) with a valid token.\x1b[0m");
             eprintln!("  Expires: {}", format_expiry(existing.expires));
-            eprintln!("  Continuing will replace your current credentials.\n");
+            eprintln!("  Continuing will replace the credential in that slot only.\n");
         } else {
-            eprintln!("\n\x1b[33m⚠ Existing token is expired. Logging in fresh.\x1b[0m\n");
+            eprintln!("\n\x1b[33m⚠ Existing token for {cred} is expired. Logging in fresh.\x1b[0m\n");
         }
     }
 
-    let result = auth::provider::login(id).await;
-
-    match result {
-        Ok(creds) => {
-            eprintln!("\n\x1b[32m✓ Login successful!\x1b[0m");
-            eprintln!("  Token saved to: {}", auth::auth_file_path().display());
-            eprintln!("  Expires: {}", format_expiry(creds.expires));
-            eprintln!("\n  You can now use SynapsCLI.\n");
-            continue_to_main_app(profile);
-            Ok(())
-        }
+    // The provider flow returns the credential UNSAVED; the duplicate-seat
+    // scan and the write then happen inside one locked read-modify-write of
+    // auth.json, so a login into a named slot never touches the default slot
+    // and two slots can never end up owning the same seat.
+    let mut creds = match auth::provider::login_unsaved(cred.provider).await {
+        Ok(creds) => creds,
         Err(e) => {
             eprintln!("\n\x1b[31m✗ Login failed: {}\x1b[0m", e);
             eprintln!("  Please try again.\n");
-            Err(e)
+            return Err(e);
         }
+    };
+    let mut metadata = auth::AccountMetadata {
+        identity: None,
+        added_at: Some(synaps_cli::epoch_millis() / 1000),
+    };
+    // Seat identity: Codex reads it off the JWT; Anthropic tokens are opaque,
+    // so the profile endpoint is asked once, before persistence, so the
+    // duplicate guard below has an `accountId` to compare. A lookup failure
+    // never aborts a login that already succeeded at the provider — the
+    // guard then reports `NoEvidence` and `synaps auth identify` can backfill.
+    let seat = match auth::identity_http_client() {
+        Ok(client) => auth::resolve_seat(cred.provider, &creds.access, &client, None).await,
+        Err(e) => auth::SeatResolution::Failed(e),
+    };
+    match seat {
+        auth::SeatResolution::Resolved(seat) => {
+            if creds.account_id.is_none() {
+                creds.account_id = Some(seat.account_id);
+            }
+            metadata.identity = seat.identity;
+        }
+        auth::SeatResolution::Failed(msg) => {
+            eprintln!(
+                "\n\x1b[33m⚠ could not verify {} account identity ({msg}); a duplicate of another slot cannot be detected.\x1b[0m",
+                provider.name
+            );
+            eprintln!("  Run `synaps auth identify` later to record it.");
+        }
+        auth::SeatResolution::Unsupported => {}
     }
-}
-
-fn oauth_storage_key(provider: LoginProvider) -> &'static str {
-    match provider.target {
-        LoginTarget::OAuth(id) => id.as_str(),
-        _ => provider.key(),
+    let outcome = match auth::save_credential_unless_duplicate(&cred, &creds, &metadata) {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            eprintln!("\n\x1b[31m✗ Login succeeded at the provider but could not be stored: {}\x1b[0m", e);
+            eprintln!("  Nothing was written.\n");
+            return Err(e);
+        }
+    };
+    match outcome.evidence {
+        auth::IdentityEvidence::Duplicate(existing) => {
+            eprintln!(
+                "\n\x1b[31m✗ Not stored: this {} seat is already connected as account '{}'.\x1b[0m",
+                provider.name, existing
+            );
+            eprintln!(
+                "  Two slots for one seat would spend its quota twice and rotate one refresh token from two owners."
+            );
+            eprintln!(
+                "  Use `synaps auth use --provider {} --account {}` instead, or remove that slot first.\n",
+                cred.provider, existing
+            );
+            return Err(format!("duplicate seat: already connected as '{existing}'"));
+        }
+        auth::IdentityEvidence::NoEvidence => {
+            eprintln!(
+                "\n\x1b[33m⚠ {} exposes no trustworthy account identity: a duplicate of another slot cannot be detected.\x1b[0m",
+                provider.name
+            );
+        }
+        auth::IdentityEvidence::NoDuplicate => {}
     }
+    eprintln!("\n\x1b[32m✓ Login successful!\x1b[0m");
+    eprintln!("  Account: {cred}");
+    if let Some(identity) = &metadata.identity {
+        eprintln!("  Identity: {identity}");
+    }
+    eprintln!("  Token saved to: {}", auth::auth_file_path().display());
+    eprintln!("  Expires: {}", format_expiry(creds.expires));
+    if !cred.account.is_default() {
+        eprintln!(
+            "  Select it with: synaps auth use --provider {} --account {}",
+            cred.provider,
+            cred.account.label_str()
+        );
+    }
+    eprintln!("\n  You can now use SynapsCLI.\n");
+    continue_to_main_app(profile);
+    Ok(())
 }
 
 struct TerminalCloudLoginUi;
@@ -393,6 +546,16 @@ fn save_api_key(_config_key: &str, provider: LoginProvider, api_key: &str) -> Re
             eprintln!("\n\x1b[31m✗ Login failed: {}\x1b[0m", e);
             Err(e)
         }
+    }
+}
+
+/// Canonical storage key of a login target's DEFAULT slot (OAuth providers
+/// use the typed id, never the CLI alias). Named slots append `@<label>`.
+#[cfg(test)]
+fn oauth_storage_key(provider: LoginProvider) -> &'static str {
+    match provider.target {
+        LoginTarget::OAuth(id) => id.as_str(),
+        _ => provider.key(),
     }
 }
 
@@ -713,6 +876,40 @@ mod tests {
 
         // unknown key returns None
         assert!(find_provider(&providers, "totally-bogus-xyz").is_none());
+    }
+
+    #[test]
+    fn banner_rows_always_fit_the_box() {
+        let inner = |row: &str| row.chars().count() - 2;
+        for (prefix, text) in [
+            ("Sign in with ", "Meta Muse"),
+            ("", "Meta account device OAuth for Muse Code (experimental)"),
+            ("", "Google account OAuth for Gemini CLI / Code Assist (experimental)"),
+            ("Account: ", "default"),
+            ("", ""),
+            ("", &"x".repeat(80)),
+        ] {
+            let rows = banner_lines(prefix, text);
+            assert!(!rows.is_empty());
+            for row in &rows {
+                assert_eq!(inner(row), BANNER_INNER, "{row:?}");
+                assert!(row.starts_with('║') && row.ends_with('║'), "{row:?}");
+            }
+            let joined: String = rows
+                .iter()
+                .map(|r| r.trim_matches('║').trim().trim_start_matches(prefix.trim()))
+                .collect::<Vec<_>>()
+                .join("");
+            assert_eq!(
+                joined.replace(' ', ""),
+                text.replace(' ', ""),
+                "no text is lost when wrapping"
+            );
+        }
+        assert_eq!(
+            banner_lines("Sign in with ", "Meta Muse"),
+            ["║  Sign in with Meta Muse              ║"]
+        );
     }
 
     #[test]

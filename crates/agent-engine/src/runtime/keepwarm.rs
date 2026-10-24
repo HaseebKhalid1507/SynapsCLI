@@ -329,13 +329,16 @@ pub(crate) fn classify_failure(err: &RuntimeError, status: u16) -> PingFailure {
         return PingFailure::Fatal(format!("HTTP {status}"));
     }
     match err {
-        RuntimeError::Api(_) | RuntimeError::ApiStatus(_) | RuntimeError::Timeout => {
-            PingFailure::Transient(if status == 0 {
-                "network".to_string()
-            } else {
-                format!("HTTP {status}")
-            })
-        }
+        // `NetworkTimeout` (upload/header deadline, stream idle) is a network
+        // blip like the `Api(timeout)` it replaced: back off, don't end the period.
+        RuntimeError::Api(_)
+        | RuntimeError::ApiStatus(_)
+        | RuntimeError::Timeout
+        | RuntimeError::NetworkTimeout(_) => PingFailure::Transient(if status == 0 {
+            "network".to_string()
+        } else {
+            format!("HTTP {status}")
+        }),
         other => PingFailure::Fatal(other.to_string()),
     }
 }
@@ -592,13 +595,32 @@ impl Runtime {
                     .read()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
             });
-            let (set, _, _) = super::stream::select_turn_start_tool_set(
+            let (mut set, _, _) = super::stream::select_turn_start_tool_set(
                 existing.as_deref(),
                 fresh,
                 tools_snapshot.catalog(),
                 true,
             );
             drop(existing);
+            // Activations carried from the previous runtime (reload, unpark)
+            // that the next turn start will restore: projected here too, on
+            // this local copy only, so a ping before that turn warms the
+            // prefix the turn will send.
+            let pending = self
+                .pending_tool_restore
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            if let Some(carried) = pending {
+                if crate::tools::activation::carry_forward_enabled() {
+                    let _ = super::stream::restore_pending_activations(
+                        &mut set,
+                        &carried,
+                        tools_snapshot.catalog(),
+                        self.activation_confirm,
+                    );
+                }
+            }
             let schema = tools_snapshot.session_tools_schema(&set).schema;
             let split = self.deferred_tool_loading.then(|| {
                 let referenced = HelperMethods::referenced_tool_ids(request_messages);
@@ -621,6 +643,7 @@ impl Runtime {
             credential_source: self.credential_source.clone(),
             token_cache: self.token_cache.clone(),
             anthropic_base_url: None,
+            anthropic_stream_client: self.anthropic_stream_client.clone(),
             anthropic_execution_plan,
             codex_request_role: self.codex_request_role(),
             // The base context: a ping must never consume `/trace next`.
@@ -642,6 +665,9 @@ impl Runtime {
                 sent: Arc::clone(&tap.sent),
                 connect_failed: Arc::clone(&tap.connect_failed),
             }),
+            // Header only (cache-key parity with the turns this ping keeps
+            // warm); a ping never sends `diagnostics` nor moves the chain.
+            cache_diagnosis: self.cache_diagnosis(),
         };
 
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -666,7 +692,7 @@ impl Runtime {
         // arrives, so an aborted ping can still be booked.
         let mut notices = Vec::new();
         let mut on_event = |event: StreamEvent| {
-            if let StreamEvent::Session(SessionEvent::Notice(n)) = &event {
+            if let StreamEvent::Session(SessionEvent::Notice(n) | SessionEvent::Retry(n)) = &event {
                 notices.push(n.clone());
             }
             tap.usage
@@ -1328,6 +1354,85 @@ mod tests {
         assert_identity_1h(&rt).await;
     }
 
+    /// A ping projects exactly what the next turn start selects — including
+    /// activations handed over by a daemon reload or an unpark that the turn
+    /// start has not restored yet. (The session only schedules pings after
+    /// an accepted request of the same runtime, so this is the projection
+    /// invariant, not a reachable pre-turn ping.)
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn ping_projects_carried_activations_the_turn_start_restores() {
+        use crate::tools::activation::{activate_exact_for_user, SessionId, SessionToolSet};
+        use crate::tools::catalog::ToolId;
+        let _base = crate::test_env::BaseDirGuard::new();
+        let (url, mock) = spawn_mock().await;
+        let _url = crate::test_env::EnvVarGuard::set("SYNAPS_ANTHROPIC_BASE_URL", &url);
+        let mut rt = opus(CacheTtl::OneHour);
+        rt.progressive_tool_disclosure = true;
+        rt.deferred_tool_loading = true;
+        let carried = {
+            let registry = rt.tools.read().await;
+            let mut previous = SessionToolSet::progressive_core_for_catalog(
+                SessionId::parse("previous-runtime").unwrap(),
+                registry.catalog(),
+            );
+            activate_exact_for_user(
+                &mut previous,
+                registry.catalog(),
+                &ToolId::builtin("subagent_status"),
+            )
+            .unwrap();
+            previous.carried_activations()
+        };
+        rt.restore_tool_activations(carried);
+
+        let history = vec![
+            user("hello"),
+            Arc::new(json!({"role": "assistant", "content": [{"type": "text", "text": "hi"}]})),
+        ];
+        let fp = rt.cache_keepwarm_probe(&history).await.unwrap().fingerprint;
+        let report = rt
+            .cache_keepwarm_ping(&history, fp, &CancellationToken::new(), &PingTap::default())
+            .await;
+        assert_eq!(report.result, Ok(PingOutcome::Sent), "{report:?}");
+        let mut next = history.clone();
+        next.push(user("next"));
+        real_turn(&rt, next).await;
+
+        let bodies: Vec<Value> = mock
+            .bodies
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|b| serde_json::from_str(b).unwrap())
+            .collect();
+        let (ping, real) = (&bodies[0], &bodies[1]);
+        // The non-deferred tools are the cached prefix. (The deferred list
+        // can still differ here: this runtime's first turn applies its
+        // idempotent setup, e.g. hiding the forum tools under the legacy
+        // memory backend; deferred definitions are outside the prefix.)
+        let loaded = |b: &Value| -> Vec<Value> {
+            b["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|t| t.get("defer_loading").is_none())
+                .cloned()
+                .collect()
+        };
+        assert_eq!(
+            serde_json::to_string(&loaded(ping)).unwrap(),
+            serde_json::to_string(&loaded(real)).unwrap()
+        );
+        assert!(
+            real["tools"].as_array().unwrap().iter().any(|t| {
+                t["name"] == "subagent_status" && t.get("defer_loading").is_none()
+            }),
+            "the restored activation is a loaded tool: {}",
+            real["tools"]
+        );
+    }
+
     /// Context management on: the guidance is appended to the system prompt
     /// of both.
     #[tokio::test]
@@ -1372,6 +1477,13 @@ mod tests {
             auth_type: "oauth".to_string(),
             refresh_token: None,
             token_expires: Some(crate::epoch_millis() + 3_600_000),
+            auth_file_mtime: None,
+            // Bound to the default local seat so the turn's binding check
+            // takes the fast path instead of re-resolving from auth.json.
+            bound_credential: Some(crate::runtime::auth::anthropic_binding(
+                &crate::auth::CredentialSource::Local,
+                &crate::auth::CredentialRef::default_for(crate::auth::OAuthProviderId::Anthropic),
+            )),
         }));
         let o = assert_identity_1h(&rt).await;
         assert!(
@@ -1474,6 +1586,72 @@ mod tests {
         assert_eq!(mock.bodies.lock().unwrap().len(), 1, "no transport retry");
     }
 
+    /// `cache_diagnostics = true`: a ping keeps the turn's beta set (cache-key
+    /// parity — the probe and the ping agree on the fingerprint, so it is
+    /// sent) but never sends `diagnostics` and never moves the turn chain.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn ping_never_carries_or_moves_the_diagnostics_chain() {
+        let _base = crate::test_env::BaseDirGuard::new();
+        let (url, mock) = spawn_mock().await;
+        let _url = crate::test_env::EnvVarGuard::set("SYNAPS_ANTHROPIC_BASE_URL", &url);
+        let history = vec![
+            user("hello"),
+            Arc::new(json!({"role": "assistant", "content": [{"type": "text", "text": "hi"}]})),
+        ];
+        let mut rt = opus(CacheTtl::OneHour);
+        rt.set_cache_diagnostics(true);
+        rt.cache_diagnosis().unwrap().record("msg_turn");
+        let mut ping_rt = rt.clone();
+        ping_rt.share_ttl_latches(&rt);
+        let fp = ping_rt
+            .cache_keepwarm_probe(&history)
+            .await
+            .unwrap()
+            .fingerprint;
+        let report = ping_rt
+            .cache_keepwarm_ping(&history, fp, &CancellationToken::new(), &PingTap::default())
+            .await;
+        assert!(report.result.is_ok(), "{report:?}");
+        let bodies = mock.bodies.lock().unwrap().clone();
+        assert_eq!(bodies.len(), 1);
+        assert!(!bodies[0].contains("\"diagnostics\""), "{}", bodies[0]);
+        assert_eq!(
+            rt.cache_diagnosis()
+                .unwrap()
+                .previous_message_id()
+                .as_deref(),
+            Some("msg_turn"),
+            "the ping's msg_kw never enters the chain"
+        );
+    }
+
+    /// Driver-turn and ping clones continue the session's chain; a plain
+    /// clone (subagent-style) starts its own chain but shares the rejection
+    /// latch; off means no chain at all.
+    #[test]
+    fn diagnostics_chain_is_shared_like_the_ttl_latches() {
+        let mut rt = opus(CacheTtl::FiveMinutes);
+        assert!(rt.cache_diagnosis().is_none(), "off: wire unchanged");
+        rt.set_cache_diagnostics(true);
+        rt.cache_diagnosis().unwrap().record("msg_a");
+        let fresh = rt.clone();
+        assert_eq!(fresh.cache_diagnosis().unwrap().previous_message_id(), None);
+        let mut shared = rt.clone();
+        shared.share_ttl_latches(&rt);
+        shared.cache_diagnosis().unwrap().record("msg_b");
+        shared.cache_diagnosis().unwrap().reject(400);
+        let chain = rt.cache_diagnosis().unwrap();
+        assert_eq!(chain.previous_message_id().as_deref(), Some("msg_b"));
+        assert!(!chain.active(), "the rejection latch is session-wide");
+        // Subagent-style clones keep their own chain but share the latch:
+        // a rejecting API is paid for (and logged) once per session.
+        let fresh_chain = fresh.cache_diagnosis().unwrap();
+        assert!(!fresh_chain.active(), "latch shared across Clone");
+        assert_eq!(fresh_chain.previous_message_id(), None);
+        assert!(!rt.clone().cache_diagnosis().unwrap().active());
+    }
+
     /// The ping shares the session's silent-downgrade latch (not a fresh
     /// one): a downgrade it observes is the session's one notice.
     #[test]
@@ -1524,6 +1702,20 @@ mod tests {
             classify_failure(&RuntimeError::Config("x".into()), 0),
             PingFailure::Fatal(_)
         ));
+    }
+
+    /// 3f2be9a3 split upload/header and stream-idle timeouts into
+    /// `NetworkTimeout`. A slow ping is a network blip: back off and retry,
+    /// never end the keep-warm period.
+    #[test]
+    fn network_timeout_is_transient() {
+        for msg in ["upload/header deadline", "stream idle"] {
+            assert_eq!(
+                classify_failure(&RuntimeError::NetworkTimeout(msg), 0),
+                PingFailure::Transient("network".to_string()),
+                "{msg}"
+            );
+        }
     }
 
     #[test]

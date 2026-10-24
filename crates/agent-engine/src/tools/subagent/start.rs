@@ -144,6 +144,7 @@ impl Tool for SubagentStartTool {
         let model = decision.model.as_str().to_owned();
         let codex_parent_plan = ctx.capabilities.codex_parent_plan.clone();
         let memory_backend = ctx.capabilities.memory_backend.clone();
+        let session_allow_all = ctx.capabilities.session_allow_all.clone();
         let timeout_secs = params["timeout"]
             .as_u64()
             .unwrap_or(ctx.limits.subagent_timeout);
@@ -279,6 +280,7 @@ impl Tool for SubagentStartTool {
                             &mut runtime,
                             &crate::config::load_config(),
                             memory_backend.as_ref(),
+                            session_allow_all.as_ref(),
                         );
                         runtime.set_system_prompt(super::compose_system_prompt(
                             system_prompt,
@@ -368,6 +370,13 @@ impl Tool for SubagentStartTool {
                 start_time,
                 None, // start.rs: not a resume
             );
+            // A cancelled worker publishes no wake, so nothing would ever
+            // prompt a collect: retire it before any terminal publication.
+            super::finalize::retire_if_cancelled(
+                &state_for_finalizer,
+                &orchestration_for_worker,
+                &handle_id_inner,
+            );
             // All terminal publications follow the recovery/finalization barrier.
             if let Some(ref tx) = tx_events_inner {
                 let s = state_for_finalizer
@@ -420,6 +429,9 @@ impl Tool for SubagentStartTool {
                 .release_delegation(&handle_id, ctx.capabilities.delegation_parent.as_deref());
             return Err(RuntimeError::Tool(error));
         }
+        // The thread may have been cancelled and finalized before it was
+        // marked running; its own retire attempt was then too early.
+        super::finalize::retire_if_cancelled(&state, orchestration, &handle_id);
 
         Ok(json!({
             "handle_id":  handle_id,
@@ -461,11 +473,32 @@ mod tests {
         );
     }
 
+    /// These tests launch a real worker thread. Run unpinned, it read the
+    /// developer's real `auth.json` (and could reach the provider), and wrote
+    /// `logs/subagents` and `subagent-history` under the real `~/.synaps-cli`,
+    /// after the test returned. Pin an empty base dir and clear the
+    /// environment's provider credentials/endpoints (`OfflineProviderEnv`), so
+    /// the worker fails at auth, offline; keep both until it has exited.
+    fn join_worker(registry: &Mutex<SubagentRegistry>, handle_id: &str) {
+        let thread = registry
+            .lock()
+            .unwrap()
+            .get_mut(handle_id)
+            .and_then(|h| h.thread_handle.take());
+        if let Some(thread) = thread {
+            let _ = thread.join();
+        }
+    }
+
     #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
     async fn test_subagent_start_blank_agent_uses_system_prompt() {
+        let _base = crate::test_env::BaseDirGuard::new();
+        let _offline = crate::test_env::OfflineProviderEnv::new();
         let tool = SubagentStartTool;
         let mut ctx = create_tool_context();
-        ctx.capabilities.subagent_registry = Some(Arc::new(Mutex::new(SubagentRegistry::new())));
+        let registry = Arc::new(Mutex::new(SubagentRegistry::new()));
+        ctx.capabilities.subagent_registry = Some(registry.clone());
 
         let params = json!({
             "agent": "",
@@ -482,14 +515,16 @@ mod tests {
         );
         let body: serde_json::Value = serde_json::from_str(&result.unwrap()).unwrap();
         assert_eq!(body["agent_name"], "inline");
-        assert!(body["handle_id"]
-            .as_str()
-            .unwrap_or_default()
-            .starts_with("sa_"));
+        let handle_id = body["handle_id"].as_str().unwrap_or_default();
+        assert!(handle_id.starts_with("sa_"));
+        join_worker(&registry, handle_id);
     }
 
     #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
     async fn test_subagent_start_inline_name_labels_the_handle() {
+        let _base = crate::test_env::BaseDirGuard::new();
+        let _offline = crate::test_env::OfflineProviderEnv::new();
         let tool = SubagentStartTool;
         let mut ctx = create_tool_context();
         let registry = Arc::new(Mutex::new(SubagentRegistry::new()));
@@ -507,10 +542,13 @@ mod tests {
         let body: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(body["agent_name"], "gif-recorder");
         let handle_id = body["handle_id"].as_str().unwrap();
-        let reg = registry.lock().unwrap();
-        assert_eq!(
-            reg.get(handle_id).expect("registered").agent_name,
-            "gif-recorder"
-        );
+        {
+            let reg = registry.lock().unwrap();
+            assert_eq!(
+                reg.get(handle_id).expect("registered").agent_name,
+                "gif-recorder"
+            );
+        }
+        join_worker(&registry, handle_id);
     }
 }
