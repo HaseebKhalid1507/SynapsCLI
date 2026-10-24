@@ -117,16 +117,16 @@ fn persisted_keepwarm_tokens(
 }
 
 /// The keep-warm subtotal a resumed conversation starts with: each bucket
-/// clamped under the total it is part of. Input/output totals persist with
-/// the session; the cache totals do not (they restart at 0), so neither do
-/// the keep-warm cache buckets — `/stats` must still add up.
+/// clamped under the total it is part of, so `/stats` still adds up. The
+/// cache totals persist with the session (snapshot-only); a session saved
+/// before they did resumes them at 0, and its keep-warm cache buckets too.
 fn resumed_keepwarm_tokens(session: &Session) -> crate::session::ConversationTokens {
     let kw = session.keepwarm_tokens;
     crate::session::ConversationTokens {
         input: kw.input.min(session.total_input_tokens),
         output: kw.output.min(session.total_output_tokens),
-        cache_read: 0,
-        cache_creation: 0,
+        cache_read: kw.cache_read.min(session.total_cache_read_tokens),
+        cache_creation: kw.cache_creation.min(session.total_cache_creation_tokens),
     }
 }
 
@@ -162,8 +162,8 @@ impl ConversationState {
             api_messages: session.api_messages.clone(),
             total_input_tokens: session.total_input_tokens,
             total_output_tokens: session.total_output_tokens,
-            total_cache_read_tokens: 0,
-            total_cache_creation_tokens: 0,
+            total_cache_read_tokens: session.total_cache_read_tokens,
+            total_cache_creation_tokens: session.total_cache_creation_tokens,
             session_cost: session.session_cost,
             keepwarm_cost: session.keepwarm_cost.min(session.session_cost).max(0.0),
             keepwarm_tokens: resumed_keepwarm_tokens(&session),
@@ -203,6 +203,8 @@ impl ConversationState {
         self.session.api_messages = self.api_messages.clone();
         self.session.total_input_tokens = self.total_input_tokens;
         self.session.total_output_tokens = self.total_output_tokens;
+        self.session.total_cache_read_tokens = self.total_cache_read_tokens;
+        self.session.total_cache_creation_tokens = self.total_cache_creation_tokens;
         self.session.session_cost = self.session_cost;
         self.session.keepwarm_cost = self.keepwarm_cost;
         self.session.keepwarm_tokens = persisted_keepwarm_tokens(&self.keepwarm_tokens);
@@ -226,6 +228,8 @@ impl ConversationState {
         candidate.api_messages = messages;
         candidate.total_input_tokens = self.total_input_tokens;
         candidate.total_output_tokens = self.total_output_tokens;
+        candidate.total_cache_read_tokens = self.total_cache_read_tokens;
+        candidate.total_cache_creation_tokens = self.total_cache_creation_tokens;
         candidate.session_cost = self.session_cost;
         candidate.keepwarm_cost = self.keepwarm_cost;
         candidate.keepwarm_tokens = persisted_keepwarm_tokens(&self.keepwarm_tokens);
@@ -432,6 +436,31 @@ mod context_head_tests {
         let mut other = session.clone();
         other.id = "new-session".into();
         assert!(!state.is_blocked(&other));
+    }
+
+    /// The cache totals persist with the session, so a daemon reload, an
+    /// unpark or `/resume` keeps the footer's cache hit rate. The keep-warm
+    /// cache buckets come back clamped under the totals they are part of.
+    #[test]
+    fn cache_totals_survive_save_and_resume() {
+        let mut s = Session::new("synthetic-model", "low", None);
+        s.api_messages = vec![Arc::new(json!({"role":"user","content":"q"}))];
+        let mut conv = ConversationState::from_resumed(s);
+        conv.add_usage(120, 40, 85_679, 6_250, None, None, "synthetic-model");
+        conv.keepwarm_tokens.cache_read = 4_000;
+        conv.keepwarm_tokens.cache_creation = 9_999; // stale label, above its total
+        let saved = conv.prepare_save().expect("non-empty history saves");
+        assert_eq!(saved.total_cache_read_tokens, 85_679);
+        assert_eq!(saved.total_cache_creation_tokens, 6_250);
+
+        let resumed = ConversationState::from_resumed(saved);
+        assert_eq!(resumed.total_cache_read_tokens, 85_679);
+        assert_eq!(resumed.total_cache_creation_tokens, 6_250);
+        assert_eq!(resumed.keepwarm_tokens.cache_read, 4_000);
+        assert_eq!(resumed.keepwarm_tokens.cache_creation, 6_250);
+        let wire = resumed.snapshot(0);
+        assert_eq!(wire.tokens.cache_read, 85_679);
+        assert_eq!(wire.tokens.cache_creation, 6_250);
     }
 
     /// `/resume` builds its conversation with `from_resumed` directly: a

@@ -747,8 +747,9 @@ written to history, the session file or the transcript.
   settlement can still lose **that one in-flight ping's** charge, at most its
   exposure (§7.2). On load both labels are clamped under the
   totals they are part of (`Session::clamp_keepwarm_to_totals`; on resume the
-  cache-token buckets restart at 0 with the cache totals, which are not
-  persisted). `journal_written_by_this_build_parses_with_the_0_10_1_reader`
+  cache-token buckets are clamped under the cache totals, which persist with
+  the session snapshot like the keep-warm labels: snapshot-only, never
+  journaled. A session saved before they persisted resumes both at 0). `journal_written_by_this_build_parses_with_the_0_10_1_reader`
   replays this build's journal through a frozen copy of 0.10.1's record types.
 - A compaction successor restarts the keep-warm subtotal exactly like the
   totals it belongs to: cost, input and output restart at 0; the cache-token
