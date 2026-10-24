@@ -44,6 +44,15 @@ const BUILTIN_THEMES: &[&str] = &[
 /// `openai-codex/<id>`, `anthropic/<id>` (and bare `claude-*`), and
 /// `xai-auth/<id>`. Providers without authoritative metadata keep the
 /// conservative set and NEVER gain max/ultra. No substring inference.
+/// Open the `/settings` modal: fresh state plus the matching ModalStack
+/// push (P7.7), stack sync asserted on the spot.
+pub(crate) fn open_modal(app: &mut super::app::App) {
+    app.settings = Some(SettingsState::new());
+    app.modal_stack.push(super::focus::PaneId::Settings);
+    #[cfg(debug_assertions)]
+    super::focus::debug_assert_stack_sync(app);
+}
+
 pub(crate) fn thinking_options_for_model(model: &str) -> Vec<String> {
     agent_engine::runtime::openai::catalog::validation::thinking_options_for_model(model)
 }

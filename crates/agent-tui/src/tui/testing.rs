@@ -111,6 +111,8 @@ pub struct TestHarness {
     /// Structured queue of dispatched slash commands awaiting the P6.3
     /// bounded async drive ([`Self::drive_slash_commands`]).
     pending_slash: Vec<(String, String)>,
+    /// Lines typed while streaming, awaiting [`Self::drive_streaming_input`].
+    pending_streaming: Vec<String>,
     quit_requested: bool,
 }
 
@@ -202,6 +204,7 @@ impl TestHarness {
             size: Size::new(cols, rows),
             actions: Vec::new(),
             pending_slash: Vec::new(),
+            pending_streaming: Vec::new(),
             quit_requested: false,
         }
     }
@@ -1040,6 +1043,63 @@ impl TestHarness {
         self
     }
 
+    /// Resolve every line typed while streaming through the production
+    /// `commands::resolve_streaming_input`, then apply the result the way
+    /// the dispatch `StreamingInput` arm does. Steers and refusals are
+    /// recorded as `streaming-steer:<text>` / `streaming-refused:<text>`.
+    pub fn drive_streaming_input(&mut self) -> &mut Self {
+        use super::commands::{CommandAction, StreamingSlash};
+        for text in std::mem::take(&mut self.pending_streaming) {
+            match super::commands::resolve_streaming_input(&text, &mut self.app, &self.registry) {
+                StreamingSlash::Steer => self.actions.push(format!("streaming-steer:{text}")),
+                StreamingSlash::Refused => {
+                    self.actions.push(format!("streaming-refused:{text}"))
+                }
+                StreamingSlash::Ran(CommandAction::OpenSettings) => {
+                    super::settings::open_modal(&mut self.app);
+                }
+                StreamingSlash::Ran(CommandAction::Quit) => self.quit_requested = true,
+                StreamingSlash::Ran(_) => {}
+            }
+        }
+        #[cfg(debug_assertions)]
+        super::focus::debug_assert_stack_sync(&self.app);
+        self
+    }
+
+    /// Run one `/settings` apply through the production
+    /// `helpers::apply_setting` against the scripted session (what the
+    /// dispatch `SettingsApply` arm does). Writes the config file under
+    /// whatever `SYNAPS_BASE_DIR` the test pinned.
+    pub fn apply_setting(&mut self, key: &'static str, value: &str) -> &mut Self {
+        let what = format!("apply_setting({key}={value})");
+        block_on_bounded(
+            &what,
+            super::helpers::apply_setting(key, value, &mut self.app, &mut self.link),
+        );
+        self
+    }
+
+    /// Whether the app believes a turn is streaming.
+    pub fn is_streaming(&self) -> bool {
+        self.app.streaming
+    }
+
+    /// The settings modal's row note / error (`(row key, text)`), if any.
+    pub fn settings_row_note(&self) -> Option<(String, String)> {
+        self.app.settings.as_ref().and_then(|s| s.row_error.clone())
+    }
+
+    /// Whether a theme cross-fade is in flight.
+    pub fn theme_transition_active(&self) -> bool {
+        self.app.theme_transition.is_some()
+    }
+
+    /// The model the session view reports.
+    pub fn view_model(&self) -> String {
+        self.link.view().model.clone()
+    }
+
     /// Apply a resolved [`super::commands::CommandAction`], mirroring the
     /// production `SlashCommand` arm in `mod.rs` for the sync-safe subset —
     /// including the ModalStack pushes, so `debug_assert_stack_sync` holds
@@ -1080,10 +1140,7 @@ impl TestHarness {
                 self.app.models = Some(super::models::ModelsModalState::new());
                 self.app.modal_stack.push(super::focus::PaneId::Models);
             }
-            CommandAction::OpenSettings => {
-                self.app.settings = Some(super::settings::SettingsState::new());
-                self.app.modal_stack.push(super::focus::PaneId::Settings);
-            }
+            CommandAction::OpenSettings => super::settings::open_modal(&mut self.app),
             CommandAction::OpenPlugins => {
                 // Production loads plugins.json from disk; the harness opens
                 // the deterministic default state instead of touching $HOME.
@@ -1137,7 +1194,10 @@ impl TestHarness {
                 self.pending_slash.push((cmd, arg));
                 desc
             }
-            InputAction::StreamingInput(text) => format!("streaming-input:{text}"),
+            InputAction::StreamingInput(text) => {
+                self.pending_streaming.push(text.clone());
+                format!("streaming-input:{text}")
+            }
             InputAction::SubagentSteer { handle_id, text } => {
                 // The dispatch arm's App-side half (its send is not run).
                 super::watch::steer_sent(&mut self.app, &handle_id, &text);

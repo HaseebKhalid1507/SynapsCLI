@@ -28,6 +28,14 @@ use super::*;
 
 use std::ops::ControlFlow;
 
+/// Open `/settings` (idle or mid-turn) plus the same live-catalog refresh
+/// the /models modal runs: the settings model picker feeds off
+/// `app.catalog_overrides`.
+fn open_settings(app: &mut App, http: &LazyHttp) {
+    settings::open_modal(app);
+    spawn_auto_catalog_refreshes(app, http);
+}
+
 fn spawn_auto_catalog_refreshes(app: &mut App, http: &LazyHttp) {
     let http = match http.get() {
         Ok(c) => c,
@@ -309,19 +317,7 @@ pub(crate) async fn handle_input_action(
                         focus::debug_assert_stack_sync(app);
                     }
                 }
-                CommandAction::OpenSettings => {
-                    app.settings = Some(settings::SettingsState::new());
-                    // P7.7: mirror the `= Some(..)` open with a stack
-                    // push (§6). GATE-1 note B: settings opens on this
-                    // async command arm, so assert sync RIGHT HERE — a
-                    // missed push is caught this event, not one later.
-                    app.modal_stack.push(focus::PaneId::Settings);
-                    #[cfg(debug_assertions)]
-                    focus::debug_assert_stack_sync(app);
-                    // Same live-catalog refresh the /models modal runs: the
-                    // settings model picker feeds off app.catalog_overrides.
-                    spawn_auto_catalog_refreshes(app, http);
-                }
+                CommandAction::OpenSettings => open_settings(app, http),
                 CommandAction::OpenPlugins => {
                     let path = synaps_cli::skills::state::PluginsState::default_path();
                     match synaps_cli::skills::state::PluginsState::load_from(&path) {

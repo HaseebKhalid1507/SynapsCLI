@@ -2733,11 +2733,13 @@ mod streaming_command_tests {
     #[test]
     fn theme_and_friends_are_streaming_commands() {
         let cmds = to_owned_commands(STREAMING_COMMANDS);
-        for typed in ["theme", "th", "attachments", "detach", "quit", "gamba", "watch"] {
+        for typed in [
+            "theme", "th", "attachments", "detach", "quit", "gamba", "watch", "settings",
+        ] {
             let cmd = resolve_prefix(typed, &cmds);
             assert!(is_streaming_command(&cmd), "/{typed} runs mid-stream");
         }
-        for typed in ["settings", "model", "compact"] {
+        for typed in ["model", "compact", "effort"] {
             let cmd = resolve_prefix(typed, &cmds);
             assert!(
                 !is_streaming_command(&cmd),
