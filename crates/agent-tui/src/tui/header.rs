@@ -2,20 +2,20 @@
 //! screen, ending in a solid block whose colour is the state.
 //!
 //! ```text
-//! ▐ SynapsCLI ❯ ~/Projects/SynapsCLI · fix-cache   voice  3 agents 4m12s  ⠋ thinking 12s ▌
-//! ▝▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▘
+//!   SynapsCLI ❯ ~/Projects/SynapsCLI · fix-cache   voice  3 agents 4m12s  ⠋ thinking 12s  
+//! ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
 //! ```
 //!
-//! * Row 0 is the prompt's body (`▐ … ▌`, at the prompt's own x edges) on
-//!   the chrome band: same body colour, same sweep in the same phase (one
+//! * Row 0 is the prompt's body, edge to edge (the full width, square ends):
+//!   same body colour, same sweep in the same phase (one
 //!   [`Slab`] built from the same [`PromptFx`]). A failed turn tints it 7%
 //!   toward the error colour, a busy one toward the warning colour.
-//! * Row 1 is the slab's bottom rim (`▝▀…▀▘`). It is the message pane's top
+//! * Row 1 is the slab's bottom rim (`▀`, full width). It is the message pane's top
 //!   edge row, so the layout and every coordinate derived from it stay as
 //!   they were; the header paints it after the pane.
 //! * Left: `Synaps`+`CLI` `❯` folder `·` session (`❯ worker` in a worker view).
-//! * Right end: the state block, inlaid. Its cells, the slab's right cap and
-//!   the rim under it take the state's fill; dark ink holds 5:1 on it.
+//! * Right end: the state block, flush to the right edge. Its cells and the
+//!   rim under it take the state's fill; dark ink holds 5:1 on it.
 //! * Wells, left of the block: square-ended 1½-row tiles for active/error
 //!   sidecar pills, `observing`, and the agent chip (count + longest clock).
 //!
@@ -419,6 +419,38 @@ fn target(role: Role, need: f32) -> f32 {
     }
 }
 
+/// The colour of letter `i` of `n` in `Synaps`. At rest (idle) it is the
+/// header colour; after a failed turn, the error colour (still, nothing moves
+/// at rest). While anything runs it glows: a gradient through the state's
+/// colour, the prompt colour and the session colour flows across the letters,
+/// one lap every 2.5 s.
+fn mark_color(t: &Theme, state: &HeaderState, i: usize, n: usize, tick: f32) -> Rgb {
+    let d = Theme::default();
+    match state {
+        HeaderState::Idle => return tone(t, Role::Mark),
+        HeaderState::Failed(_) => return rgb(t.error_color, d.error_color),
+        _ => {}
+    }
+    let accent = match fill_kind(state) {
+        Fill::Tool => rgb(t.tool_label, d.tool_label),
+        Fill::Agents => rgb(t.subagent_name, d.subagent_name),
+        Fill::Busy => rgb(t.warning_color, d.warning_color),
+        _ => rgb(t.status_streaming, d.status_streaming),
+    };
+    let palette = [
+        accent,
+        rgb(t.prompt_fg, d.prompt_fg),
+        rgb(t.claude_label, d.claude_label),
+        accent,
+    ];
+    let phase = (i as f32 / n.max(1) as f32 * 0.6 - tick / 50.0).rem_euclid(1.0);
+    let seg = phase * (palette.len() - 1) as f32;
+    let k = (seg as usize).min(palette.len() - 2);
+    let f = seg - k as f32;
+    let f = f * f * (3.0 - 2.0 * f);
+    mix(palette[k], palette[k + 1], f)
+}
+
 /// The block's state family.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Fill {
@@ -712,7 +744,7 @@ struct Plan {
     /// Pill/attach wells then the chip, left to right, each `(spans, tone)`.
     wells: Vec<(Spans, Role)>,
     block: Vec<(String, Ink)>,
-    /// Block cells `[bx, r)`; the cap at `r` is the block's too.
+    /// Block cells `[bx, w)`: flush to the right edge.
     bx: usize,
     /// Where the first well starts (`bx` with none).
     wells_x: usize,
@@ -731,8 +763,9 @@ fn plan(v: &HeaderView<'_>, w: usize) -> Plan {
             wells.push((chip, Role::Agent));
         }
         let right: usize = wells.iter().map(|(s, _)| well_w(s, cfg.pad) + 1).sum();
-        // ▐ pad [left] gap2 [wells, one gap after each] [block…▌] edge
-        let fits = 3 + spans_w(&left) + 2 + right + bw + 2 <= w;
+        // pad2 [left] gap2 [wells, one gap after each] [block: bw + 1 cells,
+        // to the edge]
+        let fits = 2 + spans_w(&left) + 2 + right + bw < w;
         last = Some((cfg, left, wells, block, bw));
         if fits {
             break;
@@ -741,7 +774,7 @@ fn plan(v: &HeaderView<'_>, w: usize) -> Plan {
     let (cfg, left, mut wells, block, bw) = last.expect("the ladder is never empty");
     // Too narrow even for the last rung: the block shrinks to the room
     // there is, then wells give way from the left. Nothing overlaps.
-    let r = w.saturating_sub(2);
+    let r = w.saturating_sub(1);
     let bw = bw.min(w.saturating_sub(4));
     let bx = r - bw;
     let right = |wells: &Vec<(Spans, Role)>| -> usize {
@@ -840,7 +873,8 @@ pub(crate) fn paint(buf: &mut Buffer, area: Rect, t: &Theme, v: &HeaderView<'_>)
     let tick = v.anim_ms as f32 * 20.0 / 1000.0;
 
     let p = plan(v, w);
-    let (l, r) = (1usize, w - 2);
+    // Edge to edge: the slab spans the full width with square ends.
+    let (l, r) = (0usize, w - 1);
     let bw = r - p.bx;
     let ax = |x: usize| area.x + x as u16;
 
@@ -866,38 +900,21 @@ pub(crate) fn paint(buf: &mut Buffer, area: Rect, t: &Theme, v: &HeaderView<'_>)
         tint.map_or(f, |c| mix(f, c, 0.07))
     };
     let fill_at = |x: usize| if x >= p.bx { block_at(x) } else { body_at(x) };
-    let halo_at = |x: usize| {
-        if solid {
-            color(slab.halo_at(x as u16))
-        } else {
-            chrome
-        }
+    // Under the rim: the transcript itself (its canvas, or the terminal's
+    // own background when the canvas is see-through), so the header is the
+    // body row plus half a row and nothing more.
+    let below = if background_is_opaque() {
+        t.message_background()
+    } else {
+        Color::Reset
     };
 
-    // The slab: row 0 body, row 1 rim. Off the slab only the block shows.
+    // The slab: row 0 body, row 1 rim, the full width. Without a colour
+    // chrome only the block shows.
     for x in 0..w {
-        let (row0, row1): (CellSpec, Option<CellSpec>) = if x < l || x > r {
-            (
-                (" ", chrome, halo_at(x)),
-                solid.then(|| (" ", chrome, halo_at(x))),
-            )
-        } else if solid || x >= p.bx {
+        let (row0, row1): (CellSpec, Option<CellSpec>) = if solid || x >= p.bx {
             let f = color(fill_at(x));
-            let rim = if x == l {
-                "\u{259d}"
-            } else if x == r {
-                "\u{2598}"
-            } else {
-                "\u{2580}"
-            };
-            let top = if x == l {
-                ("\u{2590}", f, halo_at(x))
-            } else if x == r {
-                ("\u{258c}", f, halo_at(x))
-            } else {
-                (" ", f, f)
-            };
-            (top, Some((rim, f, halo_at(x))))
+            ((" ", f, f), Some(("\u{2580}", f, below)))
         } else {
             ((" ", chrome, chrome), None)
         };
@@ -912,6 +929,27 @@ pub(crate) fn paint(buf: &mut Buffer, area: Rect, t: &Theme, v: &HeaderView<'_>)
     let mut x = ax(l + 2);
     for (text, role, bold) in &fit_spans(&p.left, usize::from(max_left - x)) {
         let tg = target(*role, need);
+        if *role == Role::Mark {
+            // `Synaps` glows while anything runs: one colour per letter.
+            let n = text.chars().count();
+            let mut tmp = [0u8; 4];
+            for (i, ch) in text.chars().enumerate() {
+                let fg = mark_color(t, &v.state, i, n, tick);
+                x = write(
+                    buf,
+                    x,
+                    y0,
+                    ch.encode_utf8(&mut tmp),
+                    fg,
+                    lift,
+                    tg,
+                    *bold,
+                    max_left,
+                    bg,
+                );
+            }
+            continue;
+        }
         x = write(
             buf,
             x,
@@ -1111,7 +1149,7 @@ mod tests {
             "{line:?}"
         );
         let x = col_of(&buf, 0, "Synaps").unwrap();
-        assert_eq!(x, 3, "inside the slab's left cap and padding");
+        assert_eq!(x, 2, "two cells of padding in from the left edge");
         assert!(
             buf[(x, 0)].modifier.contains(Modifier::BOLD),
             "Synaps is bold"
@@ -1121,13 +1159,12 @@ mod tests {
             "CLI is the second tone"
         );
         assert_ne!(buf[(x, 0)].fg, buf[(x + 6, 0)].fg);
-        // The slab's caps at the prompt's own edges, the rim under it.
-        assert_eq!(buf[(1, 0)].symbol(), "\u{2590}");
-        assert_eq!(buf[(118, 0)].symbol(), "\u{258c}");
-        assert_eq!(
-            row(&buf, 1).trim(),
-            format!("\u{259d}{}\u{2598}", "\u{2580}".repeat(116))
-        );
+        // Edge to edge: square ends, the body from column 0 to the last,
+        // and the rim under all of it.
+        assert_eq!(buf[(0, 0)].symbol(), " ");
+        assert_eq!(buf[(0, 0)].bg, buf[(10, 0)].bg, "the body reaches column 0");
+        assert_eq!(buf[(119, 0)].symbol(), " ");
+        assert_eq!(row(&buf, 1), "\u{2580}".repeat(120));
     }
 
     #[test]
@@ -1206,14 +1243,13 @@ mod tests {
             // anim_ms 0: the block's sweep is off screen, the fill exact.
             assert_eq!(buf[(x, 0)].bg, color(fill), "{text}");
             assert_eq!(buf[(x, 0)].fg, color(ink), "{text}");
-            assert_eq!(buf[(w - 2, 0)].symbol(), "\u{258c}");
             assert_eq!(
-                buf[(w - 2, 0)].fg,
+                buf[(w - 1, 0)].bg,
                 color(fill),
-                "{text}: the cap is the block's"
+                "{text}: the block is flush to the right edge"
             );
-            assert_eq!(buf[(w - 2, 1)].symbol(), "\u{2598}");
-            assert_eq!(buf[(w - 2, 1)].fg, color(fill), "{text}: so is the rim");
+            assert_eq!(buf[(w - 1, 1)].symbol(), "\u{2580}");
+            assert_eq!(buf[(w - 1, 1)].fg, color(fill), "{text}: so is the rim");
             assert_eq!(buf[(x, 1)].fg, color(fill), "{text}");
             // The slab left of the block is not.
             assert_ne!(buf[(10, 0)].bg, color(fill), "{text}");
@@ -1381,6 +1417,54 @@ mod tests {
         assert_ne!(a, draw(&later, 120));
     }
 
+    /// `Synaps` glows while anything runs (a gradient flowing across the
+    /// letters), sits still in the header colour at rest, and takes the
+    /// error colour after a failed turn.
+    #[test]
+    fn synaps_glows_while_live_and_rests_otherwise() {
+        let letters = |v: &HeaderView<'_>| -> Vec<Color> {
+            let buf = draw(v, 120);
+            let x = col_of(&buf, 0, "Synaps").unwrap();
+            (x..x + 6).map(|cx| buf[(cx, 0)].fg).collect()
+        };
+        let idle = letters(&view());
+        assert!(
+            idle.windows(2).all(|p| p[0] == p[1]),
+            "one colour at rest: {idle:?}"
+        );
+
+        for state in [
+            HeaderState::Thinking,
+            HeaderState::Tool,
+            HeaderState::Agents { done: 0, total: 1 },
+            HeaderState::Busy("reconnecting".into()),
+        ] {
+            let v = HeaderView {
+                state: state.clone(),
+                anim_ms: 400,
+                ..view()
+            };
+            let now = letters(&v);
+            assert!(
+                now.windows(2).any(|p| p[0] != p[1]),
+                "{state:?}: a gradient: {now:?}"
+            );
+            assert_ne!(now, idle, "{state:?}");
+            let later = letters(&HeaderView {
+                anim_ms: 1_650,
+                ..v
+            });
+            assert_ne!(now, later, "{state:?}: it flows");
+        }
+
+        let failed = letters(&HeaderView {
+            state: HeaderState::Failed("401".into()),
+            ..view()
+        });
+        assert!(failed.windows(2).all(|p| p[0] == p[1]), "still: {failed:?}");
+        assert_ne!(failed, idle, "the error colour");
+    }
+
     #[test]
     fn no_overlap_or_panic_at_any_width() {
         let long = HeaderView {
@@ -1505,7 +1589,12 @@ mod tests {
             let buf = h.render().clone();
             let t = THEME.load();
             assert!(top_edge_is_half_block());
-            assert_eq!(buf[(1, 1)].symbol(), "\u{259d}", "opaque={opaque}");
+            assert_eq!(buf[(0, 1)].symbol(), "\u{2580}", "opaque={opaque}");
+            assert_eq!(
+                buf[(0, 0)].bg,
+                buf[(10, 0)].bg,
+                "full width, opaque={opaque}"
+            );
             let edge = &buf[(10, 1)];
             assert_eq!(edge.symbol(), "\u{2580}", "opaque={opaque}");
             assert_eq!(
@@ -1513,8 +1602,21 @@ mod tests {
                 buf[(10, 0)].bg,
                 "the rim is the body, opaque={opaque}"
             );
-            assert_eq!(edge.bg, t.bg, "on the chrome band, opaque={opaque}");
-            assert_eq!(buf[(0, 0)].bg, t.bg, "opaque={opaque}");
+            // Under the rim is the transcript, not more header.
+            let under = if opaque {
+                t.message_background()
+            } else {
+                Color::Reset
+            };
+            assert_eq!(
+                edge.bg, under,
+                "the transcript under the rim, opaque={opaque}"
+            );
+            assert_ne!(
+                buf[(0, 0)].bg,
+                t.bg,
+                "the slab covers column 0, opaque={opaque}"
+            );
         }
         super::super::theme::set_background_opaque(prior);
     }

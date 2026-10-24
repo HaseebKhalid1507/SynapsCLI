@@ -40,11 +40,10 @@ fn header(h: &mut TestHarness) -> String {
     h.snapshot().lines().next().unwrap_or("").to_string()
 }
 
-/// The state block's text: what follows the last run of 3+ spaces, without
-/// the slab's right cap.
+/// The state block's text: what follows the last run of 3+ spaces.
 fn block(h: &mut TestHarness) -> String {
     let line = header(h);
-    let line = line.trim_end().trim_end_matches('\u{258c}').trim_end();
+    let line = line.trim_end();
     line.rsplit("   ").next().unwrap_or("").trim().to_string()
 }
 
@@ -83,10 +82,14 @@ fn idle_session_shows_the_wordmark_folder_label_and_build() {
     );
     h.set_build_id("");
     assert_eq!(block(&mut h), ver, "release build: the version alone");
-    // The rim under it, from the prompt's left edge to its right edge.
+    // The rim under it, edge to edge.
     let edge = h.snapshot().lines().nth(1).unwrap_or("").to_string();
-    assert!(edge.starts_with(" \u{259d}\u{2580}"), "{edge:?}");
-    assert!(edge.trim_end().ends_with("\u{2580}\u{2598}"), "{edge:?}");
+    assert!(edge.starts_with("\u{2580}\u{2580}"), "{edge:?}");
+    assert!(edge.trim_end().ends_with("\u{2580}\u{2580}"), "{edge:?}");
+    assert!(
+        !edge.contains('\u{259d}') && !edge.contains('\u{2598}'),
+        "{edge:?}"
+    );
 }
 
 #[test]
