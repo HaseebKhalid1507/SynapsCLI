@@ -15,8 +15,10 @@
 //! policy, auto-compact, …), its keep-warm pin, its lifecycle (a Parked
 //! session comes back Parked), the non-persisted runtime knobs
 //! (`settings_replay`: context window, compaction model, retries,
-//! timeouts, tool-output cap, worker grants, `/system`), and the CURRENT
-//! model/thinking (`/model` mid-session survives).
+//! timeouts, tool-output cap, worker grants, `/system`), the CURRENT
+//! model/thinking (`/model` mid-session survives), and the session's exact
+//! tool activations (pins only, re-validated by the new runtime at its first
+//! turn start — `SessionToolSet::restore_carried`).
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
@@ -123,6 +125,11 @@ pub struct ReloadSession {
     /// completion wake), handed to the new image (`AdoptWorkers`).
     #[serde(default)]
     pub workers: Vec<crate::runtime::subagent::CarriedWorker>,
+    /// The session's exact tool activations, restored into the new image's
+    /// runtime (re-validated there; see `SessionToolSet::restore_carried`).
+    /// Empty from an older image or a checkpoint that did not confirm.
+    #[serde(default)]
+    pub tool_activations: Vec<crate::tools::activation::CarriedActivation>,
 }
 
 /// `registry_dir()/daemon[-P].reload.json` body.
@@ -321,7 +328,7 @@ fn record(handle: &SessionHandle, rec: Option<SessionReloadRecord>) -> ReloadSes
              no archive is guaranteed and their parent will not be woken"
         );
     }
-    let (config, keep_warm, lifecycle, settings_replay, cache_keepwarm, model, workers) = match rec {
+    let (config, keep_warm, lifecycle, settings_replay, cache_keepwarm, model, workers, tool_activations) = match rec {
         Some(r) => (
             r.config,
             r.keep_warm,
@@ -330,6 +337,7 @@ fn record(handle: &SessionHandle, rec: Option<SessionReloadRecord>) -> ReloadSes
             r.cache_keepwarm,
             r.model,
             r.workers,
+            r.tool_activations,
         ),
         None => (
             SessionConfig {
@@ -353,6 +361,8 @@ fn record(handle: &SessionHandle, rec: Option<SessionReloadRecord>) -> ReloadSes
             // No checkpoint reply: whatever workers ran are lost to the exec
             // without a record (the actor never answered).
             Vec::new(),
+            // Nor are its tool activations known.
+            Vec::new(),
         ),
     };
     ReloadSession {
@@ -373,6 +383,7 @@ fn record(handle: &SessionHandle, rec: Option<SessionReloadRecord>) -> ReloadSes
         cache_keepwarm,
         input_owner_kind: None,
         workers,
+        tool_activations,
     }
 }
 
@@ -736,6 +747,19 @@ pub async fn rehydrate(state: &Arc<DaemonState>, rs: &ReloadState) {
         match created {
             Ok(h) => {
                 let new_id = h.id.as_str().to_string();
+                // First, before anything can start a turn: the same
+                // conversation continues in this image, so the grants it
+                // held come with it (re-validated by the new runtime at its
+                // first turn start). A session recreated fresh (journal not
+                // continuable) is a new conversation and inherits none.
+                let continued = h.meta().continued;
+                if continued && !s.tool_activations.is_empty() {
+                    let _ = h
+                        .send(SessionCommand::RestoreToolActivations {
+                            activations: s.tool_activations.clone(),
+                        })
+                        .await;
+                }
                 if new_id != s.id {
                     state
                         .reload_aliases
@@ -785,6 +809,40 @@ pub async fn rehydrate(state: &Arc<DaemonState>, rs: &ReloadState) {
 mod tests {
     use super::*;
 
+    /// The session's tool activations ride the reload-state file; a file
+    /// from an older image (no field) reads as none.
+    #[test]
+    fn reload_session_carries_tool_activations() {
+        use crate::tools::activation::{CarriedActivation, CarriedProvenance};
+        let carried = vec![CarriedActivation {
+            tool_id: "builtin:subagent_start".into(),
+            schema_digest: "cd".repeat(32),
+            provenance: CarriedProvenance::BuiltinRuntime,
+        }];
+        let s = ReloadSession {
+            id: "s".into(),
+            journal_id: "j".into(),
+            config: SessionConfig::default(),
+            keep_warm: false,
+            lifecycle: SessionLifecycle::Live,
+            settings_replay: Vec::new(),
+            cache_keepwarm: None,
+            input_owner_kind: None,
+            workers: Vec::new(),
+            tool_activations: carried.clone(),
+        };
+        let v = serde_json::to_value(&s).unwrap();
+        let back: ReloadSession = serde_json::from_value(v.clone()).unwrap();
+        assert_eq!(back.tool_activations, carried);
+        // Never via the create config's wire form.
+        assert!(v["config"].get("restore_tool_activations").is_none());
+
+        let mut older = v;
+        older.as_object_mut().unwrap().remove("tool_activations");
+        let back: ReloadSession = serde_json::from_value(older).unwrap();
+        assert!(back.tool_activations.is_empty());
+    }
+
     /// Reload-state written by an older image (no workers, no counter)
     /// still parses: the new fields default.
     #[test]
@@ -826,6 +884,7 @@ mod tests {
             cache_keepwarm: None,
             input_owner_kind: None,
             workers,
+            tool_activations: Vec::new(),
         };
         let mut rs = ReloadState {
             generation: 10,

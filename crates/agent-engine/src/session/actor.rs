@@ -492,6 +492,7 @@ fn command_name(cmd: &SessionCommand) -> &'static str {
         SessionCommand::KeepWarm { .. } => "keep_warm",
         SessionCommand::Park => "park",
         SessionCommand::AdoptWorkers { .. } => "adopt_workers",
+        SessionCommand::RestoreToolActivations { .. } => "restore_tool_activations",
         SessionCommand::ReloadAborted => "reload_aborted",
         SessionCommand::HostEvent(_) => "host_event",
         SessionCommand::DriverStart { .. } => "driver_start",
@@ -636,6 +637,10 @@ pub struct SessionActor {
     /// Only then does "memory is off" mean consent was revoked; see
     /// `effective_memory_mode`. Reset whenever the runtime is rebuilt.
     pub(crate) memory_seen_active: bool,
+    /// While parked: the exact tool activations the dropped runtime held,
+    /// handed to the runtime the unpark builds (and to a reload record
+    /// written while parked). Empty while live.
+    pub(crate) parked_tool_activations: Vec<crate::tools::activation::CarriedActivation>,
 }
 
 /// A reload checkpoint wrote this session's reload record; until the
@@ -955,6 +960,7 @@ impl SessionActor {
             reload_fence: None,
             memory_mode_slot: memory_mode,
             memory_seen_active: false,
+            parked_tool_activations: Vec::new(),
         };
         // Whether the build's grant (default or restored choice) took.
         actor.observe_memory();
@@ -1192,6 +1198,11 @@ impl SessionActor {
             model: view.model.clone(),
             thinking_level: view.thinking_level.clone(),
             workers: Vec::new(),
+            tool_activations: if self.runtime.is_live() {
+                self.runtime.carried_tool_activations()
+            } else {
+                self.parked_tool_activations.clone()
+            },
         }
     }
 
@@ -2325,6 +2336,10 @@ impl SessionActor {
         // The unparked runtime is built from `config.memory_mode`: a
         // revocation made without `/memory` must be recorded first.
         self.sync_memory_choice();
+        // The runtime's exact tool activations outlive it: the unparked
+        // runtime restores them, so the tools array (the start of the cached
+        // prompt prefix) and the model's tools are what they were.
+        self.parked_tool_activations = self.runtime.carried_tool_activations();
         // Drop order: conv first, then runtime — a panic between them can
         // never leave a Runtime without state to save.
         let conv = self.conv.park_take();
@@ -2466,6 +2481,7 @@ impl SessionActor {
         if journal_present && self.config.persist && self.session_lock.is_some() {
             crate::engine::setup::recover_turn_draft(&mut conv).await;
         }
+        runtime.restore_tool_activations(std::mem::take(&mut self.parked_tool_activations));
         self.runtime.unpark_set(runtime);
         self.conv.unpark_set(conv);
         // A fresh runtime: whether its grant took effect is its own.
@@ -4650,6 +4666,34 @@ impl SessionActor {
             .reload_carry(&undelivered)
     }
 
+    /// Host-only (`SessionCommand::RestoreToolActivations`, sent by
+    /// reload's rehydrate): the activations this conversation held in the
+    /// previous image. A live runtime takes them (restored at its first turn
+    /// start); a parked session keeps them for the runtime its unpark
+    /// builds, without unparking.
+    pub(crate) fn restore_tool_activations(
+        &mut self,
+        activations: Vec<crate::tools::activation::CarriedActivation>,
+    ) {
+        if activations.is_empty() {
+            return;
+        }
+        tracing::info!(
+            session = %self.id,
+            count = activations.len(),
+            "reload: tool activations handed over from the previous image"
+        );
+        if self.runtime.is_live() {
+            self.runtime.restore_tool_activations(activations);
+        } else {
+            for a in activations {
+                if !self.parked_tool_activations.iter().any(|p| p.tool_id == a.tool_id) {
+                    self.parked_tool_activations.push(a);
+                }
+            }
+        }
+    }
+
     /// Host-only (`SessionCommand::AdoptWorkers`, sent by reload's
     /// rehydrate): the workers the previous daemon image stopped or still
     /// owed a wake. Their ids resolve to their archives again, and the
@@ -4860,6 +4904,7 @@ impl SessionActor {
                     | SessionCommand::Checkpoint { .. }
                     | SessionCommand::Park
                     | SessionCommand::ReloadAborted
+                    | SessionCommand::RestoreToolActivations { .. }
                     | SessionCommand::Resync { .. }
                     | SessionCommand::HostEvent(_)
             ) && !is_close_command(&cmd) // closing a parked session must not rebuild it
@@ -5008,6 +5053,9 @@ impl SessionActor {
             SessionCommand::Resume { id, query } => self.resume(id, query).await,
             SessionCommand::Checkpoint { reason } => self.checkpoint(reason).await,
             SessionCommand::AdoptWorkers { workers } => self.adopt_workers(workers),
+            SessionCommand::RestoreToolActivations { activations } => {
+                self.restore_tool_activations(activations)
+            }
             SessionCommand::ReloadAborted => self.reload_aborted().await,
             SessionCommand::Park => {
                 // Explicit request: end an active keep-warm period, then park.
