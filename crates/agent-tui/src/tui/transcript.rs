@@ -598,6 +598,12 @@ pub(crate) struct TranscriptStore {
     /// each show their own elapsed-time on the result block, instead of
     /// sharing a single timer that the last-started tool clobbers.
     tool_start_times: std::collections::HashMap<String, std::time::Instant>,
+    /// Calls the engine said wait behind another in their scheduler lane
+    /// (`LlmEvent::ToolQueued`) and that have not started yet. Not in
+    /// `tool_start_times` meanwhile, so their cards neither sweep nor
+    /// tick; `ToolStarted` moves them back, timed from then. Empty for a
+    /// client of an engine that never sends the signal.
+    queued_tools: std::collections::HashSet<String>,
     /// When the event being applied happened, if not "now": a subagent view
     /// applies its journal only when it polls, so it replays each event at
     /// the time the engine recorded it ([`Self::set_event_time`]). `None`
@@ -698,6 +704,7 @@ impl TranscriptStore {
             worker_view: false,
             tool_start_time: None,
             tool_start_times: std::collections::HashMap::new(),
+            queued_tools: std::collections::HashSet::new(),
             event_time: None,
             live: Vec::new(),
             live_refresh: false,
@@ -2644,7 +2651,7 @@ impl TranscriptStore {
         // Track start time even if we never saw a ToolUseStart (some
         // providers go straight to a finalized tool_use).
         let now = self.event_now();
-        if !tool_id.is_empty() {
+        if !tool_id.is_empty() && !self.queued_tools.contains(&tool_id) {
             self.tool_start_times.entry(tool_id.clone()).or_insert(now);
         }
         self.set_tool_clock(Some(now));
@@ -2708,6 +2715,9 @@ impl TranscriptStore {
     /// this `tool_id` (including a delta-buffered one) and stamps the
     /// elapsed time using the per-tool start time.
     pub(crate) fn on_tool_result(&mut self, tool_id: String, result: String) {
+        // A queued call that never started (its lane was cancelled) ends
+        // here too: untimed, it never ran.
+        self.queued_tools.remove(&tool_id);
         let now = self.event_now();
         let elapsed = self
             .tool_start_times
@@ -2766,6 +2776,64 @@ impl TranscriptStore {
             }
         }
         self.push_tool_result(tool_id, result, elapsed);
+    }
+
+    /// The card of call `tool_id` (its `ToolUse`/`ToolUseStart`), if shown.
+    fn tool_use_idx(&self, tool_id: &str) -> Option<usize> {
+        self.messages.iter().position(|m| {
+            matches!(
+                &m.msg,
+                ChatMessage::ToolUse { tool_id: tid, .. }
+                | ChatMessage::ToolUseStart { tool_id: tid, .. }
+                    if tid == tool_id
+            )
+        })
+    }
+
+    /// The engine queued call `tool_id` behind another in its scheduler
+    /// lane: it is not running. Its card stops sweeping and ticking and
+    /// says `queued` until [`Self::on_tool_started`]. Ignored for a call
+    /// without an id, or one that already has its final result.
+    pub(crate) fn on_tool_queued(&mut self, tool_id: String) {
+        if tool_id.is_empty() {
+            return;
+        }
+        let finished = self.find_tool_result_idx(&tool_id).is_some_and(|i| {
+            matches!(self.messages[i].msg, ChatMessage::ToolResult { elapsed_ms: Some(_), .. })
+        });
+        if finished {
+            return;
+        }
+        self.tool_start_times.remove(&tool_id);
+        self.queued_tools.insert(tool_id.clone());
+        if self.tool_start_times.is_empty() {
+            self.set_tool_clock(None);
+        }
+        if let Some(idx) = self.tool_use_idx(&tool_id) {
+            self.live_note(idx);
+            self.invalidate_from(idx);
+        }
+    }
+
+    /// A queued call began executing: from here its card runs like any
+    /// other, and its clock and final footer count from now. A `started`
+    /// for a call that was never queued changes nothing (today's timing).
+    pub(crate) fn on_tool_started(&mut self, tool_id: String) {
+        if !self.queued_tools.remove(&tool_id) {
+            return;
+        }
+        let now = self.event_now();
+        self.tool_start_times.insert(tool_id.clone(), now);
+        self.set_tool_clock(Some(now));
+        if let Some(idx) = self.tool_use_idx(&tool_id) {
+            self.live_note(idx);
+            self.invalidate_from(idx);
+        }
+    }
+
+    /// Whether call `tool_id` is waiting in its lane (see `queued_tools`).
+    pub(crate) fn tool_queued(&self, tool_id: &str) -> bool {
+        !tool_id.is_empty() && self.queued_tools.contains(tool_id)
     }
 
     // ── Streaming text mutations (moved in slice b′) ─────────────────────────
@@ -2907,6 +2975,12 @@ impl TranscriptStore {
             }
         }
         self.tool_start_times.retain(|id, _| {
+            self.messages.iter().any(|m| {
+                matches!(&m.msg, ChatMessage::ToolUseStart { tool_id, .. }
+                    | ChatMessage::ToolUse { tool_id, .. } if tool_id == id)
+            })
+        });
+        self.queued_tools.retain(|id| {
             self.messages.iter().any(|m| {
                 matches!(&m.msg, ChatMessage::ToolUseStart { tool_id, .. }
                     | ChatMessage::ToolUse { tool_id, .. } if tool_id == id)

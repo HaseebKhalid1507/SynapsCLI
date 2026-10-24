@@ -62,6 +62,7 @@ async fn watch(t: &mut LocalTransport, id: u64, handle_id: &str, since: u64) -> 
         query: SessionQuery::SubagentWatch {
             handle_id: handle_id.into(),
             since,
+            tool_queue: true,
         },
     })
     .await

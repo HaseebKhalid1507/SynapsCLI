@@ -77,6 +77,17 @@ pub enum WatchEvent {
         tool_id: String,
         result: String,
     },
+    /// The call waits behind another in its scheduler lane
+    /// (`LlmEvent::ToolQueued`). Only in pages a client asked for with
+    /// `tool_queue: true`: this enum has no `#[serde(other)]`, so an older
+    /// client would fail the whole page on it.
+    ToolQueued {
+        tool_id: String,
+    },
+    /// A queued call began executing (`LlmEvent::ToolStarted`). Same gate.
+    ToolStarted {
+        tool_id: String,
+    },
     /// A steering message the worker took in (from the user or its parent).
     Steered {
         text: String,
@@ -119,6 +130,12 @@ impl WatchEvent {
             StreamEvent::Llm(LlmEvent::ToolResult { tool_id, result }) => Self::ToolResult {
                 tool_id: tool_id.clone(),
                 result: cap_text(result, TOOL_PAYLOAD_MAX_BYTES),
+            },
+            StreamEvent::Llm(LlmEvent::ToolQueued { tool_id }) => Self::ToolQueued {
+                tool_id: tool_id.clone(),
+            },
+            StreamEvent::Llm(LlmEvent::ToolStarted { tool_id }) => Self::ToolStarted {
+                tool_id: tool_id.clone(),
             },
             StreamEvent::Agent(AgentEvent::SteeringDelivered { message }) => Self::Steered {
                 text: message.clone(),
@@ -165,6 +182,12 @@ impl WatchEvent {
                 tool_id: tool_id.clone(),
                 result: result.clone(),
             }),
+            Self::ToolQueued { tool_id } => StreamEvent::Llm(LlmEvent::ToolQueued {
+                tool_id: tool_id.clone(),
+            }),
+            Self::ToolStarted { tool_id } => StreamEvent::Llm(LlmEvent::ToolStarted {
+                tool_id: tool_id.clone(),
+            }),
             Self::Steered { text } => StreamEvent::Agent(AgentEvent::SteeringDelivered {
                 message: text.clone(),
             }),
@@ -189,6 +212,7 @@ impl WatchEvent {
                 } => tool_id.len() + tool_name.len() + input.to_string().len(),
                 Self::ToolResultDelta { tool_id, delta } => tool_id.len() + delta.len(),
                 Self::ToolResult { tool_id, result } => tool_id.len() + result.len(),
+                Self::ToolQueued { tool_id } | Self::ToolStarted { tool_id } => tool_id.len(),
                 Self::Failed { category } => category.len(),
             }
     }
@@ -297,6 +321,34 @@ pub struct WatchPage {
     /// `at_ms` into "this long ago". Absent from older peers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub now_ms: Option<u64>,
+}
+
+impl WatchPage {
+    /// This page for a client that did not ask for queue entries
+    /// (`SessionQuery::SubagentWatch { tool_queue: false }`, i.e. every
+    /// client that predates them): `WatchEvent` has no `#[serde(other)]`,
+    /// so such a client would fail to decode the whole page.
+    pub fn without_tool_queue(mut self) -> Self {
+        let queue = |ev: &WatchEvent| {
+            matches!(ev, WatchEvent::ToolQueued { .. } | WatchEvent::ToolStarted { .. })
+        };
+        if !self.events.iter().any(queue) {
+            return self;
+        }
+        let timed = self.at_ms.len() == self.events.len();
+        let at_ms = std::mem::take(&mut self.at_ms);
+        let events = std::mem::take(&mut self.events);
+        for (i, ev) in events.into_iter().enumerate() {
+            if queue(&ev) {
+                continue;
+            }
+            if timed {
+                self.at_ms.push(at_ms[i]);
+            }
+            self.events.push(ev);
+        }
+        self
+    }
 }
 
 impl WatchJournal {
@@ -552,6 +604,53 @@ mod tests {
             ev.size() < TOOL_PAYLOAD_MAX_BYTES + 1024,
             "tool input capped"
         );
+    }
+
+    /// The scheduler's queue signals are journaled (a worker view shows a
+    /// waiting card as queued) and replay as the same stream events.
+    #[test]
+    fn queue_signals_are_journaled_and_replay() {
+        let mut j = WatchJournal::default();
+        for ev in [
+            StreamEvent::Llm(LlmEvent::ToolQueued { tool_id: "t2".into() }),
+            StreamEvent::Llm(LlmEvent::ToolStarted { tool_id: "t2".into() }),
+        ] {
+            j.record(&ev);
+        }
+        let page = j.read(0);
+        assert_eq!(
+            page.events,
+            vec![
+                WatchEvent::ToolQueued { tool_id: "t2".into() },
+                WatchEvent::ToolStarted { tool_id: "t2".into() },
+            ]
+        );
+        assert!(matches!(
+            page.events[0].to_stream(),
+            Some(StreamEvent::Llm(LlmEvent::ToolQueued { tool_id })) if tool_id == "t2"
+        ));
+        assert!(matches!(
+            page.events[1].to_stream(),
+            Some(StreamEvent::Llm(LlmEvent::ToolStarted { tool_id })) if tool_id == "t2"
+        ));
+    }
+
+    /// A client that did not opt in gets the page without them (and their
+    /// stamps), so it decodes exactly what it did before; cursors unchanged.
+    #[test]
+    fn a_page_for_an_old_client_has_no_queue_entries() {
+        let mut j = WatchJournal::default();
+        j.push(WatchEvent::ToolUseStart { tool_id: "t2".into(), tool_name: "bash".into() });
+        j.push(WatchEvent::ToolQueued { tool_id: "t2".into() });
+        j.push(WatchEvent::ToolStarted { tool_id: "t2".into() });
+        j.push(WatchEvent::ToolResult { tool_id: "t2".into(), result: "ok".into() });
+        let full = j.read(0);
+        let old = full.clone().without_tool_queue();
+        assert_eq!(old.next_seq, full.next_seq);
+        assert_eq!(old.events.len(), 2, "{:?}", old.events);
+        assert_eq!(old.at_ms.len(), 2);
+        let json = serde_json::to_string(&old).unwrap();
+        assert!(!json.contains("tool_queued") && !json.contains("tool_started"), "{json}");
     }
 
     #[test]

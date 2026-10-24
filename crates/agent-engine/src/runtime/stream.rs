@@ -2102,6 +2102,23 @@ impl StreamMethods {
                         lanes[index].push((model_order, tool_id, tool_name, prepared));
                     }
 
+                    // Every call behind another in its lane waits for it:
+                    // say so before any lane starts, in model order, so a
+                    // client can show it as queued rather than running.
+                    // Opt-in signal — a call that leads its lane gets none,
+                    // and each queued call gets `ToolStarted` when it begins.
+                    let mut waiting: Vec<(usize, &str)> = lanes
+                        .iter()
+                        .flat_map(|lane| lane.iter().skip(1))
+                        .map(|(model_order, tool_id, _, _)| (*model_order, tool_id.as_str()))
+                        .collect();
+                    waiting.sort_unstable_by_key(|(model_order, _)| *model_order);
+                    for (_, tool_id) in waiting {
+                        let _ = tx.send(StreamEvent::Llm(LlmEvent::ToolQueued {
+                            tool_id: tool_id.to_string(),
+                        }));
+                    }
+
                     // One task per lane; calls inside a lane run
                     // SEQUENTIALLY in model order, lanes run concurrently.
                     for lane in lanes {
@@ -2141,7 +2158,14 @@ impl StreamMethods {
 
                         join_set.spawn(async move {
                             let mut lane_results: Vec<(String, bool, Option<String>, Value)> = Vec::new();
-                            for (model_order, tool_id, tool_name, prepared) in lane {
+                            let mut calls = lane.into_iter().enumerate();
+                            for (position, (model_order, tool_id, tool_name, prepared)) in calls.by_ref() {
+                            if position > 0 {
+                                // It was announced `ToolQueued`; it runs now.
+                                let _ = tx_stream.send(StreamEvent::Llm(LlmEvent::ToolStarted {
+                                    tool_id: tool_id.clone(),
+                                }));
+                            }
                             let gate_outcome = match prepared {
                                 PreparedCall::ParseError(err) => {
                                     let _ = tx_stream.send(StreamEvent::Llm(LlmEvent::ToolResult {
@@ -2329,6 +2353,16 @@ impl StreamMethods {
                                 // for any calls this lane never reached.
                                 break;
                             }
+                            }
+                            // Calls the lane never reached were announced
+                            // queued and will never start: settle them for
+                            // the UI with the cancel phrase their history
+                            // result gets, or their cards would wait forever.
+                            for (_, (_, tool_id, _, _)) in calls {
+                                let _ = tx_stream.send(StreamEvent::Llm(LlmEvent::ToolResult {
+                                    tool_id,
+                                    result: turn_completion_inner.cancel_phrase().to_string(),
+                                }));
                             }
                             lane_results
                         });
@@ -3544,6 +3578,9 @@ mod rich_output_tests {
         history: Vec<SharedMessage>,
         /// Every `ToolResult` UI preview string.
         ui_results: Vec<String>,
+        /// Per-call scheduling signals in emission order: `queued:<id>`,
+        /// `started:<id>`, `result:<id>`.
+        tool_signals: Vec<String>,
         /// Request bodies the mock saw, in order.
         bodies: Vec<Value>,
         /// The stream loop returned `Err` (fail-closed) instead of `Ok`.
@@ -3800,10 +3837,20 @@ mod rich_output_tests {
 
         let mut history = Vec::new();
         let mut ui_results = Vec::new();
+        let mut tool_signals = Vec::new();
         while let Ok(ev) = rx.try_recv() {
             match ev {
                 StreamEvent::Session(SessionEvent::MessageHistory(m)) => history = m,
-                StreamEvent::Llm(LlmEvent::ToolResult { result, .. }) => ui_results.push(result),
+                StreamEvent::Llm(LlmEvent::ToolResult { result, tool_id }) => {
+                    tool_signals.push(format!("result:{tool_id}"));
+                    ui_results.push(result)
+                }
+                StreamEvent::Llm(LlmEvent::ToolQueued { tool_id }) => {
+                    tool_signals.push(format!("queued:{tool_id}"))
+                }
+                StreamEvent::Llm(LlmEvent::ToolStarted { tool_id }) => {
+                    tool_signals.push(format!("started:{tool_id}"))
+                }
                 _ => {}
             }
         }
@@ -3818,6 +3865,7 @@ mod rich_output_tests {
         Driven {
             history,
             ui_results,
+            tool_signals,
             bodies,
             rejected,
         }
@@ -3904,10 +3952,20 @@ mod rich_output_tests {
         .expect("stream loop must finish");
         let mut history = Vec::new();
         let mut ui_results = Vec::new();
+        let mut tool_signals = Vec::new();
         while let Ok(ev) = rx.try_recv() {
             match ev {
                 StreamEvent::Session(SessionEvent::MessageHistory(m)) => history = m,
-                StreamEvent::Llm(LlmEvent::ToolResult { result, .. }) => ui_results.push(result),
+                StreamEvent::Llm(LlmEvent::ToolResult { result, tool_id }) => {
+                    tool_signals.push(format!("result:{tool_id}"));
+                    ui_results.push(result)
+                }
+                StreamEvent::Llm(LlmEvent::ToolQueued { tool_id }) => {
+                    tool_signals.push(format!("queued:{tool_id}"))
+                }
+                StreamEvent::Llm(LlmEvent::ToolStarted { tool_id }) => {
+                    tool_signals.push(format!("started:{tool_id}"))
+                }
                 _ => {}
             }
         }
@@ -3916,6 +3974,7 @@ mod rich_output_tests {
         Driven {
             history,
             ui_results,
+            tool_signals,
             bodies,
             rejected: run.is_err(),
         }
@@ -4540,6 +4599,118 @@ mod rich_output_tests {
             Value::String("seen".into()),
             "a read issued after a side-effecting call must run after it"
         );
+    }
+
+    /// Two side-effecting calls share the serial lane: the second waits.
+    /// It is announced `queued` before anything runs, `started` only after
+    /// the first call's result, and the first call (which never waits) gets
+    /// neither signal.
+    #[tokio::test]
+    async fn serial_lane_calls_signal_queued_then_started_in_order() {
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let d = drive(
+            vec![Arc::new(WriterStub(flag))],
+            &[("toolu_1", "writer_stub"), ("toolu_2", "writer_stub"), ("toolu_3", "writer_stub")],
+            Arc::new(crate::extensions::hooks::HookBus::new()),
+        )
+        .await;
+        assert_eq!(
+            d.tool_signals,
+            vec![
+                "queued:toolu_2",
+                "queued:toolu_3",
+                "result:toolu_1",
+                "started:toolu_2",
+                "result:toolu_2",
+                "started:toolu_3",
+                "result:toolu_3",
+            ],
+            "queued before any result, started right after the call ahead finished"
+        );
+    }
+
+    /// Calls that never wait get no queue signal at all: reads before the
+    /// first write keep their own concurrent lane, and the write leads its
+    /// lane.
+    #[tokio::test]
+    async fn calls_that_never_wait_get_no_queue_signals() {
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let d = drive(
+            vec![Arc::new(WriterStub(flag.clone())), Arc::new(ProbeStub(flag))],
+            &[("toolu_r", "probe_stub"), ("toolu_w", "writer_stub")],
+            Arc::new(crate::extensions::hooks::HookBus::new()),
+        )
+        .await;
+        assert!(
+            d.tool_signals.iter().all(|s| s.starts_with("result:")),
+            "{:?}",
+            d.tool_signals
+        );
+        // A read that follows a write joins its lane and does wait.
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let d = drive(
+            vec![Arc::new(WriterStub(flag.clone())), Arc::new(ProbeStub(flag))],
+            &[("toolu_w", "writer_stub"), ("toolu_r", "probe_stub")],
+            Arc::new(crate::extensions::hooks::HookBus::new()),
+        )
+        .await;
+        assert_eq!(
+            d.tool_signals,
+            vec!["queued:toolu_r", "result:toolu_w", "started:toolu_r", "result:toolu_r"]
+        );
+    }
+
+    /// Side-effecting stub that cancels the turn while it runs (the user's
+    /// Esc during the first of two serial calls).
+    struct CancellingStub;
+    #[async_trait::async_trait]
+    impl Tool for CancellingStub {
+        fn name(&self) -> &str {
+            "cancelling_stub"
+        }
+        fn description(&self) -> &str {
+            "cancels the turn mid-call"
+        }
+        fn parameters(&self) -> Value {
+            json!({"type":"object","properties":{}})
+        }
+        fn origin(&self) -> crate::tools::ToolOrigin {
+            crate::tools::ToolOrigin::Builtin
+        }
+        async fn execute(&self, _params: Value, ctx: ToolContext) -> Result<String> {
+            if let Some(cancel) = ctx.capabilities.launch_cancel.as_ref() {
+                cancel.cancel();
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            Ok("not reached".to_string())
+        }
+    }
+
+    /// A queued call the lane never reached (the call ahead was cancelled)
+    /// is settled for the UI with the same cancel phrase its history result
+    /// carries — never `started`, and never left waiting forever.
+    #[tokio::test]
+    async fn a_cancelled_lane_settles_its_unreached_queued_calls() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(CancellingStub));
+        registry.register(Arc::new(WriterStub(Arc::new(
+            std::sync::atomic::AtomicBool::new(false),
+        ))));
+        let d = drive_turn(
+            Arc::new(RwLock::new(registry)),
+            &[("toolu_c", "cancelling_stub", "{}"), ("toolu_q", "writer_stub", "{}")],
+            fresh_tool_session(),
+            Default::default(),
+            false,
+        )
+        .await;
+        assert_eq!(
+            d.tool_signals,
+            vec!["queued:toolu_q", "result:toolu_c", "result:toolu_q"],
+            "{:?}",
+            d.ui_results
+        );
+        assert_eq!(d.ui_results[0], d.ui_results[1], "same cancel phrase");
     }
 
     #[tokio::test]
