@@ -48,18 +48,17 @@ fn scenario_01_empty_boot_chrome_present() {
     let mut h = TestHarness::boot();
     let frame = h.snapshot();
 
-    // Header chrome must be present: the Ghost header's wordmark.
+    // Header chrome must be present: the header's wordmark.
     let header = frame.lines().next().unwrap_or("");
     assert!(
-        header.contains("synaps"),
-        "header wordmark 'synaps' missing on boot:\n{frame}"
+        header.contains("SynapsCLI"),
+        "header wordmark 'SynapsCLI' missing on boot:\n{frame}"
     );
 
-    // Idle session: the Ghost header shows no live state on the right
-    // (no turn clock, no indicator).
+    // Idle session: the state block shows the build, no turn clock.
     assert!(
-        !header.contains("0:0"),
-        "idle header must not show a turn clock:\n{frame}"
+        header.contains(concat!("v", env!("CARGO_PKG_VERSION"))) && !header.contains("0s"),
+        "idle header must show the build, not a turn clock:\n{frame}"
     );
 
     // No error-level toasts on a clean boot.
@@ -197,7 +196,7 @@ fn scenario_05_settings_modal_open_and_close() {
     let frame_after = h.snapshot();
     // Modal is gone — main chrome should be back.
     assert!(
-        frame_after.contains("synaps") || frame_after.contains("ready"),
+        frame_after.contains("SynapsCLI") || frame_after.contains("ready"),
         "main view should be restored after Esc closes settings modal:\n{frame_after}"
     );
     // "Settings" title block should no longer appear in the rendered frame.
@@ -228,7 +227,7 @@ fn scenario_06_models_modal_open_and_close() {
 
     let frame_after = h.snapshot();
     assert!(
-        frame_after.contains("synaps") || frame_after.contains("ready"),
+        frame_after.contains("SynapsCLI") || frame_after.contains("ready"),
         "main view should be restored after Esc closes models modal:\n{frame_after}"
     );
     assert!(
@@ -257,7 +256,7 @@ fn scenario_07_plugins_modal_open_and_close() {
 
     let frame_after = h.snapshot();
     assert!(
-        frame_after.contains("synaps") || frame_after.contains("ready"),
+        frame_after.contains("SynapsCLI") || frame_after.contains("ready"),
         "main view should be restored after Esc closes plugins modal:\n{frame_after}"
     );
     assert!(
@@ -477,7 +476,7 @@ fn scenario_13_very_wide_terminal_no_panic() {
     assert_eq!(h.render().area().height, 80);
     assert!(!frame.trim().is_empty(), "frame blank at 300×80");
     assert!(
-        frame.contains("synaps"),
+        frame.contains("SynapsCLI"),
         "header missing at 300×80 (layout overflow?):\n{frame}"
     );
 }
@@ -1477,7 +1476,7 @@ fn scenario_p7_8_secret_prompt_enter_submits_and_pops() {
         "prompt title gone after submit:\n{frame}"
     );
     assert!(
-        frame.contains("synaps") || frame.contains("ready"),
+        frame.contains("SynapsCLI") || frame.contains("ready"),
         "base chat view restored after submit:\n{frame}"
     );
 }
@@ -1828,7 +1827,7 @@ fn compound_stream_resize_modal() {
     // The replayed final frame: main view restored, modal gone, typed marker
     // present. (Substrings — no wall-clock content in this streaming-free spine.)
     assert!(
-        frame0.contains("synaps") || frame0.contains("ready"),
+        frame0.contains("SynapsCLI") || frame0.contains("ready"),
         "replayed spine must restore the main chrome:\n{frame0}"
     );
     assert!(

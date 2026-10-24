@@ -135,6 +135,14 @@ impl Threads {
     pub(crate) fn workers(&self) -> impl Iterator<Item = (&str, &WorkerThread)> {
         self.workers.iter().map(|(id, w)| (id.as_str(), w))
     }
+
+    /// Full invalidate of every worker store, focused or not. For changes
+    /// that restyle all content (a theme); see [`super::app::App::invalidate_theme`].
+    pub(crate) fn invalidate_all(&mut self) {
+        for w in self.workers.values_mut() {
+            w.store.invalidate();
+        }
+    }
 }
 
 /// The focused thread's transcript (read).

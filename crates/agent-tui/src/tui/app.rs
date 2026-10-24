@@ -183,14 +183,18 @@ pub(crate) struct App {
     pub(crate) spinner_frame: usize,
     /// Transient status text shown in the header bar (auto-cleared when streaming starts)
     pub(crate) status_text: Option<String>,
-    /// Ghost header: what the current turn is doing (stream_handler.rs).
+    /// Header: what the current turn is doing (stream_handler.rs).
     pub(crate) activity: super::header::Activity,
-    /// Ghost header: tool calls dispatched whose results are not back yet.
+    /// Header: tool calls dispatched whose results are not back yet.
     pub(crate) tools_in_flight: u32,
-    /// Ghost header: when the current turn started (`None` between turns).
+    /// Header: when the current turn started (`None` between turns).
     pub(crate) turn_started: Option<std::time::Instant>,
-    /// Ghost header: zero of the indicator animation clock.
+    /// Header: zero of the state block's sweep clock.
     pub(crate) header_epoch: std::time::Instant,
+    /// The working folder the header shows (`~`-abbreviated, read once).
+    pub(crate) header_folder: String,
+    /// Attached read-only (`--observe`): the header shows `observing`.
+    pub(crate) observing: bool,
     /// (E-P8) Thin session-driver client state: "driver armed" mirror, set
     /// purely from `DriverArmed`/`DriverRevoked` wire events. Gates Esc/Ctrl-C
     /// routing and the status toast. The actor owns all driver lifecycle.
@@ -465,6 +469,8 @@ impl App {
             tools_in_flight: 0,
             turn_started: None,
             header_epoch: std::time::Instant::now(),
+            header_folder: super::header::current_folder(),
+            observing: false,
             driver_ui: super::driver_client::DriverUiState::default(),
             gamba_child: None,
             settings: None,
@@ -714,6 +720,15 @@ impl App {
         self.needs_redraw = true;
     }
 
+    /// A theme change: like [`Self::invalidate`], but for every subagent view
+    /// too. Each worker view keeps its own line cache, so invalidating only
+    /// the main one left a worker's older tool cards and thinking blocks in
+    /// the previous palette until they happened to re-render.
+    pub(crate) fn invalidate_theme(&mut self) {
+        self.threads.invalidate_all();
+        self.invalidate();
+    }
+
     /// Mark only the tail message dirty. O(1) during streaming.
     pub(crate) fn invalidate_last(&mut self) {
         self.transcript.invalidate_last();
@@ -735,7 +750,7 @@ impl App {
         self.force_redraw = true;
     }
 
-    /// Ghost header: a turn began (pre-send or `TurnStarted` on a client
+    /// Header: a turn began (pre-send or `TurnStarted` on a client
     /// that was idle). Starts the turn clock; clears a previous failure.
     pub(crate) fn header_turn_started(&mut self) {
         self.turn_started = Some(self.clock.now());
@@ -743,7 +758,7 @@ impl App {
         self.tools_in_flight = 0;
     }
 
-    /// Ghost header: the turn ended. `failure` keeps a short label on the
+    /// Header: the turn ended. `failure` keeps a short label on the
     /// right of the header until the next turn starts.
     pub(crate) fn header_turn_ended(&mut self, failure: Option<String>) {
         self.turn_started = None;
@@ -773,6 +788,8 @@ impl App {
                 .turn_started
                 .map(|t| now.saturating_duration_since(t).as_secs()),
             anim_ms: now.saturating_duration_since(self.header_epoch).as_millis() as u64,
+            folder: self.header_folder.clone(),
+            observing: self.observing,
         }
     }
 
@@ -1015,7 +1032,7 @@ impl App {
             requested,
             std::time::Instant::now(),
         );
-        self.invalidate();
+        self.invalidate_theme();
     }
 
     /// Reconcile the background MXC subscriber with the active theme name.

@@ -106,7 +106,7 @@ fn sidecar_pill_segment(
     Span::styled(text, Style::default().fg(color).add_modifier(modifier))
 }
 
-/// Pure helper for [`sidecar_pill_spans`] — given a set of (plugin_id, display_name?)
+/// Pure helper — given a set of (plugin_id, display_name?)
 /// pairs and the registry's lifecycle claims, return the plugin ids in
 /// display order: importance desc, then display_name alphabetical, then
 /// plugin id. Pulled out so the ordering can be unit-tested without
@@ -138,7 +138,7 @@ pub(crate) fn order_sidecar_pills(
     keys.into_iter().map(|(p, _)| p.clone()).collect()
 }
 
-/// Pure helper backing [`sidecar_pill_span`] — returns the rendered
+/// Pure helper backing the sidecar pill text — returns the rendered
 /// text only. Lives separately so tests can exercise the label logic
 /// without spawning a real sidecar process or mounting the full App.
 pub(crate) fn sidecar_pill_text(
@@ -163,50 +163,6 @@ pub(crate) fn sidecar_pill_text(
         }
         super::sidecar::SidecarUiStatus::Error(_) => format!(" \u{26a0} {label} error "),
     }
-}
-
-/// One sidecar pill as the header draws it (text from
-/// [`sidecar_pill_text`]; armed/active pills pulse in the streaming colour).
-pub(crate) fn sidecar_pill_span(
-    pill: &super::render_model::SidecarPillSnap,
-    spinner_frame: usize,
-) -> Span<'static> {
-    let label = pill.display_name.as_deref().unwrap_or("sidecar");
-    let text = sidecar_pill_text(label, &pill.status, pill.armed, spinner_frame);
-    let color = match &pill.status {
-        super::sidecar::SidecarUiStatus::Idle => {
-            if pill.armed {
-                let pulse =
-                    ((spinner_frame as f64 / 18.0).sin() * 0.3 + 0.7).max(0.4);
-                let base = match THEME.load().status_streaming {
-                    Color::Rgb(r, g, b) => (r, g, b),
-                    _ => (220, 80, 80),
-                };
-                Color::Rgb(
-                    (base.0 as f64 * pulse) as u8,
-                    (base.1 as f64 * pulse) as u8,
-                    (base.2 as f64 * pulse) as u8,
-                )
-            } else {
-                THEME.load().muted
-            }
-        }
-        super::sidecar::SidecarUiStatus::Active { .. } => {
-            let pulse = ((spinner_frame as f64 / 18.0).sin() * 0.3 + 0.7).max(0.4);
-            let base = match THEME.load().status_streaming {
-                Color::Rgb(r, g, b) => (r, g, b),
-                _ => (220, 80, 80),
-            };
-            Color::Rgb(
-                (base.0 as f64 * pulse) as u8,
-                (base.1 as f64 * pulse) as u8,
-                (base.2 as f64 * pulse) as u8,
-            )
-        }
-        super::sidecar::SidecarUiStatus::Loading => THEME.load().muted,
-        super::sidecar::SidecarUiStatus::Error(_) => Color::Red,
-    };
-    Span::styled(text, Style::default().fg(color).add_modifier(Modifier::BOLD))
 }
 
 #[cfg(test)]
@@ -816,38 +772,6 @@ pub(crate) fn build_render_model(
     Some((model, patch))
 }
 
-/// Header spans for a focused worker view: `│ ◉ name · sa_N · status · hint`.
-pub(crate) fn watch_banner_spans(b: &super::watch::Banner) -> Vec<Span<'static>> {
-    let theme = THEME.load();
-    let status_fg = match b.status.as_str() {
-        "running" => theme.status_streaming,
-        "completed" => theme.subagent_done,
-        "failed" | "gone" => theme.error_color,
-        "connecting" => theme.muted,
-        _ => theme.warning_color,
-    };
-    let hint = if b.steerable {
-        " \u{00b7} Enter steers \u{00b7} Esc back "
-    } else {
-        " \u{00b7} read-only \u{00b7} Esc back "
-    };
-    vec![
-        Span::styled("\u{2502}", Style::default().fg(theme.border)),
-        Span::styled(
-            format!(" \u{25c9} {} ", b.agent_name),
-            Style::default()
-                .fg(theme.subagent_name)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!("{} \u{00b7} ", b.handle_id),
-            Style::default().fg(theme.muted),
-        ),
-        Span::styled(b.status.replace('_', " "), Style::default().fg(status_fg)),
-        Span::styled(hint, Style::default().fg(theme.muted)),
-    ]
-}
-
 /// The footer context bar's colour for this much of the window used:
 /// `border_active` under 50%, `status_streaming` under 75%, `error_color`
 /// above. With no turn yet (the bar is hidden) it is the under-50% colour.
@@ -990,12 +914,6 @@ pub(crate) fn render_frame_into(
         input: input_area,
         footer: footer_area,
     } = AppAreas::from_heights(frame.area(), subagent_height, download_height, input_height);
-
-    // ── Header ────────────────────────────────────────────────────────────
-    // Ghost header (header.rs): wordmark + pills, session in the centre,
-    // live state on the right. The row under it is the message pane's top
-    // edge, drawn as the header's lower half (`header::style_top_edge`).
-    super::header::render(frame, header_area, model);
 
     // ── Messages ──────────────────────────────────────────────────────────
     let msg_area = body;
@@ -1235,24 +1153,22 @@ pub(crate) fn render_frame_into(
         }
     }
 
-    // Scroll indicator
-    if model.scroll_back > 0 {
-        let indicator = format!(" \u{2191}{} ", model.scroll_back);
-        let mut indicator_style = Style::default().fg(THEME.load().muted);
-        if super::header::top_edge_is_half_block() {
-            // Sits on the header's lower half: hang it off the header.
-            indicator_style = indicator_style.bg(THEME.load().bg);
-        }
-        let indicator_widget = Paragraph::new(Span::styled(indicator, indicator_style))
-        .alignment(Alignment::Right);
-        let indicator_area = ratatui::layout::Rect {
-            x: msg_area.x,
-            y: msg_area.y,
-            width: msg_area.width,
-            height: 1,
-        };
-        frame.render_widget(indicator_widget, indicator_area);
-    }
+    // ── Header ────────────────────────────────────────────────────────────
+    // The neon prompt's slab hung from the top (header.rs). Its bottom rim
+    // is the message pane's top edge row, so it paints after the pane; the
+    // scrolled-back tab hangs off that rim. Same sweep as the prompt's.
+    let glow = (model.streaming && super::neon_prompt::streaming_glow_enabled()).then(|| {
+        context_bar_color(
+            &THEME.load(),
+            model.last_turn_context,
+            model.last_turn_context_window,
+        )
+    });
+    let header_rows = ratatui::layout::Rect {
+        height: header_area.height + u16::from(body.height > 0),
+        ..header_area
+    };
+    super::header::render(frame, header_rows, model, glow);
 
     // ── Input ─────────────────────────────────────────────────────────────
     // Neon prompt (neon_prompt.rs): a soft-edged slab of light with no drawn
@@ -1267,13 +1183,6 @@ pub(crate) fn render_frame_into(
         let theme = THEME.load();
         // Optional streaming glow (Settings → Streaming glow): it wears the
         // context bar's colour, so it shifts with the bar as the window fills.
-        let glow = (model.streaming && neon::streaming_glow_enabled()).then(|| {
-            context_bar_color(
-                &theme,
-                model.last_turn_context,
-                model.last_turn_context_window,
-            )
-        });
         let slab = neon::Slab::new(&theme, model.prompt_fx, input_area.width, glow);
         let text_area = ratatui::layout::Rect {
             x: input_area.x.saturating_add(inset),

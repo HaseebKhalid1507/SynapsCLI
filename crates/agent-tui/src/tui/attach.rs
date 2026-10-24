@@ -426,6 +426,7 @@ pub async fn run_attached(mut opts: AttachOpts) -> Result<()> {
     }
 
     let mut app = app_from_snapshot(&snapshot);
+    app.observing = transport.mode() == AttachMode::Observe;
     let (msgs, bytes) = super::app::scrollback_from_env(&TransportMode::Socket);
     app.transcript.set_scrollback(msgs, bytes);
     ladder("app", &"");
