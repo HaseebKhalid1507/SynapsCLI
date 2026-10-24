@@ -309,7 +309,7 @@ fn row(
     text(buf, x, y, g, gc, bg, true, right);
     let name_x = x + 2;
     let name_ink = if s.done { ink.dim } else { ink.name };
-    let name_end = text(
+    text(
         buf,
         name_x,
         y,
@@ -319,14 +319,6 @@ fn row(
         !s.done,
         name_x + name_w,
     );
-    // The worker whose view is open: underline its name.
-    if s.watched {
-        for cx in name_x..name_end {
-            if let Some(cell) = buf.cell_mut((cx, y)) {
-                cell.modifier |= Modifier::UNDERLINED;
-            }
-        }
-    }
     let step_x = name_x + name_w + 2;
 
     let time_x = text_right(buf, right, y, &clock(s.elapsed_secs), ink.dim, bg);
@@ -723,7 +715,7 @@ mod render_tests {
     }
 
     /// ctrl+↑ opens a worker's view: its tray row gets a brighter band across
-    /// the whole tray (not just an underlined name); the others stay as they are.
+    /// the whole tray (no underline); the others stay as they are.
     #[test]
     fn the_watched_worker_row_is_a_brighter_band() {
         use crossterm::event::{KeyCode, KeyModifiers};
@@ -760,6 +752,12 @@ mod render_tests {
             .find(|&x| buf[(x, y)].symbol() == "s" && buf[(x + 1, y)].symbol() == "p")
             .unwrap();
         assert_eq!(buf[(x, y)].bg, band, "the name sits on the band");
+        assert!(
+            !buf[(x, y)]
+                .modifier
+                .contains(ratatui::style::Modifier::UNDERLINED),
+            "the band marks it; no underline"
+        );
     }
 
     /// The input box is exactly as without agents (corners, padding, every
