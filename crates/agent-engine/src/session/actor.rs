@@ -494,6 +494,7 @@ fn command_name(cmd: &SessionCommand) -> &'static str {
         SessionCommand::Resume { .. } => "resume",
         SessionCommand::Checkpoint { .. } => "checkpoint",
         SessionCommand::KeepWarm { .. } => "keep_warm",
+        SessionCommand::TakeInput => "take_input",
         SessionCommand::Park => "park",
         SessionCommand::AdoptWorkers { .. } => "adopt_workers",
         SessionCommand::RestoreToolActivations { .. } => "restore_tool_activations",
@@ -4559,6 +4560,38 @@ impl SessionActor {
         self.emit(SessionEventWire::ClientJoined { client: cid, kind, name, mode });
     }
 
+    /// B1 `/takeover`: the sending client takes input in place, as an
+    /// `AttachMode::Takeover` attach would, without re-attaching. An
+    /// `Observe` client is refused (it attached read-only on purpose); the
+    /// owner, the host and unknown clients change nothing. Any turn keeps
+    /// running: only who may drive the session changes.
+    fn take_input(&mut self, from: Option<ClientId>) {
+        let Some(c) = from else { return };
+        let Some(mode) = self.attached.get(&c).map(|a| a.mode) else { return };
+        if mode == AttachMode::Observe {
+            self.emit(SessionEventWire::Refused {
+                client: c,
+                command: command_name(&SessionCommand::TakeInput).to_string(),
+                reason: "this client attached with --observe and never owns input; \
+                         attach without --observe to take it"
+                    .to_string(),
+            });
+            return;
+        }
+        if self.input_owner == Some(c) {
+            return;
+        }
+        let from = self.input_owner;
+        let reason = if from.is_some() {
+            OwnerChangeReason::Takeover
+        } else {
+            OwnerChangeReason::Attach
+        };
+        self.input_owner = Some(c);
+        self.emit(SessionEventWire::InputOwnerChanged { from, to: Some(c), reason });
+        self.publish_presence();
+    }
+
     /// Never touches `stream`/`cancel`: the turn keeps running and its
     /// events buffer in the broadcast (§8 detach-without-abort). The owner
     /// leaving passes input to the oldest attached non-`Observe` client.
@@ -4953,6 +4986,7 @@ impl SessionActor {
                     | SessionCommand::RestoreToolActivations { .. }
                     | SessionCommand::Resync { .. }
                     | SessionCommand::HostEvent(_)
+                    | SessionCommand::TakeInput
             ) && !is_close_command(&cmd) // closing a parked session must not rebuild it
                 // Unpinning a parked session only clears the flag; pinning
                 // one wakes it (a pinned session is live by definition).
@@ -5110,6 +5144,7 @@ impl SessionActor {
                     return ControlFlow::Break(reason);
                 }
             }
+            SessionCommand::TakeInput => self.take_input(from),
             SessionCommand::KeepWarm { on } => {
                 self.keep_warm = on;
                 self.meta.pinned = on; // the attach snapshot's copy

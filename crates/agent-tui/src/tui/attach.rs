@@ -108,6 +108,11 @@ fn attach_notices(i: AttachNoticeInputs<'_>) -> AttachNotices {
     }
     let attached = format!("attached to {} as client #{} ({:?})", i.session_id, i.client_id, i.mode);
     match i.owned_elsewhere {
+        // Read-only until it takes over: `/takeover` does it from here
+        // (never offered to an observer, whose `/takeover` is refused).
+        Some(owned) if i.mode != AttachMode::Observe => {
+            out.transcript.push(format!("{attached} — {owned}, or /takeover here"))
+        }
         Some(owned) => out.transcript.push(format!("{attached} — {owned}")),
         None => out.toast.insert(0, attached),
     }
@@ -592,12 +597,28 @@ mod tests {
         assert_eq!(n.transcript, vec![
             "2 other sessions in this daemon".to_string(),
             "⚠ config: unknown key `fooo`".to_string(),
-            "attached to 20261001-000000-ours as client #1 (Mirror) — input is owned by client #3 (tui)"
+            "attached to 20261001-000000-ours as client #1 (Mirror) — input is owned by client #3 (tui), or /takeover here"
                 .to_string(),
         ]);
         // read-only attach: the attach line is in the transcript, not the toast
         assert!(n.toast.iter().all(|l| !l.starts_with("attached to")), "{n:?}");
         assert_eq!(n.toast[0], "adopted the running daemon (fresh session)");
+    }
+
+    /// An observer is read-only on purpose: its attach line never offers
+    /// `/takeover` (the session refuses it from an observer).
+    #[test]
+    fn an_observer_is_not_offered_takeover() {
+        let id = SessionId::from("20261001-000000-ours".to_string());
+        let n = attach_notices(AttachNoticeInputs {
+            mode: AttachMode::Observe,
+            owned_elsewhere: Some("input is owned by client #3 (tui)".to_string()),
+            ..notice_inputs(&id, &[])
+        });
+        assert_eq!(n.transcript, vec![
+            "attached to 20261001-000000-ours as client #1 (Observe) — input is owned by client #3 (tui)"
+                .to_string(),
+        ]);
     }
 
     #[test]

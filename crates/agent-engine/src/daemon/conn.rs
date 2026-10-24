@@ -50,7 +50,9 @@ fn client_may_send(cmd: &SessionCommand, own: ClientId) -> Result<(), &'static s
         | C::SubmitPrepared { .. }
         | C::PluginCommand { .. }
         | C::Resume { .. }
-        | C::KeepWarm { .. } => Ok(()),
+        | C::KeepWarm { .. }
+        // `/takeover`: the actor checks the attach mode.
+        | C::TakeInput => Ok(()),
         // A reload checkpoint stops every worker and fences the session
         // for the exec that follows: only the daemon's own reload sends it.
         C::Checkpoint { reason: crate::session::CheckpointReason::Reload } => {
@@ -716,6 +718,13 @@ mod tests {
         assert!(client_may_send(&reload, own).is_err());
         let host = SessionCommand::Checkpoint { reason: CheckpointReason::HostRequest };
         assert!(client_may_send(&host, own).is_ok());
+    }
+
+    /// `/takeover` comes from a client by definition (the actor checks the
+    /// attach mode), so the conn lets it through.
+    #[test]
+    fn take_input_is_a_client_command() {
+        assert!(client_may_send(&SessionCommand::TakeInput, ClientId(2)).is_ok());
     }
 
     fn stream_env(ev: StreamEvent) -> Envelope {

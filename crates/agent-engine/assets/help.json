@@ -662,6 +662,24 @@
     "related": ["/pin", "/sessions"]
   },
   {
+    "id": "takeover-command",
+    "command": "/takeover",
+    "title": "Take input in this client",
+    "summary": "Take input ownership of this daemon session from the client that holds it, without re-attaching.",
+    "category": "Sessions",
+    "topic": "Command",
+    "protected": true,
+    "common": false,
+    "aliases": [],
+    "keywords": ["takeover", "take over", "input", "owner", "read-only", "attach", "client", "steal", "mirror"],
+    "lines": [
+      "When several clients are attached to one daemon session, only one owns input; the others are read-only and their prompts are refused. /takeover makes this client the owner in place, like synaps --attach --takeover but without re-attaching. The previous owner is told (\"input taken over\") and becomes read-only.",
+      "It works mid-turn: the running turn keeps going, and only who may submit, steer, cancel or change settings moves.",
+      "A client attached with --observe is read-only on purpose and cannot take over; attach without --observe instead. In-process (no daemon) there is only one client, so there is nothing to take over."
+    ],
+    "related": ["/pin", "/close", "/sessions"]
+  },
+  {
     "id": "budget-command",
     "command": "/budget",
     "title": "Turn time budget",

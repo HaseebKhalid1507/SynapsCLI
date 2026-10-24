@@ -47,6 +47,9 @@ pub struct ScriptedTransport {
     pinned: bool,
     /// `roster()`; empty unless a test sets one ([`Self::with_roster`]).
     roster: agent_engine::session::Roster,
+    /// `mode()` / `input_owner()`: this client is #1, by default the owner.
+    mode: AttachMode,
+    input_owner: Option<ClientId>,
 }
 
 impl ScriptedTransport {
@@ -91,7 +94,17 @@ impl ScriptedTransport {
             daemon_pid: 0,
             pinned: false,
             roster: Default::default(),
+            mode: AttachMode::Mirror,
+            input_owner: Some(ClientId(1)),
         }
+    }
+
+    /// Attach as `mode` with `owner` holding input (this client is #1), for
+    /// `/takeover`.
+    pub fn with_ownership(mut self, mode: AttachMode, owner: Option<ClientId>) -> Self {
+        self.mode = mode;
+        self.input_owner = owner;
+        self
     }
 
     /// The clients `roster()` reports (as an attach snapshot would).
@@ -411,6 +424,24 @@ impl ScriptedTransport {
                 };
                 self.push_event(SessionEventWire::SystemNotice(notice.to_string()));
             }
+            // = the actor's `take_input`.
+            SessionCommand::TakeInput => {
+                let me = ClientId(1);
+                if self.mode == AttachMode::Observe {
+                    self.push_event(SessionEventWire::Refused {
+                        client: me,
+                        command: "take_input".into(),
+                        reason: "this client attached with --observe and never owns input".into(),
+                    });
+                } else if self.input_owner != Some(me) {
+                    let from = self.input_owner.replace(me);
+                    self.push_event(SessionEventWire::InputOwnerChanged {
+                        from,
+                        to: Some(me),
+                        reason: agent_engine::session::OwnerChangeReason::Takeover,
+                    });
+                }
+            }
             // Turn-machine commands: recorded only (the tape feeds the
             // envelopes a real actor would answer with).
             _ => {}
@@ -470,10 +501,10 @@ impl ClientTransport for ScriptedTransport {
         ClientId(1)
     }
     fn mode(&self) -> AttachMode {
-        AttachMode::Mirror
+        self.mode
     }
     fn input_owner(&self) -> Option<ClientId> {
-        Some(ClientId(1))
+        self.input_owner
     }
     fn roster(&self) -> agent_engine::session::Roster {
         self.roster.clone()

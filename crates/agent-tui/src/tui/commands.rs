@@ -15,7 +15,7 @@ use synaps_cli::extensions::runtime::InvokeCommandEvent;
 #[allow(dead_code)]
 /// Commands that work while streaming.
 pub(super) const STREAMING_COMMANDS: &[&str] = &[
-    "gamba", "theme", "quit", "exit", "attachments", "detach", "watch", "settings", "clients",
+    "gamba", "theme", "quit", "exit", "attachments", "detach", "watch", "settings", "clients", "takeover",
 ];
 
 /// Merged list of built-ins + registered skill names (deduped, sorted).
@@ -100,6 +100,9 @@ pub(super) enum CommandAction {
     SidecarToggle { plugin_id: Option<String> },
     /// Show sidecar subsystem status (`/sidecar status`).
     SidecarStatus { plugin_id: Option<String> },
+    /// `/takeover` typed mid-stream: [`takeover`] needs the session link,
+    /// which [`handle_streaming_command`] doesn't have.
+    TakeOver,
 }
 
 #[derive(Debug, Clone)]
@@ -351,6 +354,37 @@ pub(super) fn resolve_prefix(raw: &str, commands: &[String]) -> String {
 
 /// `/pin` in an in-process TUI: the session ends with this process anyway.
 pub(super) const PIN_IN_PROCESS: &str = "pin: only applies to a daemon session (synaps --attach)";
+
+pub(super) const TAKEOVER_IN_PROCESS: &str =
+    "takeover: nothing to take over; an in-process session has one client and it owns input";
+pub(super) const TAKEOVER_OBSERVING: &str =
+    "takeover: this client is observing (--observe) and never owns input; attach without --observe to take it";
+pub(super) const TAKEOVER_ALREADY: &str = "takeover: you already own input";
+
+/// `/takeover`: take input ownership from the client that holds it, in
+/// place (the in-session form of `synaps --attach --takeover`). The session
+/// answers with `InputOwnerChanged` ("you own input" toast; the old owner
+/// gets "input taken over") or, from an observer, `Refused`. Works mid-turn:
+/// the turn keeps running, only who drives the session changes.
+pub(super) async fn takeover(app: &mut App, link: &mut super::session_link::SessionLink) {
+    let t = link.transport();
+    let note = if t.daemon_pid() == 0 {
+        Some(TAKEOVER_IN_PROCESS)
+    } else if t.mode() == agent_engine::session::AttachMode::Observe {
+        Some(TAKEOVER_OBSERVING)
+    } else if t.input_owner() == Some(t.client_id()) {
+        Some(TAKEOVER_ALREADY)
+    } else {
+        None
+    };
+    if let Some(note) = note {
+        app.push_msg(ChatMessage::System(note.to_string()));
+        return;
+    }
+    if let Err(e) = link.send(agent_engine::session::SessionCommand::TakeInput).await {
+        app.push_msg(ChatMessage::Error(format!("takeover failed: {e}")));
+    }
+}
 
 /// `/pin [on|off|status]`, alias `/keep-warm on|off`: the daemon session's
 /// pin (`KeepWarm`), not `/keepwarm` (prompt-cache pings). `on|off` is sent
@@ -837,6 +871,7 @@ async fn run_command(
         }
         "pin" | "keep-warm" => pin_command(cmd, arg, app, link).await,
         "clients" => clients(app, link),
+        "takeover" => takeover(app, link).await,
         "keepwarm" => {
             // Prompt-cache keep-warm lives on the actor (task #444):
             // `EngineCommand{keepwarm}` → status / per-session override.
@@ -1620,6 +1655,7 @@ pub(super) fn handle_streaming_command(
         // Mid-turn rules live with the rows (settings::mid_turn_refusal,
         // helpers::apply_setting's next-turn notice).
         "settings" => CommandAction::OpenSettings,
+        "takeover" => CommandAction::TakeOver,
         "attachments" => {
             let summaries = app.pending_attachments.summaries();
             if summaries.is_empty() {
@@ -2013,6 +2049,79 @@ mod tests {
             .count();
         assert_eq!(said, 2);
         assert!(log.lock().unwrap().sent.is_empty(), "nothing reaches the session");
+    }
+
+    /// `/takeover` from a read-only client sends `TakeInput`; the session's
+    /// `InputOwnerChanged` makes this client the owner. Nothing is sent
+    /// in-process, from an observer or by the owner, and each says why.
+    #[tokio::test]
+    async fn takeover_takes_input_from_another_client_and_says_why_when_it_cannot() {
+        use agent_engine::session::{AttachMode, ClientId, SessionEventWire};
+        let system_prompt_path = PathBuf::from("/tmp/synaps-test-system-prompt");
+        let registry = Arc::new(CommandRegistry::new_with_plugins(&[], vec![], vec![]));
+        let keybinds = synaps_cli::skills::keybinds::KeybindRegistry::new();
+        let scripted = || async {
+            crate::tui::testing::scripted::ScriptedTransport::new(synaps_cli::Runtime::new().await.unwrap())
+        };
+
+        // Read-only mirror, client #7 owns input: takes it.
+        let transport = scripted().await.with_daemon_pid(4242).with_ownership(AttachMode::Mirror, Some(ClientId(7)));
+        let log = Arc::clone(&transport.log);
+        let mut link = crate::tui::session_link::SessionLink::new(Box::new(transport));
+        let mut app = crate::tui::app::App::new(synaps_cli::Session::new("test", "medium", None));
+        let action =
+            handle_command("takeover", "", &mut app, &mut link, &system_prompt_path, &registry, &keybinds).await;
+        assert!(matches!(action, CommandAction::None));
+        assert_eq!(log.lock().unwrap().sent, vec!["TakeInput".to_string()]);
+        let env = link.next_event().await.expect("the owner change");
+        assert!(
+            matches!(
+                env.event,
+                SessionEventWire::InputOwnerChanged { from: Some(ClientId(7)), to: Some(ClientId(1)), .. }
+            ),
+            "{:?}",
+            env.event
+        );
+        assert_eq!(link.transport().input_owner(), Some(ClientId(1)));
+
+        // Now the owner: nothing to send.
+        handle_command("takeover", "", &mut app, &mut link, &system_prompt_path, &registry, &keybinds).await;
+        assert_eq!(log.lock().unwrap().sent.len(), 1, "the owner sends nothing");
+
+        let says = |app: &crate::tui::app::App, want: &str| {
+            app.transcript.messages().iter().any(|m| matches!(&m.msg, ChatMessage::System(s) if s == want))
+        };
+        assert!(says(&app, super::TAKEOVER_ALREADY));
+
+        // In-process and observing: a note, nothing sent.
+        for (transport, note) in [
+            (scripted().await.with_ownership(AttachMode::Mirror, Some(ClientId(7))), super::TAKEOVER_IN_PROCESS),
+            (
+                scripted().await.with_daemon_pid(4242).with_ownership(AttachMode::Observe, Some(ClientId(7))),
+                super::TAKEOVER_OBSERVING,
+            ),
+        ] {
+            let log = Arc::clone(&transport.log);
+            let mut link = crate::tui::session_link::SessionLink::new(Box::new(transport));
+            let mut app = crate::tui::app::App::new(synaps_cli::Session::new("test", "medium", None));
+            handle_command("takeover", "", &mut app, &mut link, &system_prompt_path, &registry, &keybinds).await;
+            assert!(says(&app, note), "{note}");
+            assert!(log.lock().unwrap().sent.is_empty(), "{note}: nothing reaches the session");
+        }
+        assert!(synaps_cli::skills::BUILTIN_COMMANDS.contains(&"takeover"));
+    }
+
+    /// Mid-stream `/takeover` runs (it never steers): the dispatcher gets
+    /// `TakeOver` and sends it over the link.
+    #[tokio::test]
+    async fn takeover_runs_mid_stream() {
+        let registry = CommandRegistry::new_with_plugins(&[], vec![], vec![]);
+        let mut app = crate::tui::app::App::new(synaps_cli::Session::new("test", "medium", None));
+        app.streaming = true;
+        for typed in ["/takeover", "/tak"] {
+            let r = super::resolve_streaming_input(typed, &mut app, &registry);
+            assert!(matches!(r, super::StreamingSlash::Ran(CommandAction::TakeOver)), "{typed}");
+        }
     }
 
     /// A `SessionLink` over the scripted in-memory actor (A5).
@@ -2849,6 +2958,7 @@ mod streaming_command_tests {
         let cmds = to_owned_commands(STREAMING_COMMANDS);
         for typed in [
             "theme", "th", "attachments", "detach", "quit", "gamba", "watch", "settings",
+            "takeover",
         ] {
             let cmd = resolve_prefix(typed, &cmds);
             assert!(is_streaming_command(&cmd), "/{typed} runs mid-stream");

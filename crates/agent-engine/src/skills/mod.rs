@@ -237,6 +237,8 @@ pub const BUILTIN_COMMANDS: &[&str] = &[
     "pin",
     "keep-warm",
     "clients",
+    // Take input from the daemon client that owns it (`--takeover`, in place).
+    "takeover",
     "trace",
     "memory",
     "auth",

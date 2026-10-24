@@ -1111,6 +1111,7 @@ pub(crate) async fn handle_input_action(
                     let line = self::sidecar::status(app, plugin_id.as_deref(), registry);
                     app.push_msg(ChatMessage::System(line));
                 }
+                CommandAction::TakeOver => commands::takeover(app, link).await,
             }
         }
         InputAction::Submit(input) => {
@@ -1248,6 +1249,7 @@ pub(crate) async fn handle_input_action(
                     CommandAction::Ping => {}
                     CommandAction::SidecarToggle { .. } => {}
                     CommandAction::SidecarStatus { .. } => {}
+                    CommandAction::TakeOver => commands::takeover(app, link).await,
                 },
             }
         }
