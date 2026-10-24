@@ -445,7 +445,9 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
             return;
         }
     };
+    let legacy = legacy_shared(hello.client.capabilities, snapshot.client_input);
     let snapshot = replay_for(hello.client.capabilities, snapshot);
+    let snapshot = if legacy { as_owner(client, snapshot) } else { snapshot };
     if tx.send(DaemonFrame::Attached(AttachedWire::new(client, snapshot))).await.is_err() {
         let _ = handle.send(SessionCommand::Detach { client }).await;
         return;
@@ -473,7 +475,9 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
     // the `Conversation` digest the actor emits right after is what they key on.
     let history = hello.client.history;
     let caps = hello.client.capabilities;
-    let skip = move |env: &Envelope| -> bool { !forwarded(history, caps, env) };
+    let skip = move |env: &Envelope| -> bool {
+        !forwarded(history, caps, env) || (legacy && matches!(env.event, SessionEventWire::InputOwnerChanged { .. }))
+    };
     // Not tied to `shutdown`: on daemon stop the client must still see `Ended`.
     let mut forward = tokio::spawn(async move {
         loop {
@@ -488,7 +492,6 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
                         if skip(&env) {
                             continue;
                         }
-                        let env = Envelope { event: for_client(caps, env.event), ..env };
                         if fwd_tx.send(DaemonFrame::Event(env.into())).await.is_err() {
                             break;
                         }
@@ -503,7 +506,6 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
                         continue;
                     }
                     let ended = matches!(env.event, SessionEventWire::Ended { .. });
-                    let env = Envelope { event: for_client(caps, env.event), ..env };
                     if fwd_tx.send(DaemonFrame::Event(env.into())).await.is_err() {
                         break;
                     }
@@ -684,9 +686,18 @@ fn forwarded(history: HistoryMode, caps: ClientCapabilities, env: &Envelope) -> 
 /// frame, and with it every reconnect.
 fn replay_for(caps: ClientCapabilities, mut snapshot: AttachSnapshot) -> AttachSnapshot {
     snapshot.replay.retain(|env| client_decodes(caps, &env.event));
-    for env in &mut snapshot.replay {
-        env.event = for_client(caps, std::mem::replace(&mut env.event, SessionEventWire::Idle));
+    snapshot
+}
+
+/// [`legacy_shared`]: the snapshot as an older client on a shared session
+/// gets it: it owns input unless it observes, and its replay has no owner
+/// changes (it never gets live ones either).
+fn as_owner(client: ClientId, mut snapshot: AttachSnapshot) -> AttachSnapshot {
+    let observes = snapshot.roster.iter().any(|c| c.id == client && c.mode == AttachMode::Observe);
+    if !observes {
+        snapshot.input_owner = Some(client);
     }
+    snapshot.replay.retain(|env| !matches!(env.event, SessionEventWire::InputOwnerChanged { .. }));
     snapshot
 }
 

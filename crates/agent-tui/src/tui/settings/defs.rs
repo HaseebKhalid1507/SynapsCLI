@@ -361,7 +361,7 @@ define_settings! {
         };
 
     "client_input", "Client input", Daemon, EditorKind::Cycler(&["shared", "exclusive"]),
-        "Who may type in a daemon session with several clients attached (tabs, a dashboard, a bridge): shared (default) lets every client except --observe ones send input; exclusive lets only the input owner, and the others /takeover. New sessions after next launch.",
+        "Who may type in a daemon session with several clients attached (tabs, a dashboard, a bridge): shared (default) lets every client except --observe ones send input; exclusive lets only the input owner, and the others /takeover. The daemon reads it when it starts: `synaps daemon reload` applies it.",
         |_app, value| config_edit("client_input", value);
 
     // ── Context & cache ──────────────────────────────────────────────────

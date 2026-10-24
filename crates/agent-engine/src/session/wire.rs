@@ -63,6 +63,11 @@ pub const IDLE_PROBE_QUERY_ID: u64 = RESERVED_QUERY_ID_BASE + 1;
 /// `Checkpoint` replies `QueryResult{id: CHECKPOINT_QUERY_ID, {ok:true}}`
 /// so `reload.rs` can await it per session.
 pub const CHECKPOINT_QUERY_ID: u64 = RESERVED_QUERY_ID_BASE + 2;
+/// `SettingChanged{id}` broadcast when an engine command (`/model`,
+/// `/thinking`, …) changed the view: not a reply to any client's `Set`
+/// (client ids never reach the reserved range), only the new view, so every
+/// attached client mirrors it, not just the one that typed the command.
+pub const VIEW_CHANGED_SETTING_ID: u64 = RESERVED_QUERY_ID_BASE + 3;
 /// `synaps daemon close` sends the engine command `close` under a fresh id
 /// at or above this one per request (`daemon/close.rs`) and awaits that id's
 /// `QueryResult`, so concurrent closes never take each other's reply.
@@ -1017,16 +1022,16 @@ impl From<WireSessionEvent> for SessionEventWire {
 
 // ── per-client decode gate ────────────────────────────────────────────────────
 
-/// `event` as a client with `caps` can read it, for additive variants that
-/// have an older equivalent (unlike [`client_decodes`]' events, which are
-/// dropped): `OwnerChangeReason::Input` reads as `Takeover`.
-pub fn for_client(caps: ClientCapabilities, mut event: SessionEventWire) -> SessionEventWire {
-    if let SessionEventWire::InputOwnerChanged { reason, .. } = &mut event {
-        if *reason == OwnerChangeReason::Input && !caps.owner_reason_input {
-            *reason = OwnerChangeReason::Takeover;
-        }
-    }
-    event
+/// A client that predates `client_input` (no `owner_reason_input`) on a
+/// `shared` session. It knows only the owner rule, so the daemon presents
+/// the truth in those terms: it owns input (its attach snapshot says so,
+/// unless it observes) and never sees `InputOwnerChanged`. Otherwise it
+/// would announce "input is owned by …" on attach and "input taken over"
+/// whenever another client typed, while it can type all along. Matters
+/// most after a `daemon reload` onto a new build, when every open TUI is
+/// an older client.
+pub fn legacy_shared(caps: ClientCapabilities, client_input: ClientInput) -> bool {
+    client_input == ClientInput::Shared && !caps.owner_reason_input
 }
 
 /// Whether a client that declared `caps` can decode `event` once it is a
@@ -1423,10 +1428,10 @@ mod tests {
 
     /// `client_input` on the wire: a current daemon sends it; an `Attached`
     /// from an older daemon (no field) means `Exclusive`, the owner rule it
-    /// enforces. `OwnerChangeReason::Input` reaches only clients that
-    /// declared `owner_reason_input`; the others read `Takeover`.
+    /// enforces. Only a client without `owner_reason_input` on a shared
+    /// session is presented the owner rule.
     #[test]
-    fn client_input_absent_means_exclusive_and_input_reason_is_gated() {
+    fn client_input_absent_means_exclusive_and_legacy_clients_are_presented_owners() {
         let snap = |client_input| AttachSnapshot {
             meta: meta(),
             view: view(),
@@ -1453,13 +1458,10 @@ mod tests {
         assert_eq!(s.client_input, ClientInput::Exclusive);
         assert!(s.input_owned_elsewhere(ClientId(2)).is_some(), "an older daemon's non-owner is read-only");
 
-        let ev = SessionEventWire::InputOwnerChanged { from: Some(ClientId(1)), to: Some(ClientId(2)), reason: OwnerChangeReason::Input };
-        let reason = |caps| match for_client(caps, ev.clone()) {
-            SessionEventWire::InputOwnerChanged { reason, .. } => reason,
-            other => panic!("{other:?}"),
-        };
-        assert_eq!(reason(ClientCapabilities::current()), OwnerChangeReason::Input);
-        assert_eq!(reason(ClientCapabilities::default()), OwnerChangeReason::Takeover);
+        let (old_caps, new_caps) = (ClientCapabilities::default(), ClientCapabilities::current());
+        assert!(legacy_shared(old_caps, ClientInput::Shared));
+        assert!(!legacy_shared(new_caps, ClientInput::Shared));
+        assert!(!legacy_shared(old_caps, ClientInput::Exclusive), "exclusive is the rule it knows");
     }
 
     /// The gate: a client that did not declare `tool_queue` (every client

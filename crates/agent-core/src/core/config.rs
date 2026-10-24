@@ -1221,8 +1221,9 @@ pub struct SynapsConfig {
     /// is its own window and ignores this.
     pub cache_keepwarm_auto_max_hours: u32,
     /// Who may drive a daemon session with several clients attached
-    /// (`client_input`): `shared` (default) | `exclusive`. Read when a
-    /// session starts. See [`ClientInput`].
+    /// (`client_input`): `shared` (default) | `exclusive`. The daemon reads
+    /// it at start, for every session it creates or restores. See
+    /// [`ClientInput`].
     pub client_input: ClientInput,
     /// Max TUI redraw rate in frames/sec — caps streaming redraws (e.g. 60,
     /// 144, 240). User input always redraws immediately regardless. Default

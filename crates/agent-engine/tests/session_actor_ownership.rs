@@ -812,3 +812,34 @@ async fn shared_any_drive_client_may_allow_all() {
     assert_eq!(tool_results(&last_conversation(&seen)), vec!["allowed".to_string()]);
     end(&mut a).await;
 }
+
+/// `/model` in one client (an engine command, not a `Set`) reaches every
+/// client as `SettingChanged{id: VIEW_CHANGED_SETTING_ID}` with the new
+/// view, so the other tabs' footers and model chips follow it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn an_engine_command_that_changes_the_view_reaches_every_client() {
+    let _h = Home::new();
+    let (url, _) = stub(SSE_HI, false).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+    let handle = host.create_session(shared_cfg()).await.unwrap();
+    let (mut a, _) = attach(&handle, ClientKind::Tui, AttachMode::Mirror).await;
+    let (mut b, _) = attach(&handle, ClientKind::Attach, AttachMode::Mirror).await;
+
+    a.send_from_self(SessionCommand::EngineCommand { id: 5, name: "model".into(), arg: "claude-haiku-4-5".into() })
+        .await
+        .unwrap();
+    let seen = until(&mut b, |e| matches!(e, SessionEventWire::SettingChanged(_))).await;
+    match &seen.last().unwrap().event {
+        SessionEventWire::SettingChanged(applied) => {
+            assert_eq!(applied.id, agent_engine::session::wire::VIEW_CHANGED_SETTING_ID, "not a reply to b's Set");
+            assert_eq!(applied.view.model, "claude-haiku-4-5");
+            assert!(applied.ok);
+        }
+        _ => unreachable!(),
+    }
+    // a still gets its reply.
+    until(&mut a, |e| matches!(e, SessionEventWire::QueryResult { id: 5, .. })).await;
+    end(&mut a).await;
+}

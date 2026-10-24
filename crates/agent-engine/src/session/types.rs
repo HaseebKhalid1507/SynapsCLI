@@ -351,6 +351,11 @@ pub struct SessionMeta {
     /// Every attached client, named. Empty from an older daemon.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub roster: Vec<ClientInfo>,
+    /// Who may drive ([`ClientInput`]); `None` from an older daemon (which
+    /// enforces the owner: `Exclusive`). With `Shared`, `input_owner` is the
+    /// active client, not the only one that may type.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_input: Option<ClientInput>,
     /// `conv.session.id` — differs from `id` after a LinkedSuccessor compaction.
     #[serde(default)]
     pub journal_id: String,
@@ -560,7 +565,9 @@ pub struct ClientCapabilities {
     /// `LlmEvent::ToolQueued` / `ToolStarted` (scheduler lane waits).
     #[serde(default)]
     pub tool_queue: bool,
-    /// `OwnerChangeReason::Input` (`client_input = shared`).
+    /// Knows `client_input = shared`: `OwnerChangeReason::Input` and
+    /// `Attached.client_input`. Without it, a shared session is presented
+    /// in owner terms (`wire::legacy_shared`).
     #[serde(default)]
     pub owner_reason_input: bool,
 }
@@ -1334,7 +1341,8 @@ pub enum OwnerChangeReason {
     Reload,
     /// `client_input = shared`: this client sent input, so it is now the
     /// active one. Sent only to clients declaring
-    /// `ClientCapabilities::owner_reason_input`; older ones get `Takeover`.
+    /// `ClientCapabilities::owner_reason_input`: an older one never sees an
+    /// owner change on a shared session (`wire::legacy_shared`).
     Input,
 }
 

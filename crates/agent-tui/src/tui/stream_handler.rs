@@ -641,8 +641,9 @@ pub(super) async fn handle_session_event_arm(
             super::watch::on_query_result(app, id, &value, std::time::Instant::now());
         }
         SessionEventWire::SettingChanged(_) => {
-            // Unsolicited (another client's Set): the view was refreshed by
-            // `SessionLink::note`; nothing to render.
+            // Unsolicited (another client's Set or `/model`): the view was
+            // refreshed by `SessionLink::note`; redraw so the footer shows it.
+            app.request_redraw();
         }
         SessionEventWire::Attached { .. } => {}
         // The transport's roster already took the change.
@@ -796,12 +797,17 @@ pub(super) async fn handle_session_event_arm(
                 // `/takeover` changes no turn and submitted nothing: no undo.
                 app.push_msg(ChatMessage::Error(format!("/takeover refused: {reason}")));
             } else if client == me {
-                app.push_msg(ChatMessage::Error(format!(
-                    "{command} refused: {reason}{}",
-                    takeover_hint(&reason, app.observing)
-                )));
+                let line = format!("{command} refused: {reason}{}", takeover_hint(&reason, app.observing));
+                let presented = app.streaming && app.turn_baseline == app.api_messages_len;
+                if app.streaming && !presented {
+                    // A turn is streaming (another client's, or ours before
+                    // a refused steer): an error line would split its reply.
+                    app.toasts.upsert(super::toast::Toast::new("refused", line).titled("Session"));
+                } else {
+                    app.push_msg(ChatMessage::Error(line));
+                }
                 // The pre-send presentation assumed a turn: undo it.
-                if app.streaming && app.turn_baseline == app.api_messages_len {
+                if presented {
                     app.header_turn_ended(None);
                     app.streaming = false;
             app.quit_guard.reset();

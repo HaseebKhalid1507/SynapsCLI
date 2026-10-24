@@ -434,8 +434,9 @@ pub(super) const CLIENTS_IN_PROCESS: &str = "clients: in-process session; this T
 
 /// `/clients`: every client attached to this session, from the transport's
 /// roster (attach snapshot + `ClientJoined`/`ClientLeft`), one line each:
-/// name and id, kind, `drive`/`observe`, who owns input, which is you,
-/// and how long it has been attached.
+/// name and id, kind, `drive`/`observe`, who owns input (with
+/// `client_input = shared`: who is active), which is you, and how long it
+/// has been attached.
 pub(super) fn clients(app: &mut App, link: &super::session_link::SessionLink) {
     let t = link.transport();
     if t.daemon_pid() == 0 {
@@ -443,9 +444,14 @@ pub(super) fn clients(app: &mut App, link: &super::session_link::SessionLink) {
         return;
     }
     let roster = t.roster();
+    let shared = t.client_input() == agent_engine::session::ClientInput::Shared;
     let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
     let n = roster.clients().len();
-    let mut lines = vec![format!("{n} client{} attached", if n == 1 { "" } else { "s" })];
+    let mut lines = vec![format!(
+        "{n} client{} attached{}",
+        if n == 1 { "" } else { "s" },
+        if shared { " · input shared (every drive client types; active = typed last)" } else { "" }
+    )];
     for c in roster.clients() {
         let mut row = format!(
             "  {:<20} {:<7} {}",
@@ -454,7 +460,8 @@ pub(super) fn clients(app: &mut App, link: &super::session_link::SessionLink) {
             if c.mode == agent_engine::session::AttachMode::Observe { "observe" } else { "drive" },
         );
         if t.input_owner() == Some(c.id) {
-            row.push_str(" · owns input");
+            // Shared input: everyone (but observers) types; this one did last.
+            row.push_str(if shared { " · active" } else { " · owns input" });
         }
         if c.id == t.client_id() {
             row.push_str(" · you");

@@ -850,6 +850,7 @@ impl SessionActor {
             input_owner: None,
             awaiting_input: 0,
             roster: Vec::new(),
+            client_input: None,
             journal_id: sb.session.id.clone(),
             locked_by: None,
             pinned: cfg.keep_warm,
@@ -1233,6 +1234,7 @@ impl SessionActor {
             input_owner: self.input_owner,
             awaiting_input: self.pending_prompts.len(),
             roster: self.roster(),
+            client_input: Some(self.client_input),
         }));
     }
 

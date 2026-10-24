@@ -76,6 +76,7 @@ impl ScriptedTransport {
             input_owner: Some(ClientId(1)),
             awaiting_input: 0,
             roster: Vec::new(),
+            client_input: None,
             journal_id: session.id.clone(),
             locked_by: None,
             pinned: false,

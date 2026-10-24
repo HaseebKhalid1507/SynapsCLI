@@ -528,8 +528,15 @@ async fn sessions(profile: Option<String>, json: bool) -> anyhow::Result<()> {
         println!("no sessions");
     } else {
         for m in list {
+            // Shared input: every drive client types; `*` marks the active
+            // one (typed last), so don't call it the owner.
+            let owner_key = if m.client_input == Some(agent_engine::session::ClientInput::Shared) {
+                "active"
+            } else {
+                "owner"
+            };
             println!(
-                "{}  {:?}{}  clients={}  owner={}  model={}  cwd={}  created={}{}{}",
+                "{}  {:?}{}  clients={}  {owner_key}={}  model={}  cwd={}  created={}{}{}",
                 m.id,
                 m.lifecycle,
                 if m.pinned { "  pinned" } else { "" },

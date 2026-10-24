@@ -198,12 +198,13 @@ async fn clients_are_named_in_the_roster_listing_and_refusals() {
 
 /// `client_input = shared` over the wire (multi-client-sessions §6): the
 /// snapshot says so, a second mirror's input runs, and the move of the
-/// active marker reaches a current client as `reason: Input`, but an older
-/// one (no `owner_reason_input` capability) as `Takeover`, which it can
-/// decode.
+/// active marker reaches a current client as `reason: Input`. An older
+/// client (no `owner_reason_input`) knows only the owner rule, so it is
+/// presented as owning input and never sees an owner change; and its input
+/// runs too.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
-async fn shared_input_over_the_wire_and_older_clients_read_takeover() {
+async fn shared_input_over_the_wire_and_older_clients_are_presented_owners() {
     let guard = HomeGuard::new();
     let (url, _hits, _) = spawn_stub(Script::Sse(ANTHROPIC_SSE)).await;
     std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
@@ -222,13 +223,17 @@ async fn shared_input_over_the_wire_and_older_clients_read_takeover() {
     .await;
     assert_eq!(snap.client_input, ClientInput::Shared);
     let sid = a.session_id().clone();
+    let a_id = a.client_id();
 
     // An older client: it declares no `owner_reason_input`.
     let mut old_hello = Hello::new(ClientKind::Attach);
     old_hello.client.capabilities.owner_reason_input = false;
     let conn = SocketTransport::connect(&paths.sock, old_hello).await.unwrap();
-    let (mut old, _) = SocketTransport::attach(conn, Attach::Existing { session_id: sid.clone(), mode: AttachMode::Observe }).await.unwrap();
+    let (mut old, snap_old) = SocketTransport::attach(conn, Attach::Existing { session_id: sid.clone(), mode: AttachMode::Mirror }).await.unwrap();
+    assert_eq!(snap_old.input_owner, Some(old.client_id()), "presented as the owner");
+    assert_eq!(snap_old.input_owned_elsewhere(old.client_id()), None);
     let (mut b, snap_b) = attach(&paths, ClientKind::Attach, Attach::Existing { session_id: sid.clone(), mode: AttachMode::Mirror }).await;
+    assert_eq!(snap_b.input_owner, Some(a_id), "a current client sees the real active client");
     assert_eq!(snap_b.input_owned_elsewhere(b.client_id()), None);
 
     b.send_from_self(SessionCommand::Submit { text: "from b".into(), attachments: vec![] }).await.unwrap();
@@ -236,23 +241,37 @@ async fn shared_input_over_the_wire_and_older_clients_read_takeover() {
     until(&mut b, |e| matches!(e, SessionEventWire::Idle)).await;
     let b_id = b.client_id();
     let ev = until(&mut a, |e| matches!(e, SessionEventWire::InputOwnerChanged { .. })).await;
-    let a_id = a.client_id();
     assert!(
         matches!(ev, SessionEventWire::InputOwnerChanged { from: Some(f), to: Some(t), reason: OwnerChangeReason::Input } if f == a_id && t == b_id),
         "{ev:?}"
     );
-    let ev = until(&mut old, |e| matches!(e, SessionEventWire::InputOwnerChanged { .. })).await;
-    assert!(
-        matches!(ev, SessionEventWire::InputOwnerChanged { from: Some(f), to: Some(t), reason: OwnerChangeReason::Takeover } if f == a_id && t == b_id),
-        "an older client reads Takeover: {ev:?}"
-    );
-    assert_eq!(old.input_owner(), Some(b_id));
 
-    // a was not active, and still drives.
-    a.send_from_self(SessionCommand::Submit { text: "from a".into(), attachments: vec![] }).await.unwrap();
-    until(&mut a, |e| matches!(e, SessionEventWire::TurnStarted { .. })).await;
-    until(&mut a, |e| matches!(e, SessionEventWire::Idle)).await;
+    // The older client never saw b become active (it read b's whole turn);
+    // then it drives too.
+    let old_id = old.client_id();
+    let mut owner_changes = 0;
+    owner_changes += owner_changes_through_a_turn(&mut old, old_id).await;
+    old.send_from_self(SessionCommand::Submit { text: "from old".into(), attachments: vec![] }).await.unwrap();
+    owner_changes += owner_changes_through_a_turn(&mut old, old_id).await;
+    assert_eq!(owner_changes, 0, "an older client on a shared session never sees an owner change");
+    assert_eq!(old.input_owner(), Some(old_id));
 
     d.shutdown_token().cancel();
     d.wait().await;
+}
+
+/// Reads `t` through the next turn (`TurnStarted` … `Idle`), panicking on a
+/// refusal addressed to `me`; returns how many owner changes it saw.
+async fn owner_changes_through_a_turn(t: &mut SocketTransport, me: ClientId) -> usize {
+    let (mut started, mut changes) = (false, 0);
+    loop {
+        let env = tokio::time::timeout(Duration::from_secs(10), t.next_event()).await.expect("timely").expect("open");
+        match &env.event {
+            SessionEventWire::InputOwnerChanged { .. } => changes += 1,
+            SessionEventWire::Refused { client, .. } if *client == me => panic!("refused: {:?}", env.event),
+            SessionEventWire::TurnStarted { .. } => started = true,
+            SessionEventWire::Idle if started => return changes,
+            _ => {}
+        }
+    }
 }

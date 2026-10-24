@@ -21,6 +21,18 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Every client of a daemon session can type (`client_input = shared`,
+  the default).** All clients attached to a session are the daemon's own
+  user, so a second terminal, a dashboard or a bridge no longer needs
+  `/takeover` to send a prompt, steer or abort. The client that typed last
+  is the *active* one (`/clients`, `synaps daemon sessions` show it); `--observe`
+  clients stay read-only. `client_input = exclusive` keeps the old rule
+  (only the input owner drives). The TUI header shows `N clients` when
+  another client is attached, and a client that may not type keeps its text
+  and says why in a toast instead of echoing a prompt that is then refused.
+  Older clients keep working against a newer daemon: they are told they own
+  input. See [docs/daemon-mode.md](docs/daemon-mode.md).
+
 - **Kimi K3.1 Pro and K3.1 Pro Highspeed.** The `kimi` provider's catalog
   now lists `kimi-k3.1-pro` and `kimi-k3.1-pro-highspeed` (about 2-3x the
   speed, the same intelligence). Use them as `kimi/kimi-k3.1-pro` and
@@ -131,6 +143,11 @@ All notable changes to this project will be documented in this file.
   attempt is capped at 5 s.
 
 ### Fixed
+
+- **`/model` in one client now updates every client attached to the
+  session.** The others kept the old model in their footer (and
+  `synaps daemon sessions` kept showing the model the session was created
+  with), because only a `Set` reply carried the new view.
 
 - **A daemon reload or a park no longer drops the session's activated
   tools.** Under progressive disclosure, an activated tool whose reference

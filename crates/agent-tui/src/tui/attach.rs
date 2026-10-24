@@ -699,6 +699,7 @@ mod tests {
             input_owner: None,
             awaiting_input: 0,
             roster: Vec::new(),
+            client_input: None,
             journal_id: String::new(),
             locked_by: None,
             pinned: false,
