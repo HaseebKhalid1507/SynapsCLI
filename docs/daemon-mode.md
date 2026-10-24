@@ -240,18 +240,24 @@ first's turns (last-writer-wins).
 ## Protocol summary (line-JSON over UDS, `DAEMON_MAX_FRAME_BYTES` = 64 MiB, same framing as `synaps rpc`)
 
 ```
-C: {"type":"hello", protocol_version, client:{kind,terminal,instance}, cwd, client_version}   ← MUST be first
-D: {"type":"welcome", protocol_version, daemon_version, pid, profile, sessions:[SessionMeta], progressive_tool_disclosure, generation, daemon_build}
+C: {"type":"hello", protocol_version, client:{kind,terminal,instance}, cwd, client_version, accepted_events?}   ← MUST be first
+D: {"type":"welcome", protocol_version, daemon_version, pid, profile, sessions:[SessionMeta], progressive_tool_disclosure, generation, daemon_build, features, accepted_events?}
    | {"type":"refused", reason:{reason:"version",daemon_version,min,max}|"protocol"|…, message}   → daemon closes
 C: ping | sessions | shutdown{force}          → D: pong{pid,uptime_s,sessions} | session_list{sessions} | bye   (no session allocated)
 C: close{session_id, force, attached}         → D: closed{session_id, text} | refused{busy|unknown_session} (→ daemon closes) | error
 C: pin{session_id, on}                        → D: pinned{session_id, on} | refused{busy|unknown_session} (→ daemon closes) | error
+C: children{id, session_id, sid, members}     → D: child_list{id, supported, boot_id, clk_tck, sessions:[{session_id, truncated, children:[{tool_id, tool_name, handle_id, shell_session_id, child:{pid,start_ticks,boot_id,sid,pgid}, state, exit_code, signal, members?}]}], host:[{owner_kind, owner_id, child}], refused_records, ledger_full}   (feature "children"; also on an attached connection)
+C: thinking_options{id, model, warm}          → D: thinking_options_result{id, model, options:{levels, exact, basis, default_level}}   (feature "thinking_options"; also on an attached connection)
 C: {"type":"attach", attach:"existing", session_id, mode} | {"type":"attach", attach:"create", config:SessionConfig, mode}
 D: {"type":"attached", client, meta, view, conversation, streaming, replay:[WireEnvelope], pending_prompts, clients} | error
 C: {"type":"cmd", session_id, cmd:SessionCommand} …      → D: {"type":"event", session_id, seq, ts, event:WireSessionEvent} …
 C: bye | socket close = Detach (turn keeps running)
 ```
 
+- Optional frames: `welcome.features` names the control frames this daemon answers (`children` on Linux,
+  `thinking_options`); check it before sending one. An older daemon answers one with `error` ("malformed
+  frame: unknown variant …") and keeps the connection. The events `tool_child` / `tool_child_ended` go only
+  to a connection whose `hello.accepted_events` names them; `welcome.accepted_events` echoes the ones it sends.
 - Version policy: exact match on `protocol_version` (min == max == 1) → `Refused{Version}` **loudly**
   (client exit 2). Different *binary* (version, or `daemon_build`: the commit it was built from) → allowed;
   the TUI leaves a transcript notice on attach and after every reload reconnect (an attached TUI keeps
