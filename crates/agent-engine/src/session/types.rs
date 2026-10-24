@@ -716,6 +716,12 @@ pub enum SessionCommand {
     /// (B3) pin/unpin (`/pin on|off`, `--keep-warm`, `/keep-warm on|off`,
     /// `synaps daemon pin`). Published on `SessionHandle::pinned()`.
     KeepWarm { on: bool },
+    /// (B1) `/takeover`: the sending client takes input ownership in place,
+    /// like an `--takeover` attach without re-attaching. Not an input
+    /// command (a read-only client sends it); refused from an `Observe`
+    /// client, a no-op from the owner. Emits `InputOwnerChanged{Takeover}`
+    /// (`Attach` when nobody owned input).
+    TakeInput,
     /// Host-only (never wire): park now if `can_park()` (reload rehydrates
     /// a Parked session Parked). A no-op otherwise.
     #[serde(skip)]
@@ -858,6 +864,7 @@ impl std::fmt::Debug for SessionCommand {
             }
             Self::NewSession => f.write_str("NewSession"),
             Self::Save => f.write_str("Save"),
+            Self::TakeInput => f.write_str("TakeInput"),
             Self::Park => f.write_str("Park"),
             Self::AdoptWorkers { workers } => f
                 .debug_struct("AdoptWorkers")
@@ -1583,12 +1590,15 @@ mod tests {
             },
             SessionCommand::SubagentSteer { handle_id: "sa_2".into(), text: "focus on X".into() },
             SessionCommand::DriverStart { plugin: "p".into(), command: "auto".into(), arg: "start -- hi".into() },
+            SessionCommand::TakeInput,
         ];
         for cmd in cmds {
             let json = serde_json::to_string(&cmd).unwrap();
             let back: SessionCommand = serde_json::from_str(&json).unwrap();
             assert_eq!(serde_json::to_string(&back).unwrap(), json);
         }
+        let take: SessionCommand = serde_json::from_str(r#"{"cmd":"take_input"}"#).unwrap();
+        assert!(matches!(take, SessionCommand::TakeInput));
         let cp: SessionCommand = serde_json::from_str(r#"{"cmd":"checkpoint","reason":"host_request"}"#).unwrap();
         assert!(matches!(cp, SessionCommand::Checkpoint { reason: CheckpointReason::HostRequest }));
     }

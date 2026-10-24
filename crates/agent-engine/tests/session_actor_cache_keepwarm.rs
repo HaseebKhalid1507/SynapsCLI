@@ -243,6 +243,8 @@ fn classify(cmd: &SessionCommand) -> Effect {
         | SessionCommand::Resync { .. }
         | SessionCommand::Checkpoint { .. }
         | SessionCommand::KeepWarm { .. }
+        // Moves input ownership only; the next request is unchanged.
+        | SessionCommand::TakeInput
         | SessionCommand::Park
         // Its wakes reach the event queue like any other event.
         | SessionCommand::AdoptWorkers { .. }
@@ -407,6 +409,8 @@ async fn command_matrix_read_only_keeps_period_prefix_changes_end_it() {
         ),
         ("pin", SessionCommand::KeepWarm { on: true }),
         ("unpin", SessionCommand::KeepWarm { on: false }),
+        // The owner's own `/takeover`: a no-op that must not end the period.
+        ("takeover (owner)", SessionCommand::TakeInput),
         ("cancel while idle", SessionCommand::Cancel),
         (
             "answer unknown prompt",

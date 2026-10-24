@@ -784,8 +784,14 @@ pub(super) async fn handle_session_event_arm(
                 // Steering a watched worker: nothing about the main thread's
                 // turn or input changed, so none of the undo below applies.
                 super::watch::steer_refused(app, &reason);
+            } else if client == me && command == "take_input" {
+                // `/takeover` changes no turn and submitted nothing: no undo.
+                app.push_msg(ChatMessage::Error(format!("/takeover refused: {reason}")));
             } else if client == me {
-                app.push_msg(ChatMessage::Error(format!("{command} refused: {reason}")));
+                app.push_msg(ChatMessage::Error(format!(
+                    "{command} refused: {reason}{}",
+                    takeover_hint(&reason, app.observing)
+                )));
                 // The pre-send presentation assumed a turn: undo it.
                 if app.streaming && app.turn_baseline == app.api_messages_len {
                     app.header_turn_ended(None);
@@ -1148,6 +1154,18 @@ pub(super) fn reconcile_subagents(
     }
 }
 
+/// A command refused because another client owns input: how to take it
+/// here. Never offered to an `--observe` client, whose `/takeover` is
+/// refused too.
+fn takeover_hint(reason: &str, observing: bool) -> &'static str {
+    let not_owner = reason.starts_with("input owned by") || reason.starts_with("input has no owner");
+    if not_owner && !observing {
+        " — /takeover to take input"
+    } else {
+        ""
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::sanitize_notice;
@@ -1165,6 +1183,20 @@ mod tests {
     fn test_sanitize_notice_passes_normal_text() {
         let s = "retrying (attempt 2/5) — overloaded";
         assert_eq!(sanitize_notice(s), s);
+    }
+
+    /// A refusal for not owning input names `/takeover`, except to an
+    /// observer (its `/takeover` is refused) and for unrelated refusals.
+    #[test]
+    fn refused_for_input_ownership_suggests_takeover() {
+        use super::takeover_hint;
+        assert_eq!(takeover_hint("input owned by client #1", false), " — /takeover to take input");
+        assert_eq!(
+            takeover_hint("input has no owner; attach with --takeover", false),
+            " — /takeover to take input"
+        );
+        assert_eq!(takeover_hint("input owned by client #1", true), "");
+        assert_eq!(takeover_hint("checkpoint(reload) is host-only", false), "");
     }
 }
 
