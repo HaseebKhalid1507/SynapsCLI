@@ -377,7 +377,9 @@ async fn the_cli_pins_and_unpins_a_prefix_and_reports_each_outcome_with_its_exit
     let (code, text) = cli(&guard, &run, &["sessions"]).await;
     assert_eq!(code, 0, "{text}");
     let line = text.lines().find(|l| l.starts_with(sid.as_str())).unwrap_or_else(|| panic!("{text}"));
-    assert!(line.contains("Live  pinned  clients="), "{line}");
+    // `Live  idle 0s  pinned  clients=…`: the state phrase sits between them.
+    assert!(line.contains("Live  idle "), "{line}");
+    assert!(line.contains("  pinned  clients="), "{line}");
 
     let (code, json) = cli_pin(&guard, &run, &[prefix, "--off"]).await;
     assert_eq!(code, 0, "{json}");
