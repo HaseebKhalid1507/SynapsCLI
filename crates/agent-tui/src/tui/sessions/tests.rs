@@ -345,7 +345,7 @@ fn renders_every_width_and_builtin_theme() {
     handle_event(&mut confirm, key(KeyCode::Char('x')));
     let mut past = state();
     past.tab = Tab::Past;
-    past.past.set(Ok(vec![]));
+    past.past.set_catalog(std::sync::Arc::new(agent_core::session_catalog::Catalog::default()));
     let mut down = state();
     down.apply(SessionsMsg::Live { gen: 1, result: Err("daemon unreachable".into()) }, streaming);
     let mut long = state();
@@ -447,41 +447,12 @@ fn confirm_popup_text() {
     const { assert!(CLOSE_ATTACHED, "owner decision: confirm closes even with clients attached") };
 }
 
-#[test]
-fn past_tab_lists_newest_first() {
-    let theme = crate::tui::theme::Theme::builtin_for_test("default");
-    let mut st = state();
-    st.tab = Tab::Past;
-    let info = |id: &str, title: &str, h: i64| synaps_cli::SessionInfo {
-        id: id.into(),
-        title: title.into(),
-        name: None,
-        model: "m".into(),
-        created_at: now() - chrono::Duration::hours(h + 1),
-        updated_at: now() - chrono::Duration::hours(h),
-        session_cost: 1.0,
-        message_count: 10,
-    };
-    st.past.set(Ok(vec![info("old-aaaa", "older one", 30), info("new-bbbb", "newer one", 2)]));
-    let text = render_text(&st, &theme, 120, 30);
-    assert!(text.contains("enter continue"), "{text}");
-    // Enter on the newest row asks to continue its journal.
-    handle_event(&mut st, key(KeyCode::Enter));
-    assert_eq!(st.pending_switch, Some(SwitchTarget::Continue { journal_id: "new-bbbb".into(), cwd: None }));
-    assert!(text.contains("Past 2"), "{text}");
-    assert!(text.contains("search & filters coming"), "{text}");
-    let newer = text.find("newer one").unwrap();
-    let older = text.find("older one").unwrap();
-    assert!(newer < older, "{text}");
-    assert!(text.contains("2h ago"));
-}
-
 /// Dumps the Live tab at 120 cols (`cargo test -p synaps-tui dump_live_120 -- --nocapture`).
 #[test]
 fn dump_live_120() {
     let theme = crate::tui::theme::Theme::builtin_for_test("default");
     let mut st = state();
-    st.past.set(Ok(vec![]));
+    st.past.set_catalog(std::sync::Arc::new(agent_core::session_catalog::Catalog::default()));
     println!("{}", render_text(&st, &theme, 120, 30));
 }
 

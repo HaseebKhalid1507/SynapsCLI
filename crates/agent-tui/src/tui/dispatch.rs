@@ -199,6 +199,8 @@ pub(crate) async fn handle_input_action(
     match action {
         InputAction::None => {}
         InputAction::HelpFindOutcome => {}
+        InputAction::SessionsPast(cmd) => super::sessions::past::tasks::run(app, cmd),
+        InputAction::CopyText(text) => super::input::copy_to_clipboard(&text),
         InputAction::SessionsOp(op) => {
             let socket = link.transport().socket_path().map(|p| p.to_path_buf());
             super::sessions::spawn_op(app, socket, op);

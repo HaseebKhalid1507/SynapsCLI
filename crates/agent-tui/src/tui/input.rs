@@ -35,6 +35,10 @@ pub(super) enum InputAction {
     EffortApply(super::effort::EffortApply),
     /// /sessions modal asked for a daemon pin/close (spawned by dispatch).
     SessionsOp(super::sessions::SessionsOp),
+    /// /sessions Past tab: deep search / rename on a blocking task.
+    SessionsPast(super::sessions::past::PastCmd),
+    /// Copy text to the system clipboard (/sessions `y copy id`).
+    CopyText(String),
     /// Models modal requested expanding provider models.
     ModelsExpandProvider(String),
     /// Plugins modal emitted an outcome — handled in the async main loop
@@ -294,7 +298,7 @@ fn handle_mouse(
 /// Copy text to system clipboard. Uses a singleton background thread that
 /// holds one clipboard handle for the lifetime of the app. New copies replace
 /// the previous content atomically — no thread accumulation, no races.
-fn copy_to_clipboard(text: &str) {
+pub(crate) fn copy_to_clipboard(text: &str) {
     use std::sync::{mpsc, OnceLock};
     static TX: OnceLock<mpsc::Sender<String>> = OnceLock::new();
     let sender = TX.get_or_init(|| {
@@ -745,6 +749,8 @@ fn route_sessions(event: Event, app: &mut App) -> InputAction {
                 InputAction::None
             }
             super::sessions::InputOutcome::Op(op) => InputAction::SessionsOp(op),
+            super::sessions::InputOutcome::Past(cmd) => InputAction::SessionsPast(cmd),
+            super::sessions::InputOutcome::Copy(text) => InputAction::CopyText(text),
             super::sessions::InputOutcome::None => InputAction::None,
         };
     }

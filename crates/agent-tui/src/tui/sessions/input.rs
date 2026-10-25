@@ -15,6 +15,10 @@ pub(crate) enum InputOutcome {
     Close,
     /// Run this against the daemon (dispatch spawns it).
     Op(SessionsOp),
+    /// Past-tab background work (deep search / rename; dispatch spawns it).
+    Past(super::past::PastCmd),
+    /// Put this on the clipboard (dispatch does, via the TUI's copy path).
+    Copy(String),
 }
 
 pub(crate) fn handle_event(st: &mut SessionsState, key: KeyEvent) -> InputOutcome {
@@ -23,6 +27,11 @@ pub(crate) fn handle_event(st: &mut SessionsState, key: KeyEvent) -> InputOutcom
     }
     if st.confirm.is_some() {
         return confirm_key(st, key);
+    }
+    if st.tab == Tab::Past {
+        if let Some(out) = super::past::input::handle_key(st, key) {
+            return out;
+        }
     }
     match key.code {
         KeyCode::Esc => return InputOutcome::Close,
@@ -33,24 +42,12 @@ pub(crate) fn handle_event(st: &mut SessionsState, key: KeyEvent) -> InputOutcom
             };
             return InputOutcome::None;
         }
-        // Reserved: filter (PR 3). Swallowed so it never leaks anywhere.
+        // Reserved on Live (the filter is Past-only). Swallowed so it never leaks.
         KeyCode::Char('/') => return InputOutcome::None,
         _ => {}
     }
     match st.tab {
-        Tab::Past => {
-            if key.code == KeyCode::Enter {
-                // Continue that saved journal (daemon: a new session on it, or
-                // the live one if it is already loaded; in-process: /resume).
-                if let Some(id) = st.past.selected_id() {
-                    // The placeholder list has no cwd; the catalog-backed Past sets it.
-                    st.pending_switch = Some(super::SwitchTarget::Continue { journal_id: id, cwd: None });
-                }
-            } else {
-                st.past.handle_key(key);
-            }
-            InputOutcome::None
-        }
+        Tab::Past => InputOutcome::None,
         Tab::Live => live_key(st, key),
     }
 }
@@ -162,7 +159,7 @@ pub(crate) fn hint(st: &SessionsState) -> String {
         return "y close  n cancel".into();
     }
     if st.tab == Tab::Past {
-        return st.past.hint().into();
+        return super::past::input::hint(st);
     }
     let mut h = String::from("\u{2191}\u{2193} navigate");
     let daemon = !matches!(st.source, super::LiveSource::InProcess | super::LiveSource::DaemonDown(_));

@@ -592,6 +592,10 @@ impl TestHarness {
             // Determinism: relative times and `~` are drawn against these.
             st.now = sessions_test_now();
             st.home = Some(std::path::PathBuf::from("/home/u"));
+            st.past.clock = Some(agent_core::session_catalog::Clock::fixed(
+                sessions_test_now(),
+                chrono::FixedOffset::east_opt(0).expect("utc"),
+            ));
         }
         self
     }
@@ -616,13 +620,72 @@ impl TestHarness {
         self
     }
 
-    /// Deliver the Past list answer.
-    pub fn sessions_feed_past(&mut self, rows: Vec<synaps_cli::SessionInfo>) -> &mut Self {
+    /// Load a Past catalog from a fixture sessions dir (+ index) the way the
+    /// background loader does — headers, then a synchronous preview refresh
+    /// into a cache file inside `dir`'s parent — and deliver it.
+    pub fn sessions_feed_catalog_dir(&mut self, dir: &std::path::Path, index: &std::path::Path) -> &mut Self {
+        use agent_core::session_catalog::{load_catalog, CatalogPaths, PreviewCache};
+        let paths = CatalogPaths {
+            sessions_dir: dir.to_path_buf(),
+            index_path: index.to_path_buf(),
+            cache_path: dir.with_file_name("catalog-test-previews.json"),
+        };
+        let mut cat = load_catalog(&paths).expect("fixture catalog");
+        let mut cache = PreviewCache::default();
+        let no = std::sync::atomic::AtomicBool::new(false);
+        cache.refresh(dir, &cat.entries, &no, &mut |_, _| {});
+        cat.apply_previews(&cache);
         if let Some(st) = self.app.sessions.as_mut() {
             let gen = st.gen;
-            st.apply(super::sessions::SessionsMsg::Past { gen, result: Ok(rows) }, || unreachable!());
+            let msg = super::sessions::past::PastMsg::Catalog(Ok(std::sync::Arc::new(cat)));
+            st.apply(super::sessions::SessionsMsg::Past { gen, msg }, || unreachable!());
         }
         self
+    }
+
+    /// Past rows in display order (session ids; deep mode: hit session ids).
+    pub fn sessions_past_rows(&self) -> Vec<String> {
+        let Some(st) = self.app.sessions.as_ref() else { return Vec::new() };
+        let p = &st.past;
+        match &p.deep {
+            Some(d) => d.hits.iter().map(|h| h.id.clone()).collect(),
+            None => p.derived.view.rows.iter().map(|&i| p.entries[i].id.clone()).collect(),
+        }
+    }
+
+    /// The cwd a Past `enter` asked to continue in (outer `None`: no
+    /// Continue pending; inner `None`: cwd unknown).
+    pub fn sessions_pending_continue_cwd(&self) -> Option<Option<std::path::PathBuf>> {
+        match self.app.sessions.as_ref()?.pending_switch.as_ref()? {
+            super::sessions::SwitchTarget::Continue { cwd, .. } => Some(cwd.clone()),
+            super::sessions::SwitchTarget::Attach { .. } => None,
+        }
+    }
+
+    /// The journal id a Past `enter` asked to continue, if any.
+    pub fn sessions_pending_continue(&self) -> Option<String> {
+        match self.app.sessions.as_ref()?.pending_switch.as_ref()? {
+            super::sessions::SwitchTarget::Continue { journal_id, .. } => Some(journal_id.clone()),
+            super::sessions::SwitchTarget::Attach { .. } => None,
+        }
+    }
+
+    /// Deliver a rename answer for the open rename popup.
+    pub fn sessions_feed_rename(&mut self, result: Result<(), String>) -> &mut Self {
+        if let Some(st) = self.app.sessions.as_mut() {
+            let gen = st.gen;
+            let Some(r) = st.past.rename.as_ref() else { return self };
+            let (id, name) = (r.id.clone(), Some(r.buffer.trim().to_string()).filter(|n| !n.is_empty()));
+            let msg = super::sessions::past::PastMsg::Renamed { id, name, result };
+            st.apply(super::sessions::SessionsMsg::Past { gen, msg }, || unreachable!());
+        }
+        self
+    }
+
+    /// Whether the Past rename popup is up, and its inline error.
+    pub fn sessions_rename_state(&self) -> Option<(String, Option<String>)> {
+        let r = self.app.sessions.as_ref()?.past.rename.as_ref()?;
+        Some((r.buffer.clone(), r.error.clone()))
     }
 
     /// Deliver a pin/close answer for the in-flight op.
@@ -1406,6 +1469,13 @@ impl TestHarness {
                 super::sessions::SessionsOp::Pin { id, on } => format!("sessions-pin:{id}:{on}"),
                 super::sessions::SessionsOp::Close { id, .. } => format!("sessions-close:{id}"),
             },
+            InputAction::SessionsPast(cmd) => match cmd {
+                super::sessions::past::PastCmd::Deep { search } => format!("sessions-deep:{search}"),
+                super::sessions::past::PastCmd::Rename { id, name } => {
+                    format!("sessions-rename:{id}:{}", name.unwrap_or_default())
+                }
+            },
+            InputAction::CopyText(text) => format!("copy:{text}"),
             InputAction::PluginsOutcome(_) => "plugins-outcome".to_string(),
             InputAction::OpenPluginsMarketplace => "open-plugins-marketplace".to_string(),
             InputAction::PingModels => "ping-models".to_string(),

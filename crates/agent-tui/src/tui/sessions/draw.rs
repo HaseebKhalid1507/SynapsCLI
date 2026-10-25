@@ -56,13 +56,13 @@ fn wrap2(s: &str, w: usize) -> Vec<String> {
 }
 
 /// `s` fitted then right-padded to exactly `w` cells.
-fn cell(s: &str, w: usize) -> String {
+pub(crate) fn cell(s: &str, w: usize) -> String {
     let f = fit(s, w);
     let pad = w.saturating_sub(text_w(&f));
     format!("{f}{}", " ".repeat(pad))
 }
 
-fn rcell(s: &str, w: usize) -> String {
+pub(crate) fn rcell(s: &str, w: usize) -> String {
     let f = fit(s, w);
     let pad = w.saturating_sub(text_w(&f));
     format!("{}{f}", " ".repeat(pad))
@@ -167,7 +167,7 @@ pub(crate) fn render_with(frame: &mut Frame, area: Rect, st: &SessionsState, the
                 render_detail(frame, strip, st, &p);
             }
         }
-        Tab::Past => super::past::render(frame, list, &st.past, st.now, &p),
+        Tab::Past => super::past::render(frame, list, st, &p),
     }
     if let Some(n) = &st.notice {
         let fg = if n.error { p.error } else { p.value };
@@ -198,6 +198,9 @@ pub(crate) fn render_with(frame: &mut Frame, area: Rect, st: &SessionsState, the
 
 /// Header right side: `2 streaming  1 waiting  1 idle  1 parked`.
 fn summary(st: &SessionsState) -> String {
+    if st.tab == Tab::Past {
+        return format!("sort {}", st.past.sort.label());
+    }
     let (s, wt, i, pk) = st.counts();
     let mut parts = Vec::new();
     for (n, what) in [(s, "streaming"), (wt, "waiting"), (i, "idle"), (pk, "parked")] {
@@ -211,7 +214,7 @@ fn summary(st: &SessionsState) -> String {
 fn tabs_line(st: &SessionsState, p: &Palette, width: u16) -> Line<'static> {
     let live = format!("Live {}", st.live.len());
     let past = match st.past.count() {
-        Some(n) => format!("Past {n}"),
+        Some(n) => format!("Past {}", super::past::thousands(n)),
         None => "Past \u{2026}".to_string(),
     };
     let tab = |label: String, active: bool| -> Vec<Span<'static>> {

@@ -19,6 +19,7 @@ pub mod retention;
 pub mod rpc_dispatch;
 pub mod rpc_protocol;
 pub mod session;
+pub mod session_catalog;
 pub mod session_draft;
 pub mod session_index;
 pub mod session_journal;

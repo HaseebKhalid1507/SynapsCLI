@@ -118,6 +118,8 @@ pub(crate) enum SessionsOp {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum SwitchTarget {
     Attach { id: String },
+    /// `cwd`: the journal's working directory (from `index.jsonl`, via the
+    /// catalog); `None` when unknown.
     Continue { journal_id: String, cwd: Option<std::path::PathBuf> },
 }
 
@@ -125,7 +127,7 @@ pub(crate) enum SwitchTarget {
 #[derive(Debug)]
 pub(crate) enum SessionsMsg {
     Live { gen: u64, result: Result<Vec<SessionMeta>, String> },
-    Past { gen: u64, result: Result<Vec<synaps_cli::SessionInfo>, String> },
+    Past { gen: u64, msg: past::PastMsg },
     OpDone { gen: u64, op: SessionsOp, result: Result<String, String> },
 }
 
@@ -189,6 +191,15 @@ impl SessionsState {
                 .then_with(|| a.id.0.cmp(&b.id.0))
         });
         self.live = rows;
+        // Past = disk minus every session the daemon holds (by session id
+        // and by journal id) — those are on the Live tab.
+        let live_ids: std::collections::HashSet<String> = self
+            .live
+            .iter()
+            .flat_map(|m| [m.id.0.clone(), m.journal_id.clone()])
+            .filter(|id| !id.is_empty())
+            .collect();
+        self.past.set_exclude(live_ids);
         let still = self
             .selected
             .as_ref()
@@ -269,11 +280,11 @@ impl SessionsState {
                     }
                 }
             }
-            SessionsMsg::Past { gen, result } => {
+            SessionsMsg::Past { gen, msg } => {
                 if gen != self.gen {
                     return false;
                 }
-                self.past.set(result);
+                return self.past.apply(msg);
             }
             SessionsMsg::OpDone { gen, op, result } => {
                 if gen != self.gen {
@@ -450,12 +461,15 @@ pub(crate) fn open_with(app: &mut super::app::App, own: SessionMeta, socket: Opt
         return;
     }
     let tx = app.sessions_tx.clone();
-    {
-        let tx = tx.clone();
-        tokio::task::spawn_blocking(move || {
-            let result = synaps_cli::list_recent_sessions(past::PAST_LIMIT).map_err(|e| e.to_string());
-            let _ = tx.send(SessionsMsg::Past { gen, result });
-        });
+    if let Some(st) = app.sessions.as_mut() {
+        // Past: paint the last catalog this process loaded at once (if any),
+        // then load fresh headers + refresh previews in the background.
+        let paths = agent_core::session_catalog::CatalogPaths::resolve();
+        st.past.paths = Some(paths.clone());
+        if let Some(cat) = past::tasks::last_catalog() {
+            st.past.set_catalog(cat);
+        }
+        past::tasks::spawn_load(gen, tx.clone(), paths, st.past.stop.clone());
     }
     if let Some(path) = socket {
         app.sessions_poller = Some(AbortOnDrop(tokio::spawn(poll_loop(path, gen, tx))));
@@ -515,6 +529,9 @@ pub(crate) fn spawn_op(app: &mut super::app::App, socket: Option<PathBuf>, op: S
 
 /// Close the modal: drop state, pop the stack, stop the poller.
 pub(crate) fn close(app: &mut super::app::App) {
+    if let Some(st) = app.sessions.as_mut() {
+        st.past.shutdown(); // stop the preview refresh / deep scan
+    }
     app.sessions = None;
     app.sessions_poller = None;
     app.modal_stack.remove(super::focus::PaneId::Sessions);

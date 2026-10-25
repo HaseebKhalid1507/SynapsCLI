@@ -3364,6 +3364,7 @@ dependencies = [
  "fs4",
  "futures",
  "libc",
+ "memchr",
  "rand 0.9.4",
  "reqwest",
  "serde",
