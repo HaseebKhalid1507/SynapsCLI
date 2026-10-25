@@ -211,6 +211,16 @@ pub(crate) struct App {
     pub(crate) help_find: Option<synaps_cli::help::HelpFindState>,
     /// Active /effort lightbox state (Some while /effort is open).
     pub(crate) effort: Option<super::effort::EffortModalState>,
+    /// Active /sessions modal state (Some while /sessions is open).
+    pub(crate) sessions: Option<super::sessions::SessionsState>,
+    /// Bumped on every /sessions open; background answers carry it so a late
+    /// one from an earlier open is dropped.
+    pub(crate) sessions_gen: u64,
+    /// The /sessions daemon poller (aborted on drop = when the modal closes).
+    pub(crate) sessions_poller: Option<super::sessions::AbortOnDrop>,
+    /// Background /sessions answers (daemon list, past list, pin/close).
+    pub(crate) sessions_tx: tokio::sync::mpsc::UnboundedSender<super::sessions::SessionsMsg>,
+    pub(crate) sessions_rx: tokio::sync::mpsc::UnboundedReceiver<super::sessions::SessionsMsg>,
     /// P7 modal-routing stack (finished, P7.8). The single source of input
     /// routing: `input.rs` dispatches on `modal_stack.top()`, one arm per
     /// `PaneId`. It is an *index over* the `Option<…State>` modal fields above
@@ -408,6 +418,7 @@ impl App {
     pub(crate) fn new_with_clock(session: Session, clock: super::clock::TuiClock) -> Self {
         let (ping_tx_init, ping_rx_init) = tokio::sync::mpsc::unbounded_channel();
         let (model_list_tx_init, model_list_rx_init) = tokio::sync::mpsc::unbounded_channel();
+        let (sessions_tx_init, sessions_rx_init) = tokio::sync::mpsc::unbounded_channel();
         let (extension_loader_tx_init, extension_loader_rx_init) =
             tokio::sync::mpsc::unbounded_channel();
         let (widget_tx_init, widget_rx_init) =
@@ -478,6 +489,11 @@ impl App {
             models: None,
             help_find: None,
             effort: None,
+            sessions: None,
+            sessions_gen: 0,
+            sessions_poller: None,
+            sessions_tx: sessions_tx_init,
+            sessions_rx: sessions_rx_init,
             // P7.3: wired but starts EMPTY — pure no-op until P7.4 migrates a modal.
             modal_stack: super::focus::ModalStack::new(),
             // P7.8: folded off the `run()` local; production wires the mpsc

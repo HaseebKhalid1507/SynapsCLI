@@ -32,6 +32,7 @@ mod render_model;
 mod render_thread;
 mod run_setup;
 mod session_link;
+mod sessions;
 mod settings;
 mod sidecar;
 mod signals;
@@ -237,6 +238,11 @@ pub(crate) async fn run_loop(ctx: run_setup::RunContext) -> Result<()> {
             // ── Expanded model-list results ──
             result = app.model_list_rx.recv() => {
                 loop_arms::handle_model_list_arm(&mut app, result);
+            }
+
+            // ── /sessions modal: daemon list, past list, pin/close answers ──
+            Some(msg) = app.sessions_rx.recv() => {
+                loop_arms::handle_sessions_arm(&mut app, &link, msg);
             }
 
             // ── Async extension loader progress ──

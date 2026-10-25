@@ -570,6 +570,24 @@ pub(crate) fn handle_ping_arm(
     }
 }
 
+/// /sessions arm: a background answer (daemon list, past list, pin/close).
+/// Dropped when the modal is closed or the answer is from an earlier open;
+/// a closed modal also drops a poller that outlived it.
+pub(crate) fn handle_sessions_arm(
+    app: &mut App,
+    link: &super::session_link::SessionLink,
+    msg: super::sessions::SessionsMsg,
+) {
+    let own = super::sessions::own_row(app, link);
+    let Some(st) = app.sessions.as_mut() else {
+        app.sessions_poller = None;
+        return;
+    };
+    if st.apply(msg, || own) {
+        app.request_redraw();
+    }
+}
+
 /// Expanded model-list arm: async provider model enumeration returned.
 pub(crate) fn handle_model_list_arm(
     app: &mut App,

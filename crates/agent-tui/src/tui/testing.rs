@@ -147,6 +147,11 @@ fn block_on_bounded<F: std::future::Future>(what: &str, fut: F) -> F::Output {
     })
 }
 
+/// The fixed "now" the harness pins the /sessions modal to.
+pub fn sessions_test_now() -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::<chrono::Utc>::from_timestamp(1_800_000_000, 0).unwrap_or_default()
+}
+
 impl Drop for TestHarness {
     fn drop(&mut self) {
         // `set_build_id` is per harness, not per thread.
@@ -481,6 +486,89 @@ impl TestHarness {
         self
     }
 
+    /// Open the `/sessions` modal the way dispatch does. `socket = None` is
+    /// the in-process TUI; `Some(_)` puts the Live tab in daemon mode
+    /// ("asking the daemon…") — the harness has no runtime, so no poller
+    /// runs: feed answers with [`Self::sessions_feed_live`].
+    pub fn open_sessions_with(&mut self, socket: Option<std::path::PathBuf>) -> &mut Self {
+        let own = super::sessions::own_row(&self.app, &self.link);
+        super::sessions::open_with(&mut self.app, own, socket);
+        if let Some(st) = self.app.sessions.as_mut() {
+            // Determinism: relative times and `~` are drawn against these.
+            st.now = sessions_test_now();
+            st.home = Some(std::path::PathBuf::from("/home/u"));
+        }
+        self
+    }
+
+    /// The id of this harness's own session (as the Live tab sees it).
+    pub fn own_session_id(&self) -> String {
+        self.link.transport().session_id().0.clone()
+    }
+
+    /// Deliver a daemon list answer through the production arm logic
+    /// (`SessionsState::apply`), as the poller would.
+    pub fn sessions_feed_live(
+        &mut self,
+        result: Result<Vec<agent_engine::session::SessionMeta>, String>,
+    ) -> &mut Self {
+        let own = super::sessions::own_row(&self.app, &self.link);
+        if let Some(st) = self.app.sessions.as_mut() {
+            let gen = st.gen;
+            st.apply(super::sessions::SessionsMsg::Live { gen, result }, || own);
+            st.now = sessions_test_now();
+        }
+        self
+    }
+
+    /// Deliver the Past list answer.
+    pub fn sessions_feed_past(&mut self, rows: Vec<synaps_cli::SessionInfo>) -> &mut Self {
+        if let Some(st) = self.app.sessions.as_mut() {
+            let gen = st.gen;
+            st.apply(super::sessions::SessionsMsg::Past { gen, result: Ok(rows) }, || unreachable!());
+        }
+        self
+    }
+
+    /// Deliver a pin/close answer for the in-flight op.
+    pub fn sessions_feed_op(&mut self, result: Result<String, String>) -> &mut Self {
+        if let Some(st) = self.app.sessions.as_mut() {
+            let gen = st.gen;
+            let op = st.pending.clone().unwrap_or(super::sessions::SessionsOp::Pin { id: String::new(), on: true });
+            st.apply(super::sessions::SessionsMsg::OpDone { gen, op, result }, || unreachable!());
+        }
+        self
+    }
+
+    /// Mark a pin/close as in flight (what `spawn_op` does before its task).
+    pub fn sessions_mark_pending(&mut self, op_close_id: &str) -> &mut Self {
+        if let Some(st) = self.app.sessions.as_mut() {
+            let label = st
+                .live
+                .iter()
+                .find(|m| m.id.0 == op_close_id)
+                .map(super::sessions::label)
+                .unwrap_or_else(|| op_close_id.to_string());
+            st.pending = Some(super::sessions::SessionsOp::Close { id: op_close_id.to_string(), label });
+        }
+        self
+    }
+
+    /// Whether the /sessions modal is open.
+    pub fn sessions_open(&self) -> bool {
+        self.app.sessions.is_some()
+    }
+
+    /// Whether the close-confirm popup is up.
+    pub fn sessions_confirm_open(&self) -> bool {
+        self.app.sessions.as_ref().is_some_and(|s| s.confirm.is_some())
+    }
+
+    /// The inline notice line, if any.
+    pub fn sessions_notice(&self) -> Option<String> {
+        self.app.sessions.as_ref().and_then(|s| s.notice.as_ref().map(|n| n.text.clone()))
+    }
+
     /// Open the models modal directly.
     pub fn open_models_modal(&mut self) -> &mut Self {
         self.app.models = Some(super::models::ModelsModalState::new());
@@ -653,6 +741,7 @@ impl TestHarness {
             PaneId::Chat => "chat",
             PaneId::HelpFind => "help-find",
             PaneId::Effort => "effort",
+            PaneId::Sessions => "sessions",
             PaneId::Models => "models",
             PaneId::Plugins => "plugins",
             PaneId::Settings => "settings",
@@ -1058,6 +1147,9 @@ impl TestHarness {
                 StreamingSlash::Ran(CommandAction::OpenSettings) => {
                     super::settings::open_modal(&mut self.app);
                 }
+                StreamingSlash::Ran(CommandAction::OpenSessions) => {
+                self.open_sessions_with(None);
+            }
                 StreamingSlash::Ran(CommandAction::Quit) => self.quit_requested = true,
                 StreamingSlash::Ran(_) => {}
             }
@@ -1141,6 +1233,9 @@ impl TestHarness {
                 self.app.modal_stack.push(super::focus::PaneId::Models);
             }
             CommandAction::OpenSettings => super::settings::open_modal(&mut self.app),
+            CommandAction::OpenSessions => {
+                self.open_sessions_with(None);
+            }
             CommandAction::OpenPlugins => {
                 // Production loads plugins.json from disk; the harness opens
                 // the deterministic default state instead of touching $HOME.
@@ -1212,6 +1307,10 @@ impl TestHarness {
                 apply.model, apply.generation, apply.value
             ),
             InputAction::ModelsExpandProvider(p) => format!("models-expand:{p}"),
+            InputAction::SessionsOp(op) => match op {
+                super::sessions::SessionsOp::Pin { id, on } => format!("sessions-pin:{id}:{on}"),
+                super::sessions::SessionsOp::Close { id, .. } => format!("sessions-close:{id}"),
+            },
             InputAction::PluginsOutcome(_) => "plugins-outcome".to_string(),
             InputAction::OpenPluginsMarketplace => "open-plugins-marketplace".to_string(),
             InputAction::PingModels => "ping-models".to_string(),
