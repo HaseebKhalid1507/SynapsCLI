@@ -18,7 +18,7 @@ use agent_engine::extensions::hooks::HookBus;
 use agent_engine::extensions::manager::ExtensionManager;
 use agent_engine::tools::activation::{activate_exact_for_user, SessionId, SessionToolSet};
 use agent_engine::tools::catalog::ToolId;
-use agent_engine::tools::ToolRegistry;
+use agent_engine::tools::{ToolCapabilities, ToolChannels, ToolContext, ToolLimits, ToolRegistry};
 use serde_json::{json, Value};
 
 const PLUGIN: &str = "reload-fixture";
@@ -426,6 +426,77 @@ async fn a_reload_can_switch_between_eager_and_deferred() {
     let report = mgr.reload_from_disk(PLUGIN).await.expect("deferred -> eager");
     assert!(!report.deferred);
     assert_eq!(names(&registry, PLUGIN).await, vec![search]);
+
+    mgr.shutdown_all().await;
+}
+
+fn tool_context() -> ToolContext {
+    ToolContext {
+        channels: ToolChannels {
+            tx_delta: None,
+            tx_events: None,
+        },
+        capabilities: ToolCapabilities {
+            session_allow_all: None,
+            launch_cancel: None,
+            memory_backend: None,
+            telemetry: None,
+            watcher_exit_path: None,
+            tool_register_tx: None,
+            session_manager: None,
+            subagent_registry: None,
+            event_queue: None,
+            delegation_parent: None,
+            codex_parent_plan: None,
+            secret_prompt: None,
+            orchestration: None,
+            tool_activation: None,
+            mcp_leases: None,
+            extension_leases: None,
+            memory_context: None,
+            cwd: None,
+            env: None,
+            env_stripped: Vec::new(),
+            env_warned: Default::default(),
+            session_id: None,
+        },
+        limits: ToolLimits {
+            max_tool_output: 30000,
+            max_tool_buffer: 256 * 1024,
+            bash_timeout: 30,
+            bash_max_timeout: 300,
+            subagent_timeout: 300,
+        },
+    }
+}
+
+/// A call authorized before a reload (its tool fetched first, as a tool
+/// call batched with the `reload-extension` that replaces it is) fails
+/// after it. The stopped instance does not respawn and run a second copy of
+/// the extension beside its replacement; the replacement serves the call.
+#[tokio::test]
+#[serial_test::serial(reload_plugins_root)]
+async fn a_call_authorized_before_a_reload_fails_without_respawning_the_old_instance() {
+    let root = plugins_root();
+    let fx = install(&root, PLUGIN, &["search"]);
+    let (mut mgr, registry) = discovered().await;
+    let search = format!("{PLUGIN}:search");
+    let old = registry.read().await.get(&search).cloned().expect("registered");
+
+    mgr.reload_from_disk(PLUGIN).await.expect("reload");
+    assert_eq!(fx.count("spawn"), 2);
+
+    let err = old
+        .execute(json!({}), tool_context())
+        .await
+        .expect_err("the stopped instance refuses the call");
+    assert!(err.to_string().contains("was stopped"), "{err}");
+    assert_eq!(fx.count("spawn"), 2, "no second copy of the extension started");
+
+    let new = registry.read().await.get(&search).cloned().expect("replaced");
+    let out = new.execute(json!({}), tool_context()).await.expect("the new instance answers");
+    assert!(out.contains("called:search"), "{out}");
+    assert_eq!(fx.count("spawn"), 2);
 
     mgr.shutdown_all().await;
 }
