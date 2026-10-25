@@ -345,6 +345,7 @@ pub(crate) async fn run_loop(ctx: run_setup::RunContext) -> Result<()> {
                         if dispatch::handle_input_action(action, state).await.is_break() {
                             break;
                         }
+                        loop_arms::drain_session_switch(&mut app, &mut link, &mut prompt_bridge, &registry, &render_handle).await;
                     }
                     // FIX C (defense in depth): EventStream yields Err or None when
                     // crossterm detects the PTY is gone. Break cleanly here.

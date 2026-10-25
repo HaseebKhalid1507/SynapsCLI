@@ -784,6 +784,57 @@ impl App {
         self.activity = failure.map_or(super::header::Activity::Idle, super::header::Activity::Failed);
     }
 
+    /// Forget everything that belonged to the session this TUI was showing,
+    /// before a `/sessions` switch mirrors another one (the snapshot then
+    /// refills the conversation mirrors, header and transcript). App-wide
+    /// state — theme, config, keybinds, the input draft, input history,
+    /// sidecars, model caches — stays.
+    pub(crate) fn reset_for_session_switch(&mut self) {
+        super::watch::reset(self);
+        self.transcript.clear();
+        self.invalidate();
+        self.subagents.clear();
+        self.subagent_rows.clear();
+        self.queued_message = None;
+        self.pending_attachments.clear();
+        self.compaction_applied = None;
+        self.resume_pending = None;
+        self.last_submitted = None;
+        self.status_text = None;
+        self.streaming = false;
+        self.compacting = false;
+        self.header_turn_ended(None);
+        self.turn_baseline = 0;
+        self.spinner_frame = 0;
+        self.quit_guard.reset();
+        self.session_ended = None;
+        self.observing = false;
+        self.consecutive_auto_turns = 0;
+        self.pending_events_len = 0;
+        // Accounting mirrors: per-turn counters + cache stats.
+        self.api_messages_len = 0;
+        self.input_tokens = 0;
+        self.output_tokens = 0;
+        self.total_input_tokens = 0;
+        self.total_output_tokens = 0;
+        self.total_cache_read_tokens = 0;
+        self.total_cache_creation_tokens = 0;
+        self.total_cache_write_5m = 0;
+        self.total_cache_write_1h = 0;
+        self.last_turn_context = 0;
+        self.api_call_count = 0;
+        self.session_cost = 0.0;
+        self.keepwarm_cost = 0.0;
+        self.keepwarm_tokens = Default::default();
+        self.response_preview = None;
+        // Prompts of the old session: the pane closes without answering.
+        self.secret_prompts = synaps_cli::tools::SecretPromptQueue::new();
+        // Toasts that described the old session.
+        for id in ["attach", "input-owner", "lifecycle", "confirms-waiting", "watch", "driver"] {
+            self.toasts.dismiss(id);
+        }
+    }
+
     /// True while the header animates (so the tick asks for redraws).
     pub(crate) fn header_animating(&self) -> bool {
         self.streaming

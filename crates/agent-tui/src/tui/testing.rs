@@ -64,6 +64,9 @@ pub mod tape;
 /// `Runtime`; envelopes fed by tests).
 #[path = "testing/scripted.rs"]
 pub mod scripted;
+/// A scripted daemon answering `/sessions` switches (`use_fake_daemon`).
+#[path = "testing/fake_daemon.rs"]
+pub mod fake_daemon;
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 use ratatui::backend::{CrosstermBackend, TestBackend};
@@ -114,6 +117,9 @@ pub struct TestHarness {
     /// Lines typed while streaming, awaiting [`Self::drive_streaming_input`].
     pending_streaming: Vec<String>,
     quit_requested: bool,
+    /// When set, `/sessions` switches go through this scripted daemon; when
+    /// not, the harness behaves as an in-process TUI (no daemon).
+    fake_daemon: Option<fake_daemon::FakeDaemon>,
 }
 
 /// Hard upper bound on any single bounded async drive (P6.3). A slash
@@ -211,6 +217,7 @@ impl TestHarness {
             pending_slash: Vec::new(),
             pending_streaming: Vec::new(),
             quit_requested: false,
+            fake_daemon: None,
         }
     }
 
@@ -263,6 +270,78 @@ impl TestHarness {
             3,
         );
         self.record(action);
+        // Production drains a /sessions switch right after the input action.
+        self.drive_session_switch();
+        self
+    }
+
+    // ── /sessions switching ──────────────────────────────────────────────────
+
+    /// Put a scripted daemon behind `/sessions` switching (and return a
+    /// handle to stage its sessions / read what was sent).
+    pub fn use_fake_daemon(&mut self) -> fake_daemon::FakeDaemon {
+        let d = fake_daemon::FakeDaemon::default();
+        self.fake_daemon = Some(d.clone());
+        d
+    }
+
+    /// Select a Live row by session id (what ↑/↓ would land on).
+    pub fn sessions_select(&mut self, id: &str) -> &mut Self {
+        if let Some(st) = self.app.sessions.as_mut() {
+            st.selected = Some(id.to_string());
+        }
+        self
+    }
+
+    /// Subagent rows in the tray (`app.subagents`).
+    pub fn subagent_count(&self) -> usize {
+        self.app.subagents.len()
+    }
+
+    /// The queued (steer) message the footer shows, if any.
+    pub fn queued_message(&self) -> Option<String> {
+        self.app.queued_message.clone()
+    }
+
+    /// The header's session name.
+    pub fn session_name(&self) -> Option<String> {
+        self.app.session.name.clone()
+    }
+
+    /// What the Past tab's Enter does: ask to continue a saved journal.
+    pub fn request_continue(&mut self, journal_id: &str) -> &mut Self {
+        if let Some(st) = self.app.sessions.as_mut() {
+            st.pending_switch =
+                Some(super::sessions::SwitchTarget::Continue { journal_id: journal_id.to_string() });
+        }
+        self.drive_session_switch()
+    }
+
+    /// Drain a pending `/sessions` switch through the production
+    /// `sessions::switch::perform` (bounded), as the run loop does.
+    pub fn drive_session_switch(&mut self) -> &mut Self {
+        let Some(target) = self.app.sessions.as_mut().and_then(|s| s.pending_switch.take()) else {
+            return self;
+        };
+        let render_handle = super::render_thread::RenderHandle::headless();
+        let daemon = self.fake_daemon.clone();
+        block_on_bounded(
+            "sessions::switch::perform",
+            super::sessions::switch::perform(
+                &mut self.app,
+                &mut self.link,
+                &mut self.prompt_bridge,
+                target,
+                daemon.as_ref().map(|d| d as &dyn super::sessions::switch::Connector),
+                &self.registry,
+                &render_handle,
+            ),
+        );
+        // `sent_commands` follows the session now on screen.
+        let id = self.link.transport().session_id().0.clone();
+        if let Some(log) = daemon.as_ref().and_then(|d| d.log_of(&id)) {
+            self.scripted_log = log;
+        }
         self
     }
 

@@ -404,7 +404,11 @@ fn render_confirm(frame: &mut Frame, area: Rect, c: &super::ConfirmClose, p: &Pa
     let why = if c.clients == 0 {
         "it saves and ends; continue it later from Past".to_string()
     } else if super::CLOSE_ATTACHED {
-        format!("its TUI client{} will exit", if c.clients == 1 { "" } else { "s" })
+        if c.clients == 1 {
+            "its TUI client will exit (1 attached)".to_string()
+        } else {
+            format!("its TUI clients will exit ({} attached)", c.clients)
+        }
     } else {
         format!(
             "{} client{} attached \u{2014} the daemon refuses until {} detach{}",

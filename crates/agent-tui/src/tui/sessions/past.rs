@@ -71,8 +71,17 @@ impl PastState {
         }
     }
 
+    /// The selected saved session's id (Enter continues it).
+    pub(crate) fn selected_id(&self) -> Option<String> {
+        self.rows.as_ref()?.get(self.cursor).map(|r| r.id.clone())
+    }
+
     pub(crate) fn hint(&self) -> &'static str {
-        "\u{2191}\u{2193} navigate  tab live  esc close"
+        if self.rows.as_ref().is_some_and(|r| !r.is_empty()) {
+            "\u{2191}\u{2193} navigate  enter continue  tab live  esc close"
+        } else {
+            "\u{2191}\u{2193} navigate  tab live  esc close"
+        }
     }
 }
 

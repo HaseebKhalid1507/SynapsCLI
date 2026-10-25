@@ -15,6 +15,7 @@
 pub(crate) mod draw;
 pub(crate) mod input;
 pub(crate) mod past;
+pub(crate) mod switch;
 
 pub(crate) use draw::render;
 pub(crate) use input::{handle_event, InputOutcome};
@@ -28,10 +29,12 @@ use std::time::Duration;
 pub(crate) const POLL_EVERY: Duration = Duration::from_secs(1);
 /// One poll's budget: a wedged daemon must not stall the poller forever.
 const POLL_TIMEOUT: Duration = Duration::from_secs(3);
-/// `Close{attached}` sent from the modal. `false`: the daemon refuses to
-/// close a session that has clients attached, and the refusal is shown
-/// inline — the modal never kicks another terminal's TUI by itself.
-pub(crate) const CLOSE_ATTACHED: bool = false;
+/// `Close{attached}` sent from the modal (owner decision: "x closes another
+/// live session — with confirm"). `true`: after the confirm popup — which
+/// says the session's TUI clients will exit — the daemon closes it even with
+/// clients attached. `force` is never sent: a busy session (turn,
+/// compaction, workers) is still refused, inline.
+pub(crate) const CLOSE_ATTACHED: bool = true;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Tab {
@@ -110,7 +113,6 @@ pub(crate) enum SessionsOp {
 /// - `Continue`: a saved journal. The daemon creates a session continuing it
 ///   (`Attach::Create{continue_session}`); if that journal is already live in
 ///   the daemon, the loop attaches to the live one instead. Set by the Past tab.
-#[allow(dead_code)] // contract: the switch itself lands in the next commit
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum SwitchTarget {
     Attach { id: String },
@@ -144,7 +146,6 @@ pub(crate) struct SessionsState {
     pub(crate) pending: Option<SessionsOp>,
     /// A switch requested by Enter (Live → `Attach`, Past → `Continue`),
     /// drained by the dispatch loop.
-    #[allow(dead_code)] // contract: drained in the next commit
     pub(crate) pending_switch: Option<SwitchTarget>,
     pub(crate) past: past::PastState,
     /// Wall clock the relative times are drawn against (set on every poll

@@ -3,8 +3,8 @@
 //! `tab` switches Live/Past, `esc` closes (or cancels the confirm popup),
 //! `p` pins/unpins the selected session, `x` asks to close another one —
 //! always through the confirm popup, never for this TUI's own session.
-//! `enter` (switch to that session) lands in PR 4; `/` is reserved for the
-//! filter.
+//! `enter` switches this TUI to the selected session (`pending_switch`,
+//! drained by the run loop); `/` is reserved for the filter.
 
 use super::{ConfirmClose, Notice, RowState, SessionsOp, SessionsState, Tab};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -39,7 +39,15 @@ pub(crate) fn handle_event(st: &mut SessionsState, key: KeyEvent) -> InputOutcom
     }
     match st.tab {
         Tab::Past => {
-            st.past.handle_key(key);
+            if key.code == KeyCode::Enter {
+                // Continue that saved journal (daemon: a new session on it, or
+                // the live one if it is already loaded; in-process: /resume).
+                if let Some(id) = st.past.selected_id() {
+                    st.pending_switch = Some(super::SwitchTarget::Continue { journal_id: id });
+                }
+            } else {
+                st.past.handle_key(key);
+            }
             InputOutcome::None
         }
         Tab::Live => live_key(st, key),
@@ -53,6 +61,7 @@ fn live_key(st: &mut SessionsState, key: KeyEvent) -> InputOutcome {
         KeyCode::Home => st.move_selection(isize::MIN / 2),
         KeyCode::End => st.move_selection(isize::MAX / 2),
         KeyCode::Char('p') => return pin(st),
+        KeyCode::Enter => ask_switch(st),
         KeyCode::Char('x') => ask_close(st),
         _ => {}
     }
@@ -114,6 +123,24 @@ fn ask_close(st: &mut SessionsState) {
     st.confirm = Some(ConfirmClose { id, label, clients });
 }
 
+/// Enter on a Live/Parked row: switch this TUI to it (the run loop drains
+/// `pending_switch`). Not your own row; not without a daemon.
+fn ask_switch(st: &mut SessionsState) {
+    if no_daemon(st) {
+        return;
+    }
+    let Some(m) = st.selected_meta() else { return };
+    if st.is_own(m) {
+        st.notice = Some(Notice { text: "already on this session".into(), error: false });
+        return;
+    }
+    if m.lifecycle == agent_engine::session::SessionLifecycle::Ending {
+        st.notice = Some(Notice { text: format!("{} is ending", super::label(m)), error: true });
+        return;
+    }
+    st.pending_switch = Some(super::SwitchTarget::Attach { id: m.id.0.clone() });
+}
+
 fn confirm_key(st: &mut SessionsState, key: KeyEvent) -> InputOutcome {
     match key.code {
         KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
@@ -139,6 +166,9 @@ pub(crate) fn hint(st: &SessionsState) -> String {
     let mut h = String::from("\u{2191}\u{2193} navigate");
     let daemon = !matches!(st.source, super::LiveSource::InProcess | super::LiveSource::DaemonDown(_));
     if let Some(m) = st.selected_meta().filter(|_| daemon) {
+        if !st.is_own(m) {
+            h.push_str("  enter switch");
+        }
         h.push_str(if m.pinned { "  p unpin" } else { "  p pin" });
         // x is refused on our own session and while it streams: no hint.
         if !st.is_own(m) && RowState::of(m) != RowState::Streaming {

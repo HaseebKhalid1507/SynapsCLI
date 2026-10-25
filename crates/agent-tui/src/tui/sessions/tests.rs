@@ -299,8 +299,24 @@ fn tab_esc_and_slash() {
     assert_eq!(handle_event(&mut st, key(KeyCode::Char('/'))), InputOutcome::None);
     assert_eq!(handle_event(&mut st, key(KeyCode::BackTab)), InputOutcome::None);
     assert_eq!(st.tab, Tab::Live);
-    assert_eq!(handle_event(&mut st, key(KeyCode::Enter)), InputOutcome::None, "enter is PR 4");
+    // Enter on our own row: nothing to switch to.
+    assert_eq!(handle_event(&mut st, key(KeyCode::Enter)), InputOutcome::None);
+    assert!(st.pending_switch.is_none());
+    assert!(!input::hint(&st).contains("enter"), "no enter hint on our own row");
     assert_eq!(handle_event(&mut st, key(KeyCode::Esc)), InputOutcome::Close);
+}
+
+#[test]
+fn enter_on_another_row_requests_a_switch() {
+    let mut st = state();
+    select(&mut st, "20261024-181829-08e3"); // parked: attaching unparks it
+    assert!(input::hint(&st).contains("enter switch"));
+    assert_eq!(handle_event(&mut st, key(KeyCode::Enter)), InputOutcome::None);
+    assert_eq!(st.pending_switch, Some(SwitchTarget::Attach { id: "20261024-181829-08e3".into() }));
+    // In-process: no daemon to switch through.
+    let mut st = SessionsState::new(1, streaming(), false);
+    handle_event(&mut st, key(KeyCode::Enter));
+    assert!(st.pending_switch.is_none());
     assert!(!input::hint(&st).contains("enter"));
 }
 
@@ -376,7 +392,7 @@ fn live_rows_at_120_cols() {
         assert!(text.contains(want), "missing {want:?} in:\n{text}");
     }
     assert!(!text.contains("x close"), "own session selected: no close hint\n{text}");
-    assert!(!text.contains("enter"), "no enter hint until PR 4\n{text}");
+    assert!(!text.contains("enter switch"), "own row selected: no switch hint\n{text}");
     // The pinned marker sits on kite's row.
     let kite = text.lines().find(|l| l.contains("kite")).unwrap();
     assert!(kite.contains('\u{2691}'), "{kite}");
@@ -425,7 +441,8 @@ fn confirm_popup_text() {
     select(&mut st, "20261025-090200-49f6");
     handle_event(&mut st, key(KeyCode::Char('x')));
     let text = render_text(&st, &theme, 120, 30);
-    assert!(text.contains("1 client attached"), "{text}");
+    assert!(text.contains("its TUI client will exit (1 attached)"), "{text}");
+    const { assert!(CLOSE_ATTACHED, "owner decision: confirm closes even with clients attached") };
 }
 
 #[test]
@@ -445,6 +462,10 @@ fn past_tab_lists_newest_first() {
     };
     st.past.set(Ok(vec![info("old-aaaa", "older one", 30), info("new-bbbb", "newer one", 2)]));
     let text = render_text(&st, &theme, 120, 30);
+    assert!(text.contains("enter continue"), "{text}");
+    // Enter on the newest row asks to continue its journal.
+    handle_event(&mut st, key(KeyCode::Enter));
+    assert_eq!(st.pending_switch, Some(SwitchTarget::Continue { journal_id: "new-bbbb".into() }));
     assert!(text.contains("Past 2"), "{text}");
     assert!(text.contains("search & filters coming"), "{text}");
     let newer = text.find("newer one").unwrap();
