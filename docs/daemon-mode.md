@@ -566,6 +566,12 @@ checkpointed and its partial history + restart marker come back from the journal
 keep-warm + a Parked session survive (`reload_preserves_model_keep_warm_settings_and_parked`).
 F23 lock-held reload tested in `tests/daemon_reload_lock_held.rs`.
 
+The session's prompt-cache read/write totals survive too, so the footer's `%↺` and `/stats` keep the
+whole session's hit rate instead of restarting at the first request after the reload (usually the one
+miss). They live in the session's `.json` snapshot only (`Session::total_cache_read_tokens` /
+`total_cache_creation_tokens`), never in the journal: 0.10.1 rejects unknown journal fields. In
+journal mode they are as of the last snapshot. A session saved before they persisted resumes them at 0.
+
 ### Tool activations across a reload or a park
 
 Under progressive disclosure with deferred loading, an activated tool whose `tool_reference` has left

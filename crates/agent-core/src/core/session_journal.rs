@@ -432,6 +432,10 @@ fn is_zero_cost(v: &f64) -> bool {
     *v == 0.0
 }
 
+fn is_zero_tokens(v: &u64) -> bool {
+    *v == 0
+}
+
 /// `Session` fields that live ONLY in the `.json` snapshot and are never
 /// journaled. `SessionMeta` is `deny_unknown_fields` in every shipped build
 /// (0.10.1 included): a new field in a meta record makes those builds read
@@ -439,7 +443,12 @@ fn is_zero_cost(v: &f64) -> bool {
 /// journal with that truncation on the next save. The snapshot `Session`
 /// tolerates unknown fields, so new metadata goes there instead.
 #[cfg_attr(not(test), allow(dead_code))]
-const SNAPSHOT_ONLY_FIELDS: &[&str] = &["keepwarm_cost", "keepwarm_tokens"];
+const SNAPSHOT_ONLY_FIELDS: &[&str] = &[
+    "keepwarm_cost",
+    "keepwarm_tokens",
+    "total_cache_read_tokens",
+    "total_cache_creation_tokens",
+];
 
 /// Mirror of [`Session`] WITHOUT `api_messages` and the
 /// [`SNAPSHOT_ONLY_FIELDS`], with identical serde attributes.
@@ -844,6 +853,10 @@ struct SessionSnapshotRef<'a> {
     keepwarm_cost: f64,
     #[serde(skip_serializing_if = "KeepwarmTokens::is_zero")]
     keepwarm_tokens: KeepwarmTokens,
+    #[serde(skip_serializing_if = "is_zero_tokens")]
+    total_cache_read_tokens: u64,
+    #[serde(skip_serializing_if = "is_zero_tokens")]
+    total_cache_creation_tokens: u64,
     message_count: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     parent_session: &'a Option<String>,
@@ -884,6 +897,8 @@ impl<'a> SessionSnapshotRef<'a> {
             session_cost: s.session_cost,
             keepwarm_cost: s.keepwarm_cost,
             keepwarm_tokens: s.keepwarm_tokens,
+            total_cache_read_tokens: s.total_cache_read_tokens,
+            total_cache_creation_tokens: s.total_cache_creation_tokens,
             message_count: s.api_messages.len(),
             parent_session: &s.parent_session,
             compacted_into: &s.compacted_into,
@@ -1930,6 +1945,8 @@ mod snapshot_only_fields {
         s.keepwarm_cost = 0.5;
         s.keepwarm_tokens.input = 5;
         s.keepwarm_tokens.cache_read = 1_000;
+        s.total_cache_read_tokens = 2_000;
+        s.total_cache_creation_tokens = 300;
         // First save publishes the snapshot; the next two append deltas
         // (messages + meta records carrying every non-zero field).
         save_session_in_dir(&dir, &s, SessionPersistence::Journal).unwrap();
@@ -1939,6 +1956,7 @@ mod snapshot_only_fields {
             ));
             s.session_cost += 0.25;
             s.keepwarm_cost += 0.125;
+            s.total_cache_read_tokens += 1_000;
             let receipt = save_session_in_dir(&dir, &s, SessionPersistence::Journal).unwrap();
             assert!(matches!(receipt.mode, SaveMode::Append { .. }));
         }
@@ -1954,6 +1972,10 @@ mod snapshot_only_fields {
                 !line.contains("keepwarm"),
                 "journaled a snapshot-only field: {line}"
             );
+            assert!(
+                !line.contains("total_cache_"),
+                "journaled a snapshot-only field: {line}"
+            );
         }
         assert_eq!(metas, 2);
         // And this build still reads back the full history, with the
@@ -1962,6 +1984,46 @@ mod snapshot_only_fields {
         assert_eq!(loaded.api_messages.len(), 3);
         assert_eq!(loaded.session_cost, 1.5);
         assert_eq!(loaded.keepwarm_cost, 0.5);
+        assert_eq!(loaded.total_cache_read_tokens, 2_000);
+        assert_eq!(loaded.total_cache_creation_tokens, 300);
+    }
+
+    /// The cache read/write totals persist with the session, so a daemon
+    /// reload or a resume keeps the footer's session cache hit rate instead
+    /// of restarting it at the first (usually missed) request. Both modes;
+    /// journal mode publishes a snapshot on the first save.
+    #[test]
+    fn cache_totals_survive_save_and_load() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("sessions");
+        for persistence in [SessionPersistence::Json, SessionPersistence::Journal] {
+            let mut s = Session::new("m", "medium", None);
+            s.api_messages.push(std::sync::Arc::new(
+                serde_json::json!({"role": "user", "content": "q"}),
+            ));
+            s.total_input_tokens = 100;
+            s.total_output_tokens = 10;
+            s.total_cache_read_tokens = 85_679;
+            s.total_cache_creation_tokens = 6_250;
+            save_session_in_dir(&dir, &s, persistence).unwrap();
+            let loaded = load_session_in_dir(&dir, &s.id).unwrap();
+            assert_eq!(loaded.total_cache_read_tokens, 85_679, "{persistence:?}");
+            assert_eq!(loaded.total_cache_creation_tokens, 6_250, "{persistence:?}");
+            assert_eq!(loaded.total_input_tokens, 100, "{persistence:?}");
+        }
+    }
+
+    /// Zero cache totals are not written, and a snapshot saved before the
+    /// fields existed loads them as 0.
+    #[test]
+    fn cache_totals_are_optional_in_the_snapshot() {
+        let s = Session::new("m", "medium", None);
+        let value = serde_json::to_value(&s).unwrap();
+        assert!(value.get("total_cache_read_tokens").is_none());
+        assert!(value.get("total_cache_creation_tokens").is_none());
+        let legacy: Session = serde_json::from_value(value).unwrap();
+        assert_eq!(legacy.total_cache_read_tokens, 0);
+        assert_eq!(legacy.total_cache_creation_tokens, 0);
     }
 
     #[test]
