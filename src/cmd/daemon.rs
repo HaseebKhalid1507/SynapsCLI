@@ -8,7 +8,7 @@ use agent_engine::daemon::close::{resolve_session, ResolveError};
 use agent_engine::daemon::{self, registry, DaemonOpts, EXIT_REFUSED, EXIT_VERSION};
 use agent_engine::session::socket_transport::{Connected, SocketTransport};
 use agent_engine::session::wire::Hello;
-use agent_engine::session::{ClientKind, TransportError};
+use agent_engine::session::{ClientKind, SessionLifecycle, SessionMeta, TransportError};
 use clap::{Args, Subcommand};
 
 #[derive(Args, Debug, Clone)]
@@ -489,6 +489,55 @@ async fn stop(profile: Option<String>, force: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `streaming 2m` / `waiting 1m` / `idle 4m · parks in 42s` /
+/// `parked 12m · evicts in 48m` — what `/sessions` shows, for the CLI.
+/// An older daemon sends no `state_since`: the age is left out.
+fn state_phrase(m: &SessionMeta, now: chrono::DateTime<chrono::Utc>) -> String {
+    let word = match m.lifecycle {
+        SessionLifecycle::Parked => "parked",
+        SessionLifecycle::Parking => "parking",
+        SessionLifecycle::Ending => "ending",
+        SessionLifecycle::Live if m.awaiting_input > 0 => "waiting",
+        SessionLifecycle::Live if m.busy => "streaming",
+        SessionLifecycle::Live => "idle",
+    };
+    let mut s = word.to_string();
+    if let Some(since) = m.state_since {
+        s.push(' ');
+        s.push_str(&short_dur(now - since));
+    }
+    if let Some(due) = m.park_due {
+        s.push_str(&format!(" · parks in {}", short_dur(due - now)));
+    }
+    if let Some(due) = m.evict_due {
+        s.push_str(&format!(" · evicts in {}", short_dur(due - now)));
+    }
+    s
+}
+
+/// `42s` / `4m` / `3h` / `2d`; negative (clock skew, overdue) reads `0s`.
+fn short_dur(d: chrono::TimeDelta) -> String {
+    let secs = d.num_seconds().max(0);
+    match secs {
+        0..=59 => format!("{secs}s"),
+        60..=3599 => format!("{}m", secs / 60),
+        3600..=86_399 => format!("{}h", secs / 3600),
+        _ => format!("{}d", secs / 86_400),
+    }
+}
+
+/// `  $1.03  58 msgs  "title"` (cost/messages only once there are any).
+fn title_part(m: &SessionMeta) -> String {
+    let mut s = String::new();
+    if m.messages > 0 {
+        s.push_str(&format!("  ${:.2}  {} msgs", m.cost_usd, m.messages));
+    }
+    if let Some(t) = m.title.as_deref().filter(|t| !t.is_empty()) {
+        s.push_str(&format!("  \"{t}\""));
+    }
+    s
+}
+
 async fn sessions(profile: Option<String>, json: bool) -> anyhow::Result<()> {
     let paths = registry::daemon_paths(profile.as_deref());
     if !registry::is_alive(&paths) {
@@ -500,11 +549,13 @@ async fn sessions(profile: Option<String>, json: bool) -> anyhow::Result<()> {
     } else if list.is_empty() {
         println!("no sessions");
     } else {
+        let now = chrono::Utc::now();
         for m in list {
             println!(
-                "{}  {:?}{}  clients={}  owner={}  model={}  cwd={}  created={}{}{}",
+                "{}  {:?}  {}{}  clients={}  owner={}  model={}  cwd={}  created={}{}{}{}",
                 m.id,
                 m.lifecycle,
+                state_phrase(&m, now),
                 if m.pinned { "  pinned" } else { "" },
                 m.clients,
                 m.input_owner.map_or("-".into(), |c| format!("#{}", c.0)),
@@ -512,9 +563,51 @@ async fn sessions(profile: Option<String>, json: bool) -> anyhow::Result<()> {
                 m.cwd.as_deref().map_or("-".into(), |p| p.display().to_string()),
                 m.created_at.format("%H:%M:%S"),
                 m.name.as_deref().map_or(String::new(), |n| format!("  name={n}")),
-                if m.journal_id != m.id.as_str() { format!("  journal={}", m.journal_id) } else { String::new() }
+                if m.journal_id != m.id.as_str() { format!("  journal={}", m.journal_id) } else { String::new() },
+                title_part(&m)
             );
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod state_phrase_tests {
+    use super::*;
+    use chrono::{TimeDelta, Utc};
+
+    fn meta() -> SessionMeta {
+        let mut m = agent_engine::session::handle::echo::meta_for(&"s".into());
+        m.state_since = None;
+        m
+    }
+
+    #[test]
+    fn phrases() {
+        let now = Utc::now();
+        let mut m = meta();
+        assert_eq!(state_phrase(&m, now), "idle", "old daemon: no age");
+        m.busy = true;
+        m.state_since = Some(now - TimeDelta::seconds(125));
+        assert_eq!(state_phrase(&m, now), "streaming 2m");
+        m.busy = false;
+        m.state_since = Some(now - TimeDelta::minutes(4));
+        m.park_due = Some(now + TimeDelta::seconds(42));
+        assert_eq!(state_phrase(&m, now), "idle 4m · parks in 42s");
+        m.park_due = None;
+        m.lifecycle = SessionLifecycle::Parked;
+        m.state_since = Some(now - TimeDelta::minutes(12));
+        m.evict_due = Some(now + TimeDelta::minutes(48) + TimeDelta::seconds(5));
+        assert_eq!(state_phrase(&m, now), "parked 12m · evicts in 48m");
+    }
+
+    #[test]
+    fn title_and_cost() {
+        let mut m = meta();
+        assert_eq!(title_part(&m), "");
+        m.messages = 58;
+        m.cost_usd = 1.034;
+        m.title = Some("any ai events".into());
+        assert_eq!(title_part(&m), "  $1.03  58 msgs  \"any ai events\"");
+    }
 }
