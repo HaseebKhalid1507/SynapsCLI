@@ -101,6 +101,22 @@ pub(crate) enum SessionsOp {
     Close { id: String, label: String },
 }
 
+/// A session switch the modal asks for. Set on `SessionsState::pending_switch`
+/// by a tab's Enter; the dispatch loop drains it (after the key is handled)
+/// and performs the swap.
+///
+/// - `Attach`: a session the daemon already holds (Live or Parked — attaching
+///   unparks it). Set by the Live tab.
+/// - `Continue`: a saved journal. The daemon creates a session continuing it
+///   (`Attach::Create{continue_session}`); if that journal is already live in
+///   the daemon, the loop attaches to the live one instead. Set by the Past tab.
+#[allow(dead_code)] // contract: the switch itself lands in the next commit
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum SwitchTarget {
+    Attach { id: String },
+    Continue { journal_id: String },
+}
+
 /// What the background tasks send back to the main loop.
 #[derive(Debug)]
 pub(crate) enum SessionsMsg {
@@ -126,6 +142,10 @@ pub(crate) struct SessionsState {
     pub(crate) notice: Option<Notice>,
     /// The op in flight (one at a time).
     pub(crate) pending: Option<SessionsOp>,
+    /// A switch requested by Enter (Live → `Attach`, Past → `Continue`),
+    /// drained by the dispatch loop.
+    #[allow(dead_code)] // contract: drained in the next commit
+    pub(crate) pending_switch: Option<SwitchTarget>,
     pub(crate) past: past::PastState,
     /// Wall clock the relative times are drawn against (set on every poll
     /// answer, so countdowns tick with the 1 s re-poll; pinned in tests).
@@ -147,6 +167,7 @@ impl SessionsState {
             confirm: None,
             notice: None,
             pending: None,
+            pending_switch: None,
             past: past::PastState::default(),
             now: Utc::now(),
             home: std::env::var_os("HOME").map(PathBuf::from),
