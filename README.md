@@ -128,15 +128,15 @@ Synaps auto-targets `http://localhost:11434/v1`, which is Ollama's default, so a
 ## What's in the box
 
 - **One daemon, many clients.** Plain `synaps` attaches to a shared background daemon: extensions boot once, sessions are journaled and resumable, and a second terminal can mirror, observe, or take over the same live session. `synaps daemon reload` swaps in a new binary without dropping a session.
-- **Run a crew.** Named agents with roles, dispatched in parallel, thinking in a live panel. Steer one mid-flight without killing it.
+- **Run a crew.** Named agents with roles, dispatched in parallel, thinking in a live panel. Open any of them in its own view (Ctrl-↑/↓ or `/watch`) and steer it mid-flight without killing it. See [docs/subagent-watch.md](docs/subagent-watch.md).
 - **Runs without you.** `/auto` hands a session to an autonomous driver (Esc takes it back). `synaps watcher` supervises fleets: heartbeats, crash recovery, cost limits. Half the sessions on my machine have no human in them.
 - **Credentials stay in the broker.** Agents get short-lived, scoped tokens. A compromised agent can't leak what it never held. Secrets in your shell never reach the daemon either: a thin client strips them by name, and any value carrying credentials in a URL, before it connects.
-- **Bounded turns.** Caps on tool calls, wall clock, tokens, bytes, and cost. An agent can't spend what you didn't give it.
+- **Bounded turns, when you want them.** Optional caps on tool calls, rounds, wall clock, tokens, bytes, and cost (`turn_budget.*`; rounds, tool calls and bytes are unlimited by default). An agent can't spend more than you allow. Extension tool-call confirms name the extension that asked ([docs/confirm-prompts.md](docs/confirm-prompts.md)).
 - **Memory that survives.** Project-scoped memory, `/compact` checkpoints, sessions that chain across days.
 - **Sees what you see.** The model reads images directly, and `/attach` stages images, PDFs, and text into a turn.
-- **Any model.** Claude, Codex, Grok, Copilot, Gemini, Kimi, Azure, Bedrock, Vertex, any OpenAI-compatible endpoint, or the Ollama on your box. Starts with zero credentials. Routes that can't work fail closed.
+- **Any model.** Claude, Codex, Grok, Copilot, Gemini, Kimi, [Meta Muse](docs/providers/muse.md), Azure, Bedrock, Vertex, any OpenAI-compatible endpoint, or the Ollama on your box. Starts with zero credentials. Routes that can't work fail closed.
 - **Build on it.** Process-isolated extensions in any language, MCP servers, custom tools. A small core with enough hooks to bolt on whatever you want and glue it to whatever you've got.
-- **Lean is fast.** One 25MB binary, ~10 ms to first frame on a warm daemon, ~3 MB per extra session. No framework tax, no interpreter warming up.
+- **Lean is fast.** One ~27 MB binary, ~10 ms to first frame on a warm daemon, ~3 MB per extra session. No framework tax, no interpreter warming up.
 - **21 themes.** `catppuccin`, `gruvbox`, `nord`, `tokyo-night`, plus originals like `neon-rain` and `night-city`, and one light theme, `paper`. Hot-swap with `/theme`, or set `SYNAPS_THEME=<name>` for a single run without changing your config.
 
 ## Benchmarks
@@ -172,6 +172,8 @@ Warm start (attach to the running daemon) is ~10 ms to first frame; cold start
 | `synaps server` | WebSocket API: token auth, origin validation, streaming |
 | `synaps watcher` | Supervisor for unattended fleets: heartbeats, restarts, cost limits |
 | `synaps auth-broker` | One credential, many machines. Short-lived tokens over TLS |
+| `synaps auth` | Several accounts per provider: `list`, `use`, `remove`, `identify`, `plan` ([guide](docs/providers/multi-account-broker.md)) |
+| `synaps status` | Usage and reset windows per account (`--all`, `--json`) |
 
 ## Configuration
 

@@ -58,7 +58,11 @@ to the independently built Axel sidecar; do not multiply parallel build jobs.
 
 ```
 src/
-└── main.rs               — CLI entry point, subcommand dispatch
+├── main.rs               — CLI entry point, subcommand dispatch, --profile pinning
+└── cmd/                  — subcommand handlers (chat, server, agent, login, watcher, send, status, rpc, daemon, attach, auth-broker, …)
+    ├── auth_accounts.rs  — `synaps auth list|use|remove|identify|plan`
+    ├── quota_keeper.rs   — `synaps quota-keeper` (reset-window watcher, opt-in Codex activation)
+    └── status.rs         — `synaps status` (per-account usage, --provider/--account/--all/--json)
 
 crates/agent-core/src/    (crate: synaps-core)
 ├── lib.rs                — crate root; re-exports config, models, session, auth, etc.
@@ -68,6 +72,13 @@ crates/agent-core/src/    (crate: synaps-core)
 │   ├── session.rs        — on-disk session persistence (JSONL), `/saveas` naming, `resolve_session()` (chain → name → partial ID)
 │   ├── chain.rs          — named chain bookmarks (`~/.synaps-cli/chains/<name>.json`), auto-advance on `/compact`
 │   ├── auth/             — typed credential broker: OAuth PKCE, cloud identity (AWS/Azure/GCP), static keys, token storage (fs4-locked, mode 600)
+│   │   ├── account.rs        — Account / CredentialRef: `provider@label` slot keys, label validation
+│   │   ├── identity.rs       — per-account identity (email/account id) for duplicate-seat checks
+│   │   ├── usage.rs          — normalized 5h/weekly usage per account (`synaps status`)
+│   │   ├── quota_policy.rs   — pure capacity-selection policy (no I/O) behind `auto`
+│   │   ├── auto_selection.rs — `auto` choice + its secret-free explanation (soonest reset)
+│   │   ├── quota_keeper.rs   — quota keeper engine (reset windows, activation ledger)
+│   │   └── muse.rs           — Meta Muse device-flow login + Model API key mint
 │   ├── protocol.rs       — WebSocket wire format (server/client)
 │   ├── error.rs          — SynapsError type
 │   ├── logging.rs        — tracing subscriber setup
@@ -79,7 +90,6 @@ crates/agent-core/src/    (crate: synaps-core)
 
 crates/agent-engine/src/  (crate: synaps-engine)
 ├── lib.rs                — crate root; re-exports Runtime, ToolRegistry, etc.
-├── cmd/                  — subcommand handlers (chat, server, agent, login, watcher, send, status, rpc)
 ├── engine/               — shared headless engine used by chat and agent
 │   ├── setup.rs          — boot sequence (config, runtime, extensions, session)
 │   ├── commands.rs       — slash-command handling for headless mode
@@ -94,6 +104,8 @@ crates/agent-engine/src/  (crate: synaps-engine)
 │   ├── helpers.rs        — annotate_cache_breakpoint, drain_steering, etc.
 │   ├── telemetry.rs      — opt-in per-request API records (TelemetryLevel, JSONL log at ~/.cache/synaps/api-log.jsonl)
 │   ├── subagent.rs       — blocking `subagent` tool (spawns a child Runtime)
+│   ├── subagent_watch.rs — per-worker watch journal (SubagentWatch pages, SubagentSteer)
+│   ├── anthropic_quota.rs — Anthropic window-exhaustion 429 recognition + one-hop account failover
 │   ├── types.rs          — StreamEvent enum (the wire between runtime and UIs)
 │   ├── auth.rs           — auth token refresh before request
 │   └── openai/           — OpenAI-compatible provider engine
@@ -104,7 +116,8 @@ crates/agent-engine/src/  (crate: synaps-engine)
 │       ├── translate.rs  — Anthropic↔OpenAI message/tool/event translation
 │       ├── stream.rs     — call_oai_stream_inner (streaming path)
 │       ├── ping.rs       — /ping health check (parallel, non-blocking)
-│       └── catalog/      — per-provider model catalogs (anthropic, codex, xai, copilot, gemini, groq, kimi, nvidia, openrouter)
+│       ├── account_routing.rs — Codex account selection + one-hop failover
+│       └── catalog/      — per-provider model catalogs (anthropic, codex, xai, copilot, gemini, groq, kimi, muse, nvidia, openrouter)
 ├── events/               — event bus (per-session unix socket, inbox watcher, queue, registry)
 ├── tools/                — built-in tools, each impls the Tool trait
 │   ├── mod.rs            — Tool trait, ToolContext
@@ -156,7 +169,10 @@ crates/agent-tui/src/     (crate: synaps-tui)
     ├── highlight.rs      — syntect-backed syntax highlighting
     ├── stream_handler.rs — StreamEvent → UI mutation
     ├── commands.rs       — slash-command dispatch (STREAMING_COMMANDS, handle_command)
-    ├── theme/            — 17 built-in palettes + user TOML loader
+    ├── header.rs         — SynapsCLI header (folder and branch, state blocks, agent clock, version when idle)
+    ├── threads.rs        — main / worker thread focus (ThreadFocus, WorkerThread)
+    ├── watch.rs          — subagent watch view: Ctrl-↑/↓, /watch, steering
+    ├── theme/            — 21 built-in palettes (incl. light `paper`) + user TOML loader
     ├── settings/         — /settings modal (schema, input, draw)
     ├── plugins/          — /plugins modal
     └── gamba.rs          — easter egg. Don't touch.
@@ -200,8 +216,11 @@ This is the single most important flow to understand.
 Typed auth flows live in `crates/agent-core/src/core/auth/`. Three flow families:
 
 - **OAuth PKCE** — Anthropic, OpenAI Codex, xAI, GitHub Copilot, Google Gemini. Browser-based device flow with PKCE challenge, refresh token rotation.
+- **OAuth device flow** — Meta Muse (`muse.rs`): the Meta login mints a Model API key; broker-proxy only, the runtime never holds either.
 - **Cloud identity** — Azure OpenAI (Azure CLI/managed identity), AWS Bedrock (STS/profile), Google Vertex AI (gcloud ADC). Cloud secrets never leave the broker.
 - **Static keys** — Groq, Cerebras, NVIDIA, OpenRouter, Kimi. Env var or config-file discovery, broker-owned.
+
+**Multiple accounts per provider.** `auth.json` holds N OAuth logins per provider. The bare provider key (`anthropic`) is the `default` account; named accounts are `provider@label` (`anthropic@work`), added with `synaps login --provider <p> --account <label>`. Selection is `auth.account.<provider> = <label|default|auto>` or `SYNAPS_ACCOUNT_<PROVIDER>`; `auto` picks the seat whose quota resets soonest and may fail over once on a recognized window-exhaustion 429 before anything streams. An explicit or invalid selection fails closed and never falls back to another account. Always resolve credentials through `CredentialRef` (provider + account), never by provider key alone. Refresh is serialized per resolved file + slot across processes (`auth.json.<key>.refresh.lock`) and written with compare-and-swap so other slots are never overwritten. See `docs/providers/multi-account-broker.md`.
 
 The broker boundary ensures long-lived tokens (refresh tokens, cloud credentials) are never handed to model runtimes. Short-lived access tokens are minted per-request. `synaps auth-broker` exposes the broker over a socket for multi-machine setups (shared OAuth across a fleet over WireGuard or TLS).
 
@@ -452,7 +471,7 @@ Mapping (`crates/agent-core/src/core/models.rs::thinking_level_for_budget`):
 | `context_window` | string/int | auto | `200k`, `1m`, or token count |
 | `identity` | string | SynapsCLI default | System prompt preamble injected as the first message in the system block. Defines who the agent is. |
 | `agent_name` | string | — | Display name for the agent in the TUI |
-| `theme` | string | — | TUI color theme (17 built-in + user TOML) |
+| `theme` | string | — | TUI color theme (21 built-in + user TOML) |
 | `compaction_model` | string | claude-sonnet-4-6 | Model used for `/compact` |
 | `max_tool_output` | int | 30000 | Max bytes per tool output |
 | `bash_timeout` | int | 30 | Default bash timeout (seconds) |
