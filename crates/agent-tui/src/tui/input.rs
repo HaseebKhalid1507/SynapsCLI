@@ -33,6 +33,12 @@ pub(super) enum InputAction {
     /// The dispatch arm re-checks streaming + exact-model validity
     /// (`effort::apply_guard`) before any mutation/persist.
     EffortApply(super::effort::EffortApply),
+    /// /sessions modal asked for a daemon pin/close (spawned by dispatch).
+    SessionsOp(super::sessions::SessionsOp),
+    /// /sessions Past tab: deep search / rename on a blocking task.
+    SessionsPast(super::sessions::past::PastCmd),
+    /// Copy text to the system clipboard (/sessions `y copy id`).
+    CopyText(String),
     /// Models modal requested expanding provider models.
     ModelsExpandProvider(String),
     /// Plugins modal emitted an outcome — handled in the async main loop
@@ -98,6 +104,7 @@ pub(super) fn handle_event(
         }
         super::focus::PaneId::HelpFind => route_help_find(event, app),
         super::focus::PaneId::Effort => route_effort(event, app),
+        super::focus::PaneId::Sessions => route_sessions(event, app),
         super::focus::PaneId::Models => route_models(event, app, runtime),
         super::focus::PaneId::Plugins => route_plugins(event, app),
         super::focus::PaneId::Settings => route_settings(event, app, runtime, registry),
@@ -291,7 +298,7 @@ fn handle_mouse(
 /// Copy text to system clipboard. Uses a singleton background thread that
 /// holds one clipboard handle for the lifetime of the app. New copies replace
 /// the previous content atomically — no thread accumulation, no races.
-fn copy_to_clipboard(text: &str) {
+pub(crate) fn copy_to_clipboard(text: &str) {
     use std::sync::{mpsc, OnceLock};
     static TX: OnceLock<mpsc::Sender<String>> = OnceLock::new();
     let sender = TX.get_or_init(|| {
@@ -722,6 +729,29 @@ fn route_effort(event: Event, app: &mut App) -> InputAction {
                 InputAction::EffortApply(level)
             }
             super::effort::InputOutcome::None => InputAction::None,
+        };
+    }
+    InputAction::None
+}
+
+/// Stack-routed pane handler for the `/sessions` modal. `Close` drops the
+/// state, pops the stack and stops the poller ([`super::sessions::close`]);
+/// `Op` defers the daemon request to the async loop.
+fn route_sessions(event: Event, app: &mut App) -> InputAction {
+    // Invariant (checked by the tripwire): top() == Sessions ⇒ sessions is Some.
+    let Some(state) = &mut app.sessions else {
+        return InputAction::None;
+    };
+    if let Event::Key(key) = event {
+        return match super::sessions::handle_event(state, key) {
+            super::sessions::InputOutcome::Close => {
+                super::sessions::close(app);
+                InputAction::None
+            }
+            super::sessions::InputOutcome::Op(op) => InputAction::SessionsOp(op),
+            super::sessions::InputOutcome::Past(cmd) => InputAction::SessionsPast(cmd),
+            super::sessions::InputOutcome::Copy(text) => InputAction::CopyText(text),
+            super::sessions::InputOutcome::None => InputAction::None,
         };
     }
     InputAction::None

@@ -384,6 +384,15 @@ impl PromptBridge {
         }
     }
 
+    /// A fresh bridge for another session (`/sessions` switch): same pane
+    /// channel, no prompts, a new answers channel — an answer still in flight
+    /// for the old session lands on the dropped channel, never on the new one.
+    pub(crate) fn fresh(&self) -> Self {
+        let mut b = Self::new(self.secret_prompt_tx.clone());
+        b.confirms = self.confirms;
+        b
+    }
+
     /// Track input ownership (attach snapshot, `InputOwnerChanged`).
     pub(crate) fn set_owns_input(&mut self, owns: bool) {
         self.owns_input = owns;

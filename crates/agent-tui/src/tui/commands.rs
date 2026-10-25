@@ -3,7 +3,6 @@
 use std::path::Path;
 
 use chrono;
-use synaps_cli::list_recent_sessions;
 
 use super::app::{App, ChatMessage};
 use synaps_cli::extensions::commands::CommandOutputEvent;
@@ -16,6 +15,7 @@ use synaps_cli::extensions::runtime::InvokeCommandEvent;
 /// Commands that work while streaming.
 pub(super) const STREAMING_COMMANDS: &[&str] = &[
     "gamba", "theme", "quit", "exit", "attachments", "detach", "watch", "settings", "clients", "takeover",
+    "sessions",
 ];
 
 /// Merged list of built-ins + registered skill names (deduped, sorted).
@@ -52,6 +52,8 @@ pub(super) enum CommandAction {
     /// `/clients` typed mid-stream: [`clients`] needs the session link,
     /// which [`handle_streaming_command`] doesn't have.
     Clients,
+    /// Open the /sessions modal (Live / Past).
+    OpenSessions,
     /// Open the /plugins modal.
     OpenPlugins,
     /// Open the searchable /help find lightbox.
@@ -795,68 +797,7 @@ async fn run_command(
                 )));
             }
         }
-        "sessions" => match list_recent_sessions(20) {
-            Ok(sessions) if sessions.is_empty() => {
-                app.push_msg(ChatMessage::System("no saved sessions".to_string()));
-            }
-            Ok(sessions) => {
-                app.push_msg(ChatMessage::System(format!(
-                    "{} session(s):",
-                    sessions.len()
-                )));
-                for s in sessions.iter().take(20) {
-                    let active_marker = if s.id == app.session.id { " ●" } else { "" };
-                    let name_tag = s
-                        .name
-                        .as_deref()
-                        .map(|n| format!(" [@{}]", n))
-                        .unwrap_or_default();
-                    let age = {
-                        let secs = chrono::Utc::now()
-                            .signed_duration_since(s.updated_at)
-                            .num_seconds();
-                        if secs < 3600 {
-                            format!("{}m ago", secs / 60)
-                        } else if secs < 86400 {
-                            format!("{}h ago", secs / 3600)
-                        } else {
-                            format!("{}d ago", secs / 86400)
-                        }
-                    };
-                    let title_display = if s.title.is_empty() {
-                        "(no title)".to_string()
-                    } else {
-                        s.title.chars().take(60).collect::<String>()
-                    };
-                    // Last 4 chars — more recognizable than a prefix
-                    let id_short = &s.id[s.id.len().saturating_sub(4)..];
-                    let msg_str = if s.message_count > 0 {
-                        format!("{} msgs · ", s.message_count)
-                    } else {
-                        String::new()
-                    };
-                    // Line 1: identity + meta
-                    app.push_msg(ChatMessage::System(format!(
-                        "  …{}{}{} · {}{}${:.3} · {}",
-                        id_short, active_marker, name_tag,
-                        msg_str, age, s.session_cost, s.model
-                    )));
-                    // Line 2: title
-                    app.push_msg(ChatMessage::System(format!(
-                        "     └ {}",
-                        title_display
-                    )));
-                    // Blank separator between entries
-                    app.push_msg(ChatMessage::System(String::new()));
-                }
-            }
-            Err(e) => {
-                app.push_msg(ChatMessage::Error(format!(
-                    "failed to list sessions: {}",
-                    e
-                )));
-            }
-        },
+        "sessions" => return CommandAction::OpenSessions,
         "resume" => {
             if arg.is_empty() {
                 app.push_msg(ChatMessage::System(
@@ -1671,6 +1612,8 @@ pub(super) fn handle_streaming_command(
         // helpers::apply_setting's next-turn notice).
         "settings" => CommandAction::OpenSettings,
         "takeover" => CommandAction::TakeOver,
+        // Read-only list + pin/close on OTHER sessions: safe mid-turn.
+        "sessions" => CommandAction::OpenSessions,
         "attachments" => {
             let summaries = app.pending_attachments.summaries();
             if summaries.is_empty() {
@@ -3002,6 +2945,7 @@ mod streaming_command_tests {
         for typed in [
             "theme", "th", "attachments", "detach", "quit", "gamba", "watch", "settings",
             "takeover",
+            "sessions",
         ] {
             let cmd = resolve_prefix(typed, &cmds);
             assert!(is_streaming_command(&cmd), "/{typed} runs mid-stream");

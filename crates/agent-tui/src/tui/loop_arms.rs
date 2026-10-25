@@ -570,6 +570,52 @@ pub(crate) fn handle_ping_arm(
     }
 }
 
+/// /sessions arm: a background answer (daemon list, past list, pin/close).
+/// Dropped when the modal is closed or the answer is from an earlier open;
+/// a closed modal also drops a poller that outlived it.
+pub(crate) fn handle_sessions_arm(
+    app: &mut App,
+    link: &super::session_link::SessionLink,
+    msg: super::sessions::SessionsMsg,
+) {
+    let own = super::sessions::own_row(app, link);
+    let Some(st) = app.sessions.as_mut() else {
+        app.sessions_poller = None;
+        return;
+    };
+    if st.apply(msg, || own) {
+        app.request_redraw();
+    }
+}
+
+/// After an input action: a `/sessions` Enter (Live → Attach, Past →
+/// Continue) left a switch — swap this TUI onto that session.
+pub(crate) async fn drain_session_switch(
+    app: &mut App,
+    link: &mut super::session_link::SessionLink,
+    prompt_bridge: &mut super::session_link::PromptBridge,
+    registry: &std::sync::Arc<synaps_cli::skills::registry::CommandRegistry>,
+    render_handle: &super::render_thread::RenderHandle,
+) {
+    let Some(target) = app.sessions.as_mut().and_then(|s| s.pending_switch.take()) else {
+        return;
+    };
+    let connector = link
+        .transport()
+        .socket_path()
+        .map(|p| super::sessions::switch::DaemonConnector { path: p.to_path_buf() });
+    super::sessions::switch::perform(
+        app,
+        link,
+        prompt_bridge,
+        target,
+        connector.as_ref().map(|c| c as &dyn super::sessions::switch::Connector),
+        registry,
+        render_handle,
+    )
+    .await;
+}
+
 /// Expanded model-list arm: async provider model enumeration returned.
 pub(crate) fn handle_model_list_arm(
     app: &mut App,

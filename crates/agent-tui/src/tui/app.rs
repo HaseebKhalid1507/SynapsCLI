@@ -215,6 +215,16 @@ pub(crate) struct App {
     pub(crate) help_find: Option<synaps_cli::help::HelpFindState>,
     /// Active /effort lightbox state (Some while /effort is open).
     pub(crate) effort: Option<super::effort::EffortModalState>,
+    /// Active /sessions modal state (Some while /sessions is open).
+    pub(crate) sessions: Option<super::sessions::SessionsState>,
+    /// Bumped on every /sessions open; background answers carry it so a late
+    /// one from an earlier open is dropped.
+    pub(crate) sessions_gen: u64,
+    /// The /sessions daemon poller (aborted on drop = when the modal closes).
+    pub(crate) sessions_poller: Option<super::sessions::AbortOnDrop>,
+    /// Background /sessions answers (daemon list, past list, pin/close).
+    pub(crate) sessions_tx: tokio::sync::mpsc::UnboundedSender<super::sessions::SessionsMsg>,
+    pub(crate) sessions_rx: tokio::sync::mpsc::UnboundedReceiver<super::sessions::SessionsMsg>,
     /// P7 modal-routing stack (finished, P7.8). The single source of input
     /// routing: `input.rs` dispatches on `modal_stack.top()`, one arm per
     /// `PaneId`. It is an *index over* the `Option<…State>` modal fields above
@@ -256,6 +266,9 @@ pub(crate) struct App {
     /// `Resumed` reply waiting for the `Conversation` that carries the
     /// resumed session's messages (then the "switched from …" line).
     pub(crate) resume_pending: Option<ResumePending>,
+    /// Set by a `/sessions` switch: the attach's "you own input" toast is
+    /// skipped until then (the switched line already says where you are).
+    pub(crate) quiet_owner_toast_until: Option<std::time::Instant>,
     /// The last Submit text until `TurnStarted`/`Refused` (§6 #9: a refused
     /// Submit gives the editor its text back).
     pub(crate) last_submitted: Option<String>,
@@ -412,6 +425,7 @@ impl App {
     pub(crate) fn new_with_clock(session: Session, clock: super::clock::TuiClock) -> Self {
         let (ping_tx_init, ping_rx_init) = tokio::sync::mpsc::unbounded_channel();
         let (model_list_tx_init, model_list_rx_init) = tokio::sync::mpsc::unbounded_channel();
+        let (sessions_tx_init, sessions_rx_init) = tokio::sync::mpsc::unbounded_channel();
         let (extension_loader_tx_init, extension_loader_rx_init) =
             tokio::sync::mpsc::unbounded_channel();
         let (widget_tx_init, widget_rx_init) =
@@ -483,6 +497,11 @@ impl App {
             models: None,
             help_find: None,
             effort: None,
+            sessions: None,
+            sessions_gen: 0,
+            sessions_poller: None,
+            sessions_tx: sessions_tx_init,
+            sessions_rx: sessions_rx_init,
             // P7.3: wired but starts EMPTY — pure no-op until P7.4 migrates a modal.
             modal_stack: super::focus::ModalStack::new(),
             // P7.8: folded off the `run()` local; production wires the mpsc
@@ -497,6 +516,7 @@ impl App {
             subagent_rows: Vec::new(),
             compaction_applied: None,
             resume_pending: None,
+            quiet_owner_toast_until: None,
             last_submitted: None,
             pending_attachments: Default::default(),
             consecutive_auto_turns: 0,
@@ -771,6 +791,57 @@ impl App {
         self.turn_started = None;
         self.tools_in_flight = 0;
         self.activity = failure.map_or(super::header::Activity::Idle, super::header::Activity::Failed);
+    }
+
+    /// Forget everything that belonged to the session this TUI was showing,
+    /// before a `/sessions` switch mirrors another one (the snapshot then
+    /// refills the conversation mirrors, header and transcript). App-wide
+    /// state — theme, config, keybinds, the input draft, input history,
+    /// sidecars, model caches — stays.
+    pub(crate) fn reset_for_session_switch(&mut self) {
+        super::watch::reset(self);
+        self.transcript.clear();
+        self.invalidate();
+        self.subagents.clear();
+        self.subagent_rows.clear();
+        self.queued_message = None;
+        self.pending_attachments.clear();
+        self.compaction_applied = None;
+        self.resume_pending = None;
+        self.last_submitted = None;
+        self.status_text = None;
+        self.streaming = false;
+        self.compacting = false;
+        self.header_turn_ended(None);
+        self.turn_baseline = 0;
+        self.spinner_frame = 0;
+        self.quit_guard.reset();
+        self.session_ended = None;
+        self.observing = false;
+        self.consecutive_auto_turns = 0;
+        self.pending_events_len = 0;
+        // Accounting mirrors: per-turn counters + cache stats.
+        self.api_messages_len = 0;
+        self.input_tokens = 0;
+        self.output_tokens = 0;
+        self.total_input_tokens = 0;
+        self.total_output_tokens = 0;
+        self.total_cache_read_tokens = 0;
+        self.total_cache_creation_tokens = 0;
+        self.total_cache_write_5m = 0;
+        self.total_cache_write_1h = 0;
+        self.last_turn_context = 0;
+        self.api_call_count = 0;
+        self.session_cost = 0.0;
+        self.keepwarm_cost = 0.0;
+        self.keepwarm_tokens = Default::default();
+        self.response_preview = None;
+        // Prompts of the old session: the pane closes without answering.
+        self.secret_prompts = synaps_cli::tools::SecretPromptQueue::new();
+        // Toasts that described the old session.
+        for id in ["attach", "input-owner", "lifecycle", "confirms-waiting", "watch", "driver"] {
+            self.toasts.dismiss(id);
+        }
     }
 
     /// True while the header animates (so the tick asks for redraws).

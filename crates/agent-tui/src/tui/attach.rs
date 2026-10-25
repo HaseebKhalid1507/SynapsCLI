@@ -703,6 +703,13 @@ mod tests {
             journal_id: String::new(),
             locked_by: None,
             pinned: false,
+            busy: false,
+            state_since: None,
+            park_due: None,
+            evict_due: None,
+            title: None,
+            cost_usd: 0.0,
+            messages: 0,
         }
     }
 

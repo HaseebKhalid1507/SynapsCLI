@@ -847,6 +847,10 @@ impl ClientTransport for SocketTransport {
     fn daemon_binary(&self) -> Option<crate::session::transport::BinaryId> {
         Some(crate::session::transport::BinaryId::of(&self.welcome))
     }
+
+    fn socket_path(&self) -> Option<&Path> {
+        Some(&self.path)
+    }
 }
 
 #[cfg(test)]

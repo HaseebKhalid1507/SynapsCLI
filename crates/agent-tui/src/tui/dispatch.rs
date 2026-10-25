@@ -199,6 +199,12 @@ pub(crate) async fn handle_input_action(
     match action {
         InputAction::None => {}
         InputAction::HelpFindOutcome => {}
+        InputAction::SessionsPast(cmd) => super::sessions::past::tasks::run(app, cmd),
+        InputAction::CopyText(text) => super::input::copy_to_clipboard(&text),
+        InputAction::SessionsOp(op) => {
+            let socket = link.transport().socket_path().map(|p| p.to_path_buf());
+            super::sessions::spawn_op(app, socket, op);
+        }
         InputAction::Quit => {
             // F27: if streaming over a socket, the turn keeps running in the
             // daemon after detach. First Ctrl+C shows a notice; second within
@@ -322,6 +328,7 @@ pub(crate) async fn handle_input_action(
                 }
                 CommandAction::OpenSettings => open_settings(app, http),
                 CommandAction::Clients => super::commands::clients(app, link),
+                CommandAction::OpenSessions => super::sessions::open(app, link),
                 CommandAction::OpenPlugins => {
                     let path = synaps_cli::skills::state::PluginsState::default_path();
                     match synaps_cli::skills::state::PluginsState::load_from(&path) {
@@ -1241,6 +1248,7 @@ pub(crate) async fn handle_input_action(
                     CommandAction::OpenEffort => {}
                     CommandAction::OpenSettings => open_settings(app, http),
                     CommandAction::Clients => super::commands::clients(app, link),
+                    CommandAction::OpenSessions => super::sessions::open(app, link),
                     CommandAction::OpenPlugins => {}
                     CommandAction::OpenHelpFind { .. } => {}
                     CommandAction::ReloadPlugins => {}
