@@ -588,6 +588,9 @@ pub struct SessionActor {
     pub(crate) background: BackgroundTasks,
     /// B2: spawned compaction in flight (`busy` while `Some`).
     pub(crate) compact: Option<CompactionJob>,
+    /// `compact_inline` is running (it blocks the actor; listings still
+    /// see the session busy).
+    pub(crate) compacting_inline: bool,
     /// `on_session_start` for this session. `await_extensions=false`: a
     /// task waits for process-level discovery and its turn at the host's
     /// gate (one hook at a time), then calls it, so boot never blocks on
@@ -945,6 +948,7 @@ impl SessionActor {
             state: AttachState::Detached { running: false },
             background,
             compact: None,
+            compacting_inline: false,
             session_start,
             turn_awaiting_start: None,
             subagent_tick: None,
@@ -1216,13 +1220,68 @@ impl SessionActor {
     /// Also the one place the inbox gate follows `input_owner`: every owner
     /// change (attach, detach, takeover) publishes presence. `Observe`
     /// clients never own input, so a keep-warm observer keeps it shut.
+    ///
+    /// Also the `/sessions` state: busy, `state_since` (restamped whenever
+    /// idle/busy/parked changes), the park / eviction deadline as wall
+    /// clock, and the conversation's title / cost / message count (kept as
+    /// last published while Parked). Every transition that moves them —
+    /// turn and compaction start/end, attach/detach, `rearm_park`,
+    /// park/unpark — ends in a publish; stream deltas do not.
     pub(crate) fn publish_presence(&self) {
+        use super::handle::{Presence, PresenceState};
         self.background
             .set_inbox_accepting(self.input_owner.is_some());
-        self.presence.store(Arc::new(super::handle::Presence {
+        let prev = self.presence.load();
+        let busy = self.busy() || self.compacting_inline;
+        let parked = self.is_parked();
+        let state = if parked {
+            PresenceState::Parked
+        } else if busy {
+            PresenceState::Busy
+        } else {
+            PresenceState::Idle
+        };
+        let now = chrono::Utc::now();
+        let state_since = match prev.state_since {
+            Some(t) if prev.state == state => Some(t),
+            _ => Some(now),
+        };
+        let wall = |at: tokio::time::Instant| {
+            let left = at.saturating_duration_since(tokio::time::Instant::now());
+            chrono::Duration::from_std(left)
+                .ok()
+                .and_then(|d| now.checked_add_signed(d))
+        };
+        // A worker re-check is not a park (it only looks again), nor is a
+        // grace that workers now hold: its firing would only re-check. The
+        // F18 idle end of a zero-turn session counts — it leaves Live too.
+        let park_due = self
+            .park_deadline
+            .filter(|d| !parked && Some(*d) != self.park_recheck_at)
+            .filter(|_| self.can_end_idle() || self.can_park())
+            .and_then(wall);
+        let evict_due = self.park_deadline.filter(|_| parked).and_then(wall);
+        let (title, cost_usd, messages) = if self.conv.is_live() {
+            (
+                conversation_title(&self.conv),
+                self.conv.session_cost,
+                self.conv.api_messages.len(),
+            )
+        } else {
+            (prev.title.clone(), prev.cost_usd, prev.messages)
+        };
+        self.presence.store(Arc::new(Presence {
             clients: self.attached.len(),
             input_owner: self.input_owner,
             awaiting_input: self.pending_prompts.len(),
+            busy,
+            state,
+            state_since,
+            park_due,
+            evict_due,
+            title,
+            cost_usd,
+            messages,
         }));
     }
 
@@ -2163,6 +2222,11 @@ impl SessionActor {
     }
 
     pub(crate) fn rearm_park(&mut self) {
+        self.rearm_park_deadline();
+        self.publish_presence();
+    }
+
+    fn rearm_park_deadline(&mut self) {
         if self.is_parked() {
             // Eviction deadline is owned by `park()`; the attach path unparks
             // (which rebuilds the runtime and clears the deadline).
@@ -2271,6 +2335,7 @@ impl SessionActor {
     /// resolving and its push into `event_queue` is the wake-up.
     pub(crate) async fn park(&mut self) -> std::ops::ControlFlow<EndReason> {
         let flow = self.park_now().await;
+        self.publish_presence();
         // Restored to be parked but still live (it could not park): its
         // `on_session_start` runs now, as for any live session.
         if flow.is_continue()
@@ -2349,6 +2414,8 @@ impl SessionActor {
         self.parked_tool_activations = self.runtime.carried_tool_activations();
         // Drop order: conv first, then runtime — a panic between them can
         // never leave a Runtime without state to save.
+        // Last look at the conversation for listings (title/cost/messages).
+        self.publish_presence();
         let conv = self.conv.park_take();
         drop(conv);
         let runtime = self.runtime.park_take();
@@ -2513,9 +2580,12 @@ impl SessionActor {
         if !self.is_parked() {
             return Ok(());
         }
-        self.unpark()
+        let res = self
+            .unpark()
             .await
-            .map_err(|e| format!("session parked and could not be restored: {e}"))
+            .map_err(|e| format!("session parked and could not be restored: {e}"));
+        self.publish_presence();
+        res
     }
 
     /// `stream_handler.rs:264`: a turn OR a compaction blocks auto-turns.
@@ -4054,6 +4124,14 @@ impl SessionActor {
 
     /// #107 inline body (kill-switch only).
     async fn compact_inline(&mut self, instructions: Option<String>, source: &str) {
+        self.compacting_inline = true;
+        self.publish_presence();
+        self.compact_inline_inner(instructions, source).await;
+        self.compacting_inline = false;
+        self.publish_presence();
+    }
+
+    async fn compact_inline_inner(&mut self, instructions: Option<String>, source: &str) {
         self.emit(SessionEventWire::SystemNotice(format!(
             "[{}]",
             preview_compaction_disclosure(&self.runtime, &self.conv.api_messages).render_line()
@@ -4852,6 +4930,7 @@ impl SessionActor {
         if let Some(job) = self.compact.take() {
             job.task.abort();
             self.emit(SessionEventWire::CompactionCancelled);
+            self.publish_presence();
         }
     }
 
@@ -5232,6 +5311,19 @@ async fn next_stream_event(stream: &mut Option<ActiveStream>) -> Option<StreamEv
 /// Whether the 1 Hz `SubagentRows` tick keeps running: always during a turn,
 /// and after it while any worker is still running (a background worker's
 /// progress events rode the ended turn's stream; the rows carry it now).
+/// The conversation's title for listings: the saved title, else what
+/// `Session::auto_title` will make of the first user message.
+fn conversation_title(conv: &ConversationState) -> Option<String> {
+    if !conv.session.title.is_empty() {
+        return Some(conv.session.title.clone());
+    }
+    conv.api_messages
+        .iter()
+        .filter(|m| m["role"].as_str() == Some("user"))
+        .find_map(|m| agent_core::core::session::user_content_for_display(&m["content"]))
+        .map(|t| t.chars().take(80).collect())
+}
+
 fn keep_subagent_tick(streaming: bool, any_running: bool) -> bool {
     streaming || any_running
 }

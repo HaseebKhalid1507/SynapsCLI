@@ -13,11 +13,35 @@ use super::transport::TransportError;
 use super::types::{Addressed, ClientId, Envelope, SessionCommand, SessionConfig, SessionId, SessionLifecycle, SessionMeta};
 
 /// Live client accounting published by the actor (B4 `sessions()` listing).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Presence {
     pub clients: usize,
     pub input_owner: Option<ClientId>,
     pub awaiting_input: usize,
+    /// A turn or a compaction is running.
+    pub busy: bool,
+    /// What `state_since` dates (idle / busy / parked): a publish that
+    /// changes it restamps `state_since`.
+    pub state: PresenceState,
+    pub state_since: Option<chrono::DateTime<chrono::Utc>>,
+    /// Wall-clock idle park (Live, zero clients, grace armed).
+    pub park_due: Option<chrono::DateTime<chrono::Utc>>,
+    /// Wall-clock eviction of a Parked session.
+    pub evict_due: Option<chrono::DateTime<chrono::Utc>>,
+    /// Conversation title / cost / api message count. Kept as last seen
+    /// while Parked (no conversation in memory).
+    pub title: Option<String>,
+    pub cost_usd: f64,
+    pub messages: usize,
+}
+
+/// The coarse state `Presence::state_since` dates.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PresenceState {
+    #[default]
+    Idle,
+    Busy,
+    Parked,
 }
 use super::view::RuntimeView;
 
@@ -173,7 +197,7 @@ impl SessionHandle {
 
     /// Clients / input owner / pending prompts as last published.
     pub fn presence(&self) -> Presence {
-        **self.presence.load()
+        (**self.presence.load()).clone()
     }
 
     /// Current session name (create `--name` or a later `saveas`).
@@ -204,7 +228,8 @@ impl SessionHandle {
     }
 
     /// `meta()` with the live cells filled in (lifecycle, clients, owner,
-    /// awaiting_input, journal_id, name, pinned) — what listings show.
+    /// awaiting_input, journal_id, name, pinned, and the presence's
+    /// busy/state/deadlines/title/cost/messages) — what listings show.
     pub fn meta_live(&self) -> SessionMeta {
         let mut m = (*self.meta).clone();
         let p = self.presence();
@@ -215,6 +240,13 @@ impl SessionHandle {
         m.journal_id = self.journal_id();
         m.name = self.name();
         m.pinned = self.pinned();
+        m.busy = p.busy;
+        m.state_since = p.state_since;
+        m.park_due = p.park_due;
+        m.evict_due = p.evict_due;
+        m.title = p.title;
+        m.cost_usd = p.cost_usd;
+        m.messages = p.messages;
         m
     }
 
