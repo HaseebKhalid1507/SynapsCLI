@@ -108,8 +108,16 @@ pub(crate) fn apply_subagent_runtime_policy(
     config: &crate::config::SynapsConfig,
     memory_backend: Option<&crate::memory_backend::MemoryBinding>,
     session_allow_all: Option<&std::sync::Arc<crate::tools::SessionConfirmLatch>>,
+    telemetry: Option<&crate::runtime::telemetry::WorkerTelemetry>,
 ) {
     runtime.inherit_session_allow_all(session_allow_all);
+
+    // Record at the parent's telemetry level, through the parent's session
+    // writer. Workers start `Off` (`Runtime::from_parts`); without this no
+    // subagent request ever reached `api-log.jsonl`. `None` stays `Off`.
+    if let Some(parent) = telemetry {
+        runtime.inherit_telemetry(parent);
+    }
     runtime.apply_retry_config(config);
 
     // Credential source / token cache: host-built workers already share the
@@ -290,7 +298,7 @@ mod cache_ttl_policy_tests {
         );
 
         // Apply the subagent runtime policy — this is what the spawn paths call.
-        apply_subagent_runtime_policy(&mut runtime, &parent_config, None, None);
+        apply_subagent_runtime_policy(&mut runtime, &parent_config, None, None, None);
 
         // Post-condition: TTL must be FiveMinutes regardless of parent config.
         assert_eq!(
@@ -321,7 +329,7 @@ mod cache_ttl_policy_tests {
             "pre-condition: must be Hybrid"
         );
 
-        apply_subagent_runtime_policy(&mut runtime, &parent_config, None, None);
+        apply_subagent_runtime_policy(&mut runtime, &parent_config, None, None, None);
 
         assert_eq!(
             runtime.cache_ttl(),
@@ -345,7 +353,7 @@ mod cache_ttl_policy_tests {
             "pre-condition: Runtime::new() must default to 5m"
         );
 
-        apply_subagent_runtime_policy(&mut runtime, &parent_config, None, None);
+        apply_subagent_runtime_policy(&mut runtime, &parent_config, None, None, None);
 
         assert_eq!(
             runtime.cache_ttl(),
@@ -361,7 +369,7 @@ mod cache_ttl_policy_tests {
             .await
             .expect("Runtime::new() must succeed in test environment");
 
-        apply_subagent_runtime_policy(&mut runtime, &config, None, None);
+        apply_subagent_runtime_policy(&mut runtime, &config, None, None, None);
 
         assert_eq!(
             runtime.codex_request_role(),
@@ -447,7 +455,7 @@ mod cache_ttl_policy_tests {
 
         // ...and STAYS Off/no-lease after the subagent runtime policy runs.
         let config = crate::config::SynapsConfig::default();
-        apply_subagent_runtime_policy(&mut subagent, &config, None, None);
+        apply_subagent_runtime_policy(&mut subagent, &config, None, None, None);
         let after_policy = subagent.memory_context_status();
         assert_eq!(
             after_policy.durable,
@@ -528,7 +536,7 @@ mod codex_ultra_worker_tests {
         let parent = parent("openai-codex/gpt-6-astra", ReasoningLevel::Ultra).unwrap();
         assert_eq!(parent.wire_effort, Some(CodexWireEffort::XHigh));
         let mut runtime = crate::Runtime::new_headless();
-        apply_subagent_runtime_policy(&mut runtime, &Default::default(), None, None);
+        apply_subagent_runtime_policy(&mut runtime, &Default::default(), None, None, None);
         runtime.set_model(parent.qualified_model.clone());
         assert_eq!(runtime.reasoning_level(), ReasoningLevel::Medium);
         apply_codex_worker_reasoning(&mut runtime, Some(&parent));
@@ -559,7 +567,7 @@ mod codex_ultra_worker_tests {
             "openrouter/openai/gpt-6-astra",
         ] {
             let mut runtime = crate::Runtime::new_headless();
-            apply_subagent_runtime_policy(&mut runtime, &Default::default(), None, None);
+            apply_subagent_runtime_policy(&mut runtime, &Default::default(), None, None, None);
             runtime.set_model(model.into());
             let default = runtime.reasoning_level();
             apply_codex_worker_reasoning(&mut runtime, Some(&parent));
@@ -600,7 +608,7 @@ mod codex_ultra_worker_tests {
             .is_none());
         }
         let mut runtime = crate::Runtime::new_headless();
-        apply_subagent_runtime_policy(&mut runtime, &Default::default(), None, None);
+        apply_subagent_runtime_policy(&mut runtime, &Default::default(), None, None, None);
         runtime.set_model("openai-codex/gpt-6-astra".into());
         apply_codex_worker_reasoning(&mut runtime, None);
         assert_eq!(runtime.reasoning_level(), ReasoningLevel::Medium);
@@ -622,13 +630,14 @@ mod codex_ultra_worker_tests {
         };
         let parent = crate::Runtime::new_headless();
         let mut independent = crate::Runtime::new_headless();
-        apply_subagent_runtime_policy(&mut independent, &Default::default(), None, None);
+        apply_subagent_runtime_policy(&mut independent, &Default::default(), None, None, None);
         let mut worker = crate::Runtime::new_headless();
         apply_subagent_runtime_policy(
             &mut worker,
             &Default::default(),
             None,
             Some(parent.session_allow_all()),
+            None,
         );
         assert!(Arc::ptr_eq(
             parent.session_allow_all(),
@@ -685,6 +694,7 @@ mod codex_ultra_worker_tests {
             &Default::default(),
             None,
             Some(parent.session_allow_all()),
+            None,
         );
         assert!(later.session_allow_all().allows_all(&jev));
         worker.session_allow_all().clear();
@@ -718,6 +728,116 @@ mod codex_ultra_worker_tests {
                 capture < spawn && spawn < inherit && inherit < stream,
                 "{name}"
             );
+        }
+    }
+
+    /// A worker records at its parent's level through the parent's session
+    /// writer (one writer per session, never one per worker) under its own
+    /// trace session. Before this, workers stayed `Off` and every subagent
+    /// request was missing from `api-log.jsonl`.
+    #[test]
+    fn worker_policy_inherits_parent_telemetry_through_the_shared_writer() {
+        use crate::runtime::telemetry::{
+            TelemetryLevel, TelemetryRecord, TelemetryWriter, WriterOptions,
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("synaps/api-log.jsonl");
+        let writer = TelemetryWriter::new(WriterOptions {
+            telemetry_path: Some(log.clone()),
+            trace_path: Some(tmp.path().join("synaps/request-trace.jsonl")),
+            ..Default::default()
+        });
+        let mut parent = crate::Runtime::new_headless();
+        parent.install_observability_for_tests(writer);
+        parent.set_telemetry_level(TelemetryLevel::Full);
+
+        let mut worker = crate::Runtime::new_headless();
+        assert_eq!(
+            worker.telemetry_level(),
+            TelemetryLevel::Off,
+            "workers start Off"
+        );
+        apply_subagent_runtime_policy(
+            &mut worker,
+            &Default::default(),
+            None,
+            None,
+            Some(&parent.worker_telemetry()),
+        );
+        assert_eq!(worker.telemetry_level(), TelemetryLevel::Full);
+        assert!(worker.trace_context().enabled());
+        assert_ne!(
+            worker.trace_context().session_id(),
+            parent.trace_context().session_id(),
+            "a worker is its own trace session, never a break in the parent's"
+        );
+
+        // One writer, not two: what the worker enqueues, the parent's handle
+        // flushes.
+        worker
+            .telemetry_writer()
+            .expect("worker records")
+            .enqueue_telemetry(TelemetryRecord {
+                ts: 1,
+                worker: true,
+                ..Default::default()
+            });
+        let out = parent
+            .telemetry_writer()
+            .unwrap()
+            .shutdown(std::time::Duration::from_secs(10));
+        assert!(out.is_flushed());
+        assert_eq!(out.stats().written, 1);
+        let line = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(line.lines().count(), 1);
+        assert!(line.contains("\"worker\":true"), "{line}");
+    }
+
+    #[test]
+    fn worker_policy_keeps_telemetry_off_without_a_recording_parent() {
+        use crate::runtime::telemetry::TelemetryLevel;
+        let parent = crate::Runtime::new_headless();
+        let mut worker = crate::Runtime::new_headless();
+        apply_subagent_runtime_policy(
+            &mut worker,
+            &Default::default(),
+            None,
+            None,
+            Some(&parent.worker_telemetry()),
+        );
+        assert_eq!(worker.telemetry_level(), TelemetryLevel::Off);
+        assert!(worker.telemetry_writer().is_none());
+        assert!(!worker.trace_context().enabled());
+
+        // Manual contexts pass no telemetry: still Off.
+        let mut manual = crate::Runtime::new_headless();
+        apply_subagent_runtime_policy(&mut manual, &Default::default(), None, None, None);
+        assert_eq!(manual.telemetry_level(), TelemetryLevel::Off);
+        assert!(manual.telemetry_writer().is_none());
+    }
+
+    #[test]
+    fn every_worker_path_passes_parent_telemetry_before_streaming() {
+        // Both streaming dispatch sites must hand the parent's telemetry to
+        // tools, and every spawn path must pass it into the worker policy.
+        let dispatch = include_str!("../../runtime/stream.rs");
+        assert!(dispatch.contains("telemetry: Some(worker_telemetry.clone())"));
+        assert!(dispatch.contains("telemetry: Some(worker_telemetry_inner.clone())"));
+        for (name, source) in [
+            ("oneshot", include_str!("oneshot.rs")),
+            ("start", include_str!("start.rs")),
+            ("resume", include_str!("resume.rs")),
+        ] {
+            let capture = source
+                .find("let telemetry = ctx.capabilities.telemetry.clone();")
+                .unwrap();
+            let spawn = source.find("super::spawn_runtime().await").unwrap();
+            let policy = source
+                .find("super::apply_subagent_runtime_policy(")
+                .unwrap();
+            let pass = policy + source[policy..].find("telemetry.as_ref()").unwrap();
+            let stream = source.find("runtime.run_stream").unwrap();
+            assert!(capture < spawn && spawn < pass && pass < stream, "{name}");
         }
     }
 
@@ -760,7 +880,13 @@ mod forum_worker_tests {
         let mut actors = std::collections::HashSet::new();
         for _ in 0..3 {
             let mut worker = crate::Runtime::new_headless();
-            apply_subagent_runtime_policy(&mut worker, &Default::default(), Some(&binding), None);
+            apply_subagent_runtime_policy(
+                &mut worker,
+                &Default::default(),
+                Some(&binding),
+                None,
+                None,
+            );
             let inherited = worker.memory_backend_for_test();
             assert_eq!(inherited.forum_author().group, author.group);
             assert_eq!(
@@ -812,7 +938,7 @@ mod forum_worker_tests {
             "openai-codex/gpt-6-astra",
         ] {
             let mut runtime = crate::Runtime::new_headless();
-            apply_subagent_runtime_policy(&mut runtime, &Default::default(), None, None);
+            apply_subagent_runtime_policy(&mut runtime, &Default::default(), None, None, None);
             runtime.set_model(model.into());
             let before = runtime.reasoning_level();
             apply_anthropic_worker_reasoning(&mut runtime);
@@ -832,10 +958,16 @@ mod forum_worker_tests {
         let parent = crate::Runtime::new_headless();
         let parent_binding = parent.memory_backend_for_test();
         let mut worker = crate::Runtime::new_headless();
-        apply_subagent_runtime_policy(&mut worker, &Default::default(), Some(&parent_binding), None);
+        apply_subagent_runtime_policy(
+            &mut worker,
+            &Default::default(),
+            Some(&parent_binding),
+            None,
+            None,
+        );
         assert!(!worker.memory_backend_for_test().exclusive());
         let mut worker_none = crate::Runtime::new_headless();
-        apply_subagent_runtime_policy(&mut worker_none, &Default::default(), None, None);
+        apply_subagent_runtime_policy(&mut worker_none, &Default::default(), None, None, None);
         assert!(!worker_none.memory_backend_for_test().exclusive());
     }
 }
@@ -933,7 +1065,7 @@ mod retry_inheritance_tests {
                 cache_ttl: crate::config::CacheTtl::OneHour,
                 ..Default::default()
             };
-            super::apply_subagent_runtime_policy(&mut worker, &config, None, None);
+            super::apply_subagent_runtime_policy(&mut worker, &config, None, None, None);
             assert_eq!(worker.api_retries(), api);
             assert_eq!(worker.refusal_retries(), refusal);
             assert_eq!(worker.cache_ttl(), crate::config::CacheTtl::FiveMinutes);

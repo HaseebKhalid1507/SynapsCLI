@@ -3081,6 +3081,37 @@ impl Runtime {
         self.sync_observability();
     }
 
+    /// This session's telemetry, for the subagents it spawns.
+    pub fn worker_telemetry(&self) -> crate::runtime::telemetry::WorkerTelemetry {
+        crate::runtime::telemetry::WorkerTelemetry {
+            level: self.telemetry_level,
+            writer: self.telemetry_writer.clone(),
+        }
+    }
+
+    /// Record a worker's requests at its parent's telemetry level, through
+    /// the parent's session writer. Worker runtimes start `Off`
+    /// (`from_parts`), so without this every subagent request was missing
+    /// from `api-log.jsonl`.
+    ///
+    /// The writer is shared, not rebuilt: it owns its files from one thread,
+    /// and a writer per worker would race rotation. The trace context is
+    /// fresh, though: a worker is its own trace session with its own
+    /// cache-break snapshots, so its requests never read as breaks in the
+    /// parent's conversation. A parent that is `Off` leaves the worker `Off`.
+    pub fn inherit_telemetry(&mut self, parent: &crate::runtime::telemetry::WorkerTelemetry) {
+        match (&parent.writer, parent.level.enabled()) {
+            (Some(writer), true) => {
+                self.telemetry_level = parent.level;
+                self.trace_ctx = trace::TraceContext::with_sink(Arc::new(
+                    crate::runtime::telemetry::WriterTraceSink::new(writer.clone()),
+                ));
+                self.telemetry_writer = Some(writer.clone());
+            }
+            _ => self.set_telemetry_level(crate::runtime::telemetry::TelemetryLevel::Off),
+        }
+    }
+
     /// Reconcile the shared observability writer + trace sink with the
     /// telemetry level (Task 11 config rule, documented until Task 12 adds
     /// explicit trace config/UI): `basic`/`full` enables BOTH legacy
@@ -4206,6 +4237,7 @@ impl Runtime {
                                         session_allow_all: Some(self.session_allow_all.clone()),
                                         launch_cancel: None,
                                         memory_backend: Some(self.memory_backend.clone()),
+                                        telemetry: Some(self.worker_telemetry()),
                                         watcher_exit_path: self.watcher_exit_path.clone(),
                                         tool_register_tx: None,
                                         session_manager: Some(self.session_manager.clone()),
@@ -4330,6 +4362,7 @@ impl Runtime {
                             let session_allow_all_inner = self.session_allow_all.clone();
                             let orchestration_inner = cfg_orchestration.clone();
                             let memory_backend_inner = self.memory_backend.clone();
+                            let worker_telemetry_inner = self.worker_telemetry();
                             let memory_context_inner = self.memory_tool_capability();
                             let codex_parent_plan_inner = codex_parent_plan.clone();
                             let cwd_inner = cfg_cwd.clone();
@@ -4381,6 +4414,7 @@ impl Runtime {
                                                     session_allow_all: Some(session_allow_all_inner.clone()),
                                                     launch_cancel: None,
                                                     memory_backend: Some(memory_backend_inner),
+                                                    telemetry: Some(worker_telemetry_inner),
                                                     watcher_exit_path: exit_path,
                                                     tool_register_tx: None,
                                                     session_manager: Some(session_mgr_inner),

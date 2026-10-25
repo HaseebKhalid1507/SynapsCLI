@@ -120,6 +120,10 @@ pub struct ToolCapabilities {
     /// same binding; `None` is reserved for manually constructed contexts.
     /// A present binding is exclusive: errors never permit legacy fallback.
     pub memory_backend: Option<crate::memory_backend::MemoryBinding>,
+    /// Parent-session telemetry for the subagents this context spawns: they
+    /// record at the same level through the parent's session writer. `None`
+    /// (manual contexts) leaves workers `Off`.
+    pub telemetry: Option<crate::runtime::telemetry::WorkerTelemetry>,
     pub watcher_exit_path: Option<PathBuf>,
     pub tool_register_tx: Option<tokio::sync::mpsc::UnboundedSender<Vec<Arc<dyn Tool>>>>,
     pub session_manager: Option<std::sync::Arc<crate::tools::shell::SessionManager>>,
