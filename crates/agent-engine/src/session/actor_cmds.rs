@@ -580,7 +580,7 @@ impl SessionActor {
         }
         self.consecutive_auto_turns = 0;
         self.runtime.begin_conversation(Some(new_id.clone()));
-        self.journal_id.store(Arc::new(new_id.clone()));
+        self.set_journal_id(new_id.clone());
         self.publish_view().await;
         self.emit(SessionEventWire::Resumed {
             id,

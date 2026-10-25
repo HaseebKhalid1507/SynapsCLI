@@ -97,6 +97,9 @@ pub struct EngineHost {
     /// extension and the tail would pass the handler timeout and lose its
     /// injection for the whole session.
     session_start_gate: crate::session::session_start::SessionStartGate,
+    /// The daemon's pin book (set once by `Daemon::start`): sessions on this
+    /// host write their pin changes through it. `None` in-process.
+    pin_sink: OnceLock<Arc<dyn crate::session::PinSink>>,
 }
 
 /// (E-P2) Returned by [`EngineHost::claim_driver`] when another live session
@@ -219,6 +222,7 @@ impl EngineHost {
             extensions_loading: std::sync::atomic::AtomicBool::new(false),
             pending_mcp_discovery: std::sync::Mutex::new(pending_mcp_discovery),
             session_start_gate: crate::session::session_start::SessionStartGate::new(),
+            pin_sink: OnceLock::new(),
         }))
     }
 
@@ -314,6 +318,15 @@ impl EngineHost {
     /// to stderr and the log. The TUI shows them as notices instead.
     pub fn report_config_warnings(&self) {
         report_config_warnings(&self.config());
+    }
+
+    /// Install the daemon's pin book (first call wins).
+    pub fn set_pin_sink(&self, sink: Arc<dyn crate::session::PinSink>) {
+        let _ = self.pin_sink.set(sink);
+    }
+
+    pub(crate) fn pin_sink(&self) -> Option<&Arc<dyn crate::session::PinSink>> {
+        self.pin_sink.get()
     }
 
     /// The host's `on_session_start` gate (one hook at a time).
