@@ -1265,6 +1265,17 @@ impl ExtensionManager {
 
         self.hook_bus.unsubscribe_all(id).await;
         self.providers.unregister_plugin(id);
+        // Its tools go with it: each holds the handler being shut down, so
+        // a tool left behind would fail every call, and a reload whose new
+        // version no longer declares it would never replace it.
+        let tool_error = match &self.tools {
+            Some(tools) => {
+                let mut registry = tools.write().await;
+                let names = registry.tool_names_for_extension(id);
+                registry.try_disable(&names).err()
+            }
+            None => None,
+        };
         self.eager_permissions.remove(id);
         self.manifest_configs.remove(id);
         self.capabilities.remove(id);
@@ -1272,6 +1283,14 @@ impl ExtensionManager {
         self.manifest_theme_tokens.remove(id);
         handler.shutdown().await;
 
+        if let Some(error) = tool_error {
+            // Fail-closed like the deferred path: the extension is gone
+            // either way; surface the partial cleanup.
+            return Err(format!(
+                "Extension '{}' unloaded but its tools could not be deregistered: {}",
+                id, error
+            ));
+        }
         tracing::info!(extension = %id, "Extension unloaded");
         Ok(())
     }
