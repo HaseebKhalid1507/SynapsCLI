@@ -289,6 +289,13 @@ pub mod echo {
             journal_id: id.0.clone(),
             locked_by: None,
             pinned: false,
+            busy: false,
+            state_since: None,
+            park_due: None,
+            evict_due: None,
+            title: None,
+            cost_usd: 0.0,
+            messages: 0,
         }
     }
 
@@ -527,6 +534,13 @@ pub mod locked_placeholder {
             journal_id: id.0.clone(),
             locked_by: Some(holder_desc.clone()),
             pinned: false,
+            busy: false,
+            state_since: None,
+            park_due: None,
+            evict_due: None,
+            title: None,
+            cost_usd: 0.0,
+            messages: 0,
         };
         let view = crate::session::view::RuntimeView {
             model: config.model_override.clone().unwrap_or_else(|| "unknown".into()),

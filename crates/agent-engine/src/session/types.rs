@@ -355,6 +355,31 @@ pub struct SessionMeta {
     /// it (→ false); an older client ignores it.
     #[serde(default)]
     pub pinned: bool,
+    // ── state for the `/sessions` modal, published by the actor. An older
+    //    daemon omits them (→ defaults); an older client ignores them. ──
+    /// A turn or a compaction is running.
+    #[serde(default)]
+    pub busy: bool,
+    /// When the session entered its current state (turn/compaction start,
+    /// idle start, park time).
+    #[serde(default)]
+    pub state_since: Option<chrono::DateTime<chrono::Utc>>,
+    /// When the idle park fires (Live, zero clients, grace armed). `None`
+    /// when not armed — a worker re-check is not a park due.
+    #[serde(default)]
+    pub park_due: Option<chrono::DateTime<chrono::Utc>>,
+    /// When a Parked session is evicted; `None` if not parked or never.
+    #[serde(default)]
+    pub evict_due: Option<chrono::DateTime<chrono::Utc>>,
+    /// The live conversation's title, as of the last publish.
+    #[serde(default)]
+    pub title: Option<String>,
+    /// Session cost in USD, as of the last publish.
+    #[serde(default)]
+    pub cost_usd: f64,
+    /// API message count, as of the last publish.
+    #[serde(default)]
+    pub messages: usize,
 }
 
 /// Where a session is in its park/unpark life (`SessionHandle::lifecycle`).
