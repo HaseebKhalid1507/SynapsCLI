@@ -149,6 +149,18 @@ impl SessionActor {
         }
         if view_changed {
             self.publish_view().await;
+            // Clients mirror the view from `SettingChanged` (and `Attached`)
+            // only: without this, `/model` in one tab left every other
+            // tab's footer, and its next request's model chip, on the old one.
+            let view = (**self.view.load()).clone();
+            self.emit(SessionEventWire::SettingChanged(SettingApplied {
+                id: super::wire::VIEW_CHANGED_SETTING_ID,
+                setting: cmd.clone(),
+                ok: true,
+                message: None,
+                view,
+                clamp: None,
+            }));
         }
         if let Some(CommandResult::Compact {
             custom_instructions,

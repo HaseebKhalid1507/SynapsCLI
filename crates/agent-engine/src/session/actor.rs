@@ -337,6 +337,12 @@ fn replay_setting(rt: &mut Runtime, setting: &SessionSetting) {
 pub(crate) struct AttachedClient {
     pub(crate) meta: ClientMeta,
     pub(crate) mode: AttachMode,
+    /// Resolved at attach ([`resolve_client_name`]); unique in the session.
+    pub(crate) name: String,
+    /// Unix ms.
+    pub(crate) attached_at_ms: u64,
+    /// `SessionActor::input_seq` at this client's last input; 0 = none yet.
+    pub(crate) last_input: u64,
 }
 
 /// B2: a spawned `compact_conversation` (§2.5).
@@ -577,8 +583,13 @@ pub struct SessionActor {
     pub(crate) view: Arc<arc_swap::ArcSwap<RuntimeView>>,
     pub(crate) attached: HashMap<ClientId, AttachedClient>,
     /// B1: the one client whose input commands are honoured (`None` = any
-    /// host-originated sender only).
+    /// host-originated sender only). With `client_input = shared` it is the
+    /// *active* client: the drive client that sent input last.
     pub(crate) input_owner: Option<ClientId>,
+    /// Who may drive (config `client_input`, or the create override).
+    pub(crate) client_input: ClientInput,
+    /// Bumped on each input from a client ([`AttachedClient::last_input`]).
+    pub(crate) input_seq: u64,
     pub(crate) next_client_id: u64,
     pub(crate) seq: u64,
     pub(crate) turn_replay: VecDeque<Envelope>,
@@ -685,6 +696,7 @@ impl SessionActor {
             runtime.restore_session_memory_mode(mode);
         }
         let config: crate::SynapsConfig = (**host.config()).clone();
+        let client_input = cfg.client_input.unwrap_or(config.client_input);
 
         let mut sb = crate::engine::setup::resolve_session_and_prompt(
             &mut runtime,
@@ -837,6 +849,8 @@ impl SessionActor {
             clients: 0,
             input_owner: None,
             awaiting_input: 0,
+            roster: Vec::new(),
+            client_input: Some(client_input),
             journal_id: sb.session.id.clone(),
             locked_by: None,
             pinned: cfg.keep_warm,
@@ -875,6 +889,15 @@ impl SessionActor {
                 memory_mode,
             },
         ) = SessionHandle::new(meta.clone(), view);
+        // The mode is fixed for the session: seed the listing with it now.
+        // Otherwise only a presence publish (attach, detach, input) carries
+        // it, so a session restored at reload, with no client back yet,
+        // listed as `owner=-`. Not `publish_presence()`: that also sets the
+        // inbox gate, which stays as `SessionHandle::new` left it.
+        presence.store(Arc::new(super::handle::Presence {
+            client_input: Some(client_input),
+            ..Default::default()
+        }));
         *memory_mode.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = cfg.memory_mode;
         let (sp_tx, secret_prompt_rx) = mpsc::unbounded_channel();
         let session_start = if cfg.await_extensions {
@@ -932,6 +955,8 @@ impl SessionActor {
             view,
             attached: HashMap::new(),
             input_owner: None,
+            client_input,
+            input_seq: 0,
             next_client_id: 1,
             seq: 0,
             turn_replay: VecDeque::new(),
@@ -1217,7 +1242,71 @@ impl SessionActor {
             clients: self.attached.len(),
             input_owner: self.input_owner,
             awaiting_input: self.pending_prompts.len(),
+            roster: self.roster(),
+            client_input: Some(self.client_input),
         }));
+    }
+
+    /// Every attached client, by id.
+    pub(crate) fn roster(&self) -> Vec<ClientInfo> {
+        let mut roster: Vec<ClientInfo> = self
+            .attached
+            .iter()
+            .map(|(id, a)| ClientInfo {
+                id: *id,
+                name: a.name.clone(),
+                kind: a.meta.kind,
+                mode: a.mode,
+                attached_at_ms: a.attached_at_ms,
+            })
+            .collect();
+        roster.sort_by_key(|c| c.id.0);
+        roster
+    }
+
+    /// `tui (#1)`, or `client #1` for an id that isn't attached.
+    fn client_label(&self, id: ClientId) -> String {
+        match self.attached.get(&id) {
+            Some(a) => format!("{} (#{})", a.name, id.0),
+            None => format!("client #{}", id.0),
+        }
+    }
+
+    /// Why client `c` may not send an input command, if it may not.
+    /// `exclusive`: anyone but the owner. `shared`: observers (and clients
+    /// that aren't attached); every drive client may.
+    fn input_refusal(&self, c: ClientId) -> Option<String> {
+        match self.client_input {
+            ClientInput::Exclusive => (self.input_owner != Some(c)).then(|| match self.input_owner {
+                Some(o) => format!("input owned by {}", self.client_label(o)),
+                None => "input has no owner; attach with --takeover".to_string(),
+            }),
+            ClientInput::Shared => match self.attached.get(&c).map(|a| a.mode) {
+                Some(AttachMode::Mirror | AttachMode::Takeover) => None,
+                Some(AttachMode::Observe) => {
+                    Some("this client is read-only (attached with --observe)".to_string())
+                }
+                None => Some("this client is not attached".to_string()),
+            },
+        }
+    }
+
+    /// Client `c` sent input (or answered a prompt): remember when, and with
+    /// `client_input = shared` make it the active client. Observers never
+    /// become active.
+    fn note_input(&mut self, c: ClientId) {
+        let Some(a) = self.attached.get_mut(&c) else { return };
+        if a.mode == AttachMode::Observe {
+            return;
+        }
+        self.input_seq += 1;
+        a.last_input = self.input_seq;
+        if self.client_input == ClientInput::Shared && self.input_owner != Some(c) {
+            let from = self.input_owner;
+            self.input_owner = Some(c);
+            self.emit(SessionEventWire::InputOwnerChanged { from, to: Some(c), reason: OwnerChangeReason::Input });
+            self.publish_presence();
+        }
     }
 
     /// Recomputes `state` from clients/streaming and (re)arms or disarms the
@@ -4147,6 +4236,12 @@ impl SessionActor {
             v.trim()
                 .eq_ignore_ascii_case(crate::tools::CONFIRM_ANSWER_ALLOW_ALL)
         });
+        // An answer is input too: with `client_input = shared` the answering
+        // drive client becomes active first, so "Allow all" (owner only)
+        // is its to choose.
+        if let Some(c) = from {
+            self.note_input(c);
+        }
         if let Some(reason) = self.confirm_answer_refusal(from, &self.pending_prompts[pos].0, allow_all) {
             if let Some(c) = from {
                 self.emit(SessionEventWire::Refused {
@@ -4167,7 +4262,7 @@ impl SessionActor {
         self.publish_presence();
         self.emit(SessionEventWire::PromptResolved { prompt_id });
         let by = match from {
-            Some(c) => format!("client #{}", c.0),
+            Some(c) => self.client_label(c),
             None => "the host".to_string(),
         };
         // prA N3: the tool card shows the model's original input; when the
@@ -4439,6 +4534,8 @@ impl SessionActor {
             replay: self.turn_replay.iter().cloned().collect(),
             pending_prompts: self.pending_prompts.iter().map(|(p, _)| p.clone()).collect(),
             clients: self.attached.iter().map(|(c, a)| (*c, a.meta.kind)).collect(),
+            roster: self.roster(),
+            client_input: self.client_input,
             input_owner: self.input_owner,
             display_tail: None,
         }
@@ -4480,7 +4577,16 @@ impl SessionActor {
         let kind = client.kind;
         self.cache_keepwarm_note_attach(kind, mode);
         let snapshot_meta = client.clone();
-        self.attached.insert(cid, AttachedClient { meta: client, mode });
+        let name = resolve_client_name(
+            client.name.as_deref(),
+            kind,
+            self.attached.values().map(|a| a.name.as_str()),
+        );
+        let attached_at_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+        self.attached.insert(
+            cid,
+            AttachedClient { meta: client, mode, name: name.clone(), attached_at_ms, last_input: 0 },
+        );
         self.update_attach_state();
         let mut owner_change: Option<(Option<ClientId>, OwnerChangeReason)> = None;
         match mode {
@@ -4516,7 +4622,7 @@ impl SessionActor {
             client: cid,
             snapshot,
         });
-        self.emit(SessionEventWire::ClientJoined { client: cid, kind });
+        self.emit(SessionEventWire::ClientJoined { client: cid, kind, name, mode });
     }
 
     /// B1 `/takeover`: the sending client takes input in place, as an
@@ -4549,6 +4655,7 @@ impl SessionActor {
         self.input_owner = Some(c);
         self.emit(SessionEventWire::InputOwnerChanged { from, to: Some(c), reason });
         self.publish_presence();
+        self.note_input(c); // most recent, for promotion on detach
     }
 
     /// Never touches `stream`/`cancel`: the turn keeps running and its
@@ -4561,12 +4668,16 @@ impl SessionActor {
         self.update_attach_state();
         self.emit(SessionEventWire::ClientLeft { client });
         if self.input_owner == Some(client) {
+            // `shared`: back to whoever typed last (a script that sent one
+            // prompt and left hands input back to the tab in use);
+            // `exclusive`: the lowest id, as before. Ties: the lowest id.
+            let shared = self.client_input == ClientInput::Shared;
             let next = self
                 .attached
                 .iter()
                 .filter(|(_, a)| a.mode != AttachMode::Observe)
-                .map(|(c, _)| *c)
-                .min_by_key(|c| c.0);
+                .max_by_key(|(c, a)| (if shared { a.last_input } else { 0 }, std::cmp::Reverse(c.0)))
+                .map(|(c, _)| *c);
             self.input_owner = next;
             self.emit(SessionEventWire::InputOwnerChanged {
                 from: Some(client),
@@ -4899,11 +5010,7 @@ impl SessionActor {
                 });
                 return ControlFlow::Continue(());
             }
-            if is_input_command(&cmd) && self.input_owner != Some(c) {
-                let reason = match self.input_owner {
-                    Some(o) => format!("input owned by client #{}", o.0),
-                    None => "input has no owner; attach with --takeover".to_string(),
-                };
+            if let Some(reason) = is_input_command(&cmd).then(|| self.input_refusal(c)).flatten() {
                 self.emit(SessionEventWire::Refused {
                     client: c,
                     command: command_name(&cmd).to_string(),
@@ -4927,6 +5034,14 @@ impl SessionActor {
                 None => self.emit(SessionEventWire::SystemNotice(reason)),
             }
             return ControlFlow::Continue(());
+        }
+        // Accepted input: with `client_input = shared` its sender becomes the
+        // active client. `KeepWarm` doesn't count: `--keep-warm` sends it
+        // on attach, not a person typing.
+        if let Some(c) = from {
+            if is_input_command(&cmd) && !matches!(cmd, SessionCommand::KeepWarm { .. }) {
+                self.note_input(c);
+            }
         }
         // B3: anything that needs the runtime wakes a parked session first.
         if self.is_parked() {

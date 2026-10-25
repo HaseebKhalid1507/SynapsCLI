@@ -50,6 +50,9 @@ pub struct AttachOpts {
     /// `--name`: name the created session (`synaps send --session <name>`
     /// resolves it at once).
     pub name: Option<String>,
+    /// `--as`: what this client is called in the session; `None` =
+    /// `SYNAPS_CLIENT_NAME`, else the daemon's default (`tui`, `tui-2`, …).
+    pub client_name: Option<String>,
     /// A plain `synaps` adopted a running daemon (no explicit `--attach`):
     /// after attaching, show what else lives in this daemon so parked
     /// work stays discoverable (F1).
@@ -324,7 +327,12 @@ pub async fn run_attached(mut opts: AttachOpts) -> Result<()> {
             None,
         )));
     }
+    let client_name = opts.client_name.clone().or_else(agent_engine::session::client_name_from_env);
+    if let Some(name) = client_name.as_deref() {
+        agent_engine::session::validate_client_name(name).map_err(cfg_err)?;
+    }
     let hello = Hello::new(ClientKind::Tui)
+        .with_name(client_name)
         .with_history(HistoryMode::from_env_or(HistoryMode::attach_client_default()));
     let conn = match SocketTransport::connect(&paths.sock, hello).await {
         Ok(c) => c,
@@ -432,6 +440,7 @@ pub async fn run_attached(mut opts: AttachOpts) -> Result<()> {
 
     let mut app = app_from_snapshot(&snapshot);
     app.observing = transport.mode() == AttachMode::Observe;
+    app.attached_clients = transport.roster().clients().len();
     let (msgs, bytes) = super::app::scrollback_from_env(&TransportMode::Socket);
     app.transcript.set_scrollback(msgs, bytes);
     ladder("app", &"");
@@ -471,7 +480,7 @@ pub async fn run_attached(mut opts: AttachOpts) -> Result<()> {
     // the actor's pending prompts.
     let replay = snapshot.replay.clone();
     let pending = snapshot.pending_prompts.clone();
-    let owns_input = snapshot.input_owner == Some(transport.client_id());
+    let owns_input = super::session_link::may_drive(&transport);
     app.streaming = snapshot.streaming;
 
     let mut ctx = finish_setup(
@@ -670,6 +679,7 @@ mod tests {
             keep_warm: false,
             new_session,
             name: None,
+            client_name: None,
             adopted: false,
         }
     }
@@ -688,6 +698,8 @@ mod tests {
             clients,
             input_owner: None,
             awaiting_input: 0,
+            roster: Vec::new(),
+            client_input: None,
             journal_id: String::new(),
             locked_by: None,
             pinned: false,

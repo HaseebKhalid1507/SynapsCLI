@@ -15,7 +15,7 @@ use synaps_cli::extensions::runtime::InvokeCommandEvent;
 #[allow(dead_code)]
 /// Commands that work while streaming.
 pub(super) const STREAMING_COMMANDS: &[&str] = &[
-    "gamba", "theme", "quit", "exit", "attachments", "detach", "watch", "settings", "takeover",
+    "gamba", "theme", "quit", "exit", "attachments", "detach", "watch", "settings", "clients", "takeover",
 ];
 
 /// Merged list of built-ins + registered skill names (deduped, sorted).
@@ -49,6 +49,9 @@ pub(super) enum CommandAction {
     OpenEffort,
     /// Open the /settings modal.
     OpenSettings,
+    /// `/clients` typed mid-stream: [`clients`] needs the session link,
+    /// which [`handle_streaming_command`] doesn't have.
+    Clients,
     /// Open the /plugins modal.
     OpenPlugins,
     /// Open the searchable /help find lightbox.
@@ -357,6 +360,10 @@ pub(super) const TAKEOVER_IN_PROCESS: &str =
 pub(super) const TAKEOVER_OBSERVING: &str =
     "takeover: this client is observing (--observe) and never owns input; attach without --observe to take it";
 pub(super) const TAKEOVER_ALREADY: &str = "takeover: you already own input";
+pub(super) const TAKEOVER_SHARED: &str = "takeover: input is shared, so every client can already type; \
+     this one is now the active client (it gets input back first after a daemon reload)";
+pub(super) const TAKEOVER_SHARED_ALREADY: &str =
+    "takeover: input is shared, so every client can already type; this one is already the active client";
 
 /// `/takeover`: take input ownership from the client that holds it, in
 /// place (the in-session form of `synaps --attach --takeover`). The session
@@ -365,12 +372,13 @@ pub(super) const TAKEOVER_ALREADY: &str = "takeover: you already own input";
 /// the turn keeps running, only who drives the session changes.
 pub(super) async fn takeover(app: &mut App, link: &mut super::session_link::SessionLink) {
     let t = link.transport();
+    let shared = t.client_input() == agent_engine::session::ClientInput::Shared;
     let note = if t.daemon_pid() == 0 {
         Some(TAKEOVER_IN_PROCESS)
     } else if t.mode() == agent_engine::session::AttachMode::Observe {
         Some(TAKEOVER_OBSERVING)
     } else if t.input_owner() == Some(t.client_id()) {
-        Some(TAKEOVER_ALREADY)
+        Some(if shared { TAKEOVER_SHARED_ALREADY } else { TAKEOVER_ALREADY })
     } else {
         None
     };
@@ -378,8 +386,11 @@ pub(super) async fn takeover(app: &mut App, link: &mut super::session_link::Sess
         app.push_msg(ChatMessage::System(note.to_string()));
         return;
     }
-    if let Err(e) = link.send(agent_engine::session::SessionCommand::TakeInput).await {
-        app.push_msg(ChatMessage::Error(format!("takeover failed: {e}")));
+    match link.send(agent_engine::session::SessionCommand::TakeInput).await {
+        // Shared mode shows no toast when the active client moves: say it here.
+        Ok(()) if shared => app.push_msg(ChatMessage::System(TAKEOVER_SHARED.to_string())),
+        Ok(()) => {}
+        Err(e) => app.push_msg(ChatMessage::Error(format!("takeover failed: {e}"))),
     }
 }
 
@@ -415,6 +426,61 @@ async fn pin_command(cmd: &str, arg: &str, app: &mut App, link: &mut super::sess
             Err(e) => app.push_msg(ChatMessage::Error(format!("pin failed: {e}"))),
         },
         _ => app.push_msg(ChatMessage::Error(format!("usage: /{cmd} [on|off|status]"))),
+    }
+}
+
+/// `/clients` in an in-process session: there is no daemon, only this TUI.
+pub(super) const CLIENTS_IN_PROCESS: &str = "clients: in-process session; this TUI is its only client";
+
+/// `/clients`: every client attached to this session, from the transport's
+/// roster (attach snapshot + `ClientJoined`/`ClientLeft`), one line each:
+/// name and id, kind, `drive`/`observe`, who owns input (with
+/// `client_input = shared`: who is active), which is you, and how long it
+/// has been attached.
+pub(super) fn clients(app: &mut App, link: &super::session_link::SessionLink) {
+    let t = link.transport();
+    if t.daemon_pid() == 0 {
+        app.push_msg(ChatMessage::System(CLIENTS_IN_PROCESS.to_string()));
+        return;
+    }
+    let roster = t.roster();
+    let shared = t.client_input() == agent_engine::session::ClientInput::Shared;
+    let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+    let n = roster.clients().len();
+    let mut lines = vec![format!(
+        "{n} client{} attached{}",
+        if n == 1 { "" } else { "s" },
+        if shared { " · input shared (every drive client types; active = typed last)" } else { "" }
+    )];
+    for c in roster.clients() {
+        let mut row = format!(
+            "  {:<20} {:<7} {}",
+            c.label(),
+            c.kind.default_name(),
+            if c.mode == agent_engine::session::AttachMode::Observe { "observe" } else { "drive" },
+        );
+        if t.input_owner() == Some(c.id) {
+            // Shared input: everyone (but observers) types; this one did last.
+            row.push_str(if shared { " · active" } else { " · owns input" });
+        }
+        if c.id == t.client_id() {
+            row.push_str(" · you");
+        }
+        if c.attached_at_ms > 0 {
+            row.push_str(&format!(" · {}", attached_for(now_ms.saturating_sub(c.attached_at_ms))));
+        }
+        lines.push(row);
+    }
+    app.push_msg(ChatMessage::System(lines.join("\n")));
+}
+
+/// `attached 3m`, `attached 2h 5m`: how long a client has been attached.
+fn attached_for(ms: u64) -> String {
+    let mins = ms / 60_000;
+    match mins {
+        0 => "attached just now".to_string(),
+        1..=59 => format!("attached {mins}m"),
+        _ => format!("attached {}h {}m", mins / 60, mins % 60),
     }
 }
 
@@ -819,6 +885,7 @@ async fn run_command(
             }
         }
         "pin" | "keep-warm" => pin_command(cmd, arg, app, link).await,
+        "clients" => clients(app, link),
         "takeover" => takeover(app, link).await,
         "keepwarm" => {
             // Prompt-cache keep-warm lives on the actor (task #444):
@@ -1599,6 +1666,7 @@ pub(super) fn handle_streaming_command(
             CommandAction::None
         }
         "quit" | "exit" => CommandAction::Quit,
+        "clients" => CommandAction::Clients,
         // Mid-turn rules live with the rows (settings::mid_turn_refusal,
         // helpers::apply_setting's next-turn notice).
         "settings" => CommandAction::OpenSettings,
@@ -1915,6 +1983,63 @@ mod tests {
         assert_eq!(resolve_prefix("pin", &all), "pin", "not /ping");
     }
 
+    /// `/clients` lists the roster by name, marks the owner and this
+    /// client, tells drivers from observers, and sends nothing. Mid-stream
+    /// it is a `CommandAction`; in-process it says there's one client.
+    #[tokio::test]
+    async fn clients_lists_the_roster_by_name_and_sends_nothing() {
+        use agent_engine::session::{AttachMode, ClientId, ClientInfo, ClientKind};
+        let info = |id: u64, name: &str, kind: ClientKind, mode: AttachMode| ClientInfo {
+            id: ClientId(id),
+            name: name.to_string(),
+            kind,
+            mode,
+            attached_at_ms: 0,
+        };
+        let transport = crate::tui::testing::scripted::ScriptedTransport::new(synaps_cli::Runtime::new().await.unwrap())
+            .with_daemon_pid(4242)
+            .with_roster(vec![
+                info(1, "terminal", ClientKind::Tui, AttachMode::Mirror),
+                info(2, "dashboard", ClientKind::Attach, AttachMode::Observe),
+            ]);
+        let log = Arc::clone(&transport.log);
+        let mut link = crate::tui::session_link::SessionLink::new(Box::new(transport));
+        let mut app = crate::tui::app::App::new(synaps_cli::Session::new("test", "medium", None));
+        let system_prompt_path = PathBuf::from("/tmp/synaps-test-system-prompt");
+        let registry = Arc::new(CommandRegistry::new_with_plugins(&[], vec![], vec![]));
+        let keybinds = synaps_cli::skills::keybinds::KeybindRegistry::new();
+
+        let action = handle_command("clients", "", &mut app, &mut link, &system_prompt_path, &registry, &keybinds).await;
+        assert!(matches!(action, CommandAction::None));
+        let listing = app
+            .transcript
+            .messages()
+            .iter()
+            .find_map(|m| match &m.msg {
+                ChatMessage::System(s) if s.starts_with("2 clients attached") => Some(s.clone()),
+                _ => None,
+            })
+            .expect("the listing");
+        let rows: Vec<&str> = listing.lines().skip(1).collect();
+        assert_eq!(rows.len(), 2, "{listing}");
+        assert!(rows[0].contains("terminal (#1)") && rows[0].contains("drive"), "{listing}");
+        assert!(rows[0].contains("owns input") && rows[0].contains("you"), "{listing}");
+        assert!(rows[1].contains("dashboard (#2)") && rows[1].contains("observe"), "{listing}");
+        assert!(!rows[1].contains("you") && !rows[1].contains("owns input"), "{listing}");
+        assert!(log.lock().unwrap().sent.is_empty(), "nothing reaches the session");
+
+        // Mid-stream: the dispatcher runs it with the link.
+        assert!(super::STREAMING_COMMANDS.contains(&"clients"));
+        assert!(matches!(super::handle_streaming_command("clients", "/clients", &mut app), CommandAction::Clients));
+        assert!(synaps_cli::skills::BUILTIN_COMMANDS.contains(&"clients"));
+
+        // In-process: one client, no roster to show.
+        let transport = crate::tui::testing::scripted::ScriptedTransport::new(synaps_cli::Runtime::new().await.unwrap());
+        let link = crate::tui::session_link::SessionLink::new(Box::new(transport));
+        super::clients(&mut app, &link);
+        assert!(app.transcript.messages().iter().any(|m| matches!(&m.msg, ChatMessage::System(s) if s == super::CLIENTS_IN_PROCESS)));
+    }
+
     /// In-process the session ends with the TUI, so there is nothing to pin.
     #[tokio::test]
     async fn pin_in_process_says_it_only_applies_to_a_daemon_session() {
@@ -1999,6 +2124,34 @@ mod tests {
             assert!(log.lock().unwrap().sent.is_empty(), "{note}: nothing reaches the session");
         }
         assert!(synaps_cli::skills::BUILTIN_COMMANDS.contains(&"takeover"));
+    }
+
+    /// With `client_input = shared` every client already types: `/takeover`
+    /// only makes this one the active client, and says so (no toast comes).
+    #[tokio::test]
+    async fn takeover_with_shared_input_says_it_only_moves_the_active_client() {
+        use agent_engine::session::{AttachMode, ClientId, ClientInput};
+        let system_prompt_path = PathBuf::from("/tmp/synaps-test-system-prompt");
+        let registry = Arc::new(CommandRegistry::new_with_plugins(&[], vec![], vec![]));
+        let keybinds = synaps_cli::skills::keybinds::KeybindRegistry::new();
+        let transport = crate::tui::testing::scripted::ScriptedTransport::new(synaps_cli::Runtime::new().await.unwrap())
+            .with_daemon_pid(4242)
+            .with_ownership(AttachMode::Mirror, Some(ClientId(7)))
+            .with_client_input(ClientInput::Shared);
+        let log = Arc::clone(&transport.log);
+        let mut link = crate::tui::session_link::SessionLink::new(Box::new(transport));
+        assert!(crate::tui::session_link::may_drive(link.transport()), "shared: a non-active mirror drives");
+        let mut app = crate::tui::app::App::new(synaps_cli::Session::new("test", "medium", None));
+        let says = |app: &crate::tui::app::App, want: &str| {
+            app.transcript.messages().iter().any(|m| matches!(&m.msg, ChatMessage::System(s) if s == want))
+        };
+        handle_command("takeover", "", &mut app, &mut link, &system_prompt_path, &registry, &keybinds).await;
+        assert_eq!(log.lock().unwrap().sent, vec!["TakeInput".to_string()]);
+        assert!(says(&app, super::TAKEOVER_SHARED));
+        link.next_event().await.expect("the active marker moves");
+        handle_command("takeover", "", &mut app, &mut link, &system_prompt_path, &registry, &keybinds).await;
+        assert_eq!(log.lock().unwrap().sent.len(), 1, "already active: nothing sent");
+        assert!(says(&app, super::TAKEOVER_SHARED_ALREADY));
     }
 
     /// Mid-stream `/takeover` runs (it never steers): the dispatcher gets

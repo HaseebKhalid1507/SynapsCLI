@@ -641,12 +641,16 @@ pub(super) async fn handle_session_event_arm(
             super::watch::on_query_result(app, id, &value, std::time::Instant::now());
         }
         SessionEventWire::SettingChanged(_) => {
-            // Unsolicited (another client's Set): the view was refreshed by
-            // `SessionLink::note`; nothing to render.
+            // Unsolicited (another client's Set or `/model`): the view was
+            // refreshed by `SessionLink::note`; redraw so the footer shows it.
+            app.request_redraw();
         }
-        SessionEventWire::Attached { .. }
-        | SessionEventWire::ClientJoined { .. }
-        | SessionEventWire::ClientLeft { .. } => {}
+        SessionEventWire::Attached { .. } => {}
+        // The transport's roster already took the change.
+        SessionEventWire::ClientJoined { .. } | SessionEventWire::ClientLeft { .. } => {
+            app.attached_clients = link.transport().roster().clients().len();
+            app.request_redraw();
+        }
         SessionEventWire::Ended { reason } => {
             app.session_ended = Some(reason);
             return ArmFlow::Ended;
@@ -755,14 +759,19 @@ pub(super) async fn handle_session_event_arm(
         }
         SessionEventWire::Resumed { .. } => {}
         SessionEventWire::InputOwnerChanged { from, to, .. } => {
-            prompt_bridge.set_owns_input(to == Some(me));
-            if to != Some(me) {
+            let may_drive = super::session_link::may_drive_with_owner(link.transport(), to);
+            prompt_bridge.set_owns_input(may_drive);
+            if !may_drive {
                 // A prompt already on screen loses its Allow-all button too.
                 app.secret_prompts.drop_allow_all();
             }
-            if from == Some(me) && to != Some(me) {
+            let shared = link.transport().client_input() == agent_engine::session::ClientInput::Shared;
+            if shared {
+                // Input is shared: the active marker moving (you typed in
+                // another tab) is not news. `/clients` shows it.
+            } else if from == Some(me) && to != Some(me) {
                 let who = to
-                    .map(|c| format!("client #{}", c.0))
+                    .map(|c| link.transport().roster().label(c))
                     .unwrap_or_else(|| "nobody".to_string());
                 app.toasts.upsert(
                     super::toast::Toast::new("input-owner", format!("input taken over by {who}"))
@@ -788,12 +797,17 @@ pub(super) async fn handle_session_event_arm(
                 // `/takeover` changes no turn and submitted nothing: no undo.
                 app.push_msg(ChatMessage::Error(format!("/takeover refused: {reason}")));
             } else if client == me {
-                app.push_msg(ChatMessage::Error(format!(
-                    "{command} refused: {reason}{}",
-                    takeover_hint(&reason, app.observing)
-                )));
+                let line = format!("{command} refused: {reason}{}", takeover_hint(&reason, app.observing));
+                let presented = app.streaming && app.turn_baseline == app.api_messages_len;
+                if app.streaming && !presented {
+                    // A turn is streaming (another client's, or ours before
+                    // a refused steer): an error line would split its reply.
+                    app.toasts.upsert(super::toast::Toast::new("refused", line).titled("Session"));
+                } else {
+                    app.push_msg(ChatMessage::Error(line));
+                }
                 // The pre-send presentation assumed a turn: undo it.
-                if app.streaming && app.turn_baseline == app.api_messages_len {
+                if presented {
                     app.header_turn_ended(None);
                     app.streaming = false;
             app.quit_guard.reset();

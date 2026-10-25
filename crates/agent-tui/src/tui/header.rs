@@ -77,6 +77,9 @@ pub(crate) struct HeaderSnap {
     pub(crate) folder: String,
     /// This client is attached read-only (`synaps --attach --observe`).
     pub(crate) observing: bool,
+    /// Clients attached to this daemon session, this one included (0
+    /// in-process). Shown when more than one.
+    pub(crate) clients: usize,
 }
 
 /// What the header shows, derived per frame from the snapshot.
@@ -293,6 +296,8 @@ pub(crate) struct HeaderView<'a> {
     /// The worker whose view is focused.
     pub(crate) watching: Option<&'a str>,
     pub(crate) observing: bool,
+    /// Clients attached to the session (see [`HeaderSnap::clients`]).
+    pub(crate) clients: usize,
     /// Active or failed sidecar pills: `(label, failed)`. Idle ones are
     /// never listed.
     pub(crate) pills: Vec<(String, bool)>,
@@ -327,6 +332,7 @@ impl<'a> HeaderView<'a> {
             folder: &snap.folder,
             watching: model.watch_banner.as_ref().map(|b| b.agent_name.as_str()),
             observing: snap.observing,
+            clients: snap.clients,
             pills,
             workers: running.clone().count(),
             longest_worker_secs: running
@@ -614,6 +620,10 @@ fn well_items(v: &HeaderView<'_>) -> Vec<(Spans, Role)> {
         .collect();
     if v.observing {
         out.push((vec![("observing".into(), Role::Warn, false)], Role::Warn));
+    }
+    if v.clients > 1 {
+        // Another tab, a dashboard, a bridge: `/clients` says who.
+        out.push((vec![(format!("{} clients", v.clients), Role::Session, false)], Role::Session));
     }
     out
 }
@@ -1096,6 +1106,7 @@ mod tests {
             folder: "~/Projects/SynapsCLI",
             watching: None,
             observing: false,
+            clients: 0,
             pills: Vec::new(),
             workers: 0,
             longest_worker_secs: 0,
@@ -1327,6 +1338,17 @@ mod tests {
         let line = row(&draw(&v, 120), 0);
         assert_eq!(line.matches("agents").count(), 1, "{line:?}");
         assert!(line.contains("\u{280b} 3 agents 4m12s"), "{line:?}");
+    }
+
+    /// Another client attached (a tab, a dashboard): a `2 clients` well.
+    /// One client, or in-process (0), shows nothing.
+    #[test]
+    fn a_clients_well_shows_only_with_another_client() {
+        for (clients, shown) in [(0, false), (1, false), (2, true), (3, true)] {
+            let v = HeaderView { clients, ..view() };
+            let line = row(&draw(&v, 120), 0);
+            assert_eq!(line.contains(&format!("{clients} clients")), shown, "{clients}: {line:?}");
+        }
     }
 
     #[test]

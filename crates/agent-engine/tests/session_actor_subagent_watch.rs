@@ -26,7 +26,7 @@ struct FakeWorker {
 /// A session whose registry holds one fake running worker `sa_1` ("scout").
 async fn session_with_worker() -> (agent_engine::session::SessionHandle, FakeWorker) {
     let host = host().await;
-    let (handle, task) = host.create_session_unspawned(cfg()).await.unwrap();
+    let (handle, task) = host.create_session_unspawned(exclusive_cfg()).await.unwrap();
     let state = Arc::new(RwLock::new(SubagentState::new()));
     let (tx, rx) = mpsc::unbounded_channel();
     task.subagent_registry()

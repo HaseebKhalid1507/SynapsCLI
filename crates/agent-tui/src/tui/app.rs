@@ -195,6 +195,10 @@ pub(crate) struct App {
     pub(crate) header_folder: String,
     /// Attached read-only (`--observe`): the header shows `observing`.
     pub(crate) observing: bool,
+    /// Clients attached to this daemon session, this one included (0
+    /// in-process); kept from the transport's roster. The header shows it
+    /// when more than one.
+    pub(crate) attached_clients: usize,
     /// (E-P8) Thin session-driver client state: "driver armed" mirror, set
     /// purely from `DriverArmed`/`DriverRevoked` wire events. Gates Esc/Ctrl-C
     /// routing and the status toast. The actor owns all driver lifecycle.
@@ -471,6 +475,7 @@ impl App {
             header_epoch: std::time::Instant::now(),
             header_folder: super::header::current_folder(),
             observing: false,
+            attached_clients: 0,
             driver_ui: super::driver_client::DriverUiState::default(),
             gamba_child: None,
             settings: None,
@@ -792,6 +797,7 @@ impl App {
             anim_ms: now.saturating_duration_since(self.header_epoch).as_millis() as u64,
             folder: self.header_folder.clone(),
             observing: self.observing,
+            clients: self.attached_clients,
         }
     }
 

@@ -494,6 +494,22 @@ fn waiting_label(req: &PromptRequest) -> String {
     }
 }
 
+/// Whether this client may drive the session now: with
+/// `client_input = shared` any non-observer may; with `exclusive` only the
+/// input owner.
+pub(crate) fn may_drive(t: &dyn ClientTransport) -> bool {
+    may_drive_with_owner(t, t.input_owner())
+}
+
+/// [`may_drive`] with `owner` holding input: an `InputOwnerChanged` handler
+/// passes the event's `to`, whether or not the transport has applied it.
+pub(crate) fn may_drive_with_owner(t: &dyn ClientTransport, owner: Option<agent_engine::session::ClientId>) -> bool {
+    match t.client_input() {
+        agent_engine::session::ClientInput::Shared => t.mode() != AttachMode::Observe,
+        agent_engine::session::ClientInput::Exclusive => owner == Some(t.client_id()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -91,6 +91,8 @@ fn refused_while_draining(cmd: &SessionCommand) -> bool {
         )
 }
 
+// One per line read, consumed at once: not worth boxing every frame.
+#[allow(clippy::large_enum_variant)]
 enum Read {
     Frame(ClientFrame),
     Eof,
@@ -195,6 +197,12 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
                 ),
             })
             .await;
+        let _ = writer.await;
+        return;
+    }
+    // Clients validate their name before connecting; this is the backstop.
+    if let Some(Err(message)) = hello.client.name.as_deref().map(crate::session::validate_client_name) {
+        let _ = tx.send(DaemonFrame::Refused { reason: RefuseReason::Protocol, message }).await;
         let _ = writer.await;
         return;
     }
@@ -437,7 +445,9 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
             return;
         }
     };
+    let legacy = legacy_shared(hello.client.capabilities, snapshot.client_input);
     let snapshot = replay_for(hello.client.capabilities, snapshot);
+    let snapshot = if legacy { as_owner(client, snapshot) } else { snapshot };
     if tx.send(DaemonFrame::Attached(AttachedWire::new(client, snapshot))).await.is_err() {
         let _ = handle.send(SessionCommand::Detach { client }).await;
         return;
@@ -465,7 +475,9 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
     // the `Conversation` digest the actor emits right after is what they key on.
     let history = hello.client.history;
     let caps = hello.client.capabilities;
-    let skip = move |env: &Envelope| -> bool { !forwarded(history, caps, env) };
+    let skip = move |env: &Envelope| -> bool {
+        !forwarded(history, caps, env) || (legacy && matches!(env.event, SessionEventWire::InputOwnerChanged { .. }))
+    };
     // Not tied to `shutdown`: on daemon stop the client must still see `Ended`.
     let mut forward = tokio::spawn(async move {
         loop {
@@ -677,6 +689,18 @@ fn replay_for(caps: ClientCapabilities, mut snapshot: AttachSnapshot) -> AttachS
     snapshot
 }
 
+/// [`legacy_shared`]: the snapshot as an older client on a shared session
+/// gets it: it owns input unless it observes, and its replay has no owner
+/// changes (it never gets live ones either).
+fn as_owner(client: ClientId, mut snapshot: AttachSnapshot) -> AttachSnapshot {
+    let observes = snapshot.roster.iter().any(|c| c.id == client && c.mode == AttachMode::Observe);
+    if !observes {
+        snapshot.input_owner = Some(client);
+    }
+    snapshot.replay.retain(|env| !matches!(env.event, SessionEventWire::InputOwnerChanged { .. }));
+    snapshot
+}
+
 fn reload_bye(state: &DaemonState) -> ByeReason {
     ByeReason::Reloading {
         generation: state.reload_generation.load(Ordering::SeqCst),
@@ -760,6 +784,8 @@ mod tests {
             replay: vec![queued.clone(), result.clone(), started.clone()],
             pending_prompts: vec![],
             clients: vec![],
+            roster: Vec::new(),
+            client_input: ClientInput::wire_default(),
             input_owner: None,
             display_tail: None,
         };

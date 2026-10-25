@@ -236,6 +236,7 @@ pub const BUILTIN_COMMANDS: &[&str] = &[
     // (the prompt-cache pings, which cost money).
     "pin",
     "keep-warm",
+    "clients",
     // Take input from the daemon client that owns it (`--takeover`, in place).
     "takeover",
     "trace",

@@ -63,6 +63,11 @@ pub const IDLE_PROBE_QUERY_ID: u64 = RESERVED_QUERY_ID_BASE + 1;
 /// `Checkpoint` replies `QueryResult{id: CHECKPOINT_QUERY_ID, {ok:true}}`
 /// so `reload.rs` can await it per session.
 pub const CHECKPOINT_QUERY_ID: u64 = RESERVED_QUERY_ID_BASE + 2;
+/// `SettingChanged{id}` broadcast when an engine command (`/model`,
+/// `/thinking`, …) changed the view: not a reply to any client's `Set`
+/// (client ids never reach the reserved range), only the new view, so every
+/// attached client mirrors it, not just the one that typed the command.
+pub const VIEW_CHANGED_SETTING_ID: u64 = RESERVED_QUERY_ID_BASE + 3;
 /// `synaps daemon close` sends the engine command `close` under a fresh id
 /// at or above this one per request (`daemon/close.rs`) and awaits that id's
 /// `QueryResult`, so concurrent closes never take each other's reply.
@@ -241,6 +246,12 @@ impl Hello {
         }
     }
 
+    /// Ask to be called `name` in the session ([`ClientMeta::name`]).
+    pub fn with_name(mut self, name: Option<String>) -> Self {
+        self.client.name = name;
+        self
+    }
+
     /// Ask for `Full` (mirror) or `Digest` (digest + display tail) history.
     pub fn with_history(mut self, history: HistoryMode) -> Self {
         self.client.history = history;
@@ -411,6 +422,12 @@ pub struct AttachedWire {
     pub replay: Vec<WireEnvelope>,
     pub pending_prompts: Vec<PromptRequest>,
     pub clients: Vec<(ClientId, ClientKind)>,
+    /// Empty from an older daemon.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub roster: Vec<super::types::ClientInfo>,
+    /// Absent from an older daemon, which enforces the owner: `Exclusive`.
+    #[serde(default = "ClientInput::wire_default")]
+    pub client_input: ClientInput,
     #[serde(default)]
     pub input_owner: Option<ClientId>,
     #[serde(default)]
@@ -428,6 +445,8 @@ impl AttachedWire {
             replay: s.replay.into_iter().map(Into::into).collect(),
             pending_prompts: s.pending_prompts,
             clients: s.clients,
+            roster: s.roster,
+            client_input: s.client_input,
             input_owner: s.input_owner,
             display_tail: s.display_tail,
         }
@@ -444,6 +463,8 @@ impl AttachedWire {
                 replay: self.replay.into_iter().map(Into::into).collect(),
                 pending_prompts: self.pending_prompts,
                 clients: self.clients,
+                roster: self.roster,
+                client_input: self.client_input,
                 input_owner: self.input_owner,
                 display_tail: self.display_tail,
             },
@@ -561,7 +582,16 @@ pub enum WireSessionEvent {
     SettingChanged { applied: SettingApplied },
     QueryResult { id: u64, value: serde_json::Value },
     Attached { client: ClientId, snapshot: AttachedWire },
-    ClientJoined { client: ClientId, kind: ClientKind },
+    ClientJoined {
+        client: ClientId,
+        kind: ClientKind,
+        /// Empty from an older daemon (the client falls back to the kind).
+        #[serde(default)]
+        name: String,
+        /// Absent from an older daemon (read as `Mirror`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mode: Option<AttachMode>,
+    },
     ClientLeft { client: ClientId },
     Ended { reason: EndReason },
     Aborted { context_saved: bool },
@@ -886,7 +916,7 @@ impl From<SessionEventWire> for WireSessionEvent {
             S::SettingChanged(applied) => Self::SettingChanged { applied },
             S::QueryResult { id, value } => Self::QueryResult { id, value },
             S::Attached { client, snapshot } => Self::Attached { client, snapshot: AttachedWire::new(client, snapshot) },
-            S::ClientJoined { client, kind } => Self::ClientJoined { client, kind },
+            S::ClientJoined { client, kind, name, mode } => Self::ClientJoined { client, kind, name, mode: Some(mode) },
             S::ClientLeft { client } => Self::ClientLeft { client },
             S::Ended { reason } => Self::Ended { reason },
             S::Aborted { context_saved } => Self::Aborted { context_saved },
@@ -951,7 +981,9 @@ impl From<WireSessionEvent> for SessionEventWire {
                 let (client, snapshot) = snapshot.into_snapshot();
                 Self::Attached { client, snapshot }
             }
-            W::ClientJoined { client, kind } => Self::ClientJoined { client, kind },
+            W::ClientJoined { client, kind, name, mode } => {
+                Self::ClientJoined { client, kind, name, mode: mode.unwrap_or(AttachMode::Mirror) }
+            }
             W::ClientLeft { client } => Self::ClientLeft { client },
             W::Ended { reason } => Self::Ended { reason },
             W::Aborted { context_saved } => Self::Aborted { context_saved },
@@ -989,6 +1021,18 @@ impl From<WireSessionEvent> for SessionEventWire {
 }
 
 // ── per-client decode gate ────────────────────────────────────────────────────
+
+/// A client that predates `client_input` (no `owner_reason_input`) on a
+/// `shared` session. It knows only the owner rule, so the daemon presents
+/// the truth in those terms: it owns input (its attach snapshot says so,
+/// unless it observes) and never sees `InputOwnerChanged`. Otherwise it
+/// would announce "input is owned by …" on attach and "input taken over"
+/// whenever another client typed, while it can type all along. Matters
+/// most after a `daemon reload` onto a new build, when every open TUI is
+/// an older client.
+pub fn legacy_shared(caps: ClientCapabilities, client_input: ClientInput) -> bool {
+    client_input == ClientInput::Shared && !caps.owner_reason_input
+}
 
 /// Whether a client that declared `caps` can decode `event` once it is a
 /// wire frame. The enums nested under `Stream` have no `#[serde(other)]`,
@@ -1272,11 +1316,13 @@ mod tests {
                     replay: vec![env(S::Stream(StreamEvent::Llm(LlmEvent::Text("partial".into()))))],
                     pending_prompts: vec![prompt()],
                     clients: vec![(ClientId(1), ClientKind::Tui)],
+                    roster: Vec::new(),
+                    client_input: ClientInput::Shared,
                     input_owner: Some(ClientId(1)),
                     display_tail: None,
                 },
             },
-            S::ClientJoined { client: ClientId(1), kind: ClientKind::Attach },
+            S::ClientJoined { client: ClientId(1), kind: ClientKind::Attach, name: "discord".into(), mode: AttachMode::Observe },
             S::ClientLeft { client: ClientId(1) },
             S::Ended { reason: EndReason::HostShutdown },
             S::Aborted { context_saved: true },
@@ -1360,6 +1406,8 @@ mod tests {
                 replay: vec![env(SessionEventWire::Stream(StreamEvent::Llm(LlmEvent::ToolQueued { tool_id: "toolu_2".into() })))],
                 pending_prompts: vec![],
                 clients: vec![],
+                roster: Vec::new(),
+                client_input: ClientInput::Shared,
                 input_owner: None,
                 display_tail: None,
             },
@@ -1376,6 +1424,44 @@ mod tests {
             },
             other => panic!("{other:?}"),
         }
+    }
+
+    /// `client_input` on the wire: a current daemon sends it; an `Attached`
+    /// from an older daemon (no field) means `Exclusive`, the owner rule it
+    /// enforces. Only a client without `owner_reason_input` on a shared
+    /// session is presented the owner rule.
+    #[test]
+    fn client_input_absent_means_exclusive_and_legacy_clients_are_presented_owners() {
+        let snap = |client_input| AttachSnapshot {
+            meta: meta(),
+            view: view(),
+            conversation: conv(),
+            streaming: false,
+            replay: vec![],
+            pending_prompts: vec![],
+            clients: vec![],
+            roster: Vec::new(),
+            client_input,
+            input_owner: Some(ClientId(1)),
+            display_tail: None,
+        };
+        let line = encode_line(&DaemonFrame::Attached(AttachedWire::new(ClientId(2), snap(ClientInput::Shared)))).unwrap();
+        assert!(line.contains(r#""client_input":"shared""#), "{line}");
+        let decoded = |line: &str| match decode_line::<DaemonFrame>(line.trim_end()).unwrap() {
+            DaemonFrame::Attached(a) => a.into_snapshot().1,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(decoded(&line).client_input, ClientInput::Shared);
+        let old = line.replace(r#""client_input":"shared","#, "");
+        assert!(!old.contains("client_input"), "{old}");
+        let s = decoded(&old);
+        assert_eq!(s.client_input, ClientInput::Exclusive);
+        assert!(s.input_owned_elsewhere(ClientId(2)).is_some(), "an older daemon's non-owner is read-only");
+
+        let (old_caps, new_caps) = (ClientCapabilities::default(), ClientCapabilities::current());
+        assert!(legacy_shared(old_caps, ClientInput::Shared));
+        assert!(!legacy_shared(new_caps, ClientInput::Shared));
+        assert!(!legacy_shared(old_caps, ClientInput::Exclusive), "exclusive is the rule it knows");
     }
 
     /// The gate: a client that did not declare `tool_queue` (every client
@@ -1408,7 +1494,7 @@ mod tests {
         let h = Hello::new(ClientKind::Tui);
         assert!(h.client.capabilities.tool_queue);
         let line = encode_line(&ClientFrame::Hello(h)).unwrap();
-        assert!(line.contains(r#""capabilities":{"tool_queue":true}"#), "{line}");
+        assert!(line.contains(r#""capabilities":{"tool_queue":true,"owner_reason_input":true}"#), "{line}");
         match decode_line::<ClientFrame>(line.trim_end()).unwrap() {
             ClientFrame::Hello(h) => assert!(h.client.capabilities.tool_queue),
             other => panic!("{other:?}"),
@@ -1429,6 +1515,29 @@ mod tests {
         let json = serde_json::to_string(&ClientMeta::new(ClientKind::Tui)).unwrap();
         let old: OldClientMeta = serde_json::from_str(&json).unwrap();
         assert_eq!(old.kind, ClientKind::Tui);
+    }
+
+    /// Client names, both directions: an older daemon's `ClientJoined` (no
+    /// name, no mode) decodes as the kind's name in `Mirror`; a `Hello`
+    /// without a name sends no `name` key (older daemons see the old
+    /// bytes), with one it round-trips.
+    #[test]
+    fn client_names_are_additive_on_the_wire() {
+        let old = r#"{"ev":"client_joined","client":4,"kind":"attach"}"#;
+        let ev: SessionEventWire = serde_json::from_str::<WireSessionEvent>(old).unwrap().into();
+        let mut roster = Roster::default();
+        roster.apply(&ev);
+        let c = roster.get(ClientId(4)).unwrap();
+        assert_eq!((c.name.as_str(), c.mode), ("attach", AttachMode::Mirror));
+
+        let unnamed = encode_line(&ClientFrame::Hello(Hello::new(ClientKind::Tui))).unwrap();
+        assert!(!unnamed.contains(r#""name""#), "{unnamed}");
+        let named = Hello::new(ClientKind::Tui).with_name(Some("discord".into()));
+        let line = encode_line(&ClientFrame::Hello(named)).unwrap();
+        match decode_line::<ClientFrame>(line.trim_end()).unwrap() {
+            ClientFrame::Hello(h) => assert_eq!(h.client.name.as_deref(), Some("discord")),
+            other => panic!("{other:?}"),
+        }
     }
 
     /// The watch query's opt-in: an older client's query omits it (off), an
@@ -1674,6 +1783,8 @@ mod tests {
                     replay: vec![],
                     pending_prompts: vec![],
                     clients: vec![],
+                    roster: Vec::new(),
+                    client_input: ClientInput::Shared,
                     input_owner: None,
                     display_tail: None,
                 },

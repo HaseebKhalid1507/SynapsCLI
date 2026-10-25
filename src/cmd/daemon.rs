@@ -489,6 +489,33 @@ async fn stop(profile: Option<String>, force: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `clients=` in `daemon sessions`: the count, then the names when the
+/// daemon sent them — `2 (tui*, discord)`, `*` = owns input, observers
+/// marked `(observe)`.
+fn clients_field(m: &agent_engine::session::SessionMeta) -> String {
+    if m.roster.is_empty() {
+        return m.clients.to_string();
+    }
+    let names: Vec<String> = m
+        .roster
+        .iter()
+        .map(|c| {
+            let owner = if m.input_owner == Some(c.id) { "*" } else { "" };
+            let observe = if c.mode == agent_engine::session::AttachMode::Observe { "(observe)" } else { "" };
+            format!("{}{owner}{observe}", c.name)
+        })
+        .collect();
+    format!("{} ({})", m.clients, names.join(", "))
+}
+
+/// `owner=`: `tui(#1)`, or `#1` from an older daemon.
+fn owner_field(m: &agent_engine::session::SessionMeta, c: agent_engine::session::ClientId) -> String {
+    match m.roster.iter().find(|i| i.id == c) {
+        Some(i) => format!("{}(#{})", i.name, c.0),
+        None => format!("#{}", c.0),
+    }
+}
+
 async fn sessions(profile: Option<String>, json: bool) -> anyhow::Result<()> {
     let paths = registry::daemon_paths(profile.as_deref());
     if !registry::is_alive(&paths) {
@@ -501,13 +528,20 @@ async fn sessions(profile: Option<String>, json: bool) -> anyhow::Result<()> {
         println!("no sessions");
     } else {
         for m in list {
+            // Shared input: every drive client types; `*` marks the active
+            // one (typed last), so don't call it the owner.
+            let owner_key = if m.client_input == Some(agent_engine::session::ClientInput::Shared) {
+                "active"
+            } else {
+                "owner"
+            };
             println!(
-                "{}  {:?}{}  clients={}  owner={}  model={}  cwd={}  created={}{}{}",
+                "{}  {:?}{}  clients={}  {owner_key}={}  model={}  cwd={}  created={}{}{}",
                 m.id,
                 m.lifecycle,
                 if m.pinned { "  pinned" } else { "" },
-                m.clients,
-                m.input_owner.map_or("-".into(), |c| format!("#{}", c.0)),
+                clients_field(&m),
+                m.input_owner.map_or("-".into(), |c| owner_field(&m, c)),
                 m.model,
                 m.cwd.as_deref().map_or("-".into(), |p| p.display().to_string()),
                 m.created_at.format("%H:%M:%S"),

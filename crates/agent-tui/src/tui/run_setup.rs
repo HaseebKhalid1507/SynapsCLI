@@ -160,6 +160,7 @@ pub(crate) async fn run_setup(
             compaction_policy: CompactionPolicyWire::LinkedSuccessor,
             await_extensions: false,
             keep_warm: false,
+            client_input: None,
             name: None,
             max_session_cost: None,
             memory_mode: None,
@@ -471,6 +472,9 @@ pub(crate) async fn try_reconnect(
                         let lifecycle = &snapshot.meta.lifecycle;
                         let status = format!("{lifecycle:?}");
                         remirror(app, &snapshot);
+                        // The new attach has its own roster (every client
+                        // re-attached under a new id, or hasn't yet).
+                        app.attached_clients = link.transport().roster().clients().len();
                         super::watch::on_reconnect(app, std::time::Instant::now());
                         app.push_msg(ChatMessage::System(format!(
                             "reconnected to daemon (pid {new_pid}) — session {} {status}",

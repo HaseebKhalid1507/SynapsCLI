@@ -632,6 +632,50 @@ impl std::fmt::Display for CacheKeepWarm {
     }
 }
 
+/// Who may drive a daemon session with several clients attached
+/// (`client_input`; spec `multi-client-sessions.md` §6). Every client is
+/// the daemon's own user.
+///
+/// - `Shared` (default): every drive client (not `--observe`) may send
+///   input; the one that did last is the *active* client.
+/// - `Exclusive`: only the input owner may; the others are read-only until
+///   they `/takeover` (the behaviour before `client_input`).
+///
+/// On the wire a missing value means `Exclusive`: an older daemon enforces
+/// the owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientInput {
+    #[default]
+    Shared,
+    Exclusive,
+}
+
+impl ClientInput {
+    /// `shared` | `exclusive` (case-insensitive).
+    pub fn parse(val: &str) -> Option<ClientInput> {
+        match val.trim().to_ascii_lowercase().as_str() {
+            "shared" => Some(ClientInput::Shared),
+            "exclusive" => Some(ClientInput::Exclusive),
+            _ => None,
+        }
+    }
+
+    /// The wire's default: what a snapshot from an older daemon means.
+    pub fn wire_default() -> ClientInput {
+        ClientInput::Exclusive
+    }
+}
+
+impl std::fmt::Display for ClientInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            ClientInput::Shared => "shared",
+            ClientInput::Exclusive => "exclusive",
+        })
+    }
+}
+
 /// Prompt-cache TTL strategy for Anthropic requests.
 ///
 /// Controls the `cache_control` value emitted at every cache marker site:
@@ -1176,6 +1220,11 @@ pub struct SynapsConfig {
     /// [`DEFAULT_CACHE_KEEPWARM_AUTO_MAX_HOURS`]). An explicit `<N>h` mode
     /// is its own window and ignores this.
     pub cache_keepwarm_auto_max_hours: u32,
+    /// Who may drive a daemon session with several clients attached
+    /// (`client_input`): `shared` (default) | `exclusive`. The daemon reads
+    /// it at start, for every session it creates or restores. See
+    /// [`ClientInput`].
+    pub client_input: ClientInput,
     /// Max TUI redraw rate in frames/sec — caps streaming redraws (e.g. 60,
     /// 144, 240). User input always redraws immediately regardless. Default
     /// 60. Range 1–1000. The frame budget is `1000 / max_fps` ms.
@@ -1271,6 +1320,7 @@ impl Default for SynapsConfig {
             cache_ttl: CacheTtl::default(),
             cache_keepwarm: CacheKeepWarm::Off,
             cache_keepwarm_auto_max_hours: DEFAULT_CACHE_KEEPWARM_AUTO_MAX_HOURS,
+            client_input: ClientInput::Shared,
             max_fps: 60,
             scroll_lines: None,
             theme: None,
@@ -1341,6 +1391,7 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "cache_ttl",
     "cache_keepwarm",
     "cache_keepwarm_auto_max_hours",
+    "client_input",
     "max_fps",
     "scroll_lines",
     "theme",
@@ -1897,6 +1948,12 @@ fn apply_config_content_with(
                 Some(mode) => config.cache_keepwarm = mode,
                 None => config.warnings.push(format!(
                     "cache_keepwarm = {val} — expected off, auto, or 1h–{MAX_CACHE_KEEPWARM_HOURS}h; keep-warm stays off"
+                )),
+            },
+            "client_input" => match ClientInput::parse(val) {
+                Some(mode) => config.client_input = mode,
+                None => config.warnings.push(format!(
+                    "client_input = {val} — expected shared or exclusive; using shared"
                 )),
             },
             "cache_keepwarm_auto_max_hours" => {
@@ -3309,6 +3366,18 @@ mod tests {
             assert_eq!(config.thinking_budget, None);
         });
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn test_client_input_is_shared_by_default_and_parses() {
+        assert_eq!(SynapsConfig::default().client_input, ClientInput::Shared);
+        assert_eq!(load_config_from_str("").client_input, ClientInput::Shared);
+        assert_eq!(load_config_from_str("client_input = exclusive\n").client_input, ClientInput::Exclusive);
+        assert_eq!(load_config_from_str("client_input = Shared\n").client_input, ClientInput::Shared);
+        let c = load_config_from_str("client_input = mine\n");
+        assert_eq!(c.client_input, ClientInput::Shared);
+        assert!(c.warnings.iter().any(|w| w.contains("client_input")), "{:?}", c.warnings);
+        assert_eq!(ClientInput::wire_default(), ClientInput::Exclusive, "an older daemon enforces the owner");
     }
 
     // ── cache_keepwarm (task #444) ──

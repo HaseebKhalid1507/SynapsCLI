@@ -643,6 +643,25 @@
     "related": ["/close", "/keepwarm", "/sessions"]
   },
   {
+    "id": "clients-command",
+    "command": "/clients",
+    "title": "Clients attached to this session",
+    "summary": "List every client attached to this daemon session: its name, kind, drive or observe, who owns input, and which one is you.",
+    "category": "Sessions",
+    "topic": "Command",
+    "protected": true,
+    "common": false,
+    "aliases": [],
+    "keywords": ["clients", "attached", "names", "tabs", "observe", "owner", "input", "who", "as"],
+    "lines": [
+      "/clients lists every client attached to this session, one per line: name (#id), kind, drive or observe, then 'owns input' and 'you' where they apply, and how long it has been attached. It works while the agent is streaming.",
+      "Every client is you (the daemon refuses other users). A name is a label: pick one with synaps --attach --as <name> or SYNAPS_CLIENT_NAME (1-32 letters, digits, - or _). Without one a client gets its kind (tui, attach), and tui-2, tui-3 when that is taken.",
+      "Names also show in synaps daemon sessions, in 'input owned by tui (#1)' refusals and in the 'input taken over by' notice.",
+      "In-process (no daemon) there is one client, this TUI."
+    ],
+    "related": ["/pin", "/sessions"]
+  },
+  {
     "id": "takeover-command",
     "command": "/takeover",
     "title": "Take input in this client",
