@@ -42,6 +42,8 @@ use crate::{AgentEvent, LlmEvent, SessionEvent, StreamEvent, TurnError, TurnOutc
 /// rule; `Closed` only ever answers `Close`, so old clients never see it.
 /// `Pin`/`Pinned` (`synaps daemon pin`) follow the same rule, and so does
 /// `SessionMeta.pinned` (`#[serde(default)]`: an older daemon omits it).
+/// `ReloadExtension` and its two replies (`ExtensionReloaded`,
+/// `ExtensionReloadFailed`) follow it too.
 pub const PROTOCOL_VERSION: u32 = 3;
 /// Exact-match policy today (`min == max == PROTOCOL_VERSION`).
 pub const PROTOCOL_MIN: u32 = PROTOCOL_VERSION;
@@ -159,6 +161,17 @@ pub enum ClientFrame {
     /// predates this frame answers `Error` "malformed frame: unknown variant
     /// `auth_state`, ..." and keeps the connection usable.
     AuthState(agent_core::auth::AuthStateQuery),
+    /// Control fast path (no session): stop one extension and start it
+    /// again from what is installed now (`synaps daemon reload-extension`).
+    /// Extensions are daemon-wide, so every session gets the new version;
+    /// no session is checkpointed and no turn is cancelled (only a call
+    /// into the old process that is in flight fails). Also loads a plugin
+    /// installed after the daemon started. Reply: `ExtensionReloaded`,
+    /// `ExtensionReloadFailed`, or `Refused{Busy}` while the daemon
+    /// reloads. Not accepted on an attached connection.
+    ReloadExtension {
+        extension: String,
+    },
     Bye,
 }
 
@@ -194,6 +207,10 @@ impl std::fmt::Debug for ClientFrame {
                 .field("on", on)
                 .finish(),
             Self::AuthState(query) => f.debug_tuple("AuthState").field(query).finish(),
+            Self::ReloadExtension { extension } => f
+                .debug_struct("ReloadExtension")
+                .field("extension", extension)
+                .finish(),
             Self::Bye => f.write_str("Bye"),
         }
     }
@@ -321,6 +338,20 @@ pub enum DaemonFrame {
     Pinned {
         session_id: SessionId,
         on: bool,
+    },
+    /// Reply to `ReloadExtension`: the new version is loaded.
+    ExtensionReloaded {
+        report: crate::extensions::manager::ExtensionReloadReport,
+    },
+    /// Reply to `ReloadExtension`: it was not reloaded. `unloaded`: the old
+    /// instance was stopped before the new one failed to start, so the
+    /// extension is not loaded now; `false` = the running one (if any) was
+    /// not touched.
+    ExtensionReloadFailed {
+        extension: String,
+        message: String,
+        #[serde(default)]
+        unloaded: bool,
     },
     /// `Some(Reloading{..})` before exec; `None` otherwise (today).
     Bye {
@@ -1751,6 +1782,7 @@ mod tests {
                 account: Some("b".into()),
                 clear: true,
             }),
+            ClientFrame::ReloadExtension { extension: "subconscious".into() },
             ClientFrame::Bye,
         ];
         for f in frames {
@@ -1794,6 +1826,17 @@ mod tests {
             DaemonFrame::Closed { session_id: "s".into(), text: "closed".into() },
             DaemonFrame::Pinned { session_id: "s".into(), on: true },
             DaemonFrame::Pinned { session_id: "s".into(), on: false },
+            DaemonFrame::ExtensionReloaded {
+                report: crate::extensions::manager::ExtensionReloadReport {
+                    extension: "subconscious".into(),
+                    was_loaded: true,
+                    deferred: false,
+                    tools: vec!["subconscious:day_note".into()],
+                    removed_tools: vec!["subconscious:old".into()],
+                    plugin_dir: PathBuf::from("/p/subconscious"),
+                },
+            },
+            DaemonFrame::ExtensionReloadFailed { extension: "x".into(), message: "boom".into(), unloaded: true },
             DaemonFrame::Bye { reason: None },
             DaemonFrame::Bye { reason: Some(ByeReason::Reloading { generation: 2, retry_after_ms: 500 }) },
             DaemonFrame::Bye { reason: Some(ByeReason::Shutdown) },
@@ -1858,6 +1901,26 @@ mod tests {
         }
         let err = decode_line::<OldClientFrame>(r#"{"type":"pin","session_id":"s","on":true}"#).unwrap_err();
         assert!(err.contains("unknown variant `pin`"), "{err}");
+    }
+
+    #[test]
+    fn reload_extension_requires_a_name_and_older_daemons_reject_it_as_an_unknown_variant() {
+        let f: ClientFrame = decode_line(r#"{"type":"reload_extension","extension":"axel"}"#).unwrap();
+        assert!(matches!(f, ClientFrame::ReloadExtension { ref extension } if extension == "axel"));
+        assert!(decode_line::<ClientFrame>(r#"{"type":"reload_extension"}"#).is_err());
+        // An older daemon's reply-less failure mode: `Connected::reload_extension`
+        // keys "daemon too old" on this exact wording.
+        #[derive(Debug, Deserialize)]
+        #[serde(tag = "type", rename_all = "snake_case")]
+        enum OldClientFrame {
+            Ping,
+            Purge,
+        }
+        let err = decode_line::<OldClientFrame>(r#"{"type":"reload_extension","extension":"axel"}"#).unwrap_err();
+        assert!(err.contains("unknown variant `reload_extension`"), "{err}");
+        // `unloaded` is optional on the failure reply.
+        let d: DaemonFrame = serde_json::from_str(r#"{"type":"extension_reload_failed","extension":"x","message":"m"}"#).unwrap();
+        assert!(matches!(d, DaemonFrame::ExtensionReloadFailed { unloaded: false, .. }));
     }
 
     #[test]
