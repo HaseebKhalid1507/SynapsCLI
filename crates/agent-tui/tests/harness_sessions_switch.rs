@@ -282,12 +282,3 @@ fn switch_line_is_newest_and_the_owner_toast_stays_quiet() {
     });
     assert!(h.snapshot().contains("you own input"), "{}", h.snapshot());
 }
-
-#[test]
-#[ignore = "manual: prints the screen after a switch"]
-fn dump_after_switch() {
-    let (mut h, d) = setup();
-    switch_to(&mut h, &d, A);
-    switch_to(&mut h, &d, B);
-    println!("{}", h.snapshot());
-}
