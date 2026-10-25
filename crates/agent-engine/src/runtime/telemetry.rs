@@ -55,6 +55,19 @@ impl TelemetryLevel {
     }
 }
 
+/// The parent session's telemetry, handed to the subagents it spawns.
+///
+/// Workers record at the parent's level and enqueue onto the parent's
+/// session writer instead of starting their own: the writer owns its log
+/// files from a single thread, so a writer per worker would race rotation.
+/// See `Runtime::inherit_telemetry`.
+#[derive(Debug, Clone, Default)]
+pub struct WorkerTelemetry {
+    pub level: TelemetryLevel,
+    /// The parent's session writer. `None` when the parent records nothing.
+    pub writer: Option<TelemetryWriter>,
+}
+
 /// Token usage for one API call, including the cache-creation TTL breakdown.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct UsageRecord {
@@ -170,6 +183,11 @@ pub struct TelemetryRecord {
     /// can separate pings from real turns. Absent on every turn record.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub keepwarm: bool,
+    /// `true` when a subagent (worker runtime) made the request, so reports
+    /// can split delegated traffic from the foreground session. Absent on
+    /// foreground and internal records.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub worker: bool,
 }
 
 impl TelemetryRecord {
@@ -346,6 +364,7 @@ mod tests {
         assert!(!json.contains("ratelimit"));
         assert!(!json.contains("cache_diag"));
         assert!(!json.contains("keepwarm"), "turn records carry no keepwarm field");
+        assert!(!json.contains("worker"), "foreground records carry no worker field");
         assert!(json.contains("\"model\":\"claude-sonnet-4-6\""));
     }
 
@@ -359,6 +378,18 @@ mod tests {
         };
         let json = serde_json::to_string(&record).unwrap();
         assert!(json.contains("\"keepwarm\":true"), "{json}");
+    }
+
+    #[test]
+    fn worker_record_is_marked() {
+        let record = TelemetryRecord {
+            ts: 1,
+            model: "claude-opus-5-5".to_string(),
+            worker: true,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&record).unwrap();
+        assert!(json.contains("\"worker\":true"), "{json}");
     }
 
     #[test]

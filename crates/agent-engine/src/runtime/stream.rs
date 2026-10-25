@@ -672,6 +672,11 @@ impl StreamMethods {
             turn_budget,
             owner_steer_budget,
         } = session;
+        // Handed to every subagent this turn spawns (see `inherit_telemetry`).
+        let worker_telemetry = crate::runtime::telemetry::WorkerTelemetry {
+            level: telemetry_level,
+            writer: options.telemetry.clone(),
+        };
         let codex_parent_plan = crate::Runtime::codex_delegation_plan(
             &model,
             reasoning_level,
@@ -1919,7 +1924,7 @@ impl StreamMethods {
                                     let input_for_hook = input.clone();
                                     match await_tool_call(&cancel, tool.execute_rich(input, crate::ToolContext {
                                             channels: crate::tools::ToolChannels { tx_delta: Some(tx_d), tx_events: Some(tx.clone()) },
-                                            capabilities: crate::tools::ToolCapabilities { session_allow_all: Some(session_allow_all.clone()), launch_cancel: Some(cancel.clone()), memory_backend: Some(memory_backend.clone()), watcher_exit_path: watcher_exit_path.clone(), tool_register_tx: Some(tool_reg_tx.clone()), session_manager: Some(session_manager.clone()), subagent_registry: Some(subagent_registry.clone()), event_queue: Some(event_queue.clone()), delegation_parent: delegation_parent.clone(), codex_parent_plan: codex_parent_plan.clone(), secret_prompt: secret_prompt.clone(), orchestration: orchestration.clone(), tool_activation: Some(crate::tools::discovery::ActivationCapability::new(catalog_snapshot.clone(), std::sync::Arc::clone(&session_tool_set), activation_authority).with_host_prompt(activation_prompt_allowed)), mcp_leases: mcp_lease_capability.clone(), extension_leases: extension_lease_capability.clone(), memory_context: memory_context.clone(), cwd: cwd.clone(), env: env.clone(), env_stripped: env_stripped.clone(), env_warned: env_warned.clone(), session_id: session_id.clone() },
+                                            capabilities: crate::tools::ToolCapabilities { session_allow_all: Some(session_allow_all.clone()), launch_cancel: Some(cancel.clone()), memory_backend: Some(memory_backend.clone()), telemetry: Some(worker_telemetry.clone()), watcher_exit_path: watcher_exit_path.clone(), tool_register_tx: Some(tool_reg_tx.clone()), session_manager: Some(session_manager.clone()), subagent_registry: Some(subagent_registry.clone()), event_queue: Some(event_queue.clone()), delegation_parent: delegation_parent.clone(), codex_parent_plan: codex_parent_plan.clone(), secret_prompt: secret_prompt.clone(), orchestration: orchestration.clone(), tool_activation: Some(crate::tools::discovery::ActivationCapability::new(catalog_snapshot.clone(), std::sync::Arc::clone(&session_tool_set), activation_authority).with_host_prompt(activation_prompt_allowed)), mcp_leases: mcp_lease_capability.clone(), extension_leases: extension_lease_capability.clone(), memory_context: memory_context.clone(), cwd: cwd.clone(), env: env.clone(), env_stripped: env_stripped.clone(), env_warned: env_warned.clone(), session_id: session_id.clone() },
                                             limits: crate::tools::ToolLimits { max_tool_output, max_tool_buffer: 256 * 1024, bash_timeout, bash_max_timeout, subagent_timeout },
                                         })).await {
                                         (Some(res), _) => {
@@ -2227,6 +2232,7 @@ impl StreamMethods {
                         let env_stripped_inner = env_stripped.clone();
                         let env_warned_inner = env_warned.clone();
                         let memory_backend_inner = memory_backend.clone();
+                        let worker_telemetry_inner = worker_telemetry.clone();
                         let memory_context_inner = memory_context.clone();
                         let session_id_inner = session_id.clone();
                         let auto_approve_inner = auto_approve_confirms;
@@ -2316,7 +2322,7 @@ impl StreamMethods {
 
                                     match await_tool_call(&cancel_token, t.execute_rich(input, crate::ToolContext {
                                             channels: crate::tools::ToolChannels { tx_delta: Some(tx_d), tx_events: Some(tx_stream.clone()) },
-                                            capabilities: crate::tools::ToolCapabilities { session_allow_all: Some(session_allow_all_inner.clone()), launch_cancel: Some(cancel_token.clone()), memory_backend: Some(memory_backend_inner.clone()), watcher_exit_path: exit_path.clone(), tool_register_tx: Some(tool_reg_tx_inner.clone()), session_manager: Some(session_mgr.clone()), subagent_registry: Some(registry_inner.clone()), event_queue: Some(eq_inner.clone()), delegation_parent: delegation_parent_inner.clone(), codex_parent_plan: codex_parent_plan_inner.clone(), secret_prompt: prompt_inner.clone(), orchestration: orchestration_inner.clone(), tool_activation: Some(activation_inner.clone()), mcp_leases: mcp_leases_inner.clone(), extension_leases: extension_leases_inner.clone(), memory_context: memory_context_inner.clone(), cwd: cwd_inner.clone(), env: env_inner.clone(), env_stripped: env_stripped_inner.clone(), env_warned: env_warned_inner.clone(), session_id: session_id_inner.clone() },
+                                            capabilities: crate::tools::ToolCapabilities { session_allow_all: Some(session_allow_all_inner.clone()), launch_cancel: Some(cancel_token.clone()), memory_backend: Some(memory_backend_inner.clone()), telemetry: Some(worker_telemetry_inner.clone()), watcher_exit_path: exit_path.clone(), tool_register_tx: Some(tool_reg_tx_inner.clone()), session_manager: Some(session_mgr.clone()), subagent_registry: Some(registry_inner.clone()), event_queue: Some(eq_inner.clone()), delegation_parent: delegation_parent_inner.clone(), codex_parent_plan: codex_parent_plan_inner.clone(), secret_prompt: prompt_inner.clone(), orchestration: orchestration_inner.clone(), tool_activation: Some(activation_inner.clone()), mcp_leases: mcp_leases_inner.clone(), extension_leases: extension_leases_inner.clone(), memory_context: memory_context_inner.clone(), cwd: cwd_inner.clone(), env: env_inner.clone(), env_stripped: env_stripped_inner.clone(), env_warned: env_warned_inner.clone(), session_id: session_id_inner.clone() },
                                             limits: crate::tools::ToolLimits { max_tool_output, max_tool_buffer: 256 * 1024, bash_timeout, bash_max_timeout, subagent_timeout },
                                         })).await {
                                         (Some(res), _) => {

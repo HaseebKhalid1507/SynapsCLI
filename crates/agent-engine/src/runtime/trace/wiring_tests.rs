@@ -148,6 +148,17 @@ async fn drive_stream_with_events(
     cancel: &CancellationToken,
     tx: mpsc::UnboundedSender<StreamEvent>,
 ) -> crate::error::Result<serde_json::Value> {
+    drive_stream_full(options, max_retries, cancel, tx, TelemetryLevel::Off).await
+}
+
+/// `drive_stream_with_events` at an explicit telemetry level.
+async fn drive_stream_full(
+    options: &ApiOptions,
+    max_retries: u32,
+    cancel: &CancellationToken,
+    tx: mpsc::UnboundedSender<StreamEvent>,
+    level: TelemetryLevel,
+) -> crate::error::Result<serde_json::Value> {
     let client = Client::new();
     let tools = ToolRegistry::new();
     let messages = vec![Arc::new(json!({
@@ -168,7 +179,7 @@ async fn drive_stream_with_events(
         max_retries,
         0,
         options,
-        TelemetryLevel::Off,
+        level,
     )
     .await
 }
@@ -715,4 +726,53 @@ async fn slow_writer_sink_does_not_delay_model_turn() {
     let out = writer.shutdown(Duration::from_millis(100));
     assert!(!out.is_flushed());
     gate.open(); // release the worker thread
+}
+
+// ─── Subagent telemetry: worker requests are marked in api-log.jsonl ────────
+
+/// Telemetry on, one loopback request per role, both through one writer. The
+/// worker's record carries `"worker":true`; the foreground record has no
+/// `worker` key at all, so existing api-log readers see no change.
+#[tokio::test]
+async fn api_log_marks_worker_requests() {
+    use crate::runtime::openai::catalog::CodexRequestRole;
+    use crate::runtime::telemetry::{TelemetryWriter, WriterOptions};
+
+    let (url, _bodies, hits) = spawn_stub(vec![]).await;
+    let tmp = tempfile::TempDir::new().unwrap();
+    let log = tmp.path().join("synaps/api-log.jsonl");
+    let writer = TelemetryWriter::new(WriterOptions {
+        telemetry_path: Some(log.clone()),
+        trace_path: Some(tmp.path().join("synaps/request-trace.jsonl")),
+        ..WriterOptions::default()
+    });
+    for role in [CodexRequestRole::Foreground, CodexRequestRole::Worker] {
+        let options = ApiOptions {
+            anthropic_base_url: Some(url.clone()),
+            telemetry: Some(writer.clone()),
+            codex_request_role: role,
+            ..Default::default()
+        };
+        let (tx, _rx) = mpsc::unbounded_channel::<StreamEvent>();
+        drive_stream_full(
+            &options,
+            0,
+            &CancellationToken::new(),
+            tx,
+            TelemetryLevel::Basic,
+        )
+        .await
+        .expect("stub stream succeeds");
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+    assert!(writer.shutdown(Duration::from_secs(10)).is_flushed());
+
+    let records: Vec<serde_json::Value> = std::fs::read_to_string(&log)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(records.len(), 2, "one record per request");
+    assert!(records[0].get("worker").is_none(), "{}", records[0]);
+    assert_eq!(records[1]["worker"], json!(true), "{}", records[1]);
 }

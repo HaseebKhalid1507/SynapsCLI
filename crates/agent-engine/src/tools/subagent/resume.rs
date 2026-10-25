@@ -278,6 +278,7 @@ impl Tool for SubagentResumeTool {
         let codex_parent_plan = ctx.capabilities.codex_parent_plan.clone();
         let memory_backend = ctx.capabilities.memory_backend.clone();
         let session_allow_all = ctx.capabilities.session_allow_all.clone();
+        let telemetry = ctx.capabilities.telemetry.clone();
 
         tracing::info!(
             "subagent_resume: dispatching '{}' (id={}, resumed_from={}) model={}",
@@ -398,6 +399,7 @@ impl Tool for SubagentResumeTool {
                             &crate::config::load_config(),
                             memory_backend.as_ref(),
                             session_allow_all.as_ref(),
+                            telemetry.as_ref(),
                         );
                         runtime.set_system_prompt(super::compose_system_prompt(
                             system_prompt,

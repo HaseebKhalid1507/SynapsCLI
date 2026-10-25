@@ -2294,6 +2294,8 @@ impl ApiMethods {
                         breakpoints,
                     },
                     keepwarm: options.keepwarm.is_some(),
+                    worker: options.codex_request_role
+                        == crate::runtime::openai::catalog::CodexRequestRole::Worker,
                 };
                 // Non-blocking enqueue onto the session's bounded writer
                 // (Task 11): overflow or a broken log path is counted by
