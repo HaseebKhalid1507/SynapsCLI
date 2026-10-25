@@ -37,13 +37,24 @@ pub fn noise_reasons(e: &CatalogEntry) -> NoiseReasons {
 }
 
 fn is_sandbox_cwd(cwd: &Path) -> bool {
-    let tmp = std::env::temp_dir();
-    let s = cwd.to_string_lossy();
-    cwd.starts_with("/tmp")
-        || cwd.starts_with("/var/tmp")
-        || cwd.starts_with("/private/tmp")
-        || (tmp.as_os_str().len() > 1 && cwd.starts_with(&tmp))
-        || s.contains("synaps-web-sandbox")
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    is_sandbox_cwd_with(cwd, home.as_deref(), &std::env::temp_dir())
+}
+
+/// [`is_sandbox_cwd`] with `$HOME` and the temp dir passed in. The user's
+/// own home is never scratch space, even when it lives under a temp dir
+/// (CI seeds `HOME` in `/tmp`); a home that IS a temp root (or `/`) earns
+/// no exemption.
+fn is_sandbox_cwd_with(cwd: &Path, home: Option<&Path>, tmp: &Path) -> bool {
+    if cwd.to_string_lossy().contains("synaps-web-sandbox") {
+        return true;
+    }
+    let temp_roots = [Path::new("/tmp"), Path::new("/var/tmp"), Path::new("/private/tmp"), tmp];
+    let real_home = home.filter(|h| h.components().count() > 2 && !temp_roots.contains(h));
+    if real_home.is_some_and(|h| cwd.starts_with(h)) {
+        return false;
+    }
+    temp_roots.iter().any(|r| r.as_os_str().len() > 1 && cwd.starts_with(r))
 }
 
 /// Per-rule counts of hidden entries ("hiding N (sandbox, <3 msgs)").
@@ -336,4 +347,32 @@ pub fn day_groups(
         }
     }
     out
+}
+
+#[cfg(test)]
+mod sandbox_tests {
+    use super::is_sandbox_cwd_with;
+    use std::path::Path;
+
+    #[test]
+    fn a_home_under_a_temp_dir_is_not_sandbox_but_the_rest_of_tmp_is() {
+        let tmp = Path::new("/tmp");
+        let home = Some(Path::new("/tmp/synaps-dirty-home.ab12"));
+        assert!(!is_sandbox_cwd_with(Path::new("/tmp/synaps-dirty-home.ab12"), home, tmp));
+        assert!(!is_sandbox_cwd_with(Path::new("/tmp/synaps-dirty-home.ab12/Projects/x"), home, tmp));
+        assert!(is_sandbox_cwd_with(Path::new("/tmp/other"), home, tmp));
+        assert!(is_sandbox_cwd_with(Path::new("/tmp/synaps-dirty-home.ab12/synaps-web-sandbox/a"), home, tmp));
+    }
+
+    #[test]
+    fn a_home_that_is_a_temp_root_or_slash_earns_no_exemption() {
+        let tmp = Path::new("/tmp");
+        for h in ["/tmp", "/var/tmp", "/"] {
+            assert!(is_sandbox_cwd_with(Path::new("/tmp/x"), Some(Path::new(h)), tmp), "{h}");
+        }
+        assert!(is_sandbox_cwd_with(Path::new("/var/tmp/x"), None, tmp));
+        assert!(!is_sandbox_cwd_with(Path::new("/home/u/Projects/x"), Some(Path::new("/home/u")), tmp));
+        // A custom $TMPDIR counts as a temp root too.
+        assert!(is_sandbox_cwd_with(Path::new("/scratch/t/x"), Some(Path::new("/home/u")), Path::new("/scratch/t")));
+    }
 }
