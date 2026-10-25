@@ -35,7 +35,7 @@
 | `client_input = shared` (default) / `exclusive` (config, `/settings` → Daemon) | Who may type in a session with several clients attached. Every client is the daemon's own user, so by default (`shared`) every drive client (not `--observe`) may send input; the one that did last is the *active* client: `InputOwnerChanged{Input}` moves the marker (older clients, without `ClientCapabilities::owner_reason_input`, read it as `Takeover`), it may choose "Allow all" (answering makes a client active), and it gets input back first after a daemon reload. When the active client leaves, input goes to whoever typed most recently. `exclusive` is the rule before `client_input`: only the input owner drives, the others are read-only until they `--takeover` or `/takeover`. The daemon reads it from config when it starts, for every session it creates or restores (`synaps daemon reload` picks up a change; `SessionConfig.client_input` overrides it per session). The snapshot carries it (`Attached.client_input`; absent from an older daemon, which means `exclusive`), and so does the listing (`synaps daemon sessions` says `active=` instead of `owner=`). An older client (no `owner_reason_input` capability) on a shared session knows only the owner rule, so the daemon presents it as owning input and never sends it `InputOwnerChanged`: it can type all along, and would otherwise announce "input is owned by …" on attach and "input taken over" whenever another client typed (every open TUI is an older client right after a `daemon reload` onto a new build). The TUI header shows `N clients` when another client is attached; a TUI that may not drive (`--observe`, or not the owner under `exclusive`) sends nothing on Enter or Esc and says why in a toast, keeping the text. |
 | `synaps --attach --no-confirm-answers` | TUI only, any attach mode: this client never answers a `Confirm` prompt (tool-call and tool-activation approvals). It never opens the approval pane for one, so no key typed into it can approve; it lists the waiting confirms in a toast until another client's answer resolves them (`PromptResolved`). `Secret` prompts are unchanged. Client-side only: no wire or daemon change, so it works against any daemon. For a TUI embedded where keystrokes may not come from the person approving (a terminal pane in another app). An `--observe` attach still can answer prompts without this flag: `Answer` is not an input command. |
 | `SYNAPS_SESSION_COMPACT_INLINE=1` | One-release kill-switch: run `/compact` and auto-compaction inline on the actor task (the #107 body — `Attach`/`Cancel` wait behind it) instead of the spawned job. Deleted in phase 4. |
-| `synaps daemon reload` / `stop` / `purge` / `close` / `pin` from **any** same-uid client | Not a privilege boundary (0600 socket): a stray `synaps daemon reload` from any shell checkpoints every session and closes everyone's PTYs, `daemon close --attached` ends one session whoever owns its input (without `--attached` it refuses a session that has clients attached), and `daemon pin` pins one session whoever owns its input (host authority, like `stop`). `Checkpoint` over the wire is owner-only. |
+| `synaps daemon reload` / `stop` / `purge` / `close` / `pin` / `reload-extension` from **any** same-uid client | Not a privilege boundary (0600 socket): a stray `synaps daemon reload` from any shell checkpoints every session and closes everyone's PTYs, `daemon close --attached` ends one session whoever owns its input (without `--attached` it refuses a session that has clients attached), `daemon pin` pins one session whoever owns its input (host authority, like `stop`), and `daemon reload-extension` restarts an extension every session shares. `Checkpoint` over the wire is owner-only. |
 
 ## CLI
 
@@ -48,6 +48,7 @@ synaps daemon purge                  # Purge frame → memstat::purge_arenas() i
 synaps daemon reload [--now] [--drain-secs N] [--exe PATH] [--json]   # re-exec in place, same pid (C3; §Reload below)
 synaps daemon close <ID|NAME> [--force] [--attached] [--json]   # end one session without attaching (§Closing a session); exit 0/1/2/3
 synaps daemon pin <ID|NAME> [--off] [--json]       # pin/unpin one session without attaching (§Pinning a session); exit 0/1/2/3
+synaps daemon reload-extension <NAME> [--json]     # restart one extension in place, sessions untouched (§Reloading one extension); exit 0/1/2/3
 synaps attach [ID] [--create] [--continue NAME_OR_ID] [-s PROMPT] [--observe|--takeover] [--keep-warm] [--as NAME]
 synaps --attach [ID] [--observe|--takeover] [--keep-warm] [--no-confirm-answers] [--as NAME]   # thin TUI client over the socket (phase 4); starts the daemon if none is running
 ```
@@ -181,6 +182,40 @@ loaded (a long-lived worker host, an inbox other tools write to) is **pinned**:
   even with no TUI ever attached, e.g. one restored after a restart and fed by
   `synaps send`. Unpinned, only a session a typing client attached to keeps warm.
 
+## Reloading one extension (`daemon reload-extension`)
+
+Extensions are daemon-wide: one process each, shared by every session. A new
+version of one (code or manifest) used to need `synaps daemon reload`, which
+checkpoints every session and cancels the turns in flight.
+**`synaps daemon reload-extension <NAME> [--json]`** restarts just that one:
+
+- `NAME` is the plugin's directory name, as `/extensions` lists it. The daemon
+  finds it the way discovery does (`~/.synaps-cli/plugins/`, then the daemon's
+  `./.synaps/plugins/`, the later one winning), reads and validates its
+  manifest, then stops the running instance and starts the new one. A plugin
+  installed after the daemon started (or one that failed then) is loaded.
+- Every session gets the new version from its next request: its tools are
+  re-registered in the shared registry (a tool the new version dropped is
+  removed, not left calling a stopped process), its hooks re-subscribed, and a
+  deferred extension's session leases revoked (the next use starts it). No
+  session is checkpointed and no turn is cancelled; only a call into the old
+  process that is in flight when it stops fails, as it would if it crashed.
+- Anything that can be checked first is: a name discovery would never load
+  (a path, `foo.disabled`/`.bak`/…), a plugin that is not installed, disabled
+  (`disabled_plugins`), whose setup failed, without an `extension` block, or
+  whose manifest does not parse or validate is refused **with the running
+  instance untouched**. Only a new version that fails to *start* leaves the
+  extension unloaded; the error says so, and running the command again after
+  the fix loads it.
+- Exit codes: 0 reloaded (or loaded); 3 refused (the daemon is reloading); 1
+  not reloaded (any reason above), no daemon, timeout (60 s); 2 the daemon
+  predates `reload-extension` (`synaps daemon reload` once) or a protocol
+  mismatch. `--json` prints `{ok, extension, outcome, unloaded, report, text}`;
+  `report` is `{extension, was_loaded, deferred, tools, removed_tools,
+  plugin_dir}`.
+- Not reloaded with it: slash commands a plugin declares outside its
+  `extension` block come from the skills registry (`/plugins reload`).
+
 ### Pinned sessions come back after a restart
 
 The daemon keeps the set of pinned journals in the **pin book**,
@@ -294,6 +329,7 @@ D: {"type":"welcome", protocol_version, daemon_version, pid, profile, sessions:[
 C: ping | sessions | shutdown{force}          → D: pong{pid,uptime_s,sessions} | session_list{sessions} | bye   (no session allocated)
 C: close{session_id, force, attached}         → D: closed{session_id, text} | refused{busy|unknown_session} (→ daemon closes) | error
 C: pin{session_id, on}                        → D: pinned{session_id, on} | refused{busy|unknown_session} (→ daemon closes) | error
+C: reload_extension{extension}                → D: extension_reloaded{report} | extension_reload_failed{extension, message, unloaded} | refused{busy} (→ daemon closes)
 C: {"type":"attach", attach:"existing", session_id, mode} | {"type":"attach", attach:"create", config:SessionConfig, mode}
 D: {"type":"attached", client, meta, view, conversation, streaming, replay:[WireEnvelope], pending_prompts, clients} | error
 C: {"type":"cmd", session_id, cmd:SessionCommand} …      → D: {"type":"event", session_id, seq, ts, event:WireSessionEvent} …
@@ -348,6 +384,9 @@ C: bye | socket close = Detach (turn keeps running)
 - `pin` (`on` required) follows the same rule: an older daemon answers "unknown variant `pin`" and
   `synaps daemon pin` exits 2; `pinned` only answers `pin`; refused on an attached connection (that
   client has `/pin`). `SessionMeta.pinned` is `#[serde(default)]`: an older daemon omits it (→ false).
+- `reload_extension` follows it too: an older daemon answers "unknown variant `reload_extension`" and
+  `synaps daemon reload-extension` exits 2; its two replies only answer it; refused on an attached
+  connection.
 - First frame not `Hello` / malformed → `Refused{Protocol}`; oversize frame → `Error` + close;
   `Cmd` before `Attach` → `Error`, connection stays open.
 - **Client command whitelist** (`conn.rs::client_may_send`): an attached client may send `Submit`,

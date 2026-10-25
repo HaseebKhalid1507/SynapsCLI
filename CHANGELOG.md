@@ -6,6 +6,14 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **`synaps daemon reload-extension <NAME>` restarts one extension in the
+  running daemon** from what is installed now, without `daemon reload`: no
+  session is checkpointed and no turn is cancelled. Its tools, hooks and
+  deferred leases are swapped in place for every session; a plugin installed
+  after the daemon started is loaded. A bad manifest is refused before the
+  running instance is touched. See
+  [docs/daemon-mode.md](docs/daemon-mode.md#reloading-one-extension-daemon-reload-extension).
+
 - **Pinned sessions come back after the daemon restarts** (`daemon stop`,
   SIGTERM, idle exit, a crash, a reboot with `deploy/synaps-daemon.service`).
   The pin book (`<config dir>/daemon-pins.json`) is written when the pin changes
