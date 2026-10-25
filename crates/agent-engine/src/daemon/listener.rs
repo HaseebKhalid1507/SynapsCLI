@@ -1,5 +1,5 @@
 //! UDS listener: bind with 0600, accept until shutdown, one task per
-//! connection.
+//! connection. Every connection must come from the daemon's own user.
 
 use std::path::Path;
 use std::sync::atomic::Ordering;
@@ -41,6 +41,11 @@ pub async fn accept_loop(state: Arc<DaemonState>, listener: UnixListener, shutdo
         };
         match accepted {
             Ok((stream, _)) => {
+                // SAFETY: geteuid has no preconditions and cannot fail.
+                if let Err(why) = admit(&stream, unsafe { libc::geteuid() }) {
+                    tracing::warn!("daemon: refused connection: {why}");
+                    continue; // dropped unread: the peer sees EOF, no frame
+                }
                 let state = Arc::clone(&state);
                 let shutdown = shutdown.clone();
                 state.connections.fetch_add(1, Ordering::SeqCst);
@@ -54,5 +59,45 @@ pub async fn accept_loop(state: Arc<DaemonState>, listener: UnixListener, shutdo
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
         }
+    }
+}
+
+/// Every client attached to a session is the daemon's own user (spec
+/// `multi-client-sessions.md` §3). The socket's 0600 mode already says
+/// so; this keeps it true if the mode is loosened, `SYNAPS_BASE_DIR`
+/// points somewhere shared, or a future listener forgets to chmod. Root
+/// is refused too (`sudo synaps --attach` would also resolve another
+/// home). Credentials that can't be read refuse the connection.
+fn admit(stream: &tokio::net::UnixStream, own_uid: u32) -> Result<(), String> {
+    match stream.peer_cred() {
+        Ok(cred) if cred.uid() == own_uid => Ok(()),
+        Ok(cred) => Err(format!("peer uid {} is not the daemon's uid {own_uid}", cred.uid())),
+        Err(e) => Err(format!("peer credentials unreadable: {e}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn own_uid() -> u32 {
+        // SAFETY: as in `accept_loop`.
+        unsafe { libc::geteuid() }
+    }
+
+    #[tokio::test]
+    async fn a_connection_from_the_daemons_own_user_is_admitted() {
+        let (a, _b) = tokio::net::UnixStream::pair().unwrap();
+        assert_eq!(admit(&a, own_uid()), Ok(()));
+    }
+
+    /// Tests can't switch uid, so the daemon's uid is what varies: a real
+    /// peer (this process) seen by a daemon running as anyone else.
+    #[tokio::test]
+    async fn a_connection_from_another_user_is_refused() {
+        let (a, _b) = tokio::net::UnixStream::pair().unwrap();
+        let other = own_uid().wrapping_add(1);
+        let err = admit(&a, other).unwrap_err();
+        assert!(err.contains("is not the daemon's uid"), "{err}");
     }
 }

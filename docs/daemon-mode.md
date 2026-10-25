@@ -182,7 +182,7 @@ loaded (a long-lived worker host, an inbox other tools write to) is **pinned**:
 
 | File | Mode | Purpose |
 |---|---|---|
-| `daemon.sock` | 0600 | UDS listener (symlinks refused on cleanup) |
+| `daemon.sock` | 0600 | UDS listener (symlinks refused on cleanup). Every accepted connection must come from the daemon's own uid (`SO_PEERCRED`/`getpeereid`); any other peer, root included, or one whose credentials can't be read, is closed unread with a `daemon: refused connection` warning. |
 | `daemon.lock` | 0600 | **flock = liveness oracle.** Alive iff someone holds it. Nobody unlinks on ECONNREFUSED alone; `reap_stale` unlinks sock/json/pid only when the lock is free. A second daemon on the same paths is refused. |
 | `daemon.spawn.lock` | 0600 | Spawn lock: held by the one client auto-spawning the daemon (`daemon::ensure_running`). Never a liveness signal. |
 | `daemon.json` | 0600 | `{pid, protocol_version, daemon_version, profile, started_at, socket, exe, generation}` — never credentials. The daemon keeps the record in memory: when a Ping finds the file missing or naming another pid (an older `synaps` that lists sessions unlinks run-dir `*.json` files it can't parse as session cards), the lock holder writes it back (one INFO line `daemon.json rewritten` per 10 min). Every write of `daemon.json` and `daemon.pid` goes through that file's own `<name>.tmp`, created exclusively and without following a symlink, mode 0600, then renamed into place. One metadata lock serializes the start write, the heal, the reload's write and its restore, and the shutdown cleanup: a heal never writes back an older record than the one held, and nothing writes the files after the cleanup. `daemon status`, `daemon reload`, `daemon stop` and `daemon start --detach` Ping before they read it. |
@@ -568,6 +568,12 @@ owner again, second turn works; older `--exe` refused with the daemon still serv
 checkpointed and its partial history + restart marker come back from the journal; `/model` + `/context` + `/system` +
 keep-warm + a Parked session survive (`reload_preserves_model_keep_warm_settings_and_parked`).
 F23 lock-held reload tested in `tests/daemon_reload_lock_held.rs`.
+
+The session's prompt-cache read/write totals survive too, so the footer's `%↺` and `/stats` keep the
+whole session's hit rate instead of restarting at the first request after the reload (usually the one
+miss). They live in the session's `.json` snapshot only (`Session::total_cache_read_tokens` /
+`total_cache_creation_tokens`), never in the journal: 0.10.1 rejects unknown journal fields. In
+journal mode they are as of the last snapshot. A session saved before they persisted resumes them at 0.
 
 ### Tool activations across a reload or a park
 
