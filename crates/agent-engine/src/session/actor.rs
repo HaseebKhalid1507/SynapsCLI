@@ -494,6 +494,7 @@ fn command_name(cmd: &SessionCommand) -> &'static str {
         SessionCommand::AdoptWorkers { .. } => "adopt_workers",
         SessionCommand::RestoreToolActivations { .. } => "restore_tool_activations",
         SessionCommand::ReloadAborted => "reload_aborted",
+        SessionCommand::ArmPark => "arm_park",
         SessionCommand::HostEvent(_) => "host_event",
         SessionCommand::DriverStart { .. } => "driver_start",
     }
@@ -4909,6 +4910,7 @@ impl SessionActor {
                     | SessionCommand::Checkpoint { .. }
                     | SessionCommand::Park
                     | SessionCommand::ReloadAborted
+                    | SessionCommand::ArmPark
                     | SessionCommand::RestoreToolActivations { .. }
                     | SessionCommand::Resync { .. }
                     | SessionCommand::HostEvent(_)
@@ -4924,6 +4926,7 @@ impl SessionActor {
                 SessionCommand::Save
                     | SessionCommand::Cancel
                     | SessionCommand::Park
+                    | SessionCommand::ArmPark
                     | SessionCommand::Checkpoint { .. }
             ) {
                 if let SessionCommand::Checkpoint { .. } = cmd {
@@ -5062,6 +5065,8 @@ impl SessionActor {
                 self.restore_tool_activations(activations)
             }
             SessionCommand::ReloadAborted => self.reload_aborted().await,
+            // Parked sessions returned above (their evict deadline stands).
+            SessionCommand::ArmPark => self.rearm_park(),
             SessionCommand::Park => {
                 // Explicit request: end an active keep-warm period, then park.
                 self.cache_keepwarm_park_requested();

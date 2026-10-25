@@ -797,6 +797,11 @@ pub async fn rehydrate(state: &Arc<DaemonState>, rs: &ReloadState) {
                 }
                 if matches!(s.lifecycle, SessionLifecycle::Parked | SessionLifecycle::Parking) {
                     let _ = h.send(SessionCommand::Park).await;
+                } else {
+                    // Last, after the pin, keep-warm and workers it weighs:
+                    // the old image's park timer died with the exec, and a
+                    // session nobody reconnects to gets no detach to arm one.
+                    let _ = h.send(SessionCommand::ArmPark).await;
                 }
                 tracing::info!(old = %s.id, new = %new_id, lifecycle = ?s.lifecycle, "daemon: session rehydrated after reload");
             }
