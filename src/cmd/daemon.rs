@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use agent_engine::daemon::close::{resolve_session, ResolveError};
-use agent_engine::daemon::{self, registry, DaemonOpts, EXIT_REFUSED, EXIT_VERSION};
+use agent_engine::daemon::{self, pins, registry, DaemonOpts, EXIT_REFUSED, EXIT_VERSION};
 use agent_engine::session::socket_transport::{Connected, SocketTransport};
 use agent_engine::session::wire::Hello;
 use agent_engine::session::{ClientKind, SessionLifecycle, SessionMeta, TransportError};
@@ -99,9 +99,10 @@ pub(crate) enum DaemonAction {
         #[arg(long)]
         json: bool,
     },
-    /// Pin one session: it stays loaded (never parked or idle-ended) and the
-    /// daemon does not idle-exit while it is pinned. A parked session is
-    /// woken. `--off` unpins.
+    /// Pin one session: it stays loaded (never parked or idle-ended), the
+    /// daemon does not idle-exit while it is pinned, and it comes back when
+    /// the daemon starts again. A parked session is woken. `--off` unpins,
+    /// also a pin that is not live (see `daemon sessions`).
     Pin {
         /// Session id, id prefix, journal id, or name (see `daemon sessions`).
         #[arg(value_name = "ID|NAME")]
@@ -155,7 +156,16 @@ pub(crate) async fn run(profile: Option<String>, args: DaemonArgs) -> anyhow::Re
 /// short, no daemon, timeout).
 async fn pin(profile: Option<String>, target: String, on: bool, json: bool) -> anyhow::Result<()> {
     let paths = registry::daemon_paths(profile.as_deref());
+    let book = pins::PinBook::for_active_profile();
     if !registry::is_alive(&paths) {
+        // A pin that will come back on the next start can be cleared now.
+        if let Some(e) = pins::resolve_entry(&book.load(), &target).filter(|_| !on) {
+            let sid = Some(e.journal_id.as_str());
+            match book.remove(&e.journal_id) {
+                Ok(_) => pin_exit(json, 0, sid, "unpinned", false, &format!("unpinned {} (it will not come back)", e.journal_id)),
+                Err(err) => pin_exit(json, 1, sid, "error", on, &format!("pin book not changed: {err}")),
+            }
+        }
         pin_exit(json, 1, None, "no_daemon", on, "daemon not running");
     }
     let mut conn = match Connected::connect(&paths.sock, Hello::new(ClientKind::Attach)).await {
@@ -163,11 +173,17 @@ async fn pin(profile: Option<String>, target: String, on: bool, json: bool) -> a
         Err(e @ TransportError::Version { .. }) => pin_exit(json, EXIT_VERSION, None, "version", on, &e.to_string()),
         Err(e) => pin_exit(json, 1, None, "error", on, &format!("cannot reach the daemon: {e}")),
     };
+    let offline = pins::resolve_entry(&pins::offline(book.load(), &conn.welcome.sessions), &target);
     let id = match resolve_session(&conn.welcome.sessions, &target) {
         Ok(id) => id,
+        // Pinned but not live (waiting / failed / not restored): the daemon
+        // clears it (--off) or retries it.
+        Err(ResolveError::NotFound) if offline.is_some() => {
+            agent_engine::session::SessionId::from(offline.map(|e| e.journal_id).unwrap_or_default().as_str())
+        }
         Err(ResolveError::NotFound) => {
             conn.bye().await;
-            let text = format!("no live session matches {target} (see `synaps daemon sessions`)");
+            let text = format!("no live session or pin matches {target} (see `synaps daemon sessions`)");
             pin_exit(json, 1, None, "not_found", on, &text);
         }
         Err(ResolveError::TooShort { min }) => {
@@ -486,6 +502,9 @@ async fn stop(profile: Option<String>, force: bool) -> anyhow::Result<()> {
     }
     registry::reap_stale(&paths);
     println!("daemon stopped{}", pid.map_or(String::new(), |p| format!(" (pid {p})")));
+    if let Some(line) = comes_back_line(&pins::PinBook::for_active_profile().load()) {
+        println!("{line}");
+    }
     Ok(())
 }
 
@@ -567,13 +586,20 @@ fn title_part(m: &SessionMeta) -> String {
 
 async fn sessions(profile: Option<String>, json: bool) -> anyhow::Result<()> {
     let paths = registry::daemon_paths(profile.as_deref());
+    let book = pins::PinBook::for_active_profile();
     if !registry::is_alive(&paths) {
+        if !json {
+            if let Some(line) = comes_back_line(&book.load()) {
+                println!("{line}");
+            }
+        }
         anyhow::bail!("daemon not running");
     }
     let list = SocketTransport::sessions(&paths.sock).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+    let offline = pins::offline(book.load(), &list);
     if json {
         println!("{}", serde_json::to_string_pretty(&list)?);
-    } else if list.is_empty() {
+    } else if list.is_empty() && offline.is_empty() {
         println!("no sessions");
     } else {
         let now = chrono::Utc::now();
@@ -602,7 +628,60 @@ async fn sessions(profile: Option<String>, json: bool) -> anyhow::Result<()> {
             );
         }
     }
+    if !json {
+        for e in &offline {
+            println!("{}", offline_line(e));
+        }
+    }
     Ok(())
+}
+
+/// A pin that is not live: `<id>  pinned (not live)  waiting: held by …`.
+fn offline_line(e: &pins::PinEntry) -> String {
+    format!(
+        "{}  pinned (not live)  {}{}{}  (`synaps daemon pin {} --off` clears it)",
+        e.journal_id,
+        e.state_text(),
+        e.name.as_deref().map_or(String::new(), |n| format!("  name={n}")),
+        e.cwd.as_deref().map_or(String::new(), |p| format!("  cwd={}", p.display())),
+        e.journal_id,
+    )
+}
+
+/// `2 pinned sessions will come back on next start: axon, 20261025-…`.
+fn comes_back_line(entries: &[pins::PinEntry]) -> Option<String> {
+    if entries.is_empty() {
+        return None;
+    }
+    let n = entries.len();
+    let names: Vec<&str> = entries.iter().map(|e| e.label()).collect();
+    Some(format!(
+        "{n} pinned session{} will come back on next start: {}",
+        if n == 1 { "" } else { "s" },
+        names.join(", ")
+    ))
+}
+
+#[cfg(test)]
+mod pin_line_tests {
+    use super::*;
+
+    #[test]
+    fn stop_names_what_comes_back() {
+        assert_eq!(comes_back_line(&[]), None);
+        let e = |id: &str, name: Option<&str>| pins::PinEntry { journal_id: id.into(), name: name.map(Into::into), ..Default::default() };
+        assert_eq!(
+            comes_back_line(&[e("j1", Some("axon")), e("j2", None)]).as_deref(),
+            Some("2 pinned sessions will come back on next start: axon, j2")
+        );
+        assert_eq!(comes_back_line(&[e("j1", None)]).as_deref(), Some("1 pinned session will come back on next start: j1"));
+    }
+
+    #[test]
+    fn an_offline_pin_names_its_state_and_how_to_clear_it() {
+        let e = pins::PinEntry { journal_id: "j1".into(), name: Some("axon".into()), ..Default::default() };
+        assert_eq!(offline_line(&e), "j1  pinned (not live)  not restored yet  name=axon  (`synaps daemon pin j1 --off` clears it)");
+    }
 }
 
 #[cfg(test)]

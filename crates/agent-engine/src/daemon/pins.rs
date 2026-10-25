@@ -84,6 +84,11 @@ impl PinEntry {
         }
     }
 
+    /// Its name, else its journal id.
+    pub fn label(&self) -> &str {
+        self.name.as_deref().filter(|n| !n.is_empty()).unwrap_or(&self.journal_id)
+    }
+
     fn set_state(&mut self, state: &str, reason: String) {
         self.state = Some(state.to_string());
         self.reason = Some(reason);
@@ -267,6 +272,25 @@ pub fn offline(entries: Vec<PinEntry>, live: &[crate::session::SessionMeta]) -> 
         .into_iter()
         .filter(|e| !live.iter().any(|m| m.id.as_str() == e.journal_id || m.journal_id == e.journal_id))
         .collect()
+}
+
+/// `daemon pin <ID|NAME>` against the book: exact journal id, a unique
+/// name, or a unique journal-id prefix of at least
+/// [`super::close::MIN_PREFIX_LEN`] characters.
+pub fn resolve_entry(entries: &[PinEntry], query: &str) -> Option<PinEntry> {
+    let q = query.trim();
+    if q.is_empty() {
+        return None;
+    }
+    if let Some(e) = entries.iter().find(|e| e.journal_id == q) {
+        return Some(e.clone());
+    }
+    let unique = |v: Vec<&PinEntry>| if v.len() == 1 { Some(v[0].clone()) } else { None };
+    unique(entries.iter().filter(|e| e.name.as_deref() == Some(q)).collect()).or_else(|| {
+        (q.chars().count() >= super::close::MIN_PREFIX_LEN)
+            .then(|| unique(entries.iter().filter(|e| e.journal_id.starts_with(q)).collect()))
+            .flatten()
+    })
 }
 
 /// Who holds `journal_id`'s lock, if anyone (probe: take and drop it).
@@ -488,6 +512,17 @@ mod tests {
         assert!(book.load().is_empty());
         book.pinned("b", "b", None, None, None);
         assert_eq!(std::fs::read_to_string(book.path()).unwrap(), "{not json", "never overwritten");
+    }
+
+    #[test]
+    fn resolve_entry_by_id_name_or_long_prefix() {
+        let e = |id: &str, name: Option<&str>| PinEntry { journal_id: id.into(), name: name.map(Into::into), ..Default::default() };
+        let v = [e("20261025-101010-aaaa", Some("axon")), e("20261025-111111-bbbb", None)];
+        assert_eq!(resolve_entry(&v, "axon").map(|e| e.journal_id), Some("20261025-101010-aaaa".into()));
+        assert_eq!(resolve_entry(&v, "20261025-11").map(|e| e.journal_id), Some("20261025-111111-bbbb".into()));
+        assert!(resolve_entry(&v, "2026").is_none(), "too short");
+        assert!(resolve_entry(&v, "20261025-1").is_none(), "ambiguous");
+        assert!(resolve_entry(&v, "nope").is_none());
     }
 
     #[test]
