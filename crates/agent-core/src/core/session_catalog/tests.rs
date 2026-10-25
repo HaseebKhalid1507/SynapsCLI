@@ -590,8 +590,8 @@ fn facets_count_with_query_and_other_selections() {
         v.facets.when,
         vec![
             (When::Today, 1),
-            (When::ThisWeek, 2),
-            (When::ThisMonth, 1),
+            (When::Last7Days, 2),
+            (When::Last30Days, 1),
             (When::Older, 1)
         ]
     );
@@ -637,7 +637,7 @@ fn facets_count_with_query_and_other_selections() {
     assert_eq!(ids(&cat, &v), vec![A, B]);
     assert_eq!(v.facets.models.len(), 3, "own group unaffected");
     assert_eq!(v.facets.when[0], (When::Today, 1));
-    assert_eq!(v.facets.when[1], (When::ThisWeek, 1));
+    assert_eq!(v.facets.when[1], (When::Last7Days, 1));
     assert_eq!(v.facets.projects.len(), 2);
 
     // Query narrows counts.
@@ -748,10 +748,10 @@ fn sort_orders_and_day_groups() {
 fn clock_buckets_and_labels_use_local_time() {
     let c = clock();
     // 03:00Z on the 25th is still the 24th in EDT.
-    assert_eq!(c.when(at(2026, 10, 25, 3)), When::ThisWeek);
+    assert_eq!(c.when(at(2026, 10, 25, 3)), When::Last7Days);
     assert_eq!(c.when(at(2026, 10, 25, 5)), When::Today);
-    assert_eq!(c.when(at(2026, 10, 19, 12)), When::ThisWeek);
-    assert_eq!(c.when(at(2026, 10, 18, 12)), When::ThisMonth);
+    assert_eq!(c.when(at(2026, 10, 19, 12)), When::Last7Days);
+    assert_eq!(c.when(at(2026, 10, 18, 12)), When::Last30Days);
     assert_eq!(c.when(at(2026, 9, 25, 12)), When::Older);
     assert_eq!(
         c.when(at(2027, 1, 1, 0)),

@@ -36,6 +36,14 @@ impl Clock {
         }
     }
 
+    /// Local wall-clock time of `t` in this zone.
+    pub fn local(&self, t: DateTime<Utc>) -> chrono::NaiveDateTime {
+        match self.fixed {
+            Some(off) => t.with_timezone(&off).naive_local(),
+            None => t.with_timezone(&Local).naive_local(),
+        }
+    }
+
     pub fn today(&self) -> NaiveDate {
         self.date_of(self.now)
     }
@@ -57,15 +65,15 @@ impl Clock {
     }
 
     /// Bucket of `t`: rolling, exclusive windows by local calendar day —
-    /// today, the 6 days before (`This week`), the 23 before that
-    /// (`This month`, 30 days total), everything else. Future timestamps
+    /// today, the 6 days before (`Last 7 days`), the 23 before that
+    /// (`Last 30 days`, 30 days total), everything else. Future timestamps
     /// (clock skew) count as today.
     pub fn when(&self, t: DateTime<Utc>) -> When {
         let days = (self.today() - self.date_of(t)).num_days();
         match days {
             i64::MIN..=0 => When::Today,
-            1..=6 => When::ThisWeek,
-            7..=29 => When::ThisMonth,
+            1..=6 => When::Last7Days,
+            7..=29 => When::Last30Days,
             _ => When::Older,
         }
     }
@@ -90,19 +98,19 @@ impl Clock {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum When {
     Today,
-    ThisWeek,
-    ThisMonth,
+    Last7Days,
+    Last30Days,
     Older,
 }
 
 impl When {
-    pub const ALL: [When; 4] = [When::Today, When::ThisWeek, When::ThisMonth, When::Older];
+    pub const ALL: [When; 4] = [When::Today, When::Last7Days, When::Last30Days, When::Older];
 
     pub fn label(self) -> &'static str {
         match self {
             When::Today => "Today",
-            When::ThisWeek => "This week",
-            When::ThisMonth => "This month",
+            When::Last7Days => "Last 7 days",
+            When::Last30Days => "Last 30 days",
             When::Older => "Older",
         }
     }

@@ -135,6 +135,12 @@ impl CatalogEntry {
         self.id.get(n.saturating_sub(4)..).unwrap_or(&self.id)
     }
 
+    /// Set the name (after a rename) and keep the search haystack in sync.
+    pub fn set_name(&mut self, name: Option<String>) {
+        self.name = name;
+        self.rebuild_search_blob();
+    }
+
     pub(crate) fn search_blob(&self) -> &str {
         &self.search_blob
     }
