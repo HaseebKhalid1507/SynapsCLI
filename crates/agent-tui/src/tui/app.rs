@@ -262,6 +262,9 @@ pub(crate) struct App {
     /// `Resumed` reply waiting for the `Conversation` that carries the
     /// resumed session's messages (then the "switched from …" line).
     pub(crate) resume_pending: Option<ResumePending>,
+    /// Set by a `/sessions` switch: the attach's "you own input" toast is
+    /// skipped until then (the switched line already says where you are).
+    pub(crate) quiet_owner_toast_until: Option<std::time::Instant>,
     /// The last Submit text until `TurnStarted`/`Refused` (§6 #9: a refused
     /// Submit gives the editor its text back).
     pub(crate) last_submitted: Option<String>,
@@ -508,6 +511,7 @@ impl App {
             subagent_rows: Vec::new(),
             compaction_applied: None,
             resume_pending: None,
+            quiet_owner_toast_until: None,
             last_submitted: None,
             pending_attachments: Default::default(),
             consecutive_auto_turns: 0,

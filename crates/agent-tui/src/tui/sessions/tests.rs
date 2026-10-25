@@ -465,7 +465,7 @@ fn past_tab_lists_newest_first() {
     assert!(text.contains("enter continue"), "{text}");
     // Enter on the newest row asks to continue its journal.
     handle_event(&mut st, key(KeyCode::Enter));
-    assert_eq!(st.pending_switch, Some(SwitchTarget::Continue { journal_id: "new-bbbb".into() }));
+    assert_eq!(st.pending_switch, Some(SwitchTarget::Continue { journal_id: "new-bbbb".into(), cwd: None }));
     assert!(text.contains("Past 2"), "{text}");
     assert!(text.contains("search & filters coming"), "{text}");
     let newer = text.find("newer one").unwrap();

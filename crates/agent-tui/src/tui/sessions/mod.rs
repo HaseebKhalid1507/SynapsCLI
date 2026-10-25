@@ -111,12 +111,14 @@ pub(crate) enum SessionsOp {
 /// - `Attach`: a session the daemon already holds (Live or Parked — attaching
 ///   unparks it). Set by the Live tab.
 /// - `Continue`: a saved journal. The daemon creates a session continuing it
-///   (`Attach::Create{continue_session}`); if that journal is already live in
-///   the daemon, the loop attaches to the live one instead. Set by the Past tab.
+///   (`Attach::Create{continue_session}`) in `cwd` — the journal's own folder;
+///   `None`, or a folder that no longer exists, falls back to this TUI's cwd
+///   (the switched line says so). If that journal is already live in the
+///   daemon, the loop attaches to the live one instead. Set by the Past tab.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum SwitchTarget {
     Attach { id: String },
-    Continue { journal_id: String },
+    Continue { journal_id: String, cwd: Option<std::path::PathBuf> },
 }
 
 /// What the background tasks send back to the main loop.

@@ -20,6 +20,10 @@ pub struct FakeSession {
     /// `api_messages` (`{"role":…, "content":…}` values).
     pub history: Vec<serde_json::Value>,
     pub streaming: bool,
+    /// The folder the daemon created it in (`Continue`'s resolved cwd).
+    pub cwd: Option<std::path::PathBuf>,
+    /// Mid-turn partial text the attach replays (implies `streaming`).
+    pub replay_text: Option<String>,
 }
 
 impl FakeSession {
@@ -34,6 +38,8 @@ impl FakeSession {
                 serde_json::json!({"role": "assistant", "content": [{"type": "text", "text": assistant}]}),
             ],
             streaming: false,
+            cwd: None,
+            replay_text: None,
         }
     }
 }
@@ -100,6 +106,7 @@ impl FakeDaemon {
         meta.name = s.name.clone();
         meta.journal_id = s.journal_id.clone();
         meta.busy = s.streaming;
+        meta.cwd = s.cwd.clone();
         let snapshot = AttachSnapshot {
             meta,
             view: (*t.view()).clone(),
@@ -110,7 +117,28 @@ impl FakeDaemon {
                 ..Default::default()
             },
             streaming: s.streaming,
-            replay: Vec::new(),
+            replay: s
+                .replay_text
+                .iter()
+                .flat_map(|t| {
+                    let env = |event| agent_engine::session::Envelope {
+                        session_id: agent_engine::session::SessionId(s.id.clone()),
+                        seq: 0,
+                        ts: chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0).unwrap_or_default(),
+                        event,
+                    };
+                    [
+                        env(agent_engine::session::SessionEventWire::TurnStarted {
+                            turn_baseline: s.history.len(),
+                            trigger: agent_engine::session::TurnTrigger::User,
+                            user_text: None,
+                        }),
+                        env(agent_engine::session::SessionEventWire::Stream(
+                            agent_engine::StreamEvent::Llm(agent_engine::LlmEvent::Text(t.clone())),
+                        )),
+                    ]
+                })
+                .collect(),
             pending_prompts: Vec::new(),
             clients: Vec::new(),
             input_owner: Some(ClientId(1)),
@@ -135,8 +163,9 @@ impl Connector for FakeDaemon {
                     .ok_or_else(|| format!("unknown session: {id}"))?;
                 Ok(Self::build(&mut inner, &s, false))
             }
-            SwitchTarget::Continue { journal_id } => {
-                inner.connects.push(format!("continue:{journal_id}"));
+            SwitchTarget::Continue { journal_id, cwd } => {
+                let at = cwd.as_ref().map(|c| format!("@{}", c.display())).unwrap_or_default();
+                inner.connects.push(format!("continue:{journal_id}{at}"));
                 if let Some(s) = inner
                     .live
                     .iter()
@@ -152,7 +181,7 @@ impl Connector for FakeDaemon {
                     .cloned()
                     .ok_or_else(|| format!("no saved session {journal_id}"))?;
                 // The daemon continues it as a new live session on that journal.
-                let s = FakeSession { id: format!("cont-{journal_id}"), ..past };
+                let s = FakeSession { id: format!("cont-{journal_id}"), cwd: cwd.clone(), ..past };
                 inner.live.push(s.clone());
                 Ok(Self::build(&mut inner, &s, false))
             }

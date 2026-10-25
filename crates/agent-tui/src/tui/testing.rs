@@ -310,11 +310,27 @@ impl TestHarness {
 
     /// What the Past tab's Enter does: ask to continue a saved journal.
     pub fn request_continue(&mut self, journal_id: &str) -> &mut Self {
+        self.request_continue_in(journal_id, None)
+    }
+
+    /// [`Self::request_continue`] with the journal's folder.
+    pub fn request_continue_in(
+        &mut self,
+        journal_id: &str,
+        cwd: Option<std::path::PathBuf>,
+    ) -> &mut Self {
         if let Some(st) = self.app.sessions.as_mut() {
-            st.pending_switch =
-                Some(super::sessions::SwitchTarget::Continue { journal_id: journal_id.to_string() });
+            st.pending_switch = Some(super::sessions::SwitchTarget::Continue {
+                journal_id: journal_id.to_string(),
+                cwd,
+            });
         }
         self.drive_session_switch()
+    }
+
+    /// The header's folder label.
+    pub fn header_folder(&self) -> String {
+        self.app.header_folder.clone()
     }
 
     /// Drain a pending `/sessions` switch through the production

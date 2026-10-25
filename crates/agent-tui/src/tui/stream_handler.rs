@@ -769,9 +769,15 @@ pub(super) async fn handle_session_event_arm(
                         .titled("Session"),
                 );
             } else if to == Some(me) && from != Some(me) {
-                app.toasts.upsert(
-                    super::toast::Toast::new("input-owner", "you own input").titled("Session"),
-                );
+                let quiet = app
+                    .quiet_owner_toast_until
+                    .take()
+                    .is_some_and(|until| std::time::Instant::now() < until);
+                if !quiet {
+                    app.toasts.upsert(
+                        super::toast::Toast::new("input-owner", "you own input").titled("Session"),
+                    );
+                }
             }
             app.request_redraw();
         }

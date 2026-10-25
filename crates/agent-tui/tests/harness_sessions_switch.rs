@@ -216,6 +216,72 @@ fn enter_on_own_row_does_nothing() {
 }
 
 #[test]
+fn continue_runs_in_the_journal_folder_or_falls_back() {
+    let (mut h, d) = setup();
+    let dir = tempfile::TempDir::new().unwrap();
+    d.add_past(FakeSession::new("20261020-000000-here", Some("here"), "q", "a"));
+    d.add_past(FakeSession::new("20261020-000000-gone", Some("gone"), "q", "a"));
+    // The journal's folder exists: the session is created there.
+    h.open_sessions_with(Some("/nonexistent/daemon.sock".into()));
+    h.request_continue_in("20261020-000000-here", Some(dir.path().to_path_buf()));
+    assert_eq!(h.own_session_id(), "cont-20261020-000000-here");
+    assert_eq!(
+        d.connects().last().unwrap(),
+        &format!("continue:20261020-000000-here@{}", dir.path().display())
+    );
+    let t = h.main_transcript_text();
+    assert!(!t.contains("folder gone"), "{t}");
+    let last = dir.path().file_name().unwrap().to_string_lossy().to_string();
+    assert!(h.header_folder().contains(&last), "header shows the session's folder: {}", h.header_folder());
+    // Gone: falls back to this TUI's cwd and says so.
+    h.open_sessions_with(Some("/nonexistent/daemon.sock".into()));
+    h.request_continue_in("20261020-000000-gone", Some("/nonexistent/was-here".into()));
+    assert_eq!(h.own_session_id(), "cont-20261020-000000-gone");
+    let here = std::env::current_dir().unwrap();
+    assert_eq!(
+        d.connects().last().unwrap(),
+        &format!("continue:20261020-000000-gone@{}", here.display())
+    );
+    let t = h.main_transcript_text();
+    assert!(t.contains("(folder gone, using "), "{t}");
+}
+
+#[test]
+fn switch_line_is_newest_and_the_owner_toast_stays_quiet() {
+    let (mut h, d) = setup();
+    let mut busy = FakeSession::new("20261025-090200-cccc", Some("axon"), "long task", "earlier answer");
+    busy.streaming = true;
+    busy.replay_text = Some("partial reply so far".into());
+    d.add_live(busy);
+    switch_to(&mut h, &d, "20261025-090200-cccc");
+    let t = h.main_transcript_text();
+    let partial = t.find("partial reply so far").expect("replayed partial turn");
+    let line = t.find("switched to axon").expect("switched line");
+    assert!(line > partial, "switched line must come after the replay: {t}");
+    assert!(t.trim_end().ends_with("keeps running"), "newest line: {t}");
+    // The actor's InputOwnerChanged right after Attach: no toast on a switch.
+    let toasts = h.toast_count();
+    h.feed_event(SessionEventWire::InputOwnerChanged {
+        from: None,
+        to: Some(agent_engine::session::ClientId(1)),
+        reason: agent_engine::session::OwnerChangeReason::Attach,
+    });
+    assert_eq!(h.toast_count(), toasts, "no 'you own input' toast after a switch");
+    // A later real ownership change still toasts.
+    h.feed_event(SessionEventWire::InputOwnerChanged {
+        from: Some(agent_engine::session::ClientId(1)),
+        to: Some(agent_engine::session::ClientId(2)),
+        reason: agent_engine::session::OwnerChangeReason::Takeover,
+    });
+    h.feed_event(SessionEventWire::InputOwnerChanged {
+        from: Some(agent_engine::session::ClientId(2)),
+        to: Some(agent_engine::session::ClientId(1)),
+        reason: agent_engine::session::OwnerChangeReason::Takeover,
+    });
+    assert!(h.snapshot().contains("you own input"), "{}", h.snapshot());
+}
+
+#[test]
 #[ignore = "manual: prints the screen after a switch"]
 fn dump_after_switch() {
     let (mut h, d) = setup();

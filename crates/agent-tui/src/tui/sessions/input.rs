@@ -43,7 +43,8 @@ pub(crate) fn handle_event(st: &mut SessionsState, key: KeyEvent) -> InputOutcom
                 // Continue that saved journal (daemon: a new session on it, or
                 // the live one if it is already loaded; in-process: /resume).
                 if let Some(id) = st.past.selected_id() {
-                    st.pending_switch = Some(super::SwitchTarget::Continue { journal_id: id });
+                    // The placeholder list has no cwd; the catalog-backed Past sets it.
+                    st.pending_switch = Some(super::SwitchTarget::Continue { journal_id: id, cwd: None });
                 }
             } else {
                 st.past.handle_key(key);

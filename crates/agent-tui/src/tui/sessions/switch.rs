@@ -56,7 +56,7 @@ impl Connector for DaemonConnector {
             SwitchTarget::Attach { id } => {
                 (Attach::Existing { session_id: SessionId(id.clone()), mode }, false)
             }
-            SwitchTarget::Continue { journal_id } => {
+            SwitchTarget::Continue { journal_id, cwd } => {
                 // Already live (someone continued it meanwhile)? Attach to
                 // that one rather than forking a second session on one journal.
                 match conn
@@ -66,7 +66,7 @@ impl Connector for DaemonConnector {
                     .find(|m| m.journal_id == *journal_id || m.id.0 == *journal_id)
                 {
                     Some(m) => (Attach::Existing { session_id: m.id.clone(), mode }, true),
-                    None => (continue_attach(journal_id, mode), false),
+                    None => (continue_attach(journal_id, cwd.clone(), mode), false),
                 }
             }
         };
@@ -80,17 +80,39 @@ impl Connector for DaemonConnector {
     }
 }
 
-/// `synaps --attach --continue <id>`'s Create, from this TUI's cwd.
-fn continue_attach(journal_id: &str, mode: AttachMode) -> Attach {
+/// `synaps --attach --continue <id>`'s Create, in `cwd` (already resolved
+/// by [`resolve_cwd`]; `None` = this TUI's cwd).
+fn continue_attach(journal_id: &str, cwd: Option<PathBuf>, mode: AttachMode) -> Attach {
     Attach::Create {
         config: SessionConfig {
             continue_session: Some(Some(journal_id.to_string())),
-            cwd: std::env::current_dir().ok(),
+            cwd: cwd.or_else(|| std::env::current_dir().ok()),
             compaction_policy: CompactionPolicyWire::LinkedSuccessor,
             await_extensions: !synaps_cli::load_config().startup.quick_start,
             ..Default::default()
         },
         mode,
+    }
+}
+
+/// Where a Continue runs: the journal's folder if it still exists, else this
+/// TUI's cwd — with the note the switched line carries (`folder gone, using
+/// ~/x`).
+pub(crate) fn resolve_cwd(
+    wanted: Option<PathBuf>,
+    fallback: Option<PathBuf>,
+    home: Option<&std::path::Path>,
+) -> (Option<PathBuf>, Option<String>) {
+    match wanted {
+        Some(dir) if dir.is_dir() => (Some(dir), None),
+        Some(_) => {
+            let shown = fallback
+                .as_deref()
+                .map(|f| super::short_cwd(Some(f), home))
+                .unwrap_or_else(|| "this folder".to_string());
+            (fallback, Some(format!("folder gone, using {shown}")))
+        }
+        None => (fallback, None),
     }
 }
 
@@ -133,6 +155,17 @@ pub(crate) async fn perform(
     let Some(connector) = connector else {
         return in_process(app, link, target).await;
     };
+    // Continue runs in the journal's folder, or here if that folder is gone.
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let mut cwd_note = None;
+    let target = match target {
+        SwitchTarget::Continue { journal_id, cwd } => {
+            let (cwd, note) = resolve_cwd(cwd, std::env::current_dir().ok(), home.as_deref());
+            cwd_note = note;
+            SwitchTarget::Continue { journal_id, cwd }
+        }
+        other => other,
+    };
 
     let mode = if link.mode() == AttachMode::Observe { AttachMode::Observe } else { AttachMode::Mirror };
     if let Some(st) = app.sessions.as_mut() {
@@ -172,15 +205,6 @@ pub(crate) async fn perform(
     }
     super::close(app);
     crate::tui::input::reconcile_secret_prompt(app);
-    let new_name = display_name(snapshot.meta.name.as_deref(), &snapshot.meta.id.0);
-    let via = if attached.reused_live { " (already live)" } else { "" };
-    app.push_msg(ChatMessage::System(format!(
-        "switched to {new_name}{via} \u{2014} {old_name} keeps running"
-    )));
-    if let Some(n) = snapshot.input_owned_elsewhere(link.client_id()) {
-        app.push_msg(ChatMessage::System(n));
-    }
-
     // Mid-turn attach: rebuild the partial turn, then the pending prompts
     // (same order as `--attach`).
     bridge.set_owns_input(snapshot.input_owner == Some(link.client_id()));
@@ -194,6 +218,24 @@ pub(crate) async fn perform(
         bridge.on_prompt(pr);
     }
     crate::tui::stream_handler::sync_waiting_confirms(app, bridge);
+    // The switched line is the notice — the attach's "you own input" toast
+    // (the actor's InputOwnerChanged right after Attach) stays quiet.
+    app.quiet_owner_toast_until =
+        Some(std::time::Instant::now() + std::time::Duration::from_secs(3));
+    // Newest line: after the rebuilt transcript and any replayed partial turn.
+    if let Some(n) = snapshot.input_owned_elsewhere(link.client_id()) {
+        app.push_msg(ChatMessage::System(n));
+    }
+    let new_name = display_name(snapshot.meta.name.as_deref(), &snapshot.meta.id.0);
+    let mut extras = Vec::new();
+    if attached.reused_live {
+        extras.push("already live".to_string());
+    }
+    extras.extend(cwd_note);
+    let extras = if extras.is_empty() { String::new() } else { format!(" ({})", extras.join(", ")) };
+    app.push_msg(ChatMessage::System(format!(
+        "switched to {new_name}{extras} \u{2014} {old_name} keeps running"
+    )));
     #[cfg(debug_assertions)]
     crate::tui::focus::debug_assert_stack_sync(app);
     app.request_immediate_redraw();
@@ -210,7 +252,7 @@ async fn in_process(app: &mut App, link: &mut SessionLink, target: SwitchTarget)
         SwitchTarget::Continue { .. } if app.streaming || app.compacting => {
             refuse(app, "switching would cancel this turn \u{2014} wait for it to end (or Esc)");
         }
-        SwitchTarget::Continue { journal_id } => match link.resume(&journal_id).await {
+        SwitchTarget::Continue { journal_id, .. } => match link.resume(&journal_id).await {
             Ok(reply) => {
                 super::close(app);
                 app.transcript.clear();
