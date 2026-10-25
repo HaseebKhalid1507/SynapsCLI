@@ -28,7 +28,7 @@
 | Thin-client flags (`SYNAPS_CLIENT_REEXEC=0`, `SYNAPS_CLIENT_ALLOC=default`, `SYNAPS_CLIENT_THP=1`, `SYNAPS_CLIENT_PURGE_IDLE_SECS`, `SYNAPS_CLIENT_HISTORY=full`, `SYNAPS_TUI_SCROLLBACK[_BYTES]`, `SYNAPS_TUI_SYNTECT=full`, `SYNAPS_TUI_SYNTECT_IDLE_SECS`, `SYNAPS_CLIENT_SIGNAL_THREAD=1`, `SYNAPS_ATTACH_TAIL_ITEMS`) | Phase 4 client diet — full table with defaults in [memory-budget.md](memory-budget.md#kill-switches-all-env-vars). Only read on the `--attach`/`attach` thin path; the in-process fallback (`SYNAPS_DAEMON=0`, or a failed auto-spawn) boots untouched (`tests/attach_no_daemon.rs`, `tests/daemon_autospawn.rs`). |
 | `SYNAPS_DAEMON_READY_FD` | Internal: write end of the ready pipe handed to a `--detach`ed child. Scrubbed from the env before accept. |
 | `SYNAPS_DAEMON_PARK_GRACE_SECS` (default 60; `never` disables) | B3: seconds after the last detach (idle, no prompts, no compaction, not keep-warm, journal on disk) before a session is **Parked** — `Runtime` + `ConversationState` dropped, restored from the journal on the next attach/turn/`synaps send`. A session that never ran a turn has no journal and never parks. |
-| **Pin**: `/pin [on\|off\|status]` / `synaps daemon pin <ID\|NAME> [--off]` / `--keep-warm` (attach flag) / `/keep-warm on\|off` / `SessionCommand::KeepWarm` | The session stays loaded: never parked, never idle-ended (F18), never evicted, and the daemon does not idle-exit while any session is pinned. Survives `daemon reload`. See [Pinning a session](#pinning-a-session-pin). Not `/keepwarm`, which pings the API to keep the prompt cache warm and costs money. |
+| **Pin**: `/pin [on\|off\|status]` / `synaps daemon pin <ID\|NAME> [--off]` / `--keep-warm` (attach flag) / `/keep-warm on\|off` / `SessionCommand::KeepWarm` | The session stays loaded: never parked, never idle-ended (F18), never evicted, and the daemon does not idle-exit while any session is pinned. Survives `daemon reload` and comes back when the daemon starts again (after a stop, crash or reboot). See [Pinning a session](#pinning-a-session-pin). Not `/keepwarm`, which pings the API to keep the prompt cache warm and costs money. |
 | `synaps attach --observe` / `--takeover` | B1 attach modes: `--observe` never owns input (setters/`Submit` are `Refused`); `--takeover` steals ownership from the current owner (who is told via `InputOwnerChanged{Takeover}`); default `Mirror` owns input iff nobody does (with `client_input = shared`, every `Mirror` may type; see below). |
 | `synaps --attach --as NAME` / `synaps attach --as NAME` | Names this client in the session (also `SYNAPS_CLIENT_NAME`): 1–32 letters, digits, `-` or `_`, starting with a letter or digit, checked by the client and again by the daemon (an invalid name is `Refused{Protocol}` at the handshake). A label, not a login: every client is the daemon's own user. Without one a client gets its kind (`tui`, `attach`, `rpc`, …); a name already taken in the session gets the lowest free `-2`, `-3` suffix (case-insensitive). The resolved name rides `ClientJoined{name, mode}` and `Attached.roster`, and shows in `/clients`, `synaps daemon sessions` (`clients=2 (tui*, dash(observe))`, `*` = owns input), `input owned by tui (#1)` refusals, approval notices and the TUI's "input taken over by" toast. Older daemons ignore the name; older clients ignore the new fields. |
 | `/takeover` (TUI) / `SessionCommand::TakeInput` | The in-place `--takeover`: an attached read-only client takes input without re-attaching (no re-mirror), mid-turn too. Same `InputOwnerChanged{Takeover}` (`Attach` if nobody owned input); refused from an `--observe` client; a no-op from the owner. A read-only TUI's attach line and its "refused: input owned by …" errors name it. |
@@ -174,9 +174,54 @@ loaded (a long-lived worker host, an inbox other tools write to) is **pinned**:
   definition); unpinning a parked one leaves it parked.
 - `synaps daemon sessions` marks a pinned session with `pinned` after its
   lifecycle; `--json` has `"pinned": true|false` (`SessionMeta.pinned`).
-- The pin survives `daemon reload`. It does **not** keep a session alive
-  through `/close`, `daemon close`, `daemon stop` or a crash, and a pinned
-  session is not brought back when the daemon starts again (planned).
+- The pin survives `daemon reload`, and a pinned session **comes back when the
+  daemon starts again** (see below). `/close` and `daemon close` end it on
+  purpose: then it is unpinned and does not come back.
+- A pinned session keeps the prompt cache warm (`/keepwarm`, when it is on)
+  even with no TUI ever attached, e.g. one restored after a restart and fed by
+  `synaps send`. Unpinned, only a session a typing client attached to keeps warm.
+
+### Pinned sessions come back after a restart
+
+The daemon keeps the set of pinned journals in the **pin book**,
+`<config dir>/daemon-pins.json` (`~/.synaps-cli/[<profile>/]`; 0600; one entry per
+pin: `journal_id`, `name`, `cwd`, `pinned_at`, the `/keepwarm` choice, and a
+restore `state`/`reason`/`attempts`). It is written when the pin changes (TUI
+`/pin`, `daemon pin`, `p` in `/sessions`, `--keep-warm`), when a pinned session
+moves to a new journal (`/clear`, a successor compaction) or is renamed, and
+when a pinned session is ended on purpose. A daemon stop, SIGTERM, idle exit,
+reload or crash leaves it alone.
+
+When the daemon starts (not on `daemon reload`, which hands its sessions over
+already), it continues every entry that is not live, one at a time, in the
+background after it is ready (`synaps --attach --continue <id>`'s create, in the
+saved cwd), pins it, and restores its `/keepwarm` choice. Keep-warm pings
+nothing until the first real turn. The restore holds the daemon's idle exit.
+
+- **Journal held by another process** (an in-process TUI): never stolen. The
+  entry is marked `waiting: held by pid N, tui` (one 2 s re-check); the next
+  daemon start tries again, `synaps daemon pin <id>` tries now.
+- **Missing journal / create fails**: `failed: <reason>`, kept until cleared.
+- **Crash loop**: an attempt marker is written before each restore; an entry
+  whose restore the daemon did not live through twice is marked failed and not
+  retried (`synaps daemon pin <id>` retries it). The marker names whichever
+  entry was in flight, so an unrelated crash during a restore counts against it.
+- `synaps daemon sessions` lists pins that are not live (`<id>  pinned (not live)
+  <state>`), and `/sessions` shows them under **PINNED · NOT LIVE** (⚑; `p`
+  clears one, `enter` continues it). `--json` lists live sessions only.
+- `synaps daemon pin <ID|NAME> --off` clears an entry that is not live, even
+  with no daemon running. In `/sessions` → Past, a pinned journal shows ⚑; `p`
+  pins a Past row (continues it into the daemon, pinned, without switching to
+  it) or unpins a pinned one.
+- `synaps daemon stop` prints `N pinned sessions will come back on next start: …`.
+- `SYNAPS_DAEMON_RESTORE_PINS=0` starts a daemon without restoring (the pin book
+  is kept for the next start).
+- Not restored: `/system` overrides, `/settings` knobs changed in the session
+  (thinking, model override beyond the journal's, auto-approve), `/memory`
+  choice, running workers. The conversation, model, name and env come from the
+  journal.
+- At boot: `deploy/synaps-daemon.service` (systemd user unit, with
+  `loginctl enable-linger`) starts the daemon, and with it every pin.
 
 ## Files (under `registry_dir()`, one set per profile: `daemon-<P>.*`)
 

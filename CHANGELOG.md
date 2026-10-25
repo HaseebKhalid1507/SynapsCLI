@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Pinned sessions come back after the daemon restarts** (`daemon stop`,
+  SIGTERM, idle exit, a crash, a reboot with `deploy/synaps-daemon.service`).
+  The pin book (`<config dir>/daemon-pins.json`) is written when the pin changes
+  and dropped for a session ended on purpose (`/close`, `daemon close`). A held
+  journal waits, a missing one fails visibly; both show in `daemon sessions` and
+  `/sessions` (⚑, PINNED · NOT LIVE) and `daemon pin <id> --off` clears them.
+  `/sessions` → Past: ⚑ on pinned journals, `p` pins or unpins. `daemon stop`
+  says what comes back. `SYNAPS_DAEMON_RESTORE_PINS=0` skips the restore.
+- A pinned session keeps the prompt cache warm (`/keepwarm`) without a TUI
+  attached, and its `/keepwarm` choice comes back with the pin.
+
 ### Security
 
 - **Plugins can no longer request host credentials or proxy settings through
