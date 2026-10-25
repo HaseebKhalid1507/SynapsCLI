@@ -310,6 +310,13 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
                 let reply = super::pin::pin_session(&state, &session_id, on).await;
                 let _ = tx.send(reply).await;
             }
+            // `daemon reload-extension`: restart one extension in place,
+            // sessions untouched. A refusal is terminal, like `Close`.
+            Ok(Read::Frame(ClientFrame::ReloadExtension { extension })) => {
+                tracing::info!(extension = %extension, "daemon: extension reload requested over the socket");
+                let reply = super::extension_reload::reload_extension(&state, &extension).await;
+                let _ = tx.send(reply).await;
+            }
             // C2: jemalloc purge in the daemon (bench hygiene); reply Pong.
             Ok(Read::Frame(ClientFrame::Purge)) => {
                 agent_core::core::memstat::purge_arenas();
@@ -594,6 +601,7 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
             | Ok(Read::Frame(ClientFrame::Purge))
             | Ok(Read::Frame(ClientFrame::Close { .. }))
             | Ok(Read::Frame(ClientFrame::Pin { .. }))
+            | Ok(Read::Frame(ClientFrame::ReloadExtension { .. }))
             | Ok(Read::Frame(ClientFrame::AuthState(_))) => {
                 let _ = tx.send(DaemonFrame::Error { session_id: Some(sid.clone()), message: "control frames are not accepted on an attached connection".into() }).await;
             }

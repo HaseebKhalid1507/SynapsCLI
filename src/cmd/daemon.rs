@@ -1,4 +1,4 @@
-//! `synaps daemon {start,status,stop,sessions,purge,reload,close,pin}`
+//! `synaps daemon {start,status,stop,sessions,purge,reload,close,pin,reload-extension}`
 //! (PLAN-phase2 §2.11, B4; phase 3 C2 `purge`, C3 `reload`).
 
 use std::path::PathBuf;
@@ -113,6 +113,17 @@ pub(crate) enum DaemonAction {
         #[arg(long)]
         json: bool,
     },
+    /// Restart one extension from what is installed now, in every session,
+    /// without `daemon reload`: no session is checkpointed and no turn is
+    /// cancelled (only a call into the old process that is in flight
+    /// fails). Also loads a plugin installed after the daemon started.
+    ReloadExtension {
+        /// The plugin's directory name, as `/extensions` lists it.
+        #[arg(value_name = "NAME")]
+        name: String,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn opts_from(profile: Option<String>, a: &StartArgs) -> DaemonOpts {
@@ -146,7 +157,91 @@ pub(crate) async fn run(profile: Option<String>, args: DaemonArgs) -> anyhow::Re
         Some(DaemonAction::Reload { now, drain_secs, exe, json }) => reload(profile, now, drain_secs, exe, json).await,
         Some(DaemonAction::Close { target, force, attached, json }) => close(profile, target, force, attached, json).await,
         Some(DaemonAction::Pin { target, off, json }) => pin(profile, target, !off, json).await,
+        Some(DaemonAction::ReloadExtension { name, json }) => reload_extension(profile, name, json).await,
     }
+}
+
+/// `daemon reload-extension`: send `ReloadExtension`, report. Exit 0
+/// reloaded (or loaded); 3 refused (daemon reloading); 2 daemon too old or
+/// protocol mismatch; 1 otherwise (not installed, bad manifest, failed to
+/// start, no daemon, timeout).
+async fn reload_extension(profile: Option<String>, name: String, json: bool) -> anyhow::Result<()> {
+    let paths = registry::daemon_paths(profile.as_deref());
+    if !registry::is_alive(&paths) {
+        reload_extension_exit(json, 1, &name, "no_daemon", None, false, "daemon not running");
+    }
+    let mut conn = match Connected::connect(&paths.sock, Hello::new(ClientKind::Attach)).await {
+        Ok(c) => c,
+        Err(e @ TransportError::Version { .. }) => {
+            reload_extension_exit(json, EXIT_VERSION, &name, "version", None, false, &e.to_string())
+        }
+        Err(e) => reload_extension_exit(json, 1, &name, "error", None, false, &format!("cannot reach the daemon: {e}")),
+    };
+    let outcome = conn.reload_extension(&name).await;
+    conn.bye().await;
+    match outcome {
+        Ok(Ok(report)) => {
+            let verb = if report.was_loaded { "reloaded" } else { "loaded" };
+            let mut text = format!("{verb} {}", report.extension);
+            if report.deferred {
+                text.push_str(" (deferred: its process starts on first use)");
+            }
+            match report.tools.len() {
+                0 => text.push_str("; no tools"),
+                n => text.push_str(&format!("; {n} tool{}: {}", if n == 1 { "" } else { "s" }, report.tools.join(", "))),
+            }
+            if !report.removed_tools.is_empty() {
+                text.push_str(&format!("; removed: {}", report.removed_tools.join(", ")));
+            }
+            reload_extension_exit(json, 0, &name, verb, Some(&report), false, &text)
+        }
+        Ok(Err(failure)) => {
+            let mut text = format!("{name} was not reloaded: {}", failure.message);
+            if failure.unloaded {
+                text.push_str(&format!("\n{name} is not loaded now; fix it and run this again"));
+            } else {
+                text.push_str("\nthe running instance (if any) was not touched");
+            }
+            reload_extension_exit(json, 1, &name, "failed", None, failure.unloaded, &text)
+        }
+        Err(TransportError::Refused(text)) => reload_extension_exit(json, EXIT_REFUSED, &name, "refused", None, false, &text),
+        Err(e @ TransportError::DaemonTooOld { .. }) => {
+            reload_extension_exit(json, EXIT_VERSION, &name, "too_old", None, false, &e.to_string())
+        }
+        Err(e) => reload_extension_exit(json, 1, &name, "error", None, false, &format!("extension reload failed: {e}")),
+    }
+}
+
+/// Print the outcome (one JSON object with `--json`) and exit with `code`.
+/// `report` is the daemon's report on success; `unloaded` says a failed
+/// reload left the extension unloaded.
+fn reload_extension_exit(
+    json: bool,
+    code: i32,
+    name: &str,
+    outcome: &str,
+    report: Option<&agent_engine::session::socket_transport::ExtensionReloadReport>,
+    unloaded: bool,
+    text: &str,
+) -> ! {
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "ok": code == 0,
+                "extension": name,
+                "outcome": outcome,
+                "unloaded": unloaded,
+                "report": report,
+                "text": text,
+            })
+        );
+    } else if code == 0 {
+        println!("{text}");
+    } else {
+        eprintln!("{text}");
+    }
+    std::process::exit(code);
 }
 
 /// `daemon pin`: resolve the target against the `Welcome` listing (as

@@ -37,6 +37,12 @@ pub const CLOSE_TIMEOUT: Duration = Duration::from_secs(
 /// session unparking) plus a margin.
 pub const PIN_TIMEOUT: Duration =
     Duration::from_secs(crate::daemon::pin::PIN_UNPARK_BUDGET.as_secs() + 2);
+/// How long `reload_extension` waits: the daemon first waits for the
+/// extension manager's lock, then stops the old process and runs the new
+/// one's start-up handshake (each bounded by the extension runtime's own
+/// timeouts, around 15 s together). Generous, because giving up early only
+/// hides the answer: the daemon finishes the reload either way.
+pub const RELOAD_EXTENSION_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// A connection past `Hello`/`Welcome`, before `Attach`.
 pub struct Connected {
@@ -281,6 +287,25 @@ impl Connected {
         pin_reply(frame, &self.welcome.daemon_version)
     }
 
+    /// `ReloadExtension{extension}`: stop that extension and start it again
+    /// from what is installed now. `Ok(Ok(report))` = reloaded;
+    /// `Ok(Err(failure))` = the daemon tried and says why not; a refusal
+    /// (daemon reloading) → `Refused(text)`; a daemon that predates the
+    /// frame → `DaemonTooOld`.
+    pub async fn reload_extension(
+        &mut self,
+        extension: &str,
+    ) -> Result<Result<ExtensionReloadReport, ExtensionReloadFailure>, TransportError> {
+        self.writer
+            .send(ClientFrame::ReloadExtension { extension: extension.to_string() })
+            .await
+            .map_err(|_| TransportError::Closed)?;
+        let frame = tokio::time::timeout(RELOAD_EXTENSION_TIMEOUT, read_frame(&mut self.reader, &mut self.buf))
+            .await
+            .map_err(|_| TransportError::Protocol("extension reload reply timed out".into()))??;
+        reload_extension_reply(frame, &self.welcome.daemon_version)
+    }
+
     /// Say goodbye and drop the connection.
     pub async fn bye(self) {
         let _ = self.writer.send(ClientFrame::Bye).await;
@@ -322,6 +347,45 @@ fn pin_reply(frame: Option<DaemonFrame>, daemon_version: &str) -> Result<bool, T
         }
         Some(DaemonFrame::Error { message, .. }) => Err(TransportError::Protocol(message)),
         Some(other) => Err(TransportError::Protocol(format!("expected pinned, got {other:?}"))),
+        None => Err(TransportError::Closed),
+    }
+}
+
+pub use crate::extensions::manager::ExtensionReloadReport;
+
+/// The daemon's reason an extension was not reloaded
+/// (`DaemonFrame::ExtensionReloadFailed`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtensionReloadFailure {
+    pub message: String,
+    /// The old instance was stopped before the new one failed to start: the
+    /// extension is not loaded now. `false` = the running one (if any) was
+    /// not touched.
+    pub unloaded: bool,
+}
+
+/// The daemon's answer to `ReloadExtension`, as
+/// [`Connected::reload_extension`] reports it.
+fn reload_extension_reply(
+    frame: Option<DaemonFrame>,
+    daemon_version: &str,
+) -> Result<Result<ExtensionReloadReport, ExtensionReloadFailure>, TransportError> {
+    match frame {
+        Some(DaemonFrame::ExtensionReloaded { report }) => Ok(Ok(report)),
+        Some(DaemonFrame::ExtensionReloadFailed { message, unloaded, .. }) => {
+            Ok(Err(ExtensionReloadFailure { message, unloaded }))
+        }
+        Some(DaemonFrame::Refused { message, .. }) => Err(TransportError::Refused(message)),
+        // An older daemon cannot decode the frame; it answers with serde's
+        // "unknown variant `reload_extension`" and keeps the connection open.
+        Some(DaemonFrame::Error { message, .. }) if message.contains("unknown variant `reload_extension`") => {
+            Err(TransportError::DaemonTooOld {
+                daemon_version: daemon_version.to_string(),
+                request: "daemon reload-extension",
+            })
+        }
+        Some(DaemonFrame::Error { message, .. }) => Err(TransportError::Protocol(message)),
+        Some(other) => Err(TransportError::Protocol(format!("expected extension_reloaded, got {other:?}"))),
         None => Err(TransportError::Closed),
     }
 }
@@ -1288,6 +1352,43 @@ mod tests {
         let closed = DaemonFrame::Closed { session_id: "s".into(), text: "x".into() };
         assert!(matches!(pin_reply(Some(closed), "1"), Err(TransportError::Protocol(_))));
         assert!(matches!(pin_reply(None, "1"), Err(TransportError::Closed)));
+    }
+
+    #[test]
+    fn reload_extension_maps_each_daemon_answer_and_an_old_daemons_unknown_variant_error() {
+        let old = DaemonFrame::Error {
+            session_id: None,
+            message: "malformed frame: unknown variant `reload_extension`, expected one of `hello`, `ping`".into(),
+        };
+        let err = reload_extension_reply(Some(old), "0.9.0").unwrap_err();
+        assert!(
+            matches!(err, TransportError::DaemonTooOld { ref daemon_version, request: "daemon reload-extension" } if daemon_version == "0.9.0"),
+            "{err}"
+        );
+
+        let report = ExtensionReloadReport {
+            extension: "axel".into(),
+            was_loaded: true,
+            deferred: false,
+            tools: vec!["axel:axel_search".into()],
+            removed_tools: vec![],
+            plugin_dir: std::path::PathBuf::from("/p/axel"),
+        };
+        let ok = DaemonFrame::ExtensionReloaded { report: report.clone() };
+        assert_eq!(reload_extension_reply(Some(ok), "1").unwrap(), Ok(report));
+        let failed = DaemonFrame::ExtensionReloadFailed { extension: "axel".into(), message: "spawn failed".into(), unloaded: true };
+        assert_eq!(
+            reload_extension_reply(Some(failed), "1").unwrap(),
+            Err(ExtensionReloadFailure { message: "spawn failed".into(), unloaded: true })
+        );
+        let busy = DaemonFrame::Refused { reason: RefuseReason::Busy, message: "daemon reloading".into() };
+        assert!(matches!(reload_extension_reply(Some(busy), "1"), Err(TransportError::Refused(ref m)) if m.contains("reloading")));
+        // A plain `Error` (not the unknown-variant one) stays a protocol error.
+        let other = DaemonFrame::Error { session_id: None, message: "frame too large".into() };
+        assert!(matches!(reload_extension_reply(Some(other), "1"), Err(TransportError::Protocol(_))));
+        let pinned = DaemonFrame::Pinned { session_id: "s".into(), on: true };
+        assert!(matches!(reload_extension_reply(Some(pinned), "1"), Err(TransportError::Protocol(_))));
+        assert!(matches!(reload_extension_reply(None, "1"), Err(TransportError::Closed)));
     }
 
     #[tokio::test]
