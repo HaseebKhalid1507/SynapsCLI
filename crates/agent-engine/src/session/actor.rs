@@ -462,9 +462,10 @@ pub(crate) fn subagent_close_cancel_event(
 
 /// `KeepWarm{on: true}`'s notice (`/pin on`, `daemon pin`, `--keep-warm`).
 pub const PIN_ON_NOTICE: &str = "pinned: this session stays loaded (never parked or idle-ended, \
-     and the daemon will not idle-exit while it is pinned). /pin off to undo.";
+     and the daemon will not idle-exit while it is pinned) and comes back after daemon restarts. \
+     /pin off to undo.";
 /// `KeepWarm{on: false}`'s notice.
-pub const PIN_OFF_NOTICE: &str = "unpinned: this session parks again when idle";
+pub const PIN_OFF_NOTICE: &str = "unpinned: this session parks again when idle and won't come back after a restart";
 
 /// The engine command behind `/close` (`SessionActor::close_command`).
 pub(crate) const CLOSE_COMMAND: &str = "close";
