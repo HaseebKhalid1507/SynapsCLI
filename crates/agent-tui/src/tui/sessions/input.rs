@@ -140,7 +140,8 @@ pub(crate) fn hint(st: &SessionsState) -> String {
     let daemon = !matches!(st.source, super::LiveSource::InProcess | super::LiveSource::DaemonDown(_));
     if let Some(m) = st.selected_meta().filter(|_| daemon) {
         h.push_str(if m.pinned { "  p unpin" } else { "  p pin" });
-        if !st.is_own(m) {
+        // x is refused on our own session and while it streams: no hint.
+        if !st.is_own(m) && RowState::of(m) != RowState::Streaming {
             h.push_str("  x close");
         }
     }

@@ -151,6 +151,7 @@ fn clients_model_cwd_cost() {
     assert_eq!(short_cwd(Some(std::path::Path::new("/tmp/a")), Some(&home)), "/tmp/a");
     assert_eq!(cost_text(0.0), "");
     assert_eq!(cost_text(1.034), "$1.03");
+    assert_eq!(cost_text(0.0001), "<$0.01");
     assert_eq!(cost_text(123.4), "$123");
     assert_eq!(label(&parked()), "\u{2026}08e3");
     assert_eq!(label(&idle()), "axon");
@@ -245,6 +246,7 @@ fn streaming_session_close_refused_locally() {
     assert_eq!(handle_event(&mut st, key(KeyCode::Char('x'))), InputOutcome::None);
     assert!(st.confirm.is_none());
     assert!(st.notice.as_ref().unwrap().text.contains("streaming"));
+    assert!(!input::hint(&st).contains("x close"), "no close hint on a streaming row");
 }
 
 #[test]

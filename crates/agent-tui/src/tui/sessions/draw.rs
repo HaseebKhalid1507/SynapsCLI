@@ -377,8 +377,10 @@ fn render_detail(frame: &mut Frame, area: Rect, st: &SessionsState, p: &Palette)
         if !cost.is_empty() {
             l3.push(cost);
         }
-        if m.messages > 0 {
-            l3.push(format!("{} msgs", m.messages));
+        match m.messages {
+            0 => {}
+            1 => l3.push("1 msg".into()),
+            n => l3.push(format!("{n} msgs")),
         }
         l3.push(if m.pinned { "pinned".into() } else { "not pinned".into() });
         if let Some(lock) = &m.locked_by {

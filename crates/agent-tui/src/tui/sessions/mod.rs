@@ -369,10 +369,12 @@ pub(crate) fn label(m: &SessionMeta) -> String {
     }
 }
 
-/// `$12.40`.
+/// `$12.40` (`<$0.01` for a few tokens; empty when nothing was spent).
 pub(crate) fn cost_text(usd: f64) -> String {
     if usd <= 0.0 {
         String::new()
+    } else if usd < 0.005 {
+        "<$0.01".to_string()
     } else if usd >= 100.0 {
         format!("${usd:.0}")
     } else {
