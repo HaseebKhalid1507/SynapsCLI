@@ -596,3 +596,91 @@ async fn checkpoint_is_owner_only_from_clients() {
         .any(|e| matches!(e.event, SessionEventWire::Aborted { .. })));
     end(&mut a).await;
 }
+
+/// `/takeover`: a read-only mirror takes input in place (no re-attach). The
+/// old owner is told with the same `InputOwnerChanged{Takeover}` an
+/// `--takeover` attach sends; a repeat is a no-op.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn take_input_moves_ownership_without_reattaching() {
+    let _h = Home::new();
+    let (url, hits) = stub(SSE_HI, false).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+    let handle = host.create_session(cfg()).await.unwrap();
+
+    let (mut a, _) = attach(&handle, ClientKind::Tui, AttachMode::Mirror).await;
+    let (mut b, snap_b) = attach(&handle, ClientKind::Tui, AttachMode::Mirror).await;
+    assert_eq!(snap_b.input_owner, Some(a.client_id()), "b starts read-only");
+
+    let (ida, idb) = (a.client_id(), b.client_id());
+    b.send_from_self(SessionCommand::TakeInput).await.unwrap();
+    for t in [&mut a, &mut b] {
+        let seen = until(t, |e| matches!(e, SessionEventWire::InputOwnerChanged { .. })).await;
+        match &seen.last().unwrap().event {
+            SessionEventWire::InputOwnerChanged { from, to, reason } => {
+                assert_eq!(*from, Some(ida));
+                assert_eq!(*to, Some(idb));
+                assert_eq!(*reason, OwnerChangeReason::Takeover);
+            }
+            _ => unreachable!(),
+        }
+    }
+    assert_eq!(a.input_owner(), Some(b.client_id()));
+    assert_eq!(b.input_owner(), Some(b.client_id()));
+
+    // The old owner is read-only now; the new one drives.
+    a.send_from_self(submit("x")).await.unwrap();
+    let seen = until(&mut a, |e| matches!(e, SessionEventWire::Refused { .. })).await;
+    match &seen.last().unwrap().event {
+        SessionEventWire::Refused { reason, .. } => {
+            assert!(reason.contains(&format!("client #{}", idb.0)), "{reason}");
+        }
+        _ => unreachable!(),
+    }
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+    b.send_from_self(submit("y")).await.unwrap();
+    until(&mut b, |e| matches!(e, SessionEventWire::Idle)).await;
+
+    // Already the owner: nothing changes, nobody is told.
+    b.send_from_self(SessionCommand::TakeInput).await.unwrap();
+    let again = drain_for(&mut a, Duration::from_millis(300)).await;
+    assert!(
+        !again.iter().any(|e| matches!(e.event, SessionEventWire::InputOwnerChanged { .. })),
+        "{again:#?}"
+    );
+    end(&mut b).await;
+}
+
+/// `--observe` is an explicit read-only attach: `/takeover` from it is
+/// refused and the owner keeps input.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn take_input_from_an_observer_is_refused() {
+    let _h = Home::new();
+    let (url, _) = stub(SSE_HI, false).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+    let handle = host.create_session(cfg()).await.unwrap();
+
+    let (mut a, _) = attach(&handle, ClientKind::Tui, AttachMode::Mirror).await;
+    let (mut o, _) = attach(&handle, ClientKind::Tui, AttachMode::Observe).await;
+
+    o.send_from_self(SessionCommand::TakeInput).await.unwrap();
+    let seen = until(&mut o, |e| matches!(e, SessionEventWire::Refused { .. })).await;
+    match &seen.last().unwrap().event {
+        SessionEventWire::Refused { client, command, reason } => {
+            assert_eq!(*client, o.client_id());
+            assert_eq!(command, "take_input");
+            assert!(reason.contains("--observe"), "{reason}");
+        }
+        _ => unreachable!(),
+    }
+    let a_saw = drain_for(&mut a, Duration::from_millis(300)).await;
+    assert!(
+        !a_saw.iter().any(|e| matches!(e.event, SessionEventWire::InputOwnerChanged { .. })),
+        "{a_saw:#?}"
+    );
+    assert_eq!(a.input_owner(), Some(a.client_id()));
+    end(&mut a).await;
+}
