@@ -462,9 +462,10 @@ pub(crate) fn subagent_close_cancel_event(
 
 /// `KeepWarm{on: true}`'s notice (`/pin on`, `daemon pin`, `--keep-warm`).
 pub const PIN_ON_NOTICE: &str = "pinned: this session stays loaded (never parked or idle-ended, \
-     and the daemon will not idle-exit while it is pinned). /pin off to undo.";
+     and the daemon will not idle-exit while it is pinned) and comes back after daemon restarts. \
+     /pin off to undo.";
 /// `KeepWarm{on: false}`'s notice.
-pub const PIN_OFF_NOTICE: &str = "unpinned: this session parks again when idle";
+pub const PIN_OFF_NOTICE: &str = "unpinned: this session parks again when idle and won't come back after a restart";
 
 /// The engine command behind `/close` (`SessionActor::close_command`).
 pub(crate) const CLOSE_COMMAND: &str = "close";
@@ -1002,16 +1003,45 @@ impl SessionActor {
         };
         // Whether the build's grant (default or restored choice) took.
         actor.observe_memory();
+        if actor.keep_warm {
+            actor.note_pin();
+        }
         Ok((handle, SessionTask(actor)))
     }
 
     /// Publish `conv.session.name` to the handle (listings, `--continue
     /// <name>`) and rewrite this session's registry entry so `synaps send
     /// --session <name>` resolves the new name. Call after any rename.
+    /// Write the pin as it stands now to the daemon's pin book (no-op
+    /// in-process): the entry is added while pinned, dropped otherwise.
+    pub(crate) fn note_pin(&self) {
+        let Some(sink) = self.host.pin_sink() else { return };
+        let journal = (**self.journal_id.load()).clone();
+        if self.keep_warm {
+            let kw = self.cache_keepwarm.override_mode.map(|m| m.to_string());
+            sink.pinned(self.id.as_str(), &journal, self.conv.session.name.as_deref(), self.config.cwd.as_deref(), kw.as_deref());
+        } else {
+            sink.unpinned(self.id.as_str(), &journal);
+        }
+    }
+
+    /// Publish a new journal id; a pinned session's book entry follows it.
+    pub(crate) fn set_journal_id(&mut self, new_id: String) {
+        let old = self.journal_id.swap(Arc::new(new_id.clone()));
+        if self.keep_warm && *old != new_id {
+            if let Some(sink) = self.host.pin_sink() {
+                sink.moved(&old, &new_id);
+            }
+        }
+    }
+
     pub(crate) fn sync_name(&mut self) {
         let name = self.conv.session.name.clone();
         self.meta.name = name.clone();
         self.name.store(Arc::new(name.clone()));
+        if self.keep_warm {
+            self.note_pin();
+        }
         if let Err(e) = self.background.update_session_name(name.as_deref()) {
             tracing::warn!(session = %self.id, "registry name update failed: {e}");
         }
@@ -4184,7 +4214,7 @@ impl SessionActor {
                         }
                         let new_id = self.conv.session.id.clone();
                         self.runtime.set_session_id(Some(new_id.clone()));
-                        self.journal_id.store(Arc::new(new_id.clone()));
+                        self.set_journal_id(new_id.clone());
                         // F10: lock follows the new journal id.
                         self.reacquire_session_lock(&new_id);
                         // Wall 1: reset continuation state for the new session id
@@ -5235,7 +5265,7 @@ impl SessionActor {
                 self.conv.clear(&self.runtime).await;
                 self.runtime
                     .begin_conversation(Some(self.conv.session.id.clone()));
-                self.journal_id.store(Arc::new(self.conv.session.id.clone()));
+                self.set_journal_id(self.conv.session.id.clone());
                 // F10: lock follows the new session id.
                 self.reacquire_session_lock(&self.conv.session.id.clone());
                 self.emit(SessionEventWire::Cleared {
@@ -5314,6 +5344,11 @@ impl SessionActor {
                 self.keep_warm = on;
                 self.meta.pinned = on; // the attach snapshot's copy
                 self.keep_warm_cell.store(on, std::sync::atomic::Ordering::Release);
+                self.note_pin();
+                // Unpinned with nobody who ever typed: back to the old rule.
+                if !on && !self.cache_keepwarm.interactive_seen && self.cache_keepwarm.active() {
+                    self.cache_keepwarm_end(super::cache_keepwarm::PeriodEnd::Disabled);
+                }
                 self.rearm_park();
                 self.emit(SessionEventWire::SystemNotice(if on {
                     PIN_ON_NOTICE.to_string()
@@ -5344,6 +5379,12 @@ impl SessionActor {
     // ── teardown (tui/mod.rs:352-432 + chat.rs shutdown) ─────────────────
 
     async fn finish(&mut self, reason: EndReason) {
+        // Ended on purpose (`/close`, `daemon close`, a client's quit): the
+        // pin goes with it. A daemon stop, reload or crash keeps it.
+        if self.keep_warm && reason == EndReason::ClientQuit {
+            self.keep_warm = false;
+            self.note_pin();
+        }
         self.cache_keepwarm_end(super::cache_keepwarm::PeriodEnd::SessionEnding);
         // Before on_session_end clears the keyed injection (STEP 2): a hook
         // not yet called leaves the line; one in flight finishes holding the

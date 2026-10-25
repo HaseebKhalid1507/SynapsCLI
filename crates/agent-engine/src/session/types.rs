@@ -1993,3 +1993,19 @@ mod double_option {
         }
     }
 }
+
+/// Where a daemon session writes its pin (`daemon::pins::PinBook`). The
+/// actor calls it exactly when the pin changes, when a pinned session moves
+/// to a new journal or is renamed, and when a pinned session is ended on
+/// purpose. Implementations do their own I/O and never fail the caller.
+pub trait PinSink: Send + Sync {
+    /// The session is pinned: add or refresh its entry (`journal_id` is
+    /// current; `id` is the actor id, which may name an older journal).
+    /// `cache_keepwarm`: the session's `/keepwarm` override (`off`/`auto`/`<N>h`).
+    fn pinned(&self, id: &str, journal_id: &str, name: Option<&str>, cwd: Option<&std::path::Path>, cache_keepwarm: Option<&str>);
+    /// Unpinned, or ended on purpose while pinned: drop its entry.
+    fn unpinned(&self, id: &str, journal_id: &str);
+    /// A pinned session's journal changed (`/clear`, a successor compaction,
+    /// resume): the entry follows it.
+    fn moved(&self, from: &str, to: &str);
+}

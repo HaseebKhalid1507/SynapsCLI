@@ -1484,3 +1484,43 @@ async fn a_due_ping_while_fenced_and_waiting_for_the_hook_goes_out_once_both_cle
     assert_eq!(start_seam::calls(&handle.journal_id()), calls + 1, "the hook ran once");
     end(&mut t).await;
 }
+
+/// A pin is the owner's say-so: a pinned session with no interactive client
+/// ever attached (restored by the daemon, fed by `synaps send`) starts a
+/// period on the Idle after a real turn. Unpinned, the old rule holds:
+/// no typing client, no period; unpinning ends a period it started.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_pinned_session_keeps_warm_without_an_interactive_client() {
+    let h = Home::new();
+    write_config(&h, "cache_keepwarm = auto\ncache_ttl = 1h\nthinking = off\n");
+    let (url, bodies) = recording_stub().await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+
+    // Unpinned, script-only: no period.
+    let plain = host.create_session(cfg()).await.unwrap();
+    let (mut script, _) = LocalTransport::attach(plain.clone(), ClientMeta::new(ClientKind::Test))
+        .await
+        .unwrap();
+    turn(&mut script, "hello").await;
+    let st = keepwarm(&mut script, 800, "status").await;
+    assert_eq!(st["active"], false, "unpinned + no interactive client: none: {st}");
+    end(&mut script).await;
+
+    // Pinned at create, script-only: the Idle starts one.
+    let pinned = host.create_session(SessionConfig { keep_warm: true, ..cfg() }).await.unwrap();
+    let (mut script, _) = LocalTransport::attach(pinned.clone(), ClientMeta::new(ClientKind::Test))
+        .await
+        .unwrap();
+    turn(&mut script, "hello").await;
+    let st = keepwarm(&mut script, 801, "status").await;
+    assert_eq!(st["active"], true, "pinned, no interactive client: a period: {st}");
+
+    // Unpinned again: back to the old rule, the period ends.
+    pinned.send(SessionCommand::KeepWarm { on: false }).await.unwrap();
+    let st = keepwarm(&mut script, 802, "status").await;
+    assert_eq!(st["active"], false, "unpinned: no interactive client, no period: {st}");
+    let _ = pings(&bodies);
+    end(&mut script).await;
+}

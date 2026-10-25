@@ -640,12 +640,12 @@ pub fn adopt_from_env() -> anyhow::Result<Option<(DaemonLock, ReloadState, PathB
 /// the `SessionLockError::Held` case, where an in-process runtime holds
 /// the journal lock. Instead of aliasing to an empty impostor, register a
 /// Parked placeholder under the SAME id.
-fn is_lock_held_error(e: &str) -> bool {
+pub(crate) fn is_lock_held_error(e: &str) -> bool {
     e.contains("is live in another process")
 }
 
 /// Extract `"pid N (kind)"` from the lock-held error message.
-fn parse_holder_from_error(e: &str) -> String {
+pub(crate) fn parse_holder_from_error(e: &str) -> String {
     // "session X is live in another process (pid N, kind) — …"
     if let Some(start) = e.find("(pid ") {
         let after = &e[start + 1..]; // "pid N, kind) — …"

@@ -13,6 +13,7 @@ pub mod conn;
 pub mod lifecycle;
 pub mod listener;
 pub mod pin;
+pub mod pins;
 pub mod registry;
 pub mod reload;
 
@@ -210,6 +211,10 @@ pub struct DaemonState {
     /// that finds the file missing or naming another pid puts it back
     /// ([`Self::heal_daemon_json`]); reload takes its recorded exe from here.
     pub meta: registry::Metadata,
+    /// The pin book: pinned journals that come back on the next cold start.
+    pub pins: Arc<pins::PinBook>,
+    /// A cold start's pin restore is running (holds the idle exit).
+    pub restoring: AtomicBool,
 }
 
 impl DaemonState {
@@ -428,7 +433,10 @@ impl Daemon {
             lock_fd: Mutex::new(Some(lock)),
             reload_aliases: Mutex::new(HashMap::new()),
             meta,
+            pins: Arc::new(pins::PinBook::for_active_profile()),
+            restoring: AtomicBool::new(false),
         });
+        state.host.set_pin_sink(Arc::clone(&state.pins) as Arc<dyn crate::session::PinSink>);
 
         // Before any session of this image registers: drop registrations no
         // running session owns (dead owner pid). After a reload, also every
@@ -453,6 +461,10 @@ impl Daemon {
             tokio::spawn(idle_monitor(Arc::clone(&state), idle));
         }
         signal_ready();
+        // Cold start only: a reload hands its live sessions over already.
+        if reload_state.is_none() && pins::restore_enabled() {
+            tokio::spawn(pins::restore_all(Arc::clone(&state)));
+        }
         tracing::info!(sock = %paths.sock.display(), pid = info.pid, generation, "daemon: listening");
         Ok(Self { paths, state, accept })
     }
@@ -529,6 +541,9 @@ pub async fn session_is_idle(handle: &SessionHandle) -> bool {
 /// the exit because exiting would end the session the user asked to keep.
 pub async fn daemon_is_idle(state: &DaemonState) -> bool {
     if state.connections.load(Ordering::SeqCst) > 0 {
+        return false;
+    }
+    if state.restoring.load(Ordering::SeqCst) {
         return false;
     }
     let sessions = state.live_sessions();

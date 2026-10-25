@@ -162,6 +162,8 @@ pub(crate) struct PastState {
     /// Catalog minus ids the daemon lists (those are on the Live tab).
     pub(crate) entries: Arc<Vec<CatalogEntry>>,
     pub(crate) exclude: Arc<HashSet<String>>,
+    /// Journal ids in the daemon's pin book (drawn ⚑; `p` unpins).
+    pub(crate) pinned: Arc<HashSet<String>>,
     pub(crate) error: Option<String>,
     /// Preview refresh progress (`None` when idle/done).
     pub(crate) previews: Option<(usize, usize)>,
@@ -202,6 +204,7 @@ impl Default for PastState {
             catalog: None,
             entries: Arc::new(Vec::new()),
             exclude: Arc::new(HashSet::new()),
+            pinned: Arc::new(HashSet::new()),
             error: None,
             previews: None,
             stop: Arc::new(AtomicBool::new(false)),
@@ -321,6 +324,16 @@ impl PastState {
         }
         self.exclude = Arc::new(ids);
         self.rebuild_entries();
+    }
+
+    pub(crate) fn set_pinned(&mut self, ids: HashSet<String>) {
+        if *self.pinned != ids {
+            self.pinned = Arc::new(ids);
+        }
+    }
+
+    pub(crate) fn is_pinned(&self, id: &str) -> bool {
+        self.pinned.contains(id)
     }
 
     fn rebuild_entries(&mut self) {

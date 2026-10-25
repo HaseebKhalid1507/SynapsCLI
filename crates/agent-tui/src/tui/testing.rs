@@ -620,6 +620,15 @@ impl TestHarness {
         self
     }
 
+    /// Deliver a pin book read (every entry), as the poller would.
+    pub fn sessions_feed_pins(&mut self, pins: Vec<agent_engine::daemon::pins::PinEntry>) -> &mut Self {
+        if let Some(st) = self.app.sessions.as_mut() {
+            let gen = st.gen;
+            st.apply(super::sessions::SessionsMsg::Pins { gen, pins }, || unreachable!());
+        }
+        self
+    }
+
     /// Load a Past catalog from a fixture sessions dir (+ index) the way the
     /// background loader does — headers, then a synchronous preview refresh
     /// into a cache file inside `dir`'s parent — and deliver it.
@@ -693,6 +702,25 @@ impl TestHarness {
         if let Some(st) = self.app.sessions.as_mut() {
             let gen = st.gen;
             let op = st.pending.clone().unwrap_or(super::sessions::SessionsOp::Pin { id: String::new(), on: true });
+            st.apply(super::sessions::SessionsMsg::OpDone { gen, op, result }, || unreachable!());
+        }
+        self
+    }
+
+    /// Deliver the answer for an op named by `kind` (`pin`, `unpin`,
+    /// `clear-pin`, `pin-past`) on `id`, as `spawn_op`'s task would.
+    pub fn sessions_feed_op_for(&mut self, kind: &str, id: &str, result: Result<String, String>) -> &mut Self {
+        use super::sessions::SessionsOp;
+        let id = id.to_string();
+        let op = match kind {
+            "pin" => SessionsOp::Pin { id, on: true },
+            "unpin" => SessionsOp::Pin { id, on: false },
+            "clear-pin" => SessionsOp::ClearPin { id },
+            "pin-past" => SessionsOp::PinPast { journal_id: id, cwd: None },
+            other => panic!("unknown op kind {other}"),
+        };
+        if let Some(st) = self.app.sessions.as_mut() {
+            let gen = st.gen;
             st.apply(super::sessions::SessionsMsg::OpDone { gen, op, result }, || unreachable!());
         }
         self
@@ -1467,6 +1495,8 @@ impl TestHarness {
             InputAction::ModelsExpandProvider(p) => format!("models-expand:{p}"),
             InputAction::SessionsOp(op) => match op {
                 super::sessions::SessionsOp::Pin { id, on } => format!("sessions-pin:{id}:{on}"),
+                super::sessions::SessionsOp::ClearPin { id } => format!("sessions-clear-pin:{id}"),
+                super::sessions::SessionsOp::PinPast { journal_id, .. } => format!("sessions-pin-past:{journal_id}"),
                 super::sessions::SessionsOp::Close { id, .. } => format!("sessions-close:{id}"),
             },
             InputAction::SessionsPast(cmd) => match cmd {

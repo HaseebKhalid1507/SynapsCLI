@@ -475,7 +475,7 @@
     "common": true,
     "aliases": [],
     "keywords": ["sessions", "session", "history", "saved", "live", "parked", "daemon", "pin", "close"],
-    "lines": ["/sessions opens a modal: Live lists every daemon session by state (streaming, waiting, idle, parked) with pin (p) and close (x); Past lists saved conversations. Works mid-stream."],
+    "lines": ["/sessions opens a modal: Live lists every daemon session by state (streaming, waiting, idle, parked) with pin (p) and close (x), plus pins that are not live (waiting/failed, p clears them); Past lists saved conversations (\u2691 = pinned; p pins one into the daemon). A pin comes back after daemon restarts. Works mid-stream."],
     "related": ["/help sessions", "/resume"]
   },
   {
@@ -636,8 +636,8 @@
     "keywords": ["pin", "unpin", "keep-warm", "park", "idle", "daemon", "loaded", "idle-exit"],
     "lines": [
       "/pin (or /pin status) shows whether this session is pinned. /pin on pins it, /pin off unpins it; only the client that owns input can change it. /keep-warm on|off is the same command, and synaps --attach --keep-warm pins at attach.",
-      "A pinned session is never parked, idle-ended or evicted, and the daemon does not idle-exit while any session is pinned. It survives daemon reload, but not /close, synaps daemon close, synaps daemon stop or a crash.",
-      "From another shell: synaps daemon pin <ID|NAME> [--off]. synaps daemon sessions marks pinned sessions.",
+      "A pinned session is never parked, idle-ended or evicted, and the daemon does not idle-exit while any session is pinned. It comes back when the daemon starts again (after reload, daemon stop, idle exit, a crash or a reboot), pinned, with its conversation and its /keepwarm choice. /close and synaps daemon close end it on purpose: then it does not come back. SYNAPS_DAEMON_RESTORE_PINS=0 starts a daemon without bringing pins back (they stay for the next start).",
+      "From another shell: synaps daemon pin <ID|NAME> [--off]. synaps daemon sessions marks pinned sessions and lists pins that are not live (waiting: journal held by another process / failed: reason); synaps daemon pin <ID> --off clears one, synaps daemon pin <ID> retries it. A pinned session keeps the prompt cache warm (/keepwarm) even with no TUI attached.",
       "Not /keepwarm (no dash), which keeps the prompt cache warm by pinging the API and costs money. In-process (no daemon), /pin does nothing: the session ends with the TUI."
     ],
     "related": ["/close", "/keepwarm", "/sessions"]
