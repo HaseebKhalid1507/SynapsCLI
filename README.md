@@ -8,7 +8,7 @@
   <a href="https://crates.io/crates/synaps"><img src="https://img.shields.io/crates/v/synaps?color=orange&label=crates.io" alt="crates.io"></a>
   <img src="https://img.shields.io/badge/rust-1.88%2B-orange.svg" alt="Rust">
   <a href="https://ratatui.rs/"><img src="https://ratatui.rs/built-with-ratatui/badge.svg" alt="Built With Ratatui" height="20"></a>
-  <img src="https://img.shields.io/badge/binary-25MB-success.svg" alt="25MB binary">
+  <img src="https://img.shields.io/badge/binary-~32MB-success.svg" alt="~32MB binary">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="License"></a>
   <a href="https://discord.gg/JCdgRYqVDP"><img src="https://img.shields.io/badge/Discord-join%20the%20server-5865F2?logo=discord&logoColor=white" alt="Discord"></a>
 </p>
@@ -17,7 +17,7 @@
 
 <p align="center">
   Run AI agents from one binary. Tools, subagents, and extensions built in.<br>
-  Any model, 25MB, ~10ms to first frame.
+  Any model, one ~32MB binary, ~10ms to first frame.
 </p>
 
 ---
@@ -136,7 +136,7 @@ Synaps auto-targets `http://localhost:11434/v1`, which is Ollama's default, so a
 - **Sees what you see.** The model reads images directly, and `/attach` stages images, PDFs, and text into a turn.
 - **Any model.** Claude, Codex, Grok, Copilot, Gemini, Kimi, [Meta Muse](docs/providers/muse.md), Azure, Bedrock, Vertex, any OpenAI-compatible endpoint, or the Ollama on your box. Starts with zero credentials. Routes that can't work fail closed.
 - **Build on it.** Process-isolated extensions in any language, MCP servers, custom tools. A small core with enough hooks to bolt on whatever you want and glue it to whatever you've got.
-- **Lean is fast.** One ~27 MB binary, ~10 ms to first frame on a warm daemon, ~3 MB per extra session. No framework tax, no interpreter warming up.
+- **Lean is fast.** One ~32MB binary, ~10 ms to first frame on a warm daemon, ~3 MB per extra session. No framework tax, no interpreter warming up.
 - **21 themes.** `catppuccin`, `gruvbox`, `nord`, `tokyo-night`, plus originals like `neon-rain` and `night-city`, and one light theme, `paper`. Hot-swap with `/theme`, or set `SYNAPS_THEME=<name>` for a single run without changing your config.
 
 ## Benchmarks
