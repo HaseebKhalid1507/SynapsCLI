@@ -655,6 +655,127 @@ async fn idle_exit_fires_once_all_sessions_parked() {
     assert_eq!(host.sessions().len(), 0);
 }
 
+/// The old image's half of a reload, for one persisted session with
+/// history: a turn, then the session ends (its journal stays on disk). The
+/// new image's half is `reload::rehydrate` over the returned record.
+async fn reloaded_live_session(host: &Arc<agent_engine::EngineHost>) -> agent_engine::daemon::reload::ReloadState {
+    let handle = host.create_session(pcfg()).await.unwrap();
+    let (mut a, _) = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Tui))
+        .await
+        .unwrap();
+    a.send(submit("hi")).await.unwrap();
+    until(&mut a, |e| matches!(e, SessionEventWire::Idle)).await;
+    let journal = handle.journal_id();
+    end(&mut a).await;
+    while handle.is_alive() {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    agent_engine::daemon::reload::ReloadState {
+        generation: 2,
+        written_at: chrono::Utc::now(),
+        sessions: vec![agent_engine::daemon::reload::ReloadSession {
+            id: journal.clone(),
+            journal_id: journal.clone(),
+            config: SessionConfig {
+                continue_session: Some(Some(journal)),
+                ..pcfg()
+            },
+            keep_warm: false,
+            lifecycle: SessionLifecycle::Live,
+            settings_replay: Vec::new(),
+            cache_keepwarm: None,
+            input_owner_kind: None,
+            workers: Vec::new(),
+            tool_activations: Vec::new(),
+        }],
+        expected_clients: 1,
+        next_subagent_id: 0,
+    }
+}
+
+async fn start_daemon(
+    host: &Arc<agent_engine::EngineHost>,
+    run: &tempfile::TempDir,
+) -> agent_engine::daemon::Daemon {
+    agent_engine::daemon::Daemon::start(
+        Arc::clone(host),
+        agent_engine::daemon::DaemonOpts {
+            runtime_dir: Some(run.path().to_path_buf()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap()
+}
+
+/// A reload rehydrates a session that no client reconnects to: it must
+/// still park after the grace. The old image's park timer dies with the
+/// exec, and only an attach or detach armed a new one, so a session whose
+/// client left just before a reload (or never came back after it) stayed
+/// Live with zero clients forever (2026-10-25: Live 9.5 h, through four
+/// reloads, never parked).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_session_rehydrated_with_no_client_parks_after_the_grace() {
+    let _h = Home::new();
+    let _g = Grace::set("0");
+    let (url, _) = stub(SSE_HI, false).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+    let run = tempfile::TempDir::new().unwrap();
+    let d = start_daemon(&host, &run).await;
+    let rs = reloaded_live_session(&host).await;
+
+    agent_engine::daemon::reload::rehydrate(&d.state, &rs).await;
+    let reborn = d.state.live_sessions().pop().expect("rehydrated");
+    assert!(reborn.meta().continued, "the same conversation, from its journal");
+    assert_eq!(d.state.session_metas()[0].clients, 0, "nobody reconnected");
+    assert!(
+        wait_lifecycle(&reborn, SessionLifecycle::Parked, Duration::from_secs(5)).await,
+        "a rehydrated session with no client must park after the grace, not stay Live"
+    );
+    reborn
+        .send(SessionCommand::End { reason: EndReason::HostShutdown })
+        .await
+        .unwrap();
+}
+
+/// The grace the rehydrate arms is the reconnect grace, not a park: a client
+/// that reconnects within it keeps the session Live, and its later detach
+/// parks it as usual.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_client_reconnecting_after_a_reload_keeps_the_session_live() {
+    let _h = Home::new();
+    let _g = Grace::set("1");
+    let (url, _) = stub(SSE_HI, false).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+    let run = tempfile::TempDir::new().unwrap();
+    let d = start_daemon(&host, &run).await;
+    let rs = reloaded_live_session(&host).await;
+
+    agent_engine::daemon::reload::rehydrate(&d.state, &rs).await;
+    let reborn = d.state.live_sessions().pop().expect("rehydrated");
+    let (mut a, _) = LocalTransport::attach(reborn.clone(), ClientMeta::new(ClientKind::Tui))
+        .await
+        .unwrap();
+    assert!(
+        !wait_lifecycle(&reborn, SessionLifecycle::Parked, Duration::from_millis(2500)).await,
+        "an attached client cancels the rehydrate's grace"
+    );
+    assert_eq!(reborn.lifecycle(), SessionLifecycle::Live);
+    detach(&mut a).await;
+    assert!(
+        wait_lifecycle(&reborn, SessionLifecycle::Parked, Duration::from_secs(5)).await,
+        "the detach arms the grace as usual"
+    );
+    reborn
+        .send(SessionCommand::End { reason: EndReason::HostShutdown })
+        .await
+        .unwrap();
+}
+
 /// Parked sessions leave the daemon's map after `SYNAPS_DAEMON_PARKED_EVICT_SECS`
 /// (Ended(Evicted)); the journal stays and `--continue <id>` rebuilds it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

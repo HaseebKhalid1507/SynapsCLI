@@ -916,6 +916,14 @@ pub enum SessionCommand {
     RestoreToolActivations {
         activations: Vec<crate::tools::activation::CarriedActivation>,
     },
+    /// Host-only (never wire): reload's rehydrate, last, for a session that
+    /// comes back Live. The old image's park timer did not survive the exec
+    /// and only an attach or detach arms a new one, so a session no client
+    /// reconnects to stayed Live with zero clients forever. Arms the park
+    /// grace as a detach does; a client reconnecting within it clears it.
+    /// A no-op on a parked session.
+    #[serde(skip)]
+    ArmPark,
     /// Host-only (never wire): the reload this session checkpointed for
     /// did not exec (the exec failed, or the reload stopped after the
     /// checkpoints). The checkpoint's reload fence lifts, and the workers
@@ -1053,6 +1061,7 @@ impl std::fmt::Debug for SessionCommand {
                 )
                 .finish(),
             Self::ReloadAborted => f.write_str("ReloadAborted"),
+            Self::ArmPark => f.write_str("ArmPark"),
             Self::Query { id, query } => {
                 f.debug_struct("Query").field("id", id).field("query", query).finish()
             }

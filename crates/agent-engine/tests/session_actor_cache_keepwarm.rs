@@ -251,6 +251,8 @@ fn classify(cmd: &SessionCommand) -> Effect {
         // Hands the runtime pins only; the next turn start restores them.
         | SessionCommand::RestoreToolActivations { .. }
         | SessionCommand::ReloadAborted
+        // Re-arms the park timer, which an active period already defers.
+        | SessionCommand::ArmPark
         | SessionCommand::HostEvent(_) => Effect::Untouched,
         SessionCommand::DriverStart { .. } => Effect::DriverOwned,
         SessionCommand::End { .. } => Effect::SessionEnd,
