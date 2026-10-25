@@ -100,6 +100,12 @@ pub trait ClientTransport: Send {
     fn daemon_binary(&self) -> Option<BinaryId> {
         None
     }
+    /// The daemon control socket this transport talks to. `None` on
+    /// `LocalTransport` (no daemon). Lets a client open its own control
+    /// connections (session list, pin, close) to the same daemon.
+    fn socket_path(&self) -> Option<&std::path::Path> {
+        None
+    }
 }
 
 /// Which binary a process runs: its version and build

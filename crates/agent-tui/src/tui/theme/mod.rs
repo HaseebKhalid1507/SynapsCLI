@@ -18,6 +18,7 @@ pub(crate) enum ModalKind {
     Settings,
     Plugins,
     Models,
+    Sessions,
 }
 
 /// All colors used by the TUI, grouped so they can be overridden from a
@@ -112,6 +113,8 @@ pub(crate) struct Theme {
     pub(crate) plugins_title: Option<Color>,
     pub(crate) models_border: Option<Color>,
     pub(crate) models_title: Option<Color>,
+    pub(crate) sessions_border: Option<Color>,
+    pub(crate) sessions_title: Option<Color>,
     /// Resting tint of the sidecar header pill (idle + unarmed). `None` falls
     /// back to `muted`, the color the pill uses today.
     pub(crate) sidecar_pill: Option<Color>,
@@ -207,6 +210,8 @@ impl Default for Theme {
             plugins_title: None,
             models_border: None,
             models_title: None,
+            sessions_border: None,
+            sessions_title: None,
             sidecar_pill: None,
 
             // No user overrides for extension tokens by default.
@@ -339,6 +344,8 @@ impl Theme {
             "plugins.title" => self.plugins_title = Some(c),
             "models.border" => self.models_border = Some(c),
             "models.title" => self.models_title = Some(c),
+            "sessions.border" => self.sessions_border = Some(c),
+            "sessions.title" => self.sessions_title = Some(c),
             "sidecar.pill" => self.sidecar_pill = Some(c),
 
             // Extension token overrides (P19.2): any `ext.<id>.<token>` key
@@ -496,6 +503,7 @@ impl Theme {
             ModalKind::Settings => self.settings_border,
             ModalKind::Plugins => self.plugins_border,
             ModalKind::Models => self.models_border,
+            ModalKind::Sessions => self.sessions_border,
         };
         part.unwrap_or(self.border_active)
     }
@@ -507,6 +515,7 @@ impl Theme {
             ModalKind::Settings => self.settings_title,
             ModalKind::Plugins => self.plugins_title,
             ModalKind::Models => self.models_title,
+            ModalKind::Sessions => self.sessions_title,
         }
     }
 
@@ -1078,7 +1087,12 @@ mod theme_tests {
         ];
         for name in NAMES {
             let t = Theme::builtin(name).unwrap_or_else(|| panic!("{name} exists"));
-            for kind in [ModalKind::Settings, ModalKind::Plugins, ModalKind::Models] {
+            for kind in [
+                ModalKind::Settings,
+                ModalKind::Plugins,
+                ModalKind::Models,
+                ModalKind::Sessions,
+            ] {
                 assert_eq!(
                     t.modal_border(kind),
                     t.border_active,

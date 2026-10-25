@@ -64,6 +64,9 @@ pub mod tape;
 /// `Runtime`; envelopes fed by tests).
 #[path = "testing/scripted.rs"]
 pub mod scripted;
+/// A scripted daemon answering `/sessions` switches (`use_fake_daemon`).
+#[path = "testing/fake_daemon.rs"]
+pub mod fake_daemon;
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 use ratatui::backend::{CrosstermBackend, TestBackend};
@@ -114,6 +117,9 @@ pub struct TestHarness {
     /// Lines typed while streaming, awaiting [`Self::drive_streaming_input`].
     pending_streaming: Vec<String>,
     quit_requested: bool,
+    /// When set, `/sessions` switches go through this scripted daemon; when
+    /// not, the harness behaves as an in-process TUI (no daemon).
+    fake_daemon: Option<fake_daemon::FakeDaemon>,
 }
 
 /// Hard upper bound on any single bounded async drive (P6.3). A slash
@@ -145,6 +151,11 @@ fn block_on_bounded<F: std::future::Future>(what: &str, fut: F) -> F::Output {
             ),
         }
     })
+}
+
+/// The fixed "now" the harness pins the /sessions modal to.
+pub fn sessions_test_now() -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::<chrono::Utc>::from_timestamp(1_800_000_000, 0).unwrap_or_default()
 }
 
 impl Drop for TestHarness {
@@ -206,6 +217,7 @@ impl TestHarness {
             pending_slash: Vec::new(),
             pending_streaming: Vec::new(),
             quit_requested: false,
+            fake_daemon: None,
         }
     }
 
@@ -258,6 +270,94 @@ impl TestHarness {
             3,
         );
         self.record(action);
+        // Production drains a /sessions switch right after the input action.
+        self.drive_session_switch();
+        self
+    }
+
+    // ── /sessions switching ──────────────────────────────────────────────────
+
+    /// Put a scripted daemon behind `/sessions` switching (and return a
+    /// handle to stage its sessions / read what was sent).
+    pub fn use_fake_daemon(&mut self) -> fake_daemon::FakeDaemon {
+        let d = fake_daemon::FakeDaemon::default();
+        self.fake_daemon = Some(d.clone());
+        d
+    }
+
+    /// Select a Live row by session id (what ↑/↓ would land on).
+    pub fn sessions_select(&mut self, id: &str) -> &mut Self {
+        if let Some(st) = self.app.sessions.as_mut() {
+            st.selected = Some(id.to_string());
+        }
+        self
+    }
+
+    /// Subagent rows in the tray (`app.subagents`).
+    pub fn subagent_count(&self) -> usize {
+        self.app.subagents.len()
+    }
+
+    /// The queued (steer) message the footer shows, if any.
+    pub fn queued_message(&self) -> Option<String> {
+        self.app.queued_message.clone()
+    }
+
+    /// The header's session name.
+    pub fn session_name(&self) -> Option<String> {
+        self.app.session.name.clone()
+    }
+
+    /// What the Past tab's Enter does: ask to continue a saved journal.
+    pub fn request_continue(&mut self, journal_id: &str) -> &mut Self {
+        self.request_continue_in(journal_id, None)
+    }
+
+    /// [`Self::request_continue`] with the journal's folder.
+    pub fn request_continue_in(
+        &mut self,
+        journal_id: &str,
+        cwd: Option<std::path::PathBuf>,
+    ) -> &mut Self {
+        if let Some(st) = self.app.sessions.as_mut() {
+            st.pending_switch = Some(super::sessions::SwitchTarget::Continue {
+                journal_id: journal_id.to_string(),
+                cwd,
+            });
+        }
+        self.drive_session_switch()
+    }
+
+    /// The header's folder label.
+    pub fn header_folder(&self) -> String {
+        self.app.header_folder.clone()
+    }
+
+    /// Drain a pending `/sessions` switch through the production
+    /// `sessions::switch::perform` (bounded), as the run loop does.
+    pub fn drive_session_switch(&mut self) -> &mut Self {
+        let Some(target) = self.app.sessions.as_mut().and_then(|s| s.pending_switch.take()) else {
+            return self;
+        };
+        let render_handle = super::render_thread::RenderHandle::headless();
+        let daemon = self.fake_daemon.clone();
+        block_on_bounded(
+            "sessions::switch::perform",
+            super::sessions::switch::perform(
+                &mut self.app,
+                &mut self.link,
+                &mut self.prompt_bridge,
+                target,
+                daemon.as_ref().map(|d| d as &dyn super::sessions::switch::Connector),
+                &self.registry,
+                &render_handle,
+            ),
+        );
+        // `sent_commands` follows the session now on screen.
+        let id = self.link.transport().session_id().0.clone();
+        if let Some(log) = daemon.as_ref().and_then(|d| d.log_of(&id)) {
+            self.scripted_log = log;
+        }
         self
     }
 
@@ -481,6 +581,89 @@ impl TestHarness {
         self
     }
 
+    /// Open the `/sessions` modal the way dispatch does. `socket = None` is
+    /// the in-process TUI; `Some(_)` puts the Live tab in daemon mode
+    /// ("asking the daemon…") — the harness has no runtime, so no poller
+    /// runs: feed answers with [`Self::sessions_feed_live`].
+    pub fn open_sessions_with(&mut self, socket: Option<std::path::PathBuf>) -> &mut Self {
+        let own = super::sessions::own_row(&self.app, &self.link);
+        super::sessions::open_with(&mut self.app, own, socket);
+        if let Some(st) = self.app.sessions.as_mut() {
+            // Determinism: relative times and `~` are drawn against these.
+            st.now = sessions_test_now();
+            st.home = Some(std::path::PathBuf::from("/home/u"));
+        }
+        self
+    }
+
+    /// The id of this harness's own session (as the Live tab sees it).
+    pub fn own_session_id(&self) -> String {
+        self.link.transport().session_id().0.clone()
+    }
+
+    /// Deliver a daemon list answer through the production arm logic
+    /// (`SessionsState::apply`), as the poller would.
+    pub fn sessions_feed_live(
+        &mut self,
+        result: Result<Vec<agent_engine::session::SessionMeta>, String>,
+    ) -> &mut Self {
+        let own = super::sessions::own_row(&self.app, &self.link);
+        if let Some(st) = self.app.sessions.as_mut() {
+            let gen = st.gen;
+            st.apply(super::sessions::SessionsMsg::Live { gen, result }, || own);
+            st.now = sessions_test_now();
+        }
+        self
+    }
+
+    /// Deliver the Past list answer.
+    pub fn sessions_feed_past(&mut self, rows: Vec<synaps_cli::SessionInfo>) -> &mut Self {
+        if let Some(st) = self.app.sessions.as_mut() {
+            let gen = st.gen;
+            st.apply(super::sessions::SessionsMsg::Past { gen, result: Ok(rows) }, || unreachable!());
+        }
+        self
+    }
+
+    /// Deliver a pin/close answer for the in-flight op.
+    pub fn sessions_feed_op(&mut self, result: Result<String, String>) -> &mut Self {
+        if let Some(st) = self.app.sessions.as_mut() {
+            let gen = st.gen;
+            let op = st.pending.clone().unwrap_or(super::sessions::SessionsOp::Pin { id: String::new(), on: true });
+            st.apply(super::sessions::SessionsMsg::OpDone { gen, op, result }, || unreachable!());
+        }
+        self
+    }
+
+    /// Mark a pin/close as in flight (what `spawn_op` does before its task).
+    pub fn sessions_mark_pending(&mut self, op_close_id: &str) -> &mut Self {
+        if let Some(st) = self.app.sessions.as_mut() {
+            let label = st
+                .live
+                .iter()
+                .find(|m| m.id.0 == op_close_id)
+                .map(super::sessions::label)
+                .unwrap_or_else(|| op_close_id.to_string());
+            st.pending = Some(super::sessions::SessionsOp::Close { id: op_close_id.to_string(), label });
+        }
+        self
+    }
+
+    /// Whether the /sessions modal is open.
+    pub fn sessions_open(&self) -> bool {
+        self.app.sessions.is_some()
+    }
+
+    /// Whether the close-confirm popup is up.
+    pub fn sessions_confirm_open(&self) -> bool {
+        self.app.sessions.as_ref().is_some_and(|s| s.confirm.is_some())
+    }
+
+    /// The inline notice line, if any.
+    pub fn sessions_notice(&self) -> Option<String> {
+        self.app.sessions.as_ref().and_then(|s| s.notice.as_ref().map(|n| n.text.clone()))
+    }
+
     /// Open the models modal directly.
     pub fn open_models_modal(&mut self) -> &mut Self {
         self.app.models = Some(super::models::ModelsModalState::new());
@@ -653,6 +836,7 @@ impl TestHarness {
             PaneId::Chat => "chat",
             PaneId::HelpFind => "help-find",
             PaneId::Effort => "effort",
+            PaneId::Sessions => "sessions",
             PaneId::Models => "models",
             PaneId::Plugins => "plugins",
             PaneId::Settings => "settings",
@@ -1058,6 +1242,9 @@ impl TestHarness {
                 StreamingSlash::Ran(CommandAction::OpenSettings) => {
                     super::settings::open_modal(&mut self.app);
                 }
+                StreamingSlash::Ran(CommandAction::OpenSessions) => {
+                self.open_sessions_with(None);
+            }
                 StreamingSlash::Ran(CommandAction::Quit) => self.quit_requested = true,
                 StreamingSlash::Ran(_) => {}
             }
@@ -1141,6 +1328,9 @@ impl TestHarness {
                 self.app.modal_stack.push(super::focus::PaneId::Models);
             }
             CommandAction::OpenSettings => super::settings::open_modal(&mut self.app),
+            CommandAction::OpenSessions => {
+                self.open_sessions_with(None);
+            }
             CommandAction::OpenPlugins => {
                 // Production loads plugins.json from disk; the harness opens
                 // the deterministic default state instead of touching $HOME.
@@ -1212,6 +1402,10 @@ impl TestHarness {
                 apply.model, apply.generation, apply.value
             ),
             InputAction::ModelsExpandProvider(p) => format!("models-expand:{p}"),
+            InputAction::SessionsOp(op) => match op {
+                super::sessions::SessionsOp::Pin { id, on } => format!("sessions-pin:{id}:{on}"),
+                super::sessions::SessionsOp::Close { id, .. } => format!("sessions-close:{id}"),
+            },
             InputAction::PluginsOutcome(_) => "plugins-outcome".to_string(),
             InputAction::OpenPluginsMarketplace => "open-plugins-marketplace".to_string(),
             InputAction::PingModels => "ping-models".to_string(),

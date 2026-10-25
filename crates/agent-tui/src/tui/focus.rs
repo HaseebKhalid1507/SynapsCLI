@@ -48,6 +48,8 @@ pub(crate) enum PaneId {
     HelpFind,
     /// `/effort` lightbox — valid effort levels for the active exact model.
     Effort,
+    /// `/sessions` modal — Live / Past tabs (`sessions/mod.rs`).
+    Sessions,
     /// `/model` / `/models` modal (`app.rs:87`). The expanded-models lightbox
     /// stays INTERNAL to Models (`models/mod.rs:191`).
     Models,
@@ -407,6 +409,16 @@ pub(crate) fn debug_assert_stack_sync(app: &super::app::App) {
         app.effort.is_some()
     );
 
+    // Sessions modal membership must exactly mirror `app.sessions`.
+    debug_assert_eq!(
+        app.modal_stack.contains(PaneId::Sessions),
+        app.sessions.is_some(),
+        "stack sync: modal_stack.contains(Sessions)={} but sessions.is_some()={} \
+         — a push/pop site was missed",
+        app.modal_stack.contains(PaneId::Sessions),
+        app.sessions.is_some()
+    );
+
     // P7.5: Models membership on the stack must exactly mirror `app.models`.
     debug_assert_eq!(
         app.modal_stack.contains(PaneId::Models),
@@ -482,6 +494,7 @@ pub(crate) fn debug_assert_stack_sync(app: &super::app::App) {
                 pane,
                 PaneId::HelpFind
                     | PaneId::Effort
+                    | PaneId::Sessions
                     | PaneId::Models
                     | PaneId::Plugins
                     | PaneId::Settings

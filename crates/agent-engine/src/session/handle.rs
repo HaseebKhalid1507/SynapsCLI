@@ -13,7 +13,7 @@ use super::transport::TransportError;
 use super::types::{Addressed, ClientId, Envelope, SessionCommand, SessionConfig, SessionId, SessionLifecycle, SessionMeta};
 
 /// Live client accounting published by the actor (B4 `sessions()` listing).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Presence {
     pub clients: usize,
     pub input_owner: Option<ClientId>,
@@ -22,6 +22,30 @@ pub struct Presence {
     pub roster: Vec<super::types::ClientInfo>,
     /// Who may drive (`None` until the actor publishes).
     pub client_input: Option<super::types::ClientInput>,
+    /// A turn or a compaction is running.
+    pub busy: bool,
+    /// What `state_since` dates (idle / busy / parked): a publish that
+    /// changes it restamps `state_since`.
+    pub state: PresenceState,
+    pub state_since: Option<chrono::DateTime<chrono::Utc>>,
+    /// Wall-clock idle park (Live, zero clients, grace armed).
+    pub park_due: Option<chrono::DateTime<chrono::Utc>>,
+    /// Wall-clock eviction of a Parked session.
+    pub evict_due: Option<chrono::DateTime<chrono::Utc>>,
+    /// Conversation title / cost / api message count. Kept as last seen
+    /// while Parked (no conversation in memory).
+    pub title: Option<String>,
+    pub cost_usd: f64,
+    pub messages: usize,
+}
+
+/// The coarse state `Presence::state_since` dates.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PresenceState {
+    #[default]
+    Idle,
+    Busy,
+    Parked,
 }
 use super::view::RuntimeView;
 
@@ -208,8 +232,8 @@ impl SessionHandle {
     }
 
     /// `meta()` with the live cells filled in (lifecycle, clients, owner,
-    /// awaiting_input, client_input, model, journal_id, name, pinned) — what
-    /// listings show.
+    /// awaiting_input, client_input, model, journal_id, name, pinned, and the
+    /// presence's busy/state/deadlines/title/cost/messages) — what listings show.
     pub fn meta_live(&self) -> SessionMeta {
         let mut m = (*self.meta).clone();
         let p = self.presence();
@@ -224,6 +248,13 @@ impl SessionHandle {
         m.journal_id = self.journal_id();
         m.name = self.name();
         m.pinned = self.pinned();
+        m.busy = p.busy;
+        m.state_since = p.state_since;
+        m.park_due = p.park_due;
+        m.evict_due = p.evict_due;
+        m.title = p.title;
+        m.cost_usd = p.cost_usd;
+        m.messages = p.messages;
         m
     }
 
@@ -300,6 +331,13 @@ pub mod echo {
             journal_id: id.0.clone(),
             locked_by: None,
             pinned: false,
+            busy: false,
+            state_since: None,
+            park_due: None,
+            evict_due: None,
+            title: None,
+            cost_usd: 0.0,
+            messages: 0,
         }
     }
 
@@ -543,6 +581,13 @@ pub mod locked_placeholder {
             journal_id: id.0.clone(),
             locked_by: Some(holder_desc.clone()),
             pinned: false,
+            busy: false,
+            state_since: None,
+            park_due: None,
+            evict_due: None,
+            title: None,
+            cost_usd: 0.0,
+            messages: 0,
         };
         let view = crate::session::view::RuntimeView {
             model: config.model_override.clone().unwrap_or_else(|| "unknown".into()),
