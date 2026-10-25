@@ -10,7 +10,7 @@ homepage = "https://github.com/HaseebKhalid1507/SynapsCLI"
 keywords = ["ai", "agent", "terminal", "cli", "rust"]
 categories = ["command-line-utilities", "development-tools"]
 exclude = [".github/", "docs/", "tests/fixtures/", "examples/"]
-rust-version = "1.80"
+rust-version = "1.88"
 
 [features]
 # Default build is unchanged (command execution enabled).

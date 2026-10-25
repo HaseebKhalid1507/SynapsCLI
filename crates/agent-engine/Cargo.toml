@@ -2,7 +2,7 @@
 name = "synaps-engine"
 version.workspace = true
 edition = "2021"
-rust-version = "1.80"
+rust-version = "1.88"
 description = "Runtime engine — streaming, tools, MCP, skills, extensions, sidecar"
 license = "Apache-2.0"
 

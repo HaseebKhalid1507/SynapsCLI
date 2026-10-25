@@ -6,7 +6,7 @@
 
 <p align="center">
   <a href="https://crates.io/crates/synaps"><img src="https://img.shields.io/crates/v/synaps?color=orange&label=crates.io" alt="crates.io"></a>
-  <img src="https://img.shields.io/badge/rust-1.80%2B-orange.svg" alt="Rust">
+  <img src="https://img.shields.io/badge/rust-1.88%2B-orange.svg" alt="Rust">
   <a href="https://ratatui.rs/"><img src="https://ratatui.rs/built-with-ratatui/badge.svg" alt="Built With Ratatui" height="20"></a>
   <img src="https://img.shields.io/badge/binary-25MB-success.svg" alt="25MB binary">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="License"></a>

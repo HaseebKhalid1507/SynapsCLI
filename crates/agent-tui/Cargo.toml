@@ -2,7 +2,7 @@
 name = "synaps-tui"
 version.workspace = true
 edition = "2021"
-rust-version = "1.80"
+rust-version = "1.88"
 description = "Terminal UI layer — ratatui, crossterm, syntect, tachyonfx"
 license = "Apache-2.0"
 

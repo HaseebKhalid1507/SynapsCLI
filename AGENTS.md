@@ -31,7 +31,7 @@ for Synaps builds/tests (`CARGO_BUILD_JOBS=8` or `cargo -j 8`, test harness
 Repository `.cargo/config.toml` supplies these defaults. Apply the same ceiling
 to the independently built Axel sidecar; do not multiply parallel build jobs.
 
-**Minimum Rust:** 1.80 (edition 2021).
+**Minimum Rust:** 1.88 (edition 2021).
 **Config path:** `~/.synaps-cli/config` (plain `key = value`, see `crates/agent-core/src/core/config.rs`).
 **Binary:** `target/release/synaps` — single binary, dispatched via subcommand.
 
