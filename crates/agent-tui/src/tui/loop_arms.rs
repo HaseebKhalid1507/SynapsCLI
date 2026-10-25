@@ -744,7 +744,7 @@ pub(crate) async fn handle_animation_tick(
     if !app.subagents.is_empty() {
         let now = std::time::Instant::now();
         let should_reconcile =
-            last_subagent_reconcile.map_or(true, |t| now.duration_since(t).as_secs_f64() >= 1.0);
+            last_subagent_reconcile.is_none_or(|t| now.duration_since(t).as_secs_f64() >= 1.0);
         if should_reconcile {
             // From the `SubagentRows` cache the actor refreshes at 1 Hz.
             super::stream_handler::reconcile_subagents(&mut app.subagents, &app.subagent_rows, now);
@@ -801,7 +801,7 @@ pub(crate) async fn handle_animation_tick(
         }
         app.request_redraw();
     }
-    if app.spinner_frame % 3 == 0 && app.header_animating() {
+    if app.spinner_frame.is_multiple_of(3) && app.header_animating() {
         // Header block sweep + spinner (~20 fps; wall-clock speed).
         app.request_redraw();
     }

@@ -33,7 +33,7 @@ pub async fn pin_session(state: &Arc<DaemonState>, id: &SessionId, on: bool) -> 
     // A pin that is not live here (waiting, failed, not restored yet, or a
     // lock placeholder): `--off` clears its entry, on restores it now.
     let live = state.attach(id);
-    if live.as_ref().map_or(true, |h| h.meta().locked_by.is_some() && !on) {
+    if live.as_ref().is_none_or(|h| h.meta().locked_by.is_some() && !on) {
         match super::pins::pin_offline(state, id.as_str(), on).await {
             Some(Ok(())) => return DaemonFrame::Pinned { session_id: id.clone(), on },
             Some(Err(message)) => return DaemonFrame::Error { session_id: Some(id.clone()), message },

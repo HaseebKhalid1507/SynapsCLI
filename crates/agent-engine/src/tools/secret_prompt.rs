@@ -274,7 +274,7 @@ impl SecretPromptQueue {
 
     /// Whether the active prompt accepts keys yet (see [`CONFIRM_ARM_DELAY`]).
     pub fn input_armed(&self) -> bool {
-        self.active.as_ref().map_or(true, |a| a.input_armed())
+        self.active.as_ref().is_none_or(|a| a.input_armed())
     }
 
     /// Test/harness seam: treat the active prompt as opened long enough ago

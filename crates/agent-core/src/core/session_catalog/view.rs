@@ -253,7 +253,7 @@ trait NoneOrEq<T> {
 }
 impl<T: PartialEq + Copy> NoneOrEq<T> for Option<T> {
     fn is_none_or_eq(&self, v: T) -> bool {
-        self.map_or(true, |s| s == v)
+        self.is_none_or(|s| s == v)
     }
 }
 

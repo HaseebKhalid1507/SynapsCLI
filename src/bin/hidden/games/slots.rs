@@ -218,7 +218,7 @@ impl SlotsGame {
             SlotsPhase::Spinning => {
                 // All reels spin fast for 30 frames, then start stopping
                 for i in 0..3 {
-                    if self.phase_timer % self.reel_speed[i] == 0 {
+                    if self.phase_timer.is_multiple_of(self.reel_speed[i]) {
                         self.reel_pos[i] += 1;
                     }
                 }
@@ -239,7 +239,7 @@ impl SlotsGame {
                         // Decelerate current reel
                         if i == current {
                             self.reel_speed[i] = 2 + (self.phase_timer / 8).min(6);
-                            if self.phase_timer % self.reel_speed[i] == 0 {
+                            if self.phase_timer.is_multiple_of(self.reel_speed[i]) {
                                 self.reel_pos[i] += 1;
                             }
                             // Stop when we reach the end of the strip
@@ -261,7 +261,7 @@ impl SlotsGame {
                         // Already stopped reels stay put
                     } else {
                         // Still spinning fast
-                        if self.phase_timer % 2 == 0 {
+                        if self.phase_timer.is_multiple_of(2) {
                             self.reel_pos[i] += 1;
                             if self.reel_pos[i] >= self.reel_strips[i].len() {
                                 self.reel_pos[i] = 0; // loop

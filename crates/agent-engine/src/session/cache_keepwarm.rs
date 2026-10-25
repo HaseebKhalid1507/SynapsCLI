@@ -1131,7 +1131,7 @@ impl SessionActor {
         let Some(anchor) = self
             .runtime
             .cache_anchor()
-            .filter(|a| turn_started_at.map_or(true, |t| a.mono >= t))
+            .filter(|a| turn_started_at.is_none_or(|t| a.mono >= t))
         else {
             return;
         };
