@@ -178,8 +178,10 @@ pub(crate) fn render_with(frame: &mut Frame, area: Rect, st: &SessionsState, the
         frame.render_widget(Paragraph::new(lines), notice_area);
     } else if let Some(op) = &st.pending {
         let what = match op {
-            super::SessionsOp::Pin { on: true, .. } => "pinning\u{2026}".to_string(),
-            super::SessionsOp::Pin { on: false, .. } => "unpinning\u{2026}".to_string(),
+            super::SessionsOp::Pin { on: true, .. } | super::SessionsOp::PinPast { .. } => "pinning\u{2026}".to_string(),
+            super::SessionsOp::Pin { on: false, .. } | super::SessionsOp::ClearPin { .. } => {
+                "unpinning\u{2026}".to_string()
+            }
             super::SessionsOp::Close { label, .. } => format!("closing {label}\u{2026}"),
         };
         frame.render_widget(
@@ -207,6 +209,9 @@ fn summary(st: &SessionsState) -> String {
         if n > 0 {
             parts.push(format!("{n} {what}"));
         }
+    }
+    if !st.offline.is_empty() {
+        parts.push(format!("{} pinned not live", st.offline.len()));
     }
     parts.join("  ")
 }
@@ -285,6 +290,16 @@ fn render_live(frame: &mut Frame, area: Rect, st: &SessionsState, p: &Palette) {
         }
         lines.push(row_line(p, area.width, 0, "", live_spans(st, m, &cols, p, selected), selected, true));
     }
+    if !st.offline.is_empty() {
+        lines.push(section(p, "PINNED \u{00b7} NOT LIVE", area.width));
+    }
+    for e in &st.offline {
+        let selected = st.selected.as_deref() == Some(e.journal_id.as_str());
+        if selected {
+            sel_line = lines.len();
+        }
+        lines.push(row_line(p, area.width, 0, "", pin_spans(st, e, &cols, p, selected), selected, true));
+    }
     super::super::modal_kit::render_scrolled(frame, area, lines, (sel_line.saturating_sub(1), sel_line + 1));
 }
 
@@ -346,11 +361,69 @@ fn live_spans(st: &SessionsState, m: &SessionMeta, cols: &Columns, p: &Palette, 
     v
 }
 
+/// A pin that is not live: `◌ ⚑ axon  waiting: held by pid 42, tui  ~/x`.
+fn pin_spans(
+    st: &SessionsState,
+    e: &agent_engine::daemon::pins::PinEntry,
+    cols: &Columns,
+    p: &Palette,
+    selected: bool,
+) -> Vec<Span<'static>> {
+    let gap = " ".repeat(GAP);
+    let failed = e.state.as_deref() == Some(agent_engine::daemon::pins::STATE_FAILED);
+    let label = match e.name.as_deref().filter(|n| !n.is_empty()) {
+        Some(n) => n.to_string(),
+        None => format!("\u{2026}{}", super::short_id(&e.journal_id)),
+    };
+    let mut v = vec![
+        Span::styled("\u{25cc} ", Style::default().fg(p.dim)),
+        Span::styled("\u{2691} ", Style::default().fg(p.accent)),
+        Span::styled(cell(&label, NAME_W), Style::default().fg(if selected { p.value } else { p.dim })),
+    ];
+    if cols.id {
+        v.push(Span::styled(format!("{gap}{}", cell("", ID_W)), Style::default().fg(p.dim)));
+    }
+    // The state takes the optional columns' room: the reason is the point.
+    let mut w = cols.state;
+    for (on, cw) in [(cols.clients, CLIENTS_W), (cols.model, MODEL_W), (cols.cost, COST_W)] {
+        if on {
+            w += GAP + cw;
+        }
+    }
+    v.push(Span::styled(
+        format!("{gap}{}", cell(&e.state_text(), w)),
+        Style::default().fg(if failed { p.error } else if selected { p.text } else { p.dim }),
+    ));
+    if cols.cwd > 0 {
+        v.push(Span::styled(
+            format!("{gap}{}", cell(&super::short_cwd(e.cwd.as_deref(), st.home.as_deref()), cols.cwd)),
+            Style::default().fg(p.dim),
+        ));
+    }
+    v
+}
+
 fn render_detail(frame: &mut Frame, area: Rect, st: &SessionsState, p: &Palette) {
     let w = usize::from(area.width);
     let dim = Style::default().fg(p.dim);
     let text = Style::default().fg(p.text);
     let mut lines = vec![Line::from(Span::styled("\u{2500}".repeat(w), dim))];
+    if let Some(e) = st.selected_pin() {
+        let mut l1 = vec![e.label().to_string(), e.journal_id.clone()];
+        let cwd = super::short_cwd(e.cwd.as_deref(), st.home.as_deref());
+        if !cwd.is_empty() {
+            l1.push(cwd);
+        }
+        if let Some(at) = e.pinned_at {
+            l1.push(format!("pinned {}", at.with_timezone(&chrono::Local).format("%b %d %H:%M")));
+        }
+        lines.push(Line::from(Span::styled(fit(&l1.join(" \u{00b7} "), w), text)));
+        lines.push(Line::from(Span::styled(fit(&e.state_text(), w), dim)));
+        lines.push(Line::from(Span::styled(
+            fit("pinned, not live in this daemon \u{00b7} it comes back on the next daemon start \u{00b7} p unpins", w),
+            dim,
+        )));
+    }
     if let Some(m) = st.selected_meta() {
         let own = st.is_own(m);
         let created = m.created_at.with_timezone(&chrono::Local).format("%b %d %H:%M");

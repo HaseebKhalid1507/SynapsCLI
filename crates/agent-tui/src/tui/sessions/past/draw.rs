@@ -241,7 +241,8 @@ fn render_list(frame: &mut Frame, area: Rect, past: &PastState, p: &Palette) {
             ListLine::Row(pos) => {
                 let e = &past.entries[d.view.rows[pos]];
                 let selected = pos == past.cursor;
-                lines.push(row_line(p, area.width, 0, "", row_spans(e, area.width, selected, p, &clock), selected, focused));
+                let spans = row_spans(e, past.is_pinned(&e.id), area.width, selected, p, &clock);
+                lines.push(row_line(p, area.width, 0, "", spans, selected, focused));
             }
         }
     }
@@ -273,8 +274,12 @@ fn msgs_text(n: Option<usize>) -> String {
     }
 }
 
+/// The ⚑ column (as on the Live tab).
+const PIN_W: usize = 2;
+
 fn row_spans(
     e: &CatalogEntry,
+    pinned: bool,
     width: u16,
     selected: bool,
     p: &Palette,
@@ -289,7 +294,7 @@ fn row_spans(
     // msgs · cost · age. The title takes the rest (at least 12 cells).
     let cols = [(ago, 4usize), (msgs_text(e.message_count), 9), (cost_text(e.cost), 7)];
     let mut show = [false; 3];
-    let mut used = NAME_W + 1 + 12;
+    let mut used = PIN_W + NAME_W + 1 + 12;
     for (i, (_, w)) in cols.iter().enumerate() {
         if used + 2 + w <= avail {
             used += 2 + w;
@@ -298,6 +303,7 @@ fn row_spans(
     }
     let title_w = avail.saturating_sub(used - 12);
     let mut v = vec![
+        Span::styled(if pinned { "\u{2691} " } else { "  " }, Style::default().fg(p.accent)),
         Span::styled(
             cell(&entry_label(e), NAME_W),
             Style::default()

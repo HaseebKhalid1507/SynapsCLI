@@ -20,6 +20,7 @@ pub(crate) mod switch;
 pub(crate) use draw::render;
 pub(crate) use input::{handle_event, InputOutcome};
 
+use agent_engine::daemon::pins::PinEntry;
 use agent_engine::session::{SessionId, SessionLifecycle, SessionMeta};
 use chrono::{DateTime, Utc};
 use std::path::PathBuf;
@@ -100,7 +101,14 @@ pub(crate) struct Notice {
 /// A daemon request the modal asks the dispatch loop to run.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum SessionsOp {
+    /// A live session: pin/unpin it in the daemon.
     Pin { id: String, on: bool },
+    /// A pin that is not live (waiting / failed / a pinned Past row): clear
+    /// its entry, so it does not come back.
+    ClearPin { id: String },
+    /// A Past row: continue it into the daemon, pinned (it does not switch
+    /// this TUI to it).
+    PinPast { journal_id: String, cwd: Option<std::path::PathBuf> },
     Close { id: String, label: String },
 }
 
@@ -127,6 +135,8 @@ pub(crate) enum SwitchTarget {
 #[derive(Debug)]
 pub(crate) enum SessionsMsg {
     Live { gen: u64, result: Result<Vec<SessionMeta>, String> },
+    /// The pin book as the poller read it (every entry, live or not).
+    Pins { gen: u64, pins: Vec<PinEntry> },
     Past { gen: u64, msg: past::PastMsg },
     OpDone { gen: u64, op: SessionsOp, result: Result<String, String> },
 }
@@ -142,6 +152,11 @@ pub(crate) struct SessionsState {
     pub(crate) source: LiveSource,
     /// Live rows, already in display order (LIVE section, then PARKED).
     pub(crate) live: Vec<SessionMeta>,
+    /// The pin book (every entry), as last read.
+    pub(crate) pins: Vec<PinEntry>,
+    /// Pins that are not live: the PINNED · NOT LIVE section after the live
+    /// rows (selectable; `p` clears one).
+    pub(crate) offline: Vec<PinEntry>,
     /// Selected Live row, tracked by id so a refresh never jumps the cursor.
     pub(crate) selected: Option<String>,
     pub(crate) confirm: Option<ConfirmClose>,
@@ -168,6 +183,8 @@ impl SessionsState {
             own_id: own_id.clone(),
             source: if daemon { LiveSource::Loading } else { LiveSource::InProcess },
             live: Vec::new(),
+            pins: Vec::new(),
+            offline: Vec::new(),
             selected: Some(own_id),
             confirm: None,
             notice: None,
@@ -199,11 +216,9 @@ impl SessionsState {
             .flat_map(|m| [m.id.0.clone(), m.journal_id.clone()])
             .filter(|id| !id.is_empty())
             .collect();
-        self.past.set_exclude(live_ids);
-        let still = self
-            .selected
-            .as_ref()
-            .is_some_and(|id| self.live.iter().any(|m| &m.id.0 == id));
+        self.past.set_exclude(live_ids.clone());
+        self.offline = self.pins.iter().filter(|e| !live_ids.contains(&e.journal_id)).cloned().collect();
+        let still = self.selected.as_ref().is_some_and(|id| self.row_ids().any(|r| r == id));
         if !still {
             self.selected = self
                 .live
@@ -219,6 +234,19 @@ impl SessionsState {
         }
     }
 
+    /// Replace the pin book (Past rows get their ⚑ from it).
+    pub(crate) fn set_pins(&mut self, pins: Vec<PinEntry>) {
+        self.past.set_pinned(pins.iter().map(|e| e.journal_id.clone()).collect());
+        self.pins = pins;
+        let rows = std::mem::take(&mut self.live);
+        self.set_live(rows);
+    }
+
+    /// Every selectable Live-tab row id: live sessions, then pins not live.
+    fn row_ids(&self) -> impl Iterator<Item = &String> {
+        self.live.iter().map(|m| &m.id.0).chain(self.offline.iter().map(|e| &e.journal_id))
+    }
+
     pub(crate) fn selected_index(&self) -> Option<usize> {
         let id = self.selected.as_ref()?;
         self.live.iter().position(|m| &m.id.0 == id)
@@ -228,17 +256,24 @@ impl SessionsState {
         self.selected_index().map(|i| &self.live[i])
     }
 
+    /// The selected row when it is a pin that is not live.
+    pub(crate) fn selected_pin(&self) -> Option<&PinEntry> {
+        let id = self.selected.as_ref()?;
+        self.offline.iter().find(|e| &e.journal_id == id)
+    }
+
     pub(crate) fn is_own(&self, m: &SessionMeta) -> bool {
         m.id.0 == self.own_id
     }
 
     pub(crate) fn move_selection(&mut self, delta: isize) {
-        if self.live.is_empty() {
+        let ids: Vec<String> = self.row_ids().cloned().collect();
+        if ids.is_empty() {
             return;
         }
-        let cur = self.selected_index().unwrap_or(0) as isize;
-        let next = (cur + delta).clamp(0, self.live.len() as isize - 1) as usize;
-        self.selected = Some(self.live[next].id.0.clone());
+        let cur = self.selected.as_ref().and_then(|s| ids.iter().position(|r| r == s)).unwrap_or(0) as isize;
+        let next = cur.saturating_add(delta).clamp(0, ids.len() as isize - 1) as usize;
+        self.selected = Some(ids[next].clone());
     }
 
     /// `(streaming, waiting, idle, parked)` counts for the header.
@@ -280,6 +315,15 @@ impl SessionsState {
                     }
                 }
             }
+            SessionsMsg::Pins { gen, pins } => {
+                if gen != self.gen {
+                    return false;
+                }
+                if pins == self.pins {
+                    return false;
+                }
+                self.set_pins(pins);
+            }
             SessionsMsg::Past { gen, msg } => {
                 if gen != self.gen {
                     return false;
@@ -298,12 +342,22 @@ impl SessionsState {
     }
 }
 
+/// The notice a pin leaves: a pin survives daemon restarts.
+pub(crate) const PINNED_NOTICE: &str = "pinned — it stays loaded and comes back after restarts";
+
 /// The inline line a finished pin/close leaves.
 fn op_notice(op: &SessionsOp, result: Result<String, String>) -> Notice {
     match (op, result) {
-        (SessionsOp::Pin { on: true, .. }, Ok(_)) => Notice { text: "pinned — it stays loaded".into(), error: false },
-        (SessionsOp::Pin { on: false, .. }, Ok(_)) => Notice { text: "unpinned — it parks when idle".into(), error: false },
-        (SessionsOp::Pin { .. }, Err(e)) => Notice { text: format!("pin failed: {e}"), error: true },
+        (SessionsOp::Pin { on: true, .. } | SessionsOp::PinPast { .. }, Ok(_)) => {
+            Notice { text: PINNED_NOTICE.into(), error: false }
+        }
+        (SessionsOp::Pin { on: false, .. }, Ok(_)) => {
+            Notice { text: "unpinned — it parks when idle and won't come back after a restart".into(), error: false }
+        }
+        (SessionsOp::ClearPin { .. }, Ok(_)) => Notice { text: "unpinned — it won't come back".into(), error: false },
+        (SessionsOp::Pin { .. } | SessionsOp::ClearPin { .. } | SessionsOp::PinPast { .. }, Err(e)) => {
+            Notice { text: format!("pin failed: {e}"), error: true }
+        }
         (SessionsOp::Close { label, .. }, Ok(_)) => Notice { text: format!("closed {label}"), error: false },
         (SessionsOp::Close { label, .. }, Err(e)) => Notice { text: format!("{label} not closed: {}", e.trim_start_matches("not closed: ")), error: true },
     }
@@ -487,6 +541,10 @@ async fn poll_loop(path: PathBuf, gen: u64, tx: tokio::sync::mpsc::UnboundedSend
         if tx.send(SessionsMsg::Live { gen, result }).is_err() {
             return;
         }
+        let pins = agent_engine::daemon::pins::PinBook::for_active_profile().load();
+        if tx.send(SessionsMsg::Pins { gen, pins }).is_err() {
+            return;
+        }
         tokio::time::sleep(POLL_EVERY).await;
     }
 }
@@ -514,6 +572,11 @@ pub(crate) fn spawn_op(app: &mut super::app::App, socket: Option<PathBuf>, op: S
                 .await
                 .map(|on| if on { "pinned".into() } else { "unpinned".into() })
                 .map_err(|e| e.to_string()),
+            SessionsOp::ClearPin { id } => SocketTransport::pin(&path, &SessionId(id.clone()), false)
+                .await
+                .map(|_| "unpinned".into())
+                .map_err(|e| e.to_string()),
+            SessionsOp::PinPast { journal_id, cwd } => switch::pin_past(&path, journal_id, cwd.clone()).await,
             SessionsOp::Close { id, .. } => {
                 SocketTransport::close(&path, &SessionId(id.clone()), false, CLOSE_ATTACHED)
                     .await

@@ -95,6 +95,37 @@ fn continue_attach(journal_id: &str, cwd: Option<PathBuf>, mode: AttachMode) -> 
     }
 }
 
+/// `p` on a Past row: continue the journal into the daemon pinned, without
+/// switching this TUI to it (an observe attach, detached at once). Already
+/// live there (someone continued it meanwhile): pin that one.
+pub(crate) async fn pin_past(path: &std::path::Path, journal_id: &str, cwd: Option<PathBuf>) -> Result<String, String> {
+    use agent_engine::session::socket_transport::SocketTransport;
+    let conn = SocketTransport::connect(path, Hello::new(ClientKind::Tui))
+        .await
+        .map_err(|e| format!("daemon unreachable: {e}"))?;
+    if let Some(m) = conn.welcome.sessions.iter().find(|m| m.journal_id == journal_id || m.id.0 == journal_id) {
+        let id = m.id.clone();
+        drop(conn);
+        return SocketTransport::pin(path, &id, true).await.map(|_| "pinned".into()).map_err(|e| e.to_string());
+    }
+    let (cwd, _note) = resolve_cwd(cwd, std::env::current_dir().ok(), None);
+    let mut attach = continue_attach(journal_id, cwd, AttachMode::Observe);
+    if let Attach::Create { config, .. } = &mut attach {
+        config.keep_warm = true;
+    }
+    let (t, snapshot) = SocketTransport::attach(conn, attach).await.map_err(|e| match e {
+        agent_engine::session::transport::TransportError::Refused(why) => why,
+        other => other.to_string(),
+    })?;
+    let pinned = snapshot.meta.pinned;
+    t.detach().await;
+    if pinned {
+        Ok("pinned".into())
+    } else {
+        Err("the daemon did not pin it (an older daemon?); pin it from the Live tab".into())
+    }
+}
+
 /// Where a Continue runs: the journal's folder if it still exists, else this
 /// TUI's cwd — with the note the switched line carries (`folder gone, using
 /// ~/x`).

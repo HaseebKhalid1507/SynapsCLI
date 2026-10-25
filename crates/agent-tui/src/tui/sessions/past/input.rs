@@ -10,7 +10,7 @@
 //! Tab is never consumed here: it stays the Live/Past switch.
 
 use super::{Focus, PastCmd, RenameEdit};
-use crate::tui::sessions::{InputOutcome, Notice, SessionsState, SwitchTarget};
+use crate::tui::sessions::{InputOutcome, Notice, SessionsOp, SessionsState, SwitchTarget};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 /// `None` = not consumed (the shell handles it: esc closes, tab switches).
@@ -57,6 +57,7 @@ pub(crate) fn handle_key(st: &mut SessionsState, key: KeyEvent) -> Option<InputO
         (KeyCode::Enter, Focus::List) => return Some(continue_selected(st)),
         (KeyCode::Char('r'), Focus::List) => open_rename(st),
         (KeyCode::Char('y'), Focus::List) => return Some(copy_id(st)),
+        (KeyCode::Char('p'), Focus::List) => return Some(pin_selected(st)),
         _ => {
             list_nav(st, key);
         }
@@ -150,6 +151,21 @@ fn continue_selected(st: &mut SessionsState) -> InputOutcome {
     InputOutcome::None
 }
 
+/// `p` on a Past row: a pinned one is unpinned (it won't come back); any
+/// other is continued into the daemon and pinned, without switching to it.
+fn pin_selected(st: &mut SessionsState) -> InputOutcome {
+    if crate::tui::sessions::input::no_daemon(st) || crate::tui::sessions::input::busy_notice(st) {
+        return InputOutcome::None;
+    }
+    let Some(e) = st.past.selected_entry() else { return InputOutcome::None };
+    let op = if st.past.is_pinned(&e.id) {
+        SessionsOp::ClearPin { id: e.id.clone() }
+    } else {
+        SessionsOp::PinPast { journal_id: e.id.clone(), cwd: e.cwd.clone() }
+    };
+    InputOutcome::Op(op)
+}
+
 fn copy_id(st: &mut SessionsState) -> InputOutcome {
     let Some(id) = st.past.selected_entry().map(|e| e.id.clone()) else {
         return InputOutcome::None;
@@ -223,8 +239,13 @@ pub(crate) fn hint(st: &SessionsState) -> String {
     if p.focus == Focus::Sidebar {
         return "\u{2191}\u{2193} move  enter toggle  c clear  \u{2192} list  / search  tab live  esc close".into();
     }
+    let pin = match p.selected_entry() {
+        Some(e) if p.is_pinned(&e.id) => "  p unpin",
+        Some(_) => "  p pin",
+        None => "",
+    };
     format!(
-        "enter continue  / search  ctrl+f deep  s sort  h {}  r rename  y copy id  \u{2190} filters  esc {}",
+        "enter continue{pin}  / search  ctrl+f deep  s sort  h {}  r rename  y copy id  \u{2190} filters  esc {}",
         if p.show_hidden { "hide noise" } else { "show hidden" },
         if p.query_text.is_empty() { "close" } else { "clear" },
     )

@@ -66,7 +66,7 @@ fn live_key(st: &mut SessionsState, key: KeyEvent) -> InputOutcome {
     InputOutcome::None
 }
 
-fn busy_notice(st: &mut SessionsState) -> bool {
+pub(crate) fn busy_notice(st: &mut SessionsState) -> bool {
     if st.pending.is_some() {
         st.notice = Some(Notice { text: "still waiting on the daemon\u{2026}".into(), error: false });
         return true;
@@ -75,7 +75,7 @@ fn busy_notice(st: &mut SessionsState) -> bool {
 }
 
 /// No daemon to ask (in-process TUI, or it is down): say so, emit nothing.
-fn no_daemon(st: &mut SessionsState) -> bool {
+pub(crate) fn no_daemon(st: &mut SessionsState) -> bool {
     let why = match &st.source {
         super::LiveSource::InProcess => "no daemon \u{2014} pin and close need `synaps --attach`",
         super::LiveSource::DaemonDown(_) => "the daemon is unreachable \u{2014} try again when it is back",
@@ -89,6 +89,9 @@ fn pin(st: &mut SessionsState) -> InputOutcome {
     if no_daemon(st) || busy_notice(st) {
         return InputOutcome::None;
     }
+    if let Some(e) = st.selected_pin() {
+        return InputOutcome::Op(SessionsOp::ClearPin { id: e.journal_id.clone() });
+    }
     let Some(m) = st.selected_meta() else { return InputOutcome::None };
     InputOutcome::Op(SessionsOp::Pin { id: m.id.0.clone(), on: !m.pinned })
 }
@@ -98,6 +101,10 @@ fn pin(st: &mut SessionsState) -> InputOutcome {
 /// call happens here.
 fn ask_close(st: &mut SessionsState) {
     if no_daemon(st) || busy_notice(st) {
+        return;
+    }
+    if st.selected_pin().is_some() {
+        st.notice = Some(Notice { text: "not live \u{2014} p unpins it so it won't come back".into(), error: true });
         return;
     }
     let Some(m) = st.selected_meta() else { return };
@@ -125,6 +132,11 @@ fn ask_close(st: &mut SessionsState) {
 /// `pending_switch`). Not your own row; not without a daemon.
 fn ask_switch(st: &mut SessionsState) {
     if no_daemon(st) {
+        return;
+    }
+    // A pin that is not live: continue its journal, as from Past.
+    if let Some(e) = st.selected_pin() {
+        st.pending_switch = Some(super::SwitchTarget::Continue { journal_id: e.journal_id.clone(), cwd: e.cwd.clone() });
         return;
     }
     let Some(m) = st.selected_meta() else { return };
@@ -163,6 +175,9 @@ pub(crate) fn hint(st: &SessionsState) -> String {
     }
     let mut h = String::from("\u{2191}\u{2193} navigate");
     let daemon = !matches!(st.source, super::LiveSource::InProcess | super::LiveSource::DaemonDown(_));
+    if st.selected_pin().is_some() && daemon {
+        h.push_str("  enter continue  p unpin");
+    }
     if let Some(m) = st.selected_meta().filter(|_| daemon) {
         if !st.is_own(m) {
             h.push_str("  enter switch");
