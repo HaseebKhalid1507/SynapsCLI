@@ -31,6 +31,11 @@ fn offenders(needles: &[&str], skip_tests: bool) -> Vec<String> {
             continue;
         }
         let src = std::fs::read_to_string(&f).unwrap();
+        // A `tests.rs` file is a `#[cfg(test)] mod tests;` body: test code
+        // throughout (e.g. Past-tab fixtures that save journals to a tempdir).
+        if rel == "tests.rs" || rel.ends_with("/tests.rs") {
+            continue;
+        }
         let mut in_tests = false;
         for (i, line) in src.lines().enumerate() {
             if line.trim_start().starts_with("#[cfg(test)]") {

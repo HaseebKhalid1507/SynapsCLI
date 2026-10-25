@@ -7,6 +7,7 @@ use agent_core::session::Session;
 use agent_core::session_journal::{save_session_in_dir, SessionPersistence};
 use agent_tui::tui::testing::{sessions_test_now, TestHarness};
 use crossterm::event::{KeyCode, KeyModifiers};
+use agent_tui::tui::testing::fake_daemon::FakeSession;
 use std::sync::Arc;
 
 fn key(h: &mut TestHarness, c: KeyCode) {
@@ -103,15 +104,18 @@ fn past_tab_search_facet_and_enter_continue() {
     assert!(on_synaps(&frame), "{frame}");
     key(&mut h, KeyCode::Enter);
     assert_eq!(h.sessions_past_rows(), vec!["20261025-020000-ab12"]);
+    // Enter continues it: the harness drains the switch as the run loop does
+    // (PR 4), so check what reached the daemon.
+    let d = h.use_fake_daemon();
+    d.add_past(FakeSession::new("20261025-020000-ab12", None, "q", "a"));
     key(&mut h, KeyCode::Right);
     key(&mut h, KeyCode::Enter);
-    assert_eq!(h.sessions_pending_continue().as_deref(), Some("20261025-020000-ab12"));
-    assert_eq!(
-        h.sessions_pending_continue_cwd(),
-        Some(Some(std::path::PathBuf::from("/home/u/Projects/SynapsCLI"))),
-        "the journal's cwd travels with the switch"
-    );
-    assert!(h.sessions_open(), "the switch itself is the dispatch loop's (PR 4)");
+    assert_eq!(h.own_session_id(), "cont-20261025-020000-ab12");
+    assert!(d.connects().last().unwrap().starts_with("continue:20261025-020000-ab12@"), "{:?}", d.connects());
+    // The fixture's folder does not exist here, so the note proves the
+    // journal's cwd travelled with the switch (no cwd → no note).
+    let t = h.main_transcript_text();
+    assert!(t.contains("folder gone, using "), "the journal's cwd travels with the switch: {t}");
 }
 
 #[test]
