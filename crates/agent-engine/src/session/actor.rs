@@ -5308,9 +5308,6 @@ async fn next_stream_event(stream: &mut Option<ActiveStream>) -> Option<StreamEv
     }
 }
 
-/// Whether the 1 Hz `SubagentRows` tick keeps running: always during a turn,
-/// and after it while any worker is still running (a background worker's
-/// progress events rode the ended turn's stream; the rows carry it now).
 /// The conversation's title for listings: the saved title, else what
 /// `Session::auto_title` will make of the first user message.
 fn conversation_title(conv: &ConversationState) -> Option<String> {
@@ -5324,6 +5321,9 @@ fn conversation_title(conv: &ConversationState) -> Option<String> {
         .map(|t| t.chars().take(80).collect())
 }
 
+/// Whether the 1 Hz `SubagentRows` tick keeps running: always during a turn,
+/// and after it while any worker is still running (a background worker's
+/// progress events rode the ended turn's stream; the rows carry it now).
 fn keep_subagent_tick(streaming: bool, any_running: bool) -> bool {
     streaming || any_running
 }
