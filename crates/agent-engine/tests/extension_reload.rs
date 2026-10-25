@@ -16,6 +16,8 @@ use std::sync::Arc;
 
 use agent_engine::extensions::hooks::HookBus;
 use agent_engine::extensions::manager::ExtensionManager;
+use agent_engine::tools::activation::{activate_exact_for_user, SessionId, SessionToolSet};
+use agent_engine::tools::catalog::ToolId;
 use agent_engine::tools::ToolRegistry;
 use serde_json::{json, Value};
 
@@ -65,6 +67,28 @@ impl Installed {
         });
         std::fs::write(self.manifest_path(), serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
     }
+    /// The same plugin as a DEFERRED extension (dormant tools declared in
+    /// the manifest; no process until a leased call).
+    fn write_deferred_manifest(&self, tools: &[&str]) {
+        let declared: Vec<Value> = tools.iter().map(|n| tool(n)).collect();
+        let manifest = json!({
+            "name": PLUGIN,
+            "extension": {
+                "runtime": "process",
+                "command": "python3",
+                "args": [
+                    fixture_script().display().to_string(),
+                    self.spy.display().to_string(),
+                    self.tools_json.display().to_string(),
+                    "ok",
+                ],
+                "permissions": ["tools.register"],
+                "tools": declared,
+                "activation": "deferred",
+            }
+        });
+        std::fs::write(self.manifest_path(), serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
+    }
     /// What the fixture registers at its NEXT initialize.
     fn set_tools(&self, names: &[&str]) {
         let tools: Vec<Value> = names.iter().map(|n| tool(n)).collect();
@@ -99,6 +123,73 @@ async fn discovered() -> (ExtensionManager, Arc<tokio::sync::RwLock<ToolRegistry
     let (_loaded, failed) = mgr.discover_and_load().await;
     assert!(failed.is_empty(), "{failed:?}");
     (mgr, registry)
+}
+
+/// [`discovered`] under progressive disclosure (deferred manifests defer).
+async fn discovered_progressive() -> (ExtensionManager, Arc<tokio::sync::RwLock<ToolRegistry>>) {
+    let registry = Arc::new(tokio::sync::RwLock::new(ToolRegistry::new()));
+    let mut mgr = ExtensionManager::new_with_tools(Arc::new(HookBus::new()), Arc::clone(&registry));
+    mgr.set_progressive_deferral(true);
+    let (_loaded, failed) = mgr.discover_and_load().await;
+    assert!(failed.is_empty(), "{failed:?}");
+    (mgr, registry)
+}
+
+/// What a session that is mid-turn sees while `reload` runs: a poller that
+/// reads the shared registry as fast as it can and does the round-top
+/// rebuild a streaming session does whenever the catalog moved. Returns
+/// (polls that found `tool` missing, activations the rebuild dropped, the
+/// session's final set).
+struct MidTurnSession {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    task: tokio::task::JoinHandle<(usize, usize, Vec<String>, SessionToolSet)>,
+}
+
+impl MidTurnSession {
+    async fn start(registry: &Arc<tokio::sync::RwLock<ToolRegistry>>, tool: &str) -> Self {
+        let (plugin, name) = tool.split_once(':').unwrap();
+        let mut set = {
+            let reg = registry.read().await;
+            let mut set = SessionToolSet::progressive_core_for_catalog(
+                SessionId::parse("reload-mid-turn").unwrap(),
+                reg.catalog(),
+            );
+            activate_exact_for_user(&mut set, reg.catalog(), &ToolId::extension(plugin, name))
+                .expect("the extension tool is activatable");
+            set
+        };
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (registry, tool, flag) = (Arc::clone(registry), tool.to_string(), Arc::clone(&stop));
+        let task = tokio::spawn(async move {
+            let (mut polls, mut missing, mut dropped) = (0usize, 0usize, Vec::new());
+            while !flag.load(std::sync::atomic::Ordering::SeqCst) {
+                {
+                    let reg = registry.read().await;
+                    polls += 1;
+                    if reg.get(&tool).is_none() {
+                        missing += 1;
+                    }
+                    if set.is_stale(reg.catalog()) {
+                        let (next, lost) = set.rebuilt_for_catalog(reg.catalog(), true);
+                        dropped.extend(lost.into_iter().map(|d| d.id.as_str().to_string()));
+                        set = next;
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+            (polls, missing, dropped, set)
+        });
+        Self { stop, task }
+    }
+
+    async fn finish(self) -> (usize, usize, Vec<String>, SessionToolSet) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.task.await.unwrap()
+    }
+}
+
+fn activated(set: &SessionToolSet) -> Vec<String> {
+    set.activated().map(|a| a.grant().tool_id().as_str().to_string()).collect()
 }
 
 async fn names(registry: &Arc<tokio::sync::RwLock<ToolRegistry>>, plugin: &str) -> Vec<String> {
@@ -236,4 +327,105 @@ async fn names_that_discovery_would_never_load_are_refused() {
     let f = mgr.reload_from_disk("skills-only").await.unwrap_err();
     assert!(f.reason.contains("has no extension"), "{f:?}");
     assert_eq!(mgr.count(), 0);
+}
+
+/// The cache-safety contract of a reload: a session that starts a request
+/// while the extension restarts must not see its tools vanish. A gap in the
+/// registry makes the round-top rebuild drop the session's activation of
+/// that tool for good, which changes the tools array the session sends
+/// (a prompt-cache rewrite then, and another when the model re-activates).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial(reload_plugins_root)]
+async fn a_session_mid_turn_during_a_reload_keeps_its_activated_tool() {
+    let root = plugins_root();
+    let fx = install(&root, PLUGIN, &["search", "sibling"]);
+    let (mut mgr, registry) = discovered().await;
+    let search = format!("{PLUGIN}:search");
+
+    let session = MidTurnSession::start(&registry, &search).await;
+    // Same version: nothing about the tools changes, only the process.
+    let report = mgr.reload_from_disk(PLUGIN).await.expect("reload");
+    let (polls, missing, dropped, set) = session.finish().await;
+
+    assert_eq!(fx.count("spawn"), 2, "a real restart");
+    assert!(report.removed_tools.is_empty(), "{report:?}");
+    assert!(polls > 0);
+    assert_eq!(missing, 0, "the tool was missing from the registry in {missing} of {polls} polls");
+    assert!(dropped.is_empty(), "the round-top rebuild dropped {dropped:?}");
+    assert_eq!(activated(&set), vec![ToolId::extension(PLUGIN, "search").as_str().to_string()]);
+    // The new instance serves it: the entry now holds the new process.
+    assert!(registry.read().await.get(&search).is_some());
+
+    mgr.shutdown_all().await;
+}
+
+/// The same contract for a deferred extension: its dormant entries are
+/// swapped in one registry write, never removed and re-added.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial(reload_plugins_root)]
+async fn a_deferred_reload_keeps_a_mid_turn_session_activation() {
+    let root = plugins_root();
+    let fx = install(&root, PLUGIN, &["search", "sibling"]);
+    fx.write_deferred_manifest(&["search", "sibling"]);
+    let (mut mgr, registry) = discovered_progressive().await;
+    assert!(mgr.is_deferred(PLUGIN));
+    let search = format!("{PLUGIN}:search");
+
+    let session = MidTurnSession::start(&registry, &search).await;
+    for _ in 0..20 {
+        mgr.reload_from_disk(PLUGIN).await.expect("reload");
+    }
+    let (polls, missing, dropped, set) = session.finish().await;
+
+    assert!(polls > 0);
+    assert_eq!(missing, 0, "the tool was missing from the registry in {missing} of {polls} polls");
+    assert!(dropped.is_empty(), "the round-top rebuild dropped {dropped:?}");
+    assert_eq!(activated(&set), vec![ToolId::extension(PLUGIN, "search").as_str().to_string()]);
+    assert_eq!(fx.count("spawn"), 0, "a deferred reload starts no process");
+
+    mgr.shutdown_all().await;
+}
+
+/// A deferred reload whose new manifest drops a tool removes it, and a
+/// mid-turn activation of a tool that still exists survives.
+#[tokio::test]
+#[serial_test::serial(reload_plugins_root)]
+async fn a_deferred_reload_that_drops_a_tool_removes_only_that_one() {
+    let root = plugins_root();
+    let fx = install(&root, PLUGIN, &["search", "sibling"]);
+    fx.write_deferred_manifest(&["search", "sibling"]);
+    let (mut mgr, registry) = discovered_progressive().await;
+
+    fx.write_deferred_manifest(&["search"]);
+    let report = mgr.reload_from_disk(PLUGIN).await.expect("reload");
+    assert!(report.deferred);
+    // Dormant entries are not owned `ExtensionTool`s: look them up by name.
+    assert!(registry.read().await.get(&format!("{PLUGIN}:search")).is_some());
+    assert!(registry.read().await.get(&format!("{PLUGIN}:sibling")).is_none());
+
+    mgr.shutdown_all().await;
+}
+
+/// An update that switches the extension between eager and deferred still
+/// reloads in place: the kept entries are swapped either way.
+#[tokio::test]
+#[serial_test::serial(reload_plugins_root)]
+async fn a_reload_can_switch_between_eager_and_deferred() {
+    let root = plugins_root();
+    let fx = install(&root, PLUGIN, &["search"]);
+    let (mut mgr, registry) = discovered_progressive().await;
+    assert!(!mgr.is_deferred(PLUGIN), "the eager fixture loads eagerly");
+    let search = format!("{PLUGIN}:search");
+
+    fx.write_deferred_manifest(&["search"]);
+    let report = mgr.reload_from_disk(PLUGIN).await.expect("eager -> deferred");
+    assert!(report.deferred);
+    assert!(registry.read().await.get(&search).is_some());
+
+    fx.write_manifest("python3");
+    let report = mgr.reload_from_disk(PLUGIN).await.expect("deferred -> eager");
+    assert!(!report.deferred);
+    assert_eq!(names(&registry, PLUGIN).await, vec![search]);
+
+    mgr.shutdown_all().await;
 }

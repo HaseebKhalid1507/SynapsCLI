@@ -87,6 +87,19 @@ fn plugin_roots() -> Vec<PathBuf> {
     roots
 }
 
+/// The registry entries (name, current tool) of `names` that exist.
+fn kept_entries(registry: &crate::ToolRegistry, names: &[String]) -> Vec<(String, Arc<dyn crate::Tool>)> {
+    names
+        .iter()
+        .filter_map(|n| registry.get(n).map(|t| (n.clone(), Arc::clone(t))))
+        .collect()
+}
+
+/// The same tool object (data pointer; vtables may differ per codegen unit).
+fn same_tool(a: &Arc<dyn crate::Tool>, b: &Arc<dyn crate::Tool>) -> bool {
+    std::ptr::eq(Arc::as_ptr(a) as *const (), Arc::as_ptr(b) as *const ())
+}
+
 /// The directory discovery would load plugin `name` from: the last root
 /// (see [`plugin_roots`]) that has it. `None` when no root has it.
 fn locate_plugin_dir(name: &str) -> Option<PathBuf> {
@@ -368,6 +381,11 @@ pub struct ExtensionManager {
     /// CURRENT record at every lease acquisition (sync lock, map ops only,
     /// never held across I/O). Consumed by the lease lifecycle only.
     deferred_tool_only: SharedDeferredRecords,
+    /// Set by [`Self::reload`] for its load only: the dormant tool names of
+    /// the deferred instance being replaced, which the new instance's
+    /// catalog batch swaps out in the SAME registry write (see
+    /// [`Self::reload`] on why the registry must never show a gap).
+    reload_replaces: Vec<String>,
     /// Lazily-created shared extension runtime lease manager (Task 20
     /// Commit B). One instance shared by this manager (unload revocation)
     /// and the `Runtime` (per-session capabilities + session-end scope).
@@ -437,6 +455,7 @@ impl ExtensionManager {
             manifest_theme_tokens: HashMap::new(),
             progressive_deferral: false,
             deferred_tool_only: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            reload_replaces: Vec::new(),
             extension_runtime: std::sync::OnceLock::new(),
             context_providers: Vec::new(),
             context_provider_catalog: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -465,6 +484,7 @@ impl ExtensionManager {
             manifest_theme_tokens: HashMap::new(),
             progressive_deferral: false,
             deferred_tool_only: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            reload_replaces: Vec::new(),
             extension_runtime: std::sync::OnceLock::new(),
             context_providers: Vec::new(),
             context_provider_catalog: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -733,10 +753,13 @@ impl ExtensionManager {
                         id
                     ));
                 };
-                tools
-                    .write()
-                    .await
-                    .try_register_batch(dormant)
+                // A reload swaps the replaced instance's dormant entries in
+                // this same write: no reader ever sees them missing.
+                let replacing = std::mem::take(&mut self.reload_replaces);
+                let mut registry = tools.write().await;
+                registry
+                    .try_disable(&replacing)
+                    .and_then(|()| registry.try_register_batch(dormant))
                     .map_err(|e| {
                         format!("Extension '{}' deferred tool catalog rejected: {}", id, e)
                     })?;
@@ -1360,6 +1383,19 @@ impl ExtensionManager {
     /// grants cannot survive), and terminates every session's runtime
     /// lease for the plugin.
     pub async fn unload(&mut self, id: &str) -> Result<(), String> {
+        self.unload_inner(id, false).await.map(|_| ())
+    }
+
+    /// [`Self::unload`]; with `keep_tools` (a reload only) the extension's
+    /// registry entries stay where they are and are returned, for
+    /// [`Self::settle_replaced_tools`] to remove whatever the new instance
+    /// did not replace. Until then a call to one fails against the stopped
+    /// instance, as it would against a missing tool.
+    async fn unload_inner(
+        &mut self,
+        id: &str,
+        keep_tools: bool,
+    ) -> Result<Vec<(String, Arc<dyn crate::Tool>)>, String> {
         let deferred = self
             .deferred_tool_only
             .lock()
@@ -1381,6 +1417,7 @@ impl ExtensionManager {
             }
             self.hook_bus.unsubscribe_all(id).await;
             self.providers.unregister_plugin(id);
+            let mut kept = Vec::new();
             if let Some(tools) = &self.tools {
                 let names: Vec<String> = record
                     .manifest
@@ -1393,7 +1430,11 @@ impl ExtensionManager {
                             .collect()
                     })
                     .unwrap_or_default();
-                if let Err(error) = tools.write().await.try_disable(&names) {
+                if keep_tools {
+                    let registry = tools.read().await;
+                    kept = kept_entries(&registry, &names);
+                    self.reload_replaces = names.clone();
+                } else if let Err(error) = tools.write().await.try_disable(&names) {
                     // Fail-closed either way: with the record gone, dormant
                     // descriptors can never execute; surface the partial
                     // cleanup instead of hiding it.
@@ -1406,7 +1447,7 @@ impl ExtensionManager {
             self.manifest_configs.remove(id);
             self.manifest_theme_tokens.remove(id);
             tracing::info!(extension = %id, "Deferred extension unloaded");
-            return Ok(());
+            return Ok(kept);
         }
         let handler = self
             .extensions
@@ -1421,7 +1462,16 @@ impl ExtensionManager {
         // Its tools go with it: each holds the handler being shut down, so
         // a tool left behind would fail every call, and a reload whose new
         // version no longer declares it would never replace it.
+        let mut kept = Vec::new();
         let tool_error = match &self.tools {
+            Some(tools) if keep_tools => {
+                let registry = tools.read().await;
+                let names = registry.tool_names_for_extension(id);
+                kept = kept_entries(&registry, &names);
+                // A new version that defers swaps these in its batch write.
+                self.reload_replaces = names;
+                None
+            }
             Some(tools) => {
                 let mut registry = tools.write().await;
                 let names = registry.tool_names_for_extension(id);
@@ -1445,22 +1495,57 @@ impl ExtensionManager {
             ));
         }
         tracing::info!(extension = %id, "Extension unloaded");
-        Ok(())
+        Ok(kept)
+    }
+
+    /// After a reload's load: remove each kept entry the new instance did
+    /// not replace (it still holds the stopped instance), in ONE registry
+    /// write. On success that is exactly the tools the new version no
+    /// longer declares; after a failed load it is all of them (fail-closed:
+    /// no tool outlives its process).
+    async fn settle_replaced_tools(&mut self, id: &str, kept: Vec<(String, Arc<dyn crate::Tool>)>) -> Result<(), String> {
+        self.reload_replaces.clear();
+        let Some(tools) = &self.tools else { return Ok(()) };
+        if kept.is_empty() {
+            return Ok(());
+        }
+        let mut registry = tools.write().await;
+        let stale: Vec<String> = kept
+            .into_iter()
+            .filter(|(name, old)| registry.get(name).is_some_and(|now| same_tool(now, old)))
+            .map(|(name, _)| name)
+            .collect();
+        registry
+            .try_disable(&stale)
+            .map_err(|e| format!("Extension '{id}' reloaded but its stale tools could not be deregistered: {e}"))
     }
 
     /// Reload one extension by unloading any existing instance first, then loading
     /// the supplied manifest. If the new load fails, the previous instance remains
     /// unloaded so duplicate handlers cannot survive a broken reload.
+    ///
+    /// The extension's tools never leave the shared registry during the
+    /// swap: the new instance replaces them by name (a deferred one in a
+    /// single write), and only what it did not replace is removed after.
+    /// A session that starts a request mid-reload therefore still finds its
+    /// activated tools, so the round-top rebuild keeps them and the tools
+    /// array it sends (part of the cached prompt prefix) is unchanged. A
+    /// gap would drop those activations for good: a prompt-cache rewrite
+    /// then, and another when the model re-activates.
     pub async fn reload(
         &mut self,
         id: &str,
         manifest: &ExtensionManifest,
         cwd: Option<std::path::PathBuf>,
     ) -> Result<(), String> {
-        if self.extensions.contains_key(id) || self.is_deferred_tool_only(id) {
-            self.unload(id).await?;
-        }
-        self.load_with_cwd(id, manifest, cwd).await
+        let kept = if self.extensions.contains_key(id) || self.is_deferred_tool_only(id) {
+            self.unload_inner(id, true).await?
+        } else {
+            Vec::new()
+        };
+        let loaded = self.load_with_cwd(id, manifest, cwd).await;
+        let settled = self.settle_replaced_tools(id, kept).await;
+        loaded.and(settled)
     }
 
     /// Reload extension `id` from what is installed now, without touching
