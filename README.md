@@ -21,9 +21,9 @@
 </p>
 
 <!-- BENCH-STRIP: numbers from BENCHMARKS.md; update both together -->
-| **~3 MB** per extra session | **~10 ms** to first frame | **97.9%** of prompt tokens from cache |
+| **~4 MB** per extra session | **~7 ms** to first frame | **97.9%** of prompt tokens from cache |
 |:---:|:---:|:---:|
-| next lightest harness ~8 MB, Claude Code ~100 MB | on a warm daemon; cold start ~90–160 ms | 127k real requests since v0.8.0, 89.6% cheaper |
+| next lightest (jcode) ~5 MB, Claude Code ~79 MB | on a warm daemon; cold start ~41 ms | 127k real requests since v0.8.0, 89.6% cheaper |
 
 <p align="center"><sub>Same machine, same harness, versions and method in <a href="BENCHMARKS.md">BENCHMARKS.md</a>.</sub></p>
 
@@ -111,17 +111,16 @@ Local models: Synaps targets Ollama's default `http://localhost:11434/v1`. LM St
 ## Benchmarks
 
 <!-- BENCH-TABLE: from BENCHMARKS.md; update both together -->
-Memory is total PSS across each tool's whole process tree, with idle TUI sessions on one machine. Synaps shares one daemon across sessions, so each extra session is a thin client.
+Memory is total PSS (plus swapped-out pages) across each tool's whole process tree, background servers included, with idle TUI sessions. Measured 2026-10-26 on one machine (24 cores, 30 GB, Linux), median of 3. Synaps shares one daemon across sessions, so each extra session is a thin client.
 
-| Memory (total PSS) | 1 session | 10 sessions | per extra session |
-|--------------------|----------:|------------:|------------------:|
-| **synaps** (core)  | **~39 MB** | **~69 MB**  | **~3.3 MB** |
-| jcode (memory off) | 63 MB      | 136 MB      | ~8.2 MB |
-| antigravity        | 135 MB     | 358 MB      | ~25 MB |
-| pi                 | 120 MB     | 718 MB      | ~66 MB |
-| claude code        | 205 MB     | 1131 MB     | ~103 MB |
-| opencode           | 394 MB     | 1144 MB     | ~83 MB |
-| codex              | 137 MB     | 1213 MB     | ~120 MB |
+| Memory | 1 session | 10 sessions | per extra session |
+|--------|----------:|------------:|------------------:|
+| **synaps** 0.11.0 (core) | **42 MB** | **79 MB** | **~4.1 MB** |
+| jcode v0.91.0 | 117 MB | 165 MB | ~5.3 MB |
+| pi 0.85.1 | 117 MB | 708 MB | ~66 MB |
+| claude code 2.1.304 | 186 MB | 894 MB | ~79 MB |
+| codex 0.163.0 | 274 MB | 525 MB | ~28 MB |
+| opencode 2.1.1 | 387 MB | 1197 MB | ~90 MB |
 
 **Prompt cache, from real use:** 97.9% of prompt tokens came from cache across 127,453 requests since v0.8.0, every release between 97.1% and 98.4%. That's 89.6% cheaper than the same tokens at list price without caching. [Full report](benchmarks/prompt-cache/README.md)
 

@@ -1,0 +1,471 @@
+{
+  "date_utc": "2026-10-26T10:59:18Z",
+  "kernel": "7.2.11-1-cachyos",
+  "cores": 24,
+  "versions": {
+    "synaps": "synaps 0.11.0"
+  },
+  "method": "5 invocations x --runs 10; run 1 of each is cold (spawns the isolated daemon), runs 2-10 warm",
+  "cold": {
+    "first_visible_ms": {
+      "median": 40.6,
+      "min": 35.7,
+      "max": 47.8,
+      "n": 5
+    },
+    "input_ready_ms": {
+      "median": 41.8,
+      "min": 37.1,
+      "max": 49.6,
+      "n": 5
+    }
+  },
+  "warm": {
+    "first_visible_ms": {
+      "median": 7.0,
+      "min": 5.7,
+      "max": 9.8,
+      "n": 45
+    },
+    "input_ready_ms": {
+      "median": 8.3,
+      "min": 7.2,
+      "max": 11.3,
+      "n": 42
+    }
+  },
+  "live_daemons": [
+    {
+      "before": {
+        "3652": "/home/haseeb/.local/bin/synaps-dev daemon --foreground --idle-exit 600"
+      },
+      "after": {
+        "3652": "/home/haseeb/.local/bin/synaps-dev daemon --foreground --idle-exit 600"
+      }
+    },
+    {
+      "before": {
+        "3652": "/home/haseeb/.local/bin/synaps-dev daemon --foreground --idle-exit 600"
+      },
+      "after": {
+        "3652": "/home/haseeb/.local/bin/synaps-dev daemon --foreground --idle-exit 600"
+      }
+    },
+    {
+      "before": {
+        "3652": "/home/haseeb/.local/bin/synaps-dev daemon --foreground --idle-exit 600"
+      },
+      "after": {
+        "3652": "/home/haseeb/.local/bin/synaps-dev daemon --foreground --idle-exit 600"
+      }
+    },
+    {
+      "before": {
+        "3652": "/home/haseeb/.local/bin/synaps-dev daemon --foreground --idle-exit 600"
+      },
+      "after": {
+        "3652": "/home/haseeb/.local/bin/synaps-dev daemon --foreground --idle-exit 600"
+      }
+    },
+    {
+      "before": {
+        "3652": "/home/haseeb/.local/bin/synaps-dev daemon --foreground --idle-exit 600"
+      },
+      "after": {
+        "3652": "/home/haseeb/.local/bin/synaps-dev daemon --foreground --idle-exit 600"
+      }
+    }
+  ],
+  "invocations": [
+    {
+      "date_utc": "2026-10-26T10:59:18Z",
+      "kernel": "7.2.11-1-cachyos",
+      "cores": 24,
+      "args": {
+        "runs": 10,
+        "timeout": 10.0,
+        "tools": [
+          "synaps"
+        ],
+        "json_out": "/tmp/lat-1.json"
+      },
+      "versions": {
+        "synaps": "synaps 0.11.0"
+      },
+      "runs": {
+        "synaps": [
+          {
+            "first_visible_ms": 47.751494974363595,
+            "input_ready_ms": 49.58470101701096,
+            "excerpt": "SynapsCLI \u276f \u2026/benchmarks \u00b7 20261026-105918-6e7d v0.11.0"
+          },
+          {
+            "first_visible_ms": 6.994905008468777,
+            "input_ready_ms": 8.65242100553587,
+            "excerpt": "SynapsCLI \u276f \u2026/benchmarks \u00b7 20261026-105918-d725 v0.11.0"
+          },
+          {
+            "first_visible_ms": 6.455426977481693,
+            "input_ready_ms": 7.966201985254884,
+            "excerpt": "SynapsCLI \u276f \u2026/benchmarks \u00b7 20261026-105919-edf1 v0.11.0"
+          },
+          {
+            "first_visible_ms": 7.061948999762535,
+            "input_ready_ms": null,
+            "excerpt": "SynapsCLI \u276f \u2026/benchmarks \u00b7 20261026-105919-81cc v0.11.0"
+          },
+          {
+            "first_visible_ms": 7.139093999285251,
+            "input_ready_ms": 8.188239997252822,
+            "excerpt": "SynapsCLI \u276f \u2026/benchmarks \u00b7 20261026-105929-d9d1 v0.11.0"
+          },
+          {
+            "first_visible_ms": 7.1011739782989025,
+            "input_ready_ms": 8.357968996278942,
+            "excerpt": "SynapsCLI \u276f \u2026/benchmarks \u00b7 20261026-105929-7942 v0.11.0"
+          },
+          {
+            "first_visible_ms": 7.778089959174395,
+            "input_ready_ms": 9.139031986705959,
+            "excerpt": "SynapsCLI \u276f \u2026/benchmarks \u00b7 20261026-105929-d6fa v0.11.0"
+          },
+          {
+            "first_visible_ms": 8.933901030104607,
+            "input_ready_ms": 10.374127014074475,
+            "excerpt": "SynapsCLI \u276f \u2026/benchmarks \u00b7 20261026-105930-4cf4 v0.11.0"
+          },
+          {
+            "first_visible_ms": 6.643618980888277,
+            "input_ready_ms": 8.397191006224602,
+            "excerpt": "SynapsCLI \u276f \u2026/benchmarks \u00b7 20261026-105930-e2a0 v0.11.0"
+          },
+          {
+            "first_visible_ms": 9.453770995605737,
+            "input_ready_ms": 10.693844989873469,
+            "excerpt": "SynapsCLI \u276f \u2026/benchmarks \u00b7 20261026-105930-327f v0.11.0"
+          }
+        ]
+      },
+      "live_daemons": {
+        "before": {
+          "3652": "/home/haseeb/.local/bin/synaps-dev daemon --foreground --idle-exit 600"
+        },
+        "after": {
+          "3652": "/home/haseeb/.local/bin/synaps-dev daemon --foreground --idle-exit 600"
+        }
+      }
+    },
+    {
+      "date_utc": "2026-10-26T10:59:31Z",
+      "kernel": "7.2.11-1-cachyos",
+      "cores": 24,
+      "args": {
+        "runs": 10,
+        "timeout": 10.0,
+        "tools": [
+          "synaps"
+        ],
+        "json_out": "/tmp/lat-2.json"
+      },
+      "versions": {
+        "synaps": "synaps 0.11.0"
+      },
+      "runs": {
+        "synaps": [
+          {
+            "first_visible_ms": 35.73167702415958,
+            "input_ready_ms": 37.05276298569515,
+            "excerpt": "SynapsCLI \u276f \u2026/benchmarks \u00b7 20261026-105931-774d v0.11.0"
+          },
+          {
+            "first_visible_ms": 6.631263007875532,
+            "input_ready_ms": 7.525319990236312,
+            "excerpt": "SynapsCLI \u276f \u2026/benchmarks \u00b7 20261026-105931-9abb v0.11.0"
+          },
+          {
+            "first_visible_ms": 6.464490026701242,
+            "input_ready_ms": 7.421485031954944,
+            "excerpt": "SynapsCLI \u276f \u2026/benchmarks \u00b7 20261026-105932-8569 v0.11.0"
+          },
+          {
+            "first_visible_ms": 6.474937021266669,
+            "input_ready_ms": 7.684054027777165,
+            "excerpt": "SynapsCLI \u276f \u2026/benchmarks \u00b7 20261026-105932-5354 v0.11.0"
+          },
+          {
+            "first_visible_ms": 6.586359988432378,
+            "input_ready_ms": 8.119328995235264,
+            "excerpt": "SynapsCLI \u276f \u2026/benchmarks \u00b7 20261026-105932-ea02 v0.11.0"
+          },
+          {
+            "first_visible_ms": 6.345392030198127,
+            "input_ready_ms": 7.366977981291711,
+            "excerpt": "SynapsCLI \u276f \u2026/benchmarks \u00b7 20261026-105932-c59c v0.11.0"
+          },
+          {
+            "first_visible_ms": 7.134301995392889,
+            "input_ready_ms": 8.409623987972736,
+            "excerpt": "SynapsCLI \u276f \u2026/benchmarks \u00b7 20261026-105933-1a61 v0.11.0"
+          },
+          {
+            "first_visible_ms": 6.901106971781701,
+            "input_ready_ms": 7.869995955843478,
+            "excerpt": "SynapsCLI \u276f \u2026/benchmarks \u00b7 20261026-105933-4ca2 v0.11.0"
+          },
+          {
+            "first_visible_ms": 6.916681013535708,
+            "input_ready_ms": 8.406587003264576,
+            "excerpt": "SynapsCLI \u276f \u2026/benchmarks \u00b7 20261026-105933-b17b v0.11.0"
+          },
+          {
+            "first_visible_ms": 8.580135006923229,
+            "input_ready_ms": 10.223275981843472,
+            "excerpt": "SynapsCLI \u276f \u2026/benchmarks \u00b7 20261026-105933-feb7 v0.11.0"
+          }
+        ]
+      },
+      "live_daemons": {
+        "before": {
+          "3652": "/home/haseeb/.local/bin/synaps-dev daemon --foreground --idle-exit 600"
+        },
+        "after": {
+          "3652": "/home/haseeb/.local/bin/synaps-dev daemon --foreground --idle-exit 600"
+        }
+      }
+    },
+    {
+      "date_utc": "2026-10-26T10:59:34Z",
+      "kernel": "7.2.11-1-cachyos",
+      "cores": 24,
+      "args": {
+        "runs": 10,
+        "timeout": 10.0,
+        "tools": [
+          "synaps"
+        ],
+        "json_out": "/tmp/lat-3.json"
+      },
+      "versions": {
+        "synaps": "synaps 0.11.0"
+      },
+      "runs": {
+        "synaps": [
+          {
+            "first_visible_ms": 36.410183005500585,
+            "input_ready_ms": 37.328207050450146,
+            "excerpt": "SynapsCLI \u276f \u2026/benchmarks \u00b7 20261026-105934-b243 v0.11.0"
+          },
+          {
+            "first_visible_ms": 6.796996982302517,
+            "input_ready_ms": 8.04116897052154,
+            "excerpt": "SynapsCLI \u276f \u2026/benchmarks \u00b7 20261026-105935-af34 v0.11.0"
+          },
+          {
+            "first_visible_ms": 6.586529954802245,
+            "input_ready_ms": 7.883459969889373,
+            "excerpt": "SynapsCLI \u276f \u2026/benchmarks \u00b7 20261026-105935-09a1 v0.11.0"
+          },
+          {
+            "first_visible_ms": 6.520514958538115,
+            "input_ready_ms": 7.936520967632532,
+            "excerpt": "SynapsCLI \u276f \u2026/benchmarks \u00b7 20261026-105935-0ad3 v0.11.0"
+          },
+          {
+            "first_visible_ms": 6.638118007685989,
+            "input_ready_ms": 7.573823037091643,
+            "excerpt": "SynapsCLI \u276f \u2026/benchmarks \u00b7 20261026-105935-e7b7 v0.11.0"
+          },
+          {
+            "first_visible_ms": 7.023360987659544,
+            "input_ready_ms": 8.028195996303111,
+            "excerpt": "SynapsCLI \u276f \u2026/benchmarks \u00b7 20261026-105935-b0c9 v0.11.0"
+          },
+          {
+            "first_visible_ms": 7.022528967354447,
+            "input_ready_ms": 8.314804988913238,
+            "excerpt": "SynapsCLI \u276f \u2026/benchmarks \u00b7 20261026-105936-29eb v0.11.0"
+          },
+          {
+            "first_visible_ms": 7.903842022642493,
+            "input_ready_ms": 9.227907983586192,
+            "excerpt": "SynapsCLI \u276f \u2026/benchmarks \u00b7 20261026-105936-5e73 v0.11.0"
+          },
+          {
+            "first_visible_ms": 7.215972989797592,
+            "input_ready_ms": 8.41156201204285,
+            "excerpt": "SynapsCLI \u276f \u2026/benchmarks \u00b7 20261026-105936-8533 v0.11.0"
+          },
+          {
+            "first_visible_ms": 9.812143980525434,
+            "input_ready_ms": 11.241291009355336,
+            "excerpt": "SynapsCLI \u276f \u2026/benchmarks \u00b7 20261026-105936-2224 v0.11.0"
+          }
+        ]
+      },
+      "live_daemons": {
+        "before": {
+          "3652": "/home/haseeb/.local/bin/synaps-dev daemon --foreground --idle-exit 600"
+        },
+        "after": {
+          "3652": "/home/haseeb/.local/bin/synaps-dev daemon --foreground --idle-exit 600"
+        }
+      }
+    },
+    {
+      "date_utc": "2026-10-26T10:59:37Z",
+      "kernel": "7.2.11-1-cachyos",
+      "cores": 24,
+      "args": {
+        "runs": 10,
+        "timeout": 10.0,
+        "tools": [
+          "synaps"
+        ],
+        "json_out": "/tmp/lat-4.json"
+      },
+      "versions": {
+        "synaps": "synaps 0.11.0"
+      },
+      "runs": {
+        "synaps": [
+          {
+            "first_visible_ms": 41.1984589882195,
+            "input_ready_ms": 42.478026007302105,
+            "excerpt": "SynapsCLI \u276f \u2026/benchmarks \u00b7 20261026-105937-a0d9 v0.11.0"
+          },
+          {
+            "first_visible_ms": 7.183750974945724,
+            "input_ready_ms": 8.757616975344718,
+            "excerpt": "SynapsCLI \u276f \u2026/benchmarks \u00b7 20261026-105938-6bb0 v0.11.0"
+          },
+          {
+            "first_visible_ms": 7.016321993432939,
+            "input_ready_ms": 8.281268004793674,
+            "excerpt": "SynapsCLI \u276f \u2026/benchmarks \u00b7 20261026-105938-2d41 v0.11.0"
+          },
+          {
+            "first_visible_ms": 6.4635350136086345,
+            "input_ready_ms": 7.91216897778213,
+            "excerpt": "SynapsCLI \u276f \u2026/benchmarks \u00b7 20261026-105938-7225 v0.11.0"
+          },
+          {
+            "first_visible_ms": 6.869739969260991,
+            "input_ready_ms": 8.337333973031491,
+            "excerpt": "SynapsCLI \u276f \u2026/benchmarks \u00b7 20261026-105938-e512 v0.11.0"
+          },
+          {
+            "first_visible_ms": 6.663048989139497,
+            "input_ready_ms": 8.224847028031945,
+            "excerpt": "SynapsCLI \u276f \u2026/benchmarks \u00b7 20261026-105938-c644 v0.11.0"
+          },
+          {
+            "first_visible_ms": 6.089264003094286,
+            "input_ready_ms": 7.3132989928126335,
+            "excerpt": "SynapsCLI \u276f \u2026/benchmarks \u00b7 20261026-105939-67f2 v0.11.0"
+          },
+          {
+            "first_visible_ms": 7.153224025387317,
+            "input_ready_ms": null,
+            "excerpt": "SynapsCLI \u276f \u2026/benchmarks \u00b7 20261026-105939-30d3 v0.11.0"
+          },
+          {
+            "first_visible_ms": 7.398240966722369,
+            "input_ready_ms": 8.937648963183165,
+            "excerpt": "SynapsCLI \u276f \u2026/benchmarks \u00b7 20261026-105949-8013 v0.11.0"
+          },
+          {
+            "first_visible_ms": 9.288647037465125,
+            "input_ready_ms": 11.283131025265902,
+            "excerpt": "SynapsCLI \u276f \u2026/benchmarks \u00b7 20261026-105949-cbcb v0.11.0"
+          }
+        ]
+      },
+      "live_daemons": {
+        "before": {
+          "3652": "/home/haseeb/.local/bin/synaps-dev daemon --foreground --idle-exit 600"
+        },
+        "after": {
+          "3652": "/home/haseeb/.local/bin/synaps-dev daemon --foreground --idle-exit 600"
+        }
+      }
+    },
+    {
+      "date_utc": "2026-10-26T10:59:50Z",
+      "kernel": "7.2.11-1-cachyos",
+      "cores": 24,
+      "args": {
+        "runs": 10,
+        "timeout": 10.0,
+        "tools": [
+          "synaps"
+        ],
+        "json_out": "/tmp/lat-5.json"
+      },
+      "versions": {
+        "synaps": "synaps 0.11.0"
+      },
+      "runs": {
+        "synaps": [
+          {
+            "first_visible_ms": 40.626301954034716,
+            "input_ready_ms": 41.83005297090858,
+            "excerpt": "SynapsCLI \u276f \u2026/benchmarks \u00b7 20261026-105950-1a24 v0.11.0"
+          },
+          {
+            "first_visible_ms": 7.011890993453562,
+            "input_ready_ms": 8.078770944848657,
+            "excerpt": "SynapsCLI \u276f \u2026/benchmarks \u00b7 20261026-105951-70d7 v0.11.0"
+          },
+          {
+            "first_visible_ms": 6.222498952411115,
+            "input_ready_ms": 7.682530966121703,
+            "excerpt": "SynapsCLI \u276f \u2026/benchmarks \u00b7 20261026-105951-07de v0.11.0"
+          },
+          {
+            "first_visible_ms": 7.501715037506074,
+            "input_ready_ms": 8.67378804832697,
+            "excerpt": "SynapsCLI \u276f \u2026/benchmarks \u00b7 20261026-105951-470f v0.11.0"
+          },
+          {
+            "first_visible_ms": 6.4624910010024905,
+            "input_ready_ms": null,
+            "excerpt": "SynapsCLI \u276f \u2026/benchmarks \u00b7 20261026-105951-9465 v0.11.0"
+          },
+          {
+            "first_visible_ms": 7.435417035594583,
+            "input_ready_ms": 8.651400043163449,
+            "excerpt": "SynapsCLI \u276f \u2026/benchmarks \u00b7 20261026-110002-9655 v0.11.0"
+          },
+          {
+            "first_visible_ms": 5.739780957810581,
+            "input_ready_ms": 7.216605998110026,
+            "excerpt": "SynapsCLI \u276f \u2026/benchmarks \u00b7 20261026-110002-41ec v0.11.0"
+          },
+          {
+            "first_visible_ms": 7.993214996531606,
+            "input_ready_ms": 9.05125099234283,
+            "excerpt": "SynapsCLI \u276f \u2026/benchmarks \u00b7 20261026-110002-d867 v0.11.0"
+          },
+          {
+            "first_visible_ms": 6.477581046056002,
+            "input_ready_ms": 7.925078039988875,
+            "excerpt": "SynapsCLI \u276f \u2026/benchmarks \u00b7 20261026-110002-adff v0.11.0"
+          },
+          {
+            "first_visible_ms": 9.306296007707715,
+            "input_ready_ms": 10.783154983073473,
+            "excerpt": "SynapsCLI \u276f \u2026/benchmarks \u00b7 20261026-110002-e596 v0.11.0"
+          }
+        ]
+      },
+      "live_daemons": {
+        "before": {
+          "3652": "/home/haseeb/.local/bin/synaps-dev daemon --foreground --idle-exit 600"
+        },
+        "after": {
+          "3652": "/home/haseeb/.local/bin/synaps-dev daemon --foreground --idle-exit 600"
+        }
+      }
+    }
+  ]
+}
