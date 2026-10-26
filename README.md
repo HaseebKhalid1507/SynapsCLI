@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://github.com/user-attachments/assets/30332bb2-2ea0-4d53-9b59-97db77878d38" alt="SynapsCLI" width="100%" />
+  <img src="https://github.com/user-attachments/assets/3d82937b-e486-48fd-be69-f7fe82085e70" alt="SynapsCLI" width="100%" />
 </p>
 
 <h3 align="center">Lightning-fast agent runtime</h3>
@@ -17,7 +17,7 @@
 </p>
 
 <p align="center">
-  <img src="https://github.com/user-attachments/assets/4e470c8c-a53a-4fae-acb4-15a56be105b3" alt="A crew of Synaps agents running in parallel" width="100%" />
+  <img src="https://github.com/user-attachments/assets/0ce9fe56-cf4e-4bb1-9a70-b516ae6a71b6" alt="A crew of Synaps agents running in parallel" width="100%" />
 </p>
 
 <!-- BENCH-STRIP: numbers from BENCHMARKS.md; update both together -->
@@ -108,6 +108,11 @@ Local models: Synaps targets Ollama's default `http://localhost:11434/v1`. LM St
 - **Sees what you see.** The model reads images, and `/attach` adds images, PDFs and text to a turn. [More](docs/multimodal.md)
 - **Build on it.** Extensions in any language, MCP servers, and the engine over [JSON-RPC](docs/rpc-protocol.md) or WebSocket.
 
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/9f907e06-46ff-46b3-87d5-36f53783e795" alt="Two terminals attached to one live session: one asks, the other steers mid-turn" width="100%" />
+</p>
+<p align="center"><sub>Two terminals, one live session: the left one asks, the right one steers mid-turn.</sub></p>
+
 ## Benchmarks
 
 <!-- BENCH-TABLE: from BENCHMARKS.md; update both together -->
@@ -188,9 +193,9 @@ Each extension is its own crash-isolated process, with a permissions manifest th
 21 built-in themes, including `catppuccin`, `gruvbox`, `nord`, `tokyo-night`, originals like `neon-rain` and `night-city`, and a light one, `paper`. Switch live with `/theme`, or try one for a single run with `SYNAPS_THEME=<name>`.
 
 <p align="center">
-  <img src="https://github.com/user-attachments/assets/c5892efb-5f79-4648-9746-43bf316a87d3" alt="ice" width="32%" />
-  <img src="https://github.com/user-attachments/assets/b6b03e4f-4868-48e2-b5c5-bbd84e81f77c" alt="phosphor" width="32%" />
-  <img src="https://github.com/user-attachments/assets/9d06c56e-ce20-4f35-aca0-ea274507d7dc" alt="dracula" width="32%" />
+  <img src="https://github.com/user-attachments/assets/f54ea75f-0c15-41cb-b97f-b66a8396c27f" alt="night-city theme" width="32%" />
+  <img src="https://github.com/user-attachments/assets/0086bec9-6b05-432d-8099-ee84faaf3e75" alt="catppuccin theme" width="32%" />
+  <img src="https://github.com/user-attachments/assets/0492a49d-4f65-4edd-870d-375590877f40" alt="paper theme" width="32%" />
 </p>
 
 ## Security
