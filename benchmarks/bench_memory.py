@@ -28,6 +28,12 @@
 # (jcode's TUI starts `jcode serve` with setsid, which outlives its parent).
 # jcode runs with an isolated JCODE_HOME/JCODE_RUNTIME_DIR per run.
 #
+# Timing: with --hold N, the reported sample is taken N seconds after the
+# last launch, with every PTY drained meanwhile: some tools trim their heap
+# once idle (jcode's server drops ~60 MB about two minutes after start), so a
+# sample right after launch depends on how long the launches took. The
+# at-launch sample is recorded too.
+#
 # Usage:    python3 bench_memory.py --sessions 1 10 --reps 3 --tools synaps jcode
 #           SYNAPS_BIN=/path/to/synaps python3 bench_memory.py --sessions 10
 
@@ -441,7 +447,22 @@ def stop_bench_daemon(bin_: str, base: Path) -> None:
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
 
 
-def run_tool(spec: ToolSpec, sessions: int, timeout_s: float, settle_s: float) -> dict:
+def drain(launches: list[Launch], seconds: float) -> None:
+    """Keep every PTY read (and answer capability queries) for `seconds`: a TUI
+    whose terminal is never read blocks on write and stops its own idle work
+    (e.g. jcode's idle heap trim), which would freeze it in its launch state."""
+    end = time.time() + seconds
+    fds = {l.fd for l in launches}
+    while fds and time.time() < end:
+        r, _, _ = select.select(list(fds), [], [], 0.2)
+        for fd in r:
+            try:
+                answer_caps(fd, os.read(fd, 65536))
+            except OSError:
+                fds.discard(fd)
+
+
+def run_tool(spec: ToolSpec, sessions: int, timeout_s: float, settle_s: float, hold_s: float = 0.0) -> dict:
     tag = f"{os.getpid()}-{uuid.uuid4().hex[:12]}"
     env = os.environ.copy()
     env.update(spec.env)
@@ -506,7 +527,14 @@ def run_tool(spec: ToolSpec, sessions: int, timeout_s: float, settle_s: float) -
                 launches.append(lc)
                 cleanup.append(lc.pgid)
             roots = [l.pid for l in launches]
-        res = sum_tree_pss(roots, cleanup, tag)
+        at_launch = sum_tree_pss(roots, cleanup, tag)
+        res = at_launch
+        if hold_s > 0:
+            drain(launches, hold_s)
+            res = sum_tree_pss(roots, cleanup, tag)
+        res["launch"] = {k: at_launch[k] for k in ("mem_mb", "pss_mb", "swap_pss_mb", "pss_anon_mb",
+                                                   "pss_file_mb", "process_count")}
+        res["hold_s"] = hold_s
         res.update({"tool": spec.name, "sessions": sessions,
                     "ready": sum(l.ready for l in launches),
                     "excerpt": next((l.excerpt for l in launches if l.excerpt), None)})
@@ -543,6 +571,9 @@ def main() -> int:
     ap.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_S)
     ap.add_argument("--settle", type=float, default=DEFAULT_SETTLE_S)
     ap.add_argument("--json-out", default=None, help="write raw results (every repetition) here")
+    ap.add_argument("--hold", type=float, default=0.0,
+                    help="after the last launch, keep every session idle (PTYs drained) this long "
+                         "before the reported sample; a sample right after launch is kept too")
     ap.add_argument("--max-psi", type=float, default=1.0,
                     help="max memory PSI some-avg10 (%%) before/after a sample")
     ap.add_argument("--quiet-wait", type=float, default=900.0,
@@ -585,7 +616,7 @@ def main() -> int:
                 for attempt in range(1, args.max_attempts + 1):
                     before = wait_quiet(args.max_psi, args.quiet_wait)
                     check_live_daemons(live)
-                    res = run_tool(spec, n, args.timeout, args.settle)
+                    res = run_tool(spec, n, args.timeout, args.settle, args.hold)
                     check_live_daemons(live)
                     after = mem_pressure()
                     res.update({"pressure_before": before, "pressure_after": after, "attempt": attempt})
@@ -598,7 +629,8 @@ def main() -> int:
                 res["rep"] = rep
                 payload["runs"].append(res)
                 vals.append(res["mem_mb"])
-                print(f"  {n:>2} session(s) rep {rep}: {res['mem_mb']:7.1f} MB  "
+                print(f"  {n:>2} session(s) rep {rep}: {res['mem_mb']:7.1f} MB settled, "
+                      f"{res['launch']['mem_mb']:7.1f} MB at launch  "
                       f"(pss {res['pss_mb']} + swap {res['swap_pss_mb']}) "
                       f"procs={res['process_count']} outside-tree={res['outside_tree_mem_mb']} MB "
                       f"psi={res['pressure_after'].get('psi_some_avg10')}{'' if res['quiet'] else ' PRESSURED'} "
