@@ -101,7 +101,17 @@ pub(crate) const WIDGET_EVENT_QUEUE_CAPACITY: usize = 256;
 /// invisible to the renderer by construction. Builder-requested mutations
 /// come back as a [`super::view_model::RenderPatch`].
 pub(crate) struct App {
+    /// The main thread's transcript. Code that should follow the focused
+    /// thread (render, scroll, selection, Ctrl-O) goes through
+    /// [`super::threads::active_mut`] instead of this field.
     pub(crate) transcript: TranscriptStore,
+    /// Per-subagent thread views + which thread has focus (`Main` until the
+    /// user watches a worker).
+    pub(crate) threads: super::threads::Threads,
+    /// Watch polling + steering bookkeeping for the worker views.
+    pub(crate) watch: super::watch::WatchState,
+    /// Where the subagent tray was last painted (tray-row clicks).
+    pub(crate) tray_area: ratatui::layout::Rect,
     /// Sole input-buffer state (hybrid plan §3.1, tui-textarea-2). Never
     /// rendered — snapshot time derives flat `(text, cursor)` via the
     /// accessors (`input_text`, `cursor_char_pos`) and feeds the unchanged
@@ -173,6 +183,22 @@ pub(crate) struct App {
     pub(crate) spinner_frame: usize,
     /// Transient status text shown in the header bar (auto-cleared when streaming starts)
     pub(crate) status_text: Option<String>,
+    /// Header: what the current turn is doing (stream_handler.rs).
+    pub(crate) activity: super::header::Activity,
+    /// Header: tool calls dispatched whose results are not back yet.
+    pub(crate) tools_in_flight: u32,
+    /// Header: when the current turn started (`None` between turns).
+    pub(crate) turn_started: Option<std::time::Instant>,
+    /// Header: zero of the state block's sweep clock.
+    pub(crate) header_epoch: std::time::Instant,
+    /// The working folder the header shows (`~`-abbreviated, read once).
+    pub(crate) header_folder: String,
+    /// Attached read-only (`--observe`): the header shows `observing`.
+    pub(crate) observing: bool,
+    /// Clients attached to this daemon session, this one included (0
+    /// in-process); kept from the transport's roster. The header shows it
+    /// when more than one.
+    pub(crate) attached_clients: usize,
     /// (E-P8) Thin session-driver client state: "driver armed" mirror, set
     /// purely from `DriverArmed`/`DriverRevoked` wire events. Gates Esc/Ctrl-C
     /// routing and the status toast. The actor owns all driver lifecycle.
@@ -189,6 +215,16 @@ pub(crate) struct App {
     pub(crate) help_find: Option<synaps_cli::help::HelpFindState>,
     /// Active /effort lightbox state (Some while /effort is open).
     pub(crate) effort: Option<super::effort::EffortModalState>,
+    /// Active /sessions modal state (Some while /sessions is open).
+    pub(crate) sessions: Option<super::sessions::SessionsState>,
+    /// Bumped on every /sessions open; background answers carry it so a late
+    /// one from an earlier open is dropped.
+    pub(crate) sessions_gen: u64,
+    /// The /sessions daemon poller (aborted on drop = when the modal closes).
+    pub(crate) sessions_poller: Option<super::sessions::AbortOnDrop>,
+    /// Background /sessions answers (daemon list, past list, pin/close).
+    pub(crate) sessions_tx: tokio::sync::mpsc::UnboundedSender<super::sessions::SessionsMsg>,
+    pub(crate) sessions_rx: tokio::sync::mpsc::UnboundedReceiver<super::sessions::SessionsMsg>,
     /// P7 modal-routing stack (finished, P7.8). The single source of input
     /// routing: `input.rs` dispatches on `modal_stack.top()`, one arm per
     /// `PaneId`. It is an *index over* the `Option<…State>` modal fields above
@@ -208,6 +244,13 @@ pub(crate) struct App {
     /// F9: set when the daemon died and reconnection failed — `run_loop` uses
     /// this to exit non-zero with a stderr explanation.
     pub(crate) daemon_lost: Option<DaemonLostInfo>,
+    /// The session ended under this client (`Ended`): `/close`, `daemon
+    /// stop`, an eviction. A daemon-session TUI says so on stderr after it
+    /// exits (`attach::session_ended_line`).
+    pub(crate) session_ended: Option<agent_engine::session::EndReason>,
+    /// The daemon binary the version-skew notice was last shown for
+    /// (`attach::skew_notice_once`: once per daemon build, not per reconnect).
+    pub(crate) skew_noticed: Option<agent_engine::session::transport::BinaryId>,
     /// F27: quit-while-streaming guard (socket only). First Ctrl+C shows a
     /// notice; second within 3 s detaches.
     pub(crate) quit_guard: super::quit_guard::QuitGuard,
@@ -223,6 +266,9 @@ pub(crate) struct App {
     /// `Resumed` reply waiting for the `Conversation` that carries the
     /// resumed session's messages (then the "switched from …" line).
     pub(crate) resume_pending: Option<ResumePending>,
+    /// Set by a `/sessions` switch: the attach's "you own input" toast is
+    /// skipped until then (the switched line already says where you are).
+    pub(crate) quiet_owner_toast_until: Option<std::time::Instant>,
     /// The last Submit text until `TurnStarted`/`Refused` (§6 #9: a refused
     /// Submit gives the editor its text back).
     pub(crate) last_submitted: Option<String>,
@@ -379,6 +425,7 @@ impl App {
     pub(crate) fn new_with_clock(session: Session, clock: super::clock::TuiClock) -> Self {
         let (ping_tx_init, ping_rx_init) = tokio::sync::mpsc::unbounded_channel();
         let (model_list_tx_init, model_list_rx_init) = tokio::sync::mpsc::unbounded_channel();
+        let (sessions_tx_init, sessions_rx_init) = tokio::sync::mpsc::unbounded_channel();
         let (extension_loader_tx_init, extension_loader_rx_init) =
             tokio::sync::mpsc::unbounded_channel();
         let (widget_tx_init, widget_rx_init) =
@@ -387,6 +434,9 @@ impl App {
         let boot_config = synaps_cli::config::load_config();
         Self {
             transcript: TranscriptStore::new(clock.clone()),
+            threads: super::threads::Threads::default(),
+            watch: Default::default(),
+            tray_area: Default::default(),
             editor: tui_textarea::TextArea::default(),
             api_messages_len: 0,
             streaming: false,
@@ -433,6 +483,13 @@ impl App {
             pasted_char_count: 0,
             spinner_frame: 0,
             status_text: None,
+            activity: super::header::Activity::Idle,
+            tools_in_flight: 0,
+            turn_started: None,
+            header_epoch: std::time::Instant::now(),
+            header_folder: super::header::current_folder(),
+            observing: false,
+            attached_clients: 0,
             driver_ui: super::driver_client::DriverUiState::default(),
             gamba_child: None,
             settings: None,
@@ -440,6 +497,11 @@ impl App {
             models: None,
             help_find: None,
             effort: None,
+            sessions: None,
+            sessions_gen: 0,
+            sessions_poller: None,
+            sessions_tx: sessions_tx_init,
+            sessions_rx: sessions_rx_init,
             // P7.3: wired but starts EMPTY — pure no-op until P7.4 migrates a modal.
             modal_stack: super::focus::ModalStack::new(),
             // P7.8: folded off the `run()` local; production wires the mpsc
@@ -447,11 +509,14 @@ impl App {
             secret_prompts: synaps_cli::tools::SecretPromptQueue::new(),
             compacting: false,
             daemon_lost: None,
+            session_ended: None,
+            skew_noticed: None,
             quit_guard: super::quit_guard::QuitGuard::new(),
             pending_events_len: 0,
             subagent_rows: Vec::new(),
             compaction_applied: None,
             resume_pending: None,
+            quiet_owner_toast_until: None,
             last_submitted: None,
             pending_attachments: Default::default(),
             consecutive_auto_turns: 0,
@@ -560,7 +625,7 @@ impl App {
     /// True when the input buffer contains no text at all.
     pub(crate) fn input_is_empty(&self) -> bool {
         let lines = self.editor.lines();
-        lines.len() <= 1 && lines.first().map_or(true, |l| l.is_empty())
+        lines.len() <= 1 && lines.first().is_none_or(|l| l.is_empty())
     }
 
     /// Flat **char** index of the editor cursor within `input_text()`.
@@ -664,6 +729,9 @@ impl App {
     // signaling (`needs_redraw`) stays here on App.
 
     pub(crate) fn push_msg(&mut self, msg: ChatMessage) {
+        let Some(msg) = super::watch::command_output(self, msg) else {
+            return;
+        };
         self.transcript.push_msg(msg);
         self.needs_redraw = true;
     }
@@ -677,7 +745,18 @@ impl App {
         self.needs_redraw = true;
     }
 
-    /// Mark only the tail message dirty. O(1) during streaming.
+    /// A theme change: like [`Self::invalidate`], but for every subagent view
+    /// too. Each worker view keeps its own line cache, so invalidating only
+    /// the main one left a worker's older tool cards and thinking blocks in
+    /// the previous palette until they happened to re-render.
+    pub(crate) fn invalidate_theme(&mut self) {
+        self.threads.invalidate_all();
+        self.invalidate();
+    }
+
+    /// Mark only the main transcript's tail message dirty. O(1). The run
+    /// loop's animation tick uses [`Self::tick_message_animations`].
+    #[cfg(test)]
     pub(crate) fn invalidate_last(&mut self) {
         self.transcript.invalidate_last();
         self.needs_redraw = true;
@@ -698,19 +777,130 @@ impl App {
         self.force_redraw = true;
     }
 
+    /// Header: a turn began (pre-send or `TurnStarted` on a client
+    /// that was idle). Starts the turn clock; clears a previous failure.
+    pub(crate) fn header_turn_started(&mut self) {
+        self.turn_started = Some(self.clock.now());
+        self.activity = super::header::Activity::Waiting;
+        self.tools_in_flight = 0;
+    }
+
+    /// Header: the turn ended. `failure` keeps a short label on the
+    /// right of the header until the next turn starts.
+    pub(crate) fn header_turn_ended(&mut self, failure: Option<String>) {
+        self.turn_started = None;
+        self.tools_in_flight = 0;
+        self.activity = failure.map_or(super::header::Activity::Idle, super::header::Activity::Failed);
+    }
+
+    /// Forget everything that belonged to the session this TUI was showing,
+    /// before a `/sessions` switch mirrors another one (the snapshot then
+    /// refills the conversation mirrors, header and transcript). App-wide
+    /// state — theme, config, keybinds, the input draft, input history,
+    /// sidecars, model caches — stays.
+    pub(crate) fn reset_for_session_switch(&mut self) {
+        super::watch::reset(self);
+        self.transcript.clear();
+        self.invalidate();
+        self.subagents.clear();
+        self.subagent_rows.clear();
+        self.queued_message = None;
+        self.pending_attachments.clear();
+        self.compaction_applied = None;
+        self.resume_pending = None;
+        self.last_submitted = None;
+        self.status_text = None;
+        self.streaming = false;
+        self.compacting = false;
+        self.header_turn_ended(None);
+        self.turn_baseline = 0;
+        self.spinner_frame = 0;
+        self.quit_guard.reset();
+        self.session_ended = None;
+        self.observing = false;
+        self.consecutive_auto_turns = 0;
+        self.pending_events_len = 0;
+        // Accounting mirrors: per-turn counters + cache stats.
+        self.api_messages_len = 0;
+        self.input_tokens = 0;
+        self.output_tokens = 0;
+        self.total_input_tokens = 0;
+        self.total_output_tokens = 0;
+        self.total_cache_read_tokens = 0;
+        self.total_cache_creation_tokens = 0;
+        self.total_cache_write_5m = 0;
+        self.total_cache_write_1h = 0;
+        self.last_turn_context = 0;
+        self.api_call_count = 0;
+        self.session_cost = 0.0;
+        self.keepwarm_cost = 0.0;
+        self.keepwarm_tokens = Default::default();
+        self.response_preview = None;
+        // Prompts of the old session: the pane closes without answering.
+        self.secret_prompts = synaps_cli::tools::SecretPromptQueue::new();
+        // Toasts that described the old session.
+        for id in ["attach", "input-owner", "lifecycle", "confirms-waiting", "watch", "driver"] {
+            self.toasts.dismiss(id);
+        }
+    }
+
+    /// True while the header animates (so the tick asks for redraws).
+    pub(crate) fn header_animating(&self) -> bool {
+        self.streaming
+            || self.compacting
+            || self.status_text.is_some()
+            || self.subagents.iter().any(|s| !s.done)
+    }
+
+    /// The header's per-frame snapshot.
+    pub(crate) fn header_snap(&self) -> super::header::HeaderSnap {
+        let now = self.clock.now();
+        super::header::HeaderSnap {
+            activity: self.activity.clone(),
+            session_label: super::header::session_label(
+                self.session.name.as_deref(),
+                &self.session.title,
+                &self.session.id,
+            ),
+            turn_elapsed_secs: self
+                .turn_started
+                .map(|t| now.saturating_duration_since(t).as_secs()),
+            anim_ms: now.saturating_duration_since(self.header_epoch).as_millis() as u64,
+            folder: self.header_folder.clone(),
+            observing: self.observing,
+            clients: self.attached_clients,
+        }
+    }
+
     /// Advance spinner/animation state.
     ///
     /// Returns true only when text generated from `render_lines` may have changed
-    /// and the cached message lines must be rebuilt. Full-screen overlays and
+    /// and the cached message lines must be rebuilt — for the FOCUSED thread's
+    /// transcript, the one on screen (a watched subagent's running tool card
+    /// animates and counts just like main's, #287). Full-screen overlays and
     /// header/panel spinners are redrawn from current state without touching the
     /// message cache, avoiding unnecessary whole-terminal clears on every frame.
     pub(crate) fn advance_animations(&mut self) -> bool {
         self.spinner_frame = self.spinner_frame.wrapping_add(1);
-        if self.spinner_frame % 3 != 0 {
+        if !self.spinner_frame.is_multiple_of(3) {
             return false;
         }
 
-        self.transcript.uses_spinner()
+        super::threads::active(&self.transcript, &self.threads).uses_spinner()
+    }
+
+    /// One animation frame for the message area: advance the spinner and,
+    /// when an animated line (spinner, running tool clock) may have changed,
+    /// have the focused thread's transcript re-render its live slots — every
+    /// running card and the thinking placeholder, wherever they are (a steer,
+    /// a notice or a second card may sit below them), and nothing else. The
+    /// run loop's tick arm calls this once per tick.
+    pub(crate) fn tick_message_animations(&mut self) {
+        if self.advance_animations()
+            && super::threads::active_mut(&mut self.transcript, &mut self.threads).tick_live()
+        {
+            self.needs_redraw = true;
+        }
     }
 
     /// True when a full terminal clear is needed before an animated redraw.
@@ -730,18 +920,21 @@ impl App {
     // these are signature-identical delegates.
 
     /// Delegates to [`TranscriptStore::on_tool_use_start`].
+    #[cfg(any(test, feature = "testing"))] // stream handler drives the store via `apply_transcript_event`
     pub(crate) fn on_tool_use_start(&mut self, tool_id: String, tool_name: String) {
         self.transcript.on_tool_use_start(tool_id, tool_name);
         self.needs_redraw = true;
     }
 
     /// Delegates to [`TranscriptStore::on_tool_use_delta`].
+    #[cfg(any(test, feature = "testing"))] // stream handler drives the store via `apply_transcript_event`
     pub(crate) fn on_tool_use_delta(&mut self, tool_id: &str, delta: &str) {
         self.transcript.on_tool_use_delta(tool_id, delta);
         self.needs_redraw = true;
     }
 
     /// Delegates to [`TranscriptStore::on_tool_use_finalized`].
+    #[cfg(test)] // stream handler drives the store via `apply_transcript_event`
     pub(crate) fn on_tool_use_finalized(
         &mut self,
         tool_id: String,
@@ -754,12 +947,14 @@ impl App {
     }
 
     /// Delegates to [`TranscriptStore::on_tool_result_delta`].
+    #[cfg(test)] // stream handler drives the store via `apply_transcript_event`
     pub(crate) fn on_tool_result_delta(&mut self, tool_id: String, delta: String) {
         self.transcript.on_tool_result_delta(tool_id, delta);
         self.needs_redraw = true;
     }
 
     /// Delegates to [`TranscriptStore::on_tool_result`].
+    #[cfg(test)] // stream handler drives the store via `apply_transcript_event`
     pub(crate) fn on_tool_result(&mut self, tool_id: String, result: String) {
         self.transcript.on_tool_result(tool_id, result);
         self.needs_redraw = true;
@@ -800,11 +995,13 @@ impl App {
         }
     }
 
+    #[cfg(test)] // stream handler drives the store via `apply_transcript_event`
     pub(crate) fn append_or_update_text(&mut self, text: &str) {
         self.transcript.append_or_update_text(text);
         self.needs_redraw = true;
     }
 
+    #[cfg(test)] // stream handler drives the store via `apply_transcript_event`
     pub(crate) fn append_or_update_thinking(&mut self, text: &str) {
         self.transcript.append_or_update_thinking(text);
         self.needs_redraw = true;
@@ -838,6 +1035,7 @@ impl App {
             ("ice", "frozen arctic pale blues"),
             ("forest", "deep greens and browns"),
             ("lavender", "rich purple/violet"),
+            ("paper", "light: dark ink on paper, dark code blocks"),
         ];
 
         if arg.is_empty() {
@@ -929,7 +1127,7 @@ impl App {
             requested,
             std::time::Instant::now(),
         );
-        self.invalidate();
+        self.invalidate_theme();
     }
 
     /// Reconcile the background MXC subscriber with the active theme name.
@@ -1141,10 +1339,10 @@ mod tests {
                 "no borders or shade glyphs: {s:?}"
             );
         }
-        // Panel lines carry a gutter bar ▎ and a unified background.
+        // Panel lines carry a gutter bar ▐ and a unified background.
         let panel_line = lines
             .iter()
-            .find(|l| l.spans.iter().any(|s| s.content.contains('\u{258E}')))
+            .find(|l| l.spans.iter().any(|s| s.content.contains('\u{2590}')))
             .expect("a panel line with a gutter");
         assert!(
             panel_line.spans.iter().any(|s| s.style.bg.is_some()),

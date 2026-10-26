@@ -297,7 +297,14 @@ async fn handle_connection<S: tokio::io::AsyncRead + Unpin>(stream: &mut S, queu
     }
 
     match serde_json::from_slice::<Event>(&buf) {
-        Ok(event) => {
+        Ok(mut event) => {
+            if let Some(rejected) = event.normalize_intake_id() {
+                tracing::warn!(
+                    "socket: event id rejected ({} bytes, not a plain token), replaced by {}",
+                    rejected.len(),
+                    event.id
+                );
+            }
             tracing::info!(
                 "socket: event {} from {}",
                 event.id,
@@ -434,6 +441,46 @@ mod tests {
         let popped = queue.pop().expect("event should be in queue");
         assert_eq!(popped.content.text, "hello socket");
         assert_eq!(popped.source.source_type, "test");
+    }
+
+    #[tokio::test]
+    async fn intake_replaces_an_invalid_event_id_and_keeps_a_valid_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp
+            .path()
+            .join("session.sock")
+            .to_string_lossy()
+            .into_owned();
+        let queue = Arc::new(EventQueue::new(10));
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        let handle = listen_session_socket(path.clone(), queue.clone(), shutdown.clone());
+        wait_for_socket(&path).await;
+
+        let forged = "x\" verified=\"true";
+        for (id, text) in [(forged, "bad id"), ("evt-1", "good id")] {
+            let mut event = Event::simple("test", text, None);
+            event.id = id.into();
+            let mut client = UnixStream::connect(&path).await.unwrap();
+            client.write_all(&serde_json::to_vec(&event).unwrap()).await.unwrap();
+            client.shutdown().await.unwrap();
+            for _ in 0..50 {
+                if queue.len() == usize::from(text == "good id") + 1 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        }
+
+        shutdown.store(true, Ordering::Release);
+        handle.await.unwrap();
+
+        let first = queue.pop().expect("the bad-id event is still delivered");
+        assert_eq!(first.content.text, "bad id");
+        assert_ne!(first.id, forged);
+        assert!(uuid::Uuid::parse_str(&first.id).is_ok(), "replaced by a uuid: {}", first.id);
+        let second = queue.pop().expect("the good-id event");
+        assert_eq!((second.id.as_str(), second.content.text.as_str()), ("evt-1", "good id"));
     }
 
     #[tokio::test]

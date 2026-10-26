@@ -119,6 +119,23 @@ pub trait ExtensionHandler: Send + Sync {
         Err("extension runtime does not support tool.call".to_string())
     }
 
+    /// Call an extension-provided tool on behalf of a conversation.
+    ///
+    /// `session_id` is the owning conversation id (`None` = worker/subagent
+    /// or no conversation). Runtimes that put it on the wire override this;
+    /// the default drops it and calls [`Self::call_tool`], so handlers that
+    /// predate the field (and wrappers that fail closed) keep their exact
+    /// behaviour.
+    async fn call_tool_for(
+        &self,
+        name: &str,
+        input: Value,
+        session_id: Option<&str>,
+    ) -> Result<Value, String> {
+        let _ = session_id;
+        self.call_tool(name, input).await
+    }
+
     /// Complete a chat request through an extension-provided model provider.
     async fn provider_complete(
         &self,

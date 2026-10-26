@@ -40,6 +40,10 @@ pub(super) async fn apply_setting(
     // Resolve (generated from settings/defs.rs). Runtime keys round-trip
     // through `Set{id}`; on Err/rejection: set row_error and do NOT write to
     // config — the value was rejected.
+    // A session setting changed mid-turn lands in the session now, but the
+    // running turn keeps the values its stream copied when it started
+    // (`run_stream_tracked`), in-process and daemon alike: say so.
+    let mut next_turn = false;
     match settings::defs::apply_setting_dispatch(key, value, app) {
         settings::defs::SettingApply::Local(Ok(())) => {}
         settings::defs::SettingApply::Local(Err(msg)) => {
@@ -50,6 +54,7 @@ pub(super) async fn apply_setting(
         }
         settings::defs::SettingApply::Session(setting) => match link.set_checked(setting).await {
             Ok(applied) => {
+                next_turn = app.streaming;
                 if key == "context_window" {
                     // Also update the bar denominator immediately so the UI
                     // reflects the change.
@@ -92,12 +97,31 @@ pub(super) async fn apply_setting(
                 st.row_error = None;
                 st.edit_mode = None;
             }
+            if next_turn {
+                next_turn_notice(key, app);
+            }
         }
         Err(e) => {
             if let Some(st) = app.settings.as_mut() {
                 st.row_error = Some((key.to_string(), e.to_string()));
             }
         }
+    }
+}
+
+/// "<setting> change applies from the next turn": in the transcript and
+/// on the row (a `saved` note, drawn dim).
+fn next_turn_notice(key: &str, app: &mut App) {
+    let label = settings::defs::ALL_SETTINGS
+        .iter()
+        .find(|d| d.key == key)
+        .map_or(key, |d| d.label)
+        .to_lowercase();
+    app.push_msg(ChatMessage::System(format!(
+        "{label} change applies from the next turn"
+    )));
+    if let Some(st) = app.settings.as_mut() {
+        st.row_error = Some((key.to_string(), "saved — applies from the next turn".to_string()));
     }
 }
 
@@ -183,7 +207,7 @@ pub(super) fn rebuild_display_messages(api_messages: &[synaps_cli::SharedMessage
 /// prepends the identical sentinel `cap_resumed_display` produced at
 /// 741b6b60 (same text, same position).
 pub(super) fn apply_display_tail(tail: &agent_engine::session::DisplayTail, app: &mut App) {
-    use agent_engine::engine::interrupt::interruption_label;
+    use agent_engine::engine::interrupt::{interruption_label, tool_in_flight_note_label};
     use agent_engine::session::DisplayItem;
     app.transcript.clear();
     if tail.omitted > 0 {
@@ -198,7 +222,13 @@ pub(super) fn apply_display_tail(tail: &agent_engine::session::DisplayTail, app:
             // the user typed: show it as the aborted line it replaced.
             DisplayItem::User { text } => match interruption_label(text) {
                 Some(label) => ChatMessage::Error(label.to_lowercase()),
-                None => ChatMessage::User(text.clone()),
+                // The host's note about a tool that may have run (a cancel
+                // the engine never reported back on): a system line, as it
+                // was shown live, not something the user typed.
+                None => match tool_in_flight_note_label(text) {
+                    Some(note) => ChatMessage::System(note.to_string()),
+                    None => ChatMessage::User(text.clone()),
+                },
             },
             DisplayItem::Thinking { text } => ChatMessage::Thinking(text.clone()),
             DisplayItem::Text { text } => ChatMessage::Text(text.clone()),
@@ -551,6 +581,31 @@ mod tests {
             super::apply_display_tail(&tail, &mut via_tail);
             assert_eq!(transcript_repr(&old), transcript_repr(&via_tail), "fixture {name} via tail");
         }
+    }
+
+    /// The host's tool-in-flight note replays as a system line (as it was
+    /// shown live), never as text the user typed; the marker stays an error.
+    #[test]
+    fn tool_in_flight_note_replays_as_a_system_line() {
+        use agent_engine::engine::interrupt::{
+            tool_in_flight_note, tool_in_flight_note_message, InterruptReason,
+        };
+        let note = tool_in_flight_note(InterruptReason::User, &["bash".into()]);
+        let history = vec![
+            j(serde_json::json!({"role": "user", "content": "clean up"})),
+            j(serde_json::json!({"role": "assistant", "content": [{"type": "text", "text": "Let me look"}]})),
+            tool_in_flight_note_message(InterruptReason::User, &["bash".into()]),
+            j(serde_json::json!({"role": "user", "content": InterruptReason::User.marker()})),
+        ];
+        let mut app = test_app();
+        rebuild_display_messages(&history, &mut app);
+        let repr = transcript_repr(&app);
+        assert_eq!(repr[..3], ["U|clean up".to_string(), "T|Let me look".into(), format!("S|{}", &note[1..note.len() - 1])]);
+        assert!(!repr.iter().any(|l| l.starts_with("U|[")), "{repr:#?}");
+        assert!(matches!(
+            app.transcript.messages().last().map(|m| &m.msg),
+            Some(ChatMessage::Error(_))
+        ));
     }
 
     #[test]

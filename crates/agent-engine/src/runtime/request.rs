@@ -24,14 +24,18 @@ use crate::SharedMessage;
 /// was a `json!` map — serde_json without `preserve_order` backs `Value`
 /// objects with a BTreeMap, so keys serialized ALPHABETICALLY. Field
 /// declaration order below reproduces exactly that order:
-///   max_tokens, messages, model, [output_config], [stream], [system], thinking, tools
-/// Optional-field PRESENCE must also match: `output_config` only for adaptive
+///   [diagnostics], max_tokens, messages, model, [output_config], [stream], [system], thinking, tools
+/// Optional-field PRESENCE must also match: `diagnostics` only when
+/// `cache_diagnostics` is on (it must stay FIRST — the fail-soft path strips
+/// it as a byte prefix, see `cache_diagnosis::strip_diagnostics`), `output_config` only for adaptive
 /// models with a mapped effort, `stream` only on the streaming transport,
 /// `system` only when `build_system_blocks` returns Some. Guarded by
 /// `runtime::body_golden` — do not reorder fields or change skip conditions
 /// without regenerating fixtures (and accepting fleet-wide cache invalidation).
 #[derive(serde::Serialize)]
 pub(super) struct RequestBody<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    diagnostics: Option<super::cache_diagnosis::DiagnosticsParam>,
     max_tokens: u64,
     messages: &'a [SharedMessage],
     model: &'a str,
@@ -119,6 +123,7 @@ impl<'a> RequestBody<'a> {
             None
         };
         Self {
+            diagnostics: None,
             max_tokens: HelperMethods::max_tokens_for_model(model),
             messages,
             model,
@@ -204,6 +209,14 @@ impl<'a> RequestBody<'a> {
         h.0
     }
 
+    /// Opt this request into Anthropic cache diagnostics.
+    pub(super) fn set_diagnostics(
+        &mut self,
+        diagnostics: super::cache_diagnosis::DiagnosticsParam,
+    ) {
+        self.diagnostics = Some(diagnostics);
+    }
+
     /// The output cap this body will send (keep-warm worst-case pricing).
     pub(super) fn max_tokens(&self) -> u64 {
         self.max_tokens
@@ -285,9 +298,20 @@ impl ApiMethods {
     pub(super) async fn build_auth_header(
         auth: &Arc<RwLock<AuthState>>,
     ) -> (String, String, String) {
-        let (auth_token, auth_type) = {
+        let (name, value, kind, _) = Self::build_auth_snapshot(auth).await;
+        (name, value, kind)
+    }
+
+    pub(super) async fn build_auth_snapshot(
+        auth: &Arc<RwLock<AuthState>>,
+    ) -> (String, String, String, Option<String>) {
+        let (auth_token, auth_type, binding) = {
             let a = auth.read().await;
-            (a.auth_token.clone(), a.auth_type.clone())
+            (
+                a.auth_token.clone(),
+                a.auth_type.clone(),
+                a.bound_credential.clone(),
+            )
         };
         let (name, value) = if auth_type == "oauth" {
             (
@@ -297,7 +321,7 @@ impl ApiMethods {
         } else {
             ("x-api-key".to_string(), auth_token)
         };
-        (name, value, auth_type)
+        (name, value, auth_type, binding)
     }
 
     /// Build the `anthropic-beta` header value. Returns `None` when no beta
@@ -306,7 +330,8 @@ impl ApiMethods {
     /// The extended-cache-ttl token is added ONLY for API-key auth: the live
     /// probe confirmed 1h TTL is honored bare over OAuth, and the OAuth beta
     /// set is part of the pool-routing fingerprint — we do not perturb it for
-    /// a feature that works without it (spec §3.4).
+    /// a feature that works without it (spec §3.4). The cache-diagnosis token
+    /// follows the same rule (probed: diagnostics are honored bare on OAuth).
     pub(super) fn build_beta_header(
         auth_type: &str,
         options: &ApiOptions,
@@ -322,6 +347,9 @@ impl ApiMethods {
         }
         if auth_type != "oauth" && options.cache_ttl != crate::core::config::CacheTtl::FiveMinutes {
             betas.push("extended-cache-ttl-2025-04-11");
+        }
+        if super::cache_diagnosis::wants_beta_header(auth_type, options) {
+            betas.push(super::cache_diagnosis::CACHE_DIAGNOSIS_BETA);
         }
         if betas.is_empty() {
             None

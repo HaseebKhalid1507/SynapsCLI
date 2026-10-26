@@ -2,7 +2,7 @@
 name = "synaps-core"
 version.workspace = true
 edition = "2021"
-rust-version = "1.80"
+rust-version = "1.88"
 description = "Foundation types, config, session, auth, protocol — leaf crate for agent-runtime"
 license = "Apache-2.0"
 
@@ -31,6 +31,7 @@ chrono             = { version = "0.4", features = ["serde"] }
 thiserror          = "1.0"
 dirs               = "5"
 fs4                = "0.13"
+memchr             = "2"
 axum               = { version = "0.7", features = ["ws"] }
 url                = "2"
 urlencoding        = "2"

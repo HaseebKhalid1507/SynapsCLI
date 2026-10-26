@@ -130,6 +130,7 @@ impl ConfirmedUserIntent {
             UserIntentProof::ExplicitCommand { command_id } => command_id.as_str(),
             UserIntentProof::ConfirmedPrompt { confirmation_id } => confirmation_id.as_str(),
             UserIntentProof::ExactCurrentRequest { .. } => "exact-current-request",
+            UserIntentProof::OperatorConfig => "operator-config",
         }
     }
 
@@ -1329,6 +1330,8 @@ mod tests {
                 session_cost: 0.0,
                 keepwarm_cost: 0.0,
                 keepwarm_tokens: Default::default(),
+                total_cache_read_tokens: 0,
+                total_cache_creation_tokens: 0,
                 message_count: 0,
                 api_messages: vec![
                     Arc::new(json!({"role": "user", "content": user})),

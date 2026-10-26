@@ -12,9 +12,9 @@ use agent_core::reasoning::ReasoningLevel;
 
 use super::{
     anthropic_static_capability, capability_cache, codex_static_capability, kimi_code_capability,
-    kimi_static_capability, plan_codex_execution, xai_static_capability, CatalogProviderKind,
-    CodexMultiAgentVersion, CodexRequestRole, KimiReasoningCapability, ReasoningSupport,
-    XaiReasoningCapability,
+    kimi_static_capability, muse_default_level, muse_routable_id, muse_supported_levels,
+    plan_codex_execution, xai_static_capability, CatalogProviderKind, CodexMultiAgentVersion,
+    CodexRequestRole, KimiReasoningCapability, ReasoningSupport, XaiReasoningCapability,
 };
 
 /// Conservative option set for providers without authoritative exact-model
@@ -95,6 +95,26 @@ fn anthropic_capability(model_id: &str) -> Option<ReasoningSupport> {
 /// (command/settings). `Err` carries a user-facing message; callers must not
 /// mutate state or persist config on `Err`.
 pub fn validate_reasoning_mutation(model: &str, level: ReasoningLevel) -> Result<(), String> {
+    if let Some(model_id) = model.strip_prefix("muse/") {
+        // Adaptive = provider default (omit `reasoning`) — always expressible
+        // on a routable id. Named levels need the exact live effort set.
+        if !muse_routable_id(model_id) {
+            return Err(format!(
+                "no capability metadata for {model}; cannot authorize level '{level}'"
+            ));
+        }
+        if level == ReasoningLevel::Adaptive {
+            return Ok(());
+        }
+        return match muse_supported_levels(model_id) {
+            Some(levels) if levels.contains(&level) => Ok(()),
+            Some(levels) => Err(unsupported_msg(level, model, &levels)),
+            None => Err(format!(
+                "{model} has no advertised effort levels (live Muse catalog not loaded, or the \
+                 model has none); level '{level}' cannot be sent — use adaptive"
+            )),
+        };
+    }
     if let Some(model_id) = model.strip_prefix("openai-codex/") {
         // Off/Adaptive omit the provider effort field on the Codex wire.
         if matches!(level, ReasoningLevel::Off | ReasoningLevel::Adaptive) {
@@ -246,6 +266,11 @@ pub fn validate_reasoning_mutation(model: &str, level: ReasoningLevel) -> Result
 /// Model-default reasoning level applied on model switch when the user has
 /// not explicitly chosen a level. `None` = leave the current level untouched.
 pub fn default_level_for_model(model: &str) -> Option<ReasoningLevel> {
+    if let Some(model_id) = model.strip_prefix("muse/") {
+        // Live catalog default (what the official client sends) when the
+        // exact row advertised one; otherwise provider default via omission.
+        return Some(muse_default_level(model_id).unwrap_or(ReasoningLevel::Adaptive));
+    }
     if let Some(model_id) = model.strip_prefix("openai-codex/") {
         return match codex_reasoning_capability(model, model_id)? {
             ReasoningSupport::CodexNamed { default_level, .. } => default_level,
@@ -281,6 +306,13 @@ pub fn default_level_for_model(model: &str) -> Option<ReasoningLevel> {
 /// cache first, then exact static descriptors). Never claims a verified type
 /// for providers without authoritative metadata.
 pub fn reasoning_type_for_model(model: &str) -> &'static str {
+    if let Some(model_id) = model.strip_prefix("muse/") {
+        return if muse_supported_levels(model_id).is_some() {
+            "effort (named)"
+        } else {
+            "unknown"
+        };
+    }
     if model.strip_prefix("openai-codex/").is_some() {
         // Codex always expresses reasoning as named effort on the wire.
         return "effort (named)";
@@ -317,6 +349,23 @@ pub fn reasoning_type_for_model(model: &str) -> &'static str {
 /// catalog/static capabilities for the provider-qualified model id.
 pub fn thinking_options_for_model(model: &str) -> Vec<String> {
     let owned = |slice: &[&str]| slice.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    if let Some(model_id) = model.strip_prefix("muse/") {
+        // Exactly what validation authorizes: adaptive + the live effort set
+        // (`off` appears only when the catalog advertised `none`).
+        let mut opts = vec!["adaptive".to_string()];
+        if let Some(levels) = muse_supported_levels(model_id) {
+            if levels.contains(&ReasoningLevel::Off) {
+                opts.insert(0, "off".to_string());
+            }
+            opts.extend(
+                levels
+                    .iter()
+                    .filter(|l| **l != ReasoningLevel::Off)
+                    .map(|l| l.as_str().to_string()),
+            );
+        }
+        return opts;
+    }
     if let Some(model_id) = model.strip_prefix("openai-codex/") {
         if let Some(levels) = codex_supported_levels(model, model_id) {
             let mut opts = vec!["off".to_string(), "adaptive".to_string()];
@@ -411,6 +460,45 @@ pub fn thinking_options_for_model(model: &str) -> Vec<String> {
 mod tests {
     use super::*;
     use ReasoningLevel::*;
+
+    #[test]
+    fn muse_levels_follow_exact_live_catalog_and_fail_closed_otherwise() {
+        let _guard = crate::runtime::openai::catalog::muse::test_cache_guard();
+        // Static seed: only the provider default is expressible.
+        let seed = "muse/muse-wonder-1.0";
+        assert!(validate_reasoning_mutation(seed, Adaptive).is_ok());
+        for level in [Off, Low, High, Max, Ultra] {
+            assert!(validate_reasoning_mutation(seed, level).is_err(), "{level}");
+        }
+        assert_eq!(thinking_options_for_model(seed), ["adaptive"]);
+        assert_eq!(default_level_for_model(seed), Some(Adaptive));
+        // Uncataloged (routable) id: provider default only.
+        assert!(validate_reasoning_mutation("muse/never-cataloged-zz9", Adaptive).is_ok());
+        assert!(validate_reasoning_mutation("muse/never-cataloged-zz9", High).is_err());
+        // Malformed id: nothing, not even adaptive, is authorized.
+        assert!(validate_reasoning_mutation("muse/Bad Id", Adaptive).is_err());
+
+        // A live row with an exact effort set authorizes exactly that set.
+        let models = crate::runtime::openai::catalog::parse_muse_catalog_models(
+            r#"{"models":[{"id":"muse-validation-probe-zz1","reasoning_effort_variants":
+                [{"effort":"none"},{"effort":"low"},{"effort":"high"}]}]}"#,
+        )
+        .unwrap();
+        capability_cache::replace_provider("muse", &models);
+        let live = "muse/muse-validation-probe-zz1";
+        for level in [Adaptive, Off, Low, High] {
+            assert!(validate_reasoning_mutation(live, level).is_ok(), "{level}");
+        }
+        for level in [Medium, XHigh, Max, Ultra, UltraCode] {
+            assert!(validate_reasoning_mutation(live, level).is_err(), "{level}");
+        }
+        assert_eq!(
+            thinking_options_for_model(live),
+            ["off", "adaptive", "low", "high"]
+        );
+        assert_eq!(reasoning_type_for_model(live), "effort (named)");
+        capability_cache::replace_provider("muse", &[]);
+    }
 
     #[test]
     fn fable_options_expose_distinct_special_modes() {
@@ -777,16 +865,21 @@ mod tests {
 
     #[test]
     fn kimi_k3_accepts_exact_efforts_and_rejects_off_medium_xhigh_ultra() {
-        let model = "kimi/kimi-k3";
-        for level in [Adaptive, Low, High, Max] {
-            assert!(
-                validate_reasoning_mutation(model, level).is_ok(),
-                "{model} {level}"
-            );
-        }
-        for level in [Off, Medium, XHigh, Ultra, UltraCode] {
-            let err = validate_reasoning_mutation(model, level).unwrap_err();
-            assert!(err.contains("kimi"), "{err}");
+        for model in [
+            "kimi/kimi-k3",
+            "kimi/kimi-k3.1-pro",
+            "kimi/kimi-k3.1-pro-highspeed",
+        ] {
+            for level in [Adaptive, Low, High, Max] {
+                assert!(
+                    validate_reasoning_mutation(model, level).is_ok(),
+                    "{model} {level}"
+                );
+            }
+            for level in [Off, Medium, XHigh, Ultra, UltraCode] {
+                let err = validate_reasoning_mutation(model, level).unwrap_err();
+                assert!(err.contains("kimi"), "{model}: {err}");
+            }
         }
     }
 
@@ -838,10 +931,17 @@ mod tests {
 
     #[test]
     fn kimi_options_are_exact_per_model() {
-        assert_eq!(
-            thinking_options_for_model("kimi/kimi-k3"),
-            vec!["adaptive", "low", "high", "max"]
-        );
+        for model in [
+            "kimi/kimi-k3",
+            "kimi/kimi-k3.1-pro",
+            "kimi/kimi-k3.1-pro-highspeed",
+        ] {
+            assert_eq!(
+                thinking_options_for_model(model),
+                vec!["adaptive", "low", "high", "max"],
+                "{model}"
+            );
+        }
         for model in ["kimi/kimi-k2.7-code", "kimi/kimi-k2.7-code-highspeed"] {
             assert_eq!(
                 thinking_options_for_model(model),
@@ -864,17 +964,24 @@ mod tests {
 
     #[test]
     fn kimi_reasoning_types_and_default_level() {
-        assert_eq!(reasoning_type_for_model("kimi/kimi-k3"), "effort");
+        for model in [
+            "kimi/kimi-k3",
+            "kimi/kimi-k3.1-pro",
+            "kimi/kimi-k3.1-pro-highspeed",
+        ] {
+            assert_eq!(reasoning_type_for_model(model), "effort", "{model}");
+            assert_eq!(
+                default_level_for_model(model),
+                Some(ReasoningLevel::Max),
+                "{model}"
+            );
+        }
         assert_eq!(reasoning_type_for_model("kimi/kimi-k2.7-code"), "intrinsic");
         assert_eq!(
             reasoning_type_for_model("kimi/kimi-k2.6"),
             "toggle (on/off)"
         );
         assert_eq!(reasoning_type_for_model("kimi/kimi-k9000"), "unknown");
-        assert_eq!(
-            default_level_for_model("kimi/kimi-k3"),
-            Some(ReasoningLevel::Max)
-        );
         assert_eq!(
             default_level_for_model("kimi/kimi-k2.6"),
             Some(ReasoningLevel::Adaptive)

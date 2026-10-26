@@ -276,6 +276,54 @@ pub enum UserIntentProof {
         /// Digest of that exact user message.
         user_message_digest: MessageDigest,
     },
+    /// The operator's durable default (spec §12): a non-off
+    /// `memory.default_mode` together with `memory.default_mode_confirmed =
+    /// true`, hand-written in the same config file. Minted only by the host
+    /// when it starts a foreground session; never from model or plugin text.
+    OperatorConfig,
+}
+
+#[cfg(any(test, feature = "testing"))]
+static PROVIDER_UNAVAILABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Test seam: whether provider resolution should answer as if the context
+/// provider were not registered yet (an extension-backed provider during
+/// discovery after a daemon start or reload). Code-only and compiled only
+/// under `cfg(test)` / the `testing` feature, like the keep-warm interval
+/// override: no binary input can reach it. A constant `false` otherwise.
+pub(crate) fn provider_unavailable_for_test() -> bool {
+    #[cfg(any(test, feature = "testing"))]
+    {
+        if PROVIDER_UNAVAILABLE.load(std::sync::atomic::Ordering::Relaxed) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Test-only controls (`cfg(test)` / `testing` feature).
+#[cfg(any(test, feature = "testing"))]
+pub mod testing {
+    use std::sync::atomic::Ordering;
+
+    /// While alive, every memory grant in this process fails as
+    /// `ProviderNotRegistered` (tests that use it must be `#[serial]`).
+    #[must_use = "the provider comes back when the guard drops"]
+    pub struct ProviderUnavailable(());
+
+    impl ProviderUnavailable {
+        pub fn set() -> Self {
+            super::PROVIDER_UNAVAILABLE.store(true, Ordering::Relaxed);
+            Self(())
+        }
+    }
+
+    impl Drop for ProviderUnavailable {
+        fn drop(&mut self) {
+            super::PROVIDER_UNAVAILABLE.store(false, Ordering::Relaxed);
+        }
+    }
 }
 
 /// Mint one host-owned `ExplicitCommand` intent proof for a `/memory`

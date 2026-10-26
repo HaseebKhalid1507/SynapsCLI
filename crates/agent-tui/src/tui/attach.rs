@@ -1,4 +1,5 @@
-//! `synaps --attach [ID] [--observe|--takeover] [--keep-warm]` — the TUI
+//! `synaps --attach [ID] [--observe|--takeover] [--keep-warm]
+//! [--no-confirm-answers]` — the TUI
 //! over `SocketTransport` (PLAN-phase3 A4). Client diet: no `EngineHost`,
 //! no `Runtime`, no `ExtensionManager`, no MCP, no skills index — config,
 //! builtin commands, keybinds, the render thread and the event stream only.
@@ -11,8 +12,8 @@ use std::sync::Arc;
 use agent_engine::session::socket_transport::SocketTransport;
 use agent_engine::session::wire::{Attach, Hello};
 use agent_engine::session::{
-    AttachMode, ClientKind, ClientTransport, CompactionPolicyWire, HistoryMode, SessionCommand,
-    SessionConfig, SessionId, TransportError,
+    AttachMode, ClientKind, ClientTransport, CompactionPolicyWire, EndReason, HistoryMode,
+    SessionCommand, SessionConfig, SessionId, TransportError,
 };
 use synaps_cli::skills::registry::CommandRegistry;
 use synaps_cli::skills::BUILTIN_COMMANDS;
@@ -37,6 +38,11 @@ pub struct AttachOpts {
     pub system: Option<String>,
     pub prompt_manifest: Option<PathBuf>,
     pub mode: AttachMode,
+    /// `--no-confirm-answers`: never answer confirm prompts (tool-call and
+    /// tool-activation approvals) from this TUI, whatever keys reach it;
+    /// they are only listed as waiting for another client. Secret prompts
+    /// are still typed here.
+    pub no_confirm_answers: bool,
     pub keep_warm: bool,
     /// `--new`/`--create`: always create a fresh session even if one is
     /// live. Rejected together with an explicit `id`.
@@ -44,6 +50,9 @@ pub struct AttachOpts {
     /// `--name`: name the created session (`synaps send --session <name>`
     /// resolves it at once).
     pub name: Option<String>,
+    /// `--as`: what this client is called in the session; `None` =
+    /// `SYNAPS_CLIENT_NAME`, else the daemon's default (`tui`, `tui-2`, …).
+    pub client_name: Option<String>,
     /// A plain `synaps` adopted a running daemon (no explicit `--attach`):
     /// after attaching, show what else lives in this daemon so parked
     /// work stays discoverable (F1).
@@ -65,6 +74,9 @@ struct AttachNoticeInputs<'a> {
     /// The daemon's other sessions ([`adopt_banner`]), adopt only.
     others_banner: Option<String>,
     config_warnings: &'a [String],
+    /// `Some(notice)` when this client's binary differs from the daemon's
+    /// ([`version_skew_notice`](agent_engine::session::transport::version_skew_notice)).
+    version_skew: Option<String>,
 }
 
 /// Attach notes, split by whether they need the user.
@@ -91,8 +103,16 @@ fn attach_notices(i: AttachNoticeInputs<'_>) -> AttachNotices {
     for w in i.config_warnings {
         out.transcript.push(format!("⚠ config: {w}"));
     }
+    if let Some(skew) = i.version_skew {
+        out.transcript.push(format!("⚠ {skew}"));
+    }
     let attached = format!("attached to {} as client #{} ({:?})", i.session_id, i.client_id, i.mode);
     match i.owned_elsewhere {
+        // Read-only until it takes over: `/takeover` does it from here
+        // (never offered to an observer, whose `/takeover` is refused).
+        Some(owned) if i.mode != AttachMode::Observe => {
+            out.transcript.push(format!("{attached} — {owned}, or /takeover here"))
+        }
         Some(owned) => out.transcript.push(format!("{attached} — {owned}")),
         None => out.toast.insert(0, attached),
     }
@@ -238,6 +258,45 @@ pub fn attach_mode(observe: bool, takeover: bool) -> AttachMode {
     }
 }
 
+/// The version-skew notice for this daemon, once per daemon build: a
+/// reconnect to the same daemon binary (a crash restart, a `daemon reload`
+/// onto the same build) does not post it again (04-tui M8).
+pub(super) fn skew_notice_once(
+    app: &mut super::app::App,
+    daemon: agent_engine::session::transport::BinaryId,
+    session: &str,
+) -> Option<String> {
+    use agent_engine::session::transport::{version_skew_notice, BinaryId};
+    if app.skew_noticed.as_ref() == Some(&daemon) {
+        return None;
+    }
+    let notice = version_skew_notice(&BinaryId::this(), &daemon, session)?;
+    app.skew_noticed = Some(daemon);
+    Some(notice)
+}
+
+/// What a daemon-session TUI prints on stderr after it exits because the
+/// session ended under it (`Ended`): `/close` here or on another client,
+/// `daemon stop`, an eviction. The alternate screen is gone by then, so this
+/// is the only place the user can still read which session it was and how
+/// to bring it back. A session with no history (`has_history` false) has
+/// no journal, so there is nothing to continue; `None` for one the daemon
+/// ended for exactly that reason (`Idle`).
+pub(super) fn session_ended_line(reason: EndReason, session: &str, has_history: bool) -> Option<String> {
+    let what = match reason {
+        EndReason::ClientQuit => "was closed",
+        EndReason::HostShutdown => "ended: the daemon shut down",
+        EndReason::Evicted => "was evicted from the daemon",
+        EndReason::Error => "ended after an error",
+        EndReason::Idle => return None,
+    };
+    Some(if has_history {
+        format!("synaps: session {session} {what}; resume it with: synaps --attach --continue {session}")
+    } else {
+        format!("synaps: session {session} {what} (it never ran a turn, so there is nothing to resume)")
+    })
+}
+
 fn cfg_err(e: impl std::fmt::Display) -> synaps_cli::RuntimeError {
     synaps_cli::RuntimeError::Config(e.to_string())
 }
@@ -268,7 +327,12 @@ pub async fn run_attached(mut opts: AttachOpts) -> Result<()> {
             None,
         )));
     }
+    let client_name = opts.client_name.clone().or_else(agent_engine::session::client_name_from_env);
+    if let Some(name) = client_name.as_deref() {
+        agent_engine::session::validate_client_name(name).map_err(cfg_err)?;
+    }
     let hello = Hello::new(ClientKind::Tui)
+        .with_name(client_name)
         .with_history(HistoryMode::from_env_or(HistoryMode::attach_client_default()));
     let conn = match SocketTransport::connect(&paths.sock, hello).await {
         Ok(c) => c,
@@ -287,6 +351,11 @@ pub async fn run_attached(mut opts: AttachOpts) -> Result<()> {
         }
         Err(e) => return Err(cfg_err(format!("connect: {e}"))),
     };
+    if let Some(msg) =
+        agent_engine::daemon::profile_mismatch(conn.welcome.profile.as_deref(), opts.profile.as_deref())
+    {
+        return Err(cfg_err(msg));
+    }
     ladder(
         "connect",
         &format_args!("sessions={}", conn.welcome.sessions.len()),
@@ -370,6 +439,8 @@ pub async fn run_attached(mut opts: AttachOpts) -> Result<()> {
     }
 
     let mut app = app_from_snapshot(&snapshot);
+    app.observing = transport.mode() == AttachMode::Observe;
+    app.attached_clients = transport.roster().clients().len();
     let (msgs, bytes) = super::app::scrollback_from_env(&TransportMode::Socket);
     app.transcript.set_scrollback(msgs, bytes);
     ladder("app", &"");
@@ -389,6 +460,11 @@ pub async fn run_attached(mut opts: AttachOpts) -> Result<()> {
             None
         },
         config_warnings: &config.warnings,
+        version_skew: skew_notice_once(
+            &mut app,
+            agent_engine::session::transport::BinaryId::of(&transport.welcome),
+            snapshot.meta.id.as_str(),
+        ),
     });
     for n in notices.transcript {
         app.push_msg(ChatMessage::System(n));
@@ -404,6 +480,7 @@ pub async fn run_attached(mut opts: AttachOpts) -> Result<()> {
     // the actor's pending prompts.
     let replay = snapshot.replay.clone();
     let pending = snapshot.pending_prompts.clone();
+    let owns_input = super::session_link::may_drive(&transport);
     app.streaming = snapshot.streaming;
 
     let mut ctx = finish_setup(
@@ -420,6 +497,14 @@ pub async fn run_attached(mut opts: AttachOpts) -> Result<()> {
     .await?;
     // No extension host in this process: the loader arm never runs.
     ctx.app.extension_loader_running = false;
+    // Before any prompt is fed: the replay and the pending prompts below.
+    // An observer's confirm answers are refused by the session (#148 C2),
+    // so it never opens the approval pane either.
+    ctx.prompt_bridge.set_owns_input(owns_input);
+    if opts.no_confirm_answers || opts.mode == AttachMode::Observe {
+        ctx.prompt_bridge
+            .set_confirm_policy(super::session_link::ConfirmPolicy::ViewOnly);
+    }
     for env in replay {
         // Presentation only; a render handle is not needed for correctness.
         let _ = super::stream_handler::handle_session_event_arm(
@@ -436,6 +521,7 @@ pub async fn run_attached(mut opts: AttachOpts) -> Result<()> {
     for pr in pending {
         ctx.prompt_bridge.on_prompt(pr);
     }
+    super::stream_handler::sync_waiting_confirms(&mut ctx.app, &ctx.prompt_bridge);
     ladder("replay", &"");
     if opts.keep_warm {
         let _ = ctx.link.send(SessionCommand::KeepWarm { on: true }).await;
@@ -447,6 +533,26 @@ pub async fn run_attached(mut opts: AttachOpts) -> Result<()> {
 mod tests {
     use super::*;
 
+    /// The line a TUI leaves on stderr when its daemon session ended under
+    /// it names the session and how to continue it; a session that never
+    /// ran a turn has nothing to continue.
+    #[test]
+    fn an_ended_session_says_how_to_continue_it() {
+        let line = session_ended_line(EndReason::ClientQuit, "20261014-183459-3f61", true).unwrap();
+        assert_eq!(
+            line,
+            "synaps: session 20261014-183459-3f61 was closed; resume it with: \
+             synaps --attach --continue 20261014-183459-3f61"
+        );
+        let stop = session_ended_line(EndReason::HostShutdown, "s1", true).unwrap();
+        assert!(stop.contains("the daemon shut down") && stop.ends_with("--continue s1"), "{stop}");
+        assert!(session_ended_line(EndReason::Evicted, "s1", true).unwrap().contains("evicted"));
+        assert!(session_ended_line(EndReason::Error, "s1", true).unwrap().contains("error"));
+        let empty = session_ended_line(EndReason::ClientQuit, "s1", false).unwrap();
+        assert_eq!(empty, "synaps: session s1 was closed (it never ran a turn, so there is nothing to resume)");
+        assert_eq!(session_ended_line(EndReason::Idle, "s1", true), None);
+    }
+
     fn notice_inputs<'a>(id: &'a SessionId, warnings: &'a [String]) -> AttachNoticeInputs<'a> {
         AttachNoticeInputs {
             session_id: id,
@@ -456,6 +562,7 @@ mod tests {
             adopted: None,
             others_banner: None,
             config_warnings: warnings,
+            version_skew: None,
         }
     }
 
@@ -491,12 +598,62 @@ mod tests {
         assert_eq!(n.transcript, vec![
             "2 other sessions in this daemon".to_string(),
             "⚠ config: unknown key `fooo`".to_string(),
-            "attached to 20261001-000000-ours as client #1 (Mirror) — input is owned by client #3 (tui)"
+            "attached to 20261001-000000-ours as client #1 (Mirror) — input is owned by client #3 (tui), or /takeover here"
                 .to_string(),
         ]);
         // read-only attach: the attach line is in the transcript, not the toast
         assert!(n.toast.iter().all(|l| !l.starts_with("attached to")), "{n:?}");
         assert_eq!(n.toast[0], "adopted the running daemon (fresh session)");
+    }
+
+    /// An observer is read-only on purpose: its attach line never offers
+    /// `/takeover` (the session refuses it from an observer).
+    #[test]
+    fn an_observer_is_not_offered_takeover() {
+        let id = SessionId::from("20261001-000000-ours".to_string());
+        let n = attach_notices(AttachNoticeInputs {
+            mode: AttachMode::Observe,
+            owned_elsewhere: Some("input is owned by client #3 (tui)".to_string()),
+            ..notice_inputs(&id, &[])
+        });
+        assert_eq!(n.transcript, vec![
+            "attached to 20261001-000000-ours as client #1 (Observe) — input is owned by client #3 (tui)"
+                .to_string(),
+        ]);
+    }
+
+    #[test]
+    fn a_client_older_than_the_daemon_says_so_in_the_transcript() {
+        let id = SessionId::from("20261001-000000-ours".to_string());
+        use agent_engine::session::transport::{version_skew_notice, BinaryId};
+        let bin = |version: &str| BinaryId { version: version.into(), build: String::new() };
+        let skew = version_skew_notice(&bin("0.10.1"), &bin("0.10.2"), id.as_str());
+        let n = attach_notices(AttachNoticeInputs { version_skew: skew, ..notice_inputs(&id, &[]) });
+        assert_eq!(n.transcript.len(), 1, "{n:?}");
+        assert!(n.transcript[0].starts_with("⚠ this client is synaps 0.10.1 but the daemon is 0.10.2"), "{n:?}");
+        assert!(n.transcript[0].contains("synaps --attach 20261001-000000-ours"), "{n:?}");
+        // same binary: nothing extra
+        let same = version_skew_notice(&bin("0.10.2"), &bin("0.10.2"), id.as_str());
+        let n = attach_notices(AttachNoticeInputs { version_skew: same, ..notice_inputs(&id, &[]) });
+        assert!(n.transcript.is_empty(), "{n:?}");
+    }
+
+    /// 04-tui M8: the skew line was posted again on every reconnect, crash
+    /// reconnects included. It shows once per daemon build.
+    #[test]
+    fn the_skew_notice_shows_once_per_daemon_build() {
+        use agent_engine::session::transport::BinaryId;
+        let mut app = crate::tui::app::App::new(synaps_cli::Session::new("test-model", "low", None));
+        let daemon = |build: &str| BinaryId { version: "0.0.1".into(), build: build.into() };
+        assert!(skew_notice_once(&mut app, daemon("aaaa1111"), "s").is_some());
+        assert!(
+            skew_notice_once(&mut app, daemon("aaaa1111"), "s").is_none(),
+            "a reconnect to the same daemon build says nothing again"
+        );
+        assert!(
+            skew_notice_once(&mut app, daemon("bbbb2222"), "s").is_some(),
+            "a reload onto another daemon build warns again"
+        );
     }
 
     #[test]
@@ -518,9 +675,11 @@ mod tests {
             system: None,
             prompt_manifest: None,
             mode: AttachMode::Mirror,
+            no_confirm_answers: false,
             keep_warm: false,
             new_session,
             name: None,
+            client_name: None,
             adopted: false,
         }
     }
@@ -539,8 +698,18 @@ mod tests {
             clients,
             input_owner: None,
             awaiting_input: 0,
+            roster: Vec::new(),
+            client_input: None,
             journal_id: String::new(),
             locked_by: None,
+            pinned: false,
+            busy: false,
+            state_since: None,
+            park_due: None,
+            evict_due: None,
+            title: None,
+            cost_usd: 0.0,
+            messages: 0,
         }
     }
 

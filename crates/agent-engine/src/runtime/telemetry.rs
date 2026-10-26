@@ -20,8 +20,8 @@ pub mod writer;
 
 pub use writer::{
     default_telemetry_log_path, default_trace_log_path, ShutdownOutcome, TelemetryWriter,
-    WriterOptions, WriterStats, WriterTraceSink, DEFAULT_MAX_FILE_BYTES, DEFAULT_QUEUE_CAPACITY,
-    DEFAULT_SHUTDOWN_FLUSH_TIMEOUT,
+    WriteGate, WriterOptions, WriterStats, WriterTraceSink, DEFAULT_MAX_FILE_BYTES,
+    DEFAULT_QUEUE_CAPACITY, DEFAULT_SHUTDOWN_FLUSH_TIMEOUT,
 };
 
 /// Telemetry verbosity level, parsed from the `telemetry` config key.
@@ -53,6 +53,19 @@ impl TelemetryLevel {
             Self::Full => "full",
         }
     }
+}
+
+/// The parent session's telemetry, handed to the subagents it spawns.
+///
+/// Workers record at the parent's level and enqueue onto the parent's
+/// session writer instead of starting their own: the writer owns its log
+/// files from a single thread, so a writer per worker would race rotation.
+/// See `Runtime::inherit_telemetry`.
+#[derive(Debug, Clone, Default)]
+pub struct WorkerTelemetry {
+    pub level: TelemetryLevel,
+    /// The parent's session writer. `None` when the parent records nothing.
+    pub writer: Option<TelemetryWriter>,
 }
 
 /// Token usage for one API call, including the cache-creation TTL breakdown.
@@ -170,6 +183,11 @@ pub struct TelemetryRecord {
     /// can separate pings from real turns. Absent on every turn record.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub keepwarm: bool,
+    /// `true` when a subagent (worker runtime) made the request, so reports
+    /// can split delegated traffic from the foreground session. Absent on
+    /// foreground and internal records.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub worker: bool,
 }
 
 impl TelemetryRecord {
@@ -346,6 +364,7 @@ mod tests {
         assert!(!json.contains("ratelimit"));
         assert!(!json.contains("cache_diag"));
         assert!(!json.contains("keepwarm"), "turn records carry no keepwarm field");
+        assert!(!json.contains("worker"), "foreground records carry no worker field");
         assert!(json.contains("\"model\":\"claude-sonnet-4-6\""));
     }
 
@@ -359,6 +378,18 @@ mod tests {
         };
         let json = serde_json::to_string(&record).unwrap();
         assert!(json.contains("\"keepwarm\":true"), "{json}");
+    }
+
+    #[test]
+    fn worker_record_is_marked() {
+        let record = TelemetryRecord {
+            ts: 1,
+            model: "claude-opus-5-5".to_string(),
+            worker: true,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&record).unwrap();
+        assert!(json.contains("\"worker\":true"), "{json}");
     }
 
     #[test]
@@ -524,5 +555,23 @@ mod retry_delay_tests {
             d
         );
         assert!(from_hdr);
+    }
+}
+
+/// Headerless network retry delay. Bounded even for arbitrarily large config
+/// values; matches the streaming error path's 64-second ceiling.
+pub(super) fn network_retry_delay(attempt: u32) -> Duration {
+    Duration::from_secs(1u64 << attempt.saturating_sub(1).min(6))
+}
+
+#[cfg(test)]
+mod network_backoff_tests {
+    #[test]
+    fn configured_large_retry_counts_never_overflow() {
+        let seconds: Vec<_> = [0, 1, 2, 3, 7, 8, u32::MAX]
+            .into_iter()
+            .map(|n| super::network_retry_delay(n).as_secs())
+            .collect();
+        assert_eq!(seconds, [1, 1, 2, 4, 64, 64, 64]);
     }
 }

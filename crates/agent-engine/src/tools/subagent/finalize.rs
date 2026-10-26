@@ -87,6 +87,71 @@ pub fn build_completion_event(
     }
 }
 
+/// The wake a new daemon image posts for a worker carried over a reload
+/// (`SessionCommand::AdoptWorkers`): stopped mid-run by the reload, or
+/// finished with its completion wake still queued when the exec discarded
+/// the queue. Same shape as [`build_completion_event`], so it routes, wakes
+/// and renders like one.
+pub fn build_reload_carry_event(w: &crate::runtime::subagent::CarriedWorker) -> Event {
+    use serde_json::json;
+    let agent = if w.agent.is_empty() { "subagent" } else { w.agent.as_str() };
+    let id = w.id.as_str();
+    let mut ev = if w.stopped_by_reload {
+        let resume = if w.archive_path.is_some() {
+            format!(
+                "Its conversation is archived: subagent_resume with handle_id \"{id}\" continues it \
+                 where it stopped (its last tool call reads as canceled — it may have partially run); \
+                 subagent_collect reads its partial result."
+            )
+        } else {
+            format!(
+                "It did not stop in time to archive this run, so subagent_resume with handle_id \"{id}\" \
+                 continues from its previous archive or restarts it from its task."
+            )
+        };
+        let text = format!(
+            "Subagent '{agent}' ({id}) was stopped after {}s by a daemon reload, not by the user, \
+             and is no longer running. {resume} Preview: {}",
+            w.elapsed_secs, w.preview
+        );
+        let mut ev = build_completion_event(
+            id,
+            w.subagent_id,
+            agent,
+            &SubagentStatus::Cancelled,
+            &w.preview,
+            w.elapsed_secs as f64,
+            None,
+        );
+        ev.content.text = text;
+        if let Some(data) = ev.content.data.as_mut() {
+            data["stopped_by"] = json!("daemon_reload");
+        }
+        ev
+    } else {
+        let status = match w.status.as_str() {
+            "completed" => SubagentStatus::Completed,
+            "timed_out" => SubagentStatus::TimedOut,
+            "cancelled" => SubagentStatus::Cancelled,
+            other => SubagentStatus::Failed(other.to_string()),
+        };
+        build_completion_event(
+            id,
+            w.subagent_id,
+            agent,
+            &status,
+            &w.preview,
+            w.elapsed_secs as f64,
+            None,
+        )
+    };
+    if let (Some(data), Some(path)) = (ev.content.data.as_mut(), &w.archive_path) {
+        data["archive_path"] = json!(path);
+    }
+    ev.content.severity = Some(Severity::High);
+    ev
+}
+
 /// Terminal finalizer. Called EXACTLY ONCE at subagent-thread exit,
 /// OUTSIDE catch_unwind. Reads terminal status from shared state,
 /// stamps finished_at, publishes the completion event with a
@@ -145,6 +210,15 @@ pub(crate) fn finalize_subagent_in(
     );
 }
 
+/// Marks [`SubagentState::completion_settled`] when the finalizer returns.
+struct SettleOnDrop<'a>(&'a Arc<RwLock<SubagentState>>);
+
+impl Drop for SettleOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.write().unwrap_or_else(|p| p.into_inner()).completion_settled = true;
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn finalize_subagent_impl(
     state: &Arc<RwLock<SubagentState>>,
@@ -184,6 +258,9 @@ fn finalize_subagent_impl(
         let preview: String = source.chars().take(300).collect();
         (s.status.clone(), preview, s.cancel_requested)
     };
+    // However this returns from here on: settled, so a reload's checkpoint
+    // knows the wake (if any) is in the queue it is about to carry.
+    let _settled = SettleOnDrop(state);
 
     // Archive the full conversation (every terminal status, cancel included) so
     // subagent_resume and subagent_collect still work after the handle is reaped.
@@ -203,7 +280,13 @@ fn finalize_subagent_impl(
     }
 
     if cancelled {
-        tracing::info!("subagent {handle_id}: cancelled by user — suppressing completion wake");
+        // A reload's stop is re-announced by the next image (AdoptWorkers);
+        // this image's queue dies with the exec.
+        if state.read().unwrap_or_else(|p| p.into_inner()).stopped_by_reload {
+            tracing::info!("subagent {handle_id}: stopped by daemon reload — archived; the next image wakes the parent");
+        } else {
+            tracing::info!("subagent {handle_id}: cancelled by user — suppressing completion wake");
+        }
         return;
     }
 
@@ -232,10 +315,84 @@ fn finalize_subagent_impl(
     }
 }
 
+/// Fix for workers that outlive their cancellation in the orchestration
+/// registry: a user-cancelled worker suppresses its completion wake (above),
+/// so nothing would ever prompt the model to collect it, and it stayed
+/// "unreconciled" forever — deferring context rollover until the hard limit.
+///
+/// Once the finalizer has run for a cancelled worker, retire it in the
+/// orchestration registry. Called from the worker thread right after
+/// [`finalize_subagent`], and again by the launcher after `mark_running`
+/// (the thread can finish before the launcher marks it running). Returns
+/// whether the worker is now retired; a no-op for anything not cancelled.
+#[doc(hidden)]
+pub fn retire_if_cancelled(
+    state: &Arc<RwLock<SubagentState>>,
+    orchestration: &crate::orchestration::OrchestrationRuntime,
+    handle_id: &str,
+) -> bool {
+    let cancelled_and_final = {
+        let s = state.read().unwrap_or_else(|p| p.into_inner());
+        s.cancel_requested && s.finalization_ready
+    };
+    cancelled_and_final && orchestration.retire_cancelled(handle_id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::events::EventQueue;
+
+    fn carried(stopped: bool, wake_lost: bool, archive: Option<&str>) -> crate::runtime::subagent::CarriedWorker {
+        crate::runtime::subagent::CarriedWorker {
+            id: "sa_288".into(),
+            subagent_id: 288,
+            agent: "integrator".into(),
+            status: if stopped { "cancelled" } else { "completed" }.into(),
+            archive_path: archive.map(std::path::PathBuf::from),
+            stopped_by_reload: stopped,
+            wake_lost,
+            wake: stopped || wake_lost,
+            elapsed_secs: 1234,
+            preview: "polling the build".into(),
+        }
+    }
+
+    /// The reload wake says who stopped the worker (not the user), that it
+    /// is resumable, and routes exactly like a completion.
+    #[test]
+    fn reload_carry_event_for_a_stopped_worker_points_at_resume() {
+        let ev = build_reload_carry_event(&carried(true, false, Some("/h/sa_288.json")));
+        assert_eq!(ev.content.content_type, "subagent_completion");
+        assert_eq!(ev.source.source_type, "subagent");
+        assert_eq!(ev.content.severity, Some(Severity::High));
+        let text = &ev.content.text;
+        assert!(text.contains("(sa_288)") && text.contains("daemon reload"), "{text}");
+        assert!(text.contains("not by the user"), "{text}");
+        assert!(text.contains("subagent_resume with handle_id \"sa_288\""), "{text}");
+        assert!(text.contains("polling the build"), "{text}");
+        let data = ev.content.data.unwrap();
+        assert_eq!(data["handle_id"], "sa_288");
+        assert_eq!(data["status"], "cancelled");
+        assert_eq!(data["stopped_by"], "daemon_reload");
+        assert_eq!(data["archive_path"], "/h/sa_288.json");
+
+        let text = build_reload_carry_event(&carried(true, false, None)).content.text;
+        assert!(text.contains("did not stop in time"), "{text}");
+    }
+
+    /// A finished worker whose wake the exec discarded gets the ordinary
+    /// completion wake again.
+    #[test]
+    fn reload_carry_event_for_a_lost_wake_is_the_normal_completion() {
+        let ev = build_reload_carry_event(&carried(false, true, Some("/h/sa_288.json")));
+        let text = &ev.content.text;
+        assert!(text.contains("finished with status 'completed'"), "{text}");
+        assert!(!text.contains("daemon reload"), "{text}");
+        let data = ev.content.data.unwrap();
+        assert_eq!(data["status"], "completed");
+        assert!(data.get("stopped_by").is_none());
+    }
     use crate::runtime::subagent::{SubagentState, SubagentStatus};
     use std::sync::{Arc, RwLock};
 
@@ -300,6 +457,81 @@ mod tests {
         );
         assert_eq!(queue.len(), count);
         assert_eq!(state.read().unwrap().status, SubagentStatus::Completed);
+    }
+
+    fn orchestration_with_running(id: &str) -> crate::orchestration::OrchestrationRuntime {
+        let model = agent_core::prompt::QualifiedModelId::parse("openrouter/z-ai/glm-5.2").unwrap();
+        let orchestration =
+            crate::orchestration::OrchestrationRuntime::baseline(model, 3, 8).unwrap();
+        orchestration.resolve_and_authorize(id, None).unwrap();
+        orchestration.mark_starting(id).unwrap();
+        orchestration.mark_running(id).unwrap();
+        orchestration
+    }
+
+    /// A user-cancelled worker publishes no completion wake, so the model is
+    /// never told to collect it. It must not stay "unreconciled" forever:
+    /// that deferred context rollover until the hard limit refused every
+    /// further request (incident 2026-10-13).
+    #[test]
+    fn cancelled_worker_is_retired_from_orchestration() {
+        let dir = tempfile::tempdir().unwrap();
+        let orchestration = orchestration_with_running("sa_cancel");
+        let state = make_state(SubagentStatus::Running, "partial");
+        state.write().unwrap().cancel_requested = true;
+
+        // Before the finalizer runs there is nothing to retire yet.
+        assert!(!retire_if_cancelled(&state, &orchestration, "sa_cancel"));
+        assert!(orchestration.is_unreconciled("sa_cancel"));
+
+        let queue = Arc::new(EventQueue::new(100));
+        finalize_subagent_in(
+            &state,
+            Some(&queue),
+            "sa_cancel",
+            1,
+            "worker",
+            std::time::Instant::now(),
+            None,
+            dir.path(),
+        );
+        assert!(queue.is_empty(), "cancel still suppresses the wake");
+        assert!(retire_if_cancelled(&state, &orchestration, "sa_cancel"));
+        assert!(!orchestration.is_unreconciled("sa_cancel"));
+        assert!(
+            orchestration.unreconciled_runtime_handles().is_empty(),
+            "nothing left to pin rollover"
+        );
+        // Idempotent: the launcher's post-mark_running re-check is harmless,
+        // and a later model collect still succeeds.
+        assert!(retire_if_cancelled(&state, &orchestration, "sa_cancel"));
+        orchestration
+            .terminal_and_collect(
+                "sa_cancel",
+                agent_core::orchestration::WorkerTerminal::Failed,
+            )
+            .unwrap();
+        orchestration.reconcile("sa_cancel").unwrap();
+    }
+
+    /// Completed (not cancelled) workers keep the collect-and-attest contract.
+    #[test]
+    fn completed_worker_is_never_auto_reconciled() {
+        let dir = tempfile::tempdir().unwrap();
+        let orchestration = orchestration_with_running("sa_done");
+        let state = make_state(SubagentStatus::Completed, "result");
+        finalize_subagent_in(
+            &state,
+            None,
+            "sa_done",
+            1,
+            "worker",
+            std::time::Instant::now(),
+            None,
+            dir.path(),
+        );
+        assert!(!retire_if_cancelled(&state, &orchestration, "sa_done"));
+        assert!(orchestration.is_unreconciled("sa_done"));
     }
 
     #[test]

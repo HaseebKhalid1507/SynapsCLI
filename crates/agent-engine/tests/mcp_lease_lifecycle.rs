@@ -155,8 +155,10 @@ fn ctx_with(cap: Option<McpLeaseCapability>) -> ToolContext {
             tx_events: None,
         },
         capabilities: ToolCapabilities {
+            session_allow_all: None,
             launch_cancel: None,
             memory_backend: None,
+            telemetry: None,
             watcher_exit_path: None,
             tool_register_tx: None,
             session_manager: None,
@@ -174,6 +176,7 @@ fn ctx_with(cap: Option<McpLeaseCapability>) -> ToolContext {
             env: None,
             env_stripped: Vec::new(),
             env_warned: Default::default(),
+            session_id: None,
         },
         limits: ToolLimits {
             max_tool_output: 30000,
@@ -789,7 +792,7 @@ async fn fingerprint_drift_revokes_exact_grant_but_not_siblings_or_core() {
         "sibling grant untouched"
     );
     assert!(
-        set.is_core(&agent_engine::tools::catalog::ToolId::builtin("bash")),
+        set.is_core(&agent_engine::tools::catalog::ToolId::builtin("read")),
         "core untouched"
     );
     assert_eq!(
@@ -913,10 +916,10 @@ fn revoke_exact_is_typed_and_reap_scan_covers_full_cap() {
     let generation = set.schema_generation();
 
     // Core revocation refused typed, zero mutation.
-    let bash = agent_engine::tools::catalog::ToolId::builtin("bash");
+    let core = agent_engine::tools::catalog::ToolId::builtin("read");
     assert_eq!(
-        set.revoke_exact(&bash),
-        Err(ExactRevocationError::CoreTool(bash.clone()))
+        set.revoke_exact(&core),
+        Err(ExactRevocationError::CoreTool(core.clone()))
     );
     // Unknown/never-activated refused typed, zero mutation.
     let ghost = ToolId::mcp("srv", "ghost");

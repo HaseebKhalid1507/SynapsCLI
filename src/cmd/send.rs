@@ -21,6 +21,16 @@
 //!
 //! Because armed-state routing is the actor's job, `send` needs no armed-state
 //! discovery and stays transport-simple. See `tests/send_remote_steering.rs`.
+//!
+//! ## The shared inbox
+//! `~/.synaps-cli/inbox/` is untargeted mail: a daemon session takes a file
+//! only while a client owns its input, and exactly one session takes it. So
+//! an event addressed to a session never falls back to it: a `--session`
+//! that matches nothing, or whose socket still refuses the event after
+//! [`SOCKET_ATTEMPTS`] tries, is an error (exit 1, nothing delivered), not
+//! a drop that some other session would take. `--inbox` opts back in to the
+//! drop. `--broadcast` reports each session it could not reach and exits 1.
+//! Only the no-flag form, which names no session, still uses the inbox.
 
 use chrono::Utc;
 use synaps_cli::events::registry::{
@@ -32,6 +42,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 use uuid::Uuid;
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     message: String,
     source: String,
@@ -40,6 +51,7 @@ pub async fn run(
     content_type: String,
     session: Option<String>,
     broadcast: bool,
+    inbox: bool,
 ) -> anyhow::Result<()> {
     let event = build_event(message, source, severity, channel, content_type);
     let json = serde_json::to_string(&event)?;
@@ -49,19 +61,41 @@ pub async fn run(
         if sessions.is_empty() {
             eprintln!("No active sessions found for broadcast.");
         }
+        let mut missed = Vec::new();
         for reg in sessions {
-            send_to_socket_or_inbox(&reg, &json, &event).await;
+            match send_with_retry(reg.clone(), &json, None).await {
+                Ok(id) => eprintln!("Event sent to session {id} via socket."),
+                Err(e) => {
+                    eprintln!("Not delivered to session {}: {e}", reg.session_id);
+                    missed.push(reg.session_id);
+                }
+            }
+        }
+        if !missed.is_empty() {
+            anyhow::bail!("broadcast missed {} session(s): {}", missed.len(), missed.join(", "));
         }
         return Ok(());
     }
 
     if let Some(query) = session {
         match find_session_registration(&query) {
-            Some(reg) => send_to_socket_or_inbox(&reg, &json, &event).await,
-            None => {
-                eprintln!("No session matching {:?} found — dropping to inbox.", query);
+            Some(reg) => match send_with_retry(reg, &json, Some(&query)).await {
+                Ok(id) => eprintln!("Event sent to session {id} via socket."),
+                Err(e) if inbox => {
+                    eprintln!("{e} — dropping to inbox (--inbox).");
+                    write_inbox(&event)?;
+                    eprintln!("{INBOX_NOTE}");
+                }
+                Err(e) => anyhow::bail!(
+                    "{e}; nothing was delivered.\nAdd --inbox to leave it in the shared inbox instead."
+                ),
+            },
+            None if inbox => {
+                eprintln!("No session matching {:?} found — dropping to inbox (--inbox).", query);
                 write_inbox(&event)?;
+                eprintln!("{INBOX_NOTE}");
             }
+            None => anyhow::bail!("{}", no_match_message(&query, &list_active_sessions())),
         }
         return Ok(());
     }
@@ -69,7 +103,16 @@ pub async fn run(
     // No flags: try to auto-resolve to exactly one active session.
     let sessions = list_active_sessions();
     match sessions.len() {
-        1 => send_to_socket_or_inbox(&sessions[0], &json, &event).await,
+        // Nothing was addressed: if the one running session refuses, the
+        // event is still untargeted mail.
+        1 => match send_with_retry(sessions[0].clone(), &json, None).await {
+            Ok(id) => eprintln!("Event sent to session {id} via socket."),
+            Err(e) => {
+                eprintln!("{e} — writing to inbox.");
+                write_inbox(&event)?;
+                eprintln!("{INBOX_NOTE}");
+            }
+        },
         _ => {
             if sessions.is_empty() {
                 eprintln!("No active sessions — writing to inbox.");
@@ -80,10 +123,35 @@ pub async fn run(
                 );
             }
             write_inbox(&event)?;
+            eprintln!("{INBOX_NOTE}");
         }
     }
 
     Ok(())
+}
+
+/// Printed after every deliberate inbox drop: the file is not a delivery to
+/// any particular session.
+const INBOX_NOTE: &str = "Note: it went to the shared inbox; only a session with an attached \
+input owner takes it (exactly once). Use --session <id> to reach a detached session.";
+
+/// The error for a `--session` that matched nothing, naming what is running
+/// so a typo (or a short id suffix, which never matches) is easy to fix.
+fn no_match_message(query: &str, live: &[SessionRegistration]) -> String {
+    let mut msg = format!("no running session matches {query:?}; nothing was delivered.\n");
+    if live.is_empty() {
+        msg.push_str("No sessions are running.\n");
+    } else {
+        msg.push_str("Running sessions (match by full id, name, or id prefix):\n");
+        for reg in live {
+            match reg.name.as_deref() {
+                Some(name) => msg.push_str(&format!("  {}  ({name})\n", reg.session_id)),
+                None => msg.push_str(&format!("  {}\n", reg.session_id)),
+            }
+        }
+    }
+    msg.push_str("Add --inbox to leave it in the shared inbox instead.");
+    msg
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -120,19 +188,55 @@ fn build_event(
     }
 }
 
-async fn send_to_socket_or_inbox(reg: &SessionRegistration, json: &str, event: &Event) {
-    match send_via_socket(&reg.socket_path, json).await {
-        Ok(()) => eprintln!("Event sent to session {} via socket.", reg.session_id),
-        Err(e) => {
-            eprintln!(
-                "Warning: socket send to session {} failed ({}), falling back to inbox.",
-                reg.session_id, e
-            );
-            if let Err(ie) = write_inbox(event) {
-                eprintln!("Inbox fallback also failed: {}", ie);
+/// Deliver an event to exactly one running session (no inbox fallback, no
+/// broadcast). Used by the watcher for targeted completion notices so that a
+/// supervisor never injects turns into arbitrary interactive sessions.
+pub(crate) async fn send_event_to_session(query: &str, event: &Event) -> anyhow::Result<String> {
+    let reg = find_session_registration(query)
+        .ok_or_else(|| anyhow::anyhow!("no running session matches {:?}", query))?;
+    let json = serde_json::to_string(event)?;
+    send_with_retry(reg, &json, Some(query)).await
+}
+
+/// Socket attempts for an event addressed to one session, and the waits
+/// between them. A session that is streaming, or a daemon mid-reload, can
+/// refuse a connection for a moment; the event must still reach that
+/// session and no other.
+const SOCKET_ATTEMPTS: u32 = 3;
+const SOCKET_RETRY_WAITS_MS: [u64; 2] = [150, 500];
+/// One attempt may not hang `send` (and the script that called it).
+const SOCKET_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Deliver to `reg`'s socket, retrying. With `requery`, the registration is
+/// looked up again before each retry: a reload gives the session a new
+/// socket. Returns the session id it reached, or the last error.
+async fn send_with_retry(
+    mut reg: SessionRegistration,
+    json: &str,
+    requery: Option<&str>,
+) -> anyhow::Result<String> {
+    let mut last = None;
+    for attempt in 0..SOCKET_ATTEMPTS {
+        if attempt > 0 {
+            let wait = SOCKET_RETRY_WAITS_MS[(attempt as usize - 1).min(SOCKET_RETRY_WAITS_MS.len() - 1)];
+            tokio::time::sleep(std::time::Duration::from_millis(wait)).await;
+            if let Some(found) = requery.and_then(find_session_registration) {
+                reg = found;
             }
         }
+        let sent = tokio::time::timeout(SOCKET_ATTEMPT_TIMEOUT, send_via_socket(&reg.socket_path, json)).await;
+        match sent {
+            Ok(Ok(())) => return Ok(reg.session_id),
+            Ok(Err(e)) => last = Some(e.to_string()),
+            Err(_) => last = Some(format!("timed out after {} s", SOCKET_ATTEMPT_TIMEOUT.as_secs())),
+        }
     }
+    anyhow::bail!(
+        "socket send to session {} failed {} times (last: {})",
+        reg.session_id,
+        SOCKET_ATTEMPTS,
+        last.unwrap_or_default()
+    )
 }
 
 async fn send_via_socket(socket_path: &str, json: &str) -> anyhow::Result<()> {
@@ -191,4 +295,38 @@ fn write_inbox(event: &Event) -> anyhow::Result<()> {
     std::fs::rename(&tmp_path, &path)?;
     eprintln!("Event written to inbox: {}", path.display());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn reg(id: &str, name: Option<&str>) -> SessionRegistration {
+        SessionRegistration {
+            kind: "session".into(),
+            session_id: id.into(),
+            name: name.map(str::to_string),
+            socket_path: format!("/tmp/{id}.sock"),
+            pid: 1,
+            started_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn a_session_miss_names_the_running_sessions_and_the_inbox_opt_in() {
+        let msg = no_match_message(
+            "49f6",
+            &[reg("20261014-042151-49f6", Some("ion")), reg("20261014-183459-3f61", None)],
+        );
+        assert!(msg.contains("\"49f6\""), "{msg}");
+        assert!(msg.contains("20261014-042151-49f6  (ion)"), "{msg}");
+        assert!(msg.contains("20261014-183459-3f61"), "{msg}");
+        assert!(msg.contains("--inbox"), "{msg}");
+    }
+
+    #[test]
+    fn a_session_miss_with_nothing_running_says_so() {
+        let msg = no_match_message("x", &[]);
+        assert!(msg.contains("No sessions are running."), "{msg}");
+    }
 }

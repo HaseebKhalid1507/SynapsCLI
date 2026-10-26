@@ -28,13 +28,17 @@ use async_trait::async_trait;
 use futures::Stream;
 use serde::{Deserialize, Serialize};
 
+use super::account::{
+    seat_fingerprint, Account, AccountPolicy, AccountSelector, AccountSummary, CredentialRef,
+    SeatIdentity,
+};
 use super::cloud::{CloudProviderId, InvokeRequest};
 use super::provider::OAuthProviderId;
 use super::static_providers::{
     allowed_proxy_paths, static_provider, StaticProviderSpec, LOCAL_DEFAULT_BASE_URL,
     LOCAL_PROVIDER_KEY, STATIC_PROVIDERS,
 };
-use super::{load_provider_auth, storage};
+use super::storage;
 
 // ── Buffering / time limits ──────────────────────────────────────────────────
 //
@@ -164,7 +168,9 @@ pub(crate) fn anthropic_oauth_catalog_request_headers() -> &'static [(&'static s
 // ── Errors ───────────────────────────────────────────────────────────────────
 
 /// Broker failures. Messages never contain credential values.
+/// Non-exhaustive: new failure kinds are added as brokers gain operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum BrokerError {
     /// The named provider is not in any broker registry.
     UnknownProvider(String),
@@ -189,6 +195,27 @@ pub enum BrokerError {
     Transport(String),
     /// Credential storage/refresh failure (message is already secret-free).
     Credential(String),
+    /// An explicitly requested account slot does not exist. Never a fallback.
+    UnknownAccount { provider: String, label: String },
+    /// This broker implementation cannot address named account slots.
+    UnsupportedAccount { provider: String, label: String },
+    /// An account label failed validation (CLI/env/config/HTTP boundary).
+    InvalidAccount(String),
+    /// Automatic selection found no account with proven capacity. `failure`
+    /// is the typed explanation (top-level kind plus every account's kind
+    /// and HTTP status) when the broker knows it; `reason` its text.
+    NoAccountAvailable {
+        provider: String,
+        reason: String,
+        failure: Option<super::quota_policy::SelectionFailure>,
+    },
+    /// The remote broker predates an operation this client needs; the
+    /// payload names what is unavailable. Upgrade the broker host.
+    BrokerTooOld(String),
+    /// A locked token refresh failed; the kind tells a per-account cooldown,
+    /// a busy refresh lock or a transient network/provider failure apart
+    /// from an unusable login. Message is secret-free.
+    Refresh(super::token::RefreshFailure),
 }
 
 impl std::fmt::Display for BrokerError {
@@ -205,7 +232,7 @@ impl std::fmt::Display for BrokerError {
                 f,
                 "no credential configured for '{p}'. Run `synaps login` to add one."
             ),
-            Self::Unauthorized => write!(f, "broker rejected machine auth"),
+            Self::Unauthorized => f.write_str(&super::broker_token::unauthorized_hint()),
             Self::Denied(msg) => write!(f, "broker denied request: {msg}"),
             Self::UnsupportedCapability {
                 provider,
@@ -217,11 +244,56 @@ impl std::fmt::Display for BrokerError {
             ),
             Self::Transport(msg) => write!(f, "broker transport error: {msg}"),
             Self::Credential(msg) => write!(f, "credential error: {msg}"),
+            Self::Refresh(failure) => {
+                use super::token::RefreshFailureKind as K;
+                let hint = match failure.kind {
+                    K::Transient => " (network or provider error, not a login problem; retry shortly)",
+                    K::LockBusy => " (another refresh of this account is still running; retry shortly)",
+                    K::Other => " (retry shortly)",
+                    K::Credential | K::Cooldown { .. } | K::ActionRequired => "",
+                };
+                write!(f, "credential refresh failed{hint}: {failure}")
+            }
+            Self::UnknownAccount { provider, label } => write!(
+                f,
+                "unknown account '{label}' for provider '{provider}' (no fallback; run \
+                 `synaps auth list` or `synaps login --provider {provider} --account {label}`)"
+            ),
+            Self::UnsupportedAccount { provider, label } => write!(
+                f,
+                "this credential broker cannot address account '{label}' for provider '{provider}'"
+            ),
+            Self::InvalidAccount(msg) => write!(f, "invalid account: {msg}"),
+            Self::NoAccountAvailable {
+                provider,
+                reason,
+                failure: Some(failure),
+            } => write!(
+                f,
+                "no account with proven capacity for '{provider}' ({}): {reason}",
+                failure.kind
+            ),
+            Self::NoAccountAvailable {
+                provider, reason, ..
+            } => {
+                write!(
+                    f,
+                    "no account with proven capacity for '{provider}': {reason}"
+                )
+            }
+            Self::BrokerTooOld(what) => write!(
+                f,
+                "broker is older than this client; {what} unavailable (upgrade the broker host)"
+            ),
         }
     }
 }
 
 impl std::error::Error for BrokerError {}
+
+#[cfg(test)]
+#[path = "broker_remote_compat_tests.rs"]
+mod remote_compat_tests;
 
 // ── Vended types ─────────────────────────────────────────────────────────────
 
@@ -234,6 +306,31 @@ pub struct AccessToken {
     pub token: String,
     /// Absolute expiry, unix-epoch milliseconds.
     pub expires: u64,
+}
+
+/// The selected/pinned pair a runtime works with for one attempt: the
+/// credential the broker chose and the token vended for exactly that
+/// credential. Account-specific headers (e.g. the Codex account id) must be
+/// derived from `token`, never from a second lookup.
+#[derive(Debug, Clone)]
+pub struct PinnedToken {
+    pub credential: CredentialRef,
+    pub token: AccessToken,
+}
+
+impl PinnedToken {
+    /// Seat fingerprint derived from THIS token's own identity claim (Codex:
+    /// the JWT `chatgpt_account_id`), comparable with
+    /// [`AccountSummary::seat_fingerprint`]. `None` when the token carries no
+    /// account identity — callers that must spend on exactly one listed seat
+    /// treat `None` or a mismatch as "do not send".
+    pub fn seat_fingerprint(&self) -> Option<String> {
+        match self.credential.provider {
+            OAuthProviderId::OpenAiCodex => super::extract_codex_account_id(&self.token.token)
+                .and_then(|id| seat_fingerprint(self.credential.provider, &id)),
+            _ => None,
+        }
+    }
 }
 
 /// HTTP method subset the proxy protocol supports.
@@ -253,7 +350,11 @@ pub enum ProxyMethod {
 /// provider, so a key can never be coaxed toward an attacker-chosen host.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyRequest {
-    /// Static provider key (e.g. `groq`) or `local`.
+    /// Static provider key (e.g. `groq`), `local`, or an OAuth-proxied
+    /// provider. For OAuth providers an explicit account slot may be pinned
+    /// as `<provider>@<label>` or `<provider>@default`; a bare provider means
+    /// "the broker's account policy". Validated by [`validate`](Self::validate);
+    /// an explicit unknown slot is an error, never a fallback.
     pub provider: String,
     pub method: ProxyMethod,
     /// Relative path joined onto the pinned base URL, e.g. `/chat/completions`.
@@ -280,14 +381,17 @@ impl ProxyRequest {
     /// Validate provider identity and path shape. Fail closed on anything
     /// that could redirect a broker-owned credential.
     pub fn validate(&self) -> Result<(), BrokerError> {
-        if self.provider != LOCAL_PROVIDER_KEY
-            && self.provider != "xai-auth"
-            && self.provider != "github-copilot"
-            && self.provider != "google-gemini"
-            && self.provider != "openai-codex"
-            && self.provider != "anthropic"
-            && self.provider != "kimi-code"
-            && static_provider(&self.provider).is_none()
+        let (provider, _account) = self.split_provider()?;
+        let provider = provider.as_str();
+        if provider != LOCAL_PROVIDER_KEY
+            && provider != "xai-auth"
+            && provider != "github-copilot"
+            && provider != "google-gemini"
+            && provider != "openai-codex"
+            && provider != "anthropic"
+            && provider != "kimi-code"
+            && provider != "muse"
+            && static_provider(provider).is_none()
         {
             return Err(BrokerError::UnknownProvider(self.provider.clone()));
         }
@@ -302,27 +406,31 @@ impl ProxyRequest {
         // Per-provider endpoint allowlist: a signed proxy request can only
         // reach the cataloged inference/model paths, never other same-host
         // endpoints (key management, billing, admin, …).
-        let oauth_path_allowed = self.provider == "xai-auth" && self.path == "/responses"
-            || self.provider == "github-copilot"
+        let oauth_path_allowed = provider == "xai-auth" && self.path == "/responses"
+            || provider == "github-copilot"
                 && matches!(
                     self.path.as_str(),
                     "/models" | "/chat/completions" | "/responses"
                 )
-            || self.provider == "google-gemini" && is_allowed_google_gemini_path(&self.path)
+            || provider == "google-gemini" && is_allowed_google_gemini_path(&self.path)
             // Managed Kimi Code endpoint allowlist: chat inference plus the
             // read-only catalog/profile/quota surfaces the official CLI uses.
-            || self.provider == "kimi-code"
+            || provider == "kimi-code"
                 && (self.path == "/chat/completions"
                     || self.method == ProxyMethod::Get
                         && matches!(self.path.as_str(), "/models" | "/me" | "/usages"))
-            || self.provider == "openai-codex"
+            // Meta Muse: Responses inference plus the read-only model catalog.
+            // Never the key mint/logout endpoints on the same host.
+            || provider == "muse"
+                && (self.method == ProxyMethod::Post && self.path == "/v1/responses"
+                    || self.method == ProxyMethod::Get && self.path == "/muse-code/models")
+            || provider == "openai-codex"
                 && self.method == ProxyMethod::Get
                 && is_allowed_openai_codex_path(&self.path)
-            || self.provider == "anthropic"
+            || provider == "anthropic"
                 && self.method == ProxyMethod::Get
                 && is_allowed_anthropic_path(&self.path);
-        if !oauth_path_allowed && !allowed_proxy_paths(&self.provider).contains(&self.path.as_str())
-        {
+        if !oauth_path_allowed && !allowed_proxy_paths(provider).contains(&self.path.as_str()) {
             return Err(BrokerError::Denied(format!(
                 "proxy path '{}' is not in the provider's endpoint allowlist",
                 self.path
@@ -395,6 +503,43 @@ impl ProxyRequest {
         };
         Ok((request, bytes))
     }
+
+    /// Pin the request to an explicit account slot (`<provider>@<label>` /
+    /// `<provider>@default`), replacing any previous pin.
+    pub fn with_account(mut self, account: &Account) -> Self {
+        let base = self
+            .provider
+            .split_once('@')
+            .map(|(p, _)| p.to_string())
+            .unwrap_or_else(|| self.provider.clone());
+        self.provider = format!("{base}@{}", account.label_str());
+        self
+    }
+
+    /// Split `provider` into the base provider key and the explicit account
+    /// pin, validating the label. Static/local providers never carry a pin.
+    pub fn split_provider(&self) -> Result<(String, Option<Account>), BrokerError> {
+        match self.provider.split_once('@') {
+            None => Ok((self.provider.clone(), None)),
+            Some((base, account)) => {
+                if base.parse::<OAuthProviderId>().is_err() {
+                    return Err(BrokerError::UnknownProvider(self.provider.clone()));
+                }
+                let account = Account::parse(account).map_err(BrokerError::InvalidAccount)?;
+                Ok((base.to_string(), Some(account)))
+            }
+        }
+    }
+
+    /// Base provider key without any account pin (after validation).
+    pub fn base_provider(&self) -> Result<String, BrokerError> {
+        Ok(self.split_provider()?.0)
+    }
+
+    /// The explicit account pin, if any. `None` → the policy decides.
+    pub fn explicit_account(&self) -> Result<Option<Account>, BrokerError> {
+        Ok(self.split_provider()?.1)
+    }
 }
 
 /// Buffered (non-streaming) proxy result: upstream status + body text.
@@ -422,8 +567,12 @@ pub struct ProviderStatus {
     pub key: String,
     pub name: String,
     pub kind: CredentialKind,
-    /// Whether a credential is available through the broker.
+    /// Whether a credential is available through the broker (for OAuth rows:
+    /// the policy-selected account exists, or any account under `auto`).
     pub configured: bool,
+    /// Stored account slots (OAuth providers only; non-secret rows).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accounts: Vec<AccountSummary>,
 }
 
 /// Non-secret display status for one static key (settings UI).
@@ -486,8 +635,100 @@ pub type CloudEventStream = Pin<Box<dyn Stream<Item = Result<CloudEvent, BrokerE
 /// remote `synaps auth-broker` over authenticated HTTP(S) ([`RemoteBroker`]).
 #[async_trait]
 pub trait CredentialBroker: Send + Sync {
-    /// Vend a fresh OAuth access token (token + expiry ONLY).
+    /// Vend a fresh OAuth access token (token + expiry ONLY) for the
+    /// policy-selected account of `provider`.
     async fn access_token(&self, provider: OAuthProviderId) -> Result<AccessToken, BrokerError>;
+
+    /// Effective account selector for `provider` (env > config > injected
+    /// policy). No I/O beyond reading configuration; no secrets.
+    fn account_selector(&self, provider: OAuthProviderId) -> AccountSelector {
+        let _ = provider;
+        AccountSelector::Account(Account::Default)
+    }
+
+    /// Vend a token for an explicitly addressed credential. The default
+    /// implementation serves only the default slot (via [`access_token`]);
+    /// a named slot is an error — NEVER a fallback to another account.
+    ///
+    /// [`access_token`]: Self::access_token
+    async fn access_token_for(&self, cred: &CredentialRef) -> Result<AccessToken, BrokerError> {
+        match &cred.account {
+            Account::Default => self.access_token(cred.provider).await,
+            Account::Named(label) => Err(BrokerError::UnsupportedAccount {
+                provider: cred.provider.as_str().to_string(),
+                label: label.as_str().to_string(),
+            }),
+        }
+    }
+
+    /// Re-vend the exact credential whose access token was rejected. Local
+    /// brokers force refresh only if storage still holds that rejected token.
+    /// Remote/custom brokers keep their ordinary explicit-slot semantics.
+    async fn recover_rejected_token(
+        &self,
+        cred: &CredentialRef,
+        _rejected: &str,
+    ) -> Result<AccessToken, BrokerError> {
+        self.access_token_for(cred).await
+    }
+
+    /// Policy-resolved pair: the credential the broker selected for
+    /// `provider` and its token. Default implementation: the default slot.
+    async fn access_token_pinned(
+        &self,
+        provider: OAuthProviderId,
+    ) -> Result<PinnedToken, BrokerError> {
+        let token = self.access_token(provider).await?;
+        Ok(PinnedToken {
+            credential: CredentialRef::default_for(provider),
+            token,
+        })
+    }
+
+    /// Model-aware variant of [`access_token_pinned`]: under an `auto`
+    /// selector only accounts with proven capacity *for `model`* are
+    /// eligible. Default implementation ignores the model.
+    ///
+    /// [`access_token_pinned`]: Self::access_token_pinned
+    async fn access_token_pinned_for(
+        &self,
+        provider: OAuthProviderId,
+        model: Option<&str>,
+    ) -> Result<PinnedToken, BrokerError> {
+        let _ = model;
+        self.access_token_pinned(provider).await
+    }
+
+    /// Non-secret account listing for `provider`. Default: unsupported.
+    async fn accounts(&self, provider: OAuthProviderId) -> Result<Vec<AccountSummary>, BrokerError> {
+        Err(BrokerError::UnsupportedCapability {
+            provider: provider.as_str().to_string(),
+            capability: "accounts".into(),
+        })
+    }
+
+    /// Typed, read-only usage snapshot for one credential. The token is
+    /// resolved and used behind the boundary; callers receive normalized,
+    /// secret-free data only. Default: unsupported.
+    async fn usage(&self, cred: &CredentialRef) -> Result<super::usage::UsageSnapshot, BrokerError> {
+        Err(BrokerError::UnsupportedCapability {
+            provider: cred.provider.as_str().to_string(),
+            capability: "usage".into(),
+        })
+    }
+
+    /// Report that `cred` hit a provider limit so automatic selection stops
+    /// advertising it until `until_ms` (epoch ms; `None` = a short default).
+    /// Best effort; default implementation is a no-op.
+    async fn report_cooldown(
+        &self,
+        cred: &CredentialRef,
+        until_ms: Option<u64>,
+        reason: &str,
+    ) -> Result<(), BrokerError> {
+        let _ = (cred, until_ms, reason);
+        Ok(())
+    }
 
     /// Execute a non-streaming provider request with the broker-owned key.
     async fn proxy(&self, request: ProxyRequest) -> Result<ProxyResponse, BrokerError>;
@@ -1430,11 +1671,103 @@ pub struct LocalBroker {
     anthropic_usage_url: Option<String>,
     /// Test seam: overrides the pinned cloudcode-pa base URL.
     google_gemini_base_url: Option<String>,
+    /// Test seam: overrides the pinned ChatGPT backend base URL.
+    openai_codex_base_url: Option<String>,
+    /// Test seam: overrides the pinned Meta Muse API origin.
+    muse_base_url: Option<String>,
+    /// Test seam: refresh endpoint overrides (the Muse key mint).
+    refresh_endpoints: super::provider::RefreshEndpoints,
+    /// Idle (between-bytes) timeout for the per-request no-redirect client.
+    stream_idle_timeout: Duration,
     /// Time budget for buffered (non-streaming) requests.
     request_timeout: Duration,
     /// Buffered response size cap.
     max_response_bytes: usize,
     cloud_backend: Option<Arc<dyn CloudBackend>>,
+    /// Injected account policy. `None` → resolved from env + config on every
+    /// selection (no global mutation, picks up `synaps auth use` changes).
+    account_policy: Option<AccountPolicy>,
+    auto_policy: Option<super::AutoSelectionPolicy>,
+    auto_policy_cache: std::sync::Mutex<
+        Option<(
+            std::path::PathBuf,
+            Option<std::time::SystemTime>,
+            super::AutoSelectionPolicy,
+        )>,
+    >,
+    /// Successful vends only, scoped by model and immutable seat identity.
+    current_accounts: SharedMap<(CredentialRef, SeatIdentity)>,
+    /// In-memory cooldowns for automatic selection, keyed by storage key.
+    cooldowns: Arc<std::sync::Mutex<BTreeMap<String, Cooldown>>>,
+    /// Test seam: overrides the usage endpoint for typed usage snapshots.
+    usage_endpoint_override: Option<String>,
+    /// Max age of a usage observation that still counts as capacity.
+    max_snapshot_age: Duration,
+    /// Short-lived cache of the last usage snapshot per *seat key* (credential
+    /// file + storage key + [`SeatIdentity`] of the stored credential) so
+    /// automatic selection does not re-poll every provider on every token
+    /// vend. A re-login, removal or profile switch changes the key, so a
+    /// reading can never be attributed to a different seat than the one it
+    /// was taken from. Entries older than `max_snapshot_age` are never reused.
+    snapshots: SharedMap<super::usage::UsageSnapshot>,
+    /// Process-wide usage-read table (single-flight per slot, held failed
+    /// reads, last good readings); see [`super::usage_reads`].
+    usage_reads: Arc<super::usage_reads::UsageReads>,
+    /// Small per-process number for the usage-read log line (not secret).
+    instance: u64,
+    /// Cached account policy keyed by the config file's modification time
+    /// (env overlay is applied on every read; it is cheap and has no I/O).
+    policy_cache: Arc<std::sync::Mutex<Option<CachedPolicy>>>,
+    /// What `synaps auth state` shows per slot (credential file + storage
+    /// key): the last usage read and the last successful one. Diagnostic
+    /// only; selection never reads it.
+    observations: SharedMap<SlotObservations>,
+    /// Last automatic selection per [`Self::current_key`] (provider + model).
+    selections: SharedMap<super::auth_state::SelectionState>,
+}
+
+/// One slot's recorded usage reads (`synaps auth state`).
+#[derive(Debug, Clone, Default)]
+struct SlotObservations {
+    last_usage: Option<super::auth_state::ObservedOutcome>,
+    last_usage_ok_ms: Option<u64>,
+}
+
+/// Process-shared map keyed by storage key or seat key.
+type SharedMap<T> = Arc<std::sync::Mutex<BTreeMap<String, T>>>;
+/// Config-derived policy tagged with the config file mtime it was read at.
+type CachedPolicy = (Option<std::time::SystemTime>, AccountPolicy);
+
+/// A reported provider limit for one account (non-secret).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Cooldown {
+    until_ms: u64,
+    reason: String,
+}
+
+/// Cooldown applied when a limit is reported without a reset hint.
+const DEFAULT_COOLDOWN: Duration = Duration::from_secs(15 * 60);
+/// Longest cooldown a client report may impose (a weekly window plus slack);
+/// anything longer is clamped so a bad report cannot bench a seat forever.
+const MAX_COOLDOWN: Duration = Duration::from_secs(8 * 24 * 60 * 60);
+/// Default staleness bound for automatic selection. Short on purpose: a
+/// selection is a spend decision and should rest on a fresh reading.
+pub const DEFAULT_MAX_SNAPSHOT_AGE: Duration = Duration::from_secs(60);
+
+/// Idle timeout between bytes on the broker's per-request no-redirect
+/// client (Muse, Kimi, Gemini, Codex/Anthropic catalog). Matches the runtime
+/// client's 90s read timeout that xAI streams already get.
+pub const BROKER_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// Gemini (Code Assist) sends no data chunk while it thinks (thought
+/// streaming is off), and a hard prompt can think silently for minutes;
+/// its stream has no retry, so it gets a longer idle limit.
+pub const GEMINI_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Next per-process broker number for the usage-read log line.
+fn next_broker_instance() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 impl LocalBroker {
@@ -1445,15 +1778,911 @@ impl LocalBroker {
             local_base_url: None,
             anthropic_usage_url: None,
             google_gemini_base_url: None,
+            openai_codex_base_url: None,
+            muse_base_url: None,
+            refresh_endpoints: Default::default(),
+            stream_idle_timeout: BROKER_STREAM_IDLE_TIMEOUT,
             request_timeout: PROXY_REQUEST_TIMEOUT,
             max_response_bytes: MAX_PROXY_RESPONSE_BYTES,
             cloud_backend: Some(cloud_backend),
+            account_policy: None,
+            auto_policy: None,
+            auto_policy_cache: std::sync::Mutex::new(None),
+            current_accounts: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
+            cooldowns: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
+            usage_endpoint_override: None,
+            max_snapshot_age: DEFAULT_MAX_SNAPSHOT_AGE,
+            snapshots: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
+            usage_reads: super::usage_reads::process_table(),
+            instance: next_broker_instance(),
+            policy_cache: Arc::new(std::sync::Mutex::new(None)),
+            observations: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
+            selections: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
         }
     }
 
     pub fn with_cloud_backend(mut self, backend: Arc<dyn CloudBackend>) -> Self {
         self.cloud_backend = Some(backend);
         self
+    }
+
+    /// Pin the account policy instead of reading env + config per call.
+    pub fn with_account_policy(mut self, policy: AccountPolicy) -> Self {
+        self.account_policy = Some(policy);
+        self
+    }
+
+    /// Pin the automatic ranking policy (tests/embedding).
+    pub fn with_auto_policy(mut self, policy: super::AutoSelectionPolicy) -> Self {
+        self.auto_policy = Some(policy);
+        self
+    }
+
+    fn auto_policy(&self) -> super::AutoSelectionPolicy {
+        if let Some(policy) = &self.auto_policy {
+            return policy.clone();
+        }
+        let path = crate::config::resolve_read_path("config");
+        let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+        let mut cache = self
+            .auto_policy_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some((cached_path, cached_time, policy)) = cache.as_ref() {
+            if cached_path == &path && *cached_time == mtime {
+                return policy.clone();
+            }
+        }
+        let (policy, warnings) =
+            super::AutoSelectionPolicy::from_config_map(&crate::config::load_config().auth.auto);
+        for warning in warnings {
+            tracing::warn!(%warning, "automatic account policy");
+        }
+        *cache = Some((path, mtime, policy.clone()));
+        policy
+    }
+
+    fn current_key(provider: OAuthProviderId, model: Option<&str>) -> String {
+        format!(
+            "{}|{}|{}",
+            storage::auth_file_path().display(),
+            provider,
+            model.unwrap_or("")
+        )
+    }
+
+    /// Test seam: point the pinned ChatGPT backend host at a loopback fake.
+    /// Only relaxes the base URL; allowlists, bearer/header pairing and
+    /// redirect denial are unchanged.
+    #[doc(hidden)]
+    pub fn with_openai_codex_base_url_for_tests(mut self, base_url: impl Into<String>) -> Self {
+        self.openai_codex_base_url = Some(base_url.into().trim_end_matches('/').to_string());
+        self
+    }
+
+    /// Test seam: point the pinned Meta Muse origin at a loopback fake. Only
+    /// relaxes the origin; the path allowlist, bearer resolution, 401
+    /// recovery and redirect denial are unchanged.
+    #[doc(hidden)]
+    pub fn with_muse_base_url_for_tests(mut self, base_url: impl Into<String>) -> Self {
+        self.muse_base_url = Some(base_url.into().trim_end_matches('/').to_string());
+        self
+    }
+
+    /// Idle (between-bytes) limit for `provider_key`'s no-redirect client.
+    fn stream_idle_timeout_for(&self, provider_key: &str) -> Duration {
+        if provider_key == "google-gemini" {
+            GEMINI_STREAM_IDLE_TIMEOUT.max(self.stream_idle_timeout)
+        } else {
+            self.stream_idle_timeout
+        }
+    }
+
+    /// Test seam: shorten [`BROKER_STREAM_IDLE_TIMEOUT`] (not Gemini's).
+    #[doc(hidden)]
+    pub fn with_stream_idle_timeout_for_tests(mut self, idle: Duration) -> Self {
+        self.stream_idle_timeout = idle;
+        self
+    }
+
+    /// Test seam: send Muse key re-mints to a loopback fake mint
+    /// (`http://127.0.0.1:<port>/...`) instead of the pinned
+    /// `https://api.meta.ai/muse-code/key`. The request itself (headers,
+    /// body, OAuth bearer) is built exactly as in production.
+    #[doc(hidden)]
+    pub fn with_muse_mint_url_for_tests(mut self, mint_url: impl Into<String>) -> Self {
+        self.refresh_endpoints =
+            std::mem::take(&mut self.refresh_endpoints).with_muse_mint_url_for_tests(mint_url);
+        self
+    }
+
+    /// Test seam: send Anthropic token refreshes to a loopback fake token
+    /// endpoint instead of the real one; a non-loopback URL is refused at
+    /// refresh time. The request is built exactly as in production.
+    #[doc(hidden)]
+    pub fn with_anthropic_token_url_for_tests(mut self, url: impl Into<String>) -> Self {
+        self.refresh_endpoints =
+            std::mem::take(&mut self.refresh_endpoints).with_anthropic_token_url_for_tests(url);
+        self
+    }
+
+    /// Capacity-based selection for `provider` regardless of the configured
+    /// selector (used by the broker daemon when a remote client's own policy
+    /// is `auto`). Fails closed like [`access_token_pinned_for`].
+    ///
+    /// [`access_token_pinned_for`]: CredentialBroker::access_token_pinned_for
+    pub async fn access_token_auto(
+        &self,
+        provider: OAuthProviderId,
+        model: Option<&str>,
+    ) -> Result<PinnedToken, BrokerError> {
+        self.vend_auto(provider, model).await
+    }
+
+    /// Test seam: point typed usage fetches at a fake server.
+    #[doc(hidden)]
+    pub fn with_usage_endpoint_override(mut self, url: impl Into<String>) -> Self {
+        self.usage_endpoint_override = Some(url.into());
+        self
+    }
+
+    /// Bound on usage-snapshot age for automatic selection.
+    pub fn with_max_snapshot_age(mut self, age: Duration) -> Self {
+        self.max_snapshot_age = age;
+        self
+    }
+
+    /// Effective policy: injected, else env > config > default. The config
+    /// file is re-parsed only when its modification time changes, so a vend
+    /// never re-reads config (and never re-emits warnings) needlessly.
+    fn policy(&self) -> AccountPolicy {
+        if let Some(policy) = &self.account_policy {
+            return policy.clone();
+        }
+        let mtime = std::fs::metadata(crate::config::resolve_read_path("config"))
+            .and_then(|m| m.modified())
+            .ok();
+        let mut cache = self.policy_cache.lock().unwrap_or_else(|e| e.into_inner());
+        let config_policy = match cache.as_ref() {
+            Some((cached_mtime, policy)) if *cached_mtime == mtime => policy.clone(),
+            _ => {
+                let (policy, _warnings) = AccountPolicy::from_config_map(
+                    &crate::config::load_config().auth.accounts,
+                );
+                *cache = Some((mtime, policy.clone()));
+                policy
+            }
+        };
+        config_policy.with_env_overlay()
+    }
+
+    /// Limits follow the immutable seat, not an alias that can be re-used.
+    fn cooldown_key(&self, cred: &CredentialRef) -> String {
+        let seat = self
+            .stored_seat(cred)
+            .ok()
+            .map(|s| s.as_str().to_string())
+            .unwrap_or_else(|| cred.storage_key());
+        format!(
+            "{}|{}|{}",
+            storage::auth_file_path().display(),
+            cred.provider,
+            seat
+        )
+    }
+
+    /// Reading an expired cooldown is non-mutating (preview shares this path).
+    fn cooldown_until(&self, storage_key: &str, now_ms: u64) -> Option<u64> {
+        let cred = CredentialRef::parse_storage_key(storage_key)?;
+        let key = self.cooldown_key(&cred);
+        self.cooldowns
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+            .filter(|c| c.until_ms > now_ms)
+            .map(|c| c.until_ms)
+    }
+
+    // ── `synaps auth state` ─────────────────────────────────────────────
+
+    /// What this broker remembers about the accounts `query` selects: no
+    /// network request, no refresh; the account list comes from the store.
+    /// With `query.clear`, their in-memory state is dropped first.
+    pub fn auth_state(
+        &self,
+        query: &super::auth_state::AuthStateQuery,
+    ) -> Result<super::auth_state::AuthStateReport, BrokerError> {
+        auth_state_report(Some(self), query)
+    }
+
+    /// The active cooldown of `cred`'s current seat, with its reason.
+    fn cooldown_state(
+        &self,
+        cred: &CredentialRef,
+        now_ms: u64,
+    ) -> Option<super::auth_state::CooldownState> {
+        let key = self.cooldown_key(cred);
+        self.cooldowns
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+            .filter(|c| c.until_ms > now_ms)
+            .map(|c| super::auth_state::CooldownState {
+                until_ms: c.until_ms,
+                reason: super::auth_state::CooldownReason::from_reported(&c.reason),
+            })
+    }
+
+    /// Drop the in-memory state of `creds`: cooldowns, cached usage
+    /// readings, held usage-read failures and last good readings in the
+    /// process-wide table (its gates stay), `auth state` records and
+    /// stickiness. With
+    /// `whole_providers` (no single account was named), also every cooldown
+    /// and selection record of those providers, including ones a previous
+    /// occupant of a slot left. Never touches the credential store.
+    fn clear_state(&self, creds: &[CredentialRef], whole_providers: &[OAuthProviderId]) {
+        let store = storage::auth_file_path().display().to_string();
+        {
+            let mut cooldowns = self.cooldowns.lock().unwrap_or_else(|e| e.into_inner());
+            for cred in creds {
+                cooldowns.remove(&self.cooldown_key(cred));
+                cooldowns.remove(&format!("{store}|{}|{}", cred.provider, cred.storage_key()));
+            }
+            for provider in whole_providers {
+                let prefix = format!("{store}|{provider}|");
+                cooldowns.retain(|k, _| !k.starts_with(&prefix));
+            }
+        }
+        for cred in creds {
+            self.forget_snapshots(cred);
+            self.usage_reads.forget(&self.read_key(cred));
+        }
+        {
+            let mut observations = self.observations.lock().unwrap_or_else(|e| e.into_inner());
+            for cred in creds {
+                observations.remove(&Self::state_key(cred));
+            }
+        }
+        self.current_accounts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|_, (current, _)| !creds.contains(current));
+        let mut selections = self.selections.lock().unwrap_or_else(|e| e.into_inner());
+        for provider in whole_providers {
+            let prefix = format!("{store}|{provider}|");
+            selections.retain(|k, _| !k.starts_with(&prefix));
+        }
+    }
+
+    /// Verify an explicitly addressed slot exists. Named slots that are
+    /// missing are `UnknownAccount` (never a fallback); the default slot
+    /// keeps the historical load-miss `Credential` error from the refresh
+    /// path so existing "not logged in" classifiers keep working.
+    fn check_slot_exists(&self, cred: &CredentialRef) -> Result<(), BrokerError> {
+        if let Account::Named(label) = &cred.account {
+            match storage::load_credential(cred) {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    return Err(BrokerError::UnknownAccount {
+                        provider: cred.provider.as_str().to_string(),
+                        label: label.as_str().to_string(),
+                    })
+                }
+                Err(e) => return Err(BrokerError::Credential(e)),
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolve and vend for a request: explicit account (validated, never a
+    /// fallback) or the policy; `auto` goes through capacity selection with
+    /// the token paired to the proven seat.
+    async fn resolve_and_vend(
+        &self,
+        provider: OAuthProviderId,
+        explicit: Option<Account>,
+        model: Option<&str>,
+    ) -> Result<PinnedToken, BrokerError> {
+        let selector = match explicit {
+            Some(account) => AccountSelector::Account(account),
+            None => self.policy().selector(provider),
+        };
+        match selector {
+            AccountSelector::Account(account) => {
+                let credential = CredentialRef::new(provider, account);
+                let token = self.access_token_for(&credential).await?;
+                Ok(PinnedToken { credential, token })
+            }
+            AccountSelector::Auto => self.vend_auto(provider, model).await,
+            AccountSelector::Invalid { source, reason } => {
+                Err(BrokerError::InvalidAccount(format!("{source}: {reason}")))
+            }
+        }
+    }
+
+    /// Bound on select → seat-pinned vend rounds when the chosen slot is
+    /// replaced underneath us (re-login storm / rotation by another process).
+    const MAX_AUTO_VEND_ROUNDS: usize = 2;
+
+    /// `auto`: select on fresh usage, then vend a token for exactly the seat
+    /// that usage was read from. If the slot changed in between (re-login,
+    /// removal, rotation by another party) the reading is discarded and the
+    /// selection re-runs once on the new content; never a token for a seat
+    /// whose capacity was not proven.
+    async fn vend_auto(
+        &self,
+        provider: OAuthProviderId,
+        model: Option<&str>,
+    ) -> Result<PinnedToken, BrokerError> {
+        use super::token::{ensure_fresh_credential_for_seat, SeatVendError};
+        for _ in 0..Self::MAX_AUTO_VEND_ROUNDS {
+            let (credential, seat) = match self.select_auto(provider, model).await {
+                Ok(choice) => choice,
+                Err(e) => {
+                    let failure = match &e {
+                        BrokerError::NoAccountAvailable { failure, .. } => failure.clone(),
+                        // The account list could not be read (select_auto
+                        // logged it).
+                        _ => Some(super::quota_policy::SelectionFailure::new(
+                            super::quota_policy::SelectionFailureKind::CredentialStore,
+                        )),
+                    };
+                    self.record_selection(provider, model, None, failure, None);
+                    return Err(e);
+                }
+            };
+            match ensure_fresh_credential_for_seat(
+                &self.http,
+                &credential,
+                &seat,
+                &self.refresh_endpoints,
+            )
+            .await
+            {
+                Ok(creds) => {
+                    self.current_accounts
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(
+                            Self::current_key(provider, model),
+                            (credential.clone(), seat),
+                        );
+                    self.record_selection(provider, model, Some(&credential), None, None);
+                    return Ok(PinnedToken {
+                        credential,
+                        token: AccessToken {
+                            token: creds.access,
+                            expires: creds.expires,
+                        },
+                    })
+                }
+                Err(SeatVendError::SeatChanged) => {
+                    tracing::info!(credential = %credential, "slot changed after selection; re-selecting");
+                    self.forget_snapshots(&credential);
+                    continue;
+                }
+                // Typed, so a transient refresh failure of the chosen seat
+                // is never reported as an unusable login.
+                Err(SeatVendError::Other(f)) => {
+                    let cause = refresh_failure(&f);
+                    tracing::warn!(
+                        credential = %credential,
+                        kind = %cause.kind,
+                        "automatic choice could not be vended: token refresh failed"
+                    );
+                    self.record_selection(provider, model, Some(&credential), None, Some(cause));
+                    return Err(BrokerError::Refresh(auto_vend_failure(&credential, f)));
+                }
+            }
+        }
+        let failure = super::quota_policy::SelectionFailure::new(
+            super::quota_policy::SelectionFailureKind::SeatChurn,
+        );
+        self.record_selection(provider, model, None, Some(failure.clone()), None);
+        Err(selection_failed(
+            provider,
+            model,
+            "selected credential kept changing while its capacity was being proven".into(),
+            failure,
+        ))
+    }
+
+    /// Record the outcome of an automatic selection for `synaps auth state`.
+    fn record_selection(
+        &self,
+        provider: OAuthProviderId,
+        model: Option<&str>,
+        chosen: Option<&CredentialRef>,
+        failure: Option<super::quota_policy::SelectionFailure>,
+        vend_failure: Option<super::quota_policy::ObservationFailure>,
+    ) {
+        let state = super::auth_state::SelectionState {
+            provider: provider.as_str().to_string(),
+            model: model.map(str::to_string),
+            at_ms: crate::epoch_millis(),
+            chosen: chosen.map(|c| c.account.label_str().to_string()),
+            failure,
+            vend_failure,
+        };
+        self.selections
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(Self::current_key(provider, model), state);
+    }
+
+    /// Cache key for one stored seat: credential file + slot + identity of
+    /// the material stored there. Never contains token material.
+    fn seat_key(cred: &CredentialRef, seat: &SeatIdentity) -> String {
+        format!(
+            "{}|{}|{}",
+            storage::auth_file_path().display(),
+            cred.storage_key(),
+            seat.as_str()
+        )
+    }
+
+    /// Identity of the credential currently stored in `cred`'s slot.
+    fn stored_seat(&self, cred: &CredentialRef) -> Result<SeatIdentity, BrokerError> {
+        match storage::load_credential(cred).map_err(BrokerError::Credential)? {
+            Some(creds) => Ok(SeatIdentity::of(cred.provider, &creds)),
+            None => Err(BrokerError::UnknownAccount {
+                provider: cred.provider.as_str().to_string(),
+                label: cred.account.label_str().to_string(),
+            }),
+        }
+    }
+
+    fn cached_snapshot(&self, key: &str) -> Option<super::usage::UsageSnapshot> {
+        let max_age_ms = self.max_snapshot_age.as_millis() as u64;
+        let now_ms = crate::epoch_millis();
+        self.snapshots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(key)
+            .filter(|s| !s.is_stale(now_ms, max_age_ms))
+            .cloned()
+    }
+
+    /// Usage-read table key for `cred`'s slot: credential file + storage key
+    /// + usage endpoint. Stable across token rotation; no token material.
+    fn read_key(&self, cred: &CredentialRef) -> String {
+        format!(
+            "{}|{}|{}",
+            storage::auth_file_path().display(),
+            cred.storage_key(),
+            self.usage_endpoint_override.as_deref().unwrap_or("")
+        )
+    }
+
+    /// Drop every cached reading for `cred`'s slot (any seat). The
+    /// single-flight gate lives in the process-wide usage-read table and is
+    /// never dropped, so this cannot open a second flight.
+    fn forget_snapshots(&self, cred: &CredentialRef) {
+        let prefix = format!("|{}|", cred.storage_key());
+        self.snapshots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|k, _| !k.contains(&prefix));
+    }
+
+    /// Fresh usage snapshot for `cred` plus the seat it was read from: the
+    /// short-lived cache is consulted first (never past `max_snapshot_age`,
+    /// and only for the seat currently stored in the slot), otherwise the
+    /// process-wide usage-read table: ONE read per slot at a time across
+    /// every broker in the process, and a held failed read is answered
+    /// without a request. The token for the read and the reported seat come
+    /// from the same load, so the pair is exact even if the slot changes
+    /// concurrently.
+    async fn fresh_usage(
+        &self,
+        cred: &CredentialRef,
+    ) -> Result<(super::usage::UsageSnapshot, SeatIdentity), super::usage_reads::ReadError> {
+        let seat = self
+            .stored_seat(cred)
+            .map_err(|e| UsageReadError::slot(e).into_read_error())?;
+        let key = Self::seat_key(cred, &seat);
+        if let Some(cached) = self.cached_snapshot(&key) {
+            return Ok((cached, seat));
+        }
+        let (snapshot, used) = self.shared_read(cred).await?;
+        // One slot holds one seat: a reading for its current content
+        // supersedes anything cached for a previous occupant.
+        self.forget_snapshots(cred);
+        let used_key = Self::seat_key(cred, &used);
+        self.snapshots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(used_key, snapshot.clone());
+        Ok((snapshot, used))
+    }
+
+    /// Read-only usage for `cred` through the process-wide usage-read table,
+    /// reporting the seat whose token made the request. A failure keeps its
+    /// typed cause.
+    async fn usage_with_seat(
+        &self,
+        cred: &CredentialRef,
+    ) -> Result<(super::usage::UsageSnapshot, SeatIdentity), UsageReadError> {
+        self.shared_read(cred)
+            .await
+            .map_err(|e| UsageReadError::from_read(&e))
+    }
+
+    /// Key of a slot's `auth state` records: credential file + storage key.
+    /// Never contains token material.
+    fn state_key(cred: &CredentialRef) -> String {
+        format!(
+            "{}|{}",
+            storage::auth_file_path().display(),
+            cred.storage_key()
+        )
+    }
+
+    fn record_usage(
+        &self,
+        cred: &CredentialRef,
+        failure: Option<super::quota_policy::ObservationFailure>,
+    ) {
+        let at_ms = crate::epoch_millis();
+        let mut observations = self.observations.lock().unwrap_or_else(|e| e.into_inner());
+        let slot = observations.entry(Self::state_key(cred)).or_default();
+        if failure.is_none() {
+            slot.last_usage_ok_ms = Some(at_ms);
+        }
+        slot.last_usage = Some(super::auth_state::ObservedOutcome { at_ms, failure });
+    }
+
+    /// One usage read for `cred` through the process-wide table, with its
+    /// INFO line (account label, outcome, failure kind/status; no token).
+    /// A read that went to the network (or joined one in flight) is
+    /// recorded for `synaps auth state`; a held read sends nothing and is
+    /// not a new read.
+    async fn shared_read(&self, cred: &CredentialRef) -> super::usage_reads::ReadResult {
+        use super::usage_reads::{ReadError, ReadPath, USAGE_READ_TARGET};
+        let key = self.read_key(cred);
+        let (result, path) = self
+            .usage_reads
+            .read(&key, || self.network_read(cred))
+            .await;
+        if path != ReadPath::NegativeCacheHit {
+            self.record_usage(cred, result.as_ref().err().map(ReadError::cause));
+        }
+        let outcome = match (path, &result) {
+            (ReadPath::Network, Ok(_)) => "ok",
+            (ReadPath::Network, Err(_)) => "failed",
+            (ReadPath::Joined, _) => "joined",
+            (ReadPath::NegativeCacheHit, _) => "negative_cache_hit",
+        };
+        let now_ms = crate::epoch_millis();
+        let (kind, status, retry_in_s) = match &result {
+            Ok(_) => ("none", String::new(), 0),
+            Err(ReadError::Transient {
+                failure,
+                retry_at_ms,
+            }) => (
+                failure.kind,
+                failure.status.map(|s| s.to_string()).unwrap_or_default(),
+                retry_at_ms.saturating_sub(now_ms) / 1000,
+            ),
+            Err(ReadError::Other { cause, .. }) => (
+                cause.kind.as_str(),
+                cause.http_status.map(|s| s.to_string()).unwrap_or_default(),
+                0,
+            ),
+        };
+        tracing::info!(
+            target: USAGE_READ_TARGET,
+            broker = self.instance,
+            account = %cred.account.label_str(),
+            outcome = %outcome,
+            kind = %kind,
+            status = %status,
+            retry_in_s,
+            "usage read"
+        );
+        result
+    }
+
+    /// One network usage read for `cred`, reporting the seat whose token
+    /// made the request. Token resolution happens HERE, behind the boundary,
+    /// for exactly this credential; the usage helper pairs any account
+    /// header with the same token. Only [`Self::shared_read`] calls it.
+    async fn network_read(&self, cred: &CredentialRef) -> super::usage_reads::Fetched {
+        use super::usage::{fetch_usage, supports_usage, UsageClient, UsageError, UsageFetchOptions};
+        use super::usage_reads::Fetched;
+        if !supports_usage(cred.provider) {
+            return Fetched::Usage(UsageError::UnsupportedProvider {
+                provider: cred.provider.as_str().to_string(),
+            });
+        }
+        if let Err(e) = self.check_slot_exists(cred) {
+            return UsageReadError::slot(e).into_fetched();
+        }
+        let creds = match super::token::ensure_fresh_credential_via(
+            &self.http,
+            cred,
+            &self.refresh_endpoints,
+        )
+        .await
+        {
+            Ok(creds) => creds,
+            Err(f) => return UsageReadError::refresh(f).into_fetched(),
+        };
+        let seat = SeatIdentity::of(cred.provider, &creds);
+        let client = match UsageClient::new() {
+            Ok(client) => client,
+            Err(e) => return Fetched::Usage(e),
+        };
+        let opts = UsageFetchOptions {
+            endpoint_override: self.usage_endpoint_override.clone(),
+            ..UsageFetchOptions::default()
+        };
+        match fetch_usage(
+            &client,
+            cred.provider,
+            cred.account.label_str(),
+            &creds.access,
+            &opts,
+        )
+        .await
+        {
+            Ok(snapshot) => Fetched::Ok(snapshot, seat),
+            Err(e) => Fetched::Usage(e),
+        }
+    }
+
+    /// Capacity view for one account from a fresh, read-only usage snapshot,
+    /// with the seat it was read from. Anything that is not a well-formed,
+    /// fresh reading is NOT capacity; a failed read keeps its typed cause. A
+    /// read that failed transiently also reports that failure (and when
+    /// reads resume) and, when the slot has one read from the account stored
+    /// there now, its last good reading for the policy's grace, paired with
+    /// that stored seat.
+    async fn capacity_for(&self, cred: &CredentialRef) -> CandidateRead {
+        use super::quota_policy::AccountCapacity;
+        use super::usage_reads::ReadError;
+        match self.fresh_usage(cred).await {
+            Ok((snapshot, seat)) => CandidateRead {
+                capacity: capacity_from_snapshot(cred, &snapshot),
+                seat: Some(seat),
+                transient: None,
+                grace: None,
+            },
+            Err(read_err) => {
+                let err = UsageReadError::from_read(&read_err);
+                if err.failure.kind.needs_action() {
+                    // Only the user can fix this, outside synaps; the
+                    // selection failure names just the kind, so say here
+                    // what and where.
+                    tracing::warn!(
+                        credential = %cred,
+                        kind = %err.failure.kind,
+                        detail = %action_detail(cred, &err),
+                        "usage read needs action"
+                    );
+                } else {
+                    tracing::debug!(credential = %cred, cause = %err.failure, "usage read failed");
+                }
+                let capacity = AccountCapacity::failed(cred.clone(), err.failure);
+                let ReadError::Transient {
+                    failure,
+                    retry_at_ms,
+                } = read_err
+                else {
+                    return CandidateRead {
+                        capacity,
+                        seat: None,
+                        transient: None,
+                        grace: None,
+                    };
+                };
+                // Grace only on a reading of the account in the slot now: a
+                // re-login to another account id never inherits it.
+                let graced = self.stored_seat(cred).ok().and_then(|seat| {
+                    let good = self
+                        .usage_reads
+                        .last_good_for(&self.read_key(cred), &seat)?;
+                    Some((good, seat))
+                });
+                let (grace, seat) = match graced {
+                    Some((good, seat)) => (Some(capacity_from_snapshot(cred, &good)), Some(seat)),
+                    None => (None, None),
+                };
+                CandidateRead {
+                    capacity,
+                    seat,
+                    transient: Some((failure, retry_at_ms)),
+                    grace,
+                }
+            }
+        }
+    }
+
+    /// Preview the exact ranking without vending inference credentials or
+    /// changing stickiness/cooldowns. Usage reads may refresh expired OAuth
+    /// tokens through the ordinary rotation-safe credential path.
+    pub async fn plan(
+        &self,
+        provider: OAuthProviderId,
+        model: Option<&str>,
+    ) -> Result<super::SelectionPlan, BrokerError> {
+        self.selection_plan(provider, model)
+            .await
+            .map(|(plan, ..)| plan)
+    }
+
+    #[allow(clippy::type_complexity)]
+    async fn selection_plan(
+        &self,
+        provider: OAuthProviderId,
+        model: Option<&str>,
+    ) -> Result<
+        (
+            super::SelectionPlan,
+            BTreeMap<String, SeatIdentity>,
+            BTreeMap<String, (super::usage_reads::TransientReadFailure, u64)>,
+        ),
+        BrokerError,
+    > {
+        use super::quota_policy::SelectionRequest;
+        let summaries = storage::list_accounts(provider).map_err(BrokerError::Credential)?;
+        let mut candidates = Vec::with_capacity(summaries.len());
+        let mut seats = BTreeMap::new();
+        let mut transient = BTreeMap::new();
+        let mut grace = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
+        let mut exclude = Vec::new();
+        for summary in &summaries {
+            let Some(cred) = summary.credential_ref() else {
+                continue;
+            };
+            let read = self.capacity_for(&cred).await;
+            let (mut capacity, seat) = (read.capacity, read.seat);
+            if let Some(failed) = read.transient {
+                transient.insert(cred.storage_key(), failed);
+            }
+            // The same entitlement guard for a fresh reading and for a last
+            // good reading standing in for a failed read.
+            require_requested_model(provider, model, &mut capacity);
+            grace.extend(read.grace.map(|mut good| {
+                require_requested_model(provider, model, &mut good);
+                good
+            }));
+            if let Some(seat) = seat {
+                if !seen.insert(seat.as_str().to_string()) {
+                    exclude.push(cred.clone());
+                }
+                seats.insert(cred.storage_key(), seat);
+            }
+            candidates.push(capacity);
+        }
+        let now_ms = crate::epoch_millis();
+        for capacity in &mut candidates {
+            capacity.cooldown_until_ms =
+                self.cooldown_until(&capacity.credential.storage_key(), now_ms);
+        }
+        let previous = self
+            .current_accounts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&Self::current_key(provider, model))
+            .cloned();
+        let current = previous
+            .filter(|(cred, seat)| seats.get(&cred.storage_key()) == Some(seat))
+            .map(|(cred, _)| cred);
+        let policy = self.auto_policy();
+        let preference: Vec<_> = summaries.iter().map(|s| s.label.clone()).collect();
+        let request = SelectionRequest {
+            model,
+            preference: &preference,
+            exclude: &exclude,
+            strategy: policy.strategy_for(provider),
+            current: current.as_ref(),
+            urgent_horizon_ms: policy.urgent_horizon_ms,
+            sticky: policy.sticky,
+            grace: &grace,
+            ..SelectionRequest::new(provider, now_ms, self.max_snapshot_age.as_millis() as u64)
+        };
+        Ok((
+            super::SelectionPlan::from_candidates(&request, &candidates),
+            seats,
+            transient,
+        ))
+    }
+
+    async fn select_auto(
+        &self,
+        provider: OAuthProviderId,
+        model: Option<&str>,
+    ) -> Result<(CredentialRef, SeatIdentity), BrokerError> {
+        use super::quota_policy::{Selection, SelectionFailure, SelectionFailureKind};
+        use super::usage_reads::USAGE_READ_TARGET;
+        let (plan, mut seats, transient) = match self.selection_plan(provider, model).await {
+            Ok(planned) => planned,
+            // The account list itself could not be read (the only error
+            // `selection_plan` returns): still exactly one WARN for this
+            // failed selection, and the caller gets the store's own error.
+            Err(e) => {
+                log_selection_failure(
+                    provider,
+                    model,
+                    &SelectionFailure::new(SelectionFailureKind::CredentialStore),
+                );
+                return Err(e);
+            }
+        };
+        match plan.selection {
+            Selection::Selected {
+                credential,
+                tier,
+                budget_reset_ms,
+                utilization,
+                ..
+            } => {
+                // Every account whose usage was read has its seat, so a
+                // selected account always has one.
+                let seat = seats.remove(&credential.storage_key());
+                debug_assert!(
+                    seat.is_some(),
+                    "selected account has no paired seat identity"
+                );
+                let Some(seat) = seat else {
+                    return Err(selection_failed(
+                        provider,
+                        model,
+                        "selected account has no paired seat identity".into(),
+                        SelectionFailure::new(SelectionFailureKind::SeatChurn),
+                    ));
+                };
+                // A chosen account whose read failed was chosen on its last
+                // good reading (the policy's grace).
+                if let Some((failure, retry_at_ms)) = transient.get(&credential.storage_key()) {
+                    tracing::info!(
+                        target: USAGE_READ_TARGET,
+                        broker = self.instance,
+                        account = %credential.account.label_str(),
+                        outcome = %"grace",
+                        kind = %failure.kind,
+                        status = %failure.status.map(|s| s.to_string()).unwrap_or_default(),
+                        retry_in_s = retry_at_ms.saturating_sub(crate::epoch_millis()) / 1000,
+                        "usage read"
+                    );
+                }
+                tracing::info!(%credential, ?plan.strategy, tier, ?budget_reset_ms, ?utilization, "automatic subscription choice");
+                Ok((credential, seat))
+            }
+            Selection::NoCapacity {
+                rejections,
+                earliest_reset_ms,
+            } => {
+                let detail: Vec<_> = rejections
+                    .iter()
+                    .map(|r| format!("{}: {}", r.credential.account, r.describe()))
+                    .collect();
+                let reset = earliest_reset_ms
+                    .map(|t| format!("; earliest reset at {t}"))
+                    .unwrap_or_default();
+                let mut failure = super::quota_policy::SelectionFailure::from_rejections(
+                    &rejections,
+                    plan.now_ms,
+                );
+                // A held usage read goes to the network again at the next
+                // selection after its hold ends: say when.
+                if failure.kind == SelectionFailureKind::UsageReadFailed {
+                    failure.usage_read_retry_ms = rejections
+                        .iter()
+                        .filter_map(|r| transient.get(&r.credential.storage_key()))
+                        .map(|(_, at)| *at)
+                        .min();
+                }
+                let reason = if detail.is_empty() {
+                    format!("no {provider} account is logged in")
+                } else {
+                    format!("{}{reset}", detail.join(", "))
+                };
+                Err(selection_failed(provider, model, reason, failure))
+            }
+        }
     }
 
     /// Test/embedding seam: pin the `local` provider endpoint explicitly.
@@ -1554,59 +2783,170 @@ impl LocalBroker {
 
     async fn send(&self, request: &ProxyRequest) -> Result<reqwest::Response, BrokerError> {
         request.validate()?;
-        let (key, base) = if request.provider == "xai-auth" {
-            let token = self.access_token(OAuthProviderId::Xai).await?;
-            (token.token, "https://api.x.ai/v1".to_string())
-        } else if request.provider == "github-copilot" {
+        let (provider_key, explicit_account) = request.split_provider()?;
+        let provider_key = provider_key.as_str();
+        // OAuth-proxied providers: resolve ONE credential (explicit account
+        // or policy) and derive both the bearer and any account-specific
+        // header from that same credential.
+        let oauth_provider: Option<OAuthProviderId> = provider_key.parse().ok();
+        let mut pinned: Option<PinnedToken> = None;
+        // Muse honours the official CLI's `META_API_KEY` override: a Model
+        // API key from the environment wins over the account login (only for
+        // policy-selected requests — an explicit account stays explicit).
+        let muse_env_key = (provider_key == "muse" && explicit_account.is_none())
+            .then(super::muse::api_key_from_env)
+            .flatten();
+        if let Some(provider) = oauth_provider.filter(|_| muse_env_key.is_none()) {
+            if provider_key != LOCAL_PROVIDER_KEY && static_provider(provider_key).is_none() {
+                pinned = Some(self.resolve_and_vend(provider, explicit_account, None).await?);
+            }
+        }
+        let bearer = |pinned: &Option<PinnedToken>| -> Result<String, BrokerError> {
+            pinned
+                .as_ref()
+                .map(|p| p.token.token.clone())
+                .ok_or_else(|| BrokerError::UnknownProvider(request.provider.clone()))
+        };
+        let (key, base) = if provider_key == "xai-auth" {
+            (bearer(&pinned)?, "https://api.x.ai/v1".to_string())
+        } else if provider_key == "github-copilot" {
             // Catalog-only OAuth proxy: short-lived Copilot session token only.
             // Never attach the GitHub user token (stored as OAuth refresh).
-            let token = self.access_token(OAuthProviderId::GitHubCopilot).await?;
             (
-                token.token,
+                bearer(&pinned)?,
                 super::github_copilot_models_base_url().to_string(),
             )
-        } else if request.provider == "google-gemini" {
+        } else if provider_key == "google-gemini" {
             // Google Gemini (Code Assist) is broker-proxy-only. Refresh stays
             // broker-owned; runtime never receives it.
-            let token = self.access_token(OAuthProviderId::GoogleGemini).await?;
             let base = self
                 .google_gemini_base_url
                 .clone()
                 .unwrap_or_else(|| GOOGLE_GEMINI_CODE_ASSIST_BASE_URL.to_string());
-            (token.token, base)
-        } else if request.provider == "openai-codex" {
+            (bearer(&pinned)?, base)
+        } else if provider_key == "openai-codex" {
             // Catalog-only OAuth proxy for ChatGPT backend models. Access token
             // never leaves the broker; account header is derived broker-side.
-            let token = self.access_token(OAuthProviderId::OpenAiCodex).await?;
-            (token.token, OPENAI_CODEX_BACKEND_BASE_URL.to_string())
-        } else if request.provider == "kimi-code" {
+            let base = self
+                .openai_codex_base_url
+                .clone()
+                .unwrap_or_else(|| OPENAI_CODEX_BACKEND_BASE_URL.to_string());
+            (bearer(&pinned)?, base)
+        } else if provider_key == "kimi-code" {
             // Managed Kimi Code OAuth proxy: short-lived (~15 min) access
             // token resolved broker-side; the rotating refresh token never
             // leaves the boundary. Base is pinned to the managed endpoint.
-            let token = self.access_token(OAuthProviderId::KimiCode).await?;
-            (token.token, super::kimi_code::API_BASE_URL.to_string())
-        } else if request.provider == "anthropic" {
+            (bearer(&pinned)?, super::kimi_code::API_BASE_URL.to_string())
+        } else if provider_key == "muse" {
+            // Meta Muse: the bearer is a Model API key (env override, or the
+            // key minted from the broker-owned Meta OAuth login). The OAuth
+            // token itself never leaves the boundary. Origin is pinned; the
+            // allowlist pins the paths.
+            let key = match &muse_env_key {
+                Some(key) => key.clone(),
+                None => bearer(&pinned)?,
+            };
+            let base = self
+                .muse_base_url
+                .clone()
+                .unwrap_or_else(|| super::muse::API_ORIGIN.to_string());
+            (key, base)
+        } else if provider_key == "anthropic" {
             // Catalog-only OAuth proxy for Anthropic /v1/models pagination.
             // Keeps the access token broker-owned (no runtime token vending).
-            let token = self.access_token(OAuthProviderId::Anthropic).await?;
-            (token.token, "https://api.anthropic.com".to_string())
+            (bearer(&pinned)?, "https://api.anthropic.com".to_string())
         } else {
             (
-                self.resolve_static_key(&request.provider)?,
-                self.base_url_for(&request.provider)?,
+                self.resolve_static_key(provider_key)?,
+                self.base_url_for(provider_key)?,
             )
         };
+        let response = self
+            .dispatch(request, provider_key, &key, &base, &pinned)
+            .await?;
+        // Muse mirrors the official CLI: a 401 on a minted key re-mints ONCE
+        // from the stored OAuth login (under the credential's refresh locks;
+        // a peer's fresh key is adopted instead) and the request is retried
+        // once. An env-supplied key is never re-minted.
+        //
+        // If the re-mint is refused (forced-refresh cooldown) or the mint
+        // rejects the stored login, the caller gets the ORIGINAL upstream 401
+        // — status and body untouched, exactly like the env-key path — not a
+        // broker error (the authenticator-gives-up convention). A transient,
+        // lock-busy or local failure is a retryable `BrokerError::Refresh`
+        // instead. Only the status has been read, so `response` is still
+        // unconsumed here. This covers `proxy` and `proxy_stream`, which both
+        // go through `send`.
+        if provider_key == "muse" && response.status() == reqwest::StatusCode::UNAUTHORIZED {
+            if let Some(rejected) = pinned.as_ref() {
+                tracing::info!(credential = %rejected.credential, "muse key rejected (401); re-minting once");
+                match self.recover_rejected_token(&rejected.credential, &key).await {
+                    Ok(fresh) => {
+                        let pinned = Some(PinnedToken {
+                            credential: rejected.credential.clone(),
+                            token: fresh,
+                        });
+                        let key = bearer(&pinned)?;
+                        return self
+                            .dispatch(request, provider_key, &key, &base, &pinned)
+                            .await;
+                    }
+                    // A transient mint failure, a busy refresh lock, a local
+                    // failure or something the user must fix elsewhere (a
+                    // corrupt store) says nothing about the login: surface
+                    // the refresh error, not the upstream 401 (which the
+                    // runtime shows as "sign in again").
+                    Err(BrokerError::Refresh(f))
+                        if f.kind.is_retryable()
+                            || f.kind == super::token::RefreshFailureKind::ActionRequired =>
+                    {
+                        tracing::warn!(
+                            credential = %rejected.credential,
+                            reason = %f,
+                            "muse key re-mint failed; returning a retryable error"
+                        );
+                        return Err(BrokerError::Refresh(f));
+                    }
+                    Err(e) => {
+                        // Token-free: recovery errors carry sanitized reasons
+                        // (cooldown, MuseAuthError labels, lock timeouts).
+                        tracing::warn!(
+                            credential = %rejected.credential,
+                            reason = %e,
+                            "muse key re-mint refused or rejected; returning the upstream 401"
+                        );
+                    }
+                }
+            }
+        }
+        Ok(response)
+    }
+
+    /// Build and send one upstream request with an already-resolved bearer.
+    async fn dispatch(
+        &self,
+        request: &ProxyRequest,
+        provider_key: &str,
+        key: &str,
+        base: &str,
+        pinned: &Option<PinnedToken>,
+    ) -> Result<reqwest::Response, BrokerError> {
         let url = format!("{base}{}", request.path);
         // Deny redirects for credential-bearing OAuth catalog traffic and
         // google-gemini: a 3xx must not replay the bearer token off-origin.
-        let mut builder = if request.provider == "google-gemini"
-            || request.provider == "openai-codex"
-            || request.provider == "anthropic"
-            || request.provider == "kimi-code"
+        let mut builder = if provider_key == "google-gemini"
+            || provider_key == "openai-codex"
+            || provider_key == "anthropic"
+            || provider_key == "kimi-code"
+            || provider_key == "muse"
         {
+            // `read_timeout` is an IDLE timer (reset on every read), so a
+            // long SSE stream that keeps sending is never cut; a stalled one
+            // (silent NAT drop, hung edge) fails instead of hanging the turn.
             let no_redirect = reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
                 .connect_timeout(Duration::from_secs(10))
+                .read_timeout(self.stream_idle_timeout_for(provider_key))
                 .build()
                 .map_err(|e| BrokerError::Transport(format!("client build failed: {e}")))?;
             match request.method {
@@ -1619,16 +2959,23 @@ impl LocalBroker {
                 ProxyMethod::Post => self.http.post(&url),
             }
         };
-        builder = builder.bearer_auth(&key);
-        if request.provider == "openai-codex" {
-            // ChatGPT backend requires the account id. Prefer the stored
-            // credential claim; fall back to JWT extraction. Never silently omit.
-            let account_id = super::load_provider_auth("openai-codex")
-                .ok()
-                .flatten()
-                .and_then(|c| c.account_id)
-                .filter(|s| !s.trim().is_empty())
-                .or_else(|| super::extract_codex_account_id(&key))
+        builder = builder.bearer_auth(key);
+        if provider_key == "openai-codex" {
+            // ChatGPT backend requires the account id. Derive it from the SAME
+            // credential that produced the bearer: the JWT claim first, then
+            // that slot's stored `accountId`. Never another slot, never omitted.
+            let cred = pinned
+                .as_ref()
+                .map(|p| p.credential.clone())
+                .unwrap_or_else(|| CredentialRef::default_for(OAuthProviderId::OpenAiCodex));
+            let account_id = super::extract_codex_account_id(key)
+                .or_else(|| {
+                    storage::load_credential(&cred)
+                        .ok()
+                        .flatten()
+                        .and_then(|c| c.account_id)
+                        .filter(|s| !s.trim().is_empty())
+                })
                 .ok_or_else(|| {
                     BrokerError::Credential(
                         "openai-codex credential is missing chatgpt account id".into(),
@@ -1640,14 +2987,14 @@ impl LocalBroker {
                 .header("OpenAI-Beta", "responses=experimental")
                 .header("accept", "application/json");
         }
-        if request.provider == "anthropic" {
+        if provider_key == "anthropic" {
             // OAuth catalog: Bearer + anthropic-version + anthropic-beta.
             // Do NOT send the OAuth token as x-api-key.
             for (name, value) in anthropic_oauth_catalog_request_headers() {
                 builder = builder.header(*name, *value);
             }
         }
-        if request.provider == "github-copilot" {
+        if provider_key == "github-copilot" {
             for (name, value) in super::github_copilot_models_request_headers() {
                 builder = builder.header(*name, *value);
             }
@@ -1657,7 +3004,7 @@ impl LocalBroker {
                     .header("X-Initiator", "agent");
             }
         }
-        if request.provider == "google-gemini" {
+        if provider_key == "google-gemini" {
             // The Code Assist reference client uses `?alt=sse` for streaming.
             // Match that so upstream returns line-delimited SSE frames rather
             // than JSON-in-one-response.
@@ -1666,7 +3013,12 @@ impl LocalBroker {
             }
             builder = builder.header("user-agent", "SynapsCLI/0.6.0 (google-gemini)");
         }
-        if request.provider == "kimi-code" {
+        if provider_key == "muse" {
+            // API-key requests need only Authorization (verified); identify
+            // Synaps honestly instead of mimicking the official client.
+            builder = builder.header("user-agent", super::muse::USER_AGENT);
+        }
+        if provider_key == "kimi-code" {
             // Conventional Kimi device-identity surface (mirrors the official
             // CLI's `X-Msh-*` headers). Values are non-secret; the User-Agent
             // identifies Synaps honestly.
@@ -1694,7 +3046,7 @@ impl LocalBroker {
             builder = builder.timeout(self.request_timeout);
         }
         builder.send().await.map_err(|e| {
-            if e.is_connect() && request.provider == LOCAL_PROVIDER_KEY {
+            if e.is_connect() && provider_key == LOCAL_PROVIDER_KEY {
                 BrokerError::Transport(format!(
                     "can't reach local endpoint at {url} — is Ollama/LM Studio running?"
                 ))
@@ -1704,6 +3056,283 @@ impl LocalBroker {
             }
         })
     }
+}
+
+// ── Usage → capacity mapping (fail closed) ───────────────────────────────────
+
+/// Map a typed usage snapshot onto the pure capacity policy's input. Only
+/// account-wide and model-scoped quota windows constrain inference;
+/// feature-scoped windows (e.g. code review) are not inference limits.
+pub fn capacity_from_snapshot(
+    cred: &CredentialRef,
+    snapshot: &super::usage::UsageSnapshot,
+) -> super::quota_policy::AccountCapacity {
+    use super::quota_policy::{
+        AccountCapacity, ModelAvailability, ModelState, QuotaObservation, WindowLimit,
+    };
+    use super::usage::{Availability, WindowScope};
+    let mut windows: Vec<WindowLimit> = snapshot
+        .windows
+        .iter()
+        .filter_map(|w| {
+            let models = match &w.scope {
+                WindowScope::Account => None,
+                WindowScope::Model { model } => Some(vec![model.clone()]),
+                WindowScope::Feature { .. } => return None,
+            };
+            Some(WindowLimit {
+                id: w.id.clone(),
+                duration_ms: w.duration_secs.map(|s| s.saturating_mul(1000)),
+                used_percent: w.used_percent.valid(),
+                limit_reached: w.limit_reached,
+                resets_at_ms: w.reset_at,
+                models,
+            })
+        })
+        .collect();
+    if snapshot.limit_reached == Some(true) {
+        // Provider-asserted overall exhaustion applies to every model.
+        windows.push(WindowLimit {
+            id: "limit_reached".into(),
+            duration_ms: None,
+            used_percent: None,
+            limit_reached: Some(true),
+            resets_at_ms: snapshot.earliest_reset_at(),
+            models: None,
+        });
+    }
+    let models = if snapshot.model_availability.is_empty() {
+        None
+    } else {
+        Some(
+            snapshot
+                .model_availability
+                .iter()
+                .map(|m| ModelAvailability {
+                    model: m.model.clone(),
+                    state: match m.availability {
+                        Availability::Available => ModelState::Available,
+                        Availability::Exhausted => ModelState::Exhausted,
+                        Availability::Unknown => ModelState::Unknown,
+                    },
+                })
+                .collect(),
+        )
+    };
+    AccountCapacity {
+        credential: cred.clone(),
+        observed_at_ms: Some(snapshot.observed_at),
+        observation: QuotaObservation::Ok { windows, models },
+        cooldown_until_ms: None,
+        failure: None,
+    }
+}
+
+/// A failed usage read: the broker error `usage()` callers see (unchanged
+/// vocabulary) plus the typed cause the selection report keeps.
+#[derive(Debug)]
+struct UsageReadError {
+    error: BrokerError,
+    failure: super::quota_policy::ObservationFailure,
+}
+
+/// One account's read for automatic selection.
+struct CandidateRead {
+    capacity: super::quota_policy::AccountCapacity,
+    /// Seat the reading belongs to (for a graced account: the seat stored now).
+    seat: Option<SeatIdentity>,
+    /// The read failed transiently: the failure and when reads resume.
+    transient: Option<(super::usage_reads::TransientReadFailure, u64)>,
+    /// Last good reading offered to the policy's grace.
+    grace: Option<super::quota_policy::AccountCapacity>,
+}
+
+impl UsageReadError {
+    /// A read answered by the process-wide usage-read table (a network,
+    /// joined or held read): the same error and cause the read itself had.
+    fn from_read(e: &super::usage_reads::ReadError) -> Self {
+        Self {
+            error: e.to_broker_error(),
+            failure: e.cause(),
+        }
+    }
+
+    /// This failure as the table's error for a read that never reached the
+    /// usage request (slot check).
+    fn into_read_error(self) -> super::usage_reads::ReadError {
+        super::usage_reads::ReadError::Other {
+            error: self.error,
+            cause: self.failure,
+        }
+    }
+
+    /// This failure as a network read's outcome (slot check, refresh).
+    fn into_fetched(self) -> super::usage_reads::Fetched {
+        super::usage_reads::Fetched::Failed {
+            error: self.error,
+            cause: self.failure,
+        }
+    }
+
+    /// The `usage()` text stays the historical credential error; the cause
+    /// keeps the refresh kind (transient vs rejected login).
+    fn refresh(f: super::token::RefreshFailure) -> Self {
+        Self {
+            failure: refresh_failure(&f),
+            error: BrokerError::Credential(f.into()),
+        }
+    }
+
+    /// Slot checks: a slot that vanished vs a store that can't be read.
+    fn slot(error: BrokerError) -> Self {
+        use super::quota_policy::{AccountFailureKind as K, ObservationFailure};
+        let kind = match &error {
+            BrokerError::UnknownAccount { .. } => K::CredentialMissing,
+            _ => K::CredentialStore,
+        };
+        Self {
+            failure: ObservationFailure::new(kind),
+            error,
+        }
+    }
+
+    /// A failed usage request as the selection sees it: through the
+    /// usage-read table, which keeps the request's own error and cause.
+    #[cfg(test)]
+    fn usage(e: super::usage::UsageError) -> Self {
+        let table = super::usage_reads::UsageReads::default();
+        match table.record_at("slot", super::usage_reads::Fetched::Usage(e), 0) {
+            Err(read) => Self::from_read(&read),
+            Ok(_) => unreachable!("a usage error is never a reading"),
+        }
+    }
+}
+
+/// A generic Codex window (including a free 30-day plan) does not prove
+/// entitlement to Astra or any other requested model: a requested model the
+/// reading does not list counts as unknown. Applied to every reading the
+/// policy judges, fresh or graced.
+fn require_requested_model(
+    provider: OAuthProviderId,
+    model: Option<&str>,
+    capacity: &mut super::quota_policy::AccountCapacity,
+) {
+    use super::quota_policy::{model_matches, ModelAvailability, ModelState, QuotaObservation};
+    if provider != OAuthProviderId::OpenAiCodex {
+        return;
+    }
+    if let (Some(model), QuotaObservation::Ok { models, .. }) = (model, &mut capacity.observation) {
+        let availability = models.get_or_insert_with(Vec::new);
+        if !availability.iter().any(|m| model_matches(&m.model, model)) {
+            availability.push(ModelAvailability {
+                model: model.to_string(),
+                state: ModelState::Unknown,
+            });
+        }
+    }
+}
+
+/// What a usage read that needs action asks of the user. A refresh that
+/// needs action carries our own instructions (paths, what to move back);
+/// an unreadable stored login names the store, not the parser's message
+/// (which can quote stored values).
+fn action_detail(cred: &CredentialRef, err: &UsageReadError) -> String {
+    use super::quota_policy::AccountFailureKind as K;
+    match err.failure.kind {
+        K::CredentialStore => format!(
+            "the stored login of '{}' could not be read from {}; repair or restore the \
+             credential store",
+            cred.account.label_str(),
+            storage::auth_file_path().display()
+        ),
+        _ => err.error.to_string(),
+    }
+}
+
+/// The observation-failure kind of a token refresh failure, with the token
+/// endpoint's HTTP status when it answered with one.
+fn refresh_failure(f: &super::token::RefreshFailure) -> super::quota_policy::ObservationFailure {
+    let failure = refresh_kind_failure(f.kind);
+    match f.http_status() {
+        Some(status) => failure.with_status(status),
+        None => failure,
+    }
+}
+
+/// The observation-failure kind of a token refresh failure kind.
+fn refresh_kind_failure(
+    kind: super::token::RefreshFailureKind,
+) -> super::quota_policy::ObservationFailure {
+    use super::quota_policy::{AccountFailureKind as K, ObservationFailure};
+    use super::token::RefreshFailureKind as R;
+    match kind {
+        R::Transient => ObservationFailure::new(K::RefreshTransient),
+        R::LockBusy => ObservationFailure::new(K::RefreshLockBusy),
+        R::Other => ObservationFailure::new(K::RefreshOther),
+        R::Cooldown { retry_in_secs } => {
+            ObservationFailure::new(K::RefreshOther).with_retry_after(Some(retry_in_secs))
+        }
+        R::Credential => ObservationFailure::new(K::RefreshRejected),
+        R::ActionRequired => ObservationFailure::new(K::RefreshActionRequired),
+    }
+}
+
+/// The refresh failure of the automatically chosen account, with that
+/// account named: the caller never learns which seat was picked. A refused
+/// login also gets the exact command that fixes it (unless the message
+/// already has one). Same kind, so retry hints are unchanged.
+fn auto_vend_failure(
+    credential: &CredentialRef,
+    f: super::token::RefreshFailure,
+) -> super::token::RefreshFailure {
+    let label = credential.account.label_str();
+    let mut message = format!("account '{label}': {}", f.message());
+    if f.kind == super::token::RefreshFailureKind::Credential && !message.contains("synaps login") {
+        let account = if credential.account.is_default() {
+            String::new()
+        } else {
+            format!(" --account {label}")
+        };
+        message.push_str(&format!(
+            "; log it in again with `synaps login --provider {}{account}`",
+            credential.provider
+        ));
+    }
+    super::token::RefreshFailure::new(f.kind, message).with_http_status(f.http_status())
+}
+
+/// A failed automatic selection: ONE WARN (see [`log_selection_failure`]),
+/// then the typed error.
+fn selection_failed(
+    provider: OAuthProviderId,
+    model: Option<&str>,
+    reason: String,
+    failure: super::quota_policy::SelectionFailure,
+) -> BrokerError {
+    log_selection_failure(provider, model, &failure);
+    BrokerError::NoAccountAvailable {
+        provider: provider.to_string(),
+        reason,
+        failure: Some(failure),
+    }
+}
+
+/// The one `auth_selection_failed` WARN of a failed automatic selection:
+/// the top-level kind and every account's `label:kind[:status][:cooling]`
+/// (labels only, never identities or token material).
+fn log_selection_failure(
+    provider: OAuthProviderId,
+    model: Option<&str>,
+    failure: &super::quota_policy::SelectionFailure,
+) {
+    tracing::warn!(
+        provider = %provider,
+        model = model.unwrap_or("any"),
+        kind = %failure.kind,
+        accounts = %failure.accounts_field(),
+        earliest_reset_ms = ?failure.earliest_reset_ms,
+        "auth_selection_failed"
+    );
 }
 
 // ── Bounded body handling ────────────────────────────────────────────────────
@@ -1868,39 +3497,159 @@ pub fn local_model_ids() -> Vec<String> {
 }
 
 /// True if any Anthropic credential is available through the broker
-/// (OAuth login or `ANTHROPIC_API_KEY`). Non-secret answer for first-run UX.
+/// (OAuth login under the active account policy, or `ANTHROPIC_API_KEY`).
+/// Non-secret answer for first-run UX.
 pub fn anthropic_credential_available() -> bool {
-    let oauth = load_provider_auth(OAuthProviderId::Anthropic.as_str())
-        .ok()
-        .flatten()
-        .map(|c| c.auth_type == "oauth" && !c.access.is_empty())
-        .unwrap_or(false);
-    oauth || std::env::var("ANTHROPIC_API_KEY").is_ok_and(|v| !v.is_empty())
+    oauth_provider_logged_in(OAuthProviderId::Anthropic)
+        || std::env::var("ANTHROPIC_API_KEY").is_ok_and(|v| !v.is_empty())
 }
 
-/// True if the OAuth provider has stored refreshable credentials. This is a
-/// non-secret availability query for UI surfaces; an expired access token is
-/// still a valid login when the broker can refresh it on first use.
+/// True if the OAuth provider has a stored, refreshable credential the
+/// active account policy (env > config > default) can reach. Non-secret
+/// availability query for UI surfaces; an expired access token is still a
+/// valid login when the broker can refresh it on first use.
+///
+/// * An explicitly selected named account counts only if THAT slot exists
+///   (explicit selection never falls back, so neither does this answer).
+/// * Otherwise any usable slot of the provider counts — a named-only
+///   installation is logged in, not hidden. Which slot a vend uses, and
+///   whether a malformed selector fails it, is reported by the vend itself.
 pub fn oauth_provider_logged_in(provider: OAuthProviderId) -> bool {
-    load_provider_auth(provider.as_str())
-        .ok()
-        .flatten()
-        .is_some_and(|creds| {
-            creds.auth_type == "oauth" && (!creds.refresh.is_empty() || !creds.access.is_empty())
-        })
+    oauth_provider_logged_in_at(
+        &storage::auth_file_path(),
+        &AccountPolicy::from_environment(),
+        provider,
+    )
+}
+
+/// Path/policy-explicit core of [`oauth_provider_logged_in`].
+pub(crate) fn oauth_provider_logged_in_at(
+    path: &std::path::Path,
+    policy: &AccountPolicy,
+    provider: OAuthProviderId,
+) -> bool {
+    let Ok(inventory) = storage::list_accounts_detailed_at(path, Some(provider)) else {
+        return false;
+    };
+    match policy.selector(provider) {
+        AccountSelector::Account(Account::Named(label)) => inventory
+            .accounts
+            .iter()
+            .any(|row| row.label == label.as_str()),
+        AccountSelector::Account(Account::Default)
+        | AccountSelector::Auto
+        | AccountSelector::Invalid { .. } => !inventory.accounts.is_empty(),
+    }
 }
 
 #[async_trait]
 impl CredentialBroker for LocalBroker {
+    async fn recover_rejected_token(
+        &self,
+        cred: &CredentialRef,
+        rejected: &str,
+    ) -> Result<AccessToken, BrokerError> {
+        self.check_slot_exists(cred)?;
+        let creds = super::token::recover_rejected_credential(
+            &self.http,
+            cred,
+            rejected,
+            &self.refresh_endpoints,
+        )
+        .await
+        .map_err(BrokerError::Refresh)?;
+        Ok(AccessToken {
+            token: creds.access,
+            expires: creds.expires,
+        })
+    }
+
     async fn access_token(&self, provider: OAuthProviderId) -> Result<AccessToken, BrokerError> {
-        let creds = super::ensure_fresh_provider_token(&self.http, provider)
-            .await
-            .map_err(BrokerError::Credential)?;
+        Ok(self.access_token_pinned(provider).await?.token)
+    }
+
+    fn account_selector(&self, provider: OAuthProviderId) -> AccountSelector {
+        self.policy().selector(provider)
+    }
+
+    async fn access_token_for(&self, cred: &CredentialRef) -> Result<AccessToken, BrokerError> {
+        self.check_slot_exists(cred)?;
+        let creds =
+            super::token::ensure_fresh_credential_via(&self.http, cred, &self.refresh_endpoints)
+                .await
+                .map_err(|f| match f.kind {
+                    // Typed so the runtime doesn't send the user to a login
+                    // that would fail on the same store.
+                    super::token::RefreshFailureKind::ActionRequired => BrokerError::Refresh(f),
+                    _ => BrokerError::Credential(f.into()),
+                })?;
         // Strip to token + expiry: the refresh token stays behind the boundary.
         Ok(AccessToken {
             token: creds.access,
             expires: creds.expires,
         })
+    }
+
+    async fn access_token_pinned(
+        &self,
+        provider: OAuthProviderId,
+    ) -> Result<PinnedToken, BrokerError> {
+        self.access_token_pinned_for(provider, None).await
+    }
+
+    async fn access_token_pinned_for(
+        &self,
+        provider: OAuthProviderId,
+        model: Option<&str>,
+    ) -> Result<PinnedToken, BrokerError> {
+        self.resolve_and_vend(provider, None, model).await
+    }
+
+    async fn accounts(&self, provider: OAuthProviderId) -> Result<Vec<AccountSummary>, BrokerError> {
+        let mut rows = storage::list_accounts(provider).map_err(BrokerError::Credential)?;
+        let selector = self.policy().selector(provider);
+        let now_ms = crate::epoch_millis();
+        for row in &mut rows {
+            row.selected = matches!(&selector, AccountSelector::Account(a) if a.label_str() == row.label);
+            if let Some(cred) = row.credential_ref() {
+                row.cooldown_until = self.cooldown_until(&cred.storage_key(), now_ms);
+            }
+        }
+        Ok(rows)
+    }
+
+    async fn usage(&self, cred: &CredentialRef) -> Result<super::usage::UsageSnapshot, BrokerError> {
+        self.usage_with_seat(cred)
+            .await
+            .map(|(snapshot, _seat)| snapshot)
+            .map_err(|e| e.error)
+    }
+
+    async fn report_cooldown(
+        &self,
+        cred: &CredentialRef,
+        until_ms: Option<u64>,
+        reason: &str,
+    ) -> Result<(), BrokerError> {
+        let now_ms = crate::epoch_millis();
+        let max_until = now_ms.saturating_add(MAX_COOLDOWN.as_millis() as u64);
+        let until_ms = until_ms
+            .filter(|t| *t > now_ms)
+            .unwrap_or(now_ms + DEFAULT_COOLDOWN.as_millis() as u64)
+            .min(max_until);
+        let reason = crate::truncate_str(reason, 64).to_string();
+        tracing::info!(credential = %cred, until_ms, reason = %reason, "account cooldown reported");
+        let key = self.cooldown_key(cred);
+        self.cooldowns
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key.clone(), Cooldown { until_ms, reason });
+        // The cached reading predates the limit report; drop it so the next
+        // selection re-reads instead of trusting stale headroom, and drop
+        // the slot's last good reading so grace can never outlive the limit.
+        self.forget_snapshots(cred);
+        self.usage_reads.forget_last_good(&self.read_key(cred));
+        Ok(())
     }
 
     async fn proxy(&self, request: ProxyRequest) -> Result<ProxyResponse, BrokerError> {
@@ -2007,15 +3756,22 @@ impl CredentialBroker for LocalBroker {
 
     async fn capabilities(&self) -> Result<Vec<ProviderStatus>, BrokerError> {
         let mut out = Vec::new();
+        let policy = self.policy();
         for descriptor in super::provider::registry().iter() {
+            let accounts = self.accounts(descriptor.id).await.unwrap_or_default();
+            let configured = match policy.selector(descriptor.id) {
+                AccountSelector::Account(account) => accounts
+                    .iter()
+                    .any(|a| a.label == account.label_str()),
+                AccountSelector::Auto => !accounts.is_empty(),
+                AccountSelector::Invalid { .. } => false,
+            };
             out.push(ProviderStatus {
                 key: descriptor.id.as_str().to_string(),
                 name: descriptor.display_name.to_string(),
                 kind: CredentialKind::OAuth,
-                configured: load_provider_auth(descriptor.id.as_str())
-                    .ok()
-                    .flatten()
-                    .is_some(),
+                configured,
+                accounts,
             });
         }
         for spec in STATIC_PROVIDERS {
@@ -2024,6 +3780,7 @@ impl CredentialBroker for LocalBroker {
                 name: spec.name.to_string(),
                 kind: CredentialKind::StaticKey,
                 configured: static_key_configured(spec.key),
+                accounts: Vec::new(),
             });
         }
         out.push(ProviderStatus {
@@ -2031,6 +3788,7 @@ impl CredentialBroker for LocalBroker {
             name: "Local endpoint".to_string(),
             kind: CredentialKind::LocalEndpoint,
             configured: true,
+            accounts: Vec::new(),
         });
         Ok(out)
     }
@@ -2044,11 +3802,51 @@ impl CredentialBroker for LocalBroker {
 pub struct RemoteBroker {
     http: reqwest::Client,
     endpoint: String,
-    machine_token: String,
+    /// Reloadable from the local broker token file after a 401 when the
+    /// endpoint is loopback (prA I2).
+    machine_token: super::MachineToken,
     cache: super::TokenCache,
+    /// Injected account policy; `None` → env + config per call.
+    account_policy: Option<AccountPolicy>,
+}
+
+/// A 404 from a route the broker does not have: 0.10.2's axum router
+/// answers an empty, untyped body, while a current broker's errors are JSON.
+/// Only emptiness and the content type are inspected, never the content.
+async fn route_missing(resp: reqwest::Response) -> bool {
+    let json = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.contains("json"));
+    !json
+        && read_body_capped(resp, 1024)
+            .await
+            .is_ok_and(|body| body.trim().is_empty())
 }
 
 impl RemoteBroker {
+    /// True if the broker has no `/usage/snapshot` (0.10.2 and older). The
+    /// probe sends an empty account, which a current broker rejects with a
+    /// 400 before touching any credential.
+    async fn predates_usage_snapshot(&self) -> Result<bool, BrokerError> {
+        let resp = self
+            .machine_token
+            .send(|t| {
+                self.http
+                    .get(format!("{}/usage/snapshot", self.endpoint))
+                    .query(&[("provider", "anthropic"), ("account", "")])
+                    .bearer_auth(t)
+            })
+            .await
+            .map_err(|e| BrokerError::Transport(format!("broker request failed: {e}")))?;
+        match resp.status().as_u16() {
+            401 => Err(BrokerError::Unauthorized),
+            404 => Ok(route_missing(resp).await),
+            _ => Ok(false),
+        }
+    }
+
     pub fn new(
         endpoint: impl Into<String>,
         machine_token: impl Into<String>,
@@ -2064,22 +3862,179 @@ impl RemoteBroker {
             .timeout(Duration::from_secs(90))
             .build()
             .unwrap_or(http);
+        let machine_token = super::MachineToken::for_endpoint(&endpoint, machine_token);
         Self {
             http,
             endpoint,
-            machine_token: machine_token.into(),
+            machine_token,
             cache,
+            account_policy: None,
         }
+    }
+
+    /// Pin the account policy instead of reading env + config per call.
+    pub fn with_account_policy(mut self, policy: AccountPolicy) -> Self {
+        self.account_policy = Some(policy);
+        self
+    }
+
+    fn policy(&self) -> AccountPolicy {
+        self.account_policy
+            .clone()
+            .unwrap_or_else(AccountPolicy::from_environment)
+    }
+
+    fn fetcher(&self) -> super::BrokerClient {
+        super::BrokerClient::with_machine_token(
+            self.endpoint.clone(),
+            self.machine_token.clone(),
+            self.http.clone(),
+        )
+    }
+
+    /// Cache scope: endpoint + machine-principal digest (never the token).
+    fn scope(&self) -> String {
+        super::credential_source::source_scope(&self.endpoint, &self.machine_token.get())
+    }
+
+    /// Resolve the credential for a token request on the client side. An
+    /// `auto` selector is delegated to the broker daemon (`account=auto`),
+    /// which holds the usage/cooldown state; the daemon reports which slot
+    /// it chose.
+    async fn resolve_pinned(
+        &self,
+        provider: OAuthProviderId,
+        model: Option<&str>,
+    ) -> Result<PinnedToken, BrokerError> {
+        match self.policy().selector(provider) {
+            AccountSelector::Account(account) => {
+                let credential = CredentialRef::new(provider, account);
+                let token = self.access_token_for(&credential).await?;
+                Ok(PinnedToken { credential, token })
+            }
+            AccountSelector::Auto => self.fetch_auto(provider, model).await,
+            AccountSelector::Invalid { source, reason } => {
+                Err(BrokerError::InvalidAccount(format!("{source}: {reason}")))
+            }
+        }
+    }
+
+    /// `GET /token?provider=X&account=auto[&model=M]` — the daemon selects;
+    /// the response's `account` field names the chosen slot. Never cached
+    /// (the selection is the daemon's, per call).
+    async fn fetch_auto(
+        &self,
+        provider: OAuthProviderId,
+        model: Option<&str>,
+    ) -> Result<PinnedToken, BrokerError> {
+        let mut query: Vec<(&str, &str)> = vec![
+            ("provider", provider.as_str()),
+            ("account", super::account::AUTO_ACCOUNT_NAME),
+        ];
+        if let Some(model) = model {
+            query.push(("model", model));
+        }
+        let resp = self
+            .machine_token
+            .send(|t| {
+                self.http
+                .get(format!("{}/token", self.endpoint))
+                .query(&query)
+                .bearer_auth(t)
+            })
+            .await
+            .map_err(|e| BrokerError::Transport(format!("broker request failed: {e}")))?;
+        match resp.status().as_u16() {
+            401 => return Err(BrokerError::Unauthorized),
+            503 => {
+                drop(resp);
+                return Err(BrokerError::NoAccountAvailable {
+                    provider: provider.as_str().to_string(),
+                    reason: "broker reported no account with proven capacity".into(),
+                    // The broker host's own log has the per-account kinds.
+                    failure: Some(super::quota_policy::SelectionFailure::new(
+                        super::quota_policy::SelectionFailureKind::RemoteNoCapacity,
+                    )),
+                });
+            }
+            s if !(200..300).contains(&s) => {
+                drop(resp);
+                return Err(BrokerError::Transport(format!("broker returned HTTP {s}")));
+            }
+            _ => {}
+        }
+        #[derive(Deserialize)]
+        struct AutoToken {
+            access_token: String,
+            expires: u64,
+            #[serde(default)]
+            ttl_ms: Option<u64>,
+            account: Option<String>,
+        }
+        let body = read_body_capped(resp, MAX_PROXY_RESPONSE_BYTES).await?;
+        let tok: AutoToken = serde_json::from_str(&body)
+            .map_err(|e| BrokerError::Transport(format!("invalid broker token response: {e}")))?;
+        let account = tok
+            .account
+            .as_deref()
+            .ok_or_else(|| BrokerError::Transport("broker did not report the selected account".into()))
+            .and_then(|a| Account::parse(a).map_err(BrokerError::InvalidAccount))?;
+        if tok.access_token.is_empty() {
+            return Err(BrokerError::Transport("broker returned an empty access_token".into()));
+        }
+        let expires = match tok.ttl_ms {
+            Some(ttl) => crate::epoch_millis().saturating_add(ttl),
+            None => tok.expires,
+        };
+        Ok(PinnedToken {
+            credential: CredentialRef::new(provider, account),
+            token: AccessToken {
+                token: tok.access_token,
+                expires,
+            },
+        })
+    }
+
+    /// A non-2xx `/proxy` answer. A 502 whose `error` is a retryable
+    /// `BrokerError::Refresh` from the daemon (it maps those to 502) becomes
+    /// the same typed error, so the client keeps its "retry shortly" hint.
+    /// Only the KIND is read from the body, by matching the exact prefix our
+    /// own Display produces for that kind; the message is static, so no
+    /// broker-controlled byte reaches the Display (spec §5.1).
+    async fn proxy_failure(resp: reqwest::Response, fallback: String) -> BrokerError {
+        if resp.status() != reqwest::StatusCode::BAD_GATEWAY {
+            return BrokerError::Transport(fallback);
+        }
+        let Ok(body) = read_body_capped(resp, 4096).await else {
+            return BrokerError::Transport(fallback);
+        };
+        let text = serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|v| v.get("error")?.as_str().map(str::to_string))
+            .unwrap_or_default();
+        use super::token::{RefreshFailure, RefreshFailureKind as K};
+        for kind in [K::Transient, K::LockBusy, K::Other] {
+            let prefix = BrokerError::Refresh(RefreshFailure::new(kind, "")).to_string();
+            if text.starts_with(&prefix) {
+                return BrokerError::Refresh(RefreshFailure::new(
+                    kind,
+                    "the remote credential broker could not refresh this credential",
+                ));
+            }
+        }
+        BrokerError::Transport(fallback)
     }
 
     async fn post_proxy(&self, request: &ProxyRequest) -> Result<reqwest::Response, BrokerError> {
         request.validate()?;
         let resp = self
-            .http
-            .post(format!("{}/proxy", self.endpoint))
-            .bearer_auth(&self.machine_token)
-            .json(request)
-            .send()
+            .machine_token
+            .send(|t| {
+                self.http
+                .post(format!("{}/proxy", self.endpoint))
+                .bearer_auth(t)
+                .json(request)
+            })
             .await
             .map_err(|e| BrokerError::Transport(format!("broker request failed: {e}")))?;
         match resp.status().as_u16() {
@@ -2101,23 +4056,146 @@ impl RemoteBroker {
 #[async_trait]
 impl CredentialBroker for RemoteBroker {
     async fn access_token(&self, provider: OAuthProviderId) -> Result<AccessToken, BrokerError> {
-        let fetcher = super::BrokerClient::with_client(
-            self.endpoint.clone(),
-            self.machine_token.clone(),
-            self.http.clone(),
-        );
-        let tok = super::resolve_remote(
+        Ok(self.access_token_pinned(provider).await?.token)
+    }
+
+    fn account_selector(&self, provider: OAuthProviderId) -> AccountSelector {
+        self.policy().selector(provider)
+    }
+
+    async fn access_token_for(&self, cred: &CredentialRef) -> Result<AccessToken, BrokerError> {
+        let fetcher = self.fetcher();
+        let tok = super::credential_source::resolve_remote_credential(
             &fetcher,
             &self.cache,
-            provider.as_str(),
+            &self.scope(),
+            cred,
             super::DEFAULT_MARGIN_MS,
         )
         .await
-        .map_err(BrokerError::Transport)?;
+        .map_err(|e| e.into_broker_error(cred))?;
         Ok(AccessToken {
             token: tok.access_token,
             expires: tok.expires,
         })
+    }
+
+    async fn access_token_pinned(
+        &self,
+        provider: OAuthProviderId,
+    ) -> Result<PinnedToken, BrokerError> {
+        self.resolve_pinned(provider, None).await
+    }
+
+    async fn access_token_pinned_for(
+        &self,
+        provider: OAuthProviderId,
+        model: Option<&str>,
+    ) -> Result<PinnedToken, BrokerError> {
+        self.resolve_pinned(provider, model).await
+    }
+
+    async fn accounts(&self, provider: OAuthProviderId) -> Result<Vec<AccountSummary>, BrokerError> {
+        let caps = self.capabilities().await?;
+        let accounts = caps
+            .into_iter()
+            .find(|c| c.key == provider.as_str())
+            .map(|c| c.accounts)
+            .unwrap_or_default();
+        // A 0.10.2 broker lists no accounts at all; don't report that as
+        // "nothing logged in".
+        if accounts.is_empty() && self.predates_usage_snapshot().await? {
+            return Err(BrokerError::BrokerTooOld("account listing".into()));
+        }
+        Ok(accounts)
+    }
+
+    async fn usage(&self, cred: &CredentialRef) -> Result<super::usage::UsageSnapshot, BrokerError> {
+        let resp = self
+            .machine_token
+            .send(|t| {
+                self.http
+                .get(format!("{}/usage/snapshot", self.endpoint))
+                .query(&[
+                    ("provider", cred.provider.as_str()),
+                    ("account", cred.account.label_str()),
+                ])
+                .bearer_auth(t)
+            })
+            .await
+            .map_err(|e| BrokerError::Transport(format!("broker request failed: {e}")))?;
+        match resp.status().as_u16() {
+            401 => Err(BrokerError::Unauthorized),
+            404 => {
+                if !route_missing(resp).await {
+                    return Err(BrokerError::UnknownAccount {
+                        provider: cred.provider.as_str().to_string(),
+                        label: cred.account.label_str().to_string(),
+                    });
+                }
+                if cred.provider != OAuthProviderId::Anthropic || !cred.account.is_default() {
+                    return Err(BrokerError::BrokerTooOld("per-account usage".into()));
+                }
+                // The old broker's `/usage` serves its default Anthropic slot.
+                let body = self.anthropic_usage().await?.to_string();
+                super::usage::parse_anthropic_usage(
+                    &body,
+                    cred.account.label_str(),
+                    crate::epoch_millis(),
+                )
+                .map_err(super::usage::UsageError::into_broker_error)
+            }
+            s if !(200..300).contains(&s) => {
+                // Broker-controlled error body: dropped unread (spec §5.1).
+                drop(resp);
+                Err(BrokerError::Transport(format!(
+                    "broker usage snapshot returned HTTP {s}"
+                )))
+            }
+            _ => {
+                let body = read_body_capped(resp, MAX_PROXY_RESPONSE_BYTES).await?;
+                let snapshot: super::usage::UsageSnapshot = serde_json::from_str(&body)
+                    .map_err(|e| BrokerError::Transport(format!("invalid usage snapshot: {e}")))?;
+                if snapshot.provider != cred.provider.as_str()
+                    || snapshot.account != cred.account.label_str()
+                {
+                    return Err(BrokerError::Transport(
+                        "broker returned a usage snapshot for a different account".into(),
+                    ));
+                }
+                Ok(snapshot)
+            }
+        }
+    }
+
+    async fn report_cooldown(
+        &self,
+        cred: &CredentialRef,
+        until_ms: Option<u64>,
+        reason: &str,
+    ) -> Result<(), BrokerError> {
+        let resp = self
+            .machine_token
+            .send(|t| {
+                self.http
+                .post(format!("{}/accounts/cooldown", self.endpoint))
+                .bearer_auth(t)
+                .json(&serde_json::json!({
+                    "provider": cred.provider.as_str(),
+                    "account": cred.account.label_str(),
+                    "until_ms": until_ms,
+                    "reason": crate::truncate_str(reason, 64),
+                }))
+            })
+            .await
+            .map_err(|e| BrokerError::Transport(format!("broker request failed: {e}")))?;
+        match resp.status().as_u16() {
+            401 => Err(BrokerError::Unauthorized),
+            s if !(200..300).contains(&s) => {
+                Err(BrokerError::Transport(format!("broker returned HTTP {s}")))
+            }
+            _ => Ok(()),
+        }
     }
 
     async fn proxy(&self, request: ProxyRequest) -> Result<ProxyResponse, BrokerError> {
@@ -2125,10 +4203,8 @@ impl CredentialBroker for RemoteBroker {
         request.stream = false;
         let resp = self.post_proxy(&request).await?;
         if !resp.status().is_success() {
-            return Err(BrokerError::Transport(format!(
-                "broker proxy returned HTTP {}",
-                resp.status()
-            )));
+            let fallback = format!("broker proxy returned HTTP {}", resp.status());
+            return Err(Self::proxy_failure(resp, fallback).await);
         }
         let body = read_body_capped(resp, MAX_PROXY_RESPONSE_BYTES).await?;
         serde_json::from_str::<ProxyResponse>(&body)
@@ -2141,11 +4217,10 @@ impl CredentialBroker for RemoteBroker {
         let resp = self.post_proxy(&request).await?;
         let status = resp.status();
         if !status.is_success() {
-            // Broker-controlled error body: dropped unread (spec §5.1).
-            drop(resp);
-            return Err(BrokerError::Transport(format!(
-                "broker proxy stream failed: {status}"
-            )));
+            // Broker-controlled error body: only a refresh-failure kind is
+            // recovered from it, never its text (spec §5.1).
+            let fallback = format!("broker proxy stream failed: {status}");
+            return Err(Self::proxy_failure(resp, fallback).await);
         }
         use futures::StreamExt;
         let stream = resp
@@ -2158,10 +4233,12 @@ impl CredentialBroker for RemoteBroker {
         // Machine-authenticated typed operation: the remote broker resolves
         // the OAuth token on its side and returns usage JSON only.
         let resp = self
-            .http
-            .get(format!("{}/usage", self.endpoint))
-            .bearer_auth(&self.machine_token)
-            .send()
+            .machine_token
+            .send(|t| {
+                self.http
+                .get(format!("{}/usage", self.endpoint))
+                .bearer_auth(t)
+            })
             .await
             .map_err(|e| BrokerError::Transport(format!("broker request failed: {e}")))?;
         match resp.status().as_u16() {
@@ -2187,7 +4264,7 @@ impl CredentialBroker for RemoteBroker {
         context_ref: &str,
         allow_stale: bool,
     ) -> Result<Vec<CloudCatalogEntry>, BrokerError> {
-        let resp = self.http.post(format!("{}/cloud/catalog", self.endpoint)).bearer_auth(&self.machine_token).json(&serde_json::json!({"provider":provider,"context_ref":context_ref,"allow_stale":allow_stale})).send().await.map_err(|e| BrokerError::Transport(e.to_string()))?;
+        let resp = self.machine_token.send(|t| self.http.post(format!("{}/cloud/catalog", self.endpoint)).bearer_auth(t).json(&serde_json::json!({"provider":provider,"context_ref":context_ref,"allow_stale":allow_stale}))).await.map_err(|e| BrokerError::Transport(e.to_string()))?;
         if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
             return Err(BrokerError::Unauthorized);
         }
@@ -2219,7 +4296,7 @@ impl CredentialBroker for RemoteBroker {
         model_id: &str,
         request: InvokeRequest,
     ) -> Result<CloudEventStream, BrokerError> {
-        let resp = self.http.post(format!("{}/cloud/invoke", self.endpoint)).bearer_auth(&self.machine_token).json(&serde_json::json!({"provider":provider,"context_ref":context_ref,"model_id":model_id,"request":request})).send().await.map_err(|e| BrokerError::Transport(e.to_string()))?;
+        let resp = self.machine_token.send(|t| self.http.post(format!("{}/cloud/invoke", self.endpoint)).bearer_auth(t).json(&serde_json::json!({"provider":provider,"context_ref":context_ref,"model_id":model_id,"request":request}))).await.map_err(|e| BrokerError::Transport(e.to_string()))?;
         if !resp.status().is_success() {
             return Err(if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
                 BrokerError::Unauthorized
@@ -2296,10 +4373,12 @@ impl CredentialBroker for RemoteBroker {
 
     async fn capabilities(&self) -> Result<Vec<ProviderStatus>, BrokerError> {
         let resp = self
-            .http
-            .get(format!("{}/capabilities", self.endpoint))
-            .bearer_auth(&self.machine_token)
-            .send()
+            .machine_token
+            .send(|t| {
+                self.http
+                .get(format!("{}/capabilities", self.endpoint))
+                .bearer_auth(t)
+            })
             .await
             .map_err(|e| BrokerError::Transport(format!("broker request failed: {e}")))?;
         match resp.status().as_u16() {
@@ -2338,6 +4417,166 @@ pub fn preflight_cloud_capability(
     Ok(())
 }
 
+/// `synaps auth state` for the local broker `cache` holds for the current
+/// credential store and config (the one requests use) or, when no request
+/// has built one yet, the account list with nothing recorded. `live`: the
+/// caller is the process that serves requests (the daemon). No network
+/// request, no refresh; `query.clear` never writes the store.
+pub fn local_auth_state(
+    cache: &super::TokenCache,
+    query: &super::auth_state::AuthStateQuery,
+    live: bool,
+) -> Result<super::auth_state::AuthStateReport, BrokerError> {
+    let key = (
+        storage::auth_file_path(),
+        crate::config::resolve_read_path("config"),
+    );
+    let broker = cache
+        .local_brokers
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&key)
+        .cloned();
+    let mut report = auth_state_report(broker.as_deref(), query)?;
+    report.live = live;
+    Ok(report)
+}
+
+fn auth_state_report(
+    broker: Option<&LocalBroker>,
+    query: &super::auth_state::AuthStateQuery,
+) -> Result<super::auth_state::AuthStateReport, BrokerError> {
+    use super::auth_state::{
+        AccountState, AuthStateReport, IdentityKind, ObservedOutcome, AUTH_STATE_SCHEMA_VERSION,
+    };
+    let provider = match query.provider.as_deref() {
+        Some(p) => Some(
+            p.parse::<OAuthProviderId>()
+                .map_err(|_| BrokerError::UnknownProvider(p.to_string()))?,
+        ),
+        None => None,
+    };
+    let mut summaries = match provider {
+        Some(p) => storage::list_accounts(p),
+        None => storage::list_all_accounts(),
+    }
+    .map_err(BrokerError::Credential)?;
+    if let Some(label) = query.account.as_deref() {
+        summaries.retain(|s| s.label == label);
+        if summaries.is_empty() {
+            return Err(BrokerError::UnknownAccount {
+                provider: provider.map_or("any provider", |p| p.as_str()).to_string(),
+                label: label.to_string(),
+            });
+        }
+    }
+    let creds: Vec<CredentialRef> = summaries
+        .iter()
+        .filter_map(AccountSummary::credential_ref)
+        .collect();
+    let mut cleared = Vec::new();
+    if query.clear {
+        if let Some(broker) = broker {
+            let whole: Vec<OAuthProviderId> = match (&query.account, provider) {
+                (Some(_), _) => Vec::new(),
+                (None, Some(p)) => vec![p],
+                (None, None) => super::provider::DESCRIPTORS.iter().map(|d| d.id).collect(),
+            };
+            broker.clear_state(&creds, &whole);
+        }
+        cleared = creds
+            .iter()
+            .map(|c| format!("{}:{}", c.provider, c.account.label_str()))
+            .collect();
+        tracing::info!(
+            accounts = %cleared.join(","),
+            broker_active = broker.is_some(),
+            "auth_state_cleared"
+        );
+    }
+    let store = storage::auth_file_path();
+    let now_ms = crate::epoch_millis();
+    let mut accounts = Vec::with_capacity(summaries.len());
+    for summary in &summaries {
+        let Some(cred) = summary.credential_ref() else {
+            continue;
+        };
+        let observed = broker
+            .and_then(|b| {
+                b.observations
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(&LocalBroker::state_key(&cred))
+                    .cloned()
+            })
+            .unwrap_or_default();
+        accounts.push(AccountState {
+            provider: summary.provider.clone(),
+            label: summary.label.clone(),
+            identity: if summary.seat_fingerprint.is_some() {
+                IdentityKind::Stable
+            } else {
+                IdentityKind::Rotating
+            },
+            access_expires_ms: (summary.expires != 0).then_some(summary.expires),
+            cooldown: broker.and_then(|b| b.cooldown_state(&cred, now_ms)),
+            last_usage: observed.last_usage,
+            last_usage_ok_ms: observed.last_usage_ok_ms,
+            last_refresh: super::token::last_refresh_exchange(&store, &cred.storage_key()).map(
+                |x| ObservedOutcome {
+                    at_ms: x.at_ms,
+                    failure: x.failure.map(|kind| {
+                        let failure = refresh_kind_failure(kind);
+                        match x.http_status {
+                            Some(status) => failure.with_status(status),
+                            None => failure,
+                        }
+                    }),
+                },
+            ),
+        });
+    }
+    let store_prefix = format!("{}|", store.display());
+    let mut selections: Vec<_> = broker
+        .map(|b| {
+            b.selections
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .filter(|(k, s)| {
+                    k.starts_with(&store_prefix)
+                        && provider.is_none_or(|p| s.provider == p.as_str())
+                        && query
+                            .account
+                            .as_deref()
+                            .is_none_or(|label| selection_involves(s, label))
+                })
+                .map(|(_, s)| s.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    selections.sort_by_key(|s| std::cmp::Reverse(s.at_ms));
+    Ok(AuthStateReport {
+        schema_version: AUTH_STATE_SCHEMA_VERSION,
+        live: false,
+        broker_active: broker.is_some(),
+        generated_at_ms: now_ms,
+        store: store.display().to_string(),
+        accounts,
+        selections,
+        cleared,
+    })
+}
+
+/// `auth state --account LABEL` keeps a selection that chose `label` or
+/// lists it among the accounts that failed.
+fn selection_involves(s: &super::auth_state::SelectionState, label: &str) -> bool {
+    s.chosen.as_deref() == Some(label)
+        || s.failure
+            .as_ref()
+            .is_some_and(|f| f.accounts.iter().any(|a| a.account == label))
+}
+
 /// remote transport. There is no third option — and no direct-read fallback.
 pub fn broker_from_source(
     source: &super::CredentialSource,
@@ -2345,7 +4584,23 @@ pub fn broker_from_source(
     http: reqwest::Client,
 ) -> Arc<dyn CredentialBroker> {
     match source {
-        super::CredentialSource::Local => Arc::new(LocalBroker::new(http)),
+        super::CredentialSource::Local => {
+            // Runtime refresh and failover build adapters repeatedly. Keep
+            // their local authority on the runtime-owned TokenCache, not a
+            // global broker (which may belong to another remote principal).
+            let key = (
+                storage::auth_file_path(),
+                crate::config::resolve_read_path("config"),
+            );
+            let mut brokers = cache
+                .local_brokers
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            brokers
+                .entry(key)
+                .or_insert_with(|| Arc::new(LocalBroker::new(http)))
+                .clone()
+        }
         super::CredentialSource::Remote {
             endpoint,
             machine_token,
@@ -2430,6 +4685,33 @@ pub fn static_key_status_map() -> BTreeMap<String, StaticKeyStatus> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn login_availability_handles_named_only_and_explicit_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let provider = OAuthProviderId::Anthropic;
+        let empty = AccountPolicy::new();
+        assert!(!oauth_provider_logged_in_at(&path, &empty, provider));
+        std::fs::write(&path, serde_json::json!({
+            "anthropic@work": {"type":"oauth", "access":"synthetic-access",
+                "refresh":"synthetic-refresh", "expires":1}
+        }).to_string()).unwrap();
+        // This is login inventory for UI, not an authorization/capacity check.
+        assert!(oauth_provider_logged_in_at(&path, &empty, provider));
+        for selector in [AccountSelector::Auto,
+            AccountSelector::parse_or_invalid("../bad", "test"),
+            AccountSelector::Account(Account::named("work").unwrap())] {
+            let policy = AccountPolicy::new().with(provider, selector);
+            assert!(oauth_provider_logged_in_at(&path, &policy, provider));
+        }
+        let missing = AccountPolicy::new().with(provider,
+            AccountSelector::Account(Account::named("missing").unwrap()));
+        assert!(!oauth_provider_logged_in_at(&path, &missing, provider));
+        assert!(!oauth_provider_logged_in_at(&path, &empty, OAuthProviderId::OpenAiCodex));
+        std::fs::write(&path, "{broken").unwrap();
+        assert!(!oauth_provider_logged_in_at(&path, &empty, provider));
+    }
 
     /// Spec §5.5: the pre-flight capability check is a pure function — it can
     /// be (and is) called before any credential lookup or network access. A
@@ -3043,7 +5325,11 @@ mod tests {
         let e = BrokerError::NotConfigured("groq".into());
         assert!(!format!("{e}").contains("sk-"));
         let e = BrokerError::Unauthorized;
-        assert_eq!(format!("{e}"), "broker rejected machine auth");
+        let shown = format!("{e}");
+        assert!(shown.starts_with("broker rejected machine auth"), "{shown}");
+        // Actionable: names the config keys and the token file location.
+        assert!(shown.contains("auth.machine_token") && shown.contains("SYNAPS_MACHINE_TOKEN"), "{shown}");
+        assert!(shown.contains("auth-broker.token") && shown.contains("restart"), "{shown}");
     }
 
     #[test]
@@ -3653,6 +5939,77 @@ mod tests {
         }
     }
 
+    /// R2-I1: Gemini can think silently for minutes before its first data
+    /// chunk, so its no-redirect client idles longer than everyone else's.
+    #[test]
+    fn gemini_gets_the_longer_stream_idle_timeout() {
+        let broker = LocalBroker::new(reqwest::Client::new());
+        assert_eq!(broker.stream_idle_timeout_for("google-gemini"), Duration::from_secs(300));
+        for key in ["muse", "kimi-code", "openai-codex", "anthropic"] {
+            assert_eq!(broker.stream_idle_timeout_for(key), Duration::from_secs(90), "{key}");
+        }
+        let short = LocalBroker::new(reqwest::Client::new())
+            .with_stream_idle_timeout_for_tests(Duration::from_millis(10));
+        assert_eq!(short.stream_idle_timeout_for("muse"), Duration::from_millis(10));
+        assert!(short.stream_idle_timeout_for("google-gemini") >= Duration::from_secs(300));
+    }
+
+    async fn spawn_remote_broker_body(status: u16, body: String) -> RemoteBroker {
+        use axum::routing::post;
+        let code = axum::http::StatusCode::from_u16(status).unwrap();
+        let app = axum::Router::new().route(
+            "/proxy",
+            post(move || {
+                let body = body.clone();
+                async move { (code, body) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        RemoteBroker::new(
+            format!("http://{addr}"),
+            "opaque-machine-token",
+            reqwest::Client::new(),
+            super::super::TokenCache::new(),
+        )
+    }
+
+    /// Round-2 item 4: the daemon's 502 for a retryable refresh failure
+    /// (a Muse re-mint that hit the network) reaches a remote client as the
+    /// typed retryable refresh error, so the "retry shortly" hint survives.
+    /// Only the kind is taken from the body; the text is static, so a
+    /// hostile broker still can't put its bytes into the Display.
+    #[tokio::test]
+    async fn remote_broker_502_keeps_a_retryable_refresh_failure() {
+        use super::super::token::{RefreshFailure, RefreshFailureKind as K};
+        for kind in [K::Transient, K::LockBusy, K::Other] {
+            let daemon_text = BrokerError::Refresh(RefreshFailure::new(
+                kind,
+                format!("HTTP error 503 {HOSTILE_SENTINEL} ECHOED input_schema"),
+            ))
+            .to_string();
+            let body = serde_json::json!({ "error": daemon_text }).to_string();
+            let broker = spawn_remote_broker_body(502, body.clone()).await;
+            let stream_err = broker.proxy_stream(groq_request(true)).await.err().unwrap();
+            let buffered_err = broker.proxy(groq_request(false)).await.unwrap_err();
+            for err in [stream_err, buffered_err] {
+                let BrokerError::Refresh(f) = &err else {
+                    panic!("{kind:?}: expected Refresh, got {err:?}");
+                };
+                assert_eq!(f.kind, kind);
+                let msg = err.to_string();
+                assert!(msg.contains("retry shortly"), "{msg}");
+                assert_no_hostile_bytes(&msg);
+            }
+        }
+        // Anything else in a 502 stays an opaque transport error.
+        let broker = spawn_remote_broker_body(502, hostile_broker_json()).await;
+        let err = broker.proxy_stream(groq_request(true)).await.err().unwrap();
+        assert!(matches!(err, BrokerError::Transport(_)), "{err:?}");
+        assert_no_hostile_bytes(&err.to_string());
+    }
+
     /// RemoteBroker::proxy_stream: a non-2xx broker body must never enter the
     /// error; operation + status survive.
     #[tokio::test]
@@ -3708,5 +6065,162 @@ mod tests {
         }
         assert!(!json.contains("refresh"));
         assert!(!json.contains("access"));
+    }
+
+    /// The caller of an automatic vend never learns which seat was picked:
+    /// the refresh failure names it, and a refused login carries the exact
+    /// command for that slot.
+    #[test]
+    fn auto_vend_failure_names_the_chosen_account_and_its_login_command() {
+        use super::super::token::{RefreshFailure, RefreshFailureKind as R};
+        let named = CredentialRef::new(
+            OAuthProviderId::Anthropic,
+            Account::named("claude3").unwrap(),
+        );
+        let refused =
+            auto_vend_failure(&named, RefreshFailure::new(R::Credential, "invalid_grant"));
+        assert_eq!(refused.kind, R::Credential);
+        assert_eq!(
+            refused.message(),
+            "account 'claude3': invalid_grant; log it in again with \
+             `synaps login --provider anthropic --account claude3`"
+        );
+        let default = CredentialRef::new(OAuthProviderId::Anthropic, Account::Default);
+        let refused = auto_vend_failure(&default, RefreshFailure::new(R::Credential, "revoked"));
+        assert_eq!(
+            refused.message(),
+            "account 'default': revoked; log it in again with \
+             `synaps login --provider anthropic`"
+        );
+        // A message that already says which login to run gets no second one.
+        let advised = auto_vend_failure(
+            &named,
+            RefreshFailure::new(
+                R::Credential,
+                "slot removed; run `synaps login --account claude3`",
+            ),
+        );
+        assert_eq!(advised.message().matches("synaps login").count(), 1);
+        // Other kinds are named, keep their kind and get no login advice.
+        for kind in [R::Transient, R::LockBusy, R::Other, R::ActionRequired] {
+            let f = auto_vend_failure(&named, RefreshFailure::new(kind, "HTTP 503"));
+            assert_eq!(f.kind, kind);
+            assert_eq!(f.message(), "account 'claude3': HTTP 503");
+        }
+    }
+
+    /// No Anthropic refresh seam exists, so the refresh-failure → kind map
+    /// is pinned here: only a rejected login is a login problem; transient,
+    /// lock-busy, local and cooldown failures are "retry", action-required
+    /// is neither.
+    #[test]
+    fn refresh_failure_kinds_map_to_observation_kinds() {
+        use super::super::quota_policy::{AccountFailureKind as K, QuotaObservation};
+        use super::super::token::{RefreshFailure, RefreshFailureKind as R};
+        for (kind, expected, transient, login) in [
+            (R::Transient, K::RefreshTransient, true, false),
+            (R::LockBusy, K::RefreshLockBusy, true, false),
+            (R::Other, K::RefreshOther, true, false),
+            (
+                R::Cooldown { retry_in_secs: 42 },
+                K::RefreshOther,
+                true,
+                false,
+            ),
+            (R::Credential, K::RefreshRejected, false, true),
+            (R::ActionRequired, K::RefreshActionRequired, false, false),
+        ] {
+            let read = UsageReadError::refresh(RefreshFailure::new(kind, "why"));
+            assert_eq!(read.failure.kind, expected, "{kind:?}");
+            assert_eq!(read.failure.kind.is_transient(), transient, "{kind:?}");
+            assert_eq!(read.failure.kind.needs_login(), login, "{kind:?}");
+            // `usage()` keeps its historical text for every refresh failure.
+            assert_eq!(
+                read.error,
+                BrokerError::Credential("why".into()),
+                "{kind:?}"
+            );
+            let observation = read.failure.observation();
+            if login {
+                assert_eq!(observation, QuotaObservation::AuthError);
+            } else {
+                assert_eq!(observation, QuotaObservation::Unknown);
+            }
+        }
+        let cooldown =
+            refresh_failure(&RefreshFailure::new(R::Cooldown { retry_in_secs: 42 }, "x"));
+        assert_eq!(cooldown.retry_after_s, Some(42));
+        // Slot errors: vanished vs unreadable store.
+        let gone = UsageReadError::slot(BrokerError::UnknownAccount {
+            provider: "anthropic".into(),
+            label: "x".into(),
+        });
+        assert_eq!(gone.failure.kind, K::CredentialMissing);
+        assert!(gone.failure.kind.needs_login());
+        let store = UsageReadError::slot(BrokerError::Credential("unreadable".into()));
+        assert_eq!(store.failure.kind, K::CredentialStore);
+        assert!(!store.failure.kind.needs_login() && !store.failure.kind.is_transient());
+    }
+
+    /// Every usage error keeps a kind; 429 keeps its Retry-After and the
+    /// status codes survive.
+    #[test]
+    fn usage_errors_map_to_observation_kinds_with_status() {
+        use super::super::quota_policy::AccountFailureKind as K;
+        use super::super::usage::UsageError as U;
+        for (err, kind, status) in [
+            (
+                U::RateLimited {
+                    retry_after_s: Some(9),
+                },
+                K::UsageRateLimited,
+                Some(429),
+            ),
+            (
+                U::Unauthorized { status: 403 },
+                K::UsageUnauthorized,
+                Some(403),
+            ),
+            (
+                U::UpstreamStatus {
+                    status: 503,
+                    retry_after_s: None,
+                },
+                K::UsageUpstream,
+                Some(503),
+            ),
+            (U::Redirected { status: 302 }, K::UsageUpstream, Some(302)),
+            (U::Timeout, K::UsageTimeout, None),
+            (
+                U::Transport {
+                    detail: "connect".into(),
+                },
+                K::UsageTransport,
+                None,
+            ),
+            (U::Malformed { detail: "x".into() }, K::UsageMalformed, None),
+            (U::BodyTooLarge { cap: 1 }, K::UsageMalformed, None),
+            (U::AccountIdUnavailable, K::UsageUnauthorized, None),
+            (
+                U::UnsupportedProvider {
+                    provider: "p".into(),
+                },
+                K::Unsupported,
+                None,
+            ),
+        ] {
+            let read = UsageReadError::usage(err.clone());
+            assert_eq!(read.failure.kind, kind, "{err:?}");
+            assert_eq!(read.failure.http_status, status, "{err:?}");
+            assert_eq!(read.error, err.clone().into_broker_error(), "{err:?}");
+        }
+        assert_eq!(
+            UsageReadError::usage(U::RateLimited {
+                retry_after_s: Some(9)
+            })
+            .failure
+            .retry_after_s,
+            Some(9)
+        );
     }
 }

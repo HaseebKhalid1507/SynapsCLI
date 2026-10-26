@@ -60,12 +60,13 @@ pub use key::{
 };
 pub use types::{
     ActivationGrantRef, BlockKind, BlockMeta, CacheBoundaryLocation, CacheBoundaryMeta, CacheMeta,
-    CacheSegmentDelta, CacheTtlClass, EndpointMeta, ExecutionCommitStatus, ExecutionEffect,
-    ExecutionPhase, MessageMeta, MessageRole, PrefixMeta, RequestAnatomy, RequestTrace, RetryClass,
-    RetryMeta, SegmentChange, StopReason, SystemSegmentKind, SystemSegmentMeta, TimingStages,
-    ToolExecutionEvent, ToolMeta, TraceId, TraceSchemaVersion, TranslationAction,
-    TranslationElement, TranslationLoss, TransportKind, TransportOutcome, UsageMeta,
-    UsageProvenance, WireMeta, WireName, TRACE_ID_MAX_BYTES, TRACE_SCHEMA, WIRE_NAME_MAX_BYTES,
+    CacheMissReason, CacheSegmentDelta, CacheTtlClass, EndpointMeta, ExecutionCommitStatus,
+    ExecutionEffect, ExecutionPhase, MessageMeta, MessageRole, PrefixMeta, RequestAnatomy,
+    RequestTrace, RetryClass, RetryMeta, SegmentChange, ServerCacheDiagnosis, StopReason,
+    SystemSegmentKind, SystemSegmentMeta, TimingStages, ToolExecutionEvent, ToolMeta, TraceId,
+    TraceSchemaVersion, TranslationAction, TranslationElement, TranslationLoss, TransportKind,
+    TransportOutcome, UsageMeta, UsageProvenance, WireMeta, WireName, TRACE_ID_MAX_BYTES,
+    TRACE_SCHEMA, WIRE_NAME_MAX_BYTES,
 };
 
 #[cfg(test)]

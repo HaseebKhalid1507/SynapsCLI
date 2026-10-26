@@ -504,8 +504,10 @@ fn live_reactive_subagent_end_to_end() {
                 tx_events: None,
             },
             capabilities: ToolCapabilities {
+                session_allow_all: None,
                 launch_cancel: None,
                 memory_backend: None,
+                telemetry: None,
                 watcher_exit_path: None,
                 tool_register_tx: None,
                 session_manager: None,
@@ -523,6 +525,7 @@ fn live_reactive_subagent_end_to_end() {
                 env: None,
                 env_stripped: Vec::new(),
                 env_warned: Default::default(),
+                session_id: None,
             },
             limits: ToolLimits {
                 max_tool_output: 30000,
@@ -588,8 +591,10 @@ fn live_reactive_subagent_end_to_end() {
                 tx_events: None,
             },
             capabilities: ToolCapabilities {
+                session_allow_all: None,
                 launch_cancel: None,
                 memory_backend: None,
+                telemetry: None,
                 watcher_exit_path: None,
                 tool_register_tx: None,
                 session_manager: None,
@@ -607,6 +612,7 @@ fn live_reactive_subagent_end_to_end() {
                 env: None,
                 env_stripped: Vec::new(),
                 env_warned: Default::default(),
+                session_id: None,
             },
             limits: ToolLimits {
                 max_tool_output: 30000,

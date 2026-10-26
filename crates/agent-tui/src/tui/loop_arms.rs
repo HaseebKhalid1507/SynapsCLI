@@ -570,6 +570,52 @@ pub(crate) fn handle_ping_arm(
     }
 }
 
+/// /sessions arm: a background answer (daemon list, past list, pin/close).
+/// Dropped when the modal is closed or the answer is from an earlier open;
+/// a closed modal also drops a poller that outlived it.
+pub(crate) fn handle_sessions_arm(
+    app: &mut App,
+    link: &super::session_link::SessionLink,
+    msg: super::sessions::SessionsMsg,
+) {
+    let own = super::sessions::own_row(app, link);
+    let Some(st) = app.sessions.as_mut() else {
+        app.sessions_poller = None;
+        return;
+    };
+    if st.apply(msg, || own) {
+        app.request_redraw();
+    }
+}
+
+/// After an input action: a `/sessions` Enter (Live → Attach, Past →
+/// Continue) left a switch — swap this TUI onto that session.
+pub(crate) async fn drain_session_switch(
+    app: &mut App,
+    link: &mut super::session_link::SessionLink,
+    prompt_bridge: &mut super::session_link::PromptBridge,
+    registry: &std::sync::Arc<synaps_cli::skills::registry::CommandRegistry>,
+    render_handle: &super::render_thread::RenderHandle,
+) {
+    let Some(target) = app.sessions.as_mut().and_then(|s| s.pending_switch.take()) else {
+        return;
+    };
+    let connector = link
+        .transport()
+        .socket_path()
+        .map(|p| super::sessions::switch::DaemonConnector { path: p.to_path_buf() });
+    super::sessions::switch::perform(
+        app,
+        link,
+        prompt_bridge,
+        target,
+        connector.as_ref().map(|c| c as &dyn super::sessions::switch::Connector),
+        registry,
+        render_handle,
+    )
+    .await;
+}
+
 /// Expanded model-list arm: async provider model enumeration returned.
 pub(crate) fn handle_model_list_arm(
     app: &mut App,
@@ -687,7 +733,7 @@ pub(crate) async fn handle_animation_tick(
         theme::transition::advance(&mut app.theme_transition, std::time::Instant::now())
     {
         theme::set_theme(frame);
-        app.invalidate();
+        app.invalidate_theme();
     }
     // P7.8: activation/deactivation happen OUTSIDE any input event
     // (async queue + auto-chaining); reconcile the stack to the
@@ -698,7 +744,7 @@ pub(crate) async fn handle_animation_tick(
     if !app.subagents.is_empty() {
         let now = std::time::Instant::now();
         let should_reconcile =
-            last_subagent_reconcile.map_or(true, |t| now.duration_since(t).as_secs_f64() >= 1.0);
+            last_subagent_reconcile.is_none_or(|t| now.duration_since(t).as_secs_f64() >= 1.0);
         if should_reconcile {
             // From the `SubagentRows` cache the actor refreshes at 1 Hz.
             super::stream_handler::reconcile_subagents(&mut app.subagents, &app.subagent_rows, now);
@@ -755,12 +801,11 @@ pub(crate) async fn handle_animation_tick(
         }
         app.request_redraw();
     }
-    if app.advance_animations() {
-        // Spinner ticks only affect the tail message (THINKING_PLACEHOLDER,
-        // active tool animation). Mark just the last slot dirty instead of
-        // full invalidation — O(1) instead of O(n) per frame.
-        app.invalidate_last();
+    if app.spinner_frame.is_multiple_of(3) && app.header_animating() {
+        // Header block sweep + spinner (~20 fps; wall-clock speed).
+        app.request_redraw();
     }
+    app.tick_message_animations();
     if let Some(msg) = app.check_gamba_exited() {
         // check_gamba_exited() already called restore_terminal();
         // resume the render thread now that we own the terminal again.
@@ -776,10 +821,13 @@ pub(crate) async fn handle_animation_tick(
     false
 }
 
-/// Live-MXC (myx theme) boot: start the subscriber iff the configured theme
-/// is "myx". Later /theme switches reconcile via `App::sync_myx_live`.
+/// Live-MXC (myx theme) boot: start the subscriber iff the theme this
+/// process starts with is "myx": `SYNAPS_THEME` if it names a theme, else
+/// the configured one. Later /theme switches reconcile via
+/// `App::sync_myx_live`.
 pub(crate) fn boot_myx_live(app: &mut App) {
-    if theme::configured_theme_name().as_deref() == Some("myx") {
+    let boot = theme::env_theme_name().or_else(theme::configured_theme_name);
+    if boot.as_deref() == Some("myx") {
         app.sync_myx_live("myx");
     }
 }

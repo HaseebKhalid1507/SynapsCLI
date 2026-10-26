@@ -149,7 +149,7 @@ backup/cutover, preserve all inventories (including bodyless deletion evidence),
 and explicitly restore/link each original scope. Never paste private export
 bodies into model tools.
 
-Existing limits remain: Linux/procfs service, 15-second host call deadline,
+Existing limits remain: Linux/procfs or macOS service, 15-second host call deadline,
 1 MiB ordinary/24 MiB large frames, 24 MiB per atomic migration,
 16,384 combined note/tombstone entries, and bounded history inventories. Oversized
 operations fail without truncation. Repository discovery/mapping is bounded too.

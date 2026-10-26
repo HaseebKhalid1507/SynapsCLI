@@ -25,10 +25,9 @@ use agent_core::prompt::{
 use serde_json::{json, Value};
 use std::sync::Arc;
 
-/// Identity string expected when no user config has been loaded. Fixtures for
-/// the oauth scenario embed this; if a prior test in this binary loaded a user
-/// config with a custom identity, the file comparison is skipped (the live
-/// old-vs-new comparison still runs and is the actual hard gate).
+/// Identity string the oauth fixtures embed. The gates pin it on their thread
+/// ([`with_fixture_identity`]), so a user config another test loaded can't
+/// change it or skip the comparison.
 const EXPECTED_DEFAULT_IDENTITY: &str =
     "You are an AI assistant running in SynapsCLI, an open-source agent runtime.";
 
@@ -45,7 +44,6 @@ pub(super) struct Scenario {
     pub(super) auth_type: &'static str,
     pub(super) messages: Vec<SharedMessage>,
     pub(super) stream: bool,
-    pub(super) identity_sensitive: bool,
 }
 
 fn two_tools() -> Vec<Value> {
@@ -112,7 +110,6 @@ pub(super) fn scenarios() -> Vec<Scenario> {
             auth_type: "api_key",
             messages: plain_history(),
             stream: true,
-            identity_sensitive: false,
         },
         Scenario {
             name: "tools_5m",
@@ -125,7 +122,6 @@ pub(super) fn scenarios() -> Vec<Scenario> {
             auth_type: "api_key",
             messages: tool_history(),
             stream: true,
-            identity_sensitive: false,
         },
         Scenario {
             name: "tools_1h",
@@ -138,7 +134,6 @@ pub(super) fn scenarios() -> Vec<Scenario> {
             auth_type: "api_key",
             messages: tool_history(),
             stream: true,
-            identity_sensitive: false,
         },
         Scenario {
             name: "tools_hybrid",
@@ -151,7 +146,6 @@ pub(super) fn scenarios() -> Vec<Scenario> {
             auth_type: "api_key",
             messages: tool_history(),
             stream: true,
-            identity_sensitive: false,
         },
         Scenario {
             name: "system_api_key_5m",
@@ -164,7 +158,6 @@ pub(super) fn scenarios() -> Vec<Scenario> {
             auth_type: "api_key",
             messages: plain_history(),
             stream: true,
-            identity_sensitive: false,
         },
         Scenario {
             name: "system_oauth_hybrid",
@@ -177,7 +170,6 @@ pub(super) fn scenarios() -> Vec<Scenario> {
             auth_type: "oauth",
             messages: tool_history(),
             stream: true,
-            identity_sensitive: true,
         },
         Scenario {
             name: "adaptive_no_effort",
@@ -190,7 +182,6 @@ pub(super) fn scenarios() -> Vec<Scenario> {
             auth_type: "api_key",
             messages: plain_history(),
             stream: true,
-            identity_sensitive: false,
         },
         Scenario {
             name: "adaptive_effort_high",
@@ -205,7 +196,6 @@ pub(super) fn scenarios() -> Vec<Scenario> {
             auth_type: "api_key",
             messages: plain_history(),
             stream: true,
-            identity_sensitive: false,
         },
         Scenario {
             name: "legacy_adaptive_fallback",
@@ -218,7 +208,6 @@ pub(super) fn scenarios() -> Vec<Scenario> {
             auth_type: "api_key",
             messages: plain_history(),
             stream: true,
-            identity_sensitive: false,
         },
         Scenario {
             name: "sync_no_stream_1h",
@@ -231,7 +220,6 @@ pub(super) fn scenarios() -> Vec<Scenario> {
             auth_type: "api_key",
             messages: tool_history(),
             stream: false,
-            identity_sensitive: false,
         },
         Scenario {
             name: "empty_history_no_tools_5m",
@@ -244,7 +232,6 @@ pub(super) fn scenarios() -> Vec<Scenario> {
             auth_type: "api_key",
             messages: vec![],
             stream: true,
-            identity_sensitive: false,
         },
         // S241 gate-review Finding-3 armor: the four adaptive scenarios above
         // are all 5m/stream/no-system. TTL and adaptive-mode were argued
@@ -263,7 +250,6 @@ pub(super) fn scenarios() -> Vec<Scenario> {
             auth_type: "api_key",
             messages: plain_history(),
             stream: true,
-            identity_sensitive: false,
         },
         Scenario {
             name: "adaptive_sync_system_5m",
@@ -278,7 +264,6 @@ pub(super) fn scenarios() -> Vec<Scenario> {
             auth_type: "api_key",
             messages: plain_history(),
             stream: false,
-            identity_sensitive: false,
         },
         // Off semantics: thinking field omitted entirely.
         Scenario {
@@ -292,7 +277,6 @@ pub(super) fn scenarios() -> Vec<Scenario> {
             auth_type: "api_key",
             messages: plain_history(),
             stream: true,
-            identity_sensitive: false,
         },
     ]
 }
@@ -404,23 +388,30 @@ pub(super) fn fixture_dir() -> std::path::PathBuf {
         .join("golden_body")
 }
 
-pub(super) fn identity_is_default() -> bool {
-    crate::core::config::get_identity() == EXPECTED_DEFAULT_IDENTITY
+/// Run `f` with the identity the oauth fixtures were generated with pinned on
+/// this thread. `config::IDENTITY` is a process-wide latch that whichever test
+/// first loads a config sets, from the developer's real HOME if nothing pins
+/// it; these gates used to skip the oauth fixture comparison whenever that
+/// latch wasn't the default, which was every run on a machine with an
+/// `identity =` line. Pinned, they can't skip.
+pub(super) fn with_fixture_identity<R>(f: impl FnOnce() -> R) -> R {
+    crate::core::config::with_identity_for_tests(EXPECTED_DEFAULT_IDENTITY, f)
 }
 
 /// Finding-2 armor (S241 gate review): if the runtime's DEFAULT_IDENTITY ever
 /// drifts from the constant the oauth fixtures were generated with, this test
-/// FAILS LOUDLY instead of letting `identity_is_default()` silently skip the
-/// `system_oauth_hybrid` fixture comparison forever. Const-to-const compare —
-/// no global state, immune to test-order config pollution. On failure: decide
-/// consciously, regenerate fixtures (GOLDEN_WRITE=1), update both constants.
+/// FAILS LOUDLY instead of letting the fixtures (and the identity the gates
+/// pin, [`with_fixture_identity`]) silently stop matching what ships.
+/// Const-to-const compare — no global state, immune to test-order config
+/// pollution. On failure: decide consciously, regenerate fixtures
+/// (GOLDEN_WRITE=1), update both constants.
 #[test]
 fn default_identity_constant_has_not_drifted() {
     assert_eq!(
         crate::core::config::DEFAULT_IDENTITY,
         EXPECTED_DEFAULT_IDENTITY,
         "DEFAULT_IDENTITY drifted from the golden-fixture constant. The \
-         system_oauth_hybrid fixture would silently stop being compared. \
+         system_oauth_hybrid fixture would no longer describe the shipped default. \
          Regenerate fixtures (GOLDEN_WRITE=1) and update EXPECTED_DEFAULT_IDENTITY."
     );
 }
@@ -432,16 +423,14 @@ fn golden_write() {
     if std::env::var("GOLDEN_WRITE").as_deref() != Ok("1") {
         return;
     }
-    assert!(
-        identity_is_default(),
-        "refusing to generate fixtures with a non-default identity loaded"
-    );
     let dir = fixture_dir();
     std::fs::create_dir_all(&dir).expect("create fixture dir");
-    for s in scenarios() {
-        let bytes = old_body_bytes(&s);
-        std::fs::write(dir.join(format!("{}.json", s.name)), &bytes).expect("write fixture");
-    }
+    with_fixture_identity(|| {
+        for s in scenarios() {
+            let bytes = old_body_bytes(&s);
+            std::fs::write(dir.join(format!("{}.json", s.name)), &bytes).expect("write fixture");
+        }
+    });
 }
 
 /// THE GATE (#128 Slice 4): for every scenario, the borrowing serializer must
@@ -450,56 +439,106 @@ fn golden_write() {
 #[test]
 fn golden_gate_body_bytes_identical() {
     let dir = fixture_dir();
-    let default_identity = identity_is_default();
-    for s in scenarios() {
-        let old = old_body_bytes(&s);
-        let (new, has_tool_marker, has_system_marker) = new_body_bytes(&s);
+    with_fixture_identity(|| {
+        for s in scenarios() {
+            let old = old_body_bytes(&s);
+            let (new, has_tool_marker, has_system_marker) = new_body_bytes(&s);
 
-        // Live gate: new serializer vs frozen legacy replica.
-        assert_eq!(
-            new,
-            old,
-            "scenario `{}`: RequestBody bytes diverge from legacy assembly\nold: {}\nnew: {}",
-            s.name,
-            String::from_utf8_lossy(&old),
-            String::from_utf8_lossy(&new),
-        );
+            // Live gate: new serializer vs frozen legacy replica.
+            assert_eq!(
+                new,
+                old,
+                "scenario `{}`: RequestBody bytes diverge from legacy assembly\nold: {}\nnew: {}",
+                s.name,
+                String::from_utf8_lossy(&old),
+                String::from_utf8_lossy(&new),
+            );
 
-        // Marker probes must match the legacy body-inspection semantics.
-        let old_val: Value = serde_json::from_slice(&old).unwrap();
-        assert_eq!(
-            has_tool_marker,
-            old_val["tools"].as_array().is_some_and(|t| !t.is_empty()),
-            "scenario `{}`: has_tool_marker mismatch",
-            s.name
-        );
-        assert_eq!(
-            has_system_marker,
-            old_val.get("system").is_some(),
-            "scenario `{}`: has_system_marker mismatch",
-            s.name
-        );
-
-        // Fixture gate: committed bytes (regression armor across releases).
-        if s.identity_sensitive && !default_identity {
-            eprintln!(
-                "scenario `{}`: skipping FILE comparison (non-default identity loaded \
-                 by another test); live old==new gate still enforced",
+            // Marker probes must match the legacy body-inspection semantics.
+            let old_val: Value = serde_json::from_slice(&old).unwrap();
+            assert_eq!(
+                has_tool_marker,
+                old_val["tools"].as_array().is_some_and(|t| !t.is_empty()),
+                "scenario `{}`: has_tool_marker mismatch",
                 s.name
             );
-            continue;
+            assert_eq!(
+                has_system_marker,
+                old_val.get("system").is_some(),
+                "scenario `{}`: has_system_marker mismatch",
+                s.name
+            );
+
+            // Fixture gate: committed bytes (regression armor across releases).
+            let path = dir.join(format!("{}.json", s.name));
+            let fixture = std::fs::read(&path)
+                .unwrap_or_else(|e| panic!("missing fixture {} — {e}", path.display()));
+            assert_eq!(
+                new,
+                fixture,
+                "scenario `{}`: bytes diverge from committed fixture {}",
+                s.name,
+                path.display()
+            );
         }
-        let path = dir.join(format!("{}.json", s.name));
-        let fixture = std::fs::read(&path)
-            .unwrap_or_else(|e| panic!("missing fixture {} — {e}", path.display()));
-        assert_eq!(
-            new,
-            fixture,
-            "scenario `{}`: bytes diverge from committed fixture {}",
-            s.name,
-            path.display()
-        );
-    }
+    });
+}
+
+/// Cache diagnostics ON (`cache_diagnostics = true`): for every scenario the
+/// body is the committed off-path fixture with exactly one leading
+/// `"diagnostics"` member, and stripping it (the fail-soft path) gives the
+/// fixture back byte for byte. The off path itself is the gate above.
+#[test]
+fn golden_cache_diagnostics_is_one_leading_member_on_the_fixture() {
+    use super::cache_diagnosis::{strip_diagnostics, DiagnosticsParam};
+    let dir = fixture_dir();
+    with_fixture_identity(|| {
+        for s in scenarios() {
+            let fixture = std::fs::read(dir.join(format!("{}.json", s.name))).unwrap();
+            for (prev, member) in [
+                (None, r#"{"diagnostics":{"previous_message_id":null},"#),
+                (
+                    Some("msg_01Golden"),
+                    r#"{"diagnostics":{"previous_message_id":"msg_01Golden"},"#,
+                ),
+            ] {
+                let param = DiagnosticsParam {
+                    previous_message_id: prev.map(str::to_string),
+                };
+                let mut cleaned_messages = s.messages.to_vec();
+                HelperMethods::sanitize_thinking_blocks(&mut cleaned_messages);
+                HelperMethods::annotate_cache_breakpoint(&mut cleaned_messages, s.ttl);
+                let mut body = super::request::RequestBody::new(
+                    s.model,
+                    &cleaned_messages,
+                    &s.tools,
+                    &[],
+                    &s.system_prompt,
+                    s.auth_type,
+                    s.thinking_budget,
+                    s.reasoning_level,
+                    None,
+                    s.ttl,
+                    s.stream,
+                );
+                body.set_diagnostics(param.clone());
+                let on = serde_json::to_vec(&body).unwrap();
+                let mut expected = member.as_bytes().to_vec();
+                expected.extend_from_slice(&fixture[1..]);
+                assert_eq!(
+                    on, expected,
+                    "scenario `{}`: diagnostics body is not fixture + one leading member",
+                    s.name
+                );
+                assert_eq!(
+                    strip_diagnostics(&on, &param).as_deref(),
+                    Some(fixture.as_slice()),
+                    "scenario `{}`: stripping does not restore the fixture",
+                    s.name
+                );
+            }
+        }
+    });
 }
 
 #[test]

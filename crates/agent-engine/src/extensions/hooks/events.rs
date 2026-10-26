@@ -106,7 +106,12 @@ impl HookKind {
             // than re-appended on every message the way `before_message`
             // injection is.
             Self::OnSessionStart => &["continue", "inject"],
-            Self::OnMessageComplete | Self::OnCompaction | Self::OnSessionEnd => &["continue"],
+            // Advisory work-phase report for the host's automatic context
+            // management (same semantics as the model's own
+            // `context_checkpoint` tool without a note). Never capacity or
+            // permission authority.
+            Self::OnMessageComplete => &["continue", "context_phase"],
+            Self::OnCompaction | Self::OnSessionEnd => &["continue"],
         }
     }
 
@@ -126,6 +131,7 @@ impl HookKind {
                 | (Self::AfterToolCall, HookResult::Replace { .. })
                 | (Self::BeforeMessage, HookResult::Inject { .. })
                 | (Self::OnSessionStart, HookResult::Inject { .. })
+                | (Self::OnMessageComplete, HookResult::ContextPhase { .. })
         )
     }
 
@@ -368,7 +374,9 @@ impl HookEvent {
 /// What an extension handler returns after processing a hook event.
 ///
 /// The runtime resolves multiple handlers by precedence:
-/// - `Block`, `Confirm`, and `Modify` stop the handler chain for `before_tool_call`.
+/// - For `before_tool_call` only `Block` stops the handler chain. `Modify`
+///   rewrites the input that later handlers see; `Confirm` is merged and
+///   resolved after the whole chain (a `Modify` after it is ignored).
 /// - `Inject` results are accumulated for `before_message`.
 /// - `Continue` is the no-op default — processing continues normally.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -388,10 +396,36 @@ pub enum HookResult {
     Inject { content: String },
     /// Ask the runtime to get explicit user confirmation before proceeding.
     /// Only valid on before_tool_call hooks.
-    Confirm { message: String },
+    ///
+    /// `sources` / `tool` are host-stamped by `HookBus::emit` (the extension
+    /// id(s) that asked, and the tool name). They are never read from or
+    /// written to the extension wire format, so an extension cannot claim to
+    /// be another extension. The "Allow all" latch is keyed by `sources`.
+    Confirm {
+        message: String,
+        #[serde(skip)]
+        sources: Vec<String>,
+        /// Host-set load generation of each source (parallel to `sources`;
+        /// missing entries mean 0). Part of the latch key, so a plugin
+        /// reinstalled under the same id starts unlatched.
+        #[serde(skip)]
+        generations: Vec<u64>,
+        #[serde(skip)]
+        tool: Option<String>,
+        /// Host-set: the input as rewritten by `Modify` results earlier in
+        /// the chain. Approval runs THIS input (never extension-settable).
+        #[serde(skip)]
+        modified_input: Option<Value>,
+        /// Host-set: ids of the extensions whose `Modify` produced
+        /// `modified_input` (chain order, de-duplicated). Shown in the
+        /// prompt so the user knows the input was rewritten, and by whom.
+        #[serde(skip)]
+        modified_by: Vec<String>,
+    },
     /// Replace the tool **input** before execution (structured JSON args).
     /// Only valid on before_tool_call hooks. The output-side counterpart is
-    /// [`HookResult::Replace`]. The first modifier stops the handler chain.
+    /// [`HookResult::Replace`]. Does not stop the chain: later handlers see
+    /// (and may block or confirm) the modified input.
     Modify { input: Value },
     /// Replace the tool **output** after execution (flat string), before it
     /// enters history. Only valid on after_tool_call hooks. The input-side
@@ -400,6 +434,32 @@ pub enum HookResult {
     /// output transforms (compression, redaction, summarization) by extensions.
     /// The first transform stops the handler chain.
     Replace { output: String },
+    /// Advisory work-phase report for the host's automatic context
+    /// management. Only valid on `on_message_complete`, and only honoured
+    /// when the extension additionally holds `session.lifecycle`. Semantics
+    /// are identical to the model calling `context_checkpoint` with this
+    /// phase and no note: the host may roll the context window over at the
+    /// next task boundary. It is a lower-authority report — never capacity,
+    /// permission, or history authority — and does not stop the handler
+    /// chain (other observers still run; the first valid report wins).
+    /// `phase` is parsed host-side with `WorkPhase::parse`; unknown strings
+    /// are ignored with a warning.
+    ContextPhase { phase: String },
+}
+
+impl HookResult {
+    /// An unattributed `Confirm` (as an extension returns it, before
+    /// `HookBus::emit` stamps the source).
+    pub fn confirm(message: impl Into<String>) -> Self {
+        Self::Confirm {
+            message: message.into(),
+            sources: Vec::new(),
+            generations: Vec::new(),
+            tool: None,
+            modified_input: None,
+            modified_by: vec![],
+        }
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -434,6 +494,55 @@ mod tests {
         let out = serde_json::to_value(HookResult::Replace { output: "x".into() }).unwrap();
         assert_eq!(out["action"], "replace");
         assert_eq!(out["output"], "x");
+    }
+
+    /// The extension wire format `{"action":"context_phase","phase":"..."}`
+    /// deserializes to HookResult::ContextPhase and round-trips back.
+    #[test]
+    fn context_phase_action_roundtrips_extension_wire_format() {
+        let wire = json!({"action": "context_phase", "phase": "new_task"});
+        let parsed: HookResult = serde_json::from_value(wire).expect("must deserialize");
+        match &parsed {
+            HookResult::ContextPhase { phase } => assert_eq!(phase, "new_task"),
+            other => panic!("expected ContextPhase, got {other:?}"),
+        }
+
+        let out = serde_json::to_value(&parsed).unwrap();
+        assert_eq!(out, json!({"action": "context_phase", "phase": "new_task"}));
+        let back: HookResult = serde_json::from_value(out).unwrap();
+        assert_eq!(back, parsed);
+
+        // A missing `phase` is a malformed result, not a silent default.
+        assert!(serde_json::from_value::<HookResult>(json!({"action": "context_phase"})).is_err());
+    }
+
+    /// on_message_complete may return ContextPhase; no other hook may, and
+    /// on_message_complete advertises "context_phase" in its action contract.
+    #[test]
+    fn only_on_message_complete_allows_context_phase() {
+        let report = HookResult::ContextPhase {
+            phase: "execute".into(),
+        };
+        for kind in HookKind::ALL {
+            assert_eq!(
+                kind.allows_result(&report),
+                *kind == HookKind::OnMessageComplete,
+                "context_phase must be allowed only on on_message_complete (checked {})",
+                kind.as_str()
+            );
+        }
+        assert!(HookKind::OnMessageComplete
+            .allowed_action_names()
+            .contains(&"context_phase"));
+        // Still observe-only for everything else.
+        assert!(
+            !HookKind::OnMessageComplete.allows_result(&HookResult::Block { reason: "r".into() })
+        );
+        assert!(
+            !HookKind::OnMessageComplete.allows_result(&HookResult::Inject {
+                content: "c".into()
+            })
+        );
     }
 
     // ── HookKind ──────────────────────────────────────────────────────────────
@@ -678,6 +787,11 @@ mod tests {
     fn hook_result_confirm_serde() {
         let r = HookResult::Confirm {
             message: "Run this command?".to_string(),
+            sources: vec!["host-stamped".into()],
+            generations: vec![3],
+            tool: Some("bash".into()),
+            modified_input: Some(serde_json::json!({"x": 1})),
+            modified_by: vec![],
         };
         let json = serde_json::to_string(&r).unwrap();
         assert_eq!(
@@ -686,7 +800,17 @@ mod tests {
         );
 
         let back: HookResult = serde_json::from_str(&json).unwrap();
-        assert!(matches!(back, HookResult::Confirm { message } if message == "Run this command?"));
+        assert!(matches!(back, HookResult::Confirm { message, .. } if message == "Run this command?"));
+
+        // An extension cannot name a source: wire fields are ignored.
+        let spoof: HookResult = serde_json::from_str(
+            r#"{"action":"confirm","message":"m","sources":["trusted"],"tool":"x"}"#,
+        )
+        .unwrap();
+        assert!(
+            matches!(&spoof, HookResult::Confirm { sources, tool: None, modified_input: None, modified_by, .. } if sources.is_empty() && modified_by.is_empty()),
+            "{spoof:?}"
+        );
     }
 
     /// Modify carries replacement input through serialization.
@@ -764,13 +888,18 @@ mod tests {
     /// returned "inject" -- caught here now.)
     #[test]
     fn advertised_actions_match_enforced_actions() {
-        let samples: [(&str, HookResult); 6] = [
+        let samples: [(&str, HookResult); 7] = [
             ("continue", HookResult::Continue),
             ("block", HookResult::Block { reason: "r".into() }),
             (
                 "confirm",
                 HookResult::Confirm {
                     message: "m".into(),
+                    sources: vec![],
+                    generations: vec![],
+                    tool: None,
+                    modified_input: None,
+                    modified_by: vec![],
                 },
             ),
             (
@@ -784,6 +913,12 @@ mod tests {
                 "inject",
                 HookResult::Inject {
                     content: "c".into(),
+                },
+            ),
+            (
+                "context_phase",
+                HookResult::ContextPhase {
+                    phase: "new_task".into(),
                 },
             ),
         ];

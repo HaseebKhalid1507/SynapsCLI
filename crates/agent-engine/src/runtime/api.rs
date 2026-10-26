@@ -3,6 +3,7 @@ use super::sse_types::{AnthropicEvent, ContentBlock, Delta};
 use super::types::{AuthState, LlmEvent, SessionEvent, StreamEvent};
 use crate::runtime::telemetry::{self, TelemetryLevel};
 use crate::{Result, RuntimeError, ToolRegistry};
+#[cfg(test)]
 use futures::StreamExt;
 use reqwest::Client;
 use serde_json::{json, Value};
@@ -120,6 +121,9 @@ struct ParseState {
     trace_stop_reason: Option<crate::runtime::trace::StopReason>,
     /// Provider-reported usage for the trace record; `None` until observed.
     trace_usage: Option<crate::runtime::trace::UsageMeta>,
+    /// Cache-diagnosis verdict from message_start (only when this request
+    /// sent `diagnostics`); `None` = no divergence / not requested.
+    server_diagnosis: Option<crate::runtime::trace::ServerCacheDiagnosis>,
 }
 
 /// A failure surfaced as an in-stream Anthropic `error` event under a 200
@@ -196,6 +200,7 @@ impl ParseState {
             first_event_elapsed_ms: None,
             trace_stop_reason: None,
             trace_usage: None,
+            server_diagnosis: None,
         }
     }
 
@@ -289,6 +294,9 @@ struct EventCtx<'t> {
     /// Optional Task 23 turn-budget usage counters, recorded at the single
     /// authoritative Usage emission (and its residual twin) only.
     usage_counters: Option<std::sync::Arc<crate::runtime::budget::UsageCounters>>,
+    /// This request sent `diagnostics`: capture the message id (chain) and
+    /// the server's verdict from message_start.
+    cache_diagnosis: bool,
 }
 
 /// THE TEST SEAM. Strips SSE framing, skips non-data lines and the `[DONE]`
@@ -588,11 +596,15 @@ fn process_event(event: AnthropicEvent<'_>, raw: &str, state: &mut ParseState, c
             }
         }
         AnthropicEvent::MessageStart { message } => {
-            // ═══ TELEMETRY: capture msg_id ═══
-            if ctx.telemetry_level.enabled() {
+            // ═══ TELEMETRY: capture msg_id (also the diagnostics chain) ═══
+            if ctx.telemetry_level.enabled() || ctx.cache_diagnosis {
                 if let Some(id) = message.id {
                     state.telem_msg_id = Some(id.into_owned());
                 }
+            }
+            if ctx.cache_diagnosis {
+                state.server_diagnosis =
+                    super::cache_diagnosis::parse_server_diagnosis(message.diagnostics.as_ref());
             }
             if let Some(usage) = message.usage {
                 // CAPTURE ONLY — no Usage emission from this arm. Live
@@ -824,6 +836,8 @@ pub struct ApiOptions {
     /// Set by tests to point at a local mock server without touching env vars.
     #[doc(hidden)]
     pub anthropic_base_url: Option<String>,
+    /// Dedicated lazy pool: upload and body idle deadlines are independent.
+    pub(super) anthropic_stream_client: Arc<std::sync::OnceLock<Client>>,
     /// Execution authority produced by Runtime preflight. Transports must not
     /// recreate authority for Max/UltraCode from assumed prerequisites.
     pub anthropic_execution_plan: Option<crate::runtime::openai::catalog::AnthropicExecutionPlan>,
@@ -893,6 +907,12 @@ pub struct ApiOptions {
     /// [`KeepWarmMode`]), every retry budget is zero, and the telemetry
     /// record carries `"keepwarm": true`.
     pub keepwarm: Option<KeepWarmRequest>,
+    /// Anthropic cache diagnostics chain (`cache_diagnostics = true`).
+    /// `None` (default) keeps the wire byte-identical: no header, no
+    /// `diagnostics` field. Set on the foreground turn stream (which threads
+    /// `previous_message_id`) and on keep-warm pings (header only, so the
+    /// beta set matches the turns they keep warm).
+    pub cache_diagnosis: Option<super::cache_diagnosis::CacheDiagnosis>,
 }
 
 /// What a keep-warm request does once its body is built.
@@ -1147,25 +1167,29 @@ impl ApiMethods {
                 if cancel.is_cancelled() {
                     return Err(RuntimeError::Canceled);
                 }
-                return crate::runtime::cloud_invoke::cloud_invoke_stream(
-                    provider,
-                    model,
-                    cloud_model,
-                    cloud_context,
-                    !tools_schema.is_empty(),
-                    || {
-                        crate::auth::broker_from_source(
-                            &options.credential_source,
-                            &options.token_cache,
-                            client.clone(),
-                        )
-                    },
-                    system_prompt,
-                    messages,
-                    &tx,
-                    cancel,
-                    &options.trace,
-                )
+                let has_tools = !tools_schema.is_empty();
+                return with_usage_metering(model, options.usage_counters.clone(), &tx, |tx| async move {
+                    crate::runtime::cloud_invoke::cloud_invoke_stream(
+                        provider,
+                        model,
+                        cloud_model,
+                        cloud_context,
+                        has_tools,
+                        || {
+                            crate::auth::broker_from_source(
+                                &options.credential_source,
+                                &options.token_cache,
+                                client.clone(),
+                            )
+                        },
+                        system_prompt,
+                        messages,
+                        &tx,
+                        cancel,
+                        &options.trace,
+                    )
+                    .await
+                })
                 .await;
             }
         }
@@ -1173,35 +1197,106 @@ impl ApiMethods {
         if cancel.is_cancelled() {
             return Err(RuntimeError::Canceled);
         }
-        if let Some(result) = crate::runtime::openai::try_route_with_memory_backend(
-            model,
-            client,
-            &tools_schema,
-            system_prompt,
-            messages,
-            &tx,
-            None,
-            None,
-            thinking_budget,
-            reasoning_level,
-            cancel,
-            &options.credential_source,
-            &options.token_cache,
-            max_retries,
-            options.codex_request_role,
-            options.tool_session_id.as_ref(),
-            options.session_tool_set.as_ref(),
-            options.memory_backend.as_ref(),
-            &options.trace,
-            options.suppress_stream_deltas,
-        )
-        .await
-        {
+        let routed = {
+            let tools_schema = &tools_schema;
+            // Native Anthropic models fall through to the transport below,
+            // which books its own usage.
+            let counters = options
+                .usage_counters
+                .clone()
+                .filter(|_| !super::auth::model_is_anthropic(model));
+            with_usage_metering(model, counters, &tx, |tx| async move {
+                crate::runtime::openai::try_route_with_memory_backend(
+                    model,
+                    client,
+                    tools_schema,
+                    system_prompt,
+                    messages,
+                    &tx,
+                    None,
+                    None,
+                    thinking_budget,
+                    reasoning_level,
+                    cancel,
+                    &options.credential_source,
+                    &options.token_cache,
+                    max_retries,
+                    options.codex_request_role,
+                    options.tool_session_id.as_ref(),
+                    options.session_tool_set.as_ref(),
+                    options.memory_backend.as_ref(),
+                    &options.trace,
+                    options.suppress_stream_deltas,
+                )
+                .await
+            })
+            .await
+        };
+        if let Some(result) = routed {
             // Classify honestly: transport blips are API failures, not
             // config problems (incident: session 20260714-025948-3dab).
             return result
                 .map_err(|e| crate::runtime::openai::net::provider_error_to_runtime_for(model, e));
         }
+        // Account failover (G3) crosses the broker boundary through the
+        // router seam, exactly like the Codex transport: the broker vends one
+        // (credential, access token) pair, never a refresh token, and this
+        // path never opens auth.json. Built lazily — nothing is constructed
+        // until a 429 proves window exhaustion.
+        let router = super::anthropic_quota::BrokerAnthropicRouter::lazy(
+            &options.credential_source,
+            &options.token_cache,
+            client.clone(),
+        );
+        Self::anthropic_stream_with_router(
+            auth,
+            client,
+            model,
+            tools_schema,
+            system_prompt,
+            thinking_budget,
+            reasoning_level,
+            messages,
+            tx,
+            cancel,
+            max_retries,
+            refusal_retries,
+            options,
+            telemetry_level,
+            &router,
+        )
+        .await
+    }
+
+    /// The Anthropic Messages transport proper: request assembly, the
+    /// unified retry loop and SSE parsing. Routing (cloud, OpenAI-compatible
+    /// providers) has already happened in [`Self::call_api_stream_inner`];
+    /// `messages` is the wire projection and `tools_schema` the resolved
+    /// schema source. `router` is the account-failover seam (production:
+    /// [`super::anthropic_quota::BrokerAnthropicRouter`]; tests script it).
+    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::collapsible_match)]
+    pub(super) async fn anthropic_stream_with_router(
+        auth: &Arc<RwLock<AuthState>>,
+        client: &Client,
+        model: &str,
+        tools_schema: Arc<Vec<Value>>,
+        system_prompt: &Option<String>,
+        thinking_budget: u32,
+        reasoning_level: agent_core::reasoning::ReasoningLevel,
+        messages: &[crate::SharedMessage],
+        tx: mpsc::UnboundedSender<StreamEvent>,
+        cancel: &CancellationToken,
+        max_retries: u32,
+        refusal_retries: u32,
+        options: &ApiOptions,
+        telemetry_level: crate::runtime::telemetry::TelemetryLevel,
+        router: &dyn super::anthropic_quota::AnthropicAccountRouter,
+    ) -> Result<Value> {
+        use super::anthropic_quota::{
+            body_prefix, classify_anthropic_429, describe_reset_utc, failover_permitted,
+            ratelimit_header_summary, Anthropic429, AnthropicFailoverGate, QUOTA_PROBE_BODY_CAP,
+        };
         // Provider qualification is application identity; Anthropic's wire API
         // still receives its native bare model id.
         let qualified_model = model;
@@ -1228,10 +1323,12 @@ impl ApiMethods {
             })?;
         let model = model.strip_prefix("anthropic/").unwrap_or(model);
 
+        let streaming_client = super::http_phases::client(&options.anthropic_stream_client)?;
+
         // Read auth state for this API call
-        let (mut auth_header_name, mut auth_header_value, auth_type) =
-            await_or_cancel(cancel, Self::build_auth_header(auth)).await?;
-        // C1: allow a single on-401 token refetch+retry for Remote clients.
+        let (mut auth_header_name, mut auth_header_value, auth_type, mut auth_binding) =
+            await_or_cancel(cancel, Self::build_auth_snapshot(auth)).await?;
+        // One credential recovery per logical request (local OAuth or remote).
         let mut auth_retried = false;
 
         // Fail early with a clear message if no Anthropic credentials
@@ -1316,6 +1413,12 @@ impl ApiMethods {
             true,
         );
         let mut body = parts.body;
+        // Cache diagnostics (`cache_diagnostics = true`): the foreground
+        // chain only — pings and the setting-off path send no field.
+        let mut diagnostics = super::cache_diagnosis::diagnostics_for(options);
+        if let Some(d) = &diagnostics {
+            body.set_diagnostics(d.clone());
+        }
         // Keep-warm: cut the output cap (not part of the cache key), then
         // fingerprint the prefix exactly as it would go on the wire. A probe —
         // or a ping whose prefix no longer matches what is cached — returns
@@ -1356,7 +1459,7 @@ impl ApiMethods {
         // we called `req.json(&body).send()` per attempt, which re-ran
         // `serde_json::to_vec(&body)` over the entire conversation on every
         // 429 retry — wasted work since the payload is identical.
-        let body_bytes: bytes::Bytes = serde_json::to_vec(&body)
+        let mut body_bytes: bytes::Bytes = serde_json::to_vec(&body)
             .map_err(|e| {
                 RuntimeError::ApiStatus(format!("failed to serialize request body: {}", e))
             })?
@@ -1427,6 +1530,17 @@ impl ApiMethods {
         let mut overload_attempts: u32 = 0; // Claude-compatible persistent overload budget
         let mut refusal_attempts: u32 = 0; // refusal-retry budget (separate from error budget)
         let mut attempt: u32 = 0; // total attempts (for backoff calc)
+        // ═══ ACCOUNT FAILOVER (G3) request-level state ════════════════════════
+        // `output_started`: any SSE frame was parsed on an earlier attempt of
+        // this request — the strict, fail-closed reading of "nothing has been
+        // streamed" that the hop requires (no cross-account replay).
+        // `tool_activity`: an earlier attempt produced a tool_use block.
+        // `anthropic_failovers`: hops spent on this request (≤ 1).
+        // `quota_headers_logged`: the one-time schema-capture warn fired.
+        let mut output_started = false;
+        let mut tool_activity = false;
+        let mut anthropic_failovers: u32 = 0;
+        let mut quota_headers_logged = false;
 
         loop {
             let response = {
@@ -1443,7 +1557,7 @@ impl ApiMethods {
                     }
 
                     // Rebuild request (consumed on send)
-                    let mut req = client
+                    let mut req = streaming_client
                         .post(&anthropic_url)
                         .header(auth_header_name.clone(), auth_header_value.clone())
                         .header("anthropic-version", "2023-06-01")
@@ -1469,7 +1583,15 @@ impl ApiMethods {
                         Some(keepwarm) => keepwarm_body(req, body_bytes.clone(), &keepwarm.sent),
                         None => req.body(body_bytes.clone()),
                     };
-                    match await_or_cancel(cancel, req.send()).await? {
+                    match await_or_cancel(
+                        cancel,
+                        super::http_phases::send(
+                            req,
+                            super::http_phases::header_deadline(body_bytes.len()),
+                        ),
+                    )
+                    .await?
+                    {
                         Ok(resp) => {
                             let status = resp.status();
                             if let Some(keepwarm) = &options.keepwarm {
@@ -1492,13 +1614,16 @@ impl ApiMethods {
                                 break;
                             }
 
-                            // C1: a 401 with a Remote source means the broker token
-                            // was rejected (revoked, or rotated at the broker before
-                            // our cache thought it expired). Invalidate, refetch from
-                            // the broker, and retry ONCE with the fresh token.
+                            // C1: a 401 means the token we sent was rejected —
+                            // revoked, or rotated elsewhere (broker, another
+                            // `synaps login`, refresh cron, synced auth.json)
+                            // before our in-memory expiry said so. Status-level,
+                            // so nothing has streamed yet. Invalidate, re-vend,
+                            // and retry ONCE. Local API-key mode is excluded:
+                            // there is no managed credential to reload.
                             if status.as_u16() == 401
-                                && options.credential_source.is_remote()
                                 && !auth_retried
+                                && (options.credential_source.is_remote() || auth_type == "oauth")
                             {
                                 auth_retried = true;
                                 clock.mark_headers();
@@ -1513,27 +1638,49 @@ impl ApiMethods {
                                         "http_401",
                                     );
                                 }
-                                let _ = await_or_cancel(cancel, resp.text()).await?; // drain body
-                                options.token_cache.invalidate("anthropic");
-                                {
-                                    let mut g = await_or_cancel(cancel, auth.write()).await?;
-                                    g.auth_token.clear();
-                                    g.token_expires = None;
+                                // Drop the rejected response: no unbounded body drain.
+                                drop(resp);
+                                if !options.credential_source.is_remote() {
+                                    let rejected =
+                                        auth_header_value.strip_prefix("Bearer ").unwrap_or("");
+                                    await_or_cancel(
+                                        cancel,
+                                        super::auth::AuthMethods::recover_local_rejection(
+                                            auth,
+                                            client,
+                                            &options.credential_source,
+                                            &options.token_cache,
+                                            auth_binding.as_deref(),
+                                            rejected,
+                                        ),
+                                    )
+                                    .await??;
+                                } else {
+                                    options.token_cache.invalidate("anthropic");
+                                    {
+                                        let mut g = await_or_cancel(cancel, auth.write()).await?;
+                                        g.auth_token.clear();
+                                        g.token_expires = None;
+                                    }
+                                    await_or_cancel(
+                                        cancel,
+                                        super::auth::AuthMethods::refresh_if_needed(
+                                            std::sync::Arc::clone(auth),
+                                            client,
+                                            &options.credential_source,
+                                            &options.token_cache,
+                                            Some(model),
+                                            super::auth::RefreshPoint::WithinTurn,
+                                        ),
+                                    )
+                                    .await??;
                                 }
-                                await_or_cancel(
-                                    cancel,
-                                    super::auth::AuthMethods::refresh_if_needed(
-                                        std::sync::Arc::clone(auth),
-                                        client,
-                                        &options.credential_source,
-                                        &options.token_cache,
-                                    ),
-                                )
-                                .await??;
-                                let (n, v, _t) =
-                                    await_or_cancel(cancel, Self::build_auth_header(auth)).await?;
+                                let (n, v, _t, binding) =
+                                    await_or_cancel(cancel, Self::build_auth_snapshot(auth))
+                                        .await?;
                                 auth_header_name = n;
                                 auth_header_value = v;
+                                auth_binding = binding;
                                 continue;
                             }
 
@@ -1549,12 +1696,241 @@ impl ApiMethods {
                             } else {
                                 None
                             };
+                            // Headers outlive the body read only for the OAuth
+                            // 429 classifier (G3); api-key auth has no seats.
+                            let quota_headers = if is_429 && auth_type == "oauth" {
+                                Some(resp.headers().clone())
+                            } else {
+                                None
+                            };
 
                             clock.mark_headers();
                             let trace_rid = provider_request_id_from_headers(resp.headers());
-                            let error_text = await_or_cancel(cancel, resp.text())
-                                .await?
-                                .unwrap_or_default();
+                            // Error bodies may echo prompts or be unbounded.
+                            // Retain only the quota probe cap, even before
+                            // classification/humanization; never buffer the
+                            // full upstream response just to take a prefix.
+                            let error_text = await_or_cancel(cancel, async {
+                                let mut stream = resp.bytes_stream();
+                                let mut bytes = Vec::new();
+                                while let Some(Ok(chunk)) = super::http_phases::next(
+                                    &mut stream,
+                                    super::http_phases::STREAM_IDLE,
+                                )
+                                .await
+                                {
+                                    let remaining = QUOTA_PROBE_BODY_CAP - bytes.len();
+                                    bytes.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+                                    if bytes.len() == QUOTA_PROBE_BODY_CAP {
+                                        break;
+                                    }
+                                }
+                                String::from_utf8_lossy(&bytes).into_owned()
+                            })
+                            .await?;
+
+                            // ═══ ACCOUNT FAILOVER (G3): window exhaustion on a 429 ═══
+                            // Recognized ONLY from provider-declared signals (see
+                            // `anthropic_quota::classify_anthropic_429`); anything
+                            // else keeps the retry path below untouched. The body
+                            // is consulted as a bounded prefix and never logged.
+                            if let Some(headers) = quota_headers.as_ref() {
+                                if !quota_headers_logged {
+                                    quota_headers_logged = true;
+                                    tracing::warn!(
+                                        headers = %ratelimit_header_summary(headers),
+                                        "anthropic 429 headers (schema capture)"
+                                    );
+                                }
+                                let now_ms = crate::epoch_millis();
+                                if let Anthropic429::QuotaExhausted(evidence) = classify_anthropic_429(
+                                    headers,
+                                    body_prefix(&error_text, QUOTA_PROBE_BODY_CAP),
+                                    now_ms,
+                                ) {
+                                    // The seat this request is pinned to on THIS
+                                    // source. `None` = legacy/unbound state: nothing
+                                    // to report or switch, but the long-reset rule
+                                    // below still applies.
+                                    let seat = {
+                                        let g = await_or_cancel(cancel, auth.read()).await?;
+                                        super::auth::turn_pinned_credential(
+                                            &options.credential_source,
+                                            g.bound_credential.as_deref(),
+                                        )
+                                    };
+                                    let auto = router.auto_selected();
+                                    let until_ms = evidence.cooldown_until_ms(now_ms).unwrap_or(now_ms);
+                                    let until = describe_reset_utc(until_ms, now_ms);
+                                    let label = seat
+                                        .as_ref()
+                                        .map(|s| s.account.label_str().to_string())
+                                        .unwrap_or_else(|| "anthropic".to_string());
+                                    // ALWAYS report first — even when the gate then
+                                    // refuses to switch — so the next turn boundary's
+                                    // AutoRepin selects away from this seat.
+                                    match seat.as_ref() {
+                                        Some(seat) => {
+                                            await_or_cancel(cancel, router.report_exhausted(seat, &evidence))
+                                                .await?;
+                                        }
+                                        None => tracing::warn!(
+                                            signal = ?evidence.signal,
+                                            "anthropic window exhausted but no seat is bound; cooldown not reported"
+                                        ),
+                                    }
+                                    let gate = AnthropicFailoverGate {
+                                        auto_selector: auto,
+                                        output_started,
+                                        tool_activity,
+                                        failovers_so_far: anthropic_failovers,
+                                    };
+                                    let mut hop = None;
+                                    if let Some(seat) = seat.as_ref() {
+                                        match failover_permitted(&gate) {
+                                            Ok(()) => {
+                                                match await_or_cancel(cancel, router.failover(model, seat))
+                                                    .await?
+                                                {
+                                                    Ok(Some(next)) if next.credential != *seat => {
+                                                        hop = Some(next);
+                                                    }
+                                                    Ok(_) => tracing::info!(
+                                                        account = %seat,
+                                                        "anthropic window exhausted; no distinct account with capacity"
+                                                    ),
+                                                    Err(e) => tracing::warn!(
+                                                        account = %seat,
+                                                        error = %e,
+                                                        "anthropic failover candidate resolution failed; not switching"
+                                                    ),
+                                                }
+                                            }
+                                            Err(reason) => tracing::info!(
+                                                account = %seat,
+                                                reason,
+                                                "anthropic window exhausted; account failover not permitted"
+                                            ),
+                                        }
+                                    }
+                                    if let Some(next) = hop {
+                                        let next_label = next.credential.account.label_str().to_string();
+                                        tracing::warn!(
+                                            from = %label,
+                                            to = %next_label,
+                                            "anthropic window exhausted; switching account (one-time failover, no output replayed)"
+                                        );
+                                        if let Some(t) = tracer.as_mut() {
+                                            t.attempt_failed(
+                                                clock,
+                                                crate::runtime::trace::RetryClass::RateLimited,
+                                                Duration::ZERO,
+                                                Some(429),
+                                                trace_rid.clone(),
+                                                "account_failover",
+                                            );
+                                        }
+                                        // The ONE sanctioned mid-turn re-pin: bind the
+                                        // new seat exactly as the refresh path does, then
+                                        // rebuild the header from it (same as the 401
+                                        // path). The failed seat's token is still valid —
+                                        // only its capacity is spent — so no cache
+                                        // invalidation is needed.
+                                        await_or_cancel(
+                                            cancel,
+                                            super::auth::AuthMethods::bind_pinned(
+                                                auth,
+                                                &options.credential_source,
+                                                next,
+                                            ),
+                                        )
+                                        .await?;
+                                        let (n, v, _t, binding) = await_or_cancel(
+                                            cancel,
+                                            Self::build_auth_snapshot(auth),
+                                        )
+                                        .await?;
+                                        auth_header_name = n;
+                                        auth_header_value = v;
+                                        auth_binding = binding;
+                                        anthropic_failovers += 1;
+                                        let _ = tx.send(StreamEvent::Session(SessionEvent::Notice(format!(
+                                            "⚠ {label} exhausted until {until} — switching to {next_label}"
+                                        ))));
+                                        // Retry immediately on the new seat WITHOUT
+                                        // consuming a 429 retry slot.
+                                        continue;
+                                    }
+                                    // No hop. Say why the wait is what it is, then either
+                                    // end the turn now (a reset hours away must not burn
+                                    // the whole 429 budget a minute at a time) or keep
+                                    // the existing retry path for short/unknown resets.
+                                    let notice = if auto {
+                                        format!("⚠ {label} exhausted until {until}; next turn will use another account")
+                                    } else {
+                                        format!("⚠ account limit reached until {until}")
+                                    };
+                                    let _ = tx.send(StreamEvent::Session(SessionEvent::Notice(notice)));
+                                    if evidence.reset_is_long(now_ms) {
+                                        if let Some(t) = tracer.take() {
+                                            let terminal = t.failed_terminal("quota_exhausted");
+                                            t.finish(clock, Some(429), trace_rid, None, None, terminal);
+                                        }
+                                        let advice = if auto {
+                                            "The next turn will select another account."
+                                        } else {
+                                            "Wait for the reset, or switch accounts with `synaps auth use --provider anthropic --account <label|auto>`."
+                                        };
+                                        return Err(RuntimeError::ApiStatus(format!(
+                                            "Anthropic usage limit reached on account '{label}' — window resets at {until}. {advice}"
+                                        )));
+                                    }
+                                }
+                            }
+
+                            // ═══ CACHE DIAGNOSTICS fail-soft ═══
+                            // The API refused the beta header or the
+                            // `diagnostics` field: latch it off for the session
+                            // and re-send this request without either (header
+                            // is rebuilt from the latch). Costs no retry budget;
+                            // a turn never fails because of diagnostics. The
+                            // trace keeps the first attempt's wire metadata.
+                            let diag_on_wire = diagnostics.is_some()
+                                || super::cache_diagnosis::wants_beta_header(&auth_type, options);
+                            if diag_on_wire
+                                && super::cache_diagnosis::is_rejection(
+                                    status.as_u16(),
+                                    &error_text,
+                                )
+                            {
+                                if let Some(chain) = &options.cache_diagnosis {
+                                    chain.reject(status.as_u16());
+                                }
+                                if let Some(d) = diagnostics.take() {
+                                    match super::cache_diagnosis::strip_diagnostics(&body_bytes, &d)
+                                    {
+                                        Some(stripped) => body_bytes = stripped.into(),
+                                        // Unreachable by construction (the
+                                        // field serializes first); keep the
+                                        // normal error path rather than resend
+                                        // a body we could not fix.
+                                        None => diagnostics = Some(d),
+                                    }
+                                }
+                                if diagnostics.is_none() {
+                                    if let Some(t) = tracer.as_mut() {
+                                        t.attempt_failed(
+                                            clock,
+                                            crate::runtime::trace::RetryClass::Other,
+                                            Duration::ZERO,
+                                            Some(status.as_u16()),
+                                            trace_rid,
+                                            "cache_diagnosis_rejected",
+                                        );
+                                    }
+                                    continue;
+                                }
+                            }
 
                             // Decide whether we've exhausted retries for this error class.
                             // A keep-warm ping never retries: any error stops it.
@@ -1626,7 +2002,7 @@ impl ApiMethods {
                                 notice,
                                 last_err
                             );
-                            let _ = tx.send(StreamEvent::Session(SessionEvent::Notice(notice)));
+                            let _ = tx.send(StreamEvent::Session(SessionEvent::Retry(notice)));
 
                             if let Some(t) = tracer.as_mut() {
                                 t.attempt_failed(
@@ -1649,7 +2025,7 @@ impl ApiMethods {
                         }
                         Err(e) => {
                             if let Some(keepwarm) = &options.keepwarm {
-                                if e.is_connect() {
+                                if matches!(&e, RuntimeError::Api(error) if error.is_connect()) {
                                     keepwarm
                                         .connect_failed
                                         .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1661,16 +2037,13 @@ impl ApiMethods {
                                     let terminal = t.failed_terminal("network");
                                     t.finish(clock, None, None, None, None, terminal);
                                 }
-                                return Err(RuntimeError::ApiStatus(
-                                    crate::core::error::humanize_network_error(&e),
-                                ));
+                                tracing::warn!(error = %e.user_message(), "API network retries exhausted");
+                                return Err(e);
                             }
-                            last_err = e.to_string();
+                            last_err = e.user_message();
                             last_status = None;
                             // No headers on network error — plain exponential back-off.
-                            let delay = Duration::from_millis(
-                                1000 * 2u64.pow(non_429_attempts.saturating_sub(1)),
-                            );
+                            let delay = super::telemetry::network_retry_delay(non_429_attempts);
                             tracing::warn!(
                                 "API retry {}/{} after {:?}: {}",
                                 non_429_attempts,
@@ -1678,7 +2051,7 @@ impl ApiMethods {
                                 delay,
                                 last_err
                             );
-                            let _ = tx.send(StreamEvent::Session(SessionEvent::Notice(format!(
+                            let _ = tx.send(StreamEvent::Session(SessionEvent::Retry(format!(
                                 "⏳ API error, retrying ({}/{})…",
                                 non_429_attempts, max_retries
                             ))));
@@ -1740,6 +2113,7 @@ impl ApiMethods {
             };
 
             let mut stream = response.bytes_stream();
+            let mut transport_error = None;
             tracing::debug!("Stream opened");
 
             if !options.suppress_stream_deltas {
@@ -1757,6 +2131,7 @@ impl ApiMethods {
                 saw_1h_honored: options.saw_1h_honored.clone(),
                 request_has_1h_marker,
                 usage_counters: options.usage_counters.clone(),
+                cache_diagnosis: diagnostics.is_some(),
             };
 
             // SSE can split across chunk boundaries (even mid-UTF-8-codepoint), so
@@ -1766,7 +2141,12 @@ impl ApiMethods {
 
             // Cancellation exits through the normal finalization below: partial
             // content, residual Usage and attempt telemetry must not be dropped.
-            while let Ok(Some(chunk)) = await_or_cancel(cancel, stream.next()).await {
+            while let Ok(Some(chunk)) = await_or_cancel(
+                cancel,
+                super::http_phases::next(&mut stream, super::http_phases::STREAM_IDLE),
+            )
+            .await
+            {
                 if cancel.is_cancelled() {
                     break;
                 }
@@ -1787,9 +2167,10 @@ impl ApiMethods {
                         emit_residual_usage(&mut state, &ctx);
                         state.stream_error = Some(StreamError {
                             error_type: None,
-                            message: crate::core::error::humanize_network_error(&e),
+                            message: e.user_message(),
                             retryable: true,
                         });
+                        transport_error = Some(e);
                         break;
                     }
                 };
@@ -1809,6 +2190,15 @@ impl ApiMethods {
 
             // Flush any partial block and return accumulated content
             state.finalize();
+
+            // G3 failover gate inputs: once any SSE frame was parsed on this
+            // request, a later 429 must never hop accounts (no cross-account
+            // replay); a produced tool_use block is tool activity.
+            output_started |= state.first_event_seen;
+            tool_activity |= state
+                .accumulated_content
+                .iter()
+                .any(|b| b.get("type").and_then(Value::as_str) == Some("tool_use"));
 
             // Dead-stream billing: if the stream terminated before message_delta
             // (cancel, transport death mid-stream), emit the one Usage event from
@@ -1840,6 +2230,20 @@ impl ApiMethods {
                     .unwrap_or("stream_error"),
                 None => "empty_response",
             };
+
+            // ═══ CACHE DIAGNOSTICS: advance the chain, tag the trace ═══
+            // The server fingerprints every request that carried
+            // `diagnostics`, keyed by its message id — so the next request
+            // compares against this one even if its stream later failed.
+            if diagnostics.is_some() {
+                if let (Some(chain), Some(id)) = (&options.cache_diagnosis, &state.telem_msg_id) {
+                    chain.record(id);
+                }
+            }
+            let server_diagnosis = state.server_diagnosis.take();
+            if let Some(t) = tracer.as_mut() {
+                t.set_server_diagnosis(server_diagnosis);
+            }
 
             // ═══ TELEMETRY: write the record ═══
             if telemetry_level.enabled() {
@@ -1879,7 +2283,10 @@ impl ApiMethods {
                     stop_reason: state.telem_stop_reason,
                     usage: state.telem_usage,
                     ratelimit: telem_ratelimit,
-                    cache_diag: None, // TODO: wire cache-diagnostics beta in future slice
+                    cache_diag: server_diagnosis.map(|d| telemetry::CacheDiagRecord {
+                        miss_reason: d.reason.as_str().to_string(),
+                        missed_tokens: d.missed_input_tokens,
+                    }),
                     context: telemetry::ContextRecord {
                         messages: cleaned_messages.len(),
                         tools: tools_schema.len(),
@@ -1887,6 +2294,8 @@ impl ApiMethods {
                         breakpoints,
                     },
                     keepwarm: options.keepwarm.is_some(),
+                    worker: options.codex_request_role
+                        == crate::runtime::openai::catalog::CodexRequestRole::Worker,
                 };
                 // Non-blocking enqueue onto the session's bounded writer
                 // (Task 11): overflow or a broken log path is counted by
@@ -1970,6 +2379,10 @@ impl ApiMethods {
                                 terminal,
                             );
                         }
+                        if let Some(error) = transport_error {
+                            tracing::warn!(error = %error.user_message(), "API stream network retries exhausted");
+                            return Err(error);
+                        }
                         return Err(RuntimeError::ApiStatus(msg));
                     }
                     let retry_index = retries_used.saturating_add(1);
@@ -1991,7 +2404,7 @@ impl ApiMethods {
                         delay,
                         msg
                     );
-                    let _ = tx.send(StreamEvent::Session(SessionEvent::Notice(format!(
+                    let _ = tx.send(StreamEvent::Session(SessionEvent::Retry(format!(
                         "⏳ API stream error — retrying ({}/{})…",
                         retry_index, retry_budget
                     ))));
@@ -2055,7 +2468,7 @@ impl ApiMethods {
                         refusal_retries,
                         delay
                     );
-                    let _ = tx.send(StreamEvent::Session(SessionEvent::Notice(format!(
+                    let _ = tx.send(StreamEvent::Session(SessionEvent::Retry(format!(
                         "⏳ model refusal — retrying ({}/{})…",
                         refusal_attempts, refusal_retries
                     ))));
@@ -2083,10 +2496,121 @@ impl ApiMethods {
     }
 }
 
+/// Transports other than native Anthropic (cloud brokers, OpenAI-compatible
+/// providers) emit `SessionEvent::Usage` but do not book the turn's
+/// [`UsageCounters`](crate::runtime::budget::UsageCounters). Book their Usage
+/// events on the way through, priced for `model`, so the turn's cost and
+/// token budgets bind on every provider. Events keep their order.
+pub(crate) async fn with_usage_metering<T, Fut>(
+    model: &str,
+    counters: Option<Arc<crate::runtime::budget::UsageCounters>>,
+    tx: &mpsc::UnboundedSender<StreamEvent>,
+    route: impl FnOnce(mpsc::UnboundedSender<StreamEvent>) -> Fut,
+) -> T
+where
+    Fut: std::future::Future<Output = T>,
+{
+    let Some(counters) = counters else {
+        return route(tx.clone()).await;
+    };
+    let forward = move |counters: &crate::runtime::budget::UsageCounters,
+                        model: &str,
+                        tx: &mpsc::UnboundedSender<StreamEvent>,
+                        event: StreamEvent| {
+        if let StreamEvent::Session(SessionEvent::Usage {
+            input_tokens,
+            output_tokens,
+            cache_read_input_tokens,
+            cache_creation_input_tokens,
+            cache_creation_5m,
+            cache_creation_1h,
+            ..
+        }) = &event
+        {
+            counters.record_priced(
+                model,
+                *input_tokens,
+                *output_tokens,
+                *cache_read_input_tokens,
+                *cache_creation_input_tokens,
+                *cache_creation_5m,
+                *cache_creation_1h,
+            );
+        }
+        let _ = tx.send(event);
+    };
+    let (route_tx, mut route_rx) = mpsc::unbounded_channel();
+    let routed = route(route_tx);
+    tokio::pin!(routed);
+    let result = loop {
+        tokio::select! {
+            biased;
+            Some(event) = route_rx.recv() => forward(&counters, model, tx, event),
+            result = &mut routed => break result,
+        }
+    };
+    // Drain what this request sent before returning, so its usage is booked
+    // before the stream loop checks the turn budget. Normally the route's
+    // sender is gone and this ends at once; a sender clone still held by a
+    // provider task winding down gets a short, bounded wait.
+    let drained = tokio::time::timeout(Duration::from_millis(200), async {
+        while let Some(event) = route_rx.recv().await {
+            forward(&counters, model, tx, event);
+        }
+    })
+    .await
+    .is_ok();
+    if drained {
+        return result;
+    }
+    // A sender that outlives even that must not lose its events.
+    let tx = tx.clone();
+    let model = model.to_string();
+    tokio::spawn(async move {
+        while let Some(event) = route_rx.recv().await {
+            forward(&counters, &model, &tx, event);
+        }
+    });
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::runtime::telemetry::TelemetryLevel;
+
+    #[tokio::test]
+    async fn non_anthropic_usage_is_booked_into_the_turn_counters() {
+        let counters = Arc::new(crate::runtime::budget::UsageCounters::default());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let out = with_usage_metering("gpt-5", Some(Arc::clone(&counters)), &tx, |route_tx| async move {
+            let _ = route_tx.send(StreamEvent::Llm(LlmEvent::Text("hi".into())));
+            let _ = route_tx.send(StreamEvent::Session(SessionEvent::Usage {
+                input_tokens: 1_000,
+                output_tokens: 200,
+                cache_read_input_tokens: 50_000,
+                cache_creation_input_tokens: 0,
+                cache_creation_5m: None,
+                cache_creation_1h: None,
+                model: None,
+            }));
+            7
+        })
+        .await;
+        assert_eq!(out, 7);
+        assert_eq!(counters.records(), 1);
+        assert_eq!(counters.totals(), (1_000, 200, 50_000, 0));
+        let expected = agent_core::pricing::calculate_cost_optional_split(
+            "gpt-5", 1_000, 200, 50_000, 0, None, None,
+        );
+        assert!((counters.cost_usd() - expected).abs() < 1e-6);
+        // Events still reach the caller, in order.
+        assert!(matches!(rx.recv().await, Some(StreamEvent::Llm(LlmEvent::Text(_)))));
+        assert!(matches!(
+            rx.recv().await,
+            Some(StreamEvent::Session(SessionEvent::Usage { .. }))
+        ));
+    }
 
     /// Test harness: fresh ParseState + unbounded channel + EventCtx (Full
     /// telemetry so capture paths run). Returns (state, rx, ctx-parts).
@@ -2111,6 +2635,7 @@ mod tests {
             saw_1h_honored: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             request_has_1h_marker: true,
             usage_counters: None,
+            cache_diagnosis: false,
         }
     }
 
@@ -2143,6 +2668,7 @@ mod tests {
             saw_1h_honored: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             request_has_1h_marker: true,
             usage_counters: None,
+            cache_diagnosis: false,
         }
     }
 
@@ -2167,6 +2693,7 @@ mod tests {
             // carry a 1h marker. The no-marker test overrides this.
             request_has_1h_marker: true,
             usage_counters: None,
+            cache_diagnosis: false,
         }
     }
 
@@ -3141,7 +3668,8 @@ mod tests {
             .stream_error
             .take()
             .expect("error event must be captured");
-        for (text, ctx_name) in [(err.message.as_str(), "stream_error message")] {
+        {
+            let (text, ctx_name) = (err.message.as_str(), "stream_error message");
             assert!(
                 !text.contains(HOSTILE_SENTINEL),
                 "{ctx_name}: sentinel leaked: {text}"
@@ -3680,6 +4208,7 @@ mod tests {
             saw_1h_honored: honored.clone(),
             request_has_1h_marker: false,
             usage_counters: None,
+            cache_diagnosis: false,
         };
         feed(&[DOWNGRADE_START, LIVE_DELTA], &mut state, &ctx);
         assert_eq!(
@@ -3945,6 +4474,8 @@ mod on401_tests {
             auth_type: "api_key".to_string(),
             refresh_token: None,
             token_expires: Some(9_999_999_999_999),
+            auth_file_mtime: None,
+            bound_credential: None,
         }))
     }
 
@@ -3989,7 +4520,11 @@ mod on401_tests {
     // RED: before C1 guard is restored this MUST fail (no retry → error).
     // GREEN: with C1 guard it retries once with the new token and succeeds.
     #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
     async fn on401_remote_retries_once_and_succeeds() {
+        // The remote broker reads the account selector from config; keep the
+        // developer's own `auth.account.anthropic` out of this test.
+        let _config = crate::test_env::BaseDirGuard::new();
         let broker_url = spawn_mock_broker("sk-fresh-token").await;
         let (anthropic_url, counter) = spawn_mock_anthropic(1).await; // 1 × 401, then SSE
 
@@ -4031,7 +4566,11 @@ mod on401_tests {
     // Guard fires once: 2nd 401 must surface as a terminal error.
     // Anthropic endpoint must be called exactly 2 times total (no loop).
     #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
     async fn on401_remote_persistent_401_is_terminal_not_loop() {
+        // The remote broker reads the account selector from config; keep the
+        // developer's own `auth.account.anthropic` out of this test.
+        let _config = crate::test_env::BaseDirGuard::new();
         let broker_url = spawn_mock_broker("sk-fresh-but-useless").await;
         // All calls → 401 (fail_count=999 is effectively "always")
         let (anthropic_url, counter) = spawn_mock_anthropic(999).await;
@@ -4070,7 +4609,7 @@ mod on401_tests {
     // CredentialSource::Local must NOT trigger the C1 refetch path.
     // With max_retries=0 the error surfaces immediately after 1 call.
     #[tokio::test]
-    async fn on401_local_source_does_not_retry() {
+    async fn on401_local_api_key_does_not_retry() {
         // Always 401
         let (anthropic_url, counter) = spawn_mock_anthropic(999).await;
 
@@ -4088,6 +4627,207 @@ mod on401_tests {
             "Local source must never retry on 401, got {} calls",
             counter.load(Ordering::SeqCst)
         );
+    }
+
+    // ─── Local OAuth source: 401 → reload auth.json → retry once ──────────
+    //
+    // Models the reported bug: auth.json was rotated externally (another
+    // `synaps login`, refresh-auth cron, lab-laptop sync) while this session
+    // still holds the old, unexpired token in memory.
+
+    /// Mock Anthropic that 401s any request whose bearer is not `good_bearer`,
+    /// recording every Authorization header it sees.
+    async fn spawn_mock_anthropic_accepting(
+        good_bearer: &'static str,
+    ) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen_clone = Arc::clone(&seen);
+        let app = Router::new().route(
+            "/v1/messages",
+            axum_post(move |headers: HeaderMap| {
+                let seen = Arc::clone(&seen_clone);
+                async move {
+                    let got = headers
+                        .get("authorization")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("")
+                        .to_string();
+                    let ok = got == format!("Bearer {good_bearer}");
+                    seen.lock().unwrap().push(got);
+                    if ok {
+                        (
+                            StatusCode::OK,
+                            [("content-type", "text/event-stream")],
+                            SSE_SUCCESS.to_string(),
+                        )
+                            .into_response()
+                    } else {
+                        (
+                            StatusCode::UNAUTHORIZED,
+                            [("content-type", "application/json")],
+                            "{\"type\":\"error\",\"error\":{\"type\":\"authentication_error\"}}"
+                                .to_string(),
+                        )
+                            .into_response()
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), seen)
+    }
+
+    fn write_local_anthropic_creds(base: &std::path::Path, access: &str) {
+        let body = json!({
+            "anthropic": {
+                "type": "oauth",
+                "refresh": "rt-test",
+                "access": access,
+                "expires": 9_999_999_999_999u64,
+            }
+        });
+        std::fs::write(base.join("auth.json"), body.to_string()).unwrap();
+    }
+
+    /// Held token bound to the default local Anthropic seat — the state a
+    /// session is in after its pre-stream refresh, which is what 401
+    /// recovery (`recover_local_rejection`) re-vends for.
+    fn local_oauth_auth(token: &str) -> Arc<RwLock<AuthState>> {
+        Arc::new(RwLock::new(AuthState {
+            auth_token: token.to_string(),
+            auth_type: "oauth".to_string(),
+            refresh_token: None,
+            token_expires: Some(9_999_999_999_999),
+            auth_file_mtime: None,
+            bound_credential: Some(crate::runtime::auth::anthropic_binding(
+                &CredentialSource::Local,
+                &crate::auth::CredentialRef::default_for(crate::auth::OAuthProviderId::Anthropic),
+            )),
+        }))
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn on401_local_oauth_reloads_rotated_auth_json_and_retries_once() {
+        let base = crate::test_env::BaseDirGuard::new();
+        write_local_anthropic_creds(base.path(), "sk-rotated-on-disk");
+        let (url, seen) = spawn_mock_anthropic_accepting("sk-rotated-on-disk").await;
+
+        let auth = local_oauth_auth("sk-stale-in-memory");
+        let options = make_options(url, CredentialSource::Local, TokenCache::new());
+        let result = drive_call(Arc::clone(&auth), options).await;
+
+        assert!(
+            result.is_ok(),
+            "expected success after reload: {:?}",
+            result.err()
+        );
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(
+            seen,
+            vec![
+                "Bearer sk-stale-in-memory".to_string(),
+                "Bearer sk-rotated-on-disk".to_string()
+            ],
+            "exactly one retry, and it must carry the reloaded token"
+        );
+        assert_eq!(auth.read().await.auth_token, "sk-rotated-on-disk");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn on401_local_oauth_persistent_401_is_terminal_not_loop() {
+        let base = crate::test_env::BaseDirGuard::new();
+        write_local_anthropic_creds(base.path(), "sk-also-rejected");
+        let (url, seen) = spawn_mock_anthropic_accepting("sk-never-valid").await;
+
+        let auth = local_oauth_auth("sk-stale-in-memory");
+        let options = make_options(url, CredentialSource::Local, TokenCache::new());
+        let result = drive_call(auth, options).await;
+
+        let err = result.expect_err("second 401 must be terminal");
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            2,
+            "persistent 401 must cause exactly 2 upstream calls"
+        );
+        let msg = err.to_string();
+        for secret in ["sk-stale-in-memory", "sk-also-rejected", "rt-test"] {
+            assert!(
+                !msg.contains(secret),
+                "error must not surface token values: {msg}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn on401_local_oauth_adopts_peer_token_and_retries_only_once() {
+        let _config = crate::test_env::BaseDirGuard::new();
+        let credential =
+            crate::auth::CredentialRef::default_for(crate::auth::OAuthProviderId::Anthropic);
+        crate::auth::save_provider_auth(
+            "anthropic",
+            &crate::auth::OAuthCredentials {
+                auth_type: "oauth".into(),
+                access: "peer-token".into(),
+                refresh: "never-used".into(),
+                expires: crate::epoch_millis() + 3_600_000,
+                account_id: None,
+            },
+        )
+        .unwrap();
+        for failures in [1, 999] {
+            let (url, counter) = spawn_mock_anthropic(failures).await;
+            let auth = auth_with_token("rejected-token");
+            {
+                let mut state = auth.write().await;
+                state.auth_type = "oauth".into();
+                state.bound_credential = Some(crate::runtime::auth::anthropic_binding(
+                    &CredentialSource::Local,
+                    &credential,
+                ));
+            }
+            let result = drive_call(
+                auth.clone(),
+                make_options(url, CredentialSource::Local, TokenCache::new()),
+            )
+            .await;
+            assert_eq!(result.is_ok(), failures == 1);
+            assert_eq!(counter.load(Ordering::SeqCst), 2);
+            assert_eq!(auth.read().await.auth_token, "peer-token");
+        }
+    }
+
+    #[tokio::test]
+    async fn exhausted_send_and_body_disconnect_are_network_errors() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for partial_headers in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buf = [0; 8192];
+                let _ = socket.read(&mut buf).await;
+                if partial_headers {
+                    socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 10000\r\n\r\ndata: ").await.unwrap();
+                }
+            });
+            let error = drive_call(
+                auth_with_token("test"),
+                make_options(url, CredentialSource::Local, TokenCache::new()),
+            )
+            .await
+            .unwrap_err();
+            server.await.unwrap();
+            assert!(matches!(error, crate::RuntimeError::Api(_)), "{error:?}");
+            let human = crate::runtime::helpers::turn_error_for(&error, "test-turn");
+            assert!(human.category_label().contains("network_error"));
+            assert!(!human.message.contains("http://"));
+            assert!(!human.message.is_empty());
+        }
     }
 
     // ─── Request-lifecycle T1: outgoing-request trace is metadata-only ──────
@@ -4265,7 +5005,10 @@ mod on401_tests {
 
         // 2) User-visible notices (retry banners) must not leak.
         while let Ok(ev) = rx.try_recv() {
-            if let StreamEvent::Session(crate::SessionEvent::Notice(n)) = ev {
+            if let StreamEvent::Session(
+                crate::SessionEvent::Notice(n) | crate::SessionEvent::Retry(n),
+            ) = ev
+            {
                 assert_no_hostile_leak(&n, "notice");
             }
         }
@@ -4274,6 +5017,618 @@ mod on401_tests {
         let logs = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
         assert!(!logs.is_empty(), "expected retry warnings to be logged");
         assert_no_hostile_leak(&logs, "tracing output");
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// G3 — Anthropic window exhaustion → bounded account failover (loop tests)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Strategy: a scripted loopback "Anthropic" whose replies are consumed in
+// order and which records the `authorization` header of every call, plus a
+// scripted `AnthropicAccountRouter` (no broker, no env, no config, no
+// auth.json). The loop is driven through `anthropic_stream_with_router`,
+// the same seam production reaches through `call_api_stream_inner`.
+// ─────────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod anthropic_failover_tests {
+    // Every test in this module drives the OAuth 429 path, so each one can be
+    // the first to hit the "schema capture" `warn!` callsite. tracing-core
+    // caches a callsite's interest globally, and while only one scoped
+    // subscriber is registered a callsite first hit on ANOTHER thread is
+    // cached as `never` (that thread has no subscriber). That silently hid
+    // the line `schema_capture_logs_headers_once_and_never_the_body` counts
+    // and failed CI once. Serializing the module removes the race.
+    use axum::{
+        http::{HeaderMap, StatusCode},
+        response::IntoResponse,
+        routing::post as axum_post,
+        Router,
+    };
+    use reqwest::Client;
+    use serde_json::json;
+    use std::sync::{Arc, Mutex};
+    use tokio::sync::{mpsc, RwLock};
+
+    use super::{ApiMethods, ApiOptions};
+    use crate::auth::{
+        AccessToken, Account, CredentialRef, CredentialSource, OAuthProviderId, PinnedToken,
+        TokenCache,
+    };
+    use crate::runtime::anthropic_quota::{
+        AnthropicAccountRouter, AnthropicQuotaEvidence, AnthropicQuotaSignal,
+    };
+    use crate::runtime::auth::anthropic_binding;
+    use crate::runtime::telemetry::TelemetryLevel;
+    use crate::runtime::types::AuthState;
+    use crate::{StreamEvent, ToolRegistry};
+
+    /// Sentinel inside every 429 body: must never reach logs, notices or
+    /// the surfaced error.
+    const BODY_SENTINEL: &str = "G3-BODY-SENTINEL-9f1c";
+
+    const SSE_SUCCESS: &str = concat!(
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_01\",\"type\":\"message\",",
+        "\"role\":\"assistant\",\"content\":[],\"model\":\"claude-sonnet-4-5\",\"stop_reason\":null,",
+        "\"stop_sequence\":null,\"usage\":{\"input_tokens\":10,\"output_tokens\":0,",
+        "\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0}}}\n\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,",
+        "\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,",
+        "\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",",
+        "\"stop_sequence\":null},\"usage\":{\"input_tokens\":10,\"output_tokens\":1,",
+        "\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0}}\n\n",
+        "data: {\"type\":\"message_stop\"}\n\n",
+    );
+
+    /// Partial output, then an in-stream transient error: the loop retries
+    /// the request, but output has now started on this request.
+    const SSE_PARTIAL_THEN_OVERLOADED: &str = concat!(
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_02\",\"type\":\"message\",",
+        "\"role\":\"assistant\",\"content\":[],\"model\":\"claude-sonnet-4-5\",\"stop_reason\":null,",
+        "\"stop_sequence\":null,\"usage\":{\"input_tokens\":10,\"output_tokens\":0}}}\n\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,",
+        "\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,",
+        "\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n",
+        "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n",
+    );
+
+    #[derive(Clone, Copy)]
+    enum Reply {
+        /// `anthropic-ratelimit-unified-status: rejected` + unified reset this
+        /// many seconds from now, `rate_limit_error` body.
+        Rejected429 { reset_in_secs: u64 },
+        /// Ordinary 429: `retry-after` only, no exhaustion signal.
+        Plain429 { retry_after: u64 },
+        SseOk,
+        SsePartialThenOverloaded,
+    }
+
+    struct MockUpstream {
+        base_url: String,
+        /// `authorization` header of every call, in order.
+        auth_seen: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl MockUpstream {
+        fn calls(&self) -> usize {
+            self.auth_seen.lock().unwrap().len()
+        }
+        fn auth_seen(&self) -> Vec<String> {
+            self.auth_seen.lock().unwrap().clone()
+        }
+    }
+
+    async fn spawn_upstream(script: Vec<Reply>) -> MockUpstream {
+        let script = Arc::new(Mutex::new(script.into_iter()));
+        let auth_seen = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&auth_seen);
+        let app = Router::new().route(
+            "/v1/messages",
+            axum_post(move |headers: HeaderMap| {
+                let script = Arc::clone(&script);
+                let seen = Arc::clone(&seen);
+                async move {
+                    seen.lock().unwrap().push(
+                        headers
+                            .get("authorization")
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("")
+                            .to_string(),
+                    );
+                    let reply = script
+                        .lock()
+                        .unwrap()
+                        .next()
+                        .expect("upstream called more times than scripted");
+                    let now_secs = crate::epoch_millis() / 1000;
+                    let body_429 = json!({
+                        "type": "error",
+                        "error": {"type": "rate_limit_error", "message": BODY_SENTINEL}
+                    })
+                    .to_string();
+                    match reply {
+                        Reply::Rejected429 { reset_in_secs } => (
+                            StatusCode::TOO_MANY_REQUESTS,
+                            [
+                                ("content-type", "application/json".to_string()),
+                                ("anthropic-ratelimit-unified-status", "rejected".to_string()),
+                                (
+                                    "anthropic-ratelimit-unified-reset",
+                                    (now_secs + reset_in_secs).to_string(),
+                                ),
+                            ],
+                            body_429,
+                        )
+                            .into_response(),
+                        Reply::Plain429 { retry_after } => (
+                            StatusCode::TOO_MANY_REQUESTS,
+                            [
+                                ("content-type", "application/json".to_string()),
+                                ("retry-after", retry_after.to_string()),
+                            ],
+                            body_429,
+                        )
+                            .into_response(),
+                        Reply::SseOk => (
+                            StatusCode::OK,
+                            [("content-type", "text/event-stream")],
+                            SSE_SUCCESS.to_string(),
+                        )
+                            .into_response(),
+                        Reply::SsePartialThenOverloaded => (
+                            StatusCode::OK,
+                            [("content-type", "text/event-stream")],
+                            SSE_PARTIAL_THEN_OVERLOADED.to_string(),
+                        )
+                            .into_response(),
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        MockUpstream {
+            base_url: format!("http://{addr}"),
+            auth_seen,
+        }
+    }
+
+    fn seat(label: &str) -> CredentialRef {
+        CredentialRef::new(OAuthProviderId::Anthropic, Account::parse(label).unwrap())
+    }
+
+    fn pinned(label: &str) -> PinnedToken {
+        PinnedToken {
+            credential: seat(label),
+            token: AccessToken {
+                token: format!("tok-{label}"),
+                expires: u64::MAX,
+            },
+        }
+    }
+
+    /// Scripted router: fixed selector mode, fixed failover answer, records
+    /// every report and failover request.
+    struct ScriptedRouter {
+        auto: bool,
+        answer: Result<Option<PinnedToken>, String>,
+        reports: Mutex<Vec<(CredentialRef, AnthropicQuotaEvidence)>>,
+        failovers: Mutex<Vec<(String, CredentialRef)>>,
+    }
+
+    impl ScriptedRouter {
+        fn new(auto: bool, answer: Result<Option<PinnedToken>, String>) -> Self {
+            Self {
+                auto,
+                answer,
+                reports: Mutex::new(Vec::new()),
+                failovers: Mutex::new(Vec::new()),
+            }
+        }
+        fn reports(&self) -> Vec<(CredentialRef, AnthropicQuotaEvidence)> {
+            self.reports.lock().unwrap().clone()
+        }
+        fn failovers(&self) -> Vec<(String, CredentialRef)> {
+            self.failovers.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AnthropicAccountRouter for ScriptedRouter {
+        fn auto_selected(&self) -> bool {
+            self.auto
+        }
+        async fn report_exhausted(
+            &self,
+            failed: &CredentialRef,
+            evidence: &AnthropicQuotaEvidence,
+        ) {
+            self.reports
+                .lock()
+                .unwrap()
+                .push((failed.clone(), *evidence));
+        }
+        async fn failover(
+            &self,
+            model: &str,
+            failed: &CredentialRef,
+        ) -> Result<Option<PinnedToken>, String> {
+            self.failovers
+                .lock()
+                .unwrap()
+                .push((model.to_string(), failed.clone()));
+            self.answer.clone()
+        }
+    }
+
+    /// OAuth state pinned to `label` on the Local source — what
+    /// `refresh_if_needed` leaves behind before the request loop runs.
+    fn oauth_auth_pinned_to(label: &str) -> Arc<RwLock<AuthState>> {
+        Arc::new(RwLock::new(AuthState {
+            auth_token: format!("tok-{label}"),
+            auth_type: "oauth".to_string(),
+            refresh_token: None,
+            token_expires: Some(u64::MAX),
+            auth_file_mtime: None,
+            bound_credential: Some(anthropic_binding(&CredentialSource::Local, &seat(label))),
+        }))
+    }
+
+    struct Outcome {
+        result: crate::error::Result<serde_json::Value>,
+        notices: Vec<String>,
+        /// The subset that came as typed retries (`SessionEvent::Retry`).
+        retries: Vec<String>,
+    }
+
+    async fn drive(
+        upstream: &MockUpstream,
+        auth: Arc<RwLock<AuthState>>,
+        router: &ScriptedRouter,
+        max_retries: u32,
+    ) -> Outcome {
+        let options = ApiOptions {
+            anthropic_base_url: Some(upstream.base_url.clone()),
+            credential_source: CredentialSource::Local,
+            token_cache: TokenCache::new(),
+            ..Default::default()
+        };
+        let client = Client::new();
+        let tools = ToolRegistry::new();
+        let messages = vec![Arc::new(json!({"role": "user", "content": "hi"}))];
+        let (tx, mut rx) = mpsc::unbounded_channel::<StreamEvent>();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let result = ApiMethods::anthropic_stream_with_router(
+            &auth,
+            &client,
+            "claude-haiku-4-5",
+            tools.tools_schema(),
+            &None,
+            0,
+            agent_core::reasoning::ReasoningLevel::Adaptive,
+            &messages,
+            tx,
+            &cancel,
+            max_retries,
+            0,
+            &options,
+            TelemetryLevel::Off,
+            router,
+        )
+        .await;
+        let (mut notices, mut retries) = (Vec::new(), Vec::new());
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                StreamEvent::Session(crate::SessionEvent::Notice(n)) => notices.push(n),
+                StreamEvent::Session(crate::SessionEvent::Retry(n)) => {
+                    notices.push(n.clone());
+                    retries.push(n);
+                }
+                _ => {}
+            }
+        }
+        Outcome { result, notices, retries }
+    }
+
+    fn assert_no_body_leak(text: &str, ctx: &str) {
+        assert!(
+            !text.contains(BODY_SENTINEL),
+            "{ctx}: 429 body leaked: {text}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(anthropic_429_log_capture)]
+    async fn pre_output_rejected_429_hops_once_and_succeeds_on_seat_2() {
+        let upstream =
+            spawn_upstream(vec![Reply::Rejected429 { reset_in_secs: 3 * 3600 }, Reply::SseOk])
+                .await;
+        let router = ScriptedRouter::new(true, Ok(Some(pinned("claude2"))));
+        let auth = oauth_auth_pinned_to("claude4");
+
+        let out = drive(&upstream, Arc::clone(&auth), &router, 0).await;
+
+        let value = out.result.expect("success on the second seat");
+        assert_eq!(value["content"][0]["text"], "hi");
+        assert_eq!(
+            upstream.auth_seen(),
+            vec!["Bearer tok-claude4".to_string(), "Bearer tok-claude2".to_string()],
+            "the retry must carry the new seat's bearer"
+        );
+        // Exactly one cooldown report, for the failed seat, with the reset.
+        let reports = router.reports();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].0, seat("claude4"));
+        assert_eq!(
+            reports[0].1.signal,
+            AnthropicQuotaSignal::UnifiedStatusRejected
+        );
+        assert!(reports[0].1.resets_at_ms.is_some());
+        // One failover request, for the bare model id, naming the failed seat.
+        assert_eq!(
+            router.failovers(),
+            vec![("claude-haiku-4-5".to_string(), seat("claude4"))]
+        );
+        // The turn is now pinned to the new seat (mid-turn rounds keep it).
+        let g = auth.read().await;
+        assert_eq!(g.auth_token, "tok-claude2");
+        assert_eq!(
+            g.bound_credential.as_deref(),
+            Some(anthropic_binding(&CredentialSource::Local, &seat("claude2")).as_str())
+        );
+        assert!(
+            out.notices
+                .iter()
+                .any(|n| n.starts_with("⚠ claude4 exhausted until ")
+                    && n.ends_with(" — switching to claude2")),
+            "notices: {:?}",
+            out.notices
+        );
+        for n in &out.notices {
+            assert_no_body_leak(n, "notice");
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(anthropic_429_log_capture)]
+    async fn post_output_rejected_429_reports_cooldown_but_never_hops() {
+        // Attempt 1 streams partial text then dies transiently; the retry
+        // (attempt 2) is refused with a rejected window.
+        let upstream = spawn_upstream(vec![
+            Reply::SsePartialThenOverloaded,
+            Reply::Rejected429 { reset_in_secs: 3 * 3600 },
+        ])
+        .await;
+        let router = ScriptedRouter::new(true, Ok(Some(pinned("claude2"))));
+        let auth = oauth_auth_pinned_to("claude4");
+
+        let out = drive(&upstream, Arc::clone(&auth), &router, 1).await;
+
+        let err = out.result.expect_err("no hop after output; long reset is terminal");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("usage limit reached on account 'claude4'"),
+            "{msg}"
+        );
+        assert!(msg.contains("next turn will select another account"), "{msg}");
+        assert_no_body_leak(&msg, "error");
+        assert_eq!(upstream.calls(), 2, "no third call on another seat");
+        assert_eq!(router.reports().len(), 1, "cooldown still reported");
+        assert_eq!(router.reports()[0].0, seat("claude4"));
+        assert!(router.failovers().is_empty(), "gate must veto the lookup");
+        // Seat unchanged.
+        assert_eq!(auth.read().await.auth_token, "tok-claude4");
+        assert!(out
+            .notices
+            .iter()
+            .any(|n| n.starts_with("⚠ claude4 exhausted until ")
+                && n.ends_with("; next turn will use another account")));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(anthropic_429_log_capture)]
+    async fn two_rejected_429s_hop_once_then_end_the_turn() {
+        let upstream = spawn_upstream(vec![
+            Reply::Rejected429 { reset_in_secs: 3 * 3600 },
+            Reply::Rejected429 { reset_in_secs: 5 * 3600 },
+        ])
+        .await;
+        let router = ScriptedRouter::new(true, Ok(Some(pinned("claude2"))));
+        let auth = oauth_auth_pinned_to("claude4");
+
+        let out = drive(&upstream, Arc::clone(&auth), &router, 0).await;
+
+        let msg = out.result.expect_err("second exhaustion is terminal").to_string();
+        assert!(msg.contains("account 'claude2'"), "{msg}");
+        assert_eq!(upstream.calls(), 2);
+        assert_eq!(
+            upstream.auth_seen(),
+            vec!["Bearer tok-claude4".to_string(), "Bearer tok-claude2".to_string()]
+        );
+        // Both seats were reported; only one hop was attempted.
+        let reported: Vec<CredentialRef> = router.reports().into_iter().map(|r| r.0).collect();
+        assert_eq!(reported, vec![seat("claude4"), seat("claude2")]);
+        assert_eq!(router.failovers().len(), 1);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(anthropic_429_log_capture)]
+    async fn explicit_selector_reports_cooldown_and_ends_without_lookup() {
+        let upstream =
+            spawn_upstream(vec![Reply::Rejected429 { reset_in_secs: 3 * 3600 }]).await;
+        let router = ScriptedRouter::new(false, Ok(Some(pinned("claude2"))));
+        let auth = oauth_auth_pinned_to("claude4");
+
+        let out = drive(&upstream, Arc::clone(&auth), &router, 0).await;
+
+        let msg = out.result.expect_err("explicit account: terminal").to_string();
+        assert!(msg.contains("synaps auth use"), "{msg}");
+        assert_eq!(upstream.calls(), 1);
+        assert_eq!(router.reports().len(), 1);
+        assert!(router.failovers().is_empty());
+        assert_eq!(auth.read().await.auth_token, "tok-claude4");
+        assert!(out
+            .notices
+            .iter()
+            .any(|n| n.starts_with("⚠ account limit reached until ")));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(anthropic_429_log_capture)]
+    async fn same_seat_back_or_no_candidate_never_loops() {
+        for answer in [Ok(None), Ok(Some(pinned("claude4"))), Err("broker down".to_string())] {
+            let upstream =
+                spawn_upstream(vec![Reply::Rejected429 { reset_in_secs: 3 * 3600 }]).await;
+            let router = ScriptedRouter::new(true, answer);
+            let auth = oauth_auth_pinned_to("claude4");
+
+            let out = drive(&upstream, Arc::clone(&auth), &router, 0).await;
+
+            assert!(out.result.is_err());
+            assert_eq!(upstream.calls(), 1, "no retry on the exhausted seat");
+            assert_eq!(router.reports().len(), 1);
+            assert_eq!(router.failovers().len(), 1);
+            assert_eq!(auth.read().await.auth_token, "tok-claude4");
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(anthropic_429_log_capture)]
+    async fn ordinary_429_keeps_the_existing_retry_path() {
+        let upstream =
+            spawn_upstream(vec![Reply::Plain429 { retry_after: 1 }, Reply::SseOk]).await;
+        let router = ScriptedRouter::new(true, Ok(Some(pinned("claude2"))));
+        let auth = oauth_auth_pinned_to("claude4");
+
+        let out = drive(&upstream, Arc::clone(&auth), &router, 0).await;
+
+        assert!(out.result.is_ok(), "{:?}", out.result.err());
+        assert_eq!(
+            upstream.auth_seen(),
+            vec!["Bearer tok-claude4".to_string(), "Bearer tok-claude4".to_string()],
+            "same seat, plain backoff"
+        );
+        assert!(router.reports().is_empty());
+        assert!(router.failovers().is_empty());
+        // 04-tui I4: a typed retry (the header's "retrying"), not just text.
+        assert!(
+            out.retries.iter().any(|n| n.starts_with("⚠ Rate limited — resuming in ")),
+            "{:?}",
+            out.notices
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(anthropic_429_log_capture)]
+    async fn short_reset_exhaustion_without_hop_falls_through_to_retry() {
+        // Explicit account, window rejected but the reset is under the
+        // long-reset threshold: report, notify, then today's backoff retry.
+        let upstream =
+            spawn_upstream(vec![Reply::Rejected429 { reset_in_secs: 30 }, Reply::SseOk]).await;
+        let router = ScriptedRouter::new(false, Ok(None));
+        let auth = oauth_auth_pinned_to("claude4");
+
+        let out = drive(&upstream, Arc::clone(&auth), &router, 0).await;
+
+        assert!(out.result.is_ok(), "{:?}", out.result.err());
+        assert_eq!(upstream.calls(), 2);
+        assert_eq!(router.reports().len(), 1);
+        assert!(router.failovers().is_empty());
+    }
+
+    /// `std::io::Write` sink appending to a shared buffer (in-process
+    /// capture of formatted tracing output).
+    struct LogCapture(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogCapture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(anthropic_429_log_capture)]
+    async fn schema_capture_logs_headers_once_and_never_the_body() {
+        let upstream = spawn_upstream(vec![
+            Reply::Rejected429 { reset_in_secs: 3 * 3600 },
+            Reply::Rejected429 { reset_in_secs: 3 * 3600 },
+        ])
+        .await;
+        let router = ScriptedRouter::new(true, Ok(Some(pinned("claude2"))));
+        let auth = oauth_auth_pinned_to("claude4");
+
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&buf);
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(move || LogCapture(Arc::clone(&sink)))
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let out = drive(&upstream, Arc::clone(&auth), &router, 0).await;
+        assert!(out.result.is_err());
+        drop(_guard);
+
+        let logs = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert_eq!(
+            logs.matches("anthropic 429 headers (schema capture)").count(),
+            1,
+            "one schema-capture line per turn, even with two 429s: {logs}"
+        );
+        assert!(
+            logs.contains("anthropic-ratelimit-unified-status=rejected"),
+            "{logs}"
+        );
+        assert!(
+            logs.contains("anthropic-ratelimit-unified-reset="),
+            "{logs}"
+        );
+        assert_no_body_leak(&logs, "tracing output");
+        assert!(!logs.contains("tok-claude"), "bearer material in logs: {logs}");
+        for n in &out.notices {
+            assert_no_body_leak(n, "notice");
+        }
+        assert_no_body_leak(&out.result.unwrap_err().to_string(), "error");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(anthropic_429_log_capture)]
+    async fn api_key_auth_never_classifies_or_reports() {
+        // Same rejected headers, but api-key auth has no seats: the loop
+        // must take today's plain backoff path and touch no seat logic.
+        let upstream =
+            spawn_upstream(vec![Reply::Rejected429 { reset_in_secs: 3 * 3600 }, Reply::SseOk])
+                .await;
+        let router = ScriptedRouter::new(true, Ok(Some(pinned("claude2"))));
+        let auth = Arc::new(RwLock::new(AuthState {
+            auth_token: "sk-key".to_string(),
+            auth_type: "api_key".to_string(),
+            refresh_token: None,
+            token_expires: None,
+            auth_file_mtime: None,
+            bound_credential: None,
+        }));
+
+        let out = drive(&upstream, Arc::clone(&auth), &router, 0).await;
+
+        assert!(out.result.is_ok(), "{:?}", out.result.err());
+        assert_eq!(upstream.calls(), 2);
+        assert!(router.reports().is_empty());
+        assert!(router.failovers().is_empty());
+        assert!(out
+            .notices
+            .iter()
+            .all(|n| !n.contains("exhausted") && !n.contains("account limit")));
     }
 }
 
@@ -4338,6 +5693,8 @@ mod cloud_capability_tests {
             auth_type: "api_key".into(),
             refresh_token: None,
             token_expires: Some(9_999_999_999_999),
+            auth_file_mtime: None,
+            bound_credential: None,
         }));
         let client = Client::new();
         let messages = vec![Arc::new(json!({"role": "user", "content": "hi"}))];
@@ -4395,6 +5752,8 @@ mod cancellation_tests {
             auth_type: "api_key".into(),
             refresh_token: None,
             token_expires: Some(9_999_999_999_999),
+            auth_file_mtime: None,
+            bound_credential: None,
         }))
     }
 
@@ -4569,7 +5928,7 @@ mod cancellation_tests {
         let result = tokio::time::timeout(Duration::from_secs(2), async {
             let (result, ()) = tokio::join!(call(&auth, &cancel, tx, &options), async {
                 while let Some(event) = rx.recv().await {
-                    if matches!(event, StreamEvent::Session(SessionEvent::Notice(_))) {
+                    if matches!(event, StreamEvent::Session(SessionEvent::Retry(_))) {
                         cancel.cancel();
                         return;
                     }

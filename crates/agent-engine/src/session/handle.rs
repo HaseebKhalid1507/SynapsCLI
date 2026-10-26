@@ -4,7 +4,7 @@
 //! `ClientTransport` is built on it. `echo_for_test` ships a stand-in actor
 //! so package B can build the wire before the real `SessionActor` exists.
 
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 
 use tokio::sync::{broadcast, mpsc};
@@ -13,11 +13,39 @@ use super::transport::TransportError;
 use super::types::{Addressed, ClientId, Envelope, SessionCommand, SessionConfig, SessionId, SessionLifecycle, SessionMeta};
 
 /// Live client accounting published by the actor (B4 `sessions()` listing).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Presence {
     pub clients: usize,
     pub input_owner: Option<ClientId>,
     pub awaiting_input: usize,
+    /// Every attached client, named (`synaps daemon sessions`).
+    pub roster: Vec<super::types::ClientInfo>,
+    /// Who may drive (`None` until the actor publishes).
+    pub client_input: Option<super::types::ClientInput>,
+    /// A turn or a compaction is running.
+    pub busy: bool,
+    /// What `state_since` dates (idle / busy / parked): a publish that
+    /// changes it restamps `state_since`.
+    pub state: PresenceState,
+    pub state_since: Option<chrono::DateTime<chrono::Utc>>,
+    /// Wall-clock idle park (Live, zero clients, grace armed).
+    pub park_due: Option<chrono::DateTime<chrono::Utc>>,
+    /// Wall-clock eviction of a Parked session.
+    pub evict_due: Option<chrono::DateTime<chrono::Utc>>,
+    /// Conversation title / cost / api message count. Kept as last seen
+    /// while Parked (no conversation in memory).
+    pub title: Option<String>,
+    pub cost_usd: f64,
+    pub messages: usize,
+}
+
+/// The coarse state `Presence::state_since` dates.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PresenceState {
+    #[default]
+    Idle,
+    Busy,
+    Parked,
 }
 use super::view::RuntimeView;
 
@@ -52,10 +80,17 @@ pub struct SessionHandle {
     /// Session name — `--name` at create / `/cmd saveas` later. Written by
     /// the actor so listings and `--continue <name>` see renames live.
     name: Arc<arc_swap::ArcSwap<Option<String>>>,
+    /// The pin (`KeepWarm{on}`), written by the actor. Read without a probe
+    /// by listings and by the daemon's idle exit, which a pin holds.
+    keep_warm: Arc<AtomicBool>,
     /// Per-session `/keepwarm` override (task #444), written by the actor.
     /// Lives here so a daemon reload whose checkpoint did not confirm still
     /// carries the user's explicit choice.
     cache_keepwarm: super::cache_keepwarm::OverrideSlot,
+    /// The session's explicit `/memory` choice, written by the actor. Here
+    /// for the same reason as `cache_keepwarm`: a reload whose checkpoint
+    /// did not confirm must not re-grant memory the user turned off.
+    memory_mode: MemoryModeSlot,
     /// F23: only on a lock-held placeholder — the config to retry the real
     /// `create` with on the next attach. `None` for real actors.
     placeholder_config: Option<Arc<SessionConfig>>,
@@ -79,8 +114,13 @@ pub struct SessionEndpoints {
     pub journal_id: Arc<arc_swap::ArcSwap<String>>,
     pub presence: Arc<arc_swap::ArcSwap<Presence>>,
     pub name: Arc<arc_swap::ArcSwap<Option<String>>>,
+    pub keep_warm: Arc<AtomicBool>,
     pub cache_keepwarm: super::cache_keepwarm::OverrideSlot,
+    pub memory_mode: MemoryModeSlot,
 }
+
+/// The session's explicit `/memory` choice, readable without the actor.
+pub type MemoryModeSlot = Arc<std::sync::Mutex<Option<super::SessionMemoryMode>>>;
 
 impl SessionHandle {
     /// Mint a handle + the actor's ends. Used by `SessionActor` (A1) and the
@@ -93,7 +133,9 @@ impl SessionHandle {
         let journal_id = Arc::new(arc_swap::ArcSwap::from_pointee(meta.id.0.clone()));
         let presence = Arc::new(arc_swap::ArcSwap::from_pointee(Presence::default()));
         let name = Arc::new(arc_swap::ArcSwap::from_pointee(meta.name.clone()));
+        let keep_warm = Arc::new(AtomicBool::new(meta.pinned));
         let cache_keepwarm = super::cache_keepwarm::OverrideSlot::default();
+        let memory_mode = MemoryModeSlot::default();
         let handle = Self {
             id: meta.id.clone(),
             cmd_tx,
@@ -104,7 +146,9 @@ impl SessionHandle {
             journal_id: Arc::clone(&journal_id),
             presence: Arc::clone(&presence),
             name: Arc::clone(&name),
+            keep_warm: Arc::clone(&keep_warm),
             cache_keepwarm: Arc::clone(&cache_keepwarm),
+            memory_mode: Arc::clone(&memory_mode),
             placeholder_config: None,
         };
         (
@@ -117,7 +161,9 @@ impl SessionHandle {
                 journal_id,
                 presence,
                 name,
+                keep_warm,
                 cache_keepwarm,
+                memory_mode,
             },
         )
     }
@@ -155,12 +201,18 @@ impl SessionHandle {
 
     /// Clients / input owner / pending prompts as last published.
     pub fn presence(&self) -> Presence {
-        **self.presence.load()
+        (**self.presence.load()).clone()
     }
 
     /// Current session name (create `--name` or a later `saveas`).
     pub fn name(&self) -> Option<String> {
         (**self.name.load()).clone()
+    }
+
+    /// Whether the session is pinned (`KeepWarm{on}`), as last written by
+    /// the actor.
+    pub fn pinned(&self) -> bool {
+        self.keep_warm.load(Ordering::Acquire)
     }
 
     /// The session's `/keepwarm` override (`off`/`auto`/`<N>h`), if any.
@@ -171,8 +223,17 @@ impl SessionHandle {
             .map(|m| m.to_string())
     }
 
+    /// The session's explicit `/memory` choice, if it made one.
+    pub fn memory_mode(&self) -> Option<super::SessionMemoryMode> {
+        *self
+            .memory_mode
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// `meta()` with the live cells filled in (lifecycle, clients, owner,
-    /// awaiting_input, journal_id) — what listings show.
+    /// awaiting_input, client_input, model, journal_id, name, pinned, and the
+    /// presence's busy/state/deadlines/title/cost/messages) — what listings show.
     pub fn meta_live(&self) -> SessionMeta {
         let mut m = (*self.meta).clone();
         let p = self.presence();
@@ -180,8 +241,20 @@ impl SessionHandle {
         m.clients = p.clients;
         m.input_owner = p.input_owner;
         m.awaiting_input = p.awaiting_input;
+        m.roster = p.roster;
+        m.client_input = p.client_input;
+        // `/model` from any client changes it; the create-time meta doesn't.
+        m.model = self.view.load().model.clone();
         m.journal_id = self.journal_id();
         m.name = self.name();
+        m.pinned = self.pinned();
+        m.busy = p.busy;
+        m.state_since = p.state_since;
+        m.park_due = p.park_due;
+        m.evict_due = p.evict_due;
+        m.title = p.title;
+        m.cost_usd = p.cost_usd;
+        m.messages = p.messages;
         m
     }
 
@@ -253,8 +326,18 @@ pub mod echo {
             clients: 0,
             input_owner: None,
             awaiting_input: 0,
+            roster: Vec::new(),
+            client_input: None,
             journal_id: id.0.clone(),
             locked_by: None,
+            pinned: false,
+            busy: false,
+            state_since: None,
+            park_due: None,
+            evict_due: None,
+            title: None,
+            cost_usd: 0.0,
+            messages: 0,
         }
     }
 
@@ -331,6 +414,8 @@ pub mod echo {
                 replay: Vec::new(),
                 pending_prompts: Vec::new(),
                 clients: self.clients.iter().map(|(c, m)| (*c, m.kind)).collect(),
+                roster: Vec::new(),
+                client_input: ClientInput::wire_default(),
                 input_owner: None,
                 display_tail,
             }
@@ -354,7 +439,8 @@ pub mod echo {
                         client: cid,
                         snapshot,
                     });
-                    self.emit(SessionEventWire::ClientJoined { client: cid, kind });
+                    let name = kind.default_name().to_string();
+                    self.emit(SessionEventWire::ClientJoined { client: cid, kind, name, mode: AttachMode::Mirror });
                 }
                 SessionCommand::Detach { client } => {
                     if self.clients.remove(&client).is_some() {
@@ -490,8 +576,18 @@ pub mod locked_placeholder {
             clients: 0,
             input_owner: None,
             awaiting_input: 0,
+            roster: Vec::new(),
+            client_input: None,
             journal_id: id.0.clone(),
             locked_by: Some(holder_desc.clone()),
+            pinned: false,
+            busy: false,
+            state_since: None,
+            park_due: None,
+            evict_due: None,
+            title: None,
+            cost_usd: 0.0,
+            messages: 0,
         };
         let view = crate::session::view::RuntimeView {
             model: config.model_override.clone().unwrap_or_else(|| "unknown".into()),
@@ -512,6 +608,11 @@ pub mod locked_placeholder {
             prompt_inspection: None,
         };
         let (handle, ep) = SessionHandle::new(meta, view);
+        // It never answers a checkpoint: a reload records it from the
+        // handle, which must carry its memory choice like a live actor's.
+        *ep.memory_mode
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = config.memory_mode;
         let handle = handle.with_placeholder_config(config.clone());
         // Start as Parked.
         ep.lifecycle.store(SessionLifecycle::Parked as u8, Ordering::Release);

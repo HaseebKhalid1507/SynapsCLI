@@ -51,7 +51,7 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use super::actor::SessionActor;
-use super::types::ClientKind;
+use super::types::{AttachMode, ClientKind};
 use crate::core::config::{CacheKeepWarm, CacheTtl};
 use crate::runtime::keepwarm::{
     CacheAnchor, KeepWarmProbe, KeepWarmUsage, PingBill, PingFailure, PingOutcome, PingReport,
@@ -165,6 +165,19 @@ pub mod testing {
         fn drop(&mut self) {
             super::INTERVAL_OVERRIDE_MS.store(0, Ordering::Relaxed);
         }
+    }
+
+    static DUE_CHECKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    /// How many times an actor in this process looked at a possibly due
+    /// ping (`on_cache_keepwarm_due`). A timer left armed with a past
+    /// deadline shows here as a fast-growing count.
+    pub fn due_checks() -> u64 {
+        DUE_CHECKS.load(Ordering::SeqCst)
+    }
+
+    pub(super) fn note_due_check() {
+        DUE_CHECKS.fetch_add(1, Ordering::SeqCst);
     }
 }
 
@@ -855,8 +868,9 @@ pub(crate) struct KeepWarmState {
     turn_started_at: Option<Instant>,
     /// Usage of the latest real request (`None` until one reported).
     last_request: Option<KeepWarmUsage>,
-    /// A TUI/attach client has been attached at some point. Script/RPC-only
-    /// sessions (nobody will be back in human time) never keep warm.
+    /// A TUI/attach client that can type (not `Observe`) has been attached
+    /// at some point. Script/RPC-only or observe-only sessions (nobody will
+    /// be back to type in human time) never keep warm.
     pub(crate) interactive_seen: bool,
     last_end: Option<String>,
     session_pings: u32,
@@ -956,8 +970,15 @@ impl SessionActor {
         None
     }
 
-    /// A client attached: TUI/attach clients mark the session interactive.
-    pub(crate) fn cache_keepwarm_note_attach(&mut self, kind: ClientKind) {
+    /// A client attached: TUI/attach clients that can type (`Mirror` or
+    /// `Takeover`) mark the session interactive. An `Observe` attach never
+    /// does: it cannot send input, so only watching a session (`synaps
+    /// attach --observe`, a read-only pane in another app) must not make it
+    /// eligible for paid keep-warm.
+    pub(crate) fn cache_keepwarm_note_attach(&mut self, kind: ClientKind, mode: AttachMode) {
+        if mode == AttachMode::Observe {
+            return;
+        }
         if matches!(kind, ClientKind::Tui | ClientKind::Attach) {
             self.cache_keepwarm.interactive_seen = true;
         }
@@ -1101,14 +1122,16 @@ impl SessionActor {
             return;
         }
         let mode = self.cache_keepwarm.mode();
-        if mode.is_off() || !self.cache_keepwarm.interactive_seen {
+        // A pin is the owner's say-so that the session is coming back (a
+        // restored pin often has no client; `synaps send` feeds it).
+        if mode.is_off() || !(self.cache_keepwarm.interactive_seen || self.keep_warm) {
             return;
         }
         // Never before a real Anthropic request of THIS turn was accepted.
         let Some(anchor) = self
             .runtime
             .cache_anchor()
-            .filter(|a| turn_started_at.map_or(true, |t| a.mono >= t))
+            .filter(|a| turn_started_at.is_none_or(|t| a.mono >= t))
         else {
             return;
         };
@@ -1199,7 +1222,16 @@ impl SessionActor {
 
     /// `select!` arm: a ping may be due.
     pub(crate) async fn on_cache_keepwarm_due(&mut self) {
-        if self.cache_keepwarm.period.is_none() || self.cache_keepwarm.task.is_some() {
+        #[cfg(any(test, feature = "testing"))]
+        testing::note_due_check();
+        // Fenced for a reload, the exec would discard the ping's result. The
+        // ping also repeats the next turn's prefix, session-start injection
+        // included, so it waits for that hook: the timer arm is off
+        // meanwhile (`holds`), and a due deadline fires once it has run.
+        if self.holds(super::actor::WorkSource::KeepWarmTimer)
+            || self.cache_keepwarm.period.is_none()
+            || self.cache_keepwarm.task.is_some()
+        {
             return;
         }
         let (now, wall) = (Instant::now(), SystemTime::now());
@@ -1447,6 +1479,9 @@ impl SessionActor {
                 });
             };
             self.cache_keepwarm.set_override(mode);
+            if self.keep_warm {
+                self.note_pin(); // the override comes back with the pin
+            }
             if mode.is_off() {
                 self.cache_keepwarm_end(PeriodEnd::Disabled);
             } else if let Some(p) = self.cache_keepwarm.period.as_mut() {

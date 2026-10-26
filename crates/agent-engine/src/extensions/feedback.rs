@@ -198,7 +198,9 @@ impl Turn {
             LlmEvent::Thinking(_)
             | LlmEvent::ToolUseStart { .. }
             | LlmEvent::ToolUseDelta { .. }
-            | LlmEvent::ToolResultDelta { .. } => {}
+            | LlmEvent::ToolResultDelta { .. }
+            | LlmEvent::ToolQueued { .. }
+            | LlmEvent::ToolStarted { .. } => {}
         }
         Some(())
     }

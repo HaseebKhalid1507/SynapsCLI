@@ -1,5 +1,8 @@
 //! Integration test for `provider.stream` over JSON-RPC notifications.
 
+#[path = "support/hermetic_base_dir.rs"]
+mod hermetic_base_dir;
+
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -52,6 +55,7 @@ async fn spawn_named_fixture(file: &str, ext_id: &str) -> ProcessExtension {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn provider_stream_forwards_events_and_returns_final_result() {
+    hermetic_base_dir::pin();
     let handler = spawn_fixture().await;
     let (tx, mut rx) = mpsc::channel::<ProviderStreamEvent>(64);
 
@@ -102,6 +106,7 @@ async fn provider_stream_forwards_events_and_returns_final_result() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn provider_stream_completes_when_sink_dropped() {
+    hermetic_base_dir::pin();
     let handler = spawn_fixture().await;
     let (tx, rx) = mpsc::channel::<ProviderStreamEvent>(64);
     drop(rx);
@@ -120,6 +125,7 @@ async fn provider_stream_completes_when_sink_dropped() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn provider_stream_propagates_extension_error() {
+    hermetic_base_dir::pin();
     let handler = spawn_named_fixture(
         "streaming_provider_error_extension.py",
         "stream-echo-error-ext",
@@ -142,6 +148,7 @@ async fn provider_stream_propagates_extension_error() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn provider_stream_skips_malformed_notification_events() {
+    hermetic_base_dir::pin();
     let handler = spawn_named_fixture(
         "streaming_provider_malformed_extension.py",
         "stream-echo-malformed-ext",
@@ -192,6 +199,7 @@ async fn provider_stream_skips_malformed_notification_events() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn provider_stream_ignores_unknown_notification_methods() {
+    hermetic_base_dir::pin();
     let handler = spawn_named_fixture(
         "streaming_provider_unknown_method_extension.py",
         "stream-echo-unknown-ext",

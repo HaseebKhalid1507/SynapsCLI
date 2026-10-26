@@ -74,7 +74,7 @@ impl BetType {
             BetType::Red => result > 0 && number_color(result) == RouletteColor::Red,
             BetType::Black => result > 0 && number_color(result) == RouletteColor::Black,
             BetType::Odd => result > 0 && result % 2 == 1,
-            BetType::Even => result > 0 && result % 2 == 0,
+            BetType::Even => result > 0 && result.is_multiple_of(2),
             BetType::Low => (1..=18).contains(&result),
             BetType::High => (19..=36).contains(&result),
             BetType::Dozen(d) => match d {
@@ -173,7 +173,7 @@ impl RouletteGame {
             0 // stopped
         };
 
-        if speed > 0 && self.phase_timer % speed == 0 {
+        if speed > 0 && self.phase_timer.is_multiple_of(speed) {
             let mut rng = rand::rng();
             self.spin_display = rng.random_range(0..=36);
         }

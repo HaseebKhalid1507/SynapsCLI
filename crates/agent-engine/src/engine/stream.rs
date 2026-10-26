@@ -236,6 +236,11 @@ pub fn process_stream_event_with_terminal_capture(
             EngineStreamEvent::ToolResult { tool_id, result },
             StreamCompletion::Continue,
         ),
+        // Scheduler queue hints are a TUI presentation detail; line-mode
+        // renderers (`synaps chat`) print a call once, at `ToolFinalized`.
+        StreamEvent::Llm(LlmEvent::ToolQueued { .. } | LlmEvent::ToolStarted { .. }) => {
+            (EngineStreamEvent::Noop, StreamCompletion::Continue)
+        }
         StreamEvent::Session(SessionEvent::ContextHeadCheckpoint { receipt, .. }) => {
             receipt.complete(Err(std::io::Error::other(
                 "this stream consumer has no durable context-head handler",
@@ -369,7 +374,7 @@ pub fn process_stream_event_with_terminal_capture(
                 (EngineStreamEvent::Done, StreamCompletion::Done)
             }
         }
-        StreamEvent::Session(SessionEvent::Notice(text)) => {
+        StreamEvent::Session(SessionEvent::Notice(text) | SessionEvent::Retry(text)) => {
             // Display-only status (e.g. retry notice) — surface as a system
             // line, never recorded into message history.
             (EngineStreamEvent::Notice(text), StreamCompletion::Continue)

@@ -4,7 +4,9 @@
 //! messages/tools/content-blocks (the internal synaps representation) and
 //! OpenAI `chat/completions` SSE wire.
 
+pub(crate) mod account_routing;
 pub mod catalog;
+pub(crate) mod codex_wire;
 pub(crate) mod extension_route;
 pub mod net;
 pub mod ping;
@@ -140,6 +142,23 @@ pub fn resolve_route(model: &str) -> Option<ResolvedRoute> {
                 wire: WireProtocol::OpenAiChatCompletions,
             });
         }
+        if prefix == "muse" {
+            // Broker-proxied Meta Muse: the broker resolves the Model API key
+            // (env override or minted from the Meta login) and pins
+            // api.meta.ai. Server-driven catalog → registry precedent: any
+            // safe-shaped id routes and Meta decides existence. Routing never
+            // depends on the process-local catalog cache (daemon/resume).
+            if !catalog::muse_routable_id(rest) {
+                return None;
+            }
+            return Some(ResolvedRoute {
+                endpoint: crate::auth::muse::API_BASE_URL.into(),
+                model: rest.into(),
+                provider: prefix.into(),
+                auth: AuthPolicy::BrokerProxy,
+                wire: WireProtocol::OpenAiResponses,
+            });
+        }
         if prefix == "local" {
             let c = registry::resolve_provider_model(prefix, rest)?;
             return Some(ResolvedRoute {
@@ -259,6 +278,13 @@ pub(crate) async fn try_route_with_memory_backend(
     trace: &crate::runtime::trace::TraceContext,
     suppress_stream_deltas: bool,
 ) -> Option<Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>>> {
+    // Muse capability evidence (exact effort set, modalities) lives in the
+    // process-local cache; load it here via the turn's broker when this
+    // process has none for the model, BEFORE body validation consults it.
+    if model.starts_with("muse/") {
+        let broker = crate::auth::broker_from_source(source, cache, client.clone());
+        catalog::ensure_muse_catalog_for(model, &broker).await;
+    }
     if let Err(error) = super::attachments::validate_history_for_request(model, messages) {
         return Some(Err(error.into()));
     }
@@ -334,8 +360,11 @@ pub(crate) async fn try_route_with_memory_backend(
                     "internal sync routing is unavailable for this streaming provider".into(),
                 ));
             }
+            // Same wire, per-provider body/identity: Meta Muse mirrors the
+            // official Muse Code request shape; everything else is xAI.
             Some(
-                stream::call_xai_responses_stream_inner(
+                stream::call_responses_route_inner(
+                    &route.provider,
                     &cfg,
                     &broker,
                     tools_schema,
@@ -498,6 +527,31 @@ mod tests {
             resolve_route("google-gemini/gemini-pro-latest").is_none(),
             "gemini-pro-latest is not a Code Assist wire ID (404 upstream)"
         );
+    }
+
+    #[test]
+    fn muse_routing_is_broker_proxied_responses_and_fail_closed() {
+        let route = resolve_route("muse/muse-wonder-1.0").expect("documented seed routes");
+        assert_eq!(route.provider, "muse");
+        assert_eq!(route.model, "muse-wonder-1.0");
+        assert_eq!(route.endpoint, crate::auth::muse::API_BASE_URL);
+        // The Model API key never reaches the runtime: broker-proxied.
+        assert_eq!(route.auth, AuthPolicy::BrokerProxy);
+        assert_eq!(route.wire, WireProtocol::OpenAiResponses);
+        // Server-driven catalog (registry precedent): any safe-shaped id
+        // routes WITHOUT a live catalog in this process — Meta decides
+        // existence. This is what lets a daemon-hosted session switch to a
+        // model only the TUI's picker fetched.
+        let live_only = resolve_route("muse/muse-spark-9.9").expect("shape-valid id routes");
+        assert_eq!(live_only.model, "muse-spark-9.9");
+        assert_eq!(live_only.wire, WireProtocol::OpenAiResponses);
+        // Malformed ids fail closed: they never reach the request body.
+        for banned in ["MUSE-WONDER-1.0", "", "a b", "../x", "-x", "a/b"] {
+            assert!(
+                resolve_route(&format!("muse/{banned}")).is_none(),
+                "{banned} must not resolve"
+            );
+        }
     }
 
     #[test]

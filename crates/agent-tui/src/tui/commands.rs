@@ -3,7 +3,6 @@
 use std::path::Path;
 
 use chrono;
-use synaps_cli::list_recent_sessions;
 
 use super::app::{App, ChatMessage};
 use synaps_cli::extensions::commands::CommandOutputEvent;
@@ -14,7 +13,10 @@ use synaps_cli::extensions::runtime::InvokeCommandEvent;
 /// `CommandRegistry::all_commands()` for autocomplete and prefix resolution.
 #[allow(dead_code)]
 /// Commands that work while streaming.
-pub(super) const STREAMING_COMMANDS: &[&str] = &["gamba", "theme", "quit", "exit", "attachments", "detach"];
+pub(super) const STREAMING_COMMANDS: &[&str] = &[
+    "gamba", "theme", "quit", "exit", "attachments", "detach", "watch", "settings", "clients", "takeover",
+    "sessions",
+];
 
 /// Merged list of built-ins + registered skill names (deduped, sorted).
 /// Used for autocomplete and prefix resolution.
@@ -47,6 +49,11 @@ pub(super) enum CommandAction {
     OpenEffort,
     /// Open the /settings modal.
     OpenSettings,
+    /// `/clients` typed mid-stream: [`clients`] needs the session link,
+    /// which [`handle_streaming_command`] doesn't have.
+    Clients,
+    /// Open the /sessions modal (Live / Past).
+    OpenSessions,
     /// Open the /plugins modal.
     OpenPlugins,
     /// Open the searchable /help find lightbox.
@@ -95,6 +102,9 @@ pub(super) enum CommandAction {
     SidecarToggle { plugin_id: Option<String> },
     /// Show sidecar subsystem status (`/sidecar status`).
     SidecarStatus { plugin_id: Option<String> },
+    /// `/takeover` typed mid-stream: [`takeover`] needs the session link,
+    /// which [`handle_streaming_command`] doesn't have.
+    TakeOver,
 }
 
 #[derive(Debug, Clone)]
@@ -344,8 +354,156 @@ pub(super) fn resolve_prefix(raw: &str, commands: &[String]) -> String {
     raw.to_string()
 }
 
-/// Handle a slash command when NOT streaming.
+/// `/pin` in an in-process TUI: the session ends with this process anyway.
+pub(super) const PIN_IN_PROCESS: &str = "pin: only applies to a daemon session (synaps --attach)";
+
+pub(super) const TAKEOVER_IN_PROCESS: &str =
+    "takeover: nothing to take over; an in-process session has one client and it owns input";
+pub(super) const TAKEOVER_OBSERVING: &str =
+    "takeover: this client is observing (--observe) and never owns input; attach without --observe to take it";
+pub(super) const TAKEOVER_ALREADY: &str = "takeover: you already own input";
+pub(super) const TAKEOVER_SHARED: &str = "takeover: input is shared, so every client can already type; \
+     this one is now the active client (it gets input back first after a daemon reload)";
+pub(super) const TAKEOVER_SHARED_ALREADY: &str =
+    "takeover: input is shared, so every client can already type; this one is already the active client";
+
+/// `/takeover`: take input ownership from the client that holds it, in
+/// place (the in-session form of `synaps --attach --takeover`). The session
+/// answers with `InputOwnerChanged` ("you own input" toast; the old owner
+/// gets "input taken over") or, from an observer, `Refused`. Works mid-turn:
+/// the turn keeps running, only who drives the session changes.
+pub(super) async fn takeover(app: &mut App, link: &mut super::session_link::SessionLink) {
+    let t = link.transport();
+    let shared = t.client_input() == agent_engine::session::ClientInput::Shared;
+    let note = if t.daemon_pid() == 0 {
+        Some(TAKEOVER_IN_PROCESS)
+    } else if t.mode() == agent_engine::session::AttachMode::Observe {
+        Some(TAKEOVER_OBSERVING)
+    } else if t.input_owner() == Some(t.client_id()) {
+        Some(if shared { TAKEOVER_SHARED_ALREADY } else { TAKEOVER_ALREADY })
+    } else {
+        None
+    };
+    if let Some(note) = note {
+        app.push_msg(ChatMessage::System(note.to_string()));
+        return;
+    }
+    match link.send(agent_engine::session::SessionCommand::TakeInput).await {
+        // Shared mode shows no toast when the active client moves: say it here.
+        Ok(()) if shared => app.push_msg(ChatMessage::System(TAKEOVER_SHARED.to_string())),
+        Ok(()) => {}
+        Err(e) => app.push_msg(ChatMessage::Error(format!("takeover failed: {e}"))),
+    }
+}
+
+/// `/pin [on|off|status]`, alias `/keep-warm on|off`: the daemon session's
+/// pin (`KeepWarm`), not `/keepwarm` (prompt-cache pings). `on|off` is sent
+/// to the session, whose notice (or refusal, for a non-owner) arrives as an
+/// event. The status asks the session (`Status.pinned`) rather than track it
+/// here: another client or `synaps daemon pin` may have changed it.
+async fn pin_command(cmd: &str, arg: &str, app: &mut App, link: &mut super::session_link::SessionLink) {
+    if link.transport().daemon_pid() == 0 {
+        app.push_msg(ChatMessage::System(PIN_IN_PROCESS.to_string()));
+        return;
+    }
+    match arg.trim() {
+        a @ ("on" | "off") => {
+            let on = a == "on";
+            if let Err(e) = link.send(agent_engine::session::SessionCommand::KeepWarm { on }).await {
+                app.push_msg(ChatMessage::Error(format!("pin failed: {e}")));
+            }
+        }
+        "" | "status" => match link.query(agent_engine::session::SessionQuery::Status).await {
+            Ok(value) => match value["pinned"].as_bool() {
+                Some(true) => app.push_msg(ChatMessage::System(
+                    agent_engine::session::actor::PIN_ON_NOTICE.to_string(),
+                )),
+                Some(false) => app.push_msg(ChatMessage::System(
+                    "not pinned: this session parks when idle. /pin on keeps it loaded.".to_string(),
+                )),
+                None => app.push_msg(ChatMessage::Error(
+                    "pin: this daemon does not report the pin; `synaps daemon reload` updates it".to_string(),
+                )),
+            },
+            Err(e) => app.push_msg(ChatMessage::Error(format!("pin failed: {e}"))),
+        },
+        _ => app.push_msg(ChatMessage::Error(format!("usage: /{cmd} [on|off|status]"))),
+    }
+}
+
+/// `/clients` in an in-process session: there is no daemon, only this TUI.
+pub(super) const CLIENTS_IN_PROCESS: &str = "clients: in-process session; this TUI is its only client";
+
+/// `/clients`: every client attached to this session, from the transport's
+/// roster (attach snapshot + `ClientJoined`/`ClientLeft`), one line each:
+/// name and id, kind, `drive`/`observe`, who owns input (with
+/// `client_input = shared`: who is active), which is you, and how long it
+/// has been attached.
+pub(super) fn clients(app: &mut App, link: &super::session_link::SessionLink) {
+    let t = link.transport();
+    if t.daemon_pid() == 0 {
+        app.push_msg(ChatMessage::System(CLIENTS_IN_PROCESS.to_string()));
+        return;
+    }
+    let roster = t.roster();
+    let shared = t.client_input() == agent_engine::session::ClientInput::Shared;
+    let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+    let n = roster.clients().len();
+    let mut lines = vec![format!(
+        "{n} client{} attached{}",
+        if n == 1 { "" } else { "s" },
+        if shared { " · input shared (every drive client types; active = typed last)" } else { "" }
+    )];
+    for c in roster.clients() {
+        let mut row = format!(
+            "  {:<20} {:<7} {}",
+            c.label(),
+            c.kind.default_name(),
+            if c.mode == agent_engine::session::AttachMode::Observe { "observe" } else { "drive" },
+        );
+        if t.input_owner() == Some(c.id) {
+            // Shared input: everyone (but observers) types; this one did last.
+            row.push_str(if shared { " · active" } else { " · owns input" });
+        }
+        if c.id == t.client_id() {
+            row.push_str(" · you");
+        }
+        if c.attached_at_ms > 0 {
+            row.push_str(&format!(" · {}", attached_for(now_ms.saturating_sub(c.attached_at_ms))));
+        }
+        lines.push(row);
+    }
+    app.push_msg(ChatMessage::System(lines.join("\n")));
+}
+
+/// `attached 3m`, `attached 2h 5m`: how long a client has been attached.
+fn attached_for(ms: u64) -> String {
+    let mins = ms / 60_000;
+    match mins {
+        0 => "attached just now".to_string(),
+        1..=59 => format!("attached {mins}m"),
+        _ => format!("attached {}h {}m", mins / 60, mins % 60),
+    }
+}
+
+/// Handle a slash command when NOT streaming. Its notices show in the view
+/// it was typed in ([`super::watch::begin_command`]).
 pub(super) async fn handle_command(
+    cmd: &str,
+    arg: &str,
+    app: &mut App,
+    link: &mut super::session_link::SessionLink,
+    system_prompt_path: &Path,
+    registry: &std::sync::Arc<synaps_cli::skills::registry::CommandRegistry>,
+    keybind_registry: &synaps_cli::skills::keybinds::KeybindRegistry,
+) -> CommandAction {
+    let prev = super::watch::begin_command(app);
+    let action = run_command(cmd, arg, app, link, system_prompt_path, registry, keybind_registry).await;
+    super::watch::end_command(app, prev);
+    action
+}
+
+async fn run_command(
     cmd: &str,
     arg: &str,
     app: &mut App,
@@ -438,7 +596,7 @@ pub(super) async fn handle_command(
         };
     }
     if synaps_cli::engine::commands::evaluate_engine_command(cmd, arg).is_some()
-        || matches!(cmd, "context" | "trace" | "memory")
+        || matches!(cmd, "context" | "trace" | "memory" | "workers" | "confirms" | "auth" | "close")
     {
         use synaps_cli::engine::commands::persist_to_config;
         let value = match link.engine_command(cmd, arg).await {
@@ -639,68 +797,7 @@ pub(super) async fn handle_command(
                 )));
             }
         }
-        "sessions" => match list_recent_sessions(20) {
-            Ok(sessions) if sessions.is_empty() => {
-                app.push_msg(ChatMessage::System("no saved sessions".to_string()));
-            }
-            Ok(sessions) => {
-                app.push_msg(ChatMessage::System(format!(
-                    "{} session(s):",
-                    sessions.len()
-                )));
-                for s in sessions.iter().take(20) {
-                    let active_marker = if s.id == app.session.id { " ●" } else { "" };
-                    let name_tag = s
-                        .name
-                        .as_deref()
-                        .map(|n| format!(" [@{}]", n))
-                        .unwrap_or_default();
-                    let age = {
-                        let secs = chrono::Utc::now()
-                            .signed_duration_since(s.updated_at)
-                            .num_seconds();
-                        if secs < 3600 {
-                            format!("{}m ago", secs / 60)
-                        } else if secs < 86400 {
-                            format!("{}h ago", secs / 3600)
-                        } else {
-                            format!("{}d ago", secs / 86400)
-                        }
-                    };
-                    let title_display = if s.title.is_empty() {
-                        "(no title)".to_string()
-                    } else {
-                        s.title.chars().take(60).collect::<String>()
-                    };
-                    // Last 4 chars — more recognizable than a prefix
-                    let id_short = &s.id[s.id.len().saturating_sub(4)..];
-                    let msg_str = if s.message_count > 0 {
-                        format!("{} msgs · ", s.message_count)
-                    } else {
-                        String::new()
-                    };
-                    // Line 1: identity + meta
-                    app.push_msg(ChatMessage::System(format!(
-                        "  …{}{}{} · {}{}${:.3} · {}",
-                        id_short, active_marker, name_tag,
-                        msg_str, age, s.session_cost, s.model
-                    )));
-                    // Line 2: title
-                    app.push_msg(ChatMessage::System(format!(
-                        "     └ {}",
-                        title_display
-                    )));
-                    // Blank separator between entries
-                    app.push_msg(ChatMessage::System(String::new()));
-                }
-            }
-            Err(e) => {
-                app.push_msg(ChatMessage::Error(format!(
-                    "failed to list sessions: {}",
-                    e
-                )));
-            }
-        },
+        "sessions" => return CommandAction::OpenSessions,
         "resume" => {
             if arg.is_empty() {
                 app.push_msg(ChatMessage::System(
@@ -728,6 +825,9 @@ pub(super) async fn handle_command(
                 }
             }
         }
+        "pin" | "keep-warm" => pin_command(cmd, arg, app, link).await,
+        "clients" => clients(app, link),
+        "takeover" => takeover(app, link).await,
         "keepwarm" => {
             // Prompt-cache keep-warm lives on the actor (task #444):
             // `EngineCommand{keepwarm}` → status / per-session override.
@@ -857,6 +957,9 @@ pub(super) async fn handle_command(
         }
         "quit" | "exit" => {
             return CommandAction::Quit;
+        }
+        "watch" => {
+            super::watch::command(app, arg, std::time::Instant::now());
         }
         "theme" => {
             app.handle_theme_command(arg);
@@ -1238,12 +1341,116 @@ pub(super) async fn handle_command(
                         .join(", ")
                 )));
             }
+            // Nothing here handled it: ask the session. A daemon newer than
+            // this client (an attached TUI keeps its binary across `daemon
+            // reload`) may know it — `/workers` reached daemons before the
+            // TUIs attached to them — and some builtins are engine-only
+            // (`/budget`). The actor answers `unhandled` for anything it
+            // doesn't know either.
             Resolution::Builtin | Resolution::Unknown => {
-                app.push_msg(ChatMessage::Error(format!("unknown command: /{}", cmd)));
+                return forward_unhandled_command(cmd, arg, app, link).await
             }
         },
     }
     CommandAction::None
+}
+
+/// A `/cmd` the client didn't handle, forwarded as an engine command;
+/// renders the generic reply kinds (`output`/`notice`/`error`/`quit`), and
+/// "unknown command" when the session doesn't know it either.
+async fn forward_unhandled_command(
+    cmd: &str,
+    arg: &str,
+    app: &mut App,
+    link: &mut super::session_link::SessionLink,
+) -> CommandAction {
+    let unknown = || ChatMessage::Error(format!("unknown command: /{}", cmd));
+    let value = match link.engine_command(cmd, arg).await {
+        Ok(v) => v,
+        Err(_) => {
+            app.push_msg(unknown());
+            return CommandAction::None;
+        }
+    };
+    match forwarded_reply(&value) {
+        ForwardedReply::Unknown => app.push_msg(unknown()),
+        ForwardedReply::Quit => return CommandAction::Quit,
+        ForwardedReply::Error(text) => app.push_msg(ChatMessage::Error(text)),
+        ForwardedReply::Text(text) => app.push_msg(ChatMessage::System(text)),
+        ForwardedReply::Nothing => {}
+    }
+    CommandAction::None
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ForwardedReply {
+    Unknown,
+    Quit,
+    Error(String),
+    Text(String),
+    Nothing,
+}
+
+/// How a forwarded command's `QueryResult` renders (`engine_command_reply`
+/// kinds). Pure, for tests.
+fn forwarded_reply(value: &serde_json::Value) -> ForwardedReply {
+    let text = value["text"].as_str().unwrap_or("").to_string();
+    match value["kind"].as_str().unwrap_or("unhandled") {
+        "unhandled" => ForwardedReply::Unknown,
+        "quit" => ForwardedReply::Quit,
+        "error" => ForwardedReply::Error(text),
+        _ if text.is_empty() => ForwardedReply::Nothing,
+        _ => ForwardedReply::Text(text),
+    }
+}
+
+#[cfg(test)]
+mod forwarded_command_tests {
+    use super::{forwarded_reply, ForwardedReply};
+    use serde_json::json;
+
+    #[test]
+    fn a_command_the_session_knows_renders_its_reply() {
+        assert_eq!(
+            forwarded_reply(&json!({"kind": "output", "text": "2 workers running"})),
+            ForwardedReply::Text("2 workers running".into())
+        );
+        assert_eq!(
+            forwarded_reply(&json!({"kind": "notice", "text": "done"})),
+            ForwardedReply::Text("done".into())
+        );
+        assert_eq!(
+            forwarded_reply(&json!({"kind": "error", "text": "no such worker"})),
+            ForwardedReply::Error("no such worker".into())
+        );
+        assert_eq!(forwarded_reply(&json!({"kind": "quit"})), ForwardedReply::Quit);
+        assert_eq!(forwarded_reply(&json!({"kind": "none"})), ForwardedReply::Nothing);
+    }
+
+    #[test]
+    fn a_command_nobody_knows_is_unknown() {
+        assert_eq!(forwarded_reply(&json!({"kind": "unhandled"})), ForwardedReply::Unknown);
+        assert_eq!(forwarded_reply(&json!({})), ForwardedReply::Unknown);
+    }
+
+    /// End to end over the scripted session: a command only the engine
+    /// handles (`/budget`) answers instead of "unknown command" (that is how
+    /// a client older than its daemon reaches the daemon's new commands),
+    /// and a command nobody knows is still reported as unknown.
+    #[test]
+    fn unhandled_commands_go_to_the_session() {
+        use crate::tui::testing::TestHarness;
+        let mut h = TestHarness::boot_with_size(120, 30);
+        h.run_slash_command("budget", "");
+        let frame = h.snapshot();
+        assert!(frame.contains("Turn budget"), "{frame}");
+        assert!(!frame.contains("unknown command"), "{frame}");
+
+        let mut h = TestHarness::boot_with_size(120, 30);
+        h.run_slash_command("zzz-no-such-command", "");
+        let frame = h.snapshot();
+        assert!(frame.contains("unknown command: /zzz-no-such-command"), "{frame}");
+    }
 }
 
 /// Build the /stats session receipt string.
@@ -1400,6 +1607,13 @@ pub(super) fn handle_streaming_command(
             CommandAction::None
         }
         "quit" | "exit" => CommandAction::Quit,
+        "clients" => CommandAction::Clients,
+        // Mid-turn rules live with the rows (settings::mid_turn_refusal,
+        // helpers::apply_setting's next-turn notice).
+        "settings" => CommandAction::OpenSettings,
+        "takeover" => CommandAction::TakeOver,
+        // Read-only list + pin/close on OTHER sessions: safe mid-turn.
+        "sessions" => CommandAction::OpenSessions,
         "attachments" => {
             let summaries = app.pending_attachments.summaries();
             if summaries.is_empty() {
@@ -1437,7 +1651,59 @@ pub(super) fn handle_streaming_command(
             }
             CommandAction::None
         }
+        "watch" => {
+            let arg = full_input[1..]
+                .split_once(' ')
+                .map(|x| x.1)
+                .unwrap_or("");
+            super::watch::command(app, arg, std::time::Instant::now());
+            CommandAction::None
+        }
         _ => CommandAction::None, // unknown — handled by caller as steer/queue
+    }
+}
+
+/// What a line typed mid-turn resolves to (the `StreamingInput` arm).
+pub(super) enum StreamingSlash {
+    /// A streaming command ran; the caller performs its `CommandAction`
+    /// (`None` when it finished in place, e.g. `/theme`).
+    Ran(CommandAction),
+    /// A known command that can't run mid-turn: the refusal notice is
+    /// already in the transcript; nothing is sent to the model.
+    Refused,
+    /// Plain text or unknown slash text: send it as a steer.
+    Steer,
+}
+
+/// Resolve input typed while a turn streams. Known slash commands never
+/// leak into the stream as steering text: they run (the streaming set) or
+/// are refused with a notice.
+pub(super) fn resolve_streaming_input(
+    input: &str,
+    app: &mut App,
+    registry: &synaps_cli::skills::registry::CommandRegistry,
+) -> StreamingSlash {
+    let Some(rest) = input.strip_prefix('/') else {
+        return StreamingSlash::Steer;
+    };
+    let raw_cmd = rest.split_whitespace().next().unwrap_or("");
+    let streaming_cmds = to_owned_commands(STREAMING_COMMANDS);
+    let cmd = resolve_prefix(raw_cmd, &streaming_cmds);
+    match handle_streaming_command(&cmd, input, app) {
+        CommandAction::None if !is_streaming_command(&cmd) => {
+            let all_cmds = all_commands_with_skills(registry);
+            let resolved_full = resolve_prefix(raw_cmd, &all_cmds);
+            if all_cmds.iter().any(|c| c == &resolved_full) {
+                app.push_msg(super::app::ChatMessage::System(format!(
+                    "/{} can't run while streaming — press Esc to cancel first",
+                    resolved_full
+                )));
+                StreamingSlash::Refused
+            } else {
+                StreamingSlash::Steer
+            }
+        }
+        action => StreamingSlash::Ran(action),
     }
 }
 
@@ -1568,6 +1834,279 @@ mod tests {
                 assert_eq!(arg, "strict");
             }
             _ => panic!("expected plugin command action"),
+        }
+    }
+
+    /// `/close` is the session's to run (it ends it): the TUI forwards it
+    /// as the `close` engine command, shows the reply, and the loop then
+    /// meets the session's `Ended` (which `stream_handler` records for the
+    /// exit line). A refusal is shown as an error and nothing ends.
+    #[tokio::test]
+    async fn close_is_sent_to_the_session_which_then_ends() {
+        let mut app = crate::tui::app::App::new(synaps_cli::Session::new("test", "medium", None));
+        let mut link = scripted_link(synaps_cli::Runtime::new().await.unwrap());
+        let system_prompt_path = PathBuf::from("/tmp/synaps-test-system-prompt");
+        let registry = Arc::new(CommandRegistry::new_with_plugins(&[], vec![], vec![]));
+        let keybinds = synaps_cli::skills::keybinds::KeybindRegistry::new();
+
+        let action =
+            handle_command("close", "later", &mut app, &mut link, &system_prompt_path, &registry, &keybinds)
+                .await;
+        assert!(matches!(action, CommandAction::None));
+        assert!(app.transcript.messages().iter().any(|m| matches!(
+            &m.msg,
+            crate::tui::app::ChatMessage::Error(s) if s == "usage: /close [force]"
+        )));
+
+        let action =
+            handle_command("close", "", &mut app, &mut link, &system_prompt_path, &registry, &keybinds).await;
+        assert!(matches!(action, CommandAction::None), "the session ends it, not the TUI");
+        assert!(app.transcript.messages().iter().any(|m| matches!(
+            &m.msg,
+            crate::tui::app::ChatMessage::System(s)
+                if s.starts_with("closing session ") && s.contains("--attach --continue")
+        )));
+        let env = link.next_event().await.expect("the session's end");
+        assert!(matches!(
+            env.event,
+            agent_engine::session::SessionEventWire::Ended {
+                reason: agent_engine::session::EndReason::ClientQuit
+            }
+        ));
+        assert!(synaps_cli::skills::BUILTIN_COMMANDS.contains(&"close"));
+    }
+
+    /// `/pin on|off` is the session's pin: the TUI sends `KeepWarm` and the
+    /// session's notice follows; `/pin` asks the session for its state;
+    /// `/keep-warm` is the same command, never the prompt-cache `/keepwarm`.
+    #[tokio::test]
+    async fn pin_sends_keep_warm_to_a_daemon_session_and_reports_its_state() {
+        let transport = crate::tui::testing::scripted::ScriptedTransport::new(synaps_cli::Runtime::new().await.unwrap())
+            .with_daemon_pid(4242);
+        let log = Arc::clone(&transport.log);
+        let mut link = crate::tui::session_link::SessionLink::new(Box::new(transport));
+        let mut app = crate::tui::app::App::new(synaps_cli::Session::new("test", "medium", None));
+        let system_prompt_path = PathBuf::from("/tmp/synaps-test-system-prompt");
+        let registry = Arc::new(CommandRegistry::new_with_plugins(&[], vec![], vec![]));
+        let keybinds = synaps_cli::skills::keybinds::KeybindRegistry::new();
+        let has_system = |app: &crate::tui::app::App, want: &str| {
+            app.transcript.messages().iter().any(|m| matches!(&m.msg, ChatMessage::System(s) if s.starts_with(want)))
+        };
+
+        handle_command("pin", "on", &mut app, &mut link, &system_prompt_path, &registry, &keybinds).await;
+        let sent = log.lock().unwrap().sent.clone();
+        assert!(sent.iter().any(|c| c == "KeepWarm { on: true }"), "{sent:?}");
+        let env = link.next_event().await.expect("the session's notice");
+        assert!(
+            matches!(env.event, agent_engine::session::SessionEventWire::SystemNotice(ref n) if n.starts_with("pinned:")),
+            "{:?}",
+            env.event
+        );
+        handle_command("pin", "", &mut app, &mut link, &system_prompt_path, &registry, &keybinds).await;
+        assert!(has_system(&app, "pinned: this session stays loaded"));
+
+        handle_command("keep-warm", "off", &mut app, &mut link, &system_prompt_path, &registry, &keybinds).await;
+        let sent = log.lock().unwrap().sent.clone();
+        assert!(sent.iter().any(|c| c == "KeepWarm { on: false }"), "{sent:?}");
+        let env = link.next_event().await.expect("the session's notice");
+        assert!(matches!(env.event, agent_engine::session::SessionEventWire::SystemNotice(ref n) if n.starts_with("unpinned")));
+        handle_command("pin", "status", &mut app, &mut link, &system_prompt_path, &registry, &keybinds).await;
+        assert!(has_system(&app, "not pinned"));
+
+        handle_command("pin", "maybe", &mut app, &mut link, &system_prompt_path, &registry, &keybinds).await;
+        assert!(app.transcript.messages().iter().any(|m| matches!(
+            &m.msg,
+            ChatMessage::Error(s) if s == "usage: /pin [on|off|status]"
+        )));
+        for name in ["pin", "keep-warm", "keepwarm"] {
+            assert!(synaps_cli::skills::BUILTIN_COMMANDS.contains(&name), "{name}");
+        }
+        let all = super::to_owned_commands(synaps_cli::skills::BUILTIN_COMMANDS);
+        assert_eq!(resolve_prefix("keep-warm", &all), "keep-warm", "never the prompt-cache /keepwarm");
+        assert_eq!(resolve_prefix("pin", &all), "pin", "not /ping");
+    }
+
+    /// `/clients` lists the roster by name, marks the owner and this
+    /// client, tells drivers from observers, and sends nothing. Mid-stream
+    /// it is a `CommandAction`; in-process it says there's one client.
+    #[tokio::test]
+    async fn clients_lists_the_roster_by_name_and_sends_nothing() {
+        use agent_engine::session::{AttachMode, ClientId, ClientInfo, ClientKind};
+        let info = |id: u64, name: &str, kind: ClientKind, mode: AttachMode| ClientInfo {
+            id: ClientId(id),
+            name: name.to_string(),
+            kind,
+            mode,
+            attached_at_ms: 0,
+        };
+        let transport = crate::tui::testing::scripted::ScriptedTransport::new(synaps_cli::Runtime::new().await.unwrap())
+            .with_daemon_pid(4242)
+            .with_roster(vec![
+                info(1, "terminal", ClientKind::Tui, AttachMode::Mirror),
+                info(2, "dashboard", ClientKind::Attach, AttachMode::Observe),
+            ]);
+        let log = Arc::clone(&transport.log);
+        let mut link = crate::tui::session_link::SessionLink::new(Box::new(transport));
+        let mut app = crate::tui::app::App::new(synaps_cli::Session::new("test", "medium", None));
+        let system_prompt_path = PathBuf::from("/tmp/synaps-test-system-prompt");
+        let registry = Arc::new(CommandRegistry::new_with_plugins(&[], vec![], vec![]));
+        let keybinds = synaps_cli::skills::keybinds::KeybindRegistry::new();
+
+        let action = handle_command("clients", "", &mut app, &mut link, &system_prompt_path, &registry, &keybinds).await;
+        assert!(matches!(action, CommandAction::None));
+        let listing = app
+            .transcript
+            .messages()
+            .iter()
+            .find_map(|m| match &m.msg {
+                ChatMessage::System(s) if s.starts_with("2 clients attached") => Some(s.clone()),
+                _ => None,
+            })
+            .expect("the listing");
+        let rows: Vec<&str> = listing.lines().skip(1).collect();
+        assert_eq!(rows.len(), 2, "{listing}");
+        assert!(rows[0].contains("terminal (#1)") && rows[0].contains("drive"), "{listing}");
+        assert!(rows[0].contains("owns input") && rows[0].contains("you"), "{listing}");
+        assert!(rows[1].contains("dashboard (#2)") && rows[1].contains("observe"), "{listing}");
+        assert!(!rows[1].contains("you") && !rows[1].contains("owns input"), "{listing}");
+        assert!(log.lock().unwrap().sent.is_empty(), "nothing reaches the session");
+
+        // Mid-stream: the dispatcher runs it with the link.
+        assert!(super::STREAMING_COMMANDS.contains(&"clients"));
+        assert!(matches!(super::handle_streaming_command("clients", "/clients", &mut app), CommandAction::Clients));
+        assert!(synaps_cli::skills::BUILTIN_COMMANDS.contains(&"clients"));
+
+        // In-process: one client, no roster to show.
+        let transport = crate::tui::testing::scripted::ScriptedTransport::new(synaps_cli::Runtime::new().await.unwrap());
+        let link = crate::tui::session_link::SessionLink::new(Box::new(transport));
+        super::clients(&mut app, &link);
+        assert!(app.transcript.messages().iter().any(|m| matches!(&m.msg, ChatMessage::System(s) if s == super::CLIENTS_IN_PROCESS)));
+    }
+
+    /// In-process the session ends with the TUI, so there is nothing to pin.
+    #[tokio::test]
+    async fn pin_in_process_says_it_only_applies_to_a_daemon_session() {
+        let transport = crate::tui::testing::scripted::ScriptedTransport::new(synaps_cli::Runtime::new().await.unwrap());
+        let log = Arc::clone(&transport.log);
+        let mut link = crate::tui::session_link::SessionLink::new(Box::new(transport));
+        let mut app = crate::tui::app::App::new(synaps_cli::Session::new("test", "medium", None));
+        let system_prompt_path = PathBuf::from("/tmp/synaps-test-system-prompt");
+        let registry = Arc::new(CommandRegistry::new_with_plugins(&[], vec![], vec![]));
+        let keybinds = synaps_cli::skills::keybinds::KeybindRegistry::new();
+
+        for arg in ["", "on"] {
+            let action =
+                handle_command("pin", arg, &mut app, &mut link, &system_prompt_path, &registry, &keybinds).await;
+            assert!(matches!(action, CommandAction::None));
+        }
+        let said = app
+            .transcript
+            .messages()
+            .iter()
+            .filter(|m| matches!(&m.msg, ChatMessage::System(s) if s == super::PIN_IN_PROCESS))
+            .count();
+        assert_eq!(said, 2);
+        assert!(log.lock().unwrap().sent.is_empty(), "nothing reaches the session");
+    }
+
+    /// `/takeover` from a read-only client sends `TakeInput`; the session's
+    /// `InputOwnerChanged` makes this client the owner. Nothing is sent
+    /// in-process, from an observer or by the owner, and each says why.
+    #[tokio::test]
+    async fn takeover_takes_input_from_another_client_and_says_why_when_it_cannot() {
+        use agent_engine::session::{AttachMode, ClientId, SessionEventWire};
+        let system_prompt_path = PathBuf::from("/tmp/synaps-test-system-prompt");
+        let registry = Arc::new(CommandRegistry::new_with_plugins(&[], vec![], vec![]));
+        let keybinds = synaps_cli::skills::keybinds::KeybindRegistry::new();
+        let scripted = || async {
+            crate::tui::testing::scripted::ScriptedTransport::new(synaps_cli::Runtime::new().await.unwrap())
+        };
+
+        // Read-only mirror, client #7 owns input: takes it.
+        let transport = scripted().await.with_daemon_pid(4242).with_ownership(AttachMode::Mirror, Some(ClientId(7)));
+        let log = Arc::clone(&transport.log);
+        let mut link = crate::tui::session_link::SessionLink::new(Box::new(transport));
+        let mut app = crate::tui::app::App::new(synaps_cli::Session::new("test", "medium", None));
+        let action =
+            handle_command("takeover", "", &mut app, &mut link, &system_prompt_path, &registry, &keybinds).await;
+        assert!(matches!(action, CommandAction::None));
+        assert_eq!(log.lock().unwrap().sent, vec!["TakeInput".to_string()]);
+        let env = link.next_event().await.expect("the owner change");
+        assert!(
+            matches!(
+                env.event,
+                SessionEventWire::InputOwnerChanged { from: Some(ClientId(7)), to: Some(ClientId(1)), .. }
+            ),
+            "{:?}",
+            env.event
+        );
+        assert_eq!(link.transport().input_owner(), Some(ClientId(1)));
+
+        // Now the owner: nothing to send.
+        handle_command("takeover", "", &mut app, &mut link, &system_prompt_path, &registry, &keybinds).await;
+        assert_eq!(log.lock().unwrap().sent.len(), 1, "the owner sends nothing");
+
+        let says = |app: &crate::tui::app::App, want: &str| {
+            app.transcript.messages().iter().any(|m| matches!(&m.msg, ChatMessage::System(s) if s == want))
+        };
+        assert!(says(&app, super::TAKEOVER_ALREADY));
+
+        // In-process and observing: a note, nothing sent.
+        for (transport, note) in [
+            (scripted().await.with_ownership(AttachMode::Mirror, Some(ClientId(7))), super::TAKEOVER_IN_PROCESS),
+            (
+                scripted().await.with_daemon_pid(4242).with_ownership(AttachMode::Observe, Some(ClientId(7))),
+                super::TAKEOVER_OBSERVING,
+            ),
+        ] {
+            let log = Arc::clone(&transport.log);
+            let mut link = crate::tui::session_link::SessionLink::new(Box::new(transport));
+            let mut app = crate::tui::app::App::new(synaps_cli::Session::new("test", "medium", None));
+            handle_command("takeover", "", &mut app, &mut link, &system_prompt_path, &registry, &keybinds).await;
+            assert!(says(&app, note), "{note}");
+            assert!(log.lock().unwrap().sent.is_empty(), "{note}: nothing reaches the session");
+        }
+        assert!(synaps_cli::skills::BUILTIN_COMMANDS.contains(&"takeover"));
+    }
+
+    /// With `client_input = shared` every client already types: `/takeover`
+    /// only makes this one the active client, and says so (no toast comes).
+    #[tokio::test]
+    async fn takeover_with_shared_input_says_it_only_moves_the_active_client() {
+        use agent_engine::session::{AttachMode, ClientId, ClientInput};
+        let system_prompt_path = PathBuf::from("/tmp/synaps-test-system-prompt");
+        let registry = Arc::new(CommandRegistry::new_with_plugins(&[], vec![], vec![]));
+        let keybinds = synaps_cli::skills::keybinds::KeybindRegistry::new();
+        let transport = crate::tui::testing::scripted::ScriptedTransport::new(synaps_cli::Runtime::new().await.unwrap())
+            .with_daemon_pid(4242)
+            .with_ownership(AttachMode::Mirror, Some(ClientId(7)))
+            .with_client_input(ClientInput::Shared);
+        let log = Arc::clone(&transport.log);
+        let mut link = crate::tui::session_link::SessionLink::new(Box::new(transport));
+        assert!(crate::tui::session_link::may_drive(link.transport()), "shared: a non-active mirror drives");
+        let mut app = crate::tui::app::App::new(synaps_cli::Session::new("test", "medium", None));
+        let says = |app: &crate::tui::app::App, want: &str| {
+            app.transcript.messages().iter().any(|m| matches!(&m.msg, ChatMessage::System(s) if s == want))
+        };
+        handle_command("takeover", "", &mut app, &mut link, &system_prompt_path, &registry, &keybinds).await;
+        assert_eq!(log.lock().unwrap().sent, vec!["TakeInput".to_string()]);
+        assert!(says(&app, super::TAKEOVER_SHARED));
+        link.next_event().await.expect("the active marker moves");
+        handle_command("takeover", "", &mut app, &mut link, &system_prompt_path, &registry, &keybinds).await;
+        assert_eq!(log.lock().unwrap().sent.len(), 1, "already active: nothing sent");
+        assert!(says(&app, super::TAKEOVER_SHARED_ALREADY));
+    }
+
+    /// Mid-stream `/takeover` runs (it never steers): the dispatcher gets
+    /// `TakeOver` and sends it over the link.
+    #[tokio::test]
+    async fn takeover_runs_mid_stream() {
+        let registry = CommandRegistry::new_with_plugins(&[], vec![], vec![]);
+        let mut app = crate::tui::app::App::new(synaps_cli::Session::new("test", "medium", None));
+        app.streaming = true;
+        for typed in ["/takeover", "/tak"] {
+            let r = super::resolve_streaming_input(typed, &mut app, &registry);
+            assert!(matches!(r, super::StreamingSlash::Ran(CommandAction::TakeOver)), "{typed}");
         }
     }
 
@@ -2403,11 +2942,15 @@ mod streaming_command_tests {
     #[test]
     fn theme_and_friends_are_streaming_commands() {
         let cmds = to_owned_commands(STREAMING_COMMANDS);
-        for typed in ["theme", "th", "attachments", "detach", "quit", "gamba"] {
+        for typed in [
+            "theme", "th", "attachments", "detach", "quit", "gamba", "watch", "settings",
+            "takeover",
+            "sessions",
+        ] {
             let cmd = resolve_prefix(typed, &cmds);
             assert!(is_streaming_command(&cmd), "/{typed} runs mid-stream");
         }
-        for typed in ["settings", "model", "compact"] {
+        for typed in ["model", "compact", "effort"] {
             let cmd = resolve_prefix(typed, &cmds);
             assert!(
                 !is_streaming_command(&cmd),

@@ -19,23 +19,19 @@ pub fn export(q: LegacyExport, target_project: &str) -> Result<Value> {
     // immutable=1 avoids even SHM creation/write on an operator's source. Never
     // ignore uncheckpointed WAL: require operator to stop writer and checkpoint.
     for suffix in ["-wal", "-journal"] {
-        let path = PathBuf::from(format!(
-            "{}{suffix}",
-            private.path.to_str().ok_or(Error::UnsafePath)?
-        ));
-        match std::fs::metadata(path) {
+        match private.open(suffix).and_then(|file| file.metadata()) {
             Ok(m) if m.len() > 0 => return Err(Error::Unsupported),
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(_) => return Err(Error::Storage),
         }
     }
-    let before = std::fs::metadata(&private.path)?;
+    let mut file = private.open("")?;
+    let before = file.metadata()?;
     use sha2::{Digest, Sha256};
     use std::io::Read;
     let mut source_hash = Sha256::new();
     source_hash.update(before.len().to_be_bytes());
-    let mut file = std::fs::File::open(&private.path)?;
     let mut buffer = [0u8; 65536];
     loop {
         let n = file.read(&mut buffer)?;
@@ -81,7 +77,7 @@ pub fn export(q: LegacyExport, target_project: &str) -> Result<Value> {
             crate::retention::Export { full: true },
         )?;
         inventory["source_digest"] = json!(source_digest);
-        let after = std::fs::metadata(&private.path)?;
+        let after = private.open("")?.metadata()?;
         if before.ino() != after.ino()
             || before.len() != after.len()
             || before.mtime() != after.mtime()
@@ -193,7 +189,7 @@ pub fn export(q: LegacyExport, target_project: &str) -> Result<Value> {
     if tombstones.iter().any(|id| !valid_id(id)) {
         return Err(Error::Unsupported);
     }
-    let after = std::fs::metadata(&private.path)?;
+    let after = private.open("")?.metadata()?;
     if before.ino() != after.ino()
         || before.len() != after.len()
         || before.mtime() != after.mtime()

@@ -86,7 +86,7 @@ async fn wait_stream_retry(
     if !suppress_stream_deltas {
         let _ = tx.send(StreamEvent::Llm(LlmEvent::ResponseReset));
     }
-    let _ = tx.send(StreamEvent::Session(SessionEvent::Notice(format!(
+    let _ = tx.send(StreamEvent::Session(SessionEvent::Retry(format!(
         "Response incomplete — retrying response ({retry}/{max_retries}); incomplete output discarded, no tools replayed."
     ))));
     tokio::select! {
@@ -97,6 +97,20 @@ async fn wait_stream_retry(
 }
 
 pub(crate) const STREAM_INTERRUPTED: &str = "openai request failed: connection interrupted before response completed (stream retry budget exhausted)";
+
+/// The endpoint one `send_with_retries` call talks to: its log label, the
+/// URL (for the localhost-refusal fast-fail) and whether its 429 responses
+/// carry Codex quota semantics worth probing. Static per call site; the
+/// retry budget and trace clock are threaded separately because they mutate.
+#[derive(Clone, Copy)]
+struct SendTarget<'a> {
+    label: &'a str,
+    url: &'a str,
+    /// Codex only: read a bounded slice of a 429 body to distinguish proven
+    /// quota exhaustion (fail fast → account failover) from a generic 429
+    /// (normal transport retry). Every other endpoint drops the body unread.
+    quota_probe: bool,
+}
 
 /// Send a provider streaming request, retrying transient failures.
 ///
@@ -118,14 +132,22 @@ pub(crate) const STREAM_INTERRUPTED: &str = "openai request failed: connection i
 /// re-send. Terminal failures emit their final record here; on success the
 /// caller finishes the attempt after consuming the stream.
 async fn send_with_retries(
-    label: &str,
-    url: &str,
+    target: SendTarget<'_>,
     build: impl Fn() -> reqwest::RequestBuilder,
     cancel: &tokio_util::sync::CancellationToken,
     max_retries: u32,
     retries_used: &mut u32,
     trace_attempt: &mut tr::StreamAttempt,
 ) -> Result<reqwest::Response, Box<dyn std::error::Error + Send + Sync>> {
+    use super::account_routing::{
+        classify_codex_429, read_body_for_classification, Codex429, CodexQuotaExhausted,
+        QUOTA_PROBE_BODY_CAP,
+    };
+    let SendTarget {
+        label,
+        url,
+        quota_probe,
+    } = target;
     loop {
         if cancel.is_cancelled() {
             return Err("request canceled".into());
@@ -148,14 +170,77 @@ async fn send_with_retries(
                 let status = resp.status();
                 // Provider-assigned request id from validated headers only.
                 let trace_rid = tr::provider_request_id_from_headers(resp.headers());
-                let retryable =
+                let mut retryable =
                     status.as_u16() == 408 || status.as_u16() == 429 || status.is_server_error();
-                // Privacy (spec §5.1): the response body is provider-controlled
-                // and may echo the full request (prompts, system text, tool
-                // schemas, credentials). Drop it unread — it must never be
-                // stored, surfaced, or logged at any level. `status` Display
-                // uses the canonical reason phrase, never server bytes.
-                drop(resp);
+                if quota_probe && status.as_u16() == 429 {
+                    // Codex only: a 429 that PROVES the account's usage
+                    // window is spent must not burn the transport retry
+                    // budget (minutes of backoff that cannot succeed). The
+                    // body is read into a bounded buffer purely to produce
+                    // the classification enum and is dropped unread beyond
+                    // that — never stored, surfaced, or logged.
+                    let headers = resp.headers().clone();
+                    let body = tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => {
+                            trace_attempt.finish_canceled(Some(429), None);
+                            return Err("request canceled".into());
+                        }
+                        body = read_body_for_classification(resp, QUOTA_PROBE_BODY_CAP) => body,
+                    };
+                    match classify_codex_429(&headers, &body) {
+                        Codex429::QuotaExhausted(evidence) => {
+                            tracing::warn!(
+                                signal = ?evidence.signal,
+                                reset_after_secs = ?evidence.reset_after_secs,
+                                "{label} 429 is provider-declared quota exhaustion (no transport retry)"
+                            );
+                            return Err(Box::new(CodexQuotaExhausted {
+                                evidence,
+                                request_id: trace_rid,
+                            }));
+                        }
+                        Codex429::UsageNotIncluded => {
+                            // Deterministic for this account: retrying never helps.
+                            tracing::warn!("{label} 429: account has no Codex usage entitlement");
+                            retryable = false;
+                        }
+                        Codex429::Generic => {}
+                    }
+                } else if quota_probe && !retryable && status.is_client_error() {
+                    // Codex only: a terminal 4xx is undiagnosable without its
+                    // body. Read a bounded slice for classification; keep only
+                    // identifier-shaped type/code/param plus Synaps-authored
+                    // text (codex_wire). Provider prose is never kept (§5.1).
+                    let body = tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => {
+                            trace_attempt.finish_canceled(Some(status.as_u16()), None);
+                            return Err("request canceled".into());
+                        }
+                        body = read_body_for_classification(resp, super::codex_wire::CODEX_ERROR_BODY_CAP) => body,
+                    };
+                    let detail = super::codex_wire::CodexHttpErrorDetail::from_body(&body);
+                    let message = detail.user_message(label, status);
+                    tracing::warn!(error = %message, "{label} request rejected (identifiers only)");
+                    trace_attempt.finish_failed(
+                        &detail.trace_code(status.as_u16()),
+                        Some(status.as_u16()),
+                        trace_rid,
+                    );
+                    return Err(Box::new(super::codex_wire::CodexRequestRejected {
+                        message,
+                        detail,
+                    }));
+                } else {
+                    // Privacy (spec §5.1): the response body is provider-controlled
+                    // and may echo the full request (prompts, system text, tool
+                    // schemas, credentials). Drop it unread — it must never be
+                    // stored, surfaced, or logged at any level. `status` Display
+                    // uses the canonical reason phrase, never server bytes. (The
+                    // Codex 4xx arm above reads it for identifiers only.)
+                    drop(resp);
+                }
                 let code = format!("http_{}", status.as_u16());
                 if !retryable || *retries_used >= max_retries {
                     trace_attempt.finish_failed(&code, Some(status.as_u16()), trace_rid);
@@ -533,6 +618,141 @@ pub(crate) async fn call_codex_stream_inner(
     max_retries: u32,
     trace: &crate::runtime::trace::TraceContext,
 ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+    // Account selection crosses the broker boundary through the router seam:
+    // the broker vends one (credential, access token) pair, never a refresh
+    // token, and this path never opens auth.json.
+    let router = super::account_routing::BrokerCodexRouter::new(std::sync::Arc::clone(broker));
+    call_codex_stream_with_router(
+        cfg,
+        client,
+        &router,
+        tools_schema,
+        system_prompt,
+        messages,
+        tx,
+        temperature,
+        max_tokens,
+        reasoning_level,
+        codex_request_role,
+        cancel,
+        max_retries,
+        trace,
+    )
+    .await
+}
+
+/// What the failover gate judges: the recognized exhaustion on the current
+/// attempt and the two runtime facts that can veto a switch. Built at each
+/// of the two detection sites (429 probe, in-stream terminal error) so both
+/// go through the identical invariant check.
+#[derive(Clone, Copy)]
+struct FailoverRequest<'a> {
+    evidence: &'a super::account_routing::CodexQuotaEvidence,
+    /// Any content-bearing model event reached the decoder on this attempt
+    /// (text, tool, reasoning — forwarded or not). Always false on the 429
+    /// path: no response body was streamed.
+    output_started: bool,
+    /// Account switches already spent on this logical request.
+    prior_failovers: u32,
+}
+
+/// Attempt a single bounded account failover after recognized quota
+/// exhaustion on `failed`. Always reports the exhaustion to the router
+/// (cooldown sink, best effort) — even when the runtime then refuses to
+/// switch — so the broker stops advertising the seat. Returns the new pinned
+/// account only when every runtime invariant holds: `Auto` selection, no
+/// output produced, budget unspent, a candidate the router deems fresh and
+/// eligible, and that candidate is a DIFFERENT account than the one that
+/// failed. Anything else → `Ok(None)` and the caller ends the turn with the
+/// static quota message. Never loops.
+async fn try_codex_account_failover(
+    router: &dyn super::account_routing::CodexAccountRouter,
+    model: &str,
+    failed: &super::account_routing::PinnedAccount,
+    request: FailoverRequest<'_>,
+    tx: &mpsc::UnboundedSender<StreamEvent>,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<Option<super::account_routing::PinnedAccount>, super::net::BoxedProviderError> {
+    use super::account_routing::failover_gate;
+    use crate::runtime::api::await_or_cancel;
+    let FailoverRequest {
+        evidence,
+        output_started,
+        prior_failovers,
+    } = request;
+    await_or_cancel(cancel, router.report_exhausted(failed, evidence))
+        .await
+        .map_err(|_| "request canceled")?;
+    if let Err(blocked) = failover_gate(failed.auto, output_started, prior_failovers) {
+        tracing::info!(
+            account = %failed.credential,
+            reason = blocked.as_str(),
+            "codex quota exhausted; account failover not permitted"
+        );
+        return Ok(None);
+    }
+    let candidate = await_or_cancel(
+        cancel,
+        router.failover(model, failed, evidence, prior_failovers),
+    )
+    .await
+    .map_err(|_| "request canceled")?;
+    match candidate {
+        Ok(Some(next)) if next.credential != failed.credential => {
+            tracing::warn!(
+                from = %failed.credential,
+                to = %next.credential,
+                "codex quota exhausted; switching account (one-time failover, no output replayed)"
+            );
+            let _ = tx.send(StreamEvent::Session(crate::SessionEvent::Notice(format!(
+                "Codex usage quota exhausted on account '{}' — switched to account '{}' (one-time failover; no output was replayed).",
+                failed.label(),
+                next.label()
+            ))));
+            Ok(Some(next))
+        }
+        Ok(Some(_same)) => {
+            tracing::warn!(
+                account = %failed.credential,
+                "codex failover candidate is the exhausted account itself; refusing to retry"
+            );
+            Ok(None)
+        }
+        Ok(None) => {
+            tracing::info!(
+                account = %failed.credential,
+                "codex quota exhausted; no distinct account with fresh capacity"
+            );
+            Ok(None)
+        }
+        Err(e) => {
+            tracing::warn!(
+                account = %failed.credential,
+                error = %e,
+                "codex failover candidate resolution failed; not retrying"
+            );
+            Ok(None)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn call_codex_stream_with_router(
+    cfg: &ProviderConfig,
+    client: &reqwest::Client,
+    router: &dyn super::account_routing::CodexAccountRouter,
+    tools_schema: &[Value],
+    system_prompt: &Option<String>,
+    messages: &[crate::SharedMessage],
+    tx: &mpsc::UnboundedSender<StreamEvent>,
+    temperature: Option<f32>,
+    max_tokens: Option<u32>,
+    reasoning_level: agent_core::reasoning::ReasoningLevel,
+    codex_request_role: crate::runtime::openai::catalog::CodexRequestRole,
+    cancel: &tokio_util::sync::CancellationToken,
+    max_retries: u32,
+    trace: &crate::runtime::trace::TraceContext,
+) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
     // Build the exact provider-qualified plan before any credential or network
     // access. Logical Ultra is lowered here, never in the generic level enum.
     use crate::runtime::openai::catalog::plan_codex_execution;
@@ -584,22 +804,33 @@ pub(crate) async fn call_codex_stream_inner(
         network_attempted = false,
         "Codex execution plan allowed"
     );
-    // Every Codex credential, local or remote, crosses the broker boundary:
-    // the broker vends an access token + expiry only (refresh tokens are
-    // broker-owned), and this path never opens auth.json.
-    let access = crate::runtime::api::await_or_cancel(
-        cancel,
-        broker.access_token(crate::auth::OAuthProviderId::OpenAiCodex),
-    )
-    .await
-    .map_err(|_| "request canceled")?
-    .map_err(|e| e.to_string())?
-    .token;
-    // Account id is provider-owned metadata carried inside the Codex JWT.
-    let account_id = crate::auth::extract_codex_account_id(&access)
-        .ok_or("Failed to extract ChatGPT account id from Codex token — run `synaps login --provider openai-codex`")?;
+    // Exactly one pinned (account, token) pair per attempt. The
+    // `chatgpt-account-id` header is derived from THIS token's JWT claims, so
+    // bearer and header always name the same credential — a second lookup
+    // could race a policy change and pair account A's header with account
+    // B's token.
+    let mut pinned = crate::runtime::api::await_or_cancel(cancel, router.pin(&cfg.model))
+        .await
+        .map_err(|_| "request canceled")??;
+    let mut account_id = codex_account_id_for(&pinned)?;
 
     let (tools, name_map) = translate::tools_to_responses(tools_schema);
+    // Opt-in OpenAI-hosted web search (SYNAPS_CODEX_WEB_SEARCH, read from THIS
+    // process's env — the daemon's when attached). Runs server-side, so hooks
+    // can't gate it; gated by role and model (codex_wire). The session actor
+    // announces the state; each call is announced by the decoder.
+    let mut tools = tools;
+    let web_search = super::codex_wire::codex_web_search_for_request(
+        &cfg.model,
+        codex_request_role,
+        super::codex_wire::engine_env,
+    );
+    // web_search is always the last tool. Cleared on the one resend without
+    // it, so that resend can't loop; the rejection is learned only if the
+    // resend then succeeds (`web_search_pending`).
+    let mut web_search_index = web_search.as_ref().map(|_| tools.len());
+    let mut web_search_pending = false;
+    tools.extend(web_search);
     // Codex already receives the effective system prompt in `instructions`.
     // Do not also prepend it to `input`: that doubles prompt tokens and repeats
     // context/checkpoint guidance. Pass history to the translator unchanged;
@@ -615,7 +846,7 @@ pub(crate) async fn call_codex_stream_inner(
     let prompt_cache_key = codex_prompt_cache_key(&instructions, input_items.first());
     insert_codex_multi_agent_mode(&mut input_items, &plan);
     let input = serde_json::Value::Array(input_items);
-    let body = build_codex_body(
+    let mut body = build_codex_body(
         &cfg.model,
         &plan,
         input,
@@ -636,8 +867,10 @@ pub(crate) async fn call_codex_stream_inner(
 
     // Serialize ONCE. These exact bytes are digested for the trace AND are
     // the request body of every attempt — retries resend the identical
-    // buffer, so one wire digest is honest for all attempt records.
-    let body_bytes = bytes::Bytes::from(serde_json::to_vec(&body)?);
+    // buffer, so one wire digest is honest for all attempt records. The one
+    // exception (hosted web_search rejected) re-serializes and opens a new
+    // trace record for the new bytes.
+    let mut body_bytes = bytes::Bytes::from(serde_json::to_vec(&body)?);
     // ═══ TRACE (Task 10A): one record per actual attempt ═══════════════════
     let tracer = tr::begin_openai_tracer(
         trace,
@@ -660,20 +893,30 @@ pub(crate) async fn call_codex_stream_inner(
     if let Some(tracer) = &tracer {
         tr::capture_request_content(trace, tracer.request_id(), body_bytes.as_ref(), messages);
     }
+    // Whether this request holds a tracer (and, on a `/trace next` context,
+    // the one-shot gate): only then may a web_search resend reopen it.
+    let traced = tracer.is_some();
     let mut attempt = tr::StreamAttempt::new(tracer);
     let mut stream_retry = 0u32;
+    // Account switches spent on this logical request. Bounded by
+    // `MAX_CODEX_ACCOUNT_FAILOVERS`; independent of the transport retry
+    // budget (a failover neither consumes nor resets `stream_retry`).
+    let mut failovers = 0u32;
 
     loop {
         if cancel.is_cancelled() {
             return Err("request canceled".into());
         }
-        let resp = send_with_retries(
-            "codex",
-            &url,
+        let sent = send_with_retries(
+            SendTarget {
+                label: "codex",
+                url: &url,
+                quota_probe: true,
+            },
             || {
                 client
                     .post(&url)
-                    .bearer_auth(&access)
+                    .bearer_auth(&pinned.token)
                     .header("chatgpt-account-id", account_id.as_str())
                     .header("originator", "synaps")
                     .header("OpenAI-Beta", "responses=experimental")
@@ -693,7 +936,89 @@ pub(crate) async fn call_codex_stream_inner(
             &mut stream_retry,
             &mut attempt,
         )
-        .await?;
+        .await;
+        let resp = match sent {
+            Ok(resp) => {
+                if std::mem::take(&mut web_search_pending) {
+                    super::codex_wire::confirm_web_search_rejected(&cfg.model, tx);
+                }
+                resp
+            }
+            Err(error) => match error.downcast::<super::account_routing::CodexQuotaExhausted>() {
+                // A 429 that proved exhaustion arrives before any response
+                // body was streamed: nothing was produced on this attempt, so
+                // the pre-output invariant holds by construction.
+                Ok(quota) => {
+                    match try_codex_account_failover(
+                        router,
+                        &cfg.model,
+                        &pinned,
+                        FailoverRequest {
+                            evidence: &quota.evidence,
+                            output_started: false,
+                            prior_failovers: failovers,
+                        },
+                        tx,
+                        cancel,
+                    )
+                    .await?
+                    {
+                        Some(next) => {
+                            attempt.attempt_failed(
+                                crate::runtime::trace::RetryClass::RateLimited,
+                                std::time::Duration::ZERO,
+                                Some(429),
+                                quota.request_id.clone(),
+                                "account_failover",
+                            );
+                            account_id = codex_account_id_for(&next)?;
+                            pinned = next;
+                            failovers += 1;
+                            attempt.restart_clock();
+                            continue;
+                        }
+                        None => {
+                            let message = quota.to_string();
+                            attempt.finish_failed("quota_exhausted", Some(429), quota.request_id);
+                            return Err(message.into());
+                        }
+                    }
+                }
+                Err(other) => {
+                    // A pre-inference 400 pointing at hosted web_search: drop
+                    // it, re-serialize, and resend once under a fresh trace
+                    // record (one-shot `/trace next` gates are reopened for
+                    // it; content capture is not redone).
+                    super::codex_wire::hosted_search_retry(
+                        other,
+                        &mut web_search_index,
+                        &cfg.model,
+                    )?;
+                    web_search_pending = true;
+                    super::codex_wire::strip_web_search_tool(&mut body);
+                    body_bytes = bytes::Bytes::from(serde_json::to_vec(&body)?);
+                    if traced {
+                        trace.reopen_one_shot_for_resend();
+                    }
+                    attempt = tr::StreamAttempt::new(
+                        tr::begin_openai_tracer(
+                            trace,
+                            &cfg.provider,
+                            &cfg.model,
+                            crate::runtime::trace::TransportKind::OpenAiResponses,
+                            &url,
+                            Some(body_bytes.as_ref()),
+                            messages,
+                            system_prompt.as_deref(),
+                            tools_schema,
+                            tr::renamed_tool_losses(&name_map),
+                        )
+                        .await,
+                    );
+                    continue;
+                }
+            },
+        };
         // Direct HTTP: upstream status and provider request id are observed.
         let http_status = Some(resp.status().as_u16());
         let trace_rid = tr::provider_request_id_from_headers(resp.headers());
@@ -766,6 +1091,51 @@ pub(crate) async fn call_codex_stream_inner(
             attempt.mark_first_model_event();
         }
         if let Err(failure) = parser.terminal_result() {
+            if failure.code == "responses_quota" {
+                // In-stream quota exhaustion (HTTP 200 + terminal quota
+                // error). Failover only if the model produced nothing on this
+                // attempt — text, tool, reasoning or any content-bearing
+                // event makes the failure terminal (no cross-account replay).
+                let output_started =
+                    !accumulated_text.is_empty() || parser.model_produced_output();
+                let evidence = super::account_routing::CodexQuotaEvidence {
+                    signal: super::account_routing::QuotaSignal::StreamQuotaEvent,
+                    reset_after_secs: None,
+                };
+                match try_codex_account_failover(
+                    router,
+                    &cfg.model,
+                    &pinned,
+                    FailoverRequest {
+                        evidence: &evidence,
+                        output_started,
+                        prior_failovers: failovers,
+                    },
+                    tx,
+                    cancel,
+                )
+                .await?
+                {
+                    Some(next) => {
+                        attempt.attempt_failed(
+                            crate::runtime::trace::RetryClass::RateLimited,
+                            std::time::Duration::ZERO,
+                            http_status,
+                            trace_rid,
+                            "account_failover",
+                        );
+                        account_id = codex_account_id_for(&next)?;
+                        pinned = next;
+                        failovers += 1;
+                        attempt.restart_clock();
+                        continue;
+                    }
+                    None => {
+                        attempt.finish_failed(failure.code, http_status, trace_rid);
+                        return Err(failure.message.into());
+                    }
+                }
+            }
             if failure.code == "responses_empty" && stream_retry < max_retries {
                 stream_retry += 1;
                 let delay = retry_delay(stream_retry);
@@ -806,6 +1176,18 @@ pub(crate) async fn call_codex_stream_inner(
             "content": content,
         }));
     }
+}
+
+/// The `chatgpt-account-id` header value for a pinned account: provider-owned
+/// metadata carried inside THAT token's JWT. Deriving it from the same bearer
+/// the request will present is what keeps header and token paired.
+fn codex_account_id_for(
+    pinned: &super::account_routing::PinnedAccount,
+) -> Result<String, super::net::BoxedProviderError> {
+    crate::auth::extract_codex_account_id(&pinned.token)
+        .ok_or_else(|| {
+            "Failed to extract ChatGPT account id from Codex token — run `synaps login --provider openai-codex`".into()
+        })
 }
 
 /// Stable prompt-cache routing key for this conversation.
@@ -889,6 +1271,26 @@ const CODEX_MULTI_AGENT_MODE_CLOSE: &str = "</multi_agent_mode>";
 const CODEX_EXPLICIT_REQUEST_ONLY_TEXT: &str = "Do not spawn sub-agents unless the user or applicable AGENTS.md/skill instructions explicitly ask for sub-agents, delegation, or parallel agent work.";
 const CODEX_PROACTIVE_MULTI_AGENT_TEXT: &str = "Proactive multi-agent delegation is active. Any earlier instruction requiring an explicit user request before spawning sub-agents no longer applies. Use sub-agents when parallel work would materially improve speed or quality. This mode remains active until a later multi-agent mode developer message changes it.";
 
+/// Environment switch for the OpenAI-hosted `web_search` tool on Codex
+/// Responses requests.
+pub(crate) const CODEX_WEB_SEARCH_ENV: &str = "SYNAPS_CODEX_WEB_SEARCH";
+
+/// Map the `SYNAPS_CODEX_WEB_SEARCH` value to the hosted tool spec:
+/// - `live` / `on` / `true` / `1` → `{"type":"web_search"}` (live web access)
+/// - `cached` → `{"type":"web_search","external_web_access":false}`
+/// - anything else (unset, `off`, typos) → no hosted tool.
+///
+/// The hosted tool's `web_search_call` output items are not function calls:
+/// they never become tool uses; each completed one is announced as a notice
+/// with its query (`codex_wire::announce_web_search_call`).
+pub(crate) fn codex_web_search_tool(value: Option<&str>) -> Option<Value> {
+    match value.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+        Some("live" | "on" | "true" | "1" | "yes") => Some(json!({ "type": "web_search" })),
+        Some("cached") => Some(json!({ "type": "web_search", "external_web_access": false })),
+        _ => None,
+    }
+}
+
 fn codex_multi_agent_mode_item(
     plan: &crate::runtime::openai::catalog::CodexExecutionPlan,
 ) -> Option<Value> {
@@ -959,6 +1361,40 @@ fn codex_instructions(system_prompt: &Option<String>) -> String {
 }
 
 fn codex_input_messages(messages: Vec<ChatMessage>) -> Vec<Value> {
+    responses_input_messages(messages, false)
+}
+
+/// Meta Muse input: like [`codex_input_messages`], but replayed assistant
+/// text carries the Codex-style message `phase` Muse itself emits.
+///
+/// Muse labels a preamble before tool calls `phase:"commentary"` and a
+/// turn-ending answer `phase:"final_answer"` (or no phase). Replaying every
+/// past assistant message as a phase-less string taught the model that its
+/// "final answers" go on to call tools, and it then ended live turns on a
+/// bare preamble (A/B replay of the failing history: 2/16 runs reproduced
+/// with phase-less replay, 0/16 with phase restored).
+///
+/// Session storage keeps no phase, so it is inferred from structure, which
+/// matches what Muse emits: `messages_to_oai` folds an assistant turn's text
+/// into ONE message that also carries the turn's calls, so text on a message
+/// WITH tool calls is commentary, text on a message without them is the
+/// final answer. Tool-only messages and the whitespace separator
+/// `messages_to_oai` inserts between tool results and plain user text are
+/// harness wire artefacts, not model text: they keep the legacy shape.
+fn muse_input_messages(messages: Vec<ChatMessage>) -> Vec<Value> {
+    responses_input_messages(messages, true)
+}
+
+/// Wire phase Muse uses for a replayed assistant message's text.
+fn muse_assistant_phase(has_tool_calls: bool) -> &'static str {
+    if has_tool_calls {
+        "commentary"
+    } else {
+        "final_answer"
+    }
+}
+
+fn responses_input_messages(messages: Vec<ChatMessage>, assistant_phase: bool) -> Vec<Value> {
     let mut out = Vec::new();
     for msg in messages {
         if msg.role == "tool" {
@@ -976,7 +1412,22 @@ fn codex_input_messages(messages: Vec<ChatMessage>) -> Vec<Value> {
         // A mixed assistant message carries BOTH text and calls. Emit its
         // text first rather than continuing after the calls and losing it.
         // Text-only messages retain the existing string wire representation.
-        if msg.content_parts.is_some() || msg.content.is_some() || msg.tool_calls.is_none() {
+        let phased_text =
+            if assistant_phase && msg.role == "assistant" && msg.content_parts.is_none() {
+                msg.content
+                    .as_deref()
+                    .filter(|text| !text.trim().is_empty())
+            } else {
+                None
+            };
+        if let Some(text) = phased_text {
+            out.push(json!({
+                "type": "message",
+                "role": "assistant",
+                "phase": muse_assistant_phase(msg.tool_calls.as_ref().is_some_and(|c| !c.is_empty())),
+                "content": [{"type": "output_text", "text": text}],
+            }));
+        } else if msg.content_parts.is_some() || msg.content.is_some() || msg.tool_calls.is_none() {
             let content = if let Some(parts) = msg.content_parts {
                 Value::Array(parts.into_iter().map(|part| match part {
                     ChatContentPart::Text { text } => json!({
@@ -1096,9 +1547,29 @@ struct CodexSseDecoder {
     terminal_success: bool,
     terminal_failure: Option<ResponsesStreamFailure>,
     emitted_output: bool,
+    /// The model produced ANY content on this attempt — including events the
+    /// decoder does not forward to the UI (reasoning / reasoning-summary
+    /// deltas, output items, content parts). Replaying such a request on a
+    /// second account would double-spend, so account failover keys on this,
+    /// not merely on what reached the UI. Metadata-only events
+    /// (`response.created`, `response.in_progress`) never set it.
+    saw_content_output: bool,
     /// Trace (Task 10A): provider-reported usage from `response.completed`
     /// (input including cached, output, cached slice). `None` until observed.
     observed_usage: Option<(u64, u64, u64)>,
+    /// `phase` of the most recent `message` output item (`None` when that
+    /// item had no phase, or no message item was seen). Muse marks an
+    /// unfinished preamble `commentary`; see [`muse_dangling_preamble`].
+    last_message_phase: Option<String>,
+    /// `output_index` of the most recent `message` output item.
+    last_message_index: Option<usize>,
+    /// Text streamed via `output_text.delta`, per `output_index`. Bounded by
+    /// what the UI already received (it duplicates `text_acc`, split by item).
+    message_text: std::collections::BTreeMap<usize, String>,
+    /// Muse only: when a completed message item carries text that extends
+    /// what was streamed for it, emit the missing suffix as a text delta.
+    /// Off for every other provider so their decoding stays unchanged.
+    backfill_message_text: bool,
 }
 
 impl Default for CodexSseDecoder {
@@ -1140,7 +1611,7 @@ fn parse_tool_arguments(raw: &str) -> Value {
 /// uppercase, whitespace, or symbols outside the identifier charset — or
 /// longer than 64 bytes — is replaced so free-text (which can echo request
 /// content) and secret-shaped tokens can never leak into the log stream.
-fn sanitize_error_identifier(raw: Option<&str>) -> &str {
+pub(crate) fn sanitize_error_identifier(raw: Option<&str>) -> &str {
     match raw {
         None => "absent",
         Some(s) => {
@@ -1204,7 +1675,9 @@ fn user_message_for_terminal_failure(
     let classify = |value: &str| match value {
         "absent" | "error" => None,
         "invalid_api_key" | "authentication_error" | "invalid_authentication_error" => Some("auth"),
-        "insufficient_quota" | "quota_exceeded" | "billing_error" => Some("quota"),
+        "insufficient_quota" | "quota_exceeded" | "billing_error" | "usage_limit_reached" => {
+            Some("quota")
+        }
         "rate_limit_exceeded"
         | "rate_limit_error"
         | "server_overloaded"
@@ -1246,8 +1719,73 @@ impl CodexSseDecoder {
             terminal_success: false,
             terminal_failure: None,
             emitted_output: false,
+            saw_content_output: false,
             observed_usage: None,
+            last_message_phase: None,
+            last_message_index: None,
+            message_text: std::collections::BTreeMap::new(),
+            backfill_message_text: false,
         }
+    }
+
+    /// Record a `message` output item's phase/index (added or done event).
+    fn observe_message_item(&mut self, idx: usize, item: &Value) {
+        if item.get("type").and_then(Value::as_str) != Some("message") {
+            return;
+        }
+        self.last_message_index = Some(idx);
+        self.last_message_phase = item
+            .get("phase")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+    }
+
+    /// Text of the most recent message item as streamed, if any was.
+    fn last_message_text(&self) -> Option<&str> {
+        self.last_message_index
+            .and_then(|idx| self.message_text.get(&idx))
+            .map(String::as_str)
+    }
+
+    /// Muse-only (C): a completed message item whose text extends what was
+    /// streamed for it (and starts with it) gets the missing suffix emitted
+    /// as a normal text delta. Never rewrites or duplicates streamed text.
+    fn backfill_message_suffix(
+        &mut self,
+        idx: usize,
+        item: &Value,
+        tx: &mpsc::UnboundedSender<StreamEvent>,
+        text_acc: &mut String,
+    ) {
+        if !self.backfill_message_text
+            || item.get("type").and_then(Value::as_str) != Some("message")
+        {
+            return;
+        }
+        let Some(parts) = item.get("content").and_then(Value::as_array) else {
+            return;
+        };
+        let full: String = parts
+            .iter()
+            .filter(|part| part.get("type").and_then(Value::as_str) == Some("output_text"))
+            .filter_map(|part| part.get("text").and_then(Value::as_str))
+            .collect();
+        let streamed = self.message_text.entry(idx).or_default();
+        if full.len() <= streamed.len() || !full.starts_with(streamed.as_str()) {
+            return;
+        }
+        let suffix = full[streamed.len()..].to_string();
+        tracing::debug!(
+            provider = self.provider_label,
+            suffix_bytes = suffix.len(),
+            "backfilling message text missing from the delta stream"
+        );
+        streamed.push_str(&suffix);
+        self.emitted_output = true;
+        text_acc.push_str(&suffix);
+        let _ = tx.send(StreamEvent::Llm(crate::runtime::types::LlmEvent::Text(
+            suffix,
+        )));
     }
 
     /// True once anything was streamed to the UI for this attempt (text
@@ -1257,6 +1795,14 @@ impl CodexSseDecoder {
         self.emitted_output
             || !self.completed_tools.is_empty()
             || self.active_tools.iter().any(|tool| tool.started)
+    }
+
+    /// True once the model produced any content on this attempt, forwarded
+    /// or not. The account-failover gate uses this (stricter than
+    /// `emitted_any_output`): a request that already cost output on seat A
+    /// is never replayed on seat B.
+    fn model_produced_output(&self) -> bool {
+        self.saw_content_output || self.emitted_any_output()
     }
 
     fn push_line(
@@ -1315,12 +1861,34 @@ impl CodexSseDecoder {
         ) {
             self.saw_model_event = true;
         }
+        // Content-bearing event families. Anything the model emitted as
+        // output — text, tool arguments, reasoning, content parts, output
+        // items — counts, even when this decoder ignores the event below.
+        if matches!(
+            event_type,
+            "response.output_text.delta"
+                | "response.output_text.done"
+                | "response.output_item.added"
+                | "response.output_item.done"
+                | "response.function_call_arguments.delta"
+                | "response.function_call_arguments.done"
+        ) || event_type.starts_with("response.reasoning")
+            || event_type.starts_with("response.content_part")
+            || event_type.starts_with("response.refusal")
+        {
+            self.saw_content_output = true;
+        }
         match event_type {
             "response.output_text.delta" => {
                 if let Some(delta) = event.get("delta").and_then(Value::as_str) {
                     if !delta.is_empty() {
                         self.emitted_output = true;
                     }
+                    let idx = event
+                        .get("output_index")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0) as usize;
+                    self.message_text.entry(idx).or_default().push_str(delta);
                     text_acc.push_str(delta);
                     let _ = tx.send(StreamEvent::Llm(crate::runtime::types::LlmEvent::Text(
                         delta.to_string(),
@@ -1333,6 +1901,7 @@ impl CodexSseDecoder {
                         .get("output_index")
                         .and_then(Value::as_u64)
                         .unwrap_or(0) as usize;
+                    self.observe_message_item(idx, item);
                     self.add_tool_from_item(idx, item, tx);
                 }
             }
@@ -1363,6 +1932,9 @@ impl CodexSseDecoder {
                         .get("output_index")
                         .and_then(Value::as_u64)
                         .unwrap_or(0) as usize;
+                    self.observe_message_item(idx, item);
+                    self.backfill_message_suffix(idx, item, tx, text_acc);
+                    super::codex_wire::announce_web_search_call(self.provider_label, item, tx);
                     self.complete_tool_from_item(idx, item, tx);
                 }
             }
@@ -1429,6 +2001,13 @@ impl CodexSseDecoder {
                         == format!("{}{RESPONSES_CAPACITY_SUFFIX}", self.provider_label)
                     {
                         "responses_capacity"
+                    } else if super::account_routing::stream_failure_is_quota(
+                        error_kind, error_code,
+                    ) {
+                        // Vetted quota identifiers only: the account's
+                        // allowance is spent. Not retried here; the Codex
+                        // path may fail over once if nothing was produced.
+                        "responses_quota"
                     } else {
                         "responses_failed"
                     },
@@ -1844,6 +2423,107 @@ mod codex_input_messages_tests {
         );
     }
 
+    /// Anthropic-shaped stored history covering every assistant shape:
+    /// mixed text+tool_use, tool-only, text-only, plus a plain user message
+    /// right after tool results (forces the `" "` separator).
+    fn phase_history() -> Vec<Value> {
+        vec![
+            json!({"role":"user","content":"build it"}),
+            json!({"role":"assistant","content":[
+                {"type":"thinking","thinking":"hidden","signature":"s"},
+                {"type":"text","text":"Mapping the repo first."},
+                {"type":"tool_use","id":"call_a","name":"bash","input":{"command":"ls"}},
+            ]}),
+            json!({"role":"user","content":[
+                {"type":"tool_result","tool_use_id":"call_a","content":"src"},
+            ]}),
+            json!({"role":"assistant","content":[
+                {"type":"tool_use","id":"call_b","name":"bash","input":{"command":"pwd"}},
+            ]}),
+            json!({"role":"user","content":[
+                {"type":"tool_result","tool_use_id":"call_b","content":"/w"},
+            ]}),
+            json!({"role":"user","content":"also check logs"}),
+            json!({"role":"assistant","content":[{"type":"text","text":"Done: all good."}]}),
+            json!({"role":"user","content":"thanks"}),
+            json!({"role":"assistant","content":"Plain string answer."}),
+        ]
+    }
+
+    fn oai(messages: Vec<Value>) -> Vec<ChatMessage> {
+        let messages: Vec<crate::SharedMessage> =
+            messages.into_iter().map(std::sync::Arc::new).collect();
+        translate::messages_to_oai(&messages, &None, &translate::ToolNameMap::default())
+    }
+
+    #[test]
+    fn muse_input_infers_phase_from_message_structure() {
+        let out = muse_input_messages(oai(phase_history()));
+        assert_eq!(
+            out,
+            vec![
+                json!({"role":"user","content":"build it"}),
+                // Mixed message: its text is commentary and precedes its call.
+                json!({"type":"message","role":"assistant","phase":"commentary",
+                       "content":[{"type":"output_text","text":"Mapping the repo first."}]}),
+                json!({"type":"function_call","call_id":"call_a","name":"bash","arguments":"{\"command\":\"ls\"}"}),
+                json!({"type":"function_call_output","call_id":"call_a","output":"src"}),
+                // Tool-only message: unchanged, no message item invented.
+                json!({"type":"function_call","call_id":"call_b","name":"bash","arguments":"{\"command\":\"pwd\"}"}),
+                json!({"type":"function_call_output","call_id":"call_b","output":"/w"}),
+                // Harness separator keeps the legacy shape (not model text).
+                json!({"role":"assistant","content":" "}),
+                json!({"role":"user","content":"also check logs"}),
+                // Text-only messages (block and string storage) are final.
+                json!({"type":"message","role":"assistant","phase":"final_answer",
+                       "content":[{"type":"output_text","text":"Done: all good."}]}),
+                json!({"role":"user","content":"thanks"}),
+                json!({"type":"message","role":"assistant","phase":"final_answer",
+                       "content":[{"type":"output_text","text":"Plain string answer."}]}),
+            ]
+        );
+    }
+
+    #[test]
+    fn codex_and_xai_input_stay_phase_less_for_the_same_history() {
+        // Codex and xAI both build input with `codex_input_messages`; the
+        // Muse change must not alter a byte of it.
+        let out = codex_input_messages(oai(phase_history()));
+        assert_eq!(
+            out,
+            vec![
+                json!({"role":"user","content":"build it"}),
+                json!({"role":"assistant","content":"Mapping the repo first."}),
+                json!({"type":"function_call","call_id":"call_a","name":"bash","arguments":"{\"command\":\"ls\"}"}),
+                json!({"type":"function_call_output","call_id":"call_a","output":"src"}),
+                json!({"type":"function_call","call_id":"call_b","name":"bash","arguments":"{\"command\":\"pwd\"}"}),
+                json!({"type":"function_call_output","call_id":"call_b","output":"/w"}),
+                json!({"role":"assistant","content":" "}),
+                json!({"role":"user","content":"also check logs"}),
+                json!({"role":"assistant","content":"Done: all good."}),
+                json!({"role":"user","content":"thanks"}),
+                json!({"role":"assistant","content":"Plain string answer."}),
+            ]
+        );
+        assert!(!serde_json::to_string(&out).unwrap().contains("phase"));
+    }
+
+    #[test]
+    fn muse_input_leaves_non_assistant_and_tool_only_messages_identical() {
+        let messages = || {
+            vec![
+                ChatMessage::system("rules"),
+                ChatMessage::user("question"),
+                ChatMessage::assistant_tool_calls(vec![sample_tool_call()]),
+                ChatMessage::tool_result("call_nZYquCuGUh8Qs9H51dwHMDgs", "bash", "done"),
+            ]
+        };
+        assert_eq!(
+            muse_input_messages(messages()),
+            codex_input_messages(messages())
+        );
+    }
+
     #[test]
     fn codex_instructions_appends_autonomous_loop_policy() {
         let instructions = codex_instructions(&Some("Project-specific rules.".to_string()));
@@ -1945,6 +2625,104 @@ mod codex_decoder_tests {
         (decoder, text_acc, events)
     }
 
+    fn drive_with(
+        mut decoder: CodexSseDecoder,
+        lines: &[&str],
+    ) -> (CodexSseDecoder, String, Vec<StreamEvent>) {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut text_acc = String::new();
+        for line in lines {
+            decoder.push_line(line, &tx, &mut text_acc);
+        }
+        let events = collect_events(&mut rx);
+        (decoder, text_acc, events)
+    }
+
+    #[test]
+    fn decoder_captures_phase_of_the_last_message_item() {
+        // Muse shape (ask1.sse): reasoning, commentary message, function_call.
+        let (decoder, text, _) = drive(&[
+            r#"data: {"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"rs_0"}}"#,
+            "",
+            r#"data: {"type":"response.output_item.added","output_index":1,"item":{"type":"message","role":"assistant","phase":"commentary","content":[]}}"#,
+            "",
+            r#"data: {"type":"response.output_text.delta","output_index":1,"delta":"Mapping first."}"#,
+            "",
+            r#"data: {"type":"response.output_item.done","output_index":1,"item":{"type":"message","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"Mapping first."}]}}"#,
+            "",
+            r#"data: {"type":"response.output_item.added","output_index":2,"item":{"type":"function_call","call_id":"call_1","name":"bash"}}"#,
+            "",
+        ]);
+        assert_eq!(decoder.last_message_phase.as_deref(), Some("commentary"));
+        assert_eq!(decoder.last_message_index, Some(1));
+        assert_eq!(decoder.last_message_text(), Some("Mapping first."));
+        assert_eq!(text, "Mapping first.");
+
+        // A later phase-less (final) message replaces it.
+        let (decoder, _, _) = drive(&[
+            r#"data: {"type":"response.output_item.added","output_index":0,"item":{"type":"message","role":"assistant","phase":"commentary","content":[]}}"#,
+            "",
+            r#"data: {"type":"response.output_item.added","output_index":1,"item":{"type":"message","role":"assistant","content":[]}}"#,
+            "",
+            r#"data: {"type":"response.output_text.delta","output_index":1,"delta":"Answer"}"#,
+            "",
+        ]);
+        assert_eq!(decoder.last_message_phase, None);
+        assert_eq!(decoder.last_message_text(), Some("Answer"));
+    }
+
+    const TRUNCATED_STREAM: [&str; 6] = [
+        r#"data: {"type":"response.output_item.added","output_index":0,"item":{"type":"message","role":"assistant","content":[]}}"#,
+        "",
+        r#"data: {"type":"response.output_text.delta","output_index":0,"delta":"Key facts:"}"#,
+        "",
+        r#"data: {"type":"response.output_item.done","output_index":0,"item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Key facts:\nWhich format?"}]}}"#,
+        "",
+    ];
+
+    #[test]
+    fn muse_decoder_backfills_unstreamed_message_suffix_once() {
+        let mut decoder = CodexSseDecoder::for_provider("Meta Muse");
+        decoder.backfill_message_text = true;
+        let mut lines = TRUNCATED_STREAM.to_vec();
+        // A repeated done event must not emit the suffix twice.
+        lines.extend_from_slice(&TRUNCATED_STREAM[4..]);
+        let (decoder, text, events) = drive_with(decoder, &lines);
+        assert_eq!(text, "Key facts:\nWhich format?");
+        let texts: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::Llm(LlmEvent::Text(t)) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, vec!["Key facts:", "\nWhich format?"]);
+        assert_eq!(
+            decoder.last_message_text(),
+            Some("Key facts:\nWhich format?")
+        );
+    }
+
+    #[test]
+    fn backfill_is_off_by_default_and_never_rewrites_divergent_text() {
+        // Default (Codex) decoder: decoding unchanged.
+        let (_, text, _) = drive(&TRUNCATED_STREAM);
+        assert_eq!(text, "Key facts:");
+        // Muse decoder: final text that does not extend the stream is ignored.
+        let mut decoder = CodexSseDecoder::for_provider("Meta Muse");
+        decoder.backfill_message_text = true;
+        let (_, text, _) = drive_with(
+            decoder,
+            &[
+                r#"data: {"type":"response.output_text.delta","output_index":0,"delta":"Hello"}"#,
+                "",
+                r#"data: {"type":"response.output_item.done","output_index":0,"item":{"type":"message","content":[{"type":"output_text","text":"Goodbye world"}]}}"#,
+                "",
+            ],
+        );
+        assert_eq!(text, "Hello");
+    }
+
     #[test]
     fn hostile_output_index_does_not_grow_active_tools_unbounded() {
         // A provider (or wire corruption) sending an absurd `output_index` must
@@ -1981,6 +2759,59 @@ mod codex_decoder_tests {
             })
             .collect();
         assert_eq!(texts, vec!["Hello, ", "world!"]);
+    }
+
+    #[test]
+    fn hosted_web_search_items_are_not_tool_uses() {
+        // OpenAI-hosted web search (SYNAPS_CODEX_WEB_SEARCH) streams
+        // `web_search_call` output items. They run server-side, so the decoder
+        // must not surface them as local tool uses — only the answer text and
+        // real function calls come through.
+        let lines = [
+            r#"data: {"type":"response.output_item.added","output_index":0,"item":{"type":"web_search_call","id":"ws_1","status":"in_progress"}}"#,
+            "",
+            r#"data: {"type":"response.web_search_call.searching","output_index":0,"item_id":"ws_1"}"#,
+            "",
+            r#"data: {"type":"response.output_item.done","output_index":0,"item":{"type":"web_search_call","id":"ws_1","status":"completed","action":{"type":"search","query":"ram dass puja chat youtube"}}}"#,
+            "",
+            r#"data: {"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","call_id":"call_1","name":"get_asset"}}"#,
+            "",
+            r#"data: {"type":"response.output_item.done","output_index":1,"item":{"type":"function_call","call_id":"call_1","name":"get_asset","arguments":"{}"}}"#,
+            "",
+            r#"data: {"type":"response.output_text.delta","output_index":2,"delta":"Found it."}"#,
+            "",
+            r#"data: {"type":"response.output_text.annotation.added","output_index":2,"annotation":{"type":"url_citation","url":"https://www.youtube.com/watch?v=sH-u96rpYSw"}}"#,
+            "",
+        ];
+        let (decoder, text, events) = drive(&lines);
+        assert_eq!(text, "Found it.");
+        assert_eq!(decoder.completed_tools.len(), 1);
+        assert_eq!(decoder.completed_tools[0].function.name, "get_asset");
+        let starts = events
+            .iter()
+            .filter(|e| matches!(e, StreamEvent::Llm(LlmEvent::ToolUseStart { .. })))
+            .count();
+        assert_eq!(starts, 1, "web_search_call must not emit a ToolUseStart");
+    }
+
+    #[test]
+    fn web_search_env_value_maps_to_hosted_tool() {
+        use super::codex_web_search_tool;
+        assert_eq!(codex_web_search_tool(None), None);
+        assert_eq!(codex_web_search_tool(Some("")), None);
+        assert_eq!(codex_web_search_tool(Some("off")), None);
+        assert_eq!(codex_web_search_tool(Some("bogus")), None);
+        for on in ["live", "LIVE", " on ", "true", "1", "yes"] {
+            assert_eq!(
+                codex_web_search_tool(Some(on)),
+                Some(serde_json::json!({ "type": "web_search" })),
+                "{on:?}"
+            );
+        }
+        assert_eq!(
+            codex_web_search_tool(Some("cached")),
+            Some(serde_json::json!({ "type": "web_search", "external_web_access": false }))
+        );
     }
 
     #[test]
@@ -2789,6 +3620,32 @@ mod broker_stream_tests {
 /// Provider display label for the xai-auth Responses route.
 const XAI_PROVIDER_LABEL: &str = "xAI";
 
+/// Broker identity + display label for one OpenAI-Responses-wire provider
+/// routed through the shared streaming loop
+/// ([`stream_broker_responses`]).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ResponsesProfile {
+    /// Broker provider key (credential + pinned origin + path allowlist).
+    pub broker_provider: &'static str,
+    /// Allowlisted broker path for the Responses endpoint.
+    pub path: &'static str,
+    /// User-facing provider name in stream errors and logs.
+    pub label: &'static str,
+}
+
+pub(crate) const XAI_RESPONSES: ResponsesProfile = ResponsesProfile {
+    broker_provider: "xai-auth",
+    path: "/responses",
+    label: XAI_PROVIDER_LABEL,
+};
+
+/// Meta Muse: `https://api.meta.ai` origin, Responses at `/v1/responses`.
+pub(crate) const MUSE_RESPONSES: ResponsesProfile = ResponsesProfile {
+    broker_provider: "muse",
+    path: "/v1/responses",
+    label: "Meta Muse",
+};
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn call_xai_responses_stream_inner(
     cfg: &ProviderConfig,
@@ -2816,6 +3673,201 @@ pub(crate) async fn call_xai_responses_stream_inner(
         max_tokens,
     )
     .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+    stream_broker_responses(
+        XAI_RESPONSES,
+        cfg,
+        broker,
+        body,
+        &names,
+        tools_schema,
+        system_prompt,
+        messages,
+        tx,
+        cancel,
+        max_retries,
+        trace,
+        exact_wire_bytes,
+    )
+    .await
+}
+
+/// Dispatch a resolved `OpenAiResponses` route to its provider body builder:
+/// `muse` → [`call_muse_responses_stream_inner`], otherwise xAI.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn call_responses_route_inner(
+    route_provider: &str,
+    cfg: &ProviderConfig,
+    broker: &std::sync::Arc<dyn crate::auth::CredentialBroker>,
+    tools_schema: &[Value],
+    system_prompt: &Option<String>,
+    messages: &[crate::SharedMessage],
+    tx: &mpsc::UnboundedSender<StreamEvent>,
+    max_tokens: Option<u32>,
+    reasoning_level: agent_core::reasoning::ReasoningLevel,
+    cancel: &tokio_util::sync::CancellationToken,
+    max_retries: u32,
+    trace: &crate::runtime::trace::TraceContext,
+    exact_wire_bytes: bool,
+) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+    if route_provider == MUSE_RESPONSES.broker_provider {
+        call_muse_responses_stream_inner(
+            cfg,
+            broker,
+            tools_schema,
+            system_prompt,
+            messages,
+            tx,
+            max_tokens,
+            reasoning_level,
+            cancel,
+            max_retries,
+            trace,
+            exact_wire_bytes,
+        )
+        .await
+    } else {
+        call_xai_responses_stream_inner(
+            cfg,
+            broker,
+            tools_schema,
+            system_prompt,
+            messages,
+            tx,
+            max_tokens,
+            reasoning_level,
+            cancel,
+            max_retries,
+            trace,
+            exact_wire_bytes,
+        )
+        .await
+    }
+}
+
+/// Meta Muse Responses route (`muse/<id>`). Mirrors the official Muse Code
+/// request shape: system prompt as `instructions`, conversation as typed
+/// input items, `store:false` (stateless), and a `prompt_cache_key` so the
+/// server-side prompt cache routes repeated prefixes to the same cache.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn call_muse_responses_stream_inner(
+    cfg: &ProviderConfig,
+    broker: &std::sync::Arc<dyn crate::auth::CredentialBroker>,
+    tools_schema: &[Value],
+    system_prompt: &Option<String>,
+    messages: &[crate::SharedMessage],
+    tx: &mpsc::UnboundedSender<StreamEvent>,
+    max_tokens: Option<u32>,
+    reasoning_level: agent_core::reasoning::ReasoningLevel,
+    cancel: &tokio_util::sync::CancellationToken,
+    max_retries: u32,
+    trace: &crate::runtime::trace::TraceContext,
+    exact_wire_bytes: bool,
+) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+    let (tools, names) = translate::tools_to_responses(tools_schema);
+    let instructions = system_prompt.clone().unwrap_or_default();
+    // The system prompt travels as `instructions`, never duplicated in input.
+    let input = muse_input_messages(translate::messages_to_oai(messages, &None, &names));
+    let cache_key = muse_prompt_cache_key(&instructions, input.first());
+    // Validated BEFORE any broker credential access or network I/O.
+    let body = build_muse_body(
+        &cfg.model,
+        reasoning_level,
+        Value::Array(input),
+        &instructions,
+        tools,
+        max_tokens,
+        &cache_key,
+    )
+    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+    stream_broker_responses(
+        MUSE_RESPONSES,
+        cfg,
+        broker,
+        body,
+        &names,
+        tools_schema,
+        system_prompt,
+        messages,
+        tx,
+        cancel,
+        max_retries,
+        trace,
+        exact_wire_bytes,
+    )
+    .await
+}
+
+/// Deterministic Muse cache-routing key derived from the stable prompt head
+/// (instructions + first input item), like the Codex key: identical heads
+/// share the prefix the server caches, and a /compact rewrite changes the
+/// key together with the prefix it invalidates. Namespaced so it can never
+/// collide with Codex keys.
+pub(crate) fn muse_prompt_cache_key(instructions: &str, first_item: Option<&Value>) -> String {
+    codex_prompt_cache_key(instructions, first_item).replacen("synaps-", "synaps-muse-", 1)
+}
+
+/// Pure, validated body construction for the Meta Muse Responses API.
+///
+/// Shape mirrors the official Muse Code client (verified by capture):
+/// `model`, `instructions`, `input`, `store:false`, `stream:true`, `tools`,
+/// `max_output_tokens`, `reasoning.effort`, `prompt_cache_key`. Reasoning is
+/// validated against the exact model's capability first; `Adaptive` omits
+/// the field (provider default). Encrypted reasoning is not requested:
+/// Synaps does not replay reasoning items across turns.
+#[allow(clippy::too_many_arguments)] // pure builder mirroring the wire body
+pub(crate) fn build_muse_body(
+    model: &str,
+    level: agent_core::reasoning::ReasoningLevel,
+    input: Value,
+    instructions: &str,
+    tools: Vec<Value>,
+    max_tokens: Option<u32>,
+    prompt_cache_key: &str,
+) -> Result<Value, String> {
+    crate::runtime::openai::catalog::validation::validate_reasoning_mutation(
+        &format!("muse/{model}"),
+        level,
+    )?;
+    let mut body = serde_json::Map::new();
+    body.insert("model".into(), json!(model));
+    if !instructions.is_empty() {
+        body.insert("instructions".into(), json!(instructions));
+    }
+    body.insert("input".into(), input);
+    body.insert("store".into(), json!(false));
+    body.insert("stream".into(), json!(true));
+    if !tools.is_empty() {
+        body.insert("tools".into(), Value::Array(tools));
+    }
+    if let Some(max) = max_tokens {
+        body.insert("max_output_tokens".into(), json!(max));
+    }
+    if let Some(effort) = crate::runtime::openai::catalog::muse_effort_label(level) {
+        body.insert("reasoning".into(), json!({ "effort": effort }));
+    }
+    body.insert("prompt_cache_key".into(), json!(prompt_cache_key));
+    Ok(Value::Object(body))
+}
+
+/// Shared streaming loop for broker-proxied OpenAI Responses providers
+/// (xAI, Meta Muse): one exact-bytes request, SSE decode, bounded retries
+/// that never replay after output reached the UI.
+#[allow(clippy::too_many_arguments)]
+async fn stream_broker_responses(
+    profile: ResponsesProfile,
+    cfg: &ProviderConfig,
+    broker: &std::sync::Arc<dyn crate::auth::CredentialBroker>,
+    body: Value,
+    names: &translate::ToolNameMap,
+    tools_schema: &[Value],
+    system_prompt: &Option<String>,
+    messages: &[crate::SharedMessage],
+    tx: &mpsc::UnboundedSender<StreamEvent>,
+    cancel: &tokio_util::sync::CancellationToken,
+    max_retries: u32,
+    trace: &crate::runtime::trace::TraceContext,
+    exact_wire_bytes: bool,
+) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
     // Serialize ONCE via the sanctioned constructor: the digested bytes are
     // the very bytes the broker sends upstream (`body_bytes` handoff,
     // LocalBroker verbatim) — `body`/`body_bytes` cannot diverge. On a
@@ -2823,8 +3875,12 @@ pub(crate) async fn call_xai_responses_stream_inner(
     // `CloudProxy` kind and no wire-byte claim. Every retry clones this
     // same request (identical `body` and `body_bytes`), so one wire digest
     // is honest for all attempt records.
-    let (proxy_request, body_bytes) =
-        crate::auth::ProxyRequest::post_json_exact("xai-auth", "/responses", body, true)?;
+    let (proxy_request, body_bytes) = crate::auth::ProxyRequest::post_json_exact(
+        profile.broker_provider,
+        profile.path,
+        body,
+        true,
+    )?;
     let tracer = tr::begin_openai_tracer(
         trace,
         &cfg.provider,
@@ -2839,7 +3895,7 @@ pub(crate) async fn call_xai_responses_stream_inner(
         messages,
         system_prompt.as_deref(),
         tools_schema,
-        tr::renamed_tool_losses(&names),
+        tr::renamed_tool_losses(names),
     )
     .await;
     // One-shot explicit content capture (`/trace next content`): a no-op in
@@ -2862,10 +3918,18 @@ pub(crate) async fn call_xai_responses_stream_inner(
             broker.proxy_stream(proxy_request.clone()),
         )
         .await
-        .map_err(|_| "request canceled")?
-        // Privacy (spec §5.1): a broker proxy error may carry an upstream
-        // response-body snippet; redact it to status-only before surfacing.
-        .map_err(|e| super::net::redact_provider_proxy_error(&e.to_string()));
+        .map_err(|_| "request canceled")?;
+        // A credential refresh failure keeps its kind as a type (retryable /
+        // action-required vs credential); its text is ours, no upstream bytes.
+        let stream = match stream {
+            Err(crate::auth::BrokerError::Refresh(f)) => {
+                attempt.finish_failed("broker_error", None, None);
+                return Err(Box::new(super::net::BrokerRefreshError::new(f)));
+            }
+            // Privacy (spec §5.1): a broker proxy error may carry an upstream
+            // response-body snippet; redact it to status-only before surfacing.
+            other => other.map_err(|e| super::net::redact_provider_proxy_error(&e.to_string())),
+        };
         let mut stream = match stream {
             Ok(stream) => {
                 attempt.mark_headers();
@@ -2882,7 +3946,8 @@ pub(crate) async fn call_xai_responses_stream_inner(
         let _ = tx.send(StreamEvent::Llm(crate::LlmEvent::ResponseStart));
         let mut interrupted = false;
         let mut text = String::new();
-        let mut parser = CodexSseDecoder::for_provider(XAI_PROVIDER_LABEL);
+        let mut parser = CodexSseDecoder::for_provider(profile.label);
+        parser.backfill_message_text = profile.broker_provider == MUSE_RESPONSES.broker_provider;
         let mut buf = bytes::BytesMut::new();
         while let Some(chunk) = tokio::select! {
             biased;
@@ -2968,7 +4033,8 @@ pub(crate) async fn call_xai_responses_stream_inner(
                 );
                 tracing::warn!(
                     code = failure.code,
-                    "xai stream retry {stream_retry}/{max_retries} after {delay:?}"
+                    provider = profile.broker_provider,
+                    "responses stream retry {stream_retry}/{max_retries} after {delay:?}"
                 );
                 tokio::select! {
                     _ = tokio::time::sleep(delay) => {}
@@ -2990,10 +4056,107 @@ pub(crate) async fn call_xai_responses_stream_inner(
         }
         content.extend(translate::tool_calls_to_content_blocks(
             &parser.completed_tools,
-            &names,
+            names,
         ));
-        return Ok(json!({"role":"assistant","content":content}));
+        let mut response = json!({"role":"assistant","content":content});
+        if profile.broker_provider == MUSE_RESPONSES.broker_provider {
+            if let Some(reason) = muse_dangling_preamble(
+                !parser.completed_tools.is_empty(),
+                parser.last_message_phase.as_deref(),
+                parser.last_message_text().unwrap_or(&text),
+            ) {
+                tracing::info!(
+                    provider = profile.broker_provider,
+                    reason,
+                    "muse response ended on a preamble without acting"
+                );
+                // Top-level sidecar, never inside `content`: the turn loop
+                // persists only `content`, so nothing reaches stored history.
+                response[DANGLING_PREAMBLE_KEY] = json!(reason);
+            }
+        }
+        return Ok(response);
     }
+}
+
+/// Response sidecar key (top level, outside `content`) set by the Muse route
+/// when a completed response ended on a preamble without acting. Read by the
+/// turn loop's one-shot continuation; never persisted.
+pub(crate) const DANGLING_PREAMBLE_KEY: &str = "synaps_dangling_preamble";
+
+/// Upper bound (chars, trimmed) for the text heuristic. The observed failures
+/// were 32–36 output tokens (~70–130 chars); 300 leaves room for a long
+/// sentence of preamble while excluding real answers that merely end in a
+/// colon after substantive content.
+pub(crate) const PREAMBLE_MAX_CHARS: usize = 300;
+
+/// Decide whether a completed Muse response ended on an unfinished preamble.
+/// Returns the trigger reason, or `None`. Never fires when the response
+/// called a tool.
+///
+/// - `commentary_phase`: the last message item was labelled
+///   `phase:"commentary"` by Muse itself, yet no tool call followed — by the
+///   provider's own contract the turn is unfinished.
+/// - `colon_preamble`: the last message's trimmed text is short
+///   (≤ [`PREAMBLE_MAX_CHARS`]) and ends with ':' — "Blocking question
+///   before I build anything:" with nothing after it.
+pub(crate) fn muse_dangling_preamble(
+    has_tool_calls: bool,
+    last_message_phase: Option<&str>,
+    last_message_text: &str,
+) -> Option<&'static str> {
+    if has_tool_calls {
+        return None;
+    }
+    if last_message_phase == Some("commentary") {
+        return Some("commentary_phase");
+    }
+    let text = last_message_text.trim();
+    if (text.ends_with(':') || text.ends_with('\u{ff1a}'))
+        && text.chars().count() <= PREAMBLE_MAX_CHARS
+    {
+        return Some("colon_preamble");
+    }
+    None
+}
+
+/// Harness-authored nudge appended (once per user turn) after a dangling
+/// preamble. Framed like the context advisories so the model does not read
+/// it as a new user request.
+pub(crate) const PREAMBLE_NUDGE: &str = "[Host harness note, not a new user request] You ended your turn on a preamble without acting. Continue now: run the tool call you announced, or ask your question in full.";
+
+/// Visible system note shown when the nudge fires.
+pub(crate) const PREAMBLE_NUDGE_NOTICE: &str = "Muse ended its turn on a preamble without acting; continuing once automatically (disable: SYNAPS_MUSE_PREAMBLE_NUDGE=0).";
+
+/// `SYNAPS_MUSE_PREAMBLE_NUDGE=0|false|off|no` disables the one-shot
+/// continuation. Enabled by default.
+pub(crate) fn preamble_nudge_enabled() -> bool {
+    preamble_nudge_enabled_value(std::env::var("SYNAPS_MUSE_PREAMBLE_NUDGE").ok().as_deref())
+}
+
+fn preamble_nudge_enabled_value(value: Option<&str>) -> bool {
+    !matches!(
+        value.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("0" | "false" | "off" | "no")
+    )
+}
+
+/// Turn-loop gate for the one-shot preamble continuation. Returns the reason
+/// and arms `already_nudged` when the response carries the Muse sidecar, the
+/// round was not cancelled, the feature is enabled, and this user turn has
+/// not been nudged yet. At most one nudge per user turn: it cannot loop.
+pub(crate) fn take_preamble_nudge(
+    response: &Value,
+    already_nudged: &mut bool,
+    cancelled: bool,
+    enabled: bool,
+) -> Option<String> {
+    if *already_nudged || cancelled || !enabled {
+        return None;
+    }
+    let reason = response.get(DANGLING_PREAMBLE_KEY)?.as_str()?.to_string();
+    *already_nudged = true;
+    Some(reason)
 }
 
 /// Pure, validated body construction for the xAI Responses API.
@@ -3261,6 +4424,85 @@ mod xai_capacity_retry_tests {
         }
         async fn capabilities(&self) -> Result<Vec<agent_core::auth::ProviderStatus>, BrokerError> {
             Ok(vec![])
+        }
+    }
+
+    /// Broker whose `proxy_stream` fails with a typed refresh failure (a
+    /// Muse re-mint that hit the network, a corrupt store).
+    struct RefreshFailingBroker(agent_core::auth::RefreshFailureKind);
+
+    #[async_trait]
+    impl crate::auth::CredentialBroker for RefreshFailingBroker {
+        async fn access_token(
+            &self,
+            _p: agent_core::auth::OAuthProviderId,
+        ) -> Result<AccessToken, BrokerError> {
+            Err(BrokerError::Denied("stub".into()))
+        }
+        async fn proxy(&self, _request: ProxyRequest) -> Result<ProxyResponse, BrokerError> {
+            Err(BrokerError::Denied("stub".into()))
+        }
+        async fn proxy_stream(&self, _r: ProxyRequest) -> Result<ProxyByteStream, BrokerError> {
+            Err(BrokerError::Refresh(agent_core::auth::RefreshFailure::new(
+                self.0,
+                "transport error",
+            )))
+        }
+        async fn anthropic_usage(&self) -> Result<serde_json::Value, BrokerError> {
+            Err(BrokerError::Denied("stub".into()))
+        }
+        async fn capabilities(&self) -> Result<Vec<agent_core::auth::ProviderStatus>, BrokerError> {
+            Ok(vec![])
+        }
+    }
+
+    /// Round-2 m-a: the retryable kind is carried as a type through the real
+    /// pipeline (redaction, normalization, classification), not recovered
+    /// from our hint text. Retryable and action-required refresh failures
+    /// are API-side, never "Config error" and never "sign in again".
+    #[tokio::test]
+    async fn broker_refresh_failure_kind_survives_the_stream_pipeline() {
+        use agent_core::auth::RefreshFailureKind as K;
+        for (kind, api) in [
+            (K::Transient, true),
+            (K::LockBusy, true),
+            (K::Other, true),
+            (K::ActionRequired, true),
+            (K::Credential, false),
+        ] {
+            let broker: Arc<dyn crate::auth::CredentialBroker> =
+                Arc::new(RefreshFailingBroker(kind));
+            let cfg = ProviderConfig {
+                base_url: "https://api.meta.ai/v1".to_string(),
+                model: "muse-x".to_string(),
+                provider: "muse".to_string(),
+            };
+            let (tx, _rx) = mpsc::unbounded_channel::<StreamEvent>();
+            let err = call_xai_responses_stream_inner(
+                &cfg,
+                &broker,
+                &[],
+                &None,
+                &[],
+                &tx,
+                None,
+                agent_core::reasoning::ReasoningLevel::Adaptive,
+                &tokio_util::sync::CancellationToken::new(),
+                0,
+                &crate::runtime::trace::TraceContext::disabled(),
+                true,
+            )
+            .await
+            .unwrap_err();
+            let runtime = super::super::net::provider_error_to_runtime_for("muse/muse-x", err);
+            match (&runtime, api) {
+                (crate::RuntimeError::ApiStatus(m), true) => {
+                    assert!(m.contains("credential refresh failed"), "{kind:?}: {m}");
+                    assert!(!m.contains("Sign in again"), "{kind:?}: {m}");
+                }
+                (crate::RuntimeError::Config(_), false) => {}
+                other => panic!("{kind:?}: {other:?}"),
+            }
         }
     }
 
@@ -4356,7 +5598,7 @@ mod send_retry_tests {
         let waiter = cancel.clone();
         let task = tokio::spawn(async move {
             while let Some(event) = rx.recv().await {
-                if matches!(event, StreamEvent::Session(crate::SessionEvent::Notice(_))) {
+                if matches!(event, StreamEvent::Session(crate::SessionEvent::Retry(_))) {
                     waiter.cancel();
                     break;
                 }
@@ -4713,6 +5955,739 @@ mod send_retry_tests {
         assert!(err.to_string().starts_with("codex request failed: 503"));
     }
 
+    // ─── G5: account-aware selection + bounded failover ──────────────────────
+
+    use crate::runtime::openai::account_routing::{
+        CodexAccountRouter, CodexQuotaEvidence, PinnedAccount,
+    };
+    use agent_core::auth::{Account, CredentialRef, OAuthProviderId};
+
+    /// JWT-shaped token carrying `account_id` as the ChatGPT account claim.
+    fn fake_codex_token_for(account_id: &str) -> String {
+        let payload = serde_json::json!({
+            "https://api.openai.com/auth": { "chatgpt_account_id": account_id }
+        });
+        format!("h.{}.s", URL_SAFE_NO_PAD.encode(payload.to_string()))
+    }
+
+    fn pinned(label: &str, account_id: &str, auto: bool) -> PinnedAccount {
+        PinnedAccount {
+            credential: CredentialRef::new(
+                OAuthProviderId::OpenAiCodex,
+                Account::parse(label).unwrap(),
+            ),
+            token: fake_codex_token_for(account_id),
+            auto,
+        }
+    }
+
+    /// Scripted router: `pin` returns `first`; `failover` returns the next
+    /// scripted candidate (or `None`). Records every call.
+    struct ScriptedRouter {
+        first: PinnedAccount,
+        candidates: std::sync::Mutex<std::collections::VecDeque<Option<PinnedAccount>>>,
+        failover_calls: AtomicUsize,
+        reported: std::sync::Mutex<Vec<(String, CodexQuotaEvidence)>>,
+    }
+
+    impl ScriptedRouter {
+        fn new(first: PinnedAccount, candidates: Vec<Option<PinnedAccount>>) -> Self {
+            Self {
+                first,
+                candidates: std::sync::Mutex::new(candidates.into()),
+                failover_calls: AtomicUsize::new(0),
+                reported: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+        fn reports(&self) -> Vec<String> {
+            self.reported
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(k, _)| k.clone())
+                .collect()
+        }
+    }
+
+    #[async_trait]
+    impl CodexAccountRouter for ScriptedRouter {
+        async fn pin(&self, _model: &str) -> Result<PinnedAccount, String> {
+            Ok(self.first.clone())
+        }
+        async fn failover(
+            &self,
+            _model: &str,
+            _failed: &PinnedAccount,
+            _evidence: &CodexQuotaEvidence,
+            _failovers_so_far: u32,
+        ) -> Result<Option<PinnedAccount>, String> {
+            self.failover_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self.candidates.lock().unwrap().pop_front().flatten())
+        }
+        async fn report_exhausted(&self, failed: &PinnedAccount, evidence: &CodexQuotaEvidence) {
+            self.reported
+                .lock()
+                .unwrap()
+                .push((failed.credential.storage_key(), *evidence));
+        }
+    }
+
+    /// One observed request: `chatgpt-account-id` header, bearer token, body.
+    #[derive(Clone, Debug)]
+    struct Seen {
+        account: String,
+        bearer: String,
+        body: bytes::Bytes,
+    }
+
+    /// Mock Codex endpoint scripted per request: each entry is
+    /// `(status, headers, body)`; the last entry repeats. Records the
+    /// `chatgpt-account-id` header, the bearer and the body of every request.
+    type Script = Vec<(StatusCode, Vec<(&'static str, &'static str)>, &'static str)>;
+    async fn spawn_scripted_codex(script: Script) -> (String, Arc<std::sync::Mutex<Vec<Seen>>>) {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let counter = Arc::new(AtomicUsize::new(0));
+        let script = Arc::new(script);
+        let app = Router::new().route(
+            "/codex/responses",
+            axum_post({
+                let seen = Arc::clone(&seen);
+                let counter = Arc::clone(&counter);
+                let script = Arc::clone(&script);
+                move |headers: axum::http::HeaderMap, body: bytes::Bytes| {
+                    let seen = Arc::clone(&seen);
+                    let counter = Arc::clone(&counter);
+                    let script = Arc::clone(&script);
+                    async move {
+                        let header = |name: &str| {
+                            headers
+                                .get(name)
+                                .and_then(|v| v.to_str().ok())
+                                .unwrap_or("")
+                                .to_string()
+                        };
+                        let bearer = header("authorization")
+                            .strip_prefix("Bearer ")
+                            .unwrap_or("")
+                            .to_string();
+                        seen.lock().unwrap().push(Seen {
+                            account: header("chatgpt-account-id"),
+                            bearer,
+                            body,
+                        });
+                        let n = counter.fetch_add(1, Ordering::SeqCst);
+                        let (status, hdrs, body) = &script[n.min(script.len() - 1)];
+                        let mut resp = axum::response::Response::builder().status(*status);
+                        for (k, v) in hdrs {
+                            resp = resp.header(*k, *v);
+                        }
+                        let ct = if status.is_success() {
+                            "text/event-stream"
+                        } else {
+                            "application/json"
+                        };
+                        resp.header("content-type", ct)
+                            .body(axum::body::Body::from(*body))
+                            .unwrap()
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), seen)
+    }
+
+    async fn run_codex_with_router(
+        base_url: &str,
+        router: &dyn CodexAccountRouter,
+        max_retries: u32,
+        tx: &mpsc::UnboundedSender<StreamEvent>,
+    ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+        let cfg = ProviderConfig {
+            base_url: base_url.to_string(),
+            model: "gpt-5.6-sol".to_string(),
+            provider: "openai-codex".to_string(),
+        };
+        call_codex_stream_with_router(
+            &cfg,
+            &reqwest::Client::new(),
+            router,
+            &[],
+            &Some("test".to_string()),
+            &[],
+            tx,
+            None,
+            None,
+            ReasoningLevel::Medium,
+            crate::runtime::openai::catalog::CodexRequestRole::Foreground,
+            &tokio_util::sync::CancellationToken::new(),
+            max_retries,
+            &crate::runtime::trace::TraceContext::disabled(),
+        )
+        .await
+    }
+
+    const QUOTA_429: &str = r#"{"error":{"type":"usage_limit_reached","message":"ECHOED prompt","plan_type":"plus","resets_in_seconds":3600}}"#;
+    const GENERIC_429: &str = r#"{"error":{"type":"rate_limit_exceeded","message":"slow down"}}"#;
+
+    fn notices(rx: &mut mpsc::UnboundedReceiver<StreamEvent>) -> Vec<String> {
+        let mut out = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let StreamEvent::Session(
+                crate::SessionEvent::Notice(n) | crate::SessionEvent::Retry(n),
+            ) = ev
+            {
+                out.push(n);
+            }
+        }
+        out
+    }
+
+    /// Auto policy, exhausted 429 on seat A before any output, seat B fresh:
+    /// exactly one switch, the retry carries B's header (derived from B's
+    /// token), identical body bytes, and the cooldown was reported for A.
+    #[tokio::test]
+    async fn quota_429_fails_over_once_to_distinct_account_with_paired_header() {
+        let (url, seen) = spawn_scripted_codex(vec![
+            (StatusCode::TOO_MANY_REQUESTS, vec![], QUOTA_429),
+            (StatusCode::OK, vec![], CODEX_SSE_SUCCESS),
+        ])
+        .await;
+        let router = ScriptedRouter::new(
+            pinned("astra1", "acct_A", true),
+            vec![Some(pinned("astra2", "acct_B", true))],
+        );
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let result = run_codex_with_router(&url, &router, 3, &tx).await.unwrap();
+        assert_eq!(result["content"][0]["text"], "hello");
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "one failed attempt on A, one success on B");
+        assert_eq!(seen[0].account, "acct_A");
+        assert_eq!(seen[1].account, "acct_B", "header must follow the pinned token");
+        // Bearer and header are derived from the SAME credential on every
+        // attempt: A's token with A's id, then B's token with B's id — never
+        // a mixed pair.
+        assert_eq!(seen[0].bearer, fake_codex_token_for("acct_A"));
+        assert_eq!(seen[1].bearer, fake_codex_token_for("acct_B"));
+        assert_ne!(seen[0].bearer, seen[1].bearer);
+        assert_eq!(seen[0].body, seen[1].body, "same request bytes, no rebuild");
+        assert_eq!(router.failover_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(router.reports(), vec!["openai-codex@astra1".to_string()]);
+        let notes = notices(&mut rx);
+        assert!(
+            notes.iter().any(|n| n.contains("'astra1'") && n.contains("'astra2'")),
+            "operator must see the switch: {notes:?}"
+        );
+        assert!(
+            notes.iter().all(|n| !n.contains("acct_") && !n.contains("h.")),
+            "notices carry labels only, never ids/tokens: {notes:?}"
+        );
+    }
+
+    /// Explicitly selected account: never switched, even with an eligible
+    /// alternative. The turn ends with the static quota message and no
+    /// transport retries are burned on a provably exhausted seat.
+    #[tokio::test]
+    async fn quota_429_on_explicit_account_never_fails_over() {
+        let (url, seen) = spawn_scripted_codex(vec![(
+            StatusCode::TOO_MANY_REQUESTS,
+            vec![],
+            QUOTA_429,
+        )])
+        .await;
+        let router = ScriptedRouter::new(
+            pinned("astra1", "acct_A", false),
+            vec![Some(pinned("astra2", "acct_B", true))],
+        );
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let err = run_codex_with_router(&url, &router, 5, &tx)
+            .await
+            .expect_err("explicit account must fail, not switch");
+        assert_eq!(err.to_string(), format!("Codex{RESPONSES_QUOTA_SUFFIX}"));
+        assert!(!err.to_string().contains("ECHOED"));
+        assert_eq!(seen.lock().unwrap().len(), 1, "no retry on exhausted seat");
+        assert_eq!(router.failover_calls.load(Ordering::SeqCst), 0);
+        // The cooldown is still reported so the broker stops advertising A.
+        assert_eq!(router.reports(), vec!["openai-codex@astra1".to_string()]);
+    }
+
+    /// A generic 429 (no exhaustion evidence) keeps the ordinary transport
+    /// retry on the SAME account — it is not proof of a spent window.
+    #[tokio::test]
+    async fn generic_429_retries_same_account_and_never_switches() {
+        let (url, seen) = spawn_scripted_codex(vec![
+            (StatusCode::TOO_MANY_REQUESTS, vec![], GENERIC_429),
+            (StatusCode::OK, vec![], CODEX_SSE_SUCCESS),
+        ])
+        .await;
+        let router = ScriptedRouter::new(
+            pinned("astra1", "acct_A", true),
+            vec![Some(pinned("astra2", "acct_B", true))],
+        );
+        let (tx, _rx) = mpsc::unbounded_channel();
+        run_codex_with_router(&url, &router, 2, &tx).await.unwrap();
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert!(seen.iter().all(|r| r.account == "acct_A"));
+        assert!(seen.iter().all(|r| r.bearer == fake_codex_token_for("acct_A")));
+        assert_eq!(router.failover_calls.load(Ordering::SeqCst), 0);
+        assert!(router.reports().is_empty());
+    }
+
+    /// Exhausted-window headers on a 429 are provider-declared evidence too.
+    #[tokio::test]
+    async fn quota_429_by_headers_fails_over() {
+        let (url, seen) = spawn_scripted_codex(vec![
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                vec![
+                    ("x-codex-primary-used-percent", "100"),
+                    ("x-codex-primary-reset-after-seconds", "500"),
+                ],
+                "{}",
+            ),
+            (StatusCode::OK, vec![], CODEX_SSE_SUCCESS),
+        ])
+        .await;
+        let router = ScriptedRouter::new(
+            pinned("astra1", "acct_A", true),
+            vec![Some(pinned("astra2", "acct_B", true))],
+        );
+        let (tx, _rx) = mpsc::unbounded_channel();
+        run_codex_with_router(&url, &router, 2, &tx).await.unwrap();
+        assert_eq!(seen.lock().unwrap()[1].account, "acct_B");
+        let reported = router.reported.lock().unwrap();
+        assert_eq!(reported[0].1.reset_after_secs, Some(500));
+    }
+
+    /// No eligible seat: one quota failure ends the turn — no loop, no
+    /// second attempt on the exhausted account.
+    #[tokio::test]
+    async fn quota_429_with_no_eligible_candidate_fails_without_looping() {
+        let (url, seen) = spawn_scripted_codex(vec![(
+            StatusCode::TOO_MANY_REQUESTS,
+            vec![],
+            QUOTA_429,
+        )])
+        .await;
+        let router = ScriptedRouter::new(pinned("astra1", "acct_A", true), vec![None]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let err = run_codex_with_router(&url, &router, 10, &tx)
+            .await
+            .expect_err("must fail");
+        assert_eq!(err.to_string(), format!("Codex{RESPONSES_QUOTA_SUFFIX}"));
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        assert_eq!(router.failover_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// The router hands back the very account that failed (e.g. a broker
+    /// whose cooldown sink is a no-op): refused, never retried.
+    #[tokio::test]
+    async fn failover_to_same_account_is_refused() {
+        let (url, seen) = spawn_scripted_codex(vec![(
+            StatusCode::TOO_MANY_REQUESTS,
+            vec![],
+            QUOTA_429,
+        )])
+        .await;
+        let router = ScriptedRouter::new(
+            pinned("astra1", "acct_A", true),
+            vec![Some(pinned("astra1", "acct_A", true))],
+        );
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let err = run_codex_with_router(&url, &router, 10, &tx)
+            .await
+            .expect_err("must fail");
+        assert_eq!(err.to_string(), format!("Codex{RESPONSES_QUOTA_SUFFIX}"));
+        assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    /// Both seats exhausted: exactly one switch, then stop (bounded to
+    /// `MAX_CODEX_ACCOUNT_FAILOVERS`), even with a third candidate scripted.
+    #[tokio::test]
+    async fn all_accounts_exhausted_stops_after_one_failover() {
+        let (url, seen) = spawn_scripted_codex(vec![(
+            StatusCode::TOO_MANY_REQUESTS,
+            vec![],
+            QUOTA_429,
+        )])
+        .await;
+        let router = ScriptedRouter::new(
+            pinned("astra1", "acct_A", true),
+            vec![
+                Some(pinned("astra2", "acct_B", true)),
+                Some(pinned("astra3", "acct_C", true)),
+            ],
+        );
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let err = run_codex_with_router(&url, &router, 10, &tx)
+            .await
+            .expect_err("must fail");
+        assert_eq!(err.to_string(), format!("Codex{RESPONSES_QUOTA_SUFFIX}"));
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "A then B, never C");
+        assert_eq!(seen[0].account, "acct_A");
+        assert_eq!(seen[1].account, "acct_B");
+        assert_eq!(router.failover_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            router.reports(),
+            vec![
+                "openai-codex@astra1".to_string(),
+                "openai-codex@astra2".to_string()
+            ],
+            "both exhausted seats reported for cooldown"
+        );
+    }
+
+    /// In-stream quota failure (HTTP 200 + terminal `insufficient_quota`)
+    /// with NO output produced: one failover.
+    #[tokio::test]
+    async fn in_stream_quota_before_output_fails_over() {
+        const QUOTA_SSE: &str = concat!(
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"r\"}}\n\n",
+            "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"type\":\"insufficient_quota\",\"message\":\"ECHOED\"}}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let (url, seen) = spawn_scripted_codex(vec![
+            (StatusCode::OK, vec![], QUOTA_SSE),
+            (StatusCode::OK, vec![], CODEX_SSE_SUCCESS),
+        ])
+        .await;
+        let router = ScriptedRouter::new(
+            pinned("astra1", "acct_A", true),
+            vec![Some(pinned("astra2", "acct_B", true))],
+        );
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let result = run_codex_with_router(&url, &router, 2, &tx).await.unwrap();
+        assert_eq!(result["content"][0]["text"], "hello");
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[1].account, "acct_B");
+        assert_eq!(seen[1].bearer, fake_codex_token_for("acct_B"));
+    }
+
+    /// In-stream quota failure AFTER the model produced content — here only
+    /// a reasoning-summary delta, which this decoder does not even forward —
+    /// is terminal: no replay on another account.
+    #[tokio::test]
+    async fn in_stream_quota_after_any_output_never_replays() {
+        const QUOTA_AFTER_REASONING: &str = concat!(
+            "data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"thinking…\"}\n\n",
+            "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"quota_exceeded\",\"message\":\"x\"}}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let (url, seen) = spawn_scripted_codex(vec![
+            (StatusCode::OK, vec![], QUOTA_AFTER_REASONING),
+            (StatusCode::OK, vec![], CODEX_SSE_SUCCESS),
+        ])
+        .await;
+        let router = ScriptedRouter::new(
+            pinned("astra1", "acct_A", true),
+            vec![Some(pinned("astra2", "acct_B", true))],
+        );
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let err = run_codex_with_router(&url, &router, 5, &tx)
+            .await
+            .expect_err("must not replay after output");
+        assert_eq!(err.to_string(), format!("Codex{RESPONSES_QUOTA_SUFFIX}"));
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        assert_eq!(router.failover_calls.load(Ordering::SeqCst), 0);
+        // Still reported: the seat IS exhausted.
+        assert_eq!(router.reports(), vec!["openai-codex@astra1".to_string()]);
+    }
+
+    /// Text already streamed to the UI, then quota: terminal.
+    #[tokio::test]
+    async fn in_stream_quota_after_text_never_replays() {
+        const QUOTA_AFTER_TEXT: &str = concat!(
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n",
+            "data: {\"type\":\"error\",\"code\":\"usage_limit_reached\",\"message\":\"x\"}\n\n",
+        );
+        let (url, seen) = spawn_scripted_codex(vec![
+            (StatusCode::OK, vec![], QUOTA_AFTER_TEXT),
+            (StatusCode::OK, vec![], CODEX_SSE_SUCCESS),
+        ])
+        .await;
+        let router = ScriptedRouter::new(
+            pinned("astra1", "acct_A", true),
+            vec![Some(pinned("astra2", "acct_B", true))],
+        );
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let err = run_codex_with_router(&url, &router, 5, &tx)
+            .await
+            .expect_err("must not replay after output");
+        assert_eq!(err.to_string(), format!("Codex{RESPONSES_QUOTA_SUFFIX}"));
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        assert_eq!(router.failover_calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// `usage_not_included` is deterministic for the account: no transport
+    /// retry, no failover, status error surfaced.
+    #[tokio::test]
+    async fn usage_not_included_fails_fast_without_retry_or_failover() {
+        let (url, seen) = spawn_scripted_codex(vec![(
+            StatusCode::TOO_MANY_REQUESTS,
+            vec![],
+            r#"{"error":{"type":"usage_not_included","message":"no codex here"}}"#,
+        )])
+        .await;
+        let router = ScriptedRouter::new(
+            pinned("astra1", "acct_A", true),
+            vec![Some(pinned("astra2", "acct_B", true))],
+        );
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let err = run_codex_with_router(&url, &router, 5, &tx)
+            .await
+            .expect_err("must fail");
+        assert!(err.to_string().starts_with("codex request failed: 429"), "{err}");
+        assert!(!err.to_string().contains("no codex here"));
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        assert_eq!(router.failover_calls.load(Ordering::SeqCst), 0);
+        assert!(router.reports().is_empty());
+    }
+
+    /// A transient 503 (transport retry on A) followed by a quota 429 on A:
+    /// still pre-output, so one failover to B is allowed; B then needs its
+    /// own transient retry, which the shared budget still covers — a
+    /// failover neither consumes nor resets transport retries.
+    #[tokio::test]
+    async fn transport_retry_then_quota_then_failover_keeps_one_retry_budget() {
+        let (url, seen) = spawn_scripted_codex(vec![
+            (StatusCode::SERVICE_UNAVAILABLE, vec![], "{}"),
+            (StatusCode::TOO_MANY_REQUESTS, vec![], QUOTA_429),
+            (StatusCode::SERVICE_UNAVAILABLE, vec![], "{}"),
+            (StatusCode::OK, vec![], CODEX_SSE_SUCCESS),
+        ])
+        .await;
+        let router = ScriptedRouter::new(
+            pinned("astra1", "acct_A", true),
+            vec![Some(pinned("astra2", "acct_B", true))],
+        );
+        let (tx, _rx) = mpsc::unbounded_channel();
+        run_codex_with_router(&url, &router, 2, &tx).await.unwrap();
+        let seen = seen.lock().unwrap();
+        let accounts: Vec<&str> = seen.iter().map(|r| r.account.as_str()).collect();
+        assert_eq!(accounts, ["acct_A", "acct_A", "acct_B", "acct_B"]);
+        assert_eq!(router.failover_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// Transport budget already spent on A when the quota 429 arrives: the
+    /// failover is still permitted (it is not a transport retry), but B gets
+    /// no further transport retries — bounded on both axes.
+    #[tokio::test]
+    async fn failover_does_not_reset_transport_budget() {
+        let (url, seen) = spawn_scripted_codex(vec![
+            (StatusCode::SERVICE_UNAVAILABLE, vec![], "{}"),
+            (StatusCode::TOO_MANY_REQUESTS, vec![], QUOTA_429),
+            (StatusCode::SERVICE_UNAVAILABLE, vec![], "{}"),
+        ])
+        .await;
+        let router = ScriptedRouter::new(
+            pinned("astra1", "acct_A", true),
+            vec![Some(pinned("astra2", "acct_B", true))],
+        );
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let err = run_codex_with_router(&url, &router, 1, &tx)
+            .await
+            .expect_err("B's 503 exceeds the shared budget");
+        assert!(err.to_string().starts_with("codex request failed: 503"), "{err}");
+        let accounts: Vec<String> = seen.lock().unwrap().iter().map(|r| r.account.clone()).collect();
+        assert_eq!(accounts, ["acct_A", "acct_A", "acct_B"]);
+    }
+
+    /// Explicit NAMED account (`openai-codex@astra1`) with an in-stream quota
+    /// failure and an eligible alternative scripted: never rotates.
+    #[tokio::test]
+    async fn explicit_named_account_in_stream_quota_never_rotates() {
+        const QUOTA_SSE: &str = concat!(
+            "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"type\":\"insufficient_quota\",\"message\":\"x\"}}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let (url, seen) = spawn_scripted_codex(vec![
+            (StatusCode::OK, vec![], QUOTA_SSE),
+            (StatusCode::OK, vec![], CODEX_SSE_SUCCESS),
+        ])
+        .await;
+        let router = ScriptedRouter::new(
+            pinned("astra1", "acct_A", false),
+            vec![Some(pinned("astra2", "acct_B", true))],
+        );
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let err = run_codex_with_router(&url, &router, 5, &tx)
+            .await
+            .expect_err("explicit named account must not rotate");
+        assert_eq!(err.to_string(), format!("Codex{RESPONSES_QUOTA_SUFFIX}"));
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        assert_eq!(router.failover_calls.load(Ordering::SeqCst), 0);
+        assert!(notices(&mut rx).iter().all(|n| !n.contains("switched")));
+    }
+
+    /// Explicit DEFAULT slot behaves the same as a named one: no rotation.
+    #[tokio::test]
+    async fn explicit_default_account_quota_429_never_rotates() {
+        let (url, seen) = spawn_scripted_codex(vec![
+            (StatusCode::TOO_MANY_REQUESTS, vec![], QUOTA_429),
+            (StatusCode::OK, vec![], CODEX_SSE_SUCCESS),
+        ])
+        .await;
+        let router = ScriptedRouter::new(
+            pinned("default", "acct_D", false),
+            vec![Some(pinned("astra2", "acct_B", true))],
+        );
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let err = run_codex_with_router(&url, &router, 5, &tx)
+            .await
+            .expect_err("explicit default must not rotate");
+        assert_eq!(err.to_string(), format!("Codex{RESPONSES_QUOTA_SUFFIX}"));
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        assert_eq!(router.reports(), vec!["openai-codex".to_string()]);
+    }
+
+    /// Reasoning-only output as an output ITEM (no text delta, nothing
+    /// forwarded to the UI) followed by a quota failure: terminal.
+    #[tokio::test]
+    async fn in_stream_quota_after_reasoning_item_never_replays() {
+        const REASONING_ITEM_THEN_QUOTA: &str = concat!(
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"r\"}}\n\n",
+            "data: {\"type\":\"response.in_progress\",\"response\":{\"id\":\"r\"}}\n\n",
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"id\":\"rs_1\",\"summary\":[]}}\n\n",
+            "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"type\":\"insufficient_quota\",\"message\":\"x\"}}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let (url, seen) = spawn_scripted_codex(vec![
+            (StatusCode::OK, vec![], REASONING_ITEM_THEN_QUOTA),
+            (StatusCode::OK, vec![], CODEX_SSE_SUCCESS),
+        ])
+        .await;
+        let router = ScriptedRouter::new(
+            pinned("astra1", "acct_A", true),
+            vec![Some(pinned("astra2", "acct_B", true))],
+        );
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let err = run_codex_with_router(&url, &router, 5, &tx)
+            .await
+            .expect_err("reasoning output already produced");
+        assert_eq!(err.to_string(), format!("Codex{RESPONSES_QUOTA_SUFFIX}"));
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        assert_eq!(router.failover_calls.load(Ordering::SeqCst), 0);
+        // Nothing reached the UI — the gate is stricter than "was forwarded".
+        while let Ok(ev) = rx.try_recv() {
+            assert!(
+                !matches!(ev, StreamEvent::Llm(crate::LlmEvent::Text(_))),
+                "no text was forwarded"
+            );
+        }
+    }
+
+    /// A metadata-only prelude (`response.created` / `in_progress`) does not
+    /// count as output: failover stays permitted.
+    #[tokio::test]
+    async fn metadata_only_prelude_does_not_block_failover() {
+        const METADATA_THEN_QUOTA: &str = concat!(
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"r\"}}\n\n",
+            "data: {\"type\":\"response.in_progress\",\"response\":{\"id\":\"r\"}}\n\n",
+            "data: {\"type\":\"error\",\"code\":\"usage_limit_reached\",\"message\":\"x\"}\n\n",
+        );
+        let (url, seen) = spawn_scripted_codex(vec![
+            (StatusCode::OK, vec![], METADATA_THEN_QUOTA),
+            (StatusCode::OK, vec![], CODEX_SSE_SUCCESS),
+        ])
+        .await;
+        let router = ScriptedRouter::new(
+            pinned("astra1", "acct_A", true),
+            vec![Some(pinned("astra2", "acct_B", true))],
+        );
+        let (tx, _rx) = mpsc::unbounded_channel();
+        run_codex_with_router(&url, &router, 2, &tx).await.unwrap();
+        assert_eq!(seen.lock().unwrap()[1].account, "acct_B");
+    }
+
+    /// A failover candidate whose token carries no ChatGPT account claim
+    /// cannot be paired with a header: the turn fails at the runtime, and
+    /// no request is ever sent with a header borrowed from the failed seat.
+    #[tokio::test]
+    async fn failover_candidate_without_account_claim_never_sends_mixed_headers() {
+        let (url, seen) = spawn_scripted_codex(vec![
+            (StatusCode::TOO_MANY_REQUESTS, vec![], QUOTA_429),
+            (StatusCode::OK, vec![], CODEX_SSE_SUCCESS),
+        ])
+        .await;
+        let claimless = PinnedAccount {
+            credential: CredentialRef::new(
+                OAuthProviderId::OpenAiCodex,
+                Account::parse("astra2").unwrap(),
+            ),
+            token: format!(
+                "h.{}.s",
+                URL_SAFE_NO_PAD.encode(serde_json::json!({"sub": "nobody"}).to_string())
+            ),
+            auto: true,
+        };
+        let router = ScriptedRouter::new(pinned("astra1", "acct_A", true), vec![Some(claimless)]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let err = run_codex_with_router(&url, &router, 5, &tx)
+            .await
+            .expect_err("claimless token cannot be paired");
+        assert!(err.to_string().contains("account id"), "{err}");
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "only A's attempt was sent");
+        assert_eq!(seen[0].account, "acct_A");
+    }
+
+    /// The router itself failing during failover is not a loop: report,
+    /// fail the turn with the quota message.
+    #[tokio::test]
+    async fn router_failover_error_ends_turn() {
+        struct FailingRouter(PinnedAccount);
+        #[async_trait]
+        impl CodexAccountRouter for FailingRouter {
+            async fn pin(&self, _m: &str) -> Result<PinnedAccount, String> {
+                Ok(self.0.clone())
+            }
+            async fn failover(
+                &self,
+                _m: &str,
+                _f: &PinnedAccount,
+                _e: &CodexQuotaEvidence,
+                _n: u32,
+            ) -> Result<Option<PinnedAccount>, String> {
+                Err("broker unreachable".into())
+            }
+            async fn report_exhausted(&self, _f: &PinnedAccount, _e: &CodexQuotaEvidence) {}
+        }
+        let (url, seen) = spawn_scripted_codex(vec![(
+            StatusCode::TOO_MANY_REQUESTS,
+            vec![],
+            QUOTA_429,
+        )])
+        .await;
+        let router = FailingRouter(pinned("astra1", "acct_A", true));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let err = run_codex_with_router(&url, &router, 5, &tx)
+            .await
+            .expect_err("must fail");
+        assert_eq!(err.to_string(), format!("Codex{RESPONSES_QUOTA_SUFFIX}"));
+        assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    /// The broker adapter with the default trait surface pins the policy
+    /// account as an explicit selection and reports no candidates: the old
+    /// `TokenOnlyBroker` mock keeps working and a quota 429 simply fails.
+    #[tokio::test]
+    async fn broker_adapter_default_trait_surface_is_explicit_and_fails_closed() {
+        let (url, seen) = spawn_scripted_codex(vec![(
+            StatusCode::TOO_MANY_REQUESTS,
+            vec![],
+            QUOTA_429,
+        )])
+        .await;
+        let err = run_codex(&url, 5).await.expect_err("must fail");
+        assert_eq!(err.to_string(), format!("Codex{RESPONSES_QUOTA_SUFFIX}"));
+        assert_eq!(seen.lock().unwrap().len(), 1, "no retry, no failover");
+    }
+
     /// The dispatch seam lifts the generic three-attempt budget to the
     /// persistent posture adopted for Anthropic OAuth overloads (10 retries)
     /// — incident: 2026-07-16 chatgpt.com 503/520/timeout bursts.
@@ -4732,6 +6707,23 @@ mod send_retry_tests {
 
     /// Backoff doubles per attempt but caps at 2^6 — a 10-deep budget must
     /// never sleep 512s on its final attempt.
+    /// 04-tui I4: the incomplete-response retry is a typed retry (the
+    /// header's "retrying"), not a notice the client has to recognise.
+    #[tokio::test]
+    async fn a_stream_retry_is_a_typed_retry_event() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let waiting = cancel.clone();
+        let task = tokio::spawn(async move { wait_stream_retry(&tx, &waiting, 1, 3, true).await.is_ok() });
+        let ev = rx.recv().await.expect("the retry is announced");
+        cancel.cancel();
+        assert!(!task.await.unwrap(), "cancel ends the wait");
+        assert!(
+            matches!(&ev, StreamEvent::Session(crate::SessionEvent::Retry(t)) if t.starts_with("Response incomplete — retrying")),
+            "{ev:?}"
+        );
+    }
+
     #[test]
     fn retry_delay_is_exponential_with_a_capped_tail() {
         assert_eq!(retry_delay(1).as_secs(), 1);
@@ -4844,8 +6836,11 @@ mod send_retry_tests {
         let _guard = tracing::subscriber::set_default(capture_subscriber(&buf));
 
         let err = send_with_retries(
-            "codex",
-            &url,
+            SendTarget {
+                label: "codex",
+                url: &url,
+                quota_probe: true,
+            },
             || client.post(&url).json(&body),
             &tokio_util::sync::CancellationToken::new(),
             3,
@@ -4865,6 +6860,90 @@ mod send_retry_tests {
         assert_no_banned(&logs, "tracing output");
     }
 
+    /// Answer every request with `status` and a fixed body.
+    async fn spawn_fixed_body_provider(status: StatusCode, body: String) -> String {
+        let app = Router::new().fallback(move || {
+            let body = body.clone();
+            async move { (status, [("content-type", "application/json")], body).into_response() }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    /// Codex 4xx: identifiers and Synaps-authored text only. Every probe is
+    /// plain prose that a quote/length/charset sanitizer lets through; none
+    /// of it may reach the error string, the net.rs classification log, or
+    /// any captured tracing output.
+    #[tokio::test]
+    async fn codex_4xx_never_surfaces_provider_prose_in_error_or_logs() {
+        const PROSE: &str = "ZZPROSE";
+        let probes = [
+            // Apostrophe flips naive quote parsing; the echo follows it.
+            "The model can't accept 'ZZPROSE echo of the user prompt, it's long' here".to_string(),
+            // Short quoted span with a secret.
+            format!("Invalid 'input[0]': '{PROSE} AKIAIOSFODNN7EXAMPLE pls'"),
+            // Unquoted prose echo.
+            format!("Your request about {PROSE} my private quarterly notes was rejected"),
+            // Curly / guillemet quotes.
+            format!("Bad value \u{2018}{PROSE} one\u{2019} and \u{201c}{PROSE} two\u{201d} \u{ab}x\u{bb}"),
+            // Secret glued to punctuation.
+            format!("{PROSE} key:sk-proj-abc123 password=hunter2 https://h/x?token=abc"),
+            // Bidi override and zero-width characters.
+            format!("{PROSE}\u{202e}gnirts\u{202c} s\u{200b}k-\u{2066}live\u{2069}"),
+        ];
+        for prose in probes {
+            let body = serde_json::json!({"error": {
+                "message": prose,
+                "type": "invalid_request_error",
+                "code": "unsupported_value",
+                "param": "reasoning.effort",
+            }})
+            .to_string();
+            let url = spawn_fixed_body_provider(StatusCode::BAD_REQUEST, body).await;
+            let client = reqwest::Client::new();
+            let buf = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let _guard = tracing::subscriber::set_default(capture_subscriber(&buf));
+            let err = send_with_retries(
+                SendTarget {
+                    label: "codex",
+                    url: &url,
+                    quota_probe: true,
+                },
+                || client.post(&url).body("{}"),
+                &tokio_util::sync::CancellationToken::new(),
+                3,
+                &mut 0,
+                &mut tr::StreamAttempt::new(None),
+            )
+            .await
+            .expect_err("400 must fail fast");
+            // Run the error through the route classifier too: it logs.
+            let runtime =
+                super::super::net::provider_error_to_runtime_for("openai-codex/gpt-5.6-sol", err);
+            let msg = runtime.to_string();
+            let logs = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+            for (where_, text) in [("error", &msg), ("logs", &logs)] {
+                for banned in [
+                    PROSE, "can't", "AKIA", "sk-", "hunter2", "token=", "private", "gnirts",
+                    "\u{202e}", "\u{200b}", "\u{2066}", "\u{2018}", "\u{201c}",
+                ] {
+                    assert!(
+                        !text.contains(banned),
+                        "provider prose `{banned}` leaked into {where_} for probe {prose:?}: {text}"
+                    );
+                }
+            }
+            // Identifiers and our own explanation do surface.
+            assert!(
+                msg.contains("[invalid_request_error/unsupported_value, param reasoning.effort]"),
+                "{msg}"
+            );
+            assert!(msg.contains("/effort"), "static explanation missing: {msg}");
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn send_with_retries_retry_logs_never_contain_provider_body() {
         let url = spawn_hostile_echo_provider(StatusCode::SERVICE_UNAVAILABLE).await;
@@ -4875,8 +6954,11 @@ mod send_retry_tests {
         let _guard = tracing::subscriber::set_default(capture_subscriber(&buf));
 
         let err = send_with_retries(
-            "codex",
-            &url,
+            SendTarget {
+                label: "codex",
+                url: &url,
+                quota_probe: true,
+            },
             || client.post(&url).json(&body),
             &tokio_util::sync::CancellationToken::new(),
             1,
@@ -5120,5 +7202,459 @@ mod interrupted_broker_tests {
             classify_error(&format!("denied: {STREAM_INTERRUPTED}")).0,
             Outcome::Blocked
         );
+    }
+}
+
+#[cfg(test)]
+mod muse_tests {
+    //! Meta Muse Responses route: exact body shape (mirrors the official
+    //! Muse Code client) and an end-to-end turn through a capturing broker.
+    use super::*;
+    use crate::auth::{
+        AccessToken, BrokerError, CredentialBroker, ProxyByteStream, ProxyMethod, ProxyRequest,
+        ProxyResponse,
+    };
+    use agent_core::reasoning::ReasoningLevel;
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn body_mirrors_official_client_and_adaptive_omits_reasoning() {
+        let input = json!([{"role":"user","content":[{"type":"input_text","text":"hi"}]}]);
+        let tool = json!({"type":"function","name":"bash","parameters":{"type":"object"}});
+        let key = muse_prompt_cache_key("sys", input.as_array().unwrap().first());
+        let body = build_muse_body(
+            "muse-wonder-1.0",
+            ReasoningLevel::Adaptive,
+            input.clone(),
+            "sys",
+            vec![tool.clone()],
+            Some(2048),
+            &key,
+        )
+        .unwrap();
+        assert_eq!(body["model"], "muse-wonder-1.0");
+        assert_eq!(body["instructions"], "sys");
+        assert_eq!(body["input"], input);
+        assert_eq!(body["store"], false);
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["tools"], json!([tool]));
+        assert_eq!(body["max_output_tokens"], 2048);
+        assert_eq!(body["prompt_cache_key"], key.as_str());
+        assert!(
+            body.get("reasoning").is_none(),
+            "adaptive = provider default"
+        );
+        assert!(body.get("messages").is_none());
+        assert!(body.get("temperature").is_none());
+
+        // Empty prompt/tools/limit are omitted, not sent empty.
+        let bare = build_muse_body(
+            "muse-wonder-1.0",
+            ReasoningLevel::Adaptive,
+            json!([]),
+            "",
+            Vec::new(),
+            None,
+            &key,
+        )
+        .unwrap();
+        for absent in ["instructions", "tools", "max_output_tokens", "reasoning"] {
+            assert!(bare.get(absent).is_none(), "{absent}");
+        }
+    }
+
+    #[test]
+    fn named_effort_requires_exact_live_evidence_before_any_io() {
+        // Held for the whole test: the seed assertions read the shared
+        // process-global `muse/*` cache rows too.
+        let _guard = crate::runtime::openai::catalog::muse::test_cache_guard();
+        crate::runtime::openai::catalog::capability_cache::replace_provider("muse", &[]);
+        // The static seed advertises no effort set: named levels are refused
+        // in the pure builder, i.e. before credentials or network.
+        for level in [
+            ReasoningLevel::Off,
+            ReasoningLevel::High,
+            ReasoningLevel::Max,
+        ] {
+            let err = build_muse_body(
+                "muse-wonder-1.0",
+                level,
+                json!([]),
+                "",
+                Vec::new(),
+                None,
+                "k",
+            )
+            .unwrap_err();
+            assert!(err.contains("adaptive"), "{level}: {err}");
+        }
+        // Uncataloged-but-routable id: provider default only; malformed: none.
+        assert!(build_muse_body(
+            "never-cataloged-zz9",
+            ReasoningLevel::Adaptive,
+            json!([]),
+            "",
+            Vec::new(),
+            None,
+            "k"
+        )
+        .is_ok());
+        assert!(build_muse_body(
+            "Bad Id",
+            ReasoningLevel::Adaptive,
+            json!([]),
+            "",
+            Vec::new(),
+            None,
+            "k"
+        )
+        .is_err());
+
+        let models = crate::runtime::openai::catalog::parse_muse_catalog_models(
+            r#"{"models":[{"id":"muse-body-probe-zz2","reasoning_effort_variants":
+                [{"effort":"none"},{"effort":"xhigh"}]}]}"#,
+        )
+        .unwrap();
+        crate::runtime::openai::catalog::capability_cache::replace_provider("muse", &models);
+        for (level, effort) in [
+            (ReasoningLevel::Off, "none"),
+            (ReasoningLevel::XHigh, "xhigh"),
+        ] {
+            let body = build_muse_body(
+                "muse-body-probe-zz2",
+                level,
+                json!([]),
+                "",
+                Vec::new(),
+                None,
+                "k",
+            )
+            .unwrap();
+            assert_eq!(body["reasoning"], json!({"effort": effort}));
+        }
+        assert!(build_muse_body(
+            "muse-body-probe-zz2",
+            ReasoningLevel::High,
+            json!([]),
+            "",
+            Vec::new(),
+            None,
+            "k"
+        )
+        .is_err());
+        crate::runtime::openai::catalog::capability_cache::replace_provider("muse", &[]);
+    }
+
+    #[test]
+    fn cache_key_is_deterministic_namespaced_and_prefix_sensitive() {
+        let first = json!({"role":"user","content":"a"});
+        let k1 = muse_prompt_cache_key("sys", Some(&first));
+        assert_eq!(k1, muse_prompt_cache_key("sys", Some(&first)));
+        assert!(k1.starts_with("synaps-muse-"), "{k1}");
+        assert_ne!(k1, codex_prompt_cache_key("sys", Some(&first)));
+        assert_ne!(k1, muse_prompt_cache_key("sys2", Some(&first)));
+        assert_ne!(
+            k1,
+            muse_prompt_cache_key("sys", Some(&json!({"role":"user","content":"b"})))
+        );
+    }
+
+    struct CaptureBroker {
+        sse: &'static str,
+        seen: Mutex<Vec<ProxyRequest>>,
+    }
+
+    #[async_trait::async_trait]
+    impl CredentialBroker for CaptureBroker {
+        async fn access_token(
+            &self,
+            _: crate::auth::OAuthProviderId,
+        ) -> Result<AccessToken, BrokerError> {
+            unreachable!("the runtime never holds the Muse key")
+        }
+        async fn proxy(&self, _: ProxyRequest) -> Result<ProxyResponse, BrokerError> {
+            unreachable!()
+        }
+        async fn proxy_stream(
+            &self,
+            request: ProxyRequest,
+        ) -> Result<ProxyByteStream, BrokerError> {
+            self.seen.lock().unwrap().push(request);
+            Ok(Box::pin(futures::stream::iter(vec![Ok(
+                bytes::Bytes::from_static(self.sse.as_bytes()),
+            )])))
+        }
+        async fn anthropic_usage(&self) -> Result<Value, BrokerError> {
+            unreachable!()
+        }
+        async fn capabilities(&self) -> Result<Vec<agent_core::auth::ProviderStatus>, BrokerError> {
+            Ok(vec![])
+        }
+    }
+
+    const SSE: &str = concat!(
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hel\"}\n\n",
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"lo\"}\n\n",
+        "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",",
+        "\"call_id\":\"call_1\",\"name\":\"bash\",\"arguments\":\"{\\\"command\\\":\\\"ls\\\"}\"}}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"usage\":",
+        "{\"input_tokens\":12,\"output_tokens\":3}}}\n\n",
+    );
+
+    #[tokio::test]
+    async fn turn_streams_through_broker_with_system_prompt_as_instructions() {
+        let broker = Arc::new(CaptureBroker {
+            sse: SSE,
+            seen: Mutex::new(Vec::new()),
+        });
+        let dyn_broker: Arc<dyn CredentialBroker> = broker.clone();
+        let cfg = ProviderConfig {
+            base_url: crate::auth::muse::API_BASE_URL.into(),
+            model: "muse-wonder-1.0".into(),
+            provider: "muse".into(),
+        };
+        let tools = vec![json!({
+            "name":"bash","description":"run","input_schema":{"type":"object","properties":{}}
+        })];
+        let messages: Vec<crate::SharedMessage> =
+            vec![Arc::new(json!({"role":"user","content":"hi muse"}))];
+        let (tx, mut rx) = mpsc::unbounded_channel::<StreamEvent>();
+        let cancel = tokio_util::sync::CancellationToken::new();
+
+        let result = call_responses_route_inner(
+            "muse",
+            &cfg,
+            &dyn_broker,
+            &tools,
+            &Some("You are Synaps.".into()),
+            &messages,
+            &tx,
+            Some(4096),
+            ReasoningLevel::Adaptive,
+            &cancel,
+            0,
+            &crate::runtime::trace::TraceContext::disabled(),
+            true,
+        )
+        .await
+        .expect("muse turn completes");
+
+        // Assistant text + translated tool call come back Anthropic-shaped.
+        let content = result["content"].as_array().unwrap();
+        assert_eq!(content[0]["text"], "Hello");
+        let tool_use = content
+            .iter()
+            .find(|block| block["type"] == "tool_use")
+            .expect("tool call surfaced");
+        assert_eq!(tool_use["name"], "bash");
+        assert_eq!(tool_use["input"]["command"], "ls");
+
+        // Exactly one broker-proxied POST to the pinned Responses path.
+        let seen = broker.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        let request = &seen[0];
+        assert_eq!(request.provider, "muse");
+        assert_eq!(request.method, ProxyMethod::Post);
+        assert_eq!(request.path, "/v1/responses");
+        assert!(request.stream);
+        let body = request.body.as_ref().unwrap();
+        assert_eq!(body["model"], "muse-wonder-1.0");
+        assert_eq!(body["instructions"], "You are Synaps.");
+        assert_eq!(body["store"], false);
+        assert_eq!(body["max_output_tokens"], 4096);
+        assert!(body["prompt_cache_key"]
+            .as_str()
+            .unwrap()
+            .starts_with("synaps-muse-"));
+        // System prompt is NOT duplicated into the input items.
+        let wire = body["input"].to_string();
+        assert!(!wire.contains("You are Synaps."), "{wire}");
+        assert!(wire.contains("hi muse"), "{wire}");
+        assert_eq!(body["tools"][0]["name"], "bash");
+        // Exact-bytes handoff matches the structured body.
+        let bytes = request.body_bytes.as_ref().expect("exact wire bytes");
+        assert_eq!(
+            serde_json::from_slice::<Value>(bytes).unwrap(),
+            body.clone()
+        );
+
+        drop(tx);
+        let mut streamed = String::new();
+        while let Ok(event) = rx.try_recv() {
+            if let StreamEvent::Llm(crate::runtime::types::LlmEvent::Text(text)) = event {
+                streamed.push_str(&text);
+            }
+        }
+        assert_eq!(streamed, "Hello");
+    }
+
+    #[test]
+    fn dangling_preamble_trigger_cases() {
+        // (i) Muse's own commentary label with no tool call.
+        assert_eq!(
+            muse_dangling_preamble(false, Some("commentary"), "Now checking prod logs."),
+            Some("commentary_phase")
+        );
+        // (ii) short final text ending in ':' (the observed failures).
+        assert_eq!(
+            muse_dangling_preamble(
+                false,
+                None,
+                "Key facts assembled. Blocking question before I build anything:\n"
+            ),
+            Some("colon_preamble")
+        );
+        assert_eq!(
+            muse_dangling_preamble(
+                false,
+                Some("final_answer"),
+                "Now checking whether prod logs show the error:"
+            ),
+            Some("colon_preamble")
+        );
+        // Never when the response acted.
+        assert_eq!(
+            muse_dangling_preamble(true, Some("commentary"), "Running:"),
+            None
+        );
+        // Real answers: no colon, empty, or long content that ends in ':'.
+        assert_eq!(muse_dangling_preamble(false, None, "All done."), None);
+        assert_eq!(muse_dangling_preamble(false, None, "   "), None);
+        assert_eq!(
+            muse_dangling_preamble(false, Some("final_answer"), "Which format?"),
+            None
+        );
+        let long = format!("{}:", "x".repeat(PREAMBLE_MAX_CHARS));
+        assert_eq!(muse_dangling_preamble(false, None, &long), None);
+        let edge = format!("{}:", "x".repeat(PREAMBLE_MAX_CHARS - 1));
+        assert_eq!(
+            muse_dangling_preamble(false, None, &edge),
+            Some("colon_preamble")
+        );
+    }
+
+    #[test]
+    fn preamble_nudge_fires_at_most_once_per_turn() {
+        let flagged =
+            json!({"role":"assistant","content":[],DANGLING_PREAMBLE_KEY:"colon_preamble"});
+        let clean = json!({"role":"assistant","content":[]});
+        let mut nudged = false;
+        assert_eq!(take_preamble_nudge(&clean, &mut nudged, false, true), None);
+        assert!(!nudged, "a clean response must not consume the one nudge");
+        assert_eq!(
+            take_preamble_nudge(&flagged, &mut nudged, false, true).as_deref(),
+            Some("colon_preamble")
+        );
+        assert!(nudged);
+        // Second dangling preamble in the same turn: the turn ends normally.
+        assert_eq!(
+            take_preamble_nudge(&flagged, &mut nudged, false, true),
+            None
+        );
+        // Cancelled rounds and the disable switch never nudge.
+        let mut fresh = false;
+        assert_eq!(take_preamble_nudge(&flagged, &mut fresh, true, true), None);
+        assert_eq!(
+            take_preamble_nudge(&flagged, &mut fresh, false, false),
+            None
+        );
+        assert!(!fresh);
+    }
+
+    #[test]
+    fn preamble_nudge_env_switch_parses_off_values_only() {
+        assert!(preamble_nudge_enabled_value(None));
+        assert!(preamble_nudge_enabled_value(Some("1")));
+        assert!(preamble_nudge_enabled_value(Some("")));
+        for off in ["0", "false", "OFF", " no "] {
+            assert!(!preamble_nudge_enabled_value(Some(off)), "{off}");
+        }
+    }
+
+    async fn muse_turn(sse: &'static str, messages: Vec<Value>) -> (Value, Value) {
+        let broker = Arc::new(CaptureBroker {
+            sse,
+            seen: Mutex::new(Vec::new()),
+        });
+        let dyn_broker: Arc<dyn CredentialBroker> = broker.clone();
+        let cfg = ProviderConfig {
+            base_url: crate::auth::muse::API_BASE_URL.into(),
+            model: "muse-wonder-1.0".into(),
+            provider: "muse".into(),
+        };
+        let tools = vec![json!({
+            "name":"bash","description":"run","input_schema":{"type":"object","properties":{}}
+        })];
+        let messages: Vec<crate::SharedMessage> = messages.into_iter().map(Arc::new).collect();
+        let (tx, _rx) = mpsc::unbounded_channel::<StreamEvent>();
+        let result = call_responses_route_inner(
+            "muse",
+            &cfg,
+            &dyn_broker,
+            &tools,
+            &None,
+            &messages,
+            &tx,
+            None,
+            ReasoningLevel::Adaptive,
+            &tokio_util::sync::CancellationToken::new(),
+            0,
+            &crate::runtime::trace::TraceContext::disabled(),
+            true,
+        )
+        .await
+        .expect("muse turn completes");
+        let body = broker.seen.lock().unwrap()[0].body.clone().unwrap();
+        (result, body)
+    }
+
+    const PREAMBLE_SSE: &str = concat!(
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":",
+        "{\"type\":\"message\",\"role\":\"assistant\",\"content\":[]}}\n\n",
+        "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,",
+        "\"delta\":\"Blocking question before I build anything:\"}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"usage\":",
+        "{\"input_tokens\":12,\"output_tokens\":3}}}\n\n",
+    );
+
+    #[tokio::test]
+    async fn muse_route_flags_dangling_preamble_outside_content() {
+        let (result, _) =
+            muse_turn(PREAMBLE_SSE, vec![json!({"role":"user","content":"go"})]).await;
+        assert_eq!(result[DANGLING_PREAMBLE_KEY], "colon_preamble");
+        // Stored content stays Anthropic-shaped and carries no sidecar/phase.
+        assert_eq!(
+            result["content"],
+            json!([{"type":"text","text":"Blocking question before I build anything:"}])
+        );
+        // A response that acted is not flagged.
+        let (result, _) = muse_turn(SSE, vec![json!({"role":"user","content":"go"})]).await;
+        assert!(result.get(DANGLING_PREAMBLE_KEY).is_none(), "{result}");
+    }
+
+    #[tokio::test]
+    async fn muse_request_replays_assistant_text_with_phase() {
+        let (_, body) = muse_turn(
+            SSE,
+            vec![
+                json!({"role":"user","content":"go"}),
+                json!({"role":"assistant","content":[
+                    {"type":"text","text":"Checking:"},
+                    {"type":"tool_use","id":"call_a","name":"bash","input":{}},
+                ]}),
+                json!({"role":"user","content":[
+                    {"type":"tool_result","tool_use_id":"call_a","content":"ok"},
+                ]}),
+                json!({"role":"assistant","content":[{"type":"text","text":"Done."}]}),
+                json!({"role":"user","content":"next"}),
+            ],
+        )
+        .await;
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input[1]["phase"], "commentary");
+        assert_eq!(input[1]["content"][0]["text"], "Checking:");
+        assert_eq!(input[2]["type"], "function_call");
+        assert_eq!(input[4]["phase"], "final_answer");
+        assert_eq!(input[4]["content"][0]["type"], "output_text");
     }
 }

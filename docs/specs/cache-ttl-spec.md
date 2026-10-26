@@ -677,6 +677,7 @@ variant exhaustively and drives them through the actor.
 | Session detached | Keep-warm continues (cost bounded by §7.2). The idle **auto-park** is deferred while a period is active (`can_park`); when it ends, `rearm_park` and the session parks after the normal grace. |
 | Explicit `Park` (host / reload) while a period is active | The period ends (`parked by request`), then the session parks. |
 | Script/RPC-only session | No period: requires a TUI or `synaps attach` client to have attached once. |
+| Observe-only session (`--observe` attaches only) | No period: an `Observe` attach cannot type, so it never marks the session interactive, whatever its client kind. A later `Mirror`/`Takeover` TUI or `synaps attach` does. |
 
 Why defer the auto-park rather than ping while parked: parking drops the
 runtime and conversation, and the ping must be built by that runtime from
@@ -746,8 +747,9 @@ written to history, the session file or the transcript.
   settlement can still lose **that one in-flight ping's** charge, at most its
   exposure (§7.2). On load both labels are clamped under the
   totals they are part of (`Session::clamp_keepwarm_to_totals`; on resume the
-  cache-token buckets restart at 0 with the cache totals, which are not
-  persisted). `journal_written_by_this_build_parses_with_the_0_10_1_reader`
+  cache-token buckets are clamped under the cache totals, which persist with
+  the session snapshot like the keep-warm labels: snapshot-only, never
+  journaled. A session saved before they persisted resumes both at 0). `journal_written_by_this_build_parses_with_the_0_10_1_reader`
   replays this build's journal through a frozen copy of 0.10.1's record types.
 - A compaction successor restarts the keep-warm subtotal exactly like the
   totals it belongs to: cost, input and output restart at 0; the cache-token

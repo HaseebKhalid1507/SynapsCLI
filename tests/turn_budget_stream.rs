@@ -185,7 +185,7 @@ async fn infinite_tool_loop_stops_at_exact_round_budget() {
     std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
 
     let budget = TurnBudget {
-        max_provider_rounds: 3,
+        max_provider_rounds: Some(3),
         // Strict fixture: graceful continuation OFF so the round cap is the
         // exact hard stop this test pins. (Foreground defaults to 8
         // renewals, which would yield 3 * (1 + 8) = 27 rounds.)
@@ -223,7 +223,7 @@ async fn tool_call_budget_synthesizes_results_beyond_exact_allowance() {
     std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
 
     let budget = TurnBudget {
-        max_tool_calls: 2,
+        max_tool_calls: Some(2),
         ..TurnBudget::for_role(TurnRole::Foreground)
     };
     let (rt, executions) = runtime_with_fixture(budget, 8).await;
@@ -268,7 +268,7 @@ async fn accumulated_tool_result_bytes_budget_stops_turn() {
     std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
 
     let budget = TurnBudget {
-        max_accumulated_tool_result_bytes: 1024,
+        max_accumulated_tool_result_bytes: Some(1024),
         ..TurnBudget::for_role(TurnRole::Foreground)
     };
     let (rt, executions) = runtime_with_fixture(budget, 4096).await;
@@ -384,20 +384,25 @@ fn per_role_defaults_and_auto_turn_composition() {
     let fg = TurnBudget::for_role(TurnRole::Foreground);
     let auto = TurnBudget::for_role(TurnRole::Autonomous);
     let worker = TurnBudget::for_role(TurnRole::Worker);
-    assert!(fg.max_provider_rounds > auto.max_provider_rounds);
-    assert!(worker.max_provider_rounds <= fg.max_provider_rounds);
-    assert_eq!(
-        (fg.max_elapsed, auto.max_elapsed, worker.max_elapsed),
-        (None, None, None)
-    );
+    // Interactive turns are unlimited by default (#219); unattended
+    // autonomous turns and workers keep finite round caps.
+    assert_eq!(fg.max_provider_rounds, None);
+    assert_eq!(fg.max_tool_calls, None);
+    assert_eq!(fg.max_accumulated_tool_result_bytes, None);
+    assert_eq!(auto.max_provider_rounds, Some(24));
+    assert_eq!(auto.max_tool_calls, Some(96));
+    assert_eq!(worker.max_provider_rounds, Some(64));
+    for budget in [&fg, &auto, &worker] {
+        assert_eq!(budget.max_elapsed, None);
+    }
     assert!(fg.max_context_tokens.is_none() && fg.max_cost_usd.is_none());
 
     // Typed config overrides per role.
     let mut cfg = synaps_cli::config::TurnBudgetsConfig::default();
-    cfg.worker.max_provider_rounds = Some(3);
+    cfg.worker.max_provider_rounds = Some(synaps_cli::config::TurnLimit::Max(3));
     cfg.worker.max_cost_usd = Some(0.25);
     let from_cfg = TurnBudget::from_config(TurnRole::Worker, &cfg);
-    assert_eq!(from_cfg.max_provider_rounds, 3);
+    assert_eq!(from_cfg.max_provider_rounds, Some(3));
     assert_eq!(from_cfg.max_cost_usd, Some(0.25));
     // Unset fields keep the role defaults.
     assert_eq!(from_cfg.max_tool_calls, worker.max_tool_calls);
@@ -474,7 +479,7 @@ async fn budget_exhaustion_is_logged_with_exact_dimension() {
     std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
 
     let budget = TurnBudget {
-        max_provider_rounds: 2,
+        max_provider_rounds: Some(2),
         max_round_renewals: 0,
         ..TurnBudget::for_role(TurnRole::Foreground)
     };
@@ -513,7 +518,7 @@ async fn graceful_round_renewal_is_logged() {
     std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
 
     let budget = TurnBudget {
-        max_provider_rounds: 2,
+        max_provider_rounds: Some(2),
         max_round_renewals: 2,
         ..TurnBudget::for_role(TurnRole::Foreground)
     };
@@ -536,5 +541,74 @@ async fn graceful_round_renewal_is_logged() {
     assert!(
         log.contains("turn_budget_exhausted"),
         "exhausted renewals must still log a hard stop; got:\n{log}"
+    );
+}
+
+/// Text plus a tool call, in a round billed at 1M uncached input tokens
+/// ($3 on Sonnet): over any small turn cost budget.
+const SSE_EXPENSIVE_TEXT_AND_TOOL: &str = concat!(
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_c1\",\"type\":\"message\",",
+    "\"role\":\"assistant\",\"content\":[],\"model\":\"claude-sonnet-4-5\",\"stop_reason\":null,",
+    "\"stop_sequence\":null,\"usage\":{\"input_tokens\":1000000,\"output_tokens\":0,",
+    "\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0}}}\n\n",
+    "data: {\"type\":\"content_block_start\",\"index\":0,",
+    "\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+    "data: {\"type\":\"content_block_delta\",\"index\":0,",
+    "\"delta\":{\"type\":\"text_delta\",\"text\":\"paid-for findings\"}}\n\n",
+    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+    "data: {\"type\":\"content_block_start\",\"index\":1,",
+    "\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_paid\",\"name\":\"budget_fixture_tool\"}}\n\n",
+    "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\",",
+    "\"stop_sequence\":null},\"usage\":{\"input_tokens\":1000000,\"output_tokens\":5,",
+    "\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0}}\n\n",
+    "data: {\"type\":\"message_stop\"}\n\n",
+);
+
+/// A cost stop keeps the round it already paid for: the assistant's text and
+/// tool call stay in history, the call is NOT executed and gets a paired
+/// "not executed" result, and the turn ends as CostUsd-exhausted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn cost_stop_keeps_the_paid_for_response_with_unexecuted_calls_paired() {
+    let _guard = HomeGuard::new();
+    let (url, hits, _) = spawn_stub(Script::SeqSse(&[SSE_EXPENSIVE_TEXT_AND_TOOL])).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+
+    let budget = TurnBudget {
+        max_cost_usd: Some(0.50),
+        ..TurnBudget::for_role(TurnRole::Foreground)
+    };
+    let (rt, executions) = runtime_with_fixture(budget, 8).await;
+    let events = drive_runtime_turn(&rt, "spend", false).await;
+
+    assert_eq!(hits.load(Ordering::SeqCst), 1, "no further provider round");
+    assert_eq!(
+        executions.load(Ordering::SeqCst),
+        0,
+        "the call is not executed"
+    );
+    assert_eq!(
+        budget_outcome(&events),
+        Some(TurnOutcome::BudgetExceeded {
+            dimension: BudgetDimension::CostUsd
+        })
+    );
+    let history = final_history(&events);
+    let assistant = history
+        .iter()
+        .find(|m| m["role"] == "assistant")
+        .expect("the paid-for response stays in history");
+    assert!(assistant.to_string().contains("paid-for findings"));
+    assert_history_pairing(&history);
+    let results = tool_result_contents(&history);
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].0, "toolu_paid");
+    assert!(
+        results[0]
+            .1
+            .starts_with(synaps_cli::runtime::budget::TOOL_CALL_NOT_EXECUTED),
+        "{}",
+        results[0].1
     );
 }

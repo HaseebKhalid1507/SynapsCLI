@@ -171,12 +171,12 @@ fn default_core_builtin_authorizes_with_exact_identity() {
     let registry = ToolRegistry::new();
     let set = SessionToolSet::default_core_for_catalog(session("s-core"), registry.catalog());
 
-    let authorized = ExecutionGate::authorize_wire_call(&registry, &set, "bash")
+    let authorized = ExecutionGate::authorize_wire_call(&registry, &set, "read")
         .expect("core builtin must authorize");
-    assert_eq!(authorized.wire_name(), "bash");
-    assert_eq!(authorized.runtime_name(), "bash");
-    assert_eq!(authorized.tool_id(), &ToolId::builtin("bash"));
-    assert_eq!(authorized.implementation().name(), "bash");
+    assert_eq!(authorized.wire_name(), "read");
+    assert_eq!(authorized.runtime_name(), "read");
+    assert_eq!(authorized.tool_id(), &ToolId::builtin("read"));
+    assert_eq!(authorized.implementation().name(), "read");
 }
 
 #[test]
@@ -221,7 +221,7 @@ fn retained_set_survives_unrelated_catalog_mutation_without_rebuild() {
     let built_at = set.catalog_generation();
 
     // Sibling calls of one response: same retained set, same generation.
-    ExecutionGate::authorize_wire_call(&registry, &set, "bash").expect("sibling 1 authorizes");
+    ExecutionGate::authorize_wire_call(&registry, &set, "read").expect("sibling 1 authorizes");
     ExecutionGate::authorize_wire_call(&registry, &set, "ls").expect("sibling 2 authorizes");
     assert_eq!(
         set.catalog_generation(),
@@ -235,7 +235,7 @@ fn retained_set_survives_unrelated_catalog_mutation_without_rebuild() {
 
     // Unchanged builtins survive: their current catalog records still match
     // the pinned digests exactly. Generation drift alone denies nothing.
-    ExecutionGate::authorize_wire_call(&registry, &set, "bash")
+    ExecutionGate::authorize_wire_call(&registry, &set, "read")
         .expect("unchanged builtin must authorize across unrelated drift");
     ExecutionGate::authorize_wire_call(&registry, &set, "ls")
         .expect("unchanged builtin must authorize across unrelated drift");
@@ -253,7 +253,7 @@ fn retained_set_survives_unrelated_catalog_mutation_without_rebuild() {
     let rebuilt =
         SessionToolSet::default_core_for_catalog(session("s-retained"), registry.catalog());
     assert_eq!(rebuilt.activated().count(), 0, "no inherited activations");
-    ExecutionGate::authorize_wire_call(&registry, &rebuilt, "bash").expect("still authorizes");
+    ExecutionGate::authorize_wire_call(&registry, &rebuilt, "read").expect("still authorizes");
     ExecutionGate::authorize_wire_call(&registry, &rebuilt, "late-registered")
         .expect("newly registered verified tool becomes default core after rebuild");
 }

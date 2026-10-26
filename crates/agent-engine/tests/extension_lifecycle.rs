@@ -2,6 +2,9 @@
 //! bounded passive deferred declarations, and dormant zero-spawn
 //! descriptor tools for tool-only extensions.
 
+#[path = "support/hermetic_base_dir.rs"]
+mod hermetic_base_dir;
+
 use agent_engine::extensions::lifecycle::{
     classify, dormant_extension_tools, earliest_trigger, validate_runtime_tool_declarations,
     ActivationTrigger, DeclaredExtensionProvider, DeclaredExtensionProviderModel,
@@ -58,8 +61,10 @@ fn ctx() -> ToolContext {
             tx_events: None,
         },
         capabilities: ToolCapabilities {
+            session_allow_all: None,
             launch_cancel: None,
             memory_backend: None,
+            telemetry: None,
             watcher_exit_path: None,
             tool_register_tx: None,
             session_manager: None,
@@ -77,6 +82,7 @@ fn ctx() -> ToolContext {
             env: None,
             env_stripped: Vec::new(),
             env_warned: Default::default(),
+            session_id: None,
         },
         limits: ToolLimits {
             max_tool_output: 30000,
@@ -92,6 +98,7 @@ fn ctx() -> ToolContext {
 
 #[test]
 fn absent_deferred_block_stays_fully_backward_compatible() {
+    hermetic_base_dir::pin();
     // Pre-Task-20 manifest JSON: no `deferred` key anywhere.
     let m = base_manifest();
     assert!(m.deferred.is_none());
@@ -107,6 +114,7 @@ fn absent_deferred_block_stays_fully_backward_compatible() {
 
 #[test]
 fn classification_matrix_is_typed_and_exact() {
+    hermetic_base_dir::pin();
     // Legacy: deferred present but empty declares nothing => eager.
     assert_eq!(
         classify(&with_deferred(vec![], None)),
@@ -171,6 +179,7 @@ fn classification_matrix_is_typed_and_exact() {
 
 #[test]
 fn hostile_or_unbounded_deferred_declarations_fail_manifest_validation_closed() {
+    hermetic_base_dir::pin();
     // Control-char name.
     let m = with_deferred(vec![declared("bad\u{7}name")], None);
     assert!(m.validate("p").is_err());
@@ -197,6 +206,7 @@ fn hostile_or_unbounded_deferred_declarations_fail_manifest_validation_closed() 
 
 #[test]
 fn dormant_extension_tools_are_searchable_gated_and_never_spawn() {
+    hermetic_base_dir::pin();
     let dir = std::env::temp_dir().join(format!("synaps-ext-lc-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -249,6 +259,7 @@ fn dormant_extension_tools_are_searchable_gated_and_never_spawn() {
 
 #[tokio::test]
 async fn deferred_execute_without_runtime_lease_fails_typed_and_spawns_nothing() {
+    hermetic_base_dir::pin();
     let dir = std::env::temp_dir().join(format!("synaps-ext-exec-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -272,6 +283,7 @@ async fn deferred_execute_without_runtime_lease_fails_typed_and_spawns_nothing()
 
 #[test]
 fn runtime_initialize_declarations_must_match_manifest_exactly() {
+    hermetic_base_dir::pin();
     let declared = vec![declared("search")];
     let ok = vec![RegisteredExtensionToolSpec {
         name: "search".to_string(),
@@ -320,6 +332,7 @@ fn declared_provider(id: &str) -> DeclaredExtensionProvider {
 
 #[test]
 fn earliest_trigger_matrix_never_uses_tool_search_alone() {
+    hermetic_base_dir::pin();
     let mut mixed: ExtensionManifest = serde_json::from_value(json!({
         "runtime": "process",
         "command": "/bin/false",
@@ -356,6 +369,7 @@ fn earliest_trigger_matrix_never_uses_tool_search_alone() {
 
 #[test]
 fn provider_declarations_are_deeply_bounded_and_typed() {
+    hermetic_base_dir::pin();
     let ok = |p: DeclaredExtensionProvider| {
         let mut m = base_manifest();
         // Review fix A1: passive provider declarations now REQUIRE the
@@ -399,6 +413,7 @@ fn provider_declarations_are_deeply_bounded_and_typed() {
 
 #[test]
 fn user_lifecycle_conflicts_with_active_capabilities_fail_closed() {
+    hermetic_base_dir::pin();
     let m = with_deferred(vec![declared("t")], Some(DeferredLifecycle::User));
     assert!(m.validate("plug").is_err());
     let mut m = base_manifest();
@@ -416,6 +431,7 @@ fn user_lifecycle_conflicts_with_active_capabilities_fail_closed() {
 
 #[test]
 fn colon_tool_names_and_digest_metadata() {
+    hermetic_base_dir::pin();
     assert!(with_deferred(vec![declared("evil:name")], None)
         .validate("plug")
         .is_err());
@@ -427,6 +443,7 @@ fn colon_tool_names_and_digest_metadata() {
 
 #[test]
 fn runtime_description_mismatch_and_unbounded_registered_specs_fail() {
+    hermetic_base_dir::pin();
     let decl = vec![declared("search")];
     let renamed = vec![RegisteredExtensionToolSpec {
         name: "search".to_string(),
@@ -458,6 +475,7 @@ fn _assert_runtime_enum(m: &ExtensionManifest) -> &ExtensionRuntime {
 /// BEFORE any spawn or catalog registration.
 #[tokio::test]
 async fn deferred_tools_without_tools_register_permission_fail_before_spawn() {
+    hermetic_base_dir::pin();
     use agent_engine::extensions::hooks::HookBus;
     use agent_engine::extensions::manager::ExtensionManager;
 
@@ -513,6 +531,7 @@ async fn deferred_tools_without_tools_register_permission_fail_before_spawn() {
 /// A1 (providers): deferred provider metadata requires `providers.register`.
 #[test]
 fn deferred_providers_without_providers_register_permission_fail_closed() {
+    hermetic_base_dir::pin();
     let mut m = base_manifest(); // permissions: ["tools.register"] only
     m.deferred = Some(DeferredDeclarations {
         tools: vec![],
@@ -531,6 +550,7 @@ fn deferred_providers_without_providers_register_permission_fail_closed() {
 /// authorized trigger — it must fail closed, not linger untriggerable.
 #[test]
 fn hook_lifecycle_without_hook_subscriptions_fails_closed() {
+    hermetic_base_dir::pin();
     let mut m: ExtensionManifest = serde_json::from_value(json!({
         "runtime": "process",
         "command": "/bin/false",
@@ -572,6 +592,7 @@ fn hook_lifecycle_without_hook_subscriptions_fails_closed() {
 
 #[tokio::test]
 async fn manager_defers_tool_only_extension_without_spawn_and_eager_flag_off_spawns() {
+    hermetic_base_dir::pin();
     use agent_engine::extensions::hooks::HookBus;
     use agent_engine::extensions::manager::ExtensionManager;
 

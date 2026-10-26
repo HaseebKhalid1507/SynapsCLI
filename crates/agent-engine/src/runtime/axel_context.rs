@@ -171,7 +171,7 @@ fn task_literal(prompt: &str) -> Option<String> {
         if !(3..=64).contains(&word.len()) || STOP.contains(&word.to_ascii_lowercase().as_str()) {
             continue;
         }
-        if selected.map_or(true, |previous: &str| word.len() > previous.len()) {
+        if selected.is_none_or(|previous: &str| word.len() > previous.len()) {
             selected = Some(word);
         }
     }
@@ -301,21 +301,21 @@ fn visible(value: &Value) -> bool {
     ["disclosure", "disclosure_class"].iter().all(|key| {
         value
             .get(key)
-            .map_or(true, |v| v.as_str() == Some("model_visible"))
+            .is_none_or(|v| v.as_str() == Some("model_visible"))
     }) && ["sensitivity", "retention", "retention_class"]
         .iter()
         .all(|key| {
-            value.get(key).map_or(true, |v| {
+            value.get(key).is_none_or(|v| {
                 matches!(v.as_str(), Some("normal" | "standard" | "model_visible"))
             })
         })
         && ["private", "restricted"]
             .iter()
-            .all(|key| value.get(key).map_or(true, |v| v.as_bool() == Some(false)))
+            .all(|key| value.get(key).is_none_or(|v| v.as_bool() == Some(false)))
         && value
             .get("channel")
-            .map_or(true, |v| v.as_str() == Some("final"))
-        && value.get("content_class").map_or(true, |v| {
+            .is_none_or(|v| v.as_str() == Some("final"))
+        && value.get("content_class").is_none_or(|v| {
             matches!(v.as_str(), Some("user_text" | "assistant_text"))
         })
 }
@@ -362,7 +362,10 @@ fn screen_text(text: &str) -> String {
 
 #[allow(dead_code)] // merge(112): used by capture pipeline
 pub(super) fn capture_text(message: &Value) -> Option<String> {
-    if message.get("_synaps_context").is_some() || !visible(message) {
+    if message.get("_synaps_context").is_some()
+        || crate::engine::interrupt::is_tool_in_flight_note(message)
+        || !visible(message)
+    {
         return None;
     }
     let content = message.get("content")?;
@@ -487,6 +490,12 @@ mod tests {
             &json!({"role":"user","_synaps_context":{},"content":"private working note"})
         )
         .is_none());
+        // The host's tool-in-flight note is not something the user said.
+        let note = crate::engine::interrupt::tool_in_flight_note_message(
+            crate::engine::interrupt::InterruptReason::User,
+            &["bash".into()],
+        );
+        assert!(capture_text(&note).is_none());
     }
 
     #[test]

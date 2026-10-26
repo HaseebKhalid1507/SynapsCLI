@@ -2,6 +2,261 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+## [0.11.0] — 2026-10-26
+
+Sessions now live in the daemon. Every client attached to a session can
+type, `/sessions` lists live and past sessions and switches between them,
+pinned sessions come back after the daemon restarts, and
+`synaps daemon reload-extension` restarts one plugin without touching a
+session. Reloads and parks no longer rewrite the prompt cache, and this
+release adds several accounts per provider, Meta Muse, Kimi K3.1 Pro and
+subagents you can watch and steer.
+
+Read the Upgrade notes first: one change stops some plugins from loading,
+and several defaults changed. Full notes:
+[docs/upgrading/0.11.md](docs/upgrading/0.11.md).
+
+### Upgrade notes
+
+- **A plugin whose manifest `secret_env` requests a newly denied name now
+  fails to load**, with an error naming the variable (list under Security).
+  Fix: move the secret to a plugin-specific variable. (#256)
+- **Reload the daemon after installing:** install, run
+  `synaps daemon reload`, then restart attached TUIs. A 0.10.2 daemon left
+  running ignores `auth.account.*`, refreshes tokens outside the new lock
+  and can't serve subagent watch/steer. The first reload is run by the
+  0.10.2 image, which doesn't carry running workers: let subagents finish
+  first. Daemon protocol (v3) and extension protocol (1) are unchanged.
+- **Every client of a daemon session can now type** (`client_input = shared`,
+  the default); `--observe` clients stay read-only. `client_input = exclusive`
+  keeps the 0.10.2 rule (read when the daemon starts). (#300)
+- **The daemon socket refuses connections from another user**, root
+  included. (#298)
+- **Turn budgets:** interactive turns have no round, tool-call or
+  tool-result-byte limit by default (were 128 / 512 / 32 MiB); set
+  `turn_budget.foreground.*` to keep one. Watcher, event and subagent turns
+  stay bounded (see Changed). `0` still means "none allowed" but is
+  deprecated; write `unlimited` for no limit. (#219, #251)
+- **The `kimi` provider defaults to `kimi-k3.1-pro`**, which Moonshot
+  unlocks after a top-up (minimum $1). Until then choose
+  `kimi/kimi-k2.7-code`. (#281)
+- **`synaps send --session X` exits 1** when X isn't running or refuses the
+  event, instead of dropping it in the shared inbox (`--inbox` keeps the old
+  drop). A headless `synaps agent` no longer reads the shared inbox; use
+  `synaps send --session <agent>`. (#265)
+- **Loopback `synaps auth-broker` always requires a machine token**, written
+  to `~/.synaps-cli/auth-broker.token` and found by same-user clients. Other
+  users, older or SSH-forwarded clients need `auth.machine_token`. `/token`
+  no longer vends Muse keys. Upgrade a remote broker host before its
+  clients. (#252)
+- **Extensions:** only `block` stops the `before_tool_call` chain;
+  `tool.call` params always carry `session_id` (`null` for workers); a
+  JSON-RPC `error` reply is returned as-is, no longer restarted and retried.
+  (#215, #227, #252)
+- **`mcp.json` `env` values are expanded:** `${NAME}` is the parent's value,
+  or empty when unset (with a warning); `${NAME:-fallback}` sets a default.
+  Daemon sessions use the daemon's environment. (#215, #256)
+- **Profiles:** `--profile` exits with an error when it can't be applied;
+  `SYNAPS_PROFILE` now picks the daemon like `--profile`; a client never
+  attaches to another profile's daemon. (#246)
+- **Memory:** a confirmed `memory.default_mode` now applies to every new
+  session. A `/memory off` made before upgrading isn't carried over the
+  first reload; run it again. (#225, #255)
+- **Keys:** Alt-↑/↓ and Ctrl-↑/↓ switch subagent views and can't be
+  rebound. In Confirm prompts `a` no longer allows all: select "Allow all",
+  Enter, Enter. (#218, #252, #254)
+- **Scripts:** `synaps status` has a new layout; parse `--json`. (#215)
+- **Packagers:** `--no-default-features` now drops `bash` and `shell_*`. It
+  is not a sandbox. (#215, #256) The minimum Rust is now 1.88 (declared as
+  1.80 before, which the locked dependencies no longer build with).
+- **Rollback:** sessions saved by 0.11.0 open in 0.10.2. (#253)
+- **`synaps-engine` / `synaps-core` crate users:** `TurnBudget` count limits
+  are `Option`s, new `TurnRole::Event` and `BudgetDimension::TotalTokens`,
+  `BrokerError` is `#[non_exhaustive]`, and several structs gain fields.
+  `synaps-tui` takes the engine with `default-features = false`; enable
+  `synaps-engine/command-exec` to keep `bash`/`shell_*`. See the full notes.
+
+### Highlights
+
+- **Shared input.** Every client can prompt, steer and abort; the last to
+  type is the *active* client. Name clients with `--as NAME`, list them with
+  `/clients`; under `exclusive`, `/takeover` takes input in place.
+  (#296, #299, #300)
+- **`/sessions`.** Live: every daemon session by state; pin (`p`), close
+  (`x`) or switch to it (Enter). Past: search, facets, preview, deep search
+  (Ctrl+F), rename, and Enter continues a session in its own folder. (#305)
+- **Pins survive restarts.** `/pin` and `synaps daemon pin <ID|NAME>` keep a
+  session loaded and hold the daemon's idle exit. Pins come back after
+  `daemon stop`, a crash or a reboot (`deploy/synaps-daemon.service`;
+  `SYNAPS_DAEMON_RESTORE_PINS=0` skips them), and a pinned session keeps its
+  cache warm with no TUI attached. `--keep-warm` and `/keep-warm` are the
+  same pin. (#269, #306)
+- **`synaps daemon reload-extension <NAME>`** restarts one extension from
+  disk, also one installed after the daemon started: no checkpoint, no
+  cancelled turn; a bad manifest is refused first.
+  [docs/daemon-mode.md](docs/daemon-mode.md). (#307)
+- **The prompt cache survives reloads and parks.** Activated tools, cache
+  totals and the `on_session_start` injection carry across, and
+  `cache_diagnostics = true` asks Anthropic why a request missed.
+  (#262, #276, #294, #295)
+- **Several accounts per provider.**
+  `synaps login --provider <p> --account <label>` adds Claude,
+  ChatGPT/Codex, Kimi or Grok seats; select with
+  `auth.account.<provider> = <label|default|auto>`. New `synaps auth` and
+  `synaps status` subcommands and flags.
+  [Guide](docs/providers/multi-account-broker.md). (#215, #266)
+- **Watch a subagent.** Alt/Ctrl-↑/↓ or `/watch` opens a worker in its own
+  view; type there to steer it. [docs/subagent-watch.md](docs/subagent-watch.md).
+  (#218, #240, #254)
+
+### Added
+
+- **`/close`** saves and ends a daemon session;
+  **`synaps daemon close <ID|NAME> [--force] [--attached]`** does it from
+  any shell. Both refuse a busy session (`force` cancels its workers);
+  `daemon close` refuses one with clients attached unless `--attached`.
+  (#263, #264)
+- **Meta Muse** (experimental): device-flow login, then `muse/*` models.
+  [docs/providers/muse.md](docs/providers/muse.md). (#216)
+- **Kimi `kimi-k3.1-pro` and `kimi-k3.1-pro-highspeed`** (2-3x faster);
+  `/effort` offers `low` / `high` / `max`. (#281)
+- `synaps auth state` shows and clears what the daemon's broker remembers
+  per account; an auth-failed turn says what failed. (#266)
+- `synaps quota-keeper` (experimental, read-only by default). (#215)
+- `synaps daemon sessions` shows state age, park/evict deadlines, cost,
+  messages and title. (#305)
+- Codex `gpt-6.1-sol`, and hosted web search with `SYNAPS_CODEX_WEB_SEARCH`.
+  (#215)
+- The light `paper` theme; `SYNAPS_THEME=<name>` for one run. (#235)
+- Watcher agents: a `wake_if` gate, resource limits, targeted notifications.
+  (#239)
+- `--no-confirm-answers`, `/workers`, `/confirms status|reset`.
+  (#221, #236, #252)
+- Extensions may return an advisory `context_phase`. (#215)
+- axel-memory-service runs on macOS. (#224)
+
+### Changed
+
+- **`/settings` opens while a turn streams.** Appearance applies at once,
+  session settings from the next turn. (#291)
+- **Turn budgets per role:** interactive turns unlimited; watcher turns 24
+  rounds / 96 tool calls / 8 MiB; subagent runs 64 rounds x 3; turns started
+  by inbox events or subagent completions use the new `event` role (24 / 96
+  / 8 MiB) until the owner steers them. (#219, #251, #283)
+- **The SynapsCLI header:** folder and branch, a state block, the agent
+  clock, the version when idle. (#226, #228, #282)
+- Context rollover aims the successor at about 100k tokens
+  (`context_management.target_tokens`). (#241, #260)
+- A tool call waiting in its lane shows `○ queued`, timed from its start.
+  (#292)
+- Tool cards start half a row higher; an unknown `/command` in an attached
+  TUI goes to the session. (#230, #233)
+- `subagent_resume` refuses an archive with no history; unknown `auth.*`
+  keys warn. (#253)
+
+### Fixed
+
+- **A reload or park dropped the session's activated tools**, so the next
+  request rewrote the whole prompt cache. They are carried and re-validated.
+  (#294)
+- **The first request after a reload could skip `on_session_start`'s
+  injection.** Requests and keep-warm pings now wait for it. (#262)
+- Cache totals reset after reload or resume; `%↺` and `/stats` read low.
+  (#295)
+- `cache_diagnostics = true` was never sent. (#276)
+- Subagent requests were missing from `api-log.jsonl`. (#303)
+- **Shared-inbox events woke 2-3 sessions**, each starting a paid turn. Each
+  file now reaches one session with an attached client; addressed events
+  retry, then fail, never falling back to the inbox. (#265)
+- `/model` in one client now updates every attached client. (#300)
+- A session restored by a reload with no client never parked. (#304)
+- **Rollover deadlocked with workers running.** Esc cancels only the
+  interrupted turn's workers. (#221, #222)
+- **OAuth compaction failed with HTTP 429.** (#220)
+- **OAuth tokens:** reload on `auth.json` change and after a 401, refresh
+  under a cross-process lock, never lose a rotated token. (#237, #238, #249)
+  A cancelled turn or a timed-out subagent can't abort a refresh halfway,
+  forced refreshes are limited to one a minute per account (one account
+  never cools down another), and when Muse can't re-mint it returns the
+  provider's own 401.
+- `synaps status` no longer shows an empty `extra_usage` row for accounts
+  without paid extra usage.
+- `subagent_status` on an archived worker returns its error, like
+  `subagent_collect`.
+- Auth and providers: failed usage reads are held and shared; legible
+  Codex 4xx; hosted `web_search` rejection learned; usage over 100% is
+  exhausted; keep-warm backs off on timeouts; Muse streams can't hang.
+  (#249, #250, #272, #274)
+- `daemon reload` stops workers resumably and keeps `sa_N` ids; a reload is
+  fenced; `/memory off` survives park and reload. (#229, #231, #232, #255)
+- The client says when it is older or newer than the daemon. (#233, #254)
+- Subagent-view input never reaches the main thread. (#254)
+- **Tool cards:** a running card keeps counting when something lands below
+  it; subagent-view cards tick and get footers. (#289, #290)
+- Bash and shell output keep multi-byte characters split across reads.
+  (#288)
+- `systemd-run` (254+) expanded `${VAR}` in scoped commands, even in single
+  quotes. (#280)
+- **Watcher limits bind inside a turn**, cost includes cache tokens, the
+  handoff turn is metered and must save, and limit exits aren't counted as
+  crashes. (#251)
+- A turn stopped by its budget keeps its response; `max_cost_usd` binds on
+  every provider. (#251)
+- Esc keeps the partial reply when the cancel is slow. (#258)
+- A refused `--continue` deleted the live session's registry card. (#271)
+- A lost `daemon.json` is put back by the lock holder. (#259)
+- A daemon frame split across reads dropped the connection. (#285)
+- Opaque mode painted the terminal's own background (see-through in kitty).
+  (#284)
+- `--profile` was lost in the thin-client TUI. (#246)
+- Subagent activity moved a scrolled-up main thread; an observe attach made
+  a session keep-warm eligible. (#217, #234)
+- Subagents inherit the retry policy and keep readable errors. (#215)
+- Context archive locking, exclusive memory backends, repository discovery.
+  (#242, #243, #247)
+
+### Security
+
+- **`rustls` 0.23.45** (GHSA-2mjx-qc3c-rqvc / RUSTSEC-2026-0285): every
+  provider HTTPS call and the auth-broker TLS listener use it.
+- **`secret_env` can't request host credentials or proxies.** The denylist
+  covers every provider key (including `META_API_KEY`, `KIMI_API_KEY`,
+  `HF_TOKEN`, `NVIDIA_API_KEY`, `TOGETHER_API_KEY`, `LOCAL_API_KEY`,
+  `OPENAI_CODEX_ACCESS_TOKEN`), the AWS key trio and
+  `HTTPS_PROXY`/`HTTP_PROXY`/`ALL_PROXY`/`NO_PROXY`. Inside `SYNAPS_*` a
+  plugin may name only its own override; a malformed name is ignored with a
+  warning. [docs/extensions/secrets.md](docs/extensions/secrets.md). (#256)
+- "Allow all" covers only the asking extension and only the input owner can
+  arm it. (#252)
+- `find`/`ls` never run a path as an option. (#256)
+- A failed OAuth login code exchange shows only the standard error fields.
+  It could echo request material, and it panicked on multi-byte text.
+- Events can't forge or hide an `<event>` tag. (#261)
+
+### Credits
+
+- **Haseeb Khalid**: shared input, `/sessions`, `/close` and pins,
+  `reload-extension`, event delivery, prompt-cache fixes, the header, turn
+  budgets, the release-review fixes, integration and merges.
+- **JR Morton**: multi-account broker and `auth state`, quota keeper, Meta
+  Muse, subagent watch/steer, extension consent, `command-exec`, MCP env
+  expansion, Codex and Kimi K3.1 Pro, the `paper` theme, the
+  `on_session_start` gate, `daemon.json` healing, event sanitising,
+  rollover sizing, the `systemd-run` fix.
+- **adityapat958**: long-horizon watcher agents, `auth.json` reload, the
+  cross-process refresh lock.
+- **telysia-com**: axel-memory-service on macOS, `memory.default_mode` for
+  every session.
+
+### Internal
+
+- CI runs the suite under a seeded HOME with hardened clippy and the axel
+  sidecar; flaky tests fixed. (#244, #257, #293)
+- Specs for multi-client sessions and a daemon-session Petri-net model;
+  incident write-ups. (#223, #279, #297)
+
 ## [0.10.2] — 2026-10-12
 
 Long turns are no longer cut off after two hours, sessions with many images

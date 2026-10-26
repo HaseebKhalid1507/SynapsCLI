@@ -14,6 +14,7 @@ mod effort;
 mod focus;
 mod gamba;
 mod help_find;
+mod header;
 mod helpers;
 mod highlight;
 mod input;
@@ -31,6 +32,7 @@ mod render_model;
 mod render_thread;
 mod run_setup;
 mod session_link;
+mod sessions;
 mod settings;
 mod sidecar;
 mod signals;
@@ -44,9 +46,11 @@ mod termcaps;
 pub mod testing;
 pub(crate) mod text_metrics;
 mod theme;
+mod threads;
 mod toast;
 mod view_model;
 mod viewport;
+mod watch;
 
 /// Single process-global lock for ALL tests that mutate config-env vars
 /// (`SYNAPS_BASE_DIR`, `HOME`).  Both `migration_tests` (this file) and the
@@ -199,6 +203,9 @@ pub(crate) async fn run_loop(ctx: run_setup::RunContext) -> Result<()> {
             }
         }
         idle_purge.observe(app.streaming || app.compacting);
+        // A fixed deadline, read before `select!` borrows `app`: a fresh
+        // `sleep` would restart every 16 ms animation tick and never fire.
+        let watch_due = watch::poll_due_at(&app);
 
         tokio::select! {
 
@@ -233,6 +240,11 @@ pub(crate) async fn run_loop(ctx: run_setup::RunContext) -> Result<()> {
                 loop_arms::handle_model_list_arm(&mut app, result);
             }
 
+            // ── /sessions modal: daemon list, past list, pin/close answers ──
+            Some(msg) = app.sessions_rx.recv() => {
+                loop_arms::handle_sessions_arm(&mut app, &link, msg);
+            }
+
             // ── Async extension loader progress ──
             event = app.extension_loader_rx.recv(), if app.extension_loader_running => {
                 loop_arms::handle_extension_loader_arm(&mut app, link.view(), event, ext_mgr_shared.as_ref()).await;
@@ -265,12 +277,20 @@ pub(crate) async fn run_loop(ctx: run_setup::RunContext) -> Result<()> {
 
             // ── Secret-prompt answers from the pane (PromptBridge) → Answer ──
             Some((prompt_id, value)) = prompt_bridge.answers_rx.recv() => {
-                prompt_bridge.on_local_answer(prompt_id);
-                let _ = link.send(SessionCommand::Answer { prompt_id, value }).await;
+                if prompt_bridge.on_local_answer(prompt_id) {
+                    let _ = link.send(SessionCommand::Answer { prompt_id, value }).await;
+                }
+            }
+
+            // ── Subagent watch: page the focused worker view's journal ──
+            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(
+                watch_due.unwrap_or_else(Instant::now),
+            )), if watch_due.is_some() => {
+                watch::poll(&mut app, &mut link, Instant::now()).await;
             }
 
             // ── Tick: animations + spinner (~60fps when active) ──
-            _ = tokio::time::sleep(std::time::Duration::from_millis(16)), if boot_fx_sent || exit_fx_sent || app.streaming || app.compacting || app.transcript.is_empty() || app.logo_dismiss_t.is_some() || app.logo_build_t.is_some() || app.gamba_child.is_some() || app.secret_prompts.is_active() || !app.toasts.is_empty() || app.plugins.as_ref().is_some_and(|p| p.is_install_active()) || !app.subagents.is_empty() || app.theme_transition.is_some() || app.prompt_clock.animating(app.clock.now(), app.streaming) => {
+            _ = tokio::time::sleep(std::time::Duration::from_millis(16)), if boot_fx_sent || exit_fx_sent || app.streaming || app.compacting || app.transcript.is_empty() || app.logo_dismiss_t.is_some() || app.logo_build_t.is_some() || app.gamba_child.is_some() || app.secret_prompts.is_active() || !app.toasts.is_empty() || app.plugins.as_ref().is_some_and(|p| p.is_install_active()) || !app.subagents.is_empty() || watch::focused(&app).is_some() || app.theme_transition.is_some() || app.prompt_clock.animating(app.clock.now(), app.streaming) => {
                 if loop_arms::handle_animation_tick(
                     &mut app, &config, &registry, &render_handle,
                     &secret_prompt_rx, &boot_done, &exit_done,
@@ -325,6 +345,7 @@ pub(crate) async fn run_loop(ctx: run_setup::RunContext) -> Result<()> {
                         if dispatch::handle_input_action(action, state).await.is_break() {
                             break;
                         }
+                        loop_arms::drain_session_switch(&mut app, &mut link, &mut prompt_bridge, &registry, &render_handle).await;
                     }
                     // FIX C (defense in depth): EventStream yields Err or None when
                     // crossterm detects the PTY is gone. Break cleanly here.
@@ -442,6 +463,14 @@ pub(crate) async fn run_loop(ctx: run_setup::RunContext) -> Result<()> {
             lost.pid, lost.budget_secs, lost.session_id, lost.session_id, lost.session_id,
         );
         std::process::exit(agent_engine::daemon::EXIT_DAEMON_LOST);
+    }
+    // A daemon session that ended under this client (`/close` here or on
+    // another client, `daemon stop`): which one, and how to bring it back.
+    // In-process, quitting always ends the session; nothing to say.
+    if let (run_setup::TransportMode::Socket, Some(reason)) = (&mode, app.session_ended) {
+        if let Some(line) = attach::session_ended_line(reason, &app.session.id, app.api_messages_len > 0) {
+            eprintln!("{line}");
+        }
     }
 
     Ok(())

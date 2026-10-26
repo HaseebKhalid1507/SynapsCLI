@@ -110,12 +110,51 @@ impl TurnCompletion {
 
 /// Shared mutable auth state. Lives behind `Arc<RwLock<_>>` so the spawned
 /// streaming task and the parent Runtime always see the same (freshest) token.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(super) struct AuthState {
     pub(super) auth_token: String,
     pub(super) auth_type: String,
     pub(super) refresh_token: Option<String>,
     pub(super) token_expires: Option<u64>,
+    /// Local source only: mtime of auth.json observed just before the token
+    /// in `auth_token` was loaded. A different on-disk mtime means the file
+    /// was rotated externally (`synaps login`, cron, sync) and the fast path
+    /// must reload. `None` disables the check (remote / never loaded).
+    pub(super) auth_file_mtime: Option<std::time::SystemTime>,
+    /// Which credential `auth_token` was vended for:
+    /// `"<local | remote:<endpoint>#<principal fingerprint>>|<storage_key>"`
+    /// (see `runtime/auth.rs::anthropic_binding`). The principal fingerprint
+    /// is an opaque SHA-256 prefix of the machine token — never the token
+    /// itself, never an access token. `None` = unknown/legacy (api_key
+    /// harnesses, scrubbed). The pre-stream refresh refuses to serve a
+    /// cached token whose binding no longer matches the selected account on
+    /// the current source, so a config/source/principal switch can never
+    /// silently keep the previous account's token.
+    pub(super) bound_credential: Option<String>,
+}
+
+/// Redacting Debug — never print the access or refresh token.
+impl std::fmt::Debug for AuthState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthState")
+            .field(
+                "auth_token",
+                &if self.auth_token.is_empty() {
+                    "<empty>"
+                } else {
+                    "<redacted>"
+                },
+            )
+            .field("auth_type", &self.auth_type)
+            .field(
+                "refresh_token",
+                &self.refresh_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("token_expires", &self.token_expires)
+            .field("auth_file_mtime", &self.auth_file_mtime)
+            .field("bound_credential", &self.bound_credential)
+            .finish()
+    }
 }
 
 #[allow(dead_code)]

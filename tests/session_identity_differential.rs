@@ -8,6 +8,10 @@
 //!
 //! The tool outputs must match. A var present in the daemon env but absent
 //! from the client env must NOT appear (leak test).
+//!
+//! Needs the `command-exec` feature (the probe is a `bash` tool call).
+
+#![cfg(feature = "command-exec")]
 
 #[path = "support/phase2/mod.rs"]
 mod phase2;

@@ -74,10 +74,12 @@ const SETUP_BODY: &str = r#"{"cloudaicompanionProject":"test-proj","currentTier"
 
 /// Fake broker: answers `loadCodeAssist` for project setup, then serves the
 /// configured chunk script per `proxy_stream` call (one script per attempt).
+type GeminiAttempt = Result<Vec<Result<bytes::Bytes, BrokerError>>, String>;
+
 struct GeminiBroker {
     /// Per-attempt outcomes: `Err(text)` rejects the stream open with a
     /// broker transport error; `Ok(chunks)` serves the byte chunks.
-    attempts: Mutex<Vec<Result<Vec<Result<bytes::Bytes, BrokerError>>, String>>>,
+    attempts: Mutex<Vec<GeminiAttempt>>,
     seen: Mutex<Vec<ProxyRequest>>,
 }
 
@@ -156,6 +158,21 @@ async fn run_gemini(
     exact: bool,
 ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
     let (tx, _rx) = mpsc::unbounded_channel();
+    run_gemini_with_events(h, broker, tools, system, msgs, cancel, exact, tx).await
+}
+
+/// `run_gemini` with a caller-owned event channel.
+#[allow(clippy::too_many_arguments)]
+async fn run_gemini_with_events(
+    h: &Harness,
+    broker: &Arc<dyn CredentialBroker>,
+    tools: &[Value],
+    system: &Option<String>,
+    msgs: &[crate::SharedMessage],
+    cancel: &CancellationToken,
+    exact: bool,
+    tx: mpsc::UnboundedSender<crate::StreamEvent>,
+) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
     call_google_gemini_stream_inner(
         &cfg(),
         broker,
@@ -486,16 +503,27 @@ async fn gemini_cancellation_mid_stream_records_canceled_terminal() {
     }
 
     let broker: Arc<dyn CredentialBroker> = Arc::new(BlockingBroker(Mutex::new(Some(chunk_rx))));
+    // Cancel once the client has forwarded the delivered chunk's text — an
+    // observed mid-stream point, never a wall-clock timer.
     let cancel = CancellationToken::new();
+    let (tx, mut rx) = mpsc::unbounded_channel::<crate::StreamEvent>();
     let canceller = cancel.clone();
     tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        canceller.cancel();
+        while let Some(event) = rx.recv().await {
+            if matches!(event, crate::StreamEvent::Llm(crate::LlmEvent::Text(_))) {
+                canceller.cancel();
+                break;
+            }
+        }
     });
 
-    let err = run_gemini(&h, &broker, &[], &None, &messages(), &cancel, true)
-        .await
-        .expect_err("cancel must surface");
+    let err = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        run_gemini_with_events(&h, &broker, &[], &None, &messages(), &cancel, true, tx),
+    )
+    .await
+    .expect("first text delta never observed")
+    .expect_err("cancel must surface");
     assert!(err.to_string().contains("canceled"), "{err}");
     drop(chunk_tx);
 
@@ -633,8 +661,10 @@ async fn gemini_disabled_context_emits_nothing_and_still_streams() {
 // ═══ Cloud invoke (AWS Bedrock / Azure OpenAI / Google Vertex) ══════════════
 
 /// Fake cloud broker: scripted `cloud_invoke` outcomes; counts invocations.
+type CloudScript = Result<Vec<Result<CloudEvent, BrokerError>>, BrokerError>;
+
 struct CloudBroker {
-    script: Mutex<Option<Result<Vec<Result<CloudEvent, BrokerError>>, BrokerError>>>,
+    script: Mutex<Option<CloudScript>>,
     invokes: AtomicUsize,
 }
 

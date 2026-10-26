@@ -1,6 +1,9 @@
 //! E-P3/P4 actor-level driver tests. Uses the real `autonomous` plugin via
 //! `examples/extensions/autonomous/`, loaded as in `tests/autonomous_plugin.rs`.
 
+#[path = "support/hermetic_base_dir.rs"]
+mod hermetic_base_dir;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -149,6 +152,7 @@ impl TestActor {
 
 #[tokio::test]
 async fn driver_start_arms_and_emits() {
+    hermetic_base_dir::pin();
     let (host, _temp) = host_with_plugin().await;
     let mut actor = session(&host).await;
     actor.driver_start().await;
@@ -175,6 +179,7 @@ async fn driver_start_arms_and_emits() {
 
 #[tokio::test]
 async fn driver_start_without_permission_refused() {
+    hermetic_base_dir::pin();
     let host = host().await;
     let mut actor = session(&host).await;
     actor
@@ -201,6 +206,7 @@ async fn driver_start_without_permission_refused() {
 
 #[tokio::test]
 async fn driver_start_second_session_refused() {
+    hermetic_base_dir::pin();
     let (host, _temp) = host_with_plugin().await;
     let mut a1 = session(&host).await;
     let mut a2 = session(&host).await;
@@ -237,6 +243,7 @@ async fn driver_start_second_session_refused() {
 
 #[tokio::test]
 async fn cancel_revokes_driver() {
+    hermetic_base_dir::pin();
     let (host, _temp) = host_with_plugin().await;
     let mut actor = session(&host).await;
     actor.arm().await;
@@ -255,6 +262,7 @@ async fn cancel_revokes_driver() {
 
 #[tokio::test]
 async fn new_session_revokes() {
+    hermetic_base_dir::pin();
     let (host, _temp) = host_with_plugin().await;
     let mut actor = session(&host).await;
     actor.arm().await;
@@ -273,6 +281,7 @@ async fn new_session_revokes() {
 
 #[tokio::test]
 async fn end_releases_grant() {
+    hermetic_base_dir::pin();
     let (host, _temp) = host_with_plugin().await;
     let mut actor = session(&host).await;
     actor.arm().await;
@@ -289,6 +298,7 @@ async fn end_releases_grant() {
 
 #[tokio::test]
 async fn checkpoint_reload_revokes_and_notifies() {
+    hermetic_base_dir::pin();
     let (host, _temp) = host_with_plugin().await;
     let mut actor = session(&host).await;
     actor.arm().await;
@@ -314,6 +324,7 @@ async fn checkpoint_reload_revokes_and_notifies() {
 
 #[tokio::test]
 async fn armed_session_does_not_park() {
+    hermetic_base_dir::pin();
     let (host, _temp) = host_with_plugin().await;
     let handle = host
         .create_session(SessionConfig {
@@ -395,6 +406,7 @@ async fn armed_session_does_not_park() {
 /// DriverArmed), but make it explicit.
 #[tokio::test]
 async fn tick_processes_command_result_and_arms() {
+    hermetic_base_dir::pin();
     let (host, _temp) = host_with_plugin().await;
     let mut actor = session(&host).await;
     actor.driver_start().await;
@@ -411,6 +423,7 @@ async fn tick_processes_command_result_and_arms() {
 /// by canceling — if the tick is running, we'll see DriverRevoked.
 #[tokio::test]
 async fn tick_revokes_on_lifecycle_death() {
+    hermetic_base_dir::pin();
     let (host, _temp) = host_with_plugin().await;
     let mut actor = session(&host).await;
     actor.arm().await;
@@ -453,6 +466,7 @@ async fn tick_revokes_on_lifecycle_death() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn tick_revokes_on_idle_conflict() {
+    hermetic_base_dir::pin();
     let guard = HomeGuard::new();
     let (host, _temp) = stub_host(&guard, Script::Sse(ANTHROPIC_SSE), "").await;
     let mut actor = session(&host).await;
@@ -488,6 +502,7 @@ async fn tick_revokes_on_idle_conflict() {
 /// responsive while driver work is pending.
 #[tokio::test]
 async fn tick_never_blocks_the_select_loop() {
+    hermetic_base_dir::pin();
     let (host, _temp) = host_with_plugin().await;
     let mut actor = session(&host).await;
     actor.arm().await;
@@ -517,6 +532,7 @@ async fn tick_never_blocks_the_select_loop() {
 /// a preflight error. Extended timeout to handle retries.
 #[tokio::test]
 async fn driver_turn_starts_or_revokes_after_arm() {
+    hermetic_base_dir::pin();
     let (host, _temp) = host_with_plugin().await;
     let mut actor = session(&host).await;
     actor.arm().await;
@@ -553,6 +569,7 @@ async fn driver_turn_starts_or_revokes_after_arm() {
 /// revoke without an outcome.
 #[tokio::test]
 async fn driver_cancel_eof_revokes_without_outcome() {
+    hermetic_base_dir::pin();
     let (host, _temp) = host_with_plugin().await;
     let mut actor = session(&host).await;
     actor.arm().await;
@@ -578,6 +595,7 @@ async fn driver_cancel_eof_revokes_without_outcome() {
 /// ensuring a cancel after arm works cleanly (the RunTurn path is blocked).
 #[tokio::test]
 async fn event_wake_inhibited_while_armed() {
+    hermetic_base_dir::pin();
     let (host, _temp) = host_with_plugin().await;
     let mut actor = session(&host).await;
     actor.arm().await;
@@ -596,6 +614,7 @@ async fn event_wake_inhibited_while_armed() {
 /// queue to the steering FIFO instead of starting a normal turn.
 #[tokio::test]
 async fn submit_while_armed_idle_queues_steering() {
+    hermetic_base_dir::pin();
     let (host, _temp) = host_with_plugin().await;
     let mut actor = session(&host).await;
     actor.arm().await;
@@ -642,6 +661,7 @@ async fn submit_while_armed_idle_queues_steering() {
 /// Submit while unarmed is a normal turn.
 #[tokio::test]
 async fn unarmed_submit_is_a_normal_turn() {
+    hermetic_base_dir::pin();
     let host = host().await;
     let mut actor = session(&host).await;
 
@@ -675,6 +695,7 @@ async fn unarmed_submit_is_a_normal_turn() {
 /// The steering FIFO has a 16 message cap.
 #[tokio::test]
 async fn steering_fifo_16_msg_cap() {
+    hermetic_base_dir::pin();
     let (host, _temp) = host_with_plugin().await;
     let mut actor = session(&host).await;
     actor.arm().await;
@@ -718,6 +739,7 @@ async fn steering_fifo_16_msg_cap() {
 /// The steering FIFO has a 256 KiB byte cap (UTF-8 byte count).
 #[tokio::test]
 async fn steering_fifo_256kib_cap_counts_utf8_bytes() {
+    hermetic_base_dir::pin();
     let (host, _temp) = host_with_plugin().await;
     let mut actor = session(&host).await;
     actor.arm().await;
@@ -756,6 +778,7 @@ async fn steering_fifo_256kib_cap_counts_utf8_bytes() {
 /// Revocation returns undelivered steering.
 #[tokio::test]
 async fn revocation_restores_undelivered_steering() {
+    hermetic_base_dir::pin();
     let (host, _temp) = host_with_plugin().await;
     let mut actor = session(&host).await;
     actor.arm().await;
@@ -815,6 +838,7 @@ async fn revocation_restores_undelivered_steering() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn driver_runs_multiple_turns_end_to_end() {
+    hermetic_base_dir::pin();
     let _guard = HomeGuard::new();
     // Every request → canned Anthropic SSE that ends the turn (end_turn), so the
     // driver's turn reaches a Success terminal instead of dying at preflight.
@@ -967,10 +991,24 @@ async fn stub_host(
     script: Script,
     extra_config: &str,
 ) -> (Arc<EngineHost>, tempfile::TempDir) {
+    let (host, temp, _hits) = stub_host_counting(guard, script, extra_config).await;
+    (host, temp)
+}
+
+/// [`stub_host`], also returning the stub's request counter.
+async fn stub_host_counting(
+    guard: &HomeGuard,
+    script: Script,
+    extra_config: &str,
+) -> (
+    Arc<EngineHost>,
+    tempfile::TempDir,
+    Arc<std::sync::atomic::AtomicUsize>,
+) {
     if !extra_config.is_empty() {
         std::fs::write(guard.base_dir().join("config"), extra_config).unwrap();
     }
-    let (url, _hits, _bodies) = spawn_stub(script).await;
+    let (url, hits, _bodies) = spawn_stub(script).await;
     std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
     let host = host().await;
     let (temp, manifest) = plugin_copy();
@@ -993,7 +1031,7 @@ async fn stub_host(
         .load_with_cwd("autonomous", &manifest, Some(temp.path().to_path_buf()))
         .await
         .unwrap();
-    (host, temp)
+    (host, temp, hits)
 }
 
 /// A session created against `host` with a caller-tweaked `SessionConfig`, then
@@ -1120,6 +1158,7 @@ fn start_reply(max_cost_usd: Option<f64>) -> Reply {
 /// the grant becoming available again.
 #[tokio::test]
 async fn s1_detach_last_client_revokes_driver_grant() {
+    hermetic_base_dir::pin();
     let (host, _temp) = host_with_plugin().await;
 
     // Session A arms and holds the single-tenancy grant.
@@ -1172,6 +1211,7 @@ async fn s1_detach_last_client_revokes_driver_grant() {
 /// still holds the grant.
 #[tokio::test]
 async fn s1_detach_nonlast_client_keeps_driver() {
+    hermetic_base_dir::pin();
     let (host, _temp) = host_with_plugin().await;
     let mut a = session(&host).await;
     // Attach a second client to A (owner stays ClientId(1)).
@@ -1209,6 +1249,7 @@ async fn s1_detach_nonlast_client_keeps_driver() {
 /// S1: after a zero-client revoke, re-attaching and re-arming works cleanly.
 #[tokio::test]
 async fn s1_rearm_after_zero_client_revoke() {
+    hermetic_base_dir::pin();
     let (host, _temp) = host_with_plugin().await;
     // `keep_warm` keeps the (empty-history) session resident with zero clients
     // so it neither parks nor idle-ends — we can re-attach and prove the
@@ -1252,6 +1293,7 @@ async fn s1_rearm_after_zero_client_revoke() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn s1_pending_prompt_fail_closed_on_last_detach() {
+    hermetic_base_dir::pin();
     let guard = HomeGuard::new();
     // The driver's turn calls prompt_fixture → raises a host prompt (blocking the
     // turn on the SecretPromptHandle); the follow-up SSE ends the turn once the
@@ -1326,6 +1368,7 @@ async fn s1_pending_prompt_fail_closed_on_last_detach() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn s3_session_cost_cap_breach_revokes_and_emits() {
+    hermetic_base_dir::pin();
     let guard = HomeGuard::new();
     let (host, _temp) = stub_host(&guard, Script::Sse(ANTHROPIC_SSE), "").await;
 
@@ -1375,6 +1418,7 @@ async fn s3_session_cost_cap_breach_revokes_and_emits() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn s3_high_cost_cap_still_runs_turns() {
+    hermetic_base_dir::pin();
     let guard = HomeGuard::new();
     let (host, _temp) = stub_host(&guard, Script::Sse(ANTHROPIC_SSE), "").await;
 
@@ -1424,6 +1468,7 @@ async fn s3_high_cost_cap_still_runs_turns() {
 /// plugin may only lower, never raise, a host limit.
 #[test]
 fn s3_grant_effective_cost_cap_takes_minimum() {
+    hermetic_base_dir::pin();
     // Plugin proposes 0.50.
     let (grant, _p) = Grant::from_start("plugin", "sess", start_reply(Some(0.50))).unwrap();
     assert_eq!(grant.max_cost_usd, Some(0.50));
@@ -1441,6 +1486,7 @@ fn s3_grant_effective_cost_cap_takes_minimum() {
 /// S3: a plugin-proposed `max_cost_usd` is captured onto the grant at arm.
 #[test]
 fn s3_grant_from_start_captures_plugin_max_cost() {
+    hermetic_base_dir::pin();
     let (grant, _p) = Grant::from_start("plugin", "sess", start_reply(Some(2.5))).unwrap();
     assert_eq!(grant.max_cost_usd, Some(2.5));
 }
@@ -1449,6 +1495,7 @@ fn s3_grant_from_start_captures_plugin_max_cost() {
 /// when `None` — additive/back-compatible on the wire).
 #[test]
 fn s3_pollrequest_serializes_session_cost_so_far() {
+    hermetic_base_dir::pin();
     let with = PollRequest {
         run_id: "r".into(),
         decision_id: "d".into(),
@@ -1475,6 +1522,7 @@ fn s3_pollrequest_serializes_session_cost_so_far() {
 /// WireSessionEvent mirror (both `From` arms), preserving its fields.
 #[test]
 fn s3_costcapreached_wire_mirror_roundtrips() {
+    hermetic_base_dir::pin();
     use agent_engine::session::wire::WireSessionEvent;
     let ev = SessionEventWire::CostCapReached {
         scope: "run".into(),
@@ -1502,6 +1550,7 @@ fn s3_costcapreached_wire_mirror_roundtrips() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn s9_armed_driver_forces_gating_despite_auto_approve() {
+    hermetic_base_dir::pin();
     let guard = HomeGuard::new();
     // Driver turn calls activate_tools with a valid id → the tool asks the host
     // to confirm (activation_confirm = prompt) UNLESS auto-approved.
@@ -1555,6 +1604,7 @@ async fn s9_armed_driver_forces_gating_despite_auto_approve() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn s9_unarmed_auto_approve_bypasses_activation_gate() {
+    hermetic_base_dir::pin();
     let guard = HomeGuard::new();
     let sse = sse_tool_call_with_input("activate_tools", "toolu_p7c", r#"{"tools":["ns:fake"]}"#);
     let bodies: &'static [&'static str] = Box::leak(Box::new([sse, ANTHROPIC_SSE]));
@@ -1612,6 +1662,7 @@ async fn s9_unarmed_auto_approve_bypasses_activation_gate() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn a_driver_revoked_mid_turn_ends_as_an_interrupted_turn() {
+    hermetic_base_dir::pin();
     use agent_engine::engine::interrupt::InterruptReason;
     let guard = HomeGuard::new();
     let (host, _temp) = stub_host(&guard, Script::Endless(support::ANTHROPIC_SSE_PREFIX), "").await;
@@ -1671,5 +1722,185 @@ async fn a_driver_revoked_mid_turn_ends_as_an_interrupted_turn() {
     assert_eq!(last["content"], InterruptReason::Driver.marker());
     let partial = &conv.api_messages[conv.api_messages.len() - 2];
     assert_eq!(partial["role"], "assistant", "the partial reply is kept");
+    actor.end().await;
+}
+
+// ── The driver while `on_session_start` is pending ──────────────────────────
+//
+// A driver turn opens its stream from the tick, not through `start_turn`, so
+// it never enters the wait for the hook. The driver checks the hook itself
+// (`driver_idle_conflict`): a start is rejected while the hook is pending,
+// and an armed driver that finds the hook pending again is revoked before its
+// next request. A foreground turn that waits for the hook keeps waiting
+// through a rejected driver start and sends once the hook has run. Two test
+// seams make the hook pending: the host's session-start gate is held, and the
+// next turn to end puts a fresh hook back in line.
+
+use agent_engine::session::session_start_testing as start_seam;
+use std::sync::atomic::Ordering::SeqCst;
+
+/// One ordinary turn; afterwards this session's `on_session_start` waits
+/// behind the held gate. Returns the hold and the hook-call count before.
+async fn hook_pending_after_a_turn(
+    actor: &mut TestActor,
+    host: &Arc<EngineHost>,
+) -> (start_seam::GateHold, u64) {
+    let hold = start_seam::hold_gate(host).await;
+    let sid = actor.handle.journal_id();
+    let calls = start_seam::calls(&sid);
+    start_seam::requeue_after_next_turn(&sid);
+    actor
+        .send(SessionCommand::Submit {
+            text: "first".into(),
+            attachments: vec![],
+        })
+        .await;
+    actor.until(|e| matches!(e, SessionEventWire::Idle)).await;
+    (hold, calls)
+}
+
+/// Wait (bounded) until `n` hooks of session `sid` have run since `base`.
+async fn hooks_run(sid: &str, base: u64, n: u64) -> bool {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while tokio::time::Instant::now() < deadline {
+        if start_seam::calls(sid) >= base + n {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    false
+}
+
+/// The next driver-start rejection notice; panics if the driver arms instead.
+async fn driver_rejection(actor: &mut TestActor) -> String {
+    let ev = actor
+        .until(|e| {
+            matches!(e, SessionEventWire::SystemNotice(text) if text.starts_with("Session driver rejected"))
+                || matches!(e, SessionEventWire::DriverArmed { .. })
+        })
+        .await;
+    match ev {
+        SessionEventWire::SystemNotice(text) => text,
+        other => panic!("the driver armed while the hook was pending: {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_driver_start_while_on_session_start_is_pending_is_rejected_before_any_request() {
+    hermetic_base_dir::pin();
+    let guard = HomeGuard::new();
+    let (host, _temp, hits) = stub_host_counting(&guard, Script::Sse(ANTHROPIC_SSE), "").await;
+    let mut actor = session(&host).await;
+    let (hold, calls) = hook_pending_after_a_turn(&mut actor, &host).await;
+    let sent = hits.load(SeqCst);
+
+    actor.driver_start().await;
+    let notice = driver_rejection(&mut actor).await;
+    assert!(
+        notice.contains("extensions loading"),
+        "rejected for the pending hook: {notice}"
+    );
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(hits.load(SeqCst), sent, "no request while the hook is pending");
+    assert_eq!(start_seam::calls(&actor.handle.journal_id()), calls, "the hook still waits");
+
+    drop(hold);
+    assert!(hooks_run(&actor.handle.journal_id(), calls, 1).await, "the hook runs");
+    // With the hook done, a driver arms and runs its turn as usual.
+    actor.arm().await;
+    actor
+        .until(|e| matches!(e, SessionEventWire::DriverTurnOutcome { .. }))
+        .await;
+    assert!(hits.load(SeqCst) > sent, "the driver turn sent its request");
+    assert_eq!(start_seam::calls(&actor.handle.journal_id()), calls + 1, "the hook ran once");
+    actor.send(SessionCommand::Cancel).await;
+    actor.end().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn an_armed_driver_finding_on_session_start_pending_is_revoked_before_its_next_request() {
+    hermetic_base_dir::pin();
+    let guard = HomeGuard::new();
+    let (host, _temp, hits) = stub_host_counting(&guard, Script::Sse(ANTHROPIC_SSE), "").await;
+    let mut actor = session(&host).await;
+    let hold = start_seam::hold_gate(&host).await;
+    let sid = actor.handle.journal_id();
+    let calls = start_seam::calls(&sid);
+    // The driver's first turn ends with a fresh hook in line, behind the hold.
+    start_seam::requeue_after_next_turn(&sid);
+    actor.arm().await;
+
+    let seen = actor
+        .collect_until(|e| matches!(e, SessionEventWire::DriverRevoked { .. }))
+        .await;
+    match seen.last() {
+        Some(SessionEventWire::DriverRevoked { reason, .. }) => assert!(
+            reason.contains("extensions loading"),
+            "revoked for the pending hook: {reason}"
+        ),
+        other => panic!("expected a revocation: {other:?}"),
+    }
+    let turns = seen
+        .iter()
+        .filter(|e| matches!(e, SessionEventWire::TurnStarted { .. }))
+        .count();
+    assert_eq!(turns, 1, "one driver turn, then the revocation: {seen:?}");
+    let sent = hits.load(SeqCst);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(hits.load(SeqCst), sent, "no request after the revocation");
+
+    drop(hold);
+    assert!(hooks_run(&actor.handle.journal_id(), calls, 1).await, "the hook runs");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(hits.load(SeqCst), sent, "the revoked driver sends nothing");
+    assert_eq!(start_seam::calls(&actor.handle.journal_id()), calls + 1, "the hook ran once");
+    actor.end().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_turn_waiting_for_on_session_start_outlasts_a_rejected_driver_start() {
+    hermetic_base_dir::pin();
+    let guard = HomeGuard::new();
+    let (host, _temp, hits) = stub_host_counting(&guard, Script::Sse(ANTHROPIC_SSE), "").await;
+    let mut actor = session(&host).await;
+    let (hold, calls) = hook_pending_after_a_turn(&mut actor, &host).await;
+    let sent = hits.load(SeqCst);
+
+    actor
+        .send(SessionCommand::Submit {
+            text: "second".into(),
+            attachments: vec![],
+        })
+        .await;
+    actor
+        .until(|e| matches!(e, SessionEventWire::TurnStarted { .. }))
+        .await;
+    actor.driver_start().await;
+    let notice = driver_rejection(&mut actor).await;
+    assert!(
+        notice.contains("foreground turn still active") || notice.contains("extensions loading"),
+        "rejected for the waiting turn: {notice}"
+    );
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(hits.load(SeqCst), sent, "the turn still waits for the hook");
+
+    drop(hold);
+    let seen = actor
+        .collect_until(|e| matches!(e, SessionEventWire::Idle))
+        .await;
+    assert!(
+        !seen.iter().any(|e| matches!(
+            e,
+            SessionEventWire::DriverArmed { .. }
+                | SessionEventWire::DriverTurnOutcome { .. }
+                | SessionEventWire::TurnStarted { .. }
+        )),
+        "only the waiting turn runs: {seen:?}"
+    );
+    assert_eq!(hits.load(SeqCst), sent + 1, "the waiting turn sent its request once");
+    assert_eq!(start_seam::calls(&actor.handle.journal_id()), calls + 1, "the hook ran once");
     actor.end().await;
 }

@@ -71,6 +71,172 @@ fn installed_plugin_setup_failure_in(
     }
 }
 
+/// The directories discovery walks, in override order: the user's
+/// `plugins/`, then the project's `.synaps/plugins/` (unless disabled). A
+/// plugin directory in a later root replaces one of the same name earlier.
+fn plugin_roots() -> Vec<PathBuf> {
+    let mut roots = vec![crate::config::base_dir().join("plugins")];
+    if !project_plugins_disabled() {
+        if let Ok(cwd) = std::env::current_dir() {
+            let project_plugins = cwd.join(".synaps").join("plugins");
+            if project_plugins != roots[0] {
+                roots.push(project_plugins);
+            }
+        }
+    }
+    roots
+}
+
+/// The registry entries (name, current tool) of `names` that exist.
+fn kept_entries(registry: &crate::ToolRegistry, names: &[String]) -> Vec<(String, Arc<dyn crate::Tool>)> {
+    names
+        .iter()
+        .filter_map(|n| registry.get(n).map(|t| (n.clone(), Arc::clone(t))))
+        .collect()
+}
+
+/// The same tool object (data pointer; vtables may differ per codegen unit).
+fn same_tool(a: &Arc<dyn crate::Tool>, b: &Arc<dyn crate::Tool>) -> bool {
+    std::ptr::eq(Arc::as_ptr(a) as *const (), Arc::as_ptr(b) as *const ())
+}
+
+/// The directory discovery would load plugin `name` from: the last root
+/// (see [`plugin_roots`]) that has it. `None` when no root has it.
+fn locate_plugin_dir(name: &str) -> Option<PathBuf> {
+    plugin_roots()
+        .into_iter()
+        .rev()
+        .map(|root| root.join(name))
+        .find(|dir| dir.is_dir())
+}
+
+/// Read `plugin_dir`'s `.synaps-plugin/plugin.json` and resolve its
+/// `extension` block the way discovery loads it (command and args made
+/// absolute against the plugin directory). `Ok(None)`: no manifest, or a
+/// manifest without an `extension` block (not an extension). Returns the
+/// manifest path and the raw JSON too, for the load-failure hint.
+fn read_extension_manifest(
+    plugin_name: &str,
+    plugin_dir: &std::path::Path,
+) -> Result<Option<(ExtensionManifest, PathBuf, Value)>, ExtensionLoadFailure> {
+    let manifest_path = plugin_dir.join(".synaps-plugin").join("plugin.json");
+    if !manifest_path.exists() {
+        return Ok(None);
+    }
+
+    let content = match std::fs::read_to_string(&manifest_path) {
+        Ok(c) => c,
+        Err(e) => {
+            let reason = format!("Failed to read plugin manifest: {e}");
+            tracing::warn!(plugin = %plugin_name, manifest = %manifest_path.display(), error = %e, "Failed to read plugin manifest");
+            return Err(ExtensionLoadFailure::new(
+                plugin_name,
+                Some(manifest_path),
+                reason,
+                "Check manifest file permissions",
+            ));
+        }
+    };
+
+    let json: serde_json::Value = match serde_json::from_str(&content) {
+        Ok(v) => v,
+        Err(e) => {
+            let reason = format!("Invalid plugin manifest JSON: {e}");
+            tracing::warn!(plugin = %plugin_name, manifest = %manifest_path.display(), error = %e, "Invalid plugin manifest JSON");
+            return Err(ExtensionLoadFailure::new(
+                plugin_name,
+                Some(manifest_path),
+                reason,
+                "Fix the JSON syntax in .synaps-plugin/plugin.json",
+            ));
+        }
+    };
+
+    let ext_value = match json.get("extension") {
+        Some(v) => v.clone(),
+        None => return Ok(None),
+    };
+
+    let ext_manifest: ExtensionManifest = match serde_json::from_value(ext_value) {
+        Ok(m) => m,
+        Err(e) => {
+            let reason = format!("Failed to parse extension manifest: {e}");
+            tracing::warn!(plugin = %plugin_name, manifest = %manifest_path.display(), error = %e, "Failed to parse extension manifest");
+            return Err(ExtensionLoadFailure::new(
+                plugin_name,
+                Some(manifest_path),
+                reason,
+                "Check the `extension` block shape against docs/extensions/contract.json",
+            ));
+        }
+    };
+
+    #[allow(clippy::if_same_then_else)]
+    let command = if std::path::Path::new(&ext_manifest.command).is_absolute() {
+        ext_manifest.command.clone()
+    } else if !ext_manifest.command.contains(std::path::MAIN_SEPARATOR)
+        && !ext_manifest.command.contains('/')
+    {
+        ext_manifest.command.clone()
+    } else {
+        plugin_dir
+            .join(&ext_manifest.command)
+            .to_string_lossy()
+            .to_string()
+    };
+
+    let args: Vec<String> = ext_manifest
+        .args
+        .iter()
+        .map(|arg| {
+            let arg_path = plugin_dir.join(arg);
+            if arg_path.exists() {
+                if let (Ok(canonical), Ok(plugin_canonical)) =
+                    (arg_path.canonicalize(), plugin_dir.canonicalize())
+                {
+                    if canonical.starts_with(&plugin_canonical) {
+                        return canonical.to_string_lossy().to_string();
+                    }
+                }
+            }
+            arg.clone()
+        })
+        .collect();
+
+    let resolved = ExtensionManifest {
+        theme_tokens: Default::default(),
+        // Deferred declarations flow through from the installed
+        // manifest (legacy `tools`/`activation` aliases are folded
+        // into `deferred` at deserialization) so installed plugins
+        // keep their zero-spawn deferred lifecycle instead of
+        // silently loading eager.
+        command,
+        args,
+        ..ext_manifest
+    };
+    Ok(Some((resolved, manifest_path, json)))
+}
+
+/// What [`ExtensionManager::reload_from_disk`] did, as the daemon reports
+/// it to `synaps daemon reload-extension`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ExtensionReloadReport {
+    /// The plugin directory name the extension is keyed by.
+    pub extension: String,
+    /// It was loaded (live or deferred) before; `false` = first load, e.g. a
+    /// plugin installed after the daemon started or one that failed then.
+    pub was_loaded: bool,
+    /// Loaded deferred (progressive disclosure): no process until first use.
+    pub deferred: bool,
+    /// Runtime names of the tools it has now (`<extension>:<tool>`), sorted.
+    pub tools: Vec<String>,
+    /// Tools it had before the reload that the new version does not have.
+    #[serde(default)]
+    pub removed_tools: Vec<String>,
+    /// The directory it was loaded from.
+    pub plugin_dir: PathBuf,
+}
+
 fn sanitize_hint_fragment(input: &str) -> String {
     input
         .chars()
@@ -132,7 +298,7 @@ pub struct ExtensionStatus {
 ///    be run. The hint points the user at the exact command. This is
 ///    the common case for fresh marketplace installs of plugins that
 ///    build their extension binary from source.
-/// 2. **Anything else** — the generic "run plugin validate" hint.
+/// 2. **Anything else** — a generic hint pointing at the manifest contract.
 ///
 /// Pure function for unit-testability. Lives here (not in
 /// `ExtensionLoadFailure`) because the sidecar/setup convention is a
@@ -153,7 +319,7 @@ pub fn compute_extension_load_hint(
             sanitize_hint_fragment(&plugin_dir.display().to_string()),
             sanitize_hint_fragment(setup),
         ),
-        _ => "Run `plugin validate <plugin-dir>` and confirm the extension command is installed"
+        _ => "Check the `extension` block in .synaps-plugin/plugin.json against docs/extensions/contract.json and confirm the extension command is installed"
             .to_string(),
     }
 }
@@ -215,6 +381,11 @@ pub struct ExtensionManager {
     /// CURRENT record at every lease acquisition (sync lock, map ops only,
     /// never held across I/O). Consumed by the lease lifecycle only.
     deferred_tool_only: SharedDeferredRecords,
+    /// Set by [`Self::reload`] for its load only: the dormant tool names of
+    /// the deferred instance being replaced, which the new instance's
+    /// catalog batch swaps out in the SAME registry write (see
+    /// [`Self::reload`] on why the registry must never show a gap).
+    reload_replaces: Vec<String>,
     /// Lazily-created shared extension runtime lease manager (Task 20
     /// Commit B). One instance shared by this manager (unload revocation)
     /// and the `Runtime` (per-session capabilities + session-end scope).
@@ -284,6 +455,7 @@ impl ExtensionManager {
             manifest_theme_tokens: HashMap::new(),
             progressive_deferral: false,
             deferred_tool_only: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            reload_replaces: Vec::new(),
             extension_runtime: std::sync::OnceLock::new(),
             context_providers: Vec::new(),
             context_provider_catalog: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -312,6 +484,7 @@ impl ExtensionManager {
             manifest_theme_tokens: HashMap::new(),
             progressive_deferral: false,
             deferred_tool_only: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            reload_replaces: Vec::new(),
             extension_runtime: std::sync::OnceLock::new(),
             context_providers: Vec::new(),
             context_provider_catalog: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -336,6 +509,23 @@ impl ExtensionManager {
         manifest: &ExtensionManifest,
         cwd: Option<std::path::PathBuf>,
     ) -> Result<(), String> {
+        let deferred: Vec<String> = self
+            .deferred_records()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .keys()
+            .cloned()
+            .collect();
+        let loaded = self
+            .extensions
+            .keys()
+            .map(String::as_str)
+            .chain(deferred.iter().map(String::as_str));
+        if let Some(other) = Self::folded_id_collision(id, loaded) {
+            return Err(format!(
+                "Extension '{id}' collides with loaded extension '{other}': ids that differ only in '-'/'_' or case share SYNAPS_EXTENSION_* override variables"
+            ));
+        }
         let config = Self::resolve_config(id, &manifest.config, self.host_project_root())?;
         self.load_with_cwd_and_config(id, manifest, cwd, config)
             .await
@@ -563,10 +753,13 @@ impl ExtensionManager {
                         id
                     ));
                 };
-                tools
-                    .write()
-                    .await
-                    .try_register_batch(dormant)
+                // A reload swaps the replaced instance's dormant entries in
+                // this same write: no reader ever sees them missing.
+                let replacing = std::mem::take(&mut self.reload_replaces);
+                let mut registry = tools.write().await;
+                registry
+                    .try_disable(&replacing)
+                    .and_then(|()| registry.try_register_batch(dormant))
                     .map_err(|e| {
                         format!("Extension '{}' deferred tool catalog rejected: {}", id, e)
                     })?;
@@ -931,8 +1124,77 @@ impl ExtensionManager {
     /// `SYNAPS_*` host namespace except this extension's own scoped override.
     /// Third-party secrets an extension legitimately needs (`GITHUB_TOKEN`,
     /// and friends) are unaffected.
-    fn denied_secret_env(var: &str, id: &str) -> Option<&'static str> {
-        const HOST_CREDENTIALS: &[&str] = &[
+    ///
+    /// The credential set is derived from the provider registries (every
+    /// `env_vars` entry of the broker's static table and the engine catalog)
+    /// plus the credential sources read outside those tables, with the
+    /// original hand-written list kept as a floor. Drift tests below fail if a
+    /// registered or hand-read credential env var is not covered.
+    ///
+    /// `own_keys` are this manifest's declared config keys: inside `SYNAPS_*`
+    /// only their exact override names are allowed, so extension `foo`
+    /// cannot read `foo-bar`'s `SYNAPS_EXTENSION_FOO_BAR_TOKEN`.
+    ///
+    /// `var` must already have passed [`Self::secret_env_name`].
+    pub(crate) fn denied_secret_env(
+        var: &str,
+        id: &str,
+        own_keys: &[&str],
+    ) -> Option<&'static str> {
+        if var.starts_with("SYNAPS_")
+            && !own_keys
+                .iter()
+                .any(|k| Self::extension_override_var(id, k) == var)
+        {
+            return Some(
+                "SYNAPS_* is the host namespace; only this extension's own SYNAPS_EXTENSION_<ID>_<KEY> for a declared key is allowed",
+            );
+        }
+        if Self::is_host_credential_env(var) {
+            return Some(
+                "that variable holds a host credential; extensions are never handed the host's own provider keys",
+            );
+        }
+        None
+    }
+
+    /// The usable `secret_env` name: `raw` trimmed, if it matches
+    /// `[A-Z_][A-Z0-9_]*`. `None` means a malformed name; the caller warns and
+    /// ignores the `secret_env` (it is never read) instead of failing the load.
+    pub(crate) fn secret_env_name(raw: &str) -> Option<&str> {
+        let name = raw.trim();
+        let mut chars = name.chars();
+        let valid = chars
+            .next()
+            .is_some_and(|c| c.is_ascii_uppercase() || c == '_')
+            && chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
+        valid.then_some(name)
+    }
+
+    /// The per-extension env override name for config `key`
+    /// (`SYNAPS_EXTENSION_<ID>_<KEY>`, upper-cased, `-` folded to `_`).
+    fn extension_override_var(id: &str, key: &str) -> String {
+        format!(
+            "SYNAPS_EXTENSION_{}_{}",
+            id.replace('-', "_").to_ascii_uppercase(),
+            key.replace('-', "_").to_ascii_uppercase()
+        )
+    }
+
+    /// Another loaded id that differs from `id` only in `-`/`_` or case. The
+    /// two would share every `SYNAPS_EXTENSION_<ID>_*` override variable.
+    fn folded_id_collision<'a>(id: &str, loaded: impl Iterator<Item = &'a str>) -> Option<&'a str> {
+        let fold = |s: &str| s.replace('-', "_").to_ascii_uppercase();
+        let mine = fold(id);
+        loaded
+            .filter(|other| *other != id)
+            .find(|other| fold(other) == mine)
+    }
+
+    /// `up` must already be upper-cased.
+    fn is_host_credential_env(up: &str) -> bool {
+        // Floor: the original #207 list. Never shrink it.
+        const FLOOR: &[&str] = &[
             "ANTHROPIC_API_KEY",
             "OPENAI_API_KEY",
             "GEMINI_API_KEY",
@@ -945,25 +1207,31 @@ impl ExtensionManager {
             "AWS_SECRET_ACCESS_KEY",
             "AWS_SESSION_TOKEN",
         ];
-        let up = var.trim().to_ascii_uppercase();
-        if up.is_empty() {
-            return Some("secret_env must not be empty");
-        }
-        if HOST_CREDENTIALS.contains(&up.as_str()) {
-            return Some(
-                "that variable holds a host credential; extensions are never handed the host's own provider keys",
-            );
-        }
-        let own_prefix = format!(
-            "SYNAPS_EXTENSION_{}_",
-            id.replace('-', "_").to_ascii_uppercase()
-        );
-        if up.starts_with("SYNAPS_") && !up.starts_with(&own_prefix) {
-            return Some(
-                "SYNAPS_* is the host namespace; declare your own SYNAPS_EXTENSION_<ID>_<KEY> variable instead",
-            );
-        }
-        None
+        // Credential sources that are not rows in a provider registry.
+        // (`SYNAPS_*` entries are also caught by the namespace rule; they are
+        // listed so relaxing that rule can never expose them.)
+        const OTHER_SOURCES: &[&str] = &[
+            agent_core::auth::muse::API_KEY_ENV,
+            "LOCAL_API_KEY",
+            "OPENAI_CODEX_ACCESS_TOKEN",
+            "AWS_ACCESS_KEY_ID",
+            "SYNAPS_MACHINE_TOKEN",
+            "SYNAPS_BROKER_TOKEN",
+            // reqwest reads these by default; a proxy URL can embed
+            // `user:pass@`.
+            "HTTPS_PROXY",
+            "HTTP_PROXY",
+            "ALL_PROXY",
+            "NO_PROXY",
+        ];
+        FLOOR.contains(&up)
+            || OTHER_SOURCES.contains(&up)
+            || agent_core::auth::static_providers::STATIC_PROVIDERS
+                .iter()
+                .any(|s| s.env_vars.contains(&up))
+            || crate::runtime::openai::registry::providers()
+                .iter()
+                .any(|s| s.env_vars.contains(&up))
     }
 
     fn resolve_config(
@@ -971,7 +1239,21 @@ impl ExtensionManager {
         entries: &[ExtensionConfigEntry],
         host_project_root: Option<&str>,
     ) -> Result<Value, String> {
+        Self::resolve_config_with_env(id, entries, host_project_root, &|name| {
+            std::env::var(name).ok()
+        })
+    }
+
+    /// [`Self::resolve_config`] with the environment lookup injected, so
+    /// tests can prove which variable names are (and are never) read.
+    fn resolve_config_with_env(
+        id: &str,
+        entries: &[ExtensionConfigEntry],
+        host_project_root: Option<&str>,
+        env: &dyn Fn(&str) -> Option<String>,
+    ) -> Result<Value, String> {
         let mut out = Map::new();
+        let own_keys: Vec<&str> = entries.iter().map(|e| e.key.trim()).collect();
         for entry in entries {
             let key = entry.key.trim();
             if key.is_empty() {
@@ -1013,26 +1295,40 @@ impl ExtensionManager {
             }
             let config_key = format!("extension.{}.{}", id, key);
             // Security (#207 MED-2): validate the declared env var name BEFORE
-            // any resolution path can read it. Fails at load, loudly, rather
-            // than silently handing a host credential to the extension.
-            if let Some(secret_env) = &entry.secret_env {
-                if let Some(reason) = Self::denied_secret_env(secret_env, id) {
-                    return Err(format!(
-                        "Extension '{}' config key '{}' declares secret_env '{}': {}",
-                        id, key, secret_env, reason
-                    ));
-                }
-            }
-            if let Ok(value) = std::env::var(format!(
-                "SYNAPS_EXTENSION_{}_{}",
-                id.replace('-', "_").to_ascii_uppercase(),
-                key.replace('-', "_").to_ascii_uppercase()
-            )) {
+            // any resolution path can read it. A denied name (host credential,
+            // SYNAPS_*) fails the load loudly. A malformed name is ignored with
+            // a warning: it is never read, and the value resolves as if no
+            // secret_env had been declared.
+            let secret_env: Option<&str> = match entry.secret_env.as_deref() {
+                None => None,
+                Some(raw) => match Self::secret_env_name(raw) {
+                    None => {
+                        let shown: String = raw.chars().take(64).collect();
+                        tracing::warn!(
+                            extension = %id,
+                            key = %key,
+                            secret_env = ?shown,
+                            "ignoring secret_env: not an upper-case variable name matching [A-Z_][A-Z0-9_]*"
+                        );
+                        None
+                    }
+                    Some(name) => {
+                        if let Some(reason) = Self::denied_secret_env(name, id, &own_keys) {
+                            return Err(format!(
+                                "Extension '{}' config key '{}' declares secret_env '{}': {}",
+                                id, key, name, reason
+                            ));
+                        }
+                        Some(name)
+                    }
+                },
+            };
+            if let Some(value) = env(&Self::extension_override_var(id, key)) {
                 out.insert(key.to_string(), Value::String(value));
                 continue;
             }
-            if let Some(secret_env) = &entry.secret_env {
-                if let Ok(value) = std::env::var(secret_env) {
+            if let Some(secret_env) = secret_env {
+                if let Some(value) = env(secret_env) {
                     out.insert(key.to_string(), Value::String(value));
                     continue;
                 }
@@ -1050,7 +1346,7 @@ impl ExtensionManager {
                 continue;
             }
             if entry.required {
-                let hint = if let Some(secret_env) = &entry.secret_env {
+                let hint = if let Some(secret_env) = secret_env {
                     format!(
                         "set environment variable '{}' or config key '{}'",
                         secret_env, config_key
@@ -1087,6 +1383,19 @@ impl ExtensionManager {
     /// grants cannot survive), and terminates every session's runtime
     /// lease for the plugin.
     pub async fn unload(&mut self, id: &str) -> Result<(), String> {
+        self.unload_inner(id, false).await.map(|_| ())
+    }
+
+    /// [`Self::unload`]; with `keep_tools` (a reload only) the extension's
+    /// registry entries stay where they are and are returned, for
+    /// [`Self::settle_replaced_tools`] to remove whatever the new instance
+    /// did not replace. Until then a call to one fails against the stopped
+    /// instance, as it would against a missing tool.
+    async fn unload_inner(
+        &mut self,
+        id: &str,
+        keep_tools: bool,
+    ) -> Result<Vec<(String, Arc<dyn crate::Tool>)>, String> {
         let deferred = self
             .deferred_tool_only
             .lock()
@@ -1108,6 +1417,7 @@ impl ExtensionManager {
             }
             self.hook_bus.unsubscribe_all(id).await;
             self.providers.unregister_plugin(id);
+            let mut kept = Vec::new();
             if let Some(tools) = &self.tools {
                 let names: Vec<String> = record
                     .manifest
@@ -1120,7 +1430,11 @@ impl ExtensionManager {
                             .collect()
                     })
                     .unwrap_or_default();
-                if let Err(error) = tools.write().await.try_disable(&names) {
+                if keep_tools {
+                    let registry = tools.read().await;
+                    kept = kept_entries(&registry, &names);
+                    self.reload_replaces = names.clone();
+                } else if let Err(error) = tools.write().await.try_disable(&names) {
                     // Fail-closed either way: with the record gone, dormant
                     // descriptors can never execute; surface the partial
                     // cleanup instead of hiding it.
@@ -1133,7 +1447,7 @@ impl ExtensionManager {
             self.manifest_configs.remove(id);
             self.manifest_theme_tokens.remove(id);
             tracing::info!(extension = %id, "Deferred extension unloaded");
-            return Ok(());
+            return Ok(kept);
         }
         let handler = self
             .extensions
@@ -1145,6 +1459,26 @@ impl ExtensionManager {
 
         self.hook_bus.unsubscribe_all(id).await;
         self.providers.unregister_plugin(id);
+        // Its tools go with it: each holds the handler being shut down, so
+        // a tool left behind would fail every call, and a reload whose new
+        // version no longer declares it would never replace it.
+        let mut kept = Vec::new();
+        let tool_error = match &self.tools {
+            Some(tools) if keep_tools => {
+                let registry = tools.read().await;
+                let names = registry.tool_names_for_extension(id);
+                kept = kept_entries(&registry, &names);
+                // A new version that defers swaps these in its batch write.
+                self.reload_replaces = names;
+                None
+            }
+            Some(tools) => {
+                let mut registry = tools.write().await;
+                let names = registry.tool_names_for_extension(id);
+                registry.try_disable(&names).err()
+            }
+            None => None,
+        };
         self.eager_permissions.remove(id);
         self.manifest_configs.remove(id);
         self.capabilities.remove(id);
@@ -1152,23 +1486,227 @@ impl ExtensionManager {
         self.manifest_theme_tokens.remove(id);
         handler.shutdown().await;
 
+        if let Some(error) = tool_error {
+            // Fail-closed like the deferred path: the extension is gone
+            // either way; surface the partial cleanup.
+            return Err(format!(
+                "Extension '{}' unloaded but its tools could not be deregistered: {}",
+                id, error
+            ));
+        }
         tracing::info!(extension = %id, "Extension unloaded");
-        Ok(())
+        Ok(kept)
+    }
+
+    /// After a reload's load: remove each kept entry the new instance did
+    /// not replace (it still holds the stopped instance), in ONE registry
+    /// write. On success that is exactly the tools the new version no
+    /// longer declares; after a failed load it is all of them (fail-closed:
+    /// no tool outlives its process).
+    async fn settle_replaced_tools(&mut self, id: &str, kept: Vec<(String, Arc<dyn crate::Tool>)>) -> Result<(), String> {
+        self.reload_replaces.clear();
+        let Some(tools) = &self.tools else { return Ok(()) };
+        if kept.is_empty() {
+            return Ok(());
+        }
+        let mut registry = tools.write().await;
+        let stale: Vec<String> = kept
+            .into_iter()
+            .filter(|(name, old)| registry.get(name).is_some_and(|now| same_tool(now, old)))
+            .map(|(name, _)| name)
+            .collect();
+        registry
+            .try_disable(&stale)
+            .map_err(|e| format!("Extension '{id}' reloaded but its stale tools could not be deregistered: {e}"))
     }
 
     /// Reload one extension by unloading any existing instance first, then loading
     /// the supplied manifest. If the new load fails, the previous instance remains
     /// unloaded so duplicate handlers cannot survive a broken reload.
+    ///
+    /// The extension's tools never leave the shared registry during the
+    /// swap: the new instance replaces them by name (a deferred one in a
+    /// single write), and only what it did not replace is removed after.
+    /// A session that starts a request mid-reload therefore still finds its
+    /// activated tools, so the round-top rebuild keeps them and the tools
+    /// array it sends (part of the cached prompt prefix) is unchanged. A
+    /// gap would drop those activations for good: a prompt-cache rewrite
+    /// then, and another when the model re-activates.
     pub async fn reload(
         &mut self,
         id: &str,
         manifest: &ExtensionManifest,
         cwd: Option<std::path::PathBuf>,
     ) -> Result<(), String> {
-        if self.extensions.contains_key(id) || self.is_deferred_tool_only(id) {
-            self.unload(id).await?;
+        let kept = if self.extensions.contains_key(id) || self.is_deferred_tool_only(id) {
+            self.unload_inner(id, true).await?
+        } else {
+            Vec::new()
+        };
+        let loaded = self.load_with_cwd(id, manifest, cwd).await;
+        let settled = self.settle_replaced_tools(id, kept).await;
+        loaded.and(settled)
+    }
+
+    /// Reload extension `id` from what is installed now, without touching
+    /// any other extension: find its plugin directory the way discovery
+    /// does, read and validate its manifest, then stop the running instance
+    /// (if any) and start the new one. Its tools are re-registered in the
+    /// shared registry (so every session sees the new set from its next
+    /// request), its hooks re-subscribed, and a deferred extension's
+    /// session leases revoked. A plugin that is installed but not loaded
+    /// (added after discovery, or failed then) is loaded.
+    ///
+    /// Everything that can be checked without stopping the running
+    /// instance is checked first; a failure there leaves it running. Only a
+    /// failure to START the new version leaves the extension unloaded (as
+    /// [`Self::reload`] documents), and the error says so. Discovery's
+    /// recorded result is updated either way, so a later replay agrees.
+    ///
+    /// Needs discovery to have finished on this manager: before that, a
+    /// load here would make discovery's own load of the same plugin fail.
+    pub async fn reload_from_disk(
+        &mut self,
+        id: &str,
+    ) -> Result<ExtensionReloadReport, ExtensionLoadFailure> {
+        let refuse = |reason: String, hint: &str| ExtensionLoadFailure::new(id, None, reason, hint);
+        if id.is_empty()
+            || id == "."
+            || id == ".."
+            || id.contains('/')
+            || id.contains('\\')
+            || id.contains(':')
+            || id.chars().any(char::is_control)
+        {
+            return Err(refuse(
+                format!("'{id}' is not a plugin name"),
+                "Give the plugin's directory name, as `/extensions` lists it",
+            ));
         }
-        self.load_with_cwd(id, manifest, cwd).await
+        if is_inert_plugin_dir_name(id) {
+            return Err(refuse(
+                format!("'{id}' is a backup, disabled or temp directory name; discovery never loads it"),
+                "Give the plugin's directory name without the suffix",
+            ));
+        }
+        if !matches!(self.discovery, DiscoveryState::Done { .. }) {
+            return Err(refuse(
+                "extensions have not finished loading yet".into(),
+                "Retry in a moment",
+            ));
+        }
+        let was_loaded = self.is_loaded(id);
+        let Some(plugin_dir) = locate_plugin_dir(id) else {
+            let roots = plugin_roots()
+                .iter()
+                .map(|r| r.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(refuse(
+                format!("no plugin directory named '{id}' in {roots}"),
+                "Check the name against `ls ~/.synaps-cli/plugins` or `/extensions`",
+            ));
+        };
+        if crate::config::load_config()
+            .disabled_plugins
+            .iter()
+            .any(|d| d == id)
+        {
+            return Err(refuse(
+                format!("'{id}' is disabled (disabled_plugins in config)"),
+                "Remove it from disabled_plugins first",
+            ));
+        }
+        let plugins_state = {
+            let state_path = crate::skills::state::PluginsState::default_path();
+            crate::skills::state::PluginsState::load_from(&state_path).unwrap_or_default()
+        };
+        if let Some(message) = installed_plugin_setup_failure_in(&plugins_state, id) {
+            return Err(refuse(
+                format!("Post-install setup failed: {message}"),
+                "Open /plugins, reinstall or update the plugin after fixing setup",
+            ));
+        }
+        let (resolved, manifest_path, json) = match read_extension_manifest(id, &plugin_dir)? {
+            Some(read) => read,
+            None => {
+                return Err(ExtensionLoadFailure::new(
+                    id,
+                    Some(plugin_dir.join(".synaps-plugin").join("plugin.json")),
+                    format!("'{id}' has no extension (no plugin.json, or no `extension` block in it)"),
+                    "Only plugins with an `extension` block run as extensions",
+                ));
+            }
+        };
+        if let Err(e) = resolved.validate(id) {
+            return Err(ExtensionLoadFailure::new(
+                id,
+                Some(manifest_path),
+                e,
+                "Fix the manifest; the running instance was not touched",
+            ));
+        }
+
+        // Commit point: from here the running instance is stopped.
+        let prefix = format!("{id}:");
+        let owned_tools = |registry: &crate::ToolRegistry| -> Vec<String> {
+            registry
+                .iter_tools_sorted()
+                .into_iter()
+                .map(|t| t.name().to_string())
+                .filter(|n| n.starts_with(&prefix))
+                .collect()
+        };
+        let before = match &self.tools {
+            Some(tools) => owned_tools(&*tools.read().await),
+            None => Vec::new(),
+        };
+        let outcome = self.reload(id, &resolved, Some(plugin_dir.clone())).await;
+        let failure = outcome.as_ref().err().map(|e| {
+            let setup_script = json
+                .pointer("/extension/setup")
+                .and_then(|v| v.as_str())
+                .or_else(|| json.pointer("/provides/sidecar/setup").and_then(|v| v.as_str()));
+            let hint = compute_extension_load_hint(e, &plugin_dir, setup_script);
+            let reason = if was_loaded {
+                format!("{e} (the previous instance was stopped, so '{id}' is not loaded now)")
+            } else {
+                e.clone()
+            };
+            ExtensionLoadFailure::new(id, Some(manifest_path.clone()), reason, hint)
+        });
+        if let DiscoveryState::Done { loaded, failed } = &mut self.discovery {
+            loaded.retain(|l| l != id);
+            failed.retain(|f| f.plugin != id);
+            match &failure {
+                None => loaded.push(id.to_string()),
+                Some(f) => failed.push(f.clone()),
+            }
+        }
+        if let Some(failure) = failure {
+            tracing::warn!(extension = %id, error = %failure.reason, "Extension reload failed");
+            return Err(failure);
+        }
+        let tools = match &self.tools {
+            Some(tools) => owned_tools(&*tools.read().await),
+            None => Vec::new(),
+        };
+        let removed_tools = before.into_iter().filter(|n| !tools.contains(n)).collect();
+        let deferred = self.is_deferred_tool_only(id);
+        tracing::info!(extension = %id, was_loaded, deferred, tools = tools.len(), path = %plugin_dir.display(), "Extension reloaded");
+        Ok(ExtensionReloadReport {
+            extension: id.to_string(),
+            was_loaded,
+            deferred,
+            tools,
+            removed_tools,
+            plugin_dir,
+        })
+    }
+
+    /// `id` is loaded, live or deferred (no process yet).
+    pub fn is_loaded(&self, id: &str) -> bool {
+        self.extensions.contains_key(id) || self.is_deferred_tool_only(id)
     }
 
     /// Current process-level discovery state.
@@ -1750,20 +2288,10 @@ impl ExtensionManager {
     where
         F: FnMut(crate::extensions::loader::ExtensionLoaderEvent),
     {
-        let mut plugin_roots = vec![crate::config::base_dir().join("plugins")];
-        if !project_plugins_disabled() {
-            if let Ok(cwd) = std::env::current_dir() {
-                let project_plugins = cwd.join(".synaps").join("plugins");
-                if project_plugins != plugin_roots[0] {
-                    plugin_roots.push(project_plugins);
-                }
-            }
-        }
-
         let mut plugin_dirs: HashMap<String, PathBuf> = HashMap::new();
         let mut failed: Vec<ExtensionLoadFailure> = Vec::new();
 
-        for plugins_dir in plugin_roots {
+        for plugins_dir in plugin_roots() {
             if !plugins_dir.exists() {
                 continue;
             }
@@ -1822,104 +2350,15 @@ impl ExtensionManager {
                 ));
                 continue;
             }
-            let manifest_path = plugin_dir.join(".synaps-plugin").join("plugin.json");
-            if !manifest_path.exists() {
-                continue;
-            }
-
-            let content = match std::fs::read_to_string(&manifest_path) {
-                Ok(c) => c,
-                Err(e) => {
-                    let reason = format!("Failed to read plugin manifest: {e}");
-                    tracing::warn!(plugin = %plugin_name, manifest = %manifest_path.display(), error = %e, "Failed to read plugin manifest");
-                    failed.push(ExtensionLoadFailure::new(
-                        plugin_name,
-                        Some(manifest_path),
-                        reason,
-                        "Check manifest file permissions, then run `plugin validate <plugin-dir>`",
-                    ));
-                    continue;
-                }
-            };
-
-            let json: serde_json::Value = match serde_json::from_str(&content) {
-                Ok(v) => v,
-                Err(e) => {
-                    let reason = format!("Invalid plugin manifest JSON: {e}");
-                    tracing::warn!(plugin = %plugin_name, manifest = %manifest_path.display(), error = %e, "Invalid plugin manifest JSON");
-                    failed.push(ExtensionLoadFailure::new(
-                        plugin_name,
-                        Some(manifest_path),
-                        reason,
-                        "Fix JSON syntax, then run `plugin validate <plugin-dir>`",
-                    ));
-                    continue;
-                }
-            };
-
-            let ext_value = match json.get("extension") {
-                Some(v) => v.clone(),
-                None => continue,
-            };
-
-            let ext_manifest: ExtensionManifest = match serde_json::from_value(ext_value) {
-                Ok(m) => m,
-                Err(e) => {
-                    let reason = format!("Failed to parse extension manifest: {e}");
-                    tracing::warn!(plugin = %plugin_name, manifest = %manifest_path.display(), error = %e, "Failed to parse extension manifest");
-                    failed.push(ExtensionLoadFailure::new(
-                        plugin_name,
-                        Some(manifest_path),
-                        reason,
-                        "Check the `extension` block shape against docs/extensions/contract.json, then run `plugin validate <plugin-dir>`",
-                    ));
-                    continue;
-                }
-            };
-
-            #[allow(clippy::if_same_then_else)]
-            let command = if std::path::Path::new(&ext_manifest.command).is_absolute() {
-                ext_manifest.command.clone()
-            } else if !ext_manifest.command.contains(std::path::MAIN_SEPARATOR)
-                && !ext_manifest.command.contains('/')
-            {
-                ext_manifest.command.clone()
-            } else {
-                plugin_dir
-                    .join(&ext_manifest.command)
-                    .to_string_lossy()
-                    .to_string()
-            };
-
-            let args: Vec<String> = ext_manifest
-                .args
-                .iter()
-                .map(|arg| {
-                    let arg_path = plugin_dir.join(arg);
-                    if arg_path.exists() {
-                        if let (Ok(canonical), Ok(plugin_canonical)) =
-                            (arg_path.canonicalize(), plugin_dir.canonicalize())
-                        {
-                            if canonical.starts_with(&plugin_canonical) {
-                                return canonical.to_string_lossy().to_string();
-                            }
-                        }
+            let (resolved, manifest_path, json) =
+                match read_extension_manifest(&plugin_name, &plugin_dir) {
+                    Ok(Some(read)) => read,
+                    Ok(None) => continue,
+                    Err(failure) => {
+                        failed.push(failure);
+                        continue;
                     }
-                    arg.clone()
-                })
-                .collect();
-
-            let resolved = ExtensionManifest {
-                theme_tokens: Default::default(),
-                // Deferred declarations flow through from the installed
-                // manifest (legacy `tools`/`activation` aliases are folded
-                // into `deferred` at deserialization) so installed plugins
-                // keep their zero-spawn deferred lifecycle instead of
-                // silently loading eager.
-                command,
-                args,
-                ..ext_manifest
-            };
+                };
 
             match self
                 .load_with_cwd(&plugin_name, &resolved, Some(plugin_dir.clone()))
@@ -2659,7 +3098,7 @@ mod tests {
             None,
         );
         assert!(
-            hint.contains("plugin validate"),
+            hint.contains("contract.json"),
             "no setup declared → generic hint: {hint}"
         );
         assert!(
@@ -2678,7 +3117,7 @@ mod tests {
         // Setup script is declared, but the error is *not* a missing
         // binary — running the script wouldn't help. Fall back to the
         // generic hint so we don't mislead the user.
-        assert!(hint.contains("plugin validate"), "got {hint}");
+        assert!(hint.contains("contract.json"), "got {hint}");
         assert!(!hint.contains("Extension binary missing"), "got {hint}");
     }
 
@@ -2702,7 +3141,7 @@ mod tests {
             None,
         );
         assert!(hint.contains("Expected: integrated Axel"));
-        assert!(!hint.contains("plugin validate"));
+        assert!(!hint.contains("contract.json"));
     }
 
     // ── bugfix: installed-plugin backup discovery ───────────────────────────
@@ -2869,12 +3308,21 @@ mod secret_env_allowlist_tests {
             "ANTHROPIC_API_KEY",
             "OPENAI_API_KEY",
             "AWS_SECRET_ACCESS_KEY",
-            "anthropic_api_key", // case-insensitive
         ] {
             let err = ExtensionManager::resolve_config("evil", &[entry("k", var)], None)
                 .expect_err(&format!("{var} must be rejected"));
             assert!(err.contains("host credential"), "unexpected error: {err}");
         }
+        // Padding is trimmed before the denylist check, as before.
+        let entries = [entry("k", "  ANTHROPIC_API_KEY ")];
+        let err = ExtensionManager::resolve_config("evil", &entries, None)
+            .expect_err("padded host credential must be rejected");
+        assert!(err.contains("host credential"), "unexpected error: {err}");
+        // A lower-case name is malformed: ignored (never read), not fatal.
+        let entries = [entry("k", "anthropic_api_key")];
+        let out = ExtensionManager::resolve_config("evil", &entries, None)
+            .expect("malformed name is dropped, not fatal");
+        assert!(out.get("k").is_none(), "{out}");
     }
 
     /// The whole SYNAPS_* namespace is the host's, except this extension's
@@ -2889,7 +3337,8 @@ mod secret_env_allowlist_tests {
         // an extension's own scoped var is fine
         assert!(ExtensionManager::denied_secret_env(
             "SYNAPS_EXTENSION_MY_PLUGIN_TOKEN",
-            "my-plugin"
+            "my-plugin",
+            &["token"]
         )
         .is_none());
     }
@@ -2899,14 +3348,298 @@ mod secret_env_allowlist_tests {
     fn third_party_secrets_are_still_allowed() {
         for var in ["GITHUB_TOKEN", "STRIPE_KEY", "MY_SERVICE_TOKEN"] {
             assert!(
-                ExtensionManager::denied_secret_env(var, "some-ext").is_none(),
+                ExtensionManager::denied_secret_env(var, "some-ext", &[]).is_none(),
                 "{var} should be allowed"
             );
         }
     }
 
+    /// 01 I1: the denylist is built from the provider registries, so a new
+    /// provider (or credential source) cannot drift out of it.
     #[test]
-    fn empty_secret_env_is_rejected() {
-        assert!(ExtensionManager::denied_secret_env("   ", "x").is_some());
+    fn every_registered_provider_env_var_is_denied() {
+        let mut vars: Vec<&str> = Vec::new();
+        for spec in agent_core::auth::static_providers::STATIC_PROVIDERS {
+            vars.extend(spec.env_vars.iter().copied());
+        }
+        for spec in crate::runtime::openai::registry::providers() {
+            vars.extend(spec.env_vars.iter().copied());
+        }
+        vars.extend([
+            agent_core::auth::muse::API_KEY_ENV,
+            "META_API_KEY",
+            "KIMI_API_KEY",
+            "MOONSHOT_API_KEY",
+            "OPENAI_CODEX_ACCESS_TOKEN",
+            "LOCAL_API_KEY",
+            "TOGETHER_API_KEY",
+            "CEREBRAS_API_KEY",
+            "AWS_ACCESS_KEY_ID",
+        ]);
+        assert!(vars.len() > 20, "registry walk found too few vars");
+        for var in vars {
+            let reason = ExtensionManager::denied_secret_env(var, "some-ext", &[])
+                .unwrap_or_else(|| panic!("{var} must be denied as secret_env"));
+            assert!(reason.contains("host credential"), "{var}: {reason}");
+        }
+    }
+
+    /// Literal names passed to `pat` (e.g. `env::var(`), skipping any
+    /// whitespace between the open paren and the opening quote.
+    fn literal_args(src: &str, pat: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut rest = src;
+        while let Some(i) = rest.find(pat) {
+            rest = &rest[i + pat.len()..];
+            let arg = rest.trim_start();
+            if let Some(lit) = arg.strip_prefix('"') {
+                if let Some(end) = lit.find('"') {
+                    out.push(lit[..end].to_string());
+                }
+            }
+        }
+        out
+    }
+
+    /// Drift guard for credential env vars read by hand rather than through
+    /// a registry: walk every workspace source file (recursively: all crates
+    /// plus the root `src/`) for `env::var(…"NAME"…)` / `env::var_os(…)`
+    /// literals (whitespace and rustfmt line breaks allowed inside the call)
+    /// and `*_ENV: &str = "…"` consts whose names look like secrets, and
+    /// require every one to be refused.
+    #[test]
+    fn credential_env_reads_in_workspace_sources_are_denied() {
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for e in std::fs::read_dir(dir).unwrap() {
+                let p = e.unwrap().path();
+                if p.is_dir() {
+                    walk(&p, out);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    out.push(p);
+                }
+            }
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut files = Vec::new();
+        walk(&root.join("src"), &mut files);
+        for e in std::fs::read_dir(root.join("crates")).unwrap() {
+            let src = e.unwrap().path().join("src");
+            if src.is_dir() {
+                walk(&src, &mut files);
+            }
+        }
+        // The scan must reach the places the review listed, or it rotted.
+        for must in [
+            "crates/agent-core/src/core/auth/muse.rs",
+            "crates/agent-core/src/core/config.rs",
+            "crates/agent-engine/src/runtime/google_gemini/runtime.rs",
+            "crates/agent-engine/src/session/types.rs",
+            "crates/agent-engine/src/daemon/mod.rs",
+            "crates/agent-tui/src/lib.rs",
+            "src/cmd/auth_broker.rs",
+            "src/cmd/login.rs",
+        ] {
+            assert!(
+                files.iter().any(|f| f.ends_with(must)),
+                "scan does not cover {must}"
+            );
+        }
+
+        let mut seen = 0;
+        for f in &files {
+            let src = std::fs::read_to_string(f).unwrap();
+            let mut names = literal_args(&src, "env::var(");
+            names.extend(literal_args(&src, "env::var_os("));
+            names.extend(literal_args(&src, "_ENV: &str ="));
+            for name in names {
+                let up = name.to_ascii_uppercase();
+                let looks_secret = ["KEY", "TOKEN", "SECRET", "PASSWORD"]
+                    .iter()
+                    .any(|w| up.contains(w));
+                if !looks_secret {
+                    continue;
+                }
+                seen += 1;
+                assert!(
+                    ExtensionManager::secret_env_name(&name).is_none()
+                        || ExtensionManager::denied_secret_env(&name, "some-ext", &[]).is_some(),
+                    "{} reads credential env var {name}, which extensions may still request via secret_env",
+                    f.display()
+                );
+            }
+        }
+        assert!(
+            seen > 3,
+            "source scan matched almost nothing; the patterns rotted"
+        );
+    }
+
+    #[test]
+    fn literal_scan_handles_rustfmt_split_calls() {
+        // Guard the scanner itself against the rustfmt shape that the old
+        // version missed: `env::var(\n    "X",\n)`.
+        let src = "let a = std::env::var(\n        \"SPLIT_TOKEN\",\n    );\nenv::var(\"ONE\")";
+        assert_eq!(literal_args(src, "env::var("), ["SPLIT_TOKEN", "ONE"]);
+    }
+
+    /// reqwest honours these and a proxy URL can carry `user:pass@`.
+    #[test]
+    fn proxy_variables_are_denied() {
+        for var in ["HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "NO_PROXY"] {
+            assert!(
+                ExtensionManager::denied_secret_env(var, "some-ext", &[]).is_some(),
+                "{var} must be denied"
+            );
+            // Lower case (which reqwest also reads) is malformed, so it is
+            // ignored and never read. If the name rule is ever relaxed, this
+            // check must become case-insensitive.
+            let lower = var.to_ascii_lowercase();
+            assert!(
+                ExtensionManager::secret_env_name(&lower).is_none(),
+                "{lower} must never be read"
+            );
+        }
+    }
+
+    /// `foo` must not read `foo-bar`'s override var; only its own declared
+    /// keys' override names are allowed in the SYNAPS_ namespace.
+    #[test]
+    fn own_scope_is_limited_to_declared_keys() {
+        assert!(ExtensionManager::denied_secret_env(
+            "SYNAPS_EXTENSION_FOO_BAR_TOKEN",
+            "foo",
+            &["api_key"]
+        )
+        .is_some());
+        assert!(ExtensionManager::denied_secret_env(
+            "SYNAPS_EXTENSION_FOO_API_KEY",
+            "foo",
+            &["api_key"]
+        )
+        .is_none());
+        assert!(ExtensionManager::denied_secret_env(
+            "SYNAPS_EXTENSION_FOO_BAR_API_KEY",
+            "foo-bar",
+            &["api-key"]
+        )
+        .is_none());
+        // through resolve_config, with the manifest's own keys
+        let err = ExtensionManager::resolve_config(
+            "foo",
+            &[entry("k", "SYNAPS_EXTENSION_FOO_BAR_TOKEN")],
+            None,
+        )
+        .expect_err("cross-extension override must be rejected");
+        assert!(err.contains("host namespace"), "{err}");
+    }
+
+    #[test]
+    fn ids_differing_only_in_separators_collide() {
+        assert_eq!(
+            ExtensionManager::folded_id_collision("foo_bar", ["foo-bar", "x"].into_iter()),
+            Some("foo-bar")
+        );
+        assert_eq!(
+            ExtensionManager::folded_id_collision("Foo-Bar", ["foo-bar"].into_iter()),
+            Some("foo-bar")
+        );
+        // the same id (a reload) and unrelated ids are not collisions
+        assert_eq!(
+            ExtensionManager::folded_id_collision("foo-bar", ["foo-bar", "foo"].into_iter()),
+            None
+        );
+    }
+
+    #[test]
+    fn secret_env_name_format() {
+        for bad in [
+            "",
+            "   ",
+            "lower_case",
+            "HAS SPACE",
+            "A=B",
+            "A-B",
+            "1ABC",
+            "A\0B",
+            "ÄPI_KEY",
+        ] {
+            assert_eq!(ExtensionManager::secret_env_name(bad), None, "{bad:?}");
+        }
+        for good in ["GITHUB_TOKEN", "_X", "A1"] {
+            assert_eq!(ExtensionManager::secret_env_name(good), Some(good));
+            assert!(ExtensionManager::denied_secret_env(good, "some-ext", &[]).is_none());
+        }
+        // Padding is trimmed, as before.
+        assert_eq!(
+            ExtensionManager::secret_env_name("  PADDED "),
+            Some("PADDED")
+        );
+    }
+
+    /// A malformed name must never be READ, not merely tolerated: with
+    /// `lower_token` set, the resolved value is still the default. Every name
+    /// the resolver asks for is recorded, and `lower_token` is not among them.
+    #[test]
+    fn malformed_secret_env_is_never_read_even_when_set() {
+        let entry: ExtensionConfigEntry = serde_json::from_value(serde_json::json!({
+            "key": "k",
+            "secret_env": "lower_token",
+            "default": "fallback",
+        }))
+        .unwrap();
+        let asked = std::sync::Mutex::new(Vec::<String>::new());
+        let env = |name: &str| {
+            asked.lock().unwrap().push(name.to_string());
+            (name == "lower_token").then(|| "LEAK".to_string())
+        };
+        let out = ExtensionManager::resolve_config_with_env("ext", &[entry], None, &env)
+            .expect("malformed secret_env must not fail the load");
+        assert_eq!(out["k"], "fallback", "{out}");
+        assert!(
+            !asked.lock().unwrap().iter().any(|n| n == "lower_token"),
+            "malformed name was looked up: {:?}",
+            asked.lock().unwrap()
+        );
+
+        // Control: a well-formed name IS read through the same seam.
+        let good: ExtensionConfigEntry = serde_json::from_value(serde_json::json!({
+            "key": "k",
+            "secret_env": "  GOOD_TOKEN ",
+            "default": "fallback",
+        }))
+        .unwrap();
+        let env = |name: &str| (name == "GOOD_TOKEN").then(|| "value".to_string());
+        let out = ExtensionManager::resolve_config_with_env("ext", &[good], None, &env).unwrap();
+        assert_eq!(out["k"], "value");
+    }
+
+    /// A malformed `secret_env` is warned about and dropped: the plugin still
+    /// loads and the value resolves from the other sources as usual. A
+    /// `required` entry with nothing else set fails with the normal error.
+    #[test]
+    fn malformed_secret_env_is_dropped_not_fatal() {
+        let with_default: ExtensionConfigEntry = serde_json::from_value(serde_json::json!({
+            "key": "k",
+            "secret_env": "my-token",
+            "default": "fallback",
+        }))
+        .unwrap();
+        let out = ExtensionManager::resolve_config("ext", &[with_default], None)
+            .expect("malformed secret_env must not fail the load");
+        assert_eq!(out["k"], "fallback");
+
+        let required: ExtensionConfigEntry = serde_json::from_value(serde_json::json!({
+            "key": "k",
+            "secret_env": "lower_case",
+            "required": true,
+        }))
+        .unwrap();
+        let err = ExtensionManager::resolve_config("ext", &[required], None)
+            .expect_err("required entry with no value still fails");
+        assert!(err.contains("missing required config"), "{err}");
+        assert!(
+            !err.contains("lower_case"),
+            "dropped name is not suggested: {err}"
+        );
     }
 }

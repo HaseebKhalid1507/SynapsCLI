@@ -635,8 +635,7 @@ impl Tool for DeferredMcpTool {
             .memory_backend
             .clone()
             .unwrap_or_else(crate::memory_backend::MemoryBinding::configured_current);
-        if binding.exclusive() && crate::memory_backend::competing_note_tool(&self.server_tool_name)
-        {
+        if binding.exclusive() && crate::memory_backend::competing_memory_tool(self) {
             return Err(crate::RuntimeError::Tool("independent MCP memory is disabled by the host-selected backend; use short memory tools".into()));
         }
         // Without the typed session lease capability, a deferred tool NEVER
@@ -876,5 +875,55 @@ mod discovery_failure_tests {
         assert_eq!(loaded.servers["srv"].tools.len(), 1);
 
         assert!(record_discovery_failure(&path, "bad\u{7}", "fp", 1).is_err());
+    }
+}
+
+#[cfg(test)]
+mod memory_guard_tests {
+    use super::*;
+    use agent_core::config::MemoryBackendKind::{self, Axel, Legacy};
+
+    const REFUSAL: &str =
+        "independent MCP memory is disabled by the host-selected backend; use short memory tools";
+
+    async fn call(server: &str, tool: &str, kind: MemoryBackendKind) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        let binding = crate::tools::test_helpers::memory_binding(kind, dir.path());
+        let descriptor = CachedToolDescriptor {
+            name: tool.into(),
+            description: String::new(),
+            input_schema: serde_json::json!({"type": "object"}),
+        };
+        let tool = DeferredMcpTool::new(server, &descriptor, "fingerprint");
+        match tool
+            .execute(
+                serde_json::json!({}),
+                crate::tools::test_helpers::context_with_memory(binding),
+            )
+            .await
+        {
+            Err(crate::RuntimeError::Tool(message)) => message,
+            other => panic!("expected a tool error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_exclusive_binding_refuses_mcp_memory_tool_names_and_their_wire_forms() {
+        for tool in ["memory_search", "memory_fetch", "memory.search", "Memory_Store"] {
+            assert_eq!(call("notes", tool, Axel).await, REFUSAL, "{tool}");
+        }
+    }
+
+    #[tokio::test]
+    async fn other_mcp_tools_and_legacy_bindings_reach_the_lease_check() {
+        for (server, tool, kind) in [
+            ("notes", "lookup", Axel),
+            // Offered as `ext__memory__search`, not as a memory tool's name.
+            ("memory", "search", Axel),
+            ("notes", "memory_search", Legacy),
+        ] {
+            let message = call(server, tool, kind).await;
+            assert!(message.contains("is activation-deferred"), "{server}/{tool}: {message}");
+        }
     }
 }

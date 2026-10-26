@@ -1,3 +1,6 @@
+#[path = "support/hermetic_base_dir.rs"]
+mod hermetic_base_dir;
+
 use synaps_cli::extensions::hooks::events::{HookEvent, HookResult};
 use synaps_cli::extensions::runtime::process::ProcessExtension;
 use synaps_cli::extensions::runtime::{ExtensionHandler, ExtensionHealth};
@@ -36,6 +39,7 @@ async fn spawn_fixture(id: &str, mode: &str) -> TestProcess {
 
 #[tokio::test]
 async fn exits_before_response_then_respawns_and_retries() {
+    hermetic_base_dir::pin();
     let process = spawn_fixture("respawn-before-response", "exit_before_response").await;
 
     let event = HookEvent::before_tool_call("bash", serde_json::json!({"command": "echo hi"}));
@@ -51,6 +55,7 @@ async fn exits_before_response_then_respawns_and_retries() {
 
 #[tokio::test]
 async fn crashes_after_success_then_respawns_on_next_hook() {
+    hermetic_base_dir::pin();
     let process = spawn_fixture("respawn-after-success", "crash_after_success").await;
 
     let event = HookEvent::before_tool_call("bash", serde_json::json!({"command": "echo hi"}));
@@ -70,6 +75,7 @@ async fn crashes_after_success_then_respawns_on_next_hook() {
 
 #[tokio::test]
 async fn restart_exhaustion_marks_failed_and_fails_open() {
+    hermetic_base_dir::pin();
     let process = spawn_fixture("restart-limit", "always_exit").await;
 
     let event = HookEvent::before_tool_call("bash", serde_json::json!({"command": "echo hi"}));
@@ -91,6 +97,7 @@ async fn restart_exhaustion_marks_failed_and_fails_open() {
 
 #[tokio::test]
 async fn restart_count_reports_transport_restarts() {
+    hermetic_base_dir::pin();
     let process = spawn_fixture("restart-count", "exit_before_response").await;
 
     assert_eq!(process.extension.restart_count(), 0);
@@ -104,6 +111,7 @@ async fn restart_count_reports_transport_restarts() {
 
 #[tokio::test]
 async fn process_extension_initializes_before_hooks() {
+    hermetic_base_dir::pin();
     let state = temp_state_path("initialize-before-hooks");
     let ext = ProcessExtension::spawn_with_cwd(
         "init-test",
@@ -134,6 +142,7 @@ async fn process_extension_initializes_before_hooks() {
 
 #[tokio::test]
 async fn process_extension_rejects_unsupported_initialize_protocol() {
+    hermetic_base_dir::pin();
     let state = temp_state_path("initialize-bad-protocol");
     let ext = ProcessExtension::spawn_with_cwd(
         "bad-init",

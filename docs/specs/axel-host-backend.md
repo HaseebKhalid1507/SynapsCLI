@@ -17,7 +17,8 @@ counts in this document are historical; they are not verification of the revisio
 The service remains an independent Cargo workspace so Axel's SQLite/vector/ONNX
 build dependencies do not enter the ordinary Synaps dependency graph. It pins
 Axel to `edbdea401d66feedb87fcad28c879ece54e3ccd2`; the service constructs the
-storage-only `Brain`, never an embedder/model. Linux with procfs is required.
+storage-only `Brain`, never an embedder/model. Linux with procfs or macOS is
+required (see the service README for macOS volfs/descriptor anchoring).
 
 ```sh
 cargo build --manifest-path sidecars/axel-memory-service/Cargo.toml --locked
@@ -57,7 +58,14 @@ by implementation/testing.
 - Foreground, worker and extension-provider tool loops share the immutable host
   binding. Independent extension/MCP memory tools and legacy reverse-memory RPC
   remain refused in Axel mode. The installed memory-manager plugin is not another
-  authority, and no plugin process is needed for these operations.
+  authority, and no plugin process is needed for these operations. A non-builtin
+  tool counts as competing memory when its registered operation, its runtime
+  name or that name's last `:` segment is a memory tool's name, exactly or in
+  its unclaimed wire form (before collision suffixing), ignoring ASCII case: an
+  extension `memory` registering `search` has the wire form `memory_search`
+  (offered as `memory_search_2` beside the host's own tool) and is refused.
+  The rule is name-based only: other custom names cannot be recognized
+  generically.
 
 ## Continuous memory and explicit history import
 

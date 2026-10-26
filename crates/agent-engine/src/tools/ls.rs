@@ -1,3 +1,4 @@
+use super::util::path_arg_never_option;
 use super::{resolve_path_in, Tool, ToolContext};
 use crate::{Result, RuntimeError};
 use serde_json::{json, Value};
@@ -37,18 +38,7 @@ impl Tool for LsTool {
     }
 
     async fn execute(&self, params: Value, ctx: ToolContext) -> Result<String> {
-        let path = resolve_path_in(
-            params["path"].as_str().unwrap_or("."),
-            ctx.capabilities.cwd.as_deref(),
-        );
-
-        let mut cmd = Command::new("ls");
-        if let Some(env) = &ctx.capabilities.env {
-            cmd.env_clear().envs(env.iter().map(|(k, v)| (k, v)));
-        }
-        let output = cmd
-            .arg("-lah")
-            .arg(&path)
+        let output = build_command(&params, &ctx)
             .output()
             .await
             .map_err(|e| RuntimeError::Tool(format!("Failed to execute ls: {}", e)))?;
@@ -65,6 +55,21 @@ impl Tool for LsTool {
         }
     }
 }
+
+/// Build the `ls` argv (split out for tests).
+fn build_command(params: &Value, ctx: &ToolContext) -> Command {
+    let path = path_arg_never_option(resolve_path_in(
+        params["path"].as_str().unwrap_or("."),
+        ctx.capabilities.cwd.as_deref(),
+    ));
+    let mut cmd = Command::new("ls");
+    if let Some(env) = &ctx.capabilities.env {
+        cmd.env_clear().envs(env.iter().map(|(k, v)| (k, v)));
+    }
+    cmd.arg("-lah").arg(&path);
+    cmd
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::test_helpers::create_tool_context;
@@ -103,5 +108,38 @@ mod tests {
 
         // Cleanup
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 01 I3 audit: an option-like `path` must reach `ls` as a path.
+    #[test]
+    fn leading_dash_path_is_never_an_option() {
+        let ctx = create_tool_context();
+        let cmd = build_command(&json!({"path": "-R"}), &ctx);
+        let args: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args, ["-lah", "./-R"]);
+    }
+
+    #[tokio::test]
+    async fn lists_a_file_whose_name_starts_with_dash() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("-x"), "").unwrap();
+        std::fs::write(dir.path().join("other.txt"), "").unwrap();
+        let ctx = create_tool_context();
+        let mut cmd = build_command(&json!({"path": "-x"}), &ctx);
+        cmd.current_dir(dir.path());
+        let out = cmd.output().await.unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        // `-x` is listed as a file, not taken as `ls -x` over the whole dir.
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.contains("-x"), "{stdout}");
+        assert!(!stdout.contains("other.txt"), "{stdout}");
     }
 }

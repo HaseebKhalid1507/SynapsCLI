@@ -220,6 +220,7 @@ pub const BUILTIN_COMMANDS: &[&str] = &[
     "help",
     "quit",
     "exit",
+    "close",
     "settings",
     "plugins",
     "extensions",
@@ -227,12 +228,24 @@ pub const BUILTIN_COMMANDS: &[&str] = &[
     "stats",
     "context",
     "budget",
+    "workers",
+    "confirms",
     "keepwarm",
+    // The daemon-session pin; `keep-warm` is its older name, kept as an
+    // alias. Registered so `/keep-warm` never fuzzy-resolves to `/keepwarm`
+    // (the prompt-cache pings, which cost money).
+    "pin",
+    "keep-warm",
+    "clients",
+    // Take input from the daemon client that owns it (`--takeover`, in place).
+    "takeover",
     "trace",
     "memory",
+    "auth",
     "ping",
     "keybinds",
     "sidecar",
+    "watch",
 ];
 
 /// Load all skills, apply disable filters, build the command registry,

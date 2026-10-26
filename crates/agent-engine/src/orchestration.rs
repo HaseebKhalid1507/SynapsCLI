@@ -138,6 +138,10 @@ pub fn validate_user_authorizable_model(raw: &str) -> Result<QualifiedModelId, S
         crate::runtime::openai::catalog::github_copilot_runtime_model(model.model()).is_some()
     } else if model.provider() == "google-gemini" {
         crate::runtime::openai::catalog::google_gemini_model(model.model()).is_some()
+    } else if model.provider() == "muse" {
+        // Documented seed or an exact row from this process's authenticated
+        // live Muse catalog — never an invented id.
+        crate::runtime::openai::catalog::muse_runtime_model(model.model())
     } else {
         crate::runtime::openai::registry::providers()
             .iter()
@@ -604,6 +608,26 @@ impl OrchestrationRuntime {
         // One-shot results have no retained reactive handle to be reaped later.
         self.retire_reconciled(&[id.to_owned()].into_iter().collect());
         Ok(())
+    }
+    /// A worker the user (or host teardown) cancelled has no result to
+    /// integrate: the cancellation IS the attestation. Move it straight to
+    /// Reconciled so it never pins rollover, model changes or the completion
+    /// gate waiting for a collect the model may never make. The handle and
+    /// its partial output stay collectable from the subagent registry.
+    ///
+    /// Only a Running (or already-terminal) worker is retired; one still
+    /// Starting is left for the post-`mark_running` re-check. Idempotent.
+    pub fn retire_cancelled(&self, id: &str) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+        let Some(h) = inner.handles.get(id).cloned() else {
+            return false;
+        };
+        inner
+            .registry
+            .mark_terminal(&h, WorkerTerminal::Failed)
+            .and_then(|()| inner.registry.collect(&h))
+            .and_then(|()| inner.registry.reconcile(&h))
+            .is_ok()
     }
     pub fn reconcile(&self, id: &str) -> Result<(), String> {
         let mut inner = self.inner.lock().unwrap();

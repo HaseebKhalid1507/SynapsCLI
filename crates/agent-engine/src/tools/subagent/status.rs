@@ -57,9 +57,14 @@ impl Tool for SubagentStatusTool {
 
         let reg = registry.lock().unwrap();
 
-        let handle = reg.get(&handle_id).ok_or_else(|| {
-            RuntimeError::Tool(format!("No subagent found with handle_id '{}'", handle_id))
-        })?;
+        let Some(handle) = reg.get(&handle_id) else {
+            // Not live: reaped, or carried over a daemon reload. Its archive
+            // still answers (and still resumes).
+            let archive_path = reg.archive_path(&handle_id);
+            let stopped_by_reload = reg.was_stopped_by_reload(&handle_id);
+            drop(reg);
+            return archived_status(&handle_id, archive_path, stopped_by_reload);
+        };
 
         // ── Build response ─────────────────────────────────────────────────────
         // Clone all needed data under the lock, then drop lock before char traversal
@@ -107,5 +112,94 @@ impl Tool for SubagentStatusTool {
             resp["error"] = json!(reason);
         }
         Ok(resp.to_string())
+    }
+}
+
+/// `subagent_status` of a handle that is no longer live, from its archive.
+fn archived_status(
+    handle_id: &str,
+    archive_path: Option<std::path::PathBuf>,
+    stopped_by_reload: bool,
+) -> Result<String> {
+    let not_found = || RuntimeError::Tool(format!("No subagent found with handle_id '{}'", handle_id));
+    let path = archive_path.ok_or_else(not_found)?;
+    let archive = super::archive::read_archive(&path).map_err(|e| {
+        RuntimeError::Tool(format!(
+            "Subagent '{handle_id}' is no longer live and its archive ({}) could not be read: {e}",
+            path.display()
+        ))
+    })?;
+    let full = archive.output;
+    let char_count = full.chars().count();
+    let partial_output: String = if char_count > 500 {
+        full.chars().skip(char_count - 500).collect()
+    } else {
+        full
+    };
+    let note = if stopped_by_reload {
+        "Stopped by a daemon reload (not by the user); not running. subagent_resume continues it \
+         from this archive; subagent_collect reads its result."
+    } else {
+        "Not running: finished and reaped. subagent_collect reads its result from this archive; \
+         subagent_resume continues it."
+    };
+    Ok(json!({
+        "handle_id":      handle_id,
+        "agent_name":     archive.meta.agent_name,
+        "status":         archive.status,
+        // Same contract as the live path and subagent_collect: a failed
+        // worker's reason travels with its status.
+        "error":          archive.error,
+        "partial_output": partial_output,
+        "model":          archive.meta.model,
+        "archived":       true,
+        "stopped_by_reload": stopped_by_reload,
+        "archive_path":   path,
+        "note":           note,
+    })
+    .to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// After a reload the old id still answers from its archive, and says
+    /// the reload (not the user) stopped it.
+    #[test]
+    fn archived_status_reports_a_reload_stopped_worker() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = crate::runtime::subagent::SubagentArchiveMeta {
+            agent_name: "integrator".into(),
+            model: "m".into(),
+            system_prompt: "s".into(),
+            timeout_secs: 60,
+        };
+        let path = super::super::archive::write_archive(
+            dir.path(),
+            "sa_288",
+            &meta,
+            "cancelled",
+            Some("boom"),
+            "partial words",
+            &[],
+        )
+        .unwrap();
+        let v: Value =
+            serde_json::from_str(&archived_status("sa_288", Some(path.clone()), true).unwrap()).unwrap();
+        assert_eq!(v["status"], "cancelled");
+        assert_eq!(v["error"], "boom", "archived status keeps the archive's error");
+        assert_eq!(v["agent_name"], "integrator");
+        assert_eq!(v["archived"], true);
+        assert_eq!(v["stopped_by_reload"], true);
+        assert_eq!(v["partial_output"], "partial words");
+        assert!(v["note"].as_str().unwrap().contains("daemon reload"));
+
+        let v: Value =
+            serde_json::from_str(&archived_status("sa_288", Some(path), false).unwrap()).unwrap();
+        assert!(!v["note"].as_str().unwrap().contains("daemon reload"));
+
+        let err = archived_status("sa_9", None, false).unwrap_err().to_string();
+        assert!(err.contains("No subagent found"), "{err}");
     }
 }

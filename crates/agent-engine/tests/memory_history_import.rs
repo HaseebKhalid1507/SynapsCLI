@@ -135,6 +135,8 @@ fn fixture_session(id: &str, system_prompt: Option<&str>, api_messages: Vec<Valu
         session_cost: 0.0,
         keepwarm_cost: 0.0,
         keepwarm_tokens: Default::default(),
+        total_cache_read_tokens: 0,
+        total_cache_creation_tokens: 0,
         message_count: 0,
         api_messages: api_messages.into_iter().map(Arc::new).collect(),
         abort_context: None,
@@ -511,13 +513,13 @@ fn rss_anon_bytes() -> u64 {
     #[cfg(target_os = "linux")]
     {
         let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
-        return status
+        status
             .lines()
             .find_map(|line| line.strip_prefix("RssAnon:"))
             .and_then(|value| value.split_whitespace().next())
             .and_then(|value| value.parse::<u64>().ok())
             .unwrap_or(0)
-            .saturating_mul(1024);
+            .saturating_mul(1024)
     }
     #[cfg(not(target_os = "linux"))]
     {

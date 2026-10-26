@@ -1,6 +1,6 @@
 use arc_swap::ArcSwap;
 use ratatui::style::Color;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::sync::LazyLock;
 
@@ -18,6 +18,7 @@ pub(crate) enum ModalKind {
     Settings,
     Plugins,
     Models,
+    Sessions,
 }
 
 /// All colors used by the TUI, grouped so they can be overridden from a
@@ -112,6 +113,8 @@ pub(crate) struct Theme {
     pub(crate) plugins_title: Option<Color>,
     pub(crate) models_border: Option<Color>,
     pub(crate) models_title: Option<Color>,
+    pub(crate) sessions_border: Option<Color>,
+    pub(crate) sessions_title: Option<Color>,
     /// Resting tint of the sidecar header pill (idle + unarmed). `None` falls
     /// back to `muted`, the color the pill uses today.
     pub(crate) sidecar_pill: Option<Color>,
@@ -207,6 +210,8 @@ impl Default for Theme {
             plugins_title: None,
             models_border: None,
             models_title: None,
+            sessions_border: None,
+            sessions_title: None,
             sidecar_pill: None,
 
             // No user overrides for extension tokens by default.
@@ -251,6 +256,7 @@ impl Theme {
             "ice" => Some(Self::ice()),
             "forest" => Some(Self::forest()),
             "lavender" => Some(Self::lavender()),
+            "paper" => Some(Self::paper()),
             _ => None,
         }
     }
@@ -338,6 +344,8 @@ impl Theme {
             "plugins.title" => self.plugins_title = Some(c),
             "models.border" => self.models_border = Some(c),
             "models.title" => self.models_title = Some(c),
+            "sessions.border" => self.sessions_border = Some(c),
+            "sessions.title" => self.sessions_title = Some(c),
             "sidecar.pill" => self.sidecar_pill = Some(c),
 
             // Extension token overrides (P19.2): any `ext.<id>.<token>` key
@@ -351,7 +359,7 @@ impl Theme {
 }
 
 /// WCAG 2 contrast ratio between two colours; non-RGB colours count as black.
-fn wcag_contrast(a: Color, b: Color) -> f64 {
+pub(crate) fn wcag_contrast(a: Color, b: Color) -> f64 {
     fn lum(c: Color) -> f64 {
         let Color::Rgb(r, g, b) = c else {
             return 0.0;
@@ -495,6 +503,7 @@ impl Theme {
             ModalKind::Settings => self.settings_border,
             ModalKind::Plugins => self.plugins_border,
             ModalKind::Models => self.models_border,
+            ModalKind::Sessions => self.sessions_border,
         };
         part.unwrap_or(self.border_active)
     }
@@ -506,6 +515,7 @@ impl Theme {
             ModalKind::Settings => self.settings_title,
             ModalKind::Plugins => self.plugins_title,
             ModalKind::Models => self.models_title,
+            ModalKind::Sessions => self.sessions_title,
         }
     }
 
@@ -599,14 +609,63 @@ fn derive_reset(raw: Color, derived: Color) -> Color {
     }
 }
 
+/// Environment variable that picks the theme for one process (one TUI run),
+/// ahead of `~/.synaps-cli/theme` and `theme = <name>` in config. For an app
+/// that embeds the TUI (e.g. a terminal pane in a light window) and must not
+/// change the user's global theme. The value is a theme name: a user theme
+/// file `~/.synaps-cli/themes/<name>`, else a builtin. A value that is not a
+/// plain name, or names no theme, is ignored, so the usual order applies.
+pub(crate) const THEME_ENV: &str = "SYNAPS_THEME";
+
+/// A theme name from `SYNAPS_THEME`, if it is a plain name: 1 to 64 ASCII
+/// letters, digits, `-`, `_` or `.`, not starting with `.`. Anything else
+/// (a path, `..`, empty, non-UTF-8) is not a name and is ignored, so the
+/// value can never reach outside `themes/`.
+fn theme_env_name(value: Option<&std::ffi::OsStr>) -> Option<&str> {
+    let name = value?.to_str()?.trim();
+    let plain = !name.is_empty()
+        && name.len() <= 64
+        && !name.starts_with('.')
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'));
+    plain.then_some(name)
+}
+
+/// The theme `SYNAPS_THEME` names, resolved by `resolve` (a user theme file,
+/// else a builtin: [`load_theme_by_name`]); `None` when it is unset, not a
+/// plain name, or names no theme.
+fn theme_from_env(
+    value: Option<&std::ffi::OsStr>,
+    resolve: impl FnOnce(&str) -> Option<Theme>,
+) -> Option<Theme> {
+    theme_env_name(value).and_then(resolve)
+}
+
+/// The theme name `SYNAPS_THEME` sets for this process, if it names a theme.
+/// Boot uses it instead of the config's `theme` (e.g. whether the live-MXC
+/// subscriber starts for "myx").
+pub(crate) fn env_theme_name() -> Option<String> {
+    let value = std::env::var_os(THEME_ENV);
+    let name = theme_env_name(value.as_deref())?;
+    load_theme_by_name(name).map(|_| name.to_string())
+}
+
 /// Global theme, loaded in this order:
-/// 1. `~/.synaps-cli/theme` file (if exists) — overrides everything
+/// 0. `SYNAPS_THEME=<name>` in the environment (see [`THEME_ENV`]), if it
+///    names a theme — for this process only
+/// 1. `~/.synaps-cli/theme` file (if exists) — overrides everything else
 /// 2. `theme = <name>` in config:
 ///    a. Check `~/.synaps-cli/themes/<name>` file first (user-editable)
 ///    b. Fall back to compiled-in builtin
 /// 3. Falls back to default
 pub(crate) fn load_theme_from_config() -> Theme {
-    // First check for a theme file (highest priority)
+    if let Some(theme) = theme_from_env(std::env::var_os(THEME_ENV).as_deref(), load_theme_by_name)
+    {
+        return theme;
+    }
+
+    // First check for a theme file (highest priority after the environment)
     let path = synaps_cli::config::resolve_read_path("theme");
     if path.exists() {
         return Theme::load_from(&path);
@@ -671,6 +730,100 @@ pub(crate) fn set_background_opaque(opaque: bool) {
     BACKGROUND_OPAQUE.store(opaque, Ordering::Relaxed);
 }
 
+/// 8-bit RGB triple, as the terminal reports its default background.
+pub(crate) type Rgb8 = (u8, u8, u8);
+
+/// The terminal's default background (OSC 11, settled once at boot by
+/// `run_setup` from the DA1-fenced burst). Packed `0x01RRGGBB`; `0` means
+/// unknown (no reply / timeout / not a tty) ⇒ painting is unchanged.
+///
+/// Why it matters: terminals with background opacity (kitty
+/// `background_opacity`) apply it to every cell whose bg EQUALS the default
+/// bg, not only unpainted cells — so a theme colour that happens to match the
+/// user's terminal colour renders see-through even in opaque mode.
+static TERMINAL_DEFAULT_BG: AtomicU32 = AtomicU32::new(0);
+
+fn pack_rgb8(bg: Option<Rgb8>) -> u32 {
+    bg.map_or(0, |(r, g, b)| {
+        0x0100_0000 | (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b)
+    })
+}
+
+fn unpack_rgb8(v: u32) -> Option<Rgb8> {
+    (v & 0x0100_0000 != 0).then_some(((v >> 16) as u8, (v >> 8) as u8, v as u8))
+}
+
+/// Record the detected terminal default bg (`None` = unknown).
+pub(crate) fn set_terminal_default_bg(bg: Option<Rgb8>) {
+    TERMINAL_DEFAULT_BG.store(pack_rgb8(bg), Ordering::Relaxed);
+}
+
+#[cfg(any(test, feature = "testing"))]
+thread_local! {
+    /// Test seam: the terminal bg frames rendered on this thread see
+    /// (`TestHarness::set_terminal_bg`). Outer `None` = no override (use the
+    /// process global); `Some(None)` = forced unknown. Headless tests render
+    /// on their own thread, so this never leaks between parallel tests.
+    static TERMINAL_BG_OVERRIDE: std::cell::Cell<Option<Option<Rgb8>>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Override (or with `None`, clear the override of) this thread's terminal bg.
+#[cfg(any(test, feature = "testing"))]
+pub(crate) fn set_terminal_default_bg_for_thread(bg: Option<Option<Rgb8>>) {
+    TERMINAL_BG_OVERRIDE.with(|o| o.set(bg));
+}
+
+/// The detected terminal default bg, or `None` if unknown.
+pub(crate) fn terminal_default_bg() -> Option<Rgb8> {
+    #[cfg(any(test, feature = "testing"))]
+    if let Some(bg) = TERMINAL_BG_OVERRIDE.with(std::cell::Cell::get) {
+        return bg;
+    }
+    unpack_rgb8(TERMINAL_DEFAULT_BG.load(Ordering::Relaxed))
+}
+
+/// `c`, moved one imperceptible step (±1 on blue, staying in range) if it is
+/// exactly the terminal's default bg `term`; otherwise `c` unchanged. Pure.
+/// Only `Color::Rgb` can be compared: named/indexed colours resolve through
+/// the terminal's palette, which we don't query.
+pub(crate) fn steer_off_terminal_bg(c: Color, term: Option<Rgb8>) -> Color {
+    match (c, term) {
+        (Color::Rgb(r, g, b), Some(t)) if (r, g, b) == t => {
+            Color::Rgb(r, g, if b < u8::MAX { b + 1 } else { b - 1 })
+        }
+        _ => c,
+    }
+}
+
+/// Steer every cell bg in `buf` off `term` (fg untouched). Pure; a cheap
+/// compare per cell, no-op when `term` is `None`.
+pub(crate) fn steer_buffer_off_terminal_bg(buf: &mut ratatui::buffer::Buffer, term: Option<Rgb8>) {
+    if term.is_none() {
+        return;
+    }
+    for cell in &mut buf.content {
+        cell.bg = steer_off_terminal_bg(cell.bg, term);
+    }
+}
+
+/// The terminal bg the opaque guard steers off: `Some` only in opaque mode
+/// with a detected terminal bg. Invisible mode is `None` — there the
+/// see-through is the point.
+pub(crate) fn opaque_guard_target() -> Option<Rgb8> {
+    if background_is_opaque() {
+        terminal_default_bg()
+    } else {
+        None
+    }
+}
+
+/// Final per-frame pass (end of `render_frame_into`): in opaque mode, no
+/// cell may carry the terminal's exact default bg.
+pub(crate) fn guard_opaque_frame(buf: &mut ratatui::buffer::Buffer) {
+    steer_buffer_off_terminal_bg(buf, opaque_guard_target());
+}
+
 pub(crate) static THEME: LazyLock<ArcSwap<Theme>> =
     LazyLock::new(|| ArcSwap::from_pointee(load_theme_from_config()));
 
@@ -684,6 +837,73 @@ pub(crate) fn set_theme(theme: Theme) {
 #[cfg(test)]
 mod theme_tests {
     use super::*;
+
+    /// `SYNAPS_THEME=<name>` picks a theme (trimmed); unset, empty or an
+    /// unknown name gives `None`, so `load_theme_from_config` falls through
+    /// to the theme file and config as before. Resolved through an injected
+    /// resolver: the process environment and the user's themes folder are
+    /// shared by every test, so nothing here sets or reads them.
+    #[test]
+    fn synaps_theme_names_the_theme_for_this_process() {
+        use std::ffi::OsStr;
+        let builtin = |n: &str| Theme::builtin(n);
+        assert_eq!(
+            theme_from_env(Some(OsStr::new("paper")), builtin),
+            Theme::builtin("paper")
+        );
+        assert_eq!(
+            theme_from_env(Some(OsStr::new("  nord\n")), builtin),
+            Theme::builtin("nord"),
+            "trimmed"
+        );
+        assert_eq!(theme_from_env(None, builtin), None, "unset");
+        assert_eq!(theme_from_env(Some(OsStr::new("")), builtin), None, "empty");
+        assert_eq!(
+            theme_from_env(Some(OsStr::new("  ")), builtin),
+            None,
+            "blank"
+        );
+        assert_eq!(
+            theme_from_env(Some(OsStr::new("no-such-theme")), builtin),
+            None,
+            "unknown: fall through"
+        );
+    }
+
+    /// The value is joined under `themes/`, so it must be a plain name:
+    /// anything path-like is ignored before any file is looked up.
+    #[test]
+    fn synaps_theme_is_a_name_never_a_path() {
+        use std::ffi::OsStr;
+        let long = "a".repeat(65);
+        for v in [
+            "..",
+            "../theme",
+            ".hidden",
+            "a/b",
+            "/etc/passwd",
+            "a\\b",
+            "x y",
+            "pa\0per",
+            "nörd",
+            long.as_str(),
+        ] {
+            let mut asked = false;
+            let got = theme_from_env(Some(OsStr::new(v)), |_| {
+                asked = true;
+                Some(Theme::default())
+            });
+            assert!(got.is_none() && !asked, "{v:?} must not be looked up");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            assert_eq!(theme_env_name(Some(OsStr::from_bytes(b"pa\xffper"))), None);
+        }
+        for ok in ["paper", "solarized-dark", "my_theme.v2", &long[..64]] {
+            assert_eq!(theme_env_name(Some(OsStr::new(ok))), Some(ok));
+        }
+    }
 
     #[test]
     fn default_tool_panels_are_explicit() {
@@ -760,6 +980,7 @@ mod theme_tests {
             "ice",
             "forest",
             "lavender",
+            "paper",
         ] {
             let t = Theme::builtin(name).unwrap();
             let canvas = t.message_background();
@@ -840,8 +1061,8 @@ mod theme_tests {
         // Every built-in palette, with no part overrides, must resolve each
         // part to its base token — the "zero regression across 18 palettes"
         // guarantee, asserted directly against the resolvers.
-        // The 19 named palettes plus the built-in `default` (20 total).
-        const NAMES: [&str; 20] = [
+        // The 20 named palettes plus the built-in `default` (21 total).
+        const NAMES: [&str; 21] = [
             "default",
             "night-city",
             "neon-rain",
@@ -862,10 +1083,16 @@ mod theme_tests {
             "ice",
             "forest",
             "lavender",
+            "paper",
         ];
         for name in NAMES {
             let t = Theme::builtin(name).unwrap_or_else(|| panic!("{name} exists"));
-            for kind in [ModalKind::Settings, ModalKind::Plugins, ModalKind::Models] {
+            for kind in [
+                ModalKind::Settings,
+                ModalKind::Plugins,
+                ModalKind::Models,
+                ModalKind::Sessions,
+            ] {
                 assert_eq!(
                     t.modal_border(kind),
                     t.border_active,
@@ -1051,6 +1278,7 @@ mod message_canvas_tests {
         "ice",
         "forest",
         "lavender",
+        "paper",
     ];
 
     fn rgb(c: Color) -> (u8, u8, u8) {
@@ -1187,10 +1415,15 @@ mod message_canvas_tests {
     /// `solarized-dark` is exempt: its `code_bg` (0,36,43) is already darker
     /// than its `bg` (0,43,54), so code blocks recess by that palette's own
     /// design. Its canvas is raised toward its separator instead.
+    ///
+    /// `paper` is exempt: it is the light palette, and its code blocks are
+    /// dark islands on purpose (syntax highlighting is always a dark syntect
+    /// theme), so they sit far below its canvas. `paper_is_light_with_dark_code_islands`
+    /// pins that instead.
     #[test]
     fn canvas_never_outranks_code_blocks() {
         for name in BUILTINS.iter().filter(|n| !FLUSH.contains(n)) {
-            if *name == "solarized-dark" {
+            if *name == "solarized-dark" || *name == "paper" {
                 continue;
             }
             let t = Theme::builtin(name).unwrap_or_else(|| panic!("{name} is a builtin"));
@@ -1198,6 +1431,75 @@ mod message_canvas_tests {
                 luminance(rgb(t.message_background())) < luminance(rgb(t.code_bg)),
                 "{name}: canvas must sit below code_bg in elevation"
             );
+        }
+    }
+
+    /// `paper`, the light palette: a light canvas and chrome, dark code
+    /// islands, body text at 11:1 or more on the canvas, and every accent
+    /// that is drawn as text at 4.5:1 (WCAG AA) or more on the chrome and the
+    /// canvas. Every surface it paints is explicit, never a `Reset` derived
+    /// from a dark-canvas rule.
+    #[test]
+    fn paper_is_light_with_dark_code_islands() {
+        let t = Theme::builtin_for_test("paper");
+        let (bg, canvas) = (rgb(t.bg), rgb(t.message_background()));
+        assert!(
+            luminance(bg) > 0.5 && luminance(canvas) > luminance(bg),
+            "light, canvas brightest"
+        );
+        assert!(
+            luminance(rgb(t.code_bg)) < 0.05,
+            "code blocks stay dark islands"
+        );
+        assert!(
+            contrast(rgb(t.code_fg), rgb(t.code_bg)) >= 7.0,
+            "inline code reads on its island"
+        );
+        for (what, c) in [
+            ("claude_text", t.claude_text),
+            ("user_color", t.user_color),
+            ("input_fg", t.input_fg),
+            ("table_cell_color", t.table_cell_color),
+        ] {
+            let got = contrast(rgb(c), canvas);
+            assert!(got >= 11.0, "paper: {what} {got:.2} on the canvas");
+        }
+        for (what, c) in [
+            ("border_active", t.border_active),
+            ("prompt_fg", t.prompt_fg),
+            ("claude_label", t.claude_label),
+            ("heading_color", t.heading_color),
+            ("list_bullet_color", t.list_bullet_color),
+            ("table_header_color", t.table_header_color),
+            ("system_msg", t.system_msg),
+            ("header_fg", t.header_fg),
+            ("tool_label", t.tool_label),
+            ("tool_param", t.tool_param),
+            ("tool_result_color", t.tool_result_color),
+            ("tool_result_ok", t.tool_result_ok),
+            ("error_color", t.error_color),
+            ("warning_color", t.warning_color),
+            ("status_streaming", t.status_streaming),
+            ("status_ready", t.status_ready),
+            ("cost_color", t.cost_color),
+            ("subagent_name", t.subagent_name),
+            ("subagent_status", t.subagent_status),
+            ("subagent_done", t.subagent_done),
+        ] {
+            for (on, ground) in [("chrome", bg), ("canvas", canvas)] {
+                let got = contrast(rgb(c), ground);
+                assert!(got >= 4.5, "paper: {what} {got:.2} on the {on}");
+            }
+        }
+        for (what, c) in [
+            ("bg", t.bg),
+            ("message_bg", t.message_bg),
+            ("user_bg", t.user_bg),
+            ("border", t.border),
+            ("separator", t.separator),
+            ("code_bg", t.code_bg),
+        ] {
+            assert_ne!(c, Color::Reset, "paper: {what} is explicit");
         }
     }
 
@@ -1261,6 +1563,7 @@ mod chrome_dim_tests {
             "ice",
             "forest",
             "lavender",
+            "paper",
         ] {
             let t = Theme::builtin_for_test(name);
             let dim = t.chrome_dim();
@@ -1271,5 +1574,173 @@ mod chrome_dim_tests {
                 "{name}: dim text must not outshine the input text"
             );
         }
+    }
+}
+
+impl Theme {
+    /// Surface of the Confirm / secret-prompt lightbox.
+    pub(crate) fn prompt_surface(&self) -> Color {
+        self.raised_surface(1.32)
+    }
+
+    /// Confirm dialog button colours: `(idle label, focused label, focused
+    /// fill)`. Idle labels use the input text colour (≥ 4.5:1 on the prompt
+    /// surface on every built-in theme; `help_fg` was 1.0–2.5:1, which made
+    /// unfocused buttons near invisible). Focused = theme bg on the warning
+    /// fill.
+    pub(crate) fn confirm_button_colors(&self) -> (Color, Color, Color) {
+        (self.input_fg, self.bg, self.warning_color)
+    }
+}
+
+#[cfg(test)]
+mod confirm_contrast_tests {
+    use super::*;
+
+    #[test]
+    fn confirm_button_labels_read_at_aa_on_every_builtin() {
+        for name in [
+            "default",
+            "night-city",
+            "neon-rain",
+            "amber",
+            "phosphor",
+            "solarized-dark",
+            "blood",
+            "ocean",
+            "rose-pine",
+            "nord",
+            "dracula",
+            "monokai",
+            "myx",
+            "gruvbox",
+            "catppuccin",
+            "tokyo-night",
+            "sunset",
+            "ice",
+            "forest",
+            "lavender",
+            "paper",
+        ] {
+            let t = Theme::builtin_for_test(name);
+            let surface = t.prompt_surface();
+            let (idle, focus_fg, focus_bg) = t.confirm_button_colors();
+            let c = wcag_contrast(idle, surface);
+            assert!(c >= 4.5, "{name}: idle button label {c:.2}:1");
+            let c = wcag_contrast(focus_fg, focus_bg);
+            assert!(c >= 4.5, "{name}: focused button label {c:.2}:1");
+        }
+    }
+}
+
+#[cfg(test)]
+mod terminal_bg_guard_tests {
+    //! Opaque mode must never paint a bg that EQUALS the terminal's default
+    //! background (kitty `background_opacity` makes such cells see-through).
+    //! Pure functions only: no global theme / opacity is touched.
+    use super::*;
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+
+    const OCEAN_BG: Rgb8 = (3, 8, 16);
+
+    /// Every bg-like colour the ocean theme can paint, base and derived.
+    fn ocean_bg_palette() -> Vec<Color> {
+        let t = Theme::builtin("ocean").unwrap();
+        assert_eq!(t.bg, Color::Rgb(3, 8, 16), "fixture: ocean bg");
+        vec![
+            t.bg,
+            t.message_bg,
+            t.message_background(),
+            t.user_bg,
+            t.code_bg,
+            t.tool_input_background(),
+            t.tool_output_background(),
+            t.raised_surface(1.1),
+            t.prompt_surface(),
+            t.border,
+            Color::Rgb(3, 8, 16), // e.g. a slab/fx mix landing exactly on it
+        ]
+    }
+
+    fn painted(colors: &[Color]) -> Buffer {
+        let mut buf = Buffer::empty(Rect::new(0, 0, colors.len() as u16, 2));
+        for (x, c) in colors.iter().enumerate() {
+            buf[(x as u16, 0)].set_bg(*c).set_fg(Color::Rgb(3, 8, 16));
+            buf[(x as u16, 1)].set_bg(*c);
+        }
+        buf
+    }
+
+    #[test]
+    fn steered_colour_is_one_step_off_and_in_range() {
+        let t = Some(OCEAN_BG);
+        assert_eq!(
+            steer_off_terminal_bg(Color::Rgb(3, 8, 16), t),
+            Color::Rgb(3, 8, 17)
+        );
+        assert_eq!(
+            steer_off_terminal_bg(Color::Rgb(9, 9, 255), Some((9, 9, 255))),
+            Color::Rgb(9, 9, 254),
+            "stays in range at the top of the channel"
+        );
+        // Anything else is untouched.
+        assert_eq!(
+            steer_off_terminal_bg(Color::Rgb(3, 8, 17), t),
+            Color::Rgb(3, 8, 17)
+        );
+        assert_eq!(steer_off_terminal_bg(Color::Reset, t), Color::Reset);
+        assert_eq!(steer_off_terminal_bg(Color::Black, t), Color::Black);
+    }
+
+    #[test]
+    fn ocean_frame_never_paints_the_terminal_bg_when_detected() {
+        let colors = ocean_bg_palette();
+        let mut buf = painted(&colors);
+        assert!(
+            buf.content.iter().any(|c| c.bg == Color::Rgb(3, 8, 16)),
+            "fixture must contain the exact terminal bg"
+        );
+        steer_buffer_off_terminal_bg(&mut buf, Some(OCEAN_BG));
+        for (i, cell) in buf.content.iter().enumerate() {
+            assert_ne!(cell.bg, Color::Rgb(3, 8, 16), "cell {i} still see-through");
+        }
+        // Only bg moves; fg and every non-matching bg are untouched.
+        let before = painted(&colors);
+        for (a, b) in before.content.iter().zip(buf.content.iter()) {
+            assert_eq!(a.fg, b.fg, "fg must never change");
+            if a.bg != Color::Rgb(3, 8, 16) {
+                assert_eq!(a.bg, b.bg);
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_terminal_bg_changes_nothing() {
+        let colors = ocean_bg_palette();
+        let mut buf = painted(&colors);
+        steer_buffer_off_terminal_bg(&mut buf, None);
+        assert_eq!(buf, painted(&colors));
+        for c in colors {
+            assert_eq!(steer_off_terminal_bg(c, None), c);
+        }
+    }
+
+    #[test]
+    fn terminal_bg_global_round_trips_and_unknown_is_none() {
+        // The packed atomic encoding, exercised through the thread-local
+        // seam so the real process global is never written by tests.
+        set_terminal_default_bg_for_thread(Some(Some(OCEAN_BG)));
+        assert_eq!(terminal_default_bg(), Some(OCEAN_BG));
+        set_terminal_default_bg_for_thread(Some(None));
+        assert_eq!(terminal_default_bg(), None);
+        set_terminal_default_bg_for_thread(None);
+        // Black must not collide with the "unknown" encoding.
+        assert_eq!(unpack_rgb8(pack_rgb8(Some((0, 0, 0)))), Some((0, 0, 0)));
+        assert_eq!(
+            unpack_rgb8(pack_rgb8(Some((255, 255, 255)))),
+            Some((255, 255, 255))
+        );
+        assert_eq!(unpack_rgb8(pack_rgb8(None)), None);
     }
 }

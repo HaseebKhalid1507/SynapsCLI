@@ -34,6 +34,14 @@ pub struct Session {
     /// that survive a reload.
     #[serde(default, skip_serializing_if = "KeepwarmTokens::is_zero")]
     pub keepwarm_tokens: KeepwarmTokens,
+    /// Session prompt-cache read/write totals (the footer's `%↺` and
+    /// `/stats`). SNAPSHOT-ONLY, like `keepwarm_cost`: never journaled, so
+    /// in journal mode they are as of the last snapshot. Absent (0) on
+    /// sessions saved before they were persisted.
+    #[serde(default, skip_serializing_if = "is_zero_tokens")]
+    pub total_cache_read_tokens: u64,
+    #[serde(default, skip_serializing_if = "is_zero_tokens")]
+    pub total_cache_creation_tokens: u64,
     /// Persisted listing hint: `api_messages.len()` at save time. Declared
     /// BEFORE `api_messages` so it lands in the header that
     /// `read_session_header` reads without touching the message array.
@@ -141,6 +149,10 @@ fn is_zero_cost(v: &f64) -> bool {
     *v == 0.0
 }
 
+fn is_zero_tokens(v: &u64) -> bool {
+    *v == 0
+}
+
 /// Keep-warm token subtotal persisted in the snapshot (see
 /// [`Session::keepwarm_tokens`]).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -197,6 +209,8 @@ impl Session {
             session_cost: 0.0,
             keepwarm_cost: 0.0,
             keepwarm_tokens: KeepwarmTokens::default(),
+            total_cache_read_tokens: 0,
+            total_cache_creation_tokens: 0,
             message_count: 0,
             api_messages: Vec::new(),
             abort_context: None,
@@ -250,6 +264,8 @@ impl Session {
             session_cost: 0.0,
             keepwarm_cost: 0.0,
             keepwarm_tokens: KeepwarmTokens::default(),
+            total_cache_read_tokens: 0,
+            total_cache_creation_tokens: 0,
             message_count: 0,
             api_messages: crate::compaction::compaction_context_messages(summary_text),
             abort_context: None,
@@ -502,7 +518,7 @@ pub fn latest_session() -> std::io::Result<Session> {
             continue;
         };
         if let Some(mtime) = entry.mtime {
-            if newest.as_ref().map_or(true, |(t, _)| mtime > *t) {
+            if newest.as_ref().is_none_or(|(t, _)| mtime > *t) {
                 newest = Some((mtime, id.to_string()));
             }
         }

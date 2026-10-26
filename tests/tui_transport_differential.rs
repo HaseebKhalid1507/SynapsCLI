@@ -297,10 +297,11 @@ fn wait_ready(pane: &str) {
 fn normalise(frame: &str) -> String {
     let id_re = regex::Regex::new(r"\d{8}-\d{6}-[0-9a-f]{4}").unwrap();
     let ms_re = regex::Regex::new(r"\b\d+(\.\d+)?\s?(ms|s)\b").unwrap();
-    // The build sha (`GIT_HASH`, `git rev-parse --short`) is rendered
-    // exactly once: `v<ver> · <sha>[-dirty] ` in the banner (draw.rs). The
-    // banner is right-aligned, so the run of spaces before it also depends
-    // on the sha's length (`-dirty` = +6 columns): collapse it too.
+    // The build sha (`SYNAPS_BUILD_ID`, `git rev-parse --short`) is rendered
+    // exactly once: `v<ver> · <sha>[-dirty] ` right-aligned in the header
+    // (the reference binary's always; this binary's when idle, header.rs),
+    // so the run of spaces before it also depends on the sha's length
+    // (`-dirty` = +6 columns): collapse it too.
     let sha_re = regex::Regex::new(r"\s+(?P<pre>v[0-9][0-9.]* · )[0-9a-f]{7,12}(-dirty)?\b").unwrap();
     let spinner = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏', '◐', '◓', '◑', '◒'];
     frame

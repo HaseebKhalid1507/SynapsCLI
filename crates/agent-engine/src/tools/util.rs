@@ -2,8 +2,23 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Global counter for unique subagent IDs across all dispatches
+/// Global counter for unique subagent IDs across all dispatches. A daemon
+/// reload `execv`s the process, which would restart it at 1 and hand out
+/// ids the sessions' models still remember (`sa_1` aliasing a worker of the
+/// previous image): reload carries it in `ReloadState::next_subagent_id`
+/// and the new image calls [`seed_next_subagent_id`] before rehydrating.
 pub(crate) static NEXT_SUBAGENT_ID: AtomicU64 = AtomicU64::new(1);
+
+/// The id the next dispatched subagent will get (`sa_N`).
+pub(crate) fn peek_next_subagent_id() -> u64 {
+    NEXT_SUBAGENT_ID.load(Ordering::SeqCst)
+}
+
+/// Never hand out an id below `next` again. Monotonic: a lower value is a
+/// no-op, so seeding from several sources is order-independent.
+pub(crate) fn seed_next_subagent_id(next: u64) {
+    NEXT_SUBAGENT_ID.fetch_max(next, Ordering::SeqCst);
+}
 
 /// Monotonic counter to disambiguate concurrent temp files within one process.
 static NEXT_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -101,10 +116,114 @@ pub(crate) fn resolve_path_in(raw: &str, cwd: Option<&std::path::Path>) -> PathB
     }
 }
 
+/// A path handed to an external command (`find`, `ls`) must never be parsed
+/// as an option. With no session cwd a relative path reaches argv verbatim,
+/// so `-delete` would become a `find` expression (01 I3). GNU find also ends
+/// its start points at `!`, `(`, `)` and `,`. It has no `--` for start points,
+/// so prefix `./` instead: same file, never an option or expression.
+pub(crate) fn path_arg_never_option(path: std::path::PathBuf) -> std::path::PathBuf {
+    let first = path.as_os_str().as_encoded_bytes().first().copied();
+    if matches!(first, Some(b'-' | b'!' | b'(' | b')' | b',')) {
+        std::path::Path::new(".").join(path)
+    } else {
+        path
+    }
+}
+
+/// Task 24/CP-11: deterministic, symlink-aware concurrency identity for a
+/// path-target mutating tool, preserving KERNEL resolution order: each
+/// component is resolved incrementally, so a directory symlink is resolved
+/// BEFORE any later `..` applies (`a/link/../x` keys under the parent of
+/// `link`'s TARGET, never the lexical parent `a`). Components past the
+/// deepest existing prefix (create targets) are appended unresolved; a `..`
+/// inside that suffix pops suffix components only (nothing there exists yet,
+/// so no symlink can be traversed), and a `..` that empties the suffix walks
+/// the canonical — symlink-free — resolved prefix, which is kernel-correct.
+/// Any resolution ambiguity (dangling/unreadable symlink, permission error)
+/// yields `None`, which the write/edit tools map to the single conservative
+/// global mutation lane (`ConcurrencyKey::Serialize`) rather than risking
+/// concurrent writes to one actual target.
+///
+/// TOCTOU limitation (documented residual, Moderate): this is scheduling
+/// identity, not a filesystem lock. A symlink can be swapped after
+/// resolution; write/edit must retain their own filesystem safety policy
+/// for the actual mutation.
+pub(crate) fn canonical_path_key(raw: &str) -> Option<String> {
+    if raw.trim().is_empty() {
+        return None;
+    }
+    let expanded = expand_path(raw);
+    let absolute = if expanded.is_absolute() {
+        expanded
+    } else {
+        std::env::current_dir().ok()?.join(expanded)
+    };
+
+    use std::path::Component;
+    // `resolved` is always canonical (every symlink resolved) and existing;
+    // `suffix` holds the not-yet-existing tail in order.
+    let mut resolved = std::path::PathBuf::new();
+    let mut suffix: Vec<std::ffi::OsString> = Vec::new();
+    for component in absolute.components() {
+        match component {
+            Component::Prefix(prefix) => resolved.push(prefix.as_os_str()),
+            Component::RootDir => resolved.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if suffix.pop().is_some() {
+                    continue;
+                }
+                // Kernel semantics on the canonical prefix: `/..` is `/`;
+                // otherwise pop one real (symlink-free) directory.
+                let is_root = resolved.parent().is_none();
+                if !is_root && !resolved.pop() {
+                    return None;
+                }
+            }
+            Component::Normal(name) => {
+                if !suffix.is_empty() {
+                    suffix.push(name.to_os_string());
+                    continue;
+                }
+                let candidate = resolved.join(name);
+                match std::fs::symlink_metadata(&candidate) {
+                    Ok(_) => {
+                        // Exists (possibly a symlink): resolve it NOW so any
+                        // later `..` walks the actual target's parent.
+                        resolved = std::fs::canonicalize(&candidate).ok()?;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        suffix.push(name.to_os_string());
+                    }
+                    // Permission or other inspection failure: ambiguous —
+                    // fall back to the conservative global mutation lane.
+                    Err(_) => return None,
+                }
+            }
+        }
+    }
+    for component in suffix {
+        resolved.push(component);
+    }
+    Some(resolved.to_string_lossy().to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::env;
+
+    /// Seeding is monotonic: a reload's floor raises the counter, a lower
+    /// seed never lowers it (other tests dispatch concurrently: inequalities).
+    #[test]
+    fn seed_next_subagent_id_only_raises() {
+        let floor = peek_next_subagent_id() + 1_000;
+        seed_next_subagent_id(floor);
+        assert!(peek_next_subagent_id() >= floor);
+        seed_next_subagent_id(1);
+        assert!(peek_next_subagent_id() >= floor);
+        assert!(NEXT_SUBAGENT_ID.fetch_add(1, Ordering::Relaxed) >= floor);
+    }
 
     #[test]
     fn resolve_path_in_anchors_relative_to_cwd() {
@@ -283,82 +402,4 @@ mod tests {
         let result = expand_path("relative/path");
         assert_eq!(result, PathBuf::from("relative/path"));
     }
-}
-
-/// Task 24/CP-11: deterministic, symlink-aware concurrency identity for a
-/// path-target mutating tool, preserving KERNEL resolution order: each
-/// component is resolved incrementally, so a directory symlink is resolved
-/// BEFORE any later `..` applies (`a/link/../x` keys under the parent of
-/// `link`'s TARGET, never the lexical parent `a`). Components past the
-/// deepest existing prefix (create targets) are appended unresolved; a `..`
-/// inside that suffix pops suffix components only (nothing there exists yet,
-/// so no symlink can be traversed), and a `..` that empties the suffix walks
-/// the canonical — symlink-free — resolved prefix, which is kernel-correct.
-/// Any resolution ambiguity (dangling/unreadable symlink, permission error)
-/// yields `None`, which the write/edit tools map to the single conservative
-/// global mutation lane (`ConcurrencyKey::Serialize`) rather than risking
-/// concurrent writes to one actual target.
-///
-/// TOCTOU limitation (documented residual, Moderate): this is scheduling
-/// identity, not a filesystem lock. A symlink can be swapped after
-/// resolution; write/edit must retain their own filesystem safety policy
-/// for the actual mutation.
-pub(crate) fn canonical_path_key(raw: &str) -> Option<String> {
-    if raw.trim().is_empty() {
-        return None;
-    }
-    let expanded = expand_path(raw);
-    let absolute = if expanded.is_absolute() {
-        expanded
-    } else {
-        std::env::current_dir().ok()?.join(expanded)
-    };
-
-    use std::path::Component;
-    // `resolved` is always canonical (every symlink resolved) and existing;
-    // `suffix` holds the not-yet-existing tail in order.
-    let mut resolved = std::path::PathBuf::new();
-    let mut suffix: Vec<std::ffi::OsString> = Vec::new();
-    for component in absolute.components() {
-        match component {
-            Component::Prefix(prefix) => resolved.push(prefix.as_os_str()),
-            Component::RootDir => resolved.push(component.as_os_str()),
-            Component::CurDir => {}
-            Component::ParentDir => {
-                if suffix.pop().is_some() {
-                    continue;
-                }
-                // Kernel semantics on the canonical prefix: `/..` is `/`;
-                // otherwise pop one real (symlink-free) directory.
-                let is_root = resolved.parent().is_none();
-                if !is_root && !resolved.pop() {
-                    return None;
-                }
-            }
-            Component::Normal(name) => {
-                if !suffix.is_empty() {
-                    suffix.push(name.to_os_string());
-                    continue;
-                }
-                let candidate = resolved.join(name);
-                match std::fs::symlink_metadata(&candidate) {
-                    Ok(_) => {
-                        // Exists (possibly a symlink): resolve it NOW so any
-                        // later `..` walks the actual target's parent.
-                        resolved = std::fs::canonicalize(&candidate).ok()?;
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                        suffix.push(name.to_os_string());
-                    }
-                    // Permission or other inspection failure: ambiguous —
-                    // fall back to the conservative global mutation lane.
-                    Err(_) => return None,
-                }
-            }
-        }
-    }
-    for component in suffix {
-        resolved.push(component);
-    }
-    Some(resolved.to_string_lossy().to_string())
 }

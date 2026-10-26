@@ -35,8 +35,22 @@
       "permission": "privacy.llm_content",
       "tool_filter": false,
       "actions": [
-        "continue"
-      ]
+        "continue",
+        "context_phase"
+      ],
+      "context_phase": {
+        "status": "optional",
+        "compatibility": "additive optional result within extension_protocol_version 1 (no version bump; per docs/STABILITY.md \u00a71): extensions that only return \"continue\" behave exactly as before, and hosts that predate it treat \"context_phase\" as an unsupported action (continue)",
+        "shape": "{\"action\": \"context_phase\", \"phase\": \"unknown\"|\"plan\"|\"execute\"|\"wrap_up\"|\"new_task\"}",
+        "permission": "requires session.lifecycle IN ADDITION to privacy.llm_content (two-key gate); without it the report is ignored with a warning and treated as continue",
+        "semantics": [
+          "identical to the model calling context_checkpoint with this phase and no note: the host records the advisory phase in its context policy and may roll the context window over at the next task boundary",
+          "lower-authority report only: never capacity, permission, budget, or history authority; cannot force a rollover; never sets a checkpoint note; ignored when context management is disabled",
+          "does not stop the handler chain: all other on_message_complete observers still run; the first accepted report in registration order wins",
+          "unknown phase strings are ignored with a warning"
+        ],
+        "event_data": "on_message_complete data gains an additive context_management object: {enabled: bool, band: \"normal\"|\"pressure\"|\"rollover\"|\"hard_limit\"|null, phase: string}; disabled => {enabled:false, band:null, phase:\"unknown\"}; the checkpoint note is never exposed"
+      }
     },
     "on_compaction": {
       "permission": "privacy.llm_content",
@@ -96,7 +110,8 @@
     "validation": [
       "key must be non-empty and must not contain dots, slashes, or spaces",
       "required must be boolean when present",
-      "secret_env must be an environment variable name when present",
+      "secret_env, when present, should be an upper-case environment variable name matching [A-Z_][A-Z0-9_]* (surrounding whitespace is trimmed); any other name is ignored with a warning and never read",
+      "secret_env must not name a host credential (any provider-registry env var, META_API_KEY, LOCAL_API_KEY, OPENAI_CODEX_ACCESS_TOKEN, the AWS key trio, HTTPS_PROXY/HTTP_PROXY/ALL_PROXY/NO_PROXY) or a SYNAPS_* variable other than the extension's own SYNAPS_EXTENSION_<ID>_<KEY> for a declared key; such a manifest fails to load (see docs/extensions/secrets.md)",
       "host_context, when present, must be a known host-context key and must not be combined with secret_env"
     ]
   },
@@ -130,6 +145,15 @@
           "description must be non-empty",
           "input_schema must be a JSON object"
         ]
+      },
+      "call": {
+        "method": "tool.call",
+        "params": {
+          "name": "the extension's own tool name (not the plugin-id:name runtime name)",
+          "input": "the model-supplied arguments object",
+          "session_id": "owning conversation id; null for workers/subagents, the extension-provider tool route, contexts with no conversation, and under SYNAPS_HOOK_SESSION_ID=0. Always present."
+        },
+        "compatibility": "session_id is an additive params key within extension_protocol_version 1; extensions must ignore params keys they do not know"
       }
     },
     "providers": {

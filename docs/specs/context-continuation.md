@@ -47,17 +47,59 @@ context_management.pressure_tokens = auto
 context_management.rollover_tokens = auto
 context_management.reserve_tokens = 16000
 context_management.finish_rounds = 2
+# Successor footprint after a rollover; auto = min(100000, 2/3 of pressure):
+context_management.target_tokens = auto
 ```
+
+`target_tokens` is the size a rolled-over context aims for, measured over the
+same footprint as the policy's usage (system prompt + tool schemas + retained
+messages). An explicit value must be positive and below the effective pressure
+threshold. When a provider has reported usage for a recent request, the target
+is read in provider-reported tokens (what the status bar shows) and converted
+with that request's ratios; otherwise it is applied to the conservative
+estimate directly. The fixed part (system prompt + tool schemas) is taken as
+counting about 1:1 in both units, so only the rest of the target is converted,
+at the sample's messages-only ratio (estimate - fixed) / (provider - fixed). The
+whole-request ratio blends the two and over-sizes the successor when the fixed
+part is large (~10% over a 100k target with a 59k fixed part). When no
+messages-only ratio exists (the
+provider count does not exceed the fixed part) or it lies outside 0.5–2.0, the
+whole target is converted at the whole-request ratio as before. The fixed
+part is assumed to count about 1:1, and the sample's messages and the
+successor's are assumed to have comparable messages-only ratios. With a fixed
+part lower in provider units, comparable message ratios, and a successor
+smaller than the sampled request, this approximation biases downward; other
+shapes can overshoot.
+A sample applies only to the model whose request
+produced it (switching models falls back to the estimator until that model
+reports usage), and only when the provider count is nonzero and the
+estimate/actual ratio lies within 0.5–2.0. Any newly booked usage replaces the
+sample; an out-of-band or zero count clears it and the conservative estimate
+applies. Usage is input
+plus cache read plus cache write; the transport reads an omitted cache field as
+zero and cannot distinguish it from a reported zero (an understated count shows
+up as a high ratio and is rejected by the band above). Transports that do not
+report usage never calibrate.
+
+The 2/3-of-pressure ceiling caps only *optional* retention. The mandatory set
+(below) plus the continuation message can exceed it, and even the pressure or
+rollover thresholds. That case is not handled by selection: hard admission
+still refuses a request that does not fit, and a successor that cannot shrink
+by more than 1,024 tokens is reported as an unproductive rollover and deferred
+(item 3), so it does not loop.
 
 User-facing pressure notices show only the estimated token count, not internal
 phase names or task-planning instructions. `/context status` reports the
 configured capacity, current window, and effective thresholds.
 
 Auto mode alone is not a pressure signal. Model advisories are request-local and
-sent only when the current state changes (preparation, bounded finish, pending
-workers, or an unproductive rollover), not on every tool round. Normal/disabled
-assessments and committed rollovers clear stale advisory state. These notices
-never enter durable history; their bounded size is included in admission reserves.
+sent only when the current state changes (preparation, bounded finish, or an
+unproductive rollover), not on every tool round. The one exception is a due
+rollover waiting on workers: that reminder rides every deferred round, because a
+single notice scrolls out of attention while the wait goes on. UI notices stay
+edge-triggered. Normal/disabled assessments and committed rollovers clear stale
+advisory state. These notices never enter durable history; their bounded size is
+included in admission reserves.
 
 The model should continue normal work, reporting substantial task boundaries,
 not writing routine progress logs. Checkpoint notes are optional, a few lines of
@@ -106,18 +148,44 @@ summarizer. Headless chat's old automatic in-place compaction is suppressed in
 this mode; manual `/compact` is unchanged. `run_single` rejects this mode rather
 than silently behaving differently; the TUI/chat streaming engine supports it.
 
-1. Defer while workers are running/unreconciled; at hard capacity stop without
-   discarding history. Do not replay unknown tool effects.
-2. Prepare a smaller context, preserving actual user-authored turns (including
-   image-only turns), system/developer messages, the last assistant/result tail,
-   and all tool-call/result dependencies of retained messages.
+1. If workers are running or finished-but-unreconciled, wait up to four admitted
+   rounds (`WORKER_ROLLOVER_GRACE_ROUNDS`) for the model to collect them, then
+   roll over anyway. At hard capacity, never wait. Workers are not migrated or
+   cancelled; the successor envelope lists each one still tracked (handle,
+   agent, state, age, the dispatch preview) and says not to re-dispatch it, so
+   its completion wake is collected in the new window. Do not replay unknown
+   tool effects. (An unbounded wait let a session with near-continuous workers
+   grow ~240K tokens past the threshold until hard capacity refused every
+   request, including the round that would have collected them.)
+2. Prepare a smaller context under `target_tokens`. Always kept: the
+   continuation message and working note, system/developer messages, the last
+   assistant/result tail, the request that started the current turn (when a
+   turn is admitted the host tags a new plain user request with a stable
+   `_synaps_turn` id that persists with the session; interruption markers
+   never start a turn, so a re-entry with only markers, pushed events or tool
+   traffic since (e.g. cancel, save, resume, event wake) keeps the recorded
+   start; like `_synaps_context`, the key is stripped from every provider
+   request, including the compaction transport), and every user turn carrying an attachment (image,
+   document, ...) because the archive excludes those payloads and could not
+   return them. All of these keep their tool-call/result groups and are kept
+   even if together they exceed the target (hard admission still applies). The
+   session's first request is pinned if it fits ~30% of the target; a larger
+   text-only one is replaced by an archive pointer and preview carried into
+   later windows (one with an attachment is never stubbed). Remaining
+   user-authored turns fill the budget newest-first: every typed request that
+   fits first, then pushed `<event …>` messages fill whatever room remains up
+   to the target. Retained messages keep source order and their complete
+   tool-call/result groups; no tool result is synthesized. The continuation
+   message lists what was not retained (count plus one line per recent item,
+   bounded to ~2k tokens) and points to `memory_search(source=history)`; the
+   archive still seals the full eligible history.
 3. If retained material cannot meaningfully shrink at a soft boundary, keep the
    current history and continue only if the full request still passes hard
    admission. Reassess after four admitted rounds or an 8,192-token footprint
    change; repeated phase reports do not force another attempt. No archive,
    window advance or budget reset occurs for this no-op. If the current request
    cannot fit safely, stop without clearing history. User constraints are not
-   silently selected or summarized away. See `context-rollover-recovery.md`.
+   summarized away: dropped turns stay archived and indexed. See `context-rollover-recovery.md`.
 4. Seal the old eligible source projection and working note to a private archive,
    with data/directory sync and retry deduplication. Verify the note before commit.
 5. Request a frontend durable-head checkpoint. The frontend validates the logical
@@ -210,6 +278,16 @@ See [eligible-input budgeting](archive-eligible-input-budget.md).
 Storage exhaustion stops rollover; no automatic source eviction or tombstoning.
 The index is currently a bounded scan, not a large-corpus search engine.
 Non-Unix archive operations fail explicitly; enabling via the command is refused.
+
+Concurrency: operations on one project's archive (rollover seals, parallel
+history tool calls, subagents in the same process) wait for each other
+in-process (not in FIFO order) and fail as busy if not admitted within 30
+seconds; a seal and its stored note are one operation. Another process holding
+the archive lock still fails closed without waiting for it ("archive busy";
+history retained). The lock is released explicitly, so a child process forked
+concurrently by another thread cannot keep it held. A caller canceled before
+its operation is admitted reads and writes no records (opening the store may
+already have happened); an admitted operation completes.
 
 ## Axel integration: one selected memory authority
 

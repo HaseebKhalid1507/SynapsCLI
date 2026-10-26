@@ -107,9 +107,24 @@ struct Cli {
     #[arg(long, global = true)]
     takeover: bool,
 
+    /// With --attach: what this client is called in the session (`/clients`,
+    /// `synaps daemon sessions`, "input moved to …"). 1–32 letters, digits,
+    /// `-` or `_`. Default: SYNAPS_CLIENT_NAME, else `tui` (`tui-2`, … when
+    /// taken).
+    #[arg(long = "as", value_name = "NAME", global = true)]
+    client_name: Option<String>,
+
     /// With --attach: pin the session live (never parked).
     #[arg(long = "keep-warm", global = true)]
     keep_warm: bool,
+
+    /// With --attach: never answer confirm prompts (tool-call and
+    /// tool-activation approvals) from this TUI, whatever keys reach it;
+    /// they are listed as waiting for another client to answer. Secret
+    /// prompts are still typed here. For a TUI embedded where keystrokes may
+    /// come from somewhere other than the person approving.
+    #[arg(long = "no-confirm-answers", requires = "attach")]
+    no_confirm_answers: bool,
 
     /// With --attach: always create a fresh session even if one is live
     /// (cannot be combined with an explicit session ID). Not global: the
@@ -185,6 +200,11 @@ enum Command {
         /// Non-interactive: log in directly with a named provider (skips the picker). e.g. openai-codex, claude
         #[arg(long)]
         provider: Option<String>,
+        /// Store the OAuth credential in a named account slot (`<provider>@<label>`)
+        /// instead of the default slot. Label: a-z, 0-9, '.', '_', '-' (max 32).
+        /// Requires --provider. The default slot is never touched.
+        #[arg(long, requires = "provider", value_name = "LABEL")]
+        account: Option<String>,
     },
     /// Authentication management
     Auth {
@@ -197,13 +217,28 @@ enum Command {
         /// instead of account usage. Linux only.
         #[arg(long)]
         memory: bool,
-        /// With --memory: emit JSON instead of a table.
-        #[arg(long, requires = "memory")]
+        /// Emit JSON instead of a table (usage or --memory mode).
+        #[arg(long)]
         json: bool,
         /// With --memory: walk this pid's tree instead of the live sessions.
         #[arg(long, requires = "memory")]
         pid: Option<u32>,
+        /// Show full usage windows, model availability, credits and diagnostics.
+        #[arg(long, conflicts_with_all = ["memory", "json"])]
+        verbose: bool,
+        /// Usage for one OAuth provider (e.g. openai-codex, claude, kimi-code, xai-auth).
+        #[arg(long, conflicts_with = "memory")]
+        provider: Option<String>,
+        /// Usage for one stored account of --provider (label or `default`); never falls back.
+        #[arg(long, requires = "provider", conflicts_with = "memory", value_name = "LABEL")]
+        account: Option<String>,
+        /// Usage for every stored account of every usage-capable provider (or of --provider).
+        #[arg(long, conflicts_with_all = ["memory", "account"])]
+        all: bool,
     },
+    /// Quota keeper: poll per-account usage (read-only by default) and, only for
+    /// explicitly opted-in Codex accounts, run one minimal activation per reset.
+    QuotaKeeper(cmd::quota_keeper::QuotaKeeperArgs),
     /// Credential broker — serve short-lived access tokens to client machines
     /// over HTTP/HTTPS so they can share one OAuth credential without storing it.
     ///
@@ -257,7 +292,7 @@ enum Command {
         #[arg(long = "profile", value_name = "PROFILE")]
         profile: Option<String>,
     },
-    /// Send an event to the inbox (picked up by running session)
+    /// Send an event to a running session (its socket), or to the shared inbox
     Send {
         /// Message text
         message: String,
@@ -269,12 +304,19 @@ enum Command {
         channel: Option<String>,
         #[arg(long = "content-type", default_value = "message")]
         content_type: String,
-        /// Target a specific session by ID, name, or prefix
+        /// Target a specific session by ID, name, or prefix. A miss, or a
+        /// socket that still refuses after 3 tries, is an error (exit 1,
+        /// nothing delivered) unless --inbox is given
         #[arg(long, value_name = "SESSION")]
         session: Option<String>,
         /// Send to all active sessions
         #[arg(long)]
         broadcast: bool,
+        /// With --session: when nothing matches or the socket refuses, leave
+        /// the event in the shared inbox instead of failing. Only a session with an attached input
+        /// owner takes inbox files, exactly once
+        #[arg(long)]
+        inbox: bool,
     },
     /// Generate shell completions (bash, zsh, fish, elvish, powershell)
     Completions {
@@ -312,6 +354,92 @@ enum AuthAction {
         /// Non-interactive: log in directly with a named provider (skips the picker). e.g. openai-codex, claude
         #[arg(long)]
         provider: Option<String>,
+        /// Store the OAuth credential in a named account slot (`<provider>@<label>`).
+        /// Requires --provider. The default slot is never touched.
+        #[arg(long, requires = "provider", value_name = "LABEL")]
+        account: Option<String>,
+    },
+    /// List stored OAuth accounts (labels and non-secret metadata only)
+    List {
+        /// Restrict to one OAuth provider (e.g. openai-codex, claude, kimi-code)
+        #[arg(long)]
+        provider: Option<String>,
+        /// Machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Preview automatic subscription ranking without making an inference request
+    Plan {
+        #[arg(long)]
+        provider: Option<String>,
+        /// Filter capacity by the model you intend to use
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Select which stored account a provider uses (writes auth.account.<provider>)
+    Use {
+        /// OAuth provider (e.g. openai-codex, claude)
+        #[arg(long)]
+        provider: String,
+        /// Account label, `default`, or `auto` (opt-in capacity-based selection)
+        #[arg(long, value_name = "LABEL|default|auto")]
+        account: String,
+    },
+    /// Remove one stored account slot (never touches other slots)
+    Remove {
+        /// OAuth provider (e.g. openai-codex, claude)
+        #[arg(long)]
+        provider: String,
+        /// Account label or `default`
+        #[arg(long, value_name = "LABEL|default")]
+        account: String,
+        /// Skip confirmation (required for the default slot and non-interactive use)
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+    /// Verify which provider account each stored slot holds and flag slots that
+    /// share one seat (backfills identity for logins that predate this check).
+    /// Local store only. Exits non-zero when duplicates exist.
+    Identify {
+        /// Restrict to one OAuth provider (e.g. openai-codex, claude)
+        #[arg(long)]
+        provider: Option<String>,
+        /// Restrict to one account label (or `default`)
+        #[arg(long, value_name = "LABEL|default")]
+        account: Option<String>,
+        /// Resolve and report only; write nothing
+        #[arg(long)]
+        dry_run: bool,
+        /// Re-verify slots that already carry an account id
+        #[arg(long)]
+        force: bool,
+        /// Machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// What the running daemon's broker remembers about each account: its
+    /// cooldown, last usage read, last token refresh and the last automatic
+    /// selection. Memory only: no usage request, no refresh. Without a
+    /// running daemon, lists the accounts with nothing recorded.
+    State {
+        /// Restrict to one OAuth provider (e.g. claude, openai-codex)
+        #[arg(long)]
+        provider: Option<String>,
+        /// Restrict to one account label (or `default`): its state, and only
+        /// the selections that chose it or list it as failed
+        #[arg(long, value_name = "LABEL|default")]
+        account: Option<String>,
+        /// Machine-readable JSON (the report only; notices go to stderr)
+        #[arg(long)]
+        json: bool,
+        /// Drop the matched accounts' in-memory cooldowns, usage readings and
+        /// stickiness in the running daemon first. Never touches credentials.
+        /// With --account, the selection history stays; only a clear without
+        /// --account also drops it.
+        #[arg(long)]
+        clear: bool,
     },
 }
 
@@ -351,6 +479,42 @@ enum ThinClient {
     /// in-process); `--no-extensions` skips it (daemon extensions are
     /// shared, so the flag cannot be honoured over the socket).
     Adopt { profile: Option<String> },
+}
+
+impl ThinClient {
+    fn profile_mut(&mut self) -> &mut Option<String> {
+        match self {
+            ThinClient::Tui { profile } | ThinClient::Line { profile } | ThinClient::Adopt { profile } => profile,
+        }
+    }
+}
+
+/// Pin the process profile before ANY config read. `config::get_profile()`
+/// latches on first use (falling back to `SYNAPS_PROFILE`) and
+/// `set_profile` is first-write-wins, so a single `load_config()` before
+/// the pin — `ensure_daemon`'s idle-exit lookup and scope probe did that in
+/// 0.10.1 — silently drops `--profile` for the rest of the process: the
+/// TUI fell back to the default profile's config, sessions and `/model`
+/// writes. Returns the profile actually in effect (flag, else env), which
+/// is the one the daemon socket must be chosen by.
+fn pin_profile(flag: Option<String>) -> Option<String> {
+    if flag.is_some() {
+        synaps_cli::config::set_profile(flag);
+    }
+    synaps_cli::config::get_profile()
+}
+
+/// `--profile X` must be the profile in effect; if something latched
+/// another one first, refuse instead of running (and writing config,
+/// sessions) under the wrong profile.
+fn check_profile_applied(requested: Option<&str>, active: Option<&str>) -> anyhow::Result<()> {
+    match requested {
+        Some(want) if active != Some(want) => anyhow::bail!(
+            "--profile {want} could not be applied (profile `{}` was already in effect); refusing to run under the wrong profile",
+            active.unwrap_or("default")
+        ),
+        _ => Ok(()),
+    }
 }
 
 /// `SYNAPS_DAEMON_ADOPT`: ON unless `0`/`false`/`off`/`no`. Off means a
@@ -571,8 +735,13 @@ fn scrub_reexec_env() {
 }
 
 fn main() -> anyhow::Result<()> {
+    // Before anything can report it (daemon `Welcome`, the client's skew check).
+    agent_engine::session::wire::set_build_id(env!("SYNAPS_BUILD_ID"));
     let mut thin = false;
-    if let Some(kind) = thin_client() {
+    if let Some(mut kind) = thin_client() {
+        // Before `ensure_daemon`: it reads config (idle-exit, process scopes).
+        let profile = pin_profile(kind.profile_mut().take());
+        *kind.profile_mut() = profile;
         // Adopt and --attach share one path: a running daemon or a freshly
         // spawned one; a failed spawn falls back to the in-process boot.
         match ensure_daemon(&kind) {
@@ -636,6 +805,10 @@ async fn async_main() -> anyhow::Result<()> {
     if let Some(ref prof) = cli.profile {
         synaps_cli::config::set_profile(Some(prof.clone()));
     }
+    // Flag, else `SYNAPS_PROFILE`: daemon sockets are chosen by this, so an
+    // env-profiled client never lands on the default profile's daemon.
+    let active_profile = synaps_cli::config::get_profile();
+    check_profile_applied(cli.profile.as_deref(), active_profile.as_deref())?;
 
     match cli.command {
         None if cli.attach.is_some() => {
@@ -656,15 +829,17 @@ async fn async_main() -> anyhow::Result<()> {
             } else {
                 let id = cli.attach.flatten();
                 tui::attach::run_attached(tui::attach::AttachOpts {
-                    profile: cli.profile,
+                    profile: active_profile,
                     id,
                     continue_session: cli.continue_session,
                     system: cli.system,
                     prompt_manifest: cli.prompt_manifest,
                     mode: tui::attach::attach_mode(cli.observe, cli.takeover),
+                    no_confirm_answers: cli.no_confirm_answers,
                     keep_warm: cli.keep_warm,
                     new_session: cli.new_session,
                     name: cli.session_name,
+                    client_name: cli.client_name,
                     adopted: ADOPTED.load(std::sync::atomic::Ordering::SeqCst),
                 })
                 .await?;
@@ -719,24 +894,99 @@ async fn async_main() -> anyhow::Result<()> {
         Some(Command::Watcher { subcommand, args }) => {
             cmd::watcher::run(subcommand, args).await;
         }
-        Some(Command::Login { provider }) => {
-            cmd::login::run(cli.profile, provider)
+        Some(Command::Login { provider, account }) => {
+            cmd::login::run(cli.profile, provider, account)
                 .await
                 .map_err(anyhow::Error::msg)?;
         }
         Some(Command::Auth { action }) => match action {
-            AuthAction::Login { provider } => cmd::login::run(cli.profile, provider)
+            AuthAction::Login { provider, account } => {
+                cmd::login::run(cli.profile, provider, account)
+                    .await
+                    .map_err(anyhow::Error::msg)?
+            }
+            AuthAction::List { provider, json } => {
+                cmd::auth_accounts::list(cmd::auth_accounts::ListOptions { provider, json })
+                    .await
+                    .map_err(anyhow::Error::msg)?
+            }
+            AuthAction::Plan {
+                provider,
+                model,
+                json,
+            } => cmd::auth_accounts::plan(provider, model, json)
                 .await
                 .map_err(anyhow::Error::msg)?,
+            AuthAction::Use { provider, account } => {
+                cmd::auth_accounts::use_account(provider, account)
+                    .await
+                    .map_err(anyhow::Error::msg)?
+            }
+            AuthAction::Remove {
+                provider,
+                account,
+                yes,
+            } => cmd::auth_accounts::remove(provider, account, yes).map_err(anyhow::Error::msg)?,
+            AuthAction::Identify {
+                provider,
+                account,
+                dry_run,
+                force,
+                json,
+            } => cmd::auth_accounts::identify(cmd::auth_accounts::IdentifyOptions {
+                provider,
+                account,
+                dry_run,
+                force,
+                json,
+            })
+            .await
+            .map_err(anyhow::Error::msg)?,
+            AuthAction::State {
+                provider,
+                account,
+                json,
+                clear,
+            } => cmd::auth_accounts::state(
+                cli.profile,
+                cmd::auth_accounts::StateOptions {
+                    provider,
+                    account,
+                    json,
+                    clear,
+                },
+            )
+            .await
+            .map_err(anyhow::Error::msg)?,
         },
-        Some(Command::Status { memory, json, pid }) => {
+        Some(Command::Status {
+            memory,
+            json,
+            pid,
+            verbose,
+            provider,
+            account,
+            all,
+        }) => {
             if memory {
                 cmd::status::run_memory(json, pid).map_err(|e| anyhow::anyhow!(e.to_string()))?;
             } else {
-                cmd::status::run()
-                    .await
-                    .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                // No flags == legacy `synaps status` (StatusOptions::default()).
+                cmd::status::run_usage(cmd::status::StatusOptions {
+                    provider,
+                    account,
+                    all,
+                    json,
+                    verbose,
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
             }
+        }
+        Some(Command::QuotaKeeper(args)) => {
+            cmd::quota_keeper::run(args)
+                .await
+                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
         }
         Some(Command::AuthBroker {
             bind,
@@ -777,10 +1027,10 @@ async fn async_main() -> anyhow::Result<()> {
             cmd::retention::run(action)?;
         }
         Some(Command::Daemon(args)) => {
-            cmd::daemon::run(cli.profile, args).await?;
+            cmd::daemon::run(active_profile, args).await?;
         }
         Some(Command::Attach(args)) => {
-            cmd::attach::run(cli.profile, args).await?;
+            cmd::attach::run(active_profile, args, cli.client_name).await?;
         }
         Some(Command::Rpc {
             continue_id,
@@ -798,6 +1048,7 @@ async fn async_main() -> anyhow::Result<()> {
             content_type,
             session,
             broadcast,
+            inbox,
         }) => {
             cmd::send::run(
                 message,
@@ -807,6 +1058,7 @@ async fn async_main() -> anyhow::Result<()> {
                 content_type,
                 session,
                 broadcast,
+                inbox,
             )
             .await?;
         }
@@ -896,6 +1148,7 @@ mod worker_threads_tests {
             &["--system", "x", "--no-extensions"],
             &["--observe"],
             &["--keep-warm"],
+            &["--no-confirm-answers"],
             &["--new"],
             &["--name", "n"],
             &["--bogus"],
@@ -928,6 +1181,65 @@ mod worker_threads_tests {
         let named = super::Cli::try_parse_from(["synaps", "--attach", "--new", "--name", "ambient"]).unwrap();
         assert_eq!(named.session_name.as_deref(), Some("ambient"));
         assert!(super::Cli::try_parse_from(["synaps", "--name", "ambient"]).is_err());
+    }
+
+    /// `--no-confirm-answers` rides on `--attach` (any mode) and is a
+    /// clap error without it, so a binary that lacks it fails loudly.
+    #[test]
+    fn no_confirm_answers_flag_requires_attach() {
+        use clap::Parser;
+        let ok = super::Cli::try_parse_from([
+            "synaps",
+            "--attach",
+            "abc",
+            "--observe",
+            "--no-confirm-answers",
+        ])
+        .unwrap();
+        assert!(ok.no_confirm_answers && ok.observe);
+        let take = super::Cli::try_parse_from([
+            "synaps",
+            "--no-confirm-answers",
+            "--attach",
+            "abc",
+            "--takeover",
+        ])
+        .unwrap();
+        assert!(take.no_confirm_answers && take.takeover);
+        let plain = super::Cli::try_parse_from(["synaps", "--attach", "abc"]).unwrap();
+        assert!(!plain.no_confirm_answers, "off by default");
+        assert!(super::Cli::try_parse_from(["synaps", "--no-confirm-answers"]).is_err());
+        assert_eq!(
+            super::thin_client_from(v(&["--attach", "abc", "--no-confirm-answers"]), true, true),
+            Some(super::ThinClient::Tui { profile: None })
+        );
+    }
+
+    #[test]
+    fn profile_must_be_the_one_in_effect() {
+        use super::check_profile_applied as check;
+        assert!(check(None, None).is_ok());
+        // no flag: whatever SYNAPS_PROFILE latched is legitimate
+        assert!(check(None, Some("work")).is_ok());
+        assert!(check(Some("axon"), Some("axon")).is_ok());
+        // the 0.10.1 incident: `--profile axon` but the default had latched
+        let e = check(Some("axon"), None).unwrap_err().to_string();
+        assert!(e.contains("--profile axon") && e.contains("`default`"), "{e}");
+        assert!(check(Some("axon"), Some("work")).is_err());
+    }
+
+    #[test]
+    fn thin_client_profile_is_rewritable_for_every_kind() {
+        use super::ThinClient;
+        for argv in [&["--profile", "axon"][..], &["--profile=axon", "--attach"], &["--profile", "axon", "attach"]] {
+            let mut kind = thin_client_from(v(argv), true, true).expect("thin");
+            assert_eq!(kind.profile_mut().as_deref(), Some("axon"), "{argv:?}");
+            *kind.profile_mut() = Some("pinned".into());
+            let profile = match kind {
+                ThinClient::Tui { profile } | ThinClient::Line { profile } | ThinClient::Adopt { profile } => profile,
+            };
+            assert_eq!(profile.as_deref(), Some("pinned"));
+        }
     }
 
     #[test]

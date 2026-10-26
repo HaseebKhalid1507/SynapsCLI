@@ -49,7 +49,7 @@ pub use agent_core::session::{
 pub use tokio_util::sync::CancellationToken;
 pub use tools::{Tool, ToolContext, ToolOutput, ToolRegistry};
 pub use watcher_types::{
-    AgentConfig, AgentStatusInfo, ExitReason, HandoffState, SessionLimits, SessionStats,
+    AgentConfig, AgentStatusInfo, ExitReason, HandoffState, HooksConfig, SessionLimits, SessionStats,
     WatcherCommand, WatcherResponse,
 };
 

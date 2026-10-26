@@ -4,14 +4,11 @@ use crate::{contract::*, scope::Alias};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     io::Read,
     os::{
         fd::{AsRawFd, FromRawFd},
-        unix::{
-            ffi::OsStrExt,
-            fs::{MetadataExt, OpenOptionsExt},
-        },
+        unix::{ffi::OsStrExt, fs::MetadataExt},
     },
     path::{Component, Path, PathBuf},
     process::{Command, Stdio},
@@ -136,15 +133,18 @@ fn private_marker(common: &Path) -> Result<(File, File)> {
     if m.uid() != unsafe { libc::geteuid() } || m.mode() & 0o002 != 0 {
         return Err(Error::UnsafePath);
     }
-    let anchor = PathBuf::from(format!(
-        "/proc/{}/fd/{}",
-        std::process::id(),
-        directory.as_raw_fd()
-    ));
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(anchor.join("synaps-memory-identity.json"))?;
+    // Open relative to the held directory descriptor (portable; no procfs).
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            c"synaps-memory-identity.json".as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let file = unsafe { File::from_raw_fd(fd) };
     let m = file.metadata()?;
     if !m.is_file()
         || m.uid() != unsafe { libc::geteuid() }

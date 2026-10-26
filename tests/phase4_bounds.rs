@@ -30,9 +30,11 @@ use synaps_cli::tools::ledger::CallLedger;
 use synaps_cli::tools::output::{
     active_ui_forwarder_count, delta_channel_with_budgets, spawn_ui_forwarder, OutputBudgets,
 };
+#[cfg(feature = "command-exec")]
+use synaps_cli::tools::{bash_intermediary_snapshot, BashTool};
 use synaps_cli::tools::{
-    bash_intermediary_snapshot, BashTool, ConcurrencyKey, SubagentRegistry, SubagentStartTool,
-    Tool, ToolCapabilities, ToolChannels, ToolContext, ToolLimits, ToolOrigin,
+    ConcurrencyKey, SubagentRegistry, SubagentStartTool, Tool, ToolCapabilities, ToolChannels,
+    ToolContext, ToolLimits, ToolOrigin,
 };
 use synaps_cli::{BudgetDimension, Result, TurnOutcome, Value};
 use tokio_util::sync::CancellationToken;
@@ -411,7 +413,7 @@ async fn infinite_tool_loop_stops_at_exact_configured_budget() {
     std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
 
     let budget = TurnBudget {
-        max_provider_rounds: 3,
+        max_provider_rounds: Some(3),
         max_round_renewals: 0,
         ..TurnBudget::for_role(TurnRole::Foreground)
     };
@@ -446,7 +448,7 @@ async fn every_tool_use_gets_a_valid_result_at_budget_exhaustion() {
     std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
 
     let budget = TurnBudget {
-        max_tool_calls: 1,
+        max_tool_calls: Some(1),
         ..TurnBudget::for_role(TurnRole::Foreground)
     };
     let executions = Arc::new(AtomicUsize::new(0));
@@ -563,6 +565,7 @@ async fn synthetic_one_gib_slow_consumer_stays_under_fixed_retention_ceiling() {
     );
 }
 
+#[cfg(feature = "command-exec")]
 #[tokio::test]
 async fn production_bash_handoff_conserves_bytes_for_large_generated_output() {
     let before = bash_intermediary_snapshot();
@@ -573,8 +576,10 @@ async fn production_bash_handoff_conserves_bytes_for_large_generated_output() {
             tx_events: None,
         },
         capabilities: ToolCapabilities {
+            session_allow_all: None,
             launch_cancel: None,
             memory_backend: None,
+            telemetry: None,
             watcher_exit_path: None,
             tool_register_tx: None,
             session_manager: None,
@@ -592,6 +597,7 @@ async fn production_bash_handoff_conserves_bytes_for_large_generated_output() {
             env: None,
             env_stripped: Vec::new(),
             env_warned: Default::default(),
+            session_id: None,
         },
         limits: ToolLimits {
             max_tool_output: 4096,
@@ -792,8 +798,10 @@ async fn cancellation_closes_forwarder_and_releases_live_delegation_leases() {
             tx_events: None,
         },
         capabilities: ToolCapabilities {
+            session_allow_all: None,
             launch_cancel: None,
             memory_backend: None,
+            telemetry: None,
             watcher_exit_path: None,
             tool_register_tx: None,
             session_manager: None,
@@ -811,6 +819,7 @@ async fn cancellation_closes_forwarder_and_releases_live_delegation_leases() {
             env: None,
             env_stripped: Vec::new(),
             env_warned: Default::default(),
+            session_id: None,
         },
         limits: ToolLimits {
             max_tool_output: 30000,
@@ -918,12 +927,18 @@ fn delegation_depth_is_bounded_before_dispatch() {
 }
 
 #[test]
-fn role_defaults_are_finite_for_every_autonomous_role() {
-    for role in [TurnRole::Foreground, TurnRole::Autonomous, TurnRole::Worker] {
+fn role_defaults_unlimited_only_for_foreground() {
+    // Interactive turns: every per-turn limit is opt-in (off by default).
+    let fg = TurnBudget::for_role(TurnRole::Foreground);
+    assert_eq!(fg.max_provider_rounds, None);
+    assert_eq!(fg.max_tool_calls, None);
+    assert_eq!(fg.max_accumulated_tool_result_bytes, None);
+    // Unattended roles keep a finite round cap.
+    for role in [TurnRole::Autonomous, TurnRole::Worker] {
         let budget = TurnBudget::for_role(role);
-        assert!(budget.max_provider_rounds > 0);
-        assert!(budget.max_tool_calls > 0);
-        // Wall clock is opt-in (off by default); rounds and tool calls bound every role.
-        assert_eq!(budget.max_elapsed, None);
+        assert!(budget.max_provider_rounds.is_some_and(|r| r > 0));
+    }
+    for role in [TurnRole::Foreground, TurnRole::Autonomous, TurnRole::Worker] {
+        assert_eq!(TurnBudget::for_role(role).max_elapsed, None);
     }
 }

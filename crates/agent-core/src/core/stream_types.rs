@@ -52,6 +52,19 @@ pub enum LlmEvent {
         tool_id: String,
         delta: String,
     },
+    /// The call `tool_id` is waiting behind another call in its scheduler
+    /// lane (serial / same-key lane) and has NOT started executing.
+    /// Opt-in: only calls that actually wait get it, always before their
+    /// [`LlmEvent::ToolStarted`]. A consumer that ignores both keeps the
+    /// old behaviour (every call "runs" from its `ToolUse`).
+    ToolQueued {
+        tool_id: String,
+    },
+    /// A call previously announced by [`LlmEvent::ToolQueued`] has begun
+    /// executing. Never sent for a call that was not queued.
+    ToolStarted {
+        tool_id: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -79,6 +92,12 @@ pub enum SessionEvent {
     Error(TurnError),
     /// Transient status line — display-only, never persisted.
     Notice(String),
+    /// The provider pushed back (429, 5xx, a stream error, a refusal, an
+    /// incomplete response) and a retry is pending. Shown like
+    /// [`Notice`](Self::Notice); clients also show a retrying state, which
+    /// they must not infer from notice text. On the session wire it is a
+    /// `notice` with `retry: true`, so older peers read it as a notice.
+    Retry(String),
 }
 
 /// Budget dimension placeholder (spec §5.2). The full turn-budget system is
@@ -97,6 +116,8 @@ pub enum BudgetDimension {
     ToolResultBytes,
     /// Accumulated estimated USD cost within one stream turn (spec §8.1).
     CostUsd,
+    /// Uncached input + output tokens summed over one stream turn.
+    TotalTokens,
 }
 
 impl BudgetDimension {
@@ -110,6 +131,7 @@ impl BudgetDimension {
             Self::ProviderRounds => "provider_rounds",
             Self::ToolResultBytes => "tool_result_bytes",
             Self::CostUsd => "cost_usd",
+            Self::TotalTokens => "total_tokens",
         }
     }
 }

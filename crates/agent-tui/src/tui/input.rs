@@ -16,6 +16,8 @@ pub(super) enum InputAction {
     SlashCommand(String, String),
     /// User submitted input while streaming — contains the raw input string.
     StreamingInput(String),
+    /// Enter in a worker view: steer that subagent with the text.
+    SubagentSteer { handle_id: String, text: String },
     /// Start the quit animation.
     Quit,
     /// Abort the current stream (Esc during streaming).
@@ -31,6 +33,12 @@ pub(super) enum InputAction {
     /// The dispatch arm re-checks streaming + exact-model validity
     /// (`effort::apply_guard`) before any mutation/persist.
     EffortApply(super::effort::EffortApply),
+    /// /sessions modal asked for a daemon pin/close (spawned by dispatch).
+    SessionsOp(super::sessions::SessionsOp),
+    /// /sessions Past tab: deep search / rename on a blocking task.
+    SessionsPast(super::sessions::past::PastCmd),
+    /// Copy text to the system clipboard (/sessions `y copy id`).
+    CopyText(String),
     /// Models modal requested expanding provider models.
     ModelsExpandProvider(String),
     /// Plugins modal emitted an outcome — handled in the async main loop
@@ -96,6 +104,7 @@ pub(super) fn handle_event(
         }
         super::focus::PaneId::HelpFind => route_help_find(event, app),
         super::focus::PaneId::Effort => route_effort(event, app),
+        super::focus::PaneId::Sessions => route_sessions(event, app),
         super::focus::PaneId::Models => route_models(event, app, runtime),
         super::focus::PaneId::Plugins => route_plugins(event, app),
         super::focus::PaneId::Settings => route_settings(event, app, runtime, registry),
@@ -184,61 +193,86 @@ fn handle_mouse(
     // lock L3: wheel + click in one input batch maps into rows demoted as of
     // the last frame). The re-render crosses the seam via RenderCtx, same as
     // the draw path — field borrows are disjoint from `app.transcript`.
+    // A click on a tray row opens that worker's view.
+    if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
+        if let Some(i) = super::subagent_tray::row_at(
+            app.tray_area,
+            app.subagents.len(),
+            mouse.column,
+            mouse.row,
+        ) {
+            let sa = &app.subagents[i];
+            let c = super::watch::Candidate {
+                handle_id: format!("sa_{}", sa.id),
+                subagent_id: sa.id,
+                agent_name: sa.name.clone(),
+            };
+            super::watch::focus_worker(app, &c, std::time::Instant::now());
+            return InputAction::None;
+        }
+    }
+    // The focused thread renders with its own label and liveness (a
+    // watched worker's, not main's) — same as the draw path.
+    let banner = super::watch::banner(app);
     let ctx = super::transcript::RenderCtx {
         spinner_frame: app.spinner_frame,
-        streaming: app.streaming,
-        agent_name: &app.agent_name,
+        streaming: match &banner {
+            Some(b) => matches!(b.status.as_str(), "running" | "connecting"),
+            None => app.streaming,
+        },
+        agent_name: banner.as_ref().map_or(app.agent_name.as_str(), |b| b.agent_name.as_str()),
     };
+    // Scroll + selection act on the FOCUSED thread (main or a watched
+    // subagent); other threads' views never move.
+    let view = super::threads::active_mut(&mut app.transcript, &mut app.threads);
     match mouse.kind {
         // Wheel scroll no longer clears the selection (P10 lock L4):
         // endpoints are content-relative, so the selection scrolls with the
         // content and the highlight clamps to the window. Keypresses still
         // clear (handle_key top) — including Shift+Up/Down keyboard scroll.
         MouseEventKind::ScrollUp => {
-            app.transcript.scroll_up(scroll_lines);
+            view.scroll_up(scroll_lines);
         }
         MouseEventKind::ScrollDown => {
-            app.transcript.scroll_down(scroll_lines);
+            view.scroll_down(scroll_lines);
         }
 
         // Left-click starts a new selection (clears any existing one)
         MouseEventKind::Down(MouseButton::Left) => {
             // Only start selection if click is inside the message area
-            if app.transcript.hit_test(mouse.column, mouse.row) {
-                app.transcript
-                    .selection_begin(mouse.column, mouse.row, &ctx);
+            if view.hit_test(mouse.column, mouse.row) {
+                view.selection_begin(mouse.column, mouse.row, &ctx);
             } else {
-                app.transcript.clear_selection();
+                view.clear_selection();
             }
         }
 
         // Left-drag extends the selection (no-op without an anchor)
         MouseEventKind::Drag(MouseButton::Left) => {
-            app.transcript.selection_drag(mouse.column, mouse.row, &ctx);
+            view.selection_drag(mouse.column, mouse.row, &ctx);
         }
 
         // Left-release finalizes the selection (click == anchor ⇒ clear)
         MouseEventKind::Up(MouseButton::Left) => {
-            app.transcript
-                .selection_release(mouse.column, mouse.row, &ctx);
+            view.selection_release(mouse.column, mouse.row, &ctx);
         }
 
         // Right-click: copy if selection exists, paste if not
         MouseEventKind::Down(MouseButton::Right) => {
-            if app.transcript.has_selection() {
-                // Copy selected text to clipboard — right-click with selection is COPY ONLY
-                if let Some(text) = app.transcript.selected_text() {
+            if view.has_selection() {
+                // Copy selected text to clipboard — right-click with selection is COPY ONLY.
+                // Take the text and clear the selection while `view` is
+                // borrowed, then report through the App.
+                let copied = view.selected_text();
+                view.clear_selection();
+                if let Some(text) = copied {
                     copy_to_clipboard(&text);
-                    app.push_msg(ChatMessage::System(format!(
-                        "Copied {} chars",
-                        text.chars().count()
-                    )));
+                    // Reported in the thread the user copied from.
+                    super::watch::notice(app, format!("Copied {} chars", text.chars().count()));
                 }
                 // Suppress any terminal-generated paste event that follows this right-click
                 app.suppress_paste_until =
                     Some(app.clock.now() + std::time::Duration::from_millis(150));
-                // Clear selection after copy
-                app.transcript.clear_selection();
             } else {
                 // No selection — paste from clipboard at cursor position
                 if let Some(text) = paste_from_clipboard() {
@@ -264,7 +298,7 @@ fn handle_mouse(
 /// Copy text to system clipboard. Uses a singleton background thread that
 /// holds one clipboard handle for the lifetime of the app. New copies replace
 /// the previous content atomically — no thread accumulation, no races.
-fn copy_to_clipboard(text: &str) {
+pub(crate) fn copy_to_clipboard(text: &str) {
     use std::sync::{mpsc, OnceLock};
     static TX: OnceLock<mpsc::Sender<String>> = OnceLock::new();
     let sender = TX.get_or_init(|| {
@@ -310,7 +344,7 @@ fn handle_key(
 ) -> InputAction {
     let (code, modifiers) = (key.code, key.modifiers);
     // Clear text selection on any keypress (typing dismisses selection)
-    app.transcript.clear_selection();
+    super::threads::active_mut(&mut app.transcript, &mut app.threads).clear_selection();
     // Any non-Tab key resets the tab-completion cycle state. (Tab handler
     // below returns early after setting its own cycle state.)
     if !matches!(code, KeyCode::Tab) {
@@ -341,6 +375,21 @@ fn handle_key(
                 KeybindAction::LoadSkill(skill) => {
                     InputAction::SlashCommand("load".to_string(), skill.clone())
                 }
+                // In a worker view the prompt goes to that worker, or is
+                // refused there; never submitted to main (prG R2).
+                KeybindAction::InjectPrompt(text) if super::watch::focused(app).is_some() => {
+                    match super::watch::steer_target(app) {
+                        Some(Ok(handle_id)) => InputAction::SubagentSteer {
+                            handle_id,
+                            text: text.clone(),
+                        },
+                        Some(Err(reason)) => {
+                            super::watch::steer_unavailable(app, reason);
+                            InputAction::None
+                        }
+                        None => InputAction::None,
+                    }
+                }
                 KeybindAction::InjectPrompt(text) => InputAction::Submit(text.clone()),
                 KeybindAction::Disabled => InputAction::None,
                 KeybindAction::RunScript { .. } => {
@@ -349,6 +398,76 @@ fn handle_key(
                 }
             };
         }
+    }
+    // Subagent thread views (super::watch). Ctrl-↑/↓ and Alt-↑/↓ (macOS
+    // takes Ctrl-↑/↓ for Mission Control) are reserved core keys (never
+    // plugin-bindable); they must precede the history arms below, which
+    // match Up/Down with any modifier.
+    let watching = super::watch::focused(app).is_some();
+    match (code, modifiers) {
+        (KeyCode::Up | KeyCode::Down, KeyModifiers::CONTROL | KeyModifiers::ALT) => {
+            let step = if code == KeyCode::Up {
+                super::watch::Step::Up
+            } else {
+                super::watch::Step::Down
+            };
+            super::watch::switch(app, step, std::time::Instant::now());
+            return InputAction::None;
+        }
+        // Esc in a worker view returns to main — it never aborts main's turn.
+        (KeyCode::Esc, _) if watching => {
+            super::watch::leave_on_esc(app, std::time::Instant::now());
+            return InputAction::None;
+        }
+        // ...nor does a double-tapped second Esc right after.
+        (KeyCode::Esc, _)
+            if streaming && super::watch::esc_guarded(app, std::time::Instant::now()) =>
+        {
+            return InputAction::None;
+        }
+        // Shift/Alt-Enter in a worker view only ever add a line: while main
+        // streams, the arms below would send the text to MAIN (04-tui I1).
+        (KeyCode::Enter, m) if watching && m.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) => {
+            app.editor.insert_newline();
+            return InputAction::None;
+        }
+        // Enter with text in a worker view steers that worker; slash
+        // commands still run as usual.
+        (KeyCode::Enter, _)
+            if watching && !app.input_is_empty() && !app.input_first_line().starts_with('/') =>
+        {
+            match super::watch::steer_target(app) {
+                Some(Ok(handle_id)) => return process_subagent_steer(app, handle_id),
+                Some(Err(reason)) => super::watch::steer_unavailable(app, reason),
+                None => super::watch::steer_unavailable(app, "this view has no subagent to steer".into()),
+            }
+            return InputAction::None;
+        }
+        // While main streams, an unknown `/word` would be sent to main as a
+        // steer; idle, a `/` with no command word would be sent to main as a
+        // prompt (prG R1). In a worker view both are refused there instead.
+        // Idle, a non-empty unknown `/word` still goes to the session (a
+        // newer daemon's command), and its answer lands in this view.
+        (KeyCode::Enter, _)
+            if watching
+                && !slash_is_known(app, registry)
+                && (streaming || slash_word(app).is_empty()) =>
+        {
+            let word = app.input_first_line().split_whitespace().next().unwrap_or("/").to_string();
+            super::watch::notice(app, format!("unknown command: {word}"));
+            return InputAction::None;
+        }
+        // Staged attachments are main's; an empty Enter here never sends them.
+        (KeyCode::Enter, _) if watching && app.input_is_empty() => {
+            if !app.pending_attachments.is_empty() {
+                super::watch::notice(
+                    app,
+                    "attachments go to the main thread \u{2014} Esc, then Enter sends them".into(),
+                );
+            }
+            return InputAction::None;
+        }
+        _ => {}
     }
     match (code, modifiers) {
         (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
@@ -419,8 +538,8 @@ fn handle_key(
         (KeyCode::Char('o'), KeyModifiers::CONTROL) => {
             // Store-owned toggle invalidates internally (locked decision #1);
             // App only signals the frame scheduler.
-            app.transcript
-                .set_show_full_output(!app.transcript.show_full_output());
+            let view = super::threads::active_mut(&mut app.transcript, &mut app.threads);
+            view.set_show_full_output(!view.show_full_output());
             app.request_redraw();
         }
         // Alt-←/→ word jumps: the lib maps Alt-b/f and Ctrl-←/→ but leaves
@@ -433,10 +552,10 @@ fn handle_key(
                 .move_cursor(tui_textarea::CursorMove::WordForward);
         }
         (KeyCode::Up, KeyModifiers::SHIFT) => {
-            app.transcript.scroll_up(1);
+            super::threads::active_mut(&mut app.transcript, &mut app.threads).scroll_up(1);
         }
         (KeyCode::Down, KeyModifiers::SHIFT) => {
-            app.transcript.scroll_down(1);
+            super::threads::active_mut(&mut app.transcript, &mut app.threads).scroll_down(1);
         }
         // Up/Down: history only at buffer edges (§3.3 DECIDED); inside a
         // multi-line buffer they move the cursor.
@@ -461,6 +580,35 @@ fn handle_key(
     InputAction::None
 }
 
+/// Whether the input is a `/command` the streaming dispatch would run or
+/// refuse, rather than send to the main agent as a steer (the same
+/// resolution as `dispatch`'s `StreamingInput` arm). Non-slash input: true.
+fn slash_is_known(app: &App, registry: &Arc<CommandRegistry>) -> bool {
+    if !app.input_first_line().starts_with('/') {
+        return true;
+    }
+    let raw = slash_word(app);
+    if raw.is_empty() {
+        return false;
+    }
+    let streaming = super::commands::to_owned_commands(super::commands::STREAMING_COMMANDS);
+    if super::commands::is_streaming_command(&super::commands::resolve_prefix(raw, &streaming)) {
+        return true;
+    }
+    let all = super::commands::all_commands_with_skills(registry);
+    let resolved = super::commands::resolve_prefix(raw, &all);
+    all.contains(&resolved)
+}
+
+/// The command word of `/word args` (empty for a bare `/`).
+fn slash_word(app: &App) -> &str {
+    let rest = app.input_first_line().strip_prefix('/').unwrap_or("");
+    if rest.starts_with(char::is_whitespace) {
+        return "";
+    }
+    rest.split_whitespace().next().unwrap_or("")
+}
+
 /// User pressed Enter with non-empty input while not streaming.
 fn process_submit(app: &mut App, registry: &Arc<CommandRegistry>) -> InputAction {
     let now = app.clock.now();
@@ -473,7 +621,10 @@ fn process_submit(app: &mut App, registry: &Arc<CommandRegistry>) -> InputAction
     app.history_index = None;
     app.input_stash.clear();
     app.clear_input();
-    app.transcript.scroll_to_bottom();
+    // Typed in a worker view, it is a command: main keeps its place (I2).
+    if super::watch::focused(app).is_none() {
+        app.transcript.scroll_to_bottom();
+    }
 
     if input.starts_with('/') && input.len() > 1 {
         let parts: Vec<&str> = input[1..].splitn(2, char::is_whitespace).collect();
@@ -511,6 +662,19 @@ fn process_streaming_submit(app: &mut App) -> InputAction {
     app.pasted_char_count = 0;
 
     InputAction::StreamingInput(input)
+}
+
+/// Enter in a worker view: same input bookkeeping as a submit, but the text
+/// goes to the watched subagent.
+fn process_subagent_steer(app: &mut App, handle_id: String) -> InputAction {
+    let text = app.input_text();
+    app.input_history.push(text.clone());
+    app.history_index = None;
+    app.input_stash.clear();
+    app.clear_input();
+    app.input_before_paste = None;
+    app.pasted_char_count = 0;
+    InputAction::SubagentSteer { handle_id, text }
 }
 
 /// P7.4 stack-routed pane handler for the `/help find` lightbox.
@@ -565,6 +729,29 @@ fn route_effort(event: Event, app: &mut App) -> InputAction {
                 InputAction::EffortApply(level)
             }
             super::effort::InputOutcome::None => InputAction::None,
+        };
+    }
+    InputAction::None
+}
+
+/// Stack-routed pane handler for the `/sessions` modal. `Close` drops the
+/// state, pops the stack and stops the poller ([`super::sessions::close`]);
+/// `Op` defers the daemon request to the async loop.
+fn route_sessions(event: Event, app: &mut App) -> InputAction {
+    // Invariant (checked by the tripwire): top() == Sessions ⇒ sessions is Some.
+    let Some(state) = &mut app.sessions else {
+        return InputAction::None;
+    };
+    if let Event::Key(key) = event {
+        return match super::sessions::handle_event(state, key) {
+            super::sessions::InputOutcome::Close => {
+                super::sessions::close(app);
+                InputAction::None
+            }
+            super::sessions::InputOutcome::Op(op) => InputAction::SessionsOp(op),
+            super::sessions::InputOutcome::Past(cmd) => InputAction::SessionsPast(cmd),
+            super::sessions::InputOutcome::Copy(text) => InputAction::CopyText(text),
+            super::sessions::InputOutcome::None => InputAction::None,
         };
     }
     InputAction::None
@@ -736,7 +923,14 @@ fn route_settings(
                 app.model_health.clone(),
             );
             snap.catalog_overrides = app.catalog_overrides.clone();
-            match super::settings::handle_event(state, key, &snap) {
+            let outcome = super::settings::handle_event(state, key, &snap);
+            if app.streaming {
+                if let Some(refusal) = super::settings::mid_turn_refusal(&outcome) {
+                    state.row_error = Some(refusal);
+                    return InputAction::None;
+                }
+            }
+            match outcome {
                 super::settings::InputOutcome::Close => {
                     app.settings = None;
                     app.modal_stack.pop();
@@ -901,22 +1095,69 @@ fn route_secret_prompt(event: Event, app: &mut App) -> InputAction {
         .active()
         .is_some_and(|p| p.kind == PromptKind::Confirm);
     if is_confirm {
-        // Confirm dialog: no free-text field. `y` answers "y" (allow);
-        // `n`, Esc and Enter (empty field) answer None (deny, fail-closed).
-        // Everything else — including pastes — is swallowed so nothing can
-        // accidentally form an allow.
+        // Confirm dialog: a button lightbox, no free-text field.
+        //   (guard)              → every key/paste is ignored until there has
+        //                          been 400 ms with no input: each ignored key
+        //                          restarts the guard, so typing that runs on
+        //                          past the dialog opening never answers it.
+        //                          Held-key repeats are always ignored.
+        //   y / Y                → Allow (answers "y")
+        //   n / N                → Deny  (answers None)
+        //   Esc                  → Deny, or cancel a pending "Allow all"
+        //   ← → Tab BackTab      → move focus (no wrap-around)
+        //   Enter                → activate the FOCUSED button; Deny is the
+        //                          default focus, so a bare Enter denies.
+        //                          On "Allow all" the first Enter only asks
+        //                          "Press Enter again…" (fresh 400 ms guard);
+        //                          the second Enter arms it.
+        // "Allow all" has no letter key. Everything else — including pastes
+        // — is swallowed so nothing can form an allow.
+        use synaps_cli::tools::ConfirmChoice;
+        let repeat = matches!(&event, Event::Key(k) if k.kind == crossterm::event::KeyEventKind::Repeat);
+        let typed = matches!(&event, Event::Key(_) | Event::Paste(_));
+        // Any typed event other than Enter/Esc cancels a pending "Allow
+        // all" — even when the guard swallows it (prA I-R4-4: keys typed
+        // right after the first Enter land inside its fresh guard).
+        let enter_or_esc = matches!(
+            &event,
+            Event::Key(k) if matches!(k.code, KeyCode::Enter | KeyCode::Esc)
+        );
+        if typed && !enter_or_esc {
+            app.secret_prompts.cancel_allow_all_pending();
+        }
+        if repeat || !app.secret_prompts.input_armed() {
+            // Only typing restarts the guard; mouse motion, resize or focus
+            // events must not keep the dialog dead.
+            if typed {
+                app.secret_prompts.restart_input_guard();
+            }
+            return InputAction::None;
+        }
         if let Event::Key(key) = event {
-            match key.code {
+            let answered = match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => {
-                    app.secret_prompts.push_char('y');
-                    app.secret_prompts.submit();
-                    reconcile_secret_prompt(app);
+                    app.secret_prompts.confirm_answer(ConfirmChoice::Allow)
                 }
-                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Enter => {
-                    app.secret_prompts.cancel();
-                    reconcile_secret_prompt(app);
+                KeyCode::Esc if app.secret_prompts.cancel_allow_all_pending() => None,
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    app.secret_prompts.confirm_answer(ConfirmChoice::Deny)
                 }
-                _ => {}
+                KeyCode::Enter => app.secret_prompts.confirm_activate_focused(),
+                KeyCode::Right | KeyCode::Tab => {
+                    app.secret_prompts.move_confirm_focus(true);
+                    None
+                }
+                KeyCode::Left | KeyCode::BackTab => {
+                    app.secret_prompts.move_confirm_focus(false);
+                    None
+                }
+                _ => None,
+            };
+            // Arming "Allow all" is announced by the session actor as a
+            // SystemNotice to every attached client (this one included), so
+            // nothing is printed locally.
+            if answered.is_some() {
+                reconcile_secret_prompt(app);
             }
         }
         return InputAction::None;
@@ -1189,6 +1430,77 @@ mod tests {
     }
 
     /// Shift-Enter inserts a newline into the buffer instead of submitting.
+    /// A plugin keybind that injects `prompt`, pressed with Ctrl-Shift-P.
+    fn press_inject(app: &mut App, prompt: &str) -> InputAction {
+        let registry = Arc::new(CommandRegistry::new(&[], vec![]));
+        let mut keybinds = synaps_cli::skills::keybinds::KeybindRegistry::new();
+        keybinds.register_plugin(
+            "p",
+            &[synaps_cli::skills::keybinds::ManifestKeybind {
+                key: "C-S-p".into(),
+                action: "inject_prompt".into(),
+                command: None,
+                skill: None,
+                prompt: Some(prompt.into()),
+                script: None,
+                description: None,
+            }],
+            std::path::Path::new("/tmp"),
+        );
+        let mods = KeyModifiers::CONTROL | KeyModifiers::SHIFT;
+        handle_key(crossterm::event::KeyEvent::new(KeyCode::Char('p'), mods), app, false, &registry, &keybinds)
+    }
+
+    /// prG R2: plugin keybinds are checked before the worker-view handling,
+    /// so an inject-prompt bind pressed in a worker view submitted to MAIN.
+    /// It steers the watched worker instead, or is refused in its view.
+    #[test]
+    fn an_inject_prompt_keybind_in_a_worker_view_never_submits_to_main() {
+        let mut app = make_app();
+        assert!(
+            matches!(press_inject(&mut app, "run the tests"), InputAction::Submit(t) if t == "run the tests"),
+            "on main it submits, as before"
+        );
+        let clock = app.clock.clone();
+        let w = app.threads.open_worker("sa_1", 1, "scout", clock, (0, 0));
+        w.status = "running".into();
+        w.steerable = true;
+        app.threads.focus_worker("sa_1");
+        assert!(matches!(
+            press_inject(&mut app, "run the tests"),
+            InputAction::SubagentSteer { handle_id, text } if handle_id == "sa_1" && text == "run the tests"
+        ));
+        let w = app.threads.worker_mut("sa_1").unwrap();
+        w.status = "completed".into();
+        w.steerable = false;
+        assert!(matches!(press_inject(&mut app, "run the tests"), InputAction::None));
+        let note = app.threads.worker("sa_1").unwrap().store.messages().last().map(|m| match &m.msg {
+            ChatMessage::System(t) => t.clone(),
+            _ => String::new(),
+        });
+        assert!(note.unwrap_or_default().contains("read-only"), "refused in the view");
+    }
+
+    /// 04-tui I1: in a worker view, Enter on an empty box with staged
+    /// attachments fell through to the attachment-only submit, to MAIN.
+    #[test]
+    fn enter_with_only_attachments_in_a_worker_view_sends_nothing_to_main() {
+        let mut app = make_app();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.txt");
+        std::fs::write(&path, "hi").unwrap();
+        let file = agent_engine::attachments::load_attachment_sync(&path).unwrap();
+        app.pending_attachments.add(file).unwrap();
+        let clock = app.clock.clone();
+        app.threads.open_worker("sa_1", 1, "scout", clock, (0, 0));
+        app.threads.focus_worker("sa_1");
+        assert!(matches!(
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE),
+            InputAction::None
+        ));
+        assert_eq!(app.pending_attachments.len(), 1, "still staged for main");
+    }
+
     #[test]
     fn shift_enter_inserts_newline() {
         let mut app = make_app();

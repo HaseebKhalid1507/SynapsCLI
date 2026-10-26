@@ -269,6 +269,9 @@ pub async fn execute_provider_tool_use(
         .await,
         ctx.capabilities.secret_prompt.as_ref(),
         false,
+        // The session's latch, so "Allow all" here arms (and honours) the
+        // same per-extension consent as the main tool path.
+        ctx.capabilities.session_allow_all.as_deref(),
     )
     .await;
 
@@ -705,12 +708,31 @@ pub struct ProcessExtension {
     /// crashed extension still reads Degraded instead of pretending it
     /// never crashed.
     total_restarts: AtomicUsize,
+    /// Set by [`ExtensionHandler::shutdown`] (unload, reload, lease
+    /// teardown), never cleared: a stopped handler must not respawn. A call
+    /// authorized against it before the stop (a tool call batched with the
+    /// `reload-extension` that replaces it) would otherwise take the
+    /// empty-state restart path and run a second copy of the extension
+    /// beside its replacement.
+    stopped: AtomicBool,
     /// Restart policy controlling exponential backoff and budget.
     pub(crate) restart_policy: RestartPolicy,
     /// Shared mailbox between the reader task and request callers. Persists
     /// across process restarts so that any active notification subscriber
     /// survives a restart-on-error.
     inbox: Arc<Inbox>,
+}
+
+/// Prefix the reader task gives every JSON-RPC `error` response from the
+/// extension. Such an error proves the process is alive and answering, so the
+/// call-with-restart path must return it verbatim instead of restarting.
+pub(crate) const APPLICATION_ERROR_PREFIX: &str = "Extension error: ";
+
+/// Whether a call error is an application-level JSON-RPC error (the process
+/// answered) rather than a transport failure (EOF, write error, dropped
+/// response channel, timeout).
+pub(crate) fn is_application_error(error: &str) -> bool {
+    error.starts_with(APPLICATION_ERROR_PREFIX)
 }
 
 impl ProcessExtension {
@@ -778,6 +800,7 @@ impl ProcessExtension {
             restart_count: AtomicUsize::new(0),
             initialize_config: Mutex::new(Value::Object(Default::default())),
             total_restarts: AtomicUsize::new(0),
+            stopped: AtomicBool::new(false),
             restart_policy: RestartPolicy::default(),
             inbox,
         })
@@ -1156,7 +1179,7 @@ impl ProcessExtension {
                             .and_then(Value::as_str)
                             .unwrap_or("unknown extension error")
                             .to_string();
-                        Err(format!("Extension error: {}", message))
+                        Err(format!("{APPLICATION_ERROR_PREFIX}{}", message))
                     } else {
                         Ok(value.get("result").cloned().unwrap_or(Value::Null))
                     };
@@ -1599,6 +1622,12 @@ impl ProcessExtension {
     }
 
     async fn restart_locked(&self, state: &mut Option<ProcessState>) -> Result<(), String> {
+        if self.stopped.load(Ordering::Acquire) {
+            return Err(format!(
+                "Extension '{}' was stopped (unloaded or reloaded); not respawning it",
+                self.id,
+            ));
+        }
         self.inbox.invalidate_lifecycle().await;
         let attempted = self.restart_count.fetch_add(1, Ordering::Relaxed) + 1;
         self.total_restarts.fetch_add(1, Ordering::Relaxed);
@@ -1814,6 +1843,7 @@ impl ProcessExtension {
         &self,
         name: &str,
         input: Value,
+        session_id: Option<&str>,
     ) -> Result<Value, String> {
         let fut = async {
             let _call_guard = self.call_lock.lock().await;
@@ -1835,7 +1865,7 @@ impl ProcessExtension {
                 .call_once_locked(
                     &mut state,
                     "tool.call",
-                    serde_json::json!({"name": name, "input": input}),
+                    tool_call_params(name, input, session_id),
                     id,
                 )
                 .await;
@@ -1903,6 +1933,15 @@ impl ProcessExtension {
                 // crashes hours apart don't accumulate toward disable.
                 self.restart_count.store(0, Ordering::Relaxed);
                 Ok(value)
+            }
+            Err(first_error) if is_application_error(&first_error) => {
+                // The process answered with a JSON-RPC `error` object
+                // (unknown method, invalid params, a tool refusing its
+                // input). That is a live, healthy transport — restarting
+                // would only re-spawn the process to hear the same answer
+                // again, so it also counts as a real recovery.
+                self.restart_count.store(0, Ordering::Relaxed);
+                Err(first_error)
             }
             Err(first_error) => {
                 self.restart_locked(&mut state_guard).await?;
@@ -2105,6 +2144,33 @@ impl ProcessExtension {
     }
 }
 
+/// `tool.call` params. `session_id` is the owning conversation id, `null`
+/// for workers/no conversation and under the `SYNAPS_HOOK_SESSION_ID=0`
+/// kill switch, so plugins can key tool state on the same value the hook
+/// events carry. Always present (`null`, never omitted), like hook fields.
+pub(crate) fn tool_call_params(name: &str, input: Value, session_id: Option<&str>) -> Value {
+    tool_call_params_gated(
+        name,
+        input,
+        session_id,
+        crate::extensions::hooks::events::hook_session_id_enabled(),
+    )
+}
+
+fn tool_call_params_gated(
+    name: &str,
+    input: Value,
+    session_id: Option<&str>,
+    session_id_enabled: bool,
+) -> Value {
+    let session_id = if session_id_enabled { session_id } else { None };
+    serde_json::json!({
+        "name": name,
+        "input": input,
+        "session_id": session_id,
+    })
+}
+
 #[async_trait]
 impl ExtensionHandler for ProcessExtension {
     fn id(&self) -> &str {
@@ -2117,14 +2183,17 @@ impl ExtensionHandler for ProcessExtension {
     }
 
     async fn call_tool(&self, name: &str, input: Value) -> Result<Value, String> {
-        self.call(
-            "tool.call",
-            serde_json::json!({
-                "name": name,
-                "input": input,
-            }),
-        )
-        .await
+        self.call_tool_for(name, input, None).await
+    }
+
+    async fn call_tool_for(
+        &self,
+        name: &str,
+        input: Value,
+        session_id: Option<&str>,
+    ) -> Result<Value, String> {
+        self.call("tool.call", tool_call_params(name, input, session_id))
+            .await
     }
 
     async fn provider_complete(
@@ -2416,6 +2485,9 @@ impl ExtensionHandler for ProcessExtension {
     }
 
     async fn shutdown(&self) {
+        // Terminal before anything else: a call already past authorization
+        // must find this handler stopped, not respawn it (`restart_locked`).
+        self.stopped.store(true, Ordering::Release);
         self.inbox.invalidate_lifecycle().await;
         // Lease teardown is terminal for this ProcessExtension. In
         // particular, a concurrent force_shutdown may already have removed
@@ -2494,6 +2566,33 @@ mod exclusive_memory_tests {
             .await;
             assert!(result.unwrap_err().1.contains("disabled"));
         }
+    }
+}
+
+#[cfg(test)]
+mod tool_call_params_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn carries_caller_session_id() {
+        assert_eq!(
+            tool_call_params_gated("echo", json!({"text": "hi"}), Some("sess-A"), true),
+            json!({"name": "echo", "input": {"text": "hi"}, "session_id": "sess-A"})
+        );
+    }
+
+    #[test]
+    fn worker_call_has_null_session_id_key() {
+        let params = tool_call_params_gated("echo", json!({}), None, true);
+        assert_eq!(params.get("session_id"), Some(&Value::Null));
+    }
+
+    #[test]
+    fn kill_switch_forces_null() {
+        let params = tool_call_params_gated("echo", json!({}), Some("sess-A"), false);
+        assert_eq!(params.get("session_id"), Some(&Value::Null));
+        assert_eq!(params["name"], json!("echo"));
     }
 }
 
@@ -3007,6 +3106,77 @@ done"#
         ext
     }
 
+    /// Offline fixture that answers `initialize` normally and every other
+    /// method with a JSON-RPC `-32601` error object (a live, healthy process
+    /// that simply lacks the method — e.g. the optional `info.get` probe).
+    async fn unknown_method_fixture() -> ProcessExtension {
+        let init = serde_json::json!({
+            "protocol_version": CURRENT_EXTENSION_PROTOCOL_VERSION,
+            "capabilities": {}
+        })
+        .to_string();
+        let script = format!(
+            r#"while IFS= read -r header; do
+    length=${{header#Content-Length: }}
+    length=${{length%?}}
+    IFS= read -r blank || exit 1
+    body=$(dd bs=1 count="$length" 2>/dev/null) || exit 1
+    id=${{body##*\"id\":}}
+    id=${{id%%[!0-9]*}}
+    case "$body" in
+        *'"method":"initialize"'*) reply='{{"jsonrpc":"2.0","id":'"$id"',"result":{init}}}' ;;
+        *) reply='{{"jsonrpc":"2.0","id":'"$id"',"error":{{"code":-32601,"message":"unknown method"}}}}' ;;
+    esac
+    printf 'Content-Length: %s
+
+%s' "${{#reply}}" "$reply"
+done"#
+        );
+        let ext =
+            ProcessExtension::spawn("unknown-method-fixture", "/bin/sh", &["-c".into(), script])
+                .await
+                .expect("spawn offline unknown-method fixture");
+        tokio::time::timeout(Duration::from_secs(3), ext.initialize_for_test(None))
+            .await
+            .expect("bounded initialize")
+            .expect("initialize fixture");
+        ext
+    }
+
+    /// A JSON-RPC `error` reply proves the process is alive: the call must
+    /// surface it verbatim, with no restart, no generation change and no
+    /// consumption of the restart budget. (Regression: the optional
+    /// `info.get` probe used to re-spawn every tool-bearing extension at
+    /// boot just to hear "unknown method" a second time.)
+    #[tokio::test]
+    async fn application_error_reply_never_restarts_the_process() {
+        let ext = unknown_method_fixture().await;
+        let before = ext.lifecycle_snapshot().unwrap();
+        for method in ["info.get", "sidecar.spawn_args", "no.such.method"] {
+            let error = tokio::time::timeout(Duration::from_secs(3), ext.call(method, Value::Null))
+                .await
+                .expect("bounded call")
+                .expect_err("fixture answers every non-initialize method with an error");
+            assert!(is_application_error(&error), "{method}: {error}");
+            assert!(error.contains("unknown method"), "{method}: {error}");
+            assert!(
+                !error.contains("retry after restart failed"),
+                "{method}: must not restart on an application error: {error}"
+            );
+        }
+        assert_eq!(ext.total_restarts.load(Ordering::Relaxed), 0);
+        assert_eq!(ext.restart_count.load(Ordering::Relaxed), 0);
+        let after = ext.lifecycle_snapshot().unwrap();
+        assert_eq!(after.generation, before.generation);
+        assert_eq!(after.health, before.health);
+        // Transport failures still take the restart path.
+        assert!(!is_application_error(
+            "transport closed: response channel dropped"
+        ));
+        assert!(!is_application_error("Write error: broken pipe"));
+        ext.force_shutdown().await;
+    }
+
     async fn wait_failed(ext: &ProcessExtension) -> ExtensionLifecycle {
         tokio::time::timeout(Duration::from_secs(3), async {
             loop {
@@ -3078,6 +3248,22 @@ done"#
             .expect("bounded shutdown")
             .expect("shutdown task");
         assert_eq!(ext.lifecycle_snapshot(), Some(dead));
+    }
+
+    /// A call that reaches a handler after `shutdown` (it was authorized
+    /// before an unload or reload) fails; it must not respawn the process
+    /// and run a second copy beside the replacement.
+    #[tokio::test]
+    async fn a_call_after_shutdown_fails_without_respawning() {
+        let ext = fixture().await;
+        ext.shutdown().await;
+        let err = ext
+            .call_inner("tool.call", serde_json::json!({}))
+            .await
+            .expect_err("a stopped handler must refuse the call");
+        assert!(err.contains("was stopped"), "{err}");
+        assert!(ext.state.lock().await.is_none(), "no process was respawned");
+        assert_eq!(ext.total_restarts.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]

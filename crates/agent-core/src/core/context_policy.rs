@@ -133,7 +133,16 @@ impl ContextThresholds {
         context_window_tokens: u64,
     ) -> Result<Self, &'static str> {
         config.validate_for_window(context_window_tokens)?;
-        let window = context_window_tokens;
+        let (pressure_tokens, rollover_tokens) = Self::bands(config, context_window_tokens);
+        Ok(Self {
+            pressure_tokens,
+            rollover_tokens,
+        })
+    }
+
+    /// Unvalidated (pressure, rollover) after applying overrides. Callers
+    /// outside validation must use [`Self::resolve`].
+    pub(crate) fn bands(config: &ContextManagementConfig, window: u64) -> (u64, u64) {
         let (pressure, rollover) = if window <= 200_000 {
             ((window * 7 / 10).max(1), (window * 9 / 10).max(2))
         } else if window < 1_000_000 {
@@ -145,19 +154,28 @@ impl ContextThresholds {
         } else {
             (250_000, 400_000)
         };
-        let (pressure_tokens, rollover_tokens) =
-            match (config.pressure_tokens, config.rollover_tokens) {
-                (Some(p), Some(r)) => (p, r),
-                (Some(p), None) => (p, rollover.max(p + 1)),
-                (None, Some(r)) => (pressure.min(r - 1), r),
-                (None, None) => (pressure, rollover),
-            };
-        Ok(Self {
-            pressure_tokens,
-            rollover_tokens,
-        })
+        match (config.pressure_tokens, config.rollover_tokens) {
+            (Some(p), Some(r)) => (p, r),
+            (Some(p), None) => (p, rollover.max(p + 1)),
+            (None, Some(r)) => (pressure.min(r.saturating_sub(1)).max(1), r),
+            (None, None) => (pressure, rollover),
+        }
+    }
+
+    /// Footprint a rollover successor should aim for: the explicit
+    /// `target_tokens` (validated below pressure), otherwise
+    /// min(100,000, 2/3 of pressure) so small windows scale down and a fresh
+    /// successor never starts inside the pressure band.
+    pub fn target_tokens(&self, config: &ContextManagementConfig) -> u64 {
+        config
+            .target_tokens
+            .unwrap_or_else(|| DEFAULT_TARGET_TOKENS.min(self.pressure_tokens * 2 / 3))
+            .clamp(1, self.pressure_tokens.saturating_sub(1).max(1))
     }
 }
+
+/// Default successor footprint: a rolled-over context starts at about 100k.
+pub const DEFAULT_TARGET_TOKENS: u64 = 100_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContextBand {
@@ -404,6 +422,43 @@ mod tests {
             allowed.next_state.finish_rounds_used(),
             config.finish_rounds
         );
+    }
+
+    #[test]
+    fn successor_target_defaults_to_100k_and_scales_below_small_pressure() {
+        let config = auto_config();
+        for (window, target) in [
+            (1_000_000, 100_000),
+            (2_000_000, 100_000),
+            (200_000, 93_333),
+            (32_000, 14_933),
+        ] {
+            let t = ContextThresholds::resolve(&config, window).unwrap();
+            assert_eq!(t.target_tokens(&config), target, "window {window}");
+            assert!(t.target_tokens(&config) < t.pressure_tokens);
+        }
+        let explicit = ContextManagementConfig {
+            target_tokens: Some(120_000),
+            ..config
+        };
+        let t = ContextThresholds::resolve(&explicit, 1_000_000).unwrap();
+        assert_eq!(t.target_tokens(&explicit), 120_000);
+        for bad in [Some(0), Some(250_000), Some(300_000)] {
+            let invalid = ContextManagementConfig {
+                target_tokens: bad,
+                ..config
+            };
+            assert!(
+                ContextThresholds::resolve(&invalid, 1_000_000).is_err(),
+                "{bad:?}"
+            );
+        }
+        // Explicit target must clear the effective (scaled) pressure too.
+        let small = ContextManagementConfig {
+            target_tokens: Some(100_000),
+            ..config
+        };
+        assert!(ContextThresholds::resolve(&small, 128_000).is_err());
     }
 
     #[test]

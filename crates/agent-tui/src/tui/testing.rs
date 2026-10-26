@@ -64,6 +64,9 @@ pub mod tape;
 /// `Runtime`; envelopes fed by tests).
 #[path = "testing/scripted.rs"]
 pub mod scripted;
+/// A scripted daemon answering `/sessions` switches (`use_fake_daemon`).
+#[path = "testing/fake_daemon.rs"]
+pub mod fake_daemon;
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 use ratatui::backend::{CrosstermBackend, TestBackend};
@@ -111,7 +114,12 @@ pub struct TestHarness {
     /// Structured queue of dispatched slash commands awaiting the P6.3
     /// bounded async drive ([`Self::drive_slash_commands`]).
     pending_slash: Vec<(String, String)>,
+    /// Lines typed while streaming, awaiting [`Self::drive_streaming_input`].
+    pending_streaming: Vec<String>,
     quit_requested: bool,
+    /// When set, `/sessions` switches go through this scripted daemon; when
+    /// not, the harness behaves as an in-process TUI (no daemon).
+    fake_daemon: Option<fake_daemon::FakeDaemon>,
 }
 
 /// Hard upper bound on any single bounded async drive (P6.3). A slash
@@ -145,6 +153,20 @@ fn block_on_bounded<F: std::future::Future>(what: &str, fut: F) -> F::Output {
     })
 }
 
+/// The fixed "now" the harness pins the /sessions modal to.
+pub fn sessions_test_now() -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::<chrono::Utc>::from_timestamp(1_800_000_000, 0).unwrap_or_default()
+}
+
+impl Drop for TestHarness {
+    fn drop(&mut self) {
+        // `set_build_id` is per harness, not per thread.
+        super::header::set_build_id_for_thread(None);
+        // Same for the injected terminal default bg.
+        super::theme::set_terminal_default_bg_for_thread(None);
+    }
+}
+
 impl TestHarness {
     /// Boot a headless App at the default 80x24 geometry.
     pub fn boot() -> Self {
@@ -158,6 +180,12 @@ impl TestHarness {
         // Determinism: `App::new` resolves agent_name from the user config —
         // pin it so snapshots don't vary per machine.
         app.agent_name = "agent".to_string();
+        // Determinism: a fresh session's id is a timestamp plus a random
+        // suffix, and the header shows it when the session has no name or
+        // title — pin it so replays are byte-identical across boots.
+        app.session.id = "test-session".to_string();
+        // Determinism: the header shows the working folder.
+        app.header_folder = "~/Projects/SynapsCLI".to_string();
         // Skip the boot animation; a fixed frame beats a time-parametric one.
         app.logo_build_t = None;
 
@@ -187,7 +215,9 @@ impl TestHarness {
             size: Size::new(cols, rows),
             actions: Vec::new(),
             pending_slash: Vec::new(),
+            pending_streaming: Vec::new(),
             quit_requested: false,
+            fake_daemon: None,
         }
     }
 
@@ -240,10 +270,106 @@ impl TestHarness {
             3,
         );
         self.record(action);
+        // Production drains a /sessions switch right after the input action.
+        self.drive_session_switch();
+        self
+    }
+
+    // ── /sessions switching ──────────────────────────────────────────────────
+
+    /// Put a scripted daemon behind `/sessions` switching (and return a
+    /// handle to stage its sessions / read what was sent).
+    pub fn use_fake_daemon(&mut self) -> fake_daemon::FakeDaemon {
+        let d = fake_daemon::FakeDaemon::default();
+        self.fake_daemon = Some(d.clone());
+        d
+    }
+
+    /// Select a Live row by session id (what ↑/↓ would land on).
+    pub fn sessions_select(&mut self, id: &str) -> &mut Self {
+        if let Some(st) = self.app.sessions.as_mut() {
+            st.selected = Some(id.to_string());
+        }
+        self
+    }
+
+    /// Subagent rows in the tray (`app.subagents`).
+    pub fn subagent_count(&self) -> usize {
+        self.app.subagents.len()
+    }
+
+    /// The queued (steer) message the footer shows, if any.
+    pub fn queued_message(&self) -> Option<String> {
+        self.app.queued_message.clone()
+    }
+
+    /// The header's session name.
+    pub fn session_name(&self) -> Option<String> {
+        self.app.session.name.clone()
+    }
+
+    /// What the Past tab's Enter does: ask to continue a saved journal.
+    pub fn request_continue(&mut self, journal_id: &str) -> &mut Self {
+        self.request_continue_in(journal_id, None)
+    }
+
+    /// [`Self::request_continue`] with the journal's folder.
+    pub fn request_continue_in(
+        &mut self,
+        journal_id: &str,
+        cwd: Option<std::path::PathBuf>,
+    ) -> &mut Self {
+        if let Some(st) = self.app.sessions.as_mut() {
+            st.pending_switch = Some(super::sessions::SwitchTarget::Continue {
+                journal_id: journal_id.to_string(),
+                cwd,
+            });
+        }
+        self.drive_session_switch()
+    }
+
+    /// The header's folder label.
+    pub fn header_folder(&self) -> String {
+        self.app.header_folder.clone()
+    }
+
+    /// Drain a pending `/sessions` switch through the production
+    /// `sessions::switch::perform` (bounded), as the run loop does.
+    pub fn drive_session_switch(&mut self) -> &mut Self {
+        let Some(target) = self.app.sessions.as_mut().and_then(|s| s.pending_switch.take()) else {
+            return self;
+        };
+        let render_handle = super::render_thread::RenderHandle::headless();
+        let daemon = self.fake_daemon.clone();
+        block_on_bounded(
+            "sessions::switch::perform",
+            super::sessions::switch::perform(
+                &mut self.app,
+                &mut self.link,
+                &mut self.prompt_bridge,
+                target,
+                daemon.as_ref().map(|d| d as &dyn super::sessions::switch::Connector),
+                &self.registry,
+                &render_handle,
+            ),
+        );
+        // `sent_commands` follows the session now on screen.
+        let id = self.link.transport().session_id().0.clone();
+        if let Some(log) = daemon.as_ref().and_then(|d| d.log_of(&id)) {
+            self.scripted_log = log;
+        }
         self
     }
 
     // ── Render / assertion surface ───────────────────────────────────────────
+
+    /// Pretend the terminal answered OSC 11 with `bg` (or, with `None`, that
+    /// it never answered). Per thread, like [`TestHarness::set_build_id`], so
+    /// the process-global detected bg is never written by tests.
+    pub fn set_terminal_bg(&mut self, bg: Option<(u8, u8, u8)>) -> &mut Self {
+        super::theme::set_terminal_default_bg_for_thread(Some(bg));
+        self
+    }
 
     /// Advance to steady state and render one frame into the [`TestBackend`].
     ///
@@ -455,6 +581,180 @@ impl TestHarness {
         self
     }
 
+    /// Open the `/sessions` modal the way dispatch does. `socket = None` is
+    /// the in-process TUI; `Some(_)` puts the Live tab in daemon mode
+    /// ("asking the daemon…") — the harness has no runtime, so no poller
+    /// runs: feed answers with [`Self::sessions_feed_live`].
+    pub fn open_sessions_with(&mut self, socket: Option<std::path::PathBuf>) -> &mut Self {
+        let own = super::sessions::own_row(&self.app, &self.link);
+        super::sessions::open_with(&mut self.app, own, socket);
+        if let Some(st) = self.app.sessions.as_mut() {
+            // Determinism: relative times and `~` are drawn against these.
+            st.now = sessions_test_now();
+            st.home = Some(std::path::PathBuf::from("/home/u"));
+            st.past.clock = Some(agent_core::session_catalog::Clock::fixed(
+                sessions_test_now(),
+                chrono::FixedOffset::east_opt(0).expect("utc"),
+            ));
+        }
+        self
+    }
+
+    /// The id of this harness's own session (as the Live tab sees it).
+    pub fn own_session_id(&self) -> String {
+        self.link.transport().session_id().0.clone()
+    }
+
+    /// Deliver a daemon list answer through the production arm logic
+    /// (`SessionsState::apply`), as the poller would.
+    pub fn sessions_feed_live(
+        &mut self,
+        result: Result<Vec<agent_engine::session::SessionMeta>, String>,
+    ) -> &mut Self {
+        let own = super::sessions::own_row(&self.app, &self.link);
+        if let Some(st) = self.app.sessions.as_mut() {
+            let gen = st.gen;
+            st.apply(super::sessions::SessionsMsg::Live { gen, result }, || own);
+            st.now = sessions_test_now();
+        }
+        self
+    }
+
+    /// Deliver a pin book read (every entry), as the poller would.
+    pub fn sessions_feed_pins(&mut self, pins: Vec<agent_engine::daemon::pins::PinEntry>) -> &mut Self {
+        if let Some(st) = self.app.sessions.as_mut() {
+            let gen = st.gen;
+            st.apply(super::sessions::SessionsMsg::Pins { gen, pins }, || unreachable!());
+        }
+        self
+    }
+
+    /// Load a Past catalog from a fixture sessions dir (+ index) the way the
+    /// background loader does — headers, then a synchronous preview refresh
+    /// into a cache file inside `dir`'s parent — and deliver it.
+    pub fn sessions_feed_catalog_dir(&mut self, dir: &std::path::Path, index: &std::path::Path) -> &mut Self {
+        use agent_core::session_catalog::{load_catalog, CatalogPaths, PreviewCache};
+        let paths = CatalogPaths {
+            sessions_dir: dir.to_path_buf(),
+            index_path: index.to_path_buf(),
+            cache_path: dir.with_file_name("catalog-test-previews.json"),
+        };
+        let mut cat = load_catalog(&paths).expect("fixture catalog");
+        let mut cache = PreviewCache::default();
+        let no = std::sync::atomic::AtomicBool::new(false);
+        cache.refresh(dir, &cat.entries, &no, &mut |_, _| {});
+        cat.apply_previews(&cache);
+        if let Some(st) = self.app.sessions.as_mut() {
+            let gen = st.gen;
+            let msg = super::sessions::past::PastMsg::Catalog(Ok(std::sync::Arc::new(cat)));
+            st.apply(super::sessions::SessionsMsg::Past { gen, msg }, || unreachable!());
+        }
+        self
+    }
+
+    /// Past rows in display order (session ids; deep mode: hit session ids).
+    pub fn sessions_past_rows(&self) -> Vec<String> {
+        let Some(st) = self.app.sessions.as_ref() else { return Vec::new() };
+        let p = &st.past;
+        match &p.deep {
+            Some(d) => d.hits.iter().map(|h| h.id.clone()).collect(),
+            None => p.derived.view.rows.iter().map(|&i| p.entries[i].id.clone()).collect(),
+        }
+    }
+
+    /// The cwd a Past `enter` asked to continue in (outer `None`: no
+    /// Continue pending; inner `None`: cwd unknown).
+    pub fn sessions_pending_continue_cwd(&self) -> Option<Option<std::path::PathBuf>> {
+        match self.app.sessions.as_ref()?.pending_switch.as_ref()? {
+            super::sessions::SwitchTarget::Continue { cwd, .. } => Some(cwd.clone()),
+            super::sessions::SwitchTarget::Attach { .. } => None,
+        }
+    }
+
+    /// The journal id a Past `enter` asked to continue, if any.
+    pub fn sessions_pending_continue(&self) -> Option<String> {
+        match self.app.sessions.as_ref()?.pending_switch.as_ref()? {
+            super::sessions::SwitchTarget::Continue { journal_id, .. } => Some(journal_id.clone()),
+            super::sessions::SwitchTarget::Attach { .. } => None,
+        }
+    }
+
+    /// Deliver a rename answer for the open rename popup.
+    pub fn sessions_feed_rename(&mut self, result: Result<(), String>) -> &mut Self {
+        if let Some(st) = self.app.sessions.as_mut() {
+            let gen = st.gen;
+            let Some(r) = st.past.rename.as_ref() else { return self };
+            let (id, name) = (r.id.clone(), Some(r.buffer.trim().to_string()).filter(|n| !n.is_empty()));
+            let msg = super::sessions::past::PastMsg::Renamed { id, name, result };
+            st.apply(super::sessions::SessionsMsg::Past { gen, msg }, || unreachable!());
+        }
+        self
+    }
+
+    /// Whether the Past rename popup is up, and its inline error.
+    pub fn sessions_rename_state(&self) -> Option<(String, Option<String>)> {
+        let r = self.app.sessions.as_ref()?.past.rename.as_ref()?;
+        Some((r.buffer.clone(), r.error.clone()))
+    }
+
+    /// Deliver a pin/close answer for the in-flight op.
+    pub fn sessions_feed_op(&mut self, result: Result<String, String>) -> &mut Self {
+        if let Some(st) = self.app.sessions.as_mut() {
+            let gen = st.gen;
+            let op = st.pending.clone().unwrap_or(super::sessions::SessionsOp::Pin { id: String::new(), on: true });
+            st.apply(super::sessions::SessionsMsg::OpDone { gen, op, result }, || unreachable!());
+        }
+        self
+    }
+
+    /// Deliver the answer for an op named by `kind` (`pin`, `unpin`,
+    /// `clear-pin`, `pin-past`) on `id`, as `spawn_op`'s task would.
+    pub fn sessions_feed_op_for(&mut self, kind: &str, id: &str, result: Result<String, String>) -> &mut Self {
+        use super::sessions::SessionsOp;
+        let id = id.to_string();
+        let op = match kind {
+            "pin" => SessionsOp::Pin { id, on: true },
+            "unpin" => SessionsOp::Pin { id, on: false },
+            "clear-pin" => SessionsOp::ClearPin { id },
+            "pin-past" => SessionsOp::PinPast { journal_id: id, cwd: None },
+            other => panic!("unknown op kind {other}"),
+        };
+        if let Some(st) = self.app.sessions.as_mut() {
+            let gen = st.gen;
+            st.apply(super::sessions::SessionsMsg::OpDone { gen, op, result }, || unreachable!());
+        }
+        self
+    }
+
+    /// Mark a pin/close as in flight (what `spawn_op` does before its task).
+    pub fn sessions_mark_pending(&mut self, op_close_id: &str) -> &mut Self {
+        if let Some(st) = self.app.sessions.as_mut() {
+            let label = st
+                .live
+                .iter()
+                .find(|m| m.id.0 == op_close_id)
+                .map(super::sessions::label)
+                .unwrap_or_else(|| op_close_id.to_string());
+            st.pending = Some(super::sessions::SessionsOp::Close { id: op_close_id.to_string(), label });
+        }
+        self
+    }
+
+    /// Whether the /sessions modal is open.
+    pub fn sessions_open(&self) -> bool {
+        self.app.sessions.is_some()
+    }
+
+    /// Whether the close-confirm popup is up.
+    pub fn sessions_confirm_open(&self) -> bool {
+        self.app.sessions.as_ref().is_some_and(|s| s.confirm.is_some())
+    }
+
+    /// The inline notice line, if any.
+    pub fn sessions_notice(&self) -> Option<String> {
+        self.app.sessions.as_ref().and_then(|s| s.notice.as_ref().map(|n| n.text.clone()))
+    }
+
     /// Open the models modal directly.
     pub fn open_models_modal(&mut self) -> &mut Self {
         self.app.models = Some(super::models::ModelsModalState::new());
@@ -499,6 +799,37 @@ impl TestHarness {
         title: &str,
         prompt: &str,
     ) -> tokio::sync::oneshot::Receiver<Option<String>> {
+        self.activate_prompt_scoped(kind, title, prompt, None)
+    }
+
+    /// Inject an extension tool-call confirm (`Confirm tool call`) raised by
+    /// `extension` for `tool`, exactly as the runtime builds it: the scope
+    /// is what makes "Allow all from <ext>" available.
+    pub fn activate_tool_call_confirm(
+        &mut self,
+        extension: &str,
+        tool: &str,
+        prompt: &str,
+    ) -> tokio::sync::oneshot::Receiver<Option<String>> {
+        self.activate_prompt_scoped(
+            synaps_cli::tools::PromptKind::Confirm,
+            agent_engine::session::CONFIRM_PROMPT_TITLE,
+            prompt,
+            Some(agent_engine::session::ConfirmScope {
+                extensions: vec![extension.to_string()],
+                tool: Some(tool.to_string()),
+                rewritten_by: vec![],
+            }),
+        )
+    }
+
+    fn activate_prompt_scoped(
+        &mut self,
+        kind: synaps_cli::tools::PromptKind,
+        title: &str,
+        prompt: &str,
+        confirm_scope: Option<agent_engine::session::ConfirmScope>,
+    ) -> tokio::sync::oneshot::Receiver<Option<String>> {
         use synaps_cli::tools::SecretPromptRequest;
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
@@ -506,6 +837,39 @@ impl TestHarness {
             kind,
             title: title.to_string(),
             prompt: prompt.to_string(),
+            confirm_scope,
+            response_tx,
+        })
+        .expect("prompt request send is infallible on a fresh channel");
+        let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
+        self.app.secret_prompts.poll_requests(&rx);
+        input::reconcile_secret_prompt(&mut self.app);
+        // Scenarios answer right away; the 400 ms confirm arming delay is
+        // exercised explicitly by `activate_tool_call_confirm_unarmed`.
+        self.app.secret_prompts.arm_now_for_tests();
+        response_rx
+    }
+
+    /// Like [`Self::activate_tool_call_confirm`] but WITHOUT skipping the
+    /// confirm arming delay: keys sent right away must be ignored.
+    pub fn activate_tool_call_confirm_unarmed(
+        &mut self,
+        extension: &str,
+        tool: &str,
+        prompt: &str,
+    ) -> tokio::sync::oneshot::Receiver<Option<String>> {
+        use synaps_cli::tools::SecretPromptRequest;
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        tx.send(SecretPromptRequest {
+            kind: synaps_cli::tools::PromptKind::Confirm,
+            title: agent_engine::session::CONFIRM_PROMPT_TITLE.to_string(),
+            prompt: prompt.to_string(),
+            confirm_scope: Some(agent_engine::session::ConfirmScope {
+                extensions: vec![extension.to_string()],
+                tool: Some(tool.to_string()),
+                rewritten_by: vec![],
+            }),
             response_tx,
         })
         .expect("prompt request send is infallible on a fresh channel");
@@ -513,6 +877,18 @@ impl TestHarness {
         self.app.secret_prompts.poll_requests(&rx);
         input::reconcile_secret_prompt(&mut self.app);
         response_rx
+    }
+
+    /// Let the active confirm's arming delay elapse (without sleeping).
+    pub fn arm_confirm_now(&mut self) {
+        self.app.secret_prompts.arm_now_for_tests();
+    }
+
+    /// Pretend `ms` milliseconds passed for the active confirm's input guard.
+    pub fn age_confirm_guard(&mut self, ms: u64) {
+        self.app
+            .secret_prompts
+            .age_input_guard_for_tests(std::time::Duration::from_millis(ms));
     }
 
     /// Inject and activate a `Confirm` prompt (the `activate_tools` y/yes
@@ -523,6 +899,11 @@ impl TestHarness {
         prompt: &str,
     ) -> tokio::sync::oneshot::Receiver<Option<String>> {
         self.activate_prompt_with_kind(synaps_cli::tools::PromptKind::Confirm, title, prompt)
+    }
+
+    /// `Confirm` dialog: the focused button (`Deny` when none is active).
+    pub fn confirm_focus(&self) -> synaps_cli::tools::ConfirmChoice {
+        self.app.secret_prompts.confirm_focus()
     }
 
     /// Whether a secret prompt is currently active (mirrors the SecretPrompt
@@ -546,6 +927,7 @@ impl TestHarness {
             PaneId::Chat => "chat",
             PaneId::HelpFind => "help-find",
             PaneId::Effort => "effort",
+            PaneId::Sessions => "sessions",
             PaneId::Models => "models",
             PaneId::Plugins => "plugins",
             PaneId::Settings => "settings",
@@ -690,6 +1072,17 @@ impl TestHarness {
         self
     }
 
+    /// Run `frames` animation ticks exactly as the run loop's tick arm
+    /// does for the message area (spinner advance + tail invalidation).
+    /// Pair with [`Self::advance_clock_ms`] to let a running tool's clock
+    /// move between frames.
+    pub fn tick_animations(&mut self, frames: usize) -> &mut Self {
+        for _ in 0..frames {
+            self.app.tick_message_animations();
+        }
+        self
+    }
+
     /// Publish a toast with an explicit TTL (seconds) through the same
     /// provider the app uses. Expiry is governed by the frozen clock.
     pub fn push_toast_with_ttl_secs(&mut self, id: &str, text: &str, ttl_secs: u64) -> &mut Self {
@@ -722,10 +1115,52 @@ impl TestHarness {
         self.app.toasts.visible().count()
     }
 
+    /// Run as `--attach --no-confirm-answers` does: confirm prompts are
+    /// never opened or answered, only listed as waiting.
+    pub fn no_confirm_answers(&mut self) -> &mut Self {
+        self.prompt_bridge
+            .set_confirm_policy(super::session_link::ConfirmPolicy::ViewOnly);
+        self
+    }
+
     /// Force the app's streaming flag — lets scenarios exercise the
     /// streaming-input command refusal path without a live engine stream.
     pub fn set_streaming(&mut self, streaming: bool) -> &mut Self {
         self.app.streaming = streaming;
+        self
+    }
+
+    /// Pin the build id the header shows (`""` = no id: `v<version>` alone),
+    /// so header layout tests don't depend on the id the binary was built
+    /// with (a baked git hash, or none). For this harness only; cleared on
+    /// drop.
+    pub fn set_build_id(&mut self, id: &str) -> &mut Self {
+        super::header::set_build_id_for_thread(Some(id));
+        self
+    }
+
+    /// Pin the working folder the header shows.
+    pub fn set_folder(&mut self, folder: &str) -> &mut Self {
+        self.app.header_folder = folder.to_string();
+        self
+    }
+
+    /// Mark this client as attached read-only (`--observe`).
+    pub fn set_observing(&mut self, observing: bool) -> &mut Self {
+        self.app.observing = observing;
+        self
+    }
+
+    /// Name the session (the header's session label).
+    pub fn set_session_name(&mut self, name: &str) -> &mut Self {
+        self.app.session.name = Some(name.to_string());
+        self
+    }
+
+    /// Force the transient status line (`connecting…`, `reconnecting… (…)`,
+    /// …) the run loop sets around daemon reconnects.
+    pub fn set_status_text(&mut self, text: Option<&str>) -> &mut Self {
+        self.app.status_text = text.map(str::to_string);
         self
     }
 
@@ -772,7 +1207,57 @@ impl TestHarness {
         }
         self.app.secret_prompts.poll_requests(&self.secret_prompt_rx);
         input::reconcile_secret_prompt(&mut self.app);
+        self.app.secret_prompts.arm_now_for_tests();
         self
+    }
+
+    /// Fire the subagent watch poll arm once (as `run()` does when its
+    /// deadline passes) and return the query id it sent, if any.
+    pub fn drive_watch_poll(&mut self) -> Option<u64> {
+        let now = std::time::Instant::now();
+        block_on_bounded(
+            "watch::poll",
+            super::watch::poll(&mut self.app, &mut self.link, now),
+        );
+        super::watch::pending_poll(&self.app).map(|(id, _)| id)
+    }
+
+    /// Whether the watch poll arm is armed (a worker view is focused and
+    /// still has something to read).
+    pub fn watch_poll_due(&self) -> bool {
+        super::watch::poll_due_at(&self.app).is_some()
+    }
+
+    /// The focused worker view's handle id (`None` on the main thread).
+    pub fn watched(&self) -> Option<String> {
+        super::watch::focused(&self.app).map(str::to_string)
+    }
+
+    /// Plain text of the main thread's transcript.
+    pub fn main_transcript_text(&self) -> String {
+        self.app
+            .transcript
+            .messages()
+            .iter()
+            .map(|m| describe(&m.msg))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Plain text of a worker view's transcript (empty if not open).
+    pub fn worker_transcript_text(&self, handle_id: &str) -> String {
+        self.app
+            .threads
+            .worker(handle_id)
+            .map(|w| {
+                w.store
+                    .messages()
+                    .iter()
+                    .map(|m| describe(&m.msg))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default()
     }
 
     /// Stage the engine-side history the scripted session answers
@@ -833,6 +1318,66 @@ impl TestHarness {
         self
     }
 
+    /// Resolve every line typed while streaming through the production
+    /// `commands::resolve_streaming_input`, then apply the result the way
+    /// the dispatch `StreamingInput` arm does. Steers and refusals are
+    /// recorded as `streaming-steer:<text>` / `streaming-refused:<text>`.
+    pub fn drive_streaming_input(&mut self) -> &mut Self {
+        use super::commands::{CommandAction, StreamingSlash};
+        for text in std::mem::take(&mut self.pending_streaming) {
+            match super::commands::resolve_streaming_input(&text, &mut self.app, &self.registry) {
+                StreamingSlash::Steer => self.actions.push(format!("streaming-steer:{text}")),
+                StreamingSlash::Refused => {
+                    self.actions.push(format!("streaming-refused:{text}"))
+                }
+                StreamingSlash::Ran(CommandAction::OpenSettings) => {
+                    super::settings::open_modal(&mut self.app);
+                }
+                StreamingSlash::Ran(CommandAction::OpenSessions) => {
+                self.open_sessions_with(None);
+            }
+                StreamingSlash::Ran(CommandAction::Quit) => self.quit_requested = true,
+                StreamingSlash::Ran(_) => {}
+            }
+        }
+        #[cfg(debug_assertions)]
+        super::focus::debug_assert_stack_sync(&self.app);
+        self
+    }
+
+    /// Run one `/settings` apply through the production
+    /// `helpers::apply_setting` against the scripted session (what the
+    /// dispatch `SettingsApply` arm does). Writes the config file under
+    /// whatever `SYNAPS_BASE_DIR` the test pinned.
+    pub fn apply_setting(&mut self, key: &'static str, value: &str) -> &mut Self {
+        let what = format!("apply_setting({key}={value})");
+        block_on_bounded(
+            &what,
+            super::helpers::apply_setting(key, value, &mut self.app, &mut self.link),
+        );
+        self
+    }
+
+    /// Whether the app believes a turn is streaming.
+    pub fn is_streaming(&self) -> bool {
+        self.app.streaming
+    }
+
+    /// The settings modal's row note / error (`(row key, text)`), if any.
+    pub fn settings_row_note(&self) -> Option<(String, String)> {
+        self.app.settings.as_ref().and_then(|s| s.row_error.clone())
+    }
+
+    /// Whether a theme cross-fade is in flight.
+    pub fn theme_transition_active(&self) -> bool {
+        self.app.theme_transition.is_some()
+    }
+
+    /// The model the session view reports.
+    pub fn view_model(&self) -> String {
+        self.link.view().model.clone()
+    }
+
     /// Apply a resolved [`super::commands::CommandAction`], mirroring the
     /// production `SlashCommand` arm in `mod.rs` for the sync-safe subset —
     /// including the ModalStack pushes, so `debug_assert_stack_sync` holds
@@ -873,9 +1418,9 @@ impl TestHarness {
                 self.app.models = Some(super::models::ModelsModalState::new());
                 self.app.modal_stack.push(super::focus::PaneId::Models);
             }
-            CommandAction::OpenSettings => {
-                self.app.settings = Some(super::settings::SettingsState::new());
-                self.app.modal_stack.push(super::focus::PaneId::Settings);
+            CommandAction::OpenSettings => super::settings::open_modal(&mut self.app),
+            CommandAction::OpenSessions => {
+                self.open_sessions_with(None);
             }
             CommandAction::OpenPlugins => {
                 // Production loads plugins.json from disk; the harness opens
@@ -930,7 +1475,15 @@ impl TestHarness {
                 self.pending_slash.push((cmd, arg));
                 desc
             }
-            InputAction::StreamingInput(text) => format!("streaming-input:{text}"),
+            InputAction::StreamingInput(text) => {
+                self.pending_streaming.push(text.clone());
+                format!("streaming-input:{text}")
+            }
+            InputAction::SubagentSteer { handle_id, text } => {
+                // The dispatch arm's App-side half (its send is not run).
+                super::watch::steer_sent(&mut self.app, &handle_id, &text);
+                format!("subagent-steer:{handle_id}:{text}")
+            }
             InputAction::Abort => "abort".to_string(),
             InputAction::SettingsApply(key, value) => format!("settings-apply:{key}={value}"),
             InputAction::ModelsApply(model) => format!("models-apply:{model}"),
@@ -940,6 +1493,19 @@ impl TestHarness {
                 apply.model, apply.generation, apply.value
             ),
             InputAction::ModelsExpandProvider(p) => format!("models-expand:{p}"),
+            InputAction::SessionsOp(op) => match op {
+                super::sessions::SessionsOp::Pin { id, on } => format!("sessions-pin:{id}:{on}"),
+                super::sessions::SessionsOp::ClearPin { id } => format!("sessions-clear-pin:{id}"),
+                super::sessions::SessionsOp::PinPast { journal_id, .. } => format!("sessions-pin-past:{journal_id}"),
+                super::sessions::SessionsOp::Close { id, .. } => format!("sessions-close:{id}"),
+            },
+            InputAction::SessionsPast(cmd) => match cmd {
+                super::sessions::past::PastCmd::Deep { search } => format!("sessions-deep:{search}"),
+                super::sessions::past::PastCmd::Rename { id, name } => {
+                    format!("sessions-rename:{id}:{}", name.unwrap_or_default())
+                }
+            },
+            InputAction::CopyText(text) => format!("copy:{text}"),
             InputAction::PluginsOutcome(_) => "plugins-outcome".to_string(),
             InputAction::OpenPluginsMarketplace => "open-plugins-marketplace".to_string(),
             InputAction::PingModels => "ping-models".to_string(),
@@ -956,6 +1522,23 @@ impl TestHarness {
         };
         self.actions.push(desc);
     }
+}
+
+/// `kind: text` for one transcript message (the transcript-text helpers).
+fn describe(msg: &super::transcript::ChatMessage) -> String {
+    use super::transcript::ChatMessage as M;
+    let kind = match msg {
+        M::User(_) => "user",
+        M::Thinking(_) => "thinking",
+        M::Text(_) => "text",
+        M::ToolUseStart { .. } => "tool-start",
+        M::ToolUse { .. } => "tool",
+        M::ToolResult { .. } => "tool-result",
+        M::Error(_) => "error",
+        M::System(_) => "system",
+        M::Event { .. } => "event",
+    };
+    format!("{kind}: {}", msg.source_text())
 }
 
 /// Cloneable in-memory `Write` sink for [`TestHarness::render_ansi`].

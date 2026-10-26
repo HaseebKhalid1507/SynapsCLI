@@ -193,6 +193,8 @@ pub(crate) fn lerp_theme(from: &Theme, to: &Theme, t: f32) -> Theme {
         plugins_title: snap!(plugins_title),
         models_border: snap!(models_border),
         models_title: snap!(models_title),
+        sessions_border: snap!(sessions_border),
+        sessions_title: snap!(sessions_title),
         sidecar_pill: snap!(sidecar_pill),
         ext_overrides: if t >= 0.5 {
             to.ext_overrides.clone()

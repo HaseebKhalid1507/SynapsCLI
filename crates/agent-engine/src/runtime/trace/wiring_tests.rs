@@ -10,7 +10,7 @@ use super::{CollectingTraceSink, RequestTrace, StopReason, TraceContext};
 use crate::runtime::api::{ApiMethods, ApiOptions};
 use crate::runtime::telemetry::TelemetryLevel;
 use crate::runtime::types::AuthState;
-use crate::{StreamEvent, ToolRegistry};
+use crate::{LlmEvent, StreamEvent, ToolRegistry};
 use agent_core::TurnOutcome;
 use axum::body::Bytes;
 use axum::http::StatusCode;
@@ -126,6 +126,8 @@ fn auth() -> Arc<RwLock<AuthState>> {
         auth_type: "api_key".into(),
         refresh_token: None,
         token_expires: Some(9_999_999_999_999),
+        auth_file_mtime: None,
+        bound_credential: None,
     }))
 }
 
@@ -134,13 +136,35 @@ async fn drive_stream(
     max_retries: u32,
     cancel: &CancellationToken,
 ) -> crate::error::Result<serde_json::Value> {
+    let (tx, _rx) = mpsc::unbounded_channel::<StreamEvent>();
+    drive_stream_with_events(options, max_retries, cancel, tx).await
+}
+
+/// `drive_stream` with a caller-owned event channel, for tests that must
+/// react to what the client has actually observed (never to a timer).
+async fn drive_stream_with_events(
+    options: &ApiOptions,
+    max_retries: u32,
+    cancel: &CancellationToken,
+    tx: mpsc::UnboundedSender<StreamEvent>,
+) -> crate::error::Result<serde_json::Value> {
+    drive_stream_full(options, max_retries, cancel, tx, TelemetryLevel::Off).await
+}
+
+/// `drive_stream_with_events` at an explicit telemetry level.
+async fn drive_stream_full(
+    options: &ApiOptions,
+    max_retries: u32,
+    cancel: &CancellationToken,
+    tx: mpsc::UnboundedSender<StreamEvent>,
+    level: TelemetryLevel,
+) -> crate::error::Result<serde_json::Value> {
     let client = Client::new();
     let tools = ToolRegistry::new();
     let messages = vec![Arc::new(json!({
         "role": "user",
         "content": format!("{SENTINEL} hello"),
     }))];
-    let (tx, _rx) = mpsc::unbounded_channel::<StreamEvent>();
     ApiMethods::call_api_stream_inner(
         &auth(),
         &client,
@@ -155,7 +179,7 @@ async fn drive_stream(
         max_retries,
         0,
         options,
-        TelemetryLevel::Off,
+        level,
     )
     .await
 }
@@ -331,14 +355,28 @@ async fn cancellation_mid_stream_emits_one_canceled_record() {
     let url = serve(app).await;
     let h = harness(url);
 
+    // Cancel on an observed event, not a wall-clock timer: `ResponseStart`
+    // is sent only after a 2xx response opened the stream, so the cancel is
+    // guaranteed to land mid-stream. A timer could fire before or during
+    // the send on a loaded runner, which legitimately emits no record.
     let cancel = CancellationToken::new();
+    let (tx, mut rx) = mpsc::unbounded_channel::<StreamEvent>();
     let canceler = cancel.clone();
     tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(80)).await;
-        canceler.cancel();
+        while let Some(event) = rx.recv().await {
+            if matches!(event, StreamEvent::Llm(LlmEvent::ResponseStart)) {
+                canceler.cancel();
+                break;
+            }
+        }
     });
 
-    let result = drive_stream(&h.options, 0, &cancel).await;
+    let result = tokio::time::timeout(
+        Duration::from_secs(30),
+        drive_stream_with_events(&h.options, 0, &cancel, tx),
+    )
+    .await
+    .expect("stream never opened: no ResponseStart observed");
     assert!(result.is_ok(), "cancellation is not an error: {result:?}");
 
     let records = h.sink.records();
@@ -356,6 +394,54 @@ async fn cancellation_mid_stream_emits_one_canceled_record() {
         r.outcome.stop_reason.is_none(),
         "no stop reason was observed — must stay absent"
     );
+}
+
+/// Follow-up evidence, not fixed here: `trace::emit` promises one record per
+/// actual transport attempt (one HTTP send), but a cancel that lands while
+/// awaiting response headers — after the server has received the full body —
+/// currently returns `Err(Canceled)` from `await_or_cancel(.. send ..)` with
+/// no record (`api.rs`, `call_api_stream_inner`).
+#[tokio::test]
+#[ignore = "known gap: cancel while awaiting headers emits no record (follow-up)"]
+async fn cancellation_while_awaiting_headers_emits_one_canceled_record() {
+    let received = Arc::new(tokio::sync::Notify::new());
+    let received_c = Arc::clone(&received);
+    let app = Router::new().route(
+        "/v1/messages",
+        axum_post(move |_body: Bytes| {
+            let received = Arc::clone(&received_c);
+            async move {
+                // The whole request body is in: the send happened. Never
+                // answer, so the client sits waiting for headers.
+                received.notify_one();
+                std::future::pending::<()>().await;
+                StatusCode::OK
+            }
+        }),
+    );
+    let h = harness(serve(app).await);
+    let cancel = CancellationToken::new();
+    let canceler = cancel.clone();
+    tokio::spawn(async move {
+        received.notified().await;
+        canceler.cancel();
+    });
+
+    let result = tokio::time::timeout(Duration::from_secs(30), drive_stream(&h.options, 0, &cancel))
+        .await
+        .expect("server never received the request");
+    assert!(
+        matches!(result, Err(crate::error::RuntimeError::Canceled)),
+        "{result:?}"
+    );
+    let records = h.sink.records();
+    assert_eq!(
+        records.len(),
+        1,
+        "a sent attempt canceled before headers must still be recorded"
+    );
+    assert_eq!(records[0].outcome.terminal, TurnOutcome::Canceled);
+    assert!(records[0].outcome.timings.headers_ms.is_none());
 }
 
 // ─── Timing buckets ─────────────────────────────────────────────────────────
@@ -593,23 +679,27 @@ async fn compaction_call_api_simple_emits_one_record_from_exact_bytes() {
 // ─── Task 11: slow persistence must not delay the model turn ────────────────
 
 /// Loopback request through a `TraceContext` whose sink is the production
-/// bounded writer (`WriterTraceSink`) configured pathologically slow
-/// (500 ms/job, capacity 1). The model turn must complete at transport
-/// speed; queue overflow is counted, never propagated. (Spec §6.5.)
+/// bounded writer (`WriterTraceSink`) whose storage is stuck: its worker waits
+/// on a gate this test holds closed for the whole turn (capacity 1). The model
+/// turn must complete anyway; queue overflow is counted, never propagated.
+/// (Spec §6.5.) No wall clock: if the request path waited on the writer, the
+/// turn could never finish while the gate is closed, and the hang guard fires.
 #[tokio::test]
 async fn slow_writer_sink_does_not_delay_model_turn() {
-    use crate::runtime::telemetry::{TelemetryWriter, WriterOptions, WriterTraceSink};
+    use crate::runtime::telemetry::{TelemetryWriter, WriteGate, WriterOptions, WriterTraceSink};
 
     let (url, _bodies, hits) = spawn_stub(vec![]).await;
     let tmp = tempfile::TempDir::new().unwrap();
+    let gate = WriteGate::closed();
     let writer = TelemetryWriter::new(WriterOptions {
         telemetry_path: Some(tmp.path().join("synaps/api-log.jsonl")),
         trace_path: Some(tmp.path().join("synaps/request-trace.jsonl")),
         capacity: 1,
-        write_delay: Some(Duration::from_millis(500)),
+        write_gate: Some(gate.clone()),
         ..WriterOptions::default()
     });
-    // Pre-fill the queue so this request's records hit a saturated writer.
+    // Saturate: the worker takes one job and blocks on the gate, the queue
+    // holds one more, so this request's records hit a full writer.
     for _ in 0..4 {
         writer.enqueue_telemetry(crate::runtime::telemetry::TelemetryRecord::default());
     }
@@ -620,19 +710,69 @@ async fn slow_writer_sink_does_not_delay_model_turn() {
         ..Default::default()
     };
 
-    let start = std::time::Instant::now();
-    drive_stream(&options, 0, &CancellationToken::new())
-        .await
-        .expect("stream must succeed at transport speed");
-    let elapsed = start.elapsed();
+    // Hang guard only, not a performance bound.
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        drive_stream(&options, 0, &CancellationToken::new()),
+    )
+    .await
+    .expect("the turn waited on the stuck writer")
+    .expect("stream must succeed while storage is stuck");
 
     assert_eq!(hits.load(Ordering::SeqCst), 1);
-    assert!(
-        elapsed < Duration::from_millis(450),
-        "a saturated 500ms/job writer must not delay the turn: {elapsed:?}"
-    );
-    // Bounded shutdown even while the worker is mid-sleep.
+    assert!(writer.stats().dropped > 0, "overflow was counted, not blocked");
+    // Bounded shutdown even while the worker is stuck: the gate is still
+    // closed, so nothing can have flushed.
     let out = writer.shutdown(Duration::from_millis(100));
     assert!(!out.is_flushed());
-    assert!(out.stats().dropped > 0, "overflow was counted, not blocked");
+    gate.open(); // release the worker thread
+}
+
+// ─── Subagent telemetry: worker requests are marked in api-log.jsonl ────────
+
+/// Telemetry on, one loopback request per role, both through one writer. The
+/// worker's record carries `"worker":true`; the foreground record has no
+/// `worker` key at all, so existing api-log readers see no change.
+#[tokio::test]
+async fn api_log_marks_worker_requests() {
+    use crate::runtime::openai::catalog::CodexRequestRole;
+    use crate::runtime::telemetry::{TelemetryWriter, WriterOptions};
+
+    let (url, _bodies, hits) = spawn_stub(vec![]).await;
+    let tmp = tempfile::TempDir::new().unwrap();
+    let log = tmp.path().join("synaps/api-log.jsonl");
+    let writer = TelemetryWriter::new(WriterOptions {
+        telemetry_path: Some(log.clone()),
+        trace_path: Some(tmp.path().join("synaps/request-trace.jsonl")),
+        ..WriterOptions::default()
+    });
+    for role in [CodexRequestRole::Foreground, CodexRequestRole::Worker] {
+        let options = ApiOptions {
+            anthropic_base_url: Some(url.clone()),
+            telemetry: Some(writer.clone()),
+            codex_request_role: role,
+            ..Default::default()
+        };
+        let (tx, _rx) = mpsc::unbounded_channel::<StreamEvent>();
+        drive_stream_full(
+            &options,
+            0,
+            &CancellationToken::new(),
+            tx,
+            TelemetryLevel::Basic,
+        )
+        .await
+        .expect("stub stream succeeds");
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+    assert!(writer.shutdown(Duration::from_secs(10)).is_flushed());
+
+    let records: Vec<serde_json::Value> = std::fs::read_to_string(&log)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(records.len(), 2, "one record per request");
+    assert!(records[0].get("worker").is_none(), "{}", records[0]);
+    assert_eq!(records[1]["worker"], json!(true), "{}", records[1]);
 }

@@ -212,6 +212,15 @@ pub fn cfg() -> SessionConfig {
     }
 }
 
+/// [`cfg`] with `client_input = exclusive`: only the input owner drives,
+/// the others are read-only until they take input (the default is shared).
+pub fn exclusive_cfg() -> SessionConfig {
+    SessionConfig {
+        client_input: Some(agent_engine::session::ClientInput::Exclusive),
+        ..cfg()
+    }
+}
+
 pub async fn next(t: &mut LocalTransport) -> Envelope {
     tokio::time::timeout(Duration::from_secs(30), t.next_event())
         .await
@@ -319,6 +328,134 @@ pub async fn prompt_host() -> Arc<EngineHost> {
         .write()
         .await
         .register(Arc::new(PromptFixtureTool));
+    host
+}
+
+/// Same tool name as [`PromptFixtureTool`], but it raises an extension
+/// tool-call Confirm attributed to extension `jev` through the real runtime
+/// resolver (and the session's shared Allow-all latch).
+pub struct ConfirmFixtureTool;
+
+#[async_trait::async_trait]
+impl agent_engine::Tool for ConfirmFixtureTool {
+    fn name(&self) -> &str {
+        "prompt_fixture"
+    }
+    fn description(&self) -> &str {
+        "raises an extension confirm"
+    }
+    fn parameters(&self) -> agent_engine::Value {
+        serde_json::json!({"type": "object"})
+    }
+    fn origin(&self) -> agent_engine::tools::ToolOrigin {
+        agent_engine::tools::ToolOrigin::Builtin
+    }
+    async fn execute(
+        &self,
+        _params: agent_engine::Value,
+        ctx: agent_engine::ToolContext,
+    ) -> agent_engine::Result<String> {
+        use agent_engine::extensions::hooks::events::HookResult;
+        let handle = ctx
+            .capabilities
+            .secret_prompt
+            .expect("actor passes its SecretPromptHandle to the stream");
+        let result = agent_engine::runtime::resolve_before_tool_call_result(
+            HookResult::Confirm {
+                message: "run it?".into(),
+                sources: vec!["jev".into()],
+                tool: Some("bash".into()),
+                generations: vec![],
+                modified_input: None,
+                modified_by: vec![],
+            },
+            Some(&handle),
+            false,
+            ctx.capabilities.session_allow_all.as_deref(),
+        )
+        .await;
+        Ok(match result {
+            HookResult::Continue => "allowed".to_string(),
+            _ => "blocked".to_string(),
+        })
+    }
+}
+
+/// Like [`ConfirmFixtureTool`], but the Confirm carries input an earlier
+/// extension (`rewriter`) rewrote; reports the input approval would run.
+pub struct RewrittenConfirmFixtureTool;
+
+#[async_trait::async_trait]
+impl agent_engine::Tool for RewrittenConfirmFixtureTool {
+    fn name(&self) -> &str {
+        "prompt_fixture"
+    }
+    fn description(&self) -> &str {
+        "raises an extension confirm over rewritten input"
+    }
+    fn parameters(&self) -> agent_engine::Value {
+        serde_json::json!({"type": "object"})
+    }
+    fn origin(&self) -> agent_engine::tools::ToolOrigin {
+        agent_engine::tools::ToolOrigin::Builtin
+    }
+    async fn execute(
+        &self,
+        _params: agent_engine::Value,
+        ctx: agent_engine::ToolContext,
+    ) -> agent_engine::Result<String> {
+        use agent_engine::extensions::hooks::events::HookResult;
+        let handle = ctx
+            .capabilities
+            .secret_prompt
+            .expect("actor passes its SecretPromptHandle to the stream");
+        let result = agent_engine::runtime::resolve_before_tool_call_result(
+            HookResult::Confirm {
+                message: "run it?".into(),
+                sources: vec!["jev".into()],
+                generations: vec![],
+                tool: Some("bash".into()),
+                // A credential-injecting modifier (prA I-R3-1): the secrets
+                // must never reach any client's prompt.
+                modified_input: Some(serde_json::json!({
+                    "command": "echo rewritten && curl -H 'Authorization: Bearer SECRET-BEARER-123' 'https://api.example/v1?api_key=SECRET-KEY-456'",
+                    "api_key": "SECRET-FIELD-789",
+                })),
+                modified_by: vec!["rewriter".into()],
+            },
+            Some(&handle),
+            false,
+            ctx.capabilities.session_allow_all.as_deref(),
+        )
+        .await;
+        Ok(match result {
+            HookResult::Modify { input } => format!(
+                "ran:{}",
+                input["command"].as_str().unwrap_or("").split(" &&").next().unwrap_or("")
+            ),
+            HookResult::Continue => "ran:original".to_string(),
+            _ => "blocked".to_string(),
+        })
+    }
+}
+
+pub async fn rewritten_confirm_host() -> Arc<EngineHost> {
+    let host = host().await;
+    host.parts()
+        .tools
+        .write()
+        .await
+        .register(Arc::new(RewrittenConfirmFixtureTool));
+    host
+}
+
+pub async fn confirm_host() -> Arc<EngineHost> {
+    let host = host().await;
+    host.parts()
+        .tools
+        .write()
+        .await
+        .register(Arc::new(ConfirmFixtureTool));
     host
 }
 

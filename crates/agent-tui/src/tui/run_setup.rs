@@ -160,8 +160,11 @@ pub(crate) async fn run_setup(
             compaction_policy: CompactionPolicyWire::LinkedSuccessor,
             await_extensions: false,
             keep_warm: false,
+            client_input: None,
             name: None,
             max_session_cost: None,
+            memory_mode: None,
+            restore_parked: false,
         })
         .await?;
     let (transport, snapshot) =
@@ -350,6 +353,10 @@ pub(crate) async fn finish_setup(
     let term_caps =
         termcaps::negotiate(termcaps::TermCaps::detect(), termcaps::BURST_TIMEOUT).await;
     ladder_stage("termcaps", &format_args!("burst_ms={}", t_caps.elapsed().as_millis()));
+    // OSC 11: publish the terminal's default bg (None = unknown ⇒ unchanged)
+    // before the render thread starts, so the opaque guard sees it from the
+    // first frame.
+    super::theme::set_terminal_default_bg(term_caps.terminal_bg);
 
     // P16.3: hand the negotiated caps to the render thread so `render_frame`
     // can gate edge-scrub (tmux provenance) and synchronized-output (mode 2026)
@@ -439,6 +446,7 @@ pub(crate) async fn try_reconnect(
 
             // F9: clear streaming state — a turn cannot be streaming without a daemon.
             if app.streaming {
+                app.header_turn_ended(None);
                 app.streaming = false;
             }
             app.compacting = false;
@@ -464,10 +472,23 @@ pub(crate) async fn try_reconnect(
                         let lifecycle = &snapshot.meta.lifecycle;
                         let status = format!("{lifecycle:?}");
                         remirror(app, &snapshot);
+                        // The new attach has its own roster (every client
+                        // re-attached under a new id, or hasn't yet).
+                        app.attached_clients = link.transport().roster().clients().len();
+                        super::watch::on_reconnect(app, std::time::Instant::now());
                         app.push_msg(ChatMessage::System(format!(
                             "reconnected to daemon (pid {new_pid}) — session {} {status}",
                             session_id
                         )));
+                        // `daemon reload` re-execs only the daemon: after an
+                        // upgrade this client is still the old binary.
+                        // Once per daemon build, not on every reconnect.
+                        let skew = link.transport_mut().daemon_binary().and_then(|d| {
+                            super::attach::skew_notice_once(app, d, snapshot.meta.id.as_str())
+                        });
+                        if let Some(skew) = skew {
+                            app.push_msg(ChatMessage::System(format!("⚠ {skew}")));
+                        }
                         app.toasts.upsert(
                             toast::Toast::new("reload", "reconnected").titled("Daemon"),
                         );

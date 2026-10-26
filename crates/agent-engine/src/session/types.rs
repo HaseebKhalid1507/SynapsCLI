@@ -171,6 +171,10 @@ pub struct SessionConfig {
     /// Never `Park` this session (`--keep-warm`). Default `false`.
     #[serde(default)]
     pub keep_warm: bool,
+    /// Who may drive this session ([`ClientInput`]); `None` = config
+    /// `client_input`. An older daemon ignores it (and enforces the owner).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_input: Option<ClientInput>,
     /// `--name`: name the session at create (same rules as `/cmd saveas`;
     /// must be unique among saved sessions). Applied before the registry
     /// entry is written so `synaps send --session <name>` resolves at once.
@@ -182,6 +186,76 @@ pub struct SessionConfig {
     /// host-owned circuit breaker for an actor-resident autonomous driver.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_session_cost: Option<f64>,
+    /// The session's explicit `/memory` choice, recorded by the actor so a
+    /// rebuilt runtime (unpark, daemon reload) restores it instead of
+    /// re-applying the operator's `memory.default_mode`. `None` = no choice
+    /// yet: the default applies. Host-recorded: the daemon drops a value a
+    /// client sends at create.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "SessionMemoryMode::deserialize_lenient"
+    )]
+    pub memory_mode: Option<SessionMemoryMode>,
+    /// Set by a daemon reload for a session it restores Parked (never on
+    /// the wire): with `await_extensions=false`, `on_session_start` waits
+    /// until the session is unparked instead of running right after create.
+    #[serde(skip)]
+    pub restore_parked: bool,
+}
+
+/// A durable `/memory` mode the user chose for a session
+/// (`SessionConfig::memory_mode`). `/memory once` is a one-shot lease, not
+/// a mode, and is not recorded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionMemoryMode {
+    Off,
+    RecallEachPrompt,
+    CaptureOnly,
+    CaptureAndRecall,
+}
+
+impl SessionMemoryMode {
+    /// `SessionConfig::memory_mode` reader: a value this build does not know
+    /// (a newer image's mode) reads as `Off` — the consent-safe direction —
+    /// rather than an error that would fail the whole reload state and
+    /// rehydrate no session at all. Null (or a missing field) is no choice.
+    fn deserialize_lenient<'de, D>(d: D) -> Result<Option<Self>, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let v = serde_json::Value::deserialize(d)?;
+        if v.is_null() {
+            return Ok(None);
+        }
+        Ok(Some(serde_json::from_value(v.clone()).unwrap_or_else(|_| {
+            tracing::warn!(mode = %v, "unknown session memory mode; treating as off");
+            Self::Off
+        })))
+    }
+
+    /// The mode `/memory <arg>` sets, if it sets one.
+    pub fn from_command_arg(arg: &str) -> Option<Self> {
+        match arg.trim() {
+            "off" => Some(Self::Off),
+            "recall" => Some(Self::RecallEachPrompt),
+            "capture" => Some(Self::CaptureOnly),
+            "on" => Some(Self::CaptureAndRecall),
+            _ => None,
+        }
+    }
+
+    /// The lease mode to grant; `None` for `Off`.
+    pub fn lease_mode(self) -> Option<crate::runtime::memory_context::MemoryContextMode> {
+        use crate::runtime::memory_context::MemoryContextMode as M;
+        match self {
+            Self::Off => None,
+            Self::RecallEachPrompt => Some(M::RecallEachPrompt),
+            Self::CaptureOnly => Some(M::CaptureOnly),
+            Self::CaptureAndRecall => Some(M::CaptureAndRecall),
+        }
+    }
 }
 
 fn default_true() -> bool {
@@ -222,8 +296,11 @@ impl Default for SessionConfig {
             compaction_policy: CompactionPolicyWire::InPlace,
             await_extensions: true,
             keep_warm: false,
+            client_input: None,
             name: None,
             max_session_cost: None,
+            memory_mode: None,
+            restore_parked: false,
         }
     }
 }
@@ -271,6 +348,14 @@ pub struct SessionMeta {
     pub input_owner: Option<ClientId>,
     #[serde(default)]
     pub awaiting_input: usize,
+    /// Every attached client, named. Empty from an older daemon.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub roster: Vec<ClientInfo>,
+    /// Who may drive ([`ClientInput`]); `None` from an older daemon (which
+    /// enforces the owner: `Exclusive`). With `Shared`, `input_owner` is the
+    /// active client, not the only one that may type.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_input: Option<ClientInput>,
     /// `conv.session.id` — differs from `id` after a LinkedSuccessor compaction.
     #[serde(default)]
     pub journal_id: String,
@@ -278,6 +363,36 @@ pub struct SessionMeta {
     /// `"pid N (kind)"`. Shown in `daemon sessions`; cleared on unpark.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub locked_by: Option<String>,
+    /// Pinned (`KeepWarm{on}`, `/pin`): never parked, never idle-ended, and
+    /// the daemon does not idle-exit while it is set. An older daemon omits
+    /// it (→ false); an older client ignores it.
+    #[serde(default)]
+    pub pinned: bool,
+    // ── state for the `/sessions` modal, published by the actor. An older
+    //    daemon omits them (→ defaults); an older client ignores them. ──
+    /// A turn or a compaction is running.
+    #[serde(default)]
+    pub busy: bool,
+    /// When the session entered its current state (turn/compaction start,
+    /// idle start, park time).
+    #[serde(default)]
+    pub state_since: Option<chrono::DateTime<chrono::Utc>>,
+    /// When the idle park fires (Live, zero clients, grace armed). `None`
+    /// when not armed — a worker re-check is not a park due.
+    #[serde(default)]
+    pub park_due: Option<chrono::DateTime<chrono::Utc>>,
+    /// When a Parked session is evicted; `None` if not parked or never.
+    #[serde(default)]
+    pub evict_due: Option<chrono::DateTime<chrono::Utc>>,
+    /// The live conversation's title, as of the last publish.
+    #[serde(default)]
+    pub title: Option<String>,
+    /// Session cost in USD, as of the last publish.
+    #[serde(default)]
+    pub cost_usd: f64,
+    /// API message count, as of the last publish.
+    #[serde(default)]
+    pub messages: usize,
 }
 
 /// Where a session is in its park/unpark life (`SessionHandle::lifecycle`).
@@ -303,6 +418,8 @@ impl SessionLifecycle {
     }
 }
 
+pub use crate::core::config::ClientInput;
+
 /// Minted by the actor per Attach.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -321,6 +438,174 @@ pub struct ClientMeta {
     /// Display items in `Attached.display_tail` / `DisplayTail` queries (phase 4).
     #[serde(default = "default_tail_items")]
     pub tail_items: usize,
+    /// Additive stream events this client can decode. Absent from older
+    /// clients (all `false`), so a newer daemon never sends them one; an
+    /// older daemon ignores the unknown field.
+    #[serde(default, skip_serializing_if = "ClientCapabilities::is_none")]
+    pub capabilities: ClientCapabilities,
+    /// What this client asks to be called (`--as`, `SYNAPS_CLIENT_NAME`):
+    /// a label, not a login — every client is the daemon's own user. The
+    /// session resolves it ([`resolve_client_name`]) and reports the result
+    /// in `ClientJoined`/`roster`. Absent = the kind's name. An older
+    /// daemon ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+/// Longest client name ([`validate_client_name`]).
+pub const CLIENT_NAME_MAX: usize = 32;
+
+/// A client name is 1–32 ASCII letters, digits, `-` or `_`, starting with
+/// a letter or digit. The client checks before connecting; the daemon
+/// checks again and refuses the handshake.
+pub fn validate_client_name(name: &str) -> Result<(), String> {
+    let ok_first = name.chars().next().is_some_and(|c| c.is_ascii_alphanumeric());
+    let ok_rest = name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    if name.is_empty() || name.len() > CLIENT_NAME_MAX || !ok_first || !ok_rest {
+        return Err(format!(
+            "invalid client name {name:?}: use 1-{CLIENT_NAME_MAX} letters, digits, '-' or '_', starting with a letter or digit"
+        ));
+    }
+    Ok(())
+}
+
+/// `SYNAPS_CLIENT_NAME`, trimmed; `None` when unset or empty. Not
+/// validated here: the caller reports a bad one.
+pub fn client_name_from_env() -> Option<String> {
+    std::env::var("SYNAPS_CLIENT_NAME")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+/// The name a joining client gets in a session: its requested name, or its
+/// kind's name if it asked for none (or an invalid one), with the lowest
+/// free `-N` suffix (N ≥ 2) if another client already has it. Names
+/// compare case-insensitively.
+pub fn resolve_client_name<'a>(
+    requested: Option<&str>,
+    kind: ClientKind,
+    taken: impl IntoIterator<Item = &'a str>,
+) -> String {
+    let base = requested
+        .filter(|n| validate_client_name(n).is_ok())
+        .unwrap_or(kind.default_name());
+    let taken: std::collections::HashSet<String> = taken.into_iter().map(str::to_ascii_lowercase).collect();
+    if !taken.contains(&base.to_ascii_lowercase()) {
+        return base.to_string();
+    }
+    (2..)
+        .map(|n| format!("{base}-{n}"))
+        .find(|c| !taken.contains(&c.to_ascii_lowercase()))
+        .expect("an unbounded range always has a free suffix")
+}
+
+/// One attached client as every client sees it (`AttachSnapshot.roster`,
+/// `ClientJoined`, `/clients`, `synaps daemon sessions`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientInfo {
+    pub id: ClientId,
+    /// Resolved by the session ([`resolve_client_name`]); unique in it.
+    pub name: String,
+    pub kind: ClientKind,
+    pub mode: AttachMode,
+    /// Unix ms.
+    pub attached_at_ms: u64,
+}
+
+impl ClientInfo {
+    /// `discord (#3)`: the name for people, the id for scripts that grep.
+    pub fn label(&self) -> String {
+        format!("{} (#{})", self.name, self.id.0)
+    }
+}
+
+/// A client-side copy of the session's roster, kept current from the
+/// attach snapshot, `ClientJoined` and `ClientLeft` (each transport owns
+/// one).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Roster(Vec<ClientInfo>);
+
+impl Roster {
+    pub fn from_snapshot(snapshot: &AttachSnapshot) -> Self {
+        let mut r = Self(snapshot.roster.clone());
+        // An older daemon sends no roster: fall back to ids and kinds.
+        if r.0.is_empty() {
+            r.0 = snapshot
+                .clients
+                .iter()
+                .map(|(id, kind)| ClientInfo {
+                    id: *id,
+                    name: kind.default_name().to_string(),
+                    kind: *kind,
+                    mode: AttachMode::Mirror,
+                    attached_at_ms: 0,
+                })
+                .collect();
+        }
+        r
+    }
+
+    pub fn apply(&mut self, event: &SessionEventWire) {
+        match event {
+            SessionEventWire::ClientJoined { client, kind, name, mode } => {
+                self.0.retain(|c| c.id != *client);
+                self.0.push(ClientInfo {
+                    id: *client,
+                    name: if name.is_empty() { kind.default_name().to_string() } else { name.clone() },
+                    kind: *kind,
+                    mode: *mode,
+                    // The event carries no time: it just happened.
+                    attached_at_ms: chrono::Utc::now().timestamp_millis().max(0) as u64,
+                });
+                self.0.sort_by_key(|c| c.id.0);
+            }
+            SessionEventWire::ClientLeft { client } => self.0.retain(|c| c.id != *client),
+            _ => {}
+        }
+    }
+
+    pub fn clients(&self) -> &[ClientInfo] {
+        &self.0
+    }
+
+    pub fn get(&self, id: ClientId) -> Option<&ClientInfo> {
+        self.0.iter().find(|c| c.id == id)
+    }
+
+    /// `discord (#3)`, or `client #3` for an id not in the roster.
+    pub fn label(&self, id: ClientId) -> String {
+        self.get(id).map(ClientInfo::label).unwrap_or_else(|| format!("client #{}", id.0))
+    }
+}
+
+/// Opt-in stream signals (see [`ClientMeta::capabilities`]). The daemon's
+/// event enums nested under `Stream` (`WireLlmEvent`, ...) have no
+/// `#[serde(other)]`: an older client fails the whole frame on an unknown
+/// variant — and a failed frame reads as a dead socket (the TUI drops into
+/// reconnect, whose `Attached` replay would carry the same variant). So
+/// every new nested variant is sent only to a client that declares it here.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientCapabilities {
+    /// `LlmEvent::ToolQueued` / `ToolStarted` (scheduler lane waits).
+    #[serde(default)]
+    pub tool_queue: bool,
+    /// Knows `client_input = shared`: `OwnerChangeReason::Input` and
+    /// `Attached.client_input`. Without it, a shared session is presented
+    /// in owner terms (`wire::legacy_shared`).
+    #[serde(default)]
+    pub owner_reason_input: bool,
+}
+
+impl ClientCapabilities {
+    /// What this build decodes.
+    pub fn current() -> Self {
+        Self { tool_queue: true, owner_reason_input: true }
+    }
+
+    fn is_none(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 /// Default for `ClientMeta.tail_items`: matches the TUI's resumed-display cap.
@@ -348,7 +633,15 @@ impl ClientMeta {
             instance: uuid::Uuid::new_v4().to_string(),
             history: HistoryMode::default(),
             tail_items: tail_items_from_env(),
+            capabilities: ClientCapabilities::current(),
+            name: None,
         }
+    }
+
+    /// With a requested name (see [`ClientMeta::name`]).
+    pub fn named(mut self, name: Option<String>) -> Self {
+        self.name = name;
+        self
     }
 }
 
@@ -390,6 +683,20 @@ pub enum ClientKind {
     Rpc,
     Server,
     Test,
+}
+
+impl ClientKind {
+    /// The name a client of this kind gets when it asks for none.
+    pub fn default_name(self) -> &'static str {
+        match self {
+            Self::Tui => "tui",
+            Self::Chat => "chat",
+            Self::Attach => "attach",
+            Self::Rpc => "rpc",
+            Self::Server => "server",
+            Self::Test => "test",
+        }
+    }
 }
 
 /// Attach mode. Ownership (B1): `Mirror` owns input iff nobody does,
@@ -442,6 +749,69 @@ impl PromptKind {
     }
 }
 
+/// Who raised an extension tool-call Confirm and what "Allow all" would
+/// cover. Built host-side from the hook chain (`HookBus::emit` stamps the
+/// extension ids; an extension cannot name itself or another extension), so
+/// the dialog can show the exact scope BEFORE the user answers.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfirmScope {
+    /// Extension ids whose `Confirm` this prompt resolves; "Allow all"
+    /// latches exactly these.
+    pub extensions: Vec<String>,
+    /// Tool the call targets (display only; the latch is per extension).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
+    /// Extensions whose `Modify` rewrote the input this prompt approves
+    /// (empty = the model's own input). Lets the session record, for every
+    /// client's transcript, that an approved call ran rewritten input.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rewritten_by: Vec<String>,
+}
+
+impl ConfirmScope {
+    /// `a` or `a, b`.
+    pub fn extensions_label(&self) -> String {
+        self.extensions.join(", ")
+    }
+
+    /// Text of the "Allow all" button (without the key hint).
+    pub fn allow_all_label(&self) -> String {
+        format!("Allow all from {} this session", self.extensions_label())
+    }
+
+    /// The exact reach of "Allow all", shown before the user answers.
+    pub fn allow_all_scope(&self) -> String {
+        format!(
+            "Allow all: later confirms from {} (any tool) are approved without asking until \
+             /new or /confirms reset. Other extensions still ask.",
+            self.extensions_label()
+        )
+    }
+}
+
+/// Make prompt text safe to print in any client (prA I-R4-3, I-R5): drop
+/// C0/C1 control characters except `\n` (a `\t` becomes a space); the
+/// zero-width space and the LRM/RLM marks (U+200B, U+200E, U+200F); bidi
+/// embeddings/overrides/isolates (U+202A–U+202E, U+2066–U+2069) and the
+/// Arabic letter mark (U+061C); and the line/paragraph separators (U+2028,
+/// U+2029), which some terminals treat as line breaks. ZWNJ / ZWJ
+/// (U+200C, U+200D) are KEPT: emoji sequences and several scripts need
+/// them. Prevents an extension's text from moving the cursor (`\x1b[3A`,
+/// `\r`) over the host-built header, or disguising text with direction
+/// overrides.
+pub fn sanitize_prompt_text(text: &str) -> String {
+    text.chars()
+        .filter_map(|c| match c {
+            '\n' => Some('\n'),
+            '\t' => Some(' '),
+            c if c.is_control() => None,
+            '\u{200B}' | '\u{200E}' | '\u{200F}' | '\u{061C}' | '\u{2028}' | '\u{2029}' => None,
+            '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' => None,
+            c => Some(c),
+        })
+        .collect()
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PromptRequest {
     /// Per-session monotonic; actor dedups answers on it.
@@ -450,6 +820,10 @@ pub struct PromptRequest {
     pub title: String,
     pub prompt: String,
     pub raised_at: chrono::DateTime<chrono::Utc>,
+    /// Extension tool-call confirms only: the source extension(s) and tool.
+    /// Absent → "Allow all" is not offered (it could not be scoped).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirm_scope: Option<ConfirmScope>,
 }
 
 // ── commands, settings, queries ───────────────────────────────────────────────
@@ -490,6 +864,11 @@ pub enum SessionCommand {
     /// Text typed while streaming. Actor: steer if a steer_tx is live else
     /// queue; ALWAYS also sets queued_message.
     Steer { text: String },
+    /// Steer one of this session's running subagents (`sa_N`) from its watch
+    /// view. Owner-only like `Steer`. The note also enters the MAIN
+    /// conversation as an event (no auto-turn), so the main agent knows the
+    /// user redirected its worker. Failure → `Refused`.
+    SubagentSteer { handle_id: String, text: String },
     /// Esc. Cancel, adopt the turn's partial history + append the
     /// interruption marker (`engine::interrupt`), dequeue, flush pending
     /// events, cancel subagents, save.
@@ -534,12 +913,48 @@ pub enum SessionCommand {
     /// abort compaction, save, close PTYs, emit Notice. Never ends the
     /// session. Reply = `QueryResult{id: CHECKPOINT_QUERY_ID, {ok:true}}`.
     Checkpoint { reason: CheckpointReason },
-    /// (B3) pin/unpin (`--keep-warm`, `/keep-warm on|off`).
+    /// (B3) pin/unpin (`/pin on|off`, `--keep-warm`, `/keep-warm on|off`,
+    /// `synaps daemon pin`). Published on `SessionHandle::pinned()`.
     KeepWarm { on: bool },
+    /// (B1) `/takeover`: the sending client takes input ownership in place,
+    /// like an `--takeover` attach without re-attaching. Not an input
+    /// command (a read-only client sends it); refused from an `Observe`
+    /// client, a no-op from the owner. Emits `InputOwnerChanged{Takeover}`
+    /// (`Attach` when nobody owned input).
+    TakeInput,
     /// Host-only (never wire): park now if `can_park()` (reload rehydrates
     /// a Parked session Parked). A no-op otherwise.
     #[serde(skip)]
     Park,
+    /// Host-only (never wire): reload's rehydrate hands the new image the
+    /// workers the old image stopped or still owed a wake
+    /// (`SessionReloadRecord::workers`). The actor re-registers their ids
+    /// against their archives and wakes the parent once per worker.
+    #[serde(skip)]
+    AdoptWorkers { workers: Vec<crate::runtime::subagent::CarriedWorker> },
+    /// Host-only (never wire): reload's rehydrate hands the new image the
+    /// exact tool activations the session held in the previous image
+    /// (`SessionReloadRecord::tool_activations`). The runtime re-validates
+    /// and restores them at its first turn start; a parked session keeps
+    /// them for its unpark. Sent before anything can start a turn.
+    #[serde(skip)]
+    RestoreToolActivations {
+        activations: Vec<crate::tools::activation::CarriedActivation>,
+    },
+    /// Host-only (never wire): reload's rehydrate, last, for a session that
+    /// comes back Live. The old image's park timer did not survive the exec
+    /// and only an attach or detach arms a new one, so a session no client
+    /// reconnects to stayed Live with zero clients forever. Arms the park
+    /// grace as a detach does; a client reconnecting within it clears it.
+    /// A no-op on a parked session.
+    #[serde(skip)]
+    ArmPark,
+    /// Host-only (never wire): the reload this session checkpointed for
+    /// did not exec (the exec failed, or the reload stopped after the
+    /// checkpoints). The checkpoint's reload fence lifts, and the workers
+    /// the reload stopped are announced to this same image.
+    #[serde(skip)]
+    ReloadAborted,
     /// Host→session (never wire): the actor re-emits as `SessionEventWire`.
     #[serde(skip)]
     HostEvent(HostEvent),
@@ -557,7 +972,7 @@ pub enum SessionCommand {
 /// What `Checkpoint{Reload}` reports so `daemon reload` can rebuild the
 /// session as it IS (not as it was created): the actor's config, keep-warm
 /// pin, lifecycle, the non-persisted knobs (`settings_replay`, incl.
-/// `/system`), and the CURRENT model/thinking.
+/// `/system`), the CURRENT model/thinking, and its tool activations.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SessionReloadRecord {
     pub config: SessionConfig,
@@ -570,6 +985,45 @@ pub struct SessionReloadRecord {
     pub cache_keepwarm: Option<String>,
     pub model: String,
     pub thinking_level: String,
+    /// Workers a reload stopped (or that still owed a completion wake), so
+    /// the next image can re-register their ids and wake the parent.
+    #[serde(default)]
+    pub workers: Vec<crate::runtime::subagent::CarriedWorker>,
+    /// The session's exact tool activations (`activate_tools` grants), so
+    /// the next image's runtime keeps the tools array the cached prompt
+    /// prefix starts with. Pins only, re-validated on restore.
+    #[serde(default)]
+    pub tool_activations: Vec<crate::tools::activation::CarriedActivation>,
+}
+
+/// What a session tells a client whose command a daemon reload refused.
+pub const RELOADING_REFUSAL: &str = "daemon reloading; retry in a moment";
+
+impl SessionCommand {
+    /// Refused while a daemon reload has checkpointed the session (its
+    /// reload fence is up) until the exec, or until the daemon reports the
+    /// exec failed: anything that starts a turn (a `Steer` with no turn
+    /// running is a `Submit`), changes the conversation or journal the
+    /// record points at, launches or steers work, or changes a setting the
+    /// record already carries. Cancel, answers, queries, saves and
+    /// attach/detach stay open.
+    pub fn refused_while_reloading(&self) -> bool {
+        matches!(
+            self,
+            Self::Submit { .. }
+                | Self::SubmitPrepared { .. }
+                | Self::Steer { .. }
+                | Self::SubagentSteer { .. }
+                | Self::Compact { .. }
+                | Self::NewSession
+                | Self::Resume { .. }
+                | Self::EngineCommand { .. }
+                | Self::PluginCommand { .. }
+                | Self::DriverStart { .. }
+                | Self::Set { .. }
+                | Self::KeepWarm { .. }
+        )
+    }
 }
 
 impl std::fmt::Debug for SessionCommand {
@@ -587,6 +1041,11 @@ impl std::fmt::Debug for SessionCommand {
             }
             Self::Steer { .. } => f
                 .debug_struct("Steer")
+                .field("text", &format_args!("<redacted>"))
+                .finish(),
+            Self::SubagentSteer { handle_id, .. } => f
+                .debug_struct("SubagentSteer")
+                .field("handle_id", handle_id)
                 .field("text", &format_args!("<redacted>"))
                 .finish(),
             Self::SubmitPrepared { .. } => f
@@ -613,7 +1072,21 @@ impl std::fmt::Debug for SessionCommand {
             }
             Self::NewSession => f.write_str("NewSession"),
             Self::Save => f.write_str("Save"),
+            Self::TakeInput => f.write_str("TakeInput"),
             Self::Park => f.write_str("Park"),
+            Self::AdoptWorkers { workers } => f
+                .debug_struct("AdoptWorkers")
+                .field("workers", &workers.iter().map(|w| w.id.as_str()).collect::<Vec<_>>())
+                .finish(),
+            Self::RestoreToolActivations { activations } => f
+                .debug_struct("RestoreToolActivations")
+                .field(
+                    "tools",
+                    &activations.iter().map(|a| a.tool_id.as_str()).collect::<Vec<_>>(),
+                )
+                .finish(),
+            Self::ReloadAborted => f.write_str("ReloadAborted"),
+            Self::ArmPark => f.write_str("ArmPark"),
             Self::Query { id, query } => {
                 f.debug_struct("Query").field("id", id).field("query", query).finish()
             }
@@ -735,6 +1208,18 @@ pub enum SessionQuery {
     ContextReport,
     /// `display::DisplayTail` of the last `items` display items (phase 4).
     DisplayTail { items: usize },
+    /// `runtime::subagent_watch::WatchPage`: one of this session's workers,
+    /// its journal from `since` (the previous page's `next_seq`; 0 = all).
+    /// Unknown handle → `{"error": ..}`. `tool_queue`: include
+    /// `WatchEvent::ToolQueued`/`ToolStarted` entries (an older client
+    /// omits it and would fail to decode a page that had them; an older
+    /// daemon ignores it and never records them).
+    SubagentWatch {
+        handle_id: String,
+        since: u64,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        tool_queue: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -801,7 +1286,8 @@ pub enum SessionEventWire {
         client: ClientId,
         snapshot: AttachSnapshot,
     },
-    ClientJoined { client: ClientId, kind: ClientKind },
+    /// `name`: resolved by the session (unique in it).
+    ClientJoined { client: ClientId, kind: ClientKind, name: String, mode: AttachMode },
     ClientLeft { client: ClientId },
     Ended { reason: EndReason },
     /// Cancel landed. TUI: drop_empty_thinking, push Error(abort_msg),
@@ -887,6 +1373,11 @@ pub enum OwnerChangeReason {
     Takeover,
     OwnerDetached,
     Reload,
+    /// `client_input = shared`: this client sent input, so it is now the
+    /// active one. Sent only to clients declaring
+    /// `ClientCapabilities::owner_reason_input`: an older one never sees an
+    /// owner change on a shared session (`wire::legacy_shared`).
+    Input,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1031,6 +1522,11 @@ pub struct AttachSnapshot {
     pub replay: Vec<Envelope>,
     pub pending_prompts: Vec<PromptRequest>,
     pub clients: Vec<(ClientId, ClientKind)>,
+    /// Every attached client with its resolved name (`clients` stays for
+    /// older clients). Empty from an older daemon.
+    pub roster: Vec<ClientInfo>,
+    /// Who may drive ([`ClientInput`]); `Exclusive` from an older daemon.
+    pub client_input: ClientInput,
     /// Who owns input right now (B1) — so a joiner knows immediately
     /// whether its keystrokes will be honoured.
     pub input_owner: Option<ClientId>,
@@ -1041,23 +1537,19 @@ pub struct AttachSnapshot {
 
 impl AttachSnapshot {
     /// For the client this snapshot was made for (`me`): who owns input, if
-    /// someone else does — "input is owned by client #1 (tui); attach with
+    /// someone else does — "input is owned by tui (#1); attach with
     /// --takeover to steal it". Rendered by each client from its OWN
     /// snapshot; the actor used to broadcast it as a `SystemNotice`, which
     /// every attached client (the owner included) and later attach replays
     /// showed.
+    /// `None` with `client_input = shared`: every drive client may type.
     pub fn input_owned_elsewhere(&self, me: ClientId) -> Option<String> {
+        if self.client_input == ClientInput::Shared {
+            return None;
+        }
         let owner = self.input_owner.filter(|o| *o != me)?;
-        let kind = self
-            .clients
-            .iter()
-            .find(|(c, _)| *c == owner)
-            .map(|(_, k)| format!("{k:?}").to_lowercase())
-            .unwrap_or_else(|| "?".into());
-        Some(format!(
-            "input is owned by client #{} ({kind}); attach with --takeover to steal it",
-            owner.0
-        ))
+        let who = Roster::from_snapshot(self).label(owner);
+        Some(format!("input is owned by {who}; attach with --takeover to steal it"))
     }
 }
 
@@ -1081,6 +1573,67 @@ pub mod reasoning_level_serde {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn client_names_are_short_plain_labels() {
+        for ok in ["tui", "discord", "Dash_2", "a", "9lives", &"x".repeat(CLIENT_NAME_MAX)] {
+            assert_eq!(validate_client_name(ok), Ok(()), "{ok}");
+        }
+        for bad in ["", "-lead", "_lead", "has space", "dots.no", "émoji", &"x".repeat(CLIENT_NAME_MAX + 1)] {
+            let err = validate_client_name(bad).unwrap_err();
+            assert!(err.starts_with("invalid client name"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_session_resolves_names_to_unique_ones() {
+        // Requested, else the kind's name; an invalid request falls back.
+        assert_eq!(resolve_client_name(Some("discord"), ClientKind::Rpc, []), "discord");
+        assert_eq!(resolve_client_name(None, ClientKind::Tui, []), "tui");
+        assert_eq!(resolve_client_name(Some("no spaces"), ClientKind::Attach, []), "attach");
+        // Taken (case-insensitively): lowest free suffix from 2.
+        assert_eq!(resolve_client_name(None, ClientKind::Tui, ["tui"]), "tui-2");
+        assert_eq!(resolve_client_name(Some("TUI"), ClientKind::Tui, ["tui", "tui-2"]), "TUI-3");
+        assert_eq!(resolve_client_name(None, ClientKind::Tui, ["tui", "tui-3"]), "tui-2");
+        // A freed name is reused.
+        assert_eq!(resolve_client_name(None, ClientKind::Tui, ["tui-2"]), "tui");
+    }
+
+    #[test]
+    fn a_roster_follows_joins_and_leaves_and_labels_by_name() {
+        let joined = |id: u64, name: &str, mode: AttachMode| SessionEventWire::ClientJoined {
+            client: ClientId(id),
+            kind: ClientKind::Attach,
+            name: name.to_string(),
+            mode,
+        };
+        let mut r = Roster::default();
+        r.apply(&joined(2, "dash", AttachMode::Observe));
+        r.apply(&joined(1, "terminal", AttachMode::Mirror));
+        // An older daemon's join has no name: the kind's is used.
+        r.apply(&joined(3, "", AttachMode::Mirror));
+        let ids: Vec<u64> = r.clients().iter().map(|c| c.id.0).collect();
+        assert_eq!(ids, [1, 2, 3], "kept in id order");
+        assert_eq!(r.get(ClientId(2)).unwrap().mode, AttachMode::Observe);
+        assert_eq!(r.label(ClientId(1)), "terminal (#1)");
+        assert_eq!(r.label(ClientId(3)), "attach (#3)");
+        r.apply(&SessionEventWire::ClientLeft { client: ClientId(1) });
+        assert_eq!(r.label(ClientId(1)), "client #1", "gone: id only");
+        assert_eq!(r.clients().len(), 2);
+    }
+
+    /// prA I-R5 minor: line/paragraph separators and the Arabic letter mark
+    /// are stripped with the other format characters; ZWNJ/ZWJ are kept so
+    /// emoji sequences and scripts that need them render intact.
+    #[test]
+    fn sanitize_prompt_text_strips_separators_keeps_zwj_zwnj() {
+        let input = "a\u{2028}b\u{2029}c\u{061C}d\u{200B}e\u{200E}f\u{200F}g\u{202E}h\u{2067}i\x1bj\tk\nl";
+        assert_eq!(sanitize_prompt_text(input), "abcdefghij k\nl");
+        let family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}";
+        assert_eq!(sanitize_prompt_text(family), family, "ZWJ emoji intact");
+        let persian = "\u{0645}\u{06CC}\u{200C}\u{062E}\u{0648}\u{0627}\u{0647}\u{0645}";
+        assert_eq!(sanitize_prompt_text(persian), persian, "ZWNJ intact");
+    }
 
     #[test]
     fn prompt_kind_from_title() {
@@ -1295,13 +1848,21 @@ mod tests {
             SessionCommand::Checkpoint { reason: CheckpointReason::Reload },
             SessionCommand::KeepWarm { on: true },
             SessionCommand::Query { id: 3, query: SessionQuery::ContextReport },
+            SessionCommand::Query {
+                id: 4,
+                query: SessionQuery::SubagentWatch { handle_id: "sa_2".into(), since: 7, tool_queue: true },
+            },
+            SessionCommand::SubagentSteer { handle_id: "sa_2".into(), text: "focus on X".into() },
             SessionCommand::DriverStart { plugin: "p".into(), command: "auto".into(), arg: "start -- hi".into() },
+            SessionCommand::TakeInput,
         ];
         for cmd in cmds {
             let json = serde_json::to_string(&cmd).unwrap();
             let back: SessionCommand = serde_json::from_str(&json).unwrap();
             assert_eq!(serde_json::to_string(&back).unwrap(), json);
         }
+        let take: SessionCommand = serde_json::from_str(r#"{"cmd":"take_input"}"#).unwrap();
+        assert!(matches!(take, SessionCommand::TakeInput));
         let cp: SessionCommand = serde_json::from_str(r#"{"cmd":"checkpoint","reason":"host_request"}"#).unwrap();
         assert!(matches!(cp, SessionCommand::Checkpoint { reason: CheckpointReason::HostRequest }));
     }
@@ -1312,6 +1873,7 @@ mod tests {
         let cmds = vec![
             SessionCommand::Submit { text: secret.into(), attachments: vec![] },
             SessionCommand::Steer { text: secret.into() },
+            SessionCommand::SubagentSteer { handle_id: "sa_1".into(), text: secret.into() },
             SessionCommand::SubmitPrepared {
                 messages: vec![std::sync::Arc::new(serde_json::json!({"content": secret}))],
                 user_text: Some(secret.into()),
@@ -1430,4 +1992,20 @@ mod double_option {
             assert_eq!(absent.continue_session, None);
         }
     }
+}
+
+/// Where a daemon session writes its pin (`daemon::pins::PinBook`). The
+/// actor calls it exactly when the pin changes, when a pinned session moves
+/// to a new journal or is renamed, and when a pinned session is ended on
+/// purpose. Implementations do their own I/O and never fail the caller.
+pub trait PinSink: Send + Sync {
+    /// The session is pinned: add or refresh its entry (`journal_id` is
+    /// current; `id` is the actor id, which may name an older journal).
+    /// `cache_keepwarm`: the session's `/keepwarm` override (`off`/`auto`/`<N>h`).
+    fn pinned(&self, id: &str, journal_id: &str, name: Option<&str>, cwd: Option<&std::path::Path>, cache_keepwarm: Option<&str>);
+    /// Unpinned, or ended on purpose while pinned: drop its entry.
+    fn unpinned(&self, id: &str, journal_id: &str);
+    /// A pinned session's journal changed (`/clear`, a successor compaction,
+    /// resume): the entry follows it.
+    fn moved(&self, from: &str, to: &str);
 }

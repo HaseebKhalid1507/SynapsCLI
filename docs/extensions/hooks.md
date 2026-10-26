@@ -50,7 +50,8 @@ Unsupported result actions are ignored fail-open and logged as warnings.
   `on_session_start` (appended to the system prompt once, session-stable).
   See `protocol.md` §`inject` for the placement contract.
 - `modify` replaces the tool input before execution. It is accepted only on
-  `before_tool_call`; the first modifier stops the handler chain.
+  `before_tool_call`. Only `block` stops the chain: later handlers see the
+  modified input. See `protocol.md` §Handler chain order.
 - `replace` substitutes the tool **output** after execution, before it enters
   conversation history. It is accepted only on `after_tool_call`, and requires
   the **`tools.transform_output`** permission **in addition to** `tools.intercept`

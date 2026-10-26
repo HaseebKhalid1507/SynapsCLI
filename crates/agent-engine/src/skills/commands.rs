@@ -145,8 +145,10 @@ fn empty_tool_context() -> ToolContext {
             tx_events: None,
         },
         capabilities: ToolCapabilities {
+            session_allow_all: None,
             launch_cancel: None,
             memory_backend: None,
+            telemetry: None,
             watcher_exit_path: None,
             tool_register_tx: None,
             session_manager: None,
@@ -164,6 +166,7 @@ fn empty_tool_context() -> ToolContext {
             env: None,
             env_stripped: Vec::new(),
             env_warned: Default::default(),
+            session_id: None,
         },
         limits: ToolLimits {
             max_tool_output: 30_000,

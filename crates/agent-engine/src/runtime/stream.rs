@@ -2,10 +2,10 @@ use super::api::ApiMethods;
 use super::helpers::HelperMethods;
 use super::types::{AuthState, LlmEvent, SessionEvent, StreamEvent};
 use super::{
-    emit_after_tool_call, emit_before_tool_call, resolve_before_tool_call_decision,
+    emit_after_tool_call_outcome, emit_before_tool_call, resolve_before_tool_call_decision,
     BeforeToolCallDecision,
 };
-use crate::extensions::hooks::events::HookEvent;
+use crate::extensions::hooks::events::{HookEvent, HookResult};
 use crate::{Result, RuntimeError, SharedMessage, ToolRegistry};
 use reqwest::Client;
 use serde_json::{json, Value};
@@ -190,6 +190,8 @@ pub(super) struct StreamSession {
     pub(super) env_warned: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     pub(super) secret_prompt: Option<crate::tools::SecretPromptHandle>,
     pub(super) auto_approve_confirms: bool,
+    /// Session "Allow all" latch shared with the owning [`Runtime`].
+    pub(super) session_allow_all: Arc<crate::tools::SessionConfirmLatch>,
     pub(super) telemetry_level: crate::runtime::telemetry::TelemetryLevel,
     pub(super) orchestration: Option<Arc<crate::orchestration::OrchestrationRuntime>>,
     pub(super) delegation_parent: Option<String>,
@@ -209,6 +211,10 @@ pub(super) struct StreamSession {
     /// across turns, so exact activations live for the session (as the
     /// `activate_tools` contract says), not for one provider turn.
     pub(super) retained_tool_set: crate::tools::activation::RetainedSessionToolSet,
+    /// Activations handed over from this conversation's previous runtime,
+    /// restored at the first progressive turn start (see
+    /// `restore_pending_activations`).
+    pub(super) pending_tool_restore: crate::tools::activation::PendingToolRestore,
     /// Shared exact MCP lease manager (Task 19); `None` when MCP exact
     /// mode is not active.
     pub(super) mcp_runtime: Option<Arc<crate::mcp::McpRuntimeManager>>,
@@ -224,6 +230,9 @@ pub(super) struct StreamSession {
         Option<Arc<crate::extensions::lease::ExtensionSessionEndGuard>>,
     /// Per-turn budget (Task 23, spec §8.1).
     pub(super) turn_budget: crate::runtime::budget::TurnBudget,
+    /// Event-started turns only: the owner's steer moves the turn onto the
+    /// session budget it carries.
+    pub(super) owner_steer_budget: Option<Arc<crate::runtime::budget::OwnerSteerBudget>>,
 }
 
 pub(super) struct StreamMethods;
@@ -240,23 +249,36 @@ pub(super) struct StreamMethods;
 /// Flag-off (full-schema) sessions keep the per-turn set: every trusted tool
 /// is already in their core. `SYNAPS_TOOLSET_CARRY_FORWARD=0` restores the
 /// zero-inherit behavior here too.
+///
+/// Activations handed over from the same conversation's previous runtime
+/// (`pending`: a daemon reload or an unpark) are restored into the selected
+/// set here, at the first turn start, against this turn's catalog — see
+/// [`restore_pending_activations`] for the checks and the policy.
 fn retain_session_tool_set(
     retained: &crate::tools::activation::RetainedSessionToolSet,
+    pending: &crate::tools::activation::PendingToolRestore,
     fresh: crate::tools::activation::SessionToolSet,
     catalog: &crate::tools::catalog::ToolCatalog,
     progressive: bool,
+    activation_confirm: agent_core::config::ActivationConfirm,
 ) -> crate::tools::activation::SharedSessionToolSet {
     if !progressive || !crate::tools::activation::carry_forward_enabled() {
+        // Nothing to restore into: a full-schema set already holds every
+        // trusted tool. `pending` stays, so a later export still carries it.
         return std::sync::Arc::new(std::sync::RwLock::new(fresh));
     }
     let mut slot = retained
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let fresh = if let Some(existing) = slot.as_ref() {
+    let carried = pending
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    let mut fresh = if let Some(existing) = slot.as_ref() {
         let mut set = existing
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (next, dropped, reused) =
+        let (mut next, dropped, reused) =
             select_turn_start_tool_set(Some(&*set), fresh, catalog, progressive);
         if reused {
             for d in &dropped {
@@ -266,6 +288,14 @@ fn retain_session_tool_set(
                     "activation dropped at turn start"
                 );
             }
+            if let Some(carried) = &carried {
+                log_restore(&restore_pending_activations(
+                    &mut next,
+                    carried,
+                    catalog,
+                    activation_confirm,
+                ));
+            }
             *set = next;
             drop(set);
             return std::sync::Arc::clone(existing);
@@ -274,9 +304,66 @@ fn retain_session_tool_set(
     } else {
         fresh
     };
+    if let Some(carried) = &carried {
+        log_restore(&restore_pending_activations(
+            &mut fresh,
+            carried,
+            catalog,
+            activation_confirm,
+        ));
+    }
     let shared = std::sync::Arc::new(std::sync::RwLock::new(fresh));
     *slot = Some(std::sync::Arc::clone(&shared));
     shared
+}
+
+/// Restore activations the same conversation held in its previous runtime
+/// (daemon reload, park → unpark) into `set`, a set built for THIS runtime's
+/// tool session against `catalog`.
+///
+/// Policy (`tools.activation_confirm`, read from the RESTORING runtime):
+/// - `deny`: nothing is restored. Under `deny` this runtime refuses every
+///   model-initiated activation and lists no activatable tools in the
+///   system prompt, so a carried grant is dropped (reported `Denied`).
+/// - `auto` / `prompt`: restored without a new prompt. The grant was
+///   already approved in this conversation; restoring continues it, it is
+///   not a new grant. Each entry is still re-validated against the current
+///   catalog (schema digest + trust provenance pins + source trust,
+///   [`crate::tools::activation::SessionToolSet::restore_carried`]); a
+///   drifted or removed tool is dropped fail-closed and reported.
+pub(super) fn restore_pending_activations(
+    set: &mut crate::tools::activation::SessionToolSet,
+    carried: &[crate::tools::activation::CarriedActivation],
+    catalog: &crate::tools::catalog::ToolCatalog,
+    activation_confirm: agent_core::config::ActivationConfirm,
+) -> crate::tools::activation::RestoreReport {
+    use crate::tools::activation::{RestoreDropReason, RestoreReport};
+    if activation_confirm == agent_core::config::ActivationConfirm::Deny {
+        return RestoreReport {
+            restored: Vec::new(),
+            dropped: carried
+                .iter()
+                .map(|c| (c.tool_id.clone(), RestoreDropReason::Denied))
+                .collect(),
+        };
+    }
+    set.restore_carried(carried, catalog)
+}
+
+fn log_restore(report: &crate::tools::activation::RestoreReport) {
+    for (tool, reason) in &report.dropped {
+        tracing::warn!(
+            tool = %tool,
+            reason = ?reason,
+            "carried activation not restored (dropped fail-closed)"
+        );
+    }
+    if !report.restored.is_empty() {
+        tracing::info!(
+            restored = ?report.restored.iter().map(|id| id.as_str()).collect::<Vec<_>>(),
+            "restored activations carried from the previous runtime"
+        );
+    }
 }
 
 /// The pre-request context assessment of a stream round over the round's
@@ -567,6 +654,7 @@ impl StreamMethods {
             env_warned,
             secret_prompt,
             auto_approve_confirms,
+            session_allow_all,
             telemetry_level,
             orchestration,
             delegation_parent,
@@ -576,12 +664,19 @@ impl StreamMethods {
             activation_confirm,
             tool_session_id,
             retained_tool_set,
+            pending_tool_restore,
             mcp_runtime,
             mcp_session_scope,
             extension_runtime,
             extension_session_scope,
             turn_budget,
+            owner_steer_budget,
         } = session;
+        // Handed to every subagent this turn spawns (see `inherit_telemetry`).
+        let worker_telemetry = crate::runtime::telemetry::WorkerTelemetry {
+            level: telemetry_level,
+            writer: options.telemetry.clone(),
+        };
         let codex_parent_plan = crate::Runtime::codex_delegation_plan(
             &model,
             reasoning_level,
@@ -626,6 +721,13 @@ impl StreamMethods {
             &continuation,
             &memory_backend
         ))?;
+        // Host-owned identity of the request that started this turn; later
+        // steered/pushed messages must not displace it at rollover.
+        // Tags a genuinely new turn's request with a stable id (host metadata,
+        // stripped from every provider wire) or keeps a resumed turn's start.
+        if context_enabled {
+            super::continuation::record_turn_start(&continuation, &mut messages);
+        }
         if context_enabled && memory_backend.exclusive() && !memory_backend.is_axel() {
             return Err(crate::RuntimeError::Config(
                 "automatic context management requires a configured memory backend; selected backend unavailable and no fallback; history unchanged".into(),
@@ -640,7 +742,7 @@ impl StreamMethods {
                 crate::tools::context_checkpoint::ContextCheckpointTool(continuation.clone()),
             ));
             for name in ["memory_search", "memory_fetch"] {
-                if registry.get(name).map_or(true, |tool| {
+                if registry.get(name).is_none_or(|tool| {
                     tool.origin() != crate::tools::ToolOrigin::Builtin
                 }) {
                     return Err(crate::RuntimeError::Config("automatic context management requires builtin memory_search and memory_fetch; history unchanged".into()));
@@ -698,9 +800,11 @@ impl StreamMethods {
             );
             retain_session_tool_set(
                 &retained_tool_set,
+                &pending_tool_restore,
                 fresh,
                 registry.catalog(),
                 progressive_tool_disclosure,
+                activation_confirm,
             )
         };
         // Thread the RETAINED handle into the extension-provider route so
@@ -755,11 +859,11 @@ impl StreamMethods {
                     elapsed_secs = budget_meter.elapsed().as_secs(),
                     max_elapsed_secs = ?budget_meter.budget().max_elapsed_secs(),
                     rounds_used = budget_meter.rounds_used(),
-                    max_provider_rounds = budget_meter.budget().max_provider_rounds,
+                    max_provider_rounds = ?budget_meter.budget().max_provider_rounds,
                     round_renewals_used = budget_meter.round_renewals_used(),
                     max_round_renewals = budget_meter.budget().max_round_renewals,
                     tool_calls_used = budget_meter.tool_calls_used(),
-                    max_tool_calls = budget_meter.budget().max_tool_calls,
+                    max_tool_calls = ?budget_meter.budget().max_tool_calls,
                     tool_result_bytes = budget_meter.tool_result_bytes_used(),
                     "turn ended: budget exhausted"
                 );
@@ -771,7 +875,37 @@ impl StreamMethods {
             }};
         }
 
+        // Every steering drain. In an event-started turn, the drain that
+        // delivers the owner's own message also moves the turn onto the
+        // session budget; usage so far keeps counting.
+        macro_rules! drain_steering {
+            () => {{
+                let mut drain = || HelperMethods::drain_steering(&mut steering_rx, &mut messages, &tx);
+                let (steered, owner_budget) = match owner_steer_budget.as_deref() {
+                    Some(lift) => lift.drain(drain),
+                    None => (drain(), None),
+                };
+                if let Some(budget) = owner_budget {
+                    if &budget != budget_meter.budget() {
+                        tracing::info!(
+                            event = "turn_budget_owner_steer",
+                            rounds_used = budget_meter.rounds_used(),
+                            tool_calls_used = budget_meter.tool_calls_used(),
+                            max_provider_rounds = ?budget.max_provider_rounds,
+                            max_tool_calls = ?budget.max_tool_calls,
+                            "event turn moved to the session budget: the owner steered it"
+                        );
+                    }
+                    budget_meter.switch_budget(budget);
+                }
+                steered
+            }};
+        }
+
         let mut round_checkpoint = RoundCheckpoint::default();
+        // Muse dangling-preamble continuation: at most once per user turn
+        // (this run), so a model that keeps stopping on a preamble cannot loop.
+        let mut preamble_nudged = false;
         loop {
             // Check for cancellation before each API call
             if cancel.is_cancelled() {
@@ -782,7 +916,7 @@ impl StreamMethods {
             // Steering accepted while async stream setup was connecting must
             // reach the FIRST request, not wait until its tools have executed.
             // Subsequent rounds use the same path and normal request validation.
-            HelperMethods::drain_steering(&mut steering_rx, &mut messages, &tx);
+            drain_steering!();
 
             // ═══ ROUND CHECKPOINT ═══
             // Every iteration starts on a valid history (the prompt on the
@@ -803,9 +937,11 @@ impl StreamMethods {
             // exhaustion is a soft checkpoint, not a turn-ending failure —
             // long, legitimate agentic tasks would otherwise die mid-flight.
             // Renew the round allowance a bounded number of times and keep
-            // going; wall-clock (re-checked by begin_round) and the finite
-            // renewal cap still bound any true runaway. Every other dimension
-            // remains a hard stop.
+            // going; the renewal cap bounds rounds only when a round cap is
+            // set. Foreground turns have none by default (a human can
+            // interrupt); autonomous and worker turns do, and a configured
+            // wall-clock (re-checked by begin_round) bounds any role. Every
+            // other dimension remains a hard stop.
             //
             // Context-aware time checkpoints: when context management is
             // enabled, a wall-clock expiry doesn't immediately kill the turn —
@@ -882,6 +1018,8 @@ impl StreamMethods {
                     &client,
                     &credential_source,
                     &token_cache,
+                    Some(&model),
+                    super::auth::RefreshPoint::WithinTurn,
                 )
                 .await?;
             }
@@ -1024,6 +1162,17 @@ impl StreamMethods {
             super::attachments::validate_history_for_request(&model, request_messages)
                 .map_err(RuntimeError::Config)?;
 
+            // Workers have a small request-local upload budget. Never trim
+            // durable/resumable history, and validate original media first.
+            let worker_messages;
+            let request_messages =
+                if options.codex_request_role == super::openai::catalog::CodexRequestRole::Worker {
+                    worker_messages = super::image_limits::cap_worker_images(request_messages);
+                    worker_messages.as_deref().unwrap_or(request_messages)
+                } else {
+                    request_messages
+                };
+
             // History image byte cap: the per-turn byte budget resets every
             // turn but base64 images live in history forever. Bound the wire
             // by degrading the OLDEST image blocks to a text label once the
@@ -1094,6 +1243,9 @@ impl StreamMethods {
 
             // ═══ CONTEXT CONTINUATION: pre-request assessment ═══
             let mut context_advisory = None;
+            // (estimated footprint, usage records before the call) for this
+            // round's request; pairs with the provider-reported usage below.
+            let mut calibration_probe = None;
             if context_enabled {
                 use super::continuation::{ContextAdvisory, ADVISORY_RESERVE_TOKENS};
                 use agent_core::core::context_policy::{assess_context, ContextAction};
@@ -1112,12 +1264,15 @@ impl StreamMethods {
                     thinking_budget as u64,
                     max_tool_output as u64,
                 );
+                calibration_probe = Some((assessment.used_tokens(), usage_counters.records()));
                 let decision = {
                     let mut s = continuation
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                     let d = assess_context(&s.config, &s.policy, budget);
                     s.policy = d.next_state;
+                    // Informational only: surfaced to on_message_complete hooks.
+                    s.last_band = Some(d.band);
                     d
                 };
                 let current_advisory;
@@ -1147,28 +1302,33 @@ impl StreamMethods {
                             tx.send(StreamEvent::Session(SessionEvent::MessageHistory(messages)));
                         return Err(crate::RuntimeError::Config("rollover requires admitted builtin history retrieval tools; history retained".into()));
                     }
-                    let workers_pending = orchestration
-                        .as_ref()
-                        .is_some_and(|o| !o.unreconciled_runtime_handles().is_empty())
-                        || subagent_registry
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .list_active()
-                            .iter()
-                            .any(|(_, _, status)| {
-                                matches!(status, super::subagent::SubagentStatus::Running)
-                            });
-                    if workers_pending {
-                        if time_checkpoint {
-                            finish_budget_exceeded!(agent_core::BudgetDimension::WallClock);
-                        }
-                        if decision.action == ContextAction::HardStop {
-                            let _ = tx
-                                .send(StreamEvent::Session(SessionEvent::MessageHistory(messages)));
-                            return Err(crate::RuntimeError::Config("context hard limit reached with pending workers; collect/reconcile before continuing; history retained".into()));
-                        }
+                    // Workers still in flight (running, or finished but not
+                    // collected+reconciled). A due rollover waits a bounded
+                    // grace for the model to collect them, then proceeds and
+                    // carries a manifest of them into the next window. Hard
+                    // capacity never waits: refusing there used to deadlock
+                    // the session, since collecting needs the very model
+                    // round being refused (incident 2026-10-13).
+                    let pending_workers = super::subagent::pending_workers(
+                        &subagent_registry,
+                        orchestration.as_deref(),
+                    );
+                    let gate = continuation
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .worker_gate(
+                            !pending_workers.is_empty(),
+                            decision.action == ContextAction::HardStop,
+                            time_checkpoint,
+                        );
+                    if gate == super::continuation::WorkerGate::EndTurnForTime {
+                        finish_budget_exceeded!(agent_core::BudgetDimension::WallClock);
+                    }
+                    if gate == super::continuation::WorkerGate::Defer {
                         current_advisory = Some(ContextAdvisory::WorkersPending);
                     } else {
+                        let worker_manifest =
+                            super::subagent::render_worker_manifest(&pending_workers);
                         let minimum_reserve = continuation
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1185,13 +1345,39 @@ impl StreamMethods {
                                         super::context::estimate_history(&messages),
                                     )),
                             );
+                        // Aim the successor at the configured footprint, measured
+                        // like `used_tokens` (system + schemas + messages) and
+                        // calibrated to the provider-reported count when known.
+                        let target = {
+                            let s = continuation
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            let thresholds =
+                                agent_core::core::context_policy::ContextThresholds::resolve(
+                                    &s.config,
+                                    context_window,
+                                );
+                            match thresholds {
+                                Ok(t) => super::continuation::successor_budget(
+                                    t.target_tokens(&s.config),
+                                    t.pressure_tokens,
+                                    assessment.used_tokens().saturating_sub(
+                                        super::context::estimate_history(&messages),
+                                    ),
+                                    s.calibration_for(&model),
+                                ),
+                                Err(_) => super::continuation::SuccessorBudget::UNBOUNDED,
+                            }
+                        };
                         match super::continuation::rollover_for_boundary(
                             &messages,
                             &continuation,
                             &memory_backend,
                             history_budget,
+                            target,
                             &cancel,
                             time_checkpoint,
+                            &worker_manifest,
                         )
                         .await
                         {
@@ -1242,7 +1428,16 @@ impl StreamMethods {
                                 // Already published: the next round checkpoint
                                 // must not re-send the identical head.
                                 round_checkpoint.mark_published(&messages);
-                                let _=tx.send(StreamEvent::Session(SessionEvent::Notice(format!("Continued automatically in context window {window} with a fresh wall-clock allowance; earlier eligible source evidence remains searchable. Other resource limits remain unchanged. No summarizing compaction."))));
+                                let carried = if pending_workers.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!(
+                                        " Carried {} pending worker{} into the new window.",
+                                        pending_workers.len(),
+                                        if pending_workers.len() == 1 { "" } else { "s" }
+                                    )
+                                };
+                                let _=tx.send(StreamEvent::Session(SessionEvent::Notice(format!("Continued automatically in context window {window} with a fresh wall-clock allowance; earlier eligible source evidence remains searchable. Other resource limits remain unchanged. No summarizing compaction.{carried}"))));
                                 continue;
                             }
                             Err(error) => {
@@ -1256,18 +1451,22 @@ impl StreamMethods {
                 } else {
                     current_advisory = ContextAdvisory::from_assessment(&decision);
                 }
-                context_advisory = continuation
+                let transition = continuation
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .update_advisory(current_advisory);
-                if let Some(advisory) = context_advisory {
+                if let Some(advisory) = transition {
                     let _ = tx.send(StreamEvent::Session(SessionEvent::Notice(
                         advisory.notice(assessment.used_tokens()),
                     )));
                 }
+                // UI notices are edge-triggered; the model's reminder to collect
+                // pending workers rides every deferred round.
+                context_advisory = ContextAdvisory::for_request(transition, current_advisory);
             }
 
-            // Request-only pressure message, once per state transition.
+            // Request-only advisory: once per state transition, or every
+            // round while a due rollover waits on workers.
             let pressure_request;
             let request_messages = if let Some(advisory) = context_advisory {
                 pressure_request = request_messages
@@ -1317,9 +1516,30 @@ impl StreamMethods {
             // Optional usage dimensions (context tokens / cost), fed by
             // the transport's authoritative Usage emission this round.
             segment_has_provider_round = true;
-            if let Err(dimension) = budget_meter.check_usage(&usage_counters) {
-                finish_budget_exceeded!(dimension);
+            // Only a request that booked provider usage yields a sample. The
+            // Anthropic transport reads omitted cache fields as zero (it cannot
+            // tell them from a real zero); an implausible ratio clears the
+            // sample so selection falls back to the conservative estimator.
+            if let Some((estimated_tokens, before)) = calibration_probe {
+                if usage_counters.records() > before {
+                    // A booked zero count is a sample too: it fails the
+                    // plausibility check and clears any stale ratio.
+                    continuation
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .record_calibration(
+                            &model,
+                            super::continuation::TokenCalibration {
+                                provider_tokens: usage_counters.latest_context_tokens(),
+                                estimated_tokens,
+                            },
+                        );
+                }
             }
+            // A usage stop (cost, total tokens, context tokens) lands AFTER the
+            // round was paid for: its response is kept in history below (tool
+            // calls paired with "not executed" results) before the turn ends.
+            let usage_exhausted = budget_meter.check_usage(&usage_counters).err();
 
             // Check if Claude wants to use tools
             if let Some(content) = response["content"].as_array() {
@@ -1340,6 +1560,9 @@ impl StreamMethods {
                 // emitted text before the tool_use. Commit history cleanly
                 // instead of dropping the entire turn as an error.
                 if content.is_empty() {
+                    if let Some(dimension) = usage_exhausted {
+                        finish_budget_exceeded!(dimension);
+                    }
                     let after_tool_result = budget_meter.rounds_used() > 1;
                     if after_tool_result && !cancel.is_cancelled() {
                         // Legitimate empty end_turn after tool results — clean finish.
@@ -1383,6 +1606,35 @@ impl StreamMethods {
                     "content": content
                 })));
 
+                if let Some(dimension) = usage_exhausted {
+                    // Keep the paid-for response; none of its calls run.
+                    if !tool_uses.is_empty() {
+                        let content = format!(
+                            "{}: turn {} budget exhausted",
+                            crate::runtime::budget::TOOL_CALL_NOT_EXECUTED,
+                            dimension.as_str().replace('_', " ")
+                        );
+                        let results: Vec<Value> = tool_uses
+                            .iter()
+                            .filter_map(|tool_use| tool_use["id"].as_str())
+                            .map(|tool_id| {
+                                let _ = tx.send(StreamEvent::Llm(LlmEvent::ToolResult {
+                                    tool_id: tool_id.to_string(),
+                                    result: content.clone(),
+                                }));
+                                json!({
+                                    "type": "tool_result",
+                                    "tool_use_id": tool_id,
+                                    "content": content,
+                                    "is_error": true
+                                })
+                            })
+                            .collect();
+                        messages.push(Arc::new(json!({"role": "user", "content": results})));
+                    }
+                    finish_budget_exceeded!(dimension);
+                }
+
                 // Batched context_checkpoint rejection: if the model called
                 // context_checkpoint alongside other tools, reject the batch
                 // so the host can assess rollover before more work.
@@ -1395,15 +1647,30 @@ impl StreamMethods {
                 }
 
                 let assistant_text = assistant_text_from_content(content);
+                let context_management = continuation
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .hook_context_management();
                 let hook_event = HookEvent::on_message_complete(
                     &assistant_text,
                     json!({
                         "content_block_count": content.len(),
                         "has_tool_use": !tool_uses.is_empty(),
+                        "context_management": context_management,
                     }),
                 )
                 .with_session(session_id.as_deref());
-                let _ = hook_bus.emit(&hook_event).await;
+                // An extension may report an advisory work phase; it is
+                // applied exactly like the model's own `context_checkpoint`
+                // (no note) and is never capacity or permission authority.
+                if let HookResult::ContextPhase { phase } = hook_bus.emit(&hook_event).await {
+                    if context_enabled {
+                        continuation
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .report_hook_phase(&phase);
+                    }
+                }
 
                 // If no tool uses, check for steering messages before finishing.
                 // Steering can redirect the model even when it has no more tool calls.
@@ -1412,7 +1679,33 @@ impl StreamMethods {
                     // the channel stays undelivered (the frontend dequeues it)
                     // instead of entering history after the cancel.
                     let steered = !cancel.is_cancelled()
-                        && HelperMethods::drain_steering(&mut steering_rx, &mut messages, &tx);
+                        && drain_steering!();
+                    // Muse ended on an announced-but-unperformed action ("Blocking
+                    // question before I build anything:"). Continue ONCE with a
+                    // visible harness note instead of silently ending the turn.
+                    // Only the Muse route sets the sidecar; steering wins.
+                    if !steered {
+                        if let Some(reason) = crate::runtime::openai::stream::take_preamble_nudge(
+                            &response,
+                            &mut preamble_nudged,
+                            response_cancelled || cancel.is_cancelled(),
+                            crate::runtime::openai::stream::preamble_nudge_enabled(),
+                        ) {
+                            tracing::info!(
+                                event = "muse_preamble_nudge",
+                                reason = reason.as_str(),
+                                "continuing turn once after a dangling preamble"
+                            );
+                            let _ = tx.send(StreamEvent::Session(SessionEvent::Notice(
+                                crate::runtime::openai::stream::PREAMBLE_NUDGE_NOTICE.to_string(),
+                            )));
+                            messages.push(Arc::new(json!({
+                                "role": "user",
+                                "content": crate::runtime::openai::stream::PREAMBLE_NUDGE,
+                            })));
+                            continue;
+                        }
+                    }
                     if !steered {
                         // No steering, truly done. Completion is still subject to the
                         // session orchestration policy (including streamed runs).
@@ -1618,6 +1911,7 @@ impl StreamMethods {
                                     .await,
                                     secret_prompt.as_ref(),
                                     auto_approve_confirms,
+                                    Some(&session_allow_all),
                                 )
                                 .await;
                                 if let BeforeToolCallDecision::Block { reason } = decision {
@@ -1630,7 +1924,7 @@ impl StreamMethods {
                                     let input_for_hook = input.clone();
                                     match await_tool_call(&cancel, tool.execute_rich(input, crate::ToolContext {
                                             channels: crate::tools::ToolChannels { tx_delta: Some(tx_d), tx_events: Some(tx.clone()) },
-                                            capabilities: crate::tools::ToolCapabilities { launch_cancel: Some(cancel.clone()), memory_backend: Some(memory_backend.clone()), watcher_exit_path: watcher_exit_path.clone(), tool_register_tx: Some(tool_reg_tx.clone()), session_manager: Some(session_manager.clone()), subagent_registry: Some(subagent_registry.clone()), event_queue: Some(event_queue.clone()), delegation_parent: delegation_parent.clone(), codex_parent_plan: codex_parent_plan.clone(), secret_prompt: secret_prompt.clone(), orchestration: orchestration.clone(), tool_activation: Some(crate::tools::discovery::ActivationCapability::new(catalog_snapshot.clone(), std::sync::Arc::clone(&session_tool_set), activation_authority).with_host_prompt(activation_prompt_allowed)), mcp_leases: mcp_lease_capability.clone(), extension_leases: extension_lease_capability.clone(), memory_context: memory_context.clone(), cwd: cwd.clone(), env: env.clone(), env_stripped: env_stripped.clone(), env_warned: env_warned.clone() },
+                                            capabilities: crate::tools::ToolCapabilities { session_allow_all: Some(session_allow_all.clone()), launch_cancel: Some(cancel.clone()), memory_backend: Some(memory_backend.clone()), telemetry: Some(worker_telemetry.clone()), watcher_exit_path: watcher_exit_path.clone(), tool_register_tx: Some(tool_reg_tx.clone()), session_manager: Some(session_manager.clone()), subagent_registry: Some(subagent_registry.clone()), event_queue: Some(event_queue.clone()), delegation_parent: delegation_parent.clone(), codex_parent_plan: codex_parent_plan.clone(), secret_prompt: secret_prompt.clone(), orchestration: orchestration.clone(), tool_activation: Some(crate::tools::discovery::ActivationCapability::new(catalog_snapshot.clone(), std::sync::Arc::clone(&session_tool_set), activation_authority).with_host_prompt(activation_prompt_allowed)), mcp_leases: mcp_lease_capability.clone(), extension_leases: extension_lease_capability.clone(), memory_context: memory_context.clone(), cwd: cwd.clone(), env: env.clone(), env_stripped: env_stripped.clone(), env_warned: env_warned.clone(), session_id: session_id.clone() },
                                             limits: crate::tools::ToolLimits { max_tool_output, max_tool_buffer: 256 * 1024, bash_timeout, bash_max_timeout, subagent_timeout },
                                         })).await {
                                         (Some(res), _) => {
@@ -1644,7 +1938,7 @@ impl StreamMethods {
                                                     (e.to_string(), None)
                                                 }
                                             };
-                                            let hooked_output = emit_after_tool_call(
+                                            let outcome = emit_after_tool_call_outcome(
                                                 &hook_bus,
                                                 &tool_name,
                                                 Some(&runtime_name),
@@ -1656,8 +1950,11 @@ impl StreamMethods {
                                             // Hook policy: a Replace transform wins over the rich
                                             // blocks — the hook saw only the summary, so keeping
                                             // the image would desync text and image.
-                                            let rich_blocks = drop_rich_if_rewritten(rich_blocks, &hooked_output, &output);
-                                            (hooked_output, rich_blocks)
+                                            let rich_blocks = drop_rich_if_rewritten(rich_blocks, &outcome.output, &output, outcome.replaced);
+                                            if outcome.replaced {
+                                                production_output = None;
+                                            }
+                                            (outcome.output, rich_blocks)
                                         }
                                         (None, started) => {
                                             canceled = true;
@@ -1895,6 +2192,23 @@ impl StreamMethods {
                         lanes[index].push((model_order, tool_id, tool_name, prepared));
                     }
 
+                    // Every call behind another in its lane waits for it:
+                    // say so before any lane starts, in model order, so a
+                    // client can show it as queued rather than running.
+                    // Opt-in signal — a call that leads its lane gets none,
+                    // and each queued call gets `ToolStarted` when it begins.
+                    let mut waiting: Vec<(usize, &str)> = lanes
+                        .iter()
+                        .flat_map(|lane| lane.iter().skip(1))
+                        .map(|(model_order, tool_id, _, _)| (*model_order, tool_id.as_str()))
+                        .collect();
+                    waiting.sort_unstable_by_key(|(model_order, _)| *model_order);
+                    for (_, tool_id) in waiting {
+                        let _ = tx.send(StreamEvent::Llm(LlmEvent::ToolQueued {
+                            tool_id: tool_id.to_string(),
+                        }));
+                    }
+
                     // One task per lane; calls inside a lane run
                     // SEQUENTIALLY in model order, lanes run concurrently.
                     for lane in lanes {
@@ -1918,9 +2232,11 @@ impl StreamMethods {
                         let env_stripped_inner = env_stripped.clone();
                         let env_warned_inner = env_warned.clone();
                         let memory_backend_inner = memory_backend.clone();
+                        let worker_telemetry_inner = worker_telemetry.clone();
                         let memory_context_inner = memory_context.clone();
                         let session_id_inner = session_id.clone();
                         let auto_approve_inner = auto_approve_confirms;
+                        let session_allow_all_inner = session_allow_all.clone();
                         let orchestration_inner = orchestration.clone();
                         let mcp_leases_inner = mcp_lease_capability.clone();
                         let extension_leases_inner = extension_lease_capability.clone();
@@ -1933,7 +2249,14 @@ impl StreamMethods {
 
                         join_set.spawn(async move {
                             let mut lane_results: Vec<(String, bool, Option<String>, Value)> = Vec::new();
-                            for (model_order, tool_id, tool_name, prepared) in lane {
+                            let mut calls = lane.into_iter().enumerate();
+                            for (position, (model_order, tool_id, tool_name, prepared)) in calls.by_ref() {
+                            if position > 0 {
+                                // It was announced `ToolQueued`; it runs now.
+                                let _ = tx_stream.send(StreamEvent::Llm(LlmEvent::ToolStarted {
+                                    tool_id: tool_id.clone(),
+                                }));
+                            }
                             let gate_outcome = match prepared {
                                 PreparedCall::ParseError(err) => {
                                     let _ = tx_stream.send(StreamEvent::Llm(LlmEvent::ToolResult {
@@ -1966,6 +2289,7 @@ impl StreamMethods {
                                         ).await,
                                         prompt_inner.as_ref(),
                                         auto_approve_inner,
+                                        Some(&session_allow_all_inner),
                                     ).await;
                                     if let BeforeToolCallDecision::Block { reason } = decision {
                                         (false, Some(call_effect), format!("Tool call blocked by extension: {}", reason), None, None, None)
@@ -1998,7 +2322,7 @@ impl StreamMethods {
 
                                     match await_tool_call(&cancel_token, t.execute_rich(input, crate::ToolContext {
                                             channels: crate::tools::ToolChannels { tx_delta: Some(tx_d), tx_events: Some(tx_stream.clone()) },
-                                            capabilities: crate::tools::ToolCapabilities { launch_cancel: Some(cancel_token.clone()), memory_backend: Some(memory_backend_inner.clone()), watcher_exit_path: exit_path.clone(), tool_register_tx: Some(tool_reg_tx_inner.clone()), session_manager: Some(session_mgr.clone()), subagent_registry: Some(registry_inner.clone()), event_queue: Some(eq_inner.clone()), delegation_parent: delegation_parent_inner.clone(), codex_parent_plan: codex_parent_plan_inner.clone(), secret_prompt: prompt_inner.clone(), orchestration: orchestration_inner.clone(), tool_activation: Some(activation_inner.clone()), mcp_leases: mcp_leases_inner.clone(), extension_leases: extension_leases_inner.clone(), memory_context: memory_context_inner.clone(), cwd: cwd_inner.clone(), env: env_inner.clone(), env_stripped: env_stripped_inner.clone(), env_warned: env_warned_inner.clone() },
+                                            capabilities: crate::tools::ToolCapabilities { session_allow_all: Some(session_allow_all_inner.clone()), launch_cancel: Some(cancel_token.clone()), memory_backend: Some(memory_backend_inner.clone()), telemetry: Some(worker_telemetry_inner.clone()), watcher_exit_path: exit_path.clone(), tool_register_tx: Some(tool_reg_tx_inner.clone()), session_manager: Some(session_mgr.clone()), subagent_registry: Some(registry_inner.clone()), event_queue: Some(eq_inner.clone()), delegation_parent: delegation_parent_inner.clone(), codex_parent_plan: codex_parent_plan_inner.clone(), secret_prompt: prompt_inner.clone(), orchestration: orchestration_inner.clone(), tool_activation: Some(activation_inner.clone()), mcp_leases: mcp_leases_inner.clone(), extension_leases: extension_leases_inner.clone(), memory_context: memory_context_inner.clone(), cwd: cwd_inner.clone(), env: env_inner.clone(), env_stripped: env_stripped_inner.clone(), env_warned: env_warned_inner.clone(), session_id: session_id_inner.clone() },
                                             limits: crate::tools::ToolLimits { max_tool_output, max_tool_buffer: 256 * 1024, bash_timeout, bash_max_timeout, subagent_timeout },
                                         })).await {
                                         (Some(res), _) => {
@@ -2006,7 +2330,7 @@ impl StreamMethods {
                                                 Ok(o) => { let (t, b) = validated_tool_output(&model_inner, o); (t, b, false) }
                                                 Err(e) => (e.to_string(), None, true),
                                             };
-                                            let hooked_output = emit_after_tool_call(
+                                            let outcome = emit_after_tool_call_outcome(
                                                 &hook_bus_inner,
                                                 &tool_name_for_hook,
                                                 Some(&runtime_name_for_hook),
@@ -2016,11 +2340,12 @@ impl StreamMethods {
                                                 session_id_inner.as_deref(),
                                             ).await;
                                             // Hook Replace wins over rich blocks (see single-tool site).
-                                            let rich_blocks = drop_rich_if_rewritten(rich_blocks, &hooked_output, &output);
+                                            let rich_blocks = drop_rich_if_rewritten(rich_blocks, &outcome.output, &output, outcome.replaced);
                                             // F28: an errored tool's summary carries the exit
-                                            // status; drop the delta-lane handle so it can't win.
-                                            let history_handle = if errored { None } else { Some(output_handle) };
-                                            (false, Some(call_effect), hooked_output, history_handle, Some((stable_tool_id, activation_basis, tool_call_started)), rich_blocks)
+                                            // status; a real Replace is authoritative even when equal
+                                            // to the summary. Neither may lose to the delta lane.
+                                            let history_handle = if errored || outcome.replaced { None } else { Some(output_handle) };
+                                            (false, Some(call_effect), outcome.output, history_handle, Some((stable_tool_id, activation_basis, tool_call_started)), rich_blocks)
                                         }
                                         (None, started) => {
                                             (true, started.then_some(call_effect), turn_completion_inner.cancel_phrase().to_string(), Some(output_handle), Some((stable_tool_id, activation_basis, tool_call_started)), None)
@@ -2120,6 +2445,16 @@ impl StreamMethods {
                                 break;
                             }
                             }
+                            // Calls the lane never reached were announced
+                            // queued and will never start: settle them for
+                            // the UI with the cancel phrase their history
+                            // result gets, or their cards would wait forever.
+                            for (_, (_, tool_id, _, _)) in calls {
+                                let _ = tx_stream.send(StreamEvent::Llm(LlmEvent::ToolResult {
+                                    tool_id,
+                                    result: turn_completion_inner.cancel_phrase().to_string(),
+                                }));
+                            }
                             lane_results
                         });
                     }
@@ -2173,14 +2508,14 @@ impl StreamMethods {
                         dimension = agent_core::BudgetDimension::ToolCalls.as_str(),
                         not_executed = over_budget_tool_uses.len(),
                         tool_calls_used = budget_meter.tool_calls_used(),
-                        max_tool_calls = budget_meter.budget().max_tool_calls,
+                        max_tool_calls = ?budget_meter.budget().max_tool_calls,
                         elapsed_secs = budget_meter.elapsed().as_secs(),
                         "tool calls dropped: turn tool-call budget exhausted"
                     );
                 }
                 for tool_use in &over_budget_tool_uses {
                     if let Some(tool_id) = tool_use["id"].as_str() {
-                        let content = "Tool call not executed: turn tool-call budget exhausted";
+                        let content = crate::runtime::budget::TOOL_CALL_BUDGET_REFUSAL;
                         let _ = tx.send(StreamEvent::Llm(LlmEvent::ToolResult {
                             tool_id: tool_id.to_string(),
                             result: content.to_string(),
@@ -2264,7 +2599,7 @@ impl StreamMethods {
                 // allowing the user to redirect the agent mid-work. Not after
                 // a cancel: the loop top returns the history as-is.
                 if !cancel.is_cancelled() {
-                    HelperMethods::drain_steering(&mut steering_rx, &mut messages, &tx);
+                    drain_steering!();
                 }
 
                 // Continue the loop to get Claude's response with tool results
@@ -2285,8 +2620,9 @@ fn drop_rich_if_rewritten(
     rich_blocks: Option<Vec<Value>>,
     hooked_output: &str,
     output: &str,
+    replaced: bool,
 ) -> Option<Vec<Value>> {
-    if hooked_output == output {
+    if !replaced && hooked_output == output {
         return rich_blocks;
     }
     if rich_blocks.is_some() {
@@ -3052,6 +3388,205 @@ mod rich_output_tests {
         async fn shutdown(&self) {}
     }
 
+    struct StreamingTextTool {
+        summary: String,
+        errored: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for StreamingTextTool {
+        fn name(&self) -> &str {
+            "streaming_stub"
+        }
+        fn description(&self) -> &str {
+            "streams text and returns a separate summary"
+        }
+        fn parameters(&self) -> Value {
+            json!({"type":"object","properties":{}})
+        }
+        fn origin(&self) -> crate::tools::ToolOrigin {
+            crate::tools::ToolOrigin::Builtin
+        }
+        fn effect(&self) -> crate::tools::catalog::ToolEffect {
+            crate::tools::catalog::ToolEffect::ReadOnly
+        }
+        async fn execute(&self, _params: Value, ctx: ToolContext) -> Result<String> {
+            let delta = ctx.channels.tx_delta.as_ref().expect("streaming lane");
+            delta.send("old streamed ".into());
+            delta.send("text, not the summary".into());
+            if self.errored {
+                return Err(RuntimeError::Tool("error summary: exit status 17".into()));
+            }
+            Ok(self.summary.clone())
+        }
+    }
+
+    struct ContinueHook;
+    #[async_trait::async_trait]
+    impl crate::extensions::runtime::ExtensionHandler for ContinueHook {
+        fn id(&self) -> &str {
+            "continue-hook"
+        }
+        async fn handle(&self, _event: &HookEvent) -> HookResult {
+            HookResult::Continue
+        }
+        async fn shutdown(&self) {}
+    }
+
+    async fn output_hook_bus(replace: Option<bool>) -> Arc<crate::extensions::hooks::HookBus> {
+        let bus = Arc::new(crate::extensions::hooks::HookBus::new());
+        if let Some(replace) = replace {
+            let mut perms = PermissionSet::new();
+            perms.grant(crate::extensions::permissions::Permission::ToolsIntercept);
+            perms.grant(crate::extensions::permissions::Permission::ToolsTransformOutput);
+            let handler: Arc<dyn crate::extensions::runtime::ExtensionHandler> = if replace {
+                Arc::new(ReplaceHook)
+            } else {
+                Arc::new(ContinueHook)
+            };
+            bus.subscribe(HookKind::AfterToolCall, handler, None, None, perms)
+                .await
+                .unwrap();
+        }
+        bus
+    }
+
+    async fn streaming_history_cases(parallel: bool) {
+        // Equal replacement/summary bytes must STILL discard the distinct delta lane.
+        // Long Continue/no-hook summaries must NOT be mistaken for replacements.
+        for (hook, summary, errored, expected) in [
+            (Some(true), "summary".into(), false, "REPLACED BY HOOK"),
+            (
+                Some(true),
+                "REPLACED BY HOOK".into(),
+                false,
+                "REPLACED BY HOOK",
+            ),
+            (
+                Some(false),
+                "summary".into(),
+                false,
+                "old streamed text, not the summary",
+            ),
+            (
+                Some(false),
+                "s".repeat(40_000),
+                false,
+                "old streamed text, not the summary",
+            ),
+            (
+                None,
+                "s".repeat(40_000),
+                false,
+                "old streamed text, not the summary",
+            ),
+            (
+                Some(false),
+                "summary".into(),
+                true,
+                "Tool execution failed: error summary: exit status 17",
+            ),
+        ] {
+            let calls = if parallel {
+                vec![("toolu_a", "streaming_stub"), ("toolu_b", "streaming_stub")]
+            } else {
+                vec![("toolu_a", "streaming_stub")]
+            };
+            let d = drive(
+                vec![Arc::new(StreamingTextTool { summary, errored })],
+                &calls,
+                output_hook_bus(hook).await,
+            )
+            .await;
+            let wire = tool_result_message(&d.bodies[1]);
+            let history = d
+                .history
+                .iter()
+                .find(|m| m["role"] == "user" && m["content"][0]["type"] == "tool_result")
+                .expect("durable tool results");
+            for message in [wire, history.as_ref()] {
+                let results = message["content"].as_array().unwrap();
+                assert_eq!(results.len(), calls.len());
+                for result in results {
+                    assert_eq!(
+                        result["content"], expected,
+                        "parallel={parallel}, hook={hook:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn serial_streaming_history_respects_hook_outcome() {
+        let _base = crate::test_env::BaseDirGuard::new();
+        streaming_history_cases(false).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn parallel_streaming_history_respects_hook_outcome() {
+        let _base = crate::test_env::BaseDirGuard::new();
+        streaming_history_cases(true).await;
+    }
+
+    // Provider-free checks of the internal outcome and compatibility wrapper.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn after_tool_outcome_distinguishes_replace_from_truncation() {
+        let _base = crate::test_env::BaseDirGuard::new();
+        for hook in [None, Some(false), Some(true)] {
+            let bus = output_hook_bus(hook).await;
+            for summary in ["REPLACED BY HOOK".to_string(), "é".repeat(100)] {
+                let outcome = emit_after_tool_call_outcome(
+                    &bus,
+                    "stub",
+                    None,
+                    json!({}),
+                    summary.clone(),
+                    10,
+                    None,
+                )
+                .await;
+                assert_eq!(outcome.replaced, hook == Some(true));
+                let source = if outcome.replaced {
+                    "REPLACED BY HOOK"
+                } else {
+                    &summary
+                };
+                assert_eq!(
+                    outcome.output,
+                    HelperMethods::truncate_tool_result(source, 10)
+                );
+                assert_eq!(
+                    outcome.output,
+                    crate::runtime::emit_after_tool_call(
+                        &bus,
+                        "stub",
+                        None,
+                        json!({}),
+                        summary,
+                        10,
+                        None,
+                    )
+                    .await
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rich_blocks_drop_for_replacement_even_when_summary_is_equal() {
+        let blocks = Some(vec![json!({"type":"text","text":"summary"})]);
+        assert!(drop_rich_if_rewritten(blocks.clone(), "summary", "summary", true).is_none());
+        assert!(drop_rich_if_rewritten(blocks.clone(), "short", "long summary", false).is_none());
+        assert_eq!(
+            drop_rich_if_rewritten(blocks.clone(), "summary", "summary", false),
+            blocks
+        );
+    }
+
     fn sse_tool_use_round(tool_uses: &[(&str, &str)]) -> String {
         let mut s = String::new();
         s.push_str(r#"data: {"type":"message_start","message":{"id":"msg_01","type":"message","role":"assistant","content":[],"model":"claude-sonnet-4-6","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}"#);
@@ -3134,6 +3669,9 @@ mod rich_output_tests {
         history: Vec<SharedMessage>,
         /// Every `ToolResult` UI preview string.
         ui_results: Vec<String>,
+        /// Per-call scheduling signals in emission order: `queued:<id>`,
+        /// `started:<id>`, `result:<id>`.
+        tool_signals: Vec<String>,
         /// Request bodies the mock saw, in order.
         bodies: Vec<Value>,
         /// The stream loop returned `Err` (fail-closed) instead of `Ok`.
@@ -3177,6 +3715,8 @@ mod rich_output_tests {
                 auth_type: "api_key".into(),
                 refresh_token: None,
                 token_expires: Some(9_999_999_999_999),
+                auth_file_mtime: None,
+                bound_credential: None,
             })),
             client: Client::new(),
             credential_source: crate::auth::CredentialSource::Local,
@@ -3213,6 +3753,7 @@ mod rich_output_tests {
             env_warned: Default::default(),
             secret_prompt: None,
             auto_approve_confirms: true,
+            session_allow_all: Arc::new(crate::tools::SessionConfirmLatch::new()),
             telemetry_level: crate::runtime::telemetry::TelemetryLevel::Off,
             orchestration: None,
             delegation_parent: None,
@@ -3222,6 +3763,7 @@ mod rich_output_tests {
             activation_confirm: agent_core::config::ActivationConfirm::default(),
             tool_session_id,
             retained_tool_set,
+            pending_tool_restore: Default::default(),
             mcp_runtime: None,
             mcp_session_scope: None,
             extension_runtime: None,
@@ -3229,6 +3771,7 @@ mod rich_output_tests {
             turn_budget: crate::runtime::budget::TurnBudget::for_role(
                 crate::runtime::budget::TurnRole::Foreground,
             ),
+            owner_steer_budget: None,
         }
     }
 
@@ -3248,6 +3791,26 @@ mod rich_output_tests {
         .await
     }
 
+    async fn drive_with_continuation(
+        messages: Vec<SharedMessage>,
+        tools_to_register: Vec<Arc<dyn Tool>>,
+        tool_uses: &[(&str, &str)],
+        hook_bus: Arc<crate::extensions::hooks::HookBus>,
+        continuation: crate::runtime::continuation::SharedContinuation,
+    ) -> Driven {
+        drive_with_model_and_options(
+            "claude-sonnet-4-6",
+            messages,
+            tools_to_register,
+            tool_uses,
+            hook_bus,
+            std::time::Duration::from_secs(20),
+            None,
+            Some(continuation),
+        )
+        .await
+    }
+
     async fn drive_with_model(
         model: &str,
         messages: Vec<SharedMessage>,
@@ -3255,13 +3818,15 @@ mod rich_output_tests {
         tool_uses: &[(&str, &str)],
         hook_bus: Arc<crate::extensions::hooks::HookBus>,
     ) -> Driven {
-        drive_with_model_and_deadline(
+        drive_with_model_and_options(
             model,
             messages,
             tools_to_register,
             tool_uses,
             hook_bus,
             std::time::Duration::from_secs(20),
+            None,
+            None,
         )
         .await
     }
@@ -3279,13 +3844,15 @@ mod rich_output_tests {
     ) -> Driven {
         let deadline = std::time::Duration::from_secs(120);
         let started = std::time::Instant::now();
-        let driven = drive_with_model_and_deadline(
+        let driven = drive_with_model_and_options(
             "claude-sonnet-4-6",
             messages,
             tools_to_register,
             tool_uses,
             hook_bus,
             deadline,
+            None,
+            None,
         )
         .await;
         eprintln!(
@@ -3295,13 +3862,19 @@ mod rich_output_tests {
         driven
     }
 
-    async fn drive_with_model_and_deadline(
+    /// `conversation_id` is the owning conversation id the stream runs
+    /// under (`StreamSession.session_id`); `None` = worker/no conversation,
+    /// the harness default.
+    #[allow(clippy::too_many_arguments)]
+    async fn drive_with_model_and_options(
         model: &str,
         messages: Vec<SharedMessage>,
         tools_to_register: Vec<Arc<dyn Tool>>,
         tool_uses: &[(&str, &str)],
         hook_bus: Arc<crate::extensions::hooks::HookBus>,
         deadline: std::time::Duration,
+        conversation_id: Option<&str>,
+        continuation: Option<crate::runtime::continuation::SharedContinuation>,
     ) -> Driven {
         let (base_url, mock) = spawn_mock(sse_tool_use_round(tool_uses)).await;
 
@@ -3320,7 +3893,7 @@ mod rich_output_tests {
         ))
         .unwrap();
 
-        let session = harness_session(
+        let mut session = harness_session(
             base_url,
             tools,
             tx,
@@ -3331,6 +3904,10 @@ mod rich_output_tests {
             false,
             model,
         );
+        session.session_id = conversation_id.map(str::to_string);
+        if let Some(continuation) = continuation {
+            session.continuation = continuation;
+        }
 
         let started = std::time::Instant::now();
         let run = tokio::time::timeout(
@@ -3352,10 +3929,20 @@ mod rich_output_tests {
 
         let mut history = Vec::new();
         let mut ui_results = Vec::new();
+        let mut tool_signals = Vec::new();
         while let Ok(ev) = rx.try_recv() {
             match ev {
                 StreamEvent::Session(SessionEvent::MessageHistory(m)) => history = m,
-                StreamEvent::Llm(LlmEvent::ToolResult { result, .. }) => ui_results.push(result),
+                StreamEvent::Llm(LlmEvent::ToolResult { result, tool_id }) => {
+                    tool_signals.push(format!("result:{tool_id}"));
+                    ui_results.push(result)
+                }
+                StreamEvent::Llm(LlmEvent::ToolQueued { tool_id }) => {
+                    tool_signals.push(format!("queued:{tool_id}"))
+                }
+                StreamEvent::Llm(LlmEvent::ToolStarted { tool_id }) => {
+                    tool_signals.push(format!("started:{tool_id}"))
+                }
                 _ => {}
             }
         }
@@ -3370,6 +3957,7 @@ mod rich_output_tests {
         Driven {
             history,
             ui_results,
+            tool_signals,
             bodies,
             rejected,
         }
@@ -3432,6 +4020,29 @@ mod rich_output_tests {
         retained: crate::tools::activation::RetainedSessionToolSet,
         progressive: bool,
     ) -> Driven {
+        drive_turn_with(
+            tools,
+            tool_uses,
+            tool_session_id,
+            retained,
+            Default::default(),
+            agent_core::config::ActivationConfirm::default(),
+            progressive,
+        )
+        .await
+    }
+
+    /// [`drive_turn`] for a runtime that was handed activations from the
+    /// conversation's previous runtime (`pending`), under `confirm`.
+    async fn drive_turn_with(
+        tools: Arc<RwLock<ToolRegistry>>,
+        tool_uses: &[(&str, &str, &str)],
+        tool_session_id: crate::tools::activation::SessionId,
+        retained: crate::tools::activation::RetainedSessionToolSet,
+        pending: crate::tools::activation::PendingToolRestore,
+        confirm: agent_core::config::ActivationConfirm,
+        progressive: bool,
+    ) -> Driven {
         let (base_url, mock) = spawn_mock(sse_tool_use_round_with_input(tool_uses)).await;
         let (tx, mut rx) = mpsc::unbounded_channel::<StreamEvent>();
         let session_manager =
@@ -3447,6 +4058,9 @@ mod rich_output_tests {
             progressive,
             "claude-sonnet-4-6",
         );
+        let mut session = session;
+        session.pending_tool_restore = pending;
+        session.activation_confirm = confirm;
         let initial = vec![Arc::new(json!({"role":"user","content":"go"})) as SharedMessage];
         let run = tokio::time::timeout(
             std::time::Duration::from_secs(20),
@@ -3456,10 +4070,20 @@ mod rich_output_tests {
         .expect("stream loop must finish");
         let mut history = Vec::new();
         let mut ui_results = Vec::new();
+        let mut tool_signals = Vec::new();
         while let Ok(ev) = rx.try_recv() {
             match ev {
                 StreamEvent::Session(SessionEvent::MessageHistory(m)) => history = m,
-                StreamEvent::Llm(LlmEvent::ToolResult { result, .. }) => ui_results.push(result),
+                StreamEvent::Llm(LlmEvent::ToolResult { result, tool_id }) => {
+                    tool_signals.push(format!("result:{tool_id}"));
+                    ui_results.push(result)
+                }
+                StreamEvent::Llm(LlmEvent::ToolQueued { tool_id }) => {
+                    tool_signals.push(format!("queued:{tool_id}"))
+                }
+                StreamEvent::Llm(LlmEvent::ToolStarted { tool_id }) => {
+                    tool_signals.push(format!("started:{tool_id}"))
+                }
                 _ => {}
             }
         }
@@ -3468,6 +4092,7 @@ mod rich_output_tests {
         Driven {
             history,
             ui_results,
+            tool_signals,
             bodies,
             rejected: run.is_err(),
         }
@@ -3605,6 +4230,272 @@ mod rich_output_tests {
         )
         .await;
         assert!(retained.lock().unwrap().is_none());
+    }
+
+    /// Non-deferred (`loaded`) tool names of one request body, in order.
+    fn loaded_tool_names(body: &Value) -> Vec<String> {
+        body["tools"]
+            .as_array()
+            .map(|tools| {
+                tools
+                    .iter()
+                    .filter(|t| t.get("defer_loading").is_none())
+                    .filter_map(|t| t["name"].as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The previous runtime's activations (what a reload record carries).
+    fn carried_probe(
+        tools: &Arc<RwLock<ToolRegistry>>,
+    ) -> Vec<crate::tools::activation::CarriedActivation> {
+        let registry = tools.try_read().expect("no writer");
+        let mut set = crate::tools::activation::SessionToolSet::progressive_core_for_catalog(
+            fresh_tool_session(),
+            registry.catalog(),
+        );
+        crate::tools::activation::activate_exact_for_user(
+            &mut set,
+            registry.catalog(),
+            &crate::tools::catalog::ToolId::builtin("deferred_probe"),
+        )
+        .unwrap();
+        let carried = set.carried_activations();
+        serde_json::from_slice(&serde_json::to_vec(&carried).unwrap()).unwrap()
+    }
+
+    /// Reload regression (request trace 2026-10-24 05:37): a runtime handed
+    /// the previous runtime's activations restores them at its first turn
+    /// start. Its first request carries the same non-deferred tools array as
+    /// the previous runtime's request with the reference lost (no cache
+    /// rewrite), and the tool is callable without re-activation.
+    #[tokio::test]
+    async fn carried_activation_is_restored_at_the_first_turn_start() {
+        let tools = probe_registry();
+        // Previous runtime, after a rollover dropped the probe's reference:
+        // the probe rides in the non-deferred tools.
+        let old_sid = fresh_tool_session();
+        let old_retained: crate::tools::activation::RetainedSessionToolSet = Default::default();
+        let _ = drive_turn(
+            Arc::clone(&tools),
+            &[("toolu_act", "activate_tools", ACTIVATE_PROBE)],
+            old_sid.clone(),
+            Arc::clone(&old_retained),
+            true,
+        )
+        .await;
+        let before = drive_turn(
+            Arc::clone(&tools),
+            &[("toolu_probe", "deferred_probe", "{}")],
+            old_sid,
+            Arc::clone(&old_retained),
+            true,
+        )
+        .await;
+        let before_tools = before.bodies[0]["tools"].clone();
+        assert!(loaded_tool_names(&before.bodies[0]).contains(&"deferred_probe".to_string()));
+        let carried = old_retained
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .read()
+            .unwrap()
+            .carried_activations();
+        assert_eq!(carried, carried_probe(&tools));
+
+        // Next runtime: new tool session, empty retained slot, pending.
+        let pending: crate::tools::activation::PendingToolRestore =
+            Arc::new(Mutex::new(Some(carried)));
+        let retained: crate::tools::activation::RetainedSessionToolSet = Default::default();
+        let after = drive_turn_with(
+            Arc::clone(&tools),
+            &[("toolu_probe", "deferred_probe", "{}")],
+            fresh_tool_session(),
+            Arc::clone(&retained),
+            Arc::clone(&pending),
+            agent_core::config::ActivationConfirm::Prompt,
+            true,
+        )
+        .await;
+        assert_eq!(
+            after.bodies[0]["tools"].to_string(),
+            before_tools.to_string(),
+            "the first request after the hand-off keeps the tools array byte-identical"
+        );
+        assert!(
+            after.ui_results.iter().any(|r| r.contains("probe-ok")),
+            "restored without re-activation (and without a prompt under `prompt`): {:?}",
+            after.ui_results
+        );
+        assert!(pending.lock().unwrap().is_none(), "consumed by the turn start");
+        let slot = retained.lock().unwrap();
+        let set = slot.as_ref().unwrap().read().unwrap();
+        assert!(set
+            .activation(&crate::tools::catalog::ToolId::builtin("deferred_probe"))
+            .is_some());
+    }
+
+    /// `tools.activation_confirm = deny` in the restoring runtime: nothing
+    /// carried is restored, and the tool is denied.
+    #[tokio::test]
+    async fn deny_policy_drops_carried_activations() {
+        let tools = probe_registry();
+        let pending: crate::tools::activation::PendingToolRestore =
+            Arc::new(Mutex::new(Some(carried_probe(&tools))));
+        let retained: crate::tools::activation::RetainedSessionToolSet = Default::default();
+        let driven = drive_turn_with(
+            Arc::clone(&tools),
+            &[("toolu_probe", "deferred_probe", "{}")],
+            fresh_tool_session(),
+            Arc::clone(&retained),
+            Arc::clone(&pending),
+            agent_core::config::ActivationConfirm::Deny,
+            true,
+        )
+        .await;
+        assert!(!loaded_tool_names(&driven.bodies[0]).contains(&"deferred_probe".to_string()));
+        assert!(
+            !driven.ui_results.iter().any(|r| r.contains("probe-ok")),
+            "{:?}",
+            driven.ui_results
+        );
+        assert!(pending.lock().unwrap().is_none(), "dropped, not kept for later");
+        let slot = retained.lock().unwrap();
+        assert_eq!(slot.as_ref().unwrap().read().unwrap().activated().count(), 0);
+    }
+
+    /// on_message_complete hook that records every event's `data` and reports
+    /// an advisory `new_task` phase.
+    struct PhaseHook {
+        seen: Mutex<Vec<Value>>,
+    }
+    #[async_trait::async_trait]
+    impl crate::extensions::runtime::ExtensionHandler for PhaseHook {
+        fn id(&self) -> &str {
+            "phase-hook"
+        }
+        async fn handle(&self, event: &HookEvent) -> HookResult {
+            self.seen.lock().unwrap().push(event.data.clone());
+            HookResult::ContextPhase {
+                phase: "new_task".into(),
+            }
+        }
+        async fn shutdown(&self) {}
+    }
+
+    async fn phase_hook_bus(
+        with_lifecycle: bool,
+    ) -> (Arc<crate::extensions::hooks::HookBus>, Arc<PhaseHook>) {
+        let bus = Arc::new(crate::extensions::hooks::HookBus::new());
+        let hook = Arc::new(PhaseHook {
+            seen: Mutex::new(Vec::new()),
+        });
+        let mut perms = PermissionSet::new();
+        perms.grant(crate::extensions::permissions::Permission::LlmContent);
+        if with_lifecycle {
+            perms.grant(crate::extensions::permissions::Permission::SessionLifecycle);
+        }
+        let handler: Arc<dyn crate::extensions::runtime::ExtensionHandler> = hook.clone();
+        bus.subscribe(HookKind::OnMessageComplete, handler, None, None, perms)
+            .await
+            .unwrap();
+        (bus, hook)
+    }
+
+    fn auto_continuation() -> crate::runtime::continuation::SharedContinuation {
+        let mut state = crate::runtime::continuation::ContinuationState::default();
+        state.config.mode = agent_core::config::ContextManagementMode::Auto;
+        std::sync::Arc::new(std::sync::Mutex::new(state))
+    }
+
+    /// End-to-end through the stream loop: the hook sees the additive
+    /// `context_management` payload and its `context_phase` report lands in
+    /// the continuation policy exactly like a `context_checkpoint` call.
+    #[tokio::test]
+    async fn on_message_complete_context_phase_reaches_continuation() {
+        use agent_core::core::context_policy::WorkPhase;
+        let (bus, hook) = phase_hook_bus(true).await;
+        let continuation = auto_continuation();
+        let initial = vec![Arc::new(json!({"role":"user","content":"go"})) as SharedMessage];
+        let _ = drive_with_continuation(
+            initial,
+            vec![Arc::new(TextTool)],
+            &[("toolu_1", "text_stub")],
+            bus,
+            continuation.clone(),
+        )
+        .await;
+
+        let seen = hook.seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2, "one hook per assistant message: {seen:?}");
+        assert_eq!(seen[0]["content_block_count"], 1);
+        assert_eq!(seen[0]["has_tool_use"], true);
+        assert_eq!(
+            seen[0]["context_management"],
+            json!({"enabled": true, "band": "normal", "phase": "unknown"})
+        );
+        // The second event reflects the phase applied after the first report.
+        assert_eq!(seen[1]["context_management"]["phase"], "new_task");
+
+        let state = continuation.lock().unwrap();
+        assert_eq!(state.policy.phase(), WorkPhase::NewTask);
+        assert!(state.note.is_empty(), "hook path never records a note");
+        assert_eq!(
+            state.last_band,
+            Some(agent_core::core::context_policy::ContextBand::Normal)
+        );
+    }
+
+    /// Without `session.lifecycle` the report is ignored by the bus; with
+    /// context management disabled the payload says so and nothing is applied.
+    #[tokio::test]
+    async fn on_message_complete_context_phase_is_ignored_without_key_or_when_disabled() {
+        use agent_core::core::context_policy::WorkPhase;
+        // Observe key only, management enabled.
+        let (bus, hook) = phase_hook_bus(false).await;
+        let continuation = auto_continuation();
+        let initial = vec![Arc::new(json!({"role":"user","content":"go"})) as SharedMessage];
+        let _ = drive_with_continuation(
+            initial.clone(),
+            vec![Arc::new(TextTool)],
+            &[("toolu_1", "text_stub")],
+            bus,
+            continuation.clone(),
+        )
+        .await;
+        assert_eq!(hook.seen.lock().unwrap().len(), 2);
+        assert_eq!(
+            continuation.lock().unwrap().policy.phase(),
+            WorkPhase::Unknown,
+            "report without session.lifecycle must not be applied"
+        );
+
+        // Both keys, management disabled.
+        let (bus, hook) = phase_hook_bus(true).await;
+        let continuation = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::runtime::continuation::ContinuationState::default(),
+        ));
+        let _ = drive_with_continuation(
+            initial,
+            vec![Arc::new(TextTool)],
+            &[("toolu_1", "text_stub")],
+            bus,
+            continuation.clone(),
+        )
+        .await;
+        let seen = hook.seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2);
+        for data in &seen {
+            assert_eq!(
+                data["context_management"],
+                json!({"enabled": false, "band": Value::Null, "phase": "unknown"})
+            );
+        }
+        let state = continuation.lock().unwrap();
+        assert_eq!(state.policy.phase(), WorkPhase::Unknown);
+        assert_eq!(state.last_band, None);
     }
 
     /// The user message carrying tool results, from the round-2 request body.
@@ -3773,6 +4664,70 @@ mod rich_output_tests {
             .contains(REAL_PNG_B64));
     }
 
+    /// Records the owning conversation id each call's `ToolContext` carries.
+    struct SessionProbe(Arc<std::sync::Mutex<Vec<Option<String>>>>);
+    #[async_trait::async_trait]
+    impl Tool for SessionProbe {
+        fn name(&self) -> &str {
+            "session_probe"
+        }
+        fn description(&self) -> &str {
+            "records ctx.capabilities.session_id"
+        }
+        fn parameters(&self) -> Value {
+            json!({"type":"object","properties":{}})
+        }
+        fn origin(&self) -> crate::tools::ToolOrigin {
+            crate::tools::ToolOrigin::Builtin
+        }
+        fn effect(&self) -> crate::tools::catalog::ToolEffect {
+            crate::tools::catalog::ToolEffect::ReadOnly
+        }
+        async fn execute(&self, _params: Value, ctx: ToolContext) -> Result<String> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(ctx.capabilities.session_id.clone());
+            Ok("probed".to_string())
+        }
+    }
+
+    /// Tool dispatch hands the owning conversation id to every tool's
+    /// context (serial and parallel lanes) — what extension `tool.call`
+    /// forwards as `params.session_id`. Workers (`None`) stay `None`.
+    #[tokio::test]
+    async fn tool_context_carries_owning_conversation_id() {
+        for (conversation, uses) in [
+            (Some("conv-1"), &[("toolu_1", "session_probe")][..]),
+            (
+                Some("conv-2"),
+                &[("toolu_1", "session_probe"), ("toolu_2", "session_probe")][..],
+            ),
+            (None, &[("toolu_1", "session_probe")][..]),
+        ] {
+            let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let initial = vec![Arc::new(json!({"role":"user","content":"go"})) as SharedMessage];
+            let _ = drive_with_model_and_options(
+                "claude-sonnet-4-6",
+                initial,
+                vec![Arc::new(SessionProbe(seen.clone()))],
+                uses,
+                Arc::new(crate::extensions::hooks::HookBus::new()),
+                std::time::Duration::from_secs(20),
+                conversation,
+                None,
+            )
+            .await;
+            let seen = seen.lock().unwrap().clone();
+            assert_eq!(
+                seen,
+                vec![conversation.map(str::to_string); uses.len()],
+                "{} tool use(s) under {conversation:?}",
+                uses.len()
+            );
+        }
+    }
+
     #[tokio::test]
     #[serial_test::serial(synaps_base_dir)]
     async fn rich_output_and_hook_replace() {
@@ -3896,6 +4851,118 @@ mod rich_output_tests {
             Value::String("seen".into()),
             "a read issued after a side-effecting call must run after it"
         );
+    }
+
+    /// Two side-effecting calls share the serial lane: the second waits.
+    /// It is announced `queued` before anything runs, `started` only after
+    /// the first call's result, and the first call (which never waits) gets
+    /// neither signal.
+    #[tokio::test]
+    async fn serial_lane_calls_signal_queued_then_started_in_order() {
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let d = drive(
+            vec![Arc::new(WriterStub(flag))],
+            &[("toolu_1", "writer_stub"), ("toolu_2", "writer_stub"), ("toolu_3", "writer_stub")],
+            Arc::new(crate::extensions::hooks::HookBus::new()),
+        )
+        .await;
+        assert_eq!(
+            d.tool_signals,
+            vec![
+                "queued:toolu_2",
+                "queued:toolu_3",
+                "result:toolu_1",
+                "started:toolu_2",
+                "result:toolu_2",
+                "started:toolu_3",
+                "result:toolu_3",
+            ],
+            "queued before any result, started right after the call ahead finished"
+        );
+    }
+
+    /// Calls that never wait get no queue signal at all: reads before the
+    /// first write keep their own concurrent lane, and the write leads its
+    /// lane.
+    #[tokio::test]
+    async fn calls_that_never_wait_get_no_queue_signals() {
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let d = drive(
+            vec![Arc::new(WriterStub(flag.clone())), Arc::new(ProbeStub(flag))],
+            &[("toolu_r", "probe_stub"), ("toolu_w", "writer_stub")],
+            Arc::new(crate::extensions::hooks::HookBus::new()),
+        )
+        .await;
+        assert!(
+            d.tool_signals.iter().all(|s| s.starts_with("result:")),
+            "{:?}",
+            d.tool_signals
+        );
+        // A read that follows a write joins its lane and does wait.
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let d = drive(
+            vec![Arc::new(WriterStub(flag.clone())), Arc::new(ProbeStub(flag))],
+            &[("toolu_w", "writer_stub"), ("toolu_r", "probe_stub")],
+            Arc::new(crate::extensions::hooks::HookBus::new()),
+        )
+        .await;
+        assert_eq!(
+            d.tool_signals,
+            vec!["queued:toolu_r", "result:toolu_w", "started:toolu_r", "result:toolu_r"]
+        );
+    }
+
+    /// Side-effecting stub that cancels the turn while it runs (the user's
+    /// Esc during the first of two serial calls).
+    struct CancellingStub;
+    #[async_trait::async_trait]
+    impl Tool for CancellingStub {
+        fn name(&self) -> &str {
+            "cancelling_stub"
+        }
+        fn description(&self) -> &str {
+            "cancels the turn mid-call"
+        }
+        fn parameters(&self) -> Value {
+            json!({"type":"object","properties":{}})
+        }
+        fn origin(&self) -> crate::tools::ToolOrigin {
+            crate::tools::ToolOrigin::Builtin
+        }
+        async fn execute(&self, _params: Value, ctx: ToolContext) -> Result<String> {
+            if let Some(cancel) = ctx.capabilities.launch_cancel.as_ref() {
+                cancel.cancel();
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            Ok("not reached".to_string())
+        }
+    }
+
+    /// A queued call the lane never reached (the call ahead was cancelled)
+    /// is settled for the UI with the same cancel phrase its history result
+    /// carries — never `started`, and never left waiting forever.
+    #[tokio::test]
+    async fn a_cancelled_lane_settles_its_unreached_queued_calls() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(CancellingStub));
+        registry.register(Arc::new(WriterStub(Arc::new(
+            std::sync::atomic::AtomicBool::new(false),
+        ))));
+        let d = drive_turn(
+            Arc::new(RwLock::new(registry)),
+            &[("toolu_c", "cancelling_stub", "{}"), ("toolu_q", "writer_stub", "{}")],
+            fresh_tool_session(),
+            Default::default(),
+            false,
+        )
+        .await;
+        assert_eq!(
+            d.tool_signals,
+            vec!["queued:toolu_q", "result:toolu_c", "result:toolu_q"],
+            "{:?}",
+            d.ui_results
+        );
+        assert_eq!(d.ui_results[0], d.ui_results[1], "same cancel phrase");
     }
 
     #[tokio::test]
@@ -4248,6 +5315,8 @@ mod rich_output_tests {
                 auth_type: "api_key".into(),
                 refresh_token: None,
                 token_expires: Some(9_999_999_999_999),
+                auth_file_mtime: None,
+                bound_credential: None,
             })),
             client: reqwest::Client::new(),
             credential_source: crate::auth::CredentialSource::Local,
@@ -4284,6 +5353,7 @@ mod rich_output_tests {
             env_warned: Default::default(),
             secret_prompt: None,
             auto_approve_confirms: true,
+            session_allow_all: Arc::new(crate::tools::SessionConfirmLatch::new()),
             telemetry_level: crate::runtime::telemetry::TelemetryLevel::Off,
             orchestration: None,
             delegation_parent: None,
@@ -4293,6 +5363,7 @@ mod rich_output_tests {
             activation_confirm: agent_core::config::ActivationConfirm::default(),
             tool_session_id,
             retained_tool_set: Default::default(),
+            pending_tool_restore: Default::default(),
             mcp_runtime: None,
             mcp_session_scope: None,
             extension_runtime: None,
@@ -4300,6 +5371,7 @@ mod rich_output_tests {
             turn_budget: crate::runtime::budget::TurnBudget::for_role(
                 crate::runtime::budget::TurnRole::Foreground,
             ),
+            owner_steer_budget: None,
         };
 
         let messages = vec![Arc::new(json!({"role":"user","content":"do it"})) as SharedMessage];

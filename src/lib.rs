@@ -38,9 +38,11 @@ pub use session::{
 };
 pub use tools::{Tool, ToolContext, ToolRegistry};
 pub use watcher_types::{
-    AgentConfig, AgentStatusInfo, ExitReason, HandoffState, SessionLimits, SessionStats,
+    AgentConfig, AgentStatusInfo, ExitReason, HandoffState, HooksConfig, SessionLimits, SessionStats,
     WatcherCommand, WatcherResponse,
 };
+
+pub mod watcher_session;
 
 // Re-export for convenience
 pub use serde_json::Value;

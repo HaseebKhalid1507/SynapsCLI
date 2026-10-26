@@ -10,6 +10,7 @@ use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
 use tokio_util::sync::CancellationToken;
 
+mod anthropic_quota;
 mod api;
 mod api_sync;
 pub mod attachments;
@@ -18,6 +19,7 @@ mod axel_context;
 #[cfg(test)]
 mod body_golden;
 pub mod budget;
+mod cache_diagnosis;
 pub mod capture_worker;
 pub mod chat_capture;
 pub(crate) mod cloud_invoke;
@@ -27,6 +29,7 @@ pub mod continuation;
 pub mod google_gemini;
 pub mod google_vertex;
 pub(crate) mod helpers;
+mod http_phases;
 mod image_limits;
 mod image_retention;
 pub mod keepwarm;
@@ -39,6 +42,7 @@ mod sse;
 mod sse_types;
 mod stream;
 pub mod subagent;
+pub mod subagent_watch;
 pub mod telemetry;
 pub mod trace;
 pub(crate) mod transport;
@@ -76,35 +80,206 @@ pub async fn emit_before_tool_call(
     hook_bus.emit(&event).await
 }
 
+/// Answer the Confirm dialog sends for its "Allow all from <ext>" button.
+/// `resolve_before_tool_call_result` treats it as an allow AND latches the
+/// confirm's source extension(s) in the session's
+/// [`Runtime::session_allow_all`] set, so later Confirm results from those
+/// extensions (only) are auto-approved without a prompt.
+pub use crate::tools::CONFIRM_ANSWER_ALLOW_ALL;
+
+/// Longest extension `message` shown in a Confirm prompt (chars / lines).
+/// The host-built header and the dialog's buttons and scope line must stay
+/// visible, so a long or hostile message is cut with a marker.
+const MAX_CONFIRM_MESSAGE_CHARS: usize = 1200;
+const MAX_CONFIRM_MESSAGE_LINES: usize = 12;
+
+/// Sanitize, redact and cap an extension's confirm message for display:
+/// control / bidi / zero-width characters are stripped first (prA I-R4-3:
+/// they could move the cursor or disguise text in plain-text clients),
+/// then credentials are redacted (prA I-R4-1: confirmers echo the
+/// rewritten command), then the length is capped.
+fn cap_confirm_message(message: &str) -> String {
+    let message = redact_secret_text(&crate::session::sanitize_prompt_text(message));
+    let lines: Vec<&str> = message.lines().collect();
+    let over_lines = lines.len() > MAX_CONFIRM_MESSAGE_LINES;
+    let over_chars = message.chars().count() > MAX_CONFIRM_MESSAGE_CHARS;
+    if !over_lines && !over_chars {
+        return message;
+    }
+    let kept = lines[..lines.len().min(MAX_CONFIRM_MESSAGE_LINES)].join("\n");
+    let kept: String = kept.chars().take(MAX_CONFIRM_MESSAGE_CHARS).collect();
+    format!("{kept}\n…[message truncated by host]")
+}
+
+/// Lines / chars of the final-input preview shown when the input was
+/// rewritten by an earlier extension.
+const MAX_REWRITE_PREVIEW_LINES: usize = 6;
+const MAX_REWRITE_PREVIEW_CHARS: usize = 400;
+
+/// Scrub credential shapes out of free text (a shell command, a header
+/// line, an extension's confirm message) for the Confirm prompt only. Uses
+/// the AGGRESSIVE `trace::export::redact_command_text` (the shared
+/// high-precision rules plus recall-first ones). Stored text the model or
+/// user reads back (context archive, memory, traces) keeps the precise
+/// shared scrub (prA I-R5-1). The prompt is broadcast to every attached
+/// client (observers included) and replayed on attach, so it must never
+/// show a secret.
+fn redact_secret_text(text: &str) -> String {
+    crate::runtime::trace::export::redact_command_text(text)
+}
+
+/// `redact_value` (secret-named keys, secret-shaped strings) plus
+/// [`redact_secret_text`] on every remaining string, recursively.
+fn redact_preview_value(value: &mut Value) {
+    crate::runtime::trace::export::redact_value(value);
+    match value {
+        Value::Object(map) => map.values_mut().for_each(redact_preview_value),
+        Value::Array(items) => items.iter_mut().for_each(redact_preview_value),
+        Value::String(s) => *s = redact_secret_text(s),
+        _ => {}
+    }
+}
+
+/// Host-rendered, capped, REDACTED preview of the input that will actually
+/// run: a shell-style `command` string as-is, anything else as pretty JSON.
+fn final_input_preview(input: &Value) -> String {
+    let mut input = input.clone();
+    redact_preview_value(&mut input);
+    let full = match input.get("command").and_then(Value::as_str) {
+        Some(cmd) => cmd.to_string(),
+        None => serde_json::to_string_pretty(&input).unwrap_or_else(|_| input.to_string()),
+    };
+    let lines: Vec<&str> = full.lines().collect();
+    let mut out: String = lines[..lines.len().min(MAX_REWRITE_PREVIEW_LINES)]
+        .iter()
+        .map(|l| format!("  {l}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut cut = lines.len() > MAX_REWRITE_PREVIEW_LINES;
+    if out.chars().count() > MAX_REWRITE_PREVIEW_CHARS {
+        out = out.chars().take(MAX_REWRITE_PREVIEW_CHARS).collect();
+        cut = true;
+    }
+    if cut {
+        out.push_str("\n  …[preview truncated]");
+    }
+    out
+}
+
+/// Prompt body for an extension tool-call Confirm: the host-known source and
+/// tool lead, so an extension's own `message` cannot hide who is asking.
+/// When earlier extensions rewrote the input (prA N3) the header also says
+/// so, by whom, and previews the FINAL input — the one approval runs —
+/// before the extension's own message (which is cut first on small screens).
+fn confirm_prompt_body(
+    message: &str,
+    sources: &[String],
+    tool: Option<&str>,
+    rewrite: Option<(&[String], &Value)>,
+) -> String {
+    let source = if sources.is_empty() {
+        "(unknown)".to_string()
+    } else {
+        sources.join(", ")
+    };
+    let rewritten = match rewrite {
+        Some((by, input)) => format!(
+            "Input rewritten by: {}\nInput that will run:\n{}\n",
+            if by.is_empty() { "(unknown)".to_string() } else { by.join(", ") },
+            final_input_preview(input)
+        ),
+        None => String::new(),
+    };
+    // The extension's own text is labelled, so it can't pass itself off as
+    // the host-built header (e.g. a fake "Input that will run:" block).
+    // Ids and tool names are host-chosen, but sanitize the whole body too.
+    crate::session::sanitize_prompt_text(&format!(
+        "Extension: {source}\nTool: {}\n{rewritten}\nMessage from {source}:\n{}\n\nAllow this tool call?",
+        tool.unwrap_or("(unknown)"),
+        cap_confirm_message(message)
+    ))
+}
+
+/// What an approved Confirm runs: the input as modified earlier in the hook
+/// chain, if any (`Modify`), else the original (`Continue`).
+fn approved(
+    modified_input: Option<Value>,
+) -> crate::extensions::hooks::events::HookResult {
+    match modified_input {
+        Some(input) => crate::extensions::hooks::events::HookResult::Modify { input },
+        None => crate::extensions::hooks::events::HookResult::Continue,
+    }
+}
+
 /// Resolve a before_tool_call result that may request user confirmation.
 ///
-/// When `auto_approve_confirms` is true, `Confirm` is short-circuited to `Continue`.
-/// Headless/non-interactive callers with `auto_approve_confirms = false` fail closed.
+/// When `auto_approve_confirms` is true, or every source extension of the
+/// Confirm (same load generation) has been latched by an earlier "Allow
+/// all" answer, `Confirm` is short-circuited to approval. Headless /
+/// non-interactive callers with neither fail closed. "Allow all" is only
+/// offered (a `ConfirmScope` is attached) when this call site has a latch
+/// to arm; otherwise the dialog offers Allow / Deny only.
 pub async fn resolve_before_tool_call_result(
     hook_result: crate::extensions::hooks::events::HookResult,
     secret_prompt: Option<&crate::tools::SecretPromptHandle>,
     auto_approve_confirms: bool,
+    session_allow_all: Option<&crate::tools::SessionConfirmLatch>,
 ) -> crate::extensions::hooks::events::HookResult {
     match hook_result {
-        crate::extensions::hooks::events::HookResult::Confirm { message } => {
+        crate::extensions::hooks::events::HookResult::Confirm {
+            message,
+            sources,
+            generations,
+            tool,
+            modified_input,
+            modified_by,
+        } => {
+            let keys = crate::tools::latch_keys(&sources, &generations);
             if auto_approve_confirms {
                 tracing::info!(message = %message, "confirm auto-approved (auto_approve_confirms=true)");
-                return crate::extensions::hooks::events::HookResult::Continue;
+                return approved(modified_input);
+            }
+            if session_allow_all.is_some_and(|latch| latch.allows_all(&keys)) {
+                tracing::info!(
+                    message = %message,
+                    extensions = ?sources,
+                    "confirm auto-approved (extension allow-all latched)"
+                );
+                return approved(modified_input);
             }
 
             let Some(prompt) = secret_prompt else {
                 return crate::extensions::hooks::events::HookResult::Block {
                     reason: format!(
                         "Tool call requires confirmation but no interactive prompt is available: {}",
-                        message
+                        redact_secret_text(&crate::session::sanitize_prompt_text(&message))
                     ),
                 };
             };
 
+            // No latch on this path → no scope → no Allow-all button, so the
+            // dialog and the "armed" notice never promise what can't happen.
+            let scope = (session_allow_all.is_some() && !sources.is_empty()).then(|| {
+                crate::session::ConfirmScope {
+                    extensions: sources.clone(),
+                    tool: tool.clone(),
+                    rewritten_by: if modified_input.is_some() {
+                        modified_by.clone()
+                    } else {
+                        Vec::new()
+                    },
+                }
+            });
             let response = prompt
-                .prompt(
-                    "Confirm tool call".to_string(),
-                    format!("{}\n\nType 'yes' or 'y' to allow.", message),
+                .prompt_scoped(
+                    crate::session::CONFIRM_PROMPT_TITLE.to_string(),
+                    confirm_prompt_body(
+                        &message,
+                        &sources,
+                        tool.as_deref(),
+                        modified_input.as_ref().map(|i| (modified_by.as_slice(), i)),
+                    ),
+                    scope,
                 )
                 .await;
 
@@ -112,10 +287,28 @@ pub async fn resolve_before_tool_call_result(
                 Some(answer)
                     if answer.eq_ignore_ascii_case("yes") || answer.eq_ignore_ascii_case("y") =>
                 {
-                    crate::extensions::hooks::events::HookResult::Continue
+                    approved(modified_input)
+                }
+                Some(answer) if answer.eq_ignore_ascii_case(CONFIRM_ANSWER_ALLOW_ALL) => {
+                    match session_allow_all {
+                        Some(latch) if latch.allow(&keys) => tracing::warn!(
+                            extensions = ?sources,
+                            "user chose Allow all: confirms from these extensions are auto-approved for the rest of this conversation"
+                        ),
+                        Some(_) => tracing::warn!(
+                            "user chose Allow all on an unattributed or revoked confirm; approving this call only"
+                        ),
+                        None => tracing::warn!(
+                            "user chose Allow all but this path has no session latch; approving this call only"
+                        ),
+                    }
+                    approved(modified_input)
                 }
                 _ => crate::extensions::hooks::events::HookResult::Block {
-                    reason: format!("Tool call confirmation denied: {}", message),
+                    reason: format!(
+                        "Tool call confirmation denied: {}",
+                        redact_secret_text(&crate::session::sanitize_prompt_text(&message))
+                    ),
                 },
             }
         }
@@ -129,8 +322,16 @@ pub async fn resolve_before_tool_call_decision(
     hook_result: crate::extensions::hooks::events::HookResult,
     secret_prompt: Option<&crate::tools::SecretPromptHandle>,
     auto_approve_confirms: bool,
+    session_allow_all: Option<&crate::tools::SessionConfirmLatch>,
 ) -> BeforeToolCallDecision {
-    match resolve_before_tool_call_result(hook_result, secret_prompt, auto_approve_confirms).await {
+    match resolve_before_tool_call_result(
+        hook_result,
+        secret_prompt,
+        auto_approve_confirms,
+        session_allow_all,
+    )
+    .await
+    {
         crate::extensions::hooks::events::HookResult::Block { reason } => {
             BeforeToolCallDecision::Block { reason }
         }
@@ -176,6 +377,35 @@ pub async fn emit_after_tool_call(
     max_tool_output: usize,
     session_id: Option<&str>,
 ) -> String {
+    emit_after_tool_call_outcome(
+        hook_bus,
+        tool_name,
+        runtime_tool_name,
+        input,
+        output,
+        max_tool_output,
+        session_id,
+    )
+    .await
+    .output
+}
+
+/// Distinguish an authoritative hook replacement from ordinary budget truncation.
+/// Byte equality with the summary cannot establish whether the delta lane is stale.
+pub(super) struct AfterToolCallOutcome {
+    pub output: String,
+    pub replaced: bool,
+}
+
+pub(super) async fn emit_after_tool_call_outcome(
+    hook_bus: &Arc<crate::extensions::hooks::HookBus>,
+    tool_name: &str,
+    runtime_tool_name: Option<&str>,
+    input: Value,
+    output: String,
+    max_tool_output: usize,
+    session_id: Option<&str>,
+) -> AfterToolCallOutcome {
     use crate::extensions::hooks::events::HookResult;
     // Keep the original to return verbatim if no transform fires.
     let original = output.clone();
@@ -185,8 +415,10 @@ pub async fn emit_after_tool_call(
     if let Some(runtime_tool_name) = runtime_tool_name {
         event.tool_runtime_name = Some(runtime_tool_name.to_string());
     }
+    let mut replaced = false;
     let post_hook = match hook_bus.emit(&event).await {
         HookResult::Replace { mut output } => {
+            replaced = true;
             if output.len() > MAX_REPLACE_OUTPUT {
                 tracing::warn!(
                     tool = %tool_name,
@@ -216,7 +448,13 @@ pub async fn emit_after_tool_call(
     // Compress-then-truncate: apply the context-budget cap AFTER the hook.
     // Mirrors `HelperMethods::truncate_tool_result` byte-for-byte so the
     // no-extension path is behavior-identical to the legacy ordering.
-    crate::runtime::helpers::HelperMethods::truncate_tool_result(&post_hook, max_tool_output)
+    AfterToolCallOutcome {
+        output: crate::runtime::helpers::HelperMethods::truncate_tool_result(
+            &post_hook,
+            max_tool_output,
+        ),
+        replaced,
+    }
 }
 
 /// A reasoning-level substitution performed during a model change because the
@@ -277,6 +515,7 @@ struct PromptReloadSource {
 
 pub struct Runtime {
     client: Client,
+    anthropic_stream_client: Arc<std::sync::OnceLock<Client>>,
     auth: Arc<RwLock<AuthState>>,
     model: String,
     tools: Arc<RwLock<ToolRegistry>>,
@@ -434,11 +673,13 @@ pub struct Runtime {
     /// request accepted (task #444 keep-warm scheduling). Fresh per clone,
     /// shared by `share_ttl_latches`, like the TTL latches above.
     cache_anchor: std::sync::Arc<keepwarm::CacheAnchorCell>,
-    /// Last Anthropic message id (`msg_...`) — threaded into the next
-    /// request's `diagnostics.previous_message_id` when diagnostics is on.
-    /// Reserved for the cache-diagnosis beta wiring (handoff item).
-    #[allow(dead_code)]
+    /// Last foreground Anthropic message id (`msg_...`) — threaded into the
+    /// next request's `diagnostics.previous_message_id` when diagnostics is
+    /// on. Fresh per clone, shared by `share_ttl_latches`.
     last_msg_id: Arc<Mutex<Option<String>>>,
+    /// Set once the API rejected cache diagnostics: off for the session.
+    /// Shared across `Clone` (subagents never re-probe a rejecting API).
+    cache_diag_rejected: Arc<std::sync::atomic::AtomicBool>,
     session_manager: std::sync::Arc<crate::tools::shell::SessionManager>,
     /// Extension hook bus for dispatching events to extensions.
     hook_bus: Arc<crate::extensions::hooks::HookBus>,
@@ -475,6 +716,11 @@ pub struct Runtime {
     /// Current worker handle for bounded delegation-tree accounting. `None`
     /// for foreground roots.
     delegation_parent: Option<String>,
+    /// Session-scoped, per-extension "Allow all" latch for extension
+    /// `Confirm` gates (`before_tool_call`). An extension id is added when
+    /// the user picks "Allow all from <ext>" in the Confirm dialog; shared by
+    /// clones and delegated workers in the same session. Never persisted.
+    session_allow_all: std::sync::Arc<crate::tools::SessionConfirmLatch>,
     /// Shared exact MCP lease manager (Task 19). Installed at engine boot
     /// when MCP exact mode is active; streams mint per-session capabilities
     /// and RAII guards from it.
@@ -495,6 +741,10 @@ pub struct Runtime {
     /// Per-turn budget (Task 23, spec §8.1). Resolved from role + typed
     /// config at boot; every stream turn is metered against it.
     turn_budget: crate::runtime::budget::TurnBudget,
+    /// Set while an event-started turn's stream starts (like the event
+    /// budget in `turn_budget`): the owner's steer moves that stream onto
+    /// the session budget. `None` for every other stream.
+    owner_steer_budget: Option<Arc<crate::runtime::budget::OwnerSteerBudget>>,
     /// Private runtime-scoped tool-session identity (Task 16). Scopes the
     /// per-stream `SessionToolSet` the execution gate authorizes against.
     /// Minted fresh per constructed `Runtime` — two independently
@@ -512,6 +762,10 @@ pub struct Runtime {
     /// turns (exact activations are session-scoped). Minted empty with the
     /// runtime and shared by `Clone`, exactly like `host_tool_session`.
     retained_tool_set: crate::tools::activation::RetainedSessionToolSet,
+    /// Activations carried over from this conversation's previous runtime
+    /// (daemon reload, unpark), restored at the first progressive turn
+    /// start. Shared by `Clone` like `retained_tool_set`.
+    pending_tool_restore: crate::tools::activation::PendingToolRestore,
     /// Conversation/session identity this runtime serves. Keys the
     /// `on_session_start` hook injection (Phase 2 keys everything).
     /// `None` = unkeyed (workers, tests) — reads no injection.
@@ -969,11 +1223,14 @@ impl Runtime {
 
         let mut runtime = Runtime {
             client: host.client,
+            anthropic_stream_client: Default::default(),
             auth: Arc::new(RwLock::new(AuthState {
                 auth_token,
                 auth_type,
                 refresh_token,
                 token_expires,
+                auth_file_mtime: None,
+                bound_credential: None,
             })),
             model: crate::models::default_model().to_string(),
             tools: host.tools,
@@ -1030,6 +1287,7 @@ impl Runtime {
             saw_1h_honored: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             cache_anchor: Default::default(),
             last_msg_id: Arc::new(Mutex::new(None)),
+            cache_diag_rejected: Default::default(),
             session_manager,
             hook_bus: host.hook_bus,
             reaper_handle,
@@ -1042,6 +1300,7 @@ impl Runtime {
             deferred_tool_loading: true,
             activation_confirm: agent_core::config::ActivationConfirm::default(),
             delegation_parent: None,
+            session_allow_all: std::sync::Arc::new(crate::tools::SessionConfirmLatch::new()),
             mcp_runtime: None,
             mcp_session_scope: None,
             extension_runtime: None,
@@ -1049,9 +1308,11 @@ impl Runtime {
             turn_budget: crate::runtime::budget::TurnBudget::for_role(
                 crate::runtime::budget::TurnRole::Foreground,
             ),
+            owner_steer_budget: None,
             host_tool_session: fresh_host_tool_session(),
             tool_catalog_prompt: Arc::new(std::sync::Mutex::new(None)),
             retained_tool_set: Default::default(),
+            pending_tool_restore: Default::default(),
             session_id: None,
             cwd: None,
             env: None,
@@ -1102,6 +1363,8 @@ impl Runtime {
             auth_type: "api_key".to_string(),
             refresh_token: None,
             token_expires: None,
+            auth_file_mtime: None,
+            bound_credential: None,
         }));
         runtime
     }
@@ -1325,6 +1588,16 @@ impl Runtime {
     /// their role's budget explicitly.
     pub fn set_turn_budget(&mut self, budget: crate::runtime::budget::TurnBudget) {
         self.turn_budget = budget;
+    }
+
+    /// Hand the next stream an [`OwnerSteerBudget`](crate::runtime::budget::OwnerSteerBudget)
+    /// (`None` clears it). Like [`Self::set_turn_budget`], the stream takes it
+    /// when it starts.
+    pub fn set_owner_steer_budget(
+        &mut self,
+        lift: Option<Arc<crate::runtime::budget::OwnerSteerBudget>>,
+    ) {
+        self.owner_steer_budget = lift;
     }
 
     /// The currently configured per-turn budget.
@@ -1568,9 +1841,28 @@ impl Runtime {
     }
 
     /// Conversation/session identity this runtime serves (keys hook
-    /// injection). `None` = unkeyed (workers).
+    /// injection). `None` = unkeyed (workers). Does not reset consent: linked
+    /// compaction successors remain the same conversation. Use
+    /// [`Self::begin_conversation`] for explicit new/resume boundaries.
     pub fn set_session_id(&mut self, id: Option<String>) {
         self.session_id = id;
+    }
+
+    /// Start an explicitly new or resumed conversation with fresh Confirm consent.
+    /// Revoke the old set first, so workers still running from the previous
+    /// conversation stop auto-approving, then replace the Arc so old
+    /// stream/worker clones cannot grant consent to the next conversation.
+    /// Ordinary turns and linked compaction successors must not call this.
+    pub fn begin_conversation(&mut self, id: Option<String>) {
+        self.session_allow_all.revoke();
+        self.session_allow_all = std::sync::Arc::new(crate::tools::SessionConfirmLatch::new());
+        // New conversation, new cache-diagnosis chain (cleared in place so
+        // shared driver/ping clones see it too).
+        *self
+            .last_msg_id
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        self.set_session_id(id);
     }
 
     pub fn session_id(&self) -> Option<&str> {
@@ -1618,9 +1910,81 @@ impl Runtime {
         &self.client
     }
 
+    /// Load provider capability evidence for `model` into THIS process before
+    /// a model / reasoning mutation is validated against it. Only Meta Muse
+    /// needs this: its exact effort set comes from a live, server-driven
+    /// catalog held in a process-local cache, which a daemon-hosted session
+    /// does not share with the TUI that listed the model. Uses this
+    /// runtime's own credential source (local or remote broker); bounded,
+    /// backed off, and never fails the caller.
+    pub async fn prepare_model_capabilities(&self, model: &str) {
+        if model.starts_with("muse/") {
+            let broker = crate::auth::broker_from_source(
+                &self.credential_source,
+                &self.token_cache,
+                self.client.clone(),
+            );
+            crate::runtime::openai::catalog::ensure_muse_catalog_for(model, &broker).await;
+        }
+    }
+
     /// Whether this runtime projects a progressive (core-only) tool schema.
     pub fn progressive_tool_disclosure(&self) -> bool {
         self.progressive_tool_disclosure
+    }
+
+    /// This conversation's exact tool activations as plain data, for the
+    /// next runtime that serves it (daemon reload, park → unpark). The
+    /// retained set's activations once a progressive turn ran; before that,
+    /// whatever this runtime was itself handed and has not applied yet — so
+    /// a reload or park before the first turn does not lose them either.
+    pub fn carried_tool_activations(&self) -> Vec<crate::tools::activation::CarriedActivation> {
+        let retained = self
+            .retained_tool_set
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(shared) = retained {
+            return shared
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .carried_activations();
+        }
+        self.pending_tool_restore
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .unwrap_or_default()
+    }
+
+    /// Hand this runtime the activations the same conversation held in its
+    /// previous runtime. Nothing is granted here: they are re-validated and
+    /// restored (or dropped and reported) at the first progressive turn
+    /// start, against that moment's catalog and this runtime's
+    /// `tools.activation_confirm` (see
+    /// `runtime::stream::restore_pending_activations`). An empty list
+    /// clears nothing that is already pending.
+    pub fn restore_tool_activations(
+        &self,
+        carried: Vec<crate::tools::activation::CarriedActivation>,
+    ) {
+        if carried.is_empty() {
+            return;
+        }
+        let mut pending = self
+            .pending_tool_restore
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match pending.as_mut() {
+            Some(list) => {
+                for c in carried {
+                    if !list.iter().any(|p| p.tool_id == c.tool_id) {
+                        list.push(c);
+                    }
+                }
+            }
+            None => *pending = Some(carried),
+        }
     }
 
     /// `tools.activation_confirm` policy in force for this runtime.
@@ -2619,6 +2983,29 @@ impl Runtime {
                 AuthMethods::scrub_for_remote(&mut auth);
             }
         }
+        // Account switch (G5): if the in-memory Anthropic OAuth token is
+        // bound to a credential other than the one this config now selects
+        // (`auth.account.anthropic` / `SYNAPS_ACCOUNT_ANTHROPIC`, or a
+        // source change), drop it so the next turn re-vends through the
+        // broker — the previous account is never silently kept. Stateless:
+        // compares the token's recorded binding to the new selection.
+        if let Ok(mut auth) = self.auth.try_write() {
+            if auth.auth_type == "oauth" && !auth.auth_token.is_empty() {
+                let selector = config
+                    .auth
+                    .account_selector(crate::auth::OAuthProviderId::Anthropic);
+                let check = crate::runtime::auth::check_binding(
+                    &self.credential_source,
+                    &selector,
+                    auth.bound_credential.as_deref(),
+                    crate::runtime::auth::RefreshPoint::TurnStart,
+                );
+                if check != crate::runtime::auth::BindingCheck::Matches {
+                    AuthMethods::scrub_for_account_switch(&mut auth);
+                    self.token_cache.invalidate("anthropic");
+                }
+            }
+        }
         // Install the process-wide credential broker matching this source so
         // every request path (streams, pings, catalog, TUI status) resolves
         // credentials through the same boundary. Local sources get the
@@ -2670,6 +3057,17 @@ impl Runtime {
         self.subagent_timeout = v;
     }
 
+    /// Copy only retry policy; worker construction must not re-install brokers
+    /// or acquire foreground capabilities by calling full apply_config.
+    pub(crate) fn apply_retry_config(&mut self, config: &crate::SynapsConfig) {
+        self.api_retries = config.api_retries;
+        self.refusal_retries = config.refusal_retries;
+    }
+
+    pub fn refusal_retries(&self) -> u32 {
+        self.refusal_retries
+    }
+
     pub fn set_api_retries(&mut self, v: u32) {
         self.api_retries = v;
     }
@@ -2681,6 +3079,37 @@ impl Runtime {
     pub fn set_telemetry_level(&mut self, level: crate::runtime::telemetry::TelemetryLevel) {
         self.telemetry_level = level;
         self.sync_observability();
+    }
+
+    /// This session's telemetry, for the subagents it spawns.
+    pub fn worker_telemetry(&self) -> crate::runtime::telemetry::WorkerTelemetry {
+        crate::runtime::telemetry::WorkerTelemetry {
+            level: self.telemetry_level,
+            writer: self.telemetry_writer.clone(),
+        }
+    }
+
+    /// Record a worker's requests at its parent's telemetry level, through
+    /// the parent's session writer. Worker runtimes start `Off`
+    /// (`from_parts`), so without this every subagent request was missing
+    /// from `api-log.jsonl`.
+    ///
+    /// The writer is shared, not rebuilt: it owns its files from one thread,
+    /// and a writer per worker would race rotation. The trace context is
+    /// fresh, though: a worker is its own trace session with its own
+    /// cache-break snapshots, so its requests never read as breaks in the
+    /// parent's conversation. A parent that is `Off` leaves the worker `Off`.
+    pub fn inherit_telemetry(&mut self, parent: &crate::runtime::telemetry::WorkerTelemetry) {
+        match (&parent.writer, parent.level.enabled()) {
+            (Some(writer), true) => {
+                self.telemetry_level = parent.level;
+                self.trace_ctx = trace::TraceContext::with_sink(Arc::new(
+                    crate::runtime::telemetry::WriterTraceSink::new(writer.clone()),
+                ));
+                self.telemetry_writer = Some(writer.clone());
+            }
+            _ => self.set_telemetry_level(crate::runtime::telemetry::TelemetryLevel::Off),
+        }
     }
 
     /// Reconcile the shared observability writer + trace sink with the
@@ -2903,6 +3332,9 @@ impl Runtime {
     ) -> std::result::Result<memory_context::ContextProviderId, memory_context::MemoryContextError>
     {
         use crate::extensions::context_provider as ext_cp;
+        if memory_context::provider_unavailable_for_test() {
+            return Err(memory_context::MemoryContextError::ProviderNotRegistered);
+        }
         if (self.memory_backend.exclusive() && !self.memory_backend.is_axel())
             || self
                 .memory_backend_reconfigure_denied
@@ -2986,6 +3418,83 @@ impl Runtime {
             memory_context::emit_memory_observability_event(&enabled_event);
         }
         result
+    }
+
+    /// Start this fresh foreground session in the operator's confirmed
+    /// `memory.default_mode` (spec §12). Called once per session runtime by
+    /// [`crate::host::EngineHost::foreground_runtime_for`], after the memory
+    /// backend is bound; workers never call it, so they inherit storage but
+    /// not the default lease. The grant takes the exact `/memory` path —
+    /// provider resolution and validation first, fail-closed — under
+    /// [`memory_context::UserIntentProof::OperatorConfig`].
+    ///
+    /// `None`: nothing to apply (default off, consent latch unset, or the
+    /// session already has memory state). `/memory off` still revokes the
+    /// default for the rest of the session.
+    pub(crate) fn apply_memory_default_mode(
+        &self,
+        config: &agent_core::config::MemoryConfig,
+    ) -> Option<
+        std::result::Result<
+            memory_context::MemoryContextStatus,
+            memory_context::MemoryContextError,
+        >,
+    > {
+        use memory_context::MemoryContextMode as Mode;
+        // The parser already reverts an unconfirmed mode to off; re-check so
+        // a directly constructed config can never fail open.
+        if !config.default_mode_confirmed {
+            return None;
+        }
+        let mode = match config.default_mode.as_str() {
+            "recall_once" => Mode::RecallOnce,
+            "recall_each_prompt" => Mode::RecallEachPrompt,
+            "capture_only" => Mode::CaptureOnly,
+            "capture_and_recall" => Mode::CaptureAndRecall,
+            _ => return None,
+        };
+        if self.memory_context_status().durable != memory_context::DurableStatus::Off {
+            return None;
+        }
+        let proof = memory_context::UserIntentProof::OperatorConfig;
+        let result = if mode == Mode::RecallOnce {
+            self.memory_context_recall_once(proof)
+        } else {
+            self.memory_context_enable(mode, proof)
+        };
+        match &result {
+            Ok(_) => tracing::info!(
+                mode = mode.as_str(),
+                "memory.default_mode applied to session"
+            ),
+            Err(e) => tracing::warn!(
+                mode = mode.as_str(),
+                error = %e,
+                "memory.default_mode not applied; session starts with memory off"
+            ),
+        }
+        Some(result)
+    }
+
+    /// Restore a session's own `/memory` choice on a rebuilt runtime (unpark,
+    /// daemon reload) instead of the operator default. The choice was the
+    /// user's explicit command for this session, so it is re-granted under
+    /// the same `ExplicitCommand` proof the command minted; `Off` grants
+    /// nothing (the runtime was built without the default). A failed grant
+    /// is logged and leaves memory off.
+    pub(crate) fn restore_session_memory_mode(&self, mode: crate::session::SessionMemoryMode) {
+        let Some(lease) = mode.lease_mode() else {
+            return;
+        };
+        if let Err(e) =
+            self.memory_context_enable(lease, memory_context::mint_explicit_command_proof())
+        {
+            tracing::warn!(
+                mode = lease.as_str(),
+                error = %e,
+                "session memory mode not restored; memory stays off"
+            );
+        }
     }
 
     /// Install a one-shot recall lease (`/memory once`, spec §7.3) under
@@ -3451,6 +3960,21 @@ impl Runtime {
         self.ttl_downgrade_notified = parent.ttl_downgrade_notified.clone();
         self.saw_1h_honored = parent.saw_1h_honored.clone();
         self.cache_anchor = parent.cache_anchor.clone();
+        // Same session, same diagnostics chain: a driver turn continues it,
+        // and a ping sees the same rejection latch (it never moves the chain).
+        self.last_msg_id = parent.last_msg_id.clone();
+        self.cache_diag_rejected = parent.cache_diag_rejected.clone();
+    }
+
+    /// The cache-diagnosis chain for this runtime's requests, `None` when
+    /// `cache_diagnostics` is off (wire unchanged).
+    pub(crate) fn cache_diagnosis(&self) -> Option<cache_diagnosis::CacheDiagnosis> {
+        self.cache_diagnostics.then(|| {
+            cache_diagnosis::CacheDiagnosis::new(
+                Arc::clone(&self.last_msg_id),
+                Arc::clone(&self.cache_diag_rejected),
+            )
+        })
     }
 
     /// Change the cache TTL strategy mid-session. The next request re-marks
@@ -3474,6 +3998,34 @@ impl Runtime {
         self.refresh_if_needed_for_model(&self.model).await
     }
 
+    /// `/auth reload`: drop the in-memory Anthropic token and re-vend it
+    /// through the credential broker (re-reads auth.json locally, forcing a
+    /// refresh if the file still holds the token we had). Returns a
+    /// token-free status line.
+    pub async fn reload_auth(&self) -> Result<String> {
+        AuthMethods::reload_after_rejection(
+            Arc::clone(&self.auth),
+            &self.client,
+            &self.credential_source,
+            &self.token_cache,
+            None,
+        )
+        .await?;
+        let expires = self.auth.read().await.token_expires;
+        let source = if self.credential_source.is_remote() {
+            "remote broker"
+        } else {
+            "auth.json"
+        };
+        Ok(match expires {
+            Some(exp) => {
+                let mins = exp.saturating_sub(crate::epoch_millis()) / 60_000;
+                format!("Anthropic credentials reloaded from {source} (valid ~{mins} min)")
+            }
+            None => format!("Anthropic credentials reloaded from {source}"),
+        })
+    }
+
     async fn refresh_if_needed_for_model(&self, model: &str) -> Result<()> {
         // Non-Anthropic models resolve their own provider auth in the OpenAI
         // path (incl. via the broker), so skip the Anthropic pre-fetch. (#158 #7)
@@ -3485,6 +4037,8 @@ impl Runtime {
             &self.client,
             &self.credential_source,
             &self.token_cache,
+            Some(model),
+            crate::runtime::auth::RefreshPoint::TurnStart,
         )
         .await
     }
@@ -3576,6 +4130,7 @@ impl Runtime {
                     credential_source: self.credential_source.clone(),
                     token_cache: self.token_cache.clone(),
                     anthropic_base_url: None,
+                    anthropic_stream_client: self.anthropic_stream_client.clone(),
                     anthropic_execution_plan: anthropic_execution_plan.clone(),
                     codex_request_role: self.codex_request_role(),
                     // Consistent with the streaming path: a pending
@@ -3602,6 +4157,8 @@ impl Runtime {
                     usage_counters: None,
                     cache_anchor: None,
                     keepwarm: None,
+                    // The non-stream transport never sends diagnostics.
+                    cache_diagnosis: None,
                 },
             )
             .await?;
@@ -3677,8 +4234,10 @@ impl Runtime {
                                         tx_events: None,
                                     },
                                     capabilities: crate::tools::ToolCapabilities {
+                                        session_allow_all: Some(self.session_allow_all.clone()),
                                         launch_cancel: None,
                                         memory_backend: Some(self.memory_backend.clone()),
+                                        telemetry: Some(self.worker_telemetry()),
                                         watcher_exit_path: self.watcher_exit_path.clone(),
                                         tool_register_tx: None,
                                         session_manager: Some(self.session_manager.clone()),
@@ -3700,6 +4259,7 @@ impl Runtime {
                                         env: self.env.clone(),
                                         env_stripped: self.env_stripped.clone(),
                                         env_warned: self.env_warned.clone(),
+                                        session_id: self.session_id.clone(),
                                     },
                                     limits: crate::tools::ToolLimits {
                                         max_tool_output: self.max_tool_output,
@@ -3721,6 +4281,7 @@ impl Runtime {
                                     .await,
                                     None,
                                     false,
+                                    Some(&self.session_allow_all),
                                 )
                                 .await;
                                 if let BeforeToolCallDecision::Block { reason } = decision {
@@ -3798,8 +4359,10 @@ impl Runtime {
                             let registry_inner = cfg_subagent_registry.clone();
                             let event_queue_inner = cfg_event_queue.clone();
                             let hook_bus_inner = cfg_hook_bus.clone();
+                            let session_allow_all_inner = self.session_allow_all.clone();
                             let orchestration_inner = cfg_orchestration.clone();
                             let memory_backend_inner = self.memory_backend.clone();
+                            let worker_telemetry_inner = self.worker_telemetry();
                             let memory_context_inner = self.memory_tool_capability();
                             let codex_parent_plan_inner = codex_parent_plan.clone();
                             let cwd_inner = cfg_cwd.clone();
@@ -3827,6 +4390,7 @@ impl Runtime {
                                                 .await,
                                                 None,
                                                 false,
+                                                Some(&session_allow_all_inner),
                                             )
                                             .await;
                                         if let crate::runtime::BeforeToolCallDecision::Block {
@@ -3847,8 +4411,10 @@ impl Runtime {
                                                     tx_events: None,
                                                 },
                                                 capabilities: crate::tools::ToolCapabilities {
+                                                    session_allow_all: Some(session_allow_all_inner.clone()),
                                                     launch_cancel: None,
                                                     memory_backend: Some(memory_backend_inner),
+                                                    telemetry: Some(worker_telemetry_inner),
                                                     watcher_exit_path: exit_path,
                                                     tool_register_tx: None,
                                                     session_manager: Some(session_mgr_inner),
@@ -3866,6 +4432,7 @@ impl Runtime {
                                                     env: env_inner,
                                                     env_stripped: env_stripped_inner,
                                                     env_warned: env_warned_inner,
+                                                    session_id: session_id_inner.clone(),
                                                 },
                                                 limits: crate::tools::ToolLimits {
                                                     max_tool_output: cfg_max_tool_output,
@@ -3969,6 +4536,22 @@ impl Runtime {
             false,
         )
         .await
+    }
+
+    /// Session-scoped "Allow all" latch for extension Confirm gates: the
+    /// extension ids the user picked "Allow all from <ext>" for.
+    pub fn session_allow_all(&self) -> &std::sync::Arc<crate::tools::SessionConfirmLatch> {
+        &self.session_allow_all
+    }
+
+    /// Bind a worker to the calling session, not the process-wide host.
+    pub(crate) fn inherit_session_allow_all(
+        &mut self,
+        parent: Option<&std::sync::Arc<crate::tools::SessionConfirmLatch>>,
+    ) {
+        if let Some(parent) = parent {
+            self.session_allow_all = parent.clone();
+        }
     }
 
     /// Run a multi-turn conversation as a cancellable stream of [`StreamEvent`]s.
@@ -4124,6 +4707,7 @@ impl Runtime {
             credential_source: self.credential_source.clone(),
             token_cache: self.token_cache.clone(),
             anthropic_base_url: None,
+            anthropic_stream_client: self.anthropic_stream_client.clone(),
             anthropic_execution_plan,
             codex_request_role: self.codex_request_role(),
             trace: self.effective_trace_context(),
@@ -4144,6 +4728,9 @@ impl Runtime {
             // schedules from.
             cache_anchor: Some(self.cache_anchor.clone()),
             keepwarm: None,
+            // The foreground chain: the only requests that thread
+            // `diagnostics.previous_message_id`.
+            cache_diagnosis: self.cache_diagnosis(),
         };
 
         let final_capture_history: Arc<Mutex<Option<Vec<crate::SharedMessage>>>> = Arc::new(Mutex::new(None));
@@ -4185,6 +4772,7 @@ impl Runtime {
             env_stripped: self.env_stripped.clone(),
             env_warned: self.env_warned.clone(),
             auto_approve_confirms,
+            session_allow_all: self.session_allow_all.clone(),
             telemetry_level: self.telemetry_level,
             orchestration: self.orchestration.clone(),
             delegation_parent: self.delegation_parent.clone(),
@@ -4194,11 +4782,13 @@ impl Runtime {
             activation_confirm: self.activation_confirm,
             tool_session_id: self.host_tool_session.clone(),
             retained_tool_set: std::sync::Arc::clone(&self.retained_tool_set),
+            pending_tool_restore: std::sync::Arc::clone(&self.pending_tool_restore),
             mcp_runtime: self.mcp_runtime.clone(),
             mcp_session_scope: self.mcp_session_scope.clone(),
             extension_runtime: self.extension_runtime.clone(),
             extension_session_scope: self.extension_session_scope.clone(),
             turn_budget: self.turn_budget.clone(),
+            owner_steer_budget: self.owner_steer_budget.clone(),
         };
 
         tokio::spawn(async move {
@@ -4240,6 +4830,7 @@ impl Clone for Runtime {
     fn clone(&self) -> Self {
         Self {
             client: self.client.clone(),
+            anthropic_stream_client: self.anthropic_stream_client.clone(),
             auth: Arc::clone(&self.auth),
             model: self.model.clone(),
             tools: self.tools.clone(),
@@ -4308,6 +4899,7 @@ impl Clone for Runtime {
             // Subagents start their own request chain — inheriting the parent's
             // last msg_id would produce bogus `messages_changed` diagnostics.
             last_msg_id: Arc::new(Mutex::new(None)),
+            cache_diag_rejected: Arc::clone(&self.cache_diag_rejected),
             session_manager: self.session_manager.clone(),
             hook_bus: self.hook_bus.clone(),
             reaper_handle: None, // Cloned runtimes don't own the reaper
@@ -4320,6 +4912,7 @@ impl Clone for Runtime {
             deferred_tool_loading: self.deferred_tool_loading,
             activation_confirm: self.activation_confirm,
             delegation_parent: self.delegation_parent.clone(),
+            session_allow_all: self.session_allow_all.clone(),
             mcp_runtime: self.mcp_runtime.clone(),
             // Clones SHARE the durable session scope: dropping one clone or
             // one stream can never kill a sibling's leases.
@@ -4328,6 +4921,7 @@ impl Clone for Runtime {
             // Same durable shared-scope rule for extension leases.
             extension_session_scope: self.extension_session_scope.clone(),
             turn_budget: self.turn_budget.clone(),
+            owner_steer_budget: self.owner_steer_budget.clone(),
             // Clones share the live tool registry, so they share the SAME
             // host tool session (matching existing shared-session behavior);
             // independently constructed runtimes mint fresh identities and
@@ -4335,6 +4929,7 @@ impl Clone for Runtime {
             host_tool_session: self.host_tool_session.clone(),
             tool_catalog_prompt: Arc::clone(&self.tool_catalog_prompt),
             retained_tool_set: std::sync::Arc::clone(&self.retained_tool_set),
+            pending_tool_restore: std::sync::Arc::clone(&self.pending_tool_restore),
             // Clones serve the same conversation (see memory_context_state).
             session_id: self.session_id.clone(),
             cwd: self.cwd.clone(),
@@ -4463,6 +5058,31 @@ mod tests {
             other.host_tool_session_id(),
             "independently constructed runtimes must never share a session"
         );
+    }
+
+    /// Activations handed to a runtime before its first turn are what it
+    /// hands on (a second reload, or a park, before any turn loses
+    /// nothing); clones share them; another runtime does not see them.
+    #[test]
+    fn handed_activations_are_carried_on_before_the_first_turn() {
+        use crate::tools::activation::{CarriedActivation, CarriedProvenance};
+        let probe = |name: &str| CarriedActivation {
+            tool_id: format!("builtin:{name}"),
+            schema_digest: "ab".repeat(32),
+            provenance: CarriedProvenance::BuiltinRuntime,
+        };
+        let rt = Runtime::new_headless();
+        assert!(rt.carried_tool_activations().is_empty());
+        rt.restore_tool_activations(vec![probe("subagent_start")]);
+        rt.restore_tool_activations(Vec::new());
+        rt.restore_tool_activations(vec![probe("subagent_start"), probe("subagent_status")]);
+        assert_eq!(
+            rt.carried_tool_activations(),
+            vec![probe("subagent_start"), probe("subagent_status")],
+            "merged without duplicates; an empty hand-off clears nothing"
+        );
+        assert_eq!(rt.clone().carried_tool_activations().len(), 2);
+        assert!(Runtime::new_headless().carried_tool_activations().is_empty());
     }
 
     /// Task 11 config rule (documented until Task 12 adds explicit trace
@@ -4956,6 +5576,32 @@ mod tests {
             .is_ok());
     }
 
+    /// Regression ("model change blocked: trusted worker catalog
+    /// unavailable"): a daemon-hosted session has no live Muse catalog in
+    /// its process (the picker fetched it in the TUI process). Switching to
+    /// a Muse id must not depend on that process-local cache.
+    #[test]
+    fn set_model_to_uncached_muse_id_rebuilds_orchestration() {
+        let _guard = crate::runtime::openai::catalog::muse::test_cache_guard();
+        crate::runtime::openai::catalog::capability_cache::replace_provider("muse", &[]);
+        let mut runtime = Runtime::new_headless();
+        let glm = agent_core::prompt::QualifiedModelId::parse("openrouter/z-ai/glm-5.2").unwrap();
+        runtime.install_orchestration(std::sync::Arc::new(
+            crate::orchestration::OrchestrationRuntime::baseline(glm, 3, 8).unwrap(),
+        ));
+
+        for model in ["muse/muse-wonder-1.0", "muse/muse-live-only-zz5"] {
+            runtime
+                .try_set_model(model.to_owned())
+                .unwrap_or_else(|e| panic!("{model}: {e}"));
+            assert_eq!(runtime.model(), model);
+            assert_eq!(runtime.orchestration().unwrap().foreground_model(), model);
+        }
+        // Malformed ids still fail closed.
+        assert!(runtime.try_set_model("muse/Bad Id".to_owned()).is_err());
+        assert_eq!(runtime.model(), "muse/muse-live-only-zz5");
+    }
+
     #[test]
     fn set_model_refuses_to_orphan_unreconciled_policy_workers() {
         let mut runtime = Runtime::new_headless();
@@ -5055,11 +5701,10 @@ mod tests {
     #[tokio::test]
     async fn confirm_without_prompt_fails_closed() {
         let result = resolve_before_tool_call_result(
-            crate::extensions::hooks::events::HookResult::Confirm {
-                message: "Run deploy?".into(),
-            },
+            crate::extensions::hooks::events::HookResult::confirm("Run deploy?"),
             None,
             false,
+            None,
         )
         .await;
 
@@ -5079,6 +5724,7 @@ mod tests {
             },
             None,
             false,
+            None,
         )
         .await;
 
@@ -5103,11 +5749,10 @@ mod tests {
         });
 
         let result = resolve_before_tool_call_result(
-            crate::extensions::hooks::events::HookResult::Confirm {
-                message: "Run deploy?".into(),
-            },
+            crate::extensions::hooks::events::HookResult::confirm("Run deploy?"),
             Some(&handle),
             false,
+            None,
         )
         .await;
 
@@ -5129,11 +5774,10 @@ mod tests {
         });
 
         let result = resolve_before_tool_call_result(
-            crate::extensions::hooks::events::HookResult::Confirm {
-                message: "Run deploy?".into(),
-            },
+            crate::extensions::hooks::events::HookResult::confirm("Run deploy?"),
             Some(&handle),
             false,
+            None,
         )
         .await;
 
@@ -5142,6 +5786,593 @@ mod tests {
             result,
             crate::extensions::hooks::events::HookResult::Block { reason }
                 if reason.contains("confirmation denied")
+        ));
+    }
+
+    fn ext(ids: &[&str]) -> Vec<String> {
+        ids.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn key(ids: &[&str]) -> Vec<crate::tools::LatchKey> {
+        ids.iter().map(|s| (s.to_string(), 0)).collect()
+    }
+
+    fn sourced_confirm(
+        message: &str,
+        source: &str,
+        tool: &str,
+    ) -> crate::extensions::hooks::events::HookResult {
+        crate::extensions::hooks::events::HookResult::Confirm {
+            message: message.into(),
+            sources: ext(&[source]),
+            tool: Some(tool.into()),
+            generations: vec![],
+            modified_input: None,
+            modified_by: vec![],
+        }
+    }
+
+    #[test]
+    fn session_allow_all_clones_share_but_independent_runtimes_do_not() {
+        use std::sync::Arc;
+        let parent = Runtime::new_headless();
+        let cloned = parent.clone();
+        let independent = Runtime::new_headless();
+        assert!(Arc::ptr_eq(
+            parent.session_allow_all(),
+            cloned.session_allow_all()
+        ));
+        assert!(!Arc::ptr_eq(
+            parent.session_allow_all(),
+            independent.session_allow_all()
+        ));
+        cloned.session_allow_all().allow(&key(&["jev"]));
+        assert!(parent.session_allow_all().allows_all(&key(&["jev"])));
+        assert!(!independent.session_allow_all().allows_all(&key(&["jev"])));
+    }
+
+    #[test]
+    fn session_allow_all_conversation_boundary_isolates_old_clones() {
+        use std::sync::Arc;
+        let mut runtime = Runtime::new_headless();
+        let old_worker = runtime.clone();
+        old_worker.session_allow_all().allow(&key(&["jev"]));
+
+        runtime.begin_conversation(Some("next".into()));
+        assert_eq!(runtime.session_id(), Some("next"));
+        assert!(runtime.session_allow_all().is_empty());
+        assert!(!Arc::ptr_eq(
+            runtime.session_allow_all(),
+            old_worker.session_allow_all()
+        ));
+        // #148 I2b: workers still running from the old conversation stop
+        // auto-approving — the old set is revoked before the swap.
+        assert!(
+            old_worker.session_allow_all().is_empty(),
+            "old latch must be cleared, not just replaced"
+        );
+        // An old clone can neither grant the new conversation nor re-arm
+        // the revoked (orphaned) set.
+        assert!(!old_worker.session_allow_all().allow(&key(&["jev"])));
+        assert!(old_worker.session_allow_all().is_empty());
+        assert!(runtime.session_allow_all().is_empty());
+
+        let new_worker = runtime.clone();
+        new_worker.session_allow_all().allow(&key(&["jev"]));
+        assert!(runtime.session_allow_all().allows_all(&key(&["jev"])));
+        // Explicit resume of even the same ID starts fresh consent.
+        runtime.begin_conversation(Some("next".into()));
+        assert!(runtime.session_allow_all().is_empty());
+        assert!(!Arc::ptr_eq(
+            runtime.session_allow_all(),
+            new_worker.session_allow_all()
+        ));
+    }
+
+    #[test]
+    fn conversation_boundary_resets_the_cache_diagnosis_chain() {
+        let mut runtime = Runtime::new_headless();
+        runtime.set_cache_diagnostics(true);
+        let mut driver = runtime.clone();
+        driver.share_ttl_latches(&runtime);
+        runtime.cache_diagnosis().unwrap().record("msg_old");
+        // Compaction successor: same conversation, chain kept.
+        runtime.set_session_id(Some("successor".into()));
+        assert_eq!(
+            runtime
+                .cache_diagnosis()
+                .unwrap()
+                .previous_message_id()
+                .as_deref(),
+            Some("msg_old")
+        );
+        // `/clear` (and resume) start a new chain, seen by shared clones too.
+        runtime.begin_conversation(Some("next".into()));
+        assert_eq!(
+            runtime.cache_diagnosis().unwrap().previous_message_id(),
+            None
+        );
+        assert_eq!(
+            driver.cache_diagnosis().unwrap().previous_message_id(),
+            None
+        );
+    }
+
+    #[test]
+    fn session_allow_all_identity_change_preserves_compaction_consent() {
+        use std::sync::Arc;
+        let mut runtime = Runtime::new_headless();
+        let worker = runtime.clone();
+        worker.session_allow_all().allow(&key(&["jev"]));
+        runtime.set_session_id(Some("linked-successor".into()));
+        assert!(Arc::ptr_eq(
+            runtime.session_allow_all(),
+            worker.session_allow_all()
+        ));
+        assert!(runtime.session_allow_all().allows_all(&key(&["jev"])));
+    }
+
+    /// "Allow all from <ext>": the answer continues THIS call and latches
+    /// that extension only. A later confirm from the same extension resolves
+    /// without a prompt; a confirm from another extension still prompts.
+    #[tokio::test]
+    async fn confirm_prompt_always_latches_only_the_source_extension() {
+        let latch = crate::tools::SessionConfirmLatch::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let handle = crate::tools::SecretPromptHandle::new(tx);
+
+        let task = tokio::spawn(async move {
+            let first = rx.recv().await.expect("first confirm prompt");
+            // The dialog is told who asks and for which tool BEFORE answering.
+            assert_eq!(
+                first.confirm_scope,
+                Some(crate::session::ConfirmScope {
+                    extensions: vec!["jev".into()],
+                    tool: Some("bash".into()),
+                    rewritten_by: vec![],
+                })
+            );
+            assert!(first.prompt.starts_with("Extension: jev\nTool: bash\n"), "{}", first.prompt);
+            let _ = first
+                .response_tx
+                .send(Some(CONFIRM_ANSWER_ALLOW_ALL.to_string()));
+            // The next prompt must be the OTHER extension's confirm (jev's
+            // second confirm is latched and never prompts).
+            let other = rx.recv().await.expect("other extension still prompts");
+            assert_eq!(
+                other.confirm_scope.as_ref().map(|s| s.extensions.clone()),
+                Some(vec!["other".to_string()])
+            );
+            let _ = other.response_tx.send(None);
+            assert!(rx.recv().await.is_none(), "no further prompts");
+        });
+
+        let first = resolve_before_tool_call_result(
+            sourced_confirm("Run deploy?", "jev", "bash"),
+            Some(&handle),
+            false,
+            Some(&latch),
+        )
+        .await;
+        assert!(matches!(
+            first,
+            crate::extensions::hooks::events::HookResult::Continue
+        ));
+        assert_eq!(latch.extensions(), ext(&["jev"]), "latch keyed by source");
+
+        let second = resolve_before_tool_call_result(
+            sourced_confirm("Run deploy again?", "jev", "write"),
+            Some(&handle),
+            false,
+            Some(&latch),
+        )
+        .await;
+        assert!(matches!(
+            second,
+            crate::extensions::hooks::events::HookResult::Continue
+        ));
+
+        let other = resolve_before_tool_call_result(
+            sourced_confirm("Run ls?", "other", "bash"),
+            Some(&handle),
+            false,
+            Some(&latch),
+        )
+        .await;
+        assert!(
+            matches!(other, crate::extensions::hooks::events::HookResult::Block { .. }),
+            "another extension's confirm is not covered by jev's latch"
+        );
+        drop(handle);
+        task.await.unwrap();
+    }
+
+    /// Latched A + unlatched B on one call (a merged Confirm): it prompts,
+    /// the prompt names both, and "Allow all" then latches both.
+    #[tokio::test]
+    async fn latched_plus_unlatched_source_prompts_and_allow_all_latches_both() {
+        let latch = crate::tools::SessionConfirmLatch::new();
+        latch.allow(&key(&["a"]));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let handle = crate::tools::SecretPromptHandle::new(tx);
+        let task = tokio::spawn(async move {
+            let req = rx.recv().await.expect("must prompt: b is not latched");
+            assert_eq!(
+                req.confirm_scope.as_ref().map(|s| s.extensions.clone()),
+                Some(vec!["a".to_string(), "b".to_string()])
+            );
+            assert!(req.prompt.starts_with("Extension: a, b\n"), "{}", req.prompt);
+            let _ = req.response_tx.send(Some(CONFIRM_ANSWER_ALLOW_ALL.to_string()));
+        });
+        let merged = || crate::extensions::hooks::events::HookResult::Confirm {
+            message: "[a] x\n\n[b] y".into(),
+            sources: ext(&["a", "b"]),
+            generations: vec![],
+            tool: Some("bash".into()),
+            modified_input: None,
+            modified_by: vec![],
+        };
+        let first = resolve_before_tool_call_result(merged(), Some(&handle), false, Some(&latch)).await;
+        task.await.unwrap();
+        assert!(matches!(first, crate::extensions::hooks::events::HookResult::Continue));
+        assert!(latch.allows_all(&key(&["a", "b"])));
+        // Now fully latched: no prompt (handle dropped → would block).
+        drop(handle);
+        let second = resolve_before_tool_call_result(merged(), None, false, Some(&latch)).await;
+        assert!(matches!(second, crate::extensions::hooks::events::HookResult::Continue));
+    }
+
+    /// A call site with no latch never offers "Allow all" (no scope), so the
+    /// dialog and the session's "armed" notice can't promise it.
+    #[tokio::test]
+    async fn no_latch_means_no_allow_all_scope() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let handle = crate::tools::SecretPromptHandle::new(tx);
+        let task = tokio::spawn(async move {
+            let req = rx.recv().await.unwrap();
+            assert!(req.confirm_scope.is_none());
+            let _ = req.response_tx.send(Some("y".into()));
+        });
+        let r = resolve_before_tool_call_result(
+            sourced_confirm("Run?", "jev", "bash"),
+            Some(&handle),
+            false,
+            None,
+        )
+        .await;
+        task.await.unwrap();
+        assert!(matches!(r, crate::extensions::hooks::events::HookResult::Continue));
+    }
+
+    /// prA N3: a Confirm whose input an earlier extension rewrote shows who
+    /// rewrote it and a capped preview of the FINAL input, ahead of the
+    /// confirmer's own message; the scope records `rewritten_by` so the
+    /// session can mark the transcript; approval runs that final input.
+    #[tokio::test]
+    async fn rewritten_input_is_shown_in_the_confirm_prompt() {
+        let latch = crate::tools::SessionConfirmLatch::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let handle = crate::tools::SecretPromptHandle::new(tx);
+        let task = tokio::spawn(async move {
+            let req = rx.recv().await.unwrap();
+            let body = req.prompt.clone();
+            let scope = req.confirm_scope.clone().unwrap();
+            let _ = req.response_tx.send(Some("y".into()));
+            (body, scope)
+        });
+        let result = resolve_before_tool_call_result(
+            crate::extensions::hooks::events::HookResult::Confirm {
+                message: "Run this bash command?".into(),
+                sources: ext(&["jev"]),
+                generations: vec![],
+                tool: Some("bash".into()),
+                modified_input: Some(serde_json::json!({"command": "rm -rf build/"})),
+                modified_by: ext(&["rewriter"]),
+            },
+            Some(&handle),
+            false,
+            Some(&latch),
+        )
+        .await;
+        let (body, scope) = task.await.unwrap();
+        let header_end = body.find("Message from jev:\nRun this bash command?").unwrap();
+        let header = &body[..header_end];
+        assert!(header.contains("Input rewritten by: rewriter"), "{body}");
+        assert!(header.contains("Input that will run:\n  rm -rf build/"), "{body}");
+        assert_eq!(scope.rewritten_by, ext(&["rewriter"]));
+        assert!(matches!(
+            result,
+            crate::extensions::hooks::events::HookResult::Modify { input }
+                if input == serde_json::json!({"command": "rm -rf build/"})
+        ));
+        // No rewrite → no rewrite header, empty rewritten_by.
+        let plain = confirm_prompt_body("m", &ext(&["jev"]), Some("bash"), None);
+        assert!(!plain.contains("rewritten"), "{plain}");
+    }
+
+    /// prA I-R3-1: the preview is redacted before it is rendered.
+    #[test]
+    fn final_input_preview_redacts_credentials() {
+        let secrets = [
+            "SECRET-BEARER-123",
+            "SECRET-KEY-456",
+            "SECRET-FIELD-789",
+            "QmFzaWNTRUNSRVQ=",
+            "SECRET-TOK-000",
+            "SECRET-FLAG-111",
+            "sk-ant-api03-abcdefghijklmnop",
+            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2lnbmF0dXJl",
+            "ghp_abcdefghijklmnopqrstuvwxyz0123",
+        ];
+        let command = serde_json::json!({
+            "command": "curl -H 'Authorization: Bearer SECRET-BEARER-123' \
+                        'https://api.example/v1?api_key=SECRET-KEY-456' \
+                        -H \"authorization: Basic QmFzaWNTRUNSRVQ=\" \
+                        && TOKEN=SECRET-TOK-000 deploy --password SECRET-FLAG-111 \
+                        sk-ant-api03-abcdefghijklmnop \
+                        eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2lnbmF0dXJl \
+                        ghp_abcdefghijklmnopqrstuvwxyz0123"
+        });
+        let json = serde_json::json!({
+            "url": "https://x/y",
+            "api_key": "SECRET-FIELD-789",
+            "headers": {"X-Note": "Bearer SECRET-BEARER-123"},
+            "args": ["--token=SECRET-TOK-000"],
+        });
+        for input in [command, json] {
+            let p = final_input_preview(&input);
+            for secret in secrets {
+                assert!(!p.contains(secret), "{secret} leaked in:\n{p}");
+            }
+            assert!(p.contains("[REDACTED]"), "{p}");
+        }
+        // Non-secret text survives so the user can still judge the call.
+        let plain = final_input_preview(&serde_json::json!({"command": "rm -rf build/ && ls -la"}));
+        assert!(plain.contains("rm -rf build/ && ls -la"), "{plain}");
+    }
+
+    /// prA I-R4-2: every shape from the round-4 table is redacted, by the
+    /// SHARED scrubber (trace export gets the same rules).
+    #[test]
+    fn redact_secret_text_covers_round4_shapes() {
+        let rows: &[(&str, &str)] = &[
+            ("curl -H 'x-api-key: XAPIKEY-SECRET-1' https://a", "XAPIKEY-SECRET-1"),
+            ("FOO_TOKEN=TOK-SECRET-2 run", "TOK-SECRET-2"),
+            ("MY_SECRET=SEC-SECRET-3 ./x", "SEC-SECRET-3"),
+            ("DB_PASSWORD=PW-SECRET-4 ./x", "PW-SECRET-4"),
+            ("OPENAI_API_KEY=APIKEY-SECRET-5 ./x", "APIKEY-SECRET-5"),
+            ("curl -H 'Authorization: Basic QkFTSUMtU0VDUkVULTY='", "QkFTSUMtU0VDUkVULTY="),
+            ("aws_secret_access_key=AWSSEC-SECRET-7", "AWSSEC-SECRET-7"),
+            ("git clone https://alice:USERINFO-SECRET-8@github.com/o/r", "USERINFO-SECRET-8"),
+            ("psql postgres://app:PGPW-SECRET-9@db:5432/prod", "PGPW-SECRET-9"),
+            ("DATABASE_URL=postgres://app:DBURL-SECRET-10@db/prod ./run", "DBURL-SECRET-10"),
+            ("curl -H 'Cookie: sid=COOKIE-SECRET-11; theme=dark' https://a", "COOKIE-SECRET-11"),
+            ("printf 'Set-Cookie: sid=SETCOOKIE-SECRET-12'", "SETCOOKIE-SECRET-12"),
+            ("curl -u alice:CURLU-SECRET-13 https://a", "CURLU-SECRET-13"),
+            ("mysql -u root -pMYSQL-SECRET-14 prod", "MYSQL-SECRET-14"),
+            ("sshpass -p SSHPASS-SECRET-15 ssh host", "SSHPASS-SECRET-15"),
+            ("aws configure set aws_secret_access_key AWSCFG-SECRET-16", "AWSCFG-SECRET-16"),
+            ("aws x --secret-access-key FLAG-SECRET-17 --region eu", "FLAG-SECRET-17"),
+            ("aws x --access-key FLAG-SECRET-18", "FLAG-SECRET-18"),
+            ("STRIPE_KEY=rk_live_STRIPE-SECRET-19 node app", "STRIPE-SECRET-19"),
+            ("OPENAI_KEY=OAIKEY-SECRET-20 node app", "OAIKEY-SECRET-20"),
+        ];
+        // prA I-R5-1: rows whose shape is unmistakable are also caught by
+        // the SHARED high-precision scrub (trace export, memory, archive).
+        let precise = [
+            "QkFTSUMtU0VDUkVULTY=",
+            "USERINFO-SECRET-8",
+            "PGPW-SECRET-9",
+            "DBURL-SECRET-10",
+            "COOKIE-SECRET-11",
+            "SETCOOKIE-SECRET-12",
+            "CURLU-SECRET-13",
+            "MYSQL-SECRET-14",
+            "SSHPASS-SECRET-15",
+        ];
+        for (text, secret) in rows {
+            // The Confirm prompt path catches every row.
+            let out = redact_secret_text(text);
+            assert!(!out.contains(secret), "{secret} leaked: {out}");
+            assert!(out.contains("[REDACTED]"), "{out}");
+            let preview = final_input_preview(&serde_json::json!({ "command": text }));
+            assert!(!preview.contains(secret), "{secret} leaked in preview: {preview}");
+            if precise.contains(secret) {
+                let mut v = serde_json::Value::String(text.to_string());
+                crate::runtime::trace::export::redact_value(&mut v);
+                assert!(
+                    !v.as_str().unwrap().contains(secret),
+                    "shared scrub leaked {secret}: {v}"
+                );
+            }
+        }
+        // Over-redaction guards: ordinary commands and prose stay intact.
+        for ok in [
+            "mkdir -p build/out",
+            "ssh -p 2222 host",
+            "ssh -p2222 host",
+            "docker run -p 8080:80 nginx",
+            "mysql -h db -P 3306 -p prod",
+            "curl -u alice https://example.com/path",
+            "echo the token is valid and the password field is empty",
+            "monkey=1 make",
+            "git log --format=%H -- src/",
+            "https://example.com/a/b?page=2",
+        ] {
+            assert_eq!(redact_secret_text(ok), ok, "over-redacted");
+        }
+    }
+
+    /// prA I-R5-1: the shared scrub (`redact_value`) also runs over the
+    /// rollover context archive, memory captures and traces, so benign code
+    /// and prose must pass through it unchanged. Only the Confirm prompt
+    /// uses the aggressive rules.
+    #[test]
+    fn shared_scrub_leaves_benign_code_and_prose_alone() {
+        let benign = [
+            "max_tokens: 4096",
+            "password: String,",
+            "let token = load()?;",
+            "the password-reset flow",
+            "pub authorization: Option<String>,",
+            "cookie: HashMap<String, String>,",
+            "MY_KEY=value_in_docs",
+            "--token-file path/to/file",
+            "fn refresh_access_token(&self) -> Result<Token>",
+            "aws_secret_access_key is the field name",
+        ];
+        for text in benign {
+            let mut v = serde_json::Value::String(text.to_string());
+            crate::runtime::trace::export::redact_value(&mut v);
+            assert_eq!(v.as_str().unwrap(), text, "shared scrub mangled benign text");
+            assert_eq!(crate::runtime::trace::export::redact_text(text), text);
+        }
+        // Inside objects too (archive / memory records are JSON).
+        let mut record = serde_json::json!({
+            "text": "set max_tokens: 4096 and keep the password-reset flow",
+            "code": ["password: String,", "let token = load()?;"],
+        });
+        let before = record.clone();
+        crate::runtime::trace::export::redact_value(&mut record);
+        assert_eq!(record, before);
+    }
+
+    /// prA I-R4-1: the confirmer's message is redacted too — it routinely
+    /// echoes the (credential-injected) command it was shown.
+    #[test]
+    fn confirmer_message_echoing_injected_credentials_is_redacted() {
+        let injected = serde_json::json!({
+            "command": "curl -H 'Authorization: Bearer ECHOED-BEARER-X' https://a"
+        });
+        let body = confirm_prompt_body(
+            "Run: curl -H 'Authorization: Bearer ECHOED-BEARER-X' https://a ?",
+            &ext(&["jev"]),
+            Some("bash"),
+            Some((&ext(&["injector"]), &injected)),
+        );
+        assert!(!body.contains("ECHOED-BEARER-X"), "{body}");
+        assert!(body.contains("Message from jev:\nRun: curl -H 'Authorization: [REDACTED]"), "{body}");
+    }
+
+    /// prA I-R4-3: control, bidi and zero-width characters in the message
+    /// are stripped before capping, so they can't move the cursor or
+    /// disguise text in plain-text clients.
+    #[test]
+    fn confirm_message_control_and_bidi_chars_are_stripped() {
+        let hostile = "ok\x1b[3A\x1b[2KExtension: trusted\rTool: none\u{0085}\u{202E}evil\u{200B}x\u{2066}y\tz\nnext";
+        let body = confirm_prompt_body(hostile, &ext(&["jev"]), Some("bash"), None);
+        for bad in ['\x1b', '\r', '\u{0085}', '\u{202E}', '\u{200B}', '\u{2066}', '\t'] {
+            assert!(!body.contains(bad), "{bad:?} survived: {body:?}");
+        }
+        assert!(body.contains("Message from jev:\nok[3A[2KExtension: trustedTool: noneevilxy z\nnext"), "{body:?}");
+        assert!(body.starts_with("Extension: jev\nTool: bash\n"));
+    }
+
+    /// The confirmer's text is labelled, so a fake "Input that will run:"
+    /// in it lands visibly under "Message from <ext>:", after the host block.
+    #[test]
+    fn extension_message_is_labelled_after_the_host_header() {
+        let fake = "Input that will run:\n  echo harmless";
+        let body = confirm_prompt_body(fake, &ext(&["jev"]), Some("bash"), None);
+        let label = body.find("Message from jev:\n").expect(&body);
+        assert_eq!(body.find("Input that will run:"), Some(label + "Message from jev:\n".len()));
+        assert!(body.starts_with("Extension: jev\nTool: bash\n"), "{body}");
+    }
+
+    #[test]
+    fn final_input_preview_is_capped() {
+        let many = serde_json::json!({"command": (1..=20).map(|i| format!("echo {i}")).collect::<Vec<_>>().join("\n")});
+        let p = final_input_preview(&many);
+        assert!(p.lines().count() <= MAX_REWRITE_PREVIEW_LINES + 1, "{p}");
+        assert!(p.ends_with("…[preview truncated]"), "{p}");
+        let wide = serde_json::json!({"path": "x".repeat(2000)});
+        let p = final_input_preview(&wide);
+        assert!(p.chars().count() <= MAX_REWRITE_PREVIEW_CHARS + 30, "{}", p.len());
+        let obj = serde_json::json!({"path": "/tmp/a", "content": "hi"});
+        assert!(final_input_preview(&obj).contains("\"path\": \"/tmp/a\""));
+    }
+
+    /// A long extension message is capped so the host header, buttons and
+    /// scope line stay on screen.
+    #[test]
+    fn long_confirm_message_is_capped() {
+        let long = "x\n".repeat(500);
+        let body = confirm_prompt_body(&long, &ext(&["jev"]), Some("bash"), None);
+        assert!(body.starts_with("Extension: jev\nTool: bash\n"));
+        assert!(body.contains("…[message truncated by host]"));
+        assert!(body.lines().count() <= MAX_CONFIRM_MESSAGE_LINES + 8, "{}", body.lines().count());
+        let wide = "y".repeat(10_000);
+        assert!(confirm_prompt_body(&wide, &ext(&["jev"]), None, None).chars().count() < 1400);
+    }
+
+    /// An unattributed confirm (no host-stamped source) offers no scope and
+    /// an "always" answer approves only this call; nothing is latched.
+    #[tokio::test]
+    async fn unattributed_confirm_always_answer_does_not_latch() {
+        let latch = crate::tools::SessionConfirmLatch::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let handle = crate::tools::SecretPromptHandle::new(tx);
+        let task = tokio::spawn(async move {
+            let req = rx.recv().await.expect("prompt");
+            assert!(req.confirm_scope.is_none());
+            let _ = req.response_tx.send(Some(CONFIRM_ANSWER_ALLOW_ALL.to_string()));
+        });
+        let result = resolve_before_tool_call_result(
+            crate::extensions::hooks::events::HookResult::confirm("Run deploy?"),
+            Some(&handle),
+            false,
+            Some(&latch),
+        )
+        .await;
+        task.await.unwrap();
+        assert!(matches!(
+            result,
+            crate::extensions::hooks::events::HookResult::Continue
+        ));
+        assert!(latch.is_empty());
+    }
+
+    /// The latch only short-circuits Confirm; Block from an extension is
+    /// still a Block, and a headless path with the source latched continues
+    /// instead of failing closed (an unlatched source still fails closed).
+    #[tokio::test]
+    async fn session_allow_all_does_not_override_block() {
+        let latch = crate::tools::SessionConfirmLatch::new();
+        latch.allow(&key(&["jev"]));
+        let blocked = resolve_before_tool_call_result(
+            crate::extensions::hooks::events::HookResult::Block {
+                reason: "nope".into(),
+            },
+            None,
+            false,
+            Some(&latch),
+        )
+        .await;
+        assert!(matches!(
+            blocked,
+            crate::extensions::hooks::events::HookResult::Block { reason } if reason == "nope"
+        ));
+        let headless = resolve_before_tool_call_result(
+            sourced_confirm("Run deploy?", "jev", "bash"),
+            None,
+            false,
+            Some(&latch),
+        )
+        .await;
+        assert!(matches!(
+            headless,
+            crate::extensions::hooks::events::HookResult::Continue
+        ));
+        let other = resolve_before_tool_call_result(
+            sourced_confirm("Run deploy?", "other", "bash"),
+            None,
+            false,
+            Some(&latch),
+        )
+        .await;
+        assert!(matches!(
+            other,
+            crate::extensions::hooks::events::HookResult::Block { .. }
         ));
     }
 
@@ -6201,6 +7432,135 @@ mod memory_context_provider_tests {
             assert!(error.contains("restart required"), "{error}");
             assert!(runtime.resolve_memory_provider(None).is_err());
         }
+    }
+
+    fn default_mode_config(mode: &str, confirmed: bool) -> agent_core::config::MemoryConfig {
+        agent_core::config::MemoryConfig {
+            default_mode: mode.to_string(),
+            default_mode_confirmed: confirmed,
+            ..Default::default()
+        }
+    }
+
+    /// Spec §12: a confirmed non-off `memory.default_mode` starts the
+    /// session in that mode under the host-owned `OperatorConfig` proof.
+    #[test]
+    fn memory_default_mode_confirmed_grants_session_lease() {
+        for (name, mode) in [
+            (
+                "recall_each_prompt",
+                memory_context::MemoryContextMode::RecallEachPrompt,
+            ),
+            (
+                "capture_only",
+                memory_context::MemoryContextMode::CaptureOnly,
+            ),
+            (
+                "capture_and_recall",
+                memory_context::MemoryContextMode::CaptureAndRecall,
+            ),
+        ] {
+            let runtime = Runtime::new_headless();
+            let status = runtime
+                .apply_memory_default_mode(&default_mode_config(name, true))
+                .expect("a confirmed non-off default applies")
+                .expect("legacy backend grants");
+            assert!(
+                matches!(status.durable, memory_context::DurableStatus::Active { mode: m, .. } if m == mode),
+                "{name}: got {:?}",
+                status.durable
+            );
+            assert_eq!(
+                runtime.memory_durable_proof_for_test(),
+                Some(memory_context::UserIntentProof::OperatorConfig),
+                "{name}"
+            );
+        }
+
+        let runtime = Runtime::new_headless();
+        runtime
+            .apply_memory_default_mode(&default_mode_config("recall_once", true))
+            .expect("applies")
+            .expect("grants");
+        assert_eq!(
+            runtime.memory_context_status().durable,
+            memory_context::DurableStatus::Off
+        );
+        assert_eq!(
+            runtime.memory_one_shot_proof_for_test(),
+            Some(memory_context::UserIntentProof::OperatorConfig)
+        );
+    }
+
+    /// Off, unknown, or unconfirmed defaults grant nothing (fail closed).
+    #[test]
+    fn memory_default_mode_off_unknown_or_unconfirmed_grants_nothing() {
+        for (mode, confirmed) in [
+            ("off", true),
+            ("off", false),
+            ("capture_and_recall", false),
+            ("recall_once", false),
+            ("recall_everything_forever", true),
+        ] {
+            let runtime = Runtime::new_headless();
+            assert!(
+                runtime
+                    .apply_memory_default_mode(&default_mode_config(mode, confirmed))
+                    .is_none(),
+                "{mode}/{confirmed} must not apply"
+            );
+            assert_memory_off_no_lease(&runtime);
+        }
+    }
+
+    /// The default never overrides memory state the session already has,
+    /// and `/memory off` still revokes a defaulted lease.
+    #[test]
+    fn memory_default_mode_keeps_existing_state_and_off_revokes() {
+        let runtime = Runtime::new_headless();
+        runtime
+            .memory_context_enable(
+                memory_context::MemoryContextMode::RecallEachPrompt,
+                memory_context::mint_explicit_command_proof(),
+            )
+            .unwrap();
+        assert!(runtime
+            .apply_memory_default_mode(&default_mode_config("capture_and_recall", true))
+            .is_none());
+        assert!(matches!(
+            runtime.memory_context_status().durable,
+            memory_context::DurableStatus::Active {
+                mode: memory_context::MemoryContextMode::RecallEachPrompt,
+                ..
+            }
+        ));
+        assert!(matches!(
+            runtime.memory_durable_proof_for_test(),
+            Some(memory_context::UserIntentProof::ExplicitCommand { .. })
+        ));
+
+        let runtime = Runtime::new_headless();
+        runtime
+            .apply_memory_default_mode(&default_mode_config("capture_and_recall", true))
+            .unwrap()
+            .unwrap();
+        runtime.memory_context_disable();
+        assert_memory_off_no_lease(&runtime);
+    }
+
+    /// A default whose backend cannot serve fails closed: typed error,
+    /// memory stays off, no fallback provider.
+    #[test]
+    fn memory_default_mode_unusable_backend_fails_closed() {
+        let mut runtime = Runtime::new_headless();
+        runtime.apply_config(&agent_core::config::load_config_from_str(
+            "memory.backend = invalid-not-axel-not-legacy\n",
+        ));
+        assert!(runtime
+            .apply_memory_default_mode(&default_mode_config("capture_and_recall", true))
+            .expect("a confirmed default is attempted")
+            .is_err());
+        assert_memory_off_no_lease(&runtime);
     }
 
     #[test]

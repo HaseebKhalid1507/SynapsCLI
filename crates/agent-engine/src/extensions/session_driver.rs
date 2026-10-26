@@ -399,7 +399,7 @@ impl Grant {
         if self.deadline.is_some_and(|deadline| {
             Instant::now()
                 .checked_add(delay)
-                .map_or(true, |at| at >= deadline)
+                .is_none_or(|at| at >= deadline)
         }) {
             return Err("session driver deadline expires before the proposed turn".into());
         }
@@ -530,6 +530,7 @@ fn known_provider(provider: &str) -> bool {
             | "kimi-code"
             | "github-copilot"
             | "google-gemini"
+            | "muse"
             | "local"
     ) || crate::runtime::openai::registry::providers()
         .iter()
@@ -931,6 +932,7 @@ fn validate_model_capability(model: &str, level: ReasoningLevel) -> Result<(), S
             "kimi-code" => catalog::kimi_code_model(id).is_some(),
             "github-copilot" => catalog::github_copilot_runtime_model(id).is_some(),
             "google-gemini" => catalog::google_gemini_model(id).is_some(),
+            "muse" => catalog::muse_runtime_model(id),
             _ => registry::providers()
                 .iter()
                 .find(|p| p.key == provider)
@@ -944,13 +946,15 @@ fn validate_model_capability(model: &str, level: ReasoningLevel) -> Result<(), S
         "anthropic" | "openai-codex" | "xai-auth" | "kimi" | "kimi-code"
     ) && level != ReasoningLevel::Adaptive
     {
-        let exact_effort = matches!(
-            cached.as_ref().map(|entry| &entry.reasoning),
-            Some(ReasoningSupport::OpenRouter { effort: true, .. })
-        ) && matches!(
-            level,
-            ReasoningLevel::Low | ReasoningLevel::Medium | ReasoningLevel::High
-        );
+        let exact_effort = match cached.as_ref().map(|entry| &entry.reasoning) {
+            Some(ReasoningSupport::OpenRouter { effort: true, .. }) => matches!(
+                level,
+                ReasoningLevel::Low | ReasoningLevel::Medium | ReasoningLevel::High
+            ),
+            // Live catalog's exact advertised set (Meta Muse).
+            Some(ReasoningSupport::NamedEffort { supported, .. }) => supported.contains(&level),
+            _ => false,
+        };
         if !exact_effort {
             return Err("session driver effort has no exact supported capability evidence".into());
         }

@@ -339,8 +339,10 @@ pub(crate) async fn route_extension_provider(
                         tx_events: None,
                     },
                     capabilities: ToolCapabilities {
+                        session_allow_all: None,
                         launch_cancel: None,
                         memory_backend: memory_backend.cloned(),
+                        telemetry: None,
                         watcher_exit_path: None,
                         tool_register_tx: None,
                         session_manager: None,
@@ -358,6 +360,7 @@ pub(crate) async fn route_extension_provider(
                         env: None,
                         env_stripped: Vec::new(),
                         env_warned: Default::default(),
+                        session_id: None,
                     },
                     limits: ToolLimits {
                         max_tool_output: 30000,

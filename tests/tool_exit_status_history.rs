@@ -7,6 +7,10 @@
 //!
 //! Proof is the SECOND request body the stub receives: its `tool_result`
 //! content must carry the exit status and the T5 notice.
+//!
+//! Needs the `command-exec` feature (the failing tool is `bash`).
+
+#![cfg(feature = "command-exec")]
 
 #[path = "support/phase2/mod.rs"]
 mod phase2;
