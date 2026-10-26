@@ -211,11 +211,21 @@ pub(crate) fn elapsed(secs: u64) -> String {
 
 /// Session name: name, else auto title, else id. Control characters and
 /// runs of whitespace collapse to one space (titles are the first user
-/// message and may hold newlines).
+/// message and may hold newlines); the auto title also loses its inline
+/// markdown markers ([`plain_title`]) — a name is shown as typed.
 pub(crate) fn session_label(name: Option<&str>, title: &str, id: &str) -> String {
-    let raw = name
-        .filter(|n| !n.trim().is_empty())
-        .unwrap_or(if title.trim().is_empty() { id } else { title });
+    let plain;
+    let raw = match name.filter(|n| !n.trim().is_empty()) {
+        Some(n) => n,
+        None => {
+            plain = plain_title(title);
+            if plain.trim().is_empty() {
+                id
+            } else {
+                &plain
+            }
+        }
+    };
     let mut out = String::with_capacity(raw.len());
     let mut space = false;
     for ch in raw.chars() {
@@ -227,6 +237,54 @@ pub(crate) fn session_label(name: Option<&str>, title: &str, id: &str) -> String
                 space = false;
             }
             out.push(ch);
+        }
+    }
+    out
+}
+
+/// A first-message title without its inline markdown: backticks, `**`,
+/// `__`, `~~`, and a lone `*`/`_` at a word edge (`*x*`, but not
+/// `snake_case` or `2 * 3`); leading `#` heading and `>` quote markers go
+/// per line.
+pub(crate) fn plain_title(title: &str) -> String {
+    let mut out = String::with_capacity(title.len());
+    for (i, line) in title.lines().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        let mut line = line.trim_start();
+        loop {
+            let t = line.trim_start_matches('#');
+            let t = if t.len() != line.len() && t.starts_with(' ') { t.trim_start() } else { line };
+            let t = t.strip_prefix('>').map_or(t, str::trim_start);
+            if t.len() == line.len() {
+                break;
+            }
+            line = t;
+        }
+        let chars: Vec<char> = line.chars().collect();
+        let mut j = 0;
+        while j < chars.len() {
+            let c = chars[j];
+            let next = chars.get(j + 1).copied();
+            if c == '`' {
+                j += 1;
+                continue;
+            }
+            if matches!(c, '*' | '_' | '~') && next == Some(c) {
+                j += 2;
+                continue;
+            }
+            if matches!(c, '*' | '_') {
+                let word = |ch: Option<char>| ch.is_some_and(char::is_alphanumeric);
+                let prev = j.checked_sub(1).map(|k| chars[k]);
+                if word(prev) != word(next) {
+                    j += 1;
+                    continue;
+                }
+            }
+            out.push(c);
+            j += 1;
         }
     }
     out
@@ -1787,5 +1845,22 @@ mod tests {
             session_label(None, "", "20261014-011500-79cc"),
             "20261014-011500-79cc"
         );
+    }
+
+    /// C1: the header showed "Run `git log --oneline -5` and `ls crat…".
+    #[test]
+    fn session_label_strips_inline_markdown_from_the_title() {
+        assert_eq!(
+            session_label(None, "Run `git log --oneline -5` and\n`ls crates/`", "id"),
+            "Run git log --oneline -5 and ls crates/"
+        );
+        assert_eq!(
+            session_label(None, "## Fix **the** _cache_ ~~bug~~\n> in snake_case 2 * 3", "id"),
+            "Fix the cache bug in snake_case 2 * 3"
+        );
+        // Only markers: falls back to the id.
+        assert_eq!(session_label(None, "``", "abc"), "abc");
+        // A name is shown as typed.
+        assert_eq!(session_label(Some("`x`"), "t", "id"), "`x`");
     }
 }
