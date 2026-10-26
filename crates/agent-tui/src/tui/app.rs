@@ -1051,7 +1051,10 @@ impl App {
 
         if arg.is_empty() {
             let current = self.current_theme_name();
-            let mark = |name: &str| if name == current { "\u{25b8} " } else { "  " };
+            // Leading space on every row, marker included: system rows that start
+            // with a space group into one block (no blank line before the
+            // current theme's row).
+            let mark = |name: &str| if name == current { " \u{25b8}" } else { "  " };
             let tag = |name: &str| if name == current { "  (current)" } else { "" };
             self.push_msg(ChatMessage::System("Available themes:".to_string()));
             for (name, desc) in descriptions {
@@ -2546,7 +2549,10 @@ mod tests {
         let all = text.join("\n");
         assert!(!all.contains("Restart"), "{all}");
         let nord = text.iter().find(|l| l.contains("nord ")).expect("nord listed");
-        assert!(nord.starts_with("\u{25b8} ") && nord.ends_with("(current)"), "{nord}");
+        assert!(nord.starts_with(" \u{25b8}nord") && nord.ends_with("(current)"), "{nord}");
+        // Every row starts with a space so the list renders as one block.
+        let rows: Vec<&String> = text.iter().filter(|l| l.contains(" — ")).collect();
+        assert!(rows.len() > 3 && rows.iter().all(|l| l.starts_with(' ')), "{rows:?}");
         let dracula = text.iter().find(|l| l.contains("dracula")).unwrap();
         assert!(dracula.starts_with("  ") && !dracula.contains("current"), "{dracula}");
     }
