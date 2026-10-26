@@ -230,6 +230,7 @@ pub(crate) async fn perform(
     if let Some(cwd) = snapshot.meta.cwd.as_deref() {
         let home = std::env::var_os("HOME").map(PathBuf::from);
         app.header_folder = crate::tui::header::folder_label(cwd, home.as_deref());
+        app.transcript.set_path_base(crate::tui::render::paths::PathBase::new(Some(cwd.to_path_buf())));
     }
     if snapshot.meta.name.is_some() {
         app.session.name = snapshot.meta.name.clone();

@@ -4,12 +4,13 @@ use ratatui::{
     text::{Line, Span},
 };
 
+pub(crate) mod paths;
 mod subagent_card;
 
 use super::app::SPINNER_FRAMES;
 use super::draw::{bash_trace, format_tool_name, tool_accent};
 use super::highlight::{
-    clamp_line, highlight_bash_output, highlight_read_output, highlight_tool_code,
+    clamp_line, clamp_line_ellipsis, highlight_bash_output, highlight_read_output, highlight_tool_code,
     is_read_tool_output, try_highlight_grep_line,
 };
 use super::markdown::{render_markdown_spans, wrap_text, wrap_text_spans};
@@ -978,9 +979,12 @@ impl TranscriptStore {
                     for (li, line) in result_lines[..show].iter().enumerate() {
                         // Try to detect and highlight grep output (skip for timeout/error)
                         if !is_timeout && !is_error {
-                            if let Some(grep_spans) = try_highlight_grep_line(line, m) {
+                            // Display-only: paths under the session cwd
+                            // shown relative; a row too wide ends in `…`.
+                            let shorten = |p: &str| self.path_base().shorten(p).into_owned();
+                            if let Some(grep_spans) = try_highlight_grep_line(line, m, &shorten) {
                                 lines.push_meta(
-                                    clamp_line(Line::from(grep_spans), width),
+                                    clamp_line_ellipsis(Line::from(grep_spans), width),
                                     LineMeta::ContentLine {
                                         msg_idx: i,
                                         src_line: li,
@@ -989,6 +993,11 @@ impl TranscriptStore {
                                 continue;
                             }
                         }
+                        let line = if preceding_tool.as_deref() == Some("find") {
+                            self.path_base().shorten(line)
+                        } else {
+                            std::borrow::Cow::Borrowed(*line)
+                        };
                         let full = format!("{}       {}", m, line);
                         for wline in wrap_text(&full, width) {
                             let body_style = if is_error || is_timeout {
