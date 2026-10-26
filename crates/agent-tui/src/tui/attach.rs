@@ -122,7 +122,9 @@ fn attach_notices(i: AttachNoticeInputs<'_>) -> AttachNotices {
 /// One-line inventory of the daemon's other sessions, shown when a plain
 /// `synaps` adopts the daemon (F1): the lid-close user must be able to
 /// *see* their parked task, without being surprise-attached to it.
-/// `None` when nothing else is there.
+/// `None` when nothing else is there. Rows read like `/sessions` rows (same
+/// label, same state clock — `state_since`, not `created_at` — and `~`
+/// paths), and the line points there.
 pub fn adopt_banner(
     sessions: &[agent_engine::session::SessionMeta],
     ours: &SessionId,
@@ -138,29 +140,28 @@ pub fn adopt_banner(
     let n = others.len();
     let parked = others.iter().filter(|m| matches!(m.lifecycle, L::Parked)).count();
     let live = n - parked;
+    let counts: Vec<String> = [(live, "live"), (parked, "parked")]
+        .into_iter()
+        .filter(|(k, _)| *k > 0)
+        .map(|(k, what)| format!("{k} {what}"))
+        .collect();
     let mut line = format!(
-        "{n} other session{} in this daemon ({live} live, {parked} parked) — `synaps --attach <ID>` joins a live one, `synaps --continue <ID>` resumes a parked one:",
-        if n == 1 { "" } else { "s" }
+        "{n} other session{} in this daemon ({}) \u{2014} /sessions to switch:",
+        if n == 1 { "" } else { "s" },
+        counts.join(", ")
     );
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
     for m in others.iter().take(5) {
-        let age = now.signed_duration_since(m.created_at);
-        let age = if age.num_hours() >= 1 {
-            format!("{}h ago", age.num_hours())
-        } else {
-            format!("{}m ago", age.num_minutes().max(0))
-        };
-        let state = match m.lifecycle {
-            L::Parked => "parked",
-            _ if m.clients > 0 => "live, attached",
-            _ => "live",
-        };
-        let short = m.id.as_str();
-        let name = m.name.as_deref().map(|n| format!(" \"{n}\"")).unwrap_or_default();
-        let cwd = m.cwd.as_ref().map(|c| format!(" {}", c.display())).unwrap_or_default();
-        line.push_str(&format!("\n  {short}{name}  {state}  {age}{cwd}"));
+        let attached = if m.clients > 0 { " \u{00b7} attached" } else { "" };
+        let cwd = super::sessions::short_cwd(m.cwd.as_deref(), home.as_deref());
+        line.push_str(&format!(
+            "\n  {}  {}{attached}  {cwd}",
+            super::sessions::label(m),
+            super::sessions::state_text(m, now)
+        ));
     }
     if n > 5 {
-        line.push_str(&format!("\n  … and {} more (`synaps daemon sessions`)", n - 5));
+        line.push_str(&format!("\n  \u{2026} and {} more", n - 5));
     }
     Some(line)
 }
@@ -766,15 +767,41 @@ mod tests {
         let b = adopt_banner(&sessions, &ours, now).unwrap();
         assert!(b.starts_with("2 other sessions in this daemon (1 live, 1 parked)"), "{b}");
         assert!(!b.contains("ours"), "{b}");
-        // newest first, state + age + cwd per row
+        // newest first, label + state + cwd per row
         let rows: Vec<&str> = b.lines().skip(1).collect();
-        assert!(rows[0].contains("20260919-020000-bbbb") && rows[0].contains("live, attached") && rows[0].contains("m ago") && rows[0].contains("/w"), "{b}");
-        assert!(rows[1].contains("20260919-010000-aaaa") && rows[1].contains("parked") && rows[1].contains("2h ago"), "{b}");
+        assert!(rows[0].contains("\u{2026}bbbb") && rows[0].contains("attached") && rows[0].contains("/w"), "{b}");
+        assert!(rows[1].contains("\u{2026}aaaa") && rows[1].contains("parked"), "{b}");
         // capped at 5 rows + overflow line
         let many: Vec<_> = (0..8).map(|i| meta(&format!("20260919-00000{i}-xxxx"), L::Parked, 0, i)).collect();
         let b = adopt_banner(&many, &ours, now).unwrap();
         assert_eq!(b.lines().count(), 1 + 5 + 1, "{b}");
         assert!(b.contains("and 3 more"), "{b}");
+    }
+
+    /// C5: the banner dated rows by `created_at` ("parked 4m ago") while
+    /// /sessions dates them by `state_since` ("parked 2m"); it also carried
+    /// backticked CLI how-tos and absolute paths.
+    #[test]
+    fn adopt_banner_matches_the_sessions_modal() {
+        use agent_engine::session::SessionLifecycle as L;
+        let ours = SessionId::from("20260919-000000-ours".to_string());
+        let now = chrono::Utc::now();
+        let home = std::path::PathBuf::from(std::env::var_os("HOME").expect("HOME"));
+        let mut m = meta("20260919-010000-793d", L::Parked, 0, 4);
+        m.name = Some("gallery2".into());
+        m.state_since = Some(now - chrono::Duration::minutes(2));
+        m.evict_due = Some(now + chrono::Duration::minutes(57) + chrono::Duration::seconds(30));
+        m.cwd = Some(home.join("Projects/synaps"));
+        let b = adopt_banner(&[meta("20260919-000000-ours", L::Live, 1, 0), m.clone()], &ours, now).unwrap();
+        assert_eq!(
+            b,
+            format!(
+                "1 other session in this daemon (1 parked) \u{2014} /sessions to switch:\n  gallery2  {}  ~/Projects/synaps",
+                crate::tui::sessions::state_text(&m, now)
+            )
+        );
+        assert!(b.contains("parked 2m"), "{b}");
+        assert!(!b.contains('`') && !b.contains("ago"), "{b}");
     }
 
     fn live(id: &str) -> LiveSession {
