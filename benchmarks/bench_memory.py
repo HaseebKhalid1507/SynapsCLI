@@ -104,13 +104,37 @@ def synaps_daemon_pids() -> dict[int, str]:
     return out
 
 
+def is_default_daemon(pid: int, argv: str) -> bool:
+    """The user's own daemon: default base dir and no profile. Daemons of
+    other profiles/base dirs (other sessions' demos) may come and go."""
+    if "--profile" in argv.split():
+        return False
+    try:
+        env = dict(kv.split(b"=", 1) for kv in Path(f"/proc/{pid}/environ").read_bytes().split(b"\0") if b"=" in kv)
+    except OSError:
+        return True  # unreadable: assume it matters
+    if env.get(b"SYNAPS_PROFILE"):
+        return False
+    base = env.get(b"SYNAPS_BASE_DIR")
+    return base is None or Path(base.decode()).expanduser().resolve() == (Path.home() / ".synaps-cli").resolve()
+
+
 def check_live_daemons(before: dict[int, str]) -> None:
-    """Abort if a daemon that existed before the benchmark is gone."""
+    """Abort if the user's default daemon that existed before the run is gone."""
     now = synaps_daemon_pids()
     gone = {p: c for p, c in before.items() if p not in now}
-    if gone:
-        print(f"ABORT: pre-existing synaps daemon(s) disappeared during the run: {gone}", file=sys.stderr)
+    vital = {p: c for p, c in gone.items() if p in DEFAULT_DAEMONS}
+    if vital:
+        print(f"ABORT: the live default synaps daemon disappeared during the run: {vital}", file=sys.stderr)
         raise SystemExit(2)
+    for p, c in gone.items():
+        if p not in NOTED_GONE:
+            NOTED_GONE.add(p)
+            print(f"note: another session's daemon exited (not ours, not the default): {p} {c}", flush=True)
+
+
+DEFAULT_DAEMONS: set[int] = set()
+NOTED_GONE: set[int] = set()
 
 
 @dataclass
@@ -263,16 +287,17 @@ def pgroup_pids(pgids: list[int]) -> set[int]:
     return {pid for pid, (_, pgid) in proc_map().items() if pgid in want}
 
 
-def pss_mb(pid: int) -> tuple[float, float] | None:
-    """(Pss, SwapPss) in MB. SwapPss matters: with zram/swap, an idle TUI's
-    anon pages are swapped out within seconds and vanish from Pss alone."""
+def pss_mb(pid: int) -> dict[str, float] | None:
+    """Pss, SwapPss, Pss_Anon, Pss_File in MB. SwapPss matters: with zram/swap,
+    an idle TUI's anon pages are swapped out within seconds and vanish from Pss
+    alone. Pss_File drops when the kernel evicts file pages (binary text)."""
     try:
         vals = {}
         for line in Path(f"/proc/{pid}/smaps_rollup").read_text().splitlines():
             k, _, rest = line.partition(":")
-            if k in ("Pss", "SwapPss"):
+            if k in ("Pss", "SwapPss", "Pss_Anon", "Pss_File"):
                 vals[k] = int(rest.split()[0]) / 1024.0
-        return (vals["Pss"], vals.get("SwapPss", 0.0)) if "Pss" in vals else None
+        return vals if "Pss" in vals else None
     except Exception:
         return None
 
@@ -350,13 +375,18 @@ def sum_tree_pss(roots: list[int], pgids: list[int], tag: str) -> dict:
     for pid in sorted(tree | tagged):
         v = pss_mb(pid)
         if v is not None:
-            procs.append({"pid": pid, "pss_mb": round(v[0], 1), "swap_pss_mb": round(v[1], 1),
-                          "mem_mb": round(v[0] + v[1], 1), "in_tree": pid in tree,
-                          "cmd": cmdline(pid)[:120]})
+            swap = v.get("SwapPss", 0.0)
+            procs.append({"pid": pid, "pss_mb": round(v["Pss"], 1), "swap_pss_mb": round(swap, 1),
+                          "mem_mb": round(v["Pss"] + swap, 1),
+                          "pss_anon_mb": round(v.get("Pss_Anon", 0.0), 1),
+                          "pss_file_mb": round(v.get("Pss_File", 0.0), 1),
+                          "in_tree": pid in tree, "cmd": cmdline(pid)[:120]})
     total = lambda key, pred=lambda p: True: round(sum(p[key] for p in procs if pred(p)), 1)
     return {"mem_mb": total("mem_mb"),            # Pss + SwapPss: the reported number
             "pss_mb": total("pss_mb"),            # resident only
             "swap_pss_mb": total("swap_pss_mb"),
+            "pss_anon_mb": total("pss_anon_mb"),
+            "pss_file_mb": total("pss_file_mb"),
             "process_count": len(procs),
             "outside_tree_mem_mb": total("mem_mb", lambda p: not p["in_tree"]),
             "processes": procs}
@@ -534,6 +564,8 @@ def main() -> int:
                 pass
         time.sleep(0.5)
     live = synaps_daemon_pids()
+    DEFAULT_DAEMONS.update(p for p, c in live.items() if is_default_daemon(p, c))
+    print(f"live default synaps daemon(s) (abort if gone): {sorted(DEFAULT_DAEMONS) or 'none'}", flush=True)
     print(f"pre-existing synaps daemons (must survive): {sorted(live) or 'none'}", flush=True)
     if "synaps" in args.tools:
         print(f"synaps base dir (isolated): {bench_base_dir()}", flush=True)
@@ -571,6 +603,8 @@ def main() -> int:
                       f"procs={res['process_count']} outside-tree={res['outside_tree_mem_mb']} MB "
                       f"psi={res['pressure_after'].get('psi_some_avg10')}{'' if res['quiet'] else ' PRESSURED'} "
                       f"ready={res['ready']}/{n} :: {res['excerpt']}", flush=True)
+                if args.json_out:  # incremental: an abort keeps what was measured
+                    Path(args.json_out).write_text(json.dumps(payload, indent=2) + "\n")
             med = round(statistics.median(vals), 1)
             payload["summary"].append({"tool": name, "sessions": n, "median_mem_mb": med, "raw_mem_mb": vals})
             print(f"  {n:>2} session(s) median: {med} MB  raw={vals}", flush=True)

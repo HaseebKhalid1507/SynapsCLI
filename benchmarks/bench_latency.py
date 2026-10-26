@@ -111,11 +111,37 @@ def synaps_daemon_pids() -> dict[int, str]:
     return out
 
 
+def is_default_daemon(pid: int, argv: str) -> bool:
+    """The user's own daemon: default base dir and no profile. Daemons of
+    other profiles/base dirs (other sessions' demos) may come and go."""
+    if "--profile" in argv.split():
+        return False
+    try:
+        env = dict(kv.split(b"=", 1) for kv in Path(f"/proc/{pid}/environ").read_bytes().split(b"\0") if b"=" in kv)
+    except OSError:
+        return True  # unreadable: assume it matters
+    if env.get(b"SYNAPS_PROFILE"):
+        return False
+    base = env.get(b"SYNAPS_BASE_DIR")
+    return base is None or Path(base.decode()).expanduser().resolve() == (Path.home() / ".synaps-cli").resolve()
+
+
 def check_live_daemons(before: dict[int, str]) -> None:
-    gone = {p: c for p, c in before.items() if p not in synaps_daemon_pids()}
-    if gone:
-        print(f"ABORT: pre-existing synaps daemon(s) disappeared during the run: {gone}", file=sys.stderr)
+    """Abort if the user's default daemon that existed before the run is gone."""
+    now = synaps_daemon_pids()
+    gone = {p: c for p, c in before.items() if p not in now}
+    vital = {p: c for p, c in gone.items() if p in DEFAULT_DAEMONS}
+    if vital:
+        print(f"ABORT: the live default synaps daemon disappeared during the run: {vital}", file=sys.stderr)
         raise SystemExit(2)
+    for p, c in gone.items():
+        if p not in NOTED_GONE:
+            NOTED_GONE.add(p)
+            print(f"note: another session's daemon exited (not ours, not the default): {p} {c}", flush=True)
+
+
+DEFAULT_DAEMONS: set[int] = set()
+NOTED_GONE: set[int] = set()
 
 
 def stop_bench_daemon(bin_: str, base: Path) -> None:
@@ -267,6 +293,8 @@ def main() -> int:
                "versions": {}, "runs": {}}
     specs = build_specs(args)
     live = synaps_daemon_pids()
+    DEFAULT_DAEMONS.update(p for p, c in live.items() if is_default_daemon(p, c))
+    print(f"live default synaps daemon(s) (abort if gone): {sorted(DEFAULT_DAEMONS) or 'none'}", flush=True)
     print(f"pre-existing synaps daemons (must survive): {sorted(live) or 'none'}", flush=True)
 
     for name in args.tools:
