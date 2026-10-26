@@ -395,8 +395,6 @@ impl TranscriptStore {
                     };
                     let trimmed = line.trim();
                     let is_last = k == show - 1 && non_empty.len() <= 8;
-                    let connector = if is_last { "╰" } else { "│" };
-                    let continuation = "│";
 
                     // Detect structure in thinking
                     let (prefix_char, line_style) =
@@ -410,40 +408,25 @@ impl TranscriptStore {
                             ("", dim_italic)
                         };
 
-                    // Wrap manually to preserve connector on each line
-                    let first_prefix = format!("{}{} {}", m, connector, prefix_char);
-                    let cont_prefix =
-                        format!("{}{} {}", m, continuation, " ".repeat(prefix_char.len()));
-
-                    if content_width > 10 {
-                        let chars: Vec<char> = trimmed.chars().collect();
-                        let mut pos = 0;
-                        let mut is_first = true;
-                        while pos < chars.len() {
-                            let chunk_len = content_width.min(chars.len() - pos);
-                            let chunk: String = chars[pos..pos + chunk_len].iter().collect();
-                            let prefix = if is_first {
-                                &first_prefix
-                            } else {
-                                &cont_prefix
-                            };
-                            lines.push_meta(
-                                Line::from(Span::styled(
-                                    format!("{}{}", prefix, chunk),
-                                    line_style,
-                                )),
-                                meta.clone(),
-                            );
-                            pos += chunk_len;
-                            is_first = false;
-                        }
+                    // Word-wrap (was char-chunked mid-word), keeping the
+                    // connector on every row; the closing ╰ goes on the
+                    // card's very last row, not the last paragraph's first.
+                    let rows = if content_width > 10 {
+                        wrap_text(trimmed, content_width)
                     } else {
+                        vec![trimmed.to_string()]
+                    };
+                    let n_rows = rows.len();
+                    let cont_pad = " ".repeat(display_width(prefix_char));
+                    for (r, chunk) in rows.into_iter().enumerate() {
+                        let connector = if is_last && r + 1 == n_rows { "╰" } else { "│" };
+                        let lead = if r == 0 { prefix_char } else { cont_pad.as_str() };
                         lines.push_meta(
                             Line::from(Span::styled(
-                                format!("{}{}", first_prefix, trimmed),
+                                format!("{}{} {}{}", m, connector, lead, chunk),
                                 line_style,
                             )),
-                            meta,
+                            meta.clone(),
                         );
                     }
                 }
@@ -1428,6 +1411,42 @@ mod meta_tests {
                 .map(|r| UnicodeWidthStr::width(r.as_str()))
                 .collect();
             assert!(widths.windows(2).all(|w| w[0] == w[1]), "{severity}: rows {widths:?}");
+        }
+    }
+
+    /// Thinking rows word-wrap (no mid-word cuts) and the closing `╰` sits
+    /// on the card's last row only.
+    #[test]
+    fn thinking_wraps_on_words_and_closes_on_the_last_row() {
+        let last = "The safest approach is to not collect and just give a brief reply, \
+                    since there's no new instruction asking me to collect here.";
+        let text = format!("First short thought.\n{last}");
+        let mut store = TranscriptStore::new(crate::tui::clock::TuiClock::real());
+        store.push_msg(ChatMessage::Thinking(text));
+        for width in [40usize, 57, 80, 117] {
+            let rows: Vec<String> = store
+                .render_message_lines(0, width, &ctx())
+                .lines()
+                .iter()
+                .map(flatten)
+                .filter(|r| r.contains('\u{2502}') || r.contains('\u{2570}'))
+                .collect();
+            let closers: Vec<usize> = rows
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| r.contains('\u{2570}'))
+                .map(|(k, _)| k)
+                .collect();
+            assert_eq!(closers, vec![rows.len() - 1], "w={width}: {rows:#?}");
+            let body: Vec<String> = rows
+                .iter()
+                .skip(1)
+                .map(|r| r.trim_start().trim_start_matches(['\u{2502}', '\u{2570}']).trim().to_string())
+                .collect();
+            assert_eq!(body.join(" "), last, "w={width}: words intact: {rows:#?}");
+            for r in &rows {
+                assert!(unicode_width::UnicodeWidthStr::width(r.as_str()) <= width, "{r:?}");
+            }
         }
     }
 
