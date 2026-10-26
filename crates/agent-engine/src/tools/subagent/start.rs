@@ -146,6 +146,7 @@ impl Tool for SubagentStartTool {
         let memory_backend = ctx.capabilities.memory_backend.clone();
         let session_allow_all = ctx.capabilities.session_allow_all.clone();
         let telemetry = ctx.capabilities.telemetry.clone();
+        let workspace = super::WorkerWorkspace::from_capabilities(&ctx.capabilities);
         let timeout_secs = params["timeout"]
             .as_u64()
             .unwrap_or(ctx.limits.subagent_timeout);
@@ -168,6 +169,10 @@ impl Tool for SubagentStartTool {
             model: model.clone(),
             system_prompt: system_prompt.clone(),
             timeout_secs,
+            cwd: workspace
+                .cwd
+                .clone()
+                .or_else(|| std::env::current_dir().ok()),
         });
 
         state.write().unwrap().archive_dir = Some(super::archive::process_dir());
@@ -283,6 +288,7 @@ impl Tool for SubagentStartTool {
                             memory_backend.as_ref(),
                             session_allow_all.as_ref(),
                             telemetry.as_ref(),
+                            &workspace,
                         );
                         runtime.set_system_prompt(super::compose_system_prompt(
                             system_prompt,
