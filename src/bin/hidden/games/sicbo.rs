@@ -58,7 +58,7 @@ impl SicBoBet {
             SicBoBet::Big => (11..=17).contains(&total) && !is_triple,
             SicBoBet::Small => (4..=10).contains(&total) && !is_triple,
             SicBoBet::Odd => total % 2 == 1,
-            SicBoBet::Even => total % 2 == 0,
+            SicBoBet::Even => total.is_multiple_of(2),
             SicBoBet::AnyTriple => is_triple,
             SicBoBet::Triple(n) => is_triple && dice[0] == *n,
             SicBoBet::Total(t) => total == *t,
@@ -131,7 +131,7 @@ impl SicBoGame {
             0
         };
 
-        if speed > 0 && self.phase_timer % speed == 0 {
+        if speed > 0 && self.phase_timer.is_multiple_of(speed) {
             self.rolling_display = [
                 rng.random_range(1..=6),
                 rng.random_range(1..=6),

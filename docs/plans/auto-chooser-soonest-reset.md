@@ -4,12 +4,11 @@ Status: implemented; targeted integration validation passed (2026-09-21). Branch
 
 ## Implementation notes / corrections to the original proposal
 
-- G1 is committed at `05f3d60f`. G3's classifier/router and loop tests landed with the concurrent `08060e1d` commit; G2 finishes the shared broker lifecycle, config and preview.
+- G3's classifier/router and loop tests landed alongside G1; G2 finishes the shared broker lifecycle, config and preview.
 - Sliding-reset inference is only a heuristic; a single near-zero/full-duration observation cannot verify first-use anchoring. No activation work is included here.
 - `auth plan` on a new CLI process has no session's in-memory sticky/cooldown history; remote users run it on the broker host. Usage reads may rotate expired tokens, but never make inference requests or change the account selector.
 - Shared local authority is scoped to the runtime's `TokenCache` handle plus auth/config paths, not a process-global broker that might represent a different remote principal. Cooldowns are seat-scoped to prevent aliases bypassing them.
 - Disabled/null Claude `extra_usage` is feature-scoped, not an inference limit. Codex selection for a requested model rejects seats without provider-reported model availability.
-- Operator resource limit: Cargo jobs=4, test threads=2 (runtime tracing tests serial), Tokio workers=2; no concurrent verification commands or Fable workers.
 
 ## Problem
 
@@ -199,4 +198,4 @@ No commits by workers; the foreground reviews and commits per goal.
 - Full `cargo test -j 2 --workspace -- --test-threads=1` attempted, but stopped at `tests/attach_no_daemon.rs:64`: a subprocess expected a daemon-disabled notice but got terminal setup failure (`No such device or address`). Full workspace is **not** claimed green.
 - Live `auth plan --provider anthropic --model claude-fable-5-1`: claude4 tier 1, then default/claude5/claude3/claude2. Live `--provider openai-codex --model gpt-6-astra`: default then codex4 then codex3; codex3 now reports a fixed reset (tier 3, different from the original plan's idle observation). Free codex2/7 were excluded for unknown Astra availability, codex5/6 for exhaustion. No inference/activation was sent.
 
-Remaining operational validation: observe a real provider-declared exhaustion and its hop; do not deliberately spend an account just to test this. Keeper sliding-reset correction and Kimi/Grok schema work remain separate tasks. Builds use at most 4 Cargo jobs (release uses 2), Rust tests at most 2 threads, never concurrently launched by this session.
+Remaining operational validation: observe a real provider-declared exhaustion and its hop; do not deliberately spend an account just to test this. Keeper sliding-reset correction and Kimi/Grok schema work remain separate tasks.

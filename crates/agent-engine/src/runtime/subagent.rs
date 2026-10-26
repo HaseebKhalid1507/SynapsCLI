@@ -906,7 +906,7 @@ impl SubagentRegistry {
                 return true;
             }
             let s = h.state.read().unwrap_or_else(|p| p.into_inner());
-            let fresh = s.finished_at.map_or(true, |t| t.elapsed() < FINISHED_HANDLE_TTL);
+            let fresh = s.finished_at.is_none_or(|t| t.elapsed() < FINISHED_HANDLE_TTL);
             fresh && !h.collected && !s.cancel_requested
         })
     }
@@ -981,7 +981,7 @@ impl SubagentRegistry {
                         .read()
                         .unwrap_or_else(|p| p.into_inner())
                         .recovery_pinned()
-                    && h.thread_handle.as_ref().map_or(true, |t| t.is_finished())
+                    && h.thread_handle.as_ref().is_none_or(|t| t.is_finished())
                     && (h.is_collected() || h.finished_elapsed().is_some_and(|d| d >= ttl))
             })
             .map(|(id, h)| (id.clone(), !h.is_collected() && retain_unreconciled(id)))

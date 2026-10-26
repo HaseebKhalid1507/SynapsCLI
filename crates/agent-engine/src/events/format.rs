@@ -117,7 +117,7 @@ fn reads_as_event_tag(chars: &[char], i: usize) -> bool {
     match event_word_end(chars, j) {
         Some(k) => chars
             .get(k)
-            .map_or(true, |c| c.is_whitespace() || *c == '>' || *c == '/'),
+            .is_none_or(|c| c.is_whitespace() || *c == '>' || *c == '/'),
         None => false,
     }
 }

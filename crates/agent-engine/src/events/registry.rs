@@ -546,7 +546,7 @@ fn scan_registrations_locked(
 
     for entry in entries.flatten() {
         let path = entry.path();
-        if !path.extension().is_some_and(|e| e == "json") || is_reserved_json(&path) {
+        if path.extension().is_none_or(|e| e != "json") || is_reserved_json(&path) {
             continue;
         }
         if !regular_card(&path) {

@@ -171,7 +171,7 @@ fn task_literal(prompt: &str) -> Option<String> {
         if !(3..=64).contains(&word.len()) || STOP.contains(&word.to_ascii_lowercase().as_str()) {
             continue;
         }
-        if selected.map_or(true, |previous: &str| word.len() > previous.len()) {
+        if selected.is_none_or(|previous: &str| word.len() > previous.len()) {
             selected = Some(word);
         }
     }
@@ -301,21 +301,21 @@ fn visible(value: &Value) -> bool {
     ["disclosure", "disclosure_class"].iter().all(|key| {
         value
             .get(key)
-            .map_or(true, |v| v.as_str() == Some("model_visible"))
+            .is_none_or(|v| v.as_str() == Some("model_visible"))
     }) && ["sensitivity", "retention", "retention_class"]
         .iter()
         .all(|key| {
-            value.get(key).map_or(true, |v| {
+            value.get(key).is_none_or(|v| {
                 matches!(v.as_str(), Some("normal" | "standard" | "model_visible"))
             })
         })
         && ["private", "restricted"]
             .iter()
-            .all(|key| value.get(key).map_or(true, |v| v.as_bool() == Some(false)))
+            .all(|key| value.get(key).is_none_or(|v| v.as_bool() == Some(false)))
         && value
             .get("channel")
-            .map_or(true, |v| v.as_str() == Some("final"))
-        && value.get("content_class").map_or(true, |v| {
+            .is_none_or(|v| v.as_str() == Some("final"))
+        && value.get("content_class").is_none_or(|v| {
             matches!(v.as_str(), Some("user_text" | "assistant_text"))
         })
 }

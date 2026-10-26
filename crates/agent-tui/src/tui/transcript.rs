@@ -1425,7 +1425,7 @@ impl TranscriptStore {
     /// ESTIMATED heights): its `total_height` is then a new coordinate system
     /// that must not be compared against last frame's total.
     pub(crate) fn sync_cache(&mut self, content_width: usize, ctx: &RenderCtx<'_>) -> bool {
-        let needs_full_rebuild = self.line_cache().map_or(true, |c| c.width != content_width);
+        let needs_full_rebuild = self.line_cache().is_none_or(|c| c.width != content_width);
 
         // Width change ⇒ rewrap ⇒ every content coordinate is re-derived;
         // clear the selection explicitly — honest and cheap (design §3.3).

@@ -625,7 +625,7 @@ impl App {
     /// True when the input buffer contains no text at all.
     pub(crate) fn input_is_empty(&self) -> bool {
         let lines = self.editor.lines();
-        lines.len() <= 1 && lines.first().map_or(true, |l| l.is_empty())
+        lines.len() <= 1 && lines.first().is_none_or(|l| l.is_empty())
     }
 
     /// Flat **char** index of the editor cursor within `input_text()`.
@@ -882,7 +882,7 @@ impl App {
     /// message cache, avoiding unnecessary whole-terminal clears on every frame.
     pub(crate) fn advance_animations(&mut self) -> bool {
         self.spinner_frame = self.spinner_frame.wrapping_add(1);
-        if self.spinner_frame % 3 != 0 {
+        if !self.spinner_frame.is_multiple_of(3) {
             return false;
         }
 

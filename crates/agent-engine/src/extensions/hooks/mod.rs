@@ -551,7 +551,7 @@ impl HookBus {
                         true
                     }
                 })
-                .filter(|reg| reg.matcher.as_ref().map_or(true, |m| m.matches(event)))
+                .filter(|reg| reg.matcher.as_ref().is_none_or(|m| m.matches(event)))
                 .map(|reg| {
                     let handler = reg.handler.clone();
                     let event_clone = event.clone();

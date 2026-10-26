@@ -518,7 +518,7 @@ pub fn latest_session() -> std::io::Result<Session> {
             continue;
         };
         if let Some(mtime) = entry.mtime {
-            if newest.as_ref().map_or(true, |(t, _)| mtime > *t) {
+            if newest.as_ref().is_none_or(|(t, _)| mtime > *t) {
                 newest = Some((mtime, id.to_string()));
             }
         }

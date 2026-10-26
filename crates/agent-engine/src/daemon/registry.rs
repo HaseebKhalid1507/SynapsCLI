@@ -227,7 +227,7 @@ impl Metadata {
         }
         inner.heals_since_log += 1;
         // `map_or`, not `is_none_or`: the crate's MSRV is 1.80.
-        let log = if inner.heals_logged_at.map_or(true, |at| at.elapsed() >= JSON_HEAL_LOG_EVERY) {
+        let log = if inner.heals_logged_at.is_none_or(|at| at.elapsed() >= JSON_HEAL_LOG_EVERY) {
             let heals = inner.heals_since_log;
             inner.heals_logged_at = Some(std::time::Instant::now());
             inner.heals_since_log = 0;

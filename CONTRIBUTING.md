@@ -12,7 +12,7 @@ cargo build --release
 cargo test --release --lib
 ```
 
-**Requirements:** Rust 1.80+, Linux or macOS
+**Requirements:** Rust 1.88+, Linux or macOS
 
 **Note:** 7 PTY tests (`tools::shell`) fail under parallel execution — pass with `cargo test --release --lib -- --test-threads=1`. Not a bug, just TTY contention.
 

@@ -742,7 +742,7 @@ impl StreamMethods {
                 crate::tools::context_checkpoint::ContextCheckpointTool(continuation.clone()),
             ));
             for name in ["memory_search", "memory_fetch"] {
-                if registry.get(name).map_or(true, |tool| {
+                if registry.get(name).is_none_or(|tool| {
                     tool.origin() != crate::tools::ToolOrigin::Builtin
                 }) {
                     return Err(crate::RuntimeError::Config("automatic context management requires builtin memory_search and memory_fetch; history unchanged".into()));

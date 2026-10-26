@@ -94,7 +94,7 @@ impl CacheAnchorCell {
             .0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if slot.map_or(true, |prev| prev.mono <= at.mono) {
+        if slot.is_none_or(|prev| prev.mono <= at.mono) {
             *slot = Some(at);
         }
     }

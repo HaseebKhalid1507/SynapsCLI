@@ -102,7 +102,7 @@ impl App {
                 }
                 GamePhase::DealerTurn => {
                     // Dealer draws one card every 30 frames
-                    if self.blackjack.phase_timer % 30 == 0 {
+                    if self.blackjack.phase_timer.is_multiple_of(30) {
                         let done = self.blackjack.dealer_step();
                         if done {
                             let payout = self.blackjack.resolve();
@@ -168,7 +168,7 @@ impl App {
         if self.screen == Screen::Keno {
             if self.keno.phase == KenoPhase::Drawing {
                 self.keno.phase_timer += 1;
-                if self.keno.phase_timer % 8 == 0 {
+                if self.keno.phase_timer.is_multiple_of(8) {
                     let done = self.keno.draw_one();
                     if done {
                         self.keno.resolve();

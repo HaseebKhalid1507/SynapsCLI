@@ -117,7 +117,7 @@ pub fn draw_hub(f: &mut Frame, app: &App, area: Rect) {
     let sign_y = 1;
 
     // Neon flicker effect
-    let flicker = (app.frame / 8) % 20 != 0; // occasional flicker off
+    let flicker = !(app.frame / 8).is_multiple_of(20); // occasional flicker off
     let sign_color = if flicker {
         theme::MAGENTA
     } else {

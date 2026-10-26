@@ -388,12 +388,12 @@ fn fold(text: &str, ascii: bool) -> (String, Vec<usize>) {
             let l = c.to_ascii_lowercase();
             let before = out.len();
             out.push(l);
-            map.extend(std::iter::repeat(i).take(out.len() - before));
+            map.extend(std::iter::repeat_n(i, out.len() - before));
         } else {
             for l in c.to_lowercase() {
                 let before = out.len();
                 out.push(l);
-                map.extend(std::iter::repeat(i).take(out.len() - before));
+                map.extend(std::iter::repeat_n(i, out.len() - before));
             }
         }
     }

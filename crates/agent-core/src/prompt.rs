@@ -228,15 +228,15 @@ impl PromptSelectors {
     fn matches(&self, c: &SelectionContext) -> bool {
         self.provider
             .as_deref()
-            .map_or(true, |p| p == c.model.provider())
+            .is_none_or(|p| p == c.model.provider())
             && self
                 .family
                 .as_ref()
-                .map_or(true, |f| c.family.as_ref() == Some(f))
-            && self.exact.as_ref().map_or(true, |e| e == &c.model)
+                .is_none_or(|f| c.family.as_ref() == Some(f))
+            && self.exact.as_ref().is_none_or(|e| e == &c.model)
             && self
                 .workflow_mode
-                .map_or(true, |mode| c.workflow_mode == Some(mode))
+                .is_none_or(|mode| c.workflow_mode == Some(mode))
     }
 }
 
