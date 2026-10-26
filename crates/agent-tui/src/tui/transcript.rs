@@ -587,6 +587,9 @@ pub(crate) struct TranscriptStore {
     bytes_since_audit: usize,
     /// Messages dropped by the cap so far (the sentinel line reports it).
     scrollback_dropped: usize,
+    /// Local date of the last dated message pushed: a message on another
+    /// day is preceded by a `── Sun Oct 25 ──` line.
+    last_day: Option<chrono::NaiveDate>,
     /// A subagent view's store: its trim note doesn't point at `/resync`,
     /// which only reloads the main thread.
     worker_view: bool,
@@ -683,6 +686,11 @@ pub(crate) struct VisibleWindow {
     pub(crate) is_empty: bool,
 }
 
+/// The system line shown where the local date changes.
+pub(crate) fn day_line(day: chrono::NaiveDate) -> String {
+    format!("── {} ──", day.format("%a %b %-d"))
+}
+
 impl TranscriptStore {
     pub(crate) fn new(clock: super::clock::TuiClock) -> Self {
         Self {
@@ -701,6 +709,7 @@ impl TranscriptStore {
             pushes_since_audit: 0,
             bytes_since_audit: 0,
             scrollback_dropped: 0,
+            last_day: None,
             worker_view: false,
             tool_start_time: None,
             tool_start_times: std::collections::HashMap::new(),
@@ -758,6 +767,22 @@ impl TranscriptStore {
             self.clock.now().saturating_duration_since(t)
         });
         chrono::Local::now() - chrono::Duration::from_std(ago).unwrap_or(chrono::Duration::zero())
+    }
+
+    /// Before a message dated `at`: a day line when the local date changed
+    /// since the previous dated message. The first dated message sets the
+    /// day without a line.
+    fn note_day(&mut self, at: chrono::DateTime<chrono::Local>) {
+        let day = at.date_naive();
+        if self.last_day.is_some_and(|last| last != day) {
+            self.messages.push(TimestampedMsg {
+                msg: ChatMessage::System(day_line(day)),
+                time: String::new(),
+            });
+            self.live_note(self.messages.len() - 1);
+            self.invalidate_last();
+        }
+        self.last_day = Some(day);
     }
 
     /// Mark this store as a subagent view's (see `worker_view`).
@@ -1137,6 +1162,9 @@ impl TranscriptStore {
         msg: ChatMessage,
         at: Option<chrono::DateTime<chrono::Local>>,
     ) {
+        if let Some(at) = at {
+            self.note_day(at);
+        }
         self.messages.push(TimestampedMsg {
             msg,
             time: at.map(|at| at.format("%H:%M").to_string()).unwrap_or_default(),
@@ -3050,6 +3078,7 @@ impl TranscriptStore {
     /// Equivalent to `messages.clear()` + `invalidate()` in prior slices.
     pub(crate) fn clear(&mut self) {
         self.messages.clear();
+        self.last_day = None;
         self.live.clear();
         self.response_start = None;
         self.clear_selection();

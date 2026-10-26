@@ -654,6 +654,49 @@ mod tests {
         assert_eq!(times(&app), ["", "", &local_hhmm(q), &local_hhmm(a), &local_hhmm(a)]);
     }
 
+    /// A message on another local day than the previous dated one gets a
+    /// day line before it, rebuilt or live.
+    #[test]
+    fn a_new_day_gets_a_separator_line() {
+        use serde_json::json;
+        let (d1, d1b, d2) = ("2020-03-01T12:00:00Z", "2020-03-01T12:30:00Z", "2020-03-02T12:00:00Z");
+        let day = |ts: &str| {
+            super::super::transcript::day_line(
+                chrono::DateTime::parse_from_rfc3339(ts)
+                    .unwrap()
+                    .with_timezone(&chrono::Local)
+                    .date_naive(),
+            )
+        };
+        let history = vec![
+            j(json!({"role": "user", "content": "one", "_synaps_at": d1})),
+            j(json!({"role": "user", "content": "legacy"})),
+            j(json!({"role": "user", "content": "two", "_synaps_at": d1b})),
+            j(json!({"role": "user", "content": "three", "_synaps_at": d2})),
+        ];
+        let mut app = test_app();
+        rebuild_display_messages(&history, &mut app);
+        let expect = vec![
+            "U|one".to_string(),
+            "U|legacy".into(),
+            "U|two".into(),
+            format!("S|{}", day(d2)),
+            "U|three".into(),
+        ];
+        assert_eq!(transcript_repr(&app), expect);
+        // Live: today is another day than 2020-03-02.
+        app.push_msg(ChatMessage::User("now".into()));
+        let repr = transcript_repr(&app);
+        assert_eq!(repr[5], format!("S|{}", super::super::transcript::day_line(chrono::Local::now().date_naive())));
+        assert_eq!(repr[6], "U|now");
+        // Same day: no line.
+        app.push_msg(ChatMessage::User("again".into()));
+        assert_eq!(transcript_repr(&app).len(), 8);
+        // A rebuild starts over.
+        rebuild_display_messages(&history, &mut app);
+        assert_eq!(transcript_repr(&app), expect);
+    }
+
     #[test]
     fn long_fixture_actually_exercises_the_cap() {
         let (_, long) = golden_fixtures().into_iter().find(|(n, _)| *n == "long_over_120").unwrap();
