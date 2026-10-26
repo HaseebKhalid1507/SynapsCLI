@@ -21,9 +21,9 @@
 </p>
 
 <!-- BENCH-STRIP: numbers from BENCHMARKS.md; update both together -->
-| **~4 MB** per extra session | **~7 ms** to first frame | **97.9%** of prompt tokens from cache |
+| **79 MB** for 10 sessions | **~7 ms** to first frame | **97.9%** of prompt tokens from cache |
 |:---:|:---:|:---:|
-| next lightest (jcode) ~5 MB, Claude Code ~79 MB | on a warm daemon; cold start ~41 ms | 127k real requests since v0.8.0, 89.6% cheaper |
+| next lightest (jcode) 165 MB, Claude Code 894 MB | on a warm daemon; cold start ~41 ms | 127k real requests since v0.8.0, 89.6% cheaper |
 
 <p align="center"><sub>Same machine, same harness, versions and method in <a href="BENCHMARKS.md">BENCHMARKS.md</a>.</sub></p>
 
@@ -119,8 +119,10 @@ Memory is total PSS (plus swapped-out pages) across each tool's whole process tr
 | jcode v0.91.0 | 117 MB | 165 MB | ~5.3 MB |
 | pi 0.85.1 | 117 MB | 708 MB | ~66 MB |
 | claude code 2.1.304 | 186 MB | 894 MB | ~79 MB |
-| codex 0.163.0 | 274 MB | 525 MB | ~28 MB |
+| codex 0.163.0 † | 274 MB | 525 MB | ~28 MB |
 | opencode 2.1.1 | 387 MB | 1197 MB | ~90 MB |
+
+† codex never drew a frame the harness recognises within its 10 s timeout, so it was sampled at the timeout and may not have finished starting.
 
 **Prompt cache, from real use:** 97.9% of prompt tokens came from cache across 127,453 requests since v0.8.0, every release between 97.1% and 98.4%. That's 89.6% cheaper than the same tokens at list price without caching. [Full report](benchmarks/prompt-cache/README.md)
 
