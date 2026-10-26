@@ -35,6 +35,7 @@ mod image_retention;
 pub mod keepwarm;
 pub mod memory_context;
 pub mod memory_history;
+pub mod message_time;
 pub mod openai;
 pub mod relay;
 mod request;
@@ -745,6 +746,8 @@ pub struct Runtime {
     /// budget in `turn_budget`): the owner's steer moves that stream onto
     /// the session budget. `None` for every other stream.
     owner_steer_budget: Option<Arc<crate::runtime::budget::OwnerSteerBudget>>,
+    /// Source of the per-message `_synaps_at` times (see `message_time`).
+    message_clock: crate::runtime::message_time::MessageClock,
     /// Private runtime-scoped tool-session identity (Task 16). Scopes the
     /// per-stream `SessionToolSet` the execution gate authorizes against.
     /// Minted fresh per constructed `Runtime` — two independently
@@ -1309,6 +1312,7 @@ impl Runtime {
                 crate::runtime::budget::TurnRole::Foreground,
             ),
             owner_steer_budget: None,
+            message_clock: Default::default(),
             host_tool_session: fresh_host_tool_session(),
             tool_catalog_prompt: Arc::new(std::sync::Mutex::new(None)),
             retained_tool_set: Default::default(),
@@ -1598,6 +1602,15 @@ impl Runtime {
         lift: Option<Arc<crate::runtime::budget::OwnerSteerBudget>>,
     ) {
         self.owner_steer_budget = lift;
+    }
+
+    /// Where message times come from (tests inject a clock).
+    pub fn message_clock(&self) -> &crate::runtime::message_time::MessageClock {
+        &self.message_clock
+    }
+
+    pub fn set_message_clock(&mut self, clock: crate::runtime::message_time::MessageClock) {
+        self.message_clock = clock;
     }
 
     /// The currently configured per-turn budget.
@@ -4789,6 +4802,7 @@ impl Runtime {
             extension_session_scope: self.extension_session_scope.clone(),
             turn_budget: self.turn_budget.clone(),
             owner_steer_budget: self.owner_steer_budget.clone(),
+            message_clock: self.message_clock.clone(),
         };
 
         tokio::spawn(async move {
@@ -4922,6 +4936,7 @@ impl Clone for Runtime {
             extension_session_scope: self.extension_session_scope.clone(),
             turn_budget: self.turn_budget.clone(),
             owner_steer_budget: self.owner_steer_budget.clone(),
+            message_clock: self.message_clock.clone(),
             // Clones share the live tool registry, so they share the SAME
             // host tool session (matching existing shared-session behavior);
             // independently constructed runtimes mint fresh identities and

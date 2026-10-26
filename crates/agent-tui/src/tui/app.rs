@@ -736,6 +736,20 @@ impl App {
         self.needs_redraw = true;
     }
 
+    /// [`Self::push_msg`] for a message that happened at `at` (`None`: no
+    /// recorded time, shown empty) — transcript rebuilds.
+    pub(crate) fn push_msg_at(
+        &mut self,
+        msg: ChatMessage,
+        at: Option<chrono::DateTime<chrono::Local>>,
+    ) {
+        let Some(msg) = super::watch::command_output(self, msg) else {
+            return;
+        };
+        self.transcript.push_msg_at(msg, at);
+        self.needs_redraw = true;
+    }
+
     /// Mark the cached message lines stale — they'll be rebuilt on the next draw.
     /// Call this after any mutation that changes how `messages` renders.
     /// Use for structural changes (theme, width, message list reshuffle). For

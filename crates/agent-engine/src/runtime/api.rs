@@ -1149,8 +1149,9 @@ impl ApiMethods {
             ));
         }
         super::attachments::validate_history_for_request(model, messages).map_err(RuntimeError::Config)?;
-        let wire_messages = super::continuation::wire_messages(messages);
-        let messages = wire_messages.as_deref().unwrap_or(messages);
+        // Host `_synaps_*` keys never reach a provider. The native Anthropic
+        // body drops them while serializing (`WireMessages`, no history
+        // copy); every other transport strips at its own entry.
         // One provider-neutral schema source for every transport. The opt-in
         // progressive path supplies a per-round session projection; flag-off
         // keeps cloning the registry's existing cached Arc byte-for-byte.
@@ -1167,6 +1168,8 @@ impl ApiMethods {
                 if cancel.is_cancelled() {
                     return Err(RuntimeError::Canceled);
                 }
+                let wire_messages = super::continuation::wire_messages(messages);
+                let messages = wire_messages.as_deref().unwrap_or(messages);
                 let has_tools = !tools_schema.is_empty();
                 return with_usage_metering(model, options.usage_counters.clone(), &tx, |tx| async move {
                     crate::runtime::cloud_invoke::cloud_invoke_stream(

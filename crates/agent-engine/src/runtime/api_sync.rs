@@ -105,8 +105,8 @@ impl ApiMethods {
         options: &ApiOptions,
     ) -> Result<Value> {
         super::attachments::validate_history_for_request(model, messages).map_err(RuntimeError::Config)?;
-        let wire_messages = super::continuation::wire_messages(messages);
-        let messages = wire_messages.as_deref().unwrap_or(messages);
+        // Host `_synaps_*` keys: routed transports strip at their entry; the
+        // Anthropic body below drops them while serializing (`WireMessages`).
         // Route through OpenAI-compat provider if model resolves to one.
         // This synchronous facade consumes only the final response value, so
         // high-volume display deltas are suppressed at the provider boundary.

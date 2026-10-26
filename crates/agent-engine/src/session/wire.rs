@@ -284,6 +284,7 @@ impl Hello {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "attach", rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)] // one-shot handshake payload; Create carries the full config
 pub enum Attach {
     Existing {
         session_id: SessionId,

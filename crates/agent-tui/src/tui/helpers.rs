@@ -211,13 +211,22 @@ pub(super) fn apply_display_tail(tail: &agent_engine::session::DisplayTail, app:
     use agent_engine::session::DisplayItem;
     app.transcript.clear();
     if tail.omitted > 0 {
-        app.push_msg(ChatMessage::System(format!(
-            "… {} earlier message(s) hidden to speed resume — full history is still in the model's context",
-            tail.omitted
-        )));
+        app.push_msg_at(
+            ChatMessage::System(format!(
+                "… {} earlier message(s) hidden to speed resume — full history is still in the model's context",
+                tail.omitted
+            )),
+            None,
+        );
     }
-    for item in &tail.items {
-        app.push_msg(match item {
+    for (i, item) in tail.items.iter().enumerate() {
+        // The time the host recorded for the message, never "now": a
+        // message without one (legacy history) shows an empty time.
+        let at = tail
+            .time(i)
+            .and_then(|ts| chrono::DateTime::parse_from_rfc3339(ts).ok())
+            .map(|ts| ts.with_timezone(&chrono::Local));
+        let msg = match item {
             // The interruption marker is history for the model, not something
             // the user typed: show it as the aborted line it replaced.
             DisplayItem::User { text } => match interruption_label(text) {
@@ -241,7 +250,8 @@ pub(super) fn apply_display_tail(tail: &agent_engine::session::DisplayTail, app:
                 tool_name: tool_name.clone(),
                 input: input.clone(),
             },
-        });
+        };
+        app.push_msg_at(msg, at);
     }
     // Wholesale rebuild = a full message-list reshuffle. `messages.clear()` above
     // does NOT touch the line cache, and push_msg's incremental invalidate_last()
@@ -606,6 +616,42 @@ mod tests {
             app.transcript.messages().last().map(|m| &m.msg),
             Some(ChatMessage::Error(_))
         ));
+    }
+
+    fn local_hhmm(ts: &str) -> String {
+        chrono::DateTime::parse_from_rfc3339(ts)
+            .unwrap()
+            .with_timezone(&chrono::Local)
+            .format("%H:%M")
+            .to_string()
+    }
+
+    fn times(app: &App) -> Vec<String> {
+        app.transcript.messages().iter().map(|m| m.time.clone()).collect()
+    }
+
+    /// A rebuilt transcript (resume, attach, `/resync`, compaction) shows
+    /// when each message happened, and an empty time for a legacy message
+    /// with none — never the time of the rebuild.
+    #[test]
+    fn rebuild_shows_each_messages_own_time_and_blank_for_legacy() {
+        use serde_json::json;
+        let (q, a) = ("2020-03-01T05:47:00Z", "2020-03-01T05:48:00Z");
+        let history = vec![
+            j(json!({"role": "user", "content": "legacy"})),
+            j(json!({"role": "assistant", "content": [{"type": "text", "text": "old"}]})),
+            j(json!({"role": "user", "content": "asked", "_synaps_at": q})),
+            j(json!({"role": "assistant", "_synaps_at": a, "content": [
+                {"type": "thinking", "thinking": "hm"}, {"type": "text", "text": "answered"}
+            ]})),
+        ];
+        let mut app = test_app();
+        rebuild_display_messages(&history, &mut app);
+        assert_eq!(
+            transcript_repr(&app),
+            ["U|legacy", "T|old", "U|asked", "K|hm", "T|answered"]
+        );
+        assert_eq!(times(&app), ["", "", &local_hhmm(q), &local_hhmm(a), &local_hhmm(a)]);
     }
 
     #[test]
