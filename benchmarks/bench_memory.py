@@ -39,6 +39,7 @@ import re
 import select
 import shutil
 import signal
+import socket
 import statistics
 import subprocess
 import sys
@@ -118,6 +119,7 @@ class ToolSpec:
     env: dict[str, str] = field(default_factory=dict)
     synaps_daemon: bool = False
     jcode_home: bool = False  # isolated JCODE_HOME / JCODE_RUNTIME_DIR per run
+    xdg_home: bool = False    # isolated XDG_{CONFIG,DATA,STATE,CACHE}_HOME per run
 
 
 def build_specs() -> dict[str, ToolSpec]:
@@ -133,7 +135,10 @@ def build_specs() -> dict[str, ToolSpec]:
                                      {"JCODE_NO_TELEMETRY": "1", "JCODE_MEMORY_ENABLED": "0"},
                                      jcode_home=True),
         "codex": ToolSpec("codex", ["codex"], ["codex", "--version"]),
-        "opencode": ToolSpec("opencode", ["opencode"], ["opencode", "--version"]),
+        # opencode 2.x TUIs attach to a background `opencode serve --service`
+        # found via $XDG_STATE_HOME/opencode/service.json (auto-started if
+        # absent): isolated XDG dirs give it its own service, never the user's.
+        "opencode": ToolSpec("opencode", ["opencode"], ["opencode", "--version"], xdg_home=True),
         "pi": ToolSpec("pi", ["pi"], ["pi", "--version"]),
         "claude_code": ToolSpec("claude_code", ["claude"], ["claude", "--version"]),
         "cursor": ToolSpec("cursor", ["cursor-agent"], ["cursor-agent", "--version"]),
@@ -412,6 +417,24 @@ def run_tool(spec: ToolSpec, sessions: int, timeout_s: float, settle_s: float) -
                 (jroot / "run").mkdir()
                 env.update({"JCODE_HOME": str(jroot / "home"), "JCODE_RUNTIME_DIR": str(jroot / "run"),
                             "JCODE_TEMP_SERVER": "1", "JCODE_SERVER_OWNER_PID": str(os.getpid())})
+            if spec.xdg_home:
+                jroot = Path(tempfile.mkdtemp(prefix=f"{spec.name}-bench-"))
+                for d in ("config", "data", "state", "cache"):
+                    (jroot / d).mkdir()
+                    env[f"XDG_{d.upper()}_HOME"] = str(jroot / d)
+                # Pre-start the isolated service, as for the synaps daemon: on a
+                # fresh state dir, TUIs launched before service.json exists each
+                # start their own service. Its managed port is fixed (49374 by
+                # default) and may be the user's own service: pick a free one.
+                with socket.socket() as sk:
+                    sk.bind(("127.0.0.1", 0))
+                    port = sk.getsockname()[1]
+                for cmd in (["service", "set", "port", str(port)], ["service", "start"]):
+                    subprocess.run(["opencode", *cmd], env=env, timeout=60,
+                                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.DEVNULL, check=False)
+                if not wait_socket(str(jroot / "state" / "opencode" / "service.json"), timeout_s):
+                    raise RuntimeError("opencode service did not become ready")
             for _ in range(sessions):
                 lc = launch(spec.argv, env, timeout_s, settle_s)
                 launches.append(lc)
@@ -432,6 +455,10 @@ def run_tool(spec: ToolSpec, sessions: int, timeout_s: float, settle_s: float) -
             kill_pgroup(pgid)
         if base is not None:
             stop_bench_daemon(spec.argv[0], base)
+        if spec.xdg_home and jroot is not None:
+            subprocess.run(["opencode", "service", "stop"], env=env, timeout=60,
+                           stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, check=False)
         left = reap_tagged(tag)
         if left:
             print(f"WARNING: {spec.name}: processes survived cleanup: {left}", file=sys.stderr)
