@@ -3,8 +3,10 @@
 #
 # Memory-footprint benchmark for terminal agent harnesses.
 #
-# Measures total PSS (Proportional Set Size) across the full process tree of a
-# tool running N concurrent sessions. PSS (from /proc/<pid>/smaps_rollup) splits
+# Measures total PSS + SwapPss (Proportional Set Size, resident and swapped)
+# across the full process tree of a tool running N concurrent sessions. SwapPss
+# is included because with zram/swap the kernel swaps an idle TUI's pages out
+# within seconds, and resident PSS alone then undercounts by pressure. PSS (from /proc/<pid>/smaps_rollup) splits
 # shared pages proportionally, so it is the correct metric for multi-process /
 # daemon architectures where RSS would overcount shared memory.
 #
@@ -261,14 +263,18 @@ def pgroup_pids(pgids: list[int]) -> set[int]:
     return {pid for pid, (_, pgid) in proc_map().items() if pgid in want}
 
 
-def pss_mb(pid: int) -> float | None:
+def pss_mb(pid: int) -> tuple[float, float] | None:
+    """(Pss, SwapPss) in MB. SwapPss matters: with zram/swap, an idle TUI's
+    anon pages are swapped out within seconds and vanish from Pss alone."""
     try:
+        vals = {}
         for line in Path(f"/proc/{pid}/smaps_rollup").read_text().splitlines():
-            if line.startswith("Pss:"):
-                return int(line.split()[1]) / 1024.0
+            k, _, rest = line.partition(":")
+            if k in ("Pss", "SwapPss"):
+                vals[k] = int(rest.split()[0]) / 1024.0
+        return (vals["Pss"], vals.get("SwapPss", 0.0)) if "Pss" in vals else None
     except Exception:
         return None
-    return None
 
 
 def stale_bench_pids() -> set[int]:
@@ -318,11 +324,15 @@ def sum_tree_pss(roots: list[int], pgids: list[int], tag: str) -> dict:
     for pid in sorted(tree | tagged):
         v = pss_mb(pid)
         if v is not None:
-            procs.append({"pid": pid, "pss_mb": round(v, 1), "in_tree": pid in tree,
+            procs.append({"pid": pid, "pss_mb": round(v[0], 1), "swap_pss_mb": round(v[1], 1),
+                          "mem_mb": round(v[0] + v[1], 1), "in_tree": pid in tree,
                           "cmd": cmdline(pid)[:120]})
-    return {"pss_mb": round(sum(p["pss_mb"] for p in procs), 1),
+    total = lambda key, pred=lambda p: True: round(sum(p[key] for p in procs if pred(p)), 1)
+    return {"mem_mb": total("mem_mb"),            # Pss + SwapPss: the reported number
+            "pss_mb": total("pss_mb"),            # resident only
+            "swap_pss_mb": total("swap_pss_mb"),
             "process_count": len(procs),
-            "outside_tree_pss_mb": round(sum(p["pss_mb"] for p in procs if not p["in_tree"]), 1),
+            "outside_tree_mem_mb": total("mem_mb", lambda p: not p["in_tree"]),
             "processes": procs}
 
 
@@ -513,12 +523,13 @@ def main() -> int:
                 check_live_daemons(live)
                 res["rep"] = rep
                 payload["runs"].append(res)
-                vals.append(res["pss_mb"])
-                print(f"  {n:>2} session(s) rep {rep}: {res['pss_mb']:7.1f} MB  "
-                      f"procs={res['process_count']} outside-tree={res['outside_tree_pss_mb']} MB "
+                vals.append(res["mem_mb"])
+                print(f"  {n:>2} session(s) rep {rep}: {res['mem_mb']:7.1f} MB  "
+                      f"(pss {res['pss_mb']} + swap {res['swap_pss_mb']}) "
+                      f"procs={res['process_count']} outside-tree={res['outside_tree_mem_mb']} MB "
                       f"ready={res['ready']}/{n} :: {res['excerpt']}", flush=True)
             med = round(statistics.median(vals), 1)
-            payload["summary"].append({"tool": name, "sessions": n, "median_pss_mb": med, "raw": vals})
+            payload["summary"].append({"tool": name, "sessions": n, "median_mem_mb": med, "raw_mem_mb": vals})
             print(f"  {n:>2} session(s) median: {med} MB  raw={vals}", flush=True)
     payload["live_daemons_after"] = synaps_daemon_pids()
     if args.json_out:
