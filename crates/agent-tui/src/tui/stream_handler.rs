@@ -687,11 +687,15 @@ pub(super) async fn handle_session_event_arm(
             app.total_output_tokens = 0;
             app.total_cache_read_tokens = 0;
             app.total_cache_creation_tokens = 0;
+            app.total_cache_write_5m = 0;
+            app.total_cache_write_1h = 0;
             app.session_cost = 0.0;
             app.keepwarm_cost = 0.0;
             app.keepwarm_tokens = Default::default();
             app.input_tokens = 0;
             app.output_tokens = 0;
+            // The footer's context gauge described the old conversation.
+            app.last_turn_context = 0;
             app.push_msg(ChatMessage::System("new session started".to_string()));
         }
         SessionEventWire::CompactionStarted { disclosure, .. } => {
