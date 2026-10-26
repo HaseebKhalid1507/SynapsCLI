@@ -177,6 +177,14 @@ and several defaults changed. Full notes:
 - **OAuth compaction failed with HTTP 429.** (#220)
 - **OAuth tokens:** reload on `auth.json` change and after a 401, refresh
   under a cross-process lock, never lose a rotated token. (#237, #238, #249)
+  A cancelled turn or a timed-out subagent can't abort a refresh halfway,
+  forced refreshes are limited to one a minute per account (one account
+  never cools down another), and when Muse can't re-mint it returns the
+  provider's own 401.
+- `synaps status` no longer shows an empty `extra_usage` row for accounts
+  without paid extra usage.
+- `subagent_status` on an archived worker returns its error, like
+  `subagent_collect`.
 - Auth and providers: failed usage reads are held and shared; legible
   Codex 4xx; hosted `web_search` rejection learned; usage over 100% is
   exhausted; keep-warm backs off on timeouts; Muse streams can't hang.
@@ -223,6 +231,8 @@ and several defaults changed. Full notes:
 - "Allow all" covers only the asking extension and only the input owner can
   arm it. (#252)
 - `find`/`ls` never run a path as an option. (#256)
+- A failed OAuth login code exchange shows only the standard error fields.
+  It could echo request material, and it panicked on multi-byte text.
 - Events can't forge or hide an `<event>` tag. (#261)
 
 ### Credits
