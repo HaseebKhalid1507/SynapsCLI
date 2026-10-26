@@ -185,14 +185,16 @@ Each extension is its own crash-isolated process, with a permissions manifest th
 21 built-in themes, including `catppuccin`, `gruvbox`, `nord`, `tokyo-night`, originals like `neon-rain` and `night-city`, and a light one, `paper`. Switch live with `/theme`, or try one for a single run with `SYNAPS_THEME=<name>`.
 
 <p align="center">
-  <img src="https://github.com/user-attachments/assets/f54ea75f-0c15-41cb-b97f-b66a8396c27f" alt="night-city theme" width="32%" />
-  <img src="https://github.com/user-attachments/assets/0086bec9-6b05-432d-8099-ee84faaf3e75" alt="catppuccin theme" width="32%" />
-  <img src="https://github.com/user-attachments/assets/44e21013-54df-414b-8659-6b47026b170d" alt="gruvbox theme" width="32%" />
+  <img src="https://github.com/user-attachments/assets/6ef3678e-d1c1-4570-8984-1a976f82a71d" alt="phosphor theme" width="49%" />
+  <img src="https://github.com/user-attachments/assets/1d1b1217-6209-4518-9284-7da786baa856" alt="catppuccin theme" width="49%" />
 </p>
 <p align="center">
-  <img src="https://github.com/user-attachments/assets/41a8aa43-d5a5-42c2-9064-1f5fa11f360e" alt="ocean theme" width="32%" />
-  <img src="https://github.com/user-attachments/assets/220aafe7-1b5d-46cf-8d12-8fa20f06757d" alt="neon-rain theme" width="32%" />
-  <img src="https://github.com/user-attachments/assets/0492a49d-4f65-4edd-870d-375590877f40" alt="paper theme" width="32%" />
+  <img src="https://github.com/user-attachments/assets/12c26723-9167-408d-9538-f219b6f9de0a" alt="gruvbox theme" width="49%" />
+  <img src="https://github.com/user-attachments/assets/59986d8f-7e61-4d91-b1c2-4585ea424b56" alt="ocean theme" width="49%" />
+</p>
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/bfad5989-7950-462c-8ecb-0857b8d485e4" alt="neon-rain theme" width="49%" />
+  <img src="https://github.com/user-attachments/assets/985f955d-2da6-4501-9a10-bbb6e07b787f" alt="nord theme" width="49%" />
 </p>
 
 ## Security
