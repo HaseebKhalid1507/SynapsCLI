@@ -21,7 +21,12 @@
 # It also aborts if any pre-existing synaps daemon pid disappears mid-run.
 #
 # Requires: python3, pyte  (pip install pyte); Linux (/proc/*/smaps_rollup)
-# Usage:    python3 bench_memory.py --sessions 10 --tools synaps
+# Escaped processes: every launched process carries a BENCH_RUN_TAG env marker;
+# tagged processes are summed even if they left the launched tree/pgroup
+# (jcode's TUI starts `jcode serve` with setsid, which outlives its parent).
+# jcode runs with an isolated JCODE_HOME/JCODE_RUNTIME_DIR per run.
+#
+# Usage:    python3 bench_memory.py --sessions 1 10 --reps 3 --tools synaps jcode
 #           SYNAPS_BIN=/path/to/synaps python3 bench_memory.py --sessions 10
 
 from __future__ import annotations
@@ -32,10 +37,14 @@ import os
 import pty
 import re
 import select
+import shutil
 import signal
+import statistics
 import subprocess
 import sys
+import tempfile
 import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -105,22 +114,52 @@ def check_live_daemons(before: dict[int, str]) -> None:
 class ToolSpec:
     name: str
     argv: list[str]
+    version_argv: list[str]
     env: dict[str, str] = field(default_factory=dict)
     synaps_daemon: bool = False
+    jcode_home: bool = False  # isolated JCODE_HOME / JCODE_RUNTIME_DIR per run
 
 
 def build_specs() -> dict[str, ToolSpec]:
     synaps = os.environ.get("SYNAPS_BIN", "synaps")
+    jcode = ["jcode", "--no-update", "--no-selfdev"]
     return {
-        "synaps": ToolSpec("synaps", [synaps], synaps_daemon=True),
-        "jcode": ToolSpec("jcode", ["jcode", "--no-update", "--no-selfdev"],
-                          {"JCODE_NO_TELEMETRY": "1"}),
-        "codex": ToolSpec("codex", ["codex"]),
-        "opencode": ToolSpec("opencode", ["opencode"]),
-        "pi": ToolSpec("pi", ["pi"]),
-        "claude_code": ToolSpec("claude_code", ["claude"]),
-        "cursor": ToolSpec("cursor", ["cursor-agent"]),
+        "synaps": ToolSpec("synaps", [synaps], [synaps, "--version"], synaps_daemon=True),
+        # jcode's TUI spawns `jcode serve` in its own session (setsid); later
+        # TUIs attach to it. Default config has features.memory = true.
+        "jcode": ToolSpec("jcode", jcode, ["jcode", "version"],
+                          {"JCODE_NO_TELEMETRY": "1"}, jcode_home=True),
+        "jcode_memory_off": ToolSpec("jcode_memory_off", jcode, ["jcode", "version"],
+                                     {"JCODE_NO_TELEMETRY": "1", "JCODE_MEMORY_ENABLED": "0"},
+                                     jcode_home=True),
+        "codex": ToolSpec("codex", ["codex"], ["codex", "--version"]),
+        "opencode": ToolSpec("opencode", ["opencode"], ["opencode", "--version"]),
+        "pi": ToolSpec("pi", ["pi"], ["pi", "--version"]),
+        "claude_code": ToolSpec("claude_code", ["claude"], ["claude", "--version"]),
+        "cursor": ToolSpec("cursor", ["cursor-agent"], ["cursor-agent", "--version"]),
     }
+
+
+def tool_version(spec: ToolSpec) -> str:
+    env = synaps_env(bench_base_dir()) if spec.synaps_daemon else os.environ.copy()
+    try:
+        p = subprocess.run(spec.version_argv, capture_output=True, text=True, timeout=30,
+                           stdin=subprocess.DEVNULL, env=env)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return f"unavailable ({e.__class__.__name__})"
+    lines = [l.strip() for l in (p.stdout + p.stderr).splitlines() if l.strip()]
+    return " ".join(lines[0].split()) if lines else f"exit {p.returncode}"
+
+
+def machine_info() -> dict:
+    mem_kb = next(int(l.split()[1]) for l in Path("/proc/meminfo").read_text().splitlines()
+                  if l.startswith("MemTotal:"))
+    osr = dict(l.split("=", 1) for l in Path("/etc/os-release").read_text().splitlines() if "=" in l)
+    model = next((l.split(":", 1)[1].strip() for l in Path("/proc/cpuinfo").read_text().splitlines()
+                  if l.startswith("model name")), "?")
+    return {"cpu": model, "cores": os.cpu_count(), "mem_gb": round(mem_kb / 1024 / 1024, 1),
+            "os": osr.get("PRETTY_NAME", "?").strip('"'), "kernel": os.uname().release,
+            "arch": os.uname().machine}
 
 
 def answer_caps(fd: int, buf: bytes) -> bytes:
@@ -140,6 +179,8 @@ class Launch:
     pid: int
     pgid: int
     fd: int
+    ready: bool = False
+    excerpt: str | None = None
 
 
 def launch(argv: list[str], env: dict[str, str], timeout_s: float, settle_s: float) -> Launch:
@@ -151,6 +192,7 @@ def launch(argv: list[str], env: dict[str, str], timeout_s: float, settle_s: flo
     start = time.perf_counter()
     buf = b""
     ready = probe_sent = False
+    excerpt = None
     while time.perf_counter() - start < timeout_s:
         r, _, _ = select.select([master], [], [], 0.05)
         if r:
@@ -161,9 +203,10 @@ def launch(argv: list[str], env: dict[str, str], timeout_s: float, settle_s: flo
             if chunk:
                 buf = answer_caps(master, buf + chunk)
                 plain = ANSI_RE.sub("", buf.decode("utf-8", "replace"))
-                if not ready and any(sum(c.isalnum() for c in " ".join(l.split())) >= 3
-                                     for l in plain.splitlines()):
-                    ready = True
+                lines = [" ".join(l.split()) for l in plain.splitlines()]
+                hit = next((l for l in lines if sum(c.isalnum() for c in l) >= 3), None)
+                if not ready and hit:
+                    ready, excerpt = True, hit[:100]
                     if not probe_sent:
                         try:
                             os.write(master, PROBE.encode()); probe_sent = True
@@ -175,7 +218,7 @@ def launch(argv: list[str], env: dict[str, str], timeout_s: float, settle_s: flo
             break
     if ready:
         time.sleep(settle_s)
-    return Launch(proc.pid, os.getpgid(proc.pid), master)
+    return Launch(proc.pid, os.getpgid(proc.pid), master, ready, excerpt)
 
 
 def proc_map() -> dict[int, tuple[int, int]]:
@@ -223,15 +266,59 @@ def pss_mb(pid: int) -> float | None:
     return None
 
 
-def sum_tree_pss(roots: list[int], pgids: list[int]) -> tuple[float, int]:
-    pids = descendants(roots) | pgroup_pids(pgids)
-    total = counted = 0.0
-    for pid in sorted(pids):
+def stale_bench_pids() -> set[int]:
+    """Processes left by an earlier, crashed run of this harness (any tag)."""
+    out: set[int] = set()
+    for e in Path("/proc").iterdir():
+        if not e.name.isdigit() or int(e.name) == os.getpid():
+            continue
+        try:
+            if any(v.startswith(b"BENCH_RUN_TAG=") for v in (e / "environ").read_bytes().split(b"\0")):
+                out.add(int(e.name))
+        except OSError:
+            continue
+    return out
+
+
+def tagged_pids(tag: str) -> set[int]:
+    """Processes carrying this run's BENCH_RUN_TAG in their environment. This
+    catches anything a tool detached from its tree/pgroup (setsid, double
+    fork, reparenting to init), e.g. a background server spawned by the TUI."""
+    needle = f"BENCH_RUN_TAG={tag}".encode()
+    out: set[int] = set()
+    for e in Path("/proc").iterdir():
+        if not e.name.isdigit():
+            continue
+        try:
+            if needle in (e / "environ").read_bytes().split(b"\0"):
+                out.add(int(e.name))
+        except OSError:
+            continue
+    return out
+
+
+def cmdline(pid: int) -> str:
+    try:
+        return Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace").strip()
+    except OSError:
+        return "?"
+
+
+def sum_tree_pss(roots: list[int], pgids: list[int], tag: str) -> dict:
+    """Total PSS over: descendants of the roots, their process groups, and
+    every process tagged with this run's environment marker."""
+    tree = descendants(roots) | pgroup_pids(pgids)
+    tagged = tagged_pids(tag)
+    procs = []
+    for pid in sorted(tree | tagged):
         v = pss_mb(pid)
         if v is not None:
-            total += v
-            counted += 1
-    return round(total, 1), int(counted)
+            procs.append({"pid": pid, "pss_mb": round(v, 1), "in_tree": pid in tree,
+                          "cmd": cmdline(pid)[:120]})
+    return {"pss_mb": round(sum(p["pss_mb"] for p in procs), 1),
+            "process_count": len(procs),
+            "outside_tree_pss_mb": round(sum(p["pss_mb"] for p in procs if not p["in_tree"]), 1),
+            "processes": procs}
 
 
 def kill_pgroup(pgid: int) -> None:
@@ -252,6 +339,30 @@ def wait_socket(path: str, timeout_s: float) -> bool:
     return False
 
 
+def reap_tagged(tag: str) -> list[int]:
+    """Kill whatever this run left behind; returns survivors (should be [])."""
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        left = tagged_pids(tag)
+        if not left:
+            return []
+        for pid in left:
+            try:
+                os.kill(pid, sig)
+            except ProcessLookupError:
+                pass
+        time.sleep(0.5)
+    return sorted(tagged_pids(tag))
+
+
+def fresh_bench_base() -> Path:
+    """Empty isolated base dir: no plugins, no sessions, no pins carried over
+    from a previous run (pinned sessions are rehydrated on daemon start)."""
+    base = bench_base_dir()
+    shutil.rmtree(base, ignore_errors=True)
+    base.mkdir(parents=True)
+    return base
+
+
 def stop_bench_daemon(bin_: str, base: Path) -> None:
     env = synaps_env(base)
     assert Path(env["SYNAPS_BASE_DIR"]).resolve() == bench_base_dir() == base
@@ -260,15 +371,18 @@ def stop_bench_daemon(bin_: str, base: Path) -> None:
 
 
 def run_tool(spec: ToolSpec, sessions: int, timeout_s: float, settle_s: float) -> dict:
+    tag = f"{os.getpid()}-{uuid.uuid4().hex[:12]}"
     env = os.environ.copy()
     env.update(spec.env)
     launches: list[Launch] = []
     cleanup: list[int] = []
-    base = bench_base_dir() if spec.synaps_daemon else None
+    base = fresh_bench_base() if spec.synaps_daemon else None
+    jroot = None
     try:
         if spec.synaps_daemon:
             bin_ = spec.argv[0]
             env = synaps_env(base)
+            env["BENCH_RUN_TAG"] = tag
             sock = str(base / "run" / "daemon.sock")
             stop_bench_daemon(bin_, base)
             time.sleep(0.5)
@@ -287,13 +401,27 @@ def run_tool(spec: ToolSpec, sessions: int, timeout_s: float, settle_s: float) -
             time.sleep(max(settle_s, 3.0))
             roots = [server.pid] + [l.pid for l in launches]
         else:
+            env["BENCH_RUN_TAG"] = tag
+            if spec.jcode_home:
+                # Isolated jcode state + sockets: never the user's ~/.jcode or
+                # their running server. The TUI still spawns its own server as
+                # it normally would; TEMP_SERVER/OWNER_PID make that server
+                # exit with this harness as a backstop.
+                jroot = Path(tempfile.mkdtemp(prefix="jcode-bench-"))
+                (jroot / "home").mkdir()
+                (jroot / "run").mkdir()
+                env.update({"JCODE_HOME": str(jroot / "home"), "JCODE_RUNTIME_DIR": str(jroot / "run"),
+                            "JCODE_TEMP_SERVER": "1", "JCODE_SERVER_OWNER_PID": str(os.getpid())})
             for _ in range(sessions):
                 lc = launch(spec.argv, env, timeout_s, settle_s)
                 launches.append(lc)
                 cleanup.append(lc.pgid)
             roots = [l.pid for l in launches]
-        total, count = sum_tree_pss(roots, cleanup)
-        return {"tool": spec.name, "sessions": sessions, "pss_mb": total, "process_count": count}
+        res = sum_tree_pss(roots, cleanup, tag)
+        res.update({"tool": spec.name, "sessions": sessions,
+                    "ready": sum(l.ready for l in launches),
+                    "excerpt": next((l.excerpt for l in launches if l.excerpt), None)})
+        return res
     finally:
         for l in launches:
             try:
@@ -304,34 +432,71 @@ def run_tool(spec: ToolSpec, sessions: int, timeout_s: float, settle_s: float) -
             kill_pgroup(pgid)
         if base is not None:
             stop_bench_daemon(spec.argv[0], base)
+        left = reap_tagged(tag)
+        if left:
+            print(f"WARNING: {spec.name}: processes survived cleanup: {left}", file=sys.stderr)
+        if jroot is not None:
+            shutil.rmtree(jroot, ignore_errors=True)
+        if base is not None:
+            shutil.rmtree(base, ignore_errors=True)
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--sessions", type=int, required=True)
+    ap.add_argument("--sessions", type=int, nargs="+", required=True,
+                    help="one or more session counts, e.g. --sessions 1 10")
     ap.add_argument("--tools", nargs="*", default=["synaps"])
+    ap.add_argument("--reps", type=int, default=1, help="repetitions per (tool, sessions); median reported")
     ap.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_S)
     ap.add_argument("--settle", type=float, default=DEFAULT_SETTLE_S)
+    ap.add_argument("--json-out", default=None, help="write raw results (every repetition) here")
     args = ap.parse_args()
     specs = build_specs()
-    if "synaps" in args.tools:
-        base = bench_base_dir()
-        base.mkdir(parents=True, exist_ok=True)
-        print(f"synaps base dir (isolated): {base}", flush=True)
+    # a kill/hangup must still run every run's cleanup (finally blocks)
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, lambda *_: sys.exit(130))
+    stale = stale_bench_pids()
+    if stale:
+        print(f"reaping {len(stale)} process(es) left by an earlier run: {sorted(stale)}", flush=True)
+        for pid in stale:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        time.sleep(0.5)
     live = synaps_daemon_pids()
     print(f"pre-existing synaps daemons (must survive): {sorted(live) or 'none'}", flush=True)
-    results = []
+    if "synaps" in args.tools:
+        print(f"synaps base dir (isolated): {bench_base_dir()}", flush=True)
+    payload = {"date_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+               "machine": machine_info(), "args": vars(args), "versions": {},
+               "live_daemons_before": live, "summary": [], "runs": []}
     for name in args.tools:
         spec = specs.get(name)
         if not spec:
             print(f"unknown tool: {name}")
             continue
-        print(f"=== {name} @ {args.sessions} session(s) ===", flush=True)
-        check_live_daemons(live)
-        res = run_tool(spec, args.sessions, args.timeout, args.settle)
-        check_live_daemons(live)
-        print(json.dumps(res, indent=2), flush=True)
-        results.append(res)
+        payload["versions"][name] = tool_version(spec)
+        print(f"=== {name} ({payload['versions'][name]}) ===", flush=True)
+        for n in args.sessions:
+            vals = []
+            for rep in range(1, args.reps + 1):
+                check_live_daemons(live)
+                res = run_tool(spec, n, args.timeout, args.settle)
+                check_live_daemons(live)
+                res["rep"] = rep
+                payload["runs"].append(res)
+                vals.append(res["pss_mb"])
+                print(f"  {n:>2} session(s) rep {rep}: {res['pss_mb']:7.1f} MB  "
+                      f"procs={res['process_count']} outside-tree={res['outside_tree_pss_mb']} MB "
+                      f"ready={res['ready']}/{n} :: {res['excerpt']}", flush=True)
+            med = round(statistics.median(vals), 1)
+            payload["summary"].append({"tool": name, "sessions": n, "median_pss_mb": med, "raw": vals})
+            print(f"  {n:>2} session(s) median: {med} MB  raw={vals}", flush=True)
+    payload["live_daemons_after"] = synaps_daemon_pids()
+    if args.json_out:
+        Path(args.json_out).write_text(json.dumps(payload, indent=2) + "\n")
+        print(f"wrote {args.json_out}")
     return 0
 
 

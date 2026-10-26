@@ -29,6 +29,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 from pathlib import Path
 import pty
@@ -122,6 +123,25 @@ def stop_bench_daemon(bin_: str, base: Path) -> None:
     assert Path(env["SYNAPS_BASE_DIR"]).resolve() == bench_base_dir() == base
     subprocess.run([bin_, "daemon", "stop", "--force"], env=env,
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+    # Wait until no daemon of the isolated base dir is left (only those: a
+    # daemon is matched by SYNAPS_BASE_DIR=<base> in its own environment).
+    needle = f"SYNAPS_BASE_DIR={base}".encode()
+
+    def ours() -> list[int]:
+        pids = []
+        for pid in synaps_daemon_pids():
+            try:
+                if needle in Path(f"/proc/{pid}/environ").read_bytes().split(b"\0"):
+                    pids.append(pid)
+            except OSError:
+                pass
+        return pids
+
+    end = time.time() + 5
+    while ours() and time.time() < end:
+        time.sleep(0.1)
+    for pid in ours():
+        os.kill(pid, signal.SIGKILL)
 
 
 @dataclass
@@ -169,7 +189,8 @@ def answer_caps(fd: int, buf: bytes) -> bytes:
 def first_meaningful_line(screen: "pyte.Screen") -> str | None:
     for line in screen.display:
         norm = " ".join(line.split())
-        if not norm or PROBE in norm:
+        # skip the CLI's "starting daemon (pid N)" stderr notice: not a frame
+        if not norm or PROBE in norm or norm.startswith("starting daemon"):
             continue
         if sum(c.isalnum() for c in norm) >= 3 and len(norm) >= 4:
             return norm[:120]
@@ -239,7 +260,11 @@ def main() -> int:
     ap.add_argument("--runs", type=int, default=DEFAULT_RUNS)
     ap.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_S)
     ap.add_argument("--tools", nargs="*", default=["synaps"])
+    ap.add_argument("--json-out", default=None, help="write every run's raw numbers here")
     args = ap.parse_args()
+    payload = {"date_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+               "kernel": os.uname().release, "cores": os.cpu_count(), "args": vars(args),
+               "versions": {}, "runs": {}}
     specs = build_specs(args)
     live = synaps_daemon_pids()
     print(f"pre-existing synaps daemons (must survive): {sorted(live) or 'none'}", flush=True)
@@ -249,7 +274,14 @@ def main() -> int:
         if not spec:
             print(f"unknown tool: {name}", file=sys.stderr)
             continue
-        print(f"=== {name} ===", flush=True)
+        venv = synaps_env(bench_base_dir()) if spec.synaps else os.environ.copy()
+        try:
+            out = subprocess.run([spec.argv[0], "--version"], capture_output=True, text=True,
+                                 timeout=30, stdin=subprocess.DEVNULL, env=venv).stdout.strip()
+        except (OSError, subprocess.TimeoutExpired):
+            out = "unavailable"
+        payload["versions"][name] = out.splitlines()[0] if out else "?"
+        print(f"=== {name} ({payload['versions'][name]}) ===", flush=True)
         base = None
         if spec.synaps:
             base = bench_base_dir()
@@ -261,6 +293,7 @@ def main() -> int:
         for i in range(1, args.runs + 1):
             check_live_daemons(live)
             res = run_once(spec, args.timeout)
+            payload["runs"].setdefault(name, []).append(res)
             vis.append(res["first_visible_ms"])
             ready.append(res["input_ready_ms"])
             print(f"  run {i}/{args.runs}: visible={res['first_visible_ms']} "
@@ -268,13 +301,20 @@ def main() -> int:
         if base is not None:
             stop_bench_daemon(spec.argv[0], base)
         check_live_daemons(live)
-        v, r = stats(vis), stats(ready)
-        if v:
-            print(f"  first-visible ms: median={v['median']:.1f} "
-                  f"range={v['min']:.1f}-{v['max']:.1f} (n={v['n']})")
-        if r:
-            print(f"  input-ready  ms: median={r['median']:.1f} "
-                  f"range={r['min']:.1f}-{r['max']:.1f} (n={r['n']})")
+        # synaps: run 1 spawned the daemon (cold), runs 2..N attached (warm)
+        phases = [("cold", slice(0, 1)), ("warm", slice(1, None))] if spec.synaps else [("all", slice(None))]
+        for label, sl in phases:
+            v, r = stats(vis[sl]), stats(ready[sl])
+            if v:
+                print(f"  [{label}] first-visible ms: median={v['median']:.1f} "
+                      f"range={v['min']:.1f}-{v['max']:.1f} (n={v['n']})")
+            if r:
+                print(f"  [{label}] input-ready  ms: median={r['median']:.1f} "
+                      f"range={r['min']:.1f}-{r['max']:.1f} (n={r['n']})")
+    payload["live_daemons"] = {"before": live, "after": synaps_daemon_pids()}
+    if args.json_out:
+        Path(args.json_out).write_text(json.dumps(payload, indent=2) + "\n")
+        print(f"wrote {args.json_out}")
     return 0
 
 
