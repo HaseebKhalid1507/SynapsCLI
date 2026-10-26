@@ -91,7 +91,7 @@ fn help_reference_groups_all_entries_including_commands_and_plugins() {
         rendered
     );
     assert!(
-        rendered.contains("  /help — Fast paths for finding commands"),
+        rendered.contains("  /help — Type /help find to search every topic."),
         "reference should include root summary:\n{}",
         rendered
     );
@@ -153,13 +153,11 @@ fn base_help_uses_polished_intro_copy() {
         .expect("root help entry exists");
 
     assert_eq!(root.title, "SynapsCLI Help");
-    assert_eq!(
-        root.summary,
-        "Fast paths for finding commands, settings, plugins, models, and diagnostics."
-    );
+    // One useful line, no filler ("Fast paths…", "Start here…").
+    assert_eq!(root.summary, "Type /help find to search every topic.");
     assert!(
-        rendered.contains("Start here. Pick a path or search everything."),
-        "missing polished intro:\n{}",
+        !rendered.contains("Start here") && !rendered.contains("Fast paths"),
+        "filler intro is back:\n{}",
         rendered
     );
     assert!(
