@@ -88,12 +88,14 @@ struct Cli {
     no_extensions: bool,
 
     /// Run the TUI attached to a daemon session instead of in-process
-    /// (the daemon is started on first use). Optionally a session ID
-    /// (prefix ok); with no live session a new one is created (`--continue`
-    /// continues); --new (alias --create) forces a fresh session even if
-    /// one is live. Modifiers: --observe (read-only), --takeover (steal input),
-    /// --keep-warm (never parked), --new (fresh session); default mode is
-    /// SYNAPS_ATTACH_MODE or mirror (input only if nobody owns it).
+    /// (the daemon is started on first use). Optionally a session ID (prefix
+    /// ok) or name (`--name`); with no live session a new one is created
+    /// (`--continue` continues); --new (alias --create) forces a fresh
+    /// session even if one is live. Every attached client can type (config
+    /// `client_input = shared`, the default). Modifiers: --observe
+    /// (read-only), --takeover (take input under `client_input = exclusive`),
+    /// --keep-warm (never parked), --new (fresh session);
+    /// SYNAPS_ATTACH_MODE=observe|takeover sets the default mode.
     #[arg(long = "attach", value_name = "ID", global = true, num_args = 0..=1)]
     attach: Option<Option<String>>,
 
@@ -101,9 +103,9 @@ struct Cli {
     #[arg(long, global = true, conflicts_with = "takeover")]
     observe: bool,
 
-    /// With --attach: steal input ownership from the current owner (the
-    /// previous owner is told; without it a second client is read-only
-    /// while the owner is attached).
+    /// With --attach: take input ownership from the current owner (the
+    /// previous owner is told). Only matters under `client_input =
+    /// exclusive`; with the default `shared` every client can already type.
     #[arg(long, global = true)]
     takeover: bool,
 
