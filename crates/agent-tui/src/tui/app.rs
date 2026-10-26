@@ -433,7 +433,13 @@ impl App {
         let (myx_theme_tx_init, myx_theme_rx_init) = tokio::sync::mpsc::unbounded_channel();
         let boot_config = synaps_cli::config::load_config();
         Self {
-            transcript: TranscriptStore::new(clock.clone()),
+            transcript: {
+                let mut t = TranscriptStore::new(clock.clone());
+                t.set_path_base(super::render::paths::PathBase::new(
+                    std::env::current_dir().ok(),
+                ));
+                t
+            },
             threads: super::threads::Threads::default(),
             watch: Default::default(),
             tray_area: Default::default(),
