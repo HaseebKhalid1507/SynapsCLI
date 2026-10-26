@@ -174,6 +174,7 @@ mod tests {
             model: "m".into(),
             system_prompt: "s".into(),
             timeout_secs: 60,
+            thinking: None,
         };
         let path = super::super::archive::write_archive(
             dir.path(),

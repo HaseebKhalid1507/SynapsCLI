@@ -150,6 +150,9 @@ pub struct SubagentArchiveMeta {
     pub model: String,
     pub system_prompt: String,
     pub timeout_secs: u64,
+    /// Canonical worker effort; missing in archives created before this feature.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<String>,
 }
 
 impl SubagentState {

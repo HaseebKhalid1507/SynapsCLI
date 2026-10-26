@@ -238,6 +238,11 @@ define_settings! {
             Err(_) => SettingApply::Local(Ok(())),
         };
 
+    "subagent_thinking", "Subagent thinking", Agent,
+        EditorKind::Cycler(&["low", "medium", "high", "xhigh", "max"]),
+        "Default effort for new subagents; independent of foreground thinking. Resume keeps recorded effort unless overridden.",
+        |_app, value| config_edit("subagent_thinking", value);
+
     "subagent_timeout", "Subagent timeout", Agent, EditorKind::Text { numeric: true },
         "Seconds before a dispatched subagent is canceled.",
         |_app, value| match value.parse::<u64>() {

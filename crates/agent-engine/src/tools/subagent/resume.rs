@@ -33,6 +33,7 @@ struct PriorRun {
     model: String,
     system_prompt: String,
     timeout_secs: u64,
+    thinking: Option<String>,
     messages: Vec<crate::SharedMessage>,
 }
 
@@ -69,6 +70,7 @@ fn prior_run(
                             model: h.model.clone(),
                             system_prompt: h.system_prompt.clone(),
                             timeout_secs: h.timeout_secs,
+                            thinking: s.archive_meta.as_ref().and_then(|m| m.thinking.clone()),
                             messages: super::archive::resume_messages(
                                 history.iter().map(|m| m.as_ref().clone()).collect(),
                                 instructions,
@@ -90,6 +92,8 @@ fn prior_run(
                 h.model.clone(),
                 h.system_prompt.clone(),
                 h.timeout_secs,
+                h.state.read().unwrap_or_else(|p| p.into_inner())
+                    .archive_meta.as_ref().and_then(|m| m.thinking.clone()),
             )
         });
         let legacy = match handle {
@@ -133,13 +137,17 @@ fn prior_run(
             a.error.as_deref().unwrap_or(&a.status)
         )));
     }
-    let (agent_name, model, system_prompt, timeout_secs) = match (live, &archive) {
-        (Some(live), _) => live,
+    let (agent_name, model, system_prompt, timeout_secs, thinking) = match (live, &archive) {
+        (Some((agent, model, prompt, timeout, thinking)), archive) => (
+            agent, model, prompt, timeout,
+            thinking.or_else(|| archive.as_ref().and_then(|a| a.meta.thinking.clone())),
+        ),
         (None, Some(a)) => (
             a.meta.agent_name.clone(),
             a.meta.model.clone(),
             a.meta.system_prompt.clone(),
             a.meta.timeout_secs,
+            a.meta.thinking.clone(),
         ),
         (None, None) => {
             return Err(RuntimeError::Tool(format!(
@@ -164,6 +172,7 @@ fn prior_run(
         model,
         system_prompt,
         timeout_secs,
+        thinking,
         messages,
     })
 }
@@ -205,6 +214,11 @@ impl Tool for SubagentResumeTool {
                                     ~/.synaps-cli/subagent-history/) of a worker from an \
                                     earlier or crashed session. handle_id is then only a label."
                 },
+                "thinking": {
+                    "type": "string",
+                    "enum": ["low", "medium", "high", "xhigh", "max"],
+                    "description": "Override worker effort for this resumed run. Omit to keep its recorded effort; legacy archives use subagent_thinking (default xhigh). Unsupported model levels are refused."
+                },
                 "timeout": {
                     "type": "integer",
                     "description": "Optional wall-clock limit in seconds for the resumed run \
@@ -238,6 +252,9 @@ impl Tool for SubagentResumeTool {
         };
 
         let prior = prior_run(registry, &prior_handle_id, explicit_archive, &instructions)?;
+        let thinking = super::resolve_subagent_thinking(
+            &params, prior.thinking.as_deref(), &crate::config::load_config(),
+        )?;
         let (agent_name, model, system_prompt, initial_messages) = (
             prior.agent_name,
             prior.model,
@@ -294,6 +311,7 @@ impl Tool for SubagentResumeTool {
             model: model.clone(),
             system_prompt: system_prompt.clone(),
             timeout_secs,
+            thinking: Some(thinking.as_str().into()),
         });
 
         state.write().unwrap().archive_dir = Some(super::archive::process_dir());
@@ -410,6 +428,7 @@ impl Tool for SubagentResumeTool {
                             &mut runtime,
                             codex_parent_plan.as_ref(),
                         );
+                        super::apply_subagent_thinking(&mut runtime, thinking)?;
                         runtime
                             .install_worker_orchestration(Arc::clone(&orchestration_for_runtime));
                         runtime.set_delegation_parent(Some(child_parent_id.clone()));
@@ -600,6 +619,7 @@ mod tests {
             model: "anthropic/claude-opus-5-5".into(),
             system_prompt: "archived system".into(),
             timeout_secs: 3500,
+            thinking: Some("low".into()),
         };
         let history: Vec<crate::SharedMessage> = vec![
             Arc::new(json!({"role": "user", "content": "build the plate"})),
@@ -632,6 +652,35 @@ mod tests {
         let last = &prior.messages[2]["content"];
         assert_eq!(last[0]["content"], "rendered 300 frames");
         assert!(last[1]["text"].as_str().unwrap().ends_with(instructions));
+    }
+
+    #[test]
+    fn subagent_thinking_resume_archive_survives_config_change_and_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = archive_in(dir.path(), "sa_thinking");
+        let registry = Mutex::new(SubagentRegistry::new());
+        let prior = prior_run(&registry, "sa_thinking", Some(path), "continue").unwrap();
+        assert_eq!(prior.thinking.as_deref(), Some("low"));
+        let cfg = crate::config::load_config_from_str("subagent_thinking = max\n");
+        let retained = super::super::resolve_subagent_thinking(&json!({}), prior.thinking.as_deref(), &cfg).unwrap();
+        assert_eq!(retained.as_str(), "low");
+        let overridden = super::super::resolve_subagent_thinking(&json!({"thinking":"xhigh"}), prior.thinking.as_deref(), &cfg).unwrap();
+        let mut runtime = crate::Runtime::new_headless();
+        runtime.set_model("openai-codex/gpt-6-astra".into());
+        super::super::apply_subagent_thinking(&mut runtime, retained).unwrap();
+        assert_eq!(runtime.reasoning_level().as_str(), "low");
+        super::super::apply_subagent_thinking(&mut runtime, overridden).unwrap();
+        assert_eq!(runtime.reasoning_level().as_str(), "xhigh");
+    }
+
+    #[test]
+    fn subagent_thinking_legacy_archive_defaults_without_migration() {
+        let meta: crate::runtime::subagent::SubagentArchiveMeta = serde_json::from_value(json!({
+            "agent_name":"old", "model":"openai-codex/gpt-6-astra",
+            "system_prompt":"test", "timeout_secs":300
+        })).unwrap();
+        assert!(meta.thinking.is_none());
+        assert_eq!(super::super::resolve_subagent_thinking(&json!({}), meta.thinking.as_deref(), &Default::default()).unwrap().as_str(), "xhigh");
     }
 
     #[test]
@@ -689,6 +738,7 @@ mod tests {
                 model: "model".into(),
                 system_prompt: "system".into(),
                 timeout_secs: 1,
+                thinking: Some("medium".into()),
             });
             s.finished_at = None;
         }
@@ -777,6 +827,7 @@ mod tests {
             model: "anthropic/claude-opus-5-5".into(),
             system_prompt: "archived system".into(),
             timeout_secs: 30,
+            thinking: None,
         };
         let path = super::super::archive::write_archive(
             dir.path(),
