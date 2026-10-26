@@ -410,4 +410,57 @@ mod tests {
             .join("\n")
             .contains("plain text result"));
     }
+
+    #[test]
+    fn completion_event_shows_compact_summary_not_model_text() {
+        use unicode_width::UnicodeWidthStr;
+        let model_text =
+            "Subagent 'rs-counter' (sa_1) finished with status 'completed' after 3.8s. \
+             Call subagent_collect with handle_id \"sa_1\" to retrieve the full result. \
+             Preview: There is no `crates/` directory in the current repo (`/tmp/x`), so there \
+             are 0 `.rs` files to count.";
+        let failed_text = "Subagent 'x' (sa_9) finished with status 'failed' after 125.0s. \
+             Reason: provider refused Call subagent_collect with handle_id \"sa_9\" to retrieve \
+             the full result. Preview: ";
+        let mut store = TranscriptStore::new(crate::tui::clock::TuiClock::real());
+        for t in [model_text, failed_text] {
+            store.push_msg(ChatMessage::Event {
+                source: "subagent".into(),
+                severity: "high".into(),
+                text: t.into(),
+            });
+        }
+        for width in [50usize, 90] {
+            let rows = rows_of(&store, 0, width);
+            let all = rows.join("\n");
+            assert!(
+                all.contains("\u{2713} rs-counter finished \u{00B7} 3.8s"),
+                "{all}"
+            );
+            assert!(all.contains("There is no crates/ directory"), "{all}");
+            for leak in ["subagent_collect", "handle_id", "sa_1", "`", "with status"] {
+                assert!(!all.contains(leak), "w={width} leaked {leak:?}:\n{all}");
+            }
+            let widths: Vec<usize> = rows
+                .iter()
+                .filter(|r| !r.is_empty())
+                .map(|r| UnicodeWidthStr::width(r.as_str()))
+                .collect();
+            assert!(
+                widths.windows(2).all(|w| w[0] == w[1]),
+                "aligned: {widths:?}"
+            );
+            let failed = rows_of(&store, 1, width).join("\n");
+            assert!(
+                failed.contains("\u{2717} x failed \u{00B7} 2m 05s"),
+                "{failed}"
+            );
+            assert!(failed.contains("reason: provider refused"), "{failed}");
+        }
+        // The model-facing text is byte-identical (prompt cache).
+        match &store.messages()[0].msg {
+            ChatMessage::Event { text, .. } => assert_eq!(text, model_text),
+            _ => unreachable!(),
+        }
+    }
 }

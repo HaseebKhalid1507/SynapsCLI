@@ -79,6 +79,15 @@ pub(crate) fn parse_inline_md(text: &str, base_style: Style) -> Vec<Span<'static
     spans
 }
 
+/// Plain-text projection of a short markdown snippet for one-line previews
+/// (event cards, the subagent tray): drops code backticks and `**` / `__`
+/// emphasis markers. Unlike [`strip_inline_md`] it never consumes text, so a
+/// preview truncated mid-span (an unclosed backtick) or a lone `*` (math,
+/// globs) still reads correctly.
+pub(crate) fn strip_md_markers(text: &str) -> String {
+    text.replace("**", "").replace("__", "").replace('`', "")
+}
+
 /// Strip inline markdown markers (`**`, `*`, `` ` ``) from text for width calculation.
 /// Returns the visible text without formatting markers.
 fn strip_inline_md(text: &str) -> String {
@@ -1309,6 +1318,15 @@ mod tests {
             "Era span is not bold: {:?}",
             era_span.style
         );
+    }
+
+    #[test]
+    fn strip_md_markers_keeps_text_and_lone_stars() {
+        assert_eq!(
+            strip_md_markers("There is no `crates/` dir (`/a/b`), **0** `.rs` files"),
+            "There is no crates/ dir (/a/b), 0 .rs files"
+        );
+        assert_eq!(strip_md_markers("2 * 3 and `unclosed tail"), "2 * 3 and unclosed tail");
     }
 
     #[test]

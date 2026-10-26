@@ -13,6 +13,7 @@ use super::highlight::{
     is_read_tool_output, try_highlight_grep_line,
 };
 use super::markdown::{render_markdown_spans, wrap_text, wrap_text_spans};
+use super::text_metrics::width as display_width;
 use super::theme::THEME;
 use super::transcript::{
     ChatMessage, LineMeta, MsgSlot, RenderCtx, TranscriptStore, THINKING_PLACEHOLDER,
@@ -1239,13 +1240,76 @@ impl TranscriptStore {
                 ]));
                 // Content
                 let text_style = Style::default().fg(theme.event_body()).bg(event_bg);
-                for (src_line, line_off, line) in source_lines(text) {
-                    let prefix_len = m.len() + 2;
-                    for row in wrap_text_spans(&format!("{}  {}", m, line), width) {
-                        let rendered = format!("{:<width$}", row.text, width = width);
-                        let meta =
-                            classify_row(&rendered, &row, line, line_off, prefix_len, i, src_line);
-                        lines.push_meta(Line::from(Span::styled(rendered, text_style)), meta);
+                // A subagent completion carries a model-facing sentence
+                // ("… Call subagent_collect with handle_id …"); show the user
+                // a compact summary + preview. Display-only: `text` (and the
+                // model's prompt-cached copy) is untouched.
+                let completion = (source == "subagent")
+                    .then(|| subagent_card::parse_completion(text))
+                    .flatten();
+                if let Some(c) = completion {
+                    let meta = LineMeta::ContentLine {
+                        msg_idx: i,
+                        src_line: 0,
+                    };
+                    let (glyph, _, color) = subagent_card::status_badge(c.status);
+                    let verb = match c.status {
+                        "completed" => "finished".to_string(),
+                        other => subagent_card::status_badge(other).1,
+                    };
+                    let head = format!(
+                        "{}  {} {} {} \u{00B7} {}",
+                        m,
+                        glyph,
+                        c.name,
+                        verb,
+                        subagent_card::fmt_secs(c.secs)
+                    );
+                    let gap = width.saturating_sub(display_width(head.as_str()));
+                    let glyph_at = m.len() + 2;
+                    lines.push_meta(
+                        clamp_line(
+                            Line::from(vec![
+                                Span::styled(head[..glyph_at].to_string(), text_style),
+                                Span::styled(
+                                    format!("{} ", glyph),
+                                    Style::default().fg(color).bg(event_bg),
+                                ),
+                                Span::styled(
+                                    head[glyph_at + glyph.len() + 1..].to_string(),
+                                    text_style.add_modifier(Modifier::BOLD),
+                                ),
+                                Span::styled(" ".repeat(gap), text_style),
+                            ]),
+                            width,
+                        ),
+                        meta.clone(),
+                    );
+                    let mut body: Vec<(String, Style)> = Vec::new();
+                    if let Some(r) = c.reason {
+                        body.push((
+                            format!("reason: {}", r),
+                            Style::default().fg(theme.error_color).bg(event_bg),
+                        ));
+                    }
+                    for pl in super::markdown::strip_md_markers(c.preview).lines() {
+                        body.push((pl.to_string(), text_style));
+                    }
+                    for (line, st) in body {
+                        for wline in wrap_text(&format!("{}    {}", m, line), width) {
+                            let rendered = format!("{:<width$}", wline, width = width);
+                            lines.push_meta(Line::from(Span::styled(rendered, st)), meta.clone());
+                        }
+                    }
+                } else {
+                    for (src_line, line_off, line) in source_lines(text) {
+                        let prefix_len = m.len() + 2;
+                        for row in wrap_text_spans(&format!("{}  {}", m, line), width) {
+                            let rendered = format!("{:<width$}", row.text, width = width);
+                            let meta =
+                                classify_row(&rendered, &row, line, line_off, prefix_len, i, src_line);
+                            lines.push_meta(Line::from(Span::styled(rendered, text_style)), meta);
+                        }
                     }
                 }
                 // Bottom padding
