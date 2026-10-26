@@ -579,6 +579,12 @@ pub const MAX_CACHE_KEEPWARM_HOURS: u32 = 48;
 /// session left over a weekend parks. (Owner decision, task #444.)
 pub const DEFAULT_CACHE_KEEPWARM_AUTO_MAX_HOURS: u32 = 24;
 
+/// Default for `subagent_cold_resume_compact_tokens`. Below ~100k tokens a
+/// cold full replay costs well under $1 on the priciest model and keeps every
+/// detail; above it (measured resumes reached 250k–715k tokens, up to ~$3.50
+/// each) the compact context is the cheaper trade.
+pub const DEFAULT_SUBAGENT_COLD_RESUME_COMPACT_TOKENS: u64 = 100_000;
+
 /// Prompt-cache keep-warm policy (`cache_keepwarm`, task #444). See
 /// docs/specs/cache-ttl-spec.md §7.
 ///
@@ -1205,6 +1211,13 @@ pub struct SynapsConfig {
     pub bash_timeout: u64,       // default 30
     pub bash_max_timeout: u64,   // default 300
     pub subagent_timeout: u64,   // default 300
+    /// `subagent_resume` of a worker whose prompt cache has expired replays
+    /// a compact context instead of its whole transcript once the history is
+    /// at least this many (estimated) tokens: a cold replay rewrites every
+    /// token at the cache-write price. `0` disables compaction
+    /// (`subagent_cold_resume_compact_tokens`, default
+    /// [`DEFAULT_SUBAGENT_COLD_RESUME_COMPACT_TOKENS`]).
+    pub subagent_cold_resume_compact_tokens: u64,
     pub api_retries: u32,        // default 3
     pub refusal_retries: u32,    // default 2 — retries on stop_reason=refusal
     pub telemetry: String,       // off | basic | full (default off)
@@ -1313,6 +1326,7 @@ impl Default for SynapsConfig {
             bash_timeout: 30,
             bash_max_timeout: 300,
             subagent_timeout: 300,
+            subagent_cold_resume_compact_tokens: DEFAULT_SUBAGENT_COLD_RESUME_COMPACT_TOKENS,
             api_retries: 3,
             refusal_retries: 2,
             telemetry: "off".to_string(),
@@ -1378,6 +1392,7 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "bash_timeout",
     "bash_max_timeout",
     "subagent_timeout",
+    "subagent_cold_resume_compact_tokens",
     "subagent.max_concurrent",
     "subagent.max_total",
     "subagent.max_depth",
@@ -1915,6 +1930,12 @@ fn apply_config_content_with(
                     config.subagent_timeout = timeout;
                 }
             }
+            "subagent_cold_resume_compact_tokens" => match val.parse::<u64>() {
+                Ok(tokens) => config.subagent_cold_resume_compact_tokens = tokens,
+                Err(_) => config.warnings.push(format!(
+                    "subagent_cold_resume_compact_tokens = {val} — expected a token count (0 disables); using {DEFAULT_SUBAGENT_COLD_RESUME_COMPACT_TOKENS}"
+                )),
+            },
             // Legacy flat spellings (pre-`subagent.*`): same parser, same limits.
             "subagent_max_concurrent" | "subagent_max_total" => {
                 let dotted = key.replacen("subagent_", "subagent.", 1);
@@ -2617,6 +2638,32 @@ mod tests {
                 "{k} not in KNOWN_CONFIG_KEYS"
             );
         }
+    }
+
+    #[test]
+    fn subagent_cold_resume_compact_tokens_parses_defaults_and_warns() {
+        let c = super::load_config_from_str("");
+        assert_eq!(c.subagent_cold_resume_compact_tokens, 100_000);
+        assert_eq!(
+            super::SynapsConfig::default().subagent_cold_resume_compact_tokens,
+            super::DEFAULT_SUBAGENT_COLD_RESUME_COMPACT_TOKENS
+        );
+        let c = super::load_config_from_str("subagent_cold_resume_compact_tokens = 250000\n");
+        assert_eq!(c.subagent_cold_resume_compact_tokens, 250_000);
+        assert!(c.warnings.is_empty(), "warnings: {:?}", c.warnings);
+        let c = super::load_config_from_str("subagent_cold_resume_compact_tokens = 0\n");
+        assert_eq!(c.subagent_cold_resume_compact_tokens, 0, "0 disables");
+        assert!(c.warnings.is_empty(), "warnings: {:?}", c.warnings);
+        let c = super::load_config_from_str("subagent_cold_resume_compact_tokens = lots\n");
+        assert_eq!(c.subagent_cold_resume_compact_tokens, 100_000);
+        assert!(
+            c.warnings
+                .iter()
+                .any(|w| w.contains("subagent_cold_resume_compact_tokens")),
+            "warnings: {:?}",
+            c.warnings
+        );
+        assert!(super::KNOWN_CONFIG_KEYS.contains(&"subagent_cold_resume_compact_tokens"));
     }
 
     #[test]

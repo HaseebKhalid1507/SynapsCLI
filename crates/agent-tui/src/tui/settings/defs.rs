@@ -245,6 +245,11 @@ define_settings! {
             Err(_) => SettingApply::Local(Ok(())),
         };
 
+    "subagent_cold_resume_compact_tokens", "Cold resume compact (tokens)", Agent,
+        EditorKind::Text { numeric: true },
+        "subagent_resume of a worker whose prompt cache expired replays a compact context instead of the full transcript once its history reaches this many tokens (default 100000; 0 = always replay in full). Applies from the next resume.",
+        |_app, value| whole_number("subagent_cold_resume_compact_tokens", value);
+
     "max_tool_output", "Max tool output", ToolLimits, EditorKind::Text { numeric: true },
         "Bytes to capture from a tool before truncating.",
         |_app, value| match value.parse::<usize>() {
