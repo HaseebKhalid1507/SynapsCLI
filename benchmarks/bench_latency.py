@@ -15,6 +15,13 @@
 # Methodology and portions of this harness are adapted from jcode's
 # `bench_startup_visible_ready.py` by Jeremy Huang (MIT). See benchmarks/NOTICE.
 #
+# Isolation: synaps runs against an isolated base dir (SYNAPS_BASE_DIR if set,
+# else /tmp/synaps-bench-home); the harness refuses ~/.synaps-cli. Run 1 is
+# cold (no daemon in the isolated dir, so plain `synaps` spawns one), runs 2..N
+# are warm (attach to it); the isolated daemon is stopped afterwards. Without
+# this, plain `synaps` adopts the user's live daemon. It also aborts if any
+# pre-existing synaps daemon pid disappears.
+#
 # Requires: python3, pyte  (pip install pyte)
 # Usage:    python3 bench_latency.py --runs 10 --tools synaps
 #           SYNAPS_BIN=/path/to/synaps python3 bench_latency.py --runs 10
@@ -23,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import os
+from pathlib import Path
 import pty
 import select
 import signal
@@ -69,24 +77,70 @@ CAP_REPLIES = [
 ]
 
 
+DEFAULT_BENCH_BASE = "/tmp/synaps-bench-home"
+
+
+def bench_base_dir() -> Path:
+    raw = os.environ.get("SYNAPS_BASE_DIR") or DEFAULT_BENCH_BASE
+    base = Path(raw).expanduser().resolve()
+    live = (Path.home() / ".synaps-cli").resolve()
+    if base == live or live in base.parents or base in live.parents:
+        raise SystemExit(f"refusing to benchmark in {base}: it overlaps the live base dir {live}. "
+                         f"Unset SYNAPS_BASE_DIR or point it at a scratch dir (default {DEFAULT_BENCH_BASE}).")
+    return base
+
+
+def synaps_env(base: Path) -> dict[str, str]:
+    env = {k: v for k, v in os.environ.items() if not k.startswith("SYNAPS_")}
+    env["SYNAPS_BASE_DIR"] = str(base)
+    return env
+
+
+def synaps_daemon_pids() -> dict[int, str]:
+    out: dict[int, str] = {}
+    for e in Path("/proc").iterdir():
+        if not e.name.isdigit():
+            continue
+        try:
+            argv = (e / "cmdline").read_bytes().split(b"\0")
+        except OSError:
+            continue
+        if len(argv) > 1 and os.path.basename(argv[0]).startswith(b"synaps") and b"daemon" in argv[1:3]:
+            out[int(e.name)] = b" ".join(argv).decode(errors="replace").strip()
+    return out
+
+
+def check_live_daemons(before: dict[int, str]) -> None:
+    gone = {p: c for p, c in before.items() if p not in synaps_daemon_pids()}
+    if gone:
+        print(f"ABORT: pre-existing synaps daemon(s) disappeared during the run: {gone}", file=sys.stderr)
+        raise SystemExit(2)
+
+
+def stop_bench_daemon(bin_: str, base: Path) -> None:
+    env = synaps_env(base)
+    assert Path(env["SYNAPS_BASE_DIR"]).resolve() == bench_base_dir() == base
+    subprocess.run([bin_, "daemon", "stop", "--force"], env=env,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+
+
 @dataclass
 class ToolSpec:
     name: str
     argv: list[str]
     env: dict[str, str] = field(default_factory=dict)
+    synaps: bool = False
 
 
 def build_specs(args: argparse.Namespace) -> dict[str, ToolSpec]:
     synaps = os.environ.get("SYNAPS_BIN", "synaps")
     return {
-        "synaps": ToolSpec("synaps", [synaps]),
+        "synaps": ToolSpec("synaps", [synaps], synaps=True),
         "jcode": ToolSpec("jcode", ["jcode", "--no-update", "--no-selfdev"],
                           {"JCODE_NO_TELEMETRY": "1"}),
         "codex": ToolSpec("codex", ["codex"]),
         "opencode": ToolSpec("opencode", ["opencode"]),
         "pi": ToolSpec("pi", ["pi"]),
-        "antigravity": ToolSpec("antigravity", ["antigravity"],
-                                {"AGY_CLI_DISABLE_AUTO_UPDATE": "1"}),
         "claude_code": ToolSpec("claude_code", ["claude"]),
         "cursor": ToolSpec("cursor", ["cursor-agent"]),
     }
@@ -125,7 +179,7 @@ def first_meaningful_line(screen: "pyte.Screen") -> str | None:
 def run_once(spec: ToolSpec, timeout_s: float) -> dict[str, object]:
     master, slave = pty.openpty()
     configure_pty(slave)
-    env = os.environ.copy()
+    env = synaps_env(bench_base_dir()) if spec.synaps else os.environ.copy()
     env.update({"TERM": "xterm-256color", "COLORTERM": "truecolor"})
     env.update(spec.env)
     proc = subprocess.Popen(spec.argv, stdin=slave, stdout=slave, stderr=slave,
@@ -187,6 +241,8 @@ def main() -> int:
     ap.add_argument("--tools", nargs="*", default=["synaps"])
     args = ap.parse_args()
     specs = build_specs(args)
+    live = synaps_daemon_pids()
+    print(f"pre-existing synaps daemons (must survive): {sorted(live) or 'none'}", flush=True)
 
     for name in args.tools:
         spec = specs.get(name)
@@ -194,13 +250,24 @@ def main() -> int:
             print(f"unknown tool: {name}", file=sys.stderr)
             continue
         print(f"=== {name} ===", flush=True)
+        base = None
+        if spec.synaps:
+            base = bench_base_dir()
+            base.mkdir(parents=True, exist_ok=True)
+            print(f"  synaps base dir (isolated): {base}", flush=True)
+            stop_bench_daemon(spec.argv[0], base)  # run 1 must be cold
+            time.sleep(0.5)
         vis, ready = [], []
         for i in range(1, args.runs + 1):
+            check_live_daemons(live)
             res = run_once(spec, args.timeout)
             vis.append(res["first_visible_ms"])
             ready.append(res["input_ready_ms"])
             print(f"  run {i}/{args.runs}: visible={res['first_visible_ms']} "
                   f"ready={res['input_ready_ms']} :: {res['excerpt']}", flush=True)
+        if base is not None:
+            stop_bench_daemon(spec.argv[0], base)
+        check_live_daemons(live)
         v, r = stats(vis), stats(ready)
         if v:
             print(f"  first-visible ms: median={v['median']:.1f} "
