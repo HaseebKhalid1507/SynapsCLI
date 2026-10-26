@@ -188,6 +188,11 @@ Each extension is its own crash-isolated process, with a permissions manifest th
 <p align="center">
   <img src="https://github.com/user-attachments/assets/f54ea75f-0c15-41cb-b97f-b66a8396c27f" alt="night-city theme" width="32%" />
   <img src="https://github.com/user-attachments/assets/0086bec9-6b05-432d-8099-ee84faaf3e75" alt="catppuccin theme" width="32%" />
+  <img src="https://github.com/user-attachments/assets/44e21013-54df-414b-8659-6b47026b170d" alt="gruvbox theme" width="32%" />
+</p>
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/20281243-705c-49e4-8cc0-a1be82be37e8" alt="dracula theme" width="32%" />
+  <img src="https://github.com/user-attachments/assets/a9c71930-0fb1-4397-9f43-4564efb299a3" alt="tokyo-night theme" width="32%" />
   <img src="https://github.com/user-attachments/assets/0492a49d-4f65-4edd-870d-375590877f40" alt="paper theme" width="32%" />
 </p>
 
