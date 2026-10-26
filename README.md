@@ -20,13 +20,6 @@
   <img src="https://github.com/user-attachments/assets/0ce9fe56-cf4e-4bb1-9a70-b516ae6a71b6" alt="A crew of Synaps agents running in parallel" width="100%" />
 </p>
 
-<!-- BENCH-STRIP: numbers from BENCHMARKS.md; update both together -->
-| **79 MB** for 10 sessions | **~7 ms** to first frame | **97.9%** of prompt tokens from cache |
-|:---:|:---:|:---:|
-| next lightest (jcode) 165 MB, Claude Code 894 MB | on a warm daemon; cold start ~41 ms | 127k real requests since v0.8.0, 89.6% cheaper |
-
-<p align="center"><sub>Same machine, same harness, versions and method in <a href="BENCHMARKS.md">BENCHMARKS.md</a>.</sub></p>
-
 ---
 
 ## Install
