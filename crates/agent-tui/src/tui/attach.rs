@@ -168,8 +168,42 @@ pub fn adopt_banner(
 /// The slice of `Welcome.sessions` the attach decision needs.
 pub struct LiveSession {
     pub id: SessionId,
+    /// `--name` / `/name`, when set: `--attach <NAME>` resolves it too.
+    pub name: Option<String>,
     pub model: String,
     pub clients: usize,
+}
+
+/// `--attach <ARG>`: an exact id, then a session name (`--name`), then an id
+/// prefix. Unknown values pass through as ids so the daemon can still find
+/// sessions the welcome list didn't carry (and answer "unknown session").
+fn resolve_attach_target(
+    sessions: &[LiveSession],
+    arg: &str,
+) -> std::result::Result<SessionId, String> {
+    if let Some(m) = sessions.iter().find(|m| m.id.as_str() == arg) {
+        return Ok(m.id.clone());
+    }
+    let named: Vec<&LiveSession> = sessions
+        .iter()
+        .filter(|m| m.name.as_deref() == Some(arg))
+        .collect();
+    match named.as_slice() {
+        [one] => return Ok(one.id.clone()),
+        [] => {}
+        many => {
+            let mut lines = vec![format!(
+                "several live sessions are named \"{arg}\"; pick one by id:"
+            )];
+            lines.extend(many.iter().map(|m| format!("  {}  model={}", m.id, m.model)));
+            return Err(lines.join("\n"));
+        }
+    }
+    Ok(sessions
+        .iter()
+        .find(|m| m.id.as_str().starts_with(arg))
+        .map(|m| m.id.clone())
+        .unwrap_or_else(|| SessionId::from(arg)))
 }
 
 /// What to send: `Existing` for an explicit or sole live session, `Create`
@@ -207,11 +241,7 @@ pub fn choose_attach(
         return Ok((create(None), None));
     }
     if let Some(id) = &opts.id {
-        let sid = sessions
-            .iter()
-            .find(|m| m.id.as_str() == id || m.id.as_str().starts_with(id.as_str()))
-            .map(|m| m.id.clone())
-            .unwrap_or_else(|| SessionId::from(id.as_str()));
+        let sid = resolve_attach_target(sessions, id)?;
         return Ok((
             Attach::Existing {
                 session_id: sid,
@@ -234,9 +264,10 @@ pub fn choose_attach(
         )),
         many => {
             let mut lines =
-                vec!["several sessions; pick one with --attach <ID> (or --new for a fresh one):".to_string()];
+                vec!["several sessions; pick one with --attach <ID or NAME> (or --new for a fresh one):".to_string()];
             for m in many {
-                lines.push(format!("  {}  model={}  clients={}", m.id, m.model, m.clients));
+                let name = m.name.as_deref().map(|n| format!("\"{n}\"  ")).unwrap_or_default();
+                lines.push(format!("  {}  {name}model={}  clients={}", m.id, m.model, m.clients));
             }
             Err(lines.join("\n"))
         }
@@ -302,13 +333,25 @@ fn cfg_err(e: impl std::fmt::Display) -> synaps_cli::RuntimeError {
 }
 
 /// What `--attach` prints when there is no daemon to attach to: says so,
-/// and how to start one (profile-aware).
+/// and how to start one (profile-aware). The `SYNAPS_DAEMON_AUTOSPAWN` hint
+/// only appears when autospawn really is off; otherwise the daemon was there
+/// a moment ago (idle shutdown, crash) and re-running starts a new one.
 pub fn daemon_not_running_message(profile: Option<&str>, detail: Option<&str>) -> String {
+    not_running_message(profile, detail, agent_engine::daemon::autospawn_enabled())
+}
+
+fn not_running_message(profile: Option<&str>, detail: Option<&str>, autospawn: bool) -> String {
     let start = match profile {
         Some(p) => format!("synaps --profile {p} daemon --detach"),
         None => "synaps daemon --detach".to_string(),
     };
     let why = detail.map(|d| format!(" ({d})")).unwrap_or_default();
+    if autospawn {
+        return format!(
+            "no daemon is running{why}; it may have just stopped.\n\
+             re-run `synaps --attach` to start a new one, or start it yourself with:  {start}"
+        );
+    }
     format!(
         "no daemon is running{why} — nothing to attach to.\n\
          start one with:  {start}\n\
@@ -389,6 +432,7 @@ pub async fn run_attached(mut opts: AttachOpts) -> Result<()> {
         .iter()
         .map(|m| LiveSession {
             id: m.id.clone(),
+            name: m.name.clone(),
             model: m.model.clone(),
             clients: m.clients,
         })
@@ -658,13 +702,23 @@ mod tests {
 
     #[test]
     fn not_running_message_says_so_and_how_to_start() {
-        let m = daemon_not_running_message(None, None);
+        let m = not_running_message(None, None, false);
         assert!(m.starts_with("no daemon is running"), "{m}");
         assert!(m.contains("synaps daemon --detach"), "{m}");
         assert!(m.contains("synaps daemon --foreground"), "{m}");
-        let m = daemon_not_running_message(Some("work"), Some("connection refused"));
+        assert!(m.contains("SYNAPS_DAEMON_AUTOSPAWN=0"), "{m}");
+        let m = not_running_message(Some("work"), Some("connection refused"), false);
         assert!(m.contains("(connection refused)"), "{m}");
         assert!(m.contains("synaps --profile work daemon --detach"), "{m}");
+    }
+
+    #[test]
+    fn not_running_message_skips_the_autospawn_hint_when_autospawn_is_on() {
+        let m = not_running_message(Some("demo"), Some("connection refused"), true);
+        assert!(m.starts_with("no daemon is running (connection refused)"), "{m}");
+        assert!(m.contains("re-run `synaps --attach`"), "{m}");
+        assert!(m.contains("synaps --profile demo daemon --detach"), "{m}");
+        assert!(!m.contains("SYNAPS_DAEMON_AUTOSPAWN"), "{m}");
     }
 
     fn opts(id: Option<&str>, new_session: bool) -> AttachOpts {
@@ -780,6 +834,7 @@ mod tests {
     fn live(id: &str) -> LiveSession {
         LiveSession {
             id: SessionId::from(id),
+            name: None,
             model: "m".into(),
             clients: 1,
         }
@@ -792,6 +847,33 @@ mod tests {
         assert!(notice.is_none());
         let (a, _) = choose_attach(&opts(None, true), &[live("a"), live("b")], None, true).unwrap();
         assert!(matches!(a, Attach::Create { .. }), "{a:?}");
+    }
+
+    fn named(id: &str, name: &str) -> LiveSession {
+        LiveSession { name: Some(name.into()), ..live(id) }
+    }
+
+    #[test]
+    fn attach_resolves_a_session_name() {
+        let sessions = [live("20261026-081319-a97a"), named("20261026-081500-793d", "pair")];
+        let (a, _) = choose_attach(&opts(Some("pair"), false), &sessions, None, true).unwrap();
+        assert!(
+            matches!(&a, Attach::Existing { session_id, .. } if session_id.as_str() == "20261026-081500-793d"),
+            "{a:?}"
+        );
+        // An exact id still wins over a name, and id prefixes still work.
+        let sessions = [named("abc", "x"), named("def", "abc")];
+        let (a, _) = choose_attach(&opts(Some("abc"), false), &sessions, None, true).unwrap();
+        assert!(matches!(&a, Attach::Existing { session_id, .. } if session_id.as_str() == "abc"), "{a:?}");
+        let (a, _) = choose_attach(&opts(Some("de"), false), &sessions, None, true).unwrap();
+        assert!(matches!(&a, Attach::Existing { session_id, .. } if session_id.as_str() == "def"), "{a:?}");
+    }
+
+    #[test]
+    fn attach_by_ambiguous_name_lists_the_ids() {
+        let sessions = [named("aaa", "pair"), named("bbb", "pair")];
+        let e = choose_attach(&opts(Some("pair"), false), &sessions, None, true).unwrap_err();
+        assert!(e.contains("aaa") && e.contains("bbb") && e.contains("by id"), "{e}");
     }
 
     #[test]
