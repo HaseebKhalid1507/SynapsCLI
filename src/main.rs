@@ -616,9 +616,9 @@ static ADOPTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::n
 
 /// Auto-spawn (jcode model) before the runtime exists: a live daemon or a
 /// freshly spawned one. Runs BEFORE the thin re-exec/diet so a failed spawn
-/// can fall back to the untouched in-process boot. Returns the reason the
-/// TUI should fall back in-process; the line client exits 3 instead.
-fn ensure_daemon(kind: &ThinClient) -> Option<String> {
+/// can fall back to the untouched in-process boot. Returns why the TUI
+/// should fall back in-process; the line client exits 3 instead.
+fn ensure_daemon(kind: &ThinClient) -> Option<InProcessFallback> {
     use agent_engine::daemon::{self, EnsureError, Ensured, EXIT_REFUSED};
     let (profile, line) = match kind {
         ThinClient::Tui { profile } | ThinClient::Adopt { profile } => (profile.clone(), false),
@@ -636,7 +636,7 @@ fn ensure_daemon(kind: &ThinClient) -> Option<String> {
             // boot, quietly. An explicit `--attach` asked for a daemon and
             // must say why there is none.
             if matches!(kind, ThinClient::Adopt { .. }) {
-                return Some("SYNAPS_DAEMON_AUTOSPAWN=0".into());
+                return Some(InProcessFallback { reason: "SYNAPS_DAEMON_AUTOSPAWN=0".into(), quiet: true });
             }
             let msg = cmd::attach::no_daemon_message(opts.profile.as_deref());
             eprintln!("{msg}");
@@ -647,9 +647,17 @@ fn ensure_daemon(kind: &ThinClient) -> Option<String> {
                 eprintln!("synaps attach: daemon unavailable: {reason}");
                 std::process::exit(EXIT_REFUSED);
             }
-            Some(reason)
+            Some(InProcessFallback { reason, quiet: false })
         }
     }
+}
+
+/// [`ensure_daemon`]'s answer when the TUI runs in-process instead.
+struct InProcessFallback {
+    reason: String,
+    /// The user chose in-process (`SYNAPS_DAEMON_AUTOSPAWN=0` with no daemon
+    /// running): no "daemon unavailable" notice on every boot.
+    quiet: bool,
 }
 
 /// Our jemalloc boot conf for the re-exec'd thin client (`SYNAPS_CLIENT_MALLOC_CONF`
@@ -753,9 +761,11 @@ fn main() -> anyhow::Result<()> {
                 }
                 thin = true;
             }
-            Some(reason) => {
-                eprintln!("daemon unavailable: {reason} — running in-process");
-                tui::push_boot_notice(format!("daemon unavailable: {reason} — running in-process"));
+            Some(InProcessFallback { reason, quiet }) => {
+                if !quiet {
+                    eprintln!("daemon unavailable: {reason} — running in-process");
+                    tui::push_boot_notice(format!("daemon unavailable: {reason} — running in-process"));
+                }
                 std::env::set_var(ATTACH_FALLBACK, "1");
             }
         }
