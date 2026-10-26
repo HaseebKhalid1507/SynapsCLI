@@ -291,6 +291,32 @@ def stale_bench_pids() -> set[int]:
     return out
 
 
+def mem_pressure() -> dict:
+    """Memory PSI avg10 (% of time stalled on memory) and MemAvailable."""
+    out = {}
+    try:
+        for line in Path("/proc/pressure/memory").read_text().splitlines():
+            kind, *kv = line.split()
+            out[f"psi_{kind}_avg10"] = float(dict(x.split("=") for x in kv)["avg10"])
+    except OSError:
+        pass
+    avail = next(int(l.split()[1]) for l in Path("/proc/meminfo").read_text().splitlines()
+                 if l.startswith("MemAvailable:"))
+    out["mem_available_gb"] = round(avail / 1024 / 1024, 1)
+    return out
+
+
+def wait_quiet(max_psi: float, max_wait_s: float) -> dict:
+    """Under memory pressure the kernel reclaims a TUI's pages while it is being
+    sampled (file pages evicted, anon pages swapped), so wait for a quiet box."""
+    end = time.time() + max_wait_s
+    while True:
+        mp = mem_pressure()
+        if mp.get("psi_some_avg10", 0.0) <= max_psi or time.time() > end:
+            return mp
+        time.sleep(5)
+
+
 def tagged_pids(tag: str) -> set[int]:
     """Processes carrying this run's BENCH_RUN_TAG in their environment. This
     catches anything a tool detached from its tree/pgroup (setsid, double
@@ -487,6 +513,12 @@ def main() -> int:
     ap.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_S)
     ap.add_argument("--settle", type=float, default=DEFAULT_SETTLE_S)
     ap.add_argument("--json-out", default=None, help="write raw results (every repetition) here")
+    ap.add_argument("--max-psi", type=float, default=1.0,
+                    help="max memory PSI some-avg10 (%%) before/after a sample")
+    ap.add_argument("--quiet-wait", type=float, default=900.0,
+                    help="seconds to wait for memory pressure to drop before each sample")
+    ap.add_argument("--max-attempts", type=int, default=3,
+                    help="retries of a repetition that saw memory pressure (last one is kept, flagged)")
     args = ap.parse_args()
     specs = build_specs()
     # a kill/hangup must still run every run's cleanup (finally blocks)
@@ -518,15 +550,26 @@ def main() -> int:
         for n in args.sessions:
             vals = []
             for rep in range(1, args.reps + 1):
-                check_live_daemons(live)
-                res = run_tool(spec, n, args.timeout, args.settle)
-                check_live_daemons(live)
+                for attempt in range(1, args.max_attempts + 1):
+                    before = wait_quiet(args.max_psi, args.quiet_wait)
+                    check_live_daemons(live)
+                    res = run_tool(spec, n, args.timeout, args.settle)
+                    check_live_daemons(live)
+                    after = mem_pressure()
+                    res.update({"pressure_before": before, "pressure_after": after, "attempt": attempt})
+                    quiet = max(before.get("psi_some_avg10", 0), after.get("psi_some_avg10", 0)) <= args.max_psi
+                    res["quiet"] = quiet
+                    if quiet:
+                        break
+                    print(f"  {n:>2} session(s) rep {rep}: memory pressure during sample "
+                          f"({before} -> {after}), retrying", flush=True)
                 res["rep"] = rep
                 payload["runs"].append(res)
                 vals.append(res["mem_mb"])
                 print(f"  {n:>2} session(s) rep {rep}: {res['mem_mb']:7.1f} MB  "
                       f"(pss {res['pss_mb']} + swap {res['swap_pss_mb']}) "
                       f"procs={res['process_count']} outside-tree={res['outside_tree_mem_mb']} MB "
+                      f"psi={res['pressure_after'].get('psi_some_avg10')}{'' if res['quiet'] else ' PRESSURED'} "
                       f"ready={res['ready']}/{n} :: {res['excerpt']}", flush=True)
             med = round(statistics.median(vals), 1)
             payload["summary"].append({"tool": name, "sessions": n, "median_mem_mb": med, "raw_mem_mb": vals})
