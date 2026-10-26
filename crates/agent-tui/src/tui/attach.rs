@@ -513,6 +513,12 @@ pub async fn run_attached(mut opts: AttachOpts) -> Result<()> {
     for n in notices.transcript {
         app.push_msg(ChatMessage::System(n));
     }
+    // Same first-run guidance as the in-process boot: a new user's first
+    // `synaps` lands here (daemon mode is the default), and without it the
+    // first message fails with a token-refresh error.
+    if let Some(n) = super::run_setup::no_credentials_notice() {
+        app.push_msg(ChatMessage::System(n));
+    }
     if !notices.toast.is_empty() {
         app.toasts.upsert(
             super::toast::Toast::new(ATTACH_TOAST_ID, String::new())
