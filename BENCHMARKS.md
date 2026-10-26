@@ -103,8 +103,8 @@ GitHub Copilot CLI.
 ## Prompt cache
 
 Not a harness run: telemetry from real use. It covers every Anthropic request
-Synaps made on the maintainer's two machines from Apr 12 to Oct 25, 2026, main
-sessions and subagents. The full report, charts and per-release, per-month
+Synaps made on the maintainer's two machines from v0.8.0 (Aug 4) to Oct 25,
+2026, main sessions and subagents. The full report, charts and per-release, per-month
 numbers are in
 [`benchmarks/prompt-cache/`](benchmarks/prompt-cache/README.md).
 
@@ -112,10 +112,10 @@ numbers are in
 |---|---|
 | Prompt tokens served from cache | **97.9%** (median request 99.4%) |
 | Requests | 127,453 (43.7k main sessions, 81.9k subagents) |
-| Tokens read from cache | 27.35B (43.2B since Apr 12) |
-| Share of the prompt re-written | 2.1% (13.9% before v0.8.0) |
+| Tokens read from cache | 27.35B |
+| Share of the prompt re-written | 2.1% |
 | List-price equivalent, with / without cache | $14.3k / $137.7k (89.6% cheaper) |
-| Every release since v0.8.0 | 97.1% – 98.4% |
+| Every release | 97.1% – 98.4% |
 
 The dollar figures are list-price equivalents, not money spent.
 

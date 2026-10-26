@@ -171,13 +171,11 @@ maintainer's two machines since v0.8.0 (Aug 4 → Oct 25, 2026).
 | Requests | 127,453, nearly two thirds of them subagents |
 | Tokens read from cache | **27.35B** |
 | List-price equivalent, with / without cache | $14.3k / $137.7k: **89.6% cheaper** |
-| Every release since v0.8.0 | 97.1% – 98.4% |
+| Every release | 97.1% – 98.4% |
 
 ![weekly prompt-cache hit rate](benchmarks/prompt-cache/charts/1-weekly-hit-rate.png)
 
-The May–August dip was a bug: per-turn context was appended to the system prompt, which
-re-wrote the whole cached conversation on every turn. v0.8.0 fixed it. Full
-report, method and per-release numbers in
+Full report, method and per-release numbers in
 [`benchmarks/prompt-cache/`](benchmarks/prompt-cache/README.md).
 
 ## Modes
