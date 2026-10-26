@@ -1,7 +1,8 @@
 # Benchmarks
 
 How Synaps measures startup latency and memory footprint, how to reproduce it,
-and what the numbers were on the reference machine.
+and what the numbers were on the reference machine. Prompt-cache hit rates from
+real use are in [`benchmarks/prompt-cache/`](benchmarks/prompt-cache/).
 
 The harnesses live in [`benchmarks/`](benchmarks/). Methodology and portions of
 their source are adapted from [jcode](https://github.com/1jehuang/jcode)'s
@@ -14,6 +15,9 @@ benchmark scripts (MIT, Jeremy Huang) — see [`benchmarks/NOTICE`](benchmarks/N
 - **~3.3 MB per additional session** — the daemon amortizes hard.
 - On the reference machine, at 10 concurrent sessions Synaps used **less RAM
   than every other harness tested**, including jcode.
+- **97.9% of prompt tokens served from the Anthropic prompt cache** since
+  v0.8.0, over 127k real requests (median request 99.4%). See
+  [Prompt cache](#prompt-cache).
 
 ## Methodology
 
@@ -96,6 +100,27 @@ daemon is why: sessions share one runtime, so the marginal cost of a session is
 a thin client. Not shown (not installed on the reference machine): `cursor-agent`,
 GitHub Copilot CLI.
 
+## Prompt cache
+
+Not a harness run: telemetry from real use. It covers every Anthropic request
+Synaps made on the maintainer's two machines from Apr 12 to Oct 25, 2026, main
+sessions and subagents. The full report, charts and per-release, per-month
+numbers are in
+[`benchmarks/prompt-cache/`](benchmarks/prompt-cache/README.md).
+
+| since v0.8.0 (Aug 4 → Oct 25, 2026) | |
+|---|---|
+| Prompt tokens served from cache | **97.9%** (median request 99.4%) |
+| Requests | 127,453 (43.7k main sessions, 81.9k subagents) |
+| Tokens read from cache | 27.35B (43.2B since Apr 12) |
+| Share of the prompt re-written | 2.1% (13.9% before v0.8.0) |
+| List-price equivalent, with / without cache | $14.3k / $137.7k (89.6% cheaper) |
+| Every release since v0.8.0 | 97.1% – 98.4% |
+
+The dollar figures are list-price equivalents, not money spent.
+
+![weekly prompt-cache hit rate](benchmarks/prompt-cache/charts/1-weekly-hit-rate.png)
+
 ## Caveats (read these)
 
 - **Single machine.** Cross-machine comparison to any vendor's *published*
@@ -109,3 +134,6 @@ GitHub Copilot CLI.
   scale with sessions. The "with extensions" row shows a 3-extension config.
 - **What is *not* measured here:** time-to-first-token, cost-per-task, and task
   success. First-frame latency and idle RAM are necessary, not sufficient.
+- **The prompt-cache numbers are one heavy user's workload** (daily
+  development of Synaps itself, mostly Claude, many subagents). Your hit rate
+  depends on how you work: long pauses past the cache TTL cost a rebuild.
