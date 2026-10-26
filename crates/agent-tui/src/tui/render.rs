@@ -4,6 +4,8 @@ use ratatui::{
     text::{Line, Span},
 };
 
+mod subagent_card;
+
 use super::app::SPINNER_FRAMES;
 use super::draw::{bash_trace, format_tool_name, tool_accent};
 use super::highlight::{
@@ -884,9 +886,21 @@ impl TranscriptStore {
                 // Detect which tool produced this result (bound once for reuse below)
                 let preceding_tool = self.find_preceding_tool_name(i);
 
+                // subagent_* results are model-facing JSON: show the user a
+                // human card instead (display-only; `content` is untouched).
+                let human_card = if is_timeout || is_error {
+                    None
+                } else {
+                    preceding_tool.as_deref().and_then(|tool| {
+                        subagent_card::tool_result_card(tool, result, m, width, i, |h| {
+                            self.subagent_facts(h)
+                        })
+                    })
+                };
+
                 // Check if this is read tool output (line-numbered) and try syntax highlighting
                 // Skip fancy highlighting for timeouts — render everything in warning style
-                let highlighted_lines = if is_timeout || is_error {
+                let highlighted_lines = if is_timeout || is_error || human_card.is_some() {
                     None
                 } else if is_read_tool_output(&result_lines) {
                     let ext = self.find_preceding_read_extension(i);
@@ -902,7 +916,32 @@ impl TranscriptStore {
                 // tool output verbatim) and both highlight paths emit exactly
                 // one row per source line, so src_line == the enumeration
                 // index; wrapped plain rows all map to their source line.
-                if let Some(hl_lines) = highlighted_lines {
+                if let Some(card) = human_card.as_ref() {
+                    // A transformed view of the whole JSON result: every row
+                    // maps ContentLine onto it (lock L2: never Content).
+                    let cap = if self.show_full_output() { card.len() } else { 12 };
+                    for l in card.iter().take(cap) {
+                        lines.push_meta(
+                            clamp_line(l.clone(), width),
+                            LineMeta::ContentLine {
+                                msg_idx: i,
+                                src_line: 0,
+                            },
+                        );
+                    }
+                    if card.len() > cap {
+                        lines.push_meta(
+                            Line::from(Span::styled(
+                                format!("{}       +{} lines", m, card.len() - cap),
+                                Style::default().fg(THEME.load().muted),
+                            )),
+                            LineMeta::ContentLine {
+                                msg_idx: i,
+                                src_line: 0,
+                            },
+                        );
+                    }
+                } else if let Some(hl_lines) = highlighted_lines {
                     if !is_error && !is_timeout {
                         for (li, hl_line) in hl_lines.into_iter().enumerate() {
                             let dimmed_spans: Vec<Span> = hl_line
@@ -966,7 +1005,7 @@ impl TranscriptStore {
                         }
                     }
                 }
-                if result_lines.len() > show {
+                if human_card.is_none() && result_lines.len() > show {
                     // D4 (as locked): the "+N lines" truncation row stands in
                     // for the hidden tail — ContentLine anchored at the first
                     // hidden source line; slice (d)'s copy path reads a
@@ -1045,14 +1084,17 @@ impl TranscriptStore {
                         };
                         // A tool that printed nothing still ends: say so
                         // rather than leave its card open-ended (#287).
-                        let summary = if result_lines.is_empty() {
-                            "no output".to_string()
+                        let summary = if human_card.is_some() {
+                            // The card already says what happened.
+                            String::new()
+                        } else if result_lines.is_empty() {
+                            " (no output)".to_string()
                         } else {
-                            format!("{} lines", result_lines.len())
+                            format!(" ({} lines)", result_lines.len())
                         };
                         lines.push(Line::from(vec![
                             Span::styled(
-                                format!("{}     \u{2514}\u{2500} ok ({})", m, summary),
+                                format!("{}     \u{2514}\u{2500} ok{}", m, summary),
                                 Style::default().fg(THEME.load().tool_result_ok),
                             ),
                             Span::styled(
