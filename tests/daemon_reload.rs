@@ -801,3 +801,35 @@ async fn the_session_start_wait_yields_to_cancel_and_end() {
 
     SocketTransport::shutdown(&d.paths.sock, true).await.unwrap();
 }
+
+/// `daemon rename` survives `daemon reload`: the name was saved durably, so
+/// the rehydrated session lists it and the file still carries it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_rename_survives_a_reload() {
+    let guard = HomeGuard::new();
+    let (url, _hits, _) = spawn_stub(Script::Sse(ANTHROPIC_SSE)).await;
+    let d = spawn_daemon(&guard, &url).await;
+    let (mut t, snap) = attach_create(&d.paths, guard.home.path()).await;
+    let sid = t.session_id().clone();
+    let journal = snap.meta.journal_id.clone();
+    one_turn(&mut t, "hello").await;
+    let r = SocketTransport::rename(&d.paths.sock, &sid, Some("reload-proof"), Some(None)).await.unwrap();
+    assert!(r.is_ok(), "{r:?}");
+
+    assert_eq!(SocketTransport::reload(&d.paths.sock, true, None, None).await.expect("reload"), 2);
+    tokio::time::timeout(Duration::from_secs(15), t.reconnect(AttachMode::Mirror))
+        .await
+        .expect("reconnect budget")
+        .expect("reconnected");
+    let m = SocketTransport::sessions(&d.paths.sock)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|m| m.id == sid)
+        .expect("rehydrated");
+    assert_eq!(m.name.as_deref(), Some("reload-proof"));
+    let file = guard.base_dir().join("sessions").join(format!("{journal}.json"));
+    let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(file).unwrap()).unwrap();
+    assert_eq!(v["name"], "reload-proof");
+}
