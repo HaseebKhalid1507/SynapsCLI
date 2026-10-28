@@ -1095,6 +1095,7 @@ mod cold_resume_tests {
             model: "anthropic/claude-opus-5-5".into(),
             system_prompt: "be a builder".into(),
             timeout_secs: 3600,
+            cwd: None,
         }
     }
 

@@ -885,6 +885,7 @@ mod tests {
             model: "anthropic/claude-opus-5-5".into(),
             system_prompt: "archived system".into(),
             timeout_secs: 3500,
+            cwd: None,
         };
         let old_anchor = std::time::SystemTime::now() - Duration::from_secs(3600);
         let old_ms = old_anchor
@@ -958,6 +959,7 @@ mod tests {
                 model: "model".into(),
                 system_prompt: "system".into(),
                 timeout_secs: 1,
+                cwd: None,
             });
             s.archive_error = Some("archive write failed".into());
             s.finalization_ready = true;
