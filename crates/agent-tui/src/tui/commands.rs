@@ -1809,6 +1809,22 @@ mod tests {
         }
     }
 
+    /// The fixture interpreter. Windows has no `python3`, and a bare `python`
+    /// may be the Store alias stub: take the first real `python.exe` on PATH,
+    /// as `tests/daemon_reload.rs` does.
+    fn fixture_python() -> String {
+        if cfg!(windows) {
+            let path = std::env::var("PATH").unwrap_or_default();
+            path.split(';')
+                .map(|d| std::path::Path::new(d.trim().trim_matches('"')).join("python.exe"))
+                .find(|p| p.is_file() && !p.to_string_lossy().contains("WindowsApps"))
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "python".into())
+        } else {
+            "python3".into()
+        }
+    }
+
     #[tokio::test]
     async fn interactive_plugin_command_invocation_pushes_output_and_updates_tasks() {
         let bus = Arc::new(synaps_cli::extensions::hooks::HookBus::new());
@@ -1821,7 +1837,7 @@ mod tests {
             deferred: None,
             protocol_version: 1,
             runtime: synaps_cli::extensions::manifest::ExtensionRuntime::Process,
-            command: "python3".to_string(),
+            command: fixture_python(),
             setup: None,
             prebuilt: ::std::collections::HashMap::new(),
             args: vec!["tests/fixtures/interactive_command_extension.py".to_string()],
