@@ -689,6 +689,7 @@ mod gate_tests {
 /// | `ESC [ ? u`     | kitty keyboard protocol flags          | `CSI ? flags u`         |
 /// | `ESC [ > c`     | DA2 (secondary device attributes)      | `CSI > … c` (skipped)   |
 /// | `ESC [ c`       | **DA1 — the fence**                    | `CSI ? … c`             |
+#[cfg_attr(not(unix), allow(dead_code))] // the burst is negotiated on Unix only
 pub const QUERY_BURST: &[u8] = b"\x1b[>0q\x1b[?2026$p\x1b[?2027$p\x1b[?u\x1b[>c\x1b[c";
 
 /// Hard deadline for the whole reply read. Local terminals answer DA1 in
@@ -699,6 +700,7 @@ pub const BURST_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(
 
 /// Write the query burst to `w` and flush. Split out (and generic) so the
 /// vt100 tests can capture the exact bytes production emits.
+#[cfg_attr(not(unix), allow(dead_code))]
 pub fn write_query_burst<W: std::io::Write>(w: &mut W) -> std::io::Result<()> {
     w.write_all(QUERY_BURST)?;
     w.flush()
@@ -709,6 +711,7 @@ pub fn write_query_burst<W: std::io::Write>(w: &mut W) -> std::io::Result<()> {
 /// `da1` is the fence: [`TermCaps::merge_burst`] applies **nothing** unless it
 /// is set — partial (unfenced) replies are discarded wholesale, so the timeout
 /// path degenerates to "env caps unchanged".
+#[cfg_attr(not(unix), allow(dead_code))]
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct BurstReplies {
     /// DA1 reply (`CSI ? … c`) observed — the fence.
@@ -725,6 +728,7 @@ pub struct BurstReplies {
 
 /// DECRPM value ⇒ "the terminal supports this mode". 1/2/3 are supported
 /// (set, resettable, permanently set); 0/4 are not.
+#[cfg_attr(not(unix), allow(dead_code))]
 fn decrpm_supported(v: u8) -> bool {
     matches!(v, 1..=3)
 }
@@ -735,6 +739,7 @@ fn decrpm_supported(v: u8) -> bool {
 /// keystroke racing the burst) are skipped; DCS payloads (the XTVERSION
 /// reply) are skipped to their `ST` terminator; a truncated trailing sequence
 /// is ignored (the caller re-parses as more bytes arrive).
+#[cfg_attr(not(unix), allow(dead_code))]
 pub fn parse_burst_replies(buf: &[u8]) -> BurstReplies {
     let mut out = BurstReplies::default();
     let mut i = 0;
@@ -778,6 +783,7 @@ pub fn parse_burst_replies(buf: &[u8]) -> BurstReplies {
 
 /// Classify one complete CSI sequence (`body` = bytes between `ESC [` and the
 /// final byte).
+#[cfg_attr(not(unix), allow(dead_code))]
 fn classify_csi(body: &[u8], final_byte: u8, out: &mut BurstReplies) {
     match final_byte {
         // DA1 reply: CSI ? … c  (DA2 replies are `CSI > … c` — ignored)
@@ -812,6 +818,7 @@ impl TermCaps {
     ///   a terminal that answers DA1 but ignores DECRQM entirely leaves
     ///   `sync_output` at its harmless default-true (terminals that don't
     ///   support 2026 ignore the bracket anyway — this is log-honesty).
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub fn merge_burst(&mut self, replies: &BurstReplies) {
         if !replies.da1 {
             return;
