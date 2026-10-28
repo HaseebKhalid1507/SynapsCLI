@@ -48,7 +48,7 @@ synaps daemon purge                  # Purge frame → memstat::purge_arenas() i
 synaps daemon reload [--now] [--drain-secs N] [--exe PATH] [--json]   # re-exec in place, same pid (C3; §Reload below)
 synaps daemon close <ID|NAME> [--force] [--attached] [--json]   # end one session without attaching (§Closing a session); exit 0/1/2/3
 synaps daemon pin <ID|NAME> [--off] [--json]       # pin/unpin one session without attaching (§Pinning a session); exit 0/1/2/3
-synaps daemon rename <ID|NAME> <NEW_NAME> | --clear [--json]   # name/unname one session without attaching (§Renaming a session); exit 0/1/2/3
+synaps daemon rename <ID|NAME> <NEW_NAME> | --clear [--force] [--json]   # name/unname one session without attaching (§Renaming a session); exit 0/1/2/3
 synaps daemon reload-extension <NAME> [--json]     # restart one extension in place, sessions untouched (§Reloading one extension); exit 0/1/2/3
 synaps attach [ID] [--create] [--continue NAME_OR_ID] [-s PROMPT] [--observe|--takeover] [--keep-warm] [--as NAME]
 synaps --attach [ID] [--observe|--takeover] [--keep-warm] [--no-confirm-answers] [--as NAME]   # thin TUI client over the socket (phase 4); starts the daemon if none is running
@@ -186,35 +186,56 @@ loaded (a long-lived worker host, an inbox other tools write to) is **pinned**:
 ## Renaming a session (`daemon rename`)
 
 `/saveas <name>` names the session (input owner only; an observer is told it is
-read-only). **`synaps daemon rename <ID|NAME> <NEW_NAME>`** (or `--clear`) does
-the same from any shell, without attaching: renaming is metadata, not input,
-so it needs no input ownership, and since the control connection never
-attaches, presence (clients, input owner, which client claims the shared
+read-only). **`synaps daemon rename <ID|NAME> <NEW_NAME> | --clear [--force]
+[--json]`** does it from any shell, without attaching: renaming is metadata,
+not input, so it needs no input ownership, and since the control connection
+never attaches, presence (clients, input owner, which client claims the shared
 inbox) does not change. Meant for tools such as an extension that auto-names
 unnamed sessions.
 
+**Rename never silently replaces a name.** A session that already has a name
+is refused (`named`, exit 3) unless `--force`; `--clear` on a named session
+needs `--force` too. The CLI sends the name it saw in the listing as the
+frame's `expect`, which the session checks atomically, so a name the user sets
+(`/saveas`) between the listing and the rename still wins, even with
+`--force`. An auto-namer should never pass `--force`.
+
 - The target resolves like `daemon close`'s (id, id prefix, journal id, or the
   current name). The daemon sends the session the host-only engine command
-  `rename`, which runs `/saveas`'s own path in the actor: `validate_name`
+  `rename` (JSON args; a plain-text `/rename foo` typed in-process is refused:
+  use `/saveas`). The session applies `/saveas`'s rules: `validate_name`
   (`[a-z0-9-]{1,40}`), unique across the sessions directory, no clash with a
-  chain name, save, `sync_name` (the listing, the pin book and the
-  `run/<sid>.json` card) and a `Conversation` to every attached client, so a
-  TUI or an observer shows the new name at once. A blank name clears it.
-- **A parked session is not woken**: it is refused with `parked` (exit 3). It
-  holds no conversation in memory and has released its journal lock, so
-  renaming it would mean rebuilding its runtime (MCP servers, extensions) for a
-  metadata change. Rename it once it is live again (attach, or `daemon pin`).
-  The actor refuses a host `rename` while parked too, so a park that lands
-  between the daemon's check and the command does not wake it either.
-- Answers: `renamed{session_id, name}`, or `rename_failed{session_id, reason,
-  message, taken_by}` with `reason` one of `invalid`, `taken` (`taken_by` names
-  the saved session holding it), `chain_conflict`, `parked`, `locked` (live in
-  another process), `failed`.
-- Exit codes: 0 renamed or cleared; 3 refused (parked, live in another
-  process, daemon reloading); 1 invalid name, name taken, chain conflict, no
-  such session, ambiguous, prefix too short, no daemon, timeout; 2 the daemon
-  predates `daemon rename` (`synaps daemon reload`) or a protocol mismatch.
-  `--json` prints `{ok, session_id, outcome, name, taken_by, text}`.
+  chain name. A process-wide lock covers the check through the save, so two
+  sessions of this daemon can never take the same name at once (other
+  processes are covered by journal locks).
+- **A live session** saves durably (`save_durable`), then puts the file
+  mtimes of `<id>.json` (and `<id>.journal`) back: a rename is not activity,
+  so `synaps --continue` (newest mtime) and the `/sessions` order do not
+  change. Then the listing, the `run/<sid>.json` card and a pinned session's
+  pin-book entry (verbatim: a cleared name stops resolving) are updated, and
+  every attached client, observers included, gets a `Conversation` with the
+  new name. A failed save is reported (`failed`) and rolled back. A session
+  created with `persist: false` gets the name in memory only (the reply says
+  `in_memory_only`); a live session whose journal lock this daemon does not
+  hold is refused (`locked`).
+- **A parked session is renamed on disk and not woken**: under its journal
+  lock (`session_catalog::rename_past_session`, the same primitive the
+  session picker uses), with a durable save that leaves `updated_at` and the
+  mtime alone. If another process holds the journal (an in-process
+  `--continue`), it is `locked`. On unpark the name comes from the file.
+- Answers: `renamed{session_id, name, in_memory_only?}`, or
+  `rename_failed{session_id, reason, message, taken_by?, current_name?}` with
+  `reason` one of `invalid`, `taken` (`taken_by` is the holder's journal id,
+  e.g. `20261028-045932-eb8e`), `chain_conflict`, `named` (`current_name`),
+  `locked`, `busy` (queue full, daemon reloading: retry), `unknown` (no answer
+  in time: it may still apply, **re-list before retrying**), `failed`.
+- Exit codes: 0 renamed or cleared; 3 refused or not applied right now
+  (`named` without `--force`, `locked`, `busy`, `unknown`); 1 invalid name,
+  name taken, chain conflict, failed, no such session, ambiguous, prefix too
+  short, no daemon; 2 the daemon predates `daemon rename` (`synaps daemon
+  reload`), a protocol mismatch, or a usage error (a blank `NEW_NAME` is one:
+  use `--clear`). `--json` prints `{ok, session_id, outcome, name, taken_by,
+  text}`; `name` is the name afterwards, or the current name for `named`.
 - An attached client cannot send `rename` (neither the control frame nor the
   engine command): it has `/saveas`.
 
@@ -365,7 +386,7 @@ D: {"type":"welcome", protocol_version, daemon_version, pid, profile, sessions:[
 C: ping | sessions | shutdown{force}          → D: pong{pid,uptime_s,sessions} | session_list{sessions} | bye   (no session allocated)
 C: close{session_id, force, attached}         → D: closed{session_id, text} | refused{busy|unknown_session} (→ daemon closes) | error
 C: pin{session_id, on}                        → D: pinned{session_id, on} | refused{busy|unknown_session} (→ daemon closes) | error
-C: rename{session_id, name?}                  → D: renamed{session_id, name} | rename_failed{session_id, reason, message, taken_by?} | refused{busy|unknown_session} (→ daemon closes) | error
+C: rename{session_id, name?, expect?}         → D: renamed{session_id, name, in_memory_only?} | rename_failed{session_id, reason, message, taken_by?, current_name?} | refused{unknown_session} (→ daemon closes)
 C: reload_extension{extension}                → D: extension_reloaded{report} | extension_reload_failed{extension, message, unloaded} | refused{busy} (→ daemon closes)
 C: {"type":"attach", attach:"existing", session_id, mode} | {"type":"attach", attach:"create", config:SessionConfig, mode}
 D: {"type":"attached", client, meta, view, conversation, streaming, replay:[WireEnvelope], pending_prompts, clients} | error
@@ -421,7 +442,8 @@ C: bye | socket close = Detach (turn keeps running)
 - `pin` (`on` required) follows the same rule: an older daemon answers "unknown variant `pin`" and
   `synaps daemon pin` exits 2; `pinned` only answers `pin`; refused on an attached connection (that
   client has `/pin`). `SessionMeta.pinned` is `#[serde(default)]`: an older daemon omits it (→ false).
-- `rename` (`name` optional, absent = clear) follows the same rule: an older daemon answers "unknown
+- `rename` (`name` optional, absent = clear; `expect` optional: absent = no precondition, `null` = only
+  if unnamed, `"x"` = only if named `x`) follows the same rule: an older daemon answers "unknown
   variant `rename`" at once (no hang) and `synaps daemon rename` reports "daemon … predates `daemon
   rename`; run `synaps daemon reload`" (exit 2); `renamed`/`rename_failed` only answer it; refused on
   an attached connection (that client has `/saveas`). Its replies use `RENAME_QUERY_ID_BASE`+n.
