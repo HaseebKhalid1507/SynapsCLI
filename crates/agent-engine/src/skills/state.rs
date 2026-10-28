@@ -134,10 +134,12 @@ impl PluginsState {
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         // Atomic write via unique temp file + rename (avoids concurrent trampling)
         let parent = path.parent().unwrap_or(Path::new("."));
-        let tmp = tempfile::NamedTempFile::new_in(parent)?;
-        std::fs::write(tmp.path(), json)?;
-        // fsync before rename so data is durable on power loss
-        std::fs::File::open(tmp.path()).and_then(|f| f.sync_all())?;
+        let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
+        std::io::Write::write_all(&mut tmp, json.as_bytes())?;
+        // fsync before rename so data is durable on power loss. Through the
+        // temp file's own handle: Windows refuses to flush a read-only one
+        // ("Access is denied"), which failed every plugins.json save there.
+        tmp.as_file().sync_all()?;
         tmp.persist(path).map_err(|e| e.error).map(|_| ())
     }
 
