@@ -6,6 +6,13 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **`synaps daemon rename <ID|NAME> <NEW_NAME>`** (or `--clear`) names a
+  daemon session from any shell without attaching, so a tool can name a
+  session it only observes. Same rules as `/saveas`; attached clients see the
+  name at once. A parked session is renamed on disk without being woken. It
+  never replaces a name unless `--force`, never moves a session to the top of
+  `--continue` or `/sessions`, and two sessions can't take one name at once.
+  [docs/daemon-mode.md](docs/daemon-mode.md#renaming-a-session-daemon-rename)
 - **`api-log.jsonl` joins sessions and the request trace.** Each record
   carries `session_id`, the persisted conversation id that
   `synaps daemon sessions` shows, and `runtime_session_id`, `turn_id` and

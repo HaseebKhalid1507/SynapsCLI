@@ -2013,4 +2013,7 @@ pub trait PinSink: Send + Sync {
     /// A pinned session's journal changed (`/clear`, a successor compaction,
     /// resume): the entry follows it.
     fn moved(&self, from: &str, to: &str);
+    /// A pinned session was renamed (`/saveas`, `daemon rename`): its entry
+    /// takes `name` verbatim, so a cleared name stops resolving.
+    fn renamed(&self, journal_id: &str, name: Option<&str>);
 }

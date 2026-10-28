@@ -474,6 +474,15 @@ fn is_close_command(cmd: &SessionCommand) -> bool {
     matches!(cmd, SessionCommand::EngineCommand { name, .. } if name == CLOSE_COMMAND)
 }
 
+/// The host-only engine command behind `synaps daemon rename`
+/// (`SessionActor::host_rename`; JSON args, `RenameArgs`). Clients rename
+/// with `saveas`.
+pub(crate) const RENAME_COMMAND: &str = "rename";
+
+fn is_rename_command(cmd: &SessionCommand) -> bool {
+    matches!(cmd, SessionCommand::EngineCommand { name, .. } if name == RENAME_COMMAND)
+}
+
 fn command_name(cmd: &SessionCommand) -> &'static str {
     match cmd {
         SessionCommand::Submit { .. } => "submit",
@@ -492,6 +501,7 @@ fn command_name(cmd: &SessionCommand) -> &'static str {
         SessionCommand::End { .. } => "end",
         SessionCommand::Resync { .. } => "resync",
         SessionCommand::EngineCommand { name, .. } if name == CLOSE_COMMAND => "close",
+        SessionCommand::EngineCommand { name, .. } if name == RENAME_COMMAND => "rename",
         SessionCommand::EngineCommand { .. } => "engine_command",
         SessionCommand::PluginCommand { .. } => "plugin_command",
         SessionCommand::Resume { .. } => "resume",
@@ -1046,10 +1056,20 @@ impl SessionActor {
 
     pub(crate) fn sync_name(&mut self) {
         let name = self.conv.session.name.clone();
+        self.mirror_name(name);
+    }
+
+    /// Publish a name the session now has on disk (or in memory): handle
+    /// and listing, the `run/<sid>.json` card, and a pinned session's book
+    /// entry (verbatim, so a cleared name stops resolving).
+    pub(crate) fn mirror_name(&mut self, name: Option<String>) {
         self.meta.name = name.clone();
         self.name.store(Arc::new(name.clone()));
         if self.keep_warm {
-            self.note_pin();
+            if let Some(sink) = self.host.pin_sink() {
+                let journal = (**self.journal_id.load()).clone();
+                sink.renamed(&journal, name.as_deref());
+            }
         }
         if let Err(e) = self.background.update_session_name(name.as_deref()) {
             tracing::warn!(session = %self.id, "registry name update failed: {e}");
@@ -2708,6 +2728,11 @@ impl SessionActor {
         runtime.restore_tool_activations(std::mem::take(&mut self.parked_tool_activations));
         self.runtime.unpark_set(runtime);
         self.conv.unpark_set(conv);
+        // The name comes from disk: a rename while parked wrote it there.
+        if self.meta.name != self.conv.session.name {
+            let name = self.conv.session.name.clone();
+            self.mirror_name(name);
+        }
         // A fresh runtime: whether its grant took effect is its own.
         self.memory_seen_active = false;
         self.observe_memory();
@@ -5149,6 +5174,16 @@ impl SessionActor {
         use std::ops::ControlFlow;
         let Addressed { from, cmd } = addressed;
         if let Some(c) = from {
+            // `rename` is the daemon's control-connection rename; an
+            // attached client has `/saveas` (owner only).
+            if is_rename_command(&cmd) {
+                self.emit(SessionEventWire::Refused {
+                    client: c,
+                    command: command_name(&cmd).to_string(),
+                    reason: "rename is host-only; use /saveas".into(),
+                });
+                return ControlFlow::Continue(());
+            }
             // Only the daemon's reload sends a reload checkpoint (it stops
             // every worker and fences the session for the exec after it).
             if matches!(cmd, SessionCommand::Checkpoint { reason: CheckpointReason::Reload }) {
@@ -5173,6 +5208,19 @@ impl SessionActor {
         // the daemon reports it failed). The wake sources are fenced in the
         // select loop; commands are fenced here.
         if self.reload_fence.is_some() && cmd.refused_while_reloading() {
+            // A host rename answers its caller only, never the whole room.
+            if let SessionCommand::EngineCommand { id, name, .. } = &cmd {
+                if name == RENAME_COMMAND {
+                    self.emit(SessionEventWire::QueryResult {
+                        id: *id,
+                        value: serde_json::json!({
+                            "kind": "error", "code": "busy",
+                            "text": "daemon reloading; retry in a moment",
+                        }),
+                    });
+                    return ControlFlow::Continue(());
+                }
+            }
             let reason = super::RELOADING_REFUSAL.to_string();
             match from {
                 Some(c) => self.emit(SessionEventWire::Refused {
@@ -5191,6 +5239,16 @@ impl SessionActor {
             if is_input_command(&cmd) && !matches!(cmd, SessionCommand::KeepWarm { .. }) {
                 self.note_input(c);
             }
+        }
+        // A host rename (`synaps daemon rename`): handled here for live and
+        // parked sessions alike. A parked one is renamed on disk and NOT
+        // woken (`host_rename`), so this runs before the B3 wake below.
+        if is_rename_command(&cmd) {
+            if let SessionCommand::EngineCommand { id, arg, .. } = cmd {
+                let value = self.host_rename(&arg).await;
+                self.emit(SessionEventWire::QueryResult { id, value });
+            }
+            return ControlFlow::Continue(());
         }
         // B3: anything that needs the runtime wakes a parked session first.
         if self.is_parked() {
