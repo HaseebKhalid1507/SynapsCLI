@@ -13,7 +13,7 @@ All notable changes to this project will be documented in this file.
   proxy, with a custom CA bundle (`SSL_CERT_FILE`/`SSL_CERT_DIR`) or a
   custom `SYNAPS_ANTHROPIC_BASE_URL`; `SYNAPS_GZIP_REQUEST_BODIES=0` turns
   it off. If the API refuses a compressed body, the request is resent
-  uncompressed and gzip stays off for the rest of the process.
+  uncompressed and gzip stays off for the rest of the process. (#321)
 
 ## [0.11.0] — 2026-10-26
 
