@@ -1130,3 +1130,16 @@ mod noodle_tests {
         assert!(below.contains("Thinking depth"), "{below:?}");
     }
 }
+
+#[cfg(test)]
+mod tests {
+    /// A label wider than the column pushes its value out of line with the
+    /// rest (`Cold resume compact (tokens) 100000`).
+    #[test]
+    fn every_setting_label_fits_the_label_column() {
+        for def in super::super::defs::ALL_SETTINGS {
+            let n = def.label.chars().count();
+            assert!(n <= super::LABEL_W, "{:?} is {n} chars; the label column is {}", def.label, super::LABEL_W);
+        }
+    }
+}
