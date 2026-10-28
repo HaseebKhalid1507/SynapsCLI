@@ -319,7 +319,7 @@ impl Tool for SubagentStartTool {
                                 false,
                             ).await;
 
-                        super::drive::WorkerDrive {
+                        let drive_outcome = super::drive::WorkerDrive {
                             state: Arc::clone(&state_a),
                             tx_events: tx_events_a.clone(),
                             subagent_id,
@@ -330,7 +330,10 @@ impl Tool for SubagentStartTool {
                             task: task_for_timeout,
                         }
                         .run(stream)
-                        .await
+                        .await;
+                        // Date this run's cache for a later resume (cold check).
+                        super::archive::record_cache_anchor(&state_a, runtime.cache_anchor());
+                        drive_outcome
                     });
 
                 match outcome {

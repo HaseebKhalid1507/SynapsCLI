@@ -740,6 +740,10 @@ pub(crate) fn config_row_display(key: &str) -> Option<String> {
             .filter(|h| (1..=cfg::MAX_CACHE_KEEPWARM_HOURS).contains(h))
             .unwrap_or(cfg::DEFAULT_CACHE_KEEPWARM_AUTO_MAX_HOURS)
             .to_string(),
+        "subagent_cold_resume_compact_tokens" => raw_config(key)
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(cfg::DEFAULT_SUBAGENT_COLD_RESUME_COMPACT_TOKENS)
+            .to_string(),
         "context_management.mode" => raw_config(key)
             .and_then(|v| cfg::ContextManagementMode::parse(&v))
             .unwrap_or_default()

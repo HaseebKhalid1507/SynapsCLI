@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- **`subagent_resume` no longer replays a big transcript into an expired
+  cache.** Workers run on the 5-minute cache TTL, so resuming one after a
+  longer wait rewrote its whole history at the cache-write price (measured:
+  250k–715k tokens, up to ~$3.50 a resume). When the prior run's cache has
+  expired and its history is at least `subagent_cold_resume_compact_tokens`
+  (default 100000; `0` turns this off), the worker resumes from one compact
+  message instead: its original task, the last steps of the run, its final
+  report and the new instructions. `full_history: true` forces the full
+  replay. The reply says which happened (`"context": "full" | "compacted"`),
+  and the prior archive is kept, so a full replay stays possible.
+
 ## [0.11.0] — 2026-10-26
 
 Sessions now live in the daemon. Every client attached to a session can
