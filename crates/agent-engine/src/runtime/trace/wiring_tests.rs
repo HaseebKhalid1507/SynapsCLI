@@ -946,4 +946,6 @@ async fn api_log_ttft_after_a_retry_excludes_the_failed_attempt_and_the_backoff(
     assert_eq!(traces.len(), 2, "one trace record per attempt");
     assert_eq!(Some(ttft), traces[1].outcome.timings.first_model_event_ms);
     assert_eq!(record["trace_request_id"], traces[1].request_id.as_str(), "attempts share the request id");
+    assert_eq!(record["attempt"], traces[1].attempt, "the join key's attempt matches the trace's");
+    assert_eq!(traces[0].attempt, 1);
 }
