@@ -33,6 +33,8 @@ struct PriorRun {
     model: String,
     system_prompt: String,
     timeout_secs: u64,
+    /// Directory the prior run worked in, when recorded.
+    cwd: Option<std::path::PathBuf>,
     messages: Vec<crate::SharedMessage>,
 }
 
@@ -69,6 +71,7 @@ fn prior_run(
                             model: h.model.clone(),
                             system_prompt: h.system_prompt.clone(),
                             timeout_secs: h.timeout_secs,
+                            cwd: s.archive_meta.as_ref().and_then(|m| m.cwd.clone()),
                             messages: super::archive::resume_messages(
                                 history.iter().map(|m| m.as_ref().clone()).collect(),
                                 instructions,
@@ -85,11 +88,19 @@ fn prior_run(
         }
         let archive_path = reg.archive_path(prior_handle_id);
         let live = handle.map(|h| {
+            let cwd = h
+                .state
+                .read()
+                .unwrap_or_else(|p| p.into_inner())
+                .archive_meta
+                .as_ref()
+                .and_then(|m| m.cwd.clone());
             (
                 h.agent_name.clone(),
                 h.model.clone(),
                 h.system_prompt.clone(),
                 h.timeout_secs,
+                cwd,
             )
         });
         let legacy = match handle {
@@ -133,13 +144,14 @@ fn prior_run(
             a.error.as_deref().unwrap_or(&a.status)
         )));
     }
-    let (agent_name, model, system_prompt, timeout_secs) = match (live, &archive) {
+    let (agent_name, model, system_prompt, timeout_secs, live_cwd) = match (live, &archive) {
         (Some(live), _) => live,
         (None, Some(a)) => (
             a.meta.agent_name.clone(),
             a.meta.model.clone(),
             a.meta.system_prompt.clone(),
             a.meta.timeout_secs,
+            None,
         ),
         (None, None) => {
             return Err(RuntimeError::Tool(format!(
@@ -148,6 +160,7 @@ fn prior_run(
             )))
         }
     };
+    let cwd = live_cwd.or_else(|| archive.as_ref().and_then(|a| a.meta.cwd.clone()));
     let messages: Vec<crate::SharedMessage> = match (archive, legacy) {
         (Some(a), _) => super::archive::resume_messages(a.history, instructions),
         // Legacy: no archived conversation, only the prior run's text.
@@ -164,6 +177,7 @@ fn prior_run(
         model,
         system_prompt,
         timeout_secs,
+        cwd,
         messages,
     })
 }
@@ -238,6 +252,12 @@ impl Tool for SubagentResumeTool {
         };
 
         let prior = prior_run(registry, &prior_handle_id, explicit_archive, &instructions)?;
+        // The resumed worker keeps the directory it was started in (its
+        // history refers to paths there); else the resuming session's.
+        let mut workspace = super::WorkerWorkspace::from_capabilities(&ctx.capabilities);
+        if let Some(prior_cwd) = prior.cwd.filter(|dir| dir.is_dir()) {
+            workspace.cwd = Some(prior_cwd);
+        }
         let (agent_name, model, system_prompt, initial_messages) = (
             prior.agent_name,
             prior.model,
@@ -294,6 +314,10 @@ impl Tool for SubagentResumeTool {
             model: model.clone(),
             system_prompt: system_prompt.clone(),
             timeout_secs,
+            cwd: workspace
+                .cwd
+                .clone()
+                .or_else(|| std::env::current_dir().ok()),
         });
 
         state.write().unwrap().archive_dir = Some(super::archive::process_dir());
@@ -400,6 +424,7 @@ impl Tool for SubagentResumeTool {
                             memory_backend.as_ref(),
                             session_allow_all.as_ref(),
                             telemetry.as_ref(),
+                            &workspace,
                         );
                         runtime.set_system_prompt(super::compose_system_prompt(
                             system_prompt,
@@ -600,6 +625,7 @@ mod tests {
             model: "anthropic/claude-opus-5-5".into(),
             system_prompt: "archived system".into(),
             timeout_secs: 3500,
+            cwd: None,
         };
         let history: Vec<crate::SharedMessage> = vec![
             Arc::new(json!({"role": "user", "content": "build the plate"})),
@@ -689,6 +715,7 @@ mod tests {
                 model: "model".into(),
                 system_prompt: "system".into(),
                 timeout_secs: 1,
+                cwd: None,
             });
             s.finished_at = None;
         }
@@ -777,6 +804,7 @@ mod tests {
             model: "anthropic/claude-opus-5-5".into(),
             system_prompt: "archived system".into(),
             timeout_secs: 30,
+            cwd: None,
         };
         let path = super::super::archive::write_archive(
             dir.path(),

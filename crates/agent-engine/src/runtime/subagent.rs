@@ -150,6 +150,10 @@ pub struct SubagentArchiveMeta {
     pub model: String,
     pub system_prompt: String,
     pub timeout_secs: u64,
+    /// Working directory the worker ran in, so a resume continues there.
+    /// Absent in archives written before it was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<std::path::PathBuf>,
 }
 
 impl SubagentState {
