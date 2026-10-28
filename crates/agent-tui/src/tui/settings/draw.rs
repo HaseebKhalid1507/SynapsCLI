@@ -771,6 +771,7 @@ pub(crate) fn config_row_display(key: &str) -> Option<String> {
         },
         "compaction_exclude" => list_config_display(key),
         "refusal_retries" => ranged_config_display(key, 0..=u64::from(u32::MAX), 2),
+        "telemetry_log_generations" => ranged_config_display(key, 1..=100, 1),
         "telemetry" => synaps_cli::runtime::telemetry::TelemetryLevel::from_str_key(
             &raw_config(key).unwrap_or_default(),
         )

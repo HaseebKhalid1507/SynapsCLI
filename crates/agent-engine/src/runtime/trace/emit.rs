@@ -260,8 +260,13 @@ impl TraceContext {
 
     /// Context with the given sink and the installation default key path.
     pub fn with_sink(sink: Arc<dyn TraceSink>) -> Self {
-        let session_id = TraceId::new(format!("session-{}-{}", std::process::id(), unix_ms_now()))
-            .expect("generated session id is valid");
+        // `-<seq>`: contexts created in the same millisecond (workers
+        // spawned in one tool batch) still get distinct session ids.
+        static SESSION_SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SESSION_SEQ.fetch_add(1, Ordering::Relaxed);
+        let session_id =
+            TraceId::new(format!("session-{}-{}-{seq}", std::process::id(), unix_ms_now()))
+                .expect("generated session id is valid");
         Self {
             sink,
             session_id,
@@ -531,6 +536,16 @@ impl AttemptClock {
         if self.stream_end_ms.is_none() {
             self.stream_end_ms = Some(self.elapsed_ms());
         }
+    }
+
+    /// First parsed model event, ms after send start (`None` if unobserved).
+    pub fn first_model_event_ms(&self) -> Option<u64> {
+        self.first_model_event_ms
+    }
+
+    /// Stream end, ms after send start; until marked, the time elapsed so far.
+    pub fn stream_end_or_now_ms(&self) -> u64 {
+        self.stream_end_ms.unwrap_or_else(|| self.elapsed_ms())
     }
 
     fn stages(&self) -> TimingStages {

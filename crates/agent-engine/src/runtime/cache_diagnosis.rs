@@ -588,6 +588,7 @@ mod tests {
             trace_path: Some(dir.join("request-trace.jsonl")),
             capacity: 16,
             max_file_bytes: crate::runtime::telemetry::DEFAULT_MAX_FILE_BYTES,
+            max_generations: 1,
             write_delay: None,
             write_gate: None,
         })

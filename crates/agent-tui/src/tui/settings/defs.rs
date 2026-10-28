@@ -445,6 +445,11 @@ define_settings! {
             _ => SettingApply::Local(Err("expected off, basic or full".to_string())),
         };
 
+    "telemetry_log_generations", "Telemetry log generations", Context,
+        EditorKind::Text { numeric: true },
+        "Rotated files kept for api-log.jsonl and request-trace.jsonl, each up to 50 MB: <log>.1 (newest) to <log>.N (1–100, default 1). Takes effect next launch.",
+        |_app, value| whole_number("telemetry_log_generations", value);
+
     // ── Agent ────────────────────────────────────────────────────────────
 
     "subagent.max_concurrent", "Subagents at once", Agent, EditorKind::Text { numeric: true },
@@ -1115,6 +1120,9 @@ mod tests {
             assert!(is_ok(d("refusal_retries", "4")));
             assert!(is_err(d("refusal_retries", "-1")));
             assert!(is_err(d("telemetry", "loud")));
+            assert!(is_ok(d("telemetry_log_generations", "5")));
+            assert!(is_err(d("telemetry_log_generations", "0")));
+            assert!(is_err(d("telemetry_log_generations", "101")));
             assert!(is_ok(d("subagent.max_depth", "3")));
             assert!(is_err(d("subagent.max_depth", "0")));
             assert!(is_err(d("subagent.max_depth", "70000")));

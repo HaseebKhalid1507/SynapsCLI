@@ -4,6 +4,23 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **`api-log.jsonl` joins sessions and the request trace.** Each record
+  carries `session_id`, the persisted conversation id that
+  `synaps daemon sessions` shows, and `runtime_session_id`, `turn_id` and
+  `trace_request_id`, the ids in `request-trace.jsonl` (the runtime id is
+  now `session-<pid>-<ms>-<seq>`, unique per process). Subagent records
+  add `worker_agent`, `worker_handle` (`sa_N`), `parent_session_id` and
+  `parent_runtime_session_id` (`worker` stays); and
+  every record with usage has an estimated `cost_usd` from the shared
+  pricing table, 5m and 1h cache writes at their own rates. All additive.
+- `telemetry_log_generations = N` keeps `N` rotated generations
+  (`.1`..`.N`, 50 MB each) of `api-log.jsonl` and `request-trace.jsonl`.
+  Default 1, as before. Lowering it deletes the extra generations at the
+  next rotation. Rotation is now locked (`<log>.lock`), so two daemon
+  sessions can no longer rotate the same log twice and lose a generation.
+
 ### Changed
 
 - **`subagent_resume` no longer replays a big transcript into an expired
@@ -16,6 +33,14 @@ All notable changes to this project will be documented in this file.
   report and the new instructions. `full_history: true` forces the full
   replay. The reply says which happened (`"context": "full" | "compacted"`),
   and the prior archive is kept, so a full replay stays possible.
+
+### Fixed
+
+- **`ttft_ms` in `api-log.jsonl` read `0`** on nearly every record: it was
+  timed from when the response headers arrived, not from the send.
+  `ttft_ms` and `total_ms` now count from the send, like the request trace;
+  `total_ms` therefore grows by the time to headers. A request with no
+  model event has no `ttft_ms` field (never `0`).
 
 ## [0.11.0] — 2026-10-26
 

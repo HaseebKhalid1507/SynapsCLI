@@ -575,6 +575,9 @@ pub struct Runtime {
     refusal_retries: u32,
     /// Telemetry level for structured per-request API logging (opt-in).
     telemetry_level: crate::runtime::telemetry::TelemetryLevel,
+    /// Rotated generations kept per log (`telemetry_log_generations`), read
+    /// when the session writer starts.
+    telemetry_log_generations: u32,
     /// Session-shared bounded observability writer (Task 11, spec §6.5).
     /// `Some` iff `telemetry_level` is Basic/Full. Cloned runtimes
     /// (subagents) share the same handle — one worker per session, never
@@ -1263,6 +1266,7 @@ impl Runtime {
             api_retries: 3,
             refusal_retries: 2,
             telemetry_level: crate::runtime::telemetry::TelemetryLevel::Off,
+            telemetry_log_generations: crate::runtime::telemetry::DEFAULT_MAX_GENERATIONS,
             telemetry_writer: None,
             trace_ctx: trace::TraceContext::disabled(),
             trace_controls: std::sync::Arc::new(trace::TraceControls::new()),
@@ -2924,6 +2928,7 @@ impl Runtime {
         self.refusal_retries = config.refusal_retries;
         self.telemetry_level =
             crate::runtime::telemetry::TelemetryLevel::from_str_key(&config.telemetry);
+        self.telemetry_log_generations = config.telemetry_log_generations;
         self.sync_observability();
         self.cache_diagnostics = config.cache_diagnostics;
         self.cache_ttl = config.cache_ttl;
@@ -3099,6 +3104,9 @@ impl Runtime {
         crate::runtime::telemetry::WorkerTelemetry {
             level: self.telemetry_level,
             writer: self.telemetry_writer.clone(),
+            parent_session_id: self.session_id.clone(),
+            parent_runtime_session_id: Some(self.trace_ctx.session_id().as_str().to_string()),
+            ..Default::default()
         }
     }
 
@@ -3119,7 +3127,9 @@ impl Runtime {
                 self.trace_ctx = trace::TraceContext::with_sink(Arc::new(
                     crate::runtime::telemetry::WriterTraceSink::new(writer.clone()),
                 ));
-                self.telemetry_writer = Some(writer.clone());
+                // Same writer, tagged: the worker's records carry its agent,
+                // handle and the parent's session id.
+                self.telemetry_writer = parent.worker_writer();
             }
             _ => self.set_telemetry_level(crate::runtime::telemetry::TelemetryLevel::Off),
         }
@@ -3135,7 +3145,10 @@ impl Runtime {
         if self.telemetry_level.enabled() {
             if self.telemetry_writer.is_none() {
                 let writer = crate::runtime::telemetry::TelemetryWriter::new(
-                    crate::runtime::telemetry::WriterOptions::default(),
+                    crate::runtime::telemetry::WriterOptions {
+                        max_generations: self.telemetry_log_generations,
+                        ..Default::default()
+                    },
                 );
                 self.trace_ctx = trace::TraceContext::with_sink(Arc::new(
                     crate::runtime::telemetry::WriterTraceSink::new(writer.clone()),
@@ -3861,6 +3874,15 @@ impl Runtime {
     /// The shared observability writer, when telemetry is enabled.
     pub fn telemetry_writer(&self) -> Option<crate::runtime::telemetry::TelemetryWriter> {
         self.telemetry_writer.clone()
+    }
+
+    /// The writer handle for this runtime's requests: stamps the persisted
+    /// conversation id (`session_id`) on every api-log record, keeping any
+    /// worker identity the handle already carries.
+    pub(crate) fn request_telemetry(&self) -> Option<crate::runtime::telemetry::TelemetryWriter> {
+        self.telemetry_writer
+            .as_ref()
+            .map(|w| w.with_session(self.session_id.clone()))
     }
 
     /// Bounded shutdown flush of the observability writer: stop intake,
@@ -4726,7 +4748,7 @@ impl Runtime {
             trace: self.effective_trace_context(),
             request_correlation: None,
             suppress_stream_deltas: false,
-            telemetry: self.telemetry_writer.clone(),
+            telemetry: self.request_telemetry(),
             // Threads the runtime-scoped gate identity into extension-
             // provider interior tool loops (Task 16).
             tool_session_id: Some(self.host_tool_session.clone()),
@@ -4873,6 +4895,7 @@ impl Clone for Runtime {
             api_retries: self.api_retries,
             refusal_retries: self.refusal_retries,
             telemetry_level: self.telemetry_level,
+            telemetry_log_generations: self.telemetry_log_generations,
             // Shared session observability: clones (subagents) enqueue into
             // the SAME bounded writer and trace context — one worker and one
             // set of session-scoped context IDs per session.

@@ -73,7 +73,6 @@ struct ParseState {
     flushed_partial_tool: bool,
     // ── Telemetry captures ──
     telem_msg_id: Option<String>,
-    telem_ttft: Option<u64>,
     telem_stop_reason: Option<String>,
     telem_usage: telemetry::UsageRecord,
     first_event_seen: bool,
@@ -183,7 +182,6 @@ impl ParseState {
             in_thinking: false,
             flushed_partial_tool: false,
             telem_msg_id: None,
-            telem_ttft: None,
             telem_stop_reason: None,
             telem_usage: telemetry::UsageRecord::default(),
             first_event_seen: false,
@@ -320,14 +318,11 @@ fn process_data_line(line: &str, state: &mut ParseState, ctx: &EventCtx) {
 /// tail paths are uniform. `raw` is the un-parsed data line — `#[serde(other)]`
 /// discards the tag on Unknown events, so the raw line is the only forensics.
 fn process_event(event: AnthropicEvent<'_>, raw: &str, state: &mut ParseState, ctx: &EventCtx) {
-    // First-event capture: the trace timing bucket is unconditional
-    // (Task 8); the telemetry TTFT mirror stays gated as before.
+    // First-event capture (Task 8), unconditional. Feeds the attempt clock,
+    // which both the trace and the telemetry `ttft_ms` read.
     if !state.first_event_seen {
         state.first_event_seen = true;
         state.first_event_elapsed_ms = Some(ctx.request_start.elapsed().as_millis() as u64);
-        if ctx.telemetry_level.enabled() {
-            state.telem_ttft = state.first_event_elapsed_ms;
-        }
     }
 
     match event {
@@ -2270,7 +2265,7 @@ impl ApiMethods {
 
                 let system_bytes = system_prompt.as_ref().map(|s| s.len()).unwrap_or(0);
 
-                let record = telemetry::TelemetryRecord {
+                let mut record = telemetry::TelemetryRecord {
                     ts: telemetry::TelemetryRecord::now_ms(),
                     request_id: telem_request_id,
                     msg_id: state.telem_msg_id,
@@ -2281,9 +2276,13 @@ impl ApiMethods {
                     } else {
                         None
                     },
-                    ttft_ms: state.telem_ttft,
-                    total_ms: request_start.elapsed().as_millis() as u64,
+                    // Both from the attempt clock: measured from send start,
+                    // like the trace timings. Measuring from `request_start`
+                    // (taken once headers arrive) read 0 ms for TTFT.
+                    ttft_ms: clock.first_model_event_ms(),
+                    total_ms: clock.stream_end_or_now_ms(),
                     stop_reason: state.telem_stop_reason,
+                    cost_usd: state.telem_usage.cost_usd(model),
                     usage: state.telem_usage,
                     ratelimit: telem_ratelimit,
                     cache_diag: server_diagnosis.map(|d| telemetry::CacheDiagRecord {
@@ -2299,7 +2298,12 @@ impl ApiMethods {
                     keepwarm: options.keepwarm.is_some(),
                     worker: options.codex_request_role
                         == crate::runtime::openai::catalog::CodexRequestRole::Worker,
+                    ..Default::default()
                 };
+                record.set_correlation(
+                    options.trace.session_id(),
+                    tracer.as_ref().map(|t| t.correlation_ids()),
+                );
                 // Non-blocking enqueue onto the session's bounded writer
                 // (Task 11): overflow or a broken log path is counted by
                 // the writer and can never delay or fail the request.
@@ -3222,13 +3226,13 @@ mod tests {
     fn ttft_set_once_on_first_event() {
         let (mut state, tx, _rx) = harness();
         let ctx = make_ctx(&tx);
-        assert!(state.telem_ttft.is_none());
+        assert!(state.first_event_elapsed_ms.is_none());
         feed(
             &[r#"data: {"type":"message_start","message":{"id":"msg_1"}}"#],
             &mut state,
             &ctx,
         );
-        let first = state.telem_ttft;
+        let first = state.first_event_elapsed_ms;
         assert!(first.is_some());
         assert!(state.first_event_seen);
         std::thread::sleep(std::time::Duration::from_millis(5));
@@ -3240,7 +3244,7 @@ mod tests {
             &ctx,
         );
         assert_eq!(
-            state.telem_ttft, first,
+            state.first_event_elapsed_ms, first,
             "TTFT must not be overwritten by later events"
         );
     }

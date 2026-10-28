@@ -650,7 +650,7 @@ impl Runtime {
             trace: self.trace_ctx.clone(),
             request_correlation: None,
             suppress_stream_deltas: true,
-            telemetry: self.telemetry_writer.clone(),
+            telemetry: self.request_telemetry(),
             tool_session_id: Some(self.host_tool_session.clone()),
             session_tool_set: None,
             request_tools_schema: request_tools_schema.clone(),

@@ -785,6 +785,7 @@ mod codex_ultra_worker_tests {
         let mut parent = crate::Runtime::new_headless();
         parent.install_observability_for_tests(writer);
         parent.set_telemetry_level(TelemetryLevel::Full);
+        parent.set_session_id(Some("20261028-045932-eb8e".into()));
 
         let mut worker = crate::Runtime::new_headless();
         assert_eq!(
@@ -797,7 +798,7 @@ mod codex_ultra_worker_tests {
             &Default::default(),
             None,
             None,
-            Some(&parent.worker_telemetry()),
+            Some(&parent.worker_telemetry().for_worker("spike", "sa_7")),
             &Default::default(),
         );
         assert_eq!(worker.telemetry_level(), TelemetryLevel::Full);
@@ -811,11 +812,19 @@ mod codex_ultra_worker_tests {
         // One writer, not two: what the worker enqueues, the parent's handle
         // flushes.
         worker
-            .telemetry_writer()
+            .request_telemetry()
             .expect("worker records")
             .enqueue_telemetry(TelemetryRecord {
                 ts: 1,
                 worker: true,
+                ..Default::default()
+            });
+        // The parent's own requests carry its persisted conversation id.
+        parent
+            .request_telemetry()
+            .unwrap()
+            .enqueue_telemetry(TelemetryRecord {
+                ts: 2,
                 ..Default::default()
             });
         let out = parent
@@ -823,10 +832,27 @@ mod codex_ultra_worker_tests {
             .unwrap()
             .shutdown(std::time::Duration::from_secs(10));
         assert!(out.is_flushed());
-        assert_eq!(out.stats().written, 1);
-        let line = std::fs::read_to_string(&log).unwrap();
-        assert_eq!(line.lines().count(), 1);
+        assert_eq!(out.stats().written, 2);
+        let text = std::fs::read_to_string(&log).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2);
+        let line = lines[0];
         assert!(line.contains("\"worker\":true"), "{line}");
+        // The worker-tagged handle stamps who made the request and the
+        // parent's ids; the parent's own `session_id` is NOT the worker's.
+        let record: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert_eq!(record["worker_agent"], "spike", "{line}");
+        assert_eq!(record["worker_handle"], "sa_7", "{line}");
+        assert_eq!(record["parent_session_id"], "20261028-045932-eb8e", "{line}");
+        assert_eq!(
+            record["parent_runtime_session_id"],
+            parent.trace_context().session_id().as_str(),
+            "{line}"
+        );
+        assert!(record.get("session_id").is_none(), "{line}");
+        let parent_record: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(parent_record["session_id"], "20261028-045932-eb8e");
+        assert!(parent_record.get("worker_agent").is_none());
     }
 
     #[test]
@@ -868,13 +894,20 @@ mod codex_ultra_worker_tests {
             let capture = source
                 .find("let telemetry = ctx.capabilities.telemetry.clone();")
                 .unwrap();
+            // Labelled with the worker's agent + handle before the spawn.
+            let label = source
+                .find("let telemetry = telemetry.map(|t| t.for_worker(")
+                .unwrap();
             let spawn = source.find("super::spawn_runtime().await").unwrap();
             let policy = source
                 .find("super::apply_subagent_runtime_policy(")
                 .unwrap();
             let pass = policy + source[policy..].find("telemetry.as_ref()").unwrap();
             let stream = source.find("runtime.run_stream").unwrap();
-            assert!(capture < spawn && spawn < pass && pass < stream, "{name}");
+            assert!(
+                capture < label && label < spawn && spawn < pass && pass < stream,
+                "{name}"
+            );
         }
     }
 

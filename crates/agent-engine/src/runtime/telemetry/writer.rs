@@ -17,8 +17,16 @@
 //!   queue; overflow increments a dropped counter (never waits). No awaits,
 //!   no hidden runtime dependency — the worker is a dedicated OS thread, so
 //!   sync contexts can enqueue too.
-//! - **Single-owner writes.** Only the worker thread touches the files, so
-//!   size-capped rotation is concurrency-safe by construction.
+//! - **One worker thread per writer, but not per file.** Within one writer
+//!   only its worker thread touches the files. Several writers can share the
+//!   same files, though: every daemon session runtime starts its own writer
+//!   on `~/.cache/synaps/*.jsonl`, and a TUI or another daemon process can
+//!   overlap. Appends are line-sized `O_APPEND` writes; size-capped rotation
+//!   (stat, shift, rename) runs under an exclusive `flock` on `<log>.lock`
+//!   with a re-stat after acquiring it, so two writers never rotate the same
+//!   file twice. If the lock can't be had within [`ROTATE_LOCK_WAIT`] the
+//!   rotation is skipped (counted, warned once) and the line is appended past
+//!   the cap: an oversized log beats a lost record.
 //! - **Private files.** All paths use the Phase 1 `private_fs` helpers:
 //!   parent `0700`, file `0600`, `O_NOFOLLOW` (a planted symlink is refused,
 //!   never followed).
@@ -39,7 +47,7 @@
 //! `off` disables both. The trace schema is structurally metadata-only, so
 //! this can never silently persist raw content.
 
-use super::TelemetryRecord;
+use super::{RecordStamp, TelemetryRecord};
 use crate::runtime::trace::{RequestTrace, TraceSink};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -53,6 +61,19 @@ pub const DEFAULT_QUEUE_CAPACITY: usize = 1024;
 
 /// Default per-file size cap before rotation (matches the legacy writer).
 pub const DEFAULT_MAX_FILE_BYTES: u64 = 50 * 1024 * 1024;
+
+/// Default rotated generations kept per log: one (`<path>.1`), the
+/// historical behaviour. Raised by the `telemetry_log_generations` config key.
+pub const DEFAULT_MAX_GENERATIONS: u32 = 1;
+
+/// Longest a writer waits for another writer's rotation of the same log
+/// (`<log>.lock`) before appending past the cap instead.
+pub const ROTATE_LOCK_WAIT: Duration = Duration::from_secs(2);
+
+/// Highest generation any writer may keep (the config cap). A rotation
+/// prunes `<log>.{N+1}` up to this, so lowering N, or a writer that started
+/// with a larger N, never strands old generations on disk.
+const MAX_GENERATIONS: u32 = agent_core::config::MAX_TELEMETRY_LOG_GENERATIONS;
 
 /// Default budget for the shutdown flush at process-exit epilogues
 /// (Task 11): long enough for a healthy disk to drain a full queue,
@@ -90,8 +111,11 @@ pub struct WriterOptions {
     pub trace_path: Option<PathBuf>,
     /// Bounded queue capacity (jobs, both kinds combined).
     pub capacity: usize,
-    /// Size cap per log file before single-generation rotation to `<path>.1`.
+    /// Size cap per log file before rotation to `<path>.1`.
     pub max_file_bytes: u64,
+    /// Rotated generations kept per log (`<path>.1` .. `<path>.N`, oldest
+    /// highest). Default [`DEFAULT_MAX_GENERATIONS`] (1); `0` is read as 1.
+    pub max_generations: u32,
     /// Test seam: artificial per-job delay inside the worker, simulating
     /// slow storage deterministically (never set in production).
     pub write_delay: Option<Duration>,
@@ -135,6 +159,7 @@ impl Default for WriterOptions {
             trace_path: None,
             capacity: DEFAULT_QUEUE_CAPACITY,
             max_file_bytes: DEFAULT_MAX_FILE_BYTES,
+            max_generations: DEFAULT_MAX_GENERATIONS,
             write_delay: None,
             write_gate: None,
         }
@@ -190,6 +215,10 @@ impl ShutdownOutcome {
 #[derive(Debug, Clone)]
 pub struct TelemetryWriter {
     shared: Arc<Shared>,
+    /// Identity stamped onto every telemetry record enqueued through this
+    /// handle ([`Self::with_stamp`], [`Self::with_session`]). Same queue,
+    /// same files.
+    stamp: Option<Arc<RecordStamp>>,
 }
 
 /// A queued persistence job: tagged by record kind. Boxed so the queue slot
@@ -260,12 +289,13 @@ struct Shared {
     counters: Counters,
 }
 
-/// Everything the worker thread owns (single-owner writes ⇒ rotation is
-/// concurrency-safe without file locks).
+/// Everything the worker thread owns. Other writers may share the same
+/// files; rotation is serialized across them by `<log>.lock`.
 struct WorkerCfg {
     telemetry_path: Option<PathBuf>,
     trace_path: Option<PathBuf>,
     max_file_bytes: u64,
+    max_generations: u32,
     write_delay: Option<Duration>,
     write_gate: Option<WriteGate>,
     latest_traces: Arc<Shared>,
@@ -288,6 +318,7 @@ impl TelemetryWriter {
             telemetry_path: options.telemetry_path.or_else(default_telemetry_log_path),
             trace_path: options.trace_path.or_else(default_trace_log_path),
             max_file_bytes: options.max_file_bytes,
+            max_generations: options.max_generations.max(1),
             write_delay: options.write_delay,
             write_gate: options.write_gate,
             latest_traces: Arc::clone(&shared),
@@ -298,11 +329,34 @@ impl TelemetryWriter {
             .spawn(move || worker_loop(rx, cfg, worker_shared))
             .expect("spawning the telemetry writer thread cannot fail");
         *lock_recover(&shared.worker) = Some(handle);
-        Self { shared }
+        Self {
+            shared,
+            stamp: None,
+        }
+    }
+
+    /// A handle onto the same writer that stamps `stamp` (replacing this
+    /// handle's) on every telemetry record enqueued through it.
+    pub fn with_stamp(&self, stamp: RecordStamp) -> Self {
+        Self {
+            shared: Arc::clone(&self.shared),
+            stamp: Some(Arc::new(stamp)),
+        }
+    }
+
+    /// This handle, also stamping the persisted conversation id
+    /// (`session_id`); the rest of its stamp is kept.
+    pub fn with_session(&self, session_id: Option<String>) -> Self {
+        let mut stamp = self.stamp.as_deref().cloned().unwrap_or_default();
+        stamp.session_id = session_id;
+        self.with_stamp(stamp)
     }
 
     /// Enqueue a legacy telemetry record. Non-blocking; overflow drops.
-    pub fn enqueue_telemetry(&self, record: TelemetryRecord) {
+    pub fn enqueue_telemetry(&self, mut record: TelemetryRecord) {
+        if let Some(stamp) = &self.stamp {
+            stamp.apply(&mut record);
+        }
         self.enqueue(Job::Telemetry(Box::new(record)));
     }
 
@@ -468,7 +522,7 @@ fn process_job(job: Job, cfg: &WorkerCfg, c: &Counters) {
         note_io_failure(c);
         return;
     };
-    append_private_line(path, &line, cfg.max_file_bytes, c);
+    append_private_line(path, &line, cfg.max_file_bytes, cfg.max_generations, c);
 }
 
 fn note_serialization_failure(c: &Counters) {
@@ -492,10 +546,22 @@ fn note_io_failure(c: &Counters) {
     );
 }
 
-/// Append one line with private-fs hardening + single-generation rotation.
-/// Runs only on the worker thread — single-owner writes make the
-/// stat/rename/append sequence race-free.
-fn append_private_line(path: &std::path::Path, line: &str, max_bytes: u64, c: &Counters) {
+/// `<path>.<n>`.
+fn generation_path(path: &std::path::Path, n: u32) -> PathBuf {
+    let mut p = path.as_os_str().to_owned();
+    p.push(format!(".{n}"));
+    PathBuf::from(p)
+}
+
+/// Append one line with private-fs hardening + size-capped rotation
+/// ([`rotate_if_over`]).
+fn append_private_line(
+    path: &std::path::Path,
+    line: &str,
+    max_bytes: u64,
+    generations: u32,
+    c: &Counters,
+) {
     if let Some(parent) = path.parent() {
         if agent_core::core::private_fs::ensure_private_dir(parent).is_err() {
             note_io_failure(c);
@@ -503,36 +569,7 @@ fn append_private_line(path: &std::path::Path, line: &str, max_bytes: u64, c: &C
         }
     }
 
-    // Size-capped rotation: at > max_bytes, rename to `<path>.1` (clobbering
-    // any old generation) before appending. One generation is enough — this
-    // is a diagnostic log, not an audit trail.
-    if let Ok(meta) = std::fs::metadata(path) {
-        if meta.len() > max_bytes {
-            let mut rotated = path.as_os_str().to_owned();
-            rotated.push(".1");
-            let rotated = PathBuf::from(rotated);
-            if std::fs::rename(path, &rotated).is_ok() {
-                // The rotated file keeps our 0600, but repair a broader mode
-                // inherited from older builds (best-effort, policy §5.4).
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ =
-                        std::fs::set_permissions(&rotated, std::fs::Permissions::from_mode(0o600));
-                }
-                c.rotate_warned.store(false, Ordering::Relaxed);
-            } else {
-                c.io_failures.fetch_add(1, Ordering::Relaxed);
-                Counters::warn_once(
-                    &c.rotate_warned,
-                    &c.rotate_warnings,
-                    "rotate",
-                    "telemetry log rotation failed — appending past the size cap",
-                );
-                // Fall through: an oversized log beats a lost record.
-            }
-        }
-    }
+    rotate_if_over(path, max_bytes, generations, c);
 
     // Created 0600 with O_NOFOLLOW (CWE-59); pre-existing broader modes are
     // repaired by the helper. A planted symlink is refused, never followed.
@@ -548,6 +585,91 @@ fn append_private_line(path: &std::path::Path, line: &str, max_bytes: u64, c: &C
             }
         }
         Err(_) => note_io_failure(c),
+    }
+}
+
+fn over_cap(path: &std::path::Path, max_bytes: u64) -> bool {
+    std::fs::metadata(path).is_ok_and(|m| m.len() > max_bytes)
+}
+
+fn note_rotate_failure(c: &Counters, msg: &str) {
+    c.io_failures.fetch_add(1, Ordering::Relaxed);
+    Counters::warn_once(&c.rotate_warned, &c.rotate_warnings, "rotate", msg);
+}
+
+/// Repair a broader mode inherited from older builds (best-effort, policy
+/// §5.4). Renames keep our own 0600.
+fn chmod_private(path: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
+/// Exclusive `flock` on `<log>.lock` (created 0600, `O_NOFOLLOW`), waiting
+/// at most [`ROTATE_LOCK_WAIT`]. `None` = not acquired. Released on drop.
+fn lock_rotation(path: &std::path::Path) -> Option<std::fs::File> {
+    use fs4::fs_std::FileExt;
+    let mut lock_path = path.as_os_str().to_owned();
+    lock_path.push(".lock");
+    let file = agent_core::core::private_fs::open_private_append(std::path::Path::new(&lock_path)).ok()?;
+    let deadline = Instant::now() + ROTATE_LOCK_WAIT;
+    loop {
+        match FileExt::try_lock_exclusive(&file) {
+            Ok(true) => return Some(file),
+            Ok(false) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
+            _ => return None,
+        }
+    }
+}
+
+/// Size-capped rotation: once the live file is over `max_bytes`, under
+/// `<log>.lock` and only if a re-stat still finds it over (another writer
+/// may have just rotated it): shift `<log>.k` to `<log>.k+1` from the top
+/// (`<log>.N` is clobbered), rename the live file to `<log>.1`, then delete
+/// `<log>.{N+1}` .. `<log>.{MAX}`. N = 1 (the default) is the historical
+/// single generation. A missing generation is skipped.
+fn rotate_if_over(path: &std::path::Path, max_bytes: u64, generations: u32, c: &Counters) {
+    if !over_cap(path, max_bytes) {
+        return;
+    }
+    let Some(_lock) = lock_rotation(path) else {
+        note_rotate_failure(c, "telemetry log rotation lock unavailable — appending past the size cap");
+        return;
+    };
+    if !over_cap(path, max_bytes) {
+        return; // rotated by another writer while we waited
+    }
+    let n = generations.clamp(1, MAX_GENERATIONS);
+    for k in (1..n).rev() {
+        let from = generation_path(path, k);
+        if std::fs::symlink_metadata(&from).is_err() {
+            continue;
+        }
+        let to = generation_path(path, k + 1);
+        match std::fs::rename(&from, &to) {
+            Ok(()) => chmod_private(&to),
+            Err(_) => note_rotate_failure(c, "telemetry log generation shift failed — a generation may be lost"),
+        }
+    }
+    let rotated = generation_path(path, 1);
+    if std::fs::rename(path, &rotated).is_ok() {
+        chmod_private(&rotated);
+        c.rotate_warned.store(false, Ordering::Relaxed);
+    } else {
+        // Fall through to the append: an oversized log beats a lost record.
+        note_rotate_failure(c, "telemetry log rotation failed — appending past the size cap");
+    }
+    // Best-effort prune of generations beyond this writer's N (left by a
+    // larger N earlier, or by another writer that started with one).
+    for k in n + 1..=MAX_GENERATIONS {
+        let stale = generation_path(path, k);
+        if std::fs::symlink_metadata(&stale).is_ok() {
+            let _ = std::fs::remove_file(&stale);
+        }
     }
 }
 
@@ -612,6 +734,7 @@ mod tests {
             trace_path: Some(trace.clone()),
             capacity,
             max_file_bytes: DEFAULT_MAX_FILE_BYTES,
+            max_generations: DEFAULT_MAX_GENERATIONS,
             write_delay: delay,
             write_gate: None,
         });
@@ -809,6 +932,7 @@ mod tests {
             trace_path: Some(blocker.join("request-trace.jsonl")),
             capacity: 16,
             max_file_bytes: DEFAULT_MAX_FILE_BYTES,
+            max_generations: 1,
             write_delay: None,
             write_gate: None,
         });
@@ -835,6 +959,7 @@ mod tests {
             trace_path: Some(blocker.join("request-trace.jsonl")),
             capacity: 16,
             max_file_bytes: DEFAULT_MAX_FILE_BYTES,
+            max_generations: 1,
             write_delay: None,
             write_gate: None,
         });
@@ -872,6 +997,7 @@ mod tests {
             trace_path: None,
             capacity: 64,
             max_file_bytes: 64, // one record (~90B) exceeds the cap
+            max_generations: 1,
             write_delay: None,
             write_gate: None,
         });
@@ -900,6 +1026,179 @@ mod tests {
         };
         assert_eq!(ts_of(read_lines(&rotated)), vec![1]);
         assert_eq!(ts_of(read_lines(&telemetry_path)), vec![2]);
+        assert!(
+            !tmp.path().join("synaps/api-log.jsonl.2").exists(),
+            "the default keeps exactly one generation"
+        );
+    }
+
+    fn rotating_writer(telemetry_path: &std::path::Path, generations: u32) -> TelemetryWriter {
+        TelemetryWriter::new(WriterOptions {
+            telemetry_path: Some(telemetry_path.to_path_buf()),
+            trace_path: None,
+            capacity: 1024,
+            max_file_bytes: 64, // every record exceeds the cap: each write rotates
+            max_generations: generations,
+            write_delay: None,
+            write_gate: None,
+        })
+    }
+
+    fn write_n(w: &TelemetryWriter, from: u64, count: u64) {
+        for ts in from..from + count {
+            let mut r = sample_telemetry();
+            r.ts = ts;
+            w.enqueue_telemetry(r);
+        }
+    }
+
+    /// Lowering N (a later writer, or another session's writer started
+    /// with a smaller N) prunes `.{N+1}` .. `.{MAX}` on its next rotation,
+    /// so nothing is stranded; a gap past N is pruned too.
+    #[test]
+    fn rotation_prunes_generations_beyond_n_including_after_n_is_lowered() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("synaps/api-log.jsonl");
+        let w = rotating_writer(&path, 5);
+        write_n(&w, 0, 7);
+        assert!(w.shutdown(Duration::from_secs(5)).is_flushed());
+        for k in 1..=5 {
+            assert!(generation_path(&path, k).exists(), ".{k} kept at N=5");
+        }
+        // A stale generation far past any N (left by an older N=100 writer).
+        std::fs::write(generation_path(&path, 42), b"{\"ts\":999}\n").unwrap();
+
+        // N lowered to 2 for the next writer on the same files.
+        let w = rotating_writer(&path, 2);
+        write_n(&w, 100, 1);
+        let stats = w.shutdown(Duration::from_secs(5)).stats();
+        assert_eq!((stats.written, stats.io_failures), (1, 0));
+        assert!(generation_path(&path, 1).exists());
+        assert!(generation_path(&path, 2).exists());
+        for k in [3, 4, 5, 6, 42] {
+            assert!(!generation_path(&path, k).exists(), ".{k} pruned at N=2");
+        }
+    }
+
+    /// A generation shifted up keeps (or regains) mode 0600, even one an
+    /// older build left 0644.
+    #[cfg(unix)]
+    #[test]
+    fn shifted_generations_are_repaired_to_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("synaps/api-log.jsonl");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let old = generation_path(&path, 1);
+        std::fs::write(&old, b"{\"ts\":1}\n").unwrap();
+        std::fs::set_permissions(&old, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let w = rotating_writer(&path, 3);
+        write_n(&w, 10, 2);
+        assert!(w.shutdown(Duration::from_secs(5)).is_flushed());
+        for k in 1..=2 {
+            let mode = std::fs::metadata(generation_path(&path, k)).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, ".{k}");
+        }
+    }
+
+    /// Several writers on the same files (every daemon session has its own)
+    /// rotate under `<log>.lock` with a re-stat: no writer rotates a file
+    /// another just rotated, so no generation is shifted twice. With N above
+    /// the number of rotations nothing may fall off the end: every record
+    /// survives, and the generations are contiguous with none empty.
+    #[test]
+    fn concurrent_writers_on_one_log_never_double_rotate() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("synaps/api-log.jsonl");
+        const WRITERS: u64 = 4;
+        const EACH: u64 = 20; // 80 records, < MAX_GENERATIONS + 1 files
+        let writers: Vec<_> = (0..WRITERS).map(|_| rotating_writer(&path, MAX_GENERATIONS)).collect();
+        let threads: Vec<_> = writers
+            .iter()
+            .enumerate()
+            .map(|(i, w)| {
+                let w = w.clone();
+                std::thread::spawn(move || write_n(&w, i as u64 * 1000, EACH))
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        for w in &writers {
+            assert!(w.shutdown(Duration::from_secs(10)).is_flushed());
+        }
+        let total_written: u64 = writers.iter().map(|w| w.stats().written).sum();
+        assert_eq!(total_written, WRITERS * EACH);
+
+        let mut on_disk = read_lines(&path).len() as u64;
+        let mut k = 1;
+        while generation_path(&path, k).exists() {
+            let n = read_lines(&generation_path(&path, k)).len();
+            assert!(n > 0, ".{k} is empty: a double rotation");
+            on_disk += n as u64;
+            k += 1;
+        }
+        let highest = (1..=MAX_GENERATIONS).filter(|k| generation_path(&path, *k).exists()).max().unwrap_or(0);
+        assert_eq!(highest, k - 1, "generations are contiguous (no gap from a double shift)");
+        assert_eq!(on_disk, WRITERS * EACH, "no record lost to a double rotation");
+    }
+
+    /// `max_generations = N` keeps `.1` (newest) .. `.N` (oldest) for both
+    /// logs; anything older is clobbered.
+    #[test]
+    fn rotation_keeps_n_generations_for_both_logs() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let telemetry_path = tmp.path().join("synaps/api-log.jsonl");
+        let trace_path = tmp.path().join("synaps/request-trace.jsonl");
+        let w = TelemetryWriter::new(WriterOptions {
+            telemetry_path: Some(telemetry_path.clone()),
+            trace_path: Some(trace_path.clone()),
+            capacity: 64,
+            max_file_bytes: 64, // every record exceeds the cap
+            max_generations: 3,
+            write_delay: None,
+            write_gate: None,
+        });
+        for ts in 0..6u64 {
+            let mut r = sample_telemetry();
+            r.ts = ts;
+            w.enqueue_telemetry(r);
+            w.enqueue_trace(sample_trace());
+        }
+        let stats = w.shutdown(Duration::from_secs(5)).stats();
+        assert_eq!(stats.written, 12);
+        assert_eq!(stats.io_failures, 0);
+
+        let ts = |path: PathBuf| -> Vec<u64> {
+            read_lines(&path)
+                .iter()
+                .map(|l| {
+                    serde_json::from_str::<serde_json::Value>(l).unwrap()["ts"]
+                        .as_u64()
+                        .unwrap()
+                })
+                .collect()
+        };
+        assert_eq!(ts(telemetry_path.clone()), vec![5]);
+        assert_eq!(ts(generation_path(&telemetry_path, 1)), vec![4]);
+        assert_eq!(ts(generation_path(&telemetry_path, 2)), vec![3]);
+        assert_eq!(ts(generation_path(&telemetry_path, 3)), vec![2]);
+        assert!(!generation_path(&telemetry_path, 4).exists());
+        for n in 1..=3 {
+            assert_eq!(read_lines(&generation_path(&trace_path, n)).len(), 1);
+        }
+        assert!(!generation_path(&trace_path, 4).exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for n in 1..=3 {
+                let mode = std::fs::metadata(generation_path(&telemetry_path, n))
+                    .unwrap()
+                    .permissions()
+                    .mode();
+                assert_eq!(mode & 0o777, 0o600, "generation {n} stays private");
+            }
+        }
     }
 
     // ── Bounded shutdown ─────────────────────────────────────────────────
