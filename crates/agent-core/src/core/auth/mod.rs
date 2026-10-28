@@ -179,7 +179,13 @@ pub struct CallbackResult {
 /// `expires` (`now + expires_in*1000 - 5min`). So a bare `now >= expires` check
 /// already fires ~5 minutes before the credential actually dies at the provider.
 pub fn is_token_expired(creds: &OAuthCredentials) -> bool {
-    now_millis() >= creds.expires
+    token_expired_at(creds, now_millis())
+}
+
+/// The expiry rule against a given clock reading: a token is expired from
+/// its `expires` millisecond on.
+fn token_expired_at(creds: &OAuthCredentials, now_ms: u64) -> bool {
+    now_ms >= creds.expires
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
@@ -496,10 +502,9 @@ mod tests {
 
     #[test]
     fn test_is_token_expired_edge_cases() {
-        let current_time = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64;
+        // Pin the clock: against the live one, "1 ms in the future" has
+        // already passed by the time a loaded CI runner checks it.
+        let current_time = now_millis();
 
         let exactly_now_creds = OAuthCredentials {
             auth_type: "oauth".to_string(),
@@ -508,7 +513,7 @@ mod tests {
             expires: current_time,
             account_id: None,
         };
-        assert!(is_token_expired(&exactly_now_creds));
+        assert!(token_expired_at(&exactly_now_creds, current_time));
 
         let one_ms_future_creds = OAuthCredentials {
             auth_type: "oauth".to_string(),
@@ -517,7 +522,8 @@ mod tests {
             expires: current_time + 1,
             account_id: None,
         };
-        assert!(!is_token_expired(&one_ms_future_creds));
+        assert!(!token_expired_at(&one_ms_future_creds, current_time));
+        assert!(token_expired_at(&one_ms_future_creds, current_time + 1));
     }
 
     #[test]
