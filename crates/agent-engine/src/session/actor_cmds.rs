@@ -393,6 +393,11 @@ impl SessionActor {
     /// messages — persist the name change (commands.rs `saveas` arm).
     async fn session_name(&mut self, arg: &str) -> serde_json::Value {
         let trimmed = arg.trim();
+        // The same process-wide lock as `synaps daemon rename`: a `/saveas`
+        // here and a rename of another session can't both take one name.
+        let Some(_guard) = name_lock().await else {
+            return serde_json::json!({ "kind": "error", "text": NAME_LOCK_BUSY });
+        };
         // This saves `conv.session` directly (even with no messages): a
         // queued save of it, without the new name, must not land after.
         self.persister.flush().await;
@@ -720,9 +725,28 @@ mod auth_command_tests {
 // ── `synaps daemon rename` (host-only engine command `rename`) ──────────────
 
 /// Held from the uniqueness check through the save and the published name,
-/// so two sessions of this daemon can never take the same name at once (the
-/// actors are separate tasks). Other processes are covered by journal locks.
+/// by `synaps daemon rename` AND `/saveas`, so two sessions of this process
+/// can never take the same name at once (the actors are separate tasks).
+/// Only this process: a journal lock is per session, so another process
+/// (an in-process TUI's `/saveas`, the session picker) can still race.
 static NAME_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Longest a session waits for [`NAME_LOCK`] (another session's rename is
+/// saving). The wait blocks this actor's loop, so it is bounded: on expiry
+/// the rename answers `busy` instead.
+pub const NAME_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+
+async fn name_lock() -> Option<tokio::sync::MutexGuard<'static, ()>> {
+    tokio::time::timeout(NAME_LOCK_WAIT, NAME_LOCK.lock()).await.ok()
+}
+
+const NAME_LOCK_BUSY: &str = "another session is saving a rename; retry in a moment";
+
+/// Test seam: hold the process-wide name lock (as a slow rename would).
+#[doc(hidden)]
+pub async fn hold_name_lock_for_tests() -> tokio::sync::MutexGuard<'static, ()> {
+    NAME_LOCK.lock().await
+}
 
 /// The `rename` command's argument: JSON, written only by the daemon
 /// (`daemon/rename.rs`). Plain text (an in-process `/rename foo`) is refused.
@@ -784,7 +808,9 @@ impl SessionActor {
                 return rename_error("invalid", e);
             }
         }
-        let _guard = NAME_LOCK.lock().await;
+        let Some(_guard) = name_lock().await else {
+            return rename_error("busy", NAME_LOCK_BUSY);
+        };
         let current: Option<String> =
             if self.is_parked() { (**self.name.load()).clone() } else { self.conv.session.name.clone() };
         if let Some(expected) = &args.expect {
@@ -799,11 +825,11 @@ impl SessionActor {
                 return v;
             }
         }
-        if want == current {
-            return rename_ok(&want, !self.is_parked() && !self.config.persist);
-        }
         if self.is_parked() {
-            self.rename_parked(want).await
+            // Checked again against the file, under its journal lock.
+            self.rename_parked(want, args.expect).await
+        } else if want == current {
+            rename_ok(&want, !self.config.persist)
         } else {
             self.rename_live(want).await
         }
@@ -844,13 +870,17 @@ impl SessionActor {
         rename_ok(&want, false)
     }
 
-    async fn rename_parked(&mut self, want: Option<String>) -> serde_json::Value {
+    /// A parked session has released its journal lock, so another process
+    /// may have renamed its file: `expect` is checked against the FILE, under
+    /// the journal lock, and a mismatch republishes the name found there.
+    async fn rename_parked(&mut self, want: Option<String>, expect: Option<Option<String>>) -> serde_json::Value {
         use agent_core::session_catalog::RenameError;
         let dir = agent_core::session_lock::sessions_dir();
         let id = (**self.journal_id.load()).clone();
         let name = want.clone();
         let res = tokio::task::spawn_blocking(move || {
-            agent_core::session_catalog::rename_past_session(&dir, &id, name.as_deref())
+            let expect = expect.as_ref().map(|e| e.as_deref());
+            agent_core::session_catalog::rename_past_session_if(&dir, &id, name.as_deref(), expect)
         })
         .await;
         match res {
@@ -861,11 +891,16 @@ impl SessionActor {
                     RenameError::NameTaken { .. } => "taken",
                     RenameError::ChainConflict => "chain_conflict",
                     RenameError::Live { .. } => "locked",
+                    RenameError::NameMismatch { .. } => "named",
                     _ => "failed",
                 };
                 let mut v = rename_error(code, e.to_string());
                 if let RenameError::NameTaken { other_id } = &e {
                     v["taken_by"] = serde_json::json!(other_id);
+                }
+                if let RenameError::NameMismatch { current } = e {
+                    v["current_name"] = serde_json::json!(current);
+                    self.mirror_name(current);
                 }
                 return v;
             }

@@ -35,6 +35,11 @@ pub enum RenameError {
     },
     /// A chain of that name exists.
     ChainConflict,
+    /// The compare-and-set `expect` ([`rename_past_session_if`]) did not
+    /// match the name on disk: `current`.
+    NameMismatch {
+        current: Option<String>,
+    },
     Io(std::io::Error),
 }
 
@@ -62,6 +67,8 @@ impl std::fmt::Display for RenameError {
             }
             Self::NameTaken { other_id } => write!(f, "name already used by session {other_id}"),
             Self::ChainConflict => f.write_str("name conflicts with an existing chain name"),
+            Self::NameMismatch { current: Some(c) } => write!(f, "session is named '{c}' on disk; not renamed"),
+            Self::NameMismatch { current: None } => f.write_str("session has no name on disk; not renamed"),
             Self::Io(e) => write!(f, "rename failed: {e}"),
         }
     }
@@ -72,6 +79,19 @@ impl std::error::Error for RenameError {}
 /// Set (`Some`) or clear (`None`) the name of past session `id` in `dir`.
 /// Blocking. Idempotent: setting the current name is `Ok` without a write.
 pub fn rename_past_session(dir: &Path, id: &str, name: Option<&str>) -> Result<(), RenameError> {
+    rename_past_session_if(dir, id, name, None)
+}
+
+/// [`rename_past_session`] with a compare-and-set precondition checked
+/// against the name ON DISK under the session lock: `Some(None)` = only if
+/// unnamed, `Some(Some(x))` = only if named `x`, `None` = no precondition.
+/// A mismatch is [`RenameError::NameMismatch`] with the name found.
+pub fn rename_past_session_if(
+    dir: &Path,
+    id: &str,
+    name: Option<&str>,
+    expect: Option<Option<&str>>,
+) -> Result<(), RenameError> {
     if id.is_empty() || id.contains(['/', '\\']) || id.starts_with('.') {
         return Err(RenameError::InvalidId);
     }
@@ -102,7 +122,7 @@ pub fn rename_past_session(dir: &Path, id: &str, name: Option<&str>) -> Result<(
         }
         Err(SessionLockError::Io(e, _)) => return Err(RenameError::Io(e)),
     };
-    let result = rename_locked(dir, id, name);
+    let result = rename_locked(dir, id, name, expect);
     if lock_existed {
         drop(lock);
     } else {
@@ -111,9 +131,19 @@ pub fn rename_past_session(dir: &Path, id: &str, name: Option<&str>) -> Result<(
     result
 }
 
-fn rename_locked(dir: &Path, id: &str, name: Option<&str>) -> Result<(), RenameError> {
+fn rename_locked(
+    dir: &Path,
+    id: &str,
+    name: Option<&str>,
+    expect: Option<Option<&str>>,
+) -> Result<(), RenameError> {
     let mut session =
         crate::core::session_journal::load_session_in_dir(dir, id).map_err(RenameError::Io)?;
+    if let Some(expected) = expect {
+        if session.name.as_deref() != expected {
+            return Err(RenameError::NameMismatch { current: session.name.clone() });
+        }
+    }
     if session.name.as_deref() == name {
         return Ok(());
     }

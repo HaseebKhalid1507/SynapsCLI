@@ -475,7 +475,8 @@ fn is_close_command(cmd: &SessionCommand) -> bool {
 }
 
 /// The host-only engine command behind `synaps daemon rename`
-/// (`SessionActor::session_rename`). Clients rename with `saveas`.
+/// (`SessionActor::host_rename`; JSON args, `RenameArgs`). Clients rename
+/// with `saveas`.
 pub(crate) const RENAME_COMMAND: &str = "rename";
 
 fn is_rename_command(cmd: &SessionCommand) -> bool {
@@ -5207,11 +5208,6 @@ impl SessionActor {
                 self.note_input(c);
             }
         }
-        // B3: anything that needs the runtime wakes a parked session first.
-        // Except a host rename: a parked session has no conversation in
-        // memory and has released its journal lock, so renaming it would
-        // mean rebuilding it (MCP, extensions) just to change metadata.
-        // Refused with a stable code instead; it applies once it is live.
         // A host rename (`synaps daemon rename`): handled here for live and
         // parked sessions alike. A parked one is renamed on disk and NOT
         // woken (`host_rename`), so this runs before the B3 wake below.
@@ -5222,6 +5218,7 @@ impl SessionActor {
             }
             return ControlFlow::Continue(());
         }
+        // B3: anything that needs the runtime wakes a parked session first.
         if self.is_parked() {
             let needs_runtime = !matches!(
                 cmd,

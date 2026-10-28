@@ -975,6 +975,25 @@ fn rename_sets_and_clears_name_without_touching_recency() {
     assert_eq!(Session::load_from_dir(fx.dir(), A).unwrap().name, None);
 }
 
+/// The compare-and-set precondition is checked against the name on disk.
+#[test]
+fn rename_if_checks_expect_against_the_file() {
+    let fx = Fx::new();
+    fx.session(A, "t", "m", at(2026, 10, 25, 1), chat(3));
+    rename_past_session(fx.dir(), A, Some("disk-name")).unwrap();
+    match rename_past_session_if(fx.dir(), A, Some("kite"), Some(None)) {
+        Err(RenameError::NameMismatch { current }) => assert_eq!(current.as_deref(), Some("disk-name")),
+        other => panic!("expected NameMismatch, got {other:?}"),
+    }
+    match rename_past_session_if(fx.dir(), A, None, Some(Some("other"))) {
+        Err(RenameError::NameMismatch { .. }) => {}
+        other => panic!("expected NameMismatch, got {other:?}"),
+    }
+    assert_eq!(Session::load_from_dir(fx.dir(), A).unwrap().name.as_deref(), Some("disk-name"));
+    rename_past_session_if(fx.dir(), A, Some("kite"), Some(Some("disk-name"))).unwrap();
+    assert_eq!(Session::load_from_dir(fx.dir(), A).unwrap().name.as_deref(), Some("kite"));
+}
+
 #[test]
 fn rename_refuses_live_locked_session() {
     let fx = Fx::new();

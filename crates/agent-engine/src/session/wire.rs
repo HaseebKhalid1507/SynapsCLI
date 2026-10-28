@@ -163,9 +163,10 @@ pub enum ClientFrame {
     /// without being woken. `expect` is a compare-and-set precondition the
     /// actor checks atomically: absent = none, `null` = only if the session
     /// is unnamed, `"x"` = only if it is named `x`; a mismatch is
-    /// `RenameFailed{named}`. Reply: `Renamed`, `RenameFailed`, or
-    /// `Refused{Busy|UnknownSession}`. Not accepted on an attached
-    /// connection (that client has `/saveas`).
+    /// `RenameFailed{named}`. Raw clients should send `expect: null`: an
+    /// absent `expect` replaces any name. Reply: `Renamed`, `RenameFailed`
+    /// (`busy` included), or `Refused{UnknownSession}`. Not accepted on an
+    /// attached connection (that client has `/saveas`).
     Rename {
         session_id: SessionId,
         #[serde(default)]
