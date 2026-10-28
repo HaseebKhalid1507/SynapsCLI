@@ -551,6 +551,9 @@ pub struct SessionActor {
     pub(crate) owner_steer_budget: Option<Arc<crate::runtime::budget::OwnerSteerBudget>>,
     pub(crate) streaming: bool,
     pub(crate) turn_baseline: usize,
+    /// Stamps each message appended to `conv.api_messages` with its time
+    /// (`_synaps_at`); what was loaded is settled and never stamped.
+    pub(crate) message_stamper: crate::runtime::message_time::Stamper,
     pub(crate) consecutive_auto_turns: u32,
     /// Formatted events `on_queue_wake` steered into this turn's stream
     /// that the engine has not acknowledged (`SteeringDelivered`) yet. On
@@ -793,6 +796,9 @@ impl SessionActor {
         if let Some(ref m) = cfg.model_override {
             runtime.set_model(m.clone());
         }
+        if let Some(clock) = &cfg.message_clock {
+            runtime.set_message_clock(clock.clone());
+        }
 
         // Shared-inbox files are for whoever is at a keyboard: the gate stays
         // shut until a client owns input (`publish_presence`), so a detached,
@@ -881,6 +887,8 @@ impl SessionActor {
         if sb.continued && cfg.persist && session_lock.is_some() {
             crate::engine::setup::recover_turn_draft(&mut conv).await;
         }
+        // Loaded (and recovered) history keeps whatever times it carried.
+        let message_stamper = crate::runtime::message_time::Stamper::new(conv.api_messages.len());
 
         let view = RuntimeView::from_runtime(&runtime).await;
         let hook_bus = Arc::clone(runtime.hook_bus());
@@ -951,6 +959,7 @@ impl SessionActor {
             owner_steer_budget: None,
             streaming: false,
             turn_baseline: 0,
+            message_stamper,
             consecutive_auto_turns: 0,
             turn_steered_events: Vec::new(),
             turn_completion: None,
@@ -1113,8 +1122,21 @@ impl SessionActor {
     }
 
     pub(crate) fn emit_conversation(&mut self) {
+        self.stamp_new_messages();
         let snap = self.conv.snapshot(self.consecutive_auto_turns);
         self.emit(SessionEventWire::Conversation(snap));
+    }
+
+    /// Give every message appended since the last pass its time. Called
+    /// wherever history leaves the actor (turn start, save, clients), so a
+    /// message added outside a turn (events flushed at Done, notes,
+    /// interruption markers) is stamped too. O(new messages).
+    pub(crate) fn stamp_new_messages(&mut self) {
+        if !self.conv.is_live() || !self.runtime.is_live() {
+            return;
+        }
+        let clock = self.runtime.message_clock().clone();
+        self.message_stamper.stamp(&mut self.conv.api_messages, &clock);
     }
 
     pub(crate) async fn publish_view(&mut self) {
@@ -1129,6 +1151,7 @@ impl SessionActor {
         if !self.config.persist || !self.conv.is_live() {
             return;
         }
+        self.stamp_new_messages();
         let Some(session) = self.conv.prepare_save() else {
             return;
         };
@@ -2108,6 +2131,8 @@ impl SessionActor {
                             self.conv.session.thinking_level =
                                 self.runtime.thinking_level().to_owned();
                             self.consecutive_auto_turns = 0;
+                            // Admission: the request gets its time now.
+                            self.stamp_new_messages();
                             self.turn_baseline = self.conv.api_messages.len();
                             self.turn_steered_events.clear();
                             self.turn_replay.clear();
@@ -2644,6 +2669,9 @@ impl SessionActor {
             // `cfg.model_override` frozen at create: `/model` survives park.
             runtime.set_model(view.model.clone());
             let _ = runtime.restore_session_reasoning(&view.thinking_level);
+            if let Some(clock) = &cfg.message_clock {
+                runtime.set_message_clock(clock.clone());
+            }
             sb.session.model = view.model.clone();
             sb.session.thinking_level = runtime.thinking_level().to_string();
             crate::engine::setup::finish_session_setup(
@@ -2676,6 +2704,7 @@ impl SessionActor {
         if journal_present && self.config.persist && self.session_lock.is_some() {
             crate::engine::setup::recover_turn_draft(&mut conv).await;
         }
+        self.message_stamper.settle(conv.api_messages.len());
         runtime.restore_tool_activations(std::mem::take(&mut self.parked_tool_activations));
         self.runtime.unpark_set(runtime);
         self.conv.unpark_set(conv);
@@ -2896,6 +2925,9 @@ impl SessionActor {
         let ct = CancellationToken::new();
         let (s_tx, s_rx) = mpsc::unbounded_channel::<String>();
         self.streaming = true;
+        // Admission: the request (and anything queued with it) gets its
+        // time now, before the stream copies the history.
+        self.stamp_new_messages();
         self.turn_baseline = self.conv.api_messages.len();
         self.open_turn_draft();
         self.turn_steered_events.clear();

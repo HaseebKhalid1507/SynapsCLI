@@ -1149,7 +1149,44 @@ fn has_host_key(message: &Value) -> bool {
         .is_some_and(|o| o.keys().any(|k| k.starts_with(HOST_KEY_PREFIX)))
 }
 
-/// Host continuation metadata never goes onto any provider wire.
+/// One message as it goes on a provider wire: serialized without its
+/// host-only `_synaps_*` keys, never cloned. Byte-identical to serializing
+/// the stripped copy [`wire_messages`] makes (same entries, same order).
+pub(crate) struct WireMessage<'a>(pub(crate) &'a Value);
+
+impl serde::Serialize for WireMessage<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        match self.0.as_object() {
+            Some(object) if has_host_key(self.0) => {
+                let kept = object.iter().filter(|(k, _)| !k.starts_with(HOST_KEY_PREFIX));
+                let mut map = serializer.serialize_map(Some(kept.clone().count()))?;
+                for (k, v) in kept {
+                    map.serialize_entry(k, v)?;
+                }
+                map.end()
+            }
+            _ => self.0.serialize(serializer),
+        }
+    }
+}
+
+/// A history as it goes on a provider wire (see [`WireMessage`]). Every
+/// message carries a host time once stamped, so stripping by copy would
+/// deep-clone the whole history on every request; this strips while
+/// serializing instead.
+#[derive(Clone, Copy)]
+pub(crate) struct WireMessages<'a>(pub(crate) &'a [SharedMessage]);
+
+impl serde::Serialize for WireMessages<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.0.iter().map(|m| WireMessage(m)))
+    }
+}
+
+/// Host continuation metadata never goes onto any provider wire. Copies
+/// only for transports that read the history as values (they translate it
+/// or forward it verbatim); the native Anthropic body uses [`WireMessages`].
 pub(crate) fn wire_messages(messages: &[SharedMessage]) -> Option<Vec<SharedMessage>> {
     if !messages.iter().any(|m| has_host_key(m)) {
         return None;
@@ -2881,6 +2918,80 @@ mod budget_tests {
         assert_eq!(wire.last().unwrap()["content"], "continue");
     }
 
+    /// A history in which every message carries host keys, as it is once
+    /// every message has a time.
+    pub(super) fn stamped_history(n: usize) -> (Vec<SharedMessage>, Vec<SharedMessage>) {
+        let mut plain = Vec::new();
+        for i in 0..n {
+            plain.push(Arc::new(json!({"role":"user","content":[
+                {"type":"text","text":format!("question {i} ünïcode \"q\"")},
+                {"type":"tool_result","tool_use_id":format!("t{i}"),"content":"x".repeat(i % 7)}
+            ]})));
+            plain.push(Arc::new(json!({"role":"assistant","content":[
+                {"type":"thinking","thinking":"hm","signature":"sig"},
+                {"type":"text","text":format!("answer {i}")},
+                {"type":"tool_use","id":format!("t{}", i + 1),"name":"bash","input":{"command":"ls","n":i}}
+            ]})));
+        }
+        let stamped = plain
+            .iter()
+            .enumerate()
+            .map(|(i, m)| {
+                let mut m = (**m).clone();
+                m[super::super::message_time::AT_KEY] = json!("2026-10-25T05:47:00Z");
+                if i == 0 {
+                    m[TURN_KEY] = json!({"id": "t-1"});
+                }
+                Arc::new(m)
+            })
+            .collect();
+        (plain, stamped)
+    }
+
+    /// The serialize-time strip is byte-identical to serializing the old
+    /// stripped copy, and to a history that never had host keys: prompt
+    /// cache keys depend on it.
+    #[test]
+    fn wire_serialization_is_byte_identical_with_and_without_host_keys() {
+        let (plain, stamped) = stamped_history(50);
+        let before = serde_json::to_vec(&plain).unwrap();
+        let copied = serde_json::to_vec(&wire_messages(&stamped).unwrap()).unwrap();
+        let streamed = serde_json::to_vec(&WireMessages(&stamped)).unwrap();
+        assert_eq!(copied, before);
+        assert_eq!(streamed, before);
+        assert_eq!(serde_json::to_vec(&WireMessages(&plain)).unwrap(), before);
+        assert!(!String::from_utf8(streamed).unwrap().contains("_synaps_"));
+    }
+
+    /// Every transport but native Anthropic reads the history as values
+    /// (an extension provider gets it verbatim): it gets the stripped copy.
+    /// Native Anthropic strips while serializing, so it borrows.
+    #[test]
+    fn every_routed_transport_gets_a_history_without_host_keys() {
+        let (_, stamped) = stamped_history(3);
+        for model in ["claude-sonnet-4-6", "anthropic/claude-opus-4-7"] {
+            assert!(
+                crate::runtime::openai::routed_wire_messages(model, &stamped).is_none(),
+                "{model}: native Anthropic borrows"
+            );
+        }
+        for model in [
+            "groq/llama-3.3-70b-versatile",
+            "github-copilot/claude-sonnet-4.6",
+            "github-copilot/gpt-5.3-codex",
+            "openai-codex/gpt-5.1-codex-mini",
+            "google-gemini/gemini-2.5-pro",
+            "xai-auth/grok-4",
+            "my-plugin:my-provider:my-model",
+            "unknown-provider/model",
+        ] {
+            let wire = crate::runtime::openai::routed_wire_messages(model, &stamped)
+                .unwrap_or_else(|| panic!("{model}: must strip"));
+            let bytes = serde_json::to_string(&wire).unwrap();
+            assert!(!bytes.contains("_synaps_"), "{model}: {bytes}");
+        }
+    }
+
     /// Every `_synaps_*` key is host metadata, including ones a later build
     /// adds: none reaches a provider request.
     #[test]
@@ -3790,6 +3901,75 @@ mod calibration_transport_tests {
         assert!(bodies[0].contains("TAGGED REQUEST"));
         assert!(!bodies[0].contains("_synaps_turn"));
         assert!(!bodies[0].contains("_synaps_context"));
+    }
+
+    /// The request a provider gets is byte-identical whether or not the
+    /// history carries message times (prompt-cache safety), and never
+    /// contains one: streaming turn and compaction transports.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn request_bytes_are_identical_with_and_without_message_times() {
+        let _base = crate::test_env::BaseDirGuard::new();
+        let (url, mock) = spawn(Arc::new(|_, _| (200, None))).await;
+        let _g = crate::test_env::EnvVarGuard::set("SYNAPS_ANTHROPIC_BASE_URL", &url);
+        let (mut plain, mut stamped) = super::budget_tests::stamped_history(40);
+        plain.push(Arc::new(json!({"role":"user","content":"go on"})));
+        stamped.push(Arc::new(json!({"role":"user","content":"go on",
+            "_synaps_at":"2026-10-25T05:48:00Z"})));
+        for history in [plain.clone(), stamped.clone()] {
+            let mut rt = crate::Runtime::new_headless();
+            rt.set_model("claude-sonnet-4-6".to_string());
+            rt.set_api_retries(0);
+            turn_with(&rt, history, Default::default()).await;
+        }
+        let bodies = mock.bodies.lock().unwrap().clone();
+        assert_eq!(bodies.len(), 2, "one request per turn");
+        assert!(bodies[0].contains("go on"));
+        assert_eq!(bodies[0], bodies[1], "stamps changed the request bytes");
+        assert!(!bodies[1].contains("_synaps_"));
+
+        // Compaction (`call_api_simple`) sends caller history directly.
+        let mut rt = runtime();
+        rt.set_api_retries(0);
+        rt.set_compaction_model(Some("claude-sonnet-4-6".to_string()));
+        let _ = rt.compact_call(stamped).await;
+        let bodies = mock.bodies.lock().unwrap().clone();
+        assert_eq!(bodies.len(), 3);
+        assert!(bodies[2].contains("go on") && !bodies[2].contains("_synaps_"));
+    }
+
+    /// Rough cost of putting a 2,000-message history on the wire, before
+    /// (strip by copy) and after (strip while serializing). Not run by
+    /// default: `cargo test -p synaps-engine --release -- --ignored
+    /// wire_strip_timing --nocapture`.
+    #[test]
+    #[ignore]
+    fn wire_strip_timing() {
+        let (_, stamped) = super::budget_tests::stamped_history(1000);
+        assert_eq!(stamped.len(), 2000);
+        let rounds = 50;
+        let t = std::time::Instant::now();
+        let mut n = 0;
+        for _ in 0..rounds {
+            let copy = wire_messages(&stamped).unwrap();
+            n += serde_json::to_vec(&copy).unwrap().len();
+        }
+        let copy = t.elapsed() / rounds;
+        let t = std::time::Instant::now();
+        for _ in 0..rounds {
+            n += serde_json::to_vec(&WireMessages(&stamped)).unwrap().len();
+        }
+        let streamed = t.elapsed() / rounds;
+        let t = std::time::Instant::now();
+        let (plain, _) = super::budget_tests::stamped_history(1000);
+        for _ in 0..rounds {
+            n += serde_json::to_vec(&plain).unwrap().len();
+        }
+        let unstamped = t.elapsed() / rounds;
+        eprintln!(
+            "2000 msgs, {} bytes: copy+serialize {copy:?}, serialize-strip {streamed:?}, no host keys {unstamped:?}",
+            n / (3 * rounds as usize)
+        );
     }
 
     fn calibration(rt: &crate::Runtime) -> Option<TokenCalibration> {

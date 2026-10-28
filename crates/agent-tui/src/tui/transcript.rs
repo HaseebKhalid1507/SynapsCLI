@@ -587,6 +587,9 @@ pub(crate) struct TranscriptStore {
     bytes_since_audit: usize,
     /// Messages dropped by the cap so far (the sentinel line reports it).
     scrollback_dropped: usize,
+    /// Local date of the last dated message pushed: a message on another
+    /// day is preceded by a `── Sun Oct 25 ──` line.
+    last_day: Option<chrono::NaiveDate>,
     /// A subagent view's store: its trim note doesn't point at `/resync`,
     /// which only reloads the main thread.
     worker_view: bool,
@@ -683,6 +686,11 @@ pub(crate) struct VisibleWindow {
     pub(crate) is_empty: bool,
 }
 
+/// The system line shown where the local date changes.
+pub(crate) fn day_line(day: chrono::NaiveDate) -> String {
+    format!("── {} ──", day.format("%a %b %-d"))
+}
+
 impl TranscriptStore {
     pub(crate) fn new(clock: super::clock::TuiClock) -> Self {
         Self {
@@ -701,6 +709,7 @@ impl TranscriptStore {
             pushes_since_audit: 0,
             bytes_since_audit: 0,
             scrollback_dropped: 0,
+            last_day: None,
             worker_view: false,
             tool_start_time: None,
             tool_start_times: std::collections::HashMap::new(),
@@ -749,12 +758,31 @@ impl TranscriptStore {
     /// of the event being applied (a subagent view's steer shows when the
     /// worker took it, not when the view polled).
     fn event_stamp(&self) -> String {
+        self.event_wall().format("%H:%M").to_string()
+    }
+
+    /// Wall-clock time of the event being applied.
+    fn event_wall(&self) -> chrono::DateTime<chrono::Local> {
         let ago = self.event_time.map_or(std::time::Duration::ZERO, |t| {
             self.clock.now().saturating_duration_since(t)
         });
-        let wall = chrono::Local::now()
-            - chrono::Duration::from_std(ago).unwrap_or(chrono::Duration::zero());
-        wall.format("%H:%M").to_string()
+        chrono::Local::now() - chrono::Duration::from_std(ago).unwrap_or(chrono::Duration::zero())
+    }
+
+    /// Before a message dated `at`: a day line when the local date changed
+    /// since the previous dated message. The first dated message sets the
+    /// day without a line.
+    fn note_day(&mut self, at: chrono::DateTime<chrono::Local>) {
+        let day = at.date_naive();
+        if self.last_day.is_some_and(|last| last != day) {
+            self.messages.push(TimestampedMsg {
+                msg: ChatMessage::System(day_line(day)),
+                time: String::new(),
+            });
+            self.live_note(self.messages.len() - 1);
+            self.invalidate_last();
+        }
+        self.last_day = Some(day);
     }
 
     /// Mark this store as a subagent view's (see `worker_view`).
@@ -1122,9 +1150,24 @@ impl TranscriptStore {
     // App-side wrappers (locked decision #3).
 
     pub(crate) fn push_msg(&mut self, msg: ChatMessage) {
+        let at = self.event_wall();
+        self.push_msg_at(msg, Some(at));
+    }
+
+    /// Push a message that happened at `at` (a rebuilt transcript: the time
+    /// the host recorded for it), shown as local `HH:MM`. `None`: a message
+    /// with no recorded time shows an empty time, never "now".
+    pub(crate) fn push_msg_at(
+        &mut self,
+        msg: ChatMessage,
+        at: Option<chrono::DateTime<chrono::Local>>,
+    ) {
+        if let Some(at) = at {
+            self.note_day(at);
+        }
         self.messages.push(TimestampedMsg {
             msg,
-            time: self.event_stamp(),
+            time: at.map(|at| at.format("%H:%M").to_string()).unwrap_or_default(),
         });
         // Auto-scroll only when pinned to bottom
         if self.scroll_pinned {
@@ -3035,6 +3078,7 @@ impl TranscriptStore {
     /// Equivalent to `messages.clear()` + `invalidate()` in prior slices.
     pub(crate) fn clear(&mut self) {
         self.messages.clear();
+        self.last_day = None;
         self.live.clear();
         self.response_start = None;
         self.clear_selection();
@@ -3187,6 +3231,32 @@ mod visible_window_tests {
             streaming: false,
             agent_name: "synaps",
         }
+    }
+
+    /// A message without a recorded time renders an empty time, not now.
+    #[test]
+    fn a_message_without_a_time_renders_with_an_empty_time() {
+        let mut store = TranscriptStore::new(super::super::clock::TuiClock::real());
+        store.push_msg_at(ChatMessage::User("legacy".into()), None);
+        let at = chrono::DateTime::parse_from_rfc3339("2020-03-01T05:47:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Local);
+        store.push_msg_at(ChatMessage::User("dated".into()), Some(at));
+        let text = |i: usize| -> String {
+            store
+                .render_message_lines(i, 60, &test_ctx())
+                .lines
+                .unwrap()
+                .iter()
+                .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let now = chrono::Local::now().format("%H:%M").to_string();
+        let legacy = text(0);
+        assert!(legacy.contains("you") && !legacy.contains(&now), "{legacy}");
+        assert!(!legacy.chars().any(|c| c == ':'), "no time shown: {legacy}");
+        assert!(text(1).contains(&at.format("%H:%M").to_string()));
     }
 
     /// Ported from app.rs with slice (e). The app.rs original *mirrored* the

@@ -233,6 +233,8 @@ pub(super) struct StreamSession {
     /// Event-started turns only: the owner's steer moves the turn onto the
     /// session budget it carries.
     pub(super) owner_steer_budget: Option<Arc<crate::runtime::budget::OwnerSteerBudget>>,
+    /// Source of the times stamped on this turn's new messages.
+    pub(super) message_clock: crate::runtime::message_time::MessageClock,
 }
 
 pub(super) struct StreamMethods;
@@ -671,6 +673,7 @@ impl StreamMethods {
             extension_session_scope,
             turn_budget,
             owner_steer_budget,
+            message_clock,
         } = session;
         // Handed to every subagent this turn spawns (see `inherit_telemetry`).
         let worker_telemetry = crate::runtime::telemetry::WorkerTelemetry {
@@ -683,6 +686,22 @@ impl StreamMethods {
             options.codex_request_role,
         );
         let mut messages = initial_messages;
+        // Every message this turn appends gets its own time before any
+        // publish; the history it started from is settled (the frontend
+        // stamped the request it admitted). Host-only: never on the wire.
+        let mut stamper = super::message_time::Stamper::new(messages.len());
+        macro_rules! send_history {
+            () => {{
+                stamper.stamp(&mut messages, &message_clock);
+                let _ = tx.send(StreamEvent::Session(SessionEvent::MessageHistory(messages)));
+            }};
+            (clone) => {{
+                stamper.stamp(&mut messages, &message_clock);
+                let _ = tx.send(StreamEvent::Session(SessionEvent::MessageHistory(
+                    messages.clone(),
+                )));
+            }};
+        }
 
         // Only request preparation may use this early exit. Tool execution and
         // durable head publication must finish their own history/commit cleanup.
@@ -691,15 +710,14 @@ impl StreamMethods {
                 match super::api::await_or_cancel(&cancel, $future).await {
                     Ok(value) => value,
                     Err(_) => {
-                        let _ =
-                            tx.send(StreamEvent::Session(SessionEvent::MessageHistory(messages)));
+                        send_history!();
                         return Ok(());
                     }
                 }
             };
         }
         if cancel.is_cancelled() {
-            let _ = tx.send(StreamEvent::Session(SessionEvent::MessageHistory(messages)));
+            send_history!();
             return Ok(());
         }
 
@@ -867,7 +885,7 @@ impl StreamMethods {
                     tool_result_bytes = budget_meter.tool_result_bytes_used(),
                     "turn ended: budget exhausted"
                 );
-                let _ = tx.send(StreamEvent::Session(SessionEvent::MessageHistory(messages)));
+                send_history!();
                 let _ = tx.send(StreamEvent::Session(SessionEvent::Error(
                     budget_meter.exhaustion_error(dimension),
                 )));
@@ -909,7 +927,7 @@ impl StreamMethods {
         loop {
             // Check for cancellation before each API call
             if cancel.is_cancelled() {
-                let _ = tx.send(StreamEvent::Session(SessionEvent::MessageHistory(messages)));
+                send_history!();
                 return Ok(());
             }
 
@@ -927,6 +945,7 @@ impl StreamMethods {
             // crash mid-turn lost the prompt and every completed round.
             // Append-only (never rewrites a sent message) — no effect on the
             // request bytes or the provider's cached prefix.
+            stamper.stamp(&mut messages, &message_clock);
             round_checkpoint.publish(&tx, &messages);
 
             // Budget pre-flight: wall clock, then the exact round cap —
@@ -1298,8 +1317,7 @@ impl StreamMethods {
                         })
                     };
                     if !readable {
-                        let _ =
-                            tx.send(StreamEvent::Session(SessionEvent::MessageHistory(messages)));
+                        send_history!();
                         return Err(crate::RuntimeError::Config("rollover requires admitted builtin history retrieval tools; history retained".into()));
                     }
                     // Workers still in flight (running, or finished but not
@@ -1394,9 +1412,7 @@ impl StreamMethods {
                                 current_advisory = Some(ContextAdvisory::Unproductive);
                             }
                             Ok(super::continuation::RolloverPreparation::Unproductive) => {
-                                let _ = tx.send(StreamEvent::Session(
-                                    SessionEvent::MessageHistory(messages),
-                                ));
+                                send_history!();
                                 return Err(super::continuation::unproductive_rollover_error());
                             }
                             Ok(super::continuation::RolloverPreparation::Ready(prepared)) => {
@@ -1408,9 +1424,7 @@ impl StreamMethods {
                                 // Nothing has been published yet — the pre-
                                 // rollover history is still the valid head.
                                 if cancel.is_cancelled() {
-                                    let _ = tx.send(StreamEvent::Session(
-                                        SessionEvent::MessageHistory(messages),
-                                    ));
+                                    send_history!();
                                     return Ok(());
                                 }
                                 super::continuation::persist_head(&prepared, &continuation, &tx)
@@ -1422,9 +1436,7 @@ impl StreamMethods {
                                     .lock()
                                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                                     .window;
-                                let _ = tx.send(StreamEvent::Session(
-                                    SessionEvent::MessageHistory(messages.clone()),
-                                ));
+                                send_history!(clone);
                                 // Already published: the next round checkpoint
                                 // must not re-send the identical head.
                                 round_checkpoint.mark_published(&messages);
@@ -1441,9 +1453,7 @@ impl StreamMethods {
                                 continue;
                             }
                             Err(error) => {
-                                let _ = tx.send(StreamEvent::Session(
-                                    SessionEvent::MessageHistory(messages),
-                                ));
+                                send_history!();
                                 return Err(error);
                             }
                         }
@@ -1502,7 +1512,7 @@ impl StreamMethods {
                 Ok(r) => r,
                 Err(e) => {
                     // Send whatever history we have so far, so context isn't lost
-                    let _ = tx.send(StreamEvent::Session(SessionEvent::MessageHistory(messages)));
+                    send_history!();
                     return Err(e);
                 }
             };
@@ -1573,7 +1583,7 @@ impl StreamMethods {
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner) =
                             Some(messages.clone());
-                        let _ = tx.send(StreamEvent::Session(SessionEvent::MessageHistory(messages)));
+                        send_history!();
                         return Ok(());
                     }
                     if !cancel.is_cancelled() {
@@ -1587,7 +1597,7 @@ impl StreamMethods {
                             ),
                         )));
                     }
-                    let _ = tx.send(StreamEvent::Session(SessionEvent::MessageHistory(messages)));
+                    send_history!();
                     return Ok(());
                 }
 
@@ -1722,9 +1732,7 @@ impl StreamMethods {
                                     )));
                                 }
                                 agent_core::orchestration::CompletionGate::Blocked { workers } => {
-                                    let _ = tx.send(StreamEvent::Session(
-                                        SessionEvent::MessageHistory(messages),
-                                    ));
+                                    send_history!();
                                     return Err(RuntimeError::Tool(format!(
                                         "completion blocked: {} worker(s) require collection/reconciliation: {} (call subagent_collect with reconciled=true after inspecting each result)",
                                         workers.len(),
@@ -1742,8 +1750,7 @@ impl StreamMethods {
                         if !response_cancelled {
                             turn_completion.mark_completed();
                         }
-                        let _ =
-                            tx.send(StreamEvent::Session(SessionEvent::MessageHistory(messages)));
+                        send_history!();
                         return Ok(());
                     }
                     // Steering message injected — continue the loop for another LLM call
@@ -2558,7 +2565,7 @@ impl StreamMethods {
                         messages.push(Arc::new(json!({
                             "role":"user", "content":completed_results
                         })));
-                        let _ = tx.send(StreamEvent::Session(SessionEvent::MessageHistory(messages)));
+                        send_history!();
                         if let Some(call_id) = interrupted_side_effect {
                             let _ = tx.send(StreamEvent::Session(SessionEvent::Error(
                                 agent_core::TurnError::interrupted_after_side_effect(call_id),
@@ -2571,7 +2578,7 @@ impl StreamMethods {
 
                 if canceled {
                     // Send final history on cancellation so session can be saved
-                    let _ = tx.send(StreamEvent::Session(SessionEvent::MessageHistory(messages)));
+                    send_history!();
                     // Ledger (Task 25, §8.3): a NonIdempotent call interrupted
                     // after a possible side effect surfaces a typed
                     // `InterruptedAfterSideEffect` outcome (and was never
@@ -2604,7 +2611,7 @@ impl StreamMethods {
 
                 // Continue the loop to get Claude's response with tool results
             } else {
-                let _ = tx.send(StreamEvent::Session(SessionEvent::MessageHistory(messages)));
+                send_history!();
                 return Err(RuntimeError::Tool("Invalid response format".to_string()));
             }
         }
@@ -3772,6 +3779,7 @@ mod rich_output_tests {
                 crate::runtime::budget::TurnRole::Foreground,
             ),
             owner_steer_budget: None,
+            message_clock: Default::default(),
         }
     }
 
@@ -5372,6 +5380,7 @@ mod rich_output_tests {
                 crate::runtime::budget::TurnRole::Foreground,
             ),
             owner_steer_budget: None,
+            message_clock: Default::default(),
         };
 
         let messages = vec![Arc::new(json!({"role":"user","content":"do it"})) as SharedMessage];

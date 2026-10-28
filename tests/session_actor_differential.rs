@@ -270,16 +270,23 @@ impl ActorRun {
     }
 }
 
+/// Without the host-only message times (`_synaps_at`): wall-clock bytes,
+/// and the actor stamps the request it admits while the frozen reference
+/// predates message times.
 fn msgs_json(m: &[synaps_cli::SharedMessage]) -> String {
-    serde_json::to_string(m).unwrap()
+    let re = regex::Regex::new(r#""_synaps_at":"[^"]*","#).unwrap();
+    re.replace_all(&serde_json::to_string(m).unwrap(), "").into_owned()
 }
 
 /// `TurnError.correlation_id` comes from a process-global counter
-/// (`next_turn_correlation_id`) — the only legitimately run-dependent bytes.
+/// (`next_turn_correlation_id`) and message times (`_synaps_at`) from the
+/// wall clock — the only legitimately run-dependent bytes.
 fn normalise(seen: &[String]) -> Vec<String> {
     let re = regex::Regex::new(r#"correlation_id: "turn-[0-9]+-[0-9]+""#).unwrap();
+    let at = regex::Regex::new(r#""_synaps_at": String\("[^"]*"\), "#).unwrap();
     seen.iter()
         .map(|s| re.replace_all(s, r#"correlation_id: "turn-N-N""#).into_owned())
+        .map(|s| at.replace_all(&s, "").into_owned())
         .collect()
 }
 
