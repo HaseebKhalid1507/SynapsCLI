@@ -474,6 +474,14 @@ fn is_close_command(cmd: &SessionCommand) -> bool {
     matches!(cmd, SessionCommand::EngineCommand { name, .. } if name == CLOSE_COMMAND)
 }
 
+/// The host-only engine command behind `synaps daemon rename`
+/// (`SessionActor::session_rename`). Clients rename with `saveas`.
+pub(crate) const RENAME_COMMAND: &str = "rename";
+
+fn is_rename_command(cmd: &SessionCommand) -> bool {
+    matches!(cmd, SessionCommand::EngineCommand { name, .. } if name == RENAME_COMMAND)
+}
+
 fn command_name(cmd: &SessionCommand) -> &'static str {
     match cmd {
         SessionCommand::Submit { .. } => "submit",
@@ -492,6 +500,7 @@ fn command_name(cmd: &SessionCommand) -> &'static str {
         SessionCommand::End { .. } => "end",
         SessionCommand::Resync { .. } => "resync",
         SessionCommand::EngineCommand { name, .. } if name == CLOSE_COMMAND => "close",
+        SessionCommand::EngineCommand { name, .. } if name == RENAME_COMMAND => "rename",
         SessionCommand::EngineCommand { .. } => "engine_command",
         SessionCommand::PluginCommand { .. } => "plugin_command",
         SessionCommand::Resume { .. } => "resume",
@@ -5117,6 +5126,16 @@ impl SessionActor {
         use std::ops::ControlFlow;
         let Addressed { from, cmd } = addressed;
         if let Some(c) = from {
+            // `rename` is the daemon's control-connection rename; an
+            // attached client has `/saveas` (owner only).
+            if is_rename_command(&cmd) {
+                self.emit(SessionEventWire::Refused {
+                    client: c,
+                    command: command_name(&cmd).to_string(),
+                    reason: "rename is host-only; use /saveas".into(),
+                });
+                return ControlFlow::Continue(());
+            }
             // Only the daemon's reload sends a reload checkpoint (it stops
             // every worker and fences the session for the exec after it).
             if matches!(cmd, SessionCommand::Checkpoint { reason: CheckpointReason::Reload }) {
@@ -5161,6 +5180,27 @@ impl SessionActor {
             }
         }
         // B3: anything that needs the runtime wakes a parked session first.
+        // Except a host rename: a parked session has no conversation in
+        // memory and has released its journal lock, so renaming it would
+        // mean rebuilding it (MCP, extensions) just to change metadata.
+        // Refused with a stable code instead; it applies once it is live.
+        if self.is_parked() && is_rename_command(&cmd) {
+            if let SessionCommand::EngineCommand { id, .. } = cmd {
+                self.emit(SessionEventWire::QueryResult {
+                    id,
+                    value: serde_json::json!({
+                        "kind": "error",
+                        "code": "parked",
+                        "text": format!(
+                            "session {} is parked; it was not woken to rename it. \
+                             Rename it once it is live again (attach to it, or `synaps daemon pin` it)",
+                            self.id
+                        ),
+                    }),
+                });
+            }
+            return ControlFlow::Continue(());
+        }
         if self.is_parked() {
             let needs_runtime = !matches!(
                 cmd,

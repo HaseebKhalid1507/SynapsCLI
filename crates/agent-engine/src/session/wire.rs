@@ -75,6 +75,8 @@ pub const VIEW_CHANGED_SETTING_ID: u64 = RESERVED_QUERY_ID_BASE + 3;
 /// `QueryResult`, so concurrent closes never take each other's reply.
 /// Attached clients never see these.
 pub const CLOSE_QUERY_ID_BASE: u64 = RESERVED_QUERY_ID_BASE + (1 << 32);
+/// `synaps daemon rename`'s engine command `rename` ids, as for close.
+pub const RENAME_QUERY_ID_BASE: u64 = RESERVED_QUERY_ID_BASE + (2 << 32);
 
 /// The binary version the daemon/client report in the handshake.
 pub fn binary_version() -> String {
@@ -155,6 +157,17 @@ pub enum ClientFrame {
         session_id: SessionId,
         on: bool,
     },
+    /// Control fast path: name (`Some`) or unname (`None` / empty) one
+    /// session, as `/saveas` would, with host authority: no attach, no
+    /// input ownership, no presence change. A parked session is not woken
+    /// (`RenameFailed{parked}`). Reply: `Renamed`, `RenameFailed`, or
+    /// `Refused{Busy|UnknownSession}`. Not accepted on an attached
+    /// connection (that client has `/saveas`).
+    Rename {
+        session_id: SessionId,
+        #[serde(default)]
+        name: Option<String>,
+    },
     /// Control fast path (no session): the in-memory account state of the
     /// broker every session of this daemon shares (`synaps auth state`),
     /// cleared first when `clear` is set. Reply: `AuthState`. A daemon that
@@ -205,6 +218,11 @@ impl std::fmt::Debug for ClientFrame {
                 .debug_struct("Pin")
                 .field("session_id", session_id)
                 .field("on", on)
+                .finish(),
+            Self::Rename { session_id, name } => f
+                .debug_struct("Rename")
+                .field("session_id", session_id)
+                .field("name", name)
                 .finish(),
             Self::AuthState(query) => f.debug_tuple("AuthState").field(query).finish(),
             Self::ReloadExtension { extension } => f
@@ -339,6 +357,21 @@ pub enum DaemonFrame {
         session_id: SessionId,
         on: bool,
     },
+    /// Reply to `Rename`: the session's name is now `name` (`None` =
+    /// cleared). Saved, and every attached client got a `Conversation`.
+    Renamed {
+        session_id: SessionId,
+        name: Option<String>,
+    },
+    /// Reply to `Rename`: the name was not changed. `message` is the
+    /// `/saveas` text; `taken_by` names the session holding the name.
+    RenameFailed {
+        session_id: SessionId,
+        reason: RenameRefusal,
+        message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        taken_by: Option<String>,
+    },
     /// Reply to `ReloadExtension`: the new version is loaded.
     ExtensionReloaded {
         report: crate::extensions::manager::ExtensionReloadReport,
@@ -371,6 +404,51 @@ pub enum ByeReason {
     Reloading { generation: u64, retry_after_ms: u64 },
     Shutdown,
     Detached,
+}
+
+/// Why `Rename` was not applied (`DaemonFrame::RenameFailed`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RenameRefusal {
+    /// Not `[a-z0-9-]{1,40}`.
+    Invalid,
+    /// Another saved session has the name (`taken_by`).
+    Taken,
+    /// A chain has the name.
+    ChainConflict,
+    /// The session is parked; it is not woken to be renamed.
+    Parked,
+    /// The session is live in another process (a lock placeholder here).
+    Locked,
+    /// Anything else (sessions dir unreadable, no reply in time, or a
+    /// reason this client does not know).
+    #[serde(other)]
+    Failed,
+}
+
+impl RenameRefusal {
+    /// The actor's `code` → refusal.
+    pub fn from_code(code: &str) -> Self {
+        match code {
+            "invalid" => Self::Invalid,
+            "taken" => Self::Taken,
+            "chain_conflict" => Self::ChainConflict,
+            "parked" => Self::Parked,
+            "locked" => Self::Locked,
+            _ => Self::Failed,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Invalid => "invalid",
+            Self::Taken => "taken",
+            Self::ChainConflict => "chain_conflict",
+            Self::Parked => "parked",
+            Self::Locked => "locked",
+            Self::Failed => "failed",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1776,6 +1854,8 @@ mod tests {
             ClientFrame::Close { session_id: "s".into(), force: false, attached: false },
             ClientFrame::Pin { session_id: "s".into(), on: true },
             ClientFrame::Pin { session_id: "s".into(), on: false },
+            ClientFrame::Rename { session_id: "s".into(), name: Some("axon".into()) },
+            ClientFrame::Rename { session_id: "s".into(), name: None },
             ClientFrame::AuthState(agent_core::auth::AuthStateQuery::default()),
             ClientFrame::AuthState(agent_core::auth::AuthStateQuery {
                 provider: Some("anthropic".into()),
@@ -1826,6 +1906,20 @@ mod tests {
             DaemonFrame::Closed { session_id: "s".into(), text: "closed".into() },
             DaemonFrame::Pinned { session_id: "s".into(), on: true },
             DaemonFrame::Pinned { session_id: "s".into(), on: false },
+            DaemonFrame::Renamed { session_id: "s".into(), name: Some("axon".into()) },
+            DaemonFrame::Renamed { session_id: "s".into(), name: None },
+            DaemonFrame::RenameFailed {
+                session_id: "s".into(),
+                reason: RenameRefusal::Taken,
+                message: "name 'axon' already used by session t".into(),
+                taken_by: Some("t".into()),
+            },
+            DaemonFrame::RenameFailed {
+                session_id: "s".into(),
+                reason: RenameRefusal::Parked,
+                message: "parked".into(),
+                taken_by: None,
+            },
             DaemonFrame::ExtensionReloaded {
                 report: crate::extensions::manager::ExtensionReloadReport {
                     extension: "subconscious".into(),
@@ -1886,6 +1980,28 @@ mod tests {
         }
         let err = decode_line::<OldClientFrame>(r#"{"type":"close","session_id":"s","force":true}"#).unwrap_err();
         assert!(err.contains("unknown variant `close`"), "{err}");
+    }
+
+    #[test]
+    fn rename_name_defaults_to_clear_and_older_daemons_reject_it_as_an_unknown_variant() {
+        let f: ClientFrame = decode_line(r#"{"type":"rename","session_id":"s"}"#).unwrap();
+        assert!(matches!(f, ClientFrame::Rename { ref session_id, name: None } if session_id.as_str() == "s"));
+        let f: ClientFrame = decode_line(r#"{"type":"rename","session_id":"s","name":"axon"}"#).unwrap();
+        assert!(matches!(f, ClientFrame::Rename { name: Some(ref n), .. } if n == "axon"));
+        #[derive(Debug, Deserialize)]
+        #[serde(tag = "type", rename_all = "snake_case")]
+        enum OldClientFrame {
+            Ping,
+            Purge,
+        }
+        let err = decode_line::<OldClientFrame>(r#"{"type":"rename","session_id":"s","name":"x"}"#).unwrap_err();
+        assert!(err.contains("unknown variant `rename`"), "{err}");
+        // A refusal reason this client does not know decodes as `failed`.
+        let f: DaemonFrame = decode_line(
+            r#"{"type":"rename_failed","session_id":"s","reason":"from_the_future","message":"m"}"#,
+        )
+        .unwrap();
+        assert!(matches!(f, DaemonFrame::RenameFailed { reason: RenameRefusal::Failed, taken_by: None, .. }));
     }
 
     #[test]

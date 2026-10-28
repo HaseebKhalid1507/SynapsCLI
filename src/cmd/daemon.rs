@@ -1,4 +1,4 @@
-//! `synaps daemon {start,status,stop,sessions,purge,reload,close,pin,reload-extension}`
+//! `synaps daemon {start,status,stop,sessions,purge,reload,close,pin,rename,reload-extension}`
 //! (PLAN-phase2 §2.11, B4; phase 3 C2 `purge`, C3 `reload`).
 
 use std::path::PathBuf;
@@ -113,6 +113,23 @@ pub(crate) enum DaemonAction {
         #[arg(long)]
         json: bool,
     },
+    /// Name one session (as /saveas does), or clear its name with --clear,
+    /// without attaching to it: no input ownership is needed and attached
+    /// clients see the new name at once. A parked session is not woken; it
+    /// is refused (exit 3) and can be renamed once it is live.
+    Rename {
+        /// Session id, id prefix, journal id, or current name (see `daemon sessions`).
+        #[arg(value_name = "ID|NAME")]
+        target: String,
+        /// The new name: lowercase letters, digits and '-', at most 40.
+        #[arg(value_name = "NEW_NAME", required_unless_present = "clear", conflicts_with = "clear")]
+        name: Option<String>,
+        /// Clear the session's name instead.
+        #[arg(long)]
+        clear: bool,
+        #[arg(long)]
+        json: bool,
+    },
     /// Restart one extension from what is installed now, in every session,
     /// without `daemon reload`: no session is checkpointed and no turn is
     /// cancelled (only a call into the old process that is in flight
@@ -157,6 +174,9 @@ pub(crate) async fn run(profile: Option<String>, args: DaemonArgs) -> anyhow::Re
         Some(DaemonAction::Reload { now, drain_secs, exe, json }) => reload(profile, now, drain_secs, exe, json).await,
         Some(DaemonAction::Close { target, force, attached, json }) => close(profile, target, force, attached, json).await,
         Some(DaemonAction::Pin { target, off, json }) => pin(profile, target, !off, json).await,
+        Some(DaemonAction::Rename { target, name, clear, json }) => {
+            rename(profile, target, if clear { None } else { name }, json).await
+        }
         Some(DaemonAction::ReloadExtension { name, json }) => reload_extension(profile, name, json).await,
     }
 }
@@ -309,6 +329,105 @@ async fn pin(profile: Option<String>, target: String, on: bool, json: bool) -> a
         Err(e @ TransportError::DaemonTooOld { .. }) => pin_exit(json, EXIT_VERSION, sid, "too_old", on, &e.to_string()),
         Err(e) => pin_exit(json, 1, sid, "error", on, &format!("pin failed: {e}")),
     }
+}
+
+/// `daemon rename`: resolve the target against the `Welcome` listing (as
+/// `daemon close` does), send `Rename`, report. Exit 0 renamed or cleared;
+/// 3 refused (session parked, live in another process, daemon reloading);
+/// 2 daemon too old or protocol mismatch; 1 otherwise (invalid name, name
+/// taken, chain conflict, not found, ambiguous, prefix too short, no
+/// daemon, timeout).
+async fn rename(profile: Option<String>, target: String, name: Option<String>, json: bool) -> anyhow::Result<()> {
+    use agent_engine::session::wire::RenameRefusal;
+    let paths = registry::daemon_paths(profile.as_deref());
+    if !registry::is_alive(&paths) {
+        rename_exit(json, 1, None, "no_daemon", None, None, "daemon not running");
+    }
+    let mut conn = match Connected::connect(&paths.sock, Hello::new(ClientKind::Attach)).await {
+        Ok(c) => c,
+        Err(e @ TransportError::Version { .. }) => rename_exit(json, EXIT_VERSION, None, "version", None, None, &e.to_string()),
+        Err(e) => rename_exit(json, 1, None, "error", None, None, &format!("cannot reach the daemon: {e}")),
+    };
+    let id = match resolve_session(&conn.welcome.sessions, &target) {
+        Ok(id) => id,
+        Err(err) => {
+            conn.bye().await;
+            let (outcome, text) = resolve_error_text(&target, err);
+            rename_exit(json, 1, None, outcome, None, None, &text);
+        }
+    };
+    let outcome = conn.rename(&id, name.as_deref()).await;
+    conn.bye().await;
+    let sid = Some(id.as_str());
+    match outcome {
+        Ok(Ok(Some(n))) => rename_exit(json, 0, sid, "renamed", Some(&n), None, &format!("renamed {id} to {n}")),
+        Ok(Ok(None)) => rename_exit(json, 0, sid, "cleared", None, None, &format!("cleared the name of {id}")),
+        Ok(Err(f)) => {
+            let code = match f.reason {
+                RenameRefusal::Parked | RenameRefusal::Locked => EXIT_REFUSED,
+                _ => 1,
+            };
+            rename_exit(json, code, sid, f.reason.as_str(), None, f.taken_by.as_deref(), &f.message)
+        }
+        Err(TransportError::Refused(text)) => rename_exit(json, EXIT_REFUSED, sid, "refused", None, None, &text),
+        Err(TransportError::UnknownSession(text)) => rename_exit(json, 1, sid, "not_found", None, None, &text),
+        Err(e @ TransportError::DaemonTooOld { .. }) => {
+            rename_exit(json, EXIT_VERSION, sid, "too_old", None, None, &e.to_string())
+        }
+        Err(e) => rename_exit(json, 1, sid, "error", None, None, &format!("rename failed: {e}")),
+    }
+}
+
+/// `(outcome, text)` for a target that did not resolve to one session.
+fn resolve_error_text(target: &str, err: ResolveError) -> (&'static str, String) {
+    match err {
+        ResolveError::NotFound => ("not_found", format!("no live session matches {target} (see `synaps daemon sessions`)")),
+        ResolveError::TooShort { min } => (
+            "too_short",
+            format!("{target} is too short to pick a session by prefix; give at least {min} characters, the full id or the name"),
+        ),
+        ResolveError::Ambiguous(matches) => {
+            let mut text = format!("{target} matches {} sessions; use a longer prefix or the full id:", matches.len());
+            for m in &matches {
+                text.push_str(&format!("\n  {}", m.id));
+                if let Some(name) = &m.name {
+                    text.push_str(&format!("  name={name}"));
+                }
+            }
+            ("ambiguous", text)
+        }
+    }
+}
+
+/// Like [`close_exit`], plus `name` (the session's name afterwards on
+/// success, `null` when cleared or nothing was confirmed) and `taken_by`.
+fn rename_exit(
+    json: bool,
+    code: i32,
+    session_id: Option<&str>,
+    outcome: &str,
+    name: Option<&str>,
+    taken_by: Option<&str>,
+    text: &str,
+) -> ! {
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "ok": code == 0,
+                "session_id": session_id,
+                "outcome": outcome,
+                "name": name,
+                "taken_by": taken_by,
+                "text": text,
+            })
+        );
+    } else if code == 0 {
+        println!("{text}");
+    } else {
+        eprintln!("{text}");
+    }
+    std::process::exit(code);
 }
 
 /// Like [`close_exit`], plus `pinned`: the session's pin afterwards on
@@ -817,5 +936,48 @@ mod state_phrase_tests {
         m.cost_usd = 1.034;
         m.title = Some("any ai events".into());
         assert_eq!(title_part(&m), "  $1.03  58 msgs  \"any ai events\"");
+    }
+}
+
+#[cfg(test)]
+mod rename_cli_tests {
+    use super::*;
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct Cli {
+        #[command(subcommand)]
+        action: DaemonAction,
+    }
+
+    fn parse(args: &[&str]) -> Result<DaemonAction, clap::Error> {
+        Cli::try_parse_from(std::iter::once("daemon").chain(args.iter().copied())).map(|c| c.action)
+    }
+
+    #[test]
+    fn rename_takes_a_target_and_a_name_or_clear() {
+        match parse(&["rename", "20261028", "axon", "--json"]).unwrap() {
+            DaemonAction::Rename { target, name, clear, json } => {
+                assert_eq!((target.as_str(), name.as_deref(), clear, json), ("20261028", Some("axon"), false, true));
+            }
+            other => panic!("{other:?}"),
+        }
+        match parse(&["rename", "axon", "--clear"]).unwrap() {
+            DaemonAction::Rename { target, name, clear, .. } => {
+                assert_eq!((target.as_str(), name, clear), ("axon", None, true));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(parse(&["rename", "axon"]).is_err(), "a new name or --clear is required");
+        assert!(parse(&["rename", "axon", "new", "--clear"]).is_err(), "not both");
+        assert!(parse(&["rename"]).is_err());
+    }
+
+    #[test]
+    fn an_unresolved_target_names_its_outcome() {
+        assert_eq!(resolve_error_text("x", ResolveError::NotFound).0, "not_found");
+        let (outcome, text) = resolve_error_text("2026", ResolveError::TooShort { min: 8 });
+        assert_eq!(outcome, "too_short");
+        assert!(text.contains("at least 8"), "{text}");
     }
 }

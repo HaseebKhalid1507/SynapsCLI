@@ -111,6 +111,13 @@ impl SessionActor {
             self.emit(SessionEventWire::QueryResult { id, value });
             return;
         }
+        // `synaps daemon rename` (host only, see `RENAME_COMMAND`): saveas
+        // with a typed failure code.
+        if cmd == super::actor::RENAME_COMMAND {
+            let value = self.session_rename(&arg).await;
+            self.emit(SessionEventWire::QueryResult { id, value });
+            return;
+        }
         // `/keepwarm [status|off|auto|<N>h]`: actor-owned prompt-cache
         // keep-warm state (task #444).
         if cmd == "keepwarm" {
@@ -387,6 +394,33 @@ impl SessionActor {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(choice);
         }
+    }
+
+    /// `synaps daemon rename`: exactly [`Self::session_name`] (validate,
+    /// unique across the sessions dir, no chain clash, save, `sync_name`,
+    /// `emit_conversation`), but a refusal carries a stable `code`
+    /// (`invalid` | `taken` + `taken_by` | `chain_conflict` | `io`) and
+    /// success the final `name` (`null` = cleared).
+    async fn session_rename(&mut self, arg: &str) -> serde_json::Value {
+        let trimmed = arg.trim();
+        if !trimmed.is_empty() {
+            if let Err(e) = self.conv.session.check_name(trimmed) {
+                let taken_by = match &e {
+                    agent_core::session::NameError::Taken { by, .. } => serde_json::json!(by),
+                    _ => serde_json::Value::Null,
+                };
+                return serde_json::json!({
+                    "kind": "error", "code": e.code(), "text": e.to_string(), "taken_by": taken_by,
+                });
+            }
+        }
+        let mut value = self.session_name(trimmed).await;
+        if value.get("kind").and_then(|k| k.as_str()) == Some("error") {
+            // Changed between the check and the set (another rename won).
+            let code = self.conv.session.check_name(trimmed).err().map_or("io", |e| e.code());
+            value["code"] = serde_json::json!(code);
+        }
+        value
     }
 
     /// `/saveas <name>` | `/saveas` (clear). Force-saves even with no
