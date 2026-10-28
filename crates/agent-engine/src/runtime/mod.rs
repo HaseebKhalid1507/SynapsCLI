@@ -4101,7 +4101,7 @@ impl Runtime {
             // must not consume a user's one-shot `/trace next` arm.
             &api::ApiOptions {
                 trace: self.trace_ctx.clone(),
-                telemetry: self.request_telemetry(),
+                telemetry: self.telemetry_writer.clone(),
                 ..api::ApiOptions::default()
             },
         )
@@ -4162,7 +4162,7 @@ impl Runtime {
                     trace: self.effective_trace_context(),
                     request_correlation: None,
                     suppress_stream_deltas: true,
-                    telemetry: self.request_telemetry(),
+                    telemetry: self.telemetry_writer.clone(),
                     // Non-stream path note (Task 16 review): threading the
                     // host session here gates extension-provider interior
                     // tool loops identically to stream turns. The built-in
