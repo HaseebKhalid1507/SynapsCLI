@@ -784,6 +784,10 @@ const PERSISTED_ID: &str = "20261028-045932-eb8e";
 /// Drive one request with telemetry on (trace into `h.sink`, api-log into a
 /// temp file) and return the single api-log record.
 async fn one_api_log_record(h: &Harness) -> serde_json::Value {
+    one_api_log_record_with_retries(h, 0).await
+}
+
+async fn one_api_log_record_with_retries(h: &Harness, max_retries: u32) -> serde_json::Value {
     use crate::runtime::telemetry::{TelemetryWriter, WriterOptions};
     let log = h._tmp.path().join("synaps/api-log.jsonl");
     let writer = TelemetryWriter::new(WriterOptions {
@@ -800,7 +804,7 @@ async fn one_api_log_record(h: &Harness) -> serde_json::Value {
     let (tx, _rx) = mpsc::unbounded_channel::<StreamEvent>();
     let _ = drive_stream_full(
         &options,
-        0,
+        max_retries,
         &CancellationToken::new(),
         tx,
         TelemetryLevel::Basic,
@@ -897,4 +901,49 @@ async fn api_log_omits_ttft_and_cost_when_no_event_arrived() {
     assert!(record.get("cost_usd").is_none(), "{record}");
     assert_eq!(record["session_id"], PERSISTED_ID, "{record}");
     assert!(record["runtime_session_id"].is_string(), "{record}");
+}
+
+/// Each attempt restarts the clock at its own send: after a 529 (itself
+/// slow, then a 1 s `retry-after` backoff) the successful attempt's TTFT
+/// covers only its own header delay, never attempt 1 or the backoff.
+#[tokio::test]
+async fn api_log_ttft_after_a_retry_excludes_the_failed_attempt_and_the_backoff() {
+    const FAIL_MS: u64 = 300;
+    const OK_MS: u64 = 80;
+    let hits = Arc::new(AtomicUsize::new(0));
+    let hits_c = Arc::clone(&hits);
+    let app = Router::new().route(
+        "/v1/messages",
+        axum_post(move || {
+            let hits = Arc::clone(&hits_c);
+            async move {
+                if hits.fetch_add(1, Ordering::SeqCst) == 0 {
+                    tokio::time::sleep(Duration::from_millis(FAIL_MS)).await;
+                    (
+                        StatusCode::from_u16(529).unwrap(),
+                        [("retry-after", "1")],
+                        "{\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\"}}".to_string(),
+                    )
+                        .into_response()
+                } else {
+                    tokio::time::sleep(Duration::from_millis(OK_MS)).await;
+                    sse_response()
+                }
+            }
+        }),
+    );
+    let h = harness(serve(app).await);
+    let record = one_api_log_record_with_retries(&h, 3).await;
+    assert_eq!(hits.load(Ordering::SeqCst), 2, "one 529, then success");
+
+    assert_eq!(record["attempt"], 2, "{record}");
+    let ttft = record["ttft_ms"].as_u64().expect("ttft_ms present");
+    let total = record["total_ms"].as_u64().unwrap();
+    assert!(ttft >= OK_MS - 20, "covers attempt 2's own header delay: {record}");
+    assert!(ttft < FAIL_MS, "excludes attempt 1 ({FAIL_MS} ms) and the 1 s backoff: {record}");
+    assert!(total < 1000, "total_ms is attempt 2's too: {record}");
+    let traces = h.sink.records();
+    assert_eq!(traces.len(), 2, "one trace record per attempt");
+    assert_eq!(Some(ttft), traces[1].outcome.timings.first_model_event_ms);
+    assert_eq!(record["trace_request_id"], traces[1].request_id.as_str(), "attempts share the request id");
 }
