@@ -512,24 +512,36 @@ fn install_slow_start_plugin(guard: &HomeGuard) -> PathBuf {
         dir.join("extensions/slow_session_start_extension.py"),
     )
     .unwrap();
-    std::fs::write(
-        dir.join(".synaps-plugin/plugin.json"),
-        r#"{
-  "name": "slow-start",
-  "version": "0.1.0",
-  "extension": {
-    "protocol_version": 1,
-    "runtime": "process",
-    "command": "python3",
-    "args": ["extensions/slow_session_start_extension.py"],
-    "permissions": ["session.lifecycle"],
-    "hooks": [{"hook": "on_session_start"}]
-  }
-}
-"#,
-    )
-    .unwrap();
+    let manifest = serde_json::json!({
+        "name": "slow-start",
+        "version": "0.1.0",
+        "extension": {
+            "protocol_version": 1,
+            "runtime": "process",
+            "command": python(),
+            "args": ["extensions/slow_session_start_extension.py"],
+            "permissions": ["session.lifecycle"],
+            "hooks": [{"hook": "on_session_start"}]
+        }
+    });
+    std::fs::write(dir.join(".synaps-plugin/plugin.json"), serde_json::to_string_pretty(&manifest).unwrap()).unwrap();
     dir
+}
+
+/// The fixture interpreter. Windows has no `python3`, and a bare `python`
+/// may be the Store alias stub: take the first real `python.exe` on PATH
+/// (split as cmd.exe does), as `daemon_autospawn` does.
+fn python() -> String {
+    if cfg!(windows) {
+        let path = std::env::var("PATH").unwrap_or_default();
+        path.split(';')
+            .map(|d| Path::new(d.trim().trim_matches('"')).join("python.exe"))
+            .find(|p| p.is_file() && !p.to_string_lossy().contains("WindowsApps"))
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "python".into())
+    } else {
+        "python3".into()
+    }
 }
 
 /// Create `n` sessions, each with one finished turn, and detach.
@@ -588,7 +600,7 @@ async fn reload_with_a_slow_session_start_hook_answers_within_seconds() {
     let took = answered_within(&d.paths, 2, t0, Duration::from_secs(20)).await;
     assert!(took.is_some(), "the new image did not answer within 20 s of the reload");
     eprintln!("reload with {SESSIONS} slow hooks: answered after {took:?}");
-    assert_eq!(registry::read_daemon_json(&d.paths).unwrap().pid, pid_before);
+    assert_reload_pid(registry::read_daemon_json(&d.paths).unwrap().pid, pid_before);
 
     let listed = SocketTransport::sessions(&d.paths.sock).await.expect("sessions");
     for id in &ids {

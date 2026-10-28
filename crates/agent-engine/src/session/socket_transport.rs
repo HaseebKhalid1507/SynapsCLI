@@ -1231,7 +1231,7 @@ mod tests {
     #[tokio::test]
     async fn next_event_survives_cancellation_mid_frame() {
         let (_d, path) = sock();
-        let l = UnixListener::bind(&path).unwrap();
+        let l = Listener::bind(&path).unwrap();
         let srv = tokio::spawn(fake_daemon(l, PROTOCOL_VERSION));
         let conn = SocketTransport::connect(&path, Hello::new(ClientKind::Test)).await.unwrap();
         let (mut t, _) = SocketTransport::attach(conn, Attach::Existing { session_id: "fake-1".into(), mode: AttachMode::Mirror })

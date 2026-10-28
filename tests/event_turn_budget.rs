@@ -230,14 +230,9 @@ async fn send_event(t: &LocalTransport, id: &str) {
     let path = synaps_cli::events::registry::find_session_registration(t.session_id().as_str())
         .expect("published session endpoint")
         .socket_path;
-    use tokio::io::AsyncWriteExt;
-    let mut s = tokio::net::UnixStream::connect(&path)
+    synaps_cli::events::socket::send_to_session_socket(&path, serde_json::to_string(&ev).unwrap().as_bytes())
         .await
         .expect("session socket");
-    s.write_all(serde_json::to_string(&ev).unwrap().as_bytes())
-        .await
-        .unwrap();
-    s.shutdown().await.unwrap();
 }
 
 async fn until_turn_started(t: &mut LocalTransport) {
