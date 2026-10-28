@@ -1208,6 +1208,10 @@ pub struct SynapsConfig {
     pub api_retries: u32,        // default 3
     pub refusal_retries: u32,    // default 2 — retries on stop_reason=refusal
     pub telemetry: String,       // off | basic | full (default off)
+    /// Rotated generations kept for `api-log.jsonl` and
+    /// `request-trace.jsonl` (`telemetry_log_generations`, 1–
+    /// [`MAX_TELEMETRY_LOG_GENERATIONS`], default 1: just `<log>.1`).
+    pub telemetry_log_generations: u32,
     pub cache_diagnostics: bool, // opt into cache-diagnosis beta (default false)
     /// Prompt-cache TTL strategy: "5m" (default) | "1h" | "hybrid".
     pub cache_ttl: CacheTtl,
@@ -1316,6 +1320,7 @@ impl Default for SynapsConfig {
             api_retries: 3,
             refusal_retries: 2,
             telemetry: "off".to_string(),
+            telemetry_log_generations: 1,
             cache_diagnostics: false,
             cache_ttl: CacheTtl::default(),
             cache_keepwarm: CacheKeepWarm::Off,
@@ -1353,6 +1358,10 @@ impl Default for SynapsConfig {
     }
 }
 
+/// Upper bound for `telemetry_log_generations` (each generation of each log
+/// is up to 50 MB).
+pub const MAX_TELEMETRY_LOG_GENERATIONS: u32 = 100;
+
 /// Known top-level config keys — used for unknown-key warnings + did-you-mean.
 /// Public so the /settings coverage test can require a settings row (or an
 /// explicit exclusion) for every key here.
@@ -1387,6 +1396,7 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "api_retries",
     "refusal_retries",
     "telemetry",
+    "telemetry_log_generations",
     "cache_diagnostics",
     "cache_ttl",
     "cache_keepwarm",
@@ -1935,6 +1945,14 @@ fn apply_config_content_with(
                 }
             }
             "telemetry" => config.telemetry = val.to_string(),
+            "telemetry_log_generations" => match val.parse::<u32>() {
+                Ok(n) if (1..=MAX_TELEMETRY_LOG_GENERATIONS).contains(&n) => {
+                    config.telemetry_log_generations = n;
+                }
+                _ => config.warnings.push(format!(
+                    "telemetry_log_generations = {val} — expected 1–{MAX_TELEMETRY_LOG_GENERATIONS}; keeping 1"
+                )),
+            },
             "cache_diagnostics" => {
                 config.cache_diagnostics = matches!(val, "true" | "1" | "on" | "yes");
             }
@@ -3409,6 +3427,28 @@ mod tests {
         }
         for mode in [CacheKeepWarm::Off, CacheKeepWarm::Auto, CacheKeepWarm::Hours(6)] {
             assert_eq!(CacheKeepWarm::parse(&mode.to_string()), Some(mode));
+        }
+    }
+
+    #[test]
+    fn test_telemetry_log_generations_config_key() {
+        let c = load_config_from_str("telemetry = basic\n");
+        assert_eq!(c.telemetry_log_generations, 1, "default: one generation");
+
+        let c = load_config_from_str("telemetry_log_generations = 7\n");
+        assert_eq!(c.telemetry_log_generations, 7);
+        assert!(c.warnings.is_empty(), "warnings: {:?}", c.warnings);
+
+        for bad in ["0", "101", "-1", "lots"] {
+            let c = load_config_from_str(&format!("telemetry_log_generations = {bad}\n"));
+            assert_eq!(c.telemetry_log_generations, 1, "{bad}");
+            assert!(
+                c.warnings
+                    .iter()
+                    .any(|w| w.contains("telemetry_log_generations")),
+                "{bad}: {:?}",
+                c.warnings
+            );
         }
     }
 

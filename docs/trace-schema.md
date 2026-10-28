@@ -141,6 +141,26 @@ the preceding failed attempt was already recorded.
   (`~/.cache/synaps/request-trace.jsonl`); `off` (the default) disables both
   — no writer thread exists and every trace seam is the no-op sink, so the
   request path does zero observability work.
+- **Rotation:** each log rotates when it passes 50 MB
+  (`DEFAULT_MAX_FILE_BYTES`). `telemetry_log_generations = N` (1–100,
+  default 1) keeps `<log>.1` (newest) .. `<log>.N` (oldest) for both logs;
+  the default keeps the single `<log>.1` generation as before.
+- **Joining `api-log.jsonl` to the trace:** the trace's `session_id` is a
+  *runtime* id (`session-<pid>-<ms>`, new per process), not the persisted
+  conversation id. In api-log, `session_id` is the persisted conversation
+  id (`~/.synaps-cli/sessions/<id>.json`, `synaps daemon sessions`; absent
+  for unkeyed runtimes such as workers), and `runtime_session_id`,
+  `turn_id` and `trace_request_id` equal the trace record's `session_id` /
+  `turn_id` / `request_id` for that call (`request_id` in api-log stays the
+  provider's `request-id` header). The trace does not carry the persisted
+  id; join through api-log. Its
+  `ttft_ms` is the trace's `outcome.timings.first_model_event_ms` and
+  `total_ms` is measured from the same send start. Subagent records keep
+  `"worker": true` and add `worker_agent`, `worker_handle` (`sa_N`),
+  `parent_session_id` (the spawning session's persisted id) and
+  `parent_runtime_session_id` (its runtime id). `cost_usd` is
+  an estimate from `agent_core::pricing` (5m and 1h cache writes at their
+  own rates). All of these are optional and absent when unknown.
 - **Shutdown flush:** every clean process/runtime exit path that owns a
   `Runtime` (headless chat, TUI teardown, autonomous agent, RPC, server)
   calls `Runtime::shutdown_observability_async` under a short bounded budget

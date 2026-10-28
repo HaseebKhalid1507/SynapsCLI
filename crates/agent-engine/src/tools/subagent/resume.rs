@@ -279,6 +279,7 @@ impl Tool for SubagentResumeTool {
         let memory_backend = ctx.capabilities.memory_backend.clone();
         let session_allow_all = ctx.capabilities.session_allow_all.clone();
         let telemetry = ctx.capabilities.telemetry.clone();
+        let telemetry = telemetry.map(|t| t.for_worker(&label, &handle_id));
 
         tracing::info!(
             "subagent_resume: dispatching '{}' (id={}, resumed_from={}) model={}",

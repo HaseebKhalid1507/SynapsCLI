@@ -776,3 +776,125 @@ async fn api_log_marks_worker_requests() {
     assert!(records[0].get("worker").is_none(), "{}", records[0]);
     assert_eq!(records[1]["worker"], json!(true), "{}", records[1]);
 }
+
+// ─── api-log.jsonl: TTFT, correlation ids and cost ───────────────────────────
+
+const PERSISTED_ID: &str = "20261028-045932-eb8e";
+
+/// Drive one request with telemetry on (trace into `h.sink`, api-log into a
+/// temp file) and return the single api-log record.
+async fn one_api_log_record(h: &Harness) -> serde_json::Value {
+    use crate::runtime::telemetry::{TelemetryWriter, WriterOptions};
+    let log = h._tmp.path().join("synaps/api-log.jsonl");
+    let writer = TelemetryWriter::new(WriterOptions {
+        telemetry_path: Some(log.clone()),
+        trace_path: Some(h._tmp.path().join("synaps/request-trace.jsonl")),
+        ..WriterOptions::default()
+    });
+    // As `Runtime::request_telemetry` hands it out: stamped with the
+    // persisted conversation id.
+    let options = ApiOptions {
+        telemetry: Some(writer.with_session(Some(PERSISTED_ID.to_string()))),
+        ..h.options.clone()
+    };
+    let (tx, _rx) = mpsc::unbounded_channel::<StreamEvent>();
+    let _ = drive_stream_full(
+        &options,
+        0,
+        &CancellationToken::new(),
+        tx,
+        TelemetryLevel::Basic,
+    )
+    .await;
+    assert!(writer.shutdown(Duration::from_secs(10)).is_flushed());
+    let text = std::fs::read_to_string(&log).unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 1, "one api-log record per request: {text}");
+    serde_json::from_str(lines[0]).unwrap()
+}
+
+/// Regression: `ttft_ms` was measured from an instant taken AFTER the
+/// response headers arrived, and Anthropic sends `message_start` with the
+/// headers, so 44.5K of 44.9K live records read `"ttft_ms":0` while the
+/// trace showed ~480 ms. With the headers delayed by STAGE_MS, TTFT must
+/// cover that delay, equal the trace record's `first_model_event_ms`, and
+/// never exceed `total_ms`.
+#[tokio::test]
+async fn api_log_ttft_is_measured_from_send_and_matches_the_trace() {
+    const STAGE_MS: u64 = 80;
+    const TOL_MS: u64 = 60;
+    let app = Router::new().route(
+        "/v1/messages",
+        axum_post(|| async {
+            tokio::time::sleep(Duration::from_millis(STAGE_MS)).await;
+            sse_response()
+        }),
+    );
+    let h = harness(serve(app).await);
+    let record = one_api_log_record(&h).await;
+
+    let ttft = record["ttft_ms"].as_u64().expect("ttft_ms present");
+    let total = record["total_ms"].as_u64().unwrap();
+    assert!(ttft >= TOL_MS, "TTFT covers the header delay: {record}");
+    assert!(ttft <= total, "TTFT within the request: {record}");
+
+    let traces = h.sink.records();
+    assert_eq!(traces.len(), 1);
+    let trace = &traces[0];
+    assert_eq!(
+        Some(ttft),
+        trace.outcome.timings.first_model_event_ms,
+        "api-log TTFT is the trace first_model_event_ms"
+    );
+    // `session_id` is the persisted conversation id; the trace's runtime
+    // session id rides as `runtime_session_id`.
+    assert_eq!(record["session_id"], PERSISTED_ID);
+    assert_eq!(record["runtime_session_id"], trace.session_id.as_str());
+    assert_eq!(record["turn_id"], trace.turn_id.as_str());
+    assert_eq!(record["trace_request_id"], trace.request_id.as_str());
+    assert!(trace.session_id.as_str().starts_with("session-"));
+    assert!(trace.turn_id.as_str().starts_with("turn-"));
+    // Cost from agent_core::pricing over the record's own usage.
+    let expected = agent_core::pricing::calculate_cost(
+        "claude-haiku-4-5",
+        record["usage"]["input"].as_u64().unwrap(),
+        record["usage"]["output"].as_u64().unwrap(),
+        0,
+        0,
+    );
+    let cost = record["cost_usd"].as_f64().expect("cost_usd present");
+    assert!(cost > 0.0 && (cost - expected).abs() < 1e-12, "{record}");
+    // Foreground: no worker identity fields.
+    for key in [
+        "worker",
+        "worker_agent",
+        "worker_handle",
+        "parent_session_id",
+        "parent_runtime_session_id",
+    ] {
+        assert!(record.get(key).is_none(), "{key}: {record}");
+    }
+}
+
+/// A stream that ends without a single model event has no TTFT: the field
+/// is absent (never `0`), and with no usage there is no cost either.
+#[tokio::test]
+async fn api_log_omits_ttft_and_cost_when_no_event_arrived() {
+    let app = Router::new().route(
+        "/v1/messages",
+        axum_post(|| async {
+            (
+                StatusCode::OK,
+                [("content-type", "text/event-stream")],
+                ": keepalive\n\n".to_string(),
+            )
+                .into_response()
+        }),
+    );
+    let h = harness(serve(app).await);
+    let record = one_api_log_record(&h).await;
+    assert!(record.get("ttft_ms").is_none(), "{record}");
+    assert!(record.get("cost_usd").is_none(), "{record}");
+    assert_eq!(record["session_id"], PERSISTED_ID, "{record}");
+    assert!(record["runtime_session_id"].is_string(), "{record}");
+}

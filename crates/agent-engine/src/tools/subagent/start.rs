@@ -151,6 +151,7 @@ impl Tool for SubagentStartTool {
             .unwrap_or(ctx.limits.subagent_timeout);
 
         let label = super::subagent_label(agent_name.as_deref(), params["name"].as_str());
+        let telemetry = telemetry.map(|t| t.for_worker(&label, &handle_id));
         let task_preview: String = task.chars().take(80).collect();
         let task_full = task.clone();
 

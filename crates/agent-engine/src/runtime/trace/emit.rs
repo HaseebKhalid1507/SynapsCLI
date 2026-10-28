@@ -533,6 +533,16 @@ impl AttemptClock {
         }
     }
 
+    /// First parsed model event, ms after send start (`None` if unobserved).
+    pub fn first_model_event_ms(&self) -> Option<u64> {
+        self.first_model_event_ms
+    }
+
+    /// Stream end, ms after send start; until marked, the time elapsed so far.
+    pub fn stream_end_or_now_ms(&self) -> u64 {
+        self.stream_end_ms.unwrap_or_else(|| self.elapsed_ms())
+    }
+
     fn stages(&self) -> TimingStages {
         TimingStages {
             send_start_unix_ms: Some(self.send_start_unix_ms),

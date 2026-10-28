@@ -676,6 +676,9 @@ impl StreamMethods {
         let worker_telemetry = crate::runtime::telemetry::WorkerTelemetry {
             level: telemetry_level,
             writer: options.telemetry.clone(),
+            parent_session_id: session_id.clone(),
+            parent_runtime_session_id: Some(options.trace.session_id().as_str().to_string()),
+            ..Default::default()
         };
         let codex_parent_plan = crate::Runtime::codex_delegation_plan(
             &model,
