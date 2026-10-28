@@ -111,13 +111,6 @@ impl SessionActor {
             self.emit(SessionEventWire::QueryResult { id, value });
             return;
         }
-        // `synaps daemon rename` (host only, see `RENAME_COMMAND`): saveas
-        // with a typed failure code.
-        if cmd == super::actor::RENAME_COMMAND {
-            let value = self.session_rename(&arg).await;
-            self.emit(SessionEventWire::QueryResult { id, value });
-            return;
-        }
         // `/keepwarm [status|off|auto|<N>h]`: actor-owned prompt-cache
         // keep-warm state (task #444).
         if cmd == "keepwarm" {
@@ -394,33 +387,6 @@ impl SessionActor {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(choice);
         }
-    }
-
-    /// `synaps daemon rename`: exactly [`Self::session_name`] (validate,
-    /// unique across the sessions dir, no chain clash, save, `sync_name`,
-    /// `emit_conversation`), but a refusal carries a stable `code`
-    /// (`invalid` | `taken` + `taken_by` | `chain_conflict` | `io`) and
-    /// success the final `name` (`null` = cleared).
-    async fn session_rename(&mut self, arg: &str) -> serde_json::Value {
-        let trimmed = arg.trim();
-        if !trimmed.is_empty() {
-            if let Err(e) = self.conv.session.check_name(trimmed) {
-                let taken_by = match &e {
-                    agent_core::session::NameError::Taken { by, .. } => serde_json::json!(by),
-                    _ => serde_json::Value::Null,
-                };
-                return serde_json::json!({
-                    "kind": "error", "code": e.code(), "text": e.to_string(), "taken_by": taken_by,
-                });
-            }
-        }
-        let mut value = self.session_name(trimmed).await;
-        if value.get("kind").and_then(|k| k.as_str()) == Some("error") {
-            // Changed between the check and the set (another rename won).
-            let code = self.conv.session.check_name(trimmed).err().map_or("io", |e| e.code());
-            value["code"] = serde_json::json!(code);
-        }
-        value
     }
 
     /// `/saveas <name>` | `/saveas` (clear). Force-saves even with no
@@ -748,5 +714,164 @@ mod auth_command_tests {
     #[test]
     fn auth_is_a_builtin_command() {
         assert!(crate::skills::BUILTIN_COMMANDS.contains(&"auth"));
+    }
+}
+
+// ── `synaps daemon rename` (host-only engine command `rename`) ──────────────
+
+/// Held from the uniqueness check through the save and the published name,
+/// so two sessions of this daemon can never take the same name at once (the
+/// actors are separate tasks). Other processes are covered by journal locks.
+static NAME_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// The `rename` command's argument: JSON, written only by the daemon
+/// (`daemon/rename.rs`). Plain text (an in-process `/rename foo`) is refused.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub(crate) struct RenameArgs {
+    pub name: Option<String>,
+    /// Compare-and-set: `Some(None)` = only if unnamed, `Some(Some(x))` =
+    /// only if named `x`, `None` = no precondition.
+    #[serde(
+        default,
+        deserialize_with = "crate::session::wire::present_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub expect: Option<Option<String>>,
+}
+
+fn rename_error(code: &str, text: impl Into<String>) -> serde_json::Value {
+    serde_json::json!({ "kind": "error", "code": code, "text": text.into() })
+}
+
+fn rename_ok(name: &Option<String>, in_memory_only: bool) -> serde_json::Value {
+    let text = match (name, in_memory_only) {
+        (Some(n), false) => format!("session named '{n}'"),
+        (None, false) => "session name cleared".to_string(),
+        (Some(n), true) => format!("session named '{n}' (in memory only: this session is not saved)"),
+        (None, true) => "session name cleared (in memory only: this session is not saved)".to_string(),
+    };
+    serde_json::json!({ "kind": "output", "text": text, "name": name, "in_memory_only": in_memory_only })
+}
+
+fn name_error_reply(e: agent_core::session::NameError) -> serde_json::Value {
+    let mut v = rename_error(e.code(), e.to_string());
+    if let agent_core::session::NameError::Taken { by, .. } = &e {
+        v["taken_by"] = serde_json::json!(by);
+    }
+    if matches!(e, agent_core::session::NameError::Io(_)) {
+        v["code"] = serde_json::json!("failed");
+    }
+    v
+}
+
+impl SessionActor {
+    /// `synaps daemon rename`: `/saveas`'s rules (valid, unique across the
+    /// sessions dir, no chain clash) under [`NAME_LOCK`], with the
+    /// compare-and-set `expect`. A live session saves durably and keeps its
+    /// file mtimes (a rename is not activity: `--continue` and `/sessions`
+    /// go by mtime); a failed save rolls the name back. A parked session is
+    /// renamed on disk under its journal lock and is not woken.
+    pub(crate) async fn host_rename(&mut self, arg: &str) -> serde_json::Value {
+        let Ok(args) = serde_json::from_str::<RenameArgs>(arg) else {
+            return rename_error(
+                "failed",
+                "rename is the daemon's control command (`synaps daemon rename`); use /saveas",
+            );
+        };
+        let want = args.name.as_deref().map(str::trim).filter(|n| !n.is_empty()).map(str::to_string);
+        if let Some(n) = &want {
+            if let Err(e) = agent_core::session::validate_name(n) {
+                return rename_error("invalid", e);
+            }
+        }
+        let _guard = NAME_LOCK.lock().await;
+        let current: Option<String> =
+            if self.is_parked() { (**self.name.load()).clone() } else { self.conv.session.name.clone() };
+        if let Some(expected) = &args.expect {
+            if *expected != current {
+                let text = match (&current, expected) {
+                    (Some(c), None) => format!("session is named '{c}'; rename never replaces a name without --force"),
+                    (Some(c), Some(e)) => format!("session is named '{c}', not '{e}'; not renamed"),
+                    (None, _) => "session has no name any more; not renamed".to_string(),
+                };
+                let mut v = rename_error("named", text);
+                v["current_name"] = serde_json::json!(current);
+                return v;
+            }
+        }
+        if want == current {
+            return rename_ok(&want, !self.is_parked() && !self.config.persist);
+        }
+        if self.is_parked() {
+            self.rename_parked(want).await
+        } else {
+            self.rename_live(want).await
+        }
+    }
+
+    async fn rename_live(&mut self, want: Option<String>) -> serde_json::Value {
+        if let Some(n) = &want {
+            // One sessions-dir scan; the name is then assigned directly.
+            if let Err(e) = self.conv.session.check_name(n) {
+                return name_error_reply(e);
+            }
+        }
+        if !self.config.persist {
+            self.conv.session.name = want.clone();
+            self.sync_name();
+            self.emit_conversation();
+            return rename_ok(&want, true);
+        }
+        if self.session_lock.is_none() {
+            return rename_error(
+                "locked",
+                "this daemon does not hold the session's journal lock (it may be open in another process); not renamed",
+            );
+        }
+        // A queued save of the old name must not land after ours.
+        self.persister.flush().await;
+        let dir = agent_core::session_lock::sessions_dir();
+        let id = self.conv.session.id.clone();
+        let mtimes = agent_core::session_catalog::SessionMtimes::capture(&dir, &id);
+        let old = std::mem::replace(&mut self.conv.session.name, want.clone());
+        if let Err(e) = self.conv.session.save_durable().await {
+            self.conv.session.name = old;
+            return rename_error("failed", format!("rename not saved (rolled back): {e}"));
+        }
+        mtimes.restore(&dir, &id);
+        self.sync_name();
+        self.emit_conversation();
+        rename_ok(&want, false)
+    }
+
+    async fn rename_parked(&mut self, want: Option<String>) -> serde_json::Value {
+        use agent_core::session_catalog::RenameError;
+        let dir = agent_core::session_lock::sessions_dir();
+        let id = (**self.journal_id.load()).clone();
+        let name = want.clone();
+        let res = tokio::task::spawn_blocking(move || {
+            agent_core::session_catalog::rename_past_session(&dir, &id, name.as_deref())
+        })
+        .await;
+        match res {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                let code = match &e {
+                    RenameError::InvalidName(_) => "invalid",
+                    RenameError::NameTaken { .. } => "taken",
+                    RenameError::ChainConflict => "chain_conflict",
+                    RenameError::Live { .. } => "locked",
+                    _ => "failed",
+                };
+                let mut v = rename_error(code, e.to_string());
+                if let RenameError::NameTaken { other_id } = &e {
+                    v["taken_by"] = serde_json::json!(other_id);
+                }
+                return v;
+            }
+            Err(e) => return rename_error("failed", format!("rename failed: {e}")),
+        }
+        self.mirror_name(want.clone());
+        rename_ok(&want, false)
     }
 }

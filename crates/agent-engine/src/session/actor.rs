@@ -1046,10 +1046,20 @@ impl SessionActor {
 
     pub(crate) fn sync_name(&mut self) {
         let name = self.conv.session.name.clone();
+        self.mirror_name(name);
+    }
+
+    /// Publish a name the session now has on disk (or in memory): handle
+    /// and listing, the `run/<sid>.json` card, and a pinned session's book
+    /// entry (verbatim, so a cleared name stops resolving).
+    pub(crate) fn mirror_name(&mut self, name: Option<String>) {
         self.meta.name = name.clone();
         self.name.store(Arc::new(name.clone()));
         if self.keep_warm {
-            self.note_pin();
+            if let Some(sink) = self.host.pin_sink() {
+                let journal = (**self.journal_id.load()).clone();
+                sink.renamed(&journal, name.as_deref());
+            }
         }
         if let Err(e) = self.background.update_session_name(name.as_deref()) {
             tracing::warn!(session = %self.id, "registry name update failed: {e}");
@@ -2688,6 +2698,11 @@ impl SessionActor {
         runtime.restore_tool_activations(std::mem::take(&mut self.parked_tool_activations));
         self.runtime.unpark_set(runtime);
         self.conv.unpark_set(conv);
+        // The name comes from disk: a rename while parked wrote it there.
+        if self.meta.name != self.conv.session.name {
+            let name = self.conv.session.name.clone();
+            self.mirror_name(name);
+        }
         // A fresh runtime: whether its grant took effect is its own.
         self.memory_seen_active = false;
         self.observe_memory();
@@ -5160,6 +5175,19 @@ impl SessionActor {
         // the daemon reports it failed). The wake sources are fenced in the
         // select loop; commands are fenced here.
         if self.reload_fence.is_some() && cmd.refused_while_reloading() {
+            // A host rename answers its caller only, never the whole room.
+            if let SessionCommand::EngineCommand { id, name, .. } = &cmd {
+                if name == RENAME_COMMAND {
+                    self.emit(SessionEventWire::QueryResult {
+                        id: *id,
+                        value: serde_json::json!({
+                            "kind": "error", "code": "busy",
+                            "text": "daemon reloading; retry in a moment",
+                        }),
+                    });
+                    return ControlFlow::Continue(());
+                }
+            }
             let reason = super::RELOADING_REFUSAL.to_string();
             match from {
                 Some(c) => self.emit(SessionEventWire::Refused {
@@ -5184,20 +5212,13 @@ impl SessionActor {
         // memory and has released its journal lock, so renaming it would
         // mean rebuilding it (MCP, extensions) just to change metadata.
         // Refused with a stable code instead; it applies once it is live.
-        if self.is_parked() && is_rename_command(&cmd) {
-            if let SessionCommand::EngineCommand { id, .. } = cmd {
-                self.emit(SessionEventWire::QueryResult {
-                    id,
-                    value: serde_json::json!({
-                        "kind": "error",
-                        "code": "parked",
-                        "text": format!(
-                            "session {} is parked; it was not woken to rename it. \
-                             Rename it once it is live again (attach to it, or `synaps daemon pin` it)",
-                            self.id
-                        ),
-                    }),
-                });
+        // A host rename (`synaps daemon rename`): handled here for live and
+        // parked sessions alike. A parked one is renamed on disk and NOT
+        // woken (`host_rename`), so this runs before the B3 wake below.
+        if is_rename_command(&cmd) {
+            if let SessionCommand::EngineCommand { id, arg, .. } = cmd {
+                let value = self.host_rename(&arg).await;
+                self.emit(SessionEventWire::QueryResult { id, value });
             }
             return ControlFlow::Continue(());
         }

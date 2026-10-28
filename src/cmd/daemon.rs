@@ -115,18 +115,28 @@ pub(crate) enum DaemonAction {
     },
     /// Name one session (as /saveas does), or clear its name with --clear,
     /// without attaching to it: no input ownership is needed and attached
-    /// clients see the new name at once. A parked session is not woken; it
-    /// is refused (exit 3) and can be renamed once it is live.
+    /// clients see the new name at once. A parked session is renamed on
+    /// disk without being woken. Never silently replaces a name: renaming
+    /// or clearing a session that has one needs --force.
     Rename {
         /// Session id, id prefix, journal id, or current name (see `daemon sessions`).
         #[arg(value_name = "ID|NAME")]
         target: String,
         /// The new name: lowercase letters, digits and '-', at most 40.
-        #[arg(value_name = "NEW_NAME", required_unless_present = "clear", conflicts_with = "clear")]
+        #[arg(
+            value_name = "NEW_NAME",
+            required_unless_present = "clear",
+            conflicts_with = "clear",
+            value_parser = non_blank
+        )]
         name: Option<String>,
         /// Clear the session's name instead.
         #[arg(long)]
         clear: bool,
+        /// Replace (or clear) a name the session already has. The rename
+        /// still fails if the name changes before it lands.
+        #[arg(long)]
+        force: bool,
         #[arg(long)]
         json: bool,
     },
@@ -174,8 +184,8 @@ pub(crate) async fn run(profile: Option<String>, args: DaemonArgs) -> anyhow::Re
         Some(DaemonAction::Reload { now, drain_secs, exe, json }) => reload(profile, now, drain_secs, exe, json).await,
         Some(DaemonAction::Close { target, force, attached, json }) => close(profile, target, force, attached, json).await,
         Some(DaemonAction::Pin { target, off, json }) => pin(profile, target, !off, json).await,
-        Some(DaemonAction::Rename { target, name, clear, json }) => {
-            rename(profile, target, if clear { None } else { name }, json).await
+        Some(DaemonAction::Rename { target, name, clear, force, json }) => {
+            rename(profile, target, if clear { None } else { name }, force, json).await
         }
         Some(DaemonAction::ReloadExtension { name, json }) => reload_extension(profile, name, json).await,
     }
@@ -332,12 +342,29 @@ async fn pin(profile: Option<String>, target: String, on: bool, json: bool) -> a
 }
 
 /// `daemon rename`: resolve the target against the `Welcome` listing (as
-/// `daemon close` does), send `Rename`, report. Exit 0 renamed or cleared;
-/// 3 refused (session parked, live in another process, daemon reloading);
-/// 2 daemon too old or protocol mismatch; 1 otherwise (invalid name, name
-/// taken, chain conflict, not found, ambiguous, prefix too short, no
-/// daemon, timeout).
-async fn rename(profile: Option<String>, target: String, name: Option<String>, json: bool) -> anyhow::Result<()> {
+/// `daemon close` does), send `Rename` with the name it saw as `expect`,
+/// report. Exit 0 renamed or cleared; 3 refused or not applied right now
+/// (`named` without --force, `locked`, `busy`, `unknown`: re-list before
+/// retrying); 2 daemon too old or protocol mismatch; 1 otherwise (invalid
+/// name, name taken, chain conflict, failed, not found, ambiguous, prefix
+/// too short, no daemon).
+/// A blank `NEW_NAME` (an unset shell variable) is an error, never a clear:
+/// that is `--clear`.
+fn non_blank(s: &str) -> Result<String, String> {
+    if s.trim().is_empty() {
+        Err("the new name is blank; use --clear to clear the name".into())
+    } else {
+        Ok(s.to_string())
+    }
+}
+
+async fn rename(
+    profile: Option<String>,
+    target: String,
+    name: Option<String>,
+    force: bool,
+    json: bool,
+) -> anyhow::Result<()> {
     use agent_engine::session::wire::RenameRefusal;
     let paths = registry::daemon_paths(profile.as_deref());
     if !registry::is_alive(&paths) {
@@ -356,23 +383,44 @@ async fn rename(profile: Option<String>, target: String, name: Option<String>, j
             rename_exit(json, 1, None, outcome, None, None, &text);
         }
     };
-    let outcome = conn.rename(&id, name.as_deref()).await;
-    conn.bye().await;
+    // Never silently replace a name: a named target needs --force, and the
+    // name we saw is sent as the compare-and-set `expect`, so a name set (or
+    // changed) after this listing still makes the rename fail.
+    let current = conn.welcome.sessions.iter().find(|m| m.id == id).and_then(|m| m.name.clone());
     let sid = Some(id.as_str());
+    if let Some(c) = current.as_deref().filter(|c| !force && Some(*c) != name.as_deref()) {
+        conn.bye().await;
+        let text = format!("session {id} is named '{c}'; pass --force to replace (or clear) it");
+        rename_exit(json, EXIT_REFUSED, sid, "named", Some(c), None, &text);
+    }
+    let outcome = conn.rename(&id, name.as_deref(), Some(current)).await;
+    conn.bye().await;
     match outcome {
-        Ok(Ok(Some(n))) => rename_exit(json, 0, sid, "renamed", Some(&n), None, &format!("renamed {id} to {n}")),
-        Ok(Ok(None)) => rename_exit(json, 0, sid, "cleared", None, None, &format!("cleared the name of {id}")),
+        Ok(Ok(r)) => {
+            let memo = if r.in_memory_only { " (in memory only: the session is not saved)" } else { "" };
+            match r.name {
+                Some(n) => rename_exit(json, 0, sid, "renamed", Some(&n), None, &format!("renamed {id} to {n}{memo}")),
+                None => rename_exit(json, 0, sid, "cleared", None, None, &format!("cleared the name of {id}{memo}")),
+            }
+        }
         Ok(Err(f)) => {
+            // 3: refused or not applied right now (retry, re-list, or
+            // --force); 1: the request itself is wrong or failed.
             let code = match f.reason {
-                RenameRefusal::Parked | RenameRefusal::Locked => EXIT_REFUSED,
+                RenameRefusal::Named | RenameRefusal::Locked | RenameRefusal::Busy | RenameRefusal::Unknown => {
+                    EXIT_REFUSED
+                }
                 _ => 1,
             };
-            rename_exit(json, code, sid, f.reason.as_str(), None, f.taken_by.as_deref(), &f.message)
+            rename_exit(json, code, sid, f.reason.as_str(), f.current_name.as_deref(), f.taken_by.as_deref(), &f.message)
         }
         Err(TransportError::Refused(text)) => rename_exit(json, EXIT_REFUSED, sid, "refused", None, None, &text),
         Err(TransportError::UnknownSession(text)) => rename_exit(json, 1, sid, "not_found", None, None, &text),
         Err(e @ TransportError::DaemonTooOld { .. }) => {
             rename_exit(json, EXIT_VERSION, sid, "too_old", None, None, &e.to_string())
+        }
+        Err(e @ TransportError::Closed) => {
+            rename_exit(json, EXIT_REFUSED, sid, "unknown", None, None, &format!("{e}; re-list before retrying"))
         }
         Err(e) => rename_exit(json, 1, sid, "error", None, None, &format!("rename failed: {e}")),
     }
@@ -957,8 +1005,8 @@ mod rename_cli_tests {
     #[test]
     fn rename_takes_a_target_and_a_name_or_clear() {
         match parse(&["rename", "20261028", "axon", "--json"]).unwrap() {
-            DaemonAction::Rename { target, name, clear, json } => {
-                assert_eq!((target.as_str(), name.as_deref(), clear, json), ("20261028", Some("axon"), false, true));
+            DaemonAction::Rename { target, name, clear, force, json } => {
+                assert_eq!((target.as_str(), name.as_deref(), clear, force, json), ("20261028", Some("axon"), false, false, true));
             }
             other => panic!("{other:?}"),
         }
@@ -970,6 +1018,9 @@ mod rename_cli_tests {
         }
         assert!(parse(&["rename", "axon"]).is_err(), "a new name or --clear is required");
         assert!(parse(&["rename", "axon", "new", "--clear"]).is_err(), "not both");
+        assert!(parse(&["rename", "axon", ""]).is_err(), "a blank name is not a clear");
+        assert!(parse(&["rename", "axon", "   "]).is_err());
+        assert!(matches!(parse(&["rename", "axon", "--clear", "--force"]).unwrap(), DaemonAction::Rename { force: true, .. }));
         assert!(parse(&["rename"]).is_err());
     }
 

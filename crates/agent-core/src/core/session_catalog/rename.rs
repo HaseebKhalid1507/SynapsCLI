@@ -137,22 +137,53 @@ fn rename_locked(dir: &Path, id: &str, name: Option<&str>) -> Result<(), RenameE
             return Err(RenameError::ChainConflict);
         }
     }
-    let old_mtime = confined_open(dir, &format!("{id}.json"))
-        .ok()
-        .flatten()
-        .and_then(|f| f.metadata().ok())
-        .and_then(|m| m.modified().ok());
+    let mtimes = SessionMtimes::capture(dir, id);
 
     session.name = name.map(str::to_string);
     save(dir, &session).map_err(RenameError::Io)?;
 
     // Best effort: keep mtime-ordered "latest" (`--continue`) unchanged.
-    if let Some(t) = old_mtime {
-        if let Ok(Some(f)) = confined_open(dir, &format!("{id}.json")) {
-            let _ = f.set_modified(t);
+    mtimes.restore(dir, id);
+    Ok(())
+}
+
+/// The file mtimes of session `id` (`<id>.json`, and `<id>.journal` when
+/// present), so a rename's save can put them back: `latest_session()`
+/// (`--continue`) and the `/sessions` order go by mtime, and a rename is not
+/// activity in the session.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SessionMtimes {
+    snapshot: Option<std::time::SystemTime>,
+    journal: Option<std::time::SystemTime>,
+}
+
+impl SessionMtimes {
+    pub fn capture(dir: &Path, id: &str) -> Self {
+        let mtime = |name: String| {
+            confined_open(dir, &name)
+                .ok()
+                .flatten()
+                .and_then(|f| f.metadata().ok())
+                .and_then(|m| m.modified().ok())
+        };
+        Self {
+            snapshot: mtime(format!("{id}.json")),
+            journal: mtime(format!("{id}.journal")),
         }
     }
-    Ok(())
+
+    /// Best effort: set each file that still exists back to its captured
+    /// mtime (a file that did not exist before is left alone).
+    pub fn restore(&self, dir: &Path, id: &str) {
+        for (time, name) in [
+            (self.snapshot, format!("{id}.json")),
+            (self.journal, format!("{id}.journal")),
+        ] {
+            if let (Some(t), Ok(Some(f))) = (time, confined_open(dir, &name)) {
+                let _ = f.set_modified(t);
+            }
+        }
+    }
 }
 
 fn save(dir: &Path, s: &crate::core::session::Session) -> std::io::Result<()> {

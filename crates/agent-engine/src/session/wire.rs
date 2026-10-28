@@ -157,16 +157,21 @@ pub enum ClientFrame {
         session_id: SessionId,
         on: bool,
     },
-    /// Control fast path: name (`Some`) or unname (`None` / empty) one
-    /// session, as `/saveas` would, with host authority: no attach, no
-    /// input ownership, no presence change. A parked session is not woken
-    /// (`RenameFailed{parked}`). Reply: `Renamed`, `RenameFailed`, or
+    /// Control fast path: name (`Some`) or unname (`None`) one session,
+    /// with `/saveas`'s rules and host authority: no attach, no input
+    /// ownership, no presence change. A parked session is renamed on disk
+    /// without being woken. `expect` is a compare-and-set precondition the
+    /// actor checks atomically: absent = none, `null` = only if the session
+    /// is unnamed, `"x"` = only if it is named `x`; a mismatch is
+    /// `RenameFailed{named}`. Reply: `Renamed`, `RenameFailed`, or
     /// `Refused{Busy|UnknownSession}`. Not accepted on an attached
     /// connection (that client has `/saveas`).
     Rename {
         session_id: SessionId,
         #[serde(default)]
         name: Option<String>,
+        #[serde(default, deserialize_with = "present_option", skip_serializing_if = "Option::is_none")]
+        expect: Option<Option<String>>,
     },
     /// Control fast path (no session): the in-memory account state of the
     /// broker every session of this daemon shares (`synaps auth state`),
@@ -219,10 +224,11 @@ impl std::fmt::Debug for ClientFrame {
                 .field("session_id", session_id)
                 .field("on", on)
                 .finish(),
-            Self::Rename { session_id, name } => f
+            Self::Rename { session_id, name, expect } => f
                 .debug_struct("Rename")
                 .field("session_id", session_id)
                 .field("name", name)
+                .field("expect", expect)
                 .finish(),
             Self::AuthState(query) => f.debug_tuple("AuthState").field(query).finish(),
             Self::ReloadExtension { extension } => f
@@ -358,19 +364,28 @@ pub enum DaemonFrame {
         on: bool,
     },
     /// Reply to `Rename`: the session's name is now `name` (`None` =
-    /// cleared). Saved, and every attached client got a `Conversation`.
+    /// cleared), saved durably (file mtime kept), and every attached client
+    /// got a `Conversation`. `in_memory_only`: the session is not persisted
+    /// (`persist: false`), so nothing was written.
     Renamed {
         session_id: SessionId,
         name: Option<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        in_memory_only: bool,
     },
-    /// Reply to `Rename`: the name was not changed. `message` is the
-    /// `/saveas` text; `taken_by` names the session holding the name.
+    /// Reply to `Rename`: the name was not changed (except `unknown`: it may
+    /// still apply; re-list before retrying). `taken_by` is the journal id
+    /// of the saved session holding the name (e.g.
+    /// `20261028-045932-eb8e`); `current_name` is the session's name when a
+    /// precondition failed (`named`).
     RenameFailed {
         session_id: SessionId,
         reason: RenameRefusal,
         message: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         taken_by: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        current_name: Option<String>,
     },
     /// Reply to `ReloadExtension`: the new version is loaded.
     ExtensionReloaded {
@@ -406,6 +421,16 @@ pub enum ByeReason {
     Detached,
 }
 
+/// `Option<Option<T>>` where a present `null` is `Some(None)` (absent stays
+/// `None` via `#[serde(default)]`).
+pub(crate) fn present_option<'de, D, T>(d: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(d).map(Some)
+}
+
 /// Why `Rename` was not applied (`DaemonFrame::RenameFailed`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -416,12 +441,20 @@ pub enum RenameRefusal {
     Taken,
     /// A chain has the name.
     ChainConflict,
-    /// The session is parked; it is not woken to be renamed.
-    Parked,
-    /// The session is live in another process (a lock placeholder here).
+    /// `expect` did not match: the session has (or no longer has) a name.
+    /// Rename never silently replaces a name.
+    Named,
+    /// Its journal is held by another process (live there, or this daemon
+    /// could not lock it).
     Locked,
-    /// Anything else (sessions dir unreadable, no reply in time, or a
-    /// reason this client does not know).
+    /// Retry shortly: the session's queue stayed full, or the daemon is
+    /// reloading.
+    Busy,
+    /// No answer in time (or the reply was lost): it may still apply.
+    /// Re-list before retrying.
+    Unknown,
+    /// Anything else (the save failed and was rolled back, compacted into
+    /// a successor, or a reason this client does not know).
     #[serde(other)]
     Failed,
 }
@@ -433,8 +466,10 @@ impl RenameRefusal {
             "invalid" => Self::Invalid,
             "taken" => Self::Taken,
             "chain_conflict" => Self::ChainConflict,
-            "parked" => Self::Parked,
+            "named" => Self::Named,
             "locked" => Self::Locked,
+            "busy" | "reloading" => Self::Busy,
+            "unknown" => Self::Unknown,
             _ => Self::Failed,
         }
     }
@@ -444,8 +479,10 @@ impl RenameRefusal {
             Self::Invalid => "invalid",
             Self::Taken => "taken",
             Self::ChainConflict => "chain_conflict",
-            Self::Parked => "parked",
+            Self::Named => "named",
             Self::Locked => "locked",
+            Self::Busy => "busy",
+            Self::Unknown => "unknown",
             Self::Failed => "failed",
         }
     }
@@ -1854,8 +1891,9 @@ mod tests {
             ClientFrame::Close { session_id: "s".into(), force: false, attached: false },
             ClientFrame::Pin { session_id: "s".into(), on: true },
             ClientFrame::Pin { session_id: "s".into(), on: false },
-            ClientFrame::Rename { session_id: "s".into(), name: Some("axon".into()) },
-            ClientFrame::Rename { session_id: "s".into(), name: None },
+            ClientFrame::Rename { session_id: "s".into(), name: Some("axon".into()), expect: None },
+            ClientFrame::Rename { session_id: "s".into(), name: None, expect: Some(Some("axon".into())) },
+            ClientFrame::Rename { session_id: "s".into(), name: Some("axon".into()), expect: Some(None) },
             ClientFrame::AuthState(agent_core::auth::AuthStateQuery::default()),
             ClientFrame::AuthState(agent_core::auth::AuthStateQuery {
                 provider: Some("anthropic".into()),
@@ -1906,19 +1944,21 @@ mod tests {
             DaemonFrame::Closed { session_id: "s".into(), text: "closed".into() },
             DaemonFrame::Pinned { session_id: "s".into(), on: true },
             DaemonFrame::Pinned { session_id: "s".into(), on: false },
-            DaemonFrame::Renamed { session_id: "s".into(), name: Some("axon".into()) },
-            DaemonFrame::Renamed { session_id: "s".into(), name: None },
+            DaemonFrame::Renamed { session_id: "s".into(), name: Some("axon".into()), in_memory_only: false },
+            DaemonFrame::Renamed { session_id: "s".into(), name: None, in_memory_only: true },
             DaemonFrame::RenameFailed {
                 session_id: "s".into(),
                 reason: RenameRefusal::Taken,
                 message: "name 'axon' already used by session t".into(),
                 taken_by: Some("t".into()),
+                current_name: None,
             },
             DaemonFrame::RenameFailed {
                 session_id: "s".into(),
-                reason: RenameRefusal::Parked,
-                message: "parked".into(),
+                reason: RenameRefusal::Named,
+                message: "named".into(),
                 taken_by: None,
+                current_name: Some("axon".into()),
             },
             DaemonFrame::ExtensionReloaded {
                 report: crate::extensions::manager::ExtensionReloadReport {
@@ -1985,7 +2025,14 @@ mod tests {
     #[test]
     fn rename_name_defaults_to_clear_and_older_daemons_reject_it_as_an_unknown_variant() {
         let f: ClientFrame = decode_line(r#"{"type":"rename","session_id":"s"}"#).unwrap();
-        assert!(matches!(f, ClientFrame::Rename { ref session_id, name: None } if session_id.as_str() == "s"));
+        assert!(matches!(f, ClientFrame::Rename { ref session_id, name: None, expect: None } if session_id.as_str() == "s"));
+        // `expect`: absent = no precondition, `null` = must be unnamed.
+        let f: ClientFrame = decode_line(r#"{"type":"rename","session_id":"s","name":"a","expect":null}"#).unwrap();
+        assert!(matches!(f, ClientFrame::Rename { expect: Some(None), .. }));
+        let f: ClientFrame = decode_line(r#"{"type":"rename","session_id":"s","name":"a","expect":"b"}"#).unwrap();
+        assert!(matches!(f, ClientFrame::Rename { expect: Some(Some(ref b)), .. } if b == "b"));
+        let line = encode_line(&ClientFrame::Rename { session_id: "s".into(), name: None, expect: Some(None) }).unwrap();
+        assert!(line.contains(r#""expect":null"#), "{line}");
         let f: ClientFrame = decode_line(r#"{"type":"rename","session_id":"s","name":"axon"}"#).unwrap();
         assert!(matches!(f, ClientFrame::Rename { name: Some(ref n), .. } if n == "axon"));
         #[derive(Debug, Deserialize)]

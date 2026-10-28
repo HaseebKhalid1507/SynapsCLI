@@ -312,9 +312,9 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
             }
             // `daemon rename`: name/unname one session with host authority,
             // no attach. A refusal is terminal, like `Close`.
-            Ok(Read::Frame(ClientFrame::Rename { session_id, name })) => {
+            Ok(Read::Frame(ClientFrame::Rename { session_id, name, expect })) => {
                 tracing::info!(session = %session_id, clear = name.is_none(), "daemon: rename requested over the socket");
-                let reply = super::rename::rename_session(&state, &session_id, name.as_deref()).await;
+                let reply = super::rename::rename_session(&state, &session_id, name.as_deref(), expect).await;
                 let _ = tx.send(reply).await;
             }
             // `daemon reload-extension`: restart one extension in place,

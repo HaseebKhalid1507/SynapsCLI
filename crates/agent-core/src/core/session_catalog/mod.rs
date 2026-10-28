@@ -31,7 +31,7 @@ pub use deep::{
 };
 pub use preview::{Preview, PreviewCache, RefreshStats, PREVIEW_MAX_CHARS};
 pub use query::{parse_query, DateBound, Query};
-pub use rename::{rename_past_session, RenameError};
+pub use rename::{rename_past_session, RenameError, SessionMtimes};
 pub use time::{Clock, When};
 pub use view::{
     build_view, day_groups, noise_reasons, DateKey, DayGroup, FacetCount, FacetSelection, Facets,

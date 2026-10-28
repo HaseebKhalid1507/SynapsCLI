@@ -292,26 +292,37 @@ impl Connected {
         pin_reply(frame, &self.welcome.daemon_version)
     }
 
-    /// `Rename{id, name}`: name (`Some`) or unname (`None`) one session with
-    /// host authority, without attaching. `Ok(Ok(name))` = the session's
-    /// name is now `name`; `Ok(Err(failure))` = the daemon says why not
-    /// (invalid, taken, chain conflict, parked, locked); a refusal (daemon
-    /// reloading) → `Refused(text)`; no such session → `UnknownSession`; a
+    /// `Rename{id, name, expect}`: name (`Some`) or unname (`None`) one
+    /// session with host authority, without attaching. `expect` is the
+    /// compare-and-set precondition (`Some(None)` = only if unnamed).
+    /// `Ok(Ok(renamed))` = done; `Ok(Err(failure))` = the daemon says why
+    /// not, or `Unknown` when no answer came (timeout, connection lost after
+    /// sending: it may still apply). No such session → `UnknownSession`; a
     /// daemon that predates `Rename` → `DaemonTooOld` (never a hang: it
     /// answers the unknown frame at once).
     pub async fn rename(
         &mut self,
         id: &SessionId,
         name: Option<&str>,
-    ) -> Result<Result<Option<String>, RenameFailure>, TransportError> {
+        expect: Option<Option<String>>,
+    ) -> Result<Result<Renamed, RenameFailure>, TransportError> {
         self.writer
-            .send(ClientFrame::Rename { session_id: id.clone(), name: name.map(str::to_string) })
+            .send(ClientFrame::Rename { session_id: id.clone(), name: name.map(str::to_string), expect })
             .await
             .map_err(|_| TransportError::Closed)?;
-        let frame = tokio::time::timeout(RENAME_TIMEOUT, read_frame(&mut self.reader, &mut self.buf))
-            .await
-            .map_err(|_| TransportError::Protocol("rename reply timed out".into()))??;
-        rename_reply(frame, &self.welcome.daemon_version)
+        let unknown = |why: &str| {
+            Ok(Err(RenameFailure {
+                reason: crate::session::wire::RenameRefusal::Unknown,
+                message: format!("{why}; the rename may still apply. Re-list (`synaps daemon sessions`) before retrying"),
+                taken_by: None,
+                current_name: None,
+            }))
+        };
+        match tokio::time::timeout(RENAME_TIMEOUT, read_frame(&mut self.reader, &mut self.buf)).await {
+            Err(_) => unknown("no reply from the daemon in time"),
+            Ok(Ok(None)) | Ok(Err(TransportError::Closed)) => unknown("the daemon closed the connection before answering"),
+            Ok(frame) => rename_reply(frame?, &self.welcome.daemon_version),
+        }
     }
 
     /// `ReloadExtension{extension}`: stop that extension and start it again
@@ -378,24 +389,35 @@ fn pin_reply(frame: Option<DaemonFrame>, daemon_version: &str) -> Result<bool, T
     }
 }
 
+/// A rename the daemon applied (`DaemonFrame::Renamed`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Renamed {
+    /// The session's name now (`None` = cleared).
+    pub name: Option<String>,
+    /// The session is not persisted: nothing was written.
+    pub in_memory_only: bool,
+}
+
 /// Why the daemon did not rename a session (`DaemonFrame::RenameFailed`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RenameFailure {
     pub reason: crate::session::wire::RenameRefusal,
     pub message: String,
-    /// The session that already has the name (`Taken`).
+    /// Journal id of the saved session that already has the name (`Taken`).
     pub taken_by: Option<String>,
+    /// The session's name when the `expect` precondition failed (`Named`).
+    pub current_name: Option<String>,
 }
 
 /// The daemon's answer to `Rename`, as [`Connected::rename`] reports it.
 fn rename_reply(
     frame: Option<DaemonFrame>,
     daemon_version: &str,
-) -> Result<Result<Option<String>, RenameFailure>, TransportError> {
+) -> Result<Result<Renamed, RenameFailure>, TransportError> {
     match frame {
-        Some(DaemonFrame::Renamed { name, .. }) => Ok(Ok(name)),
-        Some(DaemonFrame::RenameFailed { reason, message, taken_by, .. }) => {
-            Ok(Err(RenameFailure { reason, message, taken_by }))
+        Some(DaemonFrame::Renamed { name, in_memory_only, .. }) => Ok(Ok(Renamed { name, in_memory_only })),
+        Some(DaemonFrame::RenameFailed { reason, message, taken_by, current_name, .. }) => {
+            Ok(Err(RenameFailure { reason, message, taken_by, current_name }))
         }
         Some(DaemonFrame::Refused { reason: RefuseReason::UnknownSession, message }) => {
             Err(TransportError::UnknownSession(message))
@@ -666,9 +688,10 @@ impl SocketTransport {
         path: &Path,
         id: &SessionId,
         name: Option<&str>,
-    ) -> Result<Result<Option<String>, RenameFailure>, TransportError> {
+        expect: Option<Option<String>>,
+    ) -> Result<Result<Renamed, RenameFailure>, TransportError> {
         let mut c = Connected::connect(path, Hello::new(ClientKind::Attach)).await?;
-        let r = c.rename(id, name).await;
+        let r = c.rename(id, name, expect).await;
         c.bye().await;
         r
     }
@@ -1442,15 +1465,16 @@ mod tests {
         );
         assert!(err.to_string().contains("predates `daemon rename`"), "{err}");
 
-        let ok = DaemonFrame::Renamed { session_id: "s".into(), name: Some("axon".into()) };
-        assert_eq!(rename_reply(Some(ok), "1").unwrap(), Ok(Some("axon".into())));
-        let cleared = DaemonFrame::Renamed { session_id: "s".into(), name: None };
-        assert_eq!(rename_reply(Some(cleared), "1").unwrap(), Ok(None));
+        let ok = DaemonFrame::Renamed { session_id: "s".into(), name: Some("axon".into()), in_memory_only: false };
+        assert_eq!(rename_reply(Some(ok), "1").unwrap(), Ok(Renamed { name: Some("axon".into()), in_memory_only: false }));
+        let cleared = DaemonFrame::Renamed { session_id: "s".into(), name: None, in_memory_only: true };
+        assert_eq!(rename_reply(Some(cleared), "1").unwrap(), Ok(Renamed { name: None, in_memory_only: true }));
         let taken = DaemonFrame::RenameFailed {
             session_id: "s".into(),
             reason: RenameRefusal::Taken,
             message: "name 'axon' already used by session t".into(),
             taken_by: Some("t".into()),
+            current_name: None,
         };
         let failure = rename_reply(Some(taken), "1").unwrap().unwrap_err();
         assert_eq!((failure.reason, failure.taken_by.as_deref()), (RenameRefusal::Taken, Some("t")));
