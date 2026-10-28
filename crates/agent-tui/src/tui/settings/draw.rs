@@ -767,6 +767,15 @@ pub(crate) fn config_row_display(key: &str) -> Option<String> {
         },
         "compaction_exclude" => list_config_display(key),
         "refusal_retries" => ranged_config_display(key, 0..=u64::from(u32::MAX), 2),
+        "request_compression" => raw_config(key)
+            .and_then(|v| cfg::RequestCompressionMode::parse(&v))
+            .unwrap_or_default()
+            .to_string(),
+        "request_compression_level" => ranged_config_display(
+            key,
+            1..=u64::from(cfg::MAX_REQUEST_COMPRESSION_LEVEL),
+            u64::from(cfg::DEFAULT_REQUEST_COMPRESSION_LEVEL),
+        ),
         "telemetry" => synaps_cli::runtime::telemetry::TelemetryLevel::from_str_key(
             &raw_config(key).unwrap_or_default(),
         )

@@ -10,21 +10,30 @@
 //!
 //! Only gzip: the API refuses `br`, `zstd` and `deflate` request bodies.
 //!
-//! Level 1. On real session bodies it runs at about 250 MB/s and keeps over
-//! 80% of level 6's saving. Level 6 runs at about 55 MB/s, which costs more
-//! than it saves on uplinks faster than 200-375 Mbps; level 1 breaks even
-//! between 750 Mbps and 1.3 Gbps.
+//! The level defaults to 1. On real session bodies it runs at about 250 MB/s
+//! and keeps over 80% of level 6's saving. Level 6 runs at about 55 MB/s,
+//! which costs more than it saves on uplinks faster than 200-375 Mbps; level
+//! 1 breaks even between 750 Mbps and 1.3 Gbps. On a slow uplink the extra
+//! CPU time is tens of milliseconds and the upload saved is seconds, so a
+//! higher level wins there: against level 1, levels 3-6 pay off below
+//! roughly 10-50 Mbps, depending on the body. Above 6 the body barely
+//! shrinks further.
 //!
-//! The body goes out uncompressed when any of these hold:
+//! Configured by `request_compression` (`auto` | `on` | `off`) and
+//! `request_compression_level` (1–9), both in /settings. With `auto` (the
+//! default) the body goes out uncompressed when any of these hold:
 //! * the endpoint is not `https://api.anthropic.com` (a gateway set through
 //!   `SYNAPS_ANTHROPIC_BASE_URL` may not decode request bodies);
 //! * an HTTPS proxy is configured, or a custom CA bundle (`SSL_CERT_FILE`,
 //!   `SSL_CERT_DIR`): TLS-inspecting middleboxes are the usual reason a
 //!   compressed request body gets mangled;
-//! * the body is smaller than [`MIN_BYTES`];
-//! * `SYNAPS_GZIP_REQUEST_BODIES` is `0`, `false`, `off` or `no`;
-//! * an earlier request in this process showed gzip is refused (below);
-//! * compressing would not make it smaller.
+//! * the body is smaller than [`MIN_BYTES`].
+//!
+//! `on` drops the endpoint, proxy and CA checks, for a proxy or gateway known
+//! to pass gzip bodies; `off` never compresses. In every mode the body goes
+//! out uncompressed when `SYNAPS_GZIP_REQUEST_BODIES` is `0`, `false`, `off`
+//! or `no`, when an earlier request in this process showed gzip is refused
+//! (below), or when compressing would not make it smaller.
 //!
 //! Refusal fallback: a gzip request answered 400 or 415 is resent once
 //! uncompressed, without spending retry budget. If that resend succeeds, the
@@ -36,6 +45,9 @@ use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
+use agent_core::config::{
+    RequestCompressionMode, DEFAULT_REQUEST_COMPRESSION_LEVEL, MAX_REQUEST_COMPRESSION_LEVEL,
+};
 use bytes::Bytes;
 use reqwest::RequestBuilder;
 
@@ -62,9 +74,13 @@ const SKIP_VARS: &[&str] = &[
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 enum Mode {
-    /// Production: gzip when every condition in the module docs holds.
+    /// gzip when every condition in the module docs holds.
     #[default]
     Auto,
+    /// gzip whatever the endpoint, proxy or CA bundle.
+    On,
+    /// Never compress.
+    Off,
     /// Compress every body, whatever the host, size or environment. Tests
     /// point requests at loopback servers, which `Auto` never compresses.
     #[cfg(test)]
@@ -76,6 +92,8 @@ enum Mode {
 #[derive(Debug, Clone)]
 pub struct RequestCompression {
     mode: Mode,
+    /// gzip level, 1–9.
+    level: u32,
     /// Set once the API has accepted a request only uncompressed. Whether
     /// gzip survives the network path is a property of the machine, not the
     /// session, so production shares one latch across the process.
@@ -89,19 +107,34 @@ fn process_latch() -> &'static Arc<AtomicBool> {
 
 impl Default for RequestCompression {
     fn default() -> Self {
-        Self {
-            mode: Mode::Auto,
-            refused: Arc::clone(process_latch()),
-        }
+        Self::from_config(
+            RequestCompressionMode::default(),
+            DEFAULT_REQUEST_COMPRESSION_LEVEL,
+        )
     }
 }
 
 impl RequestCompression {
+    /// The policy for `request_compression` / `request_compression_level`,
+    /// sharing the process-wide refusal latch. The level is clamped to 1–9.
+    pub fn from_config(mode: RequestCompressionMode, level: u32) -> Self {
+        Self {
+            mode: match mode {
+                RequestCompressionMode::Auto => Mode::Auto,
+                RequestCompressionMode::On => Mode::On,
+                RequestCompressionMode::Off => Mode::Off,
+            },
+            level: level.clamp(1, MAX_REQUEST_COMPRESSION_LEVEL),
+            refused: Arc::clone(process_latch()),
+        }
+    }
+
     /// Compress every body, with a latch of its own. For loopback tests.
     #[cfg(test)]
     pub fn always() -> Self {
         Self {
             mode: Mode::Always,
+            level: DEFAULT_REQUEST_COMPRESSION_LEVEL,
             refused: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -118,6 +151,8 @@ impl RequestCompression {
         match self.mode {
             #[cfg(test)]
             Mode::Always => true,
+            Mode::Off => false,
+            Mode::On => len >= MIN_BYTES && !switched_off(&env),
             Mode::Auto => {
                 len >= MIN_BYTES
                     && !switched_off(&env)
@@ -137,10 +172,12 @@ impl RequestCompression {
             return WireBody::identity(raw);
         }
         let input = raw.clone();
+        let level = self.level;
         let started = std::time::Instant::now();
-        match tokio::task::spawn_blocking(move || gzip(&input)).await {
+        match tokio::task::spawn_blocking(move || gzip(&input, level)).await {
             Ok(Ok(out)) if out.len() < raw.len() => {
                 tracing::debug!(
+                    level,
                     raw_bytes = raw.len(),
                     wire_bytes = out.len(),
                     elapsed_us = started.elapsed().as_micros() as u64,
@@ -241,10 +278,10 @@ fn is_direct_anthropic(url: &str) -> bool {
     })
 }
 
-fn gzip(raw: &[u8]) -> std::io::Result<Vec<u8>> {
+fn gzip(raw: &[u8], level: u32) -> std::io::Result<Vec<u8>> {
     let mut enc = flate2::write::GzEncoder::new(
         Vec::with_capacity(raw.len() / 2),
-        flate2::Compression::fast(),
+        flate2::Compression::new(level),
     );
     enc.write_all(raw)?;
     enc.finish()
@@ -266,11 +303,16 @@ mod tests {
         move |k| map.get(k).cloned()
     }
 
-    fn auto() -> RequestCompression {
+    /// A production policy with a latch of its own.
+    fn policy(mode: RequestCompressionMode, level: u32) -> RequestCompression {
         RequestCompression {
-            mode: Mode::Auto,
             refused: Arc::new(AtomicBool::new(false)),
+            ..RequestCompression::from_config(mode, level)
         }
+    }
+
+    fn auto() -> RequestCompression {
+        policy(RequestCompressionMode::Auto, DEFAULT_REQUEST_COMPRESSION_LEVEL)
     }
 
     fn gunzip(b: &[u8]) -> Vec<u8> {
@@ -325,6 +367,81 @@ mod tests {
         for on in ["1", "true", "yes", ""] {
             assert!(c.wants_gzip(API, 1 << 20, env(&[(ENV_SWITCH, on)])), "{on:?}");
         }
+    }
+
+    #[test]
+    fn on_skips_endpoint_proxy_and_ca_checks_but_not_the_switch() {
+        let on = policy(RequestCompressionMode::On, 1);
+        let none = env(&[]);
+        assert!(on.wants_gzip("https://gateway.example.com/v1/messages", 1 << 20, &none));
+        assert!(on.wants_gzip("http://127.0.0.1:4000/v1/messages", 1 << 20, &none));
+        for &var in SKIP_VARS {
+            assert!(on.wants_gzip(API, 1 << 20, env(&[(var, "x")])), "{var}");
+        }
+        assert!(!on.wants_gzip(API, MIN_BYTES - 1, &none), "threshold still applies");
+        assert!(!on.wants_gzip(API, 1 << 20, env(&[(ENV_SWITCH, "0")])), "the env switch wins");
+
+        let off = policy(RequestCompressionMode::Off, 9);
+        assert!(!off.wants_gzip(API, 1 << 20, &none));
+    }
+
+    #[test]
+    fn config_level_is_clamped_and_shares_the_process_latch() {
+        let at = |level| RequestCompression::from_config(RequestCompressionMode::Auto, level).level;
+        assert_eq!(at(0), 1);
+        assert_eq!(at(6), 6);
+        assert_eq!(at(42), MAX_REQUEST_COMPRESSION_LEVEL);
+        assert_eq!(RequestCompression::default().level, DEFAULT_REQUEST_COMPRESSION_LEVEL);
+        assert_eq!(RequestCompression::default().mode, Mode::Auto);
+        assert!(Arc::ptr_eq(
+            &RequestCompression::from_config(RequestCompressionMode::On, 9).refused,
+            process_latch()
+        ));
+    }
+
+    #[test]
+    fn the_runtime_takes_the_policy_from_config_and_passes_it_on() {
+        let mut rt = crate::runtime::Runtime::new_headless();
+        assert_eq!(rt.request_compression.mode, Mode::Auto);
+        assert_eq!(rt.request_compression.level, DEFAULT_REQUEST_COMPRESSION_LEVEL);
+        rt.apply_config(&agent_core::config::SynapsConfig {
+            request_compression: RequestCompressionMode::On,
+            request_compression_level: 6,
+            ..Default::default()
+        });
+        assert_eq!(rt.request_compression.mode, Mode::On);
+        assert_eq!(rt.request_compression.level, 6);
+        // Subagents are cloned runtimes: same policy, same process latch.
+        let child = rt.clone();
+        assert_eq!((child.request_compression.mode, child.request_compression.level), (Mode::On, 6));
+        assert!(Arc::ptr_eq(&child.request_compression.refused, process_latch()));
+    }
+
+    #[tokio::test]
+    async fn a_higher_level_shrinks_more() {
+        // Varied text, so the levels' match search actually differs.
+        const WORDS: &[&str] = &[
+            "fn", "let", "mut", "self", "impl", "match", "Some", "None", "Ok", "Err", "await",
+            "async", "return", "struct", "enum", "pub", "use", "crate", "error:", "warning:",
+            "test", "passed", "failed", "src/runtime/api.rs", "line", "=>", "{", "}", "(", ")",
+        ];
+        let mut x: u64 = 0x2545_f491_4f6c_dd1d;
+        let text: Vec<&str> = (0..20_000)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                WORDS[(x % WORDS.len() as u64) as usize]
+            })
+            .collect();
+        let body = serde_json::json!({"messages": [{"role": "user", "content": text.join(" ")}]});
+        let raw: Bytes = serde_json::to_vec(&body).unwrap().into();
+        let fast = policy(RequestCompressionMode::On, 1).encode(API, &raw).await;
+        let best = policy(RequestCompressionMode::On, 9).encode(API, &raw).await;
+        assert!(fast.gzip && best.gzip);
+        let (best_len, fast_len) = (best.bytes.len(), fast.bytes.len());
+        assert!(best_len < fast_len, "level 9 {best_len} vs level 1 {fast_len}");
+        assert_eq!(gunzip(&best.bytes), raw.as_ref());
     }
 
     #[test]
