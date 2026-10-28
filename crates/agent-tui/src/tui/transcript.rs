@@ -574,6 +574,9 @@ pub(crate) struct TranscriptStore {
     /// Store-owned because it changes cached line content — mutate only via
     /// [`Self::set_show_full_output`], which invalidates internally.
     show_full_output: bool,
+    /// Session cwd/home that grep/find card paths are shown relative to
+    /// (display-only). Mutate via [`Self::set_path_base`] (invalidates).
+    path_base: super::render::paths::PathBase,
 
     // ── Scrollback cap (phase 4 B6) ──────────────────────────────────────────
     /// Max retained messages (0 = unbounded).
@@ -704,6 +707,7 @@ impl TranscriptStore {
             scroll_anchor: None,
             cache: CacheState::Missing,
             show_full_output: false,
+            path_base: Default::default(),
             max_msgs: 0,
             max_bytes: 0,
             pushes_since_audit: 0,
@@ -2470,6 +2474,20 @@ impl TranscriptStore {
     /// Self-invalidating setter — the toggle changes cached line content, so
     /// the manual `invalidate()` at the call site is impossible to forget
     /// because it no longer exists (red-team overrule of design §6 decision 1).
+    /// Where card paths are shortened from (see [`Self::set_path_base`]).
+    pub(crate) fn path_base(&self) -> &super::render::paths::PathBase {
+        &self.path_base
+    }
+
+    /// Set the session cwd card paths are shown relative to; re-renders
+    /// cached cards when it changes (session switch).
+    pub(crate) fn set_path_base(&mut self, base: super::render::paths::PathBase) {
+        if self.path_base != base {
+            self.path_base = base;
+            self.invalidate();
+        }
+    }
+
     pub(crate) fn set_show_full_output(&mut self, v: bool) {
         self.show_full_output = v;
         self.invalidate();

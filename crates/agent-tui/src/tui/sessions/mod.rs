@@ -276,6 +276,12 @@ impl SessionsState {
         self.selected = Some(ids[next].clone());
     }
 
+    /// Sessions in the daemon that are not parked: the Live tab's count
+    /// (the header breaks it down and adds the parked ones).
+    pub(crate) fn live_count(&self) -> usize {
+        self.live.iter().filter(|m| !RowState::of(m).is_parked()).count()
+    }
+
     /// `(streaming, waiting, idle, parked)` counts for the header.
     pub(crate) fn counts(&self) -> (usize, usize, usize, usize) {
         let mut c = (0, 0, 0, 0);
@@ -456,6 +462,31 @@ pub(crate) fn label(m: &SessionMeta) -> String {
         Some(n) => n.to_string(),
         None => format!("\u{2026}{}", short_id(&m.id.0)),
     }
+}
+
+/// What a Live row shows in its name column: the name, else the session's
+/// title as the header shows it (markdown stripped, one line), else `None`.
+pub(crate) fn row_name(m: &SessionMeta) -> Option<String> {
+    if let Some(n) = m.name.as_deref().filter(|n| !n.trim().is_empty()) {
+        return Some(n.to_string());
+    }
+    let t = super::header::session_label(None, m.title.as_deref().unwrap_or(""), "");
+    (!t.is_empty()).then_some(t)
+}
+
+/// Longest auto title the core keeps (`Session::auto_title` takes 80 chars).
+const AUTO_TITLE_MAX: usize = 80;
+
+/// The title for the detail strip: markdown stripped, one line, and — when
+/// it is as long as the core's cut — ended at a word edge with `…`, so a
+/// title cut mid-word doesn't read as complete.
+pub(crate) fn detail_title(raw: &str) -> String {
+    let t = super::header::session_label(None, raw, "");
+    if raw.chars().count() < AUTO_TITLE_MAX {
+        return t;
+    }
+    let cut = t.rfind(' ').filter(|&i| i > t.len() / 2).unwrap_or(t.len());
+    format!("{}\u{2026}", t[..cut].trim_end())
 }
 
 /// `$12.40` (`<$0.01` for a few tokens; empty when nothing was spent).

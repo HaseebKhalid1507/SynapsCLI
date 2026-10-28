@@ -51,6 +51,18 @@ pub(crate) fn clamp_line(line: Line<'static>, width: usize) -> Line<'static> {
     Line::from(clamped)
 }
 
+/// [`clamp_line`], but a row that doesn't fit ends in `…` (in the style of
+/// the span it cuts) so a clipped row reads as clipped, not as chopped.
+pub(crate) fn clamp_line_ellipsis(line: Line<'static>, width: usize) -> Line<'static> {
+    if width == 0 || line.width() <= width {
+        return clamp_line(line, width);
+    }
+    let mut cut = clamp_line(line, width - 1);
+    let style = cut.spans.last().map(|s| s.style).unwrap_or_default();
+    cut.spans.push(Span::styled("\u{2026}", style));
+    cut
+}
+
 /// Curated syntect dump written by `build.rs` (PLAN-phase4 §3 C1): the
 /// `CURATED` grammars plus their include closure. Colours are golden-tested
 /// identical to the full default set (`tests/highlight_curated.rs`).
@@ -472,7 +484,11 @@ pub(crate) fn highlight_bash_output(lines: &[&str], margin: &str) -> Vec<Line<'s
 }
 
 /// Try to highlight a grep output line (filepath:linenum:content)
-pub(crate) fn try_highlight_grep_line(line: &str, margin: &str) -> Option<Vec<Span<'static>>> {
+pub(crate) fn try_highlight_grep_line(
+    line: &str,
+    margin: &str,
+    path_display: &dyn Fn(&str) -> String,
+) -> Option<Vec<Span<'static>>> {
     // Grep format: filepath:linenum:content  or  filepath-linenum-content (context)
     // Also: filepath:linenum:  (empty match line)
     let first_colon = line.find(':')?;
@@ -507,7 +523,7 @@ pub(crate) fn try_highlight_grep_line(line: &str, margin: &str) -> Option<Vec<Sp
             Style::default().fg(THEME.load().tool_result_color),
         ),
         Span::styled(
-            filepath.to_string(),
+            path_display(filepath),
             Style::default().fg(THEME.load().tool_label),
         ),
         Span::styled(":", Style::default().fg(THEME.load().muted)),

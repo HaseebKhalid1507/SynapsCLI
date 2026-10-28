@@ -3,7 +3,7 @@
     "id": "root",
     "command": "/help",
     "title": "SynapsCLI Help",
-    "summary": "Fast paths for finding commands, settings, plugins, models, and diagnostics.",
+    "summary": "Type /help find to search every topic.",
     "category": "Core",
     "topic": "Branch",
     "protected": true,
@@ -11,21 +11,18 @@
     "aliases": [],
     "keywords": ["help", "start", "commands"],
     "lines": [
-      "Start here. Pick a path or search everything.",
-      "",
       "Common paths",
-      "  /help find      Search every help topic",
+      "  /sessions       Switch, pin, or close sessions",
       "  /model          Choose or inspect models",
       "  /settings       Configure providers and preferences",
+      "  /theme          List or switch themes",
       "  /plugins        Manage extensions",
       "  /help doctor    Diagnose local setup",
       "",
       "Guides",
       "  /help models    Models, providers, and routing",
       "  /help plugins   Plugins, skills, commands, and trust",
-      "  /help sessions  Sessions, resume, compact, and chains",
-      "",
-      "Tip: type /help find and start typing."
+      "  /help sessions  Sessions, resume, compact, and chains"
     ],
     "related": []
   },
@@ -81,7 +78,7 @@
     "lines": [
       "Configure SynapsCLI from a focused modal.",
       "",
-      "Common commands",
+      "Common paths",
       "  /settings        Open settings",
       "  /ping            Check configured provider health",
       "  /model           Choose the active model",
@@ -106,7 +103,7 @@
     "lines": [
       "Extend SynapsCLI with skills, commands, tools, hooks, and help entries.",
       "",
-      "Common commands",
+      "Common paths",
       "  /plugins         Open plugin manager",
       "  /plugins reload  Reload installed plugins",
       "  /extensions status       Show loaded extension health",
@@ -141,7 +138,7 @@
     "lines": [
       "Use models to choose the runtime model and inspect provider health.",
       "",
-      "Common commands",
+      "Common paths",
       "  /model           Open model router",
       "  /models          Open model router",
       "  /model <name>    Switch directly",
@@ -194,7 +191,7 @@
     "lines": [
       "SynapsCLI can authenticate with OAuth for supported accounts or provider API keys in /settings.",
       "",
-      "Common commands",
+      "Common paths",
       "  synaps login     Start OAuth login from the shell",
       "  /settings        Add or update provider API keys",
       "  /status          Check account usage when available",
@@ -233,7 +230,7 @@
     "lines": [
       "Sessions keep conversation history so you can resume work later, name important threads, and compact long context.",
       "",
-      "Common commands",
+      "Common paths",
       "  /sessions        Live and saved sessions: pin, close",
       "  /resume <id>     Switch to a saved session",
       "  /saveas [name]   Name or clear the current session name",
@@ -260,7 +257,7 @@
     "lines": [
       "Extensions are plugin packages that can contribute skills, slash commands, tools, hooks, and help entries.",
       "",
-      "Common commands",
+      "Common paths",
       "  /extensions status       Show loaded extension health",
       "  /extensions config [id]  Show extension config diagnostics",
       "  /extensions audit [N]    Inspect recent provider audit entries",

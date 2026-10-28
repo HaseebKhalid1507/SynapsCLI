@@ -162,11 +162,14 @@ fn state(s: &SubagentSnap) -> State {
 fn step(s: &SubagentSnap) -> String {
     let st = s.status.trim();
     match state(s) {
-        State::Ok | State::Failed => s
-            .result
-            .clone()
-            .filter(|r| !r.is_empty())
-            .unwrap_or_else(|| st.chars().skip(2).collect()),
+        // The result is the worker's markdown: a one-line preview shows
+        // its text, not its backticks / `**`.
+        State::Ok | State::Failed => super::markdown::strip_md_markers(
+            &s.result
+                .clone()
+                .filter(|r| !r.is_empty())
+                .unwrap_or_else(|| st.chars().skip(2).collect()),
+        ),
         State::TimedOut => st.chars().skip(2).collect::<String>().trim().to_string(),
         State::Cancelling => "cancelling\u{2026}".into(),
         State::Running => {
@@ -512,6 +515,16 @@ mod tests {
         assert_eq!(step(&done), "short preview");
         done.result = Some("the full first line".into());
         assert_eq!(step(&done), "the full first line");
+    }
+
+    #[test]
+    fn finished_preview_strips_inline_markdown() {
+        let mut done = snap("a", "\u{2714} no `crates/` dir", true);
+        assert_eq!(step(&done), "no crates/ dir");
+        done.result = Some("There is no `crates/` directory, **0** `.rs` files".into());
+        assert_eq!(step(&done), "There is no crates/ directory, 0 .rs files");
+        // A running step is a command line — left verbatim.
+        assert_eq!(step(&snap("a", "$ echo `date`", false)), "$ echo `date`");
     }
 
     #[test]
