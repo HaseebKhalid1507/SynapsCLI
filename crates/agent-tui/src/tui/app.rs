@@ -169,6 +169,8 @@ pub(crate) struct App {
     /// Set by user input (scroll/typing/cursor) so interaction stays instant
     /// even while the model is streaming; cleared after the paint.
     pub(crate) force_redraw: bool,
+    /// Windows Alt-code characters arrive as lone key Releases; see `win_keys`.
+    pub(crate) alt_codes: super::win_keys::AltCodeGate,
     pub(crate) logo_dismiss_t: Option<f64>,
     pub(crate) logo_build_t: Option<f64>,
     /// Active subagent status for the live panel
@@ -478,6 +480,7 @@ impl App {
                 .unwrap_or_else(|| "agent".to_string()),
             needs_redraw: true,
             force_redraw: false,
+            alt_codes: Default::default(),
             logo_dismiss_t: None,
             // SYNAPS_NO_BOOT_FX=1: skip both the tachyonfx boot effect and the
             // ASCII logo build animation (full-screen redraws per frame are
