@@ -110,8 +110,9 @@ jobs:
   # Clippy builds and lints every target (libs, bins, tests) in both
   # feature sets, as the Linux jobs do. The daemon suites drive the
   # Windows-native daemon (named pipes, detached spawn, reload lock
-  # hand-off) with real processes. The rest of the suite isn't run here
-  # yet: dozens of tests outside the daemon still fail on Windows.
+  # hand-off) with real processes; the TUI's unit tests run in full. The
+  # rest of the suite isn't run here yet: dozens of tests outside the daemon
+  # and the TUI still fail on Windows.
   #
   # autocrlf off so the checkout is byte-identical to Linux (fixtures and
   # `include_str!` goldens are LF).
@@ -129,6 +130,7 @@ jobs:
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo clippy --workspace --all-targets --no-default-features --locked -- -D warnings
       - run: cargo test --locked --no-fail-fast --test "daemon_*"
+      - run: cargo test --locked --no-fail-fast -p synaps-tui --lib
 
   # The Axel memory sidecar is its own workspace (its own Cargo.lock and
   # dependency graph), so nothing above builds it. Its `axel` dependency is

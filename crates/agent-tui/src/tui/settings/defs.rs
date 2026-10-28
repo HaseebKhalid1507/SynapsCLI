@@ -1161,7 +1161,8 @@ mod tests {
             assert!(is_ok(d("max_fps", "144")));
             assert!(is_err(d("max_fps", "0")));
             assert!(is_err(d("scroll_lines", "21")));
-            assert!(is_ok(d("memory.axel.brain", "/srv/axel/brain.r8")));
+            let absolute = if cfg!(windows) { r"C:\srv\axel\brain.r8" } else { "/srv/axel/brain.r8" };
+            assert!(is_ok(d("memory.axel.brain", absolute)));
             assert!(is_err(d("memory.axel.brain", "brain.r8")));
             assert!(is_err(d("memory.user_scope", "yes")));
             assert!(is_err(d("memory.backend", "sqlite")));
