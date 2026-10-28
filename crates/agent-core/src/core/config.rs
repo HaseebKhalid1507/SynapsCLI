@@ -712,6 +712,56 @@ impl CacheTtl {
     }
 }
 
+/// gzip `Content-Encoding` for Anthropic request bodies
+/// (`request_compression`). Every request re-uploads the whole
+/// conversation, and the JSON compresses about 2x.
+/// - `Auto` (default): bodies of 16 KiB or more sent straight to
+///   api.anthropic.com; skipped behind an HTTPS proxy, with a custom CA
+///   bundle or a custom base URL, where a middlebox or gateway may not
+///   handle a compressed body.
+/// - `On`: those too, for a proxy or gateway known to pass gzip request
+///   bodies. A refused body is still resent uncompressed.
+/// - `Off`: never.
+///
+/// `SYNAPS_GZIP_REQUEST_BODIES=0` turns it off whatever this says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RequestCompressionMode {
+    #[default]
+    Auto,
+    On,
+    Off,
+}
+
+impl RequestCompressionMode {
+    /// `auto` | `on` | `off` (case-insensitive).
+    pub fn parse(val: &str) -> Option<RequestCompressionMode> {
+        match val.trim().to_ascii_lowercase().as_str() {
+            "auto" => Some(RequestCompressionMode::Auto),
+            "on" => Some(RequestCompressionMode::On),
+            "off" => Some(RequestCompressionMode::Off),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for RequestCompressionMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            RequestCompressionMode::Auto => "auto",
+            RequestCompressionMode::On => "on",
+            RequestCompressionMode::Off => "off",
+        })
+    }
+}
+
+/// Default gzip level for request bodies (`request_compression_level`):
+/// fast enough to pay off up to roughly gigabit uplinks.
+pub const DEFAULT_REQUEST_COMPRESSION_LEVEL: u32 = 1;
+/// Highest gzip level. Levels 3-6 pay off on slow uplinks, where the extra
+/// CPU time is tens of milliseconds and the upload saved is seconds; above
+/// 6 the body barely shrinks further.
+pub const MAX_REQUEST_COMPRESSION_LEVEL: u32 = 9;
+
 /// `tools.activation_confirm` — host policy for model-initiated
 /// `activate_tools` (progressive tool disclosure).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1237,6 +1287,13 @@ pub struct SynapsConfig {
     /// [`DEFAULT_CACHE_KEEPWARM_AUTO_MAX_HOURS`]). An explicit `<N>h` mode
     /// is its own window and ignores this.
     pub cache_keepwarm_auto_max_hours: u32,
+    /// gzip for Anthropic request bodies (`request_compression`): `auto`
+    /// (default) | `on` | `off`. See [`RequestCompressionMode`].
+    pub request_compression: RequestCompressionMode,
+    /// gzip level 1–9 (`request_compression_level`, default
+    /// [`DEFAULT_REQUEST_COMPRESSION_LEVEL`]). Higher shrinks more and costs
+    /// more CPU: raise it on a slow uplink.
+    pub request_compression_level: u32,
     /// Who may drive a daemon session with several clients attached
     /// (`client_input`): `shared` (default) | `exclusive`. The daemon reads
     /// it at start, for every session it creates or restores. See
@@ -1339,6 +1396,8 @@ impl Default for SynapsConfig {
             cache_ttl: CacheTtl::default(),
             cache_keepwarm: CacheKeepWarm::Off,
             cache_keepwarm_auto_max_hours: DEFAULT_CACHE_KEEPWARM_AUTO_MAX_HOURS,
+            request_compression: RequestCompressionMode::Auto,
+            request_compression_level: DEFAULT_REQUEST_COMPRESSION_LEVEL,
             client_input: ClientInput::Shared,
             max_fps: 60,
             scroll_lines: None,
@@ -1416,6 +1475,8 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "cache_ttl",
     "cache_keepwarm",
     "cache_keepwarm_auto_max_hours",
+    "request_compression",
+    "request_compression_level",
     "client_input",
     "max_fps",
     "scroll_lines",
@@ -2005,6 +2066,20 @@ fn apply_config_content_with(
                     )),
                 }
             }
+            "request_compression" => match RequestCompressionMode::parse(val) {
+                Some(mode) => config.request_compression = mode,
+                None => config.warnings.push(format!(
+                    "request_compression = {val} — expected auto, on, or off; using auto"
+                )),
+            },
+            "request_compression_level" => match val.trim().parse::<u32>() {
+                Ok(n) if (1..=MAX_REQUEST_COMPRESSION_LEVEL).contains(&n) => {
+                    config.request_compression_level = n
+                }
+                _ => config.warnings.push(format!(
+                    "request_compression_level = {val} — expected 1–{MAX_REQUEST_COMPRESSION_LEVEL}; using {DEFAULT_REQUEST_COMPRESSION_LEVEL}"
+                )),
+            },
             "max_fps" => match val.parse::<u32>() {
                 Ok(fps) if (1..=1000).contains(&fps) => config.max_fps = fps,
                 Ok(_) => config.warnings.push(format!(
@@ -3528,6 +3603,41 @@ mod tests {
         let c = load_config_from_str("cache_keepwarm = forever\n");
         assert_eq!(c.cache_keepwarm, CacheKeepWarm::Off, "garbage keeps keep-warm off");
         assert!(c.warnings.iter().any(|w| w.contains("cache_keepwarm")));
+    }
+
+    #[test]
+    fn request_compression_keys_parse_and_warn() {
+        let c = load_config_from_str("");
+        assert_eq!(c.request_compression, RequestCompressionMode::Auto);
+        assert_eq!(c.request_compression_level, DEFAULT_REQUEST_COMPRESSION_LEVEL);
+
+        for (val, want) in [
+            ("auto", RequestCompressionMode::Auto),
+            ("ON", RequestCompressionMode::On),
+            (" off ", RequestCompressionMode::Off),
+        ] {
+            let c = load_config_from_str(&format!("request_compression = {val}\n"));
+            assert_eq!(c.request_compression, want, "{val:?}");
+            assert!(c.warnings.is_empty(), "{val:?}: {:?}", c.warnings);
+            assert_eq!(RequestCompressionMode::parse(&want.to_string()), Some(want));
+        }
+        let c = load_config_from_str("request_compression = brotli\n");
+        assert_eq!(c.request_compression, RequestCompressionMode::Auto);
+        assert!(c.warnings.iter().any(|w| w.contains("request_compression")));
+
+        for level in 1..=MAX_REQUEST_COMPRESSION_LEVEL {
+            let c = load_config_from_str(&format!("request_compression_level = {level}\n"));
+            assert_eq!(c.request_compression_level, level);
+            assert!(c.warnings.is_empty());
+        }
+        for bad in ["0", "10", "max", "-1"] {
+            let c = load_config_from_str(&format!("request_compression_level = {bad}\n"));
+            assert_eq!(c.request_compression_level, DEFAULT_REQUEST_COMPRESSION_LEVEL, "{bad}");
+            assert!(
+                c.warnings.iter().any(|w| w.contains("request_compression_level")),
+                "{bad}"
+            );
+        }
     }
 
     // ── cache_ttl parse table (spec §3.1) ──

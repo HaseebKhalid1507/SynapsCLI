@@ -3398,6 +3398,7 @@ dependencies = [
  "chrono",
  "crossterm",
  "dirs",
+ "flate2",
  "fs4",
  "futures",
  "globset",

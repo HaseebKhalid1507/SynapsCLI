@@ -833,6 +833,10 @@ pub struct ApiOptions {
     pub anthropic_base_url: Option<String>,
     /// Dedicated lazy pool: upload and body idle deadlines are independent.
     pub(super) anthropic_stream_client: Arc<std::sync::OnceLock<Client>>,
+    /// gzip `Content-Encoding` policy for the request body (see
+    /// `request_encoding`). The default compresses large bodies sent straight
+    /// to api.anthropic.com and shares the process-wide refusal latch.
+    pub(super) request_compression: super::request_encoding::RequestCompression,
     /// Execution authority produced by Runtime preflight. Transports must not
     /// recreate authority for Max/UltraCode from assumed prerequisites.
     pub anthropic_execution_plan: Option<crate::runtime::openai::catalog::AnthropicExecutionPlan>,
@@ -993,8 +997,9 @@ pub(super) fn terminal_http_error(
 
 /// Begin an Anthropic request tracer (Task 8). Returns `None` when tracing
 /// is disabled or any structural identity is unrepresentable — tracing can
-/// never fail the request. `body_bytes` MUST be the exact buffer handed to
-/// reqwest: it is the sole source of the wire length + digest.
+/// never fail the request. `body_bytes` MUST be the exact JSON payload handed
+/// to reqwest, before any `Content-Encoding` (the server decodes gzip before
+/// reading it): it is the sole source of the wire length + digest.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn begin_anthropic_tracer(
     options: &ApiOptions,
@@ -1521,6 +1526,16 @@ impl ApiMethods {
         #[allow(unused_assignments)]
         let mut clock = crate::runtime::trace::AttemptClock::start();
 
+        // ═══ WIRE ENCODING (request_encoding) ═════════════════════════════════
+        // `body_bytes` stays the JSON: the trace digests it and the
+        // diagnostics fail-soft edits it. `wire` is what reqwest uploads,
+        // gzip-encoded when the policy allows; retries reuse it.
+        let mut wire = await_or_cancel(
+            cancel,
+            options.request_compression.encode(&anthropic_url, &body_bytes),
+        )
+        .await?;
+
         let mut last_err = String::new();
         let mut last_status: Option<u16> = None;
         let mut last_reset_hint: Option<String> = None;
@@ -1577,21 +1592,25 @@ impl ApiMethods {
                     }
                     clock = crate::runtime::trace::AttemptClock::start();
                     let sent_at = super::keepwarm::CacheAnchor::now();
+                    let req = wire.encoding_header(req);
                     let req = match &options.keepwarm {
-                        Some(keepwarm) => keepwarm_body(req, body_bytes.clone(), &keepwarm.sent),
-                        None => req.body(body_bytes.clone()),
+                        Some(keepwarm) => keepwarm_body(req, wire.bytes.clone(), &keepwarm.sent),
+                        None => req.body(wire.bytes.clone()),
                     };
                     match await_or_cancel(
                         cancel,
                         super::http_phases::send(
                             req,
-                            super::http_phases::header_deadline(body_bytes.len()),
+                            super::http_phases::header_deadline(wire.bytes.len()),
                         ),
                     )
                     .await?
                     {
                         Ok(resp) => {
                             let status = resp.status();
+                            options
+                                .request_compression
+                                .settle(&mut wire, status.is_success());
                             if let Some(keepwarm) = &options.keepwarm {
                                 keepwarm
                                     .sent
@@ -1907,7 +1926,16 @@ impl ApiMethods {
                                 if let Some(d) = diagnostics.take() {
                                     match super::cache_diagnosis::strip_diagnostics(&body_bytes, &d)
                                     {
-                                        Some(stripped) => body_bytes = stripped.into(),
+                                        Some(stripped) => {
+                                            body_bytes = stripped.into();
+                                            wire = await_or_cancel(
+                                                cancel,
+                                                options
+                                                    .request_compression
+                                                    .encode(&anthropic_url, &body_bytes),
+                                            )
+                                            .await?;
+                                        }
                                         // Unreachable by construction (the
                                         // field serializes first); keep the
                                         // normal error path rather than resend
@@ -1928,6 +1956,31 @@ impl ApiMethods {
                                     }
                                     continue;
                                 }
+                            }
+
+                            // ═══ GZIP REFUSAL fail-soft (request_encoding) ═══
+                            // A 400/415 to a gzip body: resend it once
+                            // uncompressed, costing no retry budget. The
+                            // resend's outcome decides whether gzip latches
+                            // off (`settle` above), so a genuine 400 just
+                            // fails again below and leaves gzip on.
+                            if let Some(resend) = options.request_compression.resend_uncompressed(
+                                &wire,
+                                &body_bytes,
+                                status.as_u16(),
+                            ) {
+                                wire = resend;
+                                if let Some(t) = tracer.as_mut() {
+                                    t.attempt_failed(
+                                        clock,
+                                        crate::runtime::trace::RetryClass::Other,
+                                        Duration::ZERO,
+                                        Some(status.as_u16()),
+                                        trace_rid,
+                                        "gzip_refused",
+                                    );
+                                }
+                                continue;
                             }
 
                             // Decide whether we've exhausted retries for this error class.
@@ -2022,6 +2075,7 @@ impl ApiMethods {
                             }
                         }
                         Err(e) => {
+                            options.request_compression.settle(&mut wire, false);
                             if let Some(keepwarm) = &options.keepwarm {
                                 if matches!(&e, RuntimeError::Api(error) if error.is_connect()) {
                                     keepwarm

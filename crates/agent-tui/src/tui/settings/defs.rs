@@ -450,6 +450,16 @@ define_settings! {
         "Rotated files kept for api-log.jsonl and request-trace.jsonl, each up to 50 MB: <log>.1 (newest) to <log>.N (1–100, default 1). Takes effect next launch.",
         |_app, value| whole_number("telemetry_log_generations", value);
 
+    "request_compression", "Request compression", Context,
+        EditorKind::Cycler(&["auto", "on", "off"]),
+        "gzip Anthropic request bodies of 16 KiB or more (every request re-uploads the whole conversation; text shrinks about 2x): auto (default) only when sent straight to the Anthropic API: no HTTPS proxy, custom CA bundle or custom base URL; on also through those, for a proxy or gateway known to pass gzip bodies; off never. A refused body is resent uncompressed. Env SYNAPS_GZIP_REQUEST_BODIES=0 overrides. Takes effect next launch.",
+        |_app, value| config_edit("request_compression", value);
+
+    "request_compression_level", "Compression level", Context,
+        EditorKind::Cycler(&["1", "2", "3", "4", "5", "6", "7", "8", "9"]),
+        "gzip level for request bodies, 1-9 (default 1, about 250 MB/s). Higher shrinks more and costs more CPU: 1 suits fast uplinks; on an uplink slower than roughly 10-50 Mbps (it depends on the conversation) 3-6 saves more upload time than it costs. Above 6 gains almost nothing. Takes effect next launch.",
+        |_app, value| config_edit("request_compression_level", value);
+
     // ── Agent ────────────────────────────────────────────────────────────
 
     "subagent.max_concurrent", "Subagents at once", Agent, EditorKind::Text { numeric: true },
@@ -1059,6 +1069,8 @@ mod tests {
             "process_scopes = no\n",
             "disabled_tools = bash,  ls\n",
             "turn_budget.worker.max_cost_usd = 2.5\n",
+            "request_compression = OFF\n",
+            "request_compression_level = 6\n",
         ));
         assert_eq!(config_row_display("cache_ttl").as_deref(), Some("1h"));
         assert_eq!(config_row_display("cache_keepwarm").as_deref(), Some("6h"));
@@ -1069,6 +1081,8 @@ mod tests {
             config_row_display("turn_budget.worker.max_cost_usd").as_deref(),
             Some("2.5")
         );
+        assert_eq!(config_row_display("request_compression").as_deref(), Some("off"));
+        assert_eq!(config_row_display("request_compression_level").as_deref(), Some("6"));
         drop(temp);
     }
 
@@ -1123,6 +1137,11 @@ mod tests {
             assert!(is_ok(d("telemetry_log_generations", "5")));
             assert!(is_err(d("telemetry_log_generations", "0")));
             assert!(is_err(d("telemetry_log_generations", "101")));
+            assert!(is_ok(d("request_compression", "on")));
+            assert!(is_err(d("request_compression", "brotli")));
+            assert!(is_ok(d("request_compression_level", "9")));
+            assert!(is_err(d("request_compression_level", "0")));
+            assert!(is_err(d("request_compression_level", "10")));
             assert!(is_ok(d("subagent.max_depth", "3")));
             assert!(is_err(d("subagent.max_depth", "0")));
             assert!(is_err(d("subagent.max_depth", "70000")));

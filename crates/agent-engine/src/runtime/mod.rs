@@ -39,6 +39,7 @@ pub mod message_time;
 pub mod openai;
 pub mod relay;
 mod request;
+mod request_encoding;
 mod sse;
 mod sse_types;
 mod stream;
@@ -666,6 +667,10 @@ pub struct Runtime {
     /// Prompt-cache TTL strategy (5m default | 1h | hybrid). Threaded into
     /// every request via `ApiOptions`.
     cache_ttl: crate::core::config::CacheTtl,
+    /// gzip policy for Anthropic request bodies (`request_compression`,
+    /// `request_compression_level`). Threaded into every request via
+    /// `ApiOptions`; its refusal latch is process-wide.
+    request_compression: request_encoding::RequestCompression,
     /// One-time-per-session latch for the silent 1h-downgrade notice
     /// (spec §3.4.1). Shared into `ApiOptions` for every request.
     ttl_downgrade_notified: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -1290,6 +1295,7 @@ impl Runtime {
             capture_dir: host.capture_dir,
             cache_diagnostics: false,
             cache_ttl: crate::core::config::CacheTtl::default(),
+            request_compression: Default::default(),
             ttl_downgrade_notified: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             saw_1h_honored: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             cache_anchor: Default::default(),
@@ -2932,6 +2938,10 @@ impl Runtime {
         self.sync_observability();
         self.cache_diagnostics = config.cache_diagnostics;
         self.cache_ttl = config.cache_ttl;
+        self.request_compression = request_encoding::RequestCompression::from_config(
+            config.request_compression,
+            config.request_compression_level,
+        );
         self.progressive_tool_disclosure = config.progressive_tool_disclosure;
         self.deferred_tool_loading = config.tools_deferred_loading;
         self.activation_confirm = config.tools_activation_confirm;
@@ -4115,6 +4125,8 @@ impl Runtime {
             &api::ApiOptions {
                 trace: self.trace_ctx.clone(),
                 telemetry: self.telemetry_writer.clone(),
+                // The largest body Synaps sends: the whole transcript.
+                request_compression: self.request_compression.clone(),
                 ..api::ApiOptions::default()
             },
         )
@@ -4166,6 +4178,7 @@ impl Runtime {
                     token_cache: self.token_cache.clone(),
                     anthropic_base_url: None,
                     anthropic_stream_client: self.anthropic_stream_client.clone(),
+                    request_compression: self.request_compression.clone(),
                     anthropic_execution_plan: anthropic_execution_plan.clone(),
                     codex_request_role: self.codex_request_role(),
                     // Consistent with the streaming path: a pending
@@ -4743,6 +4756,7 @@ impl Runtime {
             token_cache: self.token_cache.clone(),
             anthropic_base_url: None,
             anthropic_stream_client: self.anthropic_stream_client.clone(),
+            request_compression: self.request_compression.clone(),
             anthropic_execution_plan,
             codex_request_role: self.codex_request_role(),
             trace: self.effective_trace_context(),
@@ -4927,6 +4941,7 @@ impl Clone for Runtime {
             capture_dir: self.capture_dir.clone(),
             cache_diagnostics: self.cache_diagnostics,
             cache_ttl: self.cache_ttl,
+            request_compression: self.request_compression.clone(),
             // Subagents are their own session — fresh latches so a downgrade
             // in the subagent's chain surfaces its own (single) notice and
             // honored-state isn't inherited from the parent.
