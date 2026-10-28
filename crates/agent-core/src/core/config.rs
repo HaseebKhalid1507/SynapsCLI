@@ -1950,7 +1950,7 @@ fn apply_config_content_with(
                     config.telemetry_log_generations = n;
                 }
                 _ => config.warnings.push(format!(
-                    "telemetry_log_generations = {val} — expected 1–{MAX_TELEMETRY_LOG_GENERATIONS}; keeping 1"
+                    "telemetry_log_generations = {val} — expected 1–{MAX_TELEMETRY_LOG_GENERATIONS}; line ignored"
                 )),
             },
             "cache_diagnostics" => {

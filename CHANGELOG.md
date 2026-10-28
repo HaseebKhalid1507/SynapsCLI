@@ -9,14 +9,17 @@ All notable changes to this project will be documented in this file.
 - **`api-log.jsonl` joins sessions and the request trace.** Each record
   carries `session_id`, the persisted conversation id that
   `synaps daemon sessions` shows, and `runtime_session_id`, `turn_id` and
-  `trace_request_id`, the ids in `request-trace.jsonl`. Subagent records
+  `trace_request_id`, the ids in `request-trace.jsonl` (the runtime id is
+  now `session-<pid>-<ms>-<seq>`, unique per process). Subagent records
   add `worker_agent`, `worker_handle` (`sa_N`), `parent_session_id` and
   `parent_runtime_session_id` (`worker` stays); and
   every record with usage has an estimated `cost_usd` from the shared
   pricing table, 5m and 1h cache writes at their own rates. All additive.
 - `telemetry_log_generations = N` keeps `N` rotated generations
   (`.1`..`.N`, 50 MB each) of `api-log.jsonl` and `request-trace.jsonl`.
-  Default 1, as before.
+  Default 1, as before. Lowering it deletes the extra generations at the
+  next rotation. Rotation is now locked (`<log>.lock`), so two daemon
+  sessions can no longer rotate the same log twice and lose a generation.
 
 ### Fixed
 

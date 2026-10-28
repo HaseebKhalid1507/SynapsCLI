@@ -79,7 +79,7 @@ pub struct WorkerTelemetry {
     /// `~/.synaps-cli/sessions/<id>.json` id), stamped on the worker's
     /// records as `parent_session_id`. `None` when the parent is unkeyed.
     pub parent_session_id: Option<String>,
-    /// The parent's runtime trace session id (`session-<pid>-<ms>`),
+    /// The parent's runtime trace session id (`session-<pid>-<ms>-<seq>`),
     /// stamped as `parent_runtime_session_id`.
     pub parent_runtime_session_id: Option<String>,
     /// Set per spawn by [`Self::for_worker`]: the agent name.
@@ -270,7 +270,8 @@ pub struct TelemetryRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop_reason: Option<String>,
     pub usage: UsageRecord,
-    /// Estimated USD cost of this call ([`UsageRecord::cost_usd`]).
+    /// Estimated USD cost of this call at API list prices
+    /// ([`UsageRecord::cost_usd`]), also for OAuth/subscription auth.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cost_usd: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -292,18 +293,21 @@ pub struct TelemetryRecord {
     /// Absent for unkeyed runtimes (workers, tests).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
-    /// Runtime trace session id (`session-<pid>-<ms>`): the `session_id` of
+    /// Runtime trace session id (`session-<pid>-<ms>-<seq>`): the `session_id` of
     /// this call's `request-trace.jsonl` record. Not the persisted id.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runtime_session_id: Option<String>,
-    /// Request-trace turn id (`turn-<pid>-<n>`).
+    /// Request-trace turn id (`turn-<pid>-<n>`). Despite the name it is
+    /// minted per logical request (same counter as `trace_request_id`), not
+    /// per user turn.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub turn_id: Option<String>,
     /// Request-trace request id (`req-<pid>-<n>`), shared by every attempt
     /// of one logical request. Not the provider's `request_id`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trace_request_id: Option<String>,
-    /// Worker records: the agent name (`spike`, or the inline label).
+    /// Worker records: the agent name (`spike`), or for an inline subagent
+    /// its sanitized label (model-chosen text, `[A-Za-z0-9_-]`, bounded).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub worker_agent: Option<String>,
     /// Worker records: the subagent handle (`sa_N`).
