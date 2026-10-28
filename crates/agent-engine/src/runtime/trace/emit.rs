@@ -260,8 +260,13 @@ impl TraceContext {
 
     /// Context with the given sink and the installation default key path.
     pub fn with_sink(sink: Arc<dyn TraceSink>) -> Self {
-        let session_id = TraceId::new(format!("session-{}-{}", std::process::id(), unix_ms_now()))
-            .expect("generated session id is valid");
+        // `-<seq>`: contexts created in the same millisecond (workers
+        // spawned in one tool batch) still get distinct session ids.
+        static SESSION_SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SESSION_SEQ.fetch_add(1, Ordering::Relaxed);
+        let session_id =
+            TraceId::new(format!("session-{}-{}-{seq}", std::process::id(), unix_ms_now()))
+                .expect("generated session id is valid");
         Self {
             sink,
             session_id,
