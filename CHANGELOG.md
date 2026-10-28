@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- **Large requests to api.anthropic.com go out gzip-compressed.** A long
+  session re-uploads the whole conversation every turn; text-heavy bodies
+  shrink about 2x, so less waiting on the upload before the first token.
+  Tokens, billing and prompt caching are unchanged. Skipped behind an HTTPS
+  proxy, with a custom CA bundle (`SSL_CERT_FILE`/`SSL_CERT_DIR`) or a
+  custom `SYNAPS_ANTHROPIC_BASE_URL`; `SYNAPS_GZIP_REQUEST_BODIES=0` turns
+  it off. If the API refuses a compressed body, the request is resent
+  uncompressed and gzip stays off for the rest of the process.
+
 ## [0.11.0] — 2026-10-26
 
 Sessions now live in the daemon. Every client attached to a session can

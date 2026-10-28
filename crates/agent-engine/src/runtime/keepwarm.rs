@@ -644,6 +644,7 @@ impl Runtime {
             token_cache: self.token_cache.clone(),
             anthropic_base_url: None,
             anthropic_stream_client: self.anthropic_stream_client.clone(),
+            request_compression: Default::default(),
             anthropic_execution_plan,
             codex_request_role: self.codex_request_role(),
             // The base context: a ping must never consume `/trace next`.

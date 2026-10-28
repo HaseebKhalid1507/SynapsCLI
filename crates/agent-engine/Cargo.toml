@@ -39,6 +39,7 @@ async-trait        = "0.1.89"
 reqwest            = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls-webpki-roots", "rustls-tls-native-roots"] }
 bytes              = "1"
 memchr             = "2"
+flate2             = "1"
 
 # Serialisation
 serde              = { version = "1.0", features = ["derive", "rc"] }

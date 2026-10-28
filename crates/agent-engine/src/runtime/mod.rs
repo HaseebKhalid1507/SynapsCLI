@@ -38,6 +38,7 @@ pub mod memory_history;
 pub mod openai;
 pub mod relay;
 mod request;
+mod request_encoding;
 mod sse;
 mod sse_types;
 mod stream;
@@ -4131,6 +4132,7 @@ impl Runtime {
                     token_cache: self.token_cache.clone(),
                     anthropic_base_url: None,
                     anthropic_stream_client: self.anthropic_stream_client.clone(),
+                    request_compression: Default::default(),
                     anthropic_execution_plan: anthropic_execution_plan.clone(),
                     codex_request_role: self.codex_request_role(),
                     // Consistent with the streaming path: a pending
@@ -4708,6 +4710,7 @@ impl Runtime {
             token_cache: self.token_cache.clone(),
             anthropic_base_url: None,
             anthropic_stream_client: self.anthropic_stream_client.clone(),
+            request_compression: Default::default(),
             anthropic_execution_plan,
             codex_request_role: self.codex_request_role(),
             trace: self.effective_trace_context(),
