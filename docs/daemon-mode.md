@@ -198,16 +198,21 @@ is refused (`named`, exit 3) unless `--force`; `--clear` on a named session
 needs `--force` too. The CLI sends the name it saw in the listing as the
 frame's `expect`, which the session checks atomically, so a name the user sets
 (`/saveas`) between the listing and the rename still wins, even with
-`--force`. An auto-namer should never pass `--force`.
+`--force`. An auto-namer should never pass `--force`. **Raw socket clients:
+send `"expect": null`** — an absent `expect` means no precondition and
+replaces any name.
 
 - The target resolves like `daemon close`'s (id, id prefix, journal id, or the
   current name). The daemon sends the session the host-only engine command
   `rename` (JSON args; a plain-text `/rename foo` typed in-process is refused:
   use `/saveas`). The session applies `/saveas`'s rules: `validate_name`
   (`[a-z0-9-]{1,40}`), unique across the sessions directory, no clash with a
-  chain name. A process-wide lock covers the check through the save, so two
-  sessions of this daemon can never take the same name at once (other
-  processes are covered by journal locks).
+  chain name. A process-wide lock, taken by `daemon rename` and by
+  `/saveas` alike, covers the check through the save, so two sessions of
+  this daemon can never take the same name at once. Waiting for it is
+  bounded (3 s, then `busy`). It does not cover other processes: a journal
+  lock is per session, so an in-process TUI's `/saveas` or the session
+  picker can still race a daemon rename for a name.
 - **A live session** saves durably (`save_durable`), then puts the file
   mtimes of `<id>.json` (and `<id>.journal`) back: a rename is not activity,
   so `synaps --continue` (newest mtime) and the `/sessions` order do not
@@ -221,13 +226,16 @@ frame's `expect`, which the session checks atomically, so a name the user sets
 - **A parked session is renamed on disk and not woken**: under its journal
   lock (`session_catalog::rename_past_session`, the same primitive the
   session picker uses), with a durable save that leaves `updated_at` and the
-  mtime alone. If another process holds the journal (an in-process
-  `--continue`), it is `locked`. On unpark the name comes from the file.
+  mtime alone. `expect` is checked against the name in the file, under that
+  lock (another process may have renamed it while it was parked); a mismatch
+  is `named` and the listing picks up the file's name. If another process
+  holds the journal (an in-process `--continue`), it is `locked`. On unpark
+  the name comes from the file.
 - Answers: `renamed{session_id, name, in_memory_only?}`, or
   `rename_failed{session_id, reason, message, taken_by?, current_name?}` with
   `reason` one of `invalid`, `taken` (`taken_by` is the holder's journal id,
   e.g. `20261028-045932-eb8e`), `chain_conflict`, `named` (`current_name`),
-  `locked`, `busy` (queue full, daemon reloading: retry), `unknown` (no answer
+  `locked`, `busy` (queue full, daemon reloading, another rename saving: retry), `unknown` (no answer
   in time: it may still apply, **re-list before retrying**), `failed`.
 - Exit codes: 0 renamed or cleared; 3 refused or not applied right now
   (`named` without `--force`, `locked`, `busy`, `unknown`); 1 invalid name,

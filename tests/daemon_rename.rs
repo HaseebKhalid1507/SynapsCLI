@@ -97,6 +97,27 @@ async fn observe(sock: &Path, sid: &SessionId) -> SocketTransport {
     t
 }
 
+async fn attach_mirror(sock: &Path, sid: &SessionId) -> SocketTransport {
+    let conn = SocketTransport::connect(sock, Hello::new(ClientKind::Test)).await.unwrap();
+    let (t, _snap) =
+        SocketTransport::attach(conn, Attach::Existing { session_id: sid.clone(), mode: AttachMode::Mirror })
+            .await
+            .expect("attach mirror");
+    t
+}
+
+/// `/saveas <name>` from this (owning) client; the reply's `value`.
+async fn saveas(t: &mut SocketTransport, id: u64, name: &str) -> serde_json::Value {
+    t.send_from_self(SessionCommand::EngineCommand { id, name: "saveas".into(), arg: name.into() }).await.unwrap();
+    loop {
+        if let SessionEventWire::QueryResult { id: got, value } = next(t).await.event {
+            if got == id {
+                return value;
+            }
+        }
+    }
+}
+
 async fn run_turn(t: &mut SocketTransport) {
     t.send_from_self(SessionCommand::Submit { text: "hello".into(), attachments: vec![] }).await.unwrap();
     until(t, |e| matches!(e, SessionEventWire::Idle)).await;
@@ -384,13 +405,16 @@ async fn a_parked_session_is_renamed_on_disk_without_waking_and_keeps_the_name_a
     assert!(card_names(&guard).contains(&Some("parked-notes".into())), "card");
     assert_eq!(mtime(&session_file(&guard, &journal)), mtime_before, "mtime kept");
 
-    // Unpark: the name comes back from disk.
-    let back = observe(&sock, &sid).await;
+    // Unpark and run a turn: the conversation was rebuilt from the file, so
+    // its turn-end save keeps the name (a stale in-memory session would
+    // write it back without one).
+    let mut back = attach_mirror(&sock, &sid).await;
     assert!(wait_lifecycle(&sock, &sid, SessionLifecycle::Live, Duration::from_secs(10)).await, "unparked");
-    back.send(SessionCommand::Query { id: 1, query: SessionQuery::Status }).await.ok();
+    run_turn(&mut back).await;
+    tokio::time::sleep(Duration::from_millis(300)).await; // the queued turn-end save
+    assert_eq!(saved_name(&guard, &journal).as_deref(), Some("parked-notes"), "file after a turn");
     assert_eq!(listed(&sock, &sid).await.unwrap().name.as_deref(), Some("parked-notes"));
-    let snap_name = d.state.attach(&sid).unwrap().name();
-    assert_eq!(snap_name.as_deref(), Some("parked-notes"));
+    assert_eq!(d.state.attach(&sid).unwrap().name().as_deref(), Some("parked-notes"));
     stop(d, &sock).await;
 }
 
@@ -724,5 +748,148 @@ async fn the_cli_renames_refuses_to_replace_without_force_and_reports_each_exit_
     let m = listed(&sock, &sid).await.unwrap();
     assert_eq!((m.name, m.lifecycle), (None, SessionLifecycle::Parked));
 
+    stop(d, &sock).await;
+}
+
+/// L1: `/saveas` takes the same process-wide name lock as `daemon rename`,
+/// so a human naming session B and the auto-namer naming session A the
+/// same name at once can't both win.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn a_saveas_racing_a_daemon_rename_of_another_session_has_one_winner() {
+    let guard = HomeGuard::new();
+    let (d, _hits) = boot(&guard, "never").await;
+    let sock = d.paths.sock.clone();
+    let (mut a, sid_a) = create(&sock, guard.home.path()).await;
+    run_turn(&mut a).await;
+    let (mut b, sid_b) = create(&sock, guard.home.path()).await;
+    run_turn(&mut b).await;
+    for round in 0..8u64 {
+        let name = format!("race-{round}");
+        let (rename, saved) = tokio::join!(
+            SocketTransport::rename(&sock, &sid_a, Some(name.as_str()), None),
+            saveas(&mut b, 100 + round, &name),
+        );
+        let rename_won = matches!(rename, Ok(Ok(_)));
+        let saveas_won = saved["kind"] == "output";
+        assert!(rename_won ^ saveas_won, "round {round}: exactly one wins: {rename:?} / {saved}");
+        let a_name = listed(&sock, &sid_a).await.unwrap().name;
+        let b_name = listed(&sock, &sid_b).await.unwrap().name;
+        let holders = [a_name, b_name].iter().filter(|n| n.as_deref() == Some(name.as_str())).count();
+        assert_eq!(holders, 1, "round {round}: one session named {name}");
+    }
+    stop(d, &sock).await;
+}
+
+/// L2: waiting for the name lock is bounded; a session whose rename can't
+/// get it answers `busy` (and so does `/saveas`) instead of freezing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_rename_that_cannot_get_the_name_lock_answers_busy() {
+    let guard = HomeGuard::new();
+    let (d, _hits) = boot(&guard, "never").await;
+    let sock = d.paths.sock.clone();
+    let (mut t, sid) = create(&sock, guard.home.path()).await;
+    run_turn(&mut t).await;
+
+    let held = agent_engine::session::actor_cmds::hold_name_lock_for_tests().await;
+    let t0 = std::time::Instant::now();
+    let f = failure(SocketTransport::rename(&sock, &sid, Some("later"), UNNAMED).await);
+    assert_eq!(f.reason, RenameRefusal::Busy, "{}", f.message);
+    assert!(t0.elapsed() < Duration::from_secs(10), "bounded: {:?}", t0.elapsed());
+    let v = saveas(&mut t, 7, "later").await;
+    assert_eq!(v["kind"], "error", "{v}");
+    assert!(v["text"].as_str().unwrap().contains("retry"), "{v}");
+    drop(held);
+
+    assert_eq!(SocketTransport::rename(&sock, &sid, Some("later"), UNNAMED).await.unwrap(), renamed("later"));
+    stop(d, &sock).await;
+}
+
+/// `locked`: a parked session whose journal another process holds (an
+/// in-process `--continue`) is not renamed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_parked_session_held_by_another_process_is_locked() {
+    let guard = HomeGuard::new();
+    let (d, _hits) = boot(&guard, "0").await;
+    let sock = d.paths.sock.clone();
+    let (mut t, sid) = create(&sock, guard.home.path()).await;
+    run_turn(&mut t).await;
+    t.detach().await;
+    assert!(wait_lifecycle(&sock, &sid, SessionLifecycle::Parked, Duration::from_secs(10)).await);
+    let journal = listed(&sock, &sid).await.unwrap().journal_id;
+    let lock = agent_core::session_lock::SessionLock::try_acquire(
+        &agent_core::session_lock::sessions_dir(),
+        &journal,
+        agent_core::session_lock::LockHolder { pid: 4242, kind: "tui".into() },
+    )
+    .expect("the parked session released its lock");
+
+    let f = failure(SocketTransport::rename(&sock, &sid, Some("held"), UNNAMED).await);
+    assert_eq!(f.reason, RenameRefusal::Locked, "{}", f.message);
+    assert_eq!(saved_name(&guard, &journal), None);
+    drop(lock);
+    assert_eq!(SocketTransport::rename(&sock, &sid, Some("held"), UNNAMED).await.unwrap(), renamed("held"));
+    stop(d, &sock).await;
+}
+
+/// A parked session's `expect` is checked against the FILE: another
+/// process renamed it while parked, so an "only if unnamed" rename loses,
+/// and the listing picks up the name on disk.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_parked_rename_checks_expect_against_the_file() {
+    let guard = HomeGuard::new();
+    let (d, _hits) = boot(&guard, "0").await;
+    let sock = d.paths.sock.clone();
+    let (mut t, sid) = create(&sock, guard.home.path()).await;
+    run_turn(&mut t).await;
+    t.detach().await;
+    assert!(wait_lifecycle(&sock, &sid, SessionLifecycle::Parked, Duration::from_secs(10)).await);
+    let journal = listed(&sock, &sid).await.unwrap().journal_id;
+    // The session picker in another process (the journal lock is free).
+    agent_engine::core::session_catalog::rename_past_session(
+        &agent_core::session_lock::sessions_dir(),
+        &journal,
+        Some("external"),
+    )
+    .unwrap();
+    assert_eq!(listed(&sock, &sid).await.unwrap().name, None, "the daemon has not seen it yet");
+
+    let f = failure(SocketTransport::rename(&sock, &sid, Some("auto"), UNNAMED).await);
+    assert_eq!((f.reason, f.current_name.as_deref()), (RenameRefusal::Named, Some("external")));
+    assert_eq!(saved_name(&guard, &journal).as_deref(), Some("external"), "not clobbered");
+    assert_eq!(listed(&sock, &sid).await.unwrap().name.as_deref(), Some("external"), "listing refreshed");
+    stop(d, &sock).await;
+}
+
+/// S5: a save that fails is reported (`failed`) and rolled back: memory,
+/// listing and file keep the old name. The save is made to fail by putting
+/// a directory where the snapshot goes (the atomic rename onto it fails).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_rename_whose_save_fails_is_rolled_back() {
+    let guard = HomeGuard::new();
+    let (d, _hits) = boot(&guard, "never").await;
+    let sock = d.paths.sock.clone();
+    let (mut t, sid) = create(&sock, guard.home.path()).await;
+    run_turn(&mut t).await;
+    let journal = listed(&sock, &sid).await.unwrap().journal_id;
+    let file = session_file(&guard, &journal);
+    let aside = file.with_extension("json.aside");
+    std::fs::rename(&file, &aside).unwrap();
+    std::fs::create_dir(&file).unwrap();
+
+    let r = SocketTransport::rename(&sock, &sid, Some("unsaved"), UNNAMED).await;
+    std::fs::remove_dir(&file).unwrap();
+    std::fs::rename(&aside, &file).unwrap();
+    let f = failure(r);
+    assert_eq!(f.reason, RenameRefusal::Failed);
+    assert!(f.message.contains("rolled back"), "{}", f.message);
+    assert_eq!(listed(&sock, &sid).await.unwrap().name, None, "listing unchanged");
+    assert_eq!(saved_name(&guard, &journal), None, "file unchanged");
+    // Memory too: the precondition "unnamed" still holds.
+    assert_eq!(SocketTransport::rename(&sock, &sid, Some("saved"), UNNAMED).await.unwrap(), renamed("saved"));
     stop(d, &sock).await;
 }
