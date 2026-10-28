@@ -78,6 +78,9 @@ pub(crate) struct Columns {
     pub(crate) id: bool,
     /// cwd column width (0 = hidden).
     pub(crate) cwd: usize,
+    /// Clients / model column widths when shown ([`Columns::fit_content`]).
+    pub(crate) clients_w: usize,
+    pub(crate) model_w: usize,
 }
 
 const GLYPH_W: usize = 2;
@@ -96,7 +99,16 @@ impl Columns {
     pub(crate) fn for_width(avail: usize) -> Self {
         // Always: glyph, pin, name, state (shrinkable to STATE_MIN).
         let base = GLYPH_W + PIN_W + NAME_W + GAP;
-        let mut c = Columns { state: STATE_W, clients: false, cost: false, model: false, id: false, cwd: 0 };
+        let mut c = Columns {
+            state: STATE_W,
+            clients: false,
+            cost: false,
+            model: false,
+            id: false,
+            cwd: 0,
+            clients_w: CLIENTS_W,
+            model_w: MODEL_W,
+        };
         let mut used = base + STATE_W;
         if used > avail {
             c.state = avail.saturating_sub(base).max(STATE_MIN.min(avail.saturating_sub(base)));
@@ -123,6 +135,30 @@ impl Columns {
             c.cwd = avail - used - GAP;
         }
         c
+    }
+}
+
+impl Columns {
+    /// Shrink the state, clients and model columns to their widest text
+    /// (never below the state minimum) and give what that frees to the
+    /// path column — fixed widths left slack beside a cut path.
+    pub(crate) fn fit_content(&mut self, state: usize, clients: usize, model: usize) {
+        if self.cwd == 0 {
+            return;
+        }
+        let state = state.max(STATE_MIN);
+        if state < self.state {
+            self.cwd += self.state - state;
+            self.state = state;
+        }
+        if self.clients && clients < self.clients_w {
+            self.cwd += self.clients_w - clients;
+            self.clients_w = clients;
+        }
+        if self.model && model < self.model_w {
+            self.cwd += self.model_w - model;
+            self.model_w = model;
+        }
     }
 }
 
@@ -217,7 +253,7 @@ fn summary(st: &SessionsState) -> String {
 }
 
 fn tabs_line(st: &SessionsState, p: &Palette, width: u16) -> Line<'static> {
-    let live = format!("Live {}", st.live.len());
+    let live = format!("Live {}", st.live_count());
     let past = match st.past.count() {
         Some(n) => format!("Past {}", super::past::thousands(n)),
         None => "Past \u{2026}".to_string(),
@@ -274,7 +310,17 @@ fn render_live(frame: &mut Frame, area: Rect, st: &SessionsState, p: &Palette) {
     }
     // row_line: bar(2) + "{label:<0} " (1) + value.
     let avail = usize::from(area.width).saturating_sub(3);
-    let cols = Columns::for_width(avail);
+    let mut cols = Columns::for_width(avail);
+    // Columns only take their widest text; the rest goes to the path. Not
+    // with not-live pins listed: their reason spans these columns' room.
+    let widest = |f: &dyn Fn(&SessionMeta) -> String| st.live.iter().map(|m| text_w(&f(m))).max().unwrap_or(0);
+    if st.offline.is_empty() {
+        cols.fit_content(
+            widest(&|m| super::state_text(m, st.now)),
+            widest(&|m| super::clients_text(m, st.is_own(m))).max(text_w("you")),
+            widest(&|m| super::short_model(&m.model)),
+        );
+    }
     let sel = st.selected_index();
     let mut sel_line = 0;
     let mut in_parked = None;
@@ -322,16 +368,20 @@ fn live_spans(st: &SessionsState, m: &SessionMeta, cols: &Columns, p: &Palette, 
             if m.pinned { "\u{2691} ".to_string() } else { "  ".to_string() },
             Style::default().fg(p.accent),
         ),
-        Span::styled(
-            cell(&super::label(m), NAME_W),
-            Style::default().fg(text_fg).add_modifier(if own { Modifier::BOLD } else { Modifier::empty() }),
-        ),
     ];
+    // Every row: name (or title) in the name column, short id in the id
+    // column. Without an id column an untitled row falls back to `…id`.
+    let name = match (super::row_name(m), cols.id) {
+        (Some(n), _) => n,
+        (None, true) => "\u{2014}".to_string(),
+        (None, false) => super::label(m),
+    };
+    v.push(Span::styled(
+        cell(&name, NAME_W),
+        Style::default().fg(text_fg).add_modifier(if own { Modifier::BOLD } else { Modifier::empty() }),
+    ));
     if cols.id {
-        // Unnamed rows already show the short id as their label.
-        let named = m.name.as_deref().is_some_and(|n| !n.is_empty());
-        let id = if named { super::short_id(&m.id.0) } else { "" };
-        v.push(Span::styled(format!("{gap}{}", cell(id, ID_W)), dim));
+        v.push(Span::styled(format!("{gap}{}", cell(super::short_id(&m.id.0), ID_W)), dim));
     }
     let state_fg = match state {
         RowState::Streaming => p.accent,
@@ -344,10 +394,10 @@ fn live_spans(st: &SessionsState, m: &SessionMeta, cols: &Columns, p: &Palette, 
     ));
     if cols.clients {
         let fg = if own { p.text } else { p.dim };
-        v.push(Span::styled(format!("{gap}{}", cell(&super::clients_text(m, own), CLIENTS_W)), Style::default().fg(fg)));
+        v.push(Span::styled(format!("{gap}{}", cell(&super::clients_text(m, own), cols.clients_w)), Style::default().fg(fg)));
     }
     if cols.model {
-        v.push(Span::styled(format!("{gap}{}", cell(&super::short_model(&m.model), MODEL_W)), dim));
+        v.push(Span::styled(format!("{gap}{}", cell(&super::short_model(&m.model), cols.model_w)), dim));
     }
     if cols.cost {
         v.push(Span::styled(format!("{gap}{}", rcell(&super::cost_text(m.cost_usd), COST_W)), Style::default().fg(text_fg)));
@@ -385,7 +435,7 @@ fn pin_spans(
     }
     // The state takes the optional columns' room: the reason is the point.
     let mut w = cols.state;
-    for (on, cw) in [(cols.clients, CLIENTS_W), (cols.model, MODEL_W), (cols.cost, COST_W)] {
+    for (on, cw) in [(cols.clients, cols.clients_w), (cols.model, cols.model_w), (cols.cost, COST_W)] {
         if on {
             w += GAP + cw;
         }
@@ -428,7 +478,11 @@ fn render_detail(frame: &mut Frame, area: Rect, st: &SessionsState, p: &Palette)
         let own = st.is_own(m);
         let created = m.created_at.with_timezone(&chrono::Local).format("%b %d %H:%M");
         let cwd = super::short_cwd(m.cwd.as_deref(), st.home.as_deref());
-        let mut l1 = vec![super::label(m), m.id.0.clone(), super::short_model(&m.model)];
+        let mut l1 = Vec::new();
+        if let Some(n) = m.name.as_deref().filter(|n| !n.trim().is_empty()) {
+            l1.push(n.to_string());
+        }
+        l1.extend([m.id.0.clone(), super::short_model(&m.model)]);
         if !cwd.is_empty() {
             l1.push(cwd);
         }
@@ -436,7 +490,7 @@ fn render_detail(frame: &mut Frame, area: Rect, st: &SessionsState, p: &Palette)
         lines.push(Line::from(Span::styled(fit(&l1.join(" \u{00b7} "), w), text)));
 
         let mut l2 = match m.title.as_deref().filter(|t| !t.is_empty()) {
-            Some(t) => format!("\u{201c}{t}\u{201d}"),
+            Some(t) => format!("\u{201c}{}\u{201d}", super::detail_title(t)),
             None => "(no title yet)".to_string(),
         };
         if !m.journal_id.is_empty() && m.journal_id != m.id.0 {

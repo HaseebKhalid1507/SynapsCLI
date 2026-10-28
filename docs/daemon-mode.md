@@ -35,7 +35,7 @@
 | `client_input = shared` (default) / `exclusive` (config, `/settings` → Daemon) | Who may type in a session with several clients attached. Every client is the daemon's own user, so by default (`shared`) every drive client (not `--observe`) may send input; the one that did last is the *active* client: `InputOwnerChanged{Input}` moves the marker (older clients, without `ClientCapabilities::owner_reason_input`, read it as `Takeover`), it may choose "Allow all" (answering makes a client active), and it gets input back first after a daemon reload. When the active client leaves, input goes to whoever typed most recently. `exclusive` is the rule before `client_input`: only the input owner drives, the others are read-only until they `--takeover` or `/takeover`. The daemon reads it from config when it starts, for every session it creates or restores (`synaps daemon reload` picks up a change; `SessionConfig.client_input` overrides it per session). The snapshot carries it (`Attached.client_input`; absent from an older daemon, which means `exclusive`), and so does the listing (`synaps daemon sessions` says `active=` instead of `owner=`). An older client (no `owner_reason_input` capability) on a shared session knows only the owner rule, so the daemon presents it as owning input and never sends it `InputOwnerChanged`: it can type all along, and would otherwise announce "input is owned by …" on attach and "input taken over" whenever another client typed (every open TUI is an older client right after a `daemon reload` onto a new build). The TUI header shows `N clients` when another client is attached; a TUI that may not drive (`--observe`, or not the owner under `exclusive`) sends nothing on Enter or Esc and says why in a toast, keeping the text. |
 | `synaps --attach --no-confirm-answers` | TUI only, any attach mode: this client never answers a `Confirm` prompt (tool-call and tool-activation approvals). It never opens the approval pane for one, so no key typed into it can approve; it lists the waiting confirms in a toast until another client's answer resolves them (`PromptResolved`). `Secret` prompts are unchanged. Client-side only: no wire or daemon change, so it works against any daemon. For a TUI embedded where keystrokes may not come from the person approving (a terminal pane in another app). An `--observe` attach still can answer prompts without this flag: `Answer` is not an input command. |
 | `SYNAPS_SESSION_COMPACT_INLINE=1` | One-release kill-switch: run `/compact` and auto-compaction inline on the actor task (the #107 body — `Attach`/`Cancel` wait behind it) instead of the spawned job. Deleted in phase 4. |
-| `synaps daemon reload` / `stop` / `purge` / `close` / `pin` / `reload-extension` from **any** same-uid client | Not a privilege boundary (0600 socket): a stray `synaps daemon reload` from any shell checkpoints every session and closes everyone's PTYs, `daemon close --attached` ends one session whoever owns its input (without `--attached` it refuses a session that has clients attached), `daemon pin` pins one session whoever owns its input (host authority, like `stop`), and `daemon reload-extension` restarts an extension every session shares. `Checkpoint` over the wire is owner-only. |
+| `synaps daemon reload` / `stop` / `purge` / `close` / `pin` / `rename` / `reload-extension` from **any** same-uid client | Not a privilege boundary (0600 socket): a stray `synaps daemon reload` from any shell checkpoints every session and closes everyone's PTYs, `daemon close --attached` ends one session whoever owns its input (without `--attached` it refuses a session that has clients attached), `daemon pin` pins one session whoever owns its input (host authority, like `stop`), `daemon rename` names one session whoever owns its input (metadata only), and `daemon reload-extension` restarts an extension every session shares. `Checkpoint` over the wire is owner-only. |
 
 ## CLI
 
@@ -48,6 +48,7 @@ synaps daemon purge                  # Purge frame → memstat::purge_arenas() i
 synaps daemon reload [--now] [--drain-secs N] [--exe PATH] [--json]   # re-exec in place, same pid (C3; §Reload below)
 synaps daemon close <ID|NAME> [--force] [--attached] [--json]   # end one session without attaching (§Closing a session); exit 0/1/2/3
 synaps daemon pin <ID|NAME> [--off] [--json]       # pin/unpin one session without attaching (§Pinning a session); exit 0/1/2/3
+synaps daemon rename <ID|NAME> <NEW_NAME> | --clear [--force] [--json]   # name/unname one session without attaching (§Renaming a session); exit 0/1/2/3
 synaps daemon reload-extension <NAME> [--json]     # restart one extension in place, sessions untouched (§Reloading one extension); exit 0/1/2/3
 synaps attach [ID] [--create] [--continue NAME_OR_ID] [-s PROMPT] [--observe|--takeover] [--keep-warm] [--as NAME]
 synaps --attach [ID] [--observe|--takeover] [--keep-warm] [--no-confirm-answers] [--as NAME]   # thin TUI client over the socket (phase 4); starts the daemon if none is running
@@ -181,6 +182,70 @@ loaded (a long-lived worker host, an inbox other tools write to) is **pinned**:
 - A pinned session keeps the prompt cache warm (`/keepwarm`, when it is on)
   even with no TUI ever attached, e.g. one restored after a restart and fed by
   `synaps send`. Unpinned, only a session a typing client attached to keeps warm.
+
+## Renaming a session (`daemon rename`)
+
+`/saveas <name>` names the session (input owner only; an observer is told it is
+read-only). **`synaps daemon rename <ID|NAME> <NEW_NAME> | --clear [--force]
+[--json]`** does it from any shell, without attaching: renaming is metadata,
+not input, so it needs no input ownership, and since the control connection
+never attaches, presence (clients, input owner, which client claims the shared
+inbox) does not change. Meant for tools such as an extension that auto-names
+unnamed sessions.
+
+**Rename never silently replaces a name.** A session that already has a name
+is refused (`named`, exit 3) unless `--force`; `--clear` on a named session
+needs `--force` too. The CLI sends the name it saw in the listing as the
+frame's `expect`, which the session checks atomically, so a name the user sets
+(`/saveas`) between the listing and the rename still wins, even with
+`--force`. An auto-namer should never pass `--force`. **Raw socket clients:
+send `"expect": null`** — an absent `expect` means no precondition and
+replaces any name.
+
+- The target resolves like `daemon close`'s (id, id prefix, journal id, or the
+  current name). The daemon sends the session the host-only engine command
+  `rename` (JSON args; a plain-text `/rename foo` typed in-process is refused:
+  use `/saveas`). The session applies `/saveas`'s rules: `validate_name`
+  (`[a-z0-9-]{1,40}`), unique across the sessions directory, no clash with a
+  chain name. A process-wide lock, taken by `daemon rename` and by
+  `/saveas` alike, covers the check through the save, so two sessions of
+  this daemon can never take the same name at once. Waiting for it is
+  bounded (3 s, then `busy`). It does not cover other processes: a journal
+  lock is per session, so an in-process TUI's `/saveas` or the session
+  picker can still race a daemon rename for a name.
+- **A live session** saves durably (`save_durable`), then puts the file
+  mtimes of `<id>.json` (and `<id>.journal`) back: a rename is not activity,
+  so `synaps --continue` (newest mtime) and the `/sessions` order do not
+  change. Then the listing, the `run/<sid>.json` card and a pinned session's
+  pin-book entry (verbatim: a cleared name stops resolving) are updated, and
+  every attached client, observers included, gets a `Conversation` with the
+  new name. A failed save is reported (`failed`) and rolled back. A session
+  created with `persist: false` gets the name in memory only (the reply says
+  `in_memory_only`); a live session whose journal lock this daemon does not
+  hold is refused (`locked`).
+- **A parked session is renamed on disk and not woken**: under its journal
+  lock (`session_catalog::rename_past_session`, the same primitive the
+  session picker uses), with a durable save that leaves `updated_at` and the
+  mtime alone. `expect` is checked against the name in the file, under that
+  lock (another process may have renamed it while it was parked); a mismatch
+  is `named` and the listing picks up the file's name. If another process
+  holds the journal (an in-process `--continue`), it is `locked`. On unpark
+  the name comes from the file.
+- Answers: `renamed{session_id, name, in_memory_only?}`, or
+  `rename_failed{session_id, reason, message, taken_by?, current_name?}` with
+  `reason` one of `invalid`, `taken` (`taken_by` is the holder's journal id,
+  e.g. `20261028-045932-eb8e`), `chain_conflict`, `named` (`current_name`),
+  `locked`, `busy` (queue full, daemon reloading, another rename saving: retry), `unknown` (no answer
+  in time: it may still apply, **re-list before retrying**), `failed`.
+- Exit codes: 0 renamed or cleared; 3 refused or not applied right now
+  (`named` without `--force`, `locked`, `busy`, `unknown`); 1 invalid name,
+  name taken, chain conflict, failed, no such session, ambiguous, prefix too
+  short, no daemon; 2 the daemon predates `daemon rename` (`synaps daemon
+  reload`), a protocol mismatch, or a usage error (a blank `NEW_NAME` is one:
+  use `--clear`). `--json` prints `{ok, session_id, outcome, name, taken_by,
+  text}`; `name` is the name afterwards, or the current name for `named`.
+- An attached client cannot send `rename` (neither the control frame nor the
+  engine command): it has `/saveas`.
 
 ## Reloading one extension (`daemon reload-extension`)
 
@@ -329,6 +394,7 @@ D: {"type":"welcome", protocol_version, daemon_version, pid, profile, sessions:[
 C: ping | sessions | shutdown{force}          → D: pong{pid,uptime_s,sessions} | session_list{sessions} | bye   (no session allocated)
 C: close{session_id, force, attached}         → D: closed{session_id, text} | refused{busy|unknown_session} (→ daemon closes) | error
 C: pin{session_id, on}                        → D: pinned{session_id, on} | refused{busy|unknown_session} (→ daemon closes) | error
+C: rename{session_id, name?, expect?}         → D: renamed{session_id, name, in_memory_only?} | rename_failed{session_id, reason, message, taken_by?, current_name?} | refused{unknown_session} (→ daemon closes)
 C: reload_extension{extension}                → D: extension_reloaded{report} | extension_reload_failed{extension, message, unloaded} | refused{busy} (→ daemon closes)
 C: {"type":"attach", attach:"existing", session_id, mode} | {"type":"attach", attach:"create", config:SessionConfig, mode}
 D: {"type":"attached", client, meta, view, conversation, streaming, replay:[WireEnvelope], pending_prompts, clients} | error
@@ -384,6 +450,11 @@ C: bye | socket close = Detach (turn keeps running)
 - `pin` (`on` required) follows the same rule: an older daemon answers "unknown variant `pin`" and
   `synaps daemon pin` exits 2; `pinned` only answers `pin`; refused on an attached connection (that
   client has `/pin`). `SessionMeta.pinned` is `#[serde(default)]`: an older daemon omits it (→ false).
+- `rename` (`name` optional, absent = clear; `expect` optional: absent = no precondition, `null` = only
+  if unnamed, `"x"` = only if named `x`) follows the same rule: an older daemon answers "unknown
+  variant `rename`" at once (no hang) and `synaps daemon rename` reports "daemon … predates `daemon
+  rename`; run `synaps daemon reload`" (exit 2); `renamed`/`rename_failed` only answer it; refused on
+  an attached connection (that client has `/saveas`). Its replies use `RENAME_QUERY_ID_BASE`+n.
 - `reload_extension` follows it too: an older daemon answers "unknown variant `reload_extension`" and
   `synaps daemon reload-extension` exits 2; its two replies only answer it; refused on an attached
   connection.

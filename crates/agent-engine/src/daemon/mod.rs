@@ -17,6 +17,7 @@ pub mod pin;
 pub mod pins;
 pub mod registry;
 pub mod reload;
+pub mod rename;
 
 use std::collections::HashMap;
 use std::future::Future;

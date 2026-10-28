@@ -248,6 +248,14 @@ impl PinSink for PinBook {
             }
         });
     }
+
+    fn renamed(&self, journal_id: &str, name: Option<&str>) {
+        self.update_logged("rename", |v| {
+            if let Some(e) = v.iter_mut().find(|e| e.journal_id == journal_id) {
+                e.name = name.map(str::to_owned);
+            }
+        });
+    }
 }
 
 /// `SYNAPS_DAEMON_RESTORE_PINS` is not off.

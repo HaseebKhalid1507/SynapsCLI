@@ -4,6 +4,65 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **`synaps daemon rename <ID|NAME> <NEW_NAME>`** (or `--clear`) names a
+  daemon session from any shell without attaching, so a tool can name a
+  session it only observes. Same rules as `/saveas`; attached clients see the
+  name at once. A parked session is renamed on disk without being woken. It
+  never replaces a name unless `--force`, never moves a session to the top of
+  `--continue` or `/sessions`, and two sessions can't take one name at once.
+  [docs/daemon-mode.md](docs/daemon-mode.md#renaming-a-session-daemon-rename)
+- **`api-log.jsonl` joins sessions and the request trace.** Each record
+  carries `session_id`, the persisted conversation id that
+  `synaps daemon sessions` shows, and `runtime_session_id`, `turn_id` and
+  `trace_request_id`, the ids in `request-trace.jsonl` (the runtime id is
+  now `session-<pid>-<ms>-<seq>`, unique per process). Subagent records
+  add `worker_agent`, `worker_handle` (`sa_N`), `parent_session_id` and
+  `parent_runtime_session_id` (`worker` stays); and
+  every record with usage has an estimated `cost_usd` from the shared
+  pricing table, 5m and 1h cache writes at their own rates. All additive.
+- `telemetry_log_generations = N` keeps `N` rotated generations
+  (`.1`..`.N`, 50 MB each) of `api-log.jsonl` and `request-trace.jsonl`.
+  Default 1, as before. Lowering it deletes the extra generations at the
+  next rotation. Rotation is now locked (`<log>.lock`), so two daemon
+  sessions can no longer rotate the same log twice and lose a generation.
+
+### Changed
+
+- **`subagent_resume` no longer replays a big transcript into an expired
+  cache.** Workers run on the 5-minute cache TTL, so resuming one after a
+  longer wait rewrote its whole history at the cache-write price (measured:
+  250k–715k tokens, up to ~$3.50 a resume). When the prior run's cache has
+  expired and its history is at least `subagent_cold_resume_compact_tokens`
+  (default 100000; `0` turns this off), the worker resumes from one compact
+  message instead: its original task, the last steps of the run, its final
+  report and the new instructions. `full_history: true` forces the full
+  replay. The reply says which happened (`"context": "full" | "compacted"`),
+  and the prior archive is kept, so a full replay stays possible.
+- **Large requests to api.anthropic.com go out gzip-compressed.** A long
+  session re-uploads the whole conversation every turn; text-heavy bodies
+  shrink about 2x, so less waiting on the upload before the first token.
+  Tokens, billing and prompt caching are unchanged. By default it is
+  skipped behind an HTTPS proxy, with a custom CA bundle
+  (`SSL_CERT_FILE`/`SSL_CERT_DIR`) or a custom `SYNAPS_ANTHROPIC_BASE_URL`.
+  Two settings, both in /settings → Context & Cache:
+  `request_compression = auto | on | off` (`on` also compresses through a
+  proxy or gateway known to pass gzip bodies) and
+  `request_compression_level = 1-9` (default 1, fastest; on a slow uplink a
+  higher level saves more upload time than it costs).
+  `SYNAPS_GZIP_REQUEST_BODIES=0` turns it off whatever the config says. If
+  the API refuses a compressed body, the request is resent uncompressed and
+  gzip stays off for the rest of the process. (#321)
+
+### Fixed
+
+- **`ttft_ms` in `api-log.jsonl` read `0`** on nearly every record: it was
+  timed from when the response headers arrived, not from the send.
+  `ttft_ms` and `total_ms` now count from the send, like the request trace;
+  `total_ms` therefore grows by the time to headers. A request with no
+  model event has no `ttft_ms` field (never `0`).
+
 ## [0.11.0] — 2026-10-26
 
 Sessions now live in the daemon. Every client attached to a session can

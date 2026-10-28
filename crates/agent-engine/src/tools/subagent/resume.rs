@@ -14,6 +14,7 @@ use std::sync::{Arc, RwLock};
 use tokio::sync::{mpsc, oneshot};
 
 use super::super::{Tool, ToolContext, NEXT_SUBAGENT_ID};
+use super::archive::{CompactedResume, ResumePolicy};
 use crate::runtime::subagent::{SubagentHandle, SubagentResult, SubagentState, SubagentStatus};
 use crate::{AgentEvent, Result, RuntimeError};
 
@@ -33,14 +34,36 @@ struct PriorRun {
     model: String,
     system_prompt: String,
     timeout_secs: u64,
+    /// Directory the prior run worked in, when recorded.
+    cwd: Option<std::path::PathBuf>,
     messages: Vec<crate::SharedMessage>,
+    /// Set when a cold, large history was replaced by a compact context.
+    compacted: Option<CompactedResume>,
 }
 
+/// [`prior_run_with`] under today's full-replay policy.
+#[cfg(test)]
 fn prior_run(
     registry: &std::sync::Mutex<crate::runtime::subagent::SubagentRegistry>,
     prior_handle_id: &str,
     explicit_archive: Option<std::path::PathBuf>,
     instructions: &str,
+) -> Result<PriorRun> {
+    prior_run_with(
+        registry,
+        prior_handle_id,
+        explicit_archive,
+        instructions,
+        ResumePolicy::FULL,
+    )
+}
+
+fn prior_run_with(
+    registry: &std::sync::Mutex<crate::runtime::subagent::SubagentRegistry>,
+    prior_handle_id: &str,
+    explicit_archive: Option<std::path::PathBuf>,
+    instructions: &str,
+    policy: ResumePolicy,
 ) -> Result<PriorRun> {
     // Where the prior context comes from: the worker's archived conversation
     // (any terminal handle, including collected, reaped and tombstoned ones),
@@ -64,15 +87,29 @@ fn prior_run(
             if s.archive_error.is_some() || (s.archive_meta.is_some() && s.archive_path.is_none()) {
                 if s.finalization_ready {
                     if let Some(history) = &s.history {
+                        // No archive file to date the run by: the recorded
+                        // anchor, else time since the worker finished.
+                        let cache_age = match s.cache_anchor_unix_ms {
+                            Some(ms) => Some(super::archive::anchor_age(
+                                ms,
+                                std::time::SystemTime::now(),
+                            )),
+                            None => s.finished_at.map(|t| t.elapsed()),
+                        };
+                        let (messages, compacted) = super::archive::plan_resume_messages(
+                            history.iter().map(|m| m.as_ref().clone()).collect(),
+                            instructions,
+                            cache_age,
+                            policy,
+                        );
                         return Ok(PriorRun {
                             agent_name: h.agent_name.clone(),
                             model: h.model.clone(),
                             system_prompt: h.system_prompt.clone(),
                             timeout_secs: h.timeout_secs,
-                            messages: super::archive::resume_messages(
-                                history.iter().map(|m| m.as_ref().clone()).collect(),
-                                instructions,
-                            ),
+                            cwd: s.archive_meta.as_ref().and_then(|m| m.cwd.clone()),
+                            messages,
+                            compacted,
                         });
                     }
                 }
@@ -85,11 +122,19 @@ fn prior_run(
         }
         let archive_path = reg.archive_path(prior_handle_id);
         let live = handle.map(|h| {
+            let cwd = h
+                .state
+                .read()
+                .unwrap_or_else(|p| p.into_inner())
+                .archive_meta
+                .as_ref()
+                .and_then(|m| m.cwd.clone());
             (
                 h.agent_name.clone(),
                 h.model.clone(),
                 h.system_prompt.clone(),
                 h.timeout_secs,
+                cwd,
             )
         });
         let legacy = match handle {
@@ -133,13 +178,14 @@ fn prior_run(
             a.error.as_deref().unwrap_or(&a.status)
         )));
     }
-    let (agent_name, model, system_prompt, timeout_secs) = match (live, &archive) {
+    let (agent_name, model, system_prompt, timeout_secs, live_cwd) = match (live, &archive) {
         (Some(live), _) => live,
         (None, Some(a)) => (
             a.meta.agent_name.clone(),
             a.meta.model.clone(),
             a.meta.system_prompt.clone(),
             a.meta.timeout_secs,
+            None,
         ),
         (None, None) => {
             return Err(RuntimeError::Tool(format!(
@@ -148,8 +194,20 @@ fn prior_run(
             )))
         }
     };
+    let cwd = live_cwd.or_else(|| archive.as_ref().and_then(|a| a.meta.cwd.clone()));
+    let mut compacted = None;
     let messages: Vec<crate::SharedMessage> = match (archive, legacy) {
-        (Some(a), _) => super::archive::resume_messages(a.history, instructions),
+        (Some(a), _) => {
+            let cache_age = super::archive::archive_cache_age(
+                a.cache_anchor_unix_ms,
+                archive_path.as_deref(),
+                std::time::SystemTime::now(),
+            );
+            let (messages, plan) =
+                super::archive::plan_resume_messages(a.history, instructions, cache_age, policy);
+            compacted = plan;
+            messages
+        }
         // Legacy: no archived conversation, only the prior run's text.
         (None, Some(prior_context)) => vec![Arc::new(json!({
             "role": "user",
@@ -164,7 +222,9 @@ fn prior_run(
         model,
         system_prompt,
         timeout_secs,
+        cwd,
         messages,
+        compacted,
     })
 }
 
@@ -183,7 +243,10 @@ impl Tool for SubagentResumeTool {
          instructions. The worker continues its own archived conversation (every tool \
          call and result) with the instructions as the next user turn, so it picks up \
          where it stopped. Works after the handle was collected or reaped. For a worker \
-         from an earlier or crashed session, pass archive_path. Returns a new handle_id."
+         from an earlier or crashed session, pass archive_path. A worker whose prompt \
+         cache has expired and whose history is large resumes from a compact context \
+         (task, last steps, final report) unless full_history is true. Returns a new \
+         handle_id."
     }
 
     fn parameters(&self) -> Value {
@@ -204,6 +267,15 @@ impl Tool for SubagentResumeTool {
                     "description": "Optional: a resume archive (.json under \
                                     ~/.synaps-cli/subagent-history/) of a worker from an \
                                     earlier or crashed session. handle_id is then only a label."
+                },
+                "full_history": {
+                    "type": "boolean",
+                    "description": "Optional (default false): replay the worker's full \
+                                    conversation even when its prompt cache has expired. \
+                                    Otherwise a cold history above \
+                                    subagent_cold_resume_compact_tokens is resumed from a \
+                                    compact context (original task, last steps, final \
+                                    report), avoiding a full cache rewrite."
                 },
                 "timeout": {
                     "type": "integer",
@@ -237,7 +309,34 @@ impl Tool for SubagentResumeTool {
             None => None,
         };
 
-        let prior = prior_run(registry, &prior_handle_id, explicit_archive, &instructions)?;
+        let policy = ResumePolicy {
+            full_history: params["full_history"].as_bool().unwrap_or(false),
+            compact_tokens: crate::config::load_config().subagent_cold_resume_compact_tokens,
+        };
+        let prior = prior_run_with(
+            registry,
+            &prior_handle_id,
+            explicit_archive,
+            &instructions,
+            policy,
+        )?;
+        let compacted = prior.compacted;
+        if let Some(c) = compacted {
+            tracing::info!(
+                prior_handle_id = %prior_handle_id,
+                messages = c.messages,
+                est_tokens = c.est_tokens,
+                kept_est_tokens = c.kept_est_tokens,
+                cache_age_secs = ?c.cache_age_secs,
+                "subagent_resume: cold cache, resuming from a compact context"
+            );
+        }
+        // The resumed worker keeps the directory it was started in (its
+        // history refers to paths there); else the resuming session's.
+        let mut workspace = super::WorkerWorkspace::from_capabilities(&ctx.capabilities);
+        if let Some(prior_cwd) = prior.cwd.filter(|dir| dir.is_dir()) {
+            workspace.cwd = Some(prior_cwd);
+        }
         let (agent_name, model, system_prompt, initial_messages) = (
             prior.agent_name,
             prior.model,
@@ -279,6 +378,7 @@ impl Tool for SubagentResumeTool {
         let memory_backend = ctx.capabilities.memory_backend.clone();
         let session_allow_all = ctx.capabilities.session_allow_all.clone();
         let telemetry = ctx.capabilities.telemetry.clone();
+        let telemetry = telemetry.map(|t| t.for_worker(&label, &handle_id));
 
         tracing::info!(
             "subagent_resume: dispatching '{}' (id={}, resumed_from={}) model={}",
@@ -294,6 +394,10 @@ impl Tool for SubagentResumeTool {
             model: model.clone(),
             system_prompt: system_prompt.clone(),
             timeout_secs,
+            cwd: workspace
+                .cwd
+                .clone()
+                .or_else(|| std::env::current_dir().ok()),
         });
 
         state.write().unwrap().archive_dir = Some(super::archive::process_dir());
@@ -400,6 +504,7 @@ impl Tool for SubagentResumeTool {
                             memory_backend.as_ref(),
                             session_allow_all.as_ref(),
                             telemetry.as_ref(),
+                            &workspace,
                         );
                         runtime.set_system_prompt(super::compose_system_prompt(
                             system_prompt,
@@ -430,7 +535,7 @@ impl Tool for SubagentResumeTool {
                                 false,
                             ).await;
 
-                        super::drive::WorkerDrive {
+                        let drive_outcome = super::drive::WorkerDrive {
                             state: Arc::clone(&state_a),
                             tx_events: tx_events_a.clone(),
                             subagent_id,
@@ -441,7 +546,10 @@ impl Tool for SubagentResumeTool {
                             task: task_for_timeout,
                         }
                         .run(stream)
-                        .await
+                        .await;
+                        // Date this run's cache for the next resume (cold check).
+                        super::archive::record_cache_anchor(&state_a, runtime.cache_anchor());
+                        drive_outcome
                     });
 
                 match outcome {
@@ -543,14 +651,23 @@ impl Tool for SubagentResumeTool {
         // marked running; its own retire attempt was then too early.
         super::finalize::retire_if_cancelled(&state, orchestration, &handle_id);
 
-        Ok(json!({
+        let context = if compacted.is_some() {
+            "compacted"
+        } else {
+            "full"
+        };
+        let mut reply = json!({
             "handle_id":    handle_id,
             "resumed_from": prior_handle_id,
             "warning": timeout_warning,
             "agent_name":   label,
-            "status":       "running"
-        })
-        .to_string())
+            "status":       "running",
+            "context":      context
+        });
+        if let Some(c) = compacted {
+            reply["compacted"] = json!(c);
+        }
+        Ok(reply.to_string())
     }
 }
 
@@ -600,6 +717,7 @@ mod tests {
             model: "anthropic/claude-opus-5-5".into(),
             system_prompt: "archived system".into(),
             timeout_secs: 3500,
+            cwd: None,
         };
         let history: Vec<crate::SharedMessage> = vec![
             Arc::new(json!({"role": "user", "content": "build the plate"})),
@@ -689,6 +807,7 @@ mod tests {
                 model: "model".into(),
                 system_prompt: "system".into(),
                 timeout_secs: 1,
+                cwd: None,
             });
             s.finished_at = None;
         }
@@ -737,6 +856,132 @@ mod tests {
         assert!(state.read().unwrap().history.is_some());
     }
 
+    /// A history well above a 1k-token threshold: bulky tool results.
+    fn bulky_history() -> Vec<crate::SharedMessage> {
+        let mut h = vec![Arc::new(json!({"role": "user", "content": "render the reel"}))];
+        for i in 0..6 {
+            h.push(Arc::new(json!({"role": "assistant", "content": [
+                {"type": "tool_use", "id": format!("t{i}"), "name": "bash",
+                 "input": {"command": format!("render {i}")}}
+            ]})));
+            h.push(Arc::new(json!({"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": format!("t{i}"), "content": "z".repeat(4000)}
+            ]})));
+        }
+        h.push(Arc::new(json!({"role": "assistant", "content": "reel rendered"})));
+        h
+    }
+
+    const COMPACT: ResumePolicy = ResumePolicy {
+        full_history: false,
+        compact_tokens: 1_000,
+    };
+
+    #[test]
+    fn cold_large_archive_resumes_compacted_and_full_history_overrides() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = crate::runtime::subagent::SubagentArchiveMeta {
+            agent_name: "archived-label".into(),
+            model: "anthropic/claude-opus-5-5".into(),
+            system_prompt: "archived system".into(),
+            timeout_secs: 3500,
+            cwd: None,
+        };
+        let old_anchor = std::time::SystemTime::now() - Duration::from_secs(3600);
+        let old_ms = old_anchor
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let history = bulky_history();
+        let path = super::super::archive::write_archive_anchored(
+            dir.path(),
+            "sa_cold",
+            &meta,
+            "completed",
+            None,
+            "reel rendered",
+            &history,
+            Some(old_ms),
+        )
+        .unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let registry = Mutex::new(SubagentRegistry::new());
+
+        let prior =
+            prior_run_with(&registry, "sa_cold", Some(path.clone()), "add titles", COMPACT)
+                .unwrap();
+        let c = prior.compacted.expect("cold + big compacts");
+        assert_eq!(c.messages, history.len());
+        assert!(c.cache_age_secs.unwrap() >= 3600);
+        assert_eq!(prior.messages.len(), 1);
+        let text = prior.messages[0]["content"].to_string();
+        assert!(text.contains("render the reel") && text.contains("add titles"));
+
+        // The prior archive is untouched, so a full replay is still possible.
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let full = ResumePolicy {
+            full_history: true,
+            ..COMPACT
+        };
+        let prior =
+            prior_run_with(&registry, "sa_cold", Some(path.clone()), "add titles", full).unwrap();
+        assert!(prior.compacted.is_none());
+        assert_eq!(prior.messages.len(), history.len() + 1);
+
+        // A warm archive (fresh anchor) replays in full.
+        let fresh_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let warm = super::super::archive::write_archive_anchored(
+            dir.path(),
+            "sa_warm",
+            &meta,
+            "completed",
+            None,
+            "",
+            &history,
+            Some(fresh_ms),
+        )
+        .unwrap();
+        let prior = prior_run_with(&registry, "sa_warm", Some(warm), "x", COMPACT).unwrap();
+        assert!(prior.compacted.is_none());
+    }
+
+    #[test]
+    fn live_unarchived_history_uses_state_anchor_for_the_cold_check() {
+        let registry = Mutex::new(SubagentRegistry::new());
+        let h = finished_handle("sa_live", SubagentStatus::Completed, None);
+        {
+            let mut s = h.state.write().unwrap();
+            s.archive_meta = Some(crate::runtime::subagent::SubagentArchiveMeta {
+                agent_name: "worker".into(),
+                model: "model".into(),
+                system_prompt: "system".into(),
+                timeout_secs: 1,
+                cwd: None,
+            });
+            s.archive_error = Some("archive write failed".into());
+            s.finalization_ready = true;
+            s.history = Some(bulky_history());
+            // Finished just now, but its last request was an hour ago.
+            s.cache_anchor_unix_ms = Some(
+                (std::time::SystemTime::now() - Duration::from_secs(3600))
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64,
+            );
+        }
+        let state = Arc::clone(&h.state);
+        registry.lock().unwrap().register(h);
+        let prior = prior_run_with(&registry, "sa_live", None, "go", COMPACT).unwrap();
+        assert!(prior.compacted.is_some());
+        // Without an anchor, `finished_at` (just now) says warm.
+        state.write().unwrap().cache_anchor_unix_ms = None;
+        let prior = prior_run_with(&registry, "sa_live", None, "go", COMPACT).unwrap();
+        assert!(prior.compacted.is_none());
+    }
+
     #[test]
     fn running_worker_cannot_be_resumed() {
         let registry = Mutex::new(SubagentRegistry::new());
@@ -777,6 +1022,7 @@ mod tests {
             model: "anthropic/claude-opus-5-5".into(),
             system_prompt: "archived system".into(),
             timeout_secs: 30,
+            cwd: None,
         };
         let path = super::super::archive::write_archive(
             dir.path(),

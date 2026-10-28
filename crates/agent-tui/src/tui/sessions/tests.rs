@@ -376,7 +376,7 @@ fn live_rows_at_120_cols() {
     let text = render_text(&state(), &theme, 120, 30);
     for want in [
         "Sessions",
-        "Live 5",
+        "Live 4", // not parked; the PARKED one is in the header count
         "LIVE",
         "PARKED",
         "streaming 2m",
@@ -472,4 +472,58 @@ fn own_busy_overlays_an_old_daemon_row() {
     };
     st.apply(SessionsMsg::Live { gen: 1, result: Ok(vec![own, idle()]) }, quiet);
     assert_eq!(RowState::of(st.selected_meta().unwrap()), RowState::Idle);
+}
+
+/// C6, as walked at 120 cols: "Live 3" beside "1 idle  2 parked"; the own
+/// unnamed row showed "…1b25" with an empty id column; the path was cut
+/// ("~/Projects/syna…") beside a state column with slack; the detail title,
+/// cut by the core at 80 chars, ended mid-word with no "…".
+#[test]
+fn live_tab_is_consistent_at_120_cols() {
+    let theme = crate::tui::theme::Theme::builtin_for_test("default");
+    let home = PathBuf::from("/home/u");
+    let mut own = meta("20261026-081914-1b25", None);
+    own.state_since = ago(55);
+    own.cwd = Some(home.join("Projects/synaps"));
+    let mut gallery = meta("20261026-081500-793d", Some("gallery2"));
+    gallery.lifecycle = SessionLifecycle::Parked;
+    gallery.clients = 0;
+    gallery.state_since = ago(2 * 60);
+    gallery.evict_due = ahead(57 * 60);
+    gallery.cost_usd = 0.01;
+    gallery.cwd = own.cwd.clone();
+    let long = "Read Cargo.toml and the crates' Cargo.toml files. Show the workspace as a markdown table";
+    gallery.title = Some(long.chars().take(80).collect());
+    let mut pair = gallery.clone();
+    pair.id = SessionId("20261026-081319-a97a".into());
+    pair.name = Some("pair".into());
+    pair.title = Some("Run `ls`".into());
+    let mut st = SessionsState::new(1, own.clone(), true);
+    st.home = Some(home);
+    st.apply(SessionsMsg::Live { gen: 1, result: Ok(vec![own.clone(), gallery, pair]) }, || own.clone());
+    st.now = now();
+    st.own_id = own.id.0.clone();
+    select(&mut st, "20261026-081500-793d");
+    let text = render_text(&st, &theme, 120, 30);
+    assert!(text.contains("Live 1 "), "tab counts what is live:\n{text}");
+    assert!(text.contains("1 idle") && text.contains("2 parked"), "{text}");
+    let own_row = text.lines().find(|l| l.contains("idle 55s")).unwrap();
+    assert!(own_row.contains("1b25") && !own_row.contains("\u{2026}1b25"), "{own_row}");
+    let gal = text.lines().find(|l| l.contains("gallery2") && l.contains("793d")).unwrap();
+    assert!(gal.contains("~/Projects/synaps") && !gal.contains("syna\u{2026}"), "{gal}");
+    let wide = render_text(&state(), &theme, 120, 30);
+    assert!(wide.contains("~/Projects/SynapsCLI ") && !wide.contains("Synaps\u{2026}"), "{wide}");
+    assert!(text.contains("Show the workspace as a\u{2026}\u{201d}"), "{text}");
+    assert!(!text.contains("markdo"), "{text}");
+}
+
+#[test]
+fn row_name_falls_back_to_a_plain_title() {
+    let mut m = meta("x-1b25", None);
+    assert_eq!(row_name(&m), None);
+    m.title = Some("Run `git log`\nnow".into());
+    assert_eq!(row_name(&m).as_deref(), Some("Run git log now"));
+    m.name = Some("axon".into());
+    assert_eq!(row_name(&m).as_deref(), Some("axon"));
+    assert_eq!(detail_title("short `one`"), "short one");
 }

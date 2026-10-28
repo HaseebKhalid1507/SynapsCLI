@@ -579,6 +579,12 @@ pub const MAX_CACHE_KEEPWARM_HOURS: u32 = 48;
 /// session left over a weekend parks. (Owner decision, task #444.)
 pub const DEFAULT_CACHE_KEEPWARM_AUTO_MAX_HOURS: u32 = 24;
 
+/// Default for `subagent_cold_resume_compact_tokens`. Below ~100k tokens a
+/// cold full replay costs well under $1 on the priciest model and keeps every
+/// detail; above it (measured resumes reached 250k–715k tokens, up to ~$3.50
+/// each) the compact context is the cheaper trade.
+pub const DEFAULT_SUBAGENT_COLD_RESUME_COMPACT_TOKENS: u64 = 100_000;
+
 /// Prompt-cache keep-warm policy (`cache_keepwarm`, task #444). See
 /// docs/specs/cache-ttl-spec.md §7.
 ///
@@ -705,6 +711,56 @@ impl CacheTtl {
         }
     }
 }
+
+/// gzip `Content-Encoding` for Anthropic request bodies
+/// (`request_compression`). Every request re-uploads the whole
+/// conversation, and the JSON compresses about 2x.
+/// - `Auto` (default): bodies of 16 KiB or more sent straight to
+///   api.anthropic.com; skipped behind an HTTPS proxy, with a custom CA
+///   bundle or a custom base URL, where a middlebox or gateway may not
+///   handle a compressed body.
+/// - `On`: those too, for a proxy or gateway known to pass gzip request
+///   bodies. A refused body is still resent uncompressed.
+/// - `Off`: never.
+///
+/// `SYNAPS_GZIP_REQUEST_BODIES=0` turns it off whatever this says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RequestCompressionMode {
+    #[default]
+    Auto,
+    On,
+    Off,
+}
+
+impl RequestCompressionMode {
+    /// `auto` | `on` | `off` (case-insensitive).
+    pub fn parse(val: &str) -> Option<RequestCompressionMode> {
+        match val.trim().to_ascii_lowercase().as_str() {
+            "auto" => Some(RequestCompressionMode::Auto),
+            "on" => Some(RequestCompressionMode::On),
+            "off" => Some(RequestCompressionMode::Off),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for RequestCompressionMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            RequestCompressionMode::Auto => "auto",
+            RequestCompressionMode::On => "on",
+            RequestCompressionMode::Off => "off",
+        })
+    }
+}
+
+/// Default gzip level for request bodies (`request_compression_level`):
+/// fast enough to pay off up to roughly gigabit uplinks.
+pub const DEFAULT_REQUEST_COMPRESSION_LEVEL: u32 = 1;
+/// Highest gzip level. Levels 3-6 pay off on slow uplinks, where the extra
+/// CPU time is tens of milliseconds and the upload saved is seconds; above
+/// 6 the body barely shrinks further.
+pub const MAX_REQUEST_COMPRESSION_LEVEL: u32 = 9;
 
 /// `tools.activation_confirm` — host policy for model-initiated
 /// `activate_tools` (progressive tool disclosure).
@@ -1205,9 +1261,20 @@ pub struct SynapsConfig {
     pub bash_timeout: u64,       // default 30
     pub bash_max_timeout: u64,   // default 300
     pub subagent_timeout: u64,   // default 300
+    /// `subagent_resume` of a worker whose prompt cache has expired replays
+    /// a compact context instead of its whole transcript once the history is
+    /// at least this many (estimated) tokens: a cold replay rewrites every
+    /// token at the cache-write price. `0` disables compaction
+    /// (`subagent_cold_resume_compact_tokens`, default
+    /// [`DEFAULT_SUBAGENT_COLD_RESUME_COMPACT_TOKENS`]).
+    pub subagent_cold_resume_compact_tokens: u64,
     pub api_retries: u32,        // default 3
     pub refusal_retries: u32,    // default 2 — retries on stop_reason=refusal
     pub telemetry: String,       // off | basic | full (default off)
+    /// Rotated generations kept for `api-log.jsonl` and
+    /// `request-trace.jsonl` (`telemetry_log_generations`, 1–
+    /// [`MAX_TELEMETRY_LOG_GENERATIONS`], default 1: just `<log>.1`).
+    pub telemetry_log_generations: u32,
     pub cache_diagnostics: bool, // opt into cache-diagnosis beta (default false)
     /// Prompt-cache TTL strategy: "5m" (default) | "1h" | "hybrid".
     pub cache_ttl: CacheTtl,
@@ -1220,6 +1287,13 @@ pub struct SynapsConfig {
     /// [`DEFAULT_CACHE_KEEPWARM_AUTO_MAX_HOURS`]). An explicit `<N>h` mode
     /// is its own window and ignores this.
     pub cache_keepwarm_auto_max_hours: u32,
+    /// gzip for Anthropic request bodies (`request_compression`): `auto`
+    /// (default) | `on` | `off`. See [`RequestCompressionMode`].
+    pub request_compression: RequestCompressionMode,
+    /// gzip level 1–9 (`request_compression_level`, default
+    /// [`DEFAULT_REQUEST_COMPRESSION_LEVEL`]). Higher shrinks more and costs
+    /// more CPU: raise it on a slow uplink.
+    pub request_compression_level: u32,
     /// Who may drive a daemon session with several clients attached
     /// (`client_input`): `shared` (default) | `exclusive`. The daemon reads
     /// it at start, for every session it creates or restores. See
@@ -1313,13 +1387,17 @@ impl Default for SynapsConfig {
             bash_timeout: 30,
             bash_max_timeout: 300,
             subagent_timeout: 300,
+            subagent_cold_resume_compact_tokens: DEFAULT_SUBAGENT_COLD_RESUME_COMPACT_TOKENS,
             api_retries: 3,
             refusal_retries: 2,
             telemetry: "off".to_string(),
+            telemetry_log_generations: 1,
             cache_diagnostics: false,
             cache_ttl: CacheTtl::default(),
             cache_keepwarm: CacheKeepWarm::Off,
             cache_keepwarm_auto_max_hours: DEFAULT_CACHE_KEEPWARM_AUTO_MAX_HOURS,
+            request_compression: RequestCompressionMode::Auto,
+            request_compression_level: DEFAULT_REQUEST_COMPRESSION_LEVEL,
             client_input: ClientInput::Shared,
             max_fps: 60,
             scroll_lines: None,
@@ -1353,6 +1431,10 @@ impl Default for SynapsConfig {
     }
 }
 
+/// Upper bound for `telemetry_log_generations` (each generation of each log
+/// is up to 50 MB).
+pub const MAX_TELEMETRY_LOG_GENERATIONS: u32 = 100;
+
 /// Known top-level config keys — used for unknown-key warnings + did-you-mean.
 /// Public so the /settings coverage test can require a settings row (or an
 /// explicit exclusion) for every key here.
@@ -1378,6 +1460,7 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "bash_timeout",
     "bash_max_timeout",
     "subagent_timeout",
+    "subagent_cold_resume_compact_tokens",
     "subagent.max_concurrent",
     "subagent.max_total",
     "subagent.max_depth",
@@ -1387,10 +1470,13 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "api_retries",
     "refusal_retries",
     "telemetry",
+    "telemetry_log_generations",
     "cache_diagnostics",
     "cache_ttl",
     "cache_keepwarm",
     "cache_keepwarm_auto_max_hours",
+    "request_compression",
+    "request_compression_level",
     "client_input",
     "max_fps",
     "scroll_lines",
@@ -1915,6 +2001,12 @@ fn apply_config_content_with(
                     config.subagent_timeout = timeout;
                 }
             }
+            "subagent_cold_resume_compact_tokens" => match val.parse::<u64>() {
+                Ok(tokens) => config.subagent_cold_resume_compact_tokens = tokens,
+                Err(_) => config.warnings.push(format!(
+                    "subagent_cold_resume_compact_tokens = {val} — expected a token count (0 disables); using {DEFAULT_SUBAGENT_COLD_RESUME_COMPACT_TOKENS}"
+                )),
+            },
             // Legacy flat spellings (pre-`subagent.*`): same parser, same limits.
             "subagent_max_concurrent" | "subagent_max_total" => {
                 let dotted = key.replacen("subagent_", "subagent.", 1);
@@ -1935,6 +2027,14 @@ fn apply_config_content_with(
                 }
             }
             "telemetry" => config.telemetry = val.to_string(),
+            "telemetry_log_generations" => match val.parse::<u32>() {
+                Ok(n) if (1..=MAX_TELEMETRY_LOG_GENERATIONS).contains(&n) => {
+                    config.telemetry_log_generations = n;
+                }
+                _ => config.warnings.push(format!(
+                    "telemetry_log_generations = {val} — expected 1–{MAX_TELEMETRY_LOG_GENERATIONS}; line ignored"
+                )),
+            },
             "cache_diagnostics" => {
                 config.cache_diagnostics = matches!(val, "true" | "1" | "on" | "yes");
             }
@@ -1966,6 +2066,20 @@ fn apply_config_content_with(
                     )),
                 }
             }
+            "request_compression" => match RequestCompressionMode::parse(val) {
+                Some(mode) => config.request_compression = mode,
+                None => config.warnings.push(format!(
+                    "request_compression = {val} — expected auto, on, or off; using auto"
+                )),
+            },
+            "request_compression_level" => match val.trim().parse::<u32>() {
+                Ok(n) if (1..=MAX_REQUEST_COMPRESSION_LEVEL).contains(&n) => {
+                    config.request_compression_level = n
+                }
+                _ => config.warnings.push(format!(
+                    "request_compression_level = {val} — expected 1–{MAX_REQUEST_COMPRESSION_LEVEL}; using {DEFAULT_REQUEST_COMPRESSION_LEVEL}"
+                )),
+            },
             "max_fps" => match val.parse::<u32>() {
                 Ok(fps) if (1..=1000).contains(&fps) => config.max_fps = fps,
                 Ok(_) => config.warnings.push(format!(
@@ -2617,6 +2731,32 @@ mod tests {
                 "{k} not in KNOWN_CONFIG_KEYS"
             );
         }
+    }
+
+    #[test]
+    fn subagent_cold_resume_compact_tokens_parses_defaults_and_warns() {
+        let c = super::load_config_from_str("");
+        assert_eq!(c.subagent_cold_resume_compact_tokens, 100_000);
+        assert_eq!(
+            super::SynapsConfig::default().subagent_cold_resume_compact_tokens,
+            super::DEFAULT_SUBAGENT_COLD_RESUME_COMPACT_TOKENS
+        );
+        let c = super::load_config_from_str("subagent_cold_resume_compact_tokens = 250000\n");
+        assert_eq!(c.subagent_cold_resume_compact_tokens, 250_000);
+        assert!(c.warnings.is_empty(), "warnings: {:?}", c.warnings);
+        let c = super::load_config_from_str("subagent_cold_resume_compact_tokens = 0\n");
+        assert_eq!(c.subagent_cold_resume_compact_tokens, 0, "0 disables");
+        assert!(c.warnings.is_empty(), "warnings: {:?}", c.warnings);
+        let c = super::load_config_from_str("subagent_cold_resume_compact_tokens = lots\n");
+        assert_eq!(c.subagent_cold_resume_compact_tokens, 100_000);
+        assert!(
+            c.warnings
+                .iter()
+                .any(|w| w.contains("subagent_cold_resume_compact_tokens")),
+            "warnings: {:?}",
+            c.warnings
+        );
+        assert!(super::KNOWN_CONFIG_KEYS.contains(&"subagent_cold_resume_compact_tokens"));
     }
 
     #[test]
@@ -3413,6 +3553,28 @@ mod tests {
     }
 
     #[test]
+    fn test_telemetry_log_generations_config_key() {
+        let c = load_config_from_str("telemetry = basic\n");
+        assert_eq!(c.telemetry_log_generations, 1, "default: one generation");
+
+        let c = load_config_from_str("telemetry_log_generations = 7\n");
+        assert_eq!(c.telemetry_log_generations, 7);
+        assert!(c.warnings.is_empty(), "warnings: {:?}", c.warnings);
+
+        for bad in ["0", "101", "-1", "lots"] {
+            let c = load_config_from_str(&format!("telemetry_log_generations = {bad}\n"));
+            assert_eq!(c.telemetry_log_generations, 1, "{bad}");
+            assert!(
+                c.warnings
+                    .iter()
+                    .any(|w| w.contains("telemetry_log_generations")),
+                "{bad}: {:?}",
+                c.warnings
+            );
+        }
+    }
+
+    #[test]
     fn test_cache_keepwarm_config_key() {
         let c = load_config_from_str("cache_keepwarm = auto\ncache_ttl = 5m\n");
         assert_eq!(c.cache_keepwarm, CacheKeepWarm::Auto);
@@ -3441,6 +3603,41 @@ mod tests {
         let c = load_config_from_str("cache_keepwarm = forever\n");
         assert_eq!(c.cache_keepwarm, CacheKeepWarm::Off, "garbage keeps keep-warm off");
         assert!(c.warnings.iter().any(|w| w.contains("cache_keepwarm")));
+    }
+
+    #[test]
+    fn request_compression_keys_parse_and_warn() {
+        let c = load_config_from_str("");
+        assert_eq!(c.request_compression, RequestCompressionMode::Auto);
+        assert_eq!(c.request_compression_level, DEFAULT_REQUEST_COMPRESSION_LEVEL);
+
+        for (val, want) in [
+            ("auto", RequestCompressionMode::Auto),
+            ("ON", RequestCompressionMode::On),
+            (" off ", RequestCompressionMode::Off),
+        ] {
+            let c = load_config_from_str(&format!("request_compression = {val}\n"));
+            assert_eq!(c.request_compression, want, "{val:?}");
+            assert!(c.warnings.is_empty(), "{val:?}: {:?}", c.warnings);
+            assert_eq!(RequestCompressionMode::parse(&want.to_string()), Some(want));
+        }
+        let c = load_config_from_str("request_compression = brotli\n");
+        assert_eq!(c.request_compression, RequestCompressionMode::Auto);
+        assert!(c.warnings.iter().any(|w| w.contains("request_compression")));
+
+        for level in 1..=MAX_REQUEST_COMPRESSION_LEVEL {
+            let c = load_config_from_str(&format!("request_compression_level = {level}\n"));
+            assert_eq!(c.request_compression_level, level);
+            assert!(c.warnings.is_empty());
+        }
+        for bad in ["0", "10", "max", "-1"] {
+            let c = load_config_from_str(&format!("request_compression_level = {bad}\n"));
+            assert_eq!(c.request_compression_level, DEFAULT_REQUEST_COMPRESSION_LEVEL, "{bad}");
+            assert!(
+                c.warnings.iter().any(|w| w.contains("request_compression_level")),
+                "{bad}"
+            );
+        }
     }
 
     // ── cache_ttl parse table (spec §3.1) ──
