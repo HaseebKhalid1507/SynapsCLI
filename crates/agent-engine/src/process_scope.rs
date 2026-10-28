@@ -46,6 +46,7 @@ pub struct ScopeLauncher {
 /// arguments before exec. Releases before 254 never expanded scope commands
 /// (a scope has no ExecStart for the manager to expand), so omitting the flag
 /// there keeps arguments verbatim.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))] // read by the Linux probe; tested everywhere
 const EXPAND_ENVIRONMENT_SINCE: u32 = 254;
 
 /// systemd-run options shared by real launches and the probe, so the probe
@@ -87,6 +88,7 @@ impl ScopeLauncher {
 }
 
 /// Major version from `systemd-run --version` ("systemd 259 (259.5-1)").
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))] // read by the Linux probe; tested everywhere
 fn parse_systemd_version(output: &str) -> Option<u32> {
     let rest = output.lines().next()?.trim().strip_prefix("systemd ")?;
     let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
@@ -96,6 +98,7 @@ fn parse_systemd_version(output: &str) -> Option<u32> {
 /// Whether to pass `--expand-environment=no`; `None` if the version could not
 /// be determined, in which case scopes are not used at all: the flag may be
 /// required (>= 258) yet cannot be known to be accepted.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))] // read by the Linux probe; tested everywhere
 fn no_expand_for_version(version: Option<u32>) -> Option<bool> {
     version.map(|v| v >= EXPAND_ENVIRONMENT_SINCE)
 }

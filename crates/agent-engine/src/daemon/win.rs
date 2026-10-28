@@ -377,14 +377,14 @@ fn append_arg(line: &mut Vec<u16>, arg: &OsStr) {
             backslashes += 1;
         } else {
             if c == b'"' as u16 {
-                line.extend(std::iter::repeat(b'\\' as u16).take(backslashes + 1));
+                line.extend(std::iter::repeat_n(b'\\' as u16, backslashes + 1));
             }
             backslashes = 0;
         }
         line.push(c);
     }
     if quote {
-        line.extend(std::iter::repeat(b'\\' as u16).take(backslashes));
+        line.extend(std::iter::repeat_n(b'\\' as u16, backslashes));
         line.push(b'"' as u16);
     }
 }
@@ -564,7 +564,7 @@ mod tests {
             match c {
                 '\\' => bs += 1,
                 '"' => {
-                    cur.extend(std::iter::repeat('\\').take(bs / 2));
+                    cur.extend(std::iter::repeat_n('\\', bs / 2));
                     if bs % 2 == 1 {
                         cur.push('"');
                     } else {
@@ -574,7 +574,7 @@ mod tests {
                     bs = 0;
                 }
                 ' ' | '\t' if !inq => {
-                    cur.extend(std::iter::repeat('\\').take(bs));
+                    cur.extend(std::iter::repeat_n('\\', bs));
                     bs = 0;
                     if !cur.is_empty() || any {
                         out.push(std::mem::take(&mut cur));
@@ -582,13 +582,13 @@ mod tests {
                     any = false;
                 }
                 c => {
-                    cur.extend(std::iter::repeat('\\').take(bs));
+                    cur.extend(std::iter::repeat_n('\\', bs));
                     bs = 0;
                     cur.push(c);
                 }
             }
         }
-        cur.extend(std::iter::repeat('\\').take(bs));
+        cur.extend(std::iter::repeat_n('\\', bs));
         if !cur.is_empty() || any {
             out.push(cur);
         }
