@@ -50,6 +50,7 @@ mod toast;
 mod view_model;
 mod viewport;
 mod watch;
+mod win_keys;
 
 /// Single process-global lock for ALL tests that mutate config-env vars
 /// (`SYNAPS_BASE_DIR`, `HOME`).  Both `migration_tests` (this file) and the

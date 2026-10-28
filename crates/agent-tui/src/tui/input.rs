@@ -68,7 +68,7 @@ pub(super) enum InputAction {
 /// paths) converge on `action` so the debug-only stack/app sync tripwire always
 /// runs afterwards.
 pub(super) fn handle_event(
-    event: Event,
+    mut event: Event,
     app: &mut App,
     runtime: &impl agent_engine::session::RuntimeRead,
     streaming: bool,
@@ -83,8 +83,22 @@ pub(super) fn handle_event(
     // modal pane handlers below act on raw `Event::Key` — without this gate
     // every keypress in /models, /settings, etc. fires twice on Windows.
     // Repeat is deliberately kept (held-key navigation).
-    if let Event::Key(k) = &event {
-        if k.kind == crossterm::event::KeyEventKind::Release {
+    // Windows also delivers a character that is not on the keyboard layout
+    // (pasted text, `“`, `→`, Alt+numpad) as a lone Release, and an AltGr
+    // character (`@`, `{`, `€` on many layouts) as Ctrl+Alt: `win_keys`
+    // turns both back into the plain keypress they stand for.
+    if let Event::Key(k) = event {
+        if cfg!(windows) {
+            let now = std::time::Instant::now();
+            app.alt_codes.observe(&k, now);
+            if let Some(press) = app.alt_codes.release_as_press(&k, now) {
+                event = Event::Key(press);
+            }
+            if let Event::Key(k) = &mut event {
+                super::win_keys::altgr_as_text(k);
+            }
+        }
+        if matches!(event, Event::Key(k) if k.kind == crossterm::event::KeyEventKind::Release) {
             return InputAction::None;
         }
     }
@@ -1314,6 +1328,46 @@ mod tests {
             handle_event(release, &mut app, &runtime, false, &registry, &keybinds, 3),
             InputAction::None
         ));
+    }
+
+    /// A lone `Char` Release is an Alt-code character on Windows (a paste of
+    /// `—` arrived as nothing); elsewhere a Release is still dropped.
+    #[test]
+    fn a_lone_character_release_types_on_windows_only() {
+        let runtime = synaps_cli::Runtime::new_headless();
+        let mut app = make_app();
+        let keybinds = synaps_cli::skills::keybinds::KeybindRegistry::default();
+        let registry = Arc::new(CommandRegistry::new(&[], vec![]));
+        let key = |c, kind| {
+            Event::Key(crossterm::event::KeyEvent {
+                code: KeyCode::Char(c),
+                modifiers: KeyModifiers::NONE,
+                kind,
+                state: crossterm::event::KeyEventState::empty(),
+            })
+        };
+        use crossterm::event::KeyEventKind::{Press, Release};
+        for ev in [key('a', Press), key('a', Release), key('—', Release), key('b', Press), key('b', Release)] {
+            handle_event(ev, &mut app, &runtime, false, &registry, &keybinds, 3);
+        }
+        assert_eq!(app.input_text(), if cfg!(windows) { "a—b" } else { "ab" });
+    }
+
+    /// AltGr types `@` on a German layout; Windows reports it as Ctrl+Alt+@.
+    #[test]
+    fn an_altgr_character_is_typed_on_windows() {
+        let runtime = synaps_cli::Runtime::new_headless();
+        let mut app = make_app();
+        let keybinds = synaps_cli::skills::keybinds::KeybindRegistry::default();
+        let registry = Arc::new(CommandRegistry::new(&[], vec![]));
+        let at = Event::Key(crossterm::event::KeyEvent {
+            code: KeyCode::Char('@'),
+            modifiers: KeyModifiers::CONTROL | KeyModifiers::ALT,
+            kind: crossterm::event::KeyEventKind::Press,
+            state: crossterm::event::KeyEventState::empty(),
+        });
+        handle_event(at, &mut app, &runtime, false, &registry, &keybinds, 3);
+        assert_eq!(app.input_text(), if cfg!(windows) { "@" } else { "" });
     }
 
     fn make_app() -> App {
