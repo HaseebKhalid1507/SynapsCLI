@@ -440,7 +440,7 @@ define_settings! {
             _ => SettingApply::Local(Err("expected off, basic or full".to_string())),
         };
 
-    "telemetry_log_generations", "Telemetry log generations", Context,
+    "telemetry_log_generations", "Telemetry log files", Context,
         EditorKind::Text { numeric: true },
         "Rotated files kept for api-log.jsonl and request-trace.jsonl, each up to 50 MB: <log>.1 (newest) to <log>.N (1–100, default 1). Takes effect next launch.",
         |_app, value| whole_number("telemetry_log_generations", value);
