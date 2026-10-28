@@ -267,7 +267,7 @@ pub fn launcher_for_effective_env(
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = cwd;
+        let _ = (env, cwd);
         None
     }
 }
@@ -329,6 +329,8 @@ pub fn resolve_program(
             }
         }
     }
+    #[cfg(not(unix))]
+    let _ = (env, cwd);
     Err(std::io::Error::new(
         std::io::ErrorKind::NotFound,
         format!("program not found in child PATH: {program:?}"),

@@ -256,6 +256,7 @@ fn mode_of(path: &Path) -> u32 {
 /// Re-invoke THIS test binary to run one `#[ignore]`d worker test in a fresh
 /// process (needed where process-global state — umask, env — must not leak
 /// into parallel tests). Returns (status, combined output).
+#[cfg(unix)]
 fn run_worker(
     worker: &str,
     env: &[(&str, String)],

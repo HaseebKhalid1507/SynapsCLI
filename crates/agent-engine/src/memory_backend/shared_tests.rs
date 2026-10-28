@@ -1,9 +1,14 @@
 //! Synthetic real-service checks for one brain across repositories/worktrees.
 use super::*;
+// The real-service test (and these helpers) need Unix; see its #[cfg].
+#[cfg(unix)]
 use crate::tools::Tool;
+#[cfg(unix)]
 use agent_core::memory::store::{MemoryProvenance, MemoryRetention};
+#[cfg(unix)]
 use std::process::Command;
 
+#[cfg(unix)]
 fn git(root: &Path, args: &[&str]) {
     let result = Command::new("git")
         .arg("-C")
@@ -19,6 +24,7 @@ fn git(root: &Path, args: &[&str]) {
         String::from_utf8_lossy(&result.stderr)
     );
 }
+#[cfg(unix)]
 fn note(body: &str) -> NewMemoryRecord {
     NewMemoryRecord {
         content: body.into(),
@@ -31,6 +37,7 @@ fn note(body: &str) -> NewMemoryRecord {
         retention: MemoryRetention::Standard,
     }
 }
+#[cfg(unix)]
 fn binding(base: &Path, root: &Path, exe: &Path) -> MemoryBinding {
     let identity = ProjectScope::discover_repository_with_override(root, None).unwrap();
     let mut binding = MemoryBinding::new(

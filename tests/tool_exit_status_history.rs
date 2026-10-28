@@ -8,9 +8,9 @@
 //! Proof is the SECOND request body the stub receives: its `tool_result`
 //! content must carry the exit status and the T5 notice.
 //!
-//! Needs the `command-exec` feature (the failing tool is `bash`).
+//! Needs the `command-exec` feature (the failing tool is `bash`) and Unix.
 
-#![cfg(feature = "command-exec")]
+#![cfg(all(unix, feature = "command-exec"))]
 
 #[path = "support/phase2/mod.rs"]
 mod phase2;
@@ -57,7 +57,6 @@ const SSE_DONE: &str = concat!(
     "data: {\"type\":\"message_stop\"}\n\n",
 );
 
-#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn streamed_then_failed_tool_reports_exit_status_and_notice_to_model() {
