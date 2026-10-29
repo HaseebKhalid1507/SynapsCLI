@@ -46,6 +46,7 @@ mod stream;
 pub mod subagent;
 pub mod subagent_watch;
 pub mod telemetry;
+pub mod tool_spill;
 pub mod trace;
 pub(crate) mod transport;
 mod types;
