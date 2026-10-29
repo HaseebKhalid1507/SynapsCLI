@@ -255,6 +255,16 @@ define_settings! {
         "subagent_resume of a worker whose prompt cache expired replays a compact context instead of the full transcript once its history reaches this many tokens (default 100000; 0 = always replay in full). Applies from the next resume.",
         |_app, value| whole_number("subagent_cold_resume_compact_tokens", value);
 
+    "subagent_context_management", "Subagent rollover", Agent,
+        EditorKind::Cycler(&["auto", "off"]),
+        "Automatic context rollover for subagent workers: auto moves a worker's older rounds out of its context once it reaches the rollover size (saved as plain text beside its resume archive, nothing summarized; the task and recent rounds stay); off lets a worker's context grow until the window is full (default auto). Applies to workers started afterwards.",
+        |_app, value| config_edit("subagent_context_management", value);
+
+    "subagent_rollover_tokens", "Subagent rollover at", Agent,
+        EditorKind::Text { numeric: true },
+        "Context size, in tokens, at which a worker rolls over to a ~100k successor (default 200000, at least 20000; a smaller model window's own threshold wins). Applies to workers started afterwards.",
+        |_app, value| whole_number("subagent_rollover_tokens", value);
+
     "max_tool_output", "Max tool output", ToolLimits, EditorKind::Text { numeric: true },
         "Bytes to capture from a tool before truncating.",
         |_app, value| match value.parse::<usize>() {
@@ -1088,6 +1098,37 @@ mod tests {
         );
         assert_eq!(config_row_display("request_compression").as_deref(), Some("off"));
         assert_eq!(config_row_display("request_compression_level").as_deref(), Some("6"));
+        drop(temp);
+    }
+
+    /// Worker rollover rows: shown as the value in force, edited through
+    /// the real parser (the 20000 floor included).
+    #[test]
+    fn subagent_rollover_rows_display_and_validate() {
+        use super::super::draw::config_row_display;
+        let _lock = config_lock();
+        for (content, mode, tokens) in [
+            ("", "auto", "200000"),
+            ("subagent_context_management = OFF\nsubagent_rollover_tokens = 150000\n", "off", "150000"),
+            ("subagent_context_management = maybe\nsubagent_rollover_tokens = 5\n", "auto", "200000"),
+        ] {
+            let temp = TempConfig::new(content);
+            assert_eq!(config_row_display("subagent_context_management").as_deref(), Some(mode), "{content}");
+            assert_eq!(config_row_display("subagent_rollover_tokens").as_deref(), Some(tokens), "{content}");
+            drop(temp);
+        }
+        let temp = TempConfig::new("");
+        let mut app = app_with_model("m");
+        {
+            let mut d = |key: &str, value: &str| apply_setting_dispatch(key, value, &mut app);
+            assert!(is_ok(d("subagent_context_management", "off")));
+            assert!(is_ok(d("subagent_context_management", "auto")));
+            assert!(is_err(d("subagent_context_management", "sometimes")));
+            assert!(is_ok(d("subagent_rollover_tokens", "150000")));
+            assert!(is_ok(d("subagent_rollover_tokens", "20000")));
+            assert!(is_err(d("subagent_rollover_tokens", "19999")));
+            assert!(is_err(d("subagent_rollover_tokens", "lots")));
+        }
         drop(temp);
     }
 
