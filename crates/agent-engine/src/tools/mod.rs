@@ -26,6 +26,7 @@ mod powershell;
 pub(crate) mod read;
 mod secret_prompt;
 mod subagent;
+pub(crate) use subagent::archive::write_window_transcript;
 pub(crate) use subagent::finalize::build_reload_carry_event;
 #[doc(hidden)]
 pub use subagent::{legacy_fresh_runtime, spawn_runtime};

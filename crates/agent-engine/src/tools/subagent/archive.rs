@@ -159,6 +159,22 @@ pub fn write_archive_anchored(
     Ok(path)
 }
 
+/// Write the plain-text transcript of a worker's evicted context window
+/// (`runtime::worker_context`) next to its resume archive: the same private
+/// directory (0700), a private file (0600), written atomically.
+pub(crate) fn write_window_transcript(path: &Path, body: &str) -> std::io::Result<()> {
+    let dir = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("transcript path has no directory"))?;
+    create_private_dir(dir)?;
+    use std::io::Write;
+    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+    tmp.write_all(body.as_bytes())?;
+    tmp.as_file().sync_all()?;
+    tmp.persist(path).map_err(|e| e.error)?;
+    Ok(())
+}
+
 /// Validate a caller-supplied archive path (`subagent_resume.archive_path`, for
 /// workers of an earlier or crashed session): `~` expanded, must resolve to a
 /// `.json` file under `<base>/subagent-history`.

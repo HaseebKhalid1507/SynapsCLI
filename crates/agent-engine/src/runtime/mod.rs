@@ -47,6 +47,7 @@ pub mod subagent;
 pub mod subagent_watch;
 pub mod telemetry;
 pub mod trace;
+pub mod worker_context;
 pub(crate) mod transport;
 mod types;
 
