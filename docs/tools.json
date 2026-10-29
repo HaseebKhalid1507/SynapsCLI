@@ -19,7 +19,7 @@
     }
   },
   {
-    "description": "Execute a bash command and return its output. Use for running programs, installing packages, git operations, and any shell commands. Commands time out after 30 seconds by default; pass a larger timeout when needed. If sudo asks for a password, the user is prompted securely in the TUI and the password is never shown to the model.",
+    "description": "Execute a bash command and return its output. Use for running programs, installing packages, git operations, and any shell commands. Commands time out after 30 seconds by default; pass a larger timeout when needed. Stdin is empty. On Linux, if sudo needs a password, the user is asked in the TUI, shown the command sudo will run, and the password goes only to sudo, never to the model. Other password prompts are not answered.",
     "name": "bash",
     "parameters": {
       "properties": {
