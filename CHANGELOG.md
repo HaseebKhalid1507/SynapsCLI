@@ -63,6 +63,20 @@ All notable changes to this project will be documented in this file.
   `total_ms` therefore grows by the time to headers. A request with no
   model event has no `ttft_ms` field (never `0`).
 
+### Security
+
+- **The bash tool asks for a sudo password only when sudo really asks
+  (Linux).** It used to raise the password box for any stderr text that
+  looked like a password prompt and wrote the answer to the command's
+  stdin, so printed text (even the tool's own command line) could open the
+  box and the password went to whatever read stdin. sudo now runs with `-A`
+  and a Synaps askpass helper; the box opens only for a set-uid sudo
+  started inside that tool call, names the command sudo will run, and the
+  password goes only to sudo. The command's stdin is now empty. Other
+  password prompts (`Password:` from `mysql -p`, `psql`, …) are no longer
+  answered. macOS fails closed (`sudo -n`).
+  [docs/sudo-askpass.md](docs/sudo-askpass.md)
+
 ## [0.11.0] — 2026-10-26
 
 Sessions now live in the daemon. Every client attached to a session can
