@@ -262,6 +262,21 @@ define_settings! {
             Err(_) => SettingApply::Local(Ok(())),
         };
 
+    "tool_output_spill_bytes", "Tool output spill", ToolLimits,
+        EditorKind::Text { numeric: true },
+        "A tool result bigger than this many bytes is saved whole to a spill file; history keeps its start and end plus a pointer the model can read or grep (default 12288; 0 = off). Applies to new sessions and workers.",
+        |_app, value| whole_number("tool_output_spill_bytes", value);
+
+    "tool_output_spill_head_bytes", "Spill preview head", ToolLimits,
+        EditorKind::Text { numeric: true },
+        "Bytes from the start of a spilled tool result kept in history (default 4096).",
+        |_app, value| whole_number("tool_output_spill_head_bytes", value);
+
+    "tool_output_spill_tail_bytes", "Spill preview tail", ToolLimits,
+        EditorKind::Text { numeric: true },
+        "Bytes from the end of a spilled tool result kept in history, where errors usually are (default 3072).",
+        |_app, value| whole_number("tool_output_spill_tail_bytes", value);
+
     "bash_timeout", "Bash timeout", ToolLimits, EditorKind::Text { numeric: true },
         "Default seconds allowed for a bash command.",
         |_app, value| match value.parse::<u64>() {

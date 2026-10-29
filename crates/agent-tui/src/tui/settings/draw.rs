@@ -813,6 +813,18 @@ pub(crate) fn config_row_display(key: &str) -> Option<String> {
             checked_config_display(key, ok, DEFAULT_DISPLAY)
         }
         // Tool limits
+        "tool_output_spill_bytes" => raw_config(key)
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(cfg::DEFAULT_TOOL_OUTPUT_SPILL_BYTES)
+            .to_string(),
+        "tool_output_spill_head_bytes" => raw_config(key)
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(cfg::DEFAULT_TOOL_OUTPUT_SPILL_HEAD_BYTES)
+            .to_string(),
+        "tool_output_spill_tail_bytes" => raw_config(key)
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(cfg::DEFAULT_TOOL_OUTPUT_SPILL_TAIL_BYTES)
+            .to_string(),
         "progressive_tool_disclosure" => bool_config_display(key, false),
         "tools.deferred_loading" => bool_config_display(key, true),
         "tools.activation_confirm" => raw_config(key)
