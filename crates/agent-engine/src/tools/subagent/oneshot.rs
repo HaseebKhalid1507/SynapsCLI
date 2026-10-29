@@ -57,6 +57,11 @@ impl Tool for SubagentTool {
                         {"type": "object", "properties": {"mode": {"const": "non_overlapping_paths"}, "scopes": {"type": "array", "items": {"type": "string"}}}, "required": ["mode", "scopes"]}
                     ]
                 },
+                "thinking": {
+                    "type": "string",
+                    "enum": ["low", "medium", "high", "xhigh", "max"],
+                    "description": "Worker effort override. Omit for subagent_thinking (default xhigh), independent of foreground thinking. Unsupported model levels are refused."
+                },
                 "timeout": {
                     "type": "integer",
                     "description": "Wall-clock limit in seconds. Omit for the session default (config `subagent_timeout`); 0 = no limit."
@@ -67,6 +72,7 @@ impl Tool for SubagentTool {
     }
 
     async fn execute(&self, params: Value, ctx: ToolContext) -> Result<String> {
+        let thinking = super::resolve_subagent_thinking(&params, None, &crate::config::load_config())?;
         let task = params["task"]
             .as_str()
             .ok_or_else(|| RuntimeError::Tool("Missing 'task' parameter".to_string()))?
@@ -181,6 +187,7 @@ impl Tool for SubagentTool {
                     runtime.set_system_prompt(super::compose_system_prompt(system_prompt, runtime.memory_backend_is_axel()));
                     runtime.set_model(model);
                     super::apply_codex_worker_reasoning(&mut runtime, codex_parent_plan.as_ref());
+                    super::apply_subagent_thinking(&mut runtime, thinking)?;
 
                     let cancel = crate::CancellationToken::new();
                     let cancel_inner = cancel.clone();

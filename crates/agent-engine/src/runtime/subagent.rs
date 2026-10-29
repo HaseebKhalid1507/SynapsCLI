@@ -159,6 +159,9 @@ pub struct SubagentArchiveMeta {
     /// Absent in archives written before it was recorded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<std::path::PathBuf>,
+    /// Canonical worker effort; missing in archives created before this feature.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<String>,
 }
 
 impl SubagentState {

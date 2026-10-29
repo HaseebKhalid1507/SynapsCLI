@@ -78,6 +78,11 @@ impl Tool for SubagentStartTool {
                     ],
                     "description": "Declared write isolation and path scopes."
                 },
+                "thinking": {
+                    "type": "string",
+                    "enum": ["low", "medium", "high", "xhigh", "max"],
+                    "description": "Worker effort override. Omit for subagent_thinking (default xhigh), independent of foreground thinking. Unsupported model levels are refused."
+                },
                 "timeout": {
                     "type": "integer",
                     "description": "Wall-clock limit in seconds. Omit for the session default (config `subagent_timeout`); 0 = no limit. A timed-out worker keeps its full conversation: subagent_resume continues it where it stopped."
@@ -88,6 +93,7 @@ impl Tool for SubagentStartTool {
     }
 
     async fn execute(&self, params: Value, ctx: ToolContext) -> Result<String> {
+        let thinking = super::resolve_subagent_thinking(&params, None, &crate::config::load_config())?;
         // ── Parse params ───────────────────────────────────────────────────────
         let task = params["task"]
             .as_str()
@@ -174,6 +180,7 @@ impl Tool for SubagentStartTool {
                 .cwd
                 .clone()
                 .or_else(|| std::env::current_dir().ok()),
+            thinking: Some(thinking.as_str().into()),
         });
 
         state.write().unwrap().archive_dir = Some(super::archive::process_dir());
@@ -300,6 +307,7 @@ impl Tool for SubagentStartTool {
                             &mut runtime,
                             codex_parent_plan.as_ref(),
                         );
+                        super::apply_subagent_thinking(&mut runtime, thinking)?;
                         runtime
                             .install_worker_orchestration(Arc::clone(&orchestration_for_runtime));
                         runtime.set_delegation_parent(Some(child_parent_id.clone()));

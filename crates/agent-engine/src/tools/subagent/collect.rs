@@ -264,6 +264,7 @@ mod tests {
                 system_prompt: "system".into(),
                 timeout_secs: 1,
                 cwd: None,
+                thinking: None,
             });
         }
         registry.lock().unwrap().register(h);
@@ -308,6 +309,7 @@ mod tests {
             system_prompt: "s".into(),
             timeout_secs: 60,
             cwd: None,
+            thinking: None,
         };
         let path = super::super::archive::write_archive(
             dir.path(),

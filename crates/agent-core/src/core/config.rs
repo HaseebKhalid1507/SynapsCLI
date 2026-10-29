@@ -1268,6 +1268,8 @@ pub struct SynapsConfig {
     /// (`subagent_cold_resume_compact_tokens`, default
     /// [`DEFAULT_SUBAGENT_COLD_RESUME_COMPACT_TOKENS`]).
     pub subagent_cold_resume_compact_tokens: u64,
+    /// Worker default, independent of foreground `thinking`; per-call overrides win.
+    pub subagent_thinking: crate::core::reasoning::ReasoningLevel,
     pub api_retries: u32,        // default 3
     pub refusal_retries: u32,    // default 2 — retries on stop_reason=refusal
     pub telemetry: String,       // off | basic | full (default off)
@@ -1388,6 +1390,7 @@ impl Default for SynapsConfig {
             bash_max_timeout: 300,
             subagent_timeout: 300,
             subagent_cold_resume_compact_tokens: DEFAULT_SUBAGENT_COLD_RESUME_COMPACT_TOKENS,
+            subagent_thinking: crate::core::reasoning::ReasoningLevel::XHigh,
             api_retries: 3,
             refusal_retries: 2,
             telemetry: "off".to_string(),
@@ -1461,6 +1464,7 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "bash_max_timeout",
     "subagent_timeout",
     "subagent_cold_resume_compact_tokens",
+    "subagent_thinking",
     "subagent.max_concurrent",
     "subagent.max_total",
     "subagent.max_depth",
@@ -1994,6 +1998,15 @@ fn apply_config_content_with(
             "bash_max_timeout" => {
                 if let Ok(timeout) = val.parse::<u64>() {
                     config.bash_max_timeout = timeout;
+                }
+            }
+            "subagent_thinking" => {
+                match crate::core::reasoning::parse_subagent_thinking(val) {
+                    Some(level) => config.subagent_thinking = level,
+                    None => config.warnings.push(format!(
+                        "subagent_thinking = {val} — expected low|medium|high|xhigh|max; keeping {}",
+                        config.subagent_thinking
+                    )),
                 }
             }
             "subagent_timeout" => {
@@ -3807,6 +3820,24 @@ mod tests {
         });
 
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn subagent_thinking_config_is_independent_and_validated() {
+        use crate::core::reasoning::ReasoningLevel;
+        let cfg = load_config_from_str("thinking = low\n");
+        assert_eq!(cfg.subagent_thinking, ReasoningLevel::XHigh);
+        for value in ["low", "medium", "high", "xhigh", "max"] {
+            let cfg = load_config_from_str(&format!("thinking = high\nsubagent_thinking = {value}\n"));
+            assert_eq!(cfg.subagent_thinking.as_str(), value);
+            assert_eq!(cfg.thinking_level, Some(ReasoningLevel::High));
+            assert!(cfg.warnings.is_empty(), "{:?}", cfg.warnings);
+        }
+        for value in ["typo", "", "32768", "off", "ultra"] {
+            let cfg = load_config_from_str(&format!("subagent_thinking = {value}\n"));
+            assert_eq!(cfg.subagent_thinking, ReasoningLevel::XHigh);
+            assert!(!cfg.warnings.is_empty(), "{value:?}");
+        }
     }
 
     #[test]

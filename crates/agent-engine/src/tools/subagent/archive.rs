@@ -750,6 +750,7 @@ mod tests {
             system_prompt: "be a builder".into(),
             timeout_secs: 3600,
             cwd: None,
+            thinking: None,
         }
     }
 
@@ -1096,6 +1097,7 @@ mod cold_resume_tests {
             system_prompt: "be a builder".into(),
             timeout_secs: 3600,
             cwd: None,
+            thinking: None,
         }
     }
 
