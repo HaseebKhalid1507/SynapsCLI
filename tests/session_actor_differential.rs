@@ -58,7 +58,8 @@ const MODEL: &str = "claude-sonnet-4-5";
 #[test]
 fn reference_reactor_ext_is_frozen() {
     use sha2::{Digest, Sha256};
-    let src = include_str!("support/reference_reactor_ext.rs");
+    // LF-normalised so a Windows `core.autocrlf` checkout hashes the same.
+    let src = include_str!("support/reference_reactor_ext.rs").replace("\r\n", "\n");
     let hex = format!("{:x}", Sha256::digest(src.as_bytes()));
     assert_eq!(
         hex, "b5a5f51210616157b53e655df41182afcd618f963f7def7753f5aee1aeff78ce",
@@ -70,7 +71,8 @@ fn reference_reactor_ext_is_frozen() {
 #[test]
 fn reference_reactor_is_frozen() {
     use sha2::{Digest, Sha256};
-    let src = include_str!("support/reference_reactor.rs");
+    // LF-normalised so a Windows `core.autocrlf` checkout hashes the same.
+    let src = include_str!("support/reference_reactor.rs").replace("\r\n", "\n");
     let hex = format!("{:x}", Sha256::digest(src.as_bytes()));
     assert_eq!(
         hex, "080bbdd63a5b141cb0cc2ab8d360aec8276c75956ef5cd364548d017ce162c87",
@@ -319,12 +321,9 @@ fn fixed_event(i: usize) -> synaps_cli::events::types::Event {
 
 /// Inject an event through the session's real UDS (the `synaps send` path).
 async fn inject(session_id: &str, ev: &synaps_cli::events::types::Event) {
-    use tokio::io::AsyncWriteExt;
     let path = synaps_cli::events::registry::find_session_registration(session_id)
         .expect("published session endpoint").socket_path;
-    let mut s = tokio::net::UnixStream::connect(&path).await.expect("session socket");
-    s.write_all(serde_json::to_string(ev).unwrap().as_bytes()).await.unwrap();
-    s.shutdown().await.unwrap();
+    synaps_cli::events::socket::send_to_session_socket(&path, serde_json::to_string(ev).unwrap().as_bytes()).await.expect("session socket");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -472,32 +471,40 @@ struct SaveSampler {
 
 impl SaveSampler {
     fn watch(path: std::path::PathBuf) -> Self {
-        use std::os::unix::fs::MetadataExt;
         let stop = Arc::new(AtomicBool::new(false));
         let inodes: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
-        let (s, i) = (Arc::clone(&stop), Arc::clone(&inodes));
-        let thread = std::thread::spawn(move || {
-            let mut last = 0u64;
-            while !s.load(Ordering::Relaxed) {
-                if let Ok(m) = std::fs::metadata(&path) {
-                    let ino = m.ino();
-                    if ino != last {
-                        last = ino;
-                        i.lock().unwrap().push(ino);
+        #[cfg(unix)]
+        let thread = {
+            use std::os::unix::fs::MetadataExt;
+            let (s, i) = (Arc::clone(&stop), Arc::clone(&inodes));
+            Some(std::thread::spawn(move || {
+                let mut last = 0u64;
+                while !s.load(Ordering::Relaxed) {
+                    if let Ok(m) = std::fs::metadata(&path) {
+                        let ino = m.ino();
+                        if ino != last {
+                            last = ino;
+                            i.lock().unwrap().push(ino);
+                        }
                     }
+                    std::thread::yield_now();
                 }
-                std::thread::yield_now();
-            }
-        });
-        Self {
-            stop,
-            inodes,
-            thread: Some(thread),
-        }
+            }))
+        };
+        // No inode numbers off Unix (stable std has no file id there), so
+        // nothing is sampled and `count` is `None`.
+        #[cfg(not(unix))]
+        let thread = {
+            let _ = path;
+            None
+        };
+        Self { stop, inodes, thread }
     }
 
-    fn count(&self) -> usize {
-        self.inodes.lock().unwrap().len()
+    /// Saves observed so far; `None` where they can't be sampled (non-Unix),
+    /// which skips the save-count checks there.
+    fn count(&self) -> Option<usize> {
+        cfg!(unix).then(|| self.inodes.lock().unwrap().len())
     }
 }
 
@@ -542,15 +549,15 @@ fn assert_same_ext(o: &ReferenceReactorExt, a: &ActorRun) {
 /// exists the sampler must observe at least that inode. Poll to a short
 /// deadline; the sampler thread may simply not have run since the rename.
 fn assert_sampler_live(a_s: &SaveSampler, a_path: &std::path::Path) {
-    if !a_path.exists() {
+    if !a_path.exists() || a_s.count().is_none() {
         return;
     }
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while a_s.count() == 0 && std::time::Instant::now() < deadline {
+    while a_s.count() == Some(0) && std::time::Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(1));
     }
     assert!(
-        a_s.count() >= 1,
+        a_s.count() >= Some(1),
         "save sampler counted no save although the actor's journal exists: \
          the sampler is broken, so the save-count checks would prove nothing"
     );
@@ -568,12 +575,9 @@ fn assert_saves(
     // one), so it may write fewer times than the oracle — never more. What
     // must match is the state it leaves on disk.
     assert_sampler_live(a_s, a_path);
-    assert!(
-        a_s.count() <= o.saves,
-        "actor wrote more often than the oracle: {} > {}",
-        a_s.count(),
-        o.saves
-    );
+    if let Some(n) = a_s.count() {
+        assert!(n <= o.saves, "actor wrote more often than the oracle: {} > {}", n, o.saves);
+    }
     assert_eq!(o.saves > 0, a_path.exists(), "one side never saved");
     if o.saves > 0 {
         assert_eq!(
@@ -909,12 +913,9 @@ async fn cancel_keeps_real_history_where_the_oracle_folded_a_recap() {
     // `assert_saves`; the sampled count is a lower bound).
     assert!(a_path.exists(), "the actor never saved");
     assert_sampler_live(&a_s, &a_path);
-    assert!(
-        a_s.count() <= o.saves,
-        "actor saves {} vs oracle {}",
-        a_s.count(),
-        o.saves
-    );
+    if let Some(n) = a_s.count() {
+        assert!(n <= o.saves, "actor saves {} vs oracle {}", n, o.saves);
+    }
     a.end().await;
 }
 

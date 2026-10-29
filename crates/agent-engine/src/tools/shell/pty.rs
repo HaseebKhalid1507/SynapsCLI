@@ -78,6 +78,24 @@ impl PtyAccounting {
         PTY_DROPPED_BYTES.fetch_add(n, Ordering::Relaxed);
     }
 
+    /// Both parties (reader thread and handle) have finished and the books
+    /// balance: every byte this handle produced was consumed or released as
+    /// dropped. Per-handle, so it cannot be skewed by other live PTYs.
+    #[cfg(test)]
+    fn released(&self) -> bool {
+        self.parties.load(Ordering::Acquire) == 0
+            && self.produced.load(Ordering::Acquire)
+                == self.consumed.load(Ordering::Acquire) + self.dropped.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    fn retained(&self) -> u64 {
+        let produced = self.produced.load(Ordering::Acquire);
+        let consumed = self.consumed.load(Ordering::Acquire);
+        let dropped = self.dropped.load(Ordering::Acquire);
+        produced.saturating_sub(consumed).saturating_sub(dropped)
+    }
+
     /// Mark one party finished. The LAST party (AcqRel countdown makes the
     /// other party's counter updates visible) releases the unaccounted
     /// remainder exactly once.
@@ -435,8 +453,45 @@ impl Drop for PtyHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Keyed, not bare: a PTY spawned without a working dir starts in the
+    // child's `$HOME`, so these tests read HOME and must exclude the tests
+    // that repoint it (see `crate::test_env`). A bare `#[serial]` does not,
+    // and a spawn racing a HOME swap failed with ENOENT.
     use serial_test::serial;
     use std::collections::HashMap;
+
+    /// `try_read_output` returns after the first chunk, and a loaded machine
+    /// can split even a short echo across chunks; read until `needle` shows
+    /// up or three seconds pass.
+    async fn read_until(handle: &mut PtyHandle, needle: &str) -> String {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let mut out = Vec::new();
+        while !String::from_utf8_lossy(&out).contains(needle)
+            && tokio::time::Instant::now() < deadline
+        {
+            out.extend(handle.try_read_output(Duration::from_millis(200)).await);
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    /// Wait for one handle's reader to exit and its accounting to be
+    /// released exactly once. The process-wide gauges in
+    /// `pty_output_snapshot` also count every PTY other tests have open
+    /// (the shell session tests take no lock), so before/after deltas of
+    /// them flake under load; a handle's own books do not.
+    async fn wait_released(accounting: &PtyAccounting, what: &str) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !accounting.released() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{what}: reader still running or bytes leaked \
+                 (parties {}, retained {})",
+                accounting.parties.load(Ordering::Acquire),
+                accounting.retained()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
 
     /// A fast PTY producer with a deliberately stalled consumer is bounded
     /// at the reader-thread handoff, and dropping the handle releases it.
@@ -445,11 +500,10 @@ mod tests {
     /// separate cgroup (not a memory cap or protection from ancestor OOM). It still has a working terminal.
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    #[serial]
+    #[serial(synaps_base_dir)]
     async fn pty_shell_gets_its_own_scope_when_available() {
         if std::env::var("SYNAPS_TEST_REAL_SCOPES").as_deref() != Ok("1") { return; }
         let own = std::fs::read_to_string("/proc/self/cgroup").unwrap_or_default();
-        let before = pty_output_snapshot();
         // Typed into an interactive shell, as the tool is used (the spawn
         // command line is whitespace-split, so no quoted -c script here).
         let mut handle = PtyHandle::spawn("bash --norc --noprofile", None, HashMap::new(), 24, 80)
@@ -464,16 +518,9 @@ mod tests {
         {
             out.extend(handle.try_read_output(Duration::from_millis(200)).await);
         }
-        // Settle the process-global PTY accounting before the next #[serial]
-        // test snapshots it (same release wait as the retention tests).
+        let accounting = Arc::clone(&handle.accounting);
         drop(handle);
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        while (pty_output_snapshot().active_readers > before.active_readers
-            || pty_output_snapshot().retained_bytes != before.retained_bytes)
-            && tokio::time::Instant::now() < deadline
-        {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        wait_released(&accounting, "scoped shell").await;
         let text = String::from_utf8_lossy(&out).replace('\r', "");
         assert!(
             text.contains("tty=yes"),
@@ -496,9 +543,8 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(synaps_base_dir)]
     async fn pty_slow_consumer_retention_is_bounded_and_drop_releases_reader() {
-        let before = pty_output_snapshot();
         let handle = PtyHandle::spawn(
             "bash -c 'yes x | head -c 10485760'",
             None,
@@ -507,31 +553,27 @@ mod tests {
             80,
         )
         .expect("spawn producer");
+        let accounting = Arc::clone(&handle.accounting);
+        // Nothing drains the handle, so the reader fills the channel and
+        // blocks. Poll for that rather than assume a fixed sleep is enough
+        // for the spawn under load.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while accounting.retained() == 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "stalled consumer must retain queued PTY bytes"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // Let the producer run on into the full channel, then check the bound.
         tokio::time::sleep(Duration::from_millis(100)).await;
-        let stalled = pty_output_snapshot();
-        let retained = stalled.retained_bytes.saturating_sub(before.retained_bytes);
-        assert!(
-            retained > 0,
-            "stalled consumer must retain queued PTY bytes"
-        );
+        let retained = accounting.retained();
         assert!(
             retained <= ((PTY_OUTPUT_CHANNEL_CAPACITY + 1) * PTY_OUTPUT_MAX_CHUNK_BYTES) as u64,
             "retained {retained}"
         );
-        let readers_before = before.active_readers;
         drop(handle);
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-        while pty_output_snapshot().active_readers > readers_before
-            && tokio::time::Instant::now() < deadline
-        {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert!(pty_output_snapshot().active_readers <= readers_before);
-        assert_eq!(
-            pty_output_snapshot().retained_bytes,
-            before.retained_bytes,
-            "drop must conserve queued bytes as cancellation drops"
-        );
+        wait_released(&accounting, "drop must release the reader and its queued bytes").await;
     }
 
     /// fix1 I2c: dropping a handle at ANY point relative to the reader
@@ -540,9 +582,9 @@ mod tests {
     /// bytes. Repeated immediate drops of a flooding producer make that
     /// window land reliably.
     #[tokio::test]
-    #[serial]
+    #[serial(synaps_base_dir)]
     async fn pty_drop_races_reader_and_always_conserves_accounting() {
-        let before = pty_output_snapshot();
+        let mut released = Vec::new();
         for _ in 0..5 {
             let mut handle = PtyHandle::spawn(
                 "bash -c 'yes x | head -c 33554432'",
@@ -557,26 +599,14 @@ mod tests {
             // accepting chunks during Drop's kill/reap window — every one
             // of them must still be released exactly once.
             let _ = handle.try_read_output(Duration::from_millis(50)).await;
+            released.push(Arc::clone(&handle.accounting));
             drop(handle);
         }
-        // Wait for every reader to finish, then the books must balance
-        // EXACTLY — no leaked retained bytes from any drop/reader race.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        while pty_output_snapshot().active_readers > before.active_readers
-            && tokio::time::Instant::now() < deadline
-        {
-            tokio::time::sleep(Duration::from_millis(10)).await;
+        // Every reader must finish and every handle's books must balance
+        // EXACTLY: no leaked retained bytes from any drop/reader race.
+        for accounting in &released {
+            wait_released(accounting, "drop/reader race must conserve accounting").await;
         }
-        assert_eq!(
-            pty_output_snapshot().active_readers,
-            before.active_readers,
-            "every reader must terminate"
-        );
-        assert_eq!(
-            pty_output_snapshot().retained_bytes,
-            before.retained_bytes,
-            "30 drop/reader races must conserve queued-byte accounting exactly"
-        );
     }
 
     /// fix1 I2c (deterministic): the reader is paused IN the gap between
@@ -584,33 +614,18 @@ mod tests {
     /// dropped — exactly the preemption the parallel suite produced. The
     /// chunk must still be released exactly once after the reader resumes.
     #[tokio::test]
-    #[serial]
+    #[serial(synaps_base_dir)]
     async fn pty_preempted_accounting_across_drop_is_released_exactly_once() {
-        let before = pty_output_snapshot();
         TEST_PAUSE_AFTER_SEND_MS.store(150, Ordering::Relaxed);
         let handle = PtyHandle::spawn("bash -c 'echo leak-window'", None, HashMap::new(), 24, 80)
             .expect("spawn producer");
+        let accounting = Arc::clone(&handle.accounting);
         // Let the reader reach the pause with one chunk handed off.
         tokio::time::sleep(Duration::from_millis(40)).await;
         drop(handle); // runs entirely inside the reader's paused gap
         TEST_PAUSE_AFTER_SEND_MS.store(0, Ordering::Relaxed);
 
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        while pty_output_snapshot().active_readers > before.active_readers
-            && tokio::time::Instant::now() < deadline
-        {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert_eq!(
-            pty_output_snapshot().active_readers,
-            before.active_readers,
-            "reader must terminate"
-        );
-        assert_eq!(
-            pty_output_snapshot().retained_bytes,
-            before.retained_bytes,
-            "a drop inside the accounting gap must not leak retained bytes"
-        );
+        wait_released(&accounting, "a drop inside the accounting gap must not leak").await;
     }
 
     /// fix1 I2c: concurrent handles (spawned and dropped from parallel
@@ -618,9 +633,8 @@ mod tests {
     /// per-handle scope, no cross-handle interference, exact global
     /// conservation after all readers exit.
     #[tokio::test]
-    #[serial]
+    #[serial(synaps_base_dir)]
     async fn pty_concurrent_handles_release_exactly_once_per_handle() {
-        let before = pty_output_snapshot();
         let mut tasks = Vec::new();
         for i in 0..8 {
             tasks.push(tokio::spawn(async move {
@@ -642,40 +656,24 @@ mod tests {
                         let _ = handle.try_read_output(Duration::from_millis(10)).await;
                     }
                 }
+                let accounting = Arc::clone(&handle.accounting);
                 drop(handle);
+                accounting
             }));
         }
         for t in tasks {
-            t.await.unwrap();
+            let accounting = t.await.unwrap();
+            wait_released(&accounting, "concurrent handles must each release exactly once").await;
         }
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        while pty_output_snapshot().active_readers > before.active_readers
-            && tokio::time::Instant::now() < deadline
-        {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert_eq!(
-            pty_output_snapshot().active_readers,
-            before.active_readers,
-            "every reader must terminate"
-        );
-        assert_eq!(
-            pty_output_snapshot().retained_bytes,
-            before.retained_bytes,
-            "concurrent handles must conserve accounting exactly once each"
-        );
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(synaps_base_dir)]
     async fn test_spawn_echo_hello() {
         let mut handle = PtyHandle::spawn("echo hello", None, HashMap::new(), 24, 80)
             .expect("failed to spawn echo");
 
-        // Give the process time to produce output and exit.
-        let output = handle.try_read_output(Duration::from_secs(3)).await;
-
-        let text = String::from_utf8_lossy(&output);
+        let text = read_until(&mut handle, "hello").await;
         assert!(
             text.contains("hello"),
             "expected 'hello' in output, got: {text:?}"
@@ -683,7 +681,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(synaps_base_dir)]
     async fn test_cat_echo_back() {
         let mut handle =
             PtyHandle::spawn("cat", None, HashMap::new(), 24, 80).expect("failed to spawn cat");
@@ -691,9 +689,7 @@ mod tests {
         // Write input — cat will echo it back via the PTY.
         handle.write(b"test\n").expect("write failed");
 
-        let output = handle.try_read_output(Duration::from_secs(3)).await;
-
-        let text = String::from_utf8_lossy(&output);
+        let text = read_until(&mut handle, "test").await;
         assert!(
             text.contains("test"),
             "expected 'test' in output, got: {text:?}"
@@ -701,7 +697,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(synaps_base_dir)]
     async fn test_exit_code_detection() {
         let mut handle = PtyHandle::spawn("bash -c exit 42", None, HashMap::new(), 24, 80)
             .expect("failed to spawn bash exit");

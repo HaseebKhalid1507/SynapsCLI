@@ -1268,6 +1268,8 @@ pub struct SynapsConfig {
     /// (`subagent_cold_resume_compact_tokens`, default
     /// [`DEFAULT_SUBAGENT_COLD_RESUME_COMPACT_TOKENS`]).
     pub subagent_cold_resume_compact_tokens: u64,
+    /// Worker default, independent of foreground `thinking`; per-call overrides win.
+    pub subagent_thinking: crate::core::reasoning::ReasoningLevel,
     pub api_retries: u32,        // default 3
     pub refusal_retries: u32,    // default 2 — retries on stop_reason=refusal
     pub telemetry: String,       // off | basic | full (default off)
@@ -1388,6 +1390,7 @@ impl Default for SynapsConfig {
             bash_max_timeout: 300,
             subagent_timeout: 300,
             subagent_cold_resume_compact_tokens: DEFAULT_SUBAGENT_COLD_RESUME_COMPACT_TOKENS,
+            subagent_thinking: crate::core::reasoning::ReasoningLevel::XHigh,
             api_retries: 3,
             refusal_retries: 2,
             telemetry: "off".to_string(),
@@ -1461,6 +1464,7 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "bash_max_timeout",
     "subagent_timeout",
     "subagent_cold_resume_compact_tokens",
+    "subagent_thinking",
     "subagent.max_concurrent",
     "subagent.max_total",
     "subagent.max_depth",
@@ -1994,6 +1998,15 @@ fn apply_config_content_with(
             "bash_max_timeout" => {
                 if let Ok(timeout) = val.parse::<u64>() {
                     config.bash_max_timeout = timeout;
+                }
+            }
+            "subagent_thinking" => {
+                match crate::core::reasoning::parse_subagent_thinking(val) {
+                    Some(level) => config.subagent_thinking = level,
+                    None => config.warnings.push(format!(
+                        "subagent_thinking = {val} — expected low|medium|high|xhigh|max; keeping {}",
+                        config.subagent_thinking
+                    )),
                 }
             }
             "subagent_timeout" => {
@@ -3810,6 +3823,24 @@ mod tests {
     }
 
     #[test]
+    fn subagent_thinking_config_is_independent_and_validated() {
+        use crate::core::reasoning::ReasoningLevel;
+        let cfg = load_config_from_str("thinking = low\n");
+        assert_eq!(cfg.subagent_thinking, ReasoningLevel::XHigh);
+        for value in ["low", "medium", "high", "xhigh", "max"] {
+            let cfg = load_config_from_str(&format!("thinking = high\nsubagent_thinking = {value}\n"));
+            assert_eq!(cfg.subagent_thinking.as_str(), value);
+            assert_eq!(cfg.thinking_level, Some(ReasoningLevel::High));
+            assert!(cfg.warnings.is_empty(), "{:?}", cfg.warnings);
+        }
+        for value in ["typo", "", "32768", "off", "ultra"] {
+            let cfg = load_config_from_str(&format!("subagent_thinking = {value}\n"));
+            assert_eq!(cfg.subagent_thinking, ReasoningLevel::XHigh);
+            assert!(!cfg.warnings.is_empty(), "{value:?}");
+        }
+    }
+
+    #[test]
     fn test_parse_thinking_budget() {
         use crate::core::reasoning::ThinkingSpec;
         // ThinkingSpec::parse replaced parse_thinking_budget; verify budget values.
@@ -4802,6 +4833,12 @@ api_retries = 5
         assert!(!cfg.auth.accounts.contains_key("acount.anthropic"));
     }
 
+    /// An absolute path on this platform: `/opt/axel` has no drive on Windows.
+    #[cfg(windows)]
+    const ABSOLUTE_SAMPLE_PATH: &str = r"C:\opt\axel";
+    #[cfg(not(windows))]
+    const ABSOLUTE_SAMPLE_PATH: &str = "/opt/axel";
+
     /// Every listed family key is accepted by its parser for some value
     /// (catches a typo in `FAMILY_CONFIG_KEYS`).
     #[test]
@@ -4815,7 +4852,7 @@ api_retries = 5
                 "memory.capture_tools" => "summary_only",
                 "memory.capture_assistant" | "memory.capture_user" => "on",
                 "memory.auto_consolidate" | "memory.local_embeddings" | "memory.gliner" => "off",
-                "memory.axel.executable" | "memory.axel.brain" => "/opt/axel",
+                "memory.axel.executable" | "memory.axel.brain" => ABSOLUTE_SAMPLE_PATH,
                 "events.auto_turn" => "on",
                 "server.allowed_origins" | "server.token" => "x",
                 "server.auto_approve_confirms" | "bridge.heartbeat_mirror" => "false",
@@ -4843,7 +4880,7 @@ api_retries = 5
             assert!(validate_config_edit("cache_ttl", "2h").is_err());
             assert!(validate_config_edit("shell.max_output", "big").is_err());
             assert!(validate_config_edit("memory.axel.brain", "relative/brain").is_err());
-            assert!(validate_config_edit("memory.axel.brain", "/abs/brain.r8").is_ok());
+            assert!(validate_config_edit("memory.axel.brain", ABSOLUTE_SAMPLE_PATH).is_ok());
             assert!(validate_config_edit("model", "a\nb").is_err());
 
             // Cross-key rules see the rest of the file.

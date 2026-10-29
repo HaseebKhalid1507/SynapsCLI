@@ -759,6 +759,23 @@ async fn stop(profile: Option<String>, force: bool) -> anyhow::Result<()> {
             }
         }
     }
+    // Windows has no SIGTERM: the Shutdown frame above was the graceful
+    // path. Terminate the daemon and its children (MCP servers, shells).
+    #[cfg(windows)]
+    if force && registry::is_alive(&paths) {
+        if let Some(pid) = pid {
+            eprintln!("daemon still alive after {grace:?}; terminating pid {pid}");
+            let _ = std::process::Command::new("taskkill")
+                .args(["/PID", &pid.to_string(), "/T", "/F"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+            let t1 = std::time::Instant::now();
+            while registry::is_alive(&paths) && t1.elapsed() < Duration::from_secs(5) {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    }
     if registry::is_alive(&paths) {
         anyhow::bail!("daemon did not stop");
     }

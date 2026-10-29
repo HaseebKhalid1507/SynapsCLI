@@ -121,6 +121,7 @@ pub fn process(pid: u32) -> std::io::Result<ProcMem> {
 /// Kernel + allocator view of the calling process. Never fails; fields are
 /// zero where unavailable.
 pub fn self_snapshot() -> SelfMem {
+    #[cfg_attr(not(unix), allow(unused_mut))] // nothing to fill in off Unix
     let mut snap = SelfMem::default();
     #[cfg(target_os = "linux")]
     {
@@ -774,7 +775,7 @@ mod tests {
 
     /// Fake `/proc/<pid>` with an MCP child carrying `--api-key sk-abc`:
     /// the serialized row must not contain the key.
-    #[cfg_attr(not(target_os = "linux"), ignore)]
+    #[cfg(target_os = "linux")] // calls the procfs reader, which only exists there
     #[test]
     fn proc_row_json_never_carries_api_key() {
         let root = std::env::temp_dir().join(format!("memstat-fakeproc-{}", std::process::id()));

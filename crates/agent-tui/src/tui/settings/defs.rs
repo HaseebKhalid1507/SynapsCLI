@@ -238,6 +238,11 @@ define_settings! {
             Err(_) => SettingApply::Local(Ok(())),
         };
 
+    "subagent_thinking", "Subagent thinking", Agent,
+        EditorKind::Cycler(&["low", "medium", "high", "xhigh", "max"]),
+        "Default effort for new subagents; independent of foreground thinking. Resume keeps recorded effort unless overridden.",
+        |_app, value| config_edit("subagent_thinking", value);
+
     "subagent_timeout", "Subagent timeout", Agent, EditorKind::Text { numeric: true },
         "Seconds before a dispatched subagent is canceled.",
         |_app, value| match value.parse::<u64>() {
@@ -1161,7 +1166,8 @@ mod tests {
             assert!(is_ok(d("max_fps", "144")));
             assert!(is_err(d("max_fps", "0")));
             assert!(is_err(d("scroll_lines", "21")));
-            assert!(is_ok(d("memory.axel.brain", "/srv/axel/brain.r8")));
+            let absolute = if cfg!(windows) { r"C:\srv\axel\brain.r8" } else { "/srv/axel/brain.r8" };
+            assert!(is_ok(d("memory.axel.brain", absolute)));
             assert!(is_err(d("memory.axel.brain", "brain.r8")));
             assert!(is_err(d("memory.user_scope", "yes")));
             assert!(is_err(d("memory.backend", "sqlite")));

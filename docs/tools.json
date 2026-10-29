@@ -684,6 +684,17 @@
           "description": "The task/prompt to send to the subagent.",
           "type": "string"
         },
+        "thinking": {
+          "description": "Worker effort override. Omit for subagent_thinking (default xhigh), independent of foreground thinking. Unsupported model levels are refused.",
+          "enum": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "type": "string"
+        },
         "timeout": {
           "description": "Wall-clock limit in seconds. Omit for the session default (config `subagent_timeout`); 0 = no limit.",
           "type": "integer"
@@ -808,6 +819,17 @@
           "description": "What to do next. Sent as the next user turn after the worker's own prior conversation.",
           "type": "string"
         },
+        "thinking": {
+          "description": "Override worker effort for this resumed run. Omit to keep its recorded effort; legacy archives use subagent_thinking (default xhigh). Unsupported model levels are refused.",
+          "enum": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "type": "string"
+        },
         "timeout": {
           "description": "Optional wall-clock limit in seconds for the resumed run (default: the prior run's); 0 = no limit. Positive values below 300s emit a warning; prefer at least 600s for API retries.",
           "type": "integer"
@@ -855,6 +877,17 @@
         },
         "task": {
           "description": "The task/prompt to send to the subagent.",
+          "type": "string"
+        },
+        "thinking": {
+          "description": "Worker effort override. Omit for subagent_thinking (default xhigh), independent of foreground thinking. Unsupported model levels are refused.",
+          "enum": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
           "type": "string"
         },
         "timeout": {

@@ -10,7 +10,7 @@
 //! session "latest" for `--continue`.
 
 use crate::core::session::validate_name;
-use crate::core::session_journal::{confined_open, SessionPersistence};
+use crate::core::session_journal::{confined_open, confined_open_for_times, SessionPersistence};
 use crate::core::session_lock::{lock_path, LockHolder, SessionLock, SessionLockError};
 use std::path::Path;
 
@@ -209,7 +209,7 @@ impl SessionMtimes {
             (self.snapshot, format!("{id}.json")),
             (self.journal, format!("{id}.journal")),
         ] {
-            if let (Some(t), Ok(Some(f))) = (time, confined_open(dir, &name)) {
+            if let (Some(t), Ok(Some(f))) = (time, confined_open_for_times(dir, &name)) {
                 let _ = f.set_modified(t);
             }
         }

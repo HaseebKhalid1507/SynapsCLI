@@ -11,9 +11,7 @@
 //! 5. Release lock; assert the session is still listed (not lost).
 //! 6. No "recreating fresh" for that id in the daemon's behaviour.
 //!
-//! Unix only (flock + execv).
-
-#![cfg(unix)]
+//! Unix: flock + execv. Windows: the lock hand-off.
 
 #[path = "support/phase2/mod.rs"]
 mod phase2;
@@ -37,6 +35,14 @@ struct DaemonProc {
 
 impl Drop for DaemonProc {
     fn drop(&mut self) {
+        // Windows: after a reload the daemon is the successor image, not
+        // our child — end it too, or a failed test leaks it.
+        #[cfg(windows)]
+        if let Some(info) = registry::read_daemon_json(&self.paths) {
+            if info.pid != self.child.id() && registry::is_alive(&self.paths) {
+                let _ = std::process::Command::new("taskkill").args(["/PID", &info.pid.to_string(), "/T", "/F"]).output();
+            }
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
@@ -188,10 +194,15 @@ async fn reload_lock_held_keeps_same_id_parked_and_refuses_attach() {
         "locked_by must be set on the placeholder"
     );
     let locked_by = session.locked_by.as_ref().unwrap();
+    // Windows byte-range locks are mandatory: the holder body written into
+    // the locked journal lock file cannot be read by another process, so
+    // the holder is "unknown" there (a session_lock limitation).
+    #[cfg(unix)]
     assert!(
         locked_by.contains(&format!("pid {}", std::process::id())),
         "locked_by must name our pid: {locked_by}"
     );
+    let _ = locked_by;
 
     // No new id should exist (no alias / no fresh session).
     assert_eq!(
@@ -213,6 +224,7 @@ async fn reload_lock_held_keeps_same_id_parked_and_refuses_attach() {
                 msg.contains("journal locked") || msg.contains("locked by"),
                 "refusal must mention the lock: {msg}"
             );
+            #[cfg(unix)]
             assert!(
                 msg.contains(&format!("pid {}", std::process::id())),
                 "refusal must name our pid: {msg}"

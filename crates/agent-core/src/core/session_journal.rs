@@ -199,6 +199,33 @@ pub(crate) fn confined_open(dir: &Path, name: &str) -> std::io::Result<Option<st
     open_artifact(&handle, name)
 }
 
+/// Open `<name>` inside `dir` to set its times (`SessionMtimes`). Unix sets
+/// them through the read-only descriptor `confined_open` returns.
+#[cfg(not(windows))]
+pub(crate) fn confined_open_for_times(dir: &Path, name: &str) -> std::io::Result<Option<std::fs::File>> {
+    confined_open(dir, name)
+}
+
+/// Windows sets times through a handle with `FILE_WRITE_ATTRIBUTES`, which a
+/// read-only open lacks: the restore failed silently and every rename moved
+/// the session to the top of `--continue` and `/sessions`. `confined_open`
+/// still refuses a symlink and reports a missing file as `None` first.
+#[cfg(windows)]
+pub(crate) fn confined_open_for_times(dir: &Path, name: &str) -> std::io::Result<Option<std::fs::File>> {
+    use std::os::windows::fs::OpenOptionsExt;
+    if confined_open(dir, name)?.is_none() {
+        return Ok(None);
+    }
+    match std::fs::OpenOptions::new()
+        .access_mode(windows_sys::Win32::Storage::FileSystem::FILE_WRITE_ATTRIBUTES)
+        .open(dir.join(name))
+    {
+        Ok(f) => Ok(Some(f)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 /// Bounded read of a whole artifact from an already-confined handle.
 fn read_artifact_bytes(handle: &SessionsDirHandle, name: &str) -> std::io::Result<Option<Vec<u8>>> {
     use std::io::Read;
@@ -856,11 +883,10 @@ pub fn save_session_durable_in_dir(
     }
     #[cfg(not(unix))]
     {
-        let _ = (dir, session, mode);
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "durable session checkpoints require Unix directory fsync",
-        ))
+        // The file is fsynced before its rename; see `sync_sessions_dir`
+        // for the directory step.
+        let handle = create_sessions_dir(dir)?;
+        publish_snapshot(&handle, session, mode, true, true)
     }
 }
 
@@ -1111,13 +1137,16 @@ fn sync_sessions_dir(handle: &SessionsDirHandle) -> std::io::Result<()> {
     {
         handle.sync_all()
     }
+    // Windows has no directory fsync: a directory can't be opened for
+    // `FlushFileBuffers`, and NTFS journals the rename's metadata itself.
+    // Each file was fsynced before its rename. PostgreSQL makes the same
+    // call there. Refusing instead failed every durable save, so a rename,
+    // and a compaction or rollover's context-head save, which then blocks
+    // the session until it is reloaded.
     #[cfg(not(unix))]
     {
         let _ = handle;
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "durable session checkpoints require Unix directory fsync",
-        ))
+        Ok(())
     }
 }
 

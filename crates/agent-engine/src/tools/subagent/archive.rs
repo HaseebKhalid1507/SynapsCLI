@@ -737,6 +737,27 @@ pub fn timeout_report(
     text
 }
 
+/// Backdate a test file or directory. `File::open` is read-only: Unix lets a
+/// read-only handle change times, Windows wants write-attribute access, and
+/// opens a directory only with backup semantics.
+#[cfg(test)]
+fn set_mtime_for_test(path: &Path, time: std::time::SystemTime) {
+    let mut options = std::fs::File::options();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // Win32 FILE_WRITE_ATTRIBUTES and FILE_FLAG_BACKUP_SEMANTICS.
+        const FILE_WRITE_ATTRIBUTES: u32 = 0x0100;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        // `access_mode` replaces the read flag above.
+        options
+            .access_mode(FILE_WRITE_ATTRIBUTES)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
+    }
+    options.open(path).unwrap().set_modified(time).unwrap();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -750,6 +771,7 @@ mod tests {
             system_prompt: "be a builder".into(),
             timeout_secs: 3600,
             cwd: None,
+            thinking: None,
         }
     }
 
@@ -1068,10 +1090,7 @@ mod tests {
         std::fs::create_dir(root.path().join("old")).unwrap();
         std::fs::create_dir(root.path().join("new")).unwrap();
         let old_time = std::time::SystemTime::now() - std::time::Duration::from_secs(30 * 86400);
-        std::fs::File::open(root.path().join("old"))
-            .unwrap()
-            .set_modified(old_time)
-            .unwrap();
+        set_mtime_for_test(&root.path().join("old"), old_time);
         prune_older_than(root.path(), std::time::Duration::from_secs(14 * 86400));
         assert!(!root.path().join("old").exists());
         assert!(root.path().join("new").exists());
@@ -1096,6 +1115,7 @@ mod cold_resume_tests {
             system_prompt: "be a builder".into(),
             timeout_secs: 3600,
             cwd: None,
+            thinking: None,
         }
     }
 
@@ -1155,10 +1175,7 @@ mod cold_resume_tests {
         let path = write_archive(dir.path(), "sa_m", &meta(), "completed", None, "", &[]).unwrap();
         let fresh_mtime = archive_cache_age(None, Some(&path), SystemTime::now());
         assert!(!cache_is_cold(fresh_mtime), "no anchor + fresh mtime is warm");
-        std::fs::File::open(&path)
-            .unwrap()
-            .set_modified(SystemTime::now() - Duration::from_secs(3600))
-            .unwrap();
+        set_mtime_for_test(&path, SystemTime::now() - Duration::from_secs(3600));
         let old_mtime = archive_cache_age(None, Some(&path), SystemTime::now());
         assert!(cache_is_cold(old_mtime), "no anchor + old mtime is cold");
         // The anchor wins over the mtime.

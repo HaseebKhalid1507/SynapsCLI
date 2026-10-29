@@ -1,5 +1,6 @@
-//! Handshake + refusal paths over a real UDS (PLAN-phase2 §5.3), driven with
-//! a raw client so the daemon's behaviour is tested, not the transport's.
+//! Handshake + refusal paths over a real UDS (a named pipe on Windows)
+//! (PLAN-phase2 §5.3), driven with a raw client so the daemon's behaviour
+//! is tested, not the transport's.
 
 #[path = "support/phase2/mod.rs"]
 mod phase2;
@@ -14,7 +15,6 @@ use agent_engine::{EngineHost, HostOpts};
 use phase2::HomeGuard;
 use serial_test::serial;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
 
 async fn start(runtime_dir: &std::path::Path) -> Daemon {
     let host: Arc<EngineHost> =
@@ -25,13 +25,13 @@ async fn start(runtime_dir: &std::path::Path) -> Daemon {
 }
 
 struct Raw {
-    r: BufReader<tokio::net::unix::OwnedReadHalf>,
-    w: tokio::net::unix::OwnedWriteHalf,
+    r: BufReader<agent_engine::ipc::ClientReadHalf>,
+    w: agent_engine::ipc::ClientWriteHalf,
 }
 
 impl Raw {
     async fn connect(p: &std::path::Path) -> Self {
-        let (r, w) = UnixStream::connect(p).await.unwrap().into_split();
+        let (r, w) = agent_engine::ipc::split_client(agent_engine::ipc::connect(p).await.unwrap());
         Self { r: BufReader::new(r), w }
     }
     async fn send_line(&mut self, s: &str) {

@@ -36,6 +36,8 @@ struct PriorRun {
     timeout_secs: u64,
     /// Directory the prior run worked in, when recorded.
     cwd: Option<std::path::PathBuf>,
+    /// Worker effort recorded for the prior run; None in older archives.
+    thinking: Option<String>,
     messages: Vec<crate::SharedMessage>,
     /// Set when a cold, large history was replaced by a compact context.
     compacted: Option<CompactedResume>,
@@ -108,6 +110,7 @@ fn prior_run_with(
                             system_prompt: h.system_prompt.clone(),
                             timeout_secs: h.timeout_secs,
                             cwd: s.archive_meta.as_ref().and_then(|m| m.cwd.clone()),
+                            thinking: s.archive_meta.as_ref().and_then(|m| m.thinking.clone()),
                             messages,
                             compacted,
                         });
@@ -122,19 +125,21 @@ fn prior_run_with(
         }
         let archive_path = reg.archive_path(prior_handle_id);
         let live = handle.map(|h| {
-            let cwd = h
-                .state
-                .read()
-                .unwrap_or_else(|p| p.into_inner())
-                .archive_meta
-                .as_ref()
-                .and_then(|m| m.cwd.clone());
+            let (cwd, thinking) = {
+                let s = h.state.read().unwrap_or_else(|p| p.into_inner());
+                let meta = s.archive_meta.as_ref();
+                (
+                    meta.and_then(|m| m.cwd.clone()),
+                    meta.and_then(|m| m.thinking.clone()),
+                )
+            };
             (
                 h.agent_name.clone(),
                 h.model.clone(),
                 h.system_prompt.clone(),
                 h.timeout_secs,
                 cwd,
+                thinking,
             )
         });
         let legacy = match handle {
@@ -178,14 +183,23 @@ fn prior_run_with(
             a.error.as_deref().unwrap_or(&a.status)
         )));
     }
-    let (agent_name, model, system_prompt, timeout_secs, live_cwd) = match (live, &archive) {
-        (Some(live), _) => live,
+    let (agent_name, model, system_prompt, timeout_secs, live_cwd, thinking) =
+        match (live, &archive) {
+        (Some((agent, model, prompt, timeout, cwd, thinking)), archive) => (
+            agent,
+            model,
+            prompt,
+            timeout,
+            cwd,
+            thinking.or_else(|| archive.as_ref().and_then(|a| a.meta.thinking.clone())),
+        ),
         (None, Some(a)) => (
             a.meta.agent_name.clone(),
             a.meta.model.clone(),
             a.meta.system_prompt.clone(),
             a.meta.timeout_secs,
             None,
+            a.meta.thinking.clone(),
         ),
         (None, None) => {
             return Err(RuntimeError::Tool(format!(
@@ -223,6 +237,7 @@ fn prior_run_with(
         system_prompt,
         timeout_secs,
         cwd,
+        thinking,
         messages,
         compacted,
     })
@@ -277,6 +292,11 @@ impl Tool for SubagentResumeTool {
                                     compact context (original task, last steps, final \
                                     report), avoiding a full cache rewrite."
                 },
+                "thinking": {
+                    "type": "string",
+                    "enum": ["low", "medium", "high", "xhigh", "max"],
+                    "description": "Override worker effort for this resumed run. Omit to keep its recorded effort; legacy archives use subagent_thinking (default xhigh). Unsupported model levels are refused."
+                },
                 "timeout": {
                     "type": "integer",
                     "description": "Optional wall-clock limit in seconds for the resumed run \
@@ -309,9 +329,10 @@ impl Tool for SubagentResumeTool {
             None => None,
         };
 
+        let config = crate::config::load_config();
         let policy = ResumePolicy {
             full_history: params["full_history"].as_bool().unwrap_or(false),
-            compact_tokens: crate::config::load_config().subagent_cold_resume_compact_tokens,
+            compact_tokens: config.subagent_cold_resume_compact_tokens,
         };
         let prior = prior_run_with(
             registry,
@@ -319,6 +340,11 @@ impl Tool for SubagentResumeTool {
             explicit_archive,
             &instructions,
             policy,
+        )?;
+        let thinking = super::resolve_subagent_thinking(
+            &params,
+            prior.thinking.as_deref(),
+            &config,
         )?;
         let compacted = prior.compacted;
         if let Some(c) = compacted {
@@ -398,6 +424,7 @@ impl Tool for SubagentResumeTool {
                 .cwd
                 .clone()
                 .or_else(|| std::env::current_dir().ok()),
+            thinking: Some(thinking.as_str().into()),
         });
 
         state.write().unwrap().archive_dir = Some(super::archive::process_dir());
@@ -515,6 +542,7 @@ impl Tool for SubagentResumeTool {
                             &mut runtime,
                             codex_parent_plan.as_ref(),
                         );
+                        super::apply_subagent_thinking(&mut runtime, thinking)?;
                         runtime
                             .install_worker_orchestration(Arc::clone(&orchestration_for_runtime));
                         runtime.set_delegation_parent(Some(child_parent_id.clone()));
@@ -718,6 +746,7 @@ mod tests {
             system_prompt: "archived system".into(),
             timeout_secs: 3500,
             cwd: None,
+            thinking: Some("low".into()),
         };
         let history: Vec<crate::SharedMessage> = vec![
             Arc::new(json!({"role": "user", "content": "build the plate"})),
@@ -750,6 +779,35 @@ mod tests {
         let last = &prior.messages[2]["content"];
         assert_eq!(last[0]["content"], "rendered 300 frames");
         assert!(last[1]["text"].as_str().unwrap().ends_with(instructions));
+    }
+
+    #[test]
+    fn subagent_thinking_resume_archive_survives_config_change_and_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = archive_in(dir.path(), "sa_thinking");
+        let registry = Mutex::new(SubagentRegistry::new());
+        let prior = prior_run(&registry, "sa_thinking", Some(path), "continue").unwrap();
+        assert_eq!(prior.thinking.as_deref(), Some("low"));
+        let cfg = crate::config::load_config_from_str("subagent_thinking = max\n");
+        let retained = super::super::resolve_subagent_thinking(&json!({}), prior.thinking.as_deref(), &cfg).unwrap();
+        assert_eq!(retained.as_str(), "low");
+        let overridden = super::super::resolve_subagent_thinking(&json!({"thinking":"xhigh"}), prior.thinking.as_deref(), &cfg).unwrap();
+        let mut runtime = crate::Runtime::new_headless();
+        runtime.set_model("openai-codex/gpt-6-astra".into());
+        super::super::apply_subagent_thinking(&mut runtime, retained).unwrap();
+        assert_eq!(runtime.reasoning_level().as_str(), "low");
+        super::super::apply_subagent_thinking(&mut runtime, overridden).unwrap();
+        assert_eq!(runtime.reasoning_level().as_str(), "xhigh");
+    }
+
+    #[test]
+    fn subagent_thinking_legacy_archive_defaults_without_migration() {
+        let meta: crate::runtime::subagent::SubagentArchiveMeta = serde_json::from_value(json!({
+            "agent_name":"old", "model":"openai-codex/gpt-6-astra",
+            "system_prompt":"test", "timeout_secs":300
+        })).unwrap();
+        assert!(meta.thinking.is_none());
+        assert_eq!(super::super::resolve_subagent_thinking(&json!({}), meta.thinking.as_deref(), &Default::default()).unwrap().as_str(), "xhigh");
     }
 
     #[test]
@@ -808,6 +866,7 @@ mod tests {
                 system_prompt: "system".into(),
                 timeout_secs: 1,
                 cwd: None,
+                thinking: Some("medium".into()),
             });
             s.finished_at = None;
         }
@@ -886,6 +945,7 @@ mod tests {
             system_prompt: "archived system".into(),
             timeout_secs: 3500,
             cwd: None,
+            thinking: Some("max".into()),
         };
         let old_anchor = std::time::SystemTime::now() - Duration::from_secs(3600);
         let old_ms = old_anchor
@@ -911,6 +971,8 @@ mod tests {
             prior_run_with(&registry, "sa_cold", Some(path.clone()), "add titles", COMPACT)
                 .unwrap();
         let c = prior.compacted.expect("cold + big compacts");
+        // Compacting the history must not drop the worker's recorded effort.
+        assert_eq!(prior.thinking.as_deref(), Some("max"));
         assert_eq!(c.messages, history.len());
         assert!(c.cache_age_secs.unwrap() >= 3600);
         assert_eq!(prior.messages.len(), 1);
@@ -926,6 +988,7 @@ mod tests {
         let prior =
             prior_run_with(&registry, "sa_cold", Some(path.clone()), "add titles", full).unwrap();
         assert!(prior.compacted.is_none());
+        assert_eq!(prior.thinking.as_deref(), Some("max"));
         assert_eq!(prior.messages.len(), history.len() + 1);
 
         // A warm archive (fresh anchor) replays in full.
@@ -960,6 +1023,7 @@ mod tests {
                 system_prompt: "system".into(),
                 timeout_secs: 1,
                 cwd: None,
+                thinking: Some("medium".into()),
             });
             s.archive_error = Some("archive write failed".into());
             s.finalization_ready = true;
@@ -976,10 +1040,12 @@ mod tests {
         registry.lock().unwrap().register(h);
         let prior = prior_run_with(&registry, "sa_live", None, "go", COMPACT).unwrap();
         assert!(prior.compacted.is_some());
+        assert_eq!(prior.thinking.as_deref(), Some("medium"));
         // Without an anchor, `finished_at` (just now) says warm.
         state.write().unwrap().cache_anchor_unix_ms = None;
         let prior = prior_run_with(&registry, "sa_live", None, "go", COMPACT).unwrap();
         assert!(prior.compacted.is_none());
+        assert_eq!(prior.thinking.as_deref(), Some("medium"));
     }
 
     #[test]
@@ -1023,6 +1089,7 @@ mod tests {
             system_prompt: "archived system".into(),
             timeout_secs: 30,
             cwd: None,
+            thinking: None,
         };
         let path = super::super::archive::write_archive(
             dir.path(),

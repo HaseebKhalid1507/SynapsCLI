@@ -1109,7 +1109,7 @@ mod state_tests {
     use auth::auth_state::{AccountState, IdentityKind};
     use std::sync::{Arc, Mutex};
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    use tokio::net::UnixListener;
+    use agent_engine::ipc::{split_server, Listener};
 
     /// How the fixture daemon answers the `auth_state` frame.
     #[derive(Clone)]
@@ -1148,13 +1148,13 @@ mod state_tests {
     ) {
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("d.sock");
-        let listener = UnixListener::bind(&sock).unwrap();
+        let mut listener = Listener::bind(&sock).unwrap();
         let queries: Arc<Mutex<Vec<auth::AuthStateQuery>>> = Arc::default();
         let seen = queries.clone();
         let task = tokio::spawn(async move {
             for _ in 0..conns {
-                let (stream, _) = listener.accept().await.unwrap();
-                let (r, mut w) = stream.into_split();
+                let stream = listener.accept().await.unwrap();
+                let (r, mut w) = split_server(stream);
                 let mut lines = BufReader::new(r).lines();
                 let hello = lines.next_line().await.unwrap().expect("hello");
                 assert!(

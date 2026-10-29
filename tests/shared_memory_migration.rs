@@ -2,7 +2,10 @@
 //! HOME, real repositories or private memory. Service tests use explicit fixtures.
 
 use agent_core::memory::store::ProjectScope;
-use agent_engine::memory_backend::repository_migration::{identity_report, preview_builtin_in};
+use agent_engine::memory_backend::repository_migration::identity_report;
+#[cfg(unix)]
+use agent_engine::memory_backend::repository_migration::preview_builtin_in;
+#[cfg(unix)]
 use serde_json::json;
 use std::fs;
 

@@ -121,6 +121,8 @@ fn a_broadcast_that_cannot_reach_a_session_exits_non_zero_and_writes_no_inbox_fi
 /// A socket that comes up a moment late (a daemon mid-reload, a busy
 /// accept loop) still gets the event: the retry is what makes failing
 /// instead of falling back safe.
+// The late endpoint is a Unix socket bound by hand; on Windows a session
+// endpoint is a named pipe.
 #[cfg(unix)]
 #[test]
 fn an_addressed_send_reaches_a_socket_that_comes_up_during_the_retries() {

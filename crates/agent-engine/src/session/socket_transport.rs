@@ -12,8 +12,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 
 use super::handle::CMD_CHAN_CAP;
@@ -21,6 +19,7 @@ use super::transport::{ClientTransport, TransportError, ATTACH_TIMEOUT, ATTACH_T
 use super::types::*;
 use super::view::RuntimeView;
 use super::wire::*;
+use crate::ipc::{ClientReadHalf, ClientWriteHalf};
 
 pub const CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -51,7 +50,7 @@ pub const RELOAD_EXTENSION_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// A connection past `Hello`/`Welcome`, before `Attach`.
 pub struct Connected {
-    reader: BufReader<OwnedReadHalf>,
+    reader: BufReader<ClientReadHalf>,
     writer: mpsc::Sender<ClientFrame>,
     writer_task: tokio::task::JoinHandle<()>,
     pub welcome: Welcome,
@@ -106,7 +105,7 @@ impl FrameBuf {
     }
 }
 
-async fn read_frame(reader: &mut BufReader<OwnedReadHalf>, buf: &mut FrameBuf) -> Result<Option<DaemonFrame>, TransportError> {
+async fn read_frame(reader: &mut BufReader<ClientReadHalf>, buf: &mut FrameBuf) -> Result<Option<DaemonFrame>, TransportError> {
     // Cancel-safe: the TUI polls this inside `select!`, so a partial line
     // stays in `buf.line` across a dropped future and is cleared only once
     // a whole frame has been taken out of it.
@@ -140,7 +139,7 @@ async fn read_frame(reader: &mut BufReader<OwnedReadHalf>, buf: &mut FrameBuf) -
     }
 }
 
-fn spawn_writer(mut w: OwnedWriteHalf) -> (mpsc::Sender<ClientFrame>, tokio::task::JoinHandle<()>) {
+fn spawn_writer(mut w: ClientWriteHalf) -> (mpsc::Sender<ClientFrame>, tokio::task::JoinHandle<()>) {
     let (tx, mut rx) = mpsc::channel::<ClientFrame>(CMD_CHAN_CAP);
     let task = tokio::spawn(async move {
         while let Some(frame) = rx.recv().await {
@@ -168,10 +167,10 @@ impl Connected {
     /// Hello/Welcome only. `Refused{Version}` → `TransportError::Version`;
     /// any other refusal → `Protocol`.
     pub async fn connect(path: &Path, hello: Hello) -> Result<Self, TransportError> {
-        let stream = tokio::time::timeout(CONNECT_TIMEOUT, UnixStream::connect(path))
+        let stream = tokio::time::timeout(CONNECT_TIMEOUT, crate::ipc::connect(path))
             .await
             .map_err(|_| TransportError::Protocol("connect timed out".into()))??;
-        let (r, w) = stream.into_split();
+        let (r, w) = crate::ipc::split_client(stream);
         let mut reader = BufReader::new(r);
         let (writer, writer_task) = spawn_writer(w);
         let client_version = hello.protocol_version;
@@ -474,7 +473,7 @@ fn reload_extension_reply(
 }
 
 pub struct SocketTransport {
-    reader: BufReader<OwnedReadHalf>,
+    reader: BufReader<ClientReadHalf>,
     writer: mpsc::Sender<ClientFrame>,
     _writer_task: tokio::task::JoinHandle<()>,
     session: SessionId,
@@ -1017,14 +1016,14 @@ impl ClientTransport for SocketTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ipc::Listener;
     use crate::{LlmEvent, StreamEvent};
-    use tokio::net::UnixListener;
 
     /// A hand-rolled daemon: Welcome, answer Ping, Attach → Attached, then
     /// echo every Cmd::Submit as an Event stream.
-    async fn fake_daemon(listener: UnixListener, protocol_version: u32) {
-        let (stream, _) = listener.accept().await.unwrap();
-        let (r, mut w) = stream.into_split();
+    async fn fake_daemon(mut listener: Listener, protocol_version: u32) {
+        let stream = listener.accept().await.unwrap();
+        let (r, mut w) = crate::ipc::split_server(stream);
         let mut reader = BufReader::new(r);
         let mut line = String::new();
         let mut seq = 0u64;
@@ -1232,7 +1231,7 @@ mod tests {
     #[tokio::test]
     async fn next_event_survives_cancellation_mid_frame() {
         let (_d, path) = sock();
-        let l = UnixListener::bind(&path).unwrap();
+        let l = Listener::bind(&path).unwrap();
         let srv = tokio::spawn(fake_daemon(l, PROTOCOL_VERSION));
         let conn = SocketTransport::connect(&path, Hello::new(ClientKind::Test)).await.unwrap();
         let (mut t, _) = SocketTransport::attach(conn, Attach::Existing { session_id: "fake-1".into(), mode: AttachMode::Mirror })
@@ -1258,7 +1257,7 @@ mod tests {
     #[tokio::test]
     async fn socket_transport_handshake_attach_pump() {
         let (_d, path) = sock();
-        let l = UnixListener::bind(&path).unwrap();
+        let l = Listener::bind(&path).unwrap();
         let srv = tokio::spawn(fake_daemon(l, PROTOCOL_VERSION));
 
         let mut conn = SocketTransport::connect(&path, Hello::new(ClientKind::Test)).await.unwrap();
@@ -1303,7 +1302,7 @@ mod tests {
     #[tokio::test]
     async fn conversation_digest_miss_requeries_messages() {
         let (_d, path) = sock();
-        let l = UnixListener::bind(&path).unwrap();
+        let l = Listener::bind(&path).unwrap();
         let srv = tokio::spawn(fake_daemon(l, PROTOCOL_VERSION));
         let conn = SocketTransport::connect(&path, Hello::new(ClientKind::Test)).await.unwrap();
         let (mut t, _) = SocketTransport::attach(conn, Attach::Existing { session_id: "fake-1".into(), mode: AttachMode::Mirror })
@@ -1335,7 +1334,7 @@ mod tests {
     #[tokio::test]
     async fn reloading_then_bye_sets_last_error_and_reconnect_gives_up_on_a_dead_socket() {
         let (_d, path) = sock();
-        let l = UnixListener::bind(&path).unwrap();
+        let l = Listener::bind(&path).unwrap();
         let srv = tokio::spawn(fake_daemon(l, PROTOCOL_VERSION));
         let conn = SocketTransport::connect(&path, Hello::new(ClientKind::Test)).await.unwrap();
         let (mut t, _) = SocketTransport::attach(conn, Attach::Existing { session_id: "fake-1".into(), mode: AttachMode::Observe })
@@ -1359,11 +1358,11 @@ mod tests {
     #[tokio::test]
     async fn attach_error_frame_is_refused() {
         let (_d, path) = sock();
-        let l = UnixListener::bind(&path).unwrap();
+        let mut l = Listener::bind(&path).unwrap();
         // A daemon that welcomes, then answers the Attach with an Error frame.
         let srv = tokio::spawn(async move {
-            let (stream, _) = l.accept().await.unwrap();
-            let (r, mut w) = stream.into_split();
+            let stream = l.accept().await.unwrap();
+            let (r, mut w) = crate::ipc::split_server(stream);
             let mut reader = BufReader::new(r);
             let mut line = String::new();
             reader.read_line(&mut line).await.unwrap();
@@ -1395,7 +1394,7 @@ mod tests {
     #[tokio::test]
     async fn socket_transport_refuses_version_mismatch() {
         let (_d, path) = sock();
-        let l = UnixListener::bind(&path).unwrap();
+        let l = Listener::bind(&path).unwrap();
         let srv = tokio::spawn(fake_daemon(l, 99));
         let err = SocketTransport::connect(&path, Hello::new(ClientKind::Test)).await.err().unwrap();
         assert!(matches!(err, TransportError::Version { client: PROTOCOL_VERSION, daemon: 99 }), "{err}");

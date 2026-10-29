@@ -212,6 +212,37 @@ pub(crate) fn apply_codex_worker_reasoning(
     }
 }
 
+/// Resolve once at admission, before allocating a handle. Resume preserves the
+/// recorded level; old archives without it use today's independent worker default.
+pub(crate) fn resolve_subagent_thinking(
+    params: &serde_json::Value,
+    prior: Option<&str>,
+    config: &crate::config::SynapsConfig,
+) -> crate::Result<agent_core::reasoning::ReasoningLevel> {
+    let value = match params.get("thinking") {
+        None | Some(serde_json::Value::Null) => prior,
+        Some(serde_json::Value::String(value)) => Some(value.as_str()),
+        Some(_) => return Err(crate::RuntimeError::Tool(
+            "thinking must be low|medium|high|xhigh|max".into(),
+        )),
+    };
+    match value {
+        None => Ok(config.subagent_thinking),
+        Some(value) => agent_core::reasoning::parse_subagent_thinking(value).ok_or_else(|| {
+            crate::RuntimeError::Tool("thinking must be low|medium|high|xhigh|max".into())
+        }),
+    }
+}
+
+/// Last reasoning mutation before dispatch: neither model defaults nor a
+/// foreground Ultra inheritance may override the worker's selected effort.
+pub(crate) fn apply_subagent_thinking(
+    runtime: &mut crate::Runtime,
+    thinking: agent_core::reasoning::ReasoningLevel,
+) -> Result<(), String> {
+    runtime.set_reasoning_level_checked(thinking)
+}
+
 /// Kill-switch: `SYNAPS_SUBAGENT_FRESH_RUNTIME=1` restores the pre-engine-host
 /// spawn path (fresh `Runtime::new()`, fresh HTTP client, registry rebuilt,
 /// global broker re-installed with a fresh token cache on every spawn).
@@ -286,6 +317,71 @@ fn compose_system_prompt_with_preamble(
         format!("{prompt}\n\n{FORUM_GUIDANCE}")
     } else {
         prompt
+    }
+}
+
+#[cfg(test)]
+mod subagent_thinking_tests {
+    use super::*;
+    use crate::tools::Tool;
+    use agent_core::reasoning::ReasoningLevel;
+    use serde_json::json;
+
+    #[test]
+    fn subagent_thinking_default_override_and_resume_precedence() {
+        let cfg = crate::config::load_config_from_str("thinking = low\nsubagent_thinking = high\n");
+        assert_eq!(resolve_subagent_thinking(&json!({}), None, &cfg).unwrap(), ReasoningLevel::High);
+        assert_eq!(resolve_subagent_thinking(&json!({}), Some("low"), &cfg).unwrap(), ReasoningLevel::Low);
+        assert_eq!(resolve_subagent_thinking(&json!({"thinking":"max"}), Some("low"), &cfg).unwrap(), ReasoningLevel::Max);
+        assert_eq!(resolve_subagent_thinking(&json!({"thinking":null}), Some("medium"), &cfg).unwrap(), ReasoningLevel::Medium);
+        for value in [json!(false), json!(1), json!(""), json!("typo"), json!("ultra")] {
+            assert!(resolve_subagent_thinking(&json!({"thinking":value}), None, &cfg).is_err());
+        }
+    }
+
+    #[test]
+    fn subagent_thinking_actual_runtime_and_astra_wire() {
+        use crate::runtime::openai::catalog::{plan_codex_execution, CodexRequestRole};
+        for value in ["low", "medium", "high", "xhigh", "max"] {
+            let cfg = crate::config::load_config_from_str("thinking = low\n");
+            let params = if value == "xhigh" { json!({}) } else { json!({"thinking":value}) };
+            let level = resolve_subagent_thinking(&params, None, &cfg).unwrap();
+            let mut runtime = crate::Runtime::new_headless();
+            apply_subagent_runtime_policy(&mut runtime, &cfg, None, None, None, &Default::default());
+            runtime.set_model("openai-codex/gpt-6-astra".into());
+            let parent = crate::Runtime::codex_delegation_plan(runtime.model(), ReasoningLevel::Ultra, CodexRequestRole::Foreground).unwrap();
+            apply_codex_worker_reasoning(&mut runtime, Some(&parent));
+            apply_subagent_thinking(&mut runtime, level).unwrap();
+            assert_eq!(runtime.reasoning_level().as_str(), value);
+            let plan = plan_codex_execution(runtime.model(), runtime.reasoning_level(), runtime.codex_request_role(), None).unwrap();
+            let body = crate::runtime::openai::stream::build_codex_body(
+                "gpt-6-astra", &plan, json!([]), "test".into(), vec![], None, None, "test-cache",
+            );
+            assert_eq!(body["reasoning"]["effort"], value);
+            assert!(!plan.automatic_delegation());
+        }
+    }
+
+    #[test]
+    fn subagent_thinking_schema_and_dispatch_order_all_three_tools() {
+        for tool in [&SubagentTool as &dyn Tool, &SubagentStartTool, &SubagentResumeTool] {
+            assert_eq!(tool.parameters()["properties"]["thinking"]["enum"], json!(["low","medium","high","xhigh","max"]));
+        }
+        for source in [include_str!("oneshot.rs"), include_str!("start.rs"), include_str!("resume.rs")] {
+            let model = source.find("runtime.set_model(").unwrap();
+            let parent = source.find("super::apply_codex_worker_reasoning(").unwrap();
+            let apply = source.find("super::apply_subagent_thinking(").unwrap();
+            let send = source.find("runtime.run_stream").unwrap();
+            assert!(model < parent && parent < apply && apply < send);
+        }
+    }
+
+    #[tokio::test]
+    async fn subagent_thinking_bad_override_refused_before_launch() {
+        for tool in [&SubagentTool as &dyn Tool, &SubagentStartTool] {
+            let error = tool.execute(json!({"task":"test", "system_prompt":"test", "thinking":42}), crate::tools::test_helpers::create_tool_context()).await.unwrap_err();
+            assert!(error.to_string().contains("thinking must be"));
+        }
     }
 }
 
@@ -1167,7 +1263,12 @@ mod worker_workspace_tests {
 
     const PROBE: &str = "SYNAPS_WORKER_WS_PROBE";
     const DAEMON_ONLY: &str = "SYNAPS_WORKER_WS_DAEMON_ONLY";
+    #[cfg(not(windows))]
     const COMMAND: &str = "printf 'PWD=%s\\nPROBE=%s\\nDAEMON=%s\\n' \"$(pwd -P)\" \"${SYNAPS_WORKER_WS_PROBE:-unset}\" \"${SYNAPS_WORKER_WS_DAEMON_ONLY:-unset}\"";
+    /// Git Bash (MSYS) `pwd -P` prints an MSYS path (`/c/Users/x`, or
+    /// `/tmp/x` under its temp mount); `pwd -W` prints the native one.
+    #[cfg(windows)]
+    const COMMAND: &str = "printf 'PWD=%s\\nPROBE=%s\\nDAEMON=%s\\n' \"$(pwd -W)\" \"${SYNAPS_WORKER_WS_PROBE:-unset}\" \"${SYNAPS_WORKER_WS_DAEMON_ONLY:-unset}\"";
 
     fn sse(blocks: &str, stop: &str) -> String {
         let start = json!({"type":"message_start","message":{"id":"msg_ws","type":"message","role":"assistant","content":[],"model":"claude-sonnet-4-6","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}});
@@ -1274,12 +1375,17 @@ mod worker_workspace_tests {
     }
 
     fn assert_ran_in(result: &str, dir: &Path) {
-        let dir = dir.canonicalize().unwrap();
-        assert!(
-            result.contains(&format!("PWD={}", dir.display())),
-            "worker must run in the session cwd {}, got: {result}",
-            dir.display()
-        );
+        let want = dir.canonicalize().unwrap();
+        // The recorded tool_result content is JSON: a quoted, escaped string.
+        let text = serde_json::from_str::<String>(result).unwrap_or_else(|_| result.to_string());
+        let pwd = text
+            .lines()
+            .find_map(|line| line.strip_prefix("PWD="))
+            .unwrap_or_else(|| panic!("no PWD line in the worker output: {result}"));
+        let got = Path::new(pwd)
+            .canonicalize()
+            .unwrap_or_else(|e| panic!("worker PWD {pwd:?} does not resolve ({e}): {result}"));
+        assert_eq!(got, want, "worker must run in the session cwd, got: {result}");
         assert!(result.contains("PROBE=from-session"), "session env: {result}");
         assert!(result.contains("DAEMON=unset"), "process env must not leak: {result}");
     }
