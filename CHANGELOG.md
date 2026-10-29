@@ -6,6 +6,23 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Tool output virtualisation.** A big tool result no longer rides every
+  later request in full. When a text result of `bash`, `grep`, `find`,
+  `ls`, the shell and subagent tools, or an MCP/extension/plugin tool is
+  bigger than `tool_output_spill_bytes` (default 12288; `0` = off, history
+  exactly as before), the whole output goes to a private spill file
+  (`<base>/spill/<session>/<tool_use_id>.txt`, 0700/0600, 16 MiB per file)
+  and history gets a deterministic preview: the first
+  `tool_output_spill_head_bytes` (4096) and last
+  `tool_output_spill_tail_bytes` (3072), cut at line boundaries, and a note
+  with the path and the exact `read` offset/limit of the omitted lines. The
+  old cut at `max_tool_output` kept only the head, so the tail, where errors
+  usually are, was lost; nothing is lost now. A `read` of a big file without
+  a `limit` is not copied: its preview points back at the file. Images and
+  documents are untouched. Spill dirs are removed with their session by
+  `synaps retention` and swept after 7 idle days at startup. Request traces
+  mark virtualised calls (`virtualised: true`; `result_bytes` minus
+  `preview_bytes` is what stayed out of history). Three new /settings rows.
 - **`synaps daemon rename <ID|NAME> <NEW_NAME>`** (or `--clear`) names a
   daemon session from any shell without attaching, so a tool can name a
   session it only observes. Same rules as `/saveas`; attached clients see the
