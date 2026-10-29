@@ -833,6 +833,11 @@ pub struct ToolExecutionEvent {
     /// Original model-request position; event assembly and returned
     /// `tool_result` blocks both preserve this ordering.
     pub model_order: u32,
+    /// Tool output virtualisation: history carries a `preview_bytes`
+    /// preview of the `result_bytes` result (the rest is in a spill file,
+    /// or the file `read` read). Absent when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub virtualised: bool,
 }
 
 // --- The envelope ---
