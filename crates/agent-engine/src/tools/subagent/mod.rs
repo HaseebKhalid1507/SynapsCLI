@@ -1263,7 +1263,12 @@ mod worker_workspace_tests {
 
     const PROBE: &str = "SYNAPS_WORKER_WS_PROBE";
     const DAEMON_ONLY: &str = "SYNAPS_WORKER_WS_DAEMON_ONLY";
+    #[cfg(not(windows))]
     const COMMAND: &str = "printf 'PWD=%s\\nPROBE=%s\\nDAEMON=%s\\n' \"$(pwd -P)\" \"${SYNAPS_WORKER_WS_PROBE:-unset}\" \"${SYNAPS_WORKER_WS_DAEMON_ONLY:-unset}\"";
+    /// Git Bash (MSYS) `pwd -P` prints an MSYS path (`/c/Users/x`, or
+    /// `/tmp/x` under its temp mount); `pwd -W` prints the native one.
+    #[cfg(windows)]
+    const COMMAND: &str = "printf 'PWD=%s\\nPROBE=%s\\nDAEMON=%s\\n' \"$(pwd -W)\" \"${SYNAPS_WORKER_WS_PROBE:-unset}\" \"${SYNAPS_WORKER_WS_DAEMON_ONLY:-unset}\"";
 
     fn sse(blocks: &str, stop: &str) -> String {
         let start = json!({"type":"message_start","message":{"id":"msg_ws","type":"message","role":"assistant","content":[],"model":"claude-sonnet-4-6","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}});
@@ -1370,12 +1375,17 @@ mod worker_workspace_tests {
     }
 
     fn assert_ran_in(result: &str, dir: &Path) {
-        let dir = dir.canonicalize().unwrap();
-        assert!(
-            result.contains(&format!("PWD={}", dir.display())),
-            "worker must run in the session cwd {}, got: {result}",
-            dir.display()
-        );
+        let want = dir.canonicalize().unwrap();
+        // The recorded tool_result content is JSON: a quoted, escaped string.
+        let text = serde_json::from_str::<String>(result).unwrap_or_else(|_| result.to_string());
+        let pwd = text
+            .lines()
+            .find_map(|line| line.strip_prefix("PWD="))
+            .unwrap_or_else(|| panic!("no PWD line in the worker output: {result}"));
+        let got = Path::new(pwd)
+            .canonicalize()
+            .unwrap_or_else(|e| panic!("worker PWD {pwd:?} does not resolve ({e}): {result}"));
+        assert_eq!(got, want, "worker must run in the session cwd, got: {result}");
         assert!(result.contains("PROBE=from-session"), "session env: {result}");
         assert!(result.contains("DAEMON=unset"), "process env must not leak: {result}");
     }
