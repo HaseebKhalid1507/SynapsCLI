@@ -746,6 +746,12 @@ fn scrub_reexec_env() {
 }
 
 fn main() -> anyhow::Result<()> {
+    // sudo runs this binary as the bash tool's askpass helper; nothing else
+    // (config, logging, HOME) may happen first. Also records that this
+    // binary can be the helper, which the bash tool requires.
+    if let Some(code) = agent_engine::tools::run_sudo_askpass_helper_if_invoked() {
+        std::process::exit(code);
+    }
     // Before anything can report it (daemon `Welcome`, the client's skew check).
     agent_engine::session::wire::set_build_id(env!("SYNAPS_BUILD_ID"));
     let mut thin = false;

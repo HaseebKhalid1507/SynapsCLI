@@ -62,6 +62,7 @@ impl Tool for PowerShellTool {
             ShellSpec::PowerShell,
             params["timeout"].as_u64(),
             ctx,
+            None,
         )
         .await
     }
