@@ -554,22 +554,17 @@ impl Runtime {
         };
 
         // Messages: the durable history plus one request-local trailing user
-        // message. Same request-local image cap as a real round.
+        // message. The same request-local image retention as a real round
+        // (`image_retention::round_images`), so the retired prefix, and the
+        // retention anchor the transport places from it, match the next turn.
         let mut request: Vec<SharedMessage> = history.to_vec();
         request.push(Arc::new(
             json!({"role": "user", "content": KEEPWARM_PING_TEXT}),
         ));
-        let capped;
-        let request_messages: &[SharedMessage] = match super::stream::cap_history_image_bytes(
-            &request,
-            super::stream::HISTORY_IMAGE_BYTE_CAP,
-        ) {
-            Some(c) => {
-                capped = c;
-                &capped
-            }
-            None => &request,
-        };
+        let round_images =
+            super::image_retention::round_images(&self.model, self.codex_request_role(), &request)
+                .map_err(RuntimeError::Config)?;
+        let (request_messages, _) = round_images.views(&request);
 
         // Tools: a snapshot of the live registry (the previous turn already
         // applied its idempotent setup), projected exactly like a stream round
@@ -647,6 +642,7 @@ impl Runtime {
             request_compression: self.request_compression.clone(),
             anthropic_execution_plan,
             codex_request_role: self.codex_request_role(),
+            retention_frontier: round_images.applied_frontier(),
             // The base context: a ping must never consume `/trace next`.
             trace: self.trace_ctx.clone(),
             request_correlation: None,
@@ -743,9 +739,14 @@ impl Runtime {
         use agent_core::core::context_policy::{assess_context, ContextAction};
         let mut next: Vec<SharedMessage> = history.to_vec();
         next.push(Arc::new(json!({"role": "user", "content": ""})));
-        let capped =
-            super::stream::cap_history_image_bytes(&next, super::stream::HISTORY_IMAGE_BYTE_CAP);
-        let request_messages: &[SharedMessage] = capped.as_deref().unwrap_or(&next[..]);
+        // Estimated exactly like a real round: over the retention view.
+        let round_images =
+            super::image_retention::round_images(&self.model, self.codex_request_role(), &next)
+                .ok();
+        let (_, request_messages) = match &round_images {
+            Some(round) => round.views(&next),
+            None => (&next[..], &next[..]),
+        };
         let fallback_schema;
         let schema = match projected_schema {
             Some(s) => s,

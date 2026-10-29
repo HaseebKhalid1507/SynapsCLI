@@ -4181,6 +4181,9 @@ impl Runtime {
                     request_compression: self.request_compression.clone(),
                     anthropic_execution_plan: anthropic_execution_plan.clone(),
                     codex_request_role: self.codex_request_role(),
+                    // The legacy non-stream loop applies no request-local
+                    // image retention of its own.
+                    retention_frontier: None,
                     // Consistent with the streaming path: a pending
                     // `/trace next` arm covers the first request of this
                     // loop too (the one-shot gate inside the armed context
@@ -4759,6 +4762,9 @@ impl Runtime {
             request_compression: self.request_compression.clone(),
             anthropic_execution_plan,
             codex_request_role: self.codex_request_role(),
+            // Placeholder: the stream loop sets it per round once it has
+            // applied request-local image retention.
+            retention_frontier: None,
             trace: self.effective_trace_context(),
             request_correlation: None,
             suppress_stream_deltas: false,

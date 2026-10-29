@@ -191,7 +191,10 @@ impl ApiMethods {
         // Arc-shared (#128): to_vec() is N refcount bumps, not a deep copy;
         // sanitize/annotate clone-on-write only what they edit.
         let mut cleaned_messages = messages.to_vec();
-        let retired_count = super::image_retention::plan(messages).map_err(RuntimeError::Config)?;
+        let retention =
+            super::image_retention::plan_request(messages, super::image_retention::Budget::Native)
+                .map_err(RuntimeError::Config)?;
+        let retired_count = retention.retired;
         // Stable per-image projection precedes cache markers, only on Anthropic.
         // Original preflight above remains authoritative; recheck output budgets.
         super::image_limits::enforce_image_limits(&mut cleaned_messages, retired_count)
@@ -199,6 +202,14 @@ impl ApiMethods {
             .map_err(RuntimeError::Config)?;
         super::attachments::validate_messages(model, &cleaned_messages)
             .map_err(RuntimeError::Config)?;
+        // The frontier is a position in `messages`: anchor before sanitation
+        // merges messages. A worker round arrives already retired upstream
+        // (its frontier rides in the options) and replays as a no-op here.
+        HelperMethods::annotate_retention_anchor(
+            &mut cleaned_messages,
+            super::image_retention::earliest(options.retention_frontier, retention.frontier),
+            options.cache_ttl,
+        );
         // Strict checks retain original per-source batch boundaries: sanitizing
         // first could merge valid adjacent user batches past eight attachments.
         HelperMethods::sanitize_thinking_blocks(&mut cleaned_messages);
