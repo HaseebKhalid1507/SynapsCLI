@@ -175,15 +175,30 @@ never edited, so signed `thinking`/`redacted_thinking` blocks travel
 verbatim, and the last assistant message of a tool loop still starts with its
 thinking block. A rollover in the middle of a tool loop sends: brief, carried
 instructions, rollover note (user turns), then the assistant/tool_result
-suffix ending on the pending tool results. Consecutive user turns are already
-what the foreground successor sends.
+suffix ending on the pending tool results. The request builder merges
+consecutive user turns, so on the wire the first message is one user turn
+(the brief's text block first, verbatim, then the note), followed by the
+retained assistant turn with its signed thinking block; the integration test
+checks exactly this on the recorded request bodies.
 
 **Target.** `successor_budget(target, pressure, overhead, calibration)`, with
 the calibration sample recorded on the worker's own `ContinuationState`
-exactly as the foreground does. A candidate that does not shrink by more than
-1024 tokens, or (outside hard capacity) would still start inside the pressure
-band, is `Unproductive` and deferred with `defer_unproductive_rollover`, the
-foreground's no-thrash rule.
+exactly as the foreground does. The cut is chosen against an estimate, then
+the real successor is measured and the cut stepped to the next valid
+boundary while it is over target, so the target holds unless the must-keep
+part alone exceeds it (then it is kept whole, with a warning, as the
+foreground does). At hard capacity the target is also capped at two thirds
+of the history room the next round leaves: on a small window whose output
+reserve dominates, hard capacity comes before the rollover band, and the
+configured target could exceed the context itself. A candidate that does
+not shrink by more than 1024 tokens, or (outside hard capacity) would still
+start inside the pressure band, is `Unproductive` and deferred with
+`defer_unproductive_rollover`, the foreground's no-thrash rule.
+
+**Bounded note.** The note's index of evicted tool calls is capped at about
+2k tokens (the foreground's dropped-index budget), and it lists the 12 most
+recent earlier windows by path, naming older ones by directory, so the note
+stays bounded however long a worker runs.
 
 ### Where evicted history goes
 
