@@ -130,6 +130,18 @@ pub fn adopt_banner(
     ours: &SessionId,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Option<String> {
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    adopt_banner_with_home(sessions, ours, now, home.as_deref())
+}
+
+/// [`adopt_banner`] with the home directory given: `~` paths without
+/// reading the environment (Windows does not set `HOME`).
+fn adopt_banner_with_home(
+    sessions: &[agent_engine::session::SessionMeta],
+    ours: &SessionId,
+    now: chrono::DateTime<chrono::Utc>,
+    home: Option<&std::path::Path>,
+) -> Option<String> {
     use agent_engine::session::SessionLifecycle as L;
     let mut others: Vec<&agent_engine::session::SessionMeta> =
         sessions.iter().filter(|m| &m.id != ours).collect();
@@ -150,10 +162,9 @@ pub fn adopt_banner(
         if n == 1 { "" } else { "s" },
         counts.join(", ")
     );
-    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
     for m in others.iter().take(5) {
         let attached = if m.clients > 0 { " \u{00b7} attached" } else { "" };
-        let cwd = super::sessions::short_cwd(m.cwd.as_deref(), home.as_deref());
+        let cwd = super::sessions::short_cwd(m.cwd.as_deref(), home);
         line.push_str(&format!(
             "\n  {}  {}{attached}  {cwd}",
             super::sessions::label(m),
@@ -846,13 +857,20 @@ mod tests {
         use agent_engine::session::SessionLifecycle as L;
         let ours = SessionId::from("20260919-000000-ours".to_string());
         let now = chrono::Utc::now();
-        let home = std::path::PathBuf::from(std::env::var_os("HOME").expect("HOME"));
+        // A fixed home, not `HOME`: Windows does not set it.
+        let home = std::env::temp_dir();
         let mut m = meta("20260919-010000-793d", L::Parked, 0, 4);
         m.name = Some("gallery2".into());
         m.state_since = Some(now - chrono::Duration::minutes(2));
         m.evict_due = Some(now + chrono::Duration::minutes(57) + chrono::Duration::seconds(30));
         m.cwd = Some(home.join("Projects/synaps"));
-        let b = adopt_banner(&[meta("20260919-000000-ours", L::Live, 1, 0), m.clone()], &ours, now).unwrap();
+        let b = adopt_banner_with_home(
+            &[meta("20260919-000000-ours", L::Live, 1, 0), m.clone()],
+            &ours,
+            now,
+            Some(&home),
+        )
+        .unwrap();
         assert_eq!(
             b,
             format!(
