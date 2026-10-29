@@ -381,6 +381,82 @@ impl HelperMethods {
         }
     }
 
+    /// Annotate the retention anchor: a message-tail-TTL cache breakpoint on
+    /// the last markable top-level block BEFORE `frontier`, the oldest image
+    /// occurrence the previous request still sent (see
+    /// `image_retention::Retention::frontier`). Nothing ahead of the frontier
+    /// differs between the two requests, so when this request retires images
+    /// the lookback from the anchor finds the entry the earlier requests wrote
+    /// there, instead of every message-level entry missing (the change sits
+    /// far more than 20 blocks behind the tail) and the whole conversation
+    /// after the system prompt being written again. Between retirements the
+    /// anchor stays put and its entry is re-read. It is never stamped on a
+    /// thinking block, an empty text block or per-turn extension context.
+    ///
+    /// Run on the outgoing copy after image projection (which only rewrites
+    /// blocks in place ahead of the frontier, so the position still holds)
+    /// and before thinking sanitation merges messages (block keys survive
+    /// the merge). With the tools, system and tail markers this is at most
+    /// the API's four breakpoints.
+    pub(super) fn annotate_retention_anchor(
+        messages: &mut [SharedMessage],
+        frontier: Option<(usize, usize)>,
+        ttl: CacheTtl,
+    ) {
+        let Some((frontier_message, frontier_block)) = frontier else {
+            return;
+        };
+        if frontier_message >= messages.len() {
+            return;
+        }
+        // Durable history never carries markers (only request copies are
+        // stamped). One that arrives with its own (a replayed or foreign
+        // request) may already fill the API's four breakpoints with tools,
+        // system and tail: no anchor rather than a rejected fifth.
+        let carries_marker = |block: &Value| {
+            block.get("cache_control").is_some()
+                || block["content"]
+                    .as_array()
+                    .is_some_and(|nested| nested.iter().any(|b| b.get("cache_control").is_some()))
+        };
+        if messages.iter().any(|message| {
+            message["content"]
+                .as_array()
+                .is_some_and(|blocks| blocks.iter().any(carries_marker))
+        }) {
+            return;
+        }
+        let markable = |block: &Value| match block["type"].as_str() {
+            Some("text") => {
+                block["text"].as_str().is_some_and(|t| !t.is_empty())
+                    && !super::stream::is_ephemeral_turn_context_block(block)
+            }
+            Some("tool_use" | "tool_result") => true,
+            _ => false,
+        };
+        let mut candidate = None;
+        for message_index in (0..=frontier_message).rev() {
+            let Some(blocks) = messages[message_index]["content"].as_array() else {
+                continue;
+            };
+            let end = if message_index == frontier_message {
+                frontier_block.min(blocks.len())
+            } else {
+                blocks.len()
+            };
+            if let Some(block_index) = blocks[..end].iter().rposition(markable) {
+                candidate = Some((message_index, block_index));
+                break;
+            }
+        }
+        let Some((message_index, block_index)) = candidate else {
+            return;
+        };
+        let message = Arc::make_mut(&mut messages[message_index]);
+        message["content"][block_index]["cache_control"] =
+            cache_control_value(ttl, MarkerSite::MessageTail);
+    }
+
     /// Build the `system` value for a request, with the cache marker on the
     /// last block. Shared by both transports so the auth-specific block
     /// layout (and the OAuth identity-first invariant) has exactly one truth.
@@ -638,6 +714,145 @@ mod tests {
             .into_iter()
             .map(|m| Arc::try_unwrap(m).unwrap_or_else(|a| (*a).clone()))
             .collect();
+    }
+
+    // ─── Retention anchor ────────────────────────────────────────────────
+
+    fn anchor_fixture() -> Vec<SharedMessage> {
+        vec![
+            Arc::new(json!({"role":"user","content":[{"type":"text","text":"go"}]})),
+            Arc::new(json!({"role":"assistant","content":[
+                {"type":"thinking","thinking":"t","signature":"s"},
+                {"type":"tool_use","id":"a","name":"shot","input":{}}
+            ]})),
+            Arc::new(json!({"role":"user","content":[
+                {"type":"tool_result","tool_use_id":"a","content":"ok"},
+                {"type":"image","source":{"type":"base64","media_type":"image/png","data":"AA=="}}
+            ]})),
+            Arc::new(json!({"role":"assistant","content":[
+                {"type":"text","text":""},
+                {"type":"thinking","thinking":"t","signature":"s"}
+            ]})),
+            Arc::new(json!({"role":"user","content":[
+                {"type":"image","source":{"type":"base64","media_type":"image/png","data":"AA=="}}
+            ]})),
+        ]
+    }
+
+    /// Every `(message, block)` carrying `cache_control`, in order.
+    fn marked(messages: &[SharedMessage]) -> Vec<(usize, usize)> {
+        let mut out = Vec::new();
+        for (m, message) in messages.iter().enumerate() {
+            for (b, block) in message["content"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .enumerate()
+            {
+                if block.get("cache_control").is_some() {
+                    out.push((m, b));
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn retention_anchor_marks_the_last_markable_block_before_the_frontier() {
+        let ttl = CacheTtl::FiveMinutes;
+        // Frontier mid-message: the block right before it.
+        let mut out = anchor_fixture();
+        HelperMethods::annotate_retention_anchor(&mut out, Some((2, 1)), ttl);
+        assert_eq!(marked(&out), [(2, 0)]);
+        assert_eq!(
+            out[2]["content"][0]["cache_control"],
+            json!({"type":"ephemeral"})
+        );
+        // Frontier on a message's first block: back into the previous
+        // message, onto its tool_use, never its thinking block.
+        let mut out = anchor_fixture();
+        HelperMethods::annotate_retention_anchor(&mut out, Some((2, 0)), ttl);
+        assert_eq!(marked(&out), [(1, 1)]);
+        // An assistant message holding only an empty text and a thinking
+        // block offers nothing: the scan keeps going back.
+        let mut out = anchor_fixture();
+        HelperMethods::annotate_retention_anchor(&mut out, Some((4, 0)), ttl);
+        assert_eq!(marked(&out), [(2, 0)]);
+    }
+
+    #[test]
+    fn retention_anchor_skips_per_turn_context_and_is_a_no_op_without_a_target() {
+        let ttl = CacheTtl::FiveMinutes;
+        let context = format!(
+            "{}\nambient\n{}",
+            super::super::stream::EXTENSION_CONTEXT_OPEN,
+            super::super::stream::EXTENSION_CONTEXT_CLOSE
+        );
+        let mut out: Vec<SharedMessage> = vec![Arc::new(json!({"role":"user","content":[
+            {"type":"text","text":"look"},
+            {"type":"text","text":context},
+            {"type":"image","source":{"type":"base64","media_type":"image/png","data":"AA=="}}
+        ]}))];
+        HelperMethods::annotate_retention_anchor(&mut out, Some((0, 2)), ttl);
+        assert_eq!(marked(&out), [(0, 0)]);
+        // No frontier, a frontier past the history, nothing markable ahead:
+        // the messages (and their Arcs) are untouched.
+        let original = anchor_fixture();
+        for frontier in [None, Some((9, 0)), Some((0, 0))] {
+            let mut out = original.clone();
+            HelperMethods::annotate_retention_anchor(&mut out, frontier, ttl);
+            assert!(marked(&out).is_empty(), "{frontier:?}");
+            assert!(out.iter().zip(&original).all(|(a, b)| Arc::ptr_eq(a, b)));
+        }
+        // A history that arrives carrying its own marker, top level or nested
+        // in a tool_result, gets no anchor: never a fifth breakpoint.
+        for (message, path) in [(0, "/content/0"), (2, "/content/0")] {
+            let mut foreign = anchor_fixture();
+            let block = Arc::make_mut(&mut foreign[message])
+                .pointer_mut(path)
+                .unwrap();
+            if message == 2 {
+                block["content"] = json!([{"type":"text","text":"ok",
+                    "cache_control":{"type":"ephemeral"}}]);
+            } else {
+                block["cache_control"] = json!({"type":"ephemeral"});
+            }
+            let before = foreign.clone();
+            HelperMethods::annotate_retention_anchor(&mut foreign, Some((4, 0)), ttl);
+            assert!(
+                foreign.iter().zip(&before).all(|(a, b)| Arc::ptr_eq(a, b)),
+                "{message}"
+            );
+        }
+    }
+
+    /// The anchor is a message-tail site: it carries the tail's TTL in every
+    /// mode, so a hybrid body keeps every 1h marker ahead of the 5m ones.
+    #[test]
+    fn retention_anchor_uses_the_message_tail_ttl_and_shares_the_tail_block() {
+        for (ttl, expect) in [
+            (CacheTtl::FiveMinutes, json!({"type":"ephemeral"})),
+            (CacheTtl::Hybrid, json!({"type":"ephemeral"})),
+            (CacheTtl::OneHour, json!({"type":"ephemeral","ttl":"1h"})),
+        ] {
+            let mut out = anchor_fixture();
+            HelperMethods::annotate_retention_anchor(&mut out, Some((2, 1)), ttl);
+            assert_eq!(out[2]["content"][0]["cache_control"], expect, "{ttl:?}");
+        }
+        // Anchor and tail on the same block stay one breakpoint.
+        let mut out: Vec<SharedMessage> = vec![Arc::new(json!({"role":"user","content":[
+            {"type":"text","text":"look"},
+            {"type":"image","source":{"type":"base64","media_type":"image/png","data":"AA=="}}
+        ]}))];
+        HelperMethods::annotate_retention_anchor(&mut out, Some((0, 1)), CacheTtl::FiveMinutes);
+        HelperMethods::annotate_cache_breakpoint(&mut out, CacheTtl::FiveMinutes);
+        assert_eq!(marked(&out), [(0, 0), (0, 1)]);
+        let mut out: Vec<SharedMessage> = vec![Arc::new(json!({"role":"user","content":[
+            {"type":"text","text":"look"}
+        ]}))];
+        HelperMethods::annotate_retention_anchor(&mut out, Some((0, 1)), CacheTtl::FiveMinutes);
+        HelperMethods::annotate_cache_breakpoint(&mut out, CacheTtl::FiveMinutes);
+        assert_eq!(marked(&out), [(0, 0)]);
     }
 
     fn annotate_vals(msgs: &mut Vec<Value>, ttl: CacheTtl) {

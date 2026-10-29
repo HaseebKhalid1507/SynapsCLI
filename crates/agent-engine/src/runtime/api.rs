@@ -842,6 +842,13 @@ pub struct ApiOptions {
     pub anthropic_execution_plan: Option<crate::runtime::openai::catalog::AnthropicExecutionPlan>,
     /// Foreground/worker/internal request role.
     pub codex_request_role: crate::runtime::openai::catalog::CodexRequestRole,
+    /// Set by the stream loop (and the keep-warm ping) when request-local
+    /// image retention was already applied to the messages this request is
+    /// given (worker and routed budgets, `image_retention::round_images`):
+    /// the `(message, block)` position of that retention's frontier in those
+    /// messages. The native transport anchors a cache breakpoint ahead of the
+    /// earlier of this and its own replay's frontier. `None` otherwise.
+    pub retention_frontier: Option<(usize, usize)>,
     /// Trace emission seam (Task 8). Default is a disabled context (no-op
     /// sink, zero request-path work); tests install a collecting sink and
     /// production installs the Task 11 writer-backed sink via the Runtime.
@@ -1348,7 +1355,10 @@ impl ApiMethods {
         // Arc-shared (#128): to_vec() on &[SharedMessage] is N refcount bumps,
         // not a deep copy; sanitize/annotate clone-on-write only what they edit.
         let mut cleaned_messages = messages.to_vec();
-        let retired_count = super::image_retention::plan(messages).map_err(RuntimeError::Config)?;
+        let retention =
+            super::image_retention::plan_request(messages, super::image_retention::Budget::Native)
+                .map_err(RuntimeError::Config)?;
+        let retired_count = retention.retired;
         // Deferred tool loading: send the session's loaded tools normally and
         // every other activatable tool with `defer_loading`, and resolve the
         // history's `tool_reference` blocks to wire names. Without a split
@@ -1373,6 +1383,14 @@ impl ApiMethods {
         .map_err(RuntimeError::Config)?;
         super::attachments::validate_messages(model, &cleaned_messages)
             .map_err(RuntimeError::Config)?;
+        // The frontier is a position in `messages`: anchor before sanitation
+        // merges messages. A worker round arrives already retired upstream
+        // (its frontier rides in the options) and replays as a no-op here.
+        HelperMethods::annotate_retention_anchor(
+            &mut cleaned_messages,
+            super::image_retention::earliest(options.retention_frontier, retention.frontier),
+            options.cache_ttl,
+        );
         // Strict checks retain original per-source batch boundaries: sanitizing
         // first could merge valid adjacent user batches past eight attachments.
         HelperMethods::sanitize_thinking_blocks(&mut cleaned_messages);

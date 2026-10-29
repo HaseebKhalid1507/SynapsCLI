@@ -57,6 +57,17 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Screenshot-heavy subagents rewrote the whole prompt cache on every
+  round.** Past 6 images, the worker upload budget retired one old image
+  per new one, which changed the request far behind the tail, so nothing
+  after the system prompt was read from cache. That was 39 of the 45
+  cache breaks (88% of missed tokens) in a 72-hour sample. Workers and
+  non-Anthropic routes now retire images in chunks, down to half their
+  budget, through the same replay the native route uses, so the history
+  changes once per chunk. A cache breakpoint ahead of the oldest image the
+  previous request sent lets a retirement re-read the prefix instead of
+  rewriting it. Budgets are unchanged; a retired image is labelled the same
+  way on every route.
 - **`ttft_ms` in `api-log.jsonl` read `0`** on nearly every record: it was
   timed from when the response headers arrived, not from the send.
   `ttft_ms` and `total_ms` now count from the send, like the request trace;

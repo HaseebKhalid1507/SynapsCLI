@@ -68,16 +68,6 @@ fn image_slots(messages: &[SharedMessage]) -> Vec<Slot> {
     slots
 }
 
-fn replace_with_text(messages: &mut [SharedMessage], slot: Slot, text: String) {
-    let message = Arc::make_mut(&mut messages[slot.msg]);
-    let outer = &mut message["content"][slot.block];
-    let target = match slot.inner {
-        Some(inner) => &mut outer["content"][inner],
-        None => outer,
-    };
-    *target = json!({ "type": "text", "text": text });
-}
-
 fn block_at(messages: &[SharedMessage], slot: Slot) -> &Value {
     let outer = &messages[slot.msg]["content"][slot.block];
     match slot.inner {
@@ -631,7 +621,7 @@ mod tests {
             let first = source
                 .find("attachments::validate_history_for_request(model, messages)")
                 .unwrap();
-            let replay = source.find("image_retention::plan(messages)").unwrap();
+            let replay = source.find("image_retention::plan_request(").unwrap();
             let sanitize = source
                 .find("HelperMethods::sanitize_thinking_blocks(&mut cleaned_messages)")
                 .unwrap();
@@ -647,7 +637,16 @@ mod tests {
             let marker = source
                 .find("HelperMethods::annotate_cache_breakpoint(&mut cleaned_messages")
                 .unwrap();
+            // The retention anchor is a position in the original messages:
+            // after projection (in-place ahead of the frontier), before the
+            // merge in thinking sanitation.
+            let anchor = source
+                .find(
+                    "HelperMethods::annotate_retention_anchor(\n            &mut cleaned_messages,",
+                )
+                .unwrap();
             assert!(first < replay && replay < project && project < check);
+            assert!(check < anchor && anchor < sanitize);
             assert!(check < sanitize && sanitize < wire && wire < marker);
         }
     }
@@ -717,95 +716,5 @@ mod tests {
         enforce(&mut messages, &cache()).unwrap();
         super::super::attachments::validate_messages("anthropic/claude-sonnet-4-6", &messages)
             .unwrap();
-    }
-}
-
-/// Worker uploads must leave uplink capacity for foreground sessions. Count
-/// base64 bytes (the actual wire payload), not decoded bytes. URL images count
-/// toward the count limit but carry no embedded image payload.
-pub(crate) const WORKER_IMAGE_BYTES: usize = 4 * 1024 * 1024;
-pub(crate) const WORKER_IMAGE_COUNT: usize = 6;
-const WORKER_IMAGE_LABEL: &str = "[image omitted from this worker request: newest 6 images / 4 MiB upload budget; re-read a smaller image if needed]";
-
-pub(super) fn cap_worker_images(messages: &[SharedMessage]) -> Option<Vec<SharedMessage>> {
-    cap_images(messages, WORKER_IMAGE_COUNT, WORKER_IMAGE_BYTES)
-}
-
-fn cap_images(
-    messages: &[SharedMessage],
-    count_cap: usize,
-    byte_cap: usize,
-) -> Option<Vec<SharedMessage>> {
-    let slots = image_slots(messages);
-    let bytes = |slot| {
-        let block = block_at(messages, slot);
-        if block["source"]["type"] == "base64" {
-            block["source"]["data"].as_str().map_or(0, str::len)
-        } else {
-            0
-        }
-    };
-    let mut count = slots.len();
-    let mut total = slots.iter().map(|&slot| bytes(slot)).sum::<usize>();
-    if count <= count_cap && total <= byte_cap {
-        return None;
-    }
-    let mut out = messages.to_vec();
-    for slot in slots {
-        if count <= count_cap && total <= byte_cap {
-            break;
-        }
-        total -= bytes(slot);
-        count -= 1;
-        replace_with_text(&mut out, slot, WORKER_IMAGE_LABEL.to_owned());
-    }
-    tracing::info!(
-        remaining_images = count,
-        remaining_bytes = total,
-        "worker image upload budget applied"
-    );
-    Some(out)
-}
-
-#[cfg(test)]
-mod worker_image_tests {
-    use super::*;
-    fn image(data: &str) -> Value {
-        json!({"type":"image", "source":{"type":"base64","data":data,"media_type":"image/png"}})
-    }
-    fn message(content: Value) -> SharedMessage {
-        Arc::new(json!({"role":"user","content":content}))
-    }
-    #[test]
-    fn newest_images_survive_both_budgets_without_mutating_history() {
-        let history = vec![message(
-            json!([image("old"), {"type":"tool_result","tool_use_id":"t1",
-            "content":[{"type":"text","text":"summary"},image("middle"),image("new")]}]),
-        )];
-        let original = history[0].clone();
-        let out = cap_images(&history, 2, 9).unwrap();
-        assert_eq!(out[0]["content"][0]["type"], "text");
-        assert_eq!(out[0]["content"][1]["tool_use_id"], "t1");
-        assert_eq!(out[0]["content"][1]["content"][0]["text"], "summary");
-        assert_eq!(out[0]["content"][1]["content"][1], image("middle"));
-        assert_eq!(out[0]["content"][1]["content"][2], image("new"));
-        assert!(Arc::ptr_eq(&original, &history[0]));
-        assert_eq!(history[0]["content"][0], image("old"));
-        assert_eq!(out, cap_images(&history, 2, 9).unwrap());
-        let byte_only = cap_images(&history, 99, 3).unwrap();
-        assert_eq!(image_slots(&byte_only).len(), 1);
-        assert_eq!(byte_only[0]["content"][1]["content"][2], image("new"));
-    }
-    #[test]
-    fn count_url_and_oversize_images_and_keep_noop_allocation_free() {
-        let history = vec![message(json!([image("too big")]))];
-        assert!(cap_images(&history, 6, 7).is_none());
-        assert_eq!(image_slots(&cap_images(&history, 6, 6).unwrap()).len(), 0);
-        assert!(cap_worker_images(&[]).is_none());
-        let urls = vec![message(json!((0..7).map(|_| json!({"type":"image","source":{"type":"url","url":"https://example.invalid/a"}})).collect::<Vec<_>>()))];
-        let out = cap_worker_images(&urls).unwrap();
-        assert_eq!(image_slots(&out).len(), 6);
-        assert_eq!(image_slots(&urls).len(), 7);
-        assert_eq!(WORKER_IMAGE_BYTES, 4 * 1024 * 1024);
     }
 }
