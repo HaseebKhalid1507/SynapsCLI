@@ -912,6 +912,11 @@ pub struct ApiOptions {
     /// `previous_message_id`) and on keep-warm pings (header only, so the
     /// beta set matches the turns they keep warm).
     pub cache_diagnosis: Option<super::cache_diagnosis::CacheDiagnosis>,
+    /// The context window this request belongs to after an automatic
+    /// rollover (worker or foreground), for the telemetry record's
+    /// `rollover_window` / `rollover` fields. `None` (default) before any
+    /// rollover and on every non-turn request: records stay unchanged.
+    pub context_rollover: Option<super::telemetry::RolloverStamp>,
 }
 
 /// What a keep-warm request does once its body is built.
@@ -2352,6 +2357,8 @@ impl ApiMethods {
                     keepwarm: options.keepwarm.is_some(),
                     worker: options.codex_request_role
                         == crate::runtime::openai::catalog::CodexRequestRole::Worker,
+                    rollover_window: options.context_rollover.map(|r| r.window),
+                    rollover: options.context_rollover.is_some_and(|r| r.first_request),
                     ..Default::default()
                 };
                 record.set_correlation(

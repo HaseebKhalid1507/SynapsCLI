@@ -795,6 +795,9 @@ impl StreamMethods {
         } else {
             system_prompt
         };
+        // Set by a committed rollover: the next request is the first of its
+        // window (telemetry `rollover: true`).
+        let mut first_request_of_window = false;
         // Tracks whether this context segment has made at least one provider
         // call (wall-clock checkpoint skips an un-exercised segment).
         let mut segment_has_provider_round = false;
@@ -1218,6 +1221,21 @@ impl StreamMethods {
             // clone, exactly the pre-Task-18 request path. Flag-on: build one
             // per-round options value carrying the session projection.
             let request_correlation = options.trace.reserve_request_correlation();
+            // Which context window this request belongs to, for telemetry.
+            let context_rollover = {
+                let window = if context_enabled {
+                    continuation
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .window
+                } else {
+                    1
+                };
+                (window > 1).then(|| super::telemetry::RolloverStamp {
+                    window,
+                    first_request: std::mem::take(&mut first_request_of_window),
+                })
+            };
             let projected_options;
             let metered_options;
             let round_options: &super::api::ApiOptions = if progressive_tool_disclosure {
@@ -1251,6 +1269,7 @@ impl StreamMethods {
                     anthropic_tool_split,
                     usage_counters: Some(std::sync::Arc::clone(&usage_counters)),
                     request_correlation: request_correlation.clone(),
+                    context_rollover,
                     ..options.clone()
                 };
                 &projected_options
@@ -1258,6 +1277,7 @@ impl StreamMethods {
                 metered_options = super::api::ApiOptions {
                     usage_counters: Some(std::sync::Arc::clone(&usage_counters)),
                     request_correlation: request_correlation.clone(),
+                    context_rollover,
                     ..options.clone()
                 };
                 &metered_options
@@ -1453,6 +1473,7 @@ impl StreamMethods {
                                     )
                                 };
                                 let _=tx.send(StreamEvent::Session(SessionEvent::Notice(format!("Continued automatically in context window {window} with a fresh wall-clock allowance; earlier eligible source evidence remains searchable. Other resource limits remain unchanged. No summarizing compaction.{carried}"))));
+                                first_request_of_window = true;
                                 continue;
                             }
                             Err(error) => {

@@ -4208,6 +4208,7 @@ impl Runtime {
                     keepwarm: None,
                     // The non-stream transport never sends diagnostics.
                     cache_diagnosis: None,
+                    context_rollover: None,
                 },
             )
             .await?;
@@ -4781,6 +4782,7 @@ impl Runtime {
             // The foreground chain: the only requests that thread
             // `diagnostics.previous_message_id`.
             cache_diagnosis: self.cache_diagnosis(),
+            context_rollover: None,
         };
 
         let final_capture_history: Arc<Mutex<Option<Vec<crate::SharedMessage>>>> = Arc::new(Mutex::new(None));
