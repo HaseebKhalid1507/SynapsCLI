@@ -27,6 +27,8 @@ pub(crate) mod read;
 mod secret_prompt;
 mod subagent;
 pub(crate) use subagent::archive::write_window_transcript;
+#[cfg(test)]
+pub(crate) use subagent::archive::resume_messages;
 pub(crate) use subagent::finalize::build_reload_carry_event;
 #[doc(hidden)]
 pub use subagent::{legacy_fresh_runtime, spawn_runtime};

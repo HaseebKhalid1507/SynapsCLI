@@ -156,6 +156,8 @@ impl Tool for SubagentTool {
             return Err(RuntimeError::Tool(error));
         }
 
+        // Names this worker's rolled-over context windows (`worker_context`).
+        let transcript_stem = orchestration_id.clone();
         let thread_handle = match std::thread::Builder::new().spawn(move || {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let rt = match tokio::runtime::Builder::new_current_thread()
@@ -188,6 +190,17 @@ impl Tool for SubagentTool {
                     runtime.set_model(model);
                     super::apply_codex_worker_reasoning(&mut runtime, codex_parent_plan.as_ref());
                     super::apply_subagent_thinking(&mut runtime, thinking)?;
+                    // Rolled-over context goes to the worker archive directory.
+                    super::attach_worker_transcripts(
+                        &mut runtime,
+                        super::archive::process_dir(),
+                        &transcript_stem,
+                        None,
+                        &[],
+                        tx_events_inner.clone(),
+                        subagent_id,
+                        &label_inner,
+                    );
 
                     let cancel = crate::CancellationToken::new();
                     let cancel_inner = cancel.clone();

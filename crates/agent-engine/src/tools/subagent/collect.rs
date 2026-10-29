@@ -95,7 +95,7 @@ impl Tool for SubagentCollectTool {
                 }
             }
             if let (Some(archive), Some(path)) = (archived, archive_path) {
-                return Ok(json!({
+                let mut body = json!({
                     "handle_id": handle_id,
                     "status": archive.status,
                     "error": archive.error,
@@ -105,8 +105,13 @@ impl Tool for SubagentCollectTool {
                     "archive_path": path,
                     "note": "Handle was reaped; result read from its resume archive. \
                              subagent_resume can still continue this worker."
-                })
-                .to_string());
+                });
+                if let Some(context) =
+                    crate::runtime::subagent::archived_context_summary(&archive.history)
+                {
+                    body["context"] = context;
+                }
+                return Ok(body.to_string());
             }
             return Err(RuntimeError::Tool(format!(
                 "No subagent found with handle_id '{}'. Finished handles are retained for {} minutes after completion and then garbage-collected.",
@@ -123,6 +128,11 @@ impl Tool for SubagentCollectTool {
         let terminal = handle.terminal_diagnostic();
         let authorization = handle.authorization.clone();
         let archive_error = handle.archive_error();
+        let context = handle
+            .state
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .context_summary();
 
         // Mark collected on any terminal read so the reaper knows it's safe to GC.
         let already_collected = handle.is_collected();
@@ -190,6 +200,10 @@ impl Tool for SubagentCollectTool {
             "authorization": authorization,
             "collected": already_collected,
         });
+        // Present only once the worker's context has rolled over.
+        if let Some(context) = context {
+            body["context"] = context;
+        }
         if !reconciled_now && ctx.capabilities.orchestration.is_some() {
             // Nudge stragglers: an unreconciled terminal read leaves the
             // completion gate blocked and forces a second collect. The
