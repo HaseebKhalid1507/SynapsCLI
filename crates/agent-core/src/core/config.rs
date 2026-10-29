@@ -762,6 +762,21 @@ pub const DEFAULT_REQUEST_COMPRESSION_LEVEL: u32 = 1;
 /// 6 the body barely shrinks further.
 pub const MAX_REQUEST_COMPRESSION_LEVEL: u32 = 9;
 
+/// Default for `tool_output_spill_bytes`: a tool result bigger than this is
+/// stored whole in a spill file and model history gets a head + tail
+/// preview pointing at it. 12 KiB is about 3k tokens. Below it the preview
+/// (head + tail + pointer, ~7.3 KiB) saves too little to be worth a second
+/// look when the model does need the middle; above it every result saves at
+/// least ~4.5 KiB on every later request, and the 22-26 KB results that
+/// were re-read hundreds of times shrink by ~70%.
+pub const DEFAULT_TOOL_OUTPUT_SPILL_BYTES: usize = 12 * 1024;
+/// Default for `tool_output_spill_head_bytes`: the start of a virtualised
+/// result kept in history (the command echo, headers, the first errors).
+pub const DEFAULT_TOOL_OUTPUT_SPILL_HEAD_BYTES: usize = 4 * 1024;
+/// Default for `tool_output_spill_tail_bytes`: the end of a virtualised
+/// result kept in history (exit status, summaries, the last errors).
+pub const DEFAULT_TOOL_OUTPUT_SPILL_TAIL_BYTES: usize = 3 * 1024;
+
 /// `tools.activation_confirm` — host policy for model-initiated
 /// `activate_tools` (progressive tool disclosure).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1258,6 +1273,21 @@ pub struct SynapsConfig {
     /// Content classes excluded from remote compaction disclosure.
     pub compaction_exclude: Vec<crate::core::compaction::ContentClass>,
     pub max_tool_output: usize,  // default 30000
+    /// Tool output virtualisation: a text tool result bigger than this many
+    /// bytes is stored whole in a spill file (`<base>/spill/<session>/`) and
+    /// model history gets a head + tail preview with a pointer to it. `0`
+    /// turns it off: results go into history exactly as before (cut at
+    /// `max_tool_output`). (`tool_output_spill_bytes`, default
+    /// [`DEFAULT_TOOL_OUTPUT_SPILL_BYTES`].)
+    pub tool_output_spill_bytes: usize,
+    /// Bytes from the start of a virtualised result kept in history
+    /// (`tool_output_spill_head_bytes`, default
+    /// [`DEFAULT_TOOL_OUTPUT_SPILL_HEAD_BYTES`]).
+    pub tool_output_spill_head_bytes: usize,
+    /// Bytes from the end of a virtualised result kept in history
+    /// (`tool_output_spill_tail_bytes`, default
+    /// [`DEFAULT_TOOL_OUTPUT_SPILL_TAIL_BYTES`]).
+    pub tool_output_spill_tail_bytes: usize,
     pub bash_timeout: u64,       // default 30
     pub bash_max_timeout: u64,   // default 300
     pub subagent_timeout: u64,   // default 300
@@ -1386,6 +1416,9 @@ impl Default for SynapsConfig {
             compaction_mode: crate::core::compaction::CompactionMode::default(),
             compaction_exclude: Vec::new(),
             max_tool_output: 30000,
+            tool_output_spill_bytes: DEFAULT_TOOL_OUTPUT_SPILL_BYTES,
+            tool_output_spill_head_bytes: DEFAULT_TOOL_OUTPUT_SPILL_HEAD_BYTES,
+            tool_output_spill_tail_bytes: DEFAULT_TOOL_OUTPUT_SPILL_TAIL_BYTES,
             bash_timeout: 30,
             bash_max_timeout: 300,
             subagent_timeout: 300,
@@ -1460,6 +1493,9 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "daemon.prompt_abandon_secs",
     "daemon.parked_evict_secs",
     "max_tool_output",
+    "tool_output_spill_bytes",
+    "tool_output_spill_head_bytes",
+    "tool_output_spill_tail_bytes",
     "bash_timeout",
     "bash_max_timeout",
     "subagent_timeout",
@@ -1982,6 +2018,24 @@ fn apply_config_content_with(
                 Err(_) => config.warnings.push(format!(
                     "max_tool_output = {val} — not a number; using {}",
                     config.max_tool_output
+                )),
+            },
+            "tool_output_spill_bytes" => match val.parse::<usize>() {
+                Ok(bytes) => config.tool_output_spill_bytes = bytes,
+                Err(_) => config.warnings.push(format!(
+                    "tool_output_spill_bytes = {val} — expected a byte count (0 turns virtualisation off); using {DEFAULT_TOOL_OUTPUT_SPILL_BYTES}"
+                )),
+            },
+            "tool_output_spill_head_bytes" => match val.parse::<usize>() {
+                Ok(bytes) => config.tool_output_spill_head_bytes = bytes,
+                Err(_) => config.warnings.push(format!(
+                    "tool_output_spill_head_bytes = {val} — expected a byte count; using {DEFAULT_TOOL_OUTPUT_SPILL_HEAD_BYTES}"
+                )),
+            },
+            "tool_output_spill_tail_bytes" => match val.parse::<usize>() {
+                Ok(bytes) => config.tool_output_spill_tail_bytes = bytes,
+                Err(_) => config.warnings.push(format!(
+                    "tool_output_spill_tail_bytes = {val} — expected a byte count; using {DEFAULT_TOOL_OUTPUT_SPILL_TAIL_BYTES}"
                 )),
             },
             "bash_timeout" => match val.parse::<u64>() {
@@ -3913,6 +3967,49 @@ mod tests {
         assert!(config.bridge.uds_path.is_none());
         assert!(!config.bridge.heartbeat_mirror);
         assert_eq!(config.bridge.heartbeat_timeout_ms, 250);
+    }
+
+    #[test]
+    fn tool_output_spill_keys_parse_defaults_and_warn() {
+        let c = super::load_config_from_str("");
+        assert_eq!(c.tool_output_spill_bytes, 12 * 1024);
+        assert_eq!(c.tool_output_spill_head_bytes, 4 * 1024);
+        assert_eq!(c.tool_output_spill_tail_bytes, 3 * 1024);
+        let d = super::SynapsConfig::default();
+        assert_eq!(d.tool_output_spill_bytes, super::DEFAULT_TOOL_OUTPUT_SPILL_BYTES);
+        assert_eq!(d.tool_output_spill_head_bytes, super::DEFAULT_TOOL_OUTPUT_SPILL_HEAD_BYTES);
+        assert_eq!(d.tool_output_spill_tail_bytes, super::DEFAULT_TOOL_OUTPUT_SPILL_TAIL_BYTES);
+
+        let c = super::load_config_from_str(concat!(
+            "tool_output_spill_bytes = 20000\n",
+            "tool_output_spill_head_bytes = 6000\n",
+            "tool_output_spill_tail_bytes = 0\n",
+        ));
+        assert_eq!(c.tool_output_spill_bytes, 20_000);
+        assert_eq!(c.tool_output_spill_head_bytes, 6_000);
+        assert_eq!(c.tool_output_spill_tail_bytes, 0, "a head-only preview is allowed");
+        assert!(c.warnings.is_empty(), "warnings: {:?}", c.warnings);
+
+        let c = super::load_config_from_str("tool_output_spill_bytes = 0\n");
+        assert_eq!(c.tool_output_spill_bytes, 0, "0 turns virtualisation off");
+        assert!(c.warnings.is_empty(), "warnings: {:?}", c.warnings);
+
+        for key in [
+            "tool_output_spill_bytes",
+            "tool_output_spill_head_bytes",
+            "tool_output_spill_tail_bytes",
+        ] {
+            let c = super::load_config_from_str(&format!("{key} = lots\n"));
+            assert_eq!(c.tool_output_spill_bytes, super::DEFAULT_TOOL_OUTPUT_SPILL_BYTES);
+            assert_eq!(c.tool_output_spill_head_bytes, super::DEFAULT_TOOL_OUTPUT_SPILL_HEAD_BYTES);
+            assert_eq!(c.tool_output_spill_tail_bytes, super::DEFAULT_TOOL_OUTPUT_SPILL_TAIL_BYTES);
+            assert!(
+                c.warnings.iter().any(|w| w.contains(key)),
+                "{key}: warnings: {:?}",
+                c.warnings
+            );
+            assert!(super::KNOWN_CONFIG_KEYS.contains(&key));
+        }
     }
 
     #[test]
