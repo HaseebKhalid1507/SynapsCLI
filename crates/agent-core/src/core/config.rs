@@ -4802,6 +4802,12 @@ api_retries = 5
         assert!(!cfg.auth.accounts.contains_key("acount.anthropic"));
     }
 
+    /// An absolute path on this platform: `/opt/axel` has no drive on Windows.
+    #[cfg(windows)]
+    const ABSOLUTE_SAMPLE_PATH: &str = r"C:\opt\axel";
+    #[cfg(not(windows))]
+    const ABSOLUTE_SAMPLE_PATH: &str = "/opt/axel";
+
     /// Every listed family key is accepted by its parser for some value
     /// (catches a typo in `FAMILY_CONFIG_KEYS`).
     #[test]
@@ -4815,7 +4821,7 @@ api_retries = 5
                 "memory.capture_tools" => "summary_only",
                 "memory.capture_assistant" | "memory.capture_user" => "on",
                 "memory.auto_consolidate" | "memory.local_embeddings" | "memory.gliner" => "off",
-                "memory.axel.executable" | "memory.axel.brain" => "/opt/axel",
+                "memory.axel.executable" | "memory.axel.brain" => ABSOLUTE_SAMPLE_PATH,
                 "events.auto_turn" => "on",
                 "server.allowed_origins" | "server.token" => "x",
                 "server.auto_approve_confirms" | "bridge.heartbeat_mirror" => "false",
@@ -4843,7 +4849,7 @@ api_retries = 5
             assert!(validate_config_edit("cache_ttl", "2h").is_err());
             assert!(validate_config_edit("shell.max_output", "big").is_err());
             assert!(validate_config_edit("memory.axel.brain", "relative/brain").is_err());
-            assert!(validate_config_edit("memory.axel.brain", "/abs/brain.r8").is_ok());
+            assert!(validate_config_edit("memory.axel.brain", ABSOLUTE_SAMPLE_PATH).is_ok());
             assert!(validate_config_edit("model", "a\nb").is_err());
 
             // Cross-key rules see the rest of the file.
