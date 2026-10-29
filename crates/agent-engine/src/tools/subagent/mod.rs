@@ -149,6 +149,11 @@ pub(crate) fn apply_subagent_runtime_policy(
         runtime.inherit_telemetry(parent);
     }
     runtime.apply_retry_config(config);
+    // Tool output virtualisation: a worker spills big results into its own
+    // dir (keyed by its runtime session) and can `read`/`grep` them back.
+    runtime.set_tool_spill_policy(crate::runtime::tool_spill::ToolSpillPolicy::from_config(
+        config,
+    ));
 
     // Credential source / token cache: host-built workers already share the
     // process-wide broker (`spawn_runtime`); only the legacy fresh-runtime
@@ -504,6 +509,29 @@ mod cache_ttl_policy_tests {
             runtime.codex_request_role(),
             crate::runtime::openai::catalog::CodexRequestRole::Worker
         );
+    }
+
+    /// Workers virtualise big tool results like the foreground, into a dir
+    /// of their own (keyed by the worker's runtime trace session, since a
+    /// worker has no conversation id), under the bound `<base>/spill`.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn subagent_policy_turns_on_tool_output_virtualisation_from_config() {
+        let base = crate::test_env::BaseDirGuard::new();
+        let mut runtime = crate::Runtime::new_headless();
+        assert!(!runtime.tool_spill_policy().is_enabled(), "off until configured");
+        let config = agent_core::config::load_config_from_str("tool_output_spill_bytes = 20000\n");
+        apply_subagent_runtime_policy(&mut runtime, &config, None, None, None, &Default::default());
+        assert_eq!(runtime.tool_spill_policy().threshold_bytes, 20_000);
+        let spill = runtime.tool_spill();
+        let dir = spill.dir().expect("a worker gets its own spill dir");
+        assert_eq!(dir.parent(), Some(base.path().join("spill").as_path()));
+        let key = dir.file_name().unwrap().to_str().unwrap();
+        assert!(key.starts_with("session-"), "keyed by the runtime trace session: {key}");
+        // `0` keeps a worker on the legacy path.
+        let off = agent_core::config::load_config_from_str("tool_output_spill_bytes = 0\n");
+        apply_subagent_runtime_policy(&mut runtime, &off, None, None, None, &Default::default());
+        assert!(!runtime.tool_spill().is_enabled());
     }
 
     /// Task A5 memory-context invariant: subagents never inherit a memory
