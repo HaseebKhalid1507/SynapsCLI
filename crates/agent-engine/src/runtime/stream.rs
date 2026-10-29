@@ -496,28 +496,35 @@ fn guard_extension_context(content: &str) -> String {
     format!("{EXTENSION_CONTEXT_OPEN}\n{content}\n{EXTENSION_CONTEXT_CLOSE}")
 }
 
-/// True when `block` is a per-turn ephemeral extension-context block produced
-/// by [`attach_turn_context`] (a `text` block carrying the guard framing).
+/// True when `block` is a request-only `text` block: either a per-turn
+/// extension-context block produced by [`attach_turn_context`] (guard
+/// framing) or a host context advisory (`ContextAdvisory::message`, appended
+/// as its own user message for one request and folded into the newest user
+/// message by the sanitize adjacency merge).
 ///
 /// Used by `annotate_cache_breakpoint` to keep the conversational cache
-/// marker on DURABLE bytes: the injected block exists only in the request it
-/// was built for (never in durable history, never on tool_result rounds), so
-/// a cache entry terminating in it could never be matched by any later
-/// request. The marker must land on the last durable block and the ephemeral
-/// block must ride after it as an uncached tail.
+/// marker on DURABLE bytes: both kinds exist only in the request they were
+/// built for (never in durable history; extension context never rides
+/// tool_result rounds, an advisory fires once per state transition), so a
+/// cache entry terminating in one could never be matched by any later
+/// request. The marker must land on the last durable block and these blocks
+/// must ride after it as an uncached tail. Before advisories were recognised
+/// here the marker landed ON the advisory, and on a cold cache (the advisory
+/// re-fires after every daemon reload) the whole prefix was written twice.
 ///
-/// Detection is by the guard framing bytes, which are single-sourced in
-/// [`guard_extension_context`]. A durable user block that happens to carry
-/// the exact framing would merely shift the marker one block earlier —
-/// harmless (the cacheable prefix shortens by one block; no correctness
-/// impact).
+/// Detection is by framing bytes, single-sourced in
+/// [`guard_extension_context`] and `continuation::ADVISORY_PREFIX`. A durable
+/// user block that happens to carry the exact framing would merely shift the
+/// marker one block earlier — harmless (the cacheable prefix shortens by one
+/// block; no correctness impact).
 pub(super) fn is_ephemeral_turn_context_block(block: &Value) -> bool {
     if block["type"].as_str() != Some("text") {
         return false;
     }
     block["text"].as_str().is_some_and(|text| {
         let text = text.trim_start();
-        text.starts_with(EXTENSION_CONTEXT_OPEN) && text.ends_with(EXTENSION_CONTEXT_CLOSE)
+        (text.starts_with(EXTENSION_CONTEXT_OPEN) && text.ends_with(EXTENSION_CONTEXT_CLOSE))
+            || super::continuation::is_advisory_text(text)
     })
 }
 
@@ -3282,6 +3289,267 @@ mod tests {
             history_tail_bytes(&req).is_empty(),
             "an injected turn must not report the whole history as recomputed tail"
         );
+    }
+
+    // ── request-only context advisory vs the cache marker ──────────────────
+
+    use super::super::continuation::{ContextAdvisory, ADVISORY_PREFIX};
+    use crate::runtime::helpers::{cache_control_value, MarkerSite};
+
+    const ADVISORIES: [ContextAdvisory; 4] = [
+        ContextAdvisory::Pressure,
+        ContextAdvisory::FinishBounded,
+        ContextAdvisory::WorkersPending,
+        ContextAdvisory::Unproductive,
+    ];
+
+    /// The outgoing request exactly as the stream loop and the native
+    /// transport assemble it: optional per-turn extension context on the
+    /// newest user message, the advisory chained as its own user message,
+    /// then the transport's sanitize (adjacency merge) and tail marker.
+    fn assemble(
+        history: &[SharedMessage],
+        context: Option<&str>,
+        advisory: Option<ContextAdvisory>,
+        ttl: CacheTtl,
+    ) -> Vec<SharedMessage> {
+        let mut out = match context {
+            Some(context) => attach_turn_context(history, &guard_extension_context(context)),
+            None => history.to_vec(),
+        };
+        if let Some(advisory) = advisory {
+            out.push(user_msg(json!(advisory.message())));
+        }
+        HelperMethods::sanitize_thinking_blocks(&mut out);
+        HelperMethods::annotate_cache_breakpoint(&mut out, ttl);
+        out
+    }
+
+    /// Every content block in wire order as `(message, block, block value)`,
+    /// string content read as its single text block (equivalent on the wire).
+    fn wire_blocks(messages: &[SharedMessage]) -> Vec<(usize, usize, Value)> {
+        let mut out = Vec::new();
+        for (m, message) in messages.iter().enumerate() {
+            let blocks = match &message["content"] {
+                Value::String(text) => vec![json!({"type": "text", "text": text})],
+                Value::Array(blocks) => blocks.clone(),
+                _ => Vec::new(),
+            };
+            out.extend(blocks.into_iter().enumerate().map(|(b, v)| (m, b, v)));
+        }
+        out
+    }
+
+    fn markers(messages: &[SharedMessage]) -> Vec<(usize, usize)> {
+        wire_blocks(messages)
+            .into_iter()
+            .filter(|(_, _, block)| block.get("cache_control").is_some())
+            .map(|(m, b, _)| (m, b))
+            .collect()
+    }
+
+    #[test]
+    fn advisory_texts_share_one_prefix_and_are_request_only() {
+        for advisory in ADVISORIES {
+            let text = advisory.message();
+            assert!(text.starts_with(ADVISORY_PREFIX), "{advisory:?}");
+            assert!(
+                text[ADVISORY_PREFIX.len()..].starts_with(' '),
+                "{advisory:?}"
+            );
+            assert!(is_ephemeral_turn_context_block(
+                &json!({"type": "text", "text": text})
+            ));
+        }
+        // The framing alone is not enough on a non-text block.
+        assert!(!is_ephemeral_turn_context_block(
+            &json!({"type": "tool_result", "tool_use_id": "t", "content": ADVISORY_PREFIX})
+        ));
+        assert!(!is_ephemeral_turn_context_block(
+            &json!({"type": "text", "text": "hello"})
+        ));
+        // The texts are byte-identical to the ones in the request trace: the
+        // marked tail block of the affected requests was exactly 491 bytes
+        // (Pressure) and 514 bytes (WorkersPending) under a 1h marker.
+        let wire = |advisory: ContextAdvisory| {
+            serde_json::to_string(&json!({
+                "type": "text",
+                "text": advisory.message(),
+                "cache_control": {"type": "ephemeral", "ttl": "1h"}
+            }))
+            .unwrap()
+            .len()
+        };
+        assert_eq!(wire(ContextAdvisory::Pressure), 491);
+        assert_eq!(wire(ContextAdvisory::WorkersPending), 514);
+    }
+
+    #[test]
+    fn advisory_merged_into_last_user_message_leaves_marker_on_durable_text() {
+        let durable = || [json!("hello"), json!([{"type": "text", "text": "hello"}])];
+        for ttl in [CacheTtl::FiveMinutes, CacheTtl::OneHour, CacheTtl::Hybrid] {
+            for advisory in ADVISORIES {
+                for content in durable() {
+                    for context in [None, Some("turn ctx")] {
+                        let history = vec![
+                            user_msg(json!("q")),
+                            assistant_msg("a"),
+                            user_msg(content.clone()),
+                        ];
+                        let req = assemble(&history, context, Some(advisory), ttl);
+                        let case = format!("{ttl:?} {advisory:?} {content} {context:?}");
+                        // Precondition: the merge folded the advisory into the
+                        // newest user message as its trailing block.
+                        assert_eq!(req.len(), 3, "{case}");
+                        let blocks = req[2]["content"].as_array().unwrap();
+                        assert_eq!(blocks.len(), 2 + usize::from(context.is_some()), "{case}");
+                        assert_eq!(blocks.last().unwrap()["text"], advisory.message(), "{case}");
+                        // The marker is on the durable text, the only marker in
+                        // the messages, with nothing marked after it.
+                        assert_eq!(blocks[0]["text"], "hello", "{case}");
+                        assert_eq!(
+                            blocks[0]["cache_control"],
+                            cache_control_value(ttl, MarkerSite::MessageTail),
+                            "{case}"
+                        );
+                        assert_eq!(markers(&req), [(2, 0)], "{case}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn advisory_on_a_tool_result_round_leaves_marker_on_the_tool_result() {
+        let history = vec![
+            user_msg(json!("q")),
+            Arc::new(json!({"role": "assistant", "content": [
+                {"type": "tool_use", "id": "tu_1", "name": "bash", "input": {}}
+            ]})),
+            user_msg(json!([{"type": "tool_result", "tool_use_id": "tu_1", "content": "ok"}])),
+        ];
+        let req = assemble(
+            &history,
+            None,
+            Some(ContextAdvisory::WorkersPending),
+            CacheTtl::OneHour,
+        );
+        assert_eq!(req[2]["content"][0]["type"], "tool_result");
+        assert_eq!(markers(&req), [(2, 0)]);
+    }
+
+    #[test]
+    fn marker_walks_back_when_the_last_message_has_no_durable_block() {
+        let ttl = CacheTtl::FiveMinutes;
+        // An advisory-only user message (a request ending in an assistant
+        // message), and an empty user text plus an advisory, which the merge
+        // reduces to the advisory alone: the marker lands on the previous
+        // assistant reply instead of being dropped.
+        for history in [
+            vec![user_msg(json!("q")), assistant_msg("a")],
+            vec![
+                user_msg(json!("q")),
+                assistant_msg("a"),
+                user_msg(json!("")),
+            ],
+        ] {
+            let req = assemble(&history, None, Some(ContextAdvisory::Pressure), ttl);
+            assert_eq!(req.len(), 3);
+            assert_eq!(
+                req[2]["content"],
+                json!([{"type": "text", "text": ContextAdvisory::Pressure.message()}])
+            );
+            assert_eq!(markers(&req), [(1, 0)]);
+            // Only the target message is cloned; the first stays shared.
+            assert!(Arc::ptr_eq(&req[0], &history[0]));
+        }
+        // The walk-back skips thinking, redacted thinking, empty text and
+        // request-only text, and can reach string content.
+        let mut req = vec![
+            user_msg(json!("q")),
+            Arc::new(json!({"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "t", "signature": "s"},
+                {"type": "redacted_thinking", "data": "d"},
+                {"type": "text", "text": ""}
+            ]})),
+            user_msg(json!([
+                {"type": "text", "text": guard_extension_context("ctx")},
+                {"type": "text", "text": ContextAdvisory::Unproductive.message()}
+            ])),
+        ];
+        HelperMethods::annotate_cache_breakpoint(&mut req, ttl);
+        assert_eq!(markers(&req), [(0, 0)]);
+        let marked_q = json!({
+            "type": "text",
+            "text": "q",
+            "cache_control": cache_control_value(ttl, MarkerSite::MessageTail)
+        });
+        assert_eq!(req[0]["content"], json!([marked_q]));
+        // Nothing markable anywhere: no marker, no panic.
+        let mut req = vec![user_msg(json!(ContextAdvisory::Pressure.message()))];
+        HelperMethods::annotate_cache_breakpoint(&mut req, ttl);
+        assert!(markers(&req).is_empty());
+        HelperMethods::annotate_cache_breakpoint(&mut [], ttl);
+    }
+
+    #[test]
+    fn advisory_turn_cache_entry_is_a_prefix_of_the_next_request() {
+        // The cold double write: request N carried an advisory and its marker
+        // sat ON the advisory, so N's cache entry ended in bytes no later
+        // request sends and N+1 wrote the whole prefix again. Every block up
+        // to and including N's marked block must recur unchanged, in the same
+        // position, in N+1.
+        for ttl in [CacheTtl::FiveMinutes, CacheTtl::OneHour, CacheTtl::Hybrid] {
+            for advisory in ADVISORIES {
+                let history = vec![
+                    user_msg(json!("q")),
+                    assistant_msg("a"),
+                    user_msg(json!("durable text")),
+                ];
+                let req_n = assemble(&history, Some("turn ctx"), Some(advisory), ttl);
+
+                let mut next = history.clone();
+                next.push(Arc::new(json!({"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "tu_1", "name": "bash", "input": {}}
+                ]})));
+                next.push(user_msg(json!([
+                    {"type": "tool_result", "tool_use_id": "tu_1", "content": "ok"}
+                ])));
+                // Round 2 of the turn: the extension hook does not re-fire and
+                // the edge-triggered advisory is not repeated.
+                let req_next = assemble(&next, None, None, ttl);
+
+                let case = format!("{ttl:?} {advisory:?}");
+                let [(marked_message, marked_block)] = markers(&req_n)[..] else {
+                    panic!("{case}: request N must carry exactly one tail marker");
+                };
+                let strip = |mut block: Value| {
+                    if let Some(obj) = block.as_object_mut() {
+                        obj.remove("cache_control");
+                    }
+                    block
+                };
+                let entry: Vec<_> = wire_blocks(&req_n)
+                    .into_iter()
+                    .take_while(|(m, b, _)| (*m, *b) <= (marked_message, marked_block))
+                    .map(|(m, b, v)| (m, b, req_n[m]["role"].clone(), strip(v)))
+                    .collect();
+                assert_eq!(
+                    entry.last().unwrap().3,
+                    json!({"type": "text", "text": "durable text"}),
+                    "{case}: N's entry must end on the durable user text"
+                );
+                let next_blocks: Vec<_> = wire_blocks(&req_next)
+                    .into_iter()
+                    .map(|(m, b, v)| (m, b, req_next[m]["role"].clone(), strip(v)))
+                    .collect();
+                assert!(
+                    next_blocks.len() > entry.len(),
+                    "{case}: N+1 must extend N's entry"
+                );
+                assert_eq!(entry[..], next_blocks[..entry.len()], "{case}");
+            }
+        }
     }
 }
 

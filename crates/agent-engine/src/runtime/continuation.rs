@@ -34,6 +34,29 @@ pub(crate) const ADVISORY_RESERVE_TOKENS: u64 = 512;
 /// (incident 2026-10-13). Hard capacity never waits at all.
 pub(crate) const WORKER_ROLLOVER_GRACE_ROUNDS: u32 = 4;
 
+/// Framing of every request-only context advisory: the single source of the
+/// bytes `advisory!` prefixes onto each [`ContextAdvisory::message`] text and
+/// [`is_advisory_text`] recognises (macros so the texts stay `&'static str`).
+macro_rules! advisory_prefix {
+    () => {
+        "[Host context advisory, not a new user request]"
+    };
+}
+macro_rules! advisory {
+    ($body:literal) => {
+        concat!(advisory_prefix!(), " ", $body)
+    };
+}
+pub(super) const ADVISORY_PREFIX: &str = advisory_prefix!();
+
+/// True when `text` is a request-only context advisory. The advisory exists
+/// only in the one request it rides (it is never persisted), so it must never
+/// carry the conversational cache marker: see
+/// `stream::is_ephemeral_turn_context_block`.
+pub(super) fn is_advisory_text(text: &str) -> bool {
+    text.trim_start().starts_with(ADVISORY_PREFIX)
+}
+
 /// Model guidance and UI notices are edge-triggered by the CURRENT assessment,
 /// never by the presence of a sticky string left by an earlier warning.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -60,10 +83,10 @@ impl ContextAdvisory {
 
     pub(super) fn message(self) -> &'static str {
         match self {
-            Self::Pressure => "[Host context advisory, not a new user request] Context is approaching the rollover threshold. Continue current authorized work. At the next substantial task boundary, report the next phase using context_checkpoint alone; include only a brief note if unfinished state would otherwise be lost. No summary, new spec, or archive reread is needed just for context management. The host handles rollover and capacity checks.",
-            Self::FinishBounded => "[Host context advisory, not a new user request] Context rollover is due. Finish the current bounded step; do not expand the task. If needed, leave a brief unfinished-state note with context_checkpoint alone. Do not spend the remaining rounds summarizing or re-reading completed work. The host enforces the remaining allowance and capacity.",
-            Self::WorkersPending => "[Host context advisory, not a new user request] Context rollover is waiting briefly for pending workers. Collect any finished worker now (subagent_collect with reconciled=true) and do not start new workers or large work. If workers are still pending after a few rounds, the host rolls over anyway and lists them in the next window. Do not create a summary or repeatedly checkpoint to force rollover. Capacity and permissions remain enforced.",
-            Self::Unproductive => "[Host context advisory, not a new user request] A rollover currently cannot reduce retained history. Continue remaining authorized work; do not repeat context_checkpoint merely to force rollover. Do not summarize or re-read completed work just for context management. The host will reassess automatically. Capacity, permissions, and all budgets remain enforced.",
+            Self::Pressure => advisory!("Context is approaching the rollover threshold. Continue current authorized work. At the next substantial task boundary, report the next phase using context_checkpoint alone; include only a brief note if unfinished state would otherwise be lost. No summary, new spec, or archive reread is needed just for context management. The host handles rollover and capacity checks."),
+            Self::FinishBounded => advisory!("Context rollover is due. Finish the current bounded step; do not expand the task. If needed, leave a brief unfinished-state note with context_checkpoint alone. Do not spend the remaining rounds summarizing or re-reading completed work. The host enforces the remaining allowance and capacity."),
+            Self::WorkersPending => advisory!("Context rollover is waiting briefly for pending workers. Collect any finished worker now (subagent_collect with reconciled=true) and do not start new workers or large work. If workers are still pending after a few rounds, the host rolls over anyway and lists them in the next window. Do not create a summary or repeatedly checkpoint to force rollover. Capacity and permissions remain enforced."),
+            Self::Unproductive => advisory!("A rollover currently cannot reduce retained history. Continue remaining authorized work; do not repeat context_checkpoint merely to force rollover. Do not summarize or re-read completed work just for context management. The host will reassess automatically. Capacity, permissions, and all budgets remain enforced."),
         }
     }
 
