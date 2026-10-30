@@ -257,12 +257,39 @@ pub struct ContextAssessment {
     pub breakdown: ContextBreakdown,
     pub reserves: ContextReserves,
     pub history_messages: usize,
+    /// Footprint measured from the provider's count of an earlier request
+    /// this one extends ([`UsageAnchor`]); `None` = estimate only.
+    pub anchored_tokens: Option<u64>,
 }
 
 impl ContextAssessment {
-    /// Total conservative usage across every request segment.
+    /// The request's footprint: anchored to the provider's last reported
+    /// input when this request extends that one, otherwise the estimate.
     pub fn used_tokens(&self) -> u64 {
+        self.anchored_tokens
+            .unwrap_or_else(|| self.estimated_tokens())
+    }
+
+    /// Conservative estimate across every request segment, whether or not
+    /// an anchor applies. Calibration samples and the fixed-part overhead
+    /// of successor sizing are in these units.
+    pub fn estimated_tokens(&self) -> u64 {
         self.breakdown.total()
+    }
+
+    /// The estimate of the request's fixed part: system, tool schemas,
+    /// skills and memory (everything but the messages and their framing).
+    pub fn fixed_tokens(&self) -> u64 {
+        let b = &self.breakdown;
+        b.total() - b.history_tokens - b.framing_tokens
+    }
+
+    /// Anchor this assessment to `anchor` when `messages` (the messages it
+    /// assessed) extend the anchored request's verbatim.
+    pub fn anchored(mut self, anchor: Option<&UsageAnchor>, messages: &[SharedMessage]) -> Self {
+        self.anchored_tokens =
+            anchor.and_then(|a| a.footprint(self.fixed_tokens(), messages));
+        self
     }
 
     /// Tokens the context may occupy after all reserves: window minus
@@ -359,10 +386,58 @@ pub fn assess(inputs: &ContextBudgetInputs<'_>) -> ContextAssessment {
             }
         },
         history_messages: inputs.messages.len(),
+        anchored_tokens: None,
     }
 }
 
-fn estimate_serialized(estimator: &TokenEstimator, value: &Value) -> u64 {
+/// The provider-reported input of one request (`input + cache_read +
+/// cache_write`), kept to measure the requests that follow it.
+///
+/// The estimator cannot know what the provider bills: a thinking block's
+/// signature carries reasoning the visible (summarized) text does not show,
+/// and how much of earlier turns' reasoning bills varies by request. The
+/// provider's count is exact, so the next request is measured as that count
+/// plus an estimate of only what was appended since. Requests that rewrite
+/// the history (rollover, compaction, a changed image view) do not extend
+/// the anchored one and fall back to the estimate.
+#[derive(Clone, Debug)]
+pub struct UsageAnchor {
+    pub provider_tokens: u64,
+    /// Estimate of the anchored request's fixed part
+    /// ([`ContextAssessment::fixed_tokens`]).
+    pub fixed_tokens: u64,
+    /// The anchored request's messages as they were assessed.
+    pub messages: Vec<SharedMessage>,
+}
+
+impl UsageAnchor {
+    /// Footprint of a request with fixed part `fixed_tokens` (estimated) and
+    /// `messages`: the provider's count plus the estimate of every message
+    /// past the ones the two requests share, or `None` when they diverge
+    /// before the anchored request's last message.
+    ///
+    /// The last anchored message may differ (a per-turn injection rides the
+    /// request tail and is not kept in history): what it billed stays
+    /// counted beside the estimate of its replacement. Growth of the fixed
+    /// part is added; neither it nor a shrink is ever subtracted (the
+    /// estimate of what left may exceed what it billed). Every deviation
+    /// therefore errs high, never below the provider's count.
+    pub fn footprint(&self, fixed_tokens: u64, messages: &[SharedMessage]) -> Option<u64> {
+        let shared = self
+            .messages
+            .iter()
+            .zip(messages)
+            .take_while(|(a, b)| super::continuation::same_on_wire(a, b))
+            .count();
+        (shared + 1 >= self.messages.len()).then(|| {
+            self.provider_tokens
+                .saturating_add(estimate_history(&messages[shared..]))
+                .saturating_add(fixed_tokens.saturating_sub(self.fixed_tokens))
+        })
+    }
+}
+
+fn estimate_serialized<T: serde::Serialize + ?Sized>(estimator: &TokenEstimator, value: &T) -> u64 {
     match serde_json::to_string(value) {
         Ok(s) => estimator.estimate(&s),
         // Serialization of an in-memory Value cannot realistically fail;
@@ -371,10 +446,6 @@ fn estimate_serialized(estimator: &TokenEstimator, value: &Value) -> u64 {
     }
 }
 
-/// Like `estimate_serialized` but charges base64 image blocks at a flat
-/// `IMAGE_TOKEN_ESTIMATE` instead of by payload length. Walks
-/// `content[]` and nested `tool_result.content[]`; every other block is
-/// still charged on its serialized form.
 /// Attachment-aware history estimate shared with rollover's reduction check.
 /// Does not charge megabytes of image base64 as ordinary prompt tokens.
 pub(crate) fn estimate_history(messages: &[SharedMessage]) -> u64 {
@@ -384,23 +455,36 @@ pub(crate) fn estimate_history(messages: &[SharedMessage]) -> u64 {
     })
 }
 
+/// One message as it goes on the wire: without its host-only `_synaps_*`
+/// keys (stripped before every provider request). Messages without base64
+/// images or reasoning blocks are charged on their serialized form; the
+/// others block by block, images at [`IMAGE_TOKEN_ESTIMATE`] and reasoning
+/// by [`estimate_reasoning_block`]. Nested `tool_result.content[]` images
+/// are charged flat too.
 fn estimate_message(estimator: &TokenEstimator, msg: &Value) -> u64 {
+    let wire = super::continuation::WireMessage(msg);
     let Some(blocks) = msg["content"].as_array() else {
-        return estimate_serialized(estimator, msg);
+        return estimate_serialized(estimator, &wire);
     };
-    // Zero drift for messages without images: charge exactly as before.
+    // Zero drift for messages without images or reasoning: charge exactly
+    // as before.
     if !blocks.iter().any(|b| {
         is_base64_image(b)
+            || is_reasoning_block(b)
             || b["content"]
                 .as_array()
                 .is_some_and(|a| a.iter().any(is_base64_image))
     }) {
-        return estimate_serialized(estimator, msg);
+        return estimate_serialized(estimator, &wire);
     }
     let mut total = 0u64;
     for block in blocks {
         if is_base64_image(block) {
             total += IMAGE_TOKEN_ESTIMATE;
+            continue;
+        }
+        if is_reasoning_block(block) {
+            total += estimate_reasoning_block(estimator, block);
             continue;
         }
         if block["type"] == "tool_result" {
@@ -419,6 +503,44 @@ fn estimate_message(estimator: &TokenEstimator, msg: &Value) -> u64 {
         total += estimate_serialized(estimator, block);
     }
     total
+}
+
+/// Base64 signature (or `redacted_thinking` data) characters per estimated
+/// token. See [`estimate_reasoning_block`].
+const REASONING_SIGNATURE_CHARS_PER_TOKEN: u64 = 4;
+
+/// Block keys and delimiters of a reasoning block.
+const REASONING_BLOCK_FRAMING_TOKENS: u64 = 8;
+
+fn is_reasoning_block(b: &Value) -> bool {
+    b["type"] == "thinking" || b["type"] == "redacted_thinking"
+}
+
+/// A `thinking` / `redacted_thinking` block, charged at the larger of its
+/// visible text (conservative estimate) and one token per
+/// [`REASONING_SIGNATURE_CHARS_PER_TOKEN`] signature characters, plus
+/// framing.
+///
+/// The signature is opaque base64 that carries the full reasoning. The
+/// visible text is a summary (`display: "summarized"`) or empty. Neither is
+/// billed as text. Charging the serialized block at 2.5 characters per
+/// token billed the signature as text on top of its summary, about 2.4×
+/// what the provider bills for the block, which read xhigh-reasoning
+/// histories at 1.3–2× their billed input and rolled workers over at about
+/// half the configured size. Measured against Anthropic's billed input
+/// (Opus, 2026-10): appended reasoning blocks bill a median of ~0.17 tokens
+/// per serialized byte of the block (10th–90th percentile 0.11–0.22). This
+/// charge (0.25 per signature character, the signature being most of the
+/// block) sits near the top of that range. Some requests bill earlier
+/// reasoning lower still, which the estimator cannot see; the
+/// provider-anchored footprint ([`UsageAnchor`]) measures those.
+fn estimate_reasoning_block(estimator: &TokenEstimator, block: &Value) -> u64 {
+    let text = block["thinking"].as_str().map_or(0, |t| estimator.estimate(t));
+    let opaque = block["signature"]
+        .as_str()
+        .or_else(|| block["data"].as_str())
+        .map_or(0, |s| s.len() as u64 / REASONING_SIGNATURE_CHARS_PER_TOKEN);
+    text.max(opaque) + REASONING_BLOCK_FRAMING_TOKENS
 }
 
 fn is_base64_image(b: &Value) -> bool {
@@ -452,6 +574,253 @@ mod tests {
             "type": "image",
             "source": {"type": "base64", "media_type": "image/png", "data": "A".repeat(len)}
         })
+    }
+
+    /// A history rebuilt from a recorded block-shape fixture: block types
+    /// and lengths only (the estimator charges length, not content), no
+    /// content. Returns (fixed-part estimate, messages, billed input).
+    fn shape_fixture(json: &str) -> (u64, Vec<SharedMessage>, u64) {
+        let fixture: Value = serde_json::from_str(json).unwrap();
+        let n = |v: &Value| v.as_u64().unwrap() as usize;
+        let filler = |len: usize| "x".repeat(len);
+        let base64 = |len: usize| {
+            const B64: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            (0..len).map(|i| B64[(i * 7 + i / 64) % 64] as char).collect::<String>()
+        };
+        let messages = fixture["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| {
+                let role = m[0].as_str().unwrap();
+                let blocks = m[1].as_array().unwrap();
+                let content = match blocks[0][0].as_str().unwrap() {
+                    "s" => json!(filler(n(&blocks[0][1]))),
+                    _ => Value::Array(
+                        blocks
+                            .iter()
+                            .map(|b| match b[0].as_str().unwrap() {
+                                // Serialized length: `{"type":"text","text":""}` is 25.
+                                "b" => json!({"type": "text", "text": filler(n(&b[1]).saturating_sub(25))}),
+                                "k" => json!({
+                                    "type": "thinking",
+                                    "thinking": filler(n(&b[1])),
+                                    "signature": base64(n(&b[2])),
+                                }),
+                                "i" => image_block(1_000_000),
+                                other => panic!("block kind {other}"),
+                            })
+                            .collect(),
+                    ),
+                };
+                Arc::new(json!({"role": role, "content": content})) as SharedMessage
+            })
+            .collect();
+        let fixed = conservative_token_estimate(&filler(
+            n(&fixture["system_bytes"]) + n(&fixture["tool_schema_bytes"]),
+        ));
+        (fixed, messages, fixture["billed"].as_u64().unwrap())
+    }
+
+    /// Regression (worker rollover at about half the configured size): a
+    /// real xhigh-reasoning worker history (Opus, 279 messages, 84 signed
+    /// thinking blocks) the provider billed at 197,253 input tokens. The
+    /// estimate used to charge each thinking block's base64 signature as
+    /// text on top of its summary: 1.29× the billed count here, 1.3–2× on
+    /// other xhigh workers, so the 200k rollover fired near 150k real.
+    #[test]
+    fn xhigh_reasoning_history_estimate_tracks_its_billed_input() {
+        let (fixed, messages, billed) =
+            shape_fixture(include_str!("../../tests/fixtures/context_estimate/xhigh_worker_197k.json"));
+        assert_eq!(billed, 197_253);
+        assert!(messages.iter().any(|m| m["content"]
+            .as_array()
+            .is_some_and(|b| b.iter().any(|b| b["signature"].as_str().is_some_and(|s| s.len() > 1_000)))));
+        let estimate = fixed + estimate_history(&messages);
+        let ratio = estimate as f64 / billed as f64;
+        assert!((0.9..=1.1).contains(&ratio), "estimate {estimate} vs billed {billed}: {ratio:.3}");
+
+        // What the serialized charge (signature as text) read for it.
+        let serialized: u64 = messages
+            .iter()
+            .map(|m| {
+                estimate_serialized(&TokenEstimator::Conservative, &**m) + PER_MESSAGE_FRAMING_TOKENS
+            })
+            .sum();
+        let old = (fixed + serialized) as f64 / billed as f64;
+        assert!(old > 1.25, "the old charge read {old:.3}×");
+    }
+
+    #[test]
+    fn reasoning_blocks_charge_the_larger_of_text_and_signature() {
+        let block = |text: usize, sig: usize| {
+            json!({"type": "thinking", "thinking": "t".repeat(text), "signature": "S".repeat(sig)})
+        };
+        let one = |b: Value| {
+            estimate_history(&[Arc::new(json!({"role": "assistant", "content": [b]}))])
+                - PER_MESSAGE_FRAMING_TOKENS
+                - REASONING_BLOCK_FRAMING_TOKENS
+        };
+        // Summary longer than the signature: the text (2.5 chars/token).
+        assert_eq!(one(block(10_000, 4_000)), 4_000);
+        // Signature-dominated (omitted or short summary): 4 chars/token,
+        // never the serialized sum of both.
+        assert_eq!(one(block(0, 40_000)), 10_000);
+        assert_eq!(one(block(2_500, 40_000)), 10_000);
+        assert_eq!(
+            one(json!({"type": "redacted_thinking", "data": "D".repeat(8_000)})),
+            2_000
+        );
+        // Other blocks beside reasoning are still charged serialized.
+        let mixed = estimate_history(&[Arc::new(json!({"role": "assistant", "content": [
+            block(0, 400),
+            {"type": "text", "text": "a".repeat(2_500)},
+        ]}))]);
+        assert!((1_100..1_130).contains(&mixed), "{mixed}");
+    }
+
+    /// Host-only `_synaps_*` keys never reach the wire, so they are not
+    /// charged.
+    #[test]
+    fn host_only_keys_are_not_charged() {
+        let plain = json!({"role": "user", "content": "hello there"});
+        let mut stamped = plain.clone();
+        stamped["_synaps_at"] = json!("2026-10-30T11:00:00.000Z");
+        stamped["_synaps_turn"] = json!({"id": "x".repeat(400)});
+        assert_eq!(
+            estimate_history(&[Arc::new(stamped.clone())]),
+            estimate_history(&[Arc::new(plain)])
+        );
+        let mut reasoning = json!({"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "plan", "signature": "S".repeat(40)},
+        ]});
+        let bare = estimate_history(&[Arc::new(reasoning.clone())]);
+        reasoning["_synaps_turn"] = json!({"id": "x".repeat(400)});
+        assert_eq!(estimate_history(&[Arc::new(reasoning)]), bare);
+    }
+
+    fn msg(role: &str, text: &str) -> SharedMessage {
+        Arc::new(json!({"role": role, "content": text}))
+    }
+
+    fn assessment_of(system: &str, messages: &[SharedMessage]) -> ContextAssessment {
+        assess(&ContextBudgetInputs {
+            model: "claude-opus-5-5",
+            provider_window: 1_000_000,
+            system_prompt: Some(system),
+            tools_schema: &[],
+            messages,
+            skill_contents: &[],
+            memory_contents: &[],
+            thinking_budget_tokens: 0,
+            next_tool_result_bytes: 0,
+            max_output_tokens: 128_000,
+        })
+    }
+
+    /// The footprint of a request that extends an earlier one is the
+    /// provider's count of that one plus the estimate of only what was
+    /// appended since; the estimate of the shared part plays no role.
+    #[test]
+    fn footprint_is_anchored_to_the_last_reported_usage() {
+        let system = "s".repeat(2_500);
+        let earlier = vec![msg("user", "task"), msg("assistant", &"a".repeat(250_000))];
+        let anchor = UsageAnchor {
+            provider_tokens: 60_000,
+            fixed_tokens: assessment_of(&system, &earlier).fixed_tokens(),
+            messages: earlier.clone(),
+        };
+        let appended = [msg("user", &"r".repeat(25_000))];
+        let mut next = earlier.clone();
+        next.extend(appended.iter().cloned());
+        let assessment = assessment_of(&system, &next).anchored(Some(&anchor), &next);
+        assert_eq!(
+            assessment.used_tokens(),
+            60_000 + estimate_history(&appended),
+            "provider count + appended estimate"
+        );
+        // The estimate is still there for calibration and overhead sizing.
+        assert!(assessment.estimated_tokens() > 100_000);
+        assert_eq!(assessment.anchored_tokens, Some(assessment.used_tokens()));
+
+        // A host stamp on a shared message does not change the wire.
+        let mut stamped = next.clone();
+        let mut first = (*stamped[0]).clone();
+        first["_synaps_at"] = json!("2026-10-30T11:00:00.000Z");
+        stamped[0] = Arc::new(first);
+        assert_eq!(
+            assessment_of(&system, &stamped).anchored(Some(&anchor), &stamped).used_tokens(),
+            assessment.used_tokens()
+        );
+
+        // A larger system prompt adds its growth; a smaller one subtracts
+        // nothing.
+        let grown = "s".repeat(5_000);
+        assert_eq!(
+            assessment_of(&grown, &next).anchored(Some(&anchor), &next).used_tokens(),
+            assessment.used_tokens() + 1_000
+        );
+        assert_eq!(
+            assessment_of("", &next).anchored(Some(&anchor), &next).used_tokens(),
+            assessment.used_tokens()
+        );
+    }
+
+    /// The anchored request's last message may differ (per-turn injection
+    /// rides the request tail): its billed size stays counted, the
+    /// replacement is estimated on top, so the result never drops below the
+    /// provider's count.
+    #[test]
+    fn a_changed_request_tail_keeps_the_anchor_and_errs_high() {
+        let base = vec![msg("user", "task"), msg("assistant", &"a".repeat(25_000))];
+        let mut injected = base.clone();
+        injected.push(msg("user", &format!("next{}", "i".repeat(5_000))));
+        let anchor = UsageAnchor {
+            provider_tokens: 30_000,
+            fixed_tokens: 0,
+            messages: injected,
+        };
+        let mut next = base.clone();
+        next.push(msg("user", "next"));
+        next.push(msg("assistant", &"b".repeat(2_500)));
+        assert_eq!(
+            anchor.footprint(0, &next),
+            Some(30_000 + estimate_history(&next[2..]))
+        );
+        // A shorter request that keeps all but the last: the count stands.
+        assert_eq!(anchor.footprint(0, &base), Some(30_000));
+    }
+
+    /// Without a usable anchor (first request, after resume or rollover, a
+    /// provider without usage, or a rewritten history) the footprint is the
+    /// estimate.
+    #[test]
+    fn footprint_falls_back_to_the_estimate_without_an_anchor() {
+        let system = "s".repeat(2_500);
+        let history = vec![
+            msg("user", "task"),
+            msg("assistant", &"a".repeat(25_000)),
+            msg("user", "more"),
+            msg("assistant", &"b".repeat(25_000)),
+        ];
+        let plain = assessment_of(&system, &history);
+        assert_eq!(plain.anchored_tokens, None);
+        assert_eq!(plain.used_tokens(), plain.estimated_tokens());
+        assert_eq!(plain.anchored(None, &history).used_tokens(), plain.estimated_tokens());
+
+        // A rollover successor: the anchored history was rewritten before
+        // its last message.
+        let anchor = UsageAnchor {
+            provider_tokens: 5_000,
+            fixed_tokens: plain.fixed_tokens(),
+            messages: history.clone(),
+        };
+        let successor = vec![history[0].clone(), msg("user", "[host note]"), history[3].clone()];
+        let rolled = assessment_of(&system, &successor);
+        assert_eq!(
+            rolled.anchored(Some(&anchor), &successor).used_tokens(),
+            rolled.estimated_tokens()
+        );
     }
 
     #[test]
@@ -637,7 +1006,7 @@ mod tests {
     fn the_output_reserve_is_a_realistic_need_not_the_max_tokens_ceiling() {
         let hard_line = |model: &str, window: u64, thinking: u64| {
             let (assessment, budget) = crate::runtime::stream::pre_request_context_budget(
-                model, window, None, &[], &[], thinking, 30_000,
+                model, window, None, &[], &[], thinking, 30_000, None,
             );
             (assessment.reserves.output_tokens, window - budget.required_next_round_tokens)
         };
