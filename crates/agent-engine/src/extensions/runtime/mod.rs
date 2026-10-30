@@ -114,6 +114,21 @@ pub trait ExtensionHandler: Send + Sync {
     /// Handle a hook event. Returns the handler's decision.
     async fn handle(&self, event: &HookEvent) -> HookResult;
 
+    /// [`Self::handle`] for a caller that must never start or restart the
+    /// extension: a subagent worker's hook view
+    /// ([`HookBus::worker_transforms`]). A worker runs on its own throwaway
+    /// current-thread tokio runtime, so a child process or reader task
+    /// spawned from it would die with the worker and leave the shared
+    /// extension broken for the foreground and every other worker. An
+    /// extension that is not running (crashed, stopped by a reload, deferred
+    /// and not started yet) answers `Continue`; the foreground's next call
+    /// starts it as before. Default: [`Self::handle`] (nothing to start).
+    ///
+    /// [`HookBus::worker_transforms`]: crate::extensions::hooks::HookBus::worker_transforms
+    async fn handle_no_spawn(&self, event: &HookEvent) -> HookResult {
+        self.handle(event).await
+    }
+
     /// Call an extension-provided tool.
     async fn call_tool(&self, _name: &str, _input: Value) -> Result<Value, String> {
         Err("extension runtime does not support tool.call".to_string())

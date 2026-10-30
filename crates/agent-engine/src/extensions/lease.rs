@@ -640,6 +640,28 @@ impl ExtensionRuntimeManager {
         )
     }
 
+    /// The host-scope lease [`Self::acquire_handler_scope`] would use, only
+    /// if it is already Ready, live and launched from the current record.
+    /// Never starts, waits for or replaces a child: the subagent-worker
+    /// hook path ([`ExtensionHandler::handle_no_spawn`]).
+    fn ready_handler_scope(&self, plugin: &str) -> Option<Arc<LeaseInner>> {
+        let session = self.host_scope();
+        let (record, _validated) = self.record_and_validate(&session, plugin).ok()?;
+        let expected_fingerprint = record_fingerprint(&record);
+        let map = self
+            .leases
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match map.get(&(session.as_str().to_string(), plugin.to_string())) {
+            Some(LeaseState::Ready(inner))
+                if !inner.cancelled() && inner.fingerprint == expected_fingerprint =>
+            {
+                Some(Arc::clone(inner))
+            }
+            _ => None,
+        }
+    }
+
     /// Steps shared by every acquisition path: re-read the retained
     /// internal launch record and RE-VALIDATE the manifest (permissions
     /// included) before any spawn decision. Failure revokes the session's
@@ -1044,6 +1066,30 @@ impl ExtensionHandler for LazyExtensionHandler {
                     extension = %self.plugin,
                     error = %error,
                     "Deferred extension could not start for hook event — continuing",
+                );
+                crate::extensions::hooks::events::HookResult::Continue
+            }
+        }
+    }
+
+    /// Worker hook path: only an already-running lease serves it; a
+    /// deferred extension no foreground event has started (or one being
+    /// restarted) passes through instead of being started from a worker's
+    /// throwaway runtime.
+    async fn handle_no_spawn(
+        &self,
+        event: &crate::extensions::hooks::events::HookEvent,
+    ) -> crate::extensions::hooks::events::HookResult {
+        match self.manager.ready_handler_scope(&self.plugin) {
+            Some(inner) => {
+                let result = inner.handler.handle_no_spawn(event).await;
+                Self::touch(&inner);
+                result
+            }
+            None => {
+                tracing::debug!(
+                    extension = %self.plugin,
+                    "Deferred extension not running; worker hook event passes through",
                 );
                 crate::extensions::hooks::events::HookResult::Continue
             }
