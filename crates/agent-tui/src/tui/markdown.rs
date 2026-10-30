@@ -899,7 +899,14 @@ fn wrap_styled(
         full.push_str(&s.content);
     }
     let run_end = |i: usize| runs.get(i + 1).map_or(full.len(), |r| r.0);
-    wrap_text_spans_hang(&full, width, hang)
+    // A code pill's leading pad is part of the pill, not wrap whitespace:
+    // a row the pill opens keeps it.
+    let pads: Vec<usize> = runs
+        .iter()
+        .filter(|(at, st)| st.bg.is_some() && full[*at..].starts_with(' '))
+        .map(|(at, _)| *at)
+        .collect();
+    wrap_text_spans_hang(&full, width, hang, &pads)
         .into_iter()
         .map(|row| {
             let mut spans: Vec<Span<'static>> = Vec::new();
@@ -1002,14 +1009,21 @@ pub(crate) struct WrapRow {
 /// the expanded text IS the raw input, so cursor positions in the loop are
 /// raw byte offsets directly.
 pub(crate) fn wrap_text_spans(raw_text: &str, width: usize) -> Vec<WrapRow> {
-    wrap_text_spans_hang(raw_text, width, None)
+    wrap_text_spans_hang(raw_text, width, None, &[])
 }
 
 /// [`wrap_text_spans`] with an optional explicit continuation indent
 /// (`hang`, display columns) — used for hanging list/quote bodies so
 /// continuation rows align under the item text instead of the leading
 /// whitespace. Tab inputs ignore `hang` (the tab anchor wins, as before).
-fn wrap_text_spans_hang(raw_text: &str, width: usize, hang: Option<usize>) -> Vec<WrapRow> {
+/// `keep`: byte offsets of spaces-only words that are content (a code
+/// pill's pad), which a continuation row must not drop.
+fn wrap_text_spans_hang(
+    raw_text: &str,
+    width: usize,
+    hang: Option<usize>,
+    keep: &[usize],
+) -> Vec<WrapRow> {
     let (text, tab_anchor) = expand_tabs_with_anchor(raw_text);
     // `tab_anchor` is Some iff the input contained a tab — the eligibility
     // gate for byte-range provenance (L6). Tab-free ⇒ text == raw_text.
@@ -1096,6 +1110,20 @@ fn wrap_text_spans_hang(raw_text: &str, width: usize, hang: Option<usize>) -> Ve
             is_first_line = false;
             row_indent_bytes = indent.len();
             row_start = word_start;
+        }
+        // Spaces-only words at the head of a continuation row (the second
+        // of two spaces — a double space in the source, or a source space
+        // after a code pill's pad) are part of the break, like the trailing
+        // space the flush trims: they must not open the row with a stray
+        // blank. Tab input keeps the old path (its offsets are expanded).
+        if !is_first_line
+            && eligible
+            && current.len() == row_indent_bytes
+            && word.trim_matches(' ').is_empty()
+            && !keep.contains(&word_start)
+        {
+            row_start = pos;
+            continue;
         }
         // Word wider than effective width — hard break char by char.
         let effective_width = if is_first_line { width } else { wrap_width };
@@ -1742,6 +1770,33 @@ mod tests {
                     text.starts_with("    \u{2502} "),
                     "w={width}: gutter missing: {text:?}"
                 );
+            }
+        }
+    }
+
+    /// A soft wrap right after a code pill (its trailing pad, then the
+    /// source's own space) must not open the next row with a stray blank;
+    /// a row the pill itself opens keeps the pill's leading pad.
+    #[test]
+    fn wraps_beside_a_code_pill_leave_no_stray_blank() {
+        let src = "computed: `sync_cache` rebuilds on a width change, but \
+                   `refresh_live_slots` bails out early when it should not at all";
+        for width in 20usize..60 {
+            let lines = render_markdown_spans(src, "  ", width, 0);
+            for (i, (l, _)) in lines.iter().enumerate().skip(1) {
+                let text: String = l.spans.iter().map(|s| s.content.as_ref()).collect();
+                let body = &text[4.min(text.len())..];
+                let pill_opens = l
+                    .spans
+                    .iter()
+                    .find(|s| !s.content.trim().is_empty())
+                    .is_some_and(|s| s.style.bg.is_some());
+                if !pill_opens {
+                    assert!(
+                        !body.starts_with(' '),
+                        "w={width} row {i}: stray blank: {text:?}"
+                    );
+                }
             }
         }
     }
