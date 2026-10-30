@@ -509,6 +509,8 @@ fn build_successor(
     successor.extend(pinned.into_iter().map(|(_, m)| m));
     successor.push(Arc::new(note));
     successor.extend(messages[cut..].iter().cloned());
+    // A retained read-dedupe stub must not point at an evicted read.
+    super::read_dedupe::rewrite_dangling_stubs(&mut successor);
     Some(RolloverPlan {
         successor,
         transcript: String::new(),
@@ -959,6 +961,55 @@ mod tests {
         assert!(note.contains("/tmp/x/sa_1.window-1.md"), "{note}");
         assert!(note.contains("bash: cargo test step"), "{note}");
         assert_eq!(s[1][MARKER_KEY]["window"], 2);
+    }
+
+    /// A read-dedupe stub the cut keeps while evicting the read it names is
+    /// rewritten so it no longer claims the content is in context; with the
+    /// original kept too, the stub is untouched.
+    #[test]
+    fn a_kept_dedupe_stub_whose_read_was_evicted_is_rewritten() {
+        use crate::runtime::read_dedupe::{unchanged_stub, DROPPED_STUB};
+        let read = |id: &str, content: String| -> [SharedMessage; 2] {
+            [
+                Arc::new(json!({"role":"assistant","content":[
+                    {"type":"tool_use","id":id,"name":"read","input":{"path":"/w/database.py"}}]})),
+                Arc::new(json!({"role":"user","content":[
+                    {"type":"tool_result","tool_use_id":id,"content":content}]})),
+            ]
+        };
+        let full = "1\tdb = connect()\n".repeat(50);
+        let history = |original_late: bool| {
+            let mut m = vec![user("BRIEF: fix the parser")];
+            if !original_late {
+                m.extend(read("toolu_r1", full.clone()));
+            }
+            for i in 0..20 {
+                m.extend(round(i, 4_000));
+            }
+            if original_late {
+                m.extend(read("toolu_r1", full.clone()));
+            }
+            m.extend(read("toolu_r2", unchanged_stub("toolu_r1")));
+            m.extend(round(99, 10));
+            m
+        };
+
+        let m = history(false);
+        let plan = plan_rollover(&m, budget(8_000), 1, path).unwrap();
+        let s = &plan.successor;
+        assert!(!s.iter().any(|x| x.to_string().contains("toolu_r1")), "r1 evicted");
+        let at = s.iter().position(|x| x["content"][0]["tool_use_id"] == "toolu_r2").unwrap();
+        assert_eq!(s[at]["content"][0]["content"], DROPPED_STUB);
+        assert!(Arc::ptr_eq(&s[at - 1], &m[m.len() - 4]), "the call itself is never edited");
+        assert!(unpaired_tool_ids(s).is_empty() && plan_is_productive(&m, &plan));
+
+        // Original kept by the cut: the stub (and every kept round) untouched.
+        let m = history(true);
+        let plan = plan_rollover(&m, budget(8_000), 1, path).unwrap();
+        for x in &plan.successor[2..] {
+            assert!(m.iter().any(|o| Arc::ptr_eq(o, x)), "nothing edited");
+        }
+        assert!(plan.successor.iter().any(|x| x["content"][0]["content"] == unchanged_stub("toolu_r1")));
     }
 
     #[test]

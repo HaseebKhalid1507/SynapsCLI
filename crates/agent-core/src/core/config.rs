@@ -1300,6 +1300,12 @@ pub struct SynapsConfig {
     /// (`tool_output_spill_tail_bytes`, default
     /// [`DEFAULT_TOOL_OUTPUT_SPILL_TAIL_BYTES`]).
     pub tool_output_spill_tail_bytes: usize,
+    /// Read dedupe: a `read` whose result would be byte-identical to an
+    /// earlier `read` of the same file/range still in history is replaced by
+    /// a short stub naming that earlier call, and `write`/`edit` results say
+    /// there is no need to re-read to verify. Off = legacy tool-result bytes.
+    /// (`read_dedupe`, default on).
+    pub read_dedupe: bool,
     pub bash_timeout: u64,       // default 30
     pub bash_max_timeout: u64,   // default 300
     pub subagent_timeout: u64,   // default 300
@@ -1443,6 +1449,7 @@ impl Default for SynapsConfig {
             tool_output_spill_bytes: DEFAULT_TOOL_OUTPUT_SPILL_BYTES,
             tool_output_spill_head_bytes: DEFAULT_TOOL_OUTPUT_SPILL_HEAD_BYTES,
             tool_output_spill_tail_bytes: DEFAULT_TOOL_OUTPUT_SPILL_TAIL_BYTES,
+            read_dedupe: true,
             bash_timeout: 30,
             bash_max_timeout: 300,
             subagent_timeout: 300,
@@ -1522,6 +1529,7 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "tool_output_spill_bytes",
     "tool_output_spill_head_bytes",
     "tool_output_spill_tail_bytes",
+    "read_dedupe",
     "bash_timeout",
     "bash_max_timeout",
     "subagent_timeout",
@@ -2226,6 +2234,13 @@ fn apply_config_content_with(
                     } else {
                         "invisible"
                     }
+                )),
+            },
+            "read_dedupe" => match val {
+                "true" | "1" | "on" | "yes" => config.read_dedupe = true,
+                "false" | "0" | "off" | "no" => config.read_dedupe = false,
+                _ => config.warnings.push(format!(
+                    "read_dedupe = {val} — expected on or off; using on"
                 )),
             },
             "tui_streaming_glow" => match val {
@@ -4153,6 +4168,24 @@ mod tests {
         assert!(config.bridge.uds_path.is_none());
         assert!(!config.bridge.heartbeat_mirror);
         assert_eq!(config.bridge.heartbeat_timeout_ms, 250);
+    }
+
+    #[test]
+    fn read_dedupe_key_parses_defaults_on_and_warns() {
+        assert!(super::load_config_from_str("").read_dedupe, "default on");
+        for (line, want) in [
+            ("read_dedupe = off\n", false),
+            ("read_dedupe = false\n", false),
+            ("read_dedupe = on\n", true),
+            ("read_dedupe = true\n", true),
+        ] {
+            let c = super::load_config_from_str(line);
+            assert_eq!(c.read_dedupe, want, "{line}");
+            assert!(c.warnings.is_empty(), "{line}: {:?}", c.warnings);
+        }
+        let c = super::load_config_from_str("read_dedupe = maybe\n");
+        assert!(c.read_dedupe, "bad value keeps the default");
+        assert!(c.warnings.iter().any(|w| w.contains("read_dedupe")));
     }
 
     #[test]

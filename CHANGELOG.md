@@ -23,6 +23,22 @@ All notable changes to this project will be documented in this file.
   `synaps retention` and swept after 7 idle days at startup. Request traces
   mark virtualised calls (`virtualised: true`; `result_bytes` minus
   `preview_bytes` is what stayed out of history). Three new /settings rows.
+- **Read dedupe.** Reading a file again no longer adds a second full copy to
+  history when the first copy is still there. If a `read` of the same
+  file, `offset` and `limit` would add exactly the same text (after
+  virtualisation) as an earlier `read` that is still in the conversation,
+  history gets a one-line stub naming that earlier call instead. If the
+  file changed, the earlier result is gone (rollover, compaction, a new
+  session), or the result is an image, document, error or cancellation,
+  the full result comes back. The stub never changes once written, so
+  caching is unaffected, and it says to read again if the earlier result
+  is gone. When a context rollover (foreground or worker) keeps a stub
+  but drops the read it names, the stub is rewritten to a fixed "read the
+  file again if you need it" line. Successful `write` and `edit` results
+  now say there is no need to re-read the file to check it. Request
+  traces mark stubbed calls (`deduped: true`, `deduped_bytes`). Works the
+  same in workers. `read_dedupe` (default on; `off` = tool results exactly
+  as before), with a /settings row.
 - **`synaps daemon rename <ID|NAME> <NEW_NAME>`** (or `--clear`) names a
   daemon session from any shell without attaching, so a tool can name a
   session it only observes. Same rules as `/saveas`; attached clients see the

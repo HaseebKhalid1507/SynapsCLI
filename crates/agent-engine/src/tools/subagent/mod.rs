@@ -154,6 +154,7 @@ pub(crate) fn apply_subagent_runtime_policy(
     runtime.set_tool_spill_policy(crate::runtime::tool_spill::ToolSpillPolicy::from_config(
         config,
     ));
+    runtime.set_read_dedupe(config.read_dedupe);
 
     // Credential source / token cache: host-built workers already share the
     // process-wide broker (`spawn_runtime`); only the legacy fresh-runtime
@@ -587,6 +588,19 @@ mod cache_ttl_policy_tests {
         let off = agent_core::config::load_config_from_str("tool_output_spill_bytes = 0\n");
         apply_subagent_runtime_policy(&mut runtime, &off, None, None, None, &Default::default());
         assert!(!runtime.tool_spill().is_enabled());
+    }
+
+    /// Workers dedupe re-reads like the foreground, from the same key.
+    #[test]
+    fn subagent_policy_takes_read_dedupe_from_config() {
+        let mut runtime = crate::Runtime::new_headless();
+        assert!(!runtime.read_dedupe(), "off until configured");
+        let on = agent_core::config::load_config_from_str("");
+        apply_subagent_runtime_policy(&mut runtime, &on, None, None, None, &Default::default());
+        assert!(runtime.read_dedupe());
+        let off = agent_core::config::load_config_from_str("read_dedupe = off\n");
+        apply_subagent_runtime_policy(&mut runtime, &off, None, None, None, &Default::default());
+        assert!(!runtime.read_dedupe());
     }
 
     /// Task A5 memory-context invariant: subagents never inherit a memory
