@@ -12,7 +12,10 @@
 //!
 //! - reasoning/thinking reserve;
 //! - next likely tool-result reserve;
-//! - requested output reserve;
+//! - expected output reserve: what one round realistically produces
+//!   ([`EXPECTED_RESPONSE_TOKENS`] on top of its thinking), bounded by the
+//!   request's `max_tokens`. `max_tokens` is a ceiling, not headroom the
+//!   request needs (see [`ContextReserves::output_tokens`]);
 //! - a documented safety margin of [`SAFETY_MARGIN_PERCENT`] (spec requires
 //!   10–15%).
 //!
@@ -43,6 +46,30 @@ use crate::SharedMessage;
 /// Documented pre-dispatch safety margin, as a percentage of the provider
 /// window (spec §9.1: target at least 10–15% reserved capacity).
 pub const SAFETY_MARGIN_PERCENT: u64 = 15;
+
+/// Visible output (text and tool calls) one round is expected to need on
+/// top of its thinking. The output reserve is this plus the thinking reserve,
+/// capped at the request's `max_tokens` ([`ContextBudgetInputs::max_output_tokens`]).
+///
+/// Not the `max_tokens` ceiling itself (128k for Opus): Claude 4.5 and later
+/// accept a request whose input plus `max_tokens` exceeds the window and
+/// stop at the window with `stop_reason: "model_context_window_exceeded"`
+/// (<https://platform.claude.com/docs/en/build-with-claude/context-windows#context-window-overflow-behavior>),
+/// and for the earlier models that reject it the request builder clamps
+/// `max_tokens` to the room left (`HelperMethods::fit_max_tokens_to_window`).
+/// Reserving the full ceiling put hard capacity at ~31.5k on a 200k Opus
+/// window. 16k covers a large single-file write in one round; a round's
+/// output becomes the next round's input, so the following assessment sees
+/// it either way.
+pub const EXPECTED_RESPONSE_TOKENS: u64 = 16_384;
+
+/// Thinking reserve for a zero thinking budget: the runtime's adaptive
+/// ("the model decides") and off levels both carry 0, and the request builder
+/// itself sends a zero budget as this tier on fixed-budget models
+/// (`DEFAULT_LEGACY_ADAPTIVE_FALLBACK`, the "high" tier). Reserving it for off
+/// errs toward earlier rollover by at most this much.
+pub const ZERO_BUDGET_THINKING_RESERVE_TOKENS: u64 =
+    crate::core::models::DEFAULT_LEGACY_ADAPTIVE_FALLBACK as u64;
 
 /// Minimum history length before compaction is meaningful. A freshly
 /// compacted session (summary + acknowledgement) sits below this gate, which
@@ -126,13 +153,15 @@ pub struct ContextBudgetInputs<'a> {
     pub skill_contents: &'a [&'a str],
     /// Memory bodies loaded into the request outside system/history.
     pub memory_contents: &'a [&'a str],
-    /// Reasoning/thinking reserve in tokens.
+    /// Reasoning/thinking budget in tokens (0 = adaptive/off, reserved as
+    /// [`ZERO_BUDGET_THINKING_RESERVE_TOKENS`]).
     pub thinking_budget_tokens: u64,
     /// Byte cap of the next likely tool result (converted to a token
     /// reserve at [`TOOL_RESULT_BYTES_PER_TOKEN`]).
     pub next_tool_result_bytes: u64,
-    /// Requested output reserve (the request's `max_tokens`).
-    pub output_reserve_tokens: u64,
+    /// The request's output ceiling (its `max_tokens`). Bounds the output
+    /// reserve; it is not itself reserved ([`EXPECTED_RESPONSE_TOKENS`]).
+    pub max_output_tokens: u64,
 }
 
 /// Typed per-segment usage accounting.
@@ -167,11 +196,12 @@ pub enum ThinkingAccounting {
     /// (`thinking.budget_tokens < max_tokens`), OpenAI Responses/Chat and
     /// Codex wires (reasoning tokens count toward `max_output_tokens` /
     /// `max_completion_tokens`). Reserve ONE envelope:
-    /// `max(output_reserve, thinking_budget)`.
+    /// `min(max_tokens, thinking + EXPECTED_RESPONSE_TOKENS)`.
     InsideOutputBudget,
     /// Thinking is budgeted separately from response output (Gemini
-    /// `thinkingBudget`), or the wire is unknown — reserve both envelopes,
-    /// which errs toward earlier compaction, never toward exhaustion.
+    /// `thinkingBudget`), or the wire is unknown — reserve both (thinking,
+    /// and `min(max_tokens, EXPECTED_RESPONSE_TOKENS)`), which errs toward
+    /// earlier compaction, never toward exhaustion.
     SeparateFromOutput,
 }
 
@@ -198,9 +228,12 @@ pub struct ContextReserves {
     /// wires where thinking already spends from the output cap.
     pub thinking_tokens: u64,
     pub tool_result_tokens: u64,
-    /// The request's output envelope. On [`ThinkingAccounting::InsideOutputBudget`]
-    /// wires this is `max(output_reserve, thinking_budget)` — the wire
-    /// requires the output cap to cover thinking, so the larger governs.
+    /// The output the next round is expected to need, never more than the
+    /// request's `max_tokens`. On [`ThinkingAccounting::InsideOutputBudget`]
+    /// wires thinking spends from the output cap, so this is
+    /// `min(max_tokens, thinking + EXPECTED_RESPONSE_TOKENS)`; on separate
+    /// wires `min(max_tokens, EXPECTED_RESPONSE_TOKENS)` beside
+    /// `thinking_tokens`.
     pub output_tokens: u64,
     pub safety_margin_tokens: u64,
     /// The wire semantics the thinking/output split was computed under.
@@ -301,15 +334,18 @@ pub fn assess(inputs: &ContextBudgetInputs<'_>) -> ContextAssessment {
         },
         reserves: {
             let accounting = thinking_accounting_for_model(inputs.model);
+            let thinking = match inputs.thinking_budget_tokens {
+                0 => ZERO_BUDGET_THINKING_RESERVE_TOKENS,
+                budget => budget,
+            };
+            let cap = inputs.max_output_tokens;
             let (thinking_tokens, output_tokens) = match accounting {
                 ThinkingAccounting::InsideOutputBudget => (
                     0,
-                    inputs
-                        .output_reserve_tokens
-                        .max(inputs.thinking_budget_tokens),
+                    cap.min(thinking.saturating_add(EXPECTED_RESPONSE_TOKENS)),
                 ),
                 ThinkingAccounting::SeparateFromOutput => {
-                    (inputs.thinking_budget_tokens, inputs.output_reserve_tokens)
+                    (thinking, cap.min(EXPECTED_RESPONSE_TOKENS))
                 }
             };
             ContextReserves {
@@ -406,7 +442,7 @@ mod tests {
             memory_contents: &[],
             thinking_budget_tokens: 0,
             next_tool_result_bytes: 0,
-            output_reserve_tokens: 0,
+            max_output_tokens: 0,
         };
         assess(&inputs).breakdown.history_tokens
     }
@@ -528,7 +564,7 @@ mod tests {
             memory_contents: &[],
             thinking_budget_tokens: 1_000,
             next_tool_result_bytes: 0,
-            output_reserve_tokens: 0,
+            max_output_tokens: 64_000,
         });
         assert_eq!(assessment.budget_tokens(), 0);
         assert_eq!(assessment.remaining_tokens(), 0);
@@ -553,7 +589,7 @@ mod tests {
             memory_contents: &[],
             thinking_budget_tokens: 8_000,
             next_tool_result_bytes: 0,
-            output_reserve_tokens: 64_000,
+            max_output_tokens: 64_000,
         };
         let assessment = assess(&inputs);
         assert_eq!(
@@ -564,22 +600,61 @@ mod tests {
             assessment.reserves.thinking_tokens, 0,
             "thinking must not be reserved a second time on the Anthropic wire"
         );
-        assert_eq!(assessment.reserves.output_tokens, 64_000);
+        let envelope = 8_000 + EXPECTED_RESPONSE_TOKENS;
+        assert_eq!(assessment.reserves.output_tokens, envelope);
         assert_eq!(
             assessment.budget_tokens(),
-            window - (64_000 + margin),
+            window - (envelope + margin),
             "budget must subtract the output/thinking envelope exactly once"
         );
 
-        // A thinking budget larger than the requested output governs the
-        // envelope (the wire requires max_tokens >= budget_tokens).
+        // The output cap bounds the envelope: thinking spends from
+        // `max_tokens`, so no round can produce more than it.
         let big_thinking = ContextBudgetInputs {
             thinking_budget_tokens: 100_000,
             ..inputs
         };
         let assessment = assess(&big_thinking);
-        assert_eq!(assessment.reserves.output_tokens, 100_000);
+        assert_eq!(assessment.reserves.output_tokens, 64_000);
         assert_eq!(assessment.reserves.thinking_tokens, 0);
+
+        // A zero budget (adaptive: the model decides) reserves the high tier.
+        let adaptive = assess(&ContextBudgetInputs {
+            thinking_budget_tokens: 0,
+            ..inputs
+        });
+        assert_eq!(
+            adaptive.reserves.output_tokens,
+            ZERO_BUDGET_THINKING_RESERVE_TOKENS + EXPECTED_RESPONSE_TOKENS
+        );
+    }
+
+    /// The output reserve is the next round's realistic need, not the
+    /// `max_tokens` ceiling (128k for Opus): the hard-capacity line of a
+    /// 200k window sits above 100k for Opus and Sonnet alike, and a 1m
+    /// window keeps the 15% margin as its largest reserve.
+    #[test]
+    fn the_output_reserve_is_a_realistic_need_not_the_max_tokens_ceiling() {
+        let hard_line = |model: &str, window: u64, thinking: u64| {
+            let (assessment, budget) = crate::runtime::stream::pre_request_context_budget(
+                model, window, None, &[], &[], thinking, 30_000,
+            );
+            (assessment.reserves.output_tokens, window - budget.required_next_round_tokens)
+        };
+        // Adaptive (0) and "high" (16,384) reserve the same envelope.
+        for thinking in [0, 16_384] {
+            for model in ["claude-opus-5-5", "claude-sonnet-4-6"] {
+                // 32,768 output + 10,000 tool result + 30,000 margin + 512 advisory.
+                assert_eq!(hard_line(model, 200_000, thinking), (32_768, 126_720), "{model}");
+                assert_eq!(hard_line(model, 1_000_000, thinking), (32_768, 806_720), "{model}");
+            }
+        }
+        // "medium" (4,096), the runtime default.
+        assert_eq!(hard_line("claude-opus-5-5", 200_000, 4_096), (20_480, 139_008));
+        // "xhigh" (32,768) on Opus: still above the 93k successor target.
+        assert_eq!(hard_line("claude-opus-5-5", 200_000, 32_768), (49_152, 110_336));
+        // A budget past the model's cap: the cap (64k on Sonnet) governs.
+        assert_eq!(hard_line("claude-sonnet-4-6", 200_000, 100_000).0, 64_000);
     }
 
     /// OpenAI Responses/Chat wires bill reasoning inside the output cap too.
@@ -620,7 +695,7 @@ mod tests {
                 memory_contents: &[],
                 thinking_budget_tokens: 8_000,
                 next_tool_result_bytes: 0,
-                output_reserve_tokens: 64_000,
+                max_output_tokens: 64_000,
             });
             assert_eq!(
                 assessment.reserves.thinking_accounting,
@@ -628,10 +703,13 @@ mod tests {
                 "{model}"
             );
             assert_eq!(assessment.reserves.thinking_tokens, 8_000, "{model}");
-            assert_eq!(assessment.reserves.output_tokens, 64_000, "{model}");
+            assert_eq!(
+                assessment.reserves.output_tokens, EXPECTED_RESPONSE_TOKENS,
+                "{model}"
+            );
             assert_eq!(
                 assessment.budget_tokens(),
-                window - (8_000 + 64_000 + margin),
+                window - (8_000 + EXPECTED_RESPONSE_TOKENS + margin),
                 "{model}: separate wires reserve both envelopes"
             );
         }
@@ -666,7 +744,9 @@ mod tests {
             memory_contents: &[],
             thinking_budget_tokens: runtime.thinking_budget() as u64,
             next_tool_result_bytes: runtime.max_tool_output() as u64,
-            output_reserve_tokens: via_runtime.reserves.output_tokens,
+            max_output_tokens: crate::runtime::helpers::HelperMethods::max_tokens_for_model(
+                runtime.model(),
+            ),
         });
 
         assert_eq!(

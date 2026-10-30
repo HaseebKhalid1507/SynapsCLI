@@ -1533,6 +1533,27 @@ mod tests {
         );
     }
 
+    /// The probe shares the turn's context budget, so it gains the realistic
+    /// output reserve too: an Opus session at ~60k of its 200k window is
+    /// warmed. With the full 128k `max_tokens` reserved the next turn was at
+    /// hard capacity from ~31.5k on and the probe refused every ping there.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn probe_warms_an_opus_200k_session_past_the_old_hard_stop() {
+        let _base = crate::test_env::BaseDirGuard::new();
+        let (url, _mock) = spawn_mock().await;
+        let _url = crate::test_env::EnvVarGuard::set("SYNAPS_ANTHROPIC_BASE_URL", &url);
+        let rt = opus(CacheTtl::OneHour);
+        assert_eq!(rt.context_window(), 200_000);
+        rt.continuation.lock().unwrap().config.mode =
+            crate::core::config::ContextManagementMode::Auto;
+        let history = real_turn(&rt, vec![user(&"x".repeat(150_000))]).await;
+        let used = rt.assess_context(&history).await.used_tokens();
+        assert!((60_000..100_000).contains(&used), "{used}");
+        let probe = rt.cache_keepwarm_probe(&history).await.unwrap();
+        assert_eq!(probe.context_blocks, None, "{probe:?}");
+    }
+
     /// The probe reports the ping's real `max_tokens` (worst-case output).
     #[tokio::test]
     #[serial_test::serial(synaps_base_dir)]

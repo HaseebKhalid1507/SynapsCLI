@@ -124,17 +124,19 @@ impl WorkerPolicy {
 
     /// Whether rolling over at hard capacity can make real room. Hard
     /// capacity is the footprint `context_window - required_next_round`,
-    /// where the next round's reserves are its output envelope, thinking, the
-    /// next tool result and the safety margin. When that line is at or below
-    /// this policy's successor target the window is dominated by its
-    /// reserves: no successor of the size the policy aims for passes hard
-    /// admission, and any successor the window does hold is a fraction of
-    /// it, back at hard capacity a few rounds later. On a 200k Opus window
-    /// the reserves are about 168k (128k of it the output envelope), so hard
-    /// capacity sat near 32k against a 93k target, and workers rolled over
-    /// every few tool calls to successors of about 9k. `false`: do not roll
-    /// over at hard capacity; send the request as before worker rollover
-    /// existed and let the provider judge it.
+    /// where the next round's reserves are its expected output (thinking and
+    /// response within `max_tokens`), the next tool result and the safety
+    /// margin. When that line is at or below this policy's successor target
+    /// the window is dominated by its reserves: no successor of the size the
+    /// policy aims for passes hard admission, and any successor the window
+    /// does hold is a fraction of it, back at hard capacity a few rounds
+    /// later. That was every 200k Opus window while the reserve was the full
+    /// 128k `max_tokens` (hard capacity near 32k against a 93k target;
+    /// workers rolled over every few tool calls to successors of about 9k).
+    /// With the realistic reserve it is ~127k there; small windows (about
+    /// 110k and below) can still be dominated. `false`: do not roll over at
+    /// hard capacity; send the request as before worker rollover existed and
+    /// let the provider judge it.
     pub fn hard_capacity_has_room(&self, context_window: u64, required_next_round: u64) -> bool {
         context_window.saturating_sub(required_next_round) > self.target_tokens()
     }
@@ -950,35 +952,54 @@ mod tests {
         assert_eq!(hard_capacity_budget(normal, 10, 72_000, 1_000).history_tokens, 0);
     }
 
-    /// The live thrash (#332): an Opus worker on the 200k default window.
-    /// Its next round reserves the 128k output envelope, a 10k tool result,
-    /// the 15% safety margin (30k) and the 512 advisory reserve: hard
-    /// capacity at 31,488, a third of the 93,333 target. No rollover there
-    /// can make room. The same Opus worker on the configured 1m window, and
-    /// a Sonnet worker (64k envelope) on 200k, can hold the target.
+    /// The next round's required room, as `pre_request_context_budget`
+    /// computes it for an empty request (adaptive thinking, 30k tool cap).
+    fn required(model: &str, window: u64) -> u64 {
+        super::super::stream::pre_request_context_budget(model, window, None, &[], &[], 0, 30_000)
+            .1
+            .required_next_round_tokens
+    }
+
+    /// The live thrash (#332): an Opus worker on the 200k default window
+    /// reserved the full 128k `max_tokens` for the next round: hard capacity
+    /// at 31,488, a third of the 93,333 target, so no rollover there could
+    /// make room. The next round now reserves its expected output (32,768 of
+    /// thinking and response), the 10k tool result, the 15% margin and the
+    /// 512 advisory reserve: hard capacity at 126,720 on 200k for Opus and
+    /// Sonnet alike, and every such window holds the target. Small windows
+    /// can still be reserve-dominated.
     #[test]
     fn hard_capacity_has_room_only_when_the_target_fits_below_it() {
         use agent_core::core::context_policy::{assess_context, ContextAction, ContextBudget, ContextState};
         let on = WorkerContextSettings { enabled: true, rollover_tokens: 200_000 };
-        let opus_200k = 128_000 + 10_000 + 30_000 + 512;
         let p = on.policy(200_000).unwrap();
         assert_eq!(p.target_tokens(), 93_333);
-        // ~33k of context is hard capacity on that window.
-        let at_33k = ContextBudget {
-            context_window_tokens: 200_000,
-            used_tokens: 33_000,
-            hard_remaining_tokens: 167_000,
-            required_next_round_tokens: opus_200k,
-        };
-        assert_eq!(assess_context(&p.config, &ContextState::default(), at_33k).action, ContextAction::HardStop);
-        assert!(!p.hard_capacity_has_room(200_000, opus_200k));
-        assert!(p.hard_capacity_has_room(200_000, 64_000 + 10_000 + 30_000 + 512));
-        let opus_1m = 128_000 + 10_000 + 150_000 + 512;
-        assert!(on.policy(1_000_000).unwrap().hard_capacity_has_room(1_000_000, opus_1m));
-        // A 120k Sonnet window (the old hard-capacity test): 27.5k against 56k.
-        let small = on.policy(120_000).unwrap();
-        assert_eq!(small.target_tokens(), 56_000);
-        assert!(!small.hard_capacity_has_room(120_000, 64_000 + 10_000 + 18_000 + 512));
+        for model in ["claude-opus-5-5", "claude-sonnet-4-6"] {
+            let need = required(model, 200_000);
+            assert_eq!(need, 32_768 + 10_000 + 30_000 + 512, "{model}");
+            assert!(p.hard_capacity_has_room(200_000, need), "{model}");
+            // ~33k of context is far from hard capacity now...
+            let at = |used: u64| ContextBudget {
+                context_window_tokens: 200_000,
+                used_tokens: used,
+                hard_remaining_tokens: 200_000 - used,
+                required_next_round_tokens: need,
+            };
+            let state = ContextState::default();
+            assert_eq!(assess_context(&p.config, &state, at(33_000)).action, ContextAction::Continue);
+            // ...which is 126,720 here.
+            assert_eq!(assess_context(&p.config, &state, at(126_720)).action, ContextAction::Continue);
+            assert_eq!(assess_context(&p.config, &state, at(126_721)).action, ContextAction::HardStop);
+            let need_1m = required(model, 1_000_000);
+            assert!(on.policy(1_000_000).unwrap().hard_capacity_has_room(1_000_000, need_1m));
+        }
+        // The old 128k reserve on that window would have been dominated.
+        assert!(!p.hard_capacity_has_room(200_000, 128_000 + 10_000 + 30_000 + 512));
+        // A 100k window still is: 41,720 against 46,666.
+        let small = on.policy(100_000).unwrap();
+        assert_eq!(small.target_tokens(), 46_666);
+        assert_eq!(100_000 - required("claude-opus-5-5", 100_000), 41_720);
+        assert!(!small.hard_capacity_has_room(100_000, required("claude-opus-5-5", 100_000)));
         // The boundary: a successor at the target must start below the line.
         assert!(!p.hard_capacity_has_room(200_000, 200_000 - 93_333));
         assert!(p.hard_capacity_has_room(200_000, 200_000 - 93_334));
