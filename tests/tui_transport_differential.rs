@@ -15,7 +15,10 @@
 //!
 //! Scenarios: plain_turn, tool_loop, abort_mid_stream, steer_mid_stream,
 //! settings_model_change, clear, compaction, queued_during_compaction,
-//! secret_prompt, extension_loaded. `queue_while_busy_then_autosend`
+//! extension_loaded. `secret_prompt` is gone: the reference binary raised
+//! it from `Password:` text on bash's stderr, which this binary no longer
+//! does (only a verified sudo askpass request prompts, and that needs a
+//! real set-uid sudo). `queue_while_busy_then_autosend`
 //! (the `Steered{delivered:false}` → auto-send-on-Done branch) is NOT
 //! here: it needs the stream's steering receiver closed before `Done` is
 //! processed, which neither binary reaches deterministically (same reason
@@ -35,27 +38,6 @@ use phase2::{
     spawn_stub, Script, ANTHROPIC_MESSAGES_JSON, ANTHROPIC_SSE, ANTHROPIC_SSE_PREFIX,
     ANTHROPIC_SSE_TOOL_USE,
 };
-
-/// Anthropic SSE turn calling `bash` with a command that prints a password
-/// prompt on stderr and reads the answer from stdin — the bash tool's
-/// `detect_password_prompt` raises a secret prompt (`Prompt` envelope →
-/// secret-prompt pane on both binaries). Deterministic: the tool result is
-/// `len=<answer length>`.
-const ANTHROPIC_SSE_BASH_PASSWORD: &str = concat!(
-    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_04\",\"type\":\"message\",",
-    "\"role\":\"assistant\",\"content\":[],\"model\":\"claude-sonnet-4-5\",\"stop_reason\":null,",
-    "\"stop_sequence\":null,\"usage\":{\"input_tokens\":10,\"output_tokens\":0,",
-    "\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0}}}\n\n",
-    "data: {\"type\":\"content_block_start\",\"index\":0,",
-    "\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_pw\",\"name\":\"bash\",\"input\":{}}}\n\n",
-    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",",
-    "\"partial_json\":\"{\\\"command\\\":\\\"printf 'Password: ' >&2; read -r p; echo len=${#p}\\\"}\"}}\n\n",
-    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
-    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\",",
-    "\"stop_sequence\":null},\"usage\":{\"input_tokens\":10,\"output_tokens\":5,",
-    "\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0}}\n\n",
-    "data: {\"type\":\"message_stop\"}\n\n",
-);
 
 /// The in-tree process-extension fixture (`crates/agent-tui/tests/fixtures/
 /// interactive_command_extension.py`), planted as an installed plugin under
@@ -230,24 +212,6 @@ fn scenarios() -> Vec<Scenario> {
                 Capture("queued"),
                 Wait(3000),
                 Capture("after_compact"),
-            ],
-            extensions: false,
-        },
-        // `bash` prints `Password:` on stderr → secret prompt pane on both
-        // binaries; the answer goes back to the tool's stdin (`PromptBridge`
-        // on the new side, the inline pane on the reference).
-        Scenario {
-            name: "secret_prompt",
-            script: Script::SeqSse(&[ANTHROPIC_SSE_BASH_PASSWORD, ANTHROPIC_SSE]),
-            steps: vec![
-                Type("do it"),
-                Key("Enter"),
-                Wait(2000),
-                Capture("prompting"),
-                Type("abc"),
-                Key("Enter"),
-                Wait(2500),
-                Capture("after_answer"),
             ],
             extensions: false,
         },

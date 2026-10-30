@@ -130,7 +130,8 @@ crates/agent-engine/src/  (crate: synaps-engine)
 │   ├── respond.rs        — event-bus response tool
 │   ├── send_channel.rs   — channel send tool
 │   ├── watcher_exit.rs   — graceful-exit tool (watcher agents only)
-│   ├── secret_prompt.rs  — secure sudo password prompt handling
+│   ├── secret_prompt.rs  — masked secret / confirm prompt plumbing (TUI queue, handle)
+│   ├── sudo_askpass/     — bash tool's sudo password path: `synaps-sudo-askpass` helper + per-call broker (Linux)
 │   ├── shell/            — stateful PTY shell (start/send/end) — session manager
 │   └── util.rs           — strip_ansi, expand_path, NEXT_SUBAGENT_ID
 ├── mcp/                  — Model Context Protocol client

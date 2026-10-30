@@ -15,7 +15,7 @@
 #
 # Scenarios (SYNAPS_TUI_E2E_ONLY=<name> to run one): plain_turn, tool_loop,
 # abort_mid_stream, steer_mid_stream, settings_model_change, clear,
-# compaction, queued_during_compaction, secret_prompt, extension_loaded
+# compaction, queued_during_compaction, extension_loaded
 # (the only one that runs WITHOUT --no-extensions; plants the in-tree
 # process-extension fixture). Needs python3 on PATH for that one.
 #
