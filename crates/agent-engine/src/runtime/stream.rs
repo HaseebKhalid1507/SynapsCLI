@@ -174,6 +174,9 @@ pub(super) struct StreamSession {
     pub(super) tool_spill: super::tool_spill::ToolSpill,
     /// Read dedupe + write/edit notes (off = legacy history bytes).
     pub(super) read_dedupe: bool,
+    /// Keep the cache warm while a tool round runs (`cache_keepwarm_tools`;
+    /// `None` = off).
+    pub(super) tool_keepwarm: Option<super::tool_keepwarm::ToolKeepWarm>,
     pub(super) bash_timeout: u64,
     pub(super) bash_max_timeout: u64,
     pub(super) subagent_timeout: u64,
@@ -694,6 +697,7 @@ impl StreamMethods {
             max_tool_output,
             tool_spill,
             read_dedupe,
+            tool_keepwarm,
             bash_timeout,
             bash_max_timeout,
             subagent_timeout,
@@ -1707,6 +1711,7 @@ impl StreamMethods {
                 request_messages
             };
 
+            let round_mark = super::tool_keepwarm::RoundMark::new(&usage_counters);
             let response = match await_provider_call(&cancel, ApiMethods::call_api_stream_inner(
                 &auth,
                 &client,
@@ -1738,6 +1743,40 @@ impl StreamMethods {
             // response that asks for nothing more is then the turn's
             // normal end (`TurnCompletion`).
             let response_cancelled = cancel.is_cancelled();
+
+            // A round that asks for tools: keep its prefix warm while they
+            // run (`runtime::tool_keepwarm`). Stopped once their results are
+            // in; dropped (stopped) on every other way out of this round.
+            let mut round_keepwarm = match &tool_keepwarm {
+                Some(settings)
+                    if !response_cancelled && super::tool_keepwarm::has_tool_use(&response) =>
+                {
+                    super::tool_keepwarm::ToolRoundKeepWarm::start(
+                        settings,
+                        round_mark,
+                        super::tool_keepwarm::Round {
+                            auth: &auth,
+                            client: &client,
+                            model: &model,
+                            tools: &tools_snapshot,
+                            system_prompt: &injected_system,
+                            thinking_budget,
+                            reasoning_level,
+                            messages: request_messages,
+                            options: round_options,
+                            telemetry_level,
+                        },
+                        super::tool_keepwarm::Turn {
+                            usage: &usage_counters,
+                            max_cost_usd: budget_meter.budget().max_cost_usd,
+                            tx: &tx,
+                            cancel: &cancel,
+                        },
+                    )
+                    .await
+                }
+                _ => None,
+            };
 
             // Optional usage dimensions (context tokens / cost), fed by
             // the transport's authoritative Usage emission this round.
@@ -2911,6 +2950,12 @@ impl StreamMethods {
                             );
                         }
                     }
+                }
+
+                // The round's tools are done (or cancelled): stop its
+                // keep-warm before the next request, so no ping races it.
+                if let Some(keepwarm) = round_keepwarm.take() {
+                    keepwarm.finish().await;
                 }
 
                 // Add tool results to conversation — always, so the assistant's tool_use
@@ -4322,6 +4367,7 @@ mod rich_output_tests {
             max_tool_output: 30_000,
             tool_spill: Default::default(),
             read_dedupe: false,
+            tool_keepwarm: None,
             bash_timeout: 30,
             bash_max_timeout: 300,
             subagent_timeout: 300,
@@ -6044,6 +6090,7 @@ mod rich_output_tests {
             max_tool_output: 30_000,
             tool_spill: Default::default(),
             read_dedupe: false,
+            tool_keepwarm: None,
             bash_timeout: 30,
             bash_max_timeout: 300,
             subagent_timeout: 300,
@@ -7602,6 +7649,202 @@ mod rich_output_tests {
             for (id, body) in [("toolu_r2", 2), ("toolu_p2", 3), ("toolu_w", 4), ("toolu_e", 5)] {
                 assert_eq!(run.wire(body, id), run.result(id), "{id}");
             }
+        }
+    }
+
+    /// Tool-round keep-warm (`runtime::tool_keepwarm`) on the wire, against
+    /// a provider that simulates prompt caching (`tests/support/cache_sim.rs`).
+    mod tool_keepwarm_stream {
+        use super::*;
+        use crate::runtime::tool_keepwarm::ToolKeepWarm;
+        use std::time::{Duration, Instant};
+
+        use crate::runtime::cache_sim;
+
+        /// A tool that takes `.0` to return (it ignores cancellation, like a
+        /// command that only notices it after the fact).
+        struct Slow(Duration);
+        #[async_trait::async_trait]
+        impl Tool for Slow {
+            fn name(&self) -> &str {
+                "slow"
+            }
+            fn description(&self) -> &str {
+                "a long build"
+            }
+            fn parameters(&self) -> Value {
+                json!({"type":"object","properties":{}})
+            }
+            fn origin(&self) -> crate::tools::ToolOrigin {
+                crate::tools::ToolOrigin::Builtin
+            }
+            fn effect(&self) -> crate::tools::catalog::ToolEffect {
+                crate::tools::catalog::ToolEffect::ReadOnly
+            }
+            async fn execute(&self, _params: Value, _ctx: ToolContext) -> Result<String> {
+                tokio::time::sleep(self.0).await;
+                Ok("built".to_string())
+            }
+        }
+
+        /// The simulated cache's TTL: a round of [`LONG`] outlives it.
+        const TTL: Duration = Duration::from_millis(700);
+        const INTERVAL: Duration = Duration::from_millis(250);
+        const LONG: Duration = Duration::from_millis(1600);
+
+        struct Run {
+            requests: Vec<cache_sim::Req>,
+            sim: Arc<Mutex<cache_sim::Sim>>,
+            /// `Usage` events the turn emitted (rounds and pings).
+            usage_events: usize,
+            cancelled_at: Option<Instant>,
+            started: Instant,
+            elapsed: Duration,
+        }
+
+        impl Run {
+            fn pings(&self) -> Vec<&cache_sim::Req> {
+                self.requests.iter().filter(|r| r.is_ping()).collect()
+            }
+            fn requests_now(&self) -> usize {
+                self.sim.lock().unwrap().requests.len()
+            }
+        }
+
+        async fn run(
+            tool_time: Duration,
+            keepwarm: Option<Duration>,
+            cancel_after: Option<Duration>,
+        ) -> Run {
+            let (url, sim) = cache_sim::spawn(TTL, "slow", json!({})).await;
+            let mut registry = ToolRegistry::new();
+            registry.register(Arc::new(Slow(tool_time)));
+            let (tx, mut rx) = mpsc::unbounded_channel::<StreamEvent>();
+            let mut session = harness_session(
+                url,
+                Arc::new(RwLock::new(registry)),
+                tx,
+                crate::tools::shell::SessionManager::new(
+                    crate::tools::shell::ShellConfig::default(),
+                ),
+                Arc::new(crate::extensions::hooks::HookBus::new()),
+                crate::tools::activation::SessionId::parse(&format!(
+                    "test-{}-{}",
+                    std::process::id(),
+                    uuid::Uuid::new_v4()
+                ))
+                .unwrap(),
+                Default::default(),
+                false,
+                "claude-sonnet-4-6",
+            );
+            session.system_prompt = Some(format!("a worker\n{}", "context ".repeat(4000)));
+            session.tool_keepwarm = keepwarm.map(|interval| ToolKeepWarm {
+                trace: Default::default(),
+                interval_override: Some(interval),
+            });
+            let cancelled_at = Arc::new(Mutex::new(None));
+            if let Some(after) = cancel_after {
+                let (cancel, at) = (session.cancel.clone(), cancelled_at.clone());
+                tokio::spawn(async move {
+                    tokio::time::sleep(after).await;
+                    *at.lock().unwrap() = Some(Instant::now());
+                    cancel.cancel();
+                });
+            }
+            let started = Instant::now();
+            let messages = vec![Arc::new(json!({"role":"user","content":"build it"})) as SharedMessage];
+            let _ = tokio::time::timeout(
+                Duration::from_secs(30),
+                StreamMethods::run_stream_internal(session, messages),
+            )
+            .await
+            .expect("the turn ends");
+            let elapsed = started.elapsed();
+            let mut usage_events = 0;
+            while let Ok(event) = rx.try_recv() {
+                if matches!(event, StreamEvent::Session(SessionEvent::Usage { .. })) {
+                    usage_events += 1;
+                }
+            }
+            let requests = sim.lock().unwrap().requests.clone();
+            let cancelled_at = *cancelled_at.lock().unwrap();
+            Run {
+                requests,
+                sim,
+                usage_events,
+                cancelled_at,
+                started,
+                elapsed,
+            }
+        }
+
+        /// Pings fire once the round has run for the interval, repeat while
+        /// it runs, are the round's request plus the ping text (same tools,
+        /// system, markers and history), keep the prefix alive, and stop
+        /// when the tools return: the next request reads the whole prefix.
+        #[tokio::test]
+        async fn a_long_round_is_kept_warm_and_the_next_request_reads_the_prefix() {
+            let run = run(LONG, Some(INTERVAL), None).await;
+            let pings = cache_sim::assert_round_kept_warm("stream", &run.requests);
+            // 1600 ms at 250 ms: due at 250, 500, ... 1500 (± scheduling).
+            assert!((4..=7).contains(&pings), "repeats while the round runs: {pings}");
+            // The interval runs from the round's send (the client clock, a
+            // little before the provider sees it), so bound it by the turn.
+            let first = run.pings()[0].at.duration_since(run.started);
+            assert!(first >= INTERVAL, "not before the threshold: {first:?}");
+            // Every ping is booked into the turn.
+            assert_eq!(run.usage_events, run.requests.len(), "usage of every request");
+            // Stopped with the round: nothing after the result request.
+            let count = run.requests_now();
+            tokio::time::sleep(INTERVAL * 3).await;
+            assert_eq!(run.requests_now(), count, "no ping after the round");
+        }
+
+        /// The control: the same round without keep-warm finds the cache
+        /// expired and rewrites the prefix (what the fix is for, and proof
+        /// the simulated cache does expire).
+        #[tokio::test]
+        async fn without_keepwarm_a_long_round_rewrites_the_prefix() {
+            let run = run(LONG, None, None).await;
+            assert_eq!(run.requests.len(), 2, "the round and its result");
+            let (round, result) = (&run.requests[0], &run.requests[1]);
+            assert_eq!(result.read, 0, "expired");
+            assert!(result.write >= round.cached_prefix(), "rewritten");
+        }
+
+        /// A round shorter than the interval sends no ping.
+        #[tokio::test]
+        async fn a_short_round_sends_no_ping() {
+            let run = run(Duration::from_millis(120), Some(INTERVAL), None).await;
+            assert_eq!(run.requests.len(), 2, "no ping: {:?}", run.pings().len());
+            assert!(run.requests[1].read >= run.requests[0].cached_prefix());
+            tokio::time::sleep(INTERVAL * 2).await;
+            assert_eq!(run.requests_now(), 2);
+        }
+
+        /// A cancelled turn stops the pings at once, while its tool is
+        /// still running.
+        #[tokio::test]
+        async fn cancel_stops_the_pings() {
+            let run = run(
+                Duration::from_secs(8),
+                Some(INTERVAL),
+                Some(Duration::from_millis(900)),
+            )
+            .await;
+            let cancelled = run.cancelled_at.expect("cancelled");
+            let pings = run.pings();
+            assert!(pings.len() >= 2, "pinged before the cancel: {}", pings.len());
+            assert!(
+                pings.iter().all(|p| p.at < cancelled + Duration::from_millis(50)),
+                "a ping after the cancel"
+            );
+            let count = run.requests_now();
+            tokio::time::sleep(INTERVAL * 3).await;
+            assert_eq!(run.requests_now(), count, "no ping after the cancel");
+            assert!(run.requests.iter().all(|r| !r.has_tool_result()), "cancelled");
+            let _ = run.elapsed;
         }
     }
 }

@@ -937,6 +937,12 @@ pub enum KeepWarmMode {
     /// Send only if the built prefix still hashes to `expect`; otherwise
     /// return `{"keepwarm_prefix": <actual>}` without sending.
     Send { expect: u64 },
+    /// Send unconditionally: the messages before the trailing ping are the
+    /// exact request messages of the provider round whose tool calls are
+    /// still running (`runtime::tool_keepwarm`), re-sent with that round's
+    /// own tools, system, thinking and options, so the prefix is that
+    /// request's by construction and there is nothing to fingerprint.
+    Replay,
 }
 
 /// Wire knobs for a keep-warm request (see [`ApiOptions::keepwarm`]).
@@ -1411,7 +1417,23 @@ impl ApiMethods {
         HelperMethods::wire_tool_references(&mut cleaned_messages, &|id: &str| {
             split.and_then(|split| split.id_to_api.get(id).cloned())
         });
-        match &options.keepwarm {
+        let keepwarm_prefix_len = match &options.keepwarm {
+            // Tool-round replay (`runtime::tool_keepwarm`): `messages` are the
+            // round's own request messages, so they are processed and marked
+            // exactly as that round's request was; the ping text is appended
+            // only now, after every marker, as an uncached tail.
+            Some(k) if k.mode == KeepWarmMode::Replay => {
+                HelperMethods::annotate_cache_breakpoint(&mut cleaned_messages, cache_ttl);
+                let prefix_len = cleaned_messages.len();
+                HelperMethods::append_keepwarm_ping(
+                    &mut cleaned_messages,
+                    Arc::new(serde_json::json!({
+                        "role": "user",
+                        "content": super::keepwarm::KEEPWARM_PING_TEXT,
+                    })),
+                );
+                prefix_len
+            }
             // Keep-warm: the marker goes on the last HISTORY message — the
             // durable prefix the next real turn re-sends verbatim — and the
             // trailing ping message (never persisted) rides after it as an
@@ -1422,9 +1444,13 @@ impl ApiMethods {
                     &mut cleaned_messages[..history_len],
                     cache_ttl,
                 );
+                history_len
             }
-            _ => HelperMethods::annotate_cache_breakpoint(&mut cleaned_messages, cache_ttl),
-        }
+            _ => {
+                HelperMethods::annotate_cache_breakpoint(&mut cleaned_messages, cache_ttl);
+                cleaned_messages.len().saturating_sub(1)
+            }
+        };
 
         // Derive the thinking level from the budget for effort mapping.
         // Body assembly (#128 Slice 4): `RequestBody` BORROWS cleaned_messages
@@ -1465,9 +1491,12 @@ impl ApiMethods {
         if let Some(keepwarm) = &options.keepwarm {
             body.apply_keepwarm_max_tokens();
             let beta = Self::build_beta_header(&auth_type, options, model);
-            let actual = body
-                .prefix_fingerprint(cleaned_messages.len().saturating_sub(1), beta.as_deref());
-            let send = matches!(keepwarm.mode, KeepWarmMode::Send { expect } if expect == actual);
+            let actual = body.prefix_fingerprint(keepwarm_prefix_len, beta.as_deref());
+            let send = match keepwarm.mode {
+                KeepWarmMode::Probe => false,
+                KeepWarmMode::Send { expect } => expect == actual,
+                KeepWarmMode::Replay => true,
+            };
             if !send {
                 return Ok(serde_json::json!({
                     "keepwarm_prefix": actual,

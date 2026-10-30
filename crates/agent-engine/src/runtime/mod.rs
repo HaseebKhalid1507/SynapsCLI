@@ -33,6 +33,13 @@ mod http_phases;
 mod image_limits;
 mod image_retention;
 pub mod keepwarm;
+pub mod tool_keepwarm;
+/// The cache-simulating provider of the tool-round keep-warm tests
+/// (`runtime::stream`, `tools::subagent`; host paths:
+/// `tests/worker_tool_keepwarm.rs`).
+#[cfg(test)]
+#[path = "../../tests/support/cache_sim.rs"]
+pub(crate) mod cache_sim;
 pub mod memory_context;
 pub mod memory_history;
 pub mod message_time;
@@ -605,6 +612,10 @@ pub struct Runtime {
     /// Replace re-reads of unchanged files with a stub and note write/edit
     /// results. Off until a config is applied (production default on).
     read_dedupe: bool,
+    /// Keep the cache warm while a tool round runs (`cache_keepwarm_tools`,
+    /// `runtime::tool_keepwarm`). Off until a config is applied
+    /// (production default on).
+    tool_keepwarm: bool,
     bash_timeout: u64,
     bash_max_timeout: u64,
     subagent_timeout: u64,
@@ -1322,6 +1333,7 @@ impl Runtime {
             tool_spill_root: host.spill_root,
             tool_spill_stats: Arc::default(),
             read_dedupe: false,
+            tool_keepwarm: false,
             bash_timeout: 30,
             bash_max_timeout: 300,
             subagent_timeout: 300,
@@ -3009,6 +3021,7 @@ impl Runtime {
         self.max_tool_output = config.max_tool_output;
         self.tool_spill_policy = tool_spill::ToolSpillPolicy::from_config(config);
         self.read_dedupe = config.read_dedupe;
+        self.tool_keepwarm = config.cache_keepwarm_tools;
         self.bash_timeout = config.bash_timeout;
         self.bash_max_timeout = config.bash_max_timeout;
         self.subagent_timeout = config.subagent_timeout;
@@ -3170,6 +3183,15 @@ impl Runtime {
     /// Read dedupe + write/edit notes; off = legacy tool-result bytes.
     pub fn set_read_dedupe(&mut self, enabled: bool) {
         self.read_dedupe = enabled;
+    }
+
+    pub fn tool_keepwarm(&self) -> bool {
+        self.tool_keepwarm
+    }
+
+    /// Keep the cache warm while a tool round runs (`cache_keepwarm_tools`).
+    pub fn set_tool_keepwarm(&mut self, enabled: bool) {
+        self.tool_keepwarm = enabled;
     }
 
     /// Session totals of tool output virtualisation (count, bytes kept out
@@ -5003,6 +5025,10 @@ impl Runtime {
             max_tool_output,
             tool_spill: self.tool_spill(),
             read_dedupe: self.read_dedupe,
+            tool_keepwarm: self.tool_keepwarm.then(|| tool_keepwarm::ToolKeepWarm {
+                trace: self.trace_ctx.clone(),
+                interval_override: tool_keepwarm::interval_override(),
+            }),
             bash_timeout,
             bash_max_timeout,
             subagent_timeout,
@@ -5104,6 +5130,7 @@ impl Clone for Runtime {
             tool_spill_root: self.tool_spill_root.clone(),
             tool_spill_stats: Arc::clone(&self.tool_spill_stats),
             read_dedupe: self.read_dedupe,
+            tool_keepwarm: self.tool_keepwarm,
             bash_timeout: self.bash_timeout,
             bash_max_timeout: self.bash_max_timeout,
             subagent_timeout: self.subagent_timeout,
@@ -5743,6 +5770,19 @@ mod tests {
         assert!(runtime.clone().read_dedupe(), "clones keep it");
         runtime.apply_config(&agent_core::config::load_config_from_str("read_dedupe = off\n"));
         assert!(!runtime.read_dedupe());
+    }
+
+    #[test]
+    fn tool_keepwarm_is_off_until_configured_then_follows_config() {
+        let mut runtime = Runtime::new_headless();
+        assert!(!runtime.tool_keepwarm(), "off until a config is applied");
+        runtime.apply_config(&agent_core::config::load_config_from_str(""));
+        assert!(runtime.tool_keepwarm(), "the config default is on");
+        assert!(runtime.clone().tool_keepwarm(), "clones keep it");
+        runtime.apply_config(&agent_core::config::load_config_from_str(
+            "cache_keepwarm_tools = off\n",
+        ));
+        assert!(!runtime.tool_keepwarm());
     }
 
     #[test]

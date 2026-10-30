@@ -1446,6 +1446,13 @@ pub struct SynapsConfig {
     /// rpc/server clients over the daemon, piped `synaps attach`. Off, only a
     /// session a TUI or interactive `attach` has seen qualifies.
     pub cache_keepwarm_headless: bool,
+    /// Keep the prompt cache warm while a tool round runs
+    /// (`cache_keepwarm_tools`, default `true`): once a round's tools have
+    /// run for the TTL minus a safety margin (4.5 min on 5m, 55 min on 1h),
+    /// re-send that round's request with a minimal output cap so the next
+    /// request reads the prefix instead of rewriting it. Foreground and
+    /// workers alike; independent of the idle `cache_keepwarm`.
+    pub cache_keepwarm_tools: bool,
     /// gzip for Anthropic request bodies (`request_compression`): `auto`
     /// (default) | `on` | `off`. See [`RequestCompressionMode`].
     pub request_compression: RequestCompressionMode,
@@ -1564,6 +1571,7 @@ impl Default for SynapsConfig {
             cache_keepwarm: CacheKeepWarm::Off,
             cache_keepwarm_auto_max_hours: DEFAULT_CACHE_KEEPWARM_AUTO_MAX_HOURS,
             cache_keepwarm_headless: false,
+            cache_keepwarm_tools: true,
             request_compression: RequestCompressionMode::Auto,
             request_compression_level: DEFAULT_REQUEST_COMPRESSION_LEVEL,
             client_input: ClientInput::Shared,
@@ -1652,6 +1660,7 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "cache_keepwarm",
     "cache_keepwarm_auto_max_hours",
     "cache_keepwarm_headless",
+    "cache_keepwarm_tools",
     "request_compression",
     "request_compression_level",
     "client_input",
@@ -2296,6 +2305,13 @@ fn apply_config_content_with(
                 "false" | "0" | "off" | "no" => config.cache_keepwarm_headless = false,
                 _ => config.warnings.push(format!(
                     "cache_keepwarm_headless = {val} — expected true or false; keeping false"
+                )),
+            },
+            "cache_keepwarm_tools" => match val.trim().to_ascii_lowercase().as_str() {
+                "true" | "1" | "on" | "yes" => config.cache_keepwarm_tools = true,
+                "false" | "0" | "off" | "no" => config.cache_keepwarm_tools = false,
+                _ => config.warnings.push(format!(
+                    "cache_keepwarm_tools = {val} — expected on or off; keeping on"
                 )),
             },
             "request_compression" => match RequestCompressionMode::parse(val) {
@@ -3919,6 +3935,23 @@ mod tests {
         let c = load_config_from_str("cache_keepwarm_headless = maybe\n");
         assert!(!c.cache_keepwarm_headless, "garbage keeps it off");
         assert!(c.warnings.iter().any(|w| w.contains("cache_keepwarm_headless")));
+    }
+
+    #[test]
+    fn test_cache_keepwarm_tools_key() {
+        assert!(SynapsConfig::default().cache_keepwarm_tools, "default on");
+        assert!(load_config_from_str("").cache_keepwarm_tools);
+        for off in ["false", "0", "off", "no", "OFF"] {
+            let c = load_config_from_str(&format!("cache_keepwarm_tools = {off}\n"));
+            assert!(!c.cache_keepwarm_tools, "{off}");
+            assert!(c.warnings.is_empty(), "{off}: {:?}", c.warnings);
+        }
+        for on in ["true", "1", "on", "yes"] {
+            assert!(load_config_from_str(&format!("cache_keepwarm_tools = {on}\n")).cache_keepwarm_tools);
+        }
+        let c = load_config_from_str("cache_keepwarm_tools = maybe\n");
+        assert!(c.cache_keepwarm_tools, "garbage keeps it on");
+        assert!(c.warnings.iter().any(|w| w.contains("cache_keepwarm_tools")));
     }
 
     #[test]

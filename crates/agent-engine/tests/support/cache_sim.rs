@@ -1,0 +1,364 @@
+//! A loopback Anthropic provider that simulates prompt caching, for the
+//! tool-round keep-warm tests (`runtime::tool_keepwarm`). Compiled into the
+//! engine's unit tests (`#[path]` from `runtime/mod.rs`, used by
+//! `runtime::stream` and `tools::subagent`) and into
+//! `tests/worker_tool_keepwarm.rs`.
+//!
+//! The cache model (simplified from the API's, conservative where it
+//! matters): a request is the sequence of blocks `header` (model, thinking,
+//! tools, system), then every message content block in order; a block's key
+//! is the serialized prefix through it with every `cache_control` removed,
+//! its size in "tokens" the key's byte length. Every marked block (a
+//! `cache_control` on it; the header counts as marked when tools or system
+//! carry one) up to the last one is written if not live. The read is the
+//! longest live entry ending at or before the last marker; reading it
+//! refreshes its TTL. Unmarked bytes after the last marker are uncached
+//! input. Entries expire `ttl` after their last write or read.
+//!
+//! Replies, by the last message: the keep-warm ping text gets `ok`; a
+//! `tool_result` gets `done`; anything else gets the configured `tool_use`.
+#![allow(dead_code)]
+
+use std::collections::HashMap;
+use std::io::Read;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use axum::response::IntoResponse;
+use serde_json::{json, Value};
+
+/// The ping text (`runtime::keepwarm::KEEPWARM_PING_TEXT`) starts with this.
+pub const PING_MARK: &str = "[automated prompt-cache keep-warm ping";
+
+/// One request as the provider saw it, and what it billed.
+#[derive(Debug, Clone)]
+pub struct Req {
+    pub at: Instant,
+    pub body: Value,
+    pub read: u64,
+    pub write: u64,
+    pub input: u64,
+}
+
+impl Req {
+    fn last_message(&self) -> String {
+        self.body["messages"]
+            .as_array()
+            .and_then(|m| m.last())
+            .map(Value::to_string)
+            .unwrap_or_default()
+    }
+
+    /// The last message carries the keep-warm ping text.
+    pub fn is_ping(&self) -> bool {
+        self.last_message().contains(PING_MARK)
+    }
+
+    /// The last message carries a tool result (and is no ping).
+    pub fn has_tool_result(&self) -> bool {
+        !self.is_ping() && self.last_message().contains("tool_result")
+    }
+
+    /// The tokens through the last marker (what the request caches).
+    pub fn cached_prefix(&self) -> u64 {
+        self.read + self.write
+    }
+}
+
+#[derive(Default)]
+pub struct Sim {
+    pub requests: Vec<Req>,
+    entries: HashMap<String, Instant>,
+}
+
+fn strip(v: &Value) -> Value {
+    match v {
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .filter(|(k, _)| k.as_str() != "cache_control")
+                .map(|(k, v)| (k.clone(), strip(v)))
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(items.iter().map(strip).collect()),
+        other => other.clone(),
+    }
+}
+
+fn marked(v: &Value) -> bool {
+    v.to_string().contains("\"cache_control\"")
+}
+
+/// `(key, marked)` per block, in order.
+fn blocks(body: &Value) -> Vec<(String, bool)> {
+    let header = json!({
+        "model": body["model"],
+        "thinking": body["thinking"],
+        "tools": strip(&body["tools"]),
+        "system": strip(&body["system"]),
+    });
+    let mut key = header.to_string();
+    let mut out = vec![(
+        key.clone(),
+        marked(&body["tools"]) || marked(&body["system"]),
+    )];
+    for message in body["messages"].as_array().into_iter().flatten() {
+        key.push_str(&format!("|{}:", message["role"]));
+        let content = match &message["content"] {
+            Value::String(text) => vec![json!({"type": "text", "text": text})],
+            Value::Array(items) => items.clone(),
+            _ => Vec::new(),
+        };
+        for block in content {
+            key.push_str(&strip(&block).to_string());
+            out.push((key.clone(), marked(&block)));
+        }
+    }
+    out
+}
+
+impl Sim {
+    /// Bill one request at `now` (see the module docs).
+    fn bill(&mut self, body: &Value, now: Instant, ttl: Duration) -> (u64, u64, u64) {
+        self.entries.retain(|_, at| now.duration_since(*at) < ttl);
+        let blocks = blocks(body);
+        let total = blocks.last().map_or(0, |(k, _)| k.len() as u64);
+        let Some(last_mark) = blocks.iter().rposition(|(_, m)| *m) else {
+            return (0, 0, total);
+        };
+        let hit = blocks[..=last_mark]
+            .iter()
+            .rposition(|(k, _)| self.entries.contains_key(k));
+        let read = hit.map_or(0, |i| blocks[i].0.len() as u64);
+        if let Some(i) = hit {
+            self.entries.insert(blocks[i].0.clone(), now);
+        }
+        let through = blocks[last_mark].0.len() as u64;
+        let mut write = 0;
+        for (key, mark) in &blocks[..=last_mark] {
+            if *mark && !self.entries.contains_key(key) {
+                self.entries.insert(key.clone(), now);
+                write = through - read;
+            }
+        }
+        (read, write, total - through)
+    }
+}
+
+fn sse(id: &str, usage: (u64, u64, u64), block: Value, delta: Value, stop: &str) -> String {
+    let (read, write, input) = usage;
+    let usage = json!({
+        "input_tokens": input,
+        "output_tokens": 1,
+        "cache_creation_input_tokens": write,
+        "cache_read_input_tokens": read,
+    });
+    let mut out = format!(
+        "data: {}\n\n",
+        json!({"type":"message_start","message":{"id":id,"type":"message","role":"assistant",
+            "content":[],"model":"claude-sonnet-4-6","stop_reason":null,"stop_sequence":null,
+            "usage":usage}})
+    );
+    out += &format!(
+        "data: {}\n\n",
+        json!({"type":"content_block_start","index":0,"content_block":block})
+    );
+    out += &format!(
+        "data: {}\n\n",
+        json!({"type":"content_block_delta","index":0,"delta":delta})
+    );
+    out += "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n";
+    out += &format!(
+        "data: {}\n\n",
+        json!({"type":"message_delta","delta":{"stop_reason":stop,"stop_sequence":null},"usage":usage})
+    );
+    out + "data: {\"type\":\"message_stop\"}\n\n"
+}
+
+/// Serve the simulated provider. A request that is neither a ping nor
+/// carries a tool result is answered with a `tool_use` of `tool` with
+/// `input`.
+pub async fn spawn(ttl: Duration, tool: &str, input: Value) -> (String, Arc<Mutex<Sim>>) {
+    let sim: Arc<Mutex<Sim>> = Arc::default();
+    let state = sim.clone();
+    let (tool, input) = (tool.to_string(), input.to_string());
+    let app = axum::Router::new()
+        .route(
+            "/v1/messages",
+            axum::routing::post(
+                move |headers: axum::http::HeaderMap, raw: axum::body::Bytes| {
+                    let state = state.clone();
+                    let (tool, input) = (tool.clone(), input.clone());
+                    async move {
+                        let bytes = if headers
+                            .get("content-encoding")
+                            .is_some_and(|v| v == "gzip")
+                        {
+                            let mut out = Vec::new();
+                            flate2::read::GzDecoder::new(&raw[..])
+                                .read_to_end(&mut out)
+                                .unwrap();
+                            out
+                        } else {
+                            raw.to_vec()
+                        };
+                        let body: Value = serde_json::from_slice(&bytes).unwrap();
+                        let now = Instant::now();
+                        let mut sim = state.lock().unwrap();
+                        let (read, write, uncached) = sim.bill(&body, now, ttl);
+                        let req = Req {
+                            at: now,
+                            body,
+                            read,
+                            write,
+                            input: uncached,
+                        };
+                        let usage = (read, write, uncached);
+                        // Unique per request: a resumed worker's history
+                        // holds the earlier round's call too.
+                        let call_id = format!("toolu_{}", sim.requests.len());
+                        let reply = if req.is_ping() {
+                            sse(
+                                "msg_ping",
+                                usage,
+                                json!({"type":"text","text":""}),
+                                json!({"type":"text_delta","text":"ok"}),
+                                "end_turn",
+                            )
+                        } else if req.has_tool_result() {
+                            sse(
+                                "msg_done",
+                                usage,
+                                json!({"type":"text","text":""}),
+                                json!({"type":"text_delta","text":"done"}),
+                                "end_turn",
+                            )
+                        } else {
+                            sse(
+                                "msg_tool",
+                                usage,
+                                json!({"type":"tool_use","id":call_id,"name":tool,"input":{}}),
+                                json!({"type":"input_json_delta","partial_json":input}),
+                                "tool_use",
+                            )
+                        };
+                        sim.requests.push(req);
+                        ([("content-type", "text/event-stream")], reply).into_response()
+                    }
+                },
+            ),
+        )
+        .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (format!("http://{addr}"), sim)
+}
+
+/// `body` with every `cache_control` removed.
+pub fn without_markers(body: &Value) -> Value {
+    strip(body)
+}
+
+/// Where the markers sit: `(message, block)` per marked message block.
+pub fn marker_layout(body: &Value) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    for (i, message) in body["messages"].as_array().into_iter().flatten().enumerate() {
+        for (j, block) in message["content"].as_array().into_iter().flatten().enumerate() {
+            if block.get("cache_control").is_some() {
+                out.push((i, j));
+            }
+        }
+    }
+    out
+}
+
+/// The tool-round keep-warm contract for one worker or turn: `requests` are
+/// the round's request (`[0]`), its pings, then the request carrying the
+/// tool result. Every ping is the round's request byte for byte (tools,
+/// system, thinking, markers, messages) plus one trailing ping text block
+/// in the last user message, reads the whole cached prefix and writes
+/// nothing; the request after the round reads the round's whole prefix.
+/// Returns the number of pings.
+pub fn assert_round_kept_warm(label: &str, requests: &[Req]) -> usize {
+    assert!(requests.len() >= 3, "{label}: round, ping(s), result: {}", requests.len());
+    let round = &requests[0];
+    assert!(!round.is_ping() && !round.has_tool_result(), "{label}: the round first");
+    assert!(round.cached_prefix() > 0, "{label}: the round caches its prefix");
+    let result = requests.last().unwrap();
+    assert!(result.has_tool_result(), "{label}: the tool result last");
+    let pings = &requests[1..requests.len() - 1];
+    for (i, ping) in pings.iter().enumerate() {
+        let label = format!("{label}: ping {i}");
+        assert!(ping.is_ping(), "{label}: only pings inside the round");
+        for key in ["model", "tools", "system", "thinking", "stream"] {
+            assert_eq!(ping.body[key], round.body[key], "{label}: {key}");
+        }
+        // Minimal output: one token past a budgeted thinking block (the
+        // thinking config must match the round's for the cache to hold).
+        let floor = match &round.body["thinking"] {
+            t if t["type"] == "enabled" => t["budget_tokens"].as_u64().unwrap(),
+            _ => 0,
+        };
+        assert_eq!(ping.body["max_tokens"], json!(floor + 1), "{label}: minimal output");
+        assert_eq!(
+            marker_layout(&ping.body),
+            marker_layout(&round.body),
+            "{label}: the breakpoint layout"
+        );
+        let (pm, rm) = (
+            ping.body["messages"].as_array().unwrap(),
+            round.body["messages"].as_array().unwrap(),
+        );
+        assert_eq!(pm.len(), rm.len(), "{label}: the ping folds into the last message");
+        assert_eq!(pm[..pm.len() - 1], rm[..rm.len() - 1], "{label}: history");
+        let (pl, rl) = (
+            pm.last().unwrap()["content"].as_array().unwrap(),
+            rm.last().unwrap()["content"].as_array().unwrap(),
+        );
+        assert_eq!(pl[..pl.len() - 1], rl[..], "{label}: the round's last message");
+        let tail = pl.last().unwrap();
+        assert!(tail["text"].as_str().unwrap().starts_with(PING_MARK), "{label}: {tail}");
+        assert!(tail.get("cache_control").is_none(), "{label}: an uncached tail");
+        assert_eq!(ping.read, round.cached_prefix(), "{label}: reads the whole prefix");
+        assert_eq!(ping.write, 0, "{label}: writes nothing");
+    }
+    assert!(
+        result.read >= round.cached_prefix(),
+        "{label}: the request after the round reads the round's prefix \
+         (read {}, prefix {})",
+        result.read,
+        round.cached_prefix()
+    );
+    pings.len()
+}
+
+/// Everything the provider saw so far, clearing the log.
+pub fn take(sim: &Arc<Mutex<Sim>>) -> Vec<Req> {
+    std::mem::take(&mut sim.lock().unwrap().requests)
+}
+
+/// The simulated cache TTL of the worker tests: a `sleep` of
+/// [`WORKER_SLEEP`] outlives it.
+pub const WORKER_TTL: Duration = Duration::from_millis(700);
+
+/// The pings' interval in the worker tests (`tool_keepwarm::testing`).
+pub const WORKER_INTERVAL: Duration = Duration::from_millis(250);
+
+/// What a worker's `bash` call runs: well past [`WORKER_TTL`].
+pub const WORKER_SLEEP: &str = "sleep 1.6";
+
+/// One worker's requests with tool-round keep-warm on: kept warm (see
+/// [`assert_round_kept_warm`]), with the pings repeating.
+pub fn assert_worker_kept_warm(label: &str, requests: &[Req]) {
+    let pings = assert_round_kept_warm(label, requests);
+    assert!(pings >= 2, "{label}: repeats while the tool runs: {pings}");
+}
+
+/// One worker's requests with tool-round keep-warm off: no ping, and the
+/// request after the round finds the prefix expired and rewrites it.
+pub fn assert_worker_rewrites(label: &str, requests: &[Req]) {
+    assert_eq!(requests.len(), 2, "{label}: round and result only");
+    assert!(!requests.iter().any(Req::is_ping), "{label}: no ping");
+    assert_eq!(requests[1].read, 0, "{label}: expired");
+    assert!(requests[1].write >= requests[0].cached_prefix(), "{label}: rewritten");
+}
