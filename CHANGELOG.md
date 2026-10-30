@@ -176,6 +176,21 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Retiring a screenshot from a parallel tool batch no longer rewrites
+  the whole history.** When old images are retired from a request, the
+  cache anchor is meant to sit just before the first message that changes,
+  so the request re-reads everything ahead of it. If the oldest image still
+  being sent was not the first block of its message (the second result of
+  two parallel `read`s, say), the anchor went on an earlier block of that
+  same message. Those bytes had not changed, but Anthropic did not serve
+  the entry, and the request wrote the whole conversation again: one worker
+  read 6.8k and wrote 281k tokens on a single retirement. The anchor now
+  always goes on the last unchanged message before the one that changes,
+  on every route, including messages that the request merges into it.
+  Retirement itself was already chunked (a worker retires four or five
+  screenshots at a time, not one per screenshot), so the image budgets are
+  unchanged.
+
 - **Subagent workers follow more of the parent's config.** Workers ran
   with the defaults for `bash_timeout`, `bash_max_timeout`,
   `max_tool_output`, `cache_diagnostics` and

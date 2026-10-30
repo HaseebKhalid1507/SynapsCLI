@@ -14,8 +14,9 @@
 //! history changes once per chunk instead of once per new image. The replay
 //! also reports the retention frontier: the oldest image the PREVIOUS request
 //! still sent. Nothing before it differs between the two requests, so the
-//! native transport puts a cache breakpoint just ahead of it
-//! (`HelperMethods::annotate_retention_anchor`) and a retirement re-reads the
+//! native transport puts a cache breakpoint on the last whole message ahead
+//! of the one holding it (`HelperMethods::annotate_retention_anchor`; never
+//! an earlier block of that same message) and a retirement re-reads the
 //! prefix up to there instead of rewriting it.
 use crate::SharedMessage;
 use serde_json::{json, Value};
@@ -672,6 +673,68 @@ mod tests {
         history
     }
 
+    /// A tool loop whose round `i` takes `layout[i]` screenshots in parallel:
+    /// one assistant message with that many tool_uses, then one user batch
+    /// with as many tool_results, screenshot `j` of the round in block `j`.
+    fn screenshot_loop(layout: &[usize], bytes: usize) -> Vec<SharedMessage> {
+        let mut history = vec![Arc::new(json!({"role":"user","content":"go"}))];
+        for (i, &shots) in layout.iter().enumerate() {
+            let ids: Vec<String> = (0..shots).map(|j| format!("t{i}.{j}")).collect();
+            history.push(Arc::new(
+                json!({"role":"assistant","content":ids.iter().map(|id| json!(
+                {"type":"tool_use","id":id,"name":"screenshot","input":{}}
+            )).collect::<Vec<_>>()}),
+            ));
+            history.push(Arc::new(
+                json!({"role":"user","content":ids.iter().map(|id| json!(
+                {"type":"tool_result","tool_use_id":id,
+                 "content":[{"type":"text","text":format!("shot {id}")}, shot(bytes)]}
+            )).collect::<Vec<_>>()}),
+            ));
+        }
+        history
+    }
+
+    /// The screenshot rounds of the worker behind the 2026-10-30 cache-break
+    /// report (thinking-ui, sa_13): 41 screenshots in 34 tool rounds, with
+    /// the parallel pairs where they fell (text-only rounds in between do not
+    /// move the replay). Taken from its saved history.
+    const SA13: [usize; 34] = [
+        1, 1, 2, 1, 2, 1, 2, 2, 1, 1, 1, 2, 1, 1, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+        1, 1, 2, 1,
+    ];
+
+    /// The report read that worker's retirements as one image per new
+    /// screenshot, because it logged only the first block each one changed.
+    /// The replay (which reproduces every anchor index the telemetry logged)
+    /// retires in chunks: nine rewrites for 41 screenshots, four or five
+    /// images each, on the native and the routed worker route alike. A
+    /// budget without hysteresis (retire down to the cap) would rewrite on
+    /// every screenshot past the sixth.
+    #[test]
+    fn sa13_screenshot_session_rewrites_once_per_chunk_on_every_worker_route() {
+        for model in ["claude-opus-4-6", "groq/llama-3.3-70b-versatile"] {
+            let mut previous: Option<(usize, Vec<SharedMessage>)> = None;
+            let mut chunks = Vec::new();
+            for n in 1..=SA13.len() {
+                let history = screenshot_loop(&SA13[..n], 1_000);
+                let round = round_images(model, CodexRequestRole::Worker, &history).unwrap();
+                let (sent, _) = round.views(&history);
+                let retired = plan_request(&history, Budget::Worker).unwrap().retired;
+                if let Some((before, previous)) = &previous {
+                    // A rewrite: a message the previous request sent changed.
+                    let rewrote = previous.iter().zip(sent).any(|(a, b)| a != b);
+                    assert_eq!(rewrote, retired > *before, "{model} round {n}");
+                    if rewrote {
+                        chunks.push(retired - before);
+                    }
+                }
+                previous = Some((retired, sent.to_vec()));
+            }
+            assert_eq!(chunks, [4, 5, 5, 4, 4, 4, 4, 4, 4], "{model}");
+        }
+    }
+
     fn retired_by_round(budget: Budget, rounds: usize, bytes: usize) -> Vec<usize> {
         (1..=rounds)
             .map(|n| {
@@ -886,18 +949,36 @@ mod tests {
             let native = plan_request(sent, Budget::Native).unwrap();
             let mut out = sent.to_vec();
             retire(&mut out, native.retired);
-            HelperMethods::annotate_retention_anchor(
-                &mut out,
-                earliest(round.applied_frontier(), native.frontier),
-                CacheTtl::FiveMinutes,
-            );
+            let frontier = earliest(round.applied_frontier(), native.frontier);
+            HelperMethods::annotate_retention_anchor(&mut out, frontier, CacheTtl::FiveMinutes);
             HelperMethods::annotate_cache_breakpoint(&mut out, CacheTtl::FiveMinutes);
-            out
+            (out, frontier)
         };
-        for (role, rounds, bytes) in [
-            (CodexRequestRole::Worker, 40, 300_000),
-            (CodexRequestRole::Worker, 25, 900_000),
-            (CodexRequestRole::Foreground, 260, 10),
+        /// Markers stripped: the messages up to and including `through`.
+        fn messages_through(messages: &[SharedMessage], through: usize) -> String {
+            let stripped: Vec<Value> = messages[..=through]
+                .iter()
+                .map(|m| {
+                    let mut m = (**m).clone();
+                    for b in m["content"].as_array_mut().into_iter().flatten() {
+                        if let Some(obj) = b.as_object_mut() {
+                            obj.remove("cache_control");
+                        }
+                    }
+                    m
+                })
+                .collect();
+            serde_json::to_string(&stripped).unwrap()
+        }
+        let pairs = [2; 30];
+        let mixed: Vec<usize> = (0..260).map(|i| 2 - i % 2).collect();
+        for (role, layout, bytes) in [
+            (CodexRequestRole::Worker, &[1; 40][..], 300_000),
+            (CodexRequestRole::Worker, &[1; 25][..], 900_000),
+            (CodexRequestRole::Worker, &SA13[..], 300_000),
+            (CodexRequestRole::Worker, &pairs[..], 10),
+            (CodexRequestRole::Foreground, &[1; 260][..], 10),
+            (CodexRequestRole::Foreground, &mixed[..], 10),
         ] {
             /// What one round sent: its retirement, marker positions, body.
             struct Sent {
@@ -907,9 +988,10 @@ mod tests {
             }
             let mut previous: Option<Sent> = None;
             let mut retirements = 0;
-            for n in 1..=rounds {
-                let history = worker_loop(n, bytes);
-                let out = outgoing(&history, role);
+            let mut mid_message_frontiers = 0;
+            for n in 1..=layout.len() {
+                let history = screenshot_loop(&layout[..n], bytes);
+                let (out, frontier) = outgoing(&history, role);
                 let marks = marked(&out);
                 assert_eq!(marks.len(), 2, "anchor + tail, round {n}");
                 let budget = Budget::for_request("claude-sonnet-4-6", role);
@@ -918,6 +1000,25 @@ mod tests {
                     if retired > previous.retired {
                         retirements += 1;
                         assert_eq!(marks[0], previous.marks[0], "{role:?} round {n}");
+                        // The anchor closes a whole message ahead of the
+                        // first one the retirement rewrote, never a block
+                        // inside it.
+                        let rewritten = (0..previous.out.len())
+                            .find(|&m| {
+                                messages_through(&out, m) != messages_through(&previous.out, m)
+                            })
+                            .expect("a retirement rewrites a message");
+                        mid_message_frontiers += usize::from(frontier.unwrap().1 > 0);
+                        assert!(
+                            marks[0].0 < rewritten,
+                            "{role:?} round {n}: anchor {:?} must precede rewritten message {rewritten}",
+                            marks[0]
+                        );
+                        assert_eq!(
+                            messages_through(&out, marks[0].0),
+                            messages_through(&previous.out, marks[0].0),
+                            "{role:?} round {n}: the anchored message must not change"
+                        );
                         assert_eq!(
                             prefix_at(&out, marks[0]),
                             prefix_at(&previous.out, previous.marks[0]),
@@ -939,6 +1040,12 @@ mod tests {
                 });
             }
             assert!(retirements >= 4, "{role:?}: {retirements} retirements");
+            if layout.contains(&2) {
+                assert!(
+                    mid_message_frontiers > 0,
+                    "{role:?}: the parallel layout must put a frontier past block 0"
+                );
+            }
         }
     }
 }
