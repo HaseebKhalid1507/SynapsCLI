@@ -422,6 +422,10 @@ define_settings! {
         "Longest an auto keep-warm idle period may run, in hours (1–48, default 24). Takes effect next launch.",
         |_app, value| whole_number("cache_keepwarm_auto_max_hours", value);
 
+    "cache_keepwarm_headless", "Keep-warm headless", Context, EditorKind::Cycler(&["off", "on"]),
+        "Let daemon sessions driven only by chat, rpc or server clients (bridges, scripts) keep warm too; off (default) keeps it to sessions a TUI or `synaps attach` typed in. `synaps rpc` without the daemon never keeps warm. Takes effect next launch.",
+        |_app, value| on_off("cache_keepwarm_headless", value);
+
     "context_management.mode", "Context management", Context,
         EditorKind::Cycler(&["off", "auto"]),
         "Automatic context management: auto plans a wrap-up and hands over to a fresh context before the window fills; off disables it (default). Takes effect next launch.",
@@ -1182,6 +1186,8 @@ mod tests {
             assert!(is_err(d("cache_keepwarm", "49h")));
             assert!(is_ok(d("cache_keepwarm_auto_max_hours", "48")));
             assert!(is_err(d("cache_keepwarm_auto_max_hours", "49")));
+            assert!(is_ok(d("cache_keepwarm_headless", "on")));
+            assert!(is_ok(d("cache_keepwarm_headless", "off")));
             assert!(is_ok(d("context_management.pressure_tokens", "auto")));
             assert!(is_ok(d("context_management.pressure_tokens", "120000")));
             assert!(is_err(d("context_management.pressure_tokens", "lots")));

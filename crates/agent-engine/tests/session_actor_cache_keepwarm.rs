@@ -916,6 +916,52 @@ async fn an_observe_attach_never_makes_a_session_eligible() {
     end(&mut script).await;
 }
 
+/// `cache_keepwarm_headless`: a session driven only by a non-interactive
+/// client (chat, rpc, server) is never eligible by default, and is once the
+/// owner opts in. Observe stays excluded either way (unit-tested in
+/// `client_qualifies`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn headless_clients_qualify_only_with_the_opt_in() {
+    let (url, bodies) = recording_stub().await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    for (headless, kind) in [
+        (false, ClientKind::Chat),
+        (false, ClientKind::Rpc),
+        (false, ClientKind::Server),
+        (true, ClientKind::Chat),
+        (true, ClientKind::Rpc),
+        (true, ClientKind::Server),
+    ] {
+        let h = Home::new();
+        write_config(
+            &h,
+            &format!(
+                "cache_keepwarm = auto\ncache_ttl = 1h\nthinking = off\n\
+                 cache_keepwarm_headless = {headless}\n"
+            ),
+        );
+        let host = host().await;
+        let handle = host.create_session(cfg()).await.unwrap();
+        let (mut c, _) = LocalTransport::attach(handle.clone(), ClientMeta::new(kind))
+            .await
+            .unwrap();
+        turn(&mut c, "hello").await;
+        // On an idle session `/keepwarm auto` starts a period at once iff
+        // the session is eligible.
+        let st = keepwarm(&mut c, 710, "auto").await;
+        assert_eq!(
+            st["active"].as_bool(),
+            Some(headless),
+            "{kind:?} with cache_keepwarm_headless = {headless}: {st}"
+        );
+        // End the period before the session goes away.
+        let _ = keepwarm(&mut c, 711, "off").await;
+        end(&mut c).await;
+    }
+    assert_eq!(pings(&bodies), 0, "no ping is due within the test");
+}
+
 /// Spend is booked on every path: a ping that was billed and then failed
 /// (usage arrived, then an in-stream error) lands in the keep-warm cost, the
 /// session cost and the token totals, though it counts as no successful ping.

@@ -845,6 +845,33 @@ impl PingTask {
     }
 }
 
+/// Whether attaching a client of `kind` in `mode` makes a session eligible
+/// for keep-warm.
+///
+/// - An `Observe` attach never does: it cannot send input, so only watching
+///   a session (`synaps attach --observe`, a read-only pane in another app)
+///   must not make it eligible for paid keep-warm.
+/// - A TUI or `synaps attach` client that can type (`Mirror`/`Takeover`)
+///   always does. The daemon cannot tell a piped `synaps attach` from a
+///   terminal one, so a piped attach already qualifies.
+/// - `synaps chat`, rpc and server clients (bridges, scripts, other apps
+///   driving the daemon) qualify only with `cache_keepwarm_headless = true`:
+///   nobody may be coming back in human time, so the owner opts in.
+/// - Test clients never do.
+///
+/// `synaps rpc` (stdin/stdout JSON) runs its own runtime without a session
+/// actor, so neither rule reaches it; this is the daemon-side rule only.
+pub(crate) fn client_qualifies(kind: ClientKind, mode: AttachMode, headless: bool) -> bool {
+    if mode == AttachMode::Observe {
+        return false;
+    }
+    match kind {
+        ClientKind::Tui | ClientKind::Attach => true,
+        ClientKind::Chat | ClientKind::Rpc | ClientKind::Server => headless,
+        ClientKind::Test => false,
+    }
+}
+
 /// Actor-owned keep-warm state.
 #[derive(Default)]
 pub(crate) struct KeepWarmState {
@@ -852,6 +879,9 @@ pub(crate) struct KeepWarmState {
     configured: CacheKeepWarm,
     /// `cache_keepwarm_auto_max_hours` from config at session create.
     auto_max_hours: u32,
+    /// `cache_keepwarm_headless` from config at session create: chat, rpc
+    /// and server clients qualify too (see [`client_qualifies`]).
+    headless: bool,
     /// The current cache epoch's carry (see [`EpochCarry`]); `None` until a
     /// period of this epoch ended. Reset by every real request's usage, a
     /// compaction and a conversation swap.
@@ -868,9 +898,10 @@ pub(crate) struct KeepWarmState {
     turn_started_at: Option<Instant>,
     /// Usage of the latest real request (`None` until one reported).
     last_request: Option<KeepWarmUsage>,
-    /// A TUI/attach client that can type (not `Observe`) has been attached
-    /// at some point. Script/RPC-only or observe-only sessions (nobody will
-    /// be back to type in human time) never keep warm.
+    /// A qualifying client (see [`client_qualifies`]) has been attached at
+    /// some point. By default that is a TUI/attach client that can type;
+    /// script/RPC-only or observe-only sessions (nobody will be back to type
+    /// in human time) never keep warm unless `cache_keepwarm_headless` is on.
     pub(crate) interactive_seen: bool,
     last_end: Option<String>,
     session_pings: u32,
@@ -883,6 +914,7 @@ impl KeepWarmState {
     pub(crate) fn new(
         configured: CacheKeepWarm,
         auto_max_hours: u32,
+        headless: bool,
         override_slot: OverrideSlot,
     ) -> Self {
         let override_mode = *override_slot
@@ -891,6 +923,7 @@ impl KeepWarmState {
         Self {
             configured,
             auto_max_hours,
+            headless,
             override_mode,
             override_slot,
             ..Self::default()
@@ -970,16 +1003,10 @@ impl SessionActor {
         None
     }
 
-    /// A client attached: TUI/attach clients that can type (`Mirror` or
-    /// `Takeover`) mark the session interactive. An `Observe` attach never
-    /// does: it cannot send input, so only watching a session (`synaps
-    /// attach --observe`, a read-only pane in another app) must not make it
-    /// eligible for paid keep-warm.
+    /// A client attached: one that [qualifies](client_qualifies) marks the
+    /// session eligible for keep-warm for the rest of its life.
     pub(crate) fn cache_keepwarm_note_attach(&mut self, kind: ClientKind, mode: AttachMode) {
-        if mode == AttachMode::Observe {
-            return;
-        }
-        if matches!(kind, ClientKind::Tui | ClientKind::Attach) {
+        if client_qualifies(kind, mode, self.cache_keepwarm.headless) {
             self.cache_keepwarm.interactive_seen = true;
         }
     }
@@ -1534,6 +1561,28 @@ pub(crate) fn render_status(s: &serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn client_qualification_rule() {
+        use AttachMode::{Mirror, Observe, Takeover};
+        use ClientKind::{Attach, Chat, Rpc, Server, Test, Tui};
+        for headless in [false, true] {
+            for kind in [Tui, Chat, Attach, Rpc, Server, Test] {
+                // Observe can never type: never eligible, opt-in or not.
+                assert!(!client_qualifies(kind, Observe, headless), "{kind:?} observe");
+            }
+            for mode in [Mirror, Takeover] {
+                // TUI / attach always; test clients never.
+                assert!(client_qualifies(Tui, mode, headless));
+                assert!(client_qualifies(Attach, mode, headless));
+                assert!(!client_qualifies(Test, mode, headless));
+                // Non-interactive clients only with the opt-in.
+                for kind in [Chat, Rpc, Server] {
+                    assert_eq!(client_qualifies(kind, mode, headless), headless, "{kind:?}");
+                }
+            }
+        }
+    }
 
     const MIN: Duration = Duration::from_secs(60);
     const OPUS: &str = "claude-opus-4-7";
