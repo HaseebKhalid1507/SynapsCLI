@@ -44,8 +44,28 @@ All notable changes to this project will be documented in this file.
   Default 1, as before. Lowering it deletes the extra generations at the
   next rotation. Rotation is now locked (`<log>.lock`), so two daemon
   sessions can no longer rotate the same log twice and lose a generation.
+- **`cache_keepwarm_headless`** (default off; /settings row next to the
+  other keep-warm rows) lets daemon sessions driven by `synaps chat`,
+  rpc-over-daemon or server clients (bridges, scripts) keep their prompt
+  cache warm. Before, only sessions a TUI or `synaps attach` had attached
+  to qualified, so headless sessions never pinged. `Observe` attaches still
+  never qualify. `synaps rpc` (stdin/stdout) has no session actor and is
+  not covered; drive a daemon session instead.
 
 ### Changed
+
+- **Keep-warm decides on a ping's expected cost under budgeted thinking.**
+  There a ping must send `max_tokens = budget + 1` (the budget is part of
+  the cache key), and pricing all of it as output refused every 5m period
+  below a ~17.9K-token prefix (1h: ~10.8K) on Sonnet/Opus 4.6. Pings are
+  now priced at an expected 256 output tokens: break-even drops to ~1.2K
+  (5m) and ~0.7K (1h) tokens. The hard bound stays: it is the rewrite plus
+  a thinking reserve (the rest of `max_tokens`), each ping still has to fit
+  it at its worst case, and `/keepwarm status`, the logs and the end
+  reasons report rewrite, reserve and bound. If a ping ever bills more
+  than the estimate, the session's later periods go back to worst-case
+  pricing. Thinking-off and adaptive pings (`max_tokens = 1`) are
+  unchanged. Pings still send the turn's exact thinking configuration.
 
 - **Subagent workers roll their context over automatically.** A worker's
   context used to grow until the model window was full (one reached about

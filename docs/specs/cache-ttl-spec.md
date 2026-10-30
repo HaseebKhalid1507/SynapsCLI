@@ -446,7 +446,20 @@ TTL (`5m`, `1h`, `hybrid`) and every thinking mode, within the guards below.
 ```
 cache_keepwarm = auto               # off (default) | auto | <N>h  (N = 1–48)
 cache_keepwarm_auto_max_hours = 24  # auto's longest idle period (1–48, default 24)
+cache_keepwarm_headless = false     # also keep warm sessions driven by chat/rpc/server clients
 ```
+
+**Who qualifies.** A daemon session becomes eligible once a client that can
+type has attached: a TUI or `synaps attach` (`Mirror`/`Takeover`) always
+qualifies; a piped `synaps attach` is indistinguishable from a terminal one
+and qualifies too. Sessions driven only by `synaps chat`, rpc-over-daemon or
+server clients (bridges, scripts, other apps) qualify only with
+`cache_keepwarm_headless = true` (default off: nobody may come back in human
+time, so the owner opts in). `Observe` attaches and test clients never do.
+`synaps rpc` (stdin/stdout JSON) runs its own runtime without the session
+actor, so keep-warm cannot reach it either way; drive the daemon instead
+(`synaps chat`, or an rpc/server client attached to a daemon session) and
+turn on `cache_keepwarm_headless`.
 
 Per session: `/keepwarm [status|off|auto|<N>h]`. `auto` stops by the cost
 bound below or `cache_keepwarm_auto_max_hours` after the session went idle
@@ -474,7 +487,8 @@ minimum cacheable length, pre-warming), [Pricing][pr],
 | Is `stream` in the key? | **Not stated.** The invalidation table does not list it, and every pre-warm example is non-streaming before a non-streaming follow-up; no sentence says a non-streaming request warms a streaming one. ([pc]) | Pings stream exactly like a real turn (see `max_tokens` below). |
 | `max_tokens: 0`? | Pre-warm: "returns immediately without generating any output … Zero output tokens are billed." Rejected with `stream: true`, `thinking.type: "enabled"`, structured outputs (`output_config.format`) or a forced `tool_choice`. ([pc] "Limitations") | Not used: it requires `stream: false`, and whether `stream` is part of the cache key is undocumented. Adaptive / thinking-off pings stay streaming with `max_tokens = 1` (the docs' own "max_tokens=1 workaround"; ≤ 1 output token billed). Budgeted thinking cannot use 0 anyway. |
 | Minimum `max_tokens`, adaptive? | `max_tokens` is "a hard cap on total output … thinking and response text combined". ([at]) | Adaptive pings: `max_tokens = 1` bounds thinking too. |
-| Budgeted thinking? | `budget_tokens` ≥ 1,024 and `< max_tokens`; changing the budget invalidates message breakpoints. ([et]) | Budgeted pings keep the budget and send `max_tokens = budget + 1` — up to 32,769 at `xhigh`, all billable as output. See §7.2 worst case. |
+| Budgeted thinking? | `budget_tokens` ≥ 1,024 and `< max_tokens`; changing the budget invalidates message breakpoints. ([et]) | Budgeted pings keep the budget and send `max_tokens = budget + 1` — up to 32,769 at `xhigh`, all billable as output. Neither can be lowered without changing the cache key; §7.2 prices the expected output and reserves the rest. |
+| Can a ping switch to adaptive thinking? | Adaptive (`thinking.type: "adaptive"`) has no budget, so `max_tokens = 1` is legal; but the thinking configuration is part of the cache key. ([th], [at]) | Only where the turns already use adaptive (Synaps: Opus/Sonnet 4.7+, every 5.x; `model_supports_adaptive_thinking`): those pings send `max_tokens = 1`. Opus/Sonnet 4.6 support adaptive but Synaps keeps them on budgeted thinking; a ping cannot switch alone. |
 | Nothing cached? | Below the model's minimum cacheable length (512–4,096 tokens by model) a request "will be processed without caching, and no error is returned … if both `cache_creation_input_tokens` and `cache_read_input_tokens` are 0, the prompt was not cached". ([pc] "Cache limitations") | No period unless the last request had `read + write > 0`; a ping with `read = write = 0` ends it (§7.5). |
 | Read price | 0.1× input, except 0.025× (Fable 5.1, Mythos 5.1) and 0.05× (Opus 5.5, Sonnet 5.5); Opus 4 / 4.1 are $15 / $75. ([pr]) | `agent_core::pricing` uses the documented per-model multiplier and price, 0.1× / family default otherwise. |
 
@@ -484,14 +498,35 @@ minimum cacheable length, pre-warming), [Pricing][pr],
 [et]: https://platform.claude.com/docs/en/build-with-claude/extended-thinking
 [at]: https://platform.claude.com/docs/en/build-with-claude/adaptive-thinking
 
-### 7.2 The stopping rule: ski rental, priced at the worst case
+### 7.2 The stopping rule: ski rental on the expected cost, bounded by the worst case
 
 An idle period protects one thing: the cached prefix of `P` tokens. If it
 lapses, the next turn re-writes it — the **buy** price `B = P × write(TTL)`,
 at the write price of the TTL the server **honours** (§7.3). Each ping is
 **rent**.
 
-Rule: send a ping only while `ledger + worst(next ping) ≤ B`.
+Rule: send a ping only while `ledger + worst(next ping) ≤ bound`, where
+`bound = B + R` and `R`, the **thinking reserve**, is the output a ping may
+bill beyond what it is expected to produce:
+`R = (max_tokens − expected output) × output price`.
+
+- **Expected output**: all of `max_tokens` when it is already 1 (thinking off,
+  adaptive): `R = 0` and `bound = B`, exactly the old rule. Under budgeted
+  thinking `max_tokens = budget + 1` is forced (§7.1) while the ping is told
+  it needs no reasoning and thinks a sentence; the expected output is
+  `PING_OUTPUT_ESTIMATE` = 256 tokens, several times that.
+- Since `worst − expected = R`, the rule is the same inequality as
+  `ledger + expected(next ping) ≤ B`: **every decision, starting a period
+  included, is the ski-rental decision on the expected cost**, while the
+  ledger can still never pass the **bound it reports** (`bound_usd` in
+  `/keepwarm status`, the logs and the end reason), because each ping is
+  admitted only if its worst case fits. Pings within the estimate spend at
+  most `B`; pings that out-think it spend at most `B + R`, i.e. one ping's
+  unused budget more.
+- **Latch**: the first ping that bills more output than the estimate sets a
+  session latch (`warn` log: *ping out-thought its output estimate*). Later
+  periods of that session price pings at `max_tokens` (`R = 0`), so at most
+  one period ever relies on an estimate that proved wrong.
 
 - `ledger` is everything this period actually spent: every ping's measured
   usage, **including failed and retried pings** and an aborted in-flight ping
@@ -514,11 +549,26 @@ Rule: send a ping only while `ledger + worst(next ping) ≤ B`.
   at $0.15 but admitted only with ≈ $3.0003 of cap headroom
   (`review_205_possible_cache_miss_must_fit_admission_cap`,
   `a_cap_with_room_for_a_cache_miss_still_pings`).
-- If one worst-case ping does not fit `B` at all, **no period starts**
-  (`worst-case cache-hit ping … exceeds the … rewrite`). In practice budgeted thinking
-  then only keeps large prefixes warm: Sonnet 4.6 at `xhigh` (32,769 ×
-  $15/MTok = $0.49) under 5m with P = 20k (`B` = $0.075) never pings; under 1h
-  with P = 300k (`B` = $1.80) it does.
+- If one ping does not fit, **no period starts**: `cache-hit ping expected
+  at $E ($W worst case) exceeds the $B rewrite it would save` (budgeted, with
+  the estimate), or `worst-case cache-hit ping $W exceeds the $B rewrite`
+  (no reserve: thinking off / adaptive, or the latch). The prefix must be
+  large enough that `P × (write − read) ≥ input + expected output`; for
+  Sonnet 4.6 ($3 / $15) at budget 4,096
+  (`break_even_prefix_budgeted_vs_adaptive`):
+
+  | | `max_tokens` priced | 5m break-even | 1h break-even |
+  |---|---|---|---|
+  | before (worst case; also after the latch) | 4,097 | 17,869 tokens | 10,816 tokens |
+  | budgeted, expected output 256 | 256 (+ $0.0576 reserve) | **1,169 tokens** | **708 tokens** |
+  | thinking off / adaptive | 1 | 60 tokens | 37 tokens |
+
+  (Below the 1,024-token minimum cacheable prefix these mean "any cached
+  prefix".) Opus 4.6 ($5 / $25) has the same ratio and the same break-even.
+  At `xhigh` (budget 32,768) the expected decision is unchanged and the
+  reserve is $0.49: Sonnet 4.6 under 5m with P = 20k (`B` = $0.075) now pings,
+  reporting a $0.5627 bound; priced at the worst case it would not
+  (`budgeted_thinking_worst_case_must_fit_the_bound`).
 - An unexpected write (a miss) cannot be priced in advance — a full miss *is*
   the rewrite. It is booked when it happens and ends the period (§7.5), so it
   overshoots the bound by at most one ping.
@@ -528,6 +578,10 @@ This is the deterministic ski-rental strategy:
 - user returns before the bound → we paid only the reads;
 - user returns after → we paid ≤ B in pings + B rewrite ≤ 2 × optimal;
 - user never returns → waste ≤ B, i.e. **at most one rewrite**.
+
+(With budgeted thinking these hold for pings within the output estimate;
+pings that out-think it add at most `R` once, and the latch keeps it to one
+period per session.)
 
 `P` and `B` are re-measured from every ping (`cache_read + cache_write`);
 before the first ping `P` is the last request's `read + write + input` plus
@@ -549,8 +603,9 @@ Numbers (Anthropic's price table; [pr]), P = 300k, thinking off / adaptive
 `2.0 / 0.1 = 20` reads fit a 1h bound exactly; the 1-token output in the worst
 case makes the 20th not fit, so 19 (`ski_rental_1h_is_nineteen_pure_reads…`).
 A ping that thinks a lot ends the period sooner: 5k thinking tokens on Sonnet
-4.6 ($0.075) cut a 1h period to 10 pings
-(`an_expensive_ping_stops_the_period_early`).
+4.6 ($0.075) cut a 1h period to 10 pings priced at the worst case, 11 with
+the estimate (the 11th runs into the reserve, still within the reported
+bound; `an_expensive_ping_stops_the_period_early`).
 
 Per cache-read multiplier (pure reads, the ledger uses the session's
 per-model pricing; `ping_counts_per_multiplier_and_the_auto_cap`):
@@ -665,7 +720,8 @@ variant exhaustively and drives them through the actor.
 | A ping that wrote without reading anything | End (`ping missed the cache`). |
 | After ping 1, a ping whose write > 10% of `P` (ping 1: beyond the expected tail) | End (`ping rewrote … history no longer cached`), with a `warn` log line. |
 | Next turn would roll over / hard-stop | No period; an active one ends (§7.4). |
-| One worst-case ping exceeds the bound | No period (§7.2). |
+| One ping's expected cost exceeds the rewrite | No period (§7.2); the end reason names the expected and worst-case cost and the rewrite. |
+| A ping bills more output than the estimate | Booked as measured; the period goes on only while the next worst case still fits the bound; later periods of the session price pings at `max_tokens` (§7.2 latch). |
 | Machine slept past the TTL | Age check at fire time → period ends, no ping. Slept but still in time → the wall-clock deadline fires the ping early enough (§7.3). |
 | Transient error (429, 5xx, 529, network, in-stream) | Usage booked; retry after 5 s, 15 s, 30 s while the retry still lands before the late guard and fits the bound; then end. |
 | Any other 4xx, auth, config | Usage (if any) booked; end, no retry. |
@@ -676,7 +732,7 @@ variant exhaustively and drives them through the actor.
 | `max_session_cost` | Checked against the ping's exposure, a full cache miss included (§7.2); all ping spend counts toward it. |
 | Session detached | Keep-warm continues (cost bounded by §7.2). The idle **auto-park** is deferred while a period is active (`can_park`); when it ends, `rearm_park` and the session parks after the normal grace. |
 | Explicit `Park` (host / reload) while a period is active | The period ends (`parked by request`), then the session parks. |
-| Script/RPC-only session | No period: requires a TUI or `synaps attach` client to have attached once. |
+| Script/RPC-only session | No period unless `cache_keepwarm_headless = true`: by default it requires a TUI or `synaps attach` client to have attached once; with the opt-in a `synaps chat`, rpc or server client qualifies too (§7). `synaps rpc` (no session actor) never keeps warm. |
 | Observe-only session (`--observe` attaches only) | No period: an `Observe` attach cannot type, so it never marks the session interactive, whatever its client kind. A later `Mirror`/`Takeover` TUI or `synaps attach` does. |
 
 Why defer the auto-park rather than ping while parked: parking drops the
