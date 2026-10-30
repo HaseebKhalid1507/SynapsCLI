@@ -100,7 +100,32 @@ enum Read {
     Bad(String),
 }
 
+/// Capacity a connection's frame buffer is reset to after a large frame.
+const FRAME_BUF_KEEP: usize = 64 * 1024;
+/// A frame buffer that grew past this is dropped once the frame is read.
+const FRAME_BUF_SHRINK_ABOVE: usize = 1024 * 1024;
+
+/// Read one frame, then release the buffer if that frame made it large.
+///
+/// `line` lives as long as the connection, and `clear()` keeps capacity: one
+/// `Submit` carrying a 15 MiB attachment (~20 MiB of base64) or a refused
+/// oversize frame (up to 64 MiB) would otherwise stay allocated until the
+/// client detaches, which for a daemon-attached TUI is days. Released right
+/// after the read, on every outcome, not before the next one: an idle client
+/// can go hours between frames. Same policy as the client's `FrameBuf`.
 async fn read_frame(reader: &mut Reader, line: &mut String) -> std::io::Result<Read> {
+    let read = read_frame_into(reader, line).await;
+    release_large_frame_buf(line);
+    read
+}
+
+fn release_large_frame_buf(line: &mut String) {
+    if line.capacity() > FRAME_BUF_SHRINK_ABOVE {
+        *line = String::with_capacity(FRAME_BUF_KEEP);
+    }
+}
+
+async fn read_frame_into(reader: &mut Reader, line: &mut String) -> std::io::Result<Read> {
     loop {
         line.clear();
         let n = tokio::io::AsyncReadExt::take(&mut *reader, MAX_FRAME_BYTES as u64 + 1)
@@ -825,6 +850,56 @@ mod tests {
         };
         assert_eq!(kinds(&replay_for(old, snapshot.clone())), vec!["other"]);
         assert_eq!(kinds(&replay_for(new, snapshot)), vec!["queued", "other", "started"]);
+    }
+
+    /// A large frame doesn't pin its buffer for the life of the connection:
+    /// the buffer is back to [`FRAME_BUF_KEEP`] straight after the read (not
+    /// at the next frame, which for an idle TUI may be hours away), and the
+    /// connection keeps reading frames normally afterwards.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_large_frame_releases_its_buffer_after_the_read() {
+        let (ours, theirs) = tokio::net::UnixStream::pair().unwrap();
+        let (read_half, _keep) = ours.into_split();
+        let mut reader = BufReader::new(read_half);
+        let mut line = String::new();
+
+        // 2 MiB of leading whitespace is still a valid `ping` frame; the
+        // second big frame is garbage; the last is a normal small frame.
+        let pad = " ".repeat(2 * 1024 * 1024);
+        let input = format!("{pad}{{\"type\":\"ping\"}}\n{pad}not json\n{{\"type\":\"ping\"}}\n");
+        let writer = tokio::spawn(async move {
+            let mut theirs = theirs;
+            theirs.write_all(input.as_bytes()).await.unwrap();
+            theirs
+        });
+
+        let first = read_frame(&mut reader, &mut line).await.unwrap();
+        assert!(matches!(first, Read::Frame(ClientFrame::Ping)));
+        assert!(line.capacity() <= FRAME_BUF_SHRINK_ABOVE, "kept {} bytes", line.capacity());
+
+        let second = read_frame(&mut reader, &mut line).await.unwrap();
+        assert!(matches!(second, Read::Bad(_)), "a malformed big frame is reported");
+        assert!(line.capacity() <= FRAME_BUF_SHRINK_ABOVE, "kept {} bytes", line.capacity());
+
+        let third = read_frame(&mut reader, &mut line).await.unwrap();
+        assert!(matches!(third, Read::Frame(ClientFrame::Ping)));
+        drop(writer.await.unwrap());
+        assert!(matches!(read_frame(&mut reader, &mut line).await.unwrap(), Read::Eof));
+    }
+
+    /// Ordinary frames reuse the buffer: no reallocation per frame.
+    #[test]
+    fn a_small_frame_buffer_is_reused() {
+        let mut line = String::with_capacity(FRAME_BUF_KEEP);
+        line.push_str("{\"type\":\"ping\"}");
+        let before = line.as_ptr();
+        release_large_frame_buf(&mut line);
+        assert_eq!(line.as_ptr(), before, "a small buffer is not reallocated");
+
+        let mut big = String::with_capacity(FRAME_BUF_SHRINK_ABOVE + 1);
+        release_large_frame_buf(&mut big);
+        assert!((FRAME_BUF_KEEP..=FRAME_BUF_SHRINK_ABOVE).contains(&big.capacity()));
     }
 
     /// The drain gate refuses work that would start after the record, and

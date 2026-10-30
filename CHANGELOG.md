@@ -57,6 +57,13 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **The daemon no longer keeps a large frame's memory for the life of the
+  connection.** One `Submit` with a big `/attach` (up to ~20 MiB of base64)
+  or a refused oversize frame (up to 64 MiB) left that much allocated per
+  connection until the client detached, which for a daemon-attached TUI is
+  days. The buffer drops back to 64 KiB right after any frame over 1 MiB,
+  the same rule the client side already follows.
+
 - **`ttft_ms` in `api-log.jsonl` read `0`** on nearly every record: it was
   timed from when the response headers arrived, not from the send.
   `ttft_ms` and `total_ms` now count from the send, like the request trace;
