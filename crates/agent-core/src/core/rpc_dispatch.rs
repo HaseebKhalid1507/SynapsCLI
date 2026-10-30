@@ -40,6 +40,8 @@ pub fn parse_frame(line: &str, max_bytes: usize) -> Result<RpcCommand, RpcEvent>
 /// Returns `None` for events that are intentionally dropped on the wire:
 /// - `LlmEvent::ToolResultDelta` — wire format has no streaming-result variant;
 ///   the final `ToolResult` carries the complete text.
+/// - `LlmEvent::ToolQueued` / `ToolStarted` — scheduler queue hints for the
+///   TUI; the rpc protocol has no capability handshake to opt into them.
 /// - `AgentEvent::SteeringDelivered` — internal hook signal, not exposed.
 ///
 /// `Session(*)` variants also return `None` — they carry session bookkeeping
@@ -95,6 +97,11 @@ pub fn map_stream_event(ev: &StreamEvent) -> Option<RpcEvent> {
         }
         // Drop — wire format has no streaming-result variant; final ToolResult carries full text
         StreamEvent::Llm(LlmEvent::ToolResultDelta { .. }) => None,
+        // Drop — scheduler queue state is a TUI presentation hint. The rpc
+        // protocol is exact-match versioned with no capability handshake and
+        // `AssistantEvent` has no `#[serde(other)]` fallback, so a new
+        // variant would break existing parents; they keep today's stream.
+        StreamEvent::Llm(LlmEvent::ToolQueued { .. } | LlmEvent::ToolStarted { .. }) => None,
 
         StreamEvent::Agent(AgentEvent::SubagentStart {
             subagent_id,

@@ -1,102 +1,72 @@
 <p align="center">
-  <img src="https://github.com/user-attachments/assets/30332bb2-2ea0-4d53-9b59-97db77878d38" alt="SynapsCLI" width="100%" />
+  <img src="https://github.com/user-attachments/assets/3d82937b-e486-48fd-be69-f7fe82085e70" alt="SynapsCLI" width="100%" />
 </p>
 
-<h3 align="center">Lightning fast terminal-native agent runtime</h3>
+<h3 align="center">Lightning-fast agent runtime</h3>
 
 <p align="center">
+  <a href="https://github.com/HaseebKhalid1507/SynapsCLI/actions/workflows/ci.yml"><img src="https://github.com/HaseebKhalid1507/SynapsCLI/actions/workflows/ci.yml/badge.svg?branch=dev" alt="CI"></a>
   <a href="https://crates.io/crates/synaps"><img src="https://img.shields.io/crates/v/synaps?color=orange&label=crates.io" alt="crates.io"></a>
-  <img src="https://img.shields.io/badge/rust-1.80%2B-orange.svg" alt="Rust">
-  <a href="https://ratatui.rs/"><img src="https://ratatui.rs/built-with-ratatui/badge.svg" alt="Built With Ratatui" height="20"></a>
-  <img src="https://img.shields.io/badge/binary-25MB-success.svg" alt="25MB binary">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="License"></a>
   <a href="https://discord.gg/JCdgRYqVDP"><img src="https://img.shields.io/badge/Discord-join%20the%20server-5865F2?logo=discord&logoColor=white" alt="Discord"></a>
 </p>
 
-
-
 <p align="center">
-  Run AI agents from one binary. Tools, subagents, and extensions built in.<br>
-  Any model, 25MB, ~10ms to first frame.
-</p>
-
----
-
-<p align="center">
-  <img src="https://github.com/user-attachments/assets/4e470c8c-a53a-4fae-acb4-15a56be105b3" alt="SynapsCLI — a crew of agents running in parallel" width="100%" />
+  Run a crew of AI agents in your terminal, on any model, from one ~32 MB binary.
 </p>
 
 <p align="center">
-  <img src="https://github.com/user-attachments/assets/c5892efb-5f79-4648-9746-43bf316a87d3" alt="ice" width="32%" />
-  <img src="https://github.com/user-attachments/assets/b6b03e4f-4868-48e2-b5c5-bbd84e81f77c" alt="phosphor" width="32%" />
-  <img src="https://github.com/user-attachments/assets/9d06c56e-ce20-4f35-aca0-ea274507d7dc" alt="dracula" width="32%" />
+  <img src="https://github.com/user-attachments/assets/0ce9fe56-cf4e-4bb1-9a70-b516ae6a71b6" alt="A crew of Synaps agents running in parallel" width="100%" />
 </p>
-
-Synaps is an agent runtime written in Rust. It runs agents with built-in tools, subagents, and extensions against any model, from Claude and ChatGPT to a local Ollama. A background daemon owns the engine and every session, and the terminal UI is a thin client of it: several terminals can share one live session, and a session outlives the window that started it. `synaps rpc` speaks JSON-RPC over stdio, so other programs can drive the engine too. Extend it with plugins in any language and MCP servers.
-
----
-
-## Why Synaps
-
-- **Agents are not chat.** They're autonomous programs that happen to use language models. Treat them like services.
-- **Own your agent.** The system prompt is a file on disk. The tool list is opt-out. Your turns are yours; nothing phones home.
-- **Multi-agent is the default.** Single-agent is just n=1.
-- **Speed is a feature.** A 2-second boot already lost the dev who wanted it in a git hook.
-- **The terminal is the IDE.** If you need Electron to be productive, your tools are wrong.
 
 ---
 
 ## Install
 
+Linux and macOS.
+
 ```bash
-cargo install synaps              # crates.io
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/HaseebKhalid1507/SynapsCLI/releases/latest/download/synaps-installer.sh | sh
+# or
+brew install HaseebKhalid1507/tap/synaps
+
+synaps --version    # check it worked
 ```
 
 <details>
-<summary>More options (brew, AUR, .deb, shell installer, source)</summary>
+<summary>Other ways: cargo, AUR, .deb, source</summary>
 
 ```bash
-brew install HaseebKhalid1507/tap/synaps    # macOS / Linux
+cargo install synaps                        # crates.io, needs Rust 1.88+
 yay -S synaps                               # Arch / EndeavourOS
 
-# Debian/Ubuntu — .deb is attached to every release:
+# Debian/Ubuntu: a .deb is attached to every release
 # https://github.com/HaseebKhalid1507/SynapsCLI/releases/latest
 
-# Shell installer (any platform)
-curl -sSL https://github.com/HaseebKhalid1507/SynapsCLI/releases/latest/download/synaps-installer.sh | sh
-
-# From source
 git clone https://github.com/HaseebKhalid1507/SynapsCLI && cd SynapsCLI
 cargo build --release && ./target/release/synaps
 ```
 </details>
 
-Linux and macOS. Windows is not supported.
-
-`cargo build --release --no-default-features` drops the `command-exec` feature:
-the `bash` tool is compiled out and the `shell_*` tools are never registered.
-That is all it removes. It is not a sandbox. The agent can still start
-processes indirectly: `write`/`edit`/`multi_edit` can change shell rc files,
-`mcp.json`, plugin manifests or watcher configs; a watcher's `wake_if` runs
-through `sh -c`; and extensions, MCP servers and plugin commands all spawn
-processes.
-
-*New to agents? Start with the [ELI5](ELI5.md). Want the full tour? The [Wiki](https://github.com/HaseebKhalid1507/SynapsCLI/wiki) has 36 pages.*
-
----
-
 ## Quick start
 
 ```bash
-synaps login          # OAuth, cloud credentials, provider keys, or local Ollama
-synaps                # launch the TUI
+synaps login     # pick a provider: your subscription, an API key, cloud, or local
+synaps           # start the TUI
 ```
 
-### Sign in with what you already pay for, use cloud identity, or run locally
+Sign in with what you already pay for, or use no account at all:
 
 ```bash
-synaps login                      # searchable picker: OAuth, cloud, and API-key providers
+synaps login --provider claude      # Claude subscription (also openai-codex, xai-auth, github-copilot)
+synaps login --provider kimi        # an API key
+ollama serve                        # or a local model: run synaps, then /model local/llama3.2
+```
 
+<details>
+<summary>All providers, cloud identity and local endpoints</summary>
+
+```bash
 # Subscription OAuth
 synaps login --provider claude
 synaps login --provider openai-codex
@@ -107,72 +77,82 @@ synaps login --provider google-gemini  # requires a Synaps-owned Google Desktop 
 # Static API key
 synaps login --provider kimi            # Moonshot AI (MOONSHOT_API_KEY / KIMI_API_KEY)
 
-# Cloud identity; credentials remain broker-owned
+# Cloud identity; credentials stay in the broker
 synaps login --provider azure-openai
 synaps login --provider aws-bedrock
 synaps login --provider google-vertex
-
-# Then choose an exact provider-qualified model
-synaps                            # /model openai-codex/gpt-5.5
-
-# Ollama or any local model (no account, no key, no cloud)
-ollama serve                      # LM Studio, vLLM, llama.cpp all work too
-synaps                            # /model local/llama3.2
 ```
 
-OAuth and cloud credentials flow through the typed credential broker; long-lived tokens and cloud secrets are not handed to model runtimes. Availability still depends on each upstream account, entitlement, cloud registration, IAM policy, region, and quota. Cloud broker routes (Azure OpenAI, Amazon Bedrock, Google Vertex AI) are currently **text-only**: they are marked `text-only` in model listings, and a mode that requires tools fails with a typed unsupported-capability error before any credential use or network access.
+Models are provider-qualified: `/model <provider>/<model>`. Cloud routes (Azure OpenAI, Amazon Bedrock, Google Vertex AI) are text-only for now and say so in model listings; a mode that needs tools fails before any credential is used. Availability depends on each upstream account, region and quota.
 
-Synaps auto-targets `http://localhost:11434/v1`, which is Ollama's default, so a running Ollama just works. Point it anywhere else with `provider.local.url` in config or the `LOCAL_ENDPOINT` env var. Your keys, your box, nothing phones home.
+Local models: Synaps targets Ollama's default `http://localhost:11434/v1`. LM Studio, vLLM and llama.cpp work too; point at them with `provider.local.url` or `LOCAL_ENDPOINT`. Several accounts per provider: [docs/providers/multi-account-broker.md](docs/providers/multi-account-broker.md).
+</details>
 
----
+## What it does
 
-## What's in the box
+- **Sessions outlive the window.** A background daemon owns every session. `/sessions` lists them, and pinned ones come back after a restart. [More](docs/daemon-mode.md)
+- **Every terminal is you.** Attach several clients to one session; any of them can type, steer, or take over.
+- **Run a crew.** Named subagents work in parallel. Open any one in its own view and steer it mid-flight. [More](docs/subagent-watch.md)
+- **Any model.** Claude, Codex, Grok, Copilot, Gemini, Kimi, [Meta Muse](docs/providers/muse.md), Azure, Bedrock, Vertex, any OpenAI-compatible endpoint, or Ollama.
+- **Credentials stay in the broker.** Agents get short-lived, scoped tokens, never your keys. Several accounts per provider. [More](docs/providers/multi-account-broker.md)
+- **Bounded turns, when you want them.** Optional caps on rounds, tool calls, time, tokens and cost.
+- **Memory that survives.** Project memory, `/compact` checkpoints, sessions that chain across days.
+- **Sees what you see.** The model reads images, and `/attach` adds images, PDFs and text to a turn. [More](docs/multimodal.md)
+- **Build on it.** Extensions in any language, MCP servers, and the engine over [JSON-RPC](docs/rpc-protocol.md) or WebSocket.
 
-- **One daemon, many clients.** Plain `synaps` attaches to a shared background daemon: extensions boot once, sessions are journaled and resumable, and a second terminal can mirror, observe, or take over the same live session. `synaps daemon reload` swaps in a new binary without dropping a session.
-- **Run a crew.** Named agents with roles, dispatched in parallel, thinking in a live panel. Steer one mid-flight without killing it.
-- **Runs without you.** `/auto` hands a session to an autonomous driver (Esc takes it back). `synaps watcher` supervises fleets: heartbeats, crash recovery, cost limits. Half the sessions on my machine have no human in them.
-- **Credentials stay in the broker.** Agents get short-lived, scoped tokens. A compromised agent can't leak what it never held. Secrets in your shell never reach the daemon either: a thin client strips them by name, and any value carrying credentials in a URL, before it connects.
-- **Bounded turns.** Caps on tool calls, wall clock, tokens, bytes, and cost. An agent can't spend what you didn't give it.
-- **Memory that survives.** Project-scoped memory, `/compact` checkpoints, sessions that chain across days.
-- **Sees what you see.** The model reads images directly, and `/attach` stages images, PDFs, and text into a turn.
-- **Any model.** Claude, Codex, Grok, Copilot, Gemini, Kimi, Azure, Bedrock, Vertex, any OpenAI-compatible endpoint, or the Ollama on your box. Starts with zero credentials. Routes that can't work fail closed.
-- **Build on it.** Process-isolated extensions in any language, MCP servers, custom tools. A small core with enough hooks to bolt on whatever you want and glue it to whatever you've got.
-- **Lean is fast.** One 25MB binary, ~10 ms to first frame on a warm daemon, ~3 MB per extra session. No framework tax, no interpreter warming up.
-- **21 themes.** `catppuccin`, `gruvbox`, `nord`, `tokyo-night`, plus originals like `neon-rain` and `night-city`, and one light theme, `paper`. Hot-swap with `/theme`, or set `SYNAPS_THEME=<name>` for a single run without changing your config.
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/9f907e06-46ff-46b3-87d5-36f53783e795" alt="Two terminals attached to one live session: one asks, the other steers mid-turn" width="100%" />
+</p>
+<p align="center"><sub>Two terminals, one live session: the left one asks, the right one steers mid-turn.</sub></p>
 
 ## Benchmarks
 
-Measured on one 24-core Linux box, same machine, same harness for every tool.
-Memory is total PSS across the whole process tree; the daemon is shared across
-sessions, so the marginal cost of a session is a thin client.
+<!-- BENCH-TABLE: from BENCHMARKS.md; update both together -->
+Memory is total PSS (plus swapped-out pages) across each tool's whole process tree, background servers included, with idle TUI sessions. Measured 2026-10-26 on one machine (24 cores, 30 GB, Linux), median of 3. Synaps shares one daemon across sessions, so each extra session is a thin client.
 
-| Memory (total PSS) | 1 session | 10 sessions | per added session |
-|--------------------|----------:|------------:|------------------:|
-| **synaps** (core)  | **~39 MB** | **~69 MB**  | **~3.3 MB** |
-| jcode (memory off) | 63 MB      | 136 MB      | ~8.2 MB |
-| antigravity        | 135 MB     | 358 MB      | ~25 MB |
-| pi                 | 120 MB     | 718 MB      | ~66 MB |
-| claude code        | 205 MB     | 1131 MB     | ~103 MB |
-| opencode           | 394 MB     | 1144 MB     | ~83 MB |
-| codex              | 137 MB     | 1213 MB     | ~120 MB |
+| Memory | 1 session | 10 sessions | per extra session |
+|--------|----------:|------------:|------------------:|
+| **synaps** 0.11.0 (core) | **42 MB** | **79 MB** | **~4.1 MB** |
+| jcode v0.91.0 | 117 MB | 165 MB | ~5.3 MB |
+| pi 0.85.1 | 117 MB | 708 MB | ~66 MB |
+| claude code 2.1.304 | 186 MB | 894 MB | ~79 MB |
+| codex 0.163.0 † | 274 MB | 525 MB | ~28 MB |
+| opencode 2.1.1 | 387 MB | 1197 MB | ~90 MB |
 
-Warm start (attach to the running daemon) is ~10 ms to first frame; cold start
-(spawn the daemon) is ~90–160 ms. Reproduce with the scripts in
-[`benchmarks/`](benchmarks/) — full methodology, caveats, and how-to in
-[BENCHMARKS.md](BENCHMARKS.md).
+† codex never drew a frame the harness recognises within its 10 s timeout, so it was sampled at the timeout and may not have finished starting.
 
-## Modes
+**Prompt cache, from real use:** 97.9% of prompt tokens came from cache across 127,453 requests since v0.8.0, every release between 97.1% and 98.4%. That's 89.6% cheaper than the same tokens at list price without caching. [Full report](benchmarks/prompt-cache/README.md)
+
+![weekly prompt-cache hit rate](benchmarks/prompt-cache/charts/1-weekly-hit-rate.png)
+
+Method, tool versions, latency numbers, caveats and how to reproduce: [BENCHMARKS.md](BENCHMARKS.md).
+
+## Why Synaps
+
+- **Agents are programs, not chat.** They happen to use language models. Run them like services.
+- **Own your agent.** The system prompt is a file on disk, the tool list is opt-out, and nothing phones home.
+- **Multi-agent is the default.** Single-agent is just n=1.
+- **Speed is a feature.** A 2-second boot loses the dev who wanted it in a git hook.
+- **The terminal is the IDE.** Built for people who already live there.
+
+**Not for you if:**
+- you're on Windows. It isn't supported.
+- you want an IDE plugin or a desktop app. Synaps is terminal-first.
+- you need a sandbox. Tools run as you; see [Security](#security).
+- you want a settled tool. Synaps is young and moves fast; read the [upgrade notes](docs/upgrading/) before upgrading.
+
+## Commands
 
 | Command | What it does |
 |---------|-------------|
-| `synaps` | The TUI, a thin client on the shared daemon (spawned on first launch). Streaming, markdown, a live subagent panel |
-| `synaps attach` | A thin line client attached to a daemon session |
-| `synaps daemon` | The session daemon: `status`, `sessions`, `stop`, and `reload` (re-exec in place, sessions intact) |
-| `synaps chat` | Same engine, stdin/stdout. Pipes, scripts, CI |
-| `synaps rpc` | JSON-RPC over stdio. Embed the engine in other software |
-| `synaps server` | WebSocket API: token auth, origin validation, streaming |
-| `synaps watcher` | Supervisor for unattended fleets: heartbeats, restarts, cost limits |
-| `synaps auth-broker` | One credential, many machines. Short-lived tokens over TLS |
+| `synaps` | The TUI, a thin client on the shared daemon (started on first launch) |
+| `synaps attach` | A line client attached to a daemon session |
+| `synaps daemon` | `status`, `sessions`, `pin`, `stop`, `reload` (swap the binary, sessions intact), `reload-extension` |
+| `synaps send` | Send a message to a running session from a script |
+| `synaps chat` | The same engine on stdin/stdout, for pipes, scripts and CI |
+| `synaps rpc` | JSON-RPC over stdio, to embed the engine in other software |
+| `synaps server` | WebSocket API with token auth and streaming |
+| `synaps login` · `auth` · `status` | Sign in, manage several accounts per provider, see usage and reset windows |
 
 ## Configuration
 
@@ -184,16 +164,9 @@ thinking = high
 theme = tokyo-night
 identity = You are a senior engineer who writes clean, tested code.
 disabled_tools = bash, ls          # remove built-ins at boot (read-only profiles)
-provider.groq = gsk_...
 ```
 
-<details>
-<summary>Advanced: shared-credential broker, bridge mirror, all keys</summary>
-
-See the [Wiki](https://github.com/HaseebKhalid1507/SynapsCLI/wiki) for the full config reference, the multi-machine **auth broker** (share one OAuth credential across a fleet over WireGuard or TLS), and the bridge heartbeat mirror.
-</details>
-
----
+Every key, the multi-machine auth broker and more are in the [Wiki](https://github.com/HaseebKhalid1507/SynapsCLI/wiki).
 
 ## Extensions
 
@@ -205,40 +178,51 @@ Drop a folder in `~/.synaps-cli/plugins/` and it's live on next boot:
 └── main.py | index.js | <any>    # JSON-RPC 2.0 over stdio, any language
 ```
 
-Extensions are separate processes speaking JSON-RPC over stdio: any language, crash-isolated, with a permissions manifest gating what each one can touch. Seven lifecycle hooks, from `before_tool_call` to `on_session_end`.
+Each extension is its own crash-isolated process, with a permissions manifest that gates what it can touch, and hooks from `before_tool_call` to `on_session_end`. Restart one without touching your sessions: `synaps daemon reload-extension <name>`. Protocol and tutorial: [docs/extensions/](docs/extensions/).
 
-Protocol spec: [docs/extensions/](docs/extensions/).
+## Themes
 
----
+21 built-in themes, including `catppuccin`, `gruvbox`, `nord`, `tokyo-night`, originals like `neon-rain` and `night-city`, and a light one, `paper`. Switch live with `/theme`, or try one for a single run with `SYNAPS_THEME=<name>`.
+
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/6ef3678e-d1c1-4570-8984-1a976f82a71d" alt="phosphor theme" width="49%" />
+  <img src="https://github.com/user-attachments/assets/1d1b1217-6209-4518-9284-7da786baa856" alt="catppuccin theme" width="49%" />
+</p>
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/12c26723-9167-408d-9538-f219b6f9de0a" alt="gruvbox theme" width="49%" />
+  <img src="https://github.com/user-attachments/assets/59986d8f-7e61-4d91-b1c2-4585ea424b56" alt="ocean theme" width="49%" />
+</p>
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/bfad5989-7950-462c-8ecb-0857b8d485e4" alt="neon-rain theme" width="49%" />
+  <img src="https://github.com/user-attachments/assets/985f955d-2da6-4501-9a10-bbb6e07b787f" alt="nord theme" width="49%" />
+</p>
+
+## Security
+
+- **Credentials live in a broker.** Agents get short-lived, scoped tokens, so a compromised agent can't leak what it never held. Thin clients strip secrets from your shell's environment before connecting.
+- **Extensions are fenced.** Each runs as its own process under a permissions manifest, and a tool-call confirm names the extension that asked ([details](docs/confirm-prompts.md)).
+- **The daemon is yours alone.** Its socket is owner-only and refuses other users.
+- **Not a sandbox.** Tools run as you. Building with `--no-default-features` compiles out `bash` and the `shell_*` tools, but an agent can still start processes indirectly: by editing shell rc files or MCP config, or through extensions. Use a container or VM for untrusted work.
+
+Found a vulnerability? Report it privately: [SECURITY.md](SECURITY.md).
+
+## Docs and help
+
+- **New to agents?** Start with the [ELI5](ELI5.md).
+- **The full tour:** the [Wiki](https://github.com/HaseebKhalid1507/SynapsCLI/wiki), and the reference docs in [docs/](docs/README.md).
+- **Upgrading:** [docs/upgrading/](docs/upgrading/) and the [CHANGELOG](CHANGELOG.md).
+- **Stuck?** Ask in the [Discord](https://discord.gg/JCdgRYqVDP) or open an [issue](https://github.com/HaseebKhalid1507/SynapsCLI/issues).
 
 ## Contributing
 
-Synaps is young (started April 2026) and moving fast: 2,500+ commits, ~275K lines of Rust, and 32 releases in its first six months, shipped to crates.io, Homebrew, the AUR, and `.deb`, and listed in [awesome-ratatui](https://github.com/ratatui/awesome-ratatui). Good first contributions: a new provider in the catalog, an extension, a theme, docs, or any [`good first issue`](https://github.com/HaseebKhalid1507/SynapsCLI/labels/good%20first%20issue).
+Synaps is young and moving fast. Good first contributions: a new provider, an extension, a theme, docs, or any [`good first issue`](https://github.com/HaseebKhalid1507/SynapsCLI/labels/good%20first%20issue).
 
 ```bash
 git clone https://github.com/HaseebKhalid1507/SynapsCLI && cd SynapsCLI
 cargo build && cargo test
 ```
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). Issues and PRs welcome, the maintainer answers fast.
-
-Come hang out in the [**Synaps Discord**](https://discord.gg/JCdgRYqVDP) - questions, ideas, show-and-tell, or just to watch the crew run.
-
----
-
-## Architecture
-
-```
-crates/
-├── agent-core/      # provider identity, auth broker, models, prompts, orchestration policy
-├── agent-engine/    # provider transports, runtime, session daemon, worker lifecycle, tools, extensions
-│                   # MCP, events, skills, sidecar, cloud and OpenAI-compatible routing
-├── agent-tui/       # ratatui UI, model/effort settings, themes, plugin modals
-└── (root)           # the `synaps` binary crate: CLI dispatch, login, watcher, broker
-```
-The session daemon hosts one `EngineHost` (extensions, MCP, and providers shared across sessions) and a `SessionActor` per session; the TUI, `synaps attach`, and headless clients connect to it over a Unix socket. Native Anthropic, OpenAI Responses/chat, Gemini Code Assist, and cloud-provider transports all emit the same `StreamEvent`, so the TUI and tool loop stay provider-blind. Provider-qualified identities and pre-authorized execution plans remain typed through routing.
-
----
+Read [CONTRIBUTING.md](CONTRIBUTING.md) and [ARCHITECTURE.md](ARCHITECTURE.md) first. Issues and PRs are welcome, and the maintainer answers fast. Come hang out in the [Discord](https://discord.gg/JCdgRYqVDP): questions, ideas, show-and-tell, or just to watch the crew run.
 
 ## License
 

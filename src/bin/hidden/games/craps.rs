@@ -75,7 +75,7 @@ impl CrapsGame {
         } else {
             0
         };
-        if speed > 0 && self.phase_timer % speed == 0 {
+        if speed > 0 && self.phase_timer.is_multiple_of(speed) {
             self.rolling_display = [rng.random_range(1..=6), rng.random_range(1..=6)];
         }
 

@@ -22,12 +22,24 @@ pub struct BashIntermediarySnapshot {
     pub retained_bytes: u64,
 }
 
+impl BashIntermediarySnapshot {
+    /// Every byte ever produced has been consumed or dropped: nothing is in
+    /// flight anywhere in the process. A leaked byte keeps this false forever.
+    pub fn is_settled(&self) -> bool {
+        self.produced_bytes == self.consumed_bytes + self.dropped_bytes
+    }
+}
+
+/// Counters are read downstream-first. Each one only grows, and upstream
+/// counts are bumped before the bytes move on, so a snapshot torn by a
+/// concurrent relay can overstate in-flight bytes but never understate them:
+/// `is_settled` is never true unless the process really was settled.
 pub fn bash_intermediary_snapshot() -> BashIntermediarySnapshot {
-    use std::sync::atomic::Ordering;
-    let produced = BASH_INTERMEDIARY_PRODUCED_BYTES.load(Ordering::Relaxed);
-    let accepted = BASH_INTERMEDIARY_ACCEPTED_BYTES.load(Ordering::Relaxed);
-    let consumed = BASH_INTERMEDIARY_CONSUMED_BYTES.load(Ordering::Relaxed);
-    let dropped = BASH_INTERMEDIARY_DROPPED_BYTES.load(Ordering::Relaxed);
+    use std::sync::atomic::Ordering::SeqCst;
+    let consumed = BASH_INTERMEDIARY_CONSUMED_BYTES.load(SeqCst);
+    let dropped = BASH_INTERMEDIARY_DROPPED_BYTES.load(SeqCst);
+    let accepted = BASH_INTERMEDIARY_ACCEPTED_BYTES.load(SeqCst);
+    let produced = BASH_INTERMEDIARY_PRODUCED_BYTES.load(SeqCst);
     BashIntermediarySnapshot {
         produced_bytes: produced,
         accepted_bytes: accepted,
@@ -37,7 +49,57 @@ pub fn bash_intermediary_snapshot() -> BashIntermediarySnapshot {
     }
 }
 
+/// Test oracle for the handoff counters: wait until the whole process is
+/// settled. Concurrent relays only delay it; a leaked byte times it out.
+#[cfg(test)]
+async fn wait_handoff_settled() -> BashIntermediarySnapshot {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let now = bash_intermediary_snapshot();
+        if now.is_settled() {
+            return now;
+        }
+        assert!(std::time::Instant::now() < deadline, "handoff bytes never settled: {now:?}");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
 pub struct BashTool;
+
+/// One sanitized read in flight between a stream reader and the executor.
+/// Its bytes are counted out exactly once: `consume` when the executor takes
+/// it, or `Drop` when it never arrives (the channel closed before the send,
+/// or it was still queued when the receiver went away on timeout or cancel).
+/// Tokio drops queued values with the channel, so no path can leak a count.
+struct HandoffChunk(Option<String>);
+
+impl HandoffChunk {
+    fn new(text: String) -> Self {
+        BASH_INTERMEDIARY_PRODUCED_BYTES
+            .fetch_add(text.len() as u64, std::sync::atomic::Ordering::SeqCst);
+        Self(Some(text))
+    }
+
+    fn len(&self) -> usize {
+        self.0.as_ref().map_or(0, String::len)
+    }
+
+    fn consume(mut self) -> String {
+        let text = self.0.take().unwrap_or_default();
+        BASH_INTERMEDIARY_CONSUMED_BYTES
+            .fetch_add(text.len() as u64, std::sync::atomic::Ordering::SeqCst);
+        text
+    }
+}
+
+impl Drop for HandoffChunk {
+    fn drop(&mut self) {
+        if let Some(text) = self.0.take() {
+            BASH_INTERMEDIARY_DROPPED_BYTES
+                .fetch_add(text.len() as u64, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
 
 const READ_CHUNK_SIZE: usize = 1024;
 const MAX_STREAMED_DELTA_BYTES: usize = 16 * 1024;
@@ -48,15 +110,53 @@ enum PromptKind {
     Password,
 }
 
-fn sanitize_output(input: &[u8]) -> String {
-    let lossy = String::from_utf8_lossy(input);
-    let stripped = strip_ansi(&lossy);
+fn sanitize_output(input: &str) -> String {
+    let stripped = strip_ansi(input);
     stripped
         .chars()
         .filter(|ch| {
             *ch == '\n' || *ch == '\r' || *ch == '\t' || (!ch.is_control() && *ch != '\u{7f}')
         })
         .collect()
+}
+
+/// Read one child stream in `READ_CHUNK_SIZE` chunks and forward the
+/// sanitized text to the bash executor, tagged stdout/stderr. A character
+/// split between two reads is held back and decoded whole (#286); only an
+/// incomplete sequence (at most 3 bytes) waits, so prompts without a
+/// trailing newline are still forwarded as soon as they are read.
+async fn forward_output<R>(
+    mut reader: R,
+    is_stderr: bool,
+    tx: tokio::sync::mpsc::Sender<(bool, HandoffChunk)>,
+) where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+    let mut buf = vec![0u8; READ_CHUNK_SIZE];
+    let mut decoder = super::utf8_stream::Utf8StreamDecoder::new();
+    loop {
+        let (text, eof) = match reader.read(&mut buf).await {
+            Ok(0) | Err(_) => (decoder.finish(), true),
+            Ok(n) => (decoder.decode(&buf[..n]), false),
+        };
+        let msg = sanitize_output(&text);
+        if !msg.is_empty() {
+            let chunk = HandoffChunk::new(msg);
+            // Count acceptance before the send makes the chunk visible, so
+            // accepted >= consumed holds at every instant. A closed channel
+            // drops the chunk here, and its Drop counts it.
+            let Ok(permit) = tx.reserve().await else {
+                break;
+            };
+            BASH_INTERMEDIARY_ACCEPTED_BYTES
+                .fetch_add(chunk.len() as u64, std::sync::atomic::Ordering::SeqCst);
+            permit.send((is_stderr, chunk));
+        }
+        if eof {
+            break;
+        }
+    }
 }
 
 fn detect_password_prompt(text: &str) -> Option<PromptKind> {
@@ -386,67 +486,10 @@ pub(crate) async fn run_shell_command(
             .ok_or_else(|| RuntimeError::Tool("Failed to capture stdin".to_string()))?;
 
         let (tx_inter, mut rx_inter) =
-            tokio::sync::mpsc::channel::<(bool, String)>(BASH_INTERMEDIARY_CHANNEL_CAPACITY);
+            tokio::sync::mpsc::channel::<(bool, HandoffChunk)>(BASH_INTERMEDIARY_CHANNEL_CAPACITY);
 
-        let tx_o = tx_inter.clone();
-        tokio::spawn(async move {
-            use tokio::io::AsyncReadExt;
-            let mut reader = stdout;
-            let mut buf = vec![0u8; READ_CHUNK_SIZE];
-            loop {
-                match reader.read(&mut buf).await {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        let msg = sanitize_output(&buf[..n]);
-                        if !msg.is_empty() {
-                            use std::sync::atomic::Ordering;
-                            BASH_INTERMEDIARY_PRODUCED_BYTES
-                                .fetch_add(msg.len() as u64, Ordering::Relaxed);
-                            let len = msg.len();
-                            if tx_o.send((false, msg)).await.is_ok() {
-                                BASH_INTERMEDIARY_ACCEPTED_BYTES
-                                    .fetch_add(len as u64, Ordering::Relaxed);
-                            } else {
-                                BASH_INTERMEDIARY_DROPPED_BYTES
-                                    .fetch_add(len as u64, Ordering::Relaxed);
-                                break;
-                            }
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-        });
-
-        let tx_e = tx_inter.clone();
-        tokio::spawn(async move {
-            use tokio::io::AsyncReadExt;
-            let mut reader = stderr;
-            let mut buf = vec![0u8; READ_CHUNK_SIZE];
-            loop {
-                match reader.read(&mut buf).await {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        let msg = sanitize_output(&buf[..n]);
-                        if !msg.is_empty() {
-                            use std::sync::atomic::Ordering;
-                            BASH_INTERMEDIARY_PRODUCED_BYTES
-                                .fetch_add(msg.len() as u64, Ordering::Relaxed);
-                            let len = msg.len();
-                            if tx_e.send((true, msg)).await.is_ok() {
-                                BASH_INTERMEDIARY_ACCEPTED_BYTES
-                                    .fetch_add(len as u64, Ordering::Relaxed);
-                            } else {
-                                BASH_INTERMEDIARY_DROPPED_BYTES
-                                    .fetch_add(len as u64, Ordering::Relaxed);
-                                break;
-                            }
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-        });
+        tokio::spawn(forward_output(stdout, false, tx_inter.clone()));
+        tokio::spawn(forward_output(stderr, true, tx_inter.clone()));
 
         drop(tx_inter);
 
@@ -460,9 +503,8 @@ pub(crate) async fn run_shell_command(
             let mut streamed_bytes = 0usize;
             let mut redactions: Vec<String> = Vec::new();
 
-            while let Some((is_stderr, mut msg)) = rx_inter.recv().await {
-                BASH_INTERMEDIARY_CONSUMED_BYTES
-                    .fetch_add(msg.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            while let Some((is_stderr, chunk)) = rx_inter.recv().await {
+                let mut msg = chunk.consume();
                 if is_stderr {
                     stderr_tail.push_str(&msg);
                     if stderr_tail.len() > 512 {
@@ -676,6 +718,7 @@ mod tests {
         assert!(!marker.exists());
     }
 
+    #[cfg(target_os = "linux")]
     fn own_cgroup() -> String {
         std::fs::read_to_string("/proc/self/cgroup")
             .unwrap_or_default()
@@ -733,6 +776,7 @@ mod tests {
         assert_eq!(out.lines().next().unwrap_or_default().trim(), own_cgroup());
     }
 
+    #[cfg(target_os = "linux")]
     fn processes_named(name: &str) -> Vec<String> {
         let out = std::process::Command::new("pgrep")
             .args(["-f", name])
@@ -824,38 +868,17 @@ mod tests {
             .unwrap();
         assert!(result.contains("output truncated"));
 
-        // The counters are PROCESS-GLOBAL: sibling tests running bash
-        // concurrently (--test-threads > 1) contribute mid-flight bytes to
-        // any instantaneous snapshot. Conservation is therefore asserted at
-        // quiescence: every completed relay balances produced == consumed +
-        // dropped and returns retained to baseline, so the delta window
-        // rebalances once in-flight relays finish. A REAL leak never
-        // rebalances — the bounded poll keeps the oracle strict while
-        // removing scheduling sensitivity (observed flake under the full
-        // workspace run at 8 threads).
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        let (mut produced, mut consumed, mut accepted, mut dropped);
-        loop {
-            let after = bash_intermediary_snapshot();
-            produced = after.produced_bytes - before.produced_bytes;
-            consumed = after.consumed_bytes - before.consumed_bytes;
-            accepted = after.accepted_bytes - before.accepted_bytes;
-            dropped = after.dropped_bytes - before.dropped_bytes;
-            let balanced =
-                produced == consumed + dropped && after.retained_bytes == before.retained_bytes;
-            if balanced || std::time::Instant::now() >= deadline {
-                assert_eq!(
-                    produced,
-                    consumed + dropped,
-                    "handoff bytes must be conserved at quiescence"
-                );
-                assert_eq!(after.retained_bytes, before.retained_bytes);
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-        assert!(accepted >= consumed);
-        assert!(produced >= 64 * 1024);
+        // The counters are process-global and sibling tests run bash
+        // concurrently, so a before/after delta is skewed by whatever a
+        // sibling had mid-channel when `before` was read, and that skew
+        // never rebalances. Assert the invariant that does hold: once
+        // in-flight relays drain, every byte ever produced in this process
+        // was consumed or dropped. Siblings only delay this; a leaked byte
+        // keeps it false forever.
+        let after = wait_handoff_settled().await;
+        assert_eq!(after.retained_bytes, 0);
+        assert!(after.accepted_bytes >= after.consumed_bytes);
+        assert!(after.produced_bytes - before.produced_bytes >= 64 * 1024);
     }
 
     #[test]
@@ -868,7 +891,7 @@ mod tests {
 
     #[test]
     fn sanitizes_terminal_control_sequences_and_nuls() {
-        let cleaned = sanitize_output(b"ok\x1b[2J\x00done");
+        let cleaned = sanitize_output("ok\x1b[2J\x00done");
         assert_eq!(cleaned, "okdone");
     }
 
@@ -1346,5 +1369,166 @@ exit 1
             !msg2.contains("note: $GH_TOKEN was stripped"),
             "dedup must suppress the second notice: {msg2}"
         );
+    }
+}
+
+/// Issue #286: a multi-byte character split across two reads must come back
+/// whole, not as U+FFFD.
+#[cfg(test)]
+mod utf8_chunk_tests {
+    use super::*;
+    use crate::tools::Tool;
+    use serde_json::json;
+    use std::collections::VecDeque;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    /// Yields exactly the given chunks, one per `read`, then EOF.
+    struct ChunkedReader(VecDeque<Vec<u8>>);
+
+    impl tokio::io::AsyncRead for ChunkedReader {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if let Some(chunk) = self.0.pop_front() {
+                assert!(chunk.len() <= buf.remaining(), "test chunk larger than read buffer");
+                buf.put_slice(&chunk);
+            }
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    async fn forward_chunks(chunks: Vec<Vec<u8>>, is_stderr: bool) -> String {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1024);
+        forward_output(ChunkedReader(chunks.into()), is_stderr, tx).await;
+        let mut out = String::new();
+        while let Some((stderr, chunk)) = rx.recv().await {
+            let msg = chunk.consume();
+            assert_eq!(stderr, is_stderr);
+            out.push_str(&msg);
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn characters_split_at_every_offset_survive_both_streams() {
+        for ch in ['é', '▀', '😀'] {
+            let text = format!("a{ch}b{ch}{ch}c");
+            let bytes = text.as_bytes();
+            for split in 1..bytes.len() {
+                for is_stderr in [false, true] {
+                    let out = forward_chunks(
+                        vec![bytes[..split].to_vec(), bytes[split..].to_vec()],
+                        is_stderr,
+                    )
+                    .await;
+                    assert!(!out.contains('\u{FFFD}'), "{ch:?} split at {split}: {out:?}");
+                    assert_eq!(out.as_bytes(), bytes, "{ch:?} split at {split}");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn one_byte_reads_reassemble_every_character() {
+        let text = "é▀😀 mixed ascii ✓ 日本語";
+        let chunks = text.bytes().map(|b| vec![b]).collect();
+        assert_eq!(forward_chunks(chunks, false).await, text);
+    }
+
+    #[tokio::test]
+    async fn genuinely_invalid_bytes_still_become_replacement_characters() {
+        assert_eq!(forward_chunks(vec![b"ok\xffok".to_vec()], false).await, "ok\u{FFFD}ok");
+        // A lead byte followed by a non-continuation byte in the next read.
+        assert_eq!(
+            forward_chunks(vec![b"a\xe2".to_vec(), b"Xb".to_vec()], false).await,
+            "a\u{FFFD}Xb"
+        );
+        // A stray continuation byte at the start of a read.
+        assert_eq!(
+            forward_chunks(vec![b"a".to_vec(), b"\x80b".to_vec()], false).await,
+            "a\u{FFFD}b"
+        );
+    }
+
+    #[tokio::test]
+    async fn incomplete_sequence_at_eof_is_flushed_not_dropped() {
+        assert_eq!(forward_chunks(vec![b"ab\xe2\x96".to_vec()], false).await, "ab\u{FFFD}");
+        assert_eq!(
+            forward_chunks(vec![b"ab".to_vec(), b"\xf0\x9f".to_vec()], true).await,
+            "ab\u{FFFD}"
+        );
+    }
+
+    /// A consumer that gives up (timeout, cancelled password prompt) drops
+    /// the receiver with chunks still queued. Those bytes must be counted as
+    /// dropped, or the process-wide accounting never settles again.
+    #[tokio::test]
+    async fn chunks_still_queued_when_the_receiver_goes_away_count_as_dropped() {
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        let chunks: Vec<Vec<u8>> = (0..8).map(|_| b"queued".to_vec()).collect();
+        forward_output(ChunkedReader(chunks.into()), false, tx).await;
+        let before = bash_intermediary_snapshot();
+        drop(rx);
+        let after = wait_handoff_settled().await;
+        assert!(after.dropped_bytes - before.dropped_bytes >= 8 * 6);
+    }
+
+    /// A password prompt has no trailing newline; it must be forwarded as soon
+    /// as it is read, not held back waiting for more output or EOF.
+    #[tokio::test]
+    async fn prompt_without_newline_is_forwarded_before_eof() {
+        let (mut writer, reader) = tokio::io::duplex(4096);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let task = tokio::spawn(forward_output(reader, true, tx));
+        use tokio::io::AsyncWriteExt;
+        writer.write_all("[sudo] password for x: ".as_bytes()).await.unwrap();
+        let (is_stderr, chunk) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+                .await
+                .expect("prompt must arrive without EOF")
+                .unwrap();
+        let msg = chunk.consume();
+        assert!(is_stderr);
+        assert_eq!(detect_password_prompt(&msg), Some(PromptKind::Sudo), "{msg:?}");
+        drop(writer);
+        task.await.unwrap();
+    }
+
+    /// Through the real tool: more than 1 KiB of 3-byte characters on both
+    /// streams. 1024 is not a multiple of 3, so the reads split characters.
+    #[tokio::test]
+    async fn bash_tool_output_over_1kib_keeps_multibyte_characters_whole() {
+        let channel = crate::tools::output::delta_channel();
+        let (delta_tx, mut delta_rx) = (channel.sender, channel.receiver);
+        let mut ctx = super::super::test_helpers::create_tool_context();
+        ctx.channels.tx_delta = Some(delta_tx);
+        let result = BashTool
+            .execute(json!({"command": "printf '▀%.0s' {1..2000}", "timeout": 30}), ctx)
+            .await
+            .unwrap();
+        let mut streamed = String::new();
+        while let Some(delta) = delta_rx.try_drain() {
+            streamed.push_str(&delta);
+        }
+        let expected = "▀".repeat(2000);
+        assert!(!result.contains('\u{FFFD}'), "result has U+FFFD");
+        assert_eq!(result, expected);
+        assert!(!streamed.contains('\u{FFFD}'), "deltas have U+FFFD");
+        assert!(expected.starts_with(&streamed) && !streamed.is_empty());
+
+        let ctx = super::super::test_helpers::create_tool_context();
+        let err = BashTool
+            .execute(
+                json!({"command": "python3 -c \"import sys; sys.stderr.write(('▀'*119+'\\n')*45)\"; exit 3", "timeout": 30}),
+                ctx,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(!err.contains('\u{FFFD}'), "stderr has U+FFFD: {err}");
+        assert!(err.contains(&("▀".repeat(119) + "\n").repeat(45)), "{err}");
     }
 }

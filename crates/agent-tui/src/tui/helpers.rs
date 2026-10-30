@@ -40,6 +40,10 @@ pub(super) async fn apply_setting(
     // Resolve (generated from settings/defs.rs). Runtime keys round-trip
     // through `Set{id}`; on Err/rejection: set row_error and do NOT write to
     // config — the value was rejected.
+    // A session setting changed mid-turn lands in the session now, but the
+    // running turn keeps the values its stream copied when it started
+    // (`run_stream_tracked`), in-process and daemon alike: say so.
+    let mut next_turn = false;
     match settings::defs::apply_setting_dispatch(key, value, app) {
         settings::defs::SettingApply::Local(Ok(())) => {}
         settings::defs::SettingApply::Local(Err(msg)) => {
@@ -50,6 +54,7 @@ pub(super) async fn apply_setting(
         }
         settings::defs::SettingApply::Session(setting) => match link.set_checked(setting).await {
             Ok(applied) => {
+                next_turn = app.streaming;
                 if key == "context_window" {
                     // Also update the bar denominator immediately so the UI
                     // reflects the change.
@@ -92,12 +97,31 @@ pub(super) async fn apply_setting(
                 st.row_error = None;
                 st.edit_mode = None;
             }
+            if next_turn {
+                next_turn_notice(key, app);
+            }
         }
         Err(e) => {
             if let Some(st) = app.settings.as_mut() {
                 st.row_error = Some((key.to_string(), e.to_string()));
             }
         }
+    }
+}
+
+/// "<setting> change applies from the next turn": in the transcript and
+/// on the row (a `saved` note, drawn dim).
+fn next_turn_notice(key: &str, app: &mut App) {
+    let label = settings::defs::ALL_SETTINGS
+        .iter()
+        .find(|d| d.key == key)
+        .map_or(key, |d| d.label)
+        .to_lowercase();
+    app.push_msg(ChatMessage::System(format!(
+        "{label} change applies from the next turn"
+    )));
+    if let Some(st) = app.settings.as_mut() {
+        st.row_error = Some((key.to_string(), "saved — applies from the next turn".to_string()));
     }
 }
 
@@ -187,13 +211,22 @@ pub(super) fn apply_display_tail(tail: &agent_engine::session::DisplayTail, app:
     use agent_engine::session::DisplayItem;
     app.transcript.clear();
     if tail.omitted > 0 {
-        app.push_msg(ChatMessage::System(format!(
-            "… {} earlier message(s) hidden to speed resume — full history is still in the model's context",
-            tail.omitted
-        )));
+        app.push_msg_at(
+            ChatMessage::System(format!(
+                "… {} earlier message(s) hidden to speed resume — full history is still in the model's context",
+                tail.omitted
+            )),
+            None,
+        );
     }
-    for item in &tail.items {
-        app.push_msg(match item {
+    for (i, item) in tail.items.iter().enumerate() {
+        // The time the host recorded for the message, never "now": a
+        // message without one (legacy history) shows an empty time.
+        let at = tail
+            .time(i)
+            .and_then(|ts| chrono::DateTime::parse_from_rfc3339(ts).ok())
+            .map(|ts| ts.with_timezone(&chrono::Local));
+        let msg = match item {
             // The interruption marker is history for the model, not something
             // the user typed: show it as the aborted line it replaced.
             DisplayItem::User { text } => match interruption_label(text) {
@@ -217,7 +250,8 @@ pub(super) fn apply_display_tail(tail: &agent_engine::session::DisplayTail, app:
                 tool_name: tool_name.clone(),
                 input: input.clone(),
             },
-        });
+        };
+        app.push_msg_at(msg, at);
     }
     // Wholesale rebuild = a full message-list reshuffle. `messages.clear()` above
     // does NOT touch the line cache, and push_msg's incremental invalidate_last()
@@ -582,6 +616,85 @@ mod tests {
             app.transcript.messages().last().map(|m| &m.msg),
             Some(ChatMessage::Error(_))
         ));
+    }
+
+    fn local_hhmm(ts: &str) -> String {
+        chrono::DateTime::parse_from_rfc3339(ts)
+            .unwrap()
+            .with_timezone(&chrono::Local)
+            .format("%H:%M")
+            .to_string()
+    }
+
+    fn times(app: &App) -> Vec<String> {
+        app.transcript.messages().iter().map(|m| m.time.clone()).collect()
+    }
+
+    /// A rebuilt transcript (resume, attach, `/resync`, compaction) shows
+    /// when each message happened, and an empty time for a legacy message
+    /// with none — never the time of the rebuild.
+    #[test]
+    fn rebuild_shows_each_messages_own_time_and_blank_for_legacy() {
+        use serde_json::json;
+        let (q, a) = ("2020-03-01T05:47:00Z", "2020-03-01T05:48:00Z");
+        let history = vec![
+            j(json!({"role": "user", "content": "legacy"})),
+            j(json!({"role": "assistant", "content": [{"type": "text", "text": "old"}]})),
+            j(json!({"role": "user", "content": "asked", "_synaps_at": q})),
+            j(json!({"role": "assistant", "_synaps_at": a, "content": [
+                {"type": "thinking", "thinking": "hm"}, {"type": "text", "text": "answered"}
+            ]})),
+        ];
+        let mut app = test_app();
+        rebuild_display_messages(&history, &mut app);
+        assert_eq!(
+            transcript_repr(&app),
+            ["U|legacy", "T|old", "U|asked", "K|hm", "T|answered"]
+        );
+        assert_eq!(times(&app), ["", "", &local_hhmm(q), &local_hhmm(a), &local_hhmm(a)]);
+    }
+
+    /// A message on another local day than the previous dated one gets a
+    /// day line before it, rebuilt or live.
+    #[test]
+    fn a_new_day_gets_a_separator_line() {
+        use serde_json::json;
+        let (d1, d1b, d2) = ("2020-03-01T12:00:00Z", "2020-03-01T12:30:00Z", "2020-03-02T12:00:00Z");
+        let day = |ts: &str| {
+            super::super::transcript::day_line(
+                chrono::DateTime::parse_from_rfc3339(ts)
+                    .unwrap()
+                    .with_timezone(&chrono::Local)
+                    .date_naive(),
+            )
+        };
+        let history = vec![
+            j(json!({"role": "user", "content": "one", "_synaps_at": d1})),
+            j(json!({"role": "user", "content": "legacy"})),
+            j(json!({"role": "user", "content": "two", "_synaps_at": d1b})),
+            j(json!({"role": "user", "content": "three", "_synaps_at": d2})),
+        ];
+        let mut app = test_app();
+        rebuild_display_messages(&history, &mut app);
+        let expect = vec![
+            "U|one".to_string(),
+            "U|legacy".into(),
+            "U|two".into(),
+            format!("S|{}", day(d2)),
+            "U|three".into(),
+        ];
+        assert_eq!(transcript_repr(&app), expect);
+        // Live: today is another day than 2020-03-02.
+        app.push_msg(ChatMessage::User("now".into()));
+        let repr = transcript_repr(&app);
+        assert_eq!(repr[5], format!("S|{}", super::super::transcript::day_line(chrono::Local::now().date_naive())));
+        assert_eq!(repr[6], "U|now");
+        // Same day: no line.
+        app.push_msg(ChatMessage::User("again".into()));
+        assert_eq!(transcript_repr(&app).len(), 8);
+        // A rebuild starts over.
+        rebuild_display_messages(&history, &mut app);
+        assert_eq!(transcript_repr(&app), expect);
     }
 
     #[test]

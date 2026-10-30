@@ -376,16 +376,50 @@ impl SuccessorBudget {
 /// the user sees — provider-reported when `calibration` is known) into a
 /// conservative-estimator budget for the retained messages.
 ///
-/// The estimate is capped at 2/3 of the (estimated) pressure threshold so a
-/// fresh successor can never start inside the pressure band and thrash.
+/// With a sample, the messages are sized by the MESSAGES-ONLY ratio
+/// `(estimated - overhead) / (provider - overhead)`: the fixed part (system
+/// prompt + tool schemas, `overhead_tokens`) is assumed to count about 1:1 in
+/// both units (a live fit gave 59,064 estimated vs ~57.1k provider tokens),
+/// so it takes `overhead_tokens` of the target as is and only the rest is
+/// converted, at the messages' own ratio. (The whole-request ratio blends a
+/// 1:1 fixed part into the messages' ratio, so a successor sized by it
+/// settled ~10% over a 100k target with a 59k fixed part.) This also assumes
+/// the sample's messages and the successor's have comparable messages-only
+/// ratios. If the fixed part counts somewhat lower on the provider side, as a
+/// conservative estimator does, the messages ratio reads slightly high, but
+/// the successor then also carries that much less fixed part. With a fixed
+/// part lower in provider units, comparable message ratios, and a successor
+/// smaller than the sampled request (the usual case at a rollover), this
+/// approximation biases downward; other shapes can overshoot. When no
+/// messages ratio exists
+/// (the provider count does not exceed the fixed part) or it falls outside
+/// [`TokenCalibration`]'s bounds, the whole-request ratio is used as before.
+///
+/// The fixed part plus messages is capped at 2/3 of the (estimated) pressure
+/// threshold so a fresh successor can never start inside the pressure band
+/// and thrash.
 pub fn successor_budget(
     target_tokens: u64,
     pressure_tokens: u64,
     overhead_tokens: u64,
     calibration: Option<TokenCalibration>,
 ) -> SuccessorBudget {
-    let estimated_target = match calibration {
-        Some(c) if c.plausible() => (u128::from(target_tokens) * u128::from(c.estimated_tokens)
+    let messages_sample = calibration
+        .filter(|c| c.provider_tokens > overhead_tokens)
+        .map(|c| TokenCalibration {
+            provider_tokens: c.provider_tokens - overhead_tokens,
+            estimated_tokens: c.estimated_tokens.saturating_sub(overhead_tokens),
+        })
+        .filter(TokenCalibration::plausible);
+    let estimated_target = match (messages_sample, calibration) {
+        (Some(m), _) => {
+            let messages = u128::from(target_tokens.saturating_sub(overhead_tokens))
+                * u128::from(m.estimated_tokens)
+                / u128::from(m.provider_tokens);
+            (u128::from(overhead_tokens) + messages).min(u128::from(u64::MAX)) as u64
+        }
+        (None, Some(c)) if c.plausible() => (u128::from(target_tokens)
+            * u128::from(c.estimated_tokens)
             / u128::from(c.provider_tokens))
         .min(u128::from(u64::MAX)) as u64,
         _ => target_tokens,
@@ -1115,7 +1149,44 @@ fn has_host_key(message: &Value) -> bool {
         .is_some_and(|o| o.keys().any(|k| k.starts_with(HOST_KEY_PREFIX)))
 }
 
-/// Host continuation metadata never goes onto any provider wire.
+/// One message as it goes on a provider wire: serialized without its
+/// host-only `_synaps_*` keys, never cloned. Byte-identical to serializing
+/// the stripped copy [`wire_messages`] makes (same entries, same order).
+pub(crate) struct WireMessage<'a>(pub(crate) &'a Value);
+
+impl serde::Serialize for WireMessage<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        match self.0.as_object() {
+            Some(object) if has_host_key(self.0) => {
+                let kept = object.iter().filter(|(k, _)| !k.starts_with(HOST_KEY_PREFIX));
+                let mut map = serializer.serialize_map(Some(kept.clone().count()))?;
+                for (k, v) in kept {
+                    map.serialize_entry(k, v)?;
+                }
+                map.end()
+            }
+            _ => self.0.serialize(serializer),
+        }
+    }
+}
+
+/// A history as it goes on a provider wire (see [`WireMessage`]). Every
+/// message carries a host time once stamped, so stripping by copy would
+/// deep-clone the whole history on every request; this strips while
+/// serializing instead.
+#[derive(Clone, Copy)]
+pub(crate) struct WireMessages<'a>(pub(crate) &'a [SharedMessage]);
+
+impl serde::Serialize for WireMessages<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.0.iter().map(|m| WireMessage(m)))
+    }
+}
+
+/// Host continuation metadata never goes onto any provider wire. Copies
+/// only for transports that read the history as values (they translate it
+/// or forward it verbatim); the native Anthropic body uses [`WireMessages`].
 pub(crate) fn wire_messages(messages: &[SharedMessage]) -> Option<Vec<SharedMessage>> {
     if !messages.iter().any(|m| has_host_key(m)) {
         return None;
@@ -2686,6 +2757,9 @@ mod budget_tests {
         let plain = successor_budget(TARGET, PRESSURE, OVERHEAD, None);
         assert_eq!(plain.history_tokens, TARGET - OVERHEAD);
         // Estimator reads 1.5x the provider count: aim higher in estimator units.
+        // The provider count equals the target here, so the messages-only
+        // ratio (130,000 / 80,000) and the whole-request one give the same
+        // budget; the budget_tests below tell them apart.
         let cal = TokenCalibration {
             provider_tokens: 100_000,
             estimated_tokens: 150_000,
@@ -2695,6 +2769,7 @@ mod budget_tests {
             150_000 - OVERHEAD
         );
         // An implausible sample (ratio 9) is ignored: plain estimator target.
+        // (Its provider count is under the fixed part: no messages ratio.)
         let wild = TokenCalibration {
             provider_tokens: 10_000,
             estimated_tokens: 90_000,
@@ -2843,6 +2918,80 @@ mod budget_tests {
         assert_eq!(wire.last().unwrap()["content"], "continue");
     }
 
+    /// A history in which every message carries host keys, as it is once
+    /// every message has a time.
+    pub(super) fn stamped_history(n: usize) -> (Vec<SharedMessage>, Vec<SharedMessage>) {
+        let mut plain = Vec::new();
+        for i in 0..n {
+            plain.push(Arc::new(json!({"role":"user","content":[
+                {"type":"text","text":format!("question {i} ünïcode \"q\"")},
+                {"type":"tool_result","tool_use_id":format!("t{i}"),"content":"x".repeat(i % 7)}
+            ]})));
+            plain.push(Arc::new(json!({"role":"assistant","content":[
+                {"type":"thinking","thinking":"hm","signature":"sig"},
+                {"type":"text","text":format!("answer {i}")},
+                {"type":"tool_use","id":format!("t{}", i + 1),"name":"bash","input":{"command":"ls","n":i}}
+            ]})));
+        }
+        let stamped = plain
+            .iter()
+            .enumerate()
+            .map(|(i, m)| {
+                let mut m = (**m).clone();
+                m[super::super::message_time::AT_KEY] = json!("2026-10-25T05:47:00Z");
+                if i == 0 {
+                    m[TURN_KEY] = json!({"id": "t-1"});
+                }
+                Arc::new(m)
+            })
+            .collect();
+        (plain, stamped)
+    }
+
+    /// The serialize-time strip is byte-identical to serializing the old
+    /// stripped copy, and to a history that never had host keys: prompt
+    /// cache keys depend on it.
+    #[test]
+    fn wire_serialization_is_byte_identical_with_and_without_host_keys() {
+        let (plain, stamped) = stamped_history(50);
+        let before = serde_json::to_vec(&plain).unwrap();
+        let copied = serde_json::to_vec(&wire_messages(&stamped).unwrap()).unwrap();
+        let streamed = serde_json::to_vec(&WireMessages(&stamped)).unwrap();
+        assert_eq!(copied, before);
+        assert_eq!(streamed, before);
+        assert_eq!(serde_json::to_vec(&WireMessages(&plain)).unwrap(), before);
+        assert!(!String::from_utf8(streamed).unwrap().contains("_synaps_"));
+    }
+
+    /// Every transport but native Anthropic reads the history as values
+    /// (an extension provider gets it verbatim): it gets the stripped copy.
+    /// Native Anthropic strips while serializing, so it borrows.
+    #[test]
+    fn every_routed_transport_gets_a_history_without_host_keys() {
+        let (_, stamped) = stamped_history(3);
+        for model in ["claude-sonnet-4-6", "anthropic/claude-opus-4-7"] {
+            assert!(
+                crate::runtime::openai::routed_wire_messages(model, &stamped).is_none(),
+                "{model}: native Anthropic borrows"
+            );
+        }
+        for model in [
+            "groq/llama-3.3-70b-versatile",
+            "github-copilot/claude-sonnet-4.6",
+            "github-copilot/gpt-5.3-codex",
+            "openai-codex/gpt-5.1-codex-mini",
+            "google-gemini/gemini-2.5-pro",
+            "xai-auth/grok-4",
+            "my-plugin:my-provider:my-model",
+            "unknown-provider/model",
+        ] {
+            let wire = crate::runtime::openai::routed_wire_messages(model, &stamped)
+                .unwrap_or_else(|| panic!("{model}: must strip"));
+            let bytes = serde_json::to_string(&wire).unwrap();
+            assert!(!bytes.contains("_synaps_"), "{model}: {bytes}");
+        }
+    }
+
     /// Every `_synaps_*` key is host metadata, including ones a later build
     /// adds: none reaches a provider request.
     #[test]
@@ -2958,6 +3107,9 @@ mod budget_tests {
 
     #[test]
     fn implausible_calibration_falls_back_to_the_estimator() {
+        // Every sample here counts fewer provider tokens than the fixed part,
+        // so no messages-only ratio exists and the whole-request ratio
+        // applies, with its own bounds.
         let at = |provider_tokens, estimated_tokens| {
             successor_budget(
                 TARGET,
@@ -2998,6 +3150,106 @@ mod budget_tests {
             estimated_tokens: 0
         }
         .plausible());
+    }
+
+    /// A live-shaped sample: a fixed part of 59,064 estimator tokens (system
+    /// prompt + tool schemas, counting about 1:1) and messages the estimator
+    /// reads at ~1.35x the provider.
+    const LIVE_OVERHEAD: u64 = 59_064;
+    const LIVE_SAMPLE: TokenCalibration = TokenCalibration {
+        provider_tokens: 312_000,
+        estimated_tokens: 400_000,
+    };
+    const ROOMY_PRESSURE: u64 = 1_000_000;
+
+    #[test]
+    fn the_message_budget_uses_the_messages_only_ratio() {
+        // (100,000 - 59,064) x (400,000 - 59,064) / (312,000 - 59,064).
+        // The whole-request ratio (1.28) would give 128,205 - 59,064 = 69,141,
+        // which settles ~10% over target in provider tokens.
+        assert_eq!(
+            successor_budget(100_000, ROOMY_PRESSURE, LIVE_OVERHEAD, Some(LIVE_SAMPLE))
+                .history_tokens,
+            55_178
+        );
+    }
+
+    #[test]
+    fn the_messages_only_ratio_is_bounded_like_the_whole_request_ratio() {
+        let at = |provider_tokens, estimated_tokens| {
+            successor_budget(
+                100_000,
+                ROOMY_PRESSURE,
+                LIVE_OVERHEAD,
+                Some(TokenCalibration {
+                    provider_tokens,
+                    estimated_tokens,
+                }),
+            )
+            .history_tokens
+        };
+        let target_msgs = 100_000 - LIVE_OVERHEAD;
+        // Messages ratio exactly 2.0 and 0.5: accepted.
+        assert_eq!(
+            at(LIVE_OVERHEAD + 40_000, LIVE_OVERHEAD + 80_000),
+            target_msgs * 2
+        );
+        assert_eq!(
+            at(LIVE_OVERHEAD + 40_000, LIVE_OVERHEAD + 20_000),
+            target_msgs / 2
+        );
+        // Whole ratio 1.875 is plausible, the messages ratio (4.3) is not:
+        // today's whole-request formula, 100,000 x 1.875 - 59,064.
+        assert_eq!(at(80_000, 150_000), 128_436);
+        // Whole ratio 0.78 plausible, messages ratio 0.35 not: today's formula.
+        assert_eq!(at(90_000, 70_000), 18_713);
+        // The provider count does not exceed the fixed part: no messages
+        // ratio exists, today's formula (here 100,000 x 1.5 - 59,064).
+        assert_eq!(
+            at(LIVE_OVERHEAD, LIVE_OVERHEAD * 3 / 2),
+            100_000 * 3 / 2 - LIVE_OVERHEAD
+        );
+        assert_eq!(at(50_000, 60_000), 120_000 - LIVE_OVERHEAD);
+        // The estimate does not exceed the fixed part: today's formula.
+        assert_eq!(at(70_000, LIVE_OVERHEAD), 84_377 - LIVE_OVERHEAD);
+        // No sample: the plain estimator target.
+        assert_eq!(
+            successor_budget(100_000, ROOMY_PRESSURE, LIVE_OVERHEAD, None).history_tokens,
+            target_msgs
+        );
+    }
+
+    #[test]
+    fn a_fixed_part_at_or_over_target_leaves_no_message_budget_when_calibrated() {
+        // Provider 400,000 over a 120,000 fixed part: messages ratio 1.36, but
+        // the fixed part alone already exceeds the 100,000 target.
+        let c = TokenCalibration {
+            provider_tokens: 400_000,
+            estimated_tokens: 500_000,
+        };
+        assert_eq!(
+            successor_budget(100_000, ROOMY_PRESSURE, 120_000, Some(c)).history_tokens,
+            0
+        );
+        assert_eq!(
+            successor_budget(100_000, ROOMY_PRESSURE, 100_000, Some(c)).history_tokens,
+            0
+        );
+    }
+
+    #[test]
+    fn the_pressure_cap_bounds_the_fixed_part_plus_messages() {
+        // 2/3 of 150,000 = 100,000 for system + schemas + messages, so the
+        // messages get 100,000 - 59,064 even though 55,178 alone is below it.
+        assert_eq!(
+            successor_budget(100_000, 150_000, LIVE_OVERHEAD, Some(LIVE_SAMPLE)).history_tokens,
+            100_000 - LIVE_OVERHEAD
+        );
+        // A cap below the fixed part leaves nothing.
+        assert_eq!(
+            successor_budget(100_000, 60_000, LIVE_OVERHEAD, Some(LIVE_SAMPLE)).history_tokens,
+            0
+        );
     }
 }
 
@@ -3470,6 +3722,64 @@ mod calibration_transport_tests {
         );
     }
 
+    /// The provider's count of a request whose fixed part (everything but
+    /// `messages`) it reads 1:1 with the conservative estimate and whose
+    /// messages it reads at 1/1.35 of it — the live shape.
+    fn provider_tokens_for(body: &str) -> u64 {
+        let total = crate::runtime::context::conservative_token_estimate(body);
+        let v: Value = serde_json::from_str(body).expect("request JSON");
+        let msgs = crate::runtime::context::conservative_token_estimate(&v["messages"].to_string());
+        total.saturating_sub(msgs) + msgs * 100 / 135
+    }
+
+    /// Ruling 3 in provider units: after a rollover the first request
+    /// settles near `target_tokens` as the provider counts it, even though
+    /// the fixed part counts 1:1 and only the messages count at 1.35.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn a_rollover_settles_near_the_target_in_provider_tokens() {
+        let _base = crate::test_env::BaseDirGuard::new();
+        let bodies: Arc<std::sync::OnceLock<Arc<std::sync::Mutex<Vec<String>>>>> =
+            Arc::default();
+        let seen = bodies.clone();
+        let (url, mock) = spawn(Arc::new(move |n, _| {
+            let body = seen.get().expect("bodies").lock().unwrap()[n].clone();
+            let provider = provider_tokens_for(&body);
+            (200, Some(json!({"input_tokens":provider,"output_tokens":3,"cache_read_input_tokens":0,"cache_creation_input_tokens":0})))
+        }))
+        .await;
+        bodies.set(mock.bodies.clone()).unwrap();
+        let _g = crate::test_env::EnvVarGuard::set("SYNAPS_ANTHROPIC_BASE_URL", &url);
+        let mut rt = runtime();
+        // A fixed part about 60% of the target, as live (59k of 100k).
+        rt.set_system_prompt(format!("Fixed part. {}", "s ".repeat(6_250)));
+        // A large first window under the default thresholds: the sample.
+        let first = turn_with(&rt, big_history(), Default::default()).await;
+        assert!(first.heads.is_empty(), "no rollover in the sampling turn");
+        let sample = calibration(&rt).expect("sample");
+        low_thresholds(&rt);
+        let out = turn_with(&rt, big_history(), Default::default()).await;
+        assert_eq!(out.heads.len(), 1, "exactly one rollover");
+        let bodies = mock.bodies.lock().unwrap().clone();
+        let settled = provider_tokens_for(bodies.last().expect("a request"));
+        let fixed = {
+            let last: Value = serde_json::from_str(bodies.last().unwrap()).unwrap();
+            crate::runtime::context::conservative_token_estimate(bodies.last().unwrap())
+                - crate::runtime::context::conservative_token_estimate(
+                    &last["messages"].to_string(),
+                )
+        };
+        eprintln!(
+            "sample {sample:?} requests {} fixed {fixed} settled {settled}",
+            bodies.len()
+        );
+        assert_eq!(calibration(&rt).map(|c| c.provider_tokens), Some(settled));
+        assert!(
+            (23_750..=26_250).contains(&settled),
+            "settled {settled} provider tokens, target 25,000 +/- 5%"
+        );
+    }
+
     #[tokio::test]
     #[serial_test::serial(synaps_base_dir)]
     async fn a_new_record_reporting_zero_tokens_clears_the_sample() {
@@ -3591,6 +3901,75 @@ mod calibration_transport_tests {
         assert!(bodies[0].contains("TAGGED REQUEST"));
         assert!(!bodies[0].contains("_synaps_turn"));
         assert!(!bodies[0].contains("_synaps_context"));
+    }
+
+    /// The request a provider gets is byte-identical whether or not the
+    /// history carries message times (prompt-cache safety), and never
+    /// contains one: streaming turn and compaction transports.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn request_bytes_are_identical_with_and_without_message_times() {
+        let _base = crate::test_env::BaseDirGuard::new();
+        let (url, mock) = spawn(Arc::new(|_, _| (200, None))).await;
+        let _g = crate::test_env::EnvVarGuard::set("SYNAPS_ANTHROPIC_BASE_URL", &url);
+        let (mut plain, mut stamped) = super::budget_tests::stamped_history(40);
+        plain.push(Arc::new(json!({"role":"user","content":"go on"})));
+        stamped.push(Arc::new(json!({"role":"user","content":"go on",
+            "_synaps_at":"2026-10-25T05:48:00Z"})));
+        for history in [plain.clone(), stamped.clone()] {
+            let mut rt = crate::Runtime::new_headless();
+            rt.set_model("claude-sonnet-4-6".to_string());
+            rt.set_api_retries(0);
+            turn_with(&rt, history, Default::default()).await;
+        }
+        let bodies = mock.bodies.lock().unwrap().clone();
+        assert_eq!(bodies.len(), 2, "one request per turn");
+        assert!(bodies[0].contains("go on"));
+        assert_eq!(bodies[0], bodies[1], "stamps changed the request bytes");
+        assert!(!bodies[1].contains("_synaps_"));
+
+        // Compaction (`call_api_simple`) sends caller history directly.
+        let mut rt = runtime();
+        rt.set_api_retries(0);
+        rt.set_compaction_model(Some("claude-sonnet-4-6".to_string()));
+        let _ = rt.compact_call(stamped).await;
+        let bodies = mock.bodies.lock().unwrap().clone();
+        assert_eq!(bodies.len(), 3);
+        assert!(bodies[2].contains("go on") && !bodies[2].contains("_synaps_"));
+    }
+
+    /// Rough cost of putting a 2,000-message history on the wire, before
+    /// (strip by copy) and after (strip while serializing). Not run by
+    /// default: `cargo test -p synaps-engine --release -- --ignored
+    /// wire_strip_timing --nocapture`.
+    #[test]
+    #[ignore]
+    fn wire_strip_timing() {
+        let (_, stamped) = super::budget_tests::stamped_history(1000);
+        assert_eq!(stamped.len(), 2000);
+        let rounds = 50;
+        let t = std::time::Instant::now();
+        let mut n = 0;
+        for _ in 0..rounds {
+            let copy = wire_messages(&stamped).unwrap();
+            n += serde_json::to_vec(&copy).unwrap().len();
+        }
+        let copy = t.elapsed() / rounds;
+        let t = std::time::Instant::now();
+        for _ in 0..rounds {
+            n += serde_json::to_vec(&WireMessages(&stamped)).unwrap().len();
+        }
+        let streamed = t.elapsed() / rounds;
+        let t = std::time::Instant::now();
+        let (plain, _) = super::budget_tests::stamped_history(1000);
+        for _ in 0..rounds {
+            n += serde_json::to_vec(&plain).unwrap().len();
+        }
+        let unstamped = t.elapsed() / rounds;
+        eprintln!(
+            "2000 msgs, {} bytes: copy+serialize {copy:?}, serialize-strip {streamed:?}, no host keys {unstamped:?}",
+            n / (3 * rounds as usize)
+        );
     }
 
     fn calibration(rt: &crate::Runtime) -> Option<TokenCalibration> {

@@ -263,6 +263,8 @@ mod tests {
                 model: "model".into(),
                 system_prompt: "system".into(),
                 timeout_secs: 1,
+                cwd: None,
+                thinking: None,
             });
         }
         registry.lock().unwrap().register(h);
@@ -306,6 +308,8 @@ mod tests {
             model: "anthropic/claude-opus-5-5".into(),
             system_prompt: "s".into(),
             timeout_secs: 60,
+            cwd: None,
+            thinking: None,
         };
         let path = super::super::archive::write_archive(
             dir.path(),

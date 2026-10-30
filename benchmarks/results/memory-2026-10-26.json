@@ -1,0 +1,4358 @@
+{
+  "date_utc": "2026-10-26T10:17:42Z",
+  "machine": {
+    "cpu": "Intel(R) Core(TM) Ultra 9 275HX",
+    "cores": 24,
+    "mem_gb": 30.7,
+    "os": "CachyOS",
+    "kernel": "7.2.11-1-cachyos",
+    "arch": "x86_64"
+  },
+  "args": {
+    "sessions": [
+      1,
+      10
+    ],
+    "tools": [
+      "jcode",
+      "jcode_memory_off",
+      "pi",
+      "codex",
+      "opencode",
+      "claude_code",
+      "synaps"
+    ],
+    "reps": 3,
+    "timeout": 10.0,
+    "settle": 3.0,
+    "json_out": "results/memory-2026-10-26.json",
+    "hold": 0.0,
+    "max_psi": 1.0,
+    "quiet_wait": 900.0,
+    "max_attempts": 3
+  },
+  "versions": {
+    "jcode": "version v0.91.0 (439a243bb)",
+    "jcode_memory_off": "version v0.91.0 (439a243bb)",
+    "pi": "0.85.1",
+    "codex": "codex-cli 0.163.0",
+    "opencode": "opencode v2.1.1",
+    "claude_code": "2.1.304 (Claude Code)",
+    "synaps": "synaps 0.11.0"
+  },
+  "live_daemons_before": {
+    "3652": "/home/haseeb/.local/bin/synaps-dev daemon --foreground --idle-exit 600",
+    "2585094": "/home/haseeb/Jawz/workspace/readme-media-20261026/bin/synaps daemon --foreground --profile demo"
+  },
+  "summary": [
+    {
+      "tool": "jcode",
+      "sessions": 1,
+      "median_mem_mb": 116.7,
+      "raw_mem_mb": [
+        122.9,
+        103.7,
+        116.7
+      ]
+    },
+    {
+      "tool": "jcode",
+      "sessions": 10,
+      "median_mem_mb": 164.8,
+      "raw_mem_mb": [
+        164.8,
+        163.9,
+        177.0
+      ]
+    },
+    {
+      "tool": "jcode_memory_off",
+      "sessions": 1,
+      "median_mem_mb": 117.5,
+      "raw_mem_mb": [
+        123.4,
+        116.2,
+        117.5
+      ]
+    },
+    {
+      "tool": "jcode_memory_off",
+      "sessions": 10,
+      "median_mem_mb": 173.4,
+      "raw_mem_mb": [
+        172.3,
+        173.7,
+        173.4
+      ]
+    },
+    {
+      "tool": "pi",
+      "sessions": 1,
+      "median_mem_mb": 116.7,
+      "raw_mem_mb": [
+        117.1,
+        116.5,
+        116.7
+      ]
+    },
+    {
+      "tool": "pi",
+      "sessions": 10,
+      "median_mem_mb": 708.3,
+      "raw_mem_mb": [
+        707.0,
+        709.3,
+        708.3
+      ]
+    },
+    {
+      "tool": "codex",
+      "sessions": 1,
+      "median_mem_mb": 273.9,
+      "raw_mem_mb": [
+        273.9,
+        277.6,
+        267.1
+      ]
+    },
+    {
+      "tool": "codex",
+      "sessions": 10,
+      "median_mem_mb": 524.7,
+      "raw_mem_mb": [
+        550.6,
+        514.7,
+        524.7
+      ]
+    },
+    {
+      "tool": "opencode",
+      "sessions": 1,
+      "median_mem_mb": 387.1,
+      "raw_mem_mb": [
+        392.1,
+        387.1,
+        386.1
+      ]
+    },
+    {
+      "tool": "opencode",
+      "sessions": 10,
+      "median_mem_mb": 1197.3,
+      "raw_mem_mb": [
+        1197.3,
+        1203.2,
+        1173.2
+      ]
+    },
+    {
+      "tool": "claude_code",
+      "sessions": 1,
+      "median_mem_mb": 185.7,
+      "raw_mem_mb": [
+        185.8,
+        185.7,
+        185.2
+      ]
+    },
+    {
+      "tool": "claude_code",
+      "sessions": 10,
+      "median_mem_mb": 894.0,
+      "raw_mem_mb": [
+        894.3,
+        894.0,
+        893.5
+      ]
+    },
+    {
+      "tool": "synaps",
+      "sessions": 1,
+      "median_mem_mb": 41.5,
+      "raw_mem_mb": [
+        41.5,
+        43.2,
+        41.1
+      ]
+    },
+    {
+      "tool": "synaps",
+      "sessions": 10,
+      "median_mem_mb": 78.6,
+      "raw_mem_mb": [
+        78.6,
+        80.1,
+        78.3
+      ]
+    }
+  ],
+  "runs": [
+    {
+      "mem_mb": 122.9,
+      "pss_mb": 122.9,
+      "swap_pss_mb": 0.0,
+      "pss_anon_mb": 79.7,
+      "pss_file_mb": 43.0,
+      "process_count": 2,
+      "outside_tree_mem_mb": 0,
+      "processes": [
+        {
+          "pid": 2751363,
+          "pss_mb": 24.9,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 24.9,
+          "pss_anon_mb": 5.4,
+          "pss_file_mb": 19.4,
+          "in_tree": true,
+          "cmd": "/home/haseeb/.jcode/builds/versions/0.91.0/jcode-linux-x86_64.bin --no-update --no-selfdev"
+        },
+        {
+          "pid": 2751403,
+          "pss_mb": 98.0,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 98.0,
+          "pss_anon_mb": 74.3,
+          "pss_file_mb": 23.6,
+          "in_tree": true,
+          "cmd": "/home/haseeb/.jcode/builds/versions/0.91.0/jcode-linux-x86_64.bin --provider auto serve"
+        }
+      ],
+      "launch": {
+        "mem_mb": 122.9,
+        "pss_mb": 122.9,
+        "swap_pss_mb": 0.0,
+        "pss_anon_mb": 79.7,
+        "pss_file_mb": 43.0,
+        "process_count": 2
+      },
+      "hold_s": 0.0,
+      "tool": "jcode",
+      "sessions": 1,
+      "ready": 1,
+      "excerpt": "11;?\u0007Starting server...",
+      "pressure_before": {
+        "psi_some_avg10": 0.55,
+        "psi_full_avg10": 0.55,
+        "mem_available_gb": 25.9
+      },
+      "pressure_after": {
+        "psi_some_avg10": 0.55,
+        "psi_full_avg10": 0.55,
+        "mem_available_gb": 25.5
+      },
+      "attempt": 1,
+      "quiet": true,
+      "rep": 1
+    },
+    {
+      "mem_mb": 103.7,
+      "pss_mb": 57.6,
+      "swap_pss_mb": 46.0,
+      "pss_anon_mb": 28.5,
+      "pss_file_mb": 29.2,
+      "process_count": 2,
+      "outside_tree_mem_mb": 0,
+      "processes": [
+        {
+          "pid": 2752749,
+          "pss_mb": 16.8,
+          "swap_pss_mb": 3.7,
+          "mem_mb": 20.6,
+          "pss_anon_mb": 1.8,
+          "pss_file_mb": 15.1,
+          "in_tree": true,
+          "cmd": "/home/haseeb/.jcode/builds/versions/0.91.0/jcode-linux-x86_64.bin --no-update --no-selfdev"
+        },
+        {
+          "pid": 2752788,
+          "pss_mb": 40.8,
+          "swap_pss_mb": 42.3,
+          "mem_mb": 83.1,
+          "pss_anon_mb": 26.7,
+          "pss_file_mb": 14.1,
+          "in_tree": true,
+          "cmd": "/home/haseeb/.jcode/builds/versions/0.91.0/jcode-linux-x86_64.bin --provider auto serve"
+        }
+      ],
+      "launch": {
+        "mem_mb": 103.7,
+        "pss_mb": 57.6,
+        "swap_pss_mb": 46.0,
+        "pss_anon_mb": 28.5,
+        "pss_file_mb": 29.2,
+        "process_count": 2
+      },
+      "hold_s": 0.0,
+      "tool": "jcode",
+      "sessions": 1,
+      "ready": 1,
+      "excerpt": "Starting server...",
+      "pressure_before": {
+        "psi_some_avg10": 0.55,
+        "psi_full_avg10": 0.55,
+        "mem_available_gb": 25.5
+      },
+      "pressure_after": {
+        "psi_some_avg10": 0.92,
+        "psi_full_avg10": 0.92,
+        "mem_available_gb": 25.7
+      },
+      "attempt": 1,
+      "quiet": true,
+      "rep": 2
+    },
+    {
+      "mem_mb": 116.7,
+      "pss_mb": 116.7,
+      "swap_pss_mb": 0.0,
+      "pss_anon_mb": 73.9,
+      "pss_file_mb": 42.8,
+      "process_count": 2,
+      "outside_tree_mem_mb": 0,
+      "processes": [
+        {
+          "pid": 2754372,
+          "pss_mb": 24.6,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 24.6,
+          "pss_anon_mb": 5.5,
+          "pss_file_mb": 19.1,
+          "in_tree": true,
+          "cmd": "/home/haseeb/.jcode/builds/versions/0.91.0/jcode-linux-x86_64.bin --no-update --no-selfdev"
+        },
+        {
+          "pid": 2754411,
+          "pss_mb": 92.1,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 92.1,
+          "pss_anon_mb": 68.4,
+          "pss_file_mb": 23.7,
+          "in_tree": true,
+          "cmd": "/home/haseeb/.jcode/builds/versions/0.91.0/jcode-linux-x86_64.bin --provider auto serve"
+        }
+      ],
+      "launch": {
+        "mem_mb": 116.7,
+        "pss_mb": 116.7,
+        "swap_pss_mb": 0.0,
+        "pss_anon_mb": 73.9,
+        "pss_file_mb": 42.8,
+        "process_count": 2
+      },
+      "hold_s": 0.0,
+      "tool": "jcode",
+      "sessions": 1,
+      "ready": 1,
+      "excerpt": "11;?\u0007Starting server...",
+      "pressure_before": {
+        "psi_some_avg10": 0.92,
+        "psi_full_avg10": 0.92,
+        "mem_available_gb": 25.7
+      },
+      "pressure_after": {
+        "psi_some_avg10": 0.76,
+        "psi_full_avg10": 0.76,
+        "mem_available_gb": 25.7
+      },
+      "attempt": 1,
+      "quiet": true,
+      "rep": 3
+    },
+    {
+      "mem_mb": 164.8,
+      "pss_mb": 76.4,
+      "swap_pss_mb": 88.5,
+      "pss_anon_mb": 36.6,
+      "pss_file_mb": 39.8,
+      "process_count": 11,
+      "outside_tree_mem_mb": 0,
+      "processes": [
+        {
+          "pid": 2754850,
+          "pss_mb": 2.8,
+          "swap_pss_mb": 4.0,
+          "mem_mb": 6.8,
+          "pss_anon_mb": 1.4,
+          "pss_file_mb": 1.4,
+          "in_tree": true,
+          "cmd": "/home/haseeb/.jcode/builds/versions/0.91.0/jcode-linux-x86_64.bin --no-update --no-selfdev"
+        },
+        {
+          "pid": 2754889,
+          "pss_mb": 13.1,
+          "swap_pss_mb": 64.5,
+          "mem_mb": 77.6,
+          "pss_anon_mb": 6.7,
+          "pss_file_mb": 6.4,
+          "in_tree": true,
+          "cmd": "/home/haseeb/.jcode/builds/versions/0.91.0/jcode-linux-x86_64.bin --provider auto serve"
+        },
+        {
+          "pid": 2755169,
+          "pss_mb": 2.7,
+          "swap_pss_mb": 4.1,
+          "mem_mb": 6.7,
+          "pss_anon_mb": 1.4,
+          "pss_file_mb": 1.3,
+          "in_tree": true,
+          "cmd": "/home/haseeb/.jcode/builds/versions/0.91.0/jcode-linux-x86_64.bin --no-update --no-selfdev"
+        },
+        {
+          "pid": 2755515,
+          "pss_mb": 2.8,
+          "swap_pss_mb": 4.0,
+          "mem_mb": 6.8,
+          "pss_anon_mb": 1.4,
+          "pss_file_mb": 1.4,
+          "in_tree": true,
+          "cmd": "/home/haseeb/.jcode/builds/versions/0.91.0/jcode-linux-x86_64.bin --no-update --no-selfdev"
+        },
+        {
+          "pid": 2757002,
+          "pss_mb": 2.9,
+          "swap_pss_mb": 4.0,
+          "mem_mb": 6.9,
+          "pss_anon_mb": 1.4,
+          "pss_file_mb": 1.5,
+          "in_tree": true,
+          "cmd": "/home/haseeb/.jcode/builds/versions/0.91.0/jcode-linux-x86_64.bin --no-update --no-selfdev"
+        },
+        {
+          "pid": 2758486,
+          "pss_mb": 2.9,
+          "swap_pss_mb": 4.0,
+          "mem_mb": 6.9,
+          "pss_anon_mb": 1.4,
+          "pss_file_mb": 1.5,
+          "in_tree": true,
+          "cmd": "/home/haseeb/.jcode/builds/versions/0.91.0/jcode-linux-x86_64.bin --no-update --no-selfdev"
+        },
+        {
+          "pid": 2760170,
+          "pss_mb": 2.9,
+          "swap_pss_mb": 3.9,
+          "mem_mb": 6.8,
+          "pss_anon_mb": 1.4,
+          "pss_file_mb": 1.5,
+          "in_tree": true,
+          "cmd": "/home/haseeb/.jcode/builds/versions/0.91.0/jcode-linux-x86_64.bin --no-update --no-selfdev"
+        },
+        {
+          "pid": 2762150,
+          "pss_mb": 11.0,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 11.0,
+          "pss_anon_mb": 5.4,
+          "pss_file_mb": 5.6,
+          "in_tree": true,
+          "cmd": "/home/haseeb/.jcode/builds/versions/0.91.0/jcode-linux-x86_64.bin --no-update --no-selfdev"
+        },
+        {
+          "pid": 2763598,
+          "pss_mb": 11.7,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 11.7,
+          "pss_anon_mb": 5.4,
+          "pss_file_mb": 6.3,
+          "in_tree": true,
+          "cmd": "/home/haseeb/.jcode/builds/versions/0.91.0/jcode-linux-x86_64.bin --no-update --no-selfdev"
+        },
+        {
+          "pid": 2766198,
+          "pss_mb": 11.9,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 11.9,
+          "pss_anon_mb": 5.3,
+          "pss_file_mb": 6.6,
+          "in_tree": true,
+          "cmd": "/home/haseeb/.jcode/builds/versions/0.91.0/jcode-linux-x86_64.bin --no-update --no-selfdev"
+        },
+        {
+          "pid": 2767843,
+          "pss_mb": 11.7,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 11.7,
+          "pss_anon_mb": 5.4,
+          "pss_file_mb": 6.3,
+          "in_tree": true,
+          "cmd": "/home/haseeb/.jcode/builds/versions/0.91.0/jcode-linux-x86_64.bin --no-update --no-selfdev"
+        }
+      ],
+      "launch": {
+        "mem_mb": 164.8,
+        "pss_mb": 76.4,
+        "swap_pss_mb": 88.5,
+        "pss_anon_mb": 36.6,
+        "pss_file_mb": 39.8,
+        "process_count": 11
+      },
+      "hold_s": 0.0,
+      "tool": "jcode",
+      "sessions": 10,
+      "ready": 10,
+      "excerpt": "Starting server...",
+      "pressure_before": {
+        "psi_some_avg10": 0.76,
+        "psi_full_avg10": 0.76,
+        "mem_available_gb": 25.7
+      },
+      "pressure_after": {
+        "psi_some_avg10": 0.09,
+        "psi_full_avg10": 0.09,
+        "mem_available_gb": 25.7
+      },
+      "attempt": 1,
+      "quiet": true,
+      "rep": 1
+    },
+    {
+      "mem_mb": 163.9,
+      "pss_mb": 79.9,
+      "swap_pss_mb": 84.1,
+      "pss_anon_mb": 41.4,
+      "pss_file_mb": 38.7,
+      "process_count": 11,
+      "outside_tree_mem_mb": 0,
+      "processes": [
+        {
+          "pid": 2769613,
+          "pss_mb": 4.5,
+          "swap_pss_mb": 4.1,
+          "mem_mb": 8.6,
+          "pss_anon_mb": 1.4,
+          "pss_file_mb": 3.1,
+          "in_tree": true,
+          "cmd": "/home/haseeb/.jcode/builds/versions/0.91.0/jcode-linux-x86_64.bin --no-update --no-selfdev"
+        },
+        {
+          "pid": 2769652,
+          "pss_mb": 14.4,
+          "swap_pss_mb": 64.0,
+          "mem_mb": 78.4,
+          "pss_anon_mb": 7.1,
+          "pss_file_mb": 7.4,
+          "in_tree": true,
+          "cmd": "/home/haseeb/.jcode/builds/versions/0.91.0/jcode-linux-x86_64.bin --provider auto serve"
+        },
+        {
+          "pid": 2770016,
+          "pss_mb": 4.6,
+          "swap_pss_mb": 4.0,
+          "mem_mb": 8.6,
+          "pss_anon_mb": 1.5,
+          "pss_file_mb": 3.1,
+          "in_tree": true,
+          "cmd": "/home/haseeb/.jcode/builds/versions/0.91.0/jcode-linux-x86_64.bin --no-update --no-selfdev"
+        },
+        {
+          "pid": 2771418,
+          "pss_mb": 4.7,
+          "swap_pss_mb": 4.0,
+          "mem_mb": 8.6,
+          "pss_anon_mb": 1.5,
+          "pss_file_mb": 3.2,
+          "in_tree": true,
+          "cmd": "/home/haseeb/.jcode/builds/versions/0.91.0/jcode-linux-x86_64.bin --no-update --no-selfdev"
+        },
+        {
+          "pid": 2772913,
+          "pss_mb": 4.7,
+          "swap_pss_mb": 4.0,
+          "mem_mb": 8.7,
+          "pss_anon_mb": 1.4,
+          "pss_file_mb": 3.3,
+          "in_tree": true,
+          "cmd": "/home/haseeb/.jcode/builds/versions/0.91.0/jcode-linux-x86_64.bin --no-update --no-selfdev"
+        },
+        {
+          "pid": 2774216,
+          "pss_mb": 4.6,
+          "swap_pss_mb": 4.0,
+          "mem_mb": 8.6,
+          "pss_anon_mb": 1.5,
+          "pss_file_mb": 3.1,
+          "in_tree": true,
+          "cmd": "/home/haseeb/.jcode/builds/versions/0.91.0/jcode-linux-x86_64.bin --no-update --no-selfdev"
+        },
+        {
+          "pid": 2775646,
+          "pss_mb": 8.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 8.4,
+          "pss_anon_mb": 5.4,
+          "pss_file_mb": 3.1,
+          "in_tree": true,
+          "cmd": "/home/haseeb/.jcode/builds/versions/0.91.0/jcode-linux-x86_64.bin --no-update --no-selfdev"
+        },
+        {
+          "pid": 2777262,
+          "pss_mb": 8.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 8.4,
+          "pss_anon_mb": 5.4,
+          "pss_file_mb": 3.0,
+          "in_tree": true,
+          "cmd": "/home/haseeb/.jcode/builds/versions/0.91.0/jcode-linux-x86_64.bin --no-update --no-selfdev"
+        },
+        {
+          "pid": 2778589,
+          "pss_mb": 8.6,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 8.6,
+          "pss_anon_mb": 5.4,
+          "pss_file_mb": 3.2,
+          "in_tree": true,
+          "cmd": "/home/haseeb/.jcode/builds/versions/0.91.0/jcode-linux-x86_64.bin --no-update --no-selfdev"
+        },
+        {
+          "pid": 2780257,
+          "pss_mb": 8.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 8.4,
+          "pss_anon_mb": 5.4,
+          "pss_file_mb": 3.0,
+          "in_tree": true,
+          "cmd": "/home/haseeb/.jcode/builds/versions/0.91.0/jcode-linux-x86_64.bin --no-update --no-selfdev"
+        },
+        {
+          "pid": 2781552,
+          "pss_mb": 8.6,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 8.6,
+          "pss_anon_mb": 5.4,
+          "pss_file_mb": 3.2,
+          "in_tree": true,
+          "cmd": "/home/haseeb/.jcode/builds/versions/0.91.0/jcode-linux-x86_64.bin --no-update --no-selfdev"
+        }
+      ],
+      "launch": {
+        "mem_mb": 163.9,
+        "pss_mb": 79.9,
+        "swap_pss_mb": 84.1,
+        "pss_anon_mb": 41.4,
+        "pss_file_mb": 38.7,
+        "process_count": 11
+      },
+      "hold_s": 0.0,
+      "tool": "jcode",
+      "sessions": 10,
+      "ready": 10,
+      "excerpt": "11;?\u0007Starting server...",
+      "pressure_before": {
+        "psi_some_avg10": 0.09,
+        "psi_full_avg10": 0.09,
+        "mem_available_gb": 25.7
+      },
+      "pressure_after": {
+        "psi_some_avg10": 0.19,
+        "psi_full_avg10": 0.19,
+        "mem_available_gb": 24.6
+      },
+      "attempt": 1,
+      "quiet": true,
+      "rep": 2
+    },
+    {
+      "mem_mb": 177.0,
+      "pss_mb": 100.1,
+      "swap_pss_mb": 76.8,
+      "pss_anon_mb": 54.7,
+      "pss_file_mb": 45.6,
+      "process_count": 11,
+      "outside_tree_mem_mb": 0,
+      "processes": [
+        {
+          "pid": 2782080,
+          "pss_mb": 4.9,
+          "swap_pss_mb": 4.0,
+          "mem_mb": 9.0,
+          "pss_anon_mb": 1.5,
+          "pss_file_mb": 3.5,
+          "in_tree": true,
+          "cmd": "/home/haseeb/.jcode/builds/versions/0.91.0/jcode-linux-x86_64.bin --no-update --no-selfdev"
+        },
+        {
+          "pid": 2782119,
+          "pss_mb": 18.9,
+          "swap_pss_mb": 68.8,
+          "mem_mb": 87.7,
+          "pss_anon_mb": 7.4,
+          "pss_file_mb": 11.5,
+          "in_tree": true,
+          "cmd": "/home/haseeb/.jcode/builds/versions/0.91.0/jcode-linux-x86_64.bin --provider auto serve"
+        },
+        {
+          "pid": 2782333,
+          "pss_mb": 5.2,
+          "swap_pss_mb": 4.0,
+          "mem_mb": 9.2,
+          "pss_anon_mb": 1.5,
+          "pss_file_mb": 3.7,
+          "in_tree": true,
+          "cmd": "/home/haseeb/.jcode/builds/versions/0.91.0/jcode-linux-x86_64.bin --no-update --no-selfdev"
+        },
+        {
+          "pid": 2782630,
+          "pss_mb": 9.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 9.4,
+          "pss_anon_mb": 5.8,
+          "pss_file_mb": 3.6,
+          "in_tree": true,
+          "cmd": "/home/haseeb/.jcode/builds/versions/0.91.0/jcode-linux-x86_64.bin --no-update --no-selfdev"
+        },
+        {
+          "pid": 2782910,
+          "pss_mb": 9.3,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 9.3,
+          "pss_anon_mb": 5.8,
+          "pss_file_mb": 3.5,
+          "in_tree": true,
+          "cmd": "/home/haseeb/.jcode/builds/versions/0.91.0/jcode-linux-x86_64.bin --no-update --no-selfdev"
+        },
+        {
+          "pid": 2785331,
+          "pss_mb": 9.2,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 9.2,
+          "pss_anon_mb": 5.8,
+          "pss_file_mb": 3.4,
+          "in_tree": true,
+          "cmd": "/home/haseeb/.jcode/builds/versions/0.91.0/jcode-linux-x86_64.bin --no-update --no-selfdev"
+        },
+        {
+          "pid": 2785582,
+          "pss_mb": 8.8,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 8.8,
+          "pss_anon_mb": 5.4,
+          "pss_file_mb": 3.5,
+          "in_tree": true,
+          "cmd": "/home/haseeb/.jcode/builds/versions/0.91.0/jcode-linux-x86_64.bin --no-update --no-selfdev"
+        },
+        {
+          "pid": 2785914,
+          "pss_mb": 8.6,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 8.6,
+          "pss_anon_mb": 5.4,
+          "pss_file_mb": 3.2,
+          "in_tree": true,
+          "cmd": "/home/haseeb/.jcode/builds/versions/0.91.0/jcode-linux-x86_64.bin --no-update --no-selfdev"
+        },
+        {
+          "pid": 2786271,
+          "pss_mb": 8.6,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 8.6,
+          "pss_anon_mb": 5.4,
+          "pss_file_mb": 3.2,
+          "in_tree": true,
+          "cmd": "/home/haseeb/.jcode/builds/versions/0.91.0/jcode-linux-x86_64.bin --no-update --no-selfdev"
+        },
+        {
+          "pid": 2787564,
+          "pss_mb": 8.6,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 8.6,
+          "pss_anon_mb": 5.4,
+          "pss_file_mb": 3.2,
+          "in_tree": true,
+          "cmd": "/home/haseeb/.jcode/builds/versions/0.91.0/jcode-linux-x86_64.bin --no-update --no-selfdev"
+        },
+        {
+          "pid": 2788563,
+          "pss_mb": 8.6,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 8.6,
+          "pss_anon_mb": 5.3,
+          "pss_file_mb": 3.3,
+          "in_tree": true,
+          "cmd": "/home/haseeb/.jcode/builds/versions/0.91.0/jcode-linux-x86_64.bin --no-update --no-selfdev"
+        }
+      ],
+      "launch": {
+        "mem_mb": 177.0,
+        "pss_mb": 100.1,
+        "swap_pss_mb": 76.8,
+        "pss_anon_mb": 54.7,
+        "pss_file_mb": 45.6,
+        "process_count": 11
+      },
+      "hold_s": 0.0,
+      "tool": "jcode",
+      "sessions": 10,
+      "ready": 10,
+      "excerpt": "11;?\u0007Starting server...",
+      "pressure_before": {
+        "psi_some_avg10": 0.19,
+        "psi_full_avg10": 0.19,
+        "mem_available_gb": 24.6
+      },
+      "pressure_after": {
+        "psi_some_avg10": 0.07,
+        "psi_full_avg10": 0.06,
+        "mem_available_gb": 24.2
+      },
+      "attempt": 1,
+      "quiet": true,
+      "rep": 3
+    },
+    {
+      "mem_mb": 123.4,
+      "pss_mb": 123.4,
+      "swap_pss_mb": 0.0,
+      "pss_anon_mb": 79.9,
+      "pss_file_mb": 43.5,
+      "process_count": 2,
+      "outside_tree_mem_mb": 0,
+      "processes": [
+        {
+          "pid": 2789122,
+          "pss_mb": 25.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 25.5,
+          "pss_anon_mb": 5.5,
+          "pss_file_mb": 20.0,
+          "in_tree": true,
+          "cmd": "/home/haseeb/.jcode/builds/versions/0.91.0/jcode-linux-x86_64.bin --no-update --no-selfdev"
+        },
+        {
+          "pid": 2789161,
+          "pss_mb": 97.9,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 97.9,
+          "pss_anon_mb": 74.4,
+          "pss_file_mb": 23.5,
+          "in_tree": true,
+          "cmd": "/home/haseeb/.jcode/builds/versions/0.91.0/jcode-linux-x86_64.bin --provider auto serve"
+        }
+      ],
+      "launch": {
+        "mem_mb": 123.4,
+        "pss_mb": 123.4,
+        "swap_pss_mb": 0.0,
+        "pss_anon_mb": 79.9,
+        "pss_file_mb": 43.5,
+        "process_count": 2
+      },
+      "hold_s": 0.0,
+      "tool": "jcode_memory_off",
+      "sessions": 1,
+      "ready": 1,
+      "excerpt": "11;?\u0007Starting server...",
+      "pressure_before": {
+        "psi_some_avg10": 0.06,
+        "psi_full_avg10": 0.05,
+        "mem_available_gb": 24.2
+      },
+      "pressure_after": {
+        "psi_some_avg10": 0.04,
+        "psi_full_avg10": 0.04,
+        "mem_available_gb": 24.1
+      },
+      "attempt": 1,
+      "quiet": true,
+      "rep": 1
+    },
+    {
+      "mem_mb": 116.2,
+      "pss_mb": 116.2,
+      "swap_pss_mb": 0.0,
+      "pss_anon_mb": 73.8,
+      "pss_file_mb": 42.5,
+      "process_count": 2,
+      "outside_tree_mem_mb": 0,
+      "processes": [
+        {
+          "pid": 2789415,
+          "pss_mb": 24.9,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 24.9,
+          "pss_anon_mb": 5.5,
+          "pss_file_mb": 19.5,
+          "in_tree": true,
+          "cmd": "/home/haseeb/.jcode/builds/versions/0.91.0/jcode-linux-x86_64.bin --no-update --no-selfdev"
+        },
+        {
+          "pid": 2789466,
+          "pss_mb": 91.3,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 91.3,
+          "pss_anon_mb": 68.3,
+          "pss_file_mb": 23.0,
+          "in_tree": true,
+          "cmd": "/home/haseeb/.jcode/builds/versions/0.91.0/jcode-linux-x86_64.bin --provider auto serve"
+        }
+      ],
+      "launch": {
+        "mem_mb": 116.2,
+        "pss_mb": 116.2,
+        "swap_pss_mb": 0.0,
+        "pss_anon_mb": 73.8,
+        "pss_file_mb": 42.5,
+        "process_count": 2
+      },
+      "hold_s": 0.0,
+      "tool": "jcode_memory_off",
+      "sessions": 1,
+      "ready": 1,
+      "excerpt": "Starting server...",
+      "pressure_before": {
+        "psi_some_avg10": 0.04,
+        "psi_full_avg10": 0.04,
+        "mem_available_gb": 24.1
+      },
+      "pressure_after": {
+        "psi_some_avg10": 0.03,
+        "psi_full_avg10": 0.02,
+        "mem_available_gb": 24.0
+      },
+      "attempt": 1,
+      "quiet": true,
+      "rep": 2
+    },
+    {
+      "mem_mb": 117.5,
+      "pss_mb": 117.5,
+      "swap_pss_mb": 0.0,
+      "pss_anon_mb": 74.0,
+      "pss_file_mb": 43.3,
+      "process_count": 2,
+      "outside_tree_mem_mb": 0,
+      "processes": [
+        {
+          "pid": 2789783,
+          "pss_mb": 25.6,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 25.6,
+          "pss_anon_mb": 5.4,
+          "pss_file_mb": 20.1,
+          "in_tree": true,
+          "cmd": "/home/haseeb/.jcode/builds/versions/0.91.0/jcode-linux-x86_64.bin --no-update --no-selfdev"
+        },
+        {
+          "pid": 2789822,
+          "pss_mb": 91.9,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 91.9,
+          "pss_anon_mb": 68.6,
+          "pss_file_mb": 23.2,
+          "in_tree": true,
+          "cmd": "/home/haseeb/.jcode/builds/versions/0.91.0/jcode-linux-x86_64.bin --provider auto serve"
+        }
+      ],
+      "launch": {
+        "mem_mb": 117.5,
+        "pss_mb": 117.5,
+        "swap_pss_mb": 0.0,
+        "pss_anon_mb": 74.0,
+        "pss_file_mb": 43.3,
+        "process_count": 2
+      },
+      "hold_s": 0.0,
+      "tool": "jcode_memory_off",
+      "sessions": 1,
+      "ready": 1,
+      "excerpt": "11;?\u0007Starting server...",
+      "pressure_before": {
+        "psi_some_avg10": 0.03,
+        "psi_full_avg10": 0.02,
+        "mem_available_gb": 24.0
+      },
+      "pressure_after": {
+        "psi_some_avg10": 0.02,
+        "psi_full_avg10": 0.01,
+        "mem_available_gb": 24.0
+      },
+      "attempt": 1,
+      "quiet": true,
+      "rep": 3
+    },
+    {
+      "mem_mb": 172.3,
+      "pss_mb": 172.3,
+      "swap_pss_mb": 0.0,
+      "pss_anon_mb": 126.1,
+      "pss_file_mb": 46.4,
+      "process_count": 11,
+      "outside_tree_mem_mb": 0,
+      "processes": [
+        {
+          "pid": 2790060,
+          "pss_mb": 9.9,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 9.9,
+          "pss_anon_mb": 5.5,
+          "pss_file_mb": 4.4,
+          "in_tree": true,
+          "cmd": "/home/haseeb/.jcode/builds/versions/0.91.0/jcode-linux-x86_64.bin --no-update --no-selfdev"
+        },
+        {
+          "pid": 2790099,
+          "pss_mb": 83.6,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 83.6,
+          "pss_anon_mb": 71.5,
+          "pss_file_mb": 12.1,
+          "in_tree": true,
+          "cmd": "/home/haseeb/.jcode/builds/versions/0.91.0/jcode-linux-x86_64.bin --provider auto serve"
+        },
+        {
+          "pid": 2790947,
+          "pss_mb": 9.2,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 9.2,
+          "pss_anon_mb": 5.5,
+          "pss_file_mb": 3.7,
+          "in_tree": true,
+          "cmd": "/home/haseeb/.jcode/builds/versions/0.91.0/jcode-linux-x86_64.bin --no-update --no-selfdev"
+        },
+        {
+          "pid": 2792015,
+          "pss_mb": 8.6,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 8.6,
+          "pss_anon_mb": 5.4,
+          "pss_file_mb": 3.2,
+          "in_tree": true,
+          "cmd": "/home/haseeb/.jcode/builds/versions/0.91.0/jcode-linux-x86_64.bin --no-update --no-selfdev"
+        },
+        {
+          "pid": 2792830,
+          "pss_mb": 8.7,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 8.7,
+          "pss_anon_mb": 5.4,
+          "pss_file_mb": 3.3,
+          "in_tree": true,
+          "cmd": "/home/haseeb/.jcode/builds/versions/0.91.0/jcode-linux-x86_64.bin --no-update --no-selfdev"
+        },
+        {
+          "pid": 2793715,
+          "pss_mb": 9.0,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 9.0,
+          "pss_anon_mb": 5.8,
+          "pss_file_mb": 3.1,
+          "in_tree": true,
+          "cmd": "/home/haseeb/.jcode/builds/versions/0.91.0/jcode-linux-x86_64.bin --no-update --no-selfdev"
+        },
+        {
+          "pid": 2794615,
+          "pss_mb": 8.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 8.5,
+          "pss_anon_mb": 5.4,
+          "pss_file_mb": 3.1,
+          "in_tree": true,
+          "cmd": "/home/haseeb/.jcode/builds/versions/0.91.0/jcode-linux-x86_64.bin --no-update --no-selfdev"
+        },
+        {
+          "pid": 2795544,
+          "pss_mb": 8.6,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 8.6,
+          "pss_anon_mb": 5.4,
+          "pss_file_mb": 3.3,
+          "in_tree": true,
+          "cmd": "/home/haseeb/.jcode/builds/versions/0.91.0/jcode-linux-x86_64.bin --no-update --no-selfdev"
+        },
+        {
+          "pid": 2795931,
+          "pss_mb": 8.8,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 8.8,
+          "pss_anon_mb": 5.4,
+          "pss_file_mb": 3.5,
+          "in_tree": true,
+          "cmd": "/home/haseeb/.jcode/builds/versions/0.91.0/jcode-linux-x86_64.bin --no-update --no-selfdev"
+        },
+        {
+          "pid": 2797051,
+          "pss_mb": 8.6,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 8.6,
+          "pss_anon_mb": 5.4,
+          "pss_file_mb": 3.2,
+          "in_tree": true,
+          "cmd": "/home/haseeb/.jcode/builds/versions/0.91.0/jcode-linux-x86_64.bin --no-update --no-selfdev"
+        },
+        {
+          "pid": 2797394,
+          "pss_mb": 8.8,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 8.8,
+          "pss_anon_mb": 5.4,
+          "pss_file_mb": 3.5,
+          "in_tree": true,
+          "cmd": "/home/haseeb/.jcode/builds/versions/0.91.0/jcode-linux-x86_64.bin --no-update --no-selfdev"
+        }
+      ],
+      "launch": {
+        "mem_mb": 172.3,
+        "pss_mb": 172.3,
+        "swap_pss_mb": 0.0,
+        "pss_anon_mb": 126.1,
+        "pss_file_mb": 46.4,
+        "process_count": 11
+      },
+      "hold_s": 0.0,
+      "tool": "jcode_memory_off",
+      "sessions": 10,
+      "ready": 10,
+      "excerpt": "Starting server...",
+      "pressure_before": {
+        "psi_some_avg10": 0.02,
+        "psi_full_avg10": 0.01,
+        "mem_available_gb": 24.0
+      },
+      "pressure_after": {
+        "psi_some_avg10": 0.0,
+        "psi_full_avg10": 0.0,
+        "mem_available_gb": 24.0
+      },
+      "attempt": 1,
+      "quiet": true,
+      "rep": 1
+    },
+    {
+      "mem_mb": 173.7,
+      "pss_mb": 173.7,
+      "swap_pss_mb": 0.0,
+      "pss_anon_mb": 127.4,
+      "pss_file_mb": 46.4,
+      "process_count": 11,
+      "outside_tree_mem_mb": 0,
+      "processes": [
+        {
+          "pid": 2797989,
+          "pss_mb": 9.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 9.4,
+          "pss_anon_mb": 5.6,
+          "pss_file_mb": 3.8,
+          "in_tree": true,
+          "cmd": "/home/haseeb/.jcode/builds/versions/0.91.0/jcode-linux-x86_64.bin --no-update --no-selfdev"
+        },
+        {
+          "pid": 2798028,
+          "pss_mb": 83.9,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 83.9,
+          "pss_anon_mb": 71.6,
+          "pss_file_mb": 12.3,
+          "in_tree": true,
+          "cmd": "/home/haseeb/.jcode/builds/versions/0.91.0/jcode-linux-x86_64.bin --provider auto serve"
+        },
+        {
+          "pid": 2799035,
+          "pss_mb": 9.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 9.4,
+          "pss_anon_mb": 5.5,
+          "pss_file_mb": 3.9,
+          "in_tree": true,
+          "cmd": "/home/haseeb/.jcode/builds/versions/0.91.0/jcode-linux-x86_64.bin --no-update --no-selfdev"
+        },
+        {
+          "pid": 2800006,
+          "pss_mb": 9.3,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 9.3,
+          "pss_anon_mb": 5.9,
+          "pss_file_mb": 3.4,
+          "in_tree": true,
+          "cmd": "/home/haseeb/.jcode/builds/versions/0.91.0/jcode-linux-x86_64.bin --no-update --no-selfdev"
+        },
+        {
+          "pid": 2800320,
+          "pss_mb": 9.3,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 9.3,
+          "pss_anon_mb": 5.9,
+          "pss_file_mb": 3.4,
+          "in_tree": true,
+          "cmd": "/home/haseeb/.jcode/builds/versions/0.91.0/jcode-linux-x86_64.bin --no-update --no-selfdev"
+        },
+        {
+          "pid": 2800626,
+          "pss_mb": 9.1,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 9.1,
+          "pss_anon_mb": 5.9,
+          "pss_file_mb": 3.3,
+          "in_tree": true,
+          "cmd": "/home/haseeb/.jcode/builds/versions/0.91.0/jcode-linux-x86_64.bin --no-update --no-selfdev"
+        },
+        {
+          "pid": 2801964,
+          "pss_mb": 8.6,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 8.6,
+          "pss_anon_mb": 5.4,
+          "pss_file_mb": 3.2,
+          "in_tree": true,
+          "cmd": "/home/haseeb/.jcode/builds/versions/0.91.0/jcode-linux-x86_64.bin --no-update --no-selfdev"
+        },
+        {
+          "pid": 2802287,
+          "pss_mb": 8.6,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 8.6,
+          "pss_anon_mb": 5.4,
+          "pss_file_mb": 3.2,
+          "in_tree": true,
+          "cmd": "/home/haseeb/.jcode/builds/versions/0.91.0/jcode-linux-x86_64.bin --no-update --no-selfdev"
+        },
+        {
+          "pid": 2802558,
+          "pss_mb": 8.6,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 8.6,
+          "pss_anon_mb": 5.4,
+          "pss_file_mb": 3.2,
+          "in_tree": true,
+          "cmd": "/home/haseeb/.jcode/builds/versions/0.91.0/jcode-linux-x86_64.bin --no-update --no-selfdev"
+        },
+        {
+          "pid": 2803836,
+          "pss_mb": 8.7,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 8.7,
+          "pss_anon_mb": 5.4,
+          "pss_file_mb": 3.3,
+          "in_tree": true,
+          "cmd": "/home/haseeb/.jcode/builds/versions/0.91.0/jcode-linux-x86_64.bin --no-update --no-selfdev"
+        },
+        {
+          "pid": 2804130,
+          "pss_mb": 8.8,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 8.8,
+          "pss_anon_mb": 5.4,
+          "pss_file_mb": 3.4,
+          "in_tree": true,
+          "cmd": "/home/haseeb/.jcode/builds/versions/0.91.0/jcode-linux-x86_64.bin --no-update --no-selfdev"
+        }
+      ],
+      "launch": {
+        "mem_mb": 173.7,
+        "pss_mb": 173.7,
+        "swap_pss_mb": 0.0,
+        "pss_anon_mb": 127.4,
+        "pss_file_mb": 46.4,
+        "process_count": 11
+      },
+      "hold_s": 0.0,
+      "tool": "jcode_memory_off",
+      "sessions": 10,
+      "ready": 10,
+      "excerpt": "Starting server...",
+      "pressure_before": {
+        "psi_some_avg10": 0.0,
+        "psi_full_avg10": 0.0,
+        "mem_available_gb": 24.0
+      },
+      "pressure_after": {
+        "psi_some_avg10": 0.0,
+        "psi_full_avg10": 0.0,
+        "mem_available_gb": 26.1
+      },
+      "attempt": 1,
+      "quiet": true,
+      "rep": 2
+    },
+    {
+      "mem_mb": 173.4,
+      "pss_mb": 173.4,
+      "swap_pss_mb": 0.0,
+      "pss_anon_mb": 127.2,
+      "pss_file_mb": 46.4,
+      "process_count": 11,
+      "outside_tree_mem_mb": 0,
+      "processes": [
+        {
+          "pid": 2804748,
+          "pss_mb": 9.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 9.4,
+          "pss_anon_mb": 5.6,
+          "pss_file_mb": 3.8,
+          "in_tree": true,
+          "cmd": "/home/haseeb/.jcode/builds/versions/0.91.0/jcode-linux-x86_64.bin --no-update --no-selfdev"
+        },
+        {
+          "pid": 2804787,
+          "pss_mb": 84.3,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 84.3,
+          "pss_anon_mb": 72.1,
+          "pss_file_mb": 12.2,
+          "in_tree": true,
+          "cmd": "/home/haseeb/.jcode/builds/versions/0.91.0/jcode-linux-x86_64.bin --provider auto serve"
+        },
+        {
+          "pid": 2805730,
+          "pss_mb": 9.2,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 9.2,
+          "pss_anon_mb": 5.5,
+          "pss_file_mb": 3.6,
+          "in_tree": true,
+          "cmd": "/home/haseeb/.jcode/builds/versions/0.91.0/jcode-linux-x86_64.bin --no-update --no-selfdev"
+        },
+        {
+          "pid": 2806877,
+          "pss_mb": 8.6,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 8.6,
+          "pss_anon_mb": 5.4,
+          "pss_file_mb": 3.2,
+          "in_tree": true,
+          "cmd": "/home/haseeb/.jcode/builds/versions/0.91.0/jcode-linux-x86_64.bin --no-update --no-selfdev"
+        },
+        {
+          "pid": 2807180,
+          "pss_mb": 8.6,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 8.6,
+          "pss_anon_mb": 5.5,
+          "pss_file_mb": 3.1,
+          "in_tree": true,
+          "cmd": "/home/haseeb/.jcode/builds/versions/0.91.0/jcode-linux-x86_64.bin --no-update --no-selfdev"
+        },
+        {
+          "pid": 2808333,
+          "pss_mb": 9.0,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 9.0,
+          "pss_anon_mb": 5.9,
+          "pss_file_mb": 3.2,
+          "in_tree": true,
+          "cmd": "/home/haseeb/.jcode/builds/versions/0.91.0/jcode-linux-x86_64.bin --no-update --no-selfdev"
+        },
+        {
+          "pid": 2809358,
+          "pss_mb": 8.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 8.5,
+          "pss_anon_mb": 5.5,
+          "pss_file_mb": 3.1,
+          "in_tree": true,
+          "cmd": "/home/haseeb/.jcode/builds/versions/0.91.0/jcode-linux-x86_64.bin --no-update --no-selfdev"
+        },
+        {
+          "pid": 2810516,
+          "pss_mb": 8.7,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 8.7,
+          "pss_anon_mb": 5.5,
+          "pss_file_mb": 3.3,
+          "in_tree": true,
+          "cmd": "/home/haseeb/.jcode/builds/versions/0.91.0/jcode-linux-x86_64.bin --no-update --no-selfdev"
+        },
+        {
+          "pid": 2811580,
+          "pss_mb": 9.3,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 9.3,
+          "pss_anon_mb": 5.4,
+          "pss_file_mb": 3.9,
+          "in_tree": true,
+          "cmd": "/home/haseeb/.jcode/builds/versions/0.91.0/jcode-linux-x86_64.bin --no-update --no-selfdev"
+        },
+        {
+          "pid": 2811885,
+          "pss_mb": 8.9,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 8.9,
+          "pss_anon_mb": 5.4,
+          "pss_file_mb": 3.5,
+          "in_tree": true,
+          "cmd": "/home/haseeb/.jcode/builds/versions/0.91.0/jcode-linux-x86_64.bin --no-update --no-selfdev"
+        },
+        {
+          "pid": 2813262,
+          "pss_mb": 8.9,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 8.9,
+          "pss_anon_mb": 5.4,
+          "pss_file_mb": 3.5,
+          "in_tree": true,
+          "cmd": "/home/haseeb/.jcode/builds/versions/0.91.0/jcode-linux-x86_64.bin --no-update --no-selfdev"
+        }
+      ],
+      "launch": {
+        "mem_mb": 173.4,
+        "pss_mb": 173.4,
+        "swap_pss_mb": 0.0,
+        "pss_anon_mb": 127.2,
+        "pss_file_mb": 46.4,
+        "process_count": 11
+      },
+      "hold_s": 0.0,
+      "tool": "jcode_memory_off",
+      "sessions": 10,
+      "ready": 10,
+      "excerpt": "Starting server...",
+      "pressure_before": {
+        "psi_some_avg10": 0.0,
+        "psi_full_avg10": 0.0,
+        "mem_available_gb": 26.1
+      },
+      "pressure_after": {
+        "psi_some_avg10": 0.0,
+        "psi_full_avg10": 0.0,
+        "mem_available_gb": 26.1
+      },
+      "attempt": 1,
+      "quiet": true,
+      "rep": 3
+    },
+    {
+      "mem_mb": 117.1,
+      "pss_mb": 117.1,
+      "swap_pss_mb": 0.0,
+      "pss_anon_mb": 69.9,
+      "pss_file_mb": 47.2,
+      "process_count": 1,
+      "outside_tree_mem_mb": 0,
+      "processes": [
+        {
+          "pid": 2813910,
+          "pss_mb": 117.1,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 117.1,
+          "pss_anon_mb": 69.9,
+          "pss_file_mb": 47.2,
+          "in_tree": true,
+          "cmd": "pi"
+        }
+      ],
+      "launch": {
+        "mem_mb": 117.1,
+        "pss_mb": 117.1,
+        "swap_pss_mb": 0.0,
+        "pss_anon_mb": 69.9,
+        "pss_file_mb": 47.2,
+        "process_count": 1
+      },
+      "hold_s": 0.0,
+      "tool": "pi",
+      "sessions": 1,
+      "ready": 1,
+      "excerpt": "0;\u03c0 - benchmarks\u0007",
+      "pressure_before": {
+        "psi_some_avg10": 0.0,
+        "psi_full_avg10": 0.0,
+        "mem_available_gb": 26.1
+      },
+      "pressure_after": {
+        "psi_some_avg10": 0.0,
+        "psi_full_avg10": 0.0,
+        "mem_available_gb": 26.1
+      },
+      "attempt": 1,
+      "quiet": true,
+      "rep": 1
+    },
+    {
+      "mem_mb": 116.5,
+      "pss_mb": 116.5,
+      "swap_pss_mb": 0.0,
+      "pss_anon_mb": 69.2,
+      "pss_file_mb": 47.3,
+      "process_count": 1,
+      "outside_tree_mem_mb": 0,
+      "processes": [
+        {
+          "pid": 2814219,
+          "pss_mb": 116.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 116.5,
+          "pss_anon_mb": 69.2,
+          "pss_file_mb": 47.3,
+          "in_tree": true,
+          "cmd": "pi"
+        }
+      ],
+      "launch": {
+        "mem_mb": 116.5,
+        "pss_mb": 116.5,
+        "swap_pss_mb": 0.0,
+        "pss_anon_mb": 69.2,
+        "pss_file_mb": 47.3,
+        "process_count": 1
+      },
+      "hold_s": 0.0,
+      "tool": "pi",
+      "sessions": 1,
+      "ready": 1,
+      "excerpt": "0;\u03c0 - benchmarks\u0007",
+      "pressure_before": {
+        "psi_some_avg10": 0.0,
+        "psi_full_avg10": 0.0,
+        "mem_available_gb": 26.1
+      },
+      "pressure_after": {
+        "psi_some_avg10": 0.0,
+        "psi_full_avg10": 0.0,
+        "mem_available_gb": 26.0
+      },
+      "attempt": 1,
+      "quiet": true,
+      "rep": 2
+    },
+    {
+      "mem_mb": 116.7,
+      "pss_mb": 116.7,
+      "swap_pss_mb": 0.0,
+      "pss_anon_mb": 69.3,
+      "pss_file_mb": 47.4,
+      "process_count": 1,
+      "outside_tree_mem_mb": 0,
+      "processes": [
+        {
+          "pid": 2814520,
+          "pss_mb": 116.7,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 116.7,
+          "pss_anon_mb": 69.3,
+          "pss_file_mb": 47.4,
+          "in_tree": true,
+          "cmd": "pi"
+        }
+      ],
+      "launch": {
+        "mem_mb": 116.7,
+        "pss_mb": 116.7,
+        "swap_pss_mb": 0.0,
+        "pss_anon_mb": 69.3,
+        "pss_file_mb": 47.4,
+        "process_count": 1
+      },
+      "hold_s": 0.0,
+      "tool": "pi",
+      "sessions": 1,
+      "ready": 1,
+      "excerpt": "0;\u03c0 - benchmarks\u0007",
+      "pressure_before": {
+        "psi_some_avg10": 0.0,
+        "psi_full_avg10": 0.0,
+        "mem_available_gb": 26.0
+      },
+      "pressure_after": {
+        "psi_some_avg10": 0.0,
+        "psi_full_avg10": 0.0,
+        "mem_available_gb": 25.3
+      },
+      "attempt": 1,
+      "quiet": true,
+      "rep": 3
+    },
+    {
+      "mem_mb": 707.0,
+      "pss_mb": 636.8,
+      "swap_pss_mb": 70.1,
+      "pss_anon_mb": 588.6,
+      "pss_file_mb": 48.0,
+      "process_count": 10,
+      "outside_tree_mem_mb": 0,
+      "processes": [
+        {
+          "pid": 2820089,
+          "pss_mb": 45.0,
+          "swap_pss_mb": 17.8,
+          "mem_mb": 62.9,
+          "pss_anon_mb": 42.6,
+          "pss_file_mb": 2.4,
+          "in_tree": true,
+          "cmd": "pi"
+        },
+        {
+          "pid": 2820510,
+          "pss_mb": 45.4,
+          "swap_pss_mb": 18.2,
+          "mem_mb": 63.6,
+          "pss_anon_mb": 43.0,
+          "pss_file_mb": 2.4,
+          "in_tree": true,
+          "cmd": "pi"
+        },
+        {
+          "pid": 2820843,
+          "pss_mb": 34.9,
+          "swap_pss_mb": 34.1,
+          "mem_mb": 69.0,
+          "pss_anon_mb": 32.6,
+          "pss_file_mb": 2.3,
+          "in_tree": true,
+          "cmd": "pi"
+        },
+        {
+          "pid": 2821159,
+          "pss_mb": 71.9,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 71.9,
+          "pss_anon_mb": 66.1,
+          "pss_file_mb": 5.8,
+          "in_tree": true,
+          "cmd": "pi"
+        },
+        {
+          "pid": 2821382,
+          "pss_mb": 71.1,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 71.1,
+          "pss_anon_mb": 65.3,
+          "pss_file_mb": 5.8,
+          "in_tree": true,
+          "cmd": "pi"
+        },
+        {
+          "pid": 2821596,
+          "pss_mb": 72.0,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 72.0,
+          "pss_anon_mb": 66.1,
+          "pss_file_mb": 5.9,
+          "in_tree": true,
+          "cmd": "pi"
+        },
+        {
+          "pid": 2821854,
+          "pss_mb": 71.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 71.4,
+          "pss_anon_mb": 65.5,
+          "pss_file_mb": 5.8,
+          "in_tree": true,
+          "cmd": "pi"
+        },
+        {
+          "pid": 2822087,
+          "pss_mb": 75.0,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 75.0,
+          "pss_anon_mb": 69.1,
+          "pss_file_mb": 5.9,
+          "in_tree": true,
+          "cmd": "pi"
+        },
+        {
+          "pid": 2822501,
+          "pss_mb": 74.8,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 74.8,
+          "pss_anon_mb": 68.9,
+          "pss_file_mb": 5.8,
+          "in_tree": true,
+          "cmd": "pi"
+        },
+        {
+          "pid": 2822762,
+          "pss_mb": 75.3,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 75.3,
+          "pss_anon_mb": 69.4,
+          "pss_file_mb": 5.9,
+          "in_tree": true,
+          "cmd": "pi"
+        }
+      ],
+      "launch": {
+        "mem_mb": 707.0,
+        "pss_mb": 636.8,
+        "swap_pss_mb": 70.1,
+        "pss_anon_mb": 588.6,
+        "pss_file_mb": 48.0,
+        "process_count": 10
+      },
+      "hold_s": 0.0,
+      "tool": "pi",
+      "sessions": 10,
+      "ready": 10,
+      "excerpt": "0;\u03c0 - benchmarks\u0007",
+      "pressure_before": {
+        "psi_some_avg10": 0.88,
+        "psi_full_avg10": 0.88,
+        "mem_available_gb": 25.4
+      },
+      "pressure_after": {
+        "psi_some_avg10": 0.21,
+        "psi_full_avg10": 0.21,
+        "mem_available_gb": 18.2
+      },
+      "attempt": 2,
+      "quiet": true,
+      "rep": 1
+    },
+    {
+      "mem_mb": 709.3,
+      "pss_mb": 709.3,
+      "swap_pss_mb": 0.0,
+      "pss_anon_mb": 660.8,
+      "pss_file_mb": 48.3,
+      "process_count": 10,
+      "outside_tree_mem_mb": 0,
+      "processes": [
+        {
+          "pid": 2823254,
+          "pss_mb": 66.2,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 66.2,
+          "pss_anon_mb": 61.4,
+          "pss_file_mb": 4.8,
+          "in_tree": true,
+          "cmd": "pi"
+        },
+        {
+          "pid": 2823462,
+          "pss_mb": 65.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 65.4,
+          "pss_anon_mb": 60.6,
+          "pss_file_mb": 4.8,
+          "in_tree": true,
+          "cmd": "pi"
+        },
+        {
+          "pid": 2823688,
+          "pss_mb": 70.9,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 70.9,
+          "pss_anon_mb": 66.1,
+          "pss_file_mb": 4.8,
+          "in_tree": true,
+          "cmd": "pi"
+        },
+        {
+          "pid": 2823904,
+          "pss_mb": 71.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 71.4,
+          "pss_anon_mb": 66.4,
+          "pss_file_mb": 4.9,
+          "in_tree": true,
+          "cmd": "pi"
+        },
+        {
+          "pid": 2824128,
+          "pss_mb": 71.3,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 71.3,
+          "pss_anon_mb": 66.4,
+          "pss_file_mb": 4.8,
+          "in_tree": true,
+          "cmd": "pi"
+        },
+        {
+          "pid": 2824344,
+          "pss_mb": 70.9,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 70.9,
+          "pss_anon_mb": 66.1,
+          "pss_file_mb": 4.8,
+          "in_tree": true,
+          "cmd": "pi"
+        },
+        {
+          "pid": 2824570,
+          "pss_mb": 70.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 70.5,
+          "pss_anon_mb": 65.7,
+          "pss_file_mb": 4.8,
+          "in_tree": true,
+          "cmd": "pi"
+        },
+        {
+          "pid": 2824863,
+          "pss_mb": 74.2,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 74.2,
+          "pss_anon_mb": 69.4,
+          "pss_file_mb": 4.8,
+          "in_tree": true,
+          "cmd": "pi"
+        },
+        {
+          "pid": 2825082,
+          "pss_mb": 74.3,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 74.3,
+          "pss_anon_mb": 69.4,
+          "pss_file_mb": 4.9,
+          "in_tree": true,
+          "cmd": "pi"
+        },
+        {
+          "pid": 2825308,
+          "pss_mb": 74.2,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 74.2,
+          "pss_anon_mb": 69.3,
+          "pss_file_mb": 4.9,
+          "in_tree": true,
+          "cmd": "pi"
+        }
+      ],
+      "launch": {
+        "mem_mb": 709.3,
+        "pss_mb": 709.3,
+        "swap_pss_mb": 0.0,
+        "pss_anon_mb": 660.8,
+        "pss_file_mb": 48.3,
+        "process_count": 10
+      },
+      "hold_s": 0.0,
+      "tool": "pi",
+      "sessions": 10,
+      "ready": 10,
+      "excerpt": "0;\u03c0 - benchmarks\u0007",
+      "pressure_before": {
+        "psi_some_avg10": 0.21,
+        "psi_full_avg10": 0.21,
+        "mem_available_gb": 18.2
+      },
+      "pressure_after": {
+        "psi_some_avg10": 0.0,
+        "psi_full_avg10": 0.0,
+        "mem_available_gb": 18.6
+      },
+      "attempt": 1,
+      "quiet": true,
+      "rep": 2
+    },
+    {
+      "mem_mb": 708.3,
+      "pss_mb": 708.3,
+      "swap_pss_mb": 0.0,
+      "pss_anon_mb": 659.9,
+      "pss_file_mb": 48.4,
+      "process_count": 10,
+      "outside_tree_mem_mb": 0,
+      "processes": [
+        {
+          "pid": 2825837,
+          "pss_mb": 65.9,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 65.9,
+          "pss_anon_mb": 61.1,
+          "pss_file_mb": 4.8,
+          "in_tree": true,
+          "cmd": "pi"
+        },
+        {
+          "pid": 2826128,
+          "pss_mb": 66.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 66.4,
+          "pss_anon_mb": 61.6,
+          "pss_file_mb": 4.8,
+          "in_tree": true,
+          "cmd": "pi"
+        },
+        {
+          "pid": 2826355,
+          "pss_mb": 71.0,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 71.0,
+          "pss_anon_mb": 66.1,
+          "pss_file_mb": 4.8,
+          "in_tree": true,
+          "cmd": "pi"
+        },
+        {
+          "pid": 2826582,
+          "pss_mb": 71.3,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 71.3,
+          "pss_anon_mb": 66.4,
+          "pss_file_mb": 4.9,
+          "in_tree": true,
+          "cmd": "pi"
+        },
+        {
+          "pid": 2826948,
+          "pss_mb": 71.1,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 71.1,
+          "pss_anon_mb": 66.3,
+          "pss_file_mb": 4.9,
+          "in_tree": true,
+          "cmd": "pi"
+        },
+        {
+          "pid": 2827268,
+          "pss_mb": 70.6,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 70.6,
+          "pss_anon_mb": 65.8,
+          "pss_file_mb": 4.8,
+          "in_tree": true,
+          "cmd": "pi"
+        },
+        {
+          "pid": 2827509,
+          "pss_mb": 70.7,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 70.7,
+          "pss_anon_mb": 65.9,
+          "pss_file_mb": 4.8,
+          "in_tree": true,
+          "cmd": "pi"
+        },
+        {
+          "pid": 2827739,
+          "pss_mb": 73.7,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 73.7,
+          "pss_anon_mb": 68.8,
+          "pss_file_mb": 4.9,
+          "in_tree": true,
+          "cmd": "pi"
+        },
+        {
+          "pid": 2827964,
+          "pss_mb": 73.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 73.4,
+          "pss_anon_mb": 68.6,
+          "pss_file_mb": 4.8,
+          "in_tree": true,
+          "cmd": "pi"
+        },
+        {
+          "pid": 2828231,
+          "pss_mb": 74.2,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 74.2,
+          "pss_anon_mb": 69.3,
+          "pss_file_mb": 4.9,
+          "in_tree": true,
+          "cmd": "pi"
+        }
+      ],
+      "launch": {
+        "mem_mb": 708.3,
+        "pss_mb": 708.3,
+        "swap_pss_mb": 0.0,
+        "pss_anon_mb": 659.9,
+        "pss_file_mb": 48.4,
+        "process_count": 10
+      },
+      "hold_s": 0.0,
+      "tool": "pi",
+      "sessions": 10,
+      "ready": 10,
+      "excerpt": "0;\u03c0 - benchmarks\u0007",
+      "pressure_before": {
+        "psi_some_avg10": 0.0,
+        "psi_full_avg10": 0.0,
+        "mem_available_gb": 18.6
+      },
+      "pressure_after": {
+        "psi_some_avg10": 0.0,
+        "psi_full_avg10": 0.0,
+        "mem_available_gb": 23.5
+      },
+      "attempt": 1,
+      "quiet": true,
+      "rep": 3
+    },
+    {
+      "mem_mb": 273.9,
+      "pss_mb": 273.9,
+      "swap_pss_mb": 0.0,
+      "pss_anon_mb": 84.3,
+      "pss_file_mb": 189.6,
+      "process_count": 2,
+      "outside_tree_mem_mb": 0,
+      "processes": [
+        {
+          "pid": 2828783,
+          "pss_mb": 86.2,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 86.2,
+          "pss_anon_mb": 17.5,
+          "pss_file_mb": 68.7,
+          "in_tree": true,
+          "cmd": "codex"
+        },
+        {
+          "pid": 2828872,
+          "pss_mb": 187.7,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 187.7,
+          "pss_anon_mb": 66.8,
+          "pss_file_mb": 120.9,
+          "in_tree": true,
+          "cmd": "/home/haseeb/.codex/packages/app-server-daemon/releases/local-41c05d3a65e914ab4d242885ac8705b15f08d580e09dc6c9a370bc485b"
+        }
+      ],
+      "launch": {
+        "mem_mb": 273.9,
+        "pss_mb": 273.9,
+        "swap_pss_mb": 0.0,
+        "pss_anon_mb": 84.3,
+        "pss_file_mb": 189.6,
+        "process_count": 2
+      },
+      "hold_s": 0.0,
+      "tool": "codex",
+      "sessions": 1,
+      "ready": 0,
+      "excerpt": null,
+      "pressure_before": {
+        "psi_some_avg10": 0.0,
+        "psi_full_avg10": 0.0,
+        "mem_available_gb": 23.6
+      },
+      "pressure_after": {
+        "psi_some_avg10": 0.0,
+        "psi_full_avg10": 0.0,
+        "mem_available_gb": 23.2
+      },
+      "attempt": 1,
+      "quiet": true,
+      "rep": 1
+    },
+    {
+      "mem_mb": 277.6,
+      "pss_mb": 277.6,
+      "swap_pss_mb": 0.0,
+      "pss_anon_mb": 86.6,
+      "pss_file_mb": 191.0,
+      "process_count": 2,
+      "outside_tree_mem_mb": 0,
+      "processes": [
+        {
+          "pid": 2829717,
+          "pss_mb": 91.6,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 91.6,
+          "pss_anon_mb": 21.1,
+          "pss_file_mb": 70.5,
+          "in_tree": true,
+          "cmd": "codex"
+        },
+        {
+          "pid": 2829792,
+          "pss_mb": 186.0,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 186.0,
+          "pss_anon_mb": 65.5,
+          "pss_file_mb": 120.5,
+          "in_tree": true,
+          "cmd": "/home/haseeb/.codex/packages/app-server-daemon/releases/local-41c05d3a65e914ab4d242885ac8705b15f08d580e09dc6c9a370bc485b"
+        }
+      ],
+      "launch": {
+        "mem_mb": 277.6,
+        "pss_mb": 277.6,
+        "swap_pss_mb": 0.0,
+        "pss_anon_mb": 86.6,
+        "pss_file_mb": 191.0,
+        "process_count": 2
+      },
+      "hold_s": 0.0,
+      "tool": "codex",
+      "sessions": 1,
+      "ready": 0,
+      "excerpt": null,
+      "pressure_before": {
+        "psi_some_avg10": 0.0,
+        "psi_full_avg10": 0.0,
+        "mem_available_gb": 23.2
+      },
+      "pressure_after": {
+        "psi_some_avg10": 0.0,
+        "psi_full_avg10": 0.0,
+        "mem_available_gb": 24.0
+      },
+      "attempt": 1,
+      "quiet": true,
+      "rep": 2
+    },
+    {
+      "mem_mb": 267.1,
+      "pss_mb": 267.1,
+      "swap_pss_mb": 0.0,
+      "pss_anon_mb": 75.0,
+      "pss_file_mb": 192.3,
+      "process_count": 2,
+      "outside_tree_mem_mb": 0,
+      "processes": [
+        {
+          "pid": 2830482,
+          "pss_mb": 89.2,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 89.2,
+          "pss_anon_mb": 18.7,
+          "pss_file_mb": 70.6,
+          "in_tree": true,
+          "cmd": "codex"
+        },
+        {
+          "pid": 2830557,
+          "pss_mb": 177.9,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 177.9,
+          "pss_anon_mb": 56.3,
+          "pss_file_mb": 121.7,
+          "in_tree": true,
+          "cmd": "/home/haseeb/.codex/packages/app-server-daemon/releases/local-41c05d3a65e914ab4d242885ac8705b15f08d580e09dc6c9a370bc485b"
+        }
+      ],
+      "launch": {
+        "mem_mb": 267.1,
+        "pss_mb": 267.1,
+        "swap_pss_mb": 0.0,
+        "pss_anon_mb": 75.0,
+        "pss_file_mb": 192.3,
+        "process_count": 2
+      },
+      "hold_s": 0.0,
+      "tool": "codex",
+      "sessions": 1,
+      "ready": 0,
+      "excerpt": null,
+      "pressure_before": {
+        "psi_some_avg10": 0.0,
+        "psi_full_avg10": 0.0,
+        "mem_available_gb": 24.0
+      },
+      "pressure_after": {
+        "psi_some_avg10": 0.0,
+        "psi_full_avg10": 0.0,
+        "mem_available_gb": 24.0
+      },
+      "attempt": 1,
+      "quiet": true,
+      "rep": 3
+    },
+    {
+      "mem_mb": 550.6,
+      "pss_mb": 550.6,
+      "swap_pss_mb": 0.0,
+      "pss_anon_mb": 335.8,
+      "pss_file_mb": 214.7,
+      "process_count": 11,
+      "outside_tree_mem_mb": 0,
+      "processes": [
+        {
+          "pid": 2831342,
+          "pss_mb": 30.9,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 30.9,
+          "pss_anon_mb": 20.8,
+          "pss_file_mb": 10.1,
+          "in_tree": true,
+          "cmd": "codex"
+        },
+        {
+          "pid": 2831423,
+          "pss_mb": 252.0,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 252.0,
+          "pss_anon_mb": 129.8,
+          "pss_file_mb": 122.2,
+          "in_tree": true,
+          "cmd": "/home/haseeb/.codex/packages/app-server-daemon/releases/local-41c05d3a65e914ab4d242885ac8705b15f08d580e09dc6c9a370bc485b"
+        },
+        {
+          "pid": 2832425,
+          "pss_mb": 31.8,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 31.8,
+          "pss_anon_mb": 22.7,
+          "pss_file_mb": 9.0,
+          "in_tree": true,
+          "cmd": "codex"
+        },
+        {
+          "pid": 2833200,
+          "pss_mb": 31.2,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 31.2,
+          "pss_anon_mb": 22.3,
+          "pss_file_mb": 8.8,
+          "in_tree": true,
+          "cmd": "codex"
+        },
+        {
+          "pid": 2833855,
+          "pss_mb": 31.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 31.5,
+          "pss_anon_mb": 22.4,
+          "pss_file_mb": 9.1,
+          "in_tree": true,
+          "cmd": "codex"
+        },
+        {
+          "pid": 2834547,
+          "pss_mb": 31.2,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 31.2,
+          "pss_anon_mb": 22.5,
+          "pss_file_mb": 8.7,
+          "in_tree": true,
+          "cmd": "codex"
+        },
+        {
+          "pid": 2835207,
+          "pss_mb": 30.3,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 30.3,
+          "pss_anon_mb": 20.8,
+          "pss_file_mb": 9.5,
+          "in_tree": true,
+          "cmd": "codex"
+        },
+        {
+          "pid": 2835942,
+          "pss_mb": 27.6,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 27.6,
+          "pss_anon_mb": 18.8,
+          "pss_file_mb": 8.8,
+          "in_tree": true,
+          "cmd": "codex"
+        },
+        {
+          "pid": 2836792,
+          "pss_mb": 27.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 27.4,
+          "pss_anon_mb": 18.7,
+          "pss_file_mb": 8.7,
+          "in_tree": true,
+          "cmd": "codex"
+        },
+        {
+          "pid": 2837456,
+          "pss_mb": 28.7,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 28.7,
+          "pss_anon_mb": 19.5,
+          "pss_file_mb": 9.2,
+          "in_tree": true,
+          "cmd": "codex"
+        },
+        {
+          "pid": 2838149,
+          "pss_mb": 28.0,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 28.0,
+          "pss_anon_mb": 17.5,
+          "pss_file_mb": 10.6,
+          "in_tree": true,
+          "cmd": "codex"
+        }
+      ],
+      "launch": {
+        "mem_mb": 550.6,
+        "pss_mb": 550.6,
+        "swap_pss_mb": 0.0,
+        "pss_anon_mb": 335.8,
+        "pss_file_mb": 214.7,
+        "process_count": 11
+      },
+      "hold_s": 0.0,
+      "tool": "codex",
+      "sessions": 10,
+      "ready": 0,
+      "excerpt": null,
+      "pressure_before": {
+        "psi_some_avg10": 0.0,
+        "psi_full_avg10": 0.0,
+        "mem_available_gb": 24.0
+      },
+      "pressure_after": {
+        "psi_some_avg10": 0.0,
+        "psi_full_avg10": 0.0,
+        "mem_available_gb": 24.4
+      },
+      "attempt": 1,
+      "quiet": true,
+      "rep": 1
+    },
+    {
+      "mem_mb": 514.7,
+      "pss_mb": 514.7,
+      "swap_pss_mb": 0.0,
+      "pss_anon_mb": 304.9,
+      "pss_file_mb": 209.6,
+      "process_count": 11,
+      "outside_tree_mem_mb": 0,
+      "processes": [
+        {
+          "pid": 2839132,
+          "pss_mb": 31.9,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 31.9,
+          "pss_anon_mb": 22.7,
+          "pss_file_mb": 9.2,
+          "in_tree": true,
+          "cmd": "codex"
+        },
+        {
+          "pid": 2839205,
+          "pss_mb": 226.8,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 226.8,
+          "pss_anon_mb": 107.6,
+          "pss_file_mb": 119.2,
+          "in_tree": true,
+          "cmd": "/home/haseeb/.codex/packages/app-server-daemon/releases/local-41c05d3a65e914ab4d242885ac8705b15f08d580e09dc6c9a370bc485b"
+        },
+        {
+          "pid": 2839881,
+          "pss_mb": 29.8,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 29.8,
+          "pss_anon_mb": 21.3,
+          "pss_file_mb": 8.5,
+          "in_tree": true,
+          "cmd": "codex"
+        },
+        {
+          "pid": 2840563,
+          "pss_mb": 29.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 29.4,
+          "pss_anon_mb": 21.3,
+          "pss_file_mb": 8.1,
+          "in_tree": true,
+          "cmd": "codex"
+        },
+        {
+          "pid": 2841422,
+          "pss_mb": 28.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 28.4,
+          "pss_anon_mb": 20.3,
+          "pss_file_mb": 8.1,
+          "in_tree": true,
+          "cmd": "codex"
+        },
+        {
+          "pid": 2842118,
+          "pss_mb": 30.1,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 30.1,
+          "pss_anon_mb": 19.5,
+          "pss_file_mb": 10.6,
+          "in_tree": true,
+          "cmd": "codex"
+        },
+        {
+          "pid": 2842765,
+          "pss_mb": 27.9,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 27.9,
+          "pss_anon_mb": 17.4,
+          "pss_file_mb": 10.5,
+          "in_tree": true,
+          "cmd": "codex"
+        },
+        {
+          "pid": 2843394,
+          "pss_mb": 25.6,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 25.6,
+          "pss_anon_mb": 17.4,
+          "pss_file_mb": 8.1,
+          "in_tree": true,
+          "cmd": "codex"
+        },
+        {
+          "pid": 2844099,
+          "pss_mb": 28.8,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 28.8,
+          "pss_anon_mb": 20.6,
+          "pss_file_mb": 8.2,
+          "in_tree": true,
+          "cmd": "codex"
+        },
+        {
+          "pid": 2844797,
+          "pss_mb": 29.1,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 29.1,
+          "pss_anon_mb": 18.5,
+          "pss_file_mb": 10.6,
+          "in_tree": true,
+          "cmd": "codex"
+        },
+        {
+          "pid": 2845658,
+          "pss_mb": 26.9,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 26.9,
+          "pss_anon_mb": 18.3,
+          "pss_file_mb": 8.5,
+          "in_tree": true,
+          "cmd": "codex"
+        }
+      ],
+      "launch": {
+        "mem_mb": 514.7,
+        "pss_mb": 514.7,
+        "swap_pss_mb": 0.0,
+        "pss_anon_mb": 304.9,
+        "pss_file_mb": 209.6,
+        "process_count": 11
+      },
+      "hold_s": 0.0,
+      "tool": "codex",
+      "sessions": 10,
+      "ready": 0,
+      "excerpt": null,
+      "pressure_before": {
+        "psi_some_avg10": 0.0,
+        "psi_full_avg10": 0.0,
+        "mem_available_gb": 24.4
+      },
+      "pressure_after": {
+        "psi_some_avg10": 0.0,
+        "psi_full_avg10": 0.0,
+        "mem_available_gb": 24.9
+      },
+      "attempt": 1,
+      "quiet": true,
+      "rep": 2
+    },
+    {
+      "mem_mb": 524.7,
+      "pss_mb": 524.7,
+      "swap_pss_mb": 0.0,
+      "pss_anon_mb": 311.4,
+      "pss_file_mb": 213.2,
+      "process_count": 11,
+      "outside_tree_mem_mb": 0,
+      "processes": [
+        {
+          "pid": 2846618,
+          "pss_mb": 29.9,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 29.9,
+          "pss_anon_mb": 20.5,
+          "pss_file_mb": 9.4,
+          "in_tree": true,
+          "cmd": "codex"
+        },
+        {
+          "pid": 2846703,
+          "pss_mb": 236.2,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 236.2,
+          "pss_anon_mb": 115.3,
+          "pss_file_mb": 120.9,
+          "in_tree": true,
+          "cmd": "/home/haseeb/.codex/packages/app-server-daemon/releases/local-41c05d3a65e914ab4d242885ac8705b15f08d580e09dc6c9a370bc485b"
+        },
+        {
+          "pid": 2847463,
+          "pss_mb": 28.1,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 28.1,
+          "pss_anon_mb": 19.0,
+          "pss_file_mb": 9.0,
+          "in_tree": true,
+          "cmd": "codex"
+        },
+        {
+          "pid": 2848165,
+          "pss_mb": 31.6,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 31.6,
+          "pss_anon_mb": 22.5,
+          "pss_file_mb": 9.1,
+          "in_tree": true,
+          "cmd": "codex"
+        },
+        {
+          "pid": 2848821,
+          "pss_mb": 31.0,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 31.0,
+          "pss_anon_mb": 21.3,
+          "pss_file_mb": 9.6,
+          "in_tree": true,
+          "cmd": "codex"
+        },
+        {
+          "pid": 2849462,
+          "pss_mb": 31.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 31.4,
+          "pss_anon_mb": 22.6,
+          "pss_file_mb": 8.9,
+          "in_tree": true,
+          "cmd": "codex"
+        },
+        {
+          "pid": 2850346,
+          "pss_mb": 26.2,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 26.2,
+          "pss_anon_mb": 17.1,
+          "pss_file_mb": 9.1,
+          "in_tree": true,
+          "cmd": "codex"
+        },
+        {
+          "pid": 2851059,
+          "pss_mb": 26.6,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 26.6,
+          "pss_anon_mb": 17.3,
+          "pss_file_mb": 9.3,
+          "in_tree": true,
+          "cmd": "codex"
+        },
+        {
+          "pid": 2851709,
+          "pss_mb": 28.3,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 28.3,
+          "pss_anon_mb": 19.2,
+          "pss_file_mb": 9.1,
+          "in_tree": true,
+          "cmd": "codex"
+        },
+        {
+          "pid": 2852378,
+          "pss_mb": 26.8,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 26.8,
+          "pss_anon_mb": 17.3,
+          "pss_file_mb": 9.5,
+          "in_tree": true,
+          "cmd": "codex"
+        },
+        {
+          "pid": 2853052,
+          "pss_mb": 28.6,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 28.6,
+          "pss_anon_mb": 19.3,
+          "pss_file_mb": 9.3,
+          "in_tree": true,
+          "cmd": "codex"
+        }
+      ],
+      "launch": {
+        "mem_mb": 524.7,
+        "pss_mb": 524.7,
+        "swap_pss_mb": 0.0,
+        "pss_anon_mb": 311.4,
+        "pss_file_mb": 213.2,
+        "process_count": 11
+      },
+      "hold_s": 0.0,
+      "tool": "codex",
+      "sessions": 10,
+      "ready": 0,
+      "excerpt": null,
+      "pressure_before": {
+        "psi_some_avg10": 0.0,
+        "psi_full_avg10": 0.0,
+        "mem_available_gb": 24.9
+      },
+      "pressure_after": {
+        "psi_some_avg10": 0.0,
+        "psi_full_avg10": 0.0,
+        "mem_available_gb": 25.4
+      },
+      "attempt": 1,
+      "quiet": true,
+      "rep": 3
+    },
+    {
+      "mem_mb": 392.1,
+      "pss_mb": 392.1,
+      "swap_pss_mb": 0.0,
+      "pss_anon_mb": 304.3,
+      "pss_file_mb": 84.6,
+      "process_count": 2,
+      "outside_tree_mem_mb": 268.3,
+      "processes": [
+        {
+          "pid": 2854064,
+          "pss_mb": 268.3,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 268.3,
+          "pss_anon_mb": 208.0,
+          "pss_file_mb": 58.3,
+          "in_tree": false,
+          "cmd": "/usr/bin/opencode serve --service"
+        },
+        {
+          "pid": 2854082,
+          "pss_mb": 123.8,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 123.8,
+          "pss_anon_mb": 96.3,
+          "pss_file_mb": 26.3,
+          "in_tree": true,
+          "cmd": "opencode"
+        }
+      ],
+      "launch": {
+        "mem_mb": 392.1,
+        "pss_mb": 392.1,
+        "swap_pss_mb": 0.0,
+        "pss_anon_mb": 304.3,
+        "pss_file_mb": 84.6,
+        "process_count": 2
+      },
+      "hold_s": 0.0,
+      "tool": "opencode",
+      "sessions": 1,
+      "ready": 1,
+      "excerpt": "10;?\u000711;?\u0007+q4d7399;i=opentui-notifications:p=?;1337;Capabilities7501;?Gi=31337,s=1,v=1,a=q,t=d,f=24;",
+      "pressure_before": {
+        "psi_some_avg10": 0.0,
+        "psi_full_avg10": 0.0,
+        "mem_available_gb": 25.4
+      },
+      "pressure_after": {
+        "psi_some_avg10": 0.0,
+        "psi_full_avg10": 0.0,
+        "mem_available_gb": 25.3
+      },
+      "attempt": 1,
+      "quiet": true,
+      "rep": 1
+    },
+    {
+      "mem_mb": 387.1,
+      "pss_mb": 387.1,
+      "swap_pss_mb": 0.0,
+      "pss_anon_mb": 298.9,
+      "pss_file_mb": 84.9,
+      "process_count": 2,
+      "outside_tree_mem_mb": 262.8,
+      "processes": [
+        {
+          "pid": 2855195,
+          "pss_mb": 262.8,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 262.8,
+          "pss_anon_mb": 202.3,
+          "pss_file_mb": 58.4,
+          "in_tree": false,
+          "cmd": "/usr/bin/opencode serve --service"
+        },
+        {
+          "pid": 2855212,
+          "pss_mb": 124.3,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 124.3,
+          "pss_anon_mb": 96.6,
+          "pss_file_mb": 26.5,
+          "in_tree": true,
+          "cmd": "opencode"
+        }
+      ],
+      "launch": {
+        "mem_mb": 387.1,
+        "pss_mb": 387.1,
+        "swap_pss_mb": 0.0,
+        "pss_anon_mb": 298.9,
+        "pss_file_mb": 84.9,
+        "process_count": 2
+      },
+      "hold_s": 0.0,
+      "tool": "opencode",
+      "sessions": 1,
+      "ready": 1,
+      "excerpt": "10;?\u000711;?\u0007+q4d7399;i=opentui-notifications:p=?;1337;Capabilities7501;?Gi=31337,s=1,v=1,a=q,t=d,f=24;",
+      "pressure_before": {
+        "psi_some_avg10": 0.0,
+        "psi_full_avg10": 0.0,
+        "mem_available_gb": 25.3
+      },
+      "pressure_after": {
+        "psi_some_avg10": 0.0,
+        "psi_full_avg10": 0.0,
+        "mem_available_gb": 25.4
+      },
+      "attempt": 1,
+      "quiet": true,
+      "rep": 2
+    },
+    {
+      "mem_mb": 386.1,
+      "pss_mb": 386.1,
+      "swap_pss_mb": 0.0,
+      "pss_anon_mb": 298.0,
+      "pss_file_mb": 84.8,
+      "process_count": 2,
+      "outside_tree_mem_mb": 263.5,
+      "processes": [
+        {
+          "pid": 2856067,
+          "pss_mb": 263.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 263.5,
+          "pss_anon_mb": 202.9,
+          "pss_file_mb": 58.5,
+          "in_tree": false,
+          "cmd": "/usr/bin/opencode serve --service"
+        },
+        {
+          "pid": 2856084,
+          "pss_mb": 122.6,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 122.6,
+          "pss_anon_mb": 95.1,
+          "pss_file_mb": 26.3,
+          "in_tree": true,
+          "cmd": "opencode"
+        }
+      ],
+      "launch": {
+        "mem_mb": 386.1,
+        "pss_mb": 386.1,
+        "swap_pss_mb": 0.0,
+        "pss_anon_mb": 298.0,
+        "pss_file_mb": 84.8,
+        "process_count": 2
+      },
+      "hold_s": 0.0,
+      "tool": "opencode",
+      "sessions": 1,
+      "ready": 1,
+      "excerpt": "10;?\u000711;?\u0007+q4d7399;i=opentui-notifications:p=?;1337;Capabilities7501;?Gi=31337,s=1,v=1,a=q,t=d,f=24;",
+      "pressure_before": {
+        "psi_some_avg10": 0.0,
+        "psi_full_avg10": 0.0,
+        "mem_available_gb": 25.4
+      },
+      "pressure_after": {
+        "psi_some_avg10": 0.0,
+        "psi_full_avg10": 0.0,
+        "mem_available_gb": 25.3
+      },
+      "attempt": 1,
+      "quiet": true,
+      "rep": 3
+    },
+    {
+      "mem_mb": 1197.3,
+      "pss_mb": 1197.3,
+      "swap_pss_mb": 0.0,
+      "pss_anon_mb": 1108.1,
+      "pss_file_mb": 85.8,
+      "process_count": 11,
+      "outside_tree_mem_mb": 242.2,
+      "processes": [
+        {
+          "pid": 2856963,
+          "pss_mb": 242.2,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 242.2,
+          "pss_anon_mb": 198.6,
+          "pss_file_mb": 41.7,
+          "in_tree": false,
+          "cmd": "/usr/bin/opencode serve --service"
+        },
+        {
+          "pid": 2857023,
+          "pss_mb": 89.3,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 89.3,
+          "pss_anon_mb": 84.7,
+          "pss_file_mb": 4.4,
+          "in_tree": true,
+          "cmd": "opencode"
+        },
+        {
+          "pid": 2857738,
+          "pss_mb": 95.7,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 95.7,
+          "pss_anon_mb": 91.1,
+          "pss_file_mb": 4.4,
+          "in_tree": true,
+          "cmd": "opencode"
+        },
+        {
+          "pid": 2858777,
+          "pss_mb": 96.1,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 96.1,
+          "pss_anon_mb": 91.5,
+          "pss_file_mb": 4.4,
+          "in_tree": true,
+          "cmd": "opencode"
+        },
+        {
+          "pid": 2859518,
+          "pss_mb": 95.6,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 95.6,
+          "pss_anon_mb": 91.0,
+          "pss_file_mb": 4.5,
+          "in_tree": true,
+          "cmd": "opencode"
+        },
+        {
+          "pid": 2860261,
+          "pss_mb": 95.9,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 95.9,
+          "pss_anon_mb": 91.3,
+          "pss_file_mb": 4.4,
+          "in_tree": true,
+          "cmd": "opencode"
+        },
+        {
+          "pid": 2861054,
+          "pss_mb": 96.6,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 96.6,
+          "pss_anon_mb": 92.0,
+          "pss_file_mb": 4.4,
+          "in_tree": true,
+          "cmd": "opencode"
+        },
+        {
+          "pid": 2861806,
+          "pss_mb": 95.6,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 95.6,
+          "pss_anon_mb": 91.1,
+          "pss_file_mb": 4.4,
+          "in_tree": true,
+          "cmd": "opencode"
+        },
+        {
+          "pid": 2862790,
+          "pss_mb": 96.3,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 96.3,
+          "pss_anon_mb": 91.8,
+          "pss_file_mb": 4.4,
+          "in_tree": true,
+          "cmd": "opencode"
+        },
+        {
+          "pid": 2863576,
+          "pss_mb": 96.9,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 96.9,
+          "pss_anon_mb": 92.4,
+          "pss_file_mb": 4.4,
+          "in_tree": true,
+          "cmd": "opencode"
+        },
+        {
+          "pid": 2864369,
+          "pss_mb": 97.1,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 97.1,
+          "pss_anon_mb": 92.6,
+          "pss_file_mb": 4.4,
+          "in_tree": true,
+          "cmd": "opencode"
+        }
+      ],
+      "launch": {
+        "mem_mb": 1197.3,
+        "pss_mb": 1197.3,
+        "swap_pss_mb": 0.0,
+        "pss_anon_mb": 1108.1,
+        "pss_file_mb": 85.8,
+        "process_count": 11
+      },
+      "hold_s": 0.0,
+      "tool": "opencode",
+      "sessions": 10,
+      "ready": 10,
+      "excerpt": "10;?\u000711;?\u0007+q4d7399;i=opentui-notifications:p=?;1337;Capabilities7501;?Gi=31337,s=1,v=1,a=q,t=d,f=24;",
+      "pressure_before": {
+        "psi_some_avg10": 0.0,
+        "psi_full_avg10": 0.0,
+        "mem_available_gb": 25.3
+      },
+      "pressure_after": {
+        "psi_some_avg10": 0.0,
+        "psi_full_avg10": 0.0,
+        "mem_available_gb": 25.3
+      },
+      "attempt": 1,
+      "quiet": true,
+      "rep": 1
+    },
+    {
+      "mem_mb": 1203.2,
+      "pss_mb": 1203.2,
+      "swap_pss_mb": 0.0,
+      "pss_anon_mb": 1114.1,
+      "pss_file_mb": 85.8,
+      "process_count": 11,
+      "outside_tree_mem_mb": 252.5,
+      "processes": [
+        {
+          "pid": 2865479,
+          "pss_mb": 252.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 252.5,
+          "pss_anon_mb": 208.8,
+          "pss_file_mb": 41.7,
+          "in_tree": false,
+          "cmd": "/usr/bin/opencode serve --service"
+        },
+        {
+          "pid": 2865516,
+          "pss_mb": 89.2,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 89.2,
+          "pss_anon_mb": 84.6,
+          "pss_file_mb": 4.5,
+          "in_tree": true,
+          "cmd": "opencode"
+        },
+        {
+          "pid": 2866489,
+          "pss_mb": 95.6,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 95.6,
+          "pss_anon_mb": 91.1,
+          "pss_file_mb": 4.4,
+          "in_tree": true,
+          "cmd": "opencode"
+        },
+        {
+          "pid": 2867216,
+          "pss_mb": 94.9,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 94.9,
+          "pss_anon_mb": 90.4,
+          "pss_file_mb": 4.4,
+          "in_tree": true,
+          "cmd": "opencode"
+        },
+        {
+          "pid": 2867990,
+          "pss_mb": 94.9,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 94.9,
+          "pss_anon_mb": 90.3,
+          "pss_file_mb": 4.4,
+          "in_tree": true,
+          "cmd": "opencode"
+        },
+        {
+          "pid": 2868735,
+          "pss_mb": 96.0,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 96.0,
+          "pss_anon_mb": 91.4,
+          "pss_file_mb": 4.4,
+          "in_tree": true,
+          "cmd": "opencode"
+        },
+        {
+          "pid": 2869480,
+          "pss_mb": 95.7,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 95.7,
+          "pss_anon_mb": 91.2,
+          "pss_file_mb": 4.4,
+          "in_tree": true,
+          "cmd": "opencode"
+        },
+        {
+          "pid": 2870488,
+          "pss_mb": 95.8,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 95.8,
+          "pss_anon_mb": 91.3,
+          "pss_file_mb": 4.4,
+          "in_tree": true,
+          "cmd": "opencode"
+        },
+        {
+          "pid": 2871264,
+          "pss_mb": 95.9,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 95.9,
+          "pss_anon_mb": 91.3,
+          "pss_file_mb": 4.4,
+          "in_tree": true,
+          "cmd": "opencode"
+        },
+        {
+          "pid": 2872007,
+          "pss_mb": 96.2,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 96.2,
+          "pss_anon_mb": 91.7,
+          "pss_file_mb": 4.4,
+          "in_tree": true,
+          "cmd": "opencode"
+        },
+        {
+          "pid": 2872845,
+          "pss_mb": 96.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 96.5,
+          "pss_anon_mb": 92.0,
+          "pss_file_mb": 4.4,
+          "in_tree": true,
+          "cmd": "opencode"
+        }
+      ],
+      "launch": {
+        "mem_mb": 1203.2,
+        "pss_mb": 1203.2,
+        "swap_pss_mb": 0.0,
+        "pss_anon_mb": 1114.1,
+        "pss_file_mb": 85.8,
+        "process_count": 11
+      },
+      "hold_s": 0.0,
+      "tool": "opencode",
+      "sessions": 10,
+      "ready": 10,
+      "excerpt": "10;?\u000711;?\u0007+q4d7399;i=opentui-notifications:p=?;1337;Capabilities7501;?Gi=31337,s=1,v=1,a=q,t=d,f=24;",
+      "pressure_before": {
+        "psi_some_avg10": 0.0,
+        "psi_full_avg10": 0.0,
+        "mem_available_gb": 25.3
+      },
+      "pressure_after": {
+        "psi_some_avg10": 0.0,
+        "psi_full_avg10": 0.0,
+        "mem_available_gb": 25.2
+      },
+      "attempt": 1,
+      "quiet": true,
+      "rep": 2
+    },
+    {
+      "mem_mb": 1173.2,
+      "pss_mb": 1173.2,
+      "swap_pss_mb": 0.0,
+      "pss_anon_mb": 1118.3,
+      "pss_file_mb": 51.5,
+      "process_count": 11,
+      "outside_tree_mem_mb": 221.8,
+      "processes": [
+        {
+          "pid": 2874100,
+          "pss_mb": 221.8,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 221.8,
+          "pss_anon_mb": 208.5,
+          "pss_file_mb": 11.3,
+          "in_tree": false,
+          "cmd": "/usr/bin/opencode serve --service"
+        },
+        {
+          "pid": 2874168,
+          "pss_mb": 86.6,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 86.6,
+          "pss_anon_mb": 84.4,
+          "pss_file_mb": 2.0,
+          "in_tree": true,
+          "cmd": "opencode"
+        },
+        {
+          "pid": 2874983,
+          "pss_mb": 92.6,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 92.6,
+          "pss_anon_mb": 91.3,
+          "pss_file_mb": 1.1,
+          "in_tree": true,
+          "cmd": "opencode"
+        },
+        {
+          "pid": 2875708,
+          "pss_mb": 92.7,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 92.7,
+          "pss_anon_mb": 91.4,
+          "pss_file_mb": 1.2,
+          "in_tree": true,
+          "cmd": "opencode"
+        },
+        {
+          "pid": 2876434,
+          "pss_mb": 90.7,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 90.7,
+          "pss_anon_mb": 89.7,
+          "pss_file_mb": 0.9,
+          "in_tree": true,
+          "cmd": "opencode"
+        },
+        {
+          "pid": 2877245,
+          "pss_mb": 90.7,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 90.7,
+          "pss_anon_mb": 89.5,
+          "pss_file_mb": 1.1,
+          "in_tree": true,
+          "cmd": "opencode"
+        },
+        {
+          "pid": 2878196,
+          "pss_mb": 93.2,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 93.2,
+          "pss_anon_mb": 91.6,
+          "pss_file_mb": 1.5,
+          "in_tree": true,
+          "cmd": "opencode"
+        },
+        {
+          "pid": 2878939,
+          "pss_mb": 92.1,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 92.1,
+          "pss_anon_mb": 90.9,
+          "pss_file_mb": 1.1,
+          "in_tree": true,
+          "cmd": "opencode"
+        },
+        {
+          "pid": 2879781,
+          "pss_mb": 94.1,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 94.1,
+          "pss_anon_mb": 92.5,
+          "pss_file_mb": 1.4,
+          "in_tree": true,
+          "cmd": "opencode"
+        },
+        {
+          "pid": 2880536,
+          "pss_mb": 95.3,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 95.3,
+          "pss_anon_mb": 93.2,
+          "pss_file_mb": 2.0,
+          "in_tree": true,
+          "cmd": "opencode"
+        },
+        {
+          "pid": 2881341,
+          "pss_mb": 123.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 123.4,
+          "pss_anon_mb": 95.3,
+          "pss_file_mb": 27.9,
+          "in_tree": true,
+          "cmd": "opencode"
+        }
+      ],
+      "launch": {
+        "mem_mb": 1173.2,
+        "pss_mb": 1173.2,
+        "swap_pss_mb": 0.0,
+        "pss_anon_mb": 1118.3,
+        "pss_file_mb": 51.5,
+        "process_count": 11
+      },
+      "hold_s": 0.0,
+      "tool": "opencode",
+      "sessions": 10,
+      "ready": 10,
+      "excerpt": "10;?\u000711;?\u0007+q4d7399;i=opentui-notifications:p=?;1337;Capabilities7501;?Gi=31337,s=1,v=1,a=q,t=d,f=24;",
+      "pressure_before": {
+        "psi_some_avg10": 0.0,
+        "psi_full_avg10": 0.0,
+        "mem_available_gb": 25.2
+      },
+      "pressure_after": {
+        "psi_some_avg10": 0.38,
+        "psi_full_avg10": 0.38,
+        "mem_available_gb": 25.3
+      },
+      "attempt": 1,
+      "quiet": true,
+      "rep": 3
+    },
+    {
+      "mem_mb": 185.8,
+      "pss_mb": 185.8,
+      "swap_pss_mb": 0.0,
+      "pss_anon_mb": 76.7,
+      "pss_file_mb": 109.1,
+      "process_count": 1,
+      "outside_tree_mem_mb": 0,
+      "processes": [
+        {
+          "pid": 2882644,
+          "pss_mb": 185.8,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 185.8,
+          "pss_anon_mb": 76.7,
+          "pss_file_mb": 109.1,
+          "in_tree": true,
+          "cmd": "/opt/claude-code/bin/claude"
+        }
+      ],
+      "launch": {
+        "mem_mb": 185.8,
+        "pss_mb": 185.8,
+        "swap_pss_mb": 0.0,
+        "pss_anon_mb": 76.7,
+        "pss_file_mb": 109.1,
+        "process_count": 1
+      },
+      "hold_s": 0.0,
+      "tool": "claude_code",
+      "sessions": 1,
+      "ready": 1,
+      "excerpt": "Accessingworkspace:",
+      "pressure_before": {
+        "psi_some_avg10": 0.38,
+        "psi_full_avg10": 0.38,
+        "mem_available_gb": 25.2
+      },
+      "pressure_after": {
+        "psi_some_avg10": 0.09,
+        "psi_full_avg10": 0.09,
+        "mem_available_gb": 25.2
+      },
+      "attempt": 1,
+      "quiet": true,
+      "rep": 1
+    },
+    {
+      "mem_mb": 185.7,
+      "pss_mb": 185.7,
+      "swap_pss_mb": 0.0,
+      "pss_anon_mb": 76.5,
+      "pss_file_mb": 109.2,
+      "process_count": 1,
+      "outside_tree_mem_mb": 0,
+      "processes": [
+        {
+          "pid": 2883361,
+          "pss_mb": 185.7,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 185.7,
+          "pss_anon_mb": 76.5,
+          "pss_file_mb": 109.2,
+          "in_tree": true,
+          "cmd": "/opt/claude-code/bin/claude"
+        }
+      ],
+      "launch": {
+        "mem_mb": 185.7,
+        "pss_mb": 185.7,
+        "swap_pss_mb": 0.0,
+        "pss_anon_mb": 76.5,
+        "pss_file_mb": 109.2,
+        "process_count": 1
+      },
+      "hold_s": 0.0,
+      "tool": "claude_code",
+      "sessions": 1,
+      "ready": 1,
+      "excerpt": "Accessingworkspace:",
+      "pressure_before": {
+        "psi_some_avg10": 0.09,
+        "psi_full_avg10": 0.09,
+        "mem_available_gb": 25.2
+      },
+      "pressure_after": {
+        "psi_some_avg10": 0.02,
+        "psi_full_avg10": 0.02,
+        "mem_available_gb": 25.2
+      },
+      "attempt": 1,
+      "quiet": true,
+      "rep": 2
+    },
+    {
+      "mem_mb": 185.2,
+      "pss_mb": 185.2,
+      "swap_pss_mb": 0.0,
+      "pss_anon_mb": 75.9,
+      "pss_file_mb": 109.3,
+      "process_count": 1,
+      "outside_tree_mem_mb": 0,
+      "processes": [
+        {
+          "pid": 2884171,
+          "pss_mb": 185.2,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 185.2,
+          "pss_anon_mb": 75.9,
+          "pss_file_mb": 109.3,
+          "in_tree": true,
+          "cmd": "/opt/claude-code/bin/claude"
+        }
+      ],
+      "launch": {
+        "mem_mb": 185.2,
+        "pss_mb": 185.2,
+        "swap_pss_mb": 0.0,
+        "pss_anon_mb": 75.9,
+        "pss_file_mb": 109.3,
+        "process_count": 1
+      },
+      "hold_s": 0.0,
+      "tool": "claude_code",
+      "sessions": 1,
+      "ready": 1,
+      "excerpt": "Accessingworkspace:",
+      "pressure_before": {
+        "psi_some_avg10": 0.02,
+        "psi_full_avg10": 0.02,
+        "mem_available_gb": 25.2
+      },
+      "pressure_after": {
+        "psi_some_avg10": 0.0,
+        "psi_full_avg10": 0.0,
+        "mem_available_gb": 25.1
+      },
+      "attempt": 1,
+      "quiet": true,
+      "rep": 3
+    },
+    {
+      "mem_mb": 894.3,
+      "pss_mb": 894.3,
+      "swap_pss_mb": 0.0,
+      "pss_anon_mb": 783.1,
+      "pss_file_mb": 111.6,
+      "process_count": 10,
+      "outside_tree_mem_mb": 0,
+      "processes": [
+        {
+          "pid": 2884887,
+          "pss_mb": 84.3,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 84.3,
+          "pss_anon_mb": 73.1,
+          "pss_file_mb": 11.2,
+          "in_tree": true,
+          "cmd": "/opt/claude-code/bin/claude"
+        },
+        {
+          "pid": 2885879,
+          "pss_mb": 89.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 89.5,
+          "pss_anon_mb": 78.4,
+          "pss_file_mb": 11.2,
+          "in_tree": true,
+          "cmd": "/opt/claude-code/bin/claude"
+        },
+        {
+          "pid": 2886637,
+          "pss_mb": 90.6,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 90.6,
+          "pss_anon_mb": 79.5,
+          "pss_file_mb": 11.2,
+          "in_tree": true,
+          "cmd": "/opt/claude-code/bin/claude"
+        },
+        {
+          "pid": 2887439,
+          "pss_mb": 90.2,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 90.2,
+          "pss_anon_mb": 79.0,
+          "pss_file_mb": 11.2,
+          "in_tree": true,
+          "cmd": "/opt/claude-code/bin/claude"
+        },
+        {
+          "pid": 2888296,
+          "pss_mb": 90.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 90.4,
+          "pss_anon_mb": 79.2,
+          "pss_file_mb": 11.2,
+          "in_tree": true,
+          "cmd": "/opt/claude-code/bin/claude"
+        },
+        {
+          "pid": 2889059,
+          "pss_mb": 90.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 90.5,
+          "pss_anon_mb": 79.3,
+          "pss_file_mb": 11.2,
+          "in_tree": true,
+          "cmd": "/opt/claude-code/bin/claude"
+        },
+        {
+          "pid": 2890025,
+          "pss_mb": 90.6,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 90.6,
+          "pss_anon_mb": 79.5,
+          "pss_file_mb": 11.2,
+          "in_tree": true,
+          "cmd": "/opt/claude-code/bin/claude"
+        },
+        {
+          "pid": 2890769,
+          "pss_mb": 90.9,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 90.9,
+          "pss_anon_mb": 79.8,
+          "pss_file_mb": 11.1,
+          "in_tree": true,
+          "cmd": "/opt/claude-code/bin/claude"
+        },
+        {
+          "pid": 2891591,
+          "pss_mb": 89.8,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 89.8,
+          "pss_anon_mb": 78.8,
+          "pss_file_mb": 11.1,
+          "in_tree": true,
+          "cmd": "/opt/claude-code/bin/claude"
+        },
+        {
+          "pid": 2892386,
+          "pss_mb": 87.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 87.5,
+          "pss_anon_mb": 76.5,
+          "pss_file_mb": 11.0,
+          "in_tree": true,
+          "cmd": "/opt/claude-code/bin/claude"
+        }
+      ],
+      "launch": {
+        "mem_mb": 894.3,
+        "pss_mb": 894.3,
+        "swap_pss_mb": 0.0,
+        "pss_anon_mb": 783.1,
+        "pss_file_mb": 111.6,
+        "process_count": 10
+      },
+      "hold_s": 0.0,
+      "tool": "claude_code",
+      "sessions": 10,
+      "ready": 10,
+      "excerpt": "Accessingworkspace:",
+      "pressure_before": {
+        "psi_some_avg10": 0.0,
+        "psi_full_avg10": 0.0,
+        "mem_available_gb": 25.1
+      },
+      "pressure_after": {
+        "psi_some_avg10": 0.0,
+        "psi_full_avg10": 0.0,
+        "mem_available_gb": 25.3
+      },
+      "attempt": 1,
+      "quiet": true,
+      "rep": 1
+    },
+    {
+      "mem_mb": 894.0,
+      "pss_mb": 894.0,
+      "swap_pss_mb": 0.0,
+      "pss_anon_mb": 782.6,
+      "pss_file_mb": 111.0,
+      "process_count": 10,
+      "outside_tree_mem_mb": 0,
+      "processes": [
+        {
+          "pid": 2893664,
+          "pss_mb": 83.9,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 83.9,
+          "pss_anon_mb": 72.7,
+          "pss_file_mb": 11.1,
+          "in_tree": true,
+          "cmd": "/opt/claude-code/bin/claude"
+        },
+        {
+          "pid": 2894474,
+          "pss_mb": 89.9,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 89.9,
+          "pss_anon_mb": 78.7,
+          "pss_file_mb": 11.2,
+          "in_tree": true,
+          "cmd": "/opt/claude-code/bin/claude"
+        },
+        {
+          "pid": 2895367,
+          "pss_mb": 90.1,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 90.1,
+          "pss_anon_mb": 78.9,
+          "pss_file_mb": 11.1,
+          "in_tree": true,
+          "cmd": "/opt/claude-code/bin/claude"
+        },
+        {
+          "pid": 2896172,
+          "pss_mb": 90.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 90.5,
+          "pss_anon_mb": 79.4,
+          "pss_file_mb": 11.1,
+          "in_tree": true,
+          "cmd": "/opt/claude-code/bin/claude"
+        },
+        {
+          "pid": 2896911,
+          "pss_mb": 90.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 90.4,
+          "pss_anon_mb": 79.3,
+          "pss_file_mb": 11.1,
+          "in_tree": true,
+          "cmd": "/opt/claude-code/bin/claude"
+        },
+        {
+          "pid": 2897833,
+          "pss_mb": 90.1,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 90.1,
+          "pss_anon_mb": 78.9,
+          "pss_file_mb": 11.1,
+          "in_tree": true,
+          "cmd": "/opt/claude-code/bin/claude"
+        },
+        {
+          "pid": 2898599,
+          "pss_mb": 90.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 90.4,
+          "pss_anon_mb": 79.2,
+          "pss_file_mb": 11.1,
+          "in_tree": true,
+          "cmd": "/opt/claude-code/bin/claude"
+        },
+        {
+          "pid": 2899388,
+          "pss_mb": 90.9,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 90.9,
+          "pss_anon_mb": 79.8,
+          "pss_file_mb": 11.1,
+          "in_tree": true,
+          "cmd": "/opt/claude-code/bin/claude"
+        },
+        {
+          "pid": 2900153,
+          "pss_mb": 89.8,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 89.8,
+          "pss_anon_mb": 78.7,
+          "pss_file_mb": 11.1,
+          "in_tree": true,
+          "cmd": "/opt/claude-code/bin/claude"
+        },
+        {
+          "pid": 2900955,
+          "pss_mb": 88.0,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 88.0,
+          "pss_anon_mb": 77.0,
+          "pss_file_mb": 11.0,
+          "in_tree": true,
+          "cmd": "/opt/claude-code/bin/claude"
+        }
+      ],
+      "launch": {
+        "mem_mb": 894.0,
+        "pss_mb": 894.0,
+        "swap_pss_mb": 0.0,
+        "pss_anon_mb": 782.6,
+        "pss_file_mb": 111.0,
+        "process_count": 10
+      },
+      "hold_s": 0.0,
+      "tool": "claude_code",
+      "sessions": 10,
+      "ready": 10,
+      "excerpt": "Accessingworkspace:",
+      "pressure_before": {
+        "psi_some_avg10": 0.0,
+        "psi_full_avg10": 0.0,
+        "mem_available_gb": 25.3
+      },
+      "pressure_after": {
+        "psi_some_avg10": 0.22,
+        "psi_full_avg10": 0.12,
+        "mem_available_gb": 23.4
+      },
+      "attempt": 1,
+      "quiet": true,
+      "rep": 2
+    },
+    {
+      "mem_mb": 893.5,
+      "pss_mb": 880.6,
+      "swap_pss_mb": 12.8,
+      "pss_anon_mb": 769.6,
+      "pss_file_mb": 111.0,
+      "process_count": 10,
+      "outside_tree_mem_mb": 0,
+      "processes": [
+        {
+          "pid": 2902247,
+          "pss_mb": 71.4,
+          "swap_pss_mb": 12.2,
+          "mem_mb": 83.7,
+          "pss_anon_mb": 61.0,
+          "pss_file_mb": 10.4,
+          "in_tree": true,
+          "cmd": "/opt/claude-code/bin/claude"
+        },
+        {
+          "pid": 2903099,
+          "pss_mb": 88.6,
+          "swap_pss_mb": 0.6,
+          "mem_mb": 89.2,
+          "pss_anon_mb": 78.2,
+          "pss_file_mb": 10.4,
+          "in_tree": true,
+          "cmd": "/opt/claude-code/bin/claude"
+        },
+        {
+          "pid": 2904082,
+          "pss_mb": 90.1,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 90.1,
+          "pss_anon_mb": 78.8,
+          "pss_file_mb": 11.3,
+          "in_tree": true,
+          "cmd": "/opt/claude-code/bin/claude"
+        },
+        {
+          "pid": 2904818,
+          "pss_mb": 90.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 90.5,
+          "pss_anon_mb": 79.2,
+          "pss_file_mb": 11.3,
+          "in_tree": true,
+          "cmd": "/opt/claude-code/bin/claude"
+        },
+        {
+          "pid": 2905734,
+          "pss_mb": 90.2,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 90.2,
+          "pss_anon_mb": 78.9,
+          "pss_file_mb": 11.3,
+          "in_tree": true,
+          "cmd": "/opt/claude-code/bin/claude"
+        },
+        {
+          "pid": 2906696,
+          "pss_mb": 90.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 90.5,
+          "pss_anon_mb": 79.2,
+          "pss_file_mb": 11.3,
+          "in_tree": true,
+          "cmd": "/opt/claude-code/bin/claude"
+        },
+        {
+          "pid": 2907642,
+          "pss_mb": 90.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 90.5,
+          "pss_anon_mb": 79.2,
+          "pss_file_mb": 11.3,
+          "in_tree": true,
+          "cmd": "/opt/claude-code/bin/claude"
+        },
+        {
+          "pid": 2908669,
+          "pss_mb": 90.9,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 90.9,
+          "pss_anon_mb": 79.6,
+          "pss_file_mb": 11.3,
+          "in_tree": true,
+          "cmd": "/opt/claude-code/bin/claude"
+        },
+        {
+          "pid": 2909532,
+          "pss_mb": 89.9,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 89.9,
+          "pss_anon_mb": 78.7,
+          "pss_file_mb": 11.2,
+          "in_tree": true,
+          "cmd": "/opt/claude-code/bin/claude"
+        },
+        {
+          "pid": 2910489,
+          "pss_mb": 88.0,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 88.0,
+          "pss_anon_mb": 76.8,
+          "pss_file_mb": 11.2,
+          "in_tree": true,
+          "cmd": "/opt/claude-code/bin/claude"
+        }
+      ],
+      "launch": {
+        "mem_mb": 893.5,
+        "pss_mb": 880.6,
+        "swap_pss_mb": 12.8,
+        "pss_anon_mb": 769.6,
+        "pss_file_mb": 111.0,
+        "process_count": 10
+      },
+      "hold_s": 0.0,
+      "tool": "claude_code",
+      "sessions": 10,
+      "ready": 10,
+      "excerpt": "Accessingworkspace:",
+      "pressure_before": {
+        "psi_some_avg10": 0.22,
+        "psi_full_avg10": 0.12,
+        "mem_available_gb": 23.4
+      },
+      "pressure_after": {
+        "psi_some_avg10": 0.01,
+        "psi_full_avg10": 0.01,
+        "mem_available_gb": 19.5
+      },
+      "attempt": 1,
+      "quiet": true,
+      "rep": 3
+    },
+    {
+      "mem_mb": 41.5,
+      "pss_mb": 41.5,
+      "swap_pss_mb": 0.0,
+      "pss_anon_mb": 22.1,
+      "pss_file_mb": 19.4,
+      "process_count": 2,
+      "outside_tree_mem_mb": 0,
+      "processes": [
+        {
+          "pid": 2911598,
+          "pss_mb": 31.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 31.4,
+          "pss_anon_mb": 20.3,
+          "pss_file_mb": 11.1,
+          "in_tree": true,
+          "cmd": "synaps daemon start"
+        },
+        {
+          "pid": 2911609,
+          "pss_mb": 10.1,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 10.1,
+          "pss_anon_mb": 1.8,
+          "pss_file_mb": 8.3,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        }
+      ],
+      "launch": {
+        "mem_mb": 41.5,
+        "pss_mb": 41.5,
+        "swap_pss_mb": 0.0,
+        "pss_anon_mb": 22.1,
+        "pss_file_mb": 19.4,
+        "process_count": 2
+      },
+      "hold_s": 0.0,
+      "tool": "synaps",
+      "sessions": 1,
+      "ready": 0,
+      "excerpt": null,
+      "pressure_before": {
+        "psi_some_avg10": 0.01,
+        "psi_full_avg10": 0.01,
+        "mem_available_gb": 19.5
+      },
+      "pressure_after": {
+        "psi_some_avg10": 0.0,
+        "psi_full_avg10": 0.0,
+        "mem_available_gb": 19.2
+      },
+      "attempt": 1,
+      "quiet": true,
+      "rep": 1
+    },
+    {
+      "mem_mb": 43.2,
+      "pss_mb": 43.2,
+      "swap_pss_mb": 0.0,
+      "pss_anon_mb": 23.8,
+      "pss_file_mb": 19.3,
+      "process_count": 2,
+      "outside_tree_mem_mb": 0,
+      "processes": [
+        {
+          "pid": 2912262,
+          "pss_mb": 33.2,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 33.2,
+          "pss_anon_mb": 22.0,
+          "pss_file_mb": 11.1,
+          "in_tree": true,
+          "cmd": "synaps daemon start"
+        },
+        {
+          "pid": 2912273,
+          "pss_mb": 10.0,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 10.0,
+          "pss_anon_mb": 1.8,
+          "pss_file_mb": 8.2,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        }
+      ],
+      "launch": {
+        "mem_mb": 43.2,
+        "pss_mb": 43.2,
+        "swap_pss_mb": 0.0,
+        "pss_anon_mb": 23.8,
+        "pss_file_mb": 19.3,
+        "process_count": 2
+      },
+      "hold_s": 0.0,
+      "tool": "synaps",
+      "sessions": 1,
+      "ready": 0,
+      "excerpt": null,
+      "pressure_before": {
+        "psi_some_avg10": 0.0,
+        "psi_full_avg10": 0.0,
+        "mem_available_gb": 19.2
+      },
+      "pressure_after": {
+        "psi_some_avg10": 0.0,
+        "psi_full_avg10": 0.0,
+        "mem_available_gb": 18.9
+      },
+      "attempt": 1,
+      "quiet": true,
+      "rep": 2
+    },
+    {
+      "mem_mb": 41.1,
+      "pss_mb": 41.1,
+      "swap_pss_mb": 0.0,
+      "pss_anon_mb": 22.2,
+      "pss_file_mb": 18.8,
+      "process_count": 2,
+      "outside_tree_mem_mb": 0,
+      "processes": [
+        {
+          "pid": 2912933,
+          "pss_mb": 31.3,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 31.3,
+          "pss_anon_mb": 20.4,
+          "pss_file_mb": 10.9,
+          "in_tree": true,
+          "cmd": "synaps daemon start"
+        },
+        {
+          "pid": 2912944,
+          "pss_mb": 9.8,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 9.8,
+          "pss_anon_mb": 1.8,
+          "pss_file_mb": 7.9,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        }
+      ],
+      "launch": {
+        "mem_mb": 41.1,
+        "pss_mb": 41.1,
+        "swap_pss_mb": 0.0,
+        "pss_anon_mb": 22.2,
+        "pss_file_mb": 18.8,
+        "process_count": 2
+      },
+      "hold_s": 0.0,
+      "tool": "synaps",
+      "sessions": 1,
+      "ready": 0,
+      "excerpt": null,
+      "pressure_before": {
+        "psi_some_avg10": 0.0,
+        "psi_full_avg10": 0.0,
+        "mem_available_gb": 18.9
+      },
+      "pressure_after": {
+        "psi_some_avg10": 0.0,
+        "psi_full_avg10": 0.0,
+        "mem_available_gb": 18.1
+      },
+      "attempt": 1,
+      "quiet": true,
+      "rep": 3
+    },
+    {
+      "mem_mb": 78.6,
+      "pss_mb": 78.6,
+      "swap_pss_mb": 0.0,
+      "pss_anon_mb": 57.8,
+      "pss_file_mb": 21.2,
+      "process_count": 11,
+      "outside_tree_mem_mb": 0,
+      "processes": [
+        {
+          "pid": 2920049,
+          "pss_mb": 44.3,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 44.3,
+          "pss_anon_mb": 39.0,
+          "pss_file_mb": 5.3,
+          "in_tree": true,
+          "cmd": "synaps daemon start"
+        },
+        {
+          "pid": 2920061,
+          "pss_mb": 3.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 3.4,
+          "pss_anon_mb": 1.9,
+          "pss_file_mb": 1.6,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 2920339,
+          "pss_mb": 3.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 3.5,
+          "pss_anon_mb": 1.9,
+          "pss_file_mb": 1.7,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 2920604,
+          "pss_mb": 3.3,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 3.3,
+          "pss_anon_mb": 1.8,
+          "pss_file_mb": 1.5,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 2920950,
+          "pss_mb": 3.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 3.5,
+          "pss_anon_mb": 1.9,
+          "pss_file_mb": 1.6,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 2921155,
+          "pss_mb": 3.3,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 3.3,
+          "pss_anon_mb": 1.9,
+          "pss_file_mb": 1.5,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 2921332,
+          "pss_mb": 3.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 3.4,
+          "pss_anon_mb": 1.8,
+          "pss_file_mb": 1.6,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 2921850,
+          "pss_mb": 3.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 3.5,
+          "pss_anon_mb": 1.9,
+          "pss_file_mb": 1.6,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 2922079,
+          "pss_mb": 3.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 3.4,
+          "pss_anon_mb": 1.9,
+          "pss_file_mb": 1.6,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 2922309,
+          "pss_mb": 3.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 3.5,
+          "pss_anon_mb": 1.9,
+          "pss_file_mb": 1.6,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 2922722,
+          "pss_mb": 3.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 3.5,
+          "pss_anon_mb": 1.9,
+          "pss_file_mb": 1.6,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        }
+      ],
+      "launch": {
+        "mem_mb": 78.6,
+        "pss_mb": 78.6,
+        "swap_pss_mb": 0.0,
+        "pss_anon_mb": 57.8,
+        "pss_file_mb": 21.2,
+        "process_count": 11
+      },
+      "hold_s": 0.0,
+      "tool": "synaps",
+      "sessions": 10,
+      "ready": 0,
+      "excerpt": null,
+      "pressure_before": {
+        "psi_some_avg10": 0.91,
+        "psi_full_avg10": 0.83,
+        "mem_available_gb": 21.8
+      },
+      "pressure_after": {
+        "psi_some_avg10": 0.0,
+        "psi_full_avg10": 0.0,
+        "mem_available_gb": 23.0
+      },
+      "attempt": 2,
+      "quiet": true,
+      "rep": 1
+    },
+    {
+      "mem_mb": 80.1,
+      "pss_mb": 79.5,
+      "swap_pss_mb": 0.6,
+      "pss_anon_mb": 58.4,
+      "pss_file_mb": 21.3,
+      "process_count": 11,
+      "outside_tree_mem_mb": 0,
+      "processes": [
+        {
+          "pid": 2925633,
+          "pss_mb": 45.7,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 45.7,
+          "pss_anon_mb": 40.2,
+          "pss_file_mb": 5.5,
+          "in_tree": true,
+          "cmd": "synaps daemon start"
+        },
+        {
+          "pid": 2925644,
+          "pss_mb": 2.9,
+          "swap_pss_mb": 0.6,
+          "mem_mb": 3.5,
+          "pss_anon_mb": 1.3,
+          "pss_file_mb": 1.6,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 2925872,
+          "pss_mb": 3.3,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 3.3,
+          "pss_anon_mb": 1.8,
+          "pss_file_mb": 1.4,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 2926277,
+          "pss_mb": 3.3,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 3.3,
+          "pss_anon_mb": 1.8,
+          "pss_file_mb": 1.5,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 2926518,
+          "pss_mb": 3.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 3.5,
+          "pss_anon_mb": 1.9,
+          "pss_file_mb": 1.7,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 2926715,
+          "pss_mb": 3.7,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 3.7,
+          "pss_anon_mb": 1.9,
+          "pss_file_mb": 1.9,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 2926939,
+          "pss_mb": 3.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 3.5,
+          "pss_anon_mb": 1.9,
+          "pss_file_mb": 1.6,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 2927213,
+          "pss_mb": 3.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 3.4,
+          "pss_anon_mb": 1.9,
+          "pss_file_mb": 1.5,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 2927673,
+          "pss_mb": 3.3,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 3.3,
+          "pss_anon_mb": 1.9,
+          "pss_file_mb": 1.5,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 2927985,
+          "pss_mb": 3.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 3.4,
+          "pss_anon_mb": 1.9,
+          "pss_file_mb": 1.5,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 2928651,
+          "pss_mb": 3.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 3.5,
+          "pss_anon_mb": 1.9,
+          "pss_file_mb": 1.6,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        }
+      ],
+      "launch": {
+        "mem_mb": 80.1,
+        "pss_mb": 79.5,
+        "swap_pss_mb": 0.6,
+        "pss_anon_mb": 58.4,
+        "pss_file_mb": 21.3,
+        "process_count": 11
+      },
+      "hold_s": 0.0,
+      "tool": "synaps",
+      "sessions": 10,
+      "ready": 0,
+      "excerpt": null,
+      "pressure_before": {
+        "psi_some_avg10": 0.0,
+        "psi_full_avg10": 0.0,
+        "mem_available_gb": 23.0
+      },
+      "pressure_after": {
+        "psi_some_avg10": 0.19,
+        "psi_full_avg10": 0.19,
+        "mem_available_gb": 24.7
+      },
+      "attempt": 1,
+      "quiet": true,
+      "rep": 2
+    },
+    {
+      "mem_mb": 78.3,
+      "pss_mb": 78.3,
+      "swap_pss_mb": 0.0,
+      "pss_anon_mb": 57.3,
+      "pss_file_mb": 21.4,
+      "process_count": 11,
+      "outside_tree_mem_mb": 0,
+      "processes": [
+        {
+          "pid": 2932303,
+          "pss_mb": 44.2,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 44.2,
+          "pss_anon_mb": 38.8,
+          "pss_file_mb": 5.4,
+          "in_tree": true,
+          "cmd": "synaps daemon start"
+        },
+        {
+          "pid": 2932314,
+          "pss_mb": 3.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 3.5,
+          "pss_anon_mb": 1.8,
+          "pss_file_mb": 1.6,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 2932558,
+          "pss_mb": 3.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 3.4,
+          "pss_anon_mb": 1.8,
+          "pss_file_mb": 1.6,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 2932743,
+          "pss_mb": 3.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 3.4,
+          "pss_anon_mb": 1.8,
+          "pss_file_mb": 1.6,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 2933011,
+          "pss_mb": 3.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 3.5,
+          "pss_anon_mb": 1.9,
+          "pss_file_mb": 1.7,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 2933293,
+          "pss_mb": 3.3,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 3.3,
+          "pss_anon_mb": 1.8,
+          "pss_file_mb": 1.5,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 2933512,
+          "pss_mb": 3.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 3.4,
+          "pss_anon_mb": 1.9,
+          "pss_file_mb": 1.6,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 2933788,
+          "pss_mb": 3.3,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 3.3,
+          "pss_anon_mb": 1.8,
+          "pss_file_mb": 1.5,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 2934023,
+          "pss_mb": 3.5,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 3.5,
+          "pss_anon_mb": 1.9,
+          "pss_file_mb": 1.7,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 2934234,
+          "pss_mb": 3.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 3.4,
+          "pss_anon_mb": 1.9,
+          "pss_file_mb": 1.6,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        },
+        {
+          "pid": 2934476,
+          "pss_mb": 3.4,
+          "swap_pss_mb": 0.0,
+          "mem_mb": 3.4,
+          "pss_anon_mb": 1.9,
+          "pss_file_mb": 1.6,
+          "in_tree": true,
+          "cmd": "/usr/bin/synaps --attach --new --keep-warm"
+        }
+      ],
+      "launch": {
+        "mem_mb": 78.3,
+        "pss_mb": 78.3,
+        "swap_pss_mb": 0.0,
+        "pss_anon_mb": 57.3,
+        "pss_file_mb": 21.4,
+        "process_count": 11
+      },
+      "hold_s": 0.0,
+      "tool": "synaps",
+      "sessions": 10,
+      "ready": 0,
+      "excerpt": null,
+      "pressure_before": {
+        "psi_some_avg10": 0.19,
+        "psi_full_avg10": 0.19,
+        "mem_available_gb": 24.7
+      },
+      "pressure_after": {
+        "psi_some_avg10": 0.0,
+        "psi_full_avg10": 0.0,
+        "mem_available_gb": 25.3
+      },
+      "attempt": 1,
+      "quiet": true,
+      "rep": 3
+    }
+  ],
+  "live_daemons_after": {
+    "3652": "/home/haseeb/.local/bin/synaps-dev daemon --foreground --idle-exit 600"
+  }
+}

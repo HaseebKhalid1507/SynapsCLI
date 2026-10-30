@@ -384,6 +384,15 @@ impl PromptBridge {
         }
     }
 
+    /// A fresh bridge for another session (`/sessions` switch): same pane
+    /// channel, no prompts, a new answers channel — an answer still in flight
+    /// for the old session lands on the dropped channel, never on the new one.
+    pub(crate) fn fresh(&self) -> Self {
+        let mut b = Self::new(self.secret_prompt_tx.clone());
+        b.confirms = self.confirms;
+        b
+    }
+
     /// Track input ownership (attach snapshot, `InputOwnerChanged`).
     pub(crate) fn set_owns_input(&mut self, owns: bool) {
         self.owns_input = owns;
@@ -491,6 +500,22 @@ fn waiting_label(req: &PromptRequest) -> String {
         (Some(t), Some(e)) => format!("{}: {t} ({e})", req.title),
         (Some(t), None) => format!("{}: {t}", req.title),
         _ => req.title.clone(),
+    }
+}
+
+/// Whether this client may drive the session now: with
+/// `client_input = shared` any non-observer may; with `exclusive` only the
+/// input owner.
+pub(crate) fn may_drive(t: &dyn ClientTransport) -> bool {
+    may_drive_with_owner(t, t.input_owner())
+}
+
+/// [`may_drive`] with `owner` holding input: an `InputOwnerChanged` handler
+/// passes the event's `to`, whether or not the transport has applied it.
+pub(crate) fn may_drive_with_owner(t: &dyn ClientTransport, owner: Option<agent_engine::session::ClientId>) -> bool {
+    match t.client_input() {
+        agent_engine::session::ClientInput::Shared => t.mode() != AttachMode::Observe,
+        agent_engine::session::ClientInput::Exclusive => owner == Some(t.client_id()),
     }
 }
 

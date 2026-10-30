@@ -36,7 +36,7 @@ fn session_with_messages(n: usize) -> Session {
 }
 
 fn push_msg(s: &mut Session, body: &str) {
-    let role = if s.api_messages.len() % 2 == 0 {
+    let role = if s.api_messages.len().is_multiple_of(2) {
         "user"
     } else {
         "assistant"
@@ -581,7 +581,7 @@ fn session_of_bytes(target_bytes: usize) -> Session {
     let mut approx = serde_json::to_string(&s).unwrap().len();
     while approx < target_bytes {
         let i = s.api_messages.len();
-        let msg = json!({"role": if i % 2 == 0 {"user"} else {"assistant"},
+        let msg = json!({"role": if i.is_multiple_of(2) {"user"} else {"assistant"},
                          "content": format!("{i} {body}")});
         approx += msg.to_string().len() + 1; // + separator
         s.api_messages.push(Arc::new(msg));

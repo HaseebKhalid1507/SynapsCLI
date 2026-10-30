@@ -580,6 +580,8 @@ mod tests {
                 model: "anthropic/claude-opus-5-5".into(),
                 system_prompt: "test".into(),
                 timeout_secs: 600,
+                cwd: None,
+                thinking: None,
             });
         }
         let dir = tempfile::tempdir().unwrap();
@@ -628,6 +630,8 @@ mod tests {
             model: "model".into(),
             system_prompt: "system".into(),
             timeout_secs: 5,
+            cwd: None,
+            thinking: None,
         });
         let observed = Arc::clone(&state);
         let stream = futures::stream::once(async move {

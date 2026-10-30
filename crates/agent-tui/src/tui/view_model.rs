@@ -47,7 +47,7 @@ pub(crate) struct ViewInputs<'a> {
     pub(crate) prompt_fx: super::neon_prompt::PromptFx,
 
     // ── status / spinner / identity ──
-    /// Ghost header snapshot (header.rs), built once per frame.
+    /// Header snapshot (header.rs), built once per frame.
     pub(crate) header: super::header::HeaderSnap,
     pub(crate) streaming: bool,
     pub(crate) spinner_frame: usize,
@@ -86,6 +86,7 @@ pub(crate) struct ViewInputs<'a> {
     pub(crate) models: &'a Option<super::models::ModelsModalState>,
     pub(crate) help_find: &'a Option<synaps_cli::help::HelpFindState>,
     pub(crate) effort: &'a Option<super::effort::EffortModalState>,
+    pub(crate) sessions: &'a Option<super::sessions::SessionsState>,
     /// Settings-modal-scoped health snapshot input (spec §3.1).
     pub(crate) model_health:
         &'a std::collections::HashMap<String, (synaps_cli::runtime::openai::ping::PingStatus, u64)>,
@@ -155,6 +156,7 @@ impl<'a> ViewInputs<'a> {
             models: &app.models,
             help_find: &app.help_find,
             effort: &app.effort,
+            sessions: &app.sessions,
             model_health: &app.model_health,
             secret_prompts: &app.secret_prompts,
             modal_stack: &app.modal_stack,

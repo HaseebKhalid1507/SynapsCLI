@@ -1322,6 +1322,7 @@ pub fn capacity_view(st: &AccountState) -> Option<AccountCapacity> {
             models: st.last_models.clone(),
         },
         cooldown_until_ms: None,
+        failure: None,
     })
 }
 
@@ -1742,7 +1743,6 @@ pub struct KeeperLock {
 
 impl KeeperLock {
     pub fn acquire(dir: &Path, name: &str, holder: &str) -> Result<Self, KeeperError> {
-        use fs4::fs_std::FileExt;
         crate::private_fs::ensure_private_dir(dir).map_err(|e| KeeperError::Io {
             path: dir.to_path_buf(),
             detail: e.to_string(),
@@ -1763,7 +1763,7 @@ impl KeeperLock {
             use std::os::unix::fs::PermissionsExt;
             let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
         }
-        let locked = FileExt::try_lock_exclusive(&file).map_err(|e| KeeperError::Io {
+        let locked = crate::core::lock_file::try_lock_exclusive(&file).map_err(|e| KeeperError::Io {
             path: path.clone(),
             detail: e.to_string(),
         })?;

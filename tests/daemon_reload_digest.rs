@@ -4,9 +4,7 @@
 //! `conversation.api_messages`, no `MessageHistory` on the wire, and the
 //! transcript (the tail) is intact and grows on the next turn.
 //!
-//! Unix only (execv + flock).
-
-#![cfg(unix)]
+//! Unix: execv + flock (same pid). Windows: the lock hand-off (new pid).
 
 #[path = "support/phase2/mod.rs"]
 mod phase2;
@@ -31,6 +29,14 @@ struct DaemonProc {
 
 impl Drop for DaemonProc {
     fn drop(&mut self) {
+        // Windows: after a reload the daemon is the successor image, not
+        // our child — end it too, or a failed test leaks it.
+        #[cfg(windows)]
+        if let Some(info) = registry::read_daemon_json(&self.paths) {
+            if info.pid != self.child.id() && registry::is_alive(&self.paths) {
+                let _ = std::process::Command::new("taskkill").args(["/PID", &info.pid.to_string(), "/T", "/F"]).output();
+            }
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
@@ -151,7 +157,10 @@ async fn reload_reconnects_digest_client_with_display_tail_only() {
         .expect("reconnect budget")
         .expect("reconnected");
     assert_eq!(t.welcome.generation, 2);
+    #[cfg(unix)]
     assert_eq!(t.welcome.pid, pid_before, "same pid after execv");
+    #[cfg(windows)]
+    assert_ne!(t.welcome.pid, pid_before, "the successor image took over");
     assert_eq!(t.session_id(), &sid);
     assert_eq!(t.history_mode(), HistoryMode::Digest, "history mode survives the reconnect Hello");
 

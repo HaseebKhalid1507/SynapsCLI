@@ -506,6 +506,8 @@ fn poll_query(app: &mut App, now: Instant) -> Option<(String, SessionQuery)> {
         SessionQuery::SubagentWatch {
             handle_id: id,
             since: w.next_seq,
+            // This build renders queued tool cards; an older daemon ignores it.
+            tool_queue: true,
         },
     ))
 }
@@ -630,6 +632,7 @@ pub(crate) fn on_query_result(
 /// rollback needs the line cache rebuilt.
 pub(crate) fn apply_page(w: &mut WorkerThread, page: WatchPage, now: Instant) -> bool {
     let was = std::mem::take(&mut w.status);
+    let times = event_times(&page, w.store.now());
     w.agent_name = page.agent_name;
     w.subagent_id = page.subagent_id;
     if page.truncated {
@@ -638,14 +641,19 @@ pub(crate) fn apply_page(w: &mut WorkerThread, page: WatchPage, now: Instant) ->
         ));
     }
     let mut rolled_back = false;
-    for ev in &page.events {
+    for (i, ev) in page.events.iter().enumerate() {
         match ev.to_stream() {
             Some(stream) => {
+                // Replay it when the worker did it: a tool that started 12s
+                // ago counts from there, and a finished one is timed by its
+                // real run, not by when this view happened to poll (#287).
+                w.store.set_event_time(times.as_ref().map(|t| t[i]));
                 let applied = super::stream_handler::apply_transcript_event(
                     &mut w.store,
                     &mut w.response_preview,
                     &stream,
                 );
+                w.store.set_event_time(None);
                 rolled_back |= matches!(applied, super::stream_handler::Applied::RolledBack);
             }
             None => {
@@ -674,6 +682,25 @@ pub(crate) fn apply_page(w: &mut WorkerThread, page: WatchPage, now: Instant) ->
     w.drained = finished && !page.more;
     w.status = page.status;
     rolled_back
+}
+
+/// When each event of `page` happened, on the client clock that reads `now`
+/// (the worker store's clock). `None` when the page has no journal timing
+/// (an older daemon): the events are then timed by arrival, as before.
+fn event_times(page: &WatchPage, now: Instant) -> Option<Vec<Instant>> {
+    let read_at = page.now_ms?;
+    if page.at_ms.len() != page.events.len() {
+        return None;
+    }
+    Some(
+        page.at_ms
+            .iter()
+            .map(|&at| {
+                let ago = Duration::from_millis(read_at.saturating_sub(at));
+                now.checked_sub(ago).unwrap_or(now)
+            })
+            .collect(),
+    )
 }
 
 // ───────────────────────────── steering ────────────────────────────────────
@@ -798,7 +825,51 @@ mod tests {
             truncated: false,
             more: false,
             events,
+            ..Default::default()
         }
+    }
+
+    /// #287: journal stamps become "this long before now" on the client's
+    /// clock; a page without them (an older daemon), or with a mismatched
+    /// list, falls back to arrival time; a stamp after `now_ms` is now.
+    #[test]
+    fn event_times_place_each_event_on_the_client_clock() {
+        let now = Instant::now() + Duration::from_secs(3600);
+        let mut p = page("sa_1", "running", vec![text("a"), text("b")], 2);
+        assert_eq!(event_times(&p, now), None, "no timing: arrival time");
+        p.now_ms = Some(10_000);
+        p.at_ms = vec![4_000];
+        assert_eq!(event_times(&p, now), None, "mismatched: ignored");
+        p.at_ms = vec![4_000, 12_000];
+        assert_eq!(
+            event_times(&p, now),
+            Some(vec![now - Duration::from_secs(6), now])
+        );
+    }
+
+    /// #287 (same cause): a steer replayed late is stamped with when the
+    /// worker took it, not when the view polled.
+    #[test]
+    fn a_steer_replayed_late_keeps_its_own_time() {
+        let clock = super::super::clock::TuiClock::test();
+        clock.advance(Duration::from_secs(7200));
+        let mut threads = super::super::threads::Threads::default();
+        let w = threads.open_worker("sa_1", 1, "scout", clock, (0, 0));
+        let mut p = page(
+            "sa_1",
+            "running",
+            vec![WatchEvent::Steered {
+                text: "focus".into(),
+            }],
+            1,
+        );
+        p.at_ms = vec![0];
+        p.now_ms = Some(90 * 60 * 1000);
+        apply_page(w, p, Instant::now());
+        let stamped = &w.store.messages()[0].time;
+        let then = chrono::Local::now() - chrono::Duration::minutes(90);
+        let ok = [then, then - chrono::Duration::minutes(1)].map(|t| t.format("%H:%M").to_string());
+        assert!(ok.contains(stamped), "{stamped} vs {ok:?}");
     }
 
     fn text(t: &str) -> WatchEvent {
@@ -906,7 +977,7 @@ mod tests {
         assert!(due > Instant::now() && due <= Instant::now() + POLL_INTERVAL);
         let (_, q) = poll_query(&mut app, Instant::now()).unwrap();
         assert!(
-            matches!(&q, SessionQuery::SubagentWatch { handle_id, since: 3 } if handle_id == "sa_7"),
+            matches!(&q, SessionQuery::SubagentWatch { handle_id, since: 3, tool_queue: true } if handle_id == "sa_7"),
             "{q:?}"
         );
     }
@@ -1161,5 +1232,44 @@ mod tests {
         assert!(app.threads.worker("sa_3").is_some(), "focused");
         prune(&mut app, now + FINISHED_THREAD_TTL + Duration::from_secs(1));
         assert!(app.threads.worker("sa_1").is_none(), "past its window");
+    }
+
+    /// A theme change restyles every open worker view, not only the main
+    /// one: each view has its own line cache, and a view left out kept its
+    /// older tool cards and thinking blocks in the previous palette.
+    #[test]
+    fn a_theme_change_restyles_every_worker_view() {
+        use crate::tui::transcript::RenderCtx;
+        let ctx = RenderCtx {
+            spinner_frame: 0,
+            streaming: false,
+            agent_name: "synaps",
+        };
+        let area = ratatui::layout::Rect::new(0, 1, 82, 30);
+        let rendered = |app: &App, id: &str| {
+            app.threads.worker(id).unwrap().store.line_cache().map_or(0, |c| {
+                c.per_msg.iter().filter(|s| s.lines.is_some()).count()
+            })
+        };
+        let mut app = app();
+        app.subagent_rows = vec![
+            row(1, "a", SubagentStatus::Running),
+            row(2, "b", SubagentStatus::Running),
+        ];
+        for id in ["sa_1", "sa_2"] {
+            focus_and_answer(
+                &mut app,
+                id,
+                page(id, "running", vec![WatchEvent::ResponseStart, text("hi")], 2),
+            );
+            let w = app.threads.worker_mut(id).unwrap();
+            let _ = w.store.visible_window(area, &ctx);
+            assert!(rendered(&app, id) > 0, "{id}: precondition, rendered");
+        }
+        // sa_2 is focused; sa_1 sits in the background.
+        app.invalidate_theme();
+        for id in ["sa_1", "sa_2"] {
+            assert_eq!(rendered(&app, id), 0, "{id}: re-renders in the new theme");
+        }
     }
 }

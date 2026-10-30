@@ -33,6 +33,12 @@ pub(super) enum InputAction {
     /// The dispatch arm re-checks streaming + exact-model validity
     /// (`effort::apply_guard`) before any mutation/persist.
     EffortApply(super::effort::EffortApply),
+    /// /sessions modal asked for a daemon pin/close (spawned by dispatch).
+    SessionsOp(super::sessions::SessionsOp),
+    /// /sessions Past tab: deep search / rename on a blocking task.
+    SessionsPast(super::sessions::past::PastCmd),
+    /// Copy text to the system clipboard (/sessions `y copy id`).
+    CopyText(String),
     /// Models modal requested expanding provider models.
     ModelsExpandProvider(String),
     /// Plugins modal emitted an outcome — handled in the async main loop
@@ -68,7 +74,7 @@ pub(super) enum InputAction {
 /// paths) converge on `action` so the debug-only stack/app sync tripwire always
 /// runs afterwards.
 pub(super) fn handle_event(
-    event: Event,
+    mut event: Event,
     app: &mut App,
     runtime: &impl agent_engine::session::RuntimeRead,
     streaming: bool,
@@ -83,8 +89,22 @@ pub(super) fn handle_event(
     // modal pane handlers below act on raw `Event::Key` — without this gate
     // every keypress in /models, /settings, etc. fires twice on Windows.
     // Repeat is deliberately kept (held-key navigation).
-    if let Event::Key(k) = &event {
-        if k.kind == crossterm::event::KeyEventKind::Release {
+    // Windows also delivers a character that is not on the keyboard layout
+    // (pasted text, `“`, `→`, Alt+numpad) as a lone Release, and an AltGr
+    // character (`@`, `{`, `€` on many layouts) as Ctrl+Alt: `win_keys`
+    // turns both back into the plain keypress they stand for.
+    if let Event::Key(k) = event {
+        if cfg!(windows) {
+            let now = std::time::Instant::now();
+            app.alt_codes.observe(&k, now);
+            if let Some(press) = app.alt_codes.release_as_press(&k, now) {
+                event = Event::Key(press);
+            }
+            if let Event::Key(k) = &mut event {
+                super::win_keys::altgr_as_text(k);
+            }
+        }
+        if matches!(event, Event::Key(k) if k.kind == crossterm::event::KeyEventKind::Release) {
             return InputAction::None;
         }
     }
@@ -98,6 +118,7 @@ pub(super) fn handle_event(
         }
         super::focus::PaneId::HelpFind => route_help_find(event, app),
         super::focus::PaneId::Effort => route_effort(event, app),
+        super::focus::PaneId::Sessions => route_sessions(event, app),
         super::focus::PaneId::Models => route_models(event, app, runtime),
         super::focus::PaneId::Plugins => route_plugins(event, app),
         super::focus::PaneId::Settings => route_settings(event, app, runtime, registry),
@@ -291,7 +312,7 @@ fn handle_mouse(
 /// Copy text to system clipboard. Uses a singleton background thread that
 /// holds one clipboard handle for the lifetime of the app. New copies replace
 /// the previous content atomically — no thread accumulation, no races.
-fn copy_to_clipboard(text: &str) {
+pub(crate) fn copy_to_clipboard(text: &str) {
     use std::sync::{mpsc, OnceLock};
     static TX: OnceLock<mpsc::Sender<String>> = OnceLock::new();
     let sender = TX.get_or_init(|| {
@@ -727,6 +748,29 @@ fn route_effort(event: Event, app: &mut App) -> InputAction {
     InputAction::None
 }
 
+/// Stack-routed pane handler for the `/sessions` modal. `Close` drops the
+/// state, pops the stack and stops the poller ([`super::sessions::close`]);
+/// `Op` defers the daemon request to the async loop.
+fn route_sessions(event: Event, app: &mut App) -> InputAction {
+    // Invariant (checked by the tripwire): top() == Sessions ⇒ sessions is Some.
+    let Some(state) = &mut app.sessions else {
+        return InputAction::None;
+    };
+    if let Event::Key(key) = event {
+        return match super::sessions::handle_event(state, key) {
+            super::sessions::InputOutcome::Close => {
+                super::sessions::close(app);
+                InputAction::None
+            }
+            super::sessions::InputOutcome::Op(op) => InputAction::SessionsOp(op),
+            super::sessions::InputOutcome::Past(cmd) => InputAction::SessionsPast(cmd),
+            super::sessions::InputOutcome::Copy(text) => InputAction::CopyText(text),
+            super::sessions::InputOutcome::None => InputAction::None,
+        };
+    }
+    InputAction::None
+}
+
 /// P7.5 stack-routed pane handler for the `/model` · `/models` modal.
 ///
 /// Performs exactly what the deleted legacy chain arm did (byte-identical
@@ -893,7 +937,14 @@ fn route_settings(
                 app.model_health.clone(),
             );
             snap.catalog_overrides = app.catalog_overrides.clone();
-            match super::settings::handle_event(state, key, &snap) {
+            let outcome = super::settings::handle_event(state, key, &snap);
+            if app.streaming {
+                if let Some(refusal) = super::settings::mid_turn_refusal(&outcome) {
+                    state.row_error = Some(refusal);
+                    return InputAction::None;
+                }
+            }
+            match outcome {
                 super::settings::InputOutcome::Close => {
                     app.settings = None;
                     app.modal_stack.pop();
@@ -1314,6 +1365,46 @@ mod tests {
             handle_event(release, &mut app, &runtime, false, &registry, &keybinds, 3),
             InputAction::None
         ));
+    }
+
+    /// A lone `Char` Release is an Alt-code character on Windows (a paste of
+    /// `—` arrived as nothing); elsewhere a Release is still dropped.
+    #[test]
+    fn a_lone_character_release_types_on_windows_only() {
+        let runtime = synaps_cli::Runtime::new_headless();
+        let mut app = make_app();
+        let keybinds = synaps_cli::skills::keybinds::KeybindRegistry::default();
+        let registry = Arc::new(CommandRegistry::new(&[], vec![]));
+        let key = |c, kind| {
+            Event::Key(crossterm::event::KeyEvent {
+                code: KeyCode::Char(c),
+                modifiers: KeyModifiers::NONE,
+                kind,
+                state: crossterm::event::KeyEventState::empty(),
+            })
+        };
+        use crossterm::event::KeyEventKind::{Press, Release};
+        for ev in [key('a', Press), key('a', Release), key('—', Release), key('b', Press), key('b', Release)] {
+            handle_event(ev, &mut app, &runtime, false, &registry, &keybinds, 3);
+        }
+        assert_eq!(app.input_text(), if cfg!(windows) { "a—b" } else { "ab" });
+    }
+
+    /// AltGr types `@` on a German layout; Windows reports it as Ctrl+Alt+@.
+    #[test]
+    fn an_altgr_character_is_typed_on_windows() {
+        let runtime = synaps_cli::Runtime::new_headless();
+        let mut app = make_app();
+        let keybinds = synaps_cli::skills::keybinds::KeybindRegistry::default();
+        let registry = Arc::new(CommandRegistry::new(&[], vec![]));
+        let at = Event::Key(crossterm::event::KeyEvent {
+            code: KeyCode::Char('@'),
+            modifiers: KeyModifiers::CONTROL | KeyModifiers::ALT,
+            kind: crossterm::event::KeyEventKind::Press,
+            state: crossterm::event::KeyEventState::empty(),
+        });
+        handle_event(at, &mut app, &runtime, false, &registry, &keybinds, 3);
+        assert_eq!(app.input_text(), if cfg!(windows) { "@" } else { "" });
     }
 
     fn make_app() -> App {

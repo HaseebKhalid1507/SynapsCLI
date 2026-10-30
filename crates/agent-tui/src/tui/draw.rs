@@ -106,7 +106,7 @@ fn sidecar_pill_segment(
     Span::styled(text, Style::default().fg(color).add_modifier(modifier))
 }
 
-/// Pure helper for [`sidecar_pill_spans`] — given a set of (plugin_id, display_name?)
+/// Pure helper — given a set of (plugin_id, display_name?)
 /// pairs and the registry's lifecycle claims, return the plugin ids in
 /// display order: importance desc, then display_name alphabetical, then
 /// plugin id. Pulled out so the ordering can be unit-tested without
@@ -138,7 +138,7 @@ pub(crate) fn order_sidecar_pills(
     keys.into_iter().map(|(p, _)| p.clone()).collect()
 }
 
-/// Pure helper backing [`sidecar_pill_span`] — returns the rendered
+/// Pure helper backing the sidecar pill text — returns the rendered
 /// text only. Lives separately so tests can exercise the label logic
 /// without spawning a real sidecar process or mounting the full App.
 pub(crate) fn sidecar_pill_text(
@@ -163,50 +163,6 @@ pub(crate) fn sidecar_pill_text(
         }
         super::sidecar::SidecarUiStatus::Error(_) => format!(" \u{26a0} {label} error "),
     }
-}
-
-/// One sidecar pill as the header draws it (text from
-/// [`sidecar_pill_text`]; armed/active pills pulse in the streaming colour).
-pub(crate) fn sidecar_pill_span(
-    pill: &super::render_model::SidecarPillSnap,
-    spinner_frame: usize,
-) -> Span<'static> {
-    let label = pill.display_name.as_deref().unwrap_or("sidecar");
-    let text = sidecar_pill_text(label, &pill.status, pill.armed, spinner_frame);
-    let color = match &pill.status {
-        super::sidecar::SidecarUiStatus::Idle => {
-            if pill.armed {
-                let pulse =
-                    ((spinner_frame as f64 / 18.0).sin() * 0.3 + 0.7).max(0.4);
-                let base = match THEME.load().status_streaming {
-                    Color::Rgb(r, g, b) => (r, g, b),
-                    _ => (220, 80, 80),
-                };
-                Color::Rgb(
-                    (base.0 as f64 * pulse) as u8,
-                    (base.1 as f64 * pulse) as u8,
-                    (base.2 as f64 * pulse) as u8,
-                )
-            } else {
-                THEME.load().muted
-            }
-        }
-        super::sidecar::SidecarUiStatus::Active { .. } => {
-            let pulse = ((spinner_frame as f64 / 18.0).sin() * 0.3 + 0.7).max(0.4);
-            let base = match THEME.load().status_streaming {
-                Color::Rgb(r, g, b) => (r, g, b),
-                _ => (220, 80, 80),
-            };
-            Color::Rgb(
-                (base.0 as f64 * pulse) as u8,
-                (base.1 as f64 * pulse) as u8,
-                (base.2 as f64 * pulse) as u8,
-            )
-        }
-        super::sidecar::SidecarUiStatus::Loading => THEME.load().muted,
-        super::sidecar::SidecarUiStatus::Error(_) => Color::Red,
-    };
-    Span::styled(text, Style::default().fg(color).add_modifier(Modifier::BOLD))
 }
 
 #[cfg(test)]
@@ -808,44 +764,13 @@ pub(crate) fn build_render_model(
         models,
         help_find,
         effort: inputs.effort.clone(),
+        sessions: inputs.sessions.clone(),
         secret_prompt,
         // P7.8: stack-order snapshot driving the modal draw loop below.
         modal_order: inputs.modal_stack.iter_bottom_up().collect(),
         protected_bottom_rows,
     });
     Some((model, patch))
-}
-
-/// Header spans for a focused worker view: `│ ◉ name · sa_N · status · hint`.
-pub(crate) fn watch_banner_spans(b: &super::watch::Banner) -> Vec<Span<'static>> {
-    let theme = THEME.load();
-    let status_fg = match b.status.as_str() {
-        "running" => theme.status_streaming,
-        "completed" => theme.subagent_done,
-        "failed" | "gone" => theme.error_color,
-        "connecting" => theme.muted,
-        _ => theme.warning_color,
-    };
-    let hint = if b.steerable {
-        " \u{00b7} Enter steers \u{00b7} Esc back "
-    } else {
-        " \u{00b7} read-only \u{00b7} Esc back "
-    };
-    vec![
-        Span::styled("\u{2502}", Style::default().fg(theme.border)),
-        Span::styled(
-            format!(" \u{25c9} {} ", b.agent_name),
-            Style::default()
-                .fg(theme.subagent_name)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!("{} \u{00b7} ", b.handle_id),
-            Style::default().fg(theme.muted),
-        ),
-        Span::styled(b.status.replace('_', " "), Style::default().fg(status_fg)),
-        Span::styled(hint, Style::default().fg(theme.muted)),
-    ]
 }
 
 /// The footer context bar's colour for this much of the window used:
@@ -925,7 +850,12 @@ pub(crate) fn render_frame(
                 terminal,
                 caps,
                 model.protected_bottom_rows,
-                Style::default().bg(THEME.load().message_background()),
+                // The scrub paints straight to the backend, outside the
+                // buffer the opaque guard steers — steer its bg here too.
+                Style::default().bg(super::theme::steer_off_terminal_bg(
+                    THEME.load().message_background(),
+                    super::theme::opaque_guard_target(),
+                )),
             )?;
         }
 
@@ -985,12 +915,6 @@ pub(crate) fn render_frame_into(
         input: input_area,
         footer: footer_area,
     } = AppAreas::from_heights(frame.area(), subagent_height, download_height, input_height);
-
-    // ── Header ────────────────────────────────────────────────────────────
-    // Ghost header (header.rs): wordmark + pills, session in the centre,
-    // live state on the right. The row under it is the message pane's top
-    // edge, drawn as the header's lower half (`header::style_top_edge`).
-    super::header::render(frame, header_area, model);
 
     // ── Messages ──────────────────────────────────────────────────────────
     let msg_area = body;
@@ -1230,24 +1154,22 @@ pub(crate) fn render_frame_into(
         }
     }
 
-    // Scroll indicator
-    if model.scroll_back > 0 {
-        let indicator = format!(" \u{2191}{} ", model.scroll_back);
-        let mut indicator_style = Style::default().fg(THEME.load().muted);
-        if super::header::top_edge_is_half_block() {
-            // Sits on the header's lower half: hang it off the header.
-            indicator_style = indicator_style.bg(THEME.load().bg);
-        }
-        let indicator_widget = Paragraph::new(Span::styled(indicator, indicator_style))
-        .alignment(Alignment::Right);
-        let indicator_area = ratatui::layout::Rect {
-            x: msg_area.x,
-            y: msg_area.y,
-            width: msg_area.width,
-            height: 1,
-        };
-        frame.render_widget(indicator_widget, indicator_area);
-    }
+    // ── Header ────────────────────────────────────────────────────────────
+    // The neon prompt's slab hung from the top (header.rs). Its bottom rim
+    // is the message pane's top edge row, so it paints after the pane; the
+    // scrolled-back tab hangs off that rim. Same sweep as the prompt's.
+    let glow = (model.streaming && super::neon_prompt::streaming_glow_enabled()).then(|| {
+        context_bar_color(
+            &THEME.load(),
+            model.last_turn_context,
+            model.last_turn_context_window,
+        )
+    });
+    let header_rows = ratatui::layout::Rect {
+        height: header_area.height + u16::from(body.height > 0),
+        ..header_area
+    };
+    super::header::render(frame, header_rows, model, glow);
 
     // ── Input ─────────────────────────────────────────────────────────────
     // Neon prompt (neon_prompt.rs): a soft-edged slab of light with no drawn
@@ -1262,13 +1184,6 @@ pub(crate) fn render_frame_into(
         let theme = THEME.load();
         // Optional streaming glow (Settings → Streaming glow): it wears the
         // context bar's colour, so it shifts with the bar as the window fills.
-        let glow = (model.streaming && neon::streaming_glow_enabled()).then(|| {
-            context_bar_color(
-                &theme,
-                model.last_turn_context,
-                model.last_turn_context_window,
-            )
-        });
         let slab = neon::Slab::new(&theme, model.prompt_fx, input_area.width, glow);
         let text_area = ratatui::layout::Rect {
             x: input_area.x.saturating_add(inset),
@@ -1602,6 +1517,11 @@ pub(crate) fn render_frame_into(
                     super::help_find::render(frame, frame.area(), &mut state);
                 }
             }
+            super::focus::PaneId::Sessions => {
+                if let Some(ref state) = model.sessions {
+                    super::sessions::render(frame, frame.area(), state);
+                }
+            }
             super::focus::PaneId::Effort => {
                 if let Some(ref state) = model.effort {
                     super::effort::render(frame, frame.area(), state);
@@ -1618,6 +1538,16 @@ pub(crate) fn render_frame_into(
             super::focus::PaneId::PluginEditor | super::focus::PaneId::Chat => {}
         }
     }
+
+    // ── Opaque guard (LAST: after effects, toasts and modals) ─────────────
+    // Terminals with background opacity (kitty `background_opacity`) make
+    // every cell whose bg EQUALS the terminal's default bg see-through, so a
+    // theme whose canvas matches the user's terminal colour (ocean on a
+    // #030810 kitty) rendered see-through even in opaque mode. One pass over
+    // the finished frame catches every painter, including derived/animated
+    // mixes (slab shimmer, boot fx fades, selection inversion, transitions).
+    // No-op in invisible mode or when the terminal bg is unknown.
+    super::theme::guard_opaque_frame(frame.buffer_mut());
 }
 
 /// Number of terminal rows `text` occupies when word-wrapped at `width`
@@ -2041,6 +1971,106 @@ fn render_toasts_from_snap(frame: &mut ratatui::Frame<'_>, toasts: &[super::toas
             if let Some(cell) = frame.buffer_mut().cell_mut((rect.x, y)) {
                 cell.set_symbol("\u{2503}").set_fg(accent).set_bg(surface);
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod opaque_terminal_bg_tests {
+    //! End-to-end through the production frame body: with opaque mode on and
+    //! a detected terminal bg equal to the active theme's canvas, no painted
+    //! cell may carry that exact bg. The terminal bg is injected per thread
+    //! (`TestHarness::set_terminal_bg`); the global theme is never replaced.
+    use super::super::testing::TestHarness;
+    use super::super::theme::{background_is_opaque, set_background_opaque, Rgb8, THEME};
+    use ratatui::buffer::Buffer;
+    use ratatui::style::Color;
+    use serial_test::serial;
+
+    fn rgb(c: Color) -> Option<Rgb8> {
+        match c {
+            Color::Rgb(r, g, b) => Some((r, g, b)),
+            _ => None,
+        }
+    }
+
+    fn frame(h: &mut TestHarness) -> Buffer {
+        h.push_user_message("hello")
+            .push_text_message("some `code` and text");
+        h.render().clone()
+    }
+
+    fn count_bg(buf: &Buffer, c: Rgb8) -> usize {
+        let c = Color::Rgb(c.0, c.1, c.2);
+        buf.content.iter().filter(|cell| cell.bg == c).count()
+    }
+
+    /// The bug: opaque + terminal bg == theme canvas/chrome ⇒ see-through.
+    #[test]
+    #[serial]
+    fn opaque_never_paints_the_detected_terminal_bg() {
+        let prior = background_is_opaque();
+        set_background_opaque(true);
+        let theme = THEME.load_full();
+        for target in [theme.bg, theme.message_background()] {
+            let Some(target) = rgb(target) else { continue };
+            let mut h = TestHarness::boot_with_size(80, 24);
+            let unguarded = frame(&mut h);
+            assert!(
+                count_bg(&unguarded, target) > 0,
+                "fixture: the frame must paint {target:?} before the guard"
+            );
+            let mut h = TestHarness::boot_with_size(80, 24);
+            h.set_terminal_bg(Some(target));
+            let guarded = frame(&mut h);
+            assert_eq!(
+                count_bg(&guarded, target),
+                0,
+                "opaque frame still paints the terminal default bg {target:?}"
+            );
+            // Glyphs and fg are untouched; only the matching bgs moved.
+            for (a, b) in unguarded.content.iter().zip(guarded.content.iter()) {
+                assert_eq!(a.symbol(), b.symbol());
+                assert_eq!(a.fg, b.fg);
+            }
+        }
+        set_background_opaque(prior);
+    }
+
+    /// Invisible mode: see-through is intended, the frame is byte-identical.
+    #[test]
+    #[serial]
+    fn invisible_is_unchanged_by_a_detected_terminal_bg() {
+        let prior = background_is_opaque();
+        set_background_opaque(false);
+        let Some(target) = rgb(THEME.load().bg) else {
+            set_background_opaque(prior);
+            return;
+        };
+        let mut h = TestHarness::boot_with_size(80, 24);
+        let before = frame(&mut h);
+        let mut h = TestHarness::boot_with_size(80, 24);
+        h.set_terminal_bg(Some(target));
+        let after = frame(&mut h);
+        set_background_opaque(prior);
+        assert_eq!(before, after, "invisible mode must not be steered");
+    }
+
+    /// Unknown terminal bg (no OSC 11 reply / timeout): opaque frame unchanged.
+    #[test]
+    #[serial]
+    fn unknown_terminal_bg_leaves_the_opaque_frame_unchanged() {
+        let prior = background_is_opaque();
+        set_background_opaque(true);
+        let mut h = TestHarness::boot_with_size(80, 24);
+        let baseline = frame(&mut h);
+        let mut h = TestHarness::boot_with_size(80, 24);
+        h.set_terminal_bg(None);
+        let unknown = frame(&mut h);
+        set_background_opaque(prior);
+        assert_eq!(baseline, unknown);
+        if let Some(bg) = rgb(THEME.load().bg) {
+            assert!(count_bg(&unknown, bg) > 0, "theme bg still painted as-is");
         }
     }
 }

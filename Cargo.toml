@@ -10,7 +10,7 @@ homepage = "https://github.com/HaseebKhalid1507/SynapsCLI"
 keywords = ["ai", "agent", "terminal", "cli", "rust"]
 categories = ["command-line-utilities", "development-tools"]
 exclude = [".github/", "docs/", "tests/fixtures/", "examples/"]
-rust-version = "1.80"
+rust-version = "1.88"
 
 [features]
 # Default build is unchanged (command execution enabled).
@@ -140,12 +140,12 @@ members = ["crates/agent-core", "crates/agent-engine", "crates/agent-tui"]
 resolver = "2"
 
 [workspace.package]
-version = "0.10.2"
+version = "0.11.0"
 
 [workspace.dependencies]
-agent-core   = { path = "crates/agent-core",   version = "0.10.2", package = "synaps-core" }
+agent-core   = { path = "crates/agent-core",   version = "0.11.0", package = "synaps-core" }
 # default-features = false: the hardened gate. The root `synaps` package re-enables
 # `command-exec` through its own default feature; `--no-default-features` drops it
 # for EVERY member (workspace inheritance cannot re-enable defaults per member).
-agent-engine = { path = "crates/agent-engine", version = "0.10.2", package = "synaps-engine", default-features = false }
-agent-tui    = { path = "crates/agent-tui",    version = "0.10.2", package = "synaps-tui" }
+agent-engine = { path = "crates/agent-engine", version = "0.11.0", package = "synaps-engine", default-features = false }
+agent-tui    = { path = "crates/agent-tui",    version = "0.11.0", package = "synaps-tui" }

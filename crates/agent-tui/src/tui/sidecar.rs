@@ -292,7 +292,7 @@ pub(crate) fn status(app: &App, plugin_id: Option<&str>, registry: &CommandRegis
     for sidecar in registry
         .sidecars()
         .into_iter()
-        .filter(|s| plugin_id.map_or(true, |p| p == s.plugin_name))
+        .filter(|s| plugin_id.is_none_or(|p| p == s.plugin_name))
     {
         let pid = &sidecar.plugin_name;
         lines.push(if let Some(pending) = app.sidecar_starts.get(pid) {

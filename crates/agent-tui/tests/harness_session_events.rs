@@ -246,6 +246,38 @@ fn session_cleared_resets_transcript() {
     assert!(frame.contains("new session started"), "{frame}");
 }
 
+/// C4: `/clear` zeroed the cost but the footer's context gauge kept the old
+/// session's last-turn percentage.
+#[test]
+fn session_cleared_resets_the_context_gauge() {
+    let mut h = TestHarness::boot_with_size(120, 30);
+    let events: Vec<_> = [
+        turn(TurnTrigger::User, None),
+        W::Stream {
+            event: WireStreamEvent::Session(WireSessionStreamEvent::Usage {
+                input_tokens: 50_000,
+                output_tokens: 10,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+                cache_creation_5m: None,
+                cache_creation_1h: None,
+                model: None,
+            }),
+        },
+        done(),
+    ]
+    .into_iter()
+    .map(Into::into)
+    .collect();
+    h.feed_events(&events);
+    let before = h.snapshot();
+    assert!(before.contains('\u{2591}'), "gauge shown after a turn:\n{before}");
+    h.feed_event(W::Cleared { session_id: "new".into() }.into());
+    let after = h.snapshot();
+    assert!(after.contains("new session started"), "{after}");
+    assert!(!after.contains('\u{2591}'), "gauge reset by /clear:\n{after}");
+}
+
 #[test]
 fn session_compaction_lines() {
     let (frame, _) = frame_for(vec![

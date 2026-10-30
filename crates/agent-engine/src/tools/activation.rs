@@ -171,6 +171,76 @@ pub fn carry_forward_enabled() -> bool {
     std::env::var("SYNAPS_TOOLSET_CARRY_FORWARD").as_deref() != Ok("0")
 }
 
+/// One exact activation as plain, serializable data: what a session hands
+/// to its next runtime across a daemon reload (`SessionReloadRecord`) or a
+/// park. It carries the PINS the activation was granted against — never a
+/// grant: the next runtime has a new tool-session id and re-issues a grant
+/// only after [`SessionToolSet::restore_carried`] re-validated the pins
+/// against its own catalog. Untrusted on the way back in (it round-trips
+/// through a file), which is why every field is re-checked, not believed.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CarriedActivation {
+    /// Canonical `ToolId` (`namespace:name`).
+    pub tool_id: String,
+    /// Lowercase hex schema digest pinned at activation time.
+    pub schema_digest: String,
+    /// Trust provenance pinned at activation time.
+    pub provenance: CarriedProvenance,
+}
+
+/// Serializable mirror of [`TrustProvenance`] for [`CarriedActivation`].
+/// Only ever COMPARED with the current catalog record's provenance; never
+/// converted back into a `TrustProvenance`, so wire data cannot mint one.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CarriedProvenance {
+    BuiltinRuntime,
+    ExtensionManifest { extension_id: String },
+    McpConfig { server_id: String },
+    PluginConfig { plugin_id: String },
+    Unverified,
+}
+
+impl From<&TrustProvenance> for CarriedProvenance {
+    fn from(p: &TrustProvenance) -> Self {
+        match p {
+            TrustProvenance::BuiltinRuntime => Self::BuiltinRuntime,
+            TrustProvenance::ExtensionManifest { extension_id } => Self::ExtensionManifest {
+                extension_id: extension_id.clone(),
+            },
+            TrustProvenance::McpConfig { server_id } => Self::McpConfig {
+                server_id: server_id.clone(),
+            },
+            TrustProvenance::PluginConfig { plugin_id } => Self::PluginConfig {
+                plugin_id: plugin_id.clone(),
+            },
+            TrustProvenance::Unverified => Self::Unverified,
+        }
+    }
+}
+
+/// Why a carried activation was not restored.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RestoreDropReason {
+    /// Not in the current catalog (or not a valid `ToolId`).
+    Removed,
+    /// Schema digest, trust provenance or source trust changed.
+    Drifted,
+    /// `tools.activation_confirm = deny` in the restoring runtime.
+    Denied,
+    /// The target set was not built against the current catalog.
+    StaleSet,
+}
+
+/// Outcome of [`SessionToolSet::restore_carried`]: what was restored and
+/// what was dropped (raw id + reason), for logging and the session notice.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RestoreReport {
+    pub restored: Vec<ToolId>,
+    pub dropped: Vec<(String, RestoreDropReason)>,
+}
+
 /// The small configured core set plus exact activated deferred tools for one
 /// session, pinned to the catalog generation it was built against. Core
 /// tools are pinned with the schema digest AND trust provenance of their
@@ -318,43 +388,10 @@ impl SessionToolSet {
         let mut dropped = Vec::new();
         for old in self.activated.values() {
             let id = old.grant().tool_id().clone();
-            match catalog.get(&id) {
-                // Promoted to core by the new catalog — nothing to carry.
-                Some(_) if next.core.contains_key(&id) => {}
-                // Same checks a re-activation runs (`activate_many`): pinned
-                // digest + provenance unchanged AND the record's source still
-                // agrees with its provenance (`check_source_trust`). A record
-                // whose source drifted under a stable provenance is dropped
-                // as `Drifted` rather than carried into the schema.
-                Some(rec)
-                    if rec.schema_digest() == old.schema_digest()
-                        && rec.provenance() == old.provenance()
-                        && check_source_trust(rec).is_ok() =>
-                {
-                    let grant = SessionActivationGrant::new(
-                        self.session.as_str(),
-                        id.clone(),
-                        catalog.generation(),
-                        rec.schema_digest().clone(),
-                    )
-                    .expect("session id was valid when the set was built");
-                    next.activated.insert(
-                        id,
-                        ActivatedTool {
-                            grant,
-                            provenance: rec.provenance().clone(),
-                            lease: RuntimeLease::NotAcquired,
-                        },
-                    );
-                }
-                Some(_) => dropped.push(DroppedActivation {
-                    id,
-                    reason: DropReason::Drifted,
-                }),
-                None => dropped.push(DroppedActivation {
-                    id,
-                    reason: DropReason::Removed,
-                }),
+            if let Err(reason) = next.admit_pinned(&id, catalog, |rec| {
+                rec.schema_digest() == old.schema_digest() && rec.provenance() == old.provenance()
+            }) {
+                dropped.push(DroppedActivation { id, reason });
             }
         }
         // Session schema-generation is bookkeeping for "activation batches
@@ -362,6 +399,136 @@ impl SessionToolSet {
         // anything was dropped (the exposed schema changed).
         next.schema_generation = self.schema_generation + u64::from(!dropped.is_empty());
         (next, dropped)
+    }
+
+    /// Admit one prior activation of THIS session into this set against
+    /// `catalog` — the single check shared by turn-to-turn carrying
+    /// ([`Self::carry_activations_into`]) and cross-image restore
+    /// ([`Self::restore_carried`]), so the two can never drift:
+    ///
+    /// - uncataloged → `Removed`;
+    /// - already core → `Ok` (still on the wire, nothing to record);
+    /// - `pin_matches(record)` (the pinned schema digest AND trust
+    ///   provenance are unchanged) AND the record's source still agrees with
+    ///   its provenance (`check_source_trust`, as `activate_many`) → a grant
+    ///   at the CURRENT catalog generation is recorded;
+    /// - anything else → `Drifted`, never silently re-granted.
+    ///
+    /// Already-activated ids are left as they are (`Ok`). Does not touch the
+    /// schema-generation counter; callers own that bookkeeping.
+    fn admit_pinned(
+        &mut self,
+        id: &ToolId,
+        catalog: &ToolCatalog,
+        pin_matches: impl FnOnce(&CapabilityRecord) -> bool,
+    ) -> Result<(), DropReason> {
+        let Some(rec) = catalog.get(id) else {
+            return Err(DropReason::Removed);
+        };
+        if self.core.contains_key(id) || self.activated.contains_key(id) {
+            return Ok(());
+        }
+        if !(pin_matches(rec) && check_source_trust(rec).is_ok()) {
+            return Err(DropReason::Drifted);
+        }
+        let grant = SessionActivationGrant::new(
+            self.session.as_str(),
+            id.clone(),
+            catalog.generation(),
+            rec.schema_digest().clone(),
+        )
+        .expect("session id was valid when the set was built");
+        self.activated.insert(
+            id.clone(),
+            ActivatedTool {
+                grant,
+                provenance: rec.provenance().clone(),
+                lease: RuntimeLease::NotAcquired,
+            },
+        );
+        Ok(())
+    }
+
+    /// This session's exact activations as plain data, in `ToolId` order —
+    /// what a daemon reload or a park hands to the session's next runtime
+    /// (see [`CarriedActivation`]). Core tools are not included: the next
+    /// runtime re-derives its core from its own catalog.
+    pub fn carried_activations(&self) -> Vec<CarriedActivation> {
+        self.activated
+            .values()
+            .map(|a| CarriedActivation {
+                tool_id: a.grant().tool_id().as_str().to_string(),
+                schema_digest: a.schema_digest().as_hex().to_string(),
+                provenance: CarriedProvenance::from(a.provenance()),
+            })
+            .collect()
+    }
+
+    /// Restore activations this SAME conversation held in a previous
+    /// runtime (a daemon reload's previous image, or the runtime a park
+    /// dropped) into this set, which must be freshly built against
+    /// `catalog` for the new runtime's tool session.
+    ///
+    /// This continues grants the session already had; it is not a new
+    /// grant. Each entry is re-validated against the CURRENT catalog with
+    /// exactly the pins [`ToolRegistry::session_tools_schema`] and the
+    /// execution gate check — schema digest AND trust provenance — plus
+    /// source trust; an entry that is unparsable, uncataloged, or drifted
+    /// is dropped fail-closed and reported, never re-granted. Restored
+    /// grants are issued for THIS set's session at the current generation,
+    /// so the execution gate authorizes them like any other activation.
+    ///
+    /// Activation policy (`tools.activation_confirm`) is the caller's
+    /// decision (see `runtime::stream::restore_pending_activations`).
+    /// Advances the schema-generation counter by one iff anything was
+    /// restored (one batch), like `activate_many`.
+    pub fn restore_carried(
+        &mut self,
+        carried: &[CarriedActivation],
+        catalog: &ToolCatalog,
+    ) -> RestoreReport {
+        let mut report = RestoreReport::default();
+        if self.catalog_generation != catalog.generation() {
+            // A stale snapshot cannot take grants (as `validate_grant`):
+            // the caller rebuilds against `catalog` first.
+            report.dropped = carried
+                .iter()
+                .map(|c| (c.tool_id.clone(), RestoreDropReason::StaleSet))
+                .collect();
+            return report;
+        }
+        for c in carried {
+            let Ok(id) = ToolId::parse(&c.tool_id) else {
+                report
+                    .dropped
+                    .push((c.tool_id.clone(), RestoreDropReason::Removed));
+                continue;
+            };
+            let was_new = !self.core.contains_key(&id) && !self.activated.contains_key(&id);
+            match self.admit_pinned(&id, catalog, |rec| {
+                rec.schema_digest().as_hex() == c.schema_digest
+                    && CarriedProvenance::from(rec.provenance()) == c.provenance
+            }) {
+                Ok(()) if was_new && self.activated.contains_key(&id) => {
+                    report.restored.push(id);
+                }
+                Ok(()) => {}
+                Err(DropReason::Removed) => {
+                    report
+                        .dropped
+                        .push((c.tool_id.clone(), RestoreDropReason::Removed));
+                }
+                Err(DropReason::Drifted) => {
+                    report
+                        .dropped
+                        .push((c.tool_id.clone(), RestoreDropReason::Drifted));
+                }
+            }
+        }
+        if !report.restored.is_empty() {
+            self.schema_generation += 1;
+        }
+        report
     }
 
     /// Typed EXACT revocation (Task 19 grant invalidation): remove one
@@ -1020,6 +1187,14 @@ pub type SharedSessionToolSet = Arc<std::sync::RwLock<SessionToolSet>>;
 /// zero-activation one. Shared by `Runtime` clones exactly like
 /// `host_tool_session`; empty until the first progressive turn.
 pub type RetainedSessionToolSet = Arc<std::sync::Mutex<Option<SharedSessionToolSet>>>;
+
+/// Activations a runtime was handed from the same conversation's previous
+/// runtime (daemon reload, unpark) and has not applied yet. Consumed by the
+/// first progressive turn start (or projected read-only by a keep-warm
+/// ping before it), against THAT moment's catalog — as late as possible, so
+/// tools registered after the runtime was built are seen. Shared by
+/// `Runtime` clones exactly like [`RetainedSessionToolSet`].
+pub type PendingToolRestore = Arc<std::sync::Mutex<Option<Vec<CarriedActivation>>>>;
 
 /// Typed failure for deterministic bulk activation ([`SessionToolSet::activate_many`]).
 /// Every variant fails the WHOLE batch with zero partial mutation.

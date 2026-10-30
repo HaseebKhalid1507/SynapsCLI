@@ -865,16 +865,21 @@ mod tests {
 
     #[test]
     fn kimi_k3_accepts_exact_efforts_and_rejects_off_medium_xhigh_ultra() {
-        let model = "kimi/kimi-k3";
-        for level in [Adaptive, Low, High, Max] {
-            assert!(
-                validate_reasoning_mutation(model, level).is_ok(),
-                "{model} {level}"
-            );
-        }
-        for level in [Off, Medium, XHigh, Ultra, UltraCode] {
-            let err = validate_reasoning_mutation(model, level).unwrap_err();
-            assert!(err.contains("kimi"), "{err}");
+        for model in [
+            "kimi/kimi-k3",
+            "kimi/kimi-k3.1-pro",
+            "kimi/kimi-k3.1-pro-highspeed",
+        ] {
+            for level in [Adaptive, Low, High, Max] {
+                assert!(
+                    validate_reasoning_mutation(model, level).is_ok(),
+                    "{model} {level}"
+                );
+            }
+            for level in [Off, Medium, XHigh, Ultra, UltraCode] {
+                let err = validate_reasoning_mutation(model, level).unwrap_err();
+                assert!(err.contains("kimi"), "{model}: {err}");
+            }
         }
     }
 
@@ -926,10 +931,17 @@ mod tests {
 
     #[test]
     fn kimi_options_are_exact_per_model() {
-        assert_eq!(
-            thinking_options_for_model("kimi/kimi-k3"),
-            vec!["adaptive", "low", "high", "max"]
-        );
+        for model in [
+            "kimi/kimi-k3",
+            "kimi/kimi-k3.1-pro",
+            "kimi/kimi-k3.1-pro-highspeed",
+        ] {
+            assert_eq!(
+                thinking_options_for_model(model),
+                vec!["adaptive", "low", "high", "max"],
+                "{model}"
+            );
+        }
         for model in ["kimi/kimi-k2.7-code", "kimi/kimi-k2.7-code-highspeed"] {
             assert_eq!(
                 thinking_options_for_model(model),
@@ -952,17 +964,24 @@ mod tests {
 
     #[test]
     fn kimi_reasoning_types_and_default_level() {
-        assert_eq!(reasoning_type_for_model("kimi/kimi-k3"), "effort");
+        for model in [
+            "kimi/kimi-k3",
+            "kimi/kimi-k3.1-pro",
+            "kimi/kimi-k3.1-pro-highspeed",
+        ] {
+            assert_eq!(reasoning_type_for_model(model), "effort", "{model}");
+            assert_eq!(
+                default_level_for_model(model),
+                Some(ReasoningLevel::Max),
+                "{model}"
+            );
+        }
         assert_eq!(reasoning_type_for_model("kimi/kimi-k2.7-code"), "intrinsic");
         assert_eq!(
             reasoning_type_for_model("kimi/kimi-k2.6"),
             "toggle (on/off)"
         );
         assert_eq!(reasoning_type_for_model("kimi/kimi-k9000"), "unknown");
-        assert_eq!(
-            default_level_for_model("kimi/kimi-k3"),
-            Some(ReasoningLevel::Max)
-        );
         assert_eq!(
             default_level_for_model("kimi/kimi-k2.6"),
             Some(ReasoningLevel::Adaptive)

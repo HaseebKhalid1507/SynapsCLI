@@ -1,0 +1,46 @@
+# synaps daemon — keeps your daemon sessions (and pinned ones) running from login/boot.
+# A systemd *user* unit. Pinned sessions come back whenever the daemon starts,
+# so with this unit they come back after a reboot too.
+#
+# Install (as your user, not root):
+#   mkdir -p ~/.config/systemd/user
+#   cp deploy/synaps-daemon.service ~/.config/systemd/user/
+#   # if synaps is not at ~/.cargo/bin/synaps, edit ExecStart
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now synaps-daemon
+#   loginctl enable-linger "$USER"   # start at boot, not only at login
+#
+# Profiles: copy to synaps-daemon@.service and use `--profile %i`.
+#
+# Why these settings:
+# - Type=simple: `synaps daemon --foreground` stays in the foreground and
+#   holds the flock. `synaps daemon reload` re-execs in place (execv, same
+#   PID), so systemd keeps tracking the same main process across a reload.
+# - Restart=on-failure: a crash or SIGKILL brings the daemon back (and with it
+#   every pinned session). `synaps daemon stop` and SIGTERM exit 0, so a
+#   deliberate stop stays stopped (`systemctl --user stop synaps-daemon`).
+# - No --idle-exit: a service-managed daemon should not exit when idle.
+# - If a client already auto-spawned a daemon, this unit's start refuses with
+#   exit 3 ("another daemon holds …"; also SYNAPS_DAEMON=0), which
+#   RestartPreventExitStatus keeps from looping: stop the other one and start
+#   the unit again.
+# - SYNAPS_DAEMON_RESTORE_PINS=0 in Environment= starts it without restoring pins.
+[Unit]
+Description=synaps daemon (sessions; pinned sessions come back on start)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.cargo/bin/synaps daemon start --foreground
+Restart=on-failure
+RestartSec=5
+RestartPreventExitStatus=3
+# Ending sessions saves them; give it the daemon's own shutdown budget.
+TimeoutStopSec=45
+KillMode=mixed
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

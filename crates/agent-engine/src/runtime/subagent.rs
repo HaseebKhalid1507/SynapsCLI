@@ -134,6 +134,11 @@ pub struct SubagentState {
     pub archive_dir: Option<std::path::PathBuf>,
     /// Where the finalizer wrote this worker's resume archive.
     pub archive_path: Option<std::path::PathBuf>,
+    /// Wall-clock start (Unix ms) of the run's last accepted Anthropic
+    /// request, captured when the run ends. `subagent_resume` compares it to
+    /// the worker cache TTL: an expired prefix would be rewritten in full, so
+    /// a large cold history is resumed from a compact context instead.
+    pub cache_anchor_unix_ms: Option<u64>,
     /// Managed workers remain publicly running until their recovery outcome is published.
     pub finalization_started: bool,
     pub finalization_ready: bool,
@@ -150,6 +155,13 @@ pub struct SubagentArchiveMeta {
     pub model: String,
     pub system_prompt: String,
     pub timeout_secs: u64,
+    /// Working directory the worker ran in, so a resume continues there.
+    /// Absent in archives written before it was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<std::path::PathBuf>,
+    /// Canonical worker effort; missing in archives created before this feature.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<String>,
 }
 
 impl SubagentState {
@@ -183,6 +195,7 @@ impl SubagentState {
             archive_meta: None,
             archive_dir: None,
             archive_path: None,
+            cache_anchor_unix_ms: None,
             finalization_started: false,
             finalization_ready: false,
             archive_error: None,
@@ -906,7 +919,7 @@ impl SubagentRegistry {
                 return true;
             }
             let s = h.state.read().unwrap_or_else(|p| p.into_inner());
-            let fresh = s.finished_at.map_or(true, |t| t.elapsed() < FINISHED_HANDLE_TTL);
+            let fresh = s.finished_at.is_none_or(|t| t.elapsed() < FINISHED_HANDLE_TTL);
             fresh && !h.collected && !s.cancel_requested
         })
     }
@@ -981,7 +994,7 @@ impl SubagentRegistry {
                         .read()
                         .unwrap_or_else(|p| p.into_inner())
                         .recovery_pinned()
-                    && h.thread_handle.as_ref().map_or(true, |t| t.is_finished())
+                    && h.thread_handle.as_ref().is_none_or(|t| t.is_finished())
                     && (h.is_collected() || h.finished_elapsed().is_some_and(|d| d >= ttl))
             })
             .map(|(id, h)| (id.clone(), !h.is_collected() && retain_unreconciled(id)))

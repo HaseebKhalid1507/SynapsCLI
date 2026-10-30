@@ -79,6 +79,15 @@ pub(crate) fn parse_inline_md(text: &str, base_style: Style) -> Vec<Span<'static
     spans
 }
 
+/// Plain-text projection of a short markdown snippet for one-line previews
+/// (event cards, the subagent tray): drops code backticks and `**` / `__`
+/// emphasis markers. Unlike [`strip_inline_md`] it never consumes text, so a
+/// preview truncated mid-span (an unclosed backtick) or a lone `*` (math,
+/// globs) still reads correctly.
+pub(crate) fn strip_md_markers(text: &str) -> String {
+    text.replace("**", "").replace("__", "").replace('`', "")
+}
+
 /// Strip inline markdown markers (`**`, `*`, `` ` ``) from text for width calculation.
 /// Returns the visible text without formatting markers.
 fn strip_inline_md(text: &str) -> String {
@@ -681,17 +690,14 @@ pub(crate) fn render_markdown_spans(
             if !lines.is_empty() {
                 lines.push((Line::from(""), LineMeta::Chrome));
             }
-            let full = format!("{}  {}", prefix, heading_text);
-            for wline in wrap_text(&full, width) {
-                lines.push((
-                    Line::from(Span::styled(
-                        wline,
-                        Style::default()
-                            .fg(THEME.load().heading_color)
-                            .add_modifier(Modifier::BOLD),
-                    )),
-                    content_line.clone(),
-                ));
+            let heading_style = Style::default()
+                .fg(THEME.load().heading_color)
+                .add_modifier(Modifier::BOLD);
+            let head = format!("{}  ", prefix);
+            let body = parse_inline_md(heading_text, heading_style);
+            for (l, _) in wrap_styled(&head, heading_style, body, heading_style, width, None, None)
+            {
+                lines.push((l, content_line.clone()));
             }
             continue;
         }
@@ -699,26 +705,30 @@ pub(crate) fn render_markdown_spans(
         // Blockquotes — '>' replaced by the │ glyph: ContentLine.
         if trimmed.starts_with('>') {
             let quote_text = trimmed.strip_prefix('>').unwrap_or("").trim();
-            let full = format!("{}  \u{2502} {}", prefix, quote_text);
-            for wline in wrap_text(&full, width) {
-                lines.push((
-                    Line::from(Span::styled(
-                        wline,
-                        Style::default()
-                            .fg(THEME.load().quote_color)
-                            .add_modifier(Modifier::ITALIC),
-                    )),
-                    content_line.clone(),
-                ));
+            let quote_style = Style::default()
+                .fg(THEME.load().quote_color)
+                .add_modifier(Modifier::ITALIC);
+            let head = format!("{}  \u{2502} ", prefix);
+            let body = parse_inline_md(quote_text, quote_style);
+            let hang = Some(display_width(head.as_str()));
+            for (l, _) in wrap_styled(
+                &head,
+                quote_style,
+                body,
+                quote_style,
+                width,
+                hang,
+                Some((head.as_str(), quote_style)),
+            ) {
+                lines.push((l, content_line.clone()));
             }
             continue;
         }
 
-        // List items — bullet glyph substituted, inline md flattened: ContentLine.
+        // List items — bullet glyph substituted, inline md rendered: ContentLine.
         if trimmed.starts_with("- ") || trimmed.starts_with("* ") {
             let item_text = &trimmed[2..];
             let bullet_prefix = format!("{}  \u{2022} ", prefix);
-            let cont_prefix = format!("{}    ", prefix);
             let flat = format!("{}{}", bullet_prefix, item_text);
             if flat.chars().count() <= width {
                 let bullet_span = Span::styled(
@@ -730,25 +740,19 @@ pub(crate) fn render_markdown_spans(
                 all_spans.append(&mut item_spans);
                 lines.push((Line::from(all_spans), content_line.clone()));
             } else {
-                for (li, wline) in wrap_text(&flat, width).into_iter().enumerate() {
-                    if li == 0 {
-                        let inner = if wline.starts_with(&bullet_prefix) {
-                            &wline[bullet_prefix.len()..]
-                        } else {
-                            &wline
-                        };
-                        let bullet_span = Span::styled(
-                            bullet_prefix.clone(),
-                            Style::default().fg(THEME.load().list_bullet_color),
-                        );
-                        let mut all_spans = vec![bullet_span];
-                        all_spans.extend(parse_inline_md(inner, base_style));
-                        lines.push((Line::from(all_spans), content_line.clone()));
-                    } else {
-                        let mut all_spans = vec![Span::styled(cont_prefix.clone(), base_style)];
-                        all_spans.extend(parse_inline_md(wline.trim_start(), base_style));
-                        lines.push((Line::from(all_spans), content_line.clone()));
-                    }
+                let bullet_style = Style::default().fg(THEME.load().list_bullet_color);
+                let hang = Some(display_width(bullet_prefix.as_str()));
+                let body = parse_inline_md(item_text, base_style);
+                for (l, _) in wrap_styled(
+                    &bullet_prefix,
+                    bullet_style,
+                    body,
+                    base_style,
+                    width,
+                    hang,
+                    None,
+                ) {
+                    lines.push((l, content_line.clone()));
                 }
             }
             continue;
@@ -761,7 +765,6 @@ pub(crate) fn render_markdown_spans(
                 if pos <= 3 && trimmed[..pos].chars().all(|c| c.is_ascii_digit()) {
                     let item_text = &trimmed[pos + 2..];
                     let num_prefix = format!("{}  {}. ", prefix, &trimmed[..pos]);
-                    let cont_prefix = format!("{}     ", prefix);
                     let flat = format!("{}{}", num_prefix, item_text);
                     if flat.chars().count() <= width {
                         let num_span = Span::styled(
@@ -773,26 +776,13 @@ pub(crate) fn render_markdown_spans(
                         all_spans.append(&mut item_spans);
                         lines.push((Line::from(all_spans), content_line.clone()));
                     } else {
-                        for (li, wline) in wrap_text(&flat, width).into_iter().enumerate() {
-                            if li == 0 {
-                                let inner = if wline.starts_with(&num_prefix) {
-                                    &wline[num_prefix.len()..]
-                                } else {
-                                    &wline
-                                };
-                                let num_span = Span::styled(
-                                    num_prefix.clone(),
-                                    Style::default().fg(THEME.load().list_bullet_color),
-                                );
-                                let mut all_spans = vec![num_span];
-                                all_spans.extend(parse_inline_md(inner, base_style));
-                                lines.push((Line::from(all_spans), content_line.clone()));
-                            } else {
-                                let mut all_spans =
-                                    vec![Span::styled(cont_prefix.clone(), base_style)];
-                                all_spans.extend(parse_inline_md(wline.trim_start(), base_style));
-                                lines.push((Line::from(all_spans), content_line.clone()));
-                            }
+                        let num_style = Style::default().fg(THEME.load().list_bullet_color);
+                        let hang = Some(display_width(num_prefix.as_str()));
+                        let body = parse_inline_md(item_text, base_style);
+                        for (l, _) in
+                            wrap_styled(&num_prefix, num_style, body, base_style, width, hang, None)
+                        {
+                            lines.push((l, content_line.clone()));
                         }
                     }
                     continue;
@@ -810,8 +800,6 @@ pub(crate) fn render_markdown_spans(
         // Regular text with inline markdown
         let full_prefix = format!("{}  ", prefix);
         let spans = parse_inline_md(line, base_style);
-        // For simplicity, flatten spans into a string for wrapping, then re-parse
-        // This loses some formatting on wrap boundaries but keeps it simple
         let flat: String = spans.iter().map(|s| s.content.as_ref()).collect();
         // Untransformed prose (no inline-md consumed) is eligible for
         // char-precise Content meta under lock L1; anything parse_inline_md
@@ -842,29 +830,23 @@ pub(crate) fn render_markdown_spans(
             line_spans.extend(spans);
             lines.push((Line::from(line_spans), meta));
         } else {
-            // Wrap and re-parse each wrapped line
-            // wrap_text carries the leading indent forward on continuation lines
-            for row in wrap_text_spans(&full, width) {
-                let wline = &row.text;
-                let (prefix_part, inner) = if wline.starts_with(&full_prefix) {
-                    (full_prefix.clone(), &wline[full_prefix.len()..])
-                } else {
-                    // Continuation line — extract the indent wrap_text added
-                    let indent_len = wline.chars().take_while(|c| *c == ' ').count();
-                    let indent: String = " ".repeat(indent_len);
-                    let rest = &wline[indent.len()..];
-                    (indent, rest)
-                };
-                let parsed = parse_inline_md(inner, base_style);
+            // Wrap the styled spans directly — styles survive row breaks
+            // (wrapping then re-parsing lost them: markers were consumed).
+            for (rendered, row) in wrap_styled(
+                &full_prefix,
+                base_style,
+                spans,
+                base_style,
+                width,
+                None,
+                None,
+            ) {
                 let meta = if untransformed {
-                    // Classify against the text actually pushed (prefix +
-                    // re-parsed fragment), not the wrap output — the L1
+                    // Classify against the text actually pushed — the L1
                     // suffix check must see what renders.
-                    let rendered: String = std::iter::once(prefix_part.as_str())
-                        .chain(parsed.iter().map(|s| s.content.as_ref()))
-                        .collect();
+                    let text: String = rendered.spans.iter().map(|s| s.content.as_ref()).collect();
                     classify_row(
-                        &rendered,
+                        &text,
                         &row,
                         line,
                         line_off,
@@ -875,14 +857,84 @@ pub(crate) fn render_markdown_spans(
                 } else {
                     content_line.clone()
                 };
-                let mut line_spans = vec![Span::styled(prefix_part, base_style)];
-                line_spans.extend(parsed);
-                lines.push((Line::from(line_spans), meta));
+                lines.push((rendered, meta));
             }
         }
     }
 
     lines
+}
+
+/// Wrap `head` (styled `head_style`, leads the first row) followed by
+/// already-parsed inline-md `body` spans to `width`, keeping every span's
+/// style across row breaks.
+///
+/// The concatenated text (`head` + span contents) is wrapped once with
+/// [`wrap_text_spans_hang`]; each row's `src` byte range is then sliced back
+/// against a run map of span start offsets, so a code pill or bold run that
+/// straddles a soft wrap keeps its style on both rows. The returned
+/// [`WrapRow`] is the wrapper's own; without `cont_head` the concatenated
+/// `Line` text equals `row.text` byte-for-byte (continuation indent =
+/// `row.text.len() - src.len()` spaces), so callers classify rows as before.
+///
+/// `cont_head` optionally replaces a continuation row's injected indent with
+/// a same-width styled gutter (blockquote `│`). Rows without provenance (the
+/// tab path, lock L6) fall back to plain text in `base_style`.
+fn wrap_styled(
+    head: &str,
+    head_style: Style,
+    body: Vec<Span<'static>>,
+    base_style: Style,
+    width: usize,
+    hang: Option<usize>,
+    cont_head: Option<(&str, Style)>,
+) -> Vec<(Line<'static>, WrapRow)> {
+    let mut full = String::from(head);
+    let mut runs: Vec<(usize, Style)> = vec![(0, head_style)];
+    for s in &body {
+        if s.content.is_empty() {
+            continue;
+        }
+        runs.push((full.len(), s.style));
+        full.push_str(&s.content);
+    }
+    let run_end = |i: usize| runs.get(i + 1).map_or(full.len(), |r| r.0);
+    wrap_text_spans_hang(&full, width, hang)
+        .into_iter()
+        .map(|row| {
+            let mut spans: Vec<Span<'static>> = Vec::new();
+            match row.src.clone() {
+                Some(r) => {
+                    let indent = row.text.len() - r.len();
+                    if indent > 0 {
+                        match cont_head {
+                            // Same display width as the indent it replaces
+                            // (bytes may differ for the `│` glyph — such rows
+                            // are ContentLine-only transformed views).
+                            Some((h, st)) if display_width(h) == indent => {
+                                spans.push(Span::styled(h.to_string(), st))
+                            }
+                            _ => spans.push(Span::styled(" ".repeat(indent), base_style)),
+                        }
+                    }
+                    for (i, &(start, style)) in runs.iter().enumerate() {
+                        let (a, b) = (start.max(r.start), run_end(i).min(r.end));
+                        if a < b {
+                            spans.push(Span::styled(full[a..b].to_string(), style));
+                        }
+                    }
+                }
+                None => match row.text.strip_prefix(head) {
+                    Some(rest) if !head.is_empty() => {
+                        spans.push(Span::styled(head.to_string(), head_style));
+                        spans.push(Span::styled(rest.to_string(), base_style));
+                    }
+                    _ => spans.push(Span::styled(row.text.clone(), base_style)),
+                },
+            }
+            (Line::from(spans), row)
+        })
+        .collect()
 }
 
 /// Tab width used to expand `\t` characters before wrapping.
@@ -950,6 +1002,14 @@ pub(crate) struct WrapRow {
 /// the expanded text IS the raw input, so cursor positions in the loop are
 /// raw byte offsets directly.
 pub(crate) fn wrap_text_spans(raw_text: &str, width: usize) -> Vec<WrapRow> {
+    wrap_text_spans_hang(raw_text, width, None)
+}
+
+/// [`wrap_text_spans`] with an optional explicit continuation indent
+/// (`hang`, display columns) — used for hanging list/quote bodies so
+/// continuation rows align under the item text instead of the leading
+/// whitespace. Tab inputs ignore `hang` (the tab anchor wins, as before).
+fn wrap_text_spans_hang(raw_text: &str, width: usize, hang: Option<usize>) -> Vec<WrapRow> {
     let (text, tab_anchor) = expand_tabs_with_anchor(raw_text);
     // `tab_anchor` is Some iff the input contained a tab — the eligibility
     // gate for byte-range provenance (L6). Tab-free ⇒ text == raw_text.
@@ -977,7 +1037,12 @@ pub(crate) fn wrap_text_spans(raw_text: &str, width: usize) -> Vec<WrapRow> {
         // of body width, fall back to the leading indent. Prevents pathological
         // narrow-pane cases from starving content to a few chars per row.
         Some(a) if a + 16 <= width => a,
-        _ => leading_indent,
+        Some(_) => leading_indent,
+        None => match hang {
+            // Same starvation guard as the tab anchor.
+            Some(h) if h + 16 <= width => h,
+            _ => leading_indent,
+        },
     };
     let indent: String = " ".repeat(cont_indent_len);
     let wrap_width = width.saturating_sub(cont_indent_len);
@@ -1253,6 +1318,15 @@ mod tests {
             "Era span is not bold: {:?}",
             era_span.style
         );
+    }
+
+    #[test]
+    fn strip_md_markers_keeps_text_and_lone_stars() {
+        assert_eq!(
+            strip_md_markers("There is no `crates/` dir (`/a/b`), **0** `.rs` files"),
+            "There is no crates/ dir (/a/b), 0 .rs files"
+        );
+        assert_eq!(strip_md_markers("2 * 3 and `unclosed tail"), "2 * 3 and unclosed tail");
     }
 
     #[test]
@@ -1581,5 +1655,112 @@ mod tests {
             "early return must yield expanded text"
         );
         assert_eq!(rows[0].src, None);
+    }
+
+    // ── T1: inline formatting survives soft wraps ──────────────────────────
+
+    /// (text, style) per cell-run of every rendered row, for style probes.
+    fn styled_rows(lines: &[(Line<'static>, LineMeta)]) -> Vec<Vec<(String, Style)>> {
+        lines
+            .iter()
+            .map(|(l, _)| {
+                l.spans
+                    .iter()
+                    .map(|s| (s.content.to_string(), s.style))
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn assert_inline_styles_survive(rows: &[Vec<(String, Style)>], width: usize, ctx: &str) {
+        let t = THEME.load();
+        let all: String = rows.iter().flatten().map(|(t, _)| t.as_str()).collect();
+        assert!(
+            !all.contains('`') && !all.contains("**"),
+            "{ctx} w={width}: markers leaked: {all:?}"
+        );
+        // Every visible char of the code word is in a code-styled span, and
+        // every char of the bold words is BOLD — on whichever row it landed.
+        let mut code_chars = String::new();
+        let mut bold_chars = String::new();
+        for (text, style) in rows.iter().flatten() {
+            if style.fg == Some(t.code_fg) && style.bg == Some(t.code_bg) {
+                code_chars.push_str(text.trim());
+            }
+            if style.add_modifier.contains(Modifier::BOLD) {
+                bold_chars.push_str(&text.replace(' ', ""));
+            }
+        }
+        assert_eq!(
+            code_chars, "render_markdown_spans",
+            "{ctx} w={width}: code pill lost: {rows:?}"
+        );
+        assert_eq!(
+            bold_chars, "mustsurvivewrapping",
+            "{ctx} w={width}: bold lost: {rows:?}"
+        );
+        for row in rows {
+            let w: usize = row.iter().map(|(t, _)| display_width(t.as_str())).sum();
+            assert!(w <= width, "{ctx} w={width}: row overflows ({w}): {row:?}");
+        }
+    }
+
+    #[test]
+    fn wrapped_paragraph_keeps_code_and_bold_styles() {
+        let src = "This paragraph is deliberately long so it wraps: it calls \
+                   `render_markdown_spans` and the words **must survive wrapping** \
+                   regardless of where the soft break lands in the row.";
+        for width in [30usize, 40, 52, 61, 77] {
+            let lines = render_markdown_spans(src, "  ", width, 0);
+            assert!(lines.len() > 1, "w={width} should wrap");
+            assert_inline_styles_survive(&styled_rows(&lines), width, "paragraph");
+        }
+    }
+
+    #[test]
+    fn wrapped_list_item_keeps_code_and_bold_styles() {
+        let src = "- A list item that is long enough to wrap, mentioning \
+                   `render_markdown_spans` and **must survive wrapping** too, ok.";
+        for width in [30usize, 40, 52, 61] {
+            let lines = render_markdown_spans(src, "  ", width, 0);
+            assert!(lines.len() > 1, "w={width} should wrap");
+            assert_inline_styles_survive(&styled_rows(&lines), width, "list");
+        }
+    }
+
+    #[test]
+    fn wrapped_blockquote_renders_inline_md_and_keeps_gutter() {
+        let src = "> A quoted remark that is long enough to wrap, mentioning \
+                   `render_markdown_spans` and **must survive wrapping** too.";
+        for width in [34usize, 46, 60] {
+            let lines = render_markdown_spans(src, "  ", width, 0);
+            assert!(lines.len() > 1, "w={width} should wrap");
+            assert_inline_styles_survive(&styled_rows(&lines), width, "quote");
+            for (l, _) in &lines {
+                let text: String = l.spans.iter().map(|s| s.content.as_ref()).collect();
+                assert!(
+                    text.starts_with("    \u{2502} "),
+                    "w={width}: gutter missing: {text:?}"
+                );
+            }
+        }
+    }
+
+    /// L1 lock unchanged: untransformed wrapped prose still classifies rows
+    /// as char-precise Content whose range is the rendered suffix.
+    #[test]
+    fn wrapped_plain_paragraph_rows_stay_content_meta() {
+        let src = "plain prose with no inline markdown that wraps across several rows here";
+        let lines = render_markdown_spans(src, "  ", 24, 0);
+        assert!(lines.len() > 2);
+        for (l, meta) in &lines {
+            let text: String = l.spans.iter().map(|s| s.content.as_ref()).collect();
+            match meta {
+                LineMeta::Content { range, .. } => {
+                    assert!(text.ends_with(&src[range.clone()]), "{text:?} vs {range:?}")
+                }
+                other => panic!("expected Content meta, got {other:?}"),
+            }
+        }
     }
 }

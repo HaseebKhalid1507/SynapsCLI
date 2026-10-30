@@ -88,12 +88,14 @@ struct Cli {
     no_extensions: bool,
 
     /// Run the TUI attached to a daemon session instead of in-process
-    /// (the daemon is started on first use). Optionally a session ID
-    /// (prefix ok); with no live session a new one is created (`--continue`
-    /// continues); --new (alias --create) forces a fresh session even if
-    /// one is live. Modifiers: --observe (read-only), --takeover (steal input),
-    /// --keep-warm (never parked), --new (fresh session); default mode is
-    /// SYNAPS_ATTACH_MODE or mirror (input only if nobody owns it).
+    /// (the daemon is started on first use). Optionally a session ID (prefix
+    /// ok) or name (`--name`); with no live session a new one is created
+    /// (`--continue` continues); --new (alias --create) forces a fresh
+    /// session even if one is live. Every attached client can type (config
+    /// `client_input = shared`, the default). Modifiers: --observe
+    /// (read-only), --takeover (take input under `client_input = exclusive`),
+    /// --keep-warm (never parked), --new (fresh session);
+    /// SYNAPS_ATTACH_MODE=observe|takeover sets the default mode.
     #[arg(long = "attach", value_name = "ID", global = true, num_args = 0..=1)]
     attach: Option<Option<String>>,
 
@@ -101,11 +103,18 @@ struct Cli {
     #[arg(long, global = true, conflicts_with = "takeover")]
     observe: bool,
 
-    /// With --attach: steal input ownership from the current owner (the
-    /// previous owner is told; without it a second client is read-only
-    /// while the owner is attached).
+    /// With --attach: take input ownership from the current owner (the
+    /// previous owner is told). Only matters under `client_input =
+    /// exclusive`; with the default `shared` every client can already type.
     #[arg(long, global = true)]
     takeover: bool,
+
+    /// With --attach: what this client is called in the session (`/clients`,
+    /// `synaps daemon sessions`, "input moved to …"). 1–32 letters, digits,
+    /// `-` or `_`. Default: SYNAPS_CLIENT_NAME, else `tui` (`tui-2`, … when
+    /// taken).
+    #[arg(long = "as", value_name = "NAME", global = true)]
+    client_name: Option<String>,
 
     /// With --attach: pin the session live (never parked).
     #[arg(long = "keep-warm", global = true)]
@@ -285,7 +294,7 @@ enum Command {
         #[arg(long = "profile", value_name = "PROFILE")]
         profile: Option<String>,
     },
-    /// Send an event to the inbox (picked up by running session)
+    /// Send an event to a running session (its socket), or to the shared inbox
     Send {
         /// Message text
         message: String,
@@ -297,12 +306,19 @@ enum Command {
         channel: Option<String>,
         #[arg(long = "content-type", default_value = "message")]
         content_type: String,
-        /// Target a specific session by ID, name, or prefix
+        /// Target a specific session by ID, name, or prefix. A miss, or a
+        /// socket that still refuses after 3 tries, is an error (exit 1,
+        /// nothing delivered) unless --inbox is given
         #[arg(long, value_name = "SESSION")]
         session: Option<String>,
         /// Send to all active sessions
         #[arg(long)]
         broadcast: bool,
+        /// With --session: when nothing matches or the socket refuses, leave
+        /// the event in the shared inbox instead of failing. Only a session with an attached input
+        /// owner takes inbox files, exactly once
+        #[arg(long)]
+        inbox: bool,
     },
     /// Generate shell completions (bash, zsh, fish, elvish, powershell)
     Completions {
@@ -404,6 +420,28 @@ enum AuthAction {
         /// Machine-readable JSON
         #[arg(long)]
         json: bool,
+    },
+    /// What the running daemon's broker remembers about each account: its
+    /// cooldown, last usage read, last token refresh and the last automatic
+    /// selection. Memory only: no usage request, no refresh. Without a
+    /// running daemon, lists the accounts with nothing recorded.
+    State {
+        /// Restrict to one OAuth provider (e.g. claude, openai-codex)
+        #[arg(long)]
+        provider: Option<String>,
+        /// Restrict to one account label (or `default`): its state, and only
+        /// the selections that chose it or list it as failed
+        #[arg(long, value_name = "LABEL|default")]
+        account: Option<String>,
+        /// Machine-readable JSON (the report only; notices go to stderr)
+        #[arg(long)]
+        json: bool,
+        /// Drop the matched accounts' in-memory cooldowns, usage readings and
+        /// stickiness in the running daemon first. Never touches credentials.
+        /// With --account, the selection history stays; only a clear without
+        /// --account also drops it.
+        #[arg(long)]
+        clear: bool,
     },
 }
 
@@ -578,9 +616,9 @@ static ADOPTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::n
 
 /// Auto-spawn (jcode model) before the runtime exists: a live daemon or a
 /// freshly spawned one. Runs BEFORE the thin re-exec/diet so a failed spawn
-/// can fall back to the untouched in-process boot. Returns the reason the
-/// TUI should fall back in-process; the line client exits 3 instead.
-fn ensure_daemon(kind: &ThinClient) -> Option<String> {
+/// can fall back to the untouched in-process boot. Returns why the TUI
+/// should fall back in-process; the line client exits 3 instead.
+fn ensure_daemon(kind: &ThinClient) -> Option<InProcessFallback> {
     use agent_engine::daemon::{self, EnsureError, Ensured, EXIT_REFUSED};
     let (profile, line) = match kind {
         ThinClient::Tui { profile } | ThinClient::Adopt { profile } => (profile.clone(), false),
@@ -598,7 +636,7 @@ fn ensure_daemon(kind: &ThinClient) -> Option<String> {
             // boot, quietly. An explicit `--attach` asked for a daemon and
             // must say why there is none.
             if matches!(kind, ThinClient::Adopt { .. }) {
-                return Some("SYNAPS_DAEMON_AUTOSPAWN=0".into());
+                return Some(InProcessFallback { reason: "SYNAPS_DAEMON_AUTOSPAWN=0".into(), quiet: true });
             }
             let msg = cmd::attach::no_daemon_message(opts.profile.as_deref());
             eprintln!("{msg}");
@@ -609,13 +647,22 @@ fn ensure_daemon(kind: &ThinClient) -> Option<String> {
                 eprintln!("synaps attach: daemon unavailable: {reason}");
                 std::process::exit(EXIT_REFUSED);
             }
-            Some(reason)
+            Some(InProcessFallback { reason, quiet: false })
         }
     }
 }
 
+/// [`ensure_daemon`]'s answer when the TUI runs in-process instead.
+struct InProcessFallback {
+    reason: String,
+    /// The user chose in-process (`SYNAPS_DAEMON_AUTOSPAWN=0` with no daemon
+    /// running): no "daemon unavailable" notice on every boot.
+    quiet: bool,
+}
+
 /// Our jemalloc boot conf for the re-exec'd thin client (`SYNAPS_CLIENT_MALLOC_CONF`
 /// overrides). `narenas` is boot-only — the one knob a mallctl cannot set.
+#[cfg(target_os = "linux")]
 const THIN_MALLOC_CONF: &str = "narenas:1,background_thread:false,dirty_decay_ms:0,muzzy_decay_ms:0";
 
 /// Set by `main` when the daemon could not be started: `--attach` runs the
@@ -715,9 +762,11 @@ fn main() -> anyhow::Result<()> {
                 }
                 thin = true;
             }
-            Some(reason) => {
-                eprintln!("daemon unavailable: {reason} — running in-process");
-                tui::push_boot_notice(format!("daemon unavailable: {reason} — running in-process"));
+            Some(InProcessFallback { reason, quiet }) => {
+                if !quiet {
+                    eprintln!("daemon unavailable: {reason} — running in-process");
+                    tui::push_boot_notice(format!("daemon unavailable: {reason} — running in-process"));
+                }
                 std::env::set_var(ATTACH_FALLBACK, "1");
             }
         }
@@ -803,6 +852,7 @@ async fn async_main() -> anyhow::Result<()> {
                     keep_warm: cli.keep_warm,
                     new_session: cli.new_session,
                     name: cli.session_name,
+                    client_name: cli.client_name,
                     adopted: ADOPTED.load(std::sync::atomic::Ordering::SeqCst),
                 })
                 .await?;
@@ -905,6 +955,22 @@ async fn async_main() -> anyhow::Result<()> {
             })
             .await
             .map_err(anyhow::Error::msg)?,
+            AuthAction::State {
+                provider,
+                account,
+                json,
+                clear,
+            } => cmd::auth_accounts::state(
+                cli.profile,
+                cmd::auth_accounts::StateOptions {
+                    provider,
+                    account,
+                    json,
+                    clear,
+                },
+            )
+            .await
+            .map_err(anyhow::Error::msg)?,
         },
         Some(Command::Status {
             memory,
@@ -977,7 +1043,7 @@ async fn async_main() -> anyhow::Result<()> {
             cmd::daemon::run(active_profile, args).await?;
         }
         Some(Command::Attach(args)) => {
-            cmd::attach::run(active_profile, args).await?;
+            cmd::attach::run(active_profile, args, cli.client_name).await?;
         }
         Some(Command::Rpc {
             continue_id,
@@ -995,6 +1061,7 @@ async fn async_main() -> anyhow::Result<()> {
             content_type,
             session,
             broadcast,
+            inbox,
         }) => {
             cmd::send::run(
                 message,
@@ -1004,6 +1071,7 @@ async fn async_main() -> anyhow::Result<()> {
                 content_type,
                 session,
                 broadcast,
+                inbox,
             )
             .await?;
         }

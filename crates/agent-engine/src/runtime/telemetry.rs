@@ -4,8 +4,17 @@
 //! Writes one JSON record per API call to `~/.cache/synaps/api-log.jsonl`
 //! (mode 0600, O_NOFOLLOW — same hardening as the legacy usage log).
 //!
-//! `basic` records timing + usage + cost. `full` additionally records
-//! rate-limit headers and cache-diagnostics results when available.
+//! `basic` records timing, usage, an estimated `cost_usd` (from
+//! [`agent_core::pricing`]), the persisted conversation id (`session_id`,
+//! the `~/.synaps-cli/sessions/<id>.json` id) and the request-trace
+//! correlation ids (`runtime_session_id` / `turn_id` / `trace_request_id`),
+//! so a record joins both its session and its `request-trace.jsonl` line.
+//! Worker records also carry the worker's identity (`worker_agent`,
+//! `worker_handle`, `parent_session_id`, `parent_runtime_session_id`).
+//! `full` additionally records rate-limit headers. The `cache_diag` verdict
+//! is present at either level when `cache_diagnostics` is on.
+//!
+//! Optional fields are omitted when unknown — never written as `0`.
 //!
 //! Writes are best-effort and non-blocking: persistence goes through the
 //! bounded background [`writer`] (Task 11, spec §6.5), so a slow or broken
@@ -21,7 +30,7 @@ pub mod writer;
 pub use writer::{
     default_telemetry_log_path, default_trace_log_path, ShutdownOutcome, TelemetryWriter,
     WriteGate, WriterOptions, WriterStats, WriterTraceSink, DEFAULT_MAX_FILE_BYTES,
-    DEFAULT_QUEUE_CAPACITY, DEFAULT_SHUTDOWN_FLUSH_TIMEOUT,
+    DEFAULT_MAX_GENERATIONS, DEFAULT_QUEUE_CAPACITY, DEFAULT_SHUTDOWN_FLUSH_TIMEOUT,
 };
 
 /// Telemetry verbosity level, parsed from the `telemetry` config key.
@@ -55,6 +64,86 @@ impl TelemetryLevel {
     }
 }
 
+/// The parent session's telemetry, handed to the subagents it spawns.
+///
+/// Workers record at the parent's level and enqueue onto the parent's
+/// session writer instead of starting their own: the writer owns its log
+/// files from a single thread, so a writer per worker would race rotation.
+/// See `Runtime::inherit_telemetry`.
+#[derive(Debug, Clone, Default)]
+pub struct WorkerTelemetry {
+    pub level: TelemetryLevel,
+    /// The parent's session writer. `None` when the parent records nothing.
+    pub writer: Option<TelemetryWriter>,
+    /// The parent's persisted conversation id (the
+    /// `~/.synaps-cli/sessions/<id>.json` id), stamped on the worker's
+    /// records as `parent_session_id`. `None` when the parent is unkeyed.
+    pub parent_session_id: Option<String>,
+    /// The parent's runtime trace session id (`session-<pid>-<ms>-<seq>`),
+    /// stamped as `parent_runtime_session_id`.
+    pub parent_runtime_session_id: Option<String>,
+    /// Set per spawn by [`Self::for_worker`]: the agent name.
+    pub agent: Option<String>,
+    /// Set per spawn by [`Self::for_worker`]: the subagent handle (`sa_N`).
+    pub handle: Option<String>,
+}
+
+impl WorkerTelemetry {
+    /// This telemetry, labelled for one spawned worker.
+    pub fn for_worker(mut self, agent: &str, handle: &str) -> Self {
+        self.agent = Some(agent.to_string());
+        self.handle = Some(handle.to_string());
+        self
+    }
+
+    /// The parent's writer, re-stamped for this worker: every record the
+    /// worker enqueues carries its identity and its parent's ids, and NOT
+    /// the parent's own `session_id`.
+    pub fn worker_writer(&self) -> Option<TelemetryWriter> {
+        self.writer.as_ref().map(|w| {
+            w.with_stamp(RecordStamp {
+                session_id: None,
+                worker_agent: self.agent.clone(),
+                worker_handle: self.handle.clone(),
+                parent_session_id: self.parent_session_id.clone(),
+                parent_runtime_session_id: self.parent_runtime_session_id.clone(),
+            })
+        })
+    }
+}
+
+/// Identity fields a [`TelemetryWriter`] handle stamps onto every record
+/// enqueued through it: the persisted conversation id of the session (see
+/// `Runtime::request_telemetry`) and, on worker handles, who the worker is
+/// (see [`WorkerTelemetry::worker_writer`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RecordStamp {
+    pub session_id: Option<String>,
+    pub worker_agent: Option<String>,
+    pub worker_handle: Option<String>,
+    pub parent_session_id: Option<String>,
+    pub parent_runtime_session_id: Option<String>,
+}
+
+impl RecordStamp {
+    /// Fill the fields a record does not already carry.
+    pub fn apply(&self, record: &mut TelemetryRecord) {
+        fn fill(slot: &mut Option<String>, value: &Option<String>) {
+            if slot.is_none() {
+                slot.clone_from(value);
+            }
+        }
+        fill(&mut record.session_id, &self.session_id);
+        fill(&mut record.worker_agent, &self.worker_agent);
+        fill(&mut record.worker_handle, &self.worker_handle);
+        fill(&mut record.parent_session_id, &self.parent_session_id);
+        fill(
+            &mut record.parent_runtime_session_id,
+            &self.parent_runtime_session_id,
+        );
+    }
+}
+
 /// Token usage for one API call, including the cache-creation TTL breakdown.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct UsageRecord {
@@ -73,6 +162,24 @@ pub struct UsageRecord {
 }
 
 impl UsageRecord {
+    /// Estimated USD cost via [`agent_core::pricing`] (the single pricing
+    /// source), billing 5m and 1h cache writes at their own rates. `None`
+    /// when no usage was reported (all counts zero) — unknown, not free.
+    pub fn cost_usd(&self, model: &str) -> Option<f64> {
+        if self.input == 0 && self.output == 0 && self.cache_read == 0 && self.cache_write == 0 {
+            return None;
+        }
+        Some(agent_core::pricing::calculate_cost_optional_split(
+            model,
+            self.input,
+            self.output,
+            self.cache_read,
+            self.cache_write,
+            self.cache_write_5m,
+            self.cache_write_1h,
+        ))
+    }
+
     pub fn compute_hit_pct(&mut self) {
         let total = self.input + self.cache_read + self.cache_write;
         self.hit_pct = if total > 0 {
@@ -153,7 +260,9 @@ pub struct TelemetryRecord {
     /// Number of refusal retries consumed (0 = no refusals). Present only when > 0.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub refusal_retries_used: Option<u32>,
-    /// Milliseconds from request send to first SSE byte.
+    /// Milliseconds from request send to the first parsed model event — the
+    /// request trace's `outcome.timings.first_model_event_ms`. Absent when no
+    /// event arrived, never `0`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ttft_ms: Option<u64>,
     /// Milliseconds from request send to stream close.
@@ -161,6 +270,10 @@ pub struct TelemetryRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop_reason: Option<String>,
     pub usage: UsageRecord,
+    /// Estimated USD cost of this call at API list prices
+    /// ([`UsageRecord::cost_usd`]), also for OAuth/subscription auth.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ratelimit: Option<RateLimitRecord>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -170,9 +283,66 @@ pub struct TelemetryRecord {
     /// can separate pings from real turns. Absent on every turn record.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub keepwarm: bool,
+    /// `true` when a subagent (worker runtime) made the request, so reports
+    /// can split delegated traffic from the foreground session. Absent on
+    /// foreground and internal records.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub worker: bool,
+    /// Persisted conversation id (`20261028-045932-eb8e`): the id of
+    /// `~/.synaps-cli/sessions/<id>.json` and `synaps daemon sessions`.
+    /// Absent for unkeyed runtimes (workers, tests).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    /// Runtime trace session id (`session-<pid>-<ms>-<seq>`): the `session_id` of
+    /// this call's `request-trace.jsonl` record. Not the persisted id.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_session_id: Option<String>,
+    /// Request-trace turn id (`turn-<pid>-<n>`). Despite the name it is
+    /// minted per logical request (same counter as `trace_request_id`), not
+    /// per user turn.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+    /// Request-trace request id (`req-<pid>-<n>`), shared by every attempt
+    /// of one logical request. Not the provider's `request_id`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trace_request_id: Option<String>,
+    /// Worker records: the agent name (`spike`), or for an inline subagent
+    /// its sanitized label (model-chosen text, `[A-Za-z0-9_-]`, bounded).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker_agent: Option<String>,
+    /// Worker records: the subagent handle (`sa_N`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker_handle: Option<String>,
+    /// Worker records: the spawning session's persisted `session_id`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_session_id: Option<String>,
+    /// Worker records: the spawning session's `runtime_session_id`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_runtime_session_id: Option<String>,
 }
 
 impl TelemetryRecord {
+    /// Fill `runtime_session_id` / `turn_id` / `trace_request_id` from the
+    /// request trace's correlation ids. Without a tracer, `session` alone
+    /// still names the runtime session.
+    pub fn set_correlation(
+        &mut self,
+        session: &crate::runtime::trace::TraceId,
+        ids: Option<(
+            &crate::runtime::trace::TraceId,
+            &crate::runtime::trace::TraceId,
+            &crate::runtime::trace::TraceId,
+        )>,
+    ) {
+        let (session, turn, request) = match ids {
+            Some((s, t, r)) => (s, Some(t), Some(r)),
+            None => (session, None, None),
+        };
+        self.runtime_session_id = Some(session.as_str().to_string());
+        self.turn_id = turn.map(|t| t.as_str().to_string());
+        self.trace_request_id = request.map(|r| r.as_str().to_string());
+    }
+
     pub fn now_ms() -> u64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -346,6 +516,7 @@ mod tests {
         assert!(!json.contains("ratelimit"));
         assert!(!json.contains("cache_diag"));
         assert!(!json.contains("keepwarm"), "turn records carry no keepwarm field");
+        assert!(!json.contains("worker"), "foreground records carry no worker field");
         assert!(json.contains("\"model\":\"claude-sonnet-4-6\""));
     }
 
@@ -359,6 +530,18 @@ mod tests {
         };
         let json = serde_json::to_string(&record).unwrap();
         assert!(json.contains("\"keepwarm\":true"), "{json}");
+    }
+
+    #[test]
+    fn worker_record_is_marked() {
+        let record = TelemetryRecord {
+            ts: 1,
+            model: "claude-opus-5-5".to_string(),
+            worker: true,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&record).unwrap();
+        assert!(json.contains("\"worker\":true"), "{json}");
     }
 
     #[test]

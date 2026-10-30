@@ -19,6 +19,7 @@ mod axel_context;
 #[cfg(test)]
 mod body_golden;
 pub mod budget;
+mod cache_diagnosis;
 pub mod capture_worker;
 pub mod chat_capture;
 pub(crate) mod cloud_invoke;
@@ -34,9 +35,11 @@ mod image_retention;
 pub mod keepwarm;
 pub mod memory_context;
 pub mod memory_history;
+pub mod message_time;
 pub mod openai;
 pub mod relay;
 mod request;
+mod request_encoding;
 mod sse;
 mod sse_types;
 mod stream;
@@ -573,6 +576,9 @@ pub struct Runtime {
     refusal_retries: u32,
     /// Telemetry level for structured per-request API logging (opt-in).
     telemetry_level: crate::runtime::telemetry::TelemetryLevel,
+    /// Rotated generations kept per log (`telemetry_log_generations`), read
+    /// when the session writer starts.
+    telemetry_log_generations: u32,
     /// Session-shared bounded observability writer (Task 11, spec §6.5).
     /// `Some` iff `telemetry_level` is Basic/Full. Cloned runtimes
     /// (subagents) share the same handle — one worker per session, never
@@ -661,6 +667,10 @@ pub struct Runtime {
     /// Prompt-cache TTL strategy (5m default | 1h | hybrid). Threaded into
     /// every request via `ApiOptions`.
     cache_ttl: crate::core::config::CacheTtl,
+    /// gzip policy for Anthropic request bodies (`request_compression`,
+    /// `request_compression_level`). Threaded into every request via
+    /// `ApiOptions`; its refusal latch is process-wide.
+    request_compression: request_encoding::RequestCompression,
     /// One-time-per-session latch for the silent 1h-downgrade notice
     /// (spec §3.4.1). Shared into `ApiOptions` for every request.
     ttl_downgrade_notified: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -672,11 +682,13 @@ pub struct Runtime {
     /// request accepted (task #444 keep-warm scheduling). Fresh per clone,
     /// shared by `share_ttl_latches`, like the TTL latches above.
     cache_anchor: std::sync::Arc<keepwarm::CacheAnchorCell>,
-    /// Last Anthropic message id (`msg_...`) — threaded into the next
-    /// request's `diagnostics.previous_message_id` when diagnostics is on.
-    /// Reserved for the cache-diagnosis beta wiring (handoff item).
-    #[allow(dead_code)]
+    /// Last foreground Anthropic message id (`msg_...`) — threaded into the
+    /// next request's `diagnostics.previous_message_id` when diagnostics is
+    /// on. Fresh per clone, shared by `share_ttl_latches`.
     last_msg_id: Arc<Mutex<Option<String>>>,
+    /// Set once the API rejected cache diagnostics: off for the session.
+    /// Shared across `Clone` (subagents never re-probe a rejecting API).
+    cache_diag_rejected: Arc<std::sync::atomic::AtomicBool>,
     session_manager: std::sync::Arc<crate::tools::shell::SessionManager>,
     /// Extension hook bus for dispatching events to extensions.
     hook_bus: Arc<crate::extensions::hooks::HookBus>,
@@ -738,6 +750,12 @@ pub struct Runtime {
     /// Per-turn budget (Task 23, spec §8.1). Resolved from role + typed
     /// config at boot; every stream turn is metered against it.
     turn_budget: crate::runtime::budget::TurnBudget,
+    /// Set while an event-started turn's stream starts (like the event
+    /// budget in `turn_budget`): the owner's steer moves that stream onto
+    /// the session budget. `None` for every other stream.
+    owner_steer_budget: Option<Arc<crate::runtime::budget::OwnerSteerBudget>>,
+    /// Source of the per-message `_synaps_at` times (see `message_time`).
+    message_clock: crate::runtime::message_time::MessageClock,
     /// Private runtime-scoped tool-session identity (Task 16). Scopes the
     /// per-stream `SessionToolSet` the execution gate authorizes against.
     /// Minted fresh per constructed `Runtime` — two independently
@@ -755,6 +773,10 @@ pub struct Runtime {
     /// turns (exact activations are session-scoped). Minted empty with the
     /// runtime and shared by `Clone`, exactly like `host_tool_session`.
     retained_tool_set: crate::tools::activation::RetainedSessionToolSet,
+    /// Activations carried over from this conversation's previous runtime
+    /// (daemon reload, unpark), restored at the first progressive turn
+    /// start. Shared by `Clone` like `retained_tool_set`.
+    pending_tool_restore: crate::tools::activation::PendingToolRestore,
     /// Conversation/session identity this runtime serves. Keys the
     /// `on_session_start` hook injection (Phase 2 keys everything).
     /// `None` = unkeyed (workers, tests) — reads no injection.
@@ -1249,6 +1271,7 @@ impl Runtime {
             api_retries: 3,
             refusal_retries: 2,
             telemetry_level: crate::runtime::telemetry::TelemetryLevel::Off,
+            telemetry_log_generations: crate::runtime::telemetry::DEFAULT_MAX_GENERATIONS,
             telemetry_writer: None,
             trace_ctx: trace::TraceContext::disabled(),
             trace_controls: std::sync::Arc::new(trace::TraceControls::new()),
@@ -1272,10 +1295,12 @@ impl Runtime {
             capture_dir: host.capture_dir,
             cache_diagnostics: false,
             cache_ttl: crate::core::config::CacheTtl::default(),
+            request_compression: Default::default(),
             ttl_downgrade_notified: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             saw_1h_honored: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             cache_anchor: Default::default(),
             last_msg_id: Arc::new(Mutex::new(None)),
+            cache_diag_rejected: Default::default(),
             session_manager,
             hook_bus: host.hook_bus,
             reaper_handle,
@@ -1296,9 +1321,12 @@ impl Runtime {
             turn_budget: crate::runtime::budget::TurnBudget::for_role(
                 crate::runtime::budget::TurnRole::Foreground,
             ),
+            owner_steer_budget: None,
+            message_clock: Default::default(),
             host_tool_session: fresh_host_tool_session(),
             tool_catalog_prompt: Arc::new(std::sync::Mutex::new(None)),
             retained_tool_set: Default::default(),
+            pending_tool_restore: Default::default(),
             session_id: None,
             cwd: None,
             env: None,
@@ -1576,6 +1604,25 @@ impl Runtime {
         self.turn_budget = budget;
     }
 
+    /// Hand the next stream an [`OwnerSteerBudget`](crate::runtime::budget::OwnerSteerBudget)
+    /// (`None` clears it). Like [`Self::set_turn_budget`], the stream takes it
+    /// when it starts.
+    pub fn set_owner_steer_budget(
+        &mut self,
+        lift: Option<Arc<crate::runtime::budget::OwnerSteerBudget>>,
+    ) {
+        self.owner_steer_budget = lift;
+    }
+
+    /// Where message times come from (tests inject a clock).
+    pub fn message_clock(&self) -> &crate::runtime::message_time::MessageClock {
+        &self.message_clock
+    }
+
+    pub fn set_message_clock(&mut self, clock: crate::runtime::message_time::MessageClock) {
+        self.message_clock = clock;
+    }
+
     /// The currently configured per-turn budget.
     pub fn turn_budget(&self) -> &crate::runtime::budget::TurnBudget {
         &self.turn_budget
@@ -1832,6 +1879,12 @@ impl Runtime {
     pub fn begin_conversation(&mut self, id: Option<String>) {
         self.session_allow_all.revoke();
         self.session_allow_all = std::sync::Arc::new(crate::tools::SessionConfirmLatch::new());
+        // New conversation, new cache-diagnosis chain (cleared in place so
+        // shared driver/ping clones see it too).
+        *self
+            .last_msg_id
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         self.set_session_id(id);
     }
 
@@ -1901,6 +1954,60 @@ impl Runtime {
     /// Whether this runtime projects a progressive (core-only) tool schema.
     pub fn progressive_tool_disclosure(&self) -> bool {
         self.progressive_tool_disclosure
+    }
+
+    /// This conversation's exact tool activations as plain data, for the
+    /// next runtime that serves it (daemon reload, park → unpark). The
+    /// retained set's activations once a progressive turn ran; before that,
+    /// whatever this runtime was itself handed and has not applied yet — so
+    /// a reload or park before the first turn does not lose them either.
+    pub fn carried_tool_activations(&self) -> Vec<crate::tools::activation::CarriedActivation> {
+        let retained = self
+            .retained_tool_set
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(shared) = retained {
+            return shared
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .carried_activations();
+        }
+        self.pending_tool_restore
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .unwrap_or_default()
+    }
+
+    /// Hand this runtime the activations the same conversation held in its
+    /// previous runtime. Nothing is granted here: they are re-validated and
+    /// restored (or dropped and reported) at the first progressive turn
+    /// start, against that moment's catalog and this runtime's
+    /// `tools.activation_confirm` (see
+    /// `runtime::stream::restore_pending_activations`). An empty list
+    /// clears nothing that is already pending.
+    pub fn restore_tool_activations(
+        &self,
+        carried: Vec<crate::tools::activation::CarriedActivation>,
+    ) {
+        if carried.is_empty() {
+            return;
+        }
+        let mut pending = self
+            .pending_tool_restore
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match pending.as_mut() {
+            Some(list) => {
+                for c in carried {
+                    if !list.iter().any(|p| p.tool_id == c.tool_id) {
+                        list.push(c);
+                    }
+                }
+            }
+            None => *pending = Some(carried),
+        }
     }
 
     /// `tools.activation_confirm` policy in force for this runtime.
@@ -2827,9 +2934,14 @@ impl Runtime {
         self.refusal_retries = config.refusal_retries;
         self.telemetry_level =
             crate::runtime::telemetry::TelemetryLevel::from_str_key(&config.telemetry);
+        self.telemetry_log_generations = config.telemetry_log_generations;
         self.sync_observability();
         self.cache_diagnostics = config.cache_diagnostics;
         self.cache_ttl = config.cache_ttl;
+        self.request_compression = request_encoding::RequestCompression::from_config(
+            config.request_compression,
+            config.request_compression_level,
+        );
         self.progressive_tool_disclosure = config.progressive_tool_disclosure;
         self.deferred_tool_loading = config.tools_deferred_loading;
         self.activation_confirm = config.tools_activation_confirm;
@@ -2997,6 +3109,42 @@ impl Runtime {
         self.sync_observability();
     }
 
+    /// This session's telemetry, for the subagents it spawns.
+    pub fn worker_telemetry(&self) -> crate::runtime::telemetry::WorkerTelemetry {
+        crate::runtime::telemetry::WorkerTelemetry {
+            level: self.telemetry_level,
+            writer: self.telemetry_writer.clone(),
+            parent_session_id: self.session_id.clone(),
+            parent_runtime_session_id: Some(self.trace_ctx.session_id().as_str().to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// Record a worker's requests at its parent's telemetry level, through
+    /// the parent's session writer. Worker runtimes start `Off`
+    /// (`from_parts`), so without this every subagent request was missing
+    /// from `api-log.jsonl`.
+    ///
+    /// The writer is shared, not rebuilt: it owns its files from one thread,
+    /// and a writer per worker would race rotation. The trace context is
+    /// fresh, though: a worker is its own trace session with its own
+    /// cache-break snapshots, so its requests never read as breaks in the
+    /// parent's conversation. A parent that is `Off` leaves the worker `Off`.
+    pub fn inherit_telemetry(&mut self, parent: &crate::runtime::telemetry::WorkerTelemetry) {
+        match (&parent.writer, parent.level.enabled()) {
+            (Some(writer), true) => {
+                self.telemetry_level = parent.level;
+                self.trace_ctx = trace::TraceContext::with_sink(Arc::new(
+                    crate::runtime::telemetry::WriterTraceSink::new(writer.clone()),
+                ));
+                // Same writer, tagged: the worker's records carry its agent,
+                // handle and the parent's session id.
+                self.telemetry_writer = parent.worker_writer();
+            }
+            _ => self.set_telemetry_level(crate::runtime::telemetry::TelemetryLevel::Off),
+        }
+    }
+
     /// Reconcile the shared observability writer + trace sink with the
     /// telemetry level (Task 11 config rule, documented until Task 12 adds
     /// explicit trace config/UI): `basic`/`full` enables BOTH legacy
@@ -3007,7 +3155,10 @@ impl Runtime {
         if self.telemetry_level.enabled() {
             if self.telemetry_writer.is_none() {
                 let writer = crate::runtime::telemetry::TelemetryWriter::new(
-                    crate::runtime::telemetry::WriterOptions::default(),
+                    crate::runtime::telemetry::WriterOptions {
+                        max_generations: self.telemetry_log_generations,
+                        ..Default::default()
+                    },
                 );
                 self.trace_ctx = trace::TraceContext::with_sink(Arc::new(
                     crate::runtime::telemetry::WriterTraceSink::new(writer.clone()),
@@ -3735,6 +3886,15 @@ impl Runtime {
         self.telemetry_writer.clone()
     }
 
+    /// The writer handle for this runtime's requests: stamps the persisted
+    /// conversation id (`session_id`) on every api-log record, keeping any
+    /// worker identity the handle already carries.
+    pub(crate) fn request_telemetry(&self) -> Option<crate::runtime::telemetry::TelemetryWriter> {
+        self.telemetry_writer
+            .as_ref()
+            .map(|w| w.with_session(self.session_id.clone()))
+    }
+
     /// Bounded shutdown flush of the observability writer: stop intake,
     /// drain until `timeout`, return typed stats (`None` when telemetry is
     /// off). Sync and bounded — safe from shutdown paths that cannot await;
@@ -3845,6 +4005,21 @@ impl Runtime {
         self.ttl_downgrade_notified = parent.ttl_downgrade_notified.clone();
         self.saw_1h_honored = parent.saw_1h_honored.clone();
         self.cache_anchor = parent.cache_anchor.clone();
+        // Same session, same diagnostics chain: a driver turn continues it,
+        // and a ping sees the same rejection latch (it never moves the chain).
+        self.last_msg_id = parent.last_msg_id.clone();
+        self.cache_diag_rejected = parent.cache_diag_rejected.clone();
+    }
+
+    /// The cache-diagnosis chain for this runtime's requests, `None` when
+    /// `cache_diagnostics` is off (wire unchanged).
+    pub(crate) fn cache_diagnosis(&self) -> Option<cache_diagnosis::CacheDiagnosis> {
+        self.cache_diagnostics.then(|| {
+            cache_diagnosis::CacheDiagnosis::new(
+                Arc::clone(&self.last_msg_id),
+                Arc::clone(&self.cache_diag_rejected),
+            )
+        })
     }
 
     /// Change the cache TTL strategy mid-session. The next request re-marks
@@ -3950,6 +4125,8 @@ impl Runtime {
             &api::ApiOptions {
                 trace: self.trace_ctx.clone(),
                 telemetry: self.telemetry_writer.clone(),
+                // The largest body Synaps sends: the whole transcript.
+                request_compression: self.request_compression.clone(),
                 ..api::ApiOptions::default()
             },
         )
@@ -4001,6 +4178,7 @@ impl Runtime {
                     token_cache: self.token_cache.clone(),
                     anthropic_base_url: None,
                     anthropic_stream_client: self.anthropic_stream_client.clone(),
+                    request_compression: self.request_compression.clone(),
                     anthropic_execution_plan: anthropic_execution_plan.clone(),
                     codex_request_role: self.codex_request_role(),
                     // Consistent with the streaming path: a pending
@@ -4027,6 +4205,8 @@ impl Runtime {
                     usage_counters: None,
                     cache_anchor: None,
                     keepwarm: None,
+                    // The non-stream transport never sends diagnostics.
+                    cache_diagnosis: None,
                 },
             )
             .await?;
@@ -4105,6 +4285,7 @@ impl Runtime {
                                         session_allow_all: Some(self.session_allow_all.clone()),
                                         launch_cancel: None,
                                         memory_backend: Some(self.memory_backend.clone()),
+                                        telemetry: Some(self.worker_telemetry()),
                                         watcher_exit_path: self.watcher_exit_path.clone(),
                                         tool_register_tx: None,
                                         session_manager: Some(self.session_manager.clone()),
@@ -4229,6 +4410,7 @@ impl Runtime {
                             let session_allow_all_inner = self.session_allow_all.clone();
                             let orchestration_inner = cfg_orchestration.clone();
                             let memory_backend_inner = self.memory_backend.clone();
+                            let worker_telemetry_inner = self.worker_telemetry();
                             let memory_context_inner = self.memory_tool_capability();
                             let codex_parent_plan_inner = codex_parent_plan.clone();
                             let cwd_inner = cfg_cwd.clone();
@@ -4280,6 +4462,7 @@ impl Runtime {
                                                     session_allow_all: Some(session_allow_all_inner.clone()),
                                                     launch_cancel: None,
                                                     memory_backend: Some(memory_backend_inner),
+                                                    telemetry: Some(worker_telemetry_inner),
                                                     watcher_exit_path: exit_path,
                                                     tool_register_tx: None,
                                                     session_manager: Some(session_mgr_inner),
@@ -4573,12 +4756,13 @@ impl Runtime {
             token_cache: self.token_cache.clone(),
             anthropic_base_url: None,
             anthropic_stream_client: self.anthropic_stream_client.clone(),
+            request_compression: self.request_compression.clone(),
             anthropic_execution_plan,
             codex_request_role: self.codex_request_role(),
             trace: self.effective_trace_context(),
             request_correlation: None,
             suppress_stream_deltas: false,
-            telemetry: self.telemetry_writer.clone(),
+            telemetry: self.request_telemetry(),
             // Threads the runtime-scoped gate identity into extension-
             // provider interior tool loops (Task 16).
             tool_session_id: Some(self.host_tool_session.clone()),
@@ -4593,6 +4777,9 @@ impl Runtime {
             // schedules from.
             cache_anchor: Some(self.cache_anchor.clone()),
             keepwarm: None,
+            // The foreground chain: the only requests that thread
+            // `diagnostics.previous_message_id`.
+            cache_diagnosis: self.cache_diagnosis(),
         };
 
         let final_capture_history: Arc<Mutex<Option<Vec<crate::SharedMessage>>>> = Arc::new(Mutex::new(None));
@@ -4644,11 +4831,14 @@ impl Runtime {
             activation_confirm: self.activation_confirm,
             tool_session_id: self.host_tool_session.clone(),
             retained_tool_set: std::sync::Arc::clone(&self.retained_tool_set),
+            pending_tool_restore: std::sync::Arc::clone(&self.pending_tool_restore),
             mcp_runtime: self.mcp_runtime.clone(),
             mcp_session_scope: self.mcp_session_scope.clone(),
             extension_runtime: self.extension_runtime.clone(),
             extension_session_scope: self.extension_session_scope.clone(),
             turn_budget: self.turn_budget.clone(),
+            owner_steer_budget: self.owner_steer_budget.clone(),
+            message_clock: self.message_clock.clone(),
         };
 
         tokio::spawn(async move {
@@ -4719,6 +4909,7 @@ impl Clone for Runtime {
             api_retries: self.api_retries,
             refusal_retries: self.refusal_retries,
             telemetry_level: self.telemetry_level,
+            telemetry_log_generations: self.telemetry_log_generations,
             // Shared session observability: clones (subagents) enqueue into
             // the SAME bounded writer and trace context — one worker and one
             // set of session-scoped context IDs per session.
@@ -4750,6 +4941,7 @@ impl Clone for Runtime {
             capture_dir: self.capture_dir.clone(),
             cache_diagnostics: self.cache_diagnostics,
             cache_ttl: self.cache_ttl,
+            request_compression: self.request_compression.clone(),
             // Subagents are their own session — fresh latches so a downgrade
             // in the subagent's chain surfaces its own (single) notice and
             // honored-state isn't inherited from the parent.
@@ -4759,6 +4951,7 @@ impl Clone for Runtime {
             // Subagents start their own request chain — inheriting the parent's
             // last msg_id would produce bogus `messages_changed` diagnostics.
             last_msg_id: Arc::new(Mutex::new(None)),
+            cache_diag_rejected: Arc::clone(&self.cache_diag_rejected),
             session_manager: self.session_manager.clone(),
             hook_bus: self.hook_bus.clone(),
             reaper_handle: None, // Cloned runtimes don't own the reaper
@@ -4780,6 +4973,8 @@ impl Clone for Runtime {
             // Same durable shared-scope rule for extension leases.
             extension_session_scope: self.extension_session_scope.clone(),
             turn_budget: self.turn_budget.clone(),
+            owner_steer_budget: self.owner_steer_budget.clone(),
+            message_clock: self.message_clock.clone(),
             // Clones share the live tool registry, so they share the SAME
             // host tool session (matching existing shared-session behavior);
             // independently constructed runtimes mint fresh identities and
@@ -4787,6 +4982,7 @@ impl Clone for Runtime {
             host_tool_session: self.host_tool_session.clone(),
             tool_catalog_prompt: Arc::clone(&self.tool_catalog_prompt),
             retained_tool_set: std::sync::Arc::clone(&self.retained_tool_set),
+            pending_tool_restore: std::sync::Arc::clone(&self.pending_tool_restore),
             // Clones serve the same conversation (see memory_context_state).
             session_id: self.session_id.clone(),
             cwd: self.cwd.clone(),
@@ -4915,6 +5111,31 @@ mod tests {
             other.host_tool_session_id(),
             "independently constructed runtimes must never share a session"
         );
+    }
+
+    /// Activations handed to a runtime before its first turn are what it
+    /// hands on (a second reload, or a park, before any turn loses
+    /// nothing); clones share them; another runtime does not see them.
+    #[test]
+    fn handed_activations_are_carried_on_before_the_first_turn() {
+        use crate::tools::activation::{CarriedActivation, CarriedProvenance};
+        let probe = |name: &str| CarriedActivation {
+            tool_id: format!("builtin:{name}"),
+            schema_digest: "ab".repeat(32),
+            provenance: CarriedProvenance::BuiltinRuntime,
+        };
+        let rt = Runtime::new_headless();
+        assert!(rt.carried_tool_activations().is_empty());
+        rt.restore_tool_activations(vec![probe("subagent_start")]);
+        rt.restore_tool_activations(Vec::new());
+        rt.restore_tool_activations(vec![probe("subagent_start"), probe("subagent_status")]);
+        assert_eq!(
+            rt.carried_tool_activations(),
+            vec![probe("subagent_start"), probe("subagent_status")],
+            "merged without duplicates; an empty hand-off clears nothing"
+        );
+        assert_eq!(rt.clone().carried_tool_activations().len(), 2);
+        assert!(Runtime::new_headless().carried_tool_activations().is_empty());
     }
 
     /// Task 11 config rule (documented until Task 12 adds explicit trace
@@ -5699,6 +5920,35 @@ mod tests {
             runtime.session_allow_all(),
             new_worker.session_allow_all()
         ));
+    }
+
+    #[test]
+    fn conversation_boundary_resets_the_cache_diagnosis_chain() {
+        let mut runtime = Runtime::new_headless();
+        runtime.set_cache_diagnostics(true);
+        let mut driver = runtime.clone();
+        driver.share_ttl_latches(&runtime);
+        runtime.cache_diagnosis().unwrap().record("msg_old");
+        // Compaction successor: same conversation, chain kept.
+        runtime.set_session_id(Some("successor".into()));
+        assert_eq!(
+            runtime
+                .cache_diagnosis()
+                .unwrap()
+                .previous_message_id()
+                .as_deref(),
+            Some("msg_old")
+        );
+        // `/clear` (and resume) start a new chain, seen by shared clones too.
+        runtime.begin_conversation(Some("next".into()));
+        assert_eq!(
+            runtime.cache_diagnosis().unwrap().previous_message_id(),
+            None
+        );
+        assert_eq!(
+            driver.cache_diagnosis().unwrap().previous_message_id(),
+            None
+        );
     }
 
     #[test]
