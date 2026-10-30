@@ -872,9 +872,10 @@ impl SelectionFailure {
             .iter()
             .filter_map(AccountFailure::from_rejection)
             .collect();
-        // An excluded slot duplicates a seat that is already counted (it is
-        // excluded before its cooldown is checked), so it never picks the
-        // headline.
+        // An excluded slot duplicates a seat that is already counted (or one
+        // this request already used), so it never picks the headline. A
+        // cooling slot reports its cooldown, not `excluded` (`evaluate`
+        // checks the cooldown first), and counts as limited.
         let live: Vec<_> = accounts.iter().filter(|a| a.is_live()).collect();
         let kind = if accounts.is_empty() {
             K::NoCredentials
@@ -3274,8 +3275,8 @@ mod tests {
         let stale_exhausted = ok("y", vec![win("primary", 5 * HOUR, 100.0, NOW - 1)]);
         assert_eq!(failure_of(&[stale_exhausted]).earliest_reset_ms, None);
     }
-    /// A duplicate-seat slot is excluded before its cooldown is checked, so
-    /// it must not count as a live account: one exhausted seat plus its
+    /// A duplicate-seat slot with no cooldown of its own is excluded, and an
+    /// excluded slot must not count as a live account: one exhausted seat plus its
     /// excluded duplicate is `all_cooling_down` with the seat's reset, not
     /// `quota_unknown` ("send again to retry").
     #[test]
