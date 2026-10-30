@@ -42,6 +42,7 @@ pub(crate) enum OpenError {
     /// A FIFO, device, socket or directory.
     NotRegular,
     /// The name is a symlink now.
+    #[cfg_attr(not(unix), allow(dead_code))] // only the Unix reader can tell
     Symlink,
     Io(io::Error),
 }
@@ -334,7 +335,7 @@ mod imp {
     impl Dir {
         pub(crate) fn open(path: &Path) -> io::Result<Dir> {
             if !std::fs::metadata(path)?.is_dir() {
-                return Err(io::Error::new(io::ErrorKind::Other, "not a directory"));
+                return Err(io::Error::other("not a directory"));
             }
             Ok(Dir {
                 path: path.to_path_buf(),
