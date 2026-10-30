@@ -46,6 +46,7 @@ mod stream;
 pub mod subagent;
 pub mod subagent_watch;
 pub mod telemetry;
+pub mod tool_spill;
 pub mod trace;
 pub(crate) mod transport;
 mod types;
@@ -387,6 +388,7 @@ pub async fn emit_after_tool_call(
         output,
         max_tool_output,
         session_id,
+        false,
     )
     .await
     .output
@@ -395,10 +397,23 @@ pub async fn emit_after_tool_call(
 /// Distinguish an authoritative hook replacement from ordinary budget truncation.
 /// Byte equality with the summary cannot establish whether the delta lane is stale.
 pub(super) struct AfterToolCallOutcome {
+    /// Post-hook output cut to `max_tool_output` (the legacy history text).
     pub output: String,
     pub replaced: bool,
+    /// The post-hook output BEFORE that cut, kept only when asked for
+    /// (`keep_uncut`, i.e. tool output virtualisation is on) and only when
+    /// the cut removed bytes: a spill must hold the whole result.
+    pub uncut: Option<String>,
 }
 
+impl AfterToolCallOutcome {
+    /// The whole post-hook output: what a virtualised result spills.
+    pub fn full_text(&self) -> &str {
+        self.uncut.as_deref().unwrap_or(&self.output)
+    }
+}
+
+#[allow(clippy::too_many_arguments)] // the hook event's fields plus the history policy
 pub(super) async fn emit_after_tool_call_outcome(
     hook_bus: &Arc<crate::extensions::hooks::HookBus>,
     tool_name: &str,
@@ -407,6 +422,7 @@ pub(super) async fn emit_after_tool_call_outcome(
     output: String,
     max_tool_output: usize,
     session_id: Option<&str>,
+    keep_uncut: bool,
 ) -> AfterToolCallOutcome {
     use crate::extensions::hooks::events::HookResult;
     // Keep the original to return verbatim if no transform fires.
@@ -450,12 +466,13 @@ pub(super) async fn emit_after_tool_call_outcome(
     // Compress-then-truncate: apply the context-budget cap AFTER the hook.
     // Mirrors `HelperMethods::truncate_tool_result` byte-for-byte so the
     // no-extension path is behavior-identical to the legacy ordering.
+    let output =
+        crate::runtime::helpers::HelperMethods::truncate_tool_result(&post_hook, max_tool_output);
+    let uncut = (keep_uncut && post_hook.len() > max_tool_output).then_some(post_hook);
     AfterToolCallOutcome {
-        output: crate::runtime::helpers::HelperMethods::truncate_tool_result(
-            &post_hook,
-            max_tool_output,
-        ),
+        output,
         replaced,
+        uncut,
     }
 }
 
@@ -569,6 +586,16 @@ pub struct Runtime {
     pub watcher_exit_path: Option<PathBuf>,
     // New configurable fields
     max_tool_output: usize,
+    /// Tool output virtualisation thresholds (`tool_output_spill_*`). OFF
+    /// on construction — `Runtime::new()` is also the embedding/test path
+    /// and must not write under the base dir unless configured; every
+    /// production boot applies the config (default on), workers through
+    /// `apply_subagent_runtime_policy`.
+    tool_spill_policy: tool_spill::ToolSpillPolicy,
+    /// `<base>/spill`, bound once at construction (like `capture_dir`).
+    tool_spill_root: PathBuf,
+    /// Session-cumulative virtualisation counters; shared by clones.
+    tool_spill_stats: Arc<tool_spill::ToolSpillStats>,
     bash_timeout: u64,
     bash_max_timeout: u64,
     subagent_timeout: u64,
@@ -1166,6 +1193,8 @@ fn fresh_host_parts() -> Result<crate::host::HostParts> {
     // the SAME value bound into `capture_dir` (fix1 I2b).
     let capture_dir = trace::default_capture_dir();
     let _ = trace::sweep_expired_captures(&capture_dir);
+    // Same for tool-output spill dirs past their age (bound here too).
+    let spill_root = sweep_spill_root();
     Ok(crate::host::HostParts {
         client,
         tools: Arc::new(RwLock::new(ToolRegistry::new())),
@@ -1175,8 +1204,22 @@ fn fresh_host_parts() -> Result<crate::host::HostParts> {
         mcp_runtime: None,
         extension_runtime: None,
         capture_dir,
+        spill_root,
         progressive_tool_disclosure: false,
     })
+}
+
+/// Resolve `<base>/spill` once and remove session spill dirs past
+/// [`agent_core::core::tool_spill::SPILL_MAX_AGE`] — bounded, fail-soft,
+/// confined to the spill root, like the capture sweep beside it.
+pub(crate) fn sweep_spill_root() -> PathBuf {
+    let root = agent_core::core::tool_spill::default_spill_root();
+    let _ = agent_core::core::tool_spill::sweep_stale_spill(
+        &root,
+        agent_core::core::tool_spill::SPILL_MAX_AGE,
+        std::time::SystemTime::now(),
+    );
+    root
 }
 
 /// Preserve compatibility with favorite IDs written before Anthropic used its
@@ -1265,6 +1308,9 @@ impl Runtime {
             event_queue: Arc::new(crate::events::EventQueue::new(1000)),
             watcher_exit_path: None,
             max_tool_output: 30000,
+            tool_spill_policy: tool_spill::ToolSpillPolicy::OFF,
+            tool_spill_root: host.spill_root,
+            tool_spill_stats: Arc::default(),
             bash_timeout: 30,
             bash_max_timeout: 300,
             subagent_timeout: 300,
@@ -1369,6 +1415,7 @@ impl Runtime {
             mcp_runtime: None,
             extension_runtime: None,
             capture_dir: trace::default_capture_dir(),
+            spill_root: agent_core::core::tool_spill::default_spill_root(),
             progressive_tool_disclosure: false,
         };
         let mut runtime = Self::from_parts(RuntimeParts::without_reaper(host));
@@ -2927,6 +2974,7 @@ impl Runtime {
         self.compaction_mode = config.compaction_mode;
         self.compaction_exclusions = config.compaction_exclude.clone();
         self.max_tool_output = config.max_tool_output;
+        self.tool_spill_policy = tool_spill::ToolSpillPolicy::from_config(config);
         self.bash_timeout = config.bash_timeout;
         self.bash_max_timeout = config.bash_max_timeout;
         self.subagent_timeout = config.subagent_timeout;
@@ -3071,6 +3119,39 @@ impl Runtime {
 
     pub fn set_max_tool_output(&mut self, v: usize) {
         self.max_tool_output = v;
+    }
+
+    pub fn tool_spill_policy(&self) -> tool_spill::ToolSpillPolicy {
+        self.tool_spill_policy
+    }
+
+    pub fn set_tool_spill_policy(&mut self, policy: tool_spill::ToolSpillPolicy) {
+        self.tool_spill_policy = policy;
+    }
+
+    /// Session totals of tool output virtualisation (count, bytes kept out
+    /// of history).
+    pub fn tool_spill_totals(&self) -> tool_spill::ToolSpillTotals {
+        self.tool_spill_stats.totals()
+    }
+
+    /// The virtualiser one stream uses. Its dir is keyed by the persisted
+    /// conversation id, so retention removes it with the session; a worker
+    /// (no conversation id) is keyed by its own runtime trace session.
+    pub(crate) fn tool_spill(&self) -> tool_spill::ToolSpill {
+        if !self.tool_spill_policy.is_enabled() {
+            return tool_spill::ToolSpill::off();
+        }
+        let key = self
+            .session_id
+            .clone()
+            .unwrap_or_else(|| self.trace_ctx.session_id().as_str().to_string());
+        tool_spill::ToolSpill::new(
+            self.tool_spill_policy,
+            &self.tool_spill_root,
+            &key,
+            Arc::clone(&self.tool_spill_stats),
+        )
     }
 
     pub fn set_bash_timeout(&mut self, v: u64) {
@@ -4813,6 +4894,7 @@ impl Runtime {
             steering_rx,
             watcher_exit_path,
             max_tool_output,
+            tool_spill: self.tool_spill(),
             bash_timeout,
             bash_max_timeout,
             subagent_timeout,
@@ -4909,6 +4991,9 @@ impl Clone for Runtime {
             event_queue: self.event_queue.clone(),
             watcher_exit_path: self.watcher_exit_path.clone(),
             max_tool_output: self.max_tool_output,
+            tool_spill_policy: self.tool_spill_policy,
+            tool_spill_root: self.tool_spill_root.clone(),
+            tool_spill_stats: Arc::clone(&self.tool_spill_stats),
             bash_timeout: self.bash_timeout,
             bash_max_timeout: self.bash_max_timeout,
             subagent_timeout: self.subagent_timeout,
@@ -5494,6 +5579,49 @@ mod tests {
             "constructing a child must not mint/replay a favorite-model grant"
         );
         assert!(!session.effective_choices().contains(&favorite.to_owned()));
+    }
+
+    /// Tool output virtualisation is off on a bare runtime (embedding and
+    /// test path), follows the config once applied, and spills a foreground
+    /// session into `<base>/spill/<conversation id>` so retention can remove
+    /// it with the session.
+    #[test]
+    #[serial_test::serial(synaps_base_dir)]
+    fn tool_spill_follows_config_and_is_keyed_by_the_conversation() {
+        let base = crate::test_env::BaseDirGuard::new();
+        let mut runtime = Runtime::new_headless();
+        assert!(!runtime.tool_spill_policy().is_enabled());
+        assert!(!runtime.tool_spill().is_enabled());
+        runtime.apply_config(&crate::config::SynapsConfig::default());
+        assert_eq!(
+            runtime.tool_spill_policy(),
+            tool_spill::ToolSpillPolicy {
+                threshold_bytes: 12 * 1024,
+                head_bytes: 4 * 1024,
+                tail_bytes: 3 * 1024,
+            }
+        );
+        runtime.set_session_id(Some("20261029-120000-ab12".into()));
+        assert_eq!(
+            runtime.tool_spill().dir(),
+            Some(base.path().join("spill").join("20261029-120000-ab12").as_path())
+        );
+        // Clones (the same session) share the counters.
+        let clone = runtime.clone();
+        let text = "line\n".repeat(4_000);
+        let virtualised = clone
+            .tool_spill()
+            .virtualise("toolu_1", &tool_spill::SpillTarget::Spill, &text)
+            .expect("over the threshold");
+        assert_eq!(runtime.tool_spill_totals().virtualised, 1);
+        assert_eq!(
+            runtime.tool_spill_totals().kept_out_bytes(),
+            (text.len() - virtualised.preview.len()) as u64
+        );
+        runtime.apply_config(&agent_core::config::load_config_from_str(
+            "tool_output_spill_bytes = 0\n",
+        ));
+        assert!(!runtime.tool_spill().is_enabled(), "0 turns it off");
     }
 
     #[test]

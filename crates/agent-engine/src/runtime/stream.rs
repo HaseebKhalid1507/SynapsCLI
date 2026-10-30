@@ -168,6 +168,8 @@ pub(super) struct StreamSession {
     // Tool config
     pub(super) watcher_exit_path: Option<PathBuf>,
     pub(super) max_tool_output: usize,
+    /// Tool output virtualisation for this stream (off = legacy history).
+    pub(super) tool_spill: super::tool_spill::ToolSpill,
     pub(super) bash_timeout: u64,
     pub(super) bash_max_timeout: u64,
     pub(super) subagent_timeout: u64,
@@ -650,6 +652,7 @@ impl StreamMethods {
             mut steering_rx,
             watcher_exit_path,
             max_tool_output,
+            tool_spill,
             bash_timeout,
             bash_max_timeout,
             subagent_timeout,
@@ -1861,6 +1864,9 @@ impl StreamMethods {
                         let mut production_output: Option<crate::tools::output::OutputHandle> =
                             None;
                         let mut execution_identity = None;
+                        // Tool output virtualisation: the preview history
+                        // carries instead of the legacy selection.
+                        let mut virtualised: Option<super::tool_spill::Virtualised> = None;
                         let (result, rich_blocks) = match gate_outcome {
                             Ok((authorized, input)) => {
                                 let tool = authorized.implementation();
@@ -1927,6 +1933,13 @@ impl StreamMethods {
                                         unreachable!()
                                     };
                                     let input_for_hook = input.clone();
+                                    let spill_target = spill_target_for(
+                                        &tool_spill,
+                                        &runtime_name,
+                                        tool.as_ref(),
+                                        &input,
+                                        cwd.as_deref(),
+                                    );
                                     match await_tool_call(&cancel, tool.execute_rich(input, crate::ToolContext {
                                             channels: crate::tools::ToolChannels { tx_delta: Some(tx_d), tx_events: Some(tx.clone()) },
                                             capabilities: crate::tools::ToolCapabilities { session_allow_all: Some(session_allow_all.clone()), launch_cancel: Some(cancel.clone()), memory_backend: Some(memory_backend.clone()), telemetry: Some(worker_telemetry.clone()), watcher_exit_path: watcher_exit_path.clone(), tool_register_tx: Some(tool_reg_tx.clone()), session_manager: Some(session_manager.clone()), subagent_registry: Some(subagent_registry.clone()), event_queue: Some(event_queue.clone()), delegation_parent: delegation_parent.clone(), codex_parent_plan: codex_parent_plan.clone(), secret_prompt: secret_prompt.clone(), orchestration: orchestration.clone(), tool_activation: Some(crate::tools::discovery::ActivationCapability::new(catalog_snapshot.clone(), std::sync::Arc::clone(&session_tool_set), activation_authority).with_host_prompt(activation_prompt_allowed)), mcp_leases: mcp_lease_capability.clone(), extension_leases: extension_lease_capability.clone(), memory_context: memory_context.clone(), cwd: cwd.clone(), env: env.clone(), env_stripped: env_stripped.clone(), env_warned: env_warned.clone(), session_id: session_id.clone() },
@@ -1951,6 +1964,7 @@ impl StreamMethods {
                                                 output.clone(),
                                                 max_tool_output,
                                                 session_id.as_deref(),
+                                                tool_spill.is_enabled(),
                                             ).await;
                                             // Hook policy: a Replace transform wins over the rich
                                             // blocks — the hook saw only the summary, so keeping
@@ -1958,6 +1972,12 @@ impl StreamMethods {
                                             let rich_blocks = drop_rich_if_rewritten(rich_blocks, &outcome.output, &output, outcome.replaced);
                                             if outcome.replaced {
                                                 production_output = None;
+                                            }
+                                            // Virtualise AFTER the hook (compress-then-cut)
+                                            // and only plain-text results: rich blocks keep
+                                            // their own budget.
+                                            if rich_blocks.is_none() {
+                                                virtualised = tool_spill.virtualise(&tool_id, &spill_target, outcome.full_text());
                                             }
                                             (outcome.output, rich_blocks)
                                         }
@@ -1997,22 +2017,29 @@ impl StreamMethods {
                             Some((stable_id, wire_name, activation, effect)),
                         ) = (&execution_correlation, execution_identity)
                         {
-                            let retained = history_result
-                                .as_ref()
-                                .map(|bounded| bounded.retained_bytes)
-                                .unwrap_or_else(|| result.len().min(max_tool_output));
-                            correlation.record(
+                            let (result_bytes, retained) = match &virtualised {
+                                Some(v) => (v.original_bytes, v.preview.len()),
+                                None => (
+                                    result.len(),
+                                    history_result
+                                        .as_ref()
+                                        .map(|bounded| bounded.retained_bytes)
+                                        .unwrap_or_else(|| result.len().min(max_tool_output)),
+                                ),
+                            };
+                            correlation.record_virtualised(
                                 &tool_id,
                                 &stable_id,
                                 &wire_name,
                                 crate::runtime::trace::ExecutionPhase::ResultRecorded,
                                 tool_call_started,
-                                result.len(),
+                                result_bytes,
                                 retained,
                                 activation,
                                 effect,
                                 crate::runtime::trace::ExecutionCommitStatus::ResultRecorded,
                                 0,
+                                virtualised.is_some(),
                             );
                         }
                         let ui_result = crate::tools::output::bounded_preview(
@@ -2034,6 +2061,8 @@ impl StreamMethods {
                                 history_result.map(|bounded| bounded.text),
                                 interrupted_side_effect.is_some(),
                             )
+                        } else if let Some(virtualised) = virtualised {
+                            Value::String(virtualised.preview)
                         } else {
                             select_tool_result_content(
                                 rich_blocks,
@@ -2240,6 +2269,7 @@ impl StreamMethods {
                         let worker_telemetry_inner = worker_telemetry.clone();
                         let memory_context_inner = memory_context.clone();
                         let session_id_inner = session_id.clone();
+                        let tool_spill_inner = tool_spill.clone();
                         let auto_approve_inner = auto_approve_confirms;
                         let session_allow_all_inner = session_allow_all.clone();
                         let orchestration_inner = orchestration.clone();
@@ -2297,10 +2327,17 @@ impl StreamMethods {
                                         Some(&session_allow_all_inner),
                                     ).await;
                                     if let BeforeToolCallDecision::Block { reason } = decision {
-                                        (false, Some(call_effect), format!("Tool call blocked by extension: {}", reason), None, None, None)
+                                        (false, Some(call_effect), format!("Tool call blocked by extension: {}", reason), None, None, None, None)
                                     } else {
                                     let BeforeToolCallDecision::Continue { input } = decision else { unreachable!() };
                                     let input_for_hook = input.clone();
+                                    let spill_target = spill_target_for(
+                                        &tool_spill_inner,
+                                        &runtime_name_for_hook,
+                                        t.as_ref(),
+                                        &input,
+                                        cwd_inner.as_deref(),
+                                    );
                                     // Bounded delta lane (Task 26, §8.4) — see the single-tool site.
                                     let delta_channel =
                                         crate::tools::output::delta_channel_with_budgets(
@@ -2343,6 +2380,7 @@ impl StreamMethods {
                                                 output.clone(),
                                                 max_tool_output,
                                                 session_id_inner.as_deref(),
+                                                tool_spill_inner.is_enabled(),
                                             ).await;
                                             // Hook Replace wins over rich blocks (see single-tool site).
                                             let rich_blocks = drop_rich_if_rewritten(rich_blocks, &outcome.output, &output, outcome.replaced);
@@ -2350,17 +2388,23 @@ impl StreamMethods {
                                             // status; a real Replace is authoritative even when equal
                                             // to the summary. Neither may lose to the delta lane.
                                             let history_handle = if errored || outcome.replaced { None } else { Some(output_handle) };
-                                            (false, Some(call_effect), outcome.output, history_handle, Some((stable_tool_id, activation_basis, tool_call_started)), rich_blocks)
+                                            // Virtualise after the hook, plain text only (see single-tool site).
+                                            let virtualised = if rich_blocks.is_none() {
+                                                tool_spill_inner.virtualise(&tool_id, &spill_target, outcome.full_text())
+                                            } else {
+                                                None
+                                            };
+                                            (false, Some(call_effect), outcome.output, history_handle, Some((stable_tool_id, activation_basis, tool_call_started)), rich_blocks, virtualised)
                                         }
                                         (None, started) => {
-                                            (true, started.then_some(call_effect), turn_completion_inner.cancel_phrase().to_string(), Some(output_handle), Some((stable_tool_id, activation_basis, tool_call_started)), None)
+                                            (true, started.then_some(call_effect), turn_completion_inner.cancel_phrase().to_string(), Some(output_handle), Some((stable_tool_id, activation_basis, tool_call_started)), None, None)
                                         }
                                     }
                                     } // close else from Block check
                                 }
                                 // Typed, bounded, metadata-only gate denial —
                                 // no implementation lookup, no hook emission.
-                                Err(denial) => (false, None, denial.to_string(), None, None, None),
+                                Err(denial) => (false, None, denial.to_string(), None, None, None, None),
                             };
 
                             let _ = tx_stream.send(StreamEvent::Llm(LlmEvent::ToolResult {
@@ -2391,12 +2435,18 @@ impl StreamMethods {
                             let history_bounded = result.3.as_ref()
                                 .map(crate::tools::output::OutputHandle::model_history)
                                 .filter(|bounded| bounded.original_bytes > 0);
+                            let virtualised = result.6;
+                            let virtualised_sizes = virtualised
+                                .as_ref()
+                                .map(|v| (v.original_bytes, v.preview.len()));
                             let history: Value = if was_canceled {
                                 canceled_tool_result_content(
                                     turn_completion_inner.cancel_phrase(),
                                     history_bounded.as_ref().map(|bounded| bounded.text.clone()),
                                     interrupted.is_some(),
                                 )
+                            } else if let Some(virtualised) = virtualised {
+                                Value::String(virtualised.preview)
                             } else {
                                 select_tool_result_content(
                                     result.5,
@@ -2411,10 +2461,15 @@ impl StreamMethods {
                                         &trace_inner,
                                         request,
                                     );
-                                let retained = history_bounded
-                                    .as_ref()
-                                    .map(|bounded| bounded.retained_bytes)
-                                    .unwrap_or_else(|| result.2.len().min(max_tool_output));
+                                let (result_bytes, retained) = virtualised_sizes.unwrap_or_else(|| {
+                                    (
+                                        result.2.len(),
+                                        history_bounded
+                                            .as_ref()
+                                            .map(|bounded| bounded.retained_bytes)
+                                            .unwrap_or_else(|| result.2.len().min(max_tool_output)),
+                                    )
+                                });
                                 let commit_status = if was_canceled {
                                     match call_effect {
                                         crate::tools::catalog::ToolEffect::NonIdempotent =>
@@ -2424,7 +2479,7 @@ impl StreamMethods {
                                 } else {
                                     crate::runtime::trace::ExecutionCommitStatus::ResultRecorded
                                 };
-                                correlation.record(
+                                correlation.record_virtualised(
                                     &tool_id,
                                     &stable_tool_id,
                                     &tool_name_for_hook,
@@ -2434,12 +2489,13 @@ impl StreamMethods {
                                         crate::runtime::trace::ExecutionPhase::ResultRecorded
                                     },
                                     tool_call_started,
-                                    result.2.len(),
+                                    result_bytes,
                                     retained,
                                     activation_basis,
                                     call_effect,
                                     commit_status,
                                     model_order,
+                                    virtualised_sizes.is_some(),
                                 );
                             }
                             lane_results.push((tool_id, was_canceled, interrupted, history));
@@ -2638,6 +2694,22 @@ fn drop_rich_if_rewritten(
         );
     }
     None
+}
+
+/// How this call's result may be virtualised, decided before it runs from
+/// the tool and its final (post-`before_tool_call`) input. `Never` when
+/// virtualisation is off, so the off path does no extra work.
+fn spill_target_for(
+    tool_spill: &super::tool_spill::ToolSpill,
+    runtime_name: &str,
+    tool: &dyn crate::tools::Tool,
+    input: &Value,
+    cwd: Option<&std::path::Path>,
+) -> super::tool_spill::SpillTarget {
+    if !tool_spill.is_enabled() {
+        return super::tool_spill::SpillTarget::Never;
+    }
+    super::tool_spill::SpillTarget::classify(runtime_name, &tool.origin(), input, cwd)
 }
 
 /// Pick the `tool_result.content` value. Rich blocks win outright (they
@@ -3730,7 +3802,13 @@ mod rich_output_tests {
         let _base = crate::test_env::BaseDirGuard::new();
         for hook in [None, Some(false), Some(true)] {
             let bus = output_hook_bus(hook).await;
-            for summary in ["REPLACED BY HOOK".to_string(), "é".repeat(100)] {
+            for (summary, keep_uncut) in [
+                ("REPLACED BY HOOK".to_string(), false),
+                ("é".repeat(100), false),
+                ("REPLACED BY HOOK".to_string(), true),
+                ("é".repeat(100), true),
+                ("short".to_string(), true),
+            ] {
                 let outcome = emit_after_tool_call_outcome(
                     &bus,
                     "stub",
@@ -3739,6 +3817,7 @@ mod rich_output_tests {
                     summary.clone(),
                     10,
                     None,
+                    keep_uncut,
                 )
                 .await;
                 assert_eq!(outcome.replaced, hook == Some(true));
@@ -3751,6 +3830,10 @@ mod rich_output_tests {
                     outcome.output,
                     HelperMethods::truncate_tool_result(source, 10)
                 );
+                // Virtualisation sees the whole post-hook text; the uncut
+                // copy is kept only when asked for and only when cut.
+                assert_eq!(outcome.full_text(), if keep_uncut { source } else { outcome.output.as_str() });
+                assert_eq!(outcome.uncut.is_some(), keep_uncut && source.len() > 10);
                 assert_eq!(
                     outcome.output,
                     crate::runtime::emit_after_tool_call(
@@ -3929,6 +4012,7 @@ mod rich_output_tests {
             steering_rx: None,
             watcher_exit_path: None,
             max_tool_output: 30_000,
+            tool_spill: Default::default(),
             bash_timeout: 30,
             bash_max_timeout: 300,
             subagent_timeout: 300,
@@ -5648,6 +5732,7 @@ mod rich_output_tests {
             steering_rx: None,
             watcher_exit_path: None,
             max_tool_output: 30_000,
+            tool_spill: Default::default(),
             bash_timeout: 30,
             bash_max_timeout: 300,
             subagent_timeout: 300,
@@ -5728,5 +5813,382 @@ mod rich_output_tests {
             history[2]["content"][0]["type"] == "tool_result",
             "F19: third message must be tool_result"
         );
+    }
+
+    // ── Tool output virtualisation, through the real tool-result → history
+    // path (single and parallel dispatch, hook, wire body, durable history).
+
+    use crate::runtime::tool_spill::{ToolSpill, ToolSpillPolicy};
+
+    /// Returns `text` from a tool with the given name and origin. With
+    /// `stream_prefix`, first streams the head of it on the delta lane the
+    /// way `bash` does (16 KiB), so history would legacy-select that prefix.
+    struct BigOutputTool {
+        name: &'static str,
+        origin: crate::tools::ToolOrigin,
+        text: String,
+        stream_prefix: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for BigOutputTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn description(&self) -> &str {
+            "returns a big output"
+        }
+        fn parameters(&self) -> Value {
+            json!({"type":"object","properties":{}})
+        }
+        fn origin(&self) -> crate::tools::ToolOrigin {
+            self.origin.clone()
+        }
+        fn effect(&self) -> crate::tools::catalog::ToolEffect {
+            crate::tools::catalog::ToolEffect::ReadOnly
+        }
+        async fn execute(&self, _params: Value, ctx: ToolContext) -> Result<String> {
+            if self.stream_prefix {
+                let delta = ctx.channels.tx_delta.as_ref().expect("streaming lane");
+                delta.send(agent_core::truncate_str(&self.text, 16 * 1024).to_string());
+            }
+            Ok(self.text.clone())
+        }
+    }
+
+    fn big_tool(name: &'static str, origin: crate::tools::ToolOrigin, text: &str) -> Arc<dyn Tool> {
+        Arc::new(BigOutputTool {
+            name,
+            origin,
+            text: text.to_string(),
+            stream_prefix: false,
+        })
+    }
+
+    fn mcp_origin() -> crate::tools::ToolOrigin {
+        crate::tools::ToolOrigin::Mcp {
+            server_id: "srv".into(),
+            server_tool_name: "dump".into(),
+        }
+    }
+
+    /// `n` 100-byte numbered lines, ending in the error the tail must keep.
+    fn command_output(n: usize) -> String {
+        let mut out: String = (1..n)
+            .map(|i| format!("out {i:05} {}\n", "o".repeat(89)))
+            .collect();
+        out.push_str("ERROR: the tail is where the error is\n");
+        out
+    }
+
+    fn spill_at(root: &std::path::Path) -> ToolSpill {
+        let config = agent_core::config::SynapsConfig::default();
+        ToolSpill::new(ToolSpillPolicy::from_config(&config), root, "sess-int", Arc::default())
+    }
+
+    /// One provider round of `calls` (id, name, input JSON) under `tool_spill`.
+    async fn drive_spilling(
+        tools_to_register: Vec<Arc<dyn Tool>>,
+        calls: &[(&str, &str, &str)],
+        hook_bus: Arc<crate::extensions::hooks::HookBus>,
+        tool_spill: ToolSpill,
+    ) -> Driven {
+        let (base_url, mock) = spawn_mock(sse_tool_use_round_with_input(calls)).await;
+        let mut registry = ToolRegistry::new();
+        for t in tools_to_register {
+            registry.register(t);
+        }
+        let (tx, mut rx) = mpsc::unbounded_channel::<StreamEvent>();
+        let mut session = harness_session(
+            base_url,
+            Arc::new(RwLock::new(registry)),
+            tx,
+            crate::tools::shell::SessionManager::new(crate::tools::shell::ShellConfig::default()),
+            hook_bus,
+            crate::tools::activation::SessionId::parse(&format!(
+                "test-{}-{}",
+                std::process::id(),
+                uuid::Uuid::new_v4()
+            ))
+            .unwrap(),
+            Default::default(),
+            false,
+            "claude-sonnet-4-6",
+        );
+        session.tool_spill = tool_spill;
+        let initial = vec![Arc::new(json!({"role":"user","content":"go"})) as SharedMessage];
+        let run = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            StreamMethods::run_stream_internal(session, initial),
+        )
+        .await
+        .expect("stream loop must finish");
+        let mut history = Vec::new();
+        let mut ui_results = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                StreamEvent::Session(SessionEvent::MessageHistory(m)) => history = m,
+                StreamEvent::Llm(LlmEvent::ToolResult { result, .. }) => ui_results.push(result),
+                _ => {}
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let bodies = mock.bodies.lock().unwrap().clone();
+        assert_eq!(mock.calls.load(Ordering::SeqCst), 2, "two provider rounds");
+        Driven {
+            history,
+            ui_results,
+            tool_signals: Vec::new(),
+            bodies,
+            rejected: run.is_err(),
+        }
+    }
+
+    /// `tool_result.content` per tool_use_id, from durable history AND the
+    /// round-2 wire body — they must agree.
+    fn result_contents(d: &Driven) -> std::collections::BTreeMap<String, Value> {
+        let history = d
+            .history
+            .iter()
+            .find(|m| m["role"] == "user" && m["content"][0]["type"] == "tool_result")
+            .expect("durable tool results");
+        let by_id = |message: &Value| -> std::collections::BTreeMap<String, Value> {
+            message["content"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| (r["tool_use_id"].as_str().unwrap().to_string(), r["content"].clone()))
+                .collect()
+        };
+        let contents = by_id(history);
+        // The wire copy may carry a cache marker; the content is the same.
+        assert!(contents == by_id(tool_result_message(&d.bodies[1])), "history and wire agree");
+        contents
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn virtualised_result_reaches_history_as_a_preview_and_the_spill_holds_every_byte() {
+        let _base = crate::test_env::BaseDirGuard::new();
+        let output = command_output(450); // 44_938 bytes: past max_tool_output too
+        for parallel in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let calls: &[(&str, &str, &str)] = if parallel {
+                &[("toolu_a", "dump", "{}"), ("toolu_b", "dump", "{}")]
+            } else {
+                &[("toolu_a", "dump", "{}")]
+            };
+            let d = drive_spilling(
+                vec![big_tool("dump", mcp_origin(), &output)],
+                calls,
+                Arc::new(crate::extensions::hooks::HookBus::new()),
+                spill_at(root.path()),
+            )
+            .await;
+            assert!(!d.rejected);
+            let contents = result_contents(&d);
+            assert_eq!(contents.len(), calls.len());
+            for (id, content) in &contents {
+                let preview = content.as_str().expect("plain text content");
+                let file = root.path().join("sess-int").join(format!("{id}.txt"));
+                assert!(preview.len() < 8 * 1024, "parallel={parallel}: {} bytes", preview.len());
+                assert!(preview.starts_with("out 00001 "));
+                assert!(
+                    preview.contains("ERROR: the tail is where the error is"),
+                    "the tail survives (the legacy cut loses it)"
+                );
+                assert!(preview.ends_with(&format!(
+                    "Full output: {} (read it with offset=40 limit=379, or grep it).]",
+                    file.display()
+                )), "{preview}");
+                assert_eq!(std::fs::read_to_string(&file).unwrap(), output, "lossless spill");
+            }
+            // The UI gets exactly what it got before (only history changed).
+            let ui = HelperMethods::truncate_tool_result(&output, 30_000);
+            assert!(d.ui_results.iter().all(|r| r == &ui));
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn virtualisation_off_is_byte_identical_to_the_legacy_cut() {
+        let _base = crate::test_env::BaseDirGuard::new();
+        let output = command_output(450);
+        // Legacy: the hook path cuts at max_tool_output, then the history
+        // selection cuts the (marker-lengthened) result again.
+        let legacy = Value::String(HelperMethods::truncate_tool_result(
+            &HelperMethods::truncate_tool_result(&output, 30_000),
+            30_000,
+        ));
+        let calls = [("toolu_a", "dump", "{}")];
+        let hooks = || Arc::new(crate::extensions::hooks::HookBus::new());
+        // Off through the virtualiser...
+        let off = drive_spilling(
+            vec![big_tool("dump", mcp_origin(), &output)],
+            &calls,
+            hooks(),
+            ToolSpill::off(),
+        )
+        .await;
+        // ...and the untouched default harness: the same bytes.
+        let default = drive(
+            vec![big_tool("dump", mcp_origin(), &output)],
+            &[("toolu_a", "dump")],
+            hooks(),
+        )
+        .await;
+        assert_eq!(result_contents(&off)["toolu_a"], legacy);
+        assert_eq!(result_contents(&default)["toolu_a"], legacy);
+        assert_eq!(off.bodies[1], default.bodies[1], "identical request body");
+
+        // On, but at or under the threshold: verbatim, no file.
+        let root = tempfile::tempdir().unwrap();
+        let small = "s".repeat(12 * 1024);
+        let d = drive_spilling(
+            vec![big_tool("dump", mcp_origin(), &small)],
+            &calls,
+            hooks(),
+            spill_at(root.path()),
+        )
+        .await;
+        assert_eq!(result_contents(&d)["toolu_a"], Value::String(small));
+        assert!(!root.path().join("sess-int").exists());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn only_output_dump_tools_and_extension_tools_are_virtualised() {
+        let _base = crate::test_env::BaseDirGuard::new();
+        let output = command_output(300);
+        let legacy = Value::String(HelperMethods::truncate_tool_result(&output, 30_000));
+        let extension = crate::tools::ToolOrigin::Extension {
+            extension_id: "ext".into(),
+        };
+        for (name, origin, virtualised) in [
+            ("grep", crate::tools::ToolOrigin::Builtin, true),
+            ("ext_dump", extension, true),
+            ("edit", crate::tools::ToolOrigin::Builtin, false),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let d = drive_spilling(
+                vec![big_tool(name, origin, &output)],
+                &[("toolu_a", name, "{}")],
+                Arc::new(crate::extensions::hooks::HookBus::new()),
+                spill_at(root.path()),
+            )
+            .await;
+            let content = result_contents(&d).remove("toolu_a").unwrap();
+            if virtualised {
+                let marker = format!("[Output virtualised: {} bytes", output.len());
+                assert!(content.as_str().unwrap().contains(&marker), "{name}");
+                assert!(root.path().join("sess-int/toolu_a.txt").exists(), "{name}");
+            } else {
+                assert_eq!(content, legacy, "{name}");
+                assert!(!root.path().join("sess-int").exists(), "{name}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn a_streaming_tool_virtualises_its_whole_result_not_the_delta_prefix() {
+        let _base = crate::test_env::BaseDirGuard::new();
+        let output = command_output(250); // 25_000 bytes; bash streams only 16 KiB
+        let bash = || -> Arc<dyn Tool> {
+            Arc::new(BigOutputTool {
+                name: "bash",
+                origin: crate::tools::ToolOrigin::Builtin,
+                text: output.clone(),
+                stream_prefix: true,
+            })
+        };
+        let calls = [("toolu_a", "bash", "{}")];
+        let hooks = || Arc::new(crate::extensions::hooks::HookBus::new());
+        // Legacy: history is the 16 KiB delta-lane prefix; the error is gone.
+        let off = drive_spilling(vec![bash()], &calls, hooks(), ToolSpill::off()).await;
+        let legacy = result_contents(&off).remove("toolu_a").unwrap();
+        assert_eq!(legacy.as_str().unwrap(), agent_core::truncate_str(&output, 16 * 1024));
+        // On: a preview of the WHOLE result, tail included, and a lossless file.
+        let root = tempfile::tempdir().unwrap();
+        let on = drive_spilling(vec![bash()], &calls, hooks(), spill_at(root.path())).await;
+        let preview = result_contents(&on).remove("toolu_a").unwrap();
+        assert!(preview.as_str().unwrap().contains("ERROR: the tail is where the error is"));
+        let file = root.path().join("sess-int/toolu_a.txt");
+        assert_eq!(std::fs::read_to_string(file).unwrap(), output);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn after_tool_call_transforms_run_before_virtualisation() {
+        let _base = crate::test_env::BaseDirGuard::new();
+        let root = tempfile::tempdir().unwrap();
+        let d = drive_spilling(
+            vec![big_tool("dump", mcp_origin(), &command_output(450))],
+            &[("toolu_a", "dump", "{}")],
+            output_hook_bus(Some(true)).await,
+            spill_at(root.path()),
+        )
+        .await;
+        // The hook replaced the output with something small: nothing to spill.
+        assert_eq!(result_contents(&d)["toolu_a"], json!("REPLACED BY HOOK"));
+        assert!(!root.path().join("sess-int").exists());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn rich_results_are_untouched_when_virtualisation_is_on() {
+        let _base = crate::test_env::BaseDirGuard::new();
+        let root = tempfile::tempdir().unwrap();
+        // A threshold the rich summary is far over: still untouched.
+        let spill = ToolSpill::new(
+            ToolSpillPolicy {
+                threshold_bytes: 8,
+                head_bytes: 2,
+                tail_bytes: 2,
+            },
+            root.path(),
+            "sess-int",
+            Arc::default(),
+        );
+        let d = drive_spilling(
+            vec![Arc::new(RichTool)],
+            &[("toolu_1", "rich_stub", "{}")],
+            Arc::new(crate::extensions::hooks::HookBus::new()),
+            spill,
+        )
+        .await;
+        let content = result_contents(&d).remove("toolu_1").unwrap();
+        let blocks = content.as_array().expect("array content, as before");
+        assert_eq!(blocks[0]["text"], "Image: /tmp/x.png (1x1, image/png, 1 KB)");
+        assert_eq!(blocks[1]["type"], "image");
+        assert!(!root.path().join("sess-int").exists());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn read_previews_point_at_the_file_and_never_copy_it() {
+        let _base = crate::test_env::BaseDirGuard::new();
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("big.rs");
+        let body: String = (1..=400)
+            .map(|i| format!("let value_{i:03} = compute({i}); // {}\n", "c".repeat(40)))
+            .collect();
+        std::fs::write(&file, &body).unwrap();
+        let input = json!({"path": file.to_str().unwrap()}).to_string();
+        let ranged = json!({"path": file.to_str().unwrap(), "limit": 400}).to_string();
+        let d = drive_spilling(
+            vec![Arc::new(crate::tools::ReadTool)],
+            &[("toolu_r", "read", &input), ("toolu_l", "read", &ranged)],
+            Arc::new(crate::extensions::hooks::HookBus::new()),
+            spill_at(root.path().join("spill").as_path()),
+        )
+        .await;
+        let contents = result_contents(&d);
+        let preview = contents["toolu_r"].as_str().unwrap();
+        assert!(preview.starts_with("1\tlet value_001 "));
+        assert!(preview.contains(&format!("Read {} with offset=", file.display())), "{preview}");
+        let ranged = contents["toolu_l"].as_str().unwrap();
+        assert!(!ranged.contains("[Output virtualised"), "an explicit limit is left alone");
+        assert!(!root.path().join("spill").exists(), "read never writes a spill copy");
     }
 }

@@ -30,6 +30,8 @@ pub struct HostParts {
     pub mcp_runtime: Option<Arc<crate::mcp::McpRuntimeManager>>,
     pub extension_runtime: Option<Arc<crate::extensions::lease::ExtensionRuntimeManager>>,
     pub capture_dir: std::path::PathBuf,
+    /// `<base>/spill` (tool output virtualisation), bound once at boot.
+    pub spill_root: std::path::PathBuf,
     pub progressive_tool_disclosure: bool,
 }
 
@@ -150,6 +152,7 @@ impl EngineHost {
         let client = crate::runtime::build_host_http_client()?;
         let capture_dir = crate::runtime::trace::default_capture_dir();
         let _ = crate::runtime::trace::sweep_expired_captures(&capture_dir);
+        let spill_root = crate::runtime::sweep_spill_root();
 
         let config = crate::config::load_config();
         let tools = Arc::new(RwLock::new(ToolRegistry::new()));
@@ -203,6 +206,7 @@ impl EngineHost {
             mcp_runtime,
             extension_runtime,
             capture_dir,
+            spill_root,
             progressive_tool_disclosure: config.progressive_tool_disclosure,
         };
 

@@ -47,6 +47,41 @@ impl ExecutionCorrelation {
         commit_status: ExecutionCommitStatus,
         model_order: usize,
     ) {
+        self.record_virtualised(
+            tool_call_id,
+            stable_tool_id,
+            wire_name,
+            phase,
+            started,
+            result_bytes,
+            retained_bytes,
+            activation,
+            effect,
+            commit_status,
+            model_order,
+            false,
+        );
+    }
+
+    /// [`Self::record`] for a call whose history entry may be a tool output
+    /// virtualisation preview: then `result_bytes` is the whole output and
+    /// `retained_bytes` the preview, and the event says `virtualised`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_virtualised(
+        &self,
+        tool_call_id: &str,
+        stable_tool_id: &ToolId,
+        wire_name: &str,
+        phase: ExecutionPhase,
+        started: Instant,
+        result_bytes: usize,
+        retained_bytes: usize,
+        activation: ActivationBasis,
+        effect: ToolEffect,
+        commit_status: ExecutionCommitStatus,
+        model_order: usize,
+        virtualised: bool,
+    ) {
         let Ok(tool_call_id) = TraceId::new(tool_call_id) else {
             return;
         };
@@ -83,6 +118,7 @@ impl ExecutionCorrelation {
             effect,
             commit_status,
             model_order: model_order as u32,
+            virtualised,
         };
         self.trace.record_execution_event(event);
         self.trace.emit_execution_enriched(&self.request_id);
@@ -128,6 +164,42 @@ mod tests {
         assert!(event.truncated);
         let serialized = serde_json::to_string(event).unwrap();
         assert!(!serialized.contains("raw result"));
+    }
+
+    /// A virtualised result: `result_bytes` is the whole output,
+    /// `preview_bytes` what history carries; the difference is what was
+    /// kept out of history. Legacy events omit the flag on the wire.
+    #[test]
+    fn virtualised_results_are_flagged_and_sized() {
+        let sink = CollectingTraceSink::new();
+        let trace = TraceContext::with_sink(sink);
+        let request = trace.reserve_request_correlation().unwrap();
+        let correlation = ExecutionCorrelation::from_request(&trace, &request);
+        for (id, virtualised) in [("toolu_v", true), ("toolu_l", false)] {
+            correlation.record_virtualised(
+                id,
+                &ToolId::builtin("bash"),
+                "bash",
+                ExecutionPhase::ResultRecorded,
+                Instant::now(),
+                48_213,
+                7_400,
+                ActivationBasis::Core,
+                ToolEffect::NonIdempotent,
+                ExecutionCommitStatus::ResultRecorded,
+                0,
+                virtualised,
+            );
+        }
+        let events = trace.execution_events(&request.request_id);
+        assert!(events[0].virtualised && !events[1].virtualised);
+        assert_eq!(events[0].result_bytes - events[0].preview_bytes, 48_213 - 7_400);
+        let wire = serde_json::to_value(&events[0]).unwrap();
+        assert_eq!(wire["virtualised"], true);
+        let legacy = serde_json::to_value(&events[1]).unwrap();
+        assert!(legacy.get("virtualised").is_none(), "absent unless set: {legacy}");
+        let back: ToolExecutionEvent = serde_json::from_value(legacy).unwrap();
+        assert!(!back.virtualised, "old records still read");
     }
 
     #[test]
