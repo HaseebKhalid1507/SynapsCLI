@@ -329,7 +329,9 @@ pub fn launcher_for_effective_env(
     #[cfg(target_os = "linux")]
     {
         if let Some(fake) = fake {
-            return launcher_with_binary(&fake, env, cwd, kind, slice);
+            // The fake answers no `--version`: it launches without
+            // `--expand-environment=no`, as a pre-254 systemd-run would.
+            return launcher_with_binary(&fake, false, env, cwd, kind, slice);
         }
         static BINARY: OnceLock<Option<PathBuf>> = OnceLock::new();
         let binary = BINARY.get_or_init(find_systemd_run).as_ref()?;
@@ -542,10 +544,10 @@ exit 0
         );
         assert_eq!(systemd_run_version(&binary), Some(249));
         let env = vec![("DBUS_SESSION_BUS_ADDRESS".into(), "fake:good".into())];
-        assert!(launcher_with_binary(&binary, false, &env, None).is_some());
+        assert!(launcher_with_binary(&binary, false, &env, None, ScopeKind::Tool, None).is_some());
         // Had support been misjudged, the probe fails: direct launch, never a
         // wrapped launch with an option the binary rejects.
-        assert!(launcher_with_binary(&binary, true, &env, None).is_none());
+        assert!(launcher_with_binary(&binary, true, &env, None, ScopeKind::Tool, None).is_none());
         fake_script(dir.path(), "systemd-run", "exit 1");
         assert_eq!(systemd_run_version(&binary), None);
         fake_script(dir.path(), "systemd-run", "echo 'systemd 258 (258)'");
@@ -572,7 +574,7 @@ exit 0
         };
         let mut env = inherited_env();
         set_env(&mut env, "x", "EXPANDED");
-        let Some(launcher) = launcher_with_binary(&binary, no_expand, &env, None) else {
+        let Some(launcher) = launcher_with_binary(&binary, no_expand, &env, None, ScopeKind::Tool, None) else {
             eprintln!("skip: no reachable systemd user manager");
             return;
         };
@@ -812,6 +814,7 @@ printf 'wrapper=%s\n' "$$"
     fn wrap_passes_the_slice_before_the_description_when_set() {
         let l = ScopeLauncher {
             systemd_run: PathBuf::from("/usr/bin/systemd-run"),
+            no_expand: false,
             slice: Some("worker-agent.slice".into()),
         };
         let (program, args) = l.wrap("synaps tool: bash", "bash", ["-c".into(), "echo hi".into()]);
@@ -855,14 +858,14 @@ printf 'wrapper=%s\n' "$$"
         let fake = test_support::fake_systemd_run(dir.path());
         let env = vec![("DBUS_SESSION_BUS_ADDRESS".into(), "fake:good".into())];
         // Unset: the probe's options are today's, byte for byte.
-        assert!(launcher_with_binary(&fake, &env, Some(dir.path()), ScopeKind::Tool, None).is_some());
+        assert!(launcher_with_binary(&fake, false, &env, Some(dir.path()), ScopeKind::Tool, None).is_some());
         assert_eq!(
             test_support::recorded(dir.path(), "probe.args"),
             ["--user", "--scope", "--quiet", "--collect", "--description=synaps scope probe", "--", "/bin/true"]
         );
         // Set: the probe carries the launch's --slice.
         let slice = Some("worker-agent.slice".to_string());
-        let l = launcher_with_binary(&fake, &env, Some(dir.path()), ScopeKind::Tool, slice).unwrap();
+        let l = launcher_with_binary(&fake, false, &env, Some(dir.path()), ScopeKind::Tool, slice).unwrap();
         assert_eq!(
             test_support::recorded(dir.path(), "probe.args"),
             [
@@ -886,8 +889,8 @@ printf 'wrapper=%s\n' "$$"
 exit 0"#,
         );
         let refused = Some("refused-probe-test.slice".to_string());
-        assert!(launcher_with_binary(&refusing, &env, Some(dir.path()), ScopeKind::Tool, refused).is_none());
-        assert!(launcher_with_binary(&refusing, &env, Some(dir.path()), ScopeKind::Tool, None).is_some());
+        assert!(launcher_with_binary(&refusing, false, &env, Some(dir.path()), ScopeKind::Tool, refused).is_none());
+        assert!(launcher_with_binary(&refusing, false, &env, Some(dir.path()), ScopeKind::Tool, None).is_some());
     }
 
     #[cfg(target_os = "linux")]
