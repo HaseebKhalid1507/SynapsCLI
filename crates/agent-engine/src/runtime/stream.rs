@@ -5815,6 +5815,121 @@ mod rich_output_tests {
         );
     }
 
+    /// The 2026-10-30 anchor miss, on the wire. A worker's retention
+    /// frontier (the oldest screenshot the previous request sent) is the
+    /// SECOND image of a parallel pair. Both requests must anchor on a whole
+    /// message strictly before that pair's message: the retiring request
+    /// rewrites the pair's block 1, and an anchor on its block 0 read 6.8k
+    /// and wrote 281k in production. The two bodies share every byte up to
+    /// and including the anchored message.
+    #[tokio::test]
+    async fn worker_anchor_precedes_a_parallel_batch_whose_second_image_retires() {
+        use super::super::image_retention::OMITTED;
+        let image = || json!({"type":"image","source":{"type":"base64","media_type":"image/png","data":fake_b64(1_000)}});
+        let result = |id: &str| {
+            json!({"type":"tool_result","tool_use_id":id,
+            "content":[{"type":"text","text":format!("Image: /tmp/{id}.png")}, image()]})
+        };
+        let call = |id: &str| json!({"type":"tool_use","id":id,"name":"read","input":{"path":format!("/tmp/{id}.png")}});
+        // Screenshots s0 s1 s2, the pair (a, b) in message 8, then s3..s6:
+        // the 7th image retires s0 s1 s2 a (down to three), so the request
+        // before the tool round below sent b onward: frontier (8, 1).
+        let mut history = vec![user_msg(json!("look at these"))];
+        for batch in [
+            &["s0"][..],
+            &["s1"],
+            &["s2"],
+            &["a", "b"],
+            &["s3"],
+            &["s4"],
+            &["s5"],
+            &["s6"],
+        ] {
+            history.push(Arc::new(json!({"role":"assistant","content":
+                batch.iter().map(|id| call(id)).collect::<Vec<_>>()})));
+            history.push(user_msg(json!(batch
+                .iter()
+                .map(|id| result(id))
+                .collect::<Vec<_>>())));
+        }
+        let pair = 8;
+        assert_eq!(history[pair]["content"][1]["tool_use_id"], "b");
+        // The tool round adds a parallel pair (c, d): seven retained, so the
+        // second request retires b s3 s4 s5, starting at block 1 of `pair`.
+        let d = drive_configured(
+            "claude-sonnet-4-6",
+            history,
+            vec![Arc::new(RichTool)],
+            &[("toolu_c", "rich_stub"), ("toolu_d", "rich_stub")],
+            Arc::new(crate::extensions::hooks::HookBus::new()),
+            std::time::Duration::from_secs(60),
+            |session| {
+                session.options.codex_request_role =
+                    super::super::openai::catalog::CodexRequestRole::Worker;
+            },
+        )
+        .await;
+        assert_eq!(d.bodies.len(), 2);
+        let stripped = |body: &Value| -> Vec<Value> {
+            let mut msgs = body["messages"].as_array().unwrap().clone();
+            for msg in &mut msgs {
+                for block in msg["content"].as_array_mut().into_iter().flatten() {
+                    block.as_object_mut().unwrap().remove("cache_control");
+                }
+            }
+            msgs
+        };
+        let anchor = |body: &Value| -> (usize, usize) {
+            let marks: Vec<(usize, usize)> = body["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .enumerate()
+                .flat_map(|(m, msg)| {
+                    msg["content"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .enumerate()
+                        .filter(|(_, b)| b.get("cache_control").is_some())
+                        .map(move |(b, _)| (m, b))
+                })
+                .collect();
+            assert_eq!(marks.len(), 2, "anchor + tail: {marks:?}");
+            let total = serde_json::to_string(body)
+                .unwrap()
+                .matches("\"cache_control\"")
+                .count();
+            assert!(total <= 4, "at most four breakpoints, saw {total}");
+            marks[0]
+        };
+        let (before, after) = (stripped(&d.bodies[0]), stripped(&d.bodies[1]));
+        // The retirement: b goes in the second request, a was gone already.
+        let pair_block = |msgs: &[Value], b: usize| msgs[pair]["content"][b]["content"][1].clone();
+        assert_eq!(pair_block(&before, 0)["text"], OMITTED);
+        assert_eq!(pair_block(&before, 1)["type"], "image");
+        assert_eq!(pair_block(&after, 1)["text"], OMITTED);
+        let rewritten = (0..before.len())
+            .find(|&m| before[m] != after[m])
+            .expect("the second request retires");
+        assert_eq!(rewritten, pair);
+        // One anchor across both requests, on the message ahead of the pair
+        // (its tool_use pair), over identical bytes.
+        let (first, second) = (anchor(&d.bodies[0]), anchor(&d.bodies[1]));
+        assert_eq!(first, second);
+        assert_eq!(
+            second,
+            (pair - 1, 1),
+            "anchor on the pair's tool_use message"
+        );
+        assert!(second.0 < rewritten);
+        assert_eq!(
+            serde_json::to_string(&before[..=second.0]).unwrap(),
+            serde_json::to_string(&after[..=second.0]).unwrap(),
+            "the anchored prefix is byte-identical across the two requests"
+        );
+    }
+
     /// Histories below both retention thresholds remain untouched.
     #[tokio::test]
     async fn valid_history_reaches_provider_unpruned() {
