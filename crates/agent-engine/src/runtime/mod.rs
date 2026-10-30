@@ -1909,6 +1909,14 @@ impl Runtime {
         &self.hook_bus
     }
 
+    /// Replace the hook bus before the first turn (in-flight streams keep
+    /// the bus they started with). Subagent spawn only: the legacy
+    /// fresh-runtime path installs the host's worker view, and
+    /// `subagent_transform_hooks = off` detaches it.
+    pub(crate) fn set_hook_bus(&mut self, bus: Arc<crate::extensions::hooks::HookBus>) {
+        self.hook_bus = bus;
+    }
+
     /// Background shell/PTY sessions owned by this runtime (`Checkpoint`
     /// and `Parked` close them via `shutdown_all`).
     pub fn session_manager(&self) -> &Arc<crate::tools::shell::SessionManager> {

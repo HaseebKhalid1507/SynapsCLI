@@ -23,8 +23,11 @@ extension that ignores `session_id` sees the same shape it always did.
 
 - **Workers / subagents.** A worker runtime has no conversation id
   (`Runtime.session_id == None`), so its tool hooks still emit `null` —
-  exactly as before. Plugins must not assume every tool call belongs to a
-  session.
+  exactly as before. The only hook a worker runs is the `after_tool_call`
+  output transform (extensions with `tools.transform_output`; see
+  `hooks.md`, "Subagent workers"), and it arrives with `session_id: null`;
+  `SYNAPS_HOOK_SESSION_ID=0` changes nothing for it. Plugins must not assume
+  every tool call belongs to a session.
 - **Extension-originated `tool.invoke`.** A tool invoked by a sidecar via the
   extension protocol runs outside a conversation turn; `null`.
 - **`tool.call` outside a conversation.** The extension-provider tool route,

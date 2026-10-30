@@ -7226,6 +7226,106 @@ mod rich_output_tests {
             assert!(run.event("toolu_r3").virtualised && !run.event("toolu_r3").deduped);
         }
 
+        /// An output transform that tags every result: `[crushed]`, or with
+        /// `count`, `[crushed N]` (a different text on every call).
+        struct TagTransform {
+            count: Option<AtomicUsize>,
+        }
+
+        #[async_trait::async_trait]
+        impl crate::extensions::runtime::ExtensionHandler for TagTransform {
+            fn id(&self) -> &str {
+                "tag-transform"
+            }
+            async fn handle(&self, event: &HookEvent) -> HookResult {
+                let tag = match &self.count {
+                    Some(n) => format!("[crushed {}]", n.fetch_add(1, Ordering::SeqCst)),
+                    None => "[crushed]".to_string(),
+                };
+                HookResult::Replace {
+                    output: format!("{tag}\n{}", event.tool_output.as_deref().unwrap_or("")),
+                }
+            }
+            async fn shutdown(&self) {}
+        }
+
+        /// The worker path: a subagent's view of the host bus
+        /// (`HookBus::worker_transforms`) runs the host's output transform
+        /// in the same stream loop, in the foreground's order: the hook,
+        /// then the #334 spill (the spill file holds the transformed
+        /// output), then the #337 read dedupe (it compares the transformed
+        /// history text).
+        #[tokio::test]
+        #[serial_test::serial(synaps_base_dir)]
+        async fn a_worker_transform_runs_before_spill_and_read_dedupe() {
+            let _base = crate::test_env::BaseDirGuard::new();
+            let dir = tempfile::tempdir().unwrap();
+            let small = dir.path().join("small.py");
+            std::fs::write(&small, source(20, "s")).unwrap();
+            std::fs::write(dir.path().join("big.py"), source(600, "b")).unwrap();
+            let rounds = vec![
+                vec![("toolu_r1", "read", read(&small))],
+                vec![("toolu_r2", "read", read(&small))],
+                vec![(
+                    "toolu_g",
+                    "grep",
+                    json!({"pattern": "b line", "path": dir.path().to_string_lossy()}),
+                )],
+            ];
+            for counting in [false, true] {
+                let root = tempfile::tempdir().unwrap();
+                let host = Arc::new(crate::extensions::hooks::HookBus::new());
+                let mut perms = PermissionSet::new();
+                perms.grant(crate::extensions::permissions::Permission::ToolsIntercept);
+                perms.grant(crate::extensions::permissions::Permission::ToolsTransformOutput);
+                let transform = TagTransform {
+                    count: counting.then(|| AtomicUsize::new(1)),
+                };
+                host.subscribe(HookKind::AfterToolCall, Arc::new(transform), None, None, perms)
+                    .await
+                    .unwrap();
+                let spill = spill_at(root.path());
+                let cwd = dir.path().to_path_buf();
+                let run = drive_rounds(go(), &rounds, true, move |s| {
+                    s.hook_bus = crate::extensions::hooks::HookBus::worker_transforms(&host);
+                    s.tool_spill = spill;
+                    s.cwd = Some(cwd);
+                    s.session_id = None;
+                    s.turn_budget = crate::runtime::budget::TurnBudget::for_role(
+                        crate::runtime::budget::TurnRole::Worker,
+                    );
+                    s.options.codex_request_role =
+                        crate::runtime::openai::catalog::CodexRequestRole::Worker;
+                })
+                .await;
+
+                // 1. The hook: history carries the transformed read.
+                let r1 = run.text("toolu_r1");
+                let tag = if counting { "[crushed 1]" } else { "[crushed]" };
+                assert!(r1.starts_with(&format!("{tag}\n1\ts line 0001: ")), "{r1}");
+                // 3. Dedupe compares the post-hook text: the same transform of
+                // the same read is a stub; a different one is not a re-read.
+                if counting {
+                    assert!(run.text("toolu_r2").starts_with("[crushed 2]\n1\ts line 0001"));
+                    assert!(!run.event("toolu_r2").deduped);
+                } else {
+                    assert_eq!(run.result("toolu_r2"), Value::String(unchanged_stub("toolu_r1")));
+                    assert!(run.event("toolu_r2").deduped);
+                }
+                // 2. The spill holds the transformed output, and the preview
+                // in history is cut from it.
+                let file = root.path().join("sess-int/toolu_g.txt");
+                let spilled = std::fs::read_to_string(&file).expect("the grep result spilled");
+                let tag = if counting { "[crushed 3]\n" } else { "[crushed]\n" };
+                assert!(spilled.starts_with(tag), "spilled after the hook");
+                assert!(spilled.contains("b line 0600"), "the whole transformed output");
+                let preview = run.text("toolu_g");
+                assert!(preview.starts_with(tag) && preview.len() < 16 * 1024, "{preview}");
+                assert!(preview.contains(&file.display().to_string()));
+                assert!(run.event("toolu_g").virtualised);
+            }
+        }
+
         #[tokio::test]
         async fn a_prior_turn_read_counts_until_compaction_removes_it() {
             let dir = tempfile::tempdir().unwrap();

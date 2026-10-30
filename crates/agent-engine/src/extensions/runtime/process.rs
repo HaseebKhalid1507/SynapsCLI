@@ -1621,6 +1621,57 @@ impl ProcessExtension {
             .map(|_| ())
     }
 
+    /// A `hook.handle` call's outcome as the handler's decision: a
+    /// malformed `modify` blocks, every other failure (bad result, transport
+    /// error, timeout) is `Continue`.
+    fn hook_result(
+        &self,
+        outcome: Result<Result<Value, String>, tokio::time::error::Elapsed>,
+    ) -> HookResult {
+        match outcome {
+            Ok(Ok(value)) => match serde_json::from_value(value.clone()) {
+                Ok(result) => result,
+                Err(error) => {
+                    tracing::warn!(
+                        extension = %self.id,
+                        error = %error,
+                        response = %value,
+                        "Extension hook handler returned invalid result",
+                    );
+                    match value.get("action").and_then(Value::as_str) {
+                        // A malformed `modify` is dangerous — it would let an
+                        // unknown/partial input through. Fail safe by blocking.
+                        Some("modify") => HookResult::Block {
+                            reason: "Extension returned malformed modify result".to_string(),
+                        },
+                        // A malformed `replace` is safe to ignore: the original
+                        // tool output is preserved by emit_after_tool_call.
+                        // Explicit arm so this intent can't be silently changed
+                        // by a future edit to the catch-all below.
+                        Some("replace") => HookResult::Continue,
+                        _ => HookResult::Continue,
+                    }
+                }
+            },
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    extension = %self.id,
+                    error = %e,
+                    "Extension hook handler failed — continuing",
+                );
+                HookResult::Continue
+            }
+            Err(_) => {
+                tracing::warn!(
+                    extension = %self.id,
+                    timeout_secs = 5,
+                    "Extension hook handler timed out — continuing",
+                );
+                HookResult::Continue
+            }
+        }
+    }
+
     async fn restart_locked(&self, state: &mut Option<ProcessState>) -> Result<(), String> {
         if self.stopped.load(Ordering::Acquire) {
             return Err(format!(
@@ -2346,53 +2397,27 @@ impl ExtensionHandler for ProcessExtension {
 
     async fn handle(&self, event: &HookEvent) -> HookResult {
         let params = serde_json::to_value(event).unwrap_or(Value::Null);
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            self.call("hook.handle", params),
+        self.hook_result(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                self.call("hook.handle", params),
+            )
+            .await,
         )
-        .await
-        {
-            Ok(Ok(value)) => match serde_json::from_value(value.clone()) {
-                Ok(result) => result,
-                Err(error) => {
-                    tracing::warn!(
-                        extension = %self.id,
-                        error = %error,
-                        response = %value,
-                        "Extension hook handler returned invalid result",
-                    );
-                    match value.get("action").and_then(Value::as_str) {
-                        // A malformed `modify` is dangerous — it would let an
-                        // unknown/partial input through. Fail safe by blocking.
-                        Some("modify") => HookResult::Block {
-                            reason: "Extension returned malformed modify result".to_string(),
-                        },
-                        // A malformed `replace` is safe to ignore: the original
-                        // tool output is preserved by emit_after_tool_call.
-                        // Explicit arm so this intent can't be silently changed
-                        // by a future edit to the catch-all below.
-                        Some("replace") => HookResult::Continue,
-                        _ => HookResult::Continue,
-                    }
-                }
-            },
-            Ok(Err(e)) => {
-                tracing::warn!(
-                    extension = %self.id,
-                    error = %e,
-                    "Extension hook handler failed — continuing",
-                );
-                HookResult::Continue
-            }
-            Err(_) => {
-                tracing::warn!(
-                    extension = %self.id,
-                    timeout_secs = 5,
-                    "Extension hook handler timed out — continuing",
-                );
-                HookResult::Continue
-            }
-        }
+    }
+
+    /// The worker path: one `hook.handle` on the running child only. No
+    /// spawn, no restart (`call_no_spawn`): a missing child or a dead
+    /// transport is a failed call, so `Continue`.
+    async fn handle_no_spawn(&self, event: &HookEvent) -> HookResult {
+        let params = serde_json::to_value(event).unwrap_or(Value::Null);
+        self.hook_result(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                self.call_no_spawn("hook.handle", params),
+            )
+            .await,
+        )
     }
 
     async fn get_info(&self) -> Result<crate::extensions::info::PluginInfo, String> {
@@ -3357,5 +3382,92 @@ done"#
         drop(slot_guard);
         assert_eq!(ext.lifecycle_snapshot(), Some(before));
         ext.force_shutdown().await;
+    }
+
+    /// Offline fixture: `initialize` answers normally, `hook.handle`
+    /// replaces every output with `CRUSHED`.
+    async fn replace_fixture() -> ProcessExtension {
+        let init = serde_json::json!({
+            "protocol_version": CURRENT_EXTENSION_PROTOCOL_VERSION,
+            "capabilities": {}
+        })
+        .to_string();
+        let script = format!(
+            r#"while IFS= read -r header; do
+    length=${{header#Content-Length: }}
+    length=${{length%?}}
+    IFS= read -r blank || exit 1
+    body=$(dd bs=1 count="$length" 2>/dev/null) || exit 1
+    id=${{body##*\"id\":}}
+    id=${{id%%[!0-9]*}}
+    case "$body" in
+        *'"method":"initialize"'*) reply='{{"jsonrpc":"2.0","id":'"$id"',"result":{init}}}' ;;
+        *'"method":"hook.handle"'*) reply='{{"jsonrpc":"2.0","id":'"$id"',"result":{{"action":"replace","output":"CRUSHED"}}}}' ;;
+        *) reply='{{"jsonrpc":"2.0","id":'"$id"',"result":{{}}}}' ;;
+    esac
+    printf 'Content-Length: %s\r\n\r\n%s' "${{#reply}}" "$reply"
+done"#
+        );
+        let ext = ProcessExtension::spawn("replace-fixture", "/bin/sh", &["-c".into(), script])
+            .await
+            .expect("spawn offline replace fixture");
+        tokio::time::timeout(Duration::from_secs(3), ext.initialize_for_test(None))
+            .await
+            .expect("bounded initialize")
+            .expect("initialize fixture");
+        ext
+    }
+
+    /// The subagent-worker hook path (`handle_no_spawn`) uses the running
+    /// child and never starts or restarts one: a crashed or stopped
+    /// extension passes the output through (`Continue`) at once, and only
+    /// the restart-capable `handle` (the foreground) brings it back.
+    #[tokio::test]
+    async fn a_worker_hook_never_respawns_a_crashed_or_stopped_extension() {
+        let ext = replace_fixture().await;
+        let event = HookEvent::after_tool_call(
+            "bash",
+            serde_json::json!({"command": "ls"}),
+            "RAW".to_string(),
+        );
+        let crushed = HookResult::Replace { output: "CRUSHED".into() };
+        async fn bounded<F: std::future::Future>(fut: F) -> F::Output {
+            tokio::time::timeout(Duration::from_secs(3), fut)
+                .await
+                .expect("bounded: never hangs")
+        }
+        assert_eq!(bounded(ext.handle_no_spawn(&event)).await, crushed);
+
+        // Crash: the child dies; the reader sees EOF and closes the inbox.
+        let lifecycle = ext.state.lock().await.as_ref().unwrap().lifecycle.clone();
+        lifecycle.child.lock().await.start_kill().unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !ext.inbox.closed.load(Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("reader observes the crash");
+        for _ in 0..3 {
+            assert_eq!(
+                bounded(ext.handle_no_spawn(&event)).await,
+                HookResult::Continue,
+                "crashed: pass-through"
+            );
+        }
+        assert_eq!(ext.total_restarts.load(Ordering::Relaxed), 0, "a worker never restarts it");
+        assert!(ext.inbox.closed.load(Ordering::Acquire), "nothing was respawned");
+
+        // The foreground's restart-capable path brings it back; workers then
+        // use the restarted child.
+        assert_eq!(bounded(ext.handle(&event)).await, crushed);
+        assert_eq!(ext.total_restarts.load(Ordering::Relaxed), 1);
+        assert_eq!(bounded(ext.handle_no_spawn(&event)).await, crushed);
+
+        // Stopped (unload/reload): pass-through, and still no respawn.
+        ext.shutdown().await;
+        assert_eq!(bounded(ext.handle_no_spawn(&event)).await, HookResult::Continue);
+        assert!(ext.state.lock().await.is_none(), "no process was respawned");
+        assert_eq!(ext.total_restarts.load(Ordering::Relaxed), 1);
     }
 }

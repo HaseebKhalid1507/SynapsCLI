@@ -79,7 +79,10 @@ other engine commands, `/confirms` is owner-only from an attached client.
 Subagent tool calls **don't run extension `before_tool_call` hooks** in this
 release. So extension `confirm` and `block` don't apply to subagents at all. A
 subagent's tool call isn't prompted and isn't blocked by an extension, whatever
-you answered in the main thread.
+you answered in the main thread. The only hooks a subagent runs are output
+transforms (`after_tool_call` `replace` from extensions with
+`tools.transform_output`), which never prompt; see
+`docs/extensions/hooks.md` ("Subagent workers").
 
 ## Turning prompts off
 

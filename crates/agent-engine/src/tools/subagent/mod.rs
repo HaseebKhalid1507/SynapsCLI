@@ -155,6 +155,13 @@ pub(crate) fn apply_subagent_runtime_policy(
         config,
     ));
     runtime.set_read_dedupe(config.read_dedupe);
+    // Output transforms: the spawn path gave the worker the host's
+    // after_tool_call transform view (`EngineHost::worker_hook_bus`); the
+    // operator can turn it off. Detaching only ever narrows: no spawn path
+    // hands a worker the full host bus.
+    if !config.subagent_transform_hooks {
+        runtime.set_hook_bus(std::sync::Arc::new(crate::extensions::hooks::HookBus::new()));
+    }
 
     // Credential source / token cache: host-built workers already share the
     // process-wide broker (`spawn_runtime`); only the legacy fresh-runtime
@@ -346,6 +353,11 @@ pub fn legacy_fresh_runtime() -> bool {
 /// installed, or kill-switch set): today's `Runtime::new()` + rebuilt tools +
 /// `apply_auth_config`, verbatim.
 ///
+/// Both paths run with the host's worker hook view
+/// (`EngineHost::worker_hook_bus`: its `after_tool_call` output transforms,
+/// nothing else). Without an installed host there are no host subscriptions
+/// to see, and the legacy runtime keeps its own empty bus.
+///
 /// Called from the subagent's own OS thread / current-thread tokio runtime:
 /// `EngineHost::current()` is a `OnceLock` read and `worker_runtime()` only
 /// touches `tokio::sync` primitives, so this is runtime-agnostic.
@@ -358,6 +370,9 @@ pub async fn spawn_runtime() -> crate::Result<crate::Runtime> {
     let mut rt = crate::Runtime::new().await?;
     rt.set_tools(subagent_tools().await);
     rt.apply_auth_config(&crate::config::load_config());
+    if let Some(host) = crate::EngineHost::current() {
+        rt.set_hook_bus(host.worker_hook_bus());
+    }
     Ok(rt)
 }
 
@@ -658,6 +673,24 @@ mod cache_ttl_policy_tests {
         let off = agent_core::config::load_config_from_str("read_dedupe = off\n");
         apply_subagent_runtime_policy(&mut runtime, &off, None, None, None, &Default::default());
         assert!(!runtime.read_dedupe());
+    }
+
+    /// `subagent_transform_hooks`: on (the default) keeps the host's
+    /// transform view the spawn path installed; off detaches it, so the
+    /// worker's tool results reach history untransformed.
+    #[test]
+    fn subagent_policy_keeps_or_detaches_the_transform_view() {
+        let host = std::sync::Arc::new(crate::extensions::hooks::HookBus::new());
+        let view = crate::extensions::hooks::HookBus::worker_transforms(&host);
+        let mut runtime = crate::Runtime::new_headless();
+        runtime.set_hook_bus(view.clone());
+        let on = agent_core::config::load_config_from_str("");
+        apply_subagent_runtime_policy(&mut runtime, &on, None, None, None, &Default::default());
+        assert!(std::sync::Arc::ptr_eq(runtime.hook_bus(), &view), "default on: kept");
+        let off = agent_core::config::load_config_from_str("subagent_transform_hooks = off\n");
+        apply_subagent_runtime_policy(&mut runtime, &off, None, None, None, &Default::default());
+        assert!(!runtime.hook_bus().is_worker_view(), "off: detached");
+        assert!(!std::sync::Arc::ptr_eq(runtime.hook_bus(), &host), "never the full host bus");
     }
 
     /// Task A5 memory-context invariant: subagents never inherit a memory
@@ -1144,6 +1177,44 @@ mod codex_ultra_worker_tests {
         apply_subagent_runtime_policy(&mut manual, &Default::default(), None, None, None, &Default::default());
         assert_eq!(manual.telemetry_level(), TelemetryLevel::Off);
         assert!(manual.telemetry_writer().is_none());
+    }
+
+    /// Output transforms reach every worker: oneshot, start and resume
+    /// each build their runtime ONLY through `spawn_runtime` (whose host
+    /// and legacy fresh-runtime branches both install the host's transform
+    /// view) and apply the policy (the opt-out) before streaming. Nothing
+    /// else in a spawn path constructs a runtime or swaps its hook bus.
+    #[test]
+    fn every_spawn_path_streams_with_the_hosts_transform_view() {
+        let spawn = include_str!("mod.rs");
+        let spawn = &spawn[spawn.find("pub async fn spawn_runtime()").unwrap()..];
+        let spawn = &spawn[..spawn.find("\n}\n").unwrap()];
+        let host_branch = spawn.find("return host.worker_runtime().await;").unwrap();
+        let legacy = spawn.find("crate::Runtime::new().await?").unwrap();
+        let legacy_view = spawn.find("rt.set_hook_bus(host.worker_hook_bus());").unwrap();
+        let legacy_ok = spawn.find("Ok(rt)").unwrap();
+        assert!(host_branch < legacy && legacy < legacy_view && legacy_view < legacy_ok);
+        let host = include_str!("../../host.rs");
+        let worker_runtime = &host[host.find("pub async fn worker_runtime(").unwrap()..];
+        let worker_runtime = &worker_runtime[..worker_runtime.find("\n    }\n").unwrap()];
+        assert!(worker_runtime.contains("host.hook_bus = self.worker_hook_bus();"));
+        assert!(host.contains("HookBus::worker_transforms(&self.parts.hook_bus)"));
+
+        for (name, source) in [
+            ("oneshot", include_str!("oneshot.rs")),
+            ("start", include_str!("start.rs")),
+            ("resume", include_str!("resume.rs")),
+        ] {
+            let production = source.split("#[cfg(test)]\nmod tests").next().unwrap();
+            assert_eq!(production.matches("super::spawn_runtime().await").count(), 1, "{name}");
+            for forbidden in ["Runtime::new(", "worker_runtime(", "set_hook_bus(", "HookBus::new("] {
+                assert!(!production.contains(forbidden), "{name}: {forbidden}");
+            }
+            let spawned = production.find("super::spawn_runtime().await").unwrap();
+            let policy = production.find("super::apply_subagent_runtime_policy(").unwrap();
+            let stream = production.find("runtime.run_stream").unwrap();
+            assert!(spawned < policy && policy < stream, "{name}");
+        }
     }
 
     #[test]
