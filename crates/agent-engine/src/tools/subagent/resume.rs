@@ -546,6 +546,24 @@ impl Tool for SubagentResumeTool {
                         runtime
                             .install_worker_orchestration(Arc::clone(&orchestration_for_runtime));
                         runtime.set_delegation_parent(Some(child_parent_id.clone()));
+                        // Rolled-over context goes beside this worker's
+                        // resume archive (see `worker_context`).
+                        let archive_dir = state_a
+                            .read()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .archive_dir
+                            .clone()
+                            .unwrap_or_else(super::archive::process_dir);
+                        super::attach_worker_transcripts(
+                            &mut runtime,
+                            archive_dir,
+                            &child_parent_id,
+                            Some(Arc::clone(&state_a)),
+                            &initial_messages,
+                            tx_events_a.clone(),
+                            subagent_id,
+                            &label_a,
+                        );
 
                         let cancel = crate::CancellationToken::new();
                         let cancel_inner = cancel.clone();

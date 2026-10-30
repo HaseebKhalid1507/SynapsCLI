@@ -48,6 +48,7 @@ pub mod subagent_watch;
 pub mod telemetry;
 pub mod tool_spill;
 pub mod trace;
+pub mod worker_context;
 pub(crate) mod transport;
 mod types;
 
@@ -565,6 +566,10 @@ pub struct Runtime {
     /// Opt-in context windows within a stable logical session (#112).
     /// DARK by default: `ContextManagementMode::Off`.
     pub(crate) continuation: continuation::SharedContinuation,
+    /// Subagent workers only: automatic context rollover into the worker's
+    /// archive directory (see `worker_context`). Inert by default and on
+    /// every foreground runtime.
+    worker_context: worker_context::WorkerContext,
     /// Model used for compaction. Falls back to claude-sonnet-4-6 if not set.
     compaction_model: Option<String>,
     /// Where compaction summarization runs (spec §9.4).
@@ -1329,6 +1334,7 @@ impl Runtime {
             memory_backend_config: None,
             memory_backend_reconfigure_denied: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             continuation: Arc::new(Mutex::new(continuation::ContinuationState::default())),
+            worker_context: Default::default(),
             pending_history_import_preview: std::sync::Arc::new(std::sync::Mutex::new(None)),
             history_import_plan: std::sync::Arc::new(std::sync::Mutex::new(None)),
             #[cfg(any(test, feature = "testing"))]
@@ -4110,6 +4116,26 @@ impl Runtime {
         self.cache_ttl = ttl;
     }
 
+    /// Worker rollover policy from config (`apply_subagent_runtime_policy`).
+    /// Inert until [`Self::attach_worker_transcripts`] gives it somewhere to
+    /// keep evicted history.
+    pub fn set_worker_context_settings(
+        &mut self,
+        settings: Option<worker_context::WorkerContextSettings>,
+    ) {
+        self.worker_context.settings = settings;
+    }
+
+    /// Where this worker's evicted history goes (its archive directory and
+    /// handle), plus who to tell. Set per spawn, before the run starts.
+    pub fn attach_worker_transcripts(&mut self, sink: worker_context::WorkerTranscriptSink) {
+        self.worker_context.sink = Some(sink);
+    }
+
+    pub fn worker_context(&self) -> &worker_context::WorkerContext {
+        &self.worker_context
+    }
+
     pub fn thinking_level(&self) -> &str {
         // For Max/Ultra the named_level wins; for legacy budget-only levels
         // we fall through to the legacy bucketing.
@@ -4291,6 +4317,7 @@ impl Runtime {
                     keepwarm: None,
                     // The non-stream transport never sends diagnostics.
                     cache_diagnosis: None,
+                    context_rollover: None,
                 },
             )
             .await?;
@@ -4867,6 +4894,7 @@ impl Runtime {
             // The foreground chain: the only requests that thread
             // `diagnostics.previous_message_id`.
             cache_diagnosis: self.cache_diagnosis(),
+            context_rollover: None,
         };
 
         let final_capture_history: Arc<Mutex<Option<Vec<crate::SharedMessage>>>> = Arc::new(Mutex::new(None));
@@ -4877,6 +4905,7 @@ impl Runtime {
             turn_completion: completion,
             context_window: self.context_window(),
             continuation: self.continuation.clone(),
+            worker_context: self.worker_context.clone(),
             auth,
             client,
             credential_source,
@@ -4982,6 +5011,7 @@ impl Clone for Runtime {
             codex_request_role: self.codex_request_role,
             context_window_override: self.context_window_override,
             continuation: Arc::clone(&self.continuation),
+            worker_context: self.worker_context.clone(),
             compaction_model: self.compaction_model.clone(),
             compaction_mode: self.compaction_mode,
             compaction_exclusions: self.compaction_exclusions.clone(),

@@ -454,12 +454,12 @@ pub fn successor_budget(
 }
 
 /// Share of the target the pinned first request may use.
-const PINNED_SHARE_PERCENT: u64 = 30;
+pub(super) const PINNED_SHARE_PERCENT: u64 = 30;
 /// Bound on the dropped-message index inside the continuation message.
-const DROPPED_INDEX_TOKENS: u64 = 2_000;
+pub(super) const DROPPED_INDEX_TOKENS: u64 = 2_000;
 const PREVIEW_CHARS: usize = 80;
 
-fn message_tokens(message: &SharedMessage) -> u64 {
+pub(super) fn message_tokens(message: &SharedMessage) -> u64 {
     super::context::estimate_history(std::slice::from_ref(message))
 }
 
@@ -521,7 +521,7 @@ fn event_attr(message: &Value, key: &str) -> Option<String> {
 /// Tool call/result dependency groups: union of messages sharing a tool id.
 /// Retaining any member of a group retains the whole group, so no call is
 /// orphaned and no result is ever invented.
-fn tool_groups(messages: &[SharedMessage]) -> Vec<usize> {
+pub(super) fn tool_groups(messages: &[SharedMessage]) -> Vec<usize> {
     fn find(parent: &mut [usize], mut i: usize) -> usize {
         while parent[i] != i {
             parent[i] = parent[parent[i]];

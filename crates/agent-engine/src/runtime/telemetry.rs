@@ -11,6 +11,8 @@
 //! so a record joins both its session and its `request-trace.jsonl` line.
 //! Worker records also carry the worker's identity (`worker_agent`,
 //! `worker_handle`, `parent_session_id`, `parent_runtime_session_id`).
+//! After an automatic context rollover a record names its context window
+//! (`rollover_window`), and the window's first request says `rollover: true`.
 //! `full` additionally records rate-limit headers. The `cache_diag` verdict
 //! is present at either level when `cache_diagnostics` is on.
 //!
@@ -319,6 +321,25 @@ pub struct TelemetryRecord {
     /// Worker records: the spawning session's `runtime_session_id`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_runtime_session_id: Option<String>,
+    /// The context window (2, 3, …) this request belongs to after an
+    /// automatic context rollover, worker or foreground. Absent before the
+    /// first rollover.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rollover_window: Option<u64>,
+    /// `true` only on the first request of a rolled-over window: the request
+    /// that writes the successor's prompt cache. Absent otherwise.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub rollover: bool,
+}
+
+/// What a turn request tells its telemetry record about context rollover
+/// (see [`TelemetryRecord::rollover_window`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RolloverStamp {
+    /// The context window the request belongs to (2 after one rollover).
+    pub window: u64,
+    /// The first request of that window.
+    pub first_request: bool,
 }
 
 impl TelemetryRecord {
@@ -518,6 +539,28 @@ mod tests {
         assert!(!json.contains("keepwarm"), "turn records carry no keepwarm field");
         assert!(!json.contains("worker"), "foreground records carry no worker field");
         assert!(json.contains("\"model\":\"claude-sonnet-4-6\""));
+    }
+
+    #[test]
+    fn rollover_fields_appear_only_after_a_rollover() {
+        let plain = serde_json::to_string(&TelemetryRecord::default()).unwrap();
+        assert!(!plain.contains("rollover"), "{plain}");
+        let first = TelemetryRecord {
+            rollover_window: Some(2),
+            rollover: true,
+            worker: true,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&first).unwrap();
+        assert!(json.contains("\"rollover_window\":2"), "{json}");
+        assert!(json.contains("\"rollover\":true"), "{json}");
+        let later = TelemetryRecord {
+            rollover_window: Some(2),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&later).unwrap();
+        assert!(json.contains("\"rollover_window\":2"), "{json}");
+        assert!(!json.contains("\"rollover\":"), "{json}");
     }
 
     #[test]

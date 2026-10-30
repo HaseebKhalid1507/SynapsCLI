@@ -47,6 +47,26 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- **Subagent workers roll their context over automatically.** A worker's
+  context used to grow until the model window was full (one reached about
+  999k tokens), re-reading all of it every round, and a worker that filled
+  its window died on "prompt is too long". Now, once a worker's request
+  reaches `subagent_rollover_tokens` (default 200000; the model window's own
+  rollover threshold wins when lower), or the window is nearly full, the host
+  moves its older rounds out of context: the worker keeps its task verbatim,
+  later orchestrator instructions, a host note, and its most recent rounds
+  (about 100k tokens in all), with every tool call still paired. Nothing is
+  summarized: the moved messages are saved as plain text beside the worker's
+  resume archive (`~/.synaps-cli/subagent-history/…/<handle>.window-<N>.md`),
+  and the note tells the worker where, so it can grep or read them. Nothing
+  goes to the memory backend. `subagent_context_management = off` turns this
+  off (both keys have `/settings` rows). A rollover shows as a notice in the
+  worker's stream, its subagent panel line, a `context` object in
+  `subagent_status` / `subagent_collect`, and the `rollover_window` /
+  `rollover` fields of `api-log.jsonl` (set after a foreground rollover too).
+  `subagent_resume` continues a rolled worker's window numbering; a cold
+  resume lists its saved windows. See
+  [docs/design/subagent-rollover.md](docs/design/subagent-rollover.md).
 - **`subagent_resume` no longer replays a big transcript into an expired
   cache.** Workers run on the 5-minute cache TTL, so resuming one after a
   longer wait rewrote its whole history at the cache-write price (measured:

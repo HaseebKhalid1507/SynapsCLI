@@ -140,6 +140,8 @@ pub(super) struct StreamSession {
     pub(super) turn_completion: super::types::TurnCompletion,
     pub(super) context_window: u64,
     pub(super) continuation: super::continuation::SharedContinuation,
+    /// Workers only: host-only context rollover (inert on the foreground).
+    pub(super) worker_context: super::worker_context::WorkerContext,
 
     // Auth & network
     pub(super) auth: Arc<RwLock<AuthState>>,
@@ -635,6 +637,7 @@ impl StreamMethods {
             turn_completion,
             context_window,
             continuation,
+            worker_context,
             auth,
             client,
             credential_source,
@@ -806,6 +809,19 @@ impl StreamMethods {
         } else {
             system_prompt
         };
+        // Workers only, never alongside foreground context management: the
+        // host-only rollover policy for this model window and where evicted
+        // history goes (`worker_context`). `None` = today's behaviour.
+        let worker_rollover = if context_enabled {
+            None
+        } else {
+            worker_context.resolve(context_window)
+        };
+        let mut worker_policy_state = agent_core::core::context_policy::ContextState::default();
+        let mut worker_window = super::worker_context::window_state(&messages).0;
+        // Set by a committed rollover (worker or foreground): the next request
+        // is the first of its window (telemetry `rollover: true`).
+        let mut first_request_of_window = false;
         // Tracks whether this context segment has made at least one provider
         // call (wall-clock checkpoint skips an un-exercised segment).
         let mut segment_has_provider_round = false;
@@ -1214,6 +1230,23 @@ impl StreamMethods {
             // clone, exactly the pre-Task-18 request path. Flag-on: build one
             // per-round options value carrying the session projection.
             let request_correlation = options.trace.reserve_request_correlation();
+            // Which context window this request belongs to, for telemetry.
+            let context_rollover = {
+                let window = if context_enabled {
+                    continuation
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .window
+                } else if worker_rollover.is_some() {
+                    worker_window
+                } else {
+                    1
+                };
+                (window > 1).then(|| super::telemetry::RolloverStamp {
+                    window,
+                    first_request: std::mem::take(&mut first_request_of_window),
+                })
+            };
             let projected_options;
             let metered_options;
             let round_options: &super::api::ApiOptions = if progressive_tool_disclosure {
@@ -1248,6 +1281,7 @@ impl StreamMethods {
                     usage_counters: Some(std::sync::Arc::clone(&usage_counters)),
                     request_correlation: request_correlation.clone(),
                     retention_frontier,
+                    context_rollover,
                     ..options.clone()
                 };
                 &projected_options
@@ -1256,6 +1290,7 @@ impl StreamMethods {
                     usage_counters: Some(std::sync::Arc::clone(&usage_counters)),
                     request_correlation: request_correlation.clone(),
                     retention_frontier,
+                    context_rollover,
                     ..options.clone()
                 };
                 &metered_options
@@ -1451,6 +1486,7 @@ impl StreamMethods {
                                     )
                                 };
                                 let _=tx.send(StreamEvent::Session(SessionEvent::Notice(format!("Continued automatically in context window {window} with a fresh wall-clock allowance; earlier eligible source evidence remains searchable. Other resource limits remain unchanged. No summarizing compaction.{carried}"))));
+                                first_request_of_window = true;
                                 continue;
                             }
                             Err(error) => {
@@ -1474,6 +1510,102 @@ impl StreamMethods {
                 // UI notices are edge-triggered; the model's reminder to collect
                 // pending workers rides every deferred round.
                 context_advisory = ContextAdvisory::for_request(transition, current_advisory);
+            } else if let Some((worker_policy, worker_sink)) = worker_rollover.as_ref() {
+                // ═══ WORKER CONTEXT ROLLOVER (host-only) ═══
+                // The foreground's estimator and policy engine; a worker
+                // successor (brief + orchestrator instructions + host note +
+                // recent rounds) and the evicted window saved beside the
+                // worker's resume archive. See `worker_context`.
+                use agent_core::core::context_policy::{assess_context, ContextAction};
+                let fallback_schema = tools_snapshot.tools_schema();
+                let schema = round_options
+                    .request_tools_schema
+                    .as_deref()
+                    .map(|s| s.as_slice())
+                    .unwrap_or(&fallback_schema);
+                let (assessment, budget) = pre_request_context_budget(
+                    &model,
+                    context_window,
+                    injected_system.as_deref(),
+                    schema,
+                    estimate_messages,
+                    thinking_budget as u64,
+                    max_tool_output as u64,
+                );
+                let used = assessment.used_tokens();
+                calibration_probe = Some((used, usage_counters.records()));
+                let decision = assess_context(&worker_policy.config, &worker_policy_state, budget);
+                worker_policy_state = decision.next_state;
+                if matches!(decision.action, ContextAction::Rollover | ContextAction::HardStop) {
+                    let overhead = used.saturating_sub(super::context::estimate_history(&messages));
+                    let calibration = continuation
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .calibration_for(&model);
+                    let hard_capacity = decision.action == ContextAction::HardStop;
+                    let mut target = worker_policy.successor_budget(overhead, calibration);
+                    if hard_capacity {
+                        target = super::worker_context::hard_capacity_budget(
+                            target,
+                            context_window,
+                            budget
+                                .required_next_round_tokens
+                                .max(worker_policy.config.reserve_tokens),
+                            overhead,
+                        );
+                    }
+                    match super::worker_context::roll_over(
+                        &messages,
+                        target,
+                        used,
+                        overhead,
+                        worker_policy,
+                        worker_sink,
+                        hard_capacity,
+                    ) {
+                        Ok(Some((successor, report))) => {
+                            tracing::info!(
+                                event = "worker_context_rollover",
+                                window = report.window,
+                                before_tokens = report.before_tokens,
+                                after_tokens = report.after_tokens,
+                                evicted_messages = report.evicted_messages,
+                                hard_capacity,
+                                "worker context rolled over"
+                            );
+                            messages = successor;
+                            worker_policy_state.reset();
+                            worker_window = report.window;
+                            first_request_of_window = true;
+                            send_history!(clone);
+                            // Already published: the next round checkpoint
+                            // must not re-send the identical head.
+                            round_checkpoint.mark_published(&messages);
+                            let _ = tx.send(StreamEvent::Session(SessionEvent::Notice(
+                                report.notice(),
+                            )));
+                            if let Some(observer) = worker_sink.observer.as_ref() {
+                                observer(&report);
+                            }
+                            continue;
+                        }
+                        Ok(None) => {
+                            tracing::debug!(
+                                used_tokens = used,
+                                hard_capacity,
+                                "worker context rollover cannot shrink the context yet; deferred"
+                            );
+                            worker_policy_state.defer_unproductive_rollover(used);
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                %error,
+                                "worker context rollover skipped: the evicted window could not be saved; history kept"
+                            );
+                            worker_policy_state.defer_unproductive_rollover(used);
+                        }
+                    }
+                }
             }
 
             // Request-only advisory: once per state transition, or every
@@ -3985,6 +4117,7 @@ mod rich_output_tests {
             continuation: std::sync::Arc::new(std::sync::Mutex::new(
                 crate::runtime::continuation::ContinuationState::default(),
             )),
+            worker_context: Default::default(),
             auth: Arc::new(RwLock::new(AuthState {
                 auth_token: "test-token".into(),
                 auth_type: "api_key".into(),
@@ -5705,6 +5838,7 @@ mod rich_output_tests {
             continuation: std::sync::Arc::new(std::sync::Mutex::new(
                 crate::runtime::continuation::ContinuationState::default(),
             )),
+            worker_context: Default::default(),
             auth: Arc::new(RwLock::new(AuthState {
                 auth_token: "test-token".into(),
                 auth_type: "api_key".into(),
@@ -6190,5 +6324,325 @@ mod rich_output_tests {
         let ranged = contents["toolu_l"].as_str().unwrap();
         assert!(!ranged.contains("[Output virtualised"), "an explicit limit is left alone");
         assert!(!root.path().join("spill").exists(), "read never writes a spill copy");
+    }
+
+    // ── Worker context rollover through the real stream loop ───────────────
+
+    /// A worker tool whose every call returns a large, numbered output.
+    struct WorkerBigOutputTool(Arc<AtomicUsize>);
+    #[async_trait::async_trait]
+    impl Tool for WorkerBigOutputTool {
+        fn name(&self) -> &str {
+            "big_out"
+        }
+        fn description(&self) -> &str {
+            "returns a lot of text"
+        }
+        fn parameters(&self) -> Value {
+            json!({"type":"object","properties":{}})
+        }
+        fn origin(&self) -> crate::tools::ToolOrigin {
+            crate::tools::ToolOrigin::Builtin
+        }
+        fn effect(&self) -> crate::tools::catalog::ToolEffect {
+            crate::tools::catalog::ToolEffect::ReadOnly
+        }
+        async fn execute(&self, _params: Value, _ctx: ToolContext) -> Result<String> {
+            let n = self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(format!("ROUND-OUTPUT-{n} {}", "y".repeat(6_000)))
+        }
+    }
+
+    /// One worker round: a signed thinking block, then a `big_out` call.
+    fn sse_thinking_tool_round(n: usize) -> String {
+        let lines = [
+            format!(r#"data: {{"type":"message_start","message":{{"id":"msg_{n}","type":"message","role":"assistant","content":[],"model":"claude-sonnet-4-6","stop_reason":null,"stop_sequence":null,"usage":{{"input_tokens":10,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}}}}"#),
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#.to_string(),
+            format!(r#"data: {{"type":"content_block_delta","index":0,"delta":{{"type":"thinking_delta","thinking":"planning step {n}"}}}}"#),
+            format!(r#"data: {{"type":"content_block_delta","index":0,"delta":{{"type":"signature_delta","signature":"sig-{n}"}}}}"#),
+            r#"data: {"type":"content_block_stop","index":0}"#.to_string(),
+            format!(r#"data: {{"type":"content_block_start","index":1,"content_block":{{"type":"tool_use","id":"tu_{n}","name":"big_out"}}}}"#),
+            r#"data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{}"}}"#.to_string(),
+            r#"data: {"type":"content_block_stop","index":1}"#.to_string(),
+            r#"data: {"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"input_tokens":10,"output_tokens":5,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}"#.to_string(),
+            r#"data: {"type":"message_stop"}"#.to_string(),
+        ];
+        let mut s = lines.join("\n\n");
+        s.push_str("\n\n");
+        s
+    }
+
+    /// Anthropic stand-in: `rounds` tool rounds, then `end_turn`.
+    async fn spawn_rounds_mock(rounds: usize) -> (String, Arc<Mutex<Vec<Value>>>) {
+        let bodies = Arc::new(Mutex::new(Vec::new()));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (b, c) = (Arc::clone(&bodies), Arc::clone(&calls));
+        let app = Router::new()
+            .route(
+                "/v1/messages",
+                post(move |body: String| {
+                    let (b, c) = (Arc::clone(&b), Arc::clone(&c));
+                    async move {
+                        let n = c.fetch_add(1, Ordering::SeqCst);
+                        if let Ok(v) = serde_json::from_str::<Value>(&body) {
+                            b.lock().unwrap().push(v);
+                        }
+                        let sse = if n < rounds {
+                            sse_thinking_tool_round(n)
+                        } else {
+                            SSE_END_TURN.to_string()
+                        };
+                        (StatusCode::OK, [("content-type", "text/event-stream")], sse).into_response()
+                    }
+                }),
+            )
+            .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), bodies)
+    }
+
+    struct WorkerRun {
+        history: Vec<SharedMessage>,
+        bodies: Vec<Value>,
+        notices: Vec<String>,
+        reports: Vec<crate::runtime::worker_context::WorkerRolloverReport>,
+        records: Vec<Value>,
+    }
+
+    /// Drive one worker turn of `rounds` tool rounds with rollover at
+    /// `rollover_tokens` on a `window`-token model, writing transcripts and
+    /// telemetry into `dir`.
+    async fn drive_worker(
+        initial: Vec<SharedMessage>,
+        rounds: usize,
+        window: u64,
+        rollover_tokens: u64,
+        dir: &std::path::Path,
+        stem: &str,
+    ) -> WorkerRun {
+        use crate::runtime::worker_context::{
+            WorkerContext, WorkerContextSettings, WorkerRolloverReport, WorkerTranscriptSink,
+        };
+        let (base_url, bodies) = spawn_rounds_mock(rounds).await;
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(WorkerBigOutputTool(Arc::new(AtomicUsize::new(0)))));
+        let tools = Arc::new(RwLock::new(registry));
+        let (tx, mut rx) = mpsc::unbounded_channel::<StreamEvent>();
+        let tool_session_id = crate::tools::activation::SessionId::parse(&format!(
+            "test-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ))
+        .unwrap();
+        let mut session = harness_session(
+            base_url,
+            tools,
+            tx,
+            crate::tools::shell::SessionManager::new(crate::tools::shell::ShellConfig::default()),
+            Arc::new(crate::extensions::hooks::HookBus::new()),
+            tool_session_id,
+            Default::default(),
+            false,
+            "claude-sonnet-4-6",
+        );
+        let writer = crate::runtime::telemetry::TelemetryWriter::new(
+            crate::runtime::telemetry::WriterOptions {
+                telemetry_path: Some(dir.join("api-log.jsonl")),
+                trace_path: Some(dir.join("request-trace.jsonl")),
+                capacity: 256,
+                max_file_bytes: crate::runtime::telemetry::DEFAULT_MAX_FILE_BYTES,
+                max_generations: 1,
+                write_delay: None,
+                write_gate: None,
+            },
+        );
+        session.context_window = window;
+        session.telemetry_level = crate::runtime::telemetry::TelemetryLevel::Basic;
+        session.options.telemetry = Some(writer.clone());
+        session.options.codex_request_role = crate::runtime::openai::catalog::CodexRequestRole::Worker;
+        let reports: Arc<Mutex<Vec<WorkerRolloverReport>>> = Default::default();
+        let seen = Arc::clone(&reports);
+        session.worker_context = WorkerContext {
+            settings: Some(WorkerContextSettings { enabled: true, rollover_tokens }),
+            sink: Some(WorkerTranscriptSink {
+                dir: dir.to_path_buf(),
+                stem: stem.into(),
+                observer: Some(Arc::new(move |r: &WorkerRolloverReport| {
+                    seen.lock().unwrap().push(r.clone())
+                })),
+            }),
+        };
+        tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            StreamMethods::run_stream_internal(session, initial),
+        )
+        .await
+        .expect("worker turn finishes")
+        .expect("worker turn succeeds");
+        let mut history = Vec::new();
+        let mut notices = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                StreamEvent::Session(SessionEvent::MessageHistory(m)) => history = m,
+                StreamEvent::Session(SessionEvent::Notice(n)) => notices.push(n),
+                _ => {}
+            }
+        }
+        writer.shutdown(std::time::Duration::from_secs(5));
+        let records = std::fs::read_to_string(dir.join("api-log.jsonl"))
+            .unwrap_or_default()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let bodies = bodies.lock().unwrap().clone();
+        let reports = reports.lock().unwrap().clone();
+        WorkerRun { history, bodies, notices, reports, records }
+    }
+
+    const BRIEF: &str = "BRIEF: refactor the parser and keep the tests green";
+
+    fn wire_text(v: &Value) -> String {
+        v.to_string()
+    }
+
+    #[tokio::test]
+    async fn worker_past_the_threshold_rolls_over_and_keeps_working() {
+        use crate::runtime::worker_context::{unpaired_tool_ids, MARKER_KEY};
+        let tmp = tempfile::tempdir().unwrap();
+        let initial = vec![Arc::new(json!({"role":"user","content":BRIEF})) as SharedMessage];
+        let run = drive_worker(initial, 30, 200_000, 30_000, tmp.path(), "sa_7").await;
+
+        // Every round reached the provider: a rollover costs no extra request.
+        assert_eq!(run.bodies.len(), 31);
+        assert!(run.reports.len() >= 2, "rolled over repeatedly: {:?}", run.reports);
+        // 200k window, 30k band: pressure 29,999, target 2/3 of it. (The
+        // harness registry carries every built-in schema: ~10k of overhead.)
+        let target = crate::runtime::worker_context::WorkerContextSettings {
+            enabled: true,
+            rollover_tokens: 30_000,
+        }
+        .policy(200_000)
+        .unwrap()
+        .target_tokens();
+        assert_eq!(target, 19_999);
+        for (i, r) in run.reports.iter().enumerate() {
+            assert_eq!(r.window, i as u64 + 2);
+            assert!(r.before_tokens >= 30_000, "{r:?}");
+            assert!(r.after_tokens <= target, "lands at the target: {r:?}");
+        }
+
+        // The evicted windows are on disk, in order, without thinking.
+        let w1 = std::fs::read_to_string(tmp.path().join("sa_7.window-1.md")).unwrap();
+        assert!(w1.contains("ROUND-OUTPUT-0 "), "the first round is saved");
+        assert!(w1.contains("→ tool_use big_out (tu_0)"));
+        assert!(!w1.contains("sig-0") && !w1.contains("planning step 0"));
+        assert!(tmp.path().join("sa_7.window-2.md").exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(tmp.path().join("sa_7.window-1.md"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+
+        // Final history: brief first, one host note, every call paired, and
+        // far shorter than the 61 messages of an unrolled run.
+        assert_eq!(run.history[0]["content"], BRIEF);
+        assert_eq!(run.history.iter().filter(|m| m.get(MARKER_KEY).is_some()).count(), 1);
+        assert!(unpaired_tool_ids(&run.history).is_empty());
+        assert!(run.history.len() < 40, "{} messages", run.history.len());
+
+        // On the wire: the brief always first, host metadata never sent. The
+        // request builder merges consecutive user turns, so the first request
+        // of a new window opens on one user turn (the brief verbatim, then the
+        // host note), then a retained assistant turn with its signed thinking
+        // block intact, and ends on the pending tool result.
+        let mut rolled = 0;
+        for (i, body) in run.bodies.iter().enumerate() {
+            let msgs = body["messages"].as_array().unwrap();
+            assert!(wire_text(&msgs[0]).contains("BRIEF:"), "request {i}");
+            assert!(!wire_text(body).contains(MARKER_KEY), "request {i}");
+            if i > 0 && msgs.len() < run.bodies[i - 1]["messages"].as_array().unwrap().len() {
+                rolled += 1;
+                assert_eq!(msgs[0]["content"][0]["text"], BRIEF, "request {i}");
+                assert!(wire_text(&msgs[0]).contains("Worker context rollover"), "request {i}");
+                assert_eq!(msgs[1]["role"], "assistant");
+                assert_eq!(msgs[1]["content"][0]["type"], "thinking", "request {i}");
+                assert!(msgs[1]["content"][0]["signature"]
+                    .as_str()
+                    .is_some_and(|s| s.starts_with("sig-")));
+                let last = msgs.last().unwrap();
+                assert_eq!(last["role"], "user");
+                assert_eq!(last["content"][0]["type"], "tool_result");
+            }
+        }
+        assert_eq!(rolled, run.reports.len());
+
+        // Visible: a notice per rollover, and the api-log fields.
+        let notices: Vec<_> = run.notices.iter().filter(|n| n.contains("Worker context rolled over")).collect();
+        assert_eq!(notices.len(), run.reports.len(), "{:?}", run.notices);
+        assert_eq!(run.records.len(), 31);
+        let first = run.records.iter().position(|r| r.get("rollover_window").is_some()).unwrap();
+        assert!(run.records[..first].iter().all(|r| r.get("rollover").is_none()));
+        assert_eq!(run.records[first]["rollover_window"], 2);
+        assert_eq!(run.records[first]["rollover"], true);
+        assert!(run.records[first + 1].get("rollover").is_none());
+        assert_eq!(run.records[first + 1]["rollover_window"], 2);
+        assert_eq!(run.records.iter().filter(|r| r["rollover"] == true).count(), run.reports.len());
+        assert!(run.records.iter().all(|r| r["worker"] == true));
+    }
+
+    #[tokio::test]
+    async fn worker_at_hard_capacity_rolls_over_instead_of_failing() {
+        // A 120k window: the next round's output reserve leaves room for
+        // under 50k of context, so hard capacity comes before the rollover
+        // band (108k). The worker must still roll over and finish.
+        let tmp = tempfile::tempdir().unwrap();
+        let initial = vec![Arc::new(json!({"role":"user","content":BRIEF})) as SharedMessage];
+        let run = drive_worker(initial, 40, 120_000, 200_000, tmp.path(), "sa_8").await;
+        assert_eq!(run.bodies.len(), 41);
+        assert!(!run.reports.is_empty());
+        assert!(run.reports.iter().all(|r| r.before_tokens < 108_000), "{:?}", run.reports);
+        assert_eq!(run.history[0]["content"], BRIEF);
+    }
+
+    #[tokio::test]
+    async fn worker_below_the_threshold_and_foreground_runtimes_never_roll() {
+        let tmp = tempfile::tempdir().unwrap();
+        let initial = vec![Arc::new(json!({"role":"user","content":BRIEF})) as SharedMessage];
+        let run = drive_worker(initial, 5, 1_000_000, 200_000, tmp.path(), "sa_9").await;
+        assert!(run.reports.is_empty());
+        assert_eq!(run.history.len(), 12, "brief + 5 rounds + final answer");
+        assert!(run.records.iter().all(|r| r.get("rollover_window").is_none()));
+        assert!(std::fs::read_dir(tmp.path()).unwrap().flatten().all(|e| !e
+            .file_name()
+            .to_string_lossy()
+            .contains(".window-")));
+    }
+
+    #[tokio::test]
+    async fn resumed_rolled_worker_continues_its_window_numbering() {
+        // A full-replay resume of a rolled worker: the history carries its
+        // note (window 2); the next rollover closes window 2, not 1.
+        let tmp = tempfile::tempdir().unwrap();
+        let initial = vec![Arc::new(json!({"role":"user","content":BRIEF})) as SharedMessage];
+        let first = drive_worker(initial, 30, 200_000, 20_000, tmp.path(), "sa_10").await;
+        let window = first.reports.last().unwrap().window;
+        let history: Vec<Value> = first.history.iter().map(|m| (**m).clone()).collect();
+        let resumed = crate::tools::resume_messages(history, "RESUME: now the docs");
+        let second = drive_worker(resumed, 30, 200_000, 20_000, tmp.path(), "sa_11").await;
+        assert_eq!(second.reports[0].window, window + 1);
+        assert!(tmp.path().join(format!("sa_11.window-{window}.md")).exists());
+        let last = second.reports.last().unwrap();
+        // Every earlier window stays listed, across both handles.
+        assert!(last.transcripts.iter().any(|p| p.ends_with("sa_10.window-1.md")));
+        assert!(last.transcripts.iter().any(|p| p.ends_with(format!("sa_11.window-{window}.md"))));
+        assert_eq!(second.history[0]["content"], BRIEF, "the original brief survives the resume");
+        let text = second.history.iter().map(|m| m.to_string()).collect::<String>();
+        assert!(text.contains("RESUME: now the docs"), "the resume instructions survive the rollover");
     }
 }

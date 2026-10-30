@@ -744,6 +744,16 @@ pub(crate) fn config_row_display(key: &str) -> Option<String> {
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(cfg::DEFAULT_SUBAGENT_COLD_RESUME_COMPACT_TOKENS)
             .to_string(),
+        "subagent_context_management" => raw_config(key)
+            .and_then(|v| cfg::ContextManagementMode::parse(&v))
+            .unwrap_or(cfg::ContextManagementMode::Auto)
+            .as_str()
+            .to_string(),
+        "subagent_rollover_tokens" => raw_config(key)
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|n| *n >= cfg::MIN_SUBAGENT_ROLLOVER_TOKENS)
+            .unwrap_or(cfg::DEFAULT_SUBAGENT_ROLLOVER_TOKENS)
+            .to_string(),
         "context_management.mode" => raw_config(key)
             .and_then(|v| cfg::ContextManagementMode::parse(&v))
             .unwrap_or_default()

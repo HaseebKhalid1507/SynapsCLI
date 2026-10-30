@@ -184,6 +184,61 @@ pub(crate) fn apply_subagent_runtime_policy(
         crate::runtime::budget::TurnRole::Worker,
         &config.turn_budgets,
     ));
+
+    // Automatic context rollover (`subagent_context_management`,
+    // `subagent_rollover_tokens`). Inert until the spawn path attaches the
+    // worker's transcript sink (`attach_worker_transcripts`).
+    runtime.set_worker_context_settings(Some(
+        crate::runtime::worker_context::WorkerContextSettings::from_config(config),
+    ));
+}
+
+/// Give a worker somewhere to keep the context it rolls over: its archive
+/// directory (`<handle>.window-<N>.md` beside the resume archive), and wire
+/// each rollover into its status (`state`) and subagent panel line. Called
+/// by every spawn path after `apply_subagent_runtime_policy`, before the run
+/// starts. A resumed worker starts at its archived window.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn attach_worker_transcripts(
+    runtime: &mut crate::Runtime,
+    dir: std::path::PathBuf,
+    handle_id: &str,
+    state: Option<std::sync::Arc<std::sync::RwLock<crate::runtime::subagent::SubagentState>>>,
+    initial_messages: &[crate::SharedMessage],
+    tx_events: Option<tokio::sync::mpsc::UnboundedSender<crate::StreamEvent>>,
+    subagent_id: u64,
+    label: &str,
+) {
+    use crate::runtime::worker_context::{window_state, WorkerRolloverReport, WorkerTranscriptSink};
+    if let Some(state) = &state {
+        let (window, transcripts) = window_state(initial_messages);
+        state
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .note_context(window, transcripts.into_iter().map(|t| t.path.into()).collect());
+    }
+    let label = label.to_owned();
+    let observer = move |report: &WorkerRolloverReport| {
+        if let Some(state) = &state {
+            let mut s = state.write().unwrap_or_else(|p| p.into_inner());
+            s.note_context(report.window, report.transcripts.clone());
+            s.context_rollovers = s.context_rollovers.saturating_add(1);
+            let tools = s.tools;
+            s.note_progress(&report.step(), tools);
+        }
+        if let Some(tx) = &tx_events {
+            let _ = tx.send(crate::StreamEvent::Agent(crate::AgentEvent::SubagentUpdate {
+                subagent_id,
+                agent_name: label.clone(),
+                status: report.step(),
+            }));
+        }
+    };
+    runtime.attach_worker_transcripts(WorkerTranscriptSink {
+        dir,
+        stem: handle_id.to_owned(),
+        observer: Some(std::sync::Arc::new(observer)),
+    });
 }
 
 /// Exact Fable 5.1 worker default requested for this harness. Do not infer
@@ -1511,5 +1566,140 @@ mod worker_workspace_tests {
         assert_eq!(results.len(), 2, "{results:?}");
         assert_ran_in(&results[0], first.path());
         assert_ran_in(&results[1], first.path());
+    }
+}
+
+#[cfg(test)]
+mod worker_rollover_tests {
+    use super::{apply_subagent_runtime_policy, attach_worker_transcripts};
+    use crate::core::config::{CacheTtl, ContextManagementMode};
+    use crate::runtime::subagent::SubagentState;
+    use crate::runtime::worker_context::{WorkerContextSettings, WorkerRolloverReport};
+    use serde_json::json;
+    use std::sync::{Arc, RwLock};
+
+    /// The single policy point turns worker rollover on from config (default
+    /// auto, 200k) without disturbing the forced 5m TTL (#110); off stays off.
+    #[test]
+    fn spawn_policy_applies_the_rollover_settings_and_keeps_the_5m_ttl() {
+        let mut runtime = crate::Runtime::new_headless();
+        apply_subagent_runtime_policy(&mut runtime, &Default::default(), None, None, None, &Default::default());
+        assert_eq!(
+            runtime.worker_context().settings,
+            Some(WorkerContextSettings { enabled: true, rollover_tokens: 200_000 })
+        );
+        assert!(runtime.worker_context().sink.is_none(), "inert until a spawn attaches a sink");
+        assert_eq!(runtime.cache_ttl(), CacheTtl::FiveMinutes);
+        assert!(!runtime.context_management_enabled(), "never the foreground's rollover");
+
+        let off = crate::config::SynapsConfig {
+            subagent_context_management: ContextManagementMode::Off,
+            subagent_rollover_tokens: 150_000,
+            cache_ttl: CacheTtl::OneHour,
+            ..Default::default()
+        };
+        let mut runtime = crate::Runtime::new_headless();
+        apply_subagent_runtime_policy(&mut runtime, &off, None, None, None, &Default::default());
+        let settings = runtime.worker_context().settings.unwrap();
+        assert!(!settings.enabled);
+        assert!(settings.policy(1_000_000).is_none());
+        assert_eq!(runtime.cache_ttl(), CacheTtl::FiveMinutes);
+    }
+
+    /// Every spawn path gives its worker a transcript sink, after the policy
+    /// and before the run, exactly once.
+    #[test]
+    fn every_spawn_path_attaches_worker_transcripts_before_streaming() {
+        for (name, source) in [
+            ("oneshot", include_str!("oneshot.rs")),
+            ("start", include_str!("start.rs")),
+            ("resume", include_str!("resume.rs")),
+        ] {
+            let policy = source.find("super::apply_subagent_runtime_policy(").unwrap();
+            let attach = source.find("super::attach_worker_transcripts(").unwrap();
+            let stream = source.find("runtime.run_stream").unwrap();
+            assert!(policy < attach && attach < stream, "{name}");
+            assert_eq!(source.matches("super::attach_worker_transcripts(").count(), 1, "{name}");
+        }
+    }
+
+    fn rolled_history() -> Vec<crate::SharedMessage> {
+        vec![
+            Arc::new(json!({"role":"user","content":"brief"})),
+            Arc::new(json!({"role":"user","content":[{"type":"text","text":"note"}],
+                "_synaps_worker_context": {"schema":"synaps-worker-context/1","window":3,
+                "transcripts":[{"window":1,"path":"/a/sa_1.window-1.md","messages":4},
+                               {"window":2,"path":"/a/sa_1.window-2.md","messages":6}]}})),
+        ]
+    }
+
+    /// A resumed rolled worker reports its archived window from the start;
+    /// each rollover updates its state, panel line and status summary.
+    #[test]
+    fn rollovers_reach_the_worker_state_and_its_panel_line() {
+        let state = Arc::new(RwLock::new(SubagentState::new()));
+        assert!(state.read().unwrap().context_summary().is_none(), "absent before any rollover");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut runtime = crate::Runtime::new_headless();
+        attach_worker_transcripts(
+            &mut runtime,
+            "/a".into(),
+            "sa_9",
+            Some(Arc::clone(&state)),
+            &rolled_history(),
+            Some(tx),
+            9,
+            "spike",
+        );
+        {
+            let s = state.read().unwrap();
+            assert_eq!(s.context_window, 3);
+            assert_eq!(s.context_transcripts.len(), 2);
+            let summary = s.context_summary().unwrap();
+            assert_eq!(summary["window"], 3);
+            assert_eq!(summary["rollovers"], 0);
+        }
+        let sink = runtime.worker_context().sink.clone().unwrap();
+        assert_eq!(sink.stem, "sa_9");
+        assert_eq!(sink.dir, std::path::PathBuf::from("/a"));
+        let report = WorkerRolloverReport {
+            window: 4,
+            before_tokens: 201_000,
+            after_tokens: 99_000,
+            evicted_messages: 40,
+            transcript: "/a/sa_9.window-3.md".into(),
+            transcripts: vec![
+                "/a/sa_1.window-1.md".into(),
+                "/a/sa_1.window-2.md".into(),
+                "/a/sa_9.window-3.md".into(),
+            ],
+        };
+        (sink.observer.unwrap())(&report);
+        let s = state.read().unwrap();
+        assert_eq!((s.context_window, s.context_rollovers), (4, 1));
+        assert_eq!(s.step, "↻ context window 4: ~201k → ~99k tokens");
+        let summary = s.context_summary().unwrap();
+        assert_eq!(summary["transcripts"].as_array().unwrap().len(), 3);
+        assert_eq!(summary["rollovers"], 1);
+        match rx.try_recv().unwrap() {
+            crate::StreamEvent::Agent(crate::AgentEvent::SubagentUpdate { subagent_id, agent_name, status }) => {
+                assert_eq!((subagent_id, agent_name.as_str()), (9, "spike"));
+                assert!(status.starts_with("↻ context window 4"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(report.notice().contains("/a/sa_9.window-3.md"));
+    }
+
+    /// Status and collect of a reaped rolled worker read the summary from its
+    /// archive; a never-rolled archive has none (outputs unchanged).
+    #[test]
+    fn archived_summary_comes_from_the_history_metadata() {
+        let history: Vec<serde_json::Value> = rolled_history().iter().map(|m| (**m).clone()).collect();
+        let summary = crate::runtime::subagent::archived_context_summary(&history).unwrap();
+        assert_eq!(summary["window"], 3);
+        assert_eq!(summary["transcripts"][1], "/a/sa_1.window-2.md");
+        assert!(summary.get("rollovers").is_none(), "unknown for an archived run");
+        assert!(crate::runtime::subagent::archived_context_summary(&history[..1]).is_none());
     }
 }

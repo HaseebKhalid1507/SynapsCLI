@@ -585,6 +585,18 @@ pub const DEFAULT_CACHE_KEEPWARM_AUTO_MAX_HOURS: u32 = 24;
 /// each) the compact context is the cheaper trade.
 pub const DEFAULT_SUBAGENT_COLD_RESUME_COMPACT_TOKENS: u64 = 100_000;
 
+/// Default for `subagent_rollover_tokens`: the footprint at which a worker's
+/// context rolls over (to a successor of about 100k on a 1m window). Workers
+/// are long 5-minute-TTL loops with no human pauses, so every round re-reads
+/// the whole context; a 100k -> 200k cycle repays the ~100k successor write
+/// (about 17 rounds on Opus 5.5) well before the next rollover.
+pub const DEFAULT_SUBAGENT_ROLLOVER_TOKENS: u64 = 200_000;
+
+/// Smallest accepted `subagent_rollover_tokens`. Below it the derived
+/// successor target is smaller than a typical brief plus last round, so
+/// rollovers could not shrink the context and would only churn the cache.
+pub const MIN_SUBAGENT_ROLLOVER_TOKENS: u64 = 20_000;
+
 /// Prompt-cache keep-warm policy (`cache_keepwarm`, task #444). See
 /// docs/specs/cache-ttl-spec.md §7.
 ///
@@ -1298,6 +1310,18 @@ pub struct SynapsConfig {
     /// (`subagent_cold_resume_compact_tokens`, default
     /// [`DEFAULT_SUBAGENT_COLD_RESUME_COMPACT_TOKENS`]).
     pub subagent_cold_resume_compact_tokens: u64,
+    /// Automatic context rollover for subagent workers
+    /// (`subagent_context_management = auto | off`, default `auto`). Workers
+    /// evict older rounds into their archive directory instead of growing
+    /// until the window is full. Independent of the foreground
+    /// `context_management.mode`.
+    pub subagent_context_management: ContextManagementMode,
+    /// Estimated footprint (tokens) at which a worker's context rolls over
+    /// (`subagent_rollover_tokens`, at least [`MIN_SUBAGENT_ROLLOVER_TOKENS`],
+    /// default [`DEFAULT_SUBAGENT_ROLLOVER_TOKENS`]). The window's own
+    /// rollover band wins when it is lower; the successor target is derived
+    /// like the foreground's (min(100k, 2/3 of pressure)).
+    pub subagent_rollover_tokens: u64,
     /// Worker default, independent of foreground `thinking`; per-call overrides win.
     pub subagent_thinking: crate::core::reasoning::ReasoningLevel,
     pub api_retries: u32,        // default 3
@@ -1423,6 +1447,8 @@ impl Default for SynapsConfig {
             bash_max_timeout: 300,
             subagent_timeout: 300,
             subagent_cold_resume_compact_tokens: DEFAULT_SUBAGENT_COLD_RESUME_COMPACT_TOKENS,
+            subagent_context_management: ContextManagementMode::Auto,
+            subagent_rollover_tokens: DEFAULT_SUBAGENT_ROLLOVER_TOKENS,
             subagent_thinking: crate::core::reasoning::ReasoningLevel::XHigh,
             api_retries: 3,
             refusal_retries: 2,
@@ -1500,6 +1526,8 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "bash_max_timeout",
     "subagent_timeout",
     "subagent_cold_resume_compact_tokens",
+    "subagent_context_management",
+    "subagent_rollover_tokens",
     "subagent_thinking",
     "subagent.max_concurrent",
     "subagent.max_total",
@@ -2072,6 +2100,20 @@ fn apply_config_content_with(
                 Ok(tokens) => config.subagent_cold_resume_compact_tokens = tokens,
                 Err(_) => config.warnings.push(format!(
                     "subagent_cold_resume_compact_tokens = {val} — expected a token count (0 disables); using {DEFAULT_SUBAGENT_COLD_RESUME_COMPACT_TOKENS}"
+                )),
+            },
+            "subagent_context_management" => match ContextManagementMode::parse(val) {
+                Some(mode) => config.subagent_context_management = mode,
+                None => config.warnings.push(format!(
+                    "subagent_context_management = {val} — expected auto or off; using auto"
+                )),
+            },
+            "subagent_rollover_tokens" => match val.parse::<u64>() {
+                Ok(tokens) if tokens >= MIN_SUBAGENT_ROLLOVER_TOKENS => {
+                    config.subagent_rollover_tokens = tokens
+                }
+                _ => config.warnings.push(format!(
+                    "subagent_rollover_tokens = {val} — expected a token count of at least {MIN_SUBAGENT_ROLLOVER_TOKENS}; using {DEFAULT_SUBAGENT_ROLLOVER_TOKENS}"
                 )),
             },
             // Legacy flat spellings (pre-`subagent.*`): same parser, same limits.
@@ -2824,6 +2866,46 @@ mod tests {
             c.warnings
         );
         assert!(super::KNOWN_CONFIG_KEYS.contains(&"subagent_cold_resume_compact_tokens"));
+    }
+
+    #[test]
+    fn subagent_rollover_keys_parse_default_and_warn() {
+        use super::ContextManagementMode;
+        let c = super::load_config_from_str("");
+        assert_eq!(c.subagent_context_management, ContextManagementMode::Auto);
+        assert_eq!(c.subagent_rollover_tokens, 200_000);
+        let d = super::SynapsConfig::default();
+        assert_eq!(d.subagent_context_management, ContextManagementMode::Auto);
+        assert_eq!(d.subagent_rollover_tokens, super::DEFAULT_SUBAGENT_ROLLOVER_TOKENS);
+
+        let c = super::load_config_from_str(
+            "subagent_context_management = OFF\nsubagent_rollover_tokens = 150000\n",
+        );
+        assert_eq!(c.subagent_context_management, ContextManagementMode::Off);
+        assert_eq!(c.subagent_rollover_tokens, 150_000);
+        assert!(c.warnings.is_empty(), "warnings: {:?}", c.warnings);
+        let c = super::load_config_from_str("subagent_rollover_tokens = 20000\n");
+        assert_eq!(c.subagent_rollover_tokens, 20_000, "the floor itself is accepted");
+        assert!(c.warnings.is_empty(), "warnings: {:?}", c.warnings);
+
+        for (line, key) in [
+            ("subagent_context_management = sometimes", "subagent_context_management"),
+            ("subagent_rollover_tokens = lots", "subagent_rollover_tokens"),
+            ("subagent_rollover_tokens = 19999", "subagent_rollover_tokens"),
+            ("subagent_rollover_tokens = 0", "subagent_rollover_tokens"),
+        ] {
+            let c = super::load_config_from_str(line);
+            assert_eq!(c.subagent_context_management, ContextManagementMode::Auto, "{line}");
+            assert_eq!(c.subagent_rollover_tokens, 200_000, "{line}");
+            assert!(
+                c.warnings.iter().any(|w| w.contains(key)),
+                "{line}: warnings {:?}",
+                c.warnings
+            );
+        }
+        for key in ["subagent_context_management", "subagent_rollover_tokens"] {
+            assert!(super::KNOWN_CONFIG_KEYS.contains(&key), "{key}");
+        }
     }
 
     #[test]
