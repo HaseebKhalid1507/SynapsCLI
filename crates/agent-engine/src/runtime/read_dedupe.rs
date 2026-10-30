@@ -13,6 +13,13 @@
 //!
 //! The stub and the write/edit notes are pure functions of their inputs: no
 //! timestamps or randomness, so they are cache-safe once written.
+//!
+//! A rollover keeps the newest messages, so it can keep a stub and drop the
+//! read it names. The stub's own wording says to read again in that case,
+//! and both successor builders (foreground `continuation::successor`,
+//! worker `worker_context::build_successor`) also rewrite such a stub to
+//! [`DROPPED_STUB`] via [`rewrite_dangling_stubs`]. The cut changes the
+//! prefix anyway, so the rewrite costs no extra cache.
 
 use std::path::{Path, PathBuf};
 
@@ -109,12 +116,78 @@ pub(super) fn shape(
     }
 }
 
-/// The deterministic stub that replaces a deduped read result.
+/// Everything in a stub before the earlier call's id.
+const STUB_PREFIX: &str = "[File unchanged since your earlier read (";
+
+/// The deterministic stub that replaces a deduped read result. It stays
+/// true even if a later rollover drops the result it names.
 pub(super) fn unchanged_stub(earlier_id: &str) -> String {
     format!(
-        "[File unchanged since your earlier read ({earlier_id}) — that result is still \
-         in your context above and is current. Use it instead of re-reading.]"
+        "{STUB_PREFIX}{earlier_id}). That result is current; use it instead of \
+         re-reading. If it's no longer in your context, read the file again.]"
     )
+}
+
+/// The earlier tool_use_id `text` names, when `text` is exactly a stub
+/// [`unchanged_stub`] wrote (not a prefix match: the whole text must equal
+/// the stub for that id).
+fn stub_target(text: &str) -> Option<&str> {
+    let id = text.strip_prefix(STUB_PREFIX)?.split(')').next()?;
+    (!id.is_empty() && unchanged_stub(id) == text).then_some(id)
+}
+
+/// What a stub becomes when a rollover dropped the result it names. Fixed
+/// text: it never claims the content is in context.
+pub(super) const DROPPED_STUB: &str =
+    "[Earlier file content was dropped at a context rollover; read the file again if you need it.]";
+
+/// Rewrites, in a rollover successor, every dedupe stub whose named
+/// `tool_use_id` has no `tool_result` left in `successor` to
+/// [`DROPPED_STUB`]. Only user `tool_result` blocks are touched (never
+/// assistant messages); a message with nothing to rewrite keeps its `Arc`.
+/// Idempotent. Returns how many stubs were rewritten.
+pub(super) fn rewrite_dangling_stubs(successor: &mut [SharedMessage]) -> usize {
+    let is_result = |b: &Value| b["type"] == "tool_result";
+    let retained: std::collections::HashSet<String> = successor
+        .iter()
+        .filter(|m| m["role"] == "user")
+        .filter_map(|m| m["content"].as_array())
+        .flatten()
+        .filter(|b| is_result(b))
+        .filter_map(|b| b["tool_use_id"].as_str().map(str::to_owned))
+        .collect();
+    let dangling = |b: &Value| {
+        is_result(b)
+            && b["content"]
+                .as_str()
+                .and_then(stub_target)
+                .is_some_and(|id| !retained.contains(id))
+    };
+    let mut rewritten = 0;
+    for message in successor.iter_mut() {
+        if message["role"] != "user"
+            || !message["content"]
+                .as_array()
+                .is_some_and(|blocks| blocks.iter().any(dangling))
+        {
+            continue;
+        }
+        let mut edited = (**message).clone();
+        for block in edited["content"].as_array_mut().into_iter().flatten() {
+            if dangling(block) {
+                block["content"] = Value::String(DROPPED_STUB.to_string());
+                rewritten += 1;
+            }
+        }
+        *message = std::sync::Arc::new(edited);
+    }
+    rewritten
+}
+
+/// Host-written history text (a stub or a rewritten stub): never an
+/// original `read` result, so never a dedupe candidate.
+fn is_host_text(text: &str) -> bool {
+    text == DROPPED_STUB || stub_target(text).is_some()
 }
 
 /// One honest line appended to a successful `write` result.
@@ -179,7 +252,7 @@ pub(super) fn find_unchanged_read(
         if result["type"] != "tool_result" || result["is_error"] == Value::Bool(true) {
             continue;
         }
-        if result["content"].as_str() != Some(new_text) {
+        if result["content"].as_str() != Some(new_text) || is_host_text(new_text) {
             continue;
         }
         let Some(id) = result["tool_use_id"].as_str() else {
@@ -455,6 +528,95 @@ mod tests {
             (content, saved),
             (json!(format!("Wrote 1 lines\n\n{WRITE_NOTE}")), None)
         );
+    }
+
+    #[test]
+    fn stub_text_is_pinned_and_parses_back_exactly() {
+        let stub = unchanged_stub("toolu_01AbC");
+        assert_eq!(
+            stub,
+            "[File unchanged since your earlier read (toolu_01AbC). That result is current; \
+             use it instead of re-reading. If it's no longer in your context, read the file \
+             again.]"
+        );
+        // Short enough for the shorter-than-the-result rule to matter only
+        // for tiny files: a real Anthropic id is 30 bytes.
+        assert!(unchanged_stub(&"x".repeat(30)).len() < 200);
+        assert_eq!(stub_target(&stub), Some("toolu_01AbC"));
+        // Exact match only: no prefix, suffix or near-miss counts.
+        assert_eq!(stub_target(&format!("{stub} ")), None);
+        assert_eq!(stub_target(&stub[..stub.len() - 1]), None);
+        assert_eq!(stub_target(STUB_PREFIX), None);
+        assert_eq!(stub_target(&unchanged_stub("")), None, "an id is required");
+        assert_eq!(stub_target(DROPPED_STUB), None);
+        assert!(is_host_text(&stub) && is_host_text(DROPPED_STUB));
+        assert!(!is_host_text("1\tfn a() {}\n"));
+    }
+
+    #[test]
+    fn rollover_rewrites_only_stubs_whose_original_is_gone() {
+        let input = json!({"path": "a.rs"});
+        let kept_original = results_msg(vec![result("toolu_1", json!("1\tfn a() {}\n"))]);
+        let calls = use_msg(&[
+            ("toolu_2", "read", input.clone()),
+            ("toolu_3", "read", input.clone()),
+            ("toolu_4", "bash", json!({})),
+        ]);
+        let stubs = results_msg(vec![
+            // Names a read the cut dropped: rewritten.
+            result("toolu_2", json!(unchanged_stub("toolu_0"))),
+            // Names a read that is still here: untouched.
+            result("toolu_3", json!(unchanged_stub("toolu_1"))),
+            // Plain text that merely mentions the stub wording: untouched.
+            result(
+                "toolu_4",
+                json!(format!("echo {}", unchanged_stub("toolu_0"))),
+            ),
+        ]);
+        let untouched = results_msg(vec![result("toolu_5", json!(unchanged_stub("toolu_1")))]);
+        let mut successor = vec![
+            use_msg(&[("toolu_1", "read", input.clone())]),
+            kept_original.clone(),
+            calls.clone(),
+            stubs.clone(),
+            untouched.clone(),
+        ];
+        assert_eq!(rewrite_dangling_stubs(&mut successor), 1);
+        let blocks = successor[3]["content"].as_array().unwrap();
+        assert_eq!(blocks[0]["content"], json!(DROPPED_STUB));
+        assert_eq!(
+            blocks[0]["tool_use_id"], "toolu_2",
+            "the block keeps its pairing"
+        );
+        assert_eq!(blocks[1], stubs["content"][1]);
+        assert_eq!(blocks[2], stubs["content"][2]);
+        // Every other message is the same Arc: assistant turns never edited.
+        assert!(Arc::ptr_eq(&successor[1], &kept_original));
+        assert!(Arc::ptr_eq(&successor[2], &calls));
+        assert!(Arc::ptr_eq(&successor[4], &untouched));
+        // Idempotent and byte-stable across later rollovers.
+        let once = successor.clone();
+        assert_eq!(rewrite_dangling_stubs(&mut successor), 0);
+        assert_eq!(
+            serde_json::to_string(&successor).unwrap(),
+            serde_json::to_string(&once).unwrap()
+        );
+        // Nothing to rewrite: no message is cloned.
+        let mut clean = vec![calls.clone(), kept_original.clone()];
+        assert_eq!(rewrite_dangling_stubs(&mut clean), 0);
+        assert!(Arc::ptr_eq(&clean[1], &kept_original));
+    }
+
+    #[test]
+    fn host_written_text_is_never_a_dedupe_candidate() {
+        let input = json!({"path": "a.rs"});
+        for text in [DROPPED_STUB.to_string(), unchanged_stub("toolu_0")] {
+            let messages = vec![
+                use_msg(&[("toolu_1", "read", input.clone())]),
+                results_msg(vec![result("toolu_1", json!(text))]),
+            ];
+            assert_eq!(find(&messages, &[], &input, &text), None, "{text}");
+        }
     }
 
     #[test]
