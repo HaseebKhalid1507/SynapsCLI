@@ -2340,6 +2340,7 @@ mod tests {
                     elapsed_ms: Some(5),
                 },
                 time: "00:00".to_string(),
+                thought: None,
             },
         );
         app.transcript.invalidate_from(at);

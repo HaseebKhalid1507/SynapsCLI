@@ -386,6 +386,82 @@ pub(crate) fn wcag_contrast(a: Color, b: Color) -> f64 {
 const TOOL_INPUT_CONTRAST: f64 = 1.14;
 const TOOL_OUTPUT_CONTRAST: f64 = 1.31;
 
+/// Thinking text on the canvas (render/thinking.rs). Body ink: WCAG AA for
+/// body text, capped at a share of the answer's own contrast so the thought
+/// stays second even where `claude_text` is itself soft (solarized-dark's
+/// base0 is 4.8:1 by design).
+const THINKING_INK_CONTRAST: f64 = 4.5;
+const THINKING_INK_SHARE: f64 = 0.65;
+/// Meta text (the header's "for 12s", the "+N lines" footer, bullets): a
+/// step below the ink, still readable.
+const THINKING_META_CONTRAST: f64 = 3.0;
+const THINKING_META_SHARE: f64 = 0.7;
+/// The rail glyphs (`╭─ │ ╰`): structure, not content — a subtle tone a
+/// step below the meta text.
+const THINKING_RAIL_CONTRAST: f64 = 1.9;
+const THINKING_RAIL_SHARE: f64 = 0.65;
+
+/// `from` mixed toward `toward` (1% steps) just until it reads at `target`
+/// contrast on `ground`: `from` itself when it already does, `toward` when
+/// nothing short of it does. Non-RGB inputs come back unchanged.
+pub(crate) fn lift_to_contrast(from: Color, toward: Color, ground: Color, target: f64) -> Color {
+    let (Color::Rgb(r, g, b), Color::Rgb(tr, tg, tb)) = (from, toward) else {
+        return from;
+    };
+    for step in 0..=100u8 {
+        let c = mix_rgb((r, g, b), (tr, tg, tb), f64::from(step) / 100.0);
+        if wcag_contrast(c, ground) >= target {
+            return c;
+        }
+    }
+    toward
+}
+
+/// [`lift_to_contrast`], or — for a `from` already past `target` — `from`
+/// eased toward `ground` while it still reads at `target`: either way a
+/// colour of `from`'s hue at (about) `target`.
+fn settle_at_contrast(from: Color, toward: Color, ground: Color, target: f64) -> Color {
+    if wcag_contrast(from, ground) < target {
+        return lift_to_contrast(from, toward, ground, target);
+    }
+    let (Color::Rgb(r, g, b), Color::Rgb(gr, gg, gb)) = (from, ground) else {
+        return from;
+    };
+    let mut best = from;
+    for step in 1..=100u8 {
+        let c = mix_rgb((r, g, b), (gr, gg, gb), f64::from(step) / 100.0);
+        if wcag_contrast(c, ground) < target {
+            break;
+        }
+        best = c;
+    }
+    best
+}
+
+/// See [`Theme::thinking_colors`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ThinkingColors {
+    /// What the tones are measured against: the transcript canvas.
+    pub(crate) canvas: Color,
+    pub(crate) ink: Color,
+    pub(crate) meta: Color,
+    pub(crate) rail: Color,
+}
+
+/// `a` mixed toward `b` by `t` (0 = `a`, 1 = `b`), in sRGB.
+fn mix_rgb(a: (u8, u8, u8), b: (u8, u8, u8), t: f64) -> Color {
+    let m = |x: u8, y: u8| (f64::from(x) + (f64::from(y) - f64::from(x)) * t).round() as u8;
+    Color::Rgb(m(a.0, b.0), m(a.1, b.1), m(a.2, b.2))
+}
+
+/// [`mix_rgb`] for `Color`s: non-RGB colours come back as `a`.
+pub(crate) fn mix(a: Color, b: Color, t: f64) -> Color {
+    match (a, b) {
+        (Color::Rgb(r, g, bl), Color::Rgb(tr, tg, tb)) => mix_rgb((r, g, bl), (tr, tg, tb), t),
+        _ => a,
+    }
+}
+
 impl Theme {
     /// A raised surface on the chrome (`bg`), for selected rows and popups in
     /// modals (Noodle's `backgroundElement`): `bg` lifted toward `input_fg`
@@ -439,6 +515,31 @@ impl Theme {
     /// (one step further off the canvas than the argument panel).
     pub(crate) fn tool_output_background(&self) -> Color {
         self.tool_panel(self.tool_output_bg, TOOL_OUTPUT_CONTRAST)
+    }
+
+    /// The thinking rail's three tones (render/thinking.rs), all in
+    /// `thinking_color`'s hue and measured on the transcript canvas, each a
+    /// step below the next and all below the answer's `claude_text`:
+    ///
+    /// - `ink`, the body: `thinking_color` (configurable; most palettes set
+    ///   it near-invisible) lifted toward `claude_text` just until it reads
+    ///   at AA. A `thinking_color` that already does is used as is.
+    /// - `meta` (the header's detail, the footer, bullets) and `rail` (the
+    ///   `╭─ │ ╰` glyphs): the same hue settled at 3:1 and 1.9:1 — lifted,
+    ///   or eased back when `thinking_color` is brighter.
+    pub(crate) fn thinking_colors(&self) -> ThinkingColors {
+        let canvas = self.message_background();
+        let answer = wcag_contrast(self.claude_text, canvas);
+        let ink_target = THINKING_INK_CONTRAST.min(answer * THINKING_INK_SHARE);
+        let meta_target = THINKING_META_CONTRAST.min(ink_target * THINKING_META_SHARE);
+        let rail_target = THINKING_RAIL_CONTRAST.min(meta_target * THINKING_RAIL_SHARE);
+        let settle = |target| settle_at_contrast(self.thinking_color, self.claude_text, canvas, target);
+        ThinkingColors {
+            canvas,
+            ink: lift_to_contrast(self.thinking_color, self.claude_text, canvas, ink_target),
+            meta: settle(meta_target),
+            rail: settle(rail_target),
+        }
     }
 
     /// The canvas lifted toward the palette's own assistant text colour until
@@ -1533,6 +1634,75 @@ mod message_canvas_tests {
             assert_eq!(t.event_label(), t.event_source, "{name}");
             assert_eq!(t.event_body(), t.event_text, "{name}");
         }
+    }
+}
+
+#[cfg(test)]
+mod thinking_color_tests {
+    use super::*;
+
+    const BUILTINS: &[&str] = &[
+        "default",
+        "night-city",
+        "neon-rain",
+        "amber",
+        "phosphor",
+        "solarized-dark",
+        "blood",
+        "ocean",
+        "rose-pine",
+        "nord",
+        "dracula",
+        "monokai",
+        "myx",
+        "gruvbox",
+        "catppuccin",
+        "tokyo-night",
+        "sunset",
+        "ice",
+        "forest",
+        "lavender",
+        "paper",
+    ];
+
+    /// On every builtin (paper, the light one, included) the thinking body
+    /// reads at AA on the canvas — or, where the answer itself is soft
+    /// (solarized-dark), at the capped share of it — and the three tones
+    /// stack: rail < meta < ink < the answer's text.
+    #[test]
+    fn thinking_tones_read_on_every_builtin_and_stay_below_the_answer() {
+        for name in BUILTINS {
+            let t = Theme::builtin(name).unwrap();
+            let c = t.thinking_colors();
+            assert_eq!(c.canvas, t.message_background(), "{name}");
+            let on = |x: Color| wcag_contrast(x, c.canvas);
+            let answer = on(t.claude_text);
+            let (ink, meta, rail) = (on(c.ink), on(c.meta), on(c.rail));
+            let floor = THINKING_INK_CONTRAST.min(answer * THINKING_INK_SHARE) - 0.01;
+            assert!(ink >= floor, "{name}: ink {ink:.2} < {floor:.2}");
+            assert!(ink >= 3.0, "{name}: ink {ink:.2} is unreadable");
+            assert!(ink < answer, "{name}: ink {ink:.2} outshines the answer {answer:.2}");
+            assert!(meta < ink && meta >= 2.2, "{name}: meta {meta:.2} vs ink {ink:.2}");
+            assert!(rail < meta && rail >= 1.5, "{name}: rail {rail:.2} vs meta {meta:.2}");
+        }
+    }
+
+    /// `thinking_color` stays the knob: one that already reads at AA is the
+    /// ink verbatim, and the rail and meta tones keep its hue.
+    #[test]
+    fn a_legible_thinking_color_is_used_as_is() {
+        let mut t = Theme::default();
+        t.set("thinking_color", Color::Rgb(150, 140, 200));
+        let c = t.thinking_colors();
+        assert_eq!(c.ink, Color::Rgb(150, 140, 200));
+        for tone in [c.meta, c.rail] {
+            let Color::Rgb(r, g, b) = tone else {
+                unreachable!()
+            };
+            assert!(b > r && b > g, "{tone:?} keeps the violet hue");
+        }
+        // The near-invisible default is lifted, not used.
+        assert_ne!(Theme::default().thinking_colors().ink, Theme::default().thinking_color);
     }
 }
 
