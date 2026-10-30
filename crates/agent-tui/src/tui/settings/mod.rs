@@ -161,6 +161,10 @@ pub(crate) struct RuntimeSnapshot {
         std::collections::BTreeMap<String, crate::tui::models::ProviderCatalogOverride>,
     /// Derived reasoning type for the active model (display-only row).
     pub reasoning_type: String,
+    /// An Anthropic subscription (OAuth) login is present, sampled at
+    /// modal-open time. Display only: annotates what `cache_ttl = auto`
+    /// resolves to (1h on a subscription). Never a credential value.
+    pub anthropic_subscription: bool,
 }
 
 impl RuntimeSnapshot {
@@ -232,6 +236,9 @@ impl RuntimeSnapshot {
             thinking_options: thinking_options_for_model(runtime.model()),
             catalog_overrides: std::collections::BTreeMap::new(),
             reasoning_type: reasoning_type_for_model(runtime.model()).to_string(),
+            anthropic_subscription: synaps_cli::auth::broker::oauth_provider_logged_in(
+                synaps_cli::auth::OAuthProviderId::Anthropic,
+            ),
         }
     }
 }
@@ -446,6 +453,7 @@ mod wireup_tests {
             ],
             catalog_overrides: std::collections::BTreeMap::new(),
             reasoning_type: "budget (legacy)".into(),
+            anthropic_subscription: false,
         }
     }
 

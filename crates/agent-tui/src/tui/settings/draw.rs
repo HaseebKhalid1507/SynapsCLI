@@ -168,7 +168,8 @@ fn render_settings(
     for (i, def) in settings.iter().enumerate() {
         let selected = i == state.setting_idx && focused;
         let current_value = current_value_for(def, snap);
-        let value = if selected && focused {
+        let note = value_annotation(def.key, &current_value, snap);
+        let mut value = if selected && focused {
             match (&state.edit_mode, &def.editor) {
                 (
                     Some(ActiveEditor::Text {
@@ -194,6 +195,9 @@ fn render_settings(
         } else {
             value_span(p, current_value, false)
         };
+        if let Some(note) = note {
+            value.push(Span::styled(format!("  {note}"), Style::default().fg(p.dim)));
+        }
         let start = lines.len();
         lines.push(row_line(
             p, area.width, LABEL_W, def.label, value, selected, focused,
@@ -713,6 +717,24 @@ fn checked_config_display(key: &str, ok: impl Fn(&str) -> bool, fallback: &str) 
         .unwrap_or_else(|| fallback.to_string())
 }
 
+/// Dim suffix after a row's value, for values whose effect depends on this
+/// machine and is cheap to know from the snapshot. `None` = nothing to add.
+/// Display only: the cycler still works on the bare value.
+pub(crate) fn value_annotation(key: &str, value: &str, snap: &RuntimeSnapshot) -> Option<String> {
+    match key {
+        // `auto` resolves per credential kind (the same `resolve` the
+        // request path applies). Only claimed when a local subscription
+        // login is present: without one the kind is a remote broker's or
+        // there are no Anthropic credentials, and the TUI cannot cheaply
+        // tell which (`/keepwarm status` shows the live resolved value).
+        "cache_ttl" if value == "auto" && snap.anthropic_subscription => Some(format!(
+            "\u{2192} {} (subscription login)",
+            synaps_cli::config::CacheTtlSetting::Auto.resolve(true)
+        )),
+        _ => None,
+    }
+}
+
 /// Current configured value for the config-file-backed rows that have no
 /// runtime snapshot field, normalised to the spelling the row's cycler
 /// options use (same accepted spellings as the parser; unset/invalid →
@@ -721,11 +743,10 @@ pub(crate) fn config_row_display(key: &str) -> Option<String> {
     use synaps_cli::config as cfg;
     let v = match key {
         // Context & cache
-        "cache_ttl" => match raw_config(key).and_then(|v| cfg::CacheTtl::parse(&v)) {
-            Some(cfg::CacheTtl::OneHour) => "1h".to_string(),
-            Some(cfg::CacheTtl::Hybrid) => "hybrid".to_string(),
-            Some(cfg::CacheTtl::FiveMinutes) | None => "5m".to_string(),
-        },
+        "cache_ttl" => raw_config(key)
+            .and_then(|v| cfg::CacheTtlSetting::parse(&v))
+            .unwrap_or_default()
+            .to_string(),
         "cache_diagnostics" => bool_config_display(key, false),
         "cache_keepwarm" => raw_config(key)
             .and_then(|v| cfg::CacheKeepWarm::parse(&v))
