@@ -47,6 +47,23 @@ fn write_script(path: &Path, body: &str) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 
+/// Run a script this process just wrote. Another test thread that forks
+/// while the script's write fd is open holds a copy of it until that
+/// child's own exec, and exec of a file open for writing fails with
+/// ETXTBSY; retry briefly instead of failing on that window.
+fn output_of_fresh_script(cmd: &mut Command) -> std::process::Output {
+    const ETXTBSY: i32 = 26;
+    for _ in 0..50 {
+        match cmd.output() {
+            Err(e) if e.raw_os_error() == Some(ETXTBSY) => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            r => return r.unwrap(),
+        }
+    }
+    cmd.output().unwrap()
+}
+
 #[test]
 fn started_by_anything_but_sudo_it_refuses_and_prints_nothing() {
     let rig = rig();
@@ -78,10 +95,7 @@ fn a_fake_sudo_is_refused() {
         &fake,
         "#!/bin/sh\npw=$(\"$SUDO_ASKPASS\" '[sudo] password for me: ')\necho \"exit:$? got:[$pw]\"\n",
     );
-    let out = Command::new(&fake)
-        .env("SUDO_ASKPASS", rig.helper())
-        .output()
-        .unwrap();
+    let out = output_of_fresh_script(Command::new(&fake).env("SUDO_ASKPASS", rig.helper()));
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stdout.contains("exit:1 got:[]"), "{stdout} {stderr}");
