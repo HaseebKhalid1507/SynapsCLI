@@ -111,6 +111,26 @@ All notable changes to this project will be documented in this file.
   again is refused too. See
   [docs/design/subagent-rollover.md](docs/design/subagent-rollover.md#context-window).
 
+- **The context budget no longer treats the whole `max_tokens` as room the
+  next round needs.** It reserved the request's output ceiling (128k on
+  Opus, 64k otherwise), so on a 200k Opus window hard capacity sat at about
+  31.5k: `context_management.mode = auto` rolled over there into tiny
+  successors or ended the turn with "cannot meaningfully reduce retained
+  history", the daemon's `auto_compact` compacted at about 32k, keep-warm
+  (with context management on) refused to ping, and workers past it (after the guard above) never rolled
+  over. Claude 4.5 and later accept a request whose input plus `max_tokens`
+  exceeds the window and stop at the window
+  ([context windows](https://platform.claude.com/docs/en/build-with-claude/context-windows#context-window-overflow-behavior)),
+  so the budget now reserves what a round realistically produces: its
+  thinking budget (16,384 for adaptive) plus 16,384 of response, capped at
+  `max_tokens`. With the tool-result reserve and the 15% margin, hard
+  capacity on a 200k window is about 127k (Opus and Sonnet, high or adaptive
+  thinking; was ~31.5k / ~95.5k) and about 807k on 1m (was ~711k / ~775k).
+  For the earlier models that reject such a request (Opus 4 / 4.1, Sonnet 4,
+  3.x), every Anthropic request builder now clamps `max_tokens` to the room
+  the input leaves, keeping it above any thinking budget. Request bodies for
+  Claude 4.5 and later are unchanged.
+
 - **Screenshot-heavy subagents rewrote the whole prompt cache on every
   round.** Past 6 images, the worker upload budget retired one old image
   per new one, which changed the request far behind the tail, so nothing

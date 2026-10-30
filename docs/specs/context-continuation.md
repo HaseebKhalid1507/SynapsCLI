@@ -339,13 +339,23 @@ shrinking. Keep it opt-in until these limits have been reviewed.
 - Release binary was started in test pane `8:0.1` with the isolated synthetic profile; after restart, context status restored window 2 and a new history search recovered the same source ID. No global config or installed binary was replaced.
 
 **Reserve caveat:** the table is a soft policy, not a promise of dispatch at
-those counts. Existing `max_tokens_for_model` reserves up to 64k output (128k
-for Opus), in addition to other reserves; on a 200k configuration this can
-force rollover substantially before 140k. Calibrating that reserve requires
-matching actual provider output limits, not silently lowering the hard-budget
-check to satisfy a preferred threshold. The 350k/1m policy scenario is tested
-without changing those safeguards.
-
+those counts. Hard capacity comes first whenever the next round's reserves
+leave less than the band: the 15% safety margin, the next tool result (10k
+at the default 30 KB cap), the advisory, and the next round's expected
+output. The output reserve is the thinking budget (16,384 for adaptive/off)
+plus 16,384 of response, capped at the model's `max_tokens`
+(`EXPECTED_RESPONSE_TOKENS`); it used to be the whole `max_tokens` (128k
+for Opus), which put hard capacity at ~31.5k on a 200k Opus window. That
+ceiling is not room a request needs: Claude 4.5 and later accept input +
+`max_tokens` over the window and stop at the window
+(`model_context_window_exceeded`,
+<https://platform.claude.com/docs/en/build-with-claude/context-windows#context-window-overflow-behavior>);
+for the earlier models that reject it, the request builder clamps
+`max_tokens` to the room the input leaves. Hard capacity is now ~126.7k on
+200k and ~806.7k on 1m (high or adaptive thinking), so on 200k it still
+precedes the 180k rollover band (the margin and tool result alone take
+40.5k) and the 140k preparation band; on 1m both bands govern. The
+350k/1m policy scenario is tested without changing those safeguards.
 
 ### Post-review hardening
 
