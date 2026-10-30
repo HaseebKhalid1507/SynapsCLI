@@ -12,8 +12,6 @@ use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
 
-use fs4::fs_std::FileExt;
-
 /// Body written into the lock file so the error message can name the holder.
 #[derive(Debug, Clone)]
 pub struct LockHolder {
@@ -78,7 +76,7 @@ impl SessionLock {
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
         }
-        if FileExt::try_lock_exclusive(&file).map_err(|e| SessionLockError::Io(e, path.clone()))? {
+        if crate::core::lock_file::try_lock_exclusive(&file).map_err(|e| SessionLockError::Io(e, path.clone()))? {
             // We hold it — write our identity.
             use std::io::Write;
             let _ = file.set_len(0);

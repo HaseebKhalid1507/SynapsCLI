@@ -3,7 +3,7 @@
     "id": "root",
     "command": "/help",
     "title": "SynapsCLI Help",
-    "summary": "Fast paths for finding commands, settings, plugins, models, and diagnostics.",
+    "summary": "Type /help find to search every topic.",
     "category": "Core",
     "topic": "Branch",
     "protected": true,
@@ -11,21 +11,18 @@
     "aliases": [],
     "keywords": ["help", "start", "commands"],
     "lines": [
-      "Start here. Pick a path or search everything.",
-      "",
       "Common paths",
-      "  /help find      Search every help topic",
+      "  /sessions       Switch, pin, or close sessions",
       "  /model          Choose or inspect models",
       "  /settings       Configure providers and preferences",
+      "  /theme          List or switch themes",
       "  /plugins        Manage extensions",
       "  /help doctor    Diagnose local setup",
       "",
       "Guides",
       "  /help models    Models, providers, and routing",
       "  /help plugins   Plugins, skills, commands, and trust",
-      "  /help sessions  Sessions, resume, compact, and chains",
-      "",
-      "Tip: type /help find and start typing."
+      "  /help sessions  Sessions, resume, compact, and chains"
     ],
     "related": []
   },
@@ -81,7 +78,7 @@
     "lines": [
       "Configure SynapsCLI from a focused modal.",
       "",
-      "Common commands",
+      "Common paths",
       "  /settings        Open settings",
       "  /ping            Check configured provider health",
       "  /model           Choose the active model",
@@ -106,7 +103,7 @@
     "lines": [
       "Extend SynapsCLI with skills, commands, tools, hooks, and help entries.",
       "",
-      "Common commands",
+      "Common paths",
       "  /plugins         Open plugin manager",
       "  /plugins reload  Reload installed plugins",
       "  /extensions status       Show loaded extension health",
@@ -141,7 +138,7 @@
     "lines": [
       "Use models to choose the runtime model and inspect provider health.",
       "",
-      "Common commands",
+      "Common paths",
       "  /model           Open model router",
       "  /models          Open model router",
       "  /model <name>    Switch directly",
@@ -194,7 +191,7 @@
     "lines": [
       "SynapsCLI can authenticate with OAuth for supported accounts or provider API keys in /settings.",
       "",
-      "Common commands",
+      "Common paths",
       "  synaps login     Start OAuth login from the shell",
       "  /settings        Add or update provider API keys",
       "  /status          Check account usage when available",
@@ -233,8 +230,8 @@
     "lines": [
       "Sessions keep conversation history so you can resume work later, name important threads, and compact long context.",
       "",
-      "Common commands",
-      "  /sessions        List saved sessions",
+      "Common paths",
+      "  /sessions        Live and saved sessions: pin, close",
       "  /resume <id>     Switch to a saved session",
       "  /saveas [name]   Name or clear the current session name",
       "  /compact [focus] Summarize history and continue with a smaller context",
@@ -260,7 +257,7 @@
     "lines": [
       "Extensions are plugin packages that can contribute skills, slash commands, tools, hooks, and help entries.",
       "",
-      "Common commands",
+      "Common paths",
       "  /extensions status       Show loaded extension health",
       "  /extensions config [id]  Show extension config diagnostics",
       "  /extensions audit [N]    Inspect recent provider audit entries",
@@ -468,14 +465,14 @@
     "id": "sessions-command",
     "command": "/sessions",
     "title": "Sessions command",
-    "summary": "List saved sessions.",
+    "summary": "Open the sessions modal (live + saved).",
     "category": "Sessions",
     "topic": "Command",
     "protected": true,
     "common": true,
     "aliases": [],
-    "keywords": ["sessions", "session", "history", "saved"],
-    "lines": ["/sessions lists saved conversations so you can resume prior work."],
+    "keywords": ["sessions", "session", "history", "saved", "live", "parked", "daemon", "pin", "close"],
+    "lines": ["/sessions opens a modal: Live lists every daemon session by state (streaming, waiting, idle, parked) with pin (p) and close (x), plus pins that are not live (waiting/failed, p clears them); Past lists saved conversations (\u2691 = pinned; p pins one into the daemon). A pin comes back after daemon restarts. Works mid-stream."],
     "related": ["/help sessions", "/resume"]
   },
   {
@@ -558,8 +555,29 @@
     "common": true,
     "aliases": ["/exit"],
     "keywords": ["quit", "exit"],
-    "lines": ["/quit or /exit leaves SynapsCLI."],
-    "related": ["/help"]
+    "lines": [
+      "/quit or /exit leaves SynapsCLI.",
+      "Attached to a daemon session, it only detaches: the session stays loaded in the daemon (and a running turn keeps running). /close ends it."
+    ],
+    "related": ["/close", "/help"]
+  },
+  {
+    "id": "close-command",
+    "command": "/close",
+    "title": "Close this session",
+    "summary": "End this session in the daemon instead of only detaching from it; it can be continued later.",
+    "category": "Sessions",
+    "topic": "Command",
+    "protected": true,
+    "common": false,
+    "aliases": [],
+    "keywords": ["close", "end", "session", "daemon", "detach", "quit", "unload", "idle"],
+    "lines": [
+      "/close saves this session and ends it in the daemon: it leaves `synaps daemon sessions`, every attached client exits, and nothing wakes it again. Resume it with `synaps --attach --continue <id>`.",
+      "It refuses while closing would stop work in flight: a running turn or compaction, a running worker, or an armed /auto run. /close force closes anyway; it cancels the running workers first and notes each one in the conversation, for whoever continues it.",
+      "Only the client that owns input can close the session. In-process (no daemon), /close is /quit with the same checks."
+    ],
+    "related": ["/quit", "/workers", "/keepwarm"]
   },
   {
     "id": "watch-command",
@@ -584,7 +602,7 @@
     "id": "keepwarm-command",
     "command": "/keepwarm",
     "title": "Prompt-cache keep-warm",
-    "summary": "Show or override idle prompt-cache keep-warm for this session: off, auto, or <N>h.",
+    "summary": "Show or override idle prompt-cache keep-warm for this session: off, auto, or <N>h (pings the API; not /pin).",
     "category": "Sessions",
     "topic": "Command",
     "protected": true,
@@ -597,9 +615,66 @@
       "/keepwarm 6h applies the same bound and stops 6 hours after the session went idle instead of the auto cap (N = 1–48). /keepwarm off stops it for this session; the choice survives park and daemon reload.",
       "Nothing is pinged when nothing is cached (a prompt below the model's cache minimum), when the next turn would roll the context over first, or when one worst-case ping costs more than the rewrite (budgeted thinking on a small prompt).",
       "Pings stop by themselves when the next request would differ (/model, /thinking, /system, tool activation, /compact, /clear); read-only commands do not affect them. A new message ends the idle period.",
-      "Keep-warm spend and tokens are part of the session cost and token totals and labelled separately in the footer and /stats; each ping's spend is saved as soon as it is booked (the labels with the session snapshot). The default comes from cache_keepwarm in config (off unless set)."
+      "Keep-warm spend and tokens are part of the session cost and token totals and labelled separately in the footer and /stats; each ping's spend is saved as soon as it is booked (the labels with the session snapshot). The default comes from cache_keepwarm in config (off unless set).",
+      "This is the prompt cache, not the session: /pin keeps a daemon session loaded and costs nothing."
     ],
-    "related": ["/stats", "/context"]
+    "related": ["/stats", "/context", "/pin"]
+  },
+  {
+    "id": "pin-command",
+    "command": "/pin",
+    "title": "Pin this session",
+    "summary": "Keep this daemon session loaded: never parked or idle-ended, and the daemon does not idle-exit while it is pinned.",
+    "category": "Sessions",
+    "topic": "Command",
+    "protected": true,
+    "common": false,
+    "aliases": ["/keep-warm"],
+    "keywords": ["pin", "unpin", "keep-warm", "park", "idle", "daemon", "loaded", "idle-exit"],
+    "lines": [
+      "/pin (or /pin status) shows whether this session is pinned. /pin on pins it, /pin off unpins it; only the client that owns input can change it. /keep-warm on|off is the same command, and synaps --attach --keep-warm pins at attach.",
+      "A pinned session is never parked, idle-ended or evicted, and the daemon does not idle-exit while any session is pinned. It comes back when the daemon starts again (after reload, daemon stop, idle exit, a crash or a reboot), pinned, with its conversation and its /keepwarm choice. /close and synaps daemon close end it on purpose: then it does not come back. SYNAPS_DAEMON_RESTORE_PINS=0 starts a daemon without bringing pins back (they stay for the next start).",
+      "From another shell: synaps daemon pin <ID|NAME> [--off]. synaps daemon sessions marks pinned sessions and lists pins that are not live (waiting: journal held by another process / failed: reason); synaps daemon pin <ID> --off clears one, synaps daemon pin <ID> retries it. A pinned session keeps the prompt cache warm (/keepwarm) even with no TUI attached.",
+      "Not /keepwarm (no dash), which keeps the prompt cache warm by pinging the API and costs money. In-process (no daemon), /pin does nothing: the session ends with the TUI."
+    ],
+    "related": ["/close", "/keepwarm", "/sessions"]
+  },
+  {
+    "id": "clients-command",
+    "command": "/clients",
+    "title": "Clients attached to this session",
+    "summary": "List every client attached to this daemon session: its name, kind, drive or observe, who owns input, and which one is you.",
+    "category": "Sessions",
+    "topic": "Command",
+    "protected": true,
+    "common": false,
+    "aliases": [],
+    "keywords": ["clients", "attached", "names", "tabs", "observe", "owner", "input", "who", "as"],
+    "lines": [
+      "/clients lists every client attached to this session, one per line: name (#id), kind, drive or observe, then 'owns input' and 'you' where they apply, and how long it has been attached. It works while the agent is streaming.",
+      "Every client is you (the daemon refuses other users). A name is a label: pick one with synaps --attach --as <name> or SYNAPS_CLIENT_NAME (1-32 letters, digits, - or _). Without one a client gets its kind (tui, attach), and tui-2, tui-3 when that is taken.",
+      "Names also show in synaps daemon sessions, in 'input owned by tui (#1)' refusals and in the 'input taken over by' notice.",
+      "In-process (no daemon) there is one client, this TUI."
+    ],
+    "related": ["/pin", "/sessions"]
+  },
+  {
+    "id": "takeover-command",
+    "command": "/takeover",
+    "title": "Take input in this client",
+    "summary": "Take input ownership of this daemon session from the client that holds it, without re-attaching.",
+    "category": "Sessions",
+    "topic": "Command",
+    "protected": true,
+    "common": false,
+    "aliases": [],
+    "keywords": ["takeover", "take over", "input", "owner", "read-only", "attach", "client", "steal", "mirror"],
+    "lines": [
+      "When several clients are attached to one daemon session, only one owns input; the others are read-only and their prompts are refused. /takeover makes this client the owner in place, like synaps --attach --takeover but without re-attaching. The previous owner is told (\"input taken over\") and becomes read-only.",
+      "It works mid-turn: the running turn keeps going, and only who may submit, steer, cancel or change settings moves.",
+      "A client attached with --observe is read-only on purpose and cannot take over; attach without --observe instead. In-process (no daemon) there is only one client, so there is nothing to take over."
+    ],
+    "related": ["/pin", "/close", "/sessions"]
   },
   {
     "id": "budget-command",

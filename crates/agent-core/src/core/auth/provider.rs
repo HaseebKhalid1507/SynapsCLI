@@ -308,11 +308,12 @@ async fn login_with_persist(
 }
 
 /// Overrides for the endpoints a refresh talks to. Empty in production;
-/// tests point the Muse key mint at a loopback fake so a broker-level 401
-/// test can never reach the real mint.
+/// tests point the Muse key mint and the Anthropic token endpoint at
+/// loopback fakes so a broker-level test can never reach the real ones.
 #[derive(Debug, Clone, Default)]
 pub struct RefreshEndpoints {
     muse_mint_url: Option<String>,
+    anthropic_token_url: Option<String>,
 }
 
 impl RefreshEndpoints {
@@ -321,6 +322,14 @@ impl RefreshEndpoints {
     #[doc(hidden)]
     pub fn with_muse_mint_url_for_tests(mut self, url: impl Into<String>) -> Self {
         self.muse_mint_url = Some(url.into());
+        self
+    }
+
+    /// Loopback Anthropic token endpoint only; anything else is refused at
+    /// refresh time (never a fallback to the real endpoint).
+    #[doc(hidden)]
+    pub fn with_anthropic_token_url_for_tests(mut self, url: impl Into<String>) -> Self {
+        self.anthropic_token_url = Some(url.into());
         self
     }
 }
@@ -332,9 +341,17 @@ pub async fn refresh_via(
     refresh: &str,
     endpoints: &RefreshEndpoints,
 ) -> Result<OAuthCredentials, super::token::RefreshFailure> {
-    match (&endpoints.muse_mint_url, id) {
-        (Some(url), OAuthProviderId::Muse) => {
+    match (&endpoints.muse_mint_url, &endpoints.anthropic_token_url, id) {
+        (Some(url), _, OAuthProviderId::Muse) => {
             super::muse::refresh_token_via_test_mint(url, refresh).await
+        }
+        (_, Some(url), OAuthProviderId::Anthropic) => {
+            if !super::usage::is_loopback_url(url) {
+                return Err(super::token::RefreshFailure::other(
+                    "test token endpoint must be a loopback URL",
+                ));
+            }
+            super::token::refresh_token_at(client, url, refresh).await
         }
         _ => self::refresh(client, id, refresh).await,
     }

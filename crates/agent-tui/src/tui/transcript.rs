@@ -29,6 +29,7 @@
 //! clears the selection; width changes clear it explicitly in `sync_cache`.
 
 pub(crate) mod estimate;
+mod live;
 
 /// Read-only App state the transcript renderer needs. Constructed fresh at
 /// each cache-sync call site — cheap (a usize, a bool, a &str). This makes
@@ -573,6 +574,9 @@ pub(crate) struct TranscriptStore {
     /// Store-owned because it changes cached line content — mutate only via
     /// [`Self::set_show_full_output`], which invalidates internally.
     show_full_output: bool,
+    /// Session cwd/home that grep/find card paths are shown relative to
+    /// (display-only). Mutate via [`Self::set_path_base`] (invalidates).
+    path_base: super::render::paths::PathBase,
 
     // ── Scrollback cap (phase 4 B6) ──────────────────────────────────────────
     /// Max retained messages (0 = unbounded).
@@ -586,6 +590,9 @@ pub(crate) struct TranscriptStore {
     bytes_since_audit: usize,
     /// Messages dropped by the cap so far (the sentinel line reports it).
     scrollback_dropped: usize,
+    /// Local date of the last dated message pushed: a message on another
+    /// day is preceded by a `── Sun Oct 25 ──` line.
+    last_day: Option<chrono::NaiveDate>,
     /// A subagent view's store: its trim note doesn't point at `/resync`,
     /// which only reloads the main thread.
     worker_view: bool,
@@ -597,6 +604,28 @@ pub(crate) struct TranscriptStore {
     /// each show their own elapsed-time on the result block, instead of
     /// sharing a single timer that the last-started tool clobbers.
     tool_start_times: std::collections::HashMap<String, std::time::Instant>,
+    /// Calls the engine said wait behind another in their scheduler lane
+    /// (`LlmEvent::ToolQueued`) and that have not started yet. Not in
+    /// `tool_start_times` meanwhile, so their cards neither sweep nor
+    /// tick; `ToolStarted` moves them back, timed from then. Empty for a
+    /// client of an engine that never sends the signal.
+    queued_tools: std::collections::HashSet<String>,
+    /// When the event being applied happened, if not "now": a subagent view
+    /// applies its journal only when it polls, so it replays each event at
+    /// the time the engine recorded it ([`Self::set_event_time`]). `None`
+    /// (the main thread, always): the event is happening now.
+    event_time: Option<std::time::Instant>,
+
+    // ── Live slots (transcript/live.rs) ──────────────────────────────────────
+    /// Indices of the messages that animate on their own (a running tool
+    /// card's clock and sweep, the thinking placeholder's spinner), sorted
+    /// ascending. Kept in step with every insert/remove so the tick can
+    /// refresh exactly these slots wherever they are, and costs nothing
+    /// when it is empty.
+    live: Vec<usize>,
+    /// The tick asked for the live slots to be re-rendered; the next
+    /// [`Self::sync_cache`] does it.
+    live_refresh: bool,
 
     // ── Viewport geometry (moved in slice e) ─────────────────────────────────
     /// Inner content rect of the message area as of the last
@@ -660,6 +689,11 @@ pub(crate) struct VisibleWindow {
     pub(crate) is_empty: bool,
 }
 
+/// The system line shown where the local date changes.
+pub(crate) fn day_line(day: chrono::NaiveDate) -> String {
+    format!("── {} ──", day.format("%a %b %-d"))
+}
+
 impl TranscriptStore {
     pub(crate) fn new(clock: super::clock::TuiClock) -> Self {
         Self {
@@ -673,14 +707,20 @@ impl TranscriptStore {
             scroll_anchor: None,
             cache: CacheState::Missing,
             show_full_output: false,
+            path_base: Default::default(),
             max_msgs: 0,
             max_bytes: 0,
             pushes_since_audit: 0,
             bytes_since_audit: 0,
             scrollback_dropped: 0,
+            last_day: None,
             worker_view: false,
             tool_start_time: None,
             tool_start_times: std::collections::HashMap::new(),
+            queued_tools: std::collections::HashSet::new(),
+            event_time: None,
+            live: Vec::new(),
+            live_refresh: false,
             viewport: None,
             visible_range: None,
             selection_anchor: None,
@@ -698,6 +738,55 @@ impl TranscriptStore {
     pub(crate) fn set_scrollback(&mut self, msgs: usize, bytes: usize) {
         self.max_msgs = msgs;
         self.max_bytes = bytes;
+    }
+
+    /// The store's clock — what running tool timers count up to.
+    pub(crate) fn now(&self) -> std::time::Instant {
+        self.clock.now()
+    }
+
+    /// Apply the following events as having happened at `at` (`None`: now).
+    /// Tool timers start, and finished tools are timed, from it. Never later
+    /// than now: a running clock must not start out negative.
+    pub(crate) fn set_event_time(&mut self, at: Option<std::time::Instant>) {
+        let now = self.clock.now();
+        self.event_time = at.map(|t| t.min(now));
+    }
+
+    /// When the event being applied happened (see `event_time`).
+    fn event_now(&self) -> std::time::Instant {
+        self.event_time.unwrap_or_else(|| self.clock.now())
+    }
+
+    /// The `HH:MM` a message pushed now is stamped with: the wall-clock time
+    /// of the event being applied (a subagent view's steer shows when the
+    /// worker took it, not when the view polled).
+    fn event_stamp(&self) -> String {
+        self.event_wall().format("%H:%M").to_string()
+    }
+
+    /// Wall-clock time of the event being applied.
+    fn event_wall(&self) -> chrono::DateTime<chrono::Local> {
+        let ago = self.event_time.map_or(std::time::Duration::ZERO, |t| {
+            self.clock.now().saturating_duration_since(t)
+        });
+        chrono::Local::now() - chrono::Duration::from_std(ago).unwrap_or(chrono::Duration::zero())
+    }
+
+    /// Before a message dated `at`: a day line when the local date changed
+    /// since the previous dated message. The first dated message sets the
+    /// day without a line.
+    fn note_day(&mut self, at: chrono::DateTime<chrono::Local>) {
+        let day = at.date_naive();
+        if self.last_day.is_some_and(|last| last != day) {
+            self.messages.push(TimestampedMsg {
+                msg: ChatMessage::System(day_line(day)),
+                time: String::new(),
+            });
+            self.live_note(self.messages.len() - 1);
+            self.invalidate_last();
+        }
+        self.last_day = Some(day);
     }
 
     /// Mark this store as a subagent view's (see `worker_view`).
@@ -771,6 +860,7 @@ impl TranscriptStore {
         let n = if had_sentinel { n.max(1) } else { n };
         let dropped_real = if had_sentinel { n - 1 } else { n };
         self.messages.drain(0..n);
+        self.live_drained_front(n);
         self.scrollback_dropped += dropped_real;
         let reload = if self.worker_view {
             "a subagent view keeps only its newest messages".to_string()
@@ -788,6 +878,7 @@ impl TranscriptStore {
             time: chrono::Local::now().format("%H:%M").to_string(),
         };
         self.messages.insert(0, sentinel);
+        self.live_inserted(0);
         // Net index shift: −n (drained) +1 (sentinel).
         self.response_start = self.response_start.and_then(|s| (s >= n).then(|| s - n + 1));
         self.scroll_anchor = match self.scroll_anchor.take() {
@@ -1063,14 +1154,30 @@ impl TranscriptStore {
     // App-side wrappers (locked decision #3).
 
     pub(crate) fn push_msg(&mut self, msg: ChatMessage) {
+        let at = self.event_wall();
+        self.push_msg_at(msg, Some(at));
+    }
+
+    /// Push a message that happened at `at` (a rebuilt transcript: the time
+    /// the host recorded for it), shown as local `HH:MM`. `None`: a message
+    /// with no recorded time shows an empty time, never "now".
+    pub(crate) fn push_msg_at(
+        &mut self,
+        msg: ChatMessage,
+        at: Option<chrono::DateTime<chrono::Local>>,
+    ) {
+        if let Some(at) = at {
+            self.note_day(at);
+        }
         self.messages.push(TimestampedMsg {
             msg,
-            time: chrono::Local::now().format("%H:%M").to_string(),
+            time: at.map(|at| at.format("%H:%M").to_string()).unwrap_or_default(),
         });
         // Auto-scroll only when pinned to bottom
         if self.scroll_pinned {
             self.scroll_back = 0;
         }
+        self.live_note(self.messages.len() - 1);
         // New tail message — mark last slot dirty (append to per_msg on next rebuild).
         self.invalidate_last();
         let pushed = self.messages.last().map(|m| m.msg.approx_len()).unwrap_or(0);
@@ -1128,9 +1235,10 @@ impl TranscriptStore {
                     at,
                     TimestampedMsg {
                         msg,
-                        time: chrono::Local::now().format("%H:%M").to_string(),
+                        time: self.event_stamp(),
                     },
                 );
+                self.live_inserted(at);
                 if self.scroll_pinned {
                     self.scroll_back = 0;
                 }
@@ -1179,6 +1287,7 @@ impl TranscriptStore {
                 time: chrono::Local::now().format("%H:%M").to_string(),
             },
         );
+        self.relive();
     }
 
     // ── Invalidate family (moved in slice b′) ────────────────────────────────
@@ -1363,7 +1472,7 @@ impl TranscriptStore {
     /// ESTIMATED heights): its `total_height` is then a new coordinate system
     /// that must not be compared against last frame's total.
     pub(crate) fn sync_cache(&mut self, content_width: usize, ctx: &RenderCtx<'_>) -> bool {
-        let needs_full_rebuild = self.line_cache().map_or(true, |c| c.width != content_width);
+        let needs_full_rebuild = self.line_cache().is_none_or(|c| c.width != content_width);
 
         // Width change ⇒ rewrap ⇒ every content coordinate is re-derived;
         // clear the selection explicitly — honest and cheap (design §3.3).
@@ -1371,6 +1480,13 @@ impl TranscriptStore {
         // P11 as a rule, not this line of code — see design §7.)
         if self.line_cache().is_some_and(|c| c.width != content_width) {
             self.clear_selection();
+        }
+
+        if !needs_full_rebuild {
+            // Live slots above the watermark: re-render them in place.
+            self.refresh_live_slots(content_width, ctx);
+        } else {
+            self.live_refresh = false;
         }
 
         if needs_full_rebuild {
@@ -1447,6 +1563,7 @@ impl TranscriptStore {
             self.cache = CacheState::Clean(LineCache::new(content_width, per_msg));
         }
         self.debug_assert_cum_identity();
+        self.debug_assert_live();
         needs_full_rebuild
     }
 
@@ -2357,6 +2474,20 @@ impl TranscriptStore {
     /// Self-invalidating setter — the toggle changes cached line content, so
     /// the manual `invalidate()` at the call site is impossible to forget
     /// because it no longer exists (red-team overrule of design §6 decision 1).
+    /// Where card paths are shortened from (see [`Self::set_path_base`]).
+    pub(crate) fn path_base(&self) -> &super::render::paths::PathBase {
+        &self.path_base
+    }
+
+    /// Set the session cwd card paths are shown relative to; re-renders
+    /// cached cards when it changes (session switch).
+    pub(crate) fn set_path_base(&mut self, base: super::render::paths::PathBase) {
+        if self.path_base != base {
+            self.path_base = base;
+            self.invalidate();
+        }
+    }
+
     pub(crate) fn set_show_full_output(&mut self, v: bool) {
         self.show_full_output = v;
         self.invalidate();
@@ -2364,20 +2495,10 @@ impl TranscriptStore {
 
     /// True when any transcript line is spinner-animated, i.e. re-rendering
     /// the message cache on a spinner tick would change output. Was
-    /// `App::render_lines_uses_spinner` (design §3.4).
+    /// `App::render_lines_uses_spinner` (design §3.4). O(1): reads the
+    /// tracked live slots (transcript/live.rs) instead of scanning.
     pub(crate) fn uses_spinner(&self) -> bool {
-        self.messages
-            .iter()
-            .enumerate()
-            .any(|(idx, msg)| match &msg.msg {
-                ChatMessage::Thinking(text) => text == THINKING_PLACEHOLDER,
-                ChatMessage::ToolUseStart { .. } => true,
-                ChatMessage::ToolUse { .. } => {
-                    idx == self.messages.len().saturating_sub(1) && self.tool_start_time.is_some()
-                }
-                ChatMessage::ToolResult { .. } => self.is_active_tool_result(idx),
-                _ => false,
-            })
+        self.has_live()
     }
 
     // ── Tool state queries + find_* helpers (moved in slice b′) ──────────────
@@ -2538,11 +2659,11 @@ impl TranscriptStore {
     /// elapsed-ms is correct under parallel execution.
     pub(crate) fn on_tool_use_start(&mut self, tool_id: String, tool_name: String) {
         self.drop_empty_thinking();
-        let now = self.clock.now();
-        self.tool_start_time = Some(now);
+        let now = self.event_now();
         if !tool_id.is_empty() {
             self.tool_start_times.insert(tool_id.clone(), now);
         }
+        self.set_tool_clock(Some(now));
         self.push_msg(ChatMessage::ToolUseStart {
             tool_id,
             tool_name,
@@ -2590,11 +2711,11 @@ impl TranscriptStore {
         self.drop_empty_thinking();
         // Track start time even if we never saw a ToolUseStart (some
         // providers go straight to a finalized tool_use).
-        let now = self.clock.now();
-        if !tool_id.is_empty() {
+        let now = self.event_now();
+        if !tool_id.is_empty() && !self.queued_tools.contains(&tool_id) {
             self.tool_start_times.entry(tool_id.clone()).or_insert(now);
         }
-        self.tool_start_time = Some(now);
+        self.set_tool_clock(Some(now));
 
         if let Some(idx) = self.find_tool_use_start_idx(&tool_id) {
             self.messages[idx].msg = ChatMessage::ToolUse {
@@ -2602,6 +2723,7 @@ impl TranscriptStore {
                 tool_name,
                 input: input_str,
             };
+            self.live_note(idx);
             // P11 narrowing + lock L2: idx IS the matched use index, so
             // dirtying from idx covers the stale-header trap directly. The
             // in-place ToolUseStart→ToolUse swap can also change the render
@@ -2654,14 +2776,18 @@ impl TranscriptStore {
     /// this `tool_id` (including a delta-buffered one) and stamps the
     /// elapsed time using the per-tool start time.
     pub(crate) fn on_tool_result(&mut self, tool_id: String, result: String) {
+        // A queued call that never started (its lane was cancelled) ends
+        // here too: untimed, it never ran.
+        self.queued_tools.remove(&tool_id);
+        let now = self.event_now();
         let elapsed = self
             .tool_start_times
             .remove(&tool_id)
-            .map(|t| t.elapsed().as_millis() as u64);
+            .map(|t| now.saturating_duration_since(t).as_millis() as u64);
         // Clear the shared "active tool" timer once the *latest* tool
         // finishes — otherwise the bash trace animation lingers.
         if self.tool_start_times.is_empty() {
-            self.tool_start_time = None;
+            self.set_tool_clock(None);
         }
 
         // Lock L2 — the stale-header trap: stamping elapsed_ms (and dropping
@@ -2682,6 +2808,14 @@ impl TranscriptStore {
                 )
             })
         };
+        // The card stopped running: its rows are no longer live (before any
+        // insert below shifts the indices).
+        if let Some(u) = use_idx {
+            self.live_note(u);
+        }
+        if let Some(r) = self.find_tool_result_idx(&tool_id) {
+            self.live_note(r);
+        }
 
         if let Some(idx) = self.find_tool_result_idx(&tool_id) {
             if let ChatMessage::ToolResult {
@@ -2703,6 +2837,64 @@ impl TranscriptStore {
             }
         }
         self.push_tool_result(tool_id, result, elapsed);
+    }
+
+    /// The card of call `tool_id` (its `ToolUse`/`ToolUseStart`), if shown.
+    fn tool_use_idx(&self, tool_id: &str) -> Option<usize> {
+        self.messages.iter().position(|m| {
+            matches!(
+                &m.msg,
+                ChatMessage::ToolUse { tool_id: tid, .. }
+                | ChatMessage::ToolUseStart { tool_id: tid, .. }
+                    if tid == tool_id
+            )
+        })
+    }
+
+    /// The engine queued call `tool_id` behind another in its scheduler
+    /// lane: it is not running. Its card stops sweeping and ticking and
+    /// says `queued` until [`Self::on_tool_started`]. Ignored for a call
+    /// without an id, or one that already has its final result.
+    pub(crate) fn on_tool_queued(&mut self, tool_id: String) {
+        if tool_id.is_empty() {
+            return;
+        }
+        let finished = self.find_tool_result_idx(&tool_id).is_some_and(|i| {
+            matches!(self.messages[i].msg, ChatMessage::ToolResult { elapsed_ms: Some(_), .. })
+        });
+        if finished {
+            return;
+        }
+        self.tool_start_times.remove(&tool_id);
+        self.queued_tools.insert(tool_id.clone());
+        if self.tool_start_times.is_empty() {
+            self.set_tool_clock(None);
+        }
+        if let Some(idx) = self.tool_use_idx(&tool_id) {
+            self.live_note(idx);
+            self.invalidate_from(idx);
+        }
+    }
+
+    /// A queued call began executing: from here its card runs like any
+    /// other, and its clock and final footer count from now. A `started`
+    /// for a call that was never queued changes nothing (today's timing).
+    pub(crate) fn on_tool_started(&mut self, tool_id: String) {
+        if !self.queued_tools.remove(&tool_id) {
+            return;
+        }
+        let now = self.event_now();
+        self.tool_start_times.insert(tool_id.clone(), now);
+        self.set_tool_clock(Some(now));
+        if let Some(idx) = self.tool_use_idx(&tool_id) {
+            self.live_note(idx);
+            self.invalidate_from(idx);
+        }
+    }
+
+    /// Whether call `tool_id` is waiting in its lane (see `queued_tools`).
+    pub(crate) fn tool_queued(&self, tool_id: &str) -> bool {
+        !tool_id.is_empty() && self.queued_tools.contains(tool_id)
     }
 
     // ── Streaming text mutations (moved in slice b′) ─────────────────────────
@@ -2782,6 +2974,7 @@ impl TranscriptStore {
             // appending to it (otherwise content reads "…​<thinking>").
             if existing == THINKING_PLACEHOLDER {
                 *existing = text.to_string();
+                self.live_note(self.messages.len() - 1);
             } else {
                 existing.push_str(text);
             }
@@ -2810,6 +3003,7 @@ impl TranscriptStore {
             if let ChatMessage::Thinking(t) = &self.messages[idx].msg {
                 if t == THINKING_PLACEHOLDER || t.is_empty() {
                     self.messages.remove(idx);
+                    self.live_removed(idx);
                     self.anchor_remap_remove(idx);
                     // Structural change (remove) — full invalidate to resync per_msg lengths.
                     self.invalidate_structural();
@@ -2847,9 +3041,16 @@ impl TranscriptStore {
                     | ChatMessage::ToolUse { tool_id, .. } if tool_id == id)
             })
         });
+        self.queued_tools.retain(|id| {
+            self.messages.iter().any(|m| {
+                matches!(&m.msg, ChatMessage::ToolUseStart { tool_id, .. }
+                    | ChatMessage::ToolUse { tool_id, .. } if tool_id == id)
+            })
+        });
         if self.tool_start_times.is_empty() {
             self.tool_start_time = None;
         }
+        self.relive();
         // An anchor inside the discarded preview re-anchors on the restored
         // message the preview hung off.
         if let Some(a) = self.scroll_anchor.as_mut() {
@@ -2895,6 +3096,8 @@ impl TranscriptStore {
     /// Equivalent to `messages.clear()` + `invalidate()` in prior slices.
     pub(crate) fn clear(&mut self) {
         self.messages.clear();
+        self.last_day = None;
+        self.live.clear();
         self.response_start = None;
         self.clear_selection();
         self.cache = CacheState::Missing;
@@ -2921,20 +3124,6 @@ impl TranscriptStore {
     #[allow(dead_code)]
     pub(crate) fn is_pinned(&self) -> bool {
         self.scroll_pinned
-    }
-
-    /// Returns the elapsed time since the current tool started, if one is active.
-    /// Used by render.rs (in `impl TranscriptStore`) to format elapsed displays —
-    /// must go through this accessor because render.rs is in a sibling module.
-    pub(crate) fn tool_start_time(&self) -> Option<std::time::Instant> {
-        self.tool_start_time
-    }
-
-    /// Returns the per-tool start time for `tool_id`, if present.
-    /// Query surface (seam design §3.4) — P10/P11 consumers pending.
-    #[allow(dead_code)]
-    pub(crate) fn tool_start_time_for(&self, tool_id: &str) -> Option<std::time::Instant> {
-        self.tool_start_times.get(tool_id).copied()
     }
 
     /// Returns the dirty watermark index if the cache is in the `Dirty` state.
@@ -2996,12 +3185,14 @@ impl TranscriptStore {
     #[cfg(test)]
     pub(crate) fn test_insert_at(&mut self, idx: usize, msg: TimestampedMsg) {
         self.messages.insert(idx, msg);
+        self.relive();
     }
 
     /// Set `tool_start_time` for tests that exercise the spinner / elapsed path.
     #[cfg(test)]
     pub(crate) fn test_set_tool_start_time(&mut self, t: Option<std::time::Instant>) {
         self.tool_start_time = t;
+        self.relive();
     }
 
     /// Insert a per-tool start-time entry for tests that exercise parallel-tool
@@ -3009,6 +3200,7 @@ impl TranscriptStore {
     #[cfg(test)]
     pub(crate) fn test_insert_tool_start_time(&mut self, id: String, t: std::time::Instant) {
         self.tool_start_times.insert(id, t);
+        self.relive();
     }
 
     /// Directly set `scroll_back` for scroll unit tests that need to start from
@@ -3057,6 +3249,32 @@ mod visible_window_tests {
             streaming: false,
             agent_name: "synaps",
         }
+    }
+
+    /// A message without a recorded time renders an empty time, not now.
+    #[test]
+    fn a_message_without_a_time_renders_with_an_empty_time() {
+        let mut store = TranscriptStore::new(super::super::clock::TuiClock::real());
+        store.push_msg_at(ChatMessage::User("legacy".into()), None);
+        let at = chrono::DateTime::parse_from_rfc3339("2020-03-01T05:47:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Local);
+        store.push_msg_at(ChatMessage::User("dated".into()), Some(at));
+        let text = |i: usize| -> String {
+            store
+                .render_message_lines(i, 60, &test_ctx())
+                .lines
+                .unwrap()
+                .iter()
+                .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let now = chrono::Local::now().format("%H:%M").to_string();
+        let legacy = text(0);
+        assert!(legacy.contains("you") && !legacy.contains(&now), "{legacy}");
+        assert!(!legacy.chars().any(|c| c == ':'), "no time shown: {legacy}");
+        assert!(text(1).contains(&at.format("%H:%M").to_string()));
     }
 
     /// Ported from app.rs with slice (e). The app.rs original *mirrored* the

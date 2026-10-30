@@ -280,6 +280,7 @@ async fn s6_slow_storage_never_delays_turn_and_overflow_is_counted() {
         trace_path: Some(tmp.path().join("trace.jsonl")),
         capacity: 1,
         max_file_bytes: synaps_cli::runtime::telemetry::DEFAULT_MAX_FILE_BYTES,
+        max_generations: 1,
         write_delay: Some(Duration::from_millis(400)),
         write_gate: None,
     });
@@ -335,6 +336,7 @@ async fn s6_broken_storage_never_fails_turn_and_warns_once() {
         trace_path: Some(broken),
         capacity: 64,
         max_file_bytes: synaps_cli::runtime::telemetry::DEFAULT_MAX_FILE_BYTES,
+        max_generations: 1,
         write_delay: None,
         write_gate: None,
     });
@@ -385,6 +387,7 @@ fn s6_trace_writer_shutdown_deadline_is_bounded_under_slow_storage() {
         trace_path: Some(tmp.path().join("trace.jsonl")),
         capacity: 32,
         max_file_bytes: synaps_cli::runtime::telemetry::DEFAULT_MAX_FILE_BYTES,
+        max_generations: 1,
         write_delay: Some(Duration::from_millis(300)),
         write_gate: None,
     });

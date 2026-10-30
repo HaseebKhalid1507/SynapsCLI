@@ -20,6 +20,7 @@ use crate::{Result, RuntimeError};
 
 use super::config::ShellConfig;
 use super::pty::PtyHandle;
+use crate::tools::utf8_stream::Utf8StreamDecoder;
 use super::readiness::{ReadinessDetector, ReadinessResult, ReadinessStrategy};
 
 // ---------------------------------------------------------------------------
@@ -36,6 +37,9 @@ pub struct SessionManager {
 /// A single shell session — PTY handle, readiness detector, and metadata.
 struct ShellSession {
     pty: PtyHandle,
+    /// Holds a character split across PTY reads until its last byte arrives
+    /// (#286). Lives with the session so a split across two calls survives.
+    decoder: Utf8StreamDecoder,
     detector: ReadinessDetector,
     created_at: Instant,
     last_active: Instant,
@@ -192,6 +196,7 @@ fn status_string(status: &SessionStatus) -> String {
 /// `"active"`, `"exited"`, `"exited(N)"`, or `"timeout"`.
 async fn wait_for_output(
     pty: &mut PtyHandle,
+    decoder: &mut Utf8StreamDecoder,
     detector: &ReadinessDetector,
     timeout_override: Option<u64>,
     tx_delta: Option<&crate::tools::output::DeltaSender>,
@@ -222,7 +227,7 @@ async fn wait_for_output(
         let bytes = pty.try_read_output(poll_interval).await;
 
         if !bytes.is_empty() {
-            let text = String::from_utf8_lossy(&bytes);
+            let text = decoder.decode(&bytes);
             output.push_str(&text);
             last_output_time = Instant::now();
 
@@ -247,8 +252,9 @@ async fn wait_for_output(
             // Drain any remaining buffered output.
             tokio::time::sleep(Duration::from_millis(50)).await;
             let remaining = pty.try_read_output(Duration::from_millis(100)).await;
-            if !remaining.is_empty() {
-                let remaining_text = String::from_utf8_lossy(&remaining);
+            let mut remaining_text = decoder.decode(&remaining);
+            remaining_text.push_str(&decoder.finish());
+            if !remaining_text.is_empty() {
                 output.push_str(&remaining_text);
 
                 // Stream remaining output to TUI
@@ -384,8 +390,10 @@ impl SessionManager {
         // Without this, the silence timeout can fire before the process has
         // had time to print anything (e.g. Python startup, shell rc files).
         tokio::time::sleep(Duration::from_millis(200)).await;
+        let mut decoder = Utf8StreamDecoder::new();
         let (initial_output, status_str) = wait_for_output(
             &mut pty,
+            &mut decoder,
             &detector,
             opts.readiness_timeout_ms,
             tx_delta,
@@ -402,6 +410,7 @@ impl SessionManager {
 
         let session = ShellSession {
             pty,
+            decoder,
             detector,
             created_at: now,
             last_active: now,
@@ -464,6 +473,7 @@ impl SessionManager {
         // --- Wait for output ---
         let (output, status_str) = wait_for_output(
             &mut session.pty,
+            &mut session.decoder,
             &session.detector,
             timeout_ms,
             tx_delta,
@@ -514,10 +524,12 @@ impl SessionManager {
             .pty
             .try_read_output(Duration::from_millis(100))
             .await;
-        let final_output = if remaining.is_empty() {
+        let mut final_text = session.decoder.decode(&remaining);
+        final_text.push_str(&session.decoder.finish());
+        let final_output = if final_text.is_empty() {
             String::new()
         } else {
-            strip_ansi(&String::from_utf8_lossy(&remaining))
+            strip_ansi(&final_text)
         };
 
         // PtyHandle::drop will kill the child process.
@@ -715,6 +727,37 @@ mod tests {
 
         // Clean up
         let _ = mgr.close_session(&id).await;
+    }
+
+    /// Issue #286: a character whose bytes arrive in separate PTY polls must
+    /// come back whole. The sleep is longer than the 50 ms poll interval and
+    /// shorter than the 300 ms silence timeout.
+    #[tokio::test]
+    async fn test_character_split_across_polls_is_not_replaced() {
+        let mgr = default_manager();
+        let (id, _initial, _status) = mgr
+            .create_session(opts_for("bash"), None, 256 * 1024)
+            .await
+            .expect("failed to create session");
+
+        let result = mgr
+            .send_input(
+                &id,
+                "printf 'A\\342\\226'; sleep 0.15; printf '\\200B'; echo\n",
+                Some(2000),
+                None,
+                256 * 1024,
+            )
+            .await
+            .expect("failed to send input");
+        let _ = mgr.close_session(&id).await;
+
+        assert!(
+            !result.output.contains('\u{FFFD}'),
+            "split character became U+FFFD: {:?}",
+            result.output
+        );
+        assert!(result.output.contains("A\u{2580}B"), "{:?}", result.output);
     }
 
     // 3. Close session → idempotent (close twice is fine)

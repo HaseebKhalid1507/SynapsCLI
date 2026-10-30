@@ -1,7 +1,8 @@
 //! Auto-spawn (jcode model): the first `synaps attach` / `synaps --attach`
-//! starts the daemon itself — `setsid` + ready-fd, the daemon holds the
-//! flock — and later clients find it. Real processes, one temp HOME +
-//! runtime dir per test, no process-env mutation (parallel-safe).
+//! starts the daemon itself — `setsid` + ready-fd (Windows: a detached
+//! process + a ready event), the daemon holds the lock — and later clients
+//! find it. Real processes, one temp HOME + runtime dir per test, no
+//! process-env mutation (parallel-safe).
 //!
 //! Covered: spawn on first attach (daemon.json, pid alive, flock held) →
 //! second attach reuses (same pid) → `daemon stop` ends it; concurrent
@@ -10,8 +11,6 @@
 //! progressive disclosure off with an MCP server configured → the daemon
 //! starts (the legacy-MCP refusal is gone); `daemon status` with nobody
 //! running says it auto-starts.
-
-#![cfg(unix)]
 
 #[path = "support/phase2/mod.rs"]
 mod phase2;
@@ -79,6 +78,17 @@ impl Env {
             .env("SYNAPS_NO_BOOT_FX", "1")
             .env("TERM", "dumb")
             .current_dir(self.home.path());
+        // Windows: what any process needs (Winsock reads SystemRoot), and
+        // the profile dir pointed at the temp HOME.
+        #[cfg(windows)]
+        {
+            for k in ["SystemRoot", "SystemDrive", "WINDIR", "ComSpec", "PATHEXT", "TEMP", "TMP"] {
+                if let Some(v) = std::env::var_os(k) {
+                    c.env(k, v);
+                }
+            }
+            c.env("USERPROFILE", self.home.path());
+        }
         c
     }
 
@@ -228,8 +238,18 @@ fn wait_alive(paths: &registry::DaemonPaths, want: bool, secs: u64) {
     }
 }
 
+#[cfg(unix)]
 fn pid_alive(pid: u32) -> bool {
     Path::new(&format!("/proc/{pid}")).exists()
+}
+
+#[cfg(windows)]
+fn pid_alive(pid: u32) -> bool {
+    let out = Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+        .output()
+        .expect("tasklist");
+    String::from_utf8_lossy(&out.stdout).contains(&format!("\"{pid}\""))
 }
 
 #[test]
@@ -246,6 +266,7 @@ fn first_attach_spawns_second_reuses_stop_ends() {
     let info = registry::read_daemon_json(&paths).expect("daemon.json");
     assert!(pid_alive(info.pid), "pid {} alive", info.pid);
     assert!(paths.spawn_lock().exists(), "spawn lock file next to the flock");
+    #[cfg(unix)]
     assert!(paths.sock.exists());
 
     // Second client: same daemon, no spawn line.
@@ -414,8 +435,23 @@ fn hung_mcp_server_does_not_delay_daemon_ready() {
     let spy = env.home.path().join("hung-spy.log");
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("crates/agent-engine/tests/fixtures/mcp_fixture_server.py");
+    // Windows: an absolute interpreter path. The MCP launcher resolves a
+    // bare name with Rust's PATH rules, where `python` may be the Store
+    // alias stub, or hidden behind a malformed PATH entry.
+    let python = if cfg!(windows) {
+        // Split like cmd.exe does (`;`, quotes trimmed): one stray quote in
+        // PATH makes `split_paths` swallow every later entry.
+        let path = std::env::var("PATH").unwrap_or_default();
+        path.split(';')
+            .map(|d| Path::new(d.trim().trim_matches('"')).join("python.exe"))
+            .find(|p| p.is_file() && !p.to_string_lossy().contains("WindowsApps"))
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "python".into())
+    } else {
+        "python3".into()
+    };
     let mcp = serde_json::json!({"mcpServers": {"stuck": {
-        "command": "python3",
+        "command": python,
         "args": [fixture.display().to_string()],
         "env": {
             "MCP_FIXTURE_SPY": spy.display().to_string(),

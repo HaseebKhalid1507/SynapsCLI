@@ -417,6 +417,8 @@ mod tests {
                 model: "model".into(),
                 system_prompt: "system".into(),
                 timeout_secs: 1,
+                cwd: None,
+                thinking: None,
             });
             s.history = Some(vec![Arc::new(
                 serde_json::json!({"role":"user", "content":"task"}),

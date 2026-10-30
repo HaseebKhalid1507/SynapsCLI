@@ -76,6 +76,47 @@ pub(crate) struct TurnDraftState {
     dirty: bool,
 }
 
+/// What a started turn needs to open its stream (`start_turn`), held while
+/// its request waits for `on_session_start`.
+pub(crate) struct TurnStart {
+    cancel: CancellationToken,
+    steer_rx: mpsc::UnboundedReceiver<String>,
+    auto_approve: bool,
+    completion: crate::runtime::TurnCompletion,
+    /// Events started this turn (nobody typed it): its stream runs under the
+    /// event turn budget (#251). Decided from the turn's trigger at
+    /// `start_turn`, applied when the stream opens (`open_turn_stream`),
+    /// which may be after `on_session_start` has run.
+    event_turn: bool,
+}
+
+/// Why autonomous work may not start now
+/// ([`SessionActor::autonomous_work_blocked`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WorkBlock {
+    /// A reload checkpointed this session: nothing may start work the reload
+    /// record does not carry until the exec, or until the daemon reports
+    /// that it failed (#255's reload fence).
+    Fenced,
+    /// This session's `on_session_start` has not run yet: a request sent
+    /// now would lack its injection.
+    SessionStartPending,
+}
+
+/// A source of autonomous work in the actor's loop: work nobody asked for
+/// with a command ([`SessionActor::holds`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WorkSource {
+    /// Queued events (inbox, `synaps send`, worker completions).
+    QueueWake,
+    /// The park grace or a worker re-check.
+    ParkTimer,
+    /// A due prompt-cache keep-warm ping.
+    KeepWarmTimer,
+    /// The armed session driver's 200 ms tick.
+    DriverTick,
+}
+
 /// What `SessionActor::drain_cancelled_stream` recovered from a cancelled
 /// turn's stream.
 #[derive(Default)]
@@ -296,6 +337,12 @@ fn replay_setting(rt: &mut Runtime, setting: &SessionSetting) {
 pub(crate) struct AttachedClient {
     pub(crate) meta: ClientMeta,
     pub(crate) mode: AttachMode,
+    /// Resolved at attach ([`resolve_client_name`]); unique in the session.
+    pub(crate) name: String,
+    /// Unix ms.
+    pub(crate) attached_at_ms: u64,
+    /// `SessionActor::input_seq` at this client's last input; 0 = none yet.
+    pub(crate) last_input: u64,
 }
 
 /// B2: a spawned `compact_conversation` (§2.5).
@@ -397,6 +444,45 @@ pub(crate) fn subagent_user_cancel_event(
     }
 }
 
+/// The MAIN-conversation note for a worker `/close force` cancelled. The
+/// session ends right after, so this is for whoever continues it later
+/// (`--continue`): the worker never finished and no wake is coming.
+pub(crate) fn subagent_close_cancel_event(
+    handle_id: &str,
+    agent_name: &str,
+) -> crate::events::types::Event {
+    let mut event = subagent_user_cancel_event(handle_id, agent_name);
+    event.content.text = format!(
+        "User closed this session with /close force while subagent '{agent_name}' ({handle_id}) was \
+         running, so it was cancelled before it finished. It sends no completion wake; do not wait for \
+         it. If its work is still needed, check what it left behind and dispatch it again."
+    );
+    event
+}
+
+/// `KeepWarm{on: true}`'s notice (`/pin on`, `daemon pin`, `--keep-warm`).
+pub const PIN_ON_NOTICE: &str = "pinned: this session stays loaded (never parked or idle-ended, \
+     and the daemon will not idle-exit while it is pinned) and comes back after daemon restarts. \
+     /pin off to undo.";
+/// `KeepWarm{on: false}`'s notice.
+pub const PIN_OFF_NOTICE: &str = "unpinned: this session parks again when idle and won't come back after a restart";
+
+/// The engine command behind `/close` (`SessionActor::close_command`).
+pub(crate) const CLOSE_COMMAND: &str = "close";
+
+fn is_close_command(cmd: &SessionCommand) -> bool {
+    matches!(cmd, SessionCommand::EngineCommand { name, .. } if name == CLOSE_COMMAND)
+}
+
+/// The host-only engine command behind `synaps daemon rename`
+/// (`SessionActor::host_rename`; JSON args, `RenameArgs`). Clients rename
+/// with `saveas`.
+pub(crate) const RENAME_COMMAND: &str = "rename";
+
+fn is_rename_command(cmd: &SessionCommand) -> bool {
+    matches!(cmd, SessionCommand::EngineCommand { name, .. } if name == RENAME_COMMAND)
+}
+
 fn command_name(cmd: &SessionCommand) -> &'static str {
     match cmd {
         SessionCommand::Submit { .. } => "submit",
@@ -414,14 +500,19 @@ fn command_name(cmd: &SessionCommand) -> &'static str {
         SessionCommand::Detach { .. } => "detach",
         SessionCommand::End { .. } => "end",
         SessionCommand::Resync { .. } => "resync",
+        SessionCommand::EngineCommand { name, .. } if name == CLOSE_COMMAND => "close",
+        SessionCommand::EngineCommand { name, .. } if name == RENAME_COMMAND => "rename",
         SessionCommand::EngineCommand { .. } => "engine_command",
         SessionCommand::PluginCommand { .. } => "plugin_command",
         SessionCommand::Resume { .. } => "resume",
         SessionCommand::Checkpoint { .. } => "checkpoint",
         SessionCommand::KeepWarm { .. } => "keep_warm",
+        SessionCommand::TakeInput => "take_input",
         SessionCommand::Park => "park",
         SessionCommand::AdoptWorkers { .. } => "adopt_workers",
+        SessionCommand::RestoreToolActivations { .. } => "restore_tool_activations",
         SessionCommand::ReloadAborted => "reload_aborted",
+        SessionCommand::ArmPark => "arm_park",
         SessionCommand::HostEvent(_) => "host_event",
         SessionCommand::DriverStart { .. } => "driver_start",
     }
@@ -463,8 +554,16 @@ pub struct SessionActor {
     pub(crate) stream: Option<ActiveStream>,
     pub(crate) cancel: Option<CancellationToken>,
     pub(crate) steer_tx: Option<mpsc::UnboundedSender<String>>,
+    /// An event-started turn's way onto the session budget: `steer` sends
+    /// the owner's message through it, and the turn's stream switches to the
+    /// session budget when it delivers that message. `None` for every other
+    /// turn (they already run on the session budget).
+    pub(crate) owner_steer_budget: Option<Arc<crate::runtime::budget::OwnerSteerBudget>>,
     pub(crate) streaming: bool,
     pub(crate) turn_baseline: usize,
+    /// Stamps each message appended to `conv.api_messages` with its time
+    /// (`_synaps_at`); what was loaded is settled and never stamped.
+    pub(crate) message_stamper: crate::runtime::message_time::Stamper,
     pub(crate) consecutive_auto_turns: u32,
     /// Formatted events `on_queue_wake` steered into this turn's stream
     /// that the engine has not acknowledged (`SteeringDelivered`) yet. On
@@ -499,8 +598,13 @@ pub struct SessionActor {
     pub(crate) view: Arc<arc_swap::ArcSwap<RuntimeView>>,
     pub(crate) attached: HashMap<ClientId, AttachedClient>,
     /// B1: the one client whose input commands are honoured (`None` = any
-    /// host-originated sender only).
+    /// host-originated sender only). With `client_input = shared` it is the
+    /// *active* client: the drive client that sent input last.
     pub(crate) input_owner: Option<ClientId>,
+    /// Who may drive (config `client_input`, or the create override).
+    pub(crate) client_input: ClientInput,
+    /// Bumped on each input from a client ([`AttachedClient::last_input`]).
+    pub(crate) input_seq: u64,
     pub(crate) next_client_id: u64,
     pub(crate) seq: u64,
     pub(crate) turn_replay: VecDeque<Envelope>,
@@ -511,9 +615,21 @@ pub struct SessionActor {
     pub(crate) background: BackgroundTasks,
     /// B2: spawned compaction in flight (`busy` while `Some`).
     pub(crate) compact: Option<CompactionJob>,
-    /// `await_extensions=false`: fires when process-level discovery is done;
-    /// the actor then emits `on_session_start` without having blocked boot.
-    pub(crate) ext_ready: Option<oneshot::Receiver<()>>,
+    /// `compact_inline` is running (it blocks the actor; listings still
+    /// see the session busy).
+    pub(crate) compacting_inline: bool,
+    /// `on_session_start` for this session. `await_extensions=false`: a
+    /// task waits for process-level discovery and its turn at the host's
+    /// gate (one hook at a time), then calls it, so boot never blocks on
+    /// it. A turn that comes first moves it ahead of background hooks and
+    /// waits for it without blocking the loop (`turn_awaiting_start`); a
+    /// keep-warm ping waits with its timer off (`holds`).
+    pub(crate) session_start: super::session_start::SessionStart,
+    /// A started turn whose request waits for `on_session_start`: its
+    /// stream opens when the hook has run. The turn is live meanwhile
+    /// (`streaming`), so Cancel, End and a driver revocation end it as any
+    /// turn, with nothing sent.
+    pub(crate) turn_awaiting_start: Option<TurnStart>,
     /// 1 Hz `SubagentRows` cadence while a turn runs (`None` when idle).
     pub(crate) subagent_tick: Option<tokio::time::Interval>,
     /// Worker-registry generation of the current/last turn: a user
@@ -527,6 +643,9 @@ pub struct SessionActor {
     pub(crate) presence: Arc<arc_swap::ArcSwap<super::handle::Presence>>,
     /// Mirrors `handle.name()`; `sync_name` after any rename.
     pub(crate) name: Arc<arc_swap::ArcSwap<Option<String>>>,
+    /// Mirrors `handle.pinned()`; written with `keep_warm` (create seeds it
+    /// from `meta.pinned`, `KeepWarm{on}` stores it).
+    pub(crate) keep_warm_cell: Arc<std::sync::atomic::AtomicBool>,
     /// F10: per-session journal ownership lock. Held while Live, released on Park.
     pub(crate) session_lock: Option<agent_core::session_lock::SessionLock>,
     // ── E: session driver (actor-side, behind `session.drive` permission) ──
@@ -548,6 +667,10 @@ pub struct SessionActor {
     /// Only then does "memory is off" mean consent was revoked; see
     /// `effective_memory_mode`. Reset whenever the runtime is rebuilt.
     pub(crate) memory_seen_active: bool,
+    /// While parked: the exact tool activations the dropped runtime held,
+    /// handed to the runtime the unpark builds (and to a reload record
+    /// written while parked). Empty while live.
+    pub(crate) parked_tool_activations: Vec<crate::tools::activation::CarriedActivation>,
 }
 
 /// A reload checkpoint wrote this session's reload record; until the
@@ -562,9 +685,18 @@ pub(crate) struct ReloadFence {
     pub(crate) workers: Vec<crate::runtime::subagent::CarriedWorker>,
 }
 
+/// A create that fails after taking the journal lock: a FRESH session never
+/// journaled, so its `.lock` would be litter next to no `.json` (F18). A
+/// continued session's lock file sits next to its journal and stays.
+fn release_fresh_lock(lock: Option<agent_core::session_lock::SessionLock>, continued: bool) {
+    if let (Some(lock), false) = (lock, continued) {
+        lock.release_and_remove();
+    }
+}
+
 impl SessionActor {
     /// = today's `setup::boot()` per session (foreground_runtime →
-    /// resolve_session_and_prompt → set_cwd → model override →
+    /// resolve_session_and_prompt → journal lock → set_cwd → model override →
     /// spawn_session_background → finish_session_setup) then
     /// `on_session_start` (keyed injection).
     pub(crate) async fn create(
@@ -582,6 +714,7 @@ impl SessionActor {
             runtime.restore_session_memory_mode(mode);
         }
         let config: crate::SynapsConfig = (**host.config()).clone();
+        let client_input = cfg.client_input.unwrap_or(config.client_input);
 
         let mut sb = crate::engine::setup::resolve_session_and_prompt(
             &mut runtime,
@@ -589,98 +722,13 @@ impl SessionActor {
             cfg.system.as_deref(),
             cfg.prompt_manifest.as_deref(),
         )?;
-        // `--name` at create: apply BEFORE the registry entry is written so
-        // `synaps send --session <name>` and `--continue <name>` resolve
-        // from the first second — not only after a later `--continue`.
-        if let Some(name) = cfg.name.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
-            sb.session
-                .set_name(name)
-                .map_err(|e| crate::RuntimeError::Session(format!("--name {name:?}: {e}")))?;
-            if cfg.persist {
-                // Persist the name now so disk resolution (chain/name → id)
-                // agrees with the live map even before the first turn.
-                if let Err(e) = sb.session.save().await {
-                    tracing::warn!(session = %sb.session.id, "failed to save named session at create: {e}");
-                }
-            }
-        }
-        runtime.set_cwd(cfg.cwd.clone());
-        // T5: rehydrate env from journal when the client sent none.
-        // Precedence: explicit Hello.env from the continuing client > journal > None.
-        // Never fall back to the daemon's own process env.
-        if cfg.env.is_none() {
-            if let Some(ref journal_env) = sb.session.env {
-                cfg.env = Some(journal_env.clone());
-            }
-            if cfg.env_stripped.is_empty() && !sb.session.env_stripped.is_empty() {
-                cfg.env_stripped = sb.session.env_stripped.clone();
-            }
-        }
-        // Always persist the latest env on the session so the next
-        // restart/continue sees it — a fresh client env supersedes
-        // whatever was journaled previously.
-        if cfg.env.is_some() {
-            sb.session.env = cfg.env.clone();
-            sb.session.env_stripped = cfg.env_stripped.clone();
-        }
-        runtime.set_env(cfg.env.clone());
-        runtime.set_env_stripped(cfg.env_stripped.clone());
-        // CLI `--model` overrides whatever was persisted (rpc.rs precedent).
-        if let Some(ref m) = cfg.model_override {
-            runtime.set_model(m.clone());
-        }
-
-        let background =
-            crate::engine::setup::spawn_session_background(&runtime, &sb.session)?;
-        crate::engine::setup::finish_session_setup(
-            &mut runtime,
-            &config,
-            &sb.session,
-            cfg.cwd.clone(),
-            crate::engine::setup::IndexRecord::Start,
-        );
-
-        // C2: per-session on_session_start (keyed injection) once the
-        // process-level discovery is known-finished. Never re-runs discovery.
-        // `await_extensions=false` (TUI): a spawned waiter fires the
-        // `ext_ready` arm instead, so boot never blocks on discovery.
-        // `startup.extensions_ready_timeout_secs` (config, default 30) bounds
-        // the wait on extension discovery; the const remains the fallback.
-        let ext_ready_timeout = {
-            let secs = config.startup.extensions_ready_timeout_secs;
-            if secs == 0 {
-                budgets::EXTENSIONS_READY_TIMEOUT
-            } else {
-                std::time::Duration::from_secs(secs)
-            }
-        };
-        let mut ext_ready = None;
-        if cfg.await_extensions {
-            if tokio::time::timeout(ext_ready_timeout, host.extensions_ready())
-                .await
-                .is_err()
-            {
-                tracing::warn!(
-                    budget_secs = ext_ready_timeout.as_secs(),
-                    "extensions_ready timed out — on_session_start may miss late extensions"
-                );
-            }
-            crate::extensions::loader::emit_session_start(runtime.hook_bus(), &sb.session.id)
-                .await;
-        } else {
-            let (tx, rx) = oneshot::channel();
-            let waiter_host = Arc::clone(host);
-            tokio::spawn(async move {
-                let _ = tokio::time::timeout(ext_ready_timeout, waiter_host.extensions_ready())
-                    .await;
-                let _ = tx.send(());
-            });
-            ext_ready = Some(rx);
-        }
-
-        let id = SessionId::from(sb.session.id.clone());
-
-        // F10: acquire the per-session journal ownership lock.
+        // F10: acquire the per-session journal ownership lock BEFORE anything
+        // publishes or writes for this id: the `--name` save, the registry
+        // card + per-session socket (`spawn_session_background`), the START
+        // index record and `on_session_start`. A refused `--continue` of a
+        // session live in another process used to publish its own card over
+        // the owner's first, then delete it on drop: the owner stayed live
+        // (socket up, journal locked) but `synaps send` and peers lost it.
         let lock_kind = if cfg.await_extensions { "daemon" } else { "tui" };
         let session_lock = if sb.continued {
             // Continuing an existing session — the lock MUST succeed.
@@ -717,6 +765,98 @@ impl SessionActor {
             }
         };
 
+        // `--name` at create: apply BEFORE the registry entry is written so
+        // `synaps send --session <name>` and `--continue <name>` resolve
+        // from the first second — not only after a later `--continue`.
+        if let Some(name) = cfg.name.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
+            if let Err(e) = sb.session.set_name(name) {
+                release_fresh_lock(session_lock, sb.continued);
+                return Err(crate::RuntimeError::Session(format!("--name {name:?}: {e}")));
+            }
+            if cfg.persist {
+                // Persist the name now so disk resolution (chain/name → id)
+                // agrees with the live map even before the first turn.
+                if let Err(e) = sb.session.save().await {
+                    tracing::warn!(session = %sb.session.id, "failed to save named session at create: {e}");
+                }
+            }
+        }
+        runtime.set_cwd(cfg.cwd.clone());
+        // T5: rehydrate env from journal when the client sent none.
+        // Precedence: explicit Hello.env from the continuing client > journal > None.
+        // Never fall back to the daemon's own process env.
+        if cfg.env.is_none() {
+            if let Some(ref journal_env) = sb.session.env {
+                cfg.env = Some(journal_env.clone());
+            }
+            if cfg.env_stripped.is_empty() && !sb.session.env_stripped.is_empty() {
+                cfg.env_stripped = sb.session.env_stripped.clone();
+            }
+        }
+        // Always persist the latest env on the session so the next
+        // restart/continue sees it — a fresh client env supersedes
+        // whatever was journaled previously.
+        if cfg.env.is_some() {
+            sb.session.env = cfg.env.clone();
+            sb.session.env_stripped = cfg.env_stripped.clone();
+        }
+        runtime.set_env(cfg.env.clone());
+        runtime.set_env_stripped(cfg.env_stripped.clone());
+        // CLI `--model` overrides whatever was persisted (rpc.rs precedent).
+        if let Some(ref m) = cfg.model_override {
+            runtime.set_model(m.clone());
+        }
+        if let Some(clock) = &cfg.message_clock {
+            runtime.set_message_clock(clock.clone());
+        }
+
+        // Shared-inbox files are for whoever is at a keyboard: the gate stays
+        // shut until a client owns input (`publish_presence`), so a detached,
+        // parked or freshly rehydrated session is never woken by them.
+        let background = match crate::engine::setup::spawn_session_background_gated(
+            &runtime,
+            &sb.session,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        ) {
+            Ok(background) => background,
+            Err(e) => {
+                release_fresh_lock(session_lock, sb.continued);
+                return Err(e);
+            }
+        };
+        crate::engine::setup::finish_session_setup(
+            &mut runtime,
+            &config,
+            &sb.session,
+            cfg.cwd.clone(),
+            crate::engine::setup::IndexRecord::Start,
+        );
+
+        // C2: per-session on_session_start (keyed injection) once the
+        // process-level discovery is known-finished. Never re-runs discovery.
+        // Every call goes through the host's session-start gate.
+        // `await_extensions=false` (TUI, a reload's restore): a spawned task
+        // runs it (`session_start` below), so boot never blocks on it.
+        // `startup.extensions_ready_timeout_secs` (config, default 30) bounds
+        // the wait on extension discovery only; the const remains the
+        // fallback. `run_at_create` then waits its turn at the gate, behind a
+        // running hook and older foreground ones (see `session_start`).
+        let ext_ready_timeout = extensions_ready_timeout(&config);
+        if cfg.await_extensions {
+            if tokio::time::timeout(ext_ready_timeout, host.extensions_ready())
+                .await
+                .is_err()
+            {
+                tracing::warn!(
+                    budget_secs = ext_ready_timeout.as_secs(),
+                    "extensions_ready timed out — on_session_start may miss late extensions"
+                );
+            }
+            super::session_start::run_at_create(host, runtime.hook_bus(), &sb.session.id).await;
+        }
+
+        let id = SessionId::from(sb.session.id.clone());
+
         let meta = SessionMeta {
             id: id.clone(),
             name: sb.session.name.clone(),
@@ -730,8 +870,18 @@ impl SessionActor {
             clients: 0,
             input_owner: None,
             awaiting_input: 0,
+            roster: Vec::new(),
+            client_input: Some(client_input),
             journal_id: sb.session.id.clone(),
             locked_by: None,
+            pinned: cfg.keep_warm,
+            busy: false,
+            state_since: None,
+            park_due: None,
+            evict_due: None,
+            title: None,
+            cost_usd: 0.0,
+            messages: 0,
         };
         let mut conv = if sb.continued {
             ConversationState::from_resumed(sb.session)
@@ -747,6 +897,8 @@ impl SessionActor {
         if sb.continued && cfg.persist && session_lock.is_some() {
             crate::engine::setup::recover_turn_draft(&mut conv).await;
         }
+        // Loaded (and recovered) history keeps whatever times it carried.
+        let message_stamper = crate::runtime::message_time::Stamper::new(conv.api_messages.len());
 
         let view = RuntimeView::from_runtime(&runtime).await;
         let hook_bus = Arc::clone(runtime.hook_bus());
@@ -762,12 +914,35 @@ impl SessionActor {
                 journal_id,
                 presence,
                 name,
+                keep_warm: keep_warm_cell,
                 cache_keepwarm,
                 memory_mode,
             },
         ) = SessionHandle::new(meta.clone(), view);
+        // The mode is fixed for the session: seed the listing with it now.
+        // Otherwise only a presence publish (attach, detach, input) carries
+        // it, so a session restored at reload, with no client back yet,
+        // listed as `owner=-`. Not `publish_presence()`: that also sets the
+        // inbox gate, which stays as `SessionHandle::new` left it.
+        presence.store(Arc::new(super::handle::Presence {
+            client_input: Some(client_input),
+            ..Default::default()
+        }));
         *memory_mode.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = cfg.memory_mode;
         let (sp_tx, secret_prompt_rx) = mpsc::unbounded_channel();
+        let session_start = if cfg.await_extensions {
+            super::session_start::SessionStart::Done
+        } else if cfg.restore_parked {
+            // Parked right after create: the hook waits for the unpark.
+            super::session_start::SessionStart::Pending
+        } else {
+            super::session_start::SessionStart::queue(
+                host,
+                Arc::clone(&hook_bus),
+                Arc::clone(&journal_id),
+                ext_ready_timeout,
+            )
+        };
 
         let mut actor = SessionActor {
             id,
@@ -791,8 +966,10 @@ impl SessionActor {
             stream: None,
             cancel: None,
             steer_tx: None,
+            owner_steer_budget: None,
             streaming: false,
             turn_baseline: 0,
+            message_stamper,
             consecutive_auto_turns: 0,
             turn_steered_events: Vec::new(),
             turn_completion: None,
@@ -809,6 +986,8 @@ impl SessionActor {
             view,
             attached: HashMap::new(),
             input_owner: None,
+            client_input,
+            input_seq: 0,
             next_client_id: 1,
             seq: 0,
             turn_replay: VecDeque::new(),
@@ -816,13 +995,16 @@ impl SessionActor {
             state: AttachState::Detached { running: false },
             background,
             compact: None,
-            ext_ready,
+            compacting_inline: false,
+            session_start,
+            turn_awaiting_start: None,
             subagent_tick: None,
             turn_worker_generation: 0,
             lifecycle,
             journal_id,
             presence,
             name,
+            keep_warm_cell,
             session_lock,
             driver: None,
             driver_pending: None,
@@ -836,19 +1018,59 @@ impl SessionActor {
             reload_fence: None,
             memory_mode_slot: memory_mode,
             memory_seen_active: false,
+            parked_tool_activations: Vec::new(),
         };
         // Whether the build's grant (default or restored choice) took.
         actor.observe_memory();
+        if actor.keep_warm {
+            actor.note_pin();
+        }
         Ok((handle, SessionTask(actor)))
     }
 
     /// Publish `conv.session.name` to the handle (listings, `--continue
     /// <name>`) and rewrite this session's registry entry so `synaps send
     /// --session <name>` resolves the new name. Call after any rename.
+    /// Write the pin as it stands now to the daemon's pin book (no-op
+    /// in-process): the entry is added while pinned, dropped otherwise.
+    pub(crate) fn note_pin(&self) {
+        let Some(sink) = self.host.pin_sink() else { return };
+        let journal = (**self.journal_id.load()).clone();
+        if self.keep_warm {
+            let kw = self.cache_keepwarm.override_mode.map(|m| m.to_string());
+            sink.pinned(self.id.as_str(), &journal, self.conv.session.name.as_deref(), self.config.cwd.as_deref(), kw.as_deref());
+        } else {
+            sink.unpinned(self.id.as_str(), &journal);
+        }
+    }
+
+    /// Publish a new journal id; a pinned session's book entry follows it.
+    pub(crate) fn set_journal_id(&mut self, new_id: String) {
+        let old = self.journal_id.swap(Arc::new(new_id.clone()));
+        if self.keep_warm && *old != new_id {
+            if let Some(sink) = self.host.pin_sink() {
+                sink.moved(&old, &new_id);
+            }
+        }
+    }
+
     pub(crate) fn sync_name(&mut self) {
         let name = self.conv.session.name.clone();
+        self.mirror_name(name);
+    }
+
+    /// Publish a name the session now has on disk (or in memory): handle
+    /// and listing, the `run/<sid>.json` card, and a pinned session's book
+    /// entry (verbatim, so a cleared name stops resolving).
+    pub(crate) fn mirror_name(&mut self, name: Option<String>) {
         self.meta.name = name.clone();
         self.name.store(Arc::new(name.clone()));
+        if self.keep_warm {
+            if let Some(sink) = self.host.pin_sink() {
+                let journal = (**self.journal_id.load()).clone();
+                sink.renamed(&journal, name.as_deref());
+            }
+        }
         if let Err(e) = self.background.update_session_name(name.as_deref()) {
             tracing::warn!(session = %self.id, "registry name update failed: {e}");
         }
@@ -920,8 +1142,21 @@ impl SessionActor {
     }
 
     pub(crate) fn emit_conversation(&mut self) {
+        self.stamp_new_messages();
         let snap = self.conv.snapshot(self.consecutive_auto_turns);
         self.emit(SessionEventWire::Conversation(snap));
+    }
+
+    /// Give every message appended since the last pass its time. Called
+    /// wherever history leaves the actor (turn start, save, clients), so a
+    /// message added outside a turn (events flushed at Done, notes,
+    /// interruption markers) is stamped too. O(new messages).
+    pub(crate) fn stamp_new_messages(&mut self) {
+        if !self.conv.is_live() || !self.runtime.is_live() {
+            return;
+        }
+        let clock = self.runtime.message_clock().clone();
+        self.message_stamper.stamp(&mut self.conv.api_messages, &clock);
     }
 
     pub(crate) async fn publish_view(&mut self) {
@@ -936,6 +1171,7 @@ impl SessionActor {
         if !self.config.persist || !self.conv.is_live() {
             return;
         }
+        self.stamp_new_messages();
         let Some(session) = self.conv.prepare_save() else {
             return;
         };
@@ -986,6 +1222,11 @@ impl SessionActor {
         // checkpoint reply.
         self.sync_memory_choice();
         self.flush_saves().await;
+        // Before `Idle`, so a test that saw `Idle` knows the hook is in line.
+        #[cfg(any(test, feature = "testing"))]
+        if super::session_start::testing::take_requeue(&self.journal_id.load()) {
+            self.queue_session_start();
+        }
         self.emit(SessionEventWire::Idle);
         self.cache_keepwarm_on_idle().await;
     }
@@ -1068,15 +1309,144 @@ impl SessionActor {
             model: view.model.clone(),
             thinking_level: view.thinking_level.clone(),
             workers: Vec::new(),
+            tool_activations: if self.runtime.is_live() {
+                self.runtime.carried_tool_activations()
+            } else {
+                self.parked_tool_activations.clone()
+            },
         }
     }
 
+    /// Also the one place the inbox gate follows `input_owner`: every owner
+    /// change (attach, detach, takeover) publishes presence. `Observe`
+    /// clients never own input, so a keep-warm observer keeps it shut.
+    ///
+    /// Also the `/sessions` state: busy, `state_since` (restamped whenever
+    /// idle/busy/parked changes), the park / eviction deadline as wall
+    /// clock, and the conversation's title / cost / message count (kept as
+    /// last published while Parked). Every transition that moves them —
+    /// turn and compaction start/end, attach/detach, `rearm_park`,
+    /// park/unpark — ends in a publish; stream deltas do not.
     pub(crate) fn publish_presence(&self) {
-        self.presence.store(Arc::new(super::handle::Presence {
+        use super::handle::{Presence, PresenceState};
+        self.background
+            .set_inbox_accepting(self.input_owner.is_some());
+        let prev = self.presence.load();
+        let busy = self.busy() || self.compacting_inline;
+        let parked = self.is_parked();
+        let state = if parked {
+            PresenceState::Parked
+        } else if busy {
+            PresenceState::Busy
+        } else {
+            PresenceState::Idle
+        };
+        let now = chrono::Utc::now();
+        let state_since = match prev.state_since {
+            Some(t) if prev.state == state => Some(t),
+            _ => Some(now),
+        };
+        let wall = |at: tokio::time::Instant| {
+            let left = at.saturating_duration_since(tokio::time::Instant::now());
+            chrono::Duration::from_std(left)
+                .ok()
+                .and_then(|d| now.checked_add_signed(d))
+        };
+        // A worker re-check is not a park (it only looks again), nor is a
+        // grace that workers now hold: its firing would only re-check. The
+        // F18 idle end of a zero-turn session counts — it leaves Live too.
+        let park_due = self
+            .park_deadline
+            .filter(|d| !parked && Some(*d) != self.park_recheck_at)
+            .filter(|_| self.can_end_idle() || self.can_park())
+            .and_then(wall);
+        let evict_due = self.park_deadline.filter(|_| parked).and_then(wall);
+        let (title, cost_usd, messages) = if self.conv.is_live() {
+            (
+                conversation_title(&self.conv),
+                self.conv.session_cost,
+                self.conv.api_messages.len(),
+            )
+        } else {
+            (prev.title.clone(), prev.cost_usd, prev.messages)
+        };
+        self.presence.store(Arc::new(Presence {
             clients: self.attached.len(),
             input_owner: self.input_owner,
             awaiting_input: self.pending_prompts.len(),
+            roster: self.roster(),
+            client_input: Some(self.client_input),
+            busy,
+            state,
+            state_since,
+            park_due,
+            evict_due,
+            title,
+            cost_usd,
+            messages,
         }));
+    }
+
+    /// Every attached client, by id.
+    pub(crate) fn roster(&self) -> Vec<ClientInfo> {
+        let mut roster: Vec<ClientInfo> = self
+            .attached
+            .iter()
+            .map(|(id, a)| ClientInfo {
+                id: *id,
+                name: a.name.clone(),
+                kind: a.meta.kind,
+                mode: a.mode,
+                attached_at_ms: a.attached_at_ms,
+            })
+            .collect();
+        roster.sort_by_key(|c| c.id.0);
+        roster
+    }
+
+    /// `tui (#1)`, or `client #1` for an id that isn't attached.
+    fn client_label(&self, id: ClientId) -> String {
+        match self.attached.get(&id) {
+            Some(a) => format!("{} (#{})", a.name, id.0),
+            None => format!("client #{}", id.0),
+        }
+    }
+
+    /// Why client `c` may not send an input command, if it may not.
+    /// `exclusive`: anyone but the owner. `shared`: observers (and clients
+    /// that aren't attached); every drive client may.
+    fn input_refusal(&self, c: ClientId) -> Option<String> {
+        match self.client_input {
+            ClientInput::Exclusive => (self.input_owner != Some(c)).then(|| match self.input_owner {
+                Some(o) => format!("input owned by {}", self.client_label(o)),
+                None => "input has no owner; attach with --takeover".to_string(),
+            }),
+            ClientInput::Shared => match self.attached.get(&c).map(|a| a.mode) {
+                Some(AttachMode::Mirror | AttachMode::Takeover) => None,
+                Some(AttachMode::Observe) => {
+                    Some("this client is read-only (attached with --observe)".to_string())
+                }
+                None => Some("this client is not attached".to_string()),
+            },
+        }
+    }
+
+    /// Client `c` sent input (or answered a prompt): remember when, and with
+    /// `client_input = shared` make it the active client. Observers never
+    /// become active.
+    fn note_input(&mut self, c: ClientId) {
+        let Some(a) = self.attached.get_mut(&c) else { return };
+        if a.mode == AttachMode::Observe {
+            return;
+        }
+        self.input_seq += 1;
+        a.last_input = self.input_seq;
+        if self.client_input == ClientInput::Shared && self.input_owner != Some(c) {
+            let from = self.input_owner;
+            self.input_owner = Some(c);
+            self.emit(SessionEventWire::InputOwnerChanged { from, to: Some(c), reason: OwnerChangeReason::Input });
+            self.publish_presence();
+        }
     }
 
     /// Recomputes `state` from clients/streaming and (re)arms or disarms the
@@ -1400,6 +1770,51 @@ impl SessionActor {
         Ok(())
     }
 
+    // ── autonomous work: the reload fence and on_session_start ───────────
+
+    /// Whether autonomous work may start now, and if not, why. Two states
+    /// hold it back: a reload's fence (#255) until the exec or its abort, and
+    /// this session's `on_session_start` until it has run. `Fenced` wins when
+    /// both hold. Each source of autonomous work asks [`Self::holds`]; none
+    /// reads the fence or the hook's state itself.
+    ///
+    /// | source          | `Fenced`  | `SessionStartPending`                                         |
+    /// |-----------------|-----------|---------------------------------------------------------------|
+    /// | queue wake      | waits     | runs: the turn starts, and its request waits for the hook      |
+    /// | park timer      | waits     | runs: a park that happens takes a hook not called out of line  |
+    /// | keep-warm timer | waits     | waits (timer off): a due ping goes out once the hook has run   |
+    /// | driver tick     | waits     | runs: an armed driver is revoked (`driver_idle_conflict`)      |
+    /// | driver start    | refused * | rejected in the tick (`driver_idle_conflict`)                  |
+    ///
+    /// \* `DriverStart` is a command: under the fence the command fence
+    /// refuses it first ("daemon reloading"); the tick never sees it.
+    ///
+    /// The queue wake must not wait for the hook: a parked session's hook is
+    /// out of line (`SessionStart::Pending`) and joins it only at the unpark,
+    /// and the unpark is what the queue wake does. Waiting there would leave
+    /// an event for a parked session queued for good. The turn's own wait
+    /// (`open_turn_stream` after `session_start_ready`) holds its request
+    /// instead, without blocking the loop.
+    pub(crate) fn autonomous_work_blocked(&self) -> Option<WorkBlock> {
+        if self.reload_fence.is_some() {
+            Some(WorkBlock::Fenced)
+        } else if !self.session_start.is_done() {
+            Some(WorkBlock::SessionStartPending)
+        } else {
+            None
+        }
+    }
+
+    /// Whether `source` waits now (the table on
+    /// [`Self::autonomous_work_blocked`]).
+    pub(crate) fn holds(&self, source: WorkSource) -> bool {
+        match self.autonomous_work_blocked() {
+            None => false,
+            Some(WorkBlock::Fenced) => true,
+            Some(WorkBlock::SessionStartPending) => matches!(source, WorkSource::KeepWarmTimer),
+        }
+    }
+
     // ── E-P4: driver_tick ────────────────────────────────────────────────
 
     /// Actor-equivalent of the TUI's `idle_conflict()` (TUI :437-463).
@@ -1411,8 +1826,10 @@ impl SessionActor {
         if self.compact.is_some() {
             return Some("compaction");
         }
-        if self.ext_ready.is_some() {
-            return Some("extensions loading or reloading");
+        match self.autonomous_work_blocked() {
+            Some(WorkBlock::Fenced) => return Some("daemon reloading"),
+            Some(WorkBlock::SessionStartPending) => return Some("extensions loading or reloading"),
+            None => {}
         }
         if self.conv.context_head.is_blocked(&self.conv.session) {
             return Some("unverified context head");
@@ -1445,7 +1862,7 @@ impl SessionActor {
     /// spawned tasks. Mirrors the TUI's `tick()` (TUI :695-1027).
     pub(crate) async fn driver_tick(&mut self) {
         use crate::extensions::session_driver::Outcome;
-        if self.reload_fence.is_some() {
+        if self.holds(WorkSource::DriverTick) {
             return;
         }
 
@@ -1675,6 +2092,9 @@ impl SessionActor {
                         self.driver_revoke("foreground work took priority");
                         return;
                     }
+                    // This includes a pending `on_session_start`: a driver
+                    // turn opens its stream below, not through `start_turn`,
+                    // so it never waits for the hook and must not run before it.
                     if let Some(reason) = self.driver_idle_conflict() {
                         self.driver_revoke(reason);
                         return;
@@ -1731,6 +2151,8 @@ impl SessionActor {
                             self.conv.session.thinking_level =
                                 self.runtime.thinking_level().to_owned();
                             self.consecutive_auto_turns = 0;
+                            // Admission: the request gets its time now.
+                            self.stamp_new_messages();
                             self.turn_baseline = self.conv.api_messages.len();
                             self.turn_steered_events.clear();
                             self.turn_replay.clear();
@@ -1783,6 +2205,7 @@ impl SessionActor {
                             self.turn_completion = Some(completion.clone());
                             let (tx, rx) = mpsc::unbounded_channel();
                             self.steer_tx = Some(tx);
+                            self.owner_steer_budget = None;
                             let mut runtime = self.runtime.clone();
                             // F2: share the parent's TTL latches so the
                             // driver turn doesn't fire a redundant 1h→5m
@@ -1965,6 +2388,11 @@ impl SessionActor {
     }
 
     pub(crate) fn rearm_park(&mut self) {
+        self.rearm_park_deadline();
+        self.publish_presence();
+    }
+
+    fn rearm_park_deadline(&mut self) {
         if self.is_parked() {
             // Eviction deadline is owned by `park()`; the attach path unparks
             // (which rebuilds the runtime and clears the deadline).
@@ -2072,6 +2500,20 @@ impl SessionActor {
     /// watcher + per-session UDS + registry) stays: `synaps send` keeps
     /// resolving and its push into `event_queue` is the wake-up.
     pub(crate) async fn park(&mut self) -> std::ops::ControlFlow<EndReason> {
+        let flow = self.park_now().await;
+        self.publish_presence();
+        // Restored to be parked but still live (it could not park): its
+        // `on_session_start` runs now, as for any live session.
+        if flow.is_continue()
+            && !self.is_parked()
+            && matches!(self.session_start, super::session_start::SessionStart::Pending)
+        {
+            self.queue_session_start();
+        }
+        flow
+    }
+
+    async fn park_now(&mut self) -> std::ops::ControlFlow<EndReason> {
         // Fired by a worker re-check (not the grace, not an explicit Park)?
         let recheck = self.park_deadline.is_some() && self.park_deadline == self.park_recheck_at;
         self.park_recheck_at = None;
@@ -2132,8 +2574,14 @@ impl SessionActor {
         // The unparked runtime is built from `config.memory_mode`: a
         // revocation made without `/memory` must be recorded first.
         self.sync_memory_choice();
+        // The runtime's exact tool activations outlive it: the unparked
+        // runtime restores them, so the tools array (the start of the cached
+        // prompt prefix) and the model's tools are what they were.
+        self.parked_tool_activations = self.runtime.carried_tool_activations();
         // Drop order: conv first, then runtime — a panic between them can
         // never leave a Runtime without state to save.
+        // Last look at the conversation for listings (title/cost/messages).
+        self.publish_presence();
         let conv = self.conv.park_take();
         drop(conv);
         let runtime = self.runtime.park_take();
@@ -2146,6 +2594,8 @@ impl SessionActor {
         // pick up the parked session (the daemon will fail to re-acquire
         // on unpark and surface a clear error instead of a zombie).
         self.session_lock = None;
+        // A hook not called yet waits for the unpark, out of line.
+        self.session_start.withdraw_for_park();
         self.state = AttachState::Parked;
         self.set_lifecycle(SessionLifecycle::Parked);
         tracing::info!(session = %self.id, "session parked");
@@ -2239,6 +2689,9 @@ impl SessionActor {
             // `cfg.model_override` frozen at create: `/model` survives park.
             runtime.set_model(view.model.clone());
             let _ = runtime.restore_session_reasoning(&view.thinking_level);
+            if let Some(clock) = &cfg.message_clock {
+                runtime.set_message_clock(clock.clone());
+            }
             sb.session.model = view.model.clone();
             sb.session.thinking_level = runtime.thinking_level().to_string();
             crate::engine::setup::finish_session_setup(
@@ -2271,8 +2724,15 @@ impl SessionActor {
         if journal_present && self.config.persist && self.session_lock.is_some() {
             crate::engine::setup::recover_turn_draft(&mut conv).await;
         }
+        self.message_stamper.settle(conv.api_messages.len());
+        runtime.restore_tool_activations(std::mem::take(&mut self.parked_tool_activations));
         self.runtime.unpark_set(runtime);
         self.conv.unpark_set(conv);
+        // The name comes from disk: a rename while parked wrote it there.
+        if self.meta.name != self.conv.session.name {
+            let name = self.conv.session.name.clone();
+            self.mirror_name(name);
+        }
         // A fresh runtime: whether its grant took effect is its own.
         self.memory_seen_active = false;
         self.observe_memory();
@@ -2280,6 +2740,10 @@ impl SessionActor {
         self.state = AttachState::Detached { running: false };
         self.set_lifecycle(SessionLifecycle::Live);
         self.update_attach_state();
+        // A hook that waited for the unpark runs now (once per session).
+        if matches!(self.session_start, super::session_start::SessionStart::Pending) {
+            self.queue_session_start();
+        }
         tracing::info!(session = %self.id, ms = started.elapsed().as_millis() as u64, "session unparked");
         Ok(())
     }
@@ -2291,9 +2755,12 @@ impl SessionActor {
         if !self.is_parked() {
             return Ok(());
         }
-        self.unpark()
+        let res = self
+            .unpark()
             .await
-            .map_err(|e| format!("session parked and could not be restored: {e}"))
+            .map_err(|e| format!("session parked and could not be restored: {e}"));
+        self.publish_presence();
+        res
     }
 
     /// `stream_handler.rs:264`: a turn OR a compaction blocks auto-turns.
@@ -2363,11 +2830,129 @@ impl SessionActor {
 
     // ── turn start (dispatch.rs Submit tail / stream_handler.rs RunTurn) ──
 
+    /// This session's `on_session_start` task ended: the hook ran (or the
+    /// task failed, which counts as done: fail-open like a hook timeout).
+    /// Refresh the view, which shows the injection, then send what waited
+    /// for it: a started turn's request. A due keep-warm ping waited with its
+    /// timer off (`holds`); the loop's next pass arms it again.
+    async fn session_start_finished(
+        &mut self,
+        ran: std::result::Result<bool, tokio::task::JoinError>,
+    ) {
+        use super::session_start::SessionStart;
+        match ran {
+            Ok(true) => {}
+            // Withdrawn before it was called (a park): not run yet. Anything
+            // waiting for it puts it back in line.
+            Ok(false) => {
+                self.session_start = SessionStart::Pending;
+                if self.turn_awaiting_start.is_some() || self.cache_keepwarm.deadline().is_some() {
+                    self.session_start_ready();
+                }
+                return;
+            }
+            Err(e) => tracing::warn!(session = %self.id, "on_session_start task failed: {e}"),
+        }
+        self.session_start = SessionStart::Done;
+        if self.runtime.is_live() {
+            self.publish_view().await;
+        }
+        if let Some(start) = self.turn_awaiting_start.take() {
+            // A turn canceled from outside (a driver revocation) ends on its
+            // own path (`finish_revoked_turn`) with nothing sent.
+            if !start.cancel.is_cancelled() {
+                self.open_turn_stream(start).await;
+            }
+        }
+    }
+
+    /// No turn and no keep-warm ping goes out before `on_session_start` has
+    /// run. Its injection is part of their system prompt, so a request sent
+    /// before it would lack the extension context and the next request would
+    /// change the cached system prompt. (A manual `/compact` does not wait:
+    /// it builds its own prompt; a rolling summary reuses the request of the
+    /// turn before it or builds its own prompt.) A session created with
+    /// `await_extensions=false` (quick start, every session a reload
+    /// restores) has a task in line at the host's gate for it, or, while
+    /// parked, nothing in line until the unpark.
+    ///
+    /// `true` once the hook has run. Otherwise it puts the hook in line if
+    /// it is not (after a park) and moves it ahead of background hooks; the
+    /// caller waits for `session_start_finished` without blocking the loop.
+    /// The hook itself always runs in that task, through the gate, so it is
+    /// never called twice or beside another session's.
+    pub(crate) fn session_start_ready(&mut self) -> bool {
+        use super::session_start::SessionStart;
+        if matches!(self.session_start, SessionStart::Pending) {
+            self.queue_session_start();
+        }
+        match &self.session_start {
+            SessionStart::Done => true,
+            SessionStart::Queued { ticket, .. } => {
+                ticket.prefer();
+                false
+            }
+            SessionStart::Pending => false,
+        }
+    }
+
+    /// Put this session's `on_session_start` in line (in the background).
+    fn queue_session_start(&mut self) {
+        self.session_start = super::session_start::SessionStart::queue(
+            &self.host,
+            Arc::clone(&self.hook_bus),
+            Arc::clone(&self.journal_id),
+            extensions_ready_timeout(&self.host.config()),
+        );
+    }
+
+    /// Open the turn's stream: the request goes out.
+    async fn open_turn_stream(&mut self, start: TurnStart) {
+        // A turn started by events (nobody typed it) runs under the event
+        // turn budget for this turn only; the stream copies the budget when
+        // it starts, so the session budget is restored right after. Here and
+        // not in `start_turn`: a turn whose request waited for
+        // `on_session_start` opens its stream later, under its own budget.
+        let session_budget = start.event_turn.then(|| {
+            let event_budget = self
+                .runtime
+                .turn_budget()
+                .for_event_turn(&self.host.config().turn_budgets);
+            let session_budget = self.runtime.turn_budget().clone();
+            self.runtime.set_turn_budget(event_budget);
+            self.runtime
+                .set_owner_steer_budget(self.owner_steer_budget.clone());
+            session_budget
+        });
+        let stream = self
+            .runtime
+            .run_stream_tracked(
+                self.conv.api_messages.clone(),
+                start.cancel,
+                Some(start.steer_rx),
+                Some(self.secret_prompt_handle.clone()),
+                start.auto_approve,
+                start.completion,
+            )
+            .await;
+        if let Some(session_budget) = session_budget {
+            self.runtime.set_turn_budget(session_budget);
+            self.runtime.set_owner_steer_budget(None);
+        }
+        self.stream = Some(stream);
+    }
+
+    /// Start a turn. Its request goes out at once, or, while this session's
+    /// `on_session_start` has not run, once it has (`session_start_ready`);
+    /// the turn is live from here either way.
     pub(crate) async fn start_turn(&mut self, trigger: TurnTrigger, user_text: Option<String>) {
         self.cache_keepwarm_turn_started();
         let ct = CancellationToken::new();
         let (s_tx, s_rx) = mpsc::unbounded_channel::<String>();
         self.streaming = true;
+        // Admission: the request (and anything queued with it) gets its
+        // time now, before the stream copies the history.
+        self.stamp_new_messages();
         self.turn_baseline = self.conv.api_messages.len();
         self.open_turn_draft();
         self.turn_steered_events.clear();
@@ -2399,39 +2984,33 @@ impl SessionActor {
             .begin_turn();
         let completion = crate::runtime::TurnCompletion::new();
         self.turn_completion = Some(completion.clone());
-        // A turn started by events (nobody typed it) runs under the event
-        // turn budget for this turn only; the stream copies the budget when
-        // it starts, so the session budget is restored right after.
-        let session_budget = (trigger == TurnTrigger::EventAuto).then(|| {
-            let event_budget = self
-                .runtime
-                .turn_budget()
-                .for_event_turn(&self.host.config().turn_budgets);
-            let session_budget = self.runtime.turn_budget().clone();
-            self.runtime.set_turn_budget(event_budget);
-            session_budget
-        });
-        let stream = self
-            .runtime
-            .run_stream_tracked(
-                self.conv.api_messages.clone(),
-                ct.clone(),
-                Some(s_rx),
-                Some(self.secret_prompt_handle.clone()),
-                auto_approve,
-                completion,
-            )
-            .await;
-        if let Some(session_budget) = session_budget {
-            self.runtime.set_turn_budget(session_budget);
-        }
-        self.stream = Some(stream);
-        self.cancel = Some(ct);
+        self.cancel = Some(ct.clone());
         self.steer_tx = Some(s_tx);
+        let event_turn = trigger == TurnTrigger::EventAuto;
+        self.owner_steer_budget = event_turn.then(Default::default);
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         tick.reset();
         self.subagent_tick = Some(tick);
+        let start = TurnStart {
+            cancel: ct,
+            steer_rx: s_rx,
+            auto_approve,
+            completion,
+            event_turn,
+        };
+        if self.session_start_ready() {
+            self.open_turn_stream(start).await;
+        } else {
+            tracing::debug!(session = %self.id, "turn waits for on_session_start");
+            self.turn_awaiting_start = Some(start);
+            // Quick Start's first turn can wait here for extension discovery
+            // (`startup.extensions_ready_timeout_secs`) and then the hook:
+            // say so, or the silence looks like a hang.
+            self.emit(SessionEventWire::SystemNotice(
+                "waiting for extensions to start (on_session_start) before sending...".into(),
+            ));
+        }
     }
 
     /// Every turn-end path (Done/Error/Cancel/stream EOF). `streaming=false`
@@ -2443,8 +3022,10 @@ impl SessionActor {
     /// turn's final history, then the draft removal (`close_turn_draft`).
     pub(crate) fn clear_stream(&mut self) {
         self.stream = None;
+        self.turn_awaiting_start = None;
         self.cancel = None;
         self.steer_tx = None;
+        self.owner_steer_budget = None;
         self.streaming = false;
         self.turn_completion = None;
         self.revoked_turn_deadline = None;
@@ -2711,12 +3292,21 @@ impl SessionActor {
     }
 
     /// dispatch.rs StreamingInput plain-text branch (:1369-1378).
+    ///
+    /// Only the input owner steers (`is_input_command`). In an event-started
+    /// turn, the owner's message also moves the turn onto the session budget
+    /// (`self.runtime.turn_budget()`, which a `/budget` changes) once the
+    /// stream delivers it. A steer that misses the turn (its stream ended)
+    /// stays queued and starts a typed turn, on that budget anyway.
     pub(crate) fn steer(&mut self, text: String) {
-        let delivered = self
-            .steer_tx
-            .as_ref()
-            .map(|tx| tx.send(text.clone()).is_ok())
-            .unwrap_or(false);
+        let send = |tx: &mpsc::UnboundedSender<String>| tx.send(text.clone()).is_ok();
+        let delivered = match (self.steer_tx.as_ref(), self.owner_steer_budget.as_deref()) {
+            (Some(tx), Some(lift)) => {
+                lift.send_owner_steer(self.runtime.turn_budget().clone(), || send(tx))
+            }
+            (Some(tx), None) => send(tx),
+            (None, _) => false,
+        };
         self.emit(SessionEventWire::Steered {
             text: text.clone(),
             delivered,
@@ -3212,7 +3802,7 @@ impl SessionActor {
     // ── event-queue wake (stream_handler.rs handle_event_queue_arm) ──────
 
     async fn on_queue_wake(&mut self) {
-        if self.reload_fence.is_some() {
+        if self.holds(WorkSource::QueueWake) {
             // Fenced for a reload: the record carries what is queued.
             return;
         }
@@ -3286,8 +3876,8 @@ impl SessionActor {
                 // Starting a competing turn here would race the driver.
                 if self.driver.is_some() {
                     tracing::debug!("on_queue_wake: RunTurn inhibited — driver armed");
-                } else if self.stream.is_some() {
-                    tracing::warn!("handle_event_arm: RunTurn with active stream — skipping");
+                } else if self.streaming || self.stream.is_some() {
+                    tracing::warn!("handle_event_arm: RunTurn with active turn — skipping");
                 } else {
                     self.consecutive_auto_turns += 1;
                     self.start_turn(TurnTrigger::EventAuto, None).await;
@@ -3681,7 +4271,7 @@ impl SessionActor {
                         }
                         let new_id = self.conv.session.id.clone();
                         self.runtime.set_session_id(Some(new_id.clone()));
-                        self.journal_id.store(Arc::new(new_id.clone()));
+                        self.set_journal_id(new_id.clone());
                         // F10: lock follows the new journal id.
                         self.reacquire_session_lock(&new_id);
                         // Wall 1: reset continuation state for the new session id
@@ -3712,6 +4302,14 @@ impl SessionActor {
 
     /// #107 inline body (kill-switch only).
     async fn compact_inline(&mut self, instructions: Option<String>, source: &str) {
+        self.compacting_inline = true;
+        self.publish_presence();
+        self.compact_inline_inner(instructions, source).await;
+        self.compacting_inline = false;
+        self.publish_presence();
+    }
+
+    async fn compact_inline_inner(&mut self, instructions: Option<String>, source: &str) {
         self.emit(SessionEventWire::SystemNotice(format!(
             "[{}]",
             preview_compaction_disclosure(&self.runtime, &self.conv.api_messages).render_line()
@@ -3811,6 +4409,12 @@ impl SessionActor {
             v.trim()
                 .eq_ignore_ascii_case(crate::tools::CONFIRM_ANSWER_ALLOW_ALL)
         });
+        // An answer is input too: with `client_input = shared` the answering
+        // drive client becomes active first, so "Allow all" (owner only)
+        // is its to choose.
+        if let Some(c) = from {
+            self.note_input(c);
+        }
         if let Some(reason) = self.confirm_answer_refusal(from, &self.pending_prompts[pos].0, allow_all) {
             if let Some(c) = from {
                 self.emit(SessionEventWire::Refused {
@@ -3831,7 +4435,7 @@ impl SessionActor {
         self.publish_presence();
         self.emit(SessionEventWire::PromptResolved { prompt_id });
         let by = match from {
-            Some(c) => format!("client #{}", c.0),
+            Some(c) => self.client_label(c),
             None => "the host".to_string(),
         };
         // prA N3: the tool card shows the model's original input; when the
@@ -3988,6 +4592,7 @@ impl SessionActor {
                     "auto_turns": self.consecutive_auto_turns,
                     "attached": 0,
                     "pending_prompts": 0,
+                    "pinned": self.keep_warm,
                 }),
                 SessionQuery::View => serde_json::to_value(&**self.view.load()).unwrap_or_default(),
                 // A parked session has no live workers; a watch poll must not wake it.
@@ -4017,6 +4622,8 @@ impl SessionActor {
                 "auto_turns": self.consecutive_auto_turns,
                 "attached": self.attached.len(),
                 "pending_prompts": self.pending_prompts.len(),
+                // `/pin` status in the TUI.
+                "pinned": self.keep_warm,
             }),
             SessionQuery::Messages => {
                 serde_json::to_value(&self.conv.api_messages).unwrap_or_default()
@@ -4046,13 +4653,18 @@ impl SessionActor {
                         .collect(),
                 )
             }
-            SessionQuery::SubagentWatch { handle_id, since } => {
+            SessionQuery::SubagentWatch { handle_id, since, tool_queue } => {
                 let mut registry = self
                     .runtime
                     .subagent_registry()
                     .lock()
                     .unwrap_or_else(|p| p.into_inner());
                 match registry.watch_page(&handle_id, since) {
+                    // An older client did not ask for queue entries and
+                    // could not decode a page that had them.
+                    Some(page) if !tool_queue => {
+                        serde_json::to_value(page.without_tool_queue()).unwrap_or_default()
+                    }
                     Some(page) => serde_json::to_value(page).unwrap_or_default(),
                     None => serde_json::json!({
                         "error": format!("no subagent {handle_id} in this session")
@@ -4095,6 +4707,8 @@ impl SessionActor {
             replay: self.turn_replay.iter().cloned().collect(),
             pending_prompts: self.pending_prompts.iter().map(|(p, _)| p.clone()).collect(),
             clients: self.attached.iter().map(|(c, a)| (*c, a.meta.kind)).collect(),
+            roster: self.roster(),
+            client_input: self.client_input,
             input_owner: self.input_owner,
             display_tail: None,
         }
@@ -4136,7 +4750,16 @@ impl SessionActor {
         let kind = client.kind;
         self.cache_keepwarm_note_attach(kind, mode);
         let snapshot_meta = client.clone();
-        self.attached.insert(cid, AttachedClient { meta: client, mode });
+        let name = resolve_client_name(
+            client.name.as_deref(),
+            kind,
+            self.attached.values().map(|a| a.name.as_str()),
+        );
+        let attached_at_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+        self.attached.insert(
+            cid,
+            AttachedClient { meta: client, mode, name: name.clone(), attached_at_ms, last_input: 0 },
+        );
         self.update_attach_state();
         let mut owner_change: Option<(Option<ClientId>, OwnerChangeReason)> = None;
         match mode {
@@ -4172,7 +4795,40 @@ impl SessionActor {
             client: cid,
             snapshot,
         });
-        self.emit(SessionEventWire::ClientJoined { client: cid, kind });
+        self.emit(SessionEventWire::ClientJoined { client: cid, kind, name, mode });
+    }
+
+    /// B1 `/takeover`: the sending client takes input in place, as an
+    /// `AttachMode::Takeover` attach would, without re-attaching. An
+    /// `Observe` client is refused (it attached read-only on purpose); the
+    /// owner, the host and unknown clients change nothing. Any turn keeps
+    /// running: only who may drive the session changes.
+    fn take_input(&mut self, from: Option<ClientId>) {
+        let Some(c) = from else { return };
+        let Some(mode) = self.attached.get(&c).map(|a| a.mode) else { return };
+        if mode == AttachMode::Observe {
+            self.emit(SessionEventWire::Refused {
+                client: c,
+                command: command_name(&SessionCommand::TakeInput).to_string(),
+                reason: "this client attached with --observe and never owns input; \
+                         attach without --observe to take it"
+                    .to_string(),
+            });
+            return;
+        }
+        if self.input_owner == Some(c) {
+            return;
+        }
+        let from = self.input_owner;
+        let reason = if from.is_some() {
+            OwnerChangeReason::Takeover
+        } else {
+            OwnerChangeReason::Attach
+        };
+        self.input_owner = Some(c);
+        self.emit(SessionEventWire::InputOwnerChanged { from, to: Some(c), reason });
+        self.publish_presence();
+        self.note_input(c); // most recent, for promotion on detach
     }
 
     /// Never touches `stream`/`cancel`: the turn keeps running and its
@@ -4185,12 +4841,16 @@ impl SessionActor {
         self.update_attach_state();
         self.emit(SessionEventWire::ClientLeft { client });
         if self.input_owner == Some(client) {
+            // `shared`: back to whoever typed last (a script that sent one
+            // prompt and left hands input back to the tab in use);
+            // `exclusive`: the lowest id, as before. Ties: the lowest id.
+            let shared = self.client_input == ClientInput::Shared;
             let next = self
                 .attached
                 .iter()
                 .filter(|(_, a)| a.mode != AttachMode::Observe)
-                .map(|(c, _)| *c)
-                .min_by_key(|c| c.0);
+                .max_by_key(|(c, a)| (if shared { a.last_input } else { 0 }, std::cmp::Reverse(c.0)))
+                .map(|(c, _)| *c);
             self.input_owner = next;
             self.emit(SessionEventWire::InputOwnerChanged {
                 from: Some(client),
@@ -4326,6 +4986,34 @@ impl SessionActor {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .reload_carry(&undelivered)
+    }
+
+    /// Host-only (`SessionCommand::RestoreToolActivations`, sent by
+    /// reload's rehydrate): the activations this conversation held in the
+    /// previous image. A live runtime takes them (restored at its first turn
+    /// start); a parked session keeps them for the runtime its unpark
+    /// builds, without unparking.
+    pub(crate) fn restore_tool_activations(
+        &mut self,
+        activations: Vec<crate::tools::activation::CarriedActivation>,
+    ) {
+        if activations.is_empty() {
+            return;
+        }
+        tracing::info!(
+            session = %self.id,
+            count = activations.len(),
+            "reload: tool activations handed over from the previous image"
+        );
+        if self.runtime.is_live() {
+            self.runtime.restore_tool_activations(activations);
+        } else {
+            for a in activations {
+                if !self.parked_tool_activations.iter().any(|p| p.tool_id == a.tool_id) {
+                    self.parked_tool_activations.push(a);
+                }
+            }
+        }
     }
 
     /// Host-only (`SessionCommand::AdoptWorkers`, sent by reload's
@@ -4474,6 +5162,7 @@ impl SessionActor {
         if let Some(job) = self.compact.take() {
             job.task.abort();
             self.emit(SessionEventWire::CompactionCancelled);
+            self.publish_presence();
         }
     }
 
@@ -4485,6 +5174,16 @@ impl SessionActor {
         use std::ops::ControlFlow;
         let Addressed { from, cmd } = addressed;
         if let Some(c) = from {
+            // `rename` is the daemon's control-connection rename; an
+            // attached client has `/saveas` (owner only).
+            if is_rename_command(&cmd) {
+                self.emit(SessionEventWire::Refused {
+                    client: c,
+                    command: command_name(&cmd).to_string(),
+                    reason: "rename is host-only; use /saveas".into(),
+                });
+                return ControlFlow::Continue(());
+            }
             // Only the daemon's reload sends a reload checkpoint (it stops
             // every worker and fences the session for the exec after it).
             if matches!(cmd, SessionCommand::Checkpoint { reason: CheckpointReason::Reload }) {
@@ -4495,11 +5194,7 @@ impl SessionActor {
                 });
                 return ControlFlow::Continue(());
             }
-            if is_input_command(&cmd) && self.input_owner != Some(c) {
-                let reason = match self.input_owner {
-                    Some(o) => format!("input owned by client #{}", o.0),
-                    None => "input has no owner; attach with --takeover".to_string(),
-                };
+            if let Some(reason) = is_input_command(&cmd).then(|| self.input_refusal(c)).flatten() {
                 self.emit(SessionEventWire::Refused {
                     client: c,
                     command: command_name(&cmd).to_string(),
@@ -4513,6 +5208,19 @@ impl SessionActor {
         // the daemon reports it failed). The wake sources are fenced in the
         // select loop; commands are fenced here.
         if self.reload_fence.is_some() && cmd.refused_while_reloading() {
+            // A host rename answers its caller only, never the whole room.
+            if let SessionCommand::EngineCommand { id, name, .. } = &cmd {
+                if name == RENAME_COMMAND {
+                    self.emit(SessionEventWire::QueryResult {
+                        id: *id,
+                        value: serde_json::json!({
+                            "kind": "error", "code": "busy",
+                            "text": "daemon reloading; retry in a moment",
+                        }),
+                    });
+                    return ControlFlow::Continue(());
+                }
+            }
             let reason = super::RELOADING_REFUSAL.to_string();
             match from {
                 Some(c) => self.emit(SessionEventWire::Refused {
@@ -4521,6 +5229,24 @@ impl SessionActor {
                     reason,
                 }),
                 None => self.emit(SessionEventWire::SystemNotice(reason)),
+            }
+            return ControlFlow::Continue(());
+        }
+        // Accepted input: with `client_input = shared` its sender becomes the
+        // active client. `KeepWarm` doesn't count: `--keep-warm` sends it
+        // on attach, not a person typing.
+        if let Some(c) = from {
+            if is_input_command(&cmd) && !matches!(cmd, SessionCommand::KeepWarm { .. }) {
+                self.note_input(c);
+            }
+        }
+        // A host rename (`synaps daemon rename`): handled here for live and
+        // parked sessions alike. A parked one is renamed on disk and NOT
+        // woken (`host_rename`), so this runs before the B3 wake below.
+        if is_rename_command(&cmd) {
+            if let SessionCommand::EngineCommand { id, arg, .. } = cmd {
+                let value = self.host_rename(&arg).await;
+                self.emit(SessionEventWire::QueryResult { id, value });
             }
             return ControlFlow::Continue(());
         }
@@ -4538,9 +5264,15 @@ impl SessionActor {
                     | SessionCommand::Checkpoint { .. }
                     | SessionCommand::Park
                     | SessionCommand::ReloadAborted
+                    | SessionCommand::ArmPark
+                    | SessionCommand::RestoreToolActivations { .. }
                     | SessionCommand::Resync { .. }
                     | SessionCommand::HostEvent(_)
-            );
+                    | SessionCommand::TakeInput
+            ) && !is_close_command(&cmd) // closing a parked session must not rebuild it
+                // Unpinning a parked session only clears the flag; pinning
+                // one wakes it (a pinned session is live by definition).
+                && !matches!(cmd, SessionCommand::KeepWarm { on: false });
             if matches!(cmd, SessionCommand::HostEvent(_)) {
                 return ControlFlow::Continue(()); // nobody attached, nothing to render
             }
@@ -4549,6 +5281,7 @@ impl SessionActor {
                 SessionCommand::Save
                     | SessionCommand::Cancel
                     | SessionCommand::Park
+                    | SessionCommand::ArmPark
                     | SessionCommand::Checkpoint { .. }
             ) {
                 if let SessionCommand::Checkpoint { .. } = cmd {
@@ -4606,6 +5339,13 @@ impl SessionActor {
                 if self.driver.is_some() {
                     self.driver_revoke("session replaced");
                 }
+                // A turn still waiting for `on_session_start` would open its
+                // stream later on the cleared history, under the new journal
+                // id: cancel it first, so it ends (and is saved) in the old
+                // session with nothing sent.
+                if self.turn_awaiting_start.is_some() {
+                    self.cancel_turn(crate::engine::interrupt::InterruptReason::User).await;
+                }
                 // Before `clear` saves the old session: a ping in flight is
                 // aborted and booked to it, not to the new one.
                 self.cache_keepwarm_conversation_replaced();
@@ -4615,7 +5355,7 @@ impl SessionActor {
                 self.conv.clear(&self.runtime).await;
                 self.runtime
                     .begin_conversation(Some(self.conv.session.id.clone()));
-                self.journal_id.store(Arc::new(self.conv.session.id.clone()));
+                self.set_journal_id(self.conv.session.id.clone());
                 // F10: lock follows the new session id.
                 self.reacquire_session_lock(&self.conv.session.id.clone());
                 self.emit(SessionEventWire::Cleared {
@@ -4627,6 +5367,12 @@ impl SessionActor {
                 self.save().await;
             }
             SessionCommand::Query { id, query } => self.query(id, query).await,
+            // `/close` ends the session, which no other engine command can.
+            SessionCommand::EngineCommand { id, name, arg } if name == CLOSE_COMMAND => {
+                if let Some(reason) = self.close_command(id, &arg) {
+                    return ControlFlow::Break(reason);
+                }
+            }
             SessionCommand::EngineCommand { id, name, arg } => {
                 self.engine_command(id, name, arg).await
             }
@@ -4670,7 +5416,12 @@ impl SessionActor {
             SessionCommand::Resume { id, query } => self.resume(id, query).await,
             SessionCommand::Checkpoint { reason } => self.checkpoint(reason).await,
             SessionCommand::AdoptWorkers { workers } => self.adopt_workers(workers),
+            SessionCommand::RestoreToolActivations { activations } => {
+                self.restore_tool_activations(activations)
+            }
             SessionCommand::ReloadAborted => self.reload_aborted().await,
+            // Parked sessions returned above (their evict deadline stands).
+            SessionCommand::ArmPark => self.rearm_park(),
             SessionCommand::Park => {
                 // Explicit request: end an active keep-warm period, then park.
                 self.cache_keepwarm_park_requested();
@@ -4678,13 +5429,22 @@ impl SessionActor {
                     return ControlFlow::Break(reason);
                 }
             }
+            SessionCommand::TakeInput => self.take_input(from),
             SessionCommand::KeepWarm { on } => {
                 self.keep_warm = on;
+                self.meta.pinned = on; // the attach snapshot's copy
+                self.keep_warm_cell.store(on, std::sync::atomic::Ordering::Release);
+                self.note_pin();
+                // Unpinned with nobody who ever typed: back to the old rule.
+                if !on && !self.cache_keepwarm.interactive_seen && self.cache_keepwarm.active() {
+                    self.cache_keepwarm_end(super::cache_keepwarm::PeriodEnd::Disabled);
+                }
                 self.rearm_park();
-                self.emit(SessionEventWire::SystemNotice(format!(
-                    "keep-warm {}",
-                    if on { "on: this session will not be parked" } else { "off" }
-                )));
+                self.emit(SessionEventWire::SystemNotice(if on {
+                    PIN_ON_NOTICE.to_string()
+                } else {
+                    PIN_OFF_NOTICE.to_string()
+                }));
             }
             SessionCommand::HostEvent(ev) => match ev {
                 HostEvent::ExtensionNotification {
@@ -4709,7 +5469,17 @@ impl SessionActor {
     // ── teardown (tui/mod.rs:352-432 + chat.rs shutdown) ─────────────────
 
     async fn finish(&mut self, reason: EndReason) {
+        // Ended on purpose (`/close`, `daemon close`, a client's quit): the
+        // pin goes with it. A daemon stop, reload or crash keeps it.
+        if self.keep_warm && reason == EndReason::ClientQuit {
+            self.keep_warm = false;
+            self.note_pin();
+        }
         self.cache_keepwarm_end(super::cache_keepwarm::PeriodEnd::SessionEnding);
+        // Before on_session_end clears the keyed injection (STEP 2): a hook
+        // not yet called leaves the line; one in flight finishes holding the
+        // gate and drops what it injects (`SessionStart::end`).
+        self.session_start.end();
         self.lifecycle.store(
             SessionLifecycle::Ending as u8,
             std::sync::atomic::Ordering::Release,
@@ -4824,6 +5594,19 @@ async fn next_stream_event(stream: &mut Option<ActiveStream>) -> Option<StreamEv
     }
 }
 
+/// The conversation's title for listings: the saved title, else what
+/// `Session::auto_title` will make of the first user message.
+fn conversation_title(conv: &ConversationState) -> Option<String> {
+    if !conv.session.title.is_empty() {
+        return Some(conv.session.title.clone());
+    }
+    conv.api_messages
+        .iter()
+        .filter(|m| m["role"].as_str() == Some("user"))
+        .find_map(|m| agent_core::core::session::user_content_for_display(&m["content"]))
+        .map(|t| t.chars().take(80).collect())
+}
+
 /// Whether the 1 Hz `SubagentRows` tick keeps running: always during a turn,
 /// and after it while any worker is still running (a background worker's
 /// progress events rode the ended turn's stream; the rows carry it now).
@@ -4912,12 +5695,23 @@ async fn driver_tick_timer(
     }
 }
 
-async fn ext_ready(rx: &mut Option<oneshot::Receiver<()>>) {
-    match rx {
-        Some(r) => {
-            let _ = r.await;
-        }
-        None => std::future::pending().await,
+/// How long a session waits for process-level extension discovery before
+/// `on_session_start`: `startup.extensions_ready_timeout_secs`, or the
+/// budget constant when that is 0.
+fn extensions_ready_timeout(config: &crate::SynapsConfig) -> Duration {
+    match config.startup.extensions_ready_timeout_secs {
+        0 => budgets::EXTENSIONS_READY_TIMEOUT,
+        secs => Duration::from_secs(secs),
+    }
+}
+
+/// This session's `on_session_start` task, while it is in line or running.
+async fn session_start_task(
+    start: &mut super::session_start::SessionStart,
+) -> std::result::Result<bool, tokio::task::JoinError> {
+    match start {
+        super::session_start::SessionStart::Queued { task, .. } => task.await,
+        _ => std::future::pending().await,
     }
 }
 
@@ -4966,13 +5760,13 @@ impl SessionTask {
                     None => break EndReason::HostShutdown,
                 },
                 Some(req) = actor.secret_prompt_rx.recv() => actor.on_prompt_request(req),
-                // A reload fence keeps the wake (and its permit) queued.
-                _ = queue.notified(), if actor.reload_fence.is_none() => actor.on_queue_wake().await,
+                // A held wake (and its permit) stays queued.
+                _ = queue.notified(), if !actor.holds(WorkSource::QueueWake) => actor.on_queue_wake().await,
                 _ = next_tick(&mut actor.subagent_tick) => {
                     actor.publish_subagent_rows();
                     actor.flush_turn_draft();
                 }
-                _ = park_timer(actor.park_deadline), if actor.reload_fence.is_none() => {
+                _ = park_timer(actor.park_deadline), if !actor.holds(WorkSource::ParkTimer) => {
                     if let std::ops::ControlFlow::Break(reason) = actor.park().await {
                         break reason;
                     }
@@ -4980,23 +5774,17 @@ impl SessionTask {
                 _ = prompt_abandon_timer(actor.prompt_abandon_deadline) => {
                     actor.on_prompt_abandon_deadline();
                 }
-                _ = super::cache_keepwarm::keepwarm_timer(actor.cache_keepwarm.deadline()), if actor.reload_fence.is_none() => {
+                _ = super::cache_keepwarm::keepwarm_timer(actor.cache_keepwarm.deadline()), if !actor.holds(WorkSource::KeepWarmTimer) => {
                     actor.on_cache_keepwarm_due().await;
                 }
                 res = super::cache_keepwarm::poll_keepwarm_ping(&mut actor.cache_keepwarm.task) => {
                     actor.on_cache_keepwarm_done(res);
                 }
                 res = poll_compaction(&mut actor.compact) => actor.on_compaction_done(res).await,
-                _ = ext_ready(&mut actor.ext_ready) => {
-                    actor.ext_ready = None;
-                    let id = (**actor.journal_id.load()).clone();
-                    let bus = Arc::clone(&actor.hook_bus);
-                    crate::extensions::loader::emit_session_start(&bus, &id).await;
-                    if actor.runtime.is_live() {
-                        actor.publish_view().await;
-                    }
+                ran = session_start_task(&mut actor.session_start) => {
+                    actor.session_start_finished(ran).await;
                 },
-                _ = driver_tick_timer(actor.driver.is_some(), actor.driver_pending.is_some(), &mut actor.driver_tick_interval), if actor.reload_fence.is_none() => {
+                _ = driver_tick_timer(actor.driver.is_some(), actor.driver_pending.is_some(), &mut actor.driver_tick_interval), if !actor.holds(WorkSource::DriverTick) => {
                     actor.driver_tick().await;
                 }
                 _ = reload_fence_timer(actor.reload_fence.as_ref().map(|f| f.deadline)) => {

@@ -390,3 +390,216 @@ async fn a_client_cannot_send_a_reload_checkpoint() {
     until(&mut f.client, |e| matches!(e, SessionEventWire::Idle)).await;
     end(&mut f.client).await;
 }
+
+// ── The reload fence × a pending `on_session_start` ─────────────────────────
+//
+// Both hold back autonomous work: the fence until the exec (or the daemon's
+// report that it failed), the hook until it has run. A session that is
+// fenced AND waits for its hook sends no request for an event until both
+// have cleared, in either order. Once the fence lifts, the event's turn may
+// start while its request waits for the hook: a pending hook does not hold
+// the queue wake, and the turn's stream opens only after the hook. The hook
+// itself may run under the fence. Two test seams make the hook pending
+// after the fixture's turn: the host's session-start gate is held, and that
+// turn puts a fresh hook back in line at its end.
+//
+// What the timed drains show: "nothing started within 800 ms" (and the
+// 500 ms drain after the work) are negative observations over that window,
+// not barriers. The counts read after `Idle` check that the work ran, once
+// within what the test saw; they do not prove a second turn can never come.
+
+use agent_engine::session::session_start_testing as start_seam;
+
+/// `fixture()`, with this session's `on_session_start` back in line behind
+/// the held gate once its turn has ended. Returns the hold, the journal id
+/// and the hook-call count after the turn.
+async fn fixture_with_a_pending_hook() -> (Fixture, start_seam::GateHold, String, u64) {
+    let (url, hits, bodies) = capture_stub().await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+    let (handle, task) = host.create_session_unspawned(cfg()).await.unwrap();
+    let registry = task.subagent_registry();
+    let queue = task.event_queue();
+    tokio::spawn(task.run());
+    let (mut client, _) = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Test))
+        .await
+        .unwrap();
+    let hold = start_seam::hold_gate(&host).await;
+    let sid = handle.journal_id();
+    let calls = start_seam::calls(&sid);
+    start_seam::requeue_after_next_turn(&sid);
+    client.send(submit("hello")).await.unwrap();
+    until(&mut client, |e| matches!(e, SessionEventWire::Idle)).await;
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    assert_eq!(start_seam::calls(&sid), calls, "the hook waits behind the held gate");
+    (Fixture { handle, client, registry, queue, hits, bodies }, hold, sid, calls)
+}
+
+/// An event for the session, as its inbox watcher queues one.
+fn queue_event(f: &Fixture) {
+    f.queue
+        .push(agent_engine::events::types::Event::simple("test", "wake up", None))
+        .unwrap();
+}
+
+/// Wait (bounded) until `n` hooks of `sid` have run since `base`.
+async fn hooks_run(sid: &str, base: u64, n: u64) -> bool {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while tokio::time::Instant::now() < deadline {
+        if start_seam::calls(sid) >= base + n {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    false
+}
+
+/// The fence lifts first: the event's turn may start, but its request waits
+/// for the hook. Once the hook has run, the event gets one turn and one
+/// request, and the hook ran once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn an_event_for_a_fenced_session_waiting_for_its_hook_runs_once_both_clear_fence_first() {
+    let _h = Home::new();
+    let (mut f, hold, sid, calls) = fixture_with_a_pending_hook().await;
+    checkpoint_for_reload(&mut f).await;
+    queue_event(&f);
+    let fenced = drain_for(&mut f.client, Duration::from_millis(800)).await;
+    assert_eq!(started(&fenced), 0, "a turn started under the fence: {fenced:#?}");
+
+    f.handle.send(SessionCommand::ReloadAborted).await.unwrap();
+    let lifted = drain_for(&mut f.client, Duration::from_millis(800)).await;
+    assert_eq!(f.hits.load(Ordering::SeqCst), 1, "no request while the hook is pending");
+    assert_eq!(start_seam::calls(&sid), calls, "the hook still waits");
+
+    drop(hold);
+    let seen = until(&mut f.client, |e| matches!(e, SessionEventWire::Idle)).await;
+    assert_eq!(started(&lifted) + started(&seen), 1, "one turn for the event");
+    assert_eq!(f.hits.load(Ordering::SeqCst), 2, "one request for the event");
+    assert_eq!(start_seam::calls(&sid), calls + 1, "the hook ran once");
+    let after = drain_for(&mut f.client, Duration::from_millis(500)).await;
+    assert_eq!(started(&after), 0, "{after:#?}");
+    assert_eq!(f.hits.load(Ordering::SeqCst), 2);
+    end(&mut f.client).await;
+}
+
+/// The hook runs first, under the fence: still nothing starts. Once the
+/// fence lifts, the event gets one turn and one request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn an_event_for_a_fenced_session_waiting_for_its_hook_runs_once_both_clear_hook_first() {
+    let _h = Home::new();
+    let (mut f, hold, sid, calls) = fixture_with_a_pending_hook().await;
+    checkpoint_for_reload(&mut f).await;
+    queue_event(&f);
+
+    drop(hold);
+    assert!(hooks_run(&sid, calls, 1).await, "the hook runs under the fence");
+    let fenced = drain_for(&mut f.client, Duration::from_millis(800)).await;
+    assert_eq!(started(&fenced), 0, "a turn started under the fence: {fenced:#?}");
+    assert_eq!(f.hits.load(Ordering::SeqCst), 1, "no request under the fence");
+
+    f.handle.send(SessionCommand::ReloadAborted).await.unwrap();
+    let seen = until(&mut f.client, |e| matches!(e, SessionEventWire::Idle)).await;
+    assert_eq!(started(&seen), 1, "one turn for the event");
+    assert_eq!(f.hits.load(Ordering::SeqCst), 2, "one request for the event");
+    assert_eq!(start_seam::calls(&sid), calls + 1, "the hook ran once");
+    let after = drain_for(&mut f.client, Duration::from_millis(500)).await;
+    assert_eq!(started(&after), 0, "{after:#?}");
+    assert_eq!(f.hits.load(Ordering::SeqCst), 2);
+    end(&mut f.client).await;
+}
+
+/// A Submit while fenced and waiting for the hook: the fence's refusal comes
+/// first (the reload record must not change). Once the fence has lifted, a
+/// Submit starts its turn and its request waits for the hook; then one
+/// request goes out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_submit_while_fenced_and_waiting_for_the_hook_is_refused_and_then_waits_for_the_hook() {
+    let _h = Home::new();
+    let (mut f, hold, sid, calls) = fixture_with_a_pending_hook().await;
+    checkpoint_for_reload(&mut f).await;
+
+    f.client.send_from_self(submit("hello again")).await.unwrap();
+    let fenced = drain_for(&mut f.client, Duration::from_millis(800)).await;
+    assert_eq!(started(&fenced), 0, "a turn started under the fence: {fenced:#?}");
+    assert_eq!(
+        refusals(&fenced),
+        [("submit".to_string(), "daemon reloading; retry in a moment".to_string())],
+        "{fenced:#?}"
+    );
+
+    f.handle.send(SessionCommand::ReloadAborted).await.unwrap();
+    f.client.send_from_self(submit("hello again")).await.unwrap();
+    until(&mut f.client, |e| matches!(e, SessionEventWire::TurnStarted { .. })).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(f.hits.load(Ordering::SeqCst), 1, "the request waits for the hook");
+    assert_eq!(start_seam::calls(&sid), calls, "the hook still waits");
+
+    drop(hold);
+    until(&mut f.client, |e| matches!(e, SessionEventWire::Idle)).await;
+    assert_eq!(f.hits.load(Ordering::SeqCst), 2, "one request once the hook has run");
+    assert_eq!(start_seam::calls(&sid), calls + 1, "the hook ran once");
+    end(&mut f.client).await;
+}
+
+/// While a turn waits for the hook, the client is told why nothing happens
+/// yet: a Quick Start first turn can wait for extension discovery and the
+/// hook for many seconds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_turn_waiting_for_the_hook_says_so() {
+    let _h = Home::new();
+    let (mut f, hold, _sid, _calls) = fixture_with_a_pending_hook().await;
+    f.client.send(submit("hello again")).await.unwrap();
+    until(&mut f.client, |e| matches!(e, SessionEventWire::TurnStarted { .. })).await;
+    let waiting = drain_for(&mut f.client, Duration::from_millis(500)).await;
+    assert!(
+        waiting.iter().any(|e| matches!(
+            &e.event,
+            SessionEventWire::SystemNotice(n) if n.contains("waiting for extensions")
+        )),
+        "no notice while the turn waits for the hook: {waiting:#?}"
+    );
+    drop(hold);
+    until(&mut f.client, |e| matches!(e, SessionEventWire::Idle)).await;
+    end(&mut f.client).await;
+}
+
+/// `/clear` while a turn waits for the hook cancels that turn first. Its
+/// request never goes out, neither on the cleared history nor under the new
+/// journal id, and nothing starts once the hook has run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_clear_while_the_turn_waits_for_the_hook_cancels_the_turn() {
+    let _h = Home::new();
+    let (mut f, hold, sid, calls) = fixture_with_a_pending_hook().await;
+    f.client.send(submit("hello again")).await.unwrap();
+    until(&mut f.client, |e| matches!(e, SessionEventWire::TurnStarted { .. })).await;
+
+    f.client.send(SessionCommand::NewSession).await.unwrap();
+    let seen = until(&mut f.client, |e| matches!(e, SessionEventWire::Cleared { .. })).await;
+    assert!(
+        seen.iter().any(|e| matches!(e.event, SessionEventWire::Aborted { .. })),
+        "the waiting turn ends before the clear: {seen:#?}"
+    );
+
+    // The hook is keyed on the session's current journal id: it runs for
+    // the new conversation.
+    let new_id = seen
+        .iter()
+        .find_map(|e| match &e.event {
+            SessionEventWire::Cleared { session_id } => Some(session_id.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert_ne!(new_id, sid);
+    drop(hold);
+    assert!(hooks_run(&new_id, 0, 1).await, "the hook still runs, for the new id");
+    assert_eq!(start_seam::calls(&sid), calls, "not under the old id");
+    let after = drain_for(&mut f.client, Duration::from_millis(800)).await;
+    assert_eq!(started(&after), 0, "{after:#?}");
+    assert_eq!(f.hits.load(Ordering::SeqCst), 1, "the canceled turn sent no request");
+    end(&mut f.client).await;
+}

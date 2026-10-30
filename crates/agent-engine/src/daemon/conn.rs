@@ -9,8 +9,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::net::UnixStream;
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
@@ -19,18 +17,21 @@ use crate::session::handle::CMD_CHAN_CAP;
 use crate::session::transport::{TransportError, ATTACH_TIMEOUT, ATTACH_TIMEOUT_PARKED};
 use crate::session::wire::*;
 use crate::session::*;
+use crate::ipc::{ServerReadHalf, ServerStream, ServerWriteHalf};
 use crate::{SessionEvent, StreamEvent};
 
 const HELLO_TIMEOUT: Duration = Duration::from_secs(2);
 
-type Reader = BufReader<OwnedReadHalf>;
+type Reader = BufReader<ServerReadHalf>;
 
 /// Which `SessionCommand`s a socket client may originate (§4 MED). The UDS
 /// is 0600 same-uid, so this is a footgun guard, not an auth boundary:
 /// anything that drives the actor's *own* bookkeeping (`Attach`, `Detach`
 /// for another client, `Resync`, `HostEvent`) or ends the session for every
-/// other client (`End`) is refused with an `Error` frame. Ending a session
-/// is `daemon stop`'s job today.
+/// other client with a host reason (`End`) is refused with an `Error` frame.
+/// The owner ends a session with `/close` (an engine command, checked by the
+/// actor); `daemon close` does it from a control connection
+/// (`ClientFrame::Close`), `daemon stop` for every session.
 fn client_may_send(cmd: &SessionCommand, own: ClientId) -> Result<(), &'static str> {
     use SessionCommand as C;
     match cmd {
@@ -48,7 +49,9 @@ fn client_may_send(cmd: &SessionCommand, own: ClientId) -> Result<(), &'static s
         | C::SubmitPrepared { .. }
         | C::PluginCommand { .. }
         | C::Resume { .. }
-        | C::KeepWarm { .. } => Ok(()),
+        | C::KeepWarm { .. }
+        // `/takeover`: the actor checks the attach mode.
+        | C::TakeInput => Ok(()),
         // A reload checkpoint stops every worker and fences the session
         // for the exec that follows: only the daemon's own reload sends it.
         C::Checkpoint { reason: crate::session::CheckpointReason::Reload } => {
@@ -65,7 +68,9 @@ fn client_may_send(cmd: &SessionCommand, own: ClientId) -> Result<(), &'static s
         C::Resync { .. } => Err("resync: not a client command"),
         C::Park => Err("park: not a client command"),
         C::AdoptWorkers { .. } => Err("adopt_workers: not a client command"),
+        C::RestoreToolActivations { .. } => Err("restore_tool_activations: not a client command"),
         C::ReloadAborted => Err("reload_aborted: not a client command"),
+        C::ArmPark => Err("arm_park: not a client command"),
         C::HostEvent(_) => Err("host_event: not a client command"),
         C::DriverStart { .. } => Ok(()),
     }
@@ -86,6 +91,8 @@ fn refused_while_draining(cmd: &SessionCommand) -> bool {
         )
 }
 
+// One per line read, consumed at once: not worth boxing every frame.
+#[allow(clippy::large_enum_variant)]
 enum Read {
     Frame(ClientFrame),
     Eof,
@@ -117,7 +124,7 @@ async fn read_frame(reader: &mut Reader, line: &mut String) -> std::io::Result<R
 }
 
 /// Writer task: owns the write half; bounded queue = per-client backpressure.
-fn spawn_writer(mut w: OwnedWriteHalf) -> (mpsc::Sender<DaemonFrame>, tokio::task::JoinHandle<()>) {
+fn spawn_writer(mut w: ServerWriteHalf) -> (mpsc::Sender<DaemonFrame>, tokio::task::JoinHandle<()>) {
     let (tx, mut rx) = mpsc::channel::<DaemonFrame>(CMD_CHAN_CAP);
     let task = tokio::spawn(async move {
         while let Some(frame) = rx.recv().await {
@@ -149,8 +156,8 @@ fn spawn_writer(mut w: OwnedWriteHalf) -> (mpsc::Sender<DaemonFrame>, tokio::tas
     (tx, task)
 }
 
-pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: CancellationToken) {
-    let (r, w) = stream.into_split();
+pub async fn serve(state: Arc<DaemonState>, stream: ServerStream, shutdown: CancellationToken) {
+    let (r, w) = crate::ipc::split_server(stream);
     let mut reader = BufReader::new(r);
     let (tx, writer) = spawn_writer(w);
     let mut line = String::new();
@@ -190,6 +197,12 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
                 ),
             })
             .await;
+        let _ = writer.await;
+        return;
+    }
+    // Clients validate their name before connecting; this is the backstop.
+    if let Some(Err(message)) = hello.client.name.as_deref().map(crate::session::validate_client_name) {
+        let _ = tx.send(DaemonFrame::Refused { reason: RefuseReason::Protocol, message }).await;
         let _ = writer.await;
         return;
     }
@@ -282,12 +295,44 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
                     }
                 }
             }
+            // `daemon close`: end one session with host authority. A
+            // refusal is terminal (the writer closes after `Refused`).
+            Ok(Read::Frame(ClientFrame::Close { session_id, force, attached })) => {
+                tracing::info!(session = %session_id, force, attached, "daemon: close requested over the socket");
+                let reply = super::close::close_session(&state, &session_id, force, attached).await;
+                let _ = tx.send(reply).await;
+            }
+            // `daemon pin`: pin/unpin one session with host authority. A
+            // refusal is terminal, like `Close`.
+            Ok(Read::Frame(ClientFrame::Pin { session_id, on })) => {
+                tracing::info!(session = %session_id, on, "daemon: pin requested over the socket");
+                let reply = super::pin::pin_session(&state, &session_id, on).await;
+                let _ = tx.send(reply).await;
+            }
+            // `daemon rename`: name/unname one session with host authority,
+            // no attach. A refusal is terminal, like `Close`.
+            Ok(Read::Frame(ClientFrame::Rename { session_id, name, expect })) => {
+                tracing::info!(session = %session_id, clear = name.is_none(), "daemon: rename requested over the socket");
+                let reply = super::rename::rename_session(&state, &session_id, name.as_deref(), expect).await;
+                let _ = tx.send(reply).await;
+            }
+            // `daemon reload-extension`: restart one extension in place,
+            // sessions untouched. A refusal is terminal, like `Close`.
+            Ok(Read::Frame(ClientFrame::ReloadExtension { extension })) => {
+                tracing::info!(extension = %extension, "daemon: extension reload requested over the socket");
+                let reply = super::extension_reload::reload_extension(&state, &extension).await;
+                let _ = tx.send(reply).await;
+            }
             // C2: jemalloc purge in the daemon (bench hygiene); reply Pong.
             Ok(Read::Frame(ClientFrame::Purge)) => {
                 agent_core::core::memstat::purge_arenas();
                 let _ = tx
                     .send(DaemonFrame::Pong { pid: std::process::id(), uptime_s: state.uptime_s(), sessions: state.live_sessions().len() })
                     .await;
+            }
+            // `synaps auth state`: the host broker's in-memory account state.
+            Ok(Read::Frame(ClientFrame::AuthState(query))) => {
+                let _ = tx.send(auth_state_reply(&state, &query)).await;
             }
             Ok(Read::Frame(ClientFrame::Hello(_))) => {
                 let _ = tx.send(DaemonFrame::Error { session_id: None, message: "duplicate hello".into() }).await;
@@ -414,6 +459,9 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
             return;
         }
     };
+    let legacy = legacy_shared(hello.client.capabilities, snapshot.client_input);
+    let snapshot = replay_for(hello.client.capabilities, snapshot);
+    let snapshot = if legacy { as_owner(client, snapshot) } else { snapshot };
     if tx.send(DaemonFrame::Attached(AttachedWire::new(client, snapshot))).await.is_err() {
         let _ = handle.send(SessionCommand::Detach { client }).await;
         return;
@@ -440,13 +488,9 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
     // Phase 4 §2.3: Digest clients never receive the per-round full history;
     // the `Conversation` digest the actor emits right after is what they key on.
     let history = hello.client.history;
+    let caps = hello.client.capabilities;
     let skip = move |env: &Envelope| -> bool {
-        matches!(env.event, SessionEventWire::Attached { .. })
-            || (history == HistoryMode::Digest
-                && matches!(
-                    env.event,
-                    SessionEventWire::Stream(StreamEvent::Session(SessionEvent::MessageHistory(_)))
-                ))
+        !forwarded(history, caps, env) || (legacy && matches!(env.event, SessionEventWire::InputOwnerChanged { .. }))
     };
     // Not tied to `shutdown`: on daemon stop the client must still see `Ended`.
     let mut forward = tokio::spawn(async move {
@@ -525,6 +569,13 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
                     let _ = tx.send(DaemonFrame::Error { session_id: Some(sid.clone()), message: crate::session::RELOADING_REFUSAL.into() }).await;
                     continue;
                 }
+                // A client's own Detach ends its feed: nothing after it is
+                // forwarded (its `ClientLeft` included), whether its `Bye`
+                // shares the read (one socket segment) or comes in a later
+                // one (a named pipe often delivers the two writes apart).
+                if matches!(&cmd, SessionCommand::Detach { client: c } if *c == client) {
+                    forward.abort();
+                }
                 match handle.send_from(client, cmd).await {
                     Ok(()) => {}
                     Err(TransportError::Backpressure) => {
@@ -557,7 +608,15 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
             Ok(Read::Frame(ClientFrame::Attach(_))) | Ok(Read::Frame(ClientFrame::Hello(_))) => {
                 let _ = tx.send(DaemonFrame::Error { session_id: Some(sid.clone()), message: "already attached".into() }).await;
             }
-            Ok(Read::Frame(ClientFrame::Reload { .. })) | Ok(Read::Frame(ClientFrame::Purge)) => {
+            // An attached client closes its session with `/close` and pins
+            // it with `/pin`; `synaps auth state` is a control connection.
+            Ok(Read::Frame(ClientFrame::Reload { .. }))
+            | Ok(Read::Frame(ClientFrame::Purge))
+            | Ok(Read::Frame(ClientFrame::Close { .. }))
+            | Ok(Read::Frame(ClientFrame::Pin { .. }))
+            | Ok(Read::Frame(ClientFrame::Rename { .. }))
+            | Ok(Read::Frame(ClientFrame::ReloadExtension { .. }))
+            | Ok(Read::Frame(ClientFrame::AuthState(_))) => {
                 let _ = tx.send(DaemonFrame::Error { session_id: Some(sid.clone()), message: "control frames are not accepted on an attached connection".into() }).await;
             }
             Ok(Read::Frame(ClientFrame::Bye)) | Ok(Read::Eof) | Err(_) => break,
@@ -605,6 +664,15 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
                 let _ = forward.await;
             }
         }
+    } else if ended {
+        // The actor broadcast `Ended` before it dropped its queue, so it is
+        // in the forwarder's receiver: let it go out before the `Bye`, or the
+        // client sees EOF and never learns the session ended (`/close` from
+        // another client, `daemon close`, eviction).
+        if tokio::time::timeout(Duration::from_secs(1), &mut forward).await.is_err() {
+            forward.abort();
+            let _ = forward.await;
+        }
     } else {
         forward.abort();
         let _ = forward.await;
@@ -621,10 +689,56 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
     tracing::debug!(session = %sid, client = client.0, "daemon: client detached");
 }
 
+/// Whether the pump forwards `env` to this connection's client. Never the
+/// actor's `Attached` (the conn sends its own). Digest clients never get the
+/// per-round full history; the `Conversation` digest the actor emits right
+/// after is what they key on (phase 4 §2.3). And never an event the client
+/// cannot decode ([`client_decodes`]: an older client fails the whole frame).
+fn forwarded(history: HistoryMode, caps: ClientCapabilities, env: &Envelope) -> bool {
+    !(matches!(env.event, SessionEventWire::Attached { .. })
+        || (history == HistoryMode::Digest
+            && matches!(
+                env.event,
+                SessionEventWire::Stream(StreamEvent::Session(SessionEvent::MessageHistory(_)))
+            ))
+        || !client_decodes(caps, &env.event))
+}
+
+/// The attach snapshot as this client may receive it: its turn replay
+/// without events it cannot decode — one would sink the whole `Attached`
+/// frame, and with it every reconnect.
+fn replay_for(caps: ClientCapabilities, mut snapshot: AttachSnapshot) -> AttachSnapshot {
+    snapshot.replay.retain(|env| client_decodes(caps, &env.event));
+    snapshot
+}
+
+/// [`legacy_shared`]: the snapshot as an older client on a shared session
+/// gets it: it owns input unless it observes, and its replay has no owner
+/// changes (it never gets live ones either).
+fn as_owner(client: ClientId, mut snapshot: AttachSnapshot) -> AttachSnapshot {
+    let observes = snapshot.roster.iter().any(|c| c.id == client && c.mode == AttachMode::Observe);
+    if !observes {
+        snapshot.input_owner = Some(client);
+    }
+    snapshot.replay.retain(|env| !matches!(env.event, SessionEventWire::InputOwnerChanged { .. }));
+    snapshot
+}
+
 fn reload_bye(state: &DaemonState) -> ByeReason {
     ByeReason::Reloading {
         generation: state.reload_generation.load(Ordering::SeqCst),
         retry_after_ms: super::reload::RETRY_AFTER_MS,
+    }
+}
+
+/// `AuthState`: the in-memory account state of the broker on the host's
+/// token cache, which every session of this daemon uses. Same trust as the
+/// other control frames (the socket is the user's own). No network request,
+/// no refresh; a clear never writes the credential store.
+fn auth_state_reply(state: &DaemonState, query: &agent_core::auth::AuthStateQuery) -> DaemonFrame {
+    match agent_core::auth::local_auth_state(&state.host.parts().token_cache, query, true) {
+        Ok(report) => DaemonFrame::AuthState { report },
+        Err(e) => DaemonFrame::Error { session_id: None, message: format!("auth state: {e}") },
     }
 }
 
@@ -643,6 +757,74 @@ mod tests {
         assert!(client_may_send(&reload, own).is_err());
         let host = SessionCommand::Checkpoint { reason: CheckpointReason::HostRequest };
         assert!(client_may_send(&host, own).is_ok());
+    }
+
+    /// `/takeover` comes from a client by definition (the actor checks the
+    /// attach mode), so the conn lets it through.
+    #[test]
+    fn take_input_is_a_client_command() {
+        assert!(client_may_send(&SessionCommand::TakeInput, ClientId(2)).is_ok());
+    }
+
+    fn stream_env(ev: StreamEvent) -> Envelope {
+        Envelope {
+            session_id: SessionId::from("s"),
+            seq: 1,
+            ts: chrono::Utc::now(),
+            event: SessionEventWire::Stream(ev),
+        }
+    }
+
+    /// An older client (no `tool_queue` capability) is never sent the queue
+    /// signals — live or in the attach replay — and still gets every other
+    /// event; a current client gets them all.
+    #[test]
+    fn queue_signals_are_only_forwarded_to_clients_that_opted_in() {
+        use crate::LlmEvent;
+        let queued = stream_env(StreamEvent::Llm(LlmEvent::ToolQueued { tool_id: "t2".into() }));
+        let started = stream_env(StreamEvent::Llm(LlmEvent::ToolStarted { tool_id: "t2".into() }));
+        let result = stream_env(StreamEvent::Llm(LlmEvent::ToolResult {
+            tool_id: "t1".into(),
+            result: "ok".into(),
+        }));
+        let old = ClientCapabilities::default();
+        let new = ClientCapabilities::current();
+        for history in [HistoryMode::Full, HistoryMode::Digest] {
+            assert!(!forwarded(history, old, &queued));
+            assert!(!forwarded(history, old, &started));
+            assert!(forwarded(history, old, &result));
+            assert!(forwarded(history, new, &queued));
+            assert!(forwarded(history, new, &started));
+            assert!(forwarded(history, new, &result));
+        }
+
+        let session = crate::session::handle::echo::meta_for(&SessionId::from("s"));
+        let snapshot = AttachSnapshot {
+            meta: session,
+            view: crate::session::handle::echo::view_for(),
+            conversation: Default::default(),
+            streaming: true,
+            replay: vec![queued.clone(), result.clone(), started.clone()],
+            pending_prompts: vec![],
+            clients: vec![],
+            roster: Vec::new(),
+            client_input: ClientInput::wire_default(),
+            input_owner: None,
+            display_tail: None,
+        };
+        let kinds = |s: &AttachSnapshot| -> Vec<String> {
+            s.replay
+                .iter()
+                .map(|e| match &e.event {
+                    SessionEventWire::Stream(StreamEvent::Llm(LlmEvent::ToolQueued { .. })) => "queued",
+                    SessionEventWire::Stream(StreamEvent::Llm(LlmEvent::ToolStarted { .. })) => "started",
+                    _ => "other",
+                })
+                .map(str::to_string)
+                .collect()
+        };
+        assert_eq!(kinds(&replay_for(old, snapshot.clone())), vec!["other"]);
+        assert_eq!(kinds(&replay_for(new, snapshot)), vec!["queued", "other", "started"]);
     }
 
     /// The drain gate refuses work that would start after the record, and

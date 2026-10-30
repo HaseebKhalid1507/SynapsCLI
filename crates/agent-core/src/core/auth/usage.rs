@@ -129,11 +129,21 @@ pub enum UsageError {
     /// Provider rejected the credential (401/403).
     Unauthorized { status: u16 },
     /// 429 on the usage endpoint itself. Not proof of quota exhaustion.
-    RateLimited,
-    /// Any other non-2xx status.
-    UpstreamStatus { status: u16 },
+    /// `retry_after_s` is the delta-seconds `Retry-After` header, if sent.
+    RateLimited {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retry_after_s: Option<u64>,
+    },
+    /// Any other non-2xx status. `retry_after_s`: the delta-seconds
+    /// `Retry-After` header, if sent (an HTTP-date is ignored).
+    UpstreamStatus {
+        status: u16,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retry_after_s: Option<u64>,
+    },
     /// 3xx. Redirects are never followed.
     Redirected { status: u16 },
+    /// No answer within the timeout: no status, no `Retry-After`.
     Timeout,
     /// Transport failure; `detail` is a coarse class, never a URL or body.
     Transport { detail: String },
@@ -151,7 +161,7 @@ impl UsageError {
             Self::IdentityMismatch => "identity_mismatch",
             Self::InvalidEndpointOverride => "invalid_endpoint_override",
             Self::Unauthorized { .. } => "unauthorized",
-            Self::RateLimited => "rate_limited",
+            Self::RateLimited { .. } => "rate_limited",
             Self::UpstreamStatus { .. } => "upstream_status",
             Self::Redirected { .. } => "redirected",
             Self::Timeout => "timeout",
@@ -167,6 +177,41 @@ impl UsageError {
             self,
             Self::Unauthorized { .. } | Self::AccountIdUnavailable | Self::IdentityMismatch
         )
+    }
+
+    /// The typed observation failure this error stands for (kind, HTTP
+    /// status, `Retry-After`), for selection reports and logs.
+    pub fn failure(&self) -> super::quota_policy::ObservationFailure {
+        use super::quota_policy::{AccountFailureKind as K, ObservationFailure};
+        match self {
+            Self::UnsupportedProvider { .. } | Self::InvalidEndpointOverride => {
+                ObservationFailure::new(K::Unsupported)
+            }
+            Self::AccountIdUnavailable | Self::IdentityMismatch => {
+                ObservationFailure::new(K::UsageUnauthorized)
+            }
+            Self::Unauthorized { status } => {
+                ObservationFailure::new(K::UsageUnauthorized).with_status(*status)
+            }
+            Self::RateLimited { retry_after_s } => ObservationFailure::new(K::UsageRateLimited)
+                .with_status(429)
+                .with_retry_after(*retry_after_s),
+            Self::UpstreamStatus {
+                status,
+                retry_after_s,
+            } => ObservationFailure::new(K::UsageUpstream)
+                .with_status(*status)
+                .with_retry_after(*retry_after_s),
+            Self::Redirected { status } => {
+                ObservationFailure::new(K::UsageUpstream).with_status(*status)
+            }
+            // No answer arrived, so there is no status or Retry-After.
+            Self::Timeout => ObservationFailure::new(K::UsageTimeout),
+            Self::Transport { .. } => ObservationFailure::new(K::UsageTransport),
+            Self::BodyTooLarge { .. } | Self::Malformed { .. } => {
+                ObservationFailure::new(K::UsageMalformed)
+            }
+        }
     }
 
     /// Map onto the broker error vocabulary (secret-free by construction).
@@ -203,8 +248,25 @@ impl std::fmt::Display for UsageError {
             Self::Unauthorized { status } => {
                 write!(f, "provider rejected the access token (HTTP {status})")
             }
-            Self::RateLimited => write!(f, "usage endpoint rate limited (HTTP 429)"),
-            Self::UpstreamStatus { status } => write!(f, "usage request failed: HTTP {status}"),
+            Self::RateLimited {
+                retry_after_s: Some(secs),
+            } => write!(
+                f,
+                "usage endpoint rate limited (HTTP 429, retry after {secs}s)"
+            ),
+            Self::RateLimited {
+                retry_after_s: None,
+            } => {
+                write!(f, "usage endpoint rate limited (HTTP 429)")
+            }
+            Self::UpstreamStatus {
+                status,
+                retry_after_s: Some(secs),
+            } => write!(
+                f,
+                "usage request failed: HTTP {status}, retry after {secs}s"
+            ),
+            Self::UpstreamStatus { status, .. } => write!(f, "usage request failed: HTTP {status}"),
             Self::Redirected { status } => {
                 write!(f, "usage endpoint redirected (HTTP {status}); not followed")
             }
@@ -640,9 +702,9 @@ impl From<&UsageError> for UsageErrorSummary {
     fn from(e: &UsageError) -> Self {
         let http_status = match e {
             UsageError::Unauthorized { status }
-            | UsageError::UpstreamStatus { status }
+            | UsageError::UpstreamStatus { status, .. }
             | UsageError::Redirected { status } => Some(*status),
-            UsageError::RateLimited => Some(429),
+            UsageError::RateLimited { .. } => Some(429),
             _ => None,
         };
         Self {
@@ -768,11 +830,11 @@ fn epoch_ms_from_number(n: f64) -> Option<u64> {
 pub fn duration_label(secs: u64) -> String {
     if secs == 0 {
         "0s".into()
-    } else if secs % SECS_PER_DAY == 0 {
+    } else if secs.is_multiple_of(SECS_PER_DAY) {
         format!("{}d", secs / SECS_PER_DAY)
-    } else if secs % SECS_PER_HOUR == 0 {
+    } else if secs.is_multiple_of(SECS_PER_HOUR) {
         format!("{}h", secs / SECS_PER_HOUR)
-    } else if secs % SECS_PER_MINUTE == 0 {
+    } else if secs.is_multiple_of(SECS_PER_MINUTE) {
         format!("{}m", secs / SECS_PER_MINUTE)
     } else {
         format!("{secs}s")
@@ -848,6 +910,13 @@ fn anthropic_scope(key: &str) -> WindowScope {
     }
 }
 
+/// Whether Anthropic's `extra_usage` entry becomes a window: `is_enabled` is
+/// `true` and `utilization` is a JSON number (0 counts).
+fn extra_usage_shown(val: &Value) -> bool {
+    val.get("is_enabled").and_then(Value::as_bool) == Some(true)
+        && val.get("utilization").is_some_and(Value::is_number)
+}
+
 /// Parse `GET /api/oauth/usage`. Every object value carrying `utilization`
 /// or `resets_at` is a window; `null` windows are skipped with a note.
 pub fn parse_anthropic_usage(
@@ -860,6 +929,12 @@ pub fn parse_anthropic_usage(
     let mut skipped_null = 0usize;
     let mut unrecognized = 0usize;
     for (key, val) in &map {
+        // Paid extra usage is a window only when the account has it switched
+        // on and reports a number; otherwise the entry is omitted, with no
+        // note: a feature that is off is not a gap in the reading.
+        if key == "extra_usage" && !extra_usage_shown(val) {
+            continue;
+        }
         match val {
             Value::Object(w) if w.contains_key("utilization") || w.contains_key("resets_at") => {
                 let used_percent = UsedPercent::from_json(w.get("utilization"));
@@ -1469,7 +1544,7 @@ impl Default for UsageFetchOptions {
 }
 
 /// True for `http(s)://127.0.0.1…`, `localhost`, `[::1]`.
-fn is_loopback_url(raw: &str) -> bool {
+pub(crate) fn is_loopback_url(raw: &str) -> bool {
     let Ok(url) = url::Url::parse(raw) else {
         return false;
     };
@@ -1560,6 +1635,23 @@ async fn read_body_capped(resp: reqwest::Response, cap: usize) -> Result<String,
     })
 }
 
+/// Longest `Retry-After` we record; a larger value is clamped to it.
+const MAX_RETRY_AFTER_SECS: u64 = 24 * 60 * 60;
+
+/// The delta-seconds form of `Retry-After` (an HTTP-date or garbage is
+/// ignored), clamped to [`MAX_RETRY_AFTER_SECS`]. Only the header is read;
+/// the body stays unread.
+fn retry_after_secs(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .map(|secs| secs.min(MAX_RETRY_AFTER_SECS))
+}
+
 /// Send one pinned GET; classify status; return the capped body text.
 async fn get_json_text(
     client: &UsageClient,
@@ -1589,12 +1681,17 @@ async fn get_json_text(
             return Err(UsageError::Unauthorized { status });
         }
         429 => {
+            let retry_after_s = retry_after_secs(resp.headers());
             drop(resp);
-            return Err(UsageError::RateLimited);
+            return Err(UsageError::RateLimited { retry_after_s });
         }
         _ => {
+            let retry_after_s = retry_after_secs(resp.headers());
             drop(resp);
-            return Err(UsageError::UpstreamStatus { status });
+            return Err(UsageError::UpstreamStatus {
+                status,
+                retry_after_s,
+            });
         }
     }
     read_body_capped(resp, opts.max_body_bytes).await
@@ -1801,12 +1898,66 @@ mod tests {
         assert_eq!(s.model_availability[0].model, "sonnet");
         assert_eq!(s.model_availability[0].availability, Availability::Exhausted);
         assert!(s.notes.iter().any(|n| n == "null windows skipped"));
-        assert!(s.notes.iter().any(|n| n == "unrecognized fields ignored"));
+        // The fixture's only other entry is a disabled extra_usage: omitted,
+        // and not reported as an unrecognized field.
+        assert!(s.window("extra_usage").is_none());
+        assert!(!s.notes.iter().any(|n| n == "unrecognized fields ignored"));
         assert_eq!(s.limit_reached, None);
         // Account-level capacity: 12.5% and 60% → proven.
         assert!(s.has_proven_capacity(T0 + 1000, 60_000));
         assert_eq!(s.longest_account_window().unwrap().id, "seven_day");
         assert_eq!(s.earliest_reset_at(), epoch_ms_from_rfc3339("2025-09-20T22:00:00Z"));
+    }
+
+    /// Paid extra usage is a window only when the account has it switched on
+    /// and reports a numeric utilization (0 counts). Every other shape is
+    /// omitted with no note, so no status row can show it.
+    #[test]
+    fn anthropic_extra_usage_is_kept_only_when_enabled_with_a_numeric_utilization() {
+        let parse = |extra: &str| {
+            let body = format!(
+                r#"{{"five_hour": {{"utilization": 10, "resets_at": "2025-09-20T22:00:00Z"}}, "extra_usage": {extra}}}"#
+            );
+            parse_anthropic_usage(&body, "a", T0).unwrap()
+        };
+        for omitted in [
+            r#"{"is_enabled": false, "utilization": 0}"#,
+            r#"{"is_enabled": false, "utilization": null}"#,
+            r#"{"is_enabled": false, "monthly_limit": null, "used_credits": null, "utilization": null}"#,
+            r#"{"is_enabled": false}"#,
+            r#"{"is_enabled": true, "utilization": null}"#,
+            r#"{"is_enabled": true, "utilization": "42"}"#,
+            r#"{"is_enabled": true}"#,
+            r#"{"is_enabled": "true", "utilization": 7}"#,
+            r#"{"utilization": 7}"#,
+            "null",
+        ] {
+            let s = parse(omitted);
+            assert!(s.window("extra_usage").is_none(), "{omitted}");
+            assert_eq!(s.windows.len(), 1, "{omitted}");
+            assert!(s.notes.is_empty(), "{omitted}: {:?}", s.notes);
+        }
+        for (shown, percent) in [
+            (r#"{"is_enabled": true, "utilization": 0}"#, 0.0),
+            (
+                r#"{"is_enabled": true, "monthly_limit": 5000, "used_credits": 2100, "utilization": 42}"#,
+                42.0,
+            ),
+        ] {
+            let s = parse(shown);
+            let w = s.window("extra_usage").unwrap_or_else(|| panic!("{shown}"));
+            assert_eq!(w.used_percent.valid(), Some(percent), "{shown}");
+            assert_eq!(w.scope, WindowScope::Feature { feature: "extra_usage".into() });
+            assert!(s.notes.is_empty(), "{shown}: {:?}", s.notes);
+        }
+        // Any other unrecognized entry is still noted.
+        let s = parse_anthropic_usage(
+            r#"{"five_hour": {"utilization": 10}, "extra_usage": {"is_enabled": false}, "new_counter": 3}"#,
+            "a",
+            T0,
+        )
+        .unwrap();
+        assert!(s.notes.iter().any(|n| n == "unrecognized fields ignored"));
     }
 
     #[test]
@@ -2337,7 +2488,11 @@ mod tests {
             UsageError::InvalidEndpointOverride.into_broker_error(),
             BrokerError::Denied(_)
         ));
-        let v = serde_json::to_value(UsageError::UpstreamStatus { status: 502 }).unwrap();
+        let v = serde_json::to_value(UsageError::UpstreamStatus {
+            status: 502,
+            retry_after_s: None,
+        })
+        .unwrap();
         assert_eq!(v, serde_json::json!({"kind":"upstream_status","status":502}));
         assert!(!supports_usage(OAuthProviderId::GitHubCopilot));
         assert!(!supports_usage(OAuthProviderId::GoogleGemini));
@@ -2594,10 +2749,74 @@ mod tests {
         use axum::routing::get;
         let hostile = "{\"error\":\"leak-me-ZZZ\",\"token\":\"sk-ant-secret\"}";
         let app = axum::Router::new()
-            .route("/401", get(move || async move { (axum::http::StatusCode::UNAUTHORIZED, hostile) }))
-            .route("/403", get(move || async move { (axum::http::StatusCode::FORBIDDEN, hostile) }))
-            .route("/429", get(move || async move { (axum::http::StatusCode::TOO_MANY_REQUESTS, hostile) }))
-            .route("/500", get(move || async move { (axum::http::StatusCode::INTERNAL_SERVER_ERROR, hostile) }))
+            .route(
+                "/401",
+                get(move || async move { (axum::http::StatusCode::UNAUTHORIZED, hostile) }),
+            )
+            .route(
+                "/403",
+                get(move || async move { (axum::http::StatusCode::FORBIDDEN, hostile) }),
+            )
+            .route(
+                "/429",
+                get(move || async move { (axum::http::StatusCode::TOO_MANY_REQUESTS, hostile) }),
+            )
+            .route(
+                "/429r",
+                get(move || async move {
+                    (
+                        axum::http::StatusCode::TOO_MANY_REQUESTS,
+                        [("retry-after", "120")],
+                        hostile,
+                    )
+                }),
+            )
+            .route(
+                "/429big",
+                get(move || async move {
+                    (
+                        axum::http::StatusCode::TOO_MANY_REQUESTS,
+                        [("retry-after", "999999999")],
+                        hostile,
+                    )
+                }),
+            )
+            .route(
+                "/429date",
+                get(move || async move {
+                    (
+                        axum::http::StatusCode::TOO_MANY_REQUESTS,
+                        [("retry-after", "Wed, 21 Oct 2015 07:28:00 GMT")],
+                        hostile,
+                    )
+                }),
+            )
+            .route(
+                "/500",
+                get(
+                    move || async move { (axum::http::StatusCode::INTERNAL_SERVER_ERROR, hostile) },
+                ),
+            )
+            .route(
+                "/503r",
+                get(move || async move {
+                    (
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                        [("retry-after", "30")],
+                        hostile,
+                    )
+                }),
+            )
+            .route(
+                "/503date",
+                get(move || async move {
+                    (
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                        [("retry-after", "Wed, 21 Oct 2015 07:28:00 GMT")],
+                        hostile,
+                    )
+                }),
+            )
             .route(
                 "/302",
                 get(move || async move {
@@ -2610,11 +2829,56 @@ mod tests {
             );
         let url = spawn(app).await;
         let client = UsageClient::new().unwrap();
-        let cases: [(&str, UsageError); 5] = [
+        let cases: [(&str, UsageError); 10] = [
             ("401", UsageError::Unauthorized { status: 401 }),
             ("403", UsageError::Unauthorized { status: 403 }),
-            ("429", UsageError::RateLimited),
-            ("500", UsageError::UpstreamStatus { status: 500 }),
+            (
+                "429",
+                UsageError::RateLimited {
+                    retry_after_s: None,
+                },
+            ),
+            (
+                "429r",
+                UsageError::RateLimited {
+                    retry_after_s: Some(120),
+                },
+            ),
+            (
+                "429big",
+                UsageError::RateLimited {
+                    retry_after_s: Some(86_400),
+                },
+            ),
+            (
+                "429date",
+                UsageError::RateLimited {
+                    retry_after_s: None,
+                },
+            ),
+            (
+                "500",
+                UsageError::UpstreamStatus {
+                    status: 500,
+                    retry_after_s: None,
+                },
+            ),
+            // r2 item 6: a 5xx keeps its delta-seconds Retry-After too; an
+            // HTTP-date is still ignored.
+            (
+                "503r",
+                UsageError::UpstreamStatus {
+                    status: 503,
+                    retry_after_s: Some(30),
+                },
+            ),
+            (
+                "503date",
+                UsageError::UpstreamStatus {
+                    status: 503,
+                    retry_after_s: None,
+                },
+            ),
             ("302", UsageError::Redirected { status: 302 }),
         ];
         for (path, expected) in cases {
@@ -2625,6 +2889,14 @@ mod tests {
             secret_free(&err.to_string(), &["leak-me", "sk-ant", "tok-ZZ"]);
             secret_free(&serde_json::to_string(&err).unwrap(), &["leak-me", "sk-ant"]);
         }
+        // The selection report keeps that Retry-After with the 503.
+        let failure = UsageError::UpstreamStatus {
+            status: 503,
+            retry_after_s: Some(30),
+        }
+        .failure();
+        assert_eq!(failure.http_status, Some(503));
+        assert_eq!(failure.retry_after_s, Some(30));
     }
 
     #[tokio::test]

@@ -1117,6 +1117,7 @@ mod tests {
         assert!(matches!(err, SetupError::NotFound { .. }), "got {err:?}");
     }
 
+    #[cfg(unix)]
     #[test]
     fn resolve_rejects_symlink_pointing_outside_plugin_dir() {
         // Symlinks that escape via canonicalize should be caught by the
@@ -1150,6 +1151,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn run_setup_succeeds_for_simple_script() {
         let dir = tempfile::tempdir().unwrap();

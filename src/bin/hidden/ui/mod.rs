@@ -75,7 +75,7 @@ fn draw_crt_overlay(f: &mut Frame, app: &App) {
         }
     }
 
-    if app.frame % 4 == 0 {
+    if app.frame.is_multiple_of(4) {
         let seed = app.frame as usize;
         let gx = ((seed * 7919) % area.width as usize) as u16 + area.left();
         let gy = ((seed * 1049) % area.height as usize) as u16 + area.top();
@@ -113,7 +113,7 @@ fn draw_game_over(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let my = h / 2 - 1;
     let ay = area.top() + my as u16;
     if ay < area.bottom() {
-        let blink = (app.frame / 20) % 2 == 0;
+        let blink = (app.frame / 20).is_multiple_of(2);
         let mut cx = area.left() + mx as u16;
         for ch in msg.chars() {
             if cx >= area.right() {

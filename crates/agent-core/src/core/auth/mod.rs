@@ -13,6 +13,7 @@ use tokio::sync::oneshot;
 
 pub mod account;
 pub mod anthropic_profile;
+pub mod auth_state;
 pub mod aws_bedrock;
 pub mod azure_openai;
 pub mod broker;
@@ -37,9 +38,14 @@ pub mod quota_policy;
 pub mod static_providers;
 pub mod auto_selection;
 pub use auto_selection::{AutoSelectionPolicy, PlanRow, SelectionPlan};
+pub use auth_state::{AuthStateQuery, AuthStateReport, AUTH_STATE_SCHEMA_VERSION};
+pub use quota_policy::{
+    AccountFailure, AccountFailureKind, ObservationFailure, SelectionFailure, SelectionFailureKind,
+};
 mod storage;
 mod token;
 pub mod usage;
+pub mod usage_reads;
 mod xai;
 
 // ── Re-exports ──────────────────────────────────────────────────────────────────
@@ -53,11 +59,11 @@ pub use anthropic_profile::{
     fetch_anthropic_profile, parse_anthropic_profile, AnthropicProfile, ANTHROPIC_PROFILE_URL,
 };
 pub use broker::{
-    broker_from_source, global_broker, global_broker_install_count, preflight_cloud_capability,
-    set_global_broker, AccessToken, BrokerError, CredentialBroker, CredentialKind, LocalBroker,
-    PinnedToken, ProviderStatus, ProxyByteStream, ProxyMethod, ProxyRequest, ProxyResponse,
-    RemoteBroker, StaticKeyStatus, MAX_PROXY_REQUEST_BYTES, MAX_PROXY_RESPONSE_BYTES,
-    MAX_UPSTREAM_ERROR_BYTES, PROXY_REQUEST_TIMEOUT,
+    broker_from_source, global_broker, global_broker_install_count, local_auth_state,
+    preflight_cloud_capability, set_global_broker, AccessToken, BrokerError, CredentialBroker,
+    CredentialKind, LocalBroker, PinnedToken, ProviderStatus, ProxyByteStream, ProxyMethod,
+    ProxyRequest, ProxyResponse, RemoteBroker, StaticKeyStatus, MAX_PROXY_REQUEST_BYTES,
+    MAX_PROXY_RESPONSE_BYTES, MAX_UPSTREAM_ERROR_BYTES, PROXY_REQUEST_TIMEOUT,
 };
 pub use broker_token::{
     is_loopback_endpoint, load_or_create_broker_token, local_broker_token_path,
@@ -173,7 +179,13 @@ pub struct CallbackResult {
 /// `expires` (`now + expires_in*1000 - 5min`). So a bare `now >= expires` check
 /// already fires ~5 minutes before the credential actually dies at the provider.
 pub fn is_token_expired(creds: &OAuthCredentials) -> bool {
-    now_millis() >= creds.expires
+    token_expired_at(creds, now_millis())
+}
+
+/// The expiry rule against a given clock reading: a token is expired from
+/// its `expires` millisecond on.
+fn token_expired_at(creds: &OAuthCredentials, now_ms: u64) -> bool {
+    now_ms >= creds.expires
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
@@ -490,10 +502,9 @@ mod tests {
 
     #[test]
     fn test_is_token_expired_edge_cases() {
-        let current_time = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64;
+        // Pin the clock: against the live one, "1 ms in the future" has
+        // already passed by the time a loaded CI runner checks it.
+        let current_time = now_millis();
 
         let exactly_now_creds = OAuthCredentials {
             auth_type: "oauth".to_string(),
@@ -502,7 +513,7 @@ mod tests {
             expires: current_time,
             account_id: None,
         };
-        assert!(is_token_expired(&exactly_now_creds));
+        assert!(token_expired_at(&exactly_now_creds, current_time));
 
         let one_ms_future_creds = OAuthCredentials {
             auth_type: "oauth".to_string(),
@@ -511,7 +522,8 @@ mod tests {
             expires: current_time + 1,
             account_id: None,
         };
-        assert!(!is_token_expired(&one_ms_future_creds));
+        assert!(!token_expired_at(&one_ms_future_creds, current_time));
+        assert!(token_expired_at(&one_ms_future_creds, current_time + 1));
     }
 
     #[test]

@@ -3,7 +3,6 @@
 use std::path::Path;
 
 use chrono;
-use synaps_cli::list_recent_sessions;
 
 use super::app::{App, ChatMessage};
 use synaps_cli::extensions::commands::CommandOutputEvent;
@@ -14,8 +13,10 @@ use synaps_cli::extensions::runtime::InvokeCommandEvent;
 /// `CommandRegistry::all_commands()` for autocomplete and prefix resolution.
 #[allow(dead_code)]
 /// Commands that work while streaming.
-pub(super) const STREAMING_COMMANDS: &[&str] =
-    &["gamba", "theme", "quit", "exit", "attachments", "detach", "watch"];
+pub(super) const STREAMING_COMMANDS: &[&str] = &[
+    "gamba", "theme", "quit", "exit", "attachments", "detach", "watch", "settings", "clients", "takeover",
+    "sessions",
+];
 
 /// Merged list of built-ins + registered skill names (deduped, sorted).
 /// Used for autocomplete and prefix resolution.
@@ -48,6 +49,11 @@ pub(super) enum CommandAction {
     OpenEffort,
     /// Open the /settings modal.
     OpenSettings,
+    /// `/clients` typed mid-stream: [`clients`] needs the session link,
+    /// which [`handle_streaming_command`] doesn't have.
+    Clients,
+    /// Open the /sessions modal (Live / Past).
+    OpenSessions,
     /// Open the /plugins modal.
     OpenPlugins,
     /// Open the searchable /help find lightbox.
@@ -96,6 +102,9 @@ pub(super) enum CommandAction {
     SidecarToggle { plugin_id: Option<String> },
     /// Show sidecar subsystem status (`/sidecar status`).
     SidecarStatus { plugin_id: Option<String> },
+    /// `/takeover` typed mid-stream: [`takeover`] needs the session link,
+    /// which [`handle_streaming_command`] doesn't have.
+    TakeOver,
 }
 
 #[derive(Debug, Clone)]
@@ -345,6 +354,138 @@ pub(super) fn resolve_prefix(raw: &str, commands: &[String]) -> String {
     raw.to_string()
 }
 
+/// `/pin` in an in-process TUI: the session ends with this process anyway.
+pub(super) const PIN_IN_PROCESS: &str = "pin: only applies to a daemon session (synaps --attach)";
+
+pub(super) const TAKEOVER_IN_PROCESS: &str =
+    "takeover: nothing to take over; an in-process session has one client and it owns input";
+pub(super) const TAKEOVER_OBSERVING: &str =
+    "takeover: this client is observing (--observe) and never owns input; attach without --observe to take it";
+pub(super) const TAKEOVER_ALREADY: &str = "takeover: you already own input";
+pub(super) const TAKEOVER_SHARED: &str = "takeover: input is shared, so every client can already type; \
+     this one is now the active client (it gets input back first after a daemon reload)";
+pub(super) const TAKEOVER_SHARED_ALREADY: &str =
+    "takeover: input is shared, so every client can already type; this one is already the active client";
+
+/// `/takeover`: take input ownership from the client that holds it, in
+/// place (the in-session form of `synaps --attach --takeover`). The session
+/// answers with `InputOwnerChanged` ("you own input" toast; the old owner
+/// gets "input taken over") or, from an observer, `Refused`. Works mid-turn:
+/// the turn keeps running, only who drives the session changes.
+pub(super) async fn takeover(app: &mut App, link: &mut super::session_link::SessionLink) {
+    let t = link.transport();
+    let shared = t.client_input() == agent_engine::session::ClientInput::Shared;
+    let note = if t.daemon_pid() == 0 {
+        Some(TAKEOVER_IN_PROCESS)
+    } else if t.mode() == agent_engine::session::AttachMode::Observe {
+        Some(TAKEOVER_OBSERVING)
+    } else if t.input_owner() == Some(t.client_id()) {
+        Some(if shared { TAKEOVER_SHARED_ALREADY } else { TAKEOVER_ALREADY })
+    } else {
+        None
+    };
+    if let Some(note) = note {
+        app.push_msg(ChatMessage::System(note.to_string()));
+        return;
+    }
+    match link.send(agent_engine::session::SessionCommand::TakeInput).await {
+        // Shared mode shows no toast when the active client moves: say it here.
+        Ok(()) if shared => app.push_msg(ChatMessage::System(TAKEOVER_SHARED.to_string())),
+        Ok(()) => {}
+        Err(e) => app.push_msg(ChatMessage::Error(format!("takeover failed: {e}"))),
+    }
+}
+
+/// `/pin [on|off|status]`, alias `/keep-warm on|off`: the daemon session's
+/// pin (`KeepWarm`), not `/keepwarm` (prompt-cache pings). `on|off` is sent
+/// to the session, whose notice (or refusal, for a non-owner) arrives as an
+/// event. The status asks the session (`Status.pinned`) rather than track it
+/// here: another client or `synaps daemon pin` may have changed it.
+async fn pin_command(cmd: &str, arg: &str, app: &mut App, link: &mut super::session_link::SessionLink) {
+    if link.transport().daemon_pid() == 0 {
+        app.push_msg(ChatMessage::System(PIN_IN_PROCESS.to_string()));
+        return;
+    }
+    match arg.trim() {
+        a @ ("on" | "off") => {
+            let on = a == "on";
+            if let Err(e) = link.send(agent_engine::session::SessionCommand::KeepWarm { on }).await {
+                app.push_msg(ChatMessage::Error(format!("pin failed: {e}")));
+            }
+        }
+        "" | "status" => match link.query(agent_engine::session::SessionQuery::Status).await {
+            Ok(value) => match value["pinned"].as_bool() {
+                Some(true) => app.push_msg(ChatMessage::System(
+                    agent_engine::session::actor::PIN_ON_NOTICE.to_string(),
+                )),
+                Some(false) => app.push_msg(ChatMessage::System(
+                    "not pinned: this session parks when idle. /pin on keeps it loaded.".to_string(),
+                )),
+                None => app.push_msg(ChatMessage::Error(
+                    "pin: this daemon does not report the pin; `synaps daemon reload` updates it".to_string(),
+                )),
+            },
+            Err(e) => app.push_msg(ChatMessage::Error(format!("pin failed: {e}"))),
+        },
+        _ => app.push_msg(ChatMessage::Error(format!("usage: /{cmd} [on|off|status]"))),
+    }
+}
+
+/// `/clients` in an in-process session: there is no daemon, only this TUI.
+pub(super) const CLIENTS_IN_PROCESS: &str = "clients: in-process session; this TUI is its only client";
+
+/// `/clients`: every client attached to this session, from the transport's
+/// roster (attach snapshot + `ClientJoined`/`ClientLeft`), one line each:
+/// name and id, kind, `drive`/`observe`, who owns input (with
+/// `client_input = shared`: who is active), which is you, and how long it
+/// has been attached.
+pub(super) fn clients(app: &mut App, link: &super::session_link::SessionLink) {
+    let t = link.transport();
+    if t.daemon_pid() == 0 {
+        app.push_msg(ChatMessage::System(CLIENTS_IN_PROCESS.to_string()));
+        return;
+    }
+    let roster = t.roster();
+    let shared = t.client_input() == agent_engine::session::ClientInput::Shared;
+    let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+    let n = roster.clients().len();
+    let mut lines = vec![format!(
+        "{n} client{} attached{}",
+        if n == 1 { "" } else { "s" },
+        if shared { " · input shared (every drive client types; active = typed last)" } else { "" }
+    )];
+    for c in roster.clients() {
+        let mut row = format!(
+            "  {:<20} {:<7} {}",
+            c.label(),
+            c.kind.default_name(),
+            if c.mode == agent_engine::session::AttachMode::Observe { "observe" } else { "drive" },
+        );
+        if t.input_owner() == Some(c.id) {
+            // Shared input: everyone (but observers) types; this one did last.
+            row.push_str(if shared { " · active" } else { " · owns input" });
+        }
+        if c.id == t.client_id() {
+            row.push_str(" · you");
+        }
+        if c.attached_at_ms > 0 {
+            row.push_str(&format!(" · {}", attached_for(now_ms.saturating_sub(c.attached_at_ms))));
+        }
+        lines.push(row);
+    }
+    app.push_msg(ChatMessage::System(lines.join("\n")));
+}
+
+/// `attached 3m`, `attached 2h 5m`: how long a client has been attached.
+fn attached_for(ms: u64) -> String {
+    let mins = ms / 60_000;
+    match mins {
+        0 => "attached just now".to_string(),
+        1..=59 => format!("attached {mins}m"),
+        _ => format!("attached {}h {}m", mins / 60, mins % 60),
+    }
+}
+
 /// Handle a slash command when NOT streaming. Its notices show in the view
 /// it was typed in ([`super::watch::begin_command`]).
 pub(super) async fn handle_command(
@@ -455,7 +596,7 @@ async fn run_command(
         };
     }
     if synaps_cli::engine::commands::evaluate_engine_command(cmd, arg).is_some()
-        || matches!(cmd, "context" | "trace" | "memory" | "workers" | "confirms" | "auth")
+        || matches!(cmd, "context" | "trace" | "memory" | "workers" | "confirms" | "auth" | "close")
     {
         use synaps_cli::engine::commands::persist_to_config;
         let value = match link.engine_command(cmd, arg).await {
@@ -656,68 +797,7 @@ async fn run_command(
                 )));
             }
         }
-        "sessions" => match list_recent_sessions(20) {
-            Ok(sessions) if sessions.is_empty() => {
-                app.push_msg(ChatMessage::System("no saved sessions".to_string()));
-            }
-            Ok(sessions) => {
-                app.push_msg(ChatMessage::System(format!(
-                    "{} session(s):",
-                    sessions.len()
-                )));
-                for s in sessions.iter().take(20) {
-                    let active_marker = if s.id == app.session.id { " ●" } else { "" };
-                    let name_tag = s
-                        .name
-                        .as_deref()
-                        .map(|n| format!(" [@{}]", n))
-                        .unwrap_or_default();
-                    let age = {
-                        let secs = chrono::Utc::now()
-                            .signed_duration_since(s.updated_at)
-                            .num_seconds();
-                        if secs < 3600 {
-                            format!("{}m ago", secs / 60)
-                        } else if secs < 86400 {
-                            format!("{}h ago", secs / 3600)
-                        } else {
-                            format!("{}d ago", secs / 86400)
-                        }
-                    };
-                    let title_display = if s.title.is_empty() {
-                        "(no title)".to_string()
-                    } else {
-                        s.title.chars().take(60).collect::<String>()
-                    };
-                    // Last 4 chars — more recognizable than a prefix
-                    let id_short = &s.id[s.id.len().saturating_sub(4)..];
-                    let msg_str = if s.message_count > 0 {
-                        format!("{} msgs · ", s.message_count)
-                    } else {
-                        String::new()
-                    };
-                    // Line 1: identity + meta
-                    app.push_msg(ChatMessage::System(format!(
-                        "  …{}{}{} · {}{}${:.3} · {}",
-                        id_short, active_marker, name_tag,
-                        msg_str, age, s.session_cost, s.model
-                    )));
-                    // Line 2: title
-                    app.push_msg(ChatMessage::System(format!(
-                        "     └ {}",
-                        title_display
-                    )));
-                    // Blank separator between entries
-                    app.push_msg(ChatMessage::System(String::new()));
-                }
-            }
-            Err(e) => {
-                app.push_msg(ChatMessage::Error(format!(
-                    "failed to list sessions: {}",
-                    e
-                )));
-            }
-        },
+        "sessions" => return CommandAction::OpenSessions,
         "resume" => {
             if arg.is_empty() {
                 app.push_msg(ChatMessage::System(
@@ -745,6 +825,9 @@ async fn run_command(
                 }
             }
         }
+        "pin" | "keep-warm" => pin_command(cmd, arg, app, link).await,
+        "clients" => clients(app, link),
+        "takeover" => takeover(app, link).await,
         "keepwarm" => {
             // Prompt-cache keep-warm lives on the actor (task #444):
             // `EngineCommand{keepwarm}` → status / per-session override.
@@ -1423,37 +1506,34 @@ pub(crate) fn build_stats_receipt(
         "0%".to_string()
     };
 
-    // Aggregate counters retain neither request tiers nor model history.
-    // The actual-cost subtotal cannot reconstruct an uncached counterfactual.
+    // Aggregate counters retain neither request tiers nor model history, so
+    // no "saved by cache" figure can be reconstructed: none is shown.
 
     // ── Cost ─────────────────────────────────────────────────────────────
     let session_cost = app.session_cost;
 
     // ── Format ───────────────────────────────────────────────────────────
+    let turns = if turn_count == 1 { "1 turn".to_string() } else { format!("{turn_count} turns") };
     let mut lines = vec![
-        "─── Session Stats ───────────────────────────────".to_string(),
-        format!(
-            "  Session  {:>12}  model: {}",
-            &session_id[..session_id.len().min(12)],
-            model
-        ),
-        format!("  Duration {:>12}  turns: {}", duration_str, turn_count),
+        format!("  Session   {session_id}"),
+        format!("  Model     {model}"),
+        format!("  Duration  {duration_str} \u{00b7} {turns}"),
         String::new(),
         "  Tokens".to_string(),
-        format!("    input        {:>10}", fmt_tokens(input)),
-        format!("    output       {:>10}", fmt_tokens(output)),
-        format!("    cache read   {:>10}", fmt_tokens(c_read)),
+        format!("    input        {:>8}", fmt_tokens(input)),
+        format!("    output       {:>8}", fmt_tokens(output)),
+        format!("    cache read   {:>8}", fmt_tokens(c_read)),
     ];
 
     if c5 > 0 || c1 > 0 {
         lines.push(format!(
-            "    cache write  {:>10}  (5m: {} / 1h: {})",
+            "    cache write  {:>8}  (5m {} / 1h {})",
             fmt_tokens(c_write),
             fmt_tokens(c5),
             fmt_tokens(c1)
         ));
     } else {
-        lines.push(format!("    cache write  {:>10}", fmt_tokens(c_write)));
+        lines.push(format!("    cache write  {:>8}", fmt_tokens(c_write)));
     }
     // Keep-warm pings are inside the totals above (and the hit rate below);
     // their share is shown so the numbers add up.
@@ -1469,21 +1549,36 @@ pub(crate) fn build_stats_receipt(
     }
 
     lines.push(String::new());
-    lines.push(format!(
-        "  Cache  hit rate {:>9}",
-        hit_rate_str
-    ));
-    lines.push(String::new());
-    lines.push("  Cache savings unavailable: per-request model/tier history not retained".to_string());
-    lines.push(format!("  Cost   ${:.4}", session_cost));
+    lines.push(format!("  Cache hit rate {:>8}", hit_rate_str));
+    lines.push(format!("  Cost           {:>8}", format!("${session_cost:.4}")));
     if app.keepwarm_cost > 0.0 {
         lines.push(format!(
-            "         incl. cache keep-warm ${:.4}  (/keepwarm status)",
+            "    incl. keep-warm ${:.4} (/keepwarm status)",
             app.keepwarm_cost
         ));
     }
-    lines.push("─────────────────────────────────────────────────".to_string());
-    lines.join("\n")
+    stats_box(lines)
+}
+
+/// Frame `/stats` body lines between rules exactly as wide as the widest
+/// line (min 32 cells): the rules fit the content, never the other way.
+fn stats_box(body: Vec<String>) -> String {
+    const TITLE: &str = "\u{2500}\u{2500}\u{2500} Session Stats ";
+    let width = body
+        .iter()
+        .map(|l| super::text_metrics::width(l))
+        .max()
+        .unwrap_or(0)
+        .max(32);
+    let top = format!(
+        "{TITLE}{}",
+        "\u{2500}".repeat(width.saturating_sub(super::text_metrics::width(TITLE)))
+    );
+    let mut out = Vec::with_capacity(body.len() + 2);
+    out.push(top);
+    out.extend(body);
+    out.push("\u{2500}".repeat(width));
+    out.join("\n")
 }
 
 /// Format a token count with K/M suffix.
@@ -1524,6 +1619,13 @@ pub(super) fn handle_streaming_command(
             CommandAction::None
         }
         "quit" | "exit" => CommandAction::Quit,
+        "clients" => CommandAction::Clients,
+        // Mid-turn rules live with the rows (settings::mid_turn_refusal,
+        // helpers::apply_setting's next-turn notice).
+        "settings" => CommandAction::OpenSettings,
+        "takeover" => CommandAction::TakeOver,
+        // Read-only list + pin/close on OTHER sessions: safe mid-turn.
+        "sessions" => CommandAction::OpenSessions,
         "attachments" => {
             let summaries = app.pending_attachments.summaries();
             if summaries.is_empty() {
@@ -1570,6 +1672,50 @@ pub(super) fn handle_streaming_command(
             CommandAction::None
         }
         _ => CommandAction::None, // unknown — handled by caller as steer/queue
+    }
+}
+
+/// What a line typed mid-turn resolves to (the `StreamingInput` arm).
+pub(super) enum StreamingSlash {
+    /// A streaming command ran; the caller performs its `CommandAction`
+    /// (`None` when it finished in place, e.g. `/theme`).
+    Ran(CommandAction),
+    /// A known command that can't run mid-turn: the refusal notice is
+    /// already in the transcript; nothing is sent to the model.
+    Refused,
+    /// Plain text or unknown slash text: send it as a steer.
+    Steer,
+}
+
+/// Resolve input typed while a turn streams. Known slash commands never
+/// leak into the stream as steering text: they run (the streaming set) or
+/// are refused with a notice.
+pub(super) fn resolve_streaming_input(
+    input: &str,
+    app: &mut App,
+    registry: &synaps_cli::skills::registry::CommandRegistry,
+) -> StreamingSlash {
+    let Some(rest) = input.strip_prefix('/') else {
+        return StreamingSlash::Steer;
+    };
+    let raw_cmd = rest.split_whitespace().next().unwrap_or("");
+    let streaming_cmds = to_owned_commands(STREAMING_COMMANDS);
+    let cmd = resolve_prefix(raw_cmd, &streaming_cmds);
+    match handle_streaming_command(&cmd, input, app) {
+        CommandAction::None if !is_streaming_command(&cmd) => {
+            let all_cmds = all_commands_with_skills(registry);
+            let resolved_full = resolve_prefix(raw_cmd, &all_cmds);
+            if all_cmds.iter().any(|c| c == &resolved_full) {
+                app.push_msg(super::app::ChatMessage::System(format!(
+                    "/{} can't run while streaming — press Esc to cancel first",
+                    resolved_full
+                )));
+                StreamingSlash::Refused
+            } else {
+                StreamingSlash::Steer
+            }
+        }
+        action => StreamingSlash::Ran(action),
     }
 }
 
@@ -1703,6 +1849,279 @@ mod tests {
         }
     }
 
+    /// `/close` is the session's to run (it ends it): the TUI forwards it
+    /// as the `close` engine command, shows the reply, and the loop then
+    /// meets the session's `Ended` (which `stream_handler` records for the
+    /// exit line). A refusal is shown as an error and nothing ends.
+    #[tokio::test]
+    async fn close_is_sent_to_the_session_which_then_ends() {
+        let mut app = crate::tui::app::App::new(synaps_cli::Session::new("test", "medium", None));
+        let mut link = scripted_link(synaps_cli::Runtime::new().await.unwrap());
+        let system_prompt_path = PathBuf::from("/tmp/synaps-test-system-prompt");
+        let registry = Arc::new(CommandRegistry::new_with_plugins(&[], vec![], vec![]));
+        let keybinds = synaps_cli::skills::keybinds::KeybindRegistry::new();
+
+        let action =
+            handle_command("close", "later", &mut app, &mut link, &system_prompt_path, &registry, &keybinds)
+                .await;
+        assert!(matches!(action, CommandAction::None));
+        assert!(app.transcript.messages().iter().any(|m| matches!(
+            &m.msg,
+            crate::tui::app::ChatMessage::Error(s) if s == "usage: /close [force]"
+        )));
+
+        let action =
+            handle_command("close", "", &mut app, &mut link, &system_prompt_path, &registry, &keybinds).await;
+        assert!(matches!(action, CommandAction::None), "the session ends it, not the TUI");
+        assert!(app.transcript.messages().iter().any(|m| matches!(
+            &m.msg,
+            crate::tui::app::ChatMessage::System(s)
+                if s.starts_with("closing session ") && s.contains("--attach --continue")
+        )));
+        let env = link.next_event().await.expect("the session's end");
+        assert!(matches!(
+            env.event,
+            agent_engine::session::SessionEventWire::Ended {
+                reason: agent_engine::session::EndReason::ClientQuit
+            }
+        ));
+        assert!(synaps_cli::skills::BUILTIN_COMMANDS.contains(&"close"));
+    }
+
+    /// `/pin on|off` is the session's pin: the TUI sends `KeepWarm` and the
+    /// session's notice follows; `/pin` asks the session for its state;
+    /// `/keep-warm` is the same command, never the prompt-cache `/keepwarm`.
+    #[tokio::test]
+    async fn pin_sends_keep_warm_to_a_daemon_session_and_reports_its_state() {
+        let transport = crate::tui::testing::scripted::ScriptedTransport::new(synaps_cli::Runtime::new().await.unwrap())
+            .with_daemon_pid(4242);
+        let log = Arc::clone(&transport.log);
+        let mut link = crate::tui::session_link::SessionLink::new(Box::new(transport));
+        let mut app = crate::tui::app::App::new(synaps_cli::Session::new("test", "medium", None));
+        let system_prompt_path = PathBuf::from("/tmp/synaps-test-system-prompt");
+        let registry = Arc::new(CommandRegistry::new_with_plugins(&[], vec![], vec![]));
+        let keybinds = synaps_cli::skills::keybinds::KeybindRegistry::new();
+        let has_system = |app: &crate::tui::app::App, want: &str| {
+            app.transcript.messages().iter().any(|m| matches!(&m.msg, ChatMessage::System(s) if s.starts_with(want)))
+        };
+
+        handle_command("pin", "on", &mut app, &mut link, &system_prompt_path, &registry, &keybinds).await;
+        let sent = log.lock().unwrap().sent.clone();
+        assert!(sent.iter().any(|c| c == "KeepWarm { on: true }"), "{sent:?}");
+        let env = link.next_event().await.expect("the session's notice");
+        assert!(
+            matches!(env.event, agent_engine::session::SessionEventWire::SystemNotice(ref n) if n.starts_with("pinned:")),
+            "{:?}",
+            env.event
+        );
+        handle_command("pin", "", &mut app, &mut link, &system_prompt_path, &registry, &keybinds).await;
+        assert!(has_system(&app, "pinned: this session stays loaded"));
+
+        handle_command("keep-warm", "off", &mut app, &mut link, &system_prompt_path, &registry, &keybinds).await;
+        let sent = log.lock().unwrap().sent.clone();
+        assert!(sent.iter().any(|c| c == "KeepWarm { on: false }"), "{sent:?}");
+        let env = link.next_event().await.expect("the session's notice");
+        assert!(matches!(env.event, agent_engine::session::SessionEventWire::SystemNotice(ref n) if n.starts_with("unpinned")));
+        handle_command("pin", "status", &mut app, &mut link, &system_prompt_path, &registry, &keybinds).await;
+        assert!(has_system(&app, "not pinned"));
+
+        handle_command("pin", "maybe", &mut app, &mut link, &system_prompt_path, &registry, &keybinds).await;
+        assert!(app.transcript.messages().iter().any(|m| matches!(
+            &m.msg,
+            ChatMessage::Error(s) if s == "usage: /pin [on|off|status]"
+        )));
+        for name in ["pin", "keep-warm", "keepwarm"] {
+            assert!(synaps_cli::skills::BUILTIN_COMMANDS.contains(&name), "{name}");
+        }
+        let all = super::to_owned_commands(synaps_cli::skills::BUILTIN_COMMANDS);
+        assert_eq!(resolve_prefix("keep-warm", &all), "keep-warm", "never the prompt-cache /keepwarm");
+        assert_eq!(resolve_prefix("pin", &all), "pin", "not /ping");
+    }
+
+    /// `/clients` lists the roster by name, marks the owner and this
+    /// client, tells drivers from observers, and sends nothing. Mid-stream
+    /// it is a `CommandAction`; in-process it says there's one client.
+    #[tokio::test]
+    async fn clients_lists_the_roster_by_name_and_sends_nothing() {
+        use agent_engine::session::{AttachMode, ClientId, ClientInfo, ClientKind};
+        let info = |id: u64, name: &str, kind: ClientKind, mode: AttachMode| ClientInfo {
+            id: ClientId(id),
+            name: name.to_string(),
+            kind,
+            mode,
+            attached_at_ms: 0,
+        };
+        let transport = crate::tui::testing::scripted::ScriptedTransport::new(synaps_cli::Runtime::new().await.unwrap())
+            .with_daemon_pid(4242)
+            .with_roster(vec![
+                info(1, "terminal", ClientKind::Tui, AttachMode::Mirror),
+                info(2, "dashboard", ClientKind::Attach, AttachMode::Observe),
+            ]);
+        let log = Arc::clone(&transport.log);
+        let mut link = crate::tui::session_link::SessionLink::new(Box::new(transport));
+        let mut app = crate::tui::app::App::new(synaps_cli::Session::new("test", "medium", None));
+        let system_prompt_path = PathBuf::from("/tmp/synaps-test-system-prompt");
+        let registry = Arc::new(CommandRegistry::new_with_plugins(&[], vec![], vec![]));
+        let keybinds = synaps_cli::skills::keybinds::KeybindRegistry::new();
+
+        let action = handle_command("clients", "", &mut app, &mut link, &system_prompt_path, &registry, &keybinds).await;
+        assert!(matches!(action, CommandAction::None));
+        let listing = app
+            .transcript
+            .messages()
+            .iter()
+            .find_map(|m| match &m.msg {
+                ChatMessage::System(s) if s.starts_with("2 clients attached") => Some(s.clone()),
+                _ => None,
+            })
+            .expect("the listing");
+        let rows: Vec<&str> = listing.lines().skip(1).collect();
+        assert_eq!(rows.len(), 2, "{listing}");
+        assert!(rows[0].contains("terminal (#1)") && rows[0].contains("drive"), "{listing}");
+        assert!(rows[0].contains("owns input") && rows[0].contains("you"), "{listing}");
+        assert!(rows[1].contains("dashboard (#2)") && rows[1].contains("observe"), "{listing}");
+        assert!(!rows[1].contains("you") && !rows[1].contains("owns input"), "{listing}");
+        assert!(log.lock().unwrap().sent.is_empty(), "nothing reaches the session");
+
+        // Mid-stream: the dispatcher runs it with the link.
+        assert!(super::STREAMING_COMMANDS.contains(&"clients"));
+        assert!(matches!(super::handle_streaming_command("clients", "/clients", &mut app), CommandAction::Clients));
+        assert!(synaps_cli::skills::BUILTIN_COMMANDS.contains(&"clients"));
+
+        // In-process: one client, no roster to show.
+        let transport = crate::tui::testing::scripted::ScriptedTransport::new(synaps_cli::Runtime::new().await.unwrap());
+        let link = crate::tui::session_link::SessionLink::new(Box::new(transport));
+        super::clients(&mut app, &link);
+        assert!(app.transcript.messages().iter().any(|m| matches!(&m.msg, ChatMessage::System(s) if s == super::CLIENTS_IN_PROCESS)));
+    }
+
+    /// In-process the session ends with the TUI, so there is nothing to pin.
+    #[tokio::test]
+    async fn pin_in_process_says_it_only_applies_to_a_daemon_session() {
+        let transport = crate::tui::testing::scripted::ScriptedTransport::new(synaps_cli::Runtime::new().await.unwrap());
+        let log = Arc::clone(&transport.log);
+        let mut link = crate::tui::session_link::SessionLink::new(Box::new(transport));
+        let mut app = crate::tui::app::App::new(synaps_cli::Session::new("test", "medium", None));
+        let system_prompt_path = PathBuf::from("/tmp/synaps-test-system-prompt");
+        let registry = Arc::new(CommandRegistry::new_with_plugins(&[], vec![], vec![]));
+        let keybinds = synaps_cli::skills::keybinds::KeybindRegistry::new();
+
+        for arg in ["", "on"] {
+            let action =
+                handle_command("pin", arg, &mut app, &mut link, &system_prompt_path, &registry, &keybinds).await;
+            assert!(matches!(action, CommandAction::None));
+        }
+        let said = app
+            .transcript
+            .messages()
+            .iter()
+            .filter(|m| matches!(&m.msg, ChatMessage::System(s) if s == super::PIN_IN_PROCESS))
+            .count();
+        assert_eq!(said, 2);
+        assert!(log.lock().unwrap().sent.is_empty(), "nothing reaches the session");
+    }
+
+    /// `/takeover` from a read-only client sends `TakeInput`; the session's
+    /// `InputOwnerChanged` makes this client the owner. Nothing is sent
+    /// in-process, from an observer or by the owner, and each says why.
+    #[tokio::test]
+    async fn takeover_takes_input_from_another_client_and_says_why_when_it_cannot() {
+        use agent_engine::session::{AttachMode, ClientId, SessionEventWire};
+        let system_prompt_path = PathBuf::from("/tmp/synaps-test-system-prompt");
+        let registry = Arc::new(CommandRegistry::new_with_plugins(&[], vec![], vec![]));
+        let keybinds = synaps_cli::skills::keybinds::KeybindRegistry::new();
+        let scripted = || async {
+            crate::tui::testing::scripted::ScriptedTransport::new(synaps_cli::Runtime::new().await.unwrap())
+        };
+
+        // Read-only mirror, client #7 owns input: takes it.
+        let transport = scripted().await.with_daemon_pid(4242).with_ownership(AttachMode::Mirror, Some(ClientId(7)));
+        let log = Arc::clone(&transport.log);
+        let mut link = crate::tui::session_link::SessionLink::new(Box::new(transport));
+        let mut app = crate::tui::app::App::new(synaps_cli::Session::new("test", "medium", None));
+        let action =
+            handle_command("takeover", "", &mut app, &mut link, &system_prompt_path, &registry, &keybinds).await;
+        assert!(matches!(action, CommandAction::None));
+        assert_eq!(log.lock().unwrap().sent, vec!["TakeInput".to_string()]);
+        let env = link.next_event().await.expect("the owner change");
+        assert!(
+            matches!(
+                env.event,
+                SessionEventWire::InputOwnerChanged { from: Some(ClientId(7)), to: Some(ClientId(1)), .. }
+            ),
+            "{:?}",
+            env.event
+        );
+        assert_eq!(link.transport().input_owner(), Some(ClientId(1)));
+
+        // Now the owner: nothing to send.
+        handle_command("takeover", "", &mut app, &mut link, &system_prompt_path, &registry, &keybinds).await;
+        assert_eq!(log.lock().unwrap().sent.len(), 1, "the owner sends nothing");
+
+        let says = |app: &crate::tui::app::App, want: &str| {
+            app.transcript.messages().iter().any(|m| matches!(&m.msg, ChatMessage::System(s) if s == want))
+        };
+        assert!(says(&app, super::TAKEOVER_ALREADY));
+
+        // In-process and observing: a note, nothing sent.
+        for (transport, note) in [
+            (scripted().await.with_ownership(AttachMode::Mirror, Some(ClientId(7))), super::TAKEOVER_IN_PROCESS),
+            (
+                scripted().await.with_daemon_pid(4242).with_ownership(AttachMode::Observe, Some(ClientId(7))),
+                super::TAKEOVER_OBSERVING,
+            ),
+        ] {
+            let log = Arc::clone(&transport.log);
+            let mut link = crate::tui::session_link::SessionLink::new(Box::new(transport));
+            let mut app = crate::tui::app::App::new(synaps_cli::Session::new("test", "medium", None));
+            handle_command("takeover", "", &mut app, &mut link, &system_prompt_path, &registry, &keybinds).await;
+            assert!(says(&app, note), "{note}");
+            assert!(log.lock().unwrap().sent.is_empty(), "{note}: nothing reaches the session");
+        }
+        assert!(synaps_cli::skills::BUILTIN_COMMANDS.contains(&"takeover"));
+    }
+
+    /// With `client_input = shared` every client already types: `/takeover`
+    /// only makes this one the active client, and says so (no toast comes).
+    #[tokio::test]
+    async fn takeover_with_shared_input_says_it_only_moves_the_active_client() {
+        use agent_engine::session::{AttachMode, ClientId, ClientInput};
+        let system_prompt_path = PathBuf::from("/tmp/synaps-test-system-prompt");
+        let registry = Arc::new(CommandRegistry::new_with_plugins(&[], vec![], vec![]));
+        let keybinds = synaps_cli::skills::keybinds::KeybindRegistry::new();
+        let transport = crate::tui::testing::scripted::ScriptedTransport::new(synaps_cli::Runtime::new().await.unwrap())
+            .with_daemon_pid(4242)
+            .with_ownership(AttachMode::Mirror, Some(ClientId(7)))
+            .with_client_input(ClientInput::Shared);
+        let log = Arc::clone(&transport.log);
+        let mut link = crate::tui::session_link::SessionLink::new(Box::new(transport));
+        assert!(crate::tui::session_link::may_drive(link.transport()), "shared: a non-active mirror drives");
+        let mut app = crate::tui::app::App::new(synaps_cli::Session::new("test", "medium", None));
+        let says = |app: &crate::tui::app::App, want: &str| {
+            app.transcript.messages().iter().any(|m| matches!(&m.msg, ChatMessage::System(s) if s == want))
+        };
+        handle_command("takeover", "", &mut app, &mut link, &system_prompt_path, &registry, &keybinds).await;
+        assert_eq!(log.lock().unwrap().sent, vec!["TakeInput".to_string()]);
+        assert!(says(&app, super::TAKEOVER_SHARED));
+        link.next_event().await.expect("the active marker moves");
+        handle_command("takeover", "", &mut app, &mut link, &system_prompt_path, &registry, &keybinds).await;
+        assert_eq!(log.lock().unwrap().sent.len(), 1, "already active: nothing sent");
+        assert!(says(&app, super::TAKEOVER_SHARED_ALREADY));
+    }
+
+    /// Mid-stream `/takeover` runs (it never steers): the dispatcher gets
+    /// `TakeOver` and sends it over the link.
+    #[tokio::test]
+    async fn takeover_runs_mid_stream() {
+        let registry = CommandRegistry::new_with_plugins(&[], vec![], vec![]);
+        let mut app = crate::tui::app::App::new(synaps_cli::Session::new("test", "medium", None));
+        app.streaming = true;
+        for typed in ["/takeover", "/tak"] {
+            let r = super::resolve_streaming_input(typed, &mut app, &registry);
+            assert!(matches!(r, super::StreamingSlash::Ran(CommandAction::TakeOver)), "{typed}");
+        }
+    }
+
     /// A `SessionLink` over the scripted in-memory actor (A5).
     fn scripted_link(runtime: synaps_cli::Runtime) -> crate::tui::session_link::SessionLink {
         crate::tui::session_link::SessionLink::new(Box::new(
@@ -1809,6 +2228,22 @@ mod tests {
         }
     }
 
+    /// The fixture interpreter. Windows has no `python3`, and a bare `python`
+    /// may be the Store alias stub: take the first real `python.exe` on PATH,
+    /// as `tests/daemon_reload.rs` does.
+    fn fixture_python() -> String {
+        if cfg!(windows) {
+            let path = std::env::var("PATH").unwrap_or_default();
+            path.split(';')
+                .map(|d| std::path::Path::new(d.trim().trim_matches('"')).join("python.exe"))
+                .find(|p| p.is_file() && !p.to_string_lossy().contains("WindowsApps"))
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "python".into())
+        } else {
+            "python3".into()
+        }
+    }
+
     #[tokio::test]
     async fn interactive_plugin_command_invocation_pushes_output_and_updates_tasks() {
         let bus = Arc::new(synaps_cli::extensions::hooks::HookBus::new());
@@ -1821,7 +2256,7 @@ mod tests {
             deferred: None,
             protocol_version: 1,
             runtime: synaps_cli::extensions::manifest::ExtensionRuntime::Process,
-            command: "python3".to_string(),
+            command: fixture_python(),
             setup: None,
             prebuilt: ::std::collections::HashMap::new(),
             args: vec!["tests/fixtures/interactive_command_extension.py".to_string()],
@@ -2463,10 +2898,9 @@ mod tests {
         app.session_cost = 0.0012;
         let runtime = synaps_cli::Runtime::new_headless();
         let receipt = build_stats_receipt(&app, &runtime);
-        assert!(receipt.contains("Cache savings unavailable"));
         assert!(!receipt.contains("saved: $"));
         assert!(receipt.contains("100%"));
-        assert!(receipt.contains("Cost   $0.0012"));
+        assert!(receipt.contains("Cost            $0.0012"), "{receipt}");
     }
 
     /// /stats receipt contains expected section headers.
@@ -2491,11 +2925,42 @@ mod tests {
         assert!(receipt.contains("Tokens"), "missing Tokens section");
         assert!(receipt.contains("Cache"), "missing Cache section");
         assert!(receipt.contains("Cost"), "missing Cost section");
-        assert!(receipt.contains("Cache savings unavailable"));
         assert!(!receipt.contains("saved: $"));
-        assert!(receipt.contains("5m:"), "missing 5m split");
-        assert!(receipt.contains("1h:"), "missing 1h split");
+        assert!(receipt.contains("(5m 600 / 1h 200)"), "missing TTL split: {receipt}");
         assert!(!receipt.contains("keep-warm"), "no keep-warm line without spend");
+    }
+
+    /// C2: the session id was cut to 12 chars, a 70-cell "Cache savings
+    /// unavailable: …" line overflowed the 49-cell rule, and "Cache  hit
+    /// rate" had a double space.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn stats_receipt_shows_full_id_and_stays_inside_its_rules() {
+        let session = synaps_cli::Session::new("claude-sonnet-4-5", "medium", None);
+        let mut app = crate::tui::app::App::new(session);
+        app.total_cache_read_tokens = 2000;
+        app.total_cache_write_5m = 600;
+        app.total_cache_write_1h = 200;
+        app.keepwarm_cost = 0.18;
+        app.keepwarm_tokens = agent_engine::session::ConversationTokens {
+            input: 80,
+            output: 2,
+            cache_read: 300_000,
+            cache_creation: 0,
+        };
+        let runtime = synaps_cli::Runtime::new_headless();
+        let receipt = build_stats_receipt(&app, &runtime);
+        assert!(receipt.contains(app.session.id.as_str()), "{receipt}");
+        assert!(!receipt.contains("unavailable"), "{receipt}");
+        assert!(!receipt.contains("Cache  hit"), "{receipt}");
+        assert!(receipt.contains("Cache hit rate"), "{receipt}");
+        let lines: Vec<&str> = receipt.lines().collect();
+        let rule = crate::tui::text_metrics::width(lines[0]);
+        assert_eq!(rule, crate::tui::text_metrics::width(lines[lines.len() - 1]));
+        assert!(rule <= 72, "fits an 80-col transcript: {rule}");
+        for l in &lines {
+            assert!(crate::tui::text_metrics::width(l) <= rule, "overflows the rule: {l:?}");
+        }
     }
 
     /// Keep-warm spend is labelled inside the session cost (task #444).
@@ -2515,8 +2980,8 @@ mod tests {
         };
         let runtime = synaps_cli::Runtime::new_headless();
         let receipt = build_stats_receipt(&app, &runtime);
-        assert!(receipt.contains("Cost   $1.2500"), "{receipt}");
-        assert!(receipt.contains("incl. cache keep-warm $0.1800"), "{receipt}");
+        assert!(receipt.contains("Cost            $1.2500"), "{receipt}");
+        assert!(receipt.contains("incl. keep-warm $0.1800"), "{receipt}");
         assert!(receipt.contains("400.0K"), "the total includes pings: {receipt}");
         assert!(
             receipt.contains("incl. keep-warm  read 300.0K / write 0 / input 80 / output 2"),
@@ -2535,11 +3000,15 @@ mod streaming_command_tests {
     #[test]
     fn theme_and_friends_are_streaming_commands() {
         let cmds = to_owned_commands(STREAMING_COMMANDS);
-        for typed in ["theme", "th", "attachments", "detach", "quit", "gamba", "watch"] {
+        for typed in [
+            "theme", "th", "attachments", "detach", "quit", "gamba", "watch", "settings",
+            "takeover",
+            "sessions",
+        ] {
             let cmd = resolve_prefix(typed, &cmds);
             assert!(is_streaming_command(&cmd), "/{typed} runs mid-stream");
         }
-        for typed in ["settings", "model", "compact"] {
+        for typed in ["model", "compact", "effort"] {
             let cmd = resolve_prefix(typed, &cmds);
             assert!(
                 !is_streaming_command(&cmd),

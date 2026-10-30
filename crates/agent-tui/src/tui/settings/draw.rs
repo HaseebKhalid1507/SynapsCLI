@@ -731,10 +731,18 @@ pub(crate) fn config_row_display(key: &str) -> Option<String> {
             .and_then(|v| cfg::CacheKeepWarm::parse(&v))
             .unwrap_or_default()
             .to_string(),
+        "client_input" => raw_config(key)
+            .and_then(|v| cfg::ClientInput::parse(&v))
+            .unwrap_or_default()
+            .to_string(),
         "cache_keepwarm_auto_max_hours" => raw_config(key)
             .and_then(|v| v.trim_end_matches(['h', 'H']).parse::<u32>().ok())
             .filter(|h| (1..=cfg::MAX_CACHE_KEEPWARM_HOURS).contains(h))
             .unwrap_or(cfg::DEFAULT_CACHE_KEEPWARM_AUTO_MAX_HOURS)
+            .to_string(),
+        "subagent_cold_resume_compact_tokens" => raw_config(key)
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(cfg::DEFAULT_SUBAGENT_COLD_RESUME_COMPACT_TOKENS)
             .to_string(),
         "context_management.mode" => raw_config(key)
             .and_then(|v| cfg::ContextManagementMode::parse(&v))
@@ -763,12 +771,26 @@ pub(crate) fn config_row_display(key: &str) -> Option<String> {
         },
         "compaction_exclude" => list_config_display(key),
         "refusal_retries" => ranged_config_display(key, 0..=u64::from(u32::MAX), 2),
+        "telemetry_log_generations" => ranged_config_display(key, 1..=100, 1),
+        "request_compression" => raw_config(key)
+            .and_then(|v| cfg::RequestCompressionMode::parse(&v))
+            .unwrap_or_default()
+            .to_string(),
+        "request_compression_level" => ranged_config_display(
+            key,
+            1..=u64::from(cfg::MAX_REQUEST_COMPRESSION_LEVEL),
+            u64::from(cfg::DEFAULT_REQUEST_COMPRESSION_LEVEL),
+        ),
         "telemetry" => synaps_cli::runtime::telemetry::TelemetryLevel::from_str_key(
             &raw_config(key).unwrap_or_default(),
         )
         .as_str()
         .to_string(),
         // Agent
+        "subagent_thinking" => raw_config(key)
+            .and_then(|v| agent_core::reasoning::parse_subagent_thinking(&v))
+            .unwrap_or(agent_core::reasoning::ReasoningLevel::XHigh)
+            .as_str().to_string(),
         "subagent.max_concurrent" => ranged_config_display(key, 1..=u64::MAX, 16),
         "subagent.max_total" => ranged_config_display(key, 1..=u64::MAX, 64),
         "subagent.max_depth" => ranged_config_display(key, 1..=u64::from(u16::MAX), 4),
@@ -1120,5 +1142,18 @@ mod noodle_tests {
         // Its description sits under it.
         let below: String = (rx..W).map(|x| buf[(x, ry + 1)].symbol()).collect();
         assert!(below.contains("Thinking depth"), "{below:?}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// A label wider than the column pushes its value out of line with the
+    /// rest (`Cold resume compact (tokens) 100000`).
+    #[test]
+    fn every_setting_label_fits_the_label_column() {
+        for def in super::super::defs::ALL_SETTINGS {
+            let n = def.label.chars().count();
+            assert!(n <= super::LABEL_W, "{:?} is {n} chars; the label column is {}", def.label, super::LABEL_W);
+        }
     }
 }

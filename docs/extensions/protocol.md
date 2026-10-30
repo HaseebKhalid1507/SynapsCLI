@@ -511,6 +511,50 @@ live in the system prompt):
 
 - **`on_session_start`** — content is **appended to the system prompt** once
   and carried unchanged for the whole session. Session-stable, cache-safe.
+  A session that does not wait for extensions when it is created (quick
+  start, and every session a daemon reload restores) runs the hook in the
+  background, one session at a time per host. No turn and no keep-warm
+  request of that session goes out before its hook has run: a turn that
+  comes first waits for it (and goes ahead of other sessions' background
+  hooks), while Cancel and End still act at once; a due keep-warm ping
+  waits with its timer off and goes out once the hook has run. Unlike a
+  turn, a due ping does not move its hook ahead of other sessions'
+  background hooks: the one behaviour change from when each source checked
+  the hook on its own. Production does not reach that state: a keep-warm
+  period starts only with an accepted request, and that request already
+  waited for the hook (only a test seam builds a due ping with the hook
+  pending). A manual `/compact` builds its own prompt and does not wait.
+  This is the first turn of every in-process TUI session, and of every
+  daemon TUI session with Quick Start (`startup.quick_start`, on by
+  default): the turn starts at once, but its request waits for
+  extension discovery (up to
+  `startup.extensions_ready_timeout_secs`, 30 s by default) and then for
+  the hook (each subscribed handler up to 5 s, in turn). Clients get a
+  `SystemNotice` ("waiting for extensions to start …") while it waits. A
+  `/clear` (`NewSession`) during that wait cancels the waiting turn first;
+  its request is never sent.
+  A session restored Parked runs the hook once it is unparked; a park
+  takes a hook not yet called out of line, a park that does not happen
+  (held by running or uncollected workers) leaves it in place. While a
+  daemon reload has checkpointed the session (until the exec, until the
+  daemon reports that it failed, or until the fence's backstop timeout of
+  120 s), no queued event, keep-warm ping, park or driver tick starts
+  work, and commands that would are refused; a hook already in line may
+  still run. Work that waited for both the reload and the hook starts
+  once both have cleared. The order is strict: a hook
+  that a turn or a session's creation waits for goes before background
+  ones, which run in arrival order only while no such hook waits, so the
+  background hooks of idle sessions can be held back for as long as others
+  keep arriving. `startup.extensions_ready_timeout_secs` bounds extension
+  discovery only, not this wait: a session created with
+  `await_extensions = true` waits for the hook that is running and for any
+  older foreground ones, each bounded by the handler timeout. A hook call
+  already sent is not abandoned when its session ends or parks: the next
+  session's hook goes out only once that call has returned, so these hooks
+  do not queue inside one extension process (an ended session's injection
+  is dropped). The exception is a handler that runs past its timeout: the
+  host fails open for that session, and the extension may still be working
+  on the call when the next session's hook arrives.
 - **`before_message`** — content is re-evaluated per turn and **attached to
   the newest user message** as a trailing text block on the outgoing request,
   positioned **after** the conversational cache breakpoint: the cache marker

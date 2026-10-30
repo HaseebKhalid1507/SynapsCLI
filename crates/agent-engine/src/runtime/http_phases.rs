@@ -13,7 +13,7 @@ use crate::{Result, RuntimeError};
 pub(super) const STREAM_IDLE: Duration = Duration::from_secs(90);
 
 pub(super) fn header_deadline(bytes: usize) -> Duration {
-    let seconds = bytes / 65536 + usize::from(bytes % 65536 != 0);
+    let seconds = bytes / 65536 + usize::from(!bytes.is_multiple_of(65536));
     Duration::from_secs(90u64.saturating_add(seconds as u64))
 }
 

@@ -112,6 +112,20 @@ fn handle_extension_loader_toast(app: &mut App, title: &str, lines: Vec<String>,
     app.invalidate();
 }
 
+/// The loader's closing toast; `None` when there is nothing to report
+/// (no extensions installed, none failed).
+fn finished_toast_lines(loaded: usize, failed: usize) -> Option<Vec<String>> {
+    let plural = if loaded == 1 { "" } else { "s" };
+    match (loaded, failed) {
+        (0, 0) => None,
+        (n, 0) => Some(vec![format!("\u{2713} Loaded {n} extension{plural}")]),
+        (n, f) => Some(vec![
+            format!("Loaded {n} extension{plural}"),
+            format!("{f} failed \u{2014} see transcript"),
+        ]),
+    }
+}
+
 /// `ext_mgr` is `Some` in-process (widget watchers + live handler count);
 /// `None` over the socket (`view.hook_handler_count`, frames via envelopes).
 pub(crate) async fn handle_extension_loader_event(
@@ -183,23 +197,15 @@ pub(crate) async fn handle_extension_loader_event(
                 handlers = handler_count,
                 "Extension discovery complete"
             );
-            let lines = if failed.is_empty() {
-                vec![format!(
-                    "✓ Loaded {} extension{}",
-                    loaded.len(),
-                    if loaded.len() == 1 { "" } else { "s" }
-                )]
-            } else {
-                vec![
-                    format!(
-                        "Loaded {} extension{}",
-                        loaded.len(),
-                        if loaded.len() == 1 { "" } else { "s" }
-                    ),
-                    format!("{} failed — see transcript", failed.len()),
-                ]
-            };
-            handle_extension_loader_toast(app, "Extensions", lines, false);
+            match finished_toast_lines(loaded.len(), failed.len()) {
+                Some(lines) => handle_extension_loader_toast(app, "Extensions", lines, false),
+                // Nothing loaded, nothing failed: "Loaded 0 extensions" is
+                // noise — just take the "Discovering…" toast down.
+                None => {
+                    app.toasts.dismiss("extension-loader");
+                    app.invalidate();
+                }
+            }
 
             // P19.2: merge manifest-declared theme tokens into the theme
             // registry under `ext.<plugin-id>.<token>`. User theme-TOML
@@ -570,6 +576,52 @@ pub(crate) fn handle_ping_arm(
     }
 }
 
+/// /sessions arm: a background answer (daemon list, past list, pin/close).
+/// Dropped when the modal is closed or the answer is from an earlier open;
+/// a closed modal also drops a poller that outlived it.
+pub(crate) fn handle_sessions_arm(
+    app: &mut App,
+    link: &super::session_link::SessionLink,
+    msg: super::sessions::SessionsMsg,
+) {
+    let own = super::sessions::own_row(app, link);
+    let Some(st) = app.sessions.as_mut() else {
+        app.sessions_poller = None;
+        return;
+    };
+    if st.apply(msg, || own) {
+        app.request_redraw();
+    }
+}
+
+/// After an input action: a `/sessions` Enter (Live → Attach, Past →
+/// Continue) left a switch — swap this TUI onto that session.
+pub(crate) async fn drain_session_switch(
+    app: &mut App,
+    link: &mut super::session_link::SessionLink,
+    prompt_bridge: &mut super::session_link::PromptBridge,
+    registry: &std::sync::Arc<synaps_cli::skills::registry::CommandRegistry>,
+    render_handle: &super::render_thread::RenderHandle,
+) {
+    let Some(target) = app.sessions.as_mut().and_then(|s| s.pending_switch.take()) else {
+        return;
+    };
+    let connector = link
+        .transport()
+        .socket_path()
+        .map(|p| super::sessions::switch::DaemonConnector { path: p.to_path_buf() });
+    super::sessions::switch::perform(
+        app,
+        link,
+        prompt_bridge,
+        target,
+        connector.as_ref().map(|c| c as &dyn super::sessions::switch::Connector),
+        registry,
+        render_handle,
+    )
+    .await;
+}
+
 /// Expanded model-list arm: async provider model enumeration returned.
 pub(crate) fn handle_model_list_arm(
     app: &mut App,
@@ -687,7 +739,7 @@ pub(crate) async fn handle_animation_tick(
         theme::transition::advance(&mut app.theme_transition, std::time::Instant::now())
     {
         theme::set_theme(frame);
-        app.invalidate();
+        app.invalidate_theme();
     }
     // P7.8: activation/deactivation happen OUTSIDE any input event
     // (async queue + auto-chaining); reconcile the stack to the
@@ -698,7 +750,7 @@ pub(crate) async fn handle_animation_tick(
     if !app.subagents.is_empty() {
         let now = std::time::Instant::now();
         let should_reconcile =
-            last_subagent_reconcile.map_or(true, |t| now.duration_since(t).as_secs_f64() >= 1.0);
+            last_subagent_reconcile.is_none_or(|t| now.duration_since(t).as_secs_f64() >= 1.0);
         if should_reconcile {
             // From the `SubagentRows` cache the actor refreshes at 1 Hz.
             super::stream_handler::reconcile_subagents(&mut app.subagents, &app.subagent_rows, now);
@@ -755,16 +807,11 @@ pub(crate) async fn handle_animation_tick(
         }
         app.request_redraw();
     }
-    if app.spinner_frame % 3 == 0 && app.header_animating() {
-        // Ghost header indicators (~20 fps; their speed is wall-clock).
+    if app.spinner_frame.is_multiple_of(3) && app.header_animating() {
+        // Header block sweep + spinner (~20 fps; wall-clock speed).
         app.request_redraw();
     }
-    if app.advance_animations() {
-        // Spinner ticks only affect the tail message (THINKING_PLACEHOLDER,
-        // active tool animation). Mark just the last slot dirty instead of
-        // full invalidation — O(1) instead of O(n) per frame.
-        app.invalidate_last();
-    }
+    app.tick_message_animations();
     if let Some(msg) = app.check_gamba_exited() {
         // check_gamba_exited() already called restore_terminal();
         // resume the render thread now that we own the terminal again.
@@ -833,5 +880,21 @@ pub(crate) fn handle_myx_theme_arm(app: &mut App, msg: (theme::Theme, Option<u64
 pub(crate) fn abort_myx_live(app: &mut App) {
     if let Some(h) = app.myx_task.take() {
         h.abort();
+    }
+}
+
+#[cfg(test)]
+mod extension_toast_tests {
+    use super::finished_toast_lines;
+
+    /// "✓ Loaded 0 extensions" on every boot without extensions is noise.
+    #[test]
+    fn no_closing_toast_when_nothing_loaded_or_failed() {
+        assert_eq!(finished_toast_lines(0, 0), None);
+        assert_eq!(finished_toast_lines(1, 0), Some(vec!["\u{2713} Loaded 1 extension".to_string()]));
+        assert_eq!(
+            finished_toast_lines(0, 2),
+            Some(vec!["Loaded 0 extensions".to_string(), "2 failed \u{2014} see transcript".to_string()])
+        );
     }
 }

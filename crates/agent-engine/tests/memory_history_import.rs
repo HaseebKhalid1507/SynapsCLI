@@ -135,6 +135,8 @@ fn fixture_session(id: &str, system_prompt: Option<&str>, api_messages: Vec<Valu
         session_cost: 0.0,
         keepwarm_cost: 0.0,
         keepwarm_tokens: Default::default(),
+        total_cache_read_tokens: 0,
+        total_cache_creation_tokens: 0,
         message_count: 0,
         api_messages: api_messages.into_iter().map(Arc::new).collect(),
         abort_context: None,

@@ -171,6 +171,10 @@ pub struct SessionConfig {
     /// Never `Park` this session (`--keep-warm`). Default `false`.
     #[serde(default)]
     pub keep_warm: bool,
+    /// Who may drive this session ([`ClientInput`]); `None` = config
+    /// `client_input`. An older daemon ignores it (and enforces the owner).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_input: Option<ClientInput>,
     /// `--name`: name the session at create (same rules as `/cmd saveas`;
     /// must be unique among saved sessions). Applied before the registry
     /// entry is written so `synaps send --session <name>` resolves at once.
@@ -193,6 +197,15 @@ pub struct SessionConfig {
         deserialize_with = "SessionMemoryMode::deserialize_lenient"
     )]
     pub memory_mode: Option<SessionMemoryMode>,
+    /// Set by a daemon reload for a session it restores Parked (never on
+    /// the wire): with `await_extensions=false`, `on_session_start` waits
+    /// until the session is unparked instead of running right after create.
+    #[serde(skip)]
+    pub restore_parked: bool,
+    /// Where this session's message times come from (never on the wire).
+    /// `None` = the wall clock; tests inject a clock to advance time.
+    #[serde(skip)]
+    pub message_clock: Option<crate::runtime::message_time::MessageClock>,
 }
 
 /// A durable `/memory` mode the user chose for a session
@@ -287,9 +300,12 @@ impl Default for SessionConfig {
             compaction_policy: CompactionPolicyWire::InPlace,
             await_extensions: true,
             keep_warm: false,
+            client_input: None,
             name: None,
             max_session_cost: None,
             memory_mode: None,
+            restore_parked: false,
+            message_clock: None,
         }
     }
 }
@@ -337,6 +353,14 @@ pub struct SessionMeta {
     pub input_owner: Option<ClientId>,
     #[serde(default)]
     pub awaiting_input: usize,
+    /// Every attached client, named. Empty from an older daemon.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub roster: Vec<ClientInfo>,
+    /// Who may drive ([`ClientInput`]); `None` from an older daemon (which
+    /// enforces the owner: `Exclusive`). With `Shared`, `input_owner` is the
+    /// active client, not the only one that may type.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_input: Option<ClientInput>,
     /// `conv.session.id` — differs from `id` after a LinkedSuccessor compaction.
     #[serde(default)]
     pub journal_id: String,
@@ -344,6 +368,36 @@ pub struct SessionMeta {
     /// `"pid N (kind)"`. Shown in `daemon sessions`; cleared on unpark.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub locked_by: Option<String>,
+    /// Pinned (`KeepWarm{on}`, `/pin`): never parked, never idle-ended, and
+    /// the daemon does not idle-exit while it is set. An older daemon omits
+    /// it (→ false); an older client ignores it.
+    #[serde(default)]
+    pub pinned: bool,
+    // ── state for the `/sessions` modal, published by the actor. An older
+    //    daemon omits them (→ defaults); an older client ignores them. ──
+    /// A turn or a compaction is running.
+    #[serde(default)]
+    pub busy: bool,
+    /// When the session entered its current state (turn/compaction start,
+    /// idle start, park time).
+    #[serde(default)]
+    pub state_since: Option<chrono::DateTime<chrono::Utc>>,
+    /// When the idle park fires (Live, zero clients, grace armed). `None`
+    /// when not armed — a worker re-check is not a park due.
+    #[serde(default)]
+    pub park_due: Option<chrono::DateTime<chrono::Utc>>,
+    /// When a Parked session is evicted; `None` if not parked or never.
+    #[serde(default)]
+    pub evict_due: Option<chrono::DateTime<chrono::Utc>>,
+    /// The live conversation's title, as of the last publish.
+    #[serde(default)]
+    pub title: Option<String>,
+    /// Session cost in USD, as of the last publish.
+    #[serde(default)]
+    pub cost_usd: f64,
+    /// API message count, as of the last publish.
+    #[serde(default)]
+    pub messages: usize,
 }
 
 /// Where a session is in its park/unpark life (`SessionHandle::lifecycle`).
@@ -369,6 +423,8 @@ impl SessionLifecycle {
     }
 }
 
+pub use crate::core::config::ClientInput;
+
 /// Minted by the actor per Attach.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -387,6 +443,174 @@ pub struct ClientMeta {
     /// Display items in `Attached.display_tail` / `DisplayTail` queries (phase 4).
     #[serde(default = "default_tail_items")]
     pub tail_items: usize,
+    /// Additive stream events this client can decode. Absent from older
+    /// clients (all `false`), so a newer daemon never sends them one; an
+    /// older daemon ignores the unknown field.
+    #[serde(default, skip_serializing_if = "ClientCapabilities::is_none")]
+    pub capabilities: ClientCapabilities,
+    /// What this client asks to be called (`--as`, `SYNAPS_CLIENT_NAME`):
+    /// a label, not a login — every client is the daemon's own user. The
+    /// session resolves it ([`resolve_client_name`]) and reports the result
+    /// in `ClientJoined`/`roster`. Absent = the kind's name. An older
+    /// daemon ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+/// Longest client name ([`validate_client_name`]).
+pub const CLIENT_NAME_MAX: usize = 32;
+
+/// A client name is 1–32 ASCII letters, digits, `-` or `_`, starting with
+/// a letter or digit. The client checks before connecting; the daemon
+/// checks again and refuses the handshake.
+pub fn validate_client_name(name: &str) -> Result<(), String> {
+    let ok_first = name.chars().next().is_some_and(|c| c.is_ascii_alphanumeric());
+    let ok_rest = name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    if name.is_empty() || name.len() > CLIENT_NAME_MAX || !ok_first || !ok_rest {
+        return Err(format!(
+            "invalid client name {name:?}: use 1-{CLIENT_NAME_MAX} letters, digits, '-' or '_', starting with a letter or digit"
+        ));
+    }
+    Ok(())
+}
+
+/// `SYNAPS_CLIENT_NAME`, trimmed; `None` when unset or empty. Not
+/// validated here: the caller reports a bad one.
+pub fn client_name_from_env() -> Option<String> {
+    std::env::var("SYNAPS_CLIENT_NAME")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+/// The name a joining client gets in a session: its requested name, or its
+/// kind's name if it asked for none (or an invalid one), with the lowest
+/// free `-N` suffix (N ≥ 2) if another client already has it. Names
+/// compare case-insensitively.
+pub fn resolve_client_name<'a>(
+    requested: Option<&str>,
+    kind: ClientKind,
+    taken: impl IntoIterator<Item = &'a str>,
+) -> String {
+    let base = requested
+        .filter(|n| validate_client_name(n).is_ok())
+        .unwrap_or(kind.default_name());
+    let taken: std::collections::HashSet<String> = taken.into_iter().map(str::to_ascii_lowercase).collect();
+    if !taken.contains(&base.to_ascii_lowercase()) {
+        return base.to_string();
+    }
+    (2..)
+        .map(|n| format!("{base}-{n}"))
+        .find(|c| !taken.contains(&c.to_ascii_lowercase()))
+        .expect("an unbounded range always has a free suffix")
+}
+
+/// One attached client as every client sees it (`AttachSnapshot.roster`,
+/// `ClientJoined`, `/clients`, `synaps daemon sessions`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientInfo {
+    pub id: ClientId,
+    /// Resolved by the session ([`resolve_client_name`]); unique in it.
+    pub name: String,
+    pub kind: ClientKind,
+    pub mode: AttachMode,
+    /// Unix ms.
+    pub attached_at_ms: u64,
+}
+
+impl ClientInfo {
+    /// `discord (#3)`: the name for people, the id for scripts that grep.
+    pub fn label(&self) -> String {
+        format!("{} (#{})", self.name, self.id.0)
+    }
+}
+
+/// A client-side copy of the session's roster, kept current from the
+/// attach snapshot, `ClientJoined` and `ClientLeft` (each transport owns
+/// one).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Roster(Vec<ClientInfo>);
+
+impl Roster {
+    pub fn from_snapshot(snapshot: &AttachSnapshot) -> Self {
+        let mut r = Self(snapshot.roster.clone());
+        // An older daemon sends no roster: fall back to ids and kinds.
+        if r.0.is_empty() {
+            r.0 = snapshot
+                .clients
+                .iter()
+                .map(|(id, kind)| ClientInfo {
+                    id: *id,
+                    name: kind.default_name().to_string(),
+                    kind: *kind,
+                    mode: AttachMode::Mirror,
+                    attached_at_ms: 0,
+                })
+                .collect();
+        }
+        r
+    }
+
+    pub fn apply(&mut self, event: &SessionEventWire) {
+        match event {
+            SessionEventWire::ClientJoined { client, kind, name, mode } => {
+                self.0.retain(|c| c.id != *client);
+                self.0.push(ClientInfo {
+                    id: *client,
+                    name: if name.is_empty() { kind.default_name().to_string() } else { name.clone() },
+                    kind: *kind,
+                    mode: *mode,
+                    // The event carries no time: it just happened.
+                    attached_at_ms: chrono::Utc::now().timestamp_millis().max(0) as u64,
+                });
+                self.0.sort_by_key(|c| c.id.0);
+            }
+            SessionEventWire::ClientLeft { client } => self.0.retain(|c| c.id != *client),
+            _ => {}
+        }
+    }
+
+    pub fn clients(&self) -> &[ClientInfo] {
+        &self.0
+    }
+
+    pub fn get(&self, id: ClientId) -> Option<&ClientInfo> {
+        self.0.iter().find(|c| c.id == id)
+    }
+
+    /// `discord (#3)`, or `client #3` for an id not in the roster.
+    pub fn label(&self, id: ClientId) -> String {
+        self.get(id).map(ClientInfo::label).unwrap_or_else(|| format!("client #{}", id.0))
+    }
+}
+
+/// Opt-in stream signals (see [`ClientMeta::capabilities`]). The daemon's
+/// event enums nested under `Stream` (`WireLlmEvent`, ...) have no
+/// `#[serde(other)]`: an older client fails the whole frame on an unknown
+/// variant — and a failed frame reads as a dead socket (the TUI drops into
+/// reconnect, whose `Attached` replay would carry the same variant). So
+/// every new nested variant is sent only to a client that declares it here.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientCapabilities {
+    /// `LlmEvent::ToolQueued` / `ToolStarted` (scheduler lane waits).
+    #[serde(default)]
+    pub tool_queue: bool,
+    /// Knows `client_input = shared`: `OwnerChangeReason::Input` and
+    /// `Attached.client_input`. Without it, a shared session is presented
+    /// in owner terms (`wire::legacy_shared`).
+    #[serde(default)]
+    pub owner_reason_input: bool,
+}
+
+impl ClientCapabilities {
+    /// What this build decodes.
+    pub fn current() -> Self {
+        Self { tool_queue: true, owner_reason_input: true }
+    }
+
+    fn is_none(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 /// Default for `ClientMeta.tail_items`: matches the TUI's resumed-display cap.
@@ -414,7 +638,15 @@ impl ClientMeta {
             instance: uuid::Uuid::new_v4().to_string(),
             history: HistoryMode::default(),
             tail_items: tail_items_from_env(),
+            capabilities: ClientCapabilities::current(),
+            name: None,
         }
+    }
+
+    /// With a requested name (see [`ClientMeta::name`]).
+    pub fn named(mut self, name: Option<String>) -> Self {
+        self.name = name;
+        self
     }
 }
 
@@ -456,6 +688,20 @@ pub enum ClientKind {
     Rpc,
     Server,
     Test,
+}
+
+impl ClientKind {
+    /// The name a client of this kind gets when it asks for none.
+    pub fn default_name(self) -> &'static str {
+        match self {
+            Self::Tui => "tui",
+            Self::Chat => "chat",
+            Self::Attach => "attach",
+            Self::Rpc => "rpc",
+            Self::Server => "server",
+            Self::Test => "test",
+        }
+    }
 }
 
 /// Attach mode. Ownership (B1): `Mirror` owns input iff nobody does,
@@ -672,8 +918,15 @@ pub enum SessionCommand {
     /// abort compaction, save, close PTYs, emit Notice. Never ends the
     /// session. Reply = `QueryResult{id: CHECKPOINT_QUERY_ID, {ok:true}}`.
     Checkpoint { reason: CheckpointReason },
-    /// (B3) pin/unpin (`--keep-warm`, `/keep-warm on|off`).
+    /// (B3) pin/unpin (`/pin on|off`, `--keep-warm`, `/keep-warm on|off`,
+    /// `synaps daemon pin`). Published on `SessionHandle::pinned()`.
     KeepWarm { on: bool },
+    /// (B1) `/takeover`: the sending client takes input ownership in place,
+    /// like an `--takeover` attach without re-attaching. Not an input
+    /// command (a read-only client sends it); refused from an `Observe`
+    /// client, a no-op from the owner. Emits `InputOwnerChanged{Takeover}`
+    /// (`Attach` when nobody owned input).
+    TakeInput,
     /// Host-only (never wire): park now if `can_park()` (reload rehydrates
     /// a Parked session Parked). A no-op otherwise.
     #[serde(skip)]
@@ -684,6 +937,23 @@ pub enum SessionCommand {
     /// against their archives and wakes the parent once per worker.
     #[serde(skip)]
     AdoptWorkers { workers: Vec<crate::runtime::subagent::CarriedWorker> },
+    /// Host-only (never wire): reload's rehydrate hands the new image the
+    /// exact tool activations the session held in the previous image
+    /// (`SessionReloadRecord::tool_activations`). The runtime re-validates
+    /// and restores them at its first turn start; a parked session keeps
+    /// them for its unpark. Sent before anything can start a turn.
+    #[serde(skip)]
+    RestoreToolActivations {
+        activations: Vec<crate::tools::activation::CarriedActivation>,
+    },
+    /// Host-only (never wire): reload's rehydrate, last, for a session that
+    /// comes back Live. The old image's park timer did not survive the exec
+    /// and only an attach or detach arms a new one, so a session no client
+    /// reconnects to stayed Live with zero clients forever. Arms the park
+    /// grace as a detach does; a client reconnecting within it clears it.
+    /// A no-op on a parked session.
+    #[serde(skip)]
+    ArmPark,
     /// Host-only (never wire): the reload this session checkpointed for
     /// did not exec (the exec failed, or the reload stopped after the
     /// checkpoints). The checkpoint's reload fence lifts, and the workers
@@ -707,7 +977,7 @@ pub enum SessionCommand {
 /// What `Checkpoint{Reload}` reports so `daemon reload` can rebuild the
 /// session as it IS (not as it was created): the actor's config, keep-warm
 /// pin, lifecycle, the non-persisted knobs (`settings_replay`, incl.
-/// `/system`), and the CURRENT model/thinking.
+/// `/system`), the CURRENT model/thinking, and its tool activations.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SessionReloadRecord {
     pub config: SessionConfig,
@@ -724,6 +994,11 @@ pub struct SessionReloadRecord {
     /// the next image can re-register their ids and wake the parent.
     #[serde(default)]
     pub workers: Vec<crate::runtime::subagent::CarriedWorker>,
+    /// The session's exact tool activations (`activate_tools` grants), so
+    /// the next image's runtime keeps the tools array the cached prompt
+    /// prefix starts with. Pins only, re-validated on restore.
+    #[serde(default)]
+    pub tool_activations: Vec<crate::tools::activation::CarriedActivation>,
 }
 
 /// What a session tells a client whose command a daemon reload refused.
@@ -802,12 +1077,21 @@ impl std::fmt::Debug for SessionCommand {
             }
             Self::NewSession => f.write_str("NewSession"),
             Self::Save => f.write_str("Save"),
+            Self::TakeInput => f.write_str("TakeInput"),
             Self::Park => f.write_str("Park"),
             Self::AdoptWorkers { workers } => f
                 .debug_struct("AdoptWorkers")
                 .field("workers", &workers.iter().map(|w| w.id.as_str()).collect::<Vec<_>>())
                 .finish(),
+            Self::RestoreToolActivations { activations } => f
+                .debug_struct("RestoreToolActivations")
+                .field(
+                    "tools",
+                    &activations.iter().map(|a| a.tool_id.as_str()).collect::<Vec<_>>(),
+                )
+                .finish(),
             Self::ReloadAborted => f.write_str("ReloadAborted"),
+            Self::ArmPark => f.write_str("ArmPark"),
             Self::Query { id, query } => {
                 f.debug_struct("Query").field("id", id).field("query", query).finish()
             }
@@ -931,8 +1215,16 @@ pub enum SessionQuery {
     DisplayTail { items: usize },
     /// `runtime::subagent_watch::WatchPage`: one of this session's workers,
     /// its journal from `since` (the previous page's `next_seq`; 0 = all).
-    /// Unknown handle → `{"error": ..}`.
-    SubagentWatch { handle_id: String, since: u64 },
+    /// Unknown handle → `{"error": ..}`. `tool_queue`: include
+    /// `WatchEvent::ToolQueued`/`ToolStarted` entries (an older client
+    /// omits it and would fail to decode a page that had them; an older
+    /// daemon ignores it and never records them).
+    SubagentWatch {
+        handle_id: String,
+        since: u64,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        tool_queue: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -999,7 +1291,8 @@ pub enum SessionEventWire {
         client: ClientId,
         snapshot: AttachSnapshot,
     },
-    ClientJoined { client: ClientId, kind: ClientKind },
+    /// `name`: resolved by the session (unique in it).
+    ClientJoined { client: ClientId, kind: ClientKind, name: String, mode: AttachMode },
     ClientLeft { client: ClientId },
     Ended { reason: EndReason },
     /// Cancel landed. TUI: drop_empty_thinking, push Error(abort_msg),
@@ -1085,6 +1378,11 @@ pub enum OwnerChangeReason {
     Takeover,
     OwnerDetached,
     Reload,
+    /// `client_input = shared`: this client sent input, so it is now the
+    /// active one. Sent only to clients declaring
+    /// `ClientCapabilities::owner_reason_input`: an older one never sees an
+    /// owner change on a shared session (`wire::legacy_shared`).
+    Input,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1229,6 +1527,11 @@ pub struct AttachSnapshot {
     pub replay: Vec<Envelope>,
     pub pending_prompts: Vec<PromptRequest>,
     pub clients: Vec<(ClientId, ClientKind)>,
+    /// Every attached client with its resolved name (`clients` stays for
+    /// older clients). Empty from an older daemon.
+    pub roster: Vec<ClientInfo>,
+    /// Who may drive ([`ClientInput`]); `Exclusive` from an older daemon.
+    pub client_input: ClientInput,
     /// Who owns input right now (B1) — so a joiner knows immediately
     /// whether its keystrokes will be honoured.
     pub input_owner: Option<ClientId>,
@@ -1239,23 +1542,19 @@ pub struct AttachSnapshot {
 
 impl AttachSnapshot {
     /// For the client this snapshot was made for (`me`): who owns input, if
-    /// someone else does — "input is owned by client #1 (tui); attach with
+    /// someone else does — "input is owned by tui (#1); attach with
     /// --takeover to steal it". Rendered by each client from its OWN
     /// snapshot; the actor used to broadcast it as a `SystemNotice`, which
     /// every attached client (the owner included) and later attach replays
     /// showed.
+    /// `None` with `client_input = shared`: every drive client may type.
     pub fn input_owned_elsewhere(&self, me: ClientId) -> Option<String> {
+        if self.client_input == ClientInput::Shared {
+            return None;
+        }
         let owner = self.input_owner.filter(|o| *o != me)?;
-        let kind = self
-            .clients
-            .iter()
-            .find(|(c, _)| *c == owner)
-            .map(|(_, k)| format!("{k:?}").to_lowercase())
-            .unwrap_or_else(|| "?".into());
-        Some(format!(
-            "input is owned by client #{} ({kind}); attach with --takeover to steal it",
-            owner.0
-        ))
+        let who = Roster::from_snapshot(self).label(owner);
+        Some(format!("input is owned by {who}; attach with --takeover to steal it"))
     }
 }
 
@@ -1279,6 +1578,54 @@ pub mod reasoning_level_serde {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn client_names_are_short_plain_labels() {
+        for ok in ["tui", "discord", "Dash_2", "a", "9lives", &"x".repeat(CLIENT_NAME_MAX)] {
+            assert_eq!(validate_client_name(ok), Ok(()), "{ok}");
+        }
+        for bad in ["", "-lead", "_lead", "has space", "dots.no", "émoji", &"x".repeat(CLIENT_NAME_MAX + 1)] {
+            let err = validate_client_name(bad).unwrap_err();
+            assert!(err.starts_with("invalid client name"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_session_resolves_names_to_unique_ones() {
+        // Requested, else the kind's name; an invalid request falls back.
+        assert_eq!(resolve_client_name(Some("discord"), ClientKind::Rpc, []), "discord");
+        assert_eq!(resolve_client_name(None, ClientKind::Tui, []), "tui");
+        assert_eq!(resolve_client_name(Some("no spaces"), ClientKind::Attach, []), "attach");
+        // Taken (case-insensitively): lowest free suffix from 2.
+        assert_eq!(resolve_client_name(None, ClientKind::Tui, ["tui"]), "tui-2");
+        assert_eq!(resolve_client_name(Some("TUI"), ClientKind::Tui, ["tui", "tui-2"]), "TUI-3");
+        assert_eq!(resolve_client_name(None, ClientKind::Tui, ["tui", "tui-3"]), "tui-2");
+        // A freed name is reused.
+        assert_eq!(resolve_client_name(None, ClientKind::Tui, ["tui-2"]), "tui");
+    }
+
+    #[test]
+    fn a_roster_follows_joins_and_leaves_and_labels_by_name() {
+        let joined = |id: u64, name: &str, mode: AttachMode| SessionEventWire::ClientJoined {
+            client: ClientId(id),
+            kind: ClientKind::Attach,
+            name: name.to_string(),
+            mode,
+        };
+        let mut r = Roster::default();
+        r.apply(&joined(2, "dash", AttachMode::Observe));
+        r.apply(&joined(1, "terminal", AttachMode::Mirror));
+        // An older daemon's join has no name: the kind's is used.
+        r.apply(&joined(3, "", AttachMode::Mirror));
+        let ids: Vec<u64> = r.clients().iter().map(|c| c.id.0).collect();
+        assert_eq!(ids, [1, 2, 3], "kept in id order");
+        assert_eq!(r.get(ClientId(2)).unwrap().mode, AttachMode::Observe);
+        assert_eq!(r.label(ClientId(1)), "terminal (#1)");
+        assert_eq!(r.label(ClientId(3)), "attach (#3)");
+        r.apply(&SessionEventWire::ClientLeft { client: ClientId(1) });
+        assert_eq!(r.label(ClientId(1)), "client #1", "gone: id only");
+        assert_eq!(r.clients().len(), 2);
+    }
 
     /// prA I-R5 minor: line/paragraph separators and the Arabic letter mark
     /// are stripped with the other format characters; ZWNJ/ZWJ are kept so
@@ -1508,16 +1855,19 @@ mod tests {
             SessionCommand::Query { id: 3, query: SessionQuery::ContextReport },
             SessionCommand::Query {
                 id: 4,
-                query: SessionQuery::SubagentWatch { handle_id: "sa_2".into(), since: 7 },
+                query: SessionQuery::SubagentWatch { handle_id: "sa_2".into(), since: 7, tool_queue: true },
             },
             SessionCommand::SubagentSteer { handle_id: "sa_2".into(), text: "focus on X".into() },
             SessionCommand::DriverStart { plugin: "p".into(), command: "auto".into(), arg: "start -- hi".into() },
+            SessionCommand::TakeInput,
         ];
         for cmd in cmds {
             let json = serde_json::to_string(&cmd).unwrap();
             let back: SessionCommand = serde_json::from_str(&json).unwrap();
             assert_eq!(serde_json::to_string(&back).unwrap(), json);
         }
+        let take: SessionCommand = serde_json::from_str(r#"{"cmd":"take_input"}"#).unwrap();
+        assert!(matches!(take, SessionCommand::TakeInput));
         let cp: SessionCommand = serde_json::from_str(r#"{"cmd":"checkpoint","reason":"host_request"}"#).unwrap();
         assert!(matches!(cp, SessionCommand::Checkpoint { reason: CheckpointReason::HostRequest }));
     }
@@ -1647,4 +1997,23 @@ mod double_option {
             assert_eq!(absent.continue_session, None);
         }
     }
+}
+
+/// Where a daemon session writes its pin (`daemon::pins::PinBook`). The
+/// actor calls it exactly when the pin changes, when a pinned session moves
+/// to a new journal or is renamed, and when a pinned session is ended on
+/// purpose. Implementations do their own I/O and never fail the caller.
+pub trait PinSink: Send + Sync {
+    /// The session is pinned: add or refresh its entry (`journal_id` is
+    /// current; `id` is the actor id, which may name an older journal).
+    /// `cache_keepwarm`: the session's `/keepwarm` override (`off`/`auto`/`<N>h`).
+    fn pinned(&self, id: &str, journal_id: &str, name: Option<&str>, cwd: Option<&std::path::Path>, cache_keepwarm: Option<&str>);
+    /// Unpinned, or ended on purpose while pinned: drop its entry.
+    fn unpinned(&self, id: &str, journal_id: &str);
+    /// A pinned session's journal changed (`/clear`, a successor compaction,
+    /// resume): the entry follows it.
+    fn moved(&self, from: &str, to: &str);
+    /// A pinned session was renamed (`/saveas`, `daemon rename`): its entry
+    /// takes `name` verbatim, so a cleared name stops resolving.
+    fn renamed(&self, journal_id: &str, name: Option<&str>);
 }

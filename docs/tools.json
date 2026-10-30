@@ -684,6 +684,17 @@
           "description": "The task/prompt to send to the subagent.",
           "type": "string"
         },
+        "thinking": {
+          "description": "Worker effort override. Omit for subagent_thinking (default xhigh), independent of foreground thinking. Unsupported model levels are refused.",
+          "enum": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "type": "string"
+        },
         "timeout": {
           "description": "Wall-clock limit in seconds. Omit for the session default (config `subagent_timeout`); 0 = no limit.",
           "type": "integer"
@@ -788,7 +799,7 @@
     }
   },
   {
-    "description": "Resume a finished, timed-out, failed or cancelled reactive subagent with new instructions. The worker continues its own archived conversation (every tool call and result) with the instructions as the next user turn, so it picks up where it stopped. Works after the handle was collected or reaped. For a worker from an earlier or crashed session, pass archive_path. Returns a new handle_id.",
+    "description": "Resume a finished, timed-out, failed or cancelled reactive subagent with new instructions. The worker continues its own archived conversation (every tool call and result) with the instructions as the next user turn, so it picks up where it stopped. Works after the handle was collected or reaped. For a worker from an earlier or crashed session, pass archive_path. A worker whose prompt cache has expired and whose history is large resumes from a compact context (task, last steps, final report) unless full_history is true. Returns a new handle_id.",
     "name": "subagent_resume",
     "parameters": {
       "properties": {
@@ -796,12 +807,27 @@
           "description": "Optional: a resume archive (.json under ~/.synaps-cli/subagent-history/) of a worker from an earlier or crashed session. handle_id is then only a label.",
           "type": "string"
         },
+        "full_history": {
+          "description": "Optional (default false): replay the worker's full conversation even when its prompt cache has expired. Otherwise a cold history above subagent_cold_resume_compact_tokens is resumed from a compact context (original task, last steps, final report), avoiding a full cache rewrite.",
+          "type": "boolean"
+        },
         "handle_id": {
           "description": "Handle ID of the completed subagent to resume (e.g. \"sa_3\").",
           "type": "string"
         },
         "instructions": {
           "description": "What to do next. Sent as the next user turn after the worker's own prior conversation.",
+          "type": "string"
+        },
+        "thinking": {
+          "description": "Override worker effort for this resumed run. Omit to keep its recorded effort; legacy archives use subagent_thinking (default xhigh). Unsupported model levels are refused.",
+          "enum": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
           "type": "string"
         },
         "timeout": {
@@ -851,6 +877,17 @@
         },
         "task": {
           "description": "The task/prompt to send to the subagent.",
+          "type": "string"
+        },
+        "thinking": {
+          "description": "Worker effort override. Omit for subagent_thinking (default xhigh), independent of foreground thinking. Unsupported model levels are refused.",
+          "enum": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
           "type": "string"
         },
         "timeout": {

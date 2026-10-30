@@ -208,6 +208,39 @@ impl TurnBudget {
     }
 }
 
+/// Moves an event-started turn onto the session's budget once the owner's
+/// own message is delivered into it (a steer): from then on someone is
+/// watching. Shared by the session actor (which sends the owner's steer) and
+/// the turn's stream (which drains steering). Sending an owner steer and
+/// draining steering hold the same lock, so the stream takes the budget in
+/// the very drain that delivers the owner's message, never before it and
+/// never for an event or note steered into the same channel.
+#[derive(Debug, Default)]
+pub struct OwnerSteerBudget {
+    pending: std::sync::Mutex<Option<TurnBudget>>,
+}
+
+impl OwnerSteerBudget {
+    /// Session side: `send` the owner's message into the turn; if it went in,
+    /// the turn takes `budget` when the stream delivers it.
+    pub fn send_owner_steer(&self, budget: TurnBudget, send: impl FnOnce() -> bool) -> bool {
+        let mut pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
+        let sent = send();
+        if sent {
+            *pending = Some(budget);
+        }
+        sent
+    }
+
+    /// Stream side: run `drain` (the steering drain) and return the budget
+    /// an owner message delivered by it, or by an earlier drain, carries.
+    pub fn drain<R>(&self, drain: impl FnOnce() -> R) -> (R, Option<TurnBudget>) {
+        let mut pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
+        let drained = drain();
+        (drained, pending.take())
+    }
+}
+
 /// Shared provider-usage counters, updated at the single authoritative
 /// Usage emission sites in the transport and read by the stream loop for
 /// the optional token/cost dimensions. Metadata only.
@@ -335,6 +368,12 @@ impl TurnBudgetMeter {
 
     pub fn budget(&self) -> &TurnBudget {
         &self.budget
+    }
+
+    /// Switch the turn to `budget` mid-turn. Usage so far (rounds, tool
+    /// calls, tool-result bytes, renewals, elapsed time) keeps counting.
+    pub fn switch_budget(&mut self, budget: TurnBudget) {
+        self.budget = budget;
     }
 
     pub(crate) fn wall_clock_exceeded(&self) -> bool {
@@ -481,6 +520,37 @@ impl TurnBudgetMeter {
 mod tests {
     use super::*;
     use agent_core::config::TurnLimit;
+
+    #[test]
+    fn an_owner_steer_switches_the_budget_and_keeps_the_usage() {
+        let event = TurnBudget::from_config(TurnRole::Event, &Default::default());
+        let session = TurnBudget::for_role(TurnRole::Foreground);
+        let mut meter = TurnBudgetMeter::new(TurnBudget {
+            max_provider_rounds: Some(2),
+            ..event
+        });
+        meter.begin_round().unwrap();
+        meter.begin_round().unwrap();
+        meter.charge_tool_calls(3);
+        assert_eq!(meter.begin_round(), Err(BudgetDimension::ProviderRounds));
+
+        let lift = OwnerSteerBudget::default();
+        // Nothing sent: the drain carries no budget.
+        assert_eq!(lift.drain(|| ()).1, None);
+        // A send that fails (turn over) arms nothing.
+        assert!(!lift.send_owner_steer(session.clone(), || false));
+        assert_eq!(lift.drain(|| ()).1, None);
+        assert!(lift.send_owner_steer(session.clone(), || true));
+        let (_, budget) = lift.drain(|| ());
+        meter.switch_budget(budget.expect("the owner's steer carries the session budget"));
+        assert_eq!(lift.drain(|| ()).1, None, "taken once");
+
+        assert_eq!(meter.budget(), &session);
+        assert_eq!(meter.rounds_used(), 2, "usage keeps counting");
+        assert_eq!(meter.tool_calls_used(), 3);
+        meter.begin_round().unwrap();
+        assert_eq!(meter.rounds_used(), 3);
+    }
 
     #[test]
     fn partial_ttl_metadata_cannot_drop_cost_or_lower_tier() {

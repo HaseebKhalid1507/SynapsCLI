@@ -49,6 +49,9 @@ struct FakeProvider {
     /// Cancelled by the fake *during* `provider.complete`, modeling a user
     /// cancellation that lands while the IPC turn is active.
     cancel_during_complete: Option<CancellationToken>,
+    /// Signalled when `provider.stream` is entered, i.e. the IPC turn is
+    /// active. A stored permit, so the waiter can never miss it.
+    stream_entered: tokio::sync::Notify,
     complete_calls: AtomicUsize,
     stream_calls: AtomicUsize,
 }
@@ -86,6 +89,7 @@ impl ExtensionHandler for FakeProvider {
         sink: tokio::sync::mpsc::Sender<ProviderStreamEvent>,
     ) -> Result<ProviderCompleteResult, String> {
         self.stream_calls.fetch_add(1, Ordering::SeqCst);
+        self.stream_entered.notify_one();
         if self.hang_stream {
             std::future::pending::<()>().await;
         }
@@ -336,15 +340,23 @@ async fn streaming_cancel_while_ipc_active_emits_canceled_record() {
     });
     let manager = manager_with(handler.clone(), true, false, false).await;
 
+    // Cancel once `provider.stream` is actually running, not on a timer:
+    // a cancel that lands before the route starts emits no record by design
+    // (see `cancelled_before_start_emits_no_record_and_no_ipc`).
     let cancel = CancellationToken::new();
     let canceller = cancel.clone();
+    let entered = handler.clone();
     tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        entered.stream_entered.notified().await;
         canceller.cancel();
     });
-    let err = route(&manager, &h.trace, &cancel, Arc::new(Vec::new()))
-        .await
-        .expect_err("canceled turn errors");
+    let err = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        route(&manager, &h.trace, &cancel, Arc::new(Vec::new())),
+    )
+    .await
+    .expect("provider.stream was never entered")
+    .expect_err("canceled turn errors");
     assert!(err.to_string().contains("canceled"));
 
     assert_eq!(handler.stream_calls.load(Ordering::SeqCst), 1);

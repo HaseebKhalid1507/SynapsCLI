@@ -212,6 +212,15 @@ pub fn cfg() -> SessionConfig {
     }
 }
 
+/// [`cfg`] with `client_input = exclusive`: only the input owner drives,
+/// the others are read-only until they take input (the default is shared).
+pub fn exclusive_cfg() -> SessionConfig {
+    SessionConfig {
+        client_input: Some(agent_engine::session::ClientInput::Exclusive),
+        ..cfg()
+    }
+}
+
 pub async fn next(t: &mut LocalTransport) -> Envelope {
     tokio::time::timeout(Duration::from_secs(30), t.next_event())
         .await
