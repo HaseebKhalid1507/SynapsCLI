@@ -7087,34 +7087,11 @@ mod rich_output_tests {
             assert!(!next.event("toolu_r2").deduped);
         }
 
-        #[tokio::test]
-        async fn a_worker_rollover_that_evicted_the_read_gets_it_in_full() {
+        fn rollover_worker(sink_dir: std::path::PathBuf, reports: Arc<AtomicUsize>) -> impl FnOnce(&mut StreamSession) {
             use crate::runtime::worker_context::{
                 WorkerContext, WorkerContextSettings, WorkerTranscriptSink,
             };
-            let dir = tempfile::tempdir().unwrap();
-            let file = dir.path().join("a.py");
-            std::fs::write(&file, source(100, "a")).unwrap();
-            // ~1.5k tokens each: enough to cross the 30k band well before
-            // the re-read.
-            const FILLER: [&str; 16] = [
-                "toolu_f0", "toolu_f1", "toolu_f2", "toolu_f3", "toolu_f4", "toolu_f5",
-                "toolu_f6", "toolu_f7", "toolu_f8", "toolu_f9", "toolu_f10", "toolu_f11",
-                "toolu_f12", "toolu_f13", "toolu_f14", "toolu_f15",
-            ];
-            let mut rounds = vec![vec![("toolu_r1", "read", read(&file))]];
-            rounds.extend(FILLER.iter().map(|id| vec![(*id, "big_out", json!({}))]));
-            rounds.push(vec![("toolu_r2", "read", read(&file))]);
-
-            // Control: no rollover, the read is still in context → stub.
-            let kept = drive_rounds(go(), &rounds, true, |_| {}).await;
-            assert_eq!(kept.result("toolu_r2"), Value::String(unchanged_stub("toolu_r1")));
-
-            let transcripts = tempfile::tempdir().unwrap();
-            let reports = Arc::new(AtomicUsize::new(0));
-            let seen = Arc::clone(&reports);
-            let sink_dir = transcripts.path().to_path_buf();
-            let rolled = drive_rounds(go(), &rounds, true, move |s| {
+            move |s| {
                 s.context_window = 200_000;
                 s.options.codex_request_role = crate::runtime::openai::catalog::CodexRequestRole::Worker;
                 s.worker_context = WorkerContext {
@@ -7123,19 +7100,64 @@ mod rich_output_tests {
                         dir: sink_dir,
                         stem: "sa_1".into(),
                         observer: Some(Arc::new(move |_| {
-                            seen.fetch_add(1, Ordering::SeqCst);
+                            reports.fetch_add(1, Ordering::SeqCst);
                         })),
                     }),
                 };
-            })
-            .await;
+            }
+        }
+
+        /// #332 worker rollover through the stream loop. A read (r1), then a
+        /// stub of it (r2), then a rollover that evicts r1 but keeps r2: r2 is
+        /// rewritten so it no longer claims r1 is in context, stays
+        /// byte-identical in every later request, and the next re-read (r3)
+        /// is the full result, never a stub of the rewritten text.
+        #[tokio::test]
+        async fn a_worker_rollover_rewrites_a_kept_stub_whose_read_it_evicted() {
+            use crate::runtime::read_dedupe::DROPPED_STUB;
+            let dir = tempfile::tempdir().unwrap();
+            let file = dir.path().join("a.py");
+            std::fs::write(&file, source(100, "a")).unwrap();
+            // ~1.5k tokens each. Six keep r1 in context for r2; three more
+            // cross the 30k band, and the cut lands between r1 and r2.
+            const BEFORE: [&str; 6] =
+                ["toolu_f0", "toolu_f1", "toolu_f2", "toolu_f3", "toolu_f4", "toolu_f5"];
+            const AFTER: [&str; 3] = ["toolu_f6", "toolu_f7", "toolu_f8"];
+            let filler = |ids: &[&'static str]| -> Vec<Vec<Call>> {
+                ids.iter().map(|id| vec![(*id, "big_out", json!({}))]).collect()
+            };
+            let mut rounds = vec![vec![("toolu_r1", "read", read(&file))]];
+            rounds.extend(filler(&BEFORE));
+            rounds.push(vec![("toolu_r2", "read", read(&file))]);
+            rounds.extend(filler(&AFTER));
+            rounds.push(vec![("toolu_r3", "read", read(&file))]);
+            let stub = Value::String(unchanged_stub("toolu_r1"));
+
+            // Control: no rollover, r1 stays in context → both re-reads stub.
+            let kept = drive_rounds(go(), &rounds, true, |_| {}).await;
+            assert_eq!(kept.result("toolu_r2"), stub);
+            assert_eq!(kept.result("toolu_r3"), stub);
+
+            let transcripts = tempfile::tempdir().unwrap();
+            let reports = Arc::new(AtomicUsize::new(0));
+            let worker = rollover_worker(transcripts.path().to_path_buf(), Arc::clone(&reports));
+            let rolled = drive_rounds(go(), &rounds, true, worker).await;
             assert!(reports.load(Ordering::SeqCst) >= 1, "the worker rolled over");
-            // The rollover moved the first read out before the re-read ran...
-            let reread_request = rolled.bodies[FILLER.len() + 1].to_string();
-            assert!(!reread_request.contains("toolu_r1"), "evicted before the re-read");
-            // ...so the re-read is the full result, not a dangling stub.
-            assert_eq!(rolled.result("toolu_r2"), kept.result("toolu_r1"));
-            assert!(!rolled.event("toolu_r2").deduped);
+            // Before the rollover: r1 and its stub, as written.
+            let r2_request = BEFORE.len() + 2;
+            assert!(rolled.bodies[r2_request].to_string().contains("toolu_r1"));
+            assert_eq!(rolled.wire(r2_request, "toolu_r2"), stub);
+            // From the cut on: r1 is gone and r2 carries the fixed rewrite,
+            // byte-identical in every later request (cache-stable).
+            for body in r2_request + 1..rolled.bodies.len() {
+                assert!(!rolled.bodies[body].to_string().contains("toolu_r1"), "body {body}");
+                assert_eq!(rolled.wire(body, "toolu_r2"), DROPPED_STUB, "body {body}");
+            }
+            assert_eq!(rolled.result("toolu_r2"), DROPPED_STUB);
+            // The re-read after the cut is the full result: it never matches
+            // the rewritten stub, and its original is gone.
+            assert_eq!(rolled.result("toolu_r3"), kept.result("toolu_r1"));
+            assert!(!rolled.event("toolu_r3").deduped);
         }
 
         #[tokio::test]
