@@ -726,6 +726,23 @@ mod preamble_tests {
         );
         assert_eq!(result.matches(FORUM_GUIDANCE).count(), 1);
     }
+
+    /// Worker prompts are the agent's own text: the stock default prompt
+    /// (and its steering) never leaks into them.
+    #[test]
+    fn worker_prompt_never_includes_stock_default() {
+        for forum in [false, true] {
+            let result = compose_system_prompt_with_preamble("You are spike.".into(), None, forum);
+            let expected = if forum {
+                format!("You are spike.\n\n{FORUM_GUIDANCE}")
+            } else {
+                "You are spike.".to_string()
+            };
+            assert_eq!(result, expected);
+            assert!(!result.contains(crate::config::DEFAULT_PROMPT));
+            assert!(!result.contains("targeted edits"));
+        }
+    }
 }
 
 #[cfg(test)]

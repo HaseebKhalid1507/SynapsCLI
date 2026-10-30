@@ -47,6 +47,16 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- **The stock system prompt now steers working habits.** With only the
+  ~200-byte default, the model rewrote whole files, re-read files it had
+  just read or written, wrote heavy docs and ran verbose commands, and those
+  tokens rode along on every later request. The default (both the Windows
+  and the other variant) now adds four short habits: change files with
+  targeted edits, don't re-read a file that is still current, keep files,
+  docs and comments lean, and keep command output small. It grows from 202
+  to 539 bytes (Windows: 447 to 797). Only the built-in default changes: a
+  `--system` prompt, `system.md`, `identity`, agent files and worker
+  prompts are sent byte for byte as before.
 - **Subagent workers roll their context over automatically.** A worker's
   context used to grow until the model window was full (one reached about
   999k tokens), re-reading all of it every round, and a worker that filled
