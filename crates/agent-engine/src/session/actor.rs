@@ -958,6 +958,7 @@ impl SessionActor {
             cache_keepwarm: super::cache_keepwarm::KeepWarmState::new(
                 config.cache_keepwarm,
                 config.cache_keepwarm_auto_max_hours,
+                config.cache_keepwarm_headless,
                 cache_keepwarm,
             ),
             park_deadline: None,
