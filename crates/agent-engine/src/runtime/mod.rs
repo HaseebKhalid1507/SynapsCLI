@@ -700,9 +700,10 @@ pub struct Runtime {
     capture_dir: std::path::PathBuf,
     /// Opt into the cache-diagnosis beta (`cache-diagnosis-2026-04-07`).
     cache_diagnostics: bool,
-    /// Prompt-cache TTL strategy (5m default | 1h | hybrid). Threaded into
-    /// every request via `ApiOptions`.
-    cache_ttl: crate::core::config::CacheTtl,
+    /// Configured prompt-cache TTL (`auto` default | 5m | 1h | hybrid).
+    /// Threaded into every request via `ApiOptions`; `auto` is resolved per
+    /// request from the Anthropic credential kind (1h OAuth, 5m API key).
+    cache_ttl: crate::core::config::CacheTtlSetting,
     /// gzip policy for Anthropic request bodies (`request_compression`,
     /// `request_compression_level`). Threaded into every request via
     /// `ApiOptions`; its refusal latch is process-wide.
@@ -1351,7 +1352,7 @@ impl Runtime {
             one_shot_trace_writer: std::sync::Arc::new(std::sync::Mutex::new(None)),
             capture_dir: host.capture_dir,
             cache_diagnostics: false,
-            cache_ttl: crate::core::config::CacheTtl::default(),
+            cache_ttl: crate::core::config::CacheTtlSetting::default(),
             request_compression: Default::default(),
             ttl_downgrade_notified: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             saw_1h_honored: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -4096,8 +4097,21 @@ impl Runtime {
         self.cache_diagnostics = v;
     }
 
-    pub fn cache_ttl(&self) -> crate::core::config::CacheTtl {
+    /// The configured cache TTL (`auto` unless config or a caller fixed it).
+    /// What a request actually sends is [`Self::resolved_cache_ttl`].
+    pub fn cache_ttl(&self) -> crate::core::config::CacheTtlSetting {
         self.cache_ttl
+    }
+
+    /// The wire TTL the next Anthropic request will carry: the configured
+    /// setting resolved against the credential kind currently bound
+    /// (`auto`: 1h on OAuth/subscription, 5m on an API key). Same function
+    /// the request builder applies, so keep-warm scheduling and status
+    /// agree with the wire. Depends only on the kind, never on which
+    /// account: failover between seats of one kind leaves it unchanged.
+    pub async fn resolved_cache_ttl(&self) -> crate::core::config::CacheTtl {
+        let auth = self.auth.read().await;
+        self.cache_ttl.resolve_for_auth_type(&auth.auth_type)
     }
 
     /// Thread a parent runtime's TTL atomics onto this (cloned) runtime so
@@ -4124,11 +4138,21 @@ impl Runtime {
         })
     }
 
+    /// Test seam: set the bound Anthropic credential kind (`oauth` |
+    /// `api_key` | `none`) so `cache_ttl = auto` resolution can be exercised
+    /// without a real login.
+    #[cfg(test)]
+    pub(crate) async fn set_auth_kind_for_test(&self, kind: &str) {
+        self.auth.write().await.auth_type = kind.to_string();
+    }
+
     /// Change the cache TTL strategy mid-session. The next request re-marks
     /// with the new TTL; the old prefix expires naturally (single-last
     /// strategy never prunes old markers, so no invalidation logic needed).
-    pub fn set_cache_ttl(&mut self, ttl: crate::core::config::CacheTtl) {
-        self.cache_ttl = ttl;
+    /// Accepts a fixed [`crate::core::config::CacheTtl`] or a full
+    /// [`crate::core::config::CacheTtlSetting`] (including `auto`).
+    pub fn set_cache_ttl(&mut self, ttl: impl Into<crate::core::config::CacheTtlSetting>) {
+        self.cache_ttl = ttl.into();
     }
 
     /// Worker rollover policy from config (`apply_subagent_runtime_policy`).

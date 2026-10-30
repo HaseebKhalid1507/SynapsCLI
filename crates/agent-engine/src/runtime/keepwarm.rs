@@ -1468,6 +1468,92 @@ mod tests {
         assert!(canon(&o.ping["system"]).contains("SESSION-SCOPED-INJECTION"));
     }
 
+    /// A live OAuth (subscription) credential on `rt`, bound to the default
+    /// local seat so the turn's binding check takes the fast path instead of
+    /// re-resolving from auth.json.
+    fn bind_oauth(rt: &mut Runtime) {
+        rt.auth = Arc::new(tokio::sync::RwLock::new(super::super::types::AuthState {
+            auth_token: "oauth-test-token".to_string(),
+            auth_type: "oauth".to_string(),
+            refresh_token: None,
+            token_expires: Some(crate::epoch_millis() + 3_600_000),
+            auth_file_mtime: None,
+            bound_credential: Some(crate::runtime::auth::anthropic_binding(
+                &crate::auth::CredentialSource::Local,
+                &crate::auth::CredentialRef::default_for(crate::auth::OAuthProviderId::Anthropic),
+            )),
+        }));
+    }
+
+    /// Every `cache_control` value in a request body, in document order.
+    fn markers(v: &Value) -> Vec<Value> {
+        match v {
+            Value::Object(map) => map
+                .iter()
+                .flat_map(|(k, v)| {
+                    if k == "cache_control" {
+                        vec![v.clone()]
+                    } else {
+                        markers(v)
+                    }
+                })
+                .collect(),
+            Value::Array(items) => items.iter().flat_map(markers).collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// `cache_ttl = auto` on the real request path (turn, ping, next turn),
+    /// per credential kind: OAuth sends 1h on every marker, an API key the
+    /// bare 5m marker, and explicit values win over the kind both ways. For
+    /// `auto`, every body is byte-identical to what the explicit resolved
+    /// value sends: `auto` adds nothing to the wire.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn auto_ttl_wire_markers_follow_the_credential_kind() {
+        use crate::core::config::CacheTtlSetting;
+        let cases = [
+            (CacheTtlSetting::Auto, true, CacheTtl::OneHour),
+            (CacheTtlSetting::Auto, false, CacheTtl::FiveMinutes),
+            (CacheTtl::FiveMinutes.into(), true, CacheTtl::FiveMinutes),
+            (CacheTtl::OneHour.into(), false, CacheTtl::OneHour),
+        ];
+        for (setting, oauth, expect) in cases {
+            let ctx = format!("{setting} on {}", if oauth { "oauth" } else { "api_key" });
+            let observe = |setting: CacheTtlSetting| async move {
+                let _base = crate::test_env::BaseDirGuard::new();
+                let mut rt = opus(CacheTtl::FiveMinutes);
+                rt.set_cache_ttl(setting);
+                if oauth {
+                    bind_oauth(&mut rt);
+                }
+                let resolved = rt.resolved_cache_ttl().await;
+                (resolved, ping_then_next_turn(&rt).await)
+            };
+            let (resolved, o) = observe(setting).await;
+            assert_eq!(resolved, expect, "{ctx}");
+            let want = if expect == CacheTtl::OneHour {
+                marker_1h()
+            } else {
+                marker_5m()
+            };
+            assert_prefix_identical(&o.ping, &o.real, o.history_len, &want, 1);
+            for (name, body) in [("ping", &o.ping), ("next turn", &o.real)] {
+                let all = markers(body);
+                assert!(!all.is_empty(), "{ctx}: {name} has no markers");
+                assert!(
+                    all.iter().all(|m| *m == want),
+                    "{ctx}: {name} markers {all:?}, want all {want}"
+                );
+            }
+            if setting == CacheTtlSetting::Auto {
+                let (_, fixed) = observe(expect.into()).await;
+                assert_eq!(canon(&o.ping), canon(&fixed.ping), "{ctx}: ping bytes");
+                assert_eq!(canon(&o.real), canon(&fixed.real), "{ctx}: turn bytes");
+            }
+        }
+    }
+
     /// OAuth: the Claude Code transport identity and the extra system blocks
     /// are identical on both.
     #[tokio::test]
@@ -1475,19 +1561,7 @@ mod tests {
     async fn ping_prefix_matches_next_turn_with_oauth_system_blocks() {
         let _base = crate::test_env::BaseDirGuard::new();
         let mut rt = opus(CacheTtl::OneHour);
-        rt.auth = Arc::new(tokio::sync::RwLock::new(super::super::types::AuthState {
-            auth_token: "oauth-test-token".to_string(),
-            auth_type: "oauth".to_string(),
-            refresh_token: None,
-            token_expires: Some(crate::epoch_millis() + 3_600_000),
-            auth_file_mtime: None,
-            // Bound to the default local seat so the turn's binding check
-            // takes the fast path instead of re-resolving from auth.json.
-            bound_credential: Some(crate::runtime::auth::anthropic_binding(
-                &crate::auth::CredentialSource::Local,
-                &crate::auth::CredentialRef::default_for(crate::auth::OAuthProviderId::Anthropic),
-            )),
-        }));
+        bind_oauth(&mut rt);
         let o = assert_identity_1h(&rt).await;
         assert!(
             canon(&o.ping["system"]).contains("You are Claude Code"),

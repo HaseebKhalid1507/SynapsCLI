@@ -143,6 +143,10 @@ Parsing (config.rs key-match block, alongside `cache_diagnostics` at :461):
 | `hybrid` | `Hybrid` |
 | anything else | `FiveMinutes` + push to `config.warnings` (never block boot — house rule) |
 
+> **Superseded by §8:** the config value is now `CacheTtlSetting`, and
+> unset or invalid means `auto`, not `FiveMinutes`. `CacheTtl` stays as the
+> resolved wire policy.
+
 Add `"cache_ttl"` to the known-keys array at config.rs:219.
 
 **Rationale:** an enum, not a String, because there is a closed set of valid
@@ -379,7 +383,7 @@ Telemetry (`UsageRecord`) already carries the split; no change.
 
 | Case | Behavior |
 |---|---|
-| `cache_ttl` unset / invalid | 5m default + boot warning; payloads byte-identical to current release |
+| `cache_ttl` unset / invalid | `auto` (§8): 1h on OAuth, 5m on an API key (an API-key payload is byte-identical to the pre-feature release); invalid also warns at boot |
 | Mixed TTL within one request | Impossible by construction except the sanctioned Hybrid combination (1h prefix / 5m tail) — §3.3 |
 | 1h requested but only 5m honored (no 400) | One-time-per-session Notice; mode never auto-flipped (§3.4.1) |
 | TTL changed mid-session (`set_cache_ttl`) | Next request re-marks with new TTL; old prefix expires naturally; no invalidation logic needed because single-last strategy never prunes old markers |
@@ -441,7 +445,8 @@ Telemetry (`UsageRecord`) already carries the split; no change.
 **Opt-in, off by default.** When an interactive session goes idle, Synaps can
 keep its cached prefix alive with cache-read pings so that coming back reads
 the prefix at the cache-read price instead of re-writing it. Works with every
-TTL (`5m`, `1h`, `hybrid`) and every thinking mode, within the guards below.
+TTL (`5m`, `1h`, `hybrid`, and `auto` after it is resolved, §8) and every
+thinking mode, within the guards below.
 
 ```
 cache_keepwarm = auto               # off (default) | auto | <N>h  (N = 1–48)
@@ -865,6 +870,66 @@ written to history, the session file or the transcript.
   prompt-length tiers.
 - `agent_core::session_journal`: keep-warm labels snapshot-only, clamped on
   load, and the journal readable by 0.10.1's `SessionMeta`.
+
+## 8. `cache_ttl = auto` (the default)
+
+```
+cache_ttl = auto   # auto (default) | 5m | 1h | hybrid
+```
+
+**Why.** In a benchmark with 6-minute idle gaps (longer than 5m) on a
+subscription, the 5m TTL lost the conversation cache every turn and cost
+53-62% more than Claude Code. `cache_ttl = 1h` cost 40-43% less than 5m and
+8% less than Claude Code, which uses 1h by default on OAuth. On an API key a
+1h write costs 2x input instead of 1.25x (real dollars), so API-key users
+keep 5m.
+
+**Config.** `SynapsConfig::cache_ttl` is a `CacheTtlSetting`:
+`Auto` (default) or `Fixed(CacheTtl)`. `CacheTtlSetting::parse` accepts
+`auto` plus every `CacheTtl::parse` spelling; anything else is `auto` with a
+boot warning, and `validate_config_edit` / /settings reject it.
+`as_str` / `Display` give the canonical spelling, and parse(as_str(x)) is x.
+
+**Resolution.** `CacheTtlSetting::resolve_for_auth_type(auth_type)`:
+`Fixed(t)` is `t`; `Auto` is `OneHour` for `auth_type == "oauth"` and
+`FiveMinutes` for anything else (an API key). It runs once per request in
+`ApiMethods` (`api.rs` streaming, `api_sync.rs` sync), right after
+`build_auth_snapshot`, the point where the credential kind for that request
+is known. The resolved `CacheTtl` then drives everything §3 describes:
+the markers, the beta header (`build_beta_header` resolves the same way, so
+`auto` on an API key adds no `extended-cache-ttl` token and the OAuth beta
+set is unchanged), the request-trace prefix TTL and the §3.4.1 downgrade
+detector. Other providers never read `cache_ttl` (§4).
+
+**Stability.** The TTL is a function of the credential *kind* only, never of
+the account or token, because a TTL change rewrites the cache. Account
+failover (G3) re-pins another OAuth seat (`bind_pinned` keeps
+`auth_type = "oauth"`) and re-sends the same body, so the hop and every
+later request stay at 1h. Only an actual change of kind changes the TTL.
+`anthropic_failover_tests::auto_cache_ttl_is_stable_across_account_failover`
+pins this.
+
+**Runtime.** `Runtime::cache_ttl()` returns the configured setting;
+`Runtime::resolved_cache_ttl().await` resolves it against the bound
+credential kind with the same function. `set_cache_ttl` takes a `CacheTtl`
+or a `CacheTtlSetting`.
+
+**Workers.** Unchanged: `apply_subagent_runtime_policy` pins every worker to
+`Fixed(FiveMinutes)` (#110). `Runtime::new()` now defaults to `auto`, so that
+call is load-bearing: without it an OAuth worker would send 1h markers.
+
+**Keep-warm.** `PeriodConfig.ttl` is `resolved_cache_ttl()`, so `auto` on
+OAuth schedules and runs the §7.2 cost check exactly as an explicit `1h`:
+same governing TTL, same bound, same number of pings
+(`auto_ttl_on_oauth_keeps_warm_exactly_like_explicit_1h`).
+
+**Visibility.** `SessionQuery::Status` carries
+`"cache_ttl": {"setting": "auto", "resolved": "1h"}` (`resolved` is `null`
+off the native Anthropic transport), `/keepwarm status` prints
+`prompt-cache TTL: 1h (auto)`, and the /settings row reads
+`auto  → 1h (subscription login)` when a local Anthropic subscription
+login is present (without one it can't cheaply tell a remote broker's kind
+from no credentials, so it claims nothing).
 
 ---
 

@@ -346,7 +346,10 @@ impl ApiMethods {
         if options.use_1m_context && crate::core::models::model_supports_1m(model) {
             betas.push("context-1m-2025-08-07");
         }
-        if auth_type != "oauth" && options.cache_ttl != crate::core::config::CacheTtl::FiveMinutes {
+        if auth_type != "oauth"
+            && options.cache_ttl.resolve_for_auth_type(auth_type)
+                != crate::core::config::CacheTtl::FiveMinutes
+        {
             betas.push("extended-cache-ttl-2025-04-11");
         }
         if super::cache_diagnosis::wants_beta_header(auth_type, options) {
@@ -367,12 +370,30 @@ mod beta_header_tests {
 
     fn opts(ttl: CacheTtl) -> ApiOptions {
         ApiOptions {
-            cache_ttl: ttl,
+            cache_ttl: ttl.into(),
             ..Default::default()
         }
     }
 
     const MODEL: &str = "claude-sonnet-4-6";
+
+    #[test]
+    fn auto_ttl_beta_header_follows_resolved_ttl() {
+        // `auto` resolves to 5m on an API key: no extended-ttl token, so the
+        // default stays invisible for API-key users. On OAuth it resolves to
+        // 1h, which is honored bare: the OAuth beta set is unchanged.
+        let auto = ApiOptions::default();
+        assert_eq!(
+            auto.cache_ttl,
+            crate::core::config::CacheTtlSetting::Auto,
+            "precondition: ApiOptions defaults to cache_ttl = auto"
+        );
+        assert_eq!(ApiMethods::build_beta_header("api_key", &auto, MODEL), None);
+        assert_eq!(
+            ApiMethods::build_beta_header("oauth", &auto, MODEL),
+            ApiMethods::build_beta_header("oauth", &opts(CacheTtl::FiveMinutes), MODEL),
+        );
+    }
 
     #[test]
     fn api_key_5m_emits_no_header() {
@@ -411,7 +432,7 @@ mod beta_header_tests {
     fn extended_ttl_comma_joins_with_1m_context() {
         let options = ApiOptions {
             use_1m_context: true,
-            cache_ttl: CacheTtl::OneHour,
+            cache_ttl: CacheTtl::OneHour.into(),
             ..Default::default()
         };
         // claude-sonnet-4-6 supports 1M — precondition assert so this test

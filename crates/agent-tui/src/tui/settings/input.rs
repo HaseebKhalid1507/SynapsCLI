@@ -743,6 +743,7 @@ mod tests {
             ],
             catalog_overrides: std::collections::BTreeMap::new(),
             reasoning_type: "budget (legacy)".into(),
+            anthropic_subscription: false,
         }
     }
 
@@ -1034,6 +1035,27 @@ mod tests {
             help: None,
             default: None,
         }
+    }
+
+    /// `cache_ttl = auto` says what it resolves to when a subscription
+    /// login is present; explicit values and other rows are left bare.
+    #[test]
+    fn cache_ttl_auto_row_annotates_the_subscription_resolution() {
+        use super::super::draw::value_annotation;
+        let mut s = snap();
+        s.anthropic_subscription = true;
+        assert_eq!(
+            value_annotation("cache_ttl", "auto", &s).as_deref(),
+            Some("\u{2192} 1h (subscription login)")
+        );
+        for v in ["5m", "1h", "hybrid"] {
+            assert_eq!(value_annotation("cache_ttl", v, &s), None, "{v}");
+        }
+        assert_eq!(value_annotation("cache_keepwarm", "auto", &s), None);
+        // No local subscription login: the kind is unknown here (remote
+        // broker or no credentials), so nothing is claimed.
+        s.anthropic_subscription = false;
+        assert_eq!(value_annotation("cache_ttl", "auto", &s), None);
     }
 
     fn snap_with_plugin_cats(cats: Vec<PluginSettingsCategory>) -> RuntimeSnapshot {

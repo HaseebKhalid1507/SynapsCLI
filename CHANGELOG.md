@@ -92,7 +92,23 @@ All notable changes to this project will be documented in this file.
   than the estimate, the session's later periods go back to worst-case
   pricing. Thinking-off and adaptive pings (`max_tokens = 1`) are
   unchanged. Pings still send the turn's exact thinking configuration.
-
+- **The prompt cache lasts 1 hour on a Claude subscription by default.**
+  `cache_ttl` has a new default, `auto`: 1h when the request goes out on
+  Anthropic OAuth/subscription credentials (what Claude Code does), 5m on
+  an Anthropic API key, where a 1h cache write costs 2x input instead of
+  1.25x. Before, every session used 5m, so a pause longer than five minutes
+  lost the cached conversation and the next turn rewrote all of it. In a
+  benchmark with 6-minute gaps, 1h cost 40-43% less than 5m, and 8% less
+  than Claude Code. The TTL follows the credential *kind*, not the account:
+  an account failover between subscription seats keeps it, so the cache is
+  not rewritten. Explicit `5m`, `1h` and `hybrid` work as before; to keep
+  the old behaviour, set `cache_ttl = 5m`. Subagent workers still always
+  use 5m. Keep-warm (`cache_keepwarm`) schedules and costs pings on the
+  resolved TTL, the same as an explicit `1h`. /settings → Context & Cache
+  gains `auto` and shows `→ 1h (subscription login)`; `/keepwarm status`
+  and the session `Status` query (`cache_ttl: {setting, resolved}`) show
+  what it resolved to. See
+  [docs/specs/cache-ttl-spec.md §8](docs/specs/cache-ttl-spec.md#8-cache_ttl--auto-the-default).
 - **Subagent workers roll their context over automatically.** A worker's
   context used to grow until the model window was full (one reached about
   999k tokens), re-reading all of it every round, and a worker that filled

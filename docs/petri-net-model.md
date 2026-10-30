@@ -166,7 +166,7 @@ The Cache place is the provider's cached prefix. It covers tools → system → 
 **hit and miss.**
 - hit (prio 2) is a self-loop on Cache. Each hit therefore restarts `expire`'s timer: the TTL runs from the start of the request that read the entry.
 - miss (prio 1) is the "else": with no Cache token, the request writes the prefix and creates the token.
-- `cache_ttl` is `5m` (the default), `1h` or `hybrid`.
+- `cache_ttl` is `auto` (the default: 1h on an Anthropic subscription/OAuth login, 5m on an API key), `5m`, `1h` or `hybrid`. Subagent workers always use `5m`.
 
 **Only two transitions remove the token:** expire, and prefix_change.
 - **prefix_change** covers anything that rewrites the front of the request: compaction or rollover, and a change of model, thinking, effort, tools or system prompt.

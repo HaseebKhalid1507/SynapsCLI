@@ -408,8 +408,8 @@ define_settings! {
     // (`config_edit`), so /settings can never write a value `load_config`
     // rejects; `Local(Err)` skips the write.
 
-    "cache_ttl", "Cache TTL", Context, EditorKind::Cycler(&["5m", "1h", "hybrid"]),
-        "Prompt-cache lifetime for Anthropic requests: 5m (default), 1h on every marker, or hybrid (1h on the stable prefix, 5m on the message tail). Takes effect next launch.",
+    "cache_ttl", "Cache TTL", Context, EditorKind::Cycler(&["auto", "5m", "1h", "hybrid"]),
+        "Prompt-cache lifetime for Anthropic requests: auto (default: 1h on a Claude subscription login, 5m on an API key, where 1h writes cost 2x input), 5m, 1h on every marker, or hybrid (1h on the stable prefix, 5m on the message tail). Subagent workers always use 5m. Takes effect next launch.",
         |_app, value| config_edit("cache_ttl", value);
 
     "cache_diagnostics", "Cache diagnostics", Context, EditorKind::Cycler(&["on", "off"]),
@@ -1095,6 +1095,31 @@ mod tests {
         assert!(bad.is_empty(), "{bad:#?}");
     }
 
+    /// `cache_ttl` shows `auto` when unset (the config default) and when
+    /// set to it; unknown values fall back to the same default the parser
+    /// uses. Each shown value is a cycler option.
+    #[test]
+    fn cache_ttl_row_defaults_to_auto() {
+        use super::super::draw::config_row_display;
+        let _lock = config_lock();
+        for (content, shown) in [
+            ("", "auto"),
+            ("cache_ttl = auto\n", "auto"),
+            ("cache_ttl = 5m\n", "5m"),
+            ("cache_ttl = hybrid\n", "hybrid"),
+            ("cache_ttl = 2h\n", "auto"),
+        ] {
+            let temp = TempConfig::new(content);
+            assert_eq!(config_row_display("cache_ttl").as_deref(), Some(shown), "{content:?}");
+            drop(temp);
+        }
+        let def = ALL_SETTINGS.iter().find(|d| d.key == "cache_ttl").unwrap();
+        match def.editor {
+            EditorKind::Cycler(opts) => assert_eq!(opts, &["auto", "5m", "1h", "hybrid"]),
+            _ => panic!("cache_ttl editor should be a Cycler"),
+        }
+    }
+
     /// The display follows the configured value (normalised spellings).
     #[test]
     fn config_row_display_reads_the_configured_value() {
@@ -1210,6 +1235,7 @@ mod tests {
             let mut d = |key: &str, value: &str| apply_setting_dispatch(key, value, &mut app);
 
             assert!(is_ok(d("cache_ttl", "hybrid")));
+            assert!(is_ok(d("cache_ttl", "auto")));
             assert!(is_err(d("cache_ttl", "2h")));
             assert!(is_ok(d("cache_keepwarm", "6h")));
             assert!(is_err(d("cache_keepwarm", "49h")));
