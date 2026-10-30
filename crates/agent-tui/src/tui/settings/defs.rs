@@ -287,6 +287,10 @@ define_settings! {
         "Bytes from the end of a spilled tool result kept in history, where errors usually are (default 3072).",
         |_app, value| whole_number("tool_output_spill_tail_bytes", value);
 
+    "read_dedupe", "Read dedupe", ToolLimits, EditorKind::Cycler(&["on", "off"]),
+        "A re-read of a file whose result would be identical to an earlier read still in context returns a short stub pointing at that earlier result, and write/edit results say there is no need to re-read to verify (default on; off = full results every time). Applies to new sessions and workers.",
+        |_app, value| on_off("read_dedupe", value);
+
     "bash_timeout", "Bash timeout", ToolLimits, EditorKind::Text { numeric: true },
         "Default seconds allowed for a bash command.",
         |_app, value| match value.parse::<u64>() {
@@ -1143,6 +1147,31 @@ mod tests {
             assert!(is_ok(d("subagent_rollover_tokens", "20000")));
             assert!(is_err(d("subagent_rollover_tokens", "19999")));
             assert!(is_err(d("subagent_rollover_tokens", "lots")));
+        }
+        drop(temp);
+    }
+
+    #[test]
+    fn read_dedupe_row_displays_and_validates() {
+        use super::super::draw::config_row_display;
+        let _lock = config_lock();
+        for (content, shown) in [
+            ("", "on"),
+            ("read_dedupe = off\n", "off"),
+            ("read_dedupe = true\n", "on"),
+            ("read_dedupe = maybe\n", "on"),
+        ] {
+            let temp = TempConfig::new(content);
+            assert_eq!(config_row_display("read_dedupe").as_deref(), Some(shown), "{content}");
+            drop(temp);
+        }
+        let temp = TempConfig::new("");
+        let mut app = app_with_model("m");
+        {
+            let mut d = |key: &str, value: &str| apply_setting_dispatch(key, value, &mut app);
+            assert!(is_ok(d("read_dedupe", "off")));
+            assert!(is_ok(d("read_dedupe", "on")));
+            assert!(is_err(d("read_dedupe", "maybe")));
         }
         drop(temp);
     }

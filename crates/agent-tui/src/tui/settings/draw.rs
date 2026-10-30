@@ -823,6 +823,7 @@ pub(crate) fn config_row_display(key: &str) -> Option<String> {
             checked_config_display(key, ok, DEFAULT_DISPLAY)
         }
         // Tool limits
+        "read_dedupe" => bool_config_display(key, true),
         "tool_output_spill_bytes" => raw_config(key)
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(cfg::DEFAULT_TOOL_OUTPUT_SPILL_BYTES)
