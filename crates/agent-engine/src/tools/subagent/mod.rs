@@ -155,6 +155,10 @@ pub(crate) fn apply_subagent_runtime_policy(
         config,
     ));
     runtime.set_read_dedupe(config.read_dedupe);
+    // Keep the 5m cache warm while a tool round runs (`cache_keepwarm_tools`):
+    // a worker's builds, test sweeps and poll loops routinely outlast the
+    // TTL pinned below, and their 300s default `bash_max_timeout` equals it.
+    runtime.set_tool_keepwarm(config.cache_keepwarm_tools);
     // Tool limits, as the foreground gets them through `apply_config`.
     // Without them a worker ran every command under the 30s/300s defaults and
     // truncated tool output at 30000 whatever the operator configured.
@@ -699,6 +703,20 @@ mod cache_ttl_policy_tests {
         let off = agent_core::config::load_config_from_str("read_dedupe = off\n");
         apply_subagent_runtime_policy(&mut runtime, &off, None, None, None, &Default::default());
         assert!(!runtime.read_dedupe());
+    }
+
+    /// Workers keep their cache warm through long tool rounds, from the
+    /// foreground's key (default on).
+    #[test]
+    fn subagent_policy_takes_tool_keepwarm_from_config() {
+        let mut runtime = crate::Runtime::new_headless();
+        assert!(!runtime.tool_keepwarm(), "off until configured");
+        let on = agent_core::config::load_config_from_str("");
+        apply_subagent_runtime_policy(&mut runtime, &on, None, None, None, &Default::default());
+        assert!(runtime.tool_keepwarm());
+        let off = agent_core::config::load_config_from_str("cache_keepwarm_tools = off\n");
+        apply_subagent_runtime_policy(&mut runtime, &off, None, None, None, &Default::default());
+        assert!(!runtime.tool_keepwarm());
     }
 
     /// G3/G4/G5/G6: a worker runs under the configured bash timeouts, tool
@@ -2144,6 +2162,112 @@ mod worker_context_window_wire_tests {
 #[cfg(test)]
 #[path = "../../../tests/support/worker_wire.rs"]
 mod worker_wire;
+
+/// Tool-round keep-warm (`cache_keepwarm_tools`) reaches the worker of every
+/// spawn path with no `EngineHost`: a `bash` call that outlives the cache
+/// TTL is kept warm and the request after it reads the prefix; with the key
+/// off the same worker rewrites it.
+#[cfg(all(test, unix, feature = "command-exec"))]
+mod worker_tool_keepwarm_tests {
+    use crate::runtime::cache_sim::{self, Req, Sim};
+    use crate::runtime::subagent::{SubagentRegistry, SubagentStatus};
+    use crate::runtime::tool_keepwarm::testing::IntervalOverride;
+    use crate::test_env::{BaseDirGuard, EnvVarGuard};
+    use crate::tools::test_helpers::create_tool_context;
+    use crate::tools::Tool;
+    use serde_json::{json, Value};
+    use std::sync::{Arc, Mutex};
+
+    fn task() -> Value {
+        let prompt = format!("test worker\n{}", "padding ".repeat(3000));
+        json!({"system_prompt": prompt, "task": "run it", "model": "anthropic/claude-sonnet-4-6", "timeout": 60})
+    }
+
+    fn ctx(registry: &Arc<Mutex<SubagentRegistry>>) -> crate::tools::ToolContext {
+        let mut ctx = create_tool_context();
+        ctx.capabilities.subagent_registry = Some(registry.clone());
+        ctx
+    }
+
+    async fn finish(registry: &Arc<Mutex<SubagentRegistry>>, handle_id: &str) {
+        for _ in 0..600 {
+            let done = registry
+                .lock()
+                .unwrap()
+                .get(handle_id)
+                .is_none_or(|h| h.status() != SubagentStatus::Running);
+            if done {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let thread = registry.lock().unwrap().get_mut(handle_id).and_then(|h| h.thread_handle.take());
+        if let Some(thread) = thread {
+            tokio::task::spawn_blocking(move || thread.join()).await.unwrap().unwrap();
+        }
+        let status = registry.lock().unwrap().get(handle_id).map(|h| h.status());
+        assert_eq!(status, Some(SubagentStatus::Completed), "{handle_id}");
+    }
+
+    async fn oneshot(sim: &Arc<Mutex<Sim>>) -> Vec<Req> {
+        let registry = Arc::new(Mutex::new(SubagentRegistry::new()));
+        let out = super::SubagentTool.execute(task(), ctx(&registry)).await.expect("subagent");
+        assert!(out.contains("done"), "{out}");
+        cache_sim::take(sim)
+    }
+
+    /// The requests of the oneshot, start and resume workers, in that order.
+    async fn run_three_paths(sim: &Arc<Mutex<Sim>>) -> [Vec<Req>; 3] {
+        let registry = Arc::new(Mutex::new(SubagentRegistry::new()));
+        let oneshot = oneshot(sim).await;
+        let out = super::SubagentStartTool.execute(task(), ctx(&registry)).await.expect("subagent_start");
+        let handle = serde_json::from_str::<Value>(&out).unwrap()["handle_id"].as_str().unwrap().to_owned();
+        finish(&registry, &handle).await;
+        let start = cache_sim::take(sim);
+        let out = super::SubagentResumeTool
+            .execute(json!({"handle_id": handle, "instructions": "again", "timeout": 60}), ctx(&registry))
+            .await
+            .expect("subagent_resume");
+        let resumed = serde_json::from_str::<Value>(&out).unwrap()["handle_id"].as_str().unwrap().to_owned();
+        finish(&registry, &resumed).await;
+        [oneshot, start, cache_sim::take(sim)]
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn every_spawn_path_keeps_a_long_tool_round_warm_without_a_host() {
+        assert!(crate::EngineHost::current().is_none(), "the no-host fallback");
+        let base = BaseDirGuard::new();
+        std::fs::write(base.path().join("auth.json"), super::worker_wire::OAUTH_AUTH_JSON).unwrap();
+        std::fs::write(base.path().join("config"), "").unwrap();
+        let (url, sim) = cache_sim::spawn(
+            cache_sim::WORKER_TTL,
+            "bash",
+            json!({"command": cache_sim::WORKER_SLEEP}),
+        )
+        .await;
+        let _env = [
+            EnvVarGuard::remove("SYNAPS_AUTH_ENDPOINT"),
+            EnvVarGuard::remove("SYNAPS_MACHINE_TOKEN"),
+            EnvVarGuard::remove("SYNAPS_SUBAGENT_FRESH_RUNTIME"),
+            EnvVarGuard::remove("ANTHROPIC_API_KEY"),
+            EnvVarGuard::set("SYNAPS_ANTHROPIC_BASE_URL", &url),
+        ];
+        let _interval = IntervalOverride::set(cache_sim::WORKER_INTERVAL);
+
+        let runs = run_three_paths(&sim).await;
+        for (path, requests) in ["oneshot", "start", "resume"].iter().zip(&runs) {
+            cache_sim::assert_worker_kept_warm(&format!("no-host {path}"), requests);
+        }
+        // Stopped with the rounds: nothing once the workers are done.
+        tokio::time::sleep(cache_sim::WORKER_INTERVAL * 3).await;
+        assert!(cache_sim::take(&sim).is_empty(), "a ping after the workers");
+
+        // Control: the key off, the same worker rewrites its prefix.
+        std::fs::write(base.path().join("config"), "cache_keepwarm_tools = off\n").unwrap();
+        cache_sim::assert_worker_rewrites("no-host off", &oneshot(&sim).await);
+    }
+}
 
 /// What the worker of every spawn path puts on the wire under a locked-down,
 /// diagnostics-on, gzip-on config, with no `EngineHost` (the `load_config()`

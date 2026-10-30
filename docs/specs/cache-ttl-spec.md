@@ -871,6 +871,71 @@ written to history, the session file or the transcript.
 - `agent_core::session_journal`: keep-warm labels snapshot-only, clamped on
   load, and the journal readable by 0.10.1's `SessionMeta`.
 
+### 7.9 Tool rounds (`cache_keepwarm_tools`)
+
+```
+cache_keepwarm_tools = true   # default; keep the cache warm while a tool round runs
+```
+
+The idle keep-warm above covers a session nobody is typing in. A different
+expiry happens *inside* a turn: a round asks for tools, the tools run longer
+than the TTL (a worker's `cargo build`, a full test sweep, a `sleep N; poll`
+loop; workers are pinned to 5m and their default `bash_max_timeout` is also
+300 s), and the request carrying the results finds the prefix gone and
+rewrites all of it at 1.25×. Two such rounds in one day of `api-log.jsonl`
+rewrote 658k tokens (429k and 229k).
+
+`runtime::tool_keepwarm` runs beside the tools of every round that asked
+for some, on the native Anthropic transport, when the round's request
+cached something:
+
+- **The ping replays the round.** It re-sends that round's own request: the
+  same request messages (Arc clones, no copy, nothing persisted), tools,
+  system prompt, thinking config, beta headers and options, through the
+  same `call_api_stream_inner`, with `ApiOptions::keepwarm` set
+  (`KeepWarmMode::Replay`). The transport processes and marks the messages
+  exactly as for the round, *then* appends the ping text as a trailing
+  block of the last user message. Every breakpoint lands where the round
+  put it; the ping text is an uncached tail; the next real request (the
+  round plus its tool results) reads the prefix as if no time had passed.
+- **Schedule.** Due at the round's cache anchor + `ping_interval(TTL)`
+  (§7.3: 4.5 min on 5m, 55 min on 1h) and again after each accepted ping,
+  on the monotonic and wall clocks (`WALL_POLL`), never inside `LATE_GUARD`
+  of expiry.
+- **Stop.** When the tools return (before the results request goes out, so
+  no ping races it), on turn cancel (child token of the turn's), and on any
+  other way out of the round (the guard's `Drop`). A ping in flight is
+  aborted and booked by `ping_booking`.
+- **Guards** (the idle period's, §7.2/§7.5): the ski-rental bound on the
+  expected cost against one rewrite of the prefix at the honoured TTL; the
+  turn's `max_cost_usd`; stop on a ping that read nothing or wrote / paid
+  uncached for more than `SHARE_LIMIT_PERCENT`, a 4xx, or exhausted
+  `BACKOFF` retries.
+- **Accounting.** `max_tokens` is cut to 1 (+ the thinking budget, which
+  must match the round's for the cache to hold); retries off; the
+  api-log/telemetry record carries `"keepwarm": true`; usage goes to the
+  turn's counters (turn budget) and the session / worker cost.
+
+It applies to the foreground and to workers (`apply_subagent_runtime_policy`,
+the one policy point of every spawn path: oneshot, start, resume, host and
+legacy runtimes). On a 1h TTL it fires only for a single tool round over
+55 minutes. It is independent of `cache_keepwarm` (which defaults to off and
+only covers idle sessions).
+
+Cost: a ping reads the prefix at 0.1× (0.05× on the 5.5 models) against a
+1.25× rewrite. Over the 7 days of api-log to 2026-10-30, 92 tool rounds
+outlasted 270 s; pinging them would have cost about $8.43 (96 pings) and
+saved $12.19 of rewrites (2.50M tokens), net +$3.76. A 1h TTL for workers
+instead would have cost $405.59 more in writes to save $19.84.
+
+Tests: `runtime::stream` `tool_keepwarm_stream` (a cache-simulating
+provider, `tests/support/cache_sim.rs`: pings after the threshold, repeat,
+stop on completion and cancel, none for a short round, byte-level prefix
+equality, the request after the round reads the whole prefix; the control
+without keep-warm rewrites it), `tools::subagent::worker_tool_keepwarm_tests`
+(no host) and `tests/worker_tool_keepwarm.rs` (host and legacy branches),
+each over oneshot, start and resume, with the key off as control.
+
 ## 8. `cache_ttl = auto` (the default)
 
 ```

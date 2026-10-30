@@ -358,6 +358,24 @@ impl HelperMethods {
         }
     }
 
+    /// Append a keep-warm ping message AFTER marker placement, the way the
+    /// sanitize adjacency merge would have placed it: a new message after a
+    /// different role (the idle ping after a finished reply), else folded
+    /// into the last message as trailing blocks (a tool-round replay, whose
+    /// prefix ends with the round's user message). Either way it sits after
+    /// every marker, so it is an uncached tail that never enters a cache
+    /// entry and never moves a breakpoint.
+    pub(super) fn append_keepwarm_ping(messages: &mut Vec<SharedMessage>, ping: SharedMessage) {
+        let Some(last) = messages.last_mut().filter(|last| last["role"] == ping["role"]) else {
+            messages.push(ping);
+            return;
+        };
+        let last = Arc::make_mut(last);
+        let mut blocks = Self::coerce_content_to_blocks(std::mem::take(&mut last["content"]));
+        blocks.extend(Self::coerce_content_to_blocks(ping["content"].clone()));
+        last["content"] = Value::Array(blocks);
+    }
+
     /// Annotate a cache breakpoint on the last message (single-last strategy).
     /// Per S204 benchmarks, single-last matches sliding-4 performance (96–97% hit
     /// vs 96.7%) — a single stationary marker on the most recent message maximizes

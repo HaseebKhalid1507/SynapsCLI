@@ -387,6 +387,51 @@ pub fn reply_prefix_tokens(history: &[SharedMessage]) -> u64 {
     super::context::conservative_token_estimate(&kept.to_string())
 }
 
+/// Run one ping's request to completion, draining its private event channel
+/// WHILE it runs: usage lands in the tap as it arrives, so an aborted ping
+/// can still be booked. Notices (and retry notes) are collected; with
+/// `forward`, the ping's `Usage` and `Notice` events are also passed on as
+/// they arrive (a tool-round ping books into its turn).
+pub(super) async fn drive_ping<F>(
+    call: F,
+    rx: &mut mpsc::UnboundedReceiver<StreamEvent>,
+    tap: &PingTap,
+    forward: Option<&mpsc::UnboundedSender<StreamEvent>>,
+) -> (Result<Value>, Vec<String>)
+where
+    F: std::future::Future<Output = Result<Value>>,
+{
+    tokio::pin!(call);
+    let mut notices = Vec::new();
+    let mut on_event = |event: StreamEvent| {
+        if let StreamEvent::Session(SessionEvent::Notice(n) | SessionEvent::Retry(n)) = &event {
+            notices.push(n.clone());
+        }
+        tap.usage
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .add(&event);
+        if let Some(tx) = forward {
+            if matches!(
+                event,
+                StreamEvent::Session(SessionEvent::Usage { .. } | SessionEvent::Notice(_))
+            ) {
+                let _ = tx.send(event);
+            }
+        }
+    };
+    let result = loop {
+        tokio::select! {
+            r = &mut call => break r,
+            Some(event) = rx.recv() => on_event(event),
+        }
+    };
+    while let Ok(event) = rx.try_recv() {
+        on_event(event);
+    }
+    (result, notices)
+}
+
 impl Runtime {
     /// Why this runtime cannot keep its cache warm, or `None` when it can.
     /// Only the native Anthropic transport carries `cache_control`; every
@@ -685,28 +730,7 @@ impl Runtime {
             &options,
             self.telemetry_level,
         );
-        tokio::pin!(call);
-        // Drain events WHILE the request runs: usage lands in the tap as it
-        // arrives, so an aborted ping can still be booked.
-        let mut notices = Vec::new();
-        let mut on_event = |event: StreamEvent| {
-            if let StreamEvent::Session(SessionEvent::Notice(n) | SessionEvent::Retry(n)) = &event {
-                notices.push(n.clone());
-            }
-            tap.usage
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .add(&event);
-        };
-        let mut result = loop {
-            tokio::select! {
-                r = &mut call => break r,
-                Some(event) = rx.recv() => on_event(event),
-            }
-        };
-        while let Ok(event) = rx.try_recv() {
-            on_event(event);
-        }
+        let (mut result, notices) = drive_ping(call, &mut rx, tap, None).await;
         // Probe: also run the next turn's pre-request context assessment.
         if let (Ok(value), KeepWarmMode::Probe) = (&mut result, mode) {
             if context_enabled {

@@ -749,6 +749,7 @@ pub(crate) fn config_row_display(key: &str) -> Option<String> {
             .to_string(),
         "cache_diagnostics" => bool_config_display(key, false),
         "cache_keepwarm_headless" => bool_config_display(key, false),
+        "cache_keepwarm_tools" => bool_config_display(key, true),
         "cache_keepwarm" => raw_config(key)
             .and_then(|v| cfg::CacheKeepWarm::parse(&v))
             .unwrap_or_default()
