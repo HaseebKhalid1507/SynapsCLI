@@ -847,6 +847,7 @@ async fn the_session_start_wait_yields_to_cancel_and_end() {
 }
 
 /// One assistant response calling `bash` with `command` as `tool_id`.
+#[cfg(feature = "command-exec")]
 fn bash_round(tool_id: &str, command: &str) -> &'static str {
     let usage = serde_json::json!({"input_tokens": 10, "output_tokens": 0, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0});
     let events = [
@@ -865,6 +866,7 @@ fn bash_round(tool_id: &str, command: &str) -> &'static str {
 }
 
 /// Everything up to the next `Idle` (a turn's events on any attached client).
+#[cfg(feature = "command-exec")]
 async fn until_idle(t: &mut SocketTransport) -> Vec<SessionEventWire> {
     let mut out = Vec::new();
     loop {
@@ -881,6 +883,7 @@ async fn until_idle(t: &mut SocketTransport) -> Vec<SessionEventWire> {
 }
 
 /// The child events seen for `tool_id`: ("tool_child" | "tool_child_ended", exit code).
+#[cfg(feature = "command-exec")]
 fn child_events(events: &[SessionEventWire], tool_id: &str) -> Vec<(&'static str, Option<i32>)> {
     use agent_engine::session::child_events::ChildProcessEvent;
     events
@@ -896,6 +899,7 @@ fn child_events(events: &[SessionEventWire], tool_id: &str) -> Vec<(&'static str
 }
 
 /// `children` for one session, on a fresh control connection.
+#[cfg(feature = "command-exec")]
 async fn children_of(paths: &registry::DaemonPaths, sid: &SessionId) -> ChildListReply {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     let (r, mut w) = agent_engine::ipc::split_client(agent_engine::ipc::connect(&paths.sock).await.unwrap());
@@ -916,7 +920,8 @@ async fn children_of(paths: &registry::DaemonPaths, sid: &SessionId) -> ChildLis
 /// Across a reload: the child ledger is carried in the reload state,
 /// `features` is on the new image's Welcome, and each connection's optional
 /// events come from its own (new) Hello, never from state kept across the
-/// exec.
+/// exec. Needs the `command-exec` feature (the children come from `bash`).
+#[cfg(feature = "command-exec")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn reload_carries_the_child_ledger_and_takes_the_opt_in_from_each_new_hello() {

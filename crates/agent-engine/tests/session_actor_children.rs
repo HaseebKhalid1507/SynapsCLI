@@ -4,7 +4,9 @@
 //! worker's children on the parent session with the worker's handle id.
 //!
 //! Loopback Anthropic SSE stub; production runtime / actor / bash tool.
-#![cfg(target_os = "linux")]
+//! Linux only, and needs the `command-exec` feature (the children come from
+//! `bash` tool calls).
+#![cfg(all(target_os = "linux", feature = "command-exec"))]
 
 mod session_actor_common;
 use session_actor_common::*;
