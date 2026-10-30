@@ -89,6 +89,21 @@ pub(crate) fn turn_error_for(
     }
 }
 
+/// Whether the conversational cache marker may sit on `block`: durable bytes
+/// the next request re-sends, on a block the API accepts `cache_control` on.
+/// Never thinking/redacted_thinking, an empty text block, or request-only
+/// text (per-turn extension context, a context advisory).
+fn tail_markable(block: &Value) -> bool {
+    match block["type"].as_str() {
+        Some("thinking" | "redacted_thinking") => false,
+        Some("text") => {
+            block["text"].as_str().is_some_and(|text| !text.is_empty())
+                && !super::stream::is_ephemeral_turn_context_block(block)
+        }
+        _ => true,
+    }
+}
+
 impl HelperMethods {
     /// Drain all pending steering messages from the channel and inject them
     /// into the conversation as user messages. Returns true if any were injected.
@@ -357,14 +372,24 @@ impl HelperMethods {
     /// entry terminating in them could never be matched by any later request,
     /// which would kill every conversational cache hit in tool-free chat
     /// (#297 follow-up). Mid-message `cache_control` breakpoints are legal;
-    /// the ephemeral block rides after the marker as an uncached tail.
+    /// the ephemeral block rides after the marker as an uncached tail. The
+    /// same holds for a request-only context advisory, which the sanitize
+    /// adjacency merge folds into the newest user message as a trailing text
+    /// block (see `stream::is_ephemeral_turn_context_block`).
+    ///
+    /// When the last message holds no markable block (an advisory-only user
+    /// message, or an empty user text plus an advisory, which the merge
+    /// reduces to the advisory alone) the marker walks back to the last
+    /// markable block of an earlier message instead of being dropped. It is
+    /// never stamped on a thinking block or an empty text block.
     pub(super) fn annotate_cache_breakpoint(messages: &mut [SharedMessage], ttl: CacheTtl) {
         let Some(last) = messages.last_mut() else {
             return;
         };
         // The last message is always edited (marker stamp), so the CoW clone
         // here is the one unavoidable per-request message copy — exactly one
-        // message, never the history. Earlier messages are never touched.
+        // message, never the history. Earlier messages are only touched by
+        // the walk-back below, which a durable last message never reaches.
         let last = Arc::make_mut(last);
 
         // Coerce raw string content into a block array so we can attach cache_control.
@@ -372,13 +397,29 @@ impl HelperMethods {
             last["content"] = json!([{"type": "text", "text": text}]);
         }
 
-        if let Some(block) = last["content"].as_array_mut().and_then(|c| {
-            c.iter_mut()
-                .rev()
-                .find(|b| !super::stream::is_ephemeral_turn_context_block(b))
-        }) {
-            block["cache_control"] = cache_control_value(ttl, MarkerSite::MessageTail);
+        let target = messages
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, message)| match &message["content"] {
+                Value::String(text) => {
+                    tail_markable(&json!({"type": "text", "text": text})).then_some((index, 0))
+                }
+                Value::Array(blocks) => blocks
+                    .iter()
+                    .rposition(tail_markable)
+                    .map(|block| (index, block)),
+                _ => None,
+            });
+        let Some((index, block)) = target else {
+            return;
+        };
+        let message = Arc::make_mut(&mut messages[index]);
+        if let Some(text) = message["content"].as_str().map(str::to_owned) {
+            message["content"] = json!([{"type": "text", "text": text}]);
         }
+        message["content"][block]["cache_control"] =
+            cache_control_value(ttl, MarkerSite::MessageTail);
     }
 
     /// Annotate the retention anchor: a message-tail-TTL cache breakpoint on
