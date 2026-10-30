@@ -724,6 +724,78 @@ mod transport_tests {
         assert!(!c.refused(), "the plain resend failed too: not the encoding");
     }
 
+    /// The window clamp is wired into all three transports: a model that
+    /// rejects input + `max_tokens` over the window (Sonnet 4) gets the room
+    /// its ~160k-token input leaves of 200k; a Claude 4.5+ model gets its
+    /// full 64k, the same body as before the clamp existed.
+    #[tokio::test]
+    async fn every_transport_clamps_max_tokens_only_for_models_that_reject_overflow() {
+        let near = vec![Arc::new(json!({"role": "user", "content": "x".repeat(400_000)}))
+            as crate::SharedMessage];
+        for (model, clamped) in [("claude-sonnet-4-20250514", true), ("claude-sonnet-4-5-20250929", false)] {
+            let (url, seen) = server(Server::Accepts).await;
+            let opts = options(&url, RequestCompression::default());
+            let (tx, _rx) = mpsc::unbounded_channel::<StreamEvent>();
+            ApiMethods::call_api_stream(
+                &auth(),
+                &reqwest::Client::new(),
+                model,
+                &ToolRegistry::new(),
+                &None,
+                0,
+                agent_core::reasoning::ReasoningLevel::Adaptive,
+                &near,
+                tx,
+                0,
+                0,
+                &opts,
+                TelemetryLevel::Off,
+            )
+            .await
+            .expect("stream");
+            ApiMethods::call_api(
+                &auth(),
+                &reqwest::Client::new(),
+                model,
+                &ToolRegistry::new(),
+                &None,
+                0,
+                agent_core::reasoning::ReasoningLevel::Adaptive,
+                &near,
+                0,
+                &opts,
+            )
+            .await
+            .expect("sync");
+            ApiMethods::call_api_simple(
+                &auth(),
+                &reqwest::Client::new(),
+                model,
+                "summarize",
+                0,
+                agent_core::reasoning::ReasoningLevel::Adaptive,
+                &near,
+                0,
+                &opts,
+            )
+            .await
+            .expect("compaction");
+            let seen = seen.lock().unwrap();
+            assert_eq!(seen.len(), 3, "{model}");
+            for (_, body) in seen.iter() {
+                let max = body["max_tokens"].as_u64().unwrap();
+                assert_eq!(body["thinking"]["budget_tokens"], 16_384, "{model}");
+                if clamped {
+                    // 200k − ~160k of messages − the tool schemas (none on
+                    // the compaction path), above the thinking floor.
+                    assert!((20_480..40_000).contains(&max), "{model}: {max}");
+                } else {
+                    assert_eq!(max, 64_000, "{model}");
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn sync_and_compaction_paths_compress_and_fall_back_too() {
         let (url, seen) = server(Server::RefusesGzip).await;

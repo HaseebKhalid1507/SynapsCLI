@@ -144,6 +144,39 @@ pub fn model_supports_1m(model: &str) -> bool {
         || m.contains("fable-5")
 }
 
+/// The extended context window a 1M-capable model opens ([`model_supports_1m`]).
+pub const EXTENDED_CONTEXT_WINDOW: u64 = 1_000_000;
+
+/// Whether the Messages API rejects a request whose input plus `max_tokens`
+/// exceeds the model's context window.
+///
+/// Anthropic's context-window docs ("Context window overflow behavior",
+/// <https://platform.claude.com/docs/en/build-with-claude/context-windows#context-window-overflow-behavior>):
+/// on Claude 4.5 models and newer such a request is accepted, and generation
+/// that reaches the window stops with `stop_reason:
+/// "model_context_window_exceeded"`; earlier models return a validation
+/// error instead (unless the `model-context-window-exceeded-2025-08-26` beta
+/// is sent, which Synaps does not). Input alone over the window is a 400 on
+/// every model. So `true` only for the pre-4.5 line: Claude 2/Instant, the
+/// 3.x line, Opus 4 / 4.1 and Sonnet 4. Haiku 4.5, Sonnet/Opus 4.5 and every
+/// later or unknown future `claude-*` id accept overflow, and so does any
+/// non-Claude id: no route but the native Anthropic one sends an output cap.
+pub fn model_rejects_output_overflow(model: &str) -> bool {
+    let m = model.to_ascii_lowercase();
+    let m = m.strip_prefix("anthropic/").unwrap_or(&m);
+    const BEFORE_4_5: &[&str] = &[
+        "claude-2",
+        "claude-instant",
+        "claude-3",
+        "claude-opus-4-0",
+        "claude-opus-4-1",
+        "claude-opus-4-2025",
+        "claude-sonnet-4-0",
+        "claude-sonnet-4-2025",
+    ];
+    matches!(m, "claude-opus-4" | "claude-sonnet-4") || BEFORE_4_5.iter().any(|p| m.starts_with(p))
+}
+
 /// Returns the input context window size for a given model, in tokens.
 /// Used as the denominator for the chatui context-usage bar and anywhere
 /// else the client needs to know how much prompt the model will accept.
@@ -226,6 +259,39 @@ mod tests {
         }
         assert_eq!(budget_for_thinking_level("off"), Some(0));
         assert_eq!(budget_for_thinking_level("custom(8192)"), None);
+    }
+
+    #[test]
+    fn only_models_before_claude_4_5_reject_output_overflow() {
+        for m in [
+            "claude-opus-4-1-20250805",
+            "claude-opus-4-20250514",
+            "claude-opus-4-0",
+            "claude-sonnet-4-20250514",
+            "anthropic/claude-sonnet-4-0",
+            "claude-sonnet-4",
+            "claude-3-7-sonnet-latest",
+            "claude-3-5-haiku-20241022",
+            "CLAUDE-3-OPUS-20240229",
+            "claude-2.1",
+            "claude-instant-1.2",
+        ] {
+            assert!(model_rejects_output_overflow(m), "{m}");
+        }
+        for m in [
+            "claude-haiku-4-5-20251001",
+            "claude-sonnet-4-5-20250929",
+            "claude-opus-4-5-20251101",
+            "claude-sonnet-4-6",
+            "claude-opus-4-7",
+            "anthropic/claude-opus-5-5",
+            "claude-fable-5-1",
+            "claude-sonnet-9-0",
+            "gpt-5.5",
+            "google-gemini/gemini-2.5-pro",
+        ] {
+            assert!(!model_rejects_output_overflow(m), "{m}");
+        }
     }
 
     #[test]

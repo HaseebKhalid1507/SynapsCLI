@@ -155,16 +155,51 @@ impl<'a> RequestBody<'a> {
     ///
     /// [`KEEPWARM_OUTPUT_TOKENS`]: super::keepwarm::KEEPWARM_OUTPUT_TOKENS
     pub(super) fn apply_keepwarm_max_tokens(&mut self) {
-        let budget = self
-            .thinking
-            .as_ref()
-            .filter(|t| t["type"] == "enabled")
-            .and_then(|t| t["budget_tokens"].as_u64());
-        let cap = match budget {
+        let cap = match self.enabled_thinking_budget() {
             Some(b) => b + super::keepwarm::KEEPWARM_OUTPUT_TOKENS,
             None => super::keepwarm::KEEPWARM_OUTPUT_TOKENS,
         };
         self.max_tokens = self.max_tokens.min(cap);
+    }
+
+    /// The `budget_tokens` of budgeted thinking (`type: "enabled"`), if any.
+    fn enabled_thinking_budget(&self) -> Option<u64> {
+        self.thinking
+            .as_ref()
+            .filter(|t| t["type"] == "enabled")
+            .and_then(|t| t["budget_tokens"].as_u64())
+    }
+
+    /// Clamp `max_tokens` to the room `provider_window` leaves after this
+    /// request's input when the model rejects input + `max_tokens` over the
+    /// window ([`HelperMethods::fit_max_tokens_to_window`]). For every other
+    /// model (Claude 4.5 and later) nothing is estimated and the body is
+    /// byte-identical. `max_tokens` is not part of the cache key either way.
+    /// Call before [`Self::apply_keepwarm_max_tokens`], which only lowers it.
+    pub(super) fn fit_max_tokens_to_window(&mut self, provider_window: u64) {
+        let fitted = HelperMethods::fit_max_tokens_to_window(
+            self.model,
+            self.max_tokens,
+            provider_window,
+            self.enabled_thinking_budget(),
+            || self.input_estimate(),
+        );
+        self.max_tokens = fitted;
+    }
+
+    /// Conservative estimate of everything this request sends as input:
+    /// system blocks, tool definitions (deferred ones included, an
+    /// overcount) and the messages (images at their flat charge).
+    fn input_estimate(&self) -> u64 {
+        use super::context::{conservative_token_estimate, estimate_history};
+        // A body that cannot serialize is never sent; fail toward the clamp.
+        fn serialized<T: Serialize + ?Sized>(v: &T) -> u64 {
+            serde_json::to_string(v).map_or(u64::MAX / 1024, |s| conservative_token_estimate(&s))
+        }
+        let system = self.system.as_ref().map_or(0, serialized);
+        system
+            .saturating_add(serialized(&self.tools))
+            .saturating_add(estimate_history(self.messages.0))
     }
 
     /// FNV-1a 64 over the serialized cache-key prefix of this request:
@@ -325,6 +360,24 @@ impl ApiMethods {
         (name, value, auth_type, binding)
     }
 
+    /// Whether this request opts into the 1M window (`context-1m-2025-08-07`).
+    fn opens_1m_window(options: &ApiOptions, model: &str) -> bool {
+        options.use_1m_context && crate::core::models::model_supports_1m(model)
+    }
+
+    /// The context window the provider applies to a request built with
+    /// `options`: the 1M window exactly when [`Self::build_beta_header`]
+    /// opts in, else the model default. The window clamp
+    /// ([`RequestBody::fit_max_tokens_to_window`]) measures against this, the
+    /// provider's own limit, not the runtime's budgeting window.
+    pub(super) fn provider_window(options: &ApiOptions, model: &str) -> u64 {
+        if Self::opens_1m_window(options, model) {
+            crate::core::models::EXTENDED_CONTEXT_WINDOW
+        } else {
+            crate::core::models::context_window_for_model(model)
+        }
+    }
+
     /// Build the `anthropic-beta` header value. Returns `None` when no beta
     /// flags apply.
     ///
@@ -343,7 +396,7 @@ impl ApiMethods {
             betas.push("claude-code-20250219");
             betas.push("oauth-2025-04-20");
         }
-        if options.use_1m_context && crate::core::models::model_supports_1m(model) {
+        if Self::opens_1m_window(options, model) {
             betas.push("context-1m-2025-08-07");
         }
         if auth_type != "oauth" && options.cache_ttl != crate::core::config::CacheTtl::FiveMinutes {
@@ -424,6 +477,88 @@ mod beta_header_tests {
             ApiMethods::build_beta_header("api_key", &options, MODEL).as_deref(),
             Some("context-1m-2025-08-07,extended-cache-ttl-2025-04-11"),
         );
+    }
+}
+
+#[cfg(test)]
+mod window_clamp_tests {
+    use super::*;
+    use agent_core::reasoning::ReasoningLevel;
+
+    const REJECTS: &str = "claude-sonnet-4-20250514";
+    const ACCEPTS: &str = "claude-sonnet-4-5-20250929";
+
+    #[test]
+    fn the_clamp_applies_only_to_models_that_reject_overflow() {
+        // Claude 4.5 and later: untouched, and nothing is estimated.
+        for model in [ACCEPTS, "claude-opus-5-5", "claude-haiku-4-5-20251001"] {
+            let untouched =
+                HelperMethods::fit_max_tokens_to_window(model, 64_000, 200_000, None, || {
+                    unreachable!("no estimate for {model}")
+                });
+            assert_eq!(untouched, 64_000, "{model}");
+        }
+        let fit = |model, max, window, budget, input: u64| {
+            HelperMethods::fit_max_tokens_to_window(model, max, window, budget, || input)
+        };
+        // Earlier models: the room the input leaves...
+        assert_eq!(fit(REJECTS, 64_000, 200_000, None, 100_000), 64_000);
+        assert_eq!(fit(REJECTS, 64_000, 200_000, None, 170_000), 30_000);
+        assert_eq!(fit(REJECTS, 128_000, 200_000, Some(16_384), 150_000), 50_000);
+        // ...never raised...
+        assert_eq!(fit(REJECTS, 8_000, 200_000, None, 1_000), 8_000);
+        // ...and never below the floor, above any thinking budget.
+        let floor = super::super::helpers::MIN_WINDOW_CLAMPED_RESPONSE_TOKENS;
+        assert_eq!(fit(REJECTS, 64_000, 200_000, None, 199_000), floor);
+        assert_eq!(fit(REJECTS, 64_000, 200_000, None, 900_000), floor);
+        assert_eq!(fit(REJECTS, 64_000, 200_000, Some(16_384), 190_000), 16_384 + floor);
+    }
+
+    fn body<'a>(model: &'a str, messages: &'a [crate::SharedMessage]) -> RequestBody<'a> {
+        RequestBody::new(
+            model,
+            messages,
+            &[],
+            &[],
+            &None,
+            "api_key",
+            0,
+            ReasoningLevel::High,
+            None,
+            CacheTtl::FiveMinutes,
+            true,
+        )
+    }
+
+    #[test]
+    fn a_body_near_the_window_gets_the_room_left_and_keeps_its_thinking_budget() {
+        // ~160k estimated tokens of input on a 200k window.
+        let near: Vec<crate::SharedMessage> =
+            vec![Arc::new(json!({"role": "user", "content": "x".repeat(400_000)}))];
+        let mut clamped = body(REJECTS, &near);
+        let input = clamped.input_estimate();
+        assert!((160_000..161_000).contains(&input), "{input}");
+        clamped.fit_max_tokens_to_window(200_000);
+        let v = serde_json::to_value(&clamped).unwrap();
+        assert_eq!(v["max_tokens"], 200_000 - input);
+        assert_eq!(v["thinking"]["budget_tokens"], 16_384, "thinking unchanged");
+        assert!(v["max_tokens"].as_u64().unwrap() > 16_384);
+        // The same request in the 1M window (Sonnet 4 opts in) has room.
+        let mut roomy = body(REJECTS, &near);
+        let options = ApiOptions { use_1m_context: true, ..Default::default() };
+        roomy.fit_max_tokens_to_window(ApiMethods::provider_window(&options, REJECTS));
+        assert_eq!(roomy.max_tokens(), 64_000);
+        assert_eq!(ApiMethods::provider_window(&ApiOptions::default(), REJECTS), 200_000);
+
+        // Claude 4.5+: byte-identical with or without the fit, near the window or not.
+        let small: Vec<crate::SharedMessage> =
+            vec![Arc::new(json!({"role": "user", "content": "hi"}))];
+        for (model, messages) in [(ACCEPTS, &near), (ACCEPTS, &small), (REJECTS, &small)] {
+            let plain = serde_json::to_vec(&body(model, messages)).unwrap();
+            let mut fitted = body(model, messages);
+            fitted.fit_max_tokens_to_window(200_000);
+            assert_eq!(serde_json::to_vec(&fitted).unwrap(), plain, "{model}");
+        }
     }
 }
 
