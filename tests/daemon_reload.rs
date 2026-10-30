@@ -898,7 +898,7 @@ fn child_events(events: &[SessionEventWire], tool_id: &str) -> Vec<(&'static str
 /// `children` for one session, on a fresh control connection.
 async fn children_of(paths: &registry::DaemonPaths, sid: &SessionId) -> ChildListReply {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    let (r, mut w) = tokio::net::UnixStream::connect(&paths.sock).await.unwrap().into_split();
+    let (r, mut w) = agent_engine::ipc::split_client(agent_engine::ipc::connect(&paths.sock).await.unwrap());
     let mut r = BufReader::new(r);
     let mut line = String::new();
     w.write_all(encode_line(&ClientFrame::Hello(Hello::new(ClientKind::Test))).unwrap().as_bytes()).await.unwrap();
