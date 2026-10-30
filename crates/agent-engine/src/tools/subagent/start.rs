@@ -213,6 +213,10 @@ impl Tool for SubagentStartTool {
         let parent_queue = ctx.capabilities.event_queue.clone();
         let handle_id_inner = handle_id.clone();
         let child_parent_id = handle_id.clone();
+        // The worker's tool-call records name the calling session and this
+        // handle; its own session id stays None.
+        let tool_call_owner =
+            crate::runtime::tool_call_events::ToolCallOwner::for_worker(&ctx, &handle_id);
 
         // ── Build and register handle BEFORE spawning ─────────────────────────
         // This closes the publish-before-register race: finalize_subagent can
@@ -311,6 +315,7 @@ impl Tool for SubagentStartTool {
                         runtime
                             .install_worker_orchestration(Arc::clone(&orchestration_for_runtime));
                         runtime.set_delegation_parent(Some(child_parent_id.clone()));
+                        runtime.set_tool_call_owner(Some(tool_call_owner));
 
                         let cancel = crate::CancellationToken::new();
                         let cancel_inner = cancel.clone();

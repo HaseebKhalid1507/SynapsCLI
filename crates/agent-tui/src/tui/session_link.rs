@@ -583,6 +583,7 @@ mod tests {
             extensions: vec!["guard".into()],
             tool: Some("write".into()),
             rewritten_by: vec![],
+            tool_id: None,
         });
         b.on_prompt(from_scope);
         assert_eq!(
@@ -604,6 +605,7 @@ mod tests {
                 extensions: vec!["jev".into()],
                 tool: None,
                 rewritten_by: vec![],
+                tool_id: None,
             });
             p
         };

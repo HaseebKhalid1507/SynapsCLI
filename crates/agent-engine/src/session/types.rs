@@ -771,6 +771,12 @@ pub struct ConfirmScope {
     /// client's transcript, that an approved call ran rewritten input.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rewritten_by: Vec<String>,
+    /// The provider's id of the call this prompt confirms (`tool_use.id`),
+    /// so a client pairs the prompt with that call's tool-call `decided`
+    /// record exactly. Absent when the dispatch site has no id; an older
+    /// client ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_id: Option<String>,
 }
 
 impl ConfirmScope {

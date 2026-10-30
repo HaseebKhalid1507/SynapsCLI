@@ -105,6 +105,11 @@ pub struct HookBus {
     /// Keyed by conversation session id: one process may host N sessions
     /// (Phase 2 daemon), and each must read only its own injection.
     session_injection: RwLock<HashMap<String, String>>,
+    /// Where every dispatch site of this host publishes its tool-call
+    /// records (off until the daemon turns it on). Workers get a bus of
+    /// their own (no hooks) that shares this hub, so their calls reach the
+    /// same subscribers.
+    tool_calls: Arc<crate::runtime::tool_call_events::ToolCallHub>,
 }
 
 impl HookBus {
@@ -114,7 +119,23 @@ impl HookBus {
             handlers: RwLock::new(HashMap::new()),
             session_injection: RwLock::new(HashMap::new()),
             generations: std::sync::Mutex::new(HashMap::new()),
+            tool_calls: Arc::new(crate::runtime::tool_call_events::ToolCallHub::new()),
         }
+    }
+
+    /// This bus with `hub` as its tool-call hub (a worker's bus shares its
+    /// host's).
+    pub fn with_tool_call_hub(
+        mut self,
+        hub: Arc<crate::runtime::tool_call_events::ToolCallHub>,
+    ) -> Self {
+        self.tool_calls = hub;
+        self
+    }
+
+    /// The tool-call hub this bus's dispatch sites publish to.
+    pub fn tool_call_hub(&self) -> &Arc<crate::runtime::tool_call_events::ToolCallHub> {
+        &self.tool_calls
     }
 
     /// Current load generation of `extension_id` (0 until first unloaded).
@@ -216,6 +237,14 @@ impl HookBus {
     /// If no handlers are registered for this hook, returns immediately
     /// (the no-extensions fast path).
     pub async fn emit(&self, event: &HookEvent) -> HookResult {
+        self.emit_attributed(event).await.0
+    }
+
+    /// [`Self::emit`], plus who decided the result (host-stamped extension
+    /// ids): the blocker for `Block`, the confirmers for `Confirm`, the
+    /// modifiers for `Modify`, the transformer for `Replace`; empty
+    /// otherwise. The tool-call events' `decided.by`.
+    pub async fn emit_attributed(&self, event: &HookEvent) -> (HookResult, Vec<String>) {
         // Snapshot the handler list and drop the lock immediately.
         // This prevents holding the RwLock across async handler calls
         // (which could block subscribe/unsubscribe for the entire
@@ -224,7 +253,7 @@ impl HookBus {
             let handlers = self.handlers.read().await;
             match handlers.get(&event.kind) {
                 Some(regs) if !regs.is_empty() => regs.clone(),
-                _ => return HookResult::Continue, // fast path: no handlers
+                _ => return (HookResult::Continue, Vec::new()), // fast path: no handlers
             }
         }; // lock dropped here
 
@@ -329,7 +358,7 @@ impl HookBus {
                         reason = %reason,
                         "Hook blocked by extension"
                     );
-                    return HookResult::Block { reason };
+                    return (HookResult::Block { reason }, vec![reg.handler.id().to_string()]);
                 }
                 Ok(HookResult::Continue) => {}
                 Ok(HookResult::Inject { content }) => {
@@ -401,7 +430,7 @@ impl HookBus {
                         output.len(),
                     );
                     // First transform wins (mirrors Modify). Chaining is a future enhancement.
-                    return HookResult::Replace { output };
+                    return (HookResult::Replace { output }, vec![reg.handler.id().to_string()]);
                 }
                 Ok(HookResult::Confirm { message, .. }) => {
                     tracing::info!(
@@ -460,25 +489,29 @@ impl HookBus {
                     .collect::<Vec<_>>()
                     .join("\n\n")
             };
-            let sources = source_keys.iter().map(|(id, _)| id.clone()).collect();
+            let sources: Vec<String> = source_keys.iter().map(|(id, _)| id.clone()).collect();
             let generations = source_keys.iter().map(|(_, g)| *g).collect();
-            return HookResult::Confirm {
-                message,
-                sources,
-                generations,
-                tool,
-                modified_input: modified_event.and_then(|e| e.tool_input),
-                modified_by,
-            };
+            let by = sources.clone();
+            return (
+                HookResult::Confirm {
+                    message,
+                    sources,
+                    generations,
+                    tool,
+                    modified_input: modified_event.and_then(|e| e.tool_input),
+                    modified_by,
+                },
+                by,
+            );
         }
         if let Some(input) = modified_event.and_then(|e| e.tool_input) {
-            return HookResult::Modify { input };
+            return (HookResult::Modify { input }, modified_by);
         }
 
         // Merge accumulated injections from all handlers. An advisory phase
         // report is returned only when nothing else would be (Block/Inject
         // take precedence; on_message_complete permits neither).
-        if !injections.is_empty() {
+        let result = if !injections.is_empty() {
             HookResult::Inject {
                 content: injections.join("\n\n"),
             }
@@ -486,7 +519,8 @@ impl HookBus {
             HookResult::ContextPhase { phase }
         } else {
             HookResult::Continue
-        }
+        };
+        (result, Vec::new())
     }
 
     /// Emit a hook event to all registered handlers **concurrently**.

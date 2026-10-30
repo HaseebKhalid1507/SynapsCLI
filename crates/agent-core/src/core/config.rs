@@ -353,6 +353,11 @@ pub struct DaemonConfig {
     /// Seconds a PARKED session row lingers before eviction. `0` = keep
     /// forever. Env `SYNAPS_DAEMON_PARKED_EVICT_SECS` overrides. Default: 3600.
     pub parked_evict_secs: u64,
+    /// `daemon.tool_call_events`: let a client on the daemon socket
+    /// subscribe to a content-free record of every tool call
+    /// (`ClientFrame::ToolCalls`). Read at daemon start (and so at each
+    /// reload). Default: off.
+    pub tool_call_events: bool,
 }
 
 impl Default for DaemonConfig {
@@ -361,6 +366,7 @@ impl Default for DaemonConfig {
             idle_exit_secs: 10,
             prompt_abandon_secs: 3600,
             parked_evict_secs: 3600,
+            tool_call_events: false,
         }
     }
 }
@@ -449,6 +455,13 @@ fn parse_daemon_config_key(
         "daemon.idle_exit_secs" => config.idle_exit_secs = secs()?,
         "daemon.prompt_abandon_secs" => config.prompt_abandon_secs = secs()?,
         "daemon.parked_evict_secs" => config.parked_evict_secs = secs()?,
+        "daemon.tool_call_events" => {
+            config.tool_call_events = match value.trim() {
+                "true" | "1" | "on" | "yes" => true,
+                "false" | "0" | "off" | "no" => false,
+                _ => return Err("expected on or off"),
+            };
+        }
         _ => return Err("unknown daemon key"),
     }
     Ok(())
@@ -1459,6 +1472,7 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "daemon.idle_exit_secs",
     "daemon.prompt_abandon_secs",
     "daemon.parked_evict_secs",
+    "daemon.tool_call_events",
     "max_tool_output",
     "bash_timeout",
     "bash_max_timeout",
@@ -2862,6 +2876,29 @@ mod tests {
         ] {
             assert!(super::KNOWN_CONFIG_KEYS.contains(&k), "{k} not in KNOWN_CONFIG_KEYS");
         }
+    }
+
+    #[test]
+    fn daemon_tool_call_events_is_opt_in_and_a_known_key() {
+        assert!(!super::load_config_from_str("").daemon.tool_call_events, "off by default");
+        for (v, want) in [
+            ("on", true),
+            ("true", true),
+            ("1", true),
+            ("yes", true),
+            ("off", false),
+            ("false", false),
+            ("0", false),
+            ("no", false),
+        ] {
+            let c = super::load_config_from_str(&format!("daemon.tool_call_events = {v}\n"));
+            assert_eq!(c.daemon.tool_call_events, want, "{v}");
+            assert!(c.warnings.is_empty(), "{v}: {:?}", c.warnings);
+        }
+        let bad = super::load_config_from_str("daemon.tool_call_events = maybe\n");
+        assert!(!bad.daemon.tool_call_events, "an invalid value keeps it off");
+        assert!(bad.warnings.iter().any(|w| w.contains("daemon.tool_call_events")));
+        assert!(super::KNOWN_CONFIG_KEYS.contains(&"daemon.tool_call_events"));
     }
 
     #[test]

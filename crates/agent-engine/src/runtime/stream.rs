@@ -1,11 +1,12 @@
 use super::api::ApiMethods;
 use super::helpers::HelperMethods;
 use super::types::{AuthState, LlmEvent, SessionEvent, StreamEvent};
+use super::tool_call_events::ToolCallStatus;
 use super::{
-    emit_after_tool_call_outcome, emit_before_tool_call, resolve_before_tool_call_decision,
-    BeforeToolCallDecision,
+    emit_after_tool_call_outcome, emit_before_tool_call_recorded,
+    resolve_before_tool_call_decision_for, BeforeToolCallDecision,
 };
-use crate::extensions::hooks::events::{HookEvent, HookResult};
+use crate::extensions::hooks::events::{HookEvent, HookResult, ToolCallHookContext};
 use crate::{Result, RuntimeError, SharedMessage, ToolRegistry};
 use reqwest::Client;
 use serde_json::{json, Value};
@@ -195,6 +196,9 @@ pub(super) struct StreamSession {
     pub(super) telemetry_level: crate::runtime::telemetry::TelemetryLevel,
     pub(super) orchestration: Option<Arc<crate::orchestration::OrchestrationRuntime>>,
     pub(super) delegation_parent: Option<String>,
+    /// A worker's tool-call record owner (parent session + handle); read
+    /// only by the tool-call events.
+    pub(super) tool_call_owner: Option<super::tool_call_events::ToolCallOwner>,
     /// Per-turn correlation ID carried by typed terminal outcomes (spec §5.2).
     pub(super) turn_correlation_id: String,
     /// Opt-in Task 18 policy. False preserves the full-schema request path.
@@ -660,6 +664,7 @@ impl StreamMethods {
             telemetry_level,
             orchestration,
             delegation_parent,
+            tool_call_owner,
             turn_correlation_id,
             progressive_tool_disclosure,
             deferred_tool_loading,
@@ -1909,22 +1914,31 @@ impl StreamMethods {
 
                                 // ═══ HOOK: before_tool_call (stream single) ═══
                                 let runtime_name = authorized.runtime_name().to_string();
-                                let decision = resolve_before_tool_call_decision(
+                                let hook_call = ToolCallHookContext::for_tool_call(
+                                    session_id.as_deref(),
+                                    Some(tool_id.as_str()),
+                                    cwd.as_deref(),
+                                );
+                                let (hook_result, mut call_events) = emit_before_tool_call_recorded(
+                                    &hook_bus,
+                                    &tool_name,
+                                    Some(&runtime_name),
                                     input.clone(),
-                                    emit_before_tool_call(
-                                        &hook_bus,
-                                        &tool_name,
-                                        Some(&runtime_name),
-                                        input.clone(),
-                                        session_id.as_deref(),
-                                    )
-                                    .await,
+                                    &hook_call,
+                                    tool_call_owner.as_ref(),
+                                )
+                                .await;
+                                let decision = resolve_before_tool_call_decision_for(
+                                    &hook_call,
+                                    input.clone(),
+                                    hook_result,
                                     secret_prompt.as_ref(),
                                     auto_approve_confirms,
                                     Some(&session_allow_all),
                                 )
                                 .await;
                                 if let BeforeToolCallDecision::Block { reason } = decision {
+                                    call_events.finish(ToolCallStatus::Blocked);
                                     (format!("Tool call blocked by extension: {}", reason), None)
                                 } else {
                                     let BeforeToolCallDecision::Continue { input } = decision
@@ -1938,6 +1952,7 @@ impl StreamMethods {
                                             limits: crate::tools::ToolLimits { max_tool_output, max_tool_buffer: 256 * 1024, bash_timeout, bash_max_timeout, subagent_timeout },
                                         })).await {
                                         (Some(res), _) => {
+                                            call_events.finish(if res.is_ok() { ToolCallStatus::Ok } else { ToolCallStatus::Error });
                                             let (output, rich_blocks) = match res {
                                                 Ok(o) => validated_tool_output(&model, o),
                                                 Err(e) => {
@@ -1955,7 +1970,7 @@ impl StreamMethods {
                                                 input_for_hook,
                                                 output.clone(),
                                                 max_tool_output,
-                                                session_id.as_deref(),
+                                                &hook_call,
                                             ).await;
                                             // Hook policy: a Replace transform wins over the rich
                                             // blocks — the hook saw only the summary, so keeping
@@ -1967,6 +1982,7 @@ impl StreamMethods {
                                             (outcome.output, rich_blocks)
                                         }
                                         (None, started) => {
+                                            call_events.finish(ToolCallStatus::Cancelled);
                                             canceled = true;
                                             // Ledger: this call STARTED but
                                             // never recorded a result. A
@@ -2226,6 +2242,7 @@ impl StreamMethods {
                         let request_correlation_inner = request_correlation.clone();
                         let trace_inner = round_options.trace.clone();
                         let delegation_parent_inner = delegation_parent.clone();
+                        let tool_call_owner_inner = tool_call_owner.clone();
                         let codex_parent_plan_inner = codex_parent_plan.clone();
                         let cancel_token = cancel.clone();
                         let turn_completion_inner = turn_completion.clone();
@@ -2288,20 +2305,29 @@ impl StreamMethods {
                                     let tool_call_started = std::time::Instant::now();
                                     let runtime_name_for_hook =
                                         authorized.runtime_name().to_string();
-                                    let decision = resolve_before_tool_call_decision(
+                                    let hook_call = ToolCallHookContext::for_tool_call(
+                                        session_id_inner.as_deref(),
+                                        Some(tool_id.as_str()),
+                                        cwd_inner.as_deref(),
+                                    );
+                                    let (hook_result, mut call_events) = emit_before_tool_call_recorded(
+                                        &hook_bus_inner,
+                                        &tool_name_for_hook,
+                                        Some(&runtime_name_for_hook),
                                         input.clone(),
-                                        emit_before_tool_call(
-                                            &hook_bus_inner,
-                                            &tool_name_for_hook,
-                                            Some(&runtime_name_for_hook),
-                                            input.clone(),
-                                            session_id_inner.as_deref(),
-                                        ).await,
+                                        &hook_call,
+                                        tool_call_owner_inner.as_ref(),
+                                    ).await;
+                                    let decision = resolve_before_tool_call_decision_for(
+                                        &hook_call,
+                                        input.clone(),
+                                        hook_result,
                                         prompt_inner.as_ref(),
                                         auto_approve_inner,
                                         Some(&session_allow_all_inner),
                                     ).await;
                                     if let BeforeToolCallDecision::Block { reason } = decision {
+                                        call_events.finish(ToolCallStatus::Blocked);
                                         (false, Some(call_effect), format!("Tool call blocked by extension: {}", reason), None, None, None)
                                     } else {
                                     let BeforeToolCallDecision::Continue { input } = decision else { unreachable!() };
@@ -2336,6 +2362,7 @@ impl StreamMethods {
                                             limits: crate::tools::ToolLimits { max_tool_output, max_tool_buffer: 256 * 1024, bash_timeout, bash_max_timeout, subagent_timeout },
                                         })).await {
                                         (Some(res), _) => {
+                                            call_events.finish(if res.is_ok() { ToolCallStatus::Ok } else { ToolCallStatus::Error });
                                             let (output, rich_blocks, errored) = match res {
                                                 Ok(o) => { let (t, b) = validated_tool_output(&model_inner, o); (t, b, false) }
                                                 Err(e) => (e.to_string(), None, true),
@@ -2347,7 +2374,7 @@ impl StreamMethods {
                                                 input_for_hook,
                                                 output.clone(),
                                                 max_tool_output,
-                                                session_id_inner.as_deref(),
+                                                &hook_call,
                                             ).await;
                                             // Hook Replace wins over rich blocks (see single-tool site).
                                             let rich_blocks = drop_rich_if_rewritten(rich_blocks, &outcome.output, &output, outcome.replaced);
@@ -2358,6 +2385,7 @@ impl StreamMethods {
                                             (false, Some(call_effect), outcome.output, history_handle, Some((stable_tool_id, activation_basis, tool_call_started)), rich_blocks)
                                         }
                                         (None, started) => {
+                                            call_events.finish(ToolCallStatus::Cancelled);
                                             (true, started.then_some(call_effect), turn_completion_inner.cancel_phrase().to_string(), Some(output_handle), Some((stable_tool_id, activation_basis, tool_call_started)), None)
                                         }
                                     }
@@ -3556,7 +3584,7 @@ mod rich_output_tests {
                     json!({}),
                     summary.clone(),
                     10,
-                    None,
+                    &ToolCallHookContext::default(),
                 )
                 .await;
                 assert_eq!(outcome.replaced, hook == Some(true));
@@ -3767,6 +3795,7 @@ mod rich_output_tests {
             telemetry_level: crate::runtime::telemetry::TelemetryLevel::Off,
             orchestration: None,
             delegation_parent: None,
+            tool_call_owner: None,
             turn_correlation_id: "turn-test".into(),
             progressive_tool_disclosure: progressive,
             deferred_tool_loading: true,
@@ -3818,6 +3847,7 @@ mod rich_output_tests {
             std::time::Duration::from_secs(20),
             None,
             Some(continuation),
+            None,
         )
         .await
     }
@@ -3836,6 +3866,7 @@ mod rich_output_tests {
             tool_uses,
             hook_bus,
             std::time::Duration::from_secs(20),
+            None,
             None,
             None,
         )
@@ -3864,6 +3895,7 @@ mod rich_output_tests {
             deadline,
             None,
             None,
+            None,
         )
         .await;
         eprintln!(
@@ -3875,7 +3907,8 @@ mod rich_output_tests {
 
     /// `conversation_id` is the owning conversation id the stream runs
     /// under (`StreamSession.session_id`); `None` = worker/no conversation,
-    /// the harness default.
+    /// the harness default. `session_cwd` is `StreamSession.cwd` (`None`,
+    /// the harness default, = the process cwd).
     #[allow(clippy::too_many_arguments)]
     async fn drive_with_model_and_options(
         model: &str,
@@ -3886,6 +3919,7 @@ mod rich_output_tests {
         deadline: std::time::Duration,
         conversation_id: Option<&str>,
         continuation: Option<crate::runtime::continuation::SharedContinuation>,
+        session_cwd: Option<PathBuf>,
     ) -> Driven {
         let (base_url, mock) = spawn_mock(sse_tool_use_round(tool_uses)).await;
 
@@ -3916,6 +3950,7 @@ mod rich_output_tests {
             model,
         );
         session.session_id = conversation_id.map(str::to_string);
+        session.cwd = session_cwd;
         if let Some(continuation) = continuation {
             session.continuation = continuation;
         }
@@ -4727,6 +4762,7 @@ mod rich_output_tests {
                 std::time::Duration::from_secs(20),
                 conversation,
                 None,
+                None,
             )
             .await;
             let seen = seen.lock().unwrap().clone();
@@ -4736,6 +4772,420 @@ mod rich_output_tests {
                 "{} tool use(s) under {conversation:?}",
                 uses.len()
             );
+        }
+    }
+
+    /// Records every hook event it sees; answers Continue.
+    struct RecordingHook(Arc<std::sync::Mutex<Vec<HookEvent>>>);
+    #[async_trait::async_trait]
+    impl crate::extensions::runtime::ExtensionHandler for RecordingHook {
+        fn id(&self) -> &str {
+            "recording-hook"
+        }
+        async fn handle(&self, event: &HookEvent) -> HookResult {
+            self.0.lock().unwrap().push(event.clone());
+            HookResult::Continue
+        }
+        async fn shutdown(&self) {}
+    }
+
+    async fn recording_hook_bus(
+        events: Arc<std::sync::Mutex<Vec<HookEvent>>>,
+    ) -> Arc<crate::extensions::hooks::HookBus> {
+        let bus = Arc::new(crate::extensions::hooks::HookBus::new());
+        let mut perms = PermissionSet::new();
+        perms.grant(crate::extensions::permissions::Permission::ToolsIntercept);
+        let handler: Arc<dyn crate::extensions::runtime::ExtensionHandler> =
+            Arc::new(RecordingHook(events));
+        for kind in [HookKind::BeforeToolCall, HookKind::AfterToolCall] {
+            bus.subscribe(kind, handler.clone(), None, None, perms.clone())
+                .await
+                .unwrap();
+        }
+        bus
+    }
+
+    /// Both tool hooks carry the provider's tool call id and the cwd a
+    /// relative tool path resolves against (the session cwd, else the
+    /// process cwd), on the single and the parallel lane.
+    #[tokio::test]
+    async fn tool_hooks_carry_the_call_id_and_the_session_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_cwd = dir.path().to_path_buf();
+        let process_cwd = std::env::current_dir().unwrap();
+        let single = &[("toolu_a", "session_probe")][..];
+        let parallel = &[("toolu_a", "session_probe"), ("toolu_b", "session_probe")][..];
+        for (cwd, expected, uses) in [
+            (Some(session_cwd.clone()), session_cwd.clone(), single),
+            (Some(session_cwd.clone()), session_cwd.clone(), parallel),
+            (None, process_cwd.clone(), single),
+            (None, process_cwd.clone(), parallel),
+        ] {
+            let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let initial = vec![Arc::new(json!({"role":"user","content":"go"})) as SharedMessage];
+            let _ = drive_with_model_and_options(
+                "claude-sonnet-4-6",
+                initial,
+                vec![Arc::new(SessionProbe(Arc::new(std::sync::Mutex::new(
+                    Vec::new(),
+                ))))],
+                uses,
+                recording_hook_bus(events.clone()).await,
+                std::time::Duration::from_secs(20),
+                Some("conv-1"),
+                None,
+                cwd.clone(),
+            )
+            .await;
+            let events = events.lock().unwrap().clone();
+            let expected = expected.to_str().unwrap().to_string();
+            for kind in [HookKind::BeforeToolCall, HookKind::AfterToolCall] {
+                let mut seen: Vec<_> = events
+                    .iter()
+                    .filter(|e| e.kind == kind)
+                    .map(|e| (e.tool_call_id.clone(), e.cwd.clone(), e.session_id.clone()))
+                    .collect();
+                seen.sort();
+                let want: Vec<_> = uses
+                    .iter()
+                    .map(|(id, _)| {
+                        (
+                            Some(id.to_string()),
+                            Some(expected.clone()),
+                            Some("conv-1".to_string()),
+                        )
+                    })
+                    .collect();
+                assert_eq!(
+                    seen,
+                    want,
+                    "{kind:?}, {} tool use(s), session cwd {cwd:?}",
+                    uses.len()
+                );
+            }
+        }
+    }
+
+    // ── tool-call events at the stream dispatch sites (single + parallel) ──
+
+    use crate::runtime::tool_call_events::{
+        call_fingerprint, ToolCallDecision, ToolCallDelivery, ToolCallOwner, ToolCallPhase,
+        ToolCallSubscription,
+    };
+
+    const TCE_SECRET: &str = "sk-ant-api03-STREAMTOOLCALLSECRET0123456789abcdef";
+
+    /// Returns a secret-shaped output.
+    struct SecretEcho;
+    #[async_trait::async_trait]
+    impl Tool for SecretEcho {
+        fn name(&self) -> &str {
+            "secret_echo"
+        }
+        fn description(&self) -> &str {
+            "echoes a credential"
+        }
+        fn parameters(&self) -> Value {
+            json!({"type":"object","properties":{"text":{"type":"string"}}})
+        }
+        fn origin(&self) -> crate::tools::ToolOrigin {
+            crate::tools::ToolOrigin::Builtin
+        }
+        fn effect(&self) -> crate::tools::catalog::ToolEffect {
+            crate::tools::catalog::ToolEffect::ReadOnly
+        }
+        async fn execute(&self, _params: Value, _ctx: ToolContext) -> Result<String> {
+            Ok(format!("token={TCE_SECRET} at /tce-out/.secret"))
+        }
+    }
+
+    /// Always fails.
+    struct FailingProbe;
+    #[async_trait::async_trait]
+    impl Tool for FailingProbe {
+        fn name(&self) -> &str {
+            "failing_probe"
+        }
+        fn description(&self) -> &str {
+            "fails"
+        }
+        fn parameters(&self) -> Value {
+            json!({"type":"object","properties":{}})
+        }
+        fn origin(&self) -> crate::tools::ToolOrigin {
+            crate::tools::ToolOrigin::Builtin
+        }
+        fn effect(&self) -> crate::tools::catalog::ToolEffect {
+            crate::tools::catalog::ToolEffect::ReadOnly
+        }
+        async fn execute(&self, _params: Value, _ctx: ToolContext) -> Result<String> {
+            Err(crate::RuntimeError::Tool("probe failed".into()))
+        }
+    }
+
+    /// Answers every `before_tool_call` with `result`.
+    struct FixedHook(&'static str, HookResult);
+    #[async_trait::async_trait]
+    impl crate::extensions::runtime::ExtensionHandler for FixedHook {
+        fn id(&self) -> &str {
+            self.0
+        }
+        async fn handle(&self, _event: &HookEvent) -> HookResult {
+            self.1.clone()
+        }
+        async fn shutdown(&self) {}
+    }
+
+    /// `bus` with its tool-call events on and one subscription.
+    fn subscribed(bus: &Arc<crate::extensions::hooks::HookBus>) -> ToolCallSubscription {
+        bus.tool_call_hub().set_enabled(true);
+        bus.tool_call_hub().subscribe().expect("events on: subscribe works")
+    }
+
+    fn drained(sub: &mut ToolCallSubscription) -> Vec<ToolCallDelivery> {
+        std::iter::from_fn(|| sub.try_next()).collect()
+    }
+
+    /// `(tool_id, phase[:decision|:status])` per record, in seq order.
+    fn phases_of(got: &[ToolCallDelivery]) -> Vec<(String, String)> {
+        got.iter()
+            .map(|d| {
+                let phase = match &d.record.phase {
+                    ToolCallPhase::Called { .. } => "called".to_string(),
+                    ToolCallPhase::Decided { decision, .. } => format!("decided:{decision:?}"),
+                    ToolCallPhase::Finished { status, .. } => format!("finished:{status:?}"),
+                };
+                (d.record.tool_id.clone(), phase)
+            })
+            .collect()
+    }
+
+    /// One stream turn whose first round asks for `tool_uses` (`(id, name,
+    /// input_json)`), as `conversation_id`, in `session_cwd`, with `owner`
+    /// on the session.
+    async fn drive_tool_call_events(
+        tools_to_register: Vec<Arc<dyn Tool>>,
+        tool_uses: &[(&str, &str, &str)],
+        hook_bus: Arc<crate::extensions::hooks::HookBus>,
+        conversation_id: Option<&str>,
+        session_cwd: Option<std::path::PathBuf>,
+        owner: Option<ToolCallOwner>,
+    ) {
+        let (base_url, mock) = spawn_mock(sse_tool_use_round_with_input(tool_uses)).await;
+        let mut registry = ToolRegistry::new();
+        for t in tools_to_register {
+            registry.register(t);
+        }
+        let (tx, _rx) = mpsc::unbounded_channel::<StreamEvent>();
+        let session_manager =
+            crate::tools::shell::SessionManager::new(crate::tools::shell::ShellConfig::default());
+        let tool_session_id = crate::tools::activation::SessionId::parse(&format!(
+            "test-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ))
+        .unwrap();
+        let mut session = harness_session(
+            base_url,
+            Arc::new(RwLock::new(registry)),
+            tx,
+            session_manager,
+            hook_bus,
+            tool_session_id,
+            Default::default(),
+            false,
+            "claude-sonnet-4-6",
+        );
+        session.session_id = conversation_id.map(str::to_string);
+        session.cwd = session_cwd;
+        session.tool_call_owner = owner;
+        let initial = vec![Arc::new(json!({"role":"user","content":"go"})) as SharedMessage];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            StreamMethods::run_stream_internal(session, initial),
+        )
+        .await
+        .expect("stream loop must finish")
+        .expect("stream loop ok");
+        assert_eq!(mock.calls.load(Ordering::SeqCst), 2, "two provider rounds");
+    }
+
+    /// Group 2 + group 7 (stream single and parallel): every call gives
+    /// called → decided(allow) → finished(ok) under its own tool id, in
+    /// increasing seq, with the same fp before and after the chain, and
+    /// `called.cwd` is the cwd the call's hook event got.
+    #[tokio::test]
+    async fn tool_call_events_record_each_call_on_the_single_and_the_parallel_lane() {
+        let dir = tempfile::tempdir().unwrap();
+        let single = &[("toolu_a", "session_probe", "{}")][..];
+        let parallel = &[("toolu_a", "session_probe", "{}"), ("toolu_b", "session_probe", "{}")][..];
+        for (uses, session_cwd) in [(single, Some(dir.path().to_path_buf())), (parallel, None)] {
+            let hooks = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let bus = recording_hook_bus(hooks.clone()).await;
+            let mut sub = subscribed(&bus);
+            drive_tool_call_events(
+                vec![Arc::new(SessionProbe(Arc::new(std::sync::Mutex::new(Vec::new()))))],
+                uses,
+                bus,
+                Some("conv-1"),
+                session_cwd.clone(),
+                None,
+            )
+            .await;
+            let hooks = hooks.lock().unwrap().clone();
+            let got = drained(&mut sub);
+            for (id, _, _) in uses {
+                let hook_cwd = hooks
+                    .iter()
+                    .find(|e| matches!(e.kind, HookKind::BeforeToolCall) && e.tool_call_id.as_deref() == Some(*id))
+                    .map(|e| e.cwd.clone())
+                    .expect("the call's before_tool_call event");
+                assert!(hook_cwd.is_some());
+                assert_eq!(hook_cwd, crate::extensions::hooks::events::effective_tool_cwd(session_cwd.as_deref()));
+                let called_cwd = got.iter().find_map(|d| match &d.record.phase {
+                    ToolCallPhase::Called { cwd, .. } if d.record.tool_id == *id => Some(cwd.clone()),
+                    _ => None,
+                });
+                assert_eq!(called_cwd, Some(hook_cwd), "{id}: called.cwd is the hook event's");
+            }
+            assert!(got.windows(2).all(|w| w[1].seq > w[0].seq), "seq increases: {got:?}");
+            assert!(got.iter().all(|d| d.dropped == 0));
+            for (id, _, _) in uses {
+                let mine: Vec<_> = got.iter().filter(|d| d.record.tool_id == *id).collect();
+                let phases: Vec<_> = phases_of(&got)
+                    .into_iter()
+                    .filter(|(t, _)| t == id)
+                    .map(|(_, p)| p)
+                    .collect();
+                assert_eq!(phases, ["called", "decided:Allow", "finished:Ok"], "{id}, {} use(s)", uses.len());
+                for d in &mine {
+                    assert_eq!(d.record.session_id.as_deref(), Some("conv-1"));
+                    assert_eq!(d.record.handle_id, None);
+                    assert_eq!((d.record.tool.as_str(), d.record.tool_runtime.as_str()), ("session_probe", "session_probe"));
+                }
+                let fps: Vec<_> = mine
+                    .iter()
+                    .filter_map(|d| match &d.record.phase {
+                        ToolCallPhase::Called { fp, .. } | ToolCallPhase::Decided { fp, .. } => Some(fp.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(fps, vec![call_fingerprint("session_probe", &json!({})); 2]);
+            }
+        }
+    }
+
+    /// Group 4 at the site: a blocked call is decided(block) by its blocker
+    /// and finished(blocked); a failing tool finishes `error`.
+    #[tokio::test]
+    async fn a_blocked_call_finishes_blocked_and_a_failing_one_error() {
+        let bus = Arc::new(crate::extensions::hooks::HookBus::new());
+        let mut perms = PermissionSet::new();
+        perms.grant(crate::extensions::permissions::Permission::ToolsIntercept);
+        bus.subscribe(
+            HookKind::BeforeToolCall,
+            Arc::new(FixedHook("guard", HookResult::Block { reason: "no".into() })),
+            Some("session_probe".into()),
+            None,
+            perms,
+        )
+        .await
+        .unwrap();
+        let mut sub = subscribed(&bus);
+        drive_tool_call_events(
+            vec![
+                Arc::new(SessionProbe(Arc::new(std::sync::Mutex::new(Vec::new())))),
+                Arc::new(FailingProbe),
+            ],
+            &[("toolu_blk", "session_probe", "{}"), ("toolu_err", "failing_probe", "{}")],
+            bus,
+            Some("conv-1"),
+            None,
+            None,
+        )
+        .await;
+        let got = drained(&mut sub);
+        let phases = phases_of(&got);
+        let of = |id: &str| -> Vec<String> {
+            phases.iter().filter(|(t, _)| t == id).map(|(_, p)| p.clone()).collect()
+        };
+        assert_eq!(of("toolu_blk"), ["called", "decided:Block", "finished:Blocked"]);
+        assert_eq!(of("toolu_err"), ["called", "decided:Allow", "finished:Error"]);
+        let decided = got
+            .iter()
+            .find(|d| d.record.tool_id == "toolu_blk" && matches!(d.record.phase, ToolCallPhase::Decided { .. }))
+            .unwrap();
+        assert!(matches!(
+            &decided.record.phase,
+            ToolCallPhase::Decided { decision: ToolCallDecision::Block, by, .. } if by == &["guard".to_string()]
+        ));
+    }
+
+    /// Group 7 (owner): a worker's calls carry its parent's session id and
+    /// its handle, while the worker's own session id stays `None`: its hook
+    /// events still say `null`. A worker's runtime has no cwd of its own
+    /// (`worker_runtime` sets none), so `called.cwd` is the process cwd.
+    #[tokio::test]
+    async fn a_workers_calls_carry_its_parent_and_handle_while_its_hooks_see_null() {
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let bus = recording_hook_bus(events.clone()).await;
+        let mut sub = subscribed(&bus);
+        let owner = ToolCallOwner {
+            parent_session_id: Some("conv-parent".into()),
+            handle_id: "sa_3".into(),
+        };
+        drive_tool_call_events(
+            vec![Arc::new(SessionProbe(Arc::new(std::sync::Mutex::new(Vec::new()))))],
+            &[("toolu_w1", "session_probe", "{}"), ("toolu_w2", "session_probe", "{}")],
+            bus,
+            None,
+            None,
+            Some(owner),
+        )
+        .await;
+        let got = drained(&mut sub);
+        assert_eq!(got.len(), 6, "{got:?}");
+        let process_cwd = crate::extensions::hooks::events::effective_tool_cwd(None);
+        assert!(process_cwd.is_some());
+        for d in &got {
+            assert_eq!(d.record.session_id.as_deref(), Some("conv-parent"));
+            assert_eq!(d.record.handle_id.as_deref(), Some("sa_3"));
+            if let ToolCallPhase::Called { cwd, .. } = &d.record.phase {
+                assert_eq!(cwd, &process_cwd, "a worker's base is the process cwd");
+            }
+        }
+        let hooks = events.lock().unwrap().clone();
+        assert!(!hooks.is_empty());
+        assert!(hooks.iter().all(|e| e.session_id.is_none()), "a worker's hooks keep null");
+    }
+
+    /// Group 5 at the site: neither the input nor the output (a secret,
+    /// a path) appears in any record or its Debug line.
+    #[tokio::test]
+    async fn tool_call_records_never_carry_the_input_or_the_output() {
+        let bus = Arc::new(crate::extensions::hooks::HookBus::new());
+        let mut sub = subscribed(&bus);
+        let input = json!({"text": format!("{TCE_SECRET} /tce-in/input.txt")}).to_string();
+        let dir = tempfile::tempdir().unwrap();
+        drive_tool_call_events(
+            vec![Arc::new(SecretEcho)],
+            &[("toolu_s", "secret_echo", input.as_str())],
+            bus,
+            Some("conv-1"),
+            Some(dir.path().to_path_buf()),
+            None,
+        )
+        .await;
+        let got = drained(&mut sub);
+        assert_eq!(got.len(), 3, "{got:?}");
+        // The base directory is a path, not input or output: it is let through.
+        assert!(matches!(&got[0].record.phase, ToolCallPhase::Called { cwd: Some(_), .. }), "{got:?}");
+        for d in &got {
+            for text in [serde_json::to_string(&*d.record).unwrap(), format!("{d:?}")] {
+                for needle in [TCE_SECRET, "/tce-in", "input.txt", "/tce-out", ".secret", "token="] {
+                    assert!(!text.contains(needle), "{needle} leaked: {text}");
+                }
+            }
         }
     }
 
@@ -5368,6 +5818,7 @@ mod rich_output_tests {
             telemetry_level: crate::runtime::telemetry::TelemetryLevel::Off,
             orchestration: None,
             delegation_parent: None,
+            tool_call_owner: None,
             turn_correlation_id: "turn-f19".into(),
             progressive_tool_disclosure: false,
             deferred_tool_loading: true,

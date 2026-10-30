@@ -462,6 +462,12 @@ impl Daemon {
             tracing::info!(swept, "daemon: removed stale session registrations");
         }
 
+        // `daemon.tool_call_events`: off unless the config turns it on. Read
+        // at start, so a reload (a new image) picks up a change. Set before
+        // any session of this image runs a tool.
+        let tool_call_events = crate::config::load_config().daemon.tool_call_events;
+        state.host.parts().hook_bus.tool_call_hub().set_enabled(tool_call_events);
+
         // C3: rehydrate BEFORE accepting so a reconnecting client finds its session.
         if let Some(rs) = &reload_state {
             reload::rehydrate(&state, rs).await;

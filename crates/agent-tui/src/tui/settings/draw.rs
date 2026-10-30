@@ -797,6 +797,8 @@ pub(crate) fn config_row_display(key: &str) -> Option<String> {
         "session_persistence" => checked_config_display(key, |v| v == "journal", "json"),
         "agent_name" | "identity" => raw_config(key).unwrap_or_else(|| DEFAULT_DISPLAY.to_string()),
         "events.auto_turn" => bool_config_display(key, true),
+        // Daemon
+        "daemon.tool_call_events" => bool_config_display(key, false),
         "events.auto_turn_cap" => raw_config(key)
             .and_then(|v| cfg::parse_auto_turn_cap(&v))
             .unwrap_or(cfg::DEFAULT_AUTO_TURN_CAP)

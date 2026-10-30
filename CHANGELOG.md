@@ -6,6 +6,19 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Native tool-call events for daemon clients.** With
+  `daemon.tool_call_events = on` (default off; also on the Settings page), a
+  client on the daemon socket can send `{"type":"tool_calls"}` and receive
+  one record per phase (`called`, `decided`, `finished`) of every tool call
+  of every session, its subagents (under the parent's session id plus the
+  `sa_N` handle) and extensions' `tool.call`. A record carries ids (the
+  provider's call id, the session id), the tool name, a pria-gate-compatible
+  input fingerprint, the hook chain's decision and who made it, the status,
+  the duration and the call's base `cwd`, never the input, the output or
+  command text. Delivery is fail-open: no tool call waits for a subscriber,
+  and a slow one is told how many records it dropped. `Confirm` prompts for
+  a tool call now carry the call's id in `confirm_scope.tool_id`. See
+  [docs/tool-call-events.md](docs/tool-call-events.md).
 - **`synaps daemon rename <ID|NAME> <NEW_NAME>`** (or `--clear`) names a
   daemon session from any shell without attaching, so a tool can name a
   session it only observes. Same rules as `/saveas`; attached clients see the

@@ -370,6 +370,10 @@ define_settings! {
             Err(_) => SettingApply::Local(Err("expected a number of seconds".to_string())),
         };
 
+    "daemon.tool_call_events", "Tool-call events", Daemon, EditorKind::Cycler(&["on", "off"]),
+        "Let a client on the daemon socket subscribe to a content-free record of every tool call (no input or output). Off by default. Takes effect at the next daemon start or reload.",
+        |_app, value| on_off("daemon.tool_call_events", value);
+
     "client_input", "Client input", Daemon, EditorKind::Cycler(&["shared", "exclusive"]),
         "Who may type in a daemon session with several clients attached (tabs, a dashboard, a bridge): shared (default) lets every client except --observe ones send input; exclusive lets only the input owner, and the others /takeover. The daemon reads it when it starts: `synaps daemon reload` applies it.",
         |_app, value| config_edit("client_input", value);
@@ -771,6 +775,19 @@ mod tests {
                 matches!(def.editor, EditorKind::Text { numeric: true }),
                 "{key} should be a numeric Text editor"
             );
+        }
+    }
+
+    #[test]
+    fn daemon_tool_call_events_is_an_on_off_daemon_row() {
+        let def = ALL_SETTINGS
+            .iter()
+            .find(|d| d.key == "daemon.tool_call_events")
+            .expect("daemon.tool_call_events setting should be defined");
+        assert_eq!(def.category, Category::Daemon);
+        match def.editor {
+            EditorKind::Cycler(opts) => assert_eq!(opts, &["on", "off"]),
+            _ => panic!("daemon.tool_call_events editor should be a Cycler"),
         }
     }
 

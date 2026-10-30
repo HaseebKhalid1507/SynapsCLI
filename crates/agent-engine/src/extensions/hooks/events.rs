@@ -162,6 +162,56 @@ pub fn hook_session_id_enabled() -> bool {
     )
 }
 
+/// What a tool dispatch site knows about one call, attached to its
+/// `before_tool_call` / `after_tool_call` events by
+/// [`HookEvent::with_tool_call`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ToolCallHookContext<'a> {
+    /// Owning conversation id (`None` for workers), as for
+    /// [`HookEvent::with_session`].
+    pub session_id: Option<&'a str>,
+    /// The provider's id for the call (`tool_use.id`).
+    pub tool_call_id: Option<&'a str>,
+    /// The resolved base directory, from [`effective_tool_cwd`].
+    pub cwd: Option<String>,
+}
+
+impl<'a> ToolCallHookContext<'a> {
+    /// Context for one call: `session_cwd` is the session's working
+    /// directory as the tools receive it (`ToolCapabilities::cwd`).
+    pub fn for_tool_call(
+        session_id: Option<&'a str>,
+        tool_call_id: Option<&'a str>,
+        session_cwd: Option<&std::path::Path>,
+    ) -> Self {
+        Self {
+            session_id,
+            // An empty provider id identifies nothing.
+            tool_call_id: tool_call_id.filter(|id| !id.is_empty()),
+            cwd: effective_tool_cwd(session_cwd),
+        }
+    }
+}
+
+/// The absolute directory a tool resolves a relative path against, given
+/// the session's working directory as the tools receive it: that directory
+/// (joined to the process's current directory when it is relative), or the
+/// process's current directory when the session has none. This is the base
+/// `resolve_path_in` uses (a relative path is joined to the session cwd,
+/// and the OS resolves what is still relative against the process cwd).
+/// `None` when the process cwd is needed but unavailable, or when the
+/// result is not valid UTF-8 (it travels as a JSON string).
+pub fn effective_tool_cwd(session_cwd: Option<&std::path::Path>) -> Option<String> {
+    let base = match session_cwd {
+        Some(dir) if dir.is_absolute() => dir.to_path_buf(),
+        // `join("")` would add a trailing separator; an empty base anchors
+        // nothing, so the process cwd is the base as it is.
+        Some(dir) if !dir.as_os_str().is_empty() => std::env::current_dir().ok()?.join(dir),
+        _ => std::env::current_dir().ok()?,
+    };
+    base.into_os_string().into_string().ok()
+}
+
 /// A hook event payload dispatched to extension handlers.
 ///
 /// Fields are optional and populated only when relevant to the hook kind:
@@ -178,6 +228,10 @@ pub fn hook_session_id_enabled() -> bool {
 ///
 /// `✓*` — set via [`HookEvent::with_session`] for foreground sessions; `null`
 /// for workers (no conversation id) and when `SYNAPS_HOOK_SESSION_ID=0`.
+///
+/// `before_tool_call` and `after_tool_call` from the tool dispatch sites also
+/// carry `tool_call_id` and `cwd` (set via [`HookEvent::with_tool_call`]);
+/// both keys are omitted from the JSON when absent, and on every other event.
 ///
 /// The `data` field is available on all events for extensions that need to
 /// attach arbitrary structured context when constructing synthetic events.
@@ -200,6 +254,18 @@ pub struct HookEvent {
     pub message: Option<String>,
     /// Session identifier for session lifecycle hooks.
     pub session_id: Option<String>,
+    /// The provider's id for this tool call (`tool_use.id`) on
+    /// `before_tool_call` / `after_tool_call`, when the dispatch site has
+    /// one. An extension can use it to join its before and after records.
+    /// Omitted from the JSON when absent, so other events keep their shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    /// For `before_tool_call` / `after_tool_call`: the absolute directory a
+    /// relative tool path resolves against for this call (see
+    /// [`effective_tool_cwd`]). Omitted when unknown or not valid UTF-8, so
+    /// an extension that needs it can treat its absence as "unknown".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
     /// Session message history for `on_session_end`.
     /// Contains the conversation transcript so extensions (like Stelline)
     /// can extract memories without reaching into runtime internals.
@@ -225,6 +291,15 @@ impl HookEvent {
         self
     }
 
+    /// Attach a tool call's context (builder): the owning conversation id,
+    /// as [`HookEvent::with_session`], plus the call id and resolved cwd.
+    pub fn with_tool_call(self, ctx: &ToolCallHookContext<'_>) -> Self {
+        let mut event = self.with_session(ctx.session_id);
+        event.tool_call_id = ctx.tool_call_id.map(str::to_string);
+        event.cwd = ctx.cwd.clone();
+        event
+    }
+
     /// Construct a `before_tool_call` event.
     pub fn before_tool_call(tool_name: &str, input: Value) -> Self {
         Self {
@@ -236,6 +311,8 @@ impl HookEvent {
             session_id: None,
             tool_runtime_name: None,
             transcript: None,
+            tool_call_id: None,
+            cwd: None,
             data: Value::Null,
         }
     }
@@ -266,6 +343,8 @@ impl HookEvent {
             session_id: None,
             tool_runtime_name: None,
             transcript: None,
+            tool_call_id: None,
+            cwd: None,
             data: Value::Null,
         }
     }
@@ -281,6 +360,8 @@ impl HookEvent {
             session_id: None,
             tool_runtime_name: None,
             transcript: None,
+            tool_call_id: None,
+            cwd: None,
             data: Value::Null,
         }
     }
@@ -296,6 +377,8 @@ impl HookEvent {
             session_id: None,
             tool_runtime_name: None,
             transcript: None,
+            tool_call_id: None,
+            cwd: None,
             data,
         }
     }
@@ -334,6 +417,8 @@ impl HookEvent {
             session_id: Some(new_session_id.to_string()),
             tool_runtime_name: None,
             transcript: None,
+            tool_call_id: None,
+            cwd: None,
             data,
         }
     }
@@ -349,6 +434,8 @@ impl HookEvent {
             session_id: Some(session_id.to_string()),
             tool_runtime_name: None,
             transcript: None,
+            tool_call_id: None,
+            cwd: None,
             data: Value::Null,
         }
     }
@@ -364,6 +451,8 @@ impl HookEvent {
             session_id: Some(session_id.to_string()),
             tool_runtime_name: None,
             transcript,
+            tool_call_id: None,
+            cwd: None,
             data: Value::Null,
         }
     }
@@ -937,5 +1026,122 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ── Tool call context (tool_call_id, cwd) ────────────────────────────
+
+    #[test]
+    fn with_tool_call_attaches_session_call_id_and_cwd() {
+        let ctx = ToolCallHookContext::for_tool_call(
+            Some("conv-1"),
+            Some("toolu_01"),
+            Some(std::path::Path::new("/srv/project")),
+        );
+        for event in [
+            HookEvent::before_tool_call("bash", json!({"command": "ls"})).with_tool_call(&ctx),
+            HookEvent::after_tool_call("bash", json!({}), "out".into()).with_tool_call(&ctx),
+        ] {
+            assert_eq!(event.tool_call_id.as_deref(), Some("toolu_01"));
+            assert_eq!(event.cwd.as_deref(), Some("/srv/project"));
+            assert_eq!(event.session_id.as_deref(), Some("conv-1"));
+        }
+        // A context without them leaves both absent.
+        let bare = HookEvent::before_tool_call("bash", json!({}))
+            .with_tool_call(&ToolCallHookContext::default());
+        assert_eq!(
+            (bare.tool_call_id, bare.cwd, bare.session_id),
+            (None, None, None)
+        );
+        // An empty provider id counts as none.
+        let empty = ToolCallHookContext::for_tool_call(None, Some(""), None);
+        assert_eq!(empty.tool_call_id, None);
+    }
+
+    #[test]
+    fn effective_tool_cwd_is_the_base_the_tools_resolve_against() {
+        let process = std::env::current_dir().unwrap();
+        let text = |p: std::path::PathBuf| p.to_str().unwrap().to_string();
+        // An absolute session cwd is used as it is (no canonicalization).
+        assert_eq!(
+            effective_tool_cwd(Some(std::path::Path::new("/srv/project/../x"))),
+            Some("/srv/project/../x".to_string())
+        );
+        // A relative one is joined to the process cwd, as the OS would.
+        assert_eq!(
+            effective_tool_cwd(Some(std::path::Path::new("sub/dir"))),
+            Some(text(process.join("sub/dir")))
+        );
+        // No session cwd: the process cwd.
+        assert_eq!(effective_tool_cwd(None), Some(text(process.clone())));
+        // An empty one anchors nothing: the process cwd, as written.
+        assert_eq!(
+            effective_tool_cwd(Some(std::path::Path::new(""))),
+            Some(text(process.clone()))
+        );
+        // Matches what a tool does with a relative path.
+        for session_cwd in [
+            Some(std::path::Path::new("/srv/project")),
+            Some(std::path::Path::new("sub")),
+            Some(std::path::Path::new("")),
+            None,
+        ] {
+            let resolved = crate::tools::util::resolve_path_in("a/b.txt", session_cwd);
+            let absolute = if resolved.is_relative() {
+                process.join(&resolved)
+            } else {
+                resolved
+            };
+            let base = effective_tool_cwd(session_cwd).unwrap();
+            assert_eq!(
+                absolute,
+                std::path::Path::new(&base).join("a/b.txt"),
+                "{session_cwd:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn effective_tool_cwd_is_absent_when_not_utf8() {
+        use std::os::unix::ffi::OsStrExt;
+        let raw = std::ffi::OsStr::from_bytes(b"/srv/\xffproject");
+        assert_eq!(effective_tool_cwd(Some(std::path::Path::new(raw))), None);
+    }
+
+    #[test]
+    fn tool_call_fields_are_omitted_unless_present() {
+        // Every other event keeps its wire shape: no new keys.
+        for event in [
+            HookEvent::before_message("hi"),
+            HookEvent::on_session_start("s"),
+            HookEvent::before_tool_call("bash", json!({})).with_session(Some("conv-1")),
+        ] {
+            let wire = serde_json::to_value(&event).unwrap();
+            let object = wire.as_object().unwrap();
+            assert!(!object.contains_key("tool_call_id"), "{wire}");
+            assert!(!object.contains_key("cwd"), "{wire}");
+        }
+        let ctx = ToolCallHookContext {
+            session_id: None,
+            tool_call_id: Some("toolu_01"),
+            cwd: Some("/srv/project".into()),
+        };
+        let mut event = HookEvent::before_tool_call("bash", json!({}));
+        event.tool_call_id = ctx.tool_call_id.map(str::to_string);
+        event.cwd = ctx.cwd.clone();
+        let wire = serde_json::to_value(&event).unwrap();
+        assert_eq!(wire["tool_call_id"], "toolu_01");
+        assert_eq!(wire["cwd"], "/srv/project");
+    }
+
+    #[test]
+    fn an_event_without_the_new_fields_still_deserializes() {
+        let old = json!({
+            "kind": "before_tool_call", "tool_name": "bash", "tool_input": {"command": "ls"},
+            "tool_output": null, "message": null, "session_id": "conv-1", "data": null
+        });
+        let event: HookEvent = serde_json::from_value(old).unwrap();
+        assert_eq!((event.tool_call_id, event.cwd), (None, None));
+        assert_eq!(event.session_id.as_deref(), Some("conv-1"));
     }
 }

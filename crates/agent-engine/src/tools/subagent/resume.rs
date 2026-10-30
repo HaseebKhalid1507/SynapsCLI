@@ -454,6 +454,10 @@ impl Tool for SubagentResumeTool {
         let handle_id_inner = handle_id.clone();
         let prior_handle_for_finalizer = prior_handle_id.clone();
         let child_parent_id = handle_id.clone();
+        // The worker's tool-call records name the calling session and the
+        // new handle; its own session id stays None.
+        let tool_call_owner =
+            crate::runtime::tool_call_events::ToolCallOwner::for_worker(&ctx, &handle_id);
 
         // ── Build and register handle BEFORE spawning ─────────────────────────
         let system_prompt_for_handle = system_prompt.clone();
@@ -546,6 +550,7 @@ impl Tool for SubagentResumeTool {
                         runtime
                             .install_worker_orchestration(Arc::clone(&orchestration_for_runtime));
                         runtime.set_delegation_parent(Some(child_parent_id.clone()));
+                        runtime.set_tool_call_owner(Some(tool_call_owner));
 
                         let cancel = crate::CancellationToken::new();
                         let cancel_inner = cancel.clone();
