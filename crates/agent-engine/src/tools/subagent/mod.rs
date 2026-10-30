@@ -1633,6 +1633,59 @@ mod worker_rollover_tests {
         assert_eq!(runtime.cache_ttl(), CacheTtl::FiveMinutes);
     }
 
+    /// Workers get the configured `context_window` (the foreground gets it
+    /// from `apply_config`); without it they all budgeted against the 200k
+    /// default, where an Opus worker's reserves leave ~32k. A model
+    /// that cannot open the window (no 1M support: the request builder never
+    /// sends it the opt-in) keeps its default instead.
+    #[test]
+    fn workers_inherit_the_configured_window_fitted_to_their_model() {
+        use super::{fit_subagent_context_window, subagent_context_window};
+        let one_m = crate::config::load_config_from_str("context_window = 1m\n");
+        assert_eq!(one_m.context_window, Some(1_000_000));
+        let worker = |config: &crate::config::SynapsConfig, model: &str| {
+            let mut runtime = crate::Runtime::new_headless();
+            apply_subagent_runtime_policy(&mut runtime, config, None, None, None, &Default::default());
+            runtime.set_model(model.into());
+            fit_subagent_context_window(&mut runtime);
+            runtime
+        };
+        for model in ["anthropic/claude-opus-5-5", "claude-sonnet-4-6", "claude-opus-4-6"] {
+            let w = worker(&one_m, model);
+            assert_eq!((w.context_window_override(), w.context_window()), (Some(1_000_000), 1_000_000), "{model}");
+        }
+        // An agent file can pin a model the parent's window does not fit.
+        for model in ["claude-haiku-4-5-20251001", "claude-opus-4-5", "openai/gpt-5.5"] {
+            let w = worker(&one_m, model);
+            assert_eq!((w.context_window_override(), w.context_window()), (None, 200_000), "{model}");
+        }
+        // `auto` (unset) stays the model default; a smaller window always fits.
+        assert_eq!(worker(&Default::default(), "anthropic/claude-opus-5-5").context_window_override(), None);
+        let small = crate::config::load_config_from_str("context_window = 150000\n");
+        assert_eq!(worker(&small, "claude-haiku-4-5-20251001").context_window(), 150_000);
+        assert_eq!(subagent_context_window(Some(200_000), "claude-haiku-4-5"), Some(200_000));
+        assert_eq!(subagent_context_window(Some(200_001), "claude-haiku-4-5"), None);
+    }
+
+    /// Every spawn path fits the inherited window after choosing the model
+    /// and before the run, exactly once (the policy runs before the model is
+    /// known).
+    #[test]
+    fn every_spawn_path_fits_the_context_window_after_model_selection() {
+        for (name, source) in [
+            ("oneshot", include_str!("oneshot.rs")),
+            ("start", include_str!("start.rs")),
+            ("resume", include_str!("resume.rs")),
+        ] {
+            let policy = source.find("super::apply_subagent_runtime_policy(").unwrap();
+            let model = source.find("runtime.set_model(").unwrap();
+            let fit = source.find("super::fit_subagent_context_window(&mut runtime)").unwrap();
+            let stream = source.find("runtime.run_stream").unwrap();
+            assert!(policy < model && model < fit && fit < stream, "{name}");
+            assert_eq!(source.matches("super::fit_subagent_context_window(").count(), 1, "{name}");
+        }
+    }
+
     /// Every spawn path gives its worker a transcript sink, after the policy
     /// and before the run, exactly once.
     #[test]
@@ -1728,5 +1781,114 @@ mod worker_rollover_tests {
         assert_eq!(summary["transcripts"][1], "/a/sa_1.window-2.md");
         assert!(summary.get("rollovers").is_none(), "unknown for an archived run");
         assert!(crate::runtime::subagent::archived_context_summary(&history[..1]).is_none());
+    }
+}
+
+/// The live bug end to end: with `context_window = 1m` configured, a worker
+/// from every spawn path (oneshot, start, resume) sends the 1M opt-in, as the
+/// foreground does. Before the fix none did, through a loopback provider that
+/// records each request's `anthropic-beta` header.
+#[cfg(test)]
+mod worker_context_window_wire_tests {
+    use crate::runtime::subagent::{SubagentRegistry, SubagentStatus};
+    use crate::tools::test_helpers::create_tool_context;
+    use crate::tools::Tool;
+    use axum::response::IntoResponse;
+    use serde_json::{json, Value};
+    use std::sync::{Arc, Mutex};
+
+    /// The harness's foreground model (its catalog admits no other); 1M-capable.
+    const MODEL: &str = "anthropic/claude-sonnet-4-6";
+    const DONE: &str = concat!(
+        r#"data: {"type":"message_start","message":{"id":"msg_cw","type":"message","role":"assistant","content":[],"model":"claude-opus-5-5","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}"#, "\n\n",
+        r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#, "\n\n",
+        r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"done"}}"#, "\n\n",
+        r#"data: {"type":"content_block_stop","index":0}"#, "\n\n",
+        r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"input_tokens":10,"output_tokens":5,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}"#, "\n\n",
+        r#"data: {"type":"message_stop"}"#, "\n\n",
+    );
+
+    async fn spawn_provider() -> (String, Arc<Mutex<Vec<String>>>) {
+        let betas: Arc<Mutex<Vec<String>>> = Arc::default();
+        let seen = betas.clone();
+        let app = axum::Router::new().route(
+            "/v1/messages",
+            axum::routing::post(move |headers: axum::http::HeaderMap| {
+                let seen = seen.clone();
+                async move {
+                    let beta = headers.get("anthropic-beta").and_then(|v| v.to_str().ok());
+                    seen.lock().unwrap().push(beta.unwrap_or_default().to_string());
+                    ([("content-type", "text/event-stream")], DONE).into_response()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), betas)
+    }
+
+    async fn finish(registry: &Arc<Mutex<SubagentRegistry>>, handle_id: &str) {
+        for _ in 0..600 {
+            let done = registry
+                .lock()
+                .unwrap()
+                .get(handle_id)
+                .is_none_or(|h| h.status() != SubagentStatus::Running);
+            if done {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let thread = registry.lock().unwrap().get_mut(handle_id).and_then(|h| h.thread_handle.take());
+        if let Some(thread) = thread {
+            tokio::task::spawn_blocking(move || thread.join()).await.unwrap().unwrap();
+        }
+        let status = registry.lock().unwrap().get(handle_id).map(|h| h.status());
+        assert_eq!(status, Some(SubagentStatus::Completed), "{handle_id}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn every_spawn_path_sends_the_configured_1m_window() {
+        let base = crate::test_env::BaseDirGuard::new();
+        std::fs::write(
+            base.path().join("auth.json"),
+            r#"{"anthropic": {"type": "oauth", "refresh": "synthetic", "access": "synthetic-access", "expires": 9999999999999}}"#,
+        )
+        .unwrap();
+        std::fs::write(base.path().join("config"), "context_window = 1m\n").unwrap();
+        let (url, betas) = spawn_provider().await;
+        let _guards = [
+            crate::test_env::EnvVarGuard::remove("SYNAPS_AUTH_ENDPOINT"),
+            crate::test_env::EnvVarGuard::remove("SYNAPS_MACHINE_TOKEN"),
+            crate::test_env::EnvVarGuard::remove("SYNAPS_SUBAGENT_FRESH_RUNTIME"),
+            crate::test_env::EnvVarGuard::remove("ANTHROPIC_API_KEY"),
+            crate::test_env::EnvVarGuard::set("SYNAPS_ANTHROPIC_BASE_URL", &url),
+        ];
+        let registry = Arc::new(Mutex::new(SubagentRegistry::new()));
+        let ctx = || {
+            let mut ctx = create_tool_context();
+            ctx.capabilities.subagent_registry = Some(registry.clone());
+            ctx
+        };
+        let task = json!({"system_prompt": "test worker", "task": "run it", "model": MODEL, "timeout": 60});
+
+        super::SubagentTool.execute(task.clone(), ctx()).await.expect("subagent");
+        let out = super::SubagentStartTool.execute(task, ctx()).await.expect("subagent_start");
+        let handle = serde_json::from_str::<Value>(&out).unwrap()["handle_id"].as_str().unwrap().to_owned();
+        finish(&registry, &handle).await;
+        let out = super::SubagentResumeTool
+            .execute(json!({"handle_id": handle, "instructions": "again", "timeout": 60}), ctx())
+            .await
+            .expect("subagent_resume");
+        let resumed = serde_json::from_str::<Value>(&out).unwrap()["handle_id"].as_str().unwrap().to_owned();
+        finish(&registry, &resumed).await;
+
+        let betas = betas.lock().unwrap().clone();
+        assert_eq!(betas.len(), 3, "oneshot, start, resume: {betas:?}");
+        for (path, beta) in ["oneshot", "start", "resume"].iter().zip(&betas) {
+            assert!(beta.contains("context-1m-2025-08-07"), "{path}: {beta:?}");
+        }
     }
 }

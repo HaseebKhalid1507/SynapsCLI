@@ -950,6 +950,62 @@ mod tests {
         assert_eq!(hard_capacity_budget(normal, 10, 72_000, 1_000).history_tokens, 0);
     }
 
+    /// The live thrash (#332): an Opus worker on the 200k default window.
+    /// Its next round reserves the 128k output envelope, a 10k tool result,
+    /// the 15% safety margin (30k) and the 512 advisory reserve: hard
+    /// capacity at 31,488, a third of the 93,333 target. No rollover there
+    /// can make room. The same Opus worker on the configured 1m window, and
+    /// a Sonnet worker (64k envelope) on 200k, can hold the target.
+    #[test]
+    fn hard_capacity_has_room_only_when_the_target_fits_below_it() {
+        use agent_core::core::context_policy::{assess_context, ContextAction, ContextBudget, ContextState};
+        let on = WorkerContextSettings { enabled: true, rollover_tokens: 200_000 };
+        let opus_200k = 128_000 + 10_000 + 30_000 + 512;
+        let p = on.policy(200_000).unwrap();
+        assert_eq!(p.target_tokens(), 93_333);
+        // ~33k of context is hard capacity on that window.
+        let at_33k = ContextBudget {
+            context_window_tokens: 200_000,
+            used_tokens: 33_000,
+            hard_remaining_tokens: 167_000,
+            required_next_round_tokens: opus_200k,
+        };
+        assert_eq!(assess_context(&p.config, &ContextState::default(), at_33k).action, ContextAction::HardStop);
+        assert!(!p.hard_capacity_has_room(200_000, opus_200k));
+        assert!(p.hard_capacity_has_room(200_000, 64_000 + 10_000 + 30_000 + 512));
+        let opus_1m = 128_000 + 10_000 + 150_000 + 512;
+        assert!(on.policy(1_000_000).unwrap().hard_capacity_has_room(1_000_000, opus_1m));
+        // A 120k Sonnet window (the old hard-capacity test): 27.5k against 56k.
+        let small = on.policy(120_000).unwrap();
+        assert_eq!(small.target_tokens(), 56_000);
+        assert!(!small.hard_capacity_has_room(120_000, 64_000 + 10_000 + 18_000 + 512));
+        // The boundary: a successor at the target must start below the line.
+        assert!(!p.hard_capacity_has_room(200_000, 200_000 - 93_333));
+        assert!(p.hard_capacity_has_room(200_000, 200_000 - 93_334));
+        assert!(!p.hard_capacity_has_room(100_000, 200_000), "reserves over the window");
+    }
+
+    /// At hard capacity a successor that would itself be at hard capacity
+    /// (its must-keep tail alone is too big) makes no room: refused, as the
+    /// pressure band refuses one below hard capacity.
+    #[test]
+    fn a_successor_at_the_line_that_triggered_it_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sink = WorkerTranscriptSink { dir: tmp.path().into(), stem: "sa_1".into(), observer: None };
+        let policy = WorkerContextSettings { enabled: true, rollover_tokens: 200_000 }
+            .policy(200_000)
+            .unwrap();
+        let mut m = worker_history(20, 3_000);
+        m.extend(round(20, 60_000)); // the must-keep round: ~24k tokens
+        let before = super::super::context::estimate_history(&m);
+        let roll = |line| roll_over(&m, budget(10_000), before, 1_000, &policy, &sink, line).unwrap();
+        assert!(roll(Some(20_000)).is_none(), "would start at hard capacity again");
+        let (successor, report) = roll(Some(100_000)).expect("room below the line");
+        assert!(report.after_tokens < 100_000 && successor.len() < m.len());
+        // Below hard capacity the pressure band (140k) is the line.
+        assert!(roll(None).is_some());
+    }
+
     #[test]
     fn successor_keeps_brief_and_recent_rounds_within_the_target() {
         let messages = worker_history(40, 4_000);
