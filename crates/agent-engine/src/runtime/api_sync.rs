@@ -177,6 +177,9 @@ impl ApiMethods {
                 "No Anthropic credentials. Run `synaps login`, or switch to a provider model with `/model groq/llama-3.3-70b-versatile`.".to_string()
             ));
         }
+        // Resolve `cache_ttl = auto` against this request's credential kind
+        // (1h OAuth, 5m API key); explicit values pass through unchanged.
+        let cache_ttl = options.cache_ttl.resolve_for_auth_type(&auth_type);
 
         let auth_header = if auth_type == "oauth" {
             (
@@ -208,7 +211,7 @@ impl ApiMethods {
         HelperMethods::annotate_retention_anchor(
             &mut cleaned_messages,
             super::image_retention::earliest(options.retention_frontier, retention.frontier),
-            options.cache_ttl,
+            cache_ttl,
         );
         // Strict checks retain original per-source batch boundaries: sanitizing
         // first could merge valid adjacent user batches past eight attachments.
@@ -216,7 +219,7 @@ impl ApiMethods {
         // The sync transport sends the full registry and never defers, so any
         // `tool_reference` in the history is stripped (it would be a 400).
         HelperMethods::wire_tool_references(&mut cleaned_messages, &|_| None);
-        HelperMethods::annotate_cache_breakpoint(&mut cleaned_messages, options.cache_ttl);
+        HelperMethods::annotate_cache_breakpoint(&mut cleaned_messages, cache_ttl);
 
         // Body assembly (#128 Slice 4): borrow the history instead of the old
         // `json!` deep rebuild. Sync transport → no "stream" key. Byte-identity
@@ -232,7 +235,7 @@ impl ApiMethods {
             thinking_budget,
             reasoning_level,
             Some(&execution_plan),
-            options.cache_ttl,
+            cache_ttl,
             false,
         );
         let body = parts.body;
@@ -259,6 +262,7 @@ impl ApiMethods {
         // ═══ TRACE (Task 8): shared construction with the streaming path ═══
         let mut tracer = super::api::begin_anthropic_tracer(
             options,
+            cache_ttl,
             &anthropic_url,
             model,
             &body_bytes,
@@ -706,6 +710,7 @@ impl ApiMethods {
         // carries the three synthesized identity/guidance segment entries.
         let mut tracer = super::api::begin_anthropic_tracer(
             options,
+            options.cache_ttl.resolve_for_auth_type(&auth_type),
             &anthropic_url,
             model,
             &body_bytes,

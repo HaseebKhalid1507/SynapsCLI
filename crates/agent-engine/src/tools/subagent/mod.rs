@@ -172,9 +172,10 @@ pub(crate) fn apply_subagent_runtime_policy(
     runtime.set_codex_request_role(crate::runtime::openai::catalog::CodexRequestRole::Worker);
 
     // Policy: subagent spawns are always 5m cache TTL regardless of what the
-    // parent session configured. `Runtime::new()` already defaults to
-    // `FiveMinutes`, but this explicit call makes the invariant contract-level
-    // so a future `apply_config` addition can't silently break it.
+    // parent session configured. Load-bearing: `Runtime::new()` defaults to
+    // `cache_ttl = auto`, which resolves to 1h on OAuth credentials; this
+    // explicit call pins workers to a fixed 5m (#110) so neither that
+    // default nor a future `apply_config` addition can silently change it.
     runtime.set_cache_ttl(crate::core::config::CacheTtl::FiveMinutes);
 
     // Task 23: workers run under the WORKER turn budget (typed config
@@ -465,7 +466,7 @@ mod cache_ttl_policy_tests {
     async fn subagent_policy_forces_five_minutes_even_when_parent_is_one_hour() {
         // Build a config representing a parent session with 1h cache TTL.
         let parent_config = crate::config::SynapsConfig {
-            cache_ttl: CacheTtl::OneHour,
+            cache_ttl: CacheTtl::OneHour.into(),
             ..Default::default()
         };
 
@@ -482,7 +483,7 @@ mod cache_ttl_policy_tests {
         // Confirm the runtime IS at 1h before we apply the policy.
         assert_eq!(
             runtime.cache_ttl(),
-            CacheTtl::OneHour,
+            CacheTtl::OneHour.into(),
             "pre-condition: runtime must be at OneHour before applying subagent policy"
         );
 
@@ -492,7 +493,7 @@ mod cache_ttl_policy_tests {
         // Post-condition: TTL must be FiveMinutes regardless of parent config.
         assert_eq!(
             runtime.cache_ttl(),
-            CacheTtl::FiveMinutes,
+            CacheTtl::FiveMinutes.into(),
             "subagent spawn must always use 5m TTL, even when parent config is 1h \
              (paying 1h write premium on short-lived one-shots is unrecoverable waste)"
         );
@@ -501,7 +502,7 @@ mod cache_ttl_policy_tests {
     #[tokio::test]
     async fn subagent_policy_forces_five_minutes_even_when_parent_is_hybrid() {
         let parent_config = crate::config::SynapsConfig {
-            cache_ttl: CacheTtl::Hybrid,
+            cache_ttl: CacheTtl::Hybrid.into(),
             ..Default::default()
         };
 
@@ -514,7 +515,7 @@ mod cache_ttl_policy_tests {
 
         assert_eq!(
             runtime.cache_ttl(),
-            CacheTtl::Hybrid,
+            CacheTtl::Hybrid.into(),
             "pre-condition: must be Hybrid"
         );
 
@@ -522,32 +523,61 @@ mod cache_ttl_policy_tests {
 
         assert_eq!(
             runtime.cache_ttl(),
-            CacheTtl::FiveMinutes,
+            CacheTtl::FiveMinutes.into(),
             "subagent spawn must always use 5m TTL, even when parent config is hybrid"
         );
     }
 
     #[tokio::test]
     async fn subagent_policy_is_idempotent_when_parent_already_five_minutes() {
-        let parent_config = crate::config::SynapsConfig::default(); // FiveMinutes by default
+        let parent_config = crate::config::SynapsConfig {
+            cache_ttl: CacheTtl::FiveMinutes.into(),
+            ..Default::default()
+        };
 
         let mut runtime = crate::Runtime::new()
             .await
             .expect("Runtime::new() must succeed in test environment");
-
-        // Runtime::new() default is already FiveMinutes, but confirm it.
-        assert_eq!(
-            runtime.cache_ttl(),
-            CacheTtl::FiveMinutes,
-            "pre-condition: Runtime::new() must default to 5m"
-        );
+        runtime.set_cache_ttl(CacheTtl::FiveMinutes);
 
         apply_subagent_runtime_policy(&mut runtime, &parent_config, None, None, None, &Default::default());
 
         assert_eq!(
             runtime.cache_ttl(),
-            CacheTtl::FiveMinutes,
+            CacheTtl::FiveMinutes.into(),
             "subagent spawn must stay 5m when parent is already 5m (idempotent)"
+        );
+    }
+
+    /// `cache_ttl = auto` (the default) resolves to 1h on OAuth credentials.
+    /// Workers keep #110's forced 5m regardless: the policy replaces the
+    /// inherited `auto` with a fixed 5m, so even an OAuth-bound worker sends
+    /// 5m markers.
+    #[tokio::test]
+    async fn subagent_policy_pins_five_minutes_over_the_auto_default_on_oauth() {
+        let parent_config = crate::config::SynapsConfig::default();
+        assert_eq!(parent_config.cache_ttl, crate::config::CacheTtlSetting::Auto);
+
+        let mut runtime = crate::Runtime::new_headless();
+        runtime.set_auth_kind_for_test("oauth").await;
+        assert_eq!(
+            runtime.cache_ttl(),
+            crate::config::CacheTtlSetting::Auto,
+            "pre-condition: Runtime defaults to cache_ttl = auto"
+        );
+        assert_eq!(
+            runtime.resolved_cache_ttl().await,
+            CacheTtl::OneHour,
+            "pre-condition: auto resolves to 1h on OAuth"
+        );
+
+        apply_subagent_runtime_policy(&mut runtime, &parent_config, None, None, None, &Default::default());
+
+        assert_eq!(runtime.cache_ttl(), CacheTtl::FiveMinutes.into());
+        assert_eq!(
+            runtime.resolved_cache_ttl().await,
+            CacheTtl::FiveMinutes,
+            "an OAuth worker must still send 5m markers (#110)"
         );
     }
 
@@ -1313,13 +1343,13 @@ mod retry_inheritance_tests {
             let config = crate::SynapsConfig {
                 api_retries: api,
                 refusal_retries: refusal,
-                cache_ttl: crate::config::CacheTtl::OneHour,
+                cache_ttl: crate::config::CacheTtl::OneHour.into(),
                 ..Default::default()
             };
             super::apply_subagent_runtime_policy(&mut worker, &config, None, None, None, &Default::default());
             assert_eq!(worker.api_retries(), api);
             assert_eq!(worker.refusal_retries(), refusal);
-            assert_eq!(worker.cache_ttl(), crate::config::CacheTtl::FiveMinutes);
+            assert_eq!(worker.cache_ttl(), crate::config::CacheTtl::FiveMinutes.into());
             assert_eq!(
                 worker.codex_request_role(),
                 crate::runtime::openai::catalog::CodexRequestRole::Worker
@@ -1589,13 +1619,13 @@ mod worker_rollover_tests {
             Some(WorkerContextSettings { enabled: true, rollover_tokens: 200_000 })
         );
         assert!(runtime.worker_context().sink.is_none(), "inert until a spawn attaches a sink");
-        assert_eq!(runtime.cache_ttl(), CacheTtl::FiveMinutes);
+        assert_eq!(runtime.cache_ttl(), CacheTtl::FiveMinutes.into());
         assert!(!runtime.context_management_enabled(), "never the foreground's rollover");
 
         let off = crate::config::SynapsConfig {
             subagent_context_management: ContextManagementMode::Off,
             subagent_rollover_tokens: 150_000,
-            cache_ttl: CacheTtl::OneHour,
+            cache_ttl: CacheTtl::OneHour.into(),
             ..Default::default()
         };
         let mut runtime = crate::Runtime::new_headless();
@@ -1603,7 +1633,7 @@ mod worker_rollover_tests {
         let settings = runtime.worker_context().settings.unwrap();
         assert!(!settings.enabled);
         assert!(settings.policy(1_000_000).is_none());
-        assert_eq!(runtime.cache_ttl(), CacheTtl::FiveMinutes);
+        assert_eq!(runtime.cache_ttl(), CacheTtl::FiveMinutes.into());
     }
 
     /// Every spawn path gives its worker a transcript sink, after the policy

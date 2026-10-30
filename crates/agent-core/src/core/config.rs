@@ -722,6 +722,91 @@ impl CacheTtl {
             _ => None,
         }
     }
+
+    /// Canonical config spelling (`5m` | `1h` | `hybrid`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CacheTtl::FiveMinutes => "5m",
+            CacheTtl::OneHour => "1h",
+            CacheTtl::Hybrid => "hybrid",
+        }
+    }
+}
+
+impl std::fmt::Display for CacheTtl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The `cache_ttl` config value: either a fixed [`CacheTtl`] or `auto`.
+///
+/// `Auto` (default) resolves per credential *kind* at request time:
+/// - Anthropic OAuth / subscription credentials → [`CacheTtl::OneHour`]
+///   (what Claude Code uses on subscriptions; a subscription pays no
+///   per-token premium for 1h writes, and idle gaps over five minutes
+///   otherwise lose the conversation cache every turn).
+/// - Anthropic API key → [`CacheTtl::FiveMinutes`] (1h writes bill at 2×
+///   input versus 1.25× for 5m, so API-key users keep the cheaper write).
+/// - Other providers ignore `cache_ttl` entirely.
+///
+/// Resolution depends only on the credential kind, never on which account
+/// or token is in use, so account failover between two subscription seats
+/// can never flip the TTL (a TTL change rewrites the cache).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CacheTtlSetting {
+    #[default]
+    Auto,
+    Fixed(CacheTtl),
+}
+
+impl CacheTtlSetting {
+    /// `auto` or any [`CacheTtl::parse`] spelling (case-insensitive).
+    /// `None` for unknown values.
+    pub fn parse(val: &str) -> Option<CacheTtlSetting> {
+        let v = val.trim();
+        if v.eq_ignore_ascii_case("auto") {
+            return Some(CacheTtlSetting::Auto);
+        }
+        CacheTtl::parse(v).map(CacheTtlSetting::Fixed)
+    }
+
+    /// Canonical config spelling (`auto` | `5m` | `1h` | `hybrid`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CacheTtlSetting::Auto => "auto",
+            CacheTtlSetting::Fixed(ttl) => ttl.as_str(),
+        }
+    }
+
+    /// The wire policy for a request carried on Anthropic credentials of
+    /// the given kind (`oauth` = subscription / OAuth access token, else an
+    /// API key). Explicit values always win.
+    pub fn resolve(self, oauth: bool) -> CacheTtl {
+        match self {
+            CacheTtlSetting::Fixed(ttl) => ttl,
+            CacheTtlSetting::Auto if oauth => CacheTtl::OneHour,
+            CacheTtlSetting::Auto => CacheTtl::FiveMinutes,
+        }
+    }
+
+    /// [`Self::resolve`] keyed by the runtime's `auth_type` string. Only the
+    /// exact `"oauth"` kind counts as a subscription credential.
+    pub fn resolve_for_auth_type(self, auth_type: &str) -> CacheTtl {
+        self.resolve(auth_type == "oauth")
+    }
+}
+
+impl From<CacheTtl> for CacheTtlSetting {
+    fn from(ttl: CacheTtl) -> Self {
+        CacheTtlSetting::Fixed(ttl)
+    }
+}
+
+impl std::fmt::Display for CacheTtlSetting {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// gzip `Content-Encoding` for Anthropic request bodies
@@ -1332,8 +1417,9 @@ pub struct SynapsConfig {
     /// [`MAX_TELEMETRY_LOG_GENERATIONS`], default 1: just `<log>.1`).
     pub telemetry_log_generations: u32,
     pub cache_diagnostics: bool, // opt into cache-diagnosis beta (default false)
-    /// Prompt-cache TTL strategy: "5m" (default) | "1h" | "hybrid".
-    pub cache_ttl: CacheTtl,
+    /// Prompt-cache TTL strategy: "auto" (default: 1h on Anthropic OAuth /
+    /// subscription credentials, 5m on an API key) | "5m" | "1h" | "hybrid".
+    pub cache_ttl: CacheTtlSetting,
     /// Prompt-cache keep-warm while idle (`cache_keepwarm`): `off` (default)
     /// | `auto` | `<N>h`. See [`CacheKeepWarm`] and
     /// docs/specs/cache-ttl-spec.md §7.
@@ -1455,7 +1541,7 @@ impl Default for SynapsConfig {
             telemetry: "off".to_string(),
             telemetry_log_generations: 1,
             cache_diagnostics: false,
-            cache_ttl: CacheTtl::default(),
+            cache_ttl: CacheTtlSetting::default(),
             cache_keepwarm: CacheKeepWarm::Off,
             cache_keepwarm_auto_max_hours: DEFAULT_CACHE_KEEPWARM_AUTO_MAX_HOURS,
             request_compression: RequestCompressionMode::Auto,
@@ -2147,10 +2233,10 @@ fn apply_config_content_with(
             "cache_diagnostics" => {
                 config.cache_diagnostics = matches!(val, "true" | "1" | "on" | "yes");
             }
-            "cache_ttl" => match CacheTtl::parse(val) {
+            "cache_ttl" => match CacheTtlSetting::parse(val) {
                 Some(ttl) => config.cache_ttl = ttl,
                 None => config.warnings.push(format!(
-                    "cache_ttl = {val} — expected 5m, 1h, or hybrid; using 5m"
+                    "cache_ttl = {val} — expected auto, 5m, 1h, or hybrid; using auto"
                 )),
             },
             "cache_keepwarm" => match CacheKeepWarm::parse(val) {
@@ -3727,7 +3813,7 @@ mod tests {
     fn test_cache_keepwarm_config_key() {
         let c = load_config_from_str("cache_keepwarm = auto\ncache_ttl = 5m\n");
         assert_eq!(c.cache_keepwarm, CacheKeepWarm::Auto);
-        assert_eq!(c.cache_ttl, CacheTtl::FiveMinutes);
+        assert_eq!(c.cache_ttl, CacheTtlSetting::Fixed(CacheTtl::FiveMinutes));
         assert!(c.warnings.is_empty(), "warnings: {:?}", c.warnings);
 
         let c = load_config_from_str("cache_keepwarm = 6h\n");
@@ -3814,9 +3900,73 @@ mod tests {
     }
 
     #[test]
-    fn test_cache_ttl_default_is_five_minutes() {
+    fn test_cache_ttl_default_is_auto() {
+        // The wire policy's own default stays the historical bare 5m marker;
+        // the *config* default is `auto` (resolved per credential kind).
         assert_eq!(CacheTtl::default(), CacheTtl::FiveMinutes);
-        assert_eq!(SynapsConfig::default().cache_ttl, CacheTtl::FiveMinutes);
+        assert_eq!(CacheTtlSetting::default(), CacheTtlSetting::Auto);
+        assert_eq!(SynapsConfig::default().cache_ttl, CacheTtlSetting::Auto);
+        // An empty config file leaves it at auto.
+        assert_eq!(load_config_from_str("").cache_ttl, CacheTtlSetting::Auto);
+    }
+
+    #[test]
+    fn test_cache_ttl_setting_parse_and_round_trip() {
+        assert_eq!(CacheTtlSetting::parse("auto"), Some(CacheTtlSetting::Auto));
+        assert_eq!(CacheTtlSetting::parse(" AUTO "), Some(CacheTtlSetting::Auto));
+        assert_eq!(
+            CacheTtlSetting::parse("5m"),
+            Some(CacheTtlSetting::Fixed(CacheTtl::FiveMinutes))
+        );
+        assert_eq!(
+            CacheTtlSetting::parse("1hr"),
+            Some(CacheTtlSetting::Fixed(CacheTtl::OneHour))
+        );
+        assert_eq!(
+            CacheTtlSetting::parse("hybrid"),
+            Some(CacheTtlSetting::Fixed(CacheTtl::Hybrid))
+        );
+        for bad in ["", "2h", "forever", "automatic", "on"] {
+            assert_eq!(CacheTtlSetting::parse(bad), None, "{bad:?}");
+        }
+        // as_str → parse is the identity for every value, and the written
+        // config line reloads to the same setting.
+        for setting in [
+            CacheTtlSetting::Auto,
+            CacheTtlSetting::Fixed(CacheTtl::FiveMinutes),
+            CacheTtlSetting::Fixed(CacheTtl::OneHour),
+            CacheTtlSetting::Fixed(CacheTtl::Hybrid),
+        ] {
+            assert_eq!(CacheTtlSetting::parse(setting.as_str()), Some(setting));
+            assert_eq!(setting.to_string(), setting.as_str());
+            let cfg = load_config_from_str(&format!("cache_ttl = {setting}\n"));
+            assert_eq!(cfg.cache_ttl, setting);
+            assert!(cfg.warnings.is_empty(), "{setting}: {:?}", cfg.warnings);
+        }
+    }
+
+    #[test]
+    fn test_cache_ttl_setting_resolution() {
+        // auto: subscription (OAuth) → 1h, API key → 5m.
+        assert_eq!(CacheTtlSetting::Auto.resolve(true), CacheTtl::OneHour);
+        assert_eq!(CacheTtlSetting::Auto.resolve(false), CacheTtl::FiveMinutes);
+        assert_eq!(
+            CacheTtlSetting::Auto.resolve_for_auth_type("oauth"),
+            CacheTtl::OneHour
+        );
+        for not_oauth in ["api_key", "none", "", "OAuth"] {
+            assert_eq!(
+                CacheTtlSetting::Auto.resolve_for_auth_type(not_oauth),
+                CacheTtl::FiveMinutes,
+                "{not_oauth:?}"
+            );
+        }
+        // Explicit values win over the credential kind, both ways.
+        for ttl in [CacheTtl::FiveMinutes, CacheTtl::OneHour, CacheTtl::Hybrid] {
+            for oauth in [true, false] {
+                assert_eq!(CacheTtlSetting::Fixed(ttl).resolve(oauth), ttl);
+            }
+        }
     }
 
     #[test]
@@ -3935,7 +4085,7 @@ mod tests {
         std::fs::write(dir.join("config"), "cache_ttl = hybrid\n").unwrap();
         with_home(&home, || {
             let config = load_config();
-            assert_eq!(config.cache_ttl, CacheTtl::Hybrid);
+            assert_eq!(config.cache_ttl, CacheTtlSetting::Fixed(CacheTtl::Hybrid));
             assert!(
                 config.warnings.is_empty(),
                 "warnings: {:?}",
@@ -3947,7 +4097,7 @@ mod tests {
         std::fs::write(dir.join("config"), "cache_ttl = 2h\n").unwrap();
         with_home(&home, || {
             let config = load_config();
-            assert_eq!(config.cache_ttl, CacheTtl::FiveMinutes);
+            assert_eq!(config.cache_ttl, CacheTtlSetting::Auto);
             assert!(
                 config.warnings.iter().any(|w| w.contains("cache_ttl")),
                 "warnings: {:?}",
@@ -4960,6 +5110,7 @@ api_retries = 5
             "memory.recall_max_records = 4",
             "memory.user_scope = true",
             "cache_ttl = hybrid",
+            "cache_ttl = auto",
         ] {
             let problems = config_content_problems(good);
             assert!(problems.is_empty(), "{good}: {problems:?}");
@@ -5056,6 +5207,7 @@ api_retries = 5
         with_home(&home, || {
             // Single-key value checks.
             assert!(validate_config_edit("cache_ttl", "1h").is_ok());
+            assert!(validate_config_edit("cache_ttl", "auto").is_ok());
             assert!(validate_config_edit("cache_ttl", "2h").is_err());
             assert!(validate_config_edit("shell.max_output", "big").is_err());
             assert!(validate_config_edit("memory.axel.brain", "relative/brain").is_err());

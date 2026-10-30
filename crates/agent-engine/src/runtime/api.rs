@@ -807,9 +807,11 @@ pub struct ApiOptions {
     pub memory_backend: Option<crate::memory_backend::MemoryBinding>,
     /// Opt into the 1M context window beta header.
     pub use_1m_context: bool,
-    /// Prompt-cache TTL strategy (spec: cache-ttl). Default `FiveMinutes`
-    /// emits payloads byte-identical to the pre-feature release.
-    pub cache_ttl: crate::core::config::CacheTtl,
+    /// Configured prompt-cache TTL (spec: cache-ttl). Resolved to a wire
+    /// [`crate::core::config::CacheTtl`] per request once the credential
+    /// kind is known (`auto`: 1h on OAuth, 5m on an API key). A resolved
+    /// `FiveMinutes` emits payloads byte-identical to the pre-feature release.
+    pub cache_ttl: crate::core::config::CacheTtlSetting,
     /// One-time-per-session latch for the silent-downgrade notice (1h
     /// requested, only 5m honored). Shared via Arc so every request in the
     /// session sees the same latch; the configured mode is NEVER auto-flipped.
@@ -1015,6 +1017,7 @@ pub(super) fn terminal_http_error(
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn begin_anthropic_tracer(
     options: &ApiOptions,
+    cache_ttl: crate::core::config::CacheTtl,
     url: &str,
     bare_model: &str,
     body_bytes: &[u8],
@@ -1041,7 +1044,7 @@ pub(super) async fn begin_anthropic_tracer(
     // Lazy, spawn_blocking-backed key load; `None` degrades the record to
     // digest-free sections and is counted, never surfaced as an error.
     let key = options.trace.digest_key().await;
-    let prefix_ttl = match options.cache_ttl {
+    let prefix_ttl = match cache_ttl {
         crate::core::config::CacheTtl::FiveMinutes => Some(tr::CacheTtlClass::FiveMinutes),
         crate::core::config::CacheTtl::OneHour | crate::core::config::CacheTtl::Hybrid => {
             Some(tr::CacheTtlClass::OneHour)
@@ -1353,7 +1356,13 @@ impl ApiMethods {
             ));
         }
 
-        tracing::info!(model = %model, "Starting API request");
+        // Resolve the configured `cache_ttl` against the credential kind
+        // this request goes out on (`auto`: 1h OAuth, 5m API key). A pure
+        // function of the kind, so failover between accounts of one kind
+        // never flips the TTL (which would rewrite the cache).
+        let cache_ttl = options.cache_ttl.resolve_for_auth_type(&auth_type);
+
+        tracing::info!(model = %model, cache_ttl = %cache_ttl, "Starting API request");
 
         // Manual cache breakpoints for optimal prompt caching.
         // Tested vs auto-cache (top-level cache_control) — manual wins: 90% vs 53% hit rate.
@@ -1394,7 +1403,7 @@ impl ApiMethods {
         HelperMethods::annotate_retention_anchor(
             &mut cleaned_messages,
             super::image_retention::earliest(options.retention_frontier, retention.frontier),
-            options.cache_ttl,
+            cache_ttl,
         );
         // Strict checks retain original per-source batch boundaries: sanitizing
         // first could merge valid adjacent user batches past eight attachments.
@@ -1411,10 +1420,10 @@ impl ApiMethods {
                 let history_len = cleaned_messages.len() - 1;
                 HelperMethods::annotate_cache_breakpoint(
                     &mut cleaned_messages[..history_len],
-                    options.cache_ttl,
+                    cache_ttl,
                 );
             }
-            _ => HelperMethods::annotate_cache_breakpoint(&mut cleaned_messages, options.cache_ttl),
+            _ => HelperMethods::annotate_cache_breakpoint(&mut cleaned_messages, cache_ttl),
         }
 
         // Derive the thinking level from the budget for effort mapping.
@@ -1435,7 +1444,7 @@ impl ApiMethods {
             thinking_budget,
             reasoning_level,
             Some(&execution_plan),
-            options.cache_ttl,
+            cache_ttl,
             true,
         );
         let mut body = parts.body;
@@ -1472,7 +1481,7 @@ impl ApiMethods {
         // detector must stay disarmed (zero 1h bucket proves nothing).
         let has_tool_marker = body.has_tool_marker();
         let has_system_marker = body.has_system_marker();
-        let request_has_1h_marker = match options.cache_ttl {
+        let request_has_1h_marker = match cache_ttl {
             crate::core::config::CacheTtl::FiveMinutes => false,
             crate::core::config::CacheTtl::OneHour => {
                 !cleaned_messages.is_empty() || has_tool_marker || has_system_marker
@@ -1532,6 +1541,7 @@ impl ApiMethods {
             cancel,
             begin_anthropic_tracer(
                 options,
+                cache_ttl,
                 &anthropic_url,
                 model,
                 &body_bytes,
@@ -2201,7 +2211,7 @@ impl ApiMethods {
                 suppress_stream_deltas: options.suppress_stream_deltas,
                 telemetry_level,
                 request_start,
-                cache_ttl: options.cache_ttl,
+                cache_ttl,
                 ttl_downgrade_notified: options.ttl_downgrade_notified.clone(),
                 saw_1h_honored: options.saw_1h_honored.clone(),
                 request_has_1h_marker,
@@ -5197,6 +5207,8 @@ mod anthropic_failover_tests {
         base_url: String,
         /// `authorization` header of every call, in order.
         auth_seen: Arc<Mutex<Vec<String>>>,
+        /// Request body of every call, in order.
+        bodies: Arc<Mutex<Vec<String>>>,
     }
 
     impl MockUpstream {
@@ -5206,18 +5218,25 @@ mod anthropic_failover_tests {
         fn auth_seen(&self) -> Vec<String> {
             self.auth_seen.lock().unwrap().clone()
         }
+        fn bodies(&self) -> Vec<String> {
+            self.bodies.lock().unwrap().clone()
+        }
     }
 
     async fn spawn_upstream(script: Vec<Reply>) -> MockUpstream {
         let script = Arc::new(Mutex::new(script.into_iter()));
         let auth_seen = Arc::new(Mutex::new(Vec::new()));
+        let bodies = Arc::new(Mutex::new(Vec::new()));
         let seen = Arc::clone(&auth_seen);
+        let bodies_seen = Arc::clone(&bodies);
         let app = Router::new().route(
             "/v1/messages",
-            axum_post(move |headers: HeaderMap| {
+            axum_post(move |headers: HeaderMap, body: String| {
                 let script = Arc::clone(&script);
                 let seen = Arc::clone(&seen);
+                let bodies_seen = Arc::clone(&bodies_seen);
                 async move {
+                    bodies_seen.lock().unwrap().push(body);
                     seen.lock().unwrap().push(
                         headers
                             .get("authorization")
@@ -5281,6 +5300,7 @@ mod anthropic_failover_tests {
         MockUpstream {
             base_url: format!("http://{addr}"),
             auth_seen,
+            bodies,
         }
     }
 
@@ -5425,6 +5445,89 @@ mod anthropic_failover_tests {
         assert!(
             !text.contains(BODY_SENTINEL),
             "{ctx}: 429 body leaked: {text}"
+        );
+    }
+
+    /// Every `cache_control` value in a request body, in document order.
+    fn cache_markers(v: &serde_json::Value) -> Vec<serde_json::Value> {
+        match v {
+            serde_json::Value::Object(map) => map
+                .iter()
+                .flat_map(|(k, v)| {
+                    if k == "cache_control" {
+                        vec![v.clone()]
+                    } else {
+                        cache_markers(v)
+                    }
+                })
+                .collect(),
+            serde_json::Value::Array(items) => items.iter().flat_map(cache_markers).collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// `cache_ttl = auto` (the `ApiOptions` default) resolves from the
+    /// credential KIND only. An account failover between two subscription
+    /// seats keeps the hop's retry and the next request on the same 1h
+    /// markers (a flip would rewrite the cache); only an actual change of
+    /// kind, here to an API key, changes the TTL.
+    #[tokio::test]
+    #[serial_test::serial(anthropic_429_log_capture)]
+    async fn auto_cache_ttl_is_stable_across_account_failover() {
+        let upstream = spawn_upstream(vec![
+            Reply::Rejected429 { reset_in_secs: 3 * 3600 },
+            Reply::SseOk, // the same request, retried on seat 2
+            Reply::SseOk, // the next request, still on seat 2
+            Reply::SseOk, // a request on an API key
+        ])
+        .await;
+        let router = ScriptedRouter::new(true, Ok(Some(pinned("claude2"))));
+        let auth = oauth_auth_pinned_to("claude4");
+        assert_eq!(
+            ApiOptions::default().cache_ttl,
+            crate::core::config::CacheTtlSetting::Auto
+        );
+
+        let hop = drive(&upstream, Arc::clone(&auth), &router, 0).await;
+        hop.result.expect("the hop succeeds on seat 2");
+        let next = drive(&upstream, Arc::clone(&auth), &router, 0).await;
+        next.result.expect("the next request stays on seat 2");
+        assert_eq!(
+            upstream.auth_seen(),
+            ["Bearer tok-claude4", "Bearer tok-claude2", "Bearer tok-claude2"],
+            "control: the failover really switched seats"
+        );
+        {
+            let mut g = auth.write().await;
+            g.auth_type = "api_key".to_string();
+            g.auth_token = "sk-test".to_string();
+            g.bound_credential = None;
+        }
+        let key = drive(&upstream, Arc::clone(&auth), &router, 0).await;
+        key.result.expect("the API-key request succeeds");
+
+        let bodies = upstream.bodies();
+        assert_eq!(bodies.len(), 4);
+        assert_eq!(
+            bodies[0], bodies[1],
+            "the failover retry re-sends the identical body (same 1h markers)"
+        );
+        let markers: Vec<_> = bodies
+            .iter()
+            .map(|b| cache_markers(&serde_json::from_str(b).unwrap()))
+            .collect();
+        for (i, m) in markers[..3].iter().enumerate() {
+            assert!(!m.is_empty(), "request {i} has no markers");
+            assert!(
+                m.iter().all(|m| m["ttl"] == "1h"),
+                "request {i} on a subscription seat: {m:?}"
+            );
+        }
+        assert!(!markers[3].is_empty());
+        assert!(
+            markers[3].iter().all(|m| m.get("ttl").is_none()),
+            "a change of kind (API key) resolves auto to the bare 5m marker: {:?}",
+            markers[3]
         );
     }
 

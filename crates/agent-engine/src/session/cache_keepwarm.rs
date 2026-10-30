@@ -1167,9 +1167,14 @@ impl SessionActor {
             self.cache_keepwarm.last_end = Some(format!("not started: {reason}"));
             return;
         }
+        // The TTL the requests actually carry: `cache_ttl = auto` resolved
+        // against the bound credential kind (1h on OAuth), exactly as the
+        // request builder resolves it, so an auto-1h session schedules and
+        // cost-checks like an explicit `1h` one.
+        let ttl = self.runtime.resolved_cache_ttl().await;
         let cfg = PeriodConfig {
             mode,
-            ttl: self.runtime.cache_ttl(),
+            ttl,
             model: self.runtime.model().to_string(),
             max_tokens: probe.max_tokens,
             interval_override: interval_override(),
