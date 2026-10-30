@@ -957,7 +957,7 @@ mod tests {
     /// The next round's required room, as `pre_request_context_budget`
     /// computes it for an empty request (adaptive thinking, 30k tool cap).
     fn required(model: &str, window: u64) -> u64 {
-        super::super::stream::pre_request_context_budget(model, window, None, &[], &[], 0, 30_000)
+        super::super::stream::pre_request_context_budget(model, window, None, &[], &[], 0, 30_000, None)
             .1
             .required_next_round_tokens
     }

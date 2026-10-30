@@ -154,6 +154,9 @@ pub struct ContinuationState {
     /// Model whose request produced `token_calibration`. A sample is only
     /// applied to that model (tokenizers differ across providers/models).
     pub calibration_model: Option<String>,
+    /// The provider's count of the request behind `token_calibration`, kept
+    /// to measure the requests that extend it (same model, same lifetime).
+    pub usage_anchor: Option<super::context::UsageAnchor>,
     /// Stable id (`_synaps_turn.id` on the message) of the request that
     /// started the current turn, recorded by the host at turn admission.
     pub(crate) turn_start: Option<String>,
@@ -176,6 +179,7 @@ impl Default for ContinuationState {
             restore_pending: false,
             token_calibration: None,
             calibration_model: None,
+            usage_anchor: None,
             turn_start: None,
         }
     }
@@ -196,6 +200,34 @@ impl ContinuationState {
     pub fn record_calibration(&mut self, model: &str, sample: TokenCalibration) {
         self.token_calibration = sample.plausible().then_some(sample);
         self.calibration_model = self.token_calibration.map(|_| model.to_owned());
+        self.usage_anchor = None;
+    }
+
+    /// [`Self::record_calibration`], keeping the request as the usage anchor
+    /// for the requests that extend it. Only a plausible sample anchors: a
+    /// provider count far below the estimate is more likely missing cache
+    /// fields than an exact count, and anchoring to it would understate the
+    /// footprint.
+    pub fn record_request_usage(
+        &mut self,
+        model: &str,
+        sample: TokenCalibration,
+        fixed_tokens: u64,
+        messages: Vec<SharedMessage>,
+    ) {
+        self.record_calibration(model, sample);
+        self.usage_anchor = self.token_calibration.map(|c| super::context::UsageAnchor {
+            provider_tokens: c.provider_tokens,
+            fixed_tokens,
+            messages,
+        });
+    }
+
+    /// The usage anchor, only if it was measured on `model`.
+    pub fn usage_anchor_for(&self, model: &str) -> Option<&super::context::UsageAnchor> {
+        self.usage_anchor
+            .as_ref()
+            .filter(|_| self.calibration_model.as_deref() == Some(model))
     }
     /// Return a notice only on a transition. Normal/disabled assessments clear
     /// stale pressure; phase reports and repeated admissions do not re-arm it.
@@ -1172,6 +1204,28 @@ fn has_host_key(message: &Value) -> bool {
     message
         .as_object()
         .is_some_and(|o| o.keys().any(|k| k.starts_with(HOST_KEY_PREFIX)))
+}
+
+/// Whether two messages go on a provider wire identically: equal apart from
+/// their host-only `_synaps_*` keys (a host stamp added after a request does
+/// not change what that request sent).
+pub(crate) fn same_on_wire(a: &SharedMessage, b: &SharedMessage) -> bool {
+    if Arc::ptr_eq(a, b) {
+        return true;
+    }
+    match (a.as_object(), b.as_object()) {
+        (Some(x), Some(y)) => {
+            let wire = |o: &serde_json::Map<String, Value>| {
+                o.keys().filter(|k| !k.starts_with(HOST_KEY_PREFIX)).count()
+            };
+            wire(x) == wire(y)
+                && x
+                    .iter()
+                    .filter(|(k, _)| !k.starts_with(HOST_KEY_PREFIX))
+                    .all(|(k, v)| y.get(k) == Some(v))
+        }
+        _ => a == b,
+    }
 }
 
 /// One message as it goes on a provider wire: serialized without its

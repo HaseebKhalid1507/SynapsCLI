@@ -756,6 +756,12 @@ impl Runtime {
                 fallback_schema.as_slice()
             }
         };
+        let anchor = self
+            .continuation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .usage_anchor_for(&self.model)
+            .cloned();
         let (assessment, budget) = super::stream::pre_request_context_budget(
             &self.model,
             self.context_window(),
@@ -764,6 +770,7 @@ impl Runtime {
             request_messages,
             self.thinking_budget as u64,
             self.max_tool_output as u64,
+            anchor.as_ref(),
         );
         let state = self
             .continuation

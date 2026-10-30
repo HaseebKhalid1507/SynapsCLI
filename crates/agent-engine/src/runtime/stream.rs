@@ -374,6 +374,30 @@ fn log_restore(report: &crate::tools::activation::RestoreReport) {
     }
 }
 
+/// One round's request as assessed, to pair with the usage the provider
+/// reports for it: the calibration sample and the next round's anchor.
+struct CalibrationProbe {
+    estimated_tokens: u64,
+    fixed_tokens: u64,
+    records_before: u64,
+    messages: Vec<SharedMessage>,
+}
+
+impl CalibrationProbe {
+    fn new(
+        assessment: &super::context::ContextAssessment,
+        records_before: u64,
+        messages: &[SharedMessage],
+    ) -> Self {
+        Self {
+            estimated_tokens: assessment.estimated_tokens(),
+            fixed_tokens: assessment.fixed_tokens(),
+            records_before,
+            messages: messages.to_vec(),
+        }
+    }
+}
+
 /// The pre-request context assessment of a stream round over the round's
 /// final `request_messages` (after injection and the history image cap):
 /// the estimate and the budget `assess_context` decides on. Shared with the
@@ -383,6 +407,10 @@ fn log_restore(report: &crate::tools::activation::RestoreReport) {
 /// thinking + expected response within `max_tokens`, the next tool result,
 /// the safety margin, the advisory), not the `max_tokens` ceiling: see
 /// [`super::context::EXPECTED_RESPONSE_TOKENS`].
+///
+/// `usage_anchor` (the provider's count of an earlier request on `model`)
+/// measures the footprint when `request_messages` extend that request's;
+/// otherwise the estimate does ([`super::context::UsageAnchor`]).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn pre_request_context_budget(
     model: &str,
@@ -392,6 +420,7 @@ pub(super) fn pre_request_context_budget(
     request_messages: &[SharedMessage],
     thinking_budget_tokens: u64,
     next_tool_result_bytes: u64,
+    usage_anchor: Option<&super::context::UsageAnchor>,
 ) -> (
     super::context::ContextAssessment,
     agent_core::core::context_policy::ContextBudget,
@@ -407,7 +436,8 @@ pub(super) fn pre_request_context_budget(
         thinking_budget_tokens,
         next_tool_result_bytes,
         max_output_tokens: HelperMethods::max_tokens_for_model(model),
-    });
+    })
+    .anchored(usage_anchor, request_messages);
     let budget = agent_core::core::context_policy::ContextBudget {
         context_window_tokens: context_window,
         used_tokens: assessment.used_tokens(),
@@ -1308,9 +1338,9 @@ impl StreamMethods {
 
             // ═══ CONTEXT CONTINUATION: pre-request assessment ═══
             let mut context_advisory = None;
-            // (estimated footprint, usage records before the call) for this
-            // round's request; pairs with the provider-reported usage below.
-            let mut calibration_probe = None;
+            // This round's request as estimated; pairs with the
+            // provider-reported usage below.
+            let mut calibration_probe: Option<CalibrationProbe> = None;
             if context_enabled {
                 use super::continuation::{ContextAdvisory, ADVISORY_RESERVE_TOKENS};
                 use agent_core::core::context_policy::{assess_context, ContextAction};
@@ -1320,6 +1350,11 @@ impl StreamMethods {
                     .as_deref()
                     .map(|s| s.as_slice())
                     .unwrap_or(&fallback_schema);
+                let anchor = continuation
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .usage_anchor_for(&model)
+                    .cloned();
                 let (assessment, budget) = pre_request_context_budget(
                     &model,
                     context_window,
@@ -1328,8 +1363,13 @@ impl StreamMethods {
                     estimate_messages,
                     thinking_budget as u64,
                     max_tool_output as u64,
+                    anchor.as_ref(),
                 );
-                calibration_probe = Some((assessment.used_tokens(), usage_counters.records()));
+                calibration_probe = Some(CalibrationProbe::new(
+                    &assessment,
+                    usage_counters.records(),
+                    estimate_messages,
+                ));
                 let decision = {
                     let mut s = continuation
                         .lock()
@@ -1405,7 +1445,7 @@ impl StreamMethods {
                                     .total()
                                     .saturating_add(ADVISORY_RESERVE_TOKENS)
                                     .max(minimum_reserve)
-                                    .saturating_add(assessment.used_tokens().saturating_sub(
+                                    .saturating_add(assessment.estimated_tokens().saturating_sub(
                                         super::context::estimate_history(&messages),
                                     )),
                             );
@@ -1425,7 +1465,7 @@ impl StreamMethods {
                                 Ok(t) => super::continuation::successor_budget(
                                     t.target_tokens(&s.config),
                                     t.pressure_tokens,
-                                    assessment.used_tokens().saturating_sub(
+                                    assessment.estimated_tokens().saturating_sub(
                                         super::context::estimate_history(&messages),
                                     ),
                                     s.calibration_for(&model),
@@ -1533,6 +1573,11 @@ impl StreamMethods {
                     .as_deref()
                     .map(|s| s.as_slice())
                     .unwrap_or(&fallback_schema);
+                let anchor = continuation
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .usage_anchor_for(&model)
+                    .cloned();
                 let (assessment, budget) = pre_request_context_budget(
                     &model,
                     context_window,
@@ -1541,9 +1586,14 @@ impl StreamMethods {
                     estimate_messages,
                     thinking_budget as u64,
                     max_tool_output as u64,
+                    anchor.as_ref(),
                 );
                 let used = assessment.used_tokens();
-                calibration_probe = Some((used, usage_counters.records()));
+                calibration_probe = Some(CalibrationProbe::new(
+                    &assessment,
+                    usage_counters.records(),
+                    estimate_messages,
+                ));
                 let decision = assess_context(&worker_policy.config, &worker_policy_state, budget);
                 worker_policy_state = decision.next_state;
                 let hard_capacity = decision.action == ContextAction::HardStop;
@@ -1571,7 +1621,9 @@ impl StreamMethods {
                 if matches!(decision.action, ContextAction::Rollover | ContextAction::HardStop)
                     && !reserve_dominated
                 {
-                    let overhead = used.saturating_sub(super::context::estimate_history(&messages));
+                    let overhead = assessment
+                        .estimated_tokens()
+                        .saturating_sub(super::context::estimate_history(&messages));
                     let calibration = continuation
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1694,19 +1746,22 @@ impl StreamMethods {
             // Anthropic transport reads omitted cache fields as zero (it cannot
             // tell them from a real zero); an implausible ratio clears the
             // sample so selection falls back to the conservative estimator.
-            if let Some((estimated_tokens, before)) = calibration_probe {
-                if usage_counters.records() > before {
+            if let Some(probe) = calibration_probe {
+                if usage_counters.records() > probe.records_before {
                     // A booked zero count is a sample too: it fails the
-                    // plausibility check and clears any stale ratio.
+                    // plausibility check and clears any stale ratio and
+                    // anchor.
                     continuation
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .record_calibration(
+                        .record_request_usage(
                             &model,
                             super::continuation::TokenCalibration {
                                 provider_tokens: usage_counters.latest_context_tokens(),
-                                estimated_tokens,
+                                estimated_tokens: probe.estimated_tokens,
                             },
+                            probe.fixed_tokens,
+                            probe.messages,
                         );
                 }
             }
@@ -6475,10 +6530,11 @@ mod rich_output_tests {
         }
     }
 
-    /// One worker round: a signed thinking block, then a `big_out` call.
-    fn sse_thinking_tool_round(n: usize) -> String {
+    /// One worker round reporting `input` billed input tokens: a signed
+    /// thinking block, then a `big_out` call.
+    fn sse_thinking_tool_round_billed(n: usize, input: u64) -> String {
         let lines = [
-            format!(r#"data: {{"type":"message_start","message":{{"id":"msg_{n}","type":"message","role":"assistant","content":[],"model":"claude-sonnet-4-6","stop_reason":null,"stop_sequence":null,"usage":{{"input_tokens":10,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}}}}"#),
+            format!(r#"data: {{"type":"message_start","message":{{"id":"msg_{n}","type":"message","role":"assistant","content":[],"model":"claude-sonnet-4-6","stop_reason":null,"stop_sequence":null,"usage":{{"input_tokens":{input},"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}}}}"#),
             r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#.to_string(),
             format!(r#"data: {{"type":"content_block_delta","index":0,"delta":{{"type":"thinking_delta","thinking":"planning step {n}"}}}}"#),
             format!(r#"data: {{"type":"content_block_delta","index":0,"delta":{{"type":"signature_delta","signature":"sig-{n}"}}}}"#),
@@ -6486,7 +6542,7 @@ mod rich_output_tests {
             format!(r#"data: {{"type":"content_block_start","index":1,"content_block":{{"type":"tool_use","id":"tu_{n}","name":"big_out"}}}}"#),
             r#"data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{}"}}"#.to_string(),
             r#"data: {"type":"content_block_stop","index":1}"#.to_string(),
-            r#"data: {"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"input_tokens":10,"output_tokens":5,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}"#.to_string(),
+            format!(r#"data: {{"type":"message_delta","delta":{{"stop_reason":"tool_use","stop_sequence":null}},"usage":{{"input_tokens":{input},"output_tokens":5,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}}"#),
             r#"data: {"type":"message_stop"}"#.to_string(),
         ];
         let mut s = lines.join("\n\n");
@@ -6494,8 +6550,13 @@ mod rich_output_tests {
         s
     }
 
-    /// Anthropic stand-in: `rounds` tool rounds, then `end_turn`.
-    async fn spawn_rounds_mock(rounds: usize) -> (String, Arc<Mutex<Vec<Value>>>) {
+    /// Anthropic stand-in: `rounds` tool rounds, then `end_turn`. Each round
+    /// bills `body bytes × n / d` input tokens when `bill` is `Some((n, d))`,
+    /// else a token 10 (implausibly low: no usage anchor).
+    async fn spawn_billing_rounds_mock(
+        rounds: usize,
+        bill: Option<(u64, u64)>,
+    ) -> (String, Arc<Mutex<Vec<Value>>>) {
         let bodies = Arc::new(Mutex::new(Vec::new()));
         let calls = Arc::new(AtomicUsize::new(0));
         let (b, c) = (Arc::clone(&bodies), Arc::clone(&calls));
@@ -6509,8 +6570,9 @@ mod rich_output_tests {
                         if let Ok(v) = serde_json::from_str::<Value>(&body) {
                             b.lock().unwrap().push(v);
                         }
+                        let input = bill.map_or(10, |(num, den)| body.len() as u64 * num / den);
                         let sse = if n < rounds {
-                            sse_thinking_tool_round(n)
+                            sse_thinking_tool_round_billed(n, input)
                         } else {
                             SSE_END_TURN.to_string()
                         };
@@ -6557,10 +6619,25 @@ mod rich_output_tests {
         dir: &std::path::Path,
         stem: &str,
     ) -> WorkerRun {
+        drive_billed_worker(model, initial, rounds, window, rollover_tokens, dir, stem, None).await
+    }
+
+    /// [`drive_worker_on`] against [`spawn_billing_rounds_mock`].
+    #[allow(clippy::too_many_arguments)]
+    async fn drive_billed_worker(
+        model: &str,
+        initial: Vec<SharedMessage>,
+        rounds: usize,
+        window: u64,
+        rollover_tokens: u64,
+        dir: &std::path::Path,
+        stem: &str,
+        bill: Option<(u64, u64)>,
+    ) -> WorkerRun {
         use crate::runtime::worker_context::{
             WorkerContext, WorkerContextSettings, WorkerRolloverReport, WorkerTranscriptSink,
         };
-        let (base_url, bodies) = spawn_rounds_mock(rounds).await;
+        let (base_url, bodies) = spawn_billing_rounds_mock(rounds, bill).await;
         let mut registry = ToolRegistry::new();
         registry.register(Arc::new(WorkerBigOutputTool(Arc::new(AtomicUsize::new(0)))));
         let tools = Arc::new(RwLock::new(registry));
@@ -6640,6 +6717,68 @@ mod rich_output_tests {
 
     fn wire_text(v: &Value) -> String {
         v.to_string()
+    }
+
+    /// The worker rolls over when the provider-measured footprint reaches
+    /// the threshold, not when the estimate does. The mock bills each
+    /// request at 1 token per 4 body bytes, well under the estimator's 2.5,
+    /// as Anthropic bills an xhigh-reasoning history under its estimate.
+    /// Anchored, the last request before the first rollover is billed near
+    /// the threshold; on the estimate alone (a provider without usage) the
+    /// same worker rolls over at about 1/1.6 of it.
+    #[tokio::test]
+    async fn worker_rollover_is_anchored_to_the_reported_usage() {
+        let pressure = crate::runtime::worker_context::WorkerContextSettings {
+            enabled: true,
+            rollover_tokens: 60_000,
+        }
+        .policy(200_000)
+        .unwrap()
+        .thresholds
+        .pressure_tokens;
+        // Billed input of the last request before the first rollover, and
+        // that rollover's report.
+        let run = |bill: Option<(u64, u64)>| async move {
+            let tmp = tempfile::tempdir().unwrap();
+            let initial = vec![Arc::new(json!({"role":"user","content":BRIEF})) as SharedMessage];
+            let run = drive_billed_worker(
+                "claude-sonnet-4-6",
+                initial,
+                40,
+                200_000,
+                60_000,
+                tmp.path(),
+                "sa_40",
+                bill,
+            )
+            .await;
+            let sizes: Vec<usize> = run
+                .bodies
+                .iter()
+                .map(|b| b["messages"].as_array().unwrap().len())
+                .collect();
+            let k = (1..sizes.len())
+                .find(|&i| sizes[i] < sizes[i - 1])
+                .expect("rolled over");
+            (run.bodies[k - 1].to_string().len() as u64 / 4, run.reports[0].clone())
+        };
+
+        let (billed, report) = run(Some((1, 4))).await;
+        assert!(report.before_tokens >= pressure, "{report:?}");
+        // Measured: the count of the request before plus one round.
+        assert!(
+            report.before_tokens <= billed + 4_000,
+            "anchored, not estimated: {} vs billed {billed}",
+            report.before_tokens
+        );
+        assert!(billed >= pressure - 4_000, "billed {billed} at rollover, pressure {pressure}");
+
+        let (unanchored_billed, unanchored) = run(None).await;
+        assert!(unanchored.before_tokens >= pressure, "{unanchored:?}");
+        assert!(
+            unanchored_billed < pressure * 7 / 10,
+            "on the estimate the rollover fires early: billed {unanchored_billed}"
+        );
     }
 
     #[tokio::test]
@@ -6740,7 +6879,7 @@ mod rich_output_tests {
     /// The hard-capacity line (`window − required next round`) of a harness
     /// worker (adaptive thinking, 30k tool-output cap) on `model`.
     fn worker_hard_line(model: &str, window: u64) -> u64 {
-        let (_, budget) = super::pre_request_context_budget(model, window, None, &[], &[], 0, 30_000);
+        let (_, budget) = super::pre_request_context_budget(model, window, None, &[], &[], 0, 30_000, None);
         window - budget.required_next_round_tokens
     }
 

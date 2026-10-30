@@ -2563,6 +2563,12 @@ impl Runtime {
             .as_ref()
             .map(|segment| segment.rendered_text().to_string());
         let memory_contents: Vec<&str> = memory_rendered.as_deref().into_iter().collect();
+        let anchor = self
+            .continuation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .usage_anchor_for(&self.model)
+            .cloned();
         context::assess(&context::ContextBudgetInputs {
             model: &self.model,
             provider_window: self.context_window(),
@@ -2575,6 +2581,7 @@ impl Runtime {
             next_tool_result_bytes: self.max_tool_output as u64,
             max_output_tokens: HelperMethods::max_tokens_for_model(&self.model),
         })
+        .anchored(anchor.as_ref(), messages)
     }
 
     /// Task A7: hold a validated recall contribution for the current turn as
