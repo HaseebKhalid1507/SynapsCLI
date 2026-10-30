@@ -22,6 +22,18 @@ pub struct ExecutionCorrelation {
     request_id: TraceId,
 }
 
+/// How a call's history entry differs from its raw result, for
+/// [`ExecutionCorrelation::record_virtualised`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HistoryShaping {
+    /// The result was virtualised: history carries its preview (or, when
+    /// also deduped, the stub that replaced an identical preview).
+    pub virtualised: bool,
+    /// History carries a read-dedupe stub; the value is the bytes it kept
+    /// out of history.
+    pub deduped_bytes: Option<usize>,
+}
+
 impl ExecutionCorrelation {
     pub fn from_request(trace: &TraceContext, request: &super::RequestCorrelation) -> Self {
         Self {
@@ -59,13 +71,15 @@ impl ExecutionCorrelation {
             effect,
             commit_status,
             model_order,
-            false,
+            HistoryShaping::default(),
         );
     }
 
-    /// [`Self::record`] for a call whose history entry may be a tool output
-    /// virtualisation preview: then `result_bytes` is the whole output and
-    /// `retained_bytes` the preview, and the event says `virtualised`.
+    /// [`Self::record`] for a call whose history entry may be shaped: a tool
+    /// output virtualisation preview (then `result_bytes` is the whole
+    /// output and `retained_bytes` the preview, and the event says
+    /// `virtualised`) or a read-dedupe stub (`retained_bytes` is the stub;
+    /// the event says `deduped` with the bytes kept out of history).
     #[allow(clippy::too_many_arguments)]
     pub fn record_virtualised(
         &self,
@@ -80,7 +94,7 @@ impl ExecutionCorrelation {
         effect: ToolEffect,
         commit_status: ExecutionCommitStatus,
         model_order: usize,
-        virtualised: bool,
+        shaping: HistoryShaping,
     ) {
         let Ok(tool_call_id) = TraceId::new(tool_call_id) else {
             return;
@@ -118,7 +132,9 @@ impl ExecutionCorrelation {
             effect,
             commit_status,
             model_order: model_order as u32,
-            virtualised,
+            virtualised: shaping.virtualised,
+            deduped: shaping.deduped_bytes.is_some(),
+            deduped_bytes: shaping.deduped_bytes.unwrap_or(0) as u64,
         };
         self.trace.record_execution_event(event);
         self.trace.emit_execution_enriched(&self.request_id);
@@ -176,6 +192,10 @@ mod tests {
         let request = trace.reserve_request_correlation().unwrap();
         let correlation = ExecutionCorrelation::from_request(&trace, &request);
         for (id, virtualised) in [("toolu_v", true), ("toolu_l", false)] {
+            let shaping = HistoryShaping {
+                virtualised,
+                deduped_bytes: None,
+            };
             correlation.record_virtualised(
                 id,
                 &ToolId::builtin("bash"),
@@ -188,7 +208,7 @@ mod tests {
                 ToolEffect::NonIdempotent,
                 ExecutionCommitStatus::ResultRecorded,
                 0,
-                virtualised,
+                shaping,
             );
         }
         let events = trace.execution_events(&request.request_id);
@@ -200,6 +220,40 @@ mod tests {
         assert!(legacy.get("virtualised").is_none(), "absent unless set: {legacy}");
         let back: ToolExecutionEvent = serde_json::from_value(legacy).unwrap();
         assert!(!back.virtualised, "old records still read");
+    }
+
+    /// A read-dedupe stub: flagged with the bytes it kept out of history;
+    /// events without it serialize exactly as before.
+    #[test]
+    fn deduped_results_are_flagged_with_the_bytes_kept_out() {
+        let sink = CollectingTraceSink::new();
+        let trace = TraceContext::with_sink(sink);
+        let request = trace.reserve_request_correlation().unwrap();
+        let correlation = ExecutionCorrelation::from_request(&trace, &request);
+        for (id, deduped_bytes) in [("toolu_d", Some(7_900)), ("toolu_l", None)] {
+            correlation.record_virtualised(
+                id,
+                &ToolId::builtin("read"),
+                "read",
+                ExecutionPhase::ResultRecorded,
+                Instant::now(),
+                8_040,
+                140,
+                ActivationBasis::Core,
+                ToolEffect::ReadOnly,
+                ExecutionCommitStatus::ResultRecorded,
+                0,
+                HistoryShaping { virtualised: false, deduped_bytes },
+            );
+        }
+        let events = trace.execution_events(&request.request_id);
+        assert!(events[0].deduped && events[0].deduped_bytes == 7_900);
+        let wire = serde_json::to_value(&events[0]).unwrap();
+        assert_eq!((wire["deduped"].clone(), wire["deduped_bytes"].clone()), (true.into(), 7_900.into()));
+        let legacy = serde_json::to_value(&events[1]).unwrap();
+        assert!(legacy.get("deduped").is_none() && legacy.get("deduped_bytes").is_none(), "{legacy}");
+        let back: ToolExecutionEvent = serde_json::from_value(legacy).unwrap();
+        assert!(!back.deduped && back.deduped_bytes == 0, "old records still read");
     }
 
     #[test]

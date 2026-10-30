@@ -2171,7 +2171,10 @@ impl StreamMethods {
                                 effect,
                                 crate::runtime::trace::ExecutionCommitStatus::ResultRecorded,
                                 0,
-                                virtualised.is_some(),
+                                crate::runtime::trace::HistoryShaping {
+                                    virtualised: virtualised.is_some(),
+                                    deduped_bytes: None,
+                                },
                             );
                         }
                         let ui_result = crate::tools::output::bounded_preview(
@@ -2627,7 +2630,10 @@ impl StreamMethods {
                                     call_effect,
                                     commit_status,
                                     model_order,
-                                    virtualised_sizes.is_some(),
+                                    crate::runtime::trace::HistoryShaping {
+                                        virtualised: virtualised_sizes.is_some(),
+                                        deduped_bytes: None,
+                                    },
                                 );
                             }
                             lane_results.push((tool_id, was_canceled, interrupted, history));

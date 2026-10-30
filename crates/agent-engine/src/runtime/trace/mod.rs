@@ -49,7 +49,7 @@ pub use emit::{
     wire_meta_from_sent_bytes, AttemptClock, CollectingTraceSink, NoopTraceSink,
     RequestCorrelation, RequestStructure, RequestTracer, TraceContext, TraceSink,
 };
-pub use execution::ExecutionCorrelation;
+pub use execution::{ExecutionCorrelation, HistoryShaping};
 pub use export::{
     export_content, export_metadata, redact_value, sweep_expired_captures, ContentExport,
     ExportError, MetadataExportStats, CONTENT_EXPORT_SCHEMA,
