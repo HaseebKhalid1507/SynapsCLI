@@ -23,7 +23,11 @@ pub(crate) fn path_key(path: &Path) -> String {
     key
 }
 fn git_path(root: &Path, arg: &str) -> Result<PathBuf> {
-    let mut cmd = Command::new("git");
+    // Same rule and source as the host (agent-core's `git_program.rs`), read
+    // from this service's own DEVELOPER_DIR: `env_clear` below only clears the
+    // child's environment. No developer Git on macOS fails like a failed spawn.
+    let git = crate::git_program::git_program().map_err(|_| Error::Scope)?;
+    let mut cmd = Command::new(git);
     cmd.env_clear()
         .env("PATH", "/usr/bin:/bin")
         .env("GIT_CONFIG_NOSYSTEM", "1")
