@@ -1448,6 +1448,10 @@ impl ApiMethods {
             true,
         );
         let mut body = parts.body;
+        // A model that rejects input + `max_tokens` over the window gets the
+        // room the input leaves (no-op on Claude 4.5 and later). Before the
+        // keep-warm cut below, which only lowers it further.
+        body.fit_max_tokens_to_window(Self::provider_window(options, model));
         // Cache diagnostics (`cache_diagnostics = true`): the foreground
         // chain only — pings and the setting-off path send no field.
         let mut diagnostics = super::cache_diagnosis::diagnostics_for(options);

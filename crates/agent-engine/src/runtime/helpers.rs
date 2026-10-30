@@ -54,6 +54,13 @@ pub(super) const CLAUDE_CODE_TRANSPORT_IDENTITY: &str =
 pub(super) const OAUTH_ASSISTANT_GUIDANCE: &str =
     "You are a helpful AI assistant with access to tools. Use them when needed.";
 
+/// Smallest response room the window clamp leaves a request (on top of its
+/// thinking budget), see [`HelperMethods::fit_max_tokens_to_window`]. The
+/// clamp's input estimate is conservative (up to ~1.6x for prose), so the
+/// real room is usually larger than the estimate; below this the cap stops
+/// shrinking and the provider decides.
+pub(super) const MIN_WINDOW_CLAMPED_RESPONSE_TOKENS: u64 = 4_096;
+
 pub(crate) struct HelperMethods;
 
 /// Map a terminal [`crate::RuntimeError`] to the spec §5.2 typed
@@ -568,6 +575,33 @@ impl HelperMethods {
         } else {
             64000
         }
+    }
+
+    /// The `max_tokens` a request may send through a `provider_window`.
+    /// Unchanged for models that accept input + `max_tokens` over the window
+    /// (Claude 4.5 and later: generation stops at the window); for the
+    /// earlier ones that reject it ([`crate::core::models::model_rejects_output_overflow`])
+    /// clamped to the room the input leaves. `input_tokens` is evaluated only
+    /// then, and must be the conservative estimate, which never understates
+    /// the input, so the clamp never overstates the room. Never raised, and
+    /// never below `budget_tokens + MIN_WINDOW_CLAMPED_RESPONSE_TOKENS`: the
+    /// wire requires `max_tokens > budget_tokens`, and a request with less
+    /// room than that is beyond saving by the cap (the provider judges it).
+    pub(super) fn fit_max_tokens_to_window(
+        model: &str,
+        max_tokens: u64,
+        provider_window: u64,
+        thinking_budget_tokens: Option<u64>,
+        input_tokens: impl FnOnce() -> u64,
+    ) -> u64 {
+        if !crate::core::models::model_rejects_output_overflow(model) {
+            return max_tokens;
+        }
+        let room = provider_window.saturating_sub(input_tokens());
+        let floor = thinking_budget_tokens
+            .unwrap_or(0)
+            .saturating_add(MIN_WINDOW_CLAMPED_RESPONSE_TOKENS);
+        max_tokens.min(room.max(floor))
     }
 
     /// Append a single-line usage record to the per-call log — opt-in via the

@@ -4177,4 +4177,91 @@ mod calibration_transport_tests {
         turn(&rt).await;
         assert_eq!(calibration(&rt), Some(first));
     }
+
+    /// Opus with `context_management.mode = auto` on its 200k default window.
+    fn opus_200k() -> crate::Runtime {
+        let mut rt = crate::Runtime::new_headless();
+        rt.set_model("claude-opus-5-5".to_string());
+        rt.set_api_retries(1);
+        rt.set_context_window(Some(200_000));
+        rt.continuation.lock().unwrap().config.mode = ContextManagementMode::Auto;
+        rt
+    }
+
+    /// `n` events (~480 estimated tokens each) between a charter and a request.
+    fn events(n: usize) -> Vec<SharedMessage> {
+        let mut m = vec![Arc::new(json!({"role":"user","content":"charter"})) as SharedMessage];
+        m.extend((0..n).map(event));
+        m.push(Arc::new(json!({"role":"user","content":"next"})));
+        m
+    }
+
+    /// The next round on an Opus 200k window used to reserve the full 128k
+    /// `max_tokens`: HardStop from ~31.5k on, so every turn past it rolled
+    /// over (into a successor sized to the ~20k left) or, when a rollover
+    /// could not shrink, ended with an error. The realistic reserve puts hard
+    /// capacity at ~139k; a ~60k context just works.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn opus_on_a_200k_window_works_past_the_old_31k_hard_stop() {
+        let _base = crate::test_env::BaseDirGuard::new();
+        let (url, mock) = spawn(Arc::new(|_, _| (200, None))).await;
+        let _g = crate::test_env::EnvVarGuard::set("SYNAPS_ANTHROPIC_BASE_URL", &url);
+        let rt = opus_200k();
+        let history = events(120);
+        let assessment = rt.assess_context(&history).await;
+        assert!(
+            (50_000..100_000).contains(&assessment.used_tokens()),
+            "{}",
+            assessment.used_tokens()
+        );
+        // The daemon's opt-in auto_compact trigger reads the same budget.
+        assert!(!assessment.should_compact(), "budget {}", assessment.budget_tokens());
+        let out = turn_with(&rt, history, Default::default()).await;
+        assert!(out.heads.is_empty(), "no rollover");
+        assert_eq!(rt.continuation.lock().unwrap().window, 1);
+        assert_eq!(mock.calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// The same runtime with a band below hard capacity rolls over at its
+    /// band, into a successor at the target; at hard capacity (the default
+    /// 180k band is past it on a 200k window) the rollover has room for a
+    /// successor at the default target instead of the ~20k the old reserve
+    /// left.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn opus_on_a_200k_window_rolls_over_at_its_band() {
+        let _base = crate::test_env::BaseDirGuard::new();
+        let (url, _mock) = spawn(Arc::new(|_, _| (200, None))).await;
+        let _g = crate::test_env::EnvVarGuard::set("SYNAPS_ANTHROPIC_BASE_URL", &url);
+
+        let rt = opus_200k();
+        {
+            let mut s = rt.continuation.lock().unwrap();
+            s.config.pressure_tokens = Some(80_000);
+            s.config.rollover_tokens = Some(100_000);
+            s.config.target_tokens = Some(40_000);
+        }
+        let history = events(220);
+        let assessment = rt.assess_context(&history).await;
+        assert!(
+            (100_000..assessment.budget_tokens()).contains(&assessment.used_tokens()),
+            "past the band, below hard capacity: {} of {}",
+            assessment.used_tokens(),
+            assessment.budget_tokens()
+        );
+        let out = turn_with(&rt, history, Default::default()).await;
+        assert_eq!(out.heads.len(), 1, "exactly one rollover");
+        let head = crate::runtime::context::estimate_history(&out.heads[0]);
+        assert!(head <= 40_000, "head {head}");
+
+        // Default bands: hard capacity first, a productive rollover there.
+        let rt = opus_200k();
+        let history = events(300);
+        assert!(rt.assess_context(&history).await.should_compact(), "past hard capacity");
+        let out = turn_with(&rt, history, Default::default()).await;
+        assert_eq!(out.heads.len(), 1, "exactly one rollover");
+        let head = crate::runtime::context::estimate_history(&out.heads[0]);
+        assert!((40_000..=93_333).contains(&head), "head {head}");
+    }
 }

@@ -238,7 +238,10 @@ impl ApiMethods {
             cache_ttl,
             false,
         );
-        let body = parts.body;
+        let mut body = parts.body;
+        // A model that rejects input + `max_tokens` over the window gets the
+        // room the input leaves (no-op on Claude 4.5 and later).
+        body.fit_max_tokens_to_window(Self::provider_window(options, model));
         let translation_report = parts.report;
 
         // Serialize once up-front; each retry attempt reuses the same bytes
@@ -651,18 +654,38 @@ impl ApiMethods {
             ));
         }
 
+        // System blocks + translation report come from one helper, in one
+        // branch: the report is derived from the actual assembly decision
+        // (OAuth synthesizes transport identity + product identity +
+        // guidance; api_key is lossless) and can never drift from the wire.
+        let (system_blocks, compaction_report) =
+            compaction_system_blocks(&auth_type, system_prompt);
+        let adaptive = crate::core::models::model_supports_adaptive_thinking(model);
+        let budget = if thinking_budget == 0 {
+            crate::core::models::DEFAULT_LEGACY_ADAPTIVE_FALLBACK
+        } else {
+            thinking_budget
+        };
+        // A model that rejects input + `max_tokens` over the window gets the
+        // room the input leaves (no-op on Claude 4.5 and later). Measured
+        // against the window this path's beta set (default options) opens.
+        let max_tokens = HelperMethods::fit_max_tokens_to_window(
+            model,
+            HelperMethods::max_tokens_for_model(model),
+            Self::provider_window(&ApiOptions::default(), model),
+            (!adaptive).then_some(u64::from(budget)),
+            || {
+                super::context::conservative_token_estimate(&system_blocks.to_string())
+                    .saturating_add(super::context::estimate_history(messages))
+            },
+        );
         let mut body = json!({
             "model": model,
-            "max_tokens": HelperMethods::max_tokens_for_model(model),
+            "max_tokens": max_tokens,
             "messages": messages,
-            "thinking": if crate::core::models::model_supports_adaptive_thinking(model) {
+            "thinking": if adaptive {
                 json!({ "type": "adaptive", "display": "summarized" })
             } else {
-                let budget = if thinking_budget == 0 {
-                    crate::core::models::DEFAULT_LEGACY_ADAPTIVE_FALLBACK
-                } else {
-                    thinking_budget
-                };
                 json!({
                     "type": "enabled",
                     "budget_tokens": budget,
@@ -677,12 +700,6 @@ impl ApiMethods {
             body["output_config"] = json!({"effort": "low"});
         }
 
-        // System blocks + translation report come from one helper, in one
-        // branch: the report is derived from the actual assembly decision
-        // (OAuth synthesizes transport identity + product identity +
-        // guidance; api_key is lossless) and can never drift from the wire.
-        let (system_blocks, compaction_report) =
-            compaction_system_blocks(&auth_type, system_prompt);
         body["system"] = system_blocks;
 
         // Serialize once up-front (exact-bytes contract, spec 6.2): the

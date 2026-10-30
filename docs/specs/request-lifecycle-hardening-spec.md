@@ -484,7 +484,7 @@ The engine—not individual frontends—calculates effective context from:
 - loaded skill and memory content;
 - reasoning/thinking reserve;
 - next likely tool-result reserve;
-- requested output reserve;
+- expected output reserve (thinking plus a bounded response, capped by the requested `max_tokens`);
 - provider context window and safety margin.
 
 Use provider tokenizers where available and conservative estimators otherwise. Target at least 10–15% reserved capacity before dispatch.

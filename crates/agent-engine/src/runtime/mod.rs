@@ -2528,8 +2528,9 @@ impl Runtime {
     /// frontend consumes on its compaction trigger path. Reads the segments
     /// the next request will actually carry — the effective system prompt,
     /// the exposed tool-schema set, the supplied history — and the runtime's
-    /// configured reserves (thinking budget, tool-result cap, model output
-    /// reserve, provider window with the documented safety margin).
+    /// configured reserves (thinking budget, tool-result cap, the expected
+    /// output within the model's `max_tokens`, provider window with the
+    /// documented safety margin).
     ///
     /// Skill bodies that reach the request do so through the system prompt
     /// or history today, so they are already accounted there; the skill lane
@@ -2564,7 +2565,7 @@ impl Runtime {
             memory_contents: &memory_contents,
             thinking_budget_tokens: self.thinking_budget as u64,
             next_tool_result_bytes: self.max_tool_output as u64,
-            output_reserve_tokens: HelperMethods::max_tokens_for_model(&self.model),
+            max_output_tokens: HelperMethods::max_tokens_for_model(&self.model),
         })
     }
 

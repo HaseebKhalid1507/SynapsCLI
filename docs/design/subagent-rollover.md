@@ -147,13 +147,42 @@ not persisted is not inherited.
 
 Until this was fixed (fix/worker-rollover-window) workers never got the
 setting, and the reserves made that expensive. `pre_request_context_budget`
-reserves the next round's output envelope (`max_tokens`, 128k for Opus),
-the next tool result (10k), a 15% safety margin and 512 advisory tokens; on
-a 200k window that is about 168k for Opus, so hard capacity sat near 32k
-against a 93k target. Every hard-capacity successor was two thirds of the
-~20k left (about 9k on the wire), full again about five tool calls later:
-four Opus 5.5 workers rolled over 28 to 37 times in 20 minutes with requests
-of about 20k.
+then reserved the next round's whole output ceiling (`max_tokens`, 128k for
+Opus), the next tool result (10k), a 15% safety margin and 512 advisory
+tokens; on a 200k window that is about 168k for Opus, so hard capacity sat
+near 32k against a 93k target. Every hard-capacity successor was two thirds
+of the ~20k left (about 9k on the wire), full again about five tool calls
+later: four Opus 5.5 workers rolled over 28 to 37 times in 20 minutes with
+requests of about 20k.
+
+**The output reserve** (fix/context-output-reserve). `max_tokens` is a
+ceiling, not headroom a request needs: on Claude 4.5 and later a request
+whose input plus `max_tokens` exceeds the window is accepted, and
+generation that reaches the window stops with
+`stop_reason: "model_context_window_exceeded"`; earlier models return a
+validation error ([context windows, "Context window overflow
+behavior"](https://platform.claude.com/docs/en/build-with-claude/context-windows#context-window-overflow-behavior)).
+The shared reserve model (`runtime::context::assess`, used by the
+foreground, workers, keep-warm and `Runtime::assess_context`) now reserves
+what one round realistically produces: its thinking budget
+(`ZERO_BUDGET_THINKING_RESERVE_TOKENS` = 16,384 for adaptive/off, the
+request builder's own fallback) plus `EXPECTED_RESPONSE_TOKENS` (16,384),
+capped at `max_tokens`. With the tool result, margin and advisory:
+
+| Model, window (adaptive or high thinking) | Required next round | Hard capacity | Before |
+| --- | ---: | ---: | ---: |
+| Opus, 200k | 73,280 | 126,720 | 31,488 |
+| Sonnet, 200k | 73,280 | 126,720 | 95,488 |
+| Opus or Sonnet, 1m | 193,280 | 806,720 | 711,488 / 775,488 |
+
+Medium thinking (4,096) gives 139,008 on 200k, xhigh (32,768) on Opus
+110,336. For the models that reject the overflow (Opus 4 / 4.1, Sonnet 4,
+3.x: `model_rejects_output_overflow`), every Anthropic request builder
+(stream, sync, compaction) clamps `max_tokens` to the provider window
+minus the conservative input estimate (`fit_max_tokens_to_window`), never
+below the thinking budget plus 4,096. The provider window is the 1M window
+exactly when the request sends the 1M opt-in, else the model default.
+Claude 4.5+ request bodies are byte-identical.
 
 **Reserve-dominated windows.** `WorkerPolicy::hard_capacity_has_room`: a
 rollover at hard capacity is attempted only when the hard-capacity line
@@ -162,19 +191,20 @@ the footprint the policy itself calls a useful context. Below it no
 successor of that size passes hard admission, and any the window does hold
 refills to hard capacity within a few rounds. Such a worker does not roll
 over at hard capacity; its requests go out as before worker rollover and
-the provider judges them (Claude 4.5 and later accept a request whose input
-plus `max_tokens` exceeds the window and stop at the window with
-`model_context_window_exceeded`, so the output envelope is a ceiling, not a
-need). It logs one warning per turn. Opus on 200k is reserve-dominated;
-Opus on 1m (hard capacity ~711k, target 100k) and Sonnet on 200k (~95k,
-target 93k) are not.
+the provider judges them. It logs one warning per turn. With the realistic
+reserve (thinking up to xhigh) no 200k or larger window is reserve-dominated (200k: line 126.7k,
+target 93.3k); windows below about 110k still can be (100k: 41.7k against
+46.7k).
 
-The reserve model itself is shared with the foreground and unchanged here:
-the foreground rollover (`context_management.mode = auto`) and the daemon's
-opt-in `auto_compact` trigger (`should_compact`, budget = window − reserves)
-see the same ~32k line on a 200k Opus window. Both are opt-in and avoided by
-`context_window = 1m`; treating the output envelope as a ceiling rather
-than required headroom is a follow-up for all three.
+**Which comes first, band or hard capacity.** On a 200k window the 15%
+margin and the tool result alone take 40.5k, so hard capacity (at most
+~159.5k, ~126.7k with the output reserve) always comes before the default
+180k band, for workers and the foreground alike (the context-management
+spec's "180,000 or earlier hard reserve boundary"). A worker on 200k
+therefore rolls over at ~126.7k into a successor of at most two thirds of
+the room left, and windows last a dozen rounds or more; with
+`subagent_rollover_tokens` below the line (say 100k) it rolls at its band.
+On 1m the 200k worker band governs.
 
 ### `context_checkpoint`: host-only boundary
 
