@@ -686,6 +686,7 @@ fn selection_failure_text(f: &crate::auth::SelectionFailure, now_ms: u64) -> Str
              outside synaps"
         }
         K::CredentialStore => "the credential store could not be read, so no account was checked",
+        K::Unknown => "the daemon reported a reason this synaps build does not know",
     };
     let mut text = format!("Automatic account selection failed ({}): {what}", f.kind);
     if !f.accounts.is_empty() {
@@ -749,6 +750,16 @@ fn selection_failure_text(f: &crate::auth::SelectionFailure, now_ms: u64) -> Str
             if nothing_to_fix {
                 text.push_str(" No login needed.");
             }
+        }
+        // No hold recorded, but every live transient failure asked for a
+        // wait: sending again sooner only repeats them. (A hold that has
+        // already ended means its Retry-After has too.)
+        K::UsageReadFailed
+            if f.usage_read_retry_ms.is_none() && f.transient_retry_after_s().is_some() =>
+        {
+            let secs = f.transient_retry_after_s().unwrap_or_default();
+            text.push_str(&format!(" Send again in {secs}s or later"));
+            text.push_str(if nothing_to_fix { "; no login needed." } else { "." });
         }
         _ if nothing_to_fix => text.push_str(" Send again to retry; no login needed."),
         _ => text.push_str(" Send again to retry."),
@@ -2169,6 +2180,59 @@ mod tests {
         );
         let warn = turn_warn(&log);
         assert!(warn.contains("kind=usage_read_failed"), "{warn}");
+    }
+
+    /// PR266 review SF3: when every live transient failure carries a
+    /// Retry-After, sending again right away only repeats the 429; the text
+    /// says to wait the shortest of them. One without a Retry-After keeps
+    /// the plain "send again" text. Limited and excluded accounts don't count.
+    #[tokio::test]
+    async fn usage_read_failure_text_honours_retry_after() {
+        let mut c2 = account("claude2", AK::UsageRateLimited);
+        c2.http_status = Some(429);
+        c2.retry_after_s = Some(120);
+        let mut c3 = account("claude3", AK::RefreshOther);
+        c3.retry_after_s = Some(45);
+        let mut c5 = account("claude5", AK::UsageRateLimited);
+        c5.cooling_down = true;
+        let c7 = account("claude7", AK::Excluded);
+        let failure = SelectionFailure {
+            kind: SK::UsageReadFailed,
+            accounts: vec![c2.clone(), c3, c5, c7],
+            earliest_reset_ms: None,
+            usage_read_retry_ms: None,
+        };
+        let (text, _) = failed_turn_start(no_account(failure)).await;
+        assert!(
+            text.contains("Send again in 45s or later; no login needed."),
+            "{text}"
+        );
+        assert!(!text.contains("Send again to retry"), "{text}");
+
+        let mut c6 = account("claude6", AK::UsageUpstream);
+        c6.http_status = Some(503);
+        let failure = SelectionFailure {
+            kind: SK::UsageReadFailed,
+            accounts: vec![c2.clone(), c6],
+            earliest_reset_ms: None,
+            usage_read_retry_ms: None,
+        };
+        let (text, _) = failed_turn_start(no_account(failure)).await;
+        assert!(
+            text.contains("Send again to retry; no login needed."),
+            "{text}"
+        );
+
+        // A login problem elsewhere drops "no login needed" but keeps the wait.
+        let failure = SelectionFailure {
+            kind: SK::UsageReadFailed,
+            accounts: vec![account("claude4", AK::RefreshRejected), c2],
+            earliest_reset_ms: None,
+            usage_read_retry_ms: None,
+        };
+        let (text, _) = failed_turn_start(no_account(failure)).await;
+        assert!(text.contains("Send again in 120s or later."), "{text}");
+        assert!(!text.contains("no login needed"), "{text}");
     }
 
     /// Held usage reads: the text names when usage is read again (the next

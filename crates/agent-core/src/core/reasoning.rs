@@ -170,6 +170,17 @@ impl ThinkingSpec {
     }
 }
 
+/// Named worker effort levels shared by config and tool arguments. Execution
+/// modes (ultra/ultracode), disabling thinking and numeric budgets are not
+/// subagent effort overrides.
+pub fn parse_subagent_thinking(value: &str) -> Option<ReasoningLevel> {
+    match ReasoningLevel::parse(value)? {
+        level @ (ReasoningLevel::Low | ReasoningLevel::Medium | ReasoningLevel::High
+        | ReasoningLevel::XHigh | ReasoningLevel::Max) => Some(level),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

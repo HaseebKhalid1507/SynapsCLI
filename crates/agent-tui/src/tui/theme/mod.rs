@@ -1,6 +1,6 @@
 use arc_swap::ArcSwap;
 use ratatui::style::Color;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::sync::LazyLock;
 
@@ -18,6 +18,7 @@ pub(crate) enum ModalKind {
     Settings,
     Plugins,
     Models,
+    Sessions,
 }
 
 /// All colors used by the TUI, grouped so they can be overridden from a
@@ -112,6 +113,8 @@ pub(crate) struct Theme {
     pub(crate) plugins_title: Option<Color>,
     pub(crate) models_border: Option<Color>,
     pub(crate) models_title: Option<Color>,
+    pub(crate) sessions_border: Option<Color>,
+    pub(crate) sessions_title: Option<Color>,
     /// Resting tint of the sidecar header pill (idle + unarmed). `None` falls
     /// back to `muted`, the color the pill uses today.
     pub(crate) sidecar_pill: Option<Color>,
@@ -207,6 +210,8 @@ impl Default for Theme {
             plugins_title: None,
             models_border: None,
             models_title: None,
+            sessions_border: None,
+            sessions_title: None,
             sidecar_pill: None,
 
             // No user overrides for extension tokens by default.
@@ -339,6 +344,8 @@ impl Theme {
             "plugins.title" => self.plugins_title = Some(c),
             "models.border" => self.models_border = Some(c),
             "models.title" => self.models_title = Some(c),
+            "sessions.border" => self.sessions_border = Some(c),
+            "sessions.title" => self.sessions_title = Some(c),
             "sidecar.pill" => self.sidecar_pill = Some(c),
 
             // Extension token overrides (P19.2): any `ext.<id>.<token>` key
@@ -496,6 +503,7 @@ impl Theme {
             ModalKind::Settings => self.settings_border,
             ModalKind::Plugins => self.plugins_border,
             ModalKind::Models => self.models_border,
+            ModalKind::Sessions => self.sessions_border,
         };
         part.unwrap_or(self.border_active)
     }
@@ -507,6 +515,7 @@ impl Theme {
             ModalKind::Settings => self.settings_title,
             ModalKind::Plugins => self.plugins_title,
             ModalKind::Models => self.models_title,
+            ModalKind::Sessions => self.sessions_title,
         }
     }
 
@@ -719,6 +728,100 @@ pub(crate) fn background_is_opaque() -> bool {
 
 pub(crate) fn set_background_opaque(opaque: bool) {
     BACKGROUND_OPAQUE.store(opaque, Ordering::Relaxed);
+}
+
+/// 8-bit RGB triple, as the terminal reports its default background.
+pub(crate) type Rgb8 = (u8, u8, u8);
+
+/// The terminal's default background (OSC 11, settled once at boot by
+/// `run_setup` from the DA1-fenced burst). Packed `0x01RRGGBB`; `0` means
+/// unknown (no reply / timeout / not a tty) ⇒ painting is unchanged.
+///
+/// Why it matters: terminals with background opacity (kitty
+/// `background_opacity`) apply it to every cell whose bg EQUALS the default
+/// bg, not only unpainted cells — so a theme colour that happens to match the
+/// user's terminal colour renders see-through even in opaque mode.
+static TERMINAL_DEFAULT_BG: AtomicU32 = AtomicU32::new(0);
+
+fn pack_rgb8(bg: Option<Rgb8>) -> u32 {
+    bg.map_or(0, |(r, g, b)| {
+        0x0100_0000 | (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b)
+    })
+}
+
+fn unpack_rgb8(v: u32) -> Option<Rgb8> {
+    (v & 0x0100_0000 != 0).then_some(((v >> 16) as u8, (v >> 8) as u8, v as u8))
+}
+
+/// Record the detected terminal default bg (`None` = unknown).
+pub(crate) fn set_terminal_default_bg(bg: Option<Rgb8>) {
+    TERMINAL_DEFAULT_BG.store(pack_rgb8(bg), Ordering::Relaxed);
+}
+
+#[cfg(any(test, feature = "testing"))]
+thread_local! {
+    /// Test seam: the terminal bg frames rendered on this thread see
+    /// (`TestHarness::set_terminal_bg`). Outer `None` = no override (use the
+    /// process global); `Some(None)` = forced unknown. Headless tests render
+    /// on their own thread, so this never leaks between parallel tests.
+    static TERMINAL_BG_OVERRIDE: std::cell::Cell<Option<Option<Rgb8>>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Override (or with `None`, clear the override of) this thread's terminal bg.
+#[cfg(any(test, feature = "testing"))]
+pub(crate) fn set_terminal_default_bg_for_thread(bg: Option<Option<Rgb8>>) {
+    TERMINAL_BG_OVERRIDE.with(|o| o.set(bg));
+}
+
+/// The detected terminal default bg, or `None` if unknown.
+pub(crate) fn terminal_default_bg() -> Option<Rgb8> {
+    #[cfg(any(test, feature = "testing"))]
+    if let Some(bg) = TERMINAL_BG_OVERRIDE.with(std::cell::Cell::get) {
+        return bg;
+    }
+    unpack_rgb8(TERMINAL_DEFAULT_BG.load(Ordering::Relaxed))
+}
+
+/// `c`, moved one imperceptible step (±1 on blue, staying in range) if it is
+/// exactly the terminal's default bg `term`; otherwise `c` unchanged. Pure.
+/// Only `Color::Rgb` can be compared: named/indexed colours resolve through
+/// the terminal's palette, which we don't query.
+pub(crate) fn steer_off_terminal_bg(c: Color, term: Option<Rgb8>) -> Color {
+    match (c, term) {
+        (Color::Rgb(r, g, b), Some(t)) if (r, g, b) == t => {
+            Color::Rgb(r, g, if b < u8::MAX { b + 1 } else { b - 1 })
+        }
+        _ => c,
+    }
+}
+
+/// Steer every cell bg in `buf` off `term` (fg untouched). Pure; a cheap
+/// compare per cell, no-op when `term` is `None`.
+pub(crate) fn steer_buffer_off_terminal_bg(buf: &mut ratatui::buffer::Buffer, term: Option<Rgb8>) {
+    if term.is_none() {
+        return;
+    }
+    for cell in &mut buf.content {
+        cell.bg = steer_off_terminal_bg(cell.bg, term);
+    }
+}
+
+/// The terminal bg the opaque guard steers off: `Some` only in opaque mode
+/// with a detected terminal bg. Invisible mode is `None` — there the
+/// see-through is the point.
+pub(crate) fn opaque_guard_target() -> Option<Rgb8> {
+    if background_is_opaque() {
+        terminal_default_bg()
+    } else {
+        None
+    }
+}
+
+/// Final per-frame pass (end of `render_frame_into`): in opaque mode, no
+/// cell may carry the terminal's exact default bg.
+pub(crate) fn guard_opaque_frame(buf: &mut ratatui::buffer::Buffer) {
+    steer_buffer_off_terminal_bg(buf, opaque_guard_target());
 }
 
 pub(crate) static THEME: LazyLock<ArcSwap<Theme>> =
@@ -984,7 +1087,12 @@ mod theme_tests {
         ];
         for name in NAMES {
             let t = Theme::builtin(name).unwrap_or_else(|| panic!("{name} exists"));
-            for kind in [ModalKind::Settings, ModalKind::Plugins, ModalKind::Models] {
+            for kind in [
+                ModalKind::Settings,
+                ModalKind::Plugins,
+                ModalKind::Models,
+                ModalKind::Sessions,
+            ] {
                 assert_eq!(
                     t.modal_border(kind),
                     t.border_active,
@@ -1522,5 +1630,117 @@ mod confirm_contrast_tests {
             let c = wcag_contrast(focus_fg, focus_bg);
             assert!(c >= 4.5, "{name}: focused button label {c:.2}:1");
         }
+    }
+}
+
+#[cfg(test)]
+mod terminal_bg_guard_tests {
+    //! Opaque mode must never paint a bg that EQUALS the terminal's default
+    //! background (kitty `background_opacity` makes such cells see-through).
+    //! Pure functions only: no global theme / opacity is touched.
+    use super::*;
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+
+    const OCEAN_BG: Rgb8 = (3, 8, 16);
+
+    /// Every bg-like colour the ocean theme can paint, base and derived.
+    fn ocean_bg_palette() -> Vec<Color> {
+        let t = Theme::builtin("ocean").unwrap();
+        assert_eq!(t.bg, Color::Rgb(3, 8, 16), "fixture: ocean bg");
+        vec![
+            t.bg,
+            t.message_bg,
+            t.message_background(),
+            t.user_bg,
+            t.code_bg,
+            t.tool_input_background(),
+            t.tool_output_background(),
+            t.raised_surface(1.1),
+            t.prompt_surface(),
+            t.border,
+            Color::Rgb(3, 8, 16), // e.g. a slab/fx mix landing exactly on it
+        ]
+    }
+
+    fn painted(colors: &[Color]) -> Buffer {
+        let mut buf = Buffer::empty(Rect::new(0, 0, colors.len() as u16, 2));
+        for (x, c) in colors.iter().enumerate() {
+            buf[(x as u16, 0)].set_bg(*c).set_fg(Color::Rgb(3, 8, 16));
+            buf[(x as u16, 1)].set_bg(*c);
+        }
+        buf
+    }
+
+    #[test]
+    fn steered_colour_is_one_step_off_and_in_range() {
+        let t = Some(OCEAN_BG);
+        assert_eq!(
+            steer_off_terminal_bg(Color::Rgb(3, 8, 16), t),
+            Color::Rgb(3, 8, 17)
+        );
+        assert_eq!(
+            steer_off_terminal_bg(Color::Rgb(9, 9, 255), Some((9, 9, 255))),
+            Color::Rgb(9, 9, 254),
+            "stays in range at the top of the channel"
+        );
+        // Anything else is untouched.
+        assert_eq!(
+            steer_off_terminal_bg(Color::Rgb(3, 8, 17), t),
+            Color::Rgb(3, 8, 17)
+        );
+        assert_eq!(steer_off_terminal_bg(Color::Reset, t), Color::Reset);
+        assert_eq!(steer_off_terminal_bg(Color::Black, t), Color::Black);
+    }
+
+    #[test]
+    fn ocean_frame_never_paints_the_terminal_bg_when_detected() {
+        let colors = ocean_bg_palette();
+        let mut buf = painted(&colors);
+        assert!(
+            buf.content.iter().any(|c| c.bg == Color::Rgb(3, 8, 16)),
+            "fixture must contain the exact terminal bg"
+        );
+        steer_buffer_off_terminal_bg(&mut buf, Some(OCEAN_BG));
+        for (i, cell) in buf.content.iter().enumerate() {
+            assert_ne!(cell.bg, Color::Rgb(3, 8, 16), "cell {i} still see-through");
+        }
+        // Only bg moves; fg and every non-matching bg are untouched.
+        let before = painted(&colors);
+        for (a, b) in before.content.iter().zip(buf.content.iter()) {
+            assert_eq!(a.fg, b.fg, "fg must never change");
+            if a.bg != Color::Rgb(3, 8, 16) {
+                assert_eq!(a.bg, b.bg);
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_terminal_bg_changes_nothing() {
+        let colors = ocean_bg_palette();
+        let mut buf = painted(&colors);
+        steer_buffer_off_terminal_bg(&mut buf, None);
+        assert_eq!(buf, painted(&colors));
+        for c in colors {
+            assert_eq!(steer_off_terminal_bg(c, None), c);
+        }
+    }
+
+    #[test]
+    fn terminal_bg_global_round_trips_and_unknown_is_none() {
+        // The packed atomic encoding, exercised through the thread-local
+        // seam so the real process global is never written by tests.
+        set_terminal_default_bg_for_thread(Some(Some(OCEAN_BG)));
+        assert_eq!(terminal_default_bg(), Some(OCEAN_BG));
+        set_terminal_default_bg_for_thread(Some(None));
+        assert_eq!(terminal_default_bg(), None);
+        set_terminal_default_bg_for_thread(None);
+        // Black must not collide with the "unknown" encoding.
+        assert_eq!(unpack_rgb8(pack_rgb8(Some((0, 0, 0)))), Some((0, 0, 0)));
+        assert_eq!(
+            unpack_rgb8(pack_rgb8(Some((255, 255, 255)))),
+            Some((255, 255, 255))
+        );
+        assert_eq!(unpack_rgb8(pack_rgb8(None)), None);
     }
 }

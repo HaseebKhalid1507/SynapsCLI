@@ -34,6 +34,14 @@ pub struct Session {
     /// that survive a reload.
     #[serde(default, skip_serializing_if = "KeepwarmTokens::is_zero")]
     pub keepwarm_tokens: KeepwarmTokens,
+    /// Session prompt-cache read/write totals (the footer's `%↺` and
+    /// `/stats`). SNAPSHOT-ONLY, like `keepwarm_cost`: never journaled, so
+    /// in journal mode they are as of the last snapshot. Absent (0) on
+    /// sessions saved before they were persisted.
+    #[serde(default, skip_serializing_if = "is_zero_tokens")]
+    pub total_cache_read_tokens: u64,
+    #[serde(default, skip_serializing_if = "is_zero_tokens")]
+    pub total_cache_creation_tokens: u64,
     /// Persisted listing hint: `api_messages.len()` at save time. Declared
     /// BEFORE `api_messages` so it lands in the header that
     /// `read_session_header` reads without touching the message array.
@@ -141,6 +149,10 @@ fn is_zero_cost(v: &f64) -> bool {
     *v == 0.0
 }
 
+fn is_zero_tokens(v: &u64) -> bool {
+    *v == 0
+}
+
 /// Keep-warm token subtotal persisted in the snapshot (see
 /// [`Session::keepwarm_tokens`]).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -197,6 +209,8 @@ impl Session {
             session_cost: 0.0,
             keepwarm_cost: 0.0,
             keepwarm_tokens: KeepwarmTokens::default(),
+            total_cache_read_tokens: 0,
+            total_cache_creation_tokens: 0,
             message_count: 0,
             api_messages: Vec::new(),
             abort_context: None,
@@ -250,6 +264,8 @@ impl Session {
             session_cost: 0.0,
             keepwarm_cost: 0.0,
             keepwarm_tokens: KeepwarmTokens::default(),
+            total_cache_read_tokens: 0,
+            total_cache_creation_tokens: 0,
             message_count: 0,
             api_messages: crate::compaction::compaction_context_messages(summary_text),
             abort_context: None,
@@ -379,26 +395,34 @@ impl Session {
     /// across sessions, and rejects collisions with existing chain names.
     /// Idempotent: re-applying the current name is a no-op.
     pub fn set_name(&mut self, name: &str) -> std::io::Result<()> {
-        validate_name(name).map_err(std::io::Error::other)?;
+        self.check_name(name).map_err(|e| match e {
+            NameError::Io(e) => e,
+            other => std::io::Error::other(other.to_string()),
+        })?;
+        self.name = Some(name.to_string());
+        Ok(())
+    }
+
+    /// [`Self::set_name`]'s checks without applying the name, as a typed
+    /// error (so a caller can tell "invalid" from "taken").
+    pub fn check_name(&self, name: &str) -> Result<(), NameError> {
+        validate_name(name).map_err(NameError::Invalid)?;
         if self.name.as_deref() == Some(name) {
             return Ok(());
         }
-        let sessions = list_sessions()?;
-        for s in &sessions {
+        for s in &list_sessions().map_err(NameError::Io)? {
             if s.name.as_deref() == Some(name) && s.id != self.id {
-                return Err(std::io::Error::other(format!(
-                    "name '{}' already used by session {}",
-                    name, s.id
-                )));
+                return Err(NameError::Taken {
+                    name: name.to_string(),
+                    by: s.id.clone(),
+                });
             }
         }
         if crate::core::chain::load_chain(name).is_ok() {
-            return Err(std::io::Error::other(format!(
-                "name '{}' conflicts with an existing chain name",
-                name
-            )));
+            return Err(NameError::ChainConflict {
+                name: name.to_string(),
+            });
         }
-        self.name = Some(name.to_string());
         Ok(())
     }
 
@@ -502,7 +526,7 @@ pub fn latest_session() -> std::io::Result<Session> {
             continue;
         };
         if let Some(mtime) = entry.mtime {
-            if newest.as_ref().map_or(true, |(t, _)| mtime > *t) {
+            if newest.as_ref().is_none_or(|(t, _)| mtime > *t) {
                 newest = Some((mtime, id.to_string()));
             }
         }
@@ -696,6 +720,47 @@ fn sessions_dir() -> PathBuf {
 pub fn delete_session_file(id: &str) -> std::io::Result<()> {
     crate::core::session_journal::delete_session_files_in_dir(&sessions_dir(), id)
 }
+
+/// Why a session name was not accepted ([`Session::check_name`]). The
+/// `Display` text is what `/saveas` has always printed.
+#[derive(Debug)]
+pub enum NameError {
+    /// Not `[a-z0-9-]{1,40}` (the [`validate_name`] message).
+    Invalid(String),
+    /// Another saved session already has this name.
+    Taken { name: String, by: String },
+    /// A chain already has this name.
+    ChainConflict { name: String },
+    /// The sessions directory could not be read.
+    Io(std::io::Error),
+}
+
+impl NameError {
+    /// Stable machine code: `invalid` | `taken` | `chain_conflict` | `io`.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Invalid(_) => "invalid",
+            Self::Taken { .. } => "taken",
+            Self::ChainConflict { .. } => "chain_conflict",
+            Self::Io(_) => "io",
+        }
+    }
+}
+
+impl std::fmt::Display for NameError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Invalid(m) => f.write_str(m),
+            Self::Taken { name, by } => write!(f, "name '{name}' already used by session {by}"),
+            Self::ChainConflict { name } => {
+                write!(f, "name '{name}' conflicts with an existing chain name")
+            }
+            Self::Io(e) => write!(f, "cannot read the sessions directory: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for NameError {}
 
 /// Validate a session or chain name: [a-z0-9-]{1,40}.
 pub fn validate_name(name: &str) -> Result<(), String> {

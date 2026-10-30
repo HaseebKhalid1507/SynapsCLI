@@ -24,7 +24,7 @@
 //!    `tmux -V` provenance string. Can't hang, can't race — safe anywhere.
 //! 2. **DA1-fenced query burst** (P16.2): [`negotiate`] emits the batched
 //!    query burst (XTVERSION, DECRQM 2026/2027, kitty-keyboard query, DA2,
-//!    then DA1 **last** as the fence — the libvaxis pattern) and reads the
+//!    OSC 11 default-background, then DA1 **last** as the fence — the libvaxis pattern) and reads the
 //!    replies directly from fd 0 with a hard deadline ([`BURST_TIMEOUT`]).
 //!    Timeout or partial (unfenced) replies ⇒ the env-detected caps are
 //!    returned **unchanged**, i.e. today's blind-optimism behavior, and boot
@@ -110,6 +110,16 @@ pub struct TermCaps {
     /// unconditional thing). This flips to `true` only in P16.2 once the
     /// DA1-fenced boot burst lands.
     pub da1_answered: bool,
+
+    /// The terminal's default background colour, from the OSC 11 reply in
+    /// the DA1-fenced burst (8-bit per channel).
+    ///
+    /// **Default `None` = current behavior.** Unknown (no reply, timeout,
+    /// unparseable, unfenced) ⇒ nothing changes. When known, opaque mode
+    /// steers painted backgrounds off this exact colour, because terminals
+    /// with background opacity (kitty `background_opacity`) make every cell
+    /// whose bg EQUALS the default bg see-through, not only unpainted cells.
+    pub terminal_bg: Option<(u8, u8, u8)>,
 }
 
 impl Default for TermCaps {
@@ -123,6 +133,7 @@ impl Default for TermCaps {
             term_program: None,
             tmux: None,
             da1_answered: false, // = we never query the terminal today
+            terminal_bg: None,   // = unknown ⇒ paint unchanged
         }
     }
 }
@@ -196,13 +207,16 @@ impl TermCaps {
     /// uses it from the `mod.rs` boot line. Pure formatter — no behavior.
     pub fn summary(&self) -> String {
         format!(
-            "sync_output={} kitty_keyboard={} mode_2027={} term_program={} tmux={} da1_answered={}",
+            "sync_output={} kitty_keyboard={} mode_2027={} term_program={} tmux={} da1_answered={} terminal_bg={}",
             self.sync_output,
             self.kitty_keyboard,
             self.mode_2027,
             self.term_program.as_deref().unwrap_or("-"),
             self.tmux.as_deref().unwrap_or("-"),
             self.da1_answered,
+            self.terminal_bg
+                .map(|(r, g, b)| format!("#{r:02x}{g:02x}{b:02x}"))
+                .unwrap_or_else(|| "-".to_string()),
         )
     }
 }
@@ -688,8 +702,17 @@ mod gate_tests {
 /// | `ESC [ ?2027$p` | DECRQM: grapheme/unicode width (2027)  | `CSI ? 2027 ; v $ y`    |
 /// | `ESC [ ? u`     | kitty keyboard protocol flags          | `CSI ? flags u`         |
 /// | `ESC [ > c`     | DA2 (secondary device attributes)      | `CSI > … c` (skipped)   |
+/// | `ESC ] 11;? ST` | OSC 11: default background colour      | `OSC 11 ; rgb:R/G/B ST\|BEL` |
 /// | `ESC [ c`       | **DA1 — the fence**                    | `CSI ? … c`             |
-pub const QUERY_BURST: &[u8] = b"\x1b[>0q\x1b[?2026$p\x1b[?2027$p\x1b[?u\x1b[>c\x1b[c";
+///
+/// OSC 11 is sent ST-terminated (xterm answers with the query's terminator;
+/// the parser accepts ST and BEL). Under tmux the query is NOT wrapped in
+/// passthrough (nothing in this burst is): tmux ≥ 3.3 answers it itself
+/// with the pane's default bg — which is what it emits as "default" to the
+/// outer terminal — and older tmux stays silent ⇒ unknown ⇒ unchanged.
+#[cfg_attr(not(unix), allow(dead_code))] // the burst is negotiated on Unix only
+pub const QUERY_BURST: &[u8] =
+    b"\x1b[>0q\x1b[?2026$p\x1b[?2027$p\x1b[?u\x1b[>c\x1b]11;?\x1b\\\x1b[c";
 
 /// Hard deadline for the whole reply read. Local terminals answer DA1 in
 /// single-digit milliseconds; 150ms covers tmux/ssh indirection while keeping
@@ -699,6 +722,7 @@ pub const BURST_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(
 
 /// Write the query burst to `w` and flush. Split out (and generic) so the
 /// vt100 tests can capture the exact bytes production emits.
+#[cfg_attr(not(unix), allow(dead_code))]
 pub fn write_query_burst<W: std::io::Write>(w: &mut W) -> std::io::Result<()> {
     w.write_all(QUERY_BURST)?;
     w.flush()
@@ -709,6 +733,7 @@ pub fn write_query_burst<W: std::io::Write>(w: &mut W) -> std::io::Result<()> {
 /// `da1` is the fence: [`TermCaps::merge_burst`] applies **nothing** unless it
 /// is set — partial (unfenced) replies are discarded wholesale, so the timeout
 /// path degenerates to "env caps unchanged".
+#[cfg_attr(not(unix), allow(dead_code))]
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct BurstReplies {
     /// DA1 reply (`CSI ? … c`) observed — the fence.
@@ -721,10 +746,14 @@ pub struct BurstReplies {
     pub mode_2026: Option<u8>,
     /// DECRPM value for mode 2027 (same value semantics as `mode_2026`).
     pub mode_2027: Option<u8>,
+    /// Default background from an OSC 11 reply
+    /// (`OSC 11 ; rgb:RRRR/GGGG/BBBB ST|BEL`), scaled to 8 bits per channel.
+    pub terminal_bg: Option<(u8, u8, u8)>,
 }
 
 /// DECRPM value ⇒ "the terminal supports this mode". 1/2/3 are supported
 /// (set, resettable, permanently set); 0/4 are not.
+#[cfg_attr(not(unix), allow(dead_code))]
 fn decrpm_supported(v: u8) -> bool {
     matches!(v, 1..=3)
 }
@@ -735,6 +764,7 @@ fn decrpm_supported(v: u8) -> bool {
 /// keystroke racing the burst) are skipped; DCS payloads (the XTVERSION
 /// reply) are skipped to their `ST` terminator; a truncated trailing sequence
 /// is ignored (the caller re-parses as more bytes arrive).
+#[cfg_attr(not(unix), allow(dead_code))]
 pub fn parse_burst_replies(buf: &[u8]) -> BurstReplies {
     let mut out = BurstReplies::default();
     let mut i = 0;
@@ -769,6 +799,30 @@ pub fn parse_burst_replies(buf: &[u8]) -> BurstReplies {
                 }
                 i = j + 2;
             }
+            Some(b']') => {
+                // OSC — body runs to BEL or ST (ESC \). An ESC followed by
+                // anything else aborts the OSC (a stray Alt+] keystroke must
+                // not swallow the DA1 fence): resume parsing at that ESC.
+                let start = i + 2;
+                let mut j = start;
+                let end = loop {
+                    match buf.get(j) {
+                        None => break None, // truncated — wait for more bytes
+                        Some(0x07) => break Some((j, j + 1)),
+                        Some(0x1b) => match buf.get(j + 1) {
+                            Some(b'\\') => break Some((j, j + 2)),
+                            Some(_) => break Some((j, j)), // aborted
+                            None => break None,
+                        },
+                        Some(_) => j += 1,
+                    }
+                };
+                let Some((body_end, next)) = end else { break };
+                if next > body_end {
+                    classify_osc(&buf[start..body_end], &mut out);
+                }
+                i = next;
+            }
             Some(_) => i += 2, // other escape — skip introducer
             None => break,
         }
@@ -776,8 +830,51 @@ pub fn parse_burst_replies(buf: &[u8]) -> BurstReplies {
     out
 }
 
+/// Classify one complete OSC body (bytes between `ESC ]` and the
+/// terminator). Only the OSC 11 default-background reply is of interest.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn classify_osc(body: &[u8], out: &mut BurstReplies) {
+    if let Some(spec) = body.strip_prefix(b"11;") {
+        if let Some(rgb) = parse_x11_rgb(spec) {
+            out.terminal_bg = Some(rgb);
+        }
+    }
+}
+
+/// Parse an XParseColor `rgb:R/G/B` (or `rgba:R/G/B/A`, alpha ignored) spec
+/// with 1–4 hex digits per channel, scaled to 8 bits. Anything else — the
+/// echoed `?`, `#rrggbb`, named colours, bad digit counts — is `None`
+/// (unknown ⇒ behaviour unchanged).
+#[cfg_attr(not(unix), allow(dead_code))]
+fn parse_x11_rgb(spec: &[u8]) -> Option<(u8, u8, u8)> {
+    let spec = std::str::from_utf8(spec).ok()?;
+    let (channels, n) = if let Some(rest) = spec.strip_prefix("rgba:") {
+        (rest, 4)
+    } else {
+        (spec.strip_prefix("rgb:")?, 3)
+    };
+    let parts: Vec<&str> = channels.split('/').collect();
+    if parts.len() != n {
+        return None;
+    }
+    let channel = |p: &str| -> Option<u8> {
+        if p.is_empty() || p.len() > 4 || !p.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        let v = u32::from_str_radix(p, 16).ok()?;
+        let max = (1u32 << (4 * p.len() as u32)) - 1;
+        Some(((v * 255 + max / 2) / max) as u8)
+    };
+    let alpha_ok = n == 3 || channel(parts[3]).is_some();
+    if !alpha_ok {
+        return None;
+    }
+    Some((channel(parts[0])?, channel(parts[1])?, channel(parts[2])?))
+}
+
 /// Classify one complete CSI sequence (`body` = bytes between `ESC [` and the
 /// final byte).
+#[cfg_attr(not(unix), allow(dead_code))]
 fn classify_csi(body: &[u8], final_byte: u8, out: &mut BurstReplies) {
     match final_byte {
         // DA1 reply: CSI ? … c  (DA2 replies are `CSI > … c` — ignored)
@@ -812,6 +909,7 @@ impl TermCaps {
     ///   a terminal that answers DA1 but ignores DECRQM entirely leaves
     ///   `sync_output` at its harmless default-true (terminals that don't
     ///   support 2026 ignore the bracket anyway — this is log-honesty).
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub fn merge_burst(&mut self, replies: &BurstReplies) {
         if !replies.da1 {
             return;
@@ -823,6 +921,9 @@ impl TermCaps {
         }
         if let Some(v) = replies.mode_2027 {
             self.mode_2027 = decrpm_supported(v);
+        }
+        if replies.terminal_bg.is_some() {
+            self.terminal_bg = replies.terminal_bg;
         }
     }
 }
@@ -1046,5 +1147,115 @@ mod burst_tests {
         // Truncated DCS likewise.
         let r = parse_burst_replies(b"\x1bP>|WezTerm 2024");
         assert_eq!(r, BurstReplies::default());
+    }
+}
+
+#[cfg(test)]
+mod osc11_tests {
+    //! OSC 11 (default background) query + reply parsing.
+    use super::*;
+
+    const OCEAN: (u8, u8, u8) = (3, 8, 16);
+
+    #[test]
+    fn burst_queries_osc11_before_the_da1_fence() {
+        let s = std::str::from_utf8(QUERY_BURST).unwrap();
+        let osc = s.find("\x1b]11;?\x1b\\").expect("OSC 11 query missing");
+        let da1 = s.rfind("\x1b[c").unwrap();
+        assert!(osc < da1, "OSC 11 must precede the DA1 fence");
+        assert!(s.ends_with("\x1b[c"), "DA1 must stay last");
+    }
+
+    #[test]
+    fn osc11_four_digit_st_terminated() {
+        let r = parse_burst_replies(b"\x1b]11;rgb:0303/0808/1010\x1b\\");
+        assert_eq!(r.terminal_bg, Some(OCEAN));
+    }
+
+    #[test]
+    fn osc11_two_digit_bel_terminated() {
+        let r = parse_burst_replies(b"\x1b]11;rgb:03/08/10\x07");
+        assert_eq!(r.terminal_bg, Some(OCEAN));
+    }
+
+    #[test]
+    fn osc11_mixed_forms_scale_to_eight_bits() {
+        // 4-digit ST, 2-digit BEL, 1- and 3-digit, rgba with alpha ignored.
+        assert_eq!(
+            parse_burst_replies(b"\x1b]11;rgb:ffff/0000/8080\x07").terminal_bg,
+            Some((255, 0, 128))
+        );
+        assert_eq!(
+            parse_burst_replies(b"\x1b]11;rgb:f/0/8\x1b\\").terminal_bg,
+            Some((255, 0, 136))
+        );
+        assert_eq!(
+            parse_burst_replies(b"\x1b]11;rgb:fff/000/888\x07").terminal_bg,
+            Some((255, 0, 136))
+        );
+        assert_eq!(
+            parse_burst_replies(b"\x1b]11;rgba:0303/0808/1010/c1c1\x1b\\").terminal_bg,
+            Some(OCEAN)
+        );
+    }
+
+    #[test]
+    fn osc11_garbage_is_unknown() {
+        for bad in [
+            &b"\x1b]11;?\x1b\\"[..],              // echoed query
+            b"\x1b]11;rgb:03/08\x07",             // two channels
+            b"\x1b]11;rgb:03/08/10/20\x07",       // four channels, not rgba
+            b"\x1b]11;rgb:zz/08/10\x07",          // non-hex
+            b"\x1b]11;rgb:03/08/\x07",            // empty channel
+            b"\x1b]11;rgb:03030/08/10\x07",       // 5 digits
+            b"\x1b]11;#030810\x07",               // unsupported form
+            b"\x1b]10;rgb:0303/0808/1010\x1b\\",  // OSC 10 (fg), not 11
+            b"\x1b]111;rgb:0303/0808/1010\x1b\\", // OSC 111
+            b"\x1b]11;rgb:0303/0808/1010",        // unterminated
+            b"\x1b]11;rgb:+3/08/10\x07",          // sign is not hex
+        ] {
+            assert_eq!(
+                parse_burst_replies(bad).terminal_bg,
+                None,
+                "{:?}",
+                String::from_utf8_lossy(bad)
+            );
+        }
+    }
+
+    #[test]
+    fn osc11_interleaved_with_other_burst_replies() {
+        // XTVERSION DCS, kitty flags, DECRPMs, a racing keystroke, a stray
+        // aborted OSC (Alt+]), OSC 11, DA2, DA1 fence.
+        let stream: &[u8] = b"\x1bP>|kitty(0.32.2)\x1b\\\x1b[?1u\x1b[?2026;2$yq\x1b]\x1b[?2027;1$y\
+\x1b]11;rgb:0303/0808/1010\x1b\\\x1b[>1;4000;13c\x1b[?62;22c";
+        let r = parse_burst_replies(stream);
+        assert!(r.da1 && r.kitty);
+        assert_eq!(r.mode_2026, Some(2));
+        assert_eq!(r.mode_2027, Some(1));
+        assert_eq!(r.terminal_bg, Some(OCEAN));
+
+        let mut caps = TermCaps::default();
+        caps.merge_burst(&r);
+        assert_eq!(caps.terminal_bg, Some(OCEAN));
+        assert!(caps.summary().contains("terminal_bg=#030810"));
+    }
+
+    #[test]
+    fn osc11_without_da1_fence_is_discarded() {
+        let r = parse_burst_replies(b"\x1b]11;rgb:0303/0808/1010\x1b\\");
+        assert_eq!(r.terminal_bg, Some(OCEAN));
+        let mut caps = TermCaps::default();
+        caps.merge_burst(&r);
+        assert_eq!(caps.terminal_bg, None, "unfenced ⇒ unknown");
+    }
+
+    #[test]
+    fn no_osc11_reply_leaves_terminal_bg_unknown() {
+        let mut caps = TermCaps::default();
+        caps.merge_burst(&parse_burst_replies(b"\x1b[?1u\x1b[?62;22c"));
+        assert!(caps.da1_answered);
+        assert_eq!(caps.terminal_bg, None);
+        assert!(caps.summary().contains("terminal_bg=-"));
     }
 }

@@ -328,6 +328,10 @@ pub enum AccountFailureKind {
     Excluded,
     NotPresent,
     InvalidLabel,
+    /// A kind this build does not know (from a newer daemon). Claims no
+    /// remedy: not transient, not a login, not an action, not limited.
+    #[serde(other)]
+    Unknown,
 }
 
 impl AccountFailureKind {
@@ -359,6 +363,7 @@ impl AccountFailureKind {
             Self::Excluded => "excluded",
             Self::NotPresent => "not_present",
             Self::InvalidLabel => "invalid_label",
+            Self::Unknown => "unknown",
         }
     }
 
@@ -745,6 +750,12 @@ impl AccountFailure {
         self.cooling_down || self.kind.is_limited()
     }
 
+    /// Counts toward the headline: not limited, and not an excluded slot
+    /// (a duplicate of a seat that is already counted).
+    pub fn is_live(&self) -> bool {
+        !self.is_limited() && self.kind != AccountFailureKind::Excluded
+    }
+
     /// `label:kind[:status][:cooling]`, the log form; `:cooling` marks a
     /// cooling account whose kind is its last failed read or refresh.
     pub fn log_form(&self) -> String {
@@ -785,6 +796,9 @@ pub enum SelectionFailureKind {
     ActionRequired,
     /// The credential store could not be listed, so no account was read.
     CredentialStore,
+    /// A kind this build does not know (from a newer daemon).
+    #[serde(other)]
+    Unknown,
 }
 
 impl SelectionFailureKind {
@@ -799,6 +813,7 @@ impl SelectionFailureKind {
             Self::RemoteNoCapacity => "remote_no_capacity",
             Self::ActionRequired => "action_required",
             Self::CredentialStore => "credential_store",
+            Self::Unknown => "unknown",
         }
     }
 }
@@ -841,7 +856,8 @@ impl SelectionFailure {
     /// cooling account's read failure is shown per account. An account
     /// counts as limited when it is cooling down or at a provider limit,
     /// whatever its last read said; only the other accounts' kinds pick the
-    /// headline. First match wins: no accounts → `no_credentials`; a
+    /// headline; an `excluded` account (a duplicate of a counted seat) never
+    /// does. First match wins: no accounts → `no_credentials`; a
     /// transient failure on an account that is not limited →
     /// `usage_read_failed`; every account limited → `all_cooling_down`;
     /// every account not limited needs a login → `credential_rejected`; each
@@ -856,13 +872,18 @@ impl SelectionFailure {
             .iter()
             .filter_map(AccountFailure::from_rejection)
             .collect();
-        let live: Vec<_> = accounts.iter().filter(|a| !a.is_limited()).collect();
+        // An excluded slot duplicates a seat that is already counted (it is
+        // excluded before its cooldown is checked), so it never picks the
+        // headline.
+        let live: Vec<_> = accounts.iter().filter(|a| a.is_live()).collect();
         let kind = if accounts.is_empty() {
             K::NoCredentials
         } else if live.iter().any(|a| a.kind.is_transient()) {
             K::UsageReadFailed
-        } else if live.is_empty() {
+        } else if live.is_empty() && accounts.iter().any(AccountFailure::is_limited) {
             K::AllCoolingDown
+        } else if live.is_empty() {
+            K::QuotaUnknown
         } else if live.iter().all(|a| a.kind.needs_login()) {
             K::CredentialRejected
         } else if live
@@ -885,6 +906,20 @@ impl SelectionFailure {
             earliest_reset_ms,
             usage_read_retry_ms: None,
         }
+    }
+
+    /// The shortest `Retry-After` among the live transient failures, when
+    /// every one of them carries one: sending again sooner only repeats
+    /// them. `None` when there is no live transient failure or one has no
+    /// `Retry-After`.
+    pub fn transient_retry_after_s(&self) -> Option<u64> {
+        let waits: Option<Vec<u64>> = self
+            .accounts
+            .iter()
+            .filter(|a| a.is_live() && a.kind.is_transient())
+            .map(|a| a.retry_after_s)
+            .collect();
+        waits?.into_iter().min()
     }
 
     /// Labels whose failure only a new login fixes, in order.
@@ -2701,7 +2736,7 @@ mod tests {
             }
             go(k - 1, a, out);
             for i in 0..k - 1 {
-                if k % 2 == 0 {
+                if k.is_multiple_of(2) {
                     a.swap(i, k - 1);
                 } else {
                     a.swap(0, k - 1);
@@ -3238,5 +3273,64 @@ mod tests {
         // A past reset is never reported.
         let stale_exhausted = ok("y", vec![win("primary", 5 * HOUR, 100.0, NOW - 1)]);
         assert_eq!(failure_of(&[stale_exhausted]).earliest_reset_ms, None);
+    }
+    /// A duplicate-seat slot is excluded before its cooldown is checked, so
+    /// it must not count as a live account: one exhausted seat plus its
+    /// excluded duplicate is `all_cooling_down` with the seat's reset, not
+    /// `quota_unknown` ("send again to retry").
+    #[test]
+    fn an_excluded_duplicate_seat_does_not_pick_the_headline() {
+        use AccountFailureKind as K;
+        let reset = NOW + 2 * HOUR;
+        let spent = ok("claude1", vec![win("primary", 5 * HOUR, 100.0, reset)]);
+        let dup = ok("claude1-dup", vec![win("primary", 5 * HOUR, 100.0, reset)]);
+        let exclude = [cred("claude1-dup")];
+        let request = SelectionRequest {
+            exclude: &exclude,
+            ..req()
+        };
+        let f = match select(&request, &[spent, dup]) {
+            Selection::NoCapacity { rejections, .. } => {
+                SelectionFailure::from_rejections(&rejections, NOW)
+            }
+            other => panic!("expected no capacity, got {other:?}"),
+        };
+        assert_eq!(f.kind, SelectionFailureKind::AllCoolingDown, "{f:?}");
+        assert_eq!(f.earliest_reset_ms, Some(reset));
+        assert_eq!(f.accounts[1].kind, K::Excluded);
+
+        // Same with a cooling seat and a transient read failure on the dup.
+        let mut cooling = ok("a", vec![win("primary", 5 * HOUR, 10.0, NOW + DAY)]);
+        cooling.cooldown_until_ms = Some(NOW + HOUR);
+        let dup = failed("b", ObservationFailure::new(K::UsageRateLimited));
+        let exclude = [cred("b")];
+        let request = SelectionRequest {
+            exclude: &exclude,
+            ..req()
+        };
+        let f = match select(&request, &[cooling, dup]) {
+            Selection::NoCapacity { rejections, .. } => {
+                SelectionFailure::from_rejections(&rejections, NOW)
+            }
+            other => panic!("expected no capacity, got {other:?}"),
+        };
+        assert_eq!(f.kind, SelectionFailureKind::AllCoolingDown, "{f:?}");
+        assert_eq!(f.earliest_reset_ms, Some(NOW + HOUR));
+
+        // Every account excluded and none limited: nothing proves a limit
+        // or a login problem, so the headline stays `quota_unknown`.
+        let only = ok("x", vec![win("primary", 5 * HOUR, 10.0, NOW + DAY)]);
+        let exclude = [cred("x")];
+        let request = SelectionRequest {
+            exclude: &exclude,
+            ..req()
+        };
+        let f = match select(&request, &[only]) {
+            Selection::NoCapacity { rejections, .. } => {
+                SelectionFailure::from_rejections(&rejections, NOW)
+            }
+            other => panic!("expected no capacity, got {other:?}"),
+        };
+        assert_eq!(f.kind, SelectionFailureKind::QuotaUnknown, "{f:?}");
     }
 }

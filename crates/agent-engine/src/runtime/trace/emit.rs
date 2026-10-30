@@ -260,8 +260,13 @@ impl TraceContext {
 
     /// Context with the given sink and the installation default key path.
     pub fn with_sink(sink: Arc<dyn TraceSink>) -> Self {
-        let session_id = TraceId::new(format!("session-{}-{}", std::process::id(), unix_ms_now()))
-            .expect("generated session id is valid");
+        // `-<seq>`: contexts created in the same millisecond (workers
+        // spawned in one tool batch) still get distinct session ids.
+        static SESSION_SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SESSION_SEQ.fetch_add(1, Ordering::Relaxed);
+        let session_id =
+            TraceId::new(format!("session-{}-{}-{seq}", std::process::id(), unix_ms_now()))
+                .expect("generated session id is valid");
         Self {
             sink,
             session_id,
@@ -533,6 +538,16 @@ impl AttemptClock {
         }
     }
 
+    /// First parsed model event, ms after send start (`None` if unobserved).
+    pub fn first_model_event_ms(&self) -> Option<u64> {
+        self.first_model_event_ms
+    }
+
+    /// Stream end, ms after send start; until marked, the time elapsed so far.
+    pub fn stream_end_or_now_ms(&self) -> u64 {
+        self.stream_end_ms.unwrap_or_else(|| self.elapsed_ms())
+    }
+
     fn stages(&self) -> TimingStages {
         TimingStages {
             send_start_unix_ms: Some(self.send_start_unix_ms),
@@ -680,6 +695,9 @@ impl RequestTracer {
             },
         };
         self.emit_record(outcome);
+        // The verdict belongs to this attempt: the next one starts without
+        // it, even if it fails before streaming.
+        self.structure.cache.server_diagnosis = None;
         self.retries.push(RetryMeta {
             attempt: self.attempt,
             class,
@@ -718,6 +736,13 @@ impl RequestTracer {
             code: code.to_string(),
             correlation_id: self.request_id.as_str().to_string(),
         }
+    }
+
+    /// Attach (or clear) the provider's cache diagnosis for the attempt
+    /// that is about to finish. Set per attempt so a retry never inherits
+    /// the previous attempt's verdict.
+    pub fn set_server_diagnosis(&mut self, diagnosis: Option<super::ServerCacheDiagnosis>) {
+        self.structure.cache.server_diagnosis = diagnosis;
     }
 
     fn emit_record(&self, outcome: TransportOutcome) {

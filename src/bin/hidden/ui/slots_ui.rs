@@ -371,8 +371,8 @@ fn draw_jackpot_takeover(
 
     // Big JACKPOT text
     let cy = h / 2 - 3;
-    let blink1 = (app.frame / 6) % 2 == 0;
-    let blink2 = (app.frame / 4) % 2 == 0;
+    let blink1 = (app.frame / 6).is_multiple_of(2);
+    let blink2 = (app.frame / 4).is_multiple_of(2);
 
     let j1 = "╔══════════════════════════════╗";
     let j2 = "║  ★  J  A  C  K  P  O  T  ★  ║";

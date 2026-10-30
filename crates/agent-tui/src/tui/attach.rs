@@ -12,8 +12,8 @@ use std::sync::Arc;
 use agent_engine::session::socket_transport::SocketTransport;
 use agent_engine::session::wire::{Attach, Hello};
 use agent_engine::session::{
-    AttachMode, ClientKind, ClientTransport, CompactionPolicyWire, HistoryMode, SessionCommand,
-    SessionConfig, SessionId, TransportError,
+    AttachMode, ClientKind, ClientTransport, CompactionPolicyWire, EndReason, HistoryMode,
+    SessionCommand, SessionConfig, SessionId, TransportError,
 };
 use synaps_cli::skills::registry::CommandRegistry;
 use synaps_cli::skills::BUILTIN_COMMANDS;
@@ -50,6 +50,9 @@ pub struct AttachOpts {
     /// `--name`: name the created session (`synaps send --session <name>`
     /// resolves it at once).
     pub name: Option<String>,
+    /// `--as`: what this client is called in the session; `None` =
+    /// `SYNAPS_CLIENT_NAME`, else the daemon's default (`tui`, `tui-2`, …).
+    pub client_name: Option<String>,
     /// A plain `synaps` adopted a running daemon (no explicit `--attach`):
     /// after attaching, show what else lives in this daemon so parked
     /// work stays discoverable (F1).
@@ -105,6 +108,11 @@ fn attach_notices(i: AttachNoticeInputs<'_>) -> AttachNotices {
     }
     let attached = format!("attached to {} as client #{} ({:?})", i.session_id, i.client_id, i.mode);
     match i.owned_elsewhere {
+        // Read-only until it takes over: `/takeover` does it from here
+        // (never offered to an observer, whose `/takeover` is refused).
+        Some(owned) if i.mode != AttachMode::Observe => {
+            out.transcript.push(format!("{attached} — {owned}, or /takeover here"))
+        }
         Some(owned) => out.transcript.push(format!("{attached} — {owned}")),
         None => out.toast.insert(0, attached),
     }
@@ -114,11 +122,25 @@ fn attach_notices(i: AttachNoticeInputs<'_>) -> AttachNotices {
 /// One-line inventory of the daemon's other sessions, shown when a plain
 /// `synaps` adopts the daemon (F1): the lid-close user must be able to
 /// *see* their parked task, without being surprise-attached to it.
-/// `None` when nothing else is there.
+/// `None` when nothing else is there. Rows read like `/sessions` rows (same
+/// label, same state clock — `state_since`, not `created_at` — and `~`
+/// paths), and the line points there.
 pub fn adopt_banner(
     sessions: &[agent_engine::session::SessionMeta],
     ours: &SessionId,
     now: chrono::DateTime<chrono::Utc>,
+) -> Option<String> {
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    adopt_banner_with_home(sessions, ours, now, home.as_deref())
+}
+
+/// [`adopt_banner`] with the home directory given: `~` paths without
+/// reading the environment (Windows does not set `HOME`).
+fn adopt_banner_with_home(
+    sessions: &[agent_engine::session::SessionMeta],
+    ours: &SessionId,
+    now: chrono::DateTime<chrono::Utc>,
+    home: Option<&std::path::Path>,
 ) -> Option<String> {
     use agent_engine::session::SessionLifecycle as L;
     let mut others: Vec<&agent_engine::session::SessionMeta> =
@@ -130,29 +152,27 @@ pub fn adopt_banner(
     let n = others.len();
     let parked = others.iter().filter(|m| matches!(m.lifecycle, L::Parked)).count();
     let live = n - parked;
+    let counts: Vec<String> = [(live, "live"), (parked, "parked")]
+        .into_iter()
+        .filter(|(k, _)| *k > 0)
+        .map(|(k, what)| format!("{k} {what}"))
+        .collect();
     let mut line = format!(
-        "{n} other session{} in this daemon ({live} live, {parked} parked) — `synaps --attach <ID>` joins a live one, `synaps --continue <ID>` resumes a parked one:",
-        if n == 1 { "" } else { "s" }
+        "{n} other session{} in this daemon ({}) \u{2014} /sessions to switch:",
+        if n == 1 { "" } else { "s" },
+        counts.join(", ")
     );
     for m in others.iter().take(5) {
-        let age = now.signed_duration_since(m.created_at);
-        let age = if age.num_hours() >= 1 {
-            format!("{}h ago", age.num_hours())
-        } else {
-            format!("{}m ago", age.num_minutes().max(0))
-        };
-        let state = match m.lifecycle {
-            L::Parked => "parked",
-            _ if m.clients > 0 => "live, attached",
-            _ => "live",
-        };
-        let short = m.id.as_str();
-        let name = m.name.as_deref().map(|n| format!(" \"{n}\"")).unwrap_or_default();
-        let cwd = m.cwd.as_ref().map(|c| format!(" {}", c.display())).unwrap_or_default();
-        line.push_str(&format!("\n  {short}{name}  {state}  {age}{cwd}"));
+        let attached = if m.clients > 0 { " \u{00b7} attached" } else { "" };
+        let cwd = super::sessions::short_cwd(m.cwd.as_deref(), home);
+        line.push_str(&format!(
+            "\n  {}  {}{attached}  {cwd}",
+            super::sessions::label(m),
+            super::sessions::state_text(m, now)
+        ));
     }
     if n > 5 {
-        line.push_str(&format!("\n  … and {} more (`synaps daemon sessions`)", n - 5));
+        line.push_str(&format!("\n  \u{2026} and {} more", n - 5));
     }
     Some(line)
 }
@@ -160,8 +180,42 @@ pub fn adopt_banner(
 /// The slice of `Welcome.sessions` the attach decision needs.
 pub struct LiveSession {
     pub id: SessionId,
+    /// `--name` / `/name`, when set: `--attach <NAME>` resolves it too.
+    pub name: Option<String>,
     pub model: String,
     pub clients: usize,
+}
+
+/// `--attach <ARG>`: an exact id, then a session name (`--name`), then an id
+/// prefix. Unknown values pass through as ids so the daemon can still find
+/// sessions the welcome list didn't carry (and answer "unknown session").
+fn resolve_attach_target(
+    sessions: &[LiveSession],
+    arg: &str,
+) -> std::result::Result<SessionId, String> {
+    if let Some(m) = sessions.iter().find(|m| m.id.as_str() == arg) {
+        return Ok(m.id.clone());
+    }
+    let named: Vec<&LiveSession> = sessions
+        .iter()
+        .filter(|m| m.name.as_deref() == Some(arg))
+        .collect();
+    match named.as_slice() {
+        [one] => return Ok(one.id.clone()),
+        [] => {}
+        many => {
+            let mut lines = vec![format!(
+                "several live sessions are named \"{arg}\"; pick one by id:"
+            )];
+            lines.extend(many.iter().map(|m| format!("  {}  model={}", m.id, m.model)));
+            return Err(lines.join("\n"));
+        }
+    }
+    Ok(sessions
+        .iter()
+        .find(|m| m.id.as_str().starts_with(arg))
+        .map(|m| m.id.clone())
+        .unwrap_or_else(|| SessionId::from(arg)))
 }
 
 /// What to send: `Existing` for an explicit or sole live session, `Create`
@@ -199,11 +253,7 @@ pub fn choose_attach(
         return Ok((create(None), None));
     }
     if let Some(id) = &opts.id {
-        let sid = sessions
-            .iter()
-            .find(|m| m.id.as_str() == id || m.id.as_str().starts_with(id.as_str()))
-            .map(|m| m.id.clone())
-            .unwrap_or_else(|| SessionId::from(id.as_str()));
+        let sid = resolve_attach_target(sessions, id)?;
         return Ok((
             Attach::Existing {
                 session_id: sid,
@@ -226,9 +276,10 @@ pub fn choose_attach(
         )),
         many => {
             let mut lines =
-                vec!["several sessions; pick one with --attach <ID> (or --new for a fresh one):".to_string()];
+                vec!["several sessions; pick one with --attach <ID or NAME> (or --new for a fresh one):".to_string()];
             for m in many {
-                lines.push(format!("  {}  model={}  clients={}", m.id, m.model, m.clients));
+                let name = m.name.as_deref().map(|n| format!("\"{n}\"  ")).unwrap_or_default();
+                lines.push(format!("  {}  {name}model={}  clients={}", m.id, m.model, m.clients));
             }
             Err(lines.join("\n"))
         }
@@ -267,18 +318,52 @@ pub(super) fn skew_notice_once(
     Some(notice)
 }
 
+/// What a daemon-session TUI prints on stderr after it exits because the
+/// session ended under it (`Ended`): `/close` here or on another client,
+/// `daemon stop`, an eviction. The alternate screen is gone by then, so this
+/// is the only place the user can still read which session it was and how
+/// to bring it back. A session with no history (`has_history` false) has
+/// no journal, so there is nothing to continue; `None` for one the daemon
+/// ended for exactly that reason (`Idle`).
+pub(super) fn session_ended_line(reason: EndReason, session: &str, has_history: bool) -> Option<String> {
+    let what = match reason {
+        EndReason::ClientQuit => "was closed",
+        EndReason::HostShutdown => "ended: the daemon shut down",
+        EndReason::Evicted => "was evicted from the daemon",
+        EndReason::Error => "ended after an error",
+        EndReason::Idle => return None,
+    };
+    Some(if has_history {
+        format!("synaps: session {session} {what}; resume it with: synaps --attach --continue {session}")
+    } else {
+        format!("synaps: session {session} {what} (it never ran a turn, so there is nothing to resume)")
+    })
+}
+
 fn cfg_err(e: impl std::fmt::Display) -> synaps_cli::RuntimeError {
     synaps_cli::RuntimeError::Config(e.to_string())
 }
 
 /// What `--attach` prints when there is no daemon to attach to: says so,
-/// and how to start one (profile-aware).
+/// and how to start one (profile-aware). The `SYNAPS_DAEMON_AUTOSPAWN` hint
+/// only appears when autospawn really is off; otherwise the daemon was there
+/// a moment ago (idle shutdown, crash) and re-running starts a new one.
 pub fn daemon_not_running_message(profile: Option<&str>, detail: Option<&str>) -> String {
+    not_running_message(profile, detail, agent_engine::daemon::autospawn_enabled())
+}
+
+fn not_running_message(profile: Option<&str>, detail: Option<&str>, autospawn: bool) -> String {
     let start = match profile {
         Some(p) => format!("synaps --profile {p} daemon --detach"),
         None => "synaps daemon --detach".to_string(),
     };
     let why = detail.map(|d| format!(" ({d})")).unwrap_or_default();
+    if autospawn {
+        return format!(
+            "no daemon is running{why}; it may have just stopped.\n\
+             re-run `synaps --attach` to start a new one, or start it yourself with:  {start}"
+        );
+    }
     format!(
         "no daemon is running{why} — nothing to attach to.\n\
          start one with:  {start}\n\
@@ -297,7 +382,12 @@ pub async fn run_attached(mut opts: AttachOpts) -> Result<()> {
             None,
         )));
     }
+    let client_name = opts.client_name.clone().or_else(agent_engine::session::client_name_from_env);
+    if let Some(name) = client_name.as_deref() {
+        agent_engine::session::validate_client_name(name).map_err(cfg_err)?;
+    }
     let hello = Hello::new(ClientKind::Tui)
+        .with_name(client_name)
         .with_history(HistoryMode::from_env_or(HistoryMode::attach_client_default()));
     let conn = match SocketTransport::connect(&paths.sock, hello).await {
         Ok(c) => c,
@@ -354,6 +444,7 @@ pub async fn run_attached(mut opts: AttachOpts) -> Result<()> {
         .iter()
         .map(|m| LiveSession {
             id: m.id.clone(),
+            name: m.name.clone(),
             model: m.model.clone(),
             clients: m.clients,
         })
@@ -404,6 +495,8 @@ pub async fn run_attached(mut opts: AttachOpts) -> Result<()> {
     }
 
     let mut app = app_from_snapshot(&snapshot);
+    app.observing = transport.mode() == AttachMode::Observe;
+    app.attached_clients = transport.roster().clients().len();
     let (msgs, bytes) = super::app::scrollback_from_env(&TransportMode::Socket);
     app.transcript.set_scrollback(msgs, bytes);
     ladder("app", &"");
@@ -432,6 +525,12 @@ pub async fn run_attached(mut opts: AttachOpts) -> Result<()> {
     for n in notices.transcript {
         app.push_msg(ChatMessage::System(n));
     }
+    // Same first-run guidance as the in-process boot: a new user's first
+    // `synaps` lands here (daemon mode is the default), and without it the
+    // first message fails with a token-refresh error.
+    if let Some(n) = super::run_setup::no_credentials_notice() {
+        app.push_msg(ChatMessage::System(n));
+    }
     if !notices.toast.is_empty() {
         app.toasts.upsert(
             super::toast::Toast::new(ATTACH_TOAST_ID, String::new())
@@ -443,7 +542,7 @@ pub async fn run_attached(mut opts: AttachOpts) -> Result<()> {
     // the actor's pending prompts.
     let replay = snapshot.replay.clone();
     let pending = snapshot.pending_prompts.clone();
-    let owns_input = snapshot.input_owner == Some(transport.client_id());
+    let owns_input = super::session_link::may_drive(&transport);
     app.streaming = snapshot.streaming;
 
     let mut ctx = finish_setup(
@@ -496,6 +595,26 @@ pub async fn run_attached(mut opts: AttachOpts) -> Result<()> {
 mod tests {
     use super::*;
 
+    /// The line a TUI leaves on stderr when its daemon session ended under
+    /// it names the session and how to continue it; a session that never
+    /// ran a turn has nothing to continue.
+    #[test]
+    fn an_ended_session_says_how_to_continue_it() {
+        let line = session_ended_line(EndReason::ClientQuit, "20261014-183459-3f61", true).unwrap();
+        assert_eq!(
+            line,
+            "synaps: session 20261014-183459-3f61 was closed; resume it with: \
+             synaps --attach --continue 20261014-183459-3f61"
+        );
+        let stop = session_ended_line(EndReason::HostShutdown, "s1", true).unwrap();
+        assert!(stop.contains("the daemon shut down") && stop.ends_with("--continue s1"), "{stop}");
+        assert!(session_ended_line(EndReason::Evicted, "s1", true).unwrap().contains("evicted"));
+        assert!(session_ended_line(EndReason::Error, "s1", true).unwrap().contains("error"));
+        let empty = session_ended_line(EndReason::ClientQuit, "s1", false).unwrap();
+        assert_eq!(empty, "synaps: session s1 was closed (it never ran a turn, so there is nothing to resume)");
+        assert_eq!(session_ended_line(EndReason::Idle, "s1", true), None);
+    }
+
     fn notice_inputs<'a>(id: &'a SessionId, warnings: &'a [String]) -> AttachNoticeInputs<'a> {
         AttachNoticeInputs {
             session_id: id,
@@ -541,12 +660,28 @@ mod tests {
         assert_eq!(n.transcript, vec![
             "2 other sessions in this daemon".to_string(),
             "⚠ config: unknown key `fooo`".to_string(),
-            "attached to 20261001-000000-ours as client #1 (Mirror) — input is owned by client #3 (tui)"
+            "attached to 20261001-000000-ours as client #1 (Mirror) — input is owned by client #3 (tui), or /takeover here"
                 .to_string(),
         ]);
         // read-only attach: the attach line is in the transcript, not the toast
         assert!(n.toast.iter().all(|l| !l.starts_with("attached to")), "{n:?}");
         assert_eq!(n.toast[0], "adopted the running daemon (fresh session)");
+    }
+
+    /// An observer is read-only on purpose: its attach line never offers
+    /// `/takeover` (the session refuses it from an observer).
+    #[test]
+    fn an_observer_is_not_offered_takeover() {
+        let id = SessionId::from("20261001-000000-ours".to_string());
+        let n = attach_notices(AttachNoticeInputs {
+            mode: AttachMode::Observe,
+            owned_elsewhere: Some("input is owned by client #3 (tui)".to_string()),
+            ..notice_inputs(&id, &[])
+        });
+        assert_eq!(n.transcript, vec![
+            "attached to 20261001-000000-ours as client #1 (Observe) — input is owned by client #3 (tui)"
+                .to_string(),
+        ]);
     }
 
     #[test]
@@ -585,13 +720,23 @@ mod tests {
 
     #[test]
     fn not_running_message_says_so_and_how_to_start() {
-        let m = daemon_not_running_message(None, None);
+        let m = not_running_message(None, None, false);
         assert!(m.starts_with("no daemon is running"), "{m}");
         assert!(m.contains("synaps daemon --detach"), "{m}");
         assert!(m.contains("synaps daemon --foreground"), "{m}");
-        let m = daemon_not_running_message(Some("work"), Some("connection refused"));
+        assert!(m.contains("SYNAPS_DAEMON_AUTOSPAWN=0"), "{m}");
+        let m = not_running_message(Some("work"), Some("connection refused"), false);
         assert!(m.contains("(connection refused)"), "{m}");
         assert!(m.contains("synaps --profile work daemon --detach"), "{m}");
+    }
+
+    #[test]
+    fn not_running_message_skips_the_autospawn_hint_when_autospawn_is_on() {
+        let m = not_running_message(Some("demo"), Some("connection refused"), true);
+        assert!(m.starts_with("no daemon is running (connection refused)"), "{m}");
+        assert!(m.contains("re-run `synaps --attach`"), "{m}");
+        assert!(m.contains("synaps --profile demo daemon --detach"), "{m}");
+        assert!(!m.contains("SYNAPS_DAEMON_AUTOSPAWN"), "{m}");
     }
 
     fn opts(id: Option<&str>, new_session: bool) -> AttachOpts {
@@ -606,6 +751,7 @@ mod tests {
             keep_warm: false,
             new_session,
             name: None,
+            client_name: None,
             adopted: false,
         }
     }
@@ -624,8 +770,18 @@ mod tests {
             clients,
             input_owner: None,
             awaiting_input: 0,
+            roster: Vec::new(),
+            client_input: None,
             journal_id: String::new(),
             locked_by: None,
+            pinned: false,
+            busy: false,
+            state_since: None,
+            park_due: None,
+            evict_due: None,
+            title: None,
+            cost_usd: 0.0,
+            messages: 0,
         }
     }
 
@@ -682,10 +838,10 @@ mod tests {
         let b = adopt_banner(&sessions, &ours, now).unwrap();
         assert!(b.starts_with("2 other sessions in this daemon (1 live, 1 parked)"), "{b}");
         assert!(!b.contains("ours"), "{b}");
-        // newest first, state + age + cwd per row
+        // newest first, label + state + cwd per row
         let rows: Vec<&str> = b.lines().skip(1).collect();
-        assert!(rows[0].contains("20260919-020000-bbbb") && rows[0].contains("live, attached") && rows[0].contains("m ago") && rows[0].contains("/w"), "{b}");
-        assert!(rows[1].contains("20260919-010000-aaaa") && rows[1].contains("parked") && rows[1].contains("2h ago"), "{b}");
+        assert!(rows[0].contains("\u{2026}bbbb") && rows[0].contains("attached") && rows[0].contains("/w"), "{b}");
+        assert!(rows[1].contains("\u{2026}aaaa") && rows[1].contains("parked"), "{b}");
         // capped at 5 rows + overflow line
         let many: Vec<_> = (0..8).map(|i| meta(&format!("20260919-00000{i}-xxxx"), L::Parked, 0, i)).collect();
         let b = adopt_banner(&many, &ours, now).unwrap();
@@ -693,9 +849,43 @@ mod tests {
         assert!(b.contains("and 3 more"), "{b}");
     }
 
+    /// C5: the banner dated rows by `created_at` ("parked 4m ago") while
+    /// /sessions dates them by `state_since` ("parked 2m"); it also carried
+    /// backticked CLI how-tos and absolute paths.
+    #[test]
+    fn adopt_banner_matches_the_sessions_modal() {
+        use agent_engine::session::SessionLifecycle as L;
+        let ours = SessionId::from("20260919-000000-ours".to_string());
+        let now = chrono::Utc::now();
+        // A fixed home, not `HOME`: Windows does not set it.
+        let home = std::env::temp_dir();
+        let mut m = meta("20260919-010000-793d", L::Parked, 0, 4);
+        m.name = Some("gallery2".into());
+        m.state_since = Some(now - chrono::Duration::minutes(2));
+        m.evict_due = Some(now + chrono::Duration::minutes(57) + chrono::Duration::seconds(30));
+        m.cwd = Some(home.join("Projects/synaps"));
+        let b = adopt_banner_with_home(
+            &[meta("20260919-000000-ours", L::Live, 1, 0), m.clone()],
+            &ours,
+            now,
+            Some(&home),
+        )
+        .unwrap();
+        assert_eq!(
+            b,
+            format!(
+                "1 other session in this daemon (1 parked) \u{2014} /sessions to switch:\n  gallery2  {}  ~/Projects/synaps",
+                crate::tui::sessions::state_text(&m, now)
+            )
+        );
+        assert!(b.contains("parked 2m"), "{b}");
+        assert!(!b.contains('`') && !b.contains("ago"), "{b}");
+    }
+
     fn live(id: &str) -> LiveSession {
         LiveSession {
             id: SessionId::from(id),
+            name: None,
             model: "m".into(),
             clients: 1,
         }
@@ -708,6 +898,33 @@ mod tests {
         assert!(notice.is_none());
         let (a, _) = choose_attach(&opts(None, true), &[live("a"), live("b")], None, true).unwrap();
         assert!(matches!(a, Attach::Create { .. }), "{a:?}");
+    }
+
+    fn named(id: &str, name: &str) -> LiveSession {
+        LiveSession { name: Some(name.into()), ..live(id) }
+    }
+
+    #[test]
+    fn attach_resolves_a_session_name() {
+        let sessions = [live("20261026-081319-a97a"), named("20261026-081500-793d", "pair")];
+        let (a, _) = choose_attach(&opts(Some("pair"), false), &sessions, None, true).unwrap();
+        assert!(
+            matches!(&a, Attach::Existing { session_id, .. } if session_id.as_str() == "20261026-081500-793d"),
+            "{a:?}"
+        );
+        // An exact id still wins over a name, and id prefixes still work.
+        let sessions = [named("abc", "x"), named("def", "abc")];
+        let (a, _) = choose_attach(&opts(Some("abc"), false), &sessions, None, true).unwrap();
+        assert!(matches!(&a, Attach::Existing { session_id, .. } if session_id.as_str() == "abc"), "{a:?}");
+        let (a, _) = choose_attach(&opts(Some("de"), false), &sessions, None, true).unwrap();
+        assert!(matches!(&a, Attach::Existing { session_id, .. } if session_id.as_str() == "def"), "{a:?}");
+    }
+
+    #[test]
+    fn attach_by_ambiguous_name_lists_the_ids() {
+        let sessions = [named("aaa", "pair"), named("bbb", "pair")];
+        let e = choose_attach(&opts(Some("pair"), false), &sessions, None, true).unwrap_err();
+        assert!(e.contains("aaa") && e.contains("bbb") && e.contains("by id"), "{e}");
     }
 
     #[test]

@@ -484,6 +484,63 @@ fn golden_gate_body_bytes_identical() {
     });
 }
 
+/// Cache diagnostics ON (`cache_diagnostics = true`): for every scenario the
+/// body is the committed off-path fixture with exactly one leading
+/// `"diagnostics"` member, and stripping it (the fail-soft path) gives the
+/// fixture back byte for byte. The off path itself is the gate above.
+#[test]
+fn golden_cache_diagnostics_is_one_leading_member_on_the_fixture() {
+    use super::cache_diagnosis::{strip_diagnostics, DiagnosticsParam};
+    let dir = fixture_dir();
+    with_fixture_identity(|| {
+        for s in scenarios() {
+            let fixture = std::fs::read(dir.join(format!("{}.json", s.name))).unwrap();
+            for (prev, member) in [
+                (None, r#"{"diagnostics":{"previous_message_id":null},"#),
+                (
+                    Some("msg_01Golden"),
+                    r#"{"diagnostics":{"previous_message_id":"msg_01Golden"},"#,
+                ),
+            ] {
+                let param = DiagnosticsParam {
+                    previous_message_id: prev.map(str::to_string),
+                };
+                let mut cleaned_messages = s.messages.to_vec();
+                HelperMethods::sanitize_thinking_blocks(&mut cleaned_messages);
+                HelperMethods::annotate_cache_breakpoint(&mut cleaned_messages, s.ttl);
+                let mut body = super::request::RequestBody::new(
+                    s.model,
+                    &cleaned_messages,
+                    &s.tools,
+                    &[],
+                    &s.system_prompt,
+                    s.auth_type,
+                    s.thinking_budget,
+                    s.reasoning_level,
+                    None,
+                    s.ttl,
+                    s.stream,
+                );
+                body.set_diagnostics(param.clone());
+                let on = serde_json::to_vec(&body).unwrap();
+                let mut expected = member.as_bytes().to_vec();
+                expected.extend_from_slice(&fixture[1..]);
+                assert_eq!(
+                    on, expected,
+                    "scenario `{}`: diagnostics body is not fixture + one leading member",
+                    s.name
+                );
+                assert_eq!(
+                    strip_diagnostics(&on, &param).as_deref(),
+                    Some(fixture.as_slice()),
+                    "scenario `{}`: stripping does not restore the fixture",
+                    s.name
+                );
+            }
+        }
+    });
+}
+
 #[test]
 fn anthropic_special_modes_wire_goldens() {
     use crate::runtime::openai::catalog::{

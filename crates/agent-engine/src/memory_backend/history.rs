@@ -319,6 +319,7 @@ mod budget_tests {
         assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     #[ignore = "requires SYNAPS_AXEL_TEST_BIN; isolated synthetic archive only"]
     async fn real_axel_history_eligible_budget_roundtrip_and_atomic_refusal() {

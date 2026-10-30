@@ -254,7 +254,12 @@ async fn continue_of_live_journal_attaches_instead_of_second_actor() {
     let regs = agent_engine::events::registry::list_active_sessions();
     assert_eq!(regs.len(), 1, "{regs:?}");
     assert_eq!(regs[0].name.as_deref(), Some("ambient"));
+    #[cfg(unix)]
     assert!(tokio::net::UnixStream::connect(&regs[0].socket_path).await.is_ok());
+    #[cfg(windows)]
+    assert!(tokio::net::windows::named_pipe::ClientOptions::new()
+        .open(agent_engine::events::socket::pipe_name_for(&regs[0].socket_path))
+        .is_ok());
 
     // Same actor: a turn submitted via A streams to the mirrors.
     a.send(SessionCommand::Submit { text: "from a".into(), attachments: vec![] }).await.unwrap();

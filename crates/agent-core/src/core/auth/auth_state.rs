@@ -63,6 +63,9 @@ pub enum IdentityKind {
     /// material and changes when the token rotates (`synaps auth identify`
     /// records the id).
     Rotating,
+    /// A kind this build does not know (from a newer daemon).
+    #[serde(other)]
+    Unknown,
 }
 
 impl IdentityKind {
@@ -70,6 +73,7 @@ impl IdentityKind {
         match self {
             Self::Stable => "stable",
             Self::Rotating => "rotating",
+            Self::Unknown => "unknown",
         }
     }
 }
@@ -483,6 +487,36 @@ mod tests {
                 "{wire}"
             );
         }
+    }
+
+    /// A report from a daemon one build ahead must still decode: a kind
+    /// this build does not know reads as `unknown` instead of failing the
+    /// whole frame.
+    #[test]
+    fn kinds_from_a_newer_daemon_decode_as_unknown() {
+        let mut json = serde_json::to_value(report()).unwrap();
+        json["accounts"][0]["identity"] = "per_org".into();
+        json["accounts"][0]["last_usage"]["failure"]["kind"] = "usage_brand_new".into();
+        json["selections"][0]["failure"]["kind"] = "brand_new_headline".into();
+        json["selections"][0]["failure"]["accounts"][0]["kind"] = "usage_brand_new".into();
+        let decoded: AuthStateReport = serde_json::from_value(json).unwrap();
+        assert_eq!(decoded.accounts[0].identity, IdentityKind::Unknown);
+        let usage = decoded.accounts[0].last_usage.as_ref().unwrap();
+        assert_eq!(
+            usage.failure.as_ref().unwrap().kind,
+            AccountFailureKind::Unknown
+        );
+        let failure = decoded.selections[0].failure.as_ref().unwrap();
+        assert_eq!(failure.kind, SelectionFailureKind::Unknown);
+        assert_eq!(failure.accounts[0].kind, AccountFailureKind::Unknown);
+        // Known kinds are untouched, and an unknown one never claims a
+        // remedy it can't know.
+        assert_eq!(decoded.accounts[1].identity, IdentityKind::Rotating);
+        let k = AccountFailureKind::Unknown;
+        assert!(!k.is_transient() && !k.needs_login() && !k.needs_action() && !k.is_limited());
+        let text = render_text(&decoded);
+        assert!(text.contains("identity unknown"), "{text}");
+        assert!(text.contains("failed: unknown (claude5:unknown:429)"), "{text}");
     }
 
     #[test]

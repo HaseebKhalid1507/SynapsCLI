@@ -1,8 +1,6 @@
 //! F9 — daemon SIGKILL while a client is attached: the client must print a
 //! visible "daemon connection lost" line and exit non-zero within the
-//! reconnect budget.
-
-#![cfg(unix)]
+//! reconnect budget. (Windows: `kill` is TerminateProcess — as abrupt.)
 
 #[path = "support/phase2/mod.rs"]
 mod phase2;

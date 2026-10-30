@@ -243,10 +243,16 @@ fn classify(cmd: &SessionCommand) -> Effect {
         | SessionCommand::Resync { .. }
         | SessionCommand::Checkpoint { .. }
         | SessionCommand::KeepWarm { .. }
+        // Moves input ownership only; the next request is unchanged.
+        | SessionCommand::TakeInput
         | SessionCommand::Park
         // Its wakes reach the event queue like any other event.
         | SessionCommand::AdoptWorkers { .. }
+        // Hands the runtime pins only; the next turn start restores them.
+        | SessionCommand::RestoreToolActivations { .. }
         | SessionCommand::ReloadAborted
+        // Re-arms the park timer, which an active period already defers.
+        | SessionCommand::ArmPark
         | SessionCommand::HostEvent(_) => Effect::Untouched,
         SessionCommand::DriverStart { .. } => Effect::DriverOwned,
         SessionCommand::End { .. } => Effect::SessionEnd,
@@ -405,6 +411,8 @@ async fn command_matrix_read_only_keeps_period_prefix_changes_end_it() {
         ),
         ("pin", SessionCommand::KeepWarm { on: true }),
         ("unpin", SessionCommand::KeepWarm { on: false }),
+        // The owner's own `/takeover`: a no-op that must not end the period.
+        ("takeover (owner)", SessionCommand::TakeInput),
         ("cancel while idle", SessionCommand::Cancel),
         (
             "answer unknown prompt",
@@ -1207,4 +1215,312 @@ async fn review_205_completed_ping_accounting_is_persisted_without_manual_save()
         disk_kw > 0.0,
         "completed ping missing on disk: kw={disk_kw}, total={disk_cost}; in-memory={st}"
     );
+}
+
+// ── A due ping while `on_session_start` is pending ──────────────────────────
+//
+// The ping repeats the next turn's prefix, session-start injection included,
+// so it waits for that hook: the timer is off meanwhile and the ping is looked
+// at again once the hook has run. No production path reaches this today (a
+// period needs an accepted request, which already waited for the hook), so
+// two test seams build it: the host's session-start gate is held, and the
+// turn that starts the period puts a fresh hook back in line at its end.
+
+use agent_engine::session::cache_keepwarm::testing::due_checks;
+use agent_engine::session::session_start_testing as start_seam;
+
+/// A turn that starts a period and leaves a hook pending behind the held
+/// gate. Returns the transport, the handle, the stub's bodies, the gate hold
+/// and the hook-call count before the turn.
+async fn period_with_a_pending_hook(
+    persist: bool,
+) -> (
+    LocalTransport,
+    SessionHandle,
+    Arc<Mutex<Vec<String>>>,
+    start_seam::GateHold,
+    u64,
+) {
+    let (url, bodies) = recording_stub().await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+    let handle = host
+        .create_session(SessionConfig { persist, ..cfg() })
+        .await
+        .unwrap();
+    let (mut t, _) = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Tui))
+        .await
+        .unwrap();
+    let hold = start_seam::hold_gate(&host).await;
+    let sid = handle.journal_id();
+    let calls = start_seam::calls(&sid);
+    start_seam::requeue_after_next_turn(&sid);
+    turn(&mut t, "hello").await;
+    let st = keepwarm(&mut t, 700, "status").await;
+    assert_eq!(st["active"], true, "the turn started a period: {st}");
+    // The first ping is due one 300 ms interval after the turn's request.
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    assert_eq!(pings(&bodies), 0, "no ping before on_session_start has run");
+    assert_eq!(start_seam::calls(&sid), calls, "the hook is still in line");
+    (t, handle, bodies, hold, calls)
+}
+
+/// Wait (bounded) until `n` hooks have run since `base`.
+async fn hooks_run(sid: &str, base: u64, n: u64, for_: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + for_;
+    while tokio::time::Instant::now() < deadline {
+        if start_seam::calls(sid) >= base + n {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    start_seam::calls(sid) >= base + n
+}
+
+/// Held: no ping, no busy loop (the timer is off, so a passed deadline does
+/// not wake the actor again and again), the actor still answers. Once the
+/// hook has run the held ping goes out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_due_ping_waits_for_a_pending_session_start_hook_without_spinning() {
+    let h = Home::new();
+    write_config(&h, "cache_keepwarm = auto\ncache_ttl = 1h\nthinking = off\n");
+    let _interval = fast_pings();
+    let (mut t, handle, bodies, hold, calls) = period_with_a_pending_hook(false).await;
+
+    let checks = due_checks();
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    let more = due_checks() - checks;
+    assert!(more <= 1, "the timer is off while the ping waits: {more} due checks in 1.2 s");
+    assert_eq!(pings(&bodies), 0, "still no ping");
+    let st = keepwarm(&mut t, 701, "status").await;
+    assert_eq!(st["active"], true, "the period is still there: {st}");
+    assert_eq!(st["period"]["in_flight"], false, "{st}");
+
+    drop(hold);
+    assert!(
+        wait_pings(&bodies, 1, PATIENCE).await,
+        "the held ping goes out once the hook has run"
+    );
+    assert_eq!(start_seam::calls(&handle.journal_id()), calls + 1, "the hook ran once");
+    end(&mut t).await;
+}
+
+/// `/keepwarm off` while the ping waits: nothing goes out after the hook.
+/// A later period is not left without its timer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn keepwarm_off_while_a_ping_waits_for_the_hook_sends_nothing() {
+    let h = Home::new();
+    write_config(&h, "cache_keepwarm = auto\ncache_ttl = 1h\nthinking = off\n");
+    let _interval = fast_pings();
+    let (mut t, handle, bodies, hold, calls) = period_with_a_pending_hook(false).await;
+
+    let st = keepwarm(&mut t, 710, "off").await;
+    assert_eq!(st["active"], false, "{st}");
+    drop(hold);
+    assert!(hooks_run(&handle.journal_id(), calls, 1, PATIENCE).await, "the hook runs");
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    assert_eq!(pings(&bodies), 0, "keep-warm was turned off before the hook ran");
+
+    // Back on: the new period has a timer again and pings.
+    let st = keepwarm(&mut t, 711, "auto").await;
+    assert_eq!(st["active"], true, "{st}");
+    assert!(
+        wait_pings(&bodies, 1, PATIENCE).await,
+        "a period started after the hook pings on schedule"
+    );
+    end(&mut t).await;
+}
+
+/// A turn submitted while the ping waits also waits for the hook; then the
+/// turn's request goes out, and no ping goes out before it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_turn_while_a_ping_waits_for_the_hook_goes_first_and_alone() {
+    let h = Home::new();
+    write_config(&h, "cache_keepwarm = auto\ncache_ttl = 1h\nthinking = off\n");
+    let _interval = fast_pings();
+    let (mut t, handle, bodies, hold, calls) = period_with_a_pending_hook(false).await;
+
+    let before = bodies.lock().unwrap().len();
+    t.send(submit("second")).await.unwrap();
+    until(&mut t, |e| {
+        matches!(e, agent_engine::session::SessionEventWire::TurnStarted { .. })
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_eq!(bodies.lock().unwrap().len(), before, "the turn waits for the hook too");
+
+    drop(hold);
+    until(&mut t, |e| matches!(e, agent_engine::session::SessionEventWire::Idle)).await;
+    {
+        let all = bodies.lock().unwrap();
+        let next = all.get(before).expect("the turn sent its request");
+        assert!(!next.contains(PING_MARK), "the turn's request comes first, not the held ping");
+        assert!(next.contains("second"), "it is the second turn's request");
+    }
+    assert_eq!(start_seam::calls(&handle.journal_id()), calls + 1, "the hook ran once");
+    end(&mut t).await;
+}
+
+/// Park while the ping waits: the hook leaves the line (it is not called
+/// while parked) and no ping goes out; after the unpark the hook runs once
+/// and turns work.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn park_while_a_ping_waits_for_the_hook_withdraws_both() {
+    let h = Home::new();
+    write_config(&h, "cache_keepwarm = auto\ncache_ttl = 1h\nthinking = off\n");
+    let _interval = fast_pings();
+    let (t, handle, bodies, hold, calls) = period_with_a_pending_hook(true).await;
+
+    t.send(SessionCommand::Detach {
+        client: t.client_id(),
+    })
+    .await
+    .unwrap();
+    handle.send(SessionCommand::Park).await.unwrap();
+    assert!(
+        wait_lifecycle(&handle, SessionLifecycle::Parked, PATIENCE).await,
+        "an explicit park is not deferred"
+    );
+    drop(hold);
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    assert_eq!(start_seam::calls(&handle.journal_id()), calls, "no hook runs while parked");
+    assert_eq!(pings(&bodies), 0, "no ping while parked");
+
+    let (mut t, _) = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Tui))
+        .await
+        .unwrap();
+    assert!(hooks_run(&handle.journal_id(), calls, 1, PATIENCE).await, "the hook runs after the unpark");
+    let st = keepwarm(&mut t, 720, "status").await;
+    assert_eq!(st["last_end"], "parked by request", "{st}");
+    let before = bodies.lock().unwrap().len();
+    turn(&mut t, "after").await;
+    {
+        let all = bodies.lock().unwrap();
+        let next = all.get(before).expect("the turn sent its request");
+        assert!(!next.contains(PING_MARK) && next.contains("after"), "the turn's own request");
+    }
+    assert_eq!(start_seam::calls(&handle.journal_id()), calls + 1, "the hook ran once in all");
+    end(&mut t).await;
+}
+
+// ── A due ping while fenced for a reload AND waiting for the hook ───────────
+//
+// A reload's checkpoint fences the session until the exec (or the daemon's
+// report that it failed): the exec would discard the ping's result. The
+// ping also waits for `on_session_start`. Fenced and waiting, the due ping
+// goes out only once both have cleared, in either order.
+//
+// What the waits show: the 900 ms sleeps are negative observations (no ping
+// went out within them), not barriers, and `wait_pings(.., 1, ..)` waits
+// for at least one ping: these tests check that the ping is held and then
+// goes out, not that exactly one ever does.
+
+/// Fence `handle` as a reload's checkpoint does (host-sent).
+async fn fence_for_reload(t: &mut LocalTransport, handle: &SessionHandle) {
+    use agent_engine::session::wire::CHECKPOINT_QUERY_ID;
+    handle
+        .send(SessionCommand::Checkpoint {
+            reason: agent_engine::session::CheckpointReason::Reload,
+        })
+        .await
+        .unwrap();
+    until(t, |e| {
+        matches!(e, agent_engine::session::SessionEventWire::QueryResult { id, .. } if *id == CHECKPOINT_QUERY_ID)
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_due_ping_while_fenced_and_waiting_for_the_hook_goes_out_once_both_clear_fence_first() {
+    let h = Home::new();
+    write_config(&h, "cache_keepwarm = auto\ncache_ttl = 1h\nthinking = off\n");
+    let _interval = fast_pings();
+    let (mut t, handle, bodies, hold, calls) = period_with_a_pending_hook(false).await;
+    fence_for_reload(&mut t, &handle).await;
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    assert_eq!(pings(&bodies), 0, "no ping while fenced and waiting");
+
+    handle.send(SessionCommand::ReloadAborted).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    assert_eq!(pings(&bodies), 0, "the fence lifted; the ping still waits for the hook");
+    assert_eq!(start_seam::calls(&handle.journal_id()), calls, "the hook still waits");
+
+    drop(hold);
+    assert!(
+        wait_pings(&bodies, 1, PATIENCE).await,
+        "the held ping goes out once both have cleared"
+    );
+    assert_eq!(start_seam::calls(&handle.journal_id()), calls + 1, "the hook ran once");
+    end(&mut t).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_due_ping_while_fenced_and_waiting_for_the_hook_goes_out_once_both_clear_hook_first() {
+    let h = Home::new();
+    write_config(&h, "cache_keepwarm = auto\ncache_ttl = 1h\nthinking = off\n");
+    let _interval = fast_pings();
+    let (mut t, handle, bodies, hold, calls) = period_with_a_pending_hook(false).await;
+    fence_for_reload(&mut t, &handle).await;
+
+    drop(hold);
+    assert!(
+        hooks_run(&handle.journal_id(), calls, 1, PATIENCE).await,
+        "the hook runs under the fence"
+    );
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    assert_eq!(pings(&bodies), 0, "the hook ran; the ping still waits for the fence");
+
+    handle.send(SessionCommand::ReloadAborted).await.unwrap();
+    assert!(
+        wait_pings(&bodies, 1, PATIENCE).await,
+        "the held ping goes out once both have cleared"
+    );
+    assert_eq!(start_seam::calls(&handle.journal_id()), calls + 1, "the hook ran once");
+    end(&mut t).await;
+}
+
+/// A pin is the owner's say-so: a pinned session with no interactive client
+/// ever attached (restored by the daemon, fed by `synaps send`) starts a
+/// period on the Idle after a real turn. Unpinned, the old rule holds:
+/// no typing client, no period; unpinning ends a period it started.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_pinned_session_keeps_warm_without_an_interactive_client() {
+    let h = Home::new();
+    write_config(&h, "cache_keepwarm = auto\ncache_ttl = 1h\nthinking = off\n");
+    let (url, bodies) = recording_stub().await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+
+    // Unpinned, script-only: no period.
+    let plain = host.create_session(cfg()).await.unwrap();
+    let (mut script, _) = LocalTransport::attach(plain.clone(), ClientMeta::new(ClientKind::Test))
+        .await
+        .unwrap();
+    turn(&mut script, "hello").await;
+    let st = keepwarm(&mut script, 800, "status").await;
+    assert_eq!(st["active"], false, "unpinned + no interactive client: none: {st}");
+    end(&mut script).await;
+
+    // Pinned at create, script-only: the Idle starts one.
+    let pinned = host.create_session(SessionConfig { keep_warm: true, ..cfg() }).await.unwrap();
+    let (mut script, _) = LocalTransport::attach(pinned.clone(), ClientMeta::new(ClientKind::Test))
+        .await
+        .unwrap();
+    turn(&mut script, "hello").await;
+    let st = keepwarm(&mut script, 801, "status").await;
+    assert_eq!(st["active"], true, "pinned, no interactive client: a period: {st}");
+
+    // Unpinned again: back to the old rule, the period ends.
+    pinned.send(SessionCommand::KeepWarm { on: false }).await.unwrap();
+    let st = keepwarm(&mut script, 802, "status").await;
+    assert_eq!(st["active"], false, "unpinned: no interactive client, no period: {st}");
+    let _ = pings(&bodies);
+    end(&mut script).await;
 }

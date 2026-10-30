@@ -15,6 +15,11 @@ pub mod display;
 pub mod driver;
 pub mod handle;
 mod persister;
+pub(crate) mod session_start;
+/// Test-only controls of `on_session_start` scheduling (`cfg(test)` / the
+/// `testing` feature).
+#[cfg(any(test, feature = "testing"))]
+pub use session_start::testing as session_start_testing;
 pub mod socket_transport;
 pub mod transport;
 pub mod types;

@@ -31,18 +31,16 @@ fn flags(p: &Path, scope: &str, op: &str, payload: Value, flags: &[&str]) -> Val
         .spawn()
         .unwrap();
     let mut stdin = child.stdin.take().unwrap();
-    writeln!(
-        stdin,
-        "{}",
-        json!({"schema":SCHEMA,"project":scope,"operation":"hello","payload":{}})
-    )
-    .unwrap();
-    writeln!(
-        stdin,
-        "{}",
+    let input = format!(
+        "{}\n{}\n",
+        json!({"schema":SCHEMA,"project":scope,"operation":"hello","payload":{}}),
         json!({"schema":SCHEMA,"project":scope,"operation":op,"payload":payload})
-    )
-    .unwrap();
+    );
+    // A refused scope gets its error reply and the process exits without
+    // reading stdin, so the write can race that exit. Only that is fine.
+    if let Err(e) = stdin.write_all(input.as_bytes()) {
+        assert_eq!(e.kind(), std::io::ErrorKind::BrokenPipe, "{e}");
+    }
     drop(stdin);
     let out = child.wait_with_output().unwrap();
     assert!(out.status.success(), "{:?}", out);

@@ -71,6 +71,40 @@ impl SocketIdentity {
     }
 }
 
+/// Client end of a per-session endpoint: a stream on the Unix socket at
+/// `socket_path`, or on Windows the named pipe derived from it.
+#[cfg(unix)]
+pub type SessionClient = tokio::net::UnixStream;
+#[cfg(windows)]
+pub type SessionClient = tokio::net::windows::named_pipe::NamedPipeClient;
+
+/// Connect to the session endpoint a registration publishes as
+/// `socket_path`, so callers (`synaps send`, tests) never hard-code the
+/// platform transport.
+pub async fn connect_session_socket(socket_path: &str) -> std::io::Result<SessionClient> {
+    #[cfg(unix)]
+    {
+        tokio::net::UnixStream::connect(socket_path).await
+    }
+    #[cfg(windows)]
+    {
+        tokio::net::windows::named_pipe::ClientOptions::new().open(pipe_name_for(socket_path))
+    }
+}
+
+/// Deliver one payload to a session endpoint: connect, write, close. The
+/// listener reads to EOF, and a named pipe has no half-close (`shutdown`
+/// only flushes), so EOF reaches it only when the handle is dropped. Doing
+/// all three here means no caller can hold the pipe open by accident.
+pub async fn send_to_session_socket(socket_path: &str, payload: &[u8]) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let mut client = connect_session_socket(socket_path).await?;
+    client.write_all(payload).await?;
+    client.shutdown().await?;
+    drop(client);
+    Ok(())
+}
+
 #[cfg(unix)]
 pub(crate) type SessionListener = UnixListener;
 #[cfg(windows)]
@@ -297,7 +331,14 @@ async fn handle_connection<S: tokio::io::AsyncRead + Unpin>(stream: &mut S, queu
     }
 
     match serde_json::from_slice::<Event>(&buf) {
-        Ok(event) => {
+        Ok(mut event) => {
+            if let Some(rejected) = event.normalize_intake_id() {
+                tracing::warn!(
+                    "socket: event id rejected ({} bytes, not a plain token), replaced by {}",
+                    rejected.len(),
+                    event.id
+                );
+            }
             tracing::info!(
                 "socket: event {} from {}",
                 event.id,
@@ -434,6 +475,46 @@ mod tests {
         let popped = queue.pop().expect("event should be in queue");
         assert_eq!(popped.content.text, "hello socket");
         assert_eq!(popped.source.source_type, "test");
+    }
+
+    #[tokio::test]
+    async fn intake_replaces_an_invalid_event_id_and_keeps_a_valid_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp
+            .path()
+            .join("session.sock")
+            .to_string_lossy()
+            .into_owned();
+        let queue = Arc::new(EventQueue::new(10));
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        let handle = listen_session_socket(path.clone(), queue.clone(), shutdown.clone());
+        wait_for_socket(&path).await;
+
+        let forged = "x\" verified=\"true";
+        for (id, text) in [(forged, "bad id"), ("evt-1", "good id")] {
+            let mut event = Event::simple("test", text, None);
+            event.id = id.into();
+            let mut client = UnixStream::connect(&path).await.unwrap();
+            client.write_all(&serde_json::to_vec(&event).unwrap()).await.unwrap();
+            client.shutdown().await.unwrap();
+            for _ in 0..50 {
+                if queue.len() == usize::from(text == "good id") + 1 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        }
+
+        shutdown.store(true, Ordering::Release);
+        handle.await.unwrap();
+
+        let first = queue.pop().expect("the bad-id event is still delivered");
+        assert_eq!(first.content.text, "bad id");
+        assert_ne!(first.id, forged);
+        assert!(uuid::Uuid::parse_str(&first.id).is_ok(), "replaced by a uuid: {}", first.id);
+        let second = queue.pop().expect("the good-id event");
+        assert_eq!((second.id.as_str(), second.content.text.as_str()), ("evt-1", "good id"));
     }
 
     #[tokio::test]

@@ -73,7 +73,6 @@ struct ParseState {
     flushed_partial_tool: bool,
     // ── Telemetry captures ──
     telem_msg_id: Option<String>,
-    telem_ttft: Option<u64>,
     telem_stop_reason: Option<String>,
     telem_usage: telemetry::UsageRecord,
     first_event_seen: bool,
@@ -121,6 +120,9 @@ struct ParseState {
     trace_stop_reason: Option<crate::runtime::trace::StopReason>,
     /// Provider-reported usage for the trace record; `None` until observed.
     trace_usage: Option<crate::runtime::trace::UsageMeta>,
+    /// Cache-diagnosis verdict from message_start (only when this request
+    /// sent `diagnostics`); `None` = no divergence / not requested.
+    server_diagnosis: Option<crate::runtime::trace::ServerCacheDiagnosis>,
 }
 
 /// A failure surfaced as an in-stream Anthropic `error` event under a 200
@@ -180,7 +182,6 @@ impl ParseState {
             in_thinking: false,
             flushed_partial_tool: false,
             telem_msg_id: None,
-            telem_ttft: None,
             telem_stop_reason: None,
             telem_usage: telemetry::UsageRecord::default(),
             first_event_seen: false,
@@ -197,6 +198,7 @@ impl ParseState {
             first_event_elapsed_ms: None,
             trace_stop_reason: None,
             trace_usage: None,
+            server_diagnosis: None,
         }
     }
 
@@ -290,6 +292,9 @@ struct EventCtx<'t> {
     /// Optional Task 23 turn-budget usage counters, recorded at the single
     /// authoritative Usage emission (and its residual twin) only.
     usage_counters: Option<std::sync::Arc<crate::runtime::budget::UsageCounters>>,
+    /// This request sent `diagnostics`: capture the message id (chain) and
+    /// the server's verdict from message_start.
+    cache_diagnosis: bool,
 }
 
 /// THE TEST SEAM. Strips SSE framing, skips non-data lines and the `[DONE]`
@@ -313,14 +318,11 @@ fn process_data_line(line: &str, state: &mut ParseState, ctx: &EventCtx) {
 /// tail paths are uniform. `raw` is the un-parsed data line — `#[serde(other)]`
 /// discards the tag on Unknown events, so the raw line is the only forensics.
 fn process_event(event: AnthropicEvent<'_>, raw: &str, state: &mut ParseState, ctx: &EventCtx) {
-    // First-event capture: the trace timing bucket is unconditional
-    // (Task 8); the telemetry TTFT mirror stays gated as before.
+    // First-event capture (Task 8), unconditional. Feeds the attempt clock,
+    // which both the trace and the telemetry `ttft_ms` read.
     if !state.first_event_seen {
         state.first_event_seen = true;
         state.first_event_elapsed_ms = Some(ctx.request_start.elapsed().as_millis() as u64);
-        if ctx.telemetry_level.enabled() {
-            state.telem_ttft = state.first_event_elapsed_ms;
-        }
     }
 
     match event {
@@ -589,11 +591,15 @@ fn process_event(event: AnthropicEvent<'_>, raw: &str, state: &mut ParseState, c
             }
         }
         AnthropicEvent::MessageStart { message } => {
-            // ═══ TELEMETRY: capture msg_id ═══
-            if ctx.telemetry_level.enabled() {
+            // ═══ TELEMETRY: capture msg_id (also the diagnostics chain) ═══
+            if ctx.telemetry_level.enabled() || ctx.cache_diagnosis {
                 if let Some(id) = message.id {
                     state.telem_msg_id = Some(id.into_owned());
                 }
+            }
+            if ctx.cache_diagnosis {
+                state.server_diagnosis =
+                    super::cache_diagnosis::parse_server_diagnosis(message.diagnostics.as_ref());
             }
             if let Some(usage) = message.usage {
                 // CAPTURE ONLY — no Usage emission from this arm. Live
@@ -827,6 +833,10 @@ pub struct ApiOptions {
     pub anthropic_base_url: Option<String>,
     /// Dedicated lazy pool: upload and body idle deadlines are independent.
     pub(super) anthropic_stream_client: Arc<std::sync::OnceLock<Client>>,
+    /// gzip `Content-Encoding` policy for the request body (see
+    /// `request_encoding`). The default compresses large bodies sent straight
+    /// to api.anthropic.com and shares the process-wide refusal latch.
+    pub(super) request_compression: super::request_encoding::RequestCompression,
     /// Execution authority produced by Runtime preflight. Transports must not
     /// recreate authority for Max/UltraCode from assumed prerequisites.
     pub anthropic_execution_plan: Option<crate::runtime::openai::catalog::AnthropicExecutionPlan>,
@@ -896,6 +906,12 @@ pub struct ApiOptions {
     /// [`KeepWarmMode`]), every retry budget is zero, and the telemetry
     /// record carries `"keepwarm": true`.
     pub keepwarm: Option<KeepWarmRequest>,
+    /// Anthropic cache diagnostics chain (`cache_diagnostics = true`).
+    /// `None` (default) keeps the wire byte-identical: no header, no
+    /// `diagnostics` field. Set on the foreground turn stream (which threads
+    /// `previous_message_id`) and on keep-warm pings (header only, so the
+    /// beta set matches the turns they keep warm).
+    pub cache_diagnosis: Option<super::cache_diagnosis::CacheDiagnosis>,
 }
 
 /// What a keep-warm request does once its body is built.
@@ -981,8 +997,9 @@ pub(super) fn terminal_http_error(
 
 /// Begin an Anthropic request tracer (Task 8). Returns `None` when tracing
 /// is disabled or any structural identity is unrepresentable — tracing can
-/// never fail the request. `body_bytes` MUST be the exact buffer handed to
-/// reqwest: it is the sole source of the wire length + digest.
+/// never fail the request. `body_bytes` MUST be the exact JSON payload handed
+/// to reqwest, before any `Content-Encoding` (the server decodes gzip before
+/// reading it): it is the sole source of the wire length + digest.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn begin_anthropic_tracer(
     options: &ApiOptions,
@@ -1132,8 +1149,9 @@ impl ApiMethods {
             ));
         }
         super::attachments::validate_history_for_request(model, messages).map_err(RuntimeError::Config)?;
-        let wire_messages = super::continuation::wire_messages(messages);
-        let messages = wire_messages.as_deref().unwrap_or(messages);
+        // Host `_synaps_*` keys never reach a provider. The native Anthropic
+        // body drops them while serializing (`WireMessages`, no history
+        // copy); every other transport strips at its own entry.
         // One provider-neutral schema source for every transport. The opt-in
         // progressive path supplies a per-round session projection; flag-off
         // keeps cloning the registry's existing cached Arc byte-for-byte.
@@ -1150,6 +1168,8 @@ impl ApiMethods {
                 if cancel.is_cancelled() {
                     return Err(RuntimeError::Canceled);
                 }
+                let wire_messages = super::continuation::wire_messages(messages);
+                let messages = wire_messages.as_deref().unwrap_or(messages);
                 let has_tools = !tools_schema.is_empty();
                 return with_usage_metering(model, options.usage_counters.clone(), &tx, |tx| async move {
                     crate::runtime::cloud_invoke::cloud_invoke_stream(
@@ -1396,6 +1416,12 @@ impl ApiMethods {
             true,
         );
         let mut body = parts.body;
+        // Cache diagnostics (`cache_diagnostics = true`): the foreground
+        // chain only — pings and the setting-off path send no field.
+        let mut diagnostics = super::cache_diagnosis::diagnostics_for(options);
+        if let Some(d) = &diagnostics {
+            body.set_diagnostics(d.clone());
+        }
         // Keep-warm: cut the output cap (not part of the cache key), then
         // fingerprint the prefix exactly as it would go on the wire. A probe —
         // or a ping whose prefix no longer matches what is cached — returns
@@ -1436,7 +1462,7 @@ impl ApiMethods {
         // we called `req.json(&body).send()` per attempt, which re-ran
         // `serde_json::to_vec(&body)` over the entire conversation on every
         // 429 retry — wasted work since the payload is identical.
-        let body_bytes: bytes::Bytes = serde_json::to_vec(&body)
+        let mut body_bytes: bytes::Bytes = serde_json::to_vec(&body)
             .map_err(|e| {
                 RuntimeError::ApiStatus(format!("failed to serialize request body: {}", e))
             })?
@@ -1500,6 +1526,16 @@ impl ApiMethods {
         #[allow(unused_assignments)]
         let mut clock = crate::runtime::trace::AttemptClock::start();
 
+        // ═══ WIRE ENCODING (request_encoding) ═════════════════════════════════
+        // `body_bytes` stays the JSON: the trace digests it and the
+        // diagnostics fail-soft edits it. `wire` is what reqwest uploads,
+        // gzip-encoded when the policy allows; retries reuse it.
+        let mut wire = await_or_cancel(
+            cancel,
+            options.request_compression.encode(&anthropic_url, &body_bytes),
+        )
+        .await?;
+
         let mut last_err = String::new();
         let mut last_status: Option<u16> = None;
         let mut last_reset_hint: Option<String> = None;
@@ -1559,21 +1595,25 @@ impl ApiMethods {
                     }
                     clock = crate::runtime::trace::AttemptClock::start();
                     let sent_at = super::keepwarm::CacheAnchor::now();
+                    let req = wire.encoding_header(req);
                     let req = match &options.keepwarm {
-                        Some(keepwarm) => keepwarm_body(req, body_bytes.clone(), &keepwarm.sent),
-                        None => req.body(body_bytes.clone()),
+                        Some(keepwarm) => keepwarm_body(req, wire.bytes.clone(), &keepwarm.sent),
+                        None => req.body(wire.bytes.clone()),
                     };
                     match await_or_cancel(
                         cancel,
                         super::http_phases::send(
                             req,
-                            super::http_phases::header_deadline(body_bytes.len()),
+                            super::http_phases::header_deadline(wire.bytes.len()),
                         ),
                     )
                     .await?
                     {
                         Ok(resp) => {
                             let status = resp.status();
+                            options
+                                .request_compression
+                                .settle(&mut wire, status.is_success());
                             if let Some(keepwarm) = &options.keepwarm {
                                 keepwarm
                                     .sent
@@ -1887,6 +1927,84 @@ impl ApiMethods {
                                 }
                             }
 
+                            // ═══ CACHE DIAGNOSTICS fail-soft ═══
+                            // The API refused the beta header or the
+                            // `diagnostics` field: latch it off for the session
+                            // and re-send this request without either (header
+                            // is rebuilt from the latch). Costs no retry budget;
+                            // a turn never fails because of diagnostics. The
+                            // trace keeps the first attempt's wire metadata.
+                            let diag_on_wire = diagnostics.is_some()
+                                || super::cache_diagnosis::wants_beta_header(&auth_type, options);
+                            if diag_on_wire
+                                && super::cache_diagnosis::is_rejection(
+                                    status.as_u16(),
+                                    &error_text,
+                                )
+                            {
+                                if let Some(chain) = &options.cache_diagnosis {
+                                    chain.reject(status.as_u16());
+                                }
+                                if let Some(d) = diagnostics.take() {
+                                    match super::cache_diagnosis::strip_diagnostics(&body_bytes, &d)
+                                    {
+                                        Some(stripped) => {
+                                            body_bytes = stripped.into();
+                                            wire = await_or_cancel(
+                                                cancel,
+                                                options
+                                                    .request_compression
+                                                    .encode(&anthropic_url, &body_bytes),
+                                            )
+                                            .await?;
+                                        }
+                                        // Unreachable by construction (the
+                                        // field serializes first); keep the
+                                        // normal error path rather than resend
+                                        // a body we could not fix.
+                                        None => diagnostics = Some(d),
+                                    }
+                                }
+                                if diagnostics.is_none() {
+                                    if let Some(t) = tracer.as_mut() {
+                                        t.attempt_failed(
+                                            clock,
+                                            crate::runtime::trace::RetryClass::Other,
+                                            Duration::ZERO,
+                                            Some(status.as_u16()),
+                                            trace_rid,
+                                            "cache_diagnosis_rejected",
+                                        );
+                                    }
+                                    continue;
+                                }
+                            }
+
+                            // ═══ GZIP REFUSAL fail-soft (request_encoding) ═══
+                            // A 400/415 to a gzip body: resend it once
+                            // uncompressed, costing no retry budget. The
+                            // resend's outcome decides whether gzip latches
+                            // off (`settle` above), so a genuine 400 just
+                            // fails again below and leaves gzip on.
+                            if let Some(resend) = options.request_compression.resend_uncompressed(
+                                &wire,
+                                &body_bytes,
+                                status.as_u16(),
+                            ) {
+                                wire = resend;
+                                if let Some(t) = tracer.as_mut() {
+                                    t.attempt_failed(
+                                        clock,
+                                        crate::runtime::trace::RetryClass::Other,
+                                        Duration::ZERO,
+                                        Some(status.as_u16()),
+                                        trace_rid,
+                                        "gzip_refused",
+                                    );
+                                }
+                                continue;
+                            }
+
                             // Decide whether we've exhausted retries for this error class.
                             // A keep-warm ping never retries: any error stops it.
                             let retry_exhausted = if options.keepwarm.is_some() {
@@ -1979,6 +2097,7 @@ impl ApiMethods {
                             }
                         }
                         Err(e) => {
+                            options.request_compression.settle(&mut wire, false);
                             if let Some(keepwarm) = &options.keepwarm {
                                 if matches!(&e, RuntimeError::Api(error) if error.is_connect()) {
                                     keepwarm
@@ -2086,6 +2205,7 @@ impl ApiMethods {
                 saw_1h_honored: options.saw_1h_honored.clone(),
                 request_has_1h_marker,
                 usage_counters: options.usage_counters.clone(),
+                cache_diagnosis: diagnostics.is_some(),
             };
 
             // SSE can split across chunk boundaries (even mid-UTF-8-codepoint), so
@@ -2185,6 +2305,20 @@ impl ApiMethods {
                 None => "empty_response",
             };
 
+            // ═══ CACHE DIAGNOSTICS: advance the chain, tag the trace ═══
+            // The server fingerprints every request that carried
+            // `diagnostics`, keyed by its message id — so the next request
+            // compares against this one even if its stream later failed.
+            if diagnostics.is_some() {
+                if let (Some(chain), Some(id)) = (&options.cache_diagnosis, &state.telem_msg_id) {
+                    chain.record(id);
+                }
+            }
+            let server_diagnosis = state.server_diagnosis.take();
+            if let Some(t) = tracer.as_mut() {
+                t.set_server_diagnosis(server_diagnosis);
+            }
+
             // ═══ TELEMETRY: write the record ═══
             if telemetry_level.enabled() {
                 // Build context record — what we sent
@@ -2207,7 +2341,7 @@ impl ApiMethods {
 
                 let system_bytes = system_prompt.as_ref().map(|s| s.len()).unwrap_or(0);
 
-                let record = telemetry::TelemetryRecord {
+                let mut record = telemetry::TelemetryRecord {
                     ts: telemetry::TelemetryRecord::now_ms(),
                     request_id: telem_request_id,
                     msg_id: state.telem_msg_id,
@@ -2218,12 +2352,19 @@ impl ApiMethods {
                     } else {
                         None
                     },
-                    ttft_ms: state.telem_ttft,
-                    total_ms: request_start.elapsed().as_millis() as u64,
+                    // Both from the attempt clock: measured from send start,
+                    // like the trace timings. Measuring from `request_start`
+                    // (taken once headers arrive) read 0 ms for TTFT.
+                    ttft_ms: clock.first_model_event_ms(),
+                    total_ms: clock.stream_end_or_now_ms(),
                     stop_reason: state.telem_stop_reason,
+                    cost_usd: state.telem_usage.cost_usd(model),
                     usage: state.telem_usage,
                     ratelimit: telem_ratelimit,
-                    cache_diag: None, // TODO: wire cache-diagnostics beta in future slice
+                    cache_diag: server_diagnosis.map(|d| telemetry::CacheDiagRecord {
+                        miss_reason: d.reason.as_str().to_string(),
+                        missed_tokens: d.missed_input_tokens,
+                    }),
                     context: telemetry::ContextRecord {
                         messages: cleaned_messages.len(),
                         tools: tools_schema.len(),
@@ -2231,7 +2372,14 @@ impl ApiMethods {
                         breakpoints,
                     },
                     keepwarm: options.keepwarm.is_some(),
+                    worker: options.codex_request_role
+                        == crate::runtime::openai::catalog::CodexRequestRole::Worker,
+                    ..Default::default()
                 };
+                record.set_correlation(
+                    options.trace.session_id(),
+                    tracer.as_ref().map(|t| t.correlation_ids()),
+                );
                 // Non-blocking enqueue onto the session's bounded writer
                 // (Task 11): overflow or a broken log path is counted by
                 // the writer and can never delay or fail the request.
@@ -2570,6 +2718,7 @@ mod tests {
             saw_1h_honored: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             request_has_1h_marker: true,
             usage_counters: None,
+            cache_diagnosis: false,
         }
     }
 
@@ -2602,6 +2751,7 @@ mod tests {
             saw_1h_honored: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             request_has_1h_marker: true,
             usage_counters: None,
+            cache_diagnosis: false,
         }
     }
 
@@ -2626,6 +2776,7 @@ mod tests {
             // carry a 1h marker. The no-marker test overrides this.
             request_has_1h_marker: true,
             usage_counters: None,
+            cache_diagnosis: false,
         }
     }
 
@@ -3151,13 +3302,13 @@ mod tests {
     fn ttft_set_once_on_first_event() {
         let (mut state, tx, _rx) = harness();
         let ctx = make_ctx(&tx);
-        assert!(state.telem_ttft.is_none());
+        assert!(state.first_event_elapsed_ms.is_none());
         feed(
             &[r#"data: {"type":"message_start","message":{"id":"msg_1"}}"#],
             &mut state,
             &ctx,
         );
-        let first = state.telem_ttft;
+        let first = state.first_event_elapsed_ms;
         assert!(first.is_some());
         assert!(state.first_event_seen);
         std::thread::sleep(std::time::Duration::from_millis(5));
@@ -3169,7 +3320,7 @@ mod tests {
             &ctx,
         );
         assert_eq!(
-            state.telem_ttft, first,
+            state.first_event_elapsed_ms, first,
             "TTFT must not be overwritten by later events"
         );
     }
@@ -4140,6 +4291,7 @@ mod tests {
             saw_1h_honored: honored.clone(),
             request_has_1h_marker: false,
             usage_counters: None,
+            cache_diagnosis: false,
         };
         feed(&[DOWNGRADE_START, LIVE_DELTA], &mut state, &ctx);
         assert_eq!(

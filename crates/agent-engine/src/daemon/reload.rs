@@ -15,8 +15,20 @@
 //! policy, auto-compact, …), its keep-warm pin, its lifecycle (a Parked
 //! session comes back Parked), the non-persisted runtime knobs
 //! (`settings_replay`: context window, compaction model, retries,
-//! timeouts, tool-output cap, worker grants, `/system`), and the CURRENT
-//! model/thinking (`/model` mid-session survives).
+//! timeouts, tool-output cap, worker grants, `/system`), the CURRENT
+//! model/thinking (`/model` mid-session survives), and the session's exact
+//! tool activations (pins only, re-validated by the new runtime at its first
+//! turn start — `SessionToolSet::restore_carried`).
+//!
+//! Windows has no `execv`, and a byte-range lock cannot be inherited, so
+//! step 5 is a hand-off between two processes (see `daemon::win`): the old
+//! image starts the new one with the reload-state and a hand-off event; the
+//! new image queues its `daemon.lock` request behind the old one and sets
+//! the event; the old image exits — discarding what an exec would — and its
+//! release grants the queued request, so the liveness oracle never reads
+//! "free". The new image does this before booting anything, then proceeds
+//! exactly as after an exec. Same guarantees, one difference: the pid
+//! changes (clients learn it from the next `Welcome`).
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
@@ -41,6 +53,19 @@ pub const LOCK_FD_ENV: &str = "SYNAPS_DAEMON_LOCK_FD";
 /// `ReloadState::next_subagent_id` (written after the checkpoints): a worker
 /// that ignored its stop could still dispatch in between.
 pub const SUBAGENT_ID_FLOOR_ENV: &str = "SYNAPS_DAEMON_SUBAGENT_ID_FLOOR";
+/// Windows: env naming the event the new image sets once its `daemon.lock`
+/// request is queued behind the old image (which then exits).
+pub const HANDOFF_EVENT_ENV: &str = "SYNAPS_DAEMON_HANDOFF_EVENT";
+/// Windows: env carrying the old image's pid; the new image waits for it to
+/// be gone (and its pipe instances with it) before it binds.
+pub const HANDOFF_PID_ENV: &str = "SYNAPS_DAEMON_HANDOFF_PID";
+/// Windows: how long the old image waits for the new one to queue its lock
+/// request — process start and reading the reload-state; nothing boots first.
+#[cfg(windows)]
+const HANDOFF_ARM_TIMEOUT: Duration = Duration::from_secs(15);
+/// Windows: how long the new image waits for the old one to let go.
+#[cfg(windows)]
+const HANDOFF_EXIT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Env: default drain budget in seconds.
 pub const DRAIN_SECS_ENV: &str = "SYNAPS_DAEMON_RELOAD_DRAIN_SECS";
 const DEFAULT_DRAIN: Duration = Duration::from_secs(30);
@@ -123,6 +148,11 @@ pub struct ReloadSession {
     /// completion wake), handed to the new image (`AdoptWorkers`).
     #[serde(default)]
     pub workers: Vec<crate::runtime::subagent::CarriedWorker>,
+    /// The session's exact tool activations, restored into the new image's
+    /// runtime (re-validated there; see `SessionToolSet::restore_carried`).
+    /// Empty from an older image or a checkpoint that did not confirm.
+    #[serde(default)]
+    pub tool_activations: Vec<crate::tools::activation::CarriedActivation>,
 }
 
 /// `registry_dir()/daemon[-P].reload.json` body.
@@ -321,7 +351,7 @@ fn record(handle: &SessionHandle, rec: Option<SessionReloadRecord>) -> ReloadSes
              no archive is guaranteed and their parent will not be woken"
         );
     }
-    let (config, keep_warm, lifecycle, settings_replay, cache_keepwarm, model, workers) = match rec {
+    let (config, keep_warm, lifecycle, settings_replay, cache_keepwarm, model, workers, tool_activations) = match rec {
         Some(r) => (
             r.config,
             r.keep_warm,
@@ -330,6 +360,7 @@ fn record(handle: &SessionHandle, rec: Option<SessionReloadRecord>) -> ReloadSes
             r.cache_keepwarm,
             r.model,
             r.workers,
+            r.tool_activations,
         ),
         None => (
             SessionConfig {
@@ -341,7 +372,9 @@ fn record(handle: &SessionHandle, rec: Option<SessionReloadRecord>) -> ReloadSes
             env_stripped: Vec::new(),
                 ..SessionConfig::default()
             },
-            false,
+            // The pin is on the handle too, so it survives a reload whose
+            // checkpoint did not confirm.
+            handle.pinned(),
             handle.lifecycle(),
             Vec::new(),
             // Persisted independently of the checkpoint: an explicit
@@ -350,6 +383,8 @@ fn record(handle: &SessionHandle, rec: Option<SessionReloadRecord>) -> ReloadSes
             handle.view().model.clone(),
             // No checkpoint reply: whatever workers ran are lost to the exec
             // without a record (the actor never answered).
+            Vec::new(),
+            // Nor are its tool activations known.
             Vec::new(),
         ),
     };
@@ -371,6 +406,7 @@ fn record(handle: &SessionHandle, rec: Option<SessionReloadRecord>) -> ReloadSes
         cache_keepwarm,
         input_owner_kind: None,
         workers,
+        tool_activations,
     }
 }
 
@@ -501,7 +537,10 @@ pub async fn exec(state: &Arc<DaemonState>, p: Prepared) -> ReloadError {
     )
     .await;
 
+    #[cfg(unix)]
     let err = exec_self(&p.exe, &p.rs_path, state);
+    #[cfg(windows)]
+    let err = exec_successor(&p.exe, &p.rs_path, state).await;
     tracing::error!(error = %err, "daemon: reload exec failed; continuing on the old image");
     // The record before this attempt, whole: exe and started_at too, so the
     // next default reload uses the old exe, not the one that failed.
@@ -586,15 +625,154 @@ fn exec_self(exe: &Path, rs_path: &Path, state: &DaemonState) -> String {
     e.to_string()
 }
 
-#[cfg(not(unix))]
-fn exec_self(_exe: &Path, _rs_path: &Path, _state: &DaemonState) -> String {
-    "reload is unix-only".into()
+/// Windows `execv`: start the new image with the reload-state and a
+/// hand-off event, wait for it to queue its `daemon.lock` request behind
+/// ours, then exit — no destructors (they would unlink the `daemon.json`
+/// that now names the next generation), no session `End` (the new image
+/// rehydrates them): what the exec discards on Unix. Returns only on
+/// failure, with this image intact.
+#[cfg(windows)]
+async fn exec_successor(exe: &Path, rs_path: &Path, state: &DaemonState) -> String {
+    use super::win;
+    let armed = match win::Event::create_unique("handoff") {
+        Ok(e) => e,
+        Err(e) => return format!("hand-off event: {e}"),
+    };
+    let mut args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    if args.is_empty() || args.iter().all(|a| a != "daemon") {
+        args = vec!["daemon".into(), "--foreground".into()];
+    }
+    let mut env = crate::process_scope::inherited_env();
+    env.retain(|(k, _)| k != super::READY_EVENT_ENV);
+    crate::process_scope::set_env(&mut env, "SYNAPS_DAEMON", "1");
+    crate::process_scope::set_env(&mut env, RELOAD_STATE_ENV, rs_path.as_os_str());
+    crate::process_scope::set_env(&mut env, HANDOFF_EVENT_ENV, armed.name());
+    crate::process_scope::set_env(&mut env, HANDOFF_PID_ENV, std::process::id().to_string());
+    crate::process_scope::set_env(&mut env, SUBAGENT_ID_FLOOR_ENV, crate::tools::peek_next_subagent_id().to_string());
+    let child = match win::spawn_detached(exe, &args, &env) {
+        Ok(c) => c,
+        Err(e) => return format!("cannot start {}: {e}", exe.display()),
+    };
+    let waited = tokio::task::spawn_blocking(move || {
+        let outcome = win::wait_event_or_exit(&armed, &child, HANDOFF_ARM_TIMEOUT);
+        (child, outcome)
+    })
+    .await;
+    let (child, outcome) = match waited {
+        Ok(r) => r,
+        Err(e) => return format!("hand-off wait: {e}"),
+    };
+    match outcome {
+        win::Wait::Signalled => {
+            tracing::info!(pid = child.id(), "daemon: reload hand-off armed; this image exits");
+            state.host.flush_logs();
+            std::process::exit(0);
+        }
+        win::Wait::Exited => {
+            let mut child = child;
+            let code = child.wait(Duration::ZERO);
+            let tail = win::stderr_tail(child.take_stderr(), 64 * 1024, Duration::from_millis(500));
+            let why = tail
+                .lines()
+                .map(str::trim)
+                .rfind(|l| !l.is_empty())
+                .map(|l| l.trim_start_matches("synaps daemon: ").to_string())
+                .unwrap_or_else(|| "no output".into());
+            format!(
+                "new image exited (code {}) before taking over: {why}",
+                code.map_or_else(|| "?".to_string(), |c| c.to_string())
+            )
+        }
+        win::Wait::TimedOut => {
+            child.kill();
+            let _ = child.wait(Duration::from_secs(5));
+            format!("new image did not take over within {HANDOFF_ARM_TIMEOUT:?}")
+        }
+    }
+}
+
+/// What a new image adopts: the held lock, the reload-state and its path.
+type Adopted = (DaemonLock, ReloadState, PathBuf);
+
+/// Windows: the hand-off taken at the top of `run_foreground`, held here
+/// for [`adopt_from_env`].
+#[cfg(windows)]
+static TAKEN_OVER: std::sync::Mutex<Option<Adopted>> = std::sync::Mutex::new(None);
+
+/// Windows: take `daemon.lock` over from the previous image now, before
+/// anything boots (the previous image exits on our signal, as the exec
+/// would have replaced it). A no-op unless this is a reload.
+#[cfg(windows)]
+pub fn take_over_from_env(paths: &DaemonPaths) -> anyhow::Result<()> {
+    if let Some(adopted) = handoff_from_env(paths)? {
+        *TAKEN_OVER.lock().unwrap_or_else(|e| e.into_inner()) = Some(adopted);
+    }
+    Ok(())
+}
+
+/// New-image side (`Daemon::start`), Windows: what [`take_over_from_env`]
+/// took, or the hand-off done now.
+#[cfg(windows)]
+pub fn adopt_from_env(paths: &DaemonPaths) -> anyhow::Result<Option<Adopted>> {
+    if let Some(adopted) = TAKEN_OVER.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        return Ok(Some(adopted));
+    }
+    handoff_from_env(paths)
+}
+
+/// Windows hand-off, new-image side: parse the reload-state first (a bad
+/// one fails while the old image can still carry on), queue `daemon.lock`
+/// behind the old image and set its hand-off event, take the grant when it
+/// exits, then wait for its process to be gone. The event is mandatory —
+/// without it the old image would never let go (refuse, as Unix refuses a
+/// reload-state without its lock fd).
+#[cfg(windows)]
+fn handoff_from_env(paths: &DaemonPaths) -> anyhow::Result<Option<Adopted>> {
+    let Some(rs_path) = std::env::var_os(RELOAD_STATE_ENV) else {
+        return Ok(None);
+    };
+    let rs_path = PathBuf::from(rs_path);
+    std::env::remove_var(RELOAD_STATE_ENV);
+    let event = std::env::var(HANDOFF_EVENT_ENV).ok();
+    std::env::remove_var(HANDOFF_EVENT_ENV);
+    let old_pid = std::env::var(HANDOFF_PID_ENV).ok().and_then(|s| s.parse::<u32>().ok());
+    std::env::remove_var(HANDOFF_PID_ENV);
+    let id_floor = std::env::var(SUBAGENT_ID_FLOOR_ENV).ok().and_then(|s| s.parse::<u64>().ok());
+    std::env::remove_var(SUBAGENT_ID_FLOOR_ENV);
+    let event = event.ok_or_else(|| {
+        anyhow::anyhow!("{RELOAD_STATE_ENV} set without {HANDOFF_EVENT_ENV}: refusing to start (the lock is the liveness oracle)")
+    })?;
+    let body = std::fs::read_to_string(&rs_path)?;
+    let mut rs: ReloadState = serde_json::from_str(&body)?;
+    if let Some(floor) = id_floor {
+        rs.next_subagent_id = rs.next_subagent_id.max(floor);
+    }
+    // Opened before the signal, so its pid cannot be reused under us.
+    let old = old_pid.and_then(super::win::Process::open);
+    let mut signal_err = None;
+    let lock = DaemonLock::acquire_handoff(paths, HANDOFF_EXIT_TIMEOUT, || {
+        signal_err = super::win::signal_event(&event).err();
+    })
+    .map_err(|e| match &signal_err {
+        Some(s) => anyhow::anyhow!("taking daemon.lock over: {e} (the previous image was never told: {s})"),
+        None => anyhow::anyhow!("taking daemon.lock over from the previous image: {e}"),
+    })?;
+    if let Some(old) = old {
+        if !old.wait(Duration::from_secs(10)) {
+            tracing::warn!(pid = old_pid, "daemon: the previous image still runs after releasing daemon.lock");
+        }
+    }
+    tracing::info!(generation = rs.generation, "daemon: took daemon.lock over from the previous image");
+    // The previous image read our stderr; it is gone.
+    super::win::detach_stdio();
+    Ok(Some((lock, rs, rs_path)))
 }
 
 /// New-image side (`Daemon::start`): when `RELOAD_STATE_ENV` is set, the
 /// lock is ADOPTED from `LOCK_FD_ENV` (mandatory — refuse to start without
 /// it, risk §6.8) and the recorded generation is returned.
-pub fn adopt_from_env() -> anyhow::Result<Option<(DaemonLock, ReloadState, PathBuf)>> {
+#[cfg(unix)]
+pub fn adopt_from_env(_paths: &DaemonPaths) -> anyhow::Result<Option<Adopted>> {
     let Some(rs_path) = std::env::var_os(RELOAD_STATE_ENV) else {
         return Ok(None);
     };
@@ -627,12 +805,12 @@ pub fn adopt_from_env() -> anyhow::Result<Option<(DaemonLock, ReloadState, PathB
 /// the `SessionLockError::Held` case, where an in-process runtime holds
 /// the journal lock. Instead of aliasing to an empty impostor, register a
 /// Parked placeholder under the SAME id.
-fn is_lock_held_error(e: &str) -> bool {
+pub(crate) fn is_lock_held_error(e: &str) -> bool {
     e.contains("is live in another process")
 }
 
 /// Extract `"pid N (kind)"` from the lock-held error message.
-fn parse_holder_from_error(e: &str) -> String {
+pub(crate) fn parse_holder_from_error(e: &str) -> String {
     // "session X is live in another process (pid N, kind) — …"
     if let Some(start) = e.find("(pid ") {
         let after = &e[start + 1..]; // "pid N, kind) — …"
@@ -681,12 +859,27 @@ pub(crate) async fn send_reload_aborted(h: &SessionHandle, budget: Duration) -> 
     }
 }
 
+/// The config a session is restored with: as saved, except that the
+/// restore never waits on `on_session_start`. Each restored session runs
+/// the hook in the background (the deferred path quick-start sessions
+/// use), so the restore of N sessions does not take N hook round trips
+/// while the socket waits. A session restored Parked runs it only once it
+/// is unparked.
+fn restore_config(saved: &SessionConfig, lifecycle: SessionLifecycle) -> SessionConfig {
+    SessionConfig {
+        await_extensions: false,
+        restore_parked: matches!(lifecycle, SessionLifecycle::Parked | SessionLifecycle::Parking),
+        ..saved.clone()
+    }
+}
+
 pub async fn rehydrate(state: &Arc<DaemonState>, rs: &ReloadState) {
     // Before any session can dispatch: ids continue where the old image
     // stopped, so `sa_1` never names two different workers.
     crate::tools::seed_next_subagent_id(rs.subagent_id_floor());
     for s in &rs.sessions {
-        let created = match state.create(s.config.clone()).await {
+        let config = restore_config(&s.config, s.lifecycle);
+        let created = match state.create(config.clone()).await {
             Ok(h) => Ok(h),
             // F23: journal locked by another process — register a Parked
             // placeholder under the SAME id. No alias, no fresh session.
@@ -710,7 +903,7 @@ pub async fn rehydrate(state: &Arc<DaemonState>, rs: &ReloadState) {
                 state
                     .create(SessionConfig {
                         continue_session: None,
-                        ..s.config.clone()
+                        ..config.clone()
                     })
                     .await
             }
@@ -719,6 +912,19 @@ pub async fn rehydrate(state: &Arc<DaemonState>, rs: &ReloadState) {
         match created {
             Ok(h) => {
                 let new_id = h.id.as_str().to_string();
+                // First, before anything can start a turn: the same
+                // conversation continues in this image, so the grants it
+                // held come with it (re-validated by the new runtime at its
+                // first turn start). A session recreated fresh (journal not
+                // continuable) is a new conversation and inherits none.
+                let continued = h.meta().continued;
+                if continued && !s.tool_activations.is_empty() {
+                    let _ = h
+                        .send(SessionCommand::RestoreToolActivations {
+                            activations: s.tool_activations.clone(),
+                        })
+                        .await;
+                }
                 if new_id != s.id {
                     state
                         .reload_aliases
@@ -756,6 +962,11 @@ pub async fn rehydrate(state: &Arc<DaemonState>, rs: &ReloadState) {
                 }
                 if matches!(s.lifecycle, SessionLifecycle::Parked | SessionLifecycle::Parking) {
                     let _ = h.send(SessionCommand::Park).await;
+                } else {
+                    // Last, after the pin, keep-warm and workers it weighs:
+                    // the old image's park timer died with the exec, and a
+                    // session nobody reconnects to gets no detach to arm one.
+                    let _ = h.send(SessionCommand::ArmPark).await;
                 }
                 tracing::info!(old = %s.id, new = %new_id, lifecycle = ?s.lifecycle, "daemon: session rehydrated after reload");
             }
@@ -767,6 +978,40 @@ pub async fn rehydrate(state: &Arc<DaemonState>, rs: &ReloadState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The session's tool activations ride the reload-state file; a file
+    /// from an older image (no field) reads as none.
+    #[test]
+    fn reload_session_carries_tool_activations() {
+        use crate::tools::activation::{CarriedActivation, CarriedProvenance};
+        let carried = vec![CarriedActivation {
+            tool_id: "builtin:subagent_start".into(),
+            schema_digest: "cd".repeat(32),
+            provenance: CarriedProvenance::BuiltinRuntime,
+        }];
+        let s = ReloadSession {
+            id: "s".into(),
+            journal_id: "j".into(),
+            config: SessionConfig::default(),
+            keep_warm: false,
+            lifecycle: SessionLifecycle::Live,
+            settings_replay: Vec::new(),
+            cache_keepwarm: None,
+            input_owner_kind: None,
+            workers: Vec::new(),
+            tool_activations: carried.clone(),
+        };
+        let v = serde_json::to_value(&s).unwrap();
+        let back: ReloadSession = serde_json::from_value(v.clone()).unwrap();
+        assert_eq!(back.tool_activations, carried);
+        // Never via the create config's wire form.
+        assert!(v["config"].get("restore_tool_activations").is_none());
+
+        let mut older = v;
+        older.as_object_mut().unwrap().remove("tool_activations");
+        let back: ReloadSession = serde_json::from_value(older).unwrap();
+        assert!(back.tool_activations.is_empty());
+    }
 
     /// Reload-state written by an older image (no workers, no counter)
     /// still parses: the new fields default.
@@ -809,6 +1054,7 @@ mod tests {
             cache_keepwarm: None,
             input_owner_kind: None,
             workers,
+            tool_activations: Vec::new(),
         };
         let mut rs = ReloadState {
             generation: 10,
@@ -872,6 +1118,37 @@ mod tests {
         assert_eq!(validate_exe(&l).unwrap(), f.canonicalize().unwrap());
     }
 
+    /// A restored session never waits on `on_session_start` at create; the
+    /// rest of its saved config is kept. One restored Parked defers the hook
+    /// to its unpark, and that flag never goes on the wire.
+    #[test]
+    fn a_restore_does_not_wait_on_the_session_start_hook() {
+        let saved = SessionConfig {
+            model_override: Some("claude-sonnet-4-5".into()),
+            keep_warm: true,
+            await_extensions: true,
+            ..Default::default()
+        };
+        let restored = restore_config(&saved, SessionLifecycle::Live);
+        assert!(!restored.await_extensions);
+        assert!(!restored.restore_parked);
+        let as_saved = SessionConfig {
+            await_extensions: true,
+            ..restored
+        };
+        assert_eq!(
+            serde_json::to_value(&as_saved).unwrap(),
+            serde_json::to_value(&saved).unwrap()
+        );
+        for parked in [SessionLifecycle::Parked, SessionLifecycle::Parking] {
+            let restored = restore_config(&saved, parked);
+            assert!(restored.restore_parked, "{parked:?}");
+            assert!(!restored.await_extensions);
+            let wire = serde_json::to_value(&restored).unwrap();
+            assert!(wire.get("restore_parked").is_none(), "never on the wire");
+        }
+    }
+
     #[test]
     fn reload_state_path_follows_profile() {
         let d = tempfile::tempdir().unwrap();
@@ -896,6 +1173,19 @@ mod tests {
         assert_eq!(record(&handle, None).cache_keepwarm.as_deref(), Some("off"));
         *ep.cache_keepwarm.lock().unwrap() = Some(CacheKeepWarm::Hours(6));
         assert_eq!(record(&handle, None).cache_keepwarm.as_deref(), Some("6h"));
+    }
+
+    /// Likewise the pin: an unconfirmed checkpoint must not unpin a
+    /// session (it would park, and stop holding the daemon's idle exit).
+    #[test]
+    fn the_pin_survives_an_unconfirmed_checkpoint() {
+        use crate::session::handle::echo::{meta_for, view_for};
+        let id = crate::session::SessionId("pin-reload".into());
+        let (handle, ep) = SessionHandle::new(meta_for(&id), view_for());
+        assert!(!record(&handle, None).keep_warm);
+        ep.keep_warm.store(true, std::sync::atomic::Ordering::Release);
+        let r = record(&handle, None);
+        assert!(r.keep_warm && r.config.keep_warm);
     }
 
     /// A `memory_mode` this image does not know (written by a newer one)
@@ -932,6 +1222,25 @@ mod tests {
         }))
         .expect("the reload state still parses");
         assert_eq!(rs.sessions[0].config.memory_mode, Some(SessionMemoryMode::Off));
+    }
+
+    /// The restore without the hook wait keeps #255's `/memory` carry: the
+    /// session's recorded choice rides in the saved config, Parked or not.
+    #[test]
+    fn a_restore_keeps_the_sessions_memory_choice() {
+        use crate::session::SessionMemoryMode;
+        for mode in [Some(SessionMemoryMode::Off), Some(SessionMemoryMode::CaptureOnly), None] {
+            let saved = SessionConfig {
+                memory_mode: mode,
+                await_extensions: true,
+                ..Default::default()
+            };
+            for lifecycle in [SessionLifecycle::Live, SessionLifecycle::Parked, SessionLifecycle::Parking] {
+                let restored = restore_config(&saved, lifecycle);
+                assert_eq!(restored.memory_mode, mode, "{lifecycle:?}");
+                assert!(!restored.await_extensions, "{lifecycle:?}");
+            }
+        }
     }
 
     /// Likewise the session's `/memory` choice: a reload without a

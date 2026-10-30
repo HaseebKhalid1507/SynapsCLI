@@ -16,6 +16,10 @@
 //! environment, inherited fds and stdio. Group cleanup covers descendants that
 //! remain in that group. Each launch first performs a bounded fresh probe.
 //!
+//! Command arguments are passed verbatim: where systemd-run supports it
+//! (systemd >= 254, from a cached `--version`), `--expand-environment=no`
+//! stops it from substituting `${NAME}` in tool scripts before exec.
+//!
 //! Used only when it is available (Linux, a reachable systemd user manager)
 //! and not turned off (`process_scopes = off` in config, or
 //! `SYNAPS_PROCESS_SCOPES=off`). Otherwise commands start exactly as before.
@@ -29,6 +33,41 @@ use std::sync::OnceLock;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScopeLauncher {
     systemd_run: PathBuf,
+    /// Pass `--expand-environment=no`. Only set when the binary is known to
+    /// accept it (systemd >= 254); an unknown option would fail every launch.
+    no_expand: bool,
+}
+
+/// First systemd release whose systemd-run knows `--expand-environment=`.
+///
+/// systemd NEWS: v254 added the switch and, for `--scope` only, left
+/// expansion off by default (with a warning); v258 turned it on for scopes
+/// too, so systemd-run itself rewrites `${NAME}`/`$NAME` in the command
+/// arguments before exec. Releases before 254 never expanded scope commands
+/// (a scope has no ExecStart for the manager to expand), so omitting the flag
+/// there keeps arguments verbatim.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))] // read by the Linux probe; tested everywhere
+const EXPAND_ENVIRONMENT_SINCE: u32 = 254;
+
+/// systemd-run options shared by real launches and the probe, so the probe
+/// also proves the exact option set is accepted.
+fn scope_options(description: &str, no_expand: bool) -> Vec<OsString> {
+    let mut argv: Vec<OsString> = vec![
+        "--user".into(),
+        "--scope".into(),
+        "--quiet".into(),
+        // Garbage-collect the unit even if the command fails, so failed
+        // commands do not accumulate as failed units.
+        "--collect".into(),
+    ];
+    if no_expand {
+        // Arguments are data: tool scripts contain literal `${...}` (shell
+        // parameter expansion, JS template literals) that systemd-run would
+        // otherwise substitute from its own environment.
+        argv.push("--expand-environment=no".into());
+    }
+    argv.push(format!("--description={description}").into());
+    argv
 }
 
 impl ScopeLauncher {
@@ -40,20 +79,28 @@ impl ScopeLauncher {
         program: impl Into<OsString>,
         args: impl IntoIterator<Item = OsString>,
     ) -> (OsString, Vec<OsString>) {
-        let mut argv: Vec<OsString> = vec![
-            "--user".into(),
-            "--scope".into(),
-            "--quiet".into(),
-            // Garbage-collect the unit even if the command fails, so failed
-            // commands do not accumulate as failed units.
-            "--collect".into(),
-            format!("--description={description}").into(),
-            "--".into(),
-            program.into(),
-        ];
+        let mut argv = scope_options(description, self.no_expand);
+        argv.push("--".into());
+        argv.push(program.into());
         argv.extend(args);
         (self.systemd_run.clone().into_os_string(), argv)
     }
+}
+
+/// Major version from `systemd-run --version` ("systemd 259 (259.5-1)").
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))] // read by the Linux probe; tested everywhere
+fn parse_systemd_version(output: &str) -> Option<u32> {
+    let rest = output.lines().next()?.trim().strip_prefix("systemd ")?;
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse().ok()
+}
+
+/// Whether to pass `--expand-environment=no`; `None` if the version could not
+/// be determined, in which case scopes are not used at all: the flag may be
+/// required (>= 258) yet cannot be known to be accepted.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))] // read by the Linux probe; tested everywhere
+fn no_expand_for_version(version: Option<u32>) -> Option<bool> {
+    version.map(|v| v >= EXPAND_ENVIRONMENT_SINCE)
 }
 
 /// `true` unless turned off. The environment variable wins over config so it
@@ -86,24 +133,55 @@ fn find_systemd_run() -> Option<PathBuf> {
         .find(|p| p.is_file())
 }
 
-/// Start only a throwaway scope, with the exact child environment and cwd.
-/// Bounded to three seconds; on timeout kill and reap the probe child.
+/// Start only a throwaway scope, with the exact child environment and cwd and
+/// the same options real launches use. Bounded to three seconds.
 #[cfg(target_os = "linux")]
 fn probe(
     systemd_run: &std::path::Path,
+    no_expand: bool,
     env: &[(OsString, OsString)],
     cwd: Option<&std::path::Path>,
 ) -> bool {
-    use std::time::{Duration, Instant};
     if !env
         .iter()
         .any(|(k, v)| (k == "XDG_RUNTIME_DIR" || k == "DBUS_SESSION_BUS_ADDRESS") && !v.is_empty())
     {
         return false;
     }
-    use std::os::unix::process::CommandExt;
     let mut cmd = std::process::Command::new(systemd_run);
-    // Probe descendants must not survive a timeout. No real payload runs here.
+    cmd.env_clear().envs(env.iter().cloned());
+    if let Some(cwd) = cwd {
+        cmd.current_dir(cwd);
+    }
+    cmd.args(scope_options("synaps scope probe", no_expand))
+        .args(["--", "/bin/true"])
+        .stdout(std::process::Stdio::null());
+    run_bounded(cmd).is_some_and(|(status, _)| status.success())
+}
+
+/// `systemd-run --version`, bounded like the probe. Touches no manager.
+#[cfg(target_os = "linux")]
+fn systemd_run_version(systemd_run: &std::path::Path) -> Option<u32> {
+    let mut cmd = std::process::Command::new(systemd_run);
+    cmd.env_clear()
+        .env("LC_ALL", "C")
+        .env("SYSTEMD_PAGER", "")
+        .arg("--version")
+        .stdout(std::process::Stdio::piped());
+    let (status, stdout) = run_bounded(cmd)?;
+    status.success().then_some(())?;
+    parse_systemd_version(&String::from_utf8_lossy(&stdout))
+}
+
+/// Run a short helper command in its own session with null stdin/stderr.
+/// Returns its status and (if piped) stdout, or `None` on spawn failure or
+/// after three seconds, when the whole group is killed and reaped off-path.
+#[cfg(target_os = "linux")]
+fn run_bounded(mut cmd: std::process::Command) -> Option<(std::process::ExitStatus, Vec<u8>)> {
+    use std::io::Read;
+    use std::os::unix::process::CommandExt;
+    use std::time::{Duration, Instant};
+    // Helper descendants must not survive a timeout. No real payload runs here.
     unsafe {
         cmd.pre_exec(|| {
             if libc::setsid() < 0 {
@@ -112,31 +190,22 @@ fn probe(
             Ok(())
         });
     }
-    cmd.env_clear().envs(env.iter().cloned());
-    if let Some(cwd) = cwd {
-        cmd.current_dir(cwd);
-    }
-    let Ok(mut child) = cmd
-        .args([
-            "--user",
-            "--scope",
-            "--quiet",
-            "--collect",
-            "--description=synaps scope probe",
-            "--",
-            "/bin/true",
-        ])
+    let mut child = cmd
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
-    else {
-        return false;
-    };
+        .ok()?;
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
         match child.try_wait() {
-            Ok(Some(status)) => return status.success(),
+            Ok(Some(status)) => {
+                // Output is tiny (a version line), well under a pipe buffer.
+                let mut out = Vec::new();
+                if let Some(mut stdout) = child.stdout.take() {
+                    let _ = stdout.by_ref().take(64 * 1024).read_to_end(&mut out);
+                }
+                return Some((status, out));
+            }
             Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
             _ => {
                 // Signal before any reap; the unreaped leader pins this ID.
@@ -153,7 +222,7 @@ fn probe(
                 std::thread::spawn(move || {
                     let _ = child.wait();
                 });
-                return false;
+                return None;
             }
         }
     }
@@ -187,11 +256,21 @@ pub fn launcher_for_effective_env(
     {
         static BINARY: OnceLock<Option<PathBuf>> = OnceLock::new();
         let binary = BINARY.get_or_init(find_systemd_run).as_ref()?;
-        launcher_with_binary(binary, env, cwd)
+        // A property of the binary, not of manager availability: cache only a
+        // determined answer. Unknown means no scope rather than a guess.
+        static NO_EXPAND: OnceLock<bool> = OnceLock::new();
+        let no_expand = match NO_EXPAND.get() {
+            Some(v) => *v,
+            None => {
+                let v = no_expand_for_version(systemd_run_version(binary))?;
+                *NO_EXPAND.get_or_init(|| v)
+            }
+        };
+        launcher_with_binary(binary, no_expand, env, cwd)
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = cwd;
+        let _ = (env, cwd);
         None
     }
 }
@@ -199,11 +278,13 @@ pub fn launcher_for_effective_env(
 #[cfg(target_os = "linux")]
 fn launcher_with_binary(
     binary: &std::path::Path,
+    no_expand: bool,
     env: &[(OsString, OsString)],
     cwd: Option<&std::path::Path>,
 ) -> Option<ScopeLauncher> {
-    probe(binary, env, cwd).then(|| ScopeLauncher {
+    probe(binary, no_expand, env, cwd).then(|| ScopeLauncher {
         systemd_run: binary.to_owned(),
+        no_expand,
     })
 }
 
@@ -251,6 +332,8 @@ pub fn resolve_program(
             }
         }
     }
+    #[cfg(not(unix))]
+    let _ = (env, cwd);
     Err(std::io::Error::new(
         std::io::ErrorKind::NotFound,
         format!("program not found in child PATH: {program:?}"),
@@ -261,17 +344,44 @@ pub fn resolve_program(
 mod tests {
     use super::*;
 
-    #[test]
-    fn wrap_puts_the_command_after_systemd_run_options() {
+    fn wrapped(no_expand: bool, script: &str) -> (OsString, Vec<String>) {
         let l = ScopeLauncher {
             systemd_run: PathBuf::from("/usr/bin/systemd-run"),
+            no_expand,
         };
-        let (program, args) = l.wrap("synaps tool: bash", "bash", ["-c".into(), "echo hi".into()]);
-        assert_eq!(program, OsString::from("/usr/bin/systemd-run"));
-        let args: Vec<String> = args
+        let (program, args) = l.wrap("synaps tool: bash", "bash", ["-c".into(), script.into()]);
+        let args = args
             .iter()
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
+        (program, args)
+    }
+
+    #[test]
+    fn wrap_disables_expansion_when_systemd_run_supports_it() {
+        let (program, args) = wrapped(true, "echo 'D:${x}' $HOME");
+        assert_eq!(program, OsString::from("/usr/bin/systemd-run"));
+        assert_eq!(
+            args,
+            [
+                "--user",
+                "--scope",
+                "--quiet",
+                "--collect",
+                "--expand-environment=no",
+                "--description=synaps tool: bash",
+                "--",
+                "bash",
+                "-c",
+                "echo 'D:${x}' $HOME",
+            ]
+        );
+    }
+
+    #[test]
+    fn wrap_never_passes_the_flag_to_a_systemd_run_without_it() {
+        let (program, args) = wrapped(false, "echo hi");
+        assert_eq!(program, OsString::from("/usr/bin/systemd-run"));
         assert_eq!(
             args,
             [
@@ -285,6 +395,102 @@ mod tests {
                 "-c",
                 "echo hi",
             ]
+        );
+        assert!(!args.iter().any(|a| a.starts_with("--expand-environment")));
+    }
+
+    #[test]
+    fn version_decides_the_flag_and_unknown_versions_decide_nothing() {
+        assert_eq!(
+            parse_systemd_version("systemd 259 (259.5-0ubuntu3.4)\n+PAM +AUDIT"),
+            Some(259)
+        );
+        assert_eq!(parse_systemd_version("systemd 254 (254.5-1)"), Some(254));
+        assert_eq!(parse_systemd_version("systemd 249\n"), Some(249));
+        assert_eq!(parse_systemd_version("systemd 219"), Some(219));
+        assert_eq!(parse_systemd_version(""), None);
+        assert_eq!(parse_systemd_version("something else 300"), None);
+        assert_eq!(parse_systemd_version("systemd x"), None);
+        assert_eq!(no_expand_for_version(Some(259)), Some(true));
+        assert_eq!(no_expand_for_version(Some(254)), Some(true));
+        assert_eq!(no_expand_for_version(Some(253)), Some(false));
+        assert_eq!(no_expand_for_version(Some(219)), Some(false));
+        assert_eq!(no_expand_for_version(None), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn version_query_and_probe_use_exactly_the_launch_options() {
+        let dir = tempfile::tempdir().unwrap();
+        // An old systemd-run: rejects the unknown option like the real one.
+        let binary = fake_script(
+            dir.path(),
+            "systemd-run",
+            r#"
+[ "$1" = --version ] && { echo 'systemd 249 (249.11-0ubuntu3)'; exit 0; }
+for a in "$@"; do case "$a" in --expand-environment=*) exit 1;; --) break;; esac; done
+exit 0
+"#,
+        );
+        assert_eq!(systemd_run_version(&binary), Some(249));
+        let env = vec![("DBUS_SESSION_BUS_ADDRESS".into(), "fake:good".into())];
+        assert!(launcher_with_binary(&binary, false, &env, None).is_some());
+        // Had support been misjudged, the probe fails: direct launch, never a
+        // wrapped launch with an option the binary rejects.
+        assert!(launcher_with_binary(&binary, true, &env, None).is_none());
+        fake_script(dir.path(), "systemd-run", "exit 1");
+        assert_eq!(systemd_run_version(&binary), None);
+        fake_script(dir.path(), "systemd-run", "echo 'systemd 258 (258)'");
+        assert_eq!(systemd_run_version(&binary), Some(258));
+    }
+
+    /// Real systemd-run and user manager; skipped where either is missing.
+    /// A literal `${x}` must reach the program unchanged even though `x` is
+    /// set in the child environment (systemd >= 258 expands it by default).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn real_scope_passes_dollar_braces_through_verbatim() {
+        if std::env::var("SYNAPS_PROCESS_SCOPES").is_ok_and(|v| !enabled_from(Some(&v), true)) {
+            eprintln!("skip: SYNAPS_PROCESS_SCOPES is off");
+            return;
+        }
+        let Some(binary) = find_systemd_run() else {
+            eprintln!("skip: no systemd-run");
+            return;
+        };
+        let Some(no_expand) = no_expand_for_version(systemd_run_version(&binary)) else {
+            eprintln!("skip: systemd-run --version unusable");
+            return;
+        };
+        let mut env = inherited_env();
+        set_env(&mut env, "x", "EXPANDED");
+        let Some(launcher) = launcher_with_binary(&binary, no_expand, &env, None) else {
+            eprintln!("skip: no reachable systemd user manager");
+            return;
+        };
+        let payload = ["D:${x}", "$x", "'${x:-dflt}'", "`${a}${b}`", "$$", "${}"];
+        let mut args: Vec<OsString> =
+            vec!["-c".into(), "printf '%s\\n' \"$@\"".into(), "sh".into()];
+        args.extend(payload.iter().map(OsString::from));
+        let (program, argv) = launcher.wrap("synaps test: no expand", "/bin/sh", args);
+        let out = std::process::Command::new(program)
+            .args(argv)
+            .env_clear()
+            .envs(env)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8(out.stdout).unwrap();
+        assert_eq!(stdout.lines().collect::<Vec<_>>(), payload);
+        assert!(
+            !String::from_utf8_lossy(&out.stderr).contains("environment variable"),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
         );
     }
 
@@ -356,16 +562,16 @@ exit 0
             set_env(&mut env, k, v);
         }
         set_env(&mut env, "EXPECTED_CWD", dir.path().as_os_str());
-        assert!(launcher_with_binary(&binary, &env, Some(dir.path())).is_some());
+        assert!(launcher_with_binary(&binary, true, &env, Some(dir.path())).is_some());
         set_env(&mut env, "DBUS_SESSION_BUS_ADDRESS", "fake:stale");
-        assert!(launcher_with_binary(&binary, &env, Some(dir.path())).is_none());
+        assert!(launcher_with_binary(&binary, true, &env, Some(dir.path())).is_none());
         set_env(&mut env, "DBUS_SESSION_BUS_ADDRESS", "fake:good");
-        assert!(launcher_with_binary(&binary, &env, Some(dir.path())).is_some());
+        assert!(launcher_with_binary(&binary, true, &env, Some(dir.path())).is_some());
         // Same discovered path, changed availability: no cached positive.
         fake_script(dir.path(), "systemd-run", "exit 1");
-        assert!(launcher_with_binary(&binary, &env, Some(dir.path())).is_none());
+        assert!(launcher_with_binary(&binary, true, &env, Some(dir.path())).is_none());
         env.retain(|(k, _)| k != "DBUS_SESSION_BUS_ADDRESS");
-        assert!(!probe(&binary, &env, Some(dir.path())));
+        assert!(!probe(&binary, true, &env, Some(dir.path())));
     }
 
     #[cfg(target_os = "linux")]
@@ -395,7 +601,7 @@ printf 'wrapper=%s\n' "$$"
                     if started { "exec \"$@\"" } else { "exit 42" }
                 ),
             );
-            let launcher = launcher_with_binary(&binary, &env, Some(dir.path())).unwrap();
+            let launcher = launcher_with_binary(&binary, true, &env, Some(dir.path())).unwrap();
             let (program, args) = launcher.wrap("test", command.as_os_str(), []);
             let mut child = Command::new(program)
                 .args(args)

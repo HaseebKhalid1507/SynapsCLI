@@ -54,8 +54,9 @@ pub fn stop_reason_from_wire(raw: &str) -> StopReason {
 
 /// Build the structural description of one Anthropic request.
 ///
-/// `sent_bytes` MUST be the exact buffer handed to reqwest — wire length and
-/// digest come from it directly, never from re-serialization. When `key` is
+/// `sent_bytes` MUST be the exact JSON payload handed to reqwest, before any
+/// `Content-Encoding` — wire length and digest come from it directly, never
+/// from re-serialization. When `key` is
 /// `None` (digest key unavailable) all digest-bearing sections (`wire`,
 /// `system_segments`, `tools`, cache prefixes/delta) are omitted; counts in
 /// `anatomy` remain. `snapshots`, when provided, is the session's
@@ -241,6 +242,7 @@ fn cache_meta(
         system_prefix: None,
         history_tail: None,
         delta: None,
+        server_diagnosis: None,
     }
 }
 

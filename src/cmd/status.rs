@@ -341,23 +341,20 @@ fn absolute_time(at_ms: u64) -> String {
         .unwrap_or_else(|| "?".into())
 }
 
-fn bar(percent: Option<f64>) -> String {
+fn bar(percent: f64) -> String {
     const WIDTH: usize = 30;
-    match percent {
-        Some(p) => {
-            let filled = ((p / 100.0) * WIDTH as f64)
-                .round()
-                .clamp(0.0, WIDTH as f64) as usize;
-            format!("{}{}", "█".repeat(filled), "░".repeat(WIDTH - filled))
-        }
-        None => "?".repeat(WIDTH),
-    }
+    let filled = ((percent / 100.0) * WIDTH as f64)
+        .round()
+        .clamp(0.0, WIDTH as f64) as usize;
+    format!("{}{}", "█".repeat(filled), "░".repeat(WIDTH - filled))
 }
 
 fn window_title(w: &UsageWindow) -> String {
     let scope = match &w.scope {
         WindowScope::Account => String::new(),
         WindowScope::Model { model } => format!(" · model {model}"),
+        // A feature window named after its feature (`extra_usage`) has one title.
+        WindowScope::Feature { feature } if *feature == w.id => String::new(),
         WindowScope::Feature { feature } => format!(" · {feature}"),
     };
     let label = if w.label == w.id || w.label == "unknown" {
@@ -369,7 +366,12 @@ fn window_title(w: &UsageWindow) -> String {
 }
 
 fn render_window(out: &mut String, w: &UsageWindow, now_ms: u64) {
-    let percent = w.used_percent.valid();
+    // No gauge for an unknown reading: a row of '?' adds nothing to the
+    // "unknown (reason)" text beside it.
+    let gauge = match w.used_percent.valid() {
+        Some(p) => format!("{} ", bar(p)),
+        None => String::new(),
+    };
     let percent_text = match &w.used_percent {
         UsedPercent::Valid { percent } => format!("{percent:.0}%"),
         UsedPercent::Unknown { reason } => format!("unknown ({reason})"),
@@ -380,7 +382,7 @@ fn render_window(out: &mut String, w: &UsageWindow, now_ms: u64) {
     };
     let flag = if w.is_exhausted() { "  EXHAUSTED" } else { "" };
     out.push_str(&format!("    {}\n", window_title(w)));
-    out.push_str(&format!("    {} {}{}\n", bar(percent), percent_text, flag));
+    out.push_str(&format!("    {gauge}{percent_text}{flag}\n"));
     out.push_str(&format!("    {reset}\n"));
 }
 
@@ -526,6 +528,7 @@ fn compact_window(w: &UsageWindow, now_ms: u64) -> String {
     };
     let scope = match &w.scope {
         WindowScope::Model { model } => format!(" · {model}"),
+        WindowScope::Feature { feature } if *feature == w.id => String::new(),
         WindowScope::Feature { feature } => format!(" · {feature}"),
         WindowScope::Account => String::new(),
     };
@@ -1173,7 +1176,8 @@ mod usage_tests {
         assert!(!text.contains("extra_usage"));
         assert!(!text.contains("note:"));
         assert!(!text.contains("auth identify"));
-        assert!(render_verbose(&report, T0).contains("extra_usage"));
+        // extra_usage is off on this account: no row in either view.
+        assert!(!render_verbose(&report, T0).contains("extra_usage"));
         if let AccountUsageOutcome::Ok { snapshot } = &mut report.accounts[0].outcome {
             snapshot.spend_control_reached = Some(true);
             snapshot.limit_reached = Some(true);
@@ -1185,6 +1189,44 @@ mod usage_tests {
         assert!(text.contains("Spend control reached"));
         assert!(text.contains("Account limit reached"));
         assert!(text.contains("Provider schema unverified"));
+    }
+
+    /// An account without extra usage enabled shows no extra_usage
+    /// line at all. An enabled one shows a single title, and an unknown
+    /// reading draws no row of '?'.
+    #[test]
+    fn extra_usage_shows_only_when_enabled_with_one_title_and_unknown_draws_no_gauge() {
+        let entry = |body: &str| AccountUsageEntry {
+            provider: "anthropic".into(),
+            account: "work".into(),
+            identity: None,
+            outcome: AccountUsageOutcome::ok(parse_anthropic_usage(body, "work", T0).unwrap()),
+        };
+        let mut report = UsageReport::new("local", T0);
+        report.accounts.push(entry(
+            r#"{"five_hour": {"utilization": 10, "resets_at": "2025-09-20T22:00:00Z"},
+                "seven_day": {"utilization": null, "resets_at": null},
+                "extra_usage": {"is_enabled": false, "monthly_limit": null, "used_credits": null, "utilization": null}}"#,
+        ));
+        let off = render_verbose(&report, T0);
+        assert!(!off.contains("extra_usage"), "{off}");
+        assert!(off.contains("\n    unknown (null)\n"), "{off}");
+        assert!(!off.contains("??"), "{off}");
+        assert!(!render_text(&report, T0).contains("extra_usage"));
+        report.accounts[0] = entry(
+            r#"{"five_hour": {"utilization": 10, "resets_at": "2025-09-20T22:00:00Z"},
+                "extra_usage": {"is_enabled": true, "monthly_limit": 5000, "used_credits": 5000, "utilization": 100}}"#,
+        );
+        let on = render_verbose(&report, T0);
+        assert!(on.contains("\n    extra_usage\n"), "{on}");
+        assert!(!on.contains("extra_usage · extra_usage"), "{on}");
+        assert!(on.contains("100%  EXHAUSTED"), "{on}");
+        let compact = render_text(&report, T0);
+        assert!(
+            compact.contains("extra_usage: 100% used · reset unknown · EXHAUSTED"),
+            "{compact}"
+        );
+        assert!(!compact.contains("extra_usage · extra_usage"), "{compact}");
     }
 
     #[test]
@@ -1203,10 +1245,9 @@ mod usage_tests {
         assert_eq!(relative_time(T0, T0 + 26 * 3600 * 1000), "resets in 1d 2h");
         assert_eq!(relative_time(T0, T0 + 5 * 60 * 1000), "resets in 5m");
         assert_eq!(absolute_time(T0), "2025-09-20 20:26 UTC");
-        assert_eq!(bar(Some(0.0)).chars().filter(|c| *c == '█').count(), 0);
-        assert_eq!(bar(Some(50.0)).chars().filter(|c| *c == '█').count(), 15);
-        assert_eq!(bar(Some(100.0)).chars().filter(|c| *c == '█').count(), 30);
-        assert_eq!(bar(None), "?".repeat(30));
+        assert_eq!(bar(0.0).chars().filter(|c| *c == '█').count(), 0);
+        assert_eq!(bar(50.0).chars().filter(|c| *c == '█').count(), 15);
+        assert_eq!(bar(100.0).chars().filter(|c| *c == '█').count(), 30);
     }
 
     #[test]

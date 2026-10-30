@@ -53,7 +53,7 @@ async fn mirror_is_read_only_takeover_steals_owner_may_end() {
         &paths,
         ClientKind::Tui,
         Attach::Create {
-            config: SessionConfig { cwd: Some(guard.home.path().to_path_buf()), model_override: Some("claude-sonnet-4-5".into()), persist: false, ..Default::default() },
+            config: SessionConfig { cwd: Some(guard.home.path().to_path_buf()), model_override: Some("claude-sonnet-4-5".into()), persist: false, client_input: Some(ClientInput::Exclusive), ..Default::default() },
             mode: AttachMode::Mirror,
         },
     )
@@ -119,4 +119,159 @@ async fn mirror_is_read_only_takeover_steals_owner_may_end() {
 
     d.shutdown_token().cancel();
     d.wait().await;
+}
+
+/// Client names over the wire (spec multi-client-sessions §4): the session
+/// resolves `--as` names (dedup `-2`, kind default), every client's
+/// snapshot and the listing carry the roster, `ClientJoined` decodes with
+/// name and mode, a refusal names the owner, and the daemon refuses an
+/// invalid name at the handshake.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn clients_are_named_in_the_roster_listing_and_refusals() {
+    let guard = HomeGuard::new();
+    let (url, _hits, _) = spawn_stub(Script::Sse(ANTHROPIC_SSE)).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let run = guard.base_dir().join("run");
+    let d = start(&run).await;
+    let paths = d.paths.clone();
+    let named = |kind: ClientKind, name: Option<&str>| Hello::new(kind).with_name(name.map(str::to_string));
+
+    let conn = SocketTransport::connect(&paths.sock, named(ClientKind::Tui, Some("terminal"))).await.unwrap();
+    let (mut a, snap_a) = SocketTransport::attach(
+        conn,
+        Attach::Create {
+            config: SessionConfig { cwd: Some(guard.home.path().to_path_buf()), model_override: Some("claude-sonnet-4-5".into()), persist: false, client_input: Some(ClientInput::Exclusive), ..Default::default() },
+            mode: AttachMode::Mirror,
+        },
+    )
+    .await
+    .unwrap();
+    let sid = a.session_id().clone();
+    assert_eq!(snap_a.roster.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["terminal"]);
+
+    // A second "terminal" (any case) is told its resolved name; an observer
+    // with no name gets its kind's.
+    let conn = SocketTransport::connect(&paths.sock, named(ClientKind::Tui, Some("Terminal"))).await.unwrap();
+    let (mut b, snap_b) =
+        SocketTransport::attach(conn, Attach::Existing { session_id: sid.clone(), mode: AttachMode::Mirror }).await.unwrap();
+    let conn = SocketTransport::connect(&paths.sock, named(ClientKind::Attach, None)).await.unwrap();
+    let (_o, snap_o) =
+        SocketTransport::attach(conn, Attach::Existing { session_id: sid.clone(), mode: AttachMode::Observe }).await.unwrap();
+    assert_eq!(snap_b.roster.iter().find(|c| c.id == b.client_id()).unwrap().name, "Terminal-2");
+    let names: Vec<(&str, AttachMode)> = snap_o.roster.iter().map(|c| (c.name.as_str(), c.mode)).collect();
+    assert_eq!(names, [("terminal", AttachMode::Mirror), ("Terminal-2", AttachMode::Mirror), ("attach", AttachMode::Observe)]);
+    assert_eq!(
+        snap_b.input_owned_elsewhere(b.client_id()).unwrap(),
+        format!("input is owned by terminal (#{}); attach with --takeover to steal it", a.client_id().0)
+    );
+
+    // The owner learns each joiner by name and mode, and its roster follows.
+    let ev = until(&mut a, |e| matches!(e, SessionEventWire::ClientJoined { kind: ClientKind::Attach, .. })).await;
+    assert!(
+        matches!(&ev, SessionEventWire::ClientJoined { name, mode: AttachMode::Observe, .. } if name == "attach"),
+        "{ev:?}"
+    );
+    assert_eq!(a.roster().clients().len(), 3);
+    assert_eq!(a.roster().label(b.client_id()), format!("Terminal-2 (#{})", b.client_id().0));
+
+    // A non-owner's refusal names the owner (and keeps its id).
+    b.send_from_self(SessionCommand::Submit { text: "from b".into(), attachments: vec![] }).await.unwrap();
+    let r = until(&mut b, |e| matches!(e, SessionEventWire::Refused { .. })).await;
+    let SessionEventWire::Refused { reason, .. } = r else { unreachable!() };
+    assert_eq!(reason, format!("input owned by terminal (#{})", a.client_id().0));
+
+    // `daemon sessions` sees the roster.
+    let list = SocketTransport::sessions(&paths.sock).await.unwrap();
+    let roster: Vec<&str> = list[0].roster.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(roster, ["terminal", "Terminal-2", "attach"]);
+
+    // An invalid name never gets past the handshake.
+    match SocketTransport::connect(&paths.sock, named(ClientKind::Tui, Some("no spaces"))).await {
+        Err(e) => assert!(e.to_string().contains("invalid client name"), "{e}"),
+        Ok(_) => panic!("an invalid name was accepted"),
+    }
+
+    d.shutdown_token().cancel();
+    d.wait().await;
+}
+
+/// `client_input = shared` over the wire (multi-client-sessions §6): the
+/// snapshot says so, a second mirror's input runs, and the move of the
+/// active marker reaches a current client as `reason: Input`. An older
+/// client (no `owner_reason_input`) knows only the owner rule, so it is
+/// presented as owning input and never sees an owner change; and its input
+/// runs too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn shared_input_over_the_wire_and_older_clients_are_presented_owners() {
+    let guard = HomeGuard::new();
+    let (url, _hits, _) = spawn_stub(Script::Sse(ANTHROPIC_SSE)).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let run = guard.base_dir().join("run");
+    let d = start(&run).await;
+    let paths = d.paths.clone();
+
+    let (mut a, snap) = attach(
+        &paths,
+        ClientKind::Tui,
+        Attach::Create {
+            config: SessionConfig { cwd: Some(guard.home.path().to_path_buf()), model_override: Some("claude-sonnet-4-5".into()), persist: false, client_input: Some(ClientInput::Shared), ..Default::default() },
+            mode: AttachMode::Mirror,
+        },
+    )
+    .await;
+    assert_eq!(snap.client_input, ClientInput::Shared);
+    let sid = a.session_id().clone();
+    let a_id = a.client_id();
+
+    // An older client: it declares no `owner_reason_input`.
+    let mut old_hello = Hello::new(ClientKind::Attach);
+    old_hello.client.capabilities.owner_reason_input = false;
+    let conn = SocketTransport::connect(&paths.sock, old_hello).await.unwrap();
+    let (mut old, snap_old) = SocketTransport::attach(conn, Attach::Existing { session_id: sid.clone(), mode: AttachMode::Mirror }).await.unwrap();
+    assert_eq!(snap_old.input_owner, Some(old.client_id()), "presented as the owner");
+    assert_eq!(snap_old.input_owned_elsewhere(old.client_id()), None);
+    let (mut b, snap_b) = attach(&paths, ClientKind::Attach, Attach::Existing { session_id: sid.clone(), mode: AttachMode::Mirror }).await;
+    assert_eq!(snap_b.input_owner, Some(a_id), "a current client sees the real active client");
+    assert_eq!(snap_b.input_owned_elsewhere(b.client_id()), None);
+
+    b.send_from_self(SessionCommand::Submit { text: "from b".into(), attachments: vec![] }).await.unwrap();
+    until(&mut b, |e| matches!(e, SessionEventWire::TurnStarted { .. })).await;
+    until(&mut b, |e| matches!(e, SessionEventWire::Idle)).await;
+    let b_id = b.client_id();
+    let ev = until(&mut a, |e| matches!(e, SessionEventWire::InputOwnerChanged { .. })).await;
+    assert!(
+        matches!(ev, SessionEventWire::InputOwnerChanged { from: Some(f), to: Some(t), reason: OwnerChangeReason::Input } if f == a_id && t == b_id),
+        "{ev:?}"
+    );
+
+    // The older client never saw b become active (it read b's whole turn);
+    // then it drives too.
+    let old_id = old.client_id();
+    let mut owner_changes = 0;
+    owner_changes += owner_changes_through_a_turn(&mut old, old_id).await;
+    old.send_from_self(SessionCommand::Submit { text: "from old".into(), attachments: vec![] }).await.unwrap();
+    owner_changes += owner_changes_through_a_turn(&mut old, old_id).await;
+    assert_eq!(owner_changes, 0, "an older client on a shared session never sees an owner change");
+    assert_eq!(old.input_owner(), Some(old_id));
+
+    d.shutdown_token().cancel();
+    d.wait().await;
+}
+
+/// Reads `t` through the next turn (`TurnStarted` … `Idle`), panicking on a
+/// refusal addressed to `me`; returns how many owner changes it saw.
+async fn owner_changes_through_a_turn(t: &mut SocketTransport, me: ClientId) -> usize {
+    let (mut started, mut changes) = (false, 0);
+    loop {
+        let env = tokio::time::timeout(Duration::from_secs(10), t.next_event()).await.expect("timely").expect("open");
+        match &env.event {
+            SessionEventWire::InputOwnerChanged { .. } => changes += 1,
+            SessionEventWire::Refused { client, .. } if *client == me => panic!("refused: {:?}", env.event),
+            SessionEventWire::TurnStarted { .. } => started = true,
+            SessionEventWire::Idle if started => return changes,
+            _ => {}
+        }
+    }
 }

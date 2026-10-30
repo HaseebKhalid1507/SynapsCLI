@@ -338,7 +338,7 @@ async fn login_google_vertex(ui: &mut dyn CloudLoginUi) -> Result<(), String> {
         .map_err(|_| "invalid Vertex model catalog")?;
     if catalog["publisherModels"]
         .as_array()
-        .map_or(true, |models| models.is_empty())
+        .is_none_or(|models| models.is_empty())
     {
         return Err("Vertex model catalog is empty; prior login preserved".into());
     }

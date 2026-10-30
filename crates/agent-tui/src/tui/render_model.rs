@@ -17,7 +17,7 @@ use super::sidecar::SidecarUiStatus;
 /// The per-frame snapshot shipped to the render side.
 pub(crate) struct RenderModel {
     // ── Header / status ──────────────────────────────────────────────────────
-    /// Ghost header inputs: activity, session label, turn clock, anim clock.
+    /// Header inputs: activity, session label, folder, attach mode, clocks.
     pub(crate) header: super::header::HeaderSnap,
     pub(crate) status_text: Option<String>,
     pub(crate) streaming: bool,
@@ -95,6 +95,8 @@ pub(crate) struct RenderModel {
     pub(crate) help_find: Option<synaps_cli::help::HelpFindState>,
     /// Snapshot of the /effort lightbox state.
     pub(crate) effort: Option<super::effort::EffortModalState>,
+    /// Snapshot of the /sessions modal state.
+    pub(crate) sessions: Option<super::sessions::SessionsState>,
 
     // ── Secret prompt modal ───────────────────────────────────────────────────
     pub(crate) secret_prompt: Option<SecretPromptSnap>,

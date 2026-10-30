@@ -1,6 +1,6 @@
 # Goal plan: multi-account OAuth broker and quota keeper
 
-Status: G1–G7 implementation and automated validation complete; live account validation pending operator login. Owner: foreground foreman; implementation/review workers: `anthropic/claude-fable-5-1`.
+Status: G1–G7 implemented and shipped in 0.11.0 (#215). Live account validation was pending operator login at the time of writing.
 Base: `origin/dev` `7bd33e07`; branch `feat/multi-account-broker`. Companion: `multi-account-credential-broker.md` (initial design, superseded by safety details below).
 
 ## Outcome
@@ -74,7 +74,7 @@ Depends on G2–G5.
 
 ### G7 — Review, validate and deliver a usable build
 Depends on all above.
-- [x] Independent security/correctness review by Fable worker, findings fixed or explicitly documented.
+- [x] Independent security/correctness review, findings fixed or explicitly documented.
 - [x] Targeted tests, workspace test attempt (PTY serialized on retry), clippy/build checks with exact blockers distinguished from regressions.
 - [x] Release binary built and CLI help/dry-run smoke verified in isolated configuration; do not replace a live running installation or enable spending services without an explicit operational step.
 - [x] Update goal checkboxes with evidence; operator commands for live login and final smoke. Commit changes on feature branch; no push/PR unless requested.
@@ -87,20 +87,20 @@ Depends on all above.
 3. **Keeper/policy worker:** pure scheduler/capacity state + tests in separate modules for G5/G6; integrates with broker/CLI after foundation interfaces stabilize.
 4. **CLI/runtime worker (second wave):** G4 and G5 engine integration, consumes landed interfaces.
 5. **Reviewer (final wave):** G7 read-only audit with specific file/line findings and targeted tests.
-6. **Foreman:** review contracts, integrate non-overlapping changes, run complete validation, supervise every handle to terminal status and reconcile, correct documentation, deliver login instructions.
+6. **Integrator:** review contracts, integrate non-overlapping changes, run complete validation, correct documentation, deliver login instructions.
 
-Workers must not push, access live secrets, execute login/inference, enable services or install over the running binary. Bounded task timeouts are progress checkpoints, not end-of-task permission: resume unfinished workers as needed.
+Implementers must not push, access live secrets, execute login/inference, enable services or install over the running binary.
 
 
 ## Implementation evidence
 
-- **G1/G2:** `auth/{account,storage,token,broker,credential_source}.rs`, account-aware provider login flows and `src/cmd/auth_broker.rs`; fixture/integration tests in `crates/agent-core/tests/broker_accounts.rs`. Commits `07e13417`, `4857ed23`, `86d8b7c0` plus final seat-identity hardening. Named-only login availability is an inventory/UI answer, not proof of routable capacity; explicit named selection still never falls back.
-- **G3:** `auth/usage.rs`, `src/cmd/status.rs`, [usage schema/runbook](../providers/multi-account-usage.md); commit `52c25d6c`. All four adapters use bounded read-only requests. Live Grok billing schema remains unverified. Codex snapshot identity is paired to the bearer and carries an opaque full-seat fingerprint.
+- **G1/G2:** `auth/{account,storage,token,broker,credential_source}.rs`, account-aware provider login flows and `src/cmd/auth_broker.rs`; fixture/integration tests in `crates/agent-core/tests/broker_accounts.rs`. Final seat-identity hardening included. Named-only login availability is an inventory/UI answer, not proof of routable capacity; explicit named selection still never falls back.
+- **G3:** `auth/usage.rs`, `src/cmd/status.rs`, [usage schema/runbook](../providers/multi-account-usage.md). All four adapters use bounded read-only requests. Live Grok billing schema remains unverified. Codex snapshot identity is paired to the bearer and carries an opaque full-seat fingerprint.
 - **G4:** `src/cmd/{login,auth_accounts,status}.rs`, `src/main.rs`, `tests/multi_account_cli.rs`; [operator login runbook](../providers/multi-account-broker.md). Subprocess tests use empty environments/private synthetic stores and never open a browser or call a real provider.
-- **G5:** pure `auth/quota_policy.rs`, broker capacity cache/cooldowns, `runtime/openai/account_routing.rs` and stream integration; commits `392a9487`, `95ab4299`, `b03bdb55`. Regression cases include cached/in-flight usage while a label is re-logged into another seat, removed slots, explicit/default remote pairing, model limits, no replay after output and one bounded pre-output Codex failover.
-- **G6:** pure `auth/quota_keeper.rs`, `src/cmd/quota_keeper.rs`, [keeper runbook](../providers/quota-keeper.md), disabled `deploy/synaps-quota-keeper.service`; commit `b03bdb55` plus final alias-independent ledger and pre-send full-seat checks. Clock evaluated after fetch; full usage identity also checked so a matching short prefix cannot authorize or falsely verify another seat. Deterministic tests cover restart ambiguity, once-per-generation budget, aliases, per-account opt-in, remote refusal, canonical ledger, model mismatch and re-login.
-- **Review:** independent Fable audit and follow-up (workers sa5/sa6) recorded duplicate-login RMW, refresh deadlines, corrupt-store handling, profile fallback, remote-default mismatch and canonical keeper locks; fixed in implementation. Foreman reviewed subsequent seat/cache/keeper changes and added adversarial regressions. See final validation record for remaining inherited limitations and exact check results.
+- **G5:** pure `auth/quota_policy.rs`, broker capacity cache/cooldowns, `runtime/openai/account_routing.rs` and stream integration. Regression cases include cached/in-flight usage while a label is re-logged into another seat, removed slots, explicit/default remote pairing, model limits, no replay after output and one bounded pre-output Codex failover.
+- **G6:** pure `auth/quota_keeper.rs`, `src/cmd/quota_keeper.rs`, [keeper runbook](../providers/quota-keeper.md), disabled `deploy/synaps-quota-keeper.service`; final alias-independent ledger and pre-send full-seat checks. Clock evaluated after fetch; full usage identity also checked so a matching short prefix cannot authorize or falsely verify another seat. Deterministic tests cover restart ambiguity, once-per-generation budget, aliases, per-account opt-in, remote refusal, canonical ledger, model mismatch and re-login.
+- **Review:** an independent audit and follow-up recorded duplicate-login RMW, refresh deadlines, corrupt-store handling, profile fallback, remote-default mismatch and canonical keeper locks; fixed in implementation. Later seat/cache/keeper changes were reviewed and got adversarial regressions.
 
 Checked goals mean implementation + automated evidence, **not production-provider certification**. No installed binary has been replaced, no live credential has been read/refreshed by validation, no activation service has been enabled, and no feature branch has been pushed. User login and a deliberate first live quota/reset observation remain the operational handoff.
 
-Final evidence: [multi-account-broker-validation.md](multi-account-broker-validation.md). Full workspace: **4,671 passed / 0 failed / 40 ignored**. Standard release build and isolated CLI smoke passed. Root/core all-targets and workspace production Clippy passed; broader workspace all-targets has 14 documented inherited test-only lints. Final code commits: `552c62ed`, `2ca6f123`.
+Final evidence at delivery: full workspace tests passed, the standard release build and an isolated CLI smoke (empty or synthetic credentials only) passed, and production Clippy passed. Known limitations are listed in the [login guide](../providers/multi-account-broker.md) and the [keeper guide](../providers/quota-keeper.md).

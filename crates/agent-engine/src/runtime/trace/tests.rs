@@ -95,6 +95,7 @@ fn sample_trace(key: &TraceDigestKey) -> RequestTrace {
             system_prefix: None,
             history_tail: None,
             delta: None,
+            server_diagnosis: None,
         },
         translation_losses: vec![TranslationLoss {
             action: TranslationAction::Downgraded,
@@ -583,6 +584,22 @@ fn terminal_turn_outcome_round_trips_in_envelope() {
         let json = serde_json::to_string(&trace).unwrap();
         let back: RequestTrace = serde_json::from_str(&json).unwrap();
         assert_eq!(back.outcome.terminal, outcome);
+    }
+}
+
+/// Contexts created in the same millisecond (workers spawned in one tool
+/// batch) never share a runtime session id: `session-<pid>-<ms>-<seq>`.
+#[test]
+fn contexts_created_together_get_distinct_session_ids() {
+    let ids: std::collections::HashSet<String> = (0..64)
+        .map(|_| TraceContext::with_sink(CollectingTraceSink::new()).session_id().as_str().to_string())
+        .collect();
+    assert_eq!(ids.len(), 64, "{ids:?}");
+    for id in &ids {
+        let parts: Vec<&str> = id.split('-').collect();
+        assert_eq!(parts.len(), 4, "session-<pid>-<ms>-<seq>: {id}");
+        assert_eq!(parts[0], "session");
+        assert!(parts[1..].iter().all(|p| p.parse::<u64>().is_ok()), "{id}");
     }
 }
 

@@ -104,6 +104,11 @@ pub(super) struct MessageStartPayload<'a> {
     pub id: Option<Cow<'a, str>>,
     #[serde(default)]
     pub usage: Option<UsagePayload>,
+    /// Cache-diagnosis verdict (`null` | `{"cache_miss_reason": …}`). Kept
+    /// as a raw `Value` so an unexpected shape can never fail the event —
+    /// interpreted by `cache_diagnosis::parse_server_diagnosis`.
+    #[serde(default)]
+    pub diagnostics: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]

@@ -480,7 +480,8 @@ fn sweep_stale_registrations_in(dir: &std::path::Path, own_pid: Option<u32>) -> 
     scan_registrations(dir, own_pid).1
 }
 
-/// Returns true if a process with `pid` is alive (Unix: `kill(pid, 0)`).
+/// Returns true if a process with `pid` is alive (Unix: `kill(pid, 0)`;
+/// Windows: the process object is not yet signalled).
 fn pid_is_alive(pid: u32) -> bool {
     if pid == 0 || pid > i32::MAX as u32 {
         return false;
@@ -492,7 +493,11 @@ fn pid_is_alive(pid: u32) -> bool {
         let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
         result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        crate::daemon::win::pid_is_alive(pid)
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = pid;
         true
@@ -546,7 +551,7 @@ fn scan_registrations_locked(
 
     for entry in entries.flatten() {
         let path = entry.path();
-        if !path.extension().is_some_and(|e| e == "json") || is_reserved_json(&path) {
+        if path.extension().is_none_or(|e| e != "json") || is_reserved_json(&path) {
             continue;
         }
         if !regular_card(&path) {

@@ -830,11 +830,11 @@ fn epoch_ms_from_number(n: f64) -> Option<u64> {
 pub fn duration_label(secs: u64) -> String {
     if secs == 0 {
         "0s".into()
-    } else if secs % SECS_PER_DAY == 0 {
+    } else if secs.is_multiple_of(SECS_PER_DAY) {
         format!("{}d", secs / SECS_PER_DAY)
-    } else if secs % SECS_PER_HOUR == 0 {
+    } else if secs.is_multiple_of(SECS_PER_HOUR) {
         format!("{}h", secs / SECS_PER_HOUR)
-    } else if secs % SECS_PER_MINUTE == 0 {
+    } else if secs.is_multiple_of(SECS_PER_MINUTE) {
         format!("{}m", secs / SECS_PER_MINUTE)
     } else {
         format!("{secs}s")
@@ -910,6 +910,13 @@ fn anthropic_scope(key: &str) -> WindowScope {
     }
 }
 
+/// Whether Anthropic's `extra_usage` entry becomes a window: `is_enabled` is
+/// `true` and `utilization` is a JSON number (0 counts).
+fn extra_usage_shown(val: &Value) -> bool {
+    val.get("is_enabled").and_then(Value::as_bool) == Some(true)
+        && val.get("utilization").is_some_and(Value::is_number)
+}
+
 /// Parse `GET /api/oauth/usage`. Every object value carrying `utilization`
 /// or `resets_at` is a window; `null` windows are skipped with a note.
 pub fn parse_anthropic_usage(
@@ -922,6 +929,12 @@ pub fn parse_anthropic_usage(
     let mut skipped_null = 0usize;
     let mut unrecognized = 0usize;
     for (key, val) in &map {
+        // Paid extra usage is a window only when the account has it switched
+        // on and reports a number; otherwise the entry is omitted, with no
+        // note: a feature that is off is not a gap in the reading.
+        if key == "extra_usage" && !extra_usage_shown(val) {
+            continue;
+        }
         match val {
             Value::Object(w) if w.contains_key("utilization") || w.contains_key("resets_at") => {
                 let used_percent = UsedPercent::from_json(w.get("utilization"));
@@ -1885,12 +1898,66 @@ mod tests {
         assert_eq!(s.model_availability[0].model, "sonnet");
         assert_eq!(s.model_availability[0].availability, Availability::Exhausted);
         assert!(s.notes.iter().any(|n| n == "null windows skipped"));
-        assert!(s.notes.iter().any(|n| n == "unrecognized fields ignored"));
+        // The fixture's only other entry is a disabled extra_usage: omitted,
+        // and not reported as an unrecognized field.
+        assert!(s.window("extra_usage").is_none());
+        assert!(!s.notes.iter().any(|n| n == "unrecognized fields ignored"));
         assert_eq!(s.limit_reached, None);
         // Account-level capacity: 12.5% and 60% → proven.
         assert!(s.has_proven_capacity(T0 + 1000, 60_000));
         assert_eq!(s.longest_account_window().unwrap().id, "seven_day");
         assert_eq!(s.earliest_reset_at(), epoch_ms_from_rfc3339("2025-09-20T22:00:00Z"));
+    }
+
+    /// Paid extra usage is a window only when the account has it switched on
+    /// and reports a numeric utilization (0 counts). Every other shape is
+    /// omitted with no note, so no status row can show it.
+    #[test]
+    fn anthropic_extra_usage_is_kept_only_when_enabled_with_a_numeric_utilization() {
+        let parse = |extra: &str| {
+            let body = format!(
+                r#"{{"five_hour": {{"utilization": 10, "resets_at": "2025-09-20T22:00:00Z"}}, "extra_usage": {extra}}}"#
+            );
+            parse_anthropic_usage(&body, "a", T0).unwrap()
+        };
+        for omitted in [
+            r#"{"is_enabled": false, "utilization": 0}"#,
+            r#"{"is_enabled": false, "utilization": null}"#,
+            r#"{"is_enabled": false, "monthly_limit": null, "used_credits": null, "utilization": null}"#,
+            r#"{"is_enabled": false}"#,
+            r#"{"is_enabled": true, "utilization": null}"#,
+            r#"{"is_enabled": true, "utilization": "42"}"#,
+            r#"{"is_enabled": true}"#,
+            r#"{"is_enabled": "true", "utilization": 7}"#,
+            r#"{"utilization": 7}"#,
+            "null",
+        ] {
+            let s = parse(omitted);
+            assert!(s.window("extra_usage").is_none(), "{omitted}");
+            assert_eq!(s.windows.len(), 1, "{omitted}");
+            assert!(s.notes.is_empty(), "{omitted}: {:?}", s.notes);
+        }
+        for (shown, percent) in [
+            (r#"{"is_enabled": true, "utilization": 0}"#, 0.0),
+            (
+                r#"{"is_enabled": true, "monthly_limit": 5000, "used_credits": 2100, "utilization": 42}"#,
+                42.0,
+            ),
+        ] {
+            let s = parse(shown);
+            let w = s.window("extra_usage").unwrap_or_else(|| panic!("{shown}"));
+            assert_eq!(w.used_percent.valid(), Some(percent), "{shown}");
+            assert_eq!(w.scope, WindowScope::Feature { feature: "extra_usage".into() });
+            assert!(s.notes.is_empty(), "{shown}: {:?}", s.notes);
+        }
+        // Any other unrecognized entry is still noted.
+        let s = parse_anthropic_usage(
+            r#"{"five_hour": {"utilization": 10}, "extra_usage": {"is_enabled": false}, "new_counter": 3}"#,
+            "a",
+            T0,
+        )
+        .unwrap();
+        assert!(s.notes.iter().any(|n| n == "unrecognized fields ignored"));
     }
 
     #[test]

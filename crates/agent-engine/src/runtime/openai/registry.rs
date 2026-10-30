@@ -310,11 +310,15 @@ pub fn providers() -> &'static [ProviderSpec] {
                 name: "Kimi (Moonshot AI)",
                 base_url: "https://api.moonshot.ai/v1",
                 env_vars: &["MOONSHOT_API_KEY", "KIMI_API_KEY"],
-                default_model: "kimi-k2.7-code",
+                // K3.1 Pro: Moonshot closes the K2 series to new users from
+                // 2026-10-31. It is a flagship model, unlocked after a top-up.
+                default_model: "kimi-k3.1-pro",
                 models: &[
+                    ("kimi-k3.1-pro", "Kimi K3.1 Pro", "S+"),
+                    ("kimi-k3.1-pro-highspeed", "Kimi K3.1 Pro Highspeed", "S+"),
+                    ("kimi-k3", "Kimi K3", "S+"),
                     ("kimi-k2.7-code", "Kimi K2.7 Code", "S+"),
                     ("kimi-k2.7-code-highspeed", "Kimi K2.7 Code Highspeed", "S"),
-                    ("kimi-k3", "Kimi K3", "S+"),
                     ("kimi-k2.6", "Kimi K2.6", "S"),
                 ],
             },
@@ -523,6 +527,47 @@ mod model_list_tests {
             .expect("OpenAI-compatible providers accept published model IDs");
         assert_eq!(dynamic.model, "future-model");
         assert_eq!(dynamic.endpoint, route.endpoint);
+    }
+
+    #[test]
+    fn kimi_catalog_lists_k3_1_pro_and_highspeed_with_k3_1_pro_as_default() {
+        let spec = providers()
+            .iter()
+            .find(|spec| spec.key == "kimi")
+            .expect("Kimi must be registered");
+        assert_eq!(spec.base_url, "https://api.moonshot.ai/v1");
+        // K3.1 Pro is the default and leads the picker (the K2 series closes
+        // to new Moonshot users from 2026-10-31).
+        assert_eq!(spec.default_model, "kimi-k3.1-pro");
+        assert_eq!(spec.models[0].0, spec.default_model);
+        for (id, label) in [
+            ("kimi-k3.1-pro", "Kimi K3.1 Pro"),
+            ("kimi-k3.1-pro-highspeed", "Kimi K3.1 Pro Highspeed"),
+        ] {
+            let row = spec
+                .models
+                .iter()
+                .find(|(model, _, _)| *model == id)
+                .unwrap_or_else(|| panic!("{id} must be in the Kimi catalog"));
+            assert_eq!(row.1, label, "{id}");
+        }
+    }
+
+    /// Every Kimi catalog row has a documented reasoning capability, so a
+    /// model the picker offers never falls into the unknown-id (adaptive
+    /// only) path by omission.
+    #[test]
+    fn every_kimi_catalog_row_has_a_reasoning_capability() {
+        let spec = providers()
+            .iter()
+            .find(|spec| spec.key == "kimi")
+            .expect("Kimi must be registered");
+        for (id, _, _) in spec.models {
+            assert!(
+                crate::runtime::openai::catalog::kimi::kimi_static_capability(id).is_some(),
+                "{id} has no Kimi reasoning capability row"
+            );
+        }
     }
 
     #[test]

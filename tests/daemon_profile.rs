@@ -11,8 +11,6 @@
 //! the TUI (`ThinClient::Line` vs `Tui`/`Adopt` → `ensure_daemon`), so it
 //! exercises the profile pin without a PTY.
 
-#![cfg(unix)]
-
 #[path = "support/phase2/mod.rs"]
 mod phase2;
 
@@ -75,6 +73,17 @@ impl Env {
             .env("SYNAPS_NO_BOOT_FX", "1")
             .env("TERM", "dumb")
             .current_dir(self.home.path());
+        // Windows: what any process needs (Winsock reads SystemRoot), and
+        // the profile dir pointed at the temp HOME.
+        #[cfg(windows)]
+        {
+            for k in ["SystemRoot", "SystemDrive", "WINDIR", "ComSpec", "PATHEXT", "TEMP", "TMP"] {
+                if let Some(v) = std::env::var_os(k) {
+                    c.env(k, v);
+                }
+            }
+            c.env("USERPROFILE", self.home.path());
+        }
         c
     }
 

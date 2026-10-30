@@ -113,7 +113,9 @@ impl Client {
             SessionEventWire::AutoTurnCapReached { cap } => self.out(&format!("[auto-turn cap {cap} reached]\n")),
             SessionEventWire::Idle => {}
             SessionEventWire::External(e) => self.out(&format!("[event {}] {}\n", e.source.name, e.content.text)),
-            SessionEventWire::ClientJoined { client, kind } => self.out(&format!("[client #{} joined ({kind:?})]\n", client.0)),
+            SessionEventWire::ClientJoined { client, kind, name, .. } => {
+                self.out(&format!("[client {name} (#{}) joined ({kind:?})]\n", client.0))
+            }
             SessionEventWire::ClientLeft { client } => self.out(&format!("[client #{} left]\n", client.0)),
             SessionEventWire::Ended { reason } => self.out(&format!("[session ended: {reason:?}]\n")),
             SessionEventWire::SettingChanged(a) => {
@@ -137,7 +139,8 @@ impl Client {
             SessionEventWire::CompactionFailed { message, .. } => self.out(&format!("[compaction failed: {message}]\n")),
             SessionEventWire::CompactionCancelled => self.out("[compaction cancelled]\n"),
             SessionEventWire::InputOwnerChanged { to, reason, .. } => {
-                self.out(&format!("[input owner → {} ({reason:?})]\n", to.map(|c| format!("client #{}", c.0)).unwrap_or_else(|| "nobody".into())))
+                let who = to.map(|c| self.t.roster().label(c)).unwrap_or_else(|| "nobody".into());
+                self.out(&format!("[input owner → {who} ({reason:?})]\n"))
             }
             SessionEventWire::Refused { command, reason, .. } => self.out(&format!("[refused {command}: {reason}]\n")),
             SessionEventWire::AttachRefused { message } => self.out(&format!("[attach refused: {message}]\n")),
@@ -184,6 +187,16 @@ impl Client {
             "/abort" => {
                 let _ = self.t.send(SessionCommand::Cancel).await;
             }
+            // `/close` ends the session in the daemon (`/detach` and `/quit`
+            // leave it loaded); the session refuses while work is in flight
+            // unless `force`. The loop exits on the `Ended` that follows.
+            "/close" | "/close force" => {
+                let arg = line.strip_prefix("/close").unwrap_or("").trim().to_string();
+                let _ = self
+                    .t
+                    .send(SessionCommand::EngineCommand { id: 3, name: "close".into(), arg })
+                    .await;
+            }
             "/sessions" => {
                 let _ = self.t.send(SessionCommand::Query { id: 1, query: SessionQuery::Status }).await;
             }
@@ -193,7 +206,7 @@ impl Client {
             "/new" => {
                 let _ = self.t.send(SessionCommand::NewSession).await;
             }
-            "/help" => self.out("/detach /abort /save /new /sessions /model NAME /cmd NAME [ARG] /auto ARGS /keep-warm on|off\n"),
+            "/help" => self.out("/detach /close [force] /abort /save /new /sessions /model NAME /cmd NAME [ARG] /auto ARGS /pin on|off (alias /keep-warm on|off)\n"),
             // C1 (P9): arm a driver headlessly. Mirrors the TUI's `/auto` →
             // `DriverStart` routing (dispatch.rs) but without an in-process
             // ExtensionManager: the actor validates `session.drive` on
@@ -207,7 +220,7 @@ impl Client {
                     .send(SessionCommand::DriverStart { plugin, command, arg })
                     .await;
             }
-            "/keep-warm on" | "/keep-warm off" => {
+            "/pin on" | "/pin off" | "/keep-warm on" | "/keep-warm off" => {
                 let _ = self.t.send(SessionCommand::KeepWarm { on: line.ends_with("on") }).await;
             }
             _ if line.starts_with("/cmd ") => {
@@ -256,9 +269,13 @@ fn set_echo(on: bool) {
             .stdin(std::process::Stdio::inherit())
             .status();
     }
+    #[cfg(not(unix))]
+    let _ = on;
 }
 
-pub(crate) async fn run(profile: Option<String>, mut args: AttachArgs) -> anyhow::Result<()> {
+/// `client_name`: the global `--as` (see `main.rs`); `None` =
+/// `SYNAPS_CLIENT_NAME`, else the daemon's default (`attach`, `attach-2`, …).
+pub(crate) async fn run(profile: Option<String>, mut args: AttachArgs, client_name: Option<String>) -> anyhow::Result<()> {
     if let Err(code) = super::daemon::require_enabled("synaps attach") {
         std::process::exit(code);
     }
@@ -268,7 +285,13 @@ pub(crate) async fn run(profile: Option<String>, mut args: AttachArgs) -> anyhow
         eprintln!("{}", no_daemon_message(profile.as_deref()));
         std::process::exit(EXIT_REFUSED);
     }
-    let conn = match SocketTransport::connect(&paths.sock, Hello::new(ClientKind::Attach)).await {
+    let client_name = client_name.or_else(agent_engine::session::client_name_from_env);
+    if let Some(Err(e)) = client_name.as_deref().map(agent_engine::session::validate_client_name) {
+        eprintln!("synaps attach: {e}");
+        std::process::exit(EXIT_REFUSED);
+    }
+    let hello = Hello::new(ClientKind::Attach).with_name(client_name);
+    let conn = match SocketTransport::connect(&paths.sock, hello).await {
         Ok(c) => c,
         Err(TransportError::Version { client, daemon }) => {
             eprintln!("synaps attach: protocol version mismatch (client {client}, daemon {daemon}); restart the daemon with this binary");
@@ -342,9 +365,9 @@ pub(crate) async fn run(profile: Option<String>, mut args: AttachArgs) -> anyhow
     }
     // "○ ready" is the marker scripts/memprof/launch.sh polls for.
     c.out(&format!(
-        "[attached {} as client #{}  model={}  messages={}{}] ○ ready\n",
+        "[attached {} as {}  model={}  messages={}{}] ○ ready\n",
         snap.meta.id,
-        c.t.client_id().0,
+        c.t.roster().label(c.t.client_id()),
         snap.view.model,
         snap.conversation.api_messages.len(),
         if snap.streaming { "  streaming" } else { "" }
