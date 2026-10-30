@@ -818,6 +818,8 @@ impl StreamMethods {
             worker_context.resolve(context_window)
         };
         let mut worker_policy_state = agent_core::core::context_policy::ContextState::default();
+        // Warn once per turn when the window is too small to roll over in.
+        let mut worker_reserve_warned = false;
         let mut worker_window = super::worker_context::window_state(&messages).0;
         // Set by a committed rollover (worker or foreground): the next request
         // is the first of its window (telemetry `rollover: true`).
@@ -1536,21 +1538,42 @@ impl StreamMethods {
                 calibration_probe = Some((used, usage_counters.records()));
                 let decision = assess_context(&worker_policy.config, &worker_policy_state, budget);
                 worker_policy_state = decision.next_state;
-                if matches!(decision.action, ContextAction::Rollover | ContextAction::HardStop) {
+                let hard_capacity = decision.action == ContextAction::HardStop;
+                // The next round's reserves, as `assess_context` compares them.
+                let required = budget
+                    .required_next_round_tokens
+                    .max(worker_policy.config.reserve_tokens);
+                // A window its reserves dominate cannot hold a successor of
+                // the policy's target: rolling over there only thrashes.
+                // Send the request as before worker rollover and let the
+                // provider judge it.
+                let reserve_dominated =
+                    hard_capacity && !worker_policy.hard_capacity_has_room(context_window, required);
+                if reserve_dominated && !worker_reserve_warned {
+                    worker_reserve_warned = true;
+                    tracing::warn!(
+                        model = %model,
+                        context_window,
+                        used_tokens = used,
+                        required_next_round_tokens = required,
+                        target_tokens = worker_policy.target_tokens(),
+                        "worker context rollover skipped at hard capacity: the next round's reserves leave this window no room for a successor at the rollover target; requests go to the provider unchanged"
+                    );
+                }
+                if matches!(decision.action, ContextAction::Rollover | ContextAction::HardStop)
+                    && !reserve_dominated
+                {
                     let overhead = used.saturating_sub(super::context::estimate_history(&messages));
                     let calibration = continuation
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .calibration_for(&model);
-                    let hard_capacity = decision.action == ContextAction::HardStop;
                     let mut target = worker_policy.successor_budget(overhead, calibration);
                     if hard_capacity {
                         target = super::worker_context::hard_capacity_budget(
                             target,
                             context_window,
-                            budget
-                                .required_next_round_tokens
-                                .max(worker_policy.config.reserve_tokens),
+                            required,
                             overhead,
                         );
                     }
@@ -1561,7 +1584,7 @@ impl StreamMethods {
                         overhead,
                         worker_policy,
                         worker_sink,
-                        hard_capacity,
+                        hard_capacity.then(|| context_window.saturating_sub(required)),
                     ) {
                         Ok(Some((successor, report))) => {
                             tracing::info!(

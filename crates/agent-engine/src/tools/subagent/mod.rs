@@ -191,6 +191,33 @@ pub(crate) fn apply_subagent_runtime_policy(
     runtime.set_worker_context_settings(Some(
         crate::runtime::worker_context::WorkerContextSettings::from_config(config),
     ));
+
+    // The configured `context_window`, as the foreground gets it through
+    // `apply_config`. Without it every worker budgeted against the 200k
+    // model default and never sent the 1M opt-in, so on Opus the output
+    // reserve alone put it at hard capacity near 32k (#332 rollover thrash).
+    // The model is not chosen yet: `fit_subagent_context_window` drops a
+    // window the worker's model cannot open once it is.
+    runtime.set_context_window(config.context_window);
+}
+
+/// The window a worker on `model` runs with, given the configured
+/// `context_window`. The setting is one per user, not per model, so a worker
+/// on any model gets it, as the foreground keeps it across `/model`, except a
+/// window above the model default on a model without 1M support: the request
+/// builder never sends that model the 1M opt-in, so the provider window is
+/// the default one, and the worker must budget against that.
+pub(crate) fn subagent_context_window(configured: Option<u64>, model: &str) -> Option<u64> {
+    use crate::core::models::{context_window_for_model, model_supports_1m};
+    configured.filter(|&window| window <= context_window_for_model(model) || model_supports_1m(model))
+}
+
+/// Called after model selection by start, oneshot AND resume: fit the window
+/// `apply_subagent_runtime_policy` inherited to the model the worker runs on
+/// (an agent file or the call can pin a model other than the parent's).
+pub(crate) fn fit_subagent_context_window(runtime: &mut crate::Runtime) {
+    let fitted = subagent_context_window(runtime.context_window_override(), runtime.model());
+    runtime.set_context_window(fitted);
 }
 
 /// Give a worker somewhere to keep the context it rolls over: its archive

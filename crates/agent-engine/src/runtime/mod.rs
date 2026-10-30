@@ -2500,6 +2500,11 @@ impl Runtime {
         self.context_window_override = window;
     }
 
+    /// The configured window override (`None` = the model default).
+    pub fn context_window_override(&self) -> Option<u64> {
+        self.context_window_override
+    }
+
     /// Effective context window for the current model — user override if set,
     /// otherwise the model's native window from `models::context_window_for_model`.
     pub fn compaction_model(&self) -> &str {

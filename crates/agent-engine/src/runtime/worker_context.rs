@@ -121,12 +121,30 @@ impl WorkerPolicy {
             calibration,
         )
     }
+
+    /// Whether rolling over at hard capacity can make real room. Hard
+    /// capacity is the footprint `context_window - required_next_round`,
+    /// where the next round's reserves are its output envelope, thinking, the
+    /// next tool result and the safety margin. When that line is at or below
+    /// this policy's successor target the window is dominated by its
+    /// reserves: no successor of the size the policy aims for passes hard
+    /// admission, and any successor the window does hold is a fraction of
+    /// it, back at hard capacity a few rounds later. On a 200k Opus window
+    /// the reserves are about 168k (128k of it the output envelope), so hard
+    /// capacity sat near 32k against a 93k target, and workers rolled over
+    /// every few tool calls to successors of about 9k. `false`: do not roll
+    /// over at hard capacity; send the request as before worker rollover
+    /// existed and let the provider judge it.
+    pub fn hard_capacity_has_room(&self, context_window: u64, required_next_round: u64) -> bool {
+        context_window.saturating_sub(required_next_round) > self.target_tokens()
+    }
 }
 
-/// At hard capacity the configured target may exceed what the window still
-/// holds (a small window whose output reserve dominates reaches hard capacity
-/// before the rollover band). Aim for two thirds of the history room the
-/// next round leaves, so the successor both fits and can grow a little.
+/// At hard capacity the configured target may leave the successor little room
+/// to grow (a window whose reserves put hard capacity below the rollover band
+/// reaches it first; see [`WorkerPolicy::hard_capacity_has_room`] for one
+/// that cannot hold the target at all). Aim for two thirds of the history
+/// room the next round leaves, so the successor both fits and can grow.
 pub fn hard_capacity_budget(
     budget: SuccessorBudget,
     context_window: u64,
@@ -782,11 +800,15 @@ fn render_block(out: &mut String, b: &Value) {
 }
 
 /// Apply one worker rollover: plan it, refuse one that cannot shrink the
-/// context (or, below hard capacity, would start inside the pressure band and
-/// thrash), save the evicted messages, and return the successor with its
-/// report. `Ok(None)` = no-shrink (the caller defers like the foreground's
-/// unproductive rollover). An error writing the transcript means no
-/// rollover: nothing is evicted that was not saved.
+/// context or would start where the next round triggers another rollover
+/// (the pressure band below hard capacity, the hard-capacity line at it),
+/// save the evicted messages, and return the successor with its report.
+/// `hard_capacity` is `Some(line)` for a rollover at hard capacity, where
+/// `line` is the footprint at which the next round is at hard capacity
+/// (`context_window - required_next_round`). `Ok(None)` = no-shrink (the
+/// caller defers like the foreground's unproductive rollover). An error
+/// writing the transcript means no rollover: nothing is evicted that was not
+/// saved.
 pub fn roll_over(
     messages: &[SharedMessage],
     budget: SuccessorBudget,
@@ -794,7 +816,7 @@ pub fn roll_over(
     overhead_tokens: u64,
     policy: &WorkerPolicy,
     sink: &WorkerTranscriptSink,
-    hard_capacity: bool,
+    hard_capacity: Option<u64>,
 ) -> std::io::Result<Option<(Vec<SharedMessage>, WorkerRolloverReport)>> {
     let Some(plan) = plan_rollover(messages, budget, before_tokens, |window| {
         transcript_path(&sink.dir, &sink.stem, window)
@@ -806,7 +828,7 @@ pub fn roll_over(
     }
     let after_tokens =
         overhead_tokens.saturating_add(super::context::estimate_history(&plan.successor));
-    if !hard_capacity && after_tokens >= policy.thresholds.pressure_tokens {
+    if after_tokens >= hard_capacity.unwrap_or(policy.thresholds.pressure_tokens) {
         return Ok(None);
     }
     crate::tools::write_window_transcript(
