@@ -450,7 +450,7 @@ Ask SynapsCLI to get explicit user confirmation before proceeding. Only valid on
 |-----------|--------|----------|--------------------------------------------------|
 | `message` | string | yes      | Human-readable confirmation prompt for the user  |
 
-The host shows your extension id and the tool name above `message`; an extension cannot set or spoof them. The dialog offers **Allow** (this call), **Allow all from `<your-extension>` this session**, and **Deny**. "Allow all" auto-approves later `confirm` results from *your loaded extension only* (any tool) until `/new` or `/confirms reset`; reloading or reinstalling your extension clears it, confirms from other extensions still prompt, and `block` is never overridden. Subagent tool calls do not run extension `before_tool_call` hooks today, so neither `confirm` nor `block` applies to them. A long `message` is cut to 12 lines / 1200 characters. If an earlier extension's `modify` rewrote the input, the host adds "Input rewritten by: <ids>" and a capped, credential-redacted preview (6 lines / 400 characters; secret-named fields, `Authorization`/`Bearer` headers, `api_key=`/`token=`-style parameters, `sk-…` keys and JWTs become `[REDACTED]`) of the input that will actually run above your `message`, which is shown under "Message from <your-extension>:" (your `message` is credential-redacted the same way, and control, bidi and zero-width characters are stripped from it), and when the user approves, every attached client gets a transcript line saying the call ran rewritten input. Assume any `confirm` you return may be auto-approved once the user has chosen "Allow all" for your extension.
+The host shows your extension id and the tool name above `message`; an extension cannot set or spoof them. The dialog offers **Allow** (this call), **Allow all from `<your-extension>` this session**, and **Deny**. "Allow all" auto-approves later `confirm` results from *your loaded extension only* (any tool) until `/new` or `/confirms reset`; reloading or reinstalling your extension clears it, confirms from other extensions still prompt, and `block` is never overridden. Subagent tool calls do not run extension `before_tool_call` hooks today, so neither `confirm` nor `block` applies to them (their only hook is the `after_tool_call` `replace` transform). A long `message` is cut to 12 lines / 1200 characters. If an earlier extension's `modify` rewrote the input, the host adds "Input rewritten by: <ids>" and a capped, credential-redacted preview (6 lines / 400 characters; secret-named fields, `Authorization`/`Bearer` headers, `api_key=`/`token=`-style parameters, `sk-…` keys and JWTs become `[REDACTED]`) of the input that will actually run above your `message`, which is shown under "Message from <your-extension>:" (your `message` is credential-redacted the same way, and control, bidi and zero-width characters are stripped from it), and when the user approves, every attached client gets a transcript line saying the call ran rewritten input. Assume any `confirm` you return may be auto-approved once the user has chosen "Allow all" for your extension.
 
 ### Handler chain order
 
@@ -484,6 +484,10 @@ Requires the **`tools.transform_output`** permission *in addition to*
 original output is preserved (fail-safe). Each replacement is recorded to
 `extensions/intercept.jsonl` (metadata only: plugin id, tool, sizes — never
 content). Replacement output is clamped at 1 MiB.
+
+Subagent workers' tool results go through `replace` too (with
+`session_id: null`), and it is the only hook a worker runs; see
+`hooks.md` ("Subagent workers").
 
 > The `tool_output` an extension sees is a size-limited preview (~32 KB prefix +
 > truncation marker), so a transform decides on a preview of large outputs.

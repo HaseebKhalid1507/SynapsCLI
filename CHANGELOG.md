@@ -39,6 +39,26 @@ All notable changes to this project will be documented in this file.
   traces mark stubbed calls (`deduped: true`, `deduped_bytes`). Works the
   same in workers. `read_dedupe` (default on; `off` = tool results exactly
   as before), with a /settings row.
+- **Subagent workers run the host's output transforms.** An extension's
+  `after_tool_call` `replace` (compression, redaction; needs
+  `tools.transform_output`) now sees a subagent worker's tool results,
+  not only the main session's. Before, every worker ran with an empty hook
+  bus, so a transform like crush never saw the tool results that workers
+  produce, about 88% of all tool-result tokens in crush 2's measurements.
+  It's the only hook a worker runs: no `before_tool_call` (no confirm
+  prompt, block or input rewrite in a worker), no observe-only
+  `after_tool_call`, no message or session hooks. Everything else is the
+  main session's: chain order, the permission gate, the 5 s timeout, the
+  1 MiB clamp, pass-through on a failed or timed-out handler, and the
+  order hook, then virtualisation, then read dedupe. Workers see the
+  host's live handler list, so a reload applies from their next tool
+  call; they never start or restart an extension process (while one has
+  crashed or a deferred one hasn't started, their output passes through
+  until the main session's next call starts it). The extension sees
+  `session_id: null`. Covers the legacy
+  `SYNAPS_SUBAGENT_FRESH_RUNTIME=1` path too. `subagent_transform_hooks`
+  (default on; `off` = no hooks in workers, as before), with a /settings
+  row. [docs/extensions/hooks.md](docs/extensions/hooks.md#subagent-workers)
 - **`synaps daemon rename <ID|NAME> <NEW_NAME>`** (or `--clear`) names a
   daemon session from any shell without attaching, so a tool can name a
   session it only observes. Same rules as `/saveas`; attached clients see the
