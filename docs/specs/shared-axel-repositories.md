@@ -83,6 +83,17 @@ initialize/update the Git-private marker. `--service` additionally opens the
 selected brain and reports canonical/member scopes. A changed identity does not
 silently search old JSONL or old plugin databases.
 
+On macOS, `/usr/bin/git` is Apple's `xcrun` shim: without the Command Line
+Tools, running it opens the "install developer tools" dialog. Synaps (host and
+Axel service alike) never runs it and never looks Git up on `PATH` there. It runs
+`<dir>/usr/bin/git` by absolute path from the first of these that has one:
+`DEVELOPER_DIR` (if absolute), the `xcode-select` choice
+(`/var/db/xcode_select_link`), then `/Library/Developer/CommandLineTools`. With
+none, Git is unavailable: repository identity for a Git checkout fails closed
+(no path-scope fallback), and plugin install, update and update checks refuse
+with a request to run `xcode-select --install`. Other platforms run `git` from
+`PATH` as before.
+
 ## One database, bounded access
 
 Every operation still carries a host-selected scope. Reads, captures, archives,
