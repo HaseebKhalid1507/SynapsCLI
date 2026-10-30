@@ -1413,6 +1413,12 @@ pub struct SynapsConfig {
     /// rollover band wins when it is lower; the successor target is derived
     /// like the foreground's (min(100k, 2/3 of pressure)).
     pub subagent_rollover_tokens: u64,
+    /// Subagent workers run the host's `after_tool_call` output transforms
+    /// (extensions holding `tools.transform_output`: compression,
+    /// redaction) on their own tool results, as the foreground does. Off =
+    /// worker tool results reach history untransformed, as before.
+    /// (`subagent_transform_hooks`, default on).
+    pub subagent_transform_hooks: bool,
     /// Worker default, independent of foreground `thinking`; per-call overrides win.
     pub subagent_thinking: crate::core::reasoning::ReasoningLevel,
     pub api_retries: u32,        // default 3
@@ -1547,6 +1553,7 @@ impl Default for SynapsConfig {
             subagent_cold_resume_compact_tokens: DEFAULT_SUBAGENT_COLD_RESUME_COMPACT_TOKENS,
             subagent_context_management: ContextManagementMode::Auto,
             subagent_rollover_tokens: DEFAULT_SUBAGENT_ROLLOVER_TOKENS,
+            subagent_transform_hooks: true,
             subagent_thinking: crate::core::reasoning::ReasoningLevel::XHigh,
             api_retries: 3,
             refusal_retries: 2,
@@ -1628,6 +1635,7 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "subagent_cold_resume_compact_tokens",
     "subagent_context_management",
     "subagent_rollover_tokens",
+    "subagent_transform_hooks",
     "subagent_thinking",
     "subagent.max_concurrent",
     "subagent.max_total",
@@ -2215,6 +2223,13 @@ fn apply_config_content_with(
                 }
                 _ => config.warnings.push(format!(
                     "subagent_rollover_tokens = {val} — expected a token count of at least {MIN_SUBAGENT_ROLLOVER_TOKENS}; using {DEFAULT_SUBAGENT_ROLLOVER_TOKENS}"
+                )),
+            },
+            "subagent_transform_hooks" => match val {
+                "true" | "1" | "on" | "yes" => config.subagent_transform_hooks = true,
+                "false" | "0" | "off" | "no" => config.subagent_transform_hooks = false,
+                _ => config.warnings.push(format!(
+                    "subagent_transform_hooks = {val} — expected on or off; using on"
                 )),
             },
             // Legacy flat spellings (pre-`subagent.*`): same parser, same limits.
@@ -3012,6 +3027,25 @@ mod tests {
             c.warnings
         );
         assert!(super::KNOWN_CONFIG_KEYS.contains(&"subagent_cold_resume_compact_tokens"));
+    }
+
+    #[test]
+    fn subagent_transform_hooks_key_parses_defaults_on_and_warns() {
+        assert!(super::load_config_from_str("").subagent_transform_hooks, "default on");
+        assert!(super::SynapsConfig::default().subagent_transform_hooks);
+        for (line, want) in [
+            ("subagent_transform_hooks = off\n", false),
+            ("subagent_transform_hooks = false\n", false),
+            ("subagent_transform_hooks = on\n", true),
+            ("subagent_transform_hooks = true\n", true),
+        ] {
+            let c = super::load_config_from_str(line);
+            assert_eq!(c.subagent_transform_hooks, want, "{line}");
+            assert!(c.warnings.is_empty(), "{line}: {:?}", c.warnings);
+        }
+        let c = super::load_config_from_str("subagent_transform_hooks = maybe\n");
+        assert!(c.subagent_transform_hooks, "bad value keeps the default");
+        assert!(c.warnings.iter().any(|w| w.contains("subagent_transform_hooks")));
     }
 
     #[test]

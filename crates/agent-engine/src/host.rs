@@ -401,8 +401,8 @@ impl EngineHost {
     /// A worker (subagent) runtime. Shares credential source and token cache
     /// (so NO broker re-install and NO cache eviction) and takes a CLONE of
     /// the cached worker registry template. Does NOT share: the HTTP client
-    /// (fresh — see below), hook_bus (fresh, empty — hooks do not fire for
-    /// subagent tool calls), session_manager (fresh + reaper),
+    /// (fresh — see below), hook_bus (a worker view of it instead — see
+    /// [`Self::worker_hook_bus`]), session_manager (fresh + reaper),
     /// mcp_runtime/extension_runtime (`None`, as `Runtime::new()`).
     ///
     /// Own client: workers `block_on` a throwaway `current_thread` runtime
@@ -413,7 +413,7 @@ impl EngineHost {
     pub async fn worker_runtime(&self) -> Result<Runtime> {
         let mut host = self.parts.clone();
         host.client = crate::runtime::build_host_http_client()?;
-        host.hook_bus = Arc::new(HookBus::new());
+        host.hook_bus = self.worker_hook_bus();
         host.tools = Arc::new(RwLock::new(self.worker_registry().await));
         host.mcp_runtime = None;
         host.extension_runtime = None;
@@ -425,6 +425,21 @@ impl EngineHost {
         let mut runtime = Runtime::from_parts(RuntimeParts::with_reaper(host));
         runtime.apply_retry_config(&self.config());
         Ok(runtime)
+    }
+
+    /// The hook bus every subagent worker runs with, on both spawn paths
+    /// (this host's `worker_runtime` and the legacy
+    /// `SYNAPS_SUBAGENT_FRESH_RUNTIME=1` runtime): a live view of the host
+    /// bus's `after_tool_call` subscriptions from extensions holding
+    /// `tools.transform_output` ([`HookBus::worker_transforms`]). Output
+    /// transforms (compression, redaction) see a worker's tool results the
+    /// way they see the foreground's; `before_tool_call` and every other
+    /// hook kind still do not fire for subagent tool calls, so a worker
+    /// never raises a confirm prompt. The extension sees `session_id: null`
+    /// (a worker has no conversation id). `subagent_transform_hooks = off`
+    /// detaches it (`apply_subagent_runtime_policy`).
+    pub fn worker_hook_bus(&self) -> Arc<HookBus> {
+        HookBus::worker_transforms(&self.parts.hook_bus)
     }
 
     /// Cached-or-rebuilt worker registry: `without_subagent_with_extensions`
