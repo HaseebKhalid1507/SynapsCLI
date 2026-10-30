@@ -125,7 +125,56 @@ in the worker's own archive directory.
 - `Rollover` and `HardStop` both attempt a rollover. Hard capacity therefore
   becomes a rollover instead of a terminal provider error, even with a high
   configured threshold. If a rollover cannot help, the round proceeds exactly
-  as it does today.
+  as it does today. That includes a window the reserves dominate (below).
+
+### Context window
+
+A worker budgets against the configured `context_window`, as the foreground
+does (`apply_config`): `apply_subagent_runtime_policy` copies it. The policy
+runs before the spawn path picks the model, so `fit_subagent_context_window`
+runs after `set_model` on every path (oneshot, start, resume) and drops a
+window above the model default on a model without 1M support
+(`model_supports_1m`): the request builder never sends that model the 1M
+opt-in, so its provider window is the default and the worker must budget
+against that. The setting is one per user, not per model, so a worker on a
+different model than its parent (an agent file or the call can pin one) gets
+it whenever its model can open it: a 1m parent's Sonnet 4.6 worker gets 1m,
+its Haiku 4.5 worker 200k. Non-Anthropic models get the model default (200k
+in `context_window_for_model`, the conservative side). Like the rest of
+the policy, the value comes from the config file: `/context` and the
+`/settings` row write it there, but a session-only window change that is
+not persisted is not inherited.
+
+Until this was fixed (fix/worker-rollover-window) workers never got the
+setting, and the reserves made that expensive. `pre_request_context_budget`
+reserves the next round's output envelope (`max_tokens`, 128k for Opus),
+the next tool result (10k), a 15% safety margin and 512 advisory tokens; on
+a 200k window that is about 168k for Opus, so hard capacity sat near 32k
+against a 93k target. Every hard-capacity successor was two thirds of the
+~20k left (about 9k on the wire), full again about five tool calls later:
+four Opus 5.5 workers rolled over 28 to 37 times in 20 minutes with requests
+of about 20k.
+
+**Reserve-dominated windows.** `WorkerPolicy::hard_capacity_has_room`: a
+rollover at hard capacity is attempted only when the hard-capacity line
+(`window − required next round`) is above the policy's successor target,
+the footprint the policy itself calls a useful context. Below it no
+successor of that size passes hard admission, and any the window does hold
+refills to hard capacity within a few rounds. Such a worker does not roll
+over at hard capacity; its requests go out as before worker rollover and
+the provider judges them (Claude 4.5 and later accept a request whose input
+plus `max_tokens` exceeds the window and stop at the window with
+`model_context_window_exceeded`, so the output envelope is a ceiling, not a
+need). It logs one warning per turn. Opus on 200k is reserve-dominated;
+Opus on 1m (hard capacity ~711k, target 100k) and Sonnet on 200k (~95k,
+target 93k) are not.
+
+The reserve model itself is shared with the foreground and unchanged here:
+the foreground rollover (`context_management.mode = auto`) and the daemon's
+opt-in `auto_compact` trigger (`should_compact`, budget = window − reserves)
+see the same ~32k line on a 200k Opus window. Both are opt-in and avoided by
+`context_window = 1m`; treating the output envelope as a ceiling rather
+than required headroom is a follow-up for all three.
 
 ### `context_checkpoint`: host-only boundary
 
@@ -188,12 +237,15 @@ the real successor is measured and the cut stepped to the next valid
 boundary while it is over target, so the target holds unless the must-keep
 part alone exceeds it (then it is kept whole, with a warning, as the
 foreground does). At hard capacity the target is also capped at two thirds
-of the history room the next round leaves: on a small window whose output
-reserve dominates, hard capacity comes before the rollover band, and the
-configured target could exceed the context itself. A candidate that does
-not shrink by more than 1024 tokens, or (outside hard capacity) would still
-start inside the pressure band, is `Unproductive` and deferred with
-`defer_unproductive_rollover`, the foreground's no-thrash rule.
+of the history room the next round leaves: when the reserves put hard
+capacity below the rollover band, it comes first, and the configured target
+can leave the successor little room to grow (a window that cannot hold the
+target at all does not roll over at hard capacity; see "Context window").
+A candidate that does not shrink by more than 1024 tokens, or would start
+where the next round triggers another rollover (inside the pressure band
+below hard capacity, at or past the hard-capacity line at it), is
+`Unproductive` and deferred with `defer_unproductive_rollover`, the
+foreground's no-thrash rule.
 
 **Bounded note.** The note's index of evicted tool calls is capped at about
 2k tokens (the foreground's dropped-index budget), and it lists the 12 most
