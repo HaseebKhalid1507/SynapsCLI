@@ -324,7 +324,7 @@ fn remove_all(files: &[Pending], temps: &[Staged]) {
 }
 
 /// Creates `name` in `parent` the way staging creates a temp (tests only).
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn create_temp_for_test(parent: &Path, name: &str, bytes: &[u8]) -> std::io::Result<()> {
     let dir = Dir::open(&std::fs::canonicalize(parent)?)?;
     write_new(&dir, OsStr::new(name), bytes, None, &mut RealHooks).map(drop)

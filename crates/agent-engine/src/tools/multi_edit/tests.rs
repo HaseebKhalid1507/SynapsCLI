@@ -506,6 +506,7 @@ fn mode_of(path: &Path) -> u32 {
 }
 
 /// Every name in `dir`, sorted.
+#[cfg(unix)]
 fn entries(dir: &Path) -> Vec<String> {
     let mut names: Vec<String> = std::fs::read_dir(dir)
         .unwrap()
