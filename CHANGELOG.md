@@ -80,6 +80,20 @@ All notable changes to this project will be documented in this file.
   Default 1, as before. Lowering it deletes the extra generations at the
   next rotation. Rotation is now locked (`<log>.lock`), so two daemon
   sessions can no longer rotate the same log twice and lose a generation.
+- **Keep-warm for long tool calls** (`cache_keepwarm_tools`, default on;
+  /settings row next to the other keep-warm rows). A tool round that runs
+  past the cache TTL (a worker's `cargo build`, a test sweep, a `sleep;
+  poll` loop: workers are pinned to 5m and their default bash limit is
+  300 s) used to make the next request rewrite the whole prompt prefix at
+  1.25×: 658k tokens from two such rounds in one day of logs. Now, 4.5 min
+  into a round on 5m (55 min on 1h), the session re-sends that round's own
+  request capped to a minimal reply, so the cache stays live and the next
+  request reads it. Pings repeat while the tools run, stop the moment they
+  return or the turn is cancelled, move no cache breakpoint and touch no
+  history; they use the idle keep-warm's cost bound and budgets and are
+  logged with `"keepwarm": true`. Covers the foreground and every worker
+  spawn path. Independent of `cache_keepwarm` (idle). See
+  docs/specs/cache-ttl-spec.md §7.9.
 - **`cache_keepwarm_headless`** (default off; /settings row next to the
   other keep-warm rows) lets daemon sessions driven by `synaps chat`,
   rpc-over-daemon or server clients (bridges, scripts) keep their prompt
