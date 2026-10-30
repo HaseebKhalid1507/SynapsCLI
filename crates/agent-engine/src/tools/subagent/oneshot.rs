@@ -188,6 +188,7 @@ impl Tool for SubagentTool {
                     super::apply_subagent_runtime_policy(&mut runtime, &crate::config::load_config(), memory_backend.as_ref(), session_allow_all.as_ref(), telemetry.as_ref(), &workspace);
                     runtime.set_system_prompt(super::compose_system_prompt(system_prompt, runtime.memory_backend_is_axel()));
                     runtime.set_model(model);
+                    super::fit_subagent_context_window(&mut runtime);
                     super::apply_codex_worker_reasoning(&mut runtime, codex_parent_plan.as_ref());
                     super::apply_subagent_thinking(&mut runtime, thinking)?;
                     // Rolled-over context goes to the worker archive directory.

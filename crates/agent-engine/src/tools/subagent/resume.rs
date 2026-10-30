@@ -538,6 +538,7 @@ impl Tool for SubagentResumeTool {
                             runtime.memory_backend_is_axel(),
                         ));
                         runtime.set_model(model_a.clone());
+                        super::fit_subagent_context_window(&mut runtime);
                         super::apply_codex_worker_reasoning(
                             &mut runtime,
                             codex_parent_plan.as_ref(),

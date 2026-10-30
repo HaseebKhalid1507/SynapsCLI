@@ -156,6 +156,23 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Subagent workers rolled their context over every few tool calls.**
+  Workers never got the configured `context_window`, so every worker
+  budgeted against the 200k model default and sent no 1M opt-in. On Opus
+  the next round's reserves (the 128k output envelope, the next tool result
+  and the 15% safety margin) come to about 168k of that, so a worker hit
+  hard capacity at about 32k and rolled over into a successor of about 9k
+  that was full again five tool calls later: four Opus 5.5 workers rolled
+  over 28–37 times in 20 minutes, with requests of only ~20k. Workers now
+  get `context_window` like the foreground, except a window their model
+  cannot open (a 1m setting on a model without 1M support keeps the model
+  default). A worker whose window cannot hold a successor at the rollover
+  target once the reserves are taken no longer rolls over at hard capacity:
+  its requests go out as before worker rollover, and it logs one warning
+  per turn. A hard-capacity successor that would start at hard capacity
+  again is refused too. See
+  [docs/design/subagent-rollover.md](docs/design/subagent-rollover.md#context-window).
+
 - **Screenshot-heavy subagents rewrote the whole prompt cache on every
   round.** Past 6 images, the worker upload budget retired one old image
   per new one, which changed the request far behind the tail, so nothing

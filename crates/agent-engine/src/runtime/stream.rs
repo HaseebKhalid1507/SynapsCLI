@@ -821,6 +821,8 @@ impl StreamMethods {
             worker_context.resolve(context_window)
         };
         let mut worker_policy_state = agent_core::core::context_policy::ContextState::default();
+        // Warn once per turn when the window is too small to roll over in.
+        let mut worker_reserve_warned = false;
         let mut worker_window = super::worker_context::window_state(&messages).0;
         // Set by a committed rollover (worker or foreground): the next request
         // is the first of its window (telemetry `rollover: true`).
@@ -1539,21 +1541,42 @@ impl StreamMethods {
                 calibration_probe = Some((used, usage_counters.records()));
                 let decision = assess_context(&worker_policy.config, &worker_policy_state, budget);
                 worker_policy_state = decision.next_state;
-                if matches!(decision.action, ContextAction::Rollover | ContextAction::HardStop) {
+                let hard_capacity = decision.action == ContextAction::HardStop;
+                // The next round's reserves, as `assess_context` compares them.
+                let required = budget
+                    .required_next_round_tokens
+                    .max(worker_policy.config.reserve_tokens);
+                // A window its reserves dominate cannot hold a successor of
+                // the policy's target: rolling over there only thrashes.
+                // Send the request as before worker rollover and let the
+                // provider judge it.
+                let reserve_dominated =
+                    hard_capacity && !worker_policy.hard_capacity_has_room(context_window, required);
+                if reserve_dominated && !worker_reserve_warned {
+                    worker_reserve_warned = true;
+                    tracing::warn!(
+                        model = %model,
+                        context_window,
+                        used_tokens = used,
+                        required_next_round_tokens = required,
+                        target_tokens = worker_policy.target_tokens(),
+                        "worker context rollover skipped at hard capacity: the next round's reserves leave this window no room for a successor at the rollover target; requests go to the provider unchanged"
+                    );
+                }
+                if matches!(decision.action, ContextAction::Rollover | ContextAction::HardStop)
+                    && !reserve_dominated
+                {
                     let overhead = used.saturating_sub(super::context::estimate_history(&messages));
                     let calibration = continuation
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .calibration_for(&model);
-                    let hard_capacity = decision.action == ContextAction::HardStop;
                     let mut target = worker_policy.successor_budget(overhead, calibration);
                     if hard_capacity {
                         target = super::worker_context::hard_capacity_budget(
                             target,
                             context_window,
-                            budget
-                                .required_next_round_tokens
-                                .max(worker_policy.config.reserve_tokens),
+                            required,
                             overhead,
                         );
                     }
@@ -1564,7 +1587,7 @@ impl StreamMethods {
                         overhead,
                         worker_policy,
                         worker_sink,
-                        hard_capacity,
+                        hard_capacity.then(|| context_window.saturating_sub(required)),
                     ) {
                         Ok(Some((successor, report))) => {
                             tracing::info!(
@@ -6516,6 +6539,19 @@ mod rich_output_tests {
         dir: &std::path::Path,
         stem: &str,
     ) -> WorkerRun {
+        drive_worker_on("claude-sonnet-4-6", initial, rounds, window, rollover_tokens, dir, stem).await
+    }
+
+    /// [`drive_worker`] on `model` (its output envelope sets the reserves).
+    async fn drive_worker_on(
+        model: &str,
+        initial: Vec<SharedMessage>,
+        rounds: usize,
+        window: u64,
+        rollover_tokens: u64,
+        dir: &std::path::Path,
+        stem: &str,
+    ) -> WorkerRun {
         use crate::runtime::worker_context::{
             WorkerContext, WorkerContextSettings, WorkerRolloverReport, WorkerTranscriptSink,
         };
@@ -6539,7 +6575,7 @@ mod rich_output_tests {
             tool_session_id,
             Default::default(),
             false,
-            "claude-sonnet-4-6",
+            model,
         );
         let writer = crate::runtime::telemetry::TelemetryWriter::new(
             crate::runtime::telemetry::WriterOptions {
@@ -6690,18 +6726,87 @@ mod rich_output_tests {
         assert!(run.records.iter().all(|r| r["worker"] == true));
     }
 
+    /// Rounds of `run` at which the history shrank (a rollover's first request).
+    fn rollover_rounds(run: &WorkerRun) -> Vec<usize> {
+        let len = |b: &Value| b["messages"].as_array().map_or(0, Vec::len);
+        (1..run.bodies.len()).filter(|&i| len(&run.bodies[i]) < len(&run.bodies[i - 1])).collect()
+    }
+
     #[tokio::test]
     async fn worker_at_hard_capacity_rolls_over_instead_of_failing() {
-        // A 120k window: the next round's output reserve leaves room for
-        // under 50k of context, so hard capacity comes before the rollover
-        // band (108k). The worker must still roll over and finish.
+        // A 200k Sonnet window: the next round reserves ~104k (64k output
+        // envelope, 10k tool result, 30k safety margin), so hard capacity
+        // (~95k) comes before the rollover band (180k), but the window still
+        // holds a successor at the 93k target. The worker rolls over there
+        // into a successor with room to grow, and finishes.
         let tmp = tempfile::tempdir().unwrap();
         let initial = vec![Arc::new(json!({"role":"user","content":BRIEF})) as SharedMessage];
-        let run = drive_worker(initial, 40, 120_000, 200_000, tmp.path(), "sa_8").await;
+        let run = drive_worker(initial, 60, 200_000, 200_000, tmp.path(), "sa_8").await;
+        assert_eq!(run.bodies.len(), 61);
+        assert!(!run.reports.is_empty());
+        assert!(run.reports.iter().all(|r| r.before_tokens < 180_000), "{:?}", run.reports);
+        // Each successor starts a third of the room below hard capacity, so
+        // windows last a dozen rounds here, not two or three.
+        let hard_line = 200_000 - (64_000 + 10_000 + 30_000 + 512);
+        assert!(run.reports.iter().all(|r| r.after_tokens < hard_line), "{:?}", run.reports);
+        let rounds = rollover_rounds(&run);
+        assert!(rounds.len() >= 2 && rounds.windows(2).all(|w| w[1] - w[0] >= 10), "{rounds:?}");
+        assert_eq!(run.history[0]["content"], BRIEF);
+    }
+
+    /// The live thrash (#332): an Opus 5.5 worker on the 200k default window
+    /// reserved 128k of output envelope for the next round, so hard capacity
+    /// sat near 32k and it rolled over every few tool calls into ~9k
+    /// successors (28-37 rollovers in 20 minutes). Such a window cannot hold
+    /// a successor at the rollover target: no rollover, every round still
+    /// reaches the provider, nothing is evicted. Same for the 120k window
+    /// the old hard-capacity test used.
+    #[tokio::test]
+    async fn worker_in_a_reserve_dominated_window_never_rolls_over() {
+        for (model, window, stem) in [
+            ("claude-opus-5-5", 200_000, "sa_12"),
+            ("claude-sonnet-4-6", 120_000, "sa_13"),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let initial = vec![Arc::new(json!({"role":"user","content":BRIEF})) as SharedMessage];
+            let run = drive_worker_on(model, initial, 40, window, 200_000, tmp.path(), stem).await;
+            assert!(run.reports.is_empty(), "{model}: {:?}", run.reports);
+            assert_eq!(run.bodies.len(), 41, "{model}");
+            assert!(rollover_rounds(&run).is_empty(), "{model}");
+            assert_eq!(run.history.len(), 82, "{model}: brief + 40 rounds + final answer");
+            assert!(!run.notices.iter().any(|n| n.contains("rolled over")), "{model}");
+            assert!(std::fs::read_dir(tmp.path()).unwrap().flatten().all(|e| !e
+                .file_name()
+                .to_string_lossy()
+                .contains(".window-")), "{model}");
+            // The last request was well past hard capacity by the estimate.
+            let last = run.bodies.last().unwrap()["messages"].as_array().unwrap().len();
+            assert_eq!(last, 81, "{model}");
+        }
+    }
+
+    /// The same Opus worker on the window it now inherits (1m): the reserves
+    /// are under a third of it, so the configured band governs, not them.
+    #[tokio::test]
+    async fn opus_worker_on_a_1m_window_rolls_at_its_band() {
+        let tmp = tempfile::tempdir().unwrap();
+        let initial = vec![Arc::new(json!({"role":"user","content":BRIEF})) as SharedMessage];
+        let run =
+            drive_worker_on("claude-opus-5-5", initial, 40, 1_000_000, 60_000, tmp.path(), "sa_14").await;
         assert_eq!(run.bodies.len(), 41);
         assert!(!run.reports.is_empty());
-        assert!(run.reports.iter().all(|r| r.before_tokens < 108_000), "{:?}", run.reports);
-        assert_eq!(run.history[0]["content"], BRIEF);
+        let target = crate::runtime::worker_context::WorkerContextSettings {
+            enabled: true,
+            rollover_tokens: 60_000,
+        }
+        .policy(1_000_000)
+        .unwrap()
+        .target_tokens();
+        for r in &run.reports {
+            assert!(r.before_tokens >= 60_000 && r.after_tokens <= target, "{r:?}");
+        }
+        let rounds = rollover_rounds(&run);
+        assert!(rounds.windows(2).all(|w| w[1] - w[0] >= 5), "{rounds:?}");
     }
 
     #[tokio::test]
