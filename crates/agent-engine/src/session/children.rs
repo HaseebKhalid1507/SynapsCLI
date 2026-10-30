@@ -53,7 +53,12 @@
 //!   its own walk (never the member queries' shared one). It
 //!   judges only records (and host entries) inserted before it began: each
 //!   carries an insert sequence, and a record added during or after the walk
-//!   is never ended or dropped by it. Records outlive their daemon session.
+//!   is never ended or dropped by it. A sweep drops only records that had
+//!   ended before it was claimed: one that ends during it (by the sweep
+//!   itself, or reaped or found gone while the walk runs) is judged by a
+//!   later sweep, since a walk never lists a pid forked after it passed
+//!   that pid's place. A leader pid found reused still drops the record at
+//!   once: its session is gone. Records outlive their daemon session.
 //! - **Reload.** [`snapshot_for_reload`] / [`restore_after_reload`] carry the
 //!   records across the daemon's exec. On restore a record is dropped when
 //!   its boot id differs, or when its pid is alive with other start ticks
@@ -292,7 +297,21 @@ pub const MAX_MEMBERS_PER_REPLY: usize = 4096;
 #[derive(Debug, Clone)]
 struct Kept {
     seq: u64,
+    /// The sequence taken when it turned ended (its insert sequence while
+    /// running or when it came in ended): a sweep claimed at or before it
+    /// keeps the record.
+    ended_at: u64,
     record: ChildRecord,
+}
+
+impl Kept {
+    /// Turn it ended at sequence `at`; one already ended keeps its first end.
+    fn end(&mut self, at: u64) {
+        if self.record.state == ChildState::Running {
+            self.record.state = ChildState::Ended;
+            self.ended_at = at;
+        }
+    }
 }
 
 impl std::ops::Deref for Kept {
@@ -420,7 +439,7 @@ impl Ledger {
             return false;
         }
         let seq = self.next_seq();
-        self.records.push_back(Kept { seq, record });
+        self.records.push_back(Kept { seq, ended_at: seq, record });
         true
     }
 
@@ -442,9 +461,10 @@ impl Ledger {
 
     /// Mark the record of `child` ended. False when there is none.
     pub fn mark_ended(&mut self, child: &ChildIdentity, exit_code: Option<i32>, signal: Option<i32>) -> bool {
+        let at = self.next_seq();
         match self.records.iter_mut().find(|r| same_process(&r.child, child)) {
             Some(record) => {
-                record.state = ChildState::Ended;
+                record.end(at);
                 record.exit_code = exit_code;
                 record.signal = signal;
                 true
@@ -457,9 +477,10 @@ impl Ledger {
     /// record, if still that process and running, turns ended (code and
     /// signal unknown). Never the other way. Returns the record's state now.
     fn observe_gone(&mut self, child: &ChildIdentity) -> Option<(ChildState, Option<i32>, Option<i32>)> {
+        let at = self.next_seq();
         let record = self.records.iter_mut().find(|r| same_process(&r.child, child))?;
         if record.state == ChildState::Running {
-            record.state = ChildState::Ended;
+            record.end(at);
             record.exit_code = None;
             record.signal = None;
         }
@@ -470,10 +491,16 @@ impl Ledger {
     /// `watermark`: only records (and host entries) inserted before that are
     /// judged, so a child spawned during or after the walk is never ended or
     /// dropped by a scan that could not see it. A running record whose
-    /// leader is gone, reused or a zombie becomes ended, and an ended record
-    /// with no live process left in its sid is dropped. Zombies count as gone
-    /// throughout. Sessions truncated with no record left expire.
+    /// leader is gone, reused or a zombie becomes ended. A record that had
+    /// ended before the claim is dropped when no live process is left in its
+    /// sid; one that ended since (now, or while the walk ran) waits for the
+    /// next sweep, as the walk may have missed a pid forked during it. A
+    /// reused leader pid drops either. Zombies count as gone throughout.
+    /// Sessions truncated with no record left expire.
     pub fn apply_sweep(&mut self, scan: &[(u32, StatFields)], watermark: u64) {
+        // No scan is claimed after now (tests pass u64::MAX for everything).
+        let watermark = watermark.min(self.next_seq);
+        let ended_now = self.next_seq();
         let live_sids: HashSet<u32> = scan.iter().filter(|(_, s)| s.is_live()).map(|(_, s)| s.sid).collect();
         let live: HashMap<u32, u64> =
             scan.iter().filter(|(_, s)| s.is_live()).map(|(pid, s)| (*pid, s.start_ticks)).collect();
@@ -481,19 +508,19 @@ impl Ledger {
         let present: HashMap<u32, u64> = scan.iter().map(|(pid, s)| (*pid, s.start_ticks)).collect();
         for record in self.records.iter_mut().filter(|r| r.seq < watermark) {
             if record.state == ChildState::Running && live.get(&record.child.pid) != Some(&record.child.start_ticks) {
-                record.state = ChildState::Ended;
+                record.end(ended_now);
             }
         }
         // The kernel never reuses a pid while it still names a session, so a
         // leader's pid alive with other start_ticks means its session is gone
-        // and the live sid of that number belongs to someone else.
-        let session_alive = |r: &ChildRecord| {
+        // and the live sid of that number belongs to someone else. An empty
+        // sid is no such proof for a record ended since the claim.
+        let session_alive = |r: &Kept| {
             let leader_reused = r.child.sid == r.child.pid
                 && present.get(&r.child.pid).is_some_and(|t| *t != r.child.start_ticks);
-            !leader_reused && live_sids.contains(&r.child.sid)
+            !leader_reused && (r.ended_at >= watermark || live_sids.contains(&r.child.sid))
         };
-        self.records
-            .retain(|r| r.seq >= watermark || r.state == ChildState::Running || session_alive(&r.record));
+        self.records.retain(|r| r.seq >= watermark || r.state == ChildState::Running || session_alive(r));
         self.host
             .retain(|h| h.seq >= watermark || live.get(&h.host.child.pid) == Some(&h.host.child.start_ticks));
         let with_records: HashSet<&str> = self.records.iter().map(|r| r.session_id.as_str()).collect();
@@ -1210,6 +1237,43 @@ mod tests {
         l.finish_sweep(Some(&[(91, stat(91, 5)), (92, stat(92, 5))]), next, t0 + SWEEP_EVERY);
         assert_eq!(l.records.iter().find(|r| r.child.pid == 91).map(|r| r.state), Some(ChildState::Running));
         assert_eq!(l.list(None, None).host.len(), 1);
+    }
+
+    /// A walk never lists a pid forked after it passed that pid's place. A
+    /// leader that forks a background job and exits while a sweep's walk
+    /// runs leaves a sid that walk reads empty: the sweep ends the record but
+    /// keeps it, as it keeps one the tool reaped meanwhile. The next walk
+    /// lists the jobs and keeps both; one that finds their sids empty drops
+    /// them.
+    #[test]
+    fn a_sweep_keeps_what_ended_during_it_until_a_later_walk_judges_its_sid() {
+        let mut l = Ledger::new();
+        l.insert("s", spawn("exited", ident(90, 5, 90)));
+        l.insert("s", spawn("reaped", ident(91, 5, 91)));
+        let states = |l: &Ledger| l.records.iter().map(|r| (r.tool_id.clone(), r.state)).collect::<Vec<_>>();
+        let both_ended = vec![("exited".to_string(), ChildState::Ended), ("reaped".to_string(), ChildState::Ended)];
+        let t0 = Instant::now();
+        let watermark = l.claim_sweep(t0).expect("due");
+        // The walk ran here: 90 and 91 forked 95 and 96 past its last batch
+        // and exited, so it lists none of them; the tool reaped 91.
+        l.mark_ended(&ident(91, 5, 91), Some(0), None);
+        l.finish_sweep(Some(&[(1, stat(1, 1))]), watermark, t0);
+        assert_eq!(states(&l), both_ended, "ended during the sweep: kept");
+        let t1 = t0 + SWEEP_EVERY;
+        let next = l.claim_sweep(t1).expect("due again");
+        l.finish_sweep(Some(&[(1, stat(1, 1)), (95, stat(90, 9)), (96, stat(91, 9))]), next, t1);
+        assert_eq!(states(&l), both_ended, "a later walk lists the jobs");
+        let t2 = t1 + SWEEP_EVERY;
+        let last = l.claim_sweep(t2).expect("due again");
+        l.finish_sweep(Some(&[(1, stat(1, 1))]), last, t2);
+        assert!(l.records.is_empty(), "ended before this sweep, with an empty sid: dropped");
+        // The same for a scan applied with no claim.
+        let mut m = Ledger::new();
+        m.insert("s", spawn("exited", ident(90, 5, 90)));
+        m.apply_sweep(&[], u64::MAX);
+        assert_eq!(states(&m), vec![("exited".to_string(), ChildState::Ended)]);
+        m.apply_sweep(&[], u64::MAX);
+        assert!(m.records.is_empty());
     }
 
     /// A reply checks each listed running leader now: a zombie (or gone)
