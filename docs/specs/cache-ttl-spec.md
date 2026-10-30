@@ -902,10 +902,23 @@ cached something:
   (§7.3: 4.5 min on 5m, 55 min on 1h) and again after each accepted ping,
   on the monotonic and wall clocks (`WALL_POLL`), never inside `LATE_GUARD`
   of expiry.
-- **Stop.** When the tools return (before the results request goes out, so
-  no ping races it), on turn cancel (child token of the turn's), and on any
-  other way out of the round (the guard's `Drop`). A ping in flight is
-  aborted and booked by `ping_booking`.
+- **Stop.** When the tools return, no new ping is scheduled, but a ping
+  already in flight finishes — for up to `FINISH_GRACE` (20 s; the 122 real
+  keep-warm pings in the api-log took p50 1.9 s, p95 11 s, max 15.8 s) —
+  and is booked like any other before the results request goes out. Only a
+  turn cancel (the abort token is a child of the turn's), any other way out
+  of the round (the guard's `Drop`), or the grace running out aborts one in
+  flight. Either way the ping is settled before the next request is sent,
+  so no ping races it on the client. On the provider an aborted ping may
+  still be processed beside the next request; that is harmless: both read
+  the same prefix and the ping writes nothing (its tail is uncached).
+- **Booking.** By the idle keep-warm's rule (`ping_booking`): measured
+  usage is booked by the transport; a ping dispatched with no usage seen
+  (aborted in flight, a read timeout) is booked at its worst case — the
+  whole prefix read, `PING_INPUT_ESTIMATE` uncached, `max_tokens` out —
+  into the turn's counters and as a `Usage` event; a ping refused before
+  the network or rejected with an HTTP error books nothing. A sent ping is
+  never missing from the turn's usage or cost.
 - **Guards** (the idle period's, §7.2/§7.5): the ski-rental bound on the
   expected cost against one rewrite of the prefix at the honoured TTL; the
   turn's `max_cost_usd`; stop on a ping that read nothing or wrote / paid
@@ -930,11 +943,17 @@ instead would have cost $405.59 more in writes to save $19.84.
 
 Tests: `runtime::stream` `tool_keepwarm_stream` (a cache-simulating
 provider, `tests/support/cache_sim.rs`: pings after the threshold, repeat,
-stop on completion and cancel, none for a short round, byte-level prefix
-equality, the request after the round reads the whole prefix; the control
-without keep-warm rewrites it), `tools::subagent::worker_tool_keepwarm_tests`
-(no host) and `tests/worker_tool_keepwarm.rs` (host and legacy branches),
-each over oneshot, start and resume, with the key off as control.
+none for a short round, byte-level prefix equality, the request after the
+round reads the whole prefix; a ping in flight when the tools return
+completes and is booked as measured before the next request; one past the
+grace, or in flight at a cancel, is aborted and booked at its worst case;
+the control without keep-warm rewrites the prefix),
+`tools::subagent::worker_tool_keepwarm_tests` (no host) and
+`tests/worker_tool_keepwarm.rs` (host and legacy branches), each over
+oneshot, start and resume, with the key off as control. Deterministic: the
+simulated cache runs on a virtual clock the script moves (0.6 TTL per
+ping), and a round's tool returns when the sim releases it (after its Nth
+ping), so no assertion depends on how fast the machine is.
 
 ## 8. `cache_ttl = auto` (the default)
 

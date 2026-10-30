@@ -2241,9 +2241,9 @@ mod worker_tool_keepwarm_tests {
         std::fs::write(base.path().join("auth.json"), super::worker_wire::OAUTH_AUTH_JSON).unwrap();
         std::fs::write(base.path().join("config"), "").unwrap();
         let (url, sim) = cache_sim::spawn(
-            cache_sim::WORKER_TTL,
+            cache_sim::Script::kept_warm(2),
             "bash",
-            json!({"command": cache_sim::WORKER_SLEEP}),
+            json!({"command": cache_sim::WORKER_COMMAND}),
         )
         .await;
         let _env = [
@@ -2265,6 +2265,7 @@ mod worker_tool_keepwarm_tests {
 
         // Control: the key off, the same worker rewrites its prefix.
         std::fs::write(base.path().join("config"), "cache_keepwarm_tools = off\n").unwrap();
+        sim.lock().unwrap().script = cache_sim::Script::outlives_ttl();
         cache_sim::assert_worker_rewrites("no-host off", &oneshot(&sim).await);
     }
 }

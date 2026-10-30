@@ -5025,10 +5025,10 @@ impl Runtime {
             max_tool_output,
             tool_spill: self.tool_spill(),
             read_dedupe: self.read_dedupe,
-            tool_keepwarm: self.tool_keepwarm.then(|| tool_keepwarm::ToolKeepWarm {
-                trace: self.trace_ctx.clone(),
-                interval_override: tool_keepwarm::interval_override(),
-            }),
+            tool_keepwarm: self.tool_keepwarm.then(|| tool_keepwarm::ToolKeepWarm::new(
+                self.trace_ctx.clone(),
+                tool_keepwarm::interval_override(),
+            )),
             bash_timeout,
             bash_max_timeout,
             subagent_timeout,

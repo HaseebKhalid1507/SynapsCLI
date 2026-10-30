@@ -7769,26 +7769,34 @@ mod rich_output_tests {
 
     /// Tool-round keep-warm (`runtime::tool_keepwarm`) on the wire, against
     /// a provider that simulates prompt caching (`tests/support/cache_sim.rs`).
+    /// Deterministic: the cache runs on the sim's virtual clock and the tool
+    /// returns when the sim releases it, so nothing asserted here depends on
+    /// how fast the machine is (real time only paces the pings).
     mod tool_keepwarm_stream {
         use super::*;
+        use crate::runtime::cache_sim::{self, Script};
         use crate::runtime::tool_keepwarm::ToolKeepWarm;
+        use crate::session::cache_keepwarm::PING_INPUT_ESTIMATE;
         use std::time::{Duration, Instant};
 
-        use crate::runtime::cache_sim;
-
-        /// A tool that takes `.0` to return (it ignores cancellation, like a
-        /// command that only notices it after the fact).
-        struct Slow(Duration);
+        /// A tool that runs until the sim releases it (its `go` file
+        /// appears), then for `then` more; with `cancel`, it then cancels
+        /// the turn and keeps running (like a command that notices only
+        /// after the fact).
+        struct Gated {
+            cancel: Option<CancellationToken>,
+            then: Duration,
+        }
         #[async_trait::async_trait]
-        impl Tool for Slow {
+        impl Tool for Gated {
             fn name(&self) -> &str {
-                "slow"
+                "gated"
             }
             fn description(&self) -> &str {
                 "a long build"
             }
             fn parameters(&self) -> Value {
-                json!({"type":"object","properties":{}})
+                json!({"type":"object","properties":{"go":{"type":"string"}}})
             }
             fn origin(&self) -> crate::tools::ToolOrigin {
                 crate::tools::ToolOrigin::Builtin
@@ -7796,25 +7804,47 @@ mod rich_output_tests {
             fn effect(&self) -> crate::tools::catalog::ToolEffect {
                 crate::tools::catalog::ToolEffect::ReadOnly
             }
-            async fn execute(&self, _params: Value, _ctx: ToolContext) -> Result<String> {
-                tokio::time::sleep(self.0).await;
+            async fn execute(&self, params: Value, _ctx: ToolContext) -> Result<String> {
+                let go = std::path::PathBuf::from(params["go"].as_str().unwrap());
+                while !go.exists() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                tokio::time::sleep(self.then).await;
+                if let Some(cancel) = &self.cancel {
+                    cancel.cancel();
+                    std::future::pending::<()>().await;
+                }
                 Ok("built".to_string())
             }
         }
 
-        /// The simulated cache's TTL: a round of [`LONG`] outlives it.
-        const TTL: Duration = Duration::from_millis(700);
-        const INTERVAL: Duration = Duration::from_millis(250);
-        const LONG: Duration = Duration::from_millis(1600);
+        /// The ping interval (real time). A short round never reaches the
+        /// long one.
+        const INTERVAL: Duration = Duration::from_millis(40);
+        const NEVER: Duration = Duration::from_secs(3600);
+
+        #[derive(Default)]
+        struct Opts {
+            /// `None` = keep-warm off.
+            interval: Option<Duration>,
+            cancel_on_release: bool,
+            /// How long the tool runs once released.
+            tool_tail: Duration,
+            finish_grace: Option<Duration>,
+            /// Release the held ping when the round's end starts waiting
+            /// for it.
+            release_held_on_finish: bool,
+        }
+
+        /// `(input, read, write)` of a request or a `Usage` event.
+        type Bill = (u64, u64, u64);
 
         struct Run {
             requests: Vec<cache_sim::Req>,
             sim: Arc<Mutex<cache_sim::Sim>>,
-            /// `Usage` events the turn emitted (rounds and pings).
-            usage_events: usize,
-            cancelled_at: Option<Instant>,
+            /// The turn's `Usage` events (rounds and pings), in order.
+            usage: Vec<Bill>,
             started: Instant,
-            elapsed: Duration,
         }
 
         impl Run {
@@ -7824,17 +7854,28 @@ mod rich_output_tests {
             fn requests_now(&self) -> usize {
                 self.sim.lock().unwrap().requests.len()
             }
+            /// What the provider billed, per request, in order.
+            fn billed(&self) -> Vec<Bill> {
+                self.requests.iter().map(|r| (r.input, r.read, r.write)).collect()
+            }
+            /// No request is ever sent again (the task is gone: waited for
+            /// by the turn).
+            async fn assert_quiet(&self) {
+                let count = self.requests_now();
+                tokio::time::sleep(INTERVAL * 4).await;
+                assert_eq!(self.requests_now(), count, "a request after the turn");
+            }
         }
 
-        async fn run(
-            tool_time: Duration,
-            keepwarm: Option<Duration>,
-            cancel_after: Option<Duration>,
-        ) -> Run {
-            let (url, sim) = cache_sim::spawn(TTL, "slow", json!({})).await;
-            let mut registry = ToolRegistry::new();
-            registry.register(Arc::new(Slow(tool_time)));
+        async fn run(script: Script, opts: Opts) -> Run {
+            let (url, sim) = cache_sim::spawn(script, "gated", json!({"go": "{go}"})).await;
             let (tx, mut rx) = mpsc::unbounded_channel::<StreamEvent>();
+            let cancel = CancellationToken::new();
+            let mut registry = ToolRegistry::new();
+            registry.register(Arc::new(Gated {
+                cancel: opts.cancel_on_release.then(|| cancel.clone()),
+                then: opts.tool_tail,
+            }));
             let mut session = harness_session(
                 url,
                 Arc::new(RwLock::new(registry)),
@@ -7853,67 +7894,85 @@ mod rich_output_tests {
                 false,
                 "claude-sonnet-4-6",
             );
+            session.cancel = cancel;
             session.system_prompt = Some(format!("a worker\n{}", "context ".repeat(4000)));
-            session.tool_keepwarm = keepwarm.map(|interval| ToolKeepWarm {
+            let hook = Arc::new(tokio::sync::Notify::new());
+            session.tool_keepwarm = opts.interval.map(|interval| ToolKeepWarm {
                 trace: Default::default(),
                 interval_override: Some(interval),
+                finish_grace: opts.finish_grace,
+                finish_hook: Some(Arc::clone(&hook)),
             });
-            let cancelled_at = Arc::new(Mutex::new(None));
-            if let Some(after) = cancel_after {
-                let (cancel, at) = (session.cancel.clone(), cancelled_at.clone());
+            if opts.release_held_on_finish {
+                let sim = Arc::clone(&sim);
                 tokio::spawn(async move {
-                    tokio::time::sleep(after).await;
-                    *at.lock().unwrap() = Some(Instant::now());
-                    cancel.cancel();
+                    hook.notified().await;
+                    cache_sim::release_held(&sim);
                 });
             }
             let started = Instant::now();
             let messages = vec![Arc::new(json!({"role":"user","content":"build it"})) as SharedMessage];
             let _ = tokio::time::timeout(
-                Duration::from_secs(30),
+                Duration::from_secs(60),
                 StreamMethods::run_stream_internal(session, messages),
             )
             .await
             .expect("the turn ends");
-            let elapsed = started.elapsed();
-            let mut usage_events = 0;
+            let mut usage = Vec::new();
             while let Ok(event) = rx.try_recv() {
-                if matches!(event, StreamEvent::Session(SessionEvent::Usage { .. })) {
-                    usage_events += 1;
+                if let StreamEvent::Session(SessionEvent::Usage {
+                    input_tokens,
+                    cache_read_input_tokens,
+                    cache_creation_input_tokens,
+                    ..
+                }) = event
+                {
+                    usage.push((input_tokens, cache_read_input_tokens, cache_creation_input_tokens));
                 }
             }
             let requests = sim.lock().unwrap().requests.clone();
-            let cancelled_at = *cancelled_at.lock().unwrap();
             Run {
                 requests,
                 sim,
-                usage_events,
-                cancelled_at,
+                usage,
                 started,
-                elapsed,
             }
+        }
+
+        /// A ping booked at its worst case: the whole prefix read, the
+        /// input estimate uncached, nothing written.
+        fn worst_case(prefix: u64) -> Bill {
+            (PING_INPUT_ESTIMATE, prefix, 0)
         }
 
         /// Pings fire once the round has run for the interval, repeat while
         /// it runs, are the round's request plus the ping text (same tools,
         /// system, markers and history), keep the prefix alive, and stop
         /// when the tools return: the next request reads the whole prefix.
+        /// Each ping moves the virtual clock by 0.6 TTL; the tool returns
+        /// after three, so without their refreshes the prefix would be
+        /// 1.8 TTL old.
         #[tokio::test]
         async fn a_long_round_is_kept_warm_and_the_next_request_reads_the_prefix() {
-            let run = run(LONG, Some(INTERVAL), None).await;
+            let run = run(
+                Script::kept_warm(3),
+                Opts {
+                    interval: Some(INTERVAL),
+                    ..Default::default()
+                },
+            )
+            .await;
             let pings = cache_sim::assert_round_kept_warm("stream", &run.requests);
-            // 1600 ms at 250 ms: due at 250, 500, ... 1500 (± scheduling).
-            assert!((4..=7).contains(&pings), "repeats while the round runs: {pings}");
-            // The interval runs from the round's send (the client clock, a
-            // little before the provider sees it), so bound it by the turn.
+            assert!(pings >= 3, "repeats while the round runs: {pings}");
+            let result = run.requests.last().unwrap();
+            assert!(result.vt >= cache_sim::TTL, "the round outlived the TTL: {:?}", result.vt);
+            // Not before the threshold: the interval runs from the round's
+            // send, after the turn started (a lower bound, load-proof).
             let first = run.pings()[0].at.duration_since(run.started);
             assert!(first >= INTERVAL, "not before the threshold: {first:?}");
-            // Every ping is booked into the turn.
-            assert_eq!(run.usage_events, run.requests.len(), "usage of every request");
-            // Stopped with the round: nothing after the result request.
-            let count = run.requests_now();
-            tokio::time::sleep(INTERVAL * 3).await;
-            assert_eq!(run.requests_now(), count, "no ping after the round");
+            // Every request is booked into the turn, as measured.
+            assert_eq!(run.usage, run.billed(), "usage of every request");
+            run.assert_quiet().await;
         }
 
         /// The control: the same round without keep-warm finds the cache
@@ -7921,45 +7980,119 @@ mod rich_output_tests {
         /// the simulated cache does expire).
         #[tokio::test]
         async fn without_keepwarm_a_long_round_rewrites_the_prefix() {
-            let run = run(LONG, None, None).await;
+            let run = run(Script::outlives_ttl(), Opts::default()).await;
             assert_eq!(run.requests.len(), 2, "the round and its result");
             let (round, result) = (&run.requests[0], &run.requests[1]);
             assert_eq!(result.read, 0, "expired");
             assert!(result.write >= round.cached_prefix(), "rewritten");
         }
 
-        /// A round shorter than the interval sends no ping.
+        /// A round shorter than the interval sends no ping (the tool runs
+        /// for 300 ms of real time against an hour's interval).
         #[tokio::test]
         async fn a_short_round_sends_no_ping() {
-            let run = run(Duration::from_millis(120), Some(INTERVAL), None).await;
-            assert_eq!(run.requests.len(), 2, "no ping: {:?}", run.pings().len());
-            assert!(run.requests[1].read >= run.requests[0].cached_prefix());
-            tokio::time::sleep(INTERVAL * 2).await;
-            assert_eq!(run.requests_now(), 2);
-        }
-
-        /// A cancelled turn stops the pings at once, while its tool is
-        /// still running.
-        #[tokio::test]
-        async fn cancel_stops_the_pings() {
             let run = run(
-                Duration::from_secs(8),
-                Some(INTERVAL),
-                Some(Duration::from_millis(900)),
+                Script::short(),
+                Opts {
+                    interval: Some(NEVER),
+                    tool_tail: Duration::from_millis(300),
+                    ..Default::default()
+                },
             )
             .await;
-            let cancelled = run.cancelled_at.expect("cancelled");
-            let pings = run.pings();
-            assert!(pings.len() >= 2, "pinged before the cancel: {}", pings.len());
-            assert!(
-                pings.iter().all(|p| p.at < cancelled + Duration::from_millis(50)),
-                "a ping after the cancel"
+            assert_eq!(run.requests.len(), 2, "no ping: {:?}", run.pings().len());
+            assert!(run.requests[1].read >= run.requests[0].cached_prefix());
+            run.assert_quiet().await;
+        }
+
+        /// The tools return while a ping is in flight: no new ping is
+        /// scheduled, the one in flight completes, is booked as measured,
+        /// and only then does the next request go out — reading the whole
+        /// prefix. The sim holds the second ping (it also releases the
+        /// tool) until the round's end is waiting for it. A 1 µs interval:
+        /// a ping is due again the moment the held one answers, so only the
+        /// stop keeps a third one from going out.
+        #[tokio::test]
+        async fn a_ping_in_flight_when_the_round_ends_completes_and_is_booked() {
+            let run = run(
+                Script {
+                    hold_ping: Some(2),
+                    ..Script::kept_warm(2)
+                },
+                Opts {
+                    interval: Some(Duration::from_micros(1)),
+                    release_held_on_finish: true,
+                    // Only the release ends the wait.
+                    finish_grace: Some(NEVER),
+                    ..Default::default()
+                },
+            )
+            .await;
+            let pings = cache_sim::assert_round_kept_warm("in flight", &run.requests);
+            assert_eq!(pings, 2, "no ping scheduled after the round ended");
+            let released = run.sim.lock().unwrap().held_released_at.expect("released");
+            assert_eq!(
+                released,
+                run.requests.len() - 1,
+                "the next request waited for the ping in flight"
             );
-            let count = run.requests_now();
-            tokio::time::sleep(INTERVAL * 3).await;
-            assert_eq!(run.requests_now(), count, "no ping after the cancel");
+            assert_eq!(run.usage, run.billed(), "the ping is booked as measured");
+            run.assert_quiet().await;
+        }
+
+        /// A ping still in flight when the grace runs out is aborted and
+        /// booked at its worst case; the next request still reads the
+        /// whole prefix (the ping wrote nothing).
+        #[tokio::test]
+        async fn a_ping_past_the_grace_is_aborted_and_booked_at_its_worst_case() {
+            let run = run(
+                Script {
+                    hold_ping: Some(2),
+                    ..Script::kept_warm(2)
+                },
+                Opts {
+                    interval: Some(INTERVAL),
+                    finish_grace: Some(Duration::from_millis(50)),
+                    ..Default::default()
+                },
+            )
+            .await;
+            let pings = cache_sim::assert_round_kept_warm("grace", &run.requests);
+            assert_eq!(pings, 2);
+            assert_eq!(run.sim.lock().unwrap().held_released_at, None, "never answered");
+            let prefix = run.requests[0].cached_prefix();
+            let mut expected = run.billed();
+            expected[2] = worst_case(prefix);
+            assert_eq!(run.usage, expected, "the aborted ping is booked at its worst case");
+            run.assert_quiet().await;
+        }
+
+        /// A cancelled turn aborts the ping in flight (booked at its worst
+        /// case) and sends nothing more.
+        #[tokio::test]
+        async fn cancel_aborts_the_ping_in_flight_and_books_it() {
+            let run = run(
+                Script {
+                    hold_ping: Some(2),
+                    ..Script::kept_warm(2)
+                },
+                Opts {
+                    interval: Some(INTERVAL),
+                    cancel_on_release: true,
+                    // Only the cancel can end the wait.
+                    finish_grace: Some(NEVER),
+                    ..Default::default()
+                },
+            )
+            .await;
+            assert_eq!(run.pings().len(), 2, "nothing after the held ping");
+            assert_eq!(run.requests.len(), 3, "the round and two pings");
             assert!(run.requests.iter().all(|r| !r.has_tool_result()), "cancelled");
-            let _ = run.elapsed;
+            let prefix = run.requests[0].cached_prefix();
+            let mut expected = run.billed();
+            expected[2] = worst_case(prefix);
+            assert_eq!(run.usage, expected, "the aborted ping is booked at its worst case");
+            run.assert_quiet().await;
         }
     }
 }

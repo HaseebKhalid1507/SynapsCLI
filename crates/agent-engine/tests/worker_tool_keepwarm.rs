@@ -138,9 +138,9 @@ async fn host_workers_keep_a_long_tool_round_warm_on_both_branches() {
     std::fs::write(base.path().join("config"), "").unwrap();
     agent_engine::config::set_base_dir_for_tests(base.path().to_path_buf());
     let (url, sim) = cache_sim::spawn(
-        cache_sim::WORKER_TTL,
+        cache_sim::Script::kept_warm(2),
         "bash",
-        json!({"command": cache_sim::WORKER_SLEEP}),
+        json!({"command": cache_sim::WORKER_COMMAND}),
     )
     .await;
     for key in [
@@ -180,6 +180,7 @@ async fn host_workers_keep_a_long_tool_round_warm_on_both_branches() {
 
     // Control: the key off through the host's config, on both branches.
     std::fs::write(base.path().join("config"), "cache_keepwarm_tools = off\n").unwrap();
+    sim.lock().unwrap().script = cache_sim::Script::outlives_ttl();
     host.reload_config();
     for branch in ["host", "legacy"] {
         if branch == "legacy" {

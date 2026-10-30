@@ -88,10 +88,13 @@ All notable changes to this project will be documented in this file.
   1.25×: 658k tokens from two such rounds in one day of logs. Now, 4.5 min
   into a round on 5m (55 min on 1h), the session re-sends that round's own
   request capped to a minimal reply, so the cache stays live and the next
-  request reads it. Pings repeat while the tools run, stop the moment they
-  return or the turn is cancelled, move no cache breakpoint and touch no
-  history; they use the idle keep-warm's cost bound and budgets and are
-  logged with `"keepwarm": true`. Covers the foreground and every worker
+  request reads it. Pings repeat while the tools run and stop when they
+  return (a ping already in flight finishes, up to 20 s, and is booked
+  before the next request) or the turn is cancelled (a ping in flight is
+  aborted and booked at its worst case, so turn cost never misses a sent
+  request). They move no cache breakpoint and touch no history; they use
+  the idle keep-warm's cost bound and budgets and are logged with
+  `"keepwarm": true`. Covers the foreground and every worker
   spawn path. Independent of `cache_keepwarm` (idle). See
   docs/specs/cache-ttl-spec.md §7.9.
 - **`cache_keepwarm_headless`** (default off; /settings row next to the
