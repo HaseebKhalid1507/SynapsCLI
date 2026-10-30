@@ -143,7 +143,18 @@ pub(crate) mod tests {
             .spawn()
             .unwrap();
         wait_for_name(child.id(), "python3");
-        let argv = cmdline(child.id());
+        // exec renames the process before it maps the new argument area, so
+        // for a moment the name is right and `cmdline` is still empty. Under
+        // a loaded test run that window is wide enough to hit; wait it out.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let argv = loop {
+            let argv = cmdline(child.id());
+            let empty = matches!(&argv, Ok(a) if a.is_empty());
+            if !empty || std::time::Instant::now() >= deadline {
+                break argv;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
         let _ = child.kill();
         let _ = child.wait();
         assert_eq!(argv.unwrap(), ["python3", "-c", script, "", "a b"]);
