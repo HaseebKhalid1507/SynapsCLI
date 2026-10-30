@@ -36,10 +36,26 @@
 //!   `SHARE_LIMIT_PERCENT` of the prefix, a 4xx, or exhausted transient
 //!   retries (`BACKOFF`).
 //!
-//! Every ping's usage is booked into the turn: the transport records it in
-//! the turn's usage counters (turn budget) and its `Usage` event is
-//! forwarded to the turn's event channel (session / worker cost).
+//! Stopping. When the tools return, no new ping is scheduled, but a ping
+//! already in flight is allowed to finish — for up to [`FINISH_GRACE`] —
+//! and is booked like any other before the next request goes out. Only a
+//! turn cancel, the stream ending, or the grace running out aborts one in
+//! flight. Either way the ping is settled before the round's next request
+//! is sent, so its usage never lands after that request's. (Provider-side
+//! order would not matter anyway: an aborted ping and the next request read
+//! the same prefix, and a ping writes nothing — its tail is uncached.)
+//!
+//! Booking. Every ping that may have been billed is booked into the turn,
+//! by the idle keep-warm's rule (`keepwarm::ping_booking`): with measured
+//! usage the transport records it in the turn's usage counters (turn
+//! budget) and its `Usage` event is forwarded to the turn's event channel
+//! (session / worker cost); a ping dispatched with no usage seen (aborted in
+//! flight, a read timeout) is booked at its worst case — the whole prefix
+//! read, [`PING_INPUT_ESTIMATE`] uncached, `max_tokens` out — through both;
+//! one refused before the network or rejected with an HTTP error books
+//! nothing.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -49,8 +65,8 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use super::api::{ApiMethods, ApiOptions, KeepWarmMode, KeepWarmRequest};
-use super::keepwarm::{CacheAnchor, PingFailure, PingTap};
-use super::types::{AuthState, StreamEvent};
+use super::keepwarm::{CacheAnchor, PingBooking, PingFailure, PingTap};
+use super::types::{AuthState, SessionEvent, StreamEvent};
 use crate::core::config::CacheTtl;
 use crate::session::cache_keepwarm::{
     governing_ttl, honoured_ttl, ping_interval, ping_output_estimate, request_cost_usd,
@@ -58,6 +74,14 @@ use crate::session::cache_keepwarm::{
     WALL_POLL,
 };
 use crate::{SharedMessage, ToolRegistry};
+
+/// How long the end of a tool round waits for a ping already in flight
+/// before aborting it (and booking it at its worst case). Longer than every
+/// keep-warm ping in the api-log so far (122 real pings: p50 1.9 s, p95
+/// 11 s, max 15.8 s): the wait only happens when a ping straddles the end of
+/// the round (a few seconds out of every 270 s interval), and it delays the
+/// next request by at most the rest of that ping.
+pub const FINISH_GRACE: Duration = Duration::from_secs(20);
 
 /// Per-turn settings: present only when `cache_keepwarm_tools` is on.
 #[derive(Debug, Clone, Default)]
@@ -68,6 +92,34 @@ pub struct ToolKeepWarm {
     /// Replaces `ping_interval(honoured TTL)` (tests only, see
     /// [`interval_override`]).
     pub interval_override: Option<Duration>,
+    /// Replaces [`FINISH_GRACE`] (tests only).
+    #[cfg(test)]
+    pub finish_grace: Option<Duration>,
+    /// Notified when the end of a round starts waiting for a ping in flight
+    /// (tests only: the sync point that releases a held ping).
+    #[cfg(test)]
+    pub finish_hook: Option<Arc<tokio::sync::Notify>>,
+}
+
+impl ToolKeepWarm {
+    pub fn new(trace: super::trace::TraceContext, interval_override: Option<Duration>) -> Self {
+        Self {
+            trace,
+            interval_override,
+            #[cfg(test)]
+            finish_grace: None,
+            #[cfg(test)]
+            finish_hook: None,
+        }
+    }
+
+    fn finish_grace(&self) -> Duration {
+        #[cfg(test)]
+        if let Some(grace) = self.finish_grace {
+            return grace;
+        }
+        FINISH_GRACE
+    }
 }
 
 /// The ping interval override, in ms (0 = none). Test-only, like the idle
@@ -225,16 +277,31 @@ struct Job {
     tx: mpsc::UnboundedSender<StreamEvent>,
 }
 
-/// Running keep-warm for one tool round. Dropping it stops the pings and
-/// aborts one in flight.
+/// The task's controls: `stop` ends the schedule (no new ping), `abort`
+/// (a child of the turn's cancel) also aborts a ping in flight.
+struct Controls {
+    stop: CancellationToken,
+    abort: CancellationToken,
+    in_flight: Arc<AtomicBool>,
+}
+
+/// Running keep-warm for one tool round. [`finish`](Self::finish) stops it
+/// gracefully; dropping it (any other way out of the round) aborts a ping
+/// in flight, which the task still books.
 pub(super) struct ToolRoundKeepWarm {
-    cancel: CancellationToken,
+    stop: CancellationToken,
+    abort: CancellationToken,
+    in_flight: Arc<AtomicBool>,
+    grace: Duration,
+    #[cfg(test)]
+    hook: Option<Arc<tokio::sync::Notify>>,
     handle: Option<tokio::task::JoinHandle<Stop>>,
 }
 
 impl Drop for ToolRoundKeepWarm {
     fn drop(&mut self) {
-        self.cancel.cancel();
+        self.stop.cancel();
+        self.abort.cancel();
     }
 }
 
@@ -318,20 +385,57 @@ impl ToolRoundKeepWarm {
             max_cost_usd: turn.max_cost_usd,
             tx: turn.tx.clone(),
         };
-        let cancel = turn.cancel.child_token();
-        let handle = tokio::spawn(job.run(cancel.clone()));
+        let controls = Controls {
+            stop: CancellationToken::new(),
+            abort: turn.cancel.child_token(),
+            in_flight: Arc::default(),
+        };
+        let (stop, abort, in_flight) = (
+            controls.stop.clone(),
+            controls.abort.clone(),
+            Arc::clone(&controls.in_flight),
+        );
+        let handle = tokio::spawn(job.run(controls));
         Some(Self {
-            cancel,
+            stop,
+            abort,
+            in_flight,
+            grace: settings.finish_grace(),
+            #[cfg(test)]
+            hook: settings.finish_hook.clone(),
             handle: Some(handle),
         })
     }
 
-    /// Stop the pings and wait for the task: why it stopped.
+    /// The round's tools are done: schedule no new ping, let one in flight
+    /// finish (up to the grace, then abort it), and wait until it is booked.
+    /// Returns why the pings stopped.
     pub(super) async fn finish(mut self) -> Stop {
-        self.cancel.cancel();
-        match self.handle.take() {
-            Some(handle) => handle.await.unwrap_or(Stop::Done),
-            None => Stop::Done,
+        self.stop.cancel();
+        let Some(mut handle) = self.handle.take() else {
+            return Stop::Done;
+        };
+        if self.in_flight.load(Ordering::Acquire) {
+            tracing::debug!(
+                event = "tool_round_keepwarm_drain",
+                "tool round done with a keep-warm ping in flight; letting it finish"
+            );
+            #[cfg(test)]
+            if let Some(hook) = &self.hook {
+                hook.notify_one();
+            }
+        }
+        match tokio::time::timeout(self.grace, &mut handle).await {
+            Ok(stop) => stop.unwrap_or(Stop::Done),
+            Err(_) => {
+                tracing::info!(
+                    event = "tool_round_keepwarm_grace_expired",
+                    grace_ms = self.grace.as_millis() as u64,
+                    "tool-round keep-warm ping still in flight at the end of the round; aborting"
+                );
+                self.abort.cancel();
+                handle.await.unwrap_or(Stop::Done)
+            }
         }
     }
 }
@@ -349,20 +453,52 @@ impl Job {
         mono.max(wall)
     }
 
-    /// Sleep until the next ping is due (either clock), or `false` when
-    /// cancelled first.
-    async fn wait_due(&self, cancel: &CancellationToken) -> bool {
+    /// Sleep until the next ping is due (either clock), or `false` once
+    /// stopped or aborted.
+    async fn wait_due(&self, c: &Controls) -> bool {
         loop {
+            if c.stop.is_cancelled() || c.abort.is_cancelled() {
+                return false;
+            }
             if self.elapsed() >= self.interval {
                 return true;
             }
             let due = self.anchor.mono + self.interval;
             let wake = due.min(Instant::now() + WALL_POLL);
             tokio::select! {
-                _ = cancel.cancelled() => return false,
+                _ = c.stop.cancelled() => return false,
+                _ = c.abort.cancelled() => return false,
                 _ = tokio::time::sleep_until(wake) => {}
             }
         }
+    }
+
+    /// Book a ping that may have been billed but reported no usage (aborted
+    /// in flight, a read timeout after dispatch) at its worst case, into the
+    /// turn's counters and event channel — where a measured ping's usage
+    /// goes. A measured ping is already booked by the transport.
+    fn book_unmeasured(&self, bill: &super::keepwarm::PingBill) {
+        if bill.booking != PingBooking::WorstCase {
+            return;
+        }
+        let (input, output, read) = (PING_INPUT_ESTIMATE, self.max_tokens, self.prefix_tokens);
+        self.usage
+            .record_priced(&self.model, input, output, read, 0, None, None);
+        let _ = self.tx.send(StreamEvent::Session(SessionEvent::Usage {
+            input_tokens: input,
+            output_tokens: output,
+            cache_read_input_tokens: read,
+            cache_creation_input_tokens: 0,
+            cache_creation_5m: None,
+            cache_creation_1h: None,
+            model: Some(self.model.clone()),
+        }));
+        tracing::info!(
+            event = "tool_round_keepwarm_unmeasured",
+            model = %self.model,
+            cost_usd = bill.cost_usd,
+            "tool-round keep-warm ping dispatched without usage; booked at its worst case"
+        );
     }
 
     fn ping_cost(&self, output: u64) -> f64 {
@@ -376,8 +512,8 @@ impl Job {
         )
     }
 
-    async fn run(mut self, cancel: CancellationToken) -> Stop {
-        let stop = self.pings(&cancel).await;
+    async fn run(mut self, controls: Controls) -> Stop {
+        let stop = self.pings(&controls).await;
         if stop != Stop::Done {
             tracing::info!(
                 event = "tool_round_keepwarm_stop",
@@ -389,7 +525,7 @@ impl Job {
         stop
     }
 
-    async fn pings(&mut self, cancel: &CancellationToken) -> Stop {
+    async fn pings(&mut self, c: &Controls) -> Stop {
         let rewrite = rewrite_cost_usd(&self.model, self.ttl, self.prefix_tokens);
         let worst = self.ping_cost(self.max_tokens);
         let mut expected = self.ping_cost(ping_output_estimate(self.max_tokens));
@@ -397,7 +533,7 @@ impl Job {
         let mut retries = 0usize;
         let mut pings = 0u32;
         loop {
-            if !self.wait_due(cancel).await {
+            if !self.wait_due(c).await {
                 return Stop::Done;
             }
             // Test intervals are far below the TTL; production ones leave
@@ -425,11 +561,18 @@ impl Job {
             {
                 return Stop::Failed(format!("auth refresh: {e}"));
             }
+            // The tools may have returned during the refresh.
+            if c.stop.is_cancelled() || c.abort.is_cancelled() {
+                return Stop::Done;
+            }
             let tap = PingTap::default();
             let sent_at = CacheAnchor::now();
-            let result = self.ping(cancel, &tap).await;
+            c.in_flight.store(true, Ordering::Release);
+            let result = self.ping(&c.abort, &tap).await;
+            c.in_flight.store(false, Ordering::Release);
             let bill = tap.bill(&self.model, worst);
             ledger += bill.cost_usd;
+            self.book_unmeasured(&bill);
             match result {
                 Ok(()) => {
                     pings += 1;
@@ -462,14 +605,12 @@ impl Job {
                         .unwrap_or(sent_at);
                 }
                 Err(PingFailure::Canceled) => {
-                    if bill.booking != super::keepwarm::PingBooking::Nothing {
-                        tracing::info!(
-                            event = "tool_round_keepwarm_aborted",
-                            booking = ?bill.booking,
-                            cost_usd = bill.cost_usd,
-                            "tool-round keep-warm ping aborted in flight"
-                        );
-                    }
+                    tracing::info!(
+                        event = "tool_round_keepwarm_aborted",
+                        booking = ?bill.booking,
+                        cost_usd = bill.cost_usd,
+                        "tool-round keep-warm ping aborted in flight"
+                    );
                     return Stop::Done;
                 }
                 Err(PingFailure::Transient(why)) if retries < BACKOFF.len() => {
@@ -477,7 +618,8 @@ impl Job {
                     let delay = BACKOFF[retries];
                     retries += 1;
                     tokio::select! {
-                        _ = cancel.cancelled() => return Stop::Done,
+                        _ = c.stop.cancelled() => return Stop::Done,
+                        _ = c.abort.cancelled() => return Stop::Done,
                         _ = tokio::time::sleep(delay) => {}
                     }
                 }
