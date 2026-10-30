@@ -27,9 +27,6 @@ All notable changes to this project will be documented in this file.
   Default 1, as before. Lowering it deletes the extra generations at the
   next rotation. Rotation is now locked (`<log>.lock`), so two daemon
   sessions can no longer rotate the same log twice and lose a generation.
-
-### Added
-
 - **Slices for process scopes:** `tool_scope_slice = <name>.slice` puts the
   systemd scopes of bash tool commands and PTY shells in that slice, and
   `daemon_scope_slice` does the same for the daemon's own scope, so an
