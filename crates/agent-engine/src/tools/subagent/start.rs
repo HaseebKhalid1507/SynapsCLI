@@ -93,7 +93,9 @@ impl Tool for SubagentStartTool {
     }
 
     async fn execute(&self, params: Value, ctx: ToolContext) -> Result<String> {
-        let thinking = super::resolve_subagent_thinking(&params, None, &crate::config::load_config())?;
+        // One config snapshot for the whole spawn (`spawn_config`).
+        let config = super::spawn_config();
+        let thinking = super::resolve_subagent_thinking(&params, None, &config)?;
         // ── Parse params ───────────────────────────────────────────────────────
         let task = params["task"]
             .as_str()
@@ -292,7 +294,7 @@ impl Tool for SubagentStartTool {
                         // (~$0.23 per 10-spawn fan-out). (#110)
                         super::apply_subagent_runtime_policy(
                             &mut runtime,
-                            &crate::config::load_config(),
+                            &config,
                             memory_backend.as_ref(),
                             session_allow_all.as_ref(),
                             telemetry.as_ref(),

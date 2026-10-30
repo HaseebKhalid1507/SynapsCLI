@@ -176,6 +176,22 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Subagent workers follow more of the parent's config.** Workers ran
+  with the defaults for `bash_timeout`, `bash_max_timeout`,
+  `max_tool_output`, `cache_diagnostics` and
+  `request_compression`/`request_compression_level`, whatever the config
+  said. They now take them from the config, on every spawn path. With
+  `cache_diagnostics = true`, worker requests carry the
+  `diagnostics` object too, so worker cache misses show up in the API log.
+  Each worker keeps its own `previous_message_id` chain, starting fresh,
+  and on OAuth no beta header is sent. The object is top-level, so the
+  prompt-cache prefix is unchanged, and a refusal drops it for the rest of
+  that worker's run, as in the foreground. A spawn
+  now reads the config once, so its thinking level and its runtime policy
+  can no longer come from two different reads of a config being edited.
+  The host's cached worker tool set is rebuilt when a config reload
+  changes `disabled_tools`.
+
 - **Subagent workers rolled their context over every few tool calls.**
   Workers never got the configured `context_window`, so every worker
   budgeted against the 200k model default and sent no 1M opt-in. On Opus
@@ -239,6 +255,24 @@ All notable changes to this project will be documented in this file.
   model event has no `ttft_ms` field (never `0`).
 
 ### Security
+
+- **Subagent workers no longer get tools listed in `disabled_tools`.**
+  `disabled_tools` (the documented read-only / no-shell lockdown, e.g.
+  `disabled_tools = bash, shell_start, shell_send, shell_end`) was applied
+  only to the foreground session. A worker builds its built-in tools from
+  scratch, so with `disabled_tools = bash` a worker still had `bash`, and a
+  `subagent` or `subagent_start` call could run shell commands through
+  it. The host-built worker re-applied only the forum tools; the
+  `SYNAPS_SUBAGENT_FRESH_RUNTIME=1` worker applied none. Every worker, on
+  every spawn path (`subagent`, `subagent_start`, `subagent_resume`, host
+  or fresh runtime), now has the foreground's whole list removed: the
+  model is not offered those tools, and a call to one is refused as an
+  unknown tool. As in the foreground, the list removes built-in tools only;
+  extension and MCP tools are unaffected.
+  **Behaviour change:** an agent or workflow that relied on a worker using
+  a tool you disabled (typically a worker running `bash` under a no-shell
+  profile) now gets "Unknown tool" for that call. Remove the tool from
+  `disabled_tools` if workers need it.
 
 - **The bash tool asks for a sudo password only when sudo really asks
   (Linux).** It used to raise the password box for any stderr text that

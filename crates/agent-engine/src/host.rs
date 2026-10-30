@@ -54,6 +54,14 @@ pub struct HostOpts {
 
 pub use crate::mcp::McpDiscovery;
 
+/// What a cached worker registry template was built from
+/// ([`EngineHost::worker_registry`]).
+#[derive(PartialEq, Eq)]
+struct WorkerRegistryKey {
+    generation: CatalogGeneration,
+    disabled_tools: Vec<String>,
+}
+
 pub struct EngineHost {
     parts: HostParts,
     config: arc_swap::ArcSwap<crate::SynapsConfig>,
@@ -61,10 +69,11 @@ pub struct EngineHost {
     keybind_registry: Arc<std::sync::RwLock<crate::skills::keybinds::KeybindRegistry>>,
     ext_manager: Arc<RwLock<crate::extensions::manager::ExtensionManager>>,
     mcp_server_count: usize,
-    /// Worker (subagent) registry template, cached by shared-catalog
-    /// generation. `worker_runtime()` clones this instead of rebuilding
-    /// `without_subagent_with_extensions` + `rebuild_schema()` per spawn.
-    worker_registry: std::sync::Mutex<Option<(CatalogGeneration, ToolRegistry)>>,
+    /// Worker (subagent) registry template, cached by what it is built from:
+    /// the shared catalog generation and the `disabled_tools` list.
+    /// `worker_runtime()` clones this instead of rebuilding
+    /// `ToolRegistry::worker_set` + `rebuild_schema()` per spawn.
+    worker_registry: std::sync::Mutex<Option<(WorkerRegistryKey, ToolRegistry)>>,
     /// File-appender flush guard. Lives for the process (≥ any renderer), so
     /// log lines emitted after `boot()` returns can never be dropped by an
     /// early guard drop (the old `setup::boot` bug). Rust runs no static
@@ -442,34 +451,29 @@ impl EngineHost {
         HookBus::worker_transforms(&self.parts.hook_bus)
     }
 
-    /// Cached-or-rebuilt worker registry: `without_subagent_with_extensions`
-    /// is a pure function of the shared registry's tool set, which is a pure
-    /// function of its catalog generation, so caching by generation returns
-    /// exactly what a rebuild would.
+    /// Cached-or-rebuilt worker registry ([`ToolRegistry::worker_set`]).
+    /// The worker's built-ins are built from scratch, so the boot-time
+    /// disable on the shared registry does not carry over: `worker_set`
+    /// re-applies the whole `disabled_tools` list (before, a worker of a
+    /// host with `disabled_tools = bash` still had `bash`; only the forum
+    /// names were re-applied). The template is a pure function of the shared
+    /// registry's tool set (a pure function of its catalog generation) and
+    /// the list, so caching by both returns exactly what a rebuild would,
+    /// and a `reload_config` that changes the list rebuilds it.
     pub async fn worker_registry(&self) -> ToolRegistry {
         let shared = self.parts.tools.read().await;
-        let gen = shared.catalog().generation();
-        if let Some((cached_gen, tpl)) = &*self.worker_registry.lock().unwrap() {
-            if *cached_gen == gen {
+        let key = WorkerRegistryKey {
+            generation: shared.catalog().generation(),
+            disabled_tools: self.config().disabled_tools.clone(),
+        };
+        if let Some((cached, tpl)) = &*self.worker_registry.lock().unwrap() {
+            if *cached == key {
                 return tpl.clone();
             }
         }
-        let mut fresh = ToolRegistry::without_subagent_with_extensions(&shared);
+        let fresh = ToolRegistry::worker_set(&shared, &key.disabled_tools);
         drop(shared);
-        // #112: apply after the merge too — a shared registry must not
-        // reintroduce a forum tool the operator disabled. Other worker policy
-        // is preserved.
-        let disabled_forum: Vec<String> = self
-            .config()
-            .disabled_tools
-            .iter()
-            .filter(|name| matches!(name.as_str(), "forum_post" | "forum_read" | "forum_forget"))
-            .cloned()
-            .collect();
-        if !disabled_forum.is_empty() {
-            fresh.disable(&disabled_forum);
-        }
-        *self.worker_registry.lock().unwrap() = Some((gen, fresh.clone()));
+        *self.worker_registry.lock().unwrap() = Some((key, fresh.clone()));
         fresh
     }
 

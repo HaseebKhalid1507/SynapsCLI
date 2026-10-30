@@ -4118,6 +4118,24 @@ impl Runtime {
         self.cache_diagnostics = v;
     }
 
+    /// `request_compression` / `request_compression_level`, as `apply_config`
+    /// sets them (the process-wide refusal latch included).
+    pub fn set_request_compression(
+        &mut self,
+        mode: agent_core::config::RequestCompressionMode,
+        level: u32,
+    ) {
+        self.request_compression = request_encoding::RequestCompression::from_config(mode, level);
+    }
+
+    /// `(mode, level)` of the gzip policy this runtime's requests carry.
+    #[cfg(test)]
+    pub(crate) fn request_compression_for_test(
+        &self,
+    ) -> (Option<agent_core::config::RequestCompressionMode>, u32) {
+        self.request_compression.configured()
+    }
+
     /// The configured cache TTL (`auto` unless config or a caller fixed it).
     /// What a request actually sends is [`Self::resolved_cache_ttl`].
     pub fn cache_ttl(&self) -> crate::core::config::CacheTtlSetting {

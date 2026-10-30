@@ -329,7 +329,8 @@ impl Tool for SubagentResumeTool {
             None => None,
         };
 
-        let config = crate::config::load_config();
+        // One config snapshot for the whole spawn (`spawn_config`).
+        let config = super::spawn_config();
         let policy = ResumePolicy {
             full_history: params["full_history"].as_bool().unwrap_or(false),
             compact_tokens: config.subagent_cold_resume_compact_tokens,
@@ -527,7 +528,7 @@ impl Tool for SubagentResumeTool {
                         // (~$0.23 per 10-spawn fan-out). (#110)
                         super::apply_subagent_runtime_policy(
                             &mut runtime,
-                            &crate::config::load_config(),
+                            &config,
                             memory_backend.as_ref(),
                             session_allow_all.as_ref(),
                             telemetry.as_ref(),

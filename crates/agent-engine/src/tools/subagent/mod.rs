@@ -155,6 +155,18 @@ pub(crate) fn apply_subagent_runtime_policy(
         config,
     ));
     runtime.set_read_dedupe(config.read_dedupe);
+    // Tool limits, as the foreground gets them through `apply_config`.
+    // Without them a worker ran every command under the 30s/300s defaults and
+    // truncated tool output at 30000 whatever the operator configured.
+    runtime.set_bash_timeout(config.bash_timeout);
+    runtime.set_bash_max_timeout(config.bash_max_timeout);
+    runtime.set_max_tool_output(config.max_tool_output);
+    // Cache diagnostics: the worker's own chain (a `from_parts` runtime has a
+    // fresh `previous_message_id` and rejection latch), API-key auth only for
+    // the beta header, and the same fail-soft retry as the foreground.
+    runtime.set_cache_diagnostics(config.cache_diagnostics);
+    // gzip request bodies, sharing the process-wide refusal latch.
+    runtime.set_request_compression(config.request_compression, config.request_compression_level);
     // Output transforms: the spawn path gave the worker the host's
     // after_tool_call transform view (`EngineHost::worker_hook_bus`); the
     // operator can turn it off. Detaching only ever narrows: no spawn path
@@ -277,17 +289,6 @@ pub(crate) fn attach_worker_transcripts(
     });
 }
 
-/// Exact Fable 5.1 worker default requested for this harness. Do not infer
-/// capability or effort for sibling IDs, other providers, or foreground calls.
-#[allow(dead_code)] // merge(112): consumed when Fable model reaches the spawn paths
-pub(crate) fn apply_anthropic_worker_reasoning(runtime: &mut crate::Runtime) {
-    if runtime.codex_request_role() == crate::runtime::openai::catalog::CodexRequestRole::Worker
-        && runtime.model() == "anthropic/claude-fable-5-1"
-    {
-        runtime.set_reasoning_level(agent_core::reasoning::ReasoningLevel::XHigh);
-    }
-}
-
 /// Called after model selection by start, oneshot AND resume. Only inherit
 /// Ultra for the exact authorized foreground identity: explicitly selected
 /// different models/providers retain their own defaults. The worker planner
@@ -362,34 +363,59 @@ pub fn legacy_fresh_runtime() -> bool {
 /// `EngineHost::current()` is a `OnceLock` read and `worker_runtime()` only
 /// touches `tokio::sync` primitives, so this is runtime-agnostic.
 pub async fn spawn_runtime() -> crate::Result<crate::Runtime> {
+    let host = crate::EngineHost::current();
     if !legacy_fresh_runtime() {
-        if let Some(host) = crate::EngineHost::current() {
+        if let Some(host) = &host {
             return host.worker_runtime().await;
         }
     }
+    // The host's config when there is one (the source of its foreground
+    // lockdown and of `worker_runtime`), else the disk.
+    let config = match &host {
+        Some(host) => std::sync::Arc::clone(&*host.config()),
+        None => std::sync::Arc::new(crate::config::load_config()),
+    };
     let mut rt = crate::Runtime::new().await?;
-    rt.set_tools(subagent_tools().await);
-    rt.apply_auth_config(&crate::config::load_config());
-    if let Some(host) = crate::EngineHost::current() {
+    rt.set_tools(subagent_tools(&config.disabled_tools).await);
+    rt.apply_auth_config(&config);
+    if let Some(host) = &host {
         rt.set_hook_bus(host.worker_hook_bus());
     }
     Ok(rt)
 }
 
 /// Build the subagent tool registry: extension tools if the routing manager
-/// has a shared registry, otherwise the bare without_subagent set.
+/// has a shared registry, otherwise the bare without_subagent set, minus
+/// every built-in in `disabled` (`disabled_tools`; the legacy twin of
+/// `EngineHost::worker_registry`, see `ToolRegistry::worker_set`).
 ///
 /// Single source of truth for all three spawn paths (oneshot, start, resume).
 /// Divergence is structurally impossible when all three call this function.
-pub(crate) async fn subagent_tools() -> crate::ToolRegistry {
+pub(crate) async fn subagent_tools(disabled: &[String]) -> crate::ToolRegistry {
     if let Some(ext_mgr) = crate::runtime::openai::extension_manager_for_routing() {
         let mgr = ext_mgr.read().await;
         if let Some(shared) = mgr.tools_shared() {
             let extension_tools = shared.read().await;
-            return crate::ToolRegistry::without_subagent_with_extensions(&extension_tools);
+            return crate::ToolRegistry::worker_set(&extension_tools, disabled);
         }
     }
-    crate::ToolRegistry::without_subagent()
+    let mut tools = crate::ToolRegistry::without_subagent();
+    tools.disable(disabled);
+    tools
+}
+
+/// The config one spawn reads, once, at admission: the worker's thinking
+/// level, `apply_subagent_runtime_policy` and (resume) the cold-resume
+/// compact size all come from this one snapshot, never from a second read
+/// partway through the spawn.
+///
+/// Read from disk, not `EngineHost::config()`: nothing refreshes the host's
+/// snapshot after boot in production (`reload_config` has no caller), and
+/// every `/settings` row that says "applies to workers started afterwards"
+/// only writes the file. The registry's `disabled_tools` stays on the host
+/// snapshot, the boot-time lockdown the foreground runs under.
+pub(crate) fn spawn_config() -> std::sync::Arc<crate::config::SynapsConfig> {
+    std::sync::Arc::new(crate::config::load_config())
 }
 
 /// Project-forum guidance for workers (#112). Appended to every subagent
@@ -673,6 +699,52 @@ mod cache_ttl_policy_tests {
         let off = agent_core::config::load_config_from_str("read_dedupe = off\n");
         apply_subagent_runtime_policy(&mut runtime, &off, None, None, None, &Default::default());
         assert!(!runtime.read_dedupe());
+    }
+
+    /// G3/G4/G5/G6: a worker runs under the configured bash timeouts, tool
+    /// output cap, cache diagnostics and gzip policy, not the `Runtime`
+    /// defaults (30s / 300s / 30000 / off / auto level 1).
+    #[test]
+    fn subagent_policy_takes_tool_limits_diagnostics_and_compression_from_config() {
+        use agent_core::config::RequestCompressionMode;
+        let mut runtime = crate::Runtime::new_headless();
+        let defaults = (
+            runtime.bash_timeout(),
+            runtime.bash_max_timeout(),
+            runtime.max_tool_output(),
+            runtime.cache_diagnostics(),
+            runtime.request_compression_for_test(),
+        );
+        assert_eq!(defaults, (30, 300, 30000, false, (Some(RequestCompressionMode::Auto), 1)));
+        let config = agent_core::config::load_config_from_str(
+            "bash_timeout = 90\nbash_max_timeout = 1200\nmax_tool_output = 120000\n\
+             cache_diagnostics = true\nrequest_compression = off\nrequest_compression_level = 7\n",
+        );
+        apply_subagent_runtime_policy(&mut runtime, &config, None, None, None, &Default::default());
+        assert_eq!(runtime.bash_timeout(), 90);
+        assert_eq!(runtime.bash_max_timeout(), 1200);
+        assert_eq!(runtime.max_tool_output(), 120000);
+        assert!(runtime.cache_diagnostics());
+        assert_eq!(
+            runtime.request_compression_for_test(),
+            (Some(RequestCompressionMode::Off), 7)
+        );
+        // The worker's diagnostics chain is its own, starting empty.
+        let chain = runtime.cache_diagnosis().expect("on");
+        assert_eq!(chain.previous_message_id(), None);
+        // Back to the defaults when the config says so (no stickiness).
+        let plain = agent_core::config::load_config_from_str("");
+        apply_subagent_runtime_policy(&mut runtime, &plain, None, None, None, &Default::default());
+        assert_eq!(
+            (
+                runtime.bash_timeout(),
+                runtime.bash_max_timeout(),
+                runtime.max_tool_output(),
+                runtime.cache_diagnostics(),
+                runtime.request_compression_for_test(),
+            ),
+            defaults
+        );
     }
 
     /// `subagent_transform_hooks`: on (the default) keeps the host's
@@ -1217,6 +1289,52 @@ mod codex_ultra_worker_tests {
         }
     }
 
+    /// G2-lite + G1, by source: every spawn path reads its config ONCE,
+    /// through `spawn_config()`, and hands that one snapshot to both the
+    /// effort resolution and the runtime policy. Both `spawn_runtime`
+    /// branches build the worker registry minus the whole `disabled_tools`
+    /// list of the host's config (the disk only with no host).
+    #[test]
+    fn every_spawn_path_reads_one_config_and_drops_disabled_tools() {
+        for (name, source) in [
+            ("oneshot", include_str!("oneshot.rs")),
+            ("start", include_str!("start.rs")),
+            ("resume", include_str!("resume.rs")),
+        ] {
+            let production = source.split("#[cfg(test)]\nmod tests").next().unwrap();
+            assert!(!production.contains("load_config("), "{name}: a disk read");
+            assert_eq!(production.matches("super::spawn_config()").count(), 1, "{name}");
+            let read = production.find("let config = super::spawn_config();").unwrap();
+            let thinking = production.find("resolve_subagent_thinking(").unwrap();
+            let policy = production.find("super::apply_subagent_runtime_policy(").unwrap();
+            assert!(read < thinking && thinking < policy, "{name}");
+            let passed = &production[policy..policy + 200];
+            assert!(passed.contains("&config,"), "{name}: the policy gets the spawn's config");
+        }
+
+        let module = include_str!("mod.rs");
+        let read = &module[module.find("pub(crate) fn spawn_config()").unwrap()..];
+        let read = &read[..read.find("\n}\n").unwrap()];
+        assert_eq!(read.matches("load_config()").count(), 1, "one read");
+
+        let spawn = &module[module.find("pub async fn spawn_runtime()").unwrap()..];
+        let spawn = &spawn[..spawn.find("\n}\n").unwrap()];
+        let host_branch = spawn.find("return host.worker_runtime().await;").unwrap();
+        let legacy_config = spawn.find("Some(host) => std::sync::Arc::clone(&*host.config()),").unwrap();
+        assert!(host_branch < legacy_config);
+        assert!(spawn.contains("None => std::sync::Arc::new(crate::config::load_config()),"));
+        let legacy_tools = spawn
+            .find("rt.set_tools(subagent_tools(&config.disabled_tools).await);")
+            .unwrap();
+        let legacy_auth = spawn.find("rt.apply_auth_config(&config);").unwrap();
+        assert!(legacy_config < legacy_tools && legacy_config < legacy_auth);
+        let host_rs = include_str!("../../host.rs");
+        let registry = &host_rs[host_rs.find("pub async fn worker_registry(").unwrap()..];
+        let registry = &registry[..registry.find("\n    }\n").unwrap()];
+        assert!(registry.contains("disabled_tools: self.config().disabled_tools.clone(),"));
+        assert!(registry.contains("ToolRegistry::worker_set(&shared, &key.disabled_tools)"));
+    }
+
     #[test]
     fn every_worker_path_passes_parent_telemetry_before_streaming() {
         // Both streaming dispatch sites must hand the parent's telemetry to
@@ -1319,7 +1437,7 @@ mod forum_worker_tests {
 
     #[tokio::test]
     async fn subagent_registry_excludes_delegation_and_search_tools() {
-        let registry = subagent_tools().await;
+        let registry = subagent_tools(&[]).await;
         for name in [
             "subagent",
             "subagent_start",
@@ -1336,30 +1454,26 @@ mod forum_worker_tests {
         assert!(registry.get("edit").is_some());
     }
 
-    #[test]
-    fn fable_5_1_worker_uses_xhigh_exactly() {
-        use super::apply_anthropic_worker_reasoning;
-        use agent_core::reasoning::ReasoningLevel;
-
-        for model in [
-            "anthropic/claude-fable-5-1",
-            "anthropic/claude-fable-5",
-            "openai-codex/gpt-6-astra",
-        ] {
-            let mut runtime = crate::Runtime::new_headless();
-            apply_subagent_runtime_policy(&mut runtime, &Default::default(), None, None, None, &Default::default());
-            runtime.set_model(model.into());
-            let before = runtime.reasoning_level();
-            apply_anthropic_worker_reasoning(&mut runtime);
-            assert_eq!(
-                runtime.reasoning_level(),
-                if model == "anthropic/claude-fable-5-1" {
-                    ReasoningLevel::XHigh
-                } else {
-                    before
-                }
-            );
+    /// G1, legacy path: the whole `disabled_tools` list, not only the forum
+    /// names, never reaches a worker's registry or schema.
+    #[tokio::test]
+    async fn legacy_subagent_tools_drop_every_disabled_tool() {
+        let disabled: Vec<String> = ["bash", "shell_start", "ls", "forum_post", "no_such_tool"]
+            .map(String::from)
+            .to_vec();
+        // Not vacuous: without the list a worker has them.
+        let all = subagent_tools(&[]).await;
+        assert!(all.get("ls").is_some() && all.get("forum_post").is_some());
+        assert_eq!(all.get("bash").is_some(), cfg!(feature = "command-exec"));
+        let registry = subagent_tools(&disabled).await;
+        let schema = registry.tools_schema();
+        let names: Vec<&str> = schema.iter().filter_map(|t| t["name"].as_str()).collect();
+        for name in &disabled {
+            assert!(registry.get(name).is_none(), "{name} must not be granted");
+            assert!(!names.contains(&name.as_str()), "{name} must not be advertised: {names:?}");
         }
+        assert!(registry.get("read").is_some(), "the rest stays");
+        assert!(names.contains(&"read"));
     }
 
     #[tokio::test]
@@ -2021,6 +2135,142 @@ mod worker_context_window_wire_tests {
         assert_eq!(betas.len(), 3, "oneshot, start, resume: {betas:?}");
         for (path, beta) in ["oneshot", "start", "resume"].iter().zip(&betas) {
             assert!(beta.contains("context-1m-2025-08-07"), "{path}: {beta:?}");
+        }
+    }
+}
+
+/// The loopback provider and wire assertions the host-path twin
+/// (`tests/worker_config_inherit.rs`) shares.
+#[cfg(test)]
+#[path = "../../../tests/support/worker_wire.rs"]
+mod worker_wire;
+
+/// What the worker of every spawn path puts on the wire under a locked-down,
+/// diagnostics-on, gzip-on config, with no `EngineHost` (the `load_config()`
+/// fallback; the host paths are `tests/worker_config_inherit.rs`).
+#[cfg(test)]
+mod worker_inherit_wire_tests {
+    use super::worker_wire::{self, Seen};
+    use crate::runtime::subagent::{SubagentRegistry, SubagentStatus};
+    use crate::test_env::{BaseDirGuard, EnvVarGuard};
+    use crate::tools::test_helpers::create_tool_context;
+    use crate::tools::Tool;
+    use serde_json::{json, Value};
+    use std::sync::{Arc, Mutex};
+
+    fn task() -> Value {
+        // Over `MIN_BYTES`, so gzip applies whatever the tool set.
+        let prompt = format!("test worker\n{}", "padding ".repeat(3000));
+        json!({"system_prompt": prompt, "task": "run it", "model": "anthropic/claude-sonnet-4-6", "timeout": 60})
+    }
+
+    fn ctx(registry: &Arc<Mutex<SubagentRegistry>>) -> crate::tools::ToolContext {
+        let mut ctx = create_tool_context();
+        ctx.capabilities.subagent_registry = Some(registry.clone());
+        ctx
+    }
+
+    fn take(seen: &Arc<Mutex<Vec<Seen>>>) -> Vec<Seen> {
+        std::mem::take(&mut *seen.lock().unwrap())
+    }
+
+    async fn finish(registry: &Arc<Mutex<SubagentRegistry>>, handle_id: &str) {
+        for _ in 0..600 {
+            let done = registry
+                .lock()
+                .unwrap()
+                .get(handle_id)
+                .is_none_or(|h| h.status() != SubagentStatus::Running);
+            if done {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let thread = registry.lock().unwrap().get_mut(handle_id).and_then(|h| h.thread_handle.take());
+        if let Some(thread) = thread {
+            tokio::task::spawn_blocking(move || thread.join()).await.unwrap().unwrap();
+        }
+        let status = registry.lock().unwrap().get(handle_id).map(|h| h.status());
+        assert_eq!(status, Some(SubagentStatus::Completed), "{handle_id}");
+    }
+
+    async fn oneshot(seen: &Arc<Mutex<Vec<Seen>>>) -> Vec<Seen> {
+        let registry = Arc::new(Mutex::new(SubagentRegistry::new()));
+        let out = super::SubagentTool.execute(task(), ctx(&registry)).await.expect("subagent");
+        assert!(out.contains("done"), "{out}");
+        take(seen)
+    }
+
+    /// The requests of the oneshot, start and resume workers, in that order.
+    async fn run_three_paths(seen: &Arc<Mutex<Vec<Seen>>>) -> [Vec<Seen>; 3] {
+        let registry = Arc::new(Mutex::new(SubagentRegistry::new()));
+        let oneshot = oneshot(seen).await;
+        let out = super::SubagentStartTool.execute(task(), ctx(&registry)).await.expect("subagent_start");
+        let handle = serde_json::from_str::<Value>(&out).unwrap()["handle_id"].as_str().unwrap().to_owned();
+        finish(&registry, &handle).await;
+        let start = take(seen);
+        let out = super::SubagentResumeTool
+            .execute(json!({"handle_id": handle, "instructions": "again", "timeout": 60}), ctx(&registry))
+            .await
+            .expect("subagent_resume");
+        let resumed = serde_json::from_str::<Value>(&out).unwrap()["handle_id"].as_str().unwrap().to_owned();
+        finish(&registry, &resumed).await;
+        [oneshot, start, take(seen)]
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn every_spawn_path_inherits_disabled_tools_diagnostics_and_gzip_without_a_host() {
+        assert!(crate::EngineHost::current().is_none(), "the no-host fallback");
+        let base = BaseDirGuard::new();
+        std::fs::write(base.path().join("auth.json"), worker_wire::OAUTH_AUTH_JSON).unwrap();
+        std::fs::write(base.path().join("config"), worker_wire::LOCKED_CONFIG).unwrap();
+        let marker = base.path().join("bash-ran");
+        let (url, seen) = worker_wire::spawn_provider(&marker, false).await;
+        let _env = [
+            EnvVarGuard::remove("SYNAPS_AUTH_ENDPOINT"),
+            EnvVarGuard::remove("SYNAPS_MACHINE_TOKEN"),
+            EnvVarGuard::remove("SYNAPS_SUBAGENT_FRESH_RUNTIME"),
+            EnvVarGuard::remove("SYNAPS_GZIP_REQUEST_BODIES"),
+            EnvVarGuard::remove("ANTHROPIC_API_KEY"),
+            EnvVarGuard::set("SYNAPS_ANTHROPIC_BASE_URL", &url),
+        ];
+
+        let runs = run_three_paths(&seen).await;
+        worker_wire::assert_worker_requests("no-host", &runs, &marker);
+
+        // G5: the cache prefix is unchanged. With diagnostics off the same
+        // worker sends the same bytes the cache keys on: only the
+        // top-level object differs.
+        std::fs::write(
+            base.path().join("config"),
+            worker_wire::LOCKED_CONFIG.replace("cache_diagnostics = true", "cache_diagnostics = false"),
+        )
+        .unwrap();
+        let plain = oneshot(&seen).await;
+        assert_eq!(plain.len(), 2);
+        for (on, off) in runs[0].iter().zip(&plain) {
+            assert!(off.previous_message_id().is_none(), "off: no object");
+            assert_eq!(on.without_diagnostics(), off.body, "prefix moved");
+        }
+
+        // G5: the existing refusal fallback covers a worker too.
+        std::fs::write(base.path().join("config"), worker_wire::LOCKED_CONFIG).unwrap();
+        let (url, seen) = worker_wire::spawn_provider(&marker, true).await;
+        let _url = EnvVarGuard::set("SYNAPS_ANTHROPIC_BASE_URL", &url);
+        worker_wire::assert_diagnostics_refusal_falls_back(&oneshot(&seen).await);
+        assert!(!marker.exists());
+
+        // Control: the same worker, `bash` not listed, does run the call,
+        // so "the marker never appears" above is a real refusal.
+        if cfg!(all(unix, feature = "command-exec")) {
+            std::fs::write(base.path().join("config"), "disabled_tools = ls, grep\n").unwrap();
+            let (url, seen) = worker_wire::spawn_provider(&marker, false).await;
+            let _url = EnvVarGuard::set("SYNAPS_ANTHROPIC_BASE_URL", &url);
+            let requests = oneshot(&seen).await;
+            assert!(requests[0].tool_names().iter().any(|n| n == "bash"));
+            assert!(!requests[1].body["messages"].to_string().contains("Unknown tool"));
+            assert!(marker.exists(), "an allowed bash runs");
         }
     }
 }

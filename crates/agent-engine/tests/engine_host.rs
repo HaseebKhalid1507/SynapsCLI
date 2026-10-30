@@ -117,8 +117,9 @@ async fn worker_registry_cached_by_generation() {
     let after = h.parts().tools.read().await.catalog().generation();
     assert!(after > before);
     // Rebuilt (new template), then cached again at the new generation.
-    // (`without_subagent_with_extensions` rebuilds builtins from scratch, so
-    // a disabled builtin is not reflected — pre-existing behaviour.)
+    // (`ToolRegistry::worker_set` rebuilds the builtins from scratch minus
+    // the config's `disabled_tools`, so this ad-hoc disable of the shared
+    // registry is not reflected; `worker_config_inherit.rs` covers the list.)
     let c = h.worker_registry().await;
     assert!(!Arc::ptr_eq(&a.tools_schema(), &c.tools_schema()));
     let d = h.worker_registry().await;

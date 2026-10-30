@@ -139,6 +139,18 @@ impl RequestCompression {
         }
     }
 
+    /// `(mode, level)` as configured; `None` for the test-only `always()`.
+    #[cfg(test)]
+    pub(crate) fn configured(&self) -> (Option<RequestCompressionMode>, u32) {
+        let mode = match self.mode {
+            Mode::Auto => Some(RequestCompressionMode::Auto),
+            Mode::On => Some(RequestCompressionMode::On),
+            Mode::Off => Some(RequestCompressionMode::Off),
+            Mode::Always => None,
+        };
+        (mode, self.level)
+    }
+
     /// True once a refusal has turned gzip off.
     pub fn refused(&self) -> bool {
         self.refused.load(Ordering::Relaxed)
