@@ -4608,23 +4608,28 @@ impl SessionActor {
             return;
         }
         let value = match query {
-            SessionQuery::Status => serde_json::json!({
-                "session": self.conv.session.id,
-                "model": self.runtime.model(),
-                "lifecycle": SessionLifecycle::from_u8(self.lifecycle.load(std::sync::atomic::Ordering::Acquire)),
-                "tokens": { "input": self.conv.total_input_tokens, "output": self.conv.total_output_tokens },
-                "cost": self.conv.session_cost,
-                // Included in `cost`; labelled separately (task #444).
-                "keepwarm_cost": self.conv.keepwarm_cost,
-                "keepwarm": self.cache_keepwarm_status_json(None),
-                "messages": self.conv.api_messages.len(),
-                "streaming": self.streaming,
-                "auto_turns": self.consecutive_auto_turns,
-                "attached": self.attached.len(),
-                "pending_prompts": self.pending_prompts.len(),
-                // `/pin` status in the TUI.
-                "pinned": self.keep_warm,
-            }),
+            SessionQuery::Status => {
+                // Configured + resolved prompt-cache TTL (`auto` → 1h on OAuth).
+                let cache_ttl = self.cache_ttl_status_json().await;
+                serde_json::json!({
+                    "session": self.conv.session.id,
+                    "cache_ttl": cache_ttl,
+                    "model": self.runtime.model(),
+                    "lifecycle": SessionLifecycle::from_u8(self.lifecycle.load(std::sync::atomic::Ordering::Acquire)),
+                    "tokens": { "input": self.conv.total_input_tokens, "output": self.conv.total_output_tokens },
+                    "cost": self.conv.session_cost,
+                    // Included in `cost`; labelled separately (task #444).
+                    "keepwarm_cost": self.conv.keepwarm_cost,
+                    "keepwarm": self.cache_keepwarm_status_json(None),
+                    "messages": self.conv.api_messages.len(),
+                    "streaming": self.streaming,
+                    "auto_turns": self.consecutive_auto_turns,
+                    "attached": self.attached.len(),
+                    "pending_prompts": self.pending_prompts.len(),
+                    // `/pin` status in the TUI.
+                    "pinned": self.keep_warm,
+                })
+            }
             SessionQuery::Messages => {
                 serde_json::to_value(&self.conv.api_messages).unwrap_or_default()
             }

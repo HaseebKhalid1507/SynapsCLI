@@ -1470,6 +1470,25 @@ impl SessionActor {
         })
     }
 
+    /// The configured prompt-cache TTL and what it resolves to on the bound
+    /// credential kind right now (`auto`: 1h OAuth, 5m API key): what the
+    /// next request's markers carry. `resolved` is `null` off the native
+    /// Anthropic transport, which sends no markers. `Status` and
+    /// `/keepwarm status`.
+    /// `&mut self` only so the future stays `Send` (the actor is not `Sync`).
+    pub(crate) async fn cache_ttl_status_json(&mut self) -> serde_json::Value {
+        // Same native-transport check keep-warm eligibility uses.
+        let resolved = if self.runtime.cache_keepwarm_ineligibility().is_none() {
+            Some(self.runtime.resolved_cache_ttl().await.as_str())
+        } else {
+            None
+        };
+        serde_json::json!({
+            "setting": self.runtime.cache_ttl().as_str(),
+            "resolved": resolved,
+        })
+    }
+
     /// `/keepwarm [status|off|auto|<N>h]` (actor-owned, like `/saveas`).
     pub(crate) async fn cache_keepwarm_command(&mut self, arg: &str) -> serde_json::Value {
         let arg = arg.trim();
@@ -1497,7 +1516,8 @@ impl SessionActor {
             }
         }
         let prefix_matches = self.cache_keepwarm_recheck().await;
-        let status = self.cache_keepwarm_status_json(prefix_matches);
+        let mut status = self.cache_keepwarm_status_json(prefix_matches);
+        status["cache_ttl"] = self.cache_ttl_status_json().await;
         serde_json::json!({
             "kind": "output",
             "text": render_status(&status),
@@ -1512,6 +1532,13 @@ pub(crate) fn render_status(s: &serde_json::Value) -> String {
     let spent = s["session_keepwarm_usd"].as_f64().unwrap_or(0.0);
     let pings = s["session_pings"].as_u64().unwrap_or(0);
     let mut out = format!("cache keep-warm: {mode} — this session: {pings} pings, ${spent:.4}");
+    // `prompt-cache TTL: 1h (auto)` / `prompt-cache TTL: 5m`.
+    if let Some(resolved) = s["cache_ttl"]["resolved"].as_str() {
+        out.push_str(&format!("\nprompt-cache TTL: {resolved}"));
+        if s["cache_ttl"]["setting"].as_str() == Some("auto") {
+            out.push_str(" (auto)");
+        }
+    }
     let p = &s["period"];
     if p.is_object() {
         out.push_str(&format!(
@@ -2536,5 +2563,24 @@ mod tests {
         assert!(text.contains("$0.3000 spent of $1.8750 bound"), "{text}");
         assert!(text.contains("prefix unchanged"), "{text}");
         assert!(text.contains("last: prefix changed"), "{text}");
+        assert!(!text.contains("prompt-cache TTL"), "absent field, no line: {text}");
+    }
+
+    #[test]
+    fn status_renders_the_resolved_cache_ttl() {
+        let mut s = serde_json::json!({
+            "mode": "auto",
+            "active": false,
+            "period": null,
+            "session_pings": 0,
+            "session_keepwarm_usd": 0.0,
+            "cache_ttl": {"setting": "auto", "resolved": "1h"},
+        });
+        let text = render_status(&s);
+        assert!(text.contains("\nprompt-cache TTL: 1h (auto)\n"), "{text}");
+        s["cache_ttl"] = serde_json::json!({"setting": "5m", "resolved": "5m"});
+        let text = render_status(&s);
+        assert!(text.contains("\nprompt-cache TTL: 5m\n"), "{text}");
+        assert!(!text.contains("(auto)"), "{text}");
     }
 }

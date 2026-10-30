@@ -768,6 +768,101 @@ async fn pings_are_costed_and_an_active_period_defers_park_until_it_ends() {
         .unwrap();
 }
 
+/// Every `cache_control` value in a request body.
+fn cache_markers(v: &serde_json::Value) -> Vec<serde_json::Value> {
+    match v {
+        serde_json::Value::Object(map) => map
+            .iter()
+            .flat_map(|(k, v)| {
+                if k == "cache_control" {
+                    vec![v.clone()]
+                } else {
+                    cache_markers(v)
+                }
+            })
+            .collect(),
+        serde_json::Value::Array(items) => items.iter().flat_map(cache_markers).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// `cache_ttl` unset (`auto`) on the harness's OAuth login resolves to 1h,
+/// and keep-warm runs exactly as under an explicit `cache_ttl = 1h`: the
+/// turn and every ping carry 1h markers, the period is governed by the 1h
+/// TTL, and the ski-rental cost check admits the same number of pings
+/// before it ends the period. `Status` reports the setting and what it
+/// resolved to.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn auto_ttl_on_oauth_keeps_warm_exactly_like_explicit_1h() {
+    let mut runs = Vec::new();
+    for ttl_line in ["", "cache_ttl = 1h\n"] {
+        let h = Home::new();
+        write_config(&h, &format!("cache_keepwarm = auto\n{ttl_line}thinking = off\n"));
+        let _interval = fast_pings();
+        let (url, bodies) = recording_stub().await;
+        std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+        let host = host().await;
+        let handle = host.create_session(cfg()).await.unwrap();
+        let (mut t, _) = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Tui))
+            .await
+            .unwrap();
+        turn(&mut t, "hello").await;
+        let st = status_until(&mut t, 900, PATIENCE, |st| {
+            st["keepwarm"]["session_pings"].as_u64().unwrap_or(0) >= 1
+        })
+        .await;
+        let setting = if ttl_line.is_empty() { "auto" } else { "1h" };
+        assert_eq!(
+            st["cache_ttl"],
+            serde_json::json!({"setting": setting, "resolved": "1h"}),
+            "{st}"
+        );
+        let period_ttl = st["keepwarm"]["period"]["ttl_secs"].clone();
+        // Let the cost check end the period.
+        let st = status_until(&mut t, 1000, PATIENCE, |st| {
+            st["keepwarm"]["active"] == false
+        })
+        .await;
+        assert_eq!(st["keepwarm"]["active"], false, "the period ended: {st}");
+        let total = pings(&bodies);
+        let all = bodies.lock().unwrap().clone();
+        for (i, body) in all.iter().enumerate() {
+            let v: serde_json::Value = serde_json::from_str(body).unwrap();
+            let m = cache_markers(&v);
+            assert!(!m.is_empty(), "{setting}: request {i} has no markers");
+            assert!(
+                m.iter().all(|m| m["ttl"] == "1h"),
+                "{setting}: request {i} markers {m:?}"
+            );
+        }
+        // The human `/keepwarm status` line says it too.
+        t.send(SessionCommand::EngineCommand {
+            id: 1100,
+            name: "keepwarm".into(),
+            arg: "status".into(),
+        })
+        .await
+        .unwrap();
+        let v = query_result(&mut t, 1100).await;
+        let want_line = if setting == "auto" {
+            "prompt-cache TTL: 1h (auto)"
+        } else {
+            "prompt-cache TTL: 1h\n"
+        };
+        assert!(v["text"].as_str().unwrap().contains(want_line), "{v}");
+        end(&mut t).await;
+        runs.push((setting, period_ttl, total, st["keepwarm"]["last_end"].clone()));
+    }
+    let (auto, explicit) = (&runs[0], &runs[1]);
+    assert_eq!(auto.1, 3600, "auto on OAuth is governed by the 1h TTL: {runs:?}");
+    assert_eq!(
+        (&auto.1, auto.2, &auto.3),
+        (&explicit.1, explicit.2, &explicit.3),
+        "auto (resolved 1h) and explicit 1h: same TTL, same pings, same end: {runs:?}"
+    );
+}
+
 /// An explicit `Park` while a period is active ends it ("parked by
 /// request") and parks; only the idle auto-park waits for the period.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
