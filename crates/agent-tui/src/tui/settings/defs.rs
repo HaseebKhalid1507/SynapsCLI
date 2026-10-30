@@ -434,6 +434,10 @@ define_settings! {
         "Let daemon sessions driven only by chat, rpc or server clients (bridges, scripts) keep warm too; off (default) keeps it to sessions a TUI or `synaps attach` typed in. `synaps rpc` without the daemon never keeps warm. Takes effect next launch.",
         |_app, value| on_off("cache_keepwarm_headless", value);
 
+    "cache_keepwarm_tools", "Keep-warm tool rounds", Context, EditorKind::Cycler(&["on", "off"]),
+        "Keep the prompt cache warm while a long tool call runs (builds, test sweeps, polls): once tools have run for the TTL minus a margin (4.5 min on 5m, 55 min on 1h), resend that round's request asking for a minimal reply so the next request reads the cache instead of rewriting it. Independent of idle keep-warm (default on). Applies to new sessions and workers.",
+        |_app, value| on_off("cache_keepwarm_tools", value);
+
     "context_management.mode", "Context management", Context,
         EditorKind::Cycler(&["off", "auto"]),
         "Automatic context management: auto plans a wrap-up and hands over to a fresh context before the window fills; off disables it (default). Takes effect next launch.",
@@ -1276,6 +1280,8 @@ mod tests {
             assert!(is_err(d("cache_keepwarm_auto_max_hours", "49")));
             assert!(is_ok(d("cache_keepwarm_headless", "on")));
             assert!(is_ok(d("cache_keepwarm_headless", "off")));
+            assert!(is_ok(d("cache_keepwarm_tools", "off")));
+            assert!(is_ok(d("cache_keepwarm_tools", "on")));
             assert!(is_ok(d("context_management.pressure_tokens", "auto")));
             assert!(is_ok(d("context_management.pressure_tokens", "120000")));
             assert!(is_err(d("context_management.pressure_tokens", "lots")));
