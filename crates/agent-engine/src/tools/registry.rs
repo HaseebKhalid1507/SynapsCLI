@@ -174,7 +174,18 @@ impl ToolRegistry {
     /// built-ins inside `extension_tools` are ignored to avoid duplicating or
     /// shadowing the canonical built-in instances.
     pub fn without_subagent_with_extensions(extension_tools: &ToolRegistry) -> Self {
+        Self::worker_set(extension_tools, &[])
+    }
+
+    /// A worker's registry: [`Self::without_subagent_with_extensions`] with
+    /// the `disabled_tools` list removed from the built-ins BEFORE the
+    /// extension tools merge in, the order the host's boot pass runs in (on
+    /// the fresh registry, before skills, MCP and extensions register). A
+    /// worker so loses exactly the tools its foreground lost: every listed
+    /// built-in, and no extension tool the foreground keeps.
+    pub fn worker_set(extension_tools: &ToolRegistry, disabled: &[String]) -> Self {
         let mut combined = Self::without_subagent();
+        combined.disable(disabled);
         for tool in extension_tools.tools.values() {
             if tool.extension_id().is_some() && !is_recursive_subagent_tool_name(tool.name()) {
                 combined
@@ -1314,6 +1325,45 @@ mod tests {
         assert!(merged.get("read").is_some());
         // Subagent tools still absent.
         assert!(merged.get("subagent_start").is_none());
+    }
+
+    /// `disabled_tools` on a worker: every listed built-in goes (`bash`,
+    /// `ls`, the forum tools alike), an extension tool keeps its place even
+    /// when listed (the foreground's boot pass runs before extensions
+    /// register, so it keeps it too), and the schema matches the tool set.
+    #[test]
+    fn worker_set_disables_the_listed_built_ins_before_the_extension_merge() {
+        let mut shared = ToolRegistry::empty();
+        shared.register(Arc::new(OwnedTool("alpha:do_thing", Some("alpha"))));
+        let disabled: Vec<String> = ["bash", "shell_start", "ls", "forum_read", "alpha:do_thing"]
+            .map(String::from)
+            .to_vec();
+
+        let all = ToolRegistry::worker_set(&shared, &[]);
+        assert!(all.get("ls").is_some() && all.get("forum_read").is_some());
+        let worker = ToolRegistry::worker_set(&shared, &disabled);
+        let names: Vec<String> = worker
+            .tools_schema()
+            .iter()
+            .filter_map(|t| t["name"].as_str().map(String::from))
+            .collect();
+        for name in ["bash", "shell_start", "ls", "forum_read"] {
+            assert!(worker.get(name).is_none(), "{name} kept");
+            assert!(!names.iter().any(|n| n == name), "{name} advertised: {names:?}");
+        }
+        assert!(worker.get("alpha:do_thing").is_some(), "extension tool kept");
+        assert!(worker.get("read").is_some() && worker.get("subagent_start").is_none());
+        assert_eq!(names.len(), worker.tools.len());
+
+        // The foreground's set under the same list, built in boot order.
+        let mut foreground = ToolRegistry::new();
+        foreground.disable(&disabled);
+        for tool in shared.tools.values() {
+            foreground.insert_tool_with_catalog(tool.clone()).unwrap();
+        }
+        for name in worker.tools.keys() {
+            assert!(foreground.get(name).is_some(), "worker has {name}, the foreground does not");
+        }
     }
 
     #[cfg(feature = "command-exec")]
