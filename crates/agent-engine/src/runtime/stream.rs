@@ -172,6 +172,8 @@ pub(super) struct StreamSession {
     pub(super) max_tool_output: usize,
     /// Tool output virtualisation for this stream (off = legacy history).
     pub(super) tool_spill: super::tool_spill::ToolSpill,
+    /// Read dedupe + write/edit notes (off = legacy history bytes).
+    pub(super) read_dedupe: bool,
     pub(super) bash_timeout: u64,
     pub(super) bash_max_timeout: u64,
     pub(super) subagent_timeout: u64,
@@ -656,6 +658,7 @@ impl StreamMethods {
             watcher_exit_path,
             max_tool_output,
             tool_spill,
+            read_dedupe,
             bash_timeout,
             bash_max_timeout,
             subagent_timeout,
@@ -1999,6 +2002,10 @@ impl StreamMethods {
                         // Tool output virtualisation: the preview history
                         // carries instead of the legacy selection.
                         let mut virtualised: Option<super::tool_spill::Virtualised> = None;
+                        // Read dedupe / write-edit note: set only for a
+                        // successful plain-text result (never errors,
+                        // cancels or rich output).
+                        let mut shaping: Option<super::read_dedupe::Shaping> = None;
                         let (result, rich_blocks) = match gate_outcome {
                             Ok((authorized, input)) => {
                                 let tool = authorized.implementation();
@@ -2072,12 +2079,20 @@ impl StreamMethods {
                                         &input,
                                         cwd.as_deref(),
                                     );
+                                    let shaping_candidate = super::read_dedupe::Shaping::for_call(
+                                        read_dedupe,
+                                        &runtime_name,
+                                        &tool.origin(),
+                                        &input,
+                                        cwd.as_deref(),
+                                    );
                                     match await_tool_call(&cancel, tool.execute_rich(input, crate::ToolContext {
                                             channels: crate::tools::ToolChannels { tx_delta: Some(tx_d), tx_events: Some(tx.clone()) },
                                             capabilities: crate::tools::ToolCapabilities { session_allow_all: Some(session_allow_all.clone()), launch_cancel: Some(cancel.clone()), memory_backend: Some(memory_backend.clone()), telemetry: Some(worker_telemetry.clone()), watcher_exit_path: watcher_exit_path.clone(), tool_register_tx: Some(tool_reg_tx.clone()), session_manager: Some(session_manager.clone()), subagent_registry: Some(subagent_registry.clone()), event_queue: Some(event_queue.clone()), delegation_parent: delegation_parent.clone(), codex_parent_plan: codex_parent_plan.clone(), secret_prompt: secret_prompt.clone(), orchestration: orchestration.clone(), tool_activation: Some(crate::tools::discovery::ActivationCapability::new(catalog_snapshot.clone(), std::sync::Arc::clone(&session_tool_set), activation_authority).with_host_prompt(activation_prompt_allowed)), mcp_leases: mcp_lease_capability.clone(), extension_leases: extension_lease_capability.clone(), memory_context: memory_context.clone(), cwd: cwd.clone(), env: env.clone(), env_stripped: env_stripped.clone(), env_warned: env_warned.clone(), session_id: session_id.clone() },
                                             limits: crate::tools::ToolLimits { max_tool_output, max_tool_buffer: 256 * 1024, bash_timeout, bash_max_timeout, subagent_timeout },
                                         })).await {
                                         (Some(res), _) => {
+                                            let plain_success = matches!(res, Ok(crate::ToolOutput::Text(_)));
                                             let (output, rich_blocks) = match res {
                                                 Ok(o) => validated_tool_output(&model, o),
                                                 Err(e) => {
@@ -2110,6 +2125,9 @@ impl StreamMethods {
                                             // their own budget.
                                             if rich_blocks.is_none() {
                                                 virtualised = tool_spill.virtualise(&tool_id, &spill_target, outcome.full_text());
+                                                if plain_success {
+                                                    shaping = shaping_candidate;
+                                                }
                                             }
                                             (outcome.output, rich_blocks)
                                         }
@@ -2144,48 +2162,17 @@ impl StreamMethods {
                             .as_ref()
                             .map(crate::tools::output::OutputHandle::model_history)
                             .filter(|bounded| bounded.original_bytes > 0);
-                        if let (
-                            Some(correlation),
-                            Some((stable_id, wire_name, activation, effect)),
-                        ) = (&execution_correlation, execution_identity)
-                        {
-                            let (result_bytes, retained) = match &virtualised {
-                                Some(v) => (v.original_bytes, v.preview.len()),
-                                None => (
-                                    result.len(),
-                                    history_result
-                                        .as_ref()
-                                        .map(|bounded| bounded.retained_bytes)
-                                        .unwrap_or_else(|| result.len().min(max_tool_output)),
-                                ),
-                            };
-                            correlation.record_virtualised(
-                                &tool_id,
-                                &stable_id,
-                                &wire_name,
-                                crate::runtime::trace::ExecutionPhase::ResultRecorded,
-                                tool_call_started,
-                                result_bytes,
-                                retained,
-                                activation,
-                                effect,
-                                crate::runtime::trace::ExecutionCommitStatus::ResultRecorded,
-                                0,
-                                crate::runtime::trace::HistoryShaping {
-                                    virtualised: virtualised.is_some(),
-                                    deduped_bytes: None,
-                                },
-                            );
-                        }
-                        let ui_result = crate::tools::output::bounded_preview(
-                            &result,
-                            crate::tools::output::DEFAULT_UI_PREVIEW_BYTES,
-                        );
-                        let _ = tx.send(StreamEvent::Llm(LlmEvent::ToolResult {
-                            tool_id: tool_id.clone(),
-                            result: ui_result,
-                        }));
-
+                        let (result_bytes, mut retained) = match &virtualised {
+                            Some(v) => (v.original_bytes, v.preview.len()),
+                            None => (
+                                result.len(),
+                                history_result
+                                    .as_ref()
+                                    .map(|bounded| bounded.retained_bytes)
+                                    .unwrap_or_else(|| result.len().min(max_tool_output)),
+                            ),
+                        };
+                        let was_virtualised = virtualised.is_some();
                         // Rich blocks bypass `truncate_tool_result` by construction:
                         // the image cap is the image's own budget.
                         // A canceled call must never look completed: any
@@ -2206,6 +2193,54 @@ impl StreamMethods {
                                 max_tool_output,
                             )
                         };
+                        // Read dedupe compares the FINAL history form
+                        // (post-virtualisation) against live history.
+                        let (content, deduped_bytes) = match shaping.as_ref().filter(|_| !canceled) {
+                            Some(shaping) => super::read_dedupe::shape(
+                                shaping,
+                                &messages,
+                                &tool_results,
+                                &tool_name,
+                                cwd.as_deref(),
+                                content,
+                            ),
+                            None => (content, None),
+                        };
+                        if deduped_bytes.is_some() {
+                            retained = content.as_str().map_or(retained, str::len);
+                        }
+                        if let (
+                            Some(correlation),
+                            Some((stable_id, wire_name, activation, effect)),
+                        ) = (&execution_correlation, execution_identity)
+                        {
+                            correlation.record_virtualised(
+                                &tool_id,
+                                &stable_id,
+                                &wire_name,
+                                crate::runtime::trace::ExecutionPhase::ResultRecorded,
+                                tool_call_started,
+                                result_bytes,
+                                retained,
+                                activation,
+                                effect,
+                                crate::runtime::trace::ExecutionCommitStatus::ResultRecorded,
+                                0,
+                                crate::runtime::trace::HistoryShaping {
+                                    virtualised: was_virtualised,
+                                    deduped_bytes,
+                                },
+                            );
+                        }
+                        let ui_result = crate::tools::output::bounded_preview(
+                            &result,
+                            crate::tools::output::DEFAULT_UI_PREVIEW_BYTES,
+                        );
+                        let _ = tx.send(StreamEvent::Llm(LlmEvent::ToolResult {
+                            tool_id: tool_id.clone(),
+                            result: ui_result,
+                        }));
+
                         tool_results.push(json!({
                             "type": "tool_result",
                             "tool_use_id": tool_id,
@@ -2378,10 +2413,21 @@ impl StreamMethods {
                         }));
                     }
 
+                    // Read dedupe checks each lane's results against the
+                    // live history as it stood when the batch started (it
+                    // already holds this batch's tool_use blocks) plus the
+                    // lane's own earlier results. Empty when dedupe is off.
+                    let dedupe_history: Arc<[SharedMessage]> = if read_dedupe {
+                        messages.as_slice().into()
+                    } else {
+                        Arc::from(Vec::new())
+                    };
+
                     // One task per lane; calls inside a lane run
                     // SEQUENTIALLY in model order, lanes run concurrently.
                     for lane in lanes {
                         let tx_stream = tx.clone();
+                        let dedupe_history_inner = Arc::clone(&dedupe_history);
                         let request_correlation_inner = request_correlation.clone();
                         let trace_inner = round_options.trace.clone();
                         let delegation_parent_inner = delegation_parent.clone();
@@ -2439,6 +2485,9 @@ impl StreamMethods {
                                 PreparedCall::Gate(gate_outcome) => gate_outcome,
                             };
                             let tool_name_for_hook = tool_name.clone();
+                            // Read dedupe / write-edit note: successful
+                            // plain-text results only (see single-tool site).
+                            let mut shaping: Option<super::read_dedupe::Shaping> = None;
                             let result = match gate_outcome {
                                 Ok((authorized, input)) => {
                                     let t = authorized.implementation();
@@ -2473,6 +2522,13 @@ impl StreamMethods {
                                         &input,
                                         cwd_inner.as_deref(),
                                     );
+                                    let shaping_candidate = super::read_dedupe::Shaping::for_call(
+                                        read_dedupe,
+                                        &runtime_name_for_hook,
+                                        &t.origin(),
+                                        &input,
+                                        cwd_inner.as_deref(),
+                                    );
                                     // Bounded delta lane (Task 26, §8.4) — see the single-tool site.
                                     let delta_channel =
                                         crate::tools::output::delta_channel_with_budgets(
@@ -2503,6 +2559,7 @@ impl StreamMethods {
                                             limits: crate::tools::ToolLimits { max_tool_output, max_tool_buffer: 256 * 1024, bash_timeout, bash_max_timeout, subagent_timeout },
                                         })).await {
                                         (Some(res), _) => {
+                                            let plain_success = matches!(res, Ok(crate::ToolOutput::Text(_)));
                                             let (output, rich_blocks, errored) = match res {
                                                 Ok(o) => { let (t, b) = validated_tool_output(&model_inner, o); (t, b, false) }
                                                 Err(e) => (e.to_string(), None, true),
@@ -2529,6 +2586,9 @@ impl StreamMethods {
                                             } else {
                                                 None
                                             };
+                                            if plain_success && rich_blocks.is_none() {
+                                                shaping = shaping_candidate;
+                                            }
                                             (false, Some(call_effect), outcome.output, history_handle, Some((stable_tool_id, activation_basis, tool_call_started)), rich_blocks, virtualised)
                                         }
                                         (None, started) => {
@@ -2590,13 +2650,36 @@ impl StreamMethods {
                                     max_tool_output,
                                 )
                             };
+                            // Read dedupe on the FINAL history form, against
+                            // live history plus this lane's earlier results.
+                            let (history, deduped_bytes) = match shaping.as_ref().filter(|_| !was_canceled) {
+                                Some(shaping) => {
+                                    let pending: Vec<Value> = match shaping {
+                                        super::read_dedupe::Shaping::Read(_) => lane_results
+                                            .iter()
+                                            .filter(|(_, canceled, _, _)| !canceled)
+                                            .map(|(id, _, _, content)| json!({"type": "tool_result", "tool_use_id": id, "content": content}))
+                                            .collect(),
+                                        super::read_dedupe::Shaping::Mutation(_) => Vec::new(),
+                                    };
+                                    super::read_dedupe::shape(
+                                        shaping,
+                                        &dedupe_history_inner,
+                                        &pending,
+                                        &tool_name_for_hook,
+                                        cwd_inner.as_deref(),
+                                        history,
+                                    )
+                                }
+                                None => (history, None),
+                            };
                             if let (Some(request), Some((stable_tool_id, activation_basis, tool_call_started)), Some(call_effect)) = (request_correlation_inner.as_ref(), result.4, result.1) {
                                 let correlation =
                                     crate::runtime::trace::ExecutionCorrelation::from_request(
                                         &trace_inner,
                                         request,
                                     );
-                                let (result_bytes, retained) = virtualised_sizes.unwrap_or_else(|| {
+                                let (result_bytes, mut retained) = virtualised_sizes.unwrap_or_else(|| {
                                     (
                                         result.2.len(),
                                         history_bounded
@@ -2605,6 +2688,9 @@ impl StreamMethods {
                                             .unwrap_or_else(|| result.2.len().min(max_tool_output)),
                                     )
                                 });
+                                if deduped_bytes.is_some() {
+                                    retained = history.as_str().map_or(retained, str::len);
+                                }
                                 let commit_status = if was_canceled {
                                     match call_effect {
                                         crate::tools::catalog::ToolEffect::NonIdempotent =>
@@ -2632,7 +2718,7 @@ impl StreamMethods {
                                     model_order,
                                     crate::runtime::trace::HistoryShaping {
                                         virtualised: virtualised_sizes.is_some(),
-                                        deduped_bytes: None,
+                                        deduped_bytes,
                                     },
                                 );
                             }
@@ -4152,6 +4238,7 @@ mod rich_output_tests {
             watcher_exit_path: None,
             max_tool_output: 30_000,
             tool_spill: Default::default(),
+            read_dedupe: false,
             bash_timeout: 30,
             bash_max_timeout: 300,
             subagent_timeout: 300,
@@ -5873,6 +5960,7 @@ mod rich_output_tests {
             watcher_exit_path: None,
             max_tool_output: 30_000,
             tool_spill: Default::default(),
+            read_dedupe: false,
             bash_timeout: 30,
             bash_max_timeout: 300,
             subagent_timeout: 300,
@@ -6650,5 +6738,448 @@ mod rich_output_tests {
         assert_eq!(second.history[0]["content"], BRIEF, "the original brief survives the resume");
         let text = second.history.iter().map(|m| m.to_string()).collect::<String>();
         assert!(text.contains("RESUME: now the docs"), "the resume instructions survive the rollover");
+    }
+
+    // ── Read dedupe, through the real tool-result → history path (single
+    // and parallel dispatch, durable history, wire bodies, trace events).
+    mod read_dedupe_stream {
+        use super::*;
+        use crate::runtime::read_dedupe::{unchanged_stub, EDIT_NOTE, WRITE_NOTE};
+        use crate::runtime::trace::{CollectingTraceSink, ToolExecutionEvent, TraceContext};
+
+        /// (tool_use id, tool name, input) of one call.
+        type Call = (&'static str, &'static str, Value);
+
+        /// Anthropic stand-in: one scripted SSE response per round, then
+        /// `end_turn`.
+        async fn spawn_script_mock(rounds: Vec<String>) -> (String, Arc<Mutex<Vec<Value>>>) {
+            let bodies = Arc::new(Mutex::new(Vec::new()));
+            let calls = Arc::new(AtomicUsize::new(0));
+            let rounds = Arc::new(rounds);
+            let (b, c) = (Arc::clone(&bodies), Arc::clone(&calls));
+            let app = Router::new()
+                .route(
+                    "/v1/messages",
+                    post(move |body: String| {
+                        let (b, c, rounds) = (Arc::clone(&b), Arc::clone(&c), Arc::clone(&rounds));
+                        async move {
+                            let n = c.fetch_add(1, Ordering::SeqCst);
+                            if let Ok(v) = serde_json::from_str::<Value>(&body) {
+                                b.lock().unwrap().push(v);
+                            }
+                            let sse = rounds.get(n).cloned().unwrap_or_else(|| SSE_END_TURN.to_string());
+                            (StatusCode::OK, [("content-type", "text/event-stream")], sse).into_response()
+                        }
+                    }),
+                )
+                .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            (format!("http://{addr}"), bodies)
+        }
+
+        struct Run {
+            history: Vec<SharedMessage>,
+            /// Request bodies in order: `bodies[k + 1]` carries round k's results.
+            bodies: Vec<Value>,
+            events: Vec<ToolExecutionEvent>,
+        }
+
+        impl Run {
+            /// Durable-history `content` of `id`'s tool_result.
+            fn result(&self, id: &str) -> Value {
+                find_result(self.history.iter().map(|m| &**m), id)
+                    .unwrap_or_else(|| panic!("no durable result for {id}"))
+            }
+
+            /// `content` of `id`'s tool_result in request `body` (the wire).
+            fn wire(&self, body: usize, id: &str) -> Value {
+                let messages = self.bodies[body]["messages"].as_array().unwrap();
+                find_result(messages.iter(), id)
+                    .unwrap_or_else(|| panic!("no wire result for {id} in body {body}"))
+            }
+
+            fn text(&self, id: &str) -> String {
+                self.result(id).as_str().unwrap_or_else(|| panic!("{id}: plain text")).to_string()
+            }
+
+            fn event(&self, id: &str) -> &ToolExecutionEvent {
+                self.events
+                    .iter()
+                    .rev()
+                    .find(|e| e.tool_call_id.as_str() == id)
+                    .unwrap_or_else(|| panic!("no trace event for {id}"))
+            }
+        }
+
+        fn find_result<'a>(messages: impl Iterator<Item = &'a Value>, id: &str) -> Option<Value> {
+            messages
+                .filter_map(|m| m["content"].as_array())
+                .flatten()
+                .find(|b| b["type"] == "tool_result" && b["tool_use_id"] == id)
+                .map(|b| b["content"].clone())
+        }
+
+        /// One turn of `rounds` scripted tool rounds through the real stream
+        /// loop with the built-in read/write/edit tools (plus `big_out`).
+        async fn drive_rounds(
+            initial: Vec<SharedMessage>,
+            rounds: &[Vec<Call>],
+            read_dedupe: bool,
+            configure: impl FnOnce(&mut StreamSession),
+        ) -> Run {
+            let script = rounds
+                .iter()
+                .map(|calls| {
+                    let inputs: Vec<(&str, &str, String)> =
+                        calls.iter().map(|(id, name, input)| (*id, *name, input.to_string())).collect();
+                    let refs: Vec<(&str, &str, &str)> =
+                        inputs.iter().map(|(id, name, input)| (*id, *name, input.as_str())).collect();
+                    sse_tool_use_round_with_input(&refs)
+                })
+                .collect();
+            let (base_url, bodies) = spawn_script_mock(script).await;
+            let mut registry = ToolRegistry::new();
+            registry.register(Arc::new(WorkerBigOutputTool(Arc::new(AtomicUsize::new(0)))));
+            let (tx, mut rx) = mpsc::unbounded_channel::<StreamEvent>();
+            let mut session = harness_session(
+                base_url,
+                Arc::new(RwLock::new(registry)),
+                tx,
+                crate::tools::shell::SessionManager::new(crate::tools::shell::ShellConfig::default()),
+                Arc::new(crate::extensions::hooks::HookBus::new()),
+                crate::tools::activation::SessionId::parse(&format!(
+                    "test-{}-{}",
+                    std::process::id(),
+                    uuid::Uuid::new_v4()
+                ))
+                .unwrap(),
+                Default::default(),
+                false,
+                "claude-sonnet-4-6",
+            );
+            session.read_dedupe = read_dedupe;
+            let sink = CollectingTraceSink::new();
+            session.options.trace = TraceContext::with_sink(sink.clone());
+            configure(&mut session);
+            tokio::time::timeout(
+                std::time::Duration::from_secs(60),
+                StreamMethods::run_stream_internal(session, initial),
+            )
+            .await
+            .expect("stream loop finishes")
+            .expect("turn succeeds");
+            let mut history = Vec::new();
+            while let Ok(ev) = rx.try_recv() {
+                if let StreamEvent::Session(SessionEvent::MessageHistory(m)) = ev {
+                    history = m;
+                }
+            }
+            let bodies = bodies.lock().unwrap().clone();
+            assert_eq!(bodies.len(), rounds.len() + 1, "every round reached the provider");
+            let events = sink.records().into_iter().flat_map(|r| r.execution_events).collect();
+            Run { history, bodies, events }
+        }
+
+        fn go() -> Vec<SharedMessage> {
+            vec![Arc::new(json!({"role":"user","content":"go"})) as SharedMessage]
+        }
+
+        /// `n` ~80-byte lines tagged `tag` (200 lines ≈ the report's 8 KB read).
+        fn source(n: usize, tag: &str) -> String {
+            (1..=n).map(|i| format!("{tag} line {i:04}: {}\n", "x".repeat(60))).collect()
+        }
+
+        fn read(path: &std::path::Path) -> Value {
+            json!({"path": path.to_string_lossy()})
+        }
+
+        #[tokio::test]
+        async fn an_identical_reread_is_a_stub_in_history_and_on_the_wire() {
+            let dir = tempfile::tempdir().unwrap();
+            let file = dir.path().join("database.py");
+            std::fs::write(&file, source(200, "db")).unwrap();
+            let rounds = vec![
+                vec![("toolu_r1", "read", read(&file))],
+                vec![("toolu_r2", "read", read(&file))],
+                // Relative to the session cwd: the same resolved file.
+                vec![("toolu_r3", "read", json!({"path": "database.py", "offset": 0}))],
+            ];
+            let cwd = dir.path().to_path_buf();
+            let run = drive_rounds(go(), &rounds, true, |s| s.cwd = Some(cwd)).await;
+
+            let full = run.text("toolu_r1");
+            assert!(full.starts_with("1\tdb line 0001: ") && full.contains("200\tdb line 0200: "));
+            let stub = Value::String(unchanged_stub("toolu_r1"));
+            assert_eq!(run.result("toolu_r2"), stub);
+            assert_eq!(run.result("toolu_r3"), stub, "names the original, not the stub");
+            // The wire carries exactly what history does, and the stub never
+            // changes once written (cache-safe).
+            assert_eq!(run.wire(1, "toolu_r1"), Value::String(full.clone()));
+            assert_eq!(run.wire(2, "toolu_r2"), stub);
+            assert_eq!(run.wire(3, "toolu_r2"), stub);
+            assert_eq!(run.wire(3, "toolu_r1"), Value::String(full.clone()));
+
+            let saved = (full.len() - unchanged_stub("toolu_r1").len()) as u64;
+            let e2 = run.event("toolu_r2");
+            assert!(e2.deduped && !e2.virtualised, "{e2:?}");
+            assert_eq!(e2.deduped_bytes, saved);
+            assert_eq!(e2.preview_bytes, unchanged_stub("toolu_r1").len() as u64);
+            let e1 = run.event("toolu_r1");
+            assert!(!e1.deduped && e1.deduped_bytes == 0, "{e1:?}");
+        }
+
+        #[tokio::test]
+        async fn a_changed_file_rereads_in_full_and_write_edit_say_no_reread_needed() {
+            let dir = tempfile::tempdir().unwrap();
+            let file = dir.path().join("a.py");
+            let v1 = source(100, "v1");
+            std::fs::write(&file, &v1).unwrap();
+            let v2 = source(100, "v2");
+            let rounds = vec![
+                vec![("toolu_r1", "read", read(&file))],
+                vec![("toolu_w", "write", json!({"path": file.to_string_lossy(), "content": v2}))],
+                vec![("toolu_r2", "read", read(&file))],
+                vec![(
+                    "toolu_e",
+                    "edit",
+                    json!({"path": file.to_string_lossy(), "old_string": "v2 line 0050", "new_string": "v3 line 0050"}),
+                )],
+                vec![("toolu_r3", "read", read(&file))],
+                vec![("toolu_r4", "read", read(&file))],
+            ];
+            let run = drive_rounds(go(), &rounds, true, |_| {}).await;
+
+            assert!(run.text("toolu_r2").starts_with("1\tv2 line 0001"), "changed → full");
+            assert!(run.text("toolu_r3").contains("50\tv3 line 0050"), "edited → full");
+            assert_eq!(run.result("toolu_r4"), Value::String(unchanged_stub("toolu_r3")));
+            assert_eq!(
+                run.text("toolu_w"),
+                format!("Wrote 100 lines ({} bytes) to {}\n\n{WRITE_NOTE}", v2.len(), file.display())
+            );
+            assert_eq!(
+                run.text("toolu_e"),
+                format!("Edited {} — replaced 1 line(s) with 1 line(s)\n\n{EDIT_NOTE}", file.display())
+            );
+            assert_eq!(run.wire(2, "toolu_w"), run.result("toolu_w"));
+            for id in ["toolu_r1", "toolu_w", "toolu_r2", "toolu_e", "toolu_r3"] {
+                assert!(!run.event(id).deduped, "{id}");
+            }
+        }
+
+        #[tokio::test]
+        async fn ranges_errors_and_images_dedupe_only_like_for_like() {
+            let dir = tempfile::tempdir().unwrap();
+            let file = dir.path().join("a.py");
+            std::fs::write(&file, source(100, "a")).unwrap();
+            let missing = dir.path().join("missing.py");
+            let (_png_dir, png) = real_png_file();
+            let ranged = json!({"path": file.to_string_lossy(), "offset": 10, "limit": 20});
+            let rounds = vec![
+                vec![("toolu_g1", "read", ranged.clone())],
+                vec![("toolu_g2", "read", ranged)],
+                vec![("toolu_f1", "read", read(&file))],
+                vec![("toolu_m1", "read", read(&missing))],
+                vec![("toolu_m2", "read", read(&missing))],
+                vec![("toolu_i1", "read", read(&png))],
+                vec![("toolu_i2", "read", read(&png))],
+            ];
+            let run = drive_rounds(go(), &rounds, true, |_| {}).await;
+
+            assert_eq!(run.result("toolu_g2"), Value::String(unchanged_stub("toolu_g1")));
+            assert!(run.text("toolu_f1").starts_with("1\ta line 0001"), "another range → full");
+            let error = run.text("toolu_m1");
+            assert!(error.contains("Failed to read file"), "{error}");
+            assert_eq!(run.text("toolu_m2"), error, "errors are never deduped");
+            for id in ["toolu_i1", "toolu_i2"] {
+                assert!(run.result(id).is_array(), "{id}: rich results are never deduped");
+                assert!(!run.event(id).deduped);
+            }
+        }
+
+        #[tokio::test]
+        async fn a_parallel_batch_dedupes_against_history_and_its_lane() {
+            let dir = tempfile::tempdir().unwrap();
+            let (a, b) = (dir.path().join("a.py"), dir.path().join("b.py"));
+            std::fs::write(&a, source(100, "a")).unwrap();
+            std::fs::write(&b, source(100, "b")).unwrap();
+            let rounds = vec![
+                vec![("toolu_a1", "read", read(&a))],
+                vec![
+                    ("toolu_a2", "read", read(&a)),
+                    ("toolu_b1", "read", read(&b)),
+                    ("toolu_b2", "read", read(&b)),
+                ],
+            ];
+            let run = drive_rounds(go(), &rounds, true, |_| {}).await;
+
+            assert_eq!(run.result("toolu_a2"), Value::String(unchanged_stub("toolu_a1")));
+            assert!(run.text("toolu_b1").starts_with("1\tb line 0001"));
+            // b2 may be a stub only for b1 — never for anything else. It is
+            // b1's stub iff both ran in one lane (b1 then precedes it).
+            let b2 = run.result("toolu_b2");
+            assert!(
+                b2 == run.result("toolu_b1") || b2 == Value::String(unchanged_stub("toolu_b1")),
+                "{b2}"
+            );
+            for id in ["toolu_a2", "toolu_b1", "toolu_b2"] {
+                assert_eq!(run.wire(2, id), run.result(id), "{id}: history and wire agree");
+            }
+            assert!(run.event("toolu_a2").deduped);
+            assert!(!run.event("toolu_b1").deduped);
+        }
+
+        #[tokio::test]
+        #[serial_test::serial(synaps_base_dir)]
+        async fn virtualised_reads_dedupe_only_when_the_previews_match() {
+            let _base = crate::test_env::BaseDirGuard::new();
+            let root = tempfile::tempdir().unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let file = dir.path().join("big.py");
+            std::fs::write(&file, source(600, "v1")).unwrap(); // 500 lines read ≈ 40 KB
+            let rounds = vec![
+                vec![("toolu_r1", "read", read(&file))],
+                vec![("toolu_r2", "read", read(&file))],
+                vec![("toolu_w", "write", json!({"path": file.to_string_lossy(), "content": source(600, "v2")}))],
+                vec![("toolu_r3", "read", read(&file))],
+            ];
+            let spill = spill_at(root.path());
+            let run = drive_rounds(go(), &rounds, true, move |s| s.tool_spill = spill).await;
+
+            let preview = run.text("toolu_r1");
+            assert!(preview.len() < 16 * 1024, "virtualised: {} bytes", preview.len());
+            assert!(preview.contains(&file.display().to_string()), "points at the file");
+            assert!(run.event("toolu_r1").virtualised);
+            assert_eq!(run.result("toolu_r2"), Value::String(unchanged_stub("toolu_r1")));
+            // Virtualised, then the identical preview became the stub: the
+            // whole result is accounted for, and dedupe's share is named.
+            let e2 = run.event("toolu_r2");
+            let stub_len = unchanged_stub("toolu_r1").len() as u64;
+            assert!(e2.deduped && e2.virtualised, "{e2:?}");
+            assert_eq!(e2.preview_bytes, stub_len);
+            assert_eq!(e2.deduped_bytes, preview.len() as u64 - stub_len);
+            assert_eq!(e2.result_bytes, run.event("toolu_r1").result_bytes);
+            let r3 = run.text("toolu_r3");
+            assert!(r3.starts_with("1\tv2 line 0001") && r3 != preview, "changed preview → full");
+            assert!(run.event("toolu_r3").virtualised && !run.event("toolu_r3").deduped);
+        }
+
+        #[tokio::test]
+        async fn a_prior_turn_read_counts_until_compaction_removes_it() {
+            let dir = tempfile::tempdir().unwrap();
+            let file = dir.path().join("a.py");
+            std::fs::write(&file, source(100, "a")).unwrap();
+            let first =
+                drive_rounds(go(), &[vec![("toolu_r1", "read", read(&file))]], true, |_| {}).await;
+            let again = |mut history: Vec<SharedMessage>| {
+                history.push(Arc::new(json!({"role":"user","content":"again"})));
+                history
+            };
+            let rounds = vec![vec![("toolu_r2", "read", read(&file))]];
+            // The earlier turn's read is still in history: stub.
+            let next = drive_rounds(again(first.history.clone()), &rounds, true, |_| {}).await;
+            assert_eq!(next.result("toolu_r2"), Value::String(unchanged_stub("toolu_r1")));
+            // Compaction (or a foreground continuation) replaced it: full.
+            let compacted = vec![Arc::new(json!({"role":"user","content":"[summary: read a.py]"})) as SharedMessage];
+            let next = drive_rounds(again(compacted), &rounds, true, |_| {}).await;
+            assert_eq!(next.result("toolu_r2"), first.result("toolu_r1"));
+            assert!(!next.event("toolu_r2").deduped);
+        }
+
+        #[tokio::test]
+        async fn a_worker_rollover_that_evicted_the_read_gets_it_in_full() {
+            use crate::runtime::worker_context::{
+                WorkerContext, WorkerContextSettings, WorkerTranscriptSink,
+            };
+            let dir = tempfile::tempdir().unwrap();
+            let file = dir.path().join("a.py");
+            std::fs::write(&file, source(100, "a")).unwrap();
+            // ~1.5k tokens each: enough to cross the 30k band well before
+            // the re-read.
+            const FILLER: [&str; 16] = [
+                "toolu_f0", "toolu_f1", "toolu_f2", "toolu_f3", "toolu_f4", "toolu_f5",
+                "toolu_f6", "toolu_f7", "toolu_f8", "toolu_f9", "toolu_f10", "toolu_f11",
+                "toolu_f12", "toolu_f13", "toolu_f14", "toolu_f15",
+            ];
+            let mut rounds = vec![vec![("toolu_r1", "read", read(&file))]];
+            rounds.extend(FILLER.iter().map(|id| vec![(*id, "big_out", json!({}))]));
+            rounds.push(vec![("toolu_r2", "read", read(&file))]);
+
+            // Control: no rollover, the read is still in context → stub.
+            let kept = drive_rounds(go(), &rounds, true, |_| {}).await;
+            assert_eq!(kept.result("toolu_r2"), Value::String(unchanged_stub("toolu_r1")));
+
+            let transcripts = tempfile::tempdir().unwrap();
+            let reports = Arc::new(AtomicUsize::new(0));
+            let seen = Arc::clone(&reports);
+            let sink_dir = transcripts.path().to_path_buf();
+            let rolled = drive_rounds(go(), &rounds, true, move |s| {
+                s.context_window = 200_000;
+                s.options.codex_request_role = crate::runtime::openai::catalog::CodexRequestRole::Worker;
+                s.worker_context = WorkerContext {
+                    settings: Some(WorkerContextSettings { enabled: true, rollover_tokens: 30_000 }),
+                    sink: Some(WorkerTranscriptSink {
+                        dir: sink_dir,
+                        stem: "sa_1".into(),
+                        observer: Some(Arc::new(move |_| {
+                            seen.fetch_add(1, Ordering::SeqCst);
+                        })),
+                    }),
+                };
+            })
+            .await;
+            assert!(reports.load(Ordering::SeqCst) >= 1, "the worker rolled over");
+            // The rollover moved the first read out before the re-read ran...
+            let reread_request = rolled.bodies[FILLER.len() + 1].to_string();
+            assert!(!reread_request.contains("toolu_r1"), "evicted before the re-read");
+            // ...so the re-read is the full result, not a dangling stub.
+            assert_eq!(rolled.result("toolu_r2"), kept.result("toolu_r1"));
+            assert!(!rolled.event("toolu_r2").deduped);
+        }
+
+        #[tokio::test]
+        async fn off_is_byte_identical_legacy_output() {
+            let dir = tempfile::tempdir().unwrap();
+            let file = dir.path().join("a.py");
+            let v1 = source(100, "a");
+            std::fs::write(&file, &v1).unwrap();
+            let v2 = source(100, "b");
+            let rounds = vec![
+                vec![("toolu_r1", "read", read(&file))],
+                vec![("toolu_r2", "read", read(&file))],
+                vec![("toolu_p1", "read", read(&file)), ("toolu_p2", "read", read(&file))],
+                vec![("toolu_w", "write", json!({"path": file.to_string_lossy(), "content": v2}))],
+                vec![(
+                    "toolu_e",
+                    "edit",
+                    json!({"path": file.to_string_lossy(), "old_string": "b line 0050", "new_string": "c line 0050"}),
+                )],
+            ];
+            let run = drive_rounds(go(), &rounds, false, |_| {}).await;
+
+            let full: String = v1
+                .lines()
+                .enumerate()
+                .map(|(i, line)| format!("{}\t{line}\n", i + 1))
+                .collect();
+            for id in ["toolu_r1", "toolu_r2", "toolu_p1", "toolu_p2"] {
+                assert_eq!(run.result(id), Value::String(full.clone()), "{id}");
+                assert!(!run.event(id).deduped, "{id}");
+            }
+            assert_eq!(
+                run.text("toolu_w"),
+                format!("Wrote 100 lines ({} bytes) to {}", v2.len(), file.display())
+            );
+            assert_eq!(
+                run.text("toolu_e"),
+                format!("Edited {} — replaced 1 line(s) with 1 line(s)", file.display())
+            );
+            let wire = run.bodies.last().unwrap().to_string();
+            assert!(!wire.contains("File unchanged since") && !wire.contains("no need to re-read"));
+            for (id, body) in [("toolu_r2", 2), ("toolu_p2", 3), ("toolu_w", 4), ("toolu_e", 5)] {
+                assert_eq!(run.wire(body, id), run.result(id), "{id}");
+            }
+        }
     }
 }

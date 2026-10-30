@@ -46,6 +46,7 @@ mod stream;
 pub mod subagent;
 pub mod subagent_watch;
 pub mod telemetry;
+mod read_dedupe;
 pub mod tool_spill;
 pub mod trace;
 pub mod worker_context;
@@ -601,6 +602,9 @@ pub struct Runtime {
     tool_spill_root: PathBuf,
     /// Session-cumulative virtualisation counters; shared by clones.
     tool_spill_stats: Arc<tool_spill::ToolSpillStats>,
+    /// Replace re-reads of unchanged files with a stub and note write/edit
+    /// results. Off until a config is applied (production default on).
+    read_dedupe: bool,
     bash_timeout: u64,
     bash_max_timeout: u64,
     subagent_timeout: u64,
@@ -1316,6 +1320,7 @@ impl Runtime {
             tool_spill_policy: tool_spill::ToolSpillPolicy::OFF,
             tool_spill_root: host.spill_root,
             tool_spill_stats: Arc::default(),
+            read_dedupe: false,
             bash_timeout: 30,
             bash_max_timeout: 300,
             subagent_timeout: 300,
@@ -2981,6 +2986,7 @@ impl Runtime {
         self.compaction_exclusions = config.compaction_exclude.clone();
         self.max_tool_output = config.max_tool_output;
         self.tool_spill_policy = tool_spill::ToolSpillPolicy::from_config(config);
+        self.read_dedupe = config.read_dedupe;
         self.bash_timeout = config.bash_timeout;
         self.bash_max_timeout = config.bash_max_timeout;
         self.subagent_timeout = config.subagent_timeout;
@@ -3133,6 +3139,15 @@ impl Runtime {
 
     pub fn set_tool_spill_policy(&mut self, policy: tool_spill::ToolSpillPolicy) {
         self.tool_spill_policy = policy;
+    }
+
+    pub fn read_dedupe(&self) -> bool {
+        self.read_dedupe
+    }
+
+    /// Read dedupe + write/edit notes; off = legacy tool-result bytes.
+    pub fn set_read_dedupe(&mut self, enabled: bool) {
+        self.read_dedupe = enabled;
     }
 
     /// Session totals of tool output virtualisation (count, bytes kept out
@@ -4924,6 +4939,7 @@ impl Runtime {
             watcher_exit_path,
             max_tool_output,
             tool_spill: self.tool_spill(),
+            read_dedupe: self.read_dedupe,
             bash_timeout,
             bash_max_timeout,
             subagent_timeout,
@@ -5024,6 +5040,7 @@ impl Clone for Runtime {
             tool_spill_policy: self.tool_spill_policy,
             tool_spill_root: self.tool_spill_root.clone(),
             tool_spill_stats: Arc::clone(&self.tool_spill_stats),
+            read_dedupe: self.read_dedupe,
             bash_timeout: self.bash_timeout,
             bash_max_timeout: self.bash_max_timeout,
             subagent_timeout: self.subagent_timeout,
@@ -5652,6 +5669,17 @@ mod tests {
             "tool_output_spill_bytes = 0\n",
         ));
         assert!(!runtime.tool_spill().is_enabled(), "0 turns it off");
+    }
+
+    #[test]
+    fn read_dedupe_is_off_until_configured_then_follows_config() {
+        let mut runtime = Runtime::new_headless();
+        assert!(!runtime.read_dedupe(), "off until a config is applied");
+        runtime.apply_config(&agent_core::config::load_config_from_str(""));
+        assert!(runtime.read_dedupe(), "the config default is on");
+        assert!(runtime.clone().read_dedupe(), "clones keep it");
+        runtime.apply_config(&agent_core::config::load_config_from_str("read_dedupe = off\n"));
+        assert!(!runtime.read_dedupe());
     }
 
     #[test]
