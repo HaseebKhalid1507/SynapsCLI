@@ -630,19 +630,25 @@ impl Ledger {
 
 /// Every pid in `/proc` with its stat fields (one walk). Empty off Linux.
 pub fn scan_proc() -> Vec<(u32, StatFields)> {
-    let mut out = Vec::new();
     #[cfg(target_os = "linux")]
-    if let Ok(dir) = std::fs::read_dir("/proc") {
-        for entry in dir.flatten() {
-            let Some(pid) = entry.file_name().to_str().and_then(|n| n.parse::<u32>().ok()) else {
-                continue;
-            };
-            if let Some(stat) = read_stat(pid) {
-                out.push((pid, stat));
+    {
+        let mut out = Vec::new();
+        if let Ok(dir) = std::fs::read_dir("/proc") {
+            for entry in dir.flatten() {
+                let Some(pid) = entry.file_name().to_str().and_then(|n| n.parse::<u32>().ok()) else {
+                    continue;
+                };
+                if let Some(stat) = read_stat(pid) {
+                    out.push((pid, stat));
+                }
             }
         }
+        out
     }
-    out
+    #[cfg(not(target_os = "linux"))]
+    {
+        Vec::new()
+    }
 }
 
 /// Fill `members` for every entry: the live (non-zombie) processes in its
