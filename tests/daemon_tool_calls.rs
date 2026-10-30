@@ -411,10 +411,10 @@ async fn a_subscriber_gets_every_sessions_calls_and_a_workers_carry_its_parent_a
         assert_eq!(r["session_id"], json!(sid.as_str()), "a worker's call carries its parent: {r}");
         assert_eq!(r["handle_id"], "sa_1", "{r}");
         if r["phase"] == "called" {
-            // A worker's runtime has no cwd of its own: the process cwd.
-            let canonical = std::fs::canonicalize(&process_cwd).unwrap();
+            // A worker runs in its parent session's cwd (dev 69fa04547), not the process cwd.
+            let canonical = std::fs::canonicalize(&session_cwd).unwrap();
             let cwd = r["cwd"].as_str().expect("called carries the base directory");
-            assert!(Path::new(cwd) == process_cwd || Path::new(cwd) == canonical, "{r}");
+            assert!(Path::new(cwd) == session_cwd || Path::new(cwd) == canonical, "{r}");
         }
     }
     // The parent's own subagent_start is a call of the session too.

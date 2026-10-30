@@ -105,8 +105,8 @@ exposed or not activated) gives no record.
   it is not a secret and not a security boundary.
 - **`cwd`** is the base directory the tool resolves relative paths against:
   the same value the call's `before_tool_call` hook event carries. It is
-  omitted when unknown or not UTF-8. A subagent has no working directory of
-  its own, so its calls carry the daemon process's directory. A folder
+  omitted when unknown or not UTF-8. A subagent runs in its parent
+  session's working directory, so its calls carry that directory. A folder
   named in the tool's own input (a `path` argument, a `cd` in a command) is
   NOT here: resolve it from the `tool_use` you already have. `cwd` is on
   `called` only.
