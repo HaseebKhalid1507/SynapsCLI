@@ -2,7 +2,7 @@
 name = "synaps-core"
 version.workspace = true
 edition = "2021"
-rust-version = "1.80"
+rust-version = "1.88"
 description = "Foundation types, config, session, auth, protocol — leaf crate for agent-runtime"
 license = "Apache-2.0"
 
@@ -31,12 +31,19 @@ chrono             = { version = "0.4", features = ["serde"] }
 thiserror          = "1.0"
 dirs               = "5"
 fs4                = "0.13"
+memchr             = "2"
 axum               = { version = "0.7", features = ["ws"] }
 url                = "2"
 urlencoding        = "2"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# `core::lock_file`: a lock on a byte past the holder's body, which Windows'
+# mandatory whole-file lock would make unreadable. Same version as
+# synaps-engine's, so no second copy is built.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO"] }
 
 # Gated identically to the jemalloc allocator in the synaps binary
 # (src/main.rs): stats + manual arena purge for `memstat` (§3.7).

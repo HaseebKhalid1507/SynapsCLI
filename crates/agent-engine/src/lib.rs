@@ -6,6 +6,7 @@ pub mod events;
 pub mod extensions;
 pub mod attachments;
 pub mod daemon;
+pub mod ipc;
 pub mod help;
 pub mod process_scope;
 pub mod host;

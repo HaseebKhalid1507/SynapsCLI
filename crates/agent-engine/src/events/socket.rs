@@ -71,6 +71,40 @@ impl SocketIdentity {
     }
 }
 
+/// Client end of a per-session endpoint: a stream on the Unix socket at
+/// `socket_path`, or on Windows the named pipe derived from it.
+#[cfg(unix)]
+pub type SessionClient = tokio::net::UnixStream;
+#[cfg(windows)]
+pub type SessionClient = tokio::net::windows::named_pipe::NamedPipeClient;
+
+/// Connect to the session endpoint a registration publishes as
+/// `socket_path`, so callers (`synaps send`, tests) never hard-code the
+/// platform transport.
+pub async fn connect_session_socket(socket_path: &str) -> std::io::Result<SessionClient> {
+    #[cfg(unix)]
+    {
+        tokio::net::UnixStream::connect(socket_path).await
+    }
+    #[cfg(windows)]
+    {
+        tokio::net::windows::named_pipe::ClientOptions::new().open(pipe_name_for(socket_path))
+    }
+}
+
+/// Deliver one payload to a session endpoint: connect, write, close. The
+/// listener reads to EOF, and a named pipe has no half-close (`shutdown`
+/// only flushes), so EOF reaches it only when the handle is dropped. Doing
+/// all three here means no caller can hold the pipe open by accident.
+pub async fn send_to_session_socket(socket_path: &str, payload: &[u8]) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let mut client = connect_session_socket(socket_path).await?;
+    client.write_all(payload).await?;
+    client.shutdown().await?;
+    drop(client);
+    Ok(())
+}
+
 #[cfg(unix)]
 pub(crate) type SessionListener = UnixListener;
 #[cfg(windows)]

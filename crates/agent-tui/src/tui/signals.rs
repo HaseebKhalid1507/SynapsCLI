@@ -80,6 +80,7 @@ pub(crate) const SESSION_END_TIMEOUT_SECS: u64 = CANCEL_DRAIN_TIMEOUT_SECS
     + SESSION_END_MARGIN_SECS;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(unix), allow(dead_code))] // SIGTERM / SIGHUP exist only on Unix
 pub(crate) enum ShutdownSignal {
     Interrupt,
     Terminate,

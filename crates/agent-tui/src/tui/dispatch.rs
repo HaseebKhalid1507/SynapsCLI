@@ -199,6 +199,12 @@ pub(crate) async fn handle_input_action(
     match action {
         InputAction::None => {}
         InputAction::HelpFindOutcome => {}
+        InputAction::SessionsPast(cmd) => super::sessions::past::tasks::run(app, cmd),
+        InputAction::CopyText(text) => super::input::copy_to_clipboard(&text),
+        InputAction::SessionsOp(op) => {
+            let socket = link.transport().socket_path().map(|p| p.to_path_buf());
+            super::sessions::spawn_op(app, socket, op);
+        }
         InputAction::Quit => {
             // F27: if streaming over a socket, the turn keeps running in the
             // daemon after detach. First Ctrl+C shows a notice; second within
@@ -226,6 +232,9 @@ pub(crate) async fn handle_input_action(
             // aborted line, HUD clear) follows on `Dequeued` / `Aborted`
             // (stream_handler). The actor drains the cancelled stream first
             // (bounded), so acknowledge the keypress right away.
+            if read_only_blocked(app, link, None) {
+                return ControlFlow::Continue(());
+            }
             if app.streaming {
                 app.status_text = Some(super::stream_handler::ABORTING_STATUS.to_string());
             }
@@ -318,6 +327,8 @@ pub(crate) async fn handle_input_action(
                     }
                 }
                 CommandAction::OpenSettings => open_settings(app, http),
+                CommandAction::Clients => super::commands::clients(app, link),
+                CommandAction::OpenSessions => super::sessions::open(app, link),
                 CommandAction::OpenPlugins => {
                     let path = synaps_cli::skills::state::PluginsState::default_path();
                     match synaps_cli::skills::state::PluginsState::load_from(&path) {
@@ -1110,9 +1121,13 @@ pub(crate) async fn handle_input_action(
                     let line = self::sidecar::status(app, plugin_id.as_deref(), registry);
                     app.push_msg(ChatMessage::System(line));
                 }
+                CommandAction::TakeOver => commands::takeover(app, link).await,
             }
         }
         InputAction::Submit(input) => {
+            if read_only_blocked(app, link, Some(&input)) {
+                return ControlFlow::Continue(());
+            }
             // Queue input during compaction — the actor queues it (B2) and
             // answers `Steered{delivered:false}` → "queued: …".
             // Reject attachments during compaction; the actor would ignore them.
@@ -1165,6 +1180,9 @@ pub(crate) async fn handle_input_action(
                 .await;
         }
         InputAction::SubagentSteer { handle_id, text } => {
+            if read_only_blocked(app, link, Some(&text)) {
+                return ControlFlow::Continue(());
+            }
             // Owner-only on the engine side; a refusal comes back as
             // `Refused{command: "subagent_steer"}` (watch::steer_refused).
             super::watch::steer_sent(app, &handle_id, &text);
@@ -1179,6 +1197,9 @@ pub(crate) async fn handle_input_action(
             match commands::resolve_streaming_input(&input, app, registry) {
                 commands::StreamingSlash::Refused => {}
                 commands::StreamingSlash::Steer => {
+                    if read_only_blocked(app, link, Some(&input)) {
+                        return ControlFlow::Continue(());
+                    }
                     // Normal or unknown slash text during streaming —
                     // steer/queue ("→ steering:" / "queued:" on `Steered`).
                     let _ = link
@@ -1226,6 +1247,8 @@ pub(crate) async fn handle_input_action(
                     CommandAction::OpenModels => {}
                     CommandAction::OpenEffort => {}
                     CommandAction::OpenSettings => open_settings(app, http),
+                    CommandAction::Clients => super::commands::clients(app, link),
+                    CommandAction::OpenSessions => super::sessions::open(app, link),
                     CommandAction::OpenPlugins => {}
                     CommandAction::OpenHelpFind { .. } => {}
                     CommandAction::ReloadPlugins => {}
@@ -1246,6 +1269,7 @@ pub(crate) async fn handle_input_action(
                     CommandAction::Ping => {}
                     CommandAction::SidecarToggle { .. } => {}
                     CommandAction::SidecarStatus { .. } => {}
+                    CommandAction::TakeOver => commands::takeover(app, link).await,
                 },
             }
         }
@@ -1748,6 +1772,35 @@ pub(crate) async fn handle_input_action(
     ControlFlow::Continue(())
 }
 
+/// Shown when an `--observe` client presses Enter or Esc.
+pub(super) const OBSERVING_READ_ONLY: &str = "read-only: attach without --observe to type";
+
+/// This client may not drive the session now (`--observe`, or not the input
+/// owner with `client_input = exclusive`), so its Enter and Esc never reach
+/// it. The actor would refuse them anyway, but the prompt had already been
+/// echoed as sent and the refusal came back as an error line, splitting a
+/// reply that was streaming. Say why in a toast instead and give the text
+/// back. `true` = blocked. The daemon still enforces it: a stale local view
+/// only delays input by the time `InputOwnerChanged` takes to arrive.
+fn read_only_blocked(app: &mut App, link: &super::session_link::SessionLink, text: Option<&str>) -> bool {
+    let t = link.transport();
+    if t.daemon_pid() == 0 || super::session_link::may_drive(t) {
+        return false;
+    }
+    let (title, line) = if app.observing {
+        ("Observing", OBSERVING_READ_ONLY.to_string())
+    } else {
+        let who = t.input_owner().map(|o| t.roster().label(o)).unwrap_or_else(|| "nobody".to_string());
+        ("Read-only", format!("input owned by {who}; /takeover to type"))
+    };
+    if let Some(text) = text {
+        app.set_input_text(text);
+    }
+    app.toasts.upsert(super::toast::Toast::new("read-only", line).titled(title));
+    app.request_redraw();
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1802,5 +1855,70 @@ mod tests {
             )
         });
         assert!(found, "expected in-process-only notice under Socket mode");
+    }
+
+    /// A client that may not drive (`--observe`; not the owner under
+    /// `client_input = exclusive`) never sends Enter or Esc: no echo, the
+    /// text stays in the editor, a toast says why. A shared-input client
+    /// that isn't active sends as usual.
+    #[tokio::test]
+    async fn a_read_only_client_keeps_its_text_and_sends_nothing() {
+        use agent_engine::session::{AttachMode, ClientId, ClientInput};
+        let cases = [
+            (AttachMode::Observe, ClientInput::Shared, true, "read-only: attach without --observe"),
+            (AttachMode::Mirror, ClientInput::Exclusive, true, "input owned by client #7; /takeover to type"),
+            (AttachMode::Mirror, ClientInput::Shared, false, ""),
+        ];
+        for (mode, client_input, blocked, toast) in cases {
+            let mut app = App::new(synaps_cli::Session::new("test", "medium", None));
+            app.observing = mode == AttachMode::Observe;
+            let transport = crate::tui::testing::scripted::ScriptedTransport::new(synaps_cli::Runtime::new().await.unwrap())
+                .with_daemon_pid(4242)
+                .with_ownership(mode, Some(ClientId(7)))
+                .with_client_input(client_input);
+            let log = std::sync::Arc::clone(&transport.log);
+            let mut link = crate::tui::session_link::SessionLink::new(Box::new(transport));
+            let http = super::super::run_setup::LazyHttp::new();
+            let mut config = synaps_cli::SynapsConfig::default();
+            let registry = std::sync::Arc::new(
+                synaps_cli::skills::registry::CommandRegistry::new_with_plugins(&[], vec![], vec![]),
+            );
+            let keybind_registry =
+                std::sync::Arc::new(std::sync::RwLock::new(synaps_cli::skills::keybinds::KeybindRegistry::new()));
+            let system_prompt_path = std::path::PathBuf::from("/tmp/sp");
+            let render_handle = render_thread::RenderHandle::headless();
+            let mut event_reader: Option<crossterm::event::EventStream> = None;
+            let mut exit_fx_sent = false;
+            for action in [InputAction::Submit("hello there".into()), InputAction::Abort] {
+                let state = LoopState {
+                    app: &mut app,
+                    link: &mut link,
+                    http: &http,
+                    config: &mut config,
+                    registry: &registry,
+                    keybind_registry: &keybind_registry,
+                    system_prompt_path: &system_prompt_path,
+                    render_handle: &render_handle,
+                    event_reader: &mut event_reader,
+                    ext_mgr_shared: None,
+                    exit_fx_sent: &mut exit_fx_sent,
+                    is_socket: true,
+                };
+                let _ = handle_input_action(action, state).await;
+            }
+            let sent = log.lock().unwrap().sent.clone();
+            let echoed = app.transcript.messages().iter().any(|m| matches!(&m.msg, ChatMessage::User(_)));
+            if blocked {
+                assert!(sent.is_empty(), "{mode:?}/{client_input}: {sent:?}");
+                assert!(!echoed, "{mode:?}/{client_input}: not echoed as sent");
+                assert_eq!(app.input_text(), "hello there", "{mode:?}/{client_input}: the text is given back");
+                assert!(app.toasts.visible().any(|t| t.id() == "read-only"), "{mode:?}/{client_input}");
+                let shown = format!("{:?}", app.toasts.visible().collect::<Vec<_>>());
+                assert!(shown.contains(toast), "{mode:?}/{client_input}: {shown}");
+            } else {
+                assert!(sent.iter().any(|c| c.starts_with("Submit")), "shared: {sent:?}");
+                assert!(echoed);
+            }
+        }
     }
 }

@@ -28,6 +28,7 @@ pub use core::protocol;
 pub use core::reasoning;
 pub use core::retention;
 pub use core::session;
+pub use core::session_catalog;
 pub use core::session_journal;
 pub use core::session_lock;
 pub use core::watcher_types;

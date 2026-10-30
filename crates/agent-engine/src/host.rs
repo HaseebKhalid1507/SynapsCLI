@@ -97,6 +97,9 @@ pub struct EngineHost {
     /// extension and the tail would pass the handler timeout and lose its
     /// injection for the whole session.
     session_start_gate: crate::session::session_start::SessionStartGate,
+    /// The daemon's pin book (set once by `Daemon::start`): sessions on this
+    /// host write their pin changes through it. `None` in-process.
+    pin_sink: std::sync::RwLock<Option<Arc<dyn crate::session::PinSink>>>,
 }
 
 /// (E-P2) Returned by [`EngineHost::claim_driver`] when another live session
@@ -219,6 +222,7 @@ impl EngineHost {
             extensions_loading: std::sync::atomic::AtomicBool::new(false),
             pending_mcp_discovery: std::sync::Mutex::new(pending_mcp_discovery),
             session_start_gate: crate::session::session_start::SessionStartGate::new(),
+            pin_sink: std::sync::RwLock::new(None),
         }))
     }
 
@@ -314,6 +318,16 @@ impl EngineHost {
     /// to stderr and the log. The TUI shows them as notices instead.
     pub fn report_config_warnings(&self) {
         report_config_warnings(&self.config());
+    }
+
+    /// Install the daemon's pin book (each daemon start on this host
+    /// replaces it: the host is process-global, a daemon is not).
+    pub fn set_pin_sink(&self, sink: Arc<dyn crate::session::PinSink>) {
+        *self.pin_sink.write().unwrap_or_else(|e| e.into_inner()) = Some(sink);
+    }
+
+    pub(crate) fn pin_sink(&self) -> Option<Arc<dyn crate::session::PinSink>> {
+        self.pin_sink.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// The host's `on_session_start` gate (one hook at a time).

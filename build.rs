@@ -36,6 +36,17 @@ fn main() {
         .or_else(repo_build_id)
         .unwrap_or_default();
     println!("cargo:rustc-env=SYNAPS_BUILD_ID={}", id.trim());
+
+    // Windows reserves 1 MiB for the main thread's stack (Linux: 8 MiB). The
+    // CLI's top-level future is large in unoptimised builds and overflows it
+    // before clap has even parsed `--version`; reserve what Linux gives.
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+            println!("cargo:rustc-link-arg-bins=/STACK:8388608");
+        } else {
+            println!("cargo:rustc-link-arg-bins=-Wl,--stack,8388608");
+        }
+    }
 }
 
 fn git(dir: &Path, args: &[&str]) -> Option<String> {

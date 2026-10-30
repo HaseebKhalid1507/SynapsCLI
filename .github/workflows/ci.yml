@@ -104,6 +104,34 @@ jobs:
           save-if: ${{ github.event_name == 'push' }}
       - run: cargo check --workspace --locked
 
+  # Nothing else compiles for Windows, so Windows-only breakage landed
+  # unnoticed: `dev` stopped building there when the Unix-socket daemon
+  # merged (d49f3c6b), and test targets rotted behind Unix-only APIs.
+  # Clippy builds and lints every target (libs, bins, tests) in both
+  # feature sets, as the Linux jobs do. The daemon suites drive the
+  # Windows-native daemon (named pipes, detached spawn, reload lock
+  # hand-off) with real processes; the TUI's unit tests run in full. The
+  # rest of the suite isn't run here yet: dozens of tests outside the daemon
+  # and the TUI still fail on Windows.
+  #
+  # autocrlf off so the checkout is byte-identical to Linux (fixtures and
+  # `include_str!` goldens are LF).
+  windows:
+    runs-on: windows-2025
+    steps:
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.event_name == 'push' }}
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo clippy --workspace --all-targets --no-default-features --locked -- -D warnings
+      - run: cargo test --locked --no-fail-fast --test "daemon_*"
+      - run: cargo test --locked --no-fail-fast -p synaps-tui --lib
+
   # The Axel memory sidecar is its own workspace (its own Cargo.lock and
   # dependency graph), so nothing above builds it. Its `axel` dependency is
   # a public git repo pinned by rev; no credentials needed.

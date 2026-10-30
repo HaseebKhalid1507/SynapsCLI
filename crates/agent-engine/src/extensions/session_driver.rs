@@ -399,7 +399,7 @@ impl Grant {
         if self.deadline.is_some_and(|deadline| {
             Instant::now()
                 .checked_add(delay)
-                .map_or(true, |at| at >= deadline)
+                .is_none_or(|at| at >= deadline)
         }) {
             return Err("session driver deadline expires before the proposed turn".into());
         }

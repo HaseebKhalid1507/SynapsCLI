@@ -2,7 +2,7 @@
 name = "synaps-engine"
 version.workspace = true
 edition = "2021"
-rust-version = "1.80"
+rust-version = "1.88"
 description = "Runtime engine — streaming, tools, MCP, skills, extensions, sidecar"
 license = "Apache-2.0"
 
@@ -39,6 +39,7 @@ async-trait        = "0.1.89"
 reqwest            = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls-webpki-roots", "rustls-tls-native-roots"] }
 bytes              = "1"
 memchr             = "2"
+flate2             = "1"
 
 # Serialisation
 serde              = { version = "1.0", features = ["derive", "rc"] }
@@ -100,6 +101,22 @@ arc-swap           = "1"
 [target.'cfg(unix)'.dependencies]
 libc        = "0.2"
 signal-hook = { version = "0.3", features = ["iterator"] }
+
+# Windows-native daemon: named-pipe security (owner-only DACL, server
+# identity check), the spawn ready event, the reload lock hand-off and
+# process liveness. Same major as tokio's, so no second copy is built.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+] }
 
 [dev-dependencies]
 serial_test = "3.4.0"

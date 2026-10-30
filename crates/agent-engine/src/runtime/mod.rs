@@ -35,9 +35,11 @@ mod image_retention;
 pub mod keepwarm;
 pub mod memory_context;
 pub mod memory_history;
+pub mod message_time;
 pub mod openai;
 pub mod relay;
 mod request;
+mod request_encoding;
 mod sse;
 mod sse_types;
 mod stream;
@@ -718,6 +720,9 @@ pub struct Runtime {
     refusal_retries: u32,
     /// Telemetry level for structured per-request API logging (opt-in).
     telemetry_level: crate::runtime::telemetry::TelemetryLevel,
+    /// Rotated generations kept per log (`telemetry_log_generations`), read
+    /// when the session writer starts.
+    telemetry_log_generations: u32,
     /// Session-shared bounded observability writer (Task 11, spec §6.5).
     /// `Some` iff `telemetry_level` is Basic/Full. Cloned runtimes
     /// (subagents) share the same handle — one worker per session, never
@@ -806,6 +811,10 @@ pub struct Runtime {
     /// Prompt-cache TTL strategy (5m default | 1h | hybrid). Threaded into
     /// every request via `ApiOptions`.
     cache_ttl: crate::core::config::CacheTtl,
+    /// gzip policy for Anthropic request bodies (`request_compression`,
+    /// `request_compression_level`). Threaded into every request via
+    /// `ApiOptions`; its refusal latch is process-wide.
+    request_compression: request_encoding::RequestCompression,
     /// One-time-per-session latch for the silent 1h-downgrade notice
     /// (spec §3.4.1). Shared into `ApiOptions` for every request.
     ttl_downgrade_notified: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -892,6 +901,8 @@ pub struct Runtime {
     /// budget in `turn_budget`): the owner's steer moves that stream onto
     /// the session budget. `None` for every other stream.
     owner_steer_budget: Option<Arc<crate::runtime::budget::OwnerSteerBudget>>,
+    /// Source of the per-message `_synaps_at` times (see `message_time`).
+    message_clock: crate::runtime::message_time::MessageClock,
     /// Private runtime-scoped tool-session identity (Task 16). Scopes the
     /// per-stream `SessionToolSet` the execution gate authorizes against.
     /// Minted fresh per constructed `Runtime` — two independently
@@ -1407,6 +1418,7 @@ impl Runtime {
             api_retries: 3,
             refusal_retries: 2,
             telemetry_level: crate::runtime::telemetry::TelemetryLevel::Off,
+            telemetry_log_generations: crate::runtime::telemetry::DEFAULT_MAX_GENERATIONS,
             telemetry_writer: None,
             trace_ctx: trace::TraceContext::disabled(),
             trace_controls: std::sync::Arc::new(trace::TraceControls::new()),
@@ -1430,6 +1442,7 @@ impl Runtime {
             capture_dir: host.capture_dir,
             cache_diagnostics: false,
             cache_ttl: crate::core::config::CacheTtl::default(),
+            request_compression: Default::default(),
             ttl_downgrade_notified: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             saw_1h_honored: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             cache_anchor: Default::default(),
@@ -1457,6 +1470,7 @@ impl Runtime {
                 crate::runtime::budget::TurnRole::Foreground,
             ),
             owner_steer_budget: None,
+            message_clock: Default::default(),
             host_tool_session: fresh_host_tool_session(),
             tool_catalog_prompt: Arc::new(std::sync::Mutex::new(None)),
             retained_tool_set: Default::default(),
@@ -1746,6 +1760,15 @@ impl Runtime {
         lift: Option<Arc<crate::runtime::budget::OwnerSteerBudget>>,
     ) {
         self.owner_steer_budget = lift;
+    }
+
+    /// Where message times come from (tests inject a clock).
+    pub fn message_clock(&self) -> &crate::runtime::message_time::MessageClock {
+        &self.message_clock
+    }
+
+    pub fn set_message_clock(&mut self, clock: crate::runtime::message_time::MessageClock) {
+        self.message_clock = clock;
     }
 
     /// The currently configured per-turn budget.
@@ -3070,9 +3093,14 @@ impl Runtime {
         self.refusal_retries = config.refusal_retries;
         self.telemetry_level =
             crate::runtime::telemetry::TelemetryLevel::from_str_key(&config.telemetry);
+        self.telemetry_log_generations = config.telemetry_log_generations;
         self.sync_observability();
         self.cache_diagnostics = config.cache_diagnostics;
         self.cache_ttl = config.cache_ttl;
+        self.request_compression = request_encoding::RequestCompression::from_config(
+            config.request_compression,
+            config.request_compression_level,
+        );
         self.progressive_tool_disclosure = config.progressive_tool_disclosure;
         self.deferred_tool_loading = config.tools_deferred_loading;
         self.activation_confirm = config.tools_activation_confirm;
@@ -3240,6 +3268,42 @@ impl Runtime {
         self.sync_observability();
     }
 
+    /// This session's telemetry, for the subagents it spawns.
+    pub fn worker_telemetry(&self) -> crate::runtime::telemetry::WorkerTelemetry {
+        crate::runtime::telemetry::WorkerTelemetry {
+            level: self.telemetry_level,
+            writer: self.telemetry_writer.clone(),
+            parent_session_id: self.session_id.clone(),
+            parent_runtime_session_id: Some(self.trace_ctx.session_id().as_str().to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// Record a worker's requests at its parent's telemetry level, through
+    /// the parent's session writer. Worker runtimes start `Off`
+    /// (`from_parts`), so without this every subagent request was missing
+    /// from `api-log.jsonl`.
+    ///
+    /// The writer is shared, not rebuilt: it owns its files from one thread,
+    /// and a writer per worker would race rotation. The trace context is
+    /// fresh, though: a worker is its own trace session with its own
+    /// cache-break snapshots, so its requests never read as breaks in the
+    /// parent's conversation. A parent that is `Off` leaves the worker `Off`.
+    pub fn inherit_telemetry(&mut self, parent: &crate::runtime::telemetry::WorkerTelemetry) {
+        match (&parent.writer, parent.level.enabled()) {
+            (Some(writer), true) => {
+                self.telemetry_level = parent.level;
+                self.trace_ctx = trace::TraceContext::with_sink(Arc::new(
+                    crate::runtime::telemetry::WriterTraceSink::new(writer.clone()),
+                ));
+                // Same writer, tagged: the worker's records carry its agent,
+                // handle and the parent's session id.
+                self.telemetry_writer = parent.worker_writer();
+            }
+            _ => self.set_telemetry_level(crate::runtime::telemetry::TelemetryLevel::Off),
+        }
+    }
+
     /// Reconcile the shared observability writer + trace sink with the
     /// telemetry level (Task 11 config rule, documented until Task 12 adds
     /// explicit trace config/UI): `basic`/`full` enables BOTH legacy
@@ -3250,7 +3314,10 @@ impl Runtime {
         if self.telemetry_level.enabled() {
             if self.telemetry_writer.is_none() {
                 let writer = crate::runtime::telemetry::TelemetryWriter::new(
-                    crate::runtime::telemetry::WriterOptions::default(),
+                    crate::runtime::telemetry::WriterOptions {
+                        max_generations: self.telemetry_log_generations,
+                        ..Default::default()
+                    },
                 );
                 self.trace_ctx = trace::TraceContext::with_sink(Arc::new(
                     crate::runtime::telemetry::WriterTraceSink::new(writer.clone()),
@@ -3978,6 +4045,15 @@ impl Runtime {
         self.telemetry_writer.clone()
     }
 
+    /// The writer handle for this runtime's requests: stamps the persisted
+    /// conversation id (`session_id`) on every api-log record, keeping any
+    /// worker identity the handle already carries.
+    pub(crate) fn request_telemetry(&self) -> Option<crate::runtime::telemetry::TelemetryWriter> {
+        self.telemetry_writer
+            .as_ref()
+            .map(|w| w.with_session(self.session_id.clone()))
+    }
+
     /// Bounded shutdown flush of the observability writer: stop intake,
     /// drain until `timeout`, return typed stats (`None` when telemetry is
     /// off). Sync and bounded — safe from shutdown paths that cannot await;
@@ -4208,6 +4284,8 @@ impl Runtime {
             &api::ApiOptions {
                 trace: self.trace_ctx.clone(),
                 telemetry: self.telemetry_writer.clone(),
+                // The largest body Synaps sends: the whole transcript.
+                request_compression: self.request_compression.clone(),
                 ..api::ApiOptions::default()
             },
         )
@@ -4259,6 +4337,7 @@ impl Runtime {
                     token_cache: self.token_cache.clone(),
                     anthropic_base_url: None,
                     anthropic_stream_client: self.anthropic_stream_client.clone(),
+                    request_compression: self.request_compression.clone(),
                     anthropic_execution_plan: anthropic_execution_plan.clone(),
                     codex_request_role: self.codex_request_role(),
                     // Consistent with the streaming path: a pending
@@ -4365,6 +4444,7 @@ impl Runtime {
                                         session_allow_all: Some(self.session_allow_all.clone()),
                                         launch_cancel: None,
                                         memory_backend: Some(self.memory_backend.clone()),
+                                        telemetry: Some(self.worker_telemetry()),
                                         watcher_exit_path: self.watcher_exit_path.clone(),
                                         tool_register_tx: None,
                                         session_manager: Some(self.session_manager.clone()),
@@ -4505,6 +4585,7 @@ impl Runtime {
                             let session_allow_all_inner = self.session_allow_all.clone();
                             let orchestration_inner = cfg_orchestration.clone();
                             let memory_backend_inner = self.memory_backend.clone();
+                            let worker_telemetry_inner = self.worker_telemetry();
                             let memory_context_inner = self.memory_tool_capability();
                             let codex_parent_plan_inner = codex_parent_plan.clone();
                             let cwd_inner = cfg_cwd.clone();
@@ -4568,6 +4649,7 @@ impl Runtime {
                                                     session_allow_all: Some(session_allow_all_inner.clone()),
                                                     launch_cancel: None,
                                                     memory_backend: Some(memory_backend_inner),
+                                                    telemetry: Some(worker_telemetry_inner),
                                                     watcher_exit_path: exit_path,
                                                     tool_register_tx: None,
                                                     session_manager: Some(session_mgr_inner),
@@ -4867,12 +4949,13 @@ impl Runtime {
             token_cache: self.token_cache.clone(),
             anthropic_base_url: None,
             anthropic_stream_client: self.anthropic_stream_client.clone(),
+            request_compression: self.request_compression.clone(),
             anthropic_execution_plan,
             codex_request_role: self.codex_request_role(),
             trace: self.effective_trace_context(),
             request_correlation: None,
             suppress_stream_deltas: false,
-            telemetry: self.telemetry_writer.clone(),
+            telemetry: self.request_telemetry(),
             // Threads the runtime-scoped gate identity into extension-
             // provider interior tool loops (Task 16).
             tool_session_id: Some(self.host_tool_session.clone()),
@@ -4949,6 +5032,7 @@ impl Runtime {
             extension_session_scope: self.extension_session_scope.clone(),
             turn_budget: self.turn_budget.clone(),
             owner_steer_budget: self.owner_steer_budget.clone(),
+            message_clock: self.message_clock.clone(),
         };
 
         tokio::spawn(async move {
@@ -5019,6 +5103,7 @@ impl Clone for Runtime {
             api_retries: self.api_retries,
             refusal_retries: self.refusal_retries,
             telemetry_level: self.telemetry_level,
+            telemetry_log_generations: self.telemetry_log_generations,
             // Shared session observability: clones (subagents) enqueue into
             // the SAME bounded writer and trace context — one worker and one
             // set of session-scoped context IDs per session.
@@ -5050,6 +5135,7 @@ impl Clone for Runtime {
             capture_dir: self.capture_dir.clone(),
             cache_diagnostics: self.cache_diagnostics,
             cache_ttl: self.cache_ttl,
+            request_compression: self.request_compression.clone(),
             // Subagents are their own session — fresh latches so a downgrade
             // in the subagent's chain surfaces its own (single) notice and
             // honored-state isn't inherited from the parent.
@@ -5083,6 +5169,7 @@ impl Clone for Runtime {
             extension_session_scope: self.extension_session_scope.clone(),
             turn_budget: self.turn_budget.clone(),
             owner_steer_budget: self.owner_steer_budget.clone(),
+            message_clock: self.message_clock.clone(),
             // Clones share the live tool registry, so they share the SAME
             // host tool session (matching existing shared-session behavior);
             // independently constructed runtimes mint fresh identities and

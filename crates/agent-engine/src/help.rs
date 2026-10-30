@@ -1083,6 +1083,20 @@ mod tests {
         assert!(entries.iter().any(|entry| entry.command == "/help find"));
     }
 
+    /// C7: the landing page omitted /sessions and /theme and opened with
+    /// two filler lines ("Fast paths…", "Start here…").
+    #[test]
+    fn help_landing_lists_sessions_and_theme_without_filler() {
+        let registry = HelpRegistry::new(builtin_entries(), Vec::new());
+        let page = render_help(&registry, None).expect("root help");
+        for cmd in ["/sessions", "/theme", "/model", "/settings", "/help find"] {
+            assert!(page.contains(cmd), "missing {cmd}:\n{page}");
+        }
+        for filler in ["Fast paths", "Start here", "Tip:"] {
+            assert!(!page.contains(filler), "filler {filler:?}:\n{page}");
+        }
+    }
+
     // Slice C: /effort discovery — command registry + searchable help entry.
     #[test]
     fn effort_is_a_builtin_command_with_help_entry() {

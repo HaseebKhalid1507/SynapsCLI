@@ -253,6 +253,21 @@ pub async fn try_route(
     .await
 }
 
+/// The host-key-free history every non-Anthropic route sends, or `None`
+/// when there is nothing to strip or the model takes the native Anthropic
+/// transport (which strips while serializing its body).
+pub(crate) fn routed_wire_messages(
+    model: &str,
+    messages: &[crate::SharedMessage],
+) -> Option<Vec<crate::SharedMessage>> {
+    let native_anthropic = ProviderRegistry::parse_model_id(model).is_none()
+        && resolve_route(model).is_some_and(|r| r.wire == WireProtocol::AnthropicMessages);
+    if native_anthropic {
+        return None;
+    }
+    super::continuation::wire_messages(messages)
+}
+
 /// Runtime route retaining the host's immutable memory binding. The public
 /// compatibility facade above has no runtime capability and cannot mint one.
 #[allow(clippy::too_many_arguments)]
@@ -288,6 +303,11 @@ pub(crate) async fn try_route_with_memory_backend(
     if let Err(error) = super::attachments::validate_history_for_request(model, messages) {
         return Some(Err(error.into()));
     }
+    // Host `_synaps_*` keys never reach any of these transports (some
+    // forward the history verbatim). Only the native Anthropic route, which
+    // returns `None` below without reading `messages`, skips the copy.
+    let wire = routed_wire_messages(model, messages);
+    let messages = wire.as_deref().unwrap_or(messages);
     if let Some((plugin_id, provider_id, model_id)) = ProviderRegistry::parse_model_id(model) {
         if let Some(manager) = extension_manager_for_routing() {
             // Extension-hosted provider: routing gates, audits, and the

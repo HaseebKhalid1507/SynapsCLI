@@ -1,6 +1,6 @@
 # Plan: Multiple accounts per OAuth provider in the credential broker
 
-**Status:** draft for JR review · **Origin:** quota-juggling research 2026-09-20 (several ChatGPT/Codex "Astra" seats hit their weekly cap in ~24h; the broker can only hold one refresh token per provider) · **Branch:** `feat/multi-account-broker` off `dev @ 7bd33e07`
+**Status:** superseded by [multi-account-broker-goals.md](multi-account-broker-goals.md) (shipped in 0.11.0) · **Origin:** quota-juggling research 2026-09-20 (several ChatGPT/Codex "Astra" seats hit their weekly cap in ~24h; the broker can only hold one refresh token per provider) · **Branch:** `feat/multi-account-broker` off `dev @ 7bd33e07`
 
 > Execution update: the complete, goal-based scope and safety acceptance criteria are in [multi-account-broker-goals.md](multi-account-broker-goals.md). That plan supersedes draft details below, particularly cross-process refresh serialization, source/principal-scoped token caches, fail-closed invalid selectors, and bounded opt-in activation with provider verification. The initial Phase A-only PR scope is no longer the full task.
 
@@ -26,7 +26,7 @@ What we need:
 {
   "openai-codex":        { "type": "oauth", "refresh": "…", "access": "…", "expires": 0, "accountId": "2b2f…" },
   "openai-codex@astra2": { "type": "oauth", "refresh": "…", "access": "…", "expires": 0, "accountId": "7f53…",
-                           "label": "astra2", "identity": "inference@praxis-ai.com", "addedAt": 1789911074 },
+                           "label": "astra2", "identity": "user@example.com", "addedAt": 1789911074 },
   "anthropic":           { … },
   "kimi-code@m27":       { … }
 }

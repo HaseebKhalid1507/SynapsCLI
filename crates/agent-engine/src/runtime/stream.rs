@@ -237,6 +237,8 @@ pub(super) struct StreamSession {
     /// Event-started turns only: the owner's steer moves the turn onto the
     /// session budget it carries.
     pub(super) owner_steer_budget: Option<Arc<crate::runtime::budget::OwnerSteerBudget>>,
+    /// Source of the times stamped on this turn's new messages.
+    pub(super) message_clock: crate::runtime::message_time::MessageClock,
 }
 
 pub(super) struct StreamMethods;
@@ -676,13 +678,38 @@ impl StreamMethods {
             extension_session_scope,
             turn_budget,
             owner_steer_budget,
+            message_clock,
         } = session;
+        // Handed to every subagent this turn spawns (see `inherit_telemetry`).
+        let worker_telemetry = crate::runtime::telemetry::WorkerTelemetry {
+            level: telemetry_level,
+            writer: options.telemetry.clone(),
+            parent_session_id: session_id.clone(),
+            parent_runtime_session_id: Some(options.trace.session_id().as_str().to_string()),
+            ..Default::default()
+        };
         let codex_parent_plan = crate::Runtime::codex_delegation_plan(
             &model,
             reasoning_level,
             options.codex_request_role,
         );
         let mut messages = initial_messages;
+        // Every message this turn appends gets its own time before any
+        // publish; the history it started from is settled (the frontend
+        // stamped the request it admitted). Host-only: never on the wire.
+        let mut stamper = super::message_time::Stamper::new(messages.len());
+        macro_rules! send_history {
+            () => {{
+                stamper.stamp(&mut messages, &message_clock);
+                let _ = tx.send(StreamEvent::Session(SessionEvent::MessageHistory(messages)));
+            }};
+            (clone) => {{
+                stamper.stamp(&mut messages, &message_clock);
+                let _ = tx.send(StreamEvent::Session(SessionEvent::MessageHistory(
+                    messages.clone(),
+                )));
+            }};
+        }
 
         // Only request preparation may use this early exit. Tool execution and
         // durable head publication must finish their own history/commit cleanup.
@@ -691,15 +718,14 @@ impl StreamMethods {
                 match super::api::await_or_cancel(&cancel, $future).await {
                     Ok(value) => value,
                     Err(_) => {
-                        let _ =
-                            tx.send(StreamEvent::Session(SessionEvent::MessageHistory(messages)));
+                        send_history!();
                         return Ok(());
                     }
                 }
             };
         }
         if cancel.is_cancelled() {
-            let _ = tx.send(StreamEvent::Session(SessionEvent::MessageHistory(messages)));
+            send_history!();
             return Ok(());
         }
 
@@ -742,7 +768,7 @@ impl StreamMethods {
                 crate::tools::context_checkpoint::ContextCheckpointTool(continuation.clone()),
             ));
             for name in ["memory_search", "memory_fetch"] {
-                if registry.get(name).map_or(true, |tool| {
+                if registry.get(name).is_none_or(|tool| {
                     tool.origin() != crate::tools::ToolOrigin::Builtin
                 }) {
                     return Err(crate::RuntimeError::Config("automatic context management requires builtin memory_search and memory_fetch; history unchanged".into()));
@@ -867,7 +893,7 @@ impl StreamMethods {
                     tool_result_bytes = budget_meter.tool_result_bytes_used(),
                     "turn ended: budget exhausted"
                 );
-                let _ = tx.send(StreamEvent::Session(SessionEvent::MessageHistory(messages)));
+                send_history!();
                 let _ = tx.send(StreamEvent::Session(SessionEvent::Error(
                     budget_meter.exhaustion_error(dimension),
                 )));
@@ -909,7 +935,7 @@ impl StreamMethods {
         loop {
             // Check for cancellation before each API call
             if cancel.is_cancelled() {
-                let _ = tx.send(StreamEvent::Session(SessionEvent::MessageHistory(messages)));
+                send_history!();
                 return Ok(());
             }
 
@@ -927,6 +953,7 @@ impl StreamMethods {
             // crash mid-turn lost the prompt and every completed round.
             // Append-only (never rewrites a sent message) — no effect on the
             // request bytes or the provider's cached prefix.
+            stamper.stamp(&mut messages, &message_clock);
             round_checkpoint.publish(&tx, &messages);
 
             // Budget pre-flight: wall clock, then the exact round cap —
@@ -1298,8 +1325,7 @@ impl StreamMethods {
                         })
                     };
                     if !readable {
-                        let _ =
-                            tx.send(StreamEvent::Session(SessionEvent::MessageHistory(messages)));
+                        send_history!();
                         return Err(crate::RuntimeError::Config("rollover requires admitted builtin history retrieval tools; history retained".into()));
                     }
                     // Workers still in flight (running, or finished but not
@@ -1394,9 +1420,7 @@ impl StreamMethods {
                                 current_advisory = Some(ContextAdvisory::Unproductive);
                             }
                             Ok(super::continuation::RolloverPreparation::Unproductive) => {
-                                let _ = tx.send(StreamEvent::Session(
-                                    SessionEvent::MessageHistory(messages),
-                                ));
+                                send_history!();
                                 return Err(super::continuation::unproductive_rollover_error());
                             }
                             Ok(super::continuation::RolloverPreparation::Ready(prepared)) => {
@@ -1408,9 +1432,7 @@ impl StreamMethods {
                                 // Nothing has been published yet — the pre-
                                 // rollover history is still the valid head.
                                 if cancel.is_cancelled() {
-                                    let _ = tx.send(StreamEvent::Session(
-                                        SessionEvent::MessageHistory(messages),
-                                    ));
+                                    send_history!();
                                     return Ok(());
                                 }
                                 super::continuation::persist_head(&prepared, &continuation, &tx)
@@ -1422,9 +1444,7 @@ impl StreamMethods {
                                     .lock()
                                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                                     .window;
-                                let _ = tx.send(StreamEvent::Session(
-                                    SessionEvent::MessageHistory(messages.clone()),
-                                ));
+                                send_history!(clone);
                                 // Already published: the next round checkpoint
                                 // must not re-send the identical head.
                                 round_checkpoint.mark_published(&messages);
@@ -1441,9 +1461,7 @@ impl StreamMethods {
                                 continue;
                             }
                             Err(error) => {
-                                let _ = tx.send(StreamEvent::Session(
-                                    SessionEvent::MessageHistory(messages),
-                                ));
+                                send_history!();
                                 return Err(error);
                             }
                         }
@@ -1502,7 +1520,7 @@ impl StreamMethods {
                 Ok(r) => r,
                 Err(e) => {
                     // Send whatever history we have so far, so context isn't lost
-                    let _ = tx.send(StreamEvent::Session(SessionEvent::MessageHistory(messages)));
+                    send_history!();
                     return Err(e);
                 }
             };
@@ -1573,7 +1591,7 @@ impl StreamMethods {
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner) =
                             Some(messages.clone());
-                        let _ = tx.send(StreamEvent::Session(SessionEvent::MessageHistory(messages)));
+                        send_history!();
                         return Ok(());
                     }
                     if !cancel.is_cancelled() {
@@ -1587,7 +1605,7 @@ impl StreamMethods {
                             ),
                         )));
                     }
-                    let _ = tx.send(StreamEvent::Session(SessionEvent::MessageHistory(messages)));
+                    send_history!();
                     return Ok(());
                 }
 
@@ -1722,9 +1740,7 @@ impl StreamMethods {
                                     )));
                                 }
                                 agent_core::orchestration::CompletionGate::Blocked { workers } => {
-                                    let _ = tx.send(StreamEvent::Session(
-                                        SessionEvent::MessageHistory(messages),
-                                    ));
+                                    send_history!();
                                     return Err(RuntimeError::Tool(format!(
                                         "completion blocked: {} worker(s) require collection/reconciliation: {} (call subagent_collect with reconciled=true after inspecting each result)",
                                         workers.len(),
@@ -1742,8 +1758,7 @@ impl StreamMethods {
                         if !response_cancelled {
                             turn_completion.mark_completed();
                         }
-                        let _ =
-                            tx.send(StreamEvent::Session(SessionEvent::MessageHistory(messages)));
+                        send_history!();
                         return Ok(());
                     }
                     // Steering message injected — continue the loop for another LLM call
@@ -1933,7 +1948,7 @@ impl StreamMethods {
                                     let input_for_hook = input.clone();
                                     match await_tool_call(&cancel, tool.execute_rich(input, crate::ToolContext {
                                             channels: crate::tools::ToolChannels { tx_delta: Some(tx_d), tx_events: Some(tx.clone()) },
-                                            capabilities: crate::tools::ToolCapabilities { session_allow_all: Some(session_allow_all.clone()), launch_cancel: Some(cancel.clone()), memory_backend: Some(memory_backend.clone()), watcher_exit_path: watcher_exit_path.clone(), tool_register_tx: Some(tool_reg_tx.clone()), session_manager: Some(session_manager.clone()), subagent_registry: Some(subagent_registry.clone()), event_queue: Some(event_queue.clone()), delegation_parent: delegation_parent.clone(), codex_parent_plan: codex_parent_plan.clone(), secret_prompt: secret_prompt.clone(), orchestration: orchestration.clone(), tool_activation: Some(crate::tools::discovery::ActivationCapability::new(catalog_snapshot.clone(), std::sync::Arc::clone(&session_tool_set), activation_authority).with_host_prompt(activation_prompt_allowed)), mcp_leases: mcp_lease_capability.clone(), extension_leases: extension_lease_capability.clone(), memory_context: memory_context.clone(), cwd: cwd.clone(), env: env.clone(), env_stripped: env_stripped.clone(), env_warned: env_warned.clone(), session_id: session_id.clone() },
+                                            capabilities: crate::tools::ToolCapabilities { session_allow_all: Some(session_allow_all.clone()), launch_cancel: Some(cancel.clone()), memory_backend: Some(memory_backend.clone()), telemetry: Some(worker_telemetry.clone()), watcher_exit_path: watcher_exit_path.clone(), tool_register_tx: Some(tool_reg_tx.clone()), session_manager: Some(session_manager.clone()), subagent_registry: Some(subagent_registry.clone()), event_queue: Some(event_queue.clone()), delegation_parent: delegation_parent.clone(), codex_parent_plan: codex_parent_plan.clone(), secret_prompt: secret_prompt.clone(), orchestration: orchestration.clone(), tool_activation: Some(crate::tools::discovery::ActivationCapability::new(catalog_snapshot.clone(), std::sync::Arc::clone(&session_tool_set), activation_authority).with_host_prompt(activation_prompt_allowed)), mcp_leases: mcp_lease_capability.clone(), extension_leases: extension_lease_capability.clone(), memory_context: memory_context.clone(), cwd: cwd.clone(), env: env.clone(), env_stripped: env_stripped.clone(), env_warned: env_warned.clone(), session_id: session_id.clone() },
                                             limits: crate::tools::ToolLimits { max_tool_output, max_tool_buffer: 256 * 1024, bash_timeout, bash_max_timeout, subagent_timeout },
                                         })).await {
                                         (Some(res), _) => {
@@ -2244,6 +2259,7 @@ impl StreamMethods {
                         let env_stripped_inner = env_stripped.clone();
                         let env_warned_inner = env_warned.clone();
                         let memory_backend_inner = memory_backend.clone();
+                        let worker_telemetry_inner = worker_telemetry.clone();
                         let memory_context_inner = memory_context.clone();
                         let session_id_inner = session_id.clone();
                         let auto_approve_inner = auto_approve_confirms;
@@ -2342,7 +2358,7 @@ impl StreamMethods {
 
                                     match await_tool_call(&cancel_token, t.execute_rich(input, crate::ToolContext {
                                             channels: crate::tools::ToolChannels { tx_delta: Some(tx_d), tx_events: Some(tx_stream.clone()) },
-                                            capabilities: crate::tools::ToolCapabilities { session_allow_all: Some(session_allow_all_inner.clone()), launch_cancel: Some(cancel_token.clone()), memory_backend: Some(memory_backend_inner.clone()), watcher_exit_path: exit_path.clone(), tool_register_tx: Some(tool_reg_tx_inner.clone()), session_manager: Some(session_mgr.clone()), subagent_registry: Some(registry_inner.clone()), event_queue: Some(eq_inner.clone()), delegation_parent: delegation_parent_inner.clone(), codex_parent_plan: codex_parent_plan_inner.clone(), secret_prompt: prompt_inner.clone(), orchestration: orchestration_inner.clone(), tool_activation: Some(activation_inner.clone()), mcp_leases: mcp_leases_inner.clone(), extension_leases: extension_leases_inner.clone(), memory_context: memory_context_inner.clone(), cwd: cwd_inner.clone(), env: env_inner.clone(), env_stripped: env_stripped_inner.clone(), env_warned: env_warned_inner.clone(), session_id: session_id_inner.clone() },
+                                            capabilities: crate::tools::ToolCapabilities { session_allow_all: Some(session_allow_all_inner.clone()), launch_cancel: Some(cancel_token.clone()), memory_backend: Some(memory_backend_inner.clone()), telemetry: Some(worker_telemetry_inner.clone()), watcher_exit_path: exit_path.clone(), tool_register_tx: Some(tool_reg_tx_inner.clone()), session_manager: Some(session_mgr.clone()), subagent_registry: Some(registry_inner.clone()), event_queue: Some(eq_inner.clone()), delegation_parent: delegation_parent_inner.clone(), codex_parent_plan: codex_parent_plan_inner.clone(), secret_prompt: prompt_inner.clone(), orchestration: orchestration_inner.clone(), tool_activation: Some(activation_inner.clone()), mcp_leases: mcp_leases_inner.clone(), extension_leases: extension_leases_inner.clone(), memory_context: memory_context_inner.clone(), cwd: cwd_inner.clone(), env: env_inner.clone(), env_stripped: env_stripped_inner.clone(), env_warned: env_warned_inner.clone(), session_id: session_id_inner.clone() },
                                             limits: crate::tools::ToolLimits { max_tool_output, max_tool_buffer: 256 * 1024, bash_timeout, bash_max_timeout, subagent_timeout },
                                         })).await {
                                         (Some(res), _) => {
@@ -2580,7 +2596,7 @@ impl StreamMethods {
                         messages.push(Arc::new(json!({
                             "role":"user", "content":completed_results
                         })));
-                        let _ = tx.send(StreamEvent::Session(SessionEvent::MessageHistory(messages)));
+                        send_history!();
                         if let Some(call_id) = interrupted_side_effect {
                             let _ = tx.send(StreamEvent::Session(SessionEvent::Error(
                                 agent_core::TurnError::interrupted_after_side_effect(call_id),
@@ -2593,7 +2609,7 @@ impl StreamMethods {
 
                 if canceled {
                     // Send final history on cancellation so session can be saved
-                    let _ = tx.send(StreamEvent::Session(SessionEvent::MessageHistory(messages)));
+                    send_history!();
                     // Ledger (Task 25, §8.3): a NonIdempotent call interrupted
                     // after a possible side effect surfaces a typed
                     // `InterruptedAfterSideEffect` outcome (and was never
@@ -2626,7 +2642,7 @@ impl StreamMethods {
 
                 // Continue the loop to get Claude's response with tool results
             } else {
-                let _ = tx.send(StreamEvent::Session(SessionEvent::MessageHistory(messages)));
+                send_history!();
                 return Err(RuntimeError::Tool("Invalid response format".to_string()));
             }
         }
@@ -3795,6 +3811,7 @@ mod rich_output_tests {
                 crate::runtime::budget::TurnRole::Foreground,
             ),
             owner_steer_budget: None,
+            message_clock: Default::default(),
         }
     }
 
@@ -5817,6 +5834,7 @@ mod rich_output_tests {
                 crate::runtime::budget::TurnRole::Foreground,
             ),
             owner_steer_budget: None,
+            message_clock: Default::default(),
         };
 
         let messages = vec![Arc::new(json!({"role":"user","content":"do it"})) as SharedMessage];

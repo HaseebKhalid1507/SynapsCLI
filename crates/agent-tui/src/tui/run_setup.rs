@@ -131,6 +131,24 @@ pub(crate) fn take_boot_notices() -> Vec<String> {
     std::mem::take(&mut *BOOT_NOTICES.lock().unwrap_or_else(|e| e.into_inner()))
 }
 
+/// First-run guidance: no Anthropic credentials and no provider keys means
+/// the first message will fail, so say so up front. Shared by the in-process
+/// boot and the daemon attach (the default since 0.11.0), so a new user sees
+/// it either way instead of a token-refresh error on their first message.
+pub(crate) fn no_credentials_notice() -> Option<String> {
+    // Capability queries via the broker boundary — no credential file or
+    // credential env reads here, and answers are booleans only.
+    let has_anthropic = synaps_cli::auth::broker::anthropic_credential_available();
+    let has_provider_key = !synaps_cli::auth::broker::configured_static_provider_keys().is_empty();
+    credentials_notice_for(has_anthropic, has_provider_key)
+}
+
+fn credentials_notice_for(has_anthropic: bool, has_provider_key: bool) -> Option<String> {
+    (!has_anthropic && !has_provider_key).then(|| {
+        "👋 No credentials found. To get started:\n   • `synaps login` — sign in with Claude Pro/Max (OAuth)\n   • or `synaps login --provider <name>` — store a provider API key with the credential broker (groq, openrouter, …), then pick with /model".to_string()
+    })
+}
+
 pub(crate) async fn run_setup(
     continue_session: Option<Option<String>>,
     system: Option<String>,
@@ -160,10 +178,12 @@ pub(crate) async fn run_setup(
             compaction_policy: CompactionPolicyWire::LinkedSuccessor,
             await_extensions: false,
             keep_warm: false,
+            client_input: None,
             name: None,
             max_session_cost: None,
             memory_mode: None,
             restore_parked: false,
+            message_clock: None,
         })
         .await?;
     let (transport, snapshot) =
@@ -191,19 +211,8 @@ pub(crate) async fn run_setup(
         app.push_msg(ChatMessage::System(format!("⚠ config: {}", w)));
     }
 
-    // First-run guidance: no Anthropic credentials and no provider keys means
-    // the first message will fail — tell the user up front instead.
-    {
-        // Capability queries via the broker boundary — no credential file or
-        // credential env reads here, and answers are booleans only.
-        let has_anthropic = synaps_cli::auth::broker::anthropic_credential_available();
-        let has_provider_key =
-            !synaps_cli::auth::broker::configured_static_provider_keys().is_empty();
-        if !has_anthropic && !has_provider_key {
-            app.push_msg(ChatMessage::System(
-                "👋 No credentials found. To get started:\n   • `synaps login` — sign in with Claude Pro/Max (OAuth)\n   • or `synaps login --provider <name>` — store a provider API key with the credential broker (groq, openrouter, …), then pick with /model".to_string(),
-            ));
-        }
+    if let Some(n) = no_credentials_notice() {
+        app.push_msg(ChatMessage::System(n));
     }
 
     if mcp_server_count > 0 {
@@ -471,6 +480,9 @@ pub(crate) async fn try_reconnect(
                         let lifecycle = &snapshot.meta.lifecycle;
                         let status = format!("{lifecycle:?}");
                         remirror(app, &snapshot);
+                        // The new attach has its own roster (every client
+                        // re-attached under a new id, or hasn't yet).
+                        app.attached_clients = link.transport().roster().clients().len();
                         super::watch::on_reconnect(app, std::time::Instant::now());
                         app.push_msg(ChatMessage::System(format!(
                             "reconnected to daemon (pid {new_pid}) — session {} {status}",
@@ -581,4 +593,17 @@ pub(crate) fn remirror(app: &mut App, snapshot: &AttachSnapshot) {
     rebuild_display_from_snapshot(app, snapshot);
     app.streaming = snapshot.streaming;
     app.last_turn_context_window = snapshot.view.context_window;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::credentials_notice_for;
+
+    #[test]
+    fn credentials_notice_only_when_nothing_can_answer() {
+        let n = credentials_notice_for(false, false).expect("no credentials at all");
+        assert!(n.contains("No credentials found") && n.contains("synaps login"), "{n}");
+        assert!(credentials_notice_for(true, false).is_none());
+        assert!(credentials_notice_for(false, true).is_none());
+    }
 }

@@ -78,6 +78,11 @@ impl Tool for SubagentStartTool {
                     ],
                     "description": "Declared write isolation and path scopes."
                 },
+                "thinking": {
+                    "type": "string",
+                    "enum": ["low", "medium", "high", "xhigh", "max"],
+                    "description": "Worker effort override. Omit for subagent_thinking (default xhigh), independent of foreground thinking. Unsupported model levels are refused."
+                },
                 "timeout": {
                     "type": "integer",
                     "description": "Wall-clock limit in seconds. Omit for the session default (config `subagent_timeout`); 0 = no limit. A timed-out worker keeps its full conversation: subagent_resume continues it where it stopped."
@@ -88,6 +93,7 @@ impl Tool for SubagentStartTool {
     }
 
     async fn execute(&self, params: Value, ctx: ToolContext) -> Result<String> {
+        let thinking = super::resolve_subagent_thinking(&params, None, &crate::config::load_config())?;
         // ── Parse params ───────────────────────────────────────────────────────
         let task = params["task"]
             .as_str()
@@ -145,11 +151,14 @@ impl Tool for SubagentStartTool {
         let codex_parent_plan = ctx.capabilities.codex_parent_plan.clone();
         let memory_backend = ctx.capabilities.memory_backend.clone();
         let session_allow_all = ctx.capabilities.session_allow_all.clone();
+        let telemetry = ctx.capabilities.telemetry.clone();
+        let workspace = super::WorkerWorkspace::from_capabilities(&ctx.capabilities);
         let timeout_secs = params["timeout"]
             .as_u64()
             .unwrap_or(ctx.limits.subagent_timeout);
 
         let label = super::subagent_label(agent_name.as_deref(), params["name"].as_str());
+        let telemetry = telemetry.map(|t| t.for_worker(&label, &handle_id));
         let task_preview: String = task.chars().take(80).collect();
         let task_full = task.clone();
 
@@ -167,6 +176,11 @@ impl Tool for SubagentStartTool {
             model: model.clone(),
             system_prompt: system_prompt.clone(),
             timeout_secs,
+            cwd: workspace
+                .cwd
+                .clone()
+                .or_else(|| std::env::current_dir().ok()),
+            thinking: Some(thinking.as_str().into()),
         });
 
         state.write().unwrap().archive_dir = Some(super::archive::process_dir());
@@ -285,6 +299,8 @@ impl Tool for SubagentStartTool {
                             &crate::config::load_config(),
                             memory_backend.as_ref(),
                             session_allow_all.as_ref(),
+                            telemetry.as_ref(),
+                            &workspace,
                         );
                         runtime.set_system_prompt(super::compose_system_prompt(
                             system_prompt,
@@ -295,6 +311,7 @@ impl Tool for SubagentStartTool {
                             &mut runtime,
                             codex_parent_plan.as_ref(),
                         );
+                        super::apply_subagent_thinking(&mut runtime, thinking)?;
                         runtime
                             .install_worker_orchestration(Arc::clone(&orchestration_for_runtime));
                         runtime.set_delegation_parent(Some(child_parent_id.clone()));
@@ -316,7 +333,7 @@ impl Tool for SubagentStartTool {
                                 false,
                             ).await;
 
-                        super::drive::WorkerDrive {
+                        let drive_outcome = super::drive::WorkerDrive {
                             state: Arc::clone(&state_a),
                             tx_events: tx_events_a.clone(),
                             subagent_id,
@@ -327,7 +344,10 @@ impl Tool for SubagentStartTool {
                             task: task_for_timeout,
                         }
                         .run(stream)
-                        .await
+                        .await;
+                        // Date this run's cache for a later resume (cold check).
+                        super::archive::record_cache_anchor(&state_a, runtime.cache_anchor());
+                        drive_outcome
                     });
 
                 match outcome {

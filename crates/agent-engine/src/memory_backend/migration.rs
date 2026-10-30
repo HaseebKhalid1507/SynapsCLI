@@ -565,7 +565,7 @@ async fn external_snapshot(binding: &MemoryBinding, source: &MigrationSource) ->
         bail!("invalid source export identity or source digest");
     }
     for fingerprint in &inventory.fingerprints {
-        if !fingerprint.as_object().is_some_and(|o| o.len() == 2)
+        if fingerprint.as_object().is_none_or(|o| o.len() != 2)
             || !matches!(
                 fingerprint["kind"].as_str(),
                 Some("note" | "capture" | "history")

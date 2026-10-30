@@ -54,7 +54,7 @@ async fn process_file(path: &Path, queue: &EventQueue) {
             }
         }
     }
-    if !path.extension().is_some_and(|e| e == "json") {
+    if path.extension().is_none_or(|e| e != "json") {
         return;
     }
     // Full: leave the file untouched. A claim plus rename-back would itself
@@ -460,7 +460,7 @@ mod tests {
         let name = claimed.file_name().unwrap().to_str().unwrap();
         assert!(name.starts_with("1727-abc.json.claim-"), "{name}");
         assert!(name.contains(&std::process::id().to_string()), "{name}");
-        assert!(!claimed.extension().is_some_and(|e| e == "json"));
+        assert!(claimed.extension().is_none_or(|e| e != "json"));
         assert_ne!(
             claim_path(Path::new("/x/inbox/a.json")),
             claim_path(Path::new("/x/inbox/a.json")),

@@ -1122,14 +1122,16 @@ impl SessionActor {
             return;
         }
         let mode = self.cache_keepwarm.mode();
-        if mode.is_off() || !self.cache_keepwarm.interactive_seen {
+        // A pin is the owner's say-so that the session is coming back (a
+        // restored pin often has no client; `synaps send` feeds it).
+        if mode.is_off() || !(self.cache_keepwarm.interactive_seen || self.keep_warm) {
             return;
         }
         // Never before a real Anthropic request of THIS turn was accepted.
         let Some(anchor) = self
             .runtime
             .cache_anchor()
-            .filter(|a| turn_started_at.map_or(true, |t| a.mono >= t))
+            .filter(|a| turn_started_at.is_none_or(|t| a.mono >= t))
         else {
             return;
         };
@@ -1477,6 +1479,9 @@ impl SessionActor {
                 });
             };
             self.cache_keepwarm.set_override(mode);
+            if self.keep_warm {
+                self.note_pin(); // the override comes back with the pin
+            }
             if mode.is_off() {
                 self.cache_keepwarm_end(PeriodEnd::Disabled);
             } else if let Some(p) = self.cache_keepwarm.period.as_mut() {

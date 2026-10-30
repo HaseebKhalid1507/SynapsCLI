@@ -71,6 +71,172 @@ fn installed_plugin_setup_failure_in(
     }
 }
 
+/// The directories discovery walks, in override order: the user's
+/// `plugins/`, then the project's `.synaps/plugins/` (unless disabled). A
+/// plugin directory in a later root replaces one of the same name earlier.
+fn plugin_roots() -> Vec<PathBuf> {
+    let mut roots = vec![crate::config::base_dir().join("plugins")];
+    if !project_plugins_disabled() {
+        if let Ok(cwd) = std::env::current_dir() {
+            let project_plugins = cwd.join(".synaps").join("plugins");
+            if project_plugins != roots[0] {
+                roots.push(project_plugins);
+            }
+        }
+    }
+    roots
+}
+
+/// The registry entries (name, current tool) of `names` that exist.
+fn kept_entries(registry: &crate::ToolRegistry, names: &[String]) -> Vec<(String, Arc<dyn crate::Tool>)> {
+    names
+        .iter()
+        .filter_map(|n| registry.get(n).map(|t| (n.clone(), Arc::clone(t))))
+        .collect()
+}
+
+/// The same tool object (data pointer; vtables may differ per codegen unit).
+fn same_tool(a: &Arc<dyn crate::Tool>, b: &Arc<dyn crate::Tool>) -> bool {
+    std::ptr::eq(Arc::as_ptr(a) as *const (), Arc::as_ptr(b) as *const ())
+}
+
+/// The directory discovery would load plugin `name` from: the last root
+/// (see [`plugin_roots`]) that has it. `None` when no root has it.
+fn locate_plugin_dir(name: &str) -> Option<PathBuf> {
+    plugin_roots()
+        .into_iter()
+        .rev()
+        .map(|root| root.join(name))
+        .find(|dir| dir.is_dir())
+}
+
+/// Read `plugin_dir`'s `.synaps-plugin/plugin.json` and resolve its
+/// `extension` block the way discovery loads it (command and args made
+/// absolute against the plugin directory). `Ok(None)`: no manifest, or a
+/// manifest without an `extension` block (not an extension). Returns the
+/// manifest path and the raw JSON too, for the load-failure hint.
+fn read_extension_manifest(
+    plugin_name: &str,
+    plugin_dir: &std::path::Path,
+) -> Result<Option<(ExtensionManifest, PathBuf, Value)>, ExtensionLoadFailure> {
+    let manifest_path = plugin_dir.join(".synaps-plugin").join("plugin.json");
+    if !manifest_path.exists() {
+        return Ok(None);
+    }
+
+    let content = match std::fs::read_to_string(&manifest_path) {
+        Ok(c) => c,
+        Err(e) => {
+            let reason = format!("Failed to read plugin manifest: {e}");
+            tracing::warn!(plugin = %plugin_name, manifest = %manifest_path.display(), error = %e, "Failed to read plugin manifest");
+            return Err(ExtensionLoadFailure::new(
+                plugin_name,
+                Some(manifest_path),
+                reason,
+                "Check manifest file permissions",
+            ));
+        }
+    };
+
+    let json: serde_json::Value = match serde_json::from_str(&content) {
+        Ok(v) => v,
+        Err(e) => {
+            let reason = format!("Invalid plugin manifest JSON: {e}");
+            tracing::warn!(plugin = %plugin_name, manifest = %manifest_path.display(), error = %e, "Invalid plugin manifest JSON");
+            return Err(ExtensionLoadFailure::new(
+                plugin_name,
+                Some(manifest_path),
+                reason,
+                "Fix the JSON syntax in .synaps-plugin/plugin.json",
+            ));
+        }
+    };
+
+    let ext_value = match json.get("extension") {
+        Some(v) => v.clone(),
+        None => return Ok(None),
+    };
+
+    let ext_manifest: ExtensionManifest = match serde_json::from_value(ext_value) {
+        Ok(m) => m,
+        Err(e) => {
+            let reason = format!("Failed to parse extension manifest: {e}");
+            tracing::warn!(plugin = %plugin_name, manifest = %manifest_path.display(), error = %e, "Failed to parse extension manifest");
+            return Err(ExtensionLoadFailure::new(
+                plugin_name,
+                Some(manifest_path),
+                reason,
+                "Check the `extension` block shape against docs/extensions/contract.json",
+            ));
+        }
+    };
+
+    #[allow(clippy::if_same_then_else)]
+    let command = if std::path::Path::new(&ext_manifest.command).is_absolute() {
+        ext_manifest.command.clone()
+    } else if !ext_manifest.command.contains(std::path::MAIN_SEPARATOR)
+        && !ext_manifest.command.contains('/')
+    {
+        ext_manifest.command.clone()
+    } else {
+        plugin_dir
+            .join(&ext_manifest.command)
+            .to_string_lossy()
+            .to_string()
+    };
+
+    let args: Vec<String> = ext_manifest
+        .args
+        .iter()
+        .map(|arg| {
+            let arg_path = plugin_dir.join(arg);
+            if arg_path.exists() {
+                if let (Ok(canonical), Ok(plugin_canonical)) =
+                    (arg_path.canonicalize(), plugin_dir.canonicalize())
+                {
+                    if canonical.starts_with(&plugin_canonical) {
+                        return canonical.to_string_lossy().to_string();
+                    }
+                }
+            }
+            arg.clone()
+        })
+        .collect();
+
+    let resolved = ExtensionManifest {
+        theme_tokens: Default::default(),
+        // Deferred declarations flow through from the installed
+        // manifest (legacy `tools`/`activation` aliases are folded
+        // into `deferred` at deserialization) so installed plugins
+        // keep their zero-spawn deferred lifecycle instead of
+        // silently loading eager.
+        command,
+        args,
+        ..ext_manifest
+    };
+    Ok(Some((resolved, manifest_path, json)))
+}
+
+/// What [`ExtensionManager::reload_from_disk`] did, as the daemon reports
+/// it to `synaps daemon reload-extension`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ExtensionReloadReport {
+    /// The plugin directory name the extension is keyed by.
+    pub extension: String,
+    /// It was loaded (live or deferred) before; `false` = first load, e.g. a
+    /// plugin installed after the daemon started or one that failed then.
+    pub was_loaded: bool,
+    /// Loaded deferred (progressive disclosure): no process until first use.
+    pub deferred: bool,
+    /// Runtime names of the tools it has now (`<extension>:<tool>`), sorted.
+    pub tools: Vec<String>,
+    /// Tools it had before the reload that the new version does not have.
+    #[serde(default)]
+    pub removed_tools: Vec<String>,
+    /// The directory it was loaded from.
+    pub plugin_dir: PathBuf,
+}
+
 fn sanitize_hint_fragment(input: &str) -> String {
     input
         .chars()
@@ -215,6 +381,11 @@ pub struct ExtensionManager {
     /// CURRENT record at every lease acquisition (sync lock, map ops only,
     /// never held across I/O). Consumed by the lease lifecycle only.
     deferred_tool_only: SharedDeferredRecords,
+    /// Set by [`Self::reload`] for its load only: the dormant tool names of
+    /// the deferred instance being replaced, which the new instance's
+    /// catalog batch swaps out in the SAME registry write (see
+    /// [`Self::reload`] on why the registry must never show a gap).
+    reload_replaces: Vec<String>,
     /// Lazily-created shared extension runtime lease manager (Task 20
     /// Commit B). One instance shared by this manager (unload revocation)
     /// and the `Runtime` (per-session capabilities + session-end scope).
@@ -284,6 +455,7 @@ impl ExtensionManager {
             manifest_theme_tokens: HashMap::new(),
             progressive_deferral: false,
             deferred_tool_only: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            reload_replaces: Vec::new(),
             extension_runtime: std::sync::OnceLock::new(),
             context_providers: Vec::new(),
             context_provider_catalog: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -312,6 +484,7 @@ impl ExtensionManager {
             manifest_theme_tokens: HashMap::new(),
             progressive_deferral: false,
             deferred_tool_only: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            reload_replaces: Vec::new(),
             extension_runtime: std::sync::OnceLock::new(),
             context_providers: Vec::new(),
             context_provider_catalog: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -580,10 +753,13 @@ impl ExtensionManager {
                         id
                     ));
                 };
-                tools
-                    .write()
-                    .await
-                    .try_register_batch(dormant)
+                // A reload swaps the replaced instance's dormant entries in
+                // this same write: no reader ever sees them missing.
+                let replacing = std::mem::take(&mut self.reload_replaces);
+                let mut registry = tools.write().await;
+                registry
+                    .try_disable(&replacing)
+                    .and_then(|()| registry.try_register_batch(dormant))
                     .map_err(|e| {
                         format!("Extension '{}' deferred tool catalog rejected: {}", id, e)
                     })?;
@@ -1207,6 +1383,19 @@ impl ExtensionManager {
     /// grants cannot survive), and terminates every session's runtime
     /// lease for the plugin.
     pub async fn unload(&mut self, id: &str) -> Result<(), String> {
+        self.unload_inner(id, false).await.map(|_| ())
+    }
+
+    /// [`Self::unload`]; with `keep_tools` (a reload only) the extension's
+    /// registry entries stay where they are and are returned, for
+    /// [`Self::settle_replaced_tools`] to remove whatever the new instance
+    /// did not replace. Until then a call to one fails against the stopped
+    /// instance, as it would against a missing tool.
+    async fn unload_inner(
+        &mut self,
+        id: &str,
+        keep_tools: bool,
+    ) -> Result<Vec<(String, Arc<dyn crate::Tool>)>, String> {
         let deferred = self
             .deferred_tool_only
             .lock()
@@ -1228,6 +1417,7 @@ impl ExtensionManager {
             }
             self.hook_bus.unsubscribe_all(id).await;
             self.providers.unregister_plugin(id);
+            let mut kept = Vec::new();
             if let Some(tools) = &self.tools {
                 let names: Vec<String> = record
                     .manifest
@@ -1240,7 +1430,11 @@ impl ExtensionManager {
                             .collect()
                     })
                     .unwrap_or_default();
-                if let Err(error) = tools.write().await.try_disable(&names) {
+                if keep_tools {
+                    let registry = tools.read().await;
+                    kept = kept_entries(&registry, &names);
+                    self.reload_replaces = names.clone();
+                } else if let Err(error) = tools.write().await.try_disable(&names) {
                     // Fail-closed either way: with the record gone, dormant
                     // descriptors can never execute; surface the partial
                     // cleanup instead of hiding it.
@@ -1253,7 +1447,7 @@ impl ExtensionManager {
             self.manifest_configs.remove(id);
             self.manifest_theme_tokens.remove(id);
             tracing::info!(extension = %id, "Deferred extension unloaded");
-            return Ok(());
+            return Ok(kept);
         }
         let handler = self
             .extensions
@@ -1265,6 +1459,26 @@ impl ExtensionManager {
 
         self.hook_bus.unsubscribe_all(id).await;
         self.providers.unregister_plugin(id);
+        // Its tools go with it: each holds the handler being shut down, so
+        // a tool left behind would fail every call, and a reload whose new
+        // version no longer declares it would never replace it.
+        let mut kept = Vec::new();
+        let tool_error = match &self.tools {
+            Some(tools) if keep_tools => {
+                let registry = tools.read().await;
+                let names = registry.tool_names_for_extension(id);
+                kept = kept_entries(&registry, &names);
+                // A new version that defers swaps these in its batch write.
+                self.reload_replaces = names;
+                None
+            }
+            Some(tools) => {
+                let mut registry = tools.write().await;
+                let names = registry.tool_names_for_extension(id);
+                registry.try_disable(&names).err()
+            }
+            None => None,
+        };
         self.eager_permissions.remove(id);
         self.manifest_configs.remove(id);
         self.capabilities.remove(id);
@@ -1272,23 +1486,227 @@ impl ExtensionManager {
         self.manifest_theme_tokens.remove(id);
         handler.shutdown().await;
 
+        if let Some(error) = tool_error {
+            // Fail-closed like the deferred path: the extension is gone
+            // either way; surface the partial cleanup.
+            return Err(format!(
+                "Extension '{}' unloaded but its tools could not be deregistered: {}",
+                id, error
+            ));
+        }
         tracing::info!(extension = %id, "Extension unloaded");
-        Ok(())
+        Ok(kept)
+    }
+
+    /// After a reload's load: remove each kept entry the new instance did
+    /// not replace (it still holds the stopped instance), in ONE registry
+    /// write. On success that is exactly the tools the new version no
+    /// longer declares; after a failed load it is all of them (fail-closed:
+    /// no tool outlives its process).
+    async fn settle_replaced_tools(&mut self, id: &str, kept: Vec<(String, Arc<dyn crate::Tool>)>) -> Result<(), String> {
+        self.reload_replaces.clear();
+        let Some(tools) = &self.tools else { return Ok(()) };
+        if kept.is_empty() {
+            return Ok(());
+        }
+        let mut registry = tools.write().await;
+        let stale: Vec<String> = kept
+            .into_iter()
+            .filter(|(name, old)| registry.get(name).is_some_and(|now| same_tool(now, old)))
+            .map(|(name, _)| name)
+            .collect();
+        registry
+            .try_disable(&stale)
+            .map_err(|e| format!("Extension '{id}' reloaded but its stale tools could not be deregistered: {e}"))
     }
 
     /// Reload one extension by unloading any existing instance first, then loading
     /// the supplied manifest. If the new load fails, the previous instance remains
     /// unloaded so duplicate handlers cannot survive a broken reload.
+    ///
+    /// The extension's tools never leave the shared registry during the
+    /// swap: the new instance replaces them by name (a deferred one in a
+    /// single write), and only what it did not replace is removed after.
+    /// A session that starts a request mid-reload therefore still finds its
+    /// activated tools, so the round-top rebuild keeps them and the tools
+    /// array it sends (part of the cached prompt prefix) is unchanged. A
+    /// gap would drop those activations for good: a prompt-cache rewrite
+    /// then, and another when the model re-activates.
     pub async fn reload(
         &mut self,
         id: &str,
         manifest: &ExtensionManifest,
         cwd: Option<std::path::PathBuf>,
     ) -> Result<(), String> {
-        if self.extensions.contains_key(id) || self.is_deferred_tool_only(id) {
-            self.unload(id).await?;
+        let kept = if self.extensions.contains_key(id) || self.is_deferred_tool_only(id) {
+            self.unload_inner(id, true).await?
+        } else {
+            Vec::new()
+        };
+        let loaded = self.load_with_cwd(id, manifest, cwd).await;
+        let settled = self.settle_replaced_tools(id, kept).await;
+        loaded.and(settled)
+    }
+
+    /// Reload extension `id` from what is installed now, without touching
+    /// any other extension: find its plugin directory the way discovery
+    /// does, read and validate its manifest, then stop the running instance
+    /// (if any) and start the new one. Its tools are re-registered in the
+    /// shared registry (so every session sees the new set from its next
+    /// request), its hooks re-subscribed, and a deferred extension's
+    /// session leases revoked. A plugin that is installed but not loaded
+    /// (added after discovery, or failed then) is loaded.
+    ///
+    /// Everything that can be checked without stopping the running
+    /// instance is checked first; a failure there leaves it running. Only a
+    /// failure to START the new version leaves the extension unloaded (as
+    /// [`Self::reload`] documents), and the error says so. Discovery's
+    /// recorded result is updated either way, so a later replay agrees.
+    ///
+    /// Needs discovery to have finished on this manager: before that, a
+    /// load here would make discovery's own load of the same plugin fail.
+    pub async fn reload_from_disk(
+        &mut self,
+        id: &str,
+    ) -> Result<ExtensionReloadReport, ExtensionLoadFailure> {
+        let refuse = |reason: String, hint: &str| ExtensionLoadFailure::new(id, None, reason, hint);
+        if id.is_empty()
+            || id == "."
+            || id == ".."
+            || id.contains('/')
+            || id.contains('\\')
+            || id.contains(':')
+            || id.chars().any(char::is_control)
+        {
+            return Err(refuse(
+                format!("'{id}' is not a plugin name"),
+                "Give the plugin's directory name, as `/extensions` lists it",
+            ));
         }
-        self.load_with_cwd(id, manifest, cwd).await
+        if is_inert_plugin_dir_name(id) {
+            return Err(refuse(
+                format!("'{id}' is a backup, disabled or temp directory name; discovery never loads it"),
+                "Give the plugin's directory name without the suffix",
+            ));
+        }
+        if !matches!(self.discovery, DiscoveryState::Done { .. }) {
+            return Err(refuse(
+                "extensions have not finished loading yet".into(),
+                "Retry in a moment",
+            ));
+        }
+        let was_loaded = self.is_loaded(id);
+        let Some(plugin_dir) = locate_plugin_dir(id) else {
+            let roots = plugin_roots()
+                .iter()
+                .map(|r| r.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(refuse(
+                format!("no plugin directory named '{id}' in {roots}"),
+                "Check the name against `ls ~/.synaps-cli/plugins` or `/extensions`",
+            ));
+        };
+        if crate::config::load_config()
+            .disabled_plugins
+            .iter()
+            .any(|d| d == id)
+        {
+            return Err(refuse(
+                format!("'{id}' is disabled (disabled_plugins in config)"),
+                "Remove it from disabled_plugins first",
+            ));
+        }
+        let plugins_state = {
+            let state_path = crate::skills::state::PluginsState::default_path();
+            crate::skills::state::PluginsState::load_from(&state_path).unwrap_or_default()
+        };
+        if let Some(message) = installed_plugin_setup_failure_in(&plugins_state, id) {
+            return Err(refuse(
+                format!("Post-install setup failed: {message}"),
+                "Open /plugins, reinstall or update the plugin after fixing setup",
+            ));
+        }
+        let (resolved, manifest_path, json) = match read_extension_manifest(id, &plugin_dir)? {
+            Some(read) => read,
+            None => {
+                return Err(ExtensionLoadFailure::new(
+                    id,
+                    Some(plugin_dir.join(".synaps-plugin").join("plugin.json")),
+                    format!("'{id}' has no extension (no plugin.json, or no `extension` block in it)"),
+                    "Only plugins with an `extension` block run as extensions",
+                ));
+            }
+        };
+        if let Err(e) = resolved.validate(id) {
+            return Err(ExtensionLoadFailure::new(
+                id,
+                Some(manifest_path),
+                e,
+                "Fix the manifest; the running instance was not touched",
+            ));
+        }
+
+        // Commit point: from here the running instance is stopped.
+        let prefix = format!("{id}:");
+        let owned_tools = |registry: &crate::ToolRegistry| -> Vec<String> {
+            registry
+                .iter_tools_sorted()
+                .into_iter()
+                .map(|t| t.name().to_string())
+                .filter(|n| n.starts_with(&prefix))
+                .collect()
+        };
+        let before = match &self.tools {
+            Some(tools) => owned_tools(&*tools.read().await),
+            None => Vec::new(),
+        };
+        let outcome = self.reload(id, &resolved, Some(plugin_dir.clone())).await;
+        let failure = outcome.as_ref().err().map(|e| {
+            let setup_script = json
+                .pointer("/extension/setup")
+                .and_then(|v| v.as_str())
+                .or_else(|| json.pointer("/provides/sidecar/setup").and_then(|v| v.as_str()));
+            let hint = compute_extension_load_hint(e, &plugin_dir, setup_script);
+            let reason = if was_loaded {
+                format!("{e} (the previous instance was stopped, so '{id}' is not loaded now)")
+            } else {
+                e.clone()
+            };
+            ExtensionLoadFailure::new(id, Some(manifest_path.clone()), reason, hint)
+        });
+        if let DiscoveryState::Done { loaded, failed } = &mut self.discovery {
+            loaded.retain(|l| l != id);
+            failed.retain(|f| f.plugin != id);
+            match &failure {
+                None => loaded.push(id.to_string()),
+                Some(f) => failed.push(f.clone()),
+            }
+        }
+        if let Some(failure) = failure {
+            tracing::warn!(extension = %id, error = %failure.reason, "Extension reload failed");
+            return Err(failure);
+        }
+        let tools = match &self.tools {
+            Some(tools) => owned_tools(&*tools.read().await),
+            None => Vec::new(),
+        };
+        let removed_tools = before.into_iter().filter(|n| !tools.contains(n)).collect();
+        let deferred = self.is_deferred_tool_only(id);
+        tracing::info!(extension = %id, was_loaded, deferred, tools = tools.len(), path = %plugin_dir.display(), "Extension reloaded");
+        Ok(ExtensionReloadReport {
+            extension: id.to_string(),
+            was_loaded,
+            deferred,
+            tools,
+            removed_tools,
+            plugin_dir,
+        })
+    }
+
+    /// `id` is loaded, live or deferred (no process yet).
+    pub fn is_loaded(&self, id: &str) -> bool {
+        self.extensions.contains_key(id) || self.is_deferred_tool_only(id)
     }
 
     /// Current process-level discovery state.
@@ -1870,20 +2288,10 @@ impl ExtensionManager {
     where
         F: FnMut(crate::extensions::loader::ExtensionLoaderEvent),
     {
-        let mut plugin_roots = vec![crate::config::base_dir().join("plugins")];
-        if !project_plugins_disabled() {
-            if let Ok(cwd) = std::env::current_dir() {
-                let project_plugins = cwd.join(".synaps").join("plugins");
-                if project_plugins != plugin_roots[0] {
-                    plugin_roots.push(project_plugins);
-                }
-            }
-        }
-
         let mut plugin_dirs: HashMap<String, PathBuf> = HashMap::new();
         let mut failed: Vec<ExtensionLoadFailure> = Vec::new();
 
-        for plugins_dir in plugin_roots {
+        for plugins_dir in plugin_roots() {
             if !plugins_dir.exists() {
                 continue;
             }
@@ -1942,104 +2350,15 @@ impl ExtensionManager {
                 ));
                 continue;
             }
-            let manifest_path = plugin_dir.join(".synaps-plugin").join("plugin.json");
-            if !manifest_path.exists() {
-                continue;
-            }
-
-            let content = match std::fs::read_to_string(&manifest_path) {
-                Ok(c) => c,
-                Err(e) => {
-                    let reason = format!("Failed to read plugin manifest: {e}");
-                    tracing::warn!(plugin = %plugin_name, manifest = %manifest_path.display(), error = %e, "Failed to read plugin manifest");
-                    failed.push(ExtensionLoadFailure::new(
-                        plugin_name,
-                        Some(manifest_path),
-                        reason,
-                        "Check manifest file permissions",
-                    ));
-                    continue;
-                }
-            };
-
-            let json: serde_json::Value = match serde_json::from_str(&content) {
-                Ok(v) => v,
-                Err(e) => {
-                    let reason = format!("Invalid plugin manifest JSON: {e}");
-                    tracing::warn!(plugin = %plugin_name, manifest = %manifest_path.display(), error = %e, "Invalid plugin manifest JSON");
-                    failed.push(ExtensionLoadFailure::new(
-                        plugin_name,
-                        Some(manifest_path),
-                        reason,
-                        "Fix the JSON syntax in .synaps-plugin/plugin.json",
-                    ));
-                    continue;
-                }
-            };
-
-            let ext_value = match json.get("extension") {
-                Some(v) => v.clone(),
-                None => continue,
-            };
-
-            let ext_manifest: ExtensionManifest = match serde_json::from_value(ext_value) {
-                Ok(m) => m,
-                Err(e) => {
-                    let reason = format!("Failed to parse extension manifest: {e}");
-                    tracing::warn!(plugin = %plugin_name, manifest = %manifest_path.display(), error = %e, "Failed to parse extension manifest");
-                    failed.push(ExtensionLoadFailure::new(
-                        plugin_name,
-                        Some(manifest_path),
-                        reason,
-                        "Check the `extension` block shape against docs/extensions/contract.json",
-                    ));
-                    continue;
-                }
-            };
-
-            #[allow(clippy::if_same_then_else)]
-            let command = if std::path::Path::new(&ext_manifest.command).is_absolute() {
-                ext_manifest.command.clone()
-            } else if !ext_manifest.command.contains(std::path::MAIN_SEPARATOR)
-                && !ext_manifest.command.contains('/')
-            {
-                ext_manifest.command.clone()
-            } else {
-                plugin_dir
-                    .join(&ext_manifest.command)
-                    .to_string_lossy()
-                    .to_string()
-            };
-
-            let args: Vec<String> = ext_manifest
-                .args
-                .iter()
-                .map(|arg| {
-                    let arg_path = plugin_dir.join(arg);
-                    if arg_path.exists() {
-                        if let (Ok(canonical), Ok(plugin_canonical)) =
-                            (arg_path.canonicalize(), plugin_dir.canonicalize())
-                        {
-                            if canonical.starts_with(&plugin_canonical) {
-                                return canonical.to_string_lossy().to_string();
-                            }
-                        }
+            let (resolved, manifest_path, json) =
+                match read_extension_manifest(&plugin_name, &plugin_dir) {
+                    Ok(Some(read)) => read,
+                    Ok(None) => continue,
+                    Err(failure) => {
+                        failed.push(failure);
+                        continue;
                     }
-                    arg.clone()
-                })
-                .collect();
-
-            let resolved = ExtensionManifest {
-                theme_tokens: Default::default(),
-                // Deferred declarations flow through from the installed
-                // manifest (legacy `tools`/`activation` aliases are folded
-                // into `deferred` at deserialization) so installed plugins
-                // keep their zero-spawn deferred lifecycle instead of
-                // silently loading eager.
-                command,
-                args,
-                ..ext_manifest
-            };
+                };
 
             match self
                 .load_with_cwd(&plugin_name, &resolved, Some(plugin_dir.clone()))

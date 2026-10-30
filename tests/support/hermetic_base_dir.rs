@@ -23,6 +23,14 @@
 //! The dir lives under cargo's `CARGO_TARGET_TMPDIR` (removed by `cargo
 //! clean`), named after this binary and its pid. Each run also removes this
 //! binary's dirs left by processes that no longer exist (Linux: `/proc`).
+//!
+//! `SYNAPS_RUNTIME_DIR` is pinned too, to a short private dir under `/tmp`.
+//! Session sockets otherwise live in `<base>/run`, and under the target dir
+//! that path is past the 108-byte `sun_path` limit (about 128 bytes on CI).
+//! `create_session` then failed with "path must be shorter than SUN_LEN"
+//! unless a `HomeGuard` test happened to hold its short temp HOME at that
+//! moment. `HomeGuard` leaves `SYNAPS_RUNTIME_DIR` alone, so the pin holds
+//! for every test.
 #![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
@@ -58,6 +66,18 @@ fn hermetic_base_dir_is_set_before_main() {
     assert!(base.starts_with(env!("CARGO_TARGET_TMPDIR")), "{base:?}");
 }
 
+/// A session socket (`s-<32 hex>.sock`) fits `sun_path` (104 bytes on macOS,
+/// 108 on Linux) wherever the target dir is.
+#[cfg(unix)]
+#[test]
+fn hermetic_runtime_dir_fits_a_session_socket() {
+    pin();
+    let run = PathBuf::from(std::env::var_os("SYNAPS_RUNTIME_DIR").expect("pinned"));
+    let run = std::fs::canonicalize(&run).unwrap_or(run);
+    let sock = run.join(format!("s-{}.sock", "0".repeat(32)));
+    assert!(sock.as_os_str().len() < 104, "{sock:?}");
+}
+
 fn create() -> PathBuf {
     let root = Path::new(env!("CARGO_TARGET_TMPDIR"));
     let prefix = format!("hermetic-{}-", env!("CARGO_CRATE_NAME"));
@@ -67,7 +87,47 @@ fn create() -> PathBuf {
     std::fs::create_dir_all(&dir).expect("hermetic base dir");
     std::fs::write(dir.join("config"), "memory.backend = legacy\n").expect("hermetic config");
     std::env::set_var("SYNAPS_BASE_DIR", &dir);
+    #[cfg(unix)]
+    std::env::set_var("SYNAPS_RUNTIME_DIR", runtime_dir());
     dir
+}
+
+/// `/tmp/synaps-rt-<pid>-<random>`, mode 0700, created fresh (no reuse of an
+/// existing path). Left behind on exit and swept by the next run, like the
+/// base dir.
+#[cfg(unix)]
+fn runtime_dir() -> PathBuf {
+    let root = Path::new("/tmp");
+    let prefix = format!("synaps-rt-{}-", std::process::id());
+    sweep_dead_runtime(root);
+    tempfile::Builder::new()
+        .prefix(&prefix)
+        .tempdir_in(root)
+        .expect("hermetic runtime dir")
+        .keep()
+}
+
+/// Remove `synaps-rt-<pid>-*` dirs whose process is gone (Linux: `/proc`).
+#[cfg(unix)]
+fn sweep_dead_runtime(root: &Path) {
+    if !Path::new("/proc/self").exists() {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(root) else { return };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(pid) = name
+            .to_str()
+            .and_then(|n| n.strip_prefix("synaps-rt-"))
+            .and_then(|rest| rest.split('-').next())
+            .and_then(|p| p.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if pid != std::process::id() && !Path::new(&format!("/proc/{pid}")).exists() {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
 }
 
 /// Remove `<prefix><pid>` dirs whose process is gone. Only where liveness is

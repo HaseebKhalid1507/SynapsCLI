@@ -86,8 +86,11 @@ fn daemon_never_traces_answer_bodies() {
 #[test]
 fn session_command_debug_is_manual_and_lengthless() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("crates/agent-engine/src/session");
-    let types = std::fs::read_to_string(root.join("types.rs")).unwrap();
-    let wire = std::fs::read_to_string(root.join("wire.rs")).unwrap();
+    // LF-normalised: a Windows checkout with `core.autocrlf` has CRLF, and
+    // the impl slicing below matches on "\n}\n".
+    let read = |f: &str| std::fs::read_to_string(root.join(f)).unwrap().replace("\r\n", "\n");
+    let types = read("types.rs");
+    let wire = read("wire.rs");
 
     assert_eq!(
         types.matches("impl std::fmt::Debug for SessionCommand").count(),

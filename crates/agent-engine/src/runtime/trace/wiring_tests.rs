@@ -148,6 +148,17 @@ async fn drive_stream_with_events(
     cancel: &CancellationToken,
     tx: mpsc::UnboundedSender<StreamEvent>,
 ) -> crate::error::Result<serde_json::Value> {
+    drive_stream_full(options, max_retries, cancel, tx, TelemetryLevel::Off).await
+}
+
+/// `drive_stream_with_events` at an explicit telemetry level.
+async fn drive_stream_full(
+    options: &ApiOptions,
+    max_retries: u32,
+    cancel: &CancellationToken,
+    tx: mpsc::UnboundedSender<StreamEvent>,
+    level: TelemetryLevel,
+) -> crate::error::Result<serde_json::Value> {
     let client = Client::new();
     let tools = ToolRegistry::new();
     let messages = vec![Arc::new(json!({
@@ -168,7 +179,7 @@ async fn drive_stream_with_events(
         max_retries,
         0,
         options,
-        TelemetryLevel::Off,
+        level,
     )
     .await
 }
@@ -715,4 +726,226 @@ async fn slow_writer_sink_does_not_delay_model_turn() {
     let out = writer.shutdown(Duration::from_millis(100));
     assert!(!out.is_flushed());
     gate.open(); // release the worker thread
+}
+
+// ─── Subagent telemetry: worker requests are marked in api-log.jsonl ────────
+
+/// Telemetry on, one loopback request per role, both through one writer. The
+/// worker's record carries `"worker":true`; the foreground record has no
+/// `worker` key at all, so existing api-log readers see no change.
+#[tokio::test]
+async fn api_log_marks_worker_requests() {
+    use crate::runtime::openai::catalog::CodexRequestRole;
+    use crate::runtime::telemetry::{TelemetryWriter, WriterOptions};
+
+    let (url, _bodies, hits) = spawn_stub(vec![]).await;
+    let tmp = tempfile::TempDir::new().unwrap();
+    let log = tmp.path().join("synaps/api-log.jsonl");
+    let writer = TelemetryWriter::new(WriterOptions {
+        telemetry_path: Some(log.clone()),
+        trace_path: Some(tmp.path().join("synaps/request-trace.jsonl")),
+        ..WriterOptions::default()
+    });
+    for role in [CodexRequestRole::Foreground, CodexRequestRole::Worker] {
+        let options = ApiOptions {
+            anthropic_base_url: Some(url.clone()),
+            telemetry: Some(writer.clone()),
+            codex_request_role: role,
+            ..Default::default()
+        };
+        let (tx, _rx) = mpsc::unbounded_channel::<StreamEvent>();
+        drive_stream_full(
+            &options,
+            0,
+            &CancellationToken::new(),
+            tx,
+            TelemetryLevel::Basic,
+        )
+        .await
+        .expect("stub stream succeeds");
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+    assert!(writer.shutdown(Duration::from_secs(10)).is_flushed());
+
+    let records: Vec<serde_json::Value> = std::fs::read_to_string(&log)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(records.len(), 2, "one record per request");
+    assert!(records[0].get("worker").is_none(), "{}", records[0]);
+    assert_eq!(records[1]["worker"], json!(true), "{}", records[1]);
+}
+
+// ─── api-log.jsonl: TTFT, correlation ids and cost ───────────────────────────
+
+const PERSISTED_ID: &str = "20261028-045932-eb8e";
+
+/// Drive one request with telemetry on (trace into `h.sink`, api-log into a
+/// temp file) and return the single api-log record.
+async fn one_api_log_record(h: &Harness) -> serde_json::Value {
+    one_api_log_record_with_retries(h, 0).await
+}
+
+async fn one_api_log_record_with_retries(h: &Harness, max_retries: u32) -> serde_json::Value {
+    use crate::runtime::telemetry::{TelemetryWriter, WriterOptions};
+    let log = h._tmp.path().join("synaps/api-log.jsonl");
+    let writer = TelemetryWriter::new(WriterOptions {
+        telemetry_path: Some(log.clone()),
+        trace_path: Some(h._tmp.path().join("synaps/request-trace.jsonl")),
+        ..WriterOptions::default()
+    });
+    // As `Runtime::request_telemetry` hands it out: stamped with the
+    // persisted conversation id.
+    let options = ApiOptions {
+        telemetry: Some(writer.with_session(Some(PERSISTED_ID.to_string()))),
+        ..h.options.clone()
+    };
+    let (tx, _rx) = mpsc::unbounded_channel::<StreamEvent>();
+    let _ = drive_stream_full(
+        &options,
+        max_retries,
+        &CancellationToken::new(),
+        tx,
+        TelemetryLevel::Basic,
+    )
+    .await;
+    assert!(writer.shutdown(Duration::from_secs(10)).is_flushed());
+    let text = std::fs::read_to_string(&log).unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 1, "one api-log record per request: {text}");
+    serde_json::from_str(lines[0]).unwrap()
+}
+
+/// Regression: `ttft_ms` was measured from an instant taken AFTER the
+/// response headers arrived, and Anthropic sends `message_start` with the
+/// headers, so 44.5K of 44.9K live records read `"ttft_ms":0` while the
+/// trace showed ~480 ms. With the headers delayed by STAGE_MS, TTFT must
+/// cover that delay, equal the trace record's `first_model_event_ms`, and
+/// never exceed `total_ms`.
+#[tokio::test]
+async fn api_log_ttft_is_measured_from_send_and_matches_the_trace() {
+    const STAGE_MS: u64 = 80;
+    const TOL_MS: u64 = 60;
+    let app = Router::new().route(
+        "/v1/messages",
+        axum_post(|| async {
+            tokio::time::sleep(Duration::from_millis(STAGE_MS)).await;
+            sse_response()
+        }),
+    );
+    let h = harness(serve(app).await);
+    let record = one_api_log_record(&h).await;
+
+    let ttft = record["ttft_ms"].as_u64().expect("ttft_ms present");
+    let total = record["total_ms"].as_u64().unwrap();
+    assert!(ttft >= TOL_MS, "TTFT covers the header delay: {record}");
+    assert!(ttft <= total, "TTFT within the request: {record}");
+
+    let traces = h.sink.records();
+    assert_eq!(traces.len(), 1);
+    let trace = &traces[0];
+    assert_eq!(
+        Some(ttft),
+        trace.outcome.timings.first_model_event_ms,
+        "api-log TTFT is the trace first_model_event_ms"
+    );
+    // `session_id` is the persisted conversation id; the trace's runtime
+    // session id rides as `runtime_session_id`.
+    assert_eq!(record["session_id"], PERSISTED_ID);
+    assert_eq!(record["runtime_session_id"], trace.session_id.as_str());
+    assert_eq!(record["turn_id"], trace.turn_id.as_str());
+    assert_eq!(record["trace_request_id"], trace.request_id.as_str());
+    assert!(trace.session_id.as_str().starts_with("session-"));
+    assert!(trace.turn_id.as_str().starts_with("turn-"));
+    // Cost from agent_core::pricing over the record's own usage.
+    let expected = agent_core::pricing::calculate_cost(
+        "claude-haiku-4-5",
+        record["usage"]["input"].as_u64().unwrap(),
+        record["usage"]["output"].as_u64().unwrap(),
+        0,
+        0,
+    );
+    let cost = record["cost_usd"].as_f64().expect("cost_usd present");
+    assert!(cost > 0.0 && (cost - expected).abs() < 1e-12, "{record}");
+    // Foreground: no worker identity fields.
+    for key in [
+        "worker",
+        "worker_agent",
+        "worker_handle",
+        "parent_session_id",
+        "parent_runtime_session_id",
+    ] {
+        assert!(record.get(key).is_none(), "{key}: {record}");
+    }
+}
+
+/// A stream that ends without a single model event has no TTFT: the field
+/// is absent (never `0`), and with no usage there is no cost either.
+#[tokio::test]
+async fn api_log_omits_ttft_and_cost_when_no_event_arrived() {
+    let app = Router::new().route(
+        "/v1/messages",
+        axum_post(|| async {
+            (
+                StatusCode::OK,
+                [("content-type", "text/event-stream")],
+                ": keepalive\n\n".to_string(),
+            )
+                .into_response()
+        }),
+    );
+    let h = harness(serve(app).await);
+    let record = one_api_log_record(&h).await;
+    assert!(record.get("ttft_ms").is_none(), "{record}");
+    assert!(record.get("cost_usd").is_none(), "{record}");
+    assert_eq!(record["session_id"], PERSISTED_ID, "{record}");
+    assert!(record["runtime_session_id"].is_string(), "{record}");
+}
+
+/// Each attempt restarts the clock at its own send: after a 529 (itself
+/// slow, then a 1 s `retry-after` backoff) the successful attempt's TTFT
+/// covers only its own header delay, never attempt 1 or the backoff.
+#[tokio::test]
+async fn api_log_ttft_after_a_retry_excludes_the_failed_attempt_and_the_backoff() {
+    const FAIL_MS: u64 = 300;
+    const OK_MS: u64 = 80;
+    let hits = Arc::new(AtomicUsize::new(0));
+    let hits_c = Arc::clone(&hits);
+    let app = Router::new().route(
+        "/v1/messages",
+        axum_post(move || {
+            let hits = Arc::clone(&hits_c);
+            async move {
+                if hits.fetch_add(1, Ordering::SeqCst) == 0 {
+                    tokio::time::sleep(Duration::from_millis(FAIL_MS)).await;
+                    (
+                        StatusCode::from_u16(529).unwrap(),
+                        [("retry-after", "1")],
+                        "{\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\"}}".to_string(),
+                    )
+                        .into_response()
+                } else {
+                    tokio::time::sleep(Duration::from_millis(OK_MS)).await;
+                    sse_response()
+                }
+            }
+        }),
+    );
+    let h = harness(serve(app).await);
+    let record = one_api_log_record_with_retries(&h, 3).await;
+    assert_eq!(hits.load(Ordering::SeqCst), 2, "one 529, then success");
+
+    assert_eq!(record["attempt"], 2, "{record}");
+    let ttft = record["ttft_ms"].as_u64().expect("ttft_ms present");
+    let total = record["total_ms"].as_u64().unwrap();
+    assert!(ttft >= OK_MS - 20, "covers attempt 2's own header delay: {record}");
+    assert!(ttft < FAIL_MS, "excludes attempt 1 ({FAIL_MS} ms) and the 1 s backoff: {record}");
+    assert!(total < 1000, "total_ms is attempt 2's too: {record}");
+    let traces = h.sink.records();
+    assert_eq!(traces.len(), 2, "one trace record per attempt");
+    assert_eq!(Some(ttft), traces[1].outcome.timings.first_model_event_ms);
+    assert_eq!(record["trace_request_id"], traces[1].request_id.as_str(), "attempts share the request id");
+    assert_eq!(record["attempt"], traces[1].attempt, "the join key's attempt matches the trace's");
+    assert_eq!(traces[0].attempt, 1);
 }

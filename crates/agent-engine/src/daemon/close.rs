@@ -58,7 +58,13 @@ pub async fn close_session(state: &DaemonState, id: &SessionId, force: bool, att
     let presence = handle.presence();
     if presence.clients > 0 && !attached {
         let n = presence.clients;
-        let owner = presence.input_owner.map(|c| format!(", input owned by client #{}", c.0)).unwrap_or_default();
+        let owner = presence
+            .input_owner
+            .map(|c| match presence.roster.iter().find(|i| i.id == c) {
+                Some(i) => format!(", input owned by {}", i.label()),
+                None => format!(", input owned by client #{}", c.0),
+            })
+            .unwrap_or_default();
         return DaemonFrame::Refused {
             reason: RefuseReason::Busy,
             message: format!(

@@ -585,7 +585,7 @@ impl HookBus {
                         true
                     }
                 })
-                .filter(|reg| reg.matcher.as_ref().map_or(true, |m| m.matches(event)))
+                .filter(|reg| reg.matcher.as_ref().is_none_or(|m| m.matches(event)))
                 .map(|reg| {
                     let handler = reg.handler.clone();
                     let event_clone = event.clone();
@@ -1805,6 +1805,7 @@ mod tests {
                 session_allow_all: None,
                 launch_cancel: None,
                 memory_backend: None,
+                telemetry: None,
                 watcher_exit_path: None,
                 tool_register_tx: None,
                 session_manager: None,

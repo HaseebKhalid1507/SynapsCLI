@@ -17,6 +17,9 @@ Durable references live here at the top level. Working history is filed by kind 
 | [request-lifecycle-progressive-disclosure.md](request-lifecycle-progressive-disclosure.md) | Opt-in progressive tool disclosure. |
 | [cloud-oauth-providers-runbook.md](cloud-oauth-providers-runbook.md) | Operational runbook for the cloud OAuth providers. |
 | [open-provider-issues.md](open-provider-issues.md) | Known open provider gaps. |
+| [subagent-watch.md](subagent-watch.md) | Watching and steering a subagent in its own TUI view. |
+| [confirm-prompts.md](confirm-prompts.md) | Extension tool-call Confirm prompts, "Allow all", `/confirms`. |
+| [providers/](providers/) | Provider guides: Meta Muse, multi-account broker and usage, quota keeper, Codex. |
 | `tools.json` | Committed builtin tool manifest. Drift-checked by `tests/tools_export.rs` — regenerate with `synaps tools export --pretty`. |
 
 ## By kind

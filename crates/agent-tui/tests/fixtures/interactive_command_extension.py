@@ -4,9 +4,11 @@ import sys
 
 
 def send(msg):
-    body = json.dumps(msg)
-    sys.stdout.write(f"Content-Length: {len(body.encode())}\r\n\r\n{body}")
-    sys.stdout.flush()
+    # Bytes, not text: Windows text-mode stdout turns every \n into \r\n,
+    # which breaks the Content-Length framing.
+    body = json.dumps(msg).encode()
+    sys.stdout.buffer.write(b"Content-Length: %d\r\n\r\n" % len(body) + body)
+    sys.stdout.buffer.flush()
 
 
 def read_msg():

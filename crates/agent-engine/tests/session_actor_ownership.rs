@@ -30,7 +30,7 @@ async fn first_mirror_owns_second_mirror_is_read_only_with_notice() {
     let (url, hits) = stub(SSE_HI, false).await;
     std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
     let host = host().await;
-    let handle = host.create_session(cfg()).await.unwrap();
+    let handle = host.create_session(exclusive_cfg()).await.unwrap();
 
     let (mut a, snap_a) = attach(&handle, ClientKind::Tui, AttachMode::Mirror).await;
     assert_eq!(snap_a.input_owner, Some(a.client_id()));
@@ -40,7 +40,7 @@ async fn first_mirror_owns_second_mirror_is_read_only_with_notice() {
     assert_eq!(snap_b.input_owner, Some(a.client_id()), "a keeps input");
     // b learns it from ITS snapshot; the owner is told nothing.
     let owned = snap_b.input_owned_elsewhere(b.client_id()).expect("owned elsewhere");
-    assert!(owned.contains("input is owned by client #1 (tui)"), "{owned}");
+    assert!(owned.contains("input is owned by tui (#1)"), "{owned}");
     assert!(owned.contains("--takeover"), "{owned}");
     assert_eq!(snap_a.input_owned_elsewhere(a.client_id()), None, "a owns it");
     let a_saw = drain_for(&mut a, std::time::Duration::from_millis(300)).await;
@@ -63,7 +63,7 @@ async fn first_mirror_owns_second_mirror_is_read_only_with_notice() {
         } => {
             assert_eq!(*client, b.client_id());
             assert_eq!(command, "submit");
-            assert!(reason.contains("client #1"), "{reason}");
+            assert_eq!(reason, "input owned by tui (#1)");
         }
         _ => unreachable!(),
     }
@@ -90,7 +90,7 @@ async fn observer_never_owns_and_answer_allowed_from_any_client() {
     let (url, _) = stub_seq(&[SSE_PROMPT_TOOL_USE, SSE_HI]).await;
     std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
     let host = prompt_host().await;
-    let handle = host.create_session(cfg()).await.unwrap();
+    let handle = host.create_session(exclusive_cfg()).await.unwrap();
 
     // Observer first: still nobody owns.
     let (mut o, snap_o) = attach(&handle, ClientKind::Attach, AttachMode::Observe).await;
@@ -143,7 +143,7 @@ async fn confirm_answers_are_owner_gated_and_allow_all_is_announced() {
     let (url, _) = stub_seq(&[SSE_PROMPT_TOOL_USE, SSE_HI]).await;
     std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
     let host = confirm_host().await;
-    let handle = host.create_session(cfg()).await.unwrap();
+    let handle = host.create_session(exclusive_cfg()).await.unwrap();
 
     let (mut a, snap_a) = attach(&handle, ClientKind::Tui, AttachMode::Mirror).await;
     assert_eq!(snap_a.input_owner, Some(a.client_id()));
@@ -239,7 +239,7 @@ async fn approving_rewritten_input_is_announced_to_every_client() {
     let (url, _) = stub_seq(&[SSE_PROMPT_TOOL_USE, SSE_HI]).await;
     std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
     let host = rewritten_confirm_host().await;
-    let handle = host.create_session(cfg()).await.unwrap();
+    let handle = host.create_session(exclusive_cfg()).await.unwrap();
     let (mut a, _) = attach(&handle, ClientKind::Tui, AttachMode::Mirror).await;
     let (mut o, _) = attach(&handle, ClientKind::Attach, AttachMode::Observe).await;
     a.send_from_self(submit("go")).await.unwrap();
@@ -301,7 +301,7 @@ async fn non_owner_mirror_may_answer_a_confirm_once() {
     let (url, _) = stub_seq(&[SSE_PROMPT_TOOL_USE, SSE_HI]).await;
     std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
     let host = confirm_host().await;
-    let handle = host.create_session(cfg()).await.unwrap();
+    let handle = host.create_session(exclusive_cfg()).await.unwrap();
 
     let (mut a, _) = attach(&handle, ClientKind::Tui, AttachMode::Mirror).await;
     let (mut b, _) = attach(&handle, ClientKind::Attach, AttachMode::Mirror).await;
@@ -333,7 +333,7 @@ async fn takeover_steals_and_notifies_previous_owner() {
     let (url, _) = stub(SSE_HI, false).await;
     std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
     let host = host().await;
-    let handle = host.create_session(cfg()).await.unwrap();
+    let handle = host.create_session(exclusive_cfg()).await.unwrap();
 
     let (mut a, _) = attach(&handle, ClientKind::Tui, AttachMode::Mirror).await;
     let (mut b, snap_b) = attach(&handle, ClientKind::Attach, AttachMode::Takeover).await;
@@ -373,7 +373,7 @@ async fn owner_detach_passes_to_oldest_non_observer() {
     let (url, _) = stub(SSE_HI, false).await;
     std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
     let host = host().await;
-    let handle = host.create_session(cfg()).await.unwrap();
+    let handle = host.create_session(exclusive_cfg()).await.unwrap();
 
     let (a, _) = attach(&handle, ClientKind::Tui, AttachMode::Mirror).await;
     let (mut o, _) = attach(&handle, ClientKind::Attach, AttachMode::Observe).await;
@@ -457,7 +457,7 @@ async fn checkpoint_cancels_turn_saves_closes_ptys_answers_prompts_none() {
     let handle = host
         .create_session(agent_engine::session::SessionConfig {
             persist: true,
-            ..cfg()
+            ..exclusive_cfg()
         })
         .await
         .unwrap();
@@ -542,7 +542,7 @@ async fn checkpoint_is_owner_only_from_clients() {
     let (url, _) = stub(SSE_HI, true).await;
     std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
     let host = host().await;
-    let handle = host.create_session(cfg()).await.unwrap();
+    let handle = host.create_session(exclusive_cfg()).await.unwrap();
     let (mut a, _) = attach(&handle, ClientKind::Tui, AttachMode::Mirror).await;
     let (mut b, _) = attach(&handle, ClientKind::Attach, AttachMode::Observe).await;
 
@@ -594,5 +594,280 @@ async fn checkpoint_is_owner_only_from_clients() {
     assert!(seen
         .iter()
         .any(|e| matches!(e.event, SessionEventWire::Aborted { .. })));
+    end(&mut a).await;
+}
+
+/// `/takeover`: a read-only mirror takes input in place (no re-attach). The
+/// old owner is told with the same `InputOwnerChanged{Takeover}` an
+/// `--takeover` attach sends; a repeat is a no-op.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn take_input_moves_ownership_without_reattaching() {
+    let _h = Home::new();
+    let (url, hits) = stub(SSE_HI, false).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+    let handle = host.create_session(exclusive_cfg()).await.unwrap();
+
+    let (mut a, _) = attach(&handle, ClientKind::Tui, AttachMode::Mirror).await;
+    let (mut b, snap_b) = attach(&handle, ClientKind::Tui, AttachMode::Mirror).await;
+    assert_eq!(snap_b.input_owner, Some(a.client_id()), "b starts read-only");
+
+    let (ida, idb) = (a.client_id(), b.client_id());
+    b.send_from_self(SessionCommand::TakeInput).await.unwrap();
+    for t in [&mut a, &mut b] {
+        let seen = until(t, |e| matches!(e, SessionEventWire::InputOwnerChanged { .. })).await;
+        match &seen.last().unwrap().event {
+            SessionEventWire::InputOwnerChanged { from, to, reason } => {
+                assert_eq!(*from, Some(ida));
+                assert_eq!(*to, Some(idb));
+                assert_eq!(*reason, OwnerChangeReason::Takeover);
+            }
+            _ => unreachable!(),
+        }
+    }
+    assert_eq!(a.input_owner(), Some(b.client_id()));
+    assert_eq!(b.input_owner(), Some(b.client_id()));
+
+    // The old owner is read-only now; the new one drives.
+    a.send_from_self(submit("x")).await.unwrap();
+    let seen = until(&mut a, |e| matches!(e, SessionEventWire::Refused { .. })).await;
+    match &seen.last().unwrap().event {
+        SessionEventWire::Refused { reason, .. } => {
+            assert!(reason.contains(&format!("(#{})", idb.0)), "{reason}");
+        }
+        _ => unreachable!(),
+    }
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+    b.send_from_self(submit("y")).await.unwrap();
+    until(&mut b, |e| matches!(e, SessionEventWire::Idle)).await;
+
+    // Already the owner: nothing changes, nobody is told.
+    b.send_from_self(SessionCommand::TakeInput).await.unwrap();
+    let again = drain_for(&mut a, Duration::from_millis(300)).await;
+    assert!(
+        !again.iter().any(|e| matches!(e.event, SessionEventWire::InputOwnerChanged { .. })),
+        "{again:#?}"
+    );
+    end(&mut b).await;
+}
+
+/// `--observe` is an explicit read-only attach: `/takeover` from it is
+/// refused and the owner keeps input.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn take_input_from_an_observer_is_refused() {
+    let _h = Home::new();
+    let (url, _) = stub(SSE_HI, false).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+    let handle = host.create_session(exclusive_cfg()).await.unwrap();
+
+    let (mut a, _) = attach(&handle, ClientKind::Tui, AttachMode::Mirror).await;
+    let (mut o, _) = attach(&handle, ClientKind::Tui, AttachMode::Observe).await;
+
+    o.send_from_self(SessionCommand::TakeInput).await.unwrap();
+    let seen = until(&mut o, |e| matches!(e, SessionEventWire::Refused { .. })).await;
+    match &seen.last().unwrap().event {
+        SessionEventWire::Refused { client, command, reason } => {
+            assert_eq!(*client, o.client_id());
+            assert_eq!(command, "take_input");
+            assert!(reason.contains("--observe"), "{reason}");
+        }
+        _ => unreachable!(),
+    }
+    let a_saw = drain_for(&mut a, Duration::from_millis(300)).await;
+    assert!(
+        !a_saw.iter().any(|e| matches!(e.event, SessionEventWire::InputOwnerChanged { .. })),
+        "{a_saw:#?}"
+    );
+    assert_eq!(a.input_owner(), Some(a.client_id()));
+    end(&mut a).await;
+}
+
+// ── client_input = shared (multi-client-sessions.md §6) ──────────────────────
+
+fn shared_cfg() -> agent_engine::session::SessionConfig {
+    agent_engine::session::SessionConfig {
+        client_input: Some(agent_engine::session::ClientInput::Shared),
+        ..cfg()
+    }
+}
+
+/// The listing knows a session's input mode before any client attaches: a
+/// session the daemon restores at reload, with nobody back yet, listed as
+/// `owner=-` instead of `active=-` because only a presence publish
+/// (attach, detach, input) carried the mode.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn the_input_mode_is_listed_before_any_client_attaches() {
+    let _h = Home::new();
+    let host = host().await;
+    let shared = host.create_session(shared_cfg()).await.unwrap();
+    let exclusive = host
+        .create_session(agent_engine::session::SessionConfig {
+            client_input: Some(agent_engine::session::ClientInput::Exclusive),
+            ..cfg()
+        })
+        .await
+        .unwrap();
+    assert_eq!(shared.meta_live().clients, 0);
+    assert_eq!(
+        shared.meta_live().client_input,
+        Some(agent_engine::session::ClientInput::Shared)
+    );
+    assert_eq!(
+        exclusive.meta_live().client_input,
+        Some(agent_engine::session::ClientInput::Exclusive)
+    );
+}
+
+/// Shared input: every drive client may type and the one that did last is
+/// the active client (`InputOwnerChanged{reason: Input}`); an observer is
+/// still read-only. When the active client leaves, input goes back to
+/// whoever typed most recently, not to the lowest id.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn shared_every_drive_client_types_and_the_last_typist_is_active() {
+    let _h = Home::new();
+    let (url, hits) = stub(SSE_HI, false).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+    let handle = host.create_session(shared_cfg()).await.unwrap();
+
+    let (mut a, snap_a) = attach(&handle, ClientKind::Tui, AttachMode::Mirror).await;
+    let (mut b, snap_b) = attach(&handle, ClientKind::Attach, AttachMode::Mirror).await;
+    let (mut c, _) = attach(&handle, ClientKind::Attach, AttachMode::Mirror).await;
+    let (mut o, _) = attach(&handle, ClientKind::Attach, AttachMode::Observe).await;
+    assert_eq!(snap_a.client_input, agent_engine::session::ClientInput::Shared);
+    assert_eq!(snap_b.input_owner, Some(a.client_id()), "the first drive client starts active");
+    assert_eq!(snap_b.input_owned_elsewhere(b.client_id()), None, "shared: b is not told it is read-only");
+
+    // a, then c, then b type; each turn runs (every client sees it to its
+    // end), and the active marker follows the typist.
+    let (a_id, b_id, c_id, o_id) = (a.client_id(), b.client_id(), c.client_id(), o.client_id());
+    let mut o_saw = Vec::new();
+    for (i, text) in ["one", "two", "three"].into_iter().enumerate() {
+        let who = match i {
+            0 => &mut a,
+            1 => &mut c,
+            _ => &mut b,
+        };
+        who.send_from_self(submit(text)).await.unwrap();
+        for t in [&mut a, &mut b, &mut c, &mut o] {
+            let seen = until(t, |e| matches!(e, SessionEventWire::Idle)).await;
+            assert!(seen.iter().any(|e| matches!(e.event, SessionEventWire::TurnStarted { .. })), "{text}: {seen:#?}");
+            if t.client_id() == o_id {
+                o_saw.extend(seen.into_iter().map(|e| e.event));
+            }
+        }
+    }
+    let moves: Vec<_> = o_saw
+        .iter()
+        .filter_map(|e| match e {
+            SessionEventWire::InputOwnerChanged { from, to, reason } => Some((*from, *to, *reason)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        moves,
+        [(Some(a_id), Some(c_id), OwnerChangeReason::Input), (Some(c_id), Some(b_id), OwnerChangeReason::Input)],
+        "a was already active; then c, then b"
+    );
+    assert_eq!(o.input_owner(), Some(b_id));
+    let before = hits.load(std::sync::atomic::Ordering::SeqCst);
+
+    // The observer is refused, and does not become active.
+    o.send_from_self(submit("nope")).await.unwrap();
+    let seen = until(&mut o, |e| matches!(e, SessionEventWire::Refused { .. })).await;
+    assert!(matches!(
+        &seen.last().unwrap().event,
+        SessionEventWire::Refused { reason, .. } if reason.contains("read-only")
+    ), "{seen:#?}");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), before, "the observer's submit never ran");
+
+    // b (active) leaves: c typed after a, so c is active now (exclusive
+    // would pick a, the lowest id).
+    b.send_from_self(SessionCommand::Detach { client: b_id }).await.unwrap();
+    let seen = until(&mut a, |e| matches!(e, SessionEventWire::InputOwnerChanged { from: Some(f), .. } if *f == b_id)).await;
+    assert!(matches!(
+        seen.last().unwrap().event,
+        SessionEventWire::InputOwnerChanged { to, reason: OwnerChangeReason::OwnerDetached, .. } if to == Some(c.client_id())
+    ), "{seen:#?}");
+    end(&mut a).await;
+}
+
+/// Shared input: "Allow all" is the active client's to choose, and answering
+/// makes a client active, so any drive client may pick it. An observer
+/// still may not answer a confirm.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn shared_any_drive_client_may_allow_all() {
+    let _h = Home::new();
+    let (url, _) = stub_seq(&[SSE_PROMPT_TOOL_USE, SSE_HI]).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = confirm_host().await;
+    let handle = host.create_session(shared_cfg()).await.unwrap();
+
+    let (mut a, _) = attach(&handle, ClientKind::Tui, AttachMode::Mirror).await;
+    let (mut b, _) = attach(&handle, ClientKind::Attach, AttachMode::Mirror).await;
+    let (mut o, _) = attach(&handle, ClientKind::Attach, AttachMode::Observe).await;
+
+    a.send_from_self(submit("go")).await.unwrap();
+    let seen = until(&mut b, |e| matches!(e, SessionEventWire::Prompt(_))).await;
+    let SessionEventWire::Prompt(pr) = &seen.last().unwrap().event else { unreachable!() };
+    let pid = pr.id;
+    until(&mut o, |e| matches!(e, SessionEventWire::Prompt(_))).await;
+
+    o.send_from_self(SessionCommand::Answer { prompt_id: pid, value: Some("always".into()) }).await.unwrap();
+    let o_id = o.client_id();
+    let seen = until(&mut o, |e| matches!(e, SessionEventWire::Refused { client, .. } if *client == o_id)).await;
+    assert!(!seen.iter().any(|e| matches!(e.event, SessionEventWire::PromptResolved { .. })), "{seen:#?}");
+
+    // b was not active (a typed), but its "always" is accepted.
+    b.send_from_self(SessionCommand::Answer { prompt_id: pid, value: Some("always".into()) }).await.unwrap();
+    let seen = until(&mut b, |e| matches!(e, SessionEventWire::Idle)).await;
+    let b_id = b.client_id();
+    assert!(
+        !seen.iter().any(|e| matches!(e.event, SessionEventWire::Refused { client, .. } if client == b_id)),
+        "{seen:#?}"
+    );
+    assert!(seen.iter().any(|e| matches!(
+        &e.event,
+        SessionEventWire::InputOwnerChanged { to, reason: OwnerChangeReason::Input, .. } if *to == Some(b.client_id())
+    )), "{seen:#?}");
+    assert_eq!(tool_results(&last_conversation(&seen)), vec!["allowed".to_string()]);
+    end(&mut a).await;
+}
+
+/// `/model` in one client (an engine command, not a `Set`) reaches every
+/// client as `SettingChanged{id: VIEW_CHANGED_SETTING_ID}` with the new
+/// view, so the other tabs' footers and model chips follow it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn an_engine_command_that_changes_the_view_reaches_every_client() {
+    let _h = Home::new();
+    let (url, _) = stub(SSE_HI, false).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+    let handle = host.create_session(shared_cfg()).await.unwrap();
+    let (mut a, _) = attach(&handle, ClientKind::Tui, AttachMode::Mirror).await;
+    let (mut b, _) = attach(&handle, ClientKind::Attach, AttachMode::Mirror).await;
+
+    a.send_from_self(SessionCommand::EngineCommand { id: 5, name: "model".into(), arg: "claude-haiku-4-5".into() })
+        .await
+        .unwrap();
+    let seen = until(&mut b, |e| matches!(e, SessionEventWire::SettingChanged(_))).await;
+    match &seen.last().unwrap().event {
+        SessionEventWire::SettingChanged(applied) => {
+            assert_eq!(applied.id, agent_engine::session::wire::VIEW_CHANGED_SETTING_ID, "not a reply to b's Set");
+            assert_eq!(applied.view.model, "claude-haiku-4-5");
+            assert!(applied.ok);
+        }
+        _ => unreachable!(),
+    }
+    // a still gets its reply.
+    until(&mut a, |e| matches!(e, SessionEventWire::QueryResult { id: 5, .. })).await;
     end(&mut a).await;
 }

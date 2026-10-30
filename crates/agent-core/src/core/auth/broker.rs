@@ -4545,11 +4545,11 @@ fn auth_state_report(
                 .iter()
                 .filter(|(k, s)| {
                     k.starts_with(&store_prefix)
-                        && provider.map_or(true, |p| s.provider == p.as_str())
+                        && provider.is_none_or(|p| s.provider == p.as_str())
                         && query
                             .account
                             .as_deref()
-                            .map_or(true, |label| selection_involves(s, label))
+                            .is_none_or(|label| selection_involves(s, label))
                 })
                 .map(|(_, s)| s.clone())
                 .collect()
