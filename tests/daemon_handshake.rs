@@ -378,6 +378,9 @@ fn auth_state_cli_without_a_daemon_lists_accounts_and_refuses_to_clear() {
 /// `Welcome.features` lists "children", and the `children` query is a
 /// control frame answered before Attach and on an attached connection, from
 /// the process-wide ledger (session filter, sid filter, unknown session).
+/// Linux only, like the ledger: it reads identities from `/proc` and runs
+/// `setsid`.
+#[cfg(target_os = "linux")]
 #[tokio::test]
 #[serial]
 async fn children_query_is_answered_before_and_after_attach() {
@@ -466,6 +469,40 @@ async fn children_query_is_answered_before_and_after_attach() {
     d.wait().await;
     let _ = sleeper.kill();
     let _ = sleeper.wait();
+}
+
+/// Where the ledger is not supported (off Linux), `Welcome.features` omits
+/// "children" and a `children` query is still answered, with
+/// `supported: false` and nothing listed. Runs everywhere: on Linux the
+/// feature and the reply agree with `children::supported()`.
+#[tokio::test]
+#[serial]
+async fn the_children_feature_and_reply_follow_ledger_support() {
+    use agent_engine::session::children;
+    let supported = children::supported();
+    if !cfg!(target_os = "linux") {
+        assert!(!supported, "the ledger is Linux only");
+    }
+    let guard = HomeGuard::new();
+    let d = start(&guard.base_dir().join("run")).await;
+    let mut c = Raw::connect(&d.paths.sock).await;
+    c.send(&ClientFrame::Hello(Hello::new(ClientKind::Test))).await;
+    match c.recv().await {
+        Some(DaemonFrame::Welcome(w)) => assert_eq!(w.features.iter().any(|f| f == "children"), supported, "{:?}", w.features),
+        other => panic!("{other:?}"),
+    }
+    c.send(&ClientFrame::Children { id: Some(31), session_id: Some("hs-no-such".into()), sid: None, members: true })
+        .await;
+    match c.recv().await {
+        Some(DaemonFrame::ChildList(r)) => {
+            assert_eq!((r.id, r.supported, r.boot_id.is_some()), (Some(31), supported, supported));
+            assert!(r.sessions.is_empty() && r.host.is_empty(), "{r:?}");
+        }
+        other => panic!("{other:?}"),
+    }
+    c.send(&ClientFrame::Bye).await;
+    d.shutdown_token().cancel();
+    d.wait().await;
 }
 
 /// `thinking_options` is a control frame (before Attach and attached).
