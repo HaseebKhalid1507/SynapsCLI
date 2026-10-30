@@ -687,7 +687,7 @@ impl AcceptedEvents {
     }
 
     fn allows_name(&self, name: Option<&str>) -> bool {
-        name.map_or(true, |n| self.0.contains(&n))
+        name.is_none_or(|n| self.0.contains(&n))
     }
 
     /// Whether `event` may be sent on this connection.

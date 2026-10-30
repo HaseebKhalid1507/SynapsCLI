@@ -396,7 +396,7 @@ impl Ledger {
     /// that lost it reads truncated. False when there is none to drop.
     fn evict_oldest_ended(&mut self, session_id: Option<&str>) -> bool {
         let found = self.records.iter().position(|r| {
-            r.state == ChildState::Ended && session_id.map_or(true, |s| r.session_id == s)
+            r.state == ChildState::Ended && session_id.is_none_or(|s| r.session_id == s)
         });
         match found.and_then(|i| self.records.remove(i)) {
             Some(gone) => {
@@ -539,7 +539,7 @@ impl Ledger {
                 .truncated
                 .iter()
                 // With no sid filter every session with records is in `index`.
-                .filter(|(s, _)| !index.contains_key(s.as_str()) && session_id.map_or(true, |want| want == s.as_str()))
+                .filter(|(s, _)| !index.contains_key(s.as_str()) && session_id.is_none_or(|want| want == s.as_str()))
                 .map(|(s, seq)| (*seq, s))
                 .collect();
             empty.sort_unstable();
@@ -550,7 +550,7 @@ impl Ledger {
         let host = if session_id.is_some() {
             Vec::new()
         } else {
-            self.host.iter().filter(|h| sid.map_or(true, |s| s == h.host.child.sid)).map(|h| h.host.clone()).collect()
+            self.host.iter().filter(|h| sid.is_none_or(|s| s == h.host.child.sid)).map(|h| h.host.clone()).collect()
         };
         ChildListing { sessions, host, refused_records: self.refused, ledger_full: self.full() }
     }
