@@ -830,11 +830,11 @@ fn epoch_ms_from_number(n: f64) -> Option<u64> {
 pub fn duration_label(secs: u64) -> String {
     if secs == 0 {
         "0s".into()
-    } else if secs % SECS_PER_DAY == 0 {
+    } else if secs.is_multiple_of(SECS_PER_DAY) {
         format!("{}d", secs / SECS_PER_DAY)
-    } else if secs % SECS_PER_HOUR == 0 {
+    } else if secs.is_multiple_of(SECS_PER_HOUR) {
         format!("{}h", secs / SECS_PER_HOUR)
-    } else if secs % SECS_PER_MINUTE == 0 {
+    } else if secs.is_multiple_of(SECS_PER_MINUTE) {
         format!("{}m", secs / SECS_PER_MINUTE)
     } else {
         format!("{secs}s")

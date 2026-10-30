@@ -552,8 +552,8 @@ async fn duplicate_continue_attaches_to_live_session() {
         .expect("still registered");
     assert_eq!(reg1.socket_path, reg2.socket_path);
     assert!(
-        tokio::net::UnixStream::connect(&reg1.socket_path).await.is_ok(),
-        "first actor's UDS still bound"
+        agent_engine::events::socket::connect_session_socket(&reg1.socket_path).await.is_ok(),
+        "first actor's endpoint still bound"
     );
 
     // Same actor: a client on h2 sees the turn started via h1.
@@ -1137,7 +1137,6 @@ async fn name_at_create_and_saveas_reach_registry_and_meta() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn events_auto_turn_false_injects_without_a_turn() {
-    use tokio::io::AsyncWriteExt;
     let h = Home::new();
     let config_path = h._dir.path().join(".synaps-cli").join("config");
     std::fs::write(&config_path, "events.auto_turn = false\n").unwrap();
@@ -1159,9 +1158,7 @@ async fn events_auto_turn_false_injects_without_a_turn() {
                 text,
                 Some(agent_engine::events::types::Severity::High),
             );
-            let mut c = tokio::net::UnixStream::connect(&reg.socket_path).await.unwrap();
-            c.write_all(&serde_json::to_vec(&event).unwrap()).await.unwrap();
-            c.shutdown().await.unwrap();
+            agent_engine::events::socket::send_to_session_socket(&reg.socket_path, &serde_json::to_vec(&event).unwrap()).await.unwrap();
         }
     };
 

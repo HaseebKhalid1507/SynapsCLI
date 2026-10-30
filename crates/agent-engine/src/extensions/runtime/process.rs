@@ -708,6 +708,13 @@ pub struct ProcessExtension {
     /// crashed extension still reads Degraded instead of pretending it
     /// never crashed.
     total_restarts: AtomicUsize,
+    /// Set by [`ExtensionHandler::shutdown`] (unload, reload, lease
+    /// teardown), never cleared: a stopped handler must not respawn. A call
+    /// authorized against it before the stop (a tool call batched with the
+    /// `reload-extension` that replaces it) would otherwise take the
+    /// empty-state restart path and run a second copy of the extension
+    /// beside its replacement.
+    stopped: AtomicBool,
     /// Restart policy controlling exponential backoff and budget.
     pub(crate) restart_policy: RestartPolicy,
     /// Shared mailbox between the reader task and request callers. Persists
@@ -793,6 +800,7 @@ impl ProcessExtension {
             restart_count: AtomicUsize::new(0),
             initialize_config: Mutex::new(Value::Object(Default::default())),
             total_restarts: AtomicUsize::new(0),
+            stopped: AtomicBool::new(false),
             restart_policy: RestartPolicy::default(),
             inbox,
         })
@@ -1618,6 +1626,12 @@ impl ProcessExtension {
     }
 
     async fn restart_locked(&self, state: &mut Option<ProcessState>) -> Result<(), String> {
+        if self.stopped.load(Ordering::Acquire) {
+            return Err(format!(
+                "Extension '{}' was stopped (unloaded or reloaded); not respawning it",
+                self.id,
+            ));
+        }
         self.inbox.invalidate_lifecycle().await;
         let attempted = self.restart_count.fetch_add(1, Ordering::Relaxed) + 1;
         self.total_restarts.fetch_add(1, Ordering::Relaxed);
@@ -2475,6 +2489,9 @@ impl ExtensionHandler for ProcessExtension {
     }
 
     async fn shutdown(&self) {
+        // Terminal before anything else: a call already past authorization
+        // must find this handler stopped, not respawn it (`restart_locked`).
+        self.stopped.store(true, Ordering::Release);
         self.inbox.invalidate_lifecycle().await;
         // Lease teardown is terminal for this ProcessExtension. In
         // particular, a concurrent force_shutdown may already have removed
@@ -3235,6 +3252,22 @@ done"#
             .expect("bounded shutdown")
             .expect("shutdown task");
         assert_eq!(ext.lifecycle_snapshot(), Some(dead));
+    }
+
+    /// A call that reaches a handler after `shutdown` (it was authorized
+    /// before an unload or reload) fails; it must not respawn the process
+    /// and run a second copy beside the replacement.
+    #[tokio::test]
+    async fn a_call_after_shutdown_fails_without_respawning() {
+        let ext = fixture().await;
+        ext.shutdown().await;
+        let err = ext
+            .call_inner("tool.call", serde_json::json!({}))
+            .await
+            .expect_err("a stopped handler must refuse the call");
+        assert!(err.contains("was stopped"), "{err}");
+        assert!(ext.state.lock().await.is_none(), "no process was respawned");
+        assert_eq!(ext.total_restarts.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]

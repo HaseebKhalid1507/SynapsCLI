@@ -458,7 +458,7 @@ pub(crate) fn list_accounts_detailed_at(
             .map(str::trim)
             .filter(|s| !s.is_empty())
         {
-            if provider.map_or(true, |p| p == cred.provider) {
+            if provider.is_none_or(|p| p == cred.provider) {
                 seen.entry((cred.provider.as_str().to_string(), id.to_string()))
                     .or_default()
                     .push(key.clone());

@@ -41,6 +41,22 @@ use std::path::{Path, PathBuf};
 /// `msg` records, `_turn_ids` in the snapshot), which older readers ignore.
 pub const MESSAGE_TURN_KEY: &str = "_synaps_turn";
 
+/// Message key carrying when the host recorded the message (RFC 3339 UTC)
+/// in memory. Persisted beside the message exactly like
+/// [`MESSAGE_TURN_KEY`] (`at` on journal `msg` records, `_message_times` in
+/// the snapshot), never inside it, for the same rollback reason.
+pub const MESSAGE_AT_KEY: &str = "_synaps_at";
+
+/// The recorded time of a message, if it has one.
+pub fn message_time(message: &serde_json::Value) -> Option<&str> {
+    message.get(MESSAGE_AT_KEY)?.as_str()
+}
+
+/// A stored time is kept only if it parses as RFC 3339.
+fn valid_time(ts: &str) -> bool {
+    DateTime::parse_from_rfc3339(ts).is_ok()
+}
+
 /// Journal record schema version (line-level `"v"` field).
 pub const JOURNAL_SCHEMA_VERSION: u8 = 2;
 
@@ -181,6 +197,33 @@ pub(crate) fn confined_open(dir: &Path, name: &str) -> std::io::Result<Option<st
         return Ok(None);
     };
     open_artifact(&handle, name)
+}
+
+/// Open `<name>` inside `dir` to set its times (`SessionMtimes`). Unix sets
+/// them through the read-only descriptor `confined_open` returns.
+#[cfg(not(windows))]
+pub(crate) fn confined_open_for_times(dir: &Path, name: &str) -> std::io::Result<Option<std::fs::File>> {
+    confined_open(dir, name)
+}
+
+/// Windows sets times through a handle with `FILE_WRITE_ATTRIBUTES`, which a
+/// read-only open lacks: the restore failed silently and every rename moved
+/// the session to the top of `--continue` and `/sessions`. `confined_open`
+/// still refuses a symlink and reports a missing file as `None` first.
+#[cfg(windows)]
+pub(crate) fn confined_open_for_times(dir: &Path, name: &str) -> std::io::Result<Option<std::fs::File>> {
+    use std::os::windows::fs::OpenOptionsExt;
+    if confined_open(dir, name)?.is_none() {
+        return Ok(None);
+    }
+    match std::fs::OpenOptions::new()
+        .access_mode(windows_sys::Win32::Storage::FileSystem::FILE_WRITE_ATTRIBUTES)
+        .open(dir.join(name))
+    {
+        Ok(f) => Ok(Some(f)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 /// Bounded read of a whole artifact from an already-confined handle.
@@ -341,9 +384,13 @@ enum JournalRecord {
         /// [`turns_hash`] of the same prefix; absent = no turn ids.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         turns_hash: Option<String>,
+        /// [`times_hash`] of the same prefix; absent = no message times.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        times_hash: Option<String>,
     },
-    /// Message at ABSOLUTE history index `i`; `t` is its turn id, kept
-    /// beside the message (see [`MESSAGE_TURN_KEY`]).
+    /// Message at ABSOLUTE history index `i`; `t` is its turn id and `at`
+    /// its recorded time, both kept beside the message (see
+    /// [`MESSAGE_TURN_KEY`], [`MESSAGE_AT_KEY`]).
     #[serde(rename = "msg")]
     Msg {
         v: u8,
@@ -352,6 +399,9 @@ enum JournalRecord {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         /// Any JSON on read: a malformed id is dropped, it never ends replay.
         t: Option<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        /// Any JSON on read: a malformed time is dropped, never fatal.
+        at: Option<serde_json::Value>,
     },
     /// Full session metadata (the `Session` object minus `api_messages`).
     #[serde(rename = "meta")]
@@ -362,6 +412,8 @@ enum JournalRecord {
         history_hash: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         turns_hash: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        times_hash: Option<String>,
     },
 }
 
@@ -369,16 +421,27 @@ fn message_turn_id(message: &serde_json::Value) -> Option<&str> {
     message.get(MESSAGE_TURN_KEY)?.get("id")?.as_str()
 }
 
-/// A message as persisted: the in-memory turn key removed.
+/// In-memory host keys that are persisted beside a message, never inside.
+const SIBLING_KEYS: [&str; 2] = [MESSAGE_TURN_KEY, MESSAGE_AT_KEY];
+
+fn has_sibling_key(object: &serde_json::Map<String, serde_json::Value>) -> bool {
+    SIBLING_KEYS.iter().any(|k| object.contains_key(*k))
+}
+
+/// A message as persisted: the in-memory turn id and time removed.
 struct Stored<'a>(&'a serde_json::Value);
 
 impl Serialize for Stored<'_> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
         match self.0.as_object() {
-            Some(object) if object.contains_key(MESSAGE_TURN_KEY) => {
-                let mut object = object.clone();
-                object.remove(MESSAGE_TURN_KEY);
-                object.serialize(serializer)
+            Some(object) if has_sibling_key(object) => {
+                let kept = object.iter().filter(|(k, _)| !SIBLING_KEYS.contains(&k.as_str()));
+                let mut map = serializer.serialize_map(Some(kept.clone().count()))?;
+                for (k, v) in kept {
+                    map.serialize_entry(k, v)?;
+                }
+                map.end()
             }
             _ => self.0.serialize(serializer),
         }
@@ -396,7 +459,9 @@ impl Serialize for StoredMessages<'_> {
 fn stored_value(message: &serde_json::Value) -> serde_json::Value {
     let mut message = message.clone();
     if let Some(object) = message.as_object_mut() {
-        object.remove(MESSAGE_TURN_KEY);
+        for key in SIBLING_KEYS {
+            object.remove(key);
+        }
     }
     message
 }
@@ -422,6 +487,34 @@ fn turns_hash(messages: &[SharedMessage]) -> std::io::Result<Option<String>> {
     Ok(Some(format!("{:x}", Sha256::digest(&bytes))))
 }
 
+/// `(index, time)` of every timed message, in order.
+fn message_times(messages: &[SharedMessage]) -> Vec<(usize, &str)> {
+    messages
+        .iter()
+        .enumerate()
+        .filter_map(|(i, m)| message_time(m).map(|ts| (i, ts)))
+        .collect()
+}
+
+/// Like [`turns_hash`], for message times: a time added to (or changed on)
+/// an already-saved message forces a snapshot instead of an append that a
+/// replay would apply to a base without it. `None` = no times.
+fn times_hash(messages: &[SharedMessage]) -> std::io::Result<Option<String>> {
+    use sha2::{Digest, Sha256};
+    let times = message_times(messages);
+    if times.is_empty() {
+        return Ok(None);
+    }
+    let bytes = serde_json::to_vec(&times).map_err(std::io::Error::other)?;
+    Ok(Some(format!("{:x}", Sha256::digest(&bytes))))
+}
+
+fn set_message_time(message: &mut serde_json::Value, ts: String) {
+    if let Some(object) = message.as_object_mut() {
+        object.insert(MESSAGE_AT_KEY.into(), serde_json::Value::String(ts));
+    }
+}
+
 fn set_turn_id(message: &mut serde_json::Value, id: String) {
     if let Some(object) = message.as_object_mut() {
         object.insert(MESSAGE_TURN_KEY.into(), serde_json::json!({ "id": id }));
@@ -432,6 +525,10 @@ fn is_zero_cost(v: &f64) -> bool {
     *v == 0.0
 }
 
+fn is_zero_tokens(v: &u64) -> bool {
+    *v == 0
+}
+
 /// `Session` fields that live ONLY in the `.json` snapshot and are never
 /// journaled. `SessionMeta` is `deny_unknown_fields` in every shipped build
 /// (0.10.1 included): a new field in a meta record makes those builds read
@@ -439,7 +536,12 @@ fn is_zero_cost(v: &f64) -> bool {
 /// journal with that truncation on the next save. The snapshot `Session`
 /// tolerates unknown fields, so new metadata goes there instead.
 #[cfg_attr(not(test), allow(dead_code))]
-const SNAPSHOT_ONLY_FIELDS: &[&str] = &["keepwarm_cost", "keepwarm_tokens"];
+const SNAPSHOT_ONLY_FIELDS: &[&str] = &[
+    "keepwarm_cost",
+    "keepwarm_tokens",
+    "total_cache_read_tokens",
+    "total_cache_creation_tokens",
+];
 
 /// Mirror of [`Session`] WITHOUT `api_messages` and the
 /// [`SNAPSHOT_ONLY_FIELDS`], with identical serde attributes.
@@ -540,6 +642,44 @@ struct SnapshotBinding {
     /// leniently by [`stored_turn_ids`]: it is best-effort metadata.
     #[serde(default, rename = "_turn_ids")]
     turn_ids: serde_json::Value,
+    /// Same placement and leniency as `_turn_ids` ([`stored_message_times`]).
+    #[serde(default, rename = "_message_times")]
+    message_times: serde_json::Value,
+}
+
+/// Well-formed `[index, RFC 3339 time]` entries of a snapshot's
+/// `_message_times`. Anything else is dropped with a warning: the message
+/// then simply shows no time.
+fn stored_message_times(value: serde_json::Value) -> Vec<(usize, String)> {
+    let entries = match value {
+        serde_json::Value::Null => return Vec::new(),
+        serde_json::Value::Array(entries) => entries,
+        _ => {
+            tracing::warn!("session snapshot has a malformed _message_times; times dropped");
+            return Vec::new();
+        }
+    };
+    let total = entries.len();
+    let times: Vec<(usize, String)> = entries
+        .into_iter()
+        .filter_map(|entry| serde_json::from_value::<(usize, String)>(entry).ok())
+        .filter(|(_, ts)| valid_time(ts))
+        .collect();
+    if times.len() != total {
+        tracing::warn!(dropped = total - times.len(), "malformed _message_times entries dropped");
+    }
+    times
+}
+
+/// A journal `at`: kept only when it is an RFC 3339 string.
+fn journal_time(at: Option<serde_json::Value>) -> Option<String> {
+    match at? {
+        serde_json::Value::String(ts) if valid_time(&ts) => Some(ts),
+        _ => {
+            tracing::warn!("malformed journal message time dropped");
+            None
+        }
+    }
 }
 
 /// Well-formed `[index, id]` entries of a snapshot's `_turn_ids`. Anything
@@ -620,6 +760,7 @@ struct JournalState {
     durable_len: usize,
     history_hash: String,
     turns_hash: Option<String>,
+    times_hash: Option<String>,
     bytes: u64,
 }
 
@@ -651,6 +792,7 @@ fn read_journal_state(
         base,
         history_hash: Some(mut hash),
         turns_hash: mut turns,
+        times_hash: mut times,
         ..
     } = open
     else {
@@ -670,12 +812,14 @@ fn read_journal_state(
                 meta,
                 history_hash: Some(next_hash),
                 turns_hash: next_turns,
+                times_hash: next_times,
             }) if v == JOURNAL_SCHEMA_VERSION
                 && meta.id == id
                 && meta.message_count == Some(durable_len) =>
             {
                 hash = next_hash;
                 turns = next_turns;
+                times = next_times;
                 hashed_len = durable_len;
             }
             _ => return Ok(None),
@@ -688,6 +832,7 @@ fn read_journal_state(
         durable_len,
         history_hash: hash,
         turns_hash: turns,
+        times_hash: times,
         bytes: raw.len() as u64,
     }))
 }
@@ -738,11 +883,10 @@ pub fn save_session_durable_in_dir(
     }
     #[cfg(not(unix))]
     {
-        let _ = (dir, session, mode);
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "durable session checkpoints require Unix directory fsync",
-        ))
+        // The file is fsynced before its rename; see `sync_sessions_dir`
+        // for the directory step.
+        let handle = create_sessions_dir(dir)?;
+        publish_snapshot(&handle, session, mode, true, true)
     }
 }
 
@@ -768,6 +912,7 @@ fn save_journal_mode(
     if session.api_messages.len() < state.durable_len
         || history_hash(&session.api_messages[..state.durable_len])? != state.history_hash
         || turns_hash(&session.api_messages[..state.durable_len])? != state.turns_hash
+        || times_hash(&session.api_messages[..state.durable_len])? != state.times_hash
     {
         return full_snapshot_reset(handle, session);
     }
@@ -780,6 +925,7 @@ fn save_journal_mode(
             i: state.durable_len + offset,
             m: stored_value(msg),
             t: message_turn_id(msg).map(serde_json::Value::from),
+            at: message_time(msg).map(serde_json::Value::from),
         };
         serde_json::to_writer(&mut buf, &record).map_err(std::io::Error::other)?;
         buf.push(b'\n');
@@ -789,6 +935,7 @@ fn save_journal_mode(
         meta: Box::new(SessionMeta::of(session)),
         history_hash: Some(history_hash(&session.api_messages)?),
         turns_hash: turns_hash(&session.api_messages)?,
+        times_hash: times_hash(&session.api_messages)?,
     };
     serde_json::to_writer(&mut buf, &meta).map_err(std::io::Error::other)?;
     buf.push(b'\n');
@@ -844,6 +991,10 @@ struct SessionSnapshotRef<'a> {
     keepwarm_cost: f64,
     #[serde(skip_serializing_if = "KeepwarmTokens::is_zero")]
     keepwarm_tokens: KeepwarmTokens,
+    #[serde(skip_serializing_if = "is_zero_tokens")]
+    total_cache_read_tokens: u64,
+    #[serde(skip_serializing_if = "is_zero_tokens")]
+    total_cache_creation_tokens: u64,
     message_count: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     parent_session: &'a Option<String>,
@@ -865,6 +1016,9 @@ struct SessionSnapshotRef<'a> {
     /// Storage-only, like `_journal_generation`: `Session` ignores it.
     #[serde(rename = "_turn_ids", skip_serializing_if = "Vec::is_empty")]
     turn_ids: Vec<(usize, &'a str)>,
+    /// Storage-only too: each message's recorded time, beside it.
+    #[serde(rename = "_message_times", skip_serializing_if = "Vec::is_empty")]
+    message_times: Vec<(usize, &'a str)>,
 }
 
 impl<'a> SessionSnapshotRef<'a> {
@@ -884,6 +1038,8 @@ impl<'a> SessionSnapshotRef<'a> {
             session_cost: s.session_cost,
             keepwarm_cost: s.keepwarm_cost,
             keepwarm_tokens: s.keepwarm_tokens,
+            total_cache_read_tokens: s.total_cache_read_tokens,
+            total_cache_creation_tokens: s.total_cache_creation_tokens,
             message_count: s.api_messages.len(),
             parent_session: &s.parent_session,
             compacted_into: &s.compacted_into,
@@ -894,6 +1050,7 @@ impl<'a> SessionSnapshotRef<'a> {
             prompt_provenance: &s.prompt_provenance,
             compaction: &s.compaction,
             turn_ids: turn_ids(&s.api_messages),
+            message_times: message_times(&s.api_messages),
         }
     }
 }
@@ -945,6 +1102,7 @@ fn publish_snapshot(
             generation,
             history_hash: Some(history_hash(&session.api_messages)?),
             turns_hash: turns_hash(&session.api_messages)?,
+            times_hash: times_hash(&session.api_messages)?,
         };
         serde_json::to_writer(&mut journal, &open).map_err(std::io::Error::other)?;
         journal.push(b'\n');
@@ -979,13 +1137,16 @@ fn sync_sessions_dir(handle: &SessionsDirHandle) -> std::io::Result<()> {
     {
         handle.sync_all()
     }
+    // Windows has no directory fsync: a directory can't be opened for
+    // `FlushFileBuffers`, and NTFS journals the rename's metadata itself.
+    // Each file was fsynced before its rename. PostgreSQL makes the same
+    // call there. Refusing instead failed every durable save, so a rename,
+    // and a compaction or rollover's context-head save, which then blocks
+    // the session until it is reloaded.
     #[cfg(not(unix))]
     {
         let _ = handle;
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "durable session checkpoints require Unix directory fsync",
-        ))
+        Ok(())
     }
 }
 
@@ -1019,6 +1180,11 @@ pub fn load_session_in_dir(dir: &Path, id: &str) -> std::io::Result<Session> {
             set_turn_id(std::sync::Arc::make_mut(message), id);
         }
     }
+    for (i, ts) in stored_message_times(binding.message_times) {
+        if let Some(message) = session.api_messages.get_mut(i) {
+            set_message_time(std::sync::Arc::make_mut(message), ts);
+        }
+    }
 
     let Some(raw) = read_artifact_bytes(&handle, &format!("{id}.journal"))? else {
         return Ok(session);
@@ -1041,10 +1207,13 @@ pub fn load_session_in_dir(dir: &Path, id: &str) -> std::io::Result<Session> {
             {
                 break;
             }
-            Ok(JournalRecord::Msg { i, mut m, t, .. }) => {
+            Ok(JournalRecord::Msg { i, mut m, t, at, .. }) => {
                 if i == session.api_messages.len() {
                     if let Some(serde_json::Value::String(id)) = t {
                         set_turn_id(&mut m, id);
+                    }
+                    if let Some(ts) = journal_time(at) {
+                        set_message_time(&mut m, ts);
                     }
                     session.api_messages.push(std::sync::Arc::new(m));
                 } else if i > session.api_messages.len() {
@@ -1460,6 +1629,7 @@ mod tests {
             generation: None,
             history_hash: None,
             turns_hash: None,
+            times_hash: None,
         }];
         for i in 1..5 {
             push_message(&mut s, "legacy delta");
@@ -1468,6 +1638,7 @@ mod tests {
                 i,
                 m: s.api_messages[i].as_ref().clone(),
                 t: None,
+                at: None,
             });
         }
         s.title = "legacy title".into();
@@ -1477,6 +1648,7 @@ mod tests {
             meta: Box::new(SessionMeta::of(&s)),
             history_hash: None,
             turns_hash: None,
+            times_hash: None,
         });
         let mut bytes = Vec::new();
         for record in legacy {
@@ -1930,6 +2102,8 @@ mod snapshot_only_fields {
         s.keepwarm_cost = 0.5;
         s.keepwarm_tokens.input = 5;
         s.keepwarm_tokens.cache_read = 1_000;
+        s.total_cache_read_tokens = 2_000;
+        s.total_cache_creation_tokens = 300;
         // First save publishes the snapshot; the next two append deltas
         // (messages + meta records carrying every non-zero field).
         save_session_in_dir(&dir, &s, SessionPersistence::Journal).unwrap();
@@ -1939,6 +2113,7 @@ mod snapshot_only_fields {
             ));
             s.session_cost += 0.25;
             s.keepwarm_cost += 0.125;
+            s.total_cache_read_tokens += 1_000;
             let receipt = save_session_in_dir(&dir, &s, SessionPersistence::Journal).unwrap();
             assert!(matches!(receipt.mode, SaveMode::Append { .. }));
         }
@@ -1954,6 +2129,10 @@ mod snapshot_only_fields {
                 !line.contains("keepwarm"),
                 "journaled a snapshot-only field: {line}"
             );
+            assert!(
+                !line.contains("total_cache_"),
+                "journaled a snapshot-only field: {line}"
+            );
         }
         assert_eq!(metas, 2);
         // And this build still reads back the full history, with the
@@ -1962,6 +2141,46 @@ mod snapshot_only_fields {
         assert_eq!(loaded.api_messages.len(), 3);
         assert_eq!(loaded.session_cost, 1.5);
         assert_eq!(loaded.keepwarm_cost, 0.5);
+        assert_eq!(loaded.total_cache_read_tokens, 2_000);
+        assert_eq!(loaded.total_cache_creation_tokens, 300);
+    }
+
+    /// The cache read/write totals persist with the session, so a daemon
+    /// reload or a resume keeps the footer's session cache hit rate instead
+    /// of restarting it at the first (usually missed) request. Both modes;
+    /// journal mode publishes a snapshot on the first save.
+    #[test]
+    fn cache_totals_survive_save_and_load() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("sessions");
+        for persistence in [SessionPersistence::Json, SessionPersistence::Journal] {
+            let mut s = Session::new("m", "medium", None);
+            s.api_messages.push(std::sync::Arc::new(
+                serde_json::json!({"role": "user", "content": "q"}),
+            ));
+            s.total_input_tokens = 100;
+            s.total_output_tokens = 10;
+            s.total_cache_read_tokens = 85_679;
+            s.total_cache_creation_tokens = 6_250;
+            save_session_in_dir(&dir, &s, persistence).unwrap();
+            let loaded = load_session_in_dir(&dir, &s.id).unwrap();
+            assert_eq!(loaded.total_cache_read_tokens, 85_679, "{persistence:?}");
+            assert_eq!(loaded.total_cache_creation_tokens, 6_250, "{persistence:?}");
+            assert_eq!(loaded.total_input_tokens, 100, "{persistence:?}");
+        }
+    }
+
+    /// Zero cache totals are not written, and a snapshot saved before the
+    /// fields existed loads them as 0.
+    #[test]
+    fn cache_totals_are_optional_in_the_snapshot() {
+        let s = Session::new("m", "medium", None);
+        let value = serde_json::to_value(&s).unwrap();
+        assert!(value.get("total_cache_read_tokens").is_none());
+        assert!(value.get("total_cache_creation_tokens").is_none());
+        let legacy: Session = serde_json::from_value(value).unwrap();
+        assert_eq!(legacy.total_cache_read_tokens, 0);
+        assert_eq!(legacy.total_cache_creation_tokens, 0);
     }
 
     #[test]
@@ -1996,7 +2215,7 @@ mod snapshot_only_fields {
     fn assert_no_host_keys(m: &serde_json::Value, ctx: &str) {
         let keys: Vec<_> = m
             .as_object()
-            .map(|o| o.keys().filter(|k| k.starts_with("_synaps_turn")).cloned().collect())
+            .map(|o| o.keys().filter(|k| k.starts_with("_synaps_")).cloned().collect())
             .unwrap_or_default();
         assert!(keys.is_empty(), "{ctx}: persisted message carries {keys:?}: {m}");
     }
@@ -2232,5 +2451,137 @@ mod snapshot_only_fields {
                 "{bad}: valid entries survive"
             );
         }
+    }
+
+    // ── message times stay out of persisted message objects ───────────────
+
+    fn timed(text: &str, ts: &str) -> SharedMessage {
+        std::sync::Arc::new(serde_json::json!({
+            "role": "user", "content": text, MESSAGE_AT_KEY: ts
+        }))
+    }
+
+    const T1: &str = "2026-10-25T05:47:00Z";
+    const T2: &str = "2026-10-25T05:48:30Z";
+
+    #[test]
+    fn message_times_round_trip_beside_messages_not_inside_them() {
+        for mode in [SessionPersistence::Json, SessionPersistence::Journal] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let dir = tmp.path().join("sessions");
+            let mut s = Session::new("m", "medium", None);
+            let mut first = (*timed("first", T1)).clone();
+            first[MESSAGE_TURN_KEY] = serde_json::json!({"id": "t-1"});
+            s.api_messages.push(std::sync::Arc::new(first));
+            push_message(&mut s, "legacy reply, no time");
+            save_session_in_dir(&dir, &s, mode).unwrap();
+            s.api_messages.push(timed("second", T2));
+            let receipt = save_session_in_dir(&dir, &s, mode).unwrap();
+            if mode == SessionPersistence::Journal {
+                assert!(matches!(receipt.mode, SaveMode::Append { messages: 1 }));
+                let raw = std::fs::read_to_string(journal_path(&dir, &s.id)).unwrap();
+                assert!(raw.contains(&format!(r#""at":"{T2}""#)), "{raw}");
+            } else {
+                let raw = std::fs::read_to_string(dir.join(format!("{}.json", s.id))).unwrap();
+                assert!(raw.contains(&format!(r#""_message_times":[[0,"{T1}"],[2,"{T2}"]]"#)), "{raw}");
+            }
+            let (old, hash) = old_reader_view(&dir, &s.id);
+            assert_eq!(old.len(), 3, "{mode:?}");
+            for m in &old {
+                assert_no_host_keys(m, &format!("{mode:?}"));
+            }
+            if mode == SessionPersistence::Journal {
+                let old: Vec<SharedMessage> = old.into_iter().map(std::sync::Arc::new).collect();
+                assert_eq!(hash, Some(history_hash(&old).unwrap()), "{mode:?}");
+            }
+            let loaded = load_session_in_dir(&dir, &s.id).unwrap();
+            assert_eq!(
+                serde_json::to_value(&loaded.api_messages).unwrap(),
+                serde_json::to_value(&s.api_messages).unwrap(),
+                "{mode:?}"
+            );
+            let times: Vec<_> = loaded.api_messages.iter().map(|m| message_time(m)).collect();
+            assert_eq!(times, vec![Some(T1), None, Some(T2)], "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn stamping_an_already_saved_message_forces_a_snapshot() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("sessions");
+        let mut s = with_messages(2);
+        save_session_in_dir(&dir, &s, SessionPersistence::Journal).unwrap();
+        let mut late = (*s.api_messages[1]).clone();
+        late[MESSAGE_AT_KEY] = T1.into();
+        s.api_messages[1] = std::sync::Arc::new(late);
+        let receipt = save_session_in_dir(&dir, &s, SessionPersistence::Journal).unwrap();
+        assert!(matches!(receipt.mode, SaveMode::FullSnapshot), "{:?}", receipt.mode);
+        let loaded = load_session_in_dir(&dir, &s.id).unwrap();
+        assert_eq!(message_time(&loaded.api_messages[1]), Some(T1));
+        // Unchanged times keep appending.
+        let mut s = loaded;
+        s.api_messages.push(timed("next", T2));
+        let receipt = save_session_in_dir(&dir, &s, SessionPersistence::Journal).unwrap();
+        assert!(matches!(receipt.mode, SaveMode::Append { messages: 1 }), "{:?}", receipt.mode);
+    }
+
+    #[test]
+    fn a_session_saved_without_times_loads_unchanged() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("sessions");
+        let mut s = with_messages(2);
+        save_session_in_dir(&dir, &s, SessionPersistence::Journal).unwrap();
+        push_message(&mut s, "delta");
+        save_session_in_dir(&dir, &s, SessionPersistence::Journal).unwrap();
+        let snap = std::fs::read_to_string(dir.join(format!("{}.json", s.id))).unwrap();
+        let journal = std::fs::read_to_string(journal_path(&dir, &s.id)).unwrap();
+        assert!(!snap.contains("_message_times") && !journal.contains("times_hash"));
+        assert!(!journal.contains(r#""at":"#));
+        let loaded = load_session_in_dir(&dir, &s.id).unwrap();
+        assert_eq!(
+            serde_json::to_value(&loaded.api_messages).unwrap(),
+            serde_json::to_value(&s.api_messages).unwrap()
+        );
+        assert!(loaded.api_messages.iter().all(|m| message_time(m).is_none()));
+    }
+
+    #[test]
+    fn malformed_message_times_are_dropped_not_fatal() {
+        for bad in [
+            serde_json::json!("garbage"),
+            serde_json::json!([[0, T1], [1, "not a time"], ["x", T2], [99, T2], 7]),
+        ] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let dir = tmp.path().join("sessions");
+            let mut s = Session::new("m", "medium", None);
+            s.api_messages.push(timed("first", T1));
+            push_message(&mut s, "reply");
+            save_session_in_dir(&dir, &s, SessionPersistence::Json).unwrap();
+            let path = dir.join(format!("{}.json", s.id));
+            let mut snap: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            snap["_message_times"] = bad.clone();
+            std::fs::write(&path, snap.to_string()).unwrap();
+            let loaded = load_session_in_dir(&dir, &s.id)
+                .unwrap_or_else(|e| panic!("{bad}: session not loadable: {e}"));
+            assert_eq!(loaded.api_messages.len(), 2, "{bad}");
+            let well_formed = bad.as_array().is_some();
+            assert_eq!(message_time(&loaded.api_messages[0]), well_formed.then_some(T1), "{bad}");
+            assert_eq!(message_time(&loaded.api_messages[1]), None, "{bad}");
+        }
+        // Journal: a bad `at` drops the time, replay continues.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("sessions");
+        let mut s = with_messages(1);
+        save_session_in_dir(&dir, &s, SessionPersistence::Journal).unwrap();
+        s.api_messages.push(timed("second", T2));
+        push_message(&mut s, "third");
+        save_session_in_dir(&dir, &s, SessionPersistence::Journal).unwrap();
+        let path = journal_path(&dir, &s.id);
+        let raw = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, raw.replace(&format!(r#""at":"{T2}""#), r#""at":{"bad":1}"#)).unwrap();
+        let loaded = load_session_in_dir(&dir, &s.id).unwrap();
+        assert_eq!(loaded.api_messages.len(), 3, "replay continued past the bad time");
+        assert_eq!(message_time(&loaded.api_messages[1]), None);
     }
 }

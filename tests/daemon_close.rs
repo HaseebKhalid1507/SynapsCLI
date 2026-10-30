@@ -321,12 +321,12 @@ async fn close_unknown_session_is_refused_and_the_connection_closes() {
 
 // ── raw-socket client for the pump-loop refusal ──────────────────────────────
 
-async fn write_frame(w: &mut tokio::net::unix::OwnedWriteHalf, f: &ClientFrame) {
+async fn write_frame(w: &mut agent_engine::ipc::ClientWriteHalf, f: &ClientFrame) {
     w.write_all(encode_line(f).unwrap().as_bytes()).await.unwrap();
 }
 
 async fn read_until<T>(
-    lines: &mut tokio::io::Lines<tokio::io::BufReader<tokio::net::unix::OwnedReadHalf>>,
+    lines: &mut tokio::io::Lines<tokio::io::BufReader<agent_engine::ipc::ClientReadHalf>>,
     mut pick: impl FnMut(DaemonFrame) -> Option<T>,
 ) -> T {
     loop {
@@ -350,7 +350,7 @@ async fn close_on_an_attached_connection_is_refused_as_a_control_frame() {
     let (d, _hits) = boot(&guard, Script::Sse(ANTHROPIC_SSE), "never").await;
     let sock = d.paths.sock.clone();
 
-    let (r, mut w) = tokio::net::UnixStream::connect(&sock).await.unwrap().into_split();
+    let (r, mut w) = agent_engine::ipc::split_client(agent_engine::ipc::connect(&sock).await.unwrap());
     let mut lines = tokio::io::BufReader::new(r).lines();
     write_frame(&mut w, &ClientFrame::Hello(Hello::new(ClientKind::Test))).await;
     read_until(&mut lines, |f| matches!(f, DaemonFrame::Welcome(_)).then_some(())).await;
@@ -414,7 +414,7 @@ async fn an_owner_whose_socket_is_backed_up_still_gets_ended_before_eof() {
     let (d, _hits) = boot(&guard, Script::Sse(many_deltas_sse(3000)), "never").await;
     let sock = d.paths.sock.clone();
 
-    let (r, mut w) = tokio::net::UnixStream::connect(&sock).await.unwrap().into_split();
+    let (r, mut w) = agent_engine::ipc::split_client(agent_engine::ipc::connect(&sock).await.unwrap());
     let mut lines = tokio::io::BufReader::new(r).lines();
     write_frame(&mut w, &ClientFrame::Hello(Hello::new(ClientKind::Test))).await;
     read_until(&mut lines, |f| matches!(f, DaemonFrame::Welcome(_)).then_some(())).await;

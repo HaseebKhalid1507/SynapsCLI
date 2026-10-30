@@ -7,6 +7,7 @@
 //! comes from the handle's pin cell, which the actor writes when it applies
 //! the command; no reply event to match.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use super::DaemonState;
@@ -23,13 +24,23 @@ const PIN_POLL: Duration = Duration::from_millis(20);
 
 /// Serve `Pin{session_id, on}`. Always answers with one frame: `Pinned`,
 /// `Refused{Busy|UnknownSession}` or `Error`.
-pub async fn pin_session(state: &DaemonState, id: &SessionId, on: bool) -> DaemonFrame {
+pub async fn pin_session(state: &Arc<DaemonState>, id: &SessionId, on: bool) -> DaemonFrame {
     // The actor's reload fence swallows a host command, so the pin would
     // never land.
     if state.reloading.load(std::sync::atomic::Ordering::SeqCst) {
         return DaemonFrame::Refused { reason: RefuseReason::Busy, message: "daemon reloading; retry in a moment".into() };
     }
-    let Some(handle) = state.attach(id) else {
+    // A pin that is not live here (waiting, failed, not restored yet, or a
+    // lock placeholder): `--off` clears its entry, on restores it now.
+    let live = state.attach(id);
+    if live.as_ref().is_none_or(|h| h.meta().locked_by.is_some() && !on) {
+        match super::pins::pin_offline(state, id.as_str(), on).await {
+            Some(Ok(())) => return DaemonFrame::Pinned { session_id: id.clone(), on },
+            Some(Err(message)) => return DaemonFrame::Error { session_id: Some(id.clone()), message },
+            None => {}
+        }
+    }
+    let Some(handle) = live else {
         return DaemonFrame::Refused { reason: RefuseReason::UnknownSession, message: format!("no live session {id}") };
     };
     let sid = handle.id.clone();

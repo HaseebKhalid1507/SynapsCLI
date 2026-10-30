@@ -12,7 +12,7 @@ pub(crate) use input::{handle_event, InputOutcome};
 
 use crate::tui::focus::FocusRing;
 
-const BUILTIN_THEMES: &[&str] = &[
+pub(crate) const BUILTIN_THEMES: &[&str] = &[
     "default",
     "night-city",
     "neon-rain",

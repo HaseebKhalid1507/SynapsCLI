@@ -37,7 +37,8 @@ pub(super) struct RequestBody<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     diagnostics: Option<super::cache_diagnosis::DiagnosticsParam>,
     max_tokens: u64,
-    messages: &'a [SharedMessage],
+    /// Host `_synaps_*` keys are dropped here, while serializing.
+    messages: super::continuation::WireMessages<'a>,
     model: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     output_config: Option<Value>,
@@ -125,7 +126,7 @@ impl<'a> RequestBody<'a> {
         Self {
             diagnostics: None,
             max_tokens: HelperMethods::max_tokens_for_model(model),
-            messages,
+            messages: super::continuation::WireMessages(messages),
             model,
             output_config,
             stream: if stream { Some(true) } else { None },
@@ -202,8 +203,8 @@ impl<'a> RequestBody<'a> {
         sep(&mut h);
         let _ = serde_json::to_writer(&mut h, &self.tools);
         sep(&mut h);
-        let n = history_len.min(self.messages.len());
-        let _ = serde_json::to_writer(&mut h, &self.messages[..n]);
+        let n = history_len.min(self.messages.0.len());
+        let _ = serde_json::to_writer(&mut h, &super::continuation::WireMessages(&self.messages.0[..n]));
         sep(&mut h);
         let _ = serde_json::to_writer(&mut h, &beta);
         h.0

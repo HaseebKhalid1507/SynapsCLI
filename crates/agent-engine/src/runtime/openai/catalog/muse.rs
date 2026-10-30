@@ -316,7 +316,7 @@ pub fn parse_muse_catalog_models(body: &str) -> Result<Vec<CatalogModel>, String
         let text_output = modalities
             .output
             .as_ref()
-            .map_or(true, |out| out.iter().any(|m| m == "text"));
+            .is_none_or(|out| out.iter().any(|m| m == "text"));
         if row.visibility.as_deref() == Some("hidden")
             || meta.is_hidden == Some(true)
             || !text_output

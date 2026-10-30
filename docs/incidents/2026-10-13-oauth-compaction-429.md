@@ -1,6 +1,6 @@
 # Incident 2026-10-13: OAuth compaction fails with HTTP 429
 
-**Status:** fix proposed in `fix/compaction-oauth-transport-identity`.
+**Status:** fixed in #220 (merge `3dc9970d`), released in 0.11.0.
 **Affected:** remote compaction (`/compact`, auto-compaction) on Anthropic
 OAuth logins whose config does not override `identity`. Every release through
 0.10.2. Code references are to `dev` at `ae490b32`.

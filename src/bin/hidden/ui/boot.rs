@@ -93,7 +93,7 @@ pub fn draw_boot(f: &mut Frame, app: &App, area: Rect) {
             theme::DARK_GRAY
         } else if line.contains("Press any") {
             // Blink
-            if (app.frame / 30) % 2 == 0 {
+            if (app.frame / 30).is_multiple_of(2) {
                 theme::GREEN
             } else {
                 theme::BG
@@ -104,7 +104,7 @@ pub fn draw_boot(f: &mut Frame, app: &App, area: Rect) {
             let dot_str: String = "."
                 .repeat(dots)
                 .chars()
-                .chain(std::iter::repeat(' ').take(3 - dots))
+                .chain(std::iter::repeat_n(' ', 3 - dots))
                 .collect();
             let animated = line.replace("...", &dot_str);
             // Draw manually with animation
@@ -147,7 +147,7 @@ pub fn draw_boot(f: &mut Frame, app: &App, area: Rect) {
         let cursor_y = area.top() + lines_to_show as u16 + 1;
         if cursor_y < area.bottom() {
             let cursor_x = area.left() + 2;
-            if (app.frame / 15) % 2 == 0 {
+            if (app.frame / 15).is_multiple_of(2) {
                 buf[(cursor_x, cursor_y)].set_char('█').set_fg(theme::AMBER);
             }
         }

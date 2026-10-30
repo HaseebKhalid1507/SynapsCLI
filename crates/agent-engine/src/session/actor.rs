@@ -337,6 +337,12 @@ fn replay_setting(rt: &mut Runtime, setting: &SessionSetting) {
 pub(crate) struct AttachedClient {
     pub(crate) meta: ClientMeta,
     pub(crate) mode: AttachMode,
+    /// Resolved at attach ([`resolve_client_name`]); unique in the session.
+    pub(crate) name: String,
+    /// Unix ms.
+    pub(crate) attached_at_ms: u64,
+    /// `SessionActor::input_seq` at this client's last input; 0 = none yet.
+    pub(crate) last_input: u64,
 }
 
 /// B2: a spawned `compact_conversation` (§2.5).
@@ -456,15 +462,25 @@ pub(crate) fn subagent_close_cancel_event(
 
 /// `KeepWarm{on: true}`'s notice (`/pin on`, `daemon pin`, `--keep-warm`).
 pub const PIN_ON_NOTICE: &str = "pinned: this session stays loaded (never parked or idle-ended, \
-     and the daemon will not idle-exit while it is pinned). /pin off to undo.";
+     and the daemon will not idle-exit while it is pinned) and comes back after daemon restarts. \
+     /pin off to undo.";
 /// `KeepWarm{on: false}`'s notice.
-pub const PIN_OFF_NOTICE: &str = "unpinned: this session parks again when idle";
+pub const PIN_OFF_NOTICE: &str = "unpinned: this session parks again when idle and won't come back after a restart";
 
 /// The engine command behind `/close` (`SessionActor::close_command`).
 pub(crate) const CLOSE_COMMAND: &str = "close";
 
 fn is_close_command(cmd: &SessionCommand) -> bool {
     matches!(cmd, SessionCommand::EngineCommand { name, .. } if name == CLOSE_COMMAND)
+}
+
+/// The host-only engine command behind `synaps daemon rename`
+/// (`SessionActor::host_rename`; JSON args, `RenameArgs`). Clients rename
+/// with `saveas`.
+pub(crate) const RENAME_COMMAND: &str = "rename";
+
+fn is_rename_command(cmd: &SessionCommand) -> bool {
+    matches!(cmd, SessionCommand::EngineCommand { name, .. } if name == RENAME_COMMAND)
 }
 
 fn command_name(cmd: &SessionCommand) -> &'static str {
@@ -485,15 +501,18 @@ fn command_name(cmd: &SessionCommand) -> &'static str {
         SessionCommand::End { .. } => "end",
         SessionCommand::Resync { .. } => "resync",
         SessionCommand::EngineCommand { name, .. } if name == CLOSE_COMMAND => "close",
+        SessionCommand::EngineCommand { name, .. } if name == RENAME_COMMAND => "rename",
         SessionCommand::EngineCommand { .. } => "engine_command",
         SessionCommand::PluginCommand { .. } => "plugin_command",
         SessionCommand::Resume { .. } => "resume",
         SessionCommand::Checkpoint { .. } => "checkpoint",
         SessionCommand::KeepWarm { .. } => "keep_warm",
+        SessionCommand::TakeInput => "take_input",
         SessionCommand::Park => "park",
         SessionCommand::AdoptWorkers { .. } => "adopt_workers",
         SessionCommand::RestoreToolActivations { .. } => "restore_tool_activations",
         SessionCommand::ReloadAborted => "reload_aborted",
+        SessionCommand::ArmPark => "arm_park",
         SessionCommand::HostEvent(_) => "host_event",
         SessionCommand::DriverStart { .. } => "driver_start",
     }
@@ -542,6 +561,9 @@ pub struct SessionActor {
     pub(crate) owner_steer_budget: Option<Arc<crate::runtime::budget::OwnerSteerBudget>>,
     pub(crate) streaming: bool,
     pub(crate) turn_baseline: usize,
+    /// Stamps each message appended to `conv.api_messages` with its time
+    /// (`_synaps_at`); what was loaded is settled and never stamped.
+    pub(crate) message_stamper: crate::runtime::message_time::Stamper,
     pub(crate) consecutive_auto_turns: u32,
     /// Formatted events `on_queue_wake` steered into this turn's stream
     /// that the engine has not acknowledged (`SteeringDelivered`) yet. On
@@ -576,8 +598,13 @@ pub struct SessionActor {
     pub(crate) view: Arc<arc_swap::ArcSwap<RuntimeView>>,
     pub(crate) attached: HashMap<ClientId, AttachedClient>,
     /// B1: the one client whose input commands are honoured (`None` = any
-    /// host-originated sender only).
+    /// host-originated sender only). With `client_input = shared` it is the
+    /// *active* client: the drive client that sent input last.
     pub(crate) input_owner: Option<ClientId>,
+    /// Who may drive (config `client_input`, or the create override).
+    pub(crate) client_input: ClientInput,
+    /// Bumped on each input from a client ([`AttachedClient::last_input`]).
+    pub(crate) input_seq: u64,
     pub(crate) next_client_id: u64,
     pub(crate) seq: u64,
     pub(crate) turn_replay: VecDeque<Envelope>,
@@ -588,6 +615,9 @@ pub struct SessionActor {
     pub(crate) background: BackgroundTasks,
     /// B2: spawned compaction in flight (`busy` while `Some`).
     pub(crate) compact: Option<CompactionJob>,
+    /// `compact_inline` is running (it blocks the actor; listings still
+    /// see the session busy).
+    pub(crate) compacting_inline: bool,
     /// `on_session_start` for this session. `await_extensions=false`: a
     /// task waits for process-level discovery and its turn at the host's
     /// gate (one hook at a time), then calls it, so boot never blocks on
@@ -690,6 +720,7 @@ impl SessionActor {
             runtime.restore_session_memory_mode(mode);
         }
         let config: crate::SynapsConfig = (**host.config()).clone();
+        let client_input = cfg.client_input.unwrap_or(config.client_input);
 
         let mut sb = crate::engine::setup::resolve_session_and_prompt(
             &mut runtime,
@@ -781,6 +812,9 @@ impl SessionActor {
         if let Some(ref m) = cfg.model_override {
             runtime.set_model(m.clone());
         }
+        if let Some(clock) = &cfg.message_clock {
+            runtime.set_message_clock(clock.clone());
+        }
 
         // Shared-inbox files are for whoever is at a keyboard: the gate stays
         // shut until a client owns input (`publish_presence`), so a detached,
@@ -844,9 +878,18 @@ impl SessionActor {
             clients: 0,
             input_owner: None,
             awaiting_input: 0,
+            roster: Vec::new(),
+            client_input: Some(client_input),
             journal_id: sb.session.id.clone(),
             locked_by: None,
             pinned: cfg.keep_warm,
+            busy: false,
+            state_since: None,
+            park_due: None,
+            evict_due: None,
+            title: None,
+            cost_usd: 0.0,
+            messages: 0,
         };
         let mut conv = if sb.continued {
             ConversationState::from_resumed(sb.session)
@@ -862,6 +905,8 @@ impl SessionActor {
         if sb.continued && cfg.persist && session_lock.is_some() {
             crate::engine::setup::recover_turn_draft(&mut conv).await;
         }
+        // Loaded (and recovered) history keeps whatever times it carried.
+        let message_stamper = crate::runtime::message_time::Stamper::new(conv.api_messages.len());
 
         let view = RuntimeView::from_runtime(&runtime).await;
         let hook_bus = Arc::clone(runtime.hook_bus());
@@ -882,6 +927,15 @@ impl SessionActor {
                 memory_mode,
             },
         ) = SessionHandle::new(meta.clone(), view);
+        // The mode is fixed for the session: seed the listing with it now.
+        // Otherwise only a presence publish (attach, detach, input) carries
+        // it, so a session restored at reload, with no client back yet,
+        // listed as `owner=-`. Not `publish_presence()`: that also sets the
+        // inbox gate, which stays as `SessionHandle::new` left it.
+        presence.store(Arc::new(super::handle::Presence {
+            client_input: Some(client_input),
+            ..Default::default()
+        }));
         *memory_mode.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = cfg.memory_mode;
         let (sp_tx, secret_prompt_rx) = mpsc::unbounded_channel();
         let session_start = if cfg.await_extensions {
@@ -923,6 +977,7 @@ impl SessionActor {
             owner_steer_budget: None,
             streaming: false,
             turn_baseline: 0,
+            message_stamper,
             consecutive_auto_turns: 0,
             turn_steered_events: Vec::new(),
             turn_completion: None,
@@ -939,6 +994,8 @@ impl SessionActor {
             view,
             attached: HashMap::new(),
             input_owner: None,
+            client_input,
+            input_seq: 0,
             next_client_id: 1,
             seq: 0,
             turn_replay: VecDeque::new(),
@@ -946,6 +1003,7 @@ impl SessionActor {
             state: AttachState::Detached { running: false },
             background,
             compact: None,
+            compacting_inline: false,
             session_start,
             turn_awaiting_start: None,
             subagent_tick: None,
@@ -975,16 +1033,55 @@ impl SessionActor {
         };
         // Whether the build's grant (default or restored choice) took.
         actor.observe_memory();
+        if actor.keep_warm {
+            actor.note_pin();
+        }
         Ok((handle, SessionTask(actor)))
     }
 
     /// Publish `conv.session.name` to the handle (listings, `--continue
     /// <name>`) and rewrite this session's registry entry so `synaps send
     /// --session <name>` resolves the new name. Call after any rename.
+    /// Write the pin as it stands now to the daemon's pin book (no-op
+    /// in-process): the entry is added while pinned, dropped otherwise.
+    pub(crate) fn note_pin(&self) {
+        let Some(sink) = self.host.pin_sink() else { return };
+        let journal = (**self.journal_id.load()).clone();
+        if self.keep_warm {
+            let kw = self.cache_keepwarm.override_mode.map(|m| m.to_string());
+            sink.pinned(self.id.as_str(), &journal, self.conv.session.name.as_deref(), self.config.cwd.as_deref(), kw.as_deref());
+        } else {
+            sink.unpinned(self.id.as_str(), &journal);
+        }
+    }
+
+    /// Publish a new journal id; a pinned session's book entry follows it.
+    pub(crate) fn set_journal_id(&mut self, new_id: String) {
+        let old = self.journal_id.swap(Arc::new(new_id.clone()));
+        if self.keep_warm && *old != new_id {
+            if let Some(sink) = self.host.pin_sink() {
+                sink.moved(&old, &new_id);
+            }
+        }
+    }
+
     pub(crate) fn sync_name(&mut self) {
         let name = self.conv.session.name.clone();
+        self.mirror_name(name);
+    }
+
+    /// Publish a name the session now has on disk (or in memory): handle
+    /// and listing, the `run/<sid>.json` card, and a pinned session's book
+    /// entry (verbatim, so a cleared name stops resolving).
+    pub(crate) fn mirror_name(&mut self, name: Option<String>) {
         self.meta.name = name.clone();
         self.name.store(Arc::new(name.clone()));
+        if self.keep_warm {
+            if let Some(sink) = self.host.pin_sink() {
+                let journal = (**self.journal_id.load()).clone();
+                sink.renamed(&journal, name.as_deref());
+            }
+        }
         if let Err(e) = self.background.update_session_name(name.as_deref()) {
             tracing::warn!(session = %self.id, "registry name update failed: {e}");
         }
@@ -1057,8 +1154,21 @@ impl SessionActor {
     }
 
     pub(crate) fn emit_conversation(&mut self) {
+        self.stamp_new_messages();
         let snap = self.conv.snapshot(self.consecutive_auto_turns);
         self.emit(SessionEventWire::Conversation(snap));
+    }
+
+    /// Give every message appended since the last pass its time. Called
+    /// wherever history leaves the actor (turn start, save, clients), so a
+    /// message added outside a turn (events flushed at Done, notes,
+    /// interruption markers) is stamped too. O(new messages).
+    pub(crate) fn stamp_new_messages(&mut self) {
+        if !self.conv.is_live() || !self.runtime.is_live() {
+            return;
+        }
+        let clock = self.runtime.message_clock().clone();
+        self.message_stamper.stamp(&mut self.conv.api_messages, &clock);
     }
 
     pub(crate) async fn publish_view(&mut self) {
@@ -1073,6 +1183,7 @@ impl SessionActor {
         if !self.config.persist || !self.conv.is_live() {
             return;
         }
+        self.stamp_new_messages();
         let Some(session) = self.conv.prepare_save() else {
             return;
         };
@@ -1221,14 +1332,133 @@ impl SessionActor {
     /// Also the one place the inbox gate follows `input_owner`: every owner
     /// change (attach, detach, takeover) publishes presence. `Observe`
     /// clients never own input, so a keep-warm observer keeps it shut.
+    ///
+    /// Also the `/sessions` state: busy, `state_since` (restamped whenever
+    /// idle/busy/parked changes), the park / eviction deadline as wall
+    /// clock, and the conversation's title / cost / message count (kept as
+    /// last published while Parked). Every transition that moves them —
+    /// turn and compaction start/end, attach/detach, `rearm_park`,
+    /// park/unpark — ends in a publish; stream deltas do not.
     pub(crate) fn publish_presence(&self) {
+        use super::handle::{Presence, PresenceState};
         self.background
             .set_inbox_accepting(self.input_owner.is_some());
-        self.presence.store(Arc::new(super::handle::Presence {
+        let prev = self.presence.load();
+        let busy = self.busy() || self.compacting_inline;
+        let parked = self.is_parked();
+        let state = if parked {
+            PresenceState::Parked
+        } else if busy {
+            PresenceState::Busy
+        } else {
+            PresenceState::Idle
+        };
+        let now = chrono::Utc::now();
+        let state_since = match prev.state_since {
+            Some(t) if prev.state == state => Some(t),
+            _ => Some(now),
+        };
+        let wall = |at: tokio::time::Instant| {
+            let left = at.saturating_duration_since(tokio::time::Instant::now());
+            chrono::Duration::from_std(left)
+                .ok()
+                .and_then(|d| now.checked_add_signed(d))
+        };
+        // A worker re-check is not a park (it only looks again), nor is a
+        // grace that workers now hold: its firing would only re-check. The
+        // F18 idle end of a zero-turn session counts — it leaves Live too.
+        let park_due = self
+            .park_deadline
+            .filter(|d| !parked && Some(*d) != self.park_recheck_at)
+            .filter(|_| self.can_end_idle() || self.can_park())
+            .and_then(wall);
+        let evict_due = self.park_deadline.filter(|_| parked).and_then(wall);
+        let (title, cost_usd, messages) = if self.conv.is_live() {
+            (
+                conversation_title(&self.conv),
+                self.conv.session_cost,
+                self.conv.api_messages.len(),
+            )
+        } else {
+            (prev.title.clone(), prev.cost_usd, prev.messages)
+        };
+        self.presence.store(Arc::new(Presence {
             clients: self.attached.len(),
             input_owner: self.input_owner,
             awaiting_input: self.pending_prompts.len(),
+            roster: self.roster(),
+            client_input: Some(self.client_input),
+            busy,
+            state,
+            state_since,
+            park_due,
+            evict_due,
+            title,
+            cost_usd,
+            messages,
         }));
+    }
+
+    /// Every attached client, by id.
+    pub(crate) fn roster(&self) -> Vec<ClientInfo> {
+        let mut roster: Vec<ClientInfo> = self
+            .attached
+            .iter()
+            .map(|(id, a)| ClientInfo {
+                id: *id,
+                name: a.name.clone(),
+                kind: a.meta.kind,
+                mode: a.mode,
+                attached_at_ms: a.attached_at_ms,
+            })
+            .collect();
+        roster.sort_by_key(|c| c.id.0);
+        roster
+    }
+
+    /// `tui (#1)`, or `client #1` for an id that isn't attached.
+    fn client_label(&self, id: ClientId) -> String {
+        match self.attached.get(&id) {
+            Some(a) => format!("{} (#{})", a.name, id.0),
+            None => format!("client #{}", id.0),
+        }
+    }
+
+    /// Why client `c` may not send an input command, if it may not.
+    /// `exclusive`: anyone but the owner. `shared`: observers (and clients
+    /// that aren't attached); every drive client may.
+    fn input_refusal(&self, c: ClientId) -> Option<String> {
+        match self.client_input {
+            ClientInput::Exclusive => (self.input_owner != Some(c)).then(|| match self.input_owner {
+                Some(o) => format!("input owned by {}", self.client_label(o)),
+                None => "input has no owner; attach with --takeover".to_string(),
+            }),
+            ClientInput::Shared => match self.attached.get(&c).map(|a| a.mode) {
+                Some(AttachMode::Mirror | AttachMode::Takeover) => None,
+                Some(AttachMode::Observe) => {
+                    Some("this client is read-only (attached with --observe)".to_string())
+                }
+                None => Some("this client is not attached".to_string()),
+            },
+        }
+    }
+
+    /// Client `c` sent input (or answered a prompt): remember when, and with
+    /// `client_input = shared` make it the active client. Observers never
+    /// become active.
+    fn note_input(&mut self, c: ClientId) {
+        let Some(a) = self.attached.get_mut(&c) else { return };
+        if a.mode == AttachMode::Observe {
+            return;
+        }
+        self.input_seq += 1;
+        a.last_input = self.input_seq;
+        if self.client_input == ClientInput::Shared && self.input_owner != Some(c) {
+            let from = self.input_owner;
+            self.input_owner = Some(c);
+            self.emit(SessionEventWire::InputOwnerChanged { from, to: Some(c), reason: OwnerChangeReason::Input });
+            self.publish_presence();
+        }
     }
 
     /// Recomputes `state` from clients/streaming and (re)arms or disarms the
@@ -1933,6 +2163,8 @@ impl SessionActor {
                             self.conv.session.thinking_level =
                                 self.runtime.thinking_level().to_owned();
                             self.consecutive_auto_turns = 0;
+                            // Admission: the request gets its time now.
+                            self.stamp_new_messages();
                             self.turn_baseline = self.conv.api_messages.len();
                             self.turn_steered_events.clear();
                             self.turn_replay.clear();
@@ -2168,6 +2400,11 @@ impl SessionActor {
     }
 
     pub(crate) fn rearm_park(&mut self) {
+        self.rearm_park_deadline();
+        self.publish_presence();
+    }
+
+    fn rearm_park_deadline(&mut self) {
         if self.is_parked() {
             // Eviction deadline is owned by `park()`; the attach path unparks
             // (which rebuilds the runtime and clears the deadline).
@@ -2276,6 +2513,7 @@ impl SessionActor {
     /// resolving and its push into `event_queue` is the wake-up.
     pub(crate) async fn park(&mut self) -> std::ops::ControlFlow<EndReason> {
         let flow = self.park_now().await;
+        self.publish_presence();
         // Restored to be parked but still live (it could not park): its
         // `on_session_start` runs now, as for any live session.
         if flow.is_continue()
@@ -2354,6 +2592,8 @@ impl SessionActor {
         self.parked_tool_activations = self.runtime.carried_tool_activations();
         // Drop order: conv first, then runtime — a panic between them can
         // never leave a Runtime without state to save.
+        // Last look at the conversation for listings (title/cost/messages).
+        self.publish_presence();
         let conv = self.conv.park_take();
         drop(conv);
         let runtime = self.runtime.park_take();
@@ -2461,6 +2701,9 @@ impl SessionActor {
             // `cfg.model_override` frozen at create: `/model` survives park.
             runtime.set_model(view.model.clone());
             let _ = runtime.restore_session_reasoning(&view.thinking_level);
+            if let Some(clock) = &cfg.message_clock {
+                runtime.set_message_clock(clock.clone());
+            }
             sb.session.model = view.model.clone();
             sb.session.thinking_level = runtime.thinking_level().to_string();
             crate::engine::setup::finish_session_setup(
@@ -2493,10 +2736,16 @@ impl SessionActor {
         if journal_present && self.config.persist && self.session_lock.is_some() {
             crate::engine::setup::recover_turn_draft(&mut conv).await;
         }
+        self.message_stamper.settle(conv.api_messages.len());
         runtime.restore_tool_activations(std::mem::take(&mut self.parked_tool_activations));
         runtime.set_child_route(Some(self.child_route.clone()));
         self.runtime.unpark_set(runtime);
         self.conv.unpark_set(conv);
+        // The name comes from disk: a rename while parked wrote it there.
+        if self.meta.name != self.conv.session.name {
+            let name = self.conv.session.name.clone();
+            self.mirror_name(name);
+        }
         // A fresh runtime: whether its grant took effect is its own.
         self.memory_seen_active = false;
         self.observe_memory();
@@ -2519,9 +2768,12 @@ impl SessionActor {
         if !self.is_parked() {
             return Ok(());
         }
-        self.unpark()
+        let res = self
+            .unpark()
             .await
-            .map_err(|e| format!("session parked and could not be restored: {e}"))
+            .map_err(|e| format!("session parked and could not be restored: {e}"));
+        self.publish_presence();
+        res
     }
 
     /// `stream_handler.rs:264`: a turn OR a compaction blocks auto-turns.
@@ -2711,6 +2963,9 @@ impl SessionActor {
         let ct = CancellationToken::new();
         let (s_tx, s_rx) = mpsc::unbounded_channel::<String>();
         self.streaming = true;
+        // Admission: the request (and anything queued with it) gets its
+        // time now, before the stream copies the history.
+        self.stamp_new_messages();
         self.turn_baseline = self.conv.api_messages.len();
         self.open_turn_draft();
         self.turn_steered_events.clear();
@@ -4058,7 +4313,7 @@ impl SessionActor {
                         }
                         let new_id = self.conv.session.id.clone();
                         self.runtime.set_session_id(Some(new_id.clone()));
-                        self.journal_id.store(Arc::new(new_id.clone()));
+                        self.set_journal_id(new_id.clone());
                         // F10: lock follows the new journal id.
                         self.reacquire_session_lock(&new_id);
                         // Wall 1: reset continuation state for the new session id
@@ -4089,6 +4344,14 @@ impl SessionActor {
 
     /// #107 inline body (kill-switch only).
     async fn compact_inline(&mut self, instructions: Option<String>, source: &str) {
+        self.compacting_inline = true;
+        self.publish_presence();
+        self.compact_inline_inner(instructions, source).await;
+        self.compacting_inline = false;
+        self.publish_presence();
+    }
+
+    async fn compact_inline_inner(&mut self, instructions: Option<String>, source: &str) {
         self.emit(SessionEventWire::SystemNotice(format!(
             "[{}]",
             preview_compaction_disclosure(&self.runtime, &self.conv.api_messages).render_line()
@@ -4188,6 +4451,12 @@ impl SessionActor {
             v.trim()
                 .eq_ignore_ascii_case(crate::tools::CONFIRM_ANSWER_ALLOW_ALL)
         });
+        // An answer is input too: with `client_input = shared` the answering
+        // drive client becomes active first, so "Allow all" (owner only)
+        // is its to choose.
+        if let Some(c) = from {
+            self.note_input(c);
+        }
         if let Some(reason) = self.confirm_answer_refusal(from, &self.pending_prompts[pos].0, allow_all) {
             if let Some(c) = from {
                 self.emit(SessionEventWire::Refused {
@@ -4208,7 +4477,7 @@ impl SessionActor {
         self.publish_presence();
         self.emit(SessionEventWire::PromptResolved { prompt_id });
         let by = match from {
-            Some(c) => format!("client #{}", c.0),
+            Some(c) => self.client_label(c),
             None => "the host".to_string(),
         };
         // prA N3: the tool card shows the model's original input; when the
@@ -4480,6 +4749,8 @@ impl SessionActor {
             replay: self.turn_replay.iter().cloned().collect(),
             pending_prompts: self.pending_prompts.iter().map(|(p, _)| p.clone()).collect(),
             clients: self.attached.iter().map(|(c, a)| (*c, a.meta.kind)).collect(),
+            roster: self.roster(),
+            client_input: self.client_input,
             input_owner: self.input_owner,
             display_tail: None,
         }
@@ -4521,7 +4792,16 @@ impl SessionActor {
         let kind = client.kind;
         self.cache_keepwarm_note_attach(kind, mode);
         let snapshot_meta = client.clone();
-        self.attached.insert(cid, AttachedClient { meta: client, mode });
+        let name = resolve_client_name(
+            client.name.as_deref(),
+            kind,
+            self.attached.values().map(|a| a.name.as_str()),
+        );
+        let attached_at_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+        self.attached.insert(
+            cid,
+            AttachedClient { meta: client, mode, name: name.clone(), attached_at_ms, last_input: 0 },
+        );
         self.update_attach_state();
         let mut owner_change: Option<(Option<ClientId>, OwnerChangeReason)> = None;
         match mode {
@@ -4557,7 +4837,40 @@ impl SessionActor {
             client: cid,
             snapshot,
         });
-        self.emit(SessionEventWire::ClientJoined { client: cid, kind });
+        self.emit(SessionEventWire::ClientJoined { client: cid, kind, name, mode });
+    }
+
+    /// B1 `/takeover`: the sending client takes input in place, as an
+    /// `AttachMode::Takeover` attach would, without re-attaching. An
+    /// `Observe` client is refused (it attached read-only on purpose); the
+    /// owner, the host and unknown clients change nothing. Any turn keeps
+    /// running: only who may drive the session changes.
+    fn take_input(&mut self, from: Option<ClientId>) {
+        let Some(c) = from else { return };
+        let Some(mode) = self.attached.get(&c).map(|a| a.mode) else { return };
+        if mode == AttachMode::Observe {
+            self.emit(SessionEventWire::Refused {
+                client: c,
+                command: command_name(&SessionCommand::TakeInput).to_string(),
+                reason: "this client attached with --observe and never owns input; \
+                         attach without --observe to take it"
+                    .to_string(),
+            });
+            return;
+        }
+        if self.input_owner == Some(c) {
+            return;
+        }
+        let from = self.input_owner;
+        let reason = if from.is_some() {
+            OwnerChangeReason::Takeover
+        } else {
+            OwnerChangeReason::Attach
+        };
+        self.input_owner = Some(c);
+        self.emit(SessionEventWire::InputOwnerChanged { from, to: Some(c), reason });
+        self.publish_presence();
+        self.note_input(c); // most recent, for promotion on detach
     }
 
     /// Never touches `stream`/`cancel`: the turn keeps running and its
@@ -4570,12 +4883,16 @@ impl SessionActor {
         self.update_attach_state();
         self.emit(SessionEventWire::ClientLeft { client });
         if self.input_owner == Some(client) {
+            // `shared`: back to whoever typed last (a script that sent one
+            // prompt and left hands input back to the tab in use);
+            // `exclusive`: the lowest id, as before. Ties: the lowest id.
+            let shared = self.client_input == ClientInput::Shared;
             let next = self
                 .attached
                 .iter()
                 .filter(|(_, a)| a.mode != AttachMode::Observe)
-                .map(|(c, _)| *c)
-                .min_by_key(|c| c.0);
+                .max_by_key(|(c, a)| (if shared { a.last_input } else { 0 }, std::cmp::Reverse(c.0)))
+                .map(|(c, _)| *c);
             self.input_owner = next;
             self.emit(SessionEventWire::InputOwnerChanged {
                 from: Some(client),
@@ -4887,6 +5204,7 @@ impl SessionActor {
         if let Some(job) = self.compact.take() {
             job.task.abort();
             self.emit(SessionEventWire::CompactionCancelled);
+            self.publish_presence();
         }
     }
 
@@ -4898,6 +5216,16 @@ impl SessionActor {
         use std::ops::ControlFlow;
         let Addressed { from, cmd } = addressed;
         if let Some(c) = from {
+            // `rename` is the daemon's control-connection rename; an
+            // attached client has `/saveas` (owner only).
+            if is_rename_command(&cmd) {
+                self.emit(SessionEventWire::Refused {
+                    client: c,
+                    command: command_name(&cmd).to_string(),
+                    reason: "rename is host-only; use /saveas".into(),
+                });
+                return ControlFlow::Continue(());
+            }
             // Only the daemon's reload sends a reload checkpoint (it stops
             // every worker and fences the session for the exec after it).
             if matches!(cmd, SessionCommand::Checkpoint { reason: CheckpointReason::Reload }) {
@@ -4908,11 +5236,7 @@ impl SessionActor {
                 });
                 return ControlFlow::Continue(());
             }
-            if is_input_command(&cmd) && self.input_owner != Some(c) {
-                let reason = match self.input_owner {
-                    Some(o) => format!("input owned by client #{}", o.0),
-                    None => "input has no owner; attach with --takeover".to_string(),
-                };
+            if let Some(reason) = is_input_command(&cmd).then(|| self.input_refusal(c)).flatten() {
                 self.emit(SessionEventWire::Refused {
                     client: c,
                     command: command_name(&cmd).to_string(),
@@ -4926,6 +5250,19 @@ impl SessionActor {
         // the daemon reports it failed). The wake sources are fenced in the
         // select loop; commands are fenced here.
         if self.reload_fence.is_some() && cmd.refused_while_reloading() {
+            // A host rename answers its caller only, never the whole room.
+            if let SessionCommand::EngineCommand { id, name, .. } = &cmd {
+                if name == RENAME_COMMAND {
+                    self.emit(SessionEventWire::QueryResult {
+                        id: *id,
+                        value: serde_json::json!({
+                            "kind": "error", "code": "busy",
+                            "text": "daemon reloading; retry in a moment",
+                        }),
+                    });
+                    return ControlFlow::Continue(());
+                }
+            }
             let reason = super::RELOADING_REFUSAL.to_string();
             match from {
                 Some(c) => self.emit(SessionEventWire::Refused {
@@ -4934,6 +5271,24 @@ impl SessionActor {
                     reason,
                 }),
                 None => self.emit(SessionEventWire::SystemNotice(reason)),
+            }
+            return ControlFlow::Continue(());
+        }
+        // Accepted input: with `client_input = shared` its sender becomes the
+        // active client. `KeepWarm` doesn't count: `--keep-warm` sends it
+        // on attach, not a person typing.
+        if let Some(c) = from {
+            if is_input_command(&cmd) && !matches!(cmd, SessionCommand::KeepWarm { .. }) {
+                self.note_input(c);
+            }
+        }
+        // A host rename (`synaps daemon rename`): handled here for live and
+        // parked sessions alike. A parked one is renamed on disk and NOT
+        // woken (`host_rename`), so this runs before the B3 wake below.
+        if is_rename_command(&cmd) {
+            if let SessionCommand::EngineCommand { id, arg, .. } = cmd {
+                let value = self.host_rename(&arg).await;
+                self.emit(SessionEventWire::QueryResult { id, value });
             }
             return ControlFlow::Continue(());
         }
@@ -4951,9 +5306,11 @@ impl SessionActor {
                     | SessionCommand::Checkpoint { .. }
                     | SessionCommand::Park
                     | SessionCommand::ReloadAborted
+                    | SessionCommand::ArmPark
                     | SessionCommand::RestoreToolActivations { .. }
                     | SessionCommand::Resync { .. }
                     | SessionCommand::HostEvent(_)
+                    | SessionCommand::TakeInput
             ) && !is_close_command(&cmd) // closing a parked session must not rebuild it
                 // Unpinning a parked session only clears the flag; pinning
                 // one wakes it (a pinned session is live by definition).
@@ -4966,6 +5323,7 @@ impl SessionActor {
                 SessionCommand::Save
                     | SessionCommand::Cancel
                     | SessionCommand::Park
+                    | SessionCommand::ArmPark
                     | SessionCommand::Checkpoint { .. }
             ) {
                 if let SessionCommand::Checkpoint { .. } = cmd {
@@ -5039,7 +5397,7 @@ impl SessionActor {
                 self.conv.clear(&self.runtime).await;
                 self.runtime
                     .begin_conversation(Some(self.conv.session.id.clone()));
-                self.journal_id.store(Arc::new(self.conv.session.id.clone()));
+                self.set_journal_id(self.conv.session.id.clone());
                 // F10: lock follows the new session id.
                 self.reacquire_session_lock(&self.conv.session.id.clone());
                 self.emit(SessionEventWire::Cleared {
@@ -5104,6 +5462,8 @@ impl SessionActor {
                 self.restore_tool_activations(activations)
             }
             SessionCommand::ReloadAborted => self.reload_aborted().await,
+            // Parked sessions returned above (their evict deadline stands).
+            SessionCommand::ArmPark => self.rearm_park(),
             SessionCommand::Park => {
                 // Explicit request: end an active keep-warm period, then park.
                 self.cache_keepwarm_park_requested();
@@ -5111,10 +5471,16 @@ impl SessionActor {
                     return ControlFlow::Break(reason);
                 }
             }
+            SessionCommand::TakeInput => self.take_input(from),
             SessionCommand::KeepWarm { on } => {
                 self.keep_warm = on;
                 self.meta.pinned = on; // the attach snapshot's copy
                 self.keep_warm_cell.store(on, std::sync::atomic::Ordering::Release);
+                self.note_pin();
+                // Unpinned with nobody who ever typed: back to the old rule.
+                if !on && !self.cache_keepwarm.interactive_seen && self.cache_keepwarm.active() {
+                    self.cache_keepwarm_end(super::cache_keepwarm::PeriodEnd::Disabled);
+                }
                 self.rearm_park();
                 self.emit(SessionEventWire::SystemNotice(if on {
                     PIN_ON_NOTICE.to_string()
@@ -5145,6 +5511,12 @@ impl SessionActor {
     // ── teardown (tui/mod.rs:352-432 + chat.rs shutdown) ─────────────────
 
     async fn finish(&mut self, reason: EndReason) {
+        // Ended on purpose (`/close`, `daemon close`, a client's quit): the
+        // pin goes with it. A daemon stop, reload or crash keeps it.
+        if self.keep_warm && reason == EndReason::ClientQuit {
+            self.keep_warm = false;
+            self.note_pin();
+        }
         self.cache_keepwarm_end(super::cache_keepwarm::PeriodEnd::SessionEnding);
         // Before on_session_end clears the keyed injection (STEP 2): a hook
         // not yet called leaves the line; one in flight finishes holding the
@@ -5262,6 +5634,19 @@ async fn next_stream_event(stream: &mut Option<ActiveStream>) -> Option<StreamEv
         Some(s) => s.next().await,
         None => std::future::pending().await,
     }
+}
+
+/// The conversation's title for listings: the saved title, else what
+/// `Session::auto_title` will make of the first user message.
+fn conversation_title(conv: &ConversationState) -> Option<String> {
+    if !conv.session.title.is_empty() {
+        return Some(conv.session.title.clone());
+    }
+    conv.api_messages
+        .iter()
+        .filter(|m| m["role"].as_str() == Some("user"))
+        .find_map(|m| agent_core::core::session::user_content_for_display(&m["content"]))
+        .map(|t| t.chars().take(80).collect())
 }
 
 /// Whether the 1 Hz `SubagentRows` tick keeps running: always during a turn,

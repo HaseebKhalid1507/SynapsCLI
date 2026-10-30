@@ -238,12 +238,22 @@ define_settings! {
             Err(_) => SettingApply::Local(Ok(())),
         };
 
+    "subagent_thinking", "Subagent thinking", Agent,
+        EditorKind::Cycler(&["low", "medium", "high", "xhigh", "max"]),
+        "Default effort for new subagents; independent of foreground thinking. Resume keeps recorded effort unless overridden.",
+        |_app, value| config_edit("subagent_thinking", value);
+
     "subagent_timeout", "Subagent timeout", Agent, EditorKind::Text { numeric: true },
         "Seconds before a dispatched subagent is canceled.",
         |_app, value| match value.parse::<u64>() {
             Ok(secs) => SettingApply::Session(SessionSetting::SubagentTimeout { secs }),
             Err(_) => SettingApply::Local(Ok(())),
         };
+
+    "subagent_cold_resume_compact_tokens", "Cold resume compact", Agent,
+        EditorKind::Text { numeric: true },
+        "subagent_resume of a worker whose prompt cache expired replays a compact context instead of the full transcript once its history reaches this many tokens (default 100000; 0 = always replay in full). Applies from the next resume.",
+        |_app, value| whole_number("subagent_cold_resume_compact_tokens", value);
 
     "max_tool_output", "Max tool output", ToolLimits, EditorKind::Text { numeric: true },
         "Bytes to capture from a tool before truncating.",
@@ -360,6 +370,10 @@ define_settings! {
             Err(_) => SettingApply::Local(Err("expected a number of seconds".to_string())),
         };
 
+    "client_input", "Client input", Daemon, EditorKind::Cycler(&["shared", "exclusive"]),
+        "Who may type in a daemon session with several clients attached (tabs, a dashboard, a bridge): shared (default) lets every client except --observe ones send input; exclusive lets only the input owner, and the others /takeover. The daemon reads it when it starts: `synaps daemon reload` applies it.",
+        |_app, value| config_edit("client_input", value);
+
     // ── Context & cache ──────────────────────────────────────────────────
     // Config-only rows below validate through the real config parser
     // (`config_edit`), so /settings can never write a value `load_config`
@@ -435,6 +449,21 @@ define_settings! {
             "off" | "basic" | "full" => config_edit("telemetry", value),
             _ => SettingApply::Local(Err("expected off, basic or full".to_string())),
         };
+
+    "telemetry_log_generations", "Telemetry log files", Context,
+        EditorKind::Text { numeric: true },
+        "Rotated files kept for api-log.jsonl and request-trace.jsonl, each up to 50 MB: <log>.1 (newest) to <log>.N (1–100, default 1). Takes effect next launch.",
+        |_app, value| whole_number("telemetry_log_generations", value);
+
+    "request_compression", "Request compression", Context,
+        EditorKind::Cycler(&["auto", "on", "off"]),
+        "gzip Anthropic request bodies of 16 KiB or more (every request re-uploads the whole conversation; text shrinks about 2x): auto (default) only when sent straight to the Anthropic API: no HTTPS proxy, custom CA bundle or custom base URL; on also through those, for a proxy or gateway known to pass gzip bodies; off never. A refused body is resent uncompressed. Env SYNAPS_GZIP_REQUEST_BODIES=0 overrides. Takes effect next launch.",
+        |_app, value| config_edit("request_compression", value);
+
+    "request_compression_level", "Compression level", Context,
+        EditorKind::Cycler(&["1", "2", "3", "4", "5", "6", "7", "8", "9"]),
+        "gzip level for request bodies, 1-9 (default 1, about 250 MB/s). Higher shrinks more and costs more CPU: 1 suits fast uplinks; on an uplink slower than roughly 10-50 Mbps (it depends on the conversation) 3-6 saves more upload time than it costs. Above 6 gains almost nothing. Takes effect next launch.",
+        |_app, value| config_edit("request_compression_level", value);
 
     // ── Agent ────────────────────────────────────────────────────────────
 
@@ -1045,6 +1074,8 @@ mod tests {
             "process_scopes = no\n",
             "disabled_tools = bash,  ls\n",
             "turn_budget.worker.max_cost_usd = 2.5\n",
+            "request_compression = OFF\n",
+            "request_compression_level = 6\n",
         ));
         assert_eq!(config_row_display("cache_ttl").as_deref(), Some("1h"));
         assert_eq!(config_row_display("cache_keepwarm").as_deref(), Some("6h"));
@@ -1055,6 +1086,8 @@ mod tests {
             config_row_display("turn_budget.worker.max_cost_usd").as_deref(),
             Some("2.5")
         );
+        assert_eq!(config_row_display("request_compression").as_deref(), Some("off"));
+        assert_eq!(config_row_display("request_compression_level").as_deref(), Some("6"));
         drop(temp);
     }
 
@@ -1106,6 +1139,14 @@ mod tests {
             assert!(is_ok(d("refusal_retries", "4")));
             assert!(is_err(d("refusal_retries", "-1")));
             assert!(is_err(d("telemetry", "loud")));
+            assert!(is_ok(d("telemetry_log_generations", "5")));
+            assert!(is_err(d("telemetry_log_generations", "0")));
+            assert!(is_err(d("telemetry_log_generations", "101")));
+            assert!(is_ok(d("request_compression", "on")));
+            assert!(is_err(d("request_compression", "brotli")));
+            assert!(is_ok(d("request_compression_level", "9")));
+            assert!(is_err(d("request_compression_level", "0")));
+            assert!(is_err(d("request_compression_level", "10")));
             assert!(is_ok(d("subagent.max_depth", "3")));
             assert!(is_err(d("subagent.max_depth", "0")));
             assert!(is_err(d("subagent.max_depth", "70000")));
@@ -1125,7 +1166,8 @@ mod tests {
             assert!(is_ok(d("max_fps", "144")));
             assert!(is_err(d("max_fps", "0")));
             assert!(is_err(d("scroll_lines", "21")));
-            assert!(is_ok(d("memory.axel.brain", "/srv/axel/brain.r8")));
+            let absolute = if cfg!(windows) { r"C:\srv\axel\brain.r8" } else { "/srv/axel/brain.r8" };
+            assert!(is_ok(d("memory.axel.brain", absolute)));
             assert!(is_err(d("memory.axel.brain", "brain.r8")));
             assert!(is_err(d("memory.user_scope", "yes")));
             assert!(is_err(d("memory.backend", "sqlite")));

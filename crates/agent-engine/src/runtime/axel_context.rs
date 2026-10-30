@@ -171,7 +171,7 @@ fn task_literal(prompt: &str) -> Option<String> {
         if !(3..=64).contains(&word.len()) || STOP.contains(&word.to_ascii_lowercase().as_str()) {
             continue;
         }
-        if selected.map_or(true, |previous: &str| word.len() > previous.len()) {
+        if selected.is_none_or(|previous: &str| word.len() > previous.len()) {
             selected = Some(word);
         }
     }
@@ -301,21 +301,21 @@ fn visible(value: &Value) -> bool {
     ["disclosure", "disclosure_class"].iter().all(|key| {
         value
             .get(key)
-            .map_or(true, |v| v.as_str() == Some("model_visible"))
+            .is_none_or(|v| v.as_str() == Some("model_visible"))
     }) && ["sensitivity", "retention", "retention_class"]
         .iter()
         .all(|key| {
-            value.get(key).map_or(true, |v| {
+            value.get(key).is_none_or(|v| {
                 matches!(v.as_str(), Some("normal" | "standard" | "model_visible"))
             })
         })
         && ["private", "restricted"]
             .iter()
-            .all(|key| value.get(key).map_or(true, |v| v.as_bool() == Some(false)))
+            .all(|key| value.get(key).is_none_or(|v| v.as_bool() == Some(false)))
         && value
             .get("channel")
-            .map_or(true, |v| v.as_str() == Some("final"))
-        && value.get("content_class").map_or(true, |v| {
+            .is_none_or(|v| v.as_str() == Some("final"))
+        && value.get("content_class").is_none_or(|v| {
             matches!(v.as_str(), Some("user_text" | "assistant_text"))
         })
 }
@@ -384,6 +384,7 @@ pub(super) fn capture_text(message: &Value) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use super::super::Runtime;
     use super::*;
     use agent_core::memory::store::{MemoryProvenance, MemoryRetention};
@@ -577,6 +578,7 @@ mod tests {
         assert!(parsed.rendered.text.contains("producer=model"));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     #[serial_test::serial(synaps_base_dir)]
     async fn axel_off_and_model_control_do_not_start_process_or_grant() {
@@ -617,6 +619,7 @@ mod tests {
         assert!(!marker.exists());
         assert!(!root.join("synthetic.r8").exists());
     }
+    #[cfg(unix)]
     #[tokio::test]
     #[serial_test::serial(synaps_base_dir)]
     #[ignore = "requires pinned Axel service; consented synthetic session import only"]
@@ -693,6 +696,7 @@ mod tests {
 
     /// Explicit real-process test, synthetic brain only. Includes the exact
     /// Runtime recall entry point with its production 150 ms deadline.
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial_test::serial(synaps_base_dir)]
     #[ignore = "requires SYNAPS_AXEL_TEST_BIN pointing to the separately built pinned service"]

@@ -105,8 +105,8 @@ impl ApiMethods {
         options: &ApiOptions,
     ) -> Result<Value> {
         super::attachments::validate_history_for_request(model, messages).map_err(RuntimeError::Config)?;
-        let wire_messages = super::continuation::wire_messages(messages);
-        let messages = wire_messages.as_deref().unwrap_or(messages);
+        // Host `_synaps_*` keys: routed transports strip at their entry; the
+        // Anthropic body below drops them while serializing (`WireMessages`).
         // Route through OpenAI-compat provider if model resolves to one.
         // This synchronous facade consumes only the final response value, so
         // high-volume display deltas are suppressed at the provider boundary.
@@ -261,6 +261,12 @@ impl ApiMethods {
         .await;
         #[allow(unused_assignments)]
         let mut clock = crate::runtime::trace::AttemptClock::start();
+        // `body_bytes` stays the JSON the trace digests; `wire` is what
+        // reqwest uploads (see `request_encoding`).
+        let mut wire = options
+            .request_compression
+            .encode(&anthropic_url, &body_bytes)
+            .await;
 
         // Retry loop for transient API errors (429, 529, 500, 502, 503).
         // 429 gets a higher budget (MAX_429_RETRIES) and honours rate-limit
@@ -288,9 +294,12 @@ impl ApiMethods {
                     req = req.header("anthropic-beta", beta);
                 }
 
-                match req.body(body_bytes.clone()).send().await {
+                match wire.encoding_header(req).body(wire.bytes.clone()).send().await {
                     Ok(resp) => {
                         let status = resp.status();
+                        options
+                            .request_compression
+                            .settle(&mut wire, status.is_success());
                         if status.is_success() {
                             clock.mark_headers();
                             let trace_rid =
@@ -405,6 +414,27 @@ impl ApiMethods {
                                 super::api::provider_request_id_from_headers(resp.headers());
                             let error_text = resp.text().await.unwrap_or_default();
 
+                            // gzip refusal fail-soft: resend once uncompressed,
+                            // costing no retry budget (see `request_encoding`).
+                            if let Some(resend) = options.request_compression.resend_uncompressed(
+                                &wire,
+                                &body_bytes,
+                                status.as_u16(),
+                            ) {
+                                wire = resend;
+                                if let Some(t) = tracer.as_mut() {
+                                    t.attempt_failed(
+                                        clock,
+                                        crate::runtime::trace::RetryClass::Other,
+                                        std::time::Duration::ZERO,
+                                        Some(status.as_u16()),
+                                        trace_rid,
+                                        "gzip_refused",
+                                    );
+                                }
+                                continue;
+                            }
+
                             let retry_exhausted = if is_429 {
                                 attempt >= MAX_429_RETRIES
                             } else {
@@ -477,6 +507,7 @@ impl ApiMethods {
                         }
                     }
                     Err(e) => {
+                        options.request_compression.settle(&mut wire, false);
                         non_429_attempts += 1;
                         if non_429_attempts > max_retries {
                             if let Some(t) = tracer.take() {
@@ -677,6 +708,12 @@ impl ApiMethods {
         .await;
         #[allow(unused_assignments)]
         let mut clock = crate::runtime::trace::AttemptClock::start();
+        // `body_bytes` stays the JSON the trace digests; `wire` is what
+        // reqwest uploads (see `request_encoding`).
+        let mut wire = options
+            .request_compression
+            .encode(&anthropic_url, &body_bytes)
+            .await;
 
         // Retry loop for transient errors (compaction path).
         // Same header-aware 429 handling as the main call_api loop.
@@ -702,9 +739,12 @@ impl ApiMethods {
                     req = req.header("anthropic-beta", beta);
                 }
 
-                match req.body(body_bytes.clone()).send().await {
+                match wire.encoding_header(req).body(wire.bytes.clone()).send().await {
                     Ok(resp) => {
                         let status = resp.status();
+                        options
+                            .request_compression
+                            .settle(&mut wire, status.is_success());
                         if status.is_success() {
                             clock.mark_headers();
                             let trace_rid =
@@ -810,6 +850,27 @@ impl ApiMethods {
                             };
                             let error_text = resp.text().await.unwrap_or_default();
 
+                            // gzip refusal fail-soft: resend once uncompressed,
+                            // costing no retry budget (see `request_encoding`).
+                            if let Some(resend) = options.request_compression.resend_uncompressed(
+                                &wire,
+                                &body_bytes,
+                                status.as_u16(),
+                            ) {
+                                wire = resend;
+                                if let Some(t) = tracer.as_mut() {
+                                    t.attempt_failed(
+                                        clock,
+                                        crate::runtime::trace::RetryClass::Other,
+                                        std::time::Duration::ZERO,
+                                        Some(status.as_u16()),
+                                        trace_rid,
+                                        "gzip_refused",
+                                    );
+                                }
+                                continue;
+                            }
+
                             let retry_exhausted = if is_429 {
                                 attempt >= MAX_429_RETRIES_COMPACT
                             } else {
@@ -869,6 +930,7 @@ impl ApiMethods {
                         }
                     }
                     Err(e) => {
+                        options.request_compression.settle(&mut wire, false);
                         non_429_attempts += 1;
                         if non_429_attempts > max_retries {
                             if let Some(t) = tracer.take() {

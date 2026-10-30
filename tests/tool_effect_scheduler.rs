@@ -54,6 +54,7 @@ fn sse_two_calls(name_a: &str, id_a: &str, name_b: &str, id_b: &str) -> String {
     )
 }
 
+#[cfg(unix)]
 fn sse_two_calls_with_inputs(
     name_a: &str,
     id_a: &str,
@@ -95,6 +96,7 @@ type EventLog = Arc<Mutex<Vec<String>>>;
 
 /// The production write tool, wrapped only to record start/end timing while
 /// retaining its real effect + symlink-aware concurrency-key implementation.
+#[cfg(unix)]
 struct ObservedWrite {
     name: String,
     tag: String,
@@ -103,6 +105,7 @@ struct ObservedWrite {
     delay_ms: u64,
 }
 
+#[cfg(unix)]
 #[async_trait]
 impl Tool for ObservedWrite {
     fn name(&self) -> &str {
@@ -417,12 +420,14 @@ async fn real_path_and_directory_symlink_alias_serialize_under_reordering_pressu
 /// Mutating fixture deriving its lane from the PRODUCTION write-tool key of
 /// `path`, reporting OVERLAP/SERIAL via a shared gauge (same detector as
 /// `OverlapFixture`).
+#[cfg(unix)]
 struct KeyedOverlapWrite {
     name: String,
     path: String,
     gauge: Arc<ConcurrencyGauge>,
 }
 
+#[cfg(unix)]
 #[async_trait]
 impl Tool for KeyedOverlapWrite {
     fn name(&self) -> &str {

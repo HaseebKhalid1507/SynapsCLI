@@ -77,6 +77,9 @@ pub(crate) struct HeaderSnap {
     pub(crate) folder: String,
     /// This client is attached read-only (`synaps --attach --observe`).
     pub(crate) observing: bool,
+    /// Clients attached to this daemon session, this one included (0
+    /// in-process). Shown when more than one.
+    pub(crate) clients: usize,
 }
 
 /// What the header shows, derived per frame from the snapshot.
@@ -208,11 +211,21 @@ pub(crate) fn elapsed(secs: u64) -> String {
 
 /// Session name: name, else auto title, else id. Control characters and
 /// runs of whitespace collapse to one space (titles are the first user
-/// message and may hold newlines).
+/// message and may hold newlines); the auto title also loses its inline
+/// markdown markers ([`plain_title`]) — a name is shown as typed.
 pub(crate) fn session_label(name: Option<&str>, title: &str, id: &str) -> String {
-    let raw = name
-        .filter(|n| !n.trim().is_empty())
-        .unwrap_or(if title.trim().is_empty() { id } else { title });
+    let plain;
+    let raw = match name.filter(|n| !n.trim().is_empty()) {
+        Some(n) => n,
+        None => {
+            plain = plain_title(title);
+            if plain.trim().is_empty() {
+                id
+            } else {
+                &plain
+            }
+        }
+    };
     let mut out = String::with_capacity(raw.len());
     let mut space = false;
     for ch in raw.chars() {
@@ -224,6 +237,54 @@ pub(crate) fn session_label(name: Option<&str>, title: &str, id: &str) -> String
                 space = false;
             }
             out.push(ch);
+        }
+    }
+    out
+}
+
+/// A first-message title without its inline markdown: backticks, `**`,
+/// `__`, `~~`, and a lone `*`/`_` at a word edge (`*x*`, but not
+/// `snake_case` or `2 * 3`); leading `#` heading and `>` quote markers go
+/// per line.
+pub(crate) fn plain_title(title: &str) -> String {
+    let mut out = String::with_capacity(title.len());
+    for (i, line) in title.lines().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        let mut line = line.trim_start();
+        loop {
+            let t = line.trim_start_matches('#');
+            let t = if t.len() != line.len() && t.starts_with(' ') { t.trim_start() } else { line };
+            let t = t.strip_prefix('>').map_or(t, str::trim_start);
+            if t.len() == line.len() {
+                break;
+            }
+            line = t;
+        }
+        let chars: Vec<char> = line.chars().collect();
+        let mut j = 0;
+        while j < chars.len() {
+            let c = chars[j];
+            let next = chars.get(j + 1).copied();
+            if c == '`' {
+                j += 1;
+                continue;
+            }
+            if matches!(c, '*' | '_' | '~') && next == Some(c) {
+                j += 2;
+                continue;
+            }
+            if matches!(c, '*' | '_') {
+                let word = |ch: Option<char>| ch.is_some_and(char::is_alphanumeric);
+                let prev = j.checked_sub(1).map(|k| chars[k]);
+                if word(prev) != word(next) {
+                    j += 1;
+                    continue;
+                }
+            }
+            out.push(c);
+            j += 1;
         }
     }
     out
@@ -293,6 +354,8 @@ pub(crate) struct HeaderView<'a> {
     /// The worker whose view is focused.
     pub(crate) watching: Option<&'a str>,
     pub(crate) observing: bool,
+    /// Clients attached to the session (see [`HeaderSnap::clients`]).
+    pub(crate) clients: usize,
     /// Active or failed sidecar pills: `(label, failed)`. Idle ones are
     /// never listed.
     pub(crate) pills: Vec<(String, bool)>,
@@ -327,6 +390,7 @@ impl<'a> HeaderView<'a> {
             folder: &snap.folder,
             watching: model.watch_banner.as_ref().map(|b| b.agent_name.as_str()),
             observing: snap.observing,
+            clients: snap.clients,
             pills,
             workers: running.clone().count(),
             longest_worker_secs: running
@@ -614,6 +678,10 @@ fn well_items(v: &HeaderView<'_>) -> Vec<(Spans, Role)> {
         .collect();
     if v.observing {
         out.push((vec![("observing".into(), Role::Warn, false)], Role::Warn));
+    }
+    if v.clients > 1 {
+        // Another tab, a dashboard, a bridge: `/clients` says who.
+        out.push((vec![(format!("{} clients", v.clients), Role::Session, false)], Role::Session));
     }
     out
 }
@@ -1096,6 +1164,7 @@ mod tests {
             folder: "~/Projects/SynapsCLI",
             watching: None,
             observing: false,
+            clients: 0,
             pills: Vec::new(),
             workers: 0,
             longest_worker_secs: 0,
@@ -1327,6 +1396,17 @@ mod tests {
         let line = row(&draw(&v, 120), 0);
         assert_eq!(line.matches("agents").count(), 1, "{line:?}");
         assert!(line.contains("\u{280b} 3 agents 4m12s"), "{line:?}");
+    }
+
+    /// Another client attached (a tab, a dashboard): a `2 clients` well.
+    /// One client, or in-process (0), shows nothing.
+    #[test]
+    fn a_clients_well_shows_only_with_another_client() {
+        for (clients, shown) in [(0, false), (1, false), (2, true), (3, true)] {
+            let v = HeaderView { clients, ..view() };
+            let line = row(&draw(&v, 120), 0);
+            assert_eq!(line.contains(&format!("{clients} clients")), shown, "{clients}: {line:?}");
+        }
     }
 
     #[test]
@@ -1765,5 +1845,22 @@ mod tests {
             session_label(None, "", "20261014-011500-79cc"),
             "20261014-011500-79cc"
         );
+    }
+
+    /// C1: the header showed "Run `git log --oneline -5` and `ls crat…".
+    #[test]
+    fn session_label_strips_inline_markdown_from_the_title() {
+        assert_eq!(
+            session_label(None, "Run `git log --oneline -5` and\n`ls crates/`", "id"),
+            "Run git log --oneline -5 and ls crates/"
+        );
+        assert_eq!(
+            session_label(None, "## Fix **the** _cache_ ~~bug~~\n> in snake_case 2 * 3", "id"),
+            "Fix the cache bug in snake_case 2 * 3"
+        );
+        // Only markers: falls back to the id.
+        assert_eq!(session_label(None, "``", "abc"), "abc");
+        // A name is shown as typed.
+        assert_eq!(session_label(Some("`x`"), "t", "id"), "`x`");
     }
 }

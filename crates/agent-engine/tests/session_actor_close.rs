@@ -44,7 +44,7 @@ async fn session(body: &'static str, endless: bool) -> (LocalTransport, SessionH
     let (url, _) = stub(body, endless).await;
     std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
     let host = host().await;
-    let (handle, task) = host.create_session_unspawned(cfg()).await.unwrap();
+    let (handle, task) = host.create_session_unspawned(exclusive_cfg()).await.unwrap();
     let registry = task.subagent_registry();
     tokio::spawn(task.run());
     let (t, _) = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Tui))

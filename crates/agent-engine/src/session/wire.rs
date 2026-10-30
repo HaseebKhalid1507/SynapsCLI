@@ -42,6 +42,8 @@ use crate::{AgentEvent, LlmEvent, SessionEvent, StreamEvent, TurnError, TurnOutc
 /// rule; `Closed` only ever answers `Close`, so old clients never see it.
 /// `Pin`/`Pinned` (`synaps daemon pin`) follow the same rule, and so does
 /// `SessionMeta.pinned` (`#[serde(default)]`: an older daemon omits it).
+/// `ReloadExtension` and its two replies (`ExtensionReloaded`,
+/// `ExtensionReloadFailed`) follow it too.
 pub const PROTOCOL_VERSION: u32 = 3;
 /// Exact-match policy today (`min == max == PROTOCOL_VERSION`).
 pub const PROTOCOL_MIN: u32 = PROTOCOL_VERSION;
@@ -63,11 +65,18 @@ pub const IDLE_PROBE_QUERY_ID: u64 = RESERVED_QUERY_ID_BASE + 1;
 /// `Checkpoint` replies `QueryResult{id: CHECKPOINT_QUERY_ID, {ok:true}}`
 /// so `reload.rs` can await it per session.
 pub const CHECKPOINT_QUERY_ID: u64 = RESERVED_QUERY_ID_BASE + 2;
+/// `SettingChanged{id}` broadcast when an engine command (`/model`,
+/// `/thinking`, …) changed the view: not a reply to any client's `Set`
+/// (client ids never reach the reserved range), only the new view, so every
+/// attached client mirrors it, not just the one that typed the command.
+pub const VIEW_CHANGED_SETTING_ID: u64 = RESERVED_QUERY_ID_BASE + 3;
 /// `synaps daemon close` sends the engine command `close` under a fresh id
 /// at or above this one per request (`daemon/close.rs`) and awaits that id's
 /// `QueryResult`, so concurrent closes never take each other's reply.
 /// Attached clients never see these.
 pub const CLOSE_QUERY_ID_BASE: u64 = RESERVED_QUERY_ID_BASE + (1 << 32);
+/// `synaps daemon rename`'s engine command `rename` ids, as for close.
+pub const RENAME_QUERY_ID_BASE: u64 = RESERVED_QUERY_ID_BASE + (2 << 32);
 
 /// The binary version the daemon/client report in the handshake.
 pub fn binary_version() -> String {
@@ -148,12 +157,40 @@ pub enum ClientFrame {
         session_id: SessionId,
         on: bool,
     },
+    /// Control fast path: name (`Some`) or unname (`None`) one session,
+    /// with `/saveas`'s rules and host authority: no attach, no input
+    /// ownership, no presence change. A parked session is renamed on disk
+    /// without being woken. `expect` is a compare-and-set precondition the
+    /// actor checks atomically: absent = none, `null` = only if the session
+    /// is unnamed, `"x"` = only if it is named `x`; a mismatch is
+    /// `RenameFailed{named}`. Raw clients should send `expect: null`: an
+    /// absent `expect` replaces any name. Reply: `Renamed`, `RenameFailed`
+    /// (`busy` included), or `Refused{UnknownSession}`. Not accepted on an
+    /// attached connection (that client has `/saveas`).
+    Rename {
+        session_id: SessionId,
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default, deserialize_with = "present_option", skip_serializing_if = "Option::is_none")]
+        expect: Option<Option<String>>,
+    },
     /// Control fast path (no session): the in-memory account state of the
     /// broker every session of this daemon shares (`synaps auth state`),
     /// cleared first when `clear` is set. Reply: `AuthState`. A daemon that
     /// predates this frame answers `Error` "malformed frame: unknown variant
     /// `auth_state`, ..." and keeps the connection usable.
     AuthState(agent_core::auth::AuthStateQuery),
+    /// Control fast path (no session): stop one extension and start it
+    /// again from what is installed now (`synaps daemon reload-extension`).
+    /// Extensions are daemon-wide, so every session gets the new version;
+    /// no session is checkpointed and no turn is cancelled (only a call
+    /// into the old process that is in flight fails). Also loads a plugin
+    /// installed after the daemon started. Reply: `ExtensionReloaded`,
+    /// `ExtensionReloadFailed`, or `Refused{Busy}` while the daemon
+    /// reloads. Not accepted on an attached connection.
+    ReloadExtension {
+        extension: String,
+    },
     /// Control query (no session, also on an attached connection): the
     /// daemon's child-process ledger. Reply: `ChildList`. Feature "children".
     Children {
@@ -220,7 +257,17 @@ impl std::fmt::Debug for ClientFrame {
                 .field("session_id", session_id)
                 .field("on", on)
                 .finish(),
+            Self::Rename { session_id, name, expect } => f
+                .debug_struct("Rename")
+                .field("session_id", session_id)
+                .field("name", name)
+                .field("expect", expect)
+                .finish(),
             Self::AuthState(query) => f.debug_tuple("AuthState").field(query).finish(),
+            Self::ReloadExtension { extension } => f
+                .debug_struct("ReloadExtension")
+                .field("extension", extension)
+                .finish(),
             Self::Children { id, session_id, sid, members } => f
                 .debug_struct("Children")
                 .field("id", id)
@@ -293,6 +340,12 @@ impl Hello {
         }
     }
 
+    /// Ask to be called `name` in the session ([`ClientMeta::name`]).
+    pub fn with_name(mut self, name: Option<String>) -> Self {
+        self.client.name = name;
+        self
+    }
+
     /// Opt in to optional event kinds by name (see [`OPTIONAL_EVENTS`]).
     pub fn with_accepted_events<I, S>(mut self, names: I) -> Self
     where
@@ -318,6 +371,7 @@ impl Hello {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "attach", rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)] // one-shot handshake payload; Create carries the full config
 pub enum Attach {
     Existing {
         session_id: SessionId,
@@ -372,6 +426,44 @@ pub enum DaemonFrame {
     Pinned {
         session_id: SessionId,
         on: bool,
+    },
+    /// Reply to `Rename`: the session's name is now `name` (`None` =
+    /// cleared), saved durably (file mtime kept), and every attached client
+    /// got a `Conversation`. `in_memory_only`: the session is not persisted
+    /// (`persist: false`), so nothing was written.
+    Renamed {
+        session_id: SessionId,
+        name: Option<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        in_memory_only: bool,
+    },
+    /// Reply to `Rename`: the name was not changed (except `unknown`: it may
+    /// still apply; re-list before retrying). `taken_by` is the journal id
+    /// of the saved session holding the name (e.g.
+    /// `20261028-045932-eb8e`); `current_name` is the session's name when a
+    /// precondition failed (`named`).
+    RenameFailed {
+        session_id: SessionId,
+        reason: RenameRefusal,
+        message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        taken_by: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        current_name: Option<String>,
+    },
+    /// Reply to `ReloadExtension`: the new version is loaded.
+    ExtensionReloaded {
+        report: crate::extensions::manager::ExtensionReloadReport,
+    },
+    /// Reply to `ReloadExtension`: it was not reloaded. `unloaded`: the old
+    /// instance was stopped before the new one failed to start, so the
+    /// extension is not loaded now; `false` = the running one (if any) was
+    /// not touched.
+    ExtensionReloadFailed {
+        extension: String,
+        message: String,
+        #[serde(default)]
+        unloaded: bool,
     },
     /// `Some(Reloading{..})` before exec; `None` otherwise (today).
     Bye {
@@ -441,6 +533,73 @@ pub enum ByeReason {
     Reloading { generation: u64, retry_after_ms: u64 },
     Shutdown,
     Detached,
+}
+
+/// `Option<Option<T>>` where a present `null` is `Some(None)` (absent stays
+/// `None` via `#[serde(default)]`).
+pub(crate) fn present_option<'de, D, T>(d: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(d).map(Some)
+}
+
+/// Why `Rename` was not applied (`DaemonFrame::RenameFailed`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RenameRefusal {
+    /// Not `[a-z0-9-]{1,40}`.
+    Invalid,
+    /// Another saved session has the name (`taken_by`).
+    Taken,
+    /// A chain has the name.
+    ChainConflict,
+    /// `expect` did not match: the session has (or no longer has) a name.
+    /// Rename never silently replaces a name.
+    Named,
+    /// Its journal is held by another process (live there, or this daemon
+    /// could not lock it).
+    Locked,
+    /// Retry shortly: the session's queue stayed full, or the daemon is
+    /// reloading.
+    Busy,
+    /// No answer in time (or the reply was lost): it may still apply.
+    /// Re-list before retrying.
+    Unknown,
+    /// Anything else (the save failed and was rolled back, compacted into
+    /// a successor, or a reason this client does not know).
+    #[serde(other)]
+    Failed,
+}
+
+impl RenameRefusal {
+    /// The actor's `code` → refusal.
+    pub fn from_code(code: &str) -> Self {
+        match code {
+            "invalid" => Self::Invalid,
+            "taken" => Self::Taken,
+            "chain_conflict" => Self::ChainConflict,
+            "named" => Self::Named,
+            "locked" => Self::Locked,
+            "busy" | "reloading" => Self::Busy,
+            "unknown" => Self::Unknown,
+            _ => Self::Failed,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Invalid => "invalid",
+            Self::Taken => "taken",
+            Self::ChainConflict => "chain_conflict",
+            Self::Named => "named",
+            Self::Locked => "locked",
+            Self::Busy => "busy",
+            Self::Unknown => "unknown",
+            Self::Failed => "failed",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -582,6 +741,12 @@ pub struct AttachedWire {
     pub replay: Vec<WireEnvelope>,
     pub pending_prompts: Vec<PromptRequest>,
     pub clients: Vec<(ClientId, ClientKind)>,
+    /// Empty from an older daemon.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub roster: Vec<super::types::ClientInfo>,
+    /// Absent from an older daemon, which enforces the owner: `Exclusive`.
+    #[serde(default = "ClientInput::wire_default")]
+    pub client_input: ClientInput,
     #[serde(default)]
     pub input_owner: Option<ClientId>,
     #[serde(default)]
@@ -599,6 +764,8 @@ impl AttachedWire {
             replay: s.replay.into_iter().map(Into::into).collect(),
             pending_prompts: s.pending_prompts,
             clients: s.clients,
+            roster: s.roster,
+            client_input: s.client_input,
             input_owner: s.input_owner,
             display_tail: s.display_tail,
         }
@@ -615,6 +782,8 @@ impl AttachedWire {
                 replay: self.replay.into_iter().map(Into::into).collect(),
                 pending_prompts: self.pending_prompts,
                 clients: self.clients,
+                roster: self.roster,
+                client_input: self.client_input,
                 input_owner: self.input_owner,
                 display_tail: self.display_tail,
             },
@@ -732,7 +901,16 @@ pub enum WireSessionEvent {
     SettingChanged { applied: SettingApplied },
     QueryResult { id: u64, value: serde_json::Value },
     Attached { client: ClientId, snapshot: AttachedWire },
-    ClientJoined { client: ClientId, kind: ClientKind },
+    ClientJoined {
+        client: ClientId,
+        kind: ClientKind,
+        /// Empty from an older daemon (the client falls back to the kind).
+        #[serde(default)]
+        name: String,
+        /// Absent from an older daemon (read as `Mirror`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mode: Option<AttachMode>,
+    },
     ClientLeft { client: ClientId },
     Ended { reason: EndReason },
     Aborted { context_saved: bool },
@@ -1078,7 +1256,7 @@ impl From<SessionEventWire> for WireSessionEvent {
             S::SettingChanged(applied) => Self::SettingChanged { applied },
             S::QueryResult { id, value } => Self::QueryResult { id, value },
             S::Attached { client, snapshot } => Self::Attached { client, snapshot: AttachedWire::new(client, snapshot) },
-            S::ClientJoined { client, kind } => Self::ClientJoined { client, kind },
+            S::ClientJoined { client, kind, name, mode } => Self::ClientJoined { client, kind, name, mode: Some(mode) },
             S::ClientLeft { client } => Self::ClientLeft { client },
             S::Ended { reason } => Self::Ended { reason },
             S::Aborted { context_saved } => Self::Aborted { context_saved },
@@ -1157,7 +1335,9 @@ impl From<WireSessionEvent> for SessionEventWire {
                 let (client, snapshot) = snapshot.into_snapshot();
                 Self::Attached { client, snapshot }
             }
-            W::ClientJoined { client, kind } => Self::ClientJoined { client, kind },
+            W::ClientJoined { client, kind, name, mode } => {
+                Self::ClientJoined { client, kind, name, mode: mode.unwrap_or(AttachMode::Mirror) }
+            }
             W::ClientLeft { client } => Self::ClientLeft { client },
             W::Ended { reason } => Self::Ended { reason },
             W::Aborted { context_saved } => Self::Aborted { context_saved },
@@ -1213,6 +1393,18 @@ impl From<WireSessionEvent> for SessionEventWire {
 }
 
 // ── per-client decode gate ────────────────────────────────────────────────────
+
+/// A client that predates `client_input` (no `owner_reason_input`) on a
+/// `shared` session. It knows only the owner rule, so the daemon presents
+/// the truth in those terms: it owns input (its attach snapshot says so,
+/// unless it observes) and never sees `InputOwnerChanged`. Otherwise it
+/// would announce "input is owned by …" on attach and "input taken over"
+/// whenever another client typed, while it can type all along. Matters
+/// most after a `daemon reload` onto a new build, when every open TUI is
+/// an older client.
+pub fn legacy_shared(caps: ClientCapabilities, client_input: ClientInput) -> bool {
+    client_input == ClientInput::Shared && !caps.owner_reason_input
+}
 
 /// Whether a client that declared `caps` can decode `event` once it is a
 /// wire frame. The enums nested under `Stream` have no `#[serde(other)]`,
@@ -1538,11 +1730,13 @@ mod tests {
                     replay: vec![env(S::Stream(StreamEvent::Llm(LlmEvent::Text("partial".into()))))],
                     pending_prompts: vec![prompt()],
                     clients: vec![(ClientId(1), ClientKind::Tui)],
+                    roster: Vec::new(),
+                    client_input: ClientInput::Shared,
                     input_owner: Some(ClientId(1)),
                     display_tail: None,
                 },
             },
-            S::ClientJoined { client: ClientId(1), kind: ClientKind::Attach },
+            S::ClientJoined { client: ClientId(1), kind: ClientKind::Attach, name: "discord".into(), mode: AttachMode::Observe },
             S::ClientLeft { client: ClientId(1) },
             S::Ended { reason: EndReason::HostShutdown },
             S::Aborted { context_saved: true },
@@ -1626,6 +1820,8 @@ mod tests {
                 replay: vec![env(SessionEventWire::Stream(StreamEvent::Llm(LlmEvent::ToolQueued { tool_id: "toolu_2".into() })))],
                 pending_prompts: vec![],
                 clients: vec![],
+                roster: Vec::new(),
+                client_input: ClientInput::Shared,
                 input_owner: None,
                 display_tail: None,
             },
@@ -1642,6 +1838,44 @@ mod tests {
             },
             other => panic!("{other:?}"),
         }
+    }
+
+    /// `client_input` on the wire: a current daemon sends it; an `Attached`
+    /// from an older daemon (no field) means `Exclusive`, the owner rule it
+    /// enforces. Only a client without `owner_reason_input` on a shared
+    /// session is presented the owner rule.
+    #[test]
+    fn client_input_absent_means_exclusive_and_legacy_clients_are_presented_owners() {
+        let snap = |client_input| AttachSnapshot {
+            meta: meta(),
+            view: view(),
+            conversation: conv(),
+            streaming: false,
+            replay: vec![],
+            pending_prompts: vec![],
+            clients: vec![],
+            roster: Vec::new(),
+            client_input,
+            input_owner: Some(ClientId(1)),
+            display_tail: None,
+        };
+        let line = encode_line(&DaemonFrame::Attached(AttachedWire::new(ClientId(2), snap(ClientInput::Shared)))).unwrap();
+        assert!(line.contains(r#""client_input":"shared""#), "{line}");
+        let decoded = |line: &str| match decode_line::<DaemonFrame>(line.trim_end()).unwrap() {
+            DaemonFrame::Attached(a) => a.into_snapshot().1,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(decoded(&line).client_input, ClientInput::Shared);
+        let old = line.replace(r#""client_input":"shared","#, "");
+        assert!(!old.contains("client_input"), "{old}");
+        let s = decoded(&old);
+        assert_eq!(s.client_input, ClientInput::Exclusive);
+        assert!(s.input_owned_elsewhere(ClientId(2)).is_some(), "an older daemon's non-owner is read-only");
+
+        let (old_caps, new_caps) = (ClientCapabilities::default(), ClientCapabilities::current());
+        assert!(legacy_shared(old_caps, ClientInput::Shared));
+        assert!(!legacy_shared(new_caps, ClientInput::Shared));
+        assert!(!legacy_shared(old_caps, ClientInput::Exclusive), "exclusive is the rule it knows");
     }
 
     /// The gate: a client that did not declare `tool_queue` (every client
@@ -1674,7 +1908,7 @@ mod tests {
         let h = Hello::new(ClientKind::Tui);
         assert!(h.client.capabilities.tool_queue);
         let line = encode_line(&ClientFrame::Hello(h)).unwrap();
-        assert!(line.contains(r#""capabilities":{"tool_queue":true}"#), "{line}");
+        assert!(line.contains(r#""capabilities":{"tool_queue":true,"owner_reason_input":true}"#), "{line}");
         match decode_line::<ClientFrame>(line.trim_end()).unwrap() {
             ClientFrame::Hello(h) => assert!(h.client.capabilities.tool_queue),
             other => panic!("{other:?}"),
@@ -1695,6 +1929,29 @@ mod tests {
         let json = serde_json::to_string(&ClientMeta::new(ClientKind::Tui)).unwrap();
         let old: OldClientMeta = serde_json::from_str(&json).unwrap();
         assert_eq!(old.kind, ClientKind::Tui);
+    }
+
+    /// Client names, both directions: an older daemon's `ClientJoined` (no
+    /// name, no mode) decodes as the kind's name in `Mirror`; a `Hello`
+    /// without a name sends no `name` key (older daemons see the old
+    /// bytes), with one it round-trips.
+    #[test]
+    fn client_names_are_additive_on_the_wire() {
+        let old = r#"{"ev":"client_joined","client":4,"kind":"attach"}"#;
+        let ev: SessionEventWire = serde_json::from_str::<WireSessionEvent>(old).unwrap().into();
+        let mut roster = Roster::default();
+        roster.apply(&ev);
+        let c = roster.get(ClientId(4)).unwrap();
+        assert_eq!((c.name.as_str(), c.mode), ("attach", AttachMode::Mirror));
+
+        let unnamed = encode_line(&ClientFrame::Hello(Hello::new(ClientKind::Tui))).unwrap();
+        assert!(!unnamed.contains(r#""name""#), "{unnamed}");
+        let named = Hello::new(ClientKind::Tui).with_name(Some("discord".into()));
+        let line = encode_line(&ClientFrame::Hello(named)).unwrap();
+        match decode_line::<ClientFrame>(line.trim_end()).unwrap() {
+            ClientFrame::Hello(h) => assert_eq!(h.client.name.as_deref(), Some("discord")),
+            other => panic!("{other:?}"),
+        }
     }
 
     /// The watch query's opt-in: an older client's query omits it (off), an
@@ -1902,12 +2159,16 @@ mod tests {
             ClientFrame::Close { session_id: "s".into(), force: false, attached: false },
             ClientFrame::Pin { session_id: "s".into(), on: true },
             ClientFrame::Pin { session_id: "s".into(), on: false },
+            ClientFrame::Rename { session_id: "s".into(), name: Some("axon".into()), expect: None },
+            ClientFrame::Rename { session_id: "s".into(), name: None, expect: Some(Some("axon".into())) },
+            ClientFrame::Rename { session_id: "s".into(), name: Some("axon".into()), expect: Some(None) },
             ClientFrame::AuthState(agent_core::auth::AuthStateQuery::default()),
             ClientFrame::AuthState(agent_core::auth::AuthStateQuery {
                 provider: Some("anthropic".into()),
                 account: Some("b".into()),
                 clear: true,
             }),
+            ClientFrame::ReloadExtension { extension: "subconscious".into() },
             ClientFrame::Children { id: Some(7), session_id: Some("s".into()), sid: Some(42), members: true },
             ClientFrame::Children { id: None, session_id: None, sid: None, members: false },
             ClientFrame::ThinkingOptions { id: Some(8), model: Some("muse/muse-wonder-1.0".into()), warm: true },
@@ -1946,6 +2207,8 @@ mod tests {
                     replay: vec![],
                     pending_prompts: vec![],
                     clients: vec![],
+                    roster: Vec::new(),
+                    client_input: ClientInput::Shared,
                     input_owner: None,
                     display_tail: None,
                 },
@@ -1955,6 +2218,33 @@ mod tests {
             DaemonFrame::Closed { session_id: "s".into(), text: "closed".into() },
             DaemonFrame::Pinned { session_id: "s".into(), on: true },
             DaemonFrame::Pinned { session_id: "s".into(), on: false },
+            DaemonFrame::Renamed { session_id: "s".into(), name: Some("axon".into()), in_memory_only: false },
+            DaemonFrame::Renamed { session_id: "s".into(), name: None, in_memory_only: true },
+            DaemonFrame::RenameFailed {
+                session_id: "s".into(),
+                reason: RenameRefusal::Taken,
+                message: "name 'axon' already used by session t".into(),
+                taken_by: Some("t".into()),
+                current_name: None,
+            },
+            DaemonFrame::RenameFailed {
+                session_id: "s".into(),
+                reason: RenameRefusal::Named,
+                message: "named".into(),
+                taken_by: None,
+                current_name: Some("axon".into()),
+            },
+            DaemonFrame::ExtensionReloaded {
+                report: crate::extensions::manager::ExtensionReloadReport {
+                    extension: "subconscious".into(),
+                    was_loaded: true,
+                    deferred: false,
+                    tools: vec!["subconscious:day_note".into()],
+                    removed_tools: vec!["subconscious:old".into()],
+                    plugin_dir: PathBuf::from("/p/subconscious"),
+                },
+            },
+            DaemonFrame::ExtensionReloadFailed { extension: "x".into(), message: "boom".into(), unloaded: true },
             DaemonFrame::Bye { reason: None },
             DaemonFrame::Bye { reason: Some(ByeReason::Reloading { generation: 2, retry_after_ms: 500 }) },
             DaemonFrame::Bye { reason: Some(ByeReason::Shutdown) },
@@ -2010,6 +2300,35 @@ mod tests {
     }
 
     #[test]
+    fn rename_name_defaults_to_clear_and_older_daemons_reject_it_as_an_unknown_variant() {
+        let f: ClientFrame = decode_line(r#"{"type":"rename","session_id":"s"}"#).unwrap();
+        assert!(matches!(f, ClientFrame::Rename { ref session_id, name: None, expect: None } if session_id.as_str() == "s"));
+        // `expect`: absent = no precondition, `null` = must be unnamed.
+        let f: ClientFrame = decode_line(r#"{"type":"rename","session_id":"s","name":"a","expect":null}"#).unwrap();
+        assert!(matches!(f, ClientFrame::Rename { expect: Some(None), .. }));
+        let f: ClientFrame = decode_line(r#"{"type":"rename","session_id":"s","name":"a","expect":"b"}"#).unwrap();
+        assert!(matches!(f, ClientFrame::Rename { expect: Some(Some(ref b)), .. } if b == "b"));
+        let line = encode_line(&ClientFrame::Rename { session_id: "s".into(), name: None, expect: Some(None) }).unwrap();
+        assert!(line.contains(r#""expect":null"#), "{line}");
+        let f: ClientFrame = decode_line(r#"{"type":"rename","session_id":"s","name":"axon"}"#).unwrap();
+        assert!(matches!(f, ClientFrame::Rename { name: Some(ref n), .. } if n == "axon"));
+        #[derive(Debug, Deserialize)]
+        #[serde(tag = "type", rename_all = "snake_case")]
+        enum OldClientFrame {
+            Ping,
+            Purge,
+        }
+        let err = decode_line::<OldClientFrame>(r#"{"type":"rename","session_id":"s","name":"x"}"#).unwrap_err();
+        assert!(err.contains("unknown variant `rename`"), "{err}");
+        // A refusal reason this client does not know decodes as `failed`.
+        let f: DaemonFrame = decode_line(
+            r#"{"type":"rename_failed","session_id":"s","reason":"from_the_future","message":"m"}"#,
+        )
+        .unwrap();
+        assert!(matches!(f, DaemonFrame::RenameFailed { reason: RenameRefusal::Failed, taken_by: None, .. }));
+    }
+
+    #[test]
     fn pin_requires_on_and_older_daemons_reject_it_as_an_unknown_variant() {
         let f: ClientFrame = decode_line(r#"{"type":"pin","session_id":"s","on":false}"#).unwrap();
         assert!(matches!(f, ClientFrame::Pin { ref session_id, on: false } if session_id.as_str() == "s"));
@@ -2022,6 +2341,26 @@ mod tests {
         }
         let err = decode_line::<OldClientFrame>(r#"{"type":"pin","session_id":"s","on":true}"#).unwrap_err();
         assert!(err.contains("unknown variant `pin`"), "{err}");
+    }
+
+    #[test]
+    fn reload_extension_requires_a_name_and_older_daemons_reject_it_as_an_unknown_variant() {
+        let f: ClientFrame = decode_line(r#"{"type":"reload_extension","extension":"axel"}"#).unwrap();
+        assert!(matches!(f, ClientFrame::ReloadExtension { ref extension } if extension == "axel"));
+        assert!(decode_line::<ClientFrame>(r#"{"type":"reload_extension"}"#).is_err());
+        // An older daemon's reply-less failure mode: `Connected::reload_extension`
+        // keys "daemon too old" on this exact wording.
+        #[derive(Debug, Deserialize)]
+        #[serde(tag = "type", rename_all = "snake_case")]
+        enum OldClientFrame {
+            Ping,
+            Purge,
+        }
+        let err = decode_line::<OldClientFrame>(r#"{"type":"reload_extension","extension":"axel"}"#).unwrap_err();
+        assert!(err.contains("unknown variant `reload_extension`"), "{err}");
+        // `unloaded` is optional on the failure reply.
+        let d: DaemonFrame = serde_json::from_str(r#"{"type":"extension_reload_failed","extension":"x","message":"m"}"#).unwrap();
+        assert!(matches!(d, DaemonFrame::ExtensionReloadFailed { unloaded: false, .. }));
     }
 
     #[test]

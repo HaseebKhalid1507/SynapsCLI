@@ -46,6 +46,7 @@ fn tool_context() -> ToolContext {
             session_allow_all: None,
             launch_cancel: None,
             memory_backend: None,
+            telemetry: None,
             watcher_exit_path: None,
             tool_register_tx: None,
             session_manager: None,

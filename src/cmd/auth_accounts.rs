@@ -91,7 +91,7 @@ async fn gather(
             .map_err(|e| format!("remote broker capabilities failed: {e}"))?;
         let rows: Vec<AccountSummary> = caps
             .into_iter()
-            .filter(|c| provider.map_or(true, |p| c.key == p.as_str()))
+            .filter(|c| provider.is_none_or(|p| c.key == p.as_str()))
             .flat_map(|c| c.accounts)
             .collect();
         return Ok((Source::Remote, rows, auth::AccountInventory::default()));
@@ -117,7 +117,7 @@ pub async fn list(opts: ListOptions) -> Result<(), String> {
     if opts.json {
         let selectors: serde_json::Map<String, serde_json::Value> = auth::provider::DESCRIPTORS
             .iter()
-            .filter(|d| provider.map_or(true, |p| p == d.id))
+            .filter(|d| provider.is_none_or(|p| p == d.id))
             .map(|d| {
                 let value = match policy.selector(d.id) {
                     AccountSelector::Account(a) => serde_json::json!({"kind": "account", "account": a.label_str()}),
@@ -417,7 +417,7 @@ pub async fn identify(opts: IdentifyOptions) -> Result<(), String> {
         .filter(|row| {
             account
                 .as_ref()
-                .map_or(true, |a| a.label_str() == row.label)
+                .is_none_or(|a| a.label_str() == row.label)
         })
         .cloned()
         .collect();
@@ -1109,7 +1109,7 @@ mod state_tests {
     use auth::auth_state::{AccountState, IdentityKind};
     use std::sync::{Arc, Mutex};
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    use tokio::net::UnixListener;
+    use agent_engine::ipc::{split_server, Listener};
 
     /// How the fixture daemon answers the `auth_state` frame.
     #[derive(Clone)]
@@ -1148,13 +1148,13 @@ mod state_tests {
     ) {
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("d.sock");
-        let listener = UnixListener::bind(&sock).unwrap();
+        let mut listener = Listener::bind(&sock).unwrap();
         let queries: Arc<Mutex<Vec<auth::AuthStateQuery>>> = Arc::default();
         let seen = queries.clone();
         let task = tokio::spawn(async move {
             for _ in 0..conns {
-                let (stream, _) = listener.accept().await.unwrap();
-                let (r, mut w) = stream.into_split();
+                let stream = listener.accept().await.unwrap();
+                let (r, mut w) = split_server(stream);
                 let mut lines = BufReader::new(r).lines();
                 let hello = lines.next_line().await.unwrap().expect("hello");
                 assert!(

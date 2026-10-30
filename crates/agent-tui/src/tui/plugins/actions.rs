@@ -1927,6 +1927,7 @@ mod tests {
     /// Test it via the helper directly (`run_post_install_setup_for_dir`)
     /// so we don't have to spin up a whole install flow with a real git
     /// fixture just to assert the hook fires.
+    #[cfg(unix)] // writes and runs a `#!/bin/bash` setup script
     #[tokio::test(flavor = "current_thread")]
     async fn post_install_setup_runs_declared_script() {
         let _guard = BASE_DIR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -1991,6 +1992,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)] // writes and runs a `#!/bin/bash` setup script
     #[tokio::test(flavor = "current_thread")]
     async fn post_install_setup_propagates_non_zero_exit() {
         let _guard = BASE_DIR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -2025,6 +2027,7 @@ mod tests {
     /// and is executable inside the freshly-cloned plugin dir, skip
     /// the setup script entirely (fast-path for source-shipped binaries
     /// or reinstalls where the artifact survived in place).
+    #[cfg(unix)] // writes and runs a `#!/bin/bash` setup script
     #[tokio::test(flavor = "current_thread")]
     async fn post_install_setup_skipped_when_extension_binary_already_present() {
         let _guard = BASE_DIR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -2078,6 +2081,7 @@ mod tests {
     /// Slice C/F: setup script exits 0 but the declared
     /// `extension.command` doesn't exist after — surface a clear
     /// error instead of silently proceeding with a broken install.
+    #[cfg(unix)] // writes and runs a `#!/bin/bash` setup script
     #[tokio::test(flavor = "current_thread")]
     async fn post_install_setup_fails_when_setup_does_not_produce_extension_binary() {
         let _guard = BASE_DIR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());

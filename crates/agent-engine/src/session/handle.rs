@@ -13,11 +13,39 @@ use super::transport::TransportError;
 use super::types::{Addressed, ClientId, Envelope, SessionCommand, SessionConfig, SessionId, SessionLifecycle, SessionMeta};
 
 /// Live client accounting published by the actor (B4 `sessions()` listing).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Presence {
     pub clients: usize,
     pub input_owner: Option<ClientId>,
     pub awaiting_input: usize,
+    /// Every attached client, named (`synaps daemon sessions`).
+    pub roster: Vec<super::types::ClientInfo>,
+    /// Who may drive (`None` until the actor publishes).
+    pub client_input: Option<super::types::ClientInput>,
+    /// A turn or a compaction is running.
+    pub busy: bool,
+    /// What `state_since` dates (idle / busy / parked): a publish that
+    /// changes it restamps `state_since`.
+    pub state: PresenceState,
+    pub state_since: Option<chrono::DateTime<chrono::Utc>>,
+    /// Wall-clock idle park (Live, zero clients, grace armed).
+    pub park_due: Option<chrono::DateTime<chrono::Utc>>,
+    /// Wall-clock eviction of a Parked session.
+    pub evict_due: Option<chrono::DateTime<chrono::Utc>>,
+    /// Conversation title / cost / api message count. Kept as last seen
+    /// while Parked (no conversation in memory).
+    pub title: Option<String>,
+    pub cost_usd: f64,
+    pub messages: usize,
+}
+
+/// The coarse state `Presence::state_since` dates.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PresenceState {
+    #[default]
+    Idle,
+    Busy,
+    Parked,
 }
 use super::view::RuntimeView;
 
@@ -173,7 +201,7 @@ impl SessionHandle {
 
     /// Clients / input owner / pending prompts as last published.
     pub fn presence(&self) -> Presence {
-        **self.presence.load()
+        (**self.presence.load()).clone()
     }
 
     /// Current session name (create `--name` or a later `saveas`).
@@ -204,7 +232,8 @@ impl SessionHandle {
     }
 
     /// `meta()` with the live cells filled in (lifecycle, clients, owner,
-    /// awaiting_input, journal_id, name, pinned) — what listings show.
+    /// awaiting_input, client_input, model, journal_id, name, pinned, and the
+    /// presence's busy/state/deadlines/title/cost/messages) — what listings show.
     pub fn meta_live(&self) -> SessionMeta {
         let mut m = (*self.meta).clone();
         let p = self.presence();
@@ -212,9 +241,20 @@ impl SessionHandle {
         m.clients = p.clients;
         m.input_owner = p.input_owner;
         m.awaiting_input = p.awaiting_input;
+        m.roster = p.roster;
+        m.client_input = p.client_input;
+        // `/model` from any client changes it; the create-time meta doesn't.
+        m.model = self.view.load().model.clone();
         m.journal_id = self.journal_id();
         m.name = self.name();
         m.pinned = self.pinned();
+        m.busy = p.busy;
+        m.state_since = p.state_since;
+        m.park_due = p.park_due;
+        m.evict_due = p.evict_due;
+        m.title = p.title;
+        m.cost_usd = p.cost_usd;
+        m.messages = p.messages;
         m
     }
 
@@ -286,9 +326,18 @@ pub mod echo {
             clients: 0,
             input_owner: None,
             awaiting_input: 0,
+            roster: Vec::new(),
+            client_input: None,
             journal_id: id.0.clone(),
             locked_by: None,
             pinned: false,
+            busy: false,
+            state_since: None,
+            park_due: None,
+            evict_due: None,
+            title: None,
+            cost_usd: 0.0,
+            messages: 0,
         }
     }
 
@@ -391,6 +440,8 @@ pub mod echo {
                 replay: Vec::new(),
                 pending_prompts: Vec::new(),
                 clients: self.clients.iter().map(|(c, m)| (*c, m.kind)).collect(),
+                roster: Vec::new(),
+                client_input: ClientInput::wire_default(),
                 input_owner: None,
                 display_tail,
             }
@@ -414,7 +465,8 @@ pub mod echo {
                         client: cid,
                         snapshot,
                     });
-                    self.emit(SessionEventWire::ClientJoined { client: cid, kind });
+                    let name = kind.default_name().to_string();
+                    self.emit(SessionEventWire::ClientJoined { client: cid, kind, name, mode: AttachMode::Mirror });
                 }
                 SessionCommand::Detach { client } => {
                     if self.clients.remove(&client).is_some() {
@@ -555,9 +607,18 @@ pub mod locked_placeholder {
             clients: 0,
             input_owner: None,
             awaiting_input: 0,
+            roster: Vec::new(),
+            client_input: None,
             journal_id: id.0.clone(),
             locked_by: Some(holder_desc.clone()),
             pinned: false,
+            busy: false,
+            state_since: None,
+            park_due: None,
+            evict_due: None,
+            title: None,
+            cost_usd: 0.0,
+            messages: 0,
         };
         let view = crate::session::view::RuntimeView {
             model: config.model_override.clone().unwrap_or_else(|| "unknown".into()),

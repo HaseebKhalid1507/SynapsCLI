@@ -12,8 +12,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 
 use super::handle::CMD_CHAN_CAP;
@@ -21,6 +19,7 @@ use super::transport::{ClientTransport, TransportError, ATTACH_TIMEOUT, ATTACH_T
 use super::types::*;
 use super::view::RuntimeView;
 use super::wire::*;
+use crate::ipc::{ClientReadHalf, ClientWriteHalf};
 
 pub const CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -37,10 +36,21 @@ pub const CLOSE_TIMEOUT: Duration = Duration::from_secs(
 /// session unparking) plus a margin.
 pub const PIN_TIMEOUT: Duration =
     Duration::from_secs(crate::daemon::pin::PIN_UNPARK_BUDGET.as_secs() + 2);
+/// How long `rename` waits for the daemon's answer: its queue retry and the
+/// actor's reply (`daemon/rename.rs` budgets), plus a margin.
+pub const RENAME_TIMEOUT: Duration = Duration::from_secs(
+    crate::daemon::rename::RENAME_SEND_RETRY.as_secs() + crate::daemon::rename::RENAME_REPLY_BUDGET.as_secs() + 2,
+);
+/// How long `reload_extension` waits: the daemon first waits for the
+/// extension manager's lock, then stops the old process and runs the new
+/// one's start-up handshake (each bounded by the extension runtime's own
+/// timeouts, around 15 s together). Generous, because giving up early only
+/// hides the answer: the daemon finishes the reload either way.
+pub const RELOAD_EXTENSION_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// A connection past `Hello`/`Welcome`, before `Attach`.
 pub struct Connected {
-    reader: BufReader<OwnedReadHalf>,
+    reader: BufReader<ClientReadHalf>,
     writer: mpsc::Sender<ClientFrame>,
     writer_task: tokio::task::JoinHandle<()>,
     pub welcome: Welcome,
@@ -95,7 +105,7 @@ impl FrameBuf {
     }
 }
 
-async fn read_frame(reader: &mut BufReader<OwnedReadHalf>, buf: &mut FrameBuf) -> Result<Option<DaemonFrame>, TransportError> {
+async fn read_frame(reader: &mut BufReader<ClientReadHalf>, buf: &mut FrameBuf) -> Result<Option<DaemonFrame>, TransportError> {
     // Cancel-safe: the TUI polls this inside `select!`, so a partial line
     // stays in `buf.line` across a dropped future and is cleared only once
     // a whole frame has been taken out of it.
@@ -129,7 +139,7 @@ async fn read_frame(reader: &mut BufReader<OwnedReadHalf>, buf: &mut FrameBuf) -
     }
 }
 
-fn spawn_writer(mut w: OwnedWriteHalf) -> (mpsc::Sender<ClientFrame>, tokio::task::JoinHandle<()>) {
+fn spawn_writer(mut w: ClientWriteHalf) -> (mpsc::Sender<ClientFrame>, tokio::task::JoinHandle<()>) {
     let (tx, mut rx) = mpsc::channel::<ClientFrame>(CMD_CHAN_CAP);
     let task = tokio::spawn(async move {
         while let Some(frame) = rx.recv().await {
@@ -157,10 +167,10 @@ impl Connected {
     /// Hello/Welcome only. `Refused{Version}` → `TransportError::Version`;
     /// any other refusal → `Protocol`.
     pub async fn connect(path: &Path, hello: Hello) -> Result<Self, TransportError> {
-        let stream = tokio::time::timeout(CONNECT_TIMEOUT, UnixStream::connect(path))
+        let stream = tokio::time::timeout(CONNECT_TIMEOUT, crate::ipc::connect(path))
             .await
             .map_err(|_| TransportError::Protocol("connect timed out".into()))??;
-        let (r, w) = stream.into_split();
+        let (r, w) = crate::ipc::split_client(stream);
         let mut reader = BufReader::new(r);
         let (writer, writer_task) = spawn_writer(w);
         let client_version = hello.protocol_version;
@@ -281,6 +291,58 @@ impl Connected {
         pin_reply(frame, &self.welcome.daemon_version)
     }
 
+    /// `Rename{id, name, expect}`: name (`Some`) or unname (`None`) one
+    /// session with host authority, without attaching. `expect` is the
+    /// compare-and-set precondition (`Some(None)` = only if unnamed).
+    /// `Ok(Ok(renamed))` = done; `Ok(Err(failure))` = the daemon says why
+    /// not, or `Unknown` when no answer came (timeout, connection lost after
+    /// sending: it may still apply). No such session → `UnknownSession`; a
+    /// daemon that predates `Rename` → `DaemonTooOld` (never a hang: it
+    /// answers the unknown frame at once).
+    pub async fn rename(
+        &mut self,
+        id: &SessionId,
+        name: Option<&str>,
+        expect: Option<Option<String>>,
+    ) -> Result<Result<Renamed, RenameFailure>, TransportError> {
+        self.writer
+            .send(ClientFrame::Rename { session_id: id.clone(), name: name.map(str::to_string), expect })
+            .await
+            .map_err(|_| TransportError::Closed)?;
+        let unknown = |why: &str| {
+            Ok(Err(RenameFailure {
+                reason: crate::session::wire::RenameRefusal::Unknown,
+                message: format!("{why}; the rename may still apply. Re-list (`synaps daemon sessions`) before retrying"),
+                taken_by: None,
+                current_name: None,
+            }))
+        };
+        match tokio::time::timeout(RENAME_TIMEOUT, read_frame(&mut self.reader, &mut self.buf)).await {
+            Err(_) => unknown("no reply from the daemon in time"),
+            Ok(Ok(None)) | Ok(Err(TransportError::Closed)) => unknown("the daemon closed the connection before answering"),
+            Ok(frame) => rename_reply(frame?, &self.welcome.daemon_version),
+        }
+    }
+
+    /// `ReloadExtension{extension}`: stop that extension and start it again
+    /// from what is installed now. `Ok(Ok(report))` = reloaded;
+    /// `Ok(Err(failure))` = the daemon tried and says why not; a refusal
+    /// (daemon reloading) → `Refused(text)`; a daemon that predates the
+    /// frame → `DaemonTooOld`.
+    pub async fn reload_extension(
+        &mut self,
+        extension: &str,
+    ) -> Result<Result<ExtensionReloadReport, ExtensionReloadFailure>, TransportError> {
+        self.writer
+            .send(ClientFrame::ReloadExtension { extension: extension.to_string() })
+            .await
+            .map_err(|_| TransportError::Closed)?;
+        let frame = tokio::time::timeout(RELOAD_EXTENSION_TIMEOUT, read_frame(&mut self.reader, &mut self.buf))
+            .await
+            .map_err(|_| TransportError::Protocol("extension reload reply timed out".into()))??;
+        reload_extension_reply(frame, &self.welcome.daemon_version)
+    }
+
     /// Say goodbye and drop the connection.
     pub async fn bye(self) {
         let _ = self.writer.send(ClientFrame::Bye).await;
@@ -326,8 +388,92 @@ fn pin_reply(frame: Option<DaemonFrame>, daemon_version: &str) -> Result<bool, T
     }
 }
 
+/// A rename the daemon applied (`DaemonFrame::Renamed`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Renamed {
+    /// The session's name now (`None` = cleared).
+    pub name: Option<String>,
+    /// The session is not persisted: nothing was written.
+    pub in_memory_only: bool,
+}
+
+/// Why the daemon did not rename a session (`DaemonFrame::RenameFailed`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenameFailure {
+    pub reason: crate::session::wire::RenameRefusal,
+    pub message: String,
+    /// Journal id of the saved session that already has the name (`Taken`).
+    pub taken_by: Option<String>,
+    /// The session's name when the `expect` precondition failed (`Named`).
+    pub current_name: Option<String>,
+}
+
+/// The daemon's answer to `Rename`, as [`Connected::rename`] reports it.
+fn rename_reply(
+    frame: Option<DaemonFrame>,
+    daemon_version: &str,
+) -> Result<Result<Renamed, RenameFailure>, TransportError> {
+    match frame {
+        Some(DaemonFrame::Renamed { name, in_memory_only, .. }) => Ok(Ok(Renamed { name, in_memory_only })),
+        Some(DaemonFrame::RenameFailed { reason, message, taken_by, current_name, .. }) => {
+            Ok(Err(RenameFailure { reason, message, taken_by, current_name }))
+        }
+        Some(DaemonFrame::Refused { reason: RefuseReason::UnknownSession, message }) => {
+            Err(TransportError::UnknownSession(message))
+        }
+        Some(DaemonFrame::Refused { message, .. }) => Err(TransportError::Refused(message)),
+        // An older daemon cannot decode the frame; it answers with serde's
+        // "unknown variant `rename`" and keeps the connection open.
+        Some(DaemonFrame::Error { message, .. }) if message.contains("unknown variant `rename`") => {
+            Err(TransportError::DaemonTooOld { daemon_version: daemon_version.to_string(), request: "daemon rename" })
+        }
+        Some(DaemonFrame::Error { message, .. }) => Err(TransportError::Protocol(message)),
+        Some(other) => Err(TransportError::Protocol(format!("expected renamed, got {other:?}"))),
+        None => Err(TransportError::Closed),
+    }
+}
+
+pub use crate::extensions::manager::ExtensionReloadReport;
+
+/// The daemon's reason an extension was not reloaded
+/// (`DaemonFrame::ExtensionReloadFailed`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtensionReloadFailure {
+    pub message: String,
+    /// The old instance was stopped before the new one failed to start: the
+    /// extension is not loaded now. `false` = the running one (if any) was
+    /// not touched.
+    pub unloaded: bool,
+}
+
+/// The daemon's answer to `ReloadExtension`, as
+/// [`Connected::reload_extension`] reports it.
+fn reload_extension_reply(
+    frame: Option<DaemonFrame>,
+    daemon_version: &str,
+) -> Result<Result<ExtensionReloadReport, ExtensionReloadFailure>, TransportError> {
+    match frame {
+        Some(DaemonFrame::ExtensionReloaded { report }) => Ok(Ok(report)),
+        Some(DaemonFrame::ExtensionReloadFailed { message, unloaded, .. }) => {
+            Ok(Err(ExtensionReloadFailure { message, unloaded }))
+        }
+        Some(DaemonFrame::Refused { message, .. }) => Err(TransportError::Refused(message)),
+        // An older daemon cannot decode the frame; it answers with serde's
+        // "unknown variant `reload_extension`" and keeps the connection open.
+        Some(DaemonFrame::Error { message, .. }) if message.contains("unknown variant `reload_extension`") => {
+            Err(TransportError::DaemonTooOld {
+                daemon_version: daemon_version.to_string(),
+                request: "daemon reload-extension",
+            })
+        }
+        Some(DaemonFrame::Error { message, .. }) => Err(TransportError::Protocol(message)),
+        Some(other) => Err(TransportError::Protocol(format!("expected extension_reloaded, got {other:?}"))),
+        None => Err(TransportError::Closed),
+    }
+}
+
 pub struct SocketTransport {
-    reader: BufReader<OwnedReadHalf>,
+    reader: BufReader<ClientReadHalf>,
     writer: mpsc::Sender<ClientFrame>,
     _writer_task: tokio::task::JoinHandle<()>,
     session: SessionId,
@@ -337,6 +483,8 @@ pub struct SocketTransport {
     pub welcome: Welcome,
     mode: AttachMode,
     input_owner: Option<ClientId>,
+    roster: Roster,
+    client_input: ClientInput,
     ended: bool,
     path: PathBuf,
     hello: Hello,
@@ -419,6 +567,8 @@ impl SocketTransport {
                 welcome: conn.welcome,
                 mode,
                 input_owner: snapshot.input_owner,
+                roster: Roster::from_snapshot(&snapshot),
+                client_input: snapshot.client_input,
                 ended: false,
                 path: conn.path,
                 hello: conn.hello,
@@ -527,6 +677,20 @@ impl SocketTransport {
     pub async fn pin(path: &Path, id: &SessionId, on: bool) -> Result<bool, TransportError> {
         let mut c = Connected::connect(path, Hello::new(ClientKind::Attach)).await?;
         let r = c.pin(id, on).await;
+        c.bye().await;
+        r
+    }
+
+    /// `Rename{id, name}` on a fresh control connection (see
+    /// [`Connected::rename`]).
+    pub async fn rename(
+        path: &Path,
+        id: &SessionId,
+        name: Option<&str>,
+        expect: Option<Option<String>>,
+    ) -> Result<Result<Renamed, RenameFailure>, TransportError> {
+        let mut c = Connected::connect(path, Hello::new(ClientKind::Attach)).await?;
+        let r = c.rename(id, name, expect).await;
         c.bye().await;
         r
     }
@@ -718,7 +882,7 @@ impl ClientTransport for SocketTransport {
                         SessionEventWire::Reloading { generation, .. } => {
                             self.reload_pending = Some(*generation);
                         }
-                        _ => {}
+                        other => self.roster.apply(other),
                     }
                     return Some(env);
                 }
@@ -767,6 +931,14 @@ impl ClientTransport for SocketTransport {
 
     fn input_owner(&self) -> Option<ClientId> {
         self.input_owner
+    }
+
+    fn roster(&self) -> Roster {
+        self.roster.clone()
+    }
+
+    fn client_input(&self) -> ClientInput {
+        self.client_input
     }
 
     /// C3: after `Reloading`/EOF — backoff 100 ms ×2 → cap 5 s, total ≤
@@ -835,19 +1007,23 @@ impl ClientTransport for SocketTransport {
     fn daemon_binary(&self) -> Option<crate::session::transport::BinaryId> {
         Some(crate::session::transport::BinaryId::of(&self.welcome))
     }
+
+    fn socket_path(&self) -> Option<&Path> {
+        Some(&self.path)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ipc::Listener;
     use crate::{LlmEvent, StreamEvent};
-    use tokio::net::UnixListener;
 
     /// A hand-rolled daemon: Welcome, answer Ping, Attach → Attached, then
     /// echo every Cmd::Submit as an Event stream.
-    async fn fake_daemon(listener: UnixListener, protocol_version: u32) {
-        let (stream, _) = listener.accept().await.unwrap();
-        let (r, mut w) = stream.into_split();
+    async fn fake_daemon(mut listener: Listener, protocol_version: u32) {
+        let stream = listener.accept().await.unwrap();
+        let (r, mut w) = crate::ipc::split_server(stream);
         let mut reader = BufReader::new(r);
         let mut line = String::new();
         let mut seq = 0u64;
@@ -892,6 +1068,8 @@ mod tests {
                         replay: vec![],
                         pending_prompts: vec![],
                         clients: vec![],
+                        roster: Vec::new(),
+                        client_input: ClientInput::wire_default(),
                         input_owner: Some(ClientId(7)),
                         display_tail: None,
                     },
@@ -1055,7 +1233,7 @@ mod tests {
     #[tokio::test]
     async fn next_event_survives_cancellation_mid_frame() {
         let (_d, path) = sock();
-        let l = UnixListener::bind(&path).unwrap();
+        let l = Listener::bind(&path).unwrap();
         let srv = tokio::spawn(fake_daemon(l, PROTOCOL_VERSION));
         let conn = SocketTransport::connect(&path, Hello::new(ClientKind::Test)).await.unwrap();
         let (mut t, _) = SocketTransport::attach(conn, Attach::Existing { session_id: "fake-1".into(), mode: AttachMode::Mirror })
@@ -1081,7 +1259,7 @@ mod tests {
     #[tokio::test]
     async fn socket_transport_handshake_attach_pump() {
         let (_d, path) = sock();
-        let l = UnixListener::bind(&path).unwrap();
+        let l = Listener::bind(&path).unwrap();
         let srv = tokio::spawn(fake_daemon(l, PROTOCOL_VERSION));
 
         let mut conn = SocketTransport::connect(&path, Hello::new(ClientKind::Test)).await.unwrap();
@@ -1126,7 +1304,7 @@ mod tests {
     #[tokio::test]
     async fn conversation_digest_miss_requeries_messages() {
         let (_d, path) = sock();
-        let l = UnixListener::bind(&path).unwrap();
+        let l = Listener::bind(&path).unwrap();
         let srv = tokio::spawn(fake_daemon(l, PROTOCOL_VERSION));
         let conn = SocketTransport::connect(&path, Hello::new(ClientKind::Test)).await.unwrap();
         let (mut t, _) = SocketTransport::attach(conn, Attach::Existing { session_id: "fake-1".into(), mode: AttachMode::Mirror })
@@ -1158,7 +1336,7 @@ mod tests {
     #[tokio::test]
     async fn reloading_then_bye_sets_last_error_and_reconnect_gives_up_on_a_dead_socket() {
         let (_d, path) = sock();
-        let l = UnixListener::bind(&path).unwrap();
+        let l = Listener::bind(&path).unwrap();
         let srv = tokio::spawn(fake_daemon(l, PROTOCOL_VERSION));
         let conn = SocketTransport::connect(&path, Hello::new(ClientKind::Test)).await.unwrap();
         let (mut t, _) = SocketTransport::attach(conn, Attach::Existing { session_id: "fake-1".into(), mode: AttachMode::Observe })
@@ -1182,11 +1360,11 @@ mod tests {
     #[tokio::test]
     async fn attach_error_frame_is_refused() {
         let (_d, path) = sock();
-        let l = UnixListener::bind(&path).unwrap();
+        let mut l = Listener::bind(&path).unwrap();
         // A daemon that welcomes, then answers the Attach with an Error frame.
         let srv = tokio::spawn(async move {
-            let (stream, _) = l.accept().await.unwrap();
-            let (r, mut w) = stream.into_split();
+            let stream = l.accept().await.unwrap();
+            let (r, mut w) = crate::ipc::split_server(stream);
             let mut reader = BufReader::new(r);
             let mut line = String::new();
             reader.read_line(&mut line).await.unwrap();
@@ -1220,7 +1398,7 @@ mod tests {
     #[tokio::test]
     async fn socket_transport_refuses_version_mismatch() {
         let (_d, path) = sock();
-        let l = UnixListener::bind(&path).unwrap();
+        let l = Listener::bind(&path).unwrap();
         let srv = tokio::spawn(fake_daemon(l, 99));
         let err = SocketTransport::connect(&path, Hello::new(ClientKind::Test)).await.err().unwrap();
         assert!(matches!(err, TransportError::Version { client: PROTOCOL_VERSION, daemon: 99 }), "{err}");
@@ -1274,6 +1452,79 @@ mod tests {
         let closed = DaemonFrame::Closed { session_id: "s".into(), text: "x".into() };
         assert!(matches!(pin_reply(Some(closed), "1"), Err(TransportError::Protocol(_))));
         assert!(matches!(pin_reply(None, "1"), Err(TransportError::Closed)));
+    }
+
+    #[test]
+    fn rename_maps_each_daemon_answer_and_an_old_daemons_unknown_variant_error() {
+        use crate::session::wire::RenameRefusal;
+        let old = DaemonFrame::Error {
+            session_id: None,
+            message: "malformed frame: unknown variant `rename`, expected one of `hello`, `ping`".into(),
+        };
+        let err = rename_reply(Some(old), "0.9.0").unwrap_err();
+        assert!(
+            matches!(err, TransportError::DaemonTooOld { ref daemon_version, request: "daemon rename" } if daemon_version == "0.9.0"),
+            "{err}"
+        );
+        assert!(err.to_string().contains("predates `daemon rename`"), "{err}");
+
+        let ok = DaemonFrame::Renamed { session_id: "s".into(), name: Some("axon".into()), in_memory_only: false };
+        assert_eq!(rename_reply(Some(ok), "1").unwrap(), Ok(Renamed { name: Some("axon".into()), in_memory_only: false }));
+        let cleared = DaemonFrame::Renamed { session_id: "s".into(), name: None, in_memory_only: true };
+        assert_eq!(rename_reply(Some(cleared), "1").unwrap(), Ok(Renamed { name: None, in_memory_only: true }));
+        let taken = DaemonFrame::RenameFailed {
+            session_id: "s".into(),
+            reason: RenameRefusal::Taken,
+            message: "name 'axon' already used by session t".into(),
+            taken_by: Some("t".into()),
+            current_name: None,
+        };
+        let failure = rename_reply(Some(taken), "1").unwrap().unwrap_err();
+        assert_eq!((failure.reason, failure.taken_by.as_deref()), (RenameRefusal::Taken, Some("t")));
+        let busy = DaemonFrame::Refused { reason: RefuseReason::Busy, message: "daemon reloading".into() };
+        assert!(matches!(rename_reply(Some(busy), "1"), Err(TransportError::Refused(_))));
+        let unknown = DaemonFrame::Refused { reason: RefuseReason::UnknownSession, message: "no live session s".into() };
+        assert!(matches!(rename_reply(Some(unknown), "1"), Err(TransportError::UnknownSession(_))));
+        let other = DaemonFrame::Error { session_id: None, message: "rename: no reply".into() };
+        assert!(matches!(rename_reply(Some(other), "1"), Err(TransportError::Protocol(_))));
+        assert!(matches!(rename_reply(None, "1"), Err(TransportError::Closed)));
+    }
+
+    #[test]
+    fn reload_extension_maps_each_daemon_answer_and_an_old_daemons_unknown_variant_error() {
+        let old = DaemonFrame::Error {
+            session_id: None,
+            message: "malformed frame: unknown variant `reload_extension`, expected one of `hello`, `ping`".into(),
+        };
+        let err = reload_extension_reply(Some(old), "0.9.0").unwrap_err();
+        assert!(
+            matches!(err, TransportError::DaemonTooOld { ref daemon_version, request: "daemon reload-extension" } if daemon_version == "0.9.0"),
+            "{err}"
+        );
+
+        let report = ExtensionReloadReport {
+            extension: "axel".into(),
+            was_loaded: true,
+            deferred: false,
+            tools: vec!["axel:axel_search".into()],
+            removed_tools: vec![],
+            plugin_dir: std::path::PathBuf::from("/p/axel"),
+        };
+        let ok = DaemonFrame::ExtensionReloaded { report: report.clone() };
+        assert_eq!(reload_extension_reply(Some(ok), "1").unwrap(), Ok(report));
+        let failed = DaemonFrame::ExtensionReloadFailed { extension: "axel".into(), message: "spawn failed".into(), unloaded: true };
+        assert_eq!(
+            reload_extension_reply(Some(failed), "1").unwrap(),
+            Err(ExtensionReloadFailure { message: "spawn failed".into(), unloaded: true })
+        );
+        let busy = DaemonFrame::Refused { reason: RefuseReason::Busy, message: "daemon reloading".into() };
+        assert!(matches!(reload_extension_reply(Some(busy), "1"), Err(TransportError::Refused(ref m)) if m.contains("reloading")));
+        // A plain `Error` (not the unknown-variant one) stays a protocol error.
+        let other = DaemonFrame::Error { session_id: None, message: "frame too large".into() };
+        assert!(matches!(reload_extension_reply(Some(other), "1"), Err(TransportError::Protocol(_))));
+        let pinned = DaemonFrame::Pinned { session_id: "s".into(), on: true };
+        assert!(matches!(reload_extension_reply(Some(pinned), "1"), Err(TransportError::Protocol(_))));
+        assert!(matches!(reload_extension_reply(None, "1"), Err(TransportError::Closed)));
     }
 
     #[tokio::test]

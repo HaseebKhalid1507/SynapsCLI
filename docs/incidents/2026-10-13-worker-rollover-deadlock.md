@@ -1,6 +1,6 @@
 # Incident 2026-10-13: context rollover deadlocked behind pending workers
 
-**Status:** fixes proposed in two stacked PRs (see [Fixes](#fixes)).
+**Status:** fixed in #221 (merge `c00d5d08`) and #222 (merge `877bad59`), released in 0.11.0. See [Fixes](#fixes).
 **Affected:** `context_management = auto` sessions that run reactive workers
 (`subagent_start`). Code references are to `dev` at `ae490b32` (0.10.2).
 
@@ -99,11 +99,11 @@ workers.
 
 | # | Cause | Fix | Where |
 |---|---|---|---|
-| 1 | Rollover starves on running workers | Bounded grace, then roll over and carry the workers | `fix/rollover-pending-workers` |
-| 2 | Cancelled workers never retire | Retire cancelled workers in the orchestration at finalize | `fix/worker-cancel-scope` |
-| 3 | Advisory sent once | Repeat the WorkersPending reminder every deferred round | `fix/rollover-pending-workers` |
-| 4 | Hard stop has no way out | Hard capacity never waits on workers; `/workers reconcile` | both |
-| 5 | Esc kills earlier turns' workers | Turn-scoped cancel for user interrupts | `fix/worker-cancel-scope` |
+| 1 | Rollover starves on running workers | Bounded grace, then roll over and carry the workers | #222 (`fix/rollover-pending-workers`) |
+| 2 | Cancelled workers never retire | Retire cancelled workers in the orchestration at finalize | #221 (`fix/worker-cancel-scope`) |
+| 3 | Advisory sent once | Repeat the WorkersPending reminder every deferred round | #222 (`fix/rollover-pending-workers`) |
+| 4 | Hard stop has no way out | Hard capacity never waits on workers; `/workers reconcile` | #221, #222 |
+| 5 | Esc kills earlier turns' workers | Turn-scoped cancel for user interrupts | #221 (`fix/worker-cancel-scope`) |
 | 6 | Workers used as timers | Operator rule, no code change; fix 1 removes the lever | operator config |
 
 ### Fix 1: bounded grace, then carry the workers
