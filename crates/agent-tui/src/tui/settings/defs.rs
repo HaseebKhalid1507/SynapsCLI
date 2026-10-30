@@ -265,6 +265,10 @@ define_settings! {
         "Context size, in tokens, at which a worker rolls over to a ~100k successor (default 200000, at least 20000; a smaller model window's own threshold wins). Applies to workers started afterwards.",
         |_app, value| whole_number("subagent_rollover_tokens", value);
 
+    "subagent_transform_hooks", "Subagent output hooks", Agent, EditorKind::Cycler(&["on", "off"]),
+        "Extensions that rewrite tool output (after_tool_call replace with tools.transform_output: compression, redaction) also see subagent workers' tool results, as they see the main session's; no other hook runs in a worker, so a worker never asks for confirmation (default on; off = worker tool results reach history untransformed). Applies to workers started afterwards.",
+        |_app, value| on_off("subagent_transform_hooks", value);
+
     "max_tool_output", "Max tool output", ToolLimits, EditorKind::Text { numeric: true },
         "Bytes to capture from a tool before truncating.",
         |_app, value| match value.parse::<usize>() {
@@ -1176,6 +1180,35 @@ mod tests {
             assert!(is_ok(d("subagent_rollover_tokens", "20000")));
             assert!(is_err(d("subagent_rollover_tokens", "19999")));
             assert!(is_err(d("subagent_rollover_tokens", "lots")));
+        }
+        drop(temp);
+    }
+
+    #[test]
+    fn subagent_transform_hooks_row_displays_and_validates() {
+        use super::super::draw::config_row_display;
+        let _lock = config_lock();
+        for (content, shown) in [
+            ("", "on"),
+            ("subagent_transform_hooks = off\n", "off"),
+            ("subagent_transform_hooks = true\n", "on"),
+            ("subagent_transform_hooks = maybe\n", "on"),
+        ] {
+            let temp = TempConfig::new(content);
+            assert_eq!(
+                config_row_display("subagent_transform_hooks").as_deref(),
+                Some(shown),
+                "{content}"
+            );
+            drop(temp);
+        }
+        let temp = TempConfig::new("");
+        let mut app = app_with_model("m");
+        {
+            let mut d = |key: &str, value: &str| apply_setting_dispatch(key, value, &mut app);
+            assert!(is_ok(d("subagent_transform_hooks", "off")));
+            assert!(is_ok(d("subagent_transform_hooks", "on")));
+            assert!(is_err(d("subagent_transform_hooks", "maybe")));
         }
         drop(temp);
     }

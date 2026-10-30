@@ -776,6 +776,7 @@ pub(crate) fn config_row_display(key: &str) -> Option<String> {
             .filter(|n| *n >= cfg::MIN_SUBAGENT_ROLLOVER_TOKENS)
             .unwrap_or(cfg::DEFAULT_SUBAGENT_ROLLOVER_TOKENS)
             .to_string(),
+        "subagent_transform_hooks" => bool_config_display(key, true),
         "context_management.mode" => raw_config(key)
             .and_then(|v| cfg::ContextManagementMode::parse(&v))
             .unwrap_or_default()
