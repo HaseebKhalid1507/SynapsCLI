@@ -2679,21 +2679,52 @@ pub fn is_secret_env(key: &str, value: &str) -> bool {
     is_secret_key(key) || is_secret_env_value(value)
 }
 
+/// Working-habit steering shared by both stock prompts. It keeps output,
+/// re-reads and file sizes down; those tokens otherwise ride along on every
+/// later request. Phrased without hard tool names: any tool can be disabled.
+macro_rules! default_prompt_steering {
+    ($output_filters:literal) => {
+        concat!(
+            " Change existing files with targeted edits rather than rewriting them whole. \
+            A file you just read or wrote is current in your context; re-read it only if it may have changed. \
+            Keep files, docs and comments as lean as the task allows. \
+            Keep command output small (quiet flags, ",
+            $output_filters,
+            ") and read large outputs selectively."
+        )
+    };
+}
+
+/// Stock system prompt on Windows, used only when no `--system` value and no
+/// `system.md` exist. Custom prompts never include it.
+pub const DEFAULT_PROMPT_WINDOWS: &str = concat!(
+    "You are a helpful AI agent running in a terminal on Windows. \
+    You have access to powershell, bash, read, and write tools. \
+    Prefer the powershell tool for system commands and filesystem operations — it is native \
+    to Windows and avoids quoting/path translation issues. \
+    Use bash only when the task specifically requires WSL or a Unix environment. \
+    Be concise and direct. Use tools when the user asks you to interact with the filesystem or run commands.",
+    default_prompt_steering!("`Select-Object -Last N`, `Select-String`")
+);
+
+/// Stock system prompt on every other platform; see [`DEFAULT_PROMPT_WINDOWS`].
+pub const DEFAULT_PROMPT_UNIX: &str = concat!(
+    "You are a helpful AI agent running in a terminal. \
+    You have access to bash, read, and write tools. \
+    Be concise and direct. Use tools when the user asks you to interact with the filesystem or run commands.",
+    default_prompt_steering!("`| tail -n`, `grep`, `head`")
+);
+
+/// The stock system prompt for this platform.
+#[cfg(windows)]
+pub const DEFAULT_PROMPT: &str = DEFAULT_PROMPT_WINDOWS;
+/// The stock system prompt for this platform.
+#[cfg(not(windows))]
+pub const DEFAULT_PROMPT: &str = DEFAULT_PROMPT_UNIX;
+
 /// Resolve the system prompt from CLI flag, config file, or default.
 /// Priority: explicit value > ~/.synaps-cli/system.md > built-in default.
 pub fn resolve_system_prompt(explicit: Option<&str>) -> String {
-    #[cfg(windows)]
-    const DEFAULT_PROMPT: &str = "You are a helpful AI agent running in a terminal on Windows. \
-        You have access to powershell, bash, read, and write tools. \
-        Prefer the powershell tool for system commands and filesystem operations — it is native \
-        to Windows and avoids quoting/path translation issues. \
-        Use bash only when the task specifically requires WSL or a Unix environment. \
-        Be concise and direct. Use tools when the user asks you to interact with the filesystem or run commands.";
-    #[cfg(not(windows))]
-    const DEFAULT_PROMPT: &str = "You are a helpful AI agent running in a terminal. \
-        You have access to bash, read, and write tools. \
-        Be concise and direct. Use tools when the user asks you to interact with the filesystem or run commands.";
-
     if let Some(val) = explicit {
         let path = std::path::Path::new(val);
         if path.exists() && path.is_file() {
@@ -4013,9 +4044,82 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_resolve_system_prompt_none() {
-        let result = resolve_system_prompt(None);
-        assert!(result.contains("helpful AI agent"));
+        // Empty base dir: no system.md, so the stock default applies.
+        let home = std::env::temp_dir().join(format!("synaps-prompt-none-{}", std::process::id()));
+        std::fs::create_dir_all(home.join(".synaps-cli")).unwrap();
+        with_home(&home, || {
+            assert_eq!(resolve_system_prompt(None), DEFAULT_PROMPT);
+        });
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn default_prompts_carry_working_habit_steering() {
+        for (name, prompt) in [
+            ("unix", DEFAULT_PROMPT_UNIX),
+            ("windows", DEFAULT_PROMPT_WINDOWS),
+        ] {
+            for needle in [
+                "helpful AI agent running in a terminal",
+                "Be concise and direct.",
+                "targeted edits rather than rewriting them whole",
+                "re-read it only if it may have changed",
+                "as lean as the task allows",
+                "Keep command output small",
+                "read large outputs selectively",
+            ] {
+                assert!(prompt.contains(needle), "{name} prompt lacks {needle:?}");
+            }
+            assert!(!prompt.contains("  "), "{name} prompt has a double space");
+            assert!(prompt.ends_with("selectively."), "{name}: {prompt}");
+        }
+        assert!(DEFAULT_PROMPT_UNIX.contains("`| tail -n`"));
+        assert!(DEFAULT_PROMPT_WINDOWS.contains("on Windows"));
+        assert!(DEFAULT_PROMPT_WINDOWS.contains("`Select-Object -Last N`"));
+        assert!(!DEFAULT_PROMPT_WINDOWS.contains("tail -n"));
+    }
+
+    /// The stock prompt sits in the cached prefix of every stock request:
+    /// keep it from silently ballooning.
+    #[test]
+    fn default_prompts_stay_small() {
+        assert!(DEFAULT_PROMPT_UNIX.len() <= 640, "{}", DEFAULT_PROMPT_UNIX.len());
+        assert!(DEFAULT_PROMPT_WINDOWS.len() <= 900, "{}", DEFAULT_PROMPT_WINDOWS.len());
+    }
+
+    /// Explicit `--system` text and files are used byte for byte; the stock
+    /// steering never leaks into them.
+    #[test]
+    fn explicit_system_prompt_is_byte_identical() {
+        let text = "  Custom prompt.\n\nKeep trailing whitespace.  \n";
+        assert_eq!(resolve_system_prompt(Some(text)), text);
+
+        let dir = std::env::temp_dir().join(format!("synaps-prompt-file-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("system.txt");
+        std::fs::write(&file, text).unwrap();
+        assert_eq!(resolve_system_prompt(Some(file.to_str().unwrap())), text);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A user `system.md` (base dir or active profile) replaces the stock
+    /// default entirely, byte for byte.
+    #[test]
+    #[serial]
+    fn system_md_prompt_is_byte_identical() {
+        let text = "You are my agent.\nNo extra steering.\n";
+        let home = std::env::temp_dir().join(format!("synaps-prompt-md-{}", std::process::id()));
+        let dir = home.join(".synaps-cli");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("system.md"), text).unwrap();
+        with_home(&home, || {
+            assert_eq!(resolve_system_prompt(None), text);
+            // An explicit value still wins over system.md.
+            assert_eq!(resolve_system_prompt(Some("explicit")), "explicit");
+        });
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     // Note: test_load_config_nonexistent_file removed — HOME env var mutation
