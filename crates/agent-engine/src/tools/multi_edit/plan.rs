@@ -279,7 +279,10 @@ pub(crate) fn apply(
                     (at, 0, text.len())
                 }
                 _ => {
-                    let at = if whole_lines && m.end > 0 && !content[..m.end].ends_with('\n') {
+                    // An anchor that ends with its own newline is already at a
+                    // boundary; an empty match (`^$`) is not.
+                    let at_boundary = m.end > m.start && content[..m.end].ends_with('\n');
+                    let at = if whole_lines && !at_boundary {
                         match content[m.end..].find('\n') {
                             // A line_prefix match always ends at its line's
                             // end; say so only when it moved off mid-line.
@@ -520,6 +523,10 @@ mod tests {
             let (out, _) = run(src, op, mode, Some(anchor), None, "line 1.5\n").unwrap();
             assert_eq!(out, want, "{op:?} {mode:?} {anchor:?}");
         }
+        // An empty match (an empty line) is still a line to insert after.
+        let (out, _) =
+            run("a\n\nb\n", Op::InsertAfter, AnchorMode::LineRegex, Some("^$"), None, "x\n").unwrap();
+        assert_eq!(out, "a\n\nx\nb\n");
         // Moving off mid-line is reported; landing where the anchor already
         // ends a line is not.
         let (_, applied) =
