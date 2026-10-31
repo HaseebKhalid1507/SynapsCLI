@@ -99,6 +99,21 @@ pub struct AccountState {
     /// The last token refresh exchange for this account in this process.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_refresh: Option<ObservedOutcome>,
+    /// A refused token refresh this broker holds: the account is not
+    /// refreshed again until its stored login changes or `until_ms`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_hold: Option<RefreshHoldState>,
+}
+
+/// A held refused refresh (`refresh_rejected` / `refresh_action_required`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RefreshHoldState {
+    pub failure: ObservationFailure,
+    /// When the provider refused the refresh, epoch ms.
+    pub refused_at_ms: u64,
+    /// When one refresh is tried again unless the stored login changes
+    /// first, epoch ms.
+    pub until_ms: u64,
 }
 
 /// A reported provider limit.
@@ -300,6 +315,15 @@ pub fn render_text(report: &AuthStateReport) -> String {
                 let _ = writeln!(out, "    refresh   none in this process");
             }
         }
+        if let Some(h) = &account.refresh_hold {
+            let _ = writeln!(
+                out,
+                "    held      refresh refused ({}), {}; held until the stored login changes or {}",
+                h.failure,
+                ago(now, h.refused_at_ms),
+                utc(h.until_ms)
+            );
+        }
     }
     if !report.selections.is_empty() {
         let _ = writeln!(out, "last automatic selections");
@@ -368,6 +392,7 @@ mod tests {
                         at_ms: NOW - (2 * 3600 + 3 * 60) * 1000,
                         failure: None,
                     }),
+                    refresh_hold: None,
                 },
                 AccountState {
                     provider: "anthropic".into(),
@@ -378,6 +403,12 @@ mod tests {
                     last_usage: None,
                     last_usage_ok_ms: None,
                     last_refresh: None,
+                    refresh_hold: Some(RefreshHoldState {
+                        failure: ObservationFailure::new(AccountFailureKind::RefreshRejected)
+                            .with_status(400),
+                        refused_at_ms: NOW - 4 * 60 * 1000,
+                        until_ms: NOW + 11 * 60 * 1000,
+                    }),
                 },
             ],
             selections: vec![SelectionState {
@@ -419,6 +450,13 @@ mod tests {
         ] {
             assert!(text.contains(needle), "{needle:?} missing from:\n{text}");
         }
+        let held = format!(
+            "    held      refresh refused (refresh_rejected, HTTP 400), 4m ago; \
+             held until the stored login changes or {}\n",
+            utc(NOW + 11 * 60 * 1000)
+        );
+        assert!(text.contains(&held), "{held:?} missing from:\n{text}");
+        assert_eq!(text.matches("    held ").count(), 1, "only claude6 is held:\n{text}");
         assert!(
             text.contains("): anthropic_quota_exhausted\n"),
             "the cooldown's reason kind:\n{text}"
