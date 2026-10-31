@@ -202,6 +202,23 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **macOS: no "install developer tools" dialog from Git.** `/usr/bin/git`
+  on macOS is Apple's `xcrun` shim, and without the Command Line Tools
+  running it opens that dialog (`GIT_TERMINAL_PROMPT=0` does not stop it).
+  Synaps now runs Git by absolute path and never the shim. The host runs the
+  first `git` on `PATH`, as a shell would, so Homebrew, Nix and MacPorts Git
+  keep working; where `PATH` reaches the shim it runs the developer Git the
+  shim would have run (`DEVELOPER_DIR`, the `xcode-select` choice, Xcode,
+  the Command Line Tools; a `.app` bundle works too), or skips the shim if
+  there is none. The Axel memory service, started with an empty
+  environment, never consults `PATH` and runs that developer Git. With no
+  Git at all, repository memory fails closed with `git unavailable: run
+  xcode-select --install` (now shown, not dropped), and plugin install,
+  update and update checks refuse with the same request. Repository memory
+  with a Git older than 2.31 says it needs 2.31 instead of failing on a
+  "relative path". Linux and Windows run `git` from `PATH` as before.
+  (#343, by @JR-Morton)
+
 - **A closed session or stopped quota keeper frees its lock at once.**
   Session journal locks and quota-keeper locks were released by closing the
   lock file. A `flock` belongs to the open file, and a process that a

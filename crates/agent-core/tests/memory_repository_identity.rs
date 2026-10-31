@@ -455,7 +455,8 @@ fn repository_identity_child() {
     let root = PathBuf::from(root);
     let result = ProjectScope::discover_repository(&root);
     if let Ok(expected) = std::env::var("SYNTHETIC_EXPECTED_ERROR") {
-        assert!(result.unwrap_err().to_string().contains(&expected));
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains(&expected), "{error:?} lacks {expected:?}");
         return;
     }
     let identity = result.unwrap();
@@ -653,16 +654,11 @@ fn synthetic_git_failure(script: &str, expected: &str, timeout: bool) {
     )
     .unwrap();
     fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
-    // macOS never looks Git up on PATH (`agent_core::git_program`): it runs
-    // `$DEVELOPER_DIR/usr/bin/git`, so the synthetic Git is injected there too.
-    // Elsewhere DEVELOPER_DIR is ignored and PATH supplies it.
-    let developer = tmp.path().join("developer");
-    fs::create_dir_all(developer.join("usr/bin")).unwrap();
-    fs::copy(&executable, developer.join("usr/bin/git")).unwrap();
+    // PATH supplies the synthetic Git on every platform: macOS runs the first
+    // real `git` on PATH too (`agent_core::git_program`).
     let started = Instant::now();
     let mut process = child(&main, "")
         .env("PATH", tmp.path())
-        .env("DEVELOPER_DIR", &developer)
         .env("SYNTHETIC_GIT_PID", &pid_path)
         .env("SYNTHETIC_DESCENDANT_PID", &descendant_path)
         .env("SYNTHETIC_EXPECTED_ERROR", expected)
@@ -695,6 +691,16 @@ fn synthetic_git_failure(script: &str, expected: &str, timeout: bool) {
         assert!(started.elapsed() >= Duration::from_millis(4500));
     }
     assert!(!main.join(".git").join(MARKER).exists());
+}
+
+#[test]
+fn git_without_path_format_is_named() {
+    // Git 2.30 echoes the unknown `--path-format=absolute` and exits 0.
+    synthetic_git_failure(
+        "echo --path-format=absolute\necho \"$PWD\"\nexit 0",
+        "Git 2.31 or newer is required",
+        false,
+    );
 }
 
 #[test]

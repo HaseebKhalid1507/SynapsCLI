@@ -42,6 +42,8 @@ pub(super) async fn call(
         .arg(brain)
         .arg("--project")
         .arg(project)
+        // Empty environment, DEVELOPER_DIR included: the service picks its
+        // own Git (agent-core's `git_program.rs`), never from the host's env.
         .env_clear()
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
