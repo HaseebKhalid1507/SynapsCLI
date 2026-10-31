@@ -210,6 +210,19 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Automatic Anthropic account selection keeps a turn on an account that
+  serves.** Fixes to the mid-turn failover of #273: an account whose
+  short usage limit the ordinary retry outlived loses its cooldown, so the
+  next round no longer moves the turn to a cold-cache account (or, with one
+  account, ends it with `all_cooling_down` after its tools ran); when every
+  account is cooling down mid-turn, the turn keeps its account. Keep-warm
+  pings (idle and tool-round) never select, switch or re-bind an account
+  and send no switch notices; a ping on a cooling account stops. Only a
+  refused token refresh (a login or an action needed) moves an automatic
+  selection to another account; a transient one fails with its own kind
+  (`refresh_transient`, not `usage_read_failed`). The mid-turn re-vend
+  honours a refused refresh's hold, and cooldown lookups read auth.json
+  once per version of the file instead of on every request.
 - **A closed session or stopped quota keeper frees its lock at once.**
   Session journal locks and quota-keeper locks were released by closing the
   lock file. A `flock` belongs to the open file, and a process that a

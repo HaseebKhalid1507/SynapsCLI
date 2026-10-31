@@ -345,6 +345,8 @@ pub(crate) enum FailoverRefusal {
     OutputAlreadyStreamed,
     ToolActivity,
     BudgetExhausted,
+    /// A cache keep-warm ping: it keeps the cache of the account it is on.
+    KeepWarmPing,
 }
 
 impl FailoverRefusal {
@@ -355,6 +357,7 @@ impl FailoverRefusal {
             Self::OutputAlreadyStreamed => "output_already_streamed",
             Self::ToolActivity => "tool_activity",
             Self::BudgetExhausted => "failover_budget_exhausted",
+            Self::KeepWarmPing => "keepwarm_ping",
         }
     }
 }
@@ -399,7 +402,7 @@ pub(crate) enum NoHop {
 impl NoHop {
     pub(crate) fn from_refusal(refusal: FailoverRefusal) -> Self {
         match refusal {
-            FailoverRefusal::ExplicitSelection => Self::Explicit,
+            FailoverRefusal::ExplicitSelection | FailoverRefusal::KeepWarmPing => Self::Explicit,
             FailoverRefusal::OutputAlreadyStreamed | FailoverRefusal::ToolActivity => {
                 Self::OutputStreamed
             }
@@ -534,6 +537,13 @@ pub(crate) trait AnthropicAccountRouter: Send + Sync {
     /// refuses to switch, so the next turn boundary re-selects away.
     async fn report_exhausted(&self, failed: &CredentialRef, evidence: &AnthropicQuotaEvidence);
 
+    /// A request on `seat` sent at `sent_at_ms` (epoch ms) was accepted
+    /// after this request reported `seat` exhausted (a short or unknown
+    /// reset the ordinary retry outlived): drop the cooldown, so the next
+    /// round does not move the turn off an account that serves. Must never
+    /// fail the turn.
+    async fn report_served(&self, seat: &CredentialRef, sent_at_ms: u64);
+
     /// After recognized exhaustion, ask the broker to select again for
     /// `model`, never answering with an account in `attempted`: every
     /// account this logical request already used, the exhausted one last.
@@ -629,6 +639,10 @@ impl AnthropicAccountRouter for BrokerAnthropicRouter {
             until_ms = ?until_ms,
             "anthropic usage window exhausted"
         );
+    }
+
+    async fn report_served(&self, seat: &CredentialRef, sent_at_ms: u64) {
+        self.broker().clear_cooldown(seat, sent_at_ms);
     }
 
     async fn failover(

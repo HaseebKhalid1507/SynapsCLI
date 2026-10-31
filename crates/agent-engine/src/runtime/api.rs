@@ -1319,7 +1319,8 @@ impl ApiMethods {
     ) -> Result<Value> {
         use super::anthropic_quota::{
             body_prefix, classify_anthropic_429, failover_permitted, ratelimit_header_summary,
-            Anthropic429, AnthropicFailoverGate, LimitText, NoHop, QUOTA_PROBE_BODY_CAP,
+            Anthropic429, AnthropicFailoverGate, FailoverRefusal, LimitText, NoHop,
+            QUOTA_PROBE_BODY_CAP,
         };
         // Provider qualification is application identity; Anthropic's wire API
         // still receives its native bare model id.
@@ -1623,6 +1624,15 @@ impl ApiMethods {
         let mut anthropic_failovers: u32 = 0;
         let mut anthropic_attempted: Vec<crate::auth::CredentialRef> = Vec::new();
         let mut quota_headers_logged = false;
+        // Accounts this request reported exhausted: if one of them then
+        // serves (the ordinary retry outlived a short reset), its cooldown
+        // goes (`report_served`).
+        let mut anthropic_cooled: Vec<crate::auth::CredentialRef> = Vec::new();
+        // A cache keep-warm ping: it keeps the cache of the account it is
+        // on, so a limit is reported but never switches accounts, and no
+        // notice about it reaches the session.
+        let keepwarm_ping = options.keepwarm.is_some();
+        let mut sent_at_ms;
 
         loop {
             let response = {
@@ -1661,6 +1671,7 @@ impl ApiMethods {
                     }
                     clock = crate::runtime::trace::AttemptClock::start();
                     let sent_at = super::keepwarm::CacheAnchor::now();
+                    sent_at_ms = crate::epoch_millis();
                     let req = wire.encoding_header(req);
                     let req = match &options.keepwarm {
                         Some(keepwarm) => keepwarm_body(req, wire.bytes.clone(), &keepwarm.sent),
@@ -1695,6 +1706,22 @@ impl ApiMethods {
                                 // no earlier than `sent_at`.
                                 if let Some(anchor) = &options.cache_anchor {
                                     anchor.stamp(sent_at);
+                                }
+                                if !anthropic_cooled.is_empty() {
+                                    let served = super::auth::turn_pinned_credential(
+                                        &options.credential_source,
+                                        auth_binding.as_deref(),
+                                    );
+                                    if let Some(seat) =
+                                        served.filter(|s| anthropic_cooled.contains(s))
+                                    {
+                                        await_or_cancel(
+                                            cancel,
+                                            router.report_served(&seat, sent_at_ms),
+                                        )
+                                        .await?;
+                                        anthropic_cooled.retain(|c| c != &seat);
+                                    }
                                 }
                                 response = Some(resp);
                                 break;
@@ -1857,6 +1884,9 @@ impl ApiMethods {
                                         Some(seat) => {
                                             await_or_cancel(cancel, router.report_exhausted(seat, &evidence))
                                                 .await?;
+                                            if !anthropic_cooled.contains(seat) {
+                                                anthropic_cooled.push(seat.clone());
+                                            }
                                         }
                                         None => tracing::warn!(
                                             signal = ?evidence.signal,
@@ -1878,7 +1908,12 @@ impl ApiMethods {
                                         // attempted set (once).
                                         anthropic_attempted.retain(|c| c != seat);
                                         anthropic_attempted.push(seat.clone());
-                                        match failover_permitted(&gate) {
+                                        let permitted = if keepwarm_ping {
+                                            Err(FailoverRefusal::KeepWarmPing)
+                                        } else {
+                                            failover_permitted(&gate)
+                                        };
+                                        match permitted {
                                             Ok(()) => {
                                                 match await_or_cancel(
                                                     cancel,
@@ -1980,9 +2015,11 @@ impl ApiMethods {
                                     // budget a minute at a time) or keep the existing
                                     // retry path for short/unknown resets. No text
                                     // claims another account will serve.
-                                    let _ = tx.send(StreamEvent::Session(SessionEvent::Notice(
-                                        text.no_hop(no_hop),
-                                    )));
+                                    if !keepwarm_ping {
+                                        let _ = tx.send(StreamEvent::Session(SessionEvent::Notice(
+                                            text.no_hop(no_hop),
+                                        )));
+                                    }
                                     if evidence.reset_is_long(now_ms) {
                                         if let Some(t) = tracer.take() {
                                             let terminal = t.failed_terminal("quota_exhausted");
@@ -5381,6 +5418,7 @@ mod anthropic_failover_tests {
         answers: Mutex<Vec<Result<Option<PinnedToken>, String>>>,
         reports: Mutex<Vec<(CredentialRef, AnthropicQuotaEvidence)>>,
         failovers: Mutex<Vec<(String, Vec<CredentialRef>)>>,
+        served: Mutex<Vec<CredentialRef>>,
     }
 
     impl ScriptedRouter {
@@ -5394,6 +5432,7 @@ mod anthropic_failover_tests {
                 answers: Mutex::new(answers),
                 reports: Mutex::new(Vec::new()),
                 failovers: Mutex::new(Vec::new()),
+                served: Mutex::new(Vec::new()),
             }
         }
         fn reports(&self) -> Vec<(CredentialRef, AnthropicQuotaEvidence)> {
@@ -5401,6 +5440,9 @@ mod anthropic_failover_tests {
         }
         fn failovers(&self) -> Vec<(String, Vec<CredentialRef>)> {
             self.failovers.lock().unwrap().clone()
+        }
+        fn served(&self) -> Vec<CredentialRef> {
+            self.served.lock().unwrap().clone()
         }
     }
 
@@ -5418,6 +5460,9 @@ mod anthropic_failover_tests {
                 .lock()
                 .unwrap()
                 .push((failed.clone(), *evidence));
+        }
+        async fn report_served(&self, seat: &CredentialRef, _sent_at_ms: u64) {
+            self.served.lock().unwrap().push(seat.clone());
         }
         async fn failover(
             &self,
@@ -5463,11 +5508,22 @@ mod anthropic_failover_tests {
         router: &ScriptedRouter,
         max_retries: u32,
     ) -> Outcome {
+        drive_with(upstream, auth, router, max_retries, ApiOptions::default()).await
+    }
+
+    /// [`drive`] with `base` options (any router, e.g. the real broker's).
+    async fn drive_with(
+        upstream: &MockUpstream,
+        auth: Arc<RwLock<AuthState>>,
+        router: &dyn AnthropicAccountRouter,
+        max_retries: u32,
+        base: ApiOptions,
+    ) -> Outcome {
         let options = ApiOptions {
             anthropic_base_url: Some(upstream.base_url.clone()),
             credential_source: CredentialSource::Local,
             token_cache: TokenCache::new(),
-            ..Default::default()
+            ..base
         };
         let client = Client::new();
         let tools = ToolRegistry::new();
@@ -5504,6 +5560,279 @@ mod anthropic_failover_tests {
             }
         }
         Outcome { result, notices, retries }
+    }
+
+    /// The request after the partial stream starts no output of its own,
+    /// but output already streamed on this request: a limit on it can't
+    /// switch accounts and the ordinary retry runs. The reset is short (the
+    /// retry is not given up) but outlives the test: a cooldown that is
+    /// gone was cleared, not expired.
+    fn short_limit_after_output() -> Vec<Reply> {
+        vec![
+            Reply::SsePartialThenOverloaded,
+            Reply::Rejected429 { reset_in_secs: 120 },
+            Reply::SseOk,
+        ]
+    }
+
+    /// Review fix 1: a short limit the ordinary retry outlives. The
+    /// account that then serves is reported served, once, so its cooldown
+    /// goes; nothing else is.
+    #[tokio::test]
+    #[serial_test::serial(anthropic_429_log_capture)]
+    async fn an_account_that_serves_after_its_limit_is_reported_served() {
+        let upstream = spawn_upstream(short_limit_after_output()).await;
+        let router = ScriptedRouter::new(true, Ok(Some(pinned("claude2"))));
+        let auth = oauth_auth_pinned_to("claude4");
+        let out = drive(&upstream, Arc::clone(&auth), &router, 3).await;
+        out.result.expect("the retry succeeds on the same account");
+        assert_eq!(upstream.calls(), 3);
+        assert_eq!(router.reports().len(), 1);
+        assert!(router.failovers().is_empty(), "output streamed: no lookup");
+        assert_eq!(router.served(), vec![seat("claude4")]);
+        assert_eq!(auth.read().await.auth_token, "tok-claude4");
+
+        // A request that met no limit reports nothing.
+        let upstream = spawn_upstream(vec![Reply::SseOk]).await;
+        let router = ScriptedRouter::new(true, Ok(None));
+        drive(&upstream, Arc::clone(&auth), &router, 0)
+            .await
+            .result
+            .expect("ok");
+        assert!(router.served().is_empty());
+    }
+
+    /// Review fix 2: a keep-warm ping that meets a recognised limit reports
+    /// the cooldown but never looks up, switches or re-binds an account and
+    /// sends no notice to the session.
+    #[tokio::test]
+    #[serial_test::serial(anthropic_429_log_capture)]
+    async fn a_keepwarm_ping_at_a_limit_never_switches_accounts() {
+        let upstream = spawn_upstream(vec![Reply::Rejected429 { reset_in_secs: 3 * 3600 }]).await;
+        let router = ScriptedRouter::new(true, Ok(Some(pinned("claude2"))));
+        let auth = oauth_auth_pinned_to("claude4");
+        let ping = ApiOptions {
+            keepwarm: Some(super::KeepWarmRequest {
+                mode: super::KeepWarmMode::Replay,
+                status: Default::default(),
+                sent: Default::default(),
+                connect_failed: Default::default(),
+            }),
+            ..Default::default()
+        };
+        let out = drive_with(&upstream, Arc::clone(&auth), &router, 2, ping).await;
+        out.result.expect_err("the ping fails on its own account");
+        assert_eq!(upstream.calls(), 1, "no request on another account");
+        assert_eq!(router.reports().len(), 1, "the cooldown is still reported");
+        assert!(router.failovers().is_empty(), "no account lookup");
+        assert!(out.notices.is_empty(), "no notice from a ping: {:?}", out.notices);
+        assert_eq!(auth.read().await.auth_token, "tok-claude4");
+        assert_eq!(
+            auth.read().await.bound_credential.as_deref(),
+            Some(anthropic_binding(&CredentialSource::Local, &seat("claude4")).as_str())
+        );
+    }
+
+    /// End to end through the real `LocalBroker` (auth.json, usage reads,
+    /// cooldown memory): two automatic accounts with room, a bound to the
+    /// turn.
+    mod local_broker {
+        use super::*;
+        use crate::auth::{AccountPolicy, AccountSelector, CredentialBroker, LocalBroker};
+        use crate::runtime::anthropic_quota::BrokerAnthropicRouter;
+        use crate::runtime::auth::{AuthMethods, RefreshPoint};
+
+        fn store(home: &std::path::Path, labels: &[&str]) {
+            let mut root = serde_json::Map::new();
+            for label in labels {
+                root.insert(
+                    format!("anthropic@{label}"),
+                    json!({
+                        "type": "oauth",
+                        "access": format!("tok-{label}"),
+                        "refresh": format!("refresh-{label}"),
+                        "expires": 4_102_444_800_000u64,
+                    }),
+                );
+            }
+            std::fs::write(home.join("auth.json"), serde_json::Value::Object(root).to_string())
+                .unwrap();
+        }
+
+        /// Usage endpoint: room in every window for every account.
+        async fn spawn_usage() -> String {
+            let reset = "2099-01-01T00:00:00Z";
+            let app = Router::new().route(
+                "/usage",
+                axum::routing::get(move || async move {
+                    axum::Json(json!({
+                        "five_hour": {"utilization": 10.0, "resets_at": reset},
+                        "seven_day": {"utilization": 10.0, "resets_at": reset}
+                    }))
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            format!("http://{addr}/usage")
+        }
+
+        async fn auto_broker(home: &std::path::Path, labels: &[&str]) -> Arc<LocalBroker> {
+            store(home, labels);
+            Arc::new(
+                LocalBroker::new(Client::new())
+                    .with_account_policy(
+                        AccountPolicy::new().with(OAuthProviderId::Anthropic, AccountSelector::Auto),
+                    )
+                    .with_usage_endpoint_override(spawn_usage().await),
+            )
+        }
+
+        fn bound_to(auth: &Arc<RwLock<AuthState>>) -> Option<String> {
+            auth.try_read().unwrap().bound_credential.clone()
+        }
+
+        /// The next round's refresh, mid-turn.
+        async fn next_round(auth: &Arc<RwLock<AuthState>>, broker: &LocalBroker) {
+            AuthMethods::refresh_with_broker(
+                Arc::clone(auth),
+                &CredentialSource::Local,
+                broker,
+                Some("claude-haiku-4-5"),
+                RefreshPoint::WithinTurn,
+            )
+            .await
+            .expect("the next round has an account");
+        }
+
+        /// Review fix 1: a short limit on a, the ordinary retry succeeds on
+        /// a, and the next round keeps a (its cache) with a's cooldown gone:
+        /// with one account and with two (no needless switch to b).
+        #[tokio::test]
+        #[serial_test::serial(synaps_base_dir, anthropic_429_log_capture)]
+        async fn an_account_that_serves_after_a_short_limit_keeps_the_turn() {
+            for labels in [&["a"][..], &["a", "b"][..]] {
+                let base = crate::test_env::BaseDirGuard::new();
+                let broker = auto_broker(base.path(), labels).await;
+                let router = BrokerAnthropicRouter::new(broker.clone());
+                let upstream = spawn_upstream(short_limit_after_output()).await;
+                let auth = oauth_auth_pinned_to("a");
+                let out =
+                    drive_with(&upstream, Arc::clone(&auth), &router, 3, ApiOptions::default())
+                        .await;
+                out.result.expect("the retry succeeds on a");
+                assert_eq!(upstream.calls(), 3, "{labels:?}");
+                assert_eq!(
+                    broker.active_cooldown(&seat("a")),
+                    None,
+                    "{labels:?}: a served after its limit was reported"
+                );
+                next_round(&auth, &broker).await;
+                assert_eq!(
+                    bound_to(&auth).as_deref(),
+                    Some(anthropic_binding(&CredentialSource::Local, &seat("a")).as_str()),
+                    "{labels:?}: the turn stays on a"
+                );
+            }
+        }
+
+        /// Review fix 1 (belt and braces): a is cooling down and is the only
+        /// account. Mid-turn the round keeps a instead of failing the turn
+        /// with `all_cooling_down` after its tools ran.
+        #[tokio::test]
+        #[serial_test::serial(synaps_base_dir, anthropic_429_log_capture)]
+        async fn the_only_account_cooling_mid_turn_keeps_the_turn() {
+            let base = crate::test_env::BaseDirGuard::new();
+            let broker = auto_broker(base.path(), &["a"]).await;
+            let until = crate::epoch_millis() + 3_600_000;
+            broker
+                .report_cooldown(&seat("a"), Some(until), "anthropic_quota_exhausted")
+                .await
+                .unwrap();
+            let auth = oauth_auth_pinned_to("a");
+            auth.try_write().unwrap().auth_token = "stale".into();
+            next_round(&auth, &broker).await;
+            let g = auth.try_read().unwrap();
+            assert_eq!(g.auth_token, "tok-a", "a is re-vended");
+            assert_eq!(
+                g.bound_credential.as_deref(),
+                Some(anthropic_binding(&CredentialSource::Local, &seat("a")).as_str())
+            );
+        }
+
+        /// Review fix 4: mid-turn, the re-vend of the pinned seat honours a
+        /// refused refresh's hold, like the automatic choice's own vend. a's
+        /// token is stale and its refresh is refused (once, held); the turn
+        /// moves to b, and a later round asks the token endpoint nothing.
+        #[tokio::test]
+        #[serial_test::serial(synaps_base_dir, anthropic_429_log_capture)]
+        async fn a_held_refusal_is_honoured_by_the_mid_turn_revend() {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            let base = crate::test_env::BaseDirGuard::new();
+            store(base.path(), &["a", "b"]);
+            // a's token expired in 1970: any use refreshes first.
+            let path = base.path().join("auth.json");
+            let mut root: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            root["anthropic@a"]["expires"] = json!(1_000u64);
+            std::fs::write(&path, root.to_string()).unwrap();
+            let hits = Arc::new(AtomicUsize::new(0));
+            let counter = hits.clone();
+            let app = Router::new().route(
+                "/v1/oauth/token",
+                axum_post(move || {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        (
+                            StatusCode::BAD_REQUEST,
+                            [("content-type", "application/json")],
+                            r#"{"error":"invalid_grant"}"#,
+                        )
+                            .into_response()
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let broker = LocalBroker::new(Client::new())
+                .with_account_policy(
+                    AccountPolicy::new().with(OAuthProviderId::Anthropic, AccountSelector::Auto),
+                )
+                .with_usage_endpoint_override(spawn_usage().await)
+                .with_anthropic_token_url_for_tests(format!("http://{addr}/v1/oauth/token"));
+            let b = anthropic_binding(&CredentialSource::Local, &seat("b"));
+            for round in 0..2 {
+                let auth = oauth_auth_pinned_to("a");
+                auth.try_write().unwrap().token_expires = Some(1);
+                next_round(&auth, &broker).await;
+                assert_eq!(bound_to(&auth).as_deref(), Some(b.as_str()), "round {round}");
+                assert_eq!(hits.load(Ordering::SeqCst), 1, "round {round}: one refused refresh");
+            }
+        }
+
+        /// The PR's mid-turn re-selection through the real broker: a is
+        /// cooling down (another session met its limit) and b has room, so
+        /// the next round moves to b.
+        #[tokio::test]
+        #[serial_test::serial(synaps_base_dir, anthropic_429_log_capture)]
+        async fn a_cooling_account_mid_turn_moves_the_turn_to_one_with_room() {
+            let base = crate::test_env::BaseDirGuard::new();
+            let broker = auto_broker(base.path(), &["a", "b"]).await;
+            let until = crate::epoch_millis() + 3_600_000;
+            broker
+                .report_cooldown(&seat("a"), Some(until), "anthropic_quota_exhausted")
+                .await
+                .unwrap();
+            let auth = oauth_auth_pinned_to("a");
+            next_round(&auth, &broker).await;
+            let g = auth.try_read().unwrap();
+            assert_eq!(g.auth_token, "tok-b");
+            assert_eq!(
+                g.bound_credential.as_deref(),
+                Some(anthropic_binding(&CredentialSource::Local, &seat("b")).as_str())
+            );
+        }
     }
 
     fn assert_no_body_leak(text: &str, ctx: &str) {

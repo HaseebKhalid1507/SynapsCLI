@@ -4278,6 +4278,23 @@ impl Runtime {
         })
     }
 
+    /// A cache keep-warm ping's refresh: keeps the bound account or fails,
+    /// never selects or switches one ([`auth::RefreshPoint::KeepWarm`]).
+    pub(crate) async fn refresh_for_keepwarm(&self) -> Result<()> {
+        if !crate::runtime::auth::model_is_anthropic(&self.model) {
+            return Ok(());
+        }
+        AuthMethods::refresh_if_needed(
+            Arc::clone(&self.auth),
+            &self.client,
+            &self.credential_source,
+            &self.token_cache,
+            Some(&self.model),
+            crate::runtime::auth::RefreshPoint::KeepWarm,
+        )
+        .await
+    }
+
     async fn refresh_if_needed_for_model(&self, model: &str) -> Result<()> {
         // Non-Anthropic models resolve their own provider auth in the OpenAI
         // path (incl. via the broker), so skip the Anthropic pre-fetch. (#158 #7)
