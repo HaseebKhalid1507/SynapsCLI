@@ -745,7 +745,7 @@ mod tests {
     /// reports the shell's own exit, not a kill.
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    #[serial]
+    #[serial(synaps_base_dir)]
     async fn a_dropped_handle_reports_the_exit_it_reaped() {
         use crate::session::child_events::{ChildProcessEvent, ChildRoute};
         let (route, mut rx) = ChildRoute::channel("pty-test-session");
@@ -778,7 +778,7 @@ mod tests {
     /// ends with its status unknown, never with a kill it didn't get.
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    #[serial]
+    #[serial(synaps_base_dir)]
     async fn a_dropped_handle_claims_no_signal_it_did_not_see() {
         use crate::session::child_events::{ChildProcessEvent, ChildRoute};
         let (route, mut rx) = ChildRoute::channel("pty-test-session");
