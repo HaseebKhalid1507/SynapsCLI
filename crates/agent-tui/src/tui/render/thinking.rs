@@ -55,9 +55,6 @@ pub(super) const PREVIEW_SLACK: usize = 2;
 /// the preview however short the lines — so a delta's cost does not grow
 /// with the thought.
 const TAIL_SOURCE_LINES: usize = 24;
-/// Widest text measure in cells (indent included): past it, prose on a wide
-/// terminal stops reading as lines.
-pub(super) const MAX_MEASURE: usize = 110;
 /// Margin before the rail: the agent's `◈` column.
 const MARGIN: &str = "   ";
 /// What `render_markdown_spans` gets as its prefix: the margin plus the
@@ -436,8 +433,9 @@ pub(super) fn render(
     let (rows, cut) = if placeholder || text.trim().is_empty() {
         (Vec::new(), None)
     } else {
-        let measure = width.saturating_sub(2).clamp(1, MAX_MEASURE);
-        body_rows(text, live, expanded, msg_idx, measure, &pal)
+        // The same right edge as the agent's text: a thought wraps to the
+        // full viewport, never a narrower column of its own.
+        body_rows(text, live, expanded, msg_idx, width.max(1), &pal)
     };
     sink.push(clamp_line(
         header(text, thought, live, !rows.is_empty(), now, ctx, &pal),
@@ -486,7 +484,7 @@ mod tests {
     use super::super::super::transcript::{
         ChatMessage, LineMeta, MsgSlot, RenderCtx, TranscriptStore, THINKING_PLACEHOLDER,
     };
-    use super::{MAX_MEASURE, PREVIEW_ROWS, PREVIEW_SLACK};
+    use super::{PREVIEW_ROWS, PREVIEW_SLACK};
     use ratatui::style::Modifier;
     use unicode_width::UnicodeWidthStr;
 
@@ -531,10 +529,11 @@ mod tests {
     }
 
     /// The rail sits on the canvas: a row of air above and below, no fill
-    /// on any cell outside a code pill, and prose held to a readable
-    /// measure however wide the pane (render.rs tests the wrap and close).
+    /// on any cell outside a code pill, and prose wrapping to the same right
+    /// edge as the agent's text however wide the pane (render.rs tests the
+    /// wrap and close).
     #[test]
-    fn rail_sits_on_the_canvas_with_air_and_a_measure() {
+    fn rail_sits_on_the_canvas_with_air_and_the_agent_text_edge() {
         let text = format!("{} {}", long_thought(1), "and then some more words".repeat(12));
         for width in [40usize, 100, 200] {
             let (_, slot) = done(&text, width);
@@ -547,7 +546,17 @@ mod tests {
                 }
             }
             let widest = r.iter().map(|row| UnicodeWidthStr::width(row.as_str())).max();
-            assert!(widest.unwrap_or(0) <= MAX_MEASURE.min(width), "w={width}: {r:#?}");
+            let agent = super::render_markdown_spans(&text, "   ", width, 1)
+                .iter()
+                .map(|(line, _)| {
+                    line.spans.iter().map(|s| UnicodeWidthStr::width(s.content.as_ref())).sum::<usize>()
+                })
+                .max();
+            assert!(widest.unwrap_or(0) <= width, "w={width}: {r:#?}");
+            // Same right edge as the agent's prose, give or take one word's
+            // wrap (the thought's indent is one cell deeper).
+            let (thought, agent) = (widest.unwrap_or(0), agent.unwrap_or(0));
+            assert!(thought + 16 >= agent, "w={width}: thought {thought} vs agent {agent}: {r:#?}");
         }
     }
 
