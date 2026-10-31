@@ -313,6 +313,7 @@ fn tool_detail(tool_name: &str, input: &serde_json::Value) -> String {
         "read" => format!("reading {}", base("path", "?")),
         "write" => format!("writing {}", base("path", "?")),
         "edit" => format!("editing {}", base("path", "?")),
+        "multi_edit" => crate::tools::multi_edit_label(input),
         "grep" => format!(
             "grep /{}/",
             input["pattern"]

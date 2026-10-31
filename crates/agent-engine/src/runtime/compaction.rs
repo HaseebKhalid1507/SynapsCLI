@@ -232,7 +232,11 @@ pub fn render_compaction_input(
                                 let id = block["id"].as_str().unwrap_or("?");
                                 let name = block["name"].as_str().unwrap_or("");
                                 let input = &block["input"];
-                                if track_paths {
+                                if track_paths && name == "multi_edit" {
+                                    for path in crate::tools::multi_edit_paths(input) {
+                                        file_ops.edited.insert(path.to_string());
+                                    }
+                                } else if track_paths {
                                     if let Some(path) = input["path"].as_str() {
                                         match name {
                                             "read" => {
@@ -1845,6 +1849,39 @@ mod disclosure_tests {
                 "the call name '{name}' stays visible"
             );
         }
+    }
+
+    #[test]
+    fn multi_edit_paths_are_listed_as_modified_files() {
+        let messages: Vec<crate::SharedMessage> = vec![Arc::new(json!({
+            "role": "assistant",
+            "content": [
+                {"type": "tool_use", "id": "m1", "name": "multi_edit",
+                 "input": {"edits": [
+                     {"path": "/w/MULTI_A.md", "op": "append", "text": "x"},
+                     {"path": "/w/MULTI_B.jsonl", "op": "append_jsonl", "value": {}},
+                     {"path": "/w/MULTI_A.md", "op": "append", "text": "y"},
+                     {"op": "append", "text": "no path"},
+                     "not an object"
+                 ]}},
+                {"type": "tool_use", "id": "m2", "name": "multi_edit",
+                 "input": {"edits": "not a list"}},
+            ]
+        }))];
+        let open = render_compaction_input(&messages, None, &policy(&[]));
+        let modified = open
+            .prompt_text
+            .split("<modified-files>")
+            .nth(1)
+            .and_then(|rest| rest.split("</modified-files>").next())
+            .expect("a <modified-files> section");
+        let mut listed: Vec<&str> = modified.split_whitespace().collect();
+        listed.sort_unstable();
+        assert_eq!(listed, ["/w/MULTI_A.md", "/w/MULTI_B.jsonl"]);
+
+        let closed = render_compaction_input(&messages, None, &policy(&[ContentClass::FilePaths]));
+        assert!(!closed.prompt_text.contains("MULTI_A"), "{}", closed.prompt_text);
+        assert!(!closed.prompt_text.contains("<modified-files>"));
     }
 
     #[test]

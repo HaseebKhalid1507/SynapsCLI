@@ -21,6 +21,7 @@ mod grep;
 mod ls;
 pub mod memory;
 mod memory_context;
+mod multi_edit;
 #[cfg(feature = "command-exec")]
 mod powershell;
 pub(crate) mod read;
@@ -68,6 +69,8 @@ pub use find::FindTool;
 pub use grep::GrepTool;
 pub use ls::LsTool;
 pub use memory_context::MemoryContextTool;
+pub use multi_edit::MultiEditTool;
+pub(crate) use multi_edit::{label as multi_edit_label, paths as multi_edit_paths};
 #[cfg(feature = "command-exec")]
 pub use powershell::PowerShellTool;
 pub use read::ReadTool;
