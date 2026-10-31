@@ -1,12 +1,12 @@
 # Automatic context rollover for subagent workers
 
-Status: implemented on `feat/subagent-rollover`.
+Status: implemented (#332).
 
 ## Why
 
 Telemetry for 10-24 to 10-29: workers are 66% of all usage, and their
 contexts never shrink. Before 10-28 a worker request averaged 287k tokens;
-now joestar averages 265k (max 486k), gojo 221k, and one worker reached about
+now one named worker averages 265k (max 486k), another 221k, and one reached about
 999k. Every round re-reads the whole context, and cache reads are the largest
 single cost line (47%). The foreground session already rolls over
 (`context_management.mode = auto`). Workers get none of it.
@@ -89,8 +89,8 @@ for itself before the next rollover, and workers run hundreds of rounds.
   the worker. The successor shape keeps user requests plus the last tail; a
   worker transcript is one brief followed by hundreds of assistant /
   tool_result rounds, so it would keep the brief and one round. And the
-  evicted history would be sealed into the parent's memory backend, which for
-  Haseeb is the Axel brain.
+  evicted history would be sealed into the parent's memory backend, which can
+  be the Axel brain.
 - **What happens at hard capacity today:** nothing checks. The worker keeps
   sending its whole history; when it no longer fits, Anthropic returns
   `invalid_request_error` ("prompt is too long"), which
@@ -145,7 +145,7 @@ the policy, the value comes from the config file: `/context` and the
 `/settings` row write it there, but a session-only window change that is
 not persisted is not inherited.
 
-Until this was fixed (fix/worker-rollover-window) workers never got the
+Until this was fixed (#340) workers never got the
 setting, and the reserves made that expensive. `pre_request_context_budget`
 then reserved the next round's whole output ceiling (`max_tokens`, 128k for
 Opus), the next tool result (10k), a 15% safety margin and 512 advisory
@@ -155,7 +155,7 @@ of the ~20k left (about 9k on the wire), full again about five tool calls
 later: four Opus 5.5 workers rolled over 28 to 37 times in 20 minutes with
 requests of about 20k.
 
-**The output reserve** (fix/context-output-reserve). `max_tokens` is a
+**The output reserve** (#341). `max_tokens` is a
 ceiling, not headroom a request needs: on Claude 4.5 and later a request
 whose input plus `max_tokens` exceeds the window is accepted, and
 generation that reaches the window stops with
