@@ -1506,37 +1506,34 @@ pub(crate) fn build_stats_receipt(
         "0%".to_string()
     };
 
-    // Aggregate counters retain neither request tiers nor model history.
-    // The actual-cost subtotal cannot reconstruct an uncached counterfactual.
+    // Aggregate counters retain neither request tiers nor model history, so
+    // no "saved by cache" figure can be reconstructed: none is shown.
 
     // ── Cost ─────────────────────────────────────────────────────────────
     let session_cost = app.session_cost;
 
     // ── Format ───────────────────────────────────────────────────────────
+    let turns = if turn_count == 1 { "1 turn".to_string() } else { format!("{turn_count} turns") };
     let mut lines = vec![
-        "─── Session Stats ───────────────────────────────".to_string(),
-        format!(
-            "  Session  {:>12}  model: {}",
-            &session_id[..session_id.len().min(12)],
-            model
-        ),
-        format!("  Duration {:>12}  turns: {}", duration_str, turn_count),
+        format!("  Session   {session_id}"),
+        format!("  Model     {model}"),
+        format!("  Duration  {duration_str} \u{00b7} {turns}"),
         String::new(),
         "  Tokens".to_string(),
-        format!("    input        {:>10}", fmt_tokens(input)),
-        format!("    output       {:>10}", fmt_tokens(output)),
-        format!("    cache read   {:>10}", fmt_tokens(c_read)),
+        format!("    input        {:>8}", fmt_tokens(input)),
+        format!("    output       {:>8}", fmt_tokens(output)),
+        format!("    cache read   {:>8}", fmt_tokens(c_read)),
     ];
 
     if c5 > 0 || c1 > 0 {
         lines.push(format!(
-            "    cache write  {:>10}  (5m: {} / 1h: {})",
+            "    cache write  {:>8}  (5m {} / 1h {})",
             fmt_tokens(c_write),
             fmt_tokens(c5),
             fmt_tokens(c1)
         ));
     } else {
-        lines.push(format!("    cache write  {:>10}", fmt_tokens(c_write)));
+        lines.push(format!("    cache write  {:>8}", fmt_tokens(c_write)));
     }
     // Keep-warm pings are inside the totals above (and the hit rate below);
     // their share is shown so the numbers add up.
@@ -1552,21 +1549,36 @@ pub(crate) fn build_stats_receipt(
     }
 
     lines.push(String::new());
-    lines.push(format!(
-        "  Cache  hit rate {:>9}",
-        hit_rate_str
-    ));
-    lines.push(String::new());
-    lines.push("  Cache savings unavailable: per-request model/tier history not retained".to_string());
-    lines.push(format!("  Cost   ${:.4}", session_cost));
+    lines.push(format!("  Cache hit rate {:>8}", hit_rate_str));
+    lines.push(format!("  Cost           {:>8}", format!("${session_cost:.4}")));
     if app.keepwarm_cost > 0.0 {
         lines.push(format!(
-            "         incl. cache keep-warm ${:.4}  (/keepwarm status)",
+            "    incl. keep-warm ${:.4} (/keepwarm status)",
             app.keepwarm_cost
         ));
     }
-    lines.push("─────────────────────────────────────────────────".to_string());
-    lines.join("\n")
+    stats_box(lines)
+}
+
+/// Frame `/stats` body lines between rules exactly as wide as the widest
+/// line (min 32 cells): the rules fit the content, never the other way.
+fn stats_box(body: Vec<String>) -> String {
+    const TITLE: &str = "\u{2500}\u{2500}\u{2500} Session Stats ";
+    let width = body
+        .iter()
+        .map(|l| super::text_metrics::width(l))
+        .max()
+        .unwrap_or(0)
+        .max(32);
+    let top = format!(
+        "{TITLE}{}",
+        "\u{2500}".repeat(width.saturating_sub(super::text_metrics::width(TITLE)))
+    );
+    let mut out = Vec::with_capacity(body.len() + 2);
+    out.push(top);
+    out.extend(body);
+    out.push("\u{2500}".repeat(width));
+    out.join("\n")
 }
 
 /// Format a token count with K/M suffix.
@@ -2216,6 +2228,22 @@ mod tests {
         }
     }
 
+    /// The fixture interpreter. Windows has no `python3`, and a bare `python`
+    /// may be the Store alias stub: take the first real `python.exe` on PATH,
+    /// as `tests/daemon_reload.rs` does.
+    fn fixture_python() -> String {
+        if cfg!(windows) {
+            let path = std::env::var("PATH").unwrap_or_default();
+            path.split(';')
+                .map(|d| std::path::Path::new(d.trim().trim_matches('"')).join("python.exe"))
+                .find(|p| p.is_file() && !p.to_string_lossy().contains("WindowsApps"))
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "python".into())
+        } else {
+            "python3".into()
+        }
+    }
+
     #[tokio::test]
     async fn interactive_plugin_command_invocation_pushes_output_and_updates_tasks() {
         let bus = Arc::new(synaps_cli::extensions::hooks::HookBus::new());
@@ -2228,7 +2256,7 @@ mod tests {
             deferred: None,
             protocol_version: 1,
             runtime: synaps_cli::extensions::manifest::ExtensionRuntime::Process,
-            command: "python3".to_string(),
+            command: fixture_python(),
             setup: None,
             prebuilt: ::std::collections::HashMap::new(),
             args: vec!["tests/fixtures/interactive_command_extension.py".to_string()],
@@ -2870,10 +2898,9 @@ mod tests {
         app.session_cost = 0.0012;
         let runtime = synaps_cli::Runtime::new_headless();
         let receipt = build_stats_receipt(&app, &runtime);
-        assert!(receipt.contains("Cache savings unavailable"));
         assert!(!receipt.contains("saved: $"));
         assert!(receipt.contains("100%"));
-        assert!(receipt.contains("Cost   $0.0012"));
+        assert!(receipt.contains("Cost            $0.0012"), "{receipt}");
     }
 
     /// /stats receipt contains expected section headers.
@@ -2898,11 +2925,42 @@ mod tests {
         assert!(receipt.contains("Tokens"), "missing Tokens section");
         assert!(receipt.contains("Cache"), "missing Cache section");
         assert!(receipt.contains("Cost"), "missing Cost section");
-        assert!(receipt.contains("Cache savings unavailable"));
         assert!(!receipt.contains("saved: $"));
-        assert!(receipt.contains("5m:"), "missing 5m split");
-        assert!(receipt.contains("1h:"), "missing 1h split");
+        assert!(receipt.contains("(5m 600 / 1h 200)"), "missing TTL split: {receipt}");
         assert!(!receipt.contains("keep-warm"), "no keep-warm line without spend");
+    }
+
+    /// C2: the session id was cut to 12 chars, a 70-cell "Cache savings
+    /// unavailable: …" line overflowed the 49-cell rule, and "Cache  hit
+    /// rate" had a double space.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn stats_receipt_shows_full_id_and_stays_inside_its_rules() {
+        let session = synaps_cli::Session::new("claude-sonnet-4-5", "medium", None);
+        let mut app = crate::tui::app::App::new(session);
+        app.total_cache_read_tokens = 2000;
+        app.total_cache_write_5m = 600;
+        app.total_cache_write_1h = 200;
+        app.keepwarm_cost = 0.18;
+        app.keepwarm_tokens = agent_engine::session::ConversationTokens {
+            input: 80,
+            output: 2,
+            cache_read: 300_000,
+            cache_creation: 0,
+        };
+        let runtime = synaps_cli::Runtime::new_headless();
+        let receipt = build_stats_receipt(&app, &runtime);
+        assert!(receipt.contains(app.session.id.as_str()), "{receipt}");
+        assert!(!receipt.contains("unavailable"), "{receipt}");
+        assert!(!receipt.contains("Cache  hit"), "{receipt}");
+        assert!(receipt.contains("Cache hit rate"), "{receipt}");
+        let lines: Vec<&str> = receipt.lines().collect();
+        let rule = crate::tui::text_metrics::width(lines[0]);
+        assert_eq!(rule, crate::tui::text_metrics::width(lines[lines.len() - 1]));
+        assert!(rule <= 72, "fits an 80-col transcript: {rule}");
+        for l in &lines {
+            assert!(crate::tui::text_metrics::width(l) <= rule, "overflows the rule: {l:?}");
+        }
     }
 
     /// Keep-warm spend is labelled inside the session cost (task #444).
@@ -2922,8 +2980,8 @@ mod tests {
         };
         let runtime = synaps_cli::Runtime::new_headless();
         let receipt = build_stats_receipt(&app, &runtime);
-        assert!(receipt.contains("Cost   $1.2500"), "{receipt}");
-        assert!(receipt.contains("incl. cache keep-warm $0.1800"), "{receipt}");
+        assert!(receipt.contains("Cost            $1.2500"), "{receipt}");
+        assert!(receipt.contains("incl. keep-warm $0.1800"), "{receipt}");
         assert!(receipt.contains("400.0K"), "the total includes pings: {receipt}");
         assert!(
             receipt.contains("incl. keep-warm  read 300.0K / write 0 / input 80 / output 2"),

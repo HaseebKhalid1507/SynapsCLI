@@ -44,7 +44,7 @@
 //!   `Exhausted` (reset passed), never due.
 
 use std::collections::BTreeMap;
-use std::fs::{File, OpenOptions};
+use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -1732,18 +1732,18 @@ impl StateStore {
 // ── Locks ────────────────────────────────────────────────────────────────────
 
 /// Exclusive advisory `flock` held for the process lifetime (released on
-/// drop or process death). Used for the state-dir singleton and for one lock
-/// per kept account in the canonical keeper dir, so a second keeper with a
+/// drop, even while a forked child still holds an inherited descriptor, or
+/// on process death). Used for the state-dir singleton and for one lock per
+/// kept account in the canonical keeper dir, so a second keeper with a
 /// different `--state-dir` still cannot act on the same account.
 #[derive(Debug)]
 pub struct KeeperLock {
-    _file: File,
+    _lock: crate::core::lock_file::ExclusiveLock,
     path: PathBuf,
 }
 
 impl KeeperLock {
     pub fn acquire(dir: &Path, name: &str, holder: &str) -> Result<Self, KeeperError> {
-        use fs4::fs_std::FileExt;
         crate::private_fs::ensure_private_dir(dir).map_err(|e| KeeperError::Io {
             path: dir.to_path_buf(),
             detail: e.to_string(),
@@ -1764,19 +1764,19 @@ impl KeeperLock {
             use std::os::unix::fs::PermissionsExt;
             let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
         }
-        let locked = FileExt::try_lock_exclusive(&file).map_err(|e| KeeperError::Io {
+        let locked = crate::core::lock_file::try_lock(file).map_err(|e| KeeperError::Io {
             path: path.clone(),
             detail: e.to_string(),
         })?;
-        if !locked {
+        let Some(lock) = locked else {
             let body = std::fs::read_to_string(&path).unwrap_or_default();
             let holder = body.lines().next().map(str::to_string).filter(|s| !s.is_empty());
             return Err(KeeperError::Locked { path, holder });
-        }
+        };
         use std::io::Write;
-        let _ = file.set_len(0);
-        let _ = (&file).write_all(format!("{holder}\n").as_bytes());
-        Ok(Self { _file: file, path })
+        let _ = lock.file().set_len(0);
+        let _ = lock.file().write_all(format!("{holder}\n").as_bytes());
+        Ok(Self { _lock: lock, path })
     }
 
     pub fn path(&self) -> &Path {
@@ -2760,5 +2760,24 @@ mod tests {
         let _l2 = KeeperLock::acquire(dir.path(), &name, "pid 1").unwrap();
         drop(l1);
         let _l3 = KeeperLock::acquire(dir.path(), SINGLETON_LOCK_NAME, "pid 3").unwrap();
+    }
+
+    /// A keeper that stops releases its locks at once, even while a child
+    /// that another thread forked still holds copies of their descriptors:
+    /// the next keeper on that state dir is not refused in the name of the
+    /// one that just stopped.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial(process_spawn)]
+    fn a_stopped_keepers_lock_is_free_while_a_forked_child_holds_its_descriptor() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = KeeperLock::acquire(dir.path(), SINGLETON_LOCK_NAME, "pid 1").unwrap();
+        let child = crate::core::lock_file::ParkedChild::park();
+        drop(first);
+        let second = KeeperLock::acquire(dir.path(), SINGLETON_LOCK_NAME, "pid 2");
+        child.release();
+        if let Err(e) = second {
+            panic!("restarted keeper refused while a forked child held a copy: {e}");
+        }
     }
 }

@@ -1,9 +1,9 @@
 # Daemon mode (`synaps daemon` / `synaps attach`) — phase 2, package B
 
 **Status:** on by default. The first `synaps --attach` / `synaps attach` starts the daemon itself
-(jcode model: `setsid` + ready-fd, the daemon holds the flock); once one is running, a plain
+(jcode model: `setsid` + ready-fd, the daemon holds the flock; on Windows see [Windows](#windows)); once one is running, a plain
 `synaps` **adopts** it, spawning the daemon first if needed (thin client, fresh session — `SYNAPS_DAEMON_ADOPT=0` opts out);
-`SYNAPS_DAEMON=0` turns every daemon feature off. Protocol v1 (`crates/agent-engine/src/session/wire.rs`), daemon in `agent-engine::daemon`
+`SYNAPS_DAEMON=0` turns every daemon feature off. Protocol v3 (`crates/agent-engine/src/session/wire.rs`), daemon in `agent-engine::daemon`
 (no `agent-tui` in its graph — `tests/daemon_no_tui_dep.rs`).
 
 ## Flags and kill-switches
@@ -20,13 +20,14 @@
 | `tools.activation_confirm = auto \| prompt \| deny` (config key, default `auto`) | Host policy for MODEL-INITIATED `activate_tools` under progressive disclosure. `auto`: granted without asking. `prompt`: the session raises a `Prompt{kind: Confirm}` ("Confirm tool activation" — the TUI shows a y/n dialog listing the exact ids; `synaps attach` prints `[confirm #id] …\n(y/n):`); only `y`/`yes` allows, anything else/Esc denies (fail-closed). `deny`: always refused, no prompt is raised (locked-down hosts). `server.auto_approve_confirms = true` / `--auto-approve-confirms` still grants regardless. The mode is logged once at boot (`tools.activation_confirm: …`). |
 | `SYNAPS_RUNTIME_DIR` | Where the socket/lock/json/pid live (default `~/.synaps-cli/run`, 0700). |
 | `process_scopes = auto \| off` (config key, default `auto`) / `SYNAPS_PROCESS_SCOPES` (env wins) | On Linux with a reachable systemd user manager, the spawned daemon, every bash tool command and every PTY shell start in their **own** transient scope (`systemd-run --user --scope`). systemd-oomd kills a whole cgroup at once; without this a runaway tool command shared the cgroup of the terminal that started the daemon, and an OOM kill took the command, the daemon and every session down together (S348). Separate scopes reduce shared-cgroup OOM exposure; they are not memory caps. Ancestor-cgroup or global kernel OOM can still kill the daemon and other sessions. Windows isolation is not implemented. Off, unavailable (macOS, containers, no user bus), or a session env without `XDG_RUNTIME_DIR`/`DBUS_SESSION_BUS_ADDRESS`: processes launch directly. Each launch probes with its effective environment and working directory (a three-second polling deadline after spawn, plus best-effort cleanup; offloaded for async bash and PTY startup). The probe never dispatches the requested command, but exact-environment execution is not a side-effect-free sandbox. Kernel-stalled spawn/reaping is not covered by an absolute wall-clock guarantee. A failed probe selects direct launch. Availability can race after a successful probe: any subsequent wrapper failure surfaces as an error, never an automatic direct retry, because the command may already have started. `daemon reload` re-execs in place and keeps the current cgroup; a daemon moves into its own scope at its next fresh start. Scopes show in `systemctl --user list-units --type=scope` as `synaps daemon` / `synaps tool: bash|shell`. |
+| `tool_scope_slice = <name>.slice` / `daemon_scope_slice = <name>.slice` (config keys, default unset) | The systemd slice the scopes above go in: `tool_scope_slice` for bash tool commands and PTY shells, `daemon_scope_slice` for the daemon's own scope (separate, so tools can be capped without the daemon). Set, Synaps passes `--slice=<name>` to `systemd-run`; unset or empty (`tool_scope_slice =`), the command line is exactly as without the keys. **Synaps sets no limits** — the operator does, on the slice. Use a top-level name such as `synaps_tools.slice`: a `-` nests, and `CPUWeight` only counts against siblings. A slice that doesn't exist is created empty, not refused. Recipe, rules and checks: [Capping tool commands with a slice](#capping-tool-commands-with-a-slice). |
 | `SYNAPS_SESSION_EVENTS_CAP` | Per-session broadcast capacity (default 1024). A slow client gets `SystemNotice("event stream lagged; n dropped")`. |
 | `synaps daemon reload [--now] [--drain-secs N] [--exe PATH]` / `SYNAPS_DAEMON_RELOAD_DRAIN_SECS` (default 30) | Re-exec the daemon in place (C3). `--now` = drain 0. `--exe` overrides (and records) the binary. |
 | `SYNAPS_TUI_ATTACH_RECONNECT_SECS` (default 60) | Total `SocketTransport::reconnect` budget after `Reloading`/EOF (backoff 100 ms ×2, cap 5 s). |
-| `SYNAPS_DAEMON_RELOAD_STATE` / `SYNAPS_DAEMON_LOCK_FD` | Internal: handed to the new image by `reload`; both scrubbed at start. `RELOAD_STATE` without `LOCK_FD` refuses to start (the flock is the liveness oracle). |
+| `SYNAPS_DAEMON_RELOAD_STATE` / `SYNAPS_DAEMON_LOCK_FD` | Internal: handed to the new image by `reload`; both scrubbed at start. `RELOAD_STATE` without `LOCK_FD` refuses to start (the flock is the liveness oracle). On Windows `SYNAPS_DAEMON_HANDOFF_EVENT` and `SYNAPS_DAEMON_HANDOFF_PID` take the place of `LOCK_FD` (see [Windows](#windows)); `RELOAD_STATE` without the event refuses to start. |
 | `synaps daemon purge` / `scripts/memprof/purge.sh` | jemalloc purge in the daemon before an RssAnon sample (C2). `SYNAPS_MEMPROF_PURGE=1` makes the attach client purge on every idle immediately. |
 | Thin-client flags (`SYNAPS_CLIENT_REEXEC=0`, `SYNAPS_CLIENT_ALLOC=default`, `SYNAPS_CLIENT_THP=1`, `SYNAPS_CLIENT_PURGE_IDLE_SECS`, `SYNAPS_CLIENT_HISTORY=full`, `SYNAPS_TUI_SCROLLBACK[_BYTES]`, `SYNAPS_TUI_SYNTECT=full`, `SYNAPS_TUI_SYNTECT_IDLE_SECS`, `SYNAPS_CLIENT_SIGNAL_THREAD=1`, `SYNAPS_ATTACH_TAIL_ITEMS`) | Phase 4 client diet — full table with defaults in [memory-budget.md](memory-budget.md#kill-switches-all-env-vars). Only read on the `--attach`/`attach` thin path; the in-process fallback (`SYNAPS_DAEMON=0`, or a failed auto-spawn) boots untouched (`tests/attach_no_daemon.rs`, `tests/daemon_autospawn.rs`). |
-| `SYNAPS_DAEMON_READY_FD` | Internal: write end of the ready pipe handed to a `--detach`ed child. Scrubbed from the env before accept. |
+| `SYNAPS_DAEMON_READY_FD` / `SYNAPS_DAEMON_READY_EVENT` | Internal: write end of the ready pipe handed to a `--detach`ed child (Windows: the name of the ready event). Scrubbed from the env before accept. |
 | `SYNAPS_DAEMON_PARK_GRACE_SECS` (default 60; `never` disables) | B3: seconds after the last detach (idle, no prompts, no compaction, not keep-warm, journal on disk) before a session is **Parked** — `Runtime` + `ConversationState` dropped, restored from the journal on the next attach/turn/`synaps send`. A session that never ran a turn has no journal and never parks. |
 | **Pin**: `/pin [on\|off\|status]` / `synaps daemon pin <ID\|NAME> [--off]` / `--keep-warm` (attach flag) / `/keep-warm on\|off` / `SessionCommand::KeepWarm` | The session stays loaded: never parked, never idle-ended (F18), never evicted, and the daemon does not idle-exit while any session is pinned. Survives `daemon reload` and comes back when the daemon starts again (after a stop, crash or reboot). See [Pinning a session](#pinning-a-session-pin). Not `/keepwarm`, which pings the API to keep the prompt cache warm and costs money. |
 | `synaps attach --observe` / `--takeover` | B1 attach modes: `--observe` never owns input (setters/`Submit` are `Refused`); `--takeover` steals ownership from the current owner (who is told via `InputOwnerChanged{Takeover}`); default `Mirror` owns input iff nobody does (with `client_input = shared`, every `Mirror` may type; see below). |
@@ -35,19 +36,105 @@
 | `client_input = shared` (default) / `exclusive` (config, `/settings` → Daemon) | Who may type in a session with several clients attached. Every client is the daemon's own user, so by default (`shared`) every drive client (not `--observe`) may send input; the one that did last is the *active* client: `InputOwnerChanged{Input}` moves the marker (older clients, without `ClientCapabilities::owner_reason_input`, read it as `Takeover`), it may choose "Allow all" (answering makes a client active), and it gets input back first after a daemon reload. When the active client leaves, input goes to whoever typed most recently. `exclusive` is the rule before `client_input`: only the input owner drives, the others are read-only until they `--takeover` or `/takeover`. The daemon reads it from config when it starts, for every session it creates or restores (`synaps daemon reload` picks up a change; `SessionConfig.client_input` overrides it per session). The snapshot carries it (`Attached.client_input`; absent from an older daemon, which means `exclusive`), and so does the listing (`synaps daemon sessions` says `active=` instead of `owner=`). An older client (no `owner_reason_input` capability) on a shared session knows only the owner rule, so the daemon presents it as owning input and never sends it `InputOwnerChanged`: it can type all along, and would otherwise announce "input is owned by …" on attach and "input taken over" whenever another client typed (every open TUI is an older client right after a `daemon reload` onto a new build). The TUI header shows `N clients` when another client is attached; a TUI that may not drive (`--observe`, or not the owner under `exclusive`) sends nothing on Enter or Esc and says why in a toast, keeping the text. |
 | `synaps --attach --no-confirm-answers` | TUI only, any attach mode: this client never answers a `Confirm` prompt (tool-call and tool-activation approvals). It never opens the approval pane for one, so no key typed into it can approve; it lists the waiting confirms in a toast until another client's answer resolves them (`PromptResolved`). `Secret` prompts are unchanged. Client-side only: no wire or daemon change, so it works against any daemon. For a TUI embedded where keystrokes may not come from the person approving (a terminal pane in another app). An `--observe` attach still can answer prompts without this flag: `Answer` is not an input command. |
 | `SYNAPS_SESSION_COMPACT_INLINE=1` | One-release kill-switch: run `/compact` and auto-compaction inline on the actor task (the #107 body — `Attach`/`Cancel` wait behind it) instead of the spawned job. Deleted in phase 4. |
-| `synaps daemon reload` / `stop` / `purge` / `close` / `pin` / `reload-extension` from **any** same-uid client | Not a privilege boundary (0600 socket): a stray `synaps daemon reload` from any shell checkpoints every session and closes everyone's PTYs, `daemon close --attached` ends one session whoever owns its input (without `--attached` it refuses a session that has clients attached), `daemon pin` pins one session whoever owns its input (host authority, like `stop`), and `daemon reload-extension` restarts an extension every session shares. `Checkpoint` over the wire is owner-only. |
+| `synaps daemon reload` / `stop` / `purge` / `close` / `pin` / `rename` / `reload-extension` from **any** same-uid client | Not a privilege boundary (0600 socket): a stray `synaps daemon reload` from any shell checkpoints every session and closes everyone's PTYs, `daemon close --attached` ends one session whoever owns its input (without `--attached` it refuses a session that has clients attached), `daemon pin` pins one session whoever owns its input (host authority, like `stop`), `daemon rename` names one session whoever owns its input (metadata only), and `daemon reload-extension` restarts an extension every session shares. `Checkpoint` over the wire is owner-only. |
+
+## Capping tool commands with a slice
+
+By default the user manager puts each transient scope in its default slice
+(usually `app.slice`, next to the desktop's apps). To cap what agent tool
+commands can take, give them a slice of their own and set the limits on it.
+**Synaps sets no limits itself.**
+
+**1. Define the slice** — `~/.config/systemd/user/synaps_tools.slice`:
+
+```ini
+[Unit]
+Description=Synaps tool commands
+
+[Slice]
+# Share of CPU under contention, against the slice's siblings (systemd's
+# defaults: app.slice and session.slice 100, background.slice 30).
+CPUWeight=20
+# Reclaim/throttle above this, OOM-kill inside the slice above that.
+MemoryHigh=8G
+MemoryMax=12G
+TasksMax=2048
+```
+
+**2. Point Synaps at it** — `~/.synaps-cli/config`:
+
+```
+tool_scope_slice = synaps_tools.slice
+```
+
+**3. Load it:** `systemctl --user daemon-reload`.
+
+**When it applies.** The config is read at every spawn, so tool commands go in
+the slice from the **next** bash command or PTY shell, with no restart.
+`daemon_scope_slice` applies when the daemon **starts fresh**: `synaps daemon
+reload` re-execs in the same scope, so a change needs `synaps daemon stop` and a
+new start.
+
+**Pick a flat name.** In a slice name a `-` means nesting:
+`synaps-tools.slice` sits under `synaps.slice`, and `agent-tools.slice` under
+`agent.slice`. `CPUWeight` only weighs a cgroup against its **siblings**, so on
+a nested slice that is the only child of its parent it does nothing (the parent,
+at the default 100, is what competes with `app.slice`). Put `CPUWeight` on a
+top-level slice: a name without `-`, such as `synaps_tools.slice`.
+`MemoryHigh`/`MemoryMax`/`TasksMax` are hierarchical and hold wherever the
+slice sits (an ancestor's limits apply too).
+
+**`io` and `cpuset` are usually not yours.** The user manager typically gets
+only the `cpu`, `memory` and `pids` controllers (`cat
+/sys/fs/cgroup/user.slice/user-$UID.slice/user@$UID.service/cgroup.subtree_control`).
+Without `io` and `cpuset` there, `IOWeight=`, `IOReadBandwidthMax=` and
+`AllowedCPUs=` on a user slice are silently ignored, unless `Delegate=` on
+`user@.service` is extended (a system-level change).
+
+**A typo is not an error.** systemd creates a slice that doesn't exist on the
+fly, with no limits, so a misspelt name runs tool commands **uncapped** and the
+launch still succeeds. Check while a command runs:
+
+```
+systemctl --user status synaps_tools.slice         # Loaded: the unit file; Memory: … (high …, max …); the scopes in it
+systemd-cgls --user-unit synaps_tools.slice        # the scopes (synaps tool: bash|shell) in it
+systemctl --user show -p MemoryHigh,MemoryMax,CPUWeight,TasksMax synaps_tools.slice
+```
+
+Synaps helps once: the first time a launch in a process uses a slice, a
+background thread (off the command's path) asks the manager for the slice's
+`MemoryHigh`, `MemoryMax`, `MemorySwapMax`, `CPUWeight`, `CPUQuota` and
+`TasksMax`; if none is set it logs one WARN naming the slice ("no unit file
+defines it: a typo, or a new unit not yet loaded with `systemctl --user
+daemon-reload`?"). It is best-effort: a lookup that fails or times out says
+nothing.
+
+**Name rules.** A value must end in `.slice`, use only `[A-Za-z0-9:_.-]`, not
+start with `-`, not be `-.slice`, contain no `--`, not end its name in `-`, and
+be at most 255 bytes. Anything else is a config warning and is ignored: the key
+keeps the value of an earlier valid line, else stays unset. Write the bare name
+without quotes — the config file is not TOML (`tool_scope_slice =
+"synaps_tools.slice"` warns and is ignored). An empty value (`tool_scope_slice
+=`) unsets the key, without a warning, undoing any earlier line.
+
+**If the probe fails.** Each launch first probes with the same `--slice`. If
+the probe fails — the user manager can't be reached, or it refuses the slice
+(e.g. a slice it can't create) — the command starts without a scope, as with
+scopes unavailable, and one WARN per slice name says so: `scope probe failed
+(user manager unreachable, or slice synaps_tools.slice refused)`.
 
 ## CLI
 
 ```
 synaps daemon [--foreground|--detach] [--socket PATH] [--idle-exit SECS] [--profile P]
 synaps daemon status [--json]        # daemon.json + flock probe + Ping → state/pid/uptime/sessions (exit 1 if not answering)
-synaps daemon stop [--force]         # Shutdown{force} over the socket, wait for the flock; --force escalates SIGTERM (10 s) → SIGKILL (+5 s)
+synaps daemon stop [--force]         # Shutdown{force} over the socket, wait for the flock; --force escalates SIGTERM (10 s) → SIGKILL (+5 s); Windows: taskkill /T /F (10 s)
 synaps daemon sessions [--json]
 synaps daemon purge                  # Purge frame → memstat::purge_arenas() in the daemon; reply Pong (bench hygiene, C2)
-synaps daemon reload [--now] [--drain-secs N] [--exe PATH] [--json]   # re-exec in place, same pid (C3; §Reload below)
+synaps daemon reload [--now] [--drain-secs N] [--exe PATH] [--json]   # re-exec in place, same pid (C3; §Reload below; Windows: new pid, §Windows)
 synaps daemon close <ID|NAME> [--force] [--attached] [--json]   # end one session without attaching (§Closing a session); exit 0/1/2/3
 synaps daemon pin <ID|NAME> [--off] [--json]       # pin/unpin one session without attaching (§Pinning a session); exit 0/1/2/3
+synaps daemon rename <ID|NAME> <NEW_NAME> | --clear [--force] [--json]   # name/unname one session without attaching (§Renaming a session); exit 0/1/2/3
 synaps daemon reload-extension <NAME> [--json]     # restart one extension in place, sessions untouched (§Reloading one extension); exit 0/1/2/3
 synaps attach [ID] [--create] [--continue NAME_OR_ID] [-s PROMPT] [--observe|--takeover] [--keep-warm] [--as NAME]
 synaps --attach [ID] [--observe|--takeover] [--keep-warm] [--no-confirm-answers] [--as NAME]   # thin TUI client over the socket (phase 4); starts the daemon if none is running
@@ -182,6 +269,70 @@ loaded (a long-lived worker host, an inbox other tools write to) is **pinned**:
   even with no TUI ever attached, e.g. one restored after a restart and fed by
   `synaps send`. Unpinned, only a session a typing client attached to keeps warm.
 
+## Renaming a session (`daemon rename`)
+
+`/saveas <name>` names the session (input owner only; an observer is told it is
+read-only). **`synaps daemon rename <ID|NAME> <NEW_NAME> | --clear [--force]
+[--json]`** does it from any shell, without attaching: renaming is metadata,
+not input, so it needs no input ownership, and since the control connection
+never attaches, presence (clients, input owner, which client claims the shared
+inbox) does not change. Meant for tools such as an extension that auto-names
+unnamed sessions.
+
+**Rename never silently replaces a name.** A session that already has a name
+is refused (`named`, exit 3) unless `--force`; `--clear` on a named session
+needs `--force` too. The CLI sends the name it saw in the listing as the
+frame's `expect`, which the session checks atomically, so a name the user sets
+(`/saveas`) between the listing and the rename still wins, even with
+`--force`. An auto-namer should never pass `--force`. **Raw socket clients:
+send `"expect": null`** — an absent `expect` means no precondition and
+replaces any name.
+
+- The target resolves like `daemon close`'s (id, id prefix, journal id, or the
+  current name). The daemon sends the session the host-only engine command
+  `rename` (JSON args; a plain-text `/rename foo` typed in-process is refused:
+  use `/saveas`). The session applies `/saveas`'s rules: `validate_name`
+  (`[a-z0-9-]{1,40}`), unique across the sessions directory, no clash with a
+  chain name. A process-wide lock, taken by `daemon rename` and by
+  `/saveas` alike, covers the check through the save, so two sessions of
+  this daemon can never take the same name at once. Waiting for it is
+  bounded (3 s, then `busy`). It does not cover other processes: a journal
+  lock is per session, so an in-process TUI's `/saveas` or the session
+  picker can still race a daemon rename for a name.
+- **A live session** saves durably (`save_durable`), then puts the file
+  mtimes of `<id>.json` (and `<id>.journal`) back: a rename is not activity,
+  so `synaps --continue` (newest mtime) and the `/sessions` order do not
+  change. Then the listing, the `run/<sid>.json` card and a pinned session's
+  pin-book entry (verbatim: a cleared name stops resolving) are updated, and
+  every attached client, observers included, gets a `Conversation` with the
+  new name. A failed save is reported (`failed`) and rolled back. A session
+  created with `persist: false` gets the name in memory only (the reply says
+  `in_memory_only`); a live session whose journal lock this daemon does not
+  hold is refused (`locked`).
+- **A parked session is renamed on disk and not woken**: under its journal
+  lock (`session_catalog::rename_past_session`, the same primitive the
+  session picker uses), with a durable save that leaves `updated_at` and the
+  mtime alone. `expect` is checked against the name in the file, under that
+  lock (another process may have renamed it while it was parked); a mismatch
+  is `named` and the listing picks up the file's name. If another process
+  holds the journal (an in-process `--continue`), it is `locked`. On unpark
+  the name comes from the file.
+- Answers: `renamed{session_id, name, in_memory_only?}`, or
+  `rename_failed{session_id, reason, message, taken_by?, current_name?}` with
+  `reason` one of `invalid`, `taken` (`taken_by` is the holder's journal id,
+  e.g. `20261028-045932-eb8e`), `chain_conflict`, `named` (`current_name`),
+  `locked`, `busy` (queue full, daemon reloading, another rename saving: retry), `unknown` (no answer
+  in time: it may still apply, **re-list before retrying**), `failed`.
+- Exit codes: 0 renamed or cleared; 3 refused or not applied right now
+  (`named` without `--force`, `locked`, `busy`, `unknown`); 1 invalid name,
+  name taken, chain conflict, failed, no such session, ambiguous, prefix too
+  short, no daemon; 2 the daemon predates `daemon rename` (`synaps daemon
+  reload`), a protocol mismatch, or a usage error (a blank `NEW_NAME` is one:
+  use `--clear`). `--json` prints `{ok, session_id, outcome, name, taken_by,
+  text}`; `name` is the name afterwards, or the current name for `named`.
+- An attached client cannot send `rename` (neither the control frame nor the
+  engine command): it has `/saveas`.
+
 ## Reloading one extension (`daemon reload-extension`)
 
 Extensions are daemon-wide: one process each, shared by every session. A new
@@ -262,7 +413,7 @@ nothing until the first real turn. The restore holds the daemon's idle exit.
 
 | File | Mode | Purpose |
 |---|---|---|
-| `daemon.sock` | 0600 | UDS listener (symlinks refused on cleanup). Every accepted connection must come from the daemon's own uid (`SO_PEERCRED`/`getpeereid`); any other peer, root included, or one whose credentials can't be read, is closed unread with a `daemon: refused connection` warning. |
+| `daemon.sock` | 0600 | UDS listener (symlinks refused on cleanup; on Windows a named pipe whose name is derived from this path, nothing on disk — see [Windows](#windows)). Every accepted connection must come from the daemon's own uid (`SO_PEERCRED`/`getpeereid`); any other peer, root included, or one whose credentials can't be read, is closed unread with a `daemon: refused connection` warning. |
 | `daemon.lock` | 0600 | **flock = liveness oracle.** Alive iff someone holds it. Nobody unlinks on ECONNREFUSED alone; `reap_stale` unlinks sock/json/pid only when the lock is free. A second daemon on the same paths is refused. |
 | `daemon.spawn.lock` | 0600 | Spawn lock: held by the one client auto-spawning the daemon (`daemon::ensure_running`). Never a liveness signal. |
 | `daemon.json` | 0600 | `{pid, protocol_version, daemon_version, profile, started_at, socket, exe, generation}` — never credentials. The daemon keeps the record in memory: when a Ping finds the file missing or naming another pid (an older `synaps` that lists sessions unlinks run-dir `*.json` files it can't parse as session cards), the lock holder writes it back (one INFO line `daemon.json rewritten` per 10 min). Every write of `daemon.json` and `daemon.pid` goes through that file's own `<name>.tmp`, created exclusively and without following a symlink, mode 0600, then renamed into place. One metadata lock serializes the start write, the heal, the reload's write and its restore, and the shutdown cleanup: a heal never writes back an older record than the one held, and nothing writes the files after the cleanup. `daemon status`, `daemon reload`, `daemon stop` and `daemon start --detach` Ping before they read it. |
@@ -320,7 +471,7 @@ first's turns (last-writer-wins).
 - `unpark` failure (lock held by another process) → error surfaced to the attaching client: `cannot unpark session X: journal locked by another process`.
 - **Windows:** `fs4` maps to `LockFileEx` — same semantics, no feature-gate needed.
 
-## Protocol summary (line-JSON over UDS, `DAEMON_MAX_FRAME_BYTES` = 64 MiB, same framing as `synaps rpc`)
+## Protocol summary (line-JSON over UDS or a Windows named pipe, `DAEMON_MAX_FRAME_BYTES` = 64 MiB, same framing as `synaps rpc`)
 
 ```
 C: {"type":"hello", protocol_version, client:{kind,terminal,instance}, cwd, client_version}   ← MUST be first
@@ -329,6 +480,7 @@ D: {"type":"welcome", protocol_version, daemon_version, pid, profile, sessions:[
 C: ping | sessions | shutdown{force}          → D: pong{pid,uptime_s,sessions} | session_list{sessions} | bye   (no session allocated)
 C: close{session_id, force, attached}         → D: closed{session_id, text} | refused{busy|unknown_session} (→ daemon closes) | error
 C: pin{session_id, on}                        → D: pinned{session_id, on} | refused{busy|unknown_session} (→ daemon closes) | error
+C: rename{session_id, name?, expect?}         → D: renamed{session_id, name, in_memory_only?} | rename_failed{session_id, reason, message, taken_by?, current_name?} | refused{unknown_session} (→ daemon closes)
 C: reload_extension{extension}                → D: extension_reloaded{report} | extension_reload_failed{extension, message, unloaded} | refused{busy} (→ daemon closes)
 C: {"type":"attach", attach:"existing", session_id, mode} | {"type":"attach", attach:"create", config:SessionConfig, mode}
 D: {"type":"attached", client, meta, view, conversation, streaming, replay:[WireEnvelope], pending_prompts, clients} | error
@@ -336,7 +488,7 @@ C: {"type":"cmd", session_id, cmd:SessionCommand} …      → D: {"type":"event
 C: bye | socket close = Detach (turn keeps running)
 ```
 
-- Version policy: exact match on `protocol_version` (min == max == 1) → `Refused{Version}` **loudly**
+- Version policy: exact match on `protocol_version` (min == max == 3) → `Refused{Version}` **loudly**
   (client exit 2). Different *binary* (version, or `daemon_build`: the commit it was built from) → allowed;
   the TUI leaves a transcript notice on attach and after every reload reconnect (an attached TUI keeps
   its own binary across `daemon reload`), and sends slash commands it does not handle to the session.
@@ -356,9 +508,11 @@ C: bye | socket close = Detach (turn keeps running)
   `api_messages` copy, `MessageHistory` forwarding and `Query{Messages}` resync — and nothing else of
   the client diet): the
   daemon's `Attached` carries `conversation.api_messages = []` + `conversation.messages_len` + a
-  `display_tail {items:[{kind:user|thinking|text|tool_use,…}], omitted}` projected by
+  `display_tail {items:[{kind:user|thinking|text|tool_use,…}], omitted, times?}` projected by
   `session::display::display_tail` — the SAME filter the in-process TUI applies to its history, so Local
-  and Socket render byte-identical transcripts (golden test, `differential.sh` S pane). The conn
+  and Socket render byte-identical transcripts (golden test, `differential.sh` S pane). `times` holds each
+  item's message time (RFC 3339 UTC, parallel to `items`), omitted when no item has one (legacy history,
+  an older daemon). The conn
   forwarder drops `Stream(MessageHistory)` for Digest clients (they key on the `Conversation` digest that
   follows; `messages_len` is always filled); the mid-turn `replay` ring is filtered the same way. The
   client keeps NO mirror, never re-serialises history for `matches()`, never issues `Query{Messages}`;
@@ -384,6 +538,11 @@ C: bye | socket close = Detach (turn keeps running)
 - `pin` (`on` required) follows the same rule: an older daemon answers "unknown variant `pin`" and
   `synaps daemon pin` exits 2; `pinned` only answers `pin`; refused on an attached connection (that
   client has `/pin`). `SessionMeta.pinned` is `#[serde(default)]`: an older daemon omits it (→ false).
+- `rename` (`name` optional, absent = clear; `expect` optional: absent = no precondition, `null` = only
+  if unnamed, `"x"` = only if named `x`) follows the same rule: an older daemon answers "unknown
+  variant `rename`" at once (no hang) and `synaps daemon rename` reports "daemon … predates `daemon
+  rename`; run `synaps daemon reload`" (exit 2); `renamed`/`rename_failed` only answer it; refused on
+  an attached connection (that client has `/saveas`). Its replies use `RENAME_QUERY_ID_BASE`+n.
 - `reload_extension` follows it too: an older daemon answers "unknown variant `reload_extension`" and
   `synaps daemon reload-extension` exits 2; its two replies only answer it; refused on an attached
   connection.
@@ -400,17 +559,63 @@ C: bye | socket close = Detach (turn keeps running)
 
 ## Security posture
 
-- Socket 0600 in a 0700 dir; same trust domain as every existing per-session socket.
+- Socket 0600 in a 0700 dir; same trust domain as every existing per-session socket. On Windows an
+  owner-only named pipe ([Windows](#windows)).
 - **No secret ever crosses daemon → client.** `Welcome`/`Attached` carry summaries only (grep-tested for
   token/secret/key names). Client → daemon `Answer.value` (e.g. a sudo password) is forwarded to the actor
   and nowhere else: `ClientFrame`'s `Debug` redacts `Answer`/`Submit`/`Steer` bodies, and
   `tests/daemon_no_tui_dep.rs::daemon_never_traces_answer_bodies` greps the daemon + socket transport
   sources for any `tracing::` line mentioning `answer`/`value`.
+- A bash tool command raises a sudo password prompt only through sudo's askpass hook, verified as a
+  set-uid sudo inside that tool call ([sudo-askpass.md](sudo-askpass.md)), never from its output.
 - Backpressure, never silent drops: bounded writer queues both ways (`CMD_CHAN_CAP` = 256);
   `send` returns `TransportError::Backpressure`; the daemon replies `Error{"backpressure…"}`.
 - **The daemon trusts its uid.** Anyone who can open the socket can `shutdown`, `Attach::Create` with any
   `SessionConfig` (`prompt_manifest`, `auto_approve_confirms`, `persist:false`), and `Cancel`/`Compact`
   a session someone else is attached to. That is the same trust as the shell that started the daemon.
+
+## Windows
+
+The daemon runs natively on Windows 10/11. The protocol, sessions, pins and
+reload-state are the same; the operating-system pieces differ:
+
+- **Endpoint.** `daemon.sock` is a named pipe, `\\.\pipe\synaps-daemon-<hash>`,
+  the hash taken from the path's canonical, lower-cased form
+  (`crates/agent-engine/src/ipc.rs`). Nothing is created on disk at the path.
+  Its instances get a protected DACL granting this user and SYSTEM only, and
+  refuse remote clients. A client refuses a pipe whose server process runs
+  as another user, so no other account can squat the name while no daemon
+  serves it. This is what the 0600 socket, the 0700 dir and the peer-uid
+  check do on Unix; the file modes under Files above are Unix-only.
+  Per-session event endpoints (`synaps send --session`) are pipes too,
+  `\\.\pipe\synaps-session-<hash>` of the card's `socket_path`, with the
+  same owner-only DACL and remote refusal, and `synaps send` refuses one
+  served by another user.
+- **Spawn.** `--detach` and auto-spawn start `daemon --foreground` with a
+  hidden console (so tool commands never pop a window), in its own process
+  group (Ctrl+C in the terminal never reaches it), outside the caller's job
+  when the job allows it, and with only the handles it needs. Readiness is
+  a named event (`SYNAPS_DAEMON_READY_EVENT`) instead of the ready pipe; the
+  child exiting first plays the part of EOF before `R`. There are no
+  systemd scopes (`process_scopes` is Linux-only).
+- **Reload.** There is no `execv`, and a byte-range lock belongs to the
+  process that took it. After the checkpoint the old image starts the new
+  one, which reads the reload-state, queues an exclusive lock request on
+  `daemon.lock` behind the old image and signals it
+  (`SYNAPS_DAEMON_HANDOFF_EVENT`). The old image exits, and its release
+  grants the lock straight to the new one, so the liveness check never
+  reads "free" in between. The new image waits for the old process to be
+  gone, then binds and rehydrates as on Unix. **The pid changes.** If the
+  new image exits first, or does not signal within 15 s, the old one keeps
+  serving, as after a failed exec. `--exe` is canonicalised but not checked
+  for owner or mode.
+- **Stop.** There is no SIGTERM: the `Shutdown` frame is the graceful path,
+  and the daemon stops on Ctrl+C in a foreground console. `daemon stop
+  --force` runs `taskkill /PID <pid> /T /F` (the daemon and its children:
+  MCP servers, shells) when the daemon is still alive after 10 s, then waits
+  up to 5 s more.
+- **Locks.** `daemon.lock` and the per-session journal locks are
+  `LockFileEx` locks with the same semantics.
 
 ## Lifecycle
 

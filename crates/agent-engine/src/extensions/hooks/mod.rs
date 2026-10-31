@@ -69,6 +69,22 @@ fn accept_context_phase(
     Some(phase)
 }
 
+/// Whether a handler's `tool` filter covers `ev`. A filter matches the
+/// tool's API name or runtime name (MCP tools with sanitized names still
+/// match). Before a call, a filter for `edit` or `write` also covers the
+/// builtin `multi_edit`, which changes files the same way: a guard written
+/// before `multi_edit` existed must still block or confirm it. Output
+/// transforms (`after_tool_call`) stay exact; their rewrite is per-format.
+fn tool_filter_matches(filter: &str, ev: &HookEvent) -> bool {
+    let (api, runtime) = (ev.tool_name.as_deref(), ev.tool_runtime_name.as_deref());
+    if api == Some(filter) || runtime == Some(filter) {
+        return true;
+    }
+    ev.kind == HookKind::BeforeToolCall
+        && matches!(filter, "edit" | "write")
+        && runtime.or(api) == Some("multi_edit")
+}
+
 /// A registered hook handler with its metadata.
 #[derive(Clone)]
 pub struct HandlerRegistration {
@@ -105,6 +121,9 @@ pub struct HookBus {
     /// Keyed by conversation session id: one process may host N sessions
     /// (Phase 2 daemon), and each must read only its own injection.
     session_injection: RwLock<HashMap<String, String>>,
+    /// `Some(host)`: this bus is a subagent worker's view of `host`
+    /// ([`Self::worker_transforms`]) and has no handlers of its own.
+    transforms_of: Option<Arc<HookBus>>,
 }
 
 impl HookBus {
@@ -114,7 +133,60 @@ impl HookBus {
             handlers: RwLock::new(HashMap::new()),
             session_injection: RwLock::new(HashMap::new()),
             generations: std::sync::Mutex::new(HashMap::new()),
+            transforms_of: None,
         }
+    }
+
+    /// The hook bus a subagent worker runs with: a read-only view of
+    /// `host`'s `after_tool_call` subscriptions from extensions that hold
+    /// `tools.transform_output`, so output transforms (compression,
+    /// redaction) see worker tool results too. Nothing else fires in a
+    /// worker: no `before_tool_call` (no confirm prompt, block or modify),
+    /// no message or session hooks, no observe-only `after_tool_call`.
+    ///
+    /// Live, not a snapshot: every [`Self::emit`] reads `host`'s current
+    /// handler list, so an extension loaded, reloaded or unloaded while a
+    /// worker runs applies from that worker's next tool call (a snapshot
+    /// would keep calling a reloaded extension's stopped instance).
+    /// Dispatch is otherwise [`Self::emit`]'s: chain order, the permission
+    /// matrix, the 5 s timeout, first `replace` wins. Handlers are called
+    /// through [`ExtensionHandler::handle_no_spawn`]: a worker never starts
+    /// or restarts an extension process, and one that is not running
+    /// passes the output through.
+    ///
+    /// [`ExtensionHandler::handle_no_spawn`]: crate::extensions::runtime::ExtensionHandler::handle_no_spawn
+    pub fn worker_transforms(host: &Arc<HookBus>) -> Arc<HookBus> {
+        // A view of a view reads the same host.
+        let host = host.transforms_of.clone().unwrap_or_else(|| Arc::clone(host));
+        Arc::new(Self {
+            transforms_of: Some(host),
+            ..Self::new()
+        })
+    }
+
+    /// Whether this is a worker's view ([`Self::worker_transforms`]).
+    pub fn is_worker_view(&self) -> bool {
+        self.transforms_of.is_some()
+    }
+
+    /// Snapshot of what a worker view dispatches for `kind`: `None` for any
+    /// kind but `after_tool_call`, or when no handler holds
+    /// `tools.transform_output`.
+    async fn worker_transform_registrations(
+        &self,
+        kind: HookKind,
+    ) -> Option<Vec<HandlerRegistration>> {
+        if kind != HookKind::AfterToolCall {
+            return None;
+        }
+        let handlers = self.handlers.read().await;
+        let regs: Vec<HandlerRegistration> = handlers
+            .get(&kind)?
+            .iter()
+            .filter(|reg| reg.permissions.has(Permission::ToolsTransformOutput))
+            .cloned()
+            .collect();
+        (!regs.is_empty()).then_some(regs)
     }
 
     /// Current load generation of `extension_id` (0 until first unloaded).
@@ -175,6 +247,12 @@ impl HookBus {
         matcher: Option<HookMatcher>,
         permissions: PermissionSet,
     ) -> Result<(), String> {
+        if self.is_worker_view() {
+            return Err(format!(
+                "Extension '{}' cannot subscribe to a worker's hook view; subscribe to the host bus",
+                handler.id(),
+            ));
+        }
         // Permission check
         if !permissions.allows_hook(kind) {
             return Err(format!(
@@ -215,16 +293,27 @@ impl HookBus {
     ///
     /// If no handlers are registered for this hook, returns immediately
     /// (the no-extensions fast path).
+    ///
+    /// On a worker view ([`Self::worker_transforms`]) only the host's
+    /// `after_tool_call` transform handlers run, each through
+    /// `handle_no_spawn`; every other kind returns `Continue` at once.
     pub async fn emit(&self, event: &HookEvent) -> HookResult {
         // Snapshot the handler list and drop the lock immediately.
         // This prevents holding the RwLock across async handler calls
         // (which could block subscribe/unsubscribe for the entire
         // duration of IPC round-trips to extension processes).
-        let registrations = {
-            let handlers = self.handlers.read().await;
-            match handlers.get(&event.kind) {
-                Some(regs) if !regs.is_empty() => regs.clone(),
-                _ => return HookResult::Continue, // fast path: no handlers
+        let no_spawn = self.is_worker_view();
+        let registrations = match &self.transforms_of {
+            Some(host) => match host.worker_transform_registrations(event.kind).await {
+                Some(regs) => regs,
+                None => return HookResult::Continue,
+            },
+            None => {
+                let handlers = self.handlers.read().await;
+                match handlers.get(&event.kind) {
+                    Some(regs) if !regs.is_empty() => regs.clone(),
+                    _ => return HookResult::Continue, // fast path: no handlers
+                }
             }
         }; // lock dropped here
 
@@ -251,13 +340,7 @@ impl HookBus {
             // Check both API name and runtime name so MCP tools with
             // sanitized names (slashes→underscores) still match.
             if let Some(ref filter) = reg.tool_filter {
-                let matches = match (&ev.tool_name, &ev.tool_runtime_name) {
-                    (Some(api), Some(runtime)) => filter == api || filter == runtime,
-                    (Some(api), None) => filter == api,
-                    (None, Some(runtime)) => filter == runtime,
-                    (None, None) => false,
-                };
-                if !matches {
+                if !tool_filter_matches(filter, ev) {
                     continue;
                 }
             }
@@ -273,7 +356,14 @@ impl HookBus {
             let event_clone = ev.clone();
             let trace_enabled = extensions_trace_enabled();
             let started_at = trace_enabled.then(Instant::now);
-            let result = tokio::time::timeout(HANDLER_TIMEOUT, handler.handle(&event_clone)).await;
+            let call = async {
+                if no_spawn {
+                    handler.handle_no_spawn(&event_clone).await
+                } else {
+                    handler.handle(&event_clone).await
+                }
+            };
+            let result = tokio::time::timeout(HANDLER_TIMEOUT, call).await;
 
             if trace_enabled {
                 let health = reg.handler.health().await;
@@ -540,16 +630,9 @@ impl HookBus {
                 .iter()
                 .filter(|reg| {
                     // Apply tool filter before spawning.
-                    if let Some(ref filter) = reg.tool_filter {
-                        match (&event.tool_name, &event.tool_runtime_name) {
-                            (Some(api), Some(runtime)) => filter == api || filter == runtime,
-                            (Some(api), None) => filter == api,
-                            (None, Some(runtime)) => filter == runtime,
-                            (None, None) => false,
-                        }
-                    } else {
-                        true
-                    }
+                    reg.tool_filter
+                        .as_deref()
+                        .is_none_or(|filter| tool_filter_matches(filter, event))
                 })
                 .filter(|reg| reg.matcher.as_ref().is_none_or(|m| m.matches(event)))
                 .map(|reg| {
@@ -648,14 +731,24 @@ impl HookBus {
         }
     }
 
-    /// Number of registered handlers across all hooks.
+    /// Number of registered handlers across all hooks. On a worker view:
+    /// the host transform handlers it would dispatch.
     pub async fn handler_count(&self) -> usize {
+        if let Some(host) = &self.transforms_of {
+            return host
+                .worker_transform_registrations(HookKind::AfterToolCall)
+                .await
+                .map_or(0, |regs| regs.len());
+        }
         let handlers = self.handlers.read().await;
         handlers.values().map(|v| v.len()).sum()
     }
 
     /// Check if any handlers are registered (for fast-path decisions).
     pub async fn is_empty(&self) -> bool {
+        if self.is_worker_view() {
+            return self.handler_count().await == 0;
+        }
         let handlers = self.handlers.read().await;
         handlers.values().all(|v| v.is_empty())
     }
@@ -1621,6 +1714,38 @@ mod tests {
         assert_eq!(handler.calls(), 1);
     }
 
+    /// A guard written for `edit`/`write` (from before `multi_edit`
+    /// existed) still sees `multi_edit` before the call, so it can block or
+    /// confirm it. Output transforms stay exact.
+    #[tokio::test]
+    async fn edit_and_write_filters_also_guard_multi_edit_before_the_call() {
+        for filter in ["edit", "write"] {
+            let bus = HookBus::new();
+            let guard = TestHandler::new(
+                "guard",
+                HookResult::Block {
+                    reason: "guarded".into(),
+                },
+            );
+            let after = TestHandler::new("after", HookResult::Continue);
+            let perms = perms_with(&[Permission::ToolsIntercept]);
+            bus.subscribe(HookKind::BeforeToolCall, guard.clone(), Some(filter.into()), None, perms.clone())
+                .await
+                .unwrap();
+            bus.subscribe(HookKind::AfterToolCall, after.clone(), Some(filter.into()), None, perms)
+                .await
+                .unwrap();
+            let input = serde_json::json!({"edits": [{"path": "/etc/hosts", "op": "append", "text": "x"}]});
+            let blocked = bus.emit(&HookEvent::before_tool_call("multi_edit", input.clone())).await;
+            assert!(matches!(blocked, HookResult::Block { reason } if reason == "guarded"), "{filter}");
+            assert_eq!(guard.calls(), 1, "{filter}");
+            let other = bus.emit(&HookEvent::before_tool_call("read", serde_json::json!({}))).await;
+            assert!(matches!(other, HookResult::Continue), "{filter}: only the file-changing tool");
+            bus.emit(&HookEvent::after_tool_call("multi_edit", input, "ok".into())).await;
+            assert_eq!(after.calls(), 0, "{filter}: after_tool_call filters stay exact");
+        }
+    }
+
     #[tokio::test]
     async fn permission_denied_rejects_subscribe() {
         let bus = HookBus::new();
@@ -1972,5 +2097,348 @@ mod tests {
         assert_eq!(bus.session_injection().await.as_deref(), Some("legacy"));
         assert_eq!(bus.session_injection_for("").await.as_deref(), Some("legacy"));
         assert_eq!(bus.session_injection_for("s1").await, None);
+    }
+}
+
+/// Subagent workers' hook view ([`HookBus::worker_transforms`]): only the
+/// host's `after_tool_call` output transforms, live, dispatched without
+/// ever (re)starting an extension.
+#[cfg(test)]
+mod worker_view_tests {
+    use super::*;
+    use crate::extensions::permissions::Permission;
+    use async_trait::async_trait;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Counts `handle` / `handle_no_spawn` calls separately. `result` is
+    /// what both return; `tag_output` instead replaces with
+    /// `"<tag>:<tool_output>"` (per-call, so concurrent callers can tell
+    /// their replacements apart). `delay` sleeps first.
+    struct Probe {
+        id: String,
+        result: HookResult,
+        tag_output: Option<String>,
+        delay: Duration,
+        handled: AtomicUsize,
+        handled_no_spawn: AtomicUsize,
+    }
+
+    impl Probe {
+        fn build(id: &str, result: HookResult, tag: Option<&str>, delay: Duration) -> Arc<Self> {
+            Arc::new(Self {
+                id: id.into(),
+                result,
+                tag_output: tag.map(str::to_string),
+                delay,
+                handled: AtomicUsize::new(0),
+                handled_no_spawn: AtomicUsize::new(0),
+            })
+        }
+
+        fn new(id: &str, result: HookResult) -> Arc<Self> {
+            Self::build(id, result, None, Duration::ZERO)
+        }
+
+        fn tagging(id: &str, tag: &str, delay: Duration) -> Arc<Self> {
+            Self::build(id, HookResult::Continue, Some(tag), delay)
+        }
+
+        fn calls(&self) -> (usize, usize) {
+            (
+                self.handled.load(Ordering::SeqCst),
+                self.handled_no_spawn.load(Ordering::SeqCst),
+            )
+        }
+
+        async fn answer(&self, event: &HookEvent) -> HookResult {
+            if !self.delay.is_zero() {
+                tokio::time::sleep(self.delay).await;
+            }
+            match &self.tag_output {
+                Some(tag) => HookResult::Replace {
+                    output: format!("{tag}:{}", event.tool_output.as_deref().unwrap_or("")),
+                },
+                None => self.result.clone(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl crate::extensions::runtime::ExtensionHandler for Probe {
+        fn id(&self) -> &str {
+            &self.id
+        }
+        async fn handle(&self, event: &HookEvent) -> HookResult {
+            self.handled.fetch_add(1, Ordering::SeqCst);
+            self.answer(event).await
+        }
+        async fn handle_no_spawn(&self, event: &HookEvent) -> HookResult {
+            self.handled_no_spawn.fetch_add(1, Ordering::SeqCst);
+            self.answer(event).await
+        }
+        async fn shutdown(&self) {}
+    }
+
+    fn perms(perms: &[Permission]) -> PermissionSet {
+        let mut set = PermissionSet::new();
+        for p in perms {
+            set.grant(*p);
+        }
+        set
+    }
+
+    fn transform() -> PermissionSet {
+        perms(&[Permission::ToolsIntercept, Permission::ToolsTransformOutput])
+    }
+
+    async fn after(bus: &Arc<HookBus>, output: &str) -> String {
+        crate::runtime::emit_after_tool_call(
+            bus,
+            "bash",
+            None,
+            serde_json::json!({"command": "cat big.log"}),
+            output.to_string(),
+            30_000,
+            None,
+        )
+        .await
+    }
+
+    /// The host bus a worker views: a confirm and a block on
+    /// before_tool_call, an inject on before_message, an observe-only
+    /// after_tool_call, and one real output transform.
+    async fn host_with_every_kind() -> (Arc<HookBus>, Vec<Arc<Probe>>, Arc<Probe>) {
+        let host = Arc::new(HookBus::new());
+        let confirm = Probe::new(
+            "confirmer",
+            HookResult::Confirm {
+                message: "really?".into(),
+                sources: vec![],
+                generations: vec![],
+                tool: None,
+                modified_input: None,
+                modified_by: vec![],
+            },
+        );
+        let block = Probe::new("blocker", HookResult::Block { reason: "no".into() });
+        let inject = Probe::new("injector", HookResult::Inject { content: "ctx".into() });
+        let observer = Probe::new("observer", HookResult::Replace { output: "SNEAKY".into() });
+        let crush = Probe::new("crush", HookResult::Replace { output: "CRUSHED".into() });
+        let intercept = perms(&[Permission::ToolsIntercept]);
+        host.subscribe(HookKind::BeforeToolCall, confirm.clone(), None, None, intercept.clone())
+            .await
+            .unwrap();
+        host.subscribe(HookKind::BeforeToolCall, block.clone(), None, None, transform())
+            .await
+            .unwrap();
+        host.subscribe(
+            HookKind::BeforeMessage,
+            inject.clone(),
+            None,
+            None,
+            perms(&[Permission::LlmContent, Permission::ToolsTransformOutput]),
+        )
+        .await
+        .unwrap();
+        // Observe-only first, so on the host it is reached before `crush`.
+        host.subscribe(HookKind::AfterToolCall, observer.clone(), None, None, intercept)
+            .await
+            .unwrap();
+        host.subscribe(HookKind::AfterToolCall, crush.clone(), None, None, transform())
+            .await
+            .unwrap();
+        (host, vec![confirm, block, inject, observer], crush)
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn a_worker_runs_only_the_hosts_after_tool_call_transforms() {
+        let _base = crate::test_env::BaseDirGuard::new();
+        let (host, others, crush) = host_with_every_kind().await;
+        let worker = HookBus::worker_transforms(&host);
+        assert!(worker.is_worker_view() && !host.is_worker_view());
+
+        // The worker's bash result is replaced by the transform...
+        assert_eq!(after(&worker, "RAW 10k lines").await, "CRUSHED");
+        assert_eq!(crush.calls(), (0, 1), "through handle_no_spawn");
+        // ...and nothing else fires: no confirm prompt, no block, no inject.
+        let before = crate::runtime::emit_before_tool_call(
+            &worker,
+            "bash",
+            None,
+            serde_json::json!({"command": "rm -rf /"}),
+            None,
+        )
+        .await;
+        assert_eq!(before, HookResult::Continue);
+        let decision = crate::runtime::resolve_before_tool_call_decision(
+            serde_json::json!({"command": "rm -rf /"}),
+            before,
+            None,
+            false,
+            None,
+        )
+        .await;
+        assert!(matches!(decision, crate::runtime::BeforeToolCallDecision::Continue { .. }));
+        for kind in [HookKind::BeforeMessage, HookKind::OnMessageComplete, HookKind::OnSessionStart] {
+            let mut event = HookEvent::after_tool_call("bash", serde_json::json!({}), "x".into());
+            event.kind = kind;
+            assert_eq!(worker.emit(&event).await, HookResult::Continue, "{kind:?}");
+        }
+        for probe in &others {
+            assert_eq!(probe.calls(), (0, 0), "{} never reached from a worker", probe.id);
+        }
+        assert_eq!(worker.handler_count().await, 1, "the one transform");
+        assert!(!worker.is_empty().await);
+
+        // The foreground (host bus) is unchanged: observer first, then crush.
+        assert_eq!(after(&host, "RAW").await, "CRUSHED");
+        assert_eq!(others[3].calls(), (1, 0));
+        assert_eq!(crush.calls(), (1, 1));
+    }
+
+    /// Two-key gate on the worker path: an after_tool_call subscriber
+    /// without `tools.transform_output` is not even dispatched, so it can
+    /// neither replace nor observe a worker's output.
+    #[tokio::test]
+    async fn an_extension_without_transform_output_cannot_replace_a_workers_output() {
+        let host = Arc::new(HookBus::new());
+        let observer = Probe::new("observer", HookResult::Replace { output: "SNEAKY".into() });
+        host.subscribe(
+            HookKind::AfterToolCall,
+            observer.clone(),
+            None,
+            None,
+            perms(&[Permission::ToolsIntercept]),
+        )
+        .await
+        .unwrap();
+        let worker = HookBus::worker_transforms(&host);
+        assert_eq!(after(&worker, "RAW").await, "RAW");
+        assert_eq!(observer.calls(), (0, 0));
+        assert!(worker.is_empty().await);
+        // The foreground still ignores its Replace (the existing gate).
+        assert_eq!(after(&host, "RAW").await, "RAW");
+        assert_eq!(observer.calls(), (1, 0));
+    }
+
+    /// Fail-safe: a transform that times out (5 s) or answers `Continue`
+    /// (what a crashed or not-running extension answers) leaves the
+    /// original output, and the chain moves on to the next transform.
+    #[tokio::test(start_paused = true)]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn a_timed_out_or_crashed_transform_leaves_the_original_output() {
+        let _base = crate::test_env::BaseDirGuard::new();
+        let host = Arc::new(HookBus::new());
+        let slow = Probe::tagging("slow", "SLOW", Duration::from_secs(60));
+        host.subscribe(HookKind::AfterToolCall, slow.clone(), None, None, transform())
+            .await
+            .unwrap();
+        let worker = HookBus::worker_transforms(&host);
+        let started = tokio::time::Instant::now();
+        assert_eq!(after(&worker, "RAW").await, "RAW", "timed out → original");
+        let waited = started.elapsed();
+        assert!(
+            waited >= HANDLER_TIMEOUT && waited < HANDLER_TIMEOUT + Duration::from_secs(1),
+            "bounded by the hook timeout: {waited:?}"
+        );
+
+        let crashed = Probe::new("crashed", HookResult::Continue);
+        let next = Probe::tagging("next", "NEXT", Duration::ZERO);
+        let host = Arc::new(HookBus::new());
+        host.subscribe(HookKind::AfterToolCall, crashed.clone(), None, None, transform())
+            .await
+            .unwrap();
+        let worker = HookBus::worker_transforms(&host);
+        assert_eq!(after(&worker, "RAW").await, "RAW", "crashed → original");
+        host.subscribe(HookKind::AfterToolCall, next.clone(), None, None, transform())
+            .await
+            .unwrap();
+        assert_eq!(after(&worker, "RAW").await, "NEXT:RAW", "the chain continues");
+    }
+
+    /// Live view, not a snapshot: a worker created before an extension
+    /// loads, reloads or unloads sees each change on its next call, and
+    /// never calls a stopped instance.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn a_worker_sees_extension_loads_reloads_and_unloads_live() {
+        let _base = crate::test_env::BaseDirGuard::new();
+        let host = Arc::new(HookBus::new());
+        let worker = HookBus::worker_transforms(&host);
+        assert_eq!(after(&worker, "RAW").await, "RAW", "nothing loaded yet");
+
+        let v1 = Probe::tagging("crush", "V1", Duration::ZERO);
+        host.subscribe(HookKind::AfterToolCall, v1.clone(), None, None, transform())
+            .await
+            .unwrap();
+        assert_eq!(after(&worker, "RAW").await, "V1:RAW", "loaded after the worker started");
+
+        // Reload = unsubscribe_all + subscribe the new instance.
+        host.unsubscribe_all("crush").await;
+        assert_eq!(after(&worker, "RAW").await, "RAW", "mid-reload: pass-through");
+        let v2 = Probe::tagging("crush", "V2", Duration::ZERO);
+        host.subscribe(HookKind::AfterToolCall, v2.clone(), None, None, transform())
+            .await
+            .unwrap();
+        assert_eq!(after(&worker, "RAW").await, "V2:RAW");
+        assert_eq!(v1.calls(), (0, 1), "the stopped instance is never called again");
+
+        host.unsubscribe_all("crush").await;
+        assert_eq!(after(&worker, "RAW").await, "RAW", "unloaded");
+    }
+
+    /// Parallel workers, each on its own OS thread and current-thread
+    /// runtime (as subagents run), share one handler and each get the
+    /// replacement of their own output.
+    #[test]
+    #[serial_test::serial(synaps_base_dir)]
+    fn parallel_workers_each_get_their_own_replacement() {
+        let _base = crate::test_env::BaseDirGuard::new();
+        let crush = Probe::tagging("crush", "CRUSHED", Duration::from_millis(2));
+        let host = Arc::new(HookBus::new());
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(host.subscribe(HookKind::AfterToolCall, crush.clone(), None, None, transform()))
+            .unwrap();
+        let threads: Vec<_> = (0..8)
+            .map(|w| {
+                let worker = HookBus::worker_transforms(&host);
+                std::thread::spawn(move || {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap();
+                    rt.block_on(async {
+                        for call in 0..10 {
+                            let output = format!("worker {w} call {call}");
+                            assert_eq!(after(&worker, &output).await, format!("CRUSHED:{output}"));
+                        }
+                    });
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().expect("worker thread");
+        }
+        assert_eq!(crush.calls(), (0, 80));
+    }
+
+    #[tokio::test]
+    async fn a_view_is_read_only_and_a_view_of_a_view_reads_the_host() {
+        let host = Arc::new(HookBus::new());
+        let worker = HookBus::worker_transforms(&host);
+        let probe = Probe::tagging("crush", "C", Duration::ZERO);
+        let err = worker
+            .subscribe(HookKind::AfterToolCall, probe.clone(), None, None, transform())
+            .await
+            .unwrap_err();
+        assert!(err.contains("worker"), "{err}");
+        let nested = HookBus::worker_transforms(&worker);
+        assert!(nested.is_worker_view());
+        assert!(Arc::ptr_eq(nested.transforms_of.as_ref().unwrap(), &host));
+        assert_eq!(nested.handler_count().await, 0);
     }
 }

@@ -420,6 +420,10 @@ mod tests {
     use serial_test::serial;
     use std::time::{Duration, Instant};
 
+    // These tests assert on the process-global relay counters, which every
+    // streaming test moves. Most of those (provider stubs, keep-warm, live
+    // subagent workers) hold `synaps_base_dir`, so hold it too.
+
     const CHUNK: usize = 4096;
 
     fn text(bytes: usize) -> StreamEvent {
@@ -441,7 +445,7 @@ mod tests {
     /// within the fixed budget, account every dropped byte, and conserve
     /// produced == forwarded + dropped once the relay terminates.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[serial(stream_relay)]
+    #[serial(stream_relay, synaps_base_dir)]
     async fn flood_with_stalled_consumer_keeps_retention_within_fixed_budget() {
         let base = stream_relay_snapshot();
         let (tx, rx_in) = mpsc::unbounded_channel();
@@ -507,7 +511,7 @@ mod tests {
     /// Semantic control/terminal/tool-call events are NEVER dropped by the
     /// flood policy and arrive in order.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[serial(stream_relay)]
+    #[serial(stream_relay, synaps_base_dir)]
     async fn semantic_events_survive_flood_in_order() {
         let (tx, rx_in) = mpsc::unbounded_channel();
         let cancel = CancellationToken::new();
@@ -567,7 +571,7 @@ mod tests {
     /// keep their place — a queued call's output never overtakes its
     /// `started`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[serial(stream_relay)]
+    #[serial(stream_relay, synaps_base_dir)]
     async fn queue_signals_survive_flood_in_order() {
         let (tx, rx_in) = mpsc::unbounded_channel();
         let cancel = CancellationToken::new();
@@ -619,7 +623,7 @@ mod tests {
     /// Dropping the caller stream cancels the turn token (releasing the
     /// producing provider tasks) and terminates the relay.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[serial(stream_relay)]
+    #[serial(stream_relay, synaps_base_dir)]
     async fn caller_drop_cancels_turn_token_and_ends_relay() {
         let base = stream_relay_snapshot();
         let (tx, rx_in) = mpsc::unbounded_channel();
@@ -644,7 +648,7 @@ mod tests {
     /// A promptly-consuming caller keeps full delta granularity: no
     /// coalescing below the threshold, exact payloads, exact order.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[serial(stream_relay)]
+    #[serial(stream_relay, synaps_base_dir)]
     async fn prompt_consumer_preserves_delta_granularity() {
         let (tx, rx_in) = mpsc::unbounded_channel();
         let cancel = CancellationToken::new();

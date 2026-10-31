@@ -335,6 +335,7 @@ impl ConversationState {
 mod context_head_tests {
     use super::*;
     use agent_core::core::context_head::ContextHeadReceipt;
+    #[cfg(unix)]
     use agent_core::core::session_journal::{save_session_durable_in_dir, SessionPersistence};
     use serde_json::json;
     use std::sync::Arc;

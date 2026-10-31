@@ -134,6 +134,18 @@ pub struct SubagentState {
     pub archive_dir: Option<std::path::PathBuf>,
     /// Where the finalizer wrote this worker's resume archive.
     pub archive_path: Option<std::path::PathBuf>,
+    /// Wall-clock start (Unix ms) of the run's last accepted Anthropic
+    /// request, captured when the run ends. `subagent_resume` compares it to
+    /// the worker cache TTL: an expired prefix would be rewritten in full, so
+    /// a large cold history is resumed from a compact context instead.
+    pub cache_anchor_unix_ms: Option<u64>,
+    /// The worker's current context window (1 until its context first rolls
+    /// over; a resumed rolled worker starts at its archived window).
+    pub context_window: u64,
+    /// Automatic context rollovers in this run.
+    pub context_rollovers: u32,
+    /// Transcripts of every earlier context window, oldest first.
+    pub context_transcripts: Vec<std::path::PathBuf>,
     /// Managed workers remain publicly running until their recovery outcome is published.
     pub finalization_started: bool,
     pub finalization_ready: bool,
@@ -150,6 +162,13 @@ pub struct SubagentArchiveMeta {
     pub model: String,
     pub system_prompt: String,
     pub timeout_secs: u64,
+    /// Working directory the worker ran in, so a resume continues there.
+    /// Absent in archives written before it was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<std::path::PathBuf>,
+    /// Canonical worker effort; missing in archives created before this feature.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<String>,
 }
 
 impl SubagentState {
@@ -183,6 +202,10 @@ impl SubagentState {
             archive_meta: None,
             archive_dir: None,
             archive_path: None,
+            cache_anchor_unix_ms: None,
+            context_window: 1,
+            context_rollovers: 0,
+            context_transcripts: Vec::new(),
             finalization_started: false,
             finalization_ready: false,
             archive_error: None,
@@ -195,6 +218,23 @@ impl SubagentState {
         self.step.clear();
         self.step.push_str(step);
         self.tools = tools;
+    }
+
+    /// Record where the worker's context stands: at launch from a resumed
+    /// history, then after each rollover.
+    pub fn note_context(&mut self, window: u64, transcripts: Vec<std::path::PathBuf>) {
+        self.context_window = window.max(1);
+        self.context_transcripts = transcripts;
+    }
+
+    /// `{"window", "rollovers", "transcripts"}` for status/collect once the
+    /// worker's context has rolled over; `None` before (outputs unchanged).
+    pub fn context_summary(&self) -> Option<Value> {
+        context_summary(
+            self.context_window,
+            Some(self.context_rollovers),
+            &self.context_transcripts,
+        )
     }
 
     /// Text of the latest model response (empty if none started yet).
@@ -215,6 +255,35 @@ impl SubagentState {
         self.status = SubagentStatus::Failed(diagnostic.safe_message.clone());
         self.terminal = Some(diagnostic);
     }
+}
+
+/// The `context` object of status/collect output; `None` before the first
+/// rollover. `rollovers` is unknown for an archived run.
+pub fn context_summary(
+    window: u64,
+    rollovers: Option<u32>,
+    transcripts: &[std::path::PathBuf],
+) -> Option<Value> {
+    if window <= 1 && transcripts.is_empty() {
+        return None;
+    }
+    let mut summary = serde_json::json!({"window": window, "transcripts": transcripts});
+    if let Some(rollovers) = rollovers {
+        summary["rollovers"] = rollovers.into();
+    }
+    Some(summary)
+}
+
+/// [`context_summary`] of an archived history (from its rollover metadata).
+pub fn archived_context_summary(history: &[Value]) -> Option<Value> {
+    let shared: Vec<crate::SharedMessage> = history
+        .iter()
+        .filter(|m| m.get(crate::runtime::worker_context::MARKER_KEY).is_some())
+        .map(|m| std::sync::Arc::new(m.clone()))
+        .collect();
+    let (window, transcripts) = crate::runtime::worker_context::window_state(&shared);
+    let paths: Vec<std::path::PathBuf> = transcripts.into_iter().map(|t| t.path.into()).collect();
+    context_summary(window, None, &paths)
 }
 
 impl Default for SubagentState {

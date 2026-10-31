@@ -618,12 +618,20 @@ async fn production_bash_handoff_conserves_bytes_for_large_generated_output() {
         .await
         .expect("production bash path");
     assert!(output.contains("output truncated"));
-    let after = bash_intermediary_snapshot();
-    let produced = after.produced_bytes - before.produced_bytes;
-    let consumed = after.consumed_bytes - before.consumed_bytes;
-    let dropped = after.dropped_bytes - before.dropped_bytes;
-    assert_eq!(produced, consumed + dropped);
-    assert_eq!(after.retained_bytes, before.retained_bytes);
+    // Process-global counters: other tests in this binary may have bytes in
+    // flight, so wait for the whole process to settle rather than diffing a
+    // window. A leaked byte never settles.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let after = loop {
+        let now = bash_intermediary_snapshot();
+        if now.is_settled() {
+            break now;
+        }
+        assert!(std::time::Instant::now() < deadline, "handoff bytes never settled: {now:?}");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    };
+    assert_eq!(after.retained_bytes, 0);
+    assert!(after.produced_bytes - before.produced_bytes >= 64 * 1024);
 }
 
 // ── §8 acceptance: effect-aware scheduling through the production loop ──────

@@ -19,6 +19,16 @@
 //! model/thinking (`/model` mid-session survives), and the session's exact
 //! tool activations (pins only, re-validated by the new runtime at its first
 //! turn start — `SessionToolSet::restore_carried`).
+//!
+//! Windows has no `execv`, and a byte-range lock cannot be inherited, so
+//! step 5 is a hand-off between two processes (see `daemon::win`): the old
+//! image starts the new one with the reload-state and a hand-off event; the
+//! new image queues its `daemon.lock` request behind the old one and sets
+//! the event; the old image exits — discarding what an exec would — and its
+//! release grants the queued request, so the liveness oracle never reads
+//! "free". The new image does this before booting anything, then proceeds
+//! exactly as after an exec. Same guarantees, one difference: the pid
+//! changes (clients learn it from the next `Welcome`).
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
@@ -43,6 +53,19 @@ pub const LOCK_FD_ENV: &str = "SYNAPS_DAEMON_LOCK_FD";
 /// `ReloadState::next_subagent_id` (written after the checkpoints): a worker
 /// that ignored its stop could still dispatch in between.
 pub const SUBAGENT_ID_FLOOR_ENV: &str = "SYNAPS_DAEMON_SUBAGENT_ID_FLOOR";
+/// Windows: env naming the event the new image sets once its `daemon.lock`
+/// request is queued behind the old image (which then exits).
+pub const HANDOFF_EVENT_ENV: &str = "SYNAPS_DAEMON_HANDOFF_EVENT";
+/// Windows: env carrying the old image's pid; the new image waits for it to
+/// be gone (and its pipe instances with it) before it binds.
+pub const HANDOFF_PID_ENV: &str = "SYNAPS_DAEMON_HANDOFF_PID";
+/// Windows: how long the old image waits for the new one to queue its lock
+/// request — process start and reading the reload-state; nothing boots first.
+#[cfg(windows)]
+const HANDOFF_ARM_TIMEOUT: Duration = Duration::from_secs(15);
+/// Windows: how long the new image waits for the old one to let go.
+#[cfg(windows)]
+const HANDOFF_EXIT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Env: default drain budget in seconds.
 pub const DRAIN_SECS_ENV: &str = "SYNAPS_DAEMON_RELOAD_DRAIN_SECS";
 const DEFAULT_DRAIN: Duration = Duration::from_secs(30);
@@ -514,7 +537,10 @@ pub async fn exec(state: &Arc<DaemonState>, p: Prepared) -> ReloadError {
     )
     .await;
 
+    #[cfg(unix)]
     let err = exec_self(&p.exe, &p.rs_path, state);
+    #[cfg(windows)]
+    let err = exec_successor(&p.exe, &p.rs_path, state).await;
     tracing::error!(error = %err, "daemon: reload exec failed; continuing on the old image");
     // The record before this attempt, whole: exe and started_at too, so the
     // next default reload uses the old exe, not the one that failed.
@@ -599,15 +625,154 @@ fn exec_self(exe: &Path, rs_path: &Path, state: &DaemonState) -> String {
     e.to_string()
 }
 
-#[cfg(not(unix))]
-fn exec_self(_exe: &Path, _rs_path: &Path, _state: &DaemonState) -> String {
-    "reload is unix-only".into()
+/// Windows `execv`: start the new image with the reload-state and a
+/// hand-off event, wait for it to queue its `daemon.lock` request behind
+/// ours, then exit — no destructors (they would unlink the `daemon.json`
+/// that now names the next generation), no session `End` (the new image
+/// rehydrates them): what the exec discards on Unix. Returns only on
+/// failure, with this image intact.
+#[cfg(windows)]
+async fn exec_successor(exe: &Path, rs_path: &Path, state: &DaemonState) -> String {
+    use super::win;
+    let armed = match win::Event::create_unique("handoff") {
+        Ok(e) => e,
+        Err(e) => return format!("hand-off event: {e}"),
+    };
+    let mut args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    if args.is_empty() || args.iter().all(|a| a != "daemon") {
+        args = vec!["daemon".into(), "--foreground".into()];
+    }
+    let mut env = crate::process_scope::inherited_env();
+    env.retain(|(k, _)| k != super::READY_EVENT_ENV);
+    crate::process_scope::set_env(&mut env, "SYNAPS_DAEMON", "1");
+    crate::process_scope::set_env(&mut env, RELOAD_STATE_ENV, rs_path.as_os_str());
+    crate::process_scope::set_env(&mut env, HANDOFF_EVENT_ENV, armed.name());
+    crate::process_scope::set_env(&mut env, HANDOFF_PID_ENV, std::process::id().to_string());
+    crate::process_scope::set_env(&mut env, SUBAGENT_ID_FLOOR_ENV, crate::tools::peek_next_subagent_id().to_string());
+    let child = match win::spawn_detached(exe, &args, &env) {
+        Ok(c) => c,
+        Err(e) => return format!("cannot start {}: {e}", exe.display()),
+    };
+    let waited = tokio::task::spawn_blocking(move || {
+        let outcome = win::wait_event_or_exit(&armed, &child, HANDOFF_ARM_TIMEOUT);
+        (child, outcome)
+    })
+    .await;
+    let (child, outcome) = match waited {
+        Ok(r) => r,
+        Err(e) => return format!("hand-off wait: {e}"),
+    };
+    match outcome {
+        win::Wait::Signalled => {
+            tracing::info!(pid = child.id(), "daemon: reload hand-off armed; this image exits");
+            state.host.flush_logs();
+            std::process::exit(0);
+        }
+        win::Wait::Exited => {
+            let mut child = child;
+            let code = child.wait(Duration::ZERO);
+            let tail = win::stderr_tail(child.take_stderr(), 64 * 1024, Duration::from_millis(500));
+            let why = tail
+                .lines()
+                .map(str::trim)
+                .rfind(|l| !l.is_empty())
+                .map(|l| l.trim_start_matches("synaps daemon: ").to_string())
+                .unwrap_or_else(|| "no output".into());
+            format!(
+                "new image exited (code {}) before taking over: {why}",
+                code.map_or_else(|| "?".to_string(), |c| c.to_string())
+            )
+        }
+        win::Wait::TimedOut => {
+            child.kill();
+            let _ = child.wait(Duration::from_secs(5));
+            format!("new image did not take over within {HANDOFF_ARM_TIMEOUT:?}")
+        }
+    }
+}
+
+/// What a new image adopts: the held lock, the reload-state and its path.
+type Adopted = (DaemonLock, ReloadState, PathBuf);
+
+/// Windows: the hand-off taken at the top of `run_foreground`, held here
+/// for [`adopt_from_env`].
+#[cfg(windows)]
+static TAKEN_OVER: std::sync::Mutex<Option<Adopted>> = std::sync::Mutex::new(None);
+
+/// Windows: take `daemon.lock` over from the previous image now, before
+/// anything boots (the previous image exits on our signal, as the exec
+/// would have replaced it). A no-op unless this is a reload.
+#[cfg(windows)]
+pub fn take_over_from_env(paths: &DaemonPaths) -> anyhow::Result<()> {
+    if let Some(adopted) = handoff_from_env(paths)? {
+        *TAKEN_OVER.lock().unwrap_or_else(|e| e.into_inner()) = Some(adopted);
+    }
+    Ok(())
+}
+
+/// New-image side (`Daemon::start`), Windows: what [`take_over_from_env`]
+/// took, or the hand-off done now.
+#[cfg(windows)]
+pub fn adopt_from_env(paths: &DaemonPaths) -> anyhow::Result<Option<Adopted>> {
+    if let Some(adopted) = TAKEN_OVER.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        return Ok(Some(adopted));
+    }
+    handoff_from_env(paths)
+}
+
+/// Windows hand-off, new-image side: parse the reload-state first (a bad
+/// one fails while the old image can still carry on), queue `daemon.lock`
+/// behind the old image and set its hand-off event, take the grant when it
+/// exits, then wait for its process to be gone. The event is mandatory —
+/// without it the old image would never let go (refuse, as Unix refuses a
+/// reload-state without its lock fd).
+#[cfg(windows)]
+fn handoff_from_env(paths: &DaemonPaths) -> anyhow::Result<Option<Adopted>> {
+    let Some(rs_path) = std::env::var_os(RELOAD_STATE_ENV) else {
+        return Ok(None);
+    };
+    let rs_path = PathBuf::from(rs_path);
+    std::env::remove_var(RELOAD_STATE_ENV);
+    let event = std::env::var(HANDOFF_EVENT_ENV).ok();
+    std::env::remove_var(HANDOFF_EVENT_ENV);
+    let old_pid = std::env::var(HANDOFF_PID_ENV).ok().and_then(|s| s.parse::<u32>().ok());
+    std::env::remove_var(HANDOFF_PID_ENV);
+    let id_floor = std::env::var(SUBAGENT_ID_FLOOR_ENV).ok().and_then(|s| s.parse::<u64>().ok());
+    std::env::remove_var(SUBAGENT_ID_FLOOR_ENV);
+    let event = event.ok_or_else(|| {
+        anyhow::anyhow!("{RELOAD_STATE_ENV} set without {HANDOFF_EVENT_ENV}: refusing to start (the lock is the liveness oracle)")
+    })?;
+    let body = std::fs::read_to_string(&rs_path)?;
+    let mut rs: ReloadState = serde_json::from_str(&body)?;
+    if let Some(floor) = id_floor {
+        rs.next_subagent_id = rs.next_subagent_id.max(floor);
+    }
+    // Opened before the signal, so its pid cannot be reused under us.
+    let old = old_pid.and_then(super::win::Process::open);
+    let mut signal_err = None;
+    let lock = DaemonLock::acquire_handoff(paths, HANDOFF_EXIT_TIMEOUT, || {
+        signal_err = super::win::signal_event(&event).err();
+    })
+    .map_err(|e| match &signal_err {
+        Some(s) => anyhow::anyhow!("taking daemon.lock over: {e} (the previous image was never told: {s})"),
+        None => anyhow::anyhow!("taking daemon.lock over from the previous image: {e}"),
+    })?;
+    if let Some(old) = old {
+        if !old.wait(Duration::from_secs(10)) {
+            tracing::warn!(pid = old_pid, "daemon: the previous image still runs after releasing daemon.lock");
+        }
+    }
+    tracing::info!(generation = rs.generation, "daemon: took daemon.lock over from the previous image");
+    // The previous image read our stderr; it is gone.
+    super::win::detach_stdio();
+    Ok(Some((lock, rs, rs_path)))
 }
 
 /// New-image side (`Daemon::start`): when `RELOAD_STATE_ENV` is set, the
 /// lock is ADOPTED from `LOCK_FD_ENV` (mandatory — refuse to start without
 /// it, risk §6.8) and the recorded generation is returned.
-pub fn adopt_from_env() -> anyhow::Result<Option<(DaemonLock, ReloadState, PathBuf)>> {
+#[cfg(unix)]
+pub fn adopt_from_env(_paths: &DaemonPaths) -> anyhow::Result<Option<Adopted>> {
     let Some(rs_path) = std::env::var_os(RELOAD_STATE_ENV) else {
         return Ok(None);
     };

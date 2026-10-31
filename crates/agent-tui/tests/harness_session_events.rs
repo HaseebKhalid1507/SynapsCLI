@@ -246,6 +246,38 @@ fn session_cleared_resets_transcript() {
     assert!(frame.contains("new session started"), "{frame}");
 }
 
+/// C4: `/clear` zeroed the cost but the footer's context gauge kept the old
+/// session's last-turn percentage.
+#[test]
+fn session_cleared_resets_the_context_gauge() {
+    let mut h = TestHarness::boot_with_size(120, 30);
+    let events: Vec<_> = [
+        turn(TurnTrigger::User, None),
+        W::Stream {
+            event: WireStreamEvent::Session(WireSessionStreamEvent::Usage {
+                input_tokens: 50_000,
+                output_tokens: 10,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+                cache_creation_5m: None,
+                cache_creation_1h: None,
+                model: None,
+            }),
+        },
+        done(),
+    ]
+    .into_iter()
+    .map(Into::into)
+    .collect();
+    h.feed_events(&events);
+    let before = h.snapshot();
+    assert!(before.contains('\u{2591}'), "gauge shown after a turn:\n{before}");
+    h.feed_event(W::Cleared { session_id: "new".into() }.into());
+    let after = h.snapshot();
+    assert!(after.contains("new session started"), "{after}");
+    assert!(!after.contains('\u{2591}'), "gauge reset by /clear:\n{after}");
+}
+
 #[test]
 fn session_compaction_lines() {
     let (frame, _) = frame_for(vec![
@@ -432,4 +464,47 @@ fn session_submitter_does_not_draw_its_prompt_twice() {
         "drawn once: {frame}"
     );
     assert!(frame.contains("the answer"), "{frame}");
+}
+
+/// The `HH:MM` on each `❯ you` card of `frame`, top to bottom.
+fn you_stamps(frame: &str) -> Vec<String> {
+    frame
+        .lines()
+        .filter(|l| l.contains("\u{276f} you"))
+        .filter_map(|l| l.split_whitespace().last().map(str::to_string))
+        .collect()
+}
+
+/// Message stamps come from the harness's frozen clock, never the machine's
+/// wall clock: a replay that straddled a minute boundary stamped its prompt
+/// cards differently from the one before it, and `frame_for`'s "replay must
+/// be deterministic" failed (CI, #348). Here the stamps must move exactly as
+/// far as the tape advances the clock — with the machine's clock both cards
+/// carry the same (current) minute.
+#[test]
+fn session_message_stamps_follow_the_harness_clock_not_the_wall_clock() {
+    let mut h = TestHarness::boot_with_size(100, 40);
+    let tape = {
+        let mut rec = h.record_tape();
+        rec.session_event(turn(TurnTrigger::User, Some("first question")));
+        rec.session_event(text("first answer"));
+        rec.session_event(done());
+        rec.session_event(W::Idle);
+        rec.advance_clock_ms(61 * 60 * 1000);
+        rec.session_event(turn(TurnTrigger::User, Some("second question")));
+        rec.session_event(text("second answer"));
+        rec.session_event(done());
+        rec.session_event(W::Idle);
+        rec.finish()
+    };
+    let frame = TestHarness::replay_with_size(&tape, 100, 40);
+    let stamps = you_stamps(&frame);
+    assert_eq!(stamps.len(), 2, "two prompt cards: {frame}");
+    let minutes = |s: &str| -> i64 {
+        let (h, m) = s.split_once(':').unwrap_or_else(|| panic!("an HH:MM stamp: {s:?} in {frame}"));
+        h.parse::<i64>().unwrap() * 60 + m.parse::<i64>().unwrap()
+    };
+    let moved = (minutes(&stamps[1]) - minutes(&stamps[0])).rem_euclid(24 * 60);
+    assert_eq!(moved, 61, "stamps {stamps:?} follow the clock's 61-minute advance: {frame}");
+    assert_eq!(TestHarness::replay_with_size(&tape, 100, 40), frame, "deterministic");
 }

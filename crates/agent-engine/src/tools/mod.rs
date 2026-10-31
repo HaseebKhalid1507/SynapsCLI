@@ -21,11 +21,17 @@ mod grep;
 mod ls;
 pub mod memory;
 mod memory_context;
+mod multi_edit;
 #[cfg(feature = "command-exec")]
 mod powershell;
 pub(crate) mod read;
 mod secret_prompt;
 mod subagent;
+#[cfg(target_os = "linux")]
+pub mod sudo_askpass;
+pub(crate) use subagent::archive::write_window_transcript;
+#[cfg(test)]
+pub(crate) use subagent::archive::resume_messages;
 pub(crate) use subagent::finalize::build_reload_carry_event;
 #[doc(hidden)]
 pub use subagent::{legacy_fresh_runtime, spawn_runtime};
@@ -63,6 +69,8 @@ pub use find::FindTool;
 pub use grep::GrepTool;
 pub use ls::LsTool;
 pub use memory_context::MemoryContextTool;
+pub use multi_edit::MultiEditTool;
+pub(crate) use multi_edit::{label as multi_edit_label, paths as multi_edit_paths};
 #[cfg(feature = "command-exec")]
 pub use powershell::PowerShellTool;
 pub use read::ReadTool;
@@ -77,6 +85,20 @@ pub use secret_prompt::{
     CONFIRM_ANSWER_ALLOW_ALL,
 };
 pub use send_channel::SendChannelTool;
+
+/// Call first thing in `main`: when this process was started by sudo as
+/// the bash tool's askpass helper, runs it and returns its exit code (see
+/// `sudo_askpass`). Linux only; elsewhere always `None`.
+pub fn run_sudo_askpass_helper_if_invoked() -> Option<i32> {
+    #[cfg(target_os = "linux")]
+    {
+        sudo_askpass::run_helper_if_invoked()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
 pub use shell::{ShellEndTool, ShellSendTool, ShellStartTool};
 pub use subagent::{
     SubagentCollectTool, SubagentModelAuthorizeTool, SubagentModelsTool, SubagentResumeTool,

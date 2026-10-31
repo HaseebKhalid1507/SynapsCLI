@@ -202,6 +202,10 @@ pub struct SessionConfig {
     /// until the session is unparked instead of running right after create.
     #[serde(skip)]
     pub restore_parked: bool,
+    /// Where this session's message times come from (never on the wire).
+    /// `None` = the wall clock; tests inject a clock to advance time.
+    #[serde(skip)]
+    pub message_clock: Option<crate::runtime::message_time::MessageClock>,
 }
 
 /// A durable `/memory` mode the user chose for a session
@@ -301,6 +305,7 @@ impl Default for SessionConfig {
             max_session_cost: None,
             memory_mode: None,
             restore_parked: false,
+            message_clock: None,
         }
     }
 }
@@ -2008,4 +2013,7 @@ pub trait PinSink: Send + Sync {
     /// A pinned session's journal changed (`/clear`, a successor compaction,
     /// resume): the entry follows it.
     fn moved(&self, from: &str, to: &str);
+    /// A pinned session was renamed (`/saveas`, `daemon rename`): its entry
+    /// takes `name` verbatim, so a cleared name stops resolving.
+    fn renamed(&self, journal_id: &str, name: Option<&str>);
 }

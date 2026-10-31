@@ -5,10 +5,16 @@
 //! Injectable clock abstraction for the TUI.
 //!
 //! Production code uses [`TuiClock::real()`], which delegates to
-//! [`Instant::now()`].  Test code uses [`TuiClock::test()`], which starts
-//! frozen and only advances when [`TuiClock::advance`] is called explicitly.
-//! Cloned handles share the same underlying time source, so advancing through
-//! one handle is immediately visible through all others.
+//! [`Instant::now()`] and [`chrono::Local::now()`].  Test code uses
+//! [`TuiClock::test()`], which starts frozen and only advances when
+//! [`TuiClock::advance`] is called explicitly — both the monotonic time and
+//! the wall-clock time ([`TuiClock::wall_now`], what message `HH:MM` stamps
+//! and day lines read). Cloned handles share the same underlying time source,
+//! so advancing through one handle is immediately visible through all others.
+//!
+//! The test wall clock starts at a fixed instant ([`TEST_WALL_EPOCH_SECS`]),
+//! not at boot: two harnesses booted a minute apart (a tape replayed twice)
+//! must stamp the same `HH:MM`, and none may cross local midnight mid-replay.
 //!
 //! # Out of scope (P6.2 and later)
 //! - `mod.rs` throttle / `render_thread.rs` — those timers drive the render
@@ -16,6 +22,11 @@
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+/// Where a test clock's wall time starts: 2026-01-15 12:00:00 UTC. Mid-day
+/// and mid-month, so local time in any zone is far from a midnight or DST
+/// edge for any test's advances.
+pub(crate) const TEST_WALL_EPOCH_SECS: i64 = 1_768_478_400;
 
 // ---------------------------------------------------------------------------
 // Internal state for the test variant
@@ -81,6 +92,22 @@ impl TuiClock {
         }
     }
 
+    /// The local wall-clock time according to this clock: `Local::now()`
+    /// live; under test, the fixed [`TEST_WALL_EPOCH_SECS`] plus every
+    /// [`advance`](Self::advance) so far.
+    pub(crate) fn wall_now(&self) -> chrono::DateTime<chrono::Local> {
+        match self {
+            Self::Real => chrono::Local::now(),
+            Self::Test(state) => {
+                let offset = state.lock().expect("TuiClock poisoned").offset;
+                let epoch = chrono::DateTime::from_timestamp(TEST_WALL_EPOCH_SECS, 0)
+                    .expect("valid test wall epoch");
+                (epoch + chrono::Duration::from_std(offset).unwrap_or(chrono::Duration::zero()))
+                    .with_timezone(&chrono::Local)
+            }
+        }
+    }
+
     /// Advance a test clock by `duration`.  On a real clock this is a no-op
     /// (there is no meaningful way to "advance" wall time, and callers should
     /// not need to in production).
@@ -139,6 +166,20 @@ mod tests {
         let t0 = a.now();
         b.advance(Duration::from_millis(100));
         assert_eq!(a.now(), t0 + Duration::from_millis(100));
+    }
+
+    #[test]
+    fn test_wall_clock_is_fixed_and_advances_with_the_clock() {
+        // Two test clocks made at different real times read the same wall
+        // time: a tape replayed twice stamps the same `HH:MM`.
+        let a = TuiClock::test();
+        std::thread::sleep(Duration::from_millis(5));
+        let b = TuiClock::test();
+        assert_eq!(a.wall_now(), b.wall_now());
+        assert_eq!(a.wall_now().timestamp(), TEST_WALL_EPOCH_SECS);
+        a.advance(Duration::from_secs(90));
+        assert_eq!(a.wall_now().timestamp(), TEST_WALL_EPOCH_SECS + 90);
+        assert_eq!(b.wall_now().timestamp(), TEST_WALL_EPOCH_SECS);
     }
 
     #[test]

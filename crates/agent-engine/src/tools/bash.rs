@@ -1,7 +1,7 @@
 use super::{strip_ansi, Tool, ToolContext};
 use crate::{Result, RuntimeError};
 use serde_json::{json, Value};
-use zeroize::Zeroize;
+use zeroize::Zeroizing;
 
 const BASH_INTERMEDIARY_CHANNEL_CAPACITY: usize = 64;
 static BASH_INTERMEDIARY_PRODUCED_BYTES: std::sync::atomic::AtomicU64 =
@@ -22,12 +22,24 @@ pub struct BashIntermediarySnapshot {
     pub retained_bytes: u64,
 }
 
+impl BashIntermediarySnapshot {
+    /// Every byte ever produced has been consumed or dropped: nothing is in
+    /// flight anywhere in the process. A leaked byte keeps this false forever.
+    pub fn is_settled(&self) -> bool {
+        self.produced_bytes == self.consumed_bytes + self.dropped_bytes
+    }
+}
+
+/// Counters are read downstream-first. Each one only grows, and upstream
+/// counts are bumped before the bytes move on, so a snapshot torn by a
+/// concurrent relay can overstate in-flight bytes but never understate them:
+/// `is_settled` is never true unless the process really was settled.
 pub fn bash_intermediary_snapshot() -> BashIntermediarySnapshot {
-    use std::sync::atomic::Ordering;
-    let produced = BASH_INTERMEDIARY_PRODUCED_BYTES.load(Ordering::Relaxed);
-    let accepted = BASH_INTERMEDIARY_ACCEPTED_BYTES.load(Ordering::Relaxed);
-    let consumed = BASH_INTERMEDIARY_CONSUMED_BYTES.load(Ordering::Relaxed);
-    let dropped = BASH_INTERMEDIARY_DROPPED_BYTES.load(Ordering::Relaxed);
+    use std::sync::atomic::Ordering::SeqCst;
+    let consumed = BASH_INTERMEDIARY_CONSUMED_BYTES.load(SeqCst);
+    let dropped = BASH_INTERMEDIARY_DROPPED_BYTES.load(SeqCst);
+    let accepted = BASH_INTERMEDIARY_ACCEPTED_BYTES.load(SeqCst);
+    let produced = BASH_INTERMEDIARY_PRODUCED_BYTES.load(SeqCst);
     BashIntermediarySnapshot {
         produced_bytes: produced,
         accepted_bytes: accepted,
@@ -37,16 +49,70 @@ pub fn bash_intermediary_snapshot() -> BashIntermediarySnapshot {
     }
 }
 
+/// Test oracle for the handoff counters: wait until the whole process is
+/// settled. Concurrent relays only delay it; a leaked byte times it out.
+#[cfg(test)]
+async fn wait_handoff_settled() -> BashIntermediarySnapshot {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let now = bash_intermediary_snapshot();
+        if now.is_settled() {
+            return now;
+        }
+        assert!(std::time::Instant::now() < deadline, "handoff bytes never settled: {now:?}");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
 pub struct BashTool;
+
+/// One sanitized read in flight between a stream reader and the executor.
+/// Its bytes are counted out exactly once: `consume` when the executor takes
+/// it, or `Drop` when it never arrives (the channel closed before the send,
+/// or it was still queued when the receiver went away on timeout or cancel).
+/// Tokio drops queued values with the channel, so no path can leak a count.
+struct HandoffChunk(Option<String>);
+
+impl HandoffChunk {
+    fn new(text: String) -> Self {
+        BASH_INTERMEDIARY_PRODUCED_BYTES
+            .fetch_add(text.len() as u64, std::sync::atomic::Ordering::SeqCst);
+        Self(Some(text))
+    }
+
+    fn len(&self) -> usize {
+        self.0.as_ref().map_or(0, String::len)
+    }
+
+    fn consume(mut self) -> String {
+        let text = self.0.take().unwrap_or_default();
+        BASH_INTERMEDIARY_CONSUMED_BYTES
+            .fetch_add(text.len() as u64, std::sync::atomic::Ordering::SeqCst);
+        text
+    }
+}
+
+impl Drop for HandoffChunk {
+    fn drop(&mut self) {
+        if let Some(text) = self.0.take() {
+            BASH_INTERMEDIARY_DROPPED_BYTES
+                .fetch_add(text.len() as u64, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
 
 const READ_CHUNK_SIZE: usize = 1024;
 const MAX_STREAMED_DELTA_BYTES: usize = 16 * 1024;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PromptKind {
-    Sudo,
-    Password,
-}
+/// sudo passwords handed out during one command, redacted from its output
+/// and zeroized when dropped.
+pub(crate) type Redactions = std::sync::Arc<std::sync::Mutex<Vec<Zeroizing<String>>>>;
+
+/// The askpass broker one bash call uses (Linux), prepared before spawn.
+#[cfg(target_os = "linux")]
+pub(crate) type Askpass = super::sudo_askpass::broker::PreparedBroker;
+#[cfg(not(target_os = "linux"))]
+pub(crate) type Askpass = std::convert::Infallible;
 
 fn sanitize_output(input: &str) -> String {
     let stripped = strip_ansi(input);
@@ -66,11 +132,10 @@ fn sanitize_output(input: &str) -> String {
 async fn forward_output<R>(
     mut reader: R,
     is_stderr: bool,
-    tx: tokio::sync::mpsc::Sender<(bool, String)>,
+    tx: tokio::sync::mpsc::Sender<(bool, HandoffChunk)>,
 ) where
     R: tokio::io::AsyncRead + Unpin,
 {
-    use std::sync::atomic::Ordering;
     use tokio::io::AsyncReadExt;
     let mut buf = vec![0u8; READ_CHUNK_SIZE];
     let mut decoder = super::utf8_stream::Utf8StreamDecoder::new();
@@ -81,33 +146,20 @@ async fn forward_output<R>(
         };
         let msg = sanitize_output(&text);
         if !msg.is_empty() {
-            BASH_INTERMEDIARY_PRODUCED_BYTES.fetch_add(msg.len() as u64, Ordering::Relaxed);
-            let len = msg.len();
-            if tx.send((is_stderr, msg)).await.is_ok() {
-                BASH_INTERMEDIARY_ACCEPTED_BYTES.fetch_add(len as u64, Ordering::Relaxed);
-            } else {
-                BASH_INTERMEDIARY_DROPPED_BYTES.fetch_add(len as u64, Ordering::Relaxed);
+            let chunk = HandoffChunk::new(msg);
+            // Count acceptance before the send makes the chunk visible, so
+            // accepted >= consumed holds at every instant. A closed channel
+            // drops the chunk here, and its Drop counts it.
+            let Ok(permit) = tx.reserve().await else {
                 break;
-            }
+            };
+            BASH_INTERMEDIARY_ACCEPTED_BYTES
+                .fetch_add(chunk.len() as u64, std::sync::atomic::Ordering::SeqCst);
+            permit.send((is_stderr, chunk));
         }
         if eof {
             break;
         }
-    }
-}
-
-fn detect_password_prompt(text: &str) -> Option<PromptKind> {
-    let lower = text.to_ascii_lowercase();
-    let has_password = lower.contains("password");
-    if !has_password {
-        return None;
-    }
-    if lower.contains("[sudo]") || lower.contains("sudo") {
-        Some(PromptKind::Sudo)
-    } else if lower.trim_end().ends_with(':') || lower.contains("password:") {
-        Some(PromptKind::Password)
-    } else {
-        None
     }
 }
 
@@ -164,15 +216,28 @@ pub(crate) fn bash_program() -> std::ffi::OsString {
     }
 }
 
-pub(crate) fn bash_script_with_secure_sudo(command: &str) -> String {
-    // sudo normally opens /dev/tty for password input, bypassing our piped
-    // stdin/stderr and corrupting the TUI. In the non-interactive bash tool,
-    // shadow simple `sudo ...` invocations with a shell function that forces
-    // sudo to read from stdin and write the prompt to stderr, where the secure
-    // prompt detector can intercept it before it reaches chat/model output.
+/// The command, behind a `sudo` shell function. The child has no terminal
+/// (setsid), so a bare sudo could not prompt anyway. With the askpass
+/// broker (Linux, see `sudo_askpass`) sudo asks the user through the
+/// verified helper; without it (other platforms, embedders, setup failure)
+/// sudo must not ask at all: `-n` fails with sudo's own "a password is
+/// required", and NOPASSWD rules work either way. The password never
+/// travels through the command's stdin, which is empty.
+pub(crate) fn bash_script_with_secure_sudo(command: &str, askpass: bool) -> String {
+    #[cfg(unix)]
+    let call = if askpass {
+        r#"command sudo -A "$@""#
+    } else {
+        r#"command sudo -n "$@""#
+    };
+    #[cfg(not(unix))]
+    let call = {
+        let _ = askpass;
+        r#"command sudo -S -p '[sudo] password required: ' "$@""#
+    };
     format!(
         r#"sudo() {{
-    command sudo -S -p '[sudo] password required: ' "$@"
+    {call}
 }}
 {command}"#
     )
@@ -227,7 +292,7 @@ impl Tool for BashTool {
     }
 
     fn description(&self) -> &str {
-        "Execute a bash command and return its output. Use for running programs, installing packages, git operations, and any shell commands. Commands time out after 30 seconds by default; pass a larger timeout when needed. If sudo asks for a password, the user is prompted securely in the TUI and the password is never shown to the model."
+        "Execute a bash command and return its output. Use for running programs, installing packages, git operations, and any shell commands. Commands time out after 30 seconds by default; pass a larger timeout when needed. Stdin is empty. On Linux, if sudo needs a password, the user is asked in the TUI, shown the command sudo will run, and the password goes only to sudo, never to the model. Other password prompts are not answered."
     }
 
     fn parameters(&self) -> Value {
@@ -252,9 +317,38 @@ impl Tool for BashTool {
             .as_str()
             .ok_or_else(|| RuntimeError::Tool("Missing command parameter".to_string()))?;
 
-        let script = bash_script_with_secure_sudo(command);
-        run_shell_command(&script, ShellSpec::Bash, params["timeout"].as_u64(), ctx).await
+        run_bash(command, params["timeout"].as_u64(), ctx, prepare_askpass()).await
     }
+}
+
+/// The production askpass broker, if this platform and binary support it.
+fn prepare_askpass() -> Option<Askpass> {
+    #[cfg(target_os = "linux")]
+    {
+        use super::sudo_askpass::broker::{AskpassConfig, PreparedBroker};
+        let config = AskpassConfig::production()?;
+        match PreparedBroker::prepare(&config) {
+            Ok(broker) => Some(broker),
+            Err(e) => {
+                tracing::warn!("sudo askpass unavailable for this command: {e}");
+                None
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+pub(crate) async fn run_bash(
+    command: &str,
+    timeout: Option<u64>,
+    ctx: ToolContext,
+    askpass: Option<Askpass>,
+) -> Result<String> {
+    let script = bash_script_with_secure_sudo(command, askpass.is_some());
+    run_shell_command(&script, ShellSpec::Bash, timeout, ctx, askpass).await
 }
 
 /// Kills the command's whole process group unless the command finished on
@@ -318,15 +412,18 @@ impl ShellSpec {
     }
 }
 
-/// Shared execution core for bash + powershell: piped stdin/stdout/stderr,
-/// chunked streaming with byte-conservation accounting, secret-prompt
-/// interception, truncation, timeout. The only per-shell differences are
-/// which program is spawned and which args it takes.
+/// Shared execution core for bash + powershell: empty stdin, piped
+/// stdout/stderr, chunked streaming with byte-conservation accounting, the
+/// sudo askpass broker (bash on Linux), truncation, timeout. The only
+/// per-shell differences are which program is spawned and which args it
+/// takes. Nothing the command prints can raise a password prompt: only a
+/// verified sudo can, through `askpass`.
 pub(crate) async fn run_shell_command(
     script: &str,
     spec: ShellSpec,
     requested_timeout: Option<u64>,
     ctx: ToolContext,
+    askpass: Option<Askpass>,
 ) -> Result<String> {
     {
         let requested_timeout = requested_timeout.unwrap_or(ctx.limits.bash_timeout);
@@ -358,7 +455,7 @@ pub(crate) async fn run_shell_command(
         }
         let probe_task = tokio::task::spawn_blocking(move || {
             crate::process_scope::launcher_for_effective_env(
-                &probe_env, probe_cwd.as_deref())
+                &probe_env, probe_cwd.as_deref(), crate::process_scope::ScopeKind::Tool)
         });
         let launcher = if let Some(cancel) = &ctx.capabilities.launch_cancel {
             tokio::select! {
@@ -380,8 +477,12 @@ pub(crate) async fn run_shell_command(
             cmd.current_dir(cwd);
         }
         cmd.env_clear().envs(effective_env);
+        #[cfg(target_os = "linux")]
+        if let Some(broker) = &askpass {
+            cmd.env("SUDO_ASKPASS", broker.helper_path());
+        }
         cmd.args(&args)
-            .stdin(std::process::Stdio::piped())
+            .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
@@ -390,8 +491,8 @@ pub(crate) async fn run_shell_command(
         // terminal. Programs that open /dev/tty directly (SSH fingerprint
         // prompts, gpg pinentry, git credential helpers, pagers) will get
         // ENXIO and fail with a readable error on stderr instead of hanging
-        // invisibly until timeout. Sudo is unaffected — we already force
-        // `-S` (stdin) via bash_script_with_secure_sudo().
+        // invisibly until timeout. Sudo asks through its askpass helper
+        // instead (see bash_script_with_secure_sudo()).
         #[cfg(unix)]
         unsafe {
             cmd.pre_exec(|| {
@@ -417,13 +518,26 @@ pub(crate) async fn run_shell_command(
             .stderr
             .take()
             .ok_or_else(|| RuntimeError::Tool("Failed to capture stderr".to_string()))?;
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| RuntimeError::Tool("Failed to capture stdin".to_string()))?;
+        // Serve sudo's password requests for as long as the command runs.
+        let redactions = Redactions::default();
+        let password_cancel = crate::CancellationToken::new();
+        #[cfg(target_os = "linux")]
+        let _askpass = askpass.and_then(|broker| {
+            broker
+                .start(
+                    child.id(),
+                    ctx.capabilities.secret_prompt.clone(),
+                    redactions.clone(),
+                    password_cancel.clone(),
+                )
+                .map_err(|e| tracing::warn!("sudo askpass unavailable for this command: {e}"))
+                .ok()
+        });
+        #[cfg(not(target_os = "linux"))]
+        let _ = askpass;
 
         let (tx_inter, mut rx_inter) =
-            tokio::sync::mpsc::channel::<(bool, String)>(BASH_INTERMEDIARY_CHANNEL_CAPACITY);
+            tokio::sync::mpsc::channel::<(bool, HandoffChunk)>(BASH_INTERMEDIARY_CHANNEL_CAPACITY);
 
         tokio::spawn(forward_output(stdout, false, tx_inter.clone()));
         tokio::spawn(forward_output(stderr, true, tx_inter.clone()));
@@ -431,82 +545,31 @@ pub(crate) async fn run_shell_command(
         drop(tx_inter);
 
         let result = tokio::time::timeout(tokio::time::Duration::from_secs(timeout_secs), async {
-            use tokio::io::AsyncWriteExt;
-
-            let mut stdin = stdin;
             let mut full_output = String::new();
-            let mut stderr_tail = String::new();
             let mut truncated = false;
             let mut streamed_bytes = 0usize;
-            let mut redactions: Vec<String> = Vec::new();
 
-            while let Some((is_stderr, mut msg)) = rx_inter.recv().await {
-                BASH_INTERMEDIARY_CONSUMED_BYTES
-                    .fetch_add(msg.len() as u64, std::sync::atomic::Ordering::Relaxed);
-                if is_stderr {
-                    stderr_tail.push_str(&msg);
-                    if stderr_tail.len() > 512 {
-                        let keep_from = stderr_tail.len() - 512;
-                        if let Some((idx, _)) =
-                            stderr_tail.char_indices().find(|(i, _)| *i >= keep_from)
-                        {
-                            stderr_tail.drain(..idx);
-                        }
+            loop {
+                let item = tokio::select! {
+                    biased;
+                    // The user cancelled sudo's password prompt: stop the
+                    // command rather than let it run on without it.
+                    _ = password_cancel.cancelled() => {
+                        group.kill_now();
+                        let _ = child.kill().await;
+                        return Err(RuntimeError::Tool(
+                            "Command canceled while waiting for password".to_string(),
+                        ));
                     }
-                    if let Some(kind) = detect_password_prompt(&stderr_tail) {
-                        let prompt_text = stderr_tail.trim().to_string();
-                        let secret = match &ctx.capabilities.secret_prompt {
-                            Some(prompt) => {
-                                prompt
-                                    .prompt(
-                                        match kind {
-                                            PromptKind::Sudo => {
-                                                "sudo password required".to_string()
-                                            }
-                                            PromptKind::Password => "password required".to_string(),
-                                        },
-                                        prompt_text.clone(),
-                                    )
-                                    .await
-                            }
-                            None => None,
-                        };
-                        match secret {
-                            Some(mut value) => {
-                                let secret_value = value.clone();
-                                if !secret_value.is_empty() {
-                                    redactions.push(secret_value);
-                                }
-                                value.push('\n');
-                                let write_result = stdin.write_all(value.as_bytes()).await;
-                                let flush_result = stdin.flush().await;
-                                // Zeroize the password from memory immediately after use
-                                value.zeroize();
-                                write_result.map_err(|e| RuntimeError::Tool(e.to_string()))?;
-                                flush_result.map_err(|e| RuntimeError::Tool(e.to_string()))?;
-                            }
-                            None => {
-                                group.kill_now();
-                                let _ = child.kill().await;
-                                return Err(RuntimeError::Tool(
-                                    "Command canceled while waiting for password".to_string(),
-                                ));
-                            }
-                        }
-                        let prompt_len = prompt_text.len();
-                        if prompt_len <= msg.len() {
-                            let keep_len = msg.len() - prompt_len;
-                            msg.truncate(keep_len);
-                        } else {
-                            msg.clear();
-                        }
-                        stderr_tail.clear();
-                    }
-                }
-
-                for secret in &redactions {
+                    item = rx_inter.recv() => item,
+                };
+                let Some((_is_stderr, chunk)) = item else {
+                    break;
+                };
+                let mut msg = chunk.consume();
+                for secret in redactions.lock().unwrap_or_else(|p| p.into_inner()).iter() {
                     if !secret.is_empty() {
-                        msg = msg.replace(secret, "[redacted]");
+                        msg = msg.replace(secret.as_str(), "[redacted]");
                     }
                 }
 
@@ -547,10 +610,8 @@ pub(crate) async fn run_shell_command(
             let status = status.map_err(|e| RuntimeError::Tool(e.to_string()))?;
             // Finished on its own: leave anything it deliberately started in
             // the background (`server &`) running, as before.
-            // Zeroize redactions (passwords) from memory now that command is done
-            for secret in &mut redactions {
-                secret.zeroize();
-            }
+            // Drop (and so zeroize) the passwords now the command is done.
+            redactions.lock().unwrap_or_else(|p| p.into_inner()).clear();
             Ok::<_, RuntimeError>((status, full_output, truncated))
         })
         .await;
@@ -656,6 +717,7 @@ mod tests {
         assert!(!marker.exists());
     }
 
+    #[cfg(target_os = "linux")]
     fn own_cgroup() -> String {
         std::fs::read_to_string("/proc/self/cgroup")
             .unwrap_or_default()
@@ -693,6 +755,37 @@ mod tests {
         }
     }
 
+    /// A bash command's scope goes in `tool_scope_slice`, never in the
+    /// daemon's slice; the probe carries the same `--slice`.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn a_bash_command_is_scoped_in_the_tool_slice() {
+        use crate::process_scope::test_support::{fake_env, fake_systemd_run, recorded};
+        let base = crate::test_env::BaseDirGuard::new();
+        let _scopes = crate::test_env::EnvVarGuard::remove("SYNAPS_PROCESS_SCOPES");
+        std::fs::write(
+            base.path().join("config"),
+            "tool_scope_slice = t_tools.slice\ndaemon_scope_slice = d_daemon.slice\n",
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let fake = fake_systemd_run(dir.path());
+        let mut env = fake_env(&fake);
+        env.push(("PATH".to_string(), std::env::var("PATH").unwrap_or_default()));
+        let mut ctx = create_tool_context();
+        ctx.capabilities.env = Some(env);
+        let out = BashTool
+            .execute(json!({ "command": "echo scoped-run", "timeout": 30 }), ctx)
+            .await
+            .unwrap();
+        assert!(out.contains("scoped-run"), "{out}");
+        let launch = recorded(dir.path(), "launch.args");
+        let slices: Vec<&String> = launch.iter().filter(|a| a.starts_with("--slice")).collect();
+        assert_eq!(slices, ["--slice=t_tools.slice"], "{launch:?}");
+        assert!(recorded(dir.path(), "probe.args").contains(&"--slice=t_tools.slice".to_string()));
+    }
+
     /// A session environment rebuilt without the user-bus variables cannot
     /// reach systemd: the command starts unwrapped instead of failing.
     #[cfg(target_os = "linux")]
@@ -713,6 +806,7 @@ mod tests {
         assert_eq!(out.lines().next().unwrap_or_default().trim(), own_cgroup());
     }
 
+    #[cfg(target_os = "linux")]
     fn processes_named(name: &str) -> Vec<String> {
         let out = std::process::Command::new("pgrep")
             .args(["-f", name])
@@ -804,46 +898,17 @@ mod tests {
             .unwrap();
         assert!(result.contains("output truncated"));
 
-        // The counters are PROCESS-GLOBAL: sibling tests running bash
-        // concurrently (--test-threads > 1) contribute mid-flight bytes to
-        // any instantaneous snapshot. Conservation is therefore asserted at
-        // quiescence: every completed relay balances produced == consumed +
-        // dropped and returns retained to baseline, so the delta window
-        // rebalances once in-flight relays finish. A REAL leak never
-        // rebalances — the bounded poll keeps the oracle strict while
-        // removing scheduling sensitivity (observed flake under the full
-        // workspace run at 8 threads).
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        let (mut produced, mut consumed, mut accepted, mut dropped);
-        loop {
-            let after = bash_intermediary_snapshot();
-            produced = after.produced_bytes - before.produced_bytes;
-            consumed = after.consumed_bytes - before.consumed_bytes;
-            accepted = after.accepted_bytes - before.accepted_bytes;
-            dropped = after.dropped_bytes - before.dropped_bytes;
-            let balanced =
-                produced == consumed + dropped && after.retained_bytes == before.retained_bytes;
-            if balanced || std::time::Instant::now() >= deadline {
-                assert_eq!(
-                    produced,
-                    consumed + dropped,
-                    "handoff bytes must be conserved at quiescence"
-                );
-                assert_eq!(after.retained_bytes, before.retained_bytes);
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-        assert!(accepted >= consumed);
-        assert!(produced >= 64 * 1024);
-    }
-
-    #[test]
-    fn detects_sudo_password_prompt_without_newline() {
-        assert_eq!(
-            detect_password_prompt("[sudo] password for me: "),
-            Some(PromptKind::Sudo)
-        );
+        // The counters are process-global and sibling tests run bash
+        // concurrently, so a before/after delta is skewed by whatever a
+        // sibling had mid-channel when `before` was read, and that skew
+        // never rebalances. Assert the invariant that does hold: once
+        // in-flight relays drain, every byte ever produced in this process
+        // was consumed or dropped. Siblings only delay this; a leaked byte
+        // keeps it false forever.
+        let after = wait_handoff_settled().await;
+        assert_eq!(after.retained_bytes, 0);
+        assert!(after.accepted_bytes >= after.consumed_bytes);
+        assert!(after.produced_bytes - before.produced_bytes >= 64 * 1024);
     }
 
     #[test]
@@ -923,151 +988,75 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_bash_fake_sudo_prompt_uses_secret_prompt_and_redacts_password() {
-        let tool = BashTool;
-        let (prompt_tx, mut prompt_rx) = tokio::sync::mpsc::unbounded_channel();
-        let prompt_handle = crate::tools::SecretPromptHandle::new(prompt_tx);
-        let channel = crate::tools::output::delta_channel();
-        let (delta_tx, mut delta_rx) = (channel.sender, channel.receiver);
-
-        let responder = tokio::spawn(async move {
-            let req = prompt_rx
-                .recv()
-                .await
-                .expect("bash should request a secret prompt");
-            assert!(
-                req.prompt.to_ascii_lowercase().contains("password"),
-                "prompt was {:?}",
-                req.prompt
-            );
-            req.response_tx.send(Some("swordfish".to_string())).unwrap();
-        });
-
-        let mut ctx = create_tool_context();
-        ctx.capabilities.secret_prompt = Some(prompt_handle);
-        ctx.channels.tx_delta = Some(delta_tx);
-        let params = json!({
-            "command": "printf '[sudo] password for testuser: ' >&2; read -r pw; if [ \"$pw\" = swordfish ]; then echo AUTH_OK; else echo AUTH_FAIL; fi",
-            "timeout": 30
-        });
-
-        let result = tool.execute(params, ctx).await.unwrap();
-        responder.await.unwrap();
-        let mut streamed = String::new();
-        while let Some(delta) = delta_rx.try_drain() {
-            streamed.push_str(&delta);
-        }
-
-        assert!(result.contains("AUTH_OK"));
-        assert!(!result.contains("swordfish"));
-        assert!(!result.contains("[sudo] password"));
-        assert!(!streamed.contains("[sudo] password"));
+    fn prompt_channel() -> (
+        crate::tools::SecretPromptHandle,
+        tokio::sync::mpsc::UnboundedReceiver<crate::tools::SecretPromptRequest>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        (crate::tools::SecretPromptHandle::new(tx), rx)
     }
 
+    /// Output that merely looks like a password prompt. The first line is
+    /// what a diagnostic printing the tool's own command lines showed on
+    /// the day this misfired: the old wrapper, prompt string included.
+    const PROMPT_LOOKALIKES: &str = r#"printf '%s\n' "command sudo -S -p '[sudo] password required: ' \"\$@\"" >&2
+printf '[sudo] password for x: ' >&2
+printf 'Password: ' >&2
+if read -r got; then echo "stdin gave: $got"; else echo stdin-eof; fi"#;
+
+    /// Regression: text on stderr can no longer raise a password prompt,
+    /// and nothing is ever written to the command's stdin (it is empty).
+    #[tokio::test]
+    async fn sudo_prompt_lookalike_output_raises_no_prompt_and_feeds_no_stdin() {
+        let (handle, mut prompts) = prompt_channel();
+        let mut ctx = create_tool_context();
+        ctx.capabilities.secret_prompt = Some(handle);
+        let started = std::time::Instant::now();
+        let out = BashTool
+            .execute(json!({"command": PROMPT_LOOKALIKES, "timeout": 30}), ctx)
+            .await
+            .unwrap();
+        assert!(out.contains("stdin-eof"), "{out}");
+        assert!(out.contains("[sudo] password for x: "), "it is only output: {out}");
+        assert!(out.contains("password required: "), "{out}");
+        assert!(prompts.try_recv().is_err(), "no prompt was raised");
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    }
+
+    #[cfg(unix)]
     #[test]
-    fn test_bash_wraps_sudo_to_force_stdin_prompt() {
-        let script = super::bash_script_with_secure_sudo("sudo id");
-
-        assert!(script.contains("sudo()"));
-        assert!(script.contains("command sudo -S -p '[sudo] password required: '"));
-        assert!(script.ends_with("sudo id"));
-    }
-
-    /// Writes an executable stub `sudo` into `dir` that emulates the flags the
-    /// secure wrapper passes (`-S -p PROMPT`): `-k` exits silently like a real
-    /// timestamp reset, anything else writes PROMPT to stderr, consumes one
-    /// stdin line, and fails. Lets the wrapper be tested without the system
-    /// sudo, whose prompting behaviour is host-dependent.
-    #[cfg(unix)]
-    fn write_fake_sudo(dir: &std::path::Path) {
-        use std::os::unix::fs::PermissionsExt;
-        let sudo_path = dir.join("sudo");
-        std::fs::write(
-            &sudo_path,
-            r#"#!/bin/sh
-prompt=""
-while [ $# -gt 0 ]; do
-  case "$1" in
-    -S) shift ;;
-    -p) prompt="$2"; shift 2 ;;
-    -k) exit 0 ;;
-    *) break ;;
-  esac
-done
-printf '%s' "$prompt" >&2
-read -r _pw
-exit 1
-"#,
-        )
-        .expect("write fake sudo");
-        let mut perms = std::fs::metadata(&sudo_path)
-            .expect("stat fake sudo")
-            .permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&sudo_path, perms).expect("chmod fake sudo");
-    }
-
-    /// The `sudo()` wrapper's prompt is intercepted by the secret-prompt path
-    /// and never reaches the delta stream.
-    ///
-    /// Hermetic by construction: it drives a STUB sudo on PATH, not the host's.
-    /// `command sudo` bypasses the shell function but still honours PATH, so
-    /// the real wrapper path is exercised. PATH is exported inside the script
-    /// rather than through `std::env::set_var` because these tests are not
-    /// `#[serial]` and mutating process-global env would race them.
-    ///
-    /// This previously drove the system sudo and asserted that it prompts —
-    /// false on any host with passwordless sudo, which includes every GitHub
-    /// runner, so it could never pass in CI.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn test_bash_sudo_function_prompt_is_intercepted_before_streaming() {
-        let fake_bin = tempfile::tempdir().expect("tempdir");
-        write_fake_sudo(fake_bin.path());
-        let tool = BashTool;
-        let (prompt_tx, mut prompt_rx) = tokio::sync::mpsc::unbounded_channel();
-        let prompt_handle = crate::tools::SecretPromptHandle::new(prompt_tx);
-        let channel = crate::tools::output::delta_channel();
-        let (delta_tx, mut delta_rx) = (channel.sender, channel.receiver);
-
-        let responder = tokio::spawn(async move {
-            let req = prompt_rx
-                .recv()
-                .await
-                .expect("bash should request a secret prompt");
-            assert!(
-                req.prompt.contains("[sudo] password required"),
-                "prompt was {:?}",
-                req.prompt
-            );
-            req.response_tx
-                .send(Some("wrong-password-for-test".to_string()))
-                .unwrap();
-        });
-
-        let mut ctx = create_tool_context();
-        ctx.capabilities.secret_prompt = Some(prompt_handle);
-        ctx.channels.tx_delta = Some(delta_tx);
-        let params = json!({
-            "command": format!(
-                "export PATH=\"{}:$PATH\"; sudo -k; sudo -v",
-                fake_bin.path().display()
-            ),
-            "timeout": 30
-        });
-
-        let _ = tool.execute(params, ctx).await;
-        responder.await.unwrap();
-        let mut streamed = String::new();
-        while let Some(delta) = delta_rx.try_drain() {
-            streamed.push_str(&delta);
+    fn the_sudo_wrapper_asks_through_askpass_or_not_at_all() {
+        let script = super::bash_script_with_secure_sudo("sudo id", true);
+        assert_eq!(script, "sudo() {\n    command sudo -A \"$@\"\n}\nsudo id");
+        let script = super::bash_script_with_secure_sudo("sudo id", false);
+        assert_eq!(script, "sudo() {\n    command sudo -n \"$@\"\n}\nsudo id");
+        for askpass in [true, false] {
+            let script = super::bash_script_with_secure_sudo("x", askpass);
+            assert!(!script.contains(" -S") && !script.contains("password"), "{script}");
         }
+    }
 
-        assert!(
-            !streamed.contains("[sudo] password required"),
-            "sudo password prompt leaked into deltas: {streamed:?}"
+    /// Without the broker (this test binary does not dispatch the helper),
+    /// sudo is told never to ask: it fails with its own error, no prompt.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn without_askpass_sudo_never_asks() {
+        let fake = tempfile::tempdir().unwrap();
+        crate::tools::sudo_askpass::testing::write_fixtures(fake.path()).unwrap();
+        let (handle, mut prompts) = prompt_channel();
+        let mut ctx = create_tool_context();
+        ctx.capabilities.secret_prompt = Some(handle);
+        let command = format!(
+            "export PATH=\"{}:$PATH\"; sudo echo ran; echo after:$?",
+            fake.path().display()
         );
+        let out = BashTool
+            .execute(json!({"command": command, "timeout": 30}), ctx)
+            .await
+            .unwrap();
+        assert!(out.contains("sudo: a password is required"), "{out}");
+        assert!(out.contains("after:1") && !out.contains("ran\n"), "{out}");
+        assert!(prompts.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -1100,94 +1089,6 @@ exit 1
             "streamed deltas must be bounded, got {} bytes",
             streamed.len()
         );
-    }
-
-    #[tokio::test]
-    async fn test_bash_echoed_secret_is_redacted_from_output() {
-        let tool = BashTool;
-        let (prompt_tx, mut prompt_rx) = tokio::sync::mpsc::unbounded_channel();
-        let prompt_handle = crate::tools::SecretPromptHandle::new(prompt_tx);
-
-        let responder = tokio::spawn(async move {
-            let req = prompt_rx
-                .recv()
-                .await
-                .expect("bash should request a secret prompt");
-            req.response_tx.send(Some("swordfish".to_string())).unwrap();
-        });
-
-        let mut ctx = create_tool_context();
-        ctx.capabilities.secret_prompt = Some(prompt_handle);
-        let params = json!({
-            "command": "printf 'Password: ' >&2; read -r pw; echo seen:$pw",
-            "timeout": 30
-        });
-
-        let result = tool.execute(params, ctx).await.unwrap();
-        responder.await.unwrap();
-
-        assert!(result.contains("seen:[redacted]"));
-        assert!(!result.contains("swordfish"));
-    }
-
-    #[tokio::test]
-    async fn test_bash_sequential_password_prompts_are_each_handled() {
-        let tool = BashTool;
-        let (prompt_tx, mut prompt_rx) = tokio::sync::mpsc::unbounded_channel();
-        let prompt_handle = crate::tools::SecretPromptHandle::new(prompt_tx);
-
-        let responder = tokio::spawn(async move {
-            for value in ["first", "second"] {
-                let req = prompt_rx
-                    .recv()
-                    .await
-                    .expect("bash should request each secret prompt");
-                assert!(req.prompt.to_ascii_lowercase().contains("password"));
-                req.response_tx.send(Some(value.to_string())).unwrap();
-            }
-        });
-
-        let mut ctx = create_tool_context();
-        ctx.capabilities.secret_prompt = Some(prompt_handle);
-        let params = json!({
-            "command": "printf 'Password: ' >&2; read -r one; printf 'Password: ' >&2; read -r two; echo done:$one:$two",
-            "timeout": 30
-        });
-
-        let result = tool.execute(params, ctx).await.unwrap();
-        responder.await.unwrap();
-
-        assert!(result.contains("done:[redacted]:[redacted]"));
-        assert!(!result.contains("first"));
-        assert!(!result.contains("second"));
-    }
-
-    #[tokio::test]
-    async fn test_bash_password_prompt_cancel_kills_command_without_leaking_partial_secret() {
-        let tool = BashTool;
-        let (prompt_tx, mut prompt_rx) = tokio::sync::mpsc::unbounded_channel();
-        let prompt_handle = crate::tools::SecretPromptHandle::new(prompt_tx);
-
-        let responder = tokio::spawn(async move {
-            let req = prompt_rx
-                .recv()
-                .await
-                .expect("bash should request a secret prompt");
-            req.response_tx.send(None).unwrap();
-        });
-
-        let mut ctx = create_tool_context();
-        ctx.capabilities.secret_prompt = Some(prompt_handle);
-        let params = json!({
-            "command": "printf 'Password: ' >&2; read -r pw; echo should-not-run:$pw",
-            "timeout": 30
-        });
-
-        let err = tool.execute(params, ctx).await.unwrap_err().to_string();
-        responder.await.unwrap();
-
-        assert!(err.contains("waiting for password"));
-        assert!(!err.contains("should-not-run"));
     }
 
     #[tokio::test]
@@ -1357,20 +1258,12 @@ mod utf8_chunk_tests {
         }
     }
 
-    /// `forward_output` feeds the process-global handoff counters; count what
-    /// the test consumes too, or the conservation test running alongside
-    /// sees bytes produced that nobody consumed.
-    fn consumed(msg: &str) {
-        BASH_INTERMEDIARY_CONSUMED_BYTES
-            .fetch_add(msg.len() as u64, std::sync::atomic::Ordering::Relaxed);
-    }
-
     async fn forward_chunks(chunks: Vec<Vec<u8>>, is_stderr: bool) -> String {
         let (tx, mut rx) = tokio::sync::mpsc::channel(1024);
         forward_output(ChunkedReader(chunks.into()), is_stderr, tx).await;
         let mut out = String::new();
-        while let Some((stderr, msg)) = rx.recv().await {
-            consumed(&msg);
+        while let Some((stderr, chunk)) = rx.recv().await {
+            let msg = chunk.consume();
             assert_eq!(stderr, is_stderr);
             out.push_str(&msg);
         }
@@ -1427,6 +1320,20 @@ mod utf8_chunk_tests {
         );
     }
 
+    /// A consumer that gives up (timeout, cancelled password prompt) drops
+    /// the receiver with chunks still queued. Those bytes must be counted as
+    /// dropped, or the process-wide accounting never settles again.
+    #[tokio::test]
+    async fn chunks_still_queued_when_the_receiver_goes_away_count_as_dropped() {
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        let chunks: Vec<Vec<u8>> = (0..8).map(|_| b"queued".to_vec()).collect();
+        forward_output(ChunkedReader(chunks.into()), false, tx).await;
+        let before = bash_intermediary_snapshot();
+        drop(rx);
+        let after = wait_handoff_settled().await;
+        assert!(after.dropped_bytes - before.dropped_bytes >= 8 * 6);
+    }
+
     /// A password prompt has no trailing newline; it must be forwarded as soon
     /// as it is read, not held back waiting for more output or EOF.
     #[tokio::test]
@@ -1436,14 +1343,14 @@ mod utf8_chunk_tests {
         let task = tokio::spawn(forward_output(reader, true, tx));
         use tokio::io::AsyncWriteExt;
         writer.write_all("[sudo] password for x: ".as_bytes()).await.unwrap();
-        let (is_stderr, msg) =
+        let (is_stderr, chunk) =
             tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
                 .await
                 .expect("prompt must arrive without EOF")
                 .unwrap();
-        consumed(&msg);
+        let msg = chunk.consume();
         assert!(is_stderr);
-        assert_eq!(detect_password_prompt(&msg), Some(PromptKind::Sudo), "{msg:?}");
+        assert_eq!(msg, "[sudo] password for x: ");
         drop(writer);
         task.await.unwrap();
     }

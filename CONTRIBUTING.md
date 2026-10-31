@@ -12,7 +12,7 @@ cargo build --release
 cargo test --release --lib
 ```
 
-**Requirements:** Rust 1.88+, Linux or macOS
+**Requirements:** Rust 1.88+ on Linux, macOS or Windows (x64, MSVC toolchain). CI runs clippy and the daemon and TUI suites on Windows; gate Unix-only code with `#[cfg(unix)]`.
 
 **Note:** 7 PTY tests (`tools::shell`) fail under parallel execution — pass with `cargo test --release --lib -- --test-threads=1`. Not a bug, just TTY contention.
 

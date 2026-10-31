@@ -9,8 +9,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::net::UnixStream;
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
@@ -19,11 +17,12 @@ use crate::session::handle::CMD_CHAN_CAP;
 use crate::session::transport::{TransportError, ATTACH_TIMEOUT, ATTACH_TIMEOUT_PARKED};
 use crate::session::wire::*;
 use crate::session::*;
+use crate::ipc::{ServerReadHalf, ServerStream, ServerWriteHalf};
 use crate::{SessionEvent, StreamEvent};
 
 const HELLO_TIMEOUT: Duration = Duration::from_secs(2);
 
-type Reader = BufReader<OwnedReadHalf>;
+type Reader = BufReader<ServerReadHalf>;
 
 /// Which `SessionCommand`s a socket client may originate (§4 MED). The UDS
 /// is 0600 same-uid, so this is a footgun guard, not an auth boundary:
@@ -101,7 +100,32 @@ enum Read {
     Bad(String),
 }
 
+/// Capacity a connection's frame buffer is reset to after a large frame.
+const FRAME_BUF_KEEP: usize = 64 * 1024;
+/// A frame buffer that grew past this is dropped once the frame is read.
+const FRAME_BUF_SHRINK_ABOVE: usize = 1024 * 1024;
+
+/// Read one frame, then release the buffer if that frame made it large.
+///
+/// `line` lives as long as the connection, and `clear()` keeps capacity: one
+/// `Submit` carrying a 15 MiB attachment (~20 MiB of base64) or a refused
+/// oversize frame (up to 64 MiB) would otherwise stay allocated until the
+/// client detaches, which for a daemon-attached TUI is days. Released right
+/// after the read, on every outcome, not before the next one: an idle client
+/// can go hours between frames. Same policy as the client's `FrameBuf`.
 async fn read_frame(reader: &mut Reader, line: &mut String) -> std::io::Result<Read> {
+    let read = read_frame_into(reader, line).await;
+    release_large_frame_buf(line);
+    read
+}
+
+fn release_large_frame_buf(line: &mut String) {
+    if line.capacity() > FRAME_BUF_SHRINK_ABOVE {
+        *line = String::with_capacity(FRAME_BUF_KEEP);
+    }
+}
+
+async fn read_frame_into(reader: &mut Reader, line: &mut String) -> std::io::Result<Read> {
     loop {
         line.clear();
         let n = tokio::io::AsyncReadExt::take(&mut *reader, MAX_FRAME_BYTES as u64 + 1)
@@ -125,7 +149,7 @@ async fn read_frame(reader: &mut Reader, line: &mut String) -> std::io::Result<R
 }
 
 /// Writer task: owns the write half; bounded queue = per-client backpressure.
-fn spawn_writer(mut w: OwnedWriteHalf) -> (mpsc::Sender<DaemonFrame>, tokio::task::JoinHandle<()>) {
+fn spawn_writer(mut w: ServerWriteHalf) -> (mpsc::Sender<DaemonFrame>, tokio::task::JoinHandle<()>) {
     let (tx, mut rx) = mpsc::channel::<DaemonFrame>(CMD_CHAN_CAP);
     let task = tokio::spawn(async move {
         while let Some(frame) = rx.recv().await {
@@ -157,8 +181,8 @@ fn spawn_writer(mut w: OwnedWriteHalf) -> (mpsc::Sender<DaemonFrame>, tokio::tas
     (tx, task)
 }
 
-pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: CancellationToken) {
-    let (r, w) = stream.into_split();
+pub async fn serve(state: Arc<DaemonState>, stream: ServerStream, shutdown: CancellationToken) {
+    let (r, w) = crate::ipc::split_server(stream);
     let mut reader = BufReader::new(r);
     let (tx, writer) = spawn_writer(w);
     let mut line = String::new();
@@ -308,6 +332,13 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
             Ok(Read::Frame(ClientFrame::Pin { session_id, on })) => {
                 tracing::info!(session = %session_id, on, "daemon: pin requested over the socket");
                 let reply = super::pin::pin_session(&state, &session_id, on).await;
+                let _ = tx.send(reply).await;
+            }
+            // `daemon rename`: name/unname one session with host authority,
+            // no attach. A refusal is terminal, like `Close`.
+            Ok(Read::Frame(ClientFrame::Rename { session_id, name, expect })) => {
+                tracing::info!(session = %session_id, clear = name.is_none(), "daemon: rename requested over the socket");
+                let reply = super::rename::rename_session(&state, &session_id, name.as_deref(), expect).await;
                 let _ = tx.send(reply).await;
             }
             // `daemon reload-extension`: restart one extension in place,
@@ -563,6 +594,13 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
                     let _ = tx.send(DaemonFrame::Error { session_id: Some(sid.clone()), message: crate::session::RELOADING_REFUSAL.into() }).await;
                     continue;
                 }
+                // A client's own Detach ends its feed: nothing after it is
+                // forwarded (its `ClientLeft` included), whether its `Bye`
+                // shares the read (one socket segment) or comes in a later
+                // one (a named pipe often delivers the two writes apart).
+                if matches!(&cmd, SessionCommand::Detach { client: c } if *c == client) {
+                    forward.abort();
+                }
                 match handle.send_from(client, cmd).await {
                     Ok(()) => {}
                     Err(TransportError::Backpressure) => {
@@ -601,6 +639,7 @@ pub async fn serve(state: Arc<DaemonState>, stream: UnixStream, shutdown: Cancel
             | Ok(Read::Frame(ClientFrame::Purge))
             | Ok(Read::Frame(ClientFrame::Close { .. }))
             | Ok(Read::Frame(ClientFrame::Pin { .. }))
+            | Ok(Read::Frame(ClientFrame::Rename { .. }))
             | Ok(Read::Frame(ClientFrame::ReloadExtension { .. }))
             | Ok(Read::Frame(ClientFrame::AuthState(_))) => {
                 let _ = tx.send(DaemonFrame::Error { session_id: Some(sid.clone()), message: "control frames are not accepted on an attached connection".into() }).await;
@@ -811,6 +850,56 @@ mod tests {
         };
         assert_eq!(kinds(&replay_for(old, snapshot.clone())), vec!["other"]);
         assert_eq!(kinds(&replay_for(new, snapshot)), vec!["queued", "other", "started"]);
+    }
+
+    /// A large frame doesn't pin its buffer for the life of the connection:
+    /// the buffer is back to [`FRAME_BUF_KEEP`] straight after the read (not
+    /// at the next frame, which for an idle TUI may be hours away), and the
+    /// connection keeps reading frames normally afterwards.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_large_frame_releases_its_buffer_after_the_read() {
+        let (ours, theirs) = tokio::net::UnixStream::pair().unwrap();
+        let (read_half, _keep) = ours.into_split();
+        let mut reader = BufReader::new(read_half);
+        let mut line = String::new();
+
+        // 2 MiB of leading whitespace is still a valid `ping` frame; the
+        // second big frame is garbage; the last is a normal small frame.
+        let pad = " ".repeat(2 * 1024 * 1024);
+        let input = format!("{pad}{{\"type\":\"ping\"}}\n{pad}not json\n{{\"type\":\"ping\"}}\n");
+        let writer = tokio::spawn(async move {
+            let mut theirs = theirs;
+            theirs.write_all(input.as_bytes()).await.unwrap();
+            theirs
+        });
+
+        let first = read_frame(&mut reader, &mut line).await.unwrap();
+        assert!(matches!(first, Read::Frame(ClientFrame::Ping)));
+        assert!(line.capacity() <= FRAME_BUF_SHRINK_ABOVE, "kept {} bytes", line.capacity());
+
+        let second = read_frame(&mut reader, &mut line).await.unwrap();
+        assert!(matches!(second, Read::Bad(_)), "a malformed big frame is reported");
+        assert!(line.capacity() <= FRAME_BUF_SHRINK_ABOVE, "kept {} bytes", line.capacity());
+
+        let third = read_frame(&mut reader, &mut line).await.unwrap();
+        assert!(matches!(third, Read::Frame(ClientFrame::Ping)));
+        drop(writer.await.unwrap());
+        assert!(matches!(read_frame(&mut reader, &mut line).await.unwrap(), Read::Eof));
+    }
+
+    /// Ordinary frames reuse the buffer: no reallocation per frame.
+    #[test]
+    fn a_small_frame_buffer_is_reused() {
+        let mut line = String::with_capacity(FRAME_BUF_KEEP);
+        line.push_str("{\"type\":\"ping\"}");
+        let before = line.as_ptr();
+        release_large_frame_buf(&mut line);
+        assert_eq!(line.as_ptr(), before, "a small buffer is not reallocated");
+
+        let mut big = String::with_capacity(FRAME_BUF_SHRINK_ABOVE + 1);
+        release_large_frame_buf(&mut big);
+        assert!((FRAME_BUF_KEEP..=FRAME_BUF_SHRINK_ABOVE).contains(&big.capacity()));
     }
 
     /// The drain gate refuses work that would start after the record, and

@@ -1,12 +1,16 @@
-//! Daemon front-end (`synaps daemon`): UDS listener, per-connection pump,
-//! registry file, lifecycle (PLAN-phase2 §2.11). Lives in `agent-engine`
+//! Daemon front-end (`synaps daemon`): UDS listener (an owner-only named
+//! pipe on Windows — [`crate::ipc`]), per-connection pump, registry file,
+//! lifecycle (PLAN-phase2 §2.11). Lives in `agent-engine`
 //! (S289 D-1 amended) — `agent-tui` must never appear in this graph.
 //!
 //! On by default: the first `--attach`/`attach` client auto-spawns the
 //! daemon ([`ensure_running`]); `SYNAPS_DAEMON=0` disables every daemon
 //! feature (exit 3 with a one-line reason). Safety properties that are
 //! NEVER stubbed: the flock liveness oracle, the ready-fd pipe, socket
-//! perms 0700/0600, the spawn lock (one spawner per registry dir).
+//! perms 0700/0600, the spawn lock (one spawner per registry dir). On
+//! Windows the same properties hold with native mechanisms ([`win`]): the
+//! `LockFileEx` lock is the oracle, a named event is the ready signal, the
+//! pipe's DACL and server-identity check stand in for the file modes.
 
 pub mod close;
 pub mod conn;
@@ -17,6 +21,9 @@ pub mod pin;
 pub mod pins;
 pub mod registry;
 pub mod reload;
+pub mod rename;
+#[cfg(windows)]
+pub(crate) mod win;
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -41,6 +48,9 @@ pub const EXIT_VERSION: i32 = 2;
 pub const EXIT_DAEMON_LOST: i32 = 4;
 /// Env var carrying the write end of the ready pipe to a spawned daemon.
 pub const READY_FD_ENV: &str = "SYNAPS_DAEMON_READY_FD";
+/// Windows: env var naming the event a spawned daemon sets once ready (the
+/// ready pipe's counterpart).
+pub const READY_EVENT_ENV: &str = "SYNAPS_DAEMON_READY_EVENT";
 /// Upper bound `run_foreground` waits for extension discovery before it
 /// starts accepting and signals ready (sidecars spawn once per daemon, and
 /// early sessions must see extension tools/hooks).
@@ -380,7 +390,7 @@ impl Daemon {
         }
         // C3: after `reload` the new image ADOPTS the inherited flock and
         // skips `reap_stale` (the old image's files are ours).
-        let adopted = reload::adopt_from_env()?;
+        let adopted = reload::adopt_from_env(&paths)?;
         let (lock, reload_state) = match adopted {
             Some((lock, rs, rs_path)) => {
                 let _ = std::fs::remove_file(&rs_path);
@@ -595,6 +605,34 @@ pub fn signal_ready() {
             libc::close(fd);
         }
     }
+    #[cfg(windows)]
+    {
+        let Ok(name) = std::env::var(READY_EVENT_ENV) else {
+            return;
+        };
+        std::env::remove_var(READY_EVENT_ENV);
+        if let Err(e) = win::signal_event(&name) {
+            tracing::warn!(error = %e, "daemon: could not signal the spawner's ready event");
+        }
+        // The spawner stops reading our stderr now.
+        win::detach_stdio();
+    }
+}
+
+/// The detached daemon's program and argv: `exe cmd_args`, wrapped in the
+/// daemon's own scope (in `daemon_scope_slice` when that is set) when scopes
+/// are available for `effective_env`.
+#[cfg(unix)]
+fn daemon_launch(
+    effective_env: &[(std::ffi::OsString, std::ffi::OsString)],
+    exe: PathBuf,
+    cmd_args: Vec<std::ffi::OsString>,
+) -> (std::ffi::OsString, Vec<std::ffi::OsString>) {
+    let kind = crate::process_scope::ScopeKind::Daemon;
+    match crate::process_scope::launcher_for_effective_env(effective_env, None, kind) {
+        Some(launcher) => launcher.wrap("synaps daemon", exe, cmd_args),
+        None => (exe.into_os_string(), cmd_args),
+    }
 }
 
 /// Parent side: `current_exe daemon --foreground …` in its own session
@@ -627,10 +665,7 @@ pub fn spawn_detached(opts: &DaemonOpts) -> anyhow::Result<u32> {
     let mut effective_env = crate::process_scope::inherited_env();
     crate::process_scope::set_env(&mut effective_env, "SYNAPS_DAEMON", "1");
     effective_env.retain(|(k, _)| k != READY_FD_ENV);
-    let (program, cmd_args) = match crate::process_scope::launcher_for_effective_env(&effective_env, None) {
-        Some(launcher) => launcher.wrap("synaps daemon", exe, cmd_args),
-        None => (exe.into_os_string(), cmd_args),
-    };
+    let (program, cmd_args) = daemon_launch(&effective_env, exe, cmd_args);
     let mut fds = [0i32; 2];
     // SAFETY: plain pipe(2) on a valid 2-slot array.
     if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
@@ -747,6 +782,65 @@ pub fn spawn_detached(opts: &DaemonOpts) -> anyhow::Result<u32> {
     }
 }
 
+/// Windows: as the Unix version — `current_exe daemon --foreground …`,
+/// stdout → null, stderr → pipe, wait ≤ [`SPAWN_READY_TIMEOUT`] — with a
+/// named ready event instead of the ready pipe (the child's exit before it
+/// is set is the pipe's EOF-before-`R`) and a hidden-console, own-group,
+/// job-breakaway spawn instead of `setsid` ([`win::spawn_detached`]).
+#[cfg(windows)]
+pub fn spawn_detached(opts: &DaemonOpts) -> anyhow::Result<u32> {
+    let exe = std::env::current_exe()?;
+    let mut cmd_args: Vec<std::ffi::OsString> = vec!["daemon".into(), "--foreground".into()];
+    if let Some(p) = &opts.profile {
+        cmd_args.extend(["--profile".into(), p.into()]);
+    }
+    if let Some(s) = &opts.socket {
+        cmd_args.extend(["--socket".into(), s.into()]);
+    }
+    if let Some(i) = opts.idle_exit {
+        cmd_args.extend(["--idle-exit".into(), i.as_secs().to_string().into()]);
+    }
+    if opts.allow_legacy_mcp {
+        cmd_args.push("--allow-legacy-mcp".into());
+    }
+    let mut effective_env = crate::process_scope::inherited_env();
+    crate::process_scope::set_env(&mut effective_env, "SYNAPS_DAEMON", "1");
+    effective_env.retain(|(k, _)| k != READY_FD_ENV && k != READY_EVENT_ENV);
+    let ready = win::Event::create_unique("ready")?;
+    crate::process_scope::set_env(&mut effective_env, READY_EVENT_ENV, ready.name());
+    let mut child = win::spawn_detached(&exe, &cmd_args, &effective_env)?;
+    let pid = child.id();
+
+    if win::wait_event_or_exit(&ready, &child, SPAWN_READY_TIMEOUT) == win::Wait::Signalled {
+        // Keep draining stderr (the daemon points it at NUL once ready).
+        if let Some(mut err) = child.take_stderr() {
+            std::thread::spawn(move || {
+                let mut sink = Vec::new();
+                let _ = std::io::Read::read_to_end(&mut err, &mut sink);
+            });
+        }
+        return Ok(pid);
+    }
+    // Stop/reap before reading stderr; descendants may retain its write end
+    // (the read is bounded in bytes and time).
+    let exited = child.wait(Duration::ZERO);
+    if exited.is_none() {
+        child.kill();
+        let _ = child.wait(Duration::from_secs(5));
+    }
+    let tail = win::stderr_tail(child.take_stderr(), 64 * 1024, Duration::from_millis(500));
+    let reason = tail
+        .lines()
+        .map(str::trim)
+        .rfind(|l| !l.is_empty())
+        .map(|l| l.trim_start_matches("synaps daemon: ").to_string());
+    match (exited, reason) {
+        (Some(code), Some(r)) => anyhow::bail!("daemon exited (code {code}): {r}"),
+        (_, Some(r)) => anyhow::bail!("daemon did not become ready within {SPAWN_READY_TIMEOUT:?}: {r}"),
+        (_, None) => anyhow::bail!("daemon did not become ready within {SPAWN_READY_TIMEOUT:?}"),
+    }
+}
+
 /// Result of [`ensure_running`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Ensured {
@@ -787,14 +881,12 @@ const SPAWN_LOCK_WAIT: Duration = SPAWN_READY_TIMEOUT.saturating_add(Duration::f
 /// Never touches the socket on ECONNREFUSED alone — `reap_stale` + the
 /// flock decide. Daemon startup must NOT acquire the spawn lock: its parent
 /// holds it until the child's ready-fd acknowledgement.
-#[cfg(unix)]
 pub fn ensure_running(opts: &DaemonOpts) -> Result<Ensured, EnsureError> {
     ensure_running_with(opts, autospawn_enabled(), spawn_detached, || {})
 }
 
 // Keep the real cleanup/probe/locking path testable without spawning the unit
 // test executable. The hook marks entry to the lock attempt, not readiness.
-#[cfg(unix)]
 fn ensure_running_with(
     opts: &DaemonOpts,
     auto: bool,
@@ -869,6 +961,11 @@ pub async fn run_foreground(opts: DaemonOpts) -> anyhow::Result<()> {
     if !enabled() {
         anyhow::bail!("{DISABLED_NOTICE} (exit {EXIT_REFUSED})");
     }
+    // Windows reload: take `daemon.lock` over from the previous image before
+    // booting anything. It exits on our signal, as `execv` would have
+    // replaced it, so nothing below ever runs beside it.
+    #[cfg(windows)]
+    reload::take_over_from_env(&opts.paths())?;
     // Background MCP discovery: a hung/dead MCP server must never delay the
     // ready byte (the spawner waits only SPAWN_READY_TIMEOUT).
     let host = EngineHost::boot_and_install(crate::HostOpts {
@@ -997,7 +1094,75 @@ mod flag_tests {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(all(test, target_os = "linux"))]
+mod scope_tests {
+    use super::*;
+    use crate::process_scope::test_support::{fake_env, fake_systemd_run, recorded};
+
+    fn launch(env: &[(String, String)]) -> (std::ffi::OsString, Vec<String>) {
+        let env: Vec<(std::ffi::OsString, std::ffi::OsString)> =
+            env.iter().map(|(k, v)| (k.into(), v.into())).collect();
+        let exe = PathBuf::from("/opt/synaps/bin/synaps");
+        let (program, args) = daemon_launch(&env, exe, vec!["daemon".into(), "--foreground".into()]);
+        (program, args.iter().map(|a| a.to_string_lossy().into_owned()).collect())
+    }
+
+    /// The daemon's scope goes in `daemon_scope_slice`, never in the tools'
+    /// `tool_scope_slice`; with neither key set its argv is today's.
+    #[test]
+    #[serial_test::serial(synaps_base_dir)]
+    fn the_daemon_scope_goes_in_the_daemon_slice_only() {
+        let base = crate::test_env::BaseDirGuard::new();
+        let _scopes = crate::test_env::EnvVarGuard::remove("SYNAPS_PROCESS_SCOPES");
+        let dir = tempfile::tempdir().unwrap();
+        let fake = fake_systemd_run(dir.path());
+        let env = fake_env(&fake);
+        let today = [
+            "--user",
+            "--scope",
+            "--quiet",
+            "--collect",
+            "--description=synaps daemon",
+            "--",
+            "/opt/synaps/bin/synaps",
+            "daemon",
+            "--foreground",
+        ];
+        let (program, args) = launch(&env);
+        assert_eq!(program, fake.clone().into_os_string());
+        assert_eq!(args, today);
+        let config = base.path().join("config");
+        std::fs::write(&config, "tool_scope_slice = t_tools.slice\ndaemon_scope_slice = d_daemon.slice\n").unwrap();
+        let (program, args) = launch(&env);
+        assert_eq!(program, fake.clone().into_os_string());
+        assert_eq!(
+            args,
+            [
+                "--user",
+                "--scope",
+                "--quiet",
+                "--collect",
+                "--slice=d_daemon.slice",
+                "--description=synaps daemon",
+                "--",
+                "/opt/synaps/bin/synaps",
+                "daemon",
+                "--foreground",
+            ]
+        );
+        assert!(recorded(dir.path(), "probe.args").contains(&"--slice=d_daemon.slice".to_string()));
+        // Only the tools' key: the daemon's scope stays where it was.
+        std::fs::write(&config, "tool_scope_slice = t_tools.slice\n").unwrap();
+        assert_eq!(launch(&env).1, today);
+        // Scopes off: the daemon starts directly.
+        std::fs::write(&config, "process_scopes = off\ndaemon_scope_slice = d_daemon.slice\n").unwrap();
+        let (program, args) = launch(&env);
+        assert_eq!(program, std::ffi::OsString::from("/opt/synaps/bin/synaps"));
+        assert_eq!(args, ["daemon", "--foreground"]);
+    }
+}
+
+#[cfg(test)]
 mod ensure_tests {
     use super::*;
     use std::sync::mpsc;

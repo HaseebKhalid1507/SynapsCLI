@@ -73,7 +73,6 @@ struct ParseState {
     flushed_partial_tool: bool,
     // ── Telemetry captures ──
     telem_msg_id: Option<String>,
-    telem_ttft: Option<u64>,
     telem_stop_reason: Option<String>,
     telem_usage: telemetry::UsageRecord,
     first_event_seen: bool,
@@ -183,7 +182,6 @@ impl ParseState {
             in_thinking: false,
             flushed_partial_tool: false,
             telem_msg_id: None,
-            telem_ttft: None,
             telem_stop_reason: None,
             telem_usage: telemetry::UsageRecord::default(),
             first_event_seen: false,
@@ -208,9 +206,9 @@ impl ParseState {
     /// Idempotent: clears `in_*` and `current_text` so a second call is a no-op.
     fn finalize(&mut self) {
         if self.in_thinking {
-            // Never emit an empty `thinking` field — Anthropic rejects such
-            // blocks on the next turn (see content_block_stop arm).
-            if !self.current_thinking.is_empty() {
+            // Never emit a block with neither text nor signature — Anthropic
+            // rejects it on the next turn (see content_block_stop arm).
+            if keeps_thinking_block(&self.current_thinking, &self.current_thinking_signature) {
                 self.accumulated_content.push(json!({
                     "type": "thinking",
                     "thinking": self.current_thinking,
@@ -269,6 +267,12 @@ impl ParseState {
     }
 }
 
+/// Whether a streamed thinking block goes into the history: it carries text
+/// or a signature (an omitted-display block is empty text plus signature).
+fn keeps_thinking_block(thinking: &str, signature: &str) -> bool {
+    !thinking.is_empty() || !signature.is_empty()
+}
+
 /// Immutable per-stream context — not state. `tx` deliberately lives here and
 /// not in `ParseState`: read/write separation is the point.
 struct EventCtx<'t> {
@@ -320,14 +324,11 @@ fn process_data_line(line: &str, state: &mut ParseState, ctx: &EventCtx) {
 /// tail paths are uniform. `raw` is the un-parsed data line — `#[serde(other)]`
 /// discards the tag on Unknown events, so the raw line is the only forensics.
 fn process_event(event: AnthropicEvent<'_>, raw: &str, state: &mut ParseState, ctx: &EventCtx) {
-    // First-event capture: the trace timing bucket is unconditional
-    // (Task 8); the telemetry TTFT mirror stays gated as before.
+    // First-event capture (Task 8), unconditional. Feeds the attempt clock,
+    // which both the trace and the telemetry `ttft_ms` read.
     if !state.first_event_seen {
         state.first_event_seen = true;
         state.first_event_elapsed_ms = Some(ctx.request_start.elapsed().as_millis() as u64);
-        if ctx.telemetry_level.enabled() {
-            state.telem_ttft = state.first_event_elapsed_ms;
-        }
     }
 
     match event {
@@ -396,12 +397,15 @@ fn process_event(event: AnthropicEvent<'_>, raw: &str, state: &mut ParseState, c
         AnthropicEvent::ContentBlockStop => {
             if state.in_thinking {
                 // Flush thinking block with signature so it's echoed back in tool loops.
-                // CRITICAL: never emit an empty `thinking` field — Anthropic rejects
-                // such blocks on the next turn with
-                // `messages.N.content.M.thinking: each thinking block must contain thinking`.
-                // Empty blocks happen when the stream produced only a signature delta
-                // (or none at all) before the block_stop arrived.
-                if !state.current_thinking.is_empty() {
+                // A block with an empty `thinking` but a signature is kept: that is
+                // every block under `display: "omitted"` (and a summarized-mode
+                // progress update the model wrote no summary for); the signature
+                // carries the reasoning, and the API wants it back unchanged — a
+                // tool loop must not partially drop its thinking blocks. Only a
+                // block with neither is dropped: Anthropic rejects that one with
+                // `messages.N.content.M.thinking: each thinking block must contain
+                // thinking` (verified against the live API, 2026-11).
+                if keeps_thinking_block(&state.current_thinking, &state.current_thinking_signature) {
                     state.accumulated_content.push(json!({
                         "type": "thinking",
                         "thinking": state.current_thinking,
@@ -812,9 +816,11 @@ pub struct ApiOptions {
     pub memory_backend: Option<crate::memory_backend::MemoryBinding>,
     /// Opt into the 1M context window beta header.
     pub use_1m_context: bool,
-    /// Prompt-cache TTL strategy (spec: cache-ttl). Default `FiveMinutes`
-    /// emits payloads byte-identical to the pre-feature release.
-    pub cache_ttl: crate::core::config::CacheTtl,
+    /// Configured prompt-cache TTL (spec: cache-ttl). Resolved to a wire
+    /// [`crate::core::config::CacheTtl`] per request once the credential
+    /// kind is known (`auto`: 1h on OAuth, 5m on an API key). A resolved
+    /// `FiveMinutes` emits payloads byte-identical to the pre-feature release.
+    pub cache_ttl: crate::core::config::CacheTtlSetting,
     /// One-time-per-session latch for the silent-downgrade notice (1h
     /// requested, only 5m honored). Shared via Arc so every request in the
     /// session sees the same latch; the configured mode is NEVER auto-flipped.
@@ -838,11 +844,26 @@ pub struct ApiOptions {
     pub anthropic_base_url: Option<String>,
     /// Dedicated lazy pool: upload and body idle deadlines are independent.
     pub(super) anthropic_stream_client: Arc<std::sync::OnceLock<Client>>,
+    /// gzip `Content-Encoding` policy for the request body (see
+    /// `request_encoding`). The default compresses large bodies sent straight
+    /// to api.anthropic.com and shares the process-wide refusal latch.
+    pub(super) request_compression: super::request_encoding::RequestCompression,
     /// Execution authority produced by Runtime preflight. Transports must not
     /// recreate authority for Max/UltraCode from assumed prerequisites.
     pub anthropic_execution_plan: Option<crate::runtime::openai::catalog::AnthropicExecutionPlan>,
     /// Foreground/worker/internal request role.
     pub codex_request_role: crate::runtime::openai::catalog::CodexRequestRole,
+    /// The Anthropic request's `thinking.display`
+    /// ([`crate::Runtime::wire_thinking_display`]). The default (summarized)
+    /// keeps every body byte-identical to before the setting existed.
+    pub thinking_display: crate::config::ThinkingDisplay,
+    /// Set by the stream loop (and the keep-warm ping) when request-local
+    /// image retention was already applied to the messages this request is
+    /// given (worker and routed budgets, `image_retention::round_images`):
+    /// the `(message, block)` position of that retention's frontier in those
+    /// messages. The native transport anchors a cache breakpoint ahead of the
+    /// earlier of this and its own replay's frontier. `None` otherwise.
+    pub retention_frontier: Option<(usize, usize)>,
     /// Trace emission seam (Task 8). Default is a disabled context (no-op
     /// sink, zero request-path work); tests install a collecting sink and
     /// production installs the Task 11 writer-backed sink via the Runtime.
@@ -913,6 +934,11 @@ pub struct ApiOptions {
     /// `previous_message_id`) and on keep-warm pings (header only, so the
     /// beta set matches the turns they keep warm).
     pub cache_diagnosis: Option<super::cache_diagnosis::CacheDiagnosis>,
+    /// The context window this request belongs to after an automatic
+    /// rollover (worker or foreground), for the telemetry record's
+    /// `rollover_window` / `rollover` fields. `None` (default) before any
+    /// rollover and on every non-turn request: records stay unchanged.
+    pub context_rollover: Option<super::telemetry::RolloverStamp>,
 }
 
 /// What a keep-warm request does once its body is built.
@@ -924,6 +950,12 @@ pub enum KeepWarmMode {
     /// Send only if the built prefix still hashes to `expect`; otherwise
     /// return `{"keepwarm_prefix": <actual>}` without sending.
     Send { expect: u64 },
+    /// Send unconditionally: the messages before the trailing ping are the
+    /// exact request messages of the provider round whose tool calls are
+    /// still running (`runtime::tool_keepwarm`), re-sent with that round's
+    /// own tools, system, thinking and options, so the prefix is that
+    /// request's by construction and there is nothing to fingerprint.
+    Replay,
 }
 
 /// Wire knobs for a keep-warm request (see [`ApiOptions::keepwarm`]).
@@ -998,11 +1030,13 @@ pub(super) fn terminal_http_error(
 
 /// Begin an Anthropic request tracer (Task 8). Returns `None` when tracing
 /// is disabled or any structural identity is unrepresentable — tracing can
-/// never fail the request. `body_bytes` MUST be the exact buffer handed to
-/// reqwest: it is the sole source of the wire length + digest.
+/// never fail the request. `body_bytes` MUST be the exact JSON payload handed
+/// to reqwest, before any `Content-Encoding` (the server decodes gzip before
+/// reading it): it is the sole source of the wire length + digest.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn begin_anthropic_tracer(
     options: &ApiOptions,
+    cache_ttl: crate::core::config::CacheTtl,
     url: &str,
     bare_model: &str,
     body_bytes: &[u8],
@@ -1029,7 +1063,7 @@ pub(super) async fn begin_anthropic_tracer(
     // Lazy, spawn_blocking-backed key load; `None` degrades the record to
     // digest-free sections and is counted, never surfaced as an error.
     let key = options.trace.digest_key().await;
-    let prefix_ttl = match options.cache_ttl {
+    let prefix_ttl = match cache_ttl {
         crate::core::config::CacheTtl::FiveMinutes => Some(tr::CacheTtlClass::FiveMinutes),
         crate::core::config::CacheTtl::OneHour | crate::core::config::CacheTtl::Hybrid => {
             Some(tr::CacheTtlClass::OneHour)
@@ -1149,8 +1183,9 @@ impl ApiMethods {
             ));
         }
         super::attachments::validate_history_for_request(model, messages).map_err(RuntimeError::Config)?;
-        let wire_messages = super::continuation::wire_messages(messages);
-        let messages = wire_messages.as_deref().unwrap_or(messages);
+        // Host `_synaps_*` keys never reach a provider. The native Anthropic
+        // body drops them while serializing (`WireMessages`, no history
+        // copy); every other transport strips at its own entry.
         // One provider-neutral schema source for every transport. The opt-in
         // progressive path supplies a per-round session projection; flag-off
         // keeps cloning the registry's existing cached Arc byte-for-byte.
@@ -1167,6 +1202,8 @@ impl ApiMethods {
                 if cancel.is_cancelled() {
                     return Err(RuntimeError::Canceled);
                 }
+                let wire_messages = super::continuation::wire_messages(messages);
+                let messages = wire_messages.as_deref().unwrap_or(messages);
                 let has_tools = !tools_schema.is_empty();
                 return with_usage_metering(model, options.usage_counters.clone(), &tx, |tx| async move {
                     crate::runtime::cloud_invoke::cloud_invoke_stream(
@@ -1294,8 +1331,9 @@ impl ApiMethods {
         router: &dyn super::anthropic_quota::AnthropicAccountRouter,
     ) -> Result<Value> {
         use super::anthropic_quota::{
-            body_prefix, classify_anthropic_429, describe_reset_utc, failover_permitted,
-            ratelimit_header_summary, Anthropic429, AnthropicFailoverGate, QUOTA_PROBE_BODY_CAP,
+            body_prefix, classify_anthropic_429, failover_permitted, ratelimit_header_summary,
+            Anthropic429, AnthropicFailoverGate, FailoverRefusal, LimitText, NoHop,
+            QUOTA_PROBE_BODY_CAP,
         };
         // Provider qualification is application identity; Anthropic's wire API
         // still receives its native bare model id.
@@ -1338,14 +1376,23 @@ impl ApiMethods {
             ));
         }
 
-        tracing::info!(model = %model, "Starting API request");
+        // Resolve the configured `cache_ttl` against the credential kind
+        // this request goes out on (`auto`: 1h OAuth, 5m API key). A pure
+        // function of the kind, so failover between accounts of one kind
+        // never flips the TTL (which would rewrite the cache).
+        let cache_ttl = options.cache_ttl.resolve_for_auth_type(&auth_type);
+
+        tracing::info!(model = %model, cache_ttl = %cache_ttl, "Starting API request");
 
         // Manual cache breakpoints for optimal prompt caching.
         // Tested vs auto-cache (top-level cache_control) — manual wins: 90% vs 53% hit rate.
         // Arc-shared (#128): to_vec() on &[SharedMessage] is N refcount bumps,
         // not a deep copy; sanitize/annotate clone-on-write only what they edit.
         let mut cleaned_messages = messages.to_vec();
-        let retired_count = super::image_retention::plan(messages).map_err(RuntimeError::Config)?;
+        let retention =
+            super::image_retention::plan_request(messages, super::image_retention::Budget::Native)
+                .map_err(RuntimeError::Config)?;
+        let retired_count = retention.retired;
         // Deferred tool loading: send the session's loaded tools normally and
         // every other activatable tool with `defer_loading`, and resolve the
         // history's `tool_reference` blocks to wire names. Without a split
@@ -1370,13 +1417,37 @@ impl ApiMethods {
         .map_err(RuntimeError::Config)?;
         super::attachments::validate_messages(model, &cleaned_messages)
             .map_err(RuntimeError::Config)?;
+        // The frontier is a position in `messages`: anchor before sanitation
+        // merges messages. A worker round arrives already retired upstream
+        // (its frontier rides in the options) and replays as a no-op here.
+        HelperMethods::annotate_retention_anchor(
+            &mut cleaned_messages,
+            super::image_retention::earliest(options.retention_frontier, retention.frontier),
+            cache_ttl,
+        );
         // Strict checks retain original per-source batch boundaries: sanitizing
         // first could merge valid adjacent user batches past eight attachments.
         HelperMethods::sanitize_thinking_blocks(&mut cleaned_messages);
         HelperMethods::wire_tool_references(&mut cleaned_messages, &|id: &str| {
             split.and_then(|split| split.id_to_api.get(id).cloned())
         });
-        match &options.keepwarm {
+        let keepwarm_prefix_len = match &options.keepwarm {
+            // Tool-round replay (`runtime::tool_keepwarm`): `messages` are the
+            // round's own request messages, so they are processed and marked
+            // exactly as that round's request was; the ping text is appended
+            // only now, after every marker, as an uncached tail.
+            Some(k) if k.mode == KeepWarmMode::Replay => {
+                HelperMethods::annotate_cache_breakpoint(&mut cleaned_messages, cache_ttl);
+                let prefix_len = cleaned_messages.len();
+                HelperMethods::append_keepwarm_ping(
+                    &mut cleaned_messages,
+                    Arc::new(serde_json::json!({
+                        "role": "user",
+                        "content": super::keepwarm::KEEPWARM_PING_TEXT,
+                    })),
+                );
+                prefix_len
+            }
             // Keep-warm: the marker goes on the last HISTORY message — the
             // durable prefix the next real turn re-sends verbatim — and the
             // trailing ping message (never persisted) rides after it as an
@@ -1385,11 +1456,15 @@ impl ApiMethods {
                 let history_len = cleaned_messages.len() - 1;
                 HelperMethods::annotate_cache_breakpoint(
                     &mut cleaned_messages[..history_len],
-                    options.cache_ttl,
+                    cache_ttl,
                 );
+                history_len
             }
-            _ => HelperMethods::annotate_cache_breakpoint(&mut cleaned_messages, options.cache_ttl),
-        }
+            _ => {
+                HelperMethods::annotate_cache_breakpoint(&mut cleaned_messages, cache_ttl);
+                cleaned_messages.len().saturating_sub(1)
+            }
+        };
 
         // Derive the thinking level from the budget for effort mapping.
         // Body assembly (#128 Slice 4): `RequestBody` BORROWS cleaned_messages
@@ -1409,10 +1484,17 @@ impl ApiMethods {
             thinking_budget,
             reasoning_level,
             Some(&execution_plan),
-            options.cache_ttl,
+            cache_ttl,
             true,
         );
         let mut body = parts.body;
+        // Before the keep-warm fingerprint below: a ping's prefix is the
+        // turn's, `thinking` included.
+        body.set_thinking_display(options.thinking_display);
+        // A model that rejects input + `max_tokens` over the window gets the
+        // room the input leaves (no-op on Claude 4.5 and later). Before the
+        // keep-warm cut below, which only lowers it further.
+        body.fit_max_tokens_to_window(Self::provider_window(options, model));
         // Cache diagnostics (`cache_diagnostics = true`): the foreground
         // chain only — pings and the setting-off path send no field.
         let mut diagnostics = super::cache_diagnosis::diagnostics_for(options);
@@ -1426,9 +1508,12 @@ impl ApiMethods {
         if let Some(keepwarm) = &options.keepwarm {
             body.apply_keepwarm_max_tokens();
             let beta = Self::build_beta_header(&auth_type, options, model);
-            let actual = body
-                .prefix_fingerprint(cleaned_messages.len().saturating_sub(1), beta.as_deref());
-            let send = matches!(keepwarm.mode, KeepWarmMode::Send { expect } if expect == actual);
+            let actual = body.prefix_fingerprint(keepwarm_prefix_len, beta.as_deref());
+            let send = match keepwarm.mode {
+                KeepWarmMode::Probe => false,
+                KeepWarmMode::Send { expect } => expect == actual,
+                KeepWarmMode::Replay => true,
+            };
             if !send {
                 return Ok(serde_json::json!({
                     "keepwarm_prefix": actual,
@@ -1446,7 +1531,7 @@ impl ApiMethods {
         // detector must stay disarmed (zero 1h bucket proves nothing).
         let has_tool_marker = body.has_tool_marker();
         let has_system_marker = body.has_system_marker();
-        let request_has_1h_marker = match options.cache_ttl {
+        let request_has_1h_marker = match cache_ttl {
             crate::core::config::CacheTtl::FiveMinutes => false,
             crate::core::config::CacheTtl::OneHour => {
                 !cleaned_messages.is_empty() || has_tool_marker || has_system_marker
@@ -1506,6 +1591,7 @@ impl ApiMethods {
             cancel,
             begin_anthropic_tracer(
                 options,
+                cache_ttl,
                 &anthropic_url,
                 model,
                 &body_bytes,
@@ -1523,6 +1609,16 @@ impl ApiMethods {
         #[allow(unused_assignments)]
         let mut clock = crate::runtime::trace::AttemptClock::start();
 
+        // ═══ WIRE ENCODING (request_encoding) ═════════════════════════════════
+        // `body_bytes` stays the JSON: the trace digests it and the
+        // diagnostics fail-soft edits it. `wire` is what reqwest uploads,
+        // gzip-encoded when the policy allows; retries reuse it.
+        let mut wire = await_or_cancel(
+            cancel,
+            options.request_compression.encode(&anthropic_url, &body_bytes),
+        )
+        .await?;
+
         let mut last_err = String::new();
         let mut last_status: Option<u16> = None;
         let mut last_reset_hint: Option<String> = None;
@@ -1535,12 +1631,24 @@ impl ApiMethods {
         // this request — the strict, fail-closed reading of "nothing has been
         // streamed" that the hop requires (no cross-account replay).
         // `tool_activity`: an earlier attempt produced a tool_use block.
-        // `anthropic_failovers`: hops spent on this request (≤ 1).
+        // `anthropic_failovers`: hops spent on this request (a backstop).
+        // `anthropic_attempted`: every account this request used, in order
+        // (the pinned one, then each hop's); a hop never goes back to one.
         // `quota_headers_logged`: the one-time schema-capture warn fired.
         let mut output_started = false;
         let mut tool_activity = false;
         let mut anthropic_failovers: u32 = 0;
+        let mut anthropic_attempted: Vec<crate::auth::CredentialRef> = Vec::new();
         let mut quota_headers_logged = false;
+        // Accounts this request reported exhausted: if one of them then
+        // serves (the ordinary retry outlived a short reset), its cooldown
+        // goes (`report_served`).
+        let mut anthropic_cooled: Vec<crate::auth::CredentialRef> = Vec::new();
+        // A cache keep-warm ping: it keeps the cache of the account it is
+        // on, so a limit is reported but never switches accounts, and no
+        // notice about it reaches the session.
+        let keepwarm_ping = options.keepwarm.is_some();
+        let mut sent_at_ms;
 
         loop {
             let response = {
@@ -1579,21 +1687,26 @@ impl ApiMethods {
                     }
                     clock = crate::runtime::trace::AttemptClock::start();
                     let sent_at = super::keepwarm::CacheAnchor::now();
+                    sent_at_ms = crate::epoch_millis();
+                    let req = wire.encoding_header(req);
                     let req = match &options.keepwarm {
-                        Some(keepwarm) => keepwarm_body(req, body_bytes.clone(), &keepwarm.sent),
-                        None => req.body(body_bytes.clone()),
+                        Some(keepwarm) => keepwarm_body(req, wire.bytes.clone(), &keepwarm.sent),
+                        None => req.body(wire.bytes.clone()),
                     };
                     match await_or_cancel(
                         cancel,
                         super::http_phases::send(
                             req,
-                            super::http_phases::header_deadline(body_bytes.len()),
+                            super::http_phases::header_deadline(wire.bytes.len()),
                         ),
                     )
                     .await?
                     {
                         Ok(resp) => {
                             let status = resp.status();
+                            options
+                                .request_compression
+                                .settle(&mut wire, status.is_success());
                             if let Some(keepwarm) = &options.keepwarm {
                                 keepwarm
                                     .sent
@@ -1609,6 +1722,22 @@ impl ApiMethods {
                                 // no earlier than `sent_at`.
                                 if let Some(anchor) = &options.cache_anchor {
                                     anchor.stamp(sent_at);
+                                }
+                                if !anthropic_cooled.is_empty() {
+                                    let served = super::auth::turn_pinned_credential(
+                                        &options.credential_source,
+                                        auth_binding.as_deref(),
+                                    );
+                                    if let Some(seat) =
+                                        served.filter(|s| anthropic_cooled.contains(s))
+                                    {
+                                        await_or_cancel(
+                                            cancel,
+                                            router.report_served(&seat, sent_at_ms),
+                                        )
+                                        .await?;
+                                        anthropic_cooled.retain(|c| c != &seat);
+                                    }
                                 }
                                 response = Some(resp);
                                 break;
@@ -1760,8 +1889,6 @@ impl ApiMethods {
                                         )
                                     };
                                     let auto = router.auto_selected();
-                                    let until_ms = evidence.cooldown_until_ms(now_ms).unwrap_or(now_ms);
-                                    let until = describe_reset_utc(until_ms, now_ms);
                                     let label = seat
                                         .as_ref()
                                         .map(|s| s.account.label_str().to_string())
@@ -1773,6 +1900,9 @@ impl ApiMethods {
                                         Some(seat) => {
                                             await_or_cancel(cancel, router.report_exhausted(seat, &evidence))
                                                 .await?;
+                                            if !anthropic_cooled.contains(seat) {
+                                                anthropic_cooled.push(seat.clone());
+                                            }
                                         }
                                         None => tracing::warn!(
                                             signal = ?evidence.signal,
@@ -1786,39 +1916,74 @@ impl ApiMethods {
                                         failovers_so_far: anthropic_failovers,
                                     };
                                     let mut hop = None;
+                                    // Why there is no hop, when there isn't one.
+                                    // An unbound request never switches.
+                                    let mut no_hop = NoHop::Explicit;
                                     if let Some(seat) = seat.as_ref() {
-                                        match failover_permitted(&gate) {
+                                        // The exhausted account goes last in the
+                                        // attempted set (once).
+                                        anthropic_attempted.retain(|c| c != seat);
+                                        anthropic_attempted.push(seat.clone());
+                                        let permitted = if keepwarm_ping {
+                                            Err(FailoverRefusal::KeepWarmPing)
+                                        } else {
+                                            failover_permitted(&gate)
+                                        };
+                                        match permitted {
                                             Ok(()) => {
-                                                match await_or_cancel(cancel, router.failover(model, seat))
-                                                    .await?
+                                                match await_or_cancel(
+                                                    cancel,
+                                                    router.failover(model, &anthropic_attempted),
+                                                )
+                                                .await?
                                                 {
-                                                    Ok(Some(next)) if next.credential != *seat => {
+                                                    Ok(Some(next))
+                                                        if !anthropic_attempted
+                                                            .contains(&next.credential) =>
+                                                    {
                                                         hop = Some(next);
                                                     }
-                                                    Ok(_) => tracing::info!(
-                                                        account = %seat,
-                                                        "anthropic window exhausted; no distinct account with capacity"
-                                                    ),
-                                                    Err(e) => tracing::warn!(
-                                                        account = %seat,
-                                                        error = %e,
-                                                        "anthropic failover candidate resolution failed; not switching"
-                                                    ),
+                                                    Ok(_) => {
+                                                        no_hop = NoHop::NoOtherAccount;
+                                                        tracing::info!(
+                                                            account = %seat,
+                                                            attempted = anthropic_attempted.len(),
+                                                            "anthropic window exhausted; no account this request hasn't used has capacity"
+                                                        )
+                                                    }
+                                                    Err(e) => {
+                                                        no_hop = NoHop::LookupFailed;
+                                                        tracing::warn!(
+                                                            account = %seat,
+                                                            error = %e,
+                                                            "anthropic failover candidate resolution failed; not switching"
+                                                        )
+                                                    }
                                                 }
                                             }
-                                            Err(reason) => tracing::info!(
-                                                account = %seat,
-                                                reason,
-                                                "anthropic window exhausted; account failover not permitted"
-                                            ),
+                                            Err(refusal) => {
+                                                no_hop = NoHop::from_refusal(refusal);
+                                                tracing::info!(
+                                                    account = %seat,
+                                                    reason = refusal.label(),
+                                                    "anthropic window exhausted; account failover not permitted"
+                                                )
+                                            }
                                         }
                                     }
+                                    // Every line about this limit comes from one place.
+                                    let text = LimitText {
+                                        label: &label,
+                                        evidence: &evidence,
+                                        now_ms,
+                                    };
                                     if let Some(next) = hop {
                                         let next_label = next.credential.account.label_str().to_string();
                                         tracing::warn!(
                                             from = %label,
                                             to = %next_label,
-                                            "anthropic window exhausted; switching account (one-time failover, no output replayed)"
+                                            hop = anthropic_failovers + 1,
+                                            "anthropic window exhausted; switching account (no output replayed)"
                                         );
                                         if let Some(t) = tracer.as_mut() {
                                             t.attempt_failed(
@@ -1830,12 +1995,12 @@ impl ApiMethods {
                                                 "account_failover",
                                             );
                                         }
-                                        // The ONE sanctioned mid-turn re-pin: bind the
-                                        // new seat exactly as the refresh path does, then
-                                        // rebuild the header from it (same as the 401
-                                        // path). The failed seat's token is still valid —
-                                        // only its capacity is spent — so no cache
-                                        // invalidation is needed.
+                                        // The sanctioned mid-turn re-pin (one per hop):
+                                        // bind the new seat exactly as the refresh path
+                                        // does, then rebuild the header from it (same as
+                                        // the 401 path). The failed seat's token is still
+                                        // valid — only its capacity is spent — so no
+                                        // cache invalidation is needed.
                                         await_or_cancel(
                                             cancel,
                                             super::auth::AuthMethods::bind_pinned(
@@ -1854,36 +2019,29 @@ impl ApiMethods {
                                         auth_header_value = v;
                                         auth_binding = binding;
                                         anthropic_failovers += 1;
-                                        let _ = tx.send(StreamEvent::Session(SessionEvent::Notice(format!(
-                                            "⚠ {label} exhausted until {until} — switching to {next_label}"
-                                        ))));
+                                        let _ = tx.send(StreamEvent::Session(SessionEvent::Notice(
+                                            text.hop(&next_label),
+                                        )));
                                         // Retry immediately on the new seat WITHOUT
                                         // consuming a 429 retry slot.
                                         continue;
                                     }
-                                    // No hop. Say why the wait is what it is, then either
-                                    // end the turn now (a reset hours away must not burn
-                                    // the whole 429 budget a minute at a time) or keep
-                                    // the existing retry path for short/unknown resets.
-                                    let notice = if auto {
-                                        format!("⚠ {label} exhausted until {until}; next turn will use another account")
-                                    } else {
-                                        format!("⚠ account limit reached until {until}")
-                                    };
-                                    let _ = tx.send(StreamEvent::Session(SessionEvent::Notice(notice)));
+                                    // No hop. Say why, then either end the turn now
+                                    // (a reset hours away must not burn the whole 429
+                                    // budget a minute at a time) or keep the existing
+                                    // retry path for short/unknown resets. No text
+                                    // claims another account will serve.
+                                    if !keepwarm_ping {
+                                        let _ = tx.send(StreamEvent::Session(SessionEvent::Notice(
+                                            text.no_hop(no_hop),
+                                        )));
+                                    }
                                     if evidence.reset_is_long(now_ms) {
                                         if let Some(t) = tracer.take() {
                                             let terminal = t.failed_terminal("quota_exhausted");
                                             t.finish(clock, Some(429), trace_rid, None, None, terminal);
                                         }
-                                        let advice = if auto {
-                                            "The next turn will select another account."
-                                        } else {
-                                            "Wait for the reset, or switch accounts with `synaps auth use --provider anthropic --account <label|auto>`."
-                                        };
-                                        return Err(RuntimeError::ApiStatus(format!(
-                                            "Anthropic usage limit reached on account '{label}' — window resets at {until}. {advice}"
-                                        )));
+                                        return Err(RuntimeError::ApiStatus(text.terminal(no_hop)));
                                     }
                                 }
                             }
@@ -1909,7 +2067,16 @@ impl ApiMethods {
                                 if let Some(d) = diagnostics.take() {
                                     match super::cache_diagnosis::strip_diagnostics(&body_bytes, &d)
                                     {
-                                        Some(stripped) => body_bytes = stripped.into(),
+                                        Some(stripped) => {
+                                            body_bytes = stripped.into();
+                                            wire = await_or_cancel(
+                                                cancel,
+                                                options
+                                                    .request_compression
+                                                    .encode(&anthropic_url, &body_bytes),
+                                            )
+                                            .await?;
+                                        }
                                         // Unreachable by construction (the
                                         // field serializes first); keep the
                                         // normal error path rather than resend
@@ -1930,6 +2097,31 @@ impl ApiMethods {
                                     }
                                     continue;
                                 }
+                            }
+
+                            // ═══ GZIP REFUSAL fail-soft (request_encoding) ═══
+                            // A 400/415 to a gzip body: resend it once
+                            // uncompressed, costing no retry budget. The
+                            // resend's outcome decides whether gzip latches
+                            // off (`settle` above), so a genuine 400 just
+                            // fails again below and leaves gzip on.
+                            if let Some(resend) = options.request_compression.resend_uncompressed(
+                                &wire,
+                                &body_bytes,
+                                status.as_u16(),
+                            ) {
+                                wire = resend;
+                                if let Some(t) = tracer.as_mut() {
+                                    t.attempt_failed(
+                                        clock,
+                                        crate::runtime::trace::RetryClass::Other,
+                                        Duration::ZERO,
+                                        Some(status.as_u16()),
+                                        trace_rid,
+                                        "gzip_refused",
+                                    );
+                                }
+                                continue;
                             }
 
                             // Decide whether we've exhausted retries for this error class.
@@ -2024,6 +2216,7 @@ impl ApiMethods {
                             }
                         }
                         Err(e) => {
+                            options.request_compression.settle(&mut wire, false);
                             if let Some(keepwarm) = &options.keepwarm {
                                 if matches!(&e, RuntimeError::Api(error) if error.is_connect()) {
                                     keepwarm
@@ -2126,7 +2319,7 @@ impl ApiMethods {
                 suppress_stream_deltas: options.suppress_stream_deltas,
                 telemetry_level,
                 request_start,
-                cache_ttl: options.cache_ttl,
+                cache_ttl,
                 ttl_downgrade_notified: options.ttl_downgrade_notified.clone(),
                 saw_1h_honored: options.saw_1h_honored.clone(),
                 request_has_1h_marker,
@@ -2267,7 +2460,7 @@ impl ApiMethods {
 
                 let system_bytes = system_prompt.as_ref().map(|s| s.len()).unwrap_or(0);
 
-                let record = telemetry::TelemetryRecord {
+                let mut record = telemetry::TelemetryRecord {
                     ts: telemetry::TelemetryRecord::now_ms(),
                     request_id: telem_request_id,
                     msg_id: state.telem_msg_id,
@@ -2278,9 +2471,13 @@ impl ApiMethods {
                     } else {
                         None
                     },
-                    ttft_ms: state.telem_ttft,
-                    total_ms: request_start.elapsed().as_millis() as u64,
+                    // Both from the attempt clock: measured from send start,
+                    // like the trace timings. Measuring from `request_start`
+                    // (taken once headers arrive) read 0 ms for TTFT.
+                    ttft_ms: clock.first_model_event_ms(),
+                    total_ms: clock.stream_end_or_now_ms(),
                     stop_reason: state.telem_stop_reason,
+                    cost_usd: state.telem_usage.cost_usd(model),
                     usage: state.telem_usage,
                     ratelimit: telem_ratelimit,
                     cache_diag: server_diagnosis.map(|d| telemetry::CacheDiagRecord {
@@ -2296,7 +2493,14 @@ impl ApiMethods {
                     keepwarm: options.keepwarm.is_some(),
                     worker: options.codex_request_role
                         == crate::runtime::openai::catalog::CodexRequestRole::Worker,
+                    rollover_window: options.context_rollover.map(|r| r.window),
+                    rollover: options.context_rollover.is_some_and(|r| r.first_request),
+                    ..Default::default()
                 };
+                record.set_correlation(
+                    options.trace.session_id(),
+                    tracer.as_ref().map(|t| t.correlation_ids()),
+                );
                 // Non-blocking enqueue onto the session's bounded writer
                 // (Task 11): overflow or a broken log path is counted by
                 // the writer and can never delay or fail the request.
@@ -2891,6 +3095,8 @@ mod tests {
         ));
     }
 
+    /// A block with neither text nor signature is never emitted: Anthropic
+    /// rejects it next turn ("each thinking block must contain thinking").
     #[test]
     fn empty_thinking_block_never_emitted() {
         let (mut state, tx, _rx) = harness();
@@ -2898,9 +3104,7 @@ mod tests {
         feed(
             &[
                 r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#,
-                // Only a signature delta — no thinking text. Anthropic rejects
-                // empty thinking blocks; the guard must suppress the push.
-                r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig_only"}}"#,
+                r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":""}}"#,
                 r#"data: {"type":"content_block_stop","index":0}"#,
             ],
             &mut state,
@@ -2908,6 +3112,56 @@ mod tests {
         );
         assert!(state.accumulated_content.is_empty());
         assert!(!state.in_thinking);
+    }
+
+    /// `display: "omitted"`: the block streams one empty `thinking_delta`
+    /// and its signature. It goes into the history as the API sent it —
+    /// empty text, the signature carrying the reasoning — ahead of the text,
+    /// and the empty delta still reaches the client (the TUI's cue that a
+    /// thought happened). The end-of-stream flush keeps one cut off before
+    /// its stop the same way.
+    #[test]
+    fn omitted_thinking_block_round_trips_with_its_signature() {
+        let (mut state, tx, mut rx) = harness();
+        let ctx = make_ctx(&tx);
+        feed(
+            &[
+                r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}"#,
+                r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":""}}"#,
+                r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig_only"}}"#,
+                r#"data: {"type":"content_block_stop","index":0}"#,
+                r#"data: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}"#,
+                r#"data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"hi"}}"#,
+                r#"data: {"type":"content_block_stop","index":1}"#,
+            ],
+            &mut state,
+            &ctx,
+        );
+        assert_eq!(
+            state.accumulated_content,
+            vec![
+                json!({"type":"thinking","thinking":"","signature":"sig_only"}),
+                json!({"type":"text","text":"hi"}),
+            ]
+        );
+        let events = drain(&mut rx);
+        assert!(matches!(&events[0], StreamEvent::Llm(LlmEvent::Thinking(t)) if t.is_empty()));
+
+        let (mut state, tx, _rx) = harness();
+        let ctx = make_ctx(&tx);
+        feed(
+            &[
+                r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#,
+                r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig_cut"}}"#,
+            ],
+            &mut state,
+            &ctx,
+        );
+        state.finalize();
+        assert_eq!(
+            state.accumulated_content,
+            vec![json!({"type":"thinking","thinking":"","signature":"sig_cut"})]
+        );
     }
 
     #[test]
@@ -3219,13 +3473,13 @@ mod tests {
     fn ttft_set_once_on_first_event() {
         let (mut state, tx, _rx) = harness();
         let ctx = make_ctx(&tx);
-        assert!(state.telem_ttft.is_none());
+        assert!(state.first_event_elapsed_ms.is_none());
         feed(
             &[r#"data: {"type":"message_start","message":{"id":"msg_1"}}"#],
             &mut state,
             &ctx,
         );
-        let first = state.telem_ttft;
+        let first = state.first_event_elapsed_ms;
         assert!(first.is_some());
         assert!(state.first_event_seen);
         std::thread::sleep(std::time::Duration::from_millis(5));
@@ -3237,7 +3491,7 @@ mod tests {
             &ctx,
         );
         assert_eq!(
-            state.telem_ttft, first,
+            state.first_event_elapsed_ms, first,
             "TTFT must not be overwritten by later events"
         );
     }
@@ -5111,6 +5365,8 @@ mod anthropic_failover_tests {
         base_url: String,
         /// `authorization` header of every call, in order.
         auth_seen: Arc<Mutex<Vec<String>>>,
+        /// Request body of every call, in order.
+        bodies: Arc<Mutex<Vec<String>>>,
     }
 
     impl MockUpstream {
@@ -5120,18 +5376,25 @@ mod anthropic_failover_tests {
         fn auth_seen(&self) -> Vec<String> {
             self.auth_seen.lock().unwrap().clone()
         }
+        fn bodies(&self) -> Vec<String> {
+            self.bodies.lock().unwrap().clone()
+        }
     }
 
     async fn spawn_upstream(script: Vec<Reply>) -> MockUpstream {
         let script = Arc::new(Mutex::new(script.into_iter()));
         let auth_seen = Arc::new(Mutex::new(Vec::new()));
+        let bodies = Arc::new(Mutex::new(Vec::new()));
         let seen = Arc::clone(&auth_seen);
+        let bodies_seen = Arc::clone(&bodies);
         let app = Router::new().route(
             "/v1/messages",
-            axum_post(move |headers: HeaderMap| {
+            axum_post(move |headers: HeaderMap, body: String| {
                 let script = Arc::clone(&script);
                 let seen = Arc::clone(&seen);
+                let bodies_seen = Arc::clone(&bodies_seen);
                 async move {
+                    bodies_seen.lock().unwrap().push(body);
                     seen.lock().unwrap().push(
                         headers
                             .get("authorization")
@@ -5195,6 +5458,7 @@ mod anthropic_failover_tests {
         MockUpstream {
             base_url: format!("http://{addr}"),
             auth_seen,
+            bodies,
         }
     }
 
@@ -5212,29 +5476,39 @@ mod anthropic_failover_tests {
         }
     }
 
-    /// Scripted router: fixed selector mode, fixed failover answer, records
-    /// every report and failover request.
+    /// Scripted router: fixed selector mode, scripted failover answers (one
+    /// per lookup; the last one repeats), records every report and every
+    /// lookup with the accounts it was told to avoid.
     struct ScriptedRouter {
         auto: bool,
-        answer: Result<Option<PinnedToken>, String>,
+        answers: Mutex<Vec<Result<Option<PinnedToken>, String>>>,
         reports: Mutex<Vec<(CredentialRef, AnthropicQuotaEvidence)>>,
-        failovers: Mutex<Vec<(String, CredentialRef)>>,
+        failovers: Mutex<Vec<(String, Vec<CredentialRef>)>>,
+        served: Mutex<Vec<CredentialRef>>,
     }
 
     impl ScriptedRouter {
         fn new(auto: bool, answer: Result<Option<PinnedToken>, String>) -> Self {
+            Self::scripted(auto, vec![answer])
+        }
+        fn scripted(auto: bool, answers: Vec<Result<Option<PinnedToken>, String>>) -> Self {
+            assert!(!answers.is_empty(), "a router needs at least one answer");
             Self {
                 auto,
-                answer,
+                answers: Mutex::new(answers),
                 reports: Mutex::new(Vec::new()),
                 failovers: Mutex::new(Vec::new()),
+                served: Mutex::new(Vec::new()),
             }
         }
         fn reports(&self) -> Vec<(CredentialRef, AnthropicQuotaEvidence)> {
             self.reports.lock().unwrap().clone()
         }
-        fn failovers(&self) -> Vec<(String, CredentialRef)> {
+        fn failovers(&self) -> Vec<(String, Vec<CredentialRef>)> {
             self.failovers.lock().unwrap().clone()
+        }
+        fn served(&self) -> Vec<CredentialRef> {
+            self.served.lock().unwrap().clone()
         }
     }
 
@@ -5253,16 +5527,24 @@ mod anthropic_failover_tests {
                 .unwrap()
                 .push((failed.clone(), *evidence));
         }
+        async fn report_served(&self, seat: &CredentialRef, _sent_at_ms: u64) {
+            self.served.lock().unwrap().push(seat.clone());
+        }
         async fn failover(
             &self,
             model: &str,
-            failed: &CredentialRef,
+            attempted: &[CredentialRef],
         ) -> Result<Option<PinnedToken>, String> {
             self.failovers
                 .lock()
                 .unwrap()
-                .push((model.to_string(), failed.clone()));
-            self.answer.clone()
+                .push((model.to_string(), attempted.to_vec()));
+            let mut answers = self.answers.lock().unwrap();
+            if answers.len() > 1 {
+                answers.remove(0)
+            } else {
+                answers[0].clone()
+            }
         }
     }
 
@@ -5292,11 +5574,22 @@ mod anthropic_failover_tests {
         router: &ScriptedRouter,
         max_retries: u32,
     ) -> Outcome {
+        drive_with(upstream, auth, router, max_retries, ApiOptions::default()).await
+    }
+
+    /// [`drive`] with `base` options (any router, e.g. the real broker's).
+    async fn drive_with(
+        upstream: &MockUpstream,
+        auth: Arc<RwLock<AuthState>>,
+        router: &dyn AnthropicAccountRouter,
+        max_retries: u32,
+        base: ApiOptions,
+    ) -> Outcome {
         let options = ApiOptions {
             anthropic_base_url: Some(upstream.base_url.clone()),
             credential_source: CredentialSource::Local,
             token_cache: TokenCache::new(),
-            ..Default::default()
+            ..base
         };
         let client = Client::new();
         let tools = ToolRegistry::new();
@@ -5335,10 +5628,366 @@ mod anthropic_failover_tests {
         Outcome { result, notices, retries }
     }
 
+    /// The request after the partial stream starts no output of its own,
+    /// but output already streamed on this request: a limit on it can't
+    /// switch accounts and the ordinary retry runs. The reset is short (the
+    /// retry is not given up) but outlives the test: a cooldown that is
+    /// gone was cleared, not expired.
+    fn short_limit_after_output() -> Vec<Reply> {
+        vec![
+            Reply::SsePartialThenOverloaded,
+            Reply::Rejected429 { reset_in_secs: 120 },
+            Reply::SseOk,
+        ]
+    }
+
+    /// Review fix 1: a short limit the ordinary retry outlives. The
+    /// account that then serves is reported served, once, so its cooldown
+    /// goes; nothing else is.
+    #[tokio::test]
+    #[serial_test::serial(anthropic_429_log_capture)]
+    async fn an_account_that_serves_after_its_limit_is_reported_served() {
+        let upstream = spawn_upstream(short_limit_after_output()).await;
+        let router = ScriptedRouter::new(true, Ok(Some(pinned("claude2"))));
+        let auth = oauth_auth_pinned_to("claude4");
+        let out = drive(&upstream, Arc::clone(&auth), &router, 3).await;
+        out.result.expect("the retry succeeds on the same account");
+        assert_eq!(upstream.calls(), 3);
+        assert_eq!(router.reports().len(), 1);
+        assert!(router.failovers().is_empty(), "output streamed: no lookup");
+        assert_eq!(router.served(), vec![seat("claude4")]);
+        assert_eq!(auth.read().await.auth_token, "tok-claude4");
+
+        // A request that met no limit reports nothing.
+        let upstream = spawn_upstream(vec![Reply::SseOk]).await;
+        let router = ScriptedRouter::new(true, Ok(None));
+        drive(&upstream, Arc::clone(&auth), &router, 0)
+            .await
+            .result
+            .expect("ok");
+        assert!(router.served().is_empty());
+    }
+
+    /// Review fix 2: a keep-warm ping that meets a recognised limit reports
+    /// the cooldown but never looks up, switches or re-binds an account and
+    /// sends no notice to the session.
+    #[tokio::test]
+    #[serial_test::serial(anthropic_429_log_capture)]
+    async fn a_keepwarm_ping_at_a_limit_never_switches_accounts() {
+        let upstream = spawn_upstream(vec![Reply::Rejected429 { reset_in_secs: 3 * 3600 }]).await;
+        let router = ScriptedRouter::new(true, Ok(Some(pinned("claude2"))));
+        let auth = oauth_auth_pinned_to("claude4");
+        let ping = ApiOptions {
+            keepwarm: Some(super::KeepWarmRequest {
+                mode: super::KeepWarmMode::Replay,
+                status: Default::default(),
+                sent: Default::default(),
+                connect_failed: Default::default(),
+            }),
+            ..Default::default()
+        };
+        let out = drive_with(&upstream, Arc::clone(&auth), &router, 2, ping).await;
+        out.result.expect_err("the ping fails on its own account");
+        assert_eq!(upstream.calls(), 1, "no request on another account");
+        assert_eq!(router.reports().len(), 1, "the cooldown is still reported");
+        assert!(router.failovers().is_empty(), "no account lookup");
+        assert!(out.notices.is_empty(), "no notice from a ping: {:?}", out.notices);
+        assert_eq!(auth.read().await.auth_token, "tok-claude4");
+        assert_eq!(
+            auth.read().await.bound_credential.as_deref(),
+            Some(anthropic_binding(&CredentialSource::Local, &seat("claude4")).as_str())
+        );
+    }
+
+    /// End to end through the real `LocalBroker` (auth.json, usage reads,
+    /// cooldown memory): two automatic accounts with room, a bound to the
+    /// turn.
+    mod local_broker {
+        use super::*;
+        use crate::auth::{AccountPolicy, AccountSelector, CredentialBroker, LocalBroker};
+        use crate::runtime::anthropic_quota::BrokerAnthropicRouter;
+        use crate::runtime::auth::{AuthMethods, RefreshPoint};
+
+        fn store(home: &std::path::Path, labels: &[&str]) {
+            let mut root = serde_json::Map::new();
+            for label in labels {
+                root.insert(
+                    format!("anthropic@{label}"),
+                    json!({
+                        "type": "oauth",
+                        "access": format!("tok-{label}"),
+                        "refresh": format!("refresh-{label}"),
+                        "expires": 4_102_444_800_000u64,
+                    }),
+                );
+            }
+            std::fs::write(home.join("auth.json"), serde_json::Value::Object(root).to_string())
+                .unwrap();
+        }
+
+        /// Usage endpoint: room in every window for every account.
+        async fn spawn_usage() -> String {
+            let reset = "2099-01-01T00:00:00Z";
+            let app = Router::new().route(
+                "/usage",
+                axum::routing::get(move || async move {
+                    axum::Json(json!({
+                        "five_hour": {"utilization": 10.0, "resets_at": reset},
+                        "seven_day": {"utilization": 10.0, "resets_at": reset}
+                    }))
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            format!("http://{addr}/usage")
+        }
+
+        async fn auto_broker(home: &std::path::Path, labels: &[&str]) -> Arc<LocalBroker> {
+            store(home, labels);
+            Arc::new(
+                LocalBroker::new(Client::new())
+                    .with_account_policy(
+                        AccountPolicy::new().with(OAuthProviderId::Anthropic, AccountSelector::Auto),
+                    )
+                    .with_usage_endpoint_override(spawn_usage().await),
+            )
+        }
+
+        fn bound_to(auth: &Arc<RwLock<AuthState>>) -> Option<String> {
+            auth.try_read().unwrap().bound_credential.clone()
+        }
+
+        /// The next round's refresh, mid-turn.
+        async fn next_round(auth: &Arc<RwLock<AuthState>>, broker: &LocalBroker) {
+            AuthMethods::refresh_with_broker(
+                Arc::clone(auth),
+                &CredentialSource::Local,
+                broker,
+                Some("claude-haiku-4-5"),
+                RefreshPoint::WithinTurn,
+            )
+            .await
+            .expect("the next round has an account");
+        }
+
+        /// Review fix 1: a short limit on a, the ordinary retry succeeds on
+        /// a, and the next round keeps a (its cache) with a's cooldown gone:
+        /// with one account and with two (no needless switch to b).
+        #[tokio::test]
+        #[serial_test::serial(synaps_base_dir, anthropic_429_log_capture)]
+        async fn an_account_that_serves_after_a_short_limit_keeps_the_turn() {
+            for labels in [&["a"][..], &["a", "b"][..]] {
+                let base = crate::test_env::BaseDirGuard::new();
+                let broker = auto_broker(base.path(), labels).await;
+                let router = BrokerAnthropicRouter::new(broker.clone());
+                let upstream = spawn_upstream(short_limit_after_output()).await;
+                let auth = oauth_auth_pinned_to("a");
+                let out =
+                    drive_with(&upstream, Arc::clone(&auth), &router, 3, ApiOptions::default())
+                        .await;
+                out.result.expect("the retry succeeds on a");
+                assert_eq!(upstream.calls(), 3, "{labels:?}");
+                assert_eq!(
+                    broker.active_cooldown(&seat("a")),
+                    None,
+                    "{labels:?}: a served after its limit was reported"
+                );
+                next_round(&auth, &broker).await;
+                assert_eq!(
+                    bound_to(&auth).as_deref(),
+                    Some(anthropic_binding(&CredentialSource::Local, &seat("a")).as_str()),
+                    "{labels:?}: the turn stays on a"
+                );
+            }
+        }
+
+        /// Review fix 1 (belt and braces): a is cooling down and is the only
+        /// account. Mid-turn the round keeps a instead of failing the turn
+        /// with `all_cooling_down` after its tools ran.
+        #[tokio::test]
+        #[serial_test::serial(synaps_base_dir, anthropic_429_log_capture)]
+        async fn the_only_account_cooling_mid_turn_keeps_the_turn() {
+            let base = crate::test_env::BaseDirGuard::new();
+            let broker = auto_broker(base.path(), &["a"]).await;
+            let until = crate::epoch_millis() + 3_600_000;
+            broker
+                .report_cooldown(&seat("a"), Some(until), "anthropic_quota_exhausted")
+                .await
+                .unwrap();
+            let auth = oauth_auth_pinned_to("a");
+            auth.try_write().unwrap().auth_token = "stale".into();
+            next_round(&auth, &broker).await;
+            let g = auth.try_read().unwrap();
+            assert_eq!(g.auth_token, "tok-a", "a is re-vended");
+            assert_eq!(
+                g.bound_credential.as_deref(),
+                Some(anthropic_binding(&CredentialSource::Local, &seat("a")).as_str())
+            );
+        }
+
+        /// Review fix 4: mid-turn, the re-vend of the pinned seat honours a
+        /// refused refresh's hold, like the automatic choice's own vend. a's
+        /// token is stale and its refresh is refused (once, held); the turn
+        /// moves to b, and a later round asks the token endpoint nothing.
+        #[tokio::test]
+        #[serial_test::serial(synaps_base_dir, anthropic_429_log_capture)]
+        async fn a_held_refusal_is_honoured_by_the_mid_turn_revend() {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            let base = crate::test_env::BaseDirGuard::new();
+            store(base.path(), &["a", "b"]);
+            // a's token expired in 1970: any use refreshes first.
+            let path = base.path().join("auth.json");
+            let mut root: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            root["anthropic@a"]["expires"] = json!(1_000u64);
+            std::fs::write(&path, root.to_string()).unwrap();
+            let hits = Arc::new(AtomicUsize::new(0));
+            let counter = hits.clone();
+            let app = Router::new().route(
+                "/v1/oauth/token",
+                axum_post(move || {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        (
+                            StatusCode::BAD_REQUEST,
+                            [("content-type", "application/json")],
+                            r#"{"error":"invalid_grant"}"#,
+                        )
+                            .into_response()
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let broker = LocalBroker::new(Client::new())
+                .with_account_policy(
+                    AccountPolicy::new().with(OAuthProviderId::Anthropic, AccountSelector::Auto),
+                )
+                .with_usage_endpoint_override(spawn_usage().await)
+                .with_anthropic_token_url_for_tests(format!("http://{addr}/v1/oauth/token"));
+            let b = anthropic_binding(&CredentialSource::Local, &seat("b"));
+            for round in 0..2 {
+                let auth = oauth_auth_pinned_to("a");
+                auth.try_write().unwrap().token_expires = Some(1);
+                next_round(&auth, &broker).await;
+                assert_eq!(bound_to(&auth).as_deref(), Some(b.as_str()), "round {round}");
+                assert_eq!(hits.load(Ordering::SeqCst), 1, "round {round}: one refused refresh");
+            }
+        }
+
+        /// The PR's mid-turn re-selection through the real broker: a is
+        /// cooling down (another session met its limit) and b has room, so
+        /// the next round moves to b.
+        #[tokio::test]
+        #[serial_test::serial(synaps_base_dir, anthropic_429_log_capture)]
+        async fn a_cooling_account_mid_turn_moves_the_turn_to_one_with_room() {
+            let base = crate::test_env::BaseDirGuard::new();
+            let broker = auto_broker(base.path(), &["a", "b"]).await;
+            let until = crate::epoch_millis() + 3_600_000;
+            broker
+                .report_cooldown(&seat("a"), Some(until), "anthropic_quota_exhausted")
+                .await
+                .unwrap();
+            let auth = oauth_auth_pinned_to("a");
+            next_round(&auth, &broker).await;
+            let g = auth.try_read().unwrap();
+            assert_eq!(g.auth_token, "tok-b");
+            assert_eq!(
+                g.bound_credential.as_deref(),
+                Some(anthropic_binding(&CredentialSource::Local, &seat("b")).as_str())
+            );
+        }
+    }
+
     fn assert_no_body_leak(text: &str, ctx: &str) {
         assert!(
             !text.contains(BODY_SENTINEL),
             "{ctx}: 429 body leaked: {text}"
+        );
+    }
+
+    /// Every `cache_control` value in a request body, in document order.
+    fn cache_markers(v: &serde_json::Value) -> Vec<serde_json::Value> {
+        match v {
+            serde_json::Value::Object(map) => map
+                .iter()
+                .flat_map(|(k, v)| {
+                    if k == "cache_control" {
+                        vec![v.clone()]
+                    } else {
+                        cache_markers(v)
+                    }
+                })
+                .collect(),
+            serde_json::Value::Array(items) => items.iter().flat_map(cache_markers).collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// `cache_ttl = auto` (the `ApiOptions` default) resolves from the
+    /// credential KIND only. An account failover between two subscription
+    /// seats keeps the hop's retry and the next request on the same 1h
+    /// markers (a flip would rewrite the cache); only an actual change of
+    /// kind, here to an API key, changes the TTL.
+    #[tokio::test]
+    #[serial_test::serial(anthropic_429_log_capture)]
+    async fn auto_cache_ttl_is_stable_across_account_failover() {
+        let upstream = spawn_upstream(vec![
+            Reply::Rejected429 { reset_in_secs: 3 * 3600 },
+            Reply::SseOk, // the same request, retried on seat 2
+            Reply::SseOk, // the next request, still on seat 2
+            Reply::SseOk, // a request on an API key
+        ])
+        .await;
+        let router = ScriptedRouter::new(true, Ok(Some(pinned("claude2"))));
+        let auth = oauth_auth_pinned_to("claude4");
+        assert_eq!(
+            ApiOptions::default().cache_ttl,
+            crate::core::config::CacheTtlSetting::Auto
+        );
+
+        let hop = drive(&upstream, Arc::clone(&auth), &router, 0).await;
+        hop.result.expect("the hop succeeds on seat 2");
+        let next = drive(&upstream, Arc::clone(&auth), &router, 0).await;
+        next.result.expect("the next request stays on seat 2");
+        assert_eq!(
+            upstream.auth_seen(),
+            ["Bearer tok-claude4", "Bearer tok-claude2", "Bearer tok-claude2"],
+            "control: the failover really switched seats"
+        );
+        {
+            let mut g = auth.write().await;
+            g.auth_type = "api_key".to_string();
+            g.auth_token = "sk-test".to_string();
+            g.bound_credential = None;
+        }
+        let key = drive(&upstream, Arc::clone(&auth), &router, 0).await;
+        key.result.expect("the API-key request succeeds");
+
+        let bodies = upstream.bodies();
+        assert_eq!(bodies.len(), 4);
+        assert_eq!(
+            bodies[0], bodies[1],
+            "the failover retry re-sends the identical body (same 1h markers)"
+        );
+        let markers: Vec<_> = bodies
+            .iter()
+            .map(|b| cache_markers(&serde_json::from_str(b).unwrap()))
+            .collect();
+        for (i, m) in markers[..3].iter().enumerate() {
+            assert!(!m.is_empty(), "request {i} has no markers");
+            assert!(
+                m.iter().all(|m| m["ttl"] == "1h"),
+                "request {i} on a subscription seat: {m:?}"
+            );
+        }
+        assert!(!markers[3].is_empty());
+        assert!(
+            markers[3].iter().all(|m| m.get("ttl").is_none()),
+            "a change of kind (API key) resolves auto to the bare 5m marker: {:?}",
+            markers[3]
         );
     }
 
@@ -5369,10 +6018,10 @@ mod anthropic_failover_tests {
             AnthropicQuotaSignal::UnifiedStatusRejected
         );
         assert!(reports[0].1.resets_at_ms.is_some());
-        // One failover request, for the bare model id, naming the failed seat.
+        // One failover request, for the bare model id, told the failed seat.
         assert_eq!(
             router.failovers(),
-            vec![("claude-haiku-4-5".to_string(), seat("claude4"))]
+            vec![("claude-haiku-4-5".to_string(), vec![seat("claude4")])]
         );
         // The turn is now pinned to the new seat (mid-turn rounds keep it).
         let g = auth.read().await;
@@ -5384,7 +6033,7 @@ mod anthropic_failover_tests {
         assert!(
             out.notices
                 .iter()
-                .any(|n| n.starts_with("⚠ claude4 exhausted until ")
+                .any(|n| n.starts_with("⚠ claude4 is at a usage limit until ")
                     && n.ends_with(" — switching to claude2")),
             "notices: {:?}",
             out.notices
@@ -5415,7 +6064,15 @@ mod anthropic_failover_tests {
             msg.contains("usage limit reached on account 'claude4'"),
             "{msg}"
         );
-        assert!(msg.contains("next turn will select another account"), "{msg}");
+        // True text: nothing claims another account will serve.
+        assert!(
+            msg.contains(
+                "Output had already streamed, so this request could not switch accounts; \
+                 send again to select an account for the next turn."
+            ),
+            "{msg}"
+        );
+        assert!(!msg.contains("will select another account"), "{msg}");
         assert_no_body_leak(&msg, "error");
         assert_eq!(upstream.calls(), 2, "no third call on another seat");
         assert_eq!(router.reports().len(), 1, "cooldown still reported");
@@ -5423,16 +6080,25 @@ mod anthropic_failover_tests {
         assert!(router.failovers().is_empty(), "gate must veto the lookup");
         // Seat unchanged.
         assert_eq!(auth.read().await.auth_token, "tok-claude4");
-        assert!(out
-            .notices
-            .iter()
-            .any(|n| n.starts_with("⚠ claude4 exhausted until ")
-                && n.ends_with("; next turn will use another account")));
+        assert!(
+            out.notices
+                .iter()
+                .any(|n| n.starts_with("⚠ claude4 is at a usage limit until ")
+                    && n.ends_with(
+                        "; output already streamed, so this request can't switch accounts"
+                    )),
+            "{:?}",
+            out.notices
+        );
     }
 
+    /// Each account at most once per logical request: after claude4 and then
+    /// claude2 are exhausted, the second lookup (told both) names claude2
+    /// again. That is refused, and the turn ends saying no other account has
+    /// proven capacity, not that the next turn will find one.
     #[tokio::test]
     #[serial_test::serial(anthropic_429_log_capture)]
-    async fn two_rejected_429s_hop_once_then_end_the_turn() {
+    async fn two_exhausted_accounts_and_no_other_end_the_turn_saying_so() {
         let upstream = spawn_upstream(vec![
             Reply::Rejected429 { reset_in_secs: 3 * 3600 },
             Reply::Rejected429 { reset_in_secs: 5 * 3600 },
@@ -5445,15 +6111,226 @@ mod anthropic_failover_tests {
 
         let msg = out.result.expect_err("second exhaustion is terminal").to_string();
         assert!(msg.contains("account 'claude2'"), "{msg}");
+        assert!(
+            msg.contains(
+                "No other account has proven capacity now; \
+                 `synaps auth state --provider anthropic` shows each account's state."
+            ),
+            "{msg}"
+        );
+        assert!(!msg.contains("will select another account"), "{msg}");
         assert_eq!(upstream.calls(), 2);
         assert_eq!(
             upstream.auth_seen(),
             vec!["Bearer tok-claude4".to_string(), "Bearer tok-claude2".to_string()]
         );
-        // Both seats were reported; only one hop was attempted.
         let reported: Vec<CredentialRef> = router.reports().into_iter().map(|r| r.0).collect();
         assert_eq!(reported, vec![seat("claude4"), seat("claude2")]);
-        assert_eq!(router.failovers().len(), 1);
+        assert_eq!(
+            router.failovers(),
+            vec![
+                ("claude-haiku-4-5".to_string(), vec![seat("claude4")]),
+                (
+                    "claude-haiku-4-5".to_string(),
+                    vec![seat("claude4"), seat("claude2")]
+                ),
+            ],
+            "a second lookup, told every account this request used"
+        );
+        assert!(
+            out.notices
+                .iter()
+                .any(|n| n.starts_with("⚠ claude2 is at a usage limit until ")
+                    && n.ends_with("; no other account has proven capacity now")),
+            "{:?}",
+            out.notices
+        );
+    }
+
+    /// Each account at most once per logical request, under the same
+    /// output/tool gates: claude4 and then claude5 are exhausted before any
+    /// output, and claude2 serves. Two hops, a notice for each, and each
+    /// lookup is told every account already tried.
+    #[tokio::test]
+    #[serial_test::serial(anthropic_429_log_capture)]
+    async fn pre_output_exhaustion_hops_through_each_account_once_until_one_serves() {
+        let upstream = spawn_upstream(vec![
+            Reply::Rejected429 {
+                reset_in_secs: 3 * 3600,
+            },
+            Reply::Rejected429 {
+                reset_in_secs: 5 * 3600,
+            },
+            Reply::SseOk,
+        ])
+        .await;
+        let router = ScriptedRouter::scripted(
+            true,
+            vec![Ok(Some(pinned("claude5"))), Ok(Some(pinned("claude2")))],
+        );
+        let auth = oauth_auth_pinned_to("claude4");
+
+        let out = drive(&upstream, Arc::clone(&auth), &router, 0).await;
+
+        let value = out.result.expect("claude2 serves the request");
+        assert_eq!(value["content"][0]["text"], "hi");
+        assert_eq!(
+            upstream.auth_seen(),
+            vec![
+                "Bearer tok-claude4".to_string(),
+                "Bearer tok-claude5".to_string(),
+                "Bearer tok-claude2".to_string()
+            ]
+        );
+        let reported: Vec<CredentialRef> = router.reports().into_iter().map(|r| r.0).collect();
+        assert_eq!(reported, vec![seat("claude4"), seat("claude5")]);
+        assert_eq!(
+            router.failovers(),
+            vec![
+                ("claude-haiku-4-5".to_string(), vec![seat("claude4")]),
+                (
+                    "claude-haiku-4-5".to_string(),
+                    vec![seat("claude4"), seat("claude5")]
+                ),
+            ]
+        );
+        assert_eq!(auth.read().await.auth_token, "tok-claude2");
+        for (from, to) in [("claude4", "claude5"), ("claude5", "claude2")] {
+            assert!(
+                out.notices
+                    .iter()
+                    .any(|n| n.starts_with(&format!("⚠ {from} is at a usage limit until "))
+                        && n.ends_with(&format!(" — switching to {to}"))),
+                "{from} -> {to}: {:?}",
+                out.notices
+            );
+        }
+    }
+
+    /// A lookup that names an account this request already used is refused:
+    /// no request goes back to it, and the turn ends on the account that was
+    /// exhausted last.
+    #[tokio::test]
+    #[serial_test::serial(anthropic_429_log_capture)]
+    async fn a_hop_never_returns_to_an_account_already_tried_on_this_request() {
+        let upstream = spawn_upstream(vec![
+            Reply::Rejected429 {
+                reset_in_secs: 3 * 3600,
+            },
+            Reply::Rejected429 {
+                reset_in_secs: 5 * 3600,
+            },
+            Reply::SseOk,
+        ])
+        .await;
+        let router = ScriptedRouter::scripted(
+            true,
+            vec![Ok(Some(pinned("claude5"))), Ok(Some(pinned("claude4")))],
+        );
+        let auth = oauth_auth_pinned_to("claude4");
+
+        let out = drive(&upstream, Arc::clone(&auth), &router, 0).await;
+
+        let msg = out
+            .result
+            .expect_err("claude4 was already tried; no other account")
+            .to_string();
+        assert!(msg.contains("account 'claude5'"), "{msg}");
+        assert!(
+            msg.contains("No other account has proven capacity now"),
+            "{msg}"
+        );
+        assert_eq!(upstream.calls(), 2, "never back to claude4");
+        assert_eq!(router.failovers().len(), 2);
+        assert_eq!(
+            router.failovers()[1].1,
+            vec![seat("claude4"), seat("claude5")]
+        );
+        assert_eq!(auth.read().await.auth_token, "tok-claude5");
+    }
+
+    /// A router that keeps naming accounts never tried before still stops:
+    /// the backstop bounds the hops of one request.
+    #[tokio::test]
+    #[serial_test::serial(anthropic_429_log_capture)]
+    async fn a_router_naming_new_accounts_forever_stops_at_the_hop_backstop() {
+        let max = crate::runtime::anthropic_quota::MAX_ANTHROPIC_ACCOUNT_FAILOVERS as usize;
+        let upstream = spawn_upstream(vec![
+            Reply::Rejected429 {
+                reset_in_secs: 3 * 3600
+            };
+            max + 1
+        ])
+        .await;
+        let answers = (0..max + 4)
+            .map(|i| Ok(Some(pinned(&format!("spare{i}")))))
+            .collect();
+        let router = ScriptedRouter::scripted(true, answers);
+        let auth = oauth_auth_pinned_to("claude4");
+
+        let out = drive(&upstream, Arc::clone(&auth), &router, 0).await;
+
+        let msg = out
+            .result
+            .expect_err("the backstop ends the turn")
+            .to_string();
+        assert!(
+            msg.contains(&format!(
+                "Stopped after {max} account switches on this request; \
+                 `synaps auth state --provider anthropic` shows each account's state."
+            )),
+            "{msg}"
+        );
+        assert_eq!(upstream.calls(), max + 1);
+        assert_eq!(router.failovers().len(), max);
+        assert!(
+            out.notices
+                .iter()
+                .any(|n| n.ends_with("; no more account switches on this request")),
+            "{:?}",
+            out.notices
+        );
+    }
+
+    /// The hop rules don't loosen the output gate: once this request has
+    /// streamed output, a later exhaustion reports the cooldown but never
+    /// switches accounts.
+    #[tokio::test]
+    #[serial_test::serial(anthropic_429_log_capture)]
+    async fn a_later_hop_is_refused_once_output_streamed_on_this_request() {
+        let upstream = spawn_upstream(vec![
+            Reply::Rejected429 {
+                reset_in_secs: 3 * 3600,
+            },
+            Reply::SsePartialThenOverloaded,
+            Reply::Rejected429 {
+                reset_in_secs: 3 * 3600,
+            },
+        ])
+        .await;
+        let router = ScriptedRouter::scripted(
+            true,
+            vec![Ok(Some(pinned("claude5"))), Ok(Some(pinned("claude2")))],
+        );
+        let auth = oauth_auth_pinned_to("claude4");
+
+        let out = drive(&upstream, Arc::clone(&auth), &router, 1).await;
+
+        let msg = out.result.expect_err("no hop after output").to_string();
+        assert!(
+            msg.contains("usage limit reached on account 'claude5'"),
+            "{msg}"
+        );
+        assert!(msg.contains("Output had already streamed"), "{msg}");
+        assert_eq!(upstream.calls(), 3, "no fourth call on claude2");
+        assert_eq!(
+            router.failovers().len(),
+            1,
+            "the gate vetoed the second lookup"
+        );
+        let reported: Vec<CredentialRef> = router.reports().into_iter().map(|r| r.0).collect();
+        assert_eq!(reported, vec![seat("claude4"), seat("claude5")]);
+        assert_eq!(auth.read().await.auth_token, "tok-claude5");
     }
 
     #[tokio::test]
@@ -5481,7 +6358,24 @@ mod anthropic_failover_tests {
     #[tokio::test]
     #[serial_test::serial(anthropic_429_log_capture)]
     async fn same_seat_back_or_no_candidate_never_loops() {
-        for answer in [Ok(None), Ok(Some(pinned("claude4"))), Err("broker down".to_string())] {
+        for (answer, advice, notice) in [
+            (
+                Ok(None),
+                "No other account has proven capacity now",
+                "; no other account has proven capacity now",
+            ),
+            (
+                Ok(Some(pinned("claude4"))),
+                "No other account has proven capacity now",
+                "; no other account has proven capacity now",
+            ),
+            (
+                Err("broker down".to_string()),
+                "Looking up another account failed; \
+                 `synaps auth state --provider anthropic` shows each account's state.",
+                "; looking up another account failed",
+            ),
+        ] {
             let upstream =
                 spawn_upstream(vec![Reply::Rejected429 { reset_in_secs: 3 * 3600 }]).await;
             let router = ScriptedRouter::new(true, answer);
@@ -5489,12 +6383,65 @@ mod anthropic_failover_tests {
 
             let out = drive(&upstream, Arc::clone(&auth), &router, 0).await;
 
-            assert!(out.result.is_err());
+            let msg = out.result.expect_err("no other account").to_string();
+            assert!(msg.contains(advice), "{msg}");
+            assert!(!msg.contains("will select another account"), "{msg}");
+            assert!(
+                out.notices.iter().any(|n| n.ends_with(notice)),
+                "{notice}: {:?}",
+                out.notices
+            );
             assert_eq!(upstream.calls(), 1, "no retry on the exhausted seat");
             assert_eq!(router.reports().len(), 1);
             assert_eq!(router.failovers().len(), 1);
             assert_eq!(auth.read().await.auth_token, "tok-claude4");
         }
+    }
+
+    /// A long wait on a 429 with no usage-limit header is not called a usage
+    /// limit: the notice and the error say it is a rate limit, and how we
+    /// know.
+    #[tokio::test]
+    #[serial_test::serial(anthropic_429_log_capture)]
+    async fn a_long_wait_without_a_usage_limit_header_is_called_a_rate_limit() {
+        let upstream = spawn_upstream(vec![Reply::Plain429 {
+            retry_after: 3 * 3600,
+        }])
+        .await;
+        let router = ScriptedRouter::new(true, Ok(None));
+        let auth = oauth_auth_pinned_to("claude4");
+
+        let out = drive(&upstream, Arc::clone(&auth), &router, 0).await;
+
+        let msg = out.result.expect_err("a long wait is terminal").to_string();
+        assert!(
+            msg.contains("Anthropic rate limit on account 'claude4' until "),
+            "{msg}"
+        );
+        assert!(
+            msg.contains(
+                "(HTTP 429 with a long wait, not a declared usage limit). \
+                 No other account has proven capacity now"
+            ),
+            "{msg}"
+        );
+        assert!(!msg.contains("usage limit reached"), "{msg}");
+        assert_no_body_leak(&msg, "error");
+        assert_eq!(upstream.calls(), 1);
+        let reports = router.reports();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(
+            reports[0].1.signal,
+            AnthropicQuotaSignal::LongResetWithRateLimitBody
+        );
+        assert!(
+            out.notices.iter().any(|n| n.starts_with("⚠ claude4 is rate-limited until ")
+                && n.ends_with(
+                    "(HTTP 429, no usage-limit header); no other account has proven capacity now"
+                )),
+            "{:?}",
+            out.notices
+        );
     }
 
     #[tokio::test]

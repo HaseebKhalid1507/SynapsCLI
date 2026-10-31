@@ -3299,7 +3299,7 @@ dependencies = [
 
 [[package]]
 name = "synaps"
-version = "0.11.0"
+version = "0.11.1"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -3353,7 +3353,7 @@ dependencies = [
 
 [[package]]
 name = "synaps-core"
-version = "0.11.0"
+version = "0.11.1"
 dependencies = [
  "async-trait",
  "axum",
@@ -3383,11 +3383,12 @@ dependencies = [
  "url",
  "urlencoding",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "synaps-engine"
-version = "0.11.0"
+version = "0.11.1"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -3398,6 +3399,7 @@ dependencies = [
  "chrono",
  "crossterm",
  "dirs",
+ "flate2",
  "fs4",
  "futures",
  "globset",
@@ -3432,12 +3434,13 @@ dependencies = [
  "url",
  "urlencoding",
  "uuid",
+ "windows-sys 0.61.2",
  "zeroize",
 ]
 
 [[package]]
 name = "synaps-tui"
-version = "0.11.0"
+version = "0.11.1"
 dependencies = [
  "anyhow",
  "arboard",

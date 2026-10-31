@@ -105,8 +105,8 @@ impl ApiMethods {
         options: &ApiOptions,
     ) -> Result<Value> {
         super::attachments::validate_history_for_request(model, messages).map_err(RuntimeError::Config)?;
-        let wire_messages = super::continuation::wire_messages(messages);
-        let messages = wire_messages.as_deref().unwrap_or(messages);
+        // Host `_synaps_*` keys: routed transports strip at their entry; the
+        // Anthropic body below drops them while serializing (`WireMessages`).
         // Route through OpenAI-compat provider if model resolves to one.
         // This synchronous facade consumes only the final response value, so
         // high-volume display deltas are suppressed at the provider boundary.
@@ -177,6 +177,9 @@ impl ApiMethods {
                 "No Anthropic credentials. Run `synaps login`, or switch to a provider model with `/model groq/llama-3.3-70b-versatile`.".to_string()
             ));
         }
+        // Resolve `cache_ttl = auto` against this request's credential kind
+        // (1h OAuth, 5m API key); explicit values pass through unchanged.
+        let cache_ttl = options.cache_ttl.resolve_for_auth_type(&auth_type);
 
         let auth_header = if auth_type == "oauth" {
             (
@@ -191,7 +194,10 @@ impl ApiMethods {
         // Arc-shared (#128): to_vec() is N refcount bumps, not a deep copy;
         // sanitize/annotate clone-on-write only what they edit.
         let mut cleaned_messages = messages.to_vec();
-        let retired_count = super::image_retention::plan(messages).map_err(RuntimeError::Config)?;
+        let retention =
+            super::image_retention::plan_request(messages, super::image_retention::Budget::Native)
+                .map_err(RuntimeError::Config)?;
+        let retired_count = retention.retired;
         // Stable per-image projection precedes cache markers, only on Anthropic.
         // Original preflight above remains authoritative; recheck output budgets.
         super::image_limits::enforce_image_limits(&mut cleaned_messages, retired_count)
@@ -199,13 +205,21 @@ impl ApiMethods {
             .map_err(RuntimeError::Config)?;
         super::attachments::validate_messages(model, &cleaned_messages)
             .map_err(RuntimeError::Config)?;
+        // The frontier is a position in `messages`: anchor before sanitation
+        // merges messages. A worker round arrives already retired upstream
+        // (its frontier rides in the options) and replays as a no-op here.
+        HelperMethods::annotate_retention_anchor(
+            &mut cleaned_messages,
+            super::image_retention::earliest(options.retention_frontier, retention.frontier),
+            cache_ttl,
+        );
         // Strict checks retain original per-source batch boundaries: sanitizing
         // first could merge valid adjacent user batches past eight attachments.
         HelperMethods::sanitize_thinking_blocks(&mut cleaned_messages);
         // The sync transport sends the full registry and never defers, so any
         // `tool_reference` in the history is stripped (it would be a 400).
         HelperMethods::wire_tool_references(&mut cleaned_messages, &|_| None);
-        HelperMethods::annotate_cache_breakpoint(&mut cleaned_messages, options.cache_ttl);
+        HelperMethods::annotate_cache_breakpoint(&mut cleaned_messages, cache_ttl);
 
         // Body assembly (#128 Slice 4): borrow the history instead of the old
         // `json!` deep rebuild. Sync transport → no "stream" key. Byte-identity
@@ -221,10 +235,14 @@ impl ApiMethods {
             thinking_budget,
             reasoning_level,
             Some(&execution_plan),
-            options.cache_ttl,
+            cache_ttl,
             false,
         );
-        let body = parts.body;
+        let mut body = parts.body;
+        body.set_thinking_display(options.thinking_display);
+        // A model that rejects input + `max_tokens` over the window gets the
+        // room the input leaves (no-op on Claude 4.5 and later).
+        body.fit_max_tokens_to_window(Self::provider_window(options, model));
         let translation_report = parts.report;
 
         // Serialize once up-front; each retry attempt reuses the same bytes
@@ -248,6 +266,7 @@ impl ApiMethods {
         // ═══ TRACE (Task 8): shared construction with the streaming path ═══
         let mut tracer = super::api::begin_anthropic_tracer(
             options,
+            cache_ttl,
             &anthropic_url,
             model,
             &body_bytes,
@@ -261,6 +280,12 @@ impl ApiMethods {
         .await;
         #[allow(unused_assignments)]
         let mut clock = crate::runtime::trace::AttemptClock::start();
+        // `body_bytes` stays the JSON the trace digests; `wire` is what
+        // reqwest uploads (see `request_encoding`).
+        let mut wire = options
+            .request_compression
+            .encode(&anthropic_url, &body_bytes)
+            .await;
 
         // Retry loop for transient API errors (429, 529, 500, 502, 503).
         // 429 gets a higher budget (MAX_429_RETRIES) and honours rate-limit
@@ -288,9 +313,12 @@ impl ApiMethods {
                     req = req.header("anthropic-beta", beta);
                 }
 
-                match req.body(body_bytes.clone()).send().await {
+                match wire.encoding_header(req).body(wire.bytes.clone()).send().await {
                     Ok(resp) => {
                         let status = resp.status();
+                        options
+                            .request_compression
+                            .settle(&mut wire, status.is_success());
                         if status.is_success() {
                             clock.mark_headers();
                             let trace_rid =
@@ -405,6 +433,27 @@ impl ApiMethods {
                                 super::api::provider_request_id_from_headers(resp.headers());
                             let error_text = resp.text().await.unwrap_or_default();
 
+                            // gzip refusal fail-soft: resend once uncompressed,
+                            // costing no retry budget (see `request_encoding`).
+                            if let Some(resend) = options.request_compression.resend_uncompressed(
+                                &wire,
+                                &body_bytes,
+                                status.as_u16(),
+                            ) {
+                                wire = resend;
+                                if let Some(t) = tracer.as_mut() {
+                                    t.attempt_failed(
+                                        clock,
+                                        crate::runtime::trace::RetryClass::Other,
+                                        std::time::Duration::ZERO,
+                                        Some(status.as_u16()),
+                                        trace_rid,
+                                        "gzip_refused",
+                                    );
+                                }
+                                continue;
+                            }
+
                             let retry_exhausted = if is_429 {
                                 attempt >= MAX_429_RETRIES
                             } else {
@@ -477,6 +526,7 @@ impl ApiMethods {
                         }
                     }
                     Err(e) => {
+                        options.request_compression.settle(&mut wire, false);
                         non_429_attempts += 1;
                         if non_429_attempts > max_retries {
                             if let Some(t) = tracer.take() {
@@ -605,18 +655,38 @@ impl ApiMethods {
             ));
         }
 
+        // System blocks + translation report come from one helper, in one
+        // branch: the report is derived from the actual assembly decision
+        // (OAuth synthesizes transport identity + product identity +
+        // guidance; api_key is lossless) and can never drift from the wire.
+        let (system_blocks, compaction_report) =
+            compaction_system_blocks(&auth_type, system_prompt);
+        let adaptive = crate::core::models::model_supports_adaptive_thinking(model);
+        let budget = if thinking_budget == 0 {
+            crate::core::models::DEFAULT_LEGACY_ADAPTIVE_FALLBACK
+        } else {
+            thinking_budget
+        };
+        // A model that rejects input + `max_tokens` over the window gets the
+        // room the input leaves (no-op on Claude 4.5 and later). Measured
+        // against the window this path's beta set (default options) opens.
+        let max_tokens = HelperMethods::fit_max_tokens_to_window(
+            model,
+            HelperMethods::max_tokens_for_model(model),
+            Self::provider_window(&ApiOptions::default(), model),
+            (!adaptive).then_some(u64::from(budget)),
+            || {
+                super::context::conservative_token_estimate(&system_blocks.to_string())
+                    .saturating_add(super::context::estimate_history(messages))
+            },
+        );
         let mut body = json!({
             "model": model,
-            "max_tokens": HelperMethods::max_tokens_for_model(model),
+            "max_tokens": max_tokens,
             "messages": messages,
-            "thinking": if crate::core::models::model_supports_adaptive_thinking(model) {
+            "thinking": if adaptive {
                 json!({ "type": "adaptive", "display": "summarized" })
             } else {
-                let budget = if thinking_budget == 0 {
-                    crate::core::models::DEFAULT_LEGACY_ADAPTIVE_FALLBACK
-                } else {
-                    thinking_budget
-                };
                 json!({
                     "type": "enabled",
                     "budget_tokens": budget,
@@ -631,12 +701,6 @@ impl ApiMethods {
             body["output_config"] = json!({"effort": "low"});
         }
 
-        // System blocks + translation report come from one helper, in one
-        // branch: the report is derived from the actual assembly decision
-        // (OAuth synthesizes transport identity + product identity +
-        // guidance; api_key is lossless) and can never drift from the wire.
-        let (system_blocks, compaction_report) =
-            compaction_system_blocks(&auth_type, system_prompt);
         body["system"] = system_blocks;
 
         // Serialize once up-front (exact-bytes contract, spec 6.2): the
@@ -664,6 +728,7 @@ impl ApiMethods {
         // carries the three synthesized identity/guidance segment entries.
         let mut tracer = super::api::begin_anthropic_tracer(
             options,
+            options.cache_ttl.resolve_for_auth_type(&auth_type),
             &anthropic_url,
             model,
             &body_bytes,
@@ -677,6 +742,12 @@ impl ApiMethods {
         .await;
         #[allow(unused_assignments)]
         let mut clock = crate::runtime::trace::AttemptClock::start();
+        // `body_bytes` stays the JSON the trace digests; `wire` is what
+        // reqwest uploads (see `request_encoding`).
+        let mut wire = options
+            .request_compression
+            .encode(&anthropic_url, &body_bytes)
+            .await;
 
         // Retry loop for transient errors (compaction path).
         // Same header-aware 429 handling as the main call_api loop.
@@ -702,9 +773,12 @@ impl ApiMethods {
                     req = req.header("anthropic-beta", beta);
                 }
 
-                match req.body(body_bytes.clone()).send().await {
+                match wire.encoding_header(req).body(wire.bytes.clone()).send().await {
                     Ok(resp) => {
                         let status = resp.status();
+                        options
+                            .request_compression
+                            .settle(&mut wire, status.is_success());
                         if status.is_success() {
                             clock.mark_headers();
                             let trace_rid =
@@ -810,6 +884,27 @@ impl ApiMethods {
                             };
                             let error_text = resp.text().await.unwrap_or_default();
 
+                            // gzip refusal fail-soft: resend once uncompressed,
+                            // costing no retry budget (see `request_encoding`).
+                            if let Some(resend) = options.request_compression.resend_uncompressed(
+                                &wire,
+                                &body_bytes,
+                                status.as_u16(),
+                            ) {
+                                wire = resend;
+                                if let Some(t) = tracer.as_mut() {
+                                    t.attempt_failed(
+                                        clock,
+                                        crate::runtime::trace::RetryClass::Other,
+                                        std::time::Duration::ZERO,
+                                        Some(status.as_u16()),
+                                        trace_rid,
+                                        "gzip_refused",
+                                    );
+                                }
+                                continue;
+                            }
+
                             let retry_exhausted = if is_429 {
                                 attempt >= MAX_429_RETRIES_COMPACT
                             } else {
@@ -869,6 +964,7 @@ impl ApiMethods {
                         }
                     }
                     Err(e) => {
+                        options.request_compression.settle(&mut wire, false);
                         non_429_attempts += 1;
                         if non_429_attempts > max_retries {
                             if let Some(t) = tracer.take() {

@@ -474,6 +474,15 @@ fn is_close_command(cmd: &SessionCommand) -> bool {
     matches!(cmd, SessionCommand::EngineCommand { name, .. } if name == CLOSE_COMMAND)
 }
 
+/// The host-only engine command behind `synaps daemon rename`
+/// (`SessionActor::host_rename`; JSON args, `RenameArgs`). Clients rename
+/// with `saveas`.
+pub(crate) const RENAME_COMMAND: &str = "rename";
+
+fn is_rename_command(cmd: &SessionCommand) -> bool {
+    matches!(cmd, SessionCommand::EngineCommand { name, .. } if name == RENAME_COMMAND)
+}
+
 fn command_name(cmd: &SessionCommand) -> &'static str {
     match cmd {
         SessionCommand::Submit { .. } => "submit",
@@ -492,6 +501,7 @@ fn command_name(cmd: &SessionCommand) -> &'static str {
         SessionCommand::End { .. } => "end",
         SessionCommand::Resync { .. } => "resync",
         SessionCommand::EngineCommand { name, .. } if name == CLOSE_COMMAND => "close",
+        SessionCommand::EngineCommand { name, .. } if name == RENAME_COMMAND => "rename",
         SessionCommand::EngineCommand { .. } => "engine_command",
         SessionCommand::PluginCommand { .. } => "plugin_command",
         SessionCommand::Resume { .. } => "resume",
@@ -551,6 +561,9 @@ pub struct SessionActor {
     pub(crate) owner_steer_budget: Option<Arc<crate::runtime::budget::OwnerSteerBudget>>,
     pub(crate) streaming: bool,
     pub(crate) turn_baseline: usize,
+    /// Stamps each message appended to `conv.api_messages` with its time
+    /// (`_synaps_at`); what was loaded is settled and never stamped.
+    pub(crate) message_stamper: crate::runtime::message_time::Stamper,
     pub(crate) consecutive_auto_turns: u32,
     /// Formatted events `on_queue_wake` steered into this turn's stream
     /// that the engine has not acknowledged (`SteeringDelivered`) yet. On
@@ -793,6 +806,9 @@ impl SessionActor {
         if let Some(ref m) = cfg.model_override {
             runtime.set_model(m.clone());
         }
+        if let Some(clock) = &cfg.message_clock {
+            runtime.set_message_clock(clock.clone());
+        }
 
         // Shared-inbox files are for whoever is at a keyboard: the gate stays
         // shut until a client owns input (`publish_presence`), so a detached,
@@ -881,6 +897,8 @@ impl SessionActor {
         if sb.continued && cfg.persist && session_lock.is_some() {
             crate::engine::setup::recover_turn_draft(&mut conv).await;
         }
+        // Loaded (and recovered) history keeps whatever times it carried.
+        let message_stamper = crate::runtime::message_time::Stamper::new(conv.api_messages.len());
 
         let view = RuntimeView::from_runtime(&runtime).await;
         let hook_bus = Arc::clone(runtime.hook_bus());
@@ -940,6 +958,7 @@ impl SessionActor {
             cache_keepwarm: super::cache_keepwarm::KeepWarmState::new(
                 config.cache_keepwarm,
                 config.cache_keepwarm_auto_max_hours,
+                config.cache_keepwarm_headless,
                 cache_keepwarm,
             ),
             park_deadline: None,
@@ -951,6 +970,7 @@ impl SessionActor {
             owner_steer_budget: None,
             streaming: false,
             turn_baseline: 0,
+            message_stamper,
             consecutive_auto_turns: 0,
             turn_steered_events: Vec::new(),
             turn_completion: None,
@@ -1037,10 +1057,20 @@ impl SessionActor {
 
     pub(crate) fn sync_name(&mut self) {
         let name = self.conv.session.name.clone();
+        self.mirror_name(name);
+    }
+
+    /// Publish a name the session now has on disk (or in memory): handle
+    /// and listing, the `run/<sid>.json` card, and a pinned session's book
+    /// entry (verbatim, so a cleared name stops resolving).
+    pub(crate) fn mirror_name(&mut self, name: Option<String>) {
         self.meta.name = name.clone();
         self.name.store(Arc::new(name.clone()));
         if self.keep_warm {
-            self.note_pin();
+            if let Some(sink) = self.host.pin_sink() {
+                let journal = (**self.journal_id.load()).clone();
+                sink.renamed(&journal, name.as_deref());
+            }
         }
         if let Err(e) = self.background.update_session_name(name.as_deref()) {
             tracing::warn!(session = %self.id, "registry name update failed: {e}");
@@ -1113,8 +1143,21 @@ impl SessionActor {
     }
 
     pub(crate) fn emit_conversation(&mut self) {
+        self.stamp_new_messages();
         let snap = self.conv.snapshot(self.consecutive_auto_turns);
         self.emit(SessionEventWire::Conversation(snap));
+    }
+
+    /// Give every message appended since the last pass its time. Called
+    /// wherever history leaves the actor (turn start, save, clients), so a
+    /// message added outside a turn (events flushed at Done, notes,
+    /// interruption markers) is stamped too. O(new messages).
+    pub(crate) fn stamp_new_messages(&mut self) {
+        if !self.conv.is_live() || !self.runtime.is_live() {
+            return;
+        }
+        let clock = self.runtime.message_clock().clone();
+        self.message_stamper.stamp(&mut self.conv.api_messages, &clock);
     }
 
     pub(crate) async fn publish_view(&mut self) {
@@ -1129,6 +1172,7 @@ impl SessionActor {
         if !self.config.persist || !self.conv.is_live() {
             return;
         }
+        self.stamp_new_messages();
         let Some(session) = self.conv.prepare_save() else {
             return;
         };
@@ -2108,6 +2152,8 @@ impl SessionActor {
                             self.conv.session.thinking_level =
                                 self.runtime.thinking_level().to_owned();
                             self.consecutive_auto_turns = 0;
+                            // Admission: the request gets its time now.
+                            self.stamp_new_messages();
                             self.turn_baseline = self.conv.api_messages.len();
                             self.turn_steered_events.clear();
                             self.turn_replay.clear();
@@ -2644,6 +2690,9 @@ impl SessionActor {
             // `cfg.model_override` frozen at create: `/model` survives park.
             runtime.set_model(view.model.clone());
             let _ = runtime.restore_session_reasoning(&view.thinking_level);
+            if let Some(clock) = &cfg.message_clock {
+                runtime.set_message_clock(clock.clone());
+            }
             sb.session.model = view.model.clone();
             sb.session.thinking_level = runtime.thinking_level().to_string();
             crate::engine::setup::finish_session_setup(
@@ -2676,9 +2725,15 @@ impl SessionActor {
         if journal_present && self.config.persist && self.session_lock.is_some() {
             crate::engine::setup::recover_turn_draft(&mut conv).await;
         }
+        self.message_stamper.settle(conv.api_messages.len());
         runtime.restore_tool_activations(std::mem::take(&mut self.parked_tool_activations));
         self.runtime.unpark_set(runtime);
         self.conv.unpark_set(conv);
+        // The name comes from disk: a rename while parked wrote it there.
+        if self.meta.name != self.conv.session.name {
+            let name = self.conv.session.name.clone();
+            self.mirror_name(name);
+        }
         // A fresh runtime: whether its grant took effect is its own.
         self.memory_seen_active = false;
         self.observe_memory();
@@ -2896,6 +2951,9 @@ impl SessionActor {
         let ct = CancellationToken::new();
         let (s_tx, s_rx) = mpsc::unbounded_channel::<String>();
         self.streaming = true;
+        // Admission: the request (and anything queued with it) gets its
+        // time now, before the stream copies the history.
+        self.stamp_new_messages();
         self.turn_baseline = self.conv.api_messages.len();
         self.open_turn_draft();
         self.turn_steered_events.clear();
@@ -4551,23 +4609,28 @@ impl SessionActor {
             return;
         }
         let value = match query {
-            SessionQuery::Status => serde_json::json!({
-                "session": self.conv.session.id,
-                "model": self.runtime.model(),
-                "lifecycle": SessionLifecycle::from_u8(self.lifecycle.load(std::sync::atomic::Ordering::Acquire)),
-                "tokens": { "input": self.conv.total_input_tokens, "output": self.conv.total_output_tokens },
-                "cost": self.conv.session_cost,
-                // Included in `cost`; labelled separately (task #444).
-                "keepwarm_cost": self.conv.keepwarm_cost,
-                "keepwarm": self.cache_keepwarm_status_json(None),
-                "messages": self.conv.api_messages.len(),
-                "streaming": self.streaming,
-                "auto_turns": self.consecutive_auto_turns,
-                "attached": self.attached.len(),
-                "pending_prompts": self.pending_prompts.len(),
-                // `/pin` status in the TUI.
-                "pinned": self.keep_warm,
-            }),
+            SessionQuery::Status => {
+                // Configured + resolved prompt-cache TTL (`auto` → 1h on OAuth).
+                let cache_ttl = self.cache_ttl_status_json().await;
+                serde_json::json!({
+                    "session": self.conv.session.id,
+                    "cache_ttl": cache_ttl,
+                    "model": self.runtime.model(),
+                    "lifecycle": SessionLifecycle::from_u8(self.lifecycle.load(std::sync::atomic::Ordering::Acquire)),
+                    "tokens": { "input": self.conv.total_input_tokens, "output": self.conv.total_output_tokens },
+                    "cost": self.conv.session_cost,
+                    // Included in `cost`; labelled separately (task #444).
+                    "keepwarm_cost": self.conv.keepwarm_cost,
+                    "keepwarm": self.cache_keepwarm_status_json(None),
+                    "messages": self.conv.api_messages.len(),
+                    "streaming": self.streaming,
+                    "auto_turns": self.consecutive_auto_turns,
+                    "attached": self.attached.len(),
+                    "pending_prompts": self.pending_prompts.len(),
+                    // `/pin` status in the TUI.
+                    "pinned": self.keep_warm,
+                })
+            }
             SessionQuery::Messages => {
                 serde_json::to_value(&self.conv.api_messages).unwrap_or_default()
             }
@@ -5117,6 +5180,16 @@ impl SessionActor {
         use std::ops::ControlFlow;
         let Addressed { from, cmd } = addressed;
         if let Some(c) = from {
+            // `rename` is the daemon's control-connection rename; an
+            // attached client has `/saveas` (owner only).
+            if is_rename_command(&cmd) {
+                self.emit(SessionEventWire::Refused {
+                    client: c,
+                    command: command_name(&cmd).to_string(),
+                    reason: "rename is host-only; use /saveas".into(),
+                });
+                return ControlFlow::Continue(());
+            }
             // Only the daemon's reload sends a reload checkpoint (it stops
             // every worker and fences the session for the exec after it).
             if matches!(cmd, SessionCommand::Checkpoint { reason: CheckpointReason::Reload }) {
@@ -5141,6 +5214,19 @@ impl SessionActor {
         // the daemon reports it failed). The wake sources are fenced in the
         // select loop; commands are fenced here.
         if self.reload_fence.is_some() && cmd.refused_while_reloading() {
+            // A host rename answers its caller only, never the whole room.
+            if let SessionCommand::EngineCommand { id, name, .. } = &cmd {
+                if name == RENAME_COMMAND {
+                    self.emit(SessionEventWire::QueryResult {
+                        id: *id,
+                        value: serde_json::json!({
+                            "kind": "error", "code": "busy",
+                            "text": "daemon reloading; retry in a moment",
+                        }),
+                    });
+                    return ControlFlow::Continue(());
+                }
+            }
             let reason = super::RELOADING_REFUSAL.to_string();
             match from {
                 Some(c) => self.emit(SessionEventWire::Refused {
@@ -5159,6 +5245,16 @@ impl SessionActor {
             if is_input_command(&cmd) && !matches!(cmd, SessionCommand::KeepWarm { .. }) {
                 self.note_input(c);
             }
+        }
+        // A host rename (`synaps daemon rename`): handled here for live and
+        // parked sessions alike. A parked one is renamed on disk and NOT
+        // woken (`host_rename`), so this runs before the B3 wake below.
+        if is_rename_command(&cmd) {
+            if let SessionCommand::EngineCommand { id, arg, .. } = cmd {
+                let value = self.host_rename(&arg).await;
+                self.emit(SessionEventWire::QueryResult { id, value });
+            }
+            return ControlFlow::Continue(());
         }
         // B3: anything that needs the runtime wakes a parked session first.
         if self.is_parked() {

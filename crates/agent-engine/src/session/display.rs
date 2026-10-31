@@ -28,6 +28,33 @@ pub struct DisplayTail {
     pub items: Vec<DisplayItem>,
     #[serde(default)]
     pub omitted: usize,
+    /// When each item's message happened (RFC 3339 UTC, the message's
+    /// `_synaps_at`), parallel to `items`. Empty when no item has a time
+    /// (legacy history, older daemons); `None` for an item without one.
+    /// Clients use [`DisplayTail::time`], never index it directly.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub times: Vec<Option<String>>,
+}
+
+impl DisplayTail {
+    /// The recorded time of `items[i]`, if any.
+    pub fn time(&self, i: usize) -> Option<&str> {
+        self.times.get(i)?.as_deref()
+    }
+}
+
+/// `times` for items projected from messages: one entry per item, dropped
+/// entirely when none has a time.
+fn item_times(times: Vec<Option<String>>) -> Vec<Option<String>> {
+    if times.iter().all(Option::is_none) {
+        Vec::new()
+    } else {
+        times
+    }
+}
+
+fn time_of(msg: &serde_json::Value) -> Option<String> {
+    crate::runtime::message_time::message_time(msg).map(str::to_owned)
 }
 
 /// True iff `content` is a canonical agent-event payload
@@ -117,15 +144,29 @@ pub fn display_items(msgs: &[SharedMessage]) -> Vec<DisplayItem> {
     out
 }
 
+/// Every display item of `msgs` with its message's time.
+fn timed_items(msgs: &[SharedMessage]) -> (Vec<DisplayItem>, Vec<Option<String>>) {
+    let mut items = Vec::new();
+    let mut times = Vec::new();
+    for m in msgs {
+        items_of(m, &mut items);
+        if times.len() < items.len() {
+            times.resize(items.len(), time_of(m));
+        }
+    }
+    (items, times)
+}
+
 /// The last `max_items` display items (`0` = unbounded). Walks from the back
 /// and stops once the cap is met; the head is only counted (no allocation),
 /// so a 20 MB history costs O(tail) allocations + one O(n) scan.
 pub fn display_tail(msgs: &[SharedMessage], max_items: usize) -> DisplayTail {
     if max_items == 0 {
-        return DisplayTail { items: display_items(msgs), omitted: 0 };
+        let (items, times) = timed_items(msgs);
+        return DisplayTail { items, omitted: 0, times: item_times(times) };
     }
     // Per-message item groups, newest first, until we hold >= max_items.
-    let mut groups: Vec<Vec<DisplayItem>> = Vec::new();
+    let mut groups: Vec<(Vec<DisplayItem>, Option<String>)> = Vec::new();
     let mut held = 0usize;
     let mut idx = msgs.len();
     while idx > 0 && held < max_items {
@@ -133,17 +174,24 @@ pub fn display_tail(msgs: &[SharedMessage], max_items: usize) -> DisplayTail {
         let mut g = Vec::new();
         items_of(&msgs[idx], &mut g);
         held += g.len();
-        groups.push(g);
+        let at = if g.is_empty() { None } else { time_of(&msgs[idx]) };
+        groups.push((g, at));
     }
     // Items before `idx` were never projected: count them without cloning.
     let mut omitted: usize = msgs[..idx].iter().map(|m| count_items_of(m)).sum();
-    let mut items: Vec<DisplayItem> = groups.into_iter().rev().flatten().collect();
+    let mut items: Vec<DisplayItem> = Vec::with_capacity(held);
+    let mut times: Vec<Option<String>> = Vec::with_capacity(held);
+    for (g, at) in groups.into_iter().rev() {
+        times.extend(std::iter::repeat_n(at, g.len()));
+        items.extend(g);
+    }
     if items.len() > max_items {
         let extra = items.len() - max_items;
         items.drain(..extra);
+        times.drain(..extra);
         omitted += extra;
     }
-    DisplayTail { items, omitted }
+    DisplayTail { items, omitted, times: item_times(times) }
 }
 
 #[cfg(test)]
@@ -256,5 +304,55 @@ mod tests {
             assert_eq!(t.items[..], all[all.len() - keep..], "cap={cap}");
             assert_eq!(t.omitted, all.len() - keep, "cap={cap}");
         }
+    }
+
+    fn timed(mut m: serde_json::Value, ts: &str) -> SharedMessage {
+        m["_synaps_at"] = ts.into();
+        Arc::new(m)
+    }
+
+    #[test]
+    fn tail_carries_each_items_message_time() {
+        let msgs = vec![
+            user("legacy, no time"),
+            timed(serde_json::json!({"role": "user", "content": "q"}), "2026-10-25T05:47:00Z"),
+            timed(
+                serde_json::json!({"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "t"}, {"type": "text", "text": "a"}
+                ]}),
+                "2026-10-25T05:48:00Z",
+            ),
+            timed(serde_json::json!({"role": "user", "content": [{"type": "tool_result"}]}), "2026-10-25T05:49:00Z"),
+        ];
+        let expect = |t: &DisplayTail| {
+            (0..t.items.len()).map(|i| t.time(i).map(str::to_owned)).collect::<Vec<_>>()
+        };
+        let all = display_tail(&msgs, 0);
+        assert_eq!(
+            expect(&all),
+            vec![
+                None,
+                Some("2026-10-25T05:47:00Z".into()),
+                Some("2026-10-25T05:48:00Z".into()),
+                Some("2026-10-25T05:48:00Z".into()),
+            ]
+        );
+        for cap in 1..=5 {
+            let t = display_tail(&msgs, cap);
+            let keep = cap.min(4);
+            assert_eq!(expect(&t), expect(&all)[4 - keep..], "cap={cap}");
+        }
+        // Wire: absent when nothing has a time, and old payloads still parse.
+        let legacy = display_tail(&[user("a"), user("b")], 0);
+        assert!(legacy.times.is_empty());
+        let wire = serde_json::to_value(&legacy).unwrap();
+        assert!(wire.get("times").is_none(), "{wire}");
+        let old: DisplayTail = serde_json::from_value(serde_json::json!({
+            "items": [{"kind": "user", "text": "a"}], "omitted": 0
+        }))
+        .unwrap();
+        assert_eq!(old.time(0), None);
+        let round: DisplayTail = serde_json::from_value(serde_json::to_value(&all).unwrap()).unwrap();
+        assert_eq!(round, all);
     }
 }

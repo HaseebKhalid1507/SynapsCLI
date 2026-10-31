@@ -4,6 +4,558 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.11.1] — 2026-10-31
+
+Synaps runs on Windows now, with prebuilt x64 binaries and a PowerShell
+installer. Long sessions cost less: the prompt cache lasts an hour on a
+Claude subscription, big tool output stays out of every later request,
+re-reads of unchanged files are deduplicated, keep-warm covers long tool
+calls, and request bodies go out gzip-compressed. Subagent workers roll
+their context over instead of filling the window, follow more of the
+session's config, and run in the session's folder. This release also adds
+`multi_edit` and smoother streaming in the TUI.
+
+Read the Upgrade notes first: several defaults changed, workers no longer
+get tools listed in `disabled_tools`, and the bash tool no longer answers
+password prompts other than sudo's. Full notes:
+[docs/upgrading/0.11.md](docs/upgrading/0.11.md#upgrading-from-0110-to-0111).
+
+### Upgrade notes
+
+- **Reload the daemon after installing:** `synaps daemon reload`, then
+  restart attached TUIs. A reload stops running subagents (they can be
+  resumed), so let them finish first. Daemon protocol (v3) and extension
+  protocol (1) are unchanged.
+- **`cache_ttl` defaults to `auto`:** 1h on a Claude subscription login,
+  5m on an API key. `cache_ttl = 5m` keeps the old behaviour.
+- **New defaults, each with an off switch:** worker context rollover
+  (`subagent_context_management = off`), output spill
+  (`tool_output_spill_bytes = 0`), read dedupe (`read_dedupe = off`),
+  keep-warm during tool calls (`cache_keepwarm_tools = off`), extension
+  output transforms in workers (`subagent_transform_hooks = off`),
+  `multi_edit` (`disabled_tools = multi_edit`), request compression
+  (`request_compression = off`) and smooth streaming
+  (`tui_smooth_streaming = off`).
+- **Workers think at `subagent_thinking` (default `xhigh`)**, independent
+  of the foreground `thinking`. Lower it, or pass `thinking` per call, for
+  cheaper workers.
+- **`disabled_tools` now applies to workers too.** A worker that relied
+  on a disabled tool (say `bash` under a no-shell profile) gets "Unknown
+  tool" for it.
+- **The bash tool answers only sudo's password prompt** (Linux, through an
+  askpass helper; macOS fails closed with `sudo -n`). The command's stdin is
+  empty, and prompts from `mysql -p`, `psql` and the like are no longer
+  answered.
+- **Crate users:** `synaps-engine` has a few public API changes:
+  `Runtime::cache_ttl()` returns `CacheTtlSetting`,
+  `daemon::listener::bind` returns a platform `Listener`,
+  `daemon::reload::adopt_from_env` takes `&DaemonPaths` and returns
+  `Adopted`, and some public structs gained fields, which breaks struct
+  literals. Pin `=0.11.0` until you've updated.
+
+### Added
+
+- **Windows 10/11 (x64).** The daemon runs natively on a named pipe with an
+  owner-only DACL, and a client refuses a pipe served by another user's
+  process (the Windows analogue of the `0600` socket). The detached daemon
+  gets a hidden console and its own process group, so tool calls don't
+  flash windows and closing the terminal doesn't stop it. `daemon reload`
+  hands the daemon lock straight to the new image (Windows has no
+  `execv`), and `daemon stop --force` falls back to `taskkill /T /F`.
+  Session event pipes (`synaps send`) get the same owner-only DACL and
+  remote refusal, and `synaps send` refuses a pipe served by another user.
+  Releases ship `synaps-x86_64-pc-windows-msvc.zip` and a PowerShell
+  installer (`synaps-installer.ps1`). The `powershell` tool is built in;
+  the `bash` tool uses Git Bash or WSL's `bash.exe` when it finds one.
+  TUI fixes for the Windows console: pasted text and characters not on the
+  keyboard layout no longer vanish, AltGr characters (`@ { \ €` on German
+  and similar layouts) type instead of firing shortcuts, and `plugins.json`
+  and `trust.json` save (a read-only handle can't be flushed there, os
+  error 5). Known issue: the `grep`, `find` and `ls` tools still run the
+  Unix programs, which a stock Windows install lacks (and `find` can
+  resolve to Windows' own `find.exe`); the default Windows prompt steers
+  the agent to `powershell`. (#277, #326, #328, by JR and Haseeb)
+- **`multi_edit` tool** (#268, by JR; review fixes in this PR): anchored
+  edits to up to 16 files in one call, all or nothing. Every edit is checked
+  against in-memory copies first and nothing is written if any fails; files
+  are then published through verified directory handles, with best-effort
+  rollback. Ops `replace`, `insert_before`, `insert_after`, `append`,
+  `append_jsonl`; anchors `exact`, `line_prefix` or `line_regex`; each must
+  match once unless `occurrence` picks one; `unless_present` makes re-runs
+  no-ops; opt-in clock/mtime placeholders. On by default, in the
+  progressive-disclosure core next to `edit`, and on workers;
+  `disabled_tools = multi_edit` removes it everywhere. Final behaviour:
+  - `insert_before`/`insert_after` text that ends in a newline is whole
+    lines in every anchor mode: it lands before the anchor's line or after
+    it, never glued into it (`insert_after "line one"` + `"line 1.5\n"` used
+    to give `line oneline 1.5`). Other text goes right at the match.
+  - `append` adds a missing final newline first, like `append_jsonl`.
+  - A CRLF file stays CRLF: `\n` in `text`, an `exact` anchor and
+    `unless_present` means `\r\n` there, and so does every newline an edit
+    adds. LF files are written as given.
+  - The description states every hard limit (64 edits, 16 files, 16 MiB
+    per file, 64 MiB total, 1 MiB per field, UTF-8). Description and schema
+    were tightened from 747 to 671 tokens per request (Opus 5.5,
+    `count_tokens`).
+  - A `before_tool_call` hook filtered to `edit` or `write` also runs for
+    `multi_edit`, so existing write guards still block or confirm it.
+  - Read dedupe treats it like `edit`/`write` (a "no need to re-read" note;
+    a later read is compared against the new content). Its result is never
+    spilled. See [docs/multi-edit.md](docs/multi-edit.md).
+- **Smooth response start in the TUI.** Sending a message no longer shows
+  `◇ thinking` for a moment, then nothing, then a block of text at once.
+  The live `◇ thinking` header (with its timer, counting from the send)
+  now stays from the send until the first thinking or agent text. It is no
+  longer dropped when the provider response starts. It turns into the
+  thought in place, or gives way to the agent text in the same frame.
+  When a provider flushes a burst of text at once (summarized thinking
+  holds the answer back until its summary is written, then sends a
+  kilobyte in one instant), the TUI reveals it over a few frames. The pace
+  is about normal streaming speed, faster the more is queued. A 1 KB burst
+  takes ~0.4 s, and nothing waits more than 0.5 s. Thinking that arrives
+  with the answer reads in first. Turn end, abort, tool calls, any other
+  session event, scroll/Ctrl+O/Esc/click input, a session switch and
+  turning the setting off show everything queued at once, so the
+  transcript is never truncated or reordered. Settings → Appearance →
+  "Smooth streaming" (`tui_smooth_streaming`, default on; off = text paints
+  as it arrives, as before).
+- **`thinking_display = summarized | omitted`.** Sets the foreground
+  session's Anthropic `thinking.display`. `summarized` (default) is the
+  behaviour so far. `omitted` streams no thinking text. The reply starts
+  sooner and evenly (measured on Opus 5.5: first text 1.8–2.1 s vs
+  2.9–4.8 s at `high`, 7.9–9.0 s vs 11–12 s at `xhigh`), and the TUI shows
+  a timed `◇ thinking` header that seals to `◇ thought for 8s`. Thinking
+  effort is unchanged. Each thinking block's signature still carries the
+  full reasoning and goes back with the history unchanged. Switching keeps
+  the prompt cache (measured: the cached prefix read in full across
+  summarized ↔ omitted). Applies to new sessions. Workers, keep-warm pings
+  of worker rounds and compaction always send `summarized`: a worker's
+  thinking summaries are its record in `/watch` and its archived
+  transcripts. Settings → Model → "Thinking display".
+
+- **Tool output virtualisation.** A big tool result no longer rides every
+  later request in full. When a text result of `bash`, `grep`, `find`,
+  `ls`, the shell and subagent tools, or an MCP/extension/plugin tool is
+  bigger than `tool_output_spill_bytes` (default 12288; `0` = off, history
+  exactly as before), the whole output goes to a private spill file
+  (`<base>/spill/<session>/<tool_use_id>.txt`, 0700/0600, 16 MiB per file)
+  and history gets a deterministic preview: the first
+  `tool_output_spill_head_bytes` (4096) and last
+  `tool_output_spill_tail_bytes` (3072), cut at line boundaries, and a note
+  with the path and the exact `read` offset/limit of the omitted lines. The
+  old cut at `max_tool_output` kept only the head, so the tail, where errors
+  usually are, was lost; nothing is lost now. A `read` of a big file without
+  a `limit` is not copied: its preview points back at the file. Images and
+  documents are untouched. Spill dirs are removed with their session by
+  `synaps retention` and swept after 7 idle days at startup. Request traces
+  mark virtualised calls (`virtualised: true`; `result_bytes` minus
+  `preview_bytes` is what stayed out of history). Three new /settings rows.
+- **Read dedupe.** Reading a file again no longer adds a second full copy to
+  history when the first copy is still there. If a `read` of the same
+  file, `offset` and `limit` would add exactly the same text (after
+  virtualisation) as an earlier `read` that is still in the conversation,
+  history gets a one-line stub naming that earlier call instead. If the
+  file changed, the earlier result is gone (rollover, compaction, a new
+  session), or the result is an image, document, error or cancellation,
+  the full result comes back. The stub never changes once written, so
+  caching is unaffected, and it says to read again if the earlier result
+  is gone. When a context rollover (foreground or worker) keeps a stub
+  but drops the read it names, the stub is rewritten to a fixed "read the
+  file again if you need it" line. Successful `write` and `edit` results
+  now say there is no need to re-read the file to check it. Request
+  traces mark stubbed calls (`deduped: true`, `deduped_bytes`). Works the
+  same in workers. `read_dedupe` (default on; `off` = tool results exactly
+  as before), with a /settings row.
+- **Subagent workers run the host's output transforms.** An extension's
+  `after_tool_call` `replace` (compression, redaction; needs
+  `tools.transform_output`) now sees a subagent worker's tool results,
+  not only the main session's. Before, every worker ran with an empty hook
+  bus, so a transform like crush never saw the tool results that workers
+  produce, about 88% of all tool-result tokens in crush 2's measurements.
+  It's the only hook a worker runs: no `before_tool_call` (no confirm
+  prompt, block or input rewrite in a worker), no observe-only
+  `after_tool_call`, no message or session hooks. Everything else is the
+  main session's: chain order, the permission gate, the 5 s timeout, the
+  1 MiB clamp, pass-through on a failed or timed-out handler, and the
+  order hook, then virtualisation, then read dedupe. Workers see the
+  host's live handler list, so a reload applies from their next tool
+  call; they never start or restart an extension process (while one has
+  crashed or a deferred one hasn't started, their output passes through
+  until the main session's next call starts it). The extension sees
+  `session_id: null`. Covers the legacy
+  `SYNAPS_SUBAGENT_FRESH_RUNTIME=1` path too. `subagent_transform_hooks`
+  (default on; `off` = no hooks in workers, as before), with a /settings
+  row. [docs/extensions/hooks.md](docs/extensions/hooks.md#subagent-workers)
+- **`synaps daemon rename <ID|NAME> <NEW_NAME>`** (or `--clear`) names a
+  daemon session from any shell without attaching, so a tool can name a
+  session it only observes. Same rules as `/saveas`; attached clients see the
+  name at once. A parked session is renamed on disk without being woken. It
+  never replaces a name unless `--force`, never moves a session to the top of
+  `--continue` or `/sessions`, and two sessions can't take one name at once.
+  [docs/daemon-mode.md](docs/daemon-mode.md#renaming-a-session-daemon-rename)
+- **`api-log.jsonl` joins sessions and the request trace.** Each record
+  carries `session_id`, the persisted conversation id that
+  `synaps daemon sessions` shows, and `runtime_session_id`, `turn_id` and
+  `trace_request_id`, the ids in `request-trace.jsonl` (the runtime id is
+  now `session-<pid>-<ms>-<seq>`, unique per process). Subagent records
+  add `worker_agent`, `worker_handle` (`sa_N`), `parent_session_id` and
+  `parent_runtime_session_id` (`worker` stays); and
+  every record with usage has an estimated `cost_usd` from the shared
+  pricing table, 5m and 1h cache writes at their own rates. All additive.
+- `telemetry_log_generations = N` keeps `N` rotated generations
+  (`.1`..`.N`, 50 MB each) of `api-log.jsonl` and `request-trace.jsonl`.
+  Default 1, as before. Lowering it deletes the extra generations at the
+  next rotation. Rotation is now locked (`<log>.lock`), so two daemon
+  sessions can no longer rotate the same log twice and lose a generation.
+- **Keep-warm for long tool calls** (`cache_keepwarm_tools`, default on;
+  /settings row next to the other keep-warm rows). A tool round that runs
+  past the cache TTL (a worker's `cargo build`, a test sweep, a `sleep;
+  poll` loop: workers are pinned to 5m and their default bash limit is
+  300 s) used to make the next request rewrite the whole prompt prefix at
+  1.25×: 658k tokens from two such rounds in one day of logs. Now, 4.5 min
+  into a round on 5m (55 min on 1h), the session re-sends that round's own
+  request capped to a minimal reply, so the cache stays live and the next
+  request reads it. Pings repeat while the tools run and stop when they
+  return (a ping already in flight finishes, up to 20 s, and is booked
+  before the next request) or the turn is cancelled (a ping in flight is
+  aborted and booked at its worst case, so turn cost never misses a sent
+  request). They move no cache breakpoint and touch no history; they use
+  the idle keep-warm's cost bound and budgets and are logged with
+  `"keepwarm": true`. Covers the foreground and every worker
+  spawn path. Independent of `cache_keepwarm` (idle). See
+  docs/specs/cache-ttl-spec.md §7.9.
+- **`cache_keepwarm_headless`** (default off; /settings row next to the
+  other keep-warm rows) lets daemon sessions driven by `synaps chat`,
+  rpc-over-daemon or server clients (bridges, scripts) keep their prompt
+  cache warm. Before, only sessions a TUI or `synaps attach` had attached
+  to qualified, so headless sessions never pinged. `Observe` attaches still
+  never qualify. `synaps rpc` (stdin/stdout) has no session actor and is
+  not covered; drive a daemon session instead.
+- **Slices for process scopes** (#267, by JR): `tool_scope_slice =
+  synaps_tools.slice` puts the systemd scopes of bash tool commands and PTY
+  shells in that slice, and `daemon_scope_slice` does the same for the
+  daemon's own scope, so an operator can cap agent tool work apart from the
+  desktop's `app.slice` (a `~/.config/systemd/user/<name>.slice` unit or
+  `systemctl --user set-property`; Synaps sets no limits itself). Use a
+  top-level name without `-`: a `-` nests the slice, and `CPUWeight` only
+  weighs siblings. Unset or empty (`tool_scope_slice =`), nothing changes;
+  an empty value also undoes an earlier line. An invalid name warns and is
+  ignored. A missing slice is not refused (systemd creates it, uncapped), so
+  the first launch into a slice looks up its limits off the command's path
+  and warns once if it sets none. A failed probe (user manager unreachable,
+  or the slice refused) starts the command without a scope, with one
+  warning. Tool commands pick up a change at the next command; the daemon's
+  slice applies at its next fresh start (a reload re-execs in the same
+  scope). Recipe and checks: `docs/daemon-mode.md`, "Capping tool commands
+  with a slice".
+
+### Changed
+
+- **Subagent thinking has its own setting** (#319, by JR):
+  `subagent_thinking` (default `xhigh`, /settings row), independent of the
+  foreground `thinking`, and an optional `thinking: low | medium | high |
+  xhigh | max` on `subagent`, `subagent_start` and `subagent_resume`. A
+  resumed worker keeps its recorded effort unless the call overrides it.
+  Unsupported model/effort pairs are refused, not lowered.
+  [docs/subagent-thinking.md](docs/subagent-thinking.md)
+- **TUI polish from a user walkthrough** (#316). Wrapped paragraphs keep
+  inline code and bold. Subagent tool cards show status, name, elapsed time
+  and tool count, then the worker's answer, instead of raw JSON, and the
+  finished event reads `✓ name finished · 3.6s` plus a preview. grep/find
+  cards show paths relative to the session folder. `/stats` shows the full
+  session id, `/theme` marks the current theme and applies at once,
+  `/clear` resets the context gauge and cache-write counters, and `/help`
+  lists `/sessions` and `/theme`. A first `synaps` without credentials
+  shows the `synaps login` hint in daemon mode too, and `--attach <NAME>`
+  works for a session started with `--name`.
+- **The stock system prompt now steers working habits.** With only the
+  ~200-byte default, the model rewrote whole files, re-read files it had
+  just read or written, wrote heavy docs and ran verbose commands, and those
+  tokens rode along on every later request. The default (both the Windows
+  and the other variant) now adds four short habits: change files with
+  targeted edits, don't re-read a file that is still current, keep files,
+  docs and comments lean, and keep command output small. It grows from 202
+  to 539 bytes (Windows: 447 to 797). Only the built-in default changes: a
+  `--system` prompt, `system.md`, `identity`, agent files and worker
+  prompts are sent byte for byte as before.
+- **Keep-warm decides on a ping's expected cost under budgeted thinking.**
+  There a ping must send `max_tokens = budget + 1` (the budget is part of
+  the cache key), and pricing all of it as output refused every 5m period
+  below a ~17.9K-token prefix (1h: ~10.8K) on Sonnet/Opus 4.6. Pings are
+  now priced at an expected 256 output tokens: break-even drops to ~1.2K
+  (5m) and ~0.7K (1h) tokens. The hard bound stays: it is the rewrite plus
+  a thinking reserve (the rest of `max_tokens`), each ping still has to fit
+  it at its worst case, and `/keepwarm status`, the logs and the end
+  reasons report rewrite, reserve and bound. If a ping ever bills more
+  than the estimate, the session's later periods go back to worst-case
+  pricing. Thinking-off and adaptive pings (`max_tokens = 1`) are
+  unchanged. Pings still send the turn's exact thinking configuration.
+- **The prompt cache lasts 1 hour on a Claude subscription by default.**
+  `cache_ttl` has a new default, `auto`: 1h when the request goes out on
+  Anthropic OAuth/subscription credentials (what Claude Code does), 5m on
+  an Anthropic API key, where a 1h cache write costs 2x input instead of
+  1.25x. Before, every session used 5m, so a pause longer than five minutes
+  lost the cached conversation and the next turn rewrote all of it. In a
+  benchmark with 6-minute gaps, 1h cost 40-43% less than 5m, and 8% less
+  than Claude Code. The TTL follows the credential *kind*, not the account:
+  an account failover between subscription seats keeps it, so the cache is
+  not rewritten. Explicit `5m`, `1h` and `hybrid` work as before; to keep
+  the old behaviour, set `cache_ttl = 5m`. Subagent workers still always
+  use 5m. Keep-warm (`cache_keepwarm`) schedules and costs pings on the
+  resolved TTL, the same as an explicit `1h`. /settings → Context & Cache
+  gains `auto` and shows `→ 1h (subscription login)`; `/keepwarm status`
+  and the session `Status` query (`cache_ttl: {setting, resolved}`) show
+  what it resolved to. See
+  [docs/specs/cache-ttl-spec.md §8](docs/specs/cache-ttl-spec.md#8-cache_ttl--auto-the-default).
+- **Subagent workers roll their context over automatically.** A worker's
+  context used to grow until the model window was full (one reached about
+  999k tokens), re-reading all of it every round, and a worker that filled
+  its window died on "prompt is too long". Now, once a worker's request
+  reaches `subagent_rollover_tokens` (default 200000; the model window's own
+  rollover threshold wins when lower), or the window is nearly full, the host
+  moves its older rounds out of context: the worker keeps its task verbatim,
+  later orchestrator instructions, a host note, and its most recent rounds
+  (about 100k tokens in all), with every tool call still paired. Nothing is
+  summarized: the moved messages are saved as plain text beside the worker's
+  resume archive (`~/.synaps-cli/subagent-history/…/<handle>.window-<N>.md`),
+  and the note tells the worker where, so it can grep or read them. Nothing
+  goes to the memory backend. `subagent_context_management = off` turns this
+  off (both keys have `/settings` rows). A rollover shows as a notice in the
+  worker's stream, its subagent panel line, a `context` object in
+  `subagent_status` / `subagent_collect`, and the `rollover_window` /
+  `rollover` fields of `api-log.jsonl` (set after a foreground rollover too).
+  `subagent_resume` continues a rolled worker's window numbering; a cold
+  resume lists its saved windows. See
+  [docs/design/subagent-rollover.md](docs/design/subagent-rollover.md).
+- **`subagent_resume` no longer replays a big transcript into an expired
+  cache.** Workers run on the 5-minute cache TTL, so resuming one after a
+  longer wait rewrote its whole history at the cache-write price (measured:
+  250k–715k tokens, up to ~$3.50 a resume). When the prior run's cache has
+  expired and its history is at least `subagent_cold_resume_compact_tokens`
+  (default 100000; `0` turns this off), the worker resumes from one compact
+  message instead: its original task, the last steps of the run, its final
+  report and the new instructions. `full_history: true` forces the full
+  replay. The reply says which happened (`"context": "full" | "compacted"`),
+  and the prior archive is kept, so a full replay stays possible.
+- **Large requests to api.anthropic.com go out gzip-compressed.** A long
+  session re-uploads the whole conversation every turn; text-heavy bodies
+  shrink about 2x, so less waiting on the upload before the first token.
+  Tokens, billing and prompt caching are unchanged. By default it is
+  skipped behind an HTTPS proxy, with a custom CA bundle
+  (`SSL_CERT_FILE`/`SSL_CERT_DIR`) or a custom `SYNAPS_ANTHROPIC_BASE_URL`.
+  Two settings, both in /settings → Context & Cache:
+  `request_compression = auto | on | off` (`on` also compresses through a
+  proxy or gateway known to pass gzip bodies) and
+  `request_compression_level = 1-9` (default 1, fastest; on a slow uplink a
+  higher level saves more upload time than it costs).
+  `SYNAPS_GZIP_REQUEST_BODIES=0` turns it off whatever the config says. If
+  the API refuses a compressed body, the request is resent uncompressed and
+  gzip stays off for the rest of the process. (#321)
+
+### Fixed
+
+- **Subagent workers run in the session's folder and environment.** Under
+  the daemon they ran in the daemon process's working directory with its
+  environment, so a worker could edit files in the wrong tree. `subagent`,
+  `subagent_start` and `subagent_resume` now use the parent session's cwd
+  and env; a resumed worker continues in the folder it ran in if it still
+  exists. (#317)
+- **Transcript times survive resume, attach and rebuild.** After
+  `--attach --continue`, attaching to a live session, `/resync` or a
+  compaction rebuild, every message showed the current time. Each message
+  now keeps the time it was written. (#320)
+- **Automatic Anthropic account selection keeps a turn on an account that
+  serves.** Fixes to the mid-turn failover of #273: an account whose
+  short usage limit the ordinary retry outlived loses its cooldown, so the
+  next round no longer moves the turn to a cold-cache account (or, with one
+  account, ends it with `all_cooling_down` after its tools ran); when every
+  account is cooling down mid-turn, the turn keeps its account. Keep-warm
+  pings (idle and tool-round) never select, switch or re-bind an account
+  and send no switch notices; a ping on a cooling account stops. Only a
+  refused token refresh (a login or an action needed) moves an automatic
+  selection to another account; a transient one fails with its own kind
+  (`refresh_transient`, not `usage_read_failed`). The mid-turn re-vend
+  honours a refused refresh's hold, and cooldown lookups read auth.json
+  once per version of the file instead of on every request.
+- **macOS: no "install developer tools" dialog from Git.** `/usr/bin/git`
+  on macOS is Apple's `xcrun` shim, and without the Command Line Tools
+  running it opens that dialog (`GIT_TERMINAL_PROMPT=0` does not stop it).
+  Synaps now runs Git by absolute path and never the shim. The host runs the
+  first `git` on `PATH`, as a shell would, so Homebrew, Nix and MacPorts Git
+  keep working; where `PATH` reaches the shim it runs the developer Git the
+  shim would have run (`DEVELOPER_DIR`, the `xcode-select` choice, Xcode,
+  the Command Line Tools; a `.app` bundle works too), or skips the shim if
+  there is none. The Axel memory service, started with an empty
+  environment, never consults `PATH` and runs that developer Git. With no
+  Git at all, repository memory fails closed with `git unavailable: run
+  xcode-select --install` (now shown, not dropped), and plugin install,
+  update and update checks refuse with the same request. Repository memory
+  with a Git older than 2.31 says it needs 2.31 instead of failing on a
+  "relative path". Linux and Windows run `git` from `PATH` as before.
+  (#343, by @JR-Morton)
+- **Thinking blocks with empty text but a signature are kept in history.**
+  The stream parser and the request sanitizer dropped any thinking block
+  with empty text. That is every block under `display: "omitted"`, and
+  any summarized-mode progress update the model wrote no summary for. The
+  block's reasoning was lost from the next request, and a tool loop sent
+  its turn with thinking blocks partially dropped. Now only a block with
+  neither text nor signature is dropped (the one the API rejects with
+  "each thinking block must contain thinking", verified live).
+- **A closed session or stopped quota keeper frees its lock at once.**
+  Session journal locks and quota-keeper locks were released by closing the
+  lock file. A `flock` belongs to the open file, and a process that a
+  thread is starting at that moment (a tool, an MCP server) holds a copy of
+  every descriptor until it executes, so the lock could outlive its owner
+  by up to that long. Opening the session right then was refused with
+  "session … is live in another process" naming the process that had just
+  let it go, and a keeper started on the same state dir was refused with
+  "keeper.lock is held by pid …". Both locks now unlock explicitly when
+  released, as the context archive's lock already did.
+
+- **Retiring a screenshot from a parallel tool batch no longer rewrites
+  the whole history.** When old images are retired from a request, the
+  cache anchor is meant to sit just before the first message that changes,
+  so the request re-reads everything ahead of it. If the oldest image still
+  being sent was not the first block of its message (the second result of
+  two parallel `read`s, say), the anchor went on an earlier block of that
+  same message. Those bytes had not changed, but Anthropic did not serve
+  the entry, and the request wrote the whole conversation again: one worker
+  read 6.8k and wrote 281k tokens on a single retirement. The anchor now
+  always goes on the last unchanged message before the one that changes,
+  on every route, including messages that the request merges into it.
+  Retirement itself was already chunked (a worker retires four or five
+  screenshots at a time, not one per screenshot), so the image budgets are
+  unchanged.
+
+- **Subagent workers follow more of the parent's config.** Workers ran
+  with the defaults for `bash_timeout`, `bash_max_timeout`,
+  `max_tool_output`, `cache_diagnostics` and
+  `request_compression`/`request_compression_level`, whatever the config
+  said. They now take them from the config, on every spawn path. With
+  `cache_diagnostics = true`, worker requests carry the
+  `diagnostics` object too, so worker cache misses show up in the API log.
+  Each worker keeps its own `previous_message_id` chain, starting fresh,
+  and on OAuth no beta header is sent. The object is top-level, so the
+  prompt-cache prefix is unchanged, and a refusal drops it for the rest of
+  that worker's run, as in the foreground. A spawn
+  now reads the config once, so its thinking level and its runtime policy
+  can no longer come from two different reads of a config being edited.
+  The host's cached worker tool set is rebuilt when a config reload
+  changes `disabled_tools`.
+
+- **Subagent workers rolled their context over every few tool calls.**
+  Workers never got the configured `context_window`, so every worker
+  budgeted against the 200k model default and sent no 1M opt-in. On Opus
+  the next round's reserves (the 128k output envelope, the next tool result
+  and the 15% safety margin) come to about 168k of that, so a worker hit
+  hard capacity at about 32k and rolled over into a successor of about 9k
+  that was full again five tool calls later: four Opus 5.5 workers rolled
+  over 28–37 times in 20 minutes, with requests of only ~20k. Workers now
+  get `context_window` like the foreground, except a window their model
+  cannot open (a 1m setting on a model without 1M support keeps the model
+  default). A worker whose window cannot hold a successor at the rollover
+  target once the reserves are taken no longer rolls over at hard capacity:
+  its requests go out as before worker rollover, and it logs one warning
+  per turn. A hard-capacity successor that would start at hard capacity
+  again is refused too. See
+  [docs/design/subagent-rollover.md](docs/design/subagent-rollover.md#context-window).
+
+- **The context budget no longer treats the whole `max_tokens` as room the
+  next round needs.** It reserved the request's output ceiling (128k on
+  Opus, 64k otherwise), so on a 200k Opus window hard capacity sat at about
+  31.5k: `context_management.mode = auto` rolled over there into tiny
+  successors or ended the turn with "cannot meaningfully reduce retained
+  history", the daemon's `auto_compact` compacted at about 32k, keep-warm
+  (with context management on) refused to ping, and workers past it (after the guard above) never rolled
+  over. Claude 4.5 and later accept a request whose input plus `max_tokens`
+  exceeds the window and stop at the window
+  ([context windows](https://platform.claude.com/docs/en/build-with-claude/context-windows#context-window-overflow-behavior)),
+  so the budget now reserves what a round realistically produces: its
+  thinking budget (16,384 for adaptive) plus 16,384 of response, capped at
+  `max_tokens`. With the tool-result reserve and the 15% margin, hard
+  capacity on a 200k window is about 127k (Opus and Sonnet, high or adaptive
+  thinking; was ~31.5k / ~95.5k) and about 807k on 1m (was ~711k / ~775k).
+  For the earlier models that reject such a request (Opus 4 / 4.1, Sonnet 4,
+  3.x), every Anthropic request builder now clamps `max_tokens` to the room
+  the input leaves, keeping it above any thinking budget. Request bodies for
+  Claude 4.5 and later are unchanged.
+
+- **Screenshot-heavy subagents rewrote the whole prompt cache on every
+  round.** Past 6 images, the worker upload budget retired one old image
+  per new one, which changed the request far behind the tail, so nothing
+  after the system prompt was read from cache. That was 39 of the 45
+  cache breaks (88% of missed tokens) in a 72-hour sample. Workers and
+  non-Anthropic routes now retire images in chunks, down to half their
+  budget, through the same replay the native route uses, so the history
+  changes once per chunk. A cache breakpoint ahead of the oldest image the
+  previous request sent lets a retirement re-read the prefix instead of
+  rewriting it. Budgets are unchanged; a retired image is labelled the same
+  way on every route.
+
+- **The daemon no longer keeps a large frame's memory for the life of the
+  connection.** One `Submit` with a big `/attach` (up to ~20 MiB of base64)
+  or a refused oversize frame (up to 64 MiB) left that much allocated per
+  connection until the client detached, which for a daemon-attached TUI is
+  days. The buffer drops back to 64 KiB right after any frame over 1 MiB,
+  the same rule the client side already follows.
+
+- **`ttft_ms` in `api-log.jsonl` read `0`** on nearly every record: it was
+  timed from when the response headers arrived, not from the send.
+  `ttft_ms` and `total_ms` now count from the send, like the request trace;
+  `total_ms` therefore grows by the time to headers. A request with no
+  model event has no `ttft_ms` field (never `0`).
+
+### Security
+
+- **Subagent workers no longer get tools listed in `disabled_tools`.**
+  `disabled_tools` (the documented read-only / no-shell lockdown, e.g.
+  `disabled_tools = bash, shell_start, shell_send, shell_end`) was applied
+  only to the foreground session. A worker builds its built-in tools from
+  scratch, so with `disabled_tools = bash` a worker still had `bash`, and a
+  `subagent` or `subagent_start` call could run shell commands through
+  it. The host-built worker re-applied only the forum tools; the
+  `SYNAPS_SUBAGENT_FRESH_RUNTIME=1` worker applied none. Every worker, on
+  every spawn path (`subagent`, `subagent_start`, `subagent_resume`, host
+  or fresh runtime), now has the foreground's whole list removed: the
+  model is not offered those tools, and a call to one is refused as an
+  unknown tool. As in the foreground, the list removes built-in tools only;
+  extension and MCP tools are unaffected.
+  **Behaviour change:** an agent or workflow that relied on a worker using
+  a tool you disabled (typically a worker running `bash` under a no-shell
+  profile) now gets "Unknown tool" for that call. Remove the tool from
+  `disabled_tools` if workers need it.
+
+- **The bash tool asks for a sudo password only when sudo really asks
+  (Linux).** It used to raise the password box for any stderr text that
+  looked like a password prompt and wrote the answer to the command's
+  stdin, so printed text (even the tool's own command line) could open the
+  box and the password went to whatever read stdin. sudo now runs with `-A`
+  and a Synaps askpass helper; the box opens only for a set-uid sudo
+  started inside that tool call, names the command sudo will run, and the
+  password goes only to sudo. The command's stdin is now empty. Other
+  password prompts (`Password:` from `mysql -p`, `psql`, …) are no longer
+  answered. macOS fails closed (`sudo -n`).
+  [docs/sudo-askpass.md](docs/sudo-askpass.md)
+
+### Credits
+
+- **Haseeb Khalid**: tool output virtualisation, read dedupe, worker
+  rollover and config inheritance, keep-warm for tool calls and headless
+  sessions, the 1h cache default, request compression, smooth streaming
+  and thinking display, sudo askpass, the Windows fixes, telemetry and
+  review fixes, integration and merges.
+- **JR Morton**: the Windows-native daemon and Windows CI, `multi_edit`,
+  process-scope slices, mid-turn account failover, the macOS Git fix and
+  subagent thinking.
+
+### Internal
+
+- CI has a Windows job: clippy in both feature sets and the daemon and
+  TUI suites. (#278)
+- Flaky and platform-bound tests fixed: bash hand-off accounting, PTY,
+  auth, keep-warm timing, Windows paths and the hardened-build steps.
+  (#327, #328, #350)
+
 ## [0.11.0] — 2026-10-26
 
 Sessions now live in the daemon. Every client attached to a session can

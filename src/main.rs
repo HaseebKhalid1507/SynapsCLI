@@ -88,12 +88,14 @@ struct Cli {
     no_extensions: bool,
 
     /// Run the TUI attached to a daemon session instead of in-process
-    /// (the daemon is started on first use). Optionally a session ID
-    /// (prefix ok); with no live session a new one is created (`--continue`
-    /// continues); --new (alias --create) forces a fresh session even if
-    /// one is live. Modifiers: --observe (read-only), --takeover (steal input),
-    /// --keep-warm (never parked), --new (fresh session); default mode is
-    /// SYNAPS_ATTACH_MODE or mirror (input only if nobody owns it).
+    /// (the daemon is started on first use). Optionally a session ID (prefix
+    /// ok) or name (`--name`); with no live session a new one is created
+    /// (`--continue` continues); --new (alias --create) forces a fresh
+    /// session even if one is live. Every attached client can type (config
+    /// `client_input = shared`, the default). Modifiers: --observe
+    /// (read-only), --takeover (take input under `client_input = exclusive`),
+    /// --keep-warm (never parked), --new (fresh session);
+    /// SYNAPS_ATTACH_MODE=observe|takeover sets the default mode.
     #[arg(long = "attach", value_name = "ID", global = true, num_args = 0..=1)]
     attach: Option<Option<String>>,
 
@@ -101,9 +103,9 @@ struct Cli {
     #[arg(long, global = true, conflicts_with = "takeover")]
     observe: bool,
 
-    /// With --attach: steal input ownership from the current owner (the
-    /// previous owner is told; without it a second client is read-only
-    /// while the owner is attached).
+    /// With --attach: take input ownership from the current owner (the
+    /// previous owner is told). Only matters under `client_input =
+    /// exclusive`; with the default `shared` every client can already type.
     #[arg(long, global = true)]
     takeover: bool,
 
@@ -614,9 +616,9 @@ static ADOPTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::n
 
 /// Auto-spawn (jcode model) before the runtime exists: a live daemon or a
 /// freshly spawned one. Runs BEFORE the thin re-exec/diet so a failed spawn
-/// can fall back to the untouched in-process boot. Returns the reason the
-/// TUI should fall back in-process; the line client exits 3 instead.
-fn ensure_daemon(kind: &ThinClient) -> Option<String> {
+/// can fall back to the untouched in-process boot. Returns why the TUI
+/// should fall back in-process; the line client exits 3 instead.
+fn ensure_daemon(kind: &ThinClient) -> Option<InProcessFallback> {
     use agent_engine::daemon::{self, EnsureError, Ensured, EXIT_REFUSED};
     let (profile, line) = match kind {
         ThinClient::Tui { profile } | ThinClient::Adopt { profile } => (profile.clone(), false),
@@ -634,7 +636,7 @@ fn ensure_daemon(kind: &ThinClient) -> Option<String> {
             // boot, quietly. An explicit `--attach` asked for a daemon and
             // must say why there is none.
             if matches!(kind, ThinClient::Adopt { .. }) {
-                return Some("SYNAPS_DAEMON_AUTOSPAWN=0".into());
+                return Some(InProcessFallback { reason: "SYNAPS_DAEMON_AUTOSPAWN=0".into(), quiet: true });
             }
             let msg = cmd::attach::no_daemon_message(opts.profile.as_deref());
             eprintln!("{msg}");
@@ -645,13 +647,22 @@ fn ensure_daemon(kind: &ThinClient) -> Option<String> {
                 eprintln!("synaps attach: daemon unavailable: {reason}");
                 std::process::exit(EXIT_REFUSED);
             }
-            Some(reason)
+            Some(InProcessFallback { reason, quiet: false })
         }
     }
 }
 
+/// [`ensure_daemon`]'s answer when the TUI runs in-process instead.
+struct InProcessFallback {
+    reason: String,
+    /// The user chose in-process (`SYNAPS_DAEMON_AUTOSPAWN=0` with no daemon
+    /// running): no "daemon unavailable" notice on every boot.
+    quiet: bool,
+}
+
 /// Our jemalloc boot conf for the re-exec'd thin client (`SYNAPS_CLIENT_MALLOC_CONF`
 /// overrides). `narenas` is boot-only — the one knob a mallctl cannot set.
+#[cfg(target_os = "linux")]
 const THIN_MALLOC_CONF: &str = "narenas:1,background_thread:false,dirty_decay_ms:0,muzzy_decay_ms:0";
 
 /// Set by `main` when the daemon could not be started: `--attach` runs the
@@ -735,6 +746,12 @@ fn scrub_reexec_env() {
 }
 
 fn main() -> anyhow::Result<()> {
+    // sudo runs this binary as the bash tool's askpass helper; nothing else
+    // (config, logging, HOME) may happen first. Also records that this
+    // binary can be the helper, which the bash tool requires.
+    if let Some(code) = agent_engine::tools::run_sudo_askpass_helper_if_invoked() {
+        std::process::exit(code);
+    }
     // Before anything can report it (daemon `Welcome`, the client's skew check).
     agent_engine::session::wire::set_build_id(env!("SYNAPS_BUILD_ID"));
     let mut thin = false;
@@ -751,9 +768,11 @@ fn main() -> anyhow::Result<()> {
                 }
                 thin = true;
             }
-            Some(reason) => {
-                eprintln!("daemon unavailable: {reason} — running in-process");
-                tui::push_boot_notice(format!("daemon unavailable: {reason} — running in-process"));
+            Some(InProcessFallback { reason, quiet }) => {
+                if !quiet {
+                    eprintln!("daemon unavailable: {reason} — running in-process");
+                    tui::push_boot_notice(format!("daemon unavailable: {reason} — running in-process"));
+                }
                 std::env::set_var(ATTACH_FALLBACK, "1");
             }
         }

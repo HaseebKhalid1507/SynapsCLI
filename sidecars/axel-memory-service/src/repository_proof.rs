@@ -23,7 +23,13 @@ pub(crate) fn path_key(path: &Path) -> String {
     key
 }
 fn git_path(root: &Path, arg: &str) -> Result<PathBuf> {
-    let mut cmd = Command::new("git");
+    // Developer Git only, never PATH: not the host's rule, on purpose (see
+    // agent-core's `git_program.rs`). The host starts this service with an
+    // empty environment, so there is no DEVELOPER_DIR either: the xcode-select
+    // choice, Xcode, then the Command Line Tools, as xcrun chose for it before.
+    // No developer Git on macOS fails like a failed spawn.
+    let git = crate::git_program::developer_git().map_err(|_| Error::Scope)?;
+    let mut cmd = Command::new(git);
     cmd.env_clear()
         .env("PATH", "/usr/bin:/bin")
         .env("GIT_CONFIG_NOSYSTEM", "1")

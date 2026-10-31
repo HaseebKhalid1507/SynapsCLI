@@ -24,6 +24,9 @@
 //! same-UID process can deliberately rewrite private state; this is not a sandbox
 //! against the host user. Copying a private marker copies identity; ordinary clones
 //! do not copy Git-private files. Never initialize identity in a live repo in tests.
+// Off Unix `resolve` fails closed before reaching any Git/marker helper, so
+// they are unused there; Unix builds still lint every one of them.
+#![cfg_attr(not(unix), allow(dead_code, unused_imports))]
 
 use super::store::{MemoryError, ProjectScope};
 use serde::{Deserialize, Serialize};
@@ -149,12 +152,33 @@ fn git_output(_: &Path, _: &[&str]) -> Result<Option<Vec<u8>>, MemoryError> {
     ))
 }
 
+/// No Git at all (macOS: none on `PATH`, no Command Line Tools) says so and
+/// what to do, instead of a bare "No such file or directory".
+#[cfg(unix)]
+fn git_unavailable(e: crate::git_program::GitUnavailable) -> MemoryError {
+    MemoryError::Io(e.to_string())
+}
+
+/// Git before 2.31 has no `rev-parse --path-format`: it echoes the unknown
+/// option as a first output line instead of failing, and prints
+/// `--git-common-dir` relative. Say so instead of "relative path". (The
+/// batched rev-parse needs no check: the extra line sends it to `git_path`.)
+fn require_path_format(bytes: &[u8]) -> Result<&[u8], MemoryError> {
+    if bytes.starts_with(b"--path-format=absolute\n") {
+        return Err(invalid(
+            "Git 2.31 or newer is required (this git has no `rev-parse --path-format`)",
+        ));
+    }
+    Ok(bytes)
+}
+
 /// `Ok(None)`: Git exited unsuccessfully (the direct child is already reaped).
 #[cfg(unix)]
 fn git_output(root: &Path, args: &[&str]) -> Result<Option<Vec<u8>>, MemoryError> {
     use std::io::ErrorKind;
     use std::os::fd::AsRawFd;
-    let mut cmd = Command::new("git");
+    let program = crate::git_program::git_program().map_err(git_unavailable)?;
+    let mut cmd = Command::new(program);
     for (name, _) in std::env::vars_os() {
         if name.as_encoded_bytes().starts_with(b"GIT_") {
             cmd.env_remove(name);
@@ -285,7 +309,7 @@ fn absolute_path(bytes: &[u8]) -> Result<PathBuf, MemoryError> {
 
 fn git_path(root: &Path, arg: &str) -> Result<PathBuf, MemoryError> {
     let bytes = git(root, &["rev-parse", "--path-format=absolute", arg])?;
-    let bytes = bytes
+    let bytes = require_path_format(&bytes)?
         .strip_suffix(b"\n")
         .ok_or_else(|| invalid("invalid Git path output"))?;
     absolute_path(bytes)
@@ -822,6 +846,27 @@ mod tests {
 
     fn discover(root: &Path) -> RepositoryIdentity {
         ProjectScope::discover_repository_with_override(root, None).unwrap()
+    }
+
+    #[test]
+    fn unavailable_git_names_the_fix() {
+        let message = git_unavailable(crate::git_program::GitUnavailable).to_string();
+        assert!(message.contains("git unavailable"), "{message}");
+        assert!(message.contains("xcode-select --install"), "{message}");
+    }
+
+    #[test]
+    fn git_without_path_format_is_named() {
+        // What Git 2.30 prints for `rev-parse --path-format=absolute
+        // --show-toplevel --absolute-git-dir --git-common-dir`.
+        let old = b"--path-format=absolute\n/r\n/r/.git\n.git\n";
+        let message = require_path_format(old).unwrap_err().to_string();
+        assert!(
+            message.contains("Git 2.31 or newer is required"),
+            "{message}"
+        );
+        let new = b"/r\n/r/.git\n/r/.git\n";
+        assert_eq!(require_path_format(new).unwrap(), new);
     }
 
     #[test]

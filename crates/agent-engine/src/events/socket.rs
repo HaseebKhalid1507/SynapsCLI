@@ -71,6 +71,45 @@ impl SocketIdentity {
     }
 }
 
+/// Client end of a per-session endpoint: a stream on the Unix socket at
+/// `socket_path`, or on Windows the named pipe derived from it.
+#[cfg(unix)]
+pub type SessionClient = tokio::net::UnixStream;
+#[cfg(windows)]
+pub type SessionClient = tokio::net::windows::named_pipe::NamedPipeClient;
+
+/// Connect to the session endpoint a registration publishes as
+/// `socket_path`, so callers (`synaps send`, tests) never hard-code the
+/// platform transport.
+pub async fn connect_session_socket(socket_path: &str) -> std::io::Result<SessionClient> {
+    #[cfg(unix)]
+    {
+        tokio::net::UnixStream::connect(socket_path).await
+    }
+    #[cfg(windows)]
+    {
+        // Like the daemon pipe: refuse a server run by another account, so
+        // nobody else can squat a session's name and receive what we send.
+        let client = tokio::net::windows::named_pipe::ClientOptions::new()
+            .open(pipe_name_for(socket_path))?;
+        crate::ipc::verify_pipe_server(&client)?;
+        Ok(client)
+    }
+}
+
+/// Deliver one payload to a session endpoint: connect, write, close. The
+/// listener reads to EOF, and a named pipe has no half-close (`shutdown`
+/// only flushes), so EOF reaches it only when the handle is dropped. Doing
+/// all three here means no caller can hold the pipe open by accident.
+pub async fn send_to_session_socket(socket_path: &str, payload: &[u8]) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let mut client = connect_session_socket(socket_path).await?;
+    client.write_all(payload).await?;
+    client.shutdown().await?;
+    drop(client);
+    Ok(())
+}
+
 #[cfg(unix)]
 pub(crate) type SessionListener = UnixListener;
 #[cfg(windows)]
@@ -97,9 +136,9 @@ pub(crate) fn bind_session_socket(
     }
     #[cfg(windows)]
     {
-        let server = tokio::net::windows::named_pipe::ServerOptions::new()
-            .first_pipe_instance(true)
-            .create(pipe_name_for(path))?;
+        // Owner-only DACL and no remote clients, like the daemon pipe (the
+        // default pipe DACL also grants Everyone read).
+        let server = crate::ipc::create_owner_only_pipe(&pipe_name_for(path), true)?;
         Ok((server, SocketIdentity {}))
     }
 }
@@ -213,7 +252,6 @@ fn serve_session_socket_inner(
     shutdown: Arc<AtomicBool>,
     cleanup: Option<LegacyCleanup>,
 ) -> tokio::task::JoinHandle<()> {
-    use tokio::net::windows::named_pipe::ServerOptions;
     tokio::spawn(async move {
         let _cleanup = cleanup;
         let pipe_name = pipe_name_for(&socket_path);
@@ -234,7 +272,7 @@ fn serve_session_socket_inner(
                 Ok(Ok(())) => {
                     // Spin up the next pipe instance before handing this
                     // connection off, so new clients can connect immediately.
-                    let next = match ServerOptions::new().create(&pipe_name) {
+                    let next = match crate::ipc::create_owner_only_pipe(&pipe_name, false) {
                         Ok(s) => s,
                         Err(e) => {
                             tracing::error!("socket: failed to recreate pipe: {}", e);
@@ -575,5 +613,53 @@ mod tests {
         handle.await.unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"stale");
         std::fs::remove_file(path).unwrap();
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+    use crate::events::{Event, Severity};
+    use std::sync::atomic::AtomicBool;
+
+    /// A session pipe takes events through its first and its recreated
+    /// instances (both owner-only, `ipc::create_owner_only_pipe`), the client
+    /// side accepts a server run by this user, and a second server on the
+    /// same name is refused.
+    #[tokio::test]
+    async fn session_pipe_delivers_events_and_refuses_a_second_server() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp
+            .path()
+            .join("session.sock")
+            .to_string_lossy()
+            .into_owned();
+        let queue = Arc::new(EventQueue::new(10));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let handle = listen_session_socket(path.clone(), queue.clone(), shutdown.clone());
+
+        assert!(
+            bind_session_socket(&path).is_err(),
+            "a served session pipe name is never shared"
+        );
+
+        for text in ["first", "second"] {
+            let event = Event::simple("test", text, Some(Severity::High));
+            send_to_session_socket(&path, &serde_json::to_vec(&event).unwrap())
+                .await
+                .unwrap();
+            let mut popped = None;
+            for _ in 0..100 {
+                if let Some(e) = queue.pop() {
+                    popped = Some(e);
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            assert_eq!(popped.expect("event delivered").content.text, text);
+        }
+
+        shutdown.store(true, Ordering::Release);
+        handle.await.unwrap();
     }
 }

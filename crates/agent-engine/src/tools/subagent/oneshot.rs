@@ -57,6 +57,11 @@ impl Tool for SubagentTool {
                         {"type": "object", "properties": {"mode": {"const": "non_overlapping_paths"}, "scopes": {"type": "array", "items": {"type": "string"}}}, "required": ["mode", "scopes"]}
                     ]
                 },
+                "thinking": {
+                    "type": "string",
+                    "enum": ["low", "medium", "high", "xhigh", "max"],
+                    "description": "Worker effort override. Omit for subagent_thinking (default xhigh), independent of foreground thinking. Unsupported model levels are refused."
+                },
                 "timeout": {
                     "type": "integer",
                     "description": "Wall-clock limit in seconds. Omit for the session default (config `subagent_timeout`); 0 = no limit."
@@ -67,6 +72,9 @@ impl Tool for SubagentTool {
     }
 
     async fn execute(&self, params: Value, ctx: ToolContext) -> Result<String> {
+        // One config snapshot for the whole spawn (`spawn_config`).
+        let config = super::spawn_config();
+        let thinking = super::resolve_subagent_thinking(&params, None, &config)?;
         let task = params["task"]
             .as_str()
             .ok_or_else(|| RuntimeError::Tool("Missing 'task' parameter".to_string()))?
@@ -111,11 +119,13 @@ impl Tool for SubagentTool {
         let memory_backend = ctx.capabilities.memory_backend.clone();
         let session_allow_all = ctx.capabilities.session_allow_all.clone();
         let telemetry = ctx.capabilities.telemetry.clone();
+        let workspace = super::WorkerWorkspace::from_capabilities(&ctx.capabilities);
         let timeout_secs = params["timeout"]
             .as_u64()
             .unwrap_or(ctx.limits.subagent_timeout);
 
         let label = super::subagent_label(agent_name.as_deref(), params["name"].as_str());
+        let telemetry = telemetry.map(|t| t.for_worker(&label, &orchestration_id));
         let task_preview: String = task.chars().take(80).collect();
 
         tracing::info!(
@@ -148,6 +158,8 @@ impl Tool for SubagentTool {
             return Err(RuntimeError::Tool(error));
         }
 
+        // Names this worker's rolled-over context windows (`worker_context`).
+        let transcript_stem = orchestration_id.clone();
         let thread_handle = match std::thread::Builder::new().spawn(move || {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let rt = match tokio::runtime::Builder::new_current_thread()
@@ -175,10 +187,23 @@ impl Tool for SubagentTool {
                     // turn budget. Subagents are short-lived one-shots — paying the 1h
                     // write premium (~2× input price) on them is unrecoverable waste
                     // (~$0.23 per 10-spawn fan-out). (#110)
-                    super::apply_subagent_runtime_policy(&mut runtime, &crate::config::load_config(), memory_backend.as_ref(), session_allow_all.as_ref(), telemetry.as_ref());
+                    super::apply_subagent_runtime_policy(&mut runtime, &config, memory_backend.as_ref(), session_allow_all.as_ref(), telemetry.as_ref(), &workspace);
                     runtime.set_system_prompt(super::compose_system_prompt(system_prompt, runtime.memory_backend_is_axel()));
                     runtime.set_model(model);
+                    super::fit_subagent_context_window(&mut runtime);
                     super::apply_codex_worker_reasoning(&mut runtime, codex_parent_plan.as_ref());
+                    super::apply_subagent_thinking(&mut runtime, thinking)?;
+                    // Rolled-over context goes to the worker archive directory.
+                    super::attach_worker_transcripts(
+                        &mut runtime,
+                        super::archive::process_dir(),
+                        &transcript_stem,
+                        None,
+                        &[],
+                        tx_events_inner.clone(),
+                        subagent_id,
+                        &label_inner,
+                    );
 
                     let cancel = crate::CancellationToken::new();
                     let cancel_inner = cancel.clone();
@@ -276,6 +301,7 @@ impl Tool for SubagentTool {
                                             let short = path.rsplit('/').next().unwrap_or(path);
                                             format!("editing {}", short)
                                         }
+                                        "multi_edit" => crate::tools::multi_edit_label(&input),
                                         "grep" => {
                                             let pat = input["pattern"].as_str().unwrap_or("?");
                                             let preview: String = pat.chars().take(30).collect();

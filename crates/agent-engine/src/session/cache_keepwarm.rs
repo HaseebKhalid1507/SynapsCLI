@@ -24,12 +24,18 @@
 //! - **the prefix fingerprint** recorded at idle. Every ping re-builds the
 //!   prefix and is refused (period ends) if it no longer matches.
 //! - **a ski-rental ledger** of measured spend. A ping is only sent while
-//!   `ledger + worst-case ping ≤ bound`, where the bound is re-writing the
-//!   prefix at the honoured TTL's write price, and the worst case is a full
-//!   read of the prefix + the known write (ping 1: the last turn's uncached
-//!   tail and reply) + uncached input + `max_tokens` of output. Under
-//!   budgeted thinking `max_tokens` is `budget + 1`, so such pings only run
-//!   for prefixes large enough that one worst-case ping fits the bound.
+//!   `ledger + worst-case ping ≤ bound`. The bound is re-writing the prefix
+//!   at the honoured TTL's write price plus a **thinking reserve**: the
+//!   output a ping may bill beyond its expected output (`max_tokens −
+//!   PING_OUTPUT_ESTIMATE` under budgeted thinking, where `max_tokens` is
+//!   forced to `budget + 1`; 0 with thinking off / adaptive, where it is 1).
+//!   The worst case is a full read of the prefix + the known write (ping 1:
+//!   the last turn's uncached tail and reply) + uncached input +
+//!   `max_tokens` of output. Since worst − expected is the reserve, the
+//!   check is also `ledger + expected ping ≤ rewrite`: decisions run on the
+//!   expected cost, and the ledger can never pass the bound reported.
+//!   After a ping out-thinks the estimate the session prices pings at
+//!   `max_tokens` (no reserve) from its next period on.
 //! - **the cap exposure**: `max_session_cost` is a hard cap, so admission
 //!   prices what a dispatched ping can actually bill — the larger of that
 //!   read-path worst case and a full miss (the whole prefix written at the
@@ -83,6 +89,22 @@ pub const SHARE_LIMIT_PERCENT: u64 = 10;
 /// Estimated uncached input of a ping before one has been measured: the
 /// trailing ping message plus framing.
 pub const PING_INPUT_ESTIMATE: u64 = 64;
+
+/// Expected output of a ping under budgeted thinking: a short thinking block
+/// plus "ok". The API forces `max_tokens` to `budget + 1` (≥ 1,025) there,
+/// and the budget is part of the message cache key, so the ping cannot ask
+/// for less; it is told it needs no reasoning and in practice thinks a
+/// sentence. 256 leaves several times that as headroom. Only the start
+/// decision uses it: the hard bound still prices every ping at
+/// `max_tokens` (see [`Period::bound_usd`]).
+pub const PING_OUTPUT_ESTIMATE: u64 = 256;
+
+/// The output a ping is expected to produce when its `max_tokens` is
+/// `max_tokens`: all of it when that is already tiny (thinking off /
+/// adaptive: 1), else [`PING_OUTPUT_ESTIMATE`].
+pub fn ping_output_estimate(max_tokens: u64) -> u64 {
+    max_tokens.min(PING_OUTPUT_ESTIMATE)
+}
 
 /// Relative slack for the bound comparison (f64 sums of equal ping costs).
 const BOUND_EPSILON: f64 = 1e-9;
@@ -254,17 +276,21 @@ pub enum PeriodEnd {
         input: u64,
         prefix: u64,
     },
-    /// Ski-rental bound: the next worst-case ping would push the ledger past
-    /// the rewrite it prevents.
+    /// Ski-rental bound: the next ping at its expected cost would push the
+    /// ledger past the rewrite it prevents (equivalently: at its worst case,
+    /// past the hard bound = rewrite + reserve).
     BoundReached {
         ledger_usd: f64,
         bound_usd: f64,
+        reserve_usd: f64,
     },
-    /// Not even one worst-case ping fits the bound (budgeted thinking on a
-    /// small prefix).
+    /// Not even one ping fits: its expected cost exceeds the rewrite it
+    /// would save (a small prefix, or budgeted thinking priced at its worst
+    /// case after a ping out-thought the estimate).
     PingTooExpensive {
+        expected_usd: f64,
         worst_usd: f64,
-        bound_usd: f64,
+        rewrite_usd: f64,
     },
     /// `<N>h` window elapsed.
     HoursReached(u32),
@@ -318,16 +344,37 @@ impl std::fmt::Display for PeriodEnd {
             PeriodEnd::BoundReached {
                 ledger_usd,
                 bound_usd,
+                reserve_usd,
+            } if *reserve_usd > 0.0 => write!(
+                f,
+                "ski-rental bound reached (${ledger_usd:.4} spent of ${bound_usd:.4}: \
+                 ${:.4} rewrite + ${reserve_usd:.4} thinking reserve)",
+                bound_usd - reserve_usd
+            ),
+            PeriodEnd::BoundReached {
+                ledger_usd,
+                bound_usd,
+                ..
             } => write!(
                 f,
                 "ski-rental bound reached (${ledger_usd:.4} spent of ${bound_usd:.4})"
             ),
             PeriodEnd::PingTooExpensive {
+                expected_usd,
                 worst_usd,
-                bound_usd,
+                rewrite_usd,
+            } if worst_usd > expected_usd => write!(
+                f,
+                "cache-hit ping expected at ${expected_usd:.4} (${worst_usd:.4} worst case) \
+                 exceeds the ${rewrite_usd:.4} rewrite it would save"
+            ),
+            PeriodEnd::PingTooExpensive {
+                worst_usd,
+                rewrite_usd,
+                ..
             } => write!(
                 f,
-                "worst-case cache-hit ping ${worst_usd:.4} exceeds the ${bound_usd:.4} rewrite it would save"
+                "worst-case cache-hit ping ${worst_usd:.4} exceeds the ${rewrite_usd:.4} rewrite it would save"
             ),
             PeriodEnd::HoursReached(h) => write!(f, "{h}h window reached"),
             PeriodEnd::Expired { age_secs } => write!(
@@ -365,6 +412,11 @@ pub struct PeriodConfig {
     pub model: String,
     /// The ping's `max_tokens` (worst-case output).
     pub max_tokens: u64,
+    /// Output a ping is expected to produce (≤ `max_tokens`; see
+    /// [`ping_output_estimate`]). `max_tokens` itself prices every ping at
+    /// its worst case, as before (the session does so once a ping has
+    /// produced more than the estimate).
+    pub output_estimate: u64,
     /// Replaces `ping_interval(honoured TTL)` (test seam only).
     pub interval_override: Option<Duration>,
     /// Longest an `auto` period may run, in hours
@@ -416,10 +468,19 @@ pub struct Period {
     prefix_tokens: u64,
     /// Ping 1 legitimately writes the last turn's uncached tail and reply.
     first_write: u64,
+    /// Re-writing the prefix at the honoured TTL: what the period saves.
+    rewrite_usd: f64,
+    /// Output a ping may bill beyond the expected output: `max_tokens −
+    /// output_estimate` at the output price. Constant for the period.
+    reserve_usd: f64,
+    /// `rewrite_usd + reserve_usd`: the most the period can ever bill.
     bound_usd: f64,
     ledger_usd: f64,
+    /// The next ping on a cache hit with the expected output: the
+    /// ski-rental decision (`ledger + expected ≤ rewrite`).
+    expected_next_usd: f64,
     /// Read-path worst case of the next ping (cache hit, `max_tokens` of
-    /// output): the ski-rental basis.
+    /// output): the hard-bound check (`ledger + worst ≤ bound`).
     worst_next_usd: f64,
     /// What the next ping can bill if dispatched, a full cache miss
     /// included: the `max_session_cost` admission basis.
@@ -517,8 +578,11 @@ impl Period {
             fingerprint,
             prefix_tokens,
             first_write,
+            rewrite_usd: 0.0,
+            reserve_usd: 0.0,
             bound_usd: 0.0,
             ledger_usd: 0.0,
+            expected_next_usd: 0.0,
             worst_next_usd: 0.0,
             exposure_next_usd: 0.0,
             ping_input: PING_INPUT_ESTIMATE,
@@ -546,10 +610,13 @@ impl Period {
         let interval = p.interval();
         p.next_at = (anchor.mono + interval).max(now);
         p.next_wall = (anchor.wall + interval).max(wall);
+        // `worst > rewrite + reserve` ⇔ `expected > rewrite`: the check that
+        // guards the bound is the expected-cost decision.
         if p.worst_next_usd > p.bound_usd * (1.0 + BOUND_EPSILON) {
             return Err(PeriodEnd::PingTooExpensive {
+                expected_usd: p.expected_next_usd,
                 worst_usd: p.worst_next_usd,
-                bound_usd: p.bound_usd,
+                rewrite_usd: p.rewrite_usd,
             });
         }
         if let Some(r) = p
@@ -573,20 +640,39 @@ impl Period {
         }
     }
 
-    /// Bound, read-path worst case and cap exposure for the current prefix,
-    /// TTL and ping count.
+    /// Bound, expected and read-path worst case, and cap exposure for the
+    /// current prefix, TTL and ping count.
+    ///
+    /// The hard bound is `rewrite + reserve`, where the reserve is the
+    /// output a ping may bill beyond the expected output. Every check stays
+    /// `ledger + worst ≤ bound`, so the ledger (measured spend; an aborted
+    /// ping booked at its worst case) can never pass the bound reported.
+    /// Because `worst − expected` is exactly the reserve, that same check is
+    /// `ledger + expected ≤ rewrite`: the start decision and every later one
+    /// run on the expected cost. Thinking off / adaptive: the estimate is
+    /// `max_tokens` (1), the reserve 0 and the bound the rewrite, as before.
     fn reprice(&mut self) {
         let model = self.cfg.model.as_str();
-        self.bound_usd = rewrite_cost_usd(model, self.ttl, self.prefix_tokens);
+        let max_tokens = self.cfg.max_tokens;
+        let expected_out = self.cfg.output_estimate.min(max_tokens);
+        self.rewrite_usd = rewrite_cost_usd(model, self.ttl, self.prefix_tokens);
         let write = if self.pings == 0 { self.first_write } else { 0 };
-        self.worst_next_usd = request_cost_usd(
-            model,
-            self.ttl,
-            self.prefix_tokens.saturating_sub(write),
-            write,
-            self.ping_input,
-            self.cfg.max_tokens,
-        );
+        let hit = |out| {
+            request_cost_usd(
+                model,
+                self.ttl,
+                self.prefix_tokens.saturating_sub(write),
+                write,
+                self.ping_input,
+                out,
+            )
+        };
+        self.expected_next_usd = hit(expected_out);
+        self.worst_next_usd = hit(max_tokens);
+        // Priced in the ping's own request (the output price can depend on
+        // the prompt-size tier), so `worst − expected` is the reserve exactly.
+        self.reserve_usd = (self.worst_next_usd - self.expected_next_usd).max(0.0);
+        self.bound_usd = self.rewrite_usd + self.reserve_usd;
         // A miss rewrites the whole prefix. The ping carries the configured
         // markers, so under `1h` / `hybrid` that write can be billed at the
         // 1h price even while the honoured TTL is 5m: take the dearer one.
@@ -622,11 +708,27 @@ impl Period {
     pub fn ledger_usd(&self) -> f64 {
         self.ledger_usd
     }
+    /// The most this period can ever bill: [`rewrite_usd`](Self::rewrite_usd)
+    /// plus [`reserve_usd`](Self::reserve_usd). Every ping is admitted only
+    /// while `ledger + worst-case ping ≤ bound`.
     pub fn bound_usd(&self) -> f64 {
         self.bound_usd
     }
+    /// Re-writing the prefix at the honoured TTL: what the period saves.
+    pub fn rewrite_usd(&self) -> f64 {
+        self.rewrite_usd
+    }
+    /// Output a ping may bill beyond the expected output (0 with thinking
+    /// off / adaptive, or once the estimate was exceeded).
+    pub fn reserve_usd(&self) -> f64 {
+        self.reserve_usd
+    }
+    /// The next ping on a cache hit with the expected output.
+    pub fn expected_next_usd(&self) -> f64 {
+        self.expected_next_usd
+    }
     /// Read-path worst case of the next ping (cache hit, `max_tokens` of
-    /// output): what the ski-rental bound checks use, and what an aborted
+    /// output): what the hard-bound checks use, and what an aborted
     /// in-flight ping is booked at.
     pub fn worst_next_usd(&self) -> f64 {
         self.worst_next_usd
@@ -691,6 +793,7 @@ impl Period {
             PeriodEnd::BoundReached {
                 ledger_usd: self.ledger_usd,
                 bound_usd: self.bound_usd,
+                reserve_usd: self.reserve_usd,
             },
         )
     }
@@ -816,6 +919,7 @@ impl Period {
             return Err(PeriodEnd::BoundReached {
                 ledger_usd: self.ledger_usd,
                 bound_usd: self.bound_usd,
+                reserve_usd: self.reserve_usd,
             });
         }
         self.retries += 1;
@@ -845,6 +949,33 @@ impl PingTask {
     }
 }
 
+/// Whether attaching a client of `kind` in `mode` makes a session eligible
+/// for keep-warm.
+///
+/// - An `Observe` attach never does: it cannot send input, so only watching
+///   a session (`synaps attach --observe`, a read-only pane in another app)
+///   must not make it eligible for paid keep-warm.
+/// - A TUI or `synaps attach` client that can type (`Mirror`/`Takeover`)
+///   always does. The daemon cannot tell a piped `synaps attach` from a
+///   terminal one, so a piped attach already qualifies.
+/// - `synaps chat`, rpc and server clients (bridges, scripts, other apps
+///   driving the daemon) qualify only with `cache_keepwarm_headless = true`:
+///   nobody may be coming back in human time, so the owner opts in.
+/// - Test clients never do.
+///
+/// `synaps rpc` (stdin/stdout JSON) runs its own runtime without a session
+/// actor, so neither rule reaches it; this is the daemon-side rule only.
+pub(crate) fn client_qualifies(kind: ClientKind, mode: AttachMode, headless: bool) -> bool {
+    if mode == AttachMode::Observe {
+        return false;
+    }
+    match kind {
+        ClientKind::Tui | ClientKind::Attach => true,
+        ClientKind::Chat | ClientKind::Rpc | ClientKind::Server => headless,
+        ClientKind::Test => false,
+    }
+}
+
 /// Actor-owned keep-warm state.
 #[derive(Default)]
 pub(crate) struct KeepWarmState {
@@ -852,6 +983,9 @@ pub(crate) struct KeepWarmState {
     configured: CacheKeepWarm,
     /// `cache_keepwarm_auto_max_hours` from config at session create.
     auto_max_hours: u32,
+    /// `cache_keepwarm_headless` from config at session create: chat, rpc
+    /// and server clients qualify too (see [`client_qualifies`]).
+    headless: bool,
     /// The current cache epoch's carry (see [`EpochCarry`]); `None` until a
     /// period of this epoch ended. Reset by every real request's usage, a
     /// compaction and a conversation swap.
@@ -868,12 +1002,18 @@ pub(crate) struct KeepWarmState {
     turn_started_at: Option<Instant>,
     /// Usage of the latest real request (`None` until one reported).
     last_request: Option<KeepWarmUsage>,
-    /// A TUI/attach client that can type (not `Observe`) has been attached
-    /// at some point. Script/RPC-only or observe-only sessions (nobody will
-    /// be back to type in human time) never keep warm.
+    /// A qualifying client (see [`client_qualifies`]) has been attached at
+    /// some point. By default that is a TUI/attach client that can type;
+    /// script/RPC-only or observe-only sessions (nobody will be back to type
+    /// in human time) never keep warm unless `cache_keepwarm_headless` is on.
     pub(crate) interactive_seen: bool,
     last_end: Option<String>,
     session_pings: u32,
+    /// A ping produced more output than [`PING_OUTPUT_ESTIMATE`]: this
+    /// session's later periods price every ping at `max_tokens` (no
+    /// reserve), so at most one period ever relies on the estimate after it
+    /// proved wrong.
+    estimate_exceeded: bool,
 }
 
 /// The per-session `/keepwarm` override, readable without the actor.
@@ -883,6 +1023,7 @@ impl KeepWarmState {
     pub(crate) fn new(
         configured: CacheKeepWarm,
         auto_max_hours: u32,
+        headless: bool,
         override_slot: OverrideSlot,
     ) -> Self {
         let override_mode = *override_slot
@@ -891,6 +1032,7 @@ impl KeepWarmState {
         Self {
             configured,
             auto_max_hours,
+            headless,
             override_mode,
             override_slot,
             ..Self::default()
@@ -970,16 +1112,10 @@ impl SessionActor {
         None
     }
 
-    /// A client attached: TUI/attach clients that can type (`Mirror` or
-    /// `Takeover`) mark the session interactive. An `Observe` attach never
-    /// does: it cannot send input, so only watching a session (`synaps
-    /// attach --observe`, a read-only pane in another app) must not make it
-    /// eligible for paid keep-warm.
+    /// A client attached: one that [qualifies](client_qualifies) marks the
+    /// session eligible for keep-warm for the rest of its life.
     pub(crate) fn cache_keepwarm_note_attach(&mut self, kind: ClientKind, mode: AttachMode) {
-        if mode == AttachMode::Observe {
-            return;
-        }
-        if matches!(kind, ClientKind::Tui | ClientKind::Attach) {
+        if client_qualifies(kind, mode, self.cache_keepwarm.headless) {
             self.cache_keepwarm.interactive_seen = true;
         }
     }
@@ -1167,11 +1303,21 @@ impl SessionActor {
             self.cache_keepwarm.last_end = Some(format!("not started: {reason}"));
             return;
         }
+        // The TTL the requests actually carry: `cache_ttl = auto` resolved
+        // against the bound credential kind (1h on OAuth), exactly as the
+        // request builder resolves it, so an auto-1h session schedules and
+        // cost-checks like an explicit `1h` one.
+        let ttl = self.runtime.resolved_cache_ttl().await;
         let cfg = PeriodConfig {
             mode,
-            ttl: self.runtime.cache_ttl(),
+            ttl,
             model: self.runtime.model().to_string(),
             max_tokens: probe.max_tokens,
+            output_estimate: if self.cache_keepwarm.estimate_exceeded {
+                probe.max_tokens
+            } else {
+                ping_output_estimate(probe.max_tokens)
+            },
             interval_override: interval_override(),
             auto_max_hours: self.cache_keepwarm.auto_max_hours,
             reply_tokens: Some(crate::runtime::keepwarm::reply_prefix_tokens(
@@ -1208,6 +1354,9 @@ impl SessionActor {
                     first_ping_in_secs = p.next_at().saturating_duration_since(now).as_secs(),
                     prefix_tokens = p.prefix_tokens(),
                     bound_usd = p.bound_usd(),
+                    rewrite_usd = p.rewrite_usd(),
+                    reserve_usd = p.reserve_usd(),
+                    expected_ping_usd = p.expected_next_usd(),
                     worst_ping_usd = p.exposure_next_usd(),
                     "cache keep-warm period started"
                 );
@@ -1334,6 +1483,17 @@ impl SessionActor {
         let bill = task.bill();
         let cost = bill.cost_usd;
         self.cache_keepwarm_book(&bill.usage, cost);
+        if bill.usage.output_tokens > PING_OUTPUT_ESTIMATE && !self.cache_keepwarm.estimate_exceeded
+        {
+            self.cache_keepwarm.estimate_exceeded = true;
+            tracing::warn!(
+                session = %self.id,
+                output = bill.usage.output_tokens,
+                estimate = PING_OUTPUT_ESTIMATE,
+                "cache keep-warm ping out-thought its output estimate; \
+                 later periods price pings at max_tokens"
+            );
+        }
         for notice in &report.notices {
             self.emit(crate::session::SessionEventWire::SystemNotice(
                 notice.clone(),
@@ -1448,6 +1608,9 @@ impl SessionActor {
                 "pings": p.pings(),
                 "ledger_usd": p.ledger_usd(),
                 "bound_usd": p.bound_usd(),
+                "rewrite_usd": p.rewrite_usd(),
+                "reserve_usd": p.reserve_usd(),
+                "expected_ping_usd": p.expected_next_usd(),
                 "worst_ping_usd": p.exposure_next_usd(),
                 "prefix_tokens": p.prefix_tokens(),
                 "next_ping_in_secs": next.unwrap_or(0),
@@ -1462,6 +1625,25 @@ impl SessionActor {
             "session_pings": kw.session_pings,
             "session_keepwarm_usd": self.conv.keepwarm_cost,
             "last_end": kw.last_end,
+        })
+    }
+
+    /// The configured prompt-cache TTL and what it resolves to on the bound
+    /// credential kind right now (`auto`: 1h OAuth, 5m API key): what the
+    /// next request's markers carry. `resolved` is `null` off the native
+    /// Anthropic transport, which sends no markers. `Status` and
+    /// `/keepwarm status`.
+    /// `&mut self` only so the future stays `Send` (the actor is not `Sync`).
+    pub(crate) async fn cache_ttl_status_json(&mut self) -> serde_json::Value {
+        // Same native-transport check keep-warm eligibility uses.
+        let resolved = if self.runtime.cache_keepwarm_ineligibility().is_none() {
+            Some(self.runtime.resolved_cache_ttl().await.as_str())
+        } else {
+            None
+        };
+        serde_json::json!({
+            "setting": self.runtime.cache_ttl().as_str(),
+            "resolved": resolved,
         })
     }
 
@@ -1492,7 +1674,8 @@ impl SessionActor {
             }
         }
         let prefix_matches = self.cache_keepwarm_recheck().await;
-        let status = self.cache_keepwarm_status_json(prefix_matches);
+        let mut status = self.cache_keepwarm_status_json(prefix_matches);
+        status["cache_ttl"] = self.cache_ttl_status_json().await;
         serde_json::json!({
             "kind": "output",
             "text": render_status(&status),
@@ -1507,15 +1690,31 @@ pub(crate) fn render_status(s: &serde_json::Value) -> String {
     let spent = s["session_keepwarm_usd"].as_f64().unwrap_or(0.0);
     let pings = s["session_pings"].as_u64().unwrap_or(0);
     let mut out = format!("cache keep-warm: {mode} — this session: {pings} pings, ${spent:.4}");
+    // `prompt-cache TTL: 1h (auto)` / `prompt-cache TTL: 5m`.
+    if let Some(resolved) = s["cache_ttl"]["resolved"].as_str() {
+        out.push_str(&format!("\nprompt-cache TTL: {resolved}"));
+        if s["cache_ttl"]["setting"].as_str() == Some("auto") {
+            out.push_str(" (auto)");
+        }
+    }
     let p = &s["period"];
     if p.is_object() {
+        let reserve = p["reserve_usd"].as_f64().unwrap_or(0.0);
+        let bound = if reserve > 0.0 {
+            format!(
+                "${:.4} bound (${:.4} rewrite + ${reserve:.4} thinking reserve)",
+                p["bound_usd"].as_f64().unwrap_or(0.0),
+                p["rewrite_usd"].as_f64().unwrap_or(0.0),
+            )
+        } else {
+            format!("${:.4} bound", p["bound_usd"].as_f64().unwrap_or(0.0))
+        };
         out.push_str(&format!(
-            "\nactive: ping {} due in {}s (TTL {}s); ${:.4} spent of ${:.4} bound; prefix {}",
+            "\nactive: ping {} due in {}s (TTL {}s); ${:.4} spent of {bound}; prefix {}",
             p["pings"].as_u64().unwrap_or(0) + 1,
             p["next_ping_in_secs"].as_u64().unwrap_or(0),
             p["ttl_secs"].as_u64().unwrap_or(0),
             p["ledger_usd"].as_f64().unwrap_or(0.0),
-            p["bound_usd"].as_f64().unwrap_or(0.0),
             match s["prefix_matches"].as_bool() {
                 Some(true) => "unchanged",
                 Some(false) => "changed",
@@ -1535,6 +1734,28 @@ pub(crate) fn render_status(s: &serde_json::Value) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn client_qualification_rule() {
+        use AttachMode::{Mirror, Observe, Takeover};
+        use ClientKind::{Attach, Chat, Rpc, Server, Test, Tui};
+        for headless in [false, true] {
+            for kind in [Tui, Chat, Attach, Rpc, Server, Test] {
+                // Observe can never type: never eligible, opt-in or not.
+                assert!(!client_qualifies(kind, Observe, headless), "{kind:?} observe");
+            }
+            for mode in [Mirror, Takeover] {
+                // TUI / attach always; test clients never.
+                assert!(client_qualifies(Tui, mode, headless));
+                assert!(client_qualifies(Attach, mode, headless));
+                assert!(!client_qualifies(Test, mode, headless));
+                // Non-interactive clients only with the opt-in.
+                for kind in [Chat, Rpc, Server] {
+                    assert_eq!(client_qualifies(kind, mode, headless), headless, "{kind:?}");
+                }
+            }
+        }
+    }
+
     const MIN: Duration = Duration::from_secs(60);
     const OPUS: &str = "claude-opus-4-7";
     const SONNET: &str = "claude-sonnet-4-6";
@@ -1551,9 +1772,19 @@ mod tests {
             ttl,
             model: model.to_string(),
             max_tokens,
+            output_estimate: ping_output_estimate(max_tokens),
             interval_override: None,
             auto_max_hours: 0,
             reply_tokens: None,
+        }
+    }
+
+    /// Budgeted thinking priced at its worst case (the session's latch after
+    /// a ping out-thought the estimate): no reserve.
+    fn cfg_worst(mode: CacheKeepWarm, ttl: CacheTtl, model: &str, max_tokens: u64) -> PeriodConfig {
+        PeriodConfig {
+            output_estimate: max_tokens,
+            ..cfg_max(mode, ttl, model, max_tokens)
         }
     }
 
@@ -1753,15 +1984,29 @@ mod tests {
     fn an_expensive_ping_stops_the_period_early() {
         // Budgeted thinking that actually thought: 5k output tokens on
         // Sonnet 4.6 = $0.075 per ping on top of a $0.09 read.
-        let (heavy, ..) = run(
+        let heavy_ping = usage(SONNET, P, 0, 40, 5_000);
+        let (heavy, ledger, bound, ..) = run(
             cfg_max(CacheKeepWarm::Auto, CacheTtl::OneHour, SONNET, 5_001),
-            &[usage(SONNET, P, 0, 40, 5_000)],
+            std::slice::from_ref(&heavy_ping),
+        );
+        let (worst, worst_ledger, worst_bound, ..) = run(
+            cfg_worst(CacheKeepWarm::Auto, CacheTtl::OneHour, SONNET, 5_001),
+            std::slice::from_ref(&heavy_ping),
         );
         let (light, ..) = run(
             cfg_max(CacheKeepWarm::Auto, CacheTtl::OneHour, SONNET, 31),
             &[usage(SONNET, P, 0, 40, 30)],
         );
-        assert_eq!(heavy, 10, "rewrite $1.80 / ($0.09 read + $0.075 thinking)");
+        // Priced at the worst case: rewrite $1.80 / ($0.09 read + $0.075
+        // thinking) = 10 pings, all inside the $1.80 rewrite.
+        assert_eq!(worst, 10);
+        assert!((worst_bound - 1.80).abs() < 1e-9 && worst_ledger <= 1.80);
+        // With the estimate the ledger may run into the reserve (the pings
+        // out-thought it): one ping more, still inside the reported bound.
+        let reserve = (5_001 - PING_OUTPUT_ESTIMATE) as f64 * 15.0 / 1e6;
+        assert_eq!(heavy, 11);
+        assert!((bound - (1.80 + reserve)).abs() < 1e-9, "{bound}");
+        assert!(ledger > 1.80 && ledger <= bound, "{ledger} of {bound}");
         assert_eq!(light, 19);
     }
 
@@ -1781,43 +2026,129 @@ mod tests {
 
     /// Item: budgeted thinking can bill up to `max_tokens` of output. Sonnet
     /// 4.6 at xhigh (budget 32,768 → `max_tokens` 32,769) under 5m with a
-    /// 20k prefix: one worst-case ping ($0.49) costs more than the $0.075
-    /// rewrite it would save, so no ping is ever sent.
+    /// 20k prefix. Priced at its worst case (the latch after a ping
+    /// out-thought the estimate) one ping ($0.49) costs more than the $0.075
+    /// rewrite it would save, so none is sent. With the estimate the period
+    /// starts, and the bound it reports carries the whole overrun.
     #[test]
     fn budgeted_thinking_worst_case_must_fit_the_bound() {
         let t0 = Instant::now();
         let w0 = SystemTime::UNIX_EPOCH + Duration::from_secs(2_000);
         let small = usage(SONNET, 20_000, 0, 0, 0);
-        let err = Period::start(
-            1,
-            cfg_max(CacheKeepWarm::Auto, CacheTtl::FiveMinutes, SONNET, 32_769),
-            7,
-            &small,
-            TtlEvidence::default(),
-            anchor_at(t0, w0),
-            t0,
-            w0,
-        )
-        .unwrap_err();
-        match err {
+        let start_5m = |c| {
+            Period::start(1, c, 7, &small, TtlEvidence::default(), anchor_at(t0, w0), t0, w0)
+        };
+        let worst = cfg_worst(CacheKeepWarm::Auto, CacheTtl::FiveMinutes, SONNET, 32_769);
+        match start_5m(worst).unwrap_err() {
             PeriodEnd::PingTooExpensive {
+                expected_usd,
                 worst_usd,
-                bound_usd,
+                rewrite_usd,
             } => {
-                assert!((bound_usd - 0.075).abs() < 1e-9, "{bound_usd}");
+                assert!((rewrite_usd - 0.075).abs() < 1e-9, "{rewrite_usd}");
                 assert!(worst_usd > 0.49, "{worst_usd}");
+                assert_eq!(expected_usd, worst_usd, "no estimate: priced at worst");
             }
             other => panic!("{other}"),
         }
-        // A large prefix under 1h does fit: budgeted thinking runs there,
-        // and the worst case is what every pre-check charges.
+        let p = start_5m(cfg_max(CacheKeepWarm::Auto, CacheTtl::FiveMinutes, SONNET, 32_769))
+            .expect("expected ping fits the rewrite");
+        assert!((p.rewrite_usd() - 0.075).abs() < 1e-9);
+        let reserve = (32_769 - PING_OUTPUT_ESTIMATE) as f64 * 15.0 / 1e6;
+        assert!((p.reserve_usd() - reserve).abs() < 1e-9, "{}", p.reserve_usd());
+        assert!((p.bound_usd() - (0.075 + reserve)).abs() < 1e-9);
+        assert!(p.expected_next_usd() <= p.rewrite_usd());
+        assert!(p.worst_next_usd() <= p.bound_usd() * (1.0 + 1e-12));
+        // A large prefix under 1h fits even at the worst case.
         let p = start(
-            cfg_max(CacheKeepWarm::Auto, CacheTtl::OneHour, SONNET, 32_769),
+            cfg_worst(CacheKeepWarm::Auto, CacheTtl::OneHour, SONNET, 32_769),
             &usage(SONNET, P, 0, 0, 0),
             t0,
             w0,
         );
         assert!(p.worst_next_usd() > 0.58 && p.worst_next_usd() < p.bound_usd());
+        assert_eq!(p.reserve_usd(), 0.0);
+    }
+
+    /// Smallest prefix (fully cached, no tail) for which a period starts.
+    fn break_even(c: &PeriodConfig) -> u64 {
+        let t0 = Instant::now();
+        let w0 = SystemTime::UNIX_EPOCH + Duration::from_secs(2_000);
+        let starts = |prefix| {
+            let last = usage(&c.model, prefix, 0, 0, 0);
+            Period::start(1, c.clone(), 7, &last, ev_1h(), anchor_at(t0, w0), t0, w0).is_ok()
+        };
+        let (mut lo, mut hi) = (1, 1_000_000);
+        assert!(starts(hi) && !starts(lo));
+        while hi - lo > 1 {
+            let mid = (lo + hi) / 2;
+            if starts(mid) {
+                hi = mid;
+            } else {
+                lo = mid;
+            }
+        }
+        hi
+    }
+
+    /// The bench's refusal: Sonnet 4.6, budget 4,096 (`max_tokens` 4,097).
+    /// Priced at the worst case 5m keep-warm needs a ~17.9K prefix and 1h a
+    /// ~10.8K one; at the expected output (256 tokens) ~1.17K and ~0.71K;
+    /// adaptive / thinking off (`max_tokens` 1) below any cacheable prefix.
+    #[test]
+    fn break_even_prefix_budgeted_vs_adaptive() {
+        use CacheTtl::{FiveMinutes, OneHour};
+        let auto = CacheKeepWarm::Auto;
+        let worst_5m = break_even(&cfg_worst(auto, FiveMinutes, SONNET, 4_097));
+        let worst_1h = break_even(&cfg_worst(auto, OneHour, SONNET, 4_097));
+        let est_5m = break_even(&cfg_max(auto, FiveMinutes, SONNET, 4_097));
+        let est_1h = break_even(&cfg_max(auto, OneHour, SONNET, 4_097));
+        let adaptive_5m = break_even(&cfg(auto, FiveMinutes, OPUS));
+        let adaptive_1h = break_even(&cfg(auto, OneHour, OPUS));
+        println!(
+            "BREAK-EVEN worst 5m={worst_5m} 1h={worst_1h}; estimate 5m={est_5m} 1h={est_1h}; \
+             adaptive 5m={adaptive_5m} 1h={adaptive_1h}"
+        );
+        // (64 × $3 + 4,097 × $15) / ((1.25 − 0.1) × $3) = 17,869; / 1.9 → 10,816.
+        assert!((17_860..=17_880).contains(&worst_5m), "{worst_5m}");
+        assert!((10_810..=10_820).contains(&worst_1h), "{worst_1h}");
+        // (64 × $3 + 256 × $15) / 3.45 = 1,169; / 5.7 → 708.
+        assert!((1_165..=1_175).contains(&est_5m), "{est_5m}");
+        assert!((705..=712).contains(&est_1h), "{est_1h}");
+        // Below the smallest cacheable prefix (1,024): any cached prefix runs.
+        assert!(adaptive_5m < 1_024 && adaptive_1h < 1_024);
+        // The same model with thinking off: the estimate changes nothing.
+        let off = cfg_max(auto, FiveMinutes, SONNET, 1);
+        let off_no_estimate = PeriodConfig {
+            output_estimate: 1,
+            ..off.clone()
+        };
+        assert_eq!(break_even(&off), break_even(&off_no_estimate));
+    }
+
+    /// The hard guarantee: whatever a ping actually bills (up to its
+    /// `max_tokens`), the ledger never passes the bound the period reports;
+    /// and when pings stay within the estimate it never passes the rewrite.
+    #[test]
+    fn the_bound_holds_whatever_the_pings_think() {
+        for ttl in [CacheTtl::FiveMinutes, CacheTtl::OneHour] {
+            for prefix in [1_200, 2_000, 5_000, 20_000, 100_000] {
+                for out in [1, 100, PING_OUTPUT_ESTIMATE, 1_000, 4_097] {
+                    let c = cfg_max(CacheKeepWarm::Auto, ttl, SONNET, 4_097);
+                    let last = usage(SONNET, prefix, 0, 0, 0);
+                    let ping = usage(SONNET, prefix, 0, 40, out);
+                    let (pings, ledger, bound, reason, _) = run_from(c, &last, &[ping]);
+                    let rewrite = rewrite_cost_usd(SONNET, ttl, prefix);
+                    let ctx = format!("{ttl:?} prefix {prefix} out {out}: {pings} pings, {reason}");
+                    assert!(pings >= 1, "{ctx}");
+                    assert!(ledger <= bound * (1.0 + 1e-9), "{ctx}: ${ledger} > ${bound}");
+                    if out <= PING_OUTPUT_ESTIMATE {
+                        assert!(ledger <= rewrite * (1.0 + 1e-9), "{ctx}: ${ledger} > ${rewrite}");
+                    }
+                    assert!(matches!(reason, PeriodEnd::BoundReached { .. }), "{ctx}");
+                }
+            }
+        }
     }
 
     #[test]
@@ -2531,5 +2862,24 @@ mod tests {
         assert!(text.contains("$0.3000 spent of $1.8750 bound"), "{text}");
         assert!(text.contains("prefix unchanged"), "{text}");
         assert!(text.contains("last: prefix changed"), "{text}");
+        assert!(!text.contains("prompt-cache TTL"), "absent field, no line: {text}");
+    }
+
+    #[test]
+    fn status_renders_the_resolved_cache_ttl() {
+        let mut s = serde_json::json!({
+            "mode": "auto",
+            "active": false,
+            "period": null,
+            "session_pings": 0,
+            "session_keepwarm_usd": 0.0,
+            "cache_ttl": {"setting": "auto", "resolved": "1h"},
+        });
+        let text = render_status(&s);
+        assert!(text.contains("\nprompt-cache TTL: 1h (auto)\n"), "{text}");
+        s["cache_ttl"] = serde_json::json!({"setting": "5m", "resolved": "5m"});
+        let text = render_status(&s);
+        assert!(text.contains("\nprompt-cache TTL: 5m\n"), "{text}");
+        assert!(!text.contains("(auto)"), "{text}");
     }
 }

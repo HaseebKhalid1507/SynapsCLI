@@ -4,17 +4,20 @@ use ratatui::{
     text::{Line, Span},
 };
 
+pub(crate) mod paths;
+mod subagent_card;
+mod thinking;
+
 use super::app::SPINNER_FRAMES;
 use super::draw::{bash_trace, format_tool_name, tool_accent};
 use super::highlight::{
-    clamp_line, highlight_bash_output, highlight_read_output, highlight_tool_code,
+    clamp_line, clamp_line_ellipsis, highlight_bash_output, highlight_read_output, highlight_tool_code,
     is_read_tool_output, try_highlight_grep_line,
 };
 use super::markdown::{render_markdown_spans, wrap_text, wrap_text_spans};
+use super::text_metrics::width as display_width;
 use super::theme::THEME;
-use super::transcript::{
-    ChatMessage, LineMeta, MsgSlot, RenderCtx, TranscriptStore, THINKING_PLACEHOLDER,
-};
+use super::transcript::{ChatMessage, LineMeta, MsgSlot, RenderCtx, TranscriptStore};
 
 /// Replace column 0 of a card row (always a space: transcript rows start
 /// with the 3-space margin) with a heavy `┃` in `accent`, flush with the
@@ -337,125 +340,44 @@ impl TranscriptStore {
             }
 
             ChatMessage::Thinking(text) => {
-                // Only add spacing if previous message wasn't a User block
-                // (User blocks already have bottom margin)
-                let prev_was_user =
-                    i > 0 && matches!(&self.messages()[i - 1].msg, ChatMessage::User(_));
-                if !prev_was_user {
-                    lines.push(Line::from(""));
-                }
-                let dim = Style::default().fg(THEME.load().thinking_color);
-                let dim_italic = dim.add_modifier(Modifier::ITALIC);
-                // Header
-                let thinking_label = if text == THINKING_PLACEHOLDER {
-                    let braille = [
-                        '\u{28fe}', '\u{28f7}', '\u{28ef}', '\u{28df}', '\u{287f}', '\u{28bf}',
-                        '\u{28fb}', '\u{28fd}',
-                    ];
-                    let idx = (ctx.spinner_frame / 4) % braille.len();
-                    let wave: String = (0..3).map(|i| braille[(idx + i) % braille.len()]).collect();
-                    format!("{} thinking", wave)
-                } else {
-                    "thinking".to_string()
-                };
-                lines.push(Line::from(vec![
-                    Span::styled(format!("{}╭─ ", m), dim),
-                    Span::styled(thinking_label, dim.add_modifier(Modifier::DIM)),
-                ]));
-                // Body — structured with visual hierarchy
-                // Slice (c): rows are trimmed + char-chunked — transformed
-                // views, so they map to their untrimmed source lines at
-                // ContentLine granularity only (design §2 A2, lock L1
-                // fallback). The spinner placeholder has empty source
-                // (`source_text`), so its rows stay Chrome. Hidden tail
-                // lines (>8) are reachable via the D4 whole-card rule.
-                let is_placeholder = text == THINKING_PLACEHOLDER;
-                let non_empty: Vec<(usize, &str)> = text
-                    .lines()
-                    .enumerate()
-                    .filter(|(_, l)| !l.trim().is_empty())
-                    .collect();
-                let show = non_empty.len().min(8);
-                // Calculate usable width for thinking content
-                let prefix_len = m.len() + 4; // margin + "│ · " or "│ "
-                let content_width = width.saturating_sub(prefix_len);
-
-                for (k, (src_line, line)) in non_empty[..show].iter().enumerate() {
-                    let meta = if is_placeholder {
-                        LineMeta::Chrome
-                    } else {
-                        LineMeta::ContentLine {
-                            msg_idx: i,
-                            src_line: *src_line,
-                        }
-                    };
-                    let trimmed = line.trim();
-                    let is_last = k == show - 1 && non_empty.len() <= 8;
-                    let connector = if is_last { "╰" } else { "│" };
-                    let continuation = "│";
-
-                    // Detect structure in thinking
-                    let (prefix_char, line_style) =
-                        if trimmed.starts_with("- ") || trimmed.starts_with("* ") {
-                            ("· ", dim_italic)
-                        } else if trimmed.ends_with(':') || trimmed.starts_with('#') {
-                            ("", dim.add_modifier(Modifier::BOLD))
-                        } else if trimmed.starts_with("```") {
-                            ("", dim.add_modifier(Modifier::DIM))
-                        } else {
-                            ("", dim_italic)
-                        };
-
-                    // Wrap manually to preserve connector on each line
-                    let first_prefix = format!("{}{} {}", m, connector, prefix_char);
-                    let cont_prefix =
-                        format!("{}{} {}", m, continuation, " ".repeat(prefix_char.len()));
-
-                    if content_width > 10 {
-                        let chars: Vec<char> = trimmed.chars().collect();
-                        let mut pos = 0;
-                        let mut is_first = true;
-                        while pos < chars.len() {
-                            let chunk_len = content_width.min(chars.len() - pos);
-                            let chunk: String = chars[pos..pos + chunk_len].iter().collect();
-                            let prefix = if is_first {
-                                &first_prefix
-                            } else {
-                                &cont_prefix
-                            };
-                            lines.push_meta(
-                                Line::from(Span::styled(
-                                    format!("{}{}", prefix, chunk),
-                                    line_style,
-                                )),
-                                meta.clone(),
-                            );
-                            pos += chunk_len;
-                            is_first = false;
-                        }
-                    } else {
-                        lines.push_meta(
-                            Line::from(Span::styled(
-                                format!("{}{}", first_prefix, trimmed),
-                                line_style,
-                            )),
-                            meta,
-                        );
-                    }
-                }
-                if non_empty.len() > 8 {
-                    lines.push(Line::from(Span::styled(
-                        format!("{}╰ +{} lines", m, non_empty.len() - 8),
-                        dim,
-                    )));
-                }
+                // The light open rail at the message margin
+                // (render/thinking.rs). Slice (c): the body is
+                // `render_markdown_spans` over the raw source, so its rows
+                // carry the agent text's provenance (re-verified on the final
+                // row, lock L1); the placeholder's source is empty
+                // (`source_text`), so it is all Chrome. Collapsed rows are
+                // reachable through the footer's ContentLine (D4 whole-card
+                // rule).
+                let prev_ends_blank = i > 0
+                    && matches!(
+                        &self.messages()[i - 1].msg,
+                        ChatMessage::User(_)
+                            | ChatMessage::Text(_)
+                            | ChatMessage::Event { .. }
+                            | ChatMessage::Thinking(_)
+                    );
+                thinking::render(
+                    &mut lines,
+                    text,
+                    tmsg.thought,
+                    i,
+                    width,
+                    self.now(),
+                    ctx,
+                    prev_ends_blank,
+                    self.show_full_output(),
+                );
             }
 
             ChatMessage::Text(text) => {
                 // Turn boundary: two blank lines of breathing room between the
                 // previous block and the agent header. Replaces the old
-                // ──── · ──── divider — the extra <br> carries the beat.
-                if i > 0 {
+                // ──── · ──── divider — the extra <br> carries the beat. A
+                // thought is the answer's own prelude: it already ends in a
+                // blank row, and the answer hangs right under it.
+                let after_thought =
+                    i > 0 && matches!(&self.messages()[i - 1].msg, ChatMessage::Thinking(_));
+                if i > 0 && !after_thought {
                     lines.push(Line::from(""));
                     lines.push(Line::from(""));
                 }
@@ -884,9 +806,21 @@ impl TranscriptStore {
                 // Detect which tool produced this result (bound once for reuse below)
                 let preceding_tool = self.find_preceding_tool_name(i);
 
+                // subagent_* results are model-facing JSON: show the user a
+                // human card instead (display-only; `content` is untouched).
+                let human_card = if is_timeout || is_error {
+                    None
+                } else {
+                    preceding_tool.as_deref().and_then(|tool| {
+                        subagent_card::tool_result_card(tool, result, m, width, i, |h| {
+                            self.subagent_facts(h)
+                        })
+                    })
+                };
+
                 // Check if this is read tool output (line-numbered) and try syntax highlighting
                 // Skip fancy highlighting for timeouts — render everything in warning style
-                let highlighted_lines = if is_timeout || is_error {
+                let highlighted_lines = if is_timeout || is_error || human_card.is_some() {
                     None
                 } else if is_read_tool_output(&result_lines) {
                     let ext = self.find_preceding_read_extension(i);
@@ -902,7 +836,32 @@ impl TranscriptStore {
                 // tool output verbatim) and both highlight paths emit exactly
                 // one row per source line, so src_line == the enumeration
                 // index; wrapped plain rows all map to their source line.
-                if let Some(hl_lines) = highlighted_lines {
+                if let Some(card) = human_card.as_ref() {
+                    // A transformed view of the whole JSON result: every row
+                    // maps ContentLine onto it (lock L2: never Content).
+                    let cap = if self.show_full_output() { card.len() } else { 12 };
+                    for l in card.iter().take(cap) {
+                        lines.push_meta(
+                            clamp_line(l.clone(), width),
+                            LineMeta::ContentLine {
+                                msg_idx: i,
+                                src_line: 0,
+                            },
+                        );
+                    }
+                    if card.len() > cap {
+                        lines.push_meta(
+                            Line::from(Span::styled(
+                                format!("{}       +{} lines", m, card.len() - cap),
+                                Style::default().fg(THEME.load().muted),
+                            )),
+                            LineMeta::ContentLine {
+                                msg_idx: i,
+                                src_line: 0,
+                            },
+                        );
+                    }
+                } else if let Some(hl_lines) = highlighted_lines {
                     if !is_error && !is_timeout {
                         for (li, hl_line) in hl_lines.into_iter().enumerate() {
                             let dimmed_spans: Vec<Span> = hl_line
@@ -938,9 +897,12 @@ impl TranscriptStore {
                     for (li, line) in result_lines[..show].iter().enumerate() {
                         // Try to detect and highlight grep output (skip for timeout/error)
                         if !is_timeout && !is_error {
-                            if let Some(grep_spans) = try_highlight_grep_line(line, m) {
+                            // Display-only: paths under the session cwd
+                            // shown relative; a row too wide ends in `…`.
+                            let shorten = |p: &str| self.path_base().shorten(p).into_owned();
+                            if let Some(grep_spans) = try_highlight_grep_line(line, m, &shorten) {
                                 lines.push_meta(
-                                    clamp_line(Line::from(grep_spans), width),
+                                    clamp_line_ellipsis(Line::from(grep_spans), width),
                                     LineMeta::ContentLine {
                                         msg_idx: i,
                                         src_line: li,
@@ -949,6 +911,11 @@ impl TranscriptStore {
                                 continue;
                             }
                         }
+                        let line = if preceding_tool.as_deref() == Some("find") {
+                            self.path_base().shorten(line)
+                        } else {
+                            std::borrow::Cow::Borrowed(*line)
+                        };
                         let full = format!("{}       {}", m, line);
                         for wline in wrap_text(&full, width) {
                             let body_style = if is_error || is_timeout {
@@ -966,7 +933,7 @@ impl TranscriptStore {
                         }
                     }
                 }
-                if result_lines.len() > show {
+                if human_card.is_none() && result_lines.len() > show {
                     // D4 (as locked): the "+N lines" truncation row stands in
                     // for the hidden tail — ContentLine anchored at the first
                     // hidden source line; slice (d)'s copy path reads a
@@ -1045,14 +1012,17 @@ impl TranscriptStore {
                         };
                         // A tool that printed nothing still ends: say so
                         // rather than leave its card open-ended (#287).
-                        let summary = if result_lines.is_empty() {
-                            "no output".to_string()
+                        let summary = if human_card.is_some() {
+                            // The card already says what happened.
+                            String::new()
+                        } else if result_lines.is_empty() {
+                            " (no output)".to_string()
                         } else {
-                            format!("{} lines", result_lines.len())
+                            format!(" ({} lines)", result_lines.len())
                         };
                         lines.push(Line::from(vec![
                             Span::styled(
-                                format!("{}     \u{2514}\u{2500} ok ({})", m, summary),
+                                format!("{}     \u{2514}\u{2500} ok{}", m, summary),
                                 Style::default().fg(THEME.load().tool_result_ok),
                             ),
                             Span::styled(
@@ -1197,13 +1167,76 @@ impl TranscriptStore {
                 ]));
                 // Content
                 let text_style = Style::default().fg(theme.event_body()).bg(event_bg);
-                for (src_line, line_off, line) in source_lines(text) {
-                    let prefix_len = m.len() + 2;
-                    for row in wrap_text_spans(&format!("{}  {}", m, line), width) {
-                        let rendered = format!("{:<width$}", row.text, width = width);
-                        let meta =
-                            classify_row(&rendered, &row, line, line_off, prefix_len, i, src_line);
-                        lines.push_meta(Line::from(Span::styled(rendered, text_style)), meta);
+                // A subagent completion carries a model-facing sentence
+                // ("… Call subagent_collect with handle_id …"); show the user
+                // a compact summary + preview. Display-only: `text` (and the
+                // model's prompt-cached copy) is untouched.
+                let completion = (source == "subagent")
+                    .then(|| subagent_card::parse_completion(text))
+                    .flatten();
+                if let Some(c) = completion {
+                    let meta = LineMeta::ContentLine {
+                        msg_idx: i,
+                        src_line: 0,
+                    };
+                    let (glyph, _, color) = subagent_card::status_badge(c.status);
+                    let verb = match c.status {
+                        "completed" => "finished".to_string(),
+                        other => subagent_card::status_badge(other).1,
+                    };
+                    let head = format!(
+                        "{}  {} {} {} \u{00B7} {}",
+                        m,
+                        glyph,
+                        c.name,
+                        verb,
+                        subagent_card::fmt_secs(c.secs)
+                    );
+                    let gap = width.saturating_sub(display_width(head.as_str()));
+                    let glyph_at = m.len() + 2;
+                    lines.push_meta(
+                        clamp_line(
+                            Line::from(vec![
+                                Span::styled(head[..glyph_at].to_string(), text_style),
+                                Span::styled(
+                                    format!("{} ", glyph),
+                                    Style::default().fg(color).bg(event_bg),
+                                ),
+                                Span::styled(
+                                    head[glyph_at + glyph.len() + 1..].to_string(),
+                                    text_style.add_modifier(Modifier::BOLD),
+                                ),
+                                Span::styled(" ".repeat(gap), text_style),
+                            ]),
+                            width,
+                        ),
+                        meta.clone(),
+                    );
+                    let mut body: Vec<(String, Style)> = Vec::new();
+                    if let Some(r) = c.reason {
+                        body.push((
+                            format!("reason: {}", r),
+                            Style::default().fg(theme.error_color).bg(event_bg),
+                        ));
+                    }
+                    for pl in super::markdown::strip_md_markers(c.preview).lines() {
+                        body.push((pl.to_string(), text_style));
+                    }
+                    for (line, st) in body {
+                        for wline in wrap_text(&format!("{}    {}", m, line), width) {
+                            let rendered = format!("{:<width$}", wline, width = width);
+                            lines.push_meta(Line::from(Span::styled(rendered, st)), meta.clone());
+                        }
+                    }
+                } else {
+                    for (src_line, line_off, line) in source_lines(text) {
+                        let prefix_len = m.len() + 2;
+                        for row in wrap_text_spans(&format!("{}  {}", m, line), width) {
+                            let rendered = format!("{:<width$}", row.text, width = width);
+                            let meta =
+                                classify_row(&rendered, &row, line, line_off, prefix_len, i, src_line);
+                            lines.push_meta(Line::from(Span::styled(rendered, text_style)), meta);
+                        }
                     }
                 }
                 // Bottom padding
@@ -1316,6 +1349,52 @@ mod meta_tests {
         }
     }
 
+    /// Thinking rows word-wrap (no mid-word cuts) on the open rail: the
+    /// `╭─ ◇` header, `│` on every body row with the text two cells off it,
+    /// and the closing `╰` on the block's last row only.
+    #[test]
+    fn thinking_wraps_on_words_and_closes_on_the_last_row() {
+        let last = "The safest approach is to not collect and just give a brief reply, \
+                    since there's no new instruction asking me to collect here.";
+        let text = format!("First short thought.\n{last}");
+        let mut store = TranscriptStore::new(crate::tui::clock::TuiClock::real());
+        store.push_msg(ChatMessage::Thinking(text));
+        for width in [40usize, 57, 80, 117] {
+            let rows: Vec<String> = store
+                .render_message_lines(0, width, &ctx())
+                .lines()
+                .iter()
+                .map(flatten)
+                .filter(|r| !r.is_empty())
+                .collect();
+            assert!(
+                rows[0].starts_with("   \u{256d}\u{2500} \u{25c7} thought"),
+                "w={width}: {rows:#?}"
+            );
+            let body = &rows[1..];
+            let closers: Vec<usize> = body
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| r.starts_with("   \u{2570}"))
+                .map(|(k, _)| k)
+                .collect();
+            assert_eq!(closers, vec![body.len() - 1], "w={width}: {rows:#?}");
+            assert!(
+                body[..body.len() - 1].iter().all(|r| r.starts_with("   \u{2502}  ")),
+                "w={width}: rail on every row: {rows:#?}"
+            );
+            let words: Vec<String> = body
+                .iter()
+                .skip(1)
+                .map(|r| r.chars().skip(6).collect::<String>().trim().to_string())
+                .collect();
+            assert_eq!(words.join(" "), last, "w={width}: words intact: {rows:#?}");
+            for r in &rows {
+                assert!(unicode_width::UnicodeWidthStr::width(r.as_str()) <= width, "{r:?}");
+            }
+        }
+    }
+
     /// P10 slice (a) plumbing invariants: every rendered row is classified
     /// (meta parallel to lines through every arm, incl. the tool-card
     /// `split_off` → `panel_block` → re-extend seam); `Content` ranges are
@@ -1331,7 +1410,9 @@ mod meta_tests {
                 .into(),
         ));
         store.push_msg(ChatMessage::Thinking(
-            "pondering the request at hand".into(),
+            "pondering the request at hand, in plain prose that wraps at forty\n\
+             ## A plan\n- weigh `sync_cache` and **the splice**\n\n```rust\nlet y = 2;\n```"
+                .into(),
         ));
         store.push_msg(ChatMessage::Text(
             "Some **markdown** text with `code`\n\n```rust\nlet x = 1;\n```".into(),
@@ -1428,7 +1509,7 @@ mod meta_tests {
 
         // Plumbing must actually emit provenance for the plain-wrap paths —
         // an all-Chrome regression would pass the checks above vacuously.
-        for (idx, wants_content) in [(0usize, true), (6, true), (5, true)] {
+        for (idx, wants_content) in [(0usize, true), (1, true), (6, true), (5, true)] {
             let entry = store.render_message_lines(idx, 80, &ctx());
             assert_eq!(
                 entry

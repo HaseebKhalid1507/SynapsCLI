@@ -66,6 +66,8 @@ pub(crate) const EXCLUDED_CONFIG_KEYS: &[(&str, &str)] = &[
     ("subagent_max_total", "legacy flat alias of subagent.max_total (edit that row)"),
     ("favorite_models", "owned by the model picker (/models favorites)"),
     ("disabled_plugins", "owned by the Plugins tab"),
+    ("tool_scope_slice", "operator cgroup placement, set by hand together with the slice's limits"),
+    ("daemon_scope_slice", "operator cgroup placement, set by hand together with the slice's limits"),
     ("provider.*", "owned by the Providers tab (API keys)"),
     ("keybind.*", "keybind family (keybind registry), not a single setting"),
 ];
@@ -199,6 +201,14 @@ define_settings! {
             }
         };
 
+    "thinking_display", "Thinking display", Model,
+        EditorKind::Cycler(&["summarized", "omitted"]),
+        "What Anthropic sends of the model's thinking. summarized (default): the thought's summary streams in, and the reply waits for it, then lands in a burst. omitted: no thinking text, just a timed 'thought' line, and the reply starts sooner and streams evenly (measured on Opus 5.5: ~2 s vs 3–5 s at high effort). Thinking effort is unchanged, and the reasoning still carries over between turns. Switching keeps the prompt cache. Applies to new sessions; workers always send summarized.",
+        |_app, value| match value {
+            "summarized" | "omitted" => config_edit("thinking_display", value),
+            _ => SettingApply::Local(Err("expected summarized or omitted".to_string())),
+        };
+
     "reasoning_type", "Reasoning", Model,
         EditorKind::Display,
         "How the active model expresses reasoning depth (derived from exact model capabilities; read-only).",
@@ -238,6 +248,11 @@ define_settings! {
             Err(_) => SettingApply::Local(Ok(())),
         };
 
+    "subagent_thinking", "Subagent thinking", Agent,
+        EditorKind::Cycler(&["low", "medium", "high", "xhigh", "max"]),
+        "Default effort for new subagents; independent of foreground thinking. Resume keeps recorded effort unless overridden.",
+        |_app, value| config_edit("subagent_thinking", value);
+
     "subagent_timeout", "Subagent timeout", Agent, EditorKind::Text { numeric: true },
         "Seconds before a dispatched subagent is canceled.",
         |_app, value| match value.parse::<u64>() {
@@ -245,12 +260,50 @@ define_settings! {
             Err(_) => SettingApply::Local(Ok(())),
         };
 
+    "subagent_cold_resume_compact_tokens", "Cold resume compact", Agent,
+        EditorKind::Text { numeric: true },
+        "subagent_resume of a worker whose prompt cache expired replays a compact context instead of the full transcript once its history reaches this many tokens (default 100000; 0 = always replay in full). Applies from the next resume.",
+        |_app, value| whole_number("subagent_cold_resume_compact_tokens", value);
+
+    "subagent_context_management", "Subagent rollover", Agent,
+        EditorKind::Cycler(&["auto", "off"]),
+        "Automatic context rollover for subagent workers: auto moves a worker's older rounds out of its context once it reaches the rollover size (saved as plain text beside its resume archive, nothing summarized; the task and recent rounds stay); off lets a worker's context grow until the window is full (default auto). Applies to workers started afterwards.",
+        |_app, value| config_edit("subagent_context_management", value);
+
+    "subagent_rollover_tokens", "Subagent rollover at", Agent,
+        EditorKind::Text { numeric: true },
+        "Context size, in tokens, at which a worker rolls over to a ~100k successor (default 200000, at least 20000; a smaller model window's own threshold wins). Applies to workers started afterwards.",
+        |_app, value| whole_number("subagent_rollover_tokens", value);
+
+    "subagent_transform_hooks", "Subagent output hooks", Agent, EditorKind::Cycler(&["on", "off"]),
+        "Extensions that rewrite tool output (after_tool_call replace with tools.transform_output: compression, redaction) also see subagent workers' tool results, as they see the main session's; no other hook runs in a worker, so a worker never asks for confirmation (default on; off = worker tool results reach history untransformed). Applies to workers started afterwards.",
+        |_app, value| on_off("subagent_transform_hooks", value);
+
     "max_tool_output", "Max tool output", ToolLimits, EditorKind::Text { numeric: true },
         "Bytes to capture from a tool before truncating.",
         |_app, value| match value.parse::<usize>() {
             Ok(bytes) => SettingApply::Session(SessionSetting::MaxToolOutput { bytes }),
             Err(_) => SettingApply::Local(Ok(())),
         };
+
+    "tool_output_spill_bytes", "Tool output spill", ToolLimits,
+        EditorKind::Text { numeric: true },
+        "A tool result bigger than this many bytes is saved whole to a spill file; history keeps its start and end plus a pointer the model can read or grep (default 12288; 0 = off). Applies to new sessions and workers.",
+        |_app, value| whole_number("tool_output_spill_bytes", value);
+
+    "tool_output_spill_head_bytes", "Spill preview head", ToolLimits,
+        EditorKind::Text { numeric: true },
+        "Bytes from the start of a spilled tool result kept in history (default 4096).",
+        |_app, value| whole_number("tool_output_spill_head_bytes", value);
+
+    "tool_output_spill_tail_bytes", "Spill preview tail", ToolLimits,
+        EditorKind::Text { numeric: true },
+        "Bytes from the end of a spilled tool result kept in history, where errors usually are (default 3072).",
+        |_app, value| whole_number("tool_output_spill_tail_bytes", value);
+
+    "read_dedupe", "Read dedupe", ToolLimits, EditorKind::Cycler(&["on", "off"]),
+        "A re-read of a file whose result would be identical to an earlier read still in context returns a short stub pointing at that earlier result, and write/edit results say there is no need to re-read to verify (default on; off = full results every time). Applies to new sessions and workers.",
+        |_app, value| on_off("read_dedupe", value);
 
     "bash_timeout", "Bash timeout", ToolLimits, EditorKind::Text { numeric: true },
         "Default seconds allowed for a bash command.",
@@ -290,6 +343,17 @@ define_settings! {
                 _ => return SettingApply::Local(Err("expected on or off".to_string())),
             }
             SettingApply::Local(Ok(()))
+        };
+
+    "tui_smooth_streaming", "Smooth streaming", Appearance, EditorKind::Cycler(&["on", "off"]),
+        "When a reply's text arrives in a burst (the provider flushing a backlog at once), reveal it over a few frames instead of in one, catching up within half a second (default on). Off = text paints as it arrives.",
+        |app, value| {
+            match value {
+                "on" => app.set_smooth_streaming(true),
+                "off" => app.set_smooth_streaming(false),
+                _ => return SettingApply::Local(Err("expected on or off".to_string())),
+            }
+            on_off("tui_smooth_streaming", value)
         };
 
     "theme_transition", "Theme transition", Appearance, EditorKind::Cycler(&["on", "off"]),
@@ -369,8 +433,8 @@ define_settings! {
     // (`config_edit`), so /settings can never write a value `load_config`
     // rejects; `Local(Err)` skips the write.
 
-    "cache_ttl", "Cache TTL", Context, EditorKind::Cycler(&["5m", "1h", "hybrid"]),
-        "Prompt-cache lifetime for Anthropic requests: 5m (default), 1h on every marker, or hybrid (1h on the stable prefix, 5m on the message tail). Takes effect next launch.",
+    "cache_ttl", "Cache TTL", Context, EditorKind::Cycler(&["auto", "5m", "1h", "hybrid"]),
+        "Prompt-cache lifetime for Anthropic requests: auto (default: 1h on a Claude subscription login, 5m on an API key, where 1h writes cost 2x input), 5m, 1h on every marker, or hybrid (1h on the stable prefix, 5m on the message tail). Subagent workers always use 5m. Takes effect next launch.",
         |_app, value| config_edit("cache_ttl", value);
 
     "cache_diagnostics", "Cache diagnostics", Context, EditorKind::Cycler(&["on", "off"]),
@@ -386,6 +450,14 @@ define_settings! {
         EditorKind::Text { numeric: true },
         "Longest an auto keep-warm idle period may run, in hours (1–48, default 24). Takes effect next launch.",
         |_app, value| whole_number("cache_keepwarm_auto_max_hours", value);
+
+    "cache_keepwarm_headless", "Keep-warm headless", Context, EditorKind::Cycler(&["off", "on"]),
+        "Let daemon sessions driven only by chat, rpc or server clients (bridges, scripts) keep warm too; off (default) keeps it to sessions a TUI or `synaps attach` typed in. `synaps rpc` without the daemon never keeps warm. Takes effect next launch.",
+        |_app, value| on_off("cache_keepwarm_headless", value);
+
+    "cache_keepwarm_tools", "Keep-warm tool rounds", Context, EditorKind::Cycler(&["on", "off"]),
+        "Keep the prompt cache warm while a long tool call runs (builds, test sweeps, polls): once tools have run for the TTL minus a margin (4.5 min on 5m, 55 min on 1h), resend that round's request asking for a minimal reply so the next request reads the cache instead of rewriting it. Independent of idle keep-warm (default on). Applies to new sessions and workers.",
+        |_app, value| on_off("cache_keepwarm_tools", value);
 
     "context_management.mode", "Context management", Context,
         EditorKind::Cycler(&["off", "auto"]),
@@ -439,6 +511,21 @@ define_settings! {
             "off" | "basic" | "full" => config_edit("telemetry", value),
             _ => SettingApply::Local(Err("expected off, basic or full".to_string())),
         };
+
+    "telemetry_log_generations", "Telemetry log files", Context,
+        EditorKind::Text { numeric: true },
+        "Rotated files kept for api-log.jsonl and request-trace.jsonl, each up to 50 MB: <log>.1 (newest) to <log>.N (1–100, default 1). Takes effect next launch.",
+        |_app, value| whole_number("telemetry_log_generations", value);
+
+    "request_compression", "Request compression", Context,
+        EditorKind::Cycler(&["auto", "on", "off"]),
+        "gzip Anthropic request bodies of 16 KiB or more (every request re-uploads the whole conversation; text shrinks about 2x): auto (default) only when sent straight to the Anthropic API: no HTTPS proxy, custom CA bundle or custom base URL; on also through those, for a proxy or gateway known to pass gzip bodies; off never. A refused body is resent uncompressed. Env SYNAPS_GZIP_REQUEST_BODIES=0 overrides. Takes effect next launch.",
+        |_app, value| config_edit("request_compression", value);
+
+    "request_compression_level", "Compression level", Context,
+        EditorKind::Cycler(&["1", "2", "3", "4", "5", "6", "7", "8", "9"]),
+        "gzip level for request bodies, 1-9 (default 1, about 250 MB/s). Higher shrinks more and costs more CPU: 1 suits fast uplinks; on an uplink slower than roughly 10-50 Mbps (it depends on the conversation) 3-6 saves more upload time than it costs. Above 6 gains almost nothing. Takes effect next launch.",
+        |_app, value| config_edit("request_compression_level", value);
 
     // ── Agent ────────────────────────────────────────────────────────────
 
@@ -1037,6 +1124,31 @@ mod tests {
         assert!(bad.is_empty(), "{bad:#?}");
     }
 
+    /// `cache_ttl` shows `auto` when unset (the config default) and when
+    /// set to it; unknown values fall back to the same default the parser
+    /// uses. Each shown value is a cycler option.
+    #[test]
+    fn cache_ttl_row_defaults_to_auto() {
+        use super::super::draw::config_row_display;
+        let _lock = config_lock();
+        for (content, shown) in [
+            ("", "auto"),
+            ("cache_ttl = auto\n", "auto"),
+            ("cache_ttl = 5m\n", "5m"),
+            ("cache_ttl = hybrid\n", "hybrid"),
+            ("cache_ttl = 2h\n", "auto"),
+        ] {
+            let temp = TempConfig::new(content);
+            assert_eq!(config_row_display("cache_ttl").as_deref(), Some(shown), "{content:?}");
+            drop(temp);
+        }
+        let def = ALL_SETTINGS.iter().find(|d| d.key == "cache_ttl").unwrap();
+        match def.editor {
+            EditorKind::Cycler(opts) => assert_eq!(opts, &["auto", "5m", "1h", "hybrid"]),
+            _ => panic!("cache_ttl editor should be a Cycler"),
+        }
+    }
+
     /// The display follows the configured value (normalised spellings).
     #[test]
     fn config_row_display_reads_the_configured_value() {
@@ -1049,6 +1161,8 @@ mod tests {
             "process_scopes = no\n",
             "disabled_tools = bash,  ls\n",
             "turn_budget.worker.max_cost_usd = 2.5\n",
+            "request_compression = OFF\n",
+            "request_compression_level = 6\n",
         ));
         assert_eq!(config_row_display("cache_ttl").as_deref(), Some("1h"));
         assert_eq!(config_row_display("cache_keepwarm").as_deref(), Some("6h"));
@@ -1059,6 +1173,93 @@ mod tests {
             config_row_display("turn_budget.worker.max_cost_usd").as_deref(),
             Some("2.5")
         );
+        assert_eq!(config_row_display("request_compression").as_deref(), Some("off"));
+        assert_eq!(config_row_display("request_compression_level").as_deref(), Some("6"));
+        drop(temp);
+    }
+
+    /// Worker rollover rows: shown as the value in force, edited through
+    /// the real parser (the 20000 floor included).
+    #[test]
+    fn subagent_rollover_rows_display_and_validate() {
+        use super::super::draw::config_row_display;
+        let _lock = config_lock();
+        for (content, mode, tokens) in [
+            ("", "auto", "200000"),
+            ("subagent_context_management = OFF\nsubagent_rollover_tokens = 150000\n", "off", "150000"),
+            ("subagent_context_management = maybe\nsubagent_rollover_tokens = 5\n", "auto", "200000"),
+        ] {
+            let temp = TempConfig::new(content);
+            assert_eq!(config_row_display("subagent_context_management").as_deref(), Some(mode), "{content}");
+            assert_eq!(config_row_display("subagent_rollover_tokens").as_deref(), Some(tokens), "{content}");
+            drop(temp);
+        }
+        let temp = TempConfig::new("");
+        let mut app = app_with_model("m");
+        {
+            let mut d = |key: &str, value: &str| apply_setting_dispatch(key, value, &mut app);
+            assert!(is_ok(d("subagent_context_management", "off")));
+            assert!(is_ok(d("subagent_context_management", "auto")));
+            assert!(is_err(d("subagent_context_management", "sometimes")));
+            assert!(is_ok(d("subagent_rollover_tokens", "150000")));
+            assert!(is_ok(d("subagent_rollover_tokens", "20000")));
+            assert!(is_err(d("subagent_rollover_tokens", "19999")));
+            assert!(is_err(d("subagent_rollover_tokens", "lots")));
+        }
+        drop(temp);
+    }
+
+    #[test]
+    fn subagent_transform_hooks_row_displays_and_validates() {
+        use super::super::draw::config_row_display;
+        let _lock = config_lock();
+        for (content, shown) in [
+            ("", "on"),
+            ("subagent_transform_hooks = off\n", "off"),
+            ("subagent_transform_hooks = true\n", "on"),
+            ("subagent_transform_hooks = maybe\n", "on"),
+        ] {
+            let temp = TempConfig::new(content);
+            assert_eq!(
+                config_row_display("subagent_transform_hooks").as_deref(),
+                Some(shown),
+                "{content}"
+            );
+            drop(temp);
+        }
+        let temp = TempConfig::new("");
+        let mut app = app_with_model("m");
+        {
+            let mut d = |key: &str, value: &str| apply_setting_dispatch(key, value, &mut app);
+            assert!(is_ok(d("subagent_transform_hooks", "off")));
+            assert!(is_ok(d("subagent_transform_hooks", "on")));
+            assert!(is_err(d("subagent_transform_hooks", "maybe")));
+        }
+        drop(temp);
+    }
+
+    #[test]
+    fn read_dedupe_row_displays_and_validates() {
+        use super::super::draw::config_row_display;
+        let _lock = config_lock();
+        for (content, shown) in [
+            ("", "on"),
+            ("read_dedupe = off\n", "off"),
+            ("read_dedupe = true\n", "on"),
+            ("read_dedupe = maybe\n", "on"),
+        ] {
+            let temp = TempConfig::new(content);
+            assert_eq!(config_row_display("read_dedupe").as_deref(), Some(shown), "{content}");
+            drop(temp);
+        }
+        let temp = TempConfig::new("");
+        let mut app = app_with_model("m");
+        {
+            let mut d = |key: &str, value: &str| apply_setting_dispatch(key, value, &mut app);
+            assert!(is_ok(d("read_dedupe", "off")));
+            assert!(is_ok(d("read_dedupe", "on")));
+            assert!(is_err(d("read_dedupe", "maybe")));
+        }
         drop(temp);
     }
 
@@ -1092,11 +1293,19 @@ mod tests {
             let mut d = |key: &str, value: &str| apply_setting_dispatch(key, value, &mut app);
 
             assert!(is_ok(d("cache_ttl", "hybrid")));
+            assert!(is_ok(d("cache_ttl", "auto")));
             assert!(is_err(d("cache_ttl", "2h")));
             assert!(is_ok(d("cache_keepwarm", "6h")));
             assert!(is_err(d("cache_keepwarm", "49h")));
             assert!(is_ok(d("cache_keepwarm_auto_max_hours", "48")));
             assert!(is_err(d("cache_keepwarm_auto_max_hours", "49")));
+            assert!(is_ok(d("cache_keepwarm_headless", "on")));
+            assert!(is_ok(d("cache_keepwarm_headless", "off")));
+            assert!(is_ok(d("cache_keepwarm_tools", "off")));
+            assert!(is_ok(d("cache_keepwarm_tools", "on")));
+            assert!(is_ok(d("thinking_display", "omitted")));
+            assert!(is_ok(d("thinking_display", "summarized")));
+            assert!(is_err(d("thinking_display", "raw")));
             assert!(is_ok(d("context_management.pressure_tokens", "auto")));
             assert!(is_ok(d("context_management.pressure_tokens", "120000")));
             assert!(is_err(d("context_management.pressure_tokens", "lots")));
@@ -1110,6 +1319,14 @@ mod tests {
             assert!(is_ok(d("refusal_retries", "4")));
             assert!(is_err(d("refusal_retries", "-1")));
             assert!(is_err(d("telemetry", "loud")));
+            assert!(is_ok(d("telemetry_log_generations", "5")));
+            assert!(is_err(d("telemetry_log_generations", "0")));
+            assert!(is_err(d("telemetry_log_generations", "101")));
+            assert!(is_ok(d("request_compression", "on")));
+            assert!(is_err(d("request_compression", "brotli")));
+            assert!(is_ok(d("request_compression_level", "9")));
+            assert!(is_err(d("request_compression_level", "0")));
+            assert!(is_err(d("request_compression_level", "10")));
             assert!(is_ok(d("subagent.max_depth", "3")));
             assert!(is_err(d("subagent.max_depth", "0")));
             assert!(is_err(d("subagent.max_depth", "70000")));
@@ -1129,7 +1346,8 @@ mod tests {
             assert!(is_ok(d("max_fps", "144")));
             assert!(is_err(d("max_fps", "0")));
             assert!(is_err(d("scroll_lines", "21")));
-            assert!(is_ok(d("memory.axel.brain", "/srv/axel/brain.r8")));
+            let absolute = if cfg!(windows) { r"C:\srv\axel\brain.r8" } else { "/srv/axel/brain.r8" };
+            assert!(is_ok(d("memory.axel.brain", absolute)));
             assert!(is_err(d("memory.axel.brain", "brain.r8")));
             assert!(is_err(d("memory.user_scope", "yes")));
             assert!(is_err(d("memory.backend", "sqlite")));

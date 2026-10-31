@@ -41,6 +41,10 @@
 //! - The socket's parent directory must exist and be owned by our uid
 //!   before we connect (squat defense for the world-writable `/tmp`
 //!   fallback; `$XDG_RUNTIME_DIR` passes the same check trivially).
+// Myx publishes over a Unix socket only. On Windows the subscriber idles
+// (`socket_dir_trust` is always `Missing`), so the protocol layer is unused
+// outside the unit tests, which still exercise it there.
+#![cfg_attr(windows, allow(dead_code))]
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -458,7 +462,10 @@ pub(crate) async fn run_subscriber(tx: tokio::sync::mpsc::UnboundedSender<(Theme
                 }
             }
             #[cfg(windows)]
-            SocketDirTrust::Trusted => unreachable!("socket_dir_trust never returns Trusted on Windows"),
+            SocketDirTrust::Trusted => {
+                let _ = (&tx, &mut skew_warned);
+                unreachable!("socket_dir_trust never returns Trusted on Windows")
+            }
         }
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(BACKOFF_CAP);
@@ -877,12 +884,14 @@ mod tests {
         assert_eq!(t.sidecar_pill, None);
     }
 
+    #[cfg(unix)]
     #[test]
     fn socket_path_honours_xdg_runtime_dir() {
         let p = socket_path_in(Some(PathBuf::from("/run/user/1000")));
         assert_eq!(p, PathBuf::from("/run/user/1000/myx/theme.sock"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn socket_path_falls_back_to_uid_scoped_tmp() {
         let p = socket_path_in(None);
@@ -905,6 +914,19 @@ mod tests {
         }
     }
 
+    /// Myx is a Linux compositor companion: on Windows the client never
+    /// connects, whatever exists on disk.
+    #[cfg(windows)]
+    #[test]
+    fn socket_dir_is_always_missing_on_windows() {
+        let dir = std::env::temp_dir().join(format!("mxc-trust-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        assert_eq!(socket_dir_trust(&dir.join("theme.sock")), SocketDirTrust::Missing);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(socket_dir_trust(&socket_path()), SocketDirTrust::Missing);
+    }
+
+    #[cfg(unix)]
     #[test]
     fn socket_dir_trust_classifies_missing_and_trusted() {
         // Missing: parent dir does not exist → quiet retry, no connect.

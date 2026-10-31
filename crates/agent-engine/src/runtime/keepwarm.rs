@@ -387,6 +387,51 @@ pub fn reply_prefix_tokens(history: &[SharedMessage]) -> u64 {
     super::context::conservative_token_estimate(&kept.to_string())
 }
 
+/// Run one ping's request to completion, draining its private event channel
+/// WHILE it runs: usage lands in the tap as it arrives, so an aborted ping
+/// can still be booked. Notices (and retry notes) are collected; with
+/// `forward`, the ping's `Usage` and `Notice` events are also passed on as
+/// they arrive (a tool-round ping books into its turn).
+pub(super) async fn drive_ping<F>(
+    call: F,
+    rx: &mut mpsc::UnboundedReceiver<StreamEvent>,
+    tap: &PingTap,
+    forward: Option<&mpsc::UnboundedSender<StreamEvent>>,
+) -> (Result<Value>, Vec<String>)
+where
+    F: std::future::Future<Output = Result<Value>>,
+{
+    tokio::pin!(call);
+    let mut notices = Vec::new();
+    let mut on_event = |event: StreamEvent| {
+        if let StreamEvent::Session(SessionEvent::Notice(n) | SessionEvent::Retry(n)) = &event {
+            notices.push(n.clone());
+        }
+        tap.usage
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .add(&event);
+        if let Some(tx) = forward {
+            if matches!(
+                event,
+                StreamEvent::Session(SessionEvent::Usage { .. } | SessionEvent::Notice(_))
+            ) {
+                let _ = tx.send(event);
+            }
+        }
+    };
+    let result = loop {
+        tokio::select! {
+            r = &mut call => break r,
+            Some(event) = rx.recv() => on_event(event),
+        }
+    };
+    while let Ok(event) = rx.try_recv() {
+        on_event(event);
+    }
+    (result, notices)
+}
+
 impl Runtime {
     /// Why this runtime cannot keep its cache warm, or `None` when it can.
     /// Only the native Anthropic transport carries `cache_control`; every
@@ -527,7 +572,9 @@ impl Runtime {
         self.validate_request_preflight().await?;
         let anthropic_execution_plan = self.authorized_anthropic_plan().await?;
         if matches!(mode, KeepWarmMode::Send { .. }) {
-            self.refresh_if_needed().await?;
+            // Never selects, switches or re-binds an account; a cooling
+            // account ends the period (the ping fails before sending).
+            self.refresh_for_keepwarm().await?;
         }
 
         // System prompt: run_stream_tracked → run_stream_internal, verbatim.
@@ -554,22 +601,17 @@ impl Runtime {
         };
 
         // Messages: the durable history plus one request-local trailing user
-        // message. Same request-local image cap as a real round.
+        // message. The same request-local image retention as a real round
+        // (`image_retention::round_images`), so the retired prefix, and the
+        // retention anchor the transport places from it, match the next turn.
         let mut request: Vec<SharedMessage> = history.to_vec();
         request.push(Arc::new(
             json!({"role": "user", "content": KEEPWARM_PING_TEXT}),
         ));
-        let capped;
-        let request_messages: &[SharedMessage] = match super::stream::cap_history_image_bytes(
-            &request,
-            super::stream::HISTORY_IMAGE_BYTE_CAP,
-        ) {
-            Some(c) => {
-                capped = c;
-                &capped
-            }
-            None => &request,
-        };
+        let round_images =
+            super::image_retention::round_images(&self.model, self.codex_request_role(), &request)
+                .map_err(RuntimeError::Config)?;
+        let (request_messages, _) = round_images.views(&request);
 
         // Tools: a snapshot of the live registry (the previous turn already
         // applied its idempotent setup), projected exactly like a stream round
@@ -644,13 +686,17 @@ impl Runtime {
             token_cache: self.token_cache.clone(),
             anthropic_base_url: None,
             anthropic_stream_client: self.anthropic_stream_client.clone(),
+            request_compression: self.request_compression.clone(),
             anthropic_execution_plan,
             codex_request_role: self.codex_request_role(),
+            // The turns' own `thinking` object: the ping's prefix is theirs.
+            thinking_display: self.wire_thinking_display(),
+            retention_frontier: round_images.applied_frontier(),
             // The base context: a ping must never consume `/trace next`.
             trace: self.trace_ctx.clone(),
             request_correlation: None,
             suppress_stream_deltas: true,
-            telemetry: self.telemetry_writer.clone(),
+            telemetry: self.request_telemetry(),
             tool_session_id: Some(self.host_tool_session.clone()),
             session_tool_set: None,
             request_tools_schema: request_tools_schema.clone(),
@@ -668,6 +714,7 @@ impl Runtime {
             // Header only (cache-key parity with the turns this ping keeps
             // warm); a ping never sends `diagnostics` nor moves the chain.
             cache_diagnosis: self.cache_diagnosis(),
+            context_rollover: None,
         };
 
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -687,28 +734,7 @@ impl Runtime {
             &options,
             self.telemetry_level,
         );
-        tokio::pin!(call);
-        // Drain events WHILE the request runs: usage lands in the tap as it
-        // arrives, so an aborted ping can still be booked.
-        let mut notices = Vec::new();
-        let mut on_event = |event: StreamEvent| {
-            if let StreamEvent::Session(SessionEvent::Notice(n) | SessionEvent::Retry(n)) = &event {
-                notices.push(n.clone());
-            }
-            tap.usage
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .add(&event);
-        };
-        let mut result = loop {
-            tokio::select! {
-                r = &mut call => break r,
-                Some(event) = rx.recv() => on_event(event),
-            }
-        };
-        while let Ok(event) = rx.try_recv() {
-            on_event(event);
-        }
+        let (mut result, notices) = drive_ping(call, &mut rx, tap, None).await;
         // Probe: also run the next turn's pre-request context assessment.
         if let (Ok(value), KeepWarmMode::Probe) = (&mut result, mode) {
             if context_enabled {
@@ -742,9 +768,14 @@ impl Runtime {
         use agent_core::core::context_policy::{assess_context, ContextAction};
         let mut next: Vec<SharedMessage> = history.to_vec();
         next.push(Arc::new(json!({"role": "user", "content": ""})));
-        let capped =
-            super::stream::cap_history_image_bytes(&next, super::stream::HISTORY_IMAGE_BYTE_CAP);
-        let request_messages: &[SharedMessage] = capped.as_deref().unwrap_or(&next[..]);
+        // Estimated exactly like a real round: over the retention view.
+        let round_images =
+            super::image_retention::round_images(&self.model, self.codex_request_role(), &next)
+                .ok();
+        let (_, request_messages) = match &round_images {
+            Some(round) => round.views(&next),
+            None => (&next[..], &next[..]),
+        };
         let fallback_schema;
         let schema = match projected_schema {
             Some(s) => s,
@@ -753,6 +784,12 @@ impl Runtime {
                 fallback_schema.as_slice()
             }
         };
+        let anchor = self
+            .continuation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .usage_anchor_for(&self.model)
+            .cloned();
         let (assessment, budget) = super::stream::pre_request_context_budget(
             &self.model,
             self.context_window(),
@@ -761,6 +798,7 @@ impl Runtime {
             request_messages,
             self.thinking_budget as u64,
             self.max_tool_output as u64,
+            anchor.as_ref(),
         );
         let state = self
             .continuation
@@ -1465,6 +1503,128 @@ mod tests {
         assert!(canon(&o.ping["system"]).contains("SESSION-SCOPED-INJECTION"));
     }
 
+    /// A live OAuth (subscription) credential on `rt`, bound to the default
+    /// local seat so the turn's binding check takes the fast path instead of
+    /// re-resolving from auth.json.
+    fn bind_oauth(rt: &mut Runtime) {
+        rt.auth = Arc::new(tokio::sync::RwLock::new(super::super::types::AuthState {
+            auth_token: "oauth-test-token".to_string(),
+            auth_type: "oauth".to_string(),
+            refresh_token: None,
+            token_expires: Some(crate::epoch_millis() + 3_600_000),
+            auth_file_mtime: None,
+            bound_credential: Some(crate::runtime::auth::anthropic_binding(
+                &crate::auth::CredentialSource::Local,
+                &crate::auth::CredentialRef::default_for(crate::auth::OAuthProviderId::Anthropic),
+            )),
+        }));
+    }
+
+    /// Review fix 2: an idle keep-warm ping never selects, switches or
+    /// re-binds an account. The session's account cooling down (a limit met
+    /// elsewhere) stops it before anything is sent, saying so; the session
+    /// stays bound to its account.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn an_idle_ping_on_a_cooling_account_sends_nothing() {
+        let _base = crate::test_env::BaseDirGuard::new();
+        let (url, mock) = spawn_mock().await;
+        let _url = crate::test_env::EnvVarGuard::set("SYNAPS_ANTHROPIC_BASE_URL", &url);
+        let mut rt = opus(CacheTtl::OneHour);
+        bind_oauth(&mut rt);
+        let history = real_turn(&rt, vec![user("hello")]).await;
+        let fingerprint = rt.cache_keepwarm_probe(&history).await.unwrap().fingerprint;
+        let seat = crate::auth::CredentialRef::default_for(crate::auth::OAuthProviderId::Anthropic);
+        crate::auth::broker_from_source(&rt.credential_source, &rt.token_cache, reqwest::Client::new())
+            .report_cooldown(&seat, Some(crate::epoch_millis() + 3_600_000), "test")
+            .await
+            .unwrap();
+        let bound = rt.auth.read().await.bound_credential.clone();
+
+        let tap = PingTap::default();
+        let report = rt
+            .cache_keepwarm_ping(&history, fingerprint, &CancellationToken::new(), &tap)
+            .await;
+        match &report.result {
+            Err(PingFailure::Fatal(why)) => assert!(why.contains("account cooling"), "{why}"),
+            other => panic!("the ping stops on the cooling account: {other:?}"),
+        }
+        assert!(!tap.was_sent());
+        assert!(report.notices.is_empty(), "{:?}", report.notices);
+        assert_eq!(mock.bodies.lock().unwrap().len(), 1, "only the turn was sent");
+        assert_eq!(rt.auth.read().await.bound_credential, bound, "not re-bound");
+        assert_eq!(rt.auth.read().await.auth_token, "oauth-test-token");
+    }
+
+    /// Every `cache_control` value in a request body, in document order.
+    fn markers(v: &Value) -> Vec<Value> {
+        match v {
+            Value::Object(map) => map
+                .iter()
+                .flat_map(|(k, v)| {
+                    if k == "cache_control" {
+                        vec![v.clone()]
+                    } else {
+                        markers(v)
+                    }
+                })
+                .collect(),
+            Value::Array(items) => items.iter().flat_map(markers).collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// `cache_ttl = auto` on the real request path (turn, ping, next turn),
+    /// per credential kind: OAuth sends 1h on every marker, an API key the
+    /// bare 5m marker, and explicit values win over the kind both ways. For
+    /// `auto`, every body is byte-identical to what the explicit resolved
+    /// value sends: `auto` adds nothing to the wire.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn auto_ttl_wire_markers_follow_the_credential_kind() {
+        use crate::core::config::CacheTtlSetting;
+        let cases = [
+            (CacheTtlSetting::Auto, true, CacheTtl::OneHour),
+            (CacheTtlSetting::Auto, false, CacheTtl::FiveMinutes),
+            (CacheTtl::FiveMinutes.into(), true, CacheTtl::FiveMinutes),
+            (CacheTtl::OneHour.into(), false, CacheTtl::OneHour),
+        ];
+        for (setting, oauth, expect) in cases {
+            let ctx = format!("{setting} on {}", if oauth { "oauth" } else { "api_key" });
+            let observe = |setting: CacheTtlSetting| async move {
+                let _base = crate::test_env::BaseDirGuard::new();
+                let mut rt = opus(CacheTtl::FiveMinutes);
+                rt.set_cache_ttl(setting);
+                if oauth {
+                    bind_oauth(&mut rt);
+                }
+                let resolved = rt.resolved_cache_ttl().await;
+                (resolved, ping_then_next_turn(&rt).await)
+            };
+            let (resolved, o) = observe(setting).await;
+            assert_eq!(resolved, expect, "{ctx}");
+            let want = if expect == CacheTtl::OneHour {
+                marker_1h()
+            } else {
+                marker_5m()
+            };
+            assert_prefix_identical(&o.ping, &o.real, o.history_len, &want, 1);
+            for (name, body) in [("ping", &o.ping), ("next turn", &o.real)] {
+                let all = markers(body);
+                assert!(!all.is_empty(), "{ctx}: {name} has no markers");
+                assert!(
+                    all.iter().all(|m| *m == want),
+                    "{ctx}: {name} markers {all:?}, want all {want}"
+                );
+            }
+            if setting == CacheTtlSetting::Auto {
+                let (_, fixed) = observe(expect.into()).await;
+                assert_eq!(canon(&o.ping), canon(&fixed.ping), "{ctx}: ping bytes");
+                assert_eq!(canon(&o.real), canon(&fixed.real), "{ctx}: turn bytes");
+            }
+        }
+    }
+
     /// OAuth: the Claude Code transport identity and the extra system blocks
     /// are identical on both.
     #[tokio::test]
@@ -1472,19 +1632,7 @@ mod tests {
     async fn ping_prefix_matches_next_turn_with_oauth_system_blocks() {
         let _base = crate::test_env::BaseDirGuard::new();
         let mut rt = opus(CacheTtl::OneHour);
-        rt.auth = Arc::new(tokio::sync::RwLock::new(super::super::types::AuthState {
-            auth_token: "oauth-test-token".to_string(),
-            auth_type: "oauth".to_string(),
-            refresh_token: None,
-            token_expires: Some(crate::epoch_millis() + 3_600_000),
-            auth_file_mtime: None,
-            // Bound to the default local seat so the turn's binding check
-            // takes the fast path instead of re-resolving from auth.json.
-            bound_credential: Some(crate::runtime::auth::anthropic_binding(
-                &crate::auth::CredentialSource::Local,
-                &crate::auth::CredentialRef::default_for(crate::auth::OAuthProviderId::Anthropic),
-            )),
-        }));
+        bind_oauth(&mut rt);
         let o = assert_identity_1h(&rt).await;
         assert!(
             canon(&o.ping["system"]).contains("You are Claude Code"),
@@ -1528,6 +1676,27 @@ mod tests {
                 .context_blocks,
             None
         );
+    }
+
+    /// The probe shares the turn's context budget, so it gains the realistic
+    /// output reserve too: an Opus session at ~60k of its 200k window is
+    /// warmed. With the full 128k `max_tokens` reserved the next turn was at
+    /// hard capacity from ~31.5k on and the probe refused every ping there.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn probe_warms_an_opus_200k_session_past_the_old_hard_stop() {
+        let _base = crate::test_env::BaseDirGuard::new();
+        let (url, _mock) = spawn_mock().await;
+        let _url = crate::test_env::EnvVarGuard::set("SYNAPS_ANTHROPIC_BASE_URL", &url);
+        let rt = opus(CacheTtl::OneHour);
+        assert_eq!(rt.context_window(), 200_000);
+        rt.continuation.lock().unwrap().config.mode =
+            crate::core::config::ContextManagementMode::Auto;
+        let history = real_turn(&rt, vec![user(&"x".repeat(150_000))]).await;
+        let used = rt.assess_context(&history).await.used_tokens();
+        assert!((60_000..100_000).contains(&used), "{used}");
+        let probe = rt.cache_keepwarm_probe(&history).await.unwrap();
+        assert_eq!(probe.context_blocks, None, "{probe:?}");
     }
 
     /// The probe reports the ping's real `max_tokens` (worst-case output).

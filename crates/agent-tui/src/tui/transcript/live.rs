@@ -1,5 +1,5 @@
 //! Live slots: the messages that animate on their own — a running tool
-//! card's clock and sweep, the thinking placeholder's spinner.
+//! card's clock and sweep, a thinking block's header while it thinks.
 //!
 //! The animation tick used to dirty only the LAST message, so a live
 //! element anywhere else (a running card with a steer or a notice under it,
@@ -76,12 +76,22 @@ impl TranscriptStore {
     /// position — the renderer decides which row of a running card carries
     /// the clock.
     fn is_live(&self, idx: usize) -> bool {
-        match self.messages.get(idx).map(|m| &m.msg) {
-            Some(ChatMessage::Thinking(t)) => t == THINKING_PLACEHOLDER,
-            Some(
-                ChatMessage::ToolUseStart { tool_id, .. } | ChatMessage::ToolUse { tool_id, .. },
-            ) => self.tool_running(tool_id),
-            Some(ChatMessage::ToolResult { .. }) => self.is_active_tool_result(idx),
+        let Some(m) = self.messages.get(idx) else {
+            return false;
+        };
+        match &m.msg {
+            // The placeholder's header, and a streamed block's until it is
+            // sealed (its header shimmers; the clock lives on the message).
+            // Not while Ctrl+O shows thoughts whole: the card then renders
+            // its full source, so it moves per delta only, like agent text.
+            ChatMessage::Thinking(t) => {
+                t == THINKING_PLACEHOLDER
+                    || !self.show_full_output && m.thought.is_some_and(|c| !c.done)
+            }
+            ChatMessage::ToolUseStart { tool_id, .. } | ChatMessage::ToolUse { tool_id, .. } => {
+                self.tool_running(tool_id)
+            }
+            ChatMessage::ToolResult { .. } => self.is_active_tool_result(idx),
             _ => false,
         }
     }
@@ -251,6 +261,28 @@ mod tests {
     fn running(s: &mut TranscriptStore, id: &str) {
         s.on_tool_use_start(id.into(), "bash".into());
         s.on_tool_use_finalized(id.into(), "bash".into(), r#"{"command":"sleep 9"}"#.into());
+    }
+
+    /// A streamed thought is live (its header shimmers and counts) from its
+    /// first delta until the model moves on; Ctrl+O, which renders thoughts
+    /// whole, takes it off the tick (it then moves per delta, like agent
+    /// text) and back.
+    #[test]
+    fn a_streaming_thought_is_live_until_sealed() {
+        let mut s = store();
+        s.push_msg(ChatMessage::User("go".into()));
+        s.push_msg(ChatMessage::Thinking(THINKING_PLACEHOLDER.into()));
+        assert_eq!(s.live_slots(), &[1]);
+        s.append_or_update_thinking("weighing it");
+        assert_eq!(s.live_slots(), &[1], "real thinking keeps the slot");
+        s.set_show_full_output(true);
+        assert!(s.live_slots().is_empty(), "expanded: not ticked");
+        s.set_show_full_output(false);
+        assert_eq!(s.live_slots(), &[1]);
+        s.append_or_update_text("answer");
+        assert!(s.live_slots().is_empty(), "text sealed the thought");
+        assert!(s.messages()[1].thought.is_some_and(|c| c.done));
+        s.debug_assert_live();
     }
 
     #[test]

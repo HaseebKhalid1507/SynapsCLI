@@ -78,6 +78,11 @@ impl Tool for SubagentStatusTool {
         let terminal = handle.terminal_diagnostic();
         let authorization = handle.authorization.clone();
         let archive_error = handle.archive_error();
+        let context = handle
+            .state
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .context_summary();
         let _ = handle;
         drop(reg);
 
@@ -111,6 +116,10 @@ impl Tool for SubagentStatusTool {
         if let Some(reason) = status.failure_reason() {
             resp["error"] = json!(reason);
         }
+        // Present only once the worker's context has rolled over.
+        if let Some(context) = context {
+            resp["context"] = context;
+        }
         Ok(resp.to_string())
     }
 }
@@ -143,7 +152,7 @@ fn archived_status(
         "Not running: finished and reaped. subagent_collect reads its result from this archive; \
          subagent_resume continues it."
     };
-    Ok(json!({
+    let mut resp = json!({
         "handle_id":      handle_id,
         "agent_name":     archive.meta.agent_name,
         "status":         archive.status,
@@ -156,8 +165,11 @@ fn archived_status(
         "stopped_by_reload": stopped_by_reload,
         "archive_path":   path,
         "note":           note,
-    })
-    .to_string())
+    });
+    if let Some(context) = crate::runtime::subagent::archived_context_summary(&archive.history) {
+        resp["context"] = context;
+    }
+    Ok(resp.to_string())
 }
 
 #[cfg(test)]
@@ -174,6 +186,8 @@ mod tests {
             model: "m".into(),
             system_prompt: "s".into(),
             timeout_secs: 60,
+            cwd: None,
+            thinking: None,
         };
         let path = super::super::archive::write_archive(
             dir.path(),
@@ -201,5 +215,42 @@ mod tests {
 
         let err = archived_status("sa_9", None, false).unwrap_err().to_string();
         assert!(err.contains("No subagent found"), "{err}");
+    }
+
+    /// A reaped worker whose context rolled over still reports where its
+    /// earlier windows are; one that never rolled has no `context` key.
+    #[test]
+    fn archived_status_reports_a_rolled_worker_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = crate::runtime::subagent::SubagentArchiveMeta {
+            agent_name: "spike".into(),
+            model: "m".into(),
+            system_prompt: "s".into(),
+            timeout_secs: 60,
+            cwd: None,
+            thinking: None,
+        };
+        let history = vec![
+            std::sync::Arc::new(json!({"role":"user","content":"brief"})),
+            std::sync::Arc::new(json!({"role":"user","content":"note",
+                "_synaps_worker_context": {"schema":"synaps-worker-context/1","window":2,
+                "transcripts":[{"window":1,"path":"/a/sa_4.window-1.md","messages":8}]}})),
+        ];
+        let rolled = super::super::archive::write_archive(
+            dir.path(), "sa_4", &meta, "completed", None, "done", &history,
+        )
+        .unwrap();
+        let v: Value =
+            serde_json::from_str(&archived_status("sa_4", Some(rolled), false).unwrap()).unwrap();
+        assert_eq!(v["context"]["window"], 2);
+        assert_eq!(v["context"]["transcripts"][0], "/a/sa_4.window-1.md");
+
+        let plain = super::super::archive::write_archive(
+            dir.path(), "sa_5", &meta, "completed", None, "done", &history[..1],
+        )
+        .unwrap();
+        let v: Value =
+            serde_json::from_str(&archived_status("sa_5", Some(plain), false).unwrap()).unwrap();
+        assert!(v.get("context").is_none());
     }
 }

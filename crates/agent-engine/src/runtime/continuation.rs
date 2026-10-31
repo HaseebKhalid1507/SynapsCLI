@@ -34,6 +34,29 @@ pub(crate) const ADVISORY_RESERVE_TOKENS: u64 = 512;
 /// (incident 2026-10-13). Hard capacity never waits at all.
 pub(crate) const WORKER_ROLLOVER_GRACE_ROUNDS: u32 = 4;
 
+/// Framing of every request-only context advisory: the single source of the
+/// bytes `advisory!` prefixes onto each [`ContextAdvisory::message`] text and
+/// [`is_advisory_text`] recognises (macros so the texts stay `&'static str`).
+macro_rules! advisory_prefix {
+    () => {
+        "[Host context advisory, not a new user request]"
+    };
+}
+macro_rules! advisory {
+    ($body:literal) => {
+        concat!(advisory_prefix!(), " ", $body)
+    };
+}
+pub(super) const ADVISORY_PREFIX: &str = advisory_prefix!();
+
+/// True when `text` is a request-only context advisory. The advisory exists
+/// only in the one request it rides (it is never persisted), so it must never
+/// carry the conversational cache marker: see
+/// `stream::is_ephemeral_turn_context_block`.
+pub(super) fn is_advisory_text(text: &str) -> bool {
+    text.trim_start().starts_with(ADVISORY_PREFIX)
+}
+
 /// Model guidance and UI notices are edge-triggered by the CURRENT assessment,
 /// never by the presence of a sticky string left by an earlier warning.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -60,10 +83,10 @@ impl ContextAdvisory {
 
     pub(super) fn message(self) -> &'static str {
         match self {
-            Self::Pressure => "[Host context advisory, not a new user request] Context is approaching the rollover threshold. Continue current authorized work. At the next substantial task boundary, report the next phase using context_checkpoint alone; include only a brief note if unfinished state would otherwise be lost. No summary, new spec, or archive reread is needed just for context management. The host handles rollover and capacity checks.",
-            Self::FinishBounded => "[Host context advisory, not a new user request] Context rollover is due. Finish the current bounded step; do not expand the task. If needed, leave a brief unfinished-state note with context_checkpoint alone. Do not spend the remaining rounds summarizing or re-reading completed work. The host enforces the remaining allowance and capacity.",
-            Self::WorkersPending => "[Host context advisory, not a new user request] Context rollover is waiting briefly for pending workers. Collect any finished worker now (subagent_collect with reconciled=true) and do not start new workers or large work. If workers are still pending after a few rounds, the host rolls over anyway and lists them in the next window. Do not create a summary or repeatedly checkpoint to force rollover. Capacity and permissions remain enforced.",
-            Self::Unproductive => "[Host context advisory, not a new user request] A rollover currently cannot reduce retained history. Continue remaining authorized work; do not repeat context_checkpoint merely to force rollover. Do not summarize or re-read completed work just for context management. The host will reassess automatically. Capacity, permissions, and all budgets remain enforced.",
+            Self::Pressure => advisory!("Context is approaching the rollover threshold. Continue current authorized work. At the next substantial task boundary, report the next phase using context_checkpoint alone; include only a brief note if unfinished state would otherwise be lost. No summary, new spec, or archive reread is needed just for context management. The host handles rollover and capacity checks."),
+            Self::FinishBounded => advisory!("Context rollover is due. Finish the current bounded step; do not expand the task. If needed, leave a brief unfinished-state note with context_checkpoint alone. Do not spend the remaining rounds summarizing or re-reading completed work. The host enforces the remaining allowance and capacity."),
+            Self::WorkersPending => advisory!("Context rollover is waiting briefly for pending workers. Collect any finished worker now (subagent_collect with reconciled=true) and do not start new workers or large work. If workers are still pending after a few rounds, the host rolls over anyway and lists them in the next window. Do not create a summary or repeatedly checkpoint to force rollover. Capacity and permissions remain enforced."),
+            Self::Unproductive => advisory!("A rollover currently cannot reduce retained history. Continue remaining authorized work; do not repeat context_checkpoint merely to force rollover. Do not summarize or re-read completed work just for context management. The host will reassess automatically. Capacity, permissions, and all budgets remain enforced."),
         }
     }
 
@@ -131,6 +154,9 @@ pub struct ContinuationState {
     /// Model whose request produced `token_calibration`. A sample is only
     /// applied to that model (tokenizers differ across providers/models).
     pub calibration_model: Option<String>,
+    /// The provider's count of the request behind `token_calibration`, kept
+    /// to measure the requests that extend it (same model, same lifetime).
+    pub usage_anchor: Option<super::context::UsageAnchor>,
     /// Stable id (`_synaps_turn.id` on the message) of the request that
     /// started the current turn, recorded by the host at turn admission.
     pub(crate) turn_start: Option<String>,
@@ -153,6 +179,7 @@ impl Default for ContinuationState {
             restore_pending: false,
             token_calibration: None,
             calibration_model: None,
+            usage_anchor: None,
             turn_start: None,
         }
     }
@@ -173,6 +200,34 @@ impl ContinuationState {
     pub fn record_calibration(&mut self, model: &str, sample: TokenCalibration) {
         self.token_calibration = sample.plausible().then_some(sample);
         self.calibration_model = self.token_calibration.map(|_| model.to_owned());
+        self.usage_anchor = None;
+    }
+
+    /// [`Self::record_calibration`], keeping the request as the usage anchor
+    /// for the requests that extend it. Only a plausible sample anchors: a
+    /// provider count far below the estimate is more likely missing cache
+    /// fields than an exact count, and anchoring to it would understate the
+    /// footprint.
+    pub fn record_request_usage(
+        &mut self,
+        model: &str,
+        sample: TokenCalibration,
+        fixed_tokens: u64,
+        messages: Vec<SharedMessage>,
+    ) {
+        self.record_calibration(model, sample);
+        self.usage_anchor = self.token_calibration.map(|c| super::context::UsageAnchor {
+            provider_tokens: c.provider_tokens,
+            fixed_tokens,
+            messages,
+        });
+    }
+
+    /// The usage anchor, only if it was measured on `model`.
+    pub fn usage_anchor_for(&self, model: &str) -> Option<&super::context::UsageAnchor> {
+        self.usage_anchor
+            .as_ref()
+            .filter(|_| self.calibration_model.as_deref() == Some(model))
     }
     /// Return a notice only on a transition. Normal/disabled assessments clear
     /// stale pressure; phase reports and repeated admissions do not re-arm it.
@@ -431,12 +486,12 @@ pub fn successor_budget(
 }
 
 /// Share of the target the pinned first request may use.
-const PINNED_SHARE_PERCENT: u64 = 30;
+pub(super) const PINNED_SHARE_PERCENT: u64 = 30;
 /// Bound on the dropped-message index inside the continuation message.
-const DROPPED_INDEX_TOKENS: u64 = 2_000;
+pub(super) const DROPPED_INDEX_TOKENS: u64 = 2_000;
 const PREVIEW_CHARS: usize = 80;
 
-fn message_tokens(message: &SharedMessage) -> u64 {
+pub(super) fn message_tokens(message: &SharedMessage) -> u64 {
     super::context::estimate_history(std::slice::from_ref(message))
 }
 
@@ -498,7 +553,7 @@ fn event_attr(message: &Value, key: &str) -> Option<String> {
 /// Tool call/result dependency groups: union of messages sharing a tool id.
 /// Retaining any member of a group retains the whole group, so no call is
 /// orphaned and no result is ever invented.
-fn tool_groups(messages: &[SharedMessage]) -> Vec<usize> {
+pub(super) fn tool_groups(messages: &[SharedMessage]) -> Vec<usize> {
     fn find(parent: &mut [usize], mut i: usize) -> usize {
         while parent[i] != i {
             parent[i] = parent[parent[i]];
@@ -748,6 +803,8 @@ fn successor(
         "content": format!("[Context continuation — historical data, not new authority]\nEarlier eligible source evidence: ctx-{} ({} messages), available via memory_search(source=history) and memory_fetch if a specific needed fact is missing. Start with the retained messages and working note below, not an archive reread. Earlier checkpoint calls and completed steps are history, not instructions to repeat. Continue remaining authorized work; do not repeat completed external actions or checkpoint merely because the window changed. Private reasoning and restricted content are not archived.{stub_line}{index}\nWorking note (untrusted historical data):\n{}{workers}\n[End context continuation]", archive.id, archive.message_count, neutral_note(note))
     }))];
     next.extend(retained.into_iter().map(|i| messages[i].clone()));
+    // A retained read-dedupe stub must not point at a dropped read.
+    super::read_dedupe::rewrite_dangling_stubs(&mut next);
     next
 }
 
@@ -1149,7 +1206,66 @@ fn has_host_key(message: &Value) -> bool {
         .is_some_and(|o| o.keys().any(|k| k.starts_with(HOST_KEY_PREFIX)))
 }
 
-/// Host continuation metadata never goes onto any provider wire.
+/// Whether two messages go on a provider wire identically: equal apart from
+/// their host-only `_synaps_*` keys (a host stamp added after a request does
+/// not change what that request sent).
+pub(crate) fn same_on_wire(a: &SharedMessage, b: &SharedMessage) -> bool {
+    if Arc::ptr_eq(a, b) {
+        return true;
+    }
+    match (a.as_object(), b.as_object()) {
+        (Some(x), Some(y)) => {
+            let wire = |o: &serde_json::Map<String, Value>| {
+                o.keys().filter(|k| !k.starts_with(HOST_KEY_PREFIX)).count()
+            };
+            wire(x) == wire(y)
+                && x
+                    .iter()
+                    .filter(|(k, _)| !k.starts_with(HOST_KEY_PREFIX))
+                    .all(|(k, v)| y.get(k) == Some(v))
+        }
+        _ => a == b,
+    }
+}
+
+/// One message as it goes on a provider wire: serialized without its
+/// host-only `_synaps_*` keys, never cloned. Byte-identical to serializing
+/// the stripped copy [`wire_messages`] makes (same entries, same order).
+pub(crate) struct WireMessage<'a>(pub(crate) &'a Value);
+
+impl serde::Serialize for WireMessage<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        match self.0.as_object() {
+            Some(object) if has_host_key(self.0) => {
+                let kept = object.iter().filter(|(k, _)| !k.starts_with(HOST_KEY_PREFIX));
+                let mut map = serializer.serialize_map(Some(kept.clone().count()))?;
+                for (k, v) in kept {
+                    map.serialize_entry(k, v)?;
+                }
+                map.end()
+            }
+            _ => self.0.serialize(serializer),
+        }
+    }
+}
+
+/// A history as it goes on a provider wire (see [`WireMessage`]). Every
+/// message carries a host time once stamped, so stripping by copy would
+/// deep-clone the whole history on every request; this strips while
+/// serializing instead.
+#[derive(Clone, Copy)]
+pub(crate) struct WireMessages<'a>(pub(crate) &'a [SharedMessage]);
+
+impl serde::Serialize for WireMessages<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.0.iter().map(|m| WireMessage(m)))
+    }
+}
+
+/// Host continuation metadata never goes onto any provider wire. Copies
+/// only for transports that read the history as values (they translate it
+/// or forward it verbatim); the native Anthropic body uses [`WireMessages`].
 pub(crate) fn wire_messages(messages: &[SharedMessage]) -> Option<Vec<SharedMessage>> {
     if !messages.iter().any(|m| has_host_key(m)) {
         return None;
@@ -2574,6 +2690,61 @@ mod budget_tests {
         in_source_order(&input, &next);
     }
 
+    /// A read-dedupe stub the successor keeps while dropping the read it
+    /// names is rewritten so it no longer claims the content is in context;
+    /// with the original kept, the stub is untouched.
+    #[test]
+    fn a_kept_dedupe_stub_whose_read_was_dropped_is_rewritten() {
+        use crate::runtime::read_dedupe::{unchanged_stub, DROPPED_STUB};
+        let read = |id: &str| {
+            msg(json!({"role":"assistant","content":[
+                {"type":"tool_use","id":id,"name":"read","input":{"path":"/w/database.py"}}]}))
+        };
+        let result = |id: &str, content: String| {
+            msg(json!({"role":"user","content":[
+                {"type":"tool_result","tool_use_id":id,"content":content}]}))
+        };
+        let full = "1\tdb = connect()\n".repeat(50);
+        // The successor keeps requests and the protocol tail; the earlier
+        // tool round holding r1 is dropped, the tail holding its stub kept.
+        let input = vec![
+            user("CHARTER: build the API"),
+            user("read the database module"),
+            read("toolu_r1"),
+            result("toolu_r1", full.clone()),
+            assistant("read it"),
+            user("TURN-START: check it again"),
+            read("toolu_r2"),
+            result("toolu_r2", unchanged_stub("toolu_r1")),
+        ];
+        let next = successor(&input, &archive(), "note", 2, budget(), None, "");
+        assert!(!next.iter().any(|m| m.to_string().contains("toolu_r1")), "r1 dropped");
+        let last = next.last().unwrap();
+        assert_eq!(last["content"][0]["tool_use_id"], "toolu_r2");
+        assert_eq!(last["content"][0]["content"], DROPPED_STUB);
+        assert_pairs_intact(&next);
+        // Assistant turns are never edited: the kept call is the same Arc.
+        assert!(Arc::ptr_eq(&next[next.len() - 2], &input[6]));
+        // A later rollover leaves the rewritten text byte-identical.
+        let again = successor(&next[1..], &archive(), "note", 3, budget(), None, "");
+        assert_eq!(again.last().unwrap()["content"], last["content"]);
+
+        // Original kept (both reads in the kept tail): the stub is untouched.
+        let input = vec![
+            user("CHARTER: build the API"),
+            user("TURN-START: read it twice"),
+            msg(json!({"role":"assistant","content":[
+                {"type":"tool_use","id":"toolu_r1","name":"read","input":{"path":"/w/database.py"}},
+                {"type":"tool_use","id":"toolu_r2","name":"read","input":{"path":"/w/database.py"}}]})),
+            msg(json!({"role":"user","content":[
+                {"type":"tool_result","tool_use_id":"toolu_r1","content":full},
+                {"type":"tool_result","tool_use_id":"toolu_r2","content":unchanged_stub("toolu_r1")}]})),
+        ];
+        let kept = successor(&input, &archive(), "note", 2, budget(), None, "");
+        assert_eq!(&kept[1..], input.as_slice());
+        assert!(Arc::ptr_eq(kept.last().unwrap(), input.last().unwrap()));
+    }
+
     #[test]
     fn tool_pairs_stay_intact_and_oversized_tail_is_kept_whole() {
         let mut input = vec![charter()];
@@ -2879,6 +3050,80 @@ mod budget_tests {
         let wire = wire_messages(&m).expect("host keys present");
         assert!(wire.iter().all(|x| x.get(TURN_KEY).is_none()));
         assert_eq!(wire.last().unwrap()["content"], "continue");
+    }
+
+    /// A history in which every message carries host keys, as it is once
+    /// every message has a time.
+    pub(super) fn stamped_history(n: usize) -> (Vec<SharedMessage>, Vec<SharedMessage>) {
+        let mut plain = Vec::new();
+        for i in 0..n {
+            plain.push(Arc::new(json!({"role":"user","content":[
+                {"type":"text","text":format!("question {i} ünïcode \"q\"")},
+                {"type":"tool_result","tool_use_id":format!("t{i}"),"content":"x".repeat(i % 7)}
+            ]})));
+            plain.push(Arc::new(json!({"role":"assistant","content":[
+                {"type":"thinking","thinking":"hm","signature":"sig"},
+                {"type":"text","text":format!("answer {i}")},
+                {"type":"tool_use","id":format!("t{}", i + 1),"name":"bash","input":{"command":"ls","n":i}}
+            ]})));
+        }
+        let stamped = plain
+            .iter()
+            .enumerate()
+            .map(|(i, m)| {
+                let mut m = (**m).clone();
+                m[super::super::message_time::AT_KEY] = json!("2026-10-25T05:47:00Z");
+                if i == 0 {
+                    m[TURN_KEY] = json!({"id": "t-1"});
+                }
+                Arc::new(m)
+            })
+            .collect();
+        (plain, stamped)
+    }
+
+    /// The serialize-time strip is byte-identical to serializing the old
+    /// stripped copy, and to a history that never had host keys: prompt
+    /// cache keys depend on it.
+    #[test]
+    fn wire_serialization_is_byte_identical_with_and_without_host_keys() {
+        let (plain, stamped) = stamped_history(50);
+        let before = serde_json::to_vec(&plain).unwrap();
+        let copied = serde_json::to_vec(&wire_messages(&stamped).unwrap()).unwrap();
+        let streamed = serde_json::to_vec(&WireMessages(&stamped)).unwrap();
+        assert_eq!(copied, before);
+        assert_eq!(streamed, before);
+        assert_eq!(serde_json::to_vec(&WireMessages(&plain)).unwrap(), before);
+        assert!(!String::from_utf8(streamed).unwrap().contains("_synaps_"));
+    }
+
+    /// Every transport but native Anthropic reads the history as values
+    /// (an extension provider gets it verbatim): it gets the stripped copy.
+    /// Native Anthropic strips while serializing, so it borrows.
+    #[test]
+    fn every_routed_transport_gets_a_history_without_host_keys() {
+        let (_, stamped) = stamped_history(3);
+        for model in ["claude-sonnet-4-6", "anthropic/claude-opus-4-7"] {
+            assert!(
+                crate::runtime::openai::routed_wire_messages(model, &stamped).is_none(),
+                "{model}: native Anthropic borrows"
+            );
+        }
+        for model in [
+            "groq/llama-3.3-70b-versatile",
+            "github-copilot/claude-sonnet-4.6",
+            "github-copilot/gpt-5.3-codex",
+            "openai-codex/gpt-5.1-codex-mini",
+            "google-gemini/gemini-2.5-pro",
+            "xai-auth/grok-4",
+            "my-plugin:my-provider:my-model",
+            "unknown-provider/model",
+        ] {
+            let wire = crate::runtime::openai::routed_wire_messages(model, &stamped)
+                .unwrap_or_else(|| panic!("{model}: must strip"));
+            let bytes = serde_json::to_string(&wire).unwrap();
+            assert!(!bytes.contains("_synaps_"), "{model}: {bytes}");
+        }
     }
 
     /// Every `_synaps_*` key is host metadata, including ones a later build
@@ -3792,6 +4037,75 @@ mod calibration_transport_tests {
         assert!(!bodies[0].contains("_synaps_context"));
     }
 
+    /// The request a provider gets is byte-identical whether or not the
+    /// history carries message times (prompt-cache safety), and never
+    /// contains one: streaming turn and compaction transports.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn request_bytes_are_identical_with_and_without_message_times() {
+        let _base = crate::test_env::BaseDirGuard::new();
+        let (url, mock) = spawn(Arc::new(|_, _| (200, None))).await;
+        let _g = crate::test_env::EnvVarGuard::set("SYNAPS_ANTHROPIC_BASE_URL", &url);
+        let (mut plain, mut stamped) = super::budget_tests::stamped_history(40);
+        plain.push(Arc::new(json!({"role":"user","content":"go on"})));
+        stamped.push(Arc::new(json!({"role":"user","content":"go on",
+            "_synaps_at":"2026-10-25T05:48:00Z"})));
+        for history in [plain.clone(), stamped.clone()] {
+            let mut rt = crate::Runtime::new_headless();
+            rt.set_model("claude-sonnet-4-6".to_string());
+            rt.set_api_retries(0);
+            turn_with(&rt, history, Default::default()).await;
+        }
+        let bodies = mock.bodies.lock().unwrap().clone();
+        assert_eq!(bodies.len(), 2, "one request per turn");
+        assert!(bodies[0].contains("go on"));
+        assert_eq!(bodies[0], bodies[1], "stamps changed the request bytes");
+        assert!(!bodies[1].contains("_synaps_"));
+
+        // Compaction (`call_api_simple`) sends caller history directly.
+        let mut rt = runtime();
+        rt.set_api_retries(0);
+        rt.set_compaction_model(Some("claude-sonnet-4-6".to_string()));
+        let _ = rt.compact_call(stamped).await;
+        let bodies = mock.bodies.lock().unwrap().clone();
+        assert_eq!(bodies.len(), 3);
+        assert!(bodies[2].contains("go on") && !bodies[2].contains("_synaps_"));
+    }
+
+    /// Rough cost of putting a 2,000-message history on the wire, before
+    /// (strip by copy) and after (strip while serializing). Not run by
+    /// default: `cargo test -p synaps-engine --release -- --ignored
+    /// wire_strip_timing --nocapture`.
+    #[test]
+    #[ignore]
+    fn wire_strip_timing() {
+        let (_, stamped) = super::budget_tests::stamped_history(1000);
+        assert_eq!(stamped.len(), 2000);
+        let rounds = 50;
+        let t = std::time::Instant::now();
+        let mut n = 0;
+        for _ in 0..rounds {
+            let copy = wire_messages(&stamped).unwrap();
+            n += serde_json::to_vec(&copy).unwrap().len();
+        }
+        let copy = t.elapsed() / rounds;
+        let t = std::time::Instant::now();
+        for _ in 0..rounds {
+            n += serde_json::to_vec(&WireMessages(&stamped)).unwrap().len();
+        }
+        let streamed = t.elapsed() / rounds;
+        let t = std::time::Instant::now();
+        let (plain, _) = super::budget_tests::stamped_history(1000);
+        for _ in 0..rounds {
+            n += serde_json::to_vec(&plain).unwrap().len();
+        }
+        let unstamped = t.elapsed() / rounds;
+        eprintln!(
+            "2000 msgs, {} bytes: copy+serialize {copy:?}, serialize-strip {streamed:?}, no host keys {unstamped:?}",
+            n / (3 * rounds as usize)
+        );
+    }
+
     fn calibration(rt: &crate::Runtime) -> Option<TokenCalibration> {
         rt.continuation.lock().unwrap().token_calibration
     }
@@ -3916,5 +4230,92 @@ mod calibration_transport_tests {
         phase.store(1, Ordering::SeqCst);
         turn(&rt).await;
         assert_eq!(calibration(&rt), Some(first));
+    }
+
+    /// Opus with `context_management.mode = auto` on its 200k default window.
+    fn opus_200k() -> crate::Runtime {
+        let mut rt = crate::Runtime::new_headless();
+        rt.set_model("claude-opus-5-5".to_string());
+        rt.set_api_retries(1);
+        rt.set_context_window(Some(200_000));
+        rt.continuation.lock().unwrap().config.mode = ContextManagementMode::Auto;
+        rt
+    }
+
+    /// `n` events (~480 estimated tokens each) between a charter and a request.
+    fn events(n: usize) -> Vec<SharedMessage> {
+        let mut m = vec![Arc::new(json!({"role":"user","content":"charter"})) as SharedMessage];
+        m.extend((0..n).map(event));
+        m.push(Arc::new(json!({"role":"user","content":"next"})));
+        m
+    }
+
+    /// The next round on an Opus 200k window used to reserve the full 128k
+    /// `max_tokens`: HardStop from ~31.5k on, so every turn past it rolled
+    /// over (into a successor sized to the ~20k left) or, when a rollover
+    /// could not shrink, ended with an error. The realistic reserve puts hard
+    /// capacity at ~139k; a ~60k context just works.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn opus_on_a_200k_window_works_past_the_old_31k_hard_stop() {
+        let _base = crate::test_env::BaseDirGuard::new();
+        let (url, mock) = spawn(Arc::new(|_, _| (200, None))).await;
+        let _g = crate::test_env::EnvVarGuard::set("SYNAPS_ANTHROPIC_BASE_URL", &url);
+        let rt = opus_200k();
+        let history = events(120);
+        let assessment = rt.assess_context(&history).await;
+        assert!(
+            (50_000..100_000).contains(&assessment.used_tokens()),
+            "{}",
+            assessment.used_tokens()
+        );
+        // The daemon's opt-in auto_compact trigger reads the same budget.
+        assert!(!assessment.should_compact(), "budget {}", assessment.budget_tokens());
+        let out = turn_with(&rt, history, Default::default()).await;
+        assert!(out.heads.is_empty(), "no rollover");
+        assert_eq!(rt.continuation.lock().unwrap().window, 1);
+        assert_eq!(mock.calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// The same runtime with a band below hard capacity rolls over at its
+    /// band, into a successor at the target; at hard capacity (the default
+    /// 180k band is past it on a 200k window) the rollover has room for a
+    /// successor at the default target instead of the ~20k the old reserve
+    /// left.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn opus_on_a_200k_window_rolls_over_at_its_band() {
+        let _base = crate::test_env::BaseDirGuard::new();
+        let (url, _mock) = spawn(Arc::new(|_, _| (200, None))).await;
+        let _g = crate::test_env::EnvVarGuard::set("SYNAPS_ANTHROPIC_BASE_URL", &url);
+
+        let rt = opus_200k();
+        {
+            let mut s = rt.continuation.lock().unwrap();
+            s.config.pressure_tokens = Some(80_000);
+            s.config.rollover_tokens = Some(100_000);
+            s.config.target_tokens = Some(40_000);
+        }
+        let history = events(220);
+        let assessment = rt.assess_context(&history).await;
+        assert!(
+            (100_000..assessment.budget_tokens()).contains(&assessment.used_tokens()),
+            "past the band, below hard capacity: {} of {}",
+            assessment.used_tokens(),
+            assessment.budget_tokens()
+        );
+        let out = turn_with(&rt, history, Default::default()).await;
+        assert_eq!(out.heads.len(), 1, "exactly one rollover");
+        let head = crate::runtime::context::estimate_history(&out.heads[0]);
+        assert!(head <= 40_000, "head {head}");
+
+        // Default bands: hard capacity first, a productive rollover there.
+        let rt = opus_200k();
+        let history = events(300);
+        assert!(rt.assess_context(&history).await.should_compact(), "past hard capacity");
+        let out = turn_with(&rt, history, Default::default()).await;
+        assert_eq!(out.heads.len(), 1, "exactly one rollover");
+        let head = crate::runtime::context::estimate_history(&out.heads[0]);
+        assert!((40_000..=93_333).contains(&head), "head {head}");
     }
 }

@@ -833,6 +833,26 @@ pub struct ToolExecutionEvent {
     /// Original model-request position; event assembly and returned
     /// `tool_result` blocks both preserve this ordering.
     pub model_order: u32,
+    /// Tool output virtualisation: history carries a `preview_bytes`
+    /// preview of the `result_bytes` result (the rest is in a spill file,
+    /// or the file `read` read). Absent when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub virtualised: bool,
+    /// Read dedupe: history carries a short "unchanged since your earlier
+    /// read" stub (`preview_bytes`) instead of a result byte-identical to
+    /// one still in context. With `virtualised` also set, the identical
+    /// thing was the virtualisation preview, and the stub replaced it.
+    /// Absent when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub deduped: bool,
+    /// Bytes the dedupe stub kept out of history: the history text this
+    /// call would have added minus the stub. Absent when zero.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub deduped_bytes: u64,
+}
+
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
 }
 
 // --- The envelope ---

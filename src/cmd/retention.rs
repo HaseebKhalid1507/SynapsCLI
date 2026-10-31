@@ -440,7 +440,10 @@ async fn export_members(binding: &MemoryBinding, dest: &Path) -> Result<Value> {
 async fn export_members(_: &MemoryBinding, _: &Path) -> Result<Value> {
     bail!("private Axel export requires Unix nofollow filesystem support")
 }
+// Only the Unix exporter writes files; elsewhere `export_members` refuses.
+#[cfg(unix)]
 const EXPORT_INDEX: &str = "axel-memory-index.json";
+#[cfg(unix)]
 fn export_filename(project: &str, members: usize) -> String {
     if members == 1 {
         "axel-memory.json".into()
@@ -448,6 +451,7 @@ fn export_filename(project: &str, members: usize) -> String {
         format!("axel-memory-{project}.json")
     }
 }
+#[cfg(unix)]
 fn validate_exact_export(value: &Value, project: &str) -> Result<()> {
     if value["format"] != "synaps-axel-export/1"
         || value["source_project"] != project

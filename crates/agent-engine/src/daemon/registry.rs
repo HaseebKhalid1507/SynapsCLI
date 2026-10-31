@@ -333,6 +333,33 @@ impl DaemonLock {
     }
 }
 
+#[cfg(windows)]
+impl DaemonLock {
+    /// Reload hand-off — Windows has no `execv`, and a byte-range lock
+    /// belongs to the process that took it (see [`super::win`]). Queue an
+    /// exclusive lock on `daemon.lock` behind the previous image, run
+    /// `queued` once the request sits in the kernel's queue (the previous
+    /// image exits on that signal), then wait up to `wait` for the grant.
+    /// No prober can take the lock in between: the release grants it here.
+    pub fn acquire_handoff(
+        paths: &DaemonPaths,
+        wait: std::time::Duration,
+        queued: impl FnOnce(),
+    ) -> io::Result<Self> {
+        use std::os::windows::fs::OpenOptionsExt;
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            // Overlapped, so the lock request queues instead of blocking.
+            .custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OVERLAPPED)
+            .open(&paths.lock)?;
+        super::win::lock_exclusive_queued(&file, wait, queued)?;
+        Ok(Self { file })
+    }
+}
+
 impl Drop for DaemonLock {
     fn drop(&mut self) {
         let _ = FileExt::unlock(&self.file);

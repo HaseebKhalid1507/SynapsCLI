@@ -325,6 +325,7 @@ impl SessionToolSet {
             "read",
             "write",
             "edit",
+            "multi_edit",
             "grep",
             "find",
             "ls",

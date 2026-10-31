@@ -74,13 +74,15 @@ pub(crate) fn save_trust_state_to(base: &Path, state: &ProviderTrustState) -> Re
     // Atomic write: write to a unique temp file in the same directory then rename.
     // Using tempfile::NamedTempFile avoids trampling when concurrent writers hit
     // the same target path.
-    let tmp = tempfile::NamedTempFile::new_in(parent)
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)
         .map_err(|e| format!("failed to create temp file in {}: {}", parent.display(), e))?;
-    std::fs::write(tmp.path(), serialized.as_bytes())
+    std::io::Write::write_all(&mut tmp, serialized.as_bytes())
         .map_err(|e| format!("failed to write {}: {}", tmp.path().display(), e))?;
-    // fsync before rename so data is durable on power loss
-    std::fs::File::open(tmp.path())
-        .and_then(|f| f.sync_all())
+    // fsync before rename so data is durable on power loss. Through the temp
+    // file's own handle: Windows refuses to flush a read-only one ("Access is
+    // denied"), which failed every trust-store save there.
+    tmp.as_file()
+        .sync_all()
         .map_err(|e| format!("failed to fsync {}: {}", tmp.path().display(), e))?;
     tmp.persist(&path).map_err(|e| {
         format!(

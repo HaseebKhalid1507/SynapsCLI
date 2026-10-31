@@ -196,11 +196,21 @@ async fn productive_rollover_still_waits_for_ack_and_failed_ack_blocks_inference
         std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", url);
         let rt = runtime(6).await;
         // Force soft rollover at a threshold, without a model checkpoint round.
-        rt.context_management_command("auto 20000 30000").unwrap();
+        // Size the bands from the runtime's own fixed request part (system
+        // prompt + tool schemas, assessed over no history), not from the
+        // default tool registry's size: the successor target (2/3 of
+        // pressure) then leaves ~10k tokens for its messages, room for the
+        // pinned first request beside the continuation envelope.
+        let base = rt.assess_context(&[]).await.used_tokens();
+        let pressure = (base + 10_000) * 3 / 2;
+        let rollover = pressure + 10_000;
+        rt.context_management_command(&format!("auto {pressure} {rollover}"))
+            .unwrap();
         let history = vec![
             user("Do not deploy.".into()),
+            // Alone over the rollover band: ~10.8 conservative tokens a repeat.
             Arc::new(
-                json!({"role":"assistant", "content":"Archivable prior evidence. ".repeat(4000)}),
+                json!({"role":"assistant", "content":"Archivable prior evidence. ".repeat(rollover as usize / 10)}),
             ),
             user("Continue only remaining work.".into()),
             Arc::new(json!({"role":"assistant", "content":"Last bounded result."})),
@@ -246,4 +256,46 @@ async fn productive_rollover_still_waits_for_ack_and_failed_ack_blocks_inference
             assert!(events.iter().any(|event| matches!(event, StreamEvent::Session(SessionEvent::Error(e)) if e.message.contains("durability was not acknowledged"))));
         }
     }
+}
+
+/// The api-log names the context window of every request after a rollover,
+/// and marks the window's first request (the one that writes the
+/// successor's prompt cache).
+#[tokio::test]
+#[serial]
+async fn foreground_rollover_marks_the_first_request_of_the_new_window() {
+    let home = HomeGuard::new();
+    let (url, hits, _) = spawn_stub(Script::Sse(ANTHROPIC_SSE)).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", url);
+    let mut rt = runtime(6).await;
+    rt.set_telemetry_level(synaps_cli::runtime::telemetry::TelemetryLevel::Basic);
+    rt.context_management_command("auto 20000 30000").unwrap();
+    let history = vec![
+        user("Do not deploy.".into()),
+        Arc::new(json!({"role":"assistant", "content":"Archivable prior evidence. ".repeat(4000)})),
+        user("Continue only remaining work.".into()),
+        Arc::new(json!({"role":"assistant", "content":"Last bounded result."})),
+    ];
+    let mut stream = rt
+        .run_stream_with_messages(history, CancellationToken::new(), None, None, false)
+        .await;
+    while let Some(event) = tokio::time::timeout(Duration::from_secs(30), stream.next())
+        .await
+        .unwrap()
+    {
+        if let StreamEvent::Session(SessionEvent::ContextHeadCheckpoint { ref receipt, .. }) = event {
+            receipt.complete(Ok(()));
+        }
+        if matches!(event, StreamEvent::Session(SessionEvent::Done)) {
+            break;
+        }
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    rt.telemetry_writer().unwrap().shutdown(Duration::from_secs(5));
+    let log = std::fs::read_to_string(home.home.path().join(".cache/synaps/api-log.jsonl")).unwrap();
+    let records: Vec<serde_json::Value> = log.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    assert_eq!(records.len(), 1, "{log}");
+    assert_eq!(records[0]["rollover_window"], 2, "{log}");
+    assert_eq!(records[0]["rollover"], true, "{log}");
+    assert!(records[0].get("worker").is_none());
 }

@@ -768,6 +768,101 @@ async fn pings_are_costed_and_an_active_period_defers_park_until_it_ends() {
         .unwrap();
 }
 
+/// Every `cache_control` value in a request body.
+fn cache_markers(v: &serde_json::Value) -> Vec<serde_json::Value> {
+    match v {
+        serde_json::Value::Object(map) => map
+            .iter()
+            .flat_map(|(k, v)| {
+                if k == "cache_control" {
+                    vec![v.clone()]
+                } else {
+                    cache_markers(v)
+                }
+            })
+            .collect(),
+        serde_json::Value::Array(items) => items.iter().flat_map(cache_markers).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// `cache_ttl` unset (`auto`) on the harness's OAuth login resolves to 1h,
+/// and keep-warm runs exactly as under an explicit `cache_ttl = 1h`: the
+/// turn and every ping carry 1h markers, the period is governed by the 1h
+/// TTL, and the ski-rental cost check admits the same number of pings
+/// before it ends the period. `Status` reports the setting and what it
+/// resolved to.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn auto_ttl_on_oauth_keeps_warm_exactly_like_explicit_1h() {
+    let mut runs = Vec::new();
+    for ttl_line in ["", "cache_ttl = 1h\n"] {
+        let h = Home::new();
+        write_config(&h, &format!("cache_keepwarm = auto\n{ttl_line}thinking = off\n"));
+        let _interval = fast_pings();
+        let (url, bodies) = recording_stub().await;
+        std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+        let host = host().await;
+        let handle = host.create_session(cfg()).await.unwrap();
+        let (mut t, _) = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Tui))
+            .await
+            .unwrap();
+        turn(&mut t, "hello").await;
+        let st = status_until(&mut t, 900, PATIENCE, |st| {
+            st["keepwarm"]["session_pings"].as_u64().unwrap_or(0) >= 1
+        })
+        .await;
+        let setting = if ttl_line.is_empty() { "auto" } else { "1h" };
+        assert_eq!(
+            st["cache_ttl"],
+            serde_json::json!({"setting": setting, "resolved": "1h"}),
+            "{st}"
+        );
+        let period_ttl = st["keepwarm"]["period"]["ttl_secs"].clone();
+        // Let the cost check end the period.
+        let st = status_until(&mut t, 1000, PATIENCE, |st| {
+            st["keepwarm"]["active"] == false
+        })
+        .await;
+        assert_eq!(st["keepwarm"]["active"], false, "the period ended: {st}");
+        let total = pings(&bodies);
+        let all = bodies.lock().unwrap().clone();
+        for (i, body) in all.iter().enumerate() {
+            let v: serde_json::Value = serde_json::from_str(body).unwrap();
+            let m = cache_markers(&v);
+            assert!(!m.is_empty(), "{setting}: request {i} has no markers");
+            assert!(
+                m.iter().all(|m| m["ttl"] == "1h"),
+                "{setting}: request {i} markers {m:?}"
+            );
+        }
+        // The human `/keepwarm status` line says it too.
+        t.send(SessionCommand::EngineCommand {
+            id: 1100,
+            name: "keepwarm".into(),
+            arg: "status".into(),
+        })
+        .await
+        .unwrap();
+        let v = query_result(&mut t, 1100).await;
+        let want_line = if setting == "auto" {
+            "prompt-cache TTL: 1h (auto)"
+        } else {
+            "prompt-cache TTL: 1h\n"
+        };
+        assert!(v["text"].as_str().unwrap().contains(want_line), "{v}");
+        end(&mut t).await;
+        runs.push((setting, period_ttl, total, st["keepwarm"]["last_end"].clone()));
+    }
+    let (auto, explicit) = (&runs[0], &runs[1]);
+    assert_eq!(auto.1, 3600, "auto on OAuth is governed by the 1h TTL: {runs:?}");
+    assert_eq!(
+        (&auto.1, auto.2, &auto.3),
+        (&explicit.1, explicit.2, &explicit.3),
+        "auto (resolved 1h) and explicit 1h: same TTL, same pings, same end: {runs:?}"
+    );
+}
+
 /// An explicit `Park` while a period is active ends it ("parked by
 /// request") and parks; only the idle auto-park waits for the period.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -914,6 +1009,52 @@ async fn an_observe_attach_never_makes_a_session_eligible() {
     assert_eq!(st["active"], true, "a Mirror TUI makes it eligible: {st}");
     drop(watchers);
     end(&mut script).await;
+}
+
+/// `cache_keepwarm_headless`: a session driven only by a non-interactive
+/// client (chat, rpc, server) is never eligible by default, and is once the
+/// owner opts in. Observe stays excluded either way (unit-tested in
+/// `client_qualifies`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn headless_clients_qualify_only_with_the_opt_in() {
+    let (url, bodies) = recording_stub().await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    for (headless, kind) in [
+        (false, ClientKind::Chat),
+        (false, ClientKind::Rpc),
+        (false, ClientKind::Server),
+        (true, ClientKind::Chat),
+        (true, ClientKind::Rpc),
+        (true, ClientKind::Server),
+    ] {
+        let h = Home::new();
+        write_config(
+            &h,
+            &format!(
+                "cache_keepwarm = auto\ncache_ttl = 1h\nthinking = off\n\
+                 cache_keepwarm_headless = {headless}\n"
+            ),
+        );
+        let host = host().await;
+        let handle = host.create_session(cfg()).await.unwrap();
+        let (mut c, _) = LocalTransport::attach(handle.clone(), ClientMeta::new(kind))
+            .await
+            .unwrap();
+        turn(&mut c, "hello").await;
+        // On an idle session `/keepwarm auto` starts a period at once iff
+        // the session is eligible.
+        let st = keepwarm(&mut c, 710, "auto").await;
+        assert_eq!(
+            st["active"].as_bool(),
+            Some(headless),
+            "{kind:?} with cache_keepwarm_headless = {headless}: {st}"
+        );
+        // End the period before the session goes away.
+        let _ = keepwarm(&mut c, 711, "off").await;
+        end(&mut c).await;
+    }
+    assert_eq!(pings(&bodies), 0, "no ping is due within the test");
 }
 
 /// Spend is booked on every path: a ping that was billed and then failed
@@ -1523,4 +1664,263 @@ async fn a_pinned_session_keeps_warm_without_an_interactive_client() {
     assert_eq!(st["active"], false, "unpinned: no interactive client, no period: {st}");
     let _ = pings(&bodies);
     end(&mut script).await;
+}
+
+/// An SSE reply: `read` cached, `write` written at 5m, 10 uncached input
+/// tokens, `output` output tokens (a ping's thinking is billed as output).
+fn sse_5m(read: u64, write: u64, output: u64) -> String {
+    let usage = format!(
+        "\"input_tokens\":10,\"cache_creation_input_tokens\":{write},\
+         \"cache_read_input_tokens\":{read},\"cache_creation\":\
+         {{\"ephemeral_5m_input_tokens\":{write},\"ephemeral_1h_input_tokens\":0}}"
+    );
+    format!(
+        "data: {{\"type\":\"message_start\",\"message\":{{\"id\":\"msg_kw\",\"type\":\"message\",\
+         \"role\":\"assistant\",\"content\":[],\"model\":\"{MODEL}\",\"stop_reason\":null,\
+         \"stop_sequence\":null,\"usage\":{{\"output_tokens\":0,{usage}}}}}}}\n\n\
+         data: {{\"type\":\"content_block_start\",\"index\":0,\
+         \"content_block\":{{\"type\":\"text\",\"text\":\"\"}}}}\n\n\
+         data: {{\"type\":\"content_block_delta\",\"index\":0,\
+         \"delta\":{{\"type\":\"text_delta\",\"text\":\"ok\"}}}}\n\n\
+         data: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n\
+         data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\",\
+         \"stop_sequence\":null}},\"usage\":{{\"output_tokens\":{output},{usage}}}}}\n\n\
+         data: {{\"type\":\"message_stop\"}}\n\n"
+    )
+}
+
+/// A 5,011-token prefix: turns read 4,000 and write 1,000 (+10 input, 1
+/// output); pings read 5,000 and write the 11-token tail, with
+/// `ping_output` output tokens.
+async fn small_prefix_stub(
+    ping_output: Arc<std::sync::atomic::AtomicU64>,
+) -> (String, Arc<Mutex<Vec<String>>>) {
+    let bodies = Arc::new(Mutex::new(Vec::new()));
+    let b = Arc::clone(&bodies);
+    let app = axum::Router::new().fallback(move |body: String| {
+        let b = Arc::clone(&b);
+        let out = Arc::clone(&ping_output);
+        async move {
+            let streaming = body.contains("\"stream\":true");
+            let ping = body.contains(PING_MARK);
+            b.lock().unwrap().push(body);
+            if !streaming {
+                return axum::Json(serde_json::json!({
+                    "id": "msg_c", "type": "message", "role": "assistant",
+                    "model": MODEL, "stop_reason": "end_turn",
+                    "content": [{"type": "text", "text": "summary"}],
+                    "usage": {"input_tokens": 10, "output_tokens": 5}
+                }))
+                .into_response();
+            }
+            let sse = if ping {
+                sse_5m(5_000, 11, out.load(std::sync::atomic::Ordering::SeqCst))
+            } else {
+                sse_5m(4_000, 1_000, 1)
+            };
+            (
+                axum::http::StatusCode::OK,
+                [("content-type", "text/event-stream")],
+                sse,
+            )
+                .into_response()
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (format!("http://{addr}"), bodies)
+}
+
+/// The top-level members of a JSON object body as the raw bytes sent.
+fn raw_members(body: &str) -> std::collections::BTreeMap<String, String> {
+    let b = body.as_bytes();
+    let mut out = std::collections::BTreeMap::new();
+    let mut i = body.find('{').expect("object") + 1;
+    let skip_ws = |i: &mut usize| {
+        while *i < b.len() && (b[*i] as char).is_ascii_whitespace() {
+            *i += 1;
+        }
+    };
+    // End (exclusive) of the string starting at `i` (on its opening quote).
+    let string_end = |mut i: usize| {
+        i += 1;
+        while b[i] != b'"' {
+            i += if b[i] == b'\\' { 2 } else { 1 };
+        }
+        i + 1
+    };
+    loop {
+        skip_ws(&mut i);
+        if b[i] == b'}' {
+            return out;
+        }
+        let k_end = string_end(i);
+        let key: String = serde_json::from_str(&body[i..k_end]).unwrap();
+        i = k_end;
+        skip_ws(&mut i);
+        assert_eq!(b[i], b':');
+        i += 1;
+        skip_ws(&mut i);
+        let start = i;
+        let mut depth = 0usize;
+        while depth > 0 || (b[i] != b',' && b[i] != b'}') {
+            match b[i] {
+                b'"' => {
+                    i = string_end(i);
+                    continue;
+                }
+                b'{' | b'[' => depth += 1,
+                b'}' | b']' => depth -= 1,
+                _ => {}
+            }
+            i += 1;
+        }
+        out.insert(key, body[start..i].trim_end().to_string());
+        if b[i] == b',' {
+            i += 1;
+        }
+    }
+}
+
+/// A message as the cache sees it: string content is the documented
+/// shorthand for one text block (a turn that marks the message sends the
+/// block form, the next request the shorthand), and markers are not content.
+fn strip_markers(mut msg: serde_json::Value) -> serde_json::Value {
+    if let Some(text) = msg["content"].as_str() {
+        msg["content"] = serde_json::json!([{"type": "text", "text": text}]);
+    }
+    if let Some(blocks) = msg["content"].as_array_mut() {
+        for b in blocks {
+            if let Some(o) = b.as_object_mut() {
+                o.remove("cache_control");
+            }
+        }
+    }
+    msg
+}
+
+/// Budgeted thinking on a 5K prefix through the real session actor. Before
+/// the expected-cost decision no period ever started here (a worst-case
+/// ping, 4,097 output tokens, costs more than the $0.0188 rewrite). Now:
+/// - pings go out, and every cache-key field (everything but `messages` and
+///   `max_tokens`, `thinking` included) is byte-identical to the turn whose
+///   cache it keeps warm, the history byte-identical beyond its markers;
+/// - pings within the output estimate never spend more than the rewrite;
+/// - a ping that out-thinks the estimate stays inside the reported bound
+///   (rewrite + thinking reserve), and from then on the session prices
+///   pings at their worst case, which refuses this prefix again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn budgeted_thinking_small_prefix_pings_within_the_reported_bound() {
+    use agent_engine::core::config::CacheTtl;
+    use agent_engine::session::cache_keepwarm::{
+        request_cost_usd, rewrite_cost_usd, PING_INPUT_ESTIMATE, PING_OUTPUT_ESTIMATE,
+    };
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let h = Home::new();
+    write_config(
+        &h,
+        "cache_keepwarm = auto\ncache_ttl = 5m\nthinking = medium\n",
+    );
+    let _interval = fast_pings();
+    let ping_output = Arc::new(AtomicU64::new(100));
+    let (url, bodies) = small_prefix_stub(Arc::clone(&ping_output)).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+    let handle = host.create_session(cfg()).await.unwrap();
+    let (mut t, _) = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Tui))
+        .await
+        .unwrap();
+    let ended = |st: &serde_json::Value| {
+        st["keepwarm"]["period"].is_null()
+            && st["keepwarm"]["last_end"]
+                .as_str()
+                .is_some_and(|s| s.contains("bound reached"))
+    };
+    let rewrite = rewrite_cost_usd(MODEL, CacheTtl::FiveMinutes, 5_011);
+    let worst = |out| {
+        request_cost_usd(
+            MODEL,
+            CacheTtl::FiveMinutes,
+            5_000,
+            11,
+            PING_INPUT_ESTIMATE,
+            out,
+        )
+    };
+    let reserve = worst(4_097) - worst(PING_OUTPUT_ESTIMATE);
+
+    // Period 1: pings think 100 tokens (within the estimate).
+    turn(&mut t, "hello").await;
+    let st = status_until(&mut t, 100, PATIENCE, ended).await;
+    assert!(ended(&st), "{st}");
+    let first = pings(&bodies);
+    assert!(first >= 2, "{first} pings: {st}");
+    let spent = st["keepwarm_cost"].as_f64().unwrap();
+    assert!(spent <= rewrite * (1.0 + 1e-9), "${spent} > ${rewrite} rewrite");
+    let last_end = st["keepwarm"]["last_end"].as_str().unwrap();
+    assert!(last_end.contains("thinking reserve"), "{last_end}");
+
+    // The cache-key fields, as sent.
+    let (turn_body, ping_body) = {
+        let all = bodies.lock().unwrap();
+        let turn = all
+            .iter()
+            .find(|b| b.contains("\"stream\":true") && !b.contains(PING_MARK))
+            .unwrap()
+            .clone();
+        let ping = all.iter().find(|b| b.contains(PING_MARK)).unwrap().clone();
+        (turn, ping)
+    };
+    let (mut tr, mut pr) = (raw_members(&turn_body), raw_members(&ping_body));
+    let (tm, pm) = (tr.remove("messages").unwrap(), pr.remove("messages").unwrap());
+    // `max_tokens` is not part of the cache key: the turn keeps its own.
+    let turn_max = tr.remove("max_tokens").unwrap();
+    let ping_max = pr.remove("max_tokens").unwrap();
+    assert_ne!(turn_max, ping_max);
+    assert_eq!(tr, pr, "cache-key fields differ between the turn and its ping");
+    let thinking: serde_json::Value = serde_json::from_str(&pr["thinking"]).unwrap();
+    assert_eq!(thinking["type"], "enabled", "{thinking}");
+    assert_eq!(thinking["budget_tokens"], 4096, "{thinking}");
+    assert_eq!(ping_max, "4097", "budget + 1: the API's minimum");
+    let tm: Vec<serde_json::Value> = serde_json::from_str(&tm).unwrap();
+    let pm: Vec<serde_json::Value> = serde_json::from_str(&pm).unwrap();
+    assert_eq!(pm.len(), tm.len() + 2, "history + reply + the ping");
+    for (i, m) in tm.iter().enumerate() {
+        assert_eq!(strip_markers(pm[i].clone()), strip_markers(m.clone()), "message {i}");
+    }
+
+    // Period 2: the first ping out-thinks the estimate. It still fits the
+    // reported bound; nothing more fits after it.
+    ping_output.store(2_000, Ordering::SeqCst);
+    turn(&mut t, "again").await;
+    let st = status_until(&mut t, 200, PATIENCE, |st| {
+        ended(st) && pings(&bodies) > first
+    })
+    .await;
+    assert!(ended(&st), "{st}");
+    assert_eq!(pings(&bodies), first + 1, "{st}");
+    let spent2 = st["keepwarm_cost"].as_f64().unwrap() - spent;
+    assert!(spent2 > rewrite, "the overrun is real: ${spent2}");
+    assert!(spent2 <= (rewrite + reserve) * (1.0 + 1e-9), "${spent2} > bound");
+
+    // Period 3: priced at the worst case now, this prefix is refused again.
+    turn(&mut t, "third").await;
+    let st = status_until(&mut t, 300, PATIENCE, |st| {
+        st["keepwarm"]["last_end"]
+            .as_str()
+            .is_some_and(|s| s.starts_with("not started"))
+    })
+    .await;
+    let last_end = st["keepwarm"]["last_end"].as_str().unwrap();
+    assert!(last_end.contains("worst-case cache-hit ping"), "{last_end}");
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    assert_eq!(pings(&bodies), first + 1, "no ping after the refusal");
+    handle
+        .send(SessionCommand::End {
+            reason: EndReason::HostShutdown,
+        })
+        .await
+        .unwrap();
 }

@@ -155,6 +155,59 @@ impl ChatMessage {
 pub(crate) struct TimestampedMsg {
     pub(crate) msg: ChatMessage,
     pub(crate) time: String,
+    /// A streamed thinking block's clock (its header: "thinking" while
+    /// it runs, then "thought for 12s"). `None` for every other message and
+    /// for thinking rebuilt from history, which has no timing.
+    pub(crate) thought: Option<ThoughtClock>,
+}
+
+/// When a thinking block received its first delta and when its thinking
+/// step ended (or its latest delta, while it runs) — on the store's event
+/// clock, so a subagent view replays a worker's real pace.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ThoughtClock {
+    first: std::time::Instant,
+    last: std::time::Instant,
+    /// Sealed by [`TranscriptStore::drop_empty_thinking`] when the model
+    /// moves on (text, a tool call, the response or turn ending). Until
+    /// then the block is a live slot: its header animates.
+    pub(crate) done: bool,
+}
+
+impl ThoughtClock {
+    fn start(now: std::time::Instant) -> Self {
+        Self {
+            first: now,
+            last: now,
+            done: false,
+        }
+    }
+
+    /// Another delta: the block is (again) receiving thinking.
+    fn delta(&mut self, now: std::time::Instant) {
+        self.last = self.last.max(now);
+        self.done = false;
+    }
+
+    /// The thinking step ended at `now` (the model moved on).
+    fn seal(&mut self, now: std::time::Instant) {
+        self.last = self.last.max(now);
+        self.done = true;
+    }
+
+    /// When the block began receiving thinking.
+    pub(crate) fn first(&self) -> std::time::Instant {
+        self.first
+    }
+
+    /// How long the model thought: first delta to the seal (or the latest
+    /// delta while it runs), in whole seconds (rounded). `None` under half a
+    /// second — a block that arrived in one piece has no meaningful
+    /// duration, so its header counts words instead.
+    pub(crate) fn secs(&self) -> Option<u64> {
+        let d = self.last.saturating_duration_since(self.first).as_secs_f64();
+        (d >= 0.5).then(|| d.round() as u64)
+    }
 }
 
 /// Provenance of one display row: which bytes of the owning message's
@@ -574,6 +627,9 @@ pub(crate) struct TranscriptStore {
     /// Store-owned because it changes cached line content — mutate only via
     /// [`Self::set_show_full_output`], which invalidates internally.
     show_full_output: bool,
+    /// Session cwd/home that grep/find card paths are shown relative to
+    /// (display-only). Mutate via [`Self::set_path_base`] (invalidates).
+    path_base: super::render::paths::PathBase,
 
     // ── Scrollback cap (phase 4 B6) ──────────────────────────────────────────
     /// Max retained messages (0 = unbounded).
@@ -587,6 +643,9 @@ pub(crate) struct TranscriptStore {
     bytes_since_audit: usize,
     /// Messages dropped by the cap so far (the sentinel line reports it).
     scrollback_dropped: usize,
+    /// Local date of the last dated message pushed: a message on another
+    /// day is preceded by a `── Sun Oct 25 ──` line.
+    last_day: Option<chrono::NaiveDate>,
     /// A subagent view's store: its trim note doesn't point at `/resync`,
     /// which only reloads the main thread.
     worker_view: bool,
@@ -683,6 +742,11 @@ pub(crate) struct VisibleWindow {
     pub(crate) is_empty: bool,
 }
 
+/// The system line shown where the local date changes.
+pub(crate) fn day_line(day: chrono::NaiveDate) -> String {
+    format!("── {} ──", day.format("%a %b %-d"))
+}
+
 impl TranscriptStore {
     pub(crate) fn new(clock: super::clock::TuiClock) -> Self {
         Self {
@@ -696,11 +760,13 @@ impl TranscriptStore {
             scroll_anchor: None,
             cache: CacheState::Missing,
             show_full_output: false,
+            path_base: Default::default(),
             max_msgs: 0,
             max_bytes: 0,
             pushes_since_audit: 0,
             bytes_since_audit: 0,
             scrollback_dropped: 0,
+            last_day: None,
             worker_view: false,
             tool_start_time: None,
             tool_start_times: std::collections::HashMap::new(),
@@ -749,12 +815,32 @@ impl TranscriptStore {
     /// of the event being applied (a subagent view's steer shows when the
     /// worker took it, not when the view polled).
     fn event_stamp(&self) -> String {
+        self.event_wall().format("%H:%M").to_string()
+    }
+
+    /// Wall-clock time of the event being applied.
+    fn event_wall(&self) -> chrono::DateTime<chrono::Local> {
         let ago = self.event_time.map_or(std::time::Duration::ZERO, |t| {
             self.clock.now().saturating_duration_since(t)
         });
-        let wall = chrono::Local::now()
-            - chrono::Duration::from_std(ago).unwrap_or(chrono::Duration::zero());
-        wall.format("%H:%M").to_string()
+        self.clock.wall_now() - chrono::Duration::from_std(ago).unwrap_or(chrono::Duration::zero())
+    }
+
+    /// Before a message dated `at`: a day line when the local date changed
+    /// since the previous dated message. The first dated message sets the
+    /// day without a line.
+    fn note_day(&mut self, at: chrono::DateTime<chrono::Local>) {
+        let day = at.date_naive();
+        if self.last_day.is_some_and(|last| last != day) {
+            self.messages.push(TimestampedMsg {
+                msg: ChatMessage::System(day_line(day)),
+                time: String::new(),
+                thought: None,
+            });
+            self.live_note(self.messages.len() - 1);
+            self.invalidate_last();
+        }
+        self.last_day = Some(day);
     }
 
     /// Mark this store as a subagent view's (see `worker_view`).
@@ -843,7 +929,8 @@ impl TranscriptStore {
                 "{SCROLLBACK_SENTINEL_PREFIX}{} earlier message(s) hidden {SCROLLBACK_SENTINEL_MARK}{}; {reload})",
                 self.scrollback_dropped, self.max_msgs
             )),
-            time: chrono::Local::now().format("%H:%M").to_string(),
+            time: self.clock.wall_now().format("%H:%M").to_string(),
+            thought: None,
         };
         self.messages.insert(0, sentinel);
         self.live_inserted(0);
@@ -1122,9 +1209,29 @@ impl TranscriptStore {
     // App-side wrappers (locked decision #3).
 
     pub(crate) fn push_msg(&mut self, msg: ChatMessage) {
+        let at = self.event_wall();
+        self.push_msg_at(msg, Some(at));
+    }
+
+    /// Push a message that happened at `at` (a rebuilt transcript: the time
+    /// the host recorded for it), shown as local `HH:MM`. `None`: a message
+    /// with no recorded time shows an empty time, never "now".
+    pub(crate) fn push_msg_at(
+        &mut self,
+        msg: ChatMessage,
+        at: Option<chrono::DateTime<chrono::Local>>,
+    ) {
+        if let Some(at) = at {
+            self.note_day(at);
+        }
+        // The placeholder's header counts from when it appeared; a real
+        // thought that replaces it keeps that clock (no jump back to 0s).
+        let thought = matches!(&msg, ChatMessage::Thinking(t) if t == THINKING_PLACEHOLDER)
+            .then(|| ThoughtClock::start(self.event_now()));
         self.messages.push(TimestampedMsg {
             msg,
-            time: self.event_stamp(),
+            time: at.map(|at| at.format("%H:%M").to_string()).unwrap_or_default(),
+            thought,
         });
         // Auto-scroll only when pinned to bottom
         if self.scroll_pinned {
@@ -1189,6 +1296,7 @@ impl TranscriptStore {
                     TimestampedMsg {
                         msg,
                         time: self.event_stamp(),
+                        thought: None,
                     },
                 );
                 self.live_inserted(at);
@@ -1237,7 +1345,8 @@ impl TranscriptStore {
                 msg: ChatMessage::System(format!(
                     "… {omitted} earlier message(s) hidden to speed resume — full history is still in the model's context"
                 )),
-                time: chrono::Local::now().format("%H:%M").to_string(),
+                time: self.clock.wall_now().format("%H:%M").to_string(),
+                thought: None,
             },
         );
         self.relive();
@@ -2427,8 +2536,24 @@ impl TranscriptStore {
     /// Self-invalidating setter — the toggle changes cached line content, so
     /// the manual `invalidate()` at the call site is impossible to forget
     /// because it no longer exists (red-team overrule of design §6 decision 1).
+    /// Where card paths are shortened from (see [`Self::set_path_base`]).
+    pub(crate) fn path_base(&self) -> &super::render::paths::PathBase {
+        &self.path_base
+    }
+
+    /// Set the session cwd card paths are shown relative to; re-renders
+    /// cached cards when it changes (session switch).
+    pub(crate) fn set_path_base(&mut self, base: super::render::paths::PathBase) {
+        if self.path_base != base {
+            self.path_base = base;
+            self.invalidate();
+        }
+    }
+
     pub(crate) fn set_show_full_output(&mut self, v: bool) {
         self.show_full_output = v;
+        // A streaming thought is live only while collapsed (live.rs).
+        self.relive();
         self.invalidate();
     }
 
@@ -2903,35 +3028,59 @@ impl TranscriptStore {
         self.response_start
     }
 
+    /// Append a thinking delta, starting (or extending) the block's clock:
+    /// the block stays a live slot, its header animating, until
+    /// [`Self::drop_empty_thinking`] seals it.
     pub(crate) fn append_or_update_thinking(&mut self, text: &str) {
+        let now = self.event_now();
         if let Some(TimestampedMsg {
             msg: ChatMessage::Thinking(ref mut existing),
+            thought,
             ..
         }) = self.messages.last_mut()
         {
-            // First real delta replaces the sentinel placeholder rather than
-            // appending to it (otherwise content reads "…​<thinking>").
+            // First delta replaces the sentinel placeholder rather than
+            // appending to it (otherwise content reads "…​<thinking>"), in
+            // place: the live header becomes the thought, its clock running
+            // on from the placeholder's. An empty delta makes it a thought
+            // with no text — `thinking_display = omitted` streams just that
+            // one — which stays the live header, then seals to a bare
+            // "thought for Ns" instead of vanishing.
             if existing == THINKING_PLACEHOLDER {
                 *existing = text.to_string();
-                self.live_note(self.messages.len() - 1);
+                thought.get_or_insert(ThoughtClock::start(now)).delta(now);
             } else {
                 existing.push_str(text);
+                // A block rebuilt from history has no clock: it stays
+                // untimed rather than timing only its tail.
+                if let Some(clock) = thought {
+                    clock.delta(now);
+                }
             }
         } else {
             self.push_msg(ChatMessage::Thinking(text.to_string()));
+            if let Some(m) = self.messages.last_mut() {
+                m.thought = Some(ThoughtClock::start(now));
+            }
         }
+        self.live_note(self.messages.len() - 1);
         self.invalidate_last();
     }
 
-    /// Remove a trailing thinking block that never received content — the
-    /// sentinel placeholder, or one left empty. Called when the model starts
-    /// producing real output or the turn ends, so the thinking spinner can't
-    /// run forever on an empty thinking step.
+    /// The thinking step is over. Remove a trailing thinking block that never
+    /// received content — the sentinel placeholder, or an untimed empty one —
+    /// so the thinking spinner can't run forever on an empty thinking step;
+    /// or seal a trailing real one, which stops its live header and fixes its
+    /// "thought for Ns". A timed empty one is real (an omitted-display
+    /// thought: the model thought, the API sent no text) and is sealed too.
+    /// Called when the model starts producing real output or the
+    /// response/turn ends.
     ///
     /// Scans backward past trailing System/Notice messages so a placeholder
     /// stranded mid-list (e.g. when a Notice arrives on top of it) is still
     /// found and removed (FIX 4).
     pub(crate) fn drop_empty_thinking(&mut self) {
+        let now = self.event_now();
         // Walk from the tail, skipping System messages, to find the first
         // non-System message. If it's an empty/placeholder Thinking, drop it.
         let candidate_idx = self
@@ -2940,14 +3089,56 @@ impl TranscriptStore {
             .rposition(|m| !matches!(&m.msg, ChatMessage::System(_)));
         if let Some(idx) = candidate_idx {
             if let ChatMessage::Thinking(t) = &self.messages[idx].msg {
-                if t == THINKING_PLACEHOLDER || t.is_empty() {
+                let untimed_empty = t.is_empty() && self.messages[idx].thought.is_none();
+                if t == THINKING_PLACEHOLDER || untimed_empty {
                     self.messages.remove(idx);
                     self.live_removed(idx);
                     self.anchor_remap_remove(idx);
                     // Structural change (remove) — full invalidate to resync per_msg lengths.
                     self.invalidate_structural();
+                } else if let Some(clock) =
+                    self.messages[idx].thought.as_mut().filter(|c| !c.done)
+                {
+                    // It thought until the model moved on.
+                    clock.seal(now);
+                    self.live_note(idx);
+                    // The block swaps the live tail for the collapsed head
+                    // preview and the "thought for" header: content rows
+                    // change, so a selection reaching it is cleared (L3).
+                    self.invalidate_from(idx);
                 }
             }
+        }
+    }
+
+    /// A provider response starts: seal (or drop, if empty) a thought the
+    /// previous response left, as [`Self::drop_empty_thinking`] does — but a
+    /// trailing placeholder stays. Nothing has streamed yet, and it is the
+    /// turn's live `thinking` header until the first thinking or agent text
+    /// replaces it.
+    ///
+    /// A placeholder that system lines (a retry notice) landed under moves
+    /// to the very end: the response then starts right after it, so a
+    /// `ResponseReset` restores it exactly (the rollback snapshot's `last`)
+    /// and removes everything the failed attempt streamed.
+    pub(crate) fn settle_thinking_for_response(&mut self) {
+        let tail = self
+            .messages
+            .iter()
+            .rposition(|m| !matches!(&m.msg, ChatMessage::System(_)));
+        let Some(idx) = tail.filter(|&i| {
+            matches!(&self.messages[i].msg, ChatMessage::Thinking(t) if t == THINKING_PLACEHOLDER)
+        }) else {
+            self.drop_empty_thinking();
+            return;
+        };
+        if idx + 1 < self.messages.len() {
+            let m = self.messages.remove(idx);
+            self.live_removed(idx);
+            self.anchor_remap_remove(idx);
+            self.messages.push(m);
+            self.live_note(self.messages.len() - 1);
+            self.invalidate_structural();
         }
     }
 
@@ -3035,6 +3226,7 @@ impl TranscriptStore {
     /// Equivalent to `messages.clear()` + `invalidate()` in prior slices.
     pub(crate) fn clear(&mut self) {
         self.messages.clear();
+        self.last_day = None;
         self.live.clear();
         self.response_start = None;
         self.clear_selection();
@@ -3187,6 +3379,32 @@ mod visible_window_tests {
             streaming: false,
             agent_name: "synaps",
         }
+    }
+
+    /// A message without a recorded time renders an empty time, not now.
+    #[test]
+    fn a_message_without_a_time_renders_with_an_empty_time() {
+        let mut store = TranscriptStore::new(super::super::clock::TuiClock::real());
+        store.push_msg_at(ChatMessage::User("legacy".into()), None);
+        let at = chrono::DateTime::parse_from_rfc3339("2020-03-01T05:47:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Local);
+        store.push_msg_at(ChatMessage::User("dated".into()), Some(at));
+        let text = |i: usize| -> String {
+            store
+                .render_message_lines(i, 60, &test_ctx())
+                .lines
+                .unwrap()
+                .iter()
+                .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let now = chrono::Local::now().format("%H:%M").to_string();
+        let legacy = text(0);
+        assert!(legacy.contains("you") && !legacy.contains(&now), "{legacy}");
+        assert!(!legacy.chars().any(|c| c == ':'), "no time shown: {legacy}");
+        assert!(text(1).contains(&at.format("%H:%M").to_string()));
     }
 
     /// Ported from app.rs with slice (e). The app.rs original *mirrored* the

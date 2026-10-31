@@ -30,6 +30,8 @@ pub struct HostParts {
     pub mcp_runtime: Option<Arc<crate::mcp::McpRuntimeManager>>,
     pub extension_runtime: Option<Arc<crate::extensions::lease::ExtensionRuntimeManager>>,
     pub capture_dir: std::path::PathBuf,
+    /// `<base>/spill` (tool output virtualisation), bound once at boot.
+    pub spill_root: std::path::PathBuf,
     pub progressive_tool_disclosure: bool,
 }
 
@@ -52,6 +54,14 @@ pub struct HostOpts {
 
 pub use crate::mcp::McpDiscovery;
 
+/// What a cached worker registry template was built from
+/// ([`EngineHost::worker_registry`]).
+#[derive(PartialEq, Eq)]
+struct WorkerRegistryKey {
+    generation: CatalogGeneration,
+    disabled_tools: Vec<String>,
+}
+
 pub struct EngineHost {
     parts: HostParts,
     config: arc_swap::ArcSwap<crate::SynapsConfig>,
@@ -59,10 +69,11 @@ pub struct EngineHost {
     keybind_registry: Arc<std::sync::RwLock<crate::skills::keybinds::KeybindRegistry>>,
     ext_manager: Arc<RwLock<crate::extensions::manager::ExtensionManager>>,
     mcp_server_count: usize,
-    /// Worker (subagent) registry template, cached by shared-catalog
-    /// generation. `worker_runtime()` clones this instead of rebuilding
-    /// `without_subagent_with_extensions` + `rebuild_schema()` per spawn.
-    worker_registry: std::sync::Mutex<Option<(CatalogGeneration, ToolRegistry)>>,
+    /// Worker (subagent) registry template, cached by what it is built from:
+    /// the shared catalog generation and the `disabled_tools` list.
+    /// `worker_runtime()` clones this instead of rebuilding
+    /// `ToolRegistry::worker_set` + `rebuild_schema()` per spawn.
+    worker_registry: std::sync::Mutex<Option<(WorkerRegistryKey, ToolRegistry)>>,
     /// File-appender flush guard. Lives for the process (≥ any renderer), so
     /// log lines emitted after `boot()` returns can never be dropped by an
     /// early guard drop (the old `setup::boot` bug). Rust runs no static
@@ -150,6 +161,7 @@ impl EngineHost {
         let client = crate::runtime::build_host_http_client()?;
         let capture_dir = crate::runtime::trace::default_capture_dir();
         let _ = crate::runtime::trace::sweep_expired_captures(&capture_dir);
+        let spill_root = crate::runtime::sweep_spill_root();
 
         let config = crate::config::load_config();
         let tools = Arc::new(RwLock::new(ToolRegistry::new()));
@@ -203,6 +215,7 @@ impl EngineHost {
             mcp_runtime,
             extension_runtime,
             capture_dir,
+            spill_root,
             progressive_tool_disclosure: config.progressive_tool_disclosure,
         };
 
@@ -397,8 +410,8 @@ impl EngineHost {
     /// A worker (subagent) runtime. Shares credential source and token cache
     /// (so NO broker re-install and NO cache eviction) and takes a CLONE of
     /// the cached worker registry template. Does NOT share: the HTTP client
-    /// (fresh — see below), hook_bus (fresh, empty — hooks do not fire for
-    /// subagent tool calls), session_manager (fresh + reaper),
+    /// (fresh — see below), hook_bus (a worker view of it instead — see
+    /// [`Self::worker_hook_bus`]), session_manager (fresh + reaper),
     /// mcp_runtime/extension_runtime (`None`, as `Runtime::new()`).
     ///
     /// Own client: workers `block_on` a throwaway `current_thread` runtime
@@ -409,7 +422,7 @@ impl EngineHost {
     pub async fn worker_runtime(&self) -> Result<Runtime> {
         let mut host = self.parts.clone();
         host.client = crate::runtime::build_host_http_client()?;
-        host.hook_bus = Arc::new(HookBus::new());
+        host.hook_bus = self.worker_hook_bus();
         host.tools = Arc::new(RwLock::new(self.worker_registry().await));
         host.mcp_runtime = None;
         host.extension_runtime = None;
@@ -423,34 +436,44 @@ impl EngineHost {
         Ok(runtime)
     }
 
-    /// Cached-or-rebuilt worker registry: `without_subagent_with_extensions`
-    /// is a pure function of the shared registry's tool set, which is a pure
-    /// function of its catalog generation, so caching by generation returns
-    /// exactly what a rebuild would.
+    /// The hook bus every subagent worker runs with, on both spawn paths
+    /// (this host's `worker_runtime` and the legacy
+    /// `SYNAPS_SUBAGENT_FRESH_RUNTIME=1` runtime): a live view of the host
+    /// bus's `after_tool_call` subscriptions from extensions holding
+    /// `tools.transform_output` ([`HookBus::worker_transforms`]). Output
+    /// transforms (compression, redaction) see a worker's tool results the
+    /// way they see the foreground's; `before_tool_call` and every other
+    /// hook kind still do not fire for subagent tool calls, so a worker
+    /// never raises a confirm prompt. The extension sees `session_id: null`
+    /// (a worker has no conversation id). `subagent_transform_hooks = off`
+    /// detaches it (`apply_subagent_runtime_policy`).
+    pub fn worker_hook_bus(&self) -> Arc<HookBus> {
+        HookBus::worker_transforms(&self.parts.hook_bus)
+    }
+
+    /// Cached-or-rebuilt worker registry ([`ToolRegistry::worker_set`]).
+    /// The worker's built-ins are built from scratch, so the boot-time
+    /// disable on the shared registry does not carry over: `worker_set`
+    /// re-applies the whole `disabled_tools` list (before, a worker of a
+    /// host with `disabled_tools = bash` still had `bash`; only the forum
+    /// names were re-applied). The template is a pure function of the shared
+    /// registry's tool set (a pure function of its catalog generation) and
+    /// the list, so caching by both returns exactly what a rebuild would,
+    /// and a `reload_config` that changes the list rebuilds it.
     pub async fn worker_registry(&self) -> ToolRegistry {
         let shared = self.parts.tools.read().await;
-        let gen = shared.catalog().generation();
-        if let Some((cached_gen, tpl)) = &*self.worker_registry.lock().unwrap() {
-            if *cached_gen == gen {
+        let key = WorkerRegistryKey {
+            generation: shared.catalog().generation(),
+            disabled_tools: self.config().disabled_tools.clone(),
+        };
+        if let Some((cached, tpl)) = &*self.worker_registry.lock().unwrap() {
+            if *cached == key {
                 return tpl.clone();
             }
         }
-        let mut fresh = ToolRegistry::without_subagent_with_extensions(&shared);
+        let fresh = ToolRegistry::worker_set(&shared, &key.disabled_tools);
         drop(shared);
-        // #112: apply after the merge too — a shared registry must not
-        // reintroduce a forum tool the operator disabled. Other worker policy
-        // is preserved.
-        let disabled_forum: Vec<String> = self
-            .config()
-            .disabled_tools
-            .iter()
-            .filter(|name| matches!(name.as_str(), "forum_post" | "forum_read" | "forum_forget"))
-            .cloned()
-            .collect();
-        if !disabled_forum.is_empty() {
-            fresh.disable(&disabled_forum);
-        }
-        *self.worker_registry.lock().unwrap() = Some((gen, fresh.clone()));
+        *self.worker_registry.lock().unwrap() = Some((key, fresh.clone()));
         fresh
     }
 

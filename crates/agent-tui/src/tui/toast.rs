@@ -169,6 +169,11 @@ impl ToastProvider {
     }
 }
 
+/// Rows a top-anchored toast leaves clear: the header row and the message
+/// pane's top edge, which the header paints as its slab's rim. A toast at
+/// row 1 sat on that rim, glued to (and visually overlapping) the header.
+pub(crate) const TOAST_TOP_CLEARANCE: u16 = 2;
+
 /// Compute the rectangle for a toast with the given content size.
 pub(crate) fn toast_rect(
     area: Rect,
@@ -185,7 +190,7 @@ pub(crate) fn toast_rect(
         ToastX::Right => safe.x + safe.width.saturating_sub(width),
     };
     let y = match position.y {
-        ToastY::Top => safe.y.saturating_add(1),
+        ToastY::Top => safe.y.saturating_add(TOAST_TOP_CLEARANCE),
         ToastY::Middle => safe.y + safe.height.saturating_sub(height) / 2,
         ToastY::Bottom => safe.y + safe.height.saturating_sub(height),
     }
@@ -237,11 +242,11 @@ mod tests {
         let area = Rect::new(0, 0, 100, 40);
         assert_eq!(
             toast_rect(area, 20, 5, ToastPosition::TOP_LEFT),
-            Rect::new(2, 1, 20, 5)
+            Rect::new(2, 2, 20, 5)
         );
         assert_eq!(
             toast_rect(area, 20, 5, ToastPosition::TOP_RIGHT),
-            Rect::new(78, 1, 20, 5)
+            Rect::new(78, 2, 20, 5)
         );
         assert_eq!(
             toast_rect(area, 20, 5, ToastPosition::BOTTOM_LEFT),
@@ -262,7 +267,7 @@ mod tests {
         );
         assert_eq!(
             toast_rect(area, 21, 5, ToastPosition::TOP_CENTER),
-            Rect::new(40, 1, 21, 5)
+            Rect::new(40, 2, 21, 5)
         );
         assert_eq!(
             toast_rect(area, 21, 5, ToastPosition::MIDDLE_LEFT),
@@ -284,7 +289,7 @@ mod tests {
         assert_eq!(ToastPosition::default(), ToastPosition::TOP_CENTER);
         assert_eq!(
             toast_rect(area, 20, 5, ToastPosition::default()),
-            Rect::new(40, 1, 20, 5)
+            Rect::new(40, 2, 20, 5)
         );
     }
 

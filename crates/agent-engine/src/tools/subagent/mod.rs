@@ -91,6 +91,26 @@ fn sanitize_label(raw: &str) -> Option<String> {
     (!out.is_empty()).then(|| out.to_string())
 }
 
+/// The parent session's working directory and environment, handed to every
+/// worker it spawns. `Default` (all empty) = process cwd/env, the in-process
+/// behaviour.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct WorkerWorkspace {
+    pub cwd: Option<std::path::PathBuf>,
+    pub env: Option<crate::session::types::SessionEnv>,
+    pub env_stripped: Vec<String>,
+}
+
+impl WorkerWorkspace {
+    pub(crate) fn from_capabilities(caps: &crate::tools::ToolCapabilities) -> Self {
+        Self {
+            cwd: caps.cwd.clone(),
+            env: caps.env.clone(),
+            env_stripped: caps.env_stripped.clone(),
+        }
+    }
+}
+
 /// Apply the subagent-spawn credential policy to a freshly-created `Runtime`
 /// (which has already had `Runtime::new()` called), then **unconditionally
 /// force** the cache TTL to `FiveMinutes`.
@@ -109,7 +129,17 @@ pub(crate) fn apply_subagent_runtime_policy(
     memory_backend: Option<&crate::memory_backend::MemoryBinding>,
     session_allow_all: Option<&std::sync::Arc<crate::tools::SessionConfirmLatch>>,
     telemetry: Option<&crate::runtime::telemetry::WorkerTelemetry>,
+    workspace: &WorkerWorkspace,
 ) {
+    // Workers run where their parent session runs. Under the daemon the
+    // process cwd/env belong to the daemon, not the session; without this
+    // every worker tool resolved paths and spawned commands in the daemon's
+    // directory. Set before the memory fallback below so it scopes to the
+    // session's project too.
+    runtime.set_cwd(workspace.cwd.clone());
+    runtime.set_env(workspace.env.clone());
+    runtime.set_env_stripped(workspace.env_stripped.clone());
+
     runtime.inherit_session_allow_all(session_allow_all);
 
     // Record at the parent's telemetry level, through the parent's session
@@ -119,6 +149,35 @@ pub(crate) fn apply_subagent_runtime_policy(
         runtime.inherit_telemetry(parent);
     }
     runtime.apply_retry_config(config);
+    // Tool output virtualisation: a worker spills big results into its own
+    // dir (keyed by its runtime session) and can `read`/`grep` them back.
+    runtime.set_tool_spill_policy(crate::runtime::tool_spill::ToolSpillPolicy::from_config(
+        config,
+    ));
+    runtime.set_read_dedupe(config.read_dedupe);
+    // Keep the 5m cache warm while a tool round runs (`cache_keepwarm_tools`):
+    // a worker's builds, test sweeps and poll loops routinely outlast the
+    // TTL pinned below, and their 300s default `bash_max_timeout` equals it.
+    runtime.set_tool_keepwarm(config.cache_keepwarm_tools);
+    // Tool limits, as the foreground gets them through `apply_config`.
+    // Without them a worker ran every command under the 30s/300s defaults and
+    // truncated tool output at 30000 whatever the operator configured.
+    runtime.set_bash_timeout(config.bash_timeout);
+    runtime.set_bash_max_timeout(config.bash_max_timeout);
+    runtime.set_max_tool_output(config.max_tool_output);
+    // Cache diagnostics: the worker's own chain (a `from_parts` runtime has a
+    // fresh `previous_message_id` and rejection latch), API-key auth only for
+    // the beta header, and the same fail-soft retry as the foreground.
+    runtime.set_cache_diagnostics(config.cache_diagnostics);
+    // gzip request bodies, sharing the process-wide refusal latch.
+    runtime.set_request_compression(config.request_compression, config.request_compression_level);
+    // Output transforms: the spawn path gave the worker the host's
+    // after_tool_call transform view (`EngineHost::worker_hook_bus`); the
+    // operator can turn it off. Detaching only ever narrows: no spawn path
+    // hands a worker the full host bus.
+    if !config.subagent_transform_hooks {
+        runtime.set_hook_bus(std::sync::Arc::new(crate::extensions::hooks::HookBus::new()));
+    }
 
     // Credential source / token cache: host-built workers already share the
     // process-wide broker (`spawn_runtime`); only the legacy fresh-runtime
@@ -128,15 +187,19 @@ pub(crate) fn apply_subagent_runtime_policy(
     // inherit path forks execution authorship, not authority: never copy
     // session recall/capture leases or expand the worker tool registry.
     runtime.inherit_memory_backend(memory_backend.cloned().unwrap_or_else(|| {
-        crate::memory_backend::MemoryBinding::from_config(&config.memory_backend)
+        crate::memory_backend::MemoryBinding::from_config_with_cwd(
+            &config.memory_backend,
+            workspace.cwd.clone().or_else(|| std::env::current_dir().ok()),
+        )
     }));
 
     runtime.set_codex_request_role(crate::runtime::openai::catalog::CodexRequestRole::Worker);
 
     // Policy: subagent spawns are always 5m cache TTL regardless of what the
-    // parent session configured. `Runtime::new()` already defaults to
-    // `FiveMinutes`, but this explicit call makes the invariant contract-level
-    // so a future `apply_config` addition can't silently break it.
+    // parent session configured. Load-bearing: `Runtime::new()` defaults to
+    // `cache_ttl = auto`, which resolves to 1h on OAuth credentials; this
+    // explicit call pins workers to a fixed 5m (#110) so neither that
+    // default nor a future `apply_config` addition can silently change it.
     runtime.set_cache_ttl(crate::core::config::CacheTtl::FiveMinutes);
 
     // Task 23: workers run under the WORKER turn budget (typed config
@@ -146,17 +209,88 @@ pub(crate) fn apply_subagent_runtime_policy(
         crate::runtime::budget::TurnRole::Worker,
         &config.turn_budgets,
     ));
+
+    // Automatic context rollover (`subagent_context_management`,
+    // `subagent_rollover_tokens`). Inert until the spawn path attaches the
+    // worker's transcript sink (`attach_worker_transcripts`).
+    runtime.set_worker_context_settings(Some(
+        crate::runtime::worker_context::WorkerContextSettings::from_config(config),
+    ));
+
+    // The configured `context_window`, as the foreground gets it through
+    // `apply_config`. Without it every worker budgeted against the 200k
+    // model default and never sent the 1M opt-in, so on Opus the output
+    // reserve alone put it at hard capacity near 32k (#332 rollover thrash).
+    // The model is not chosen yet: `fit_subagent_context_window` drops a
+    // window the worker's model cannot open once it is.
+    runtime.set_context_window(config.context_window);
 }
 
-/// Exact Fable 5.1 worker default requested for this harness. Do not infer
-/// capability or effort for sibling IDs, other providers, or foreground calls.
-#[allow(dead_code)] // merge(112): consumed when Fable model reaches the spawn paths
-pub(crate) fn apply_anthropic_worker_reasoning(runtime: &mut crate::Runtime) {
-    if runtime.codex_request_role() == crate::runtime::openai::catalog::CodexRequestRole::Worker
-        && runtime.model() == "anthropic/claude-fable-5-1"
-    {
-        runtime.set_reasoning_level(agent_core::reasoning::ReasoningLevel::XHigh);
+/// The window a worker on `model` runs with, given the configured
+/// `context_window`. The setting is one per user, not per model, so a worker
+/// on any model gets it, as the foreground keeps it across `/model`, except a
+/// window above the model default on a model without 1M support: the request
+/// builder never sends that model the 1M opt-in, so the provider window is
+/// the default one, and the worker must budget against that.
+pub(crate) fn subagent_context_window(configured: Option<u64>, model: &str) -> Option<u64> {
+    use crate::core::models::{context_window_for_model, model_supports_1m};
+    configured.filter(|&window| window <= context_window_for_model(model) || model_supports_1m(model))
+}
+
+/// Called after model selection by start, oneshot AND resume: fit the window
+/// `apply_subagent_runtime_policy` inherited to the model the worker runs on
+/// (an agent file or the call can pin a model other than the parent's).
+pub(crate) fn fit_subagent_context_window(runtime: &mut crate::Runtime) {
+    let fitted = subagent_context_window(runtime.context_window_override(), runtime.model());
+    runtime.set_context_window(fitted);
+}
+
+/// Give a worker somewhere to keep the context it rolls over: its archive
+/// directory (`<handle>.window-<N>.md` beside the resume archive), and wire
+/// each rollover into its status (`state`) and subagent panel line. Called
+/// by every spawn path after `apply_subagent_runtime_policy`, before the run
+/// starts. A resumed worker starts at its archived window.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn attach_worker_transcripts(
+    runtime: &mut crate::Runtime,
+    dir: std::path::PathBuf,
+    handle_id: &str,
+    state: Option<std::sync::Arc<std::sync::RwLock<crate::runtime::subagent::SubagentState>>>,
+    initial_messages: &[crate::SharedMessage],
+    tx_events: Option<tokio::sync::mpsc::UnboundedSender<crate::StreamEvent>>,
+    subagent_id: u64,
+    label: &str,
+) {
+    use crate::runtime::worker_context::{window_state, WorkerRolloverReport, WorkerTranscriptSink};
+    if let Some(state) = &state {
+        let (window, transcripts) = window_state(initial_messages);
+        state
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .note_context(window, transcripts.into_iter().map(|t| t.path.into()).collect());
     }
+    let label = label.to_owned();
+    let observer = move |report: &WorkerRolloverReport| {
+        if let Some(state) = &state {
+            let mut s = state.write().unwrap_or_else(|p| p.into_inner());
+            s.note_context(report.window, report.transcripts.clone());
+            s.context_rollovers = s.context_rollovers.saturating_add(1);
+            let tools = s.tools;
+            s.note_progress(&report.step(), tools);
+        }
+        if let Some(tx) = &tx_events {
+            let _ = tx.send(crate::StreamEvent::Agent(crate::AgentEvent::SubagentUpdate {
+                subagent_id,
+                agent_name: label.clone(),
+                status: report.step(),
+            }));
+        }
+    };
+    runtime.attach_worker_transcripts(WorkerTranscriptSink {
+        dir,
+        stem: handle_id.to_owned(),
+        observer: Some(std::sync::Arc::new(observer)),
+    });
 }
 
 /// Called after model selection by start, oneshot AND resume. Only inherit
@@ -179,6 +313,37 @@ pub(crate) fn apply_codex_worker_reasoning(
     }
 }
 
+/// Resolve once at admission, before allocating a handle. Resume preserves the
+/// recorded level; old archives without it use today's independent worker default.
+pub(crate) fn resolve_subagent_thinking(
+    params: &serde_json::Value,
+    prior: Option<&str>,
+    config: &crate::config::SynapsConfig,
+) -> crate::Result<agent_core::reasoning::ReasoningLevel> {
+    let value = match params.get("thinking") {
+        None | Some(serde_json::Value::Null) => prior,
+        Some(serde_json::Value::String(value)) => Some(value.as_str()),
+        Some(_) => return Err(crate::RuntimeError::Tool(
+            "thinking must be low|medium|high|xhigh|max".into(),
+        )),
+    };
+    match value {
+        None => Ok(config.subagent_thinking),
+        Some(value) => agent_core::reasoning::parse_subagent_thinking(value).ok_or_else(|| {
+            crate::RuntimeError::Tool("thinking must be low|medium|high|xhigh|max".into())
+        }),
+    }
+}
+
+/// Last reasoning mutation before dispatch: neither model defaults nor a
+/// foreground Ultra inheritance may override the worker's selected effort.
+pub(crate) fn apply_subagent_thinking(
+    runtime: &mut crate::Runtime,
+    thinking: agent_core::reasoning::ReasoningLevel,
+) -> Result<(), String> {
+    runtime.set_reasoning_level_checked(thinking)
+}
+
 /// Kill-switch: `SYNAPS_SUBAGENT_FRESH_RUNTIME=1` restores the pre-engine-host
 /// spawn path (fresh `Runtime::new()`, fresh HTTP client, registry rebuilt,
 /// global broker re-installed with a fresh token cache on every spawn).
@@ -193,35 +358,68 @@ pub fn legacy_fresh_runtime() -> bool {
 /// installed, or kill-switch set): today's `Runtime::new()` + rebuilt tools +
 /// `apply_auth_config`, verbatim.
 ///
+/// Both paths run with the host's worker hook view
+/// (`EngineHost::worker_hook_bus`: its `after_tool_call` output transforms,
+/// nothing else). Without an installed host there are no host subscriptions
+/// to see, and the legacy runtime keeps its own empty bus.
+///
 /// Called from the subagent's own OS thread / current-thread tokio runtime:
 /// `EngineHost::current()` is a `OnceLock` read and `worker_runtime()` only
 /// touches `tokio::sync` primitives, so this is runtime-agnostic.
 pub async fn spawn_runtime() -> crate::Result<crate::Runtime> {
+    let host = crate::EngineHost::current();
     if !legacy_fresh_runtime() {
-        if let Some(host) = crate::EngineHost::current() {
+        if let Some(host) = &host {
             return host.worker_runtime().await;
         }
     }
+    // The host's config when there is one (the source of its foreground
+    // lockdown and of `worker_runtime`), else the disk.
+    let config = match &host {
+        Some(host) => std::sync::Arc::clone(&*host.config()),
+        None => std::sync::Arc::new(crate::config::load_config()),
+    };
     let mut rt = crate::Runtime::new().await?;
-    rt.set_tools(subagent_tools().await);
-    rt.apply_auth_config(&crate::config::load_config());
+    rt.set_tools(subagent_tools(&config.disabled_tools).await);
+    rt.apply_auth_config(&config);
+    if let Some(host) = &host {
+        rt.set_hook_bus(host.worker_hook_bus());
+    }
     Ok(rt)
 }
 
 /// Build the subagent tool registry: extension tools if the routing manager
-/// has a shared registry, otherwise the bare without_subagent set.
+/// has a shared registry, otherwise the bare without_subagent set, minus
+/// every built-in in `disabled` (`disabled_tools`; the legacy twin of
+/// `EngineHost::worker_registry`, see `ToolRegistry::worker_set`).
 ///
 /// Single source of truth for all three spawn paths (oneshot, start, resume).
 /// Divergence is structurally impossible when all three call this function.
-pub(crate) async fn subagent_tools() -> crate::ToolRegistry {
+pub(crate) async fn subagent_tools(disabled: &[String]) -> crate::ToolRegistry {
     if let Some(ext_mgr) = crate::runtime::openai::extension_manager_for_routing() {
         let mgr = ext_mgr.read().await;
         if let Some(shared) = mgr.tools_shared() {
             let extension_tools = shared.read().await;
-            return crate::ToolRegistry::without_subagent_with_extensions(&extension_tools);
+            return crate::ToolRegistry::worker_set(&extension_tools, disabled);
         }
     }
-    crate::ToolRegistry::without_subagent()
+    let mut tools = crate::ToolRegistry::without_subagent();
+    tools.disable(disabled);
+    tools
+}
+
+/// The config one spawn reads, once, at admission: the worker's thinking
+/// level, `apply_subagent_runtime_policy` and (resume) the cold-resume
+/// compact size all come from this one snapshot, never from a second read
+/// partway through the spawn.
+///
+/// Read from disk, not `EngineHost::config()`: nothing refreshes the host's
+/// snapshot after boot in production (`reload_config` has no caller), and
+/// every `/settings` row that says "applies to workers started afterwards"
+/// only writes the file. The registry's `disabled_tools` stays on the host
+/// snapshot, the boot-time lockdown the foreground runs under.
+pub(crate) fn spawn_config() -> std::sync::Arc<crate::config::SynapsConfig> {
+    std::sync::Arc::new(crate::config::load_config())
 }
 
 /// Project-forum guidance for workers (#112). Appended to every subagent
@@ -257,6 +455,71 @@ fn compose_system_prompt_with_preamble(
 }
 
 #[cfg(test)]
+mod subagent_thinking_tests {
+    use super::*;
+    use crate::tools::Tool;
+    use agent_core::reasoning::ReasoningLevel;
+    use serde_json::json;
+
+    #[test]
+    fn subagent_thinking_default_override_and_resume_precedence() {
+        let cfg = crate::config::load_config_from_str("thinking = low\nsubagent_thinking = high\n");
+        assert_eq!(resolve_subagent_thinking(&json!({}), None, &cfg).unwrap(), ReasoningLevel::High);
+        assert_eq!(resolve_subagent_thinking(&json!({}), Some("low"), &cfg).unwrap(), ReasoningLevel::Low);
+        assert_eq!(resolve_subagent_thinking(&json!({"thinking":"max"}), Some("low"), &cfg).unwrap(), ReasoningLevel::Max);
+        assert_eq!(resolve_subagent_thinking(&json!({"thinking":null}), Some("medium"), &cfg).unwrap(), ReasoningLevel::Medium);
+        for value in [json!(false), json!(1), json!(""), json!("typo"), json!("ultra")] {
+            assert!(resolve_subagent_thinking(&json!({"thinking":value}), None, &cfg).is_err());
+        }
+    }
+
+    #[test]
+    fn subagent_thinking_actual_runtime_and_astra_wire() {
+        use crate::runtime::openai::catalog::{plan_codex_execution, CodexRequestRole};
+        for value in ["low", "medium", "high", "xhigh", "max"] {
+            let cfg = crate::config::load_config_from_str("thinking = low\n");
+            let params = if value == "xhigh" { json!({}) } else { json!({"thinking":value}) };
+            let level = resolve_subagent_thinking(&params, None, &cfg).unwrap();
+            let mut runtime = crate::Runtime::new_headless();
+            apply_subagent_runtime_policy(&mut runtime, &cfg, None, None, None, &Default::default());
+            runtime.set_model("openai-codex/gpt-6-astra".into());
+            let parent = crate::Runtime::codex_delegation_plan(runtime.model(), ReasoningLevel::Ultra, CodexRequestRole::Foreground).unwrap();
+            apply_codex_worker_reasoning(&mut runtime, Some(&parent));
+            apply_subagent_thinking(&mut runtime, level).unwrap();
+            assert_eq!(runtime.reasoning_level().as_str(), value);
+            let plan = plan_codex_execution(runtime.model(), runtime.reasoning_level(), runtime.codex_request_role(), None).unwrap();
+            let body = crate::runtime::openai::stream::build_codex_body(
+                "gpt-6-astra", &plan, json!([]), "test".into(), vec![], None, None, "test-cache",
+            );
+            assert_eq!(body["reasoning"]["effort"], value);
+            assert!(!plan.automatic_delegation());
+        }
+    }
+
+    #[test]
+    fn subagent_thinking_schema_and_dispatch_order_all_three_tools() {
+        for tool in [&SubagentTool as &dyn Tool, &SubagentStartTool, &SubagentResumeTool] {
+            assert_eq!(tool.parameters()["properties"]["thinking"]["enum"], json!(["low","medium","high","xhigh","max"]));
+        }
+        for source in [include_str!("oneshot.rs"), include_str!("start.rs"), include_str!("resume.rs")] {
+            let model = source.find("runtime.set_model(").unwrap();
+            let parent = source.find("super::apply_codex_worker_reasoning(").unwrap();
+            let apply = source.find("super::apply_subagent_thinking(").unwrap();
+            let send = source.find("runtime.run_stream").unwrap();
+            assert!(model < parent && parent < apply && apply < send);
+        }
+    }
+
+    #[tokio::test]
+    async fn subagent_thinking_bad_override_refused_before_launch() {
+        for tool in [&SubagentTool as &dyn Tool, &SubagentStartTool] {
+            let error = tool.execute(json!({"task":"test", "system_prompt":"test", "thinking":42}), crate::tools::test_helpers::create_tool_context()).await.unwrap_err();
+            assert!(error.to_string().contains("thinking must be"));
+        }
+    }
+}
+
+#[cfg(test)]
 mod cache_ttl_policy_tests {
     use super::apply_subagent_runtime_policy;
     use crate::core::config::CacheTtl;
@@ -276,7 +539,7 @@ mod cache_ttl_policy_tests {
     async fn subagent_policy_forces_five_minutes_even_when_parent_is_one_hour() {
         // Build a config representing a parent session with 1h cache TTL.
         let parent_config = crate::config::SynapsConfig {
-            cache_ttl: CacheTtl::OneHour,
+            cache_ttl: CacheTtl::OneHour.into(),
             ..Default::default()
         };
 
@@ -293,17 +556,17 @@ mod cache_ttl_policy_tests {
         // Confirm the runtime IS at 1h before we apply the policy.
         assert_eq!(
             runtime.cache_ttl(),
-            CacheTtl::OneHour,
+            CacheTtl::OneHour.into(),
             "pre-condition: runtime must be at OneHour before applying subagent policy"
         );
 
         // Apply the subagent runtime policy — this is what the spawn paths call.
-        apply_subagent_runtime_policy(&mut runtime, &parent_config, None, None, None);
+        apply_subagent_runtime_policy(&mut runtime, &parent_config, None, None, None, &Default::default());
 
         // Post-condition: TTL must be FiveMinutes regardless of parent config.
         assert_eq!(
             runtime.cache_ttl(),
-            CacheTtl::FiveMinutes,
+            CacheTtl::FiveMinutes.into(),
             "subagent spawn must always use 5m TTL, even when parent config is 1h \
              (paying 1h write premium on short-lived one-shots is unrecoverable waste)"
         );
@@ -312,7 +575,7 @@ mod cache_ttl_policy_tests {
     #[tokio::test]
     async fn subagent_policy_forces_five_minutes_even_when_parent_is_hybrid() {
         let parent_config = crate::config::SynapsConfig {
-            cache_ttl: CacheTtl::Hybrid,
+            cache_ttl: CacheTtl::Hybrid.into(),
             ..Default::default()
         };
 
@@ -325,40 +588,69 @@ mod cache_ttl_policy_tests {
 
         assert_eq!(
             runtime.cache_ttl(),
-            CacheTtl::Hybrid,
+            CacheTtl::Hybrid.into(),
             "pre-condition: must be Hybrid"
         );
 
-        apply_subagent_runtime_policy(&mut runtime, &parent_config, None, None, None);
+        apply_subagent_runtime_policy(&mut runtime, &parent_config, None, None, None, &Default::default());
 
         assert_eq!(
             runtime.cache_ttl(),
-            CacheTtl::FiveMinutes,
+            CacheTtl::FiveMinutes.into(),
             "subagent spawn must always use 5m TTL, even when parent config is hybrid"
         );
     }
 
     #[tokio::test]
     async fn subagent_policy_is_idempotent_when_parent_already_five_minutes() {
-        let parent_config = crate::config::SynapsConfig::default(); // FiveMinutes by default
+        let parent_config = crate::config::SynapsConfig {
+            cache_ttl: CacheTtl::FiveMinutes.into(),
+            ..Default::default()
+        };
 
         let mut runtime = crate::Runtime::new()
             .await
             .expect("Runtime::new() must succeed in test environment");
+        runtime.set_cache_ttl(CacheTtl::FiveMinutes);
 
-        // Runtime::new() default is already FiveMinutes, but confirm it.
+        apply_subagent_runtime_policy(&mut runtime, &parent_config, None, None, None, &Default::default());
+
         assert_eq!(
             runtime.cache_ttl(),
-            CacheTtl::FiveMinutes,
-            "pre-condition: Runtime::new() must default to 5m"
+            CacheTtl::FiveMinutes.into(),
+            "subagent spawn must stay 5m when parent is already 5m (idempotent)"
+        );
+    }
+
+    /// `cache_ttl = auto` (the default) resolves to 1h on OAuth credentials.
+    /// Workers keep #110's forced 5m regardless: the policy replaces the
+    /// inherited `auto` with a fixed 5m, so even an OAuth-bound worker sends
+    /// 5m markers.
+    #[tokio::test]
+    async fn subagent_policy_pins_five_minutes_over_the_auto_default_on_oauth() {
+        let parent_config = crate::config::SynapsConfig::default();
+        assert_eq!(parent_config.cache_ttl, crate::config::CacheTtlSetting::Auto);
+
+        let mut runtime = crate::Runtime::new_headless();
+        runtime.set_auth_kind_for_test("oauth").await;
+        assert_eq!(
+            runtime.cache_ttl(),
+            crate::config::CacheTtlSetting::Auto,
+            "pre-condition: Runtime defaults to cache_ttl = auto"
+        );
+        assert_eq!(
+            runtime.resolved_cache_ttl().await,
+            CacheTtl::OneHour,
+            "pre-condition: auto resolves to 1h on OAuth"
         );
 
-        apply_subagent_runtime_policy(&mut runtime, &parent_config, None, None, None);
+        apply_subagent_runtime_policy(&mut runtime, &parent_config, None, None, None, &Default::default());
 
+        assert_eq!(runtime.cache_ttl(), CacheTtl::FiveMinutes.into());
         assert_eq!(
-            runtime.cache_ttl(),
+            runtime.resolved_cache_ttl().await,
             CacheTtl::FiveMinutes,
-            "subagent spawn must stay 5m when parent is already 5m (idempotent)"
+            "an OAuth worker must still send 5m markers (#110)"
         );
     }
 
@@ -369,12 +661,126 @@ mod cache_ttl_policy_tests {
             .await
             .expect("Runtime::new() must succeed in test environment");
 
-        apply_subagent_runtime_policy(&mut runtime, &config, None, None, None);
+        apply_subagent_runtime_policy(&mut runtime, &config, None, None, None, &Default::default());
 
         assert_eq!(
             runtime.codex_request_role(),
             crate::runtime::openai::catalog::CodexRequestRole::Worker
         );
+    }
+
+    /// Workers virtualise big tool results like the foreground, into a dir
+    /// of their own (keyed by the worker's runtime trace session, since a
+    /// worker has no conversation id), under the bound `<base>/spill`.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn subagent_policy_turns_on_tool_output_virtualisation_from_config() {
+        let base = crate::test_env::BaseDirGuard::new();
+        let mut runtime = crate::Runtime::new_headless();
+        assert!(!runtime.tool_spill_policy().is_enabled(), "off until configured");
+        let config = agent_core::config::load_config_from_str("tool_output_spill_bytes = 20000\n");
+        apply_subagent_runtime_policy(&mut runtime, &config, None, None, None, &Default::default());
+        assert_eq!(runtime.tool_spill_policy().threshold_bytes, 20_000);
+        let spill = runtime.tool_spill();
+        let dir = spill.dir().expect("a worker gets its own spill dir");
+        assert_eq!(dir.parent(), Some(base.path().join("spill").as_path()));
+        let key = dir.file_name().unwrap().to_str().unwrap();
+        assert!(key.starts_with("session-"), "keyed by the runtime trace session: {key}");
+        // `0` keeps a worker on the legacy path.
+        let off = agent_core::config::load_config_from_str("tool_output_spill_bytes = 0\n");
+        apply_subagent_runtime_policy(&mut runtime, &off, None, None, None, &Default::default());
+        assert!(!runtime.tool_spill().is_enabled());
+    }
+
+    /// Workers dedupe re-reads like the foreground, from the same key.
+    #[test]
+    fn subagent_policy_takes_read_dedupe_from_config() {
+        let mut runtime = crate::Runtime::new_headless();
+        assert!(!runtime.read_dedupe(), "off until configured");
+        let on = agent_core::config::load_config_from_str("");
+        apply_subagent_runtime_policy(&mut runtime, &on, None, None, None, &Default::default());
+        assert!(runtime.read_dedupe());
+        let off = agent_core::config::load_config_from_str("read_dedupe = off\n");
+        apply_subagent_runtime_policy(&mut runtime, &off, None, None, None, &Default::default());
+        assert!(!runtime.read_dedupe());
+    }
+
+    /// Workers keep their cache warm through long tool rounds, from the
+    /// foreground's key (default on).
+    #[test]
+    fn subagent_policy_takes_tool_keepwarm_from_config() {
+        let mut runtime = crate::Runtime::new_headless();
+        assert!(!runtime.tool_keepwarm(), "off until configured");
+        let on = agent_core::config::load_config_from_str("");
+        apply_subagent_runtime_policy(&mut runtime, &on, None, None, None, &Default::default());
+        assert!(runtime.tool_keepwarm());
+        let off = agent_core::config::load_config_from_str("cache_keepwarm_tools = off\n");
+        apply_subagent_runtime_policy(&mut runtime, &off, None, None, None, &Default::default());
+        assert!(!runtime.tool_keepwarm());
+    }
+
+    /// G3/G4/G5/G6: a worker runs under the configured bash timeouts, tool
+    /// output cap, cache diagnostics and gzip policy, not the `Runtime`
+    /// defaults (30s / 300s / 30000 / off / auto level 1).
+    #[test]
+    fn subagent_policy_takes_tool_limits_diagnostics_and_compression_from_config() {
+        use agent_core::config::RequestCompressionMode;
+        let mut runtime = crate::Runtime::new_headless();
+        let defaults = (
+            runtime.bash_timeout(),
+            runtime.bash_max_timeout(),
+            runtime.max_tool_output(),
+            runtime.cache_diagnostics(),
+            runtime.request_compression_for_test(),
+        );
+        assert_eq!(defaults, (30, 300, 30000, false, (Some(RequestCompressionMode::Auto), 1)));
+        let config = agent_core::config::load_config_from_str(
+            "bash_timeout = 90\nbash_max_timeout = 1200\nmax_tool_output = 120000\n\
+             cache_diagnostics = true\nrequest_compression = off\nrequest_compression_level = 7\n",
+        );
+        apply_subagent_runtime_policy(&mut runtime, &config, None, None, None, &Default::default());
+        assert_eq!(runtime.bash_timeout(), 90);
+        assert_eq!(runtime.bash_max_timeout(), 1200);
+        assert_eq!(runtime.max_tool_output(), 120000);
+        assert!(runtime.cache_diagnostics());
+        assert_eq!(
+            runtime.request_compression_for_test(),
+            (Some(RequestCompressionMode::Off), 7)
+        );
+        // The worker's diagnostics chain is its own, starting empty.
+        let chain = runtime.cache_diagnosis().expect("on");
+        assert_eq!(chain.previous_message_id(), None);
+        // Back to the defaults when the config says so (no stickiness).
+        let plain = agent_core::config::load_config_from_str("");
+        apply_subagent_runtime_policy(&mut runtime, &plain, None, None, None, &Default::default());
+        assert_eq!(
+            (
+                runtime.bash_timeout(),
+                runtime.bash_max_timeout(),
+                runtime.max_tool_output(),
+                runtime.cache_diagnostics(),
+                runtime.request_compression_for_test(),
+            ),
+            defaults
+        );
+    }
+
+    /// `subagent_transform_hooks`: on (the default) keeps the host's
+    /// transform view the spawn path installed; off detaches it, so the
+    /// worker's tool results reach history untransformed.
+    #[test]
+    fn subagent_policy_keeps_or_detaches_the_transform_view() {
+        let host = std::sync::Arc::new(crate::extensions::hooks::HookBus::new());
+        let view = crate::extensions::hooks::HookBus::worker_transforms(&host);
+        let mut runtime = crate::Runtime::new_headless();
+        runtime.set_hook_bus(view.clone());
+        let on = agent_core::config::load_config_from_str("");
+        apply_subagent_runtime_policy(&mut runtime, &on, None, None, None, &Default::default());
+        assert!(std::sync::Arc::ptr_eq(runtime.hook_bus(), &view), "default on: kept");
+        let off = agent_core::config::load_config_from_str("subagent_transform_hooks = off\n");
+        apply_subagent_runtime_policy(&mut runtime, &off, None, None, None, &Default::default());
+        assert!(!runtime.hook_bus().is_worker_view(), "off: detached");
+        assert!(!std::sync::Arc::ptr_eq(runtime.hook_bus(), &host), "never the full host bus");
     }
 
     /// Task A5 memory-context invariant: subagents never inherit a memory
@@ -455,7 +861,7 @@ mod cache_ttl_policy_tests {
 
         // ...and STAYS Off/no-lease after the subagent runtime policy runs.
         let config = crate::config::SynapsConfig::default();
-        apply_subagent_runtime_policy(&mut subagent, &config, None, None, None);
+        apply_subagent_runtime_policy(&mut subagent, &config, None, None, None, &Default::default());
         let after_policy = subagent.memory_context_status();
         assert_eq!(
             after_policy.durable,
@@ -514,6 +920,23 @@ mod preamble_tests {
         );
         assert_eq!(result.matches(FORUM_GUIDANCE).count(), 1);
     }
+
+    /// Worker prompts are the agent's own text: the stock default prompt
+    /// (and its steering) never leaks into them.
+    #[test]
+    fn worker_prompt_never_includes_stock_default() {
+        for forum in [false, true] {
+            let result = compose_system_prompt_with_preamble("You are spike.".into(), None, forum);
+            let expected = if forum {
+                format!("You are spike.\n\n{FORUM_GUIDANCE}")
+            } else {
+                "You are spike.".to_string()
+            };
+            assert_eq!(result, expected);
+            assert!(!result.contains(crate::config::DEFAULT_PROMPT));
+            assert!(!result.contains("targeted edits"));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -536,7 +959,7 @@ mod codex_ultra_worker_tests {
         let parent = parent("openai-codex/gpt-6-astra", ReasoningLevel::Ultra).unwrap();
         assert_eq!(parent.wire_effort, Some(CodexWireEffort::XHigh));
         let mut runtime = crate::Runtime::new_headless();
-        apply_subagent_runtime_policy(&mut runtime, &Default::default(), None, None, None);
+        apply_subagent_runtime_policy(&mut runtime, &Default::default(), None, None, None, &Default::default());
         runtime.set_model(parent.qualified_model.clone());
         assert_eq!(runtime.reasoning_level(), ReasoningLevel::Medium);
         apply_codex_worker_reasoning(&mut runtime, Some(&parent));
@@ -567,7 +990,7 @@ mod codex_ultra_worker_tests {
             "openrouter/openai/gpt-6-astra",
         ] {
             let mut runtime = crate::Runtime::new_headless();
-            apply_subagent_runtime_policy(&mut runtime, &Default::default(), None, None, None);
+            apply_subagent_runtime_policy(&mut runtime, &Default::default(), None, None, None, &Default::default());
             runtime.set_model(model.into());
             let default = runtime.reasoning_level();
             apply_codex_worker_reasoning(&mut runtime, Some(&parent));
@@ -608,7 +1031,7 @@ mod codex_ultra_worker_tests {
             .is_none());
         }
         let mut runtime = crate::Runtime::new_headless();
-        apply_subagent_runtime_policy(&mut runtime, &Default::default(), None, None, None);
+        apply_subagent_runtime_policy(&mut runtime, &Default::default(), None, None, None, &Default::default());
         runtime.set_model("openai-codex/gpt-6-astra".into());
         apply_codex_worker_reasoning(&mut runtime, None);
         assert_eq!(runtime.reasoning_level(), ReasoningLevel::Medium);
@@ -630,7 +1053,7 @@ mod codex_ultra_worker_tests {
         };
         let parent = crate::Runtime::new_headless();
         let mut independent = crate::Runtime::new_headless();
-        apply_subagent_runtime_policy(&mut independent, &Default::default(), None, None, None);
+        apply_subagent_runtime_policy(&mut independent, &Default::default(), None, None, None, &Default::default());
         let mut worker = crate::Runtime::new_headless();
         apply_subagent_runtime_policy(
             &mut worker,
@@ -638,6 +1061,7 @@ mod codex_ultra_worker_tests {
             None,
             Some(parent.session_allow_all()),
             None,
+            &Default::default(),
         );
         assert!(Arc::ptr_eq(
             parent.session_allow_all(),
@@ -695,6 +1119,7 @@ mod codex_ultra_worker_tests {
             None,
             Some(parent.session_allow_all()),
             None,
+            &Default::default(),
         );
         assert!(later.session_allow_all().allows_all(&jev));
         worker.session_allow_all().clear();
@@ -750,6 +1175,7 @@ mod codex_ultra_worker_tests {
         let mut parent = crate::Runtime::new_headless();
         parent.install_observability_for_tests(writer);
         parent.set_telemetry_level(TelemetryLevel::Full);
+        parent.set_session_id(Some("20261028-045932-eb8e".into()));
 
         let mut worker = crate::Runtime::new_headless();
         assert_eq!(
@@ -762,7 +1188,8 @@ mod codex_ultra_worker_tests {
             &Default::default(),
             None,
             None,
-            Some(&parent.worker_telemetry()),
+            Some(&parent.worker_telemetry().for_worker("spike", "sa_7")),
+            &Default::default(),
         );
         assert_eq!(worker.telemetry_level(), TelemetryLevel::Full);
         assert!(worker.trace_context().enabled());
@@ -775,11 +1202,19 @@ mod codex_ultra_worker_tests {
         // One writer, not two: what the worker enqueues, the parent's handle
         // flushes.
         worker
-            .telemetry_writer()
+            .request_telemetry()
             .expect("worker records")
             .enqueue_telemetry(TelemetryRecord {
                 ts: 1,
                 worker: true,
+                ..Default::default()
+            });
+        // The parent's own requests carry its persisted conversation id.
+        parent
+            .request_telemetry()
+            .unwrap()
+            .enqueue_telemetry(TelemetryRecord {
+                ts: 2,
                 ..Default::default()
             });
         let out = parent
@@ -787,10 +1222,27 @@ mod codex_ultra_worker_tests {
             .unwrap()
             .shutdown(std::time::Duration::from_secs(10));
         assert!(out.is_flushed());
-        assert_eq!(out.stats().written, 1);
-        let line = std::fs::read_to_string(&log).unwrap();
-        assert_eq!(line.lines().count(), 1);
+        assert_eq!(out.stats().written, 2);
+        let text = std::fs::read_to_string(&log).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2);
+        let line = lines[0];
         assert!(line.contains("\"worker\":true"), "{line}");
+        // The worker-tagged handle stamps who made the request and the
+        // parent's ids; the parent's own `session_id` is NOT the worker's.
+        let record: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert_eq!(record["worker_agent"], "spike", "{line}");
+        assert_eq!(record["worker_handle"], "sa_7", "{line}");
+        assert_eq!(record["parent_session_id"], "20261028-045932-eb8e", "{line}");
+        assert_eq!(
+            record["parent_runtime_session_id"],
+            parent.trace_context().session_id().as_str(),
+            "{line}"
+        );
+        assert!(record.get("session_id").is_none(), "{line}");
+        let parent_record: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(parent_record["session_id"], "20261028-045932-eb8e");
+        assert!(parent_record.get("worker_agent").is_none());
     }
 
     #[test]
@@ -804,6 +1256,7 @@ mod codex_ultra_worker_tests {
             None,
             None,
             Some(&parent.worker_telemetry()),
+            &Default::default(),
         );
         assert_eq!(worker.telemetry_level(), TelemetryLevel::Off);
         assert!(worker.telemetry_writer().is_none());
@@ -811,9 +1264,93 @@ mod codex_ultra_worker_tests {
 
         // Manual contexts pass no telemetry: still Off.
         let mut manual = crate::Runtime::new_headless();
-        apply_subagent_runtime_policy(&mut manual, &Default::default(), None, None, None);
+        apply_subagent_runtime_policy(&mut manual, &Default::default(), None, None, None, &Default::default());
         assert_eq!(manual.telemetry_level(), TelemetryLevel::Off);
         assert!(manual.telemetry_writer().is_none());
+    }
+
+    /// Output transforms reach every worker: oneshot, start and resume
+    /// each build their runtime ONLY through `spawn_runtime` (whose host
+    /// and legacy fresh-runtime branches both install the host's transform
+    /// view) and apply the policy (the opt-out) before streaming. Nothing
+    /// else in a spawn path constructs a runtime or swaps its hook bus.
+    #[test]
+    fn every_spawn_path_streams_with_the_hosts_transform_view() {
+        let spawn = include_str!("mod.rs");
+        let spawn = &spawn[spawn.find("pub async fn spawn_runtime()").unwrap()..];
+        let spawn = &spawn[..spawn.find("\n}\n").unwrap()];
+        let host_branch = spawn.find("return host.worker_runtime().await;").unwrap();
+        let legacy = spawn.find("crate::Runtime::new().await?").unwrap();
+        let legacy_view = spawn.find("rt.set_hook_bus(host.worker_hook_bus());").unwrap();
+        let legacy_ok = spawn.find("Ok(rt)").unwrap();
+        assert!(host_branch < legacy && legacy < legacy_view && legacy_view < legacy_ok);
+        let host = include_str!("../../host.rs");
+        let worker_runtime = &host[host.find("pub async fn worker_runtime(").unwrap()..];
+        let worker_runtime = &worker_runtime[..worker_runtime.find("\n    }\n").unwrap()];
+        assert!(worker_runtime.contains("host.hook_bus = self.worker_hook_bus();"));
+        assert!(host.contains("HookBus::worker_transforms(&self.parts.hook_bus)"));
+
+        for (name, source) in [
+            ("oneshot", include_str!("oneshot.rs")),
+            ("start", include_str!("start.rs")),
+            ("resume", include_str!("resume.rs")),
+        ] {
+            let production = source.split("#[cfg(test)]\nmod tests").next().unwrap();
+            assert_eq!(production.matches("super::spawn_runtime().await").count(), 1, "{name}");
+            for forbidden in ["Runtime::new(", "worker_runtime(", "set_hook_bus(", "HookBus::new("] {
+                assert!(!production.contains(forbidden), "{name}: {forbidden}");
+            }
+            let spawned = production.find("super::spawn_runtime().await").unwrap();
+            let policy = production.find("super::apply_subagent_runtime_policy(").unwrap();
+            let stream = production.find("runtime.run_stream").unwrap();
+            assert!(spawned < policy && policy < stream, "{name}");
+        }
+    }
+
+    /// G2-lite + G1, by source: every spawn path reads its config ONCE,
+    /// through `spawn_config()`, and hands that one snapshot to both the
+    /// effort resolution and the runtime policy. Both `spawn_runtime`
+    /// branches build the worker registry minus the whole `disabled_tools`
+    /// list of the host's config (the disk only with no host).
+    #[test]
+    fn every_spawn_path_reads_one_config_and_drops_disabled_tools() {
+        for (name, source) in [
+            ("oneshot", include_str!("oneshot.rs")),
+            ("start", include_str!("start.rs")),
+            ("resume", include_str!("resume.rs")),
+        ] {
+            let production = source.split("#[cfg(test)]\nmod tests").next().unwrap();
+            assert!(!production.contains("load_config("), "{name}: a disk read");
+            assert_eq!(production.matches("super::spawn_config()").count(), 1, "{name}");
+            let read = production.find("let config = super::spawn_config();").unwrap();
+            let thinking = production.find("resolve_subagent_thinking(").unwrap();
+            let policy = production.find("super::apply_subagent_runtime_policy(").unwrap();
+            assert!(read < thinking && thinking < policy, "{name}");
+            let passed = &production[policy..policy + 200];
+            assert!(passed.contains("&config,"), "{name}: the policy gets the spawn's config");
+        }
+
+        let module = include_str!("mod.rs");
+        let read = &module[module.find("pub(crate) fn spawn_config()").unwrap()..];
+        let read = &read[..read.find("\n}\n").unwrap()];
+        assert_eq!(read.matches("load_config()").count(), 1, "one read");
+
+        let spawn = &module[module.find("pub async fn spawn_runtime()").unwrap()..];
+        let spawn = &spawn[..spawn.find("\n}\n").unwrap()];
+        let host_branch = spawn.find("return host.worker_runtime().await;").unwrap();
+        let legacy_config = spawn.find("Some(host) => std::sync::Arc::clone(&*host.config()),").unwrap();
+        assert!(host_branch < legacy_config);
+        assert!(spawn.contains("None => std::sync::Arc::new(crate::config::load_config()),"));
+        let legacy_tools = spawn
+            .find("rt.set_tools(subagent_tools(&config.disabled_tools).await);")
+            .unwrap();
+        let legacy_auth = spawn.find("rt.apply_auth_config(&config);").unwrap();
+        assert!(legacy_config < legacy_tools && legacy_config < legacy_auth);
+        let host_rs = include_str!("../../host.rs");
+        let registry = &host_rs[host_rs.find("pub async fn worker_registry(").unwrap()..];
+        let registry = &registry[..registry.find("\n    }\n").unwrap()];
+        assert!(registry.contains("disabled_tools: self.config().disabled_tools.clone(),"));
+        assert!(registry.contains("ToolRegistry::worker_set(&shared, &key.disabled_tools)"));
     }
 
     #[test]
@@ -831,13 +1368,20 @@ mod codex_ultra_worker_tests {
             let capture = source
                 .find("let telemetry = ctx.capabilities.telemetry.clone();")
                 .unwrap();
+            // Labelled with the worker's agent + handle before the spawn.
+            let label = source
+                .find("let telemetry = telemetry.map(|t| t.for_worker(")
+                .unwrap();
             let spawn = source.find("super::spawn_runtime().await").unwrap();
             let policy = source
                 .find("super::apply_subagent_runtime_policy(")
                 .unwrap();
             let pass = policy + source[policy..].find("telemetry.as_ref()").unwrap();
             let stream = source.find("runtime.run_stream").unwrap();
-            assert!(capture < spawn && spawn < pass && pass < stream, "{name}");
+            assert!(
+                capture < label && label < spawn && spawn < pass && pass < stream,
+                "{name}"
+            );
         }
     }
 
@@ -886,6 +1430,7 @@ mod forum_worker_tests {
                 Some(&binding),
                 None,
                 None,
+                &Default::default(),
             );
             let inherited = worker.memory_backend_for_test();
             assert_eq!(inherited.forum_author().group, author.group);
@@ -910,7 +1455,7 @@ mod forum_worker_tests {
 
     #[tokio::test]
     async fn subagent_registry_excludes_delegation_and_search_tools() {
-        let registry = subagent_tools().await;
+        let registry = subagent_tools(&[]).await;
         for name in [
             "subagent",
             "subagent_start",
@@ -927,30 +1472,26 @@ mod forum_worker_tests {
         assert!(registry.get("edit").is_some());
     }
 
-    #[test]
-    fn fable_5_1_worker_uses_xhigh_exactly() {
-        use super::apply_anthropic_worker_reasoning;
-        use agent_core::reasoning::ReasoningLevel;
-
-        for model in [
-            "anthropic/claude-fable-5-1",
-            "anthropic/claude-fable-5",
-            "openai-codex/gpt-6-astra",
-        ] {
-            let mut runtime = crate::Runtime::new_headless();
-            apply_subagent_runtime_policy(&mut runtime, &Default::default(), None, None, None);
-            runtime.set_model(model.into());
-            let before = runtime.reasoning_level();
-            apply_anthropic_worker_reasoning(&mut runtime);
-            assert_eq!(
-                runtime.reasoning_level(),
-                if model == "anthropic/claude-fable-5-1" {
-                    ReasoningLevel::XHigh
-                } else {
-                    before
-                }
-            );
+    /// G1, legacy path: the whole `disabled_tools` list, not only the forum
+    /// names, never reaches a worker's registry or schema.
+    #[tokio::test]
+    async fn legacy_subagent_tools_drop_every_disabled_tool() {
+        let disabled: Vec<String> = ["bash", "shell_start", "ls", "forum_post", "no_such_tool"]
+            .map(String::from)
+            .to_vec();
+        // Not vacuous: without the list a worker has them.
+        let all = subagent_tools(&[]).await;
+        assert!(all.get("ls").is_some() && all.get("forum_post").is_some());
+        assert_eq!(all.get("bash").is_some(), cfg!(feature = "command-exec"));
+        let registry = subagent_tools(&disabled).await;
+        let schema = registry.tools_schema();
+        let names: Vec<&str> = schema.iter().filter_map(|t| t["name"].as_str()).collect();
+        for name in &disabled {
+            assert!(registry.get(name).is_none(), "{name} must not be granted");
+            assert!(!names.contains(&name.as_str()), "{name} must not be advertised: {names:?}");
         }
+        assert!(registry.get("read").is_some(), "the rest stays");
+        assert!(names.contains(&"read"));
     }
 
     #[tokio::test]
@@ -964,10 +1505,11 @@ mod forum_worker_tests {
             Some(&parent_binding),
             None,
             None,
+            &Default::default(),
         );
         assert!(!worker.memory_backend_for_test().exclusive());
         let mut worker_none = crate::Runtime::new_headless();
-        apply_subagent_runtime_policy(&mut worker_none, &Default::default(), None, None, None);
+        apply_subagent_runtime_policy(&mut worker_none, &Default::default(), None, None, None, &Default::default());
         assert!(!worker_none.memory_backend_for_test().exclusive());
     }
 }
@@ -1062,17 +1604,798 @@ mod retry_inheritance_tests {
             let config = crate::SynapsConfig {
                 api_retries: api,
                 refusal_retries: refusal,
-                cache_ttl: crate::config::CacheTtl::OneHour,
+                cache_ttl: crate::config::CacheTtl::OneHour.into(),
                 ..Default::default()
             };
-            super::apply_subagent_runtime_policy(&mut worker, &config, None, None, None);
+            super::apply_subagent_runtime_policy(&mut worker, &config, None, None, None, &Default::default());
             assert_eq!(worker.api_retries(), api);
             assert_eq!(worker.refusal_retries(), refusal);
-            assert_eq!(worker.cache_ttl(), crate::config::CacheTtl::FiveMinutes);
+            assert_eq!(worker.cache_ttl(), crate::config::CacheTtl::FiveMinutes.into());
             assert_eq!(
                 worker.codex_request_role(),
                 crate::runtime::openai::catalog::CodexRequestRole::Worker
             );
+        }
+    }
+}
+
+/// Workers run in the PARENT SESSION's directory and environment, not the
+/// process's. Under the daemon the process cwd/env are the daemon's; these
+/// tests make the session cwd a temp dir distinct from the test process cwd
+/// and check what a worker's `bash` actually sees, through a loopback
+/// provider that asks each worker to run one command.
+#[cfg(all(test, feature = "command-exec"))]
+mod worker_workspace_tests {
+    use crate::runtime::subagent::{SubagentRegistry, SubagentStatus};
+    use crate::tools::test_helpers::create_tool_context;
+    use crate::tools::Tool;
+    use axum::response::IntoResponse;
+    use serde_json::{json, Value};
+    use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    const PROBE: &str = "SYNAPS_WORKER_WS_PROBE";
+    const DAEMON_ONLY: &str = "SYNAPS_WORKER_WS_DAEMON_ONLY";
+    #[cfg(not(windows))]
+    const COMMAND: &str = "printf 'PWD=%s\\nPROBE=%s\\nDAEMON=%s\\n' \"$(pwd -P)\" \"${SYNAPS_WORKER_WS_PROBE:-unset}\" \"${SYNAPS_WORKER_WS_DAEMON_ONLY:-unset}\"";
+    /// Git Bash (MSYS) `pwd -P` prints an MSYS path (`/c/Users/x`, or
+    /// `/tmp/x` under its temp mount); `pwd -W` prints the native one.
+    #[cfg(windows)]
+    const COMMAND: &str = "printf 'PWD=%s\\nPROBE=%s\\nDAEMON=%s\\n' \"$(pwd -W)\" \"${SYNAPS_WORKER_WS_PROBE:-unset}\" \"${SYNAPS_WORKER_WS_DAEMON_ONLY:-unset}\"";
+
+    fn sse(blocks: &str, stop: &str) -> String {
+        let start = json!({"type":"message_start","message":{"id":"msg_ws","type":"message","role":"assistant","content":[],"model":"claude-sonnet-4-6","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}});
+        let delta = json!({"type":"message_delta","delta":{"stop_reason":stop,"stop_sequence":null},"usage":{"input_tokens":10,"output_tokens":5,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}});
+        format!("data: {start}\n\n{blocks}data: {delta}\n\ndata: {{\"type\":\"message_stop\"}}\n\n")
+    }
+
+    fn block(start: Value, delta: Value) -> String {
+        let stop = json!({"type":"content_block_stop","index":0});
+        format!("data: {start}\n\ndata: {delta}\n\ndata: {stop}\n\n")
+    }
+
+    /// Every worker turn that does not end in a tool result gets one `bash`
+    /// call; a tool result gets "done". Returns the base URL and every bash
+    /// result the workers sent back, in order.
+    async fn spawn_provider() -> (String, Arc<Mutex<Vec<String>>>) {
+        let results: Arc<Mutex<Vec<String>>> = Arc::default();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = results.clone();
+        let app = axum::Router::new().route(
+            "/v1/messages",
+            axum::routing::post(move |body: String| {
+                let seen = seen.clone();
+                let calls = calls.clone();
+                async move {
+                    let body: Value = serde_json::from_str(&body).unwrap_or_default();
+                    let result = body["messages"]
+                        .as_array()
+                        .and_then(|m| m.last())
+                        .and_then(|m| m["content"].as_array())
+                        .and_then(|c| c.iter().find(|b| b["type"] == "tool_result"))
+                        .map(|b| b["content"].to_string());
+                    let frames = match result {
+                        Some(result) => {
+                            seen.lock().unwrap().push(result);
+                            block(
+                                json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+                                json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"done"}}),
+                            ) + ""
+                        }
+                        None => {
+                            let id = format!("toolu_ws{}", calls.fetch_add(1, Ordering::SeqCst));
+                            let input = json!({"command": COMMAND}).to_string();
+                            return (
+                                [("content-type", "text/event-stream")],
+                                sse(
+                                    &block(
+                                        json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":id,"name":"bash","input":{}}}),
+                                        json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":input}}),
+                                    ),
+                                    "tool_use",
+                                ),
+                            )
+                                .into_response();
+                        }
+                    };
+                    ([("content-type", "text/event-stream")], sse(&frames, "end_turn")).into_response()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), results)
+    }
+
+    struct Env {
+        _base: crate::test_env::BaseDirGuard,
+        _guards: Vec<crate::test_env::EnvVarGuard>,
+        results: Arc<Mutex<Vec<String>>>,
+    }
+
+    async fn env() -> Env {
+        let base = crate::test_env::BaseDirGuard::new();
+        std::fs::write(
+            base.path().join("auth.json"),
+            r#"{"anthropic": {"type": "oauth", "refresh": "synthetic", "access": "synthetic-access", "expires": 9999999999999}}"#,
+        )
+        .unwrap();
+        let (url, results) = spawn_provider().await;
+        let guards = vec![
+            crate::test_env::EnvVarGuard::remove("SYNAPS_AUTH_ENDPOINT"),
+            crate::test_env::EnvVarGuard::remove("SYNAPS_MACHINE_TOKEN"),
+            crate::test_env::EnvVarGuard::remove("SYNAPS_SUBAGENT_FRESH_RUNTIME"),
+            crate::test_env::EnvVarGuard::remove("ANTHROPIC_API_KEY"),
+            crate::test_env::EnvVarGuard::set("SYNAPS_ANTHROPIC_BASE_URL", &url),
+            crate::test_env::EnvVarGuard::set(DAEMON_ONLY, "leaked"),
+        ];
+        Env { _base: base, _guards: guards, results }
+    }
+
+    /// A parent context whose session runs in `dir`, with a session env
+    /// snapshot that carries `PROBE` and not the process-only var.
+    fn parent_ctx(dir: &Path, registry: &Arc<Mutex<SubagentRegistry>>) -> crate::tools::ToolContext {
+        let mut ctx = create_tool_context();
+        ctx.capabilities.subagent_registry = Some(registry.clone());
+        ctx.capabilities.cwd = Some(dir.to_path_buf());
+        ctx.capabilities.env = Some(vec![
+            ("PATH".into(), std::env::var("PATH").unwrap_or_default()),
+            ("HOME".into(), std::env::var("HOME").unwrap_or_default()),
+            (PROBE.into(), "from-session".into()),
+        ]);
+        ctx
+    }
+
+    fn assert_ran_in(result: &str, dir: &Path) {
+        let want = dir.canonicalize().unwrap();
+        // The recorded tool_result content is JSON: a quoted, escaped string.
+        let text = serde_json::from_str::<String>(result).unwrap_or_else(|_| result.to_string());
+        let pwd = text
+            .lines()
+            .find_map(|line| line.strip_prefix("PWD="))
+            .unwrap_or_else(|| panic!("no PWD line in the worker output: {result}"));
+        let got = Path::new(pwd)
+            .canonicalize()
+            .unwrap_or_else(|e| panic!("worker PWD {pwd:?} does not resolve ({e}): {result}"));
+        assert_eq!(got, want, "worker must run in the session cwd, got: {result}");
+        assert!(result.contains("PROBE=from-session"), "session env: {result}");
+        assert!(result.contains("DAEMON=unset"), "process env must not leak: {result}");
+    }
+
+    async fn finish(registry: &Arc<Mutex<SubagentRegistry>>, handle_id: &str) {
+        for _ in 0..600 {
+            let done = registry
+                .lock()
+                .unwrap()
+                .get(handle_id)
+                .is_none_or(|h| h.status() != SubagentStatus::Running);
+            if done {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let thread = registry
+            .lock()
+            .unwrap()
+            .get_mut(handle_id)
+            .and_then(|h| h.thread_handle.take());
+        if let Some(thread) = thread {
+            tokio::task::spawn_blocking(move || thread.join()).await.unwrap().unwrap();
+        }
+        let status = registry.lock().unwrap().get(handle_id).map(|h| h.status());
+        assert_eq!(status, Some(SubagentStatus::Completed), "{handle_id}");
+    }
+
+    async fn start(ctx: crate::tools::ToolContext) -> String {
+        let out = super::SubagentStartTool
+            .execute(
+                json!({"system_prompt": "test worker", "task": "run it", "model": "anthropic/claude-sonnet-4-6", "timeout": 60}),
+                ctx,
+            )
+            .await
+            .expect("subagent_start");
+        let body: Value = serde_json::from_str(&out).unwrap();
+        body["handle_id"].as_str().unwrap().to_string()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial(synaps_base_dir)]
+    async fn started_worker_runs_in_the_parent_session_cwd_and_env() {
+        let env = env().await;
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Arc::new(Mutex::new(SubagentRegistry::new()));
+        let handle = start(parent_ctx(dir.path(), &registry)).await;
+        finish(&registry, &handle).await;
+        let results = env.results.lock().unwrap().clone();
+        assert_eq!(results.len(), 1, "{results:?}");
+        assert_ran_in(&results[0], dir.path());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial(synaps_base_dir)]
+    async fn oneshot_worker_runs_in_the_parent_session_cwd_and_env() {
+        let env = env().await;
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Arc::new(Mutex::new(SubagentRegistry::new()));
+        super::SubagentTool
+            .execute(
+                json!({"system_prompt": "test worker", "task": "run it", "model": "anthropic/claude-sonnet-4-6", "timeout": 60}),
+                parent_ctx(dir.path(), &registry),
+            )
+            .await
+            .expect("subagent");
+        let results = env.results.lock().unwrap().clone();
+        assert_eq!(results.len(), 1, "{results:?}");
+        assert_ran_in(&results[0], dir.path());
+    }
+
+    /// A resumed worker continues in the directory it was started in (its
+    /// history refers to paths there), even when resumed from elsewhere.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial(synaps_base_dir)]
+    async fn resumed_worker_keeps_the_directory_it_started_in() {
+        let env = env().await;
+        let first = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let registry = Arc::new(Mutex::new(SubagentRegistry::new()));
+        let handle = start(parent_ctx(first.path(), &registry)).await;
+        finish(&registry, &handle).await;
+
+        let out = super::SubagentResumeTool
+            .execute(
+                json!({"handle_id": handle, "instructions": "run it again", "timeout": 60}),
+                parent_ctx(elsewhere.path(), &registry),
+            )
+            .await
+            .expect("subagent_resume");
+        let body: Value = serde_json::from_str(&out).unwrap();
+        finish(&registry, body["handle_id"].as_str().unwrap()).await;
+
+        let results = env.results.lock().unwrap().clone();
+        assert_eq!(results.len(), 2, "{results:?}");
+        assert_ran_in(&results[0], first.path());
+        assert_ran_in(&results[1], first.path());
+    }
+}
+
+#[cfg(test)]
+mod worker_rollover_tests {
+    use super::{apply_subagent_runtime_policy, attach_worker_transcripts};
+    use crate::core::config::{CacheTtl, ContextManagementMode};
+    use crate::runtime::subagent::SubagentState;
+    use crate::runtime::worker_context::{WorkerContextSettings, WorkerRolloverReport};
+    use serde_json::json;
+    use std::sync::{Arc, RwLock};
+
+    /// The single policy point turns worker rollover on from config (default
+    /// auto, 200k) without disturbing the forced 5m TTL (#110); off stays off.
+    #[test]
+    fn spawn_policy_applies_the_rollover_settings_and_keeps_the_5m_ttl() {
+        let mut runtime = crate::Runtime::new_headless();
+        apply_subagent_runtime_policy(&mut runtime, &Default::default(), None, None, None, &Default::default());
+        assert_eq!(
+            runtime.worker_context().settings,
+            Some(WorkerContextSettings { enabled: true, rollover_tokens: 200_000 })
+        );
+        assert!(runtime.worker_context().sink.is_none(), "inert until a spawn attaches a sink");
+        assert_eq!(runtime.cache_ttl(), CacheTtl::FiveMinutes.into());
+        assert!(!runtime.context_management_enabled(), "never the foreground's rollover");
+
+        let off = crate::config::SynapsConfig {
+            subagent_context_management: ContextManagementMode::Off,
+            subagent_rollover_tokens: 150_000,
+            cache_ttl: CacheTtl::OneHour.into(),
+            ..Default::default()
+        };
+        let mut runtime = crate::Runtime::new_headless();
+        apply_subagent_runtime_policy(&mut runtime, &off, None, None, None, &Default::default());
+        let settings = runtime.worker_context().settings.unwrap();
+        assert!(!settings.enabled);
+        assert!(settings.policy(1_000_000).is_none());
+        assert_eq!(runtime.cache_ttl(), CacheTtl::FiveMinutes.into());
+    }
+
+    /// Workers get the configured `context_window` (the foreground gets it
+    /// from `apply_config`); without it they all budgeted against the 200k
+    /// default, where an Opus worker's reserves leave ~32k. A model
+    /// that cannot open the window (no 1M support: the request builder never
+    /// sends it the opt-in) keeps its default instead.
+    #[test]
+    fn workers_inherit_the_configured_window_fitted_to_their_model() {
+        use super::{fit_subagent_context_window, subagent_context_window};
+        let one_m = crate::config::load_config_from_str("context_window = 1m\n");
+        assert_eq!(one_m.context_window, Some(1_000_000));
+        let worker = |config: &crate::config::SynapsConfig, model: &str| {
+            let mut runtime = crate::Runtime::new_headless();
+            apply_subagent_runtime_policy(&mut runtime, config, None, None, None, &Default::default());
+            runtime.set_model(model.into());
+            fit_subagent_context_window(&mut runtime);
+            runtime
+        };
+        for model in ["anthropic/claude-opus-5-5", "claude-sonnet-4-6", "claude-opus-4-6"] {
+            let w = worker(&one_m, model);
+            assert_eq!((w.context_window_override(), w.context_window()), (Some(1_000_000), 1_000_000), "{model}");
+        }
+        // An agent file can pin a model the parent's window does not fit.
+        for model in ["claude-haiku-4-5-20251001", "claude-opus-4-5", "openai/gpt-5.5"] {
+            let w = worker(&one_m, model);
+            assert_eq!((w.context_window_override(), w.context_window()), (None, 200_000), "{model}");
+        }
+        // `auto` (unset) stays the model default; a smaller window always fits.
+        assert_eq!(worker(&Default::default(), "anthropic/claude-opus-5-5").context_window_override(), None);
+        let small = crate::config::load_config_from_str("context_window = 150000\n");
+        assert_eq!(worker(&small, "claude-haiku-4-5-20251001").context_window(), 150_000);
+        assert_eq!(subagent_context_window(Some(200_000), "claude-haiku-4-5"), Some(200_000));
+        assert_eq!(subagent_context_window(Some(200_001), "claude-haiku-4-5"), None);
+    }
+
+    /// Every spawn path fits the inherited window after choosing the model
+    /// and before the run, exactly once (the policy runs before the model is
+    /// known).
+    #[test]
+    fn every_spawn_path_fits_the_context_window_after_model_selection() {
+        for (name, source) in [
+            ("oneshot", include_str!("oneshot.rs")),
+            ("start", include_str!("start.rs")),
+            ("resume", include_str!("resume.rs")),
+        ] {
+            let policy = source.find("super::apply_subagent_runtime_policy(").unwrap();
+            let model = source.find("runtime.set_model(").unwrap();
+            let fit = source.find("super::fit_subagent_context_window(&mut runtime)").unwrap();
+            let stream = source.find("runtime.run_stream").unwrap();
+            assert!(policy < model && model < fit && fit < stream, "{name}");
+            assert_eq!(source.matches("super::fit_subagent_context_window(").count(), 1, "{name}");
+        }
+    }
+
+    /// Every spawn path gives its worker a transcript sink, after the policy
+    /// and before the run, exactly once.
+    #[test]
+    fn every_spawn_path_attaches_worker_transcripts_before_streaming() {
+        for (name, source) in [
+            ("oneshot", include_str!("oneshot.rs")),
+            ("start", include_str!("start.rs")),
+            ("resume", include_str!("resume.rs")),
+        ] {
+            let policy = source.find("super::apply_subagent_runtime_policy(").unwrap();
+            let attach = source.find("super::attach_worker_transcripts(").unwrap();
+            let stream = source.find("runtime.run_stream").unwrap();
+            assert!(policy < attach && attach < stream, "{name}");
+            assert_eq!(source.matches("super::attach_worker_transcripts(").count(), 1, "{name}");
+        }
+    }
+
+    fn rolled_history() -> Vec<crate::SharedMessage> {
+        vec![
+            Arc::new(json!({"role":"user","content":"brief"})),
+            Arc::new(json!({"role":"user","content":[{"type":"text","text":"note"}],
+                "_synaps_worker_context": {"schema":"synaps-worker-context/1","window":3,
+                "transcripts":[{"window":1,"path":"/a/sa_1.window-1.md","messages":4},
+                               {"window":2,"path":"/a/sa_1.window-2.md","messages":6}]}})),
+        ]
+    }
+
+    /// A resumed rolled worker reports its archived window from the start;
+    /// each rollover updates its state, panel line and status summary.
+    #[test]
+    fn rollovers_reach_the_worker_state_and_its_panel_line() {
+        let state = Arc::new(RwLock::new(SubagentState::new()));
+        assert!(state.read().unwrap().context_summary().is_none(), "absent before any rollover");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut runtime = crate::Runtime::new_headless();
+        attach_worker_transcripts(
+            &mut runtime,
+            "/a".into(),
+            "sa_9",
+            Some(Arc::clone(&state)),
+            &rolled_history(),
+            Some(tx),
+            9,
+            "spike",
+        );
+        {
+            let s = state.read().unwrap();
+            assert_eq!(s.context_window, 3);
+            assert_eq!(s.context_transcripts.len(), 2);
+            let summary = s.context_summary().unwrap();
+            assert_eq!(summary["window"], 3);
+            assert_eq!(summary["rollovers"], 0);
+        }
+        let sink = runtime.worker_context().sink.clone().unwrap();
+        assert_eq!(sink.stem, "sa_9");
+        assert_eq!(sink.dir, std::path::PathBuf::from("/a"));
+        let report = WorkerRolloverReport {
+            window: 4,
+            before_tokens: 201_000,
+            after_tokens: 99_000,
+            evicted_messages: 40,
+            transcript: "/a/sa_9.window-3.md".into(),
+            transcripts: vec![
+                "/a/sa_1.window-1.md".into(),
+                "/a/sa_1.window-2.md".into(),
+                "/a/sa_9.window-3.md".into(),
+            ],
+        };
+        (sink.observer.unwrap())(&report);
+        let s = state.read().unwrap();
+        assert_eq!((s.context_window, s.context_rollovers), (4, 1));
+        assert_eq!(s.step, "↻ context window 4: ~201k → ~99k tokens");
+        let summary = s.context_summary().unwrap();
+        assert_eq!(summary["transcripts"].as_array().unwrap().len(), 3);
+        assert_eq!(summary["rollovers"], 1);
+        match rx.try_recv().unwrap() {
+            crate::StreamEvent::Agent(crate::AgentEvent::SubagentUpdate { subagent_id, agent_name, status }) => {
+                assert_eq!((subagent_id, agent_name.as_str()), (9, "spike"));
+                assert!(status.starts_with("↻ context window 4"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(report.notice().contains("/a/sa_9.window-3.md"));
+    }
+
+    /// Status and collect of a reaped rolled worker read the summary from its
+    /// archive; a never-rolled archive has none (outputs unchanged).
+    #[test]
+    fn archived_summary_comes_from_the_history_metadata() {
+        let history: Vec<serde_json::Value> = rolled_history().iter().map(|m| (**m).clone()).collect();
+        let summary = crate::runtime::subagent::archived_context_summary(&history).unwrap();
+        assert_eq!(summary["window"], 3);
+        assert_eq!(summary["transcripts"][1], "/a/sa_1.window-2.md");
+        assert!(summary.get("rollovers").is_none(), "unknown for an archived run");
+        assert!(crate::runtime::subagent::archived_context_summary(&history[..1]).is_none());
+    }
+}
+
+/// The live bug end to end: with `context_window = 1m` configured, a worker
+/// from every spawn path (oneshot, start, resume) sends the 1M opt-in, as the
+/// foreground does. Before the fix none did, through a loopback provider that
+/// records each request's `anthropic-beta` header.
+#[cfg(test)]
+mod worker_context_window_wire_tests {
+    use crate::runtime::subagent::{SubagentRegistry, SubagentStatus};
+    use crate::tools::test_helpers::create_tool_context;
+    use crate::tools::Tool;
+    use axum::response::IntoResponse;
+    use serde_json::{json, Value};
+    use std::sync::{Arc, Mutex};
+
+    /// The harness's foreground model (its catalog admits no other); 1M-capable.
+    const MODEL: &str = "anthropic/claude-sonnet-4-6";
+    const DONE: &str = concat!(
+        r#"data: {"type":"message_start","message":{"id":"msg_cw","type":"message","role":"assistant","content":[],"model":"claude-opus-5-5","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}"#, "\n\n",
+        r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#, "\n\n",
+        r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"done"}}"#, "\n\n",
+        r#"data: {"type":"content_block_stop","index":0}"#, "\n\n",
+        r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"input_tokens":10,"output_tokens":5,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}"#, "\n\n",
+        r#"data: {"type":"message_stop"}"#, "\n\n",
+    );
+
+    async fn spawn_provider() -> (String, Arc<Mutex<Vec<String>>>) {
+        let betas: Arc<Mutex<Vec<String>>> = Arc::default();
+        let seen = betas.clone();
+        let app = axum::Router::new().route(
+            "/v1/messages",
+            axum::routing::post(move |headers: axum::http::HeaderMap| {
+                let seen = seen.clone();
+                async move {
+                    let beta = headers.get("anthropic-beta").and_then(|v| v.to_str().ok());
+                    seen.lock().unwrap().push(beta.unwrap_or_default().to_string());
+                    ([("content-type", "text/event-stream")], DONE).into_response()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), betas)
+    }
+
+    async fn finish(registry: &Arc<Mutex<SubagentRegistry>>, handle_id: &str) {
+        for _ in 0..600 {
+            let done = registry
+                .lock()
+                .unwrap()
+                .get(handle_id)
+                .is_none_or(|h| h.status() != SubagentStatus::Running);
+            if done {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let thread = registry.lock().unwrap().get_mut(handle_id).and_then(|h| h.thread_handle.take());
+        if let Some(thread) = thread {
+            tokio::task::spawn_blocking(move || thread.join()).await.unwrap().unwrap();
+        }
+        let status = registry.lock().unwrap().get(handle_id).map(|h| h.status());
+        assert_eq!(status, Some(SubagentStatus::Completed), "{handle_id}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn every_spawn_path_sends_the_configured_1m_window() {
+        let base = crate::test_env::BaseDirGuard::new();
+        std::fs::write(
+            base.path().join("auth.json"),
+            r#"{"anthropic": {"type": "oauth", "refresh": "synthetic", "access": "synthetic-access", "expires": 9999999999999}}"#,
+        )
+        .unwrap();
+        std::fs::write(base.path().join("config"), "context_window = 1m\n").unwrap();
+        let (url, betas) = spawn_provider().await;
+        let _guards = [
+            crate::test_env::EnvVarGuard::remove("SYNAPS_AUTH_ENDPOINT"),
+            crate::test_env::EnvVarGuard::remove("SYNAPS_MACHINE_TOKEN"),
+            crate::test_env::EnvVarGuard::remove("SYNAPS_SUBAGENT_FRESH_RUNTIME"),
+            crate::test_env::EnvVarGuard::remove("ANTHROPIC_API_KEY"),
+            crate::test_env::EnvVarGuard::set("SYNAPS_ANTHROPIC_BASE_URL", &url),
+        ];
+        let registry = Arc::new(Mutex::new(SubagentRegistry::new()));
+        let ctx = || {
+            let mut ctx = create_tool_context();
+            ctx.capabilities.subagent_registry = Some(registry.clone());
+            ctx
+        };
+        let task = json!({"system_prompt": "test worker", "task": "run it", "model": MODEL, "timeout": 60});
+
+        super::SubagentTool.execute(task.clone(), ctx()).await.expect("subagent");
+        let out = super::SubagentStartTool.execute(task, ctx()).await.expect("subagent_start");
+        let handle = serde_json::from_str::<Value>(&out).unwrap()["handle_id"].as_str().unwrap().to_owned();
+        finish(&registry, &handle).await;
+        let out = super::SubagentResumeTool
+            .execute(json!({"handle_id": handle, "instructions": "again", "timeout": 60}), ctx())
+            .await
+            .expect("subagent_resume");
+        let resumed = serde_json::from_str::<Value>(&out).unwrap()["handle_id"].as_str().unwrap().to_owned();
+        finish(&registry, &resumed).await;
+
+        let betas = betas.lock().unwrap().clone();
+        assert_eq!(betas.len(), 3, "oneshot, start, resume: {betas:?}");
+        for (path, beta) in ["oneshot", "start", "resume"].iter().zip(&betas) {
+            assert!(beta.contains("context-1m-2025-08-07"), "{path}: {beta:?}");
+        }
+    }
+}
+
+/// The loopback provider and wire assertions the host-path twin
+/// (`tests/worker_config_inherit.rs`) shares.
+#[cfg(test)]
+#[path = "../../../tests/support/worker_wire.rs"]
+mod worker_wire;
+
+/// Tool-round keep-warm (`cache_keepwarm_tools`) reaches the worker of every
+/// spawn path with no `EngineHost`: a `bash` call that outlives the cache
+/// TTL is kept warm and the request after it reads the prefix; with the key
+/// off the same worker rewrites it.
+#[cfg(all(test, unix, feature = "command-exec"))]
+mod worker_tool_keepwarm_tests {
+    use crate::runtime::cache_sim::{self, Req, Sim};
+    use crate::runtime::subagent::{SubagentRegistry, SubagentStatus};
+    use crate::runtime::tool_keepwarm::testing::IntervalOverride;
+    use crate::test_env::{BaseDirGuard, EnvVarGuard};
+    use crate::tools::test_helpers::create_tool_context;
+    use crate::tools::Tool;
+    use serde_json::{json, Value};
+    use std::sync::{Arc, Mutex};
+
+    fn task() -> Value {
+        let prompt = format!("test worker\n{}", "padding ".repeat(3000));
+        json!({"system_prompt": prompt, "task": "run it", "model": "anthropic/claude-sonnet-4-6", "timeout": 60})
+    }
+
+    fn ctx(registry: &Arc<Mutex<SubagentRegistry>>) -> crate::tools::ToolContext {
+        let mut ctx = create_tool_context();
+        ctx.capabilities.subagent_registry = Some(registry.clone());
+        ctx
+    }
+
+    async fn finish(registry: &Arc<Mutex<SubagentRegistry>>, handle_id: &str) {
+        for _ in 0..600 {
+            let done = registry
+                .lock()
+                .unwrap()
+                .get(handle_id)
+                .is_none_or(|h| h.status() != SubagentStatus::Running);
+            if done {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let thread = registry.lock().unwrap().get_mut(handle_id).and_then(|h| h.thread_handle.take());
+        if let Some(thread) = thread {
+            tokio::task::spawn_blocking(move || thread.join()).await.unwrap().unwrap();
+        }
+        let status = registry.lock().unwrap().get(handle_id).map(|h| h.status());
+        assert_eq!(status, Some(SubagentStatus::Completed), "{handle_id}");
+    }
+
+    async fn oneshot(sim: &Arc<Mutex<Sim>>) -> Vec<Req> {
+        let registry = Arc::new(Mutex::new(SubagentRegistry::new()));
+        let out = super::SubagentTool.execute(task(), ctx(&registry)).await.expect("subagent");
+        assert!(out.contains("done"), "{out}");
+        cache_sim::take(sim)
+    }
+
+    /// The requests of the oneshot, start and resume workers, in that order.
+    async fn run_three_paths(sim: &Arc<Mutex<Sim>>) -> [Vec<Req>; 3] {
+        let registry = Arc::new(Mutex::new(SubagentRegistry::new()));
+        let oneshot = oneshot(sim).await;
+        let out = super::SubagentStartTool.execute(task(), ctx(&registry)).await.expect("subagent_start");
+        let handle = serde_json::from_str::<Value>(&out).unwrap()["handle_id"].as_str().unwrap().to_owned();
+        finish(&registry, &handle).await;
+        let start = cache_sim::take(sim);
+        let out = super::SubagentResumeTool
+            .execute(json!({"handle_id": handle, "instructions": "again", "timeout": 60}), ctx(&registry))
+            .await
+            .expect("subagent_resume");
+        let resumed = serde_json::from_str::<Value>(&out).unwrap()["handle_id"].as_str().unwrap().to_owned();
+        finish(&registry, &resumed).await;
+        [oneshot, start, cache_sim::take(sim)]
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn every_spawn_path_keeps_a_long_tool_round_warm_without_a_host() {
+        assert!(crate::EngineHost::current().is_none(), "the no-host fallback");
+        let base = BaseDirGuard::new();
+        std::fs::write(base.path().join("auth.json"), super::worker_wire::OAUTH_AUTH_JSON).unwrap();
+        std::fs::write(base.path().join("config"), "").unwrap();
+        let (url, sim) = cache_sim::spawn(
+            cache_sim::Script::kept_warm(2),
+            "bash",
+            json!({"command": cache_sim::WORKER_COMMAND}),
+        )
+        .await;
+        let _env = [
+            EnvVarGuard::remove("SYNAPS_AUTH_ENDPOINT"),
+            EnvVarGuard::remove("SYNAPS_MACHINE_TOKEN"),
+            EnvVarGuard::remove("SYNAPS_SUBAGENT_FRESH_RUNTIME"),
+            EnvVarGuard::remove("ANTHROPIC_API_KEY"),
+            EnvVarGuard::set("SYNAPS_ANTHROPIC_BASE_URL", &url),
+        ];
+        let _interval = IntervalOverride::set(cache_sim::WORKER_INTERVAL);
+
+        let runs = run_three_paths(&sim).await;
+        for (path, requests) in ["oneshot", "start", "resume"].iter().zip(&runs) {
+            cache_sim::assert_worker_kept_warm(&format!("no-host {path}"), requests);
+        }
+        // Stopped with the rounds: nothing once the workers are done.
+        tokio::time::sleep(cache_sim::WORKER_INTERVAL * 3).await;
+        assert!(cache_sim::take(&sim).is_empty(), "a ping after the workers");
+
+        // Control: the key off, the same worker rewrites its prefix.
+        std::fs::write(base.path().join("config"), "cache_keepwarm_tools = off\n").unwrap();
+        sim.lock().unwrap().script = cache_sim::Script::outlives_ttl();
+        cache_sim::assert_worker_rewrites("no-host off", &oneshot(&sim).await);
+    }
+}
+
+/// What the worker of every spawn path puts on the wire under a locked-down,
+/// diagnostics-on, gzip-on config, with no `EngineHost` (the `load_config()`
+/// fallback; the host paths are `tests/worker_config_inherit.rs`).
+#[cfg(test)]
+mod worker_inherit_wire_tests {
+    use super::worker_wire::{self, Seen};
+    use crate::runtime::subagent::{SubagentRegistry, SubagentStatus};
+    use crate::test_env::{BaseDirGuard, EnvVarGuard};
+    use crate::tools::test_helpers::create_tool_context;
+    use crate::tools::Tool;
+    use serde_json::{json, Value};
+    use std::sync::{Arc, Mutex};
+
+    fn task() -> Value {
+        // Over `MIN_BYTES`, so gzip applies whatever the tool set.
+        let prompt = format!("test worker\n{}", "padding ".repeat(3000));
+        json!({"system_prompt": prompt, "task": "run it", "model": "anthropic/claude-sonnet-4-6", "timeout": 60})
+    }
+
+    fn ctx(registry: &Arc<Mutex<SubagentRegistry>>) -> crate::tools::ToolContext {
+        let mut ctx = create_tool_context();
+        ctx.capabilities.subagent_registry = Some(registry.clone());
+        ctx
+    }
+
+    fn take(seen: &Arc<Mutex<Vec<Seen>>>) -> Vec<Seen> {
+        std::mem::take(&mut *seen.lock().unwrap())
+    }
+
+    async fn finish(registry: &Arc<Mutex<SubagentRegistry>>, handle_id: &str) {
+        for _ in 0..600 {
+            let done = registry
+                .lock()
+                .unwrap()
+                .get(handle_id)
+                .is_none_or(|h| h.status() != SubagentStatus::Running);
+            if done {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let thread = registry.lock().unwrap().get_mut(handle_id).and_then(|h| h.thread_handle.take());
+        if let Some(thread) = thread {
+            tokio::task::spawn_blocking(move || thread.join()).await.unwrap().unwrap();
+        }
+        let status = registry.lock().unwrap().get(handle_id).map(|h| h.status());
+        assert_eq!(status, Some(SubagentStatus::Completed), "{handle_id}");
+    }
+
+    async fn oneshot(seen: &Arc<Mutex<Vec<Seen>>>) -> Vec<Seen> {
+        let registry = Arc::new(Mutex::new(SubagentRegistry::new()));
+        let out = super::SubagentTool.execute(task(), ctx(&registry)).await.expect("subagent");
+        assert!(out.contains("done"), "{out}");
+        take(seen)
+    }
+
+    /// The requests of the oneshot, start and resume workers, in that order.
+    async fn run_three_paths(seen: &Arc<Mutex<Vec<Seen>>>) -> [Vec<Seen>; 3] {
+        let registry = Arc::new(Mutex::new(SubagentRegistry::new()));
+        let oneshot = oneshot(seen).await;
+        let out = super::SubagentStartTool.execute(task(), ctx(&registry)).await.expect("subagent_start");
+        let handle = serde_json::from_str::<Value>(&out).unwrap()["handle_id"].as_str().unwrap().to_owned();
+        finish(&registry, &handle).await;
+        let start = take(seen);
+        let out = super::SubagentResumeTool
+            .execute(json!({"handle_id": handle, "instructions": "again", "timeout": 60}), ctx(&registry))
+            .await
+            .expect("subagent_resume");
+        let resumed = serde_json::from_str::<Value>(&out).unwrap()["handle_id"].as_str().unwrap().to_owned();
+        finish(&registry, &resumed).await;
+        [oneshot, start, take(seen)]
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn every_spawn_path_inherits_disabled_tools_diagnostics_and_gzip_without_a_host() {
+        assert!(crate::EngineHost::current().is_none(), "the no-host fallback");
+        let base = BaseDirGuard::new();
+        std::fs::write(base.path().join("auth.json"), worker_wire::OAUTH_AUTH_JSON).unwrap();
+        std::fs::write(base.path().join("config"), worker_wire::LOCKED_CONFIG).unwrap();
+        let marker = base.path().join("bash-ran");
+        let (url, seen) = worker_wire::spawn_provider(&marker, false).await;
+        let _env = [
+            EnvVarGuard::remove("SYNAPS_AUTH_ENDPOINT"),
+            EnvVarGuard::remove("SYNAPS_MACHINE_TOKEN"),
+            EnvVarGuard::remove("SYNAPS_SUBAGENT_FRESH_RUNTIME"),
+            EnvVarGuard::remove("SYNAPS_GZIP_REQUEST_BODIES"),
+            EnvVarGuard::remove("ANTHROPIC_API_KEY"),
+            EnvVarGuard::set("SYNAPS_ANTHROPIC_BASE_URL", &url),
+        ];
+
+        let runs = run_three_paths(&seen).await;
+        worker_wire::assert_worker_requests("no-host", &runs, &marker);
+
+        // G5: the cache prefix is unchanged. With diagnostics off the same
+        // worker sends the same bytes the cache keys on: only the
+        // top-level object differs.
+        std::fs::write(
+            base.path().join("config"),
+            worker_wire::LOCKED_CONFIG.replace("cache_diagnostics = true", "cache_diagnostics = false"),
+        )
+        .unwrap();
+        let plain = oneshot(&seen).await;
+        assert_eq!(plain.len(), 2);
+        for (on, off) in runs[0].iter().zip(&plain) {
+            assert!(off.previous_message_id().is_none(), "off: no object");
+            assert_eq!(on.without_diagnostics(), off.body, "prefix moved");
+        }
+
+        // G5: the existing refusal fallback covers a worker too.
+        std::fs::write(base.path().join("config"), worker_wire::LOCKED_CONFIG).unwrap();
+        let (url, seen) = worker_wire::spawn_provider(&marker, true).await;
+        let _url = EnvVarGuard::set("SYNAPS_ANTHROPIC_BASE_URL", &url);
+        worker_wire::assert_diagnostics_refusal_falls_back(&oneshot(&seen).await);
+        assert!(!marker.exists());
+
+        // Control: the same worker, `bash` not listed, does run the call,
+        // so "the marker never appears" above is a real refusal.
+        if cfg!(all(unix, feature = "command-exec")) {
+            std::fs::write(base.path().join("config"), "disabled_tools = ls, grep\n").unwrap();
+            let (url, seen) = worker_wire::spawn_provider(&marker, false).await;
+            let _url = EnvVarGuard::set("SYNAPS_ANTHROPIC_BASE_URL", &url);
+            let requests = oneshot(&seen).await;
+            assert!(requests[0].tool_names().iter().any(|n| n == "bash"));
+            assert!(!requests[1].body["messages"].to_string().contains("Unknown tool"));
+            assert!(marker.exists(), "an allowed bash runs");
         }
     }
 }

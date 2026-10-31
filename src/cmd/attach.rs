@@ -269,6 +269,8 @@ fn set_echo(on: bool) {
             .stdin(std::process::Stdio::inherit())
             .status();
     }
+    #[cfg(not(unix))]
+    let _ = on;
 }
 
 /// `client_name`: the global `--as` (see `main.rs`); `None` =

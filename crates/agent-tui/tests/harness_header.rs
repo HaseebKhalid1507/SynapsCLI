@@ -350,3 +350,24 @@ fn dump_header_rows() {
     }
     assert!(dump.contains("\u{2717}"));
 }
+
+/// C8: a top toast ("Subagents / no subagents to watch", the boot
+/// "Extensions" one) was drawn from row 1 — over the header's rim — so it
+/// looked glued onto the header. Rows 0 (header) and 1 (rim) stay as they
+/// were; the toast starts below them.
+#[test]
+fn top_toasts_leave_the_header_and_its_rim_alone() {
+    let mut h = TestHarness::boot_with_size(100, 30);
+    let rows = |buf: &ratatui::buffer::Buffer| -> Vec<ratatui::buffer::Cell> {
+        (0..2u16)
+            .flat_map(|y| (0..100u16).map(move |x| (x, y)))
+            .map(|p| buf[p].clone())
+            .collect()
+    };
+    let before = rows(h.render());
+    h.push_toast_with_ttl_secs("watch", "no subagents to watch", 3600);
+    let buf = h.render().clone();
+    assert_eq!(rows(&buf), before, "header rows changed under a toast");
+    let text: String = (0..100u16).map(|x| buf[(x, 3)].symbol().to_string()).collect();
+    assert!(text.contains("no subagents to watch"), "toast below the header: {text:?}");
+}

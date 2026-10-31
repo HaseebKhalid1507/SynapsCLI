@@ -169,6 +169,8 @@ pub(crate) struct App {
     /// Set by user input (scroll/typing/cursor) so interaction stays instant
     /// even while the model is streaming; cleared after the paint.
     pub(crate) force_redraw: bool,
+    /// Windows Alt-code characters arrive as lone key Releases; see `win_keys`.
+    pub(crate) alt_codes: super::win_keys::AltCodeGate,
     pub(crate) logo_dismiss_t: Option<f64>,
     pub(crate) logo_build_t: Option<f64>,
     /// Active subagent status for the live panel
@@ -370,6 +372,10 @@ pub(crate) struct App {
     /// still myx" bit: `sync_myx_live` is the single writer, on this thread,
     /// on every theme-apply path.
     pub(crate) myx_task: Option<tokio::task::JoinHandle<()>>,
+    /// The theme last applied in this process (`/theme <name>` or the
+    /// settings picker); `None` until then — the boot theme comes from
+    /// `SYNAPS_THEME` / config ([`App::current_theme_name`]).
+    pub(crate) active_theme: Option<String>,
     /// Last-good LIVE palette from the MXC subscriber. Re-applying "myx"
     /// statically (`/theme myx` again, settings Esc-revert, picker browse)
     /// restores this instead of stranding on the static snapshot until the
@@ -384,6 +390,12 @@ pub(crate) struct App {
     /// Injectable clock (P6.2). Real in production, Test in the harness so
     /// time-dependent state (toast expiry, tool timers) stays deterministic.
     pub(crate) clock: super::clock::TuiClock,
+    /// Streamed text not shown yet: a burst is revealed over a few frames
+    /// (`stream_handler::reveal`).
+    pub(crate) reveal: super::stream_handler::reveal::Reveal,
+    /// `tui_smooth_streaming` (Settings → Appearance): pace bursts through
+    /// [`Self::reveal`]; off = every delta paints as it arrives.
+    pub(crate) smooth_streaming: bool,
     /// Neon-prompt timing: input/stream events → per-frame animation
     /// snapshot. Its `animating()` is one of the tick guard's terms.
     pub(crate) prompt_clock: super::neon_prompt::PromptClock,
@@ -433,7 +445,13 @@ impl App {
         let (myx_theme_tx_init, myx_theme_rx_init) = tokio::sync::mpsc::unbounded_channel();
         let boot_config = synaps_cli::config::load_config();
         Self {
-            transcript: TranscriptStore::new(clock.clone()),
+            transcript: {
+                let mut t = TranscriptStore::new(clock.clone());
+                t.set_path_base(super::render::paths::PathBase::new(
+                    std::env::current_dir().ok(),
+                ));
+                t
+            },
             threads: super::threads::Threads::default(),
             watch: Default::default(),
             tray_area: Default::default(),
@@ -468,6 +486,7 @@ impl App {
                 .unwrap_or_else(|| "agent".to_string()),
             needs_redraw: true,
             force_redraw: false,
+            alt_codes: Default::default(),
             logo_dismiss_t: None,
             // SYNAPS_NO_BOOT_FX=1: skip both the tachyonfx boot effect and the
             // ASCII logo build animation (full-screen redraws per frame are
@@ -486,7 +505,9 @@ impl App {
             activity: super::header::Activity::Idle,
             tools_in_flight: 0,
             turn_started: None,
-            header_epoch: std::time::Instant::now(),
+            // The injected clock, as `header_snap` reads it: a frozen
+            // harness clock must not sweep by how long boot took.
+            header_epoch: clock.now(),
             header_folder: super::header::current_folder(),
             observing: false,
             attached_clients: 0,
@@ -544,11 +565,14 @@ impl App {
             myx_theme_rx: myx_theme_rx_init,
             myx_theme_tx: myx_theme_tx_init,
             myx_task: None,
+            active_theme: None,
             myx_last_live: None,
             theme_transition: None,
             keybinds: None,
             response_preview: None,
             prompt_clock: super::neon_prompt::PromptClock::new(clock.now()),
+            reveal: Default::default(),
+            smooth_streaming: boot_config.tui_smooth_streaming,
             clock,
         }
     }
@@ -736,6 +760,20 @@ impl App {
         self.needs_redraw = true;
     }
 
+    /// [`Self::push_msg`] for a message that happened at `at` (`None`: no
+    /// recorded time, shown empty) — transcript rebuilds.
+    pub(crate) fn push_msg_at(
+        &mut self,
+        msg: ChatMessage,
+        at: Option<chrono::DateTime<chrono::Local>>,
+    ) {
+        let Some(msg) = super::watch::command_output(self, msg) else {
+            return;
+        };
+        self.transcript.push_msg_at(msg, at);
+        self.needs_redraw = true;
+    }
+
     /// Mark the cached message lines stale — they'll be rebuilt on the next draw.
     /// Call this after any mutation that changes how `messages` renders.
     /// Use for structural changes (theme, width, message list reshuffle). For
@@ -799,6 +837,9 @@ impl App {
     /// state — theme, config, keybinds, the input draft, input history,
     /// sidecars, model caches — stays.
     pub(crate) fn reset_for_session_switch(&mut self) {
+        // The old session's queued text goes into its transcript, cleared
+        // just below: none of it may land in the new one.
+        self.flush_reveal();
         super::watch::reset(self);
         self.transcript.clear();
         self.invalidate();
@@ -1039,6 +1080,12 @@ impl App {
         ];
 
         if arg.is_empty() {
+            let current = self.current_theme_name();
+            // Leading space on every row, marker included: system rows that start
+            // with a space group into one block (no blank line before the
+            // current theme's row).
+            let mark = |name: &str| if name == current { " \u{25b8}" } else { "  " };
+            let tag = |name: &str| if name == current { "  (current)" } else { "" };
             self.push_msg(ChatMessage::System("Available themes:".to_string()));
             for (name, desc) in descriptions {
                 // Soft detection annotation for the live theme: "myx" always
@@ -1050,12 +1097,22 @@ impl App {
                         "static — myx not detected"
                     };
                     self.push_msg(ChatMessage::System(format!(
-                        "  {:<15} — {} [{}]",
-                        name, desc, status
+                        "{}{:<15} — {} [{}]{}",
+                        mark(name),
+                        name,
+                        desc,
+                        status,
+                        tag(name)
                     )));
                     continue;
                 }
-                self.push_msg(ChatMessage::System(format!("  {:<15} — {}", name, desc)));
+                self.push_msg(ChatMessage::System(format!(
+                    "{}{:<15} — {}{}",
+                    mark(name),
+                    name,
+                    desc,
+                    tag(name)
+                )));
             }
             let themes_dir = synaps_cli::config::base_dir().join("themes");
             if let Ok(entries) = std::fs::read_dir(&themes_dir) {
@@ -1066,12 +1123,17 @@ impl App {
                     .collect();
                 custom.sort();
                 for name in &custom {
-                    self.push_msg(ChatMessage::System(format!("  {:<15} — custom", name)));
+                    self.push_msg(ChatMessage::System(format!(
+                        "{}{:<15} — custom{}",
+                        mark(name),
+                        name,
+                        tag(name)
+                    )));
                 }
             }
             self.push_msg(ChatMessage::System(String::new()));
             self.push_msg(ChatMessage::System(
-                "Usage: /theme <name> to set. Restart to apply.".to_string(),
+                "/theme <name> switches now and keeps it as your theme.".to_string(),
             ));
         } else {
             let name = arg.trim();
@@ -1095,6 +1157,7 @@ impl App {
                         // Reconcile the live-MXC layer: spawn the subscriber
                         // when switching TO myx, abort it when switching away.
                         self.sync_myx_live(name);
+                        self.active_theme = Some(name.to_string());
                         self.push_msg(ChatMessage::System(format!("Theme applied: {}", name)));
                         self.invalidate();
                     }
@@ -1176,6 +1239,17 @@ impl App {
         let target = self.resolve_apply_theme(name).unwrap_or_default();
         self.apply_theme_animated(target, None);
         self.sync_myx_live(name);
+        self.active_theme = Some(name.to_string());
+    }
+
+    /// The theme on screen: the last one applied here, else `SYNAPS_THEME`,
+    /// else the configured one, else `default`.
+    pub(crate) fn current_theme_name(&self) -> String {
+        self.active_theme
+            .clone()
+            .or_else(super::theme::env_theme_name)
+            .or_else(super::theme::configured_theme_name)
+            .unwrap_or_else(|| "default".to_string())
     }
 }
 
@@ -2279,6 +2353,7 @@ mod tests {
                     elapsed_ms: Some(5),
                 },
                 time: "00:00".to_string(),
+                thought: None,
             },
         );
         app.transcript.invalidate_from(at);
@@ -2484,6 +2559,33 @@ mod tests {
             super::super::theme::load_theme_by_name("nord")
         );
         app.myx_task.take().unwrap().abort();
+    }
+
+    /// C3: the list said "Restart to apply." (it applies live) and did not
+    /// say which theme is on.
+    #[test]
+    fn theme_list_marks_the_current_theme_and_says_it_applies_now() {
+        let mut app = test_app();
+        app.active_theme = Some("nord".to_string());
+        app.handle_theme_command("");
+        let text: Vec<String> = app
+            .transcript
+            .messages()
+            .iter()
+            .filter_map(|m| match &m.msg {
+                ChatMessage::System(t) => Some(t.clone()),
+                _ => None,
+            })
+            .collect();
+        let all = text.join("\n");
+        assert!(!all.contains("Restart"), "{all}");
+        let nord = text.iter().find(|l| l.contains("nord ")).expect("nord listed");
+        assert!(nord.starts_with(" \u{25b8}nord") && nord.ends_with("(current)"), "{nord}");
+        // Every row starts with a space so the list renders as one block.
+        let rows: Vec<&String> = text.iter().filter(|l| l.contains(" — ")).collect();
+        assert!(rows.len() > 3 && rows.iter().all(|l| l.starts_with(' ')), "{rows:?}");
+        let dracula = text.iter().find(|l| l.contains("dracula")).unwrap();
+        assert!(dracula.starts_with("  ") && !dracula.contains("current"), "{dracula}");
     }
 
     /// Settings-path lifecycle (shady F2 / okarin F1): committing a theme

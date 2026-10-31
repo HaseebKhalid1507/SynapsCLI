@@ -6,6 +6,21 @@ use std::process::{Command, Stdio};
 
 use sha2::{Digest, Sha256};
 
+/// A `git` command for a plugin `action` ("Plugin install", ...). On macOS
+/// without Apple's Command Line Tools there is no developer Git (and running
+/// `/usr/bin/git` would open the install dialog), so refuse with what to do.
+fn git_command(action: &str) -> Result<Command, String> {
+    let program = agent_core::git_program::git_program().map_err(|_| git_unavailable(action))?;
+    Ok(Command::new(program))
+}
+
+fn git_unavailable(action: &str) -> String {
+    format!(
+        "{action} needs git. Install Apple's Command Line Tools \
+         (run `xcode-select --install`), then try again."
+    )
+}
+
 /// Streaming `git clone --depth=1 --progress` — forwards every chunk of
 /// stderr (split on `\r`/`\n`) to `on_chunk` as it arrives.
 ///
@@ -24,11 +39,12 @@ pub fn clone_repo_with_progress(
     if source_url.starts_with('-') {
         return Err(format!("refusing suspicious url: {}", source_url));
     }
+    let mut git = git_command("Plugin install")?;
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("mkdir {}: {}", parent.display(), e))?;
     }
-    let mut child = Command::new("git")
+    let mut child = git
         .args(["clone", "--progress", "--depth=1", "--", source_url])
         .arg(dest)
         .stdout(Stdio::null())
@@ -123,7 +139,7 @@ pub fn install_plugin_with_progress(
         ));
     }
     clone_repo_with_progress(source_url, dest, on_chunk)?;
-    rev_parse_head(dest)
+    rev_parse_head(dest, "Plugin install")
 }
 
 /// Shallow-clone `marketplace_url` into a temp dir sibling to `dest`, then
@@ -176,7 +192,7 @@ pub fn install_plugin_from_subdir_with_progress(
 
     clone_repo_with_progress(marketplace_url, &tmp, on_chunk)?;
 
-    let sha = match rev_parse_head(&tmp) {
+    let sha = match rev_parse_head(&tmp, "Plugin install") {
         Ok(s) => s,
         Err(e) => {
             let _ = std::fs::remove_dir_all(&tmp);
@@ -337,7 +353,7 @@ fn collect_regular_files(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> Res
 
 /// `git -C <path> pull --ff-only`, then capture new SHA.
 pub fn update_plugin(install_path: &Path) -> Result<String, String> {
-    let out = Command::new("git")
+    let out = git_command("Plugin update")?
         .args(["-C"])
         .arg(install_path)
         .args(["pull", "--ff-only", "-q"])
@@ -349,7 +365,7 @@ pub fn update_plugin(install_path: &Path) -> Result<String, String> {
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
-    rev_parse_head(install_path)
+    rev_parse_head(install_path, "Plugin update")
 }
 
 /// `git ls-remote <url> HEAD` → first column (SHA). Network op.
@@ -357,7 +373,7 @@ pub fn ls_remote_head(source_url: &str) -> Result<String, String> {
     if source_url.starts_with('-') {
         return Err(format!("refusing suspicious url: {}", source_url));
     }
-    let out = Command::new("git")
+    let out = git_command("Plugin update check")?
         .args(["ls-remote", "--", source_url, "HEAD"])
         .output()
         .map_err(|e| format!("spawn git: {}", e))?;
@@ -378,8 +394,8 @@ pub fn ls_remote_head(source_url: &str) -> Result<String, String> {
     Ok(sha.to_string())
 }
 
-fn rev_parse_head(repo: &Path) -> Result<String, String> {
-    let out = Command::new("git")
+fn rev_parse_head(repo: &Path, action: &str) -> Result<String, String> {
+    let out = git_command(action)?
         .args(["-C"])
         .arg(repo)
         .args(["rev-parse", "HEAD"])
@@ -621,6 +637,21 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("nothere");
         assert!(uninstall_plugin(&p).is_ok());
+    }
+
+    #[test]
+    fn missing_developer_git_refusal_names_the_fix() {
+        assert_eq!(
+            git_unavailable("Plugin update check"),
+            "Plugin update check needs git. Install Apple's Command Line Tools (run `xcode-select --install`), then try again."
+        );
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn other_platforms_run_git_from_path() {
+        let git = git_command("Plugin install").unwrap();
+        assert_eq!(git.get_program(), "git");
     }
 
     #[test]
