@@ -32,6 +32,7 @@ Repository `.cargo/config.toml` supplies these defaults. Apply the same ceiling
 to the independently built Axel sidecar; do not multiply parallel build jobs.
 
 **Minimum Rust:** 1.88 (edition 2021).
+**Platforms:** Linux, macOS and Windows 10/11. CI runs the full suite on Linux; macOS gets `cargo check` and the `git_program` tests; Windows gets clippy in both feature sets (default and `--no-default-features`), the `daemon_*` integration tests and `cargo test -p synaps-tui --lib` — the rest of the suite isn't run there yet. Gate Unix-only code and tests with `#[cfg(unix)]` (or `target_os = "linux"` for procfs/systemd); the Windows CI job is the only build that compiles the `cfg(windows)` code.
 **Config path:** `~/.synaps-cli/config` (plain `key = value`, see `crates/agent-core/src/core/config.rs`).
 **Binary:** `target/release/synaps` — single binary, dispatched via subcommand.
 
@@ -123,6 +124,8 @@ crates/agent-engine/src/  (crate: synaps-engine)
 │   ├── mod.rs            — Tool trait, ToolContext
 │   ├── registry.rs       — ToolRegistry::new() registers all built-ins
 │   ├── {bash,read,write,edit,grep,find,ls}.rs  — core filesystem/shell tools
+│   ├── multi_edit.rs     — anchored edits across files, all or nothing (docs/multi-edit.md)
+│   ├── powershell.rs     — PowerShell tool (Windows only; shares the bash tool's runner)
 │   ├── subagent/         — reactive lifecycle: start, status, steer, collect, resume, authorize_model, finalize + oneshot
 │   ├── memory/           — memory_store, memory_search, memory_fetch, memory_forget, memory_context tools
 │   ├── agent.rs          — (legacy — prefer the subagent tools)
@@ -478,9 +481,15 @@ Mapping (`crates/agent-core/src/core/models.rs::thinking_level_for_budget`):
 | `tool_output_spill_bytes` | int | 12288 | Tool output virtualisation: a text result of an output-dump tool (`bash`, `grep`, `find`, `ls`, shell and subagent tools, MCP/extension/plugin tools) bigger than this is saved whole to `<base>/spill/<session>/<tool_use_id>.txt` (0700/0600) and history gets a head + tail preview naming the file and the omitted line range; a default-range `read` points back at the file instead. `0` = off (history exactly as before). Spill dirs go with their session (retention) or after 7 idle days |
 | `tool_output_spill_head_bytes` | int | 4096 | Bytes from the start of a virtualised result kept in history (cut at a line boundary when possible) |
 | `tool_output_spill_tail_bytes` | int | 3072 | Bytes from the end of a virtualised result kept in history |
+| `read_dedupe` | bool | on | A `read` whose result would be byte-identical to an earlier `read` of the same file/range still in history becomes a short stub naming that call |
 | `bash_timeout` | int | 30 | Default bash timeout (seconds) |
 | `bash_max_timeout` | int | 300 | Max allowed bash timeout |
 | `subagent_timeout` | int | 300 | Default subagent timeout (seconds; 0 = no limit) |
+| `subagent_thinking` | string | xhigh | Worker thinking default (`low`, `medium`, `high`, `xhigh`, `max`), independent of `thinking`; a per-call `thinking` argument wins ([docs/subagent-thinking.md](docs/subagent-thinking.md)) |
+| `subagent_context_management` | string | auto | `auto` or `off`: workers roll their context over instead of filling the window ([docs/design/subagent-rollover.md](docs/design/subagent-rollover.md)) |
+| `subagent_rollover_tokens` | int | 200000 | Estimated footprint at which a worker rolls over (at least 20000; a lower window band wins) |
+| `subagent_cold_resume_compact_tokens` | int | 100000 | `subagent_resume` of a worker whose cache has expired replays a compact context once history is at least this big; `0` = off |
+| `subagent_transform_hooks` | bool | on | Workers run the host's `after_tool_call` output transforms on their own tool results |
 | `subagent.max_concurrent` | int | 16 | Workers running at once across the session's delegation tree |
 | `subagent.max_total` | int | 64 | Dispatched workers not yet reconciled |
 | `subagent.max_depth` | int | 4 | Maximum nesting depth; 1 means foreground-only delegation |
@@ -488,7 +497,15 @@ Mapping (`crates/agent-core/src/core/models.rs::thinking_level_for_budget`):
 | `favorite_models` | comma list | — | Pinned models in model picker |
 | `disabled_plugins` | comma list | — | Plugins to skip on boot |
 | `disabled_skills` | comma list | — | Skills to skip on boot |
-| `disabled_tools` | comma list | — | Built-in tools to remove from the registry at boot (by runtime name, e.g. `bash, ls`) |
+| `disabled_tools` | comma list | — | Built-in tools to remove from the registry at boot (by runtime name, e.g. `bash, ls`); subagent workers don't get them either |
+| `cache_ttl` | string | auto | Prompt-cache TTL: `auto` (1h on an Anthropic subscription/OAuth login, 5m on an API key), `5m`, `1h` or `hybrid`. Other providers ignore it; workers always use 5m |
+| `cache_keepwarm_tools` | bool | on | Keep the prompt cache warm while a long tool round runs (foreground and workers) |
+| `cache_keepwarm_headless` | bool | off | Let idle keep-warm (`cache_keepwarm`) run for daemon sessions driven only by non-interactive clients |
+| `request_compression` | string | auto | gzip Anthropic request bodies: `auto` (16 KiB+ bodies sent straight to api.anthropic.com), `on`, `off`. `SYNAPS_GZIP_REQUEST_BODIES=0` turns it off |
+| `request_compression_level` | int | 1 | gzip level, 1–9 |
+| `thinking_display` | string | summarized | `summarized` or `omitted`: the foreground session's `thinking.display` |
+| `tui_smooth_streaming` | bool | on | The TUI reveals a burst of streamed text over a few frames instead of at once |
+| `tool_scope_slice` / `daemon_scope_slice` | string | — | Linux: the systemd slice for tool-command scopes / the daemon's scope (see [docs/daemon-mode.md](docs/daemon-mode.md#capping-tool-commands-with-a-slice)) |
 | `provider.<name>` | string | — | API key for provider (e.g. `provider.groq = gsk_...`) |
 | `provider.<name>.url` | string | — | Custom base URL (e.g. `provider.local.url = http://...`) |
 | `keybind.<key>` | string | — | Custom keybind (e.g. `keybind.F5 = /compact`) |
@@ -508,7 +525,7 @@ Mapping (`crates/agent-core/src/core/models.rs::thinking_level_for_budget`):
 5. **Binary swap requires process restart.** `cargo build` replaces `target/release/synaps` on disk but the running process keeps the old binary mmap'd. Must exit + relaunch to pick up changes.
 6. **New StreamEvents need TWO consumers.** `crates/agent-tui/src/tui/stream_handler.rs` AND `crates/agent-engine/src/engine/stream.rs` — update only the TUI one and headless mode silently drops the event.
 7. **Subagent has NO subagent.** No recursion. Subagents also lack `connect_mcp_server`, `load_skill`, `watcher_exit`. Enforced via the restricted registry in `crates/agent-engine/src/tools/registry.rs` (see the second tool list).
-8. **Theme change requires restart.** The `apply_setting` path flags this with `"saved — restart to apply"`. Not a bug — `Theme` is captured by long-lived render state.
+8. **Theme changes apply live.** `/theme` and the `/settings` theme row apply at once with a cross-fade, no restart. Any path that changes the persisted theme must also call `App::sync_myx_live` (see `apply_theme_from_settings`), or the live `myx` subscriber leaks.
 9. **MCP servers are lazy-spawned.** First `connect_mcp_server` pays the spawn cost. Tools are registered dynamically via `ToolContext::tool_register_tx` — this channel breaks the `Arc<ToolRegistry>` circularity.
 10. **OAuth tokens are file-locked** via `fs4`. Concurrent TUI + watcher instances are safe, but a crashed process holding the lock will block others until its file is cleaned up.
 11. **Provider model IDs contain slashes.** `nvidia/meta/llama-3.3-70b-instruct` — the first slash separates provider from model. `resolve_shorthand` uses `split_once('/')`. Nested slashes in model IDs (NVIDIA, DeepInfra) are preserved correctly.
@@ -645,6 +662,16 @@ Surgical replacement. `old_string` must match exactly once.
 
 | `path` (string, req) | `old_string` (string, req) | `new_string` (string, req) |
 
+### `multi_edit`
+Anchored edits across up to 16 files in one call (max 64 edits), all or nothing: if any edit fails, nothing is written. Ops: `replace`, `insert_before`, `insert_after`, `append`, `append_jsonl`. See [docs/multi-edit.md](docs/multi-edit.md).
+
+| `edits` (array, req) | `placeholders` (bool) |
+
+### `powershell` (Windows only)
+Run a PowerShell command (`pwsh` if installed, else Windows PowerShell). Same runner, timeout and output limits as `bash`. On Windows `bash` resolves to `bash.exe` on PATH, then Git Bash, then WSL's `bash.exe`.
+
+| `command` (string, req) | `timeout` (integer) |
+
 ### `grep`
 Recursive regex search.
 
@@ -683,10 +710,11 @@ Dispatch a specialist. **Not available to subagents.**
 | `system_prompt` | string | * | — | Inline alternative to `agent` |
 | `model` | string | | sonnet | Override |
 | `timeout` | integer | | 300 | Seconds |
+| `thinking` | string | | `subagent_thinking` (xhigh) | `low`, `medium`, `high`, `xhigh`, `max` |
 
 *Must provide `agent` OR `system_prompt`.
 
-Runs in isolated thread with its own tokio runtime. Core tools only (no subagent/MCP). Logs to `~/.synaps-cli/logs/subagents/`. Output prefixed `[subagent:{name}]`. Returns partial results on timeout.
+Runs in isolated thread with its own tokio runtime, in the parent session's cwd and environment (under the daemon too). Core tools only (no subagent/MCP). Logs to `~/.synaps-cli/logs/subagents/`. Output prefixed `[subagent:{name}]`. Returns partial results on timeout.
 
 ### `connect_mcp_server`
 Connect to an MCP server defined in `~/.synaps-cli/mcp.json`. Tools registered as `ext__{server}__{tool}`. 30s request timeout.
@@ -723,23 +751,25 @@ Stateful PTY sessions. Returns a `session_id` from `shell_start`; use with `shel
 | `read` | path | offset, limit | File reading |
 | `write` | path, content | — | File creation |
 | `edit` | path, old_string, new_string | — | Surgical editing |
+| `multi_edit` | edits | placeholders | Anchored multi-file edits, all or nothing |
+| `powershell`† | command | timeout | PowerShell execution |
 | `grep` | pattern | path, include, context | Regex search |
 | `find` | pattern | path, type | File discovery |
 | `ls` | — | path | Directory listing |
-| `subagent` | task | agent, system_prompt, model, timeout | Agent dispatch |
+| `subagent` | task | agent, system_prompt, model, timeout, thinking | Agent dispatch |
 | `connect_mcp_server` | server | — | MCP server connection |
 | `load_skill` | skill | — | Behavioral guidelines |
 | `shell_start` | — | cwd, env, … | Start PTY session |
 | `shell_send` | session_id, input | timeout_ms | Interact with PTY |
 | `shell_end` | session_id | — | Close PTY |
-| `subagent_start` | task | agent, system_prompt, model, timeout | Reactive dispatch (non-blocking) |
+| `subagent_start` | task | agent, system_prompt, model, timeout, thinking | Reactive dispatch (non-blocking) |
 | `subagent_status` | handle_id | — | Poll reactive subagent state |
 | `subagent_steer` | handle_id, message | — | Inject guidance mid-run |
 | `subagent_collect` | handle_id | — | Collect result (non-blocking poll) |
-| `subagent_resume` | handle_id, instructions | archive_path, timeout | Continue a finished/timed-out/failed worker from its own archived conversation |
+| `subagent_resume` | handle_id, instructions | archive_path, timeout, thinking | Continue a finished/timed-out/failed worker from its own archived conversation |
 | `watcher_exit`* | reason, summary | pending, context | Watcher handoff |
 
-*Watcher agents only. Subagents cannot use `subagent`, `connect_mcp_server`, `load_skill`, `watcher_exit`.
+*Watcher agents only. Subagents cannot use `subagent`, `connect_mcp_server`, `load_skill`, `watcher_exit`. †Windows only.
 
 ---
 

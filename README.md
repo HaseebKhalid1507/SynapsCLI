@@ -23,7 +23,7 @@
 
 ## Install
 
-Linux and macOS.
+Linux, macOS and Windows 10/11 (x64).
 
 ```bash
 curl --proto '=https' --tlsv1.2 -LsSf https://github.com/HaseebKhalid1507/SynapsCLI/releases/latest/download/synaps-installer.sh | sh
@@ -33,14 +33,23 @@ brew install HaseebKhalid1507/tap/synaps
 synaps --version    # check it worked
 ```
 
+On Windows:
+
+```powershell
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/HaseebKhalid1507/SynapsCLI/releases/latest/download/synaps-installer.ps1 | iex"
+```
+
+This installs `synaps.exe` in `%USERPROFILE%\.cargo\bin` (`%CARGO_HOME%\bin` if set). On Windows the agent also gets a built-in `powershell` tool, and the default system prompt tells it to prefer it. The `bash` tool uses Git Bash, or WSL's `bash.exe`, when it finds one; with neither, bash calls fail with a not-found error, so install [Git for Windows](https://git-scm.com/download/win) if you want bash.
+
 <details>
-<summary>Other ways: cargo, AUR, .deb, source</summary>
+<summary>Other ways: cargo, AUR, .deb, .zip, source</summary>
 
 ```bash
 cargo install synaps                        # crates.io, needs Rust 1.88+
 yay -S synaps                               # Arch / EndeavourOS
 
 # Debian/Ubuntu: a .deb is attached to every release
+# Windows: so is synaps-x86_64-pc-windows-msvc.zip
 # https://github.com/HaseebKhalid1507/SynapsCLI/releases/latest
 
 git clone https://github.com/HaseebKhalid1507/SynapsCLI && cd SynapsCLI
@@ -96,6 +105,7 @@ Local models: Synaps targets Ollama's default `http://localhost:11434/v1`. LM St
 - **Any model.** Claude, Codex, Grok, Copilot, Gemini, Kimi, [Meta Muse](docs/providers/muse.md), Azure, Bedrock, Vertex, any OpenAI-compatible endpoint, or Ollama.
 - **Credentials stay in the broker.** Agents get short-lived, scoped tokens, never your keys. Several accounts per provider. [More](docs/providers/multi-account-broker.md)
 - **Bounded turns, when you want them.** Optional caps on rounds, tool calls, time, tokens and cost.
+- **Long sessions stay cheap.** The prompt cache lasts an hour on a Claude subscription, large tool output waits on disk behind a short preview, re-reads of unchanged files are deduplicated, and workers roll their context over instead of filling the window.
 - **Memory that survives.** Project memory, `/compact` checkpoints, sessions that chain across days.
 - **Sees what you see.** The model reads images, and `/attach` adds images, PDFs and text to a turn. [More](docs/multimodal.md)
 - **Build on it.** Extensions in any language, MCP servers, and the engine over [JSON-RPC](docs/rpc-protocol.md) or WebSocket.
@@ -136,7 +146,6 @@ Method, tool versions, latency numbers, caveats and how to reproduce: [BENCHMARK
 - **The terminal is the IDE.** Built for people who already live there.
 
 **Not for you if:**
-- you're on Windows. It isn't supported.
 - you want an IDE plugin or a desktop app. Synaps is terminal-first.
 - you need a sandbox. Tools run as you; see [Security](#security).
 - you want a settled tool. Synaps is young and moves fast; read the [upgrade notes](docs/upgrading/) before upgrading.
@@ -147,7 +156,7 @@ Method, tool versions, latency numbers, caveats and how to reproduce: [BENCHMARK
 |---------|-------------|
 | `synaps` | The TUI, a thin client on the shared daemon (started on first launch) |
 | `synaps attach` | A line client attached to a daemon session |
-| `synaps daemon` | `status`, `sessions`, `pin`, `stop`, `reload` (swap the binary, sessions intact), `reload-extension` |
+| `synaps daemon` | `status`, `sessions`, `pin`, `rename`, `close`, `stop`, `reload` (swap the binary, sessions intact), `reload-extension` |
 | `synaps send` | Send a message to a running session from a script |
 | `synaps chat` | The same engine on stdin/stdout, for pipes, scripts and CI |
 | `synaps rpc` | JSON-RPC over stdio, to embed the engine in other software |
@@ -201,7 +210,7 @@ Each extension is its own crash-isolated process, with a permissions manifest th
 
 - **Credentials live in a broker.** Agents get short-lived, scoped tokens, so a compromised agent can't leak what it never held. Thin clients strip secrets from your shell's environment before connecting.
 - **Extensions are fenced.** Each runs as its own process under a permissions manifest, and a tool-call confirm names the extension that asked ([details](docs/confirm-prompts.md)).
-- **The daemon is yours alone.** Its socket is owner-only and refuses other users.
+- **The daemon is yours alone.** Its socket (a named pipe on Windows) is owner-only and refuses other users.
 - **Not a sandbox.** Tools run as you. Building with `--no-default-features` compiles out `bash` and the `shell_*` tools, but an agent can still start processes indirectly: by editing shell rc files or MCP config, or through extensions. Use a container or VM for untrusted work.
 
 Found a vulnerability? Report it privately: [SECURITY.md](SECURITY.md).

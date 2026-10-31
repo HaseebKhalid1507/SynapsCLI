@@ -62,6 +62,8 @@ password prompts other than sudo's. Full notes:
   flash windows and closing the terminal doesn't stop it. `daemon reload`
   hands the daemon lock straight to the new image (Windows has no
   `execv`), and `daemon stop --force` falls back to `taskkill /T /F`.
+  Session event pipes (`synaps send`) get the same owner-only DACL and
+  remote refusal, and `synaps send` refuses a pipe served by another user.
   Releases ship `synaps-x86_64-pc-windows-msvc.zip` and a PowerShell
   installer (`synaps-installer.ps1`). The `powershell` tool is built in;
   the `bash` tool uses Git Bash or WSL's `bash.exe` when it finds one.
@@ -69,7 +71,10 @@ password prompts other than sudo's. Full notes:
   keyboard layout no longer vanish, AltGr characters (`@ { \ €` on German
   and similar layouts) type instead of firing shortcuts, and `plugins.json`
   and `trust.json` save (a read-only handle can't be flushed there, os
-  error 5). (#277, #326, #328, by JR and Haseeb)
+  error 5). Known issue: the `grep`, `find` and `ls` tools still run the
+  Unix programs, which a stock Windows install lacks (and `find` can
+  resolve to Windows' own `find.exe`); the default Windows prompt steers
+  the agent to `powershell`. (#277, #326, #328, by JR and Haseeb)
 - **`multi_edit` tool** (#268, by JR; review fixes in this PR): anchored
   edits to up to 16 files in one call, all or nothing. Every edit is checked
   against in-memory copies first and nothing is written if any fails; files

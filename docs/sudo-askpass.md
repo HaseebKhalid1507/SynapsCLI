@@ -111,8 +111,8 @@ helper.
   `sudo -n`: a sudo that needs a password fails with "a password is
   required" and never asks. A macOS port would need `proc_pidinfo` for the
   credentials and ancestry, and sudo's argv for the prompt, which
-  `KERN_PROCARGS2` does not give to another effective uid; and it could not
-  be tested here, which is not a good place to be for this code.
+  `KERN_PROCARGS2` does not give to another effective uid; and it would
+  ship untested, which is not a good place to be for this code.
 - **Windows:** no sudo; unchanged.
 
 ## Testing it by hand
