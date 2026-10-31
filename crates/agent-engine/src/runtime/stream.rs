@@ -7874,6 +7874,95 @@ mod rich_output_tests {
                 assert_eq!(run.wire(body, id), run.result(id), "{id}");
             }
         }
+
+        /// `multi_edit` is a mutation like `write`/`edit`: its result gets
+        /// the no-need-to-re-read note, and a read after it is in full (the
+        /// file changed), never an "unchanged" stub of the pre-edit read.
+        #[tokio::test]
+        async fn a_multi_edit_rereads_in_full_and_says_no_reread_needed() {
+            let dir = tempfile::tempdir().unwrap();
+            let file = dir.path().join("a.py");
+            std::fs::write(&file, source(100, "v1")).unwrap();
+            let me = json!({"edits": [{
+                "path": file.to_string_lossy(), "op": "replace",
+                "anchor": "v1 line 0050", "text": "v2 line 0050",
+            }]});
+            let rounds = vec![
+                vec![("toolu_r1", "read", read(&file))],
+                vec![("toolu_m", "multi_edit", me)],
+                vec![("toolu_r2", "read", read(&file))],
+                vec![("toolu_r3", "read", read(&file))],
+            ];
+            let run = drive_rounds(go(), &rounds, true, |_| {}).await;
+
+            let r2 = run.text("toolu_r2");
+            assert!(r2.contains("50\tv2 line 0050"), "edited → full: {r2}");
+            assert!(!run.event("toolu_r2").deduped);
+            assert_eq!(run.result("toolu_r3"), Value::String(unchanged_stub("toolu_r2")));
+            let m = run.text("toolu_m");
+            assert!(m.starts_with("multi_edit: 1 file(s) written"), "{m}");
+            assert!(
+                m.ends_with(&format!("\n\n{}", crate::runtime::read_dedupe::MULTI_EDIT_NOTE)),
+                "{m}"
+            );
+        }
+
+        /// A `before_tool_call` hook that answers with a fixed result.
+        struct FixedHook(HookResult);
+        #[async_trait::async_trait]
+        impl crate::extensions::runtime::ExtensionHandler for FixedHook {
+            fn id(&self) -> &str {
+                "write-guard"
+            }
+            async fn handle(&self, _event: &HookEvent) -> HookResult {
+                self.0.clone()
+            }
+            async fn shutdown(&self) {}
+        }
+
+        /// A guard extension written for `edit`/`write` (a `tool` filter of
+        /// `edit` or `write`) also blocks or confirms `multi_edit`: through
+        /// the real tool path, a blocked call and an unanswerable confirm
+        /// leave the file untouched. A path outside the session's cwd gets
+        /// no special treatment, the same as `edit`/`write`.
+        #[tokio::test]
+        async fn an_edit_or_write_guard_hook_also_stops_multi_edit() {
+            for (filter, verdict, expect) in [
+                ("edit", HookResult::Block { reason: "no edits here".into() }, "no edits here"),
+                ("write", HookResult::confirm("write outside the repo?"), "requires confirmation"),
+            ] {
+                let cwd = tempfile::tempdir().unwrap();
+                let outside = tempfile::tempdir().unwrap();
+                let file = outside.path().join("a.txt");
+                std::fs::write(&file, "keep\n").unwrap();
+                let bus = Arc::new(crate::extensions::hooks::HookBus::new());
+                let mut perms = PermissionSet::new();
+                perms.grant(crate::extensions::permissions::Permission::ToolsIntercept);
+                bus.subscribe(
+                    HookKind::BeforeToolCall,
+                    Arc::new(FixedHook(verdict)),
+                    Some(filter.into()),
+                    None,
+                    perms,
+                )
+                .await
+                .unwrap();
+                let me = json!({"edits": [{
+                    "path": file.to_string_lossy(), "op": "append", "text": "pwned\n",
+                }]});
+                let rounds = vec![vec![("toolu_m", "multi_edit", me)]];
+                let cwd_path = cwd.path().to_path_buf();
+                let run = drive_rounds(go(), &rounds, true, move |s| {
+                    s.hook_bus = bus;
+                    s.cwd = Some(cwd_path);
+                    s.auto_approve_confirms = false;
+                })
+                .await;
+                assert_eq!(std::fs::read_to_string(&file).unwrap(), "keep\n", "{filter}");
+                let out = run.text("toolu_m");
+                assert!(out.contains(expect), "{filter}: {out}");
+            }
+        }
     }
 
     /// Tool-round keep-warm (`runtime::tool_keepwarm`) on the wire, against

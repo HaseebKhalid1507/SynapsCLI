@@ -210,6 +210,9 @@ struct FileEntry {
     identity: Option<(u64, u64)>,
     mode: Option<u32>,
     content: String,
+    /// The file's dominant line ending is CRLF (`plan::is_crlf` of the
+    /// original; a new file is LF).
+    crlf: bool,
     /// The "(created)" note was already shown for this new file.
     created_noted: bool,
 }
@@ -370,6 +373,7 @@ fn run(
                         .map_err(at)?;
                     read_bytes += content.len();
                     FileEntry {
+                        crlf: plan::is_crlf(&content),
                         display: spec.path.clone(),
                         target: target.clone(),
                         dir,
@@ -396,6 +400,7 @@ fn run(
                         original: None,
                         identity: None,
                         mode: None,
+                        crlf: false,
                         content: String::new(),
                         created_noted: false,
                     }
@@ -446,6 +451,7 @@ fn run(
             spec.occurrence,
             &text,
             guard.as_deref(),
+            entry.crlf,
         )
         .map_err(at)?;
         if entry.content.len() > MAX_FILE_BYTES {
@@ -583,7 +589,10 @@ impl Tool for MultiEditTool {
     }
 
     fn description(&self) -> &str {
-        "Anchored edits across one or more files. Every edit is checked in memory first; if any check fails, no file is written. If a write fails partway, files already written are restored where possible, and any that could not be are named. Each anchor must match exactly once (or give `occurrence`). Edits to one file apply in order. Returns one line per edit (file, op, lines as of that edit, bytes)."
+        // Every word here is sent with every request: keep it to what a
+        // caller needs (docs/multi-edit.md has the rest). The limits are
+        // checked against the constants by a test.
+        "Anchored edits across files in one call, all or nothing: if any edit fails, nothing is written. A file's edits apply in order. Each anchor must match exactly once unless occurrence is set. insert_*: text ending in a newline is inserted as lines before/after the anchor's line, other text at the anchor. append adds a missing final newline. In CRLF files, newlines in anchor/text are CRLF. Max 64 edits, 16 files, 16 MiB per file (64 MiB total), 1 MiB per field. UTF-8."
     }
 
     fn parameters(&self) -> Value {
@@ -592,26 +601,25 @@ impl Tool for MultiEditTool {
             "properties": {
                 "edits": {
                     "type": "array",
-                    "minItems": 1,
                     "maxItems": MAX_EDITS,
                     "items": {
                         "type": "object",
                         "properties": {
                             "path": {"type": "string"},
                             "op": {"type": "string", "enum": ["replace", "insert_before", "insert_after", "append", "append_jsonl"]},
-                            "anchor": {"type": "string", "description": "Text to find (replace/insert_*). Literal, never expanded."},
-                            "anchor_mode": {"type": "string", "enum": ["exact", "line_prefix", "line_regex"], "description": "exact (default): substring. line_prefix: lines starting with anchor. line_regex: regex per line; with one capture group only the group is the span."},
-                            "occurrence": {"type": "integer", "minimum": 1, "description": "Use the Nth match instead of requiring exactly one"},
-                            "text": {"type": "string", "description": "Inserted or replacement text, verbatim"},
-                            "value": {"type": "object", "description": "append_jsonl: the row object"},
-                            "timestamp_field": {"type": "string", "description": "append_jsonl: field set to the call's clock (ISO 8601, local)"},
-                            "unless_present": {"type": "string", "description": "Skip this edit if this text is already in the file"},
-                            "create": {"type": "boolean", "description": "append/append_jsonl: create the file if missing"}
+                            "anchor": {"type": "string"},
+                            "anchor_mode": {"type": "string", "enum": ["exact", "line_prefix", "line_regex"], "description": "exact (default): substring; line_prefix: line starts with it; line_regex: per-line regex, a capture group narrows the span"},
+                            "occurrence": {"type": "integer", "minimum": 1, "description": "Use the Nth match"},
+                            "text": {"type": "string"},
+                            "value": {"type": "object", "description": "append_jsonl row"},
+                            "timestamp_field": {"type": "string", "description": "append_jsonl: field set to now"},
+                            "unless_present": {"type": "string", "description": "Skip if the file contains it"},
+                            "create": {"type": "boolean", "description": "append*: create if missing"}
                         },
                         "required": ["path", "op"]
                     }
                 },
-                "placeholders": {"type": "boolean", "description": "Expand {{now:FMT}}, {{now_iso}}, {{mtime:FMT:/abs/path}}, {{mtime_iso:/abs/path}} in text, value strings and unless_present; one clock reading per call. {{{{ is a literal {{."}
+                "placeholders": {"type": "boolean", "description": "Expand {{now_iso}} {{now:FMT}} {{mtime_iso:/path}} {{mtime:FMT:/path}} in text/value/unless_present"}
             },
             "required": ["edits"]
         })

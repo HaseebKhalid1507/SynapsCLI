@@ -14,11 +14,6 @@ pub(crate) struct Match {
     pub start: usize,
     /// End of the matched span (exclusive).
     pub end: usize,
-    /// Offset just past the matched line's terminator (line_prefix only;
-    /// equals `end` for the other modes).
-    pub line_next: usize,
-    /// Whether the matched line ends with a terminator (line_prefix only).
-    pub terminated: bool,
 }
 
 /// What one edit did, for the per-edit result line.
@@ -96,12 +91,7 @@ pub(crate) fn find_matches(
                 };
                 let start = i + p;
                 let end = start + anchor.len();
-                out.push(Match {
-                    start,
-                    end,
-                    line_next: end,
-                    terminated: false,
-                });
+                out.push(Match { start, end });
                 let step = content[start..]
                     .chars()
                     .next()
@@ -111,14 +101,9 @@ pub(crate) fn find_matches(
             }
         }
         AnchorMode::LinePrefix => {
-            for (start, end, next, terminated) in lines(content) {
+            for (start, end, _, _) in lines(content) {
                 if content[start..end].starts_with(anchor) {
-                    out.push(Match {
-                        start,
-                        end,
-                        line_next: next,
-                        terminated,
-                    });
+                    out.push(Match { start, end });
                 }
             }
         }
@@ -142,8 +127,6 @@ pub(crate) fn find_matches(
                         out.push(Match {
                             start: start + m.start(),
                             end: start + m.end(),
-                            line_next: start + m.end(),
-                            terminated: false,
                         });
                     }
                 }
@@ -199,8 +182,45 @@ fn span_lines(content: &str, pos: usize, len: usize) -> (usize, usize) {
     (first, last)
 }
 
+/// Whether `content`'s dominant line ending is `\r\n`: more CRLF than bare
+/// LF terminators. A tie, or no newline at all, is LF.
+pub(crate) fn is_crlf(content: &str) -> bool {
+    let lf = content.matches('\n').count();
+    let crlf = content.matches("\r\n").count();
+    crlf > lf - crlf
+}
+
+/// `s` with every `\n` not already preceded by `\r` written as `\r\n`.
+pub(crate) fn to_crlf(s: &str) -> std::borrow::Cow<'_, str> {
+    if !s.contains('\n') {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    let mut out = String::with_capacity(s.len() + s.len() / 16);
+    let mut prev = '\0';
+    for c in s.chars() {
+        if c == '\n' && prev != '\r' {
+            out.push('\r');
+        }
+        out.push(c);
+        prev = c;
+    }
+    std::borrow::Cow::Owned(out)
+}
+
 /// Apply one edit to `content` in place. `text` is already expanded; for
 /// `append_jsonl` it is the compact row without its newline.
+///
+/// `crlf`: the file's dominant line ending is `\r\n` ([`is_crlf`]). Then a
+/// `\n` in `text`, an `exact` anchor and `unless_present` means `\r\n`, and
+/// every newline this function adds itself is `\r\n`.
+///
+/// `insert_before`/`insert_after`, every anchor mode: text that ends in a
+/// newline is whole lines, so it goes in at the start of the line where the
+/// match starts (before) or after the line where the match ends (after);
+/// other text goes right at the match (a `line_prefix` match is the line's
+/// content, so that is the line's start or end). `append` adds a missing
+/// final newline first unless the text starts with one.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn apply(
     content: &mut String,
     op: Op,
@@ -209,9 +229,19 @@ pub(crate) fn apply(
     occurrence: Option<u64>,
     text: &str,
     unless_present: Option<&str>,
+    crlf: bool,
 ) -> Result<Applied, String> {
+    let eol = if crlf { "\r\n" } else { "\n" };
+    let adapt = |s: &'_ str| -> String {
+        if crlf {
+            to_crlf(s).into_owned()
+        } else {
+            s.to_string()
+        }
+    };
     if let Some(guard) = unless_present {
-        if let Some(at) = content.find(guard) {
+        let guard = adapt(guard);
+        if let Some(at) = content.find(guard.as_str()) {
             // Report the line of the guard's first visible character, so
             // a guard written as "\n17. " points at the "17." line.
             let lead = guard.len() - guard.trim_start_matches(['\n', '\r']).len();
@@ -220,29 +250,52 @@ pub(crate) fn apply(
             });
         }
     }
+    let text = if op == Op::AppendJsonl { text.to_string() } else { adapt(text) };
+    let text = text.as_str();
     let mut note = None;
     let (pos, removed, added) = match op {
         Op::Replace | Op::InsertBefore | Op::InsertAfter => {
             let anchor = anchor.ok_or("anchor is required")?;
-            let matches = find_matches(content, anchor, mode)?;
+            let anchor = if mode == AnchorMode::Exact { adapt(anchor) } else { anchor.to_string() };
+            let matches = find_matches(content, &anchor, mode)?;
             let m = select(content, &matches, occurrence)?;
+            // Text ending in a newline is whole lines: it goes in at a line
+            // boundary, never mid-line. Other text goes right at the match.
+            let whole_lines = text.ends_with('\n');
             match op {
                 Op::Replace => {
                     content.replace_range(m.start..m.end, text);
                     (m.start, m.end - m.start, text.len())
                 }
                 Op::InsertBefore => {
-                    content.insert_str(m.start, text);
-                    (m.start, 0, text.len())
+                    let line_start = content[..m.start].rfind('\n').map_or(0, |i| i + 1);
+                    let at = if whole_lines && line_start != m.start {
+                        note = Some("text ends in a newline: inserted before the anchor's line");
+                        line_start
+                    } else {
+                        m.start
+                    };
+                    content.insert_str(at, text);
+                    (at, 0, text.len())
                 }
                 _ => {
-                    let at = if mode == AnchorMode::LinePrefix {
-                        if !m.terminated {
-                            content.insert(m.line_next, '\n');
-                            note = Some("added newline after the last line");
-                            m.line_next + 1
-                        } else {
-                            m.line_next
+                    // An anchor that ends with its own newline is already at a
+                    // boundary; an empty match (`^$`) is not.
+                    let at_boundary = m.end > m.start && content[..m.end].ends_with('\n');
+                    let at = if whole_lines && !at_boundary {
+                        match content[m.end..].find('\n') {
+                            // A line_prefix match always ends at its line's
+                            // end; say so only when it moved off mid-line.
+                            Some(i) if i == 0 || content[m.end..m.end + i] == *"\r" => m.end + i + 1,
+                            Some(i) => {
+                                note = Some("text ends in a newline: inserted after the anchor's line");
+                                m.end + i + 1
+                            }
+                            None => {
+                                content.push_str(eol);
+                                note = Some("added newline after the last line");
+                                content.len()
+                            }
                         }
                     } else {
                         m.end
@@ -253,19 +306,27 @@ pub(crate) fn apply(
             }
         }
         Op::Append => {
+            if !content.is_empty()
+                && !content.ends_with('\n')
+                && !text.starts_with('\n')
+                && !text.starts_with("\r\n")
+            {
+                content.push_str(eol);
+                note = Some("added missing newline before the text");
+            }
             let at = content.len();
             content.push_str(text);
             (at, 0, text.len())
         }
         Op::AppendJsonl => {
             if !content.is_empty() && !content.ends_with('\n') {
-                content.push('\n');
+                content.push_str(eol);
                 note = Some("added missing newline before the row");
             }
             let at = content.len();
             content.push_str(text);
-            content.push('\n');
-            (at, 0, text.len() + 1)
+            content.push_str(eol);
+            (at, 0, text.len() + eol.len())
         }
     };
     let (first_line, last_line) = span_lines(content, pos, added);
@@ -291,7 +352,7 @@ mod tests {
         text: &str,
     ) -> Result<(String, Applied), String> {
         let mut s = content.to_string();
-        let applied = apply(&mut s, op, mode, anchor, occurrence, text, None)?;
+        let applied = apply(&mut s, op, mode, anchor, occurrence, text, None, false)?;
         Ok((s, applied))
     }
 
@@ -424,13 +485,108 @@ mod tests {
     }
 
     #[test]
-    fn append_is_verbatim_and_jsonl_adds_a_missing_newline() {
-        let (out, _) = run("a", Op::Append, AnchorMode::Exact, None, None, "b").unwrap();
-        assert_eq!(out, "ab");
+    fn append_and_jsonl_add_a_missing_newline() {
+        let (out, applied) = run("a", Op::Append, AnchorMode::Exact, None, None, "b").unwrap();
+        assert_eq!(out, "a\nb");
+        assert!(matches!(applied, Applied::Edit { first_line: 2, note: Some(_), .. }));
+        // Text that starts with its own newline, an empty file and a
+        // terminated last line get nothing extra.
+        for (src, text, want) in [("a", "\nb", "a\nb"), ("", "b", "b"), ("a\n", "b", "a\nb")] {
+            let (out, applied) = run(src, Op::Append, AnchorMode::Exact, None, None, text).unwrap();
+            assert_eq!(out, want, "{src:?} + {text:?}");
+            assert!(matches!(applied, Applied::Edit { note: None, .. }), "{src:?} + {text:?}");
+        }
         let (out, applied) =
             run("{\"a\":1}", Op::AppendJsonl, AnchorMode::Exact, None, None, "{\"b\":2}").unwrap();
         assert_eq!(out, "{\"a\":1}\n{\"b\":2}\n");
         assert!(matches!(applied, Applied::Edit { first_line: 2, last_line: 2, note: Some(_), .. }));
+    }
+
+    /// Text that ends in a newline is whole lines in every anchor mode: it
+    /// lands at a line boundary, never glued into the anchor's line. Other
+    /// text goes right at the match.
+    #[test]
+    fn line_text_is_inserted_at_a_line_boundary_in_every_mode() {
+        let src = "line one\nline two\n";
+        let cases = [
+            (Op::InsertAfter, AnchorMode::Exact, "line one", "line one\nline 1.5\nline two\n"),
+            (Op::InsertAfter, AnchorMode::Exact, "one", "line one\nline 1.5\nline two\n"),
+            (Op::InsertAfter, AnchorMode::Exact, "ne o", "line one\nline 1.5\nline two\n"),
+            (Op::InsertAfter, AnchorMode::Exact, "line one\n", "line one\nline 1.5\nline two\n"),
+            (Op::InsertAfter, AnchorMode::LineRegex, "o(n)e", "line one\nline 1.5\nline two\n"),
+            (Op::InsertAfter, AnchorMode::LinePrefix, "line o", "line one\nline 1.5\nline two\n"),
+            (Op::InsertBefore, AnchorMode::Exact, "two", "line one\nline 1.5\nline two\n"),
+            (Op::InsertBefore, AnchorMode::LineRegex, "t(w)o", "line one\nline 1.5\nline two\n"),
+            (Op::InsertBefore, AnchorMode::LinePrefix, "line t", "line one\nline 1.5\nline two\n"),
+        ];
+        for (op, mode, anchor, want) in cases {
+            let (out, _) = run(src, op, mode, Some(anchor), None, "line 1.5\n").unwrap();
+            assert_eq!(out, want, "{op:?} {mode:?} {anchor:?}");
+        }
+        // An empty match (an empty line) is still a line to insert after.
+        let (out, _) =
+            run("a\n\nb\n", Op::InsertAfter, AnchorMode::LineRegex, Some("^$"), None, "x\n").unwrap();
+        assert_eq!(out, "a\n\nx\nb\n");
+        // Moving off mid-line is reported; landing where the anchor already
+        // ends a line is not.
+        let (_, applied) =
+            run(src, Op::InsertAfter, AnchorMode::Exact, Some("ne o"), None, "x\n").unwrap();
+        assert!(
+            matches!(applied, Applied::Edit { first_line: 2, note: Some(n), .. } if n.contains("after the anchor's line")),
+            "{applied:?}"
+        );
+        let (_, applied) =
+            run(src, Op::InsertAfter, AnchorMode::Exact, Some("line one"), None, "x\n").unwrap();
+        assert!(matches!(applied, Applied::Edit { first_line: 2, note: None, .. }), "{applied:?}");
+        // Inline text stays inline, in every mode.
+        let (out, _) = run(src, Op::InsertAfter, AnchorMode::Exact, Some("one"), None, "!").unwrap();
+        assert_eq!(out, "line one!\nline two\n");
+        let (out, _) =
+            run(src, Op::InsertAfter, AnchorMode::LinePrefix, Some("line o"), None, " (1)").unwrap();
+        assert_eq!(out, "line one (1)\nline two\n");
+        let (out, _) =
+            run(src, Op::InsertBefore, AnchorMode::LinePrefix, Some("line t"), None, "- ").unwrap();
+        assert_eq!(out, "line one\n- line two\n");
+    }
+
+    #[test]
+    fn crlf_is_detected_by_majority_and_converted_once() {
+        assert!(is_crlf("a\r\nb\r\nc\n"));
+        assert!(!is_crlf("a\r\nb\nc\n"), "a tie is LF");
+        assert!(!is_crlf("no newline") && !is_crlf(""));
+        assert_eq!(to_crlf("a\nb\r\nc\n"), "a\r\nb\r\nc\r\n");
+        assert!(matches!(to_crlf("abc"), std::borrow::Cow::Borrowed(_)));
+    }
+
+    /// In a CRLF file, `\n` in the text, an exact anchor and the guard means
+    /// `\r\n`, and every newline the edit adds is `\r\n`: no mixed endings.
+    #[test]
+    fn a_crlf_file_gets_crlf_everywhere_an_edit_writes_a_newline() {
+        let crlf = |src: &str, op, mode, anchor: Option<&str>, text: &str| {
+            let mut s = src.to_string();
+            let applied = apply(&mut s, op, mode, anchor, None, text, None, true).unwrap();
+            (s, applied)
+        };
+        let src = "a = 1\r\nother = 2\r\n";
+        let (out, _) = crlf(src, Op::InsertAfter, AnchorMode::LinePrefix, Some("other"), "added = 3\n");
+        assert_eq!(out, "a = 1\r\nother = 2\r\nadded = 3\r\n");
+        let (out, _) = crlf(src, Op::Replace, AnchorMode::Exact, Some("1\nother"), "10\nother");
+        assert_eq!(out, "a = 10\r\nother = 2\r\n");
+        let (out, _) = crlf("x\r\ny", Op::Append, AnchorMode::Exact, None, "z\n");
+        assert_eq!(out, "x\r\ny\r\nz\r\n");
+        let (out, _) = crlf("x\r\ny", Op::AppendJsonl, AnchorMode::Exact, None, "{}");
+        assert_eq!(out, "x\r\ny\r\n{}\r\n");
+        let (out, _) = crlf("x\r\nlast", Op::InsertAfter, AnchorMode::Exact, Some("last"), "n\n");
+        assert_eq!(out, "x\r\nlast\r\nn\r\n");
+        let mut s = src.to_string();
+        let skipped =
+            apply(&mut s, Op::Append, AnchorMode::Exact, None, None, "x", Some("1\nother"), true)
+                .unwrap();
+        assert_eq!(skipped, Applied::Skipped { line: 1 });
+        // An LF file is written as given.
+        let mut s = "a\n".to_string();
+        apply(&mut s, Op::Append, AnchorMode::Exact, None, None, "b\r\nc\n", None, false).unwrap();
+        assert_eq!(s, "a\nb\r\nc\n");
     }
 
     #[test]
@@ -444,6 +600,7 @@ mod tests {
             None,
             "x",
             Some("\n17. "),
+            false,
         )
         .unwrap();
         assert_eq!(applied, Applied::Skipped { line: 2 });

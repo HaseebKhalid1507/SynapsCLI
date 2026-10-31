@@ -116,7 +116,7 @@ impl Expander {
             return format_checked(&t, fmt).map_err(|e| format!("{{{{{token}}}}}: {e}"));
         }
         Err(format!(
-            "unknown placeholder {{{{{token}}}}} (known: now:FMT, now_iso, mtime:FMT:/path, mtime_iso:/path)"
+            "unknown placeholder {{{{{token}}}}} (known: now:FMT, now_iso, mtime:FMT:/path, mtime_iso:/path; write {{{{{{{{ for a literal {{{{)"
         ))
     }
 

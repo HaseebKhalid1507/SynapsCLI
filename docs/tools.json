@@ -527,7 +527,7 @@
     }
   },
   {
-    "description": "Anchored edits across one or more files. Every edit is checked in memory first; if any check fails, no file is written. If a write fails partway, files already written are restored where possible, and any that could not be are named. Each anchor must match exactly once (or give `occurrence`). Edits to one file apply in order. Returns one line per edit (file, op, lines as of that edit, bytes).",
+    "description": "Anchored edits across files in one call, all or nothing: if any edit fails, nothing is written. A file's edits apply in order. Each anchor must match exactly once unless occurrence is set. insert_*: text ending in a newline is inserted as lines before/after the anchor's line, other text at the anchor. append adds a missing final newline. In CRLF files, newlines in anchor/text are CRLF. Max 64 edits, 16 files, 16 MiB per file (64 MiB total), 1 MiB per field. UTF-8.",
     "name": "multi_edit",
     "parameters": {
       "properties": {
@@ -535,11 +535,10 @@
           "items": {
             "properties": {
               "anchor": {
-                "description": "Text to find (replace/insert_*). Literal, never expanded.",
                 "type": "string"
               },
               "anchor_mode": {
-                "description": "exact (default): substring. line_prefix: lines starting with anchor. line_regex: regex per line; with one capture group only the group is the span.",
+                "description": "exact (default): substring; line_prefix: line starts with it; line_regex: per-line regex, a capture group narrows the span",
                 "enum": [
                   "exact",
                   "line_prefix",
@@ -548,11 +547,11 @@
                 "type": "string"
               },
               "create": {
-                "description": "append/append_jsonl: create the file if missing",
+                "description": "append*: create if missing",
                 "type": "boolean"
               },
               "occurrence": {
-                "description": "Use the Nth match instead of requiring exactly one",
+                "description": "Use the Nth match",
                 "minimum": 1,
                 "type": "integer"
               },
@@ -570,19 +569,18 @@
                 "type": "string"
               },
               "text": {
-                "description": "Inserted or replacement text, verbatim",
                 "type": "string"
               },
               "timestamp_field": {
-                "description": "append_jsonl: field set to the call's clock (ISO 8601, local)",
+                "description": "append_jsonl: field set to now",
                 "type": "string"
               },
               "unless_present": {
-                "description": "Skip this edit if this text is already in the file",
+                "description": "Skip if the file contains it",
                 "type": "string"
               },
               "value": {
-                "description": "append_jsonl: the row object",
+                "description": "append_jsonl row",
                 "type": "object"
               }
             },
@@ -593,11 +591,10 @@
             "type": "object"
           },
           "maxItems": 64,
-          "minItems": 1,
           "type": "array"
         },
         "placeholders": {
-          "description": "Expand {{now:FMT}}, {{now_iso}}, {{mtime:FMT:/abs/path}}, {{mtime_iso:/abs/path}} in text, value strings and unless_present; one clock reading per call. {{{{ is a literal {{.",
+          "description": "Expand {{now_iso}} {{now:FMT}} {{mtime_iso:/path}} {{mtime:FMT:/path}} in text/value/unless_present",
           "type": "boolean"
         }
       },

@@ -6,6 +6,33 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **`multi_edit` tool** (#268, by JR; review fixes in this PR): anchored
+  edits to up to 16 files in one call, all or nothing. Every edit is checked
+  against in-memory copies first and nothing is written if any fails; files
+  are then published through verified directory handles, with best-effort
+  rollback. Ops `replace`, `insert_before`, `insert_after`, `append`,
+  `append_jsonl`; anchors `exact`, `line_prefix` or `line_regex`; each must
+  match once unless `occurrence` picks one; `unless_present` makes re-runs
+  no-ops; opt-in clock/mtime placeholders. On by default, in the
+  progressive-disclosure core next to `edit`, and on workers;
+  `disabled_tools = multi_edit` removes it everywhere. Final behaviour:
+  - `insert_before`/`insert_after` text that ends in a newline is whole
+    lines in every anchor mode: it lands before the anchor's line or after
+    it, never glued into it (`insert_after "line one"` + `"line 1.5\n"` used
+    to give `line oneline 1.5`). Other text goes right at the match.
+  - `append` adds a missing final newline first, like `append_jsonl`.
+  - A CRLF file stays CRLF: `\n` in `text`, an `exact` anchor and
+    `unless_present` means `\r\n` there, and so does every newline an edit
+    adds. LF files are written as given.
+  - The description states every hard limit (64 edits, 16 files, 16 MiB
+    per file, 64 MiB total, 1 MiB per field, UTF-8). Description and schema
+    were tightened from 747 to 671 tokens per request (Opus 5.5,
+    `count_tokens`).
+  - A `before_tool_call` hook filtered to `edit` or `write` also runs for
+    `multi_edit`, so existing write guards still block or confirm it.
+  - Read dedupe treats it like `edit`/`write` (a "no need to re-read" note;
+    a later read is compared against the new content). Its result is never
+    spilled. See [docs/multi-edit.md](docs/multi-edit.md).
 - **Smooth response start in the TUI.** Sending a message no longer shows
   `◇ thinking` for a moment, then nothing, then a block of text at once.
   The live `◇ thinking` header (with its timer, counting from the send)

@@ -53,14 +53,14 @@ impl ReadKey {
 pub(super) enum Shaping {
     /// A builtin `read`: may become an "unchanged" stub.
     Read(ReadKey),
-    /// A builtin `write` / `edit`: gets its no-need-to-re-read note.
+    /// A builtin `write` / `edit` / `multi_edit`: gets its no-need-to-re-read note.
     Mutation(&'static str),
 }
 
 impl Shaping {
     /// The shaping a call is eligible for, decided from its (post-hook)
     /// input before it runs. `None` when dedupe is off or the tool is not
-    /// the builtin `read` / `write` / `edit`. The caller must apply it only
+    /// the builtin `read` / `write` / `edit` / `multi_edit`. The caller must apply it only
     /// to a successful, plain-text, not-cancelled result.
     pub(super) fn for_call(
         enabled: bool,
@@ -76,6 +76,7 @@ impl Shaping {
             "read" => ReadKey::from_input(input, cwd).map(Shaping::Read),
             "write" => Some(Shaping::Mutation("write")),
             "edit" => Some(Shaping::Mutation("edit")),
+            "multi_edit" => Some(Shaping::Mutation("multi_edit")),
             _ => None,
         }
     }
@@ -198,12 +199,19 @@ pub(super) const WRITE_NOTE: &str =
 pub(super) const EDIT_NOTE: &str =
     "The edit was applied exactly as given; no need to re-read the file to verify.";
 
-/// Appends the write/edit note for builtin `write`/`edit` successes.
+/// One honest line appended to a successful `multi_edit` result. Its result
+/// already lists every edit, skip and newline/line-ending adjustment.
+pub(super) const MULTI_EDIT_NOTE: &str =
+    "Every edit above was applied as reported; no need to re-read the files to verify.";
+
+/// Appends the write/edit note for builtin `write`/`edit`/`multi_edit`
+/// successes.
 /// Returns `content` unchanged for every other tool.
 pub(super) fn with_mutation_note(runtime_name: &str, content: String) -> String {
     let note = match runtime_name {
         "write" => WRITE_NOTE,
         "edit" => EDIT_NOTE,
+        "multi_edit" => MULTI_EDIT_NOTE,
         _ => return content,
     };
     if content.is_empty() {
@@ -617,6 +625,22 @@ mod tests {
             ];
             assert_eq!(find(&messages, &[], &input, &text), None, "{text}");
         }
+    }
+
+    /// `multi_edit` changes files like `edit`/`write`, so it gets the same
+    /// treatment: a mutation note, never a read stub.
+    #[test]
+    fn multi_edit_is_a_mutation_with_its_own_note() {
+        let input = json!({"edits": [{"path": "a.rs", "op": "append", "text": "x"}]});
+        let builtin = crate::tools::ToolOrigin::Builtin;
+        assert_eq!(
+            Shaping::for_call(true, "multi_edit", &builtin, &input, Some(Path::new("/work"))),
+            Some(Shaping::Mutation("multi_edit"))
+        );
+        assert_eq!(
+            with_mutation_note("multi_edit", "multi_edit: 1 file(s) written".into()),
+            format!("multi_edit: 1 file(s) written\n\n{MULTI_EDIT_NOTE}")
+        );
     }
 
     #[test]

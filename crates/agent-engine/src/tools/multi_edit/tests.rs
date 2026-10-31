@@ -1295,3 +1295,93 @@ fn the_call_input_limit_is_checked_before_each_read() {
     );
     assert_eq!(reads.0, 4);
 }
+
+// Review of #268, gojo's footgun 1: an `exact` insert_after of a line lands
+// on its own line, not glued into the anchor's line.
+#[tokio::test]
+async fn insert_after_an_exact_anchor_inserts_whole_lines_after_its_line() {
+    let d = tmpdir();
+    let m = d.path().join("m.txt");
+    std::fs::write(&m, "line one\nline two\n").unwrap();
+    let out = call(json!({"edits": [
+        {"path": p(&m), "op": "insert_after", "anchor": "line one", "text": "line 1.5\n"}
+    ]}))
+    .await
+    .unwrap();
+    assert_eq!(std::fs::read_to_string(&m).unwrap(), "line one\nline 1.5\nline two\n");
+    assert!(out.contains("insert_after L2 +9 B"), "{out}");
+    // Mid-line anchor: moved to the line boundary, and the result says so.
+    let out = call(json!({"edits": [
+        {"path": p(&m), "op": "insert_before", "anchor": "two", "text": "line 1.75\n"}
+    ]}))
+    .await
+    .unwrap();
+    assert!(out.contains("inserted before the anchor's line"), "{out}");
+    assert_eq!(
+        std::fs::read_to_string(&m).unwrap(),
+        "line one\nline 1.5\nline 1.75\nline two\n"
+    );
+}
+
+// Footgun 2: `append` repairs a missing final newline like `append_jsonl`.
+#[tokio::test]
+async fn append_adds_the_missing_final_newline_and_says_so() {
+    let d = tmpdir();
+    let c = d.path().join("c.log");
+    std::fs::write(&c, "x\ny").unwrap();
+    let out = call(json!({"edits": [{"path": p(&c), "op": "append", "text": "z\n"}]}))
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read_to_string(&c).unwrap(), "x\ny\nz\n");
+    assert!(out.contains("added missing newline before the text"), "{out}");
+}
+
+// Footgun 3: a CRLF file stays CRLF; an LF anchor still matches it.
+#[tokio::test]
+async fn a_crlf_file_stays_crlf() {
+    let d = tmpdir();
+    let f = d.path().join("app.ini");
+    std::fs::write(&f, "[a]\r\nother = 2\r\n").unwrap();
+    let params = json!({"edits": [
+        {"path": p(&f), "op": "insert_after", "anchor": "other", "anchor_mode": "line_prefix",
+         "text": "added = 3\n", "unless_present": "added = 3\n"},
+        {"path": p(&f), "op": "replace", "anchor": "[a]\nother", "text": "[a]\n; note\nother"}
+    ]});
+    call(params.clone()).await.unwrap();
+    let want = "[a]\r\n; note\r\nother = 2\r\nadded = 3\r\n";
+    assert_eq!(std::fs::read_to_string(&f).unwrap(), want);
+    // The guard is read as CRLF too, so a re-run skips instead of doubling.
+    let again = call(json!({"edits": [params["edits"][0].clone()]})).await.unwrap();
+    assert!(again.contains("1 skipped"), "{again}");
+    assert_eq!(std::fs::read_to_string(&f).unwrap(), want);
+}
+
+// Footgun 4: every hard limit is in the description the model sees, and
+// matches the constant that enforces it.
+#[test]
+fn the_description_states_every_hard_limit() {
+    let desc = MultiEditTool.description();
+    const MIB: usize = 1024 * 1024;
+    for limit in [
+        format!("{MAX_EDITS} edits"),
+        format!("{MAX_FILES} files"),
+        format!("{} MiB per file", MAX_FILE_BYTES / MIB),
+        format!("{} MiB total", MAX_TOTAL_BYTES / MIB),
+        format!("{} MiB per field", MAX_TEXT_BYTES / MIB),
+        "UTF-8".to_string(),
+    ] {
+        assert!(desc.contains(&limit), "description lacks {limit:?}: {desc}");
+    }
+    assert_eq!(MultiEditTool.parameters()["properties"]["edits"]["maxItems"], json!(MAX_EDITS));
+}
+
+// Item 5: the schema is sent with every request. #268 shipped 1,824 bytes
+// (395 description + 1,429 compact JSON schema), 747 tokens on Opus 5.5
+// (`count_tokens`, against an `edit`-only baseline); the review cut it to
+// 1,536 bytes, 671 tokens. Growing it again should be a decision.
+#[test]
+fn the_schema_stays_compact() {
+    let tool = MultiEditTool;
+    let bytes = tool.description().len() + serde_json::to_string(&tool.parameters()).unwrap().len();
+    assert!(bytes <= 1_600, "multi_edit description + schema is {bytes} bytes");
+}
