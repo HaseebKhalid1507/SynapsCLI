@@ -101,7 +101,14 @@ pub(crate) fn turn_error_for(
 /// assistant message left with none is dropped whole).
 fn sanitation_keeps_block(block: &Value) -> bool {
     match block["type"].as_str() {
-        Some("thinking") => block["thinking"].as_str().is_some_and(|s| !s.is_empty()),
+        // Text, or an omitted-display block's signature alone (empty text,
+        // the reasoning in the signature): the API takes those back. One
+        // with neither is a 400 ("each thinking block must contain thinking").
+        Some("thinking") => {
+            block["thinking"].as_str().is_some_and(|s| !s.is_empty())
+                || (block["thinking"].is_string()
+                    && block["signature"].as_str().is_some_and(|s| !s.is_empty()))
+        }
         Some("redacted_thinking") => block["data"].as_str().is_some_and(|s| !s.is_empty()),
         Some("text") => block["text"].as_str().is_some_and(|s| !s.is_empty()),
         _ => true,
@@ -1110,12 +1117,13 @@ mod tests {
         );
     }
 
+    /// Empty text and no signature: the API's 400, so dropped.
     #[test]
     fn sanitize_drops_empty_thinking_blocks() {
         let mut msgs = vec![json!({
             "role": "assistant",
             "content": [
-                {"type": "thinking", "thinking": "", "signature": "sig1"},
+                {"type": "thinking", "thinking": "", "signature": ""},
                 {"type": "text", "text": "hello"},
             ]
         })];
@@ -1123,6 +1131,21 @@ mod tests {
         let content = msgs[0]["content"].as_array().unwrap();
         assert_eq!(content.len(), 1);
         assert_eq!(content[0]["type"], "text");
+    }
+
+    /// `display: "omitted"`: empty text, the reasoning in the signature.
+    /// Kept unchanged, the history's own `Arc` (nothing edited).
+    #[test]
+    fn sanitize_keeps_omitted_thinking_blocks_unchanged() {
+        let block = json!({"type": "thinking", "thinking": "", "signature": "sig1"});
+        let msg = Arc::new(json!({
+            "role": "assistant",
+            "content": [block.clone(), {"type": "tool_use", "id": "t", "name": "x", "input": {}}]
+        }));
+        let mut msgs = vec![Arc::clone(&msg)];
+        HelperMethods::sanitize_thinking_blocks(&mut msgs);
+        assert!(Arc::ptr_eq(&msgs[0], &msg), "untouched");
+        assert_eq!(msgs[0]["content"][0], block);
     }
 
     #[test]
@@ -1160,7 +1183,7 @@ mod tests {
             json!({
                 "role": "assistant",
                 "content": [
-                    {"type": "thinking", "thinking": "", "signature": "sig1"},
+                    {"type": "thinking", "thinking": "", "signature": ""},
                 ]
             }),
             json!({"role": "user", "content": "second"}),

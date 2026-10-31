@@ -1224,10 +1224,14 @@ impl TranscriptStore {
         if let Some(at) = at {
             self.note_day(at);
         }
+        // The placeholder's header counts from when it appeared; a real
+        // thought that replaces it keeps that clock (no jump back to 0s).
+        let thought = matches!(&msg, ChatMessage::Thinking(t) if t == THINKING_PLACEHOLDER)
+            .then(|| ThoughtClock::start(self.event_now()));
         self.messages.push(TimestampedMsg {
             msg,
             time: at.map(|at| at.format("%H:%M").to_string()).unwrap_or_default(),
-            thought: None,
+            thought,
         });
         // Auto-scroll only when pinned to bottom
         if self.scroll_pinned {
@@ -3035,11 +3039,16 @@ impl TranscriptStore {
             ..
         }) = self.messages.last_mut()
         {
-            // First real delta replaces the sentinel placeholder rather than
-            // appending to it (otherwise content reads "…​<thinking>").
+            // First delta replaces the sentinel placeholder rather than
+            // appending to it (otherwise content reads "…​<thinking>"), in
+            // place: the live header becomes the thought, its clock running
+            // on from the placeholder's. An empty delta makes it a thought
+            // with no text — `thinking_display = omitted` streams just that
+            // one — which stays the live header, then seals to a bare
+            // "thought for Ns" instead of vanishing.
             if existing == THINKING_PLACEHOLDER {
                 *existing = text.to_string();
-                *thought = Some(ThoughtClock::start(now));
+                thought.get_or_insert(ThoughtClock::start(now)).delta(now);
             } else {
                 existing.push_str(text);
                 // A block rebuilt from history has no clock: it stays
@@ -3059,11 +3068,13 @@ impl TranscriptStore {
     }
 
     /// The thinking step is over. Remove a trailing thinking block that never
-    /// received content — the sentinel placeholder, or one left empty — so
-    /// the thinking spinner can't run forever on an empty thinking step; or
-    /// seal a trailing real one, which stops its live header and fixes its
-    /// "thought for Ns". Called when the model starts producing real output
-    /// or the response/turn ends.
+    /// received content — the sentinel placeholder, or an untimed empty one —
+    /// so the thinking spinner can't run forever on an empty thinking step;
+    /// or seal a trailing real one, which stops its live header and fixes its
+    /// "thought for Ns". A timed empty one is real (an omitted-display
+    /// thought: the model thought, the API sent no text) and is sealed too.
+    /// Called when the model starts producing real output or the
+    /// response/turn ends.
     ///
     /// Scans backward past trailing System/Notice messages so a placeholder
     /// stranded mid-list (e.g. when a Notice arrives on top of it) is still
@@ -3078,7 +3089,8 @@ impl TranscriptStore {
             .rposition(|m| !matches!(&m.msg, ChatMessage::System(_)));
         if let Some(idx) = candidate_idx {
             if let ChatMessage::Thinking(t) = &self.messages[idx].msg {
-                if t == THINKING_PLACEHOLDER || t.is_empty() {
+                let untimed_empty = t.is_empty() && self.messages[idx].thought.is_none();
+                if t == THINKING_PLACEHOLDER || untimed_empty {
                     self.messages.remove(idx);
                     self.live_removed(idx);
                     self.anchor_remap_remove(idx);
@@ -3096,6 +3108,37 @@ impl TranscriptStore {
                     self.invalidate_from(idx);
                 }
             }
+        }
+    }
+
+    /// A provider response starts: seal (or drop, if empty) a thought the
+    /// previous response left, as [`Self::drop_empty_thinking`] does — but a
+    /// trailing placeholder stays. Nothing has streamed yet, and it is the
+    /// turn's live `thinking` header until the first thinking or agent text
+    /// replaces it.
+    ///
+    /// A placeholder that system lines (a retry notice) landed under moves
+    /// to the very end: the response then starts right after it, so a
+    /// `ResponseReset` restores it exactly (the rollback snapshot's `last`)
+    /// and removes everything the failed attempt streamed.
+    pub(crate) fn settle_thinking_for_response(&mut self) {
+        let tail = self
+            .messages
+            .iter()
+            .rposition(|m| !matches!(&m.msg, ChatMessage::System(_)));
+        let Some(idx) = tail.filter(|&i| {
+            matches!(&self.messages[i].msg, ChatMessage::Thinking(t) if t == THINKING_PLACEHOLDER)
+        }) else {
+            self.drop_empty_thinking();
+            return;
+        };
+        if idx + 1 < self.messages.len() {
+            let m = self.messages.remove(idx);
+            self.live_removed(idx);
+            self.anchor_remap_remove(idx);
+            self.messages.push(m);
+            self.live_note(self.messages.len() - 1);
+            self.invalidate_structural();
         }
     }
 

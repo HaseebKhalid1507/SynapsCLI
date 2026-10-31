@@ -685,6 +685,51 @@ impl ClientInput {
     }
 }
 
+/// What an Anthropic thinking block carries back (`thinking_display`), sent
+/// as the request's `thinking.display` on the foreground session's requests.
+///
+/// - `Summarized` (default): the model's thinking summary streams into the
+///   block. The API holds the answer back until that summary is written,
+///   then flushes the text it generated meanwhile in one burst.
+/// - `Omitted`: the block's `thinking` text is empty; its `signature` still
+///   carries the full reasoning, so history round-trips it unchanged. The
+///   answer starts streaming sooner and evenly (measured on Opus 5.5:
+///   first text 1.8–2.1 s vs 2.9–4.8 s at `high`, 7.9–9.0 s vs 11–12 s at
+///   `xhigh`), and the TUI shows only a timed `thought` header.
+///
+/// Workers and internal requests (compaction) always send `Summarized`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ThinkingDisplay {
+    #[default]
+    Summarized,
+    Omitted,
+}
+
+impl ThinkingDisplay {
+    /// `summarized` | `omitted` (case-insensitive).
+    pub fn parse(val: &str) -> Option<ThinkingDisplay> {
+        match val.trim().to_ascii_lowercase().as_str() {
+            "summarized" => Some(ThinkingDisplay::Summarized),
+            "omitted" => Some(ThinkingDisplay::Omitted),
+            _ => None,
+        }
+    }
+
+    /// The wire value of `thinking.display`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ThinkingDisplay::Summarized => "summarized",
+            ThinkingDisplay::Omitted => "omitted",
+        }
+    }
+}
+
+impl std::fmt::Display for ThinkingDisplay {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 impl std::fmt::Display for ClientInput {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
@@ -1465,6 +1510,9 @@ pub struct SynapsConfig {
     /// it at start, for every session it creates or restores. See
     /// [`ClientInput`].
     pub client_input: ClientInput,
+    /// `thinking_display`: `summarized` (default) | `omitted`. The
+    /// foreground session's `thinking.display`; see [`ThinkingDisplay`].
+    pub thinking_display: ThinkingDisplay,
     /// Max TUI redraw rate in frames/sec — caps streaming redraws (e.g. 60,
     /// 144, 240). User input always redraws immediately regardless. Default
     /// 60. Range 1–1000. The frame budget is `1000 / max_fps` ms.
@@ -1481,6 +1529,9 @@ pub struct SynapsConfig {
     pub tui_background_opaque: bool,
     /// Whether the prompt shows a glow sweeping across it while a turn streams. Default off.
     pub tui_streaming_glow: bool,
+    /// Whether the TUI reveals a burst of streamed text (a provider flushing
+    /// a backlog at once) over a few frames instead of in one. Default on.
+    pub tui_smooth_streaming: bool,
     /// Run the daemon, bash tool commands and PTY shells each in their own
     /// systemd scope (Linux, when a systemd user manager is reachable), so the
     /// out-of-memory killer can stop one runaway command instead of the whole
@@ -1589,12 +1640,14 @@ impl Default for SynapsConfig {
             request_compression: RequestCompressionMode::Auto,
             request_compression_level: DEFAULT_REQUEST_COMPRESSION_LEVEL,
             client_input: ClientInput::Shared,
+            thinking_display: ThinkingDisplay::Summarized,
             max_fps: 60,
             scroll_lines: None,
             theme: None,
             theme_transition: ThemeTransitionMode::default(),
             tui_background_opaque: true,
             tui_streaming_glow: false,
+            tui_smooth_streaming: true,
             process_scopes: true,
             tool_scope_slice: None,
             daemon_scope_slice: None,
@@ -1718,12 +1771,14 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "request_compression",
     "request_compression_level",
     "client_input",
+    "thinking_display",
     "max_fps",
     "scroll_lines",
     "theme",
     "theme_transition",
     "tui_background_opaque",
     "tui_streaming_glow",
+    "tui_smooth_streaming",
     "process_scopes",
     "tool_scope_slice",
     "daemon_scope_slice",
@@ -2340,6 +2395,12 @@ fn apply_config_content_with(
                     "cache_keepwarm = {val} — expected off, auto, or 1h–{MAX_CACHE_KEEPWARM_HOURS}h; keep-warm stays off"
                 )),
             },
+            "thinking_display" => match ThinkingDisplay::parse(val) {
+                Some(display) => config.thinking_display = display,
+                None => config.warnings.push(format!(
+                    "thinking_display = {val} — expected summarized or omitted; using summarized"
+                )),
+            },
             "client_input" => match ClientInput::parse(val) {
                 Some(mode) => config.client_input = mode,
                 None => config.warnings.push(format!(
@@ -2435,6 +2496,13 @@ fn apply_config_content_with(
                 "false" | "0" | "off" | "no" => config.tui_streaming_glow = false,
                 _ => config.warnings.push(format!(
                     "tui_streaming_glow = {val} — expected on or off; using off"
+                )),
+            },
+            "tui_smooth_streaming" => match val {
+                "true" | "1" | "on" | "yes" => config.tui_smooth_streaming = true,
+                "false" | "0" | "off" | "no" => config.tui_smooth_streaming = false,
+                _ => config.warnings.push(format!(
+                    "tui_smooth_streaming = {val} — expected on or off; using on"
                 )),
             },
             "process_scopes" => match val {
@@ -3636,6 +3704,37 @@ mod tests {
             assess_context(&config.context_management, &state, budget).action,
             ContextAction::Rollover
         );
+    }
+
+    #[test]
+    fn thinking_display_defaults_summarized_and_parses() {
+        use super::ThinkingDisplay;
+        assert_eq!(super::load_config_from_str("").thinking_display, ThinkingDisplay::Summarized);
+        assert_eq!(
+            super::load_config_from_str("thinking_display = omitted\n").thinking_display,
+            ThinkingDisplay::Omitted
+        );
+        assert_eq!(
+            super::load_config_from_str("thinking_display = Summarized\n").thinking_display,
+            ThinkingDisplay::Summarized
+        );
+        let invalid = super::load_config_from_str("thinking_display = raw\n");
+        assert_eq!(invalid.thinking_display, ThinkingDisplay::Summarized, "invalid keeps the default");
+        assert!(invalid.warnings.iter().any(|w| w.contains("thinking_display")));
+        assert_eq!(ThinkingDisplay::Omitted.as_str(), "omitted");
+    }
+
+    #[test]
+    fn tui_smooth_streaming_defaults_on_and_parses() {
+        assert!(super::load_config_from_str("").tui_smooth_streaming);
+        assert!(!super::load_config_from_str("tui_smooth_streaming = off\n").tui_smooth_streaming);
+        assert!(super::load_config_from_str("tui_smooth_streaming = on\n").tui_smooth_streaming);
+        let invalid = super::load_config_from_str("tui_smooth_streaming = jerky\n");
+        assert!(invalid.tui_smooth_streaming, "invalid keeps the default (on)");
+        assert!(invalid
+            .warnings
+            .iter()
+            .any(|w| w.contains("tui_smooth_streaming")));
     }
 
     #[test]

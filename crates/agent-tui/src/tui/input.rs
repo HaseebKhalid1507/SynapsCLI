@@ -109,6 +109,14 @@ pub(super) fn handle_event(
         }
     }
 
+    // Smooth streaming: scroll, Ctrl+O, Esc, a click or drag act on the whole
+    // transcript — show what is still queued first (typing does not).
+    if app.modal_stack.top() == super::focus::PaneId::Chat
+        && super::stream_handler::reveal::input_flushes(&event)
+    {
+        app.flush_reveal();
+    }
+
     // P7.8: stack-driven routing — one arm per pane, no fall-through chain.
     // `Chat` (empty stack) is the base pane; every modal + the folded-in
     // SecretPrompt has its own handler. The match is exhaustive over `PaneId`.

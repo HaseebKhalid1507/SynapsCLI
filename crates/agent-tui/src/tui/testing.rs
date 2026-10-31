@@ -188,6 +188,10 @@ impl TestHarness {
         app.header_folder = "~/Projects/SynapsCLI".to_string();
         // Skip the boot animation; a fixed frame beats a time-parametric one.
         app.logo_build_t = None;
+        // Determinism: `tui_smooth_streaming` comes from the user config.
+        // Off (every delta paints as it arrives) unless a test opts in with
+        // [`TestHarness::set_smooth_streaming`].
+        app.smooth_streaming = false;
 
         let backend = TestBackend::new(cols, rows);
         let terminal = Terminal::with_options(
@@ -378,6 +382,9 @@ impl TestHarness {
     /// maintenance), then draw it with the production frame body. Returns
     /// the rendered [`Buffer`] for cell-level assertions.
     pub fn render(&mut self) -> &Buffer {
+        // The run loop releases what smooth streaming has due right before
+        // it builds a frame; so does the harness (a no-op when off).
+        self.app.advance_reveal();
         let (model, patch) = build_render_model(
             &mut super::view_model::ViewInputs::from_app(&mut self.app),
             &**self.link.view(),
@@ -1067,6 +1074,17 @@ impl TestHarness {
     /// Advance the injectable [`TuiClock`] by `ms` milliseconds. Under the
     /// harness the clock is frozen at boot, so time-dependent state (toast
     /// expiry, tool timers) only moves when the test calls this.
+    /// `tui_smooth_streaming` (the harness boots with it off).
+    pub fn set_smooth_streaming(&mut self, on: bool) -> &mut Self {
+        self.app.set_smooth_streaming(on);
+        self
+    }
+
+    /// Chars of streamed text smooth streaming has not shown yet.
+    pub fn reveal_backlog(&self) -> usize {
+        self.app.reveal.backlog()
+    }
+
     pub fn advance_clock_ms(&mut self, ms: u64) -> &mut Self {
         self.app.clock.advance(std::time::Duration::from_millis(ms));
         self

@@ -6,6 +6,37 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Smooth response start in the TUI.** Sending a message no longer shows
+  `◇ thinking` for a moment, then nothing, then a block of text at once.
+  The live `◇ thinking` header (with its timer, counting from the send)
+  now stays from the send until the first thinking or agent text. It is no
+  longer dropped when the provider response starts. It turns into the
+  thought in place, or gives way to the agent text in the same frame.
+  When a provider flushes a burst of text at once (summarized thinking
+  holds the answer back until its summary is written, then sends a
+  kilobyte in one instant), the TUI reveals it over a few frames. The pace
+  is about normal streaming speed, faster the more is queued. A 1 KB burst
+  takes ~0.4 s, and nothing waits more than 0.5 s. Thinking that arrives
+  with the answer reads in first. Turn end, abort, tool calls, any other
+  session event, scroll/Ctrl+O/Esc/click input, a session switch and
+  turning the setting off show everything queued at once, so the
+  transcript is never truncated or reordered. Settings → Appearance →
+  "Smooth streaming" (`tui_smooth_streaming`, default on; off = text paints
+  as it arrives, as before).
+- **`thinking_display = summarized | omitted`.** Sets the foreground
+  session's Anthropic `thinking.display`. `summarized` (default) is the
+  behaviour so far. `omitted` streams no thinking text. The reply starts
+  sooner and evenly (measured on Opus 5.5: first text 1.8–2.1 s vs
+  2.9–4.8 s at `high`, 7.9–9.0 s vs 11–12 s at `xhigh`), and the TUI shows
+  a timed `◇ thinking` header that seals to `◇ thought for 8s`. Thinking
+  effort is unchanged. Each thinking block's signature still carries the
+  full reasoning and goes back with the history unchanged. Switching keeps
+  the prompt cache (measured: the cached prefix read in full across
+  summarized ↔ omitted). Applies to new sessions. Workers, keep-warm pings
+  of worker rounds and compaction always send `summarized`: a worker's
+  thinking summaries are its record in `/watch` and its archived
+  transcripts. Settings → Model → "Thinking display".
+
 - **Tool output virtualisation.** A big tool result no longer rides every
   later request in full. When a text result of `bash`, `grep`, `find`,
   `ls`, the shell and subagent tools, or an MCP/extension/plugin tool is
@@ -239,7 +270,14 @@ All notable changes to this project will be documented in this file.
   with a Git older than 2.31 says it needs 2.31 instead of failing on a
   "relative path". Linux and Windows run `git` from `PATH` as before.
   (#343, by @JR-Morton)
-
+- **Thinking blocks with empty text but a signature are kept in history.**
+  The stream parser and the request sanitizer dropped any thinking block
+  with empty text. That is every block under `display: "omitted"`, and
+  any summarized-mode progress update the model wrote no summary for. The
+  block's reasoning was lost from the next request, and a tool loop sent
+  its turn with thinking blocks partially dropped. Now only a block with
+  neither text nor signature is dropped (the one the API rejects with
+  "each thinking block must contain thinking", verified live).
 - **A closed session or stopped quota keeper frees its lock at once.**
   Session journal locks and quota-keeper locks were released by closing the
   lock file. A `flock` belongs to the open file, and a process that a

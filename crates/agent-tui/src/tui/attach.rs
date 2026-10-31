@@ -580,6 +580,8 @@ pub async fn run_attached(mut opts: AttachOpts) -> Result<()> {
         )
         .await;
     }
+    // The replayed partial turn is history: shown whole, not paced in.
+    ctx.app.flush_reveal();
     for pr in pending {
         ctx.prompt_bridge.on_prompt(pr);
     }

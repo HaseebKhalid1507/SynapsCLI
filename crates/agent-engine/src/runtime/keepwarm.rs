@@ -689,6 +689,8 @@ impl Runtime {
             request_compression: self.request_compression.clone(),
             anthropic_execution_plan,
             codex_request_role: self.codex_request_role(),
+            // The turns' own `thinking` object: the ping's prefix is theirs.
+            thinking_display: self.wire_thinking_display(),
             retention_frontier: round_images.applied_frontier(),
             // The base context: a ping must never consume `/trace next`.
             trace: self.trace_ctx.clone(),

@@ -201,6 +201,14 @@ define_settings! {
             }
         };
 
+    "thinking_display", "Thinking display", Model,
+        EditorKind::Cycler(&["summarized", "omitted"]),
+        "What Anthropic sends of the model's thinking. summarized (default): the thought's summary streams in, and the reply waits for it, then lands in a burst. omitted: no thinking text, just a timed 'thought' line, and the reply starts sooner and streams evenly (measured on Opus 5.5: ~2 s vs 3–5 s at high effort). Thinking effort is unchanged, and the reasoning still carries over between turns. Switching keeps the prompt cache. Applies to new sessions; workers always send summarized.",
+        |_app, value| match value {
+            "summarized" | "omitted" => config_edit("thinking_display", value),
+            _ => SettingApply::Local(Err("expected summarized or omitted".to_string())),
+        };
+
     "reasoning_type", "Reasoning", Model,
         EditorKind::Display,
         "How the active model expresses reasoning depth (derived from exact model capabilities; read-only).",
@@ -335,6 +343,17 @@ define_settings! {
                 _ => return SettingApply::Local(Err("expected on or off".to_string())),
             }
             SettingApply::Local(Ok(()))
+        };
+
+    "tui_smooth_streaming", "Smooth streaming", Appearance, EditorKind::Cycler(&["on", "off"]),
+        "When a reply's text arrives in a burst (the provider flushing a backlog at once), reveal it over a few frames instead of in one, catching up within half a second (default on). Off = text paints as it arrives.",
+        |app, value| {
+            match value {
+                "on" => app.set_smooth_streaming(true),
+                "off" => app.set_smooth_streaming(false),
+                _ => return SettingApply::Local(Err("expected on or off".to_string())),
+            }
+            on_off("tui_smooth_streaming", value)
         };
 
     "theme_transition", "Theme transition", Appearance, EditorKind::Cycler(&["on", "off"]),
@@ -1284,6 +1303,9 @@ mod tests {
             assert!(is_ok(d("cache_keepwarm_headless", "off")));
             assert!(is_ok(d("cache_keepwarm_tools", "off")));
             assert!(is_ok(d("cache_keepwarm_tools", "on")));
+            assert!(is_ok(d("thinking_display", "omitted")));
+            assert!(is_ok(d("thinking_display", "summarized")));
+            assert!(is_err(d("thinking_display", "raw")));
             assert!(is_ok(d("context_management.pressure_tokens", "auto")));
             assert!(is_ok(d("context_management.pressure_tokens", "120000")));
             assert!(is_err(d("context_management.pressure_tokens", "lots")));
