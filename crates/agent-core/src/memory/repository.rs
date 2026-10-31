@@ -152,11 +152,24 @@ fn git_output(_: &Path, _: &[&str]) -> Result<Option<Vec<u8>>, MemoryError> {
     ))
 }
 
-/// No developer Git (macOS without the Command Line Tools) fails exactly as a
-/// `git` missing from `PATH` does: the error of a spawn that finds no program.
+/// No Git at all (macOS: none on `PATH`, no Command Line Tools) says so and
+/// what to do, instead of a bare "No such file or directory".
 #[cfg(unix)]
-fn git_unavailable(_: crate::git_program::GitUnavailable) -> std::io::Error {
-    std::io::Error::from_raw_os_error(libc::ENOENT)
+fn git_unavailable(e: crate::git_program::GitUnavailable) -> MemoryError {
+    MemoryError::Io(e.to_string())
+}
+
+/// Git before 2.31 has no `rev-parse --path-format`: it echoes the unknown
+/// option as a first output line instead of failing, and prints
+/// `--git-common-dir` relative. Say so instead of "relative path". (The
+/// batched rev-parse needs no check: the extra line sends it to `git_path`.)
+fn require_path_format(bytes: &[u8]) -> Result<&[u8], MemoryError> {
+    if bytes.starts_with(b"--path-format=absolute\n") {
+        return Err(invalid(
+            "Git 2.31 or newer is required (this git has no `rev-parse --path-format`)",
+        ));
+    }
+    Ok(bytes)
 }
 
 /// `Ok(None)`: Git exited unsuccessfully (the direct child is already reaped).
@@ -296,7 +309,7 @@ fn absolute_path(bytes: &[u8]) -> Result<PathBuf, MemoryError> {
 
 fn git_path(root: &Path, arg: &str) -> Result<PathBuf, MemoryError> {
     let bytes = git(root, &["rev-parse", "--path-format=absolute", arg])?;
-    let bytes = bytes
+    let bytes = require_path_format(&bytes)?
         .strip_suffix(b"\n")
         .ok_or_else(|| invalid("invalid Git path output"))?;
     absolute_path(bytes)
@@ -836,18 +849,24 @@ mod tests {
     }
 
     #[test]
-    #[serial(process_spawn)]
-    fn unavailable_git_fails_like_a_missing_git() {
-        let missing = Command::new("/nonexistent/synaps-test/git")
-            .spawn()
-            .unwrap_err();
-        let unavailable = git_unavailable(crate::git_program::GitUnavailable);
-        let (MemoryError::Io(missing), MemoryError::Io(unavailable)) =
-            (MemoryError::from(missing), MemoryError::from(unavailable))
-        else {
-            panic!("both must be MemoryError::Io");
-        };
-        assert_eq!(missing, unavailable);
+    fn unavailable_git_names_the_fix() {
+        let message = git_unavailable(crate::git_program::GitUnavailable).to_string();
+        assert!(message.contains("git unavailable"), "{message}");
+        assert!(message.contains("xcode-select --install"), "{message}");
+    }
+
+    #[test]
+    fn git_without_path_format_is_named() {
+        // What Git 2.30 prints for `rev-parse --path-format=absolute
+        // --show-toplevel --absolute-git-dir --git-common-dir`.
+        let old = b"--path-format=absolute\n/r\n/r/.git\n.git\n";
+        let message = require_path_format(old).unwrap_err().to_string();
+        assert!(
+            message.contains("Git 2.31 or newer is required"),
+            "{message}"
+        );
+        let new = b"/r\n/r/.git\n/r/.git\n";
+        assert_eq!(require_path_format(new).unwrap(), new);
     }
 
     #[test]

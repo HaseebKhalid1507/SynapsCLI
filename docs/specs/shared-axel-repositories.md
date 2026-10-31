@@ -84,15 +84,30 @@ selected brain and reports canonical/member scopes. A changed identity does not
 silently search old JSONL or old plugin databases.
 
 On macOS, `/usr/bin/git` is Apple's `xcrun` shim: without the Command Line
-Tools, running it opens the "install developer tools" dialog. Synaps (host and
-Axel service alike) never runs it and never looks Git up on `PATH` there. It runs
-`<dir>/usr/bin/git` by absolute path from the first of these that has one:
+Tools, running it opens the "install developer tools" dialog. Synaps never runs
+it; it runs Git by absolute path. A developer Git is `<dir>/usr/bin/git` (or
+`<dir>/Contents/Developer/usr/bin/git`, for a `.app` bundle) from the first of
 `DEVELOPER_DIR` (if absolute), the `xcode-select` choice
-(`/var/db/xcode_select_link`), then `/Library/Developer/CommandLineTools`. With
-none, Git is unavailable: repository identity for a Git checkout fails closed
-(no path-scope fallback), and plugin install, update and update checks refuse
-with a request to run `xcode-select --install`. Other platforms run `git` from
-`PATH` as before.
+(`/var/db/xcode_select_link`), `/Applications/Xcode.app/Contents/Developer`,
+then `/Library/Developer/CommandLineTools`. Host and Axel service deliberately
+choose differently:
+
+- The host runs the first executable `git` in an absolute `PATH` directory, so
+  Homebrew, Nix and MacPorts Git keep working. Where `PATH` reaches the shim it
+  runs the developer Git the shim would run, or skips the shim if there is
+  none; with no Git on `PATH` it falls back to the developer Git.
+- The service never looks at `PATH`. The host starts it with an empty
+  environment (no `DEVELOPER_DIR` either), so it runs the developer Git the
+  shim would pick with no environment: the `xcode-select` choice, Xcode, then
+  the Command Line Tools.
+
+They may therefore run different Gits; both only run read-only
+`rev-parse --path-format=absolute` (Git 2.31 or newer; an older host Git is
+reported as such), and a service Git that cannot read the repository fails
+closed. With no Git, repository identity for a Git checkout fails closed (no
+path-scope fallback) with `git unavailable: run xcode-select --install`, and
+plugin install, update and update checks refuse with the same request. Other
+platforms run `git` from `PATH` as before.
 
 ## One database, bounded access
 
