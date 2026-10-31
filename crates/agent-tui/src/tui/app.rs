@@ -499,7 +499,9 @@ impl App {
             activity: super::header::Activity::Idle,
             tools_in_flight: 0,
             turn_started: None,
-            header_epoch: std::time::Instant::now(),
+            // The injected clock, as `header_snap` reads it: a frozen
+            // harness clock must not sweep by how long boot took.
+            header_epoch: clock.now(),
             header_folder: super::header::current_folder(),
             observing: false,
             attached_clients: 0,

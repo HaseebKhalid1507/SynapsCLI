@@ -854,7 +854,7 @@ mod tests {
         let clock = super::super::clock::TuiClock::test();
         clock.advance(Duration::from_secs(7200));
         let mut threads = super::super::threads::Threads::default();
-        let w = threads.open_worker("sa_1", 1, "scout", clock, (0, 0));
+        let w = threads.open_worker("sa_1", 1, "scout", clock.clone(), (0, 0));
         let mut p = page(
             "sa_1",
             "running",
@@ -867,9 +867,9 @@ mod tests {
         p.now_ms = Some(90 * 60 * 1000);
         apply_page(w, p, Instant::now());
         let stamped = &w.store.messages()[0].time;
-        let then = chrono::Local::now() - chrono::Duration::minutes(90);
-        let ok = [then, then - chrono::Duration::minutes(1)].map(|t| t.format("%H:%M").to_string());
-        assert!(ok.contains(stamped), "{stamped} vs {ok:?}");
+        // The store's wall clock is the frozen test clock's: exact.
+        let then = clock.wall_now() - chrono::Duration::minutes(90);
+        assert_eq!(stamped, &then.format("%H:%M").to_string());
     }
 
     fn text(t: &str) -> WatchEvent {
