@@ -245,6 +245,20 @@ impl<'a> RequestBody<'a> {
         h.0
     }
 
+    /// Send `thinking.display = display` (`thinking_display`). Summarized
+    /// leaves the body as built, byte for byte; a body without `thinking`
+    /// (reasoning off) stays without it.
+    pub(super) fn set_thinking_display(&mut self, display: crate::config::ThinkingDisplay) {
+        if display == crate::config::ThinkingDisplay::Summarized {
+            return;
+        }
+        if let Some(thinking) = self.thinking.as_mut().and_then(Value::as_object_mut) {
+            if thinking.contains_key("display") {
+                thinking.insert("display".to_string(), Value::from(display.as_str()));
+            }
+        }
+    }
+
     /// Opt this request into Anthropic cache diagnostics.
     pub(super) fn set_diagnostics(
         &mut self,
@@ -694,6 +708,45 @@ mod anthropic_reasoning_body_tests {
             assert_eq!(value["thinking"]["type"], "adaptive");
             assert!(!serde_json::to_string(&value).unwrap().contains("ultracode"));
         }
+    }
+
+    /// `thinking_display`: omitted swaps only the `display` value, on both
+    /// wire shapes; summarized leaves the body byte for byte; a body with no
+    /// `thinking` (reasoning off) gains none.
+    #[test]
+    fn thinking_display_sets_only_the_display_value() {
+        use crate::config::ThinkingDisplay;
+        let messages: Vec<crate::SharedMessage> =
+            vec![Arc::new(json!({"role": "user", "content": "hi"}))];
+        let build = |model, level, display| {
+            let mut body = RequestBody::new(
+                model, &messages, &[], &[], &None, "api_key", 8192, level, None,
+                CacheTtl::FiveMinutes, true,
+            );
+            body.set_thinking_display(display);
+            serde_json::to_vec(&body).unwrap()
+        };
+        for (model, level) in [
+            (ADAPTIVE_MODEL, ReasoningLevel::High),
+            (FIXED_MODEL, ReasoningLevel::High),
+        ] {
+            let summarized = build(model, level, ThinkingDisplay::Summarized);
+            let plain = serde_json::to_vec(&RequestBody::new(
+                model, &messages, &[], &[], &None, "api_key", 8192, level, None,
+                CacheTtl::FiveMinutes, true,
+            ))
+            .unwrap();
+            assert_eq!(summarized, plain, "{model}: summarized = the body as built");
+            let omitted = String::from_utf8(build(model, level, ThinkingDisplay::Omitted)).unwrap();
+            let expected = String::from_utf8(plain)
+                .unwrap()
+                .replacen(r#""display":"summarized""#, r#""display":"omitted""#, 1);
+            assert_eq!(omitted, expected, "{model}");
+            assert!(!omitted.contains("summarized"), "{model}");
+        }
+        let off = build(ADAPTIVE_MODEL, ReasoningLevel::Off, ThinkingDisplay::Omitted);
+        let v: serde_json::Value = serde_json::from_slice(&off).unwrap();
+        assert!(v.get("thinking").is_none());
     }
 
     /// Fixed-budget models keep enabled+budget_tokens exactly and must never

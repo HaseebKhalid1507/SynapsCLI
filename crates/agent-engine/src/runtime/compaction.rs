@@ -209,7 +209,11 @@ pub fn render_compaction_input(
                                 if policy.excludes(ContentClass::Thinking) {
                                     continue;
                                 }
-                                if let Some(text) = block["thinking"].as_str() {
+                                // An omitted-display block has no text to
+                                // summarize (its reasoning is the signature).
+                                if let Some(text) =
+                                    block["thinking"].as_str().filter(|t| !t.is_empty())
+                                {
                                     present.insert(ContentClass::Thinking);
                                     let preview: String = text.chars().take(500).collect();
                                     parts.push(format!("[Assistant thinking]: {}", preview));

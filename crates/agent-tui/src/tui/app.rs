@@ -390,6 +390,12 @@ pub(crate) struct App {
     /// Injectable clock (P6.2). Real in production, Test in the harness so
     /// time-dependent state (toast expiry, tool timers) stays deterministic.
     pub(crate) clock: super::clock::TuiClock,
+    /// Streamed text not shown yet: a burst is revealed over a few frames
+    /// (`stream_handler::reveal`).
+    pub(crate) reveal: super::stream_handler::reveal::Reveal,
+    /// `tui_smooth_streaming` (Settings → Appearance): pace bursts through
+    /// [`Self::reveal`]; off = every delta paints as it arrives.
+    pub(crate) smooth_streaming: bool,
     /// Neon-prompt timing: input/stream events → per-frame animation
     /// snapshot. Its `animating()` is one of the tick guard's terms.
     pub(crate) prompt_clock: super::neon_prompt::PromptClock,
@@ -565,6 +571,8 @@ impl App {
             keybinds: None,
             response_preview: None,
             prompt_clock: super::neon_prompt::PromptClock::new(clock.now()),
+            reveal: Default::default(),
+            smooth_streaming: boot_config.tui_smooth_streaming,
             clock,
         }
     }
@@ -829,6 +837,9 @@ impl App {
     /// state — theme, config, keybinds, the input draft, input history,
     /// sidecars, model caches — stays.
     pub(crate) fn reset_for_session_switch(&mut self) {
+        // The old session's queued text goes into its transcript, cleared
+        // just below: none of it may land in the new one.
+        self.flush_reveal();
         super::watch::reset(self);
         self.transcript.clear();
         self.invalidate();

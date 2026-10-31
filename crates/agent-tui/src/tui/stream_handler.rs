@@ -16,6 +16,8 @@ use super::render_thread::RenderHandle;
 use super::session_link::{PromptBridge, SessionLink};
 use super::view_model::ViewInputs;
 
+pub(super) mod reveal;
+
 /// Returns true if the event should trigger an immediate redraw.
 pub(super) fn needs_immediate_draw(event: &StreamEvent) -> bool {
     matches!(
@@ -128,8 +130,11 @@ pub(super) fn apply_transcript_event(
             )));
         }
         // ResponseStart: snapshot the transcript position for rollback on reset.
+        // The turn's `thinking` placeholder stays: it is the live header
+        // until the first thinking or agent text (dropping it here left the
+        // screen blank until then).
         StreamEvent::Llm(LlmEvent::ResponseStart) => {
-            store.drop_empty_thinking();
+            store.settle_thinking_for_response();
             *preview = Some((
                 store.messages().len(),
                 store.messages().last().map(|m| m.msg.clone()),
@@ -466,6 +471,17 @@ pub(super) async fn handle_session_event_arm(
     >,
 ) -> ArmFlow {
     let me = link.client_id();
+    // Smooth streaming: a text/thinking delta joins the reveal queue (the
+    // run loop releases it frame by frame); anything else the session says
+    // shows the queue whole first, so it lands after every delta that came
+    // before it — a turn end, abort or tool call never truncates the text.
+    if let SessionEventWire::Stream(ev) = &env.event {
+        if app.defer_stream_text(ev) {
+            track_activity(app, ev);
+            return ArmFlow::Continue;
+        }
+    }
+    app.flush_reveal();
     match env.event {
         SessionEventWire::Stream(ev) => {
             let do_draw = needs_immediate_draw(&ev);

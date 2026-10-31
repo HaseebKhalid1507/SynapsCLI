@@ -1743,7 +1743,10 @@ fn rebuild_history(api_messages: &[synaps_cli::SharedMessage]) -> Vec<HistoryEnt
                     for block in content {
                         match block["type"].as_str() {
                             Some("thinking") => {
-                                if let Some(text) = block["thinking"].as_str() {
+                                // An omitted-display block has no text to show.
+                                if let Some(text) =
+                                    block["thinking"].as_str().filter(|t| !t.is_empty())
+                                {
                                     history.push(HistoryEntry::Thinking {
                                         content: text.to_string(),
                                         time: String::new(),

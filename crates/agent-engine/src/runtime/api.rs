@@ -206,9 +206,9 @@ impl ParseState {
     /// Idempotent: clears `in_*` and `current_text` so a second call is a no-op.
     fn finalize(&mut self) {
         if self.in_thinking {
-            // Never emit an empty `thinking` field — Anthropic rejects such
-            // blocks on the next turn (see content_block_stop arm).
-            if !self.current_thinking.is_empty() {
+            // Never emit a block with neither text nor signature — Anthropic
+            // rejects it on the next turn (see content_block_stop arm).
+            if keeps_thinking_block(&self.current_thinking, &self.current_thinking_signature) {
                 self.accumulated_content.push(json!({
                     "type": "thinking",
                     "thinking": self.current_thinking,
@@ -265,6 +265,12 @@ impl ParseState {
         self.flushed_partial_tool = false;
         content
     }
+}
+
+/// Whether a streamed thinking block goes into the history: it carries text
+/// or a signature (an omitted-display block is empty text plus signature).
+fn keeps_thinking_block(thinking: &str, signature: &str) -> bool {
+    !thinking.is_empty() || !signature.is_empty()
 }
 
 /// Immutable per-stream context — not state. `tx` deliberately lives here and
@@ -391,12 +397,15 @@ fn process_event(event: AnthropicEvent<'_>, raw: &str, state: &mut ParseState, c
         AnthropicEvent::ContentBlockStop => {
             if state.in_thinking {
                 // Flush thinking block with signature so it's echoed back in tool loops.
-                // CRITICAL: never emit an empty `thinking` field — Anthropic rejects
-                // such blocks on the next turn with
-                // `messages.N.content.M.thinking: each thinking block must contain thinking`.
-                // Empty blocks happen when the stream produced only a signature delta
-                // (or none at all) before the block_stop arrived.
-                if !state.current_thinking.is_empty() {
+                // A block with an empty `thinking` but a signature is kept: that is
+                // every block under `display: "omitted"` (and a summarized-mode
+                // progress update the model wrote no summary for); the signature
+                // carries the reasoning, and the API wants it back unchanged — a
+                // tool loop must not partially drop its thinking blocks. Only a
+                // block with neither is dropped: Anthropic rejects that one with
+                // `messages.N.content.M.thinking: each thinking block must contain
+                // thinking` (verified against the live API, 2026-11).
+                if keeps_thinking_block(&state.current_thinking, &state.current_thinking_signature) {
                     state.accumulated_content.push(json!({
                         "type": "thinking",
                         "thinking": state.current_thinking,
@@ -844,6 +853,10 @@ pub struct ApiOptions {
     pub anthropic_execution_plan: Option<crate::runtime::openai::catalog::AnthropicExecutionPlan>,
     /// Foreground/worker/internal request role.
     pub codex_request_role: crate::runtime::openai::catalog::CodexRequestRole,
+    /// The Anthropic request's `thinking.display`
+    /// ([`crate::Runtime::wire_thinking_display`]). The default (summarized)
+    /// keeps every body byte-identical to before the setting existed.
+    pub thinking_display: crate::config::ThinkingDisplay,
     /// Set by the stream loop (and the keep-warm ping) when request-local
     /// image retention was already applied to the messages this request is
     /// given (worker and routed budgets, `image_retention::round_images`):
@@ -1475,6 +1488,9 @@ impl ApiMethods {
             true,
         );
         let mut body = parts.body;
+        // Before the keep-warm fingerprint below: a ping's prefix is the
+        // turn's, `thinking` included.
+        body.set_thinking_display(options.thinking_display);
         // A model that rejects input + `max_tokens` over the window gets the
         // room the input leaves (no-op on Claude 4.5 and later). Before the
         // keep-warm cut below, which only lowers it further.
@@ -3079,6 +3095,8 @@ mod tests {
         ));
     }
 
+    /// A block with neither text nor signature is never emitted: Anthropic
+    /// rejects it next turn ("each thinking block must contain thinking").
     #[test]
     fn empty_thinking_block_never_emitted() {
         let (mut state, tx, _rx) = harness();
@@ -3086,9 +3104,7 @@ mod tests {
         feed(
             &[
                 r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#,
-                // Only a signature delta — no thinking text. Anthropic rejects
-                // empty thinking blocks; the guard must suppress the push.
-                r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig_only"}}"#,
+                r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":""}}"#,
                 r#"data: {"type":"content_block_stop","index":0}"#,
             ],
             &mut state,
@@ -3096,6 +3112,56 @@ mod tests {
         );
         assert!(state.accumulated_content.is_empty());
         assert!(!state.in_thinking);
+    }
+
+    /// `display: "omitted"`: the block streams one empty `thinking_delta`
+    /// and its signature. It goes into the history as the API sent it —
+    /// empty text, the signature carrying the reasoning — ahead of the text,
+    /// and the empty delta still reaches the client (the TUI's cue that a
+    /// thought happened). The end-of-stream flush keeps one cut off before
+    /// its stop the same way.
+    #[test]
+    fn omitted_thinking_block_round_trips_with_its_signature() {
+        let (mut state, tx, mut rx) = harness();
+        let ctx = make_ctx(&tx);
+        feed(
+            &[
+                r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}"#,
+                r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":""}}"#,
+                r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig_only"}}"#,
+                r#"data: {"type":"content_block_stop","index":0}"#,
+                r#"data: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}"#,
+                r#"data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"hi"}}"#,
+                r#"data: {"type":"content_block_stop","index":1}"#,
+            ],
+            &mut state,
+            &ctx,
+        );
+        assert_eq!(
+            state.accumulated_content,
+            vec![
+                json!({"type":"thinking","thinking":"","signature":"sig_only"}),
+                json!({"type":"text","text":"hi"}),
+            ]
+        );
+        let events = drain(&mut rx);
+        assert!(matches!(&events[0], StreamEvent::Llm(LlmEvent::Thinking(t)) if t.is_empty()));
+
+        let (mut state, tx, _rx) = harness();
+        let ctx = make_ctx(&tx);
+        feed(
+            &[
+                r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#,
+                r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig_cut"}}"#,
+            ],
+            &mut state,
+            &ctx,
+        );
+        state.finalize();
+        assert_eq!(
+            state.accumulated_content,
+            vec![json!({"type":"thinking","thinking":"","signature":"sig_cut"})]
+        );
     }
 
     #[test]

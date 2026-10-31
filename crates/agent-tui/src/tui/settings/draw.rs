@@ -750,6 +750,12 @@ pub(crate) fn config_row_display(key: &str) -> Option<String> {
         "cache_diagnostics" => bool_config_display(key, false),
         "cache_keepwarm_headless" => bool_config_display(key, false),
         "cache_keepwarm_tools" => bool_config_display(key, true),
+        "thinking_display" => raw_config(key)
+            .and_then(|v| cfg::ThinkingDisplay::parse(&v))
+            .unwrap_or_default()
+            .to_string(),
+        // Appearance (written on every apply, so the file is the live value)
+        "tui_smooth_streaming" => bool_config_display(key, true),
         "cache_keepwarm" => raw_config(key)
             .and_then(|v| cfg::CacheKeepWarm::parse(&v))
             .unwrap_or_default()

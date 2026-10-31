@@ -612,6 +612,9 @@ pub struct Runtime {
     /// Replace re-reads of unchanged files with a stub and note write/edit
     /// results. Off until a config is applied (production default on).
     read_dedupe: bool,
+    /// `thinking_display`: the foreground session's `thinking.display`
+    /// ([`Self::wire_thinking_display`]). Workers always send summarized.
+    thinking_display: crate::config::ThinkingDisplay,
     /// Keep the cache warm while a tool round runs (`cache_keepwarm_tools`,
     /// `runtime::tool_keepwarm`). Off until a config is applied
     /// (production default on).
@@ -1333,6 +1336,7 @@ impl Runtime {
             tool_spill_root: host.spill_root,
             tool_spill_stats: Arc::default(),
             read_dedupe: false,
+            thinking_display: crate::config::ThinkingDisplay::Summarized,
             tool_keepwarm: false,
             bash_timeout: 30,
             bash_max_timeout: 300,
@@ -3021,6 +3025,7 @@ impl Runtime {
         self.max_tool_output = config.max_tool_output;
         self.tool_spill_policy = tool_spill::ToolSpillPolicy::from_config(config);
         self.read_dedupe = config.read_dedupe;
+        self.thinking_display = config.thinking_display;
         self.tool_keepwarm = config.cache_keepwarm_tools;
         self.bash_timeout = config.bash_timeout;
         self.bash_max_timeout = config.bash_max_timeout;
@@ -3183,6 +3188,28 @@ impl Runtime {
     /// Read dedupe + write/edit notes; off = legacy tool-result bytes.
     pub fn set_read_dedupe(&mut self, enabled: bool) {
         self.read_dedupe = enabled;
+    }
+
+    /// The configured `thinking_display` (whatever this runtime's role).
+    pub fn thinking_display(&self) -> crate::config::ThinkingDisplay {
+        self.thinking_display
+    }
+
+    pub fn set_thinking_display(&mut self, display: crate::config::ThinkingDisplay) {
+        self.thinking_display = display;
+    }
+
+    /// The `thinking.display` this runtime's requests send: the configured
+    /// value on the foreground session; always summarized for a worker or an
+    /// internal request. A worker's thinking summaries are its record: they
+    /// stream into `/watch`, and its rollover transcripts and the parent's
+    /// archived worker history keep them for review, and no one is
+    /// waiting on its first text token.
+    pub(crate) fn wire_thinking_display(&self) -> crate::config::ThinkingDisplay {
+        match self.codex_request_role {
+            crate::runtime::openai::catalog::CodexRequestRole::Foreground => self.thinking_display,
+            _ => crate::config::ThinkingDisplay::Summarized,
+        }
     }
 
     pub fn tool_keepwarm(&self) -> bool {
@@ -4405,6 +4432,7 @@ impl Runtime {
                     request_compression: self.request_compression.clone(),
                     anthropic_execution_plan: anthropic_execution_plan.clone(),
                     codex_request_role: self.codex_request_role(),
+                    thinking_display: self.wire_thinking_display(),
                     // The legacy non-stream loop applies no request-local
                     // image retention of its own.
                     retention_frontier: None,
@@ -4987,6 +5015,7 @@ impl Runtime {
             request_compression: self.request_compression.clone(),
             anthropic_execution_plan,
             codex_request_role: self.codex_request_role(),
+            thinking_display: self.wire_thinking_display(),
             // Placeholder: the stream loop sets it per round once it has
             // applied request-local image retention.
             retention_frontier: None,
@@ -5147,6 +5176,7 @@ impl Clone for Runtime {
             tool_spill_root: self.tool_spill_root.clone(),
             tool_spill_stats: Arc::clone(&self.tool_spill_stats),
             read_dedupe: self.read_dedupe,
+            thinking_display: self.thinking_display,
             tool_keepwarm: self.tool_keepwarm,
             bash_timeout: self.bash_timeout,
             bash_max_timeout: self.bash_max_timeout,
@@ -5787,6 +5817,33 @@ mod tests {
         assert!(runtime.clone().read_dedupe(), "clones keep it");
         runtime.apply_config(&agent_core::config::load_config_from_str("read_dedupe = off\n"));
         assert!(!runtime.read_dedupe());
+    }
+
+    /// `thinking_display` reaches the foreground's requests; a worker (and
+    /// an internal request) sends summarized whatever the config says, even
+    /// one cloned from an omitted foreground.
+    #[test]
+    fn thinking_display_is_foreground_only() {
+        use crate::config::ThinkingDisplay;
+        use crate::runtime::openai::catalog::CodexRequestRole;
+        let mut runtime = Runtime::new_headless();
+        assert_eq!(runtime.wire_thinking_display(), ThinkingDisplay::Summarized);
+        runtime.apply_config(&agent_core::config::load_config_from_str("thinking_display = omitted\n"));
+        assert_eq!(runtime.thinking_display(), ThinkingDisplay::Omitted);
+        assert_eq!(runtime.wire_thinking_display(), ThinkingDisplay::Omitted);
+        assert_eq!(runtime.clone().wire_thinking_display(), ThinkingDisplay::Omitted);
+
+        // What `apply_subagent_runtime_policy` does to every worker runtime.
+        let mut worker = runtime.clone();
+        worker.set_codex_request_role(CodexRequestRole::Worker);
+        assert_eq!(worker.thinking_display(), ThinkingDisplay::Omitted, "config kept");
+        assert_eq!(worker.wire_thinking_display(), ThinkingDisplay::Summarized, "wire forced");
+        let mut internal = runtime.clone();
+        internal.set_codex_request_role(CodexRequestRole::Internal);
+        assert_eq!(internal.wire_thinking_display(), ThinkingDisplay::Summarized);
+
+        runtime.apply_config(&agent_core::config::load_config_from_str(""));
+        assert_eq!(runtime.wire_thinking_display(), ThinkingDisplay::Summarized, "default");
     }
 
     #[test]

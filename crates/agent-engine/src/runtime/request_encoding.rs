@@ -808,6 +808,40 @@ mod transport_tests {
         }
     }
 
+    /// `thinking_display = omitted` reaches the streaming and the
+    /// non-streaming turn; compaction (an internal summary) stays summarized.
+    #[tokio::test]
+    async fn thinking_display_reaches_both_turn_transports_not_compaction() {
+        let (url, seen) = server(Server::Accepts).await;
+        let opts = ApiOptions {
+            thinking_display: crate::config::ThinkingDisplay::Omitted,
+            ..options(&url, RequestCompression::default())
+        };
+        let level = agent_core::reasoning::ReasoningLevel::High;
+        let model = "claude-opus-4-7";
+        let (tx, _rx) = mpsc::unbounded_channel::<StreamEvent>();
+        ApiMethods::call_api_stream(
+            &auth(), &reqwest::Client::new(), model, &ToolRegistry::new(), &None, 0, level,
+            &messages(), tx, 0, 0, &opts, TelemetryLevel::Off,
+        )
+        .await
+        .expect("stream");
+        ApiMethods::call_api(
+            &auth(), &reqwest::Client::new(), model, &ToolRegistry::new(), &None, 0, level,
+            &messages(), 0, &opts,
+        )
+        .await
+        .expect("sync");
+        ApiMethods::call_api_simple(
+            &auth(), &reqwest::Client::new(), model, "summarize", 0, level, &messages(), 0, &opts,
+        )
+        .await
+        .expect("compaction");
+        let seen = seen.lock().unwrap();
+        let displays: Vec<&Value> = seen.iter().map(|(_, b)| &b["thinking"]["display"]).collect();
+        assert_eq!(displays, [&json!("omitted"), &json!("omitted"), &json!("summarized")]);
+    }
+
     #[tokio::test]
     async fn sync_and_compaction_paths_compress_and_fall_back_too() {
         let (url, seen) = server(Server::RefusesGzip).await;

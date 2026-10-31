@@ -4620,6 +4620,87 @@ mod rich_output_tests {
         }
     }
 
+    /// `thinking_display = omitted`, end to end through the stream loop: the
+    /// requests send `thinking.display = "omitted"`, and the round's thinking
+    /// block (empty text, the reasoning in its signature) comes back on the
+    /// next request exactly as the API sent it, ahead of the tool call it
+    /// belongs to, through an `after_tool_call` hook that rewrites the
+    /// output. The durable history keeps it too (session resume).
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn omitted_thinking_round_trips_through_a_tool_loop() {
+        // The replacing hook writes an audit record.
+        let _base = crate::test_env::BaseDirGuard::new();
+        let block = json!({"type": "thinking", "thinking": "", "signature": "sig-omitted"});
+        let mut first = String::new();
+        for ev in [
+            json!({"type":"message_start","message":{"id":"msg_01","type":"message","role":"assistant","content":[],"model":"claude-sonnet-4-6","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}),
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":""}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig-omitted"}}),
+            json!({"type":"content_block_stop","index":0}),
+            json!({"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_1","name":"text_stub"}}),
+            json!({"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{}"}}),
+            json!({"type":"content_block_stop","index":1}),
+            json!({"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"input_tokens":10,"output_tokens":5,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}),
+            json!({"type":"message_stop"}),
+        ] {
+            first.push_str(&format!("data: {ev}\n\n"));
+        }
+        let (base_url, mock) = spawn_mock(first).await;
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(TextTool));
+        let (tx, mut rx) = mpsc::unbounded_channel::<StreamEvent>();
+        let tool_session_id = crate::tools::activation::SessionId::parse(&format!(
+            "test-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ))
+        .unwrap();
+        let mut session = harness_session(
+            base_url,
+            Arc::new(RwLock::new(registry)),
+            tx,
+            crate::tools::shell::SessionManager::new(crate::tools::shell::ShellConfig::default()),
+            output_hook_bus(Some(true)).await,
+            tool_session_id,
+            Default::default(),
+            false,
+            "claude-sonnet-4-6",
+        );
+        session.reasoning_level = agent_core::reasoning::ReasoningLevel::High;
+        session.options.thinking_display = crate::config::ThinkingDisplay::Omitted;
+        let initial = vec![Arc::new(json!({"role":"user","content":"go"})) as SharedMessage];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            StreamMethods::run_stream_internal(session, initial),
+        )
+        .await
+        .expect("stream loop must finish")
+        .expect("turn succeeds");
+        let mut history = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let StreamEvent::Session(SessionEvent::MessageHistory(m)) = ev {
+                history = m;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let bodies = mock.bodies.lock().unwrap().clone();
+        assert_eq!(bodies.len(), 2);
+        for (i, body) in bodies.iter().enumerate() {
+            assert_eq!(body["thinking"]["display"], "omitted", "request {i}: {}", body["thinking"]);
+        }
+        let assistant = &bodies[1]["messages"][1];
+        assert_eq!(assistant["role"], "assistant");
+        assert_eq!(assistant["content"][0], block, "the block comes back unchanged");
+        assert_eq!(assistant["content"][1]["type"], "tool_use");
+        assert!(wire_text(&bodies[1]).contains("REPLACED BY HOOK"), "the hook ran");
+        assert!(
+            history.iter().any(|m| m["content"].as_array().is_some_and(|c| c.contains(&block))),
+            "the durable history keeps it"
+        );
+    }
+
     /// A deferred (non-core) tool: under progressive disclosure it is callable
     /// only after an exact `activate_tools` grant.
     struct DeferredProbe;

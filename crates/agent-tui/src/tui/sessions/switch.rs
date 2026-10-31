@@ -246,6 +246,8 @@ pub(crate) async fn perform(
         )
         .await;
     }
+    // The replayed partial turn is history: shown whole, not paced in.
+    app.flush_reveal();
     for pr in snapshot.pending_prompts.clone() {
         bridge.on_prompt(pr);
     }

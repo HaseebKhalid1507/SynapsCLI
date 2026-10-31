@@ -484,6 +484,59 @@ fn golden_gate_body_bytes_identical() {
     });
 }
 
+/// `thinking_display` against the committed fixtures, for every scenario:
+/// summarized (the default) is the fixture byte for byte; omitted is the
+/// fixture with its one `"display":"summarized"` swapped for
+/// `"display":"omitted"` and nothing else (a scenario with reasoning off has
+/// no `thinking` and stays the fixture). The live API keeps the prompt cache
+/// across that swap (measured on Opus 5.5, system and message breakpoints).
+#[test]
+fn golden_thinking_display_is_one_value_on_the_fixture() {
+    use crate::config::ThinkingDisplay;
+    let dir = fixture_dir();
+    with_fixture_identity(|| {
+        for s in scenarios() {
+            let fixture = std::fs::read(dir.join(format!("{}.json", s.name))).unwrap();
+            let fixture = String::from_utf8(fixture).unwrap();
+            for display in [ThinkingDisplay::Summarized, ThinkingDisplay::Omitted] {
+                let mut cleaned = s.messages.to_vec();
+                HelperMethods::sanitize_thinking_blocks(&mut cleaned);
+                HelperMethods::annotate_cache_breakpoint(&mut cleaned, s.ttl);
+                let mut body = super::request::RequestBody::new(
+                    s.model,
+                    &cleaned,
+                    &s.tools,
+                    &[],
+                    &s.system_prompt,
+                    s.auth_type,
+                    s.thinking_budget,
+                    s.reasoning_level,
+                    None,
+                    s.ttl,
+                    s.stream,
+                );
+                body.set_thinking_display(display);
+                let got = String::from_utf8(serde_json::to_vec(&body).unwrap()).unwrap();
+                let swaps = fixture.matches(r#""display":"summarized""#).count();
+                let expected = match display {
+                    ThinkingDisplay::Summarized => fixture.clone(),
+                    ThinkingDisplay::Omitted => {
+                        fixture.replacen(r#""display":"summarized""#, r#""display":"omitted""#, 1)
+                    }
+                };
+                assert!(swaps <= 1, "scenario `{}`: {swaps} display members", s.name);
+                assert_eq!(
+                    swaps == 0,
+                    s.reasoning_level == agent_core::reasoning::ReasoningLevel::Off,
+                    "scenario `{}`: a thinking object iff reasoning is on",
+                    s.name
+                );
+                assert_eq!(got, expected, "scenario `{}` with display {display}", s.name);
+            }
+        }
+    });
+}
+
 /// Cache diagnostics ON (`cache_diagnostics = true`): for every scenario the
 /// body is the committed off-path fixture with exactly one leading
 /// `"diagnostics"` member, and stripping it (the fail-soft path) gives the
