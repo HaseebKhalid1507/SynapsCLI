@@ -20,7 +20,7 @@
 | `tools.activation_confirm = auto \| prompt \| deny` (config key, default `auto`) | Host policy for MODEL-INITIATED `activate_tools` under progressive disclosure. `auto`: granted without asking. `prompt`: the session raises a `Prompt{kind: Confirm}` ("Confirm tool activation" — the TUI shows a y/n dialog listing the exact ids; `synaps attach` prints `[confirm #id] …\n(y/n):`); only `y`/`yes` allows, anything else/Esc denies (fail-closed). `deny`: always refused, no prompt is raised (locked-down hosts). `server.auto_approve_confirms = true` / `--auto-approve-confirms` still grants regardless. The mode is logged once at boot (`tools.activation_confirm: …`). |
 | `SYNAPS_RUNTIME_DIR` | Where the socket/lock/json/pid live (default `~/.synaps-cli/run`, 0700). |
 | `process_scopes = auto \| off` (config key, default `auto`) / `SYNAPS_PROCESS_SCOPES` (env wins) | On Linux with a reachable systemd user manager, the spawned daemon, every bash tool command and every PTY shell start in their **own** transient scope (`systemd-run --user --scope`). systemd-oomd kills a whole cgroup at once; without this a runaway tool command shared the cgroup of the terminal that started the daemon, and an OOM kill took the command, the daemon and every session down together (S348). Separate scopes reduce shared-cgroup OOM exposure; they are not memory caps. Ancestor-cgroup or global kernel OOM can still kill the daemon and other sessions. Windows isolation is not implemented. Off, unavailable (macOS, containers, no user bus), or a session env without `XDG_RUNTIME_DIR`/`DBUS_SESSION_BUS_ADDRESS`: processes launch directly. Each launch probes with its effective environment and working directory (a three-second polling deadline after spawn, plus best-effort cleanup; offloaded for async bash and PTY startup). The probe never dispatches the requested command, but exact-environment execution is not a side-effect-free sandbox. Kernel-stalled spawn/reaping is not covered by an absolute wall-clock guarantee. A failed probe selects direct launch. Availability can race after a successful probe: any subsequent wrapper failure surfaces as an error, never an automatic direct retry, because the command may already have started. `daemon reload` re-execs in place and keeps the current cgroup; a daemon moves into its own scope at its next fresh start. Scopes show in `systemctl --user list-units --type=scope` as `synaps daemon` / `synaps tool: bash|shell`. |
-| `tool_scope_slice = <name>.slice` / `daemon_scope_slice = <name>.slice` (config keys, default unset) | The systemd slice the scopes above go in. By default the user manager places each transient scope in its default slice (usually `app.slice`, next to the desktop's apps), and that slice has no limit. `tool_scope_slice` covers every scope Synaps makes for a tool command (bash tool commands and PTY shells); `daemon_scope_slice` covers the daemon's own scope. They are separate so an operator can cap tool work without putting the daemon under the same cap. Set, Synaps passes `--slice=<name>` to `systemd-run` (a `-` nests: `worker-agent.slice` sits under `worker.slice`); unset, the command line is exactly as without the keys. **Synaps sets no limits**: the operator sets them on the slice (`systemctl --user set-property worker-agent.slice MemoryHigh=8G MemoryMax=12G`, or a drop-in under `~/.config/systemd/user/worker-agent.slice.d/`). A name must end in `.slice`, use only `[A-Za-z0-9:_.-]`, not start with `-`, not be `-.slice`, contain no `--`, not end its name in `-`, and be at most 255 bytes; anything else is a config warning and is ignored (the key keeps the value of an earlier valid line, else stays unset). Write the bare name, without quotes — the config file is not TOML: `tool_scope_slice = worker-agent.slice`, not `tool_scope_slice = "worker-agent.slice"` (quoted, it warns and is ignored: the previous value, or none, stays). The probe runs with the same `--slice`, so a slice the user manager refuses fails the probe and the command starts as it does with scopes unavailable, with one WARN naming the slice. When it applies: tool scopes follow the config each spawn loads (a changed key takes effect at the next bash command or PTY shell); the daemon's slice applies when the daemon starts — `daemon reload` re-execs in the same scope, so a change needs `synaps daemon stop` and a fresh start. |
+| `tool_scope_slice = <name>.slice` / `daemon_scope_slice = <name>.slice` (config keys, default unset) | The systemd slice the scopes above go in: `tool_scope_slice` for bash tool commands and PTY shells, `daemon_scope_slice` for the daemon's own scope (separate, so tools can be capped without the daemon). Set, Synaps passes `--slice=<name>` to `systemd-run`; unset or empty (`tool_scope_slice =`), the command line is exactly as without the keys. **Synaps sets no limits** — the operator does, on the slice. Use a top-level name such as `synaps_tools.slice`: a `-` nests, and `CPUWeight` only counts against siblings. A slice that doesn't exist is created empty, not refused. Recipe, rules and checks: [Capping tool commands with a slice](#capping-tool-commands-with-a-slice). |
 | `SYNAPS_SESSION_EVENTS_CAP` | Per-session broadcast capacity (default 1024). A slow client gets `SystemNotice("event stream lagged; n dropped")`. |
 | `synaps daemon reload [--now] [--drain-secs N] [--exe PATH]` / `SYNAPS_DAEMON_RELOAD_DRAIN_SECS` (default 30) | Re-exec the daemon in place (C3). `--now` = drain 0. `--exe` overrides (and records) the binary. |
 | `SYNAPS_TUI_ATTACH_RECONNECT_SECS` (default 60) | Total `SocketTransport::reconnect` budget after `Reloading`/EOF (backoff 100 ms ×2, cap 5 s). |
@@ -37,6 +37,91 @@
 | `synaps --attach --no-confirm-answers` | TUI only, any attach mode: this client never answers a `Confirm` prompt (tool-call and tool-activation approvals). It never opens the approval pane for one, so no key typed into it can approve; it lists the waiting confirms in a toast until another client's answer resolves them (`PromptResolved`). `Secret` prompts are unchanged. Client-side only: no wire or daemon change, so it works against any daemon. For a TUI embedded where keystrokes may not come from the person approving (a terminal pane in another app). An `--observe` attach still can answer prompts without this flag: `Answer` is not an input command. |
 | `SYNAPS_SESSION_COMPACT_INLINE=1` | One-release kill-switch: run `/compact` and auto-compaction inline on the actor task (the #107 body — `Attach`/`Cancel` wait behind it) instead of the spawned job. Deleted in phase 4. |
 | `synaps daemon reload` / `stop` / `purge` / `close` / `pin` / `rename` / `reload-extension` from **any** same-uid client | Not a privilege boundary (0600 socket): a stray `synaps daemon reload` from any shell checkpoints every session and closes everyone's PTYs, `daemon close --attached` ends one session whoever owns its input (without `--attached` it refuses a session that has clients attached), `daemon pin` pins one session whoever owns its input (host authority, like `stop`), `daemon rename` names one session whoever owns its input (metadata only), and `daemon reload-extension` restarts an extension every session shares. `Checkpoint` over the wire is owner-only. |
+
+## Capping tool commands with a slice
+
+By default the user manager puts each transient scope in its default slice
+(usually `app.slice`, next to the desktop's apps). To cap what agent tool
+commands can take, give them a slice of their own and set the limits on it.
+**Synaps sets no limits itself.**
+
+**1. Define the slice** — `~/.config/systemd/user/synaps_tools.slice`:
+
+```ini
+[Unit]
+Description=Synaps tool commands
+
+[Slice]
+# Share of CPU under contention, against the slice's siblings (systemd's
+# defaults: app.slice and session.slice 100, background.slice 30).
+CPUWeight=20
+# Reclaim/throttle above this, OOM-kill inside the slice above that.
+MemoryHigh=8G
+MemoryMax=12G
+TasksMax=2048
+```
+
+**2. Point Synaps at it** — `~/.synaps-cli/config`:
+
+```
+tool_scope_slice = synaps_tools.slice
+```
+
+**3. Load it:** `systemctl --user daemon-reload`.
+
+**When it applies.** The config is read at every spawn, so tool commands go in
+the slice from the **next** bash command or PTY shell, with no restart.
+`daemon_scope_slice` applies when the daemon **starts fresh**: `synaps daemon
+reload` re-execs in the same scope, so a change needs `synaps daemon stop` and a
+new start.
+
+**Pick a flat name.** In a slice name a `-` means nesting:
+`synaps-tools.slice` sits under `synaps.slice`, and `agent-tools.slice` under
+`agent.slice`. `CPUWeight` only weighs a cgroup against its **siblings**, so on
+a nested slice that is the only child of its parent it does nothing (the parent,
+at the default 100, is what competes with `app.slice`). Put `CPUWeight` on a
+top-level slice: a name without `-`, such as `synaps_tools.slice`.
+`MemoryHigh`/`MemoryMax`/`TasksMax` are hierarchical and hold wherever the
+slice sits (an ancestor's limits apply too).
+
+**`io` and `cpuset` are usually not yours.** The user manager typically gets
+only the `cpu`, `memory` and `pids` controllers (`cat
+/sys/fs/cgroup/user.slice/user-$UID.slice/user@$UID.service/cgroup.subtree_control`).
+Without `io` and `cpuset` there, `IOWeight=`, `IOReadBandwidthMax=` and
+`AllowedCPUs=` on a user slice are silently ignored, unless `Delegate=` on
+`user@.service` is extended (a system-level change).
+
+**A typo is not an error.** systemd creates a slice that doesn't exist on the
+fly, with no limits, so a misspelt name runs tool commands **uncapped** and the
+launch still succeeds. Check while a command runs:
+
+```
+systemctl --user status synaps_tools.slice         # Loaded: the unit file; Memory: … (high …, max …); the scopes in it
+systemd-cgls --user-unit synaps_tools.slice        # the scopes (synaps tool: bash|shell) in it
+systemctl --user show -p MemoryHigh,MemoryMax,CPUWeight,TasksMax synaps_tools.slice
+```
+
+Synaps helps once: the first time a launch in a process uses a slice, a
+background thread (off the command's path) asks the manager for the slice's
+`MemoryHigh`, `MemoryMax`, `MemorySwapMax`, `CPUWeight`, `CPUQuota` and
+`TasksMax`; if none is set it logs one WARN naming the slice ("no unit file
+defines it: a typo, or a new unit not yet loaded with `systemctl --user
+daemon-reload`?"). It is best-effort: a lookup that fails or times out says
+nothing.
+
+**Name rules.** A value must end in `.slice`, use only `[A-Za-z0-9:_.-]`, not
+start with `-`, not be `-.slice`, contain no `--`, not end its name in `-`, and
+be at most 255 bytes. Anything else is a config warning and is ignored: the key
+keeps the value of an earlier valid line, else stays unset. Write the bare name
+without quotes — the config file is not TOML (`tool_scope_slice =
+"synaps_tools.slice"` warns and is ignored). An empty value (`tool_scope_slice
+=`) unsets the key, without a warning, undoing any earlier line.
+
+**If the probe fails.** Each launch first probes with the same `--slice`. If
+the probe fails — the user manager can't be reached, or it refuses the slice
+(e.g. a slice it can't create) — the command starts without a scope, as with
+scopes unavailable, and one WARN per slice name says so: `scope probe failed
+(user manager unreachable, or slice synaps_tools.slice refused)`.
 
 ## CLI
 

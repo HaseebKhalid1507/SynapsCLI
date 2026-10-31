@@ -485,11 +485,11 @@ mod tests {
         assert!(slices().is_empty());
         std::fs::write(
             base.path().join("config"),
-            "tool_scope_slice = t-agent.slice\ndaemon_scope_slice = d-agent.slice\n",
+            "tool_scope_slice = t_tools.slice\ndaemon_scope_slice = d_daemon.slice\n",
         )
         .unwrap();
-        assert_eq!(slices(), ["--slice=t-agent.slice"]);
-        assert!(recorded(dir.path(), "probe.args").contains(&"--slice=t-agent.slice".to_string()));
+        assert_eq!(slices(), ["--slice=t_tools.slice"]);
+        assert!(recorded(dir.path(), "probe.args").contains(&"--slice=t_tools.slice".to_string()));
     }
 
     /// `try_read_output` returns after the first chunk, and a loaded machine

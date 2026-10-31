@@ -766,7 +766,7 @@ mod tests {
         let _scopes = crate::test_env::EnvVarGuard::remove("SYNAPS_PROCESS_SCOPES");
         std::fs::write(
             base.path().join("config"),
-            "tool_scope_slice = t-agent.slice\ndaemon_scope_slice = d-agent.slice\n",
+            "tool_scope_slice = t_tools.slice\ndaemon_scope_slice = d_daemon.slice\n",
         )
         .unwrap();
         let dir = tempfile::tempdir().unwrap();
@@ -782,8 +782,8 @@ mod tests {
         assert!(out.contains("scoped-run"), "{out}");
         let launch = recorded(dir.path(), "launch.args");
         let slices: Vec<&String> = launch.iter().filter(|a| a.starts_with("--slice")).collect();
-        assert_eq!(slices, ["--slice=t-agent.slice"], "{launch:?}");
-        assert!(recorded(dir.path(), "probe.args").contains(&"--slice=t-agent.slice".to_string()));
+        assert_eq!(slices, ["--slice=t_tools.slice"], "{launch:?}");
+        assert!(recorded(dir.path(), "probe.args").contains(&"--slice=t_tools.slice".to_string()));
     }
 
     /// A session environment rebuilt without the user-bus variables cannot

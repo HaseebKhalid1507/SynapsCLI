@@ -104,15 +104,23 @@ All notable changes to this project will be documented in this file.
   to qualified, so headless sessions never pinged. `Observe` attaches still
   never qualify. `synaps rpc` (stdin/stdout) has no session actor and is
   not covered; drive a daemon session instead.
-- **Slices for process scopes:** `tool_scope_slice = <name>.slice` puts the
-  systemd scopes of bash tool commands and PTY shells in that slice, and
-  `daemon_scope_slice` does the same for the daemon's own scope, so an
-  operator can cap agent tool work apart from the desktop's `app.slice`
-  (`systemctl --user set-property <name>.slice MemoryHigh=…` or a drop-in;
-  Synaps sets no limits itself). Unset, nothing changes. An invalid name
-  warns and is ignored; a slice the user manager refuses means the command
-  starts without a scope, with one warning. The daemon's slice applies at
-  its next fresh start (a reload re-execs in the same scope).
+- **Slices for process scopes** (#267, by JR): `tool_scope_slice =
+  synaps_tools.slice` puts the systemd scopes of bash tool commands and PTY
+  shells in that slice, and `daemon_scope_slice` does the same for the
+  daemon's own scope, so an operator can cap agent tool work apart from the
+  desktop's `app.slice` (a `~/.config/systemd/user/<name>.slice` unit or
+  `systemctl --user set-property`; Synaps sets no limits itself). Use a
+  top-level name without `-`: a `-` nests the slice, and `CPUWeight` only
+  weighs siblings. Unset or empty (`tool_scope_slice =`), nothing changes;
+  an empty value also undoes an earlier line. An invalid name warns and is
+  ignored. A missing slice is not refused (systemd creates it, uncapped), so
+  the first launch into a slice looks up its limits off the command's path
+  and warns once if it sets none. A failed probe (user manager unreachable,
+  or the slice refused) starts the command without a scope, with one
+  warning. Tool commands pick up a change at the next command; the daemon's
+  slice applies at its next fresh start (a reload re-execs in the same
+  scope). Recipe and checks: `docs/daemon-mode.md`, "Capping tool commands
+  with a slice".
 
 ### Changed
 

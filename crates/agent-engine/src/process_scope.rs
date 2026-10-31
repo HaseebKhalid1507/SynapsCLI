@@ -30,8 +30,12 @@
 //! `daemon_scope_slice` (the daemon's own scope) pass `--slice=<name>`, so
 //! an operator can cap agent tool work on its own slice. Synaps sets no
 //! limits; the operator sets them on the slice. The probe uses the same
-//! `--slice`: a slice the manager refuses fails the probe, the command
-//! starts as it does without scopes, and one WARN names the slice.
+//! `--slice`: when it fails (no reachable user manager, or a slice it
+//! refuses) the command starts as it does without scopes, with one WARN per
+//! slice name. A slice that doesn't exist is not refused: systemd creates it
+//! on the fly, without limits. So, once per slice name and on a background
+//! thread, Synaps asks the manager for the slice's limits and WARNs if none
+//! is set (a typo, or a unit file not yet `daemon-reload`ed).
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -281,17 +285,15 @@ fn run_bounded(mut cmd: std::process::Command) -> Option<(std::process::ExitStat
 /// `SYNAPS_TEST_FAKE_SYSTEMD_RUN` in the launch's own environment. Tests
 /// that set it run only their own synthetic script; a test without it in
 /// its env is unaffected, so parallel tests don't see each other's fake.
+///
+/// There is no non-test version: outside `cfg(test)` this function and the
+/// variable's name don't exist, and the call site is `cfg(test)` too, so a
+/// release build cannot consult the seam at all.
 #[cfg(test)]
 fn test_fake_systemd_run(env: &[(OsString, OsString)]) -> Option<PathBuf> {
     env.iter()
         .find(|(k, _)| k == "SYNAPS_TEST_FAKE_SYSTEMD_RUN")
         .map(|(_, v)| PathBuf::from(v))
-}
-
-/// Outside unit tests the seam is always empty.
-#[cfg(not(test))]
-fn test_fake_systemd_run(_env: &[(OsString, OsString)]) -> Option<PathBuf> {
-    None
 }
 
 /// Fresh, bounded availability check. Synchronous callers (PTY and detached
@@ -308,7 +310,10 @@ pub fn launcher_for_effective_env(
 ) -> Option<ScopeLauncher> {
     // Unit tests only (always `None` otherwise): a synthetic systemd-run
     // named in this launch's own env, so the callers' argv can be tested.
+    #[cfg(test)]
     let fake = test_fake_systemd_run(env);
+    #[cfg(not(test))]
+    let fake: Option<PathBuf> = None;
     // Test-support builds must not reach a developer's user manager merely
     // because ordinary bash/PTY tests inherit a desktop environment. Synthetic
     // launcher tests use a fake systemd-run; real smoke is opt-in.
@@ -364,6 +369,11 @@ fn launcher_with_binary(
     slice: Option<String>,
 ) -> Option<ScopeLauncher> {
     if probe(binary, no_expand, env, cwd, slice.as_deref()) {
+        if let Some(slice) = slice.as_deref() {
+            if first_limits_check(slice) {
+                spawn_slice_limits_check(binary, env, kind, slice);
+            }
+        }
         return Some(ScopeLauncher {
             systemd_run: binary.to_owned(),
             no_expand,
@@ -373,14 +383,31 @@ fn launcher_with_binary(
     // Without a user manager in reach a slice changes nothing: no WARN then.
     if let Some(slice) = slice.filter(|_| has_manager_env(env)) {
         if first_refusal(&slice) {
-            tracing::warn!(
-                key = kind.slice_key(),
-                slice = %slice,
-                "process scope: the scope probe with --slice={slice} failed (does the user manager accept that slice?); these launches start without a scope"
-            );
+            tracing::warn!(key = kind.slice_key(), slice = %slice, "{}", probe_failed_warning(&slice));
         }
     }
     None
+}
+
+/// The WARN for a failed probe with a slice set. The probe also fails when
+/// the user manager can't be reached (the bus env is set but stale, the
+/// manager is gone or slow), so it must not blame the slice alone.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))] // logged by the Linux launcher; tested everywhere
+fn probe_failed_warning(slice: &str) -> String {
+    format!(
+        "process scope: scope probe failed (user manager unreachable, or slice {slice} refused); these launches start without a scope"
+    )
+}
+
+/// `true` the first time `name` is seen in `seen`.
+#[cfg(target_os = "linux")]
+fn first_in(seen: &std::sync::Mutex<Vec<String>>, name: &str) -> bool {
+    let mut seen = seen.lock().unwrap_or_else(|e| e.into_inner());
+    if seen.iter().any(|s| s == name) {
+        return false;
+    }
+    seen.push(name.to_owned());
+    true
 }
 
 /// `true` the first time `slice` fails its probe in this process, so a
@@ -388,12 +415,15 @@ fn launcher_with_binary(
 #[cfg(target_os = "linux")]
 fn first_refusal(slice: &str) -> bool {
     static WARNED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
-    let mut warned = WARNED.lock().unwrap_or_else(|e| e.into_inner());
-    if warned.iter().any(|s| s == slice) {
-        return false;
-    }
-    warned.push(slice.to_owned());
-    true
+    first_in(&WARNED, slice)
+}
+
+/// `true` the first time a probe with `slice` succeeds in this process: its
+/// limits are looked up once per name, never per command.
+#[cfg(target_os = "linux")]
+fn first_limits_check(slice: &str) -> bool {
+    static CHECKED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    first_in(&CHECKED, slice)
 }
 
 /// Compatibility convenience for inherited or fully rebuilt environments,
@@ -403,6 +433,89 @@ pub fn launcher_for_env(env: Option<&[(String, String)]>) -> Option<ScopeLaunche
         .map(|e| e.iter().map(|(k, v)| (k.into(), v.into())).collect())
         .unwrap_or_else(inherited_env);
     launcher_for_effective_env(&env, None, ScopeKind::Tool)
+}
+
+/// The slice properties that cap what runs in it. If none is set, the slice
+/// caps nothing: most likely a typo (systemd makes a missing slice on the
+/// fly) or a unit file the manager hasn't loaded yet.
+const SLICE_LIMIT_PROPERTIES: &str = "MemoryHigh,MemoryMax,MemorySwapMax,CPUWeight,CPUQuotaPerSecUSec,TasksMax";
+
+/// From `systemctl --user show -p <SLICE_LIMIT_PROPERTIES> -p FragmentPath`:
+/// `Some(has_unit_file)` when the output lists the limit properties and every
+/// one is at its "no limit" value, `None` when one is set or the output is
+/// not what was asked for (then nothing is reported). systemd prints an
+/// unset value as `infinity`, `[not set]`, empty, or (older releases)
+/// `u64::MAX`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))] // read by the Linux check; tested everywhere
+fn slice_without_limits(show: &str) -> Option<bool> {
+    let mut limits_seen = 0;
+    let mut unit_file = false;
+    for line in show.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if key == "FragmentPath" {
+            unit_file = !value.is_empty();
+        } else if SLICE_LIMIT_PROPERTIES.split(',').any(|p| p == key) {
+            if !matches!(value, "" | "infinity" | "[not set]" | "18446744073709551615") {
+                return None;
+            }
+            limits_seen += 1;
+        }
+    }
+    (limits_seen == SLICE_LIMIT_PROPERTIES.split(',').count()).then_some(unit_file)
+}
+
+/// The WARN for a slice with no limits.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))] // logged by the Linux check; tested everywhere
+fn no_limits_warning(slice: &str, unit_file: bool) -> String {
+    let why = if unit_file {
+        "its unit sets none"
+    } else {
+        "no unit file defines it: a typo, or a new unit not yet loaded with `systemctl --user daemon-reload`?"
+    };
+    format!(
+        "process scope: slice {slice} has no MemoryHigh, MemoryMax, MemorySwapMax, CPUWeight, CPUQuota or TasksMax set ({why}); scopes in it run uncapped"
+    )
+}
+
+/// Ask the user manager `env` reaches whether `slice` sets any limit, with
+/// the `systemctl` next to the `systemd-run` in use (never a PATH lookup).
+/// `Some(has_unit_file)` if it sets none; `None` if it sets one or the
+/// question fails. Bounded like the probe.
+#[cfg(target_os = "linux")]
+fn query_slice_without_limits(
+    systemctl: &std::path::Path,
+    env: &[(OsString, OsString)],
+    slice: &str,
+) -> Option<bool> {
+    let mut cmd = std::process::Command::new(systemctl);
+    cmd.env_clear()
+        .envs(env.iter().cloned())
+        .env("LC_ALL", "C")
+        .env("SYSTEMD_PAGER", "")
+        .args(["--user", "show", "-p", SLICE_LIMIT_PROPERTIES, "-p", "FragmentPath", "--", slice])
+        .stdout(std::process::Stdio::piped());
+    let (status, stdout) = run_bounded(cmd)?;
+    status.success().then_some(())?;
+    slice_without_limits(&String::from_utf8_lossy(&stdout))
+}
+
+/// Off the launch path: a detached thread looks the slice up and WARNs if it
+/// caps nothing. Best effort: a short-lived process may exit first, and any
+/// failure stays silent (the probe already decided the launch).
+#[cfg(target_os = "linux")]
+fn spawn_slice_limits_check(systemd_run: &std::path::Path, env: &[(OsString, OsString)], kind: ScopeKind, slice: &str) {
+    let systemctl = systemd_run.with_file_name("systemctl");
+    let env = env.to_vec();
+    let slice = slice.to_owned();
+    let _ = std::thread::Builder::new()
+        .name("synaps-slice-limits".into())
+        .spawn(move || {
+            if let Some(unit_file) = query_slice_without_limits(&systemctl, &env, &slice) {
+                tracing::warn!(key = kind.slice_key(), slice = %slice, "{}", no_limits_warning(&slice, unit_file));
+            }
+        });
 }
 
 /// Resolve before wrapping: systemd-run must not substitute its own executable
@@ -815,7 +928,7 @@ printf 'wrapper=%s\n' "$$"
         let l = ScopeLauncher {
             systemd_run: PathBuf::from("/usr/bin/systemd-run"),
             no_expand: false,
-            slice: Some("worker-agent.slice".into()),
+            slice: Some("synaps_tools.slice".into()),
         };
         let (program, args) = l.wrap("synaps tool: bash", "bash", ["-c".into(), "echo hi".into()]);
         assert_eq!(program, OsString::from("/usr/bin/systemd-run"));
@@ -826,7 +939,7 @@ printf 'wrapper=%s\n' "$$"
                 "--scope",
                 "--quiet",
                 "--collect",
-                "--slice=worker-agent.slice",
+                "--slice=synaps_tools.slice",
                 "--description=synaps tool: bash",
                 "--",
                 "bash",
@@ -841,12 +954,12 @@ printf 'wrapper=%s\n' "$$"
         let mut c = crate::config::SynapsConfig::default();
         assert_eq!(slice_for(ScopeKind::Tool, &c), None);
         assert_eq!(slice_for(ScopeKind::Daemon, &c), None);
-        c.tool_scope_slice = Some("t-agent.slice".into());
-        assert_eq!(slice_for(ScopeKind::Tool, &c).as_deref(), Some("t-agent.slice"));
+        c.tool_scope_slice = Some("t_tools.slice".into());
+        assert_eq!(slice_for(ScopeKind::Tool, &c).as_deref(), Some("t_tools.slice"));
         assert_eq!(slice_for(ScopeKind::Daemon, &c), None);
-        c.daemon_scope_slice = Some("d-agent.slice".into());
-        assert_eq!(slice_for(ScopeKind::Daemon, &c).as_deref(), Some("d-agent.slice"));
-        assert_eq!(slice_for(ScopeKind::Tool, &c).as_deref(), Some("t-agent.slice"));
+        c.daemon_scope_slice = Some("d_daemon.slice".into());
+        assert_eq!(slice_for(ScopeKind::Daemon, &c).as_deref(), Some("d_daemon.slice"));
+        assert_eq!(slice_for(ScopeKind::Tool, &c).as_deref(), Some("t_tools.slice"));
         assert_eq!(ScopeKind::Tool.slice_key(), "tool_scope_slice");
         assert_eq!(ScopeKind::Daemon.slice_key(), "daemon_scope_slice");
     }
@@ -864,7 +977,7 @@ printf 'wrapper=%s\n' "$$"
             ["--user", "--scope", "--quiet", "--collect", "--description=synaps scope probe", "--", "/bin/true"]
         );
         // Set: the probe carries the launch's --slice.
-        let slice = Some("worker-agent.slice".to_string());
+        let slice = Some("synaps_tools.slice".to_string());
         let l = launcher_with_binary(&fake, false, &env, Some(dir.path()), ScopeKind::Tool, slice).unwrap();
         assert_eq!(
             test_support::recorded(dir.path(), "probe.args"),
@@ -873,13 +986,13 @@ printf 'wrapper=%s\n' "$$"
                 "--scope",
                 "--quiet",
                 "--collect",
-                "--slice=worker-agent.slice",
+                "--slice=synaps_tools.slice",
                 "--description=synaps scope probe",
                 "--",
                 "/bin/true",
             ]
         );
-        assert!(args_of(&l.wrap("t", "/bin/echo", []).1).contains(&"--slice=worker-agent.slice".to_string()));
+        assert!(args_of(&l.wrap("t", "/bin/echo", []).1).contains(&"--slice=synaps_tools.slice".to_string()));
         // A manager that refuses the slice fails the probe: no launcher, so
         // the command starts directly, as with scopes unavailable.
         let refusing = fake_script(
@@ -927,21 +1040,135 @@ exit 0"#,
         assert_eq!(slices(ScopeKind::Tool), Some(vec![]));
         assert_eq!(slices(ScopeKind::Daemon), Some(vec![]));
         let config = base.path().join("config");
-        std::fs::write(&config, "tool_scope_slice = t-agent.slice\ndaemon_scope_slice = d-agent.slice\n").unwrap();
-        assert_eq!(slices(ScopeKind::Tool), Some(vec!["--slice=t-agent.slice".to_string()]));
-        assert_eq!(slices(ScopeKind::Daemon), Some(vec!["--slice=d-agent.slice".to_string()]));
-        std::fs::write(&config, "process_scopes = off\ntool_scope_slice = t-agent.slice\n").unwrap();
+        std::fs::write(&config, "tool_scope_slice = t_tools.slice\ndaemon_scope_slice = d_daemon.slice\n").unwrap();
+        assert_eq!(slices(ScopeKind::Tool), Some(vec!["--slice=t_tools.slice".to_string()]));
+        assert_eq!(slices(ScopeKind::Daemon), Some(vec!["--slice=d_daemon.slice".to_string()]));
+        std::fs::write(&config, "process_scopes = off\ntool_scope_slice = t_tools.slice\n").unwrap();
         assert_eq!(slices(ScopeKind::Tool), None);
     }
 
-    /// The test seam is compiled into unit tests only.
+    /// The test seam is compiled into unit tests only: its one definition and
+    /// its one call are each gated on `cfg(test)`, so a non-test build has
+    /// neither (a stray ungated definition would also be dead code there,
+    /// which clippy `-D warnings` rejects). Whitespace and line breaks don't
+    /// matter to this check.
     #[test]
     fn the_fake_systemd_run_seam_is_test_only() {
-        let source = include_str!("process_scope.rs");
-        assert!(source.contains("#[cfg(test)]\nfn test_fake_systemd_run("));
-        assert!(source.contains(
-            "#[cfg(not(test))]\nfn test_fake_systemd_run(_env: &[(OsString, OsString)]) -> Option<PathBuf> {\n    None\n}"
-        ));
+        let compact: String = include_str!("process_scope.rs")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        // Built from pieces so this test's own text doesn't match.
+        let name = ["test_fake", "_systemd_run"].concat();
+        let gate = "#[cfg(test)]";
+        let definitions: Vec<_> = compact.match_indices(&format!("fn{name}(")).collect();
+        assert_eq!(definitions.len(), 1, "one definition of the seam");
+        assert!(compact[..definitions[0].0].ends_with(gate), "the definition is cfg(test)");
+        let calls: Vec<_> = compact.match_indices(&format!("={name}(")).collect();
+        assert_eq!(calls.len(), 1, "one call of the seam");
+        assert!(
+            compact[..calls[0].0].ends_with(&format!("{gate}letfake")),
+            "the call is cfg(test)"
+        );
+        // Outside the cfg(test) modules (`tests`, `test_support`) the
+        // variable is named in the seam alone.
+        let production = compact.split("#[cfg(test)]modtests{").next().unwrap();
+        let env_name = ["SYNAPS_TEST_FAKE", "_SYSTEMD_RUN"].concat();
+        assert_eq!(production.matches(&format!("\"{env_name}\"")).count(), 1, "named only in the seam");
+    }
+
+    #[test]
+    fn a_failed_probe_warning_does_not_blame_the_slice_alone() {
+        let w = probe_failed_warning("synaps_tools.slice");
+        assert!(w.contains("user manager unreachable"), "{w}");
+        assert!(w.contains("or slice synaps_tools.slice refused"), "{w}");
+        assert!(w.contains("start without a scope"), "{w}");
+    }
+
+    #[test]
+    fn a_slice_with_no_limit_set_is_reported_and_one_limit_is_enough() {
+        // systemd 262 on a slice nobody defined (made on the fly).
+        let missing = "LoadState=loaded\nFragmentPath=\nCPUWeight=[not set]\nCPUQuotaPerSecUSec=infinity\n\
+                       MemoryHigh=infinity\nMemoryMax=infinity\nMemorySwapMax=infinity\nTasksMax=infinity\n";
+        assert_eq!(slice_without_limits(missing), Some(false));
+        let with_unit = missing.replace("FragmentPath=\n", "FragmentPath=/home/u/.config/systemd/user/synaps_tools.slice\n");
+        assert_eq!(slice_without_limits(&with_unit), Some(true));
+        // Older releases print an unset value as u64::MAX, or nothing.
+        let old = missing.replace("[not set]", "18446744073709551615").replace("TasksMax=infinity", "TasksMax=");
+        assert_eq!(slice_without_limits(&old), Some(false));
+        // Any one limit set: nothing to report.
+        for (from, to) in [
+            ("CPUWeight=[not set]", "CPUWeight=20"),
+            ("CPUQuotaPerSecUSec=infinity", "CPUQuotaPerSecUSec=2s"),
+            ("MemoryHigh=infinity", "MemoryHigh=8589934592"),
+            ("MemoryMax=infinity", "MemoryMax=12884901888"),
+            ("MemorySwapMax=infinity", "MemorySwapMax=0"),
+            ("TasksMax=infinity", "TasksMax=512"),
+        ] {
+            assert_eq!(slice_without_limits(&missing.replace(from, to)), None, "{to}");
+        }
+        // Output that doesn't answer the question (an error, a property
+        // missing): nothing to report rather than a false alarm.
+        assert_eq!(slice_without_limits(""), None);
+        assert_eq!(slice_without_limits(&missing.replace("TasksMax=infinity\n", "")), None);
+        let w = no_limits_warning("synaps_tools.slice", false);
+        assert!(w.contains("synaps_tools.slice") && w.contains("typo") && w.contains("daemon-reload"), "{w}");
+        assert!(no_limits_warning("synaps_tools.slice", true).contains("its unit sets none"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn slice_limits_are_looked_up_once_per_name_off_the_launch_path() {
+        assert!(first_limits_check("limits-once-test-a.slice"));
+        assert!(!first_limits_check("limits-once-test-a.slice"));
+        assert!(first_limits_check("limits-once-test-b.slice"));
+        // The gates are separate: a name checked for limits can still warn
+        // once for a failed probe, and the other way round.
+        assert!(first_refusal("limits-once-test-a.slice"));
+    }
+
+    /// End to end with a fake `systemd-run` and a fake `systemctl` beside it:
+    /// a successful probe with a slice asks the same manager (same env) for
+    /// that slice's limits, once per name; without a slice nothing is asked.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_launch_with_a_slice_asks_the_manager_for_its_limits_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = test_support::fake_systemd_run(dir.path());
+        let log = dir.path().join("systemctl.log");
+        fake_script(
+            dir.path(),
+            "systemctl",
+            &format!(
+                "printf '%s %s\\n' \"$DBUS_SESSION_BUS_ADDRESS\" \"$*\" >> '{}'\n\
+                 printf 'FragmentPath=\\nCPUWeight=[not set]\\nCPUQuotaPerSecUSec=infinity\\n'\n\
+                 printf 'MemoryHigh=infinity\\nMemoryMax=infinity\\nMemorySwapMax=infinity\\nTasksMax=infinity\\n'",
+                log.display()
+            ),
+        );
+        let env = vec![("DBUS_SESSION_BUS_ADDRESS".into(), "fake:limits".into())];
+        let read_log = || std::fs::read_to_string(&log).unwrap_or_default();
+        // Unset: no lookup.
+        assert!(launcher_with_binary(&fake, false, &env, None, ScopeKind::Tool, None).is_some());
+        let slice = "limits-e2e-test.slice".to_string();
+        for _ in 0..3 {
+            assert!(launcher_with_binary(&fake, false, &env, None, ScopeKind::Tool, Some(slice.clone())).is_some());
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while read_log().is_empty() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // Give a (wrong) second lookup time to show up before counting.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert_eq!(
+            read_log().lines().collect::<Vec<_>>(),
+            [format!("fake:limits --user show -p {SLICE_LIMIT_PROPERTIES} -p FragmentPath -- {slice}")]
+        );
+        // The query itself, synchronously: defaults and no unit file.
+        let systemctl = dir.path().join("systemctl");
+        assert_eq!(query_slice_without_limits(&systemctl, &env, &slice), Some(false));
+        fake_script(dir.path(), "systemctl", "exit 1");
+        assert_eq!(query_slice_without_limits(&systemctl, &env, &slice), None);
     }
 }
 
