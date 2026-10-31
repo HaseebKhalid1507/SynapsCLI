@@ -193,6 +193,17 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **A closed session or stopped quota keeper frees its lock at once.**
+  Session journal locks and quota-keeper locks were released by closing the
+  lock file. A `flock` belongs to the open file, and a process that a
+  thread is starting at that moment (a tool, an MCP server) holds a copy of
+  every descriptor until it executes, so the lock could outlive its owner
+  by up to that long. Opening the session right then was refused with
+  "session … is live in another process" naming the process that had just
+  let it go, and a keeper started on the same state dir was refused with
+  "keeper.lock is held by pid …". Both locks now unlock explicitly when
+  released, as the context archive's lock already did.
+
 - **Retiring a screenshot from a parallel tool batch no longer rewrites
   the whole history.** When old images are retired from a request, the
   cache anchor is meant to sit just before the first message that changes,
