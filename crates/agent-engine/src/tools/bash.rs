@@ -455,7 +455,7 @@ pub(crate) async fn run_shell_command(
         }
         let probe_task = tokio::task::spawn_blocking(move || {
             crate::process_scope::launcher_for_effective_env(
-                &probe_env, probe_cwd.as_deref())
+                &probe_env, probe_cwd.as_deref(), crate::process_scope::ScopeKind::Tool)
         });
         let launcher = if let Some(cancel) = &ctx.capabilities.launch_cancel {
             tokio::select! {
@@ -753,6 +753,37 @@ mod tests {
         } else {
             assert_eq!(child_cgroup, own_cgroup(), "unwrapped fallback");
         }
+    }
+
+    /// A bash command's scope goes in `tool_scope_slice`, never in the
+    /// daemon's slice; the probe carries the same `--slice`.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn a_bash_command_is_scoped_in_the_tool_slice() {
+        use crate::process_scope::test_support::{fake_env, fake_systemd_run, recorded};
+        let base = crate::test_env::BaseDirGuard::new();
+        let _scopes = crate::test_env::EnvVarGuard::remove("SYNAPS_PROCESS_SCOPES");
+        std::fs::write(
+            base.path().join("config"),
+            "tool_scope_slice = t-agent.slice\ndaemon_scope_slice = d-agent.slice\n",
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let fake = fake_systemd_run(dir.path());
+        let mut env = fake_env(&fake);
+        env.push(("PATH".to_string(), std::env::var("PATH").unwrap_or_default()));
+        let mut ctx = create_tool_context();
+        ctx.capabilities.env = Some(env);
+        let out = BashTool
+            .execute(json!({ "command": "echo scoped-run", "timeout": 30 }), ctx)
+            .await
+            .unwrap();
+        assert!(out.contains("scoped-run"), "{out}");
+        let launch = recorded(dir.path(), "launch.args");
+        let slices: Vec<&String> = launch.iter().filter(|a| a.starts_with("--slice")).collect();
+        assert_eq!(slices, ["--slice=t-agent.slice"], "{launch:?}");
+        assert!(recorded(dir.path(), "probe.args").contains(&"--slice=t-agent.slice".to_string()));
     }
 
     /// A session environment rebuilt without the user-bus variables cannot

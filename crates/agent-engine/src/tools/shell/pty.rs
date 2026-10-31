@@ -198,7 +198,8 @@ impl PtyHandle {
             .or_else(|| effective_env.iter().find(|(k, _)| k == "HOME")
                 .map(|(_, v)| std::path::PathBuf::from(v)));
         let launcher = scope_cwd.as_deref().and_then(|cwd|
-            crate::process_scope::launcher_for_effective_env(&effective_env, Some(cwd)));
+            crate::process_scope::launcher_for_effective_env(
+                &effective_env, Some(cwd), crate::process_scope::ScopeKind::Tool));
         (effective_env, scope_cwd, launcher)
     }
 
@@ -459,6 +460,37 @@ mod tests {
     // and a spawn racing a HOME swap failed with ENOENT.
     use serial_test::serial;
     use std::collections::HashMap;
+
+    /// A PTY shell's scope goes in `tool_scope_slice`, never in the daemon's
+    /// slice; neither key set, no `--slice`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[serial_test::serial(synaps_base_dir)]
+    fn a_pty_shell_is_scoped_in_the_tool_slice() {
+        use crate::process_scope::test_support::{fake_env, fake_systemd_run, recorded};
+        let base = crate::test_env::BaseDirGuard::new();
+        let _scopes = crate::test_env::EnvVarGuard::remove("SYNAPS_PROCESS_SCOPES");
+        let dir = tempfile::tempdir().unwrap();
+        let fake = fake_systemd_run(dir.path());
+        let env: HashMap<String, String> = fake_env(&fake).into_iter().collect();
+        let cwd = dir.path().to_str().unwrap();
+        let slices = || {
+            let (_, _, launcher) = PtyHandle::prepare_scope(Some(cwd), &env);
+            let (_, args) = launcher.expect("the fake probe succeeds").wrap("synaps tool: shell", "/bin/sh", []);
+            args.iter()
+                .map(|a| a.to_string_lossy().into_owned())
+                .filter(|a| a.starts_with("--slice"))
+                .collect::<Vec<_>>()
+        };
+        assert!(slices().is_empty());
+        std::fs::write(
+            base.path().join("config"),
+            "tool_scope_slice = t-agent.slice\ndaemon_scope_slice = d-agent.slice\n",
+        )
+        .unwrap();
+        assert_eq!(slices(), ["--slice=t-agent.slice"]);
+        assert!(recorded(dir.path(), "probe.args").contains(&"--slice=t-agent.slice".to_string()));
+    }
 
     /// `try_read_output` returns after the first chunk, and a loaded machine
     /// can split even a short echo across chunks; read until `needle` shows

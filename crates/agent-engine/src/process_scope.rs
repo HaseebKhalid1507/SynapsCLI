@@ -23,11 +23,48 @@
 //! Used only when it is available (Linux, a reachable systemd user manager)
 //! and not turned off (`process_scopes = off` in config, or
 //! `SYNAPS_PROCESS_SCOPES=off`). Otherwise commands start exactly as before.
+//!
+//! Slices: by default systemd puts each scope where the user manager puts
+//! transient units (usually `app.slice`, next to the desktop's apps). The
+//! config keys `tool_scope_slice` (bash tool commands and PTY shells) and
+//! `daemon_scope_slice` (the daemon's own scope) pass `--slice=<name>`, so
+//! an operator can cap agent tool work on its own slice. Synaps sets no
+//! limits; the operator sets them on the slice. The probe uses the same
+//! `--slice`: a slice the manager refuses fails the probe, the command
+//! starts as it does without scopes, and one WARN names the slice.
 
 use std::ffi::OsString;
 use std::path::PathBuf;
 #[cfg(target_os = "linux")]
 use std::sync::OnceLock;
+
+/// Which of Synaps's scopes a launch makes. Each kind has its own slice key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScopeKind {
+    /// A tool command: a bash tool command or a PTY shell (`tool_scope_slice`).
+    Tool,
+    /// The daemon itself (`daemon_scope_slice`).
+    Daemon,
+}
+
+impl ScopeKind {
+    /// The config key naming this kind's slice.
+    pub fn slice_key(self) -> &'static str {
+        match self {
+            ScopeKind::Tool => "tool_scope_slice",
+            ScopeKind::Daemon => "daemon_scope_slice",
+        }
+    }
+}
+
+/// The configured slice for `kind`, if any. The config parser has already
+/// refused invalid names (they leave the key unset).
+fn slice_for(kind: ScopeKind, config: &crate::config::SynapsConfig) -> Option<String> {
+    match kind {
+        ScopeKind::Tool => config.tool_scope_slice.clone(),
+        ScopeKind::Daemon => config.daemon_scope_slice.clone(),
+    }
+}
 
 /// Turns `program args…` into `systemd-run --user --scope … -- program args…`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -36,6 +73,8 @@ pub struct ScopeLauncher {
     /// Pass `--expand-environment=no`. Only set when the binary is known to
     /// accept it (systemd >= 254); an unknown option would fail every launch.
     no_expand: bool,
+    /// `--slice=<name>`, from the kind's config key; `None` adds nothing.
+    slice: Option<String>,
 }
 
 /// First systemd release whose systemd-run knows `--expand-environment=`.
@@ -50,8 +89,8 @@ pub struct ScopeLauncher {
 const EXPAND_ENVIRONMENT_SINCE: u32 = 254;
 
 /// systemd-run options shared by real launches and the probe, so the probe
-/// also proves the exact option set is accepted.
-fn scope_options(description: &str, no_expand: bool) -> Vec<OsString> {
+/// also proves the exact option set (the slice included) is accepted.
+fn scope_options(description: &str, no_expand: bool, slice: Option<&str>) -> Vec<OsString> {
     let mut argv: Vec<OsString> = vec![
         "--user".into(),
         "--scope".into(),
@@ -66,6 +105,9 @@ fn scope_options(description: &str, no_expand: bool) -> Vec<OsString> {
         // otherwise substitute from its own environment.
         argv.push("--expand-environment=no".into());
     }
+    if let Some(slice) = slice {
+        argv.push(format!("--slice={slice}").into());
+    }
     argv.push(format!("--description={description}").into());
     argv
 }
@@ -79,7 +121,7 @@ impl ScopeLauncher {
         program: impl Into<OsString>,
         args: impl IntoIterator<Item = OsString>,
     ) -> (OsString, Vec<OsString>) {
-        let mut argv = scope_options(description, self.no_expand);
+        let mut argv = scope_options(description, self.no_expand, self.slice.as_deref());
         argv.push("--".into());
         argv.push(program.into());
         argv.extend(args);
@@ -133,19 +175,26 @@ fn find_systemd_run() -> Option<PathBuf> {
         .find(|p| p.is_file())
 }
 
+/// Whether `env` can reach a user manager at all (`XDG_RUNTIME_DIR` or
+/// `DBUS_SESSION_BUS_ADDRESS` set and non-empty).
+#[cfg(target_os = "linux")]
+fn has_manager_env(env: &[(OsString, OsString)]) -> bool {
+    env.iter()
+        .any(|(k, v)| (k == "XDG_RUNTIME_DIR" || k == "DBUS_SESSION_BUS_ADDRESS") && !v.is_empty())
+}
+
 /// Start only a throwaway scope, with the exact child environment and cwd and
-/// the same options real launches use. Bounded to three seconds.
+/// the same options real launches use (`slice` included). Bounded to three
+/// seconds.
 #[cfg(target_os = "linux")]
 fn probe(
     systemd_run: &std::path::Path,
     no_expand: bool,
     env: &[(OsString, OsString)],
     cwd: Option<&std::path::Path>,
+    slice: Option<&str>,
 ) -> bool {
-    if !env
-        .iter()
-        .any(|(k, v)| (k == "XDG_RUNTIME_DIR" || k == "DBUS_SESSION_BUS_ADDRESS") && !v.is_empty())
-    {
+    if !has_manager_env(env) {
         return false;
     }
     let mut cmd = std::process::Command::new(systemd_run);
@@ -153,7 +202,7 @@ fn probe(
     if let Some(cwd) = cwd {
         cmd.current_dir(cwd);
     }
-    cmd.args(scope_options("synaps scope probe", no_expand))
+    cmd.args(scope_options("synaps scope probe", no_expand, slice))
         .args(["--", "/bin/true"])
         .stdout(std::process::Stdio::null());
     run_bounded(cmd).is_some_and(|(status, _)| status.success())
@@ -228,32 +277,62 @@ fn run_bounded(mut cmd: std::process::Command) -> Option<(std::process::ExitStat
     }
 }
 
+/// Test seam, unit tests only: the `systemd-run` named by
+/// `SYNAPS_TEST_FAKE_SYSTEMD_RUN` in the launch's own environment. Tests
+/// that set it run only their own synthetic script; a test without it in
+/// its env is unaffected, so parallel tests don't see each other's fake.
+#[cfg(test)]
+fn test_fake_systemd_run(env: &[(OsString, OsString)]) -> Option<PathBuf> {
+    env.iter()
+        .find(|(k, _)| k == "SYNAPS_TEST_FAKE_SYSTEMD_RUN")
+        .map(|(_, v)| PathBuf::from(v))
+}
+
+/// Outside unit tests the seam is always empty.
+#[cfg(not(test))]
+fn test_fake_systemd_run(_env: &[(OsString, OsString)]) -> Option<PathBuf> {
+    None
+}
+
 /// Fresh, bounded availability check. Synchronous callers (PTY and detached
 /// daemon spawn) may wait up to three seconds. Async callers must offload it.
 /// Probe failure selects direct launch. After success, wrapper failure is an
 /// error, NEVER a reason to replay the command: availability can race, and the
 /// wrapped command may already have executed. This is not a launch handshake.
+/// `kind` picks the slice key (`tool_scope_slice` / `daemon_scope_slice`),
+/// read from the config this call loads.
 pub fn launcher_for_effective_env(
     env: &[(OsString, OsString)],
     cwd: Option<&std::path::Path>,
+    kind: ScopeKind,
 ) -> Option<ScopeLauncher> {
+    // Unit tests only (always `None` otherwise): a synthetic systemd-run
+    // named in this launch's own env, so the callers' argv can be tested.
+    let fake = test_fake_systemd_run(env);
     // Test-support builds must not reach a developer's user manager merely
     // because ordinary bash/PTY tests inherit a desktop environment. Synthetic
-    // launcher tests call launcher_with_binary directly; real smoke is opt-in.
+    // launcher tests use a fake systemd-run; real smoke is opt-in.
     #[cfg(any(test, feature = "testing"))]
-    if std::env::var("SYNAPS_TEST_REAL_SCOPES").as_deref() != Ok("1") {
+    if fake.is_none() && std::env::var("SYNAPS_TEST_REAL_SCOPES").as_deref() != Ok("1") {
         return None;
     }
     // Operator policy belongs to the host, not the tool's rebuilt env. A
     // child cannot enable scopes behind the host's explicit opt-out.
+    let config = crate::config::load_config();
     if !enabled_from(
         std::env::var("SYNAPS_PROCESS_SCOPES").ok().as_deref(),
-        crate::config::load_config().process_scopes,
+        config.process_scopes,
     ) {
         return None;
     }
+    let slice = slice_for(kind, &config);
     #[cfg(target_os = "linux")]
     {
+        if let Some(fake) = fake {
+            // The fake answers no `--version`: it launches without
+            // `--expand-environment=no`, as a pre-254 systemd-run would.
+            return launcher_with_binary(&fake, false, env, cwd, kind, slice);
+        }
         static BINARY: OnceLock<Option<PathBuf>> = OnceLock::new();
         let binary = BINARY.get_or_init(find_systemd_run).as_ref()?;
         // A property of the binary, not of manager availability: cache only a
@@ -266,11 +345,11 @@ pub fn launcher_for_effective_env(
                 *NO_EXPAND.get_or_init(|| v)
             }
         };
-        launcher_with_binary(binary, no_expand, env, cwd)
+        launcher_with_binary(binary, no_expand, env, cwd, kind, slice)
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (env, cwd);
+        let _ = (env, cwd, fake, slice);
         None
     }
 }
@@ -281,19 +360,49 @@ fn launcher_with_binary(
     no_expand: bool,
     env: &[(OsString, OsString)],
     cwd: Option<&std::path::Path>,
+    kind: ScopeKind,
+    slice: Option<String>,
 ) -> Option<ScopeLauncher> {
-    probe(binary, no_expand, env, cwd).then(|| ScopeLauncher {
-        systemd_run: binary.to_owned(),
-        no_expand,
-    })
+    if probe(binary, no_expand, env, cwd, slice.as_deref()) {
+        return Some(ScopeLauncher {
+            systemd_run: binary.to_owned(),
+            no_expand,
+            slice,
+        });
+    }
+    // Without a user manager in reach a slice changes nothing: no WARN then.
+    if let Some(slice) = slice.filter(|_| has_manager_env(env)) {
+        if first_refusal(&slice) {
+            tracing::warn!(
+                key = kind.slice_key(),
+                slice = %slice,
+                "process scope: the scope probe with --slice={slice} failed (does the user manager accept that slice?); these launches start without a scope"
+            );
+        }
+    }
+    None
 }
 
-/// Compatibility convenience for inherited or fully rebuilt environments.
+/// `true` the first time `slice` fails its probe in this process, so a
+/// refused slice logs one WARN, not one per command.
+#[cfg(target_os = "linux")]
+fn first_refusal(slice: &str) -> bool {
+    static WARNED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    let mut warned = WARNED.lock().unwrap_or_else(|e| e.into_inner());
+    if warned.iter().any(|s| s == slice) {
+        return false;
+    }
+    warned.push(slice.to_owned());
+    true
+}
+
+/// Compatibility convenience for inherited or fully rebuilt environments,
+/// for a tool launch.
 pub fn launcher_for_env(env: Option<&[(String, String)]>) -> Option<ScopeLauncher> {
     let env = env
         .map(|e| e.iter().map(|(k, v)| (k.into(), v.into())).collect())
         .unwrap_or_else(inherited_env);
-    launcher_for_effective_env(&env, None)
+    launcher_for_effective_env(&env, None, ScopeKind::Tool)
 }
 
 /// Resolve before wrapping: systemd-run must not substitute its own executable
@@ -348,6 +457,7 @@ mod tests {
         let l = ScopeLauncher {
             systemd_run: PathBuf::from("/usr/bin/systemd-run"),
             no_expand,
+            slice: None,
         };
         let (program, args) = l.wrap("synaps tool: bash", "bash", ["-c".into(), script.into()]);
         let args = args
@@ -434,10 +544,10 @@ exit 0
         );
         assert_eq!(systemd_run_version(&binary), Some(249));
         let env = vec![("DBUS_SESSION_BUS_ADDRESS".into(), "fake:good".into())];
-        assert!(launcher_with_binary(&binary, false, &env, None).is_some());
+        assert!(launcher_with_binary(&binary, false, &env, None, ScopeKind::Tool, None).is_some());
         // Had support been misjudged, the probe fails: direct launch, never a
         // wrapped launch with an option the binary rejects.
-        assert!(launcher_with_binary(&binary, true, &env, None).is_none());
+        assert!(launcher_with_binary(&binary, true, &env, None, ScopeKind::Tool, None).is_none());
         fake_script(dir.path(), "systemd-run", "exit 1");
         assert_eq!(systemd_run_version(&binary), None);
         fake_script(dir.path(), "systemd-run", "echo 'systemd 258 (258)'");
@@ -464,7 +574,7 @@ exit 0
         };
         let mut env = inherited_env();
         set_env(&mut env, "x", "EXPANDED");
-        let Some(launcher) = launcher_with_binary(&binary, no_expand, &env, None) else {
+        let Some(launcher) = launcher_with_binary(&binary, no_expand, &env, None, ScopeKind::Tool, None) else {
             eprintln!("skip: no reachable systemd user manager");
             return;
         };
@@ -503,7 +613,7 @@ exit 0
             "DBUS_SESSION_BUS_ADDRESS".into(),
             "fake:must-not-probe".into(),
         )];
-        assert!(launcher_for_effective_env(&env, None).is_none());
+        assert!(launcher_for_effective_env(&env, None, ScopeKind::Tool).is_none());
     }
 
     #[test]
@@ -562,16 +672,16 @@ exit 0
             set_env(&mut env, k, v);
         }
         set_env(&mut env, "EXPECTED_CWD", dir.path().as_os_str());
-        assert!(launcher_with_binary(&binary, true, &env, Some(dir.path())).is_some());
+        assert!(launcher_with_binary(&binary, true, &env, Some(dir.path()), ScopeKind::Tool, None).is_some());
         set_env(&mut env, "DBUS_SESSION_BUS_ADDRESS", "fake:stale");
-        assert!(launcher_with_binary(&binary, true, &env, Some(dir.path())).is_none());
+        assert!(launcher_with_binary(&binary, true, &env, Some(dir.path()), ScopeKind::Tool, None).is_none());
         set_env(&mut env, "DBUS_SESSION_BUS_ADDRESS", "fake:good");
-        assert!(launcher_with_binary(&binary, true, &env, Some(dir.path())).is_some());
+        assert!(launcher_with_binary(&binary, true, &env, Some(dir.path()), ScopeKind::Tool, None).is_some());
         // Same discovered path, changed availability: no cached positive.
         fake_script(dir.path(), "systemd-run", "exit 1");
-        assert!(launcher_with_binary(&binary, true, &env, Some(dir.path())).is_none());
+        assert!(launcher_with_binary(&binary, true, &env, Some(dir.path()), ScopeKind::Tool, None).is_none());
         env.retain(|(k, _)| k != "DBUS_SESSION_BUS_ADDRESS");
-        assert!(!probe(&binary, true, &env, Some(dir.path())));
+        assert!(!probe(&binary, true, &env, Some(dir.path()), None));
     }
 
     #[cfg(target_os = "linux")]
@@ -601,7 +711,7 @@ printf 'wrapper=%s\n' "$$"
                     if started { "exec \"$@\"" } else { "exit 42" }
                 ),
             );
-            let launcher = launcher_with_binary(&binary, true, &env, Some(dir.path())).unwrap();
+            let launcher = launcher_with_binary(&binary, true, &env, Some(dir.path()), ScopeKind::Tool, None).unwrap();
             let (program, args) = launcher.wrap("test", command.as_os_str(), []);
             let mut child = Command::new(program)
                 .args(args)
@@ -675,9 +785,7 @@ printf 'wrapper=%s\n' "$$"
         assert_eq!(spawn.matches(".spawn_command(cmd)").count(), 1);
         let daemon = include_str!("daemon/mod.rs");
         let spawn = daemon.split("pub fn spawn_detached(").nth(1).unwrap();
-        assert!(
-            spawn.find("launcher_for_effective_env").unwrap() < spawn.find("libc::pipe(").unwrap()
-        );
+        assert!(spawn.find("daemon_launch(").unwrap() < spawn.find("libc::pipe(").unwrap());
         assert!(
             spawn.find("libc::pipe(").unwrap()
                 < spawn
@@ -696,5 +804,187 @@ printf 'wrapper=%s\n' "$$"
             .unwrap();
         assert_eq!(spawn.matches("cmd.spawn()").count(), 1);
         assert!(spawn.contains("_ = cancel.cancelled()"));
+    }
+
+    fn args_of(args: &[OsString]) -> Vec<String> {
+        args.iter().map(|a| a.to_string_lossy().into_owned()).collect()
+    }
+
+    #[test]
+    fn wrap_passes_the_slice_before_the_description_when_set() {
+        let l = ScopeLauncher {
+            systemd_run: PathBuf::from("/usr/bin/systemd-run"),
+            no_expand: false,
+            slice: Some("worker-agent.slice".into()),
+        };
+        let (program, args) = l.wrap("synaps tool: bash", "bash", ["-c".into(), "echo hi".into()]);
+        assert_eq!(program, OsString::from("/usr/bin/systemd-run"));
+        assert_eq!(
+            args_of(&args),
+            [
+                "--user",
+                "--scope",
+                "--quiet",
+                "--collect",
+                "--slice=worker-agent.slice",
+                "--description=synaps tool: bash",
+                "--",
+                "bash",
+                "-c",
+                "echo hi",
+            ]
+        );
+    }
+
+    #[test]
+    fn each_kind_reads_its_own_slice_key() {
+        let mut c = crate::config::SynapsConfig::default();
+        assert_eq!(slice_for(ScopeKind::Tool, &c), None);
+        assert_eq!(slice_for(ScopeKind::Daemon, &c), None);
+        c.tool_scope_slice = Some("t-agent.slice".into());
+        assert_eq!(slice_for(ScopeKind::Tool, &c).as_deref(), Some("t-agent.slice"));
+        assert_eq!(slice_for(ScopeKind::Daemon, &c), None);
+        c.daemon_scope_slice = Some("d-agent.slice".into());
+        assert_eq!(slice_for(ScopeKind::Daemon, &c).as_deref(), Some("d-agent.slice"));
+        assert_eq!(slice_for(ScopeKind::Tool, &c).as_deref(), Some("t-agent.slice"));
+        assert_eq!(ScopeKind::Tool.slice_key(), "tool_scope_slice");
+        assert_eq!(ScopeKind::Daemon.slice_key(), "daemon_scope_slice");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_probe_runs_with_the_launch_slice_and_a_refused_slice_launches_direct() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = test_support::fake_systemd_run(dir.path());
+        let env = vec![("DBUS_SESSION_BUS_ADDRESS".into(), "fake:good".into())];
+        // Unset: the probe's options are today's, byte for byte.
+        assert!(launcher_with_binary(&fake, false, &env, Some(dir.path()), ScopeKind::Tool, None).is_some());
+        assert_eq!(
+            test_support::recorded(dir.path(), "probe.args"),
+            ["--user", "--scope", "--quiet", "--collect", "--description=synaps scope probe", "--", "/bin/true"]
+        );
+        // Set: the probe carries the launch's --slice.
+        let slice = Some("worker-agent.slice".to_string());
+        let l = launcher_with_binary(&fake, false, &env, Some(dir.path()), ScopeKind::Tool, slice).unwrap();
+        assert_eq!(
+            test_support::recorded(dir.path(), "probe.args"),
+            [
+                "--user",
+                "--scope",
+                "--quiet",
+                "--collect",
+                "--slice=worker-agent.slice",
+                "--description=synaps scope probe",
+                "--",
+                "/bin/true",
+            ]
+        );
+        assert!(args_of(&l.wrap("t", "/bin/echo", []).1).contains(&"--slice=worker-agent.slice".to_string()));
+        // A manager that refuses the slice fails the probe: no launcher, so
+        // the command starts directly, as with scopes unavailable.
+        let refusing = fake_script(
+            dir.path(),
+            "refusing-systemd-run",
+            r#"for a in "$@"; do case "$a" in --slice=*) exit 1;; esac; done
+exit 0"#,
+        );
+        let refused = Some("refused-probe-test.slice".to_string());
+        assert!(launcher_with_binary(&refusing, false, &env, Some(dir.path()), ScopeKind::Tool, refused).is_none());
+        assert!(launcher_with_binary(&refusing, false, &env, Some(dir.path()), ScopeKind::Tool, None).is_some());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_refused_slice_warns_once_per_name() {
+        assert!(first_refusal("warn-once-test-a.slice"));
+        assert!(!first_refusal("warn-once-test-a.slice"));
+        assert!(first_refusal("warn-once-test-b.slice"));
+    }
+
+    /// End to end through the selection: each kind's scope goes in its own
+    /// configured slice; neither key set, no `--slice`; `process_scopes =
+    /// off` still means no scope.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[serial_test::serial(synaps_base_dir)]
+    fn each_kind_launches_in_its_configured_slice() {
+        let base = crate::test_env::BaseDirGuard::new();
+        let _scopes = crate::test_env::EnvVarGuard::remove("SYNAPS_PROCESS_SCOPES");
+        let dir = tempfile::tempdir().unwrap();
+        let fake = test_support::fake_systemd_run(dir.path());
+        let env: Vec<(OsString, OsString)> = test_support::fake_env(&fake)
+            .into_iter()
+            .map(|(k, v)| (k.into(), v.into()))
+            .collect();
+        let slices = |kind| {
+            launcher_for_effective_env(&env, Some(dir.path()), kind).map(|l| {
+                args_of(&l.wrap("t", "/bin/echo", []).1)
+                    .into_iter()
+                    .filter(|a| a.starts_with("--slice"))
+                    .collect::<Vec<_>>()
+            })
+        };
+        assert_eq!(slices(ScopeKind::Tool), Some(vec![]));
+        assert_eq!(slices(ScopeKind::Daemon), Some(vec![]));
+        let config = base.path().join("config");
+        std::fs::write(&config, "tool_scope_slice = t-agent.slice\ndaemon_scope_slice = d-agent.slice\n").unwrap();
+        assert_eq!(slices(ScopeKind::Tool), Some(vec!["--slice=t-agent.slice".to_string()]));
+        assert_eq!(slices(ScopeKind::Daemon), Some(vec!["--slice=d-agent.slice".to_string()]));
+        std::fs::write(&config, "process_scopes = off\ntool_scope_slice = t-agent.slice\n").unwrap();
+        assert_eq!(slices(ScopeKind::Tool), None);
+    }
+
+    /// The test seam is compiled into unit tests only.
+    #[test]
+    fn the_fake_systemd_run_seam_is_test_only() {
+        let source = include_str!("process_scope.rs");
+        assert!(source.contains("#[cfg(test)]\nfn test_fake_systemd_run("));
+        assert!(source.contains(
+            "#[cfg(not(test))]\nfn test_fake_systemd_run(_env: &[(OsString, OsString)]) -> Option<PathBuf> {\n    None\n}"
+        ));
+    }
+}
+
+/// Shared by the callers' tests (bash, PTY, daemon): a synthetic
+/// systemd-run, never a real manager.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) mod test_support {
+    use std::path::{Path, PathBuf};
+
+    /// A fake `systemd-run` in `dir`. The probe (`… -- /bin/true`) writes its
+    /// arguments to `dir/probe.args` and succeeds; a launch writes them to
+    /// `dir/launch.args` and execs the command after `--`.
+    pub(crate) fn fake_systemd_run(dir: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("systemd-run");
+        let body = format!(
+            "#!/bin/sh\nfor a in \"$@\"; do last=$a; done\n\
+             if [ \"$last\" = /bin/true ]; then printf '%s\\n' \"$@\" > '{probe}'; exit 0; fi\n\
+             printf '%s\\n' \"$@\" > '{launch}'\n\
+             while [ \"$1\" != -- ]; do shift; done\nshift\nexec \"$@\"\n",
+            probe = dir.join("probe.args").display(),
+            launch = dir.join("launch.args").display(),
+        );
+        std::fs::write(&path, body).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        path
+    }
+
+    /// The arguments the fake recorded (`probe.args` / `launch.args`).
+    pub(crate) fn recorded(dir: &Path, which: &str) -> Vec<String> {
+        std::fs::read_to_string(dir.join(which))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// What a launch through the fake needs in its env: a user-bus address
+    /// (the probe's precondition) and the seam variable naming the fake.
+    pub(crate) fn fake_env(fake: &Path) -> Vec<(String, String)> {
+        vec![
+            ("DBUS_SESSION_BUS_ADDRESS".into(), "fake:slice-test".into()),
+            ("SYNAPS_TEST_FAKE_SYSTEMD_RUN".into(), fake.display().to_string()),
+        ]
     }
 }
