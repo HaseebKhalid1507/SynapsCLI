@@ -159,6 +159,22 @@ pub fn write_archive_anchored(
     Ok(path)
 }
 
+/// Write the plain-text transcript of a worker's evicted context window
+/// (`runtime::worker_context`) next to its resume archive: the same private
+/// directory (0700), a private file (0600), written atomically.
+pub(crate) fn write_window_transcript(path: &Path, body: &str) -> std::io::Result<()> {
+    let dir = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("transcript path has no directory"))?;
+    create_private_dir(dir)?;
+    use std::io::Write;
+    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+    tmp.write_all(body.as_bytes())?;
+    tmp.as_file().sync_all()?;
+    tmp.persist(path).map_err(|e| e.error)?;
+    Ok(())
+}
+
 /// Validate a caller-supplied archive path (`subagent_resume.archive_path`, for
 /// workers of an earlier or crashed session): `~` expanded, must resolve to a
 /// `.json` file under `<base>/subagent-history`.
@@ -681,7 +697,14 @@ pub fn cold_resume_messages(
         tail.push('\n');
     }
 
-    let blocks = [header, task, tail, report, note];
+    // A run whose context rolled over: name the saved earlier windows, and
+    // carry their metadata so the resumed worker keeps numbering them.
+    let marker = crate::runtime::worker_context::carried_marker(history);
+    let windows = marker.as_ref().map(earlier_windows_section).unwrap_or_default();
+    let blocks: Vec<String> = [header, task, windows, tail, report, note]
+        .into_iter()
+        .filter(|b| !b.is_empty())
+        .collect();
     // Not smaller than replaying everything: the compaction only loses detail.
     if crate::runtime::context::conservative_token_estimate(&blocks.concat()) >= info.est_tokens {
         return None;
@@ -690,10 +713,28 @@ pub fn cold_resume_messages(
         .into_iter()
         .map(|text| serde_json::json!({"type": "text", "text": text}))
         .collect();
-    Some(vec![std::sync::Arc::new(serde_json::json!({
-        "role": "user",
-        "content": content
-    }))])
+    let mut message = serde_json::json!({"role": "user", "content": content});
+    if let Some(marker) = marker {
+        message[crate::runtime::worker_context::MARKER_KEY] = marker;
+    }
+    Some(vec![std::sync::Arc::new(message)])
+}
+
+/// The cold-resume section listing a rolled run's saved context windows.
+fn earlier_windows_section(marker: &Value) -> String {
+    let mut out = String::from(
+        "## Earlier context windows of this run\n\nYour context rolled over during the run; \
+         the messages moved out of it are saved as plain text you can grep or read by line range:",
+    );
+    for t in marker["transcripts"].as_array().into_iter().flatten() {
+        out.push_str(&format!(
+            "\n- window {}: {} ({} messages)",
+            t["window"],
+            crate::runtime::continuation::neutral_note(t["path"].as_str().unwrap_or("?")),
+            t["messages"]
+        ));
+    }
+    out
 }
 
 /// What a timed-out worker reports: latest progress first, so the completion
@@ -1139,6 +1180,68 @@ mod cold_resume_tests {
             {"type": "text", "text": "FINAL-REPORT all done"}
         ]}));
         h
+    }
+
+    /// `big_history`, rolled over by the worker rollover into window 2.
+    fn rolled_history(rounds: usize) -> Vec<Value> {
+        let shared: Vec<crate::SharedMessage> =
+            big_history(rounds).into_iter().map(Arc::new).collect();
+        let plan = crate::runtime::worker_context::plan_rollover(
+            &shared,
+            crate::runtime::continuation::SuccessorBudget { history_tokens: 30_000 },
+            200_000,
+            |w| std::path::PathBuf::from(format!("/arch/sa_3.window-{w}.md")),
+        )
+        .expect("rolls over");
+        plan.successor.iter().map(|m| (**m).clone()).collect()
+    }
+
+    #[test]
+    fn resume_after_rollover_keeps_the_brief_and_the_way_back_to_earlier_windows() {
+        use crate::runtime::worker_context::{window_state, MARKER_KEY};
+        let history = rolled_history(60);
+        assert_eq!(history[0]["content"], "TASK-MARK build the plate");
+        let est = estimate_history_tokens(&history);
+        assert!(est >= 20_000, "{est}");
+
+        // Warm (or full_history): the rolled window is replayed as is, note
+        // and its metadata included, so numbering continues at window 2.
+        let policy = ResumePolicy { full_history: false, compact_tokens: 10_000 };
+        let (warm, compacted) =
+            plan_resume_messages(history.clone(), "NEW-INSTRUCTIONS", Some(Duration::from_secs(10)), policy);
+        assert!(compacted.is_none());
+        assert_eq!(warm[0]["content"], "TASK-MARK build the plate");
+        assert!(warm[1].get(MARKER_KEY).is_some());
+        assert_eq!(window_state(&warm).0, 2);
+        assert!(warm.last().unwrap().to_string().contains("NEW-INSTRUCTIONS"));
+
+        // Cold and large (#315): the compact message keeps the original task,
+        // names the saved windows, and carries their metadata.
+        let (cold, compacted) =
+            plan_resume_messages(history, "NEW-INSTRUCTIONS", Some(Duration::from_secs(3600)), policy);
+        assert!(compacted.is_some());
+        assert_eq!(cold.len(), 1);
+        let text = joined_text(&cold);
+        assert!(text.contains("## Your original task\n\nTASK-MARK build the plate"), "{text}");
+        assert!(text.contains("## Earlier context windows of this run"), "{text}");
+        assert!(text.contains("- window 1: /arch/sa_3.window-1.md"), "{text}");
+        let (window, transcripts) = window_state(&cold);
+        assert_eq!(window, 2);
+        assert_eq!(transcripts.len(), 1);
+        // Host metadata stays off the wire.
+        let wire = serde_json::to_string(&crate::runtime::continuation::WireMessages(&cold)).unwrap();
+        assert!(!wire.contains(MARKER_KEY));
+    }
+
+    #[test]
+    fn cold_resume_of_a_never_rolled_worker_is_unchanged() {
+        let history = big_history(60);
+        let policy = ResumePolicy { full_history: false, compact_tokens: 10_000 };
+        let (cold, _) =
+            plan_resume_messages(history, "go", Some(Duration::from_secs(3600)), policy);
+        assert!(!joined_text(&cold).contains("Earlier context windows"));
+        assert!(cold[0].get(crate::runtime::worker_context::MARKER_KEY).is_none());
+        assert_eq!(cold[0]["content"].as_array().unwrap().len(), 5);
     }
 
     fn info_for(history: &[Value]) -> ColdResumeInfo {

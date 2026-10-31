@@ -6,6 +6,7 @@ use ratatui::{
 
 pub(crate) mod paths;
 mod subagent_card;
+mod thinking;
 
 use super::app::SPINNER_FRAMES;
 use super::draw::{bash_trace, format_tool_name, tool_accent};
@@ -16,9 +17,7 @@ use super::highlight::{
 use super::markdown::{render_markdown_spans, wrap_text, wrap_text_spans};
 use super::text_metrics::width as display_width;
 use super::theme::THEME;
-use super::transcript::{
-    ChatMessage, LineMeta, MsgSlot, RenderCtx, TranscriptStore, THINKING_PLACEHOLDER,
-};
+use super::transcript::{ChatMessage, LineMeta, MsgSlot, RenderCtx, TranscriptStore};
 
 /// Replace column 0 of a card row (always a space: transcript rows start
 /// with the 3-space margin) with a heavy `┃` in `accent`, flush with the
@@ -341,108 +340,44 @@ impl TranscriptStore {
             }
 
             ChatMessage::Thinking(text) => {
-                // Only add spacing if previous message wasn't a User block
-                // (User blocks already have bottom margin)
-                let prev_was_user =
-                    i > 0 && matches!(&self.messages()[i - 1].msg, ChatMessage::User(_));
-                if !prev_was_user {
-                    lines.push(Line::from(""));
-                }
-                let dim = Style::default().fg(THEME.load().thinking_color);
-                let dim_italic = dim.add_modifier(Modifier::ITALIC);
-                // Header
-                let thinking_label = if text == THINKING_PLACEHOLDER {
-                    let braille = [
-                        '\u{28fe}', '\u{28f7}', '\u{28ef}', '\u{28df}', '\u{287f}', '\u{28bf}',
-                        '\u{28fb}', '\u{28fd}',
-                    ];
-                    let idx = (ctx.spinner_frame / 4) % braille.len();
-                    let wave: String = (0..3).map(|i| braille[(idx + i) % braille.len()]).collect();
-                    format!("{} thinking", wave)
-                } else {
-                    "thinking".to_string()
-                };
-                lines.push(Line::from(vec![
-                    Span::styled(format!("{}╭─ ", m), dim),
-                    Span::styled(thinking_label, dim.add_modifier(Modifier::DIM)),
-                ]));
-                // Body — structured with visual hierarchy
-                // Slice (c): rows are trimmed + char-chunked — transformed
-                // views, so they map to their untrimmed source lines at
-                // ContentLine granularity only (design §2 A2, lock L1
-                // fallback). The spinner placeholder has empty source
-                // (`source_text`), so its rows stay Chrome. Hidden tail
-                // lines (>8) are reachable via the D4 whole-card rule.
-                let is_placeholder = text == THINKING_PLACEHOLDER;
-                let non_empty: Vec<(usize, &str)> = text
-                    .lines()
-                    .enumerate()
-                    .filter(|(_, l)| !l.trim().is_empty())
-                    .collect();
-                let show = non_empty.len().min(8);
-                // Calculate usable width for thinking content
-                let prefix_len = m.len() + 4; // margin + "│ · " or "│ "
-                let content_width = width.saturating_sub(prefix_len);
-
-                for (k, (src_line, line)) in non_empty[..show].iter().enumerate() {
-                    let meta = if is_placeholder {
-                        LineMeta::Chrome
-                    } else {
-                        LineMeta::ContentLine {
-                            msg_idx: i,
-                            src_line: *src_line,
-                        }
-                    };
-                    let trimmed = line.trim();
-                    let is_last = k == show - 1 && non_empty.len() <= 8;
-
-                    // Detect structure in thinking
-                    let (prefix_char, line_style) =
-                        if trimmed.starts_with("- ") || trimmed.starts_with("* ") {
-                            ("· ", dim_italic)
-                        } else if trimmed.ends_with(':') || trimmed.starts_with('#') {
-                            ("", dim.add_modifier(Modifier::BOLD))
-                        } else if trimmed.starts_with("```") {
-                            ("", dim.add_modifier(Modifier::DIM))
-                        } else {
-                            ("", dim_italic)
-                        };
-
-                    // Word-wrap (was char-chunked mid-word), keeping the
-                    // connector on every row; the closing ╰ goes on the
-                    // card's very last row, not the last paragraph's first.
-                    let rows = if content_width > 10 {
-                        wrap_text(trimmed, content_width)
-                    } else {
-                        vec![trimmed.to_string()]
-                    };
-                    let n_rows = rows.len();
-                    let cont_pad = " ".repeat(display_width(prefix_char));
-                    for (r, chunk) in rows.into_iter().enumerate() {
-                        let connector = if is_last && r + 1 == n_rows { "╰" } else { "│" };
-                        let lead = if r == 0 { prefix_char } else { cont_pad.as_str() };
-                        lines.push_meta(
-                            Line::from(Span::styled(
-                                format!("{}{} {}{}", m, connector, lead, chunk),
-                                line_style,
-                            )),
-                            meta.clone(),
-                        );
-                    }
-                }
-                if non_empty.len() > 8 {
-                    lines.push(Line::from(Span::styled(
-                        format!("{}╰ +{} lines", m, non_empty.len() - 8),
-                        dim,
-                    )));
-                }
+                // The light open rail at the message margin
+                // (render/thinking.rs). Slice (c): the body is
+                // `render_markdown_spans` over the raw source, so its rows
+                // carry the agent text's provenance (re-verified on the final
+                // row, lock L1); the placeholder's source is empty
+                // (`source_text`), so it is all Chrome. Collapsed rows are
+                // reachable through the footer's ContentLine (D4 whole-card
+                // rule).
+                let prev_ends_blank = i > 0
+                    && matches!(
+                        &self.messages()[i - 1].msg,
+                        ChatMessage::User(_)
+                            | ChatMessage::Text(_)
+                            | ChatMessage::Event { .. }
+                            | ChatMessage::Thinking(_)
+                    );
+                thinking::render(
+                    &mut lines,
+                    text,
+                    tmsg.thought,
+                    i,
+                    width,
+                    self.now(),
+                    ctx,
+                    prev_ends_blank,
+                    self.show_full_output(),
+                );
             }
 
             ChatMessage::Text(text) => {
                 // Turn boundary: two blank lines of breathing room between the
                 // previous block and the agent header. Replaces the old
-                // ──── · ──── divider — the extra <br> carries the beat.
-                if i > 0 {
+                // ──── · ──── divider — the extra <br> carries the beat. A
+                // thought is the answer's own prelude: it already ends in a
+                // blank row, and the answer hangs right under it.
+                let after_thought =
+                    i > 0 && matches!(&self.messages()[i - 1].msg, ChatMessage::Thinking(_));
+                if i > 0 && !after_thought {
                     lines.push(Line::from(""));
                     lines.push(Line::from(""));
                 }
@@ -1414,8 +1349,9 @@ mod meta_tests {
         }
     }
 
-    /// Thinking rows word-wrap (no mid-word cuts) and the closing `╰` sits
-    /// on the card's last row only.
+    /// Thinking rows word-wrap (no mid-word cuts) on the open rail: the
+    /// `╭─ ◇` header, `│` on every body row with the text two cells off it,
+    /// and the closing `╰` on the block's last row only.
     #[test]
     fn thinking_wraps_on_words_and_closes_on_the_last_row() {
         let last = "The safest approach is to not collect and just give a brief reply, \
@@ -1429,21 +1365,30 @@ mod meta_tests {
                 .lines()
                 .iter()
                 .map(flatten)
-                .filter(|r| r.contains('\u{2502}') || r.contains('\u{2570}'))
+                .filter(|r| !r.is_empty())
                 .collect();
-            let closers: Vec<usize> = rows
+            assert!(
+                rows[0].starts_with("   \u{256d}\u{2500} \u{25c7} thought"),
+                "w={width}: {rows:#?}"
+            );
+            let body = &rows[1..];
+            let closers: Vec<usize> = body
                 .iter()
                 .enumerate()
-                .filter(|(_, r)| r.contains('\u{2570}'))
+                .filter(|(_, r)| r.starts_with("   \u{2570}"))
                 .map(|(k, _)| k)
                 .collect();
-            assert_eq!(closers, vec![rows.len() - 1], "w={width}: {rows:#?}");
-            let body: Vec<String> = rows
+            assert_eq!(closers, vec![body.len() - 1], "w={width}: {rows:#?}");
+            assert!(
+                body[..body.len() - 1].iter().all(|r| r.starts_with("   \u{2502}  ")),
+                "w={width}: rail on every row: {rows:#?}"
+            );
+            let words: Vec<String> = body
                 .iter()
                 .skip(1)
-                .map(|r| r.trim_start().trim_start_matches(['\u{2502}', '\u{2570}']).trim().to_string())
+                .map(|r| r.chars().skip(6).collect::<String>().trim().to_string())
                 .collect();
-            assert_eq!(body.join(" "), last, "w={width}: words intact: {rows:#?}");
+            assert_eq!(words.join(" "), last, "w={width}: words intact: {rows:#?}");
             for r in &rows {
                 assert!(unicode_width::UnicodeWidthStr::width(r.as_str()) <= width, "{r:?}");
             }
@@ -1465,7 +1410,9 @@ mod meta_tests {
                 .into(),
         ));
         store.push_msg(ChatMessage::Thinking(
-            "pondering the request at hand".into(),
+            "pondering the request at hand, in plain prose that wraps at forty\n\
+             ## A plan\n- weigh `sync_cache` and **the splice**\n\n```rust\nlet y = 2;\n```"
+                .into(),
         ));
         store.push_msg(ChatMessage::Text(
             "Some **markdown** text with `code`\n\n```rust\nlet x = 1;\n```".into(),
@@ -1562,7 +1509,7 @@ mod meta_tests {
 
         // Plumbing must actually emit provenance for the plain-wrap paths —
         // an all-Chrome regression would pass the checks above vacuously.
-        for (idx, wants_content) in [(0usize, true), (6, true), (5, true)] {
+        for (idx, wants_content) in [(0usize, true), (1, true), (6, true), (5, true)] {
             let entry = store.render_message_lines(idx, 80, &ctx());
             assert_eq!(
                 entry

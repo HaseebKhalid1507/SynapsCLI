@@ -87,3 +87,35 @@ id, and `data` includes `old_session_id`, `new_session_id`, `message_count`, and
 registration order. Put high-priority security policy extensions earlier in plugin
 load order, and avoid granting trust to plugins that can modify tool inputs unless
 you accept this ordering behavior.
+
+## Subagent workers
+
+A subagent worker's tool calls run only one kind of hook: `after_tool_call`
+for extensions that hold **`tools.transform_output`**, so output transforms
+(compression, redaction) see worker tool results the way they see the main
+session's. Nothing else fires for a worker's tool calls: no `before_tool_call`
+(so a worker never raises a confirm prompt and an extension can't block or
+modify its input), no observe-only `after_tool_call` (`tools.intercept`
+without `tools.transform_output`), no message or session hooks.
+
+- **Same rules as the main session:** the handler chain order, the first
+  `replace` wins, the two-key permission gate, the 5 s timeout, the 1 MiB
+  clamp, and fail-safe pass-through (a timed-out, crashed or malformed handler
+  leaves the original output). The order inside the worker's tool loop is the
+  main session's too: your `replace`, then tool output virtualisation (the
+  spill file holds your output), then read dedupe.
+- **`session_id` is `null`.** A worker has no conversation id (see
+  `session-id.md`). Treat `null` as "a worker or no session".
+- **One process for everyone.** The main session and all its workers call the
+  same extension process; calls are serialized per extension and matched by
+  JSON-RPC id, so parallel workers each get the reply to their own call. A
+  call that waits behind a slow one still has its own 5 s budget, then passes
+  through.
+- **Workers never start or restart your process.** While it is down
+  (crashed, or deferred and not yet started by the main session), a worker's
+  tool result passes through untransformed; the main session's next call
+  starts it as before. A call in flight when a reload stops the old instance
+  passes through; a reloaded or newly loaded extension applies to running
+  workers from their next tool call.
+- **Opt-out:** `subagent_transform_hooks = off` (default on; a /settings
+  row) runs no hooks at all for workers, as before.

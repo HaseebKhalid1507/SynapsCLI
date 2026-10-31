@@ -255,12 +255,45 @@ define_settings! {
         "subagent_resume of a worker whose prompt cache expired replays a compact context instead of the full transcript once its history reaches this many tokens (default 100000; 0 = always replay in full). Applies from the next resume.",
         |_app, value| whole_number("subagent_cold_resume_compact_tokens", value);
 
+    "subagent_context_management", "Subagent rollover", Agent,
+        EditorKind::Cycler(&["auto", "off"]),
+        "Automatic context rollover for subagent workers: auto moves a worker's older rounds out of its context once it reaches the rollover size (saved as plain text beside its resume archive, nothing summarized; the task and recent rounds stay); off lets a worker's context grow until the window is full (default auto). Applies to workers started afterwards.",
+        |_app, value| config_edit("subagent_context_management", value);
+
+    "subagent_rollover_tokens", "Subagent rollover at", Agent,
+        EditorKind::Text { numeric: true },
+        "Context size, in tokens, at which a worker rolls over to a ~100k successor (default 200000, at least 20000; a smaller model window's own threshold wins). Applies to workers started afterwards.",
+        |_app, value| whole_number("subagent_rollover_tokens", value);
+
+    "subagent_transform_hooks", "Subagent output hooks", Agent, EditorKind::Cycler(&["on", "off"]),
+        "Extensions that rewrite tool output (after_tool_call replace with tools.transform_output: compression, redaction) also see subagent workers' tool results, as they see the main session's; no other hook runs in a worker, so a worker never asks for confirmation (default on; off = worker tool results reach history untransformed). Applies to workers started afterwards.",
+        |_app, value| on_off("subagent_transform_hooks", value);
+
     "max_tool_output", "Max tool output", ToolLimits, EditorKind::Text { numeric: true },
         "Bytes to capture from a tool before truncating.",
         |_app, value| match value.parse::<usize>() {
             Ok(bytes) => SettingApply::Session(SessionSetting::MaxToolOutput { bytes }),
             Err(_) => SettingApply::Local(Ok(())),
         };
+
+    "tool_output_spill_bytes", "Tool output spill", ToolLimits,
+        EditorKind::Text { numeric: true },
+        "A tool result bigger than this many bytes is saved whole to a spill file; history keeps its start and end plus a pointer the model can read or grep (default 12288; 0 = off). Applies to new sessions and workers.",
+        |_app, value| whole_number("tool_output_spill_bytes", value);
+
+    "tool_output_spill_head_bytes", "Spill preview head", ToolLimits,
+        EditorKind::Text { numeric: true },
+        "Bytes from the start of a spilled tool result kept in history (default 4096).",
+        |_app, value| whole_number("tool_output_spill_head_bytes", value);
+
+    "tool_output_spill_tail_bytes", "Spill preview tail", ToolLimits,
+        EditorKind::Text { numeric: true },
+        "Bytes from the end of a spilled tool result kept in history, where errors usually are (default 3072).",
+        |_app, value| whole_number("tool_output_spill_tail_bytes", value);
+
+    "read_dedupe", "Read dedupe", ToolLimits, EditorKind::Cycler(&["on", "off"]),
+        "A re-read of a file whose result would be identical to an earlier read still in context returns a short stub pointing at that earlier result, and write/edit results say there is no need to re-read to verify (default on; off = full results every time). Applies to new sessions and workers.",
+        |_app, value| on_off("read_dedupe", value);
 
     "bash_timeout", "Bash timeout", ToolLimits, EditorKind::Text { numeric: true },
         "Default seconds allowed for a bash command.",
@@ -379,8 +412,8 @@ define_settings! {
     // (`config_edit`), so /settings can never write a value `load_config`
     // rejects; `Local(Err)` skips the write.
 
-    "cache_ttl", "Cache TTL", Context, EditorKind::Cycler(&["5m", "1h", "hybrid"]),
-        "Prompt-cache lifetime for Anthropic requests: 5m (default), 1h on every marker, or hybrid (1h on the stable prefix, 5m on the message tail). Takes effect next launch.",
+    "cache_ttl", "Cache TTL", Context, EditorKind::Cycler(&["auto", "5m", "1h", "hybrid"]),
+        "Prompt-cache lifetime for Anthropic requests: auto (default: 1h on a Claude subscription login, 5m on an API key, where 1h writes cost 2x input), 5m, 1h on every marker, or hybrid (1h on the stable prefix, 5m on the message tail). Subagent workers always use 5m. Takes effect next launch.",
         |_app, value| config_edit("cache_ttl", value);
 
     "cache_diagnostics", "Cache diagnostics", Context, EditorKind::Cycler(&["on", "off"]),
@@ -396,6 +429,14 @@ define_settings! {
         EditorKind::Text { numeric: true },
         "Longest an auto keep-warm idle period may run, in hours (1–48, default 24). Takes effect next launch.",
         |_app, value| whole_number("cache_keepwarm_auto_max_hours", value);
+
+    "cache_keepwarm_headless", "Keep-warm headless", Context, EditorKind::Cycler(&["off", "on"]),
+        "Let daemon sessions driven only by chat, rpc or server clients (bridges, scripts) keep warm too; off (default) keeps it to sessions a TUI or `synaps attach` typed in. `synaps rpc` without the daemon never keeps warm. Takes effect next launch.",
+        |_app, value| on_off("cache_keepwarm_headless", value);
+
+    "cache_keepwarm_tools", "Keep-warm tool rounds", Context, EditorKind::Cycler(&["on", "off"]),
+        "Keep the prompt cache warm while a long tool call runs (builds, test sweeps, polls): once tools have run for the TTL minus a margin (4.5 min on 5m, 55 min on 1h), resend that round's request asking for a minimal reply so the next request reads the cache instead of rewriting it. Independent of idle keep-warm (default on). Applies to new sessions and workers.",
+        |_app, value| on_off("cache_keepwarm_tools", value);
 
     "context_management.mode", "Context management", Context,
         EditorKind::Cycler(&["off", "auto"]),
@@ -1062,6 +1103,31 @@ mod tests {
         assert!(bad.is_empty(), "{bad:#?}");
     }
 
+    /// `cache_ttl` shows `auto` when unset (the config default) and when
+    /// set to it; unknown values fall back to the same default the parser
+    /// uses. Each shown value is a cycler option.
+    #[test]
+    fn cache_ttl_row_defaults_to_auto() {
+        use super::super::draw::config_row_display;
+        let _lock = config_lock();
+        for (content, shown) in [
+            ("", "auto"),
+            ("cache_ttl = auto\n", "auto"),
+            ("cache_ttl = 5m\n", "5m"),
+            ("cache_ttl = hybrid\n", "hybrid"),
+            ("cache_ttl = 2h\n", "auto"),
+        ] {
+            let temp = TempConfig::new(content);
+            assert_eq!(config_row_display("cache_ttl").as_deref(), Some(shown), "{content:?}");
+            drop(temp);
+        }
+        let def = ALL_SETTINGS.iter().find(|d| d.key == "cache_ttl").unwrap();
+        match def.editor {
+            EditorKind::Cycler(opts) => assert_eq!(opts, &["auto", "5m", "1h", "hybrid"]),
+            _ => panic!("cache_ttl editor should be a Cycler"),
+        }
+    }
+
     /// The display follows the configured value (normalised spellings).
     #[test]
     fn config_row_display_reads_the_configured_value() {
@@ -1088,6 +1154,91 @@ mod tests {
         );
         assert_eq!(config_row_display("request_compression").as_deref(), Some("off"));
         assert_eq!(config_row_display("request_compression_level").as_deref(), Some("6"));
+        drop(temp);
+    }
+
+    /// Worker rollover rows: shown as the value in force, edited through
+    /// the real parser (the 20000 floor included).
+    #[test]
+    fn subagent_rollover_rows_display_and_validate() {
+        use super::super::draw::config_row_display;
+        let _lock = config_lock();
+        for (content, mode, tokens) in [
+            ("", "auto", "200000"),
+            ("subagent_context_management = OFF\nsubagent_rollover_tokens = 150000\n", "off", "150000"),
+            ("subagent_context_management = maybe\nsubagent_rollover_tokens = 5\n", "auto", "200000"),
+        ] {
+            let temp = TempConfig::new(content);
+            assert_eq!(config_row_display("subagent_context_management").as_deref(), Some(mode), "{content}");
+            assert_eq!(config_row_display("subagent_rollover_tokens").as_deref(), Some(tokens), "{content}");
+            drop(temp);
+        }
+        let temp = TempConfig::new("");
+        let mut app = app_with_model("m");
+        {
+            let mut d = |key: &str, value: &str| apply_setting_dispatch(key, value, &mut app);
+            assert!(is_ok(d("subagent_context_management", "off")));
+            assert!(is_ok(d("subagent_context_management", "auto")));
+            assert!(is_err(d("subagent_context_management", "sometimes")));
+            assert!(is_ok(d("subagent_rollover_tokens", "150000")));
+            assert!(is_ok(d("subagent_rollover_tokens", "20000")));
+            assert!(is_err(d("subagent_rollover_tokens", "19999")));
+            assert!(is_err(d("subagent_rollover_tokens", "lots")));
+        }
+        drop(temp);
+    }
+
+    #[test]
+    fn subagent_transform_hooks_row_displays_and_validates() {
+        use super::super::draw::config_row_display;
+        let _lock = config_lock();
+        for (content, shown) in [
+            ("", "on"),
+            ("subagent_transform_hooks = off\n", "off"),
+            ("subagent_transform_hooks = true\n", "on"),
+            ("subagent_transform_hooks = maybe\n", "on"),
+        ] {
+            let temp = TempConfig::new(content);
+            assert_eq!(
+                config_row_display("subagent_transform_hooks").as_deref(),
+                Some(shown),
+                "{content}"
+            );
+            drop(temp);
+        }
+        let temp = TempConfig::new("");
+        let mut app = app_with_model("m");
+        {
+            let mut d = |key: &str, value: &str| apply_setting_dispatch(key, value, &mut app);
+            assert!(is_ok(d("subagent_transform_hooks", "off")));
+            assert!(is_ok(d("subagent_transform_hooks", "on")));
+            assert!(is_err(d("subagent_transform_hooks", "maybe")));
+        }
+        drop(temp);
+    }
+
+    #[test]
+    fn read_dedupe_row_displays_and_validates() {
+        use super::super::draw::config_row_display;
+        let _lock = config_lock();
+        for (content, shown) in [
+            ("", "on"),
+            ("read_dedupe = off\n", "off"),
+            ("read_dedupe = true\n", "on"),
+            ("read_dedupe = maybe\n", "on"),
+        ] {
+            let temp = TempConfig::new(content);
+            assert_eq!(config_row_display("read_dedupe").as_deref(), Some(shown), "{content}");
+            drop(temp);
+        }
+        let temp = TempConfig::new("");
+        let mut app = app_with_model("m");
+        {
+            let mut d = |key: &str, value: &str| apply_setting_dispatch(key, value, &mut app);
+            assert!(is_ok(d("read_dedupe", "off")));
+            assert!(is_ok(d("read_dedupe", "on")));
+            assert!(is_err(d("read_dedupe", "maybe")));
+        }
         drop(temp);
     }
 
@@ -1121,11 +1272,16 @@ mod tests {
             let mut d = |key: &str, value: &str| apply_setting_dispatch(key, value, &mut app);
 
             assert!(is_ok(d("cache_ttl", "hybrid")));
+            assert!(is_ok(d("cache_ttl", "auto")));
             assert!(is_err(d("cache_ttl", "2h")));
             assert!(is_ok(d("cache_keepwarm", "6h")));
             assert!(is_err(d("cache_keepwarm", "49h")));
             assert!(is_ok(d("cache_keepwarm_auto_max_hours", "48")));
             assert!(is_err(d("cache_keepwarm_auto_max_hours", "49")));
+            assert!(is_ok(d("cache_keepwarm_headless", "on")));
+            assert!(is_ok(d("cache_keepwarm_headless", "off")));
+            assert!(is_ok(d("cache_keepwarm_tools", "off")));
+            assert!(is_ok(d("cache_keepwarm_tools", "on")));
             assert!(is_ok(d("context_management.pressure_tokens", "auto")));
             assert!(is_ok(d("context_management.pressure_tokens", "120000")));
             assert!(is_err(d("context_management.pressure_tokens", "lots")));

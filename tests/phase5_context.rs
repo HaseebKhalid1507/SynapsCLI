@@ -175,7 +175,7 @@ fn all_fixtures() -> Vec<Fixture> {
 
 const WINDOW: u64 = 200_000;
 const THINKING_RESERVE: u64 = 8_000;
-const OUTPUT_RESERVE: u64 = 64_000;
+const MAX_OUTPUT_TOKENS: u64 = 64_000;
 const TOOL_RESULT_BYTES: u64 = 50_000;
 
 fn base_inputs<'a>(messages: &'a [SharedMessage], tools: &'a [Value]) -> ContextBudgetInputs<'a> {
@@ -189,7 +189,7 @@ fn base_inputs<'a>(messages: &'a [SharedMessage], tools: &'a [Value]) -> Context
         memory_contents: &[],
         thinking_budget_tokens: THINKING_RESERVE,
         next_tool_result_bytes: TOOL_RESULT_BYTES,
-        output_reserve_tokens: OUTPUT_RESERVE,
+        max_output_tokens: MAX_OUTPUT_TOKENS,
     }
 }
 

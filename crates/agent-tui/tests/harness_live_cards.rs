@@ -197,10 +197,24 @@ fn a_running_card_with_output_keeps_counting_after_a_steer() {
     assert!(clock.is_some(), "the result row's clock moved on:\n{frame}");
 }
 
-/// The thinking placeholder's spinner keeps turning when a steer lands
+/// The `◇ thinking` row as each cell's symbol and colour: the
+/// placeholder's live state is a colour sweep over the label, not a glyph
+/// spinner.
+fn thinking_row(h: &mut TestHarness) -> String {
+    let buf = h.render();
+    let area = *buf.area();
+    let y = (area.top()..area.bottom())
+        .find(|&y| (area.left()..area.right()).any(|x| buf[(x, y)].symbol() == "\u{25c7}"))
+        .unwrap_or_else(|| panic!("no thinking row"));
+    (area.left()..area.right())
+        .map(|x| format!("{}{:?}", buf[(x, y)].symbol(), buf[(x, y)].fg))
+        .collect()
+}
+
+/// The thinking placeholder's shimmer keeps moving when a steer lands
 /// under it before the model says anything.
 #[test]
-fn the_thinking_spinner_keeps_turning_with_a_steer_below_it() {
+fn the_thinking_shimmer_keeps_moving_with_a_steer_below_it() {
     let mut h = TestHarness::boot_with_size(120, 30);
     h.feed_event(SessionEventWire::TurnStarted {
         turn_baseline: 1,
@@ -208,17 +222,11 @@ fn the_thinking_spinner_keeps_turning_with_a_steer_below_it() {
         user_text: None,
     });
     h.feed_event(steered("think harder"));
-    let row = |h: &mut TestHarness| {
-        h.snapshot()
-            .lines()
-            .find(|l| l.contains(" thinking"))
-            .unwrap_or_else(|| panic!("no thinking row"))
-            .to_string()
-    };
-    let before = row(&mut h);
+    assert!(h.snapshot().contains("\u{25c7} thinking"), "{}", h.snapshot());
+    let before = thinking_row(&mut h);
     h.tick_animations(12);
-    let after = row(&mut h);
-    assert_ne!(before, after, "the spinner stood still");
+    let after = thinking_row(&mut h);
+    assert_ne!(before, after, "the shimmer stood still");
 }
 
 /// Finished cards stop being live: once every tool is done, ticking

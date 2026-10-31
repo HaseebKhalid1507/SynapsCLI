@@ -585,6 +585,18 @@ pub const DEFAULT_CACHE_KEEPWARM_AUTO_MAX_HOURS: u32 = 24;
 /// each) the compact context is the cheaper trade.
 pub const DEFAULT_SUBAGENT_COLD_RESUME_COMPACT_TOKENS: u64 = 100_000;
 
+/// Default for `subagent_rollover_tokens`: the footprint at which a worker's
+/// context rolls over (to a successor of about 100k on a 1m window). Workers
+/// are long 5-minute-TTL loops with no human pauses, so every round re-reads
+/// the whole context; a 100k -> 200k cycle repays the ~100k successor write
+/// (about 17 rounds on Opus 5.5) well before the next rollover.
+pub const DEFAULT_SUBAGENT_ROLLOVER_TOKENS: u64 = 200_000;
+
+/// Smallest accepted `subagent_rollover_tokens`. Below it the derived
+/// successor target is smaller than a typical brief plus last round, so
+/// rollovers could not shrink the context and would only churn the cache.
+pub const MIN_SUBAGENT_ROLLOVER_TOKENS: u64 = 20_000;
+
 /// Prompt-cache keep-warm policy (`cache_keepwarm`, task #444). See
 /// docs/specs/cache-ttl-spec.md §7.
 ///
@@ -710,6 +722,91 @@ impl CacheTtl {
             _ => None,
         }
     }
+
+    /// Canonical config spelling (`5m` | `1h` | `hybrid`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CacheTtl::FiveMinutes => "5m",
+            CacheTtl::OneHour => "1h",
+            CacheTtl::Hybrid => "hybrid",
+        }
+    }
+}
+
+impl std::fmt::Display for CacheTtl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The `cache_ttl` config value: either a fixed [`CacheTtl`] or `auto`.
+///
+/// `Auto` (default) resolves per credential *kind* at request time:
+/// - Anthropic OAuth / subscription credentials → [`CacheTtl::OneHour`]
+///   (what Claude Code uses on subscriptions; a subscription pays no
+///   per-token premium for 1h writes, and idle gaps over five minutes
+///   otherwise lose the conversation cache every turn).
+/// - Anthropic API key → [`CacheTtl::FiveMinutes`] (1h writes bill at 2×
+///   input versus 1.25× for 5m, so API-key users keep the cheaper write).
+/// - Other providers ignore `cache_ttl` entirely.
+///
+/// Resolution depends only on the credential kind, never on which account
+/// or token is in use, so account failover between two subscription seats
+/// can never flip the TTL (a TTL change rewrites the cache).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CacheTtlSetting {
+    #[default]
+    Auto,
+    Fixed(CacheTtl),
+}
+
+impl CacheTtlSetting {
+    /// `auto` or any [`CacheTtl::parse`] spelling (case-insensitive).
+    /// `None` for unknown values.
+    pub fn parse(val: &str) -> Option<CacheTtlSetting> {
+        let v = val.trim();
+        if v.eq_ignore_ascii_case("auto") {
+            return Some(CacheTtlSetting::Auto);
+        }
+        CacheTtl::parse(v).map(CacheTtlSetting::Fixed)
+    }
+
+    /// Canonical config spelling (`auto` | `5m` | `1h` | `hybrid`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CacheTtlSetting::Auto => "auto",
+            CacheTtlSetting::Fixed(ttl) => ttl.as_str(),
+        }
+    }
+
+    /// The wire policy for a request carried on Anthropic credentials of
+    /// the given kind (`oauth` = subscription / OAuth access token, else an
+    /// API key). Explicit values always win.
+    pub fn resolve(self, oauth: bool) -> CacheTtl {
+        match self {
+            CacheTtlSetting::Fixed(ttl) => ttl,
+            CacheTtlSetting::Auto if oauth => CacheTtl::OneHour,
+            CacheTtlSetting::Auto => CacheTtl::FiveMinutes,
+        }
+    }
+
+    /// [`Self::resolve`] keyed by the runtime's `auth_type` string. Only the
+    /// exact `"oauth"` kind counts as a subscription credential.
+    pub fn resolve_for_auth_type(self, auth_type: &str) -> CacheTtl {
+        self.resolve(auth_type == "oauth")
+    }
+}
+
+impl From<CacheTtl> for CacheTtlSetting {
+    fn from(ttl: CacheTtl) -> Self {
+        CacheTtlSetting::Fixed(ttl)
+    }
+}
+
+impl std::fmt::Display for CacheTtlSetting {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// gzip `Content-Encoding` for Anthropic request bodies
@@ -761,6 +858,21 @@ pub const DEFAULT_REQUEST_COMPRESSION_LEVEL: u32 = 1;
 /// CPU time is tens of milliseconds and the upload saved is seconds; above
 /// 6 the body barely shrinks further.
 pub const MAX_REQUEST_COMPRESSION_LEVEL: u32 = 9;
+
+/// Default for `tool_output_spill_bytes`: a tool result bigger than this is
+/// stored whole in a spill file and model history gets a head + tail
+/// preview pointing at it. 12 KiB is about 3k tokens. Below it the preview
+/// (head + tail + pointer, ~7.3 KiB) saves too little to be worth a second
+/// look when the model does need the middle; above it every result saves at
+/// least ~4.5 KiB on every later request, and the 22-26 KB results that
+/// were re-read hundreds of times shrink by ~70%.
+pub const DEFAULT_TOOL_OUTPUT_SPILL_BYTES: usize = 12 * 1024;
+/// Default for `tool_output_spill_head_bytes`: the start of a virtualised
+/// result kept in history (the command echo, headers, the first errors).
+pub const DEFAULT_TOOL_OUTPUT_SPILL_HEAD_BYTES: usize = 4 * 1024;
+/// Default for `tool_output_spill_tail_bytes`: the end of a virtualised
+/// result kept in history (exit status, summaries, the last errors).
+pub const DEFAULT_TOOL_OUTPUT_SPILL_TAIL_BYTES: usize = 3 * 1024;
 
 /// `tools.activation_confirm` — host policy for model-initiated
 /// `activate_tools` (progressive tool disclosure).
@@ -1258,6 +1370,27 @@ pub struct SynapsConfig {
     /// Content classes excluded from remote compaction disclosure.
     pub compaction_exclude: Vec<crate::core::compaction::ContentClass>,
     pub max_tool_output: usize,  // default 30000
+    /// Tool output virtualisation: a text tool result bigger than this many
+    /// bytes is stored whole in a spill file (`<base>/spill/<session>/`) and
+    /// model history gets a head + tail preview with a pointer to it. `0`
+    /// turns it off: results go into history exactly as before (cut at
+    /// `max_tool_output`). (`tool_output_spill_bytes`, default
+    /// [`DEFAULT_TOOL_OUTPUT_SPILL_BYTES`].)
+    pub tool_output_spill_bytes: usize,
+    /// Bytes from the start of a virtualised result kept in history
+    /// (`tool_output_spill_head_bytes`, default
+    /// [`DEFAULT_TOOL_OUTPUT_SPILL_HEAD_BYTES`]).
+    pub tool_output_spill_head_bytes: usize,
+    /// Bytes from the end of a virtualised result kept in history
+    /// (`tool_output_spill_tail_bytes`, default
+    /// [`DEFAULT_TOOL_OUTPUT_SPILL_TAIL_BYTES`]).
+    pub tool_output_spill_tail_bytes: usize,
+    /// Read dedupe: a `read` whose result would be byte-identical to an
+    /// earlier `read` of the same file/range still in history is replaced by
+    /// a short stub naming that earlier call, and `write`/`edit` results say
+    /// there is no need to re-read to verify. Off = legacy tool-result bytes.
+    /// (`read_dedupe`, default on).
+    pub read_dedupe: bool,
     pub bash_timeout: u64,       // default 30
     pub bash_max_timeout: u64,   // default 300
     pub subagent_timeout: u64,   // default 300
@@ -1268,6 +1401,24 @@ pub struct SynapsConfig {
     /// (`subagent_cold_resume_compact_tokens`, default
     /// [`DEFAULT_SUBAGENT_COLD_RESUME_COMPACT_TOKENS`]).
     pub subagent_cold_resume_compact_tokens: u64,
+    /// Automatic context rollover for subagent workers
+    /// (`subagent_context_management = auto | off`, default `auto`). Workers
+    /// evict older rounds into their archive directory instead of growing
+    /// until the window is full. Independent of the foreground
+    /// `context_management.mode`.
+    pub subagent_context_management: ContextManagementMode,
+    /// Estimated footprint (tokens) at which a worker's context rolls over
+    /// (`subagent_rollover_tokens`, at least [`MIN_SUBAGENT_ROLLOVER_TOKENS`],
+    /// default [`DEFAULT_SUBAGENT_ROLLOVER_TOKENS`]). The window's own
+    /// rollover band wins when it is lower; the successor target is derived
+    /// like the foreground's (min(100k, 2/3 of pressure)).
+    pub subagent_rollover_tokens: u64,
+    /// Subagent workers run the host's `after_tool_call` output transforms
+    /// (extensions holding `tools.transform_output`: compression,
+    /// redaction) on their own tool results, as the foreground does. Off =
+    /// worker tool results reach history untransformed, as before.
+    /// (`subagent_transform_hooks`, default on).
+    pub subagent_transform_hooks: bool,
     /// Worker default, independent of foreground `thinking`; per-call overrides win.
     pub subagent_thinking: crate::core::reasoning::ReasoningLevel,
     pub api_retries: u32,        // default 3
@@ -1278,8 +1429,9 @@ pub struct SynapsConfig {
     /// [`MAX_TELEMETRY_LOG_GENERATIONS`], default 1: just `<log>.1`).
     pub telemetry_log_generations: u32,
     pub cache_diagnostics: bool, // opt into cache-diagnosis beta (default false)
-    /// Prompt-cache TTL strategy: "5m" (default) | "1h" | "hybrid".
-    pub cache_ttl: CacheTtl,
+    /// Prompt-cache TTL strategy: "auto" (default: 1h on Anthropic OAuth /
+    /// subscription credentials, 5m on an API key) | "5m" | "1h" | "hybrid".
+    pub cache_ttl: CacheTtlSetting,
     /// Prompt-cache keep-warm while idle (`cache_keepwarm`): `off` (default)
     /// | `auto` | `<N>h`. See [`CacheKeepWarm`] and
     /// docs/specs/cache-ttl-spec.md §7.
@@ -1289,6 +1441,18 @@ pub struct SynapsConfig {
     /// [`DEFAULT_CACHE_KEEPWARM_AUTO_MAX_HOURS`]). An explicit `<N>h` mode
     /// is its own window and ignores this.
     pub cache_keepwarm_auto_max_hours: u32,
+    /// Let keep-warm run for daemon sessions driven only by non-interactive
+    /// clients (`cache_keepwarm_headless`, default `false`): `synaps chat`,
+    /// rpc/server clients over the daemon, piped `synaps attach`. Off, only a
+    /// session a TUI or interactive `attach` has seen qualifies.
+    pub cache_keepwarm_headless: bool,
+    /// Keep the prompt cache warm while a tool round runs
+    /// (`cache_keepwarm_tools`, default `true`): once a round's tools have
+    /// run for the TTL minus a safety margin (4.5 min on 5m, 55 min on 1h),
+    /// re-send that round's request with a minimal output cap so the next
+    /// request reads the prefix instead of rewriting it. Foreground and
+    /// workers alike; independent of the idle `cache_keepwarm`.
+    pub cache_keepwarm_tools: bool,
     /// gzip for Anthropic request bodies (`request_compression`): `auto`
     /// (default) | `on` | `off`. See [`RequestCompressionMode`].
     pub request_compression: RequestCompressionMode,
@@ -1386,19 +1550,28 @@ impl Default for SynapsConfig {
             compaction_mode: crate::core::compaction::CompactionMode::default(),
             compaction_exclude: Vec::new(),
             max_tool_output: 30000,
+            tool_output_spill_bytes: DEFAULT_TOOL_OUTPUT_SPILL_BYTES,
+            tool_output_spill_head_bytes: DEFAULT_TOOL_OUTPUT_SPILL_HEAD_BYTES,
+            tool_output_spill_tail_bytes: DEFAULT_TOOL_OUTPUT_SPILL_TAIL_BYTES,
+            read_dedupe: true,
             bash_timeout: 30,
             bash_max_timeout: 300,
             subagent_timeout: 300,
             subagent_cold_resume_compact_tokens: DEFAULT_SUBAGENT_COLD_RESUME_COMPACT_TOKENS,
+            subagent_context_management: ContextManagementMode::Auto,
+            subagent_rollover_tokens: DEFAULT_SUBAGENT_ROLLOVER_TOKENS,
+            subagent_transform_hooks: true,
             subagent_thinking: crate::core::reasoning::ReasoningLevel::XHigh,
             api_retries: 3,
             refusal_retries: 2,
             telemetry: "off".to_string(),
             telemetry_log_generations: 1,
             cache_diagnostics: false,
-            cache_ttl: CacheTtl::default(),
+            cache_ttl: CacheTtlSetting::default(),
             cache_keepwarm: CacheKeepWarm::Off,
             cache_keepwarm_auto_max_hours: DEFAULT_CACHE_KEEPWARM_AUTO_MAX_HOURS,
+            cache_keepwarm_headless: false,
+            cache_keepwarm_tools: true,
             request_compression: RequestCompressionMode::Auto,
             request_compression_level: DEFAULT_REQUEST_COMPRESSION_LEVEL,
             client_input: ClientInput::Shared,
@@ -1460,10 +1633,17 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "daemon.prompt_abandon_secs",
     "daemon.parked_evict_secs",
     "max_tool_output",
+    "tool_output_spill_bytes",
+    "tool_output_spill_head_bytes",
+    "tool_output_spill_tail_bytes",
+    "read_dedupe",
     "bash_timeout",
     "bash_max_timeout",
     "subagent_timeout",
     "subagent_cold_resume_compact_tokens",
+    "subagent_context_management",
+    "subagent_rollover_tokens",
+    "subagent_transform_hooks",
     "subagent_thinking",
     "subagent.max_concurrent",
     "subagent.max_total",
@@ -1479,6 +1659,8 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "cache_ttl",
     "cache_keepwarm",
     "cache_keepwarm_auto_max_hours",
+    "cache_keepwarm_headless",
+    "cache_keepwarm_tools",
     "request_compression",
     "request_compression_level",
     "client_input",
@@ -1984,6 +2166,24 @@ fn apply_config_content_with(
                     config.max_tool_output
                 )),
             },
+            "tool_output_spill_bytes" => match val.parse::<usize>() {
+                Ok(bytes) => config.tool_output_spill_bytes = bytes,
+                Err(_) => config.warnings.push(format!(
+                    "tool_output_spill_bytes = {val} — expected a byte count (0 turns virtualisation off); using {DEFAULT_TOOL_OUTPUT_SPILL_BYTES}"
+                )),
+            },
+            "tool_output_spill_head_bytes" => match val.parse::<usize>() {
+                Ok(bytes) => config.tool_output_spill_head_bytes = bytes,
+                Err(_) => config.warnings.push(format!(
+                    "tool_output_spill_head_bytes = {val} — expected a byte count; using {DEFAULT_TOOL_OUTPUT_SPILL_HEAD_BYTES}"
+                )),
+            },
+            "tool_output_spill_tail_bytes" => match val.parse::<usize>() {
+                Ok(bytes) => config.tool_output_spill_tail_bytes = bytes,
+                Err(_) => config.warnings.push(format!(
+                    "tool_output_spill_tail_bytes = {val} — expected a byte count; using {DEFAULT_TOOL_OUTPUT_SPILL_TAIL_BYTES}"
+                )),
+            },
             "bash_timeout" => match val.parse::<u64>() {
                 Ok(t) if t >= 1 => config.bash_timeout = t,
                 Ok(_) => config.warnings.push(format!(
@@ -2020,6 +2220,27 @@ fn apply_config_content_with(
                     "subagent_cold_resume_compact_tokens = {val} — expected a token count (0 disables); using {DEFAULT_SUBAGENT_COLD_RESUME_COMPACT_TOKENS}"
                 )),
             },
+            "subagent_context_management" => match ContextManagementMode::parse(val) {
+                Some(mode) => config.subagent_context_management = mode,
+                None => config.warnings.push(format!(
+                    "subagent_context_management = {val} — expected auto or off; using auto"
+                )),
+            },
+            "subagent_rollover_tokens" => match val.parse::<u64>() {
+                Ok(tokens) if tokens >= MIN_SUBAGENT_ROLLOVER_TOKENS => {
+                    config.subagent_rollover_tokens = tokens
+                }
+                _ => config.warnings.push(format!(
+                    "subagent_rollover_tokens = {val} — expected a token count of at least {MIN_SUBAGENT_ROLLOVER_TOKENS}; using {DEFAULT_SUBAGENT_ROLLOVER_TOKENS}"
+                )),
+            },
+            "subagent_transform_hooks" => match val {
+                "true" | "1" | "on" | "yes" => config.subagent_transform_hooks = true,
+                "false" | "0" | "off" | "no" => config.subagent_transform_hooks = false,
+                _ => config.warnings.push(format!(
+                    "subagent_transform_hooks = {val} — expected on or off; using on"
+                )),
+            },
             // Legacy flat spellings (pre-`subagent.*`): same parser, same limits.
             "subagent_max_concurrent" | "subagent_max_total" => {
                 let dotted = key.replacen("subagent_", "subagent.", 1);
@@ -2051,10 +2272,10 @@ fn apply_config_content_with(
             "cache_diagnostics" => {
                 config.cache_diagnostics = matches!(val, "true" | "1" | "on" | "yes");
             }
-            "cache_ttl" => match CacheTtl::parse(val) {
+            "cache_ttl" => match CacheTtlSetting::parse(val) {
                 Some(ttl) => config.cache_ttl = ttl,
                 None => config.warnings.push(format!(
-                    "cache_ttl = {val} — expected 5m, 1h, or hybrid; using 5m"
+                    "cache_ttl = {val} — expected auto, 5m, 1h, or hybrid; using auto"
                 )),
             },
             "cache_keepwarm" => match CacheKeepWarm::parse(val) {
@@ -2079,6 +2300,20 @@ fn apply_config_content_with(
                     )),
                 }
             }
+            "cache_keepwarm_headless" => match val.trim().to_ascii_lowercase().as_str() {
+                "true" | "1" | "on" | "yes" => config.cache_keepwarm_headless = true,
+                "false" | "0" | "off" | "no" => config.cache_keepwarm_headless = false,
+                _ => config.warnings.push(format!(
+                    "cache_keepwarm_headless = {val} — expected true or false; keeping false"
+                )),
+            },
+            "cache_keepwarm_tools" => match val.trim().to_ascii_lowercase().as_str() {
+                "true" | "1" | "on" | "yes" => config.cache_keepwarm_tools = true,
+                "false" | "0" | "off" | "no" => config.cache_keepwarm_tools = false,
+                _ => config.warnings.push(format!(
+                    "cache_keepwarm_tools = {val} — expected on or off; keeping on"
+                )),
+            },
             "request_compression" => match RequestCompressionMode::parse(val) {
                 Some(mode) => config.request_compression = mode,
                 None => config.warnings.push(format!(
@@ -2130,6 +2365,13 @@ fn apply_config_content_with(
                     } else {
                         "invisible"
                     }
+                )),
+            },
+            "read_dedupe" => match val {
+                "true" | "1" | "on" | "yes" => config.read_dedupe = true,
+                "false" | "0" | "off" | "no" => config.read_dedupe = false,
+                _ => config.warnings.push(format!(
+                    "read_dedupe = {val} — expected on or off; using on"
                 )),
             },
             "tui_streaming_glow" => match val {
@@ -2583,21 +2825,52 @@ pub fn is_secret_env(key: &str, value: &str) -> bool {
     is_secret_key(key) || is_secret_env_value(value)
 }
 
+/// Working-habit steering shared by both stock prompts. It keeps output,
+/// re-reads and file sizes down; those tokens otherwise ride along on every
+/// later request. Phrased without hard tool names: any tool can be disabled.
+macro_rules! default_prompt_steering {
+    ($output_filters:literal) => {
+        concat!(
+            " Change existing files with targeted edits rather than rewriting them whole. \
+            A file you just read or wrote is current in your context; re-read it only if it may have changed. \
+            Keep files, docs and comments as lean as the task allows. \
+            Keep command output small (quiet flags, ",
+            $output_filters,
+            ") and read large outputs selectively."
+        )
+    };
+}
+
+/// Stock system prompt on Windows, used only when no `--system` value and no
+/// `system.md` exist. Custom prompts never include it.
+pub const DEFAULT_PROMPT_WINDOWS: &str = concat!(
+    "You are a helpful AI agent running in a terminal on Windows. \
+    You have access to powershell, bash, read, and write tools. \
+    Prefer the powershell tool for system commands and filesystem operations — it is native \
+    to Windows and avoids quoting/path translation issues. \
+    Use bash only when the task specifically requires WSL or a Unix environment. \
+    Be concise and direct. Use tools when the user asks you to interact with the filesystem or run commands.",
+    default_prompt_steering!("`Select-Object -Last N`, `Select-String`")
+);
+
+/// Stock system prompt on every other platform; see [`DEFAULT_PROMPT_WINDOWS`].
+pub const DEFAULT_PROMPT_UNIX: &str = concat!(
+    "You are a helpful AI agent running in a terminal. \
+    You have access to bash, read, and write tools. \
+    Be concise and direct. Use tools when the user asks you to interact with the filesystem or run commands.",
+    default_prompt_steering!("`| tail -n`, `grep`, `head`")
+);
+
+/// The stock system prompt for this platform.
+#[cfg(windows)]
+pub const DEFAULT_PROMPT: &str = DEFAULT_PROMPT_WINDOWS;
+/// The stock system prompt for this platform.
+#[cfg(not(windows))]
+pub const DEFAULT_PROMPT: &str = DEFAULT_PROMPT_UNIX;
+
 /// Resolve the system prompt from CLI flag, config file, or default.
 /// Priority: explicit value > ~/.synaps-cli/system.md > built-in default.
 pub fn resolve_system_prompt(explicit: Option<&str>) -> String {
-    #[cfg(windows)]
-    const DEFAULT_PROMPT: &str = "You are a helpful AI agent running in a terminal on Windows. \
-        You have access to powershell, bash, read, and write tools. \
-        Prefer the powershell tool for system commands and filesystem operations — it is native \
-        to Windows and avoids quoting/path translation issues. \
-        Use bash only when the task specifically requires WSL or a Unix environment. \
-        Be concise and direct. Use tools when the user asks you to interact with the filesystem or run commands.";
-    #[cfg(not(windows))]
-    const DEFAULT_PROMPT: &str = "You are a helpful AI agent running in a terminal. \
-        You have access to bash, read, and write tools. \
-        Be concise and direct. Use tools when the user asks you to interact with the filesystem or run commands.";
-
     if let Some(val) = explicit {
         let path = std::path::Path::new(val);
         if path.exists() && path.is_file() {
@@ -2770,6 +3043,65 @@ mod tests {
             c.warnings
         );
         assert!(super::KNOWN_CONFIG_KEYS.contains(&"subagent_cold_resume_compact_tokens"));
+    }
+
+    #[test]
+    fn subagent_transform_hooks_key_parses_defaults_on_and_warns() {
+        assert!(super::load_config_from_str("").subagent_transform_hooks, "default on");
+        assert!(super::SynapsConfig::default().subagent_transform_hooks);
+        for (line, want) in [
+            ("subagent_transform_hooks = off\n", false),
+            ("subagent_transform_hooks = false\n", false),
+            ("subagent_transform_hooks = on\n", true),
+            ("subagent_transform_hooks = true\n", true),
+        ] {
+            let c = super::load_config_from_str(line);
+            assert_eq!(c.subagent_transform_hooks, want, "{line}");
+            assert!(c.warnings.is_empty(), "{line}: {:?}", c.warnings);
+        }
+        let c = super::load_config_from_str("subagent_transform_hooks = maybe\n");
+        assert!(c.subagent_transform_hooks, "bad value keeps the default");
+        assert!(c.warnings.iter().any(|w| w.contains("subagent_transform_hooks")));
+    }
+
+    #[test]
+    fn subagent_rollover_keys_parse_default_and_warn() {
+        use super::ContextManagementMode;
+        let c = super::load_config_from_str("");
+        assert_eq!(c.subagent_context_management, ContextManagementMode::Auto);
+        assert_eq!(c.subagent_rollover_tokens, 200_000);
+        let d = super::SynapsConfig::default();
+        assert_eq!(d.subagent_context_management, ContextManagementMode::Auto);
+        assert_eq!(d.subagent_rollover_tokens, super::DEFAULT_SUBAGENT_ROLLOVER_TOKENS);
+
+        let c = super::load_config_from_str(
+            "subagent_context_management = OFF\nsubagent_rollover_tokens = 150000\n",
+        );
+        assert_eq!(c.subagent_context_management, ContextManagementMode::Off);
+        assert_eq!(c.subagent_rollover_tokens, 150_000);
+        assert!(c.warnings.is_empty(), "warnings: {:?}", c.warnings);
+        let c = super::load_config_from_str("subagent_rollover_tokens = 20000\n");
+        assert_eq!(c.subagent_rollover_tokens, 20_000, "the floor itself is accepted");
+        assert!(c.warnings.is_empty(), "warnings: {:?}", c.warnings);
+
+        for (line, key) in [
+            ("subagent_context_management = sometimes", "subagent_context_management"),
+            ("subagent_rollover_tokens = lots", "subagent_rollover_tokens"),
+            ("subagent_rollover_tokens = 19999", "subagent_rollover_tokens"),
+            ("subagent_rollover_tokens = 0", "subagent_rollover_tokens"),
+        ] {
+            let c = super::load_config_from_str(line);
+            assert_eq!(c.subagent_context_management, ContextManagementMode::Auto, "{line}");
+            assert_eq!(c.subagent_rollover_tokens, 200_000, "{line}");
+            assert!(
+                c.warnings.iter().any(|w| w.contains(key)),
+                "{line}: warnings {:?}",
+                c.warnings
+            );
+        }
+        for key in ["subagent_context_management", "subagent_rollover_tokens"] {
+            assert!(super::KNOWN_CONFIG_KEYS.contains(&key), "{key}");
+        }
     }
 
     #[test]
@@ -3588,10 +3920,45 @@ mod tests {
     }
 
     #[test]
+    fn test_cache_keepwarm_headless_key() {
+        assert!(!SynapsConfig::default().cache_keepwarm_headless, "default off");
+        assert!(!load_config_from_str("").cache_keepwarm_headless);
+        for on in ["true", "1", "on", "yes", "TRUE"] {
+            let c = load_config_from_str(&format!("cache_keepwarm_headless = {on}\n"));
+            assert!(c.cache_keepwarm_headless, "{on}");
+            assert!(c.warnings.is_empty(), "{on}: {:?}", c.warnings);
+        }
+        for off in ["false", "0", "off", "no"] {
+            let c = load_config_from_str(&format!("cache_keepwarm_headless = {off}\n"));
+            assert!(!c.cache_keepwarm_headless, "{off}");
+        }
+        let c = load_config_from_str("cache_keepwarm_headless = maybe\n");
+        assert!(!c.cache_keepwarm_headless, "garbage keeps it off");
+        assert!(c.warnings.iter().any(|w| w.contains("cache_keepwarm_headless")));
+    }
+
+    #[test]
+    fn test_cache_keepwarm_tools_key() {
+        assert!(SynapsConfig::default().cache_keepwarm_tools, "default on");
+        assert!(load_config_from_str("").cache_keepwarm_tools);
+        for off in ["false", "0", "off", "no", "OFF"] {
+            let c = load_config_from_str(&format!("cache_keepwarm_tools = {off}\n"));
+            assert!(!c.cache_keepwarm_tools, "{off}");
+            assert!(c.warnings.is_empty(), "{off}: {:?}", c.warnings);
+        }
+        for on in ["true", "1", "on", "yes"] {
+            assert!(load_config_from_str(&format!("cache_keepwarm_tools = {on}\n")).cache_keepwarm_tools);
+        }
+        let c = load_config_from_str("cache_keepwarm_tools = maybe\n");
+        assert!(c.cache_keepwarm_tools, "garbage keeps it on");
+        assert!(c.warnings.iter().any(|w| w.contains("cache_keepwarm_tools")));
+    }
+
+    #[test]
     fn test_cache_keepwarm_config_key() {
         let c = load_config_from_str("cache_keepwarm = auto\ncache_ttl = 5m\n");
         assert_eq!(c.cache_keepwarm, CacheKeepWarm::Auto);
-        assert_eq!(c.cache_ttl, CacheTtl::FiveMinutes);
+        assert_eq!(c.cache_ttl, CacheTtlSetting::Fixed(CacheTtl::FiveMinutes));
         assert!(c.warnings.is_empty(), "warnings: {:?}", c.warnings);
 
         let c = load_config_from_str("cache_keepwarm = 6h\n");
@@ -3678,9 +4045,73 @@ mod tests {
     }
 
     #[test]
-    fn test_cache_ttl_default_is_five_minutes() {
+    fn test_cache_ttl_default_is_auto() {
+        // The wire policy's own default stays the historical bare 5m marker;
+        // the *config* default is `auto` (resolved per credential kind).
         assert_eq!(CacheTtl::default(), CacheTtl::FiveMinutes);
-        assert_eq!(SynapsConfig::default().cache_ttl, CacheTtl::FiveMinutes);
+        assert_eq!(CacheTtlSetting::default(), CacheTtlSetting::Auto);
+        assert_eq!(SynapsConfig::default().cache_ttl, CacheTtlSetting::Auto);
+        // An empty config file leaves it at auto.
+        assert_eq!(load_config_from_str("").cache_ttl, CacheTtlSetting::Auto);
+    }
+
+    #[test]
+    fn test_cache_ttl_setting_parse_and_round_trip() {
+        assert_eq!(CacheTtlSetting::parse("auto"), Some(CacheTtlSetting::Auto));
+        assert_eq!(CacheTtlSetting::parse(" AUTO "), Some(CacheTtlSetting::Auto));
+        assert_eq!(
+            CacheTtlSetting::parse("5m"),
+            Some(CacheTtlSetting::Fixed(CacheTtl::FiveMinutes))
+        );
+        assert_eq!(
+            CacheTtlSetting::parse("1hr"),
+            Some(CacheTtlSetting::Fixed(CacheTtl::OneHour))
+        );
+        assert_eq!(
+            CacheTtlSetting::parse("hybrid"),
+            Some(CacheTtlSetting::Fixed(CacheTtl::Hybrid))
+        );
+        for bad in ["", "2h", "forever", "automatic", "on"] {
+            assert_eq!(CacheTtlSetting::parse(bad), None, "{bad:?}");
+        }
+        // as_str → parse is the identity for every value, and the written
+        // config line reloads to the same setting.
+        for setting in [
+            CacheTtlSetting::Auto,
+            CacheTtlSetting::Fixed(CacheTtl::FiveMinutes),
+            CacheTtlSetting::Fixed(CacheTtl::OneHour),
+            CacheTtlSetting::Fixed(CacheTtl::Hybrid),
+        ] {
+            assert_eq!(CacheTtlSetting::parse(setting.as_str()), Some(setting));
+            assert_eq!(setting.to_string(), setting.as_str());
+            let cfg = load_config_from_str(&format!("cache_ttl = {setting}\n"));
+            assert_eq!(cfg.cache_ttl, setting);
+            assert!(cfg.warnings.is_empty(), "{setting}: {:?}", cfg.warnings);
+        }
+    }
+
+    #[test]
+    fn test_cache_ttl_setting_resolution() {
+        // auto: subscription (OAuth) → 1h, API key → 5m.
+        assert_eq!(CacheTtlSetting::Auto.resolve(true), CacheTtl::OneHour);
+        assert_eq!(CacheTtlSetting::Auto.resolve(false), CacheTtl::FiveMinutes);
+        assert_eq!(
+            CacheTtlSetting::Auto.resolve_for_auth_type("oauth"),
+            CacheTtl::OneHour
+        );
+        for not_oauth in ["api_key", "none", "", "OAuth"] {
+            assert_eq!(
+                CacheTtlSetting::Auto.resolve_for_auth_type(not_oauth),
+                CacheTtl::FiveMinutes,
+                "{not_oauth:?}"
+            );
+        }
+        // Explicit values win over the credential kind, both ways.
+        for ttl in [CacheTtl::FiveMinutes, CacheTtl::OneHour, CacheTtl::Hybrid] {
+            for oauth in [true, false] {
+                assert_eq!(CacheTtlSetting::Fixed(ttl).resolve(oauth), ttl);
+            }
+        }
     }
 
     #[test]
@@ -3799,7 +4230,7 @@ mod tests {
         std::fs::write(dir.join("config"), "cache_ttl = hybrid\n").unwrap();
         with_home(&home, || {
             let config = load_config();
-            assert_eq!(config.cache_ttl, CacheTtl::Hybrid);
+            assert_eq!(config.cache_ttl, CacheTtlSetting::Fixed(CacheTtl::Hybrid));
             assert!(
                 config.warnings.is_empty(),
                 "warnings: {:?}",
@@ -3811,7 +4242,7 @@ mod tests {
         std::fs::write(dir.join("config"), "cache_ttl = 2h\n").unwrap();
         with_home(&home, || {
             let config = load_config();
-            assert_eq!(config.cache_ttl, CacheTtl::FiveMinutes);
+            assert_eq!(config.cache_ttl, CacheTtlSetting::Auto);
             assert!(
                 config.warnings.iter().any(|w| w.contains("cache_ttl")),
                 "warnings: {:?}",
@@ -3877,9 +4308,82 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_resolve_system_prompt_none() {
-        let result = resolve_system_prompt(None);
-        assert!(result.contains("helpful AI agent"));
+        // Empty base dir: no system.md, so the stock default applies.
+        let home = std::env::temp_dir().join(format!("synaps-prompt-none-{}", std::process::id()));
+        std::fs::create_dir_all(home.join(".synaps-cli")).unwrap();
+        with_home(&home, || {
+            assert_eq!(resolve_system_prompt(None), DEFAULT_PROMPT);
+        });
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn default_prompts_carry_working_habit_steering() {
+        for (name, prompt) in [
+            ("unix", DEFAULT_PROMPT_UNIX),
+            ("windows", DEFAULT_PROMPT_WINDOWS),
+        ] {
+            for needle in [
+                "helpful AI agent running in a terminal",
+                "Be concise and direct.",
+                "targeted edits rather than rewriting them whole",
+                "re-read it only if it may have changed",
+                "as lean as the task allows",
+                "Keep command output small",
+                "read large outputs selectively",
+            ] {
+                assert!(prompt.contains(needle), "{name} prompt lacks {needle:?}");
+            }
+            assert!(!prompt.contains("  "), "{name} prompt has a double space");
+            assert!(prompt.ends_with("selectively."), "{name}: {prompt}");
+        }
+        assert!(DEFAULT_PROMPT_UNIX.contains("`| tail -n`"));
+        assert!(DEFAULT_PROMPT_WINDOWS.contains("on Windows"));
+        assert!(DEFAULT_PROMPT_WINDOWS.contains("`Select-Object -Last N`"));
+        assert!(!DEFAULT_PROMPT_WINDOWS.contains("tail -n"));
+    }
+
+    /// The stock prompt sits in the cached prefix of every stock request:
+    /// keep it from silently ballooning.
+    #[test]
+    fn default_prompts_stay_small() {
+        assert!(DEFAULT_PROMPT_UNIX.len() <= 640, "{}", DEFAULT_PROMPT_UNIX.len());
+        assert!(DEFAULT_PROMPT_WINDOWS.len() <= 900, "{}", DEFAULT_PROMPT_WINDOWS.len());
+    }
+
+    /// Explicit `--system` text and files are used byte for byte; the stock
+    /// steering never leaks into them.
+    #[test]
+    fn explicit_system_prompt_is_byte_identical() {
+        let text = "  Custom prompt.\n\nKeep trailing whitespace.  \n";
+        assert_eq!(resolve_system_prompt(Some(text)), text);
+
+        let dir = std::env::temp_dir().join(format!("synaps-prompt-file-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("system.txt");
+        std::fs::write(&file, text).unwrap();
+        assert_eq!(resolve_system_prompt(Some(file.to_str().unwrap())), text);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A user `system.md` (base dir or active profile) replaces the stock
+    /// default entirely, byte for byte.
+    #[test]
+    #[serial]
+    fn system_md_prompt_is_byte_identical() {
+        let text = "You are my agent.\nNo extra steering.\n";
+        let home = std::env::temp_dir().join(format!("synaps-prompt-md-{}", std::process::id()));
+        let dir = home.join(".synaps-cli");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("system.md"), text).unwrap();
+        with_home(&home, || {
+            assert_eq!(resolve_system_prompt(None), text);
+            // An explicit value still wins over system.md.
+            assert_eq!(resolve_system_prompt(Some("explicit")), "explicit");
+        });
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     // Note: test_load_config_nonexistent_file removed — HOME env var mutation
@@ -3913,6 +4417,67 @@ mod tests {
         assert!(config.bridge.uds_path.is_none());
         assert!(!config.bridge.heartbeat_mirror);
         assert_eq!(config.bridge.heartbeat_timeout_ms, 250);
+    }
+
+    #[test]
+    fn read_dedupe_key_parses_defaults_on_and_warns() {
+        assert!(super::load_config_from_str("").read_dedupe, "default on");
+        for (line, want) in [
+            ("read_dedupe = off\n", false),
+            ("read_dedupe = false\n", false),
+            ("read_dedupe = on\n", true),
+            ("read_dedupe = true\n", true),
+        ] {
+            let c = super::load_config_from_str(line);
+            assert_eq!(c.read_dedupe, want, "{line}");
+            assert!(c.warnings.is_empty(), "{line}: {:?}", c.warnings);
+        }
+        let c = super::load_config_from_str("read_dedupe = maybe\n");
+        assert!(c.read_dedupe, "bad value keeps the default");
+        assert!(c.warnings.iter().any(|w| w.contains("read_dedupe")));
+    }
+
+    #[test]
+    fn tool_output_spill_keys_parse_defaults_and_warn() {
+        let c = super::load_config_from_str("");
+        assert_eq!(c.tool_output_spill_bytes, 12 * 1024);
+        assert_eq!(c.tool_output_spill_head_bytes, 4 * 1024);
+        assert_eq!(c.tool_output_spill_tail_bytes, 3 * 1024);
+        let d = super::SynapsConfig::default();
+        assert_eq!(d.tool_output_spill_bytes, super::DEFAULT_TOOL_OUTPUT_SPILL_BYTES);
+        assert_eq!(d.tool_output_spill_head_bytes, super::DEFAULT_TOOL_OUTPUT_SPILL_HEAD_BYTES);
+        assert_eq!(d.tool_output_spill_tail_bytes, super::DEFAULT_TOOL_OUTPUT_SPILL_TAIL_BYTES);
+
+        let c = super::load_config_from_str(concat!(
+            "tool_output_spill_bytes = 20000\n",
+            "tool_output_spill_head_bytes = 6000\n",
+            "tool_output_spill_tail_bytes = 0\n",
+        ));
+        assert_eq!(c.tool_output_spill_bytes, 20_000);
+        assert_eq!(c.tool_output_spill_head_bytes, 6_000);
+        assert_eq!(c.tool_output_spill_tail_bytes, 0, "a head-only preview is allowed");
+        assert!(c.warnings.is_empty(), "warnings: {:?}", c.warnings);
+
+        let c = super::load_config_from_str("tool_output_spill_bytes = 0\n");
+        assert_eq!(c.tool_output_spill_bytes, 0, "0 turns virtualisation off");
+        assert!(c.warnings.is_empty(), "warnings: {:?}", c.warnings);
+
+        for key in [
+            "tool_output_spill_bytes",
+            "tool_output_spill_head_bytes",
+            "tool_output_spill_tail_bytes",
+        ] {
+            let c = super::load_config_from_str(&format!("{key} = lots\n"));
+            assert_eq!(c.tool_output_spill_bytes, super::DEFAULT_TOOL_OUTPUT_SPILL_BYTES);
+            assert_eq!(c.tool_output_spill_head_bytes, super::DEFAULT_TOOL_OUTPUT_SPILL_HEAD_BYTES);
+            assert_eq!(c.tool_output_spill_tail_bytes, super::DEFAULT_TOOL_OUTPUT_SPILL_TAIL_BYTES);
+            assert!(
+                c.warnings.iter().any(|w| w.contains(key)),
+                "{key}: warnings: {:?}",
+                c.warnings
+            );
+            assert!(super::KNOWN_CONFIG_KEYS.contains(&key));
+        }
     }
 
     #[test]
@@ -4781,6 +5346,7 @@ api_retries = 5
             "memory.recall_max_records = 4",
             "memory.user_scope = true",
             "cache_ttl = hybrid",
+            "cache_ttl = auto",
         ] {
             let problems = config_content_problems(good);
             assert!(problems.is_empty(), "{good}: {problems:?}");
@@ -4877,6 +5443,7 @@ api_retries = 5
         with_home(&home, || {
             // Single-key value checks.
             assert!(validate_config_edit("cache_ttl", "1h").is_ok());
+            assert!(validate_config_edit("cache_ttl", "auto").is_ok());
             assert!(validate_config_edit("cache_ttl", "2h").is_err());
             assert!(validate_config_edit("shell.max_output", "big").is_err());
             assert!(validate_config_edit("memory.axel.brain", "relative/brain").is_err());

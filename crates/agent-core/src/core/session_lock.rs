@@ -8,7 +8,7 @@
 //! The lock is released on drop (or when the process dies — `flock`
 //! semantics). Stale lock files from dead processes never block.
 
-use std::fs::{File, OpenOptions};
+use std::fs::OpenOptions;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -32,10 +32,11 @@ impl LockHolder {
     }
 }
 
-/// Held for the runtime's lifetime; dropping releases the `flock`.
+/// Held for the runtime's lifetime; dropping releases the `flock`, even
+/// while a forked child still holds an inherited descriptor.
 #[derive(Debug)]
 pub struct SessionLock {
-    _file: File,
+    _lock: crate::core::lock_file::ExclusiveLock,
     path: PathBuf,
 }
 
@@ -76,12 +77,14 @@ impl SessionLock {
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
         }
-        if crate::core::lock_file::try_lock_exclusive(&file).map_err(|e| SessionLockError::Io(e, path.clone()))? {
+        if let Some(lock) =
+            crate::core::lock_file::try_lock(file).map_err(|e| SessionLockError::Io(e, path.clone()))?
+        {
             // We hold it — write our identity.
             use std::io::Write;
-            let _ = file.set_len(0);
-            let _ = (&file).write_all(holder.serialize().as_bytes());
-            Ok(Self { _file: file, path })
+            let _ = lock.file().set_len(0);
+            let _ = lock.file().write_all(holder.serialize().as_bytes());
+            Ok(Self { _lock: lock, path })
         } else {
             // Someone else holds it — read their identity.
             let body = std::fs::read_to_string(&path).unwrap_or_default();
@@ -161,11 +164,9 @@ impl std::fmt::Display for SessionLockError {
 
 impl std::error::Error for SessionLockError {}
 
-// Locks are non-blocking: a concurrently spawned test process can briefly
-// hold an inherited lock descriptor until it executes, see memory::repository
-// tests.
+// Dropping a `SessionLock` unlocks explicitly, so these tests can run beside
+// concurrent process spawns (see `fork_tests`).
 #[cfg(test)]
-#[serial_test::parallel(process_spawn)]
 mod tests {
     use super::*;
 
@@ -209,5 +210,28 @@ mod tests {
         std::fs::write(&path, "99999\ndaemon\n").unwrap();
         // Must succeed — no flock held.
         let _lock = SessionLock::try_acquire(dir.path(), "stale", holder("tui")).unwrap();
+    }
+}
+
+#[cfg(all(test, unix))]
+mod fork_tests {
+    use super::*;
+
+    /// A runtime that drops its session releases the journal at once, even
+    /// while a child that another thread forked (a tool, an MCP server)
+    /// still holds a copy of the lock's descriptor.
+    #[test]
+    #[serial_test::serial(process_spawn)]
+    fn a_dropped_lock_is_free_while_a_forked_child_holds_its_descriptor() {
+        let dir = tempfile::tempdir().unwrap();
+        let holder = |kind: &str| LockHolder { pid: std::process::id(), kind: kind.to_string() };
+        let first = SessionLock::try_acquire(dir.path(), "s", holder("daemon")).unwrap();
+        let child = crate::core::lock_file::ParkedChild::park();
+        drop(first);
+        let second = SessionLock::try_acquire(dir.path(), "s", holder("tui"));
+        child.release();
+        if let Err(e) = second {
+            panic!("dropped session lock still held via a forked child's copy: {e}");
+        }
     }
 }

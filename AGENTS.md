@@ -130,7 +130,8 @@ crates/agent-engine/src/  (crate: synaps-engine)
 │   ├── respond.rs        — event-bus response tool
 │   ├── send_channel.rs   — channel send tool
 │   ├── watcher_exit.rs   — graceful-exit tool (watcher agents only)
-│   ├── secret_prompt.rs  — secure sudo password prompt handling
+│   ├── secret_prompt.rs  — masked secret / confirm prompt plumbing (TUI queue, handle)
+│   ├── sudo_askpass/     — bash tool's sudo password path: `synaps-sudo-askpass` helper + per-call broker (Linux)
 │   ├── shell/            — stateful PTY shell (start/send/end) — session manager
 │   └── util.rs           — strip_ansi, expand_path, NEXT_SUBAGENT_ID
 ├── mcp/                  — Model Context Protocol client
@@ -474,6 +475,9 @@ Mapping (`crates/agent-core/src/core/models.rs::thinking_level_for_budget`):
 | `theme` | string | — | TUI color theme (21 built-in + user TOML) |
 | `compaction_model` | string | claude-sonnet-4-6 | Model used for `/compact` |
 | `max_tool_output` | int | 30000 | Max bytes per tool output |
+| `tool_output_spill_bytes` | int | 12288 | Tool output virtualisation: a text result of an output-dump tool (`bash`, `grep`, `find`, `ls`, shell and subagent tools, MCP/extension/plugin tools) bigger than this is saved whole to `<base>/spill/<session>/<tool_use_id>.txt` (0700/0600) and history gets a head + tail preview naming the file and the omitted line range; a default-range `read` points back at the file instead. `0` = off (history exactly as before). Spill dirs go with their session (retention) or after 7 idle days |
+| `tool_output_spill_head_bytes` | int | 4096 | Bytes from the start of a virtualised result kept in history (cut at a line boundary when possible) |
+| `tool_output_spill_tail_bytes` | int | 3072 | Bytes from the end of a virtualised result kept in history |
 | `bash_timeout` | int | 30 | Default bash timeout (seconds) |
 | `bash_max_timeout` | int | 300 | Max allowed bash timeout |
 | `subagent_timeout` | int | 300 | Default subagent timeout (seconds; 0 = no limit) |

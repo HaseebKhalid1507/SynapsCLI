@@ -54,6 +54,13 @@ pub(super) const CLAUDE_CODE_TRANSPORT_IDENTITY: &str =
 pub(super) const OAUTH_ASSISTANT_GUIDANCE: &str =
     "You are a helpful AI assistant with access to tools. Use them when needed.";
 
+/// Smallest response room the window clamp leaves a request (on top of its
+/// thinking budget), see [`HelperMethods::fit_max_tokens_to_window`]. The
+/// clamp's input estimate is conservative (up to ~1.6x for prose), so the
+/// real room is usually larger than the estimate; below this the cap stops
+/// shrinking and the provider decides.
+pub(super) const MIN_WINDOW_CLAMPED_RESPONSE_TOKENS: u64 = 4_096;
+
 pub(crate) struct HelperMethods;
 
 /// Map a terminal [`crate::RuntimeError`] to the spec §5.2 typed
@@ -86,6 +93,33 @@ pub(crate) fn turn_error_for(
     agent_core::TurnError {
         message: err.user_message(),
         outcome,
+    }
+}
+
+/// Whether `HelperMethods::sanitize_thinking_blocks` keeps an assistant
+/// block: empty thinking, redacted thinking and text blocks are dropped (an
+/// assistant message left with none is dropped whole).
+fn sanitation_keeps_block(block: &Value) -> bool {
+    match block["type"].as_str() {
+        Some("thinking") => block["thinking"].as_str().is_some_and(|s| !s.is_empty()),
+        Some("redacted_thinking") => block["data"].as_str().is_some_and(|s| !s.is_empty()),
+        Some("text") => block["text"].as_str().is_some_and(|s| !s.is_empty()),
+        _ => true,
+    }
+}
+
+/// Whether the conversational cache marker may sit on `block`: durable bytes
+/// the next request re-sends, on a block the API accepts `cache_control` on.
+/// Never thinking/redacted_thinking, an empty text block, or request-only
+/// text (per-turn extension context, a context advisory).
+fn tail_markable(block: &Value) -> bool {
+    match block["type"].as_str() {
+        Some("thinking" | "redacted_thinking") => false,
+        Some("text") => {
+            block["text"].as_str().is_some_and(|text| !text.is_empty())
+                && !super::stream::is_ephemeral_turn_context_block(block)
+        }
+        _ => true,
     }
 }
 
@@ -266,30 +300,12 @@ impl HelperMethods {
         // message that actually needs a block filtered or a merge applied is
         // deep-cloned, via `Arc::make_mut` (bounded: that one message). In the
         // healthy path this function edits nothing, so the whole pass is free.
-        fn block_is_valid(block: &Value) -> bool {
-            match block["type"].as_str() {
-                Some("thinking") => block["thinking"]
-                    .as_str()
-                    .map(|s| !s.is_empty())
-                    .unwrap_or(false),
-                Some("redacted_thinking") => block["data"]
-                    .as_str()
-                    .map(|s| !s.is_empty())
-                    .unwrap_or(false),
-                Some("text") => block["text"]
-                    .as_str()
-                    .map(|s| !s.is_empty())
-                    .unwrap_or(false),
-                _ => true,
-            }
-        }
-
         let original = std::mem::take(messages);
         let mut out: Vec<SharedMessage> = Vec::with_capacity(original.len());
         for mut msg in original {
             if msg["role"].as_str() == Some("assistant") {
                 if let Some(content) = msg["content"].as_array() {
-                    let survivors = content.iter().filter(|b| block_is_valid(b)).count();
+                    let survivors = content.iter().filter(|b| sanitation_keeps_block(b)).count();
                     if survivors == 0 {
                         // No salvageable content. The API rejects empty content
                         // arrays and empty text placeholders alike, so drop the
@@ -300,7 +316,7 @@ impl HelperMethods {
                         // Only clone-on-write when a block actually gets dropped.
                         let m = Arc::make_mut(&mut msg);
                         if let Some(content) = m["content"].as_array_mut() {
-                            content.retain(block_is_valid);
+                            content.retain(sanitation_keeps_block);
                         }
                     }
                 }
@@ -342,6 +358,24 @@ impl HelperMethods {
         }
     }
 
+    /// Append a keep-warm ping message AFTER marker placement, the way the
+    /// sanitize adjacency merge would have placed it: a new message after a
+    /// different role (the idle ping after a finished reply), else folded
+    /// into the last message as trailing blocks (a tool-round replay, whose
+    /// prefix ends with the round's user message). Either way it sits after
+    /// every marker, so it is an uncached tail that never enters a cache
+    /// entry and never moves a breakpoint.
+    pub(super) fn append_keepwarm_ping(messages: &mut Vec<SharedMessage>, ping: SharedMessage) {
+        let Some(last) = messages.last_mut().filter(|last| last["role"] == ping["role"]) else {
+            messages.push(ping);
+            return;
+        };
+        let last = Arc::make_mut(last);
+        let mut blocks = Self::coerce_content_to_blocks(std::mem::take(&mut last["content"]));
+        blocks.extend(Self::coerce_content_to_blocks(ping["content"].clone()));
+        last["content"] = Value::Array(blocks);
+    }
+
     /// Annotate a cache breakpoint on the last message (single-last strategy).
     /// Per S204 benchmarks, single-last matches sliding-4 performance (96–97% hit
     /// vs 96.7%) — a single stationary marker on the most recent message maximizes
@@ -357,14 +391,24 @@ impl HelperMethods {
     /// entry terminating in them could never be matched by any later request,
     /// which would kill every conversational cache hit in tool-free chat
     /// (#297 follow-up). Mid-message `cache_control` breakpoints are legal;
-    /// the ephemeral block rides after the marker as an uncached tail.
+    /// the ephemeral block rides after the marker as an uncached tail. The
+    /// same holds for a request-only context advisory, which the sanitize
+    /// adjacency merge folds into the newest user message as a trailing text
+    /// block (see `stream::is_ephemeral_turn_context_block`).
+    ///
+    /// When the last message holds no markable block (an advisory-only user
+    /// message, or an empty user text plus an advisory, which the merge
+    /// reduces to the advisory alone) the marker walks back to the last
+    /// markable block of an earlier message instead of being dropped. It is
+    /// never stamped on a thinking block or an empty text block.
     pub(super) fn annotate_cache_breakpoint(messages: &mut [SharedMessage], ttl: CacheTtl) {
         let Some(last) = messages.last_mut() else {
             return;
         };
         // The last message is always edited (marker stamp), so the CoW clone
         // here is the one unavoidable per-request message copy — exactly one
-        // message, never the history. Earlier messages are never touched.
+        // message, never the history. Earlier messages are only touched by
+        // the walk-back below, which a durable last message never reaches.
         let last = Arc::make_mut(last);
 
         // Coerce raw string content into a block array so we can attach cache_control.
@@ -372,13 +416,128 @@ impl HelperMethods {
             last["content"] = json!([{"type": "text", "text": text}]);
         }
 
-        if let Some(block) = last["content"].as_array_mut().and_then(|c| {
-            c.iter_mut()
-                .rev()
-                .find(|b| !super::stream::is_ephemeral_turn_context_block(b))
-        }) {
-            block["cache_control"] = cache_control_value(ttl, MarkerSite::MessageTail);
+        let target = messages
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, message)| match &message["content"] {
+                Value::String(text) => {
+                    tail_markable(&json!({"type": "text", "text": text})).then_some((index, 0))
+                }
+                Value::Array(blocks) => blocks
+                    .iter()
+                    .rposition(tail_markable)
+                    .map(|block| (index, block)),
+                _ => None,
+            });
+        let Some((index, block)) = target else {
+            return;
+        };
+        let message = Arc::make_mut(&mut messages[index]);
+        if let Some(text) = message["content"].as_str().map(str::to_owned) {
+            message["content"] = json!([{"type": "text", "text": text}]);
         }
+        message["content"][block]["cache_control"] =
+            cache_control_value(ttl, MarkerSite::MessageTail);
+    }
+
+    /// Annotate the retention anchor: a message-tail-TTL cache breakpoint on
+    /// the last markable block of the last WIRE message strictly before the
+    /// one holding `frontier`, the oldest image occurrence the previous
+    /// request still sent (see `image_retention::Retention::frontier`).
+    /// Nothing ahead of that message differs between the two requests, so
+    /// when this request retires images the lookback from the anchor finds the
+    /// entry the earlier requests wrote there, instead of every message-level
+    /// entry missing (the change sits far more than 20 blocks behind the tail)
+    /// and the whole conversation after the system prompt being written
+    /// again. Between retirements the anchor stays put and its entry is
+    /// re-read. It is never stamped on a thinking block, an empty text block
+    /// or per-turn extension context.
+    ///
+    /// Only the frontier's MESSAGE counts, never its block. A frontier image
+    /// in block 1 of a parallel tool-result batch once put the anchor on
+    /// block 0 of that same message: those bytes were unchanged, but the
+    /// retiring request still missed the entry and wrote the whole history
+    /// again (sa_13, 2026-10-30: read 6.8k, wrote 281k). An entry that ends
+    /// inside a message whose later blocks change is not one a later request
+    /// can rely on, so the anchor always closes a whole, unchanged message.
+    /// "Wire message": thinking sanitation merges adjacent same-role messages
+    /// (and first drops an assistant message it would empty), so the walk
+    /// starts ahead of every message that would merge into the frontier's.
+    ///
+    /// Run on the outgoing copy after image projection and before thinking
+    /// sanitation merges messages (block keys survive the merge). With the
+    /// tools, system and tail markers this is at most the API's four
+    /// breakpoints, and the anchor never shares the tail's message.
+    pub(super) fn annotate_retention_anchor(
+        messages: &mut [SharedMessage],
+        frontier: Option<(usize, usize)>,
+        ttl: CacheTtl,
+    ) {
+        let Some((frontier_message, _)) = frontier else {
+            return;
+        };
+        if frontier_message >= messages.len() {
+            return;
+        }
+        // Durable history never carries markers (only request copies are
+        // stamped). One that arrives with its own (a replayed or foreign
+        // request) may already fill the API's four breakpoints with tools,
+        // system and tail: no anchor rather than a rejected fifth.
+        let carries_marker = |block: &Value| {
+            block.get("cache_control").is_some()
+                || block["content"]
+                    .as_array()
+                    .is_some_and(|nested| nested.iter().any(|b| b.get("cache_control").is_some()))
+        };
+        if messages.iter().any(|message| {
+            message["content"]
+                .as_array()
+                .is_some_and(|blocks| blocks.iter().any(carries_marker))
+        }) {
+            return;
+        }
+        let wire_start = Self::wire_message_start(messages, frontier_message);
+        let markable = |block: &Value| match block["type"].as_str() {
+            Some("text") => {
+                block["text"].as_str().is_some_and(|t| !t.is_empty())
+                    && !super::stream::is_ephemeral_turn_context_block(block)
+            }
+            Some("tool_use" | "tool_result") => true,
+            _ => false,
+        };
+        let candidate = (0..wire_start).rev().find_map(|message_index| {
+            messages[message_index]["content"]
+                .as_array()?
+                .iter()
+                .rposition(markable)
+                .map(|block_index| (message_index, block_index))
+        });
+        let Some((message_index, block_index)) = candidate else {
+            return;
+        };
+        let message = Arc::make_mut(&mut messages[message_index]);
+        message["content"][block_index]["cache_control"] =
+            cache_control_value(ttl, MarkerSite::MessageTail);
+    }
+
+    /// The first original message that thinking sanitation folds into the
+    /// wire message holding `messages[index]`: same-role neighbours merge,
+    /// and an assistant message whose every block sanitation drops vanishes
+    /// first, letting the messages on either side of it merge.
+    fn wire_message_start(messages: &[SharedMessage], index: usize) -> usize {
+        let dropped = |message: &Value| {
+            message["role"] == "assistant"
+                && message["content"]
+                    .as_array()
+                    .is_some_and(|blocks| !blocks.iter().any(sanitation_keeps_block))
+        };
+        let role = &messages[index]["role"];
+        let mut start = index;
+        while start > 0 && (dropped(&messages[start - 1]) || messages[start - 1]["role"] == *role) {
+            start -= 1;
+        }
+        start
     }
 
     /// Build the `system` value for a request, with the cache marker on the
@@ -451,6 +610,33 @@ impl HelperMethods {
         } else {
             64000
         }
+    }
+
+    /// The `max_tokens` a request may send through a `provider_window`.
+    /// Unchanged for models that accept input + `max_tokens` over the window
+    /// (Claude 4.5 and later: generation stops at the window); for the
+    /// earlier ones that reject it ([`crate::core::models::model_rejects_output_overflow`])
+    /// clamped to the room the input leaves. `input_tokens` is evaluated only
+    /// then, and must be the conservative estimate, which never understates
+    /// the input, so the clamp never overstates the room. Never raised, and
+    /// never below `budget_tokens + MIN_WINDOW_CLAMPED_RESPONSE_TOKENS`: the
+    /// wire requires `max_tokens > budget_tokens`, and a request with less
+    /// room than that is beyond saving by the cap (the provider judges it).
+    pub(super) fn fit_max_tokens_to_window(
+        model: &str,
+        max_tokens: u64,
+        provider_window: u64,
+        thinking_budget_tokens: Option<u64>,
+        input_tokens: impl FnOnce() -> u64,
+    ) -> u64 {
+        if !crate::core::models::model_rejects_output_overflow(model) {
+            return max_tokens;
+        }
+        let room = provider_window.saturating_sub(input_tokens());
+        let floor = thinking_budget_tokens
+            .unwrap_or(0)
+            .saturating_add(MIN_WINDOW_CLAMPED_RESPONSE_TOKENS);
+        max_tokens.min(room.max(floor))
     }
 
     /// Append a single-line usage record to the per-call log — opt-in via the
@@ -638,6 +824,208 @@ mod tests {
             .into_iter()
             .map(|m| Arc::try_unwrap(m).unwrap_or_else(|a| (*a).clone()))
             .collect();
+    }
+
+    // ─── Retention anchor ────────────────────────────────────────────────
+
+    fn anchor_fixture() -> Vec<SharedMessage> {
+        vec![
+            Arc::new(json!({"role":"user","content":[{"type":"text","text":"go"}]})),
+            Arc::new(json!({"role":"assistant","content":[
+                {"type":"thinking","thinking":"t","signature":"s"},
+                {"type":"tool_use","id":"a","name":"shot","input":{}}
+            ]})),
+            Arc::new(json!({"role":"user","content":[
+                {"type":"tool_result","tool_use_id":"a","content":"ok"},
+                {"type":"image","source":{"type":"base64","media_type":"image/png","data":"AA=="}}
+            ]})),
+            Arc::new(json!({"role":"assistant","content":[
+                {"type":"text","text":""},
+                {"type":"thinking","thinking":"t","signature":"s"}
+            ]})),
+            Arc::new(json!({"role":"user","content":[
+                {"type":"image","source":{"type":"base64","media_type":"image/png","data":"AA=="}}
+            ]})),
+        ]
+    }
+
+    /// Every `(message, block)` carrying `cache_control`, in order.
+    fn marked(messages: &[SharedMessage]) -> Vec<(usize, usize)> {
+        let mut out = Vec::new();
+        for (m, message) in messages.iter().enumerate() {
+            for (b, block) in message["content"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .enumerate()
+            {
+                if block.get("cache_control").is_some() {
+                    out.push((m, b));
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn retention_anchor_marks_the_last_markable_block_before_the_frontier() {
+        let ttl = CacheTtl::FiveMinutes;
+        // Frontier on a message's first block: back into the previous
+        // message, onto its tool_use, never its thinking block.
+        let mut out = anchor_fixture();
+        HelperMethods::annotate_retention_anchor(&mut out, Some((2, 0)), ttl);
+        assert_eq!(marked(&out), [(1, 1)]);
+        assert_eq!(
+            out[1]["content"][1]["cache_control"],
+            json!({"type":"ephemeral"})
+        );
+        // Frontier mid-message (an image in block 1 of a parallel batch):
+        // still the previous message, never an earlier block of the
+        // frontier's own message, whose later bytes are about to change.
+        let mut out = anchor_fixture();
+        HelperMethods::annotate_retention_anchor(&mut out, Some((2, 1)), ttl);
+        assert_eq!(marked(&out), [(1, 1)]);
+        // An assistant message holding only an empty text and a thinking
+        // block offers nothing: the scan keeps going back.
+        let mut out = anchor_fixture();
+        HelperMethods::annotate_retention_anchor(&mut out, Some((4, 0)), ttl);
+        assert_eq!(marked(&out), [(2, 0)]);
+    }
+
+    /// The anchor closes a whole WIRE message: thinking sanitation merges a
+    /// same-role neighbour (or two user messages around an assistant message
+    /// it empties) into the frontier's message, so the anchor goes ahead of
+    /// all of them. Checked on the sanitized body, as the API sees it.
+    #[test]
+    fn retention_anchor_precedes_every_message_merged_into_the_frontiers() {
+        let ttl = CacheTtl::FiveMinutes;
+        let image = json!({"type":"image","source":{"type":"base64","media_type":"image/png","data":"AA=="}});
+        let head = || -> Vec<SharedMessage> {
+            vec![
+                Arc::new(json!({"role":"user","content":[{"type":"text","text":"go"}]})),
+                Arc::new(json!({"role":"assistant","content":[
+                    {"type":"tool_use","id":"a","name":"shot","input":{}}
+                ]})),
+                Arc::new(json!({"role":"user","content":[
+                    {"type":"tool_result","tool_use_id":"a","content":"ok"}
+                ]})),
+            ]
+        };
+        let mut adjacent = head();
+        adjacent.push(Arc::new(json!({"role":"user","content":[image.clone()]})));
+        let mut emptied = head();
+        emptied.push(Arc::new(
+            json!({"role":"assistant","content":[{"type":"text","text":""}]}),
+        ));
+        emptied.push(Arc::new(json!({"role":"user","content":[image.clone()]})));
+        for mut out in [adjacent, emptied] {
+            let frontier = out.len() - 1;
+            HelperMethods::annotate_retention_anchor(&mut out, Some((frontier, 0)), ttl);
+            assert_eq!(marked(&out), [(1, 0)]);
+            let mut wire = out.clone();
+            HelperMethods::sanitize_thinking_blocks(&mut wire);
+            let anchored = wire
+                .iter()
+                .position(|m| {
+                    m["content"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|b| b.get("cache_control").is_some())
+                })
+                .unwrap();
+            let framed = wire
+                .iter()
+                .position(|m| {
+                    m["content"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|b| b["type"] == "image")
+                })
+                .unwrap();
+            assert!(
+                anchored < framed,
+                "anchor {anchored} must precede the frontier's wire message {framed}"
+            );
+        }
+    }
+
+    #[test]
+    fn retention_anchor_skips_per_turn_context_and_is_a_no_op_without_a_target() {
+        let ttl = CacheTtl::FiveMinutes;
+        let context = format!(
+            "{}\nambient\n{}",
+            super::super::stream::EXTENSION_CONTEXT_OPEN,
+            super::super::stream::EXTENSION_CONTEXT_CLOSE
+        );
+        let mut out: Vec<SharedMessage> = vec![
+            Arc::new(json!({"role":"user","content":[
+                {"type":"text","text":"look"},
+                {"type":"text","text":context}
+            ]})),
+            Arc::new(json!({"role":"assistant","content":[
+                {"type":"thinking","thinking":"t","signature":"s"}
+            ]})),
+            Arc::new(json!({"role":"user","content":[
+                {"type":"image","source":{"type":"base64","media_type":"image/png","data":"AA=="}}
+            ]})),
+        ];
+        HelperMethods::annotate_retention_anchor(&mut out, Some((2, 0)), ttl);
+        assert_eq!(marked(&out), [(0, 0)]);
+        // No frontier, a frontier past the history, nothing markable ahead:
+        // the messages (and their Arcs) are untouched.
+        let original = anchor_fixture();
+        for frontier in [None, Some((9, 0)), Some((0, 0))] {
+            let mut out = original.clone();
+            HelperMethods::annotate_retention_anchor(&mut out, frontier, ttl);
+            assert!(marked(&out).is_empty(), "{frontier:?}");
+            assert!(out.iter().zip(&original).all(|(a, b)| Arc::ptr_eq(a, b)));
+        }
+        // A history that arrives carrying its own marker, top level or nested
+        // in a tool_result, gets no anchor: never a fifth breakpoint.
+        for (message, path) in [(0, "/content/0"), (2, "/content/0")] {
+            let mut foreign = anchor_fixture();
+            let block = Arc::make_mut(&mut foreign[message])
+                .pointer_mut(path)
+                .unwrap();
+            if message == 2 {
+                block["content"] = json!([{"type":"text","text":"ok",
+                    "cache_control":{"type":"ephemeral"}}]);
+            } else {
+                block["cache_control"] = json!({"type":"ephemeral"});
+            }
+            let before = foreign.clone();
+            HelperMethods::annotate_retention_anchor(&mut foreign, Some((4, 0)), ttl);
+            assert!(
+                foreign.iter().zip(&before).all(|(a, b)| Arc::ptr_eq(a, b)),
+                "{message}"
+            );
+        }
+    }
+
+    /// The anchor is a message-tail site: it carries the tail's TTL in every
+    /// mode, so a hybrid body keeps every 1h marker ahead of the 5m ones.
+    #[test]
+    fn retention_anchor_uses_the_message_tail_ttl_and_shares_the_tail_block() {
+        for (ttl, expect) in [
+            (CacheTtl::FiveMinutes, json!({"type":"ephemeral"})),
+            (CacheTtl::Hybrid, json!({"type":"ephemeral"})),
+            (CacheTtl::OneHour, json!({"type":"ephemeral","ttl":"1h"})),
+        ] {
+            let mut out = anchor_fixture();
+            HelperMethods::annotate_retention_anchor(&mut out, Some((2, 1)), ttl);
+            assert_eq!(out[1]["content"][1]["cache_control"], expect, "{ttl:?}");
+        }
+        // A frontier in the only (tail) message leaves nothing ahead of it:
+        // the tail marker alone, never an anchor inside the tail message.
+        let mut out: Vec<SharedMessage> = vec![Arc::new(json!({"role":"user","content":[
+            {"type":"text","text":"look"},
+            {"type":"image","source":{"type":"base64","media_type":"image/png","data":"AA=="}}
+        ]}))];
+        HelperMethods::annotate_retention_anchor(&mut out, Some((0, 1)), CacheTtl::FiveMinutes);
+        HelperMethods::annotate_cache_breakpoint(&mut out, CacheTtl::FiveMinutes);
+        assert_eq!(marked(&out), [(0, 1)]);
     }
 
     fn annotate_vals(msgs: &mut Vec<Value>, ttl: CacheTtl) {

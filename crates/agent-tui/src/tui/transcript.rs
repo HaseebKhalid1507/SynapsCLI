@@ -155,6 +155,59 @@ impl ChatMessage {
 pub(crate) struct TimestampedMsg {
     pub(crate) msg: ChatMessage,
     pub(crate) time: String,
+    /// A streamed thinking block's clock (its header: "thinking" while
+    /// it runs, then "thought for 12s"). `None` for every other message and
+    /// for thinking rebuilt from history, which has no timing.
+    pub(crate) thought: Option<ThoughtClock>,
+}
+
+/// When a thinking block received its first delta and when its thinking
+/// step ended (or its latest delta, while it runs) — on the store's event
+/// clock, so a subagent view replays a worker's real pace.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ThoughtClock {
+    first: std::time::Instant,
+    last: std::time::Instant,
+    /// Sealed by [`TranscriptStore::drop_empty_thinking`] when the model
+    /// moves on (text, a tool call, the response or turn ending). Until
+    /// then the block is a live slot: its header animates.
+    pub(crate) done: bool,
+}
+
+impl ThoughtClock {
+    fn start(now: std::time::Instant) -> Self {
+        Self {
+            first: now,
+            last: now,
+            done: false,
+        }
+    }
+
+    /// Another delta: the block is (again) receiving thinking.
+    fn delta(&mut self, now: std::time::Instant) {
+        self.last = self.last.max(now);
+        self.done = false;
+    }
+
+    /// The thinking step ended at `now` (the model moved on).
+    fn seal(&mut self, now: std::time::Instant) {
+        self.last = self.last.max(now);
+        self.done = true;
+    }
+
+    /// When the block began receiving thinking.
+    pub(crate) fn first(&self) -> std::time::Instant {
+        self.first
+    }
+
+    /// How long the model thought: first delta to the seal (or the latest
+    /// delta while it runs), in whole seconds (rounded). `None` under half a
+    /// second — a block that arrived in one piece has no meaningful
+    /// duration, so its header counts words instead.
+    pub(crate) fn secs(&self) -> Option<u64> {
+        let d = self.last.saturating_duration_since(self.first).as_secs_f64();
+        (d >= 0.5).then(|| d.round() as u64)
+    }
 }
 
 /// Provenance of one display row: which bytes of the owning message's
@@ -770,7 +823,7 @@ impl TranscriptStore {
         let ago = self.event_time.map_or(std::time::Duration::ZERO, |t| {
             self.clock.now().saturating_duration_since(t)
         });
-        chrono::Local::now() - chrono::Duration::from_std(ago).unwrap_or(chrono::Duration::zero())
+        self.clock.wall_now() - chrono::Duration::from_std(ago).unwrap_or(chrono::Duration::zero())
     }
 
     /// Before a message dated `at`: a day line when the local date changed
@@ -782,6 +835,7 @@ impl TranscriptStore {
             self.messages.push(TimestampedMsg {
                 msg: ChatMessage::System(day_line(day)),
                 time: String::new(),
+                thought: None,
             });
             self.live_note(self.messages.len() - 1);
             self.invalidate_last();
@@ -875,7 +929,8 @@ impl TranscriptStore {
                 "{SCROLLBACK_SENTINEL_PREFIX}{} earlier message(s) hidden {SCROLLBACK_SENTINEL_MARK}{}; {reload})",
                 self.scrollback_dropped, self.max_msgs
             )),
-            time: chrono::Local::now().format("%H:%M").to_string(),
+            time: self.clock.wall_now().format("%H:%M").to_string(),
+            thought: None,
         };
         self.messages.insert(0, sentinel);
         self.live_inserted(0);
@@ -1172,6 +1227,7 @@ impl TranscriptStore {
         self.messages.push(TimestampedMsg {
             msg,
             time: at.map(|at| at.format("%H:%M").to_string()).unwrap_or_default(),
+            thought: None,
         });
         // Auto-scroll only when pinned to bottom
         if self.scroll_pinned {
@@ -1236,6 +1292,7 @@ impl TranscriptStore {
                     TimestampedMsg {
                         msg,
                         time: self.event_stamp(),
+                        thought: None,
                     },
                 );
                 self.live_inserted(at);
@@ -1284,7 +1341,8 @@ impl TranscriptStore {
                 msg: ChatMessage::System(format!(
                     "… {omitted} earlier message(s) hidden to speed resume — full history is still in the model's context"
                 )),
-                time: chrono::Local::now().format("%H:%M").to_string(),
+                time: self.clock.wall_now().format("%H:%M").to_string(),
+                thought: None,
             },
         );
         self.relive();
@@ -2490,6 +2548,8 @@ impl TranscriptStore {
 
     pub(crate) fn set_show_full_output(&mut self, v: bool) {
         self.show_full_output = v;
+        // A streaming thought is live only while collapsed (live.rs).
+        self.relive();
         self.invalidate();
     }
 
@@ -2964,9 +3024,14 @@ impl TranscriptStore {
         self.response_start
     }
 
+    /// Append a thinking delta, starting (or extending) the block's clock:
+    /// the block stays a live slot, its header animating, until
+    /// [`Self::drop_empty_thinking`] seals it.
     pub(crate) fn append_or_update_thinking(&mut self, text: &str) {
+        let now = self.event_now();
         if let Some(TimestampedMsg {
             msg: ChatMessage::Thinking(ref mut existing),
+            thought,
             ..
         }) = self.messages.last_mut()
         {
@@ -2974,25 +3039,37 @@ impl TranscriptStore {
             // appending to it (otherwise content reads "…​<thinking>").
             if existing == THINKING_PLACEHOLDER {
                 *existing = text.to_string();
-                self.live_note(self.messages.len() - 1);
+                *thought = Some(ThoughtClock::start(now));
             } else {
                 existing.push_str(text);
+                // A block rebuilt from history has no clock: it stays
+                // untimed rather than timing only its tail.
+                if let Some(clock) = thought {
+                    clock.delta(now);
+                }
             }
         } else {
             self.push_msg(ChatMessage::Thinking(text.to_string()));
+            if let Some(m) = self.messages.last_mut() {
+                m.thought = Some(ThoughtClock::start(now));
+            }
         }
+        self.live_note(self.messages.len() - 1);
         self.invalidate_last();
     }
 
-    /// Remove a trailing thinking block that never received content — the
-    /// sentinel placeholder, or one left empty. Called when the model starts
-    /// producing real output or the turn ends, so the thinking spinner can't
-    /// run forever on an empty thinking step.
+    /// The thinking step is over. Remove a trailing thinking block that never
+    /// received content — the sentinel placeholder, or one left empty — so
+    /// the thinking spinner can't run forever on an empty thinking step; or
+    /// seal a trailing real one, which stops its live header and fixes its
+    /// "thought for Ns". Called when the model starts producing real output
+    /// or the response/turn ends.
     ///
     /// Scans backward past trailing System/Notice messages so a placeholder
     /// stranded mid-list (e.g. when a Notice arrives on top of it) is still
     /// found and removed (FIX 4).
     pub(crate) fn drop_empty_thinking(&mut self) {
+        let now = self.event_now();
         // Walk from the tail, skipping System messages, to find the first
         // non-System message. If it's an empty/placeholder Thinking, drop it.
         let candidate_idx = self
@@ -3007,6 +3084,16 @@ impl TranscriptStore {
                     self.anchor_remap_remove(idx);
                     // Structural change (remove) — full invalidate to resync per_msg lengths.
                     self.invalidate_structural();
+                } else if let Some(clock) =
+                    self.messages[idx].thought.as_mut().filter(|c| !c.done)
+                {
+                    // It thought until the model moved on.
+                    clock.seal(now);
+                    self.live_note(idx);
+                    // The block swaps the live tail for the collapsed head
+                    // preview and the "thought for" header: content rows
+                    // change, so a selection reaching it is cleared (L3).
+                    self.invalidate_from(idx);
                 }
             }
         }

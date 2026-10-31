@@ -143,6 +143,10 @@ Parsing (config.rs key-match block, alongside `cache_diagnostics` at :461):
 | `hybrid` | `Hybrid` |
 | anything else | `FiveMinutes` + push to `config.warnings` (never block boot — house rule) |
 
+> **Superseded by §8:** the config value is now `CacheTtlSetting`, and
+> unset or invalid means `auto`, not `FiveMinutes`. `CacheTtl` stays as the
+> resolved wire policy.
+
 Add `"cache_ttl"` to the known-keys array at config.rs:219.
 
 **Rationale:** an enum, not a String, because there is a closed set of valid
@@ -379,7 +383,7 @@ Telemetry (`UsageRecord`) already carries the split; no change.
 
 | Case | Behavior |
 |---|---|
-| `cache_ttl` unset / invalid | 5m default + boot warning; payloads byte-identical to current release |
+| `cache_ttl` unset / invalid | `auto` (§8): 1h on OAuth, 5m on an API key (an API-key payload is byte-identical to the pre-feature release); invalid also warns at boot |
 | Mixed TTL within one request | Impossible by construction except the sanctioned Hybrid combination (1h prefix / 5m tail) — §3.3 |
 | 1h requested but only 5m honored (no 400) | One-time-per-session Notice; mode never auto-flipped (§3.4.1) |
 | TTL changed mid-session (`set_cache_ttl`) | Next request re-marks with new TTL; old prefix expires naturally; no invalidation logic needed because single-last strategy never prunes old markers |
@@ -441,12 +445,26 @@ Telemetry (`UsageRecord`) already carries the split; no change.
 **Opt-in, off by default.** When an interactive session goes idle, Synaps can
 keep its cached prefix alive with cache-read pings so that coming back reads
 the prefix at the cache-read price instead of re-writing it. Works with every
-TTL (`5m`, `1h`, `hybrid`) and every thinking mode, within the guards below.
+TTL (`5m`, `1h`, `hybrid`, and `auto` after it is resolved, §8) and every
+thinking mode, within the guards below.
 
 ```
 cache_keepwarm = auto               # off (default) | auto | <N>h  (N = 1–48)
 cache_keepwarm_auto_max_hours = 24  # auto's longest idle period (1–48, default 24)
+cache_keepwarm_headless = false     # also keep warm sessions driven by chat/rpc/server clients
 ```
+
+**Who qualifies.** A daemon session becomes eligible once a client that can
+type has attached: a TUI or `synaps attach` (`Mirror`/`Takeover`) always
+qualifies; a piped `synaps attach` is indistinguishable from a terminal one
+and qualifies too. Sessions driven only by `synaps chat`, rpc-over-daemon or
+server clients (bridges, scripts, other apps) qualify only with
+`cache_keepwarm_headless = true` (default off: nobody may come back in human
+time, so the owner opts in). `Observe` attaches and test clients never do.
+`synaps rpc` (stdin/stdout JSON) runs its own runtime without the session
+actor, so keep-warm cannot reach it either way; drive the daemon instead
+(`synaps chat`, or an rpc/server client attached to a daemon session) and
+turn on `cache_keepwarm_headless`.
 
 Per session: `/keepwarm [status|off|auto|<N>h]`. `auto` stops by the cost
 bound below or `cache_keepwarm_auto_max_hours` after the session went idle
@@ -474,7 +492,8 @@ minimum cacheable length, pre-warming), [Pricing][pr],
 | Is `stream` in the key? | **Not stated.** The invalidation table does not list it, and every pre-warm example is non-streaming before a non-streaming follow-up; no sentence says a non-streaming request warms a streaming one. ([pc]) | Pings stream exactly like a real turn (see `max_tokens` below). |
 | `max_tokens: 0`? | Pre-warm: "returns immediately without generating any output … Zero output tokens are billed." Rejected with `stream: true`, `thinking.type: "enabled"`, structured outputs (`output_config.format`) or a forced `tool_choice`. ([pc] "Limitations") | Not used: it requires `stream: false`, and whether `stream` is part of the cache key is undocumented. Adaptive / thinking-off pings stay streaming with `max_tokens = 1` (the docs' own "max_tokens=1 workaround"; ≤ 1 output token billed). Budgeted thinking cannot use 0 anyway. |
 | Minimum `max_tokens`, adaptive? | `max_tokens` is "a hard cap on total output … thinking and response text combined". ([at]) | Adaptive pings: `max_tokens = 1` bounds thinking too. |
-| Budgeted thinking? | `budget_tokens` ≥ 1,024 and `< max_tokens`; changing the budget invalidates message breakpoints. ([et]) | Budgeted pings keep the budget and send `max_tokens = budget + 1` — up to 32,769 at `xhigh`, all billable as output. See §7.2 worst case. |
+| Budgeted thinking? | `budget_tokens` ≥ 1,024 and `< max_tokens`; changing the budget invalidates message breakpoints. ([et]) | Budgeted pings keep the budget and send `max_tokens = budget + 1` — up to 32,769 at `xhigh`, all billable as output. Neither can be lowered without changing the cache key; §7.2 prices the expected output and reserves the rest. |
+| Can a ping switch to adaptive thinking? | Adaptive (`thinking.type: "adaptive"`) has no budget, so `max_tokens = 1` is legal; but the thinking configuration is part of the cache key. ([th], [at]) | Only where the turns already use adaptive (Synaps: Opus/Sonnet 4.7+, every 5.x; `model_supports_adaptive_thinking`): those pings send `max_tokens = 1`. Opus/Sonnet 4.6 support adaptive but Synaps keeps them on budgeted thinking; a ping cannot switch alone. |
 | Nothing cached? | Below the model's minimum cacheable length (512–4,096 tokens by model) a request "will be processed without caching, and no error is returned … if both `cache_creation_input_tokens` and `cache_read_input_tokens` are 0, the prompt was not cached". ([pc] "Cache limitations") | No period unless the last request had `read + write > 0`; a ping with `read = write = 0` ends it (§7.5). |
 | Read price | 0.1× input, except 0.025× (Fable 5.1, Mythos 5.1) and 0.05× (Opus 5.5, Sonnet 5.5); Opus 4 / 4.1 are $15 / $75. ([pr]) | `agent_core::pricing` uses the documented per-model multiplier and price, 0.1× / family default otherwise. |
 
@@ -484,14 +503,35 @@ minimum cacheable length, pre-warming), [Pricing][pr],
 [et]: https://platform.claude.com/docs/en/build-with-claude/extended-thinking
 [at]: https://platform.claude.com/docs/en/build-with-claude/adaptive-thinking
 
-### 7.2 The stopping rule: ski rental, priced at the worst case
+### 7.2 The stopping rule: ski rental on the expected cost, bounded by the worst case
 
 An idle period protects one thing: the cached prefix of `P` tokens. If it
 lapses, the next turn re-writes it — the **buy** price `B = P × write(TTL)`,
 at the write price of the TTL the server **honours** (§7.3). Each ping is
 **rent**.
 
-Rule: send a ping only while `ledger + worst(next ping) ≤ B`.
+Rule: send a ping only while `ledger + worst(next ping) ≤ bound`, where
+`bound = B + R` and `R`, the **thinking reserve**, is the output a ping may
+bill beyond what it is expected to produce:
+`R = (max_tokens − expected output) × output price`.
+
+- **Expected output**: all of `max_tokens` when it is already 1 (thinking off,
+  adaptive): `R = 0` and `bound = B`, exactly the old rule. Under budgeted
+  thinking `max_tokens = budget + 1` is forced (§7.1) while the ping is told
+  it needs no reasoning and thinks a sentence; the expected output is
+  `PING_OUTPUT_ESTIMATE` = 256 tokens, several times that.
+- Since `worst − expected = R`, the rule is the same inequality as
+  `ledger + expected(next ping) ≤ B`: **every decision, starting a period
+  included, is the ski-rental decision on the expected cost**, while the
+  ledger can still never pass the **bound it reports** (`bound_usd` in
+  `/keepwarm status`, the logs and the end reason), because each ping is
+  admitted only if its worst case fits. Pings within the estimate spend at
+  most `B`; pings that out-think it spend at most `B + R`, i.e. one ping's
+  unused budget more.
+- **Latch**: the first ping that bills more output than the estimate sets a
+  session latch (`warn` log: *ping out-thought its output estimate*). Later
+  periods of that session price pings at `max_tokens` (`R = 0`), so at most
+  one period ever relies on an estimate that proved wrong.
 
 - `ledger` is everything this period actually spent: every ping's measured
   usage, **including failed and retried pings** and an aborted in-flight ping
@@ -514,11 +554,26 @@ Rule: send a ping only while `ledger + worst(next ping) ≤ B`.
   at $0.15 but admitted only with ≈ $3.0003 of cap headroom
   (`review_205_possible_cache_miss_must_fit_admission_cap`,
   `a_cap_with_room_for_a_cache_miss_still_pings`).
-- If one worst-case ping does not fit `B` at all, **no period starts**
-  (`worst-case cache-hit ping … exceeds the … rewrite`). In practice budgeted thinking
-  then only keeps large prefixes warm: Sonnet 4.6 at `xhigh` (32,769 ×
-  $15/MTok = $0.49) under 5m with P = 20k (`B` = $0.075) never pings; under 1h
-  with P = 300k (`B` = $1.80) it does.
+- If one ping does not fit, **no period starts**: `cache-hit ping expected
+  at $E ($W worst case) exceeds the $B rewrite it would save` (budgeted, with
+  the estimate), or `worst-case cache-hit ping $W exceeds the $B rewrite`
+  (no reserve: thinking off / adaptive, or the latch). The prefix must be
+  large enough that `P × (write − read) ≥ input + expected output`; for
+  Sonnet 4.6 ($3 / $15) at budget 4,096
+  (`break_even_prefix_budgeted_vs_adaptive`):
+
+  | | `max_tokens` priced | 5m break-even | 1h break-even |
+  |---|---|---|---|
+  | before (worst case; also after the latch) | 4,097 | 17,869 tokens | 10,816 tokens |
+  | budgeted, expected output 256 | 256 (+ $0.0576 reserve) | **1,169 tokens** | **708 tokens** |
+  | thinking off / adaptive | 1 | 60 tokens | 37 tokens |
+
+  (Below the 1,024-token minimum cacheable prefix these mean "any cached
+  prefix".) Opus 4.6 ($5 / $25) has the same ratio and the same break-even.
+  At `xhigh` (budget 32,768) the expected decision is unchanged and the
+  reserve is $0.49: Sonnet 4.6 under 5m with P = 20k (`B` = $0.075) now pings,
+  reporting a $0.5627 bound; priced at the worst case it would not
+  (`budgeted_thinking_worst_case_must_fit_the_bound`).
 - An unexpected write (a miss) cannot be priced in advance — a full miss *is*
   the rewrite. It is booked when it happens and ends the period (§7.5), so it
   overshoots the bound by at most one ping.
@@ -528,6 +583,10 @@ This is the deterministic ski-rental strategy:
 - user returns before the bound → we paid only the reads;
 - user returns after → we paid ≤ B in pings + B rewrite ≤ 2 × optimal;
 - user never returns → waste ≤ B, i.e. **at most one rewrite**.
+
+(With budgeted thinking these hold for pings within the output estimate;
+pings that out-think it add at most `R` once, and the latch keeps it to one
+period per session.)
 
 `P` and `B` are re-measured from every ping (`cache_read + cache_write`);
 before the first ping `P` is the last request's `read + write + input` plus
@@ -549,8 +608,9 @@ Numbers (Anthropic's price table; [pr]), P = 300k, thinking off / adaptive
 `2.0 / 0.1 = 20` reads fit a 1h bound exactly; the 1-token output in the worst
 case makes the 20th not fit, so 19 (`ski_rental_1h_is_nineteen_pure_reads…`).
 A ping that thinks a lot ends the period sooner: 5k thinking tokens on Sonnet
-4.6 ($0.075) cut a 1h period to 10 pings
-(`an_expensive_ping_stops_the_period_early`).
+4.6 ($0.075) cut a 1h period to 10 pings priced at the worst case, 11 with
+the estimate (the 11th runs into the reserve, still within the reported
+bound; `an_expensive_ping_stops_the_period_early`).
 
 Per cache-read multiplier (pure reads, the ledger uses the session's
 per-model pricing; `ping_counts_per_multiplier_and_the_auto_cap`):
@@ -665,7 +725,8 @@ variant exhaustively and drives them through the actor.
 | A ping that wrote without reading anything | End (`ping missed the cache`). |
 | After ping 1, a ping whose write > 10% of `P` (ping 1: beyond the expected tail) | End (`ping rewrote … history no longer cached`), with a `warn` log line. |
 | Next turn would roll over / hard-stop | No period; an active one ends (§7.4). |
-| One worst-case ping exceeds the bound | No period (§7.2). |
+| One ping's expected cost exceeds the rewrite | No period (§7.2); the end reason names the expected and worst-case cost and the rewrite. |
+| A ping bills more output than the estimate | Booked as measured; the period goes on only while the next worst case still fits the bound; later periods of the session price pings at `max_tokens` (§7.2 latch). |
 | Machine slept past the TTL | Age check at fire time → period ends, no ping. Slept but still in time → the wall-clock deadline fires the ping early enough (§7.3). |
 | Transient error (429, 5xx, 529, network, in-stream) | Usage booked; retry after 5 s, 15 s, 30 s while the retry still lands before the late guard and fits the bound; then end. |
 | Any other 4xx, auth, config | Usage (if any) booked; end, no retry. |
@@ -676,7 +737,7 @@ variant exhaustively and drives them through the actor.
 | `max_session_cost` | Checked against the ping's exposure, a full cache miss included (§7.2); all ping spend counts toward it. |
 | Session detached | Keep-warm continues (cost bounded by §7.2). The idle **auto-park** is deferred while a period is active (`can_park`); when it ends, `rearm_park` and the session parks after the normal grace. |
 | Explicit `Park` (host / reload) while a period is active | The period ends (`parked by request`), then the session parks. |
-| Script/RPC-only session | No period: requires a TUI or `synaps attach` client to have attached once. |
+| Script/RPC-only session | No period unless `cache_keepwarm_headless = true`: by default it requires a TUI or `synaps attach` client to have attached once; with the opt-in a `synaps chat`, rpc or server client qualifies too (§7). `synaps rpc` (no session actor) never keeps warm. |
 | Observe-only session (`--observe` attaches only) | No period: an `Observe` attach cannot type, so it never marks the session interactive, whatever its client kind. A later `Mirror`/`Takeover` TUI or `synaps attach` does. |
 
 Why defer the auto-park rather than ping while parked: parking drops the
@@ -809,6 +870,150 @@ written to history, the session file or the transcript.
   prompt-length tiers.
 - `agent_core::session_journal`: keep-warm labels snapshot-only, clamped on
   load, and the journal readable by 0.10.1's `SessionMeta`.
+
+### 7.9 Tool rounds (`cache_keepwarm_tools`)
+
+```
+cache_keepwarm_tools = true   # default; keep the cache warm while a tool round runs
+```
+
+The idle keep-warm above covers a session nobody is typing in. A different
+expiry happens *inside* a turn: a round asks for tools, the tools run longer
+than the TTL (a worker's `cargo build`, a full test sweep, a `sleep N; poll`
+loop; workers are pinned to 5m and their default `bash_max_timeout` is also
+300 s), and the request carrying the results finds the prefix gone and
+rewrites all of it at 1.25×. Two such rounds in one day of `api-log.jsonl`
+rewrote 658k tokens (429k and 229k).
+
+`runtime::tool_keepwarm` runs beside the tools of every round that asked
+for some, on the native Anthropic transport, when the round's request
+cached something:
+
+- **The ping replays the round.** It re-sends that round's own request: the
+  same request messages (Arc clones, no copy, nothing persisted), tools,
+  system prompt, thinking config, beta headers and options, through the
+  same `call_api_stream_inner`, with `ApiOptions::keepwarm` set
+  (`KeepWarmMode::Replay`). The transport processes and marks the messages
+  exactly as for the round, *then* appends the ping text as a trailing
+  block of the last user message. Every breakpoint lands where the round
+  put it; the ping text is an uncached tail; the next real request (the
+  round plus its tool results) reads the prefix as if no time had passed.
+- **Schedule.** Due at the round's cache anchor + `ping_interval(TTL)`
+  (§7.3: 4.5 min on 5m, 55 min on 1h) and again after each accepted ping,
+  on the monotonic and wall clocks (`WALL_POLL`), never inside `LATE_GUARD`
+  of expiry.
+- **Stop.** When the tools return, no new ping is scheduled, but a ping
+  already in flight finishes — for up to `FINISH_GRACE` (20 s; the 122 real
+  keep-warm pings in the api-log took p50 1.9 s, p95 11 s, max 15.8 s) —
+  and is booked like any other before the results request goes out. Only a
+  turn cancel (the abort token is a child of the turn's), any other way out
+  of the round (the guard's `Drop`), or the grace running out aborts one in
+  flight. Either way the ping is settled before the next request is sent,
+  so no ping races it on the client. On the provider an aborted ping may
+  still be processed beside the next request; that is harmless: both read
+  the same prefix and the ping writes nothing (its tail is uncached).
+- **Booking.** By the idle keep-warm's rule (`ping_booking`): measured
+  usage is booked by the transport; a ping dispatched with no usage seen
+  (aborted in flight, a read timeout) is booked at its worst case — the
+  whole prefix read, `PING_INPUT_ESTIMATE` uncached, `max_tokens` out —
+  into the turn's counters and as a `Usage` event; a ping refused before
+  the network or rejected with an HTTP error books nothing. A sent ping is
+  never missing from the turn's usage or cost.
+- **Guards** (the idle period's, §7.2/§7.5): the ski-rental bound on the
+  expected cost against one rewrite of the prefix at the honoured TTL; the
+  turn's `max_cost_usd`; stop on a ping that read nothing or wrote / paid
+  uncached for more than `SHARE_LIMIT_PERCENT`, a 4xx, or exhausted
+  `BACKOFF` retries.
+- **Accounting.** `max_tokens` is cut to 1 (+ the thinking budget, which
+  must match the round's for the cache to hold); retries off; the
+  api-log/telemetry record carries `"keepwarm": true`; usage goes to the
+  turn's counters (turn budget) and the session / worker cost.
+
+It applies to the foreground and to workers (`apply_subagent_runtime_policy`,
+the one policy point of every spawn path: oneshot, start, resume, host and
+legacy runtimes). On a 1h TTL it fires only for a single tool round over
+55 minutes. It is independent of `cache_keepwarm` (which defaults to off and
+only covers idle sessions).
+
+Cost: a ping reads the prefix at 0.1× (0.05× on the 5.5 models) against a
+1.25× rewrite. Over the 7 days of api-log to 2026-10-30, 92 tool rounds
+outlasted 270 s; pinging them would have cost about $8.43 (96 pings) and
+saved $12.19 of rewrites (2.50M tokens), net +$3.76. A 1h TTL for workers
+instead would have cost $405.59 more in writes to save $19.84.
+
+Tests: `runtime::stream` `tool_keepwarm_stream` (a cache-simulating
+provider, `tests/support/cache_sim.rs`: pings after the threshold, repeat,
+none for a short round, byte-level prefix equality, the request after the
+round reads the whole prefix; a ping in flight when the tools return
+completes and is booked as measured before the next request; one past the
+grace, or in flight at a cancel, is aborted and booked at its worst case;
+the control without keep-warm rewrites the prefix),
+`tools::subagent::worker_tool_keepwarm_tests` (no host) and
+`tests/worker_tool_keepwarm.rs` (host and legacy branches), each over
+oneshot, start and resume, with the key off as control. Deterministic: the
+simulated cache runs on a virtual clock the script moves (0.6 TTL per
+ping), and a round's tool returns when the sim releases it (after its Nth
+ping), so no assertion depends on how fast the machine is.
+
+## 8. `cache_ttl = auto` (the default)
+
+```
+cache_ttl = auto   # auto (default) | 5m | 1h | hybrid
+```
+
+**Why.** In a benchmark with 6-minute idle gaps (longer than 5m) on a
+subscription, the 5m TTL lost the conversation cache every turn and cost
+53-62% more than Claude Code. `cache_ttl = 1h` cost 40-43% less than 5m and
+8% less than Claude Code, which uses 1h by default on OAuth. On an API key a
+1h write costs 2x input instead of 1.25x (real dollars), so API-key users
+keep 5m.
+
+**Config.** `SynapsConfig::cache_ttl` is a `CacheTtlSetting`:
+`Auto` (default) or `Fixed(CacheTtl)`. `CacheTtlSetting::parse` accepts
+`auto` plus every `CacheTtl::parse` spelling; anything else is `auto` with a
+boot warning, and `validate_config_edit` / /settings reject it.
+`as_str` / `Display` give the canonical spelling, and parse(as_str(x)) is x.
+
+**Resolution.** `CacheTtlSetting::resolve_for_auth_type(auth_type)`:
+`Fixed(t)` is `t`; `Auto` is `OneHour` for `auth_type == "oauth"` and
+`FiveMinutes` for anything else (an API key). It runs once per request in
+`ApiMethods` (`api.rs` streaming, `api_sync.rs` sync), right after
+`build_auth_snapshot`, the point where the credential kind for that request
+is known. The resolved `CacheTtl` then drives everything §3 describes:
+the markers, the beta header (`build_beta_header` resolves the same way, so
+`auto` on an API key adds no `extended-cache-ttl` token and the OAuth beta
+set is unchanged), the request-trace prefix TTL and the §3.4.1 downgrade
+detector. Other providers never read `cache_ttl` (§4).
+
+**Stability.** The TTL is a function of the credential *kind* only, never of
+the account or token, because a TTL change rewrites the cache. Account
+failover (G3) re-pins another OAuth seat (`bind_pinned` keeps
+`auth_type = "oauth"`) and re-sends the same body, so the hop and every
+later request stay at 1h. Only an actual change of kind changes the TTL.
+`anthropic_failover_tests::auto_cache_ttl_is_stable_across_account_failover`
+pins this.
+
+**Runtime.** `Runtime::cache_ttl()` returns the configured setting;
+`Runtime::resolved_cache_ttl().await` resolves it against the bound
+credential kind with the same function. `set_cache_ttl` takes a `CacheTtl`
+or a `CacheTtlSetting`.
+
+**Workers.** Unchanged: `apply_subagent_runtime_policy` pins every worker to
+`Fixed(FiveMinutes)` (#110). `Runtime::new()` now defaults to `auto`, so that
+call is load-bearing: without it an OAuth worker would send 1h markers.
+
+**Keep-warm.** `PeriodConfig.ttl` is `resolved_cache_ttl()`, so `auto` on
+OAuth schedules and runs the §7.2 cost check exactly as an explicit `1h`:
+same governing TTL, same bound, same number of pings
+(`auto_ttl_on_oauth_keeps_warm_exactly_like_explicit_1h`).
+
+**Visibility.** `SessionQuery::Status` carries
+`"cache_ttl": {"setting": "auto", "resolved": "1h"}` (`resolved` is `null`
+off the native Anthropic transport), `/keepwarm status` prints
+`prompt-cache TTL: 1h (auto)`, and the /settings row reads
+`auto  → 1h (subscription login)` when a local Anthropic subscription
+login is present (without one it can't cheaply tell a remote broker's kind
+from no credentials, so it claims nothing).
 
 ---
 

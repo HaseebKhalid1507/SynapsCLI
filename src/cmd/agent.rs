@@ -246,6 +246,11 @@ pub async fn run(config_path: String, trigger_context: String) {
         synaps_cli::runtime::budget::TurnRole::Autonomous,
         &synaps_config.turn_budgets,
     ));
+    // Long headless loops re-read their history every round: virtualise big
+    // tool results like an interactive session does.
+    runtime.set_tool_spill_policy(
+        synaps_cli::runtime::tool_spill::ToolSpillPolicy::from_config(&synaps_config),
+    );
     runtime.set_model(config.agent.model.clone());
     let foreground = agent_engine::orchestration::canonical_foreground_identity(runtime.model())
         .unwrap_or_else(|e| {

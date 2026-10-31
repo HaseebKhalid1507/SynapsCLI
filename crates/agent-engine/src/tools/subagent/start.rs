@@ -93,7 +93,9 @@ impl Tool for SubagentStartTool {
     }
 
     async fn execute(&self, params: Value, ctx: ToolContext) -> Result<String> {
-        let thinking = super::resolve_subagent_thinking(&params, None, &crate::config::load_config())?;
+        // One config snapshot for the whole spawn (`spawn_config`).
+        let config = super::spawn_config();
+        let thinking = super::resolve_subagent_thinking(&params, None, &config)?;
         // ── Parse params ───────────────────────────────────────────────────────
         let task = params["task"]
             .as_str()
@@ -292,7 +294,7 @@ impl Tool for SubagentStartTool {
                         // (~$0.23 per 10-spawn fan-out). (#110)
                         super::apply_subagent_runtime_policy(
                             &mut runtime,
-                            &crate::config::load_config(),
+                            &config,
                             memory_backend.as_ref(),
                             session_allow_all.as_ref(),
                             telemetry.as_ref(),
@@ -303,6 +305,7 @@ impl Tool for SubagentStartTool {
                             runtime.memory_backend_is_axel(),
                         ));
                         runtime.set_model(model_a.clone());
+                        super::fit_subagent_context_window(&mut runtime);
                         super::apply_codex_worker_reasoning(
                             &mut runtime,
                             codex_parent_plan.as_ref(),
@@ -311,6 +314,24 @@ impl Tool for SubagentStartTool {
                         runtime
                             .install_worker_orchestration(Arc::clone(&orchestration_for_runtime));
                         runtime.set_delegation_parent(Some(child_parent_id.clone()));
+                        // Rolled-over context goes beside this worker's
+                        // resume archive (see `worker_context`).
+                        let archive_dir = state_a
+                            .read()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .archive_dir
+                            .clone()
+                            .unwrap_or_else(super::archive::process_dir);
+                        super::attach_worker_transcripts(
+                            &mut runtime,
+                            archive_dir,
+                            &child_parent_id,
+                            Some(Arc::clone(&state_a)),
+                            &initial_messages,
+                            tx_events_a.clone(),
+                            subagent_id,
+                            &label_a,
+                        );
 
                         let cancel = crate::CancellationToken::new();
                         let cancel_inner = cancel.clone();

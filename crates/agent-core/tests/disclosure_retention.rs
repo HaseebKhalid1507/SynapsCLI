@@ -434,6 +434,54 @@ fn forget_deletes_by_domain_and_protects_chain_heads() {
     assert!(!h.roots.cache_dir.join("request-trace.jsonl").exists());
 }
 
+fn write_spill(roots: &RetentionRoots, dir: &str) -> std::path::PathBuf {
+    let dir = roots.base_dir.join("spill").join(dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("toolu_1.txt"), "spilled tool output").unwrap();
+    dir
+}
+
+#[test]
+fn sessions_take_their_tool_output_spill_dirs_with_them() {
+    let h = harness();
+    let policy = RetentionPolicy {
+        max_age_days: Some(30),
+        max_disk_bytes: None,
+    };
+    write_session(&h.roots, "old", 10 * DAY_MS, None);
+    write_session(&h.roots, "fresh", 99 * DAY_MS, None);
+    write_session(&h.roots, "forgotten", 99 * DAY_MS, None);
+    let old = write_spill(&h.roots, "old");
+    let fresh = write_spill(&h.roots, "fresh");
+    let forgotten = write_spill(&h.roots, "forgotten");
+
+    let outcome = sweep_at(&h.roots, &policy, 100 * DAY_MS).unwrap();
+    assert!(!session_exists(&h.roots, "old"));
+    assert!(!old.exists(), "an aged-out session takes its spill dir");
+    assert!(fresh.join("toolu_1.txt").exists(), "a kept session keeps it");
+    assert!(outcome.deleted_files >= 2, "session + spill file: {outcome:?}");
+
+    forget(&h.roots, RetentionDomain::Sessions, "forgotten").unwrap();
+    assert!(!forgotten.exists(), "forgetting a session forgets its spill dir");
+    assert!(fresh.exists());
+}
+
+#[test]
+fn worker_spill_dirs_age_out_by_mtime_against_the_same_cutoff() {
+    let h = harness();
+    let policy = RetentionPolicy {
+        max_age_days: Some(30),
+        max_disk_bytes: None,
+    };
+    // Workers have no session file: only the age pass removes their dir.
+    let worker = write_spill(&h.roots, "session-4242-1700000000000-0");
+    let now = agent_core::epoch_millis();
+    sweep_at(&h.roots, &policy, now).unwrap();
+    assert!(worker.exists(), "written just now: kept");
+    sweep_at(&h.roots, &policy, now + 31 * DAY_MS).unwrap();
+    assert!(!worker.exists(), "31 days on: past the 30-day cutoff");
+}
+
 // ─── CP-13 fix1: forget hardening ────────────────────────────────────────────
 
 #[test]

@@ -33,6 +33,13 @@ mod http_phases;
 mod image_limits;
 mod image_retention;
 pub mod keepwarm;
+pub mod tool_keepwarm;
+/// The cache-simulating provider of the tool-round keep-warm tests
+/// (`runtime::stream`, `tools::subagent`; host paths:
+/// `tests/worker_tool_keepwarm.rs`).
+#[cfg(test)]
+#[path = "../../tests/support/cache_sim.rs"]
+pub(crate) mod cache_sim;
 pub mod memory_context;
 pub mod memory_history;
 pub mod message_time;
@@ -46,7 +53,10 @@ mod stream;
 pub mod subagent;
 pub mod subagent_watch;
 pub mod telemetry;
+mod read_dedupe;
+pub mod tool_spill;
 pub mod trace;
+pub mod worker_context;
 pub(crate) mod transport;
 mod types;
 
@@ -387,6 +397,7 @@ pub async fn emit_after_tool_call(
         output,
         max_tool_output,
         session_id,
+        false,
     )
     .await
     .output
@@ -395,10 +406,23 @@ pub async fn emit_after_tool_call(
 /// Distinguish an authoritative hook replacement from ordinary budget truncation.
 /// Byte equality with the summary cannot establish whether the delta lane is stale.
 pub(super) struct AfterToolCallOutcome {
+    /// Post-hook output cut to `max_tool_output` (the legacy history text).
     pub output: String,
     pub replaced: bool,
+    /// The post-hook output BEFORE that cut, kept only when asked for
+    /// (`keep_uncut`, i.e. tool output virtualisation is on) and only when
+    /// the cut removed bytes: a spill must hold the whole result.
+    pub uncut: Option<String>,
 }
 
+impl AfterToolCallOutcome {
+    /// The whole post-hook output: what a virtualised result spills.
+    pub fn full_text(&self) -> &str {
+        self.uncut.as_deref().unwrap_or(&self.output)
+    }
+}
+
+#[allow(clippy::too_many_arguments)] // the hook event's fields plus the history policy
 pub(super) async fn emit_after_tool_call_outcome(
     hook_bus: &Arc<crate::extensions::hooks::HookBus>,
     tool_name: &str,
@@ -407,6 +431,7 @@ pub(super) async fn emit_after_tool_call_outcome(
     output: String,
     max_tool_output: usize,
     session_id: Option<&str>,
+    keep_uncut: bool,
 ) -> AfterToolCallOutcome {
     use crate::extensions::hooks::events::HookResult;
     // Keep the original to return verbatim if no transform fires.
@@ -450,12 +475,13 @@ pub(super) async fn emit_after_tool_call_outcome(
     // Compress-then-truncate: apply the context-budget cap AFTER the hook.
     // Mirrors `HelperMethods::truncate_tool_result` byte-for-byte so the
     // no-extension path is behavior-identical to the legacy ordering.
+    let output =
+        crate::runtime::helpers::HelperMethods::truncate_tool_result(&post_hook, max_tool_output);
+    let uncut = (keep_uncut && post_hook.len() > max_tool_output).then_some(post_hook);
     AfterToolCallOutcome {
-        output: crate::runtime::helpers::HelperMethods::truncate_tool_result(
-            &post_hook,
-            max_tool_output,
-        ),
+        output,
         replaced,
+        uncut,
     }
 }
 
@@ -548,6 +574,10 @@ pub struct Runtime {
     /// Opt-in context windows within a stable logical session (#112).
     /// DARK by default: `ContextManagementMode::Off`.
     pub(crate) continuation: continuation::SharedContinuation,
+    /// Subagent workers only: automatic context rollover into the worker's
+    /// archive directory (see `worker_context`). Inert by default and on
+    /// every foreground runtime.
+    worker_context: worker_context::WorkerContext,
     /// Model used for compaction. Falls back to claude-sonnet-4-6 if not set.
     compaction_model: Option<String>,
     /// Where compaction summarization runs (spec §9.4).
@@ -569,6 +599,23 @@ pub struct Runtime {
     pub watcher_exit_path: Option<PathBuf>,
     // New configurable fields
     max_tool_output: usize,
+    /// Tool output virtualisation thresholds (`tool_output_spill_*`). OFF
+    /// on construction — `Runtime::new()` is also the embedding/test path
+    /// and must not write under the base dir unless configured; every
+    /// production boot applies the config (default on), workers through
+    /// `apply_subagent_runtime_policy`.
+    tool_spill_policy: tool_spill::ToolSpillPolicy,
+    /// `<base>/spill`, bound once at construction (like `capture_dir`).
+    tool_spill_root: PathBuf,
+    /// Session-cumulative virtualisation counters; shared by clones.
+    tool_spill_stats: Arc<tool_spill::ToolSpillStats>,
+    /// Replace re-reads of unchanged files with a stub and note write/edit
+    /// results. Off until a config is applied (production default on).
+    read_dedupe: bool,
+    /// Keep the cache warm while a tool round runs (`cache_keepwarm_tools`,
+    /// `runtime::tool_keepwarm`). Off until a config is applied
+    /// (production default on).
+    tool_keepwarm: bool,
     bash_timeout: u64,
     bash_max_timeout: u64,
     subagent_timeout: u64,
@@ -664,9 +711,10 @@ pub struct Runtime {
     capture_dir: std::path::PathBuf,
     /// Opt into the cache-diagnosis beta (`cache-diagnosis-2026-04-07`).
     cache_diagnostics: bool,
-    /// Prompt-cache TTL strategy (5m default | 1h | hybrid). Threaded into
-    /// every request via `ApiOptions`.
-    cache_ttl: crate::core::config::CacheTtl,
+    /// Configured prompt-cache TTL (`auto` default | 5m | 1h | hybrid).
+    /// Threaded into every request via `ApiOptions`; `auto` is resolved per
+    /// request from the Anthropic credential kind (1h OAuth, 5m API key).
+    cache_ttl: crate::core::config::CacheTtlSetting,
     /// gzip policy for Anthropic request bodies (`request_compression`,
     /// `request_compression_level`). Threaded into every request via
     /// `ApiOptions`; its refusal latch is process-wide.
@@ -1166,6 +1214,8 @@ fn fresh_host_parts() -> Result<crate::host::HostParts> {
     // the SAME value bound into `capture_dir` (fix1 I2b).
     let capture_dir = trace::default_capture_dir();
     let _ = trace::sweep_expired_captures(&capture_dir);
+    // Same for tool-output spill dirs past their age (bound here too).
+    let spill_root = sweep_spill_root();
     Ok(crate::host::HostParts {
         client,
         tools: Arc::new(RwLock::new(ToolRegistry::new())),
@@ -1175,8 +1225,22 @@ fn fresh_host_parts() -> Result<crate::host::HostParts> {
         mcp_runtime: None,
         extension_runtime: None,
         capture_dir,
+        spill_root,
         progressive_tool_disclosure: false,
     })
+}
+
+/// Resolve `<base>/spill` once and remove session spill dirs past
+/// [`agent_core::core::tool_spill::SPILL_MAX_AGE`] — bounded, fail-soft,
+/// confined to the spill root, like the capture sweep beside it.
+pub(crate) fn sweep_spill_root() -> PathBuf {
+    let root = agent_core::core::tool_spill::default_spill_root();
+    let _ = agent_core::core::tool_spill::sweep_stale_spill(
+        &root,
+        agent_core::core::tool_spill::SPILL_MAX_AGE,
+        std::time::SystemTime::now(),
+    );
+    root
 }
 
 /// Preserve compatibility with favorite IDs written before Anthropic used its
@@ -1265,6 +1329,11 @@ impl Runtime {
             event_queue: Arc::new(crate::events::EventQueue::new(1000)),
             watcher_exit_path: None,
             max_tool_output: 30000,
+            tool_spill_policy: tool_spill::ToolSpillPolicy::OFF,
+            tool_spill_root: host.spill_root,
+            tool_spill_stats: Arc::default(),
+            read_dedupe: false,
+            tool_keepwarm: false,
             bash_timeout: 30,
             bash_max_timeout: 300,
             subagent_timeout: 300,
@@ -1283,6 +1352,7 @@ impl Runtime {
             memory_backend_config: None,
             memory_backend_reconfigure_denied: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             continuation: Arc::new(Mutex::new(continuation::ContinuationState::default())),
+            worker_context: Default::default(),
             pending_history_import_preview: std::sync::Arc::new(std::sync::Mutex::new(None)),
             history_import_plan: std::sync::Arc::new(std::sync::Mutex::new(None)),
             #[cfg(any(test, feature = "testing"))]
@@ -1294,7 +1364,7 @@ impl Runtime {
             one_shot_trace_writer: std::sync::Arc::new(std::sync::Mutex::new(None)),
             capture_dir: host.capture_dir,
             cache_diagnostics: false,
-            cache_ttl: crate::core::config::CacheTtl::default(),
+            cache_ttl: crate::core::config::CacheTtlSetting::default(),
             request_compression: Default::default(),
             ttl_downgrade_notified: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             saw_1h_honored: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1369,6 +1439,7 @@ impl Runtime {
             mcp_runtime: None,
             extension_runtime: None,
             capture_dir: trace::default_capture_dir(),
+            spill_root: agent_core::core::tool_spill::default_spill_root(),
             progressive_tool_disclosure: false,
         };
         let mut runtime = Self::from_parts(RuntimeParts::without_reaper(host));
@@ -1848,6 +1919,14 @@ impl Runtime {
     /// Get a shared reference to the extension hook bus.
     pub fn hook_bus(&self) -> &Arc<crate::extensions::hooks::HookBus> {
         &self.hook_bus
+    }
+
+    /// Replace the hook bus before the first turn (in-flight streams keep
+    /// the bus they started with). Subagent spawn only: the legacy
+    /// fresh-runtime path installs the host's worker view, and
+    /// `subagent_transform_hooks = off` detaches it.
+    pub(crate) fn set_hook_bus(&mut self, bus: Arc<crate::extensions::hooks::HookBus>) {
+        self.hook_bus = bus;
     }
 
     /// Background shell/PTY sessions owned by this runtime (`Checkpoint`
@@ -2447,6 +2526,11 @@ impl Runtime {
         self.context_window_override = window;
     }
 
+    /// The configured window override (`None` = the model default).
+    pub fn context_window_override(&self) -> Option<u64> {
+        self.context_window_override
+    }
+
     /// Effective context window for the current model — user override if set,
     /// otherwise the model's native window from `models::context_window_for_model`.
     pub fn compaction_model(&self) -> &str {
@@ -2464,8 +2548,9 @@ impl Runtime {
     /// frontend consumes on its compaction trigger path. Reads the segments
     /// the next request will actually carry — the effective system prompt,
     /// the exposed tool-schema set, the supplied history — and the runtime's
-    /// configured reserves (thinking budget, tool-result cap, model output
-    /// reserve, provider window with the documented safety margin).
+    /// configured reserves (thinking budget, tool-result cap, the expected
+    /// output within the model's `max_tokens`, provider window with the
+    /// documented safety margin).
     ///
     /// Skill bodies that reach the request do so through the system prompt
     /// or history today, so they are already accounted there; the skill lane
@@ -2490,6 +2575,12 @@ impl Runtime {
             .as_ref()
             .map(|segment| segment.rendered_text().to_string());
         let memory_contents: Vec<&str> = memory_rendered.as_deref().into_iter().collect();
+        let anchor = self
+            .continuation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .usage_anchor_for(&self.model)
+            .cloned();
         context::assess(&context::ContextBudgetInputs {
             model: &self.model,
             provider_window: self.context_window(),
@@ -2500,8 +2591,9 @@ impl Runtime {
             memory_contents: &memory_contents,
             thinking_budget_tokens: self.thinking_budget as u64,
             next_tool_result_bytes: self.max_tool_output as u64,
-            output_reserve_tokens: HelperMethods::max_tokens_for_model(&self.model),
+            max_output_tokens: HelperMethods::max_tokens_for_model(&self.model),
         })
+        .anchored(anchor.as_ref(), messages)
     }
 
     /// Task A7: hold a validated recall contribution for the current turn as
@@ -2927,6 +3019,9 @@ impl Runtime {
         self.compaction_mode = config.compaction_mode;
         self.compaction_exclusions = config.compaction_exclude.clone();
         self.max_tool_output = config.max_tool_output;
+        self.tool_spill_policy = tool_spill::ToolSpillPolicy::from_config(config);
+        self.read_dedupe = config.read_dedupe;
+        self.tool_keepwarm = config.cache_keepwarm_tools;
         self.bash_timeout = config.bash_timeout;
         self.bash_max_timeout = config.bash_max_timeout;
         self.subagent_timeout = config.subagent_timeout;
@@ -3071,6 +3166,57 @@ impl Runtime {
 
     pub fn set_max_tool_output(&mut self, v: usize) {
         self.max_tool_output = v;
+    }
+
+    pub fn tool_spill_policy(&self) -> tool_spill::ToolSpillPolicy {
+        self.tool_spill_policy
+    }
+
+    pub fn set_tool_spill_policy(&mut self, policy: tool_spill::ToolSpillPolicy) {
+        self.tool_spill_policy = policy;
+    }
+
+    pub fn read_dedupe(&self) -> bool {
+        self.read_dedupe
+    }
+
+    /// Read dedupe + write/edit notes; off = legacy tool-result bytes.
+    pub fn set_read_dedupe(&mut self, enabled: bool) {
+        self.read_dedupe = enabled;
+    }
+
+    pub fn tool_keepwarm(&self) -> bool {
+        self.tool_keepwarm
+    }
+
+    /// Keep the cache warm while a tool round runs (`cache_keepwarm_tools`).
+    pub fn set_tool_keepwarm(&mut self, enabled: bool) {
+        self.tool_keepwarm = enabled;
+    }
+
+    /// Session totals of tool output virtualisation (count, bytes kept out
+    /// of history).
+    pub fn tool_spill_totals(&self) -> tool_spill::ToolSpillTotals {
+        self.tool_spill_stats.totals()
+    }
+
+    /// The virtualiser one stream uses. Its dir is keyed by the persisted
+    /// conversation id, so retention removes it with the session; a worker
+    /// (no conversation id) is keyed by its own runtime trace session.
+    pub(crate) fn tool_spill(&self) -> tool_spill::ToolSpill {
+        if !self.tool_spill_policy.is_enabled() {
+            return tool_spill::ToolSpill::off();
+        }
+        let key = self
+            .session_id
+            .clone()
+            .unwrap_or_else(|| self.trace_ctx.session_id().as_str().to_string());
+        tool_spill::ToolSpill::new(
+            self.tool_spill_policy,
+            &self.tool_spill_root,
+            &key,
+            Arc::clone(&self.tool_spill_stats),
+        )
     }
 
     pub fn set_bash_timeout(&mut self, v: u64) {
@@ -3994,8 +4140,39 @@ impl Runtime {
         self.cache_diagnostics = v;
     }
 
-    pub fn cache_ttl(&self) -> crate::core::config::CacheTtl {
+    /// `request_compression` / `request_compression_level`, as `apply_config`
+    /// sets them (the process-wide refusal latch included).
+    pub fn set_request_compression(
+        &mut self,
+        mode: agent_core::config::RequestCompressionMode,
+        level: u32,
+    ) {
+        self.request_compression = request_encoding::RequestCompression::from_config(mode, level);
+    }
+
+    /// `(mode, level)` of the gzip policy this runtime's requests carry.
+    #[cfg(test)]
+    pub(crate) fn request_compression_for_test(
+        &self,
+    ) -> (Option<agent_core::config::RequestCompressionMode>, u32) {
+        self.request_compression.configured()
+    }
+
+    /// The configured cache TTL (`auto` unless config or a caller fixed it).
+    /// What a request actually sends is [`Self::resolved_cache_ttl`].
+    pub fn cache_ttl(&self) -> crate::core::config::CacheTtlSetting {
         self.cache_ttl
+    }
+
+    /// The wire TTL the next Anthropic request will carry: the configured
+    /// setting resolved against the credential kind currently bound
+    /// (`auto`: 1h on OAuth/subscription, 5m on an API key). Same function
+    /// the request builder applies, so keep-warm scheduling and status
+    /// agree with the wire. Depends only on the kind, never on which
+    /// account: failover between seats of one kind leaves it unchanged.
+    pub async fn resolved_cache_ttl(&self) -> crate::core::config::CacheTtl {
+        let auth = self.auth.read().await;
+        self.cache_ttl.resolve_for_auth_type(&auth.auth_type)
     }
 
     /// Thread a parent runtime's TTL atomics onto this (cloned) runtime so
@@ -4022,11 +4199,41 @@ impl Runtime {
         })
     }
 
+    /// Test seam: set the bound Anthropic credential kind (`oauth` |
+    /// `api_key` | `none`) so `cache_ttl = auto` resolution can be exercised
+    /// without a real login.
+    #[cfg(test)]
+    pub(crate) async fn set_auth_kind_for_test(&self, kind: &str) {
+        self.auth.write().await.auth_type = kind.to_string();
+    }
+
     /// Change the cache TTL strategy mid-session. The next request re-marks
     /// with the new TTL; the old prefix expires naturally (single-last
     /// strategy never prunes old markers, so no invalidation logic needed).
-    pub fn set_cache_ttl(&mut self, ttl: crate::core::config::CacheTtl) {
-        self.cache_ttl = ttl;
+    /// Accepts a fixed [`crate::core::config::CacheTtl`] or a full
+    /// [`crate::core::config::CacheTtlSetting`] (including `auto`).
+    pub fn set_cache_ttl(&mut self, ttl: impl Into<crate::core::config::CacheTtlSetting>) {
+        self.cache_ttl = ttl.into();
+    }
+
+    /// Worker rollover policy from config (`apply_subagent_runtime_policy`).
+    /// Inert until [`Self::attach_worker_transcripts`] gives it somewhere to
+    /// keep evicted history.
+    pub fn set_worker_context_settings(
+        &mut self,
+        settings: Option<worker_context::WorkerContextSettings>,
+    ) {
+        self.worker_context.settings = settings;
+    }
+
+    /// Where this worker's evicted history goes (its archive directory and
+    /// handle), plus who to tell. Set per spawn, before the run starts.
+    pub fn attach_worker_transcripts(&mut self, sink: worker_context::WorkerTranscriptSink) {
+        self.worker_context.sink = Some(sink);
+    }
+
+    pub fn worker_context(&self) -> &worker_context::WorkerContext {
+        &self.worker_context
     }
 
     pub fn thinking_level(&self) -> &str {
@@ -4181,6 +4388,9 @@ impl Runtime {
                     request_compression: self.request_compression.clone(),
                     anthropic_execution_plan: anthropic_execution_plan.clone(),
                     codex_request_role: self.codex_request_role(),
+                    // The legacy non-stream loop applies no request-local
+                    // image retention of its own.
+                    retention_frontier: None,
                     // Consistent with the streaming path: a pending
                     // `/trace next` arm covers the first request of this
                     // loop too (the one-shot gate inside the armed context
@@ -4207,6 +4417,7 @@ impl Runtime {
                     keepwarm: None,
                     // The non-stream transport never sends diagnostics.
                     cache_diagnosis: None,
+                    context_rollover: None,
                 },
             )
             .await?;
@@ -4759,6 +4970,9 @@ impl Runtime {
             request_compression: self.request_compression.clone(),
             anthropic_execution_plan,
             codex_request_role: self.codex_request_role(),
+            // Placeholder: the stream loop sets it per round once it has
+            // applied request-local image retention.
+            retention_frontier: None,
             trace: self.effective_trace_context(),
             request_correlation: None,
             suppress_stream_deltas: false,
@@ -4780,6 +4994,7 @@ impl Runtime {
             // The foreground chain: the only requests that thread
             // `diagnostics.previous_message_id`.
             cache_diagnosis: self.cache_diagnosis(),
+            context_rollover: None,
         };
 
         let final_capture_history: Arc<Mutex<Option<Vec<crate::SharedMessage>>>> = Arc::new(Mutex::new(None));
@@ -4790,6 +5005,7 @@ impl Runtime {
             turn_completion: completion,
             context_window: self.context_window(),
             continuation: self.continuation.clone(),
+            worker_context: self.worker_context.clone(),
             auth,
             client,
             credential_source,
@@ -4807,6 +5023,12 @@ impl Runtime {
             steering_rx,
             watcher_exit_path,
             max_tool_output,
+            tool_spill: self.tool_spill(),
+            read_dedupe: self.read_dedupe,
+            tool_keepwarm: self.tool_keepwarm.then(|| tool_keepwarm::ToolKeepWarm::new(
+                self.trace_ctx.clone(),
+                tool_keepwarm::interval_override(),
+            )),
             bash_timeout,
             bash_max_timeout,
             subagent_timeout,
@@ -4894,6 +5116,7 @@ impl Clone for Runtime {
             codex_request_role: self.codex_request_role,
             context_window_override: self.context_window_override,
             continuation: Arc::clone(&self.continuation),
+            worker_context: self.worker_context.clone(),
             compaction_model: self.compaction_model.clone(),
             compaction_mode: self.compaction_mode,
             compaction_exclusions: self.compaction_exclusions.clone(),
@@ -4903,6 +5126,11 @@ impl Clone for Runtime {
             event_queue: self.event_queue.clone(),
             watcher_exit_path: self.watcher_exit_path.clone(),
             max_tool_output: self.max_tool_output,
+            tool_spill_policy: self.tool_spill_policy,
+            tool_spill_root: self.tool_spill_root.clone(),
+            tool_spill_stats: Arc::clone(&self.tool_spill_stats),
+            read_dedupe: self.read_dedupe,
+            tool_keepwarm: self.tool_keepwarm,
             bash_timeout: self.bash_timeout,
             bash_max_timeout: self.bash_max_timeout,
             subagent_timeout: self.subagent_timeout,
@@ -5488,6 +5716,73 @@ mod tests {
             "constructing a child must not mint/replay a favorite-model grant"
         );
         assert!(!session.effective_choices().contains(&favorite.to_owned()));
+    }
+
+    /// Tool output virtualisation is off on a bare runtime (embedding and
+    /// test path), follows the config once applied, and spills a foreground
+    /// session into `<base>/spill/<conversation id>` so retention can remove
+    /// it with the session.
+    #[test]
+    #[serial_test::serial(synaps_base_dir)]
+    fn tool_spill_follows_config_and_is_keyed_by_the_conversation() {
+        let base = crate::test_env::BaseDirGuard::new();
+        let mut runtime = Runtime::new_headless();
+        assert!(!runtime.tool_spill_policy().is_enabled());
+        assert!(!runtime.tool_spill().is_enabled());
+        runtime.apply_config(&crate::config::SynapsConfig::default());
+        assert_eq!(
+            runtime.tool_spill_policy(),
+            tool_spill::ToolSpillPolicy {
+                threshold_bytes: 12 * 1024,
+                head_bytes: 4 * 1024,
+                tail_bytes: 3 * 1024,
+            }
+        );
+        runtime.set_session_id(Some("20261029-120000-ab12".into()));
+        assert_eq!(
+            runtime.tool_spill().dir(),
+            Some(base.path().join("spill").join("20261029-120000-ab12").as_path())
+        );
+        // Clones (the same session) share the counters.
+        let clone = runtime.clone();
+        let text = "line\n".repeat(4_000);
+        let virtualised = clone
+            .tool_spill()
+            .virtualise("toolu_1", &tool_spill::SpillTarget::Spill, &text)
+            .expect("over the threshold");
+        assert_eq!(runtime.tool_spill_totals().virtualised, 1);
+        assert_eq!(
+            runtime.tool_spill_totals().kept_out_bytes(),
+            (text.len() - virtualised.preview.len()) as u64
+        );
+        runtime.apply_config(&agent_core::config::load_config_from_str(
+            "tool_output_spill_bytes = 0\n",
+        ));
+        assert!(!runtime.tool_spill().is_enabled(), "0 turns it off");
+    }
+
+    #[test]
+    fn read_dedupe_is_off_until_configured_then_follows_config() {
+        let mut runtime = Runtime::new_headless();
+        assert!(!runtime.read_dedupe(), "off until a config is applied");
+        runtime.apply_config(&agent_core::config::load_config_from_str(""));
+        assert!(runtime.read_dedupe(), "the config default is on");
+        assert!(runtime.clone().read_dedupe(), "clones keep it");
+        runtime.apply_config(&agent_core::config::load_config_from_str("read_dedupe = off\n"));
+        assert!(!runtime.read_dedupe());
+    }
+
+    #[test]
+    fn tool_keepwarm_is_off_until_configured_then_follows_config() {
+        let mut runtime = Runtime::new_headless();
+        assert!(!runtime.tool_keepwarm(), "off until a config is applied");
+        runtime.apply_config(&agent_core::config::load_config_from_str(""));
+        assert!(runtime.tool_keepwarm(), "the config default is on");
+        assert!(runtime.clone().tool_keepwarm(), "clones keep it");
+        runtime.apply_config(&agent_core::config::load_config_from_str(
+            "cache_keepwarm_tools = off\n",
+        ));
+        assert!(!runtime.tool_keepwarm());
     }
 
     #[test]

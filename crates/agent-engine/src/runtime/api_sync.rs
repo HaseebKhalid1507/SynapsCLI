@@ -177,6 +177,9 @@ impl ApiMethods {
                 "No Anthropic credentials. Run `synaps login`, or switch to a provider model with `/model groq/llama-3.3-70b-versatile`.".to_string()
             ));
         }
+        // Resolve `cache_ttl = auto` against this request's credential kind
+        // (1h OAuth, 5m API key); explicit values pass through unchanged.
+        let cache_ttl = options.cache_ttl.resolve_for_auth_type(&auth_type);
 
         let auth_header = if auth_type == "oauth" {
             (
@@ -191,7 +194,10 @@ impl ApiMethods {
         // Arc-shared (#128): to_vec() is N refcount bumps, not a deep copy;
         // sanitize/annotate clone-on-write only what they edit.
         let mut cleaned_messages = messages.to_vec();
-        let retired_count = super::image_retention::plan(messages).map_err(RuntimeError::Config)?;
+        let retention =
+            super::image_retention::plan_request(messages, super::image_retention::Budget::Native)
+                .map_err(RuntimeError::Config)?;
+        let retired_count = retention.retired;
         // Stable per-image projection precedes cache markers, only on Anthropic.
         // Original preflight above remains authoritative; recheck output budgets.
         super::image_limits::enforce_image_limits(&mut cleaned_messages, retired_count)
@@ -199,13 +205,21 @@ impl ApiMethods {
             .map_err(RuntimeError::Config)?;
         super::attachments::validate_messages(model, &cleaned_messages)
             .map_err(RuntimeError::Config)?;
+        // The frontier is a position in `messages`: anchor before sanitation
+        // merges messages. A worker round arrives already retired upstream
+        // (its frontier rides in the options) and replays as a no-op here.
+        HelperMethods::annotate_retention_anchor(
+            &mut cleaned_messages,
+            super::image_retention::earliest(options.retention_frontier, retention.frontier),
+            cache_ttl,
+        );
         // Strict checks retain original per-source batch boundaries: sanitizing
         // first could merge valid adjacent user batches past eight attachments.
         HelperMethods::sanitize_thinking_blocks(&mut cleaned_messages);
         // The sync transport sends the full registry and never defers, so any
         // `tool_reference` in the history is stripped (it would be a 400).
         HelperMethods::wire_tool_references(&mut cleaned_messages, &|_| None);
-        HelperMethods::annotate_cache_breakpoint(&mut cleaned_messages, options.cache_ttl);
+        HelperMethods::annotate_cache_breakpoint(&mut cleaned_messages, cache_ttl);
 
         // Body assembly (#128 Slice 4): borrow the history instead of the old
         // `json!` deep rebuild. Sync transport → no "stream" key. Byte-identity
@@ -221,10 +235,13 @@ impl ApiMethods {
             thinking_budget,
             reasoning_level,
             Some(&execution_plan),
-            options.cache_ttl,
+            cache_ttl,
             false,
         );
-        let body = parts.body;
+        let mut body = parts.body;
+        // A model that rejects input + `max_tokens` over the window gets the
+        // room the input leaves (no-op on Claude 4.5 and later).
+        body.fit_max_tokens_to_window(Self::provider_window(options, model));
         let translation_report = parts.report;
 
         // Serialize once up-front; each retry attempt reuses the same bytes
@@ -248,6 +265,7 @@ impl ApiMethods {
         // ═══ TRACE (Task 8): shared construction with the streaming path ═══
         let mut tracer = super::api::begin_anthropic_tracer(
             options,
+            cache_ttl,
             &anthropic_url,
             model,
             &body_bytes,
@@ -636,18 +654,38 @@ impl ApiMethods {
             ));
         }
 
+        // System blocks + translation report come from one helper, in one
+        // branch: the report is derived from the actual assembly decision
+        // (OAuth synthesizes transport identity + product identity +
+        // guidance; api_key is lossless) and can never drift from the wire.
+        let (system_blocks, compaction_report) =
+            compaction_system_blocks(&auth_type, system_prompt);
+        let adaptive = crate::core::models::model_supports_adaptive_thinking(model);
+        let budget = if thinking_budget == 0 {
+            crate::core::models::DEFAULT_LEGACY_ADAPTIVE_FALLBACK
+        } else {
+            thinking_budget
+        };
+        // A model that rejects input + `max_tokens` over the window gets the
+        // room the input leaves (no-op on Claude 4.5 and later). Measured
+        // against the window this path's beta set (default options) opens.
+        let max_tokens = HelperMethods::fit_max_tokens_to_window(
+            model,
+            HelperMethods::max_tokens_for_model(model),
+            Self::provider_window(&ApiOptions::default(), model),
+            (!adaptive).then_some(u64::from(budget)),
+            || {
+                super::context::conservative_token_estimate(&system_blocks.to_string())
+                    .saturating_add(super::context::estimate_history(messages))
+            },
+        );
         let mut body = json!({
             "model": model,
-            "max_tokens": HelperMethods::max_tokens_for_model(model),
+            "max_tokens": max_tokens,
             "messages": messages,
-            "thinking": if crate::core::models::model_supports_adaptive_thinking(model) {
+            "thinking": if adaptive {
                 json!({ "type": "adaptive", "display": "summarized" })
             } else {
-                let budget = if thinking_budget == 0 {
-                    crate::core::models::DEFAULT_LEGACY_ADAPTIVE_FALLBACK
-                } else {
-                    thinking_budget
-                };
                 json!({
                     "type": "enabled",
                     "budget_tokens": budget,
@@ -662,12 +700,6 @@ impl ApiMethods {
             body["output_config"] = json!({"effort": "low"});
         }
 
-        // System blocks + translation report come from one helper, in one
-        // branch: the report is derived from the actual assembly decision
-        // (OAuth synthesizes transport identity + product identity +
-        // guidance; api_key is lossless) and can never drift from the wire.
-        let (system_blocks, compaction_report) =
-            compaction_system_blocks(&auth_type, system_prompt);
         body["system"] = system_blocks;
 
         // Serialize once up-front (exact-bytes contract, spec 6.2): the
@@ -695,6 +727,7 @@ impl ApiMethods {
         // carries the three synthesized identity/guidance segment entries.
         let mut tracer = super::api::begin_anthropic_tracer(
             options,
+            options.cache_ttl.resolve_for_auth_type(&auth_type),
             &anthropic_url,
             model,
             &body_bytes,

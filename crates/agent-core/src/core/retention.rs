@@ -77,7 +77,7 @@ impl From<io::Error> for RetentionError {
 pub struct RetentionRoots {
     /// Active config dir: sessions/, chains/, synaps.log* live here.
     pub config_dir: PathBuf,
-    /// Base dir: memory/ lives here.
+    /// Base dir: memory/ and spill/ (tool-output spill files) live here.
     pub base_dir: PathBuf,
     /// Cache dir: trace/telemetry JSONL files live here.
     pub cache_dir: PathBuf,
@@ -107,6 +107,9 @@ impl RetentionRoots {
     }
     fn index_dir(&self) -> PathBuf {
         self.memory_dir().join("index")
+    }
+    fn spill_dir(&self) -> PathBuf {
+        crate::core::tool_spill::spill_root(&self.base_dir)
     }
 }
 
@@ -351,6 +354,8 @@ pub fn sweep_at(
             };
             if age_ref < cutoff {
                 delete_session_artifact(&path, &mut outcome)?;
+                // Its tool-output spill files die with it.
+                remove_session_spill(roots, &id, &mut outcome)?;
             }
         }
 
@@ -364,6 +369,14 @@ pub fn sweep_at(
                 delete_file(&path, &mut outcome)?;
             }
         }
+
+        // ── Tool-output spill dirs past the same cutoff (worker dirs have
+        // no session file, so this is what ages them out) ──
+        let age = std::time::Duration::from_millis(now_ms.saturating_sub(cutoff));
+        let now = std::time::UNIX_EPOCH + std::time::Duration::from_millis(now_ms);
+        let swept = crate::core::tool_spill::sweep_stale_spill(&roots.spill_dir(), age, now);
+        outcome.deleted_files += swept.files;
+        outcome.freed_bytes += swept.bytes;
     }
 
     // ── Memory: atomic rewrite dropping tombstoned records, records past
@@ -623,6 +636,18 @@ fn is_paired_journal(path: &Path) -> bool {
         && path.with_extension("json").exists()
 }
 
+/// Remove session `id`'s tool-output spill dir (`<base>/spill/<id>/`).
+fn remove_session_spill(
+    roots: &RetentionRoots,
+    id: &str,
+    outcome: &mut SweepOutcome,
+) -> io::Result<()> {
+    let freed = crate::core::tool_spill::remove_session_spill(&roots.spill_dir(), id)?;
+    outcome.deleted_files += freed.files;
+    outcome.freed_bytes += freed.bytes;
+    Ok(())
+}
+
 /// Delete a session artifact: the file plus, for `.json` snapshots, any
 /// sibling journal and turn draft (Task 35 — a session and its journal die
 /// together, so a sweep can never orphan journal state).
@@ -877,6 +902,8 @@ pub fn forget(roots: &RetentionRoots, domain: RetentionDomain, id: &str) -> io::
                     other => other?,
                 }
             }
+            // And its tool-output spill files.
+            crate::core::tool_spill::remove_session_spill(&roots.spill_dir(), id)?;
             Ok(())
         }
         RetentionDomain::Traces => {

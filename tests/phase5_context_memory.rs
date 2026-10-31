@@ -400,7 +400,7 @@ fn s9_2_compaction_triggers_before_exhaustion_across_fixture_classes() {
                 memory_contents: &[],
                 thinking_budget_tokens: 0,
                 next_tool_result_bytes: 0,
-                output_reserve_tokens: 0,
+                max_output_tokens: 0,
             };
             let assessment = assess(&inputs);
             if assessment.should_compact() {
