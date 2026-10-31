@@ -21,8 +21,6 @@ install-path = "CARGO_HOME"
 install-updater = false
 # Allow CI to proceed even if generated files differ (we have custom jobs)
 allow-dirty = ["ci"]
-# TEMPORARY (release PR only): build every artifact on this PR, Windows included.
-pr-run-mode = "upload"
 
 # macos-14 runner images are retired on 2026-11-02 (actions/runner-images#13518);
 # dist 0.31 still picks them for Apple Silicon.
