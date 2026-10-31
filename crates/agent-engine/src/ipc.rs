@@ -185,6 +185,21 @@ mod imp {
         }
     }
 
+    /// A pipe instance with the daemon pipe's protections, for other
+    /// per-user endpoints (the session event pipes): an owner-only DACL
+    /// (this user and SYSTEM) and no remote clients. `first` refuses a name
+    /// that is already served.
+    pub(crate) fn create_owner_only_pipe(name: &str, first: bool) -> io::Result<NamedPipeServer> {
+        win::PipeSecurity::current_user_only()?
+            .create(ServerOptions::new().first_pipe_instance(first).reject_remote_clients(true), name)
+    }
+
+    /// Refuse a connected pipe whose server process runs as another account.
+    pub(crate) fn verify_pipe_server(client: &NamedPipeClient) -> io::Result<()> {
+        use std::os::windows::io::AsRawHandle;
+        win::verify_server_is_current_user(client.as_raw_handle())
+    }
+
     /// The pipe name for an endpoint path. Hashed: pipe names live in one
     /// flat, machine-wide namespace and may not contain `\`.
     ///

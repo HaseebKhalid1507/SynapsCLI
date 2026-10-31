@@ -134,6 +134,7 @@ jobs:
       - run: cargo clippy --workspace --all-targets --no-default-features --locked -- -D warnings
       - run: cargo test --locked --no-fail-fast --test "daemon_*"
       - run: cargo test --locked --no-fail-fast -p synaps-tui --lib
+      - run: cargo test --locked --no-fail-fast -p synaps-engine --lib -- events::socket ipc::
 
   # The Axel memory sidecar is its own workspace (its own Cargo.lock and
   # dependency graph), so nothing above builds it. Its `axel` dependency is
