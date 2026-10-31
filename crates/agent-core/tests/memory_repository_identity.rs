@@ -159,7 +159,8 @@ fn moved_main_and_worktree_retain_key_and_historical_aliases() {
         ],
     );
     resolve(&moved_worker);
-    let moved_main = tmp.path().join("new-main");
+    // Canonical: on macOS the temp dir is /var/..., which resolves to /private/var/...
+    let moved_main = tmp.path().canonicalize().unwrap().join("new-main");
     fs::rename(&main, &moved_main).unwrap();
     git(
         &moved_main,
@@ -312,7 +313,8 @@ fn untrusted_common_directory_is_not_chmod_repaired() {
 fn separate_gitdir_worktree_first_shares_random_key_and_common_directory_root() {
     let tmp = TempDir::new().unwrap();
     let main = tmp.path().join("main");
-    let common = tmp.path().join("separate.git");
+    // Canonical: on macOS the temp dir is /var/..., which resolves to /private/var/...
+    let common = tmp.path().canonicalize().unwrap().join("separate.git");
     fs::create_dir(&main).unwrap();
     git(
         &main,
@@ -651,9 +653,16 @@ fn synthetic_git_failure(script: &str, expected: &str, timeout: bool) {
     )
     .unwrap();
     fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+    // macOS never looks Git up on PATH (`agent_core::git_program`): it runs
+    // `$DEVELOPER_DIR/usr/bin/git`, so the synthetic Git is injected there too.
+    // Elsewhere DEVELOPER_DIR is ignored and PATH supplies it.
+    let developer = tmp.path().join("developer");
+    fs::create_dir_all(developer.join("usr/bin")).unwrap();
+    fs::copy(&executable, developer.join("usr/bin/git")).unwrap();
     let started = Instant::now();
     let mut process = child(&main, "")
         .env("PATH", tmp.path())
+        .env("DEVELOPER_DIR", &developer)
         .env("SYNTHETIC_GIT_PID", &pid_path)
         .env("SYNTHETIC_DESCENDANT_PID", &descendant_path)
         .env("SYNTHETIC_EXPECTED_ERROR", expected)

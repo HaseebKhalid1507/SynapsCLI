@@ -2,6 +2,7 @@
 //! protocol, memory, and pricing. Leaf crate: no in-repo upward deps.
 
 pub mod core;
+pub mod git_program;
 pub mod memory;
 pub mod pricing;
 

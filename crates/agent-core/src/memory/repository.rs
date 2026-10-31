@@ -152,12 +152,20 @@ fn git_output(_: &Path, _: &[&str]) -> Result<Option<Vec<u8>>, MemoryError> {
     ))
 }
 
+/// No developer Git (macOS without the Command Line Tools) fails exactly as a
+/// `git` missing from `PATH` does: the error of a spawn that finds no program.
+#[cfg(unix)]
+fn git_unavailable(_: crate::git_program::GitUnavailable) -> std::io::Error {
+    std::io::Error::from_raw_os_error(libc::ENOENT)
+}
+
 /// `Ok(None)`: Git exited unsuccessfully (the direct child is already reaped).
 #[cfg(unix)]
 fn git_output(root: &Path, args: &[&str]) -> Result<Option<Vec<u8>>, MemoryError> {
     use std::io::ErrorKind;
     use std::os::fd::AsRawFd;
-    let mut cmd = Command::new("git");
+    let program = crate::git_program::git_program().map_err(git_unavailable)?;
+    let mut cmd = Command::new(program);
     for (name, _) in std::env::vars_os() {
         if name.as_encoded_bytes().starts_with(b"GIT_") {
             cmd.env_remove(name);
@@ -825,6 +833,21 @@ mod tests {
 
     fn discover(root: &Path) -> RepositoryIdentity {
         ProjectScope::discover_repository_with_override(root, None).unwrap()
+    }
+
+    #[test]
+    #[serial(process_spawn)]
+    fn unavailable_git_fails_like_a_missing_git() {
+        let missing = Command::new("/nonexistent/synaps-test/git")
+            .spawn()
+            .unwrap_err();
+        let unavailable = git_unavailable(crate::git_program::GitUnavailable);
+        let (MemoryError::Io(missing), MemoryError::Io(unavailable)) =
+            (MemoryError::from(missing), MemoryError::from(unavailable))
+        else {
+            panic!("both must be MemoryError::Io");
+        };
+        assert_eq!(missing, unavailable);
     }
 
     #[test]

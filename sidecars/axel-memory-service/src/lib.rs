@@ -6,6 +6,8 @@ pub mod contract;
 mod forum;
 #[path = "../../../crates/agent-core/src/memory/forum.rs"]
 pub mod forum_contract;
+#[path = "../../../crates/agent-core/src/git_program.rs"]
+pub mod git_program;
 mod private_path;
 pub mod protocol;
 pub mod service;
