@@ -95,9 +95,9 @@ impl MemoryBinding {
         };
         let scope = match &repository {
             Some(Ok(identity)) => Ok(identity.scope.clone()),
-            Some(Err(_)) => {
-                Err("repository memory identity unavailable; no path-scope fallback".into())
-            }
+            Some(Err(e)) => Err(format!(
+                "repository memory identity unavailable ({e}); no path-scope fallback"
+            )),
             None => cwd
                 .ok_or_else(|| "workspace unavailable".to_owned())
                 .and_then(|cwd| {
@@ -215,7 +215,7 @@ impl MemoryBinding {
         self.0
             .scope
             .as_ref()
-            .map_err(|_| error("host project scope unavailable"))
+            .map_err(|reason| error(format!("host project scope unavailable: {reason}")))
     }
     pub fn base(&self) -> &Path {
         &self.0.base
@@ -548,6 +548,25 @@ mod tests {
             }
             _ => panic!("worker changed the selected backend"),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_repository_identity_names_its_cause() {
+        if std::env::var_os("SYNAPS_PROJECT_ROOT").is_some() {
+            return; // the override disables repository discovery
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::os::unix::fs::symlink(root.join("elsewhere"), root.join(".git")).unwrap();
+        let config = MemoryBackendConfig {
+            kind: MemoryBackendKind::Axel,
+            ..Default::default()
+        };
+        let binding = MemoryBinding::from_config_with_cwd(&config, Some(root));
+        let message = binding.scope().unwrap_err().to_string();
+        assert!(message.contains("no path-scope fallback"), "{message}");
+        assert!(message.contains("unsafe .git entry"), "{message}");
     }
 
     #[test]

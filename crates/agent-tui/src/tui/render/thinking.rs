@@ -395,6 +395,8 @@ fn header(
     let detail = match thought.and_then(|c| c.secs()) {
         Some(secs) => format!(" for {}", elapsed(secs.max(1))),
         None => match text.split_whitespace().count() {
+            // An omitted-display thought (no text by design): just "thought".
+            0 if text.is_empty() => String::new(),
             0 => " \u{00b7} empty".to_string(),
             1 => " \u{00b7} 1 word".to_string(),
             n => format!(" \u{00b7} {n} words"),
@@ -678,13 +680,21 @@ mod tests {
         let slot = s.render_message_lines(1, 80, &ctx());
         let r = rows(&slot);
         assert_eq!(r.len(), 2, "header + air (the user card ends in air): {r:#?}");
-        assert_eq!(r[0].trim_end(), "   \u{2576}\u{2500} \u{25c7} thinking");
+        // Timed from when it appeared (the send): 0s on the frozen clock.
+        assert_eq!(r[0].trim_end(), "   \u{2576}\u{2500} \u{25c7} thinking 0s");
         assert!(slot.meta_slice().iter().all(|m| *m == LineMeta::Chrome));
         assert!(s.live_slots().contains(&1), "the placeholder animates");
 
         let (_, slot) = done("  \n\t\n", 80);
         let r = rows(&slot);
         assert_eq!(r[1].trim_end(), "   \u{2576}\u{2500} \u{25c7} thought \u{00b7} empty");
+        assert_eq!(r.len(), 3);
+
+        // An omitted-display thought rebuilt from history (empty text, no
+        // clock): a bare "thought", one row, no rail.
+        let (_, slot) = done("", 80);
+        let r = rows(&slot);
+        assert_eq!(r[1].trim_end(), "   \u{2576}\u{2500} \u{25c7} thought");
         assert_eq!(r.len(), 3);
     }
 

@@ -862,7 +862,9 @@ mod tests {
         for name in ["bash", "grep", "find", "ls", "shell_send", "subagent_collect"] {
             assert_eq!(SpillTarget::classify(name, &builtin, &none, None), SpillTarget::Spill, "{name}");
         }
-        for name in ["edit", "write", "load_skill", "memory_fetch", "respond"] {
+        // Mutation results (multi_edit's included: at most 64 short lines,
+        // each saying what changed) stay whole in history, never a preview.
+        for name in ["edit", "write", "multi_edit", "load_skill", "memory_fetch", "respond"] {
             assert_eq!(SpillTarget::classify(name, &builtin, &none, None), SpillTarget::Never, "{name}");
         }
         let mcp = ToolOrigin::Mcp {

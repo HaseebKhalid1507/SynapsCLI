@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 
 use super::account::{
     seat_fingerprint, Account, AccountPolicy, AccountSelector, AccountSummary, CredentialRef,
-    SeatIdentity,
+    MaterialDigest, SeatIdentity,
 };
 use super::cloud::{CloudProviderId, InvokeRequest};
 use super::provider::OAuthProviderId;
@@ -699,6 +699,33 @@ pub trait CredentialBroker: Send + Sync {
         self.access_token_pinned(provider).await
     }
 
+    /// [`access_token_pinned_for`] that never answers with an account in
+    /// `exclude` (the accounts one logical request already used). Default
+    /// implementation: the ordinary selection, with an excluded answer
+    /// refused as "no account available"; a broker that can pass the
+    /// exclusion into its own selection overrides this.
+    ///
+    /// [`access_token_pinned_for`]: Self::access_token_pinned_for
+    async fn access_token_pinned_excluding(
+        &self,
+        provider: OAuthProviderId,
+        model: Option<&str>,
+        exclude: &[CredentialRef],
+    ) -> Result<PinnedToken, BrokerError> {
+        let pinned = self.access_token_pinned_for(provider, model).await?;
+        if exclude.contains(&pinned.credential) {
+            return Err(BrokerError::NoAccountAvailable {
+                provider: provider.as_str().to_string(),
+                reason: format!(
+                    "the broker chose {}, which this request already used",
+                    pinned.credential.account
+                ),
+                failure: None,
+            });
+        }
+        Ok(pinned)
+    }
+
     /// Non-secret account listing for `provider`. Default: unsupported.
     async fn accounts(&self, provider: OAuthProviderId) -> Result<Vec<AccountSummary>, BrokerError> {
         Err(BrokerError::UnsupportedCapability {
@@ -728,6 +755,34 @@ pub trait CredentialBroker: Send + Sync {
     ) -> Result<(), BrokerError> {
         let _ = (cred, until_ms, reason);
         Ok(())
+    }
+
+    /// When `cred`'s active cooldown ends (epoch ms), if this broker knows
+    /// of one. No network request and no token refresh. Default: none.
+    fn active_cooldown(&self, cred: &CredentialRef) -> Option<u64> {
+        let _ = cred;
+        None
+    }
+
+    /// A request sent on `cred` at `sent_at_ms` (epoch ms) was accepted:
+    /// drop its cooldown if that was reported no later than the request
+    /// left (the same millisecond counts: the caller saw the limit first), so
+    /// a limit that has passed does not keep moving turns off the account.
+    /// A cooldown reported later than `sent_at_ms` stays (that request proves
+    /// nothing about it). Memory only. Default: no-op.
+    fn clear_cooldown(&self, cred: &CredentialRef, sent_at_ms: u64) {
+        let _ = (cred, sent_at_ms);
+    }
+
+    /// Re-vend `cred` for automatic selection (a turn keeping the account
+    /// it is on). Unlike [`access_token_for`], which serves an account the
+    /// user chose, this honours and records a refused refresh's hold, the
+    /// same as the automatic choice's own vend. Default:
+    /// [`access_token_for`].
+    ///
+    /// [`access_token_for`]: Self::access_token_for
+    async fn access_token_for_auto(&self, cred: &CredentialRef) -> Result<AccessToken, BrokerError> {
+        self.access_token_for(cred).await
     }
 
     /// Execute a non-streaming provider request with the broker-owned key.
@@ -1724,6 +1779,37 @@ pub struct LocalBroker {
     observations: SharedMap<SlotObservations>,
     /// Last automatic selection per [`Self::current_key`] (provider + model).
     selections: SharedMap<super::auth_state::SelectionState>,
+    /// Refused token refreshes held per [`Self::state_key`] (see
+    /// [`REFUSED_REFRESH_HOLD`]). Memory only.
+    refresh_holds: SharedMap<RefreshHold>,
+    /// Stored seats for cooldown lookups, valid for one version of the
+    /// credential file ([`Self::cooldown_seat`]).
+    seat_cache: Arc<std::sync::Mutex<Option<SeatCache>>>,
+    /// Stored-login reads [`Self::cooldown_seat`] made (test seam).
+    seat_loads: Arc<std::sync::atomic::AtomicU64>,
+}
+
+/// One version of the credential file: modification time, length and
+/// inode (writes replace the file by rename, so each one gets a new inode;
+/// the coarse mtime alone could miss two writes in one clock tick).
+type FileStamp = (std::time::SystemTime, u64, u64);
+
+/// The version of the file at `path`, if it can be stat'ed.
+fn file_stamp(path: &std::path::Path) -> Option<FileStamp> {
+    let meta = std::fs::metadata(path).ok()?;
+    #[cfg(unix)]
+    let inode = std::os::unix::fs::MetadataExt::ino(&meta);
+    #[cfg(not(unix))]
+    let inode = 0;
+    Some((meta.modified().ok()?, meta.len(), inode))
+}
+
+/// The stored seat of each slot looked up, read from one version of the
+/// credential file.
+struct SeatCache {
+    path: std::path::PathBuf,
+    stamp: FileStamp,
+    seats: BTreeMap<String, Option<SeatIdentity>>,
 }
 
 /// One slot's recorded usage reads (`synaps auth state`).
@@ -1735,6 +1821,12 @@ struct SlotObservations {
 
 /// Process-shared map keyed by storage key or seat key.
 type SharedMap<T> = Arc<std::sync::Mutex<BTreeMap<String, T>>>;
+
+/// The accounts that failed earlier in one automatic selection (storage key
+/// → why): a failed refresh of the chosen seat or a failed usage read. They
+/// count as failed for the rest of that selection, without a new request.
+type FailedThisSelection = BTreeMap<String, super::quota_policy::ObservationFailure>;
+
 /// Config-derived policy tagged with the config file mtime it was read at.
 type CachedPolicy = (Option<std::time::SystemTime>, AccountPolicy);
 
@@ -1743,10 +1835,121 @@ type CachedPolicy = (Option<std::time::SystemTime>, AccountPolicy);
 struct Cooldown {
     until_ms: u64,
     reason: String,
+    /// When it was reported (epoch ms): only a request sent after this
+    /// clears it ([`CredentialBroker::clear_cooldown`]).
+    reported_at_ms: u64,
+}
+
+/// The keys one account's cooldown is kept under
+/// ([`LocalBroker::cooldown_keys`]). Non-secret: the seat part is an
+/// identity digest, never a token.
+struct CooldownKeys {
+    /// The stored seat's key; None when the slot has no readable login.
+    seat: Option<String>,
+    /// The slot's key.
+    slot: String,
+    /// The stored seat names a provider account id.
+    identified: bool,
+}
+
+impl CooldownKeys {
+    /// Keys a report writes: the seat's, and the slot's unless the seat
+    /// names an account id.
+    fn written(&self) -> impl Iterator<Item = &str> + '_ {
+        let slot = (!self.identified).then_some(self.slot.as_str());
+        self.seat.as_deref().into_iter().chain(slot)
+    }
+
+    /// Keys a lookup or a clear reads: the seat's and the slot's.
+    fn read(&self) -> impl Iterator<Item = &str> + '_ {
+        self.seat.as_deref().into_iter().chain([self.slot.as_str()])
+    }
 }
 
 /// Cooldown applied when a limit is reported without a reset hint.
 const DEFAULT_COOLDOWN: Duration = Duration::from_secs(15 * 60);
+
+/// A refused token refresh of one slot. No Debug: `material` is
+/// secret-derived.
+struct RefreshHold {
+    /// The stored login the provider refused.
+    material: MaterialDigest,
+    failure: super::token::RefreshFailure,
+    at_ms: u64,
+}
+
+/// How long a refused refresh (`refresh_rejected` /
+/// `refresh_action_required`) of an unchanged stored login is held. While
+/// held, neither refresh site (the chosen account's vend, the usage read's
+/// pre-read refresh) asks the provider again: the account fails with the
+/// held kind. The hold ends when the stored login changes (a new login, or a
+/// refresh by another process), on `synaps auth state --clear`, on a restart,
+/// or after this window; then ONE refresh is tried and a new refusal holds
+/// it again. Bounded so that a provider wrongly refusing during an outage
+/// cannot leave every account dead until a login or a restart; one probe per
+/// account per window is no storm. Retryable refresh failures are never
+/// held.
+pub const REFUSED_REFRESH_HOLD: Duration = Duration::from_secs(15 * 60);
+
+/// One slot's refused-refresh hold as the token helper sees it
+/// ([`super::token::RefusalMemory`]): checked after the stored login is
+/// re-read under the slot's refresh gate and lock, and written there from
+/// the exchange's answer. So concurrent callers of one slot make one
+/// decision: one exchange, and every waiter takes the held refusal. The
+/// digest is of the login actually refused. No Debug (the holds are
+/// secret-derived).
+struct SlotHold {
+    holds: SharedMap<RefreshHold>,
+    /// [`LocalBroker::state_key`] of the slot.
+    key: String,
+    provider: OAuthProviderId,
+    /// Set when this call was answered from the hold (no exchange).
+    answered: std::sync::atomic::AtomicBool,
+}
+
+impl SlotHold {
+    fn answered(&self) -> bool {
+        self.answered.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl super::token::RefusalMemory for SlotHold {
+    /// The hold of this slot while it is inside [`REFUSED_REFRESH_HOLD`]
+    /// and is for exactly `creds`; anything else ends it.
+    fn held(&self, creds: &super::OAuthCredentials) -> Option<super::token::RefreshFailure> {
+        let material = MaterialDigest::of(self.provider, creds);
+        let window_ms = REFUSED_REFRESH_HOLD.as_millis() as u64;
+        let mut holds = self.holds.lock().unwrap_or_else(|e| e.into_inner());
+        let hold = holds.get(&self.key)?;
+        if crate::epoch_millis() < hold.at_ms.saturating_add(window_ms)
+            && hold.material == material
+        {
+            self.answered.store(true, std::sync::atomic::Ordering::SeqCst);
+            return Some(hold.failure.clone());
+        }
+        holds.remove(&self.key);
+        None
+    }
+
+    /// Holds a refusal (`Credential` / `ActionRequired`) of `creds`; a
+    /// retryable kind is never held. Store failures never arrive here.
+    fn refused(&self, creds: &super::OAuthCredentials, failure: &super::token::RefreshFailure) {
+        use super::token::RefreshFailureKind as R;
+        if !matches!(failure.kind, R::Credential | R::ActionRequired) {
+            return;
+        }
+        let hold = RefreshHold {
+            material: MaterialDigest::of(self.provider, creds),
+            failure: failure.clone(),
+            at_ms: crate::epoch_millis(),
+        };
+        self.holds
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(self.key.clone(), hold);
+    }
+}
+
 /// Longest cooldown a client report may impose (a weekly window plus slack);
 /// anything longer is clamped so a bad report cannot bench a seat forever.
 const MAX_COOLDOWN: Duration = Duration::from_secs(8 * 24 * 60 * 60);
@@ -1798,6 +2001,9 @@ impl LocalBroker {
             policy_cache: Arc::new(std::sync::Mutex::new(None)),
             observations: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
             selections: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
+            refresh_holds: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
+            seat_cache: Arc::new(std::sync::Mutex::new(None)),
+            seat_loads: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
@@ -1916,7 +2122,7 @@ impl LocalBroker {
         provider: OAuthProviderId,
         model: Option<&str>,
     ) -> Result<PinnedToken, BrokerError> {
-        self.vend_auto(provider, model).await
+        self.vend_auto(provider, model, &[]).await
     }
 
     /// Test seam: point typed usage fetches at a fake server.
@@ -1956,31 +2162,109 @@ impl LocalBroker {
         config_policy.with_env_overlay()
     }
 
-    /// Limits follow the immutable seat, not an alias that can be re-used.
-    fn cooldown_key(&self, cred: &CredentialRef) -> String {
-        let seat = self
-            .stored_seat(cred)
-            .ok()
-            .map(|s| s.as_str().to_string())
-            .unwrap_or_else(|| cred.storage_key());
-        format!(
-            "{}|{}|{}",
-            storage::auth_file_path().display(),
-            cred.provider,
-            seat
-        )
+    /// Where `cred`'s cooldown is kept. Limits follow the seat, not an
+    /// alias that can be re-used: aliases of one seat share its cooldown.
+    /// A login without a provider account id has a seat derived from its
+    /// token, which a refresh rotates, so its cooldown is also kept under
+    /// its slot and survives the rotation. The slot can't tell that login
+    /// gaining an id from another account logging into the label, so any
+    /// new login into the slot inherits it too (under-use only; `auth state
+    /// --clear` drops it). The cooldown of a login WITH an account id is
+    /// kept under that id only: a login with another id does not inherit it.
+    fn cooldown_keys(&self, cred: &CredentialRef) -> CooldownKeys {
+        let store = storage::auth_file_path().display().to_string();
+        let slot = format!("{store}|{}|{}", cred.provider, cred.storage_key());
+        let seat = self.cooldown_seat(cred);
+        CooldownKeys {
+            identified: seat.as_ref().is_some_and(|s| s.seat_fingerprint().is_some()),
+            seat: seat.map(|s| format!("{store}|{}|{}", cred.provider, s.as_str())),
+            slot,
+        }
+    }
+
+    /// The seat stored in `cred`'s slot, for cooldown keys. A turn asks for
+    /// its account's cooldown before every request while any cooldown is
+    /// active, so the stored login is read once per version of the
+    /// credential file ([`FileStamp`]), not per lookup:
+    /// a later lookup costs one stat. A write by this or another process
+    /// (a login, a refresh) changes the version, so a rotated or replaced
+    /// login is read again. Never used for spending (vends and usage reads
+    /// load the slot themselves).
+    fn cooldown_seat(&self, cred: &CredentialRef) -> Option<SeatIdentity> {
+        let path = storage::auth_file_path();
+        let stamp = file_stamp(&path);
+        let key = cred.storage_key();
+        let mut cache = self.seat_cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let (Some(stamp), Some(c)) = (stamp, cache.as_ref()) {
+            if c.path == path && c.stamp == stamp {
+                if let Some(seat) = c.seats.get(&key) {
+                    return seat.clone();
+                }
+            }
+        }
+        self.seat_loads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let seat = self.stored_seat(cred).ok();
+        match stamp {
+            Some(stamp) => {
+                let fresh = cache
+                    .as_ref()
+                    .is_some_and(|c| c.path == path && c.stamp == stamp);
+                if !fresh {
+                    *cache = Some(SeatCache {
+                        path,
+                        stamp,
+                        seats: BTreeMap::new(),
+                    });
+                }
+                if let Some(c) = cache.as_mut() {
+                    c.seats.insert(key, seat.clone());
+                }
+            }
+            None => *cache = None,
+        }
+        seat
+    }
+
+    /// Test seam: how many times cooldown lookups read a stored login.
+    #[doc(hidden)]
+    pub fn cooldown_seat_loads_for_tests(&self) -> u64 {
+        self.seat_loads.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Whether any cooldown is active at `now_ms`.
+    fn any_cooldown_active(&self, now_ms: u64) -> bool {
+        self.cooldowns
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .any(|c| c.until_ms > now_ms)
+    }
+
+    /// `cred`'s active cooldown: the latest one under its keys.
+    fn active_cooldown_at(&self, cred: &CredentialRef, now_ms: u64) -> Option<Cooldown> {
+        // Nothing cooling, nothing to look up: no read of the stored login
+        // (a turn asks before every request).
+        if !self.any_cooldown_active(now_ms) {
+            return None;
+        }
+        self.cooldown_for_keys(&self.cooldown_keys(cred), now_ms)
+    }
+
+    /// The latest active cooldown under `keys`.
+    fn cooldown_for_keys(&self, keys: &CooldownKeys, now_ms: u64) -> Option<Cooldown> {
+        let cooldowns = self.cooldowns.lock().unwrap_or_else(|e| e.into_inner());
+        keys.read()
+            .filter_map(|key| cooldowns.get(key))
+            .filter(|c| c.until_ms > now_ms)
+            .max_by_key(|c| c.until_ms)
+            .cloned()
     }
 
     /// Reading an expired cooldown is non-mutating (preview shares this path).
     fn cooldown_until(&self, storage_key: &str, now_ms: u64) -> Option<u64> {
         let cred = CredentialRef::parse_storage_key(storage_key)?;
-        let key = self.cooldown_key(&cred);
-        self.cooldowns
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&key)
-            .filter(|c| c.until_ms > now_ms)
-            .map(|c| c.until_ms)
+        self.active_cooldown_at(&cred, now_ms).map(|c| c.until_ms)
     }
 
     // ── `synaps auth state` ─────────────────────────────────────────────
@@ -2001,12 +2285,7 @@ impl LocalBroker {
         cred: &CredentialRef,
         now_ms: u64,
     ) -> Option<super::auth_state::CooldownState> {
-        let key = self.cooldown_key(cred);
-        self.cooldowns
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&key)
-            .filter(|c| c.until_ms > now_ms)
+        self.active_cooldown_at(cred, now_ms)
             .map(|c| super::auth_state::CooldownState {
                 until_ms: c.until_ms,
                 reason: super::auth_state::CooldownReason::from_reported(&c.reason),
@@ -2015,18 +2294,18 @@ impl LocalBroker {
 
     /// Drop the in-memory state of `creds`: cooldowns, cached usage
     /// readings, held usage-read failures and last good readings in the
-    /// process-wide table (its gates stay), `auth state` records and
-    /// stickiness. With
+    /// process-wide table (its gates stay), `auth state` records, held
+    /// refused refreshes and stickiness. With
     /// `whole_providers` (no single account was named), also every cooldown
     /// and selection record of those providers, including ones a previous
     /// occupant of a slot left. Never touches the credential store.
     fn clear_state(&self, creds: &[CredentialRef], whole_providers: &[OAuthProviderId]) {
         let store = storage::auth_file_path().display().to_string();
+        let keys: Vec<CooldownKeys> = creds.iter().map(|c| self.cooldown_keys(c)).collect();
         {
             let mut cooldowns = self.cooldowns.lock().unwrap_or_else(|e| e.into_inner());
-            for cred in creds {
-                cooldowns.remove(&self.cooldown_key(cred));
-                cooldowns.remove(&format!("{store}|{}|{}", cred.provider, cred.storage_key()));
+            for key in keys.iter().flat_map(|k| k.read()) {
+                cooldowns.remove(key);
             }
             for provider in whole_providers {
                 let prefix = format!("{store}|{provider}|");
@@ -2041,6 +2320,17 @@ impl LocalBroker {
             let mut observations = self.observations.lock().unwrap_or_else(|e| e.into_inner());
             for cred in creds {
                 observations.remove(&Self::state_key(cred));
+            }
+        }
+        {
+            let mut holds = self.refresh_holds.lock().unwrap_or_else(|e| e.into_inner());
+            for cred in creds {
+                holds.remove(&Self::state_key(cred));
+            }
+            for provider in whole_providers {
+                let slot = format!("{store}|{}", provider.as_str());
+                let named = format!("{slot}@");
+                holds.retain(|k, _| *k != slot && !k.starts_with(&named));
             }
         }
         self.current_accounts
@@ -2076,12 +2366,15 @@ impl LocalBroker {
 
     /// Resolve and vend for a request: explicit account (validated, never a
     /// fallback) or the policy; `auto` goes through capacity selection with
-    /// the token paired to the proven seat.
+    /// the token paired to the proven seat. `exclude` lists the accounts the
+    /// request already used: `auto` selects among the rest, and an explicit
+    /// account in it is refused.
     async fn resolve_and_vend(
         &self,
         provider: OAuthProviderId,
         explicit: Option<Account>,
         model: Option<&str>,
+        exclude: &[CredentialRef],
     ) -> Result<PinnedToken, BrokerError> {
         let selector = match explicit {
             Some(account) => AccountSelector::Account(account),
@@ -2090,10 +2383,20 @@ impl LocalBroker {
         match selector {
             AccountSelector::Account(account) => {
                 let credential = CredentialRef::new(provider, account);
+                if exclude.contains(&credential) {
+                    return Err(BrokerError::NoAccountAvailable {
+                        provider: provider.as_str().to_string(),
+                        reason: format!(
+                            "the selected account {} was already used by this request",
+                            credential.account
+                        ),
+                        failure: None,
+                    });
+                }
                 let token = self.access_token_for(&credential).await?;
                 Ok(PinnedToken { credential, token })
             }
-            AccountSelector::Auto => self.vend_auto(provider, model).await,
+            AccountSelector::Auto => self.vend_auto(provider, model, exclude).await,
             AccountSelector::Invalid { source, reason } => {
                 Err(BrokerError::InvalidAccount(format!("{source}: {reason}")))
             }
@@ -2107,16 +2410,39 @@ impl LocalBroker {
     /// `auto`: select on fresh usage, then vend a token for exactly the seat
     /// that usage was read from. If the slot changed in between (re-login,
     /// removal, rotation by another party) the reading is discarded and the
-    /// selection re-runs once on the new content; never a token for a seat
-    /// whose capacity was not proven.
+    /// selection re-runs on the new content, at most
+    /// [`Self::MAX_AUTO_VEND_ROUNDS`] times; never a token for a seat whose
+    /// capacity was not proven.
+    ///
+    /// A refused refresh of the chosen seat (`refresh_rejected`,
+    /// `refresh_action_required`) does not end the selection while another
+    /// account has proven capacity: the account counts as failed, with its
+    /// refresh kind, for the rest of this selection and the selection runs
+    /// again without it. A retryable refresh failure (transient, lock busy,
+    /// other) ends the selection with that kind ([`BrokerError::Refresh`]):
+    /// it says nothing against the account, and moving would cost the turn
+    /// its prompt cache. A failed usage
+    /// read counts the same way (a held transient read is answered by the
+    /// usage-read table without a request). So each account gets at most one
+    /// refresh attempt and one failed read per selection, and the rounds are
+    /// bounded by the number of accounts. When none is left, the selection
+    /// fails with every account's kind (S1's classified failure). A refused
+    /// refresh is also held across selections ([`REFUSED_REFRESH_HOLD`]): a
+    /// held account fails with its held kind and no exchange.
     async fn vend_auto(
         &self,
         provider: OAuthProviderId,
         model: Option<&str>,
+        exclude: &[CredentialRef],
     ) -> Result<PinnedToken, BrokerError> {
         use super::token::{ensure_fresh_credential_for_seat, SeatVendError};
-        for _ in 0..Self::MAX_AUTO_VEND_ROUNDS {
-            let (credential, seat) = match self.select_auto(provider, model).await {
+        let mut failed = FailedThisSelection::new();
+        let mut seat_changes = 0;
+        loop {
+            let (credential, seat) = match self
+                .select_auto(provider, model, exclude, &mut failed)
+                .await
+            {
                 Ok(choice) => choice,
                 Err(e) => {
                     let failure = match &e {
@@ -2131,11 +2457,27 @@ impl LocalBroker {
                     return Err(e);
                 }
             };
+            // A refused refresh of this login is held: no new exchange.
+            if let Some(held) = self.held_refresh(&credential) {
+                let cause = refresh_failure(&held);
+                tracing::info!(
+                    credential = %credential,
+                    kind = %cause.kind,
+                    "automatic choice not vended: its refused token refresh is held until the stored login changes; selecting again"
+                );
+                failed.insert(credential.storage_key(), cause);
+                continue;
+            }
+            // The hold is checked again, and a refusal recorded, under the
+            // slot's refresh gate: concurrent turns make one decision.
+            let hold = self.slot_hold(&credential);
+            let memory: Arc<dyn super::token::RefusalMemory> = hold.clone();
             match ensure_fresh_credential_for_seat(
                 &self.http,
                 &credential,
                 &seat,
                 &self.refresh_endpoints,
+                Some(memory),
             )
             .await
             {
@@ -2154,24 +2496,55 @@ impl LocalBroker {
                             token: creds.access,
                             expires: creds.expires,
                         },
-                    })
+                    });
                 }
                 Err(SeatVendError::SeatChanged) => {
                     tracing::info!(credential = %credential, "slot changed after selection; re-selecting");
                     self.forget_snapshots(&credential);
-                    continue;
+                    seat_changes += 1;
+                    if seat_changes >= Self::MAX_AUTO_VEND_ROUNDS {
+                        break;
+                    }
                 }
                 // Typed, so a transient refresh failure of the chosen seat
                 // is never reported as an unusable login.
                 Err(SeatVendError::Other(f)) => {
                     let cause = refresh_failure(&f);
-                    tracing::warn!(
-                        credential = %credential,
-                        kind = %cause.kind,
-                        "automatic choice could not be vended: token refresh failed"
-                    );
-                    self.record_selection(provider, model, Some(&credential), None, Some(cause));
-                    return Err(BrokerError::Refresh(auto_vend_failure(&credential, f)));
+                    // Only a refusal (a login or an action fixes it) moves
+                    // the selection on. A retryable failure (the token
+                    // endpoint down, the refresh lock busy) says nothing
+                    // against this account, and another account would cost
+                    // the turn its prompt cache for nothing: the selection
+                    // fails with the refresh's own kind, and the next turn
+                    // tries again.
+                    if !matches!(
+                        f.kind,
+                        super::token::RefreshFailureKind::Credential
+                            | super::token::RefreshFailureKind::ActionRequired
+                    ) {
+                        tracing::warn!(
+                            credential = %credential,
+                            kind = %cause.kind,
+                            "automatic choice could not be vended: token refresh failed"
+                        );
+                        self.record_selection(provider, model, Some(&credential), None, Some(cause));
+                        return Err(BrokerError::Refresh(auto_vend_failure(&credential, f)));
+                    }
+                    if hold.answered() {
+                        // A refusal another caller just got, under the gate.
+                        tracing::info!(
+                            credential = %credential,
+                            kind = %cause.kind,
+                            "automatic choice not vended: its refused token refresh is held until the stored login changes; selecting again"
+                        );
+                    } else {
+                        tracing::warn!(
+                            credential = %credential,
+                            kind = %cause.kind,
+                            "automatic choice could not be vended: token refresh failed; selecting again"
+                        );
+                    }
+                    failed.insert(credential.storage_key(), cause);
                 }
             }
         }
@@ -2188,6 +2561,9 @@ impl LocalBroker {
     }
 
     /// Record the outcome of an automatic selection for `synaps auth state`.
+    /// `vend_failure`: the chosen account's token refresh failed for a
+    /// retryable reason, which ended the selection. (A refused refresh is
+    /// no outcome: the selection runs again without that account.)
     fn record_selection(
         &self,
         provider: OAuthProviderId,
@@ -2277,6 +2653,9 @@ impl LocalBroker {
         &self,
         cred: &CredentialRef,
     ) -> Result<(super::usage::UsageSnapshot, SeatIdentity), super::usage_reads::ReadError> {
+        if let Some(held) = self.held_refresh(cred) {
+            return Err(Self::held_read(cred, held).into_read_error());
+        }
         let seat = self
             .stored_seat(cred)
             .map_err(|e| UsageReadError::slot(e).into_read_error())?;
@@ -2298,11 +2677,14 @@ impl LocalBroker {
 
     /// Read-only usage for `cred` through the process-wide usage-read table,
     /// reporting the seat whose token made the request. A failure keeps its
-    /// typed cause.
+    /// typed cause. A held refused refresh answers without a request.
     async fn usage_with_seat(
         &self,
         cred: &CredentialRef,
     ) -> Result<(super::usage::UsageSnapshot, SeatIdentity), UsageReadError> {
+        if let Some(held) = self.held_refresh(cred) {
+            return Err(Self::held_read(cred, held));
+        }
         self.shared_read(cred)
             .await
             .map_err(|e| UsageReadError::from_read(&e))
@@ -2316,6 +2698,111 @@ impl LocalBroker {
             storage::auth_file_path().display(),
             cred.storage_key()
         )
+    }
+
+    /// Digest of the login stored in `cred`'s slot now; `None` when the
+    /// slot is empty or the store can't be read.
+    fn stored_material(cred: &CredentialRef) -> Option<MaterialDigest> {
+        storage::load_credential(cred)
+            .ok()
+            .flatten()
+            .map(|creds| MaterialDigest::of(cred.provider, &creds))
+    }
+
+    /// The held refused refresh of `cred`'s slot, if the provider refused
+    /// the login stored there now and [`REFUSED_REFRESH_HOLD`] has not
+    /// passed. A changed login or an ended window drops the hold, so the
+    /// next refresh asks the provider again. Without a hold for the slot
+    /// nothing is loaded.
+    fn held_refresh(&self, cred: &CredentialRef) -> Option<super::token::RefreshFailure> {
+        let key = Self::state_key(cred);
+        let (material, failure, at_ms) = {
+            let holds = self.refresh_holds.lock().unwrap_or_else(|e| e.into_inner());
+            let hold = holds.get(&key)?;
+            (hold.material.clone(), hold.failure.clone(), hold.at_ms)
+        };
+        let window_ms = REFUSED_REFRESH_HOLD.as_millis() as u64;
+        let in_window = crate::epoch_millis() < at_ms.saturating_add(window_ms);
+        if in_window && Self::stored_material(cred).as_ref() == Some(&material) {
+            return Some(failure);
+        }
+        let mut holds = self.refresh_holds.lock().unwrap_or_else(|e| e.into_inner());
+        if holds.get(&key).is_some_and(|h| h.at_ms == at_ms) {
+            holds.remove(&key);
+        }
+        None
+    }
+
+    /// The refused-refresh hold of `cred`'s slot, for the token helper to
+    /// check and write under the slot's refresh gate ([`SlotHold`]).
+    fn slot_hold(&self, cred: &CredentialRef) -> Arc<SlotHold> {
+        Arc::new(SlotHold {
+            holds: self.refresh_holds.clone(),
+            key: Self::state_key(cred),
+            provider: cred.provider,
+            answered: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+
+    /// A usage read of an account whose refused refresh is held: no refresh
+    /// and no request, so not recorded as a read; the failure is the held
+    /// refusal (it names the login command or remedy).
+    fn held_read(cred: &CredentialRef, held: super::token::RefreshFailure) -> UsageReadError {
+        let err = UsageReadError::refresh(held);
+        tracing::debug!(
+            credential = %cred,
+            kind = %err.failure.kind,
+            "usage read not sent: the refused token refresh is held until the stored login changes"
+        );
+        err
+    }
+
+    /// What `auth state` shows of `cred`'s held refused refresh (the same
+    /// test as [`Self::held_refresh`], dropping nothing). Never the digest.
+    fn refresh_hold_state(
+        &self,
+        cred: &CredentialRef,
+        now_ms: u64,
+    ) -> Option<super::auth_state::RefreshHoldState> {
+        let (material, failure, at_ms) = {
+            let holds = self.refresh_holds.lock().unwrap_or_else(|e| e.into_inner());
+            let hold = holds.get(&Self::state_key(cred))?;
+            (hold.material.clone(), hold.failure.clone(), hold.at_ms)
+        };
+        let until_ms = at_ms.saturating_add(REFUSED_REFRESH_HOLD.as_millis() as u64);
+        (now_ms < until_ms && Self::stored_material(cred).as_ref() == Some(&material)).then(|| {
+            super::auth_state::RefreshHoldState {
+                failure: refresh_failure(&failure),
+                refused_at_ms: at_ms,
+                until_ms,
+            }
+        })
+    }
+
+    /// Test seam: move every held refused refresh `by` into the past (the
+    /// hold window's injected clock).
+    #[doc(hidden)]
+    pub fn age_refresh_holds_for_tests(&self, by: Duration) {
+        let by_ms = by.as_millis() as u64;
+        for hold in self
+            .refresh_holds
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values_mut()
+        {
+            hold.at_ms = hold.at_ms.saturating_sub(by_ms);
+        }
+    }
+
+    /// Test seam: the digest a held refusal of `cred` keeps, so a test can
+    /// check that it appears in no output.
+    #[doc(hidden)]
+    pub fn refresh_hold_digest_for_tests(&self, cred: &CredentialRef) -> Option<String> {
+        self.refresh_holds
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&Self::state_key(cred))
+            .map(|h| h.material.expose_for_tests().to_string())
     }
 
     fn record_usage(
@@ -2398,10 +2885,14 @@ impl LocalBroker {
         if let Err(e) = self.check_slot_exists(cred) {
             return UsageReadError::slot(e).into_fetched();
         }
+        // The hold is checked again, and a refusal recorded, under the
+        // slot's refresh gate ([`SlotHold`]).
+        let memory: Arc<dyn super::token::RefusalMemory> = self.slot_hold(cred);
         let creds = match super::token::ensure_fresh_credential_via(
             &self.http,
             cred,
             &self.refresh_endpoints,
+            Some(memory),
         )
         .await
         {
@@ -2506,16 +2997,24 @@ impl LocalBroker {
         provider: OAuthProviderId,
         model: Option<&str>,
     ) -> Result<super::SelectionPlan, BrokerError> {
-        self.selection_plan(provider, model)
+        self.selection_plan(provider, model, &[], &mut FailedThisSelection::new())
             .await
             .map(|(plan, ..)| plan)
     }
 
+    /// Read every account's capacity and rank them; an account whose
+    /// cooldown is active is not read. `exclude` lists the
+    /// accounts the request already used. An account in `failed` failed
+    /// earlier in this selection: it counts as failed with that kind and is
+    /// not read again; a read that fails now (other than a held transient
+    /// read, which the usage-read table answers without a request) is added.
     #[allow(clippy::type_complexity)]
     async fn selection_plan(
         &self,
         provider: OAuthProviderId,
         model: Option<&str>,
+        exclude: &[CredentialRef],
+        failed: &mut FailedThisSelection,
     ) -> Result<
         (
             super::SelectionPlan,
@@ -2524,22 +3023,57 @@ impl LocalBroker {
         ),
         BrokerError,
     > {
-        use super::quota_policy::SelectionRequest;
+        use super::quota_policy::{AccountCapacity, SelectionRequest};
         let summaries = storage::list_accounts(provider).map_err(BrokerError::Credential)?;
         let mut candidates = Vec::with_capacity(summaries.len());
         let mut seats = BTreeMap::new();
         let mut transient = BTreeMap::new();
         let mut grace = Vec::new();
         let mut seen = std::collections::BTreeSet::new();
-        let mut exclude = Vec::new();
+        let mut exclude = exclude.to_vec();
+        // Each account's cooldown keys, worked out once for both lookups
+        // below (and only while some cooldown is active: they read the
+        // stored login).
+        let cooling_any = self.any_cooldown_active(crate::epoch_millis());
+        let mut keys = BTreeMap::new();
         for summary in &summaries {
             let Some(cred) = summary.credential_ref() else {
                 continue;
             };
-            let read = self.capacity_for(&cred).await;
+            if cooling_any {
+                keys.insert(cred.storage_key(), self.cooldown_keys(&cred));
+            }
+            if let Some(failure) = failed.get(&cred.storage_key()) {
+                candidates.push(AccountCapacity::failed(cred, failure.clone()));
+                continue;
+            }
+            // An account whose cooldown is active can't be chosen, so its
+            // usage is not read (no usage request, no token refresh). It
+            // keeps its stored seat, for stickiness and the duplicate-seat
+            // check; the policy rejects it as cooling down.
+            let read = if keys
+                .get(&cred.storage_key())
+                .and_then(|k| self.cooldown_for_keys(k, crate::epoch_millis()))
+                .is_some()
+            {
+                CandidateRead {
+                    capacity: AccountCapacity::unobserved(cred.clone()),
+                    seat: self.stored_seat(&cred).ok(),
+                    transient: None,
+                    grace: None,
+                }
+            } else {
+                self.capacity_for(&cred).await
+            };
             let (mut capacity, seat) = (read.capacity, read.seat);
-            if let Some(failed) = read.transient {
-                transient.insert(cred.storage_key(), failed);
+            match (read.transient, &capacity.failure) {
+                (Some(held), _) => {
+                    transient.insert(cred.storage_key(), held);
+                }
+                (None, Some(failure)) => {
+                    failed.insert(cred.storage_key(), failure.clone());
+                }
+                (None, None) => {}
             }
             // The same entitlement guard for a fresh reading and for a last
             // good reading standing in for a failed read.
@@ -2557,9 +3091,18 @@ impl LocalBroker {
             candidates.push(capacity);
         }
         let now_ms = crate::epoch_millis();
+        // A cooldown reported while the reads ran counts too.
+        if !cooling_any && self.any_cooldown_active(now_ms) {
+            for capacity in &candidates {
+                let cred = &capacity.credential;
+                keys.insert(cred.storage_key(), self.cooldown_keys(cred));
+            }
+        }
         for capacity in &mut candidates {
-            capacity.cooldown_until_ms =
-                self.cooldown_until(&capacity.credential.storage_key(), now_ms);
+            capacity.cooldown_until_ms = keys
+                .get(&capacity.credential.storage_key())
+                .and_then(|k| self.cooldown_for_keys(k, now_ms))
+                .map(|c| c.until_ms);
         }
         let previous = self
             .current_accounts
@@ -2594,10 +3137,15 @@ impl LocalBroker {
         &self,
         provider: OAuthProviderId,
         model: Option<&str>,
+        exclude: &[CredentialRef],
+        failed: &mut FailedThisSelection,
     ) -> Result<(CredentialRef, SeatIdentity), BrokerError> {
         use super::quota_policy::{Selection, SelectionFailure, SelectionFailureKind};
         use super::usage_reads::USAGE_READ_TARGET;
-        let (plan, mut seats, transient) = match self.selection_plan(provider, model).await {
+        let (plan, mut seats, transient) = match self
+            .selection_plan(provider, model, exclude, failed)
+            .await
+        {
             Ok(planned) => planned,
             // The account list itself could not be read (the only error
             // `selection_plan` returns): still exactly one WARN for this
@@ -2798,7 +3346,10 @@ impl LocalBroker {
             .flatten();
         if let Some(provider) = oauth_provider.filter(|_| muse_env_key.is_none()) {
             if provider_key != LOCAL_PROVIDER_KEY && static_provider(provider_key).is_none() {
-                pinned = Some(self.resolve_and_vend(provider, explicit_account, None).await?);
+                pinned = Some(
+                    self.resolve_and_vend(provider, explicit_account, None, &[])
+                        .await?,
+                );
             }
         }
         let bearer = |pinned: &Option<PinnedToken>| -> Result<String, BrokerError> {
@@ -3277,10 +3828,8 @@ fn refresh_kind_failure(
     }
 }
 
-/// The refresh failure of the automatically chosen account, with that
-/// account named: the caller never learns which seat was picked. A refused
-/// login also gets the exact command that fixes it (unless the message
-/// already has one). Same kind, so retry hints are unchanged.
+/// The refresh failure of an automatically chosen account, naming it (and,
+/// for a refused login, the command that logs it in again).
 fn auto_vend_failure(
     credential: &CredentialRef,
     f: super::token::RefreshFailure,
@@ -3574,15 +4123,20 @@ impl CredentialBroker for LocalBroker {
 
     async fn access_token_for(&self, cred: &CredentialRef) -> Result<AccessToken, BrokerError> {
         self.check_slot_exists(cred)?;
-        let creds =
-            super::token::ensure_fresh_credential_via(&self.http, cred, &self.refresh_endpoints)
-                .await
-                .map_err(|f| match f.kind {
-                    // Typed so the runtime doesn't send the user to a login
-                    // that would fail on the same store.
-                    super::token::RefreshFailureKind::ActionRequired => BrokerError::Refresh(f),
-                    _ => BrokerError::Credential(f.into()),
-                })?;
+        // An account the user chose is never held (no memory).
+        let creds = super::token::ensure_fresh_credential_via(
+            &self.http,
+            cred,
+            &self.refresh_endpoints,
+            None,
+        )
+        .await
+        .map_err(|f| match f.kind {
+            // Typed so the runtime doesn't send the user to a login
+            // that would fail on the same store.
+            super::token::RefreshFailureKind::ActionRequired => BrokerError::Refresh(f),
+            _ => BrokerError::Credential(f.into()),
+        })?;
         // Strip to token + expiry: the refresh token stays behind the boundary.
         Ok(AccessToken {
             token: creds.access,
@@ -3602,7 +4156,19 @@ impl CredentialBroker for LocalBroker {
         provider: OAuthProviderId,
         model: Option<&str>,
     ) -> Result<PinnedToken, BrokerError> {
-        self.resolve_and_vend(provider, None, model).await
+        self.resolve_and_vend(provider, None, model, &[]).await
+    }
+
+    /// The exclusion goes into the selection itself: `auto` selects among
+    /// the accounts the request hasn't used (one that is cooling down still
+    /// reads as cooling down in a failure).
+    async fn access_token_pinned_excluding(
+        &self,
+        provider: OAuthProviderId,
+        model: Option<&str>,
+        exclude: &[CredentialRef],
+    ) -> Result<PinnedToken, BrokerError> {
+        self.resolve_and_vend(provider, None, model, exclude).await
     }
 
     async fn accounts(&self, provider: OAuthProviderId) -> Result<Vec<AccountSummary>, BrokerError> {
@@ -3625,6 +4191,60 @@ impl CredentialBroker for LocalBroker {
             .map_err(|e| e.error)
     }
 
+    fn active_cooldown(&self, cred: &CredentialRef) -> Option<u64> {
+        self.active_cooldown_at(cred, crate::epoch_millis())
+            .map(|c| c.until_ms)
+    }
+
+    fn clear_cooldown(&self, cred: &CredentialRef, sent_at_ms: u64) {
+        let now_ms = crate::epoch_millis();
+        if !self.any_cooldown_active(now_ms) {
+            return;
+        }
+        let keys = self.cooldown_keys(cred);
+        let mut cleared = None;
+        {
+            let mut cooldowns = self.cooldowns.lock().unwrap_or_else(|e| e.into_inner());
+            for key in keys.read() {
+                if cooldowns
+                    .get(key)
+                    .is_some_and(|c| c.until_ms > now_ms && c.reported_at_ms <= sent_at_ms)
+                {
+                    cleared = cooldowns.remove(key).or(cleared);
+                }
+            }
+        }
+        if let Some(c) = cleared {
+            tracing::info!(
+                credential = %cred,
+                until_ms = c.until_ms,
+                reason = %c.reason,
+                "account cooldown cleared: a request sent after it was reported was accepted"
+            );
+        }
+    }
+
+    async fn access_token_for_auto(&self, cred: &CredentialRef) -> Result<AccessToken, BrokerError> {
+        self.check_slot_exists(cred)?;
+        // A refused refresh of this login is held: no new exchange.
+        if let Some(held) = self.held_refresh(cred) {
+            return Err(BrokerError::Refresh(auto_vend_failure(cred, held)));
+        }
+        let memory: Arc<dyn super::token::RefusalMemory> = self.slot_hold(cred);
+        let creds = super::token::ensure_fresh_credential_via(
+            &self.http,
+            cred,
+            &self.refresh_endpoints,
+            Some(memory),
+        )
+        .await
+        .map_err(|f| BrokerError::Refresh(auto_vend_failure(cred, f)))?;
+        Ok(AccessToken {
+            token: creds.access,
+            expires: creds.expires,
+        })
+    }
+
     async fn report_cooldown(
         &self,
         cred: &CredentialRef,
@@ -3639,11 +4259,20 @@ impl CredentialBroker for LocalBroker {
             .min(max_until);
         let reason = crate::truncate_str(reason, 64).to_string();
         tracing::info!(credential = %cred, until_ms, reason = %reason, "account cooldown reported");
-        let key = self.cooldown_key(cred);
-        self.cooldowns
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(key.clone(), Cooldown { until_ms, reason });
+        let keys = self.cooldown_keys(cred);
+        {
+            let mut cooldowns = self.cooldowns.lock().unwrap_or_else(|e| e.into_inner());
+            for key in keys.written() {
+                cooldowns.insert(
+                    key.to_string(),
+                    Cooldown {
+                        until_ms,
+                        reason: reason.clone(),
+                        reported_at_ms: now_ms,
+                    },
+                );
+            }
+        }
         // The cached reading predates the limit report; drop it so the next
         // selection re-reads instead of trusting stale headroom, and drop
         // the slot's last good reading so grace can never outlive the limit.
@@ -4534,6 +5163,7 @@ fn auth_state_report(
                     }),
                 },
             ),
+            refresh_hold: broker.and_then(|b| b.refresh_hold_state(&cred, now_ms)),
         });
     }
     let store_prefix = format!("{}|", store.display());
@@ -6065,48 +6695,6 @@ mod tests {
         }
         assert!(!json.contains("refresh"));
         assert!(!json.contains("access"));
-    }
-
-    /// The caller of an automatic vend never learns which seat was picked:
-    /// the refresh failure names it, and a refused login carries the exact
-    /// command for that slot.
-    #[test]
-    fn auto_vend_failure_names_the_chosen_account_and_its_login_command() {
-        use super::super::token::{RefreshFailure, RefreshFailureKind as R};
-        let named = CredentialRef::new(
-            OAuthProviderId::Anthropic,
-            Account::named("claude3").unwrap(),
-        );
-        let refused =
-            auto_vend_failure(&named, RefreshFailure::new(R::Credential, "invalid_grant"));
-        assert_eq!(refused.kind, R::Credential);
-        assert_eq!(
-            refused.message(),
-            "account 'claude3': invalid_grant; log it in again with \
-             `synaps login --provider anthropic --account claude3`"
-        );
-        let default = CredentialRef::new(OAuthProviderId::Anthropic, Account::Default);
-        let refused = auto_vend_failure(&default, RefreshFailure::new(R::Credential, "revoked"));
-        assert_eq!(
-            refused.message(),
-            "account 'default': revoked; log it in again with \
-             `synaps login --provider anthropic`"
-        );
-        // A message that already says which login to run gets no second one.
-        let advised = auto_vend_failure(
-            &named,
-            RefreshFailure::new(
-                R::Credential,
-                "slot removed; run `synaps login --account claude3`",
-            ),
-        );
-        assert_eq!(advised.message().matches("synaps login").count(), 1);
-        // Other kinds are named, keep their kind and get no login advice.
-        for kind in [R::Transient, R::LockBusy, R::Other, R::ActionRequired] {
-            let f = auto_vend_failure(&named, RefreshFailure::new(kind, "HTTP 503"));
-            assert_eq!(f.kind, kind);
-            assert_eq!(f.message(), "account 'claude3': HTTP 503");
-        }
     }
 
     /// No Anthropic refresh seam exists, so the refresh-failure → kind map

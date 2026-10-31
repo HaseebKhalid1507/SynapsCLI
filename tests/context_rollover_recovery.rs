@@ -196,11 +196,21 @@ async fn productive_rollover_still_waits_for_ack_and_failed_ack_blocks_inference
         std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", url);
         let rt = runtime(6).await;
         // Force soft rollover at a threshold, without a model checkpoint round.
-        rt.context_management_command("auto 20000 30000").unwrap();
+        // Size the bands from the runtime's own fixed request part (system
+        // prompt + tool schemas, assessed over no history), not from the
+        // default tool registry's size: the successor target (2/3 of
+        // pressure) then leaves ~10k tokens for its messages, room for the
+        // pinned first request beside the continuation envelope.
+        let base = rt.assess_context(&[]).await.used_tokens();
+        let pressure = (base + 10_000) * 3 / 2;
+        let rollover = pressure + 10_000;
+        rt.context_management_command(&format!("auto {pressure} {rollover}"))
+            .unwrap();
         let history = vec![
             user("Do not deploy.".into()),
+            // Alone over the rollover band: ~10.8 conservative tokens a repeat.
             Arc::new(
-                json!({"role":"assistant", "content":"Archivable prior evidence. ".repeat(4000)}),
+                json!({"role":"assistant", "content":"Archivable prior evidence. ".repeat(rollover as usize / 10)}),
             ),
             user("Continue only remaining work.".into()),
             Arc::new(json!({"role":"assistant", "content":"Last bounded result."})),

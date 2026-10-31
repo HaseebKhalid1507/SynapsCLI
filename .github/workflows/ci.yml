@@ -103,6 +103,9 @@ jobs:
         with:
           save-if: ${{ github.event_name == 'push' }}
       - run: cargo check --workspace --locked
+      # The macOS Git resolution (`git_program`: PATH, the /usr/bin/git
+      # shim, developer directories) only takes its real branch here.
+      - run: cargo test --locked -p synaps-core --lib git_program
 
   # Nothing else compiles for Windows, so Windows-only breakage landed
   # unnoticed: `dev` stopped building there when the Unix-socket daemon

@@ -544,6 +544,32 @@ impl fmt::Debug for SeatIdentity {
     }
 }
 
+/// Digest of ALL the credential material stored in one slot (access AND
+/// refresh token), under its own domain tag (not the seat identity's): any
+/// change of the stored login changes it, a re-login as well as a refresh
+/// by another process. The broker keeps a refused refresh only while this
+/// stays the same. Secret-derived: no Debug or Display, never logged or
+/// shown.
+#[derive(Clone, PartialEq, Eq)]
+pub struct MaterialDigest(String);
+
+impl MaterialDigest {
+    pub fn of(provider: OAuthProviderId, creds: &super::OAuthCredentials) -> Self {
+        Self(hex_digest(&[
+            b"synaps-refused-refresh-v1",
+            provider.as_str().as_bytes(),
+            creds.access.as_bytes(),
+            creds.refresh.as_bytes(),
+        ]))
+    }
+
+    /// The digest text, for tests that check it appears nowhere.
+    #[doc(hidden)]
+    pub fn expose_for_tests(&self) -> &str {
+        &self.0
+    }
+}
+
 /// Short, non-reversible identity preview (`account_id_prefix`).
 pub(crate) fn account_id_prefix(account_id: &str) -> Option<String> {
     let trimmed = account_id.trim();

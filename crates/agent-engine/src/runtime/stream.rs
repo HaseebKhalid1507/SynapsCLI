@@ -4620,6 +4620,87 @@ mod rich_output_tests {
         }
     }
 
+    /// `thinking_display = omitted`, end to end through the stream loop: the
+    /// requests send `thinking.display = "omitted"`, and the round's thinking
+    /// block (empty text, the reasoning in its signature) comes back on the
+    /// next request exactly as the API sent it, ahead of the tool call it
+    /// belongs to, through an `after_tool_call` hook that rewrites the
+    /// output. The durable history keeps it too (session resume).
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn omitted_thinking_round_trips_through_a_tool_loop() {
+        // The replacing hook writes an audit record.
+        let _base = crate::test_env::BaseDirGuard::new();
+        let block = json!({"type": "thinking", "thinking": "", "signature": "sig-omitted"});
+        let mut first = String::new();
+        for ev in [
+            json!({"type":"message_start","message":{"id":"msg_01","type":"message","role":"assistant","content":[],"model":"claude-sonnet-4-6","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}),
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":""}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig-omitted"}}),
+            json!({"type":"content_block_stop","index":0}),
+            json!({"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_1","name":"text_stub"}}),
+            json!({"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{}"}}),
+            json!({"type":"content_block_stop","index":1}),
+            json!({"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"input_tokens":10,"output_tokens":5,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}),
+            json!({"type":"message_stop"}),
+        ] {
+            first.push_str(&format!("data: {ev}\n\n"));
+        }
+        let (base_url, mock) = spawn_mock(first).await;
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(TextTool));
+        let (tx, mut rx) = mpsc::unbounded_channel::<StreamEvent>();
+        let tool_session_id = crate::tools::activation::SessionId::parse(&format!(
+            "test-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ))
+        .unwrap();
+        let mut session = harness_session(
+            base_url,
+            Arc::new(RwLock::new(registry)),
+            tx,
+            crate::tools::shell::SessionManager::new(crate::tools::shell::ShellConfig::default()),
+            output_hook_bus(Some(true)).await,
+            tool_session_id,
+            Default::default(),
+            false,
+            "claude-sonnet-4-6",
+        );
+        session.reasoning_level = agent_core::reasoning::ReasoningLevel::High;
+        session.options.thinking_display = crate::config::ThinkingDisplay::Omitted;
+        let initial = vec![Arc::new(json!({"role":"user","content":"go"})) as SharedMessage];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            StreamMethods::run_stream_internal(session, initial),
+        )
+        .await
+        .expect("stream loop must finish")
+        .expect("turn succeeds");
+        let mut history = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let StreamEvent::Session(SessionEvent::MessageHistory(m)) = ev {
+                history = m;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let bodies = mock.bodies.lock().unwrap().clone();
+        assert_eq!(bodies.len(), 2);
+        for (i, body) in bodies.iter().enumerate() {
+            assert_eq!(body["thinking"]["display"], "omitted", "request {i}: {}", body["thinking"]);
+        }
+        let assistant = &bodies[1]["messages"][1];
+        assert_eq!(assistant["role"], "assistant");
+        assert_eq!(assistant["content"][0], block, "the block comes back unchanged");
+        assert_eq!(assistant["content"][1]["type"], "tool_use");
+        assert!(wire_text(&bodies[1]).contains("REPLACED BY HOOK"), "the hook ran");
+        assert!(
+            history.iter().any(|m| m["content"].as_array().is_some_and(|c| c.contains(&block))),
+            "the durable history keeps it"
+        );
+    }
+
     /// A deferred (non-core) tool: under progressive disclosure it is callable
     /// only after an exact `activate_tools` grant.
     struct DeferredProbe;
@@ -7793,6 +7874,95 @@ mod rich_output_tests {
                 assert_eq!(run.wire(body, id), run.result(id), "{id}");
             }
         }
+
+        /// `multi_edit` is a mutation like `write`/`edit`: its result gets
+        /// the no-need-to-re-read note, and a read after it is in full (the
+        /// file changed), never an "unchanged" stub of the pre-edit read.
+        #[tokio::test]
+        async fn a_multi_edit_rereads_in_full_and_says_no_reread_needed() {
+            let dir = tempfile::tempdir().unwrap();
+            let file = dir.path().join("a.py");
+            std::fs::write(&file, source(100, "v1")).unwrap();
+            let me = json!({"edits": [{
+                "path": file.to_string_lossy(), "op": "replace",
+                "anchor": "v1 line 0050", "text": "v2 line 0050",
+            }]});
+            let rounds = vec![
+                vec![("toolu_r1", "read", read(&file))],
+                vec![("toolu_m", "multi_edit", me)],
+                vec![("toolu_r2", "read", read(&file))],
+                vec![("toolu_r3", "read", read(&file))],
+            ];
+            let run = drive_rounds(go(), &rounds, true, |_| {}).await;
+
+            let r2 = run.text("toolu_r2");
+            assert!(r2.contains("50\tv2 line 0050"), "edited → full: {r2}");
+            assert!(!run.event("toolu_r2").deduped);
+            assert_eq!(run.result("toolu_r3"), Value::String(unchanged_stub("toolu_r2")));
+            let m = run.text("toolu_m");
+            assert!(m.starts_with("multi_edit: 1 file(s) written"), "{m}");
+            assert!(
+                m.ends_with(&format!("\n\n{}", crate::runtime::read_dedupe::MULTI_EDIT_NOTE)),
+                "{m}"
+            );
+        }
+
+        /// A `before_tool_call` hook that answers with a fixed result.
+        struct FixedHook(HookResult);
+        #[async_trait::async_trait]
+        impl crate::extensions::runtime::ExtensionHandler for FixedHook {
+            fn id(&self) -> &str {
+                "write-guard"
+            }
+            async fn handle(&self, _event: &HookEvent) -> HookResult {
+                self.0.clone()
+            }
+            async fn shutdown(&self) {}
+        }
+
+        /// A guard extension written for `edit`/`write` (a `tool` filter of
+        /// `edit` or `write`) also blocks or confirms `multi_edit`: through
+        /// the real tool path, a blocked call and an unanswerable confirm
+        /// leave the file untouched. A path outside the session's cwd gets
+        /// no special treatment, the same as `edit`/`write`.
+        #[tokio::test]
+        async fn an_edit_or_write_guard_hook_also_stops_multi_edit() {
+            for (filter, verdict, expect) in [
+                ("edit", HookResult::Block { reason: "no edits here".into() }, "no edits here"),
+                ("write", HookResult::confirm("write outside the repo?"), "requires confirmation"),
+            ] {
+                let cwd = tempfile::tempdir().unwrap();
+                let outside = tempfile::tempdir().unwrap();
+                let file = outside.path().join("a.txt");
+                std::fs::write(&file, "keep\n").unwrap();
+                let bus = Arc::new(crate::extensions::hooks::HookBus::new());
+                let mut perms = PermissionSet::new();
+                perms.grant(crate::extensions::permissions::Permission::ToolsIntercept);
+                bus.subscribe(
+                    HookKind::BeforeToolCall,
+                    Arc::new(FixedHook(verdict)),
+                    Some(filter.into()),
+                    None,
+                    perms,
+                )
+                .await
+                .unwrap();
+                let me = json!({"edits": [{
+                    "path": file.to_string_lossy(), "op": "append", "text": "pwned\n",
+                }]});
+                let rounds = vec![vec![("toolu_m", "multi_edit", me)]];
+                let cwd_path = cwd.path().to_path_buf();
+                let run = drive_rounds(go(), &rounds, true, move |s| {
+                    s.hook_bus = bus;
+                    s.cwd = Some(cwd_path);
+                    s.auto_approve_confirms = false;
+                })
+                .await;
+                assert_eq!(std::fs::read_to_string(&file).unwrap(), "keep\n", "{filter}");
+                let out = run.text("toolu_m");
+                assert!(out.contains(expect), "{filter}: {out}");
+            }
+        }
     }
 
     /// Tool-round keep-warm (`runtime::tool_keepwarm`) on the wire, against
@@ -7862,6 +8032,10 @@ mod rich_output_tests {
             /// Release the held ping when the round's end starts waiting
             /// for it.
             release_held_on_finish: bool,
+            /// The turn runs on a subscription login whose account is
+            /// cooling down (an explicit selector: the turn itself is not
+            /// moved, only its pings are concerned).
+            account_cooling: bool,
         }
 
         /// `(input, read, write)` of a request or a `Usage` event.
@@ -7923,6 +8097,32 @@ mod rich_output_tests {
                 "claude-sonnet-4-6",
             );
             session.cancel = cancel;
+            if opts.account_cooling {
+                let seat = crate::auth::CredentialRef::default_for(crate::auth::OAuthProviderId::Anthropic);
+                session.auth = Arc::new(RwLock::new(AuthState {
+                    auth_token: "oauth-test-token".into(),
+                    auth_type: "oauth".into(),
+                    refresh_token: None,
+                    token_expires: Some(9_999_999_999_999),
+                    auth_file_mtime: None,
+                    bound_credential: Some(crate::runtime::auth::anthropic_binding(
+                        &session.credential_source,
+                        &seat,
+                    )),
+                }));
+                // One credential authority for the turn and its requests,
+                // as in production (the harness builds two).
+                session.options.token_cache = session.token_cache.clone();
+                session.options.credential_source = session.credential_source.clone();
+                crate::auth::broker_from_source(
+                    &session.credential_source,
+                    &session.token_cache,
+                    reqwest::Client::new(),
+                )
+                .report_cooldown(&seat, Some(crate::epoch_millis() + 3_600_000), "test")
+                .await
+                .unwrap();
+            }
             session.system_prompt = Some(format!("a worker\n{}", "context ".repeat(4000)));
             let hook = Arc::new(tokio::sync::Notify::new());
             session.tool_keepwarm = opts.interval.map(|interval| ToolKeepWarm {
@@ -8030,6 +8230,28 @@ mod rich_output_tests {
             .await;
             assert_eq!(run.requests.len(), 2, "no ping: {:?}", run.pings().len());
             assert!(run.requests[1].read >= run.requests[0].cached_prefix());
+            run.assert_quiet().await;
+        }
+
+        /// Review fix 2: a tool-round ping never selects or re-binds an
+        /// account, and stops when the turn's account is cooling down. The
+        /// round still runs (an explicit selector keeps the turn on it); no
+        /// ping goes out.
+        #[tokio::test]
+        #[serial_test::serial(synaps_base_dir)]
+        async fn a_round_on_a_cooling_account_sends_no_ping() {
+            let _base = crate::test_env::BaseDirGuard::new();
+            let run = run(
+                Script::short(),
+                Opts {
+                    interval: Some(INTERVAL),
+                    tool_tail: Duration::from_millis(300),
+                    account_cooling: true,
+                    ..Default::default()
+                },
+            )
+            .await;
+            assert_eq!(run.requests.len(), 2, "no ping: {:?}", run.pings().len());
             run.assert_quiet().await;
         }
 

@@ -1230,6 +1230,7 @@ mod state_tests {
                 last_usage: None,
                 last_usage_ok_ms: None,
                 last_refresh: None,
+                refresh_hold: None,
             }],
             selections: vec![],
             cleared: vec![],

@@ -239,6 +239,7 @@ impl ApiMethods {
             false,
         );
         let mut body = parts.body;
+        body.set_thinking_display(options.thinking_display);
         // A model that rejects input + `max_tokens` over the window gets the
         // room the input leaves (no-op on Claude 4.5 and later).
         body.fit_max_tokens_to_window(Self::provider_window(options, model));

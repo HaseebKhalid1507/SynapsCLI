@@ -527,6 +527,84 @@
     }
   },
   {
+    "description": "Anchored edits across files in one call, all or nothing: if any edit fails, nothing is written. A file's edits apply in order. Each anchor must match exactly once unless occurrence is set. insert_*: text ending in a newline is inserted as lines before/after the anchor's line, other text at the anchor. append adds a missing final newline. In CRLF files, newlines in anchor/text are CRLF. Max 64 edits, 16 files, 16 MiB per file (64 MiB total), 1 MiB per field. UTF-8.",
+    "name": "multi_edit",
+    "parameters": {
+      "properties": {
+        "edits": {
+          "items": {
+            "properties": {
+              "anchor": {
+                "type": "string"
+              },
+              "anchor_mode": {
+                "description": "exact (default): substring; line_prefix: line starts with it; line_regex: per-line regex, a capture group narrows the span",
+                "enum": [
+                  "exact",
+                  "line_prefix",
+                  "line_regex"
+                ],
+                "type": "string"
+              },
+              "create": {
+                "description": "append*: create if missing",
+                "type": "boolean"
+              },
+              "occurrence": {
+                "description": "Use the Nth match",
+                "minimum": 1,
+                "type": "integer"
+              },
+              "op": {
+                "enum": [
+                  "replace",
+                  "insert_before",
+                  "insert_after",
+                  "append",
+                  "append_jsonl"
+                ],
+                "type": "string"
+              },
+              "path": {
+                "type": "string"
+              },
+              "text": {
+                "type": "string"
+              },
+              "timestamp_field": {
+                "description": "append_jsonl: field set to now",
+                "type": "string"
+              },
+              "unless_present": {
+                "description": "Skip if the file contains it",
+                "type": "string"
+              },
+              "value": {
+                "description": "append_jsonl row",
+                "type": "object"
+              }
+            },
+            "required": [
+              "path",
+              "op"
+            ],
+            "type": "object"
+          },
+          "maxItems": 64,
+          "type": "array"
+        },
+        "placeholders": {
+          "description": "Expand {{now_iso}} {{now:FMT}} {{mtime_iso:/path}} {{mtime:FMT:/path}} in text/value/unless_present",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "edits"
+      ],
+      "type": "object"
+    }
+  },
+  {
     "description": "Read the contents of a file. Returns lines with line numbers. Reads up to 500 lines by default. For large files, use offset and limit to read in sections. Image files (PNG, JPEG, GIF, WebP) are returned as an image the model can see, up to 3.5 MB.",
     "name": "read",
     "parameters": {

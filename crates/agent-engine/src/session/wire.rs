@@ -1237,7 +1237,7 @@ mod tests {
 
     /// An `AuthState` reply with every nested type present.
     fn auth_state_report() -> agent_core::auth::AuthStateReport {
-        use agent_core::auth::auth_state::{AccountState, CooldownReason, CooldownState, IdentityKind, ObservedOutcome, SelectionState};
+        use agent_core::auth::auth_state::{AccountState, CooldownReason, CooldownState, IdentityKind, ObservedOutcome, RefreshHoldState, SelectionState};
         use agent_core::auth::quota_policy::{
             AccountFailure, AccountFailureKind, ObservationFailure, SelectionFailure, SelectionFailureKind,
         };
@@ -1257,6 +1257,11 @@ mod tests {
                 last_usage: Some(ObservedOutcome { at_ms: 1_799_999_990_000, failure: Some(usage_429.clone()) }),
                 last_usage_ok_ms: Some(1_799_999_000_000),
                 last_refresh: Some(ObservedOutcome { at_ms: 1_799_999_500_000, failure: None }),
+                refresh_hold: Some(RefreshHoldState {
+                    failure: ObservationFailure { kind: AccountFailureKind::RefreshRejected, http_status: Some(400), retry_after_s: None },
+                    refused_at_ms: 1_799_999_600_000,
+                    until_ms: 1_800_000_500_000,
+                }),
             }],
             selections: vec![SelectionState {
                 provider: "anthropic".into(),

@@ -317,10 +317,13 @@ pub(crate) fn describe_reset_utc(until_ms: u64, now_ms: u64) -> String {
 
 // ── Runtime gate ─────────────────────────────────────────────────────────────
 
-/// Upper bound on account switches per logical request. One is the whole
-/// design: a second exhausted seat means the operator needs to know, not a
-/// silent tour through every account.
-pub(crate) const MAX_ANTHROPIC_ACCOUNT_FAILOVERS: u32 = 1;
+/// Backstop on account switches per logical request. The real bound is the
+/// attempted set: a request uses each account at most once, so it stops
+/// when no account it hasn't used has proven capacity. This limit only
+/// stops a router that keeps naming accounts the request hasn't seen. (It
+/// was 1, "one is the whole design": that ended turns on the second
+/// exhausted account while other accounts still had capacity.)
+pub(crate) const MAX_ANTHROPIC_ACCOUNT_FAILOVERS: u32 = 16;
 
 /// What the gate judges. Built at the 429 site from request-level state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -335,24 +338,188 @@ pub(crate) struct AnthropicFailoverGate {
     pub(crate) failovers_so_far: u32,
 }
 
+/// Why the gate refused an account switch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FailoverRefusal {
+    ExplicitSelection,
+    OutputAlreadyStreamed,
+    ToolActivity,
+    BudgetExhausted,
+    /// A cache keep-warm ping: it keeps the cache of the account it is on.
+    KeepWarmPing,
+}
+
+impl FailoverRefusal {
+    /// Static reason label for logs.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::ExplicitSelection => "explicit_selection",
+            Self::OutputAlreadyStreamed => "output_already_streamed",
+            Self::ToolActivity => "tool_activity",
+            Self::BudgetExhausted => "failover_budget_exhausted",
+            Self::KeepWarmPing => "keepwarm_ping",
+        }
+    }
+}
+
 /// Runtime preconditions for an Anthropic account failover. Pure; evaluated
 /// before any candidate lookup so an explicit account or a partially
-/// streamed request never triggers usage fetches or token vends. The error
-/// is a static reason label for logs.
-pub(crate) fn failover_permitted(gate: &AnthropicFailoverGate) -> Result<(), &'static str> {
+/// streamed request never triggers usage fetches or token vends.
+pub(crate) fn failover_permitted(gate: &AnthropicFailoverGate) -> Result<(), FailoverRefusal> {
     if !gate.auto_selector {
-        return Err("explicit_selection");
+        return Err(FailoverRefusal::ExplicitSelection);
     }
     if gate.output_started {
-        return Err("output_already_streamed");
+        return Err(FailoverRefusal::OutputAlreadyStreamed);
     }
     if gate.tool_activity {
-        return Err("tool_activity");
+        return Err(FailoverRefusal::ToolActivity);
     }
     if gate.failovers_so_far >= MAX_ANTHROPIC_ACCOUNT_FAILOVERS {
-        return Err("failover_budget_exhausted");
+        return Err(FailoverRefusal::BudgetExhausted);
     }
     Ok(())
+}
+
+/// Why a recognized limit on the request's account did not switch it to
+/// another account. Each reason has its own text: none of them may claim
+/// that another account will serve.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NoHop {
+    /// An explicit account, or a request bound to no account: the runtime
+    /// never switches.
+    Explicit,
+    /// Output or a tool call already streamed on this request.
+    OutputStreamed,
+    /// [`MAX_ANTHROPIC_ACCOUNT_FAILOVERS`] switches were spent.
+    Backstop,
+    /// The broker named no account this request hasn't used.
+    NoOtherAccount,
+    /// Looking up another account failed.
+    LookupFailed,
+}
+
+impl NoHop {
+    pub(crate) fn from_refusal(refusal: FailoverRefusal) -> Self {
+        match refusal {
+            FailoverRefusal::ExplicitSelection | FailoverRefusal::KeepWarmPing => Self::Explicit,
+            FailoverRefusal::OutputAlreadyStreamed | FailoverRefusal::ToolActivity => {
+                Self::OutputStreamed
+            }
+            FailoverRefusal::BudgetExhausted => Self::Backstop,
+        }
+    }
+
+    /// The reason in a notice; `None` for an explicit or unbound request,
+    /// whose notice has its own form.
+    fn reason(self) -> Option<&'static str> {
+        match self {
+            Self::Explicit => None,
+            Self::OutputStreamed => {
+                Some("output already streamed, so this request can't switch accounts")
+            }
+            Self::Backstop => Some("no more account switches on this request"),
+            Self::NoOtherAccount => Some("no other account has proven capacity now"),
+            Self::LookupFailed => Some("looking up another account failed"),
+        }
+    }
+
+    /// The advice that ends the turn on a long reset.
+    pub(crate) fn advice(self) -> String {
+        const STATE: &str = "`synaps auth state --provider anthropic` shows each account's state.";
+        match self {
+            Self::Explicit => "Wait for the reset, or switch accounts with \
+                `synaps auth use --provider anthropic --account <label|auto>`."
+                .to_string(),
+            Self::OutputStreamed => "Output had already streamed, so this request could not \
+                switch accounts; send again to select an account for the next turn."
+                .to_string(),
+            Self::Backstop => format!(
+                "Stopped after {MAX_ANTHROPIC_ACCOUNT_FAILOVERS} account switches on this \
+                 request; {STATE}"
+            ),
+            Self::NoOtherAccount => format!("No other account has proven capacity now; {STATE}"),
+            Self::LookupFailed => format!("Looking up another account failed; {STATE}"),
+        }
+    }
+}
+
+/// Every line the request loop shows about a recognized limit on one
+/// account: the switch notice, the no-switch notice and the error that ends
+/// the turn. The words say what the provider declared. A unified or
+/// per-window `rejected` status "is at a usage limit"; without a reset time
+/// the time shown is our own cooldown, and the text says so. A long wait on
+/// a 429 with no usage-limit header "is rate-limited", not at a usage limit.
+pub(crate) struct LimitText<'a> {
+    pub(crate) label: &'a str,
+    pub(crate) evidence: &'a AnthropicQuotaEvidence,
+    pub(crate) now_ms: u64,
+}
+
+impl LimitText<'_> {
+    /// When the account is used again: the provider's reset, else our
+    /// cooldown.
+    fn until(&self) -> String {
+        let until_ms = self
+            .evidence
+            .cooldown_until_ms(self.now_ms)
+            .unwrap_or(self.now_ms);
+        describe_reset_utc(until_ms, self.now_ms)
+    }
+
+    fn reset_given(&self) -> bool {
+        self.evidence.resets_at_ms.is_some_and(|t| t > self.now_ms)
+    }
+
+    fn rate_limited(&self) -> bool {
+        self.evidence.signal == AnthropicQuotaSignal::LongResetWithRateLimitBody
+    }
+
+    /// "{label} is at a usage limit until …", and the other two forms.
+    fn state(&self) -> String {
+        let (label, until) = (self.label, self.until());
+        if self.rate_limited() {
+            format!("{label} is rate-limited until {until} (HTTP 429, no usage-limit header)")
+        } else if self.reset_given() {
+            format!("{label} is at a usage limit until {until}")
+        } else {
+            format!(
+                "{label} is at a usage limit (reset time not given; not used again before {until})"
+            )
+        }
+    }
+
+    /// The notice for a switch to `next`.
+    pub(crate) fn hop(&self, next: &str) -> String {
+        format!("⚠ {} — switching to {next}", self.state())
+    }
+
+    /// The notice when the request did not switch accounts.
+    pub(crate) fn no_hop(&self, why: NoHop) -> String {
+        match why.reason() {
+            Some(reason) => format!("⚠ {}; {reason}", self.state()),
+            None => format!("⚠ account limit reached until {}", self.until()),
+        }
+    }
+
+    /// The error that ends the turn on a long reset.
+    pub(crate) fn terminal(&self, why: NoHop) -> String {
+        let (label, until) = (self.label, self.until());
+        let head = if self.rate_limited() {
+            format!(
+                "Anthropic rate limit on account '{label}' until {until} \
+                 (HTTP 429 with a long wait, not a declared usage limit)."
+            )
+        } else if self.reset_given() {
+            format!("Anthropic usage limit reached on account '{label}' — window resets at {until}.")
+        } else {
+            format!(
+                "Anthropic usage limit reached on account '{label}' (reset time not given; \
+                 not used again before {until})."
+            )
+        };
+        format!("{head} {}", why.advice())
+    }
 }
 
 // ── Router seam ──────────────────────────────────────────────────────────────
@@ -370,14 +537,23 @@ pub(crate) trait AnthropicAccountRouter: Send + Sync {
     /// refuses to switch, so the next turn boundary re-selects away.
     async fn report_exhausted(&self, failed: &CredentialRef, evidence: &AnthropicQuotaEvidence);
 
-    /// After recognized exhaustion on `failed`, ask the broker to select
-    /// again for `model`. `Ok(None)` when the answer is the same seat or no
-    /// eligible seat exists; `Err` for any other broker failure. Called only
-    /// after [`failover_permitted`] passed.
+    /// A request on `seat` sent at `sent_at_ms` (epoch ms) was accepted
+    /// after this request reported `seat` exhausted (a short or unknown
+    /// reset the ordinary retry outlived): drop the cooldown, so the next
+    /// round does not move the turn off an account that serves. Must never
+    /// fail the turn.
+    async fn report_served(&self, seat: &CredentialRef, sent_at_ms: u64);
+
+    /// After recognized exhaustion, ask the broker to select again for
+    /// `model`, never answering with an account in `attempted`: every
+    /// account this logical request already used, the exhausted one last.
+    /// `Ok(None)` when no other eligible account exists (or the broker's
+    /// answer was already attempted); `Err` for any other broker failure.
+    /// Called only after [`failover_permitted`] passed.
     async fn failover(
         &self,
         model: &str,
-        failed: &CredentialRef,
+        attempted: &[CredentialRef],
     ) -> Result<Option<PinnedToken>, String>;
 }
 
@@ -387,8 +563,9 @@ pub(crate) trait AnthropicAccountRouter: Send + Sync {
 /// Selection policy lives in exactly one place: the broker's `Auto`
 /// selector. Failover therefore does not rebuild candidates in the runtime;
 /// it reports the exhausted seat's cooldown and asks the broker to select
-/// again, then verifies the answer is a DIFFERENT account. A broker that
-/// cannot honour the cooldown (default no-op sink) answers with the same
+/// again without the accounts the request already used, then verifies the
+/// answer is none of them. A broker that cannot honour the cooldown or the
+/// exclusion (default no-op sink, a remote broker) answers with an attempted
 /// seat, which the runtime refuses — bounded and safe, never a loop.
 ///
 /// The broker is built lazily from the request's credential source so the
@@ -464,10 +641,14 @@ impl AnthropicAccountRouter for BrokerAnthropicRouter {
         );
     }
 
+    async fn report_served(&self, seat: &CredentialRef, sent_at_ms: u64) {
+        self.broker().clear_cooldown(seat, sent_at_ms);
+    }
+
     async fn failover(
         &self,
         model: &str,
-        failed: &CredentialRef,
+        attempted: &[CredentialRef],
     ) -> Result<Option<PinnedToken>, String> {
         let provider = OAuthProviderId::Anthropic;
         // The gate already established `Auto`; re-check so a policy that
@@ -477,11 +658,15 @@ impl AnthropicAccountRouter for BrokerAnthropicRouter {
         }
         match self
             .broker()
-            .access_token_pinned_for(provider, Some(super::auth::quota_model_key(model)))
+            .access_token_pinned_excluding(
+                provider,
+                Some(super::auth::quota_model_key(model)),
+                attempted,
+            )
             .await
         {
-            Ok(next) if next.credential != *failed => Ok(Some(next)),
-            Ok(_same_seat) => Ok(None),
+            Ok(next) if !attempted.contains(&next.credential) => Ok(Some(next)),
+            Ok(_attempted_seat) => Ok(None),
             Err(BrokerError::NoAccountAvailable { .. }) => Ok(None),
             Err(e) => Err(e.to_string()),
         }
@@ -894,28 +1079,28 @@ mod tests {
                 auto_selector: false,
                 ..ok
             }),
-            Err("explicit_selection")
+            Err(FailoverRefusal::ExplicitSelection)
         );
         assert_eq!(
             failover_permitted(&AnthropicFailoverGate {
                 output_started: true,
                 ..ok
             }),
-            Err("output_already_streamed")
+            Err(FailoverRefusal::OutputAlreadyStreamed)
         );
         assert_eq!(
             failover_permitted(&AnthropicFailoverGate {
                 tool_activity: true,
                 ..ok
             }),
-            Err("tool_activity")
+            Err(FailoverRefusal::ToolActivity)
         );
         assert_eq!(
             failover_permitted(&AnthropicFailoverGate {
                 failovers_so_far: MAX_ANTHROPIC_ACCOUNT_FAILOVERS,
                 ..ok
             }),
-            Err("failover_budget_exhausted")
+            Err(FailoverRefusal::BudgetExhausted)
         );
         // Explicit selection is checked first: an explicit account never has
         // candidates looked up, whatever else is true.
@@ -926,8 +1111,139 @@ mod tests {
                 tool_activity: true,
                 failovers_so_far: 5,
             }),
-            Err("explicit_selection")
+            Err(FailoverRefusal::ExplicitSelection)
         );
+        // The log labels are unchanged.
+        assert_eq!(
+            [
+                FailoverRefusal::ExplicitSelection,
+                FailoverRefusal::OutputAlreadyStreamed,
+                FailoverRefusal::ToolActivity,
+                FailoverRefusal::BudgetExhausted,
+            ]
+            .map(FailoverRefusal::label),
+            [
+                "explicit_selection",
+                "output_already_streamed",
+                "tool_activity",
+                "failover_budget_exhausted",
+            ]
+        );
+    }
+
+    /// The limit texts say what the provider declared: a `rejected` status
+    /// is a usage limit, with its reset or with our cooldown named as such;
+    /// a long wait on a plain 429 is a rate limit. None says another account
+    /// will serve, and every no-switch advice but the explicit one points at
+    /// `auth state`.
+    #[test]
+    fn limit_texts_say_what_the_provider_declared() {
+        let at = |signal, resets_at_ms| AnthropicQuotaEvidence {
+            signal,
+            resets_at_ms,
+        };
+        let unified = at(
+            AnthropicQuotaSignal::UnifiedStatusRejected,
+            Some(NOW_MS + 3600 * 1000),
+        );
+        let window = at(
+            AnthropicQuotaSignal::WindowStatusRejected { window: "7d" },
+            Some(NOW_MS + 3600 * 1000),
+        );
+        let no_reset = at(AnthropicQuotaSignal::UnifiedStatusRejected, None);
+        let long_wait = at(
+            AnthropicQuotaSignal::LongResetWithRateLimitBody,
+            Some(NOW_MS + 3600 * 1000),
+        );
+        fn text(evidence: &AnthropicQuotaEvidence) -> LimitText<'_> {
+            LimitText {
+                label: "claude4",
+                evidence,
+                now_ms: NOW_MS,
+            }
+        }
+
+        for evidence in [&unified, &window] {
+            let t = text(evidence);
+            assert_eq!(
+                t.hop("claude5"),
+                "⚠ claude4 is at a usage limit until 06:20 UTC — switching to claude5"
+            );
+            assert_eq!(
+                t.no_hop(NoHop::NoOtherAccount),
+                "⚠ claude4 is at a usage limit until 06:20 UTC; \
+                 no other account has proven capacity now"
+            );
+            assert_eq!(
+                t.terminal(NoHop::NoOtherAccount),
+                "Anthropic usage limit reached on account 'claude4' — window resets at \
+                 06:20 UTC. No other account has proven capacity now; \
+                 `synaps auth state --provider anthropic` shows each account's state."
+            );
+        }
+
+        let t = text(&no_reset);
+        assert_eq!(
+            t.hop("claude5"),
+            "⚠ claude4 is at a usage limit (reset time not given; not used again before \
+             05:35 UTC) — switching to claude5"
+        );
+        assert_eq!(
+            t.no_hop(NoHop::LookupFailed),
+            "⚠ claude4 is at a usage limit (reset time not given; not used again before \
+             05:35 UTC); looking up another account failed"
+        );
+
+        let t = text(&long_wait);
+        assert_eq!(
+            t.hop("claude5"),
+            "⚠ claude4 is rate-limited until 06:20 UTC (HTTP 429, no usage-limit header) \
+             — switching to claude5"
+        );
+        assert_eq!(
+            t.no_hop(NoHop::OutputStreamed),
+            "⚠ claude4 is rate-limited until 06:20 UTC (HTTP 429, no usage-limit header); \
+             output already streamed, so this request can't switch accounts"
+        );
+        assert_eq!(
+            t.terminal(NoHop::Backstop),
+            format!(
+                "Anthropic rate limit on account 'claude4' until 06:20 UTC (HTTP 429 with a \
+                 long wait, not a declared usage limit). Stopped after \
+                 {MAX_ANTHROPIC_ACCOUNT_FAILOVERS} account switches on this request; \
+                 `synaps auth state --provider anthropic` shows each account's state."
+            )
+        );
+        assert!(!t.terminal(NoHop::Backstop).contains("usage limit reached"));
+
+        // Explicit or unbound: the notice and advice are unchanged.
+        let t = text(&unified);
+        assert_eq!(
+            t.no_hop(NoHop::Explicit),
+            "⚠ account limit reached until 06:20 UTC"
+        );
+        assert!(t
+            .terminal(NoHop::Explicit)
+            .ends_with("Wait for the reset, or switch accounts with `synaps auth use --provider anthropic --account <label|auto>`."));
+
+        for why in [
+            NoHop::OutputStreamed,
+            NoHop::Backstop,
+            NoHop::NoOtherAccount,
+            NoHop::LookupFailed,
+        ] {
+            let advice = why.advice();
+            assert!(!advice.contains("another account will"), "{advice}");
+            assert!(!advice.contains("next turn will"), "{advice}");
+            if why != NoHop::OutputStreamed {
+                assert!(
+                    advice.ends_with(
+                        "`synaps auth state --provider anthropic` shows each account's state."
+                    ),
+                    "{advice}"
+                );
+            }
+        }
     }
 
     // ── router over a scripted broker ───────────────────────────────────────
@@ -940,6 +1256,8 @@ mod tests {
         vend_error: Mutex<Option<BrokerError>>,
         cooldowns: Mutex<Vec<(String, Option<u64>, String)>>,
         auto_calls: Mutex<Vec<Option<String>>>,
+        /// The `exclude` list of every excluding vend.
+        excluded: Mutex<Vec<Vec<CredentialRef>>>,
     }
 
     impl ScriptedBroker {
@@ -950,6 +1268,7 @@ mod tests {
                 vend_error: Mutex::new(None),
                 cooldowns: Mutex::new(Vec::new()),
                 auto_calls: Mutex::new(Vec::new()),
+                excluded: Mutex::new(Vec::new()),
             })
         }
     }
@@ -988,6 +1307,25 @@ mod tests {
                     expires: u64::MAX,
                 },
             })
+        }
+        /// Records the exclusion, then answers like the trait default:
+        /// the scripted pick, refused when it is excluded.
+        async fn access_token_pinned_excluding(
+            &self,
+            provider: OAuthProviderId,
+            model: Option<&str>,
+            exclude: &[CredentialRef],
+        ) -> Result<PinnedToken, BrokerError> {
+            self.excluded.lock().unwrap().push(exclude.to_vec());
+            let pinned = self.access_token_pinned_for(provider, model).await?;
+            if exclude.contains(&pinned.credential) {
+                return Err(BrokerError::NoAccountAvailable {
+                    provider: provider.as_str().into(),
+                    reason: "scripted: already attempted".into(),
+                    failure: None,
+                });
+            }
+            Ok(pinned)
         }
         async fn report_cooldown(
             &self,
@@ -1065,7 +1403,7 @@ mod tests {
         let router = BrokerAnthropicRouter::new(broker.clone());
         assert!(router.auto_selected());
         let next = router
-            .failover("anthropic/claude-opus-4-7", &seat("claude4"))
+            .failover("anthropic/claude-opus-4-7", &[seat("claude4")])
             .await
             .unwrap()
             .expect("distinct seat");
@@ -1078,7 +1416,7 @@ mod tests {
         );
         // Same seat back ⇒ no failover (a no-op cooldown sink can never loop).
         let same = router
-            .failover("claude-opus-4-7", &seat("claude2"))
+            .failover("claude-opus-4-7", &[seat("claude2")])
             .await
             .unwrap();
         assert!(same.is_none());
@@ -1089,16 +1427,41 @@ mod tests {
         let broker = ScriptedBroker::new(AccountSelector::Auto, None);
         let router = BrokerAnthropicRouter::new(broker.clone());
         assert!(router
-            .failover("claude-opus-4-7", &seat("claude4"))
+            .failover("claude-opus-4-7", &[seat("claude4")])
             .await
             .unwrap()
             .is_none());
         *broker.vend_error.lock().unwrap() = Some(BrokerError::Transport("down".into()));
         let err = router
-            .failover("claude-opus-4-7", &seat("claude4"))
+            .failover("claude-opus-4-7", &[seat("claude4")])
             .await
             .unwrap_err();
         assert!(err.contains("down"));
+    }
+
+    #[tokio::test]
+    async fn router_failover_passes_every_attempted_account_and_never_answers_one() {
+        let broker = ScriptedBroker::new(AccountSelector::Auto, Some("claude2"));
+        let router = BrokerAnthropicRouter::new(broker.clone());
+        let attempted = [seat("claude4"), seat("claude5")];
+        let next = router
+            .failover("claude-opus-4-7", &attempted)
+            .await
+            .unwrap()
+            .expect("claude2 was not attempted");
+        assert_eq!(next.credential, seat("claude2"));
+        // The broker's answer is attempted ⇒ no failover.
+        let attempted_too = [seat("claude4"), seat("claude2")];
+        assert!(router
+            .failover("claude-opus-4-7", &attempted_too)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            broker.excluded.lock().unwrap().clone(),
+            vec![attempted.to_vec(), attempted_too.to_vec()],
+            "the broker is told every attempted account, in order"
+        );
     }
 
     #[tokio::test]
@@ -1108,7 +1471,7 @@ mod tests {
         *broker.selector.lock().unwrap() = AccountSelector::Account(Account::Default);
         assert!(!router.auto_selected());
         assert!(router
-            .failover("claude-opus-4-7", &seat("claude4"))
+            .failover("claude-opus-4-7", &[seat("claude4")])
             .await
             .unwrap()
             .is_none());

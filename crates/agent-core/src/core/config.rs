@@ -685,6 +685,51 @@ impl ClientInput {
     }
 }
 
+/// What an Anthropic thinking block carries back (`thinking_display`), sent
+/// as the request's `thinking.display` on the foreground session's requests.
+///
+/// - `Summarized` (default): the model's thinking summary streams into the
+///   block. The API holds the answer back until that summary is written,
+///   then flushes the text it generated meanwhile in one burst.
+/// - `Omitted`: the block's `thinking` text is empty; its `signature` still
+///   carries the full reasoning, so history round-trips it unchanged. The
+///   answer starts streaming sooner and evenly (measured on Opus 5.5:
+///   first text 1.8–2.1 s vs 2.9–4.8 s at `high`, 7.9–9.0 s vs 11–12 s at
+///   `xhigh`), and the TUI shows only a timed `thought` header.
+///
+/// Workers and internal requests (compaction) always send `Summarized`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ThinkingDisplay {
+    #[default]
+    Summarized,
+    Omitted,
+}
+
+impl ThinkingDisplay {
+    /// `summarized` | `omitted` (case-insensitive).
+    pub fn parse(val: &str) -> Option<ThinkingDisplay> {
+        match val.trim().to_ascii_lowercase().as_str() {
+            "summarized" => Some(ThinkingDisplay::Summarized),
+            "omitted" => Some(ThinkingDisplay::Omitted),
+            _ => None,
+        }
+    }
+
+    /// The wire value of `thinking.display`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ThinkingDisplay::Summarized => "summarized",
+            ThinkingDisplay::Omitted => "omitted",
+        }
+    }
+}
+
+impl std::fmt::Display for ThinkingDisplay {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 impl std::fmt::Display for ClientInput {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
@@ -1465,6 +1510,9 @@ pub struct SynapsConfig {
     /// it at start, for every session it creates or restores. See
     /// [`ClientInput`].
     pub client_input: ClientInput,
+    /// `thinking_display`: `summarized` (default) | `omitted`. The
+    /// foreground session's `thinking.display`; see [`ThinkingDisplay`].
+    pub thinking_display: ThinkingDisplay,
     /// Max TUI redraw rate in frames/sec — caps streaming redraws (e.g. 60,
     /// 144, 240). User input always redraws immediately regardless. Default
     /// 60. Range 1–1000. The frame budget is `1000 / max_fps` ms.
@@ -1481,12 +1529,29 @@ pub struct SynapsConfig {
     pub tui_background_opaque: bool,
     /// Whether the prompt shows a glow sweeping across it while a turn streams. Default off.
     pub tui_streaming_glow: bool,
+    /// Whether the TUI reveals a burst of streamed text (a provider flushing
+    /// a backlog at once) over a few frames instead of in one. Default on.
+    pub tui_smooth_streaming: bool,
     /// Run the daemon, bash tool commands and PTY shells each in their own
     /// systemd scope (Linux, when a systemd user manager is reachable), so the
     /// out-of-memory killer can stop one runaway command instead of the whole
     /// terminal scope with the daemon in it. `process_scopes = off` disables;
     /// env `SYNAPS_PROCESS_SCOPES` overrides. Default on.
     pub process_scopes: bool,
+    /// The systemd slice for every scope Synaps makes for a tool command
+    /// (bash tool commands, PTY shells): `tool_scope_slice = synaps_tools.slice`
+    /// passes `--slice=synaps_tools.slice` to `systemd-run`, so an operator
+    /// can cap tool work on that slice apart from the desktop's
+    /// `app.slice`. Unset or empty (the default) leaves systemd's placement
+    /// as it is. Read with the config each spawn loads. Synaps sets no limits
+    /// itself. Use a top-level (dash-free) name: `CPUWeight` only weighs a
+    /// slice against its siblings (`docs/daemon-mode.md`).
+    pub tool_scope_slice: Option<String>,
+    /// The systemd slice for the daemon's own scope, applied when the daemon
+    /// starts (a reload re-execs in the same scope). Separate from
+    /// [`Self::tool_scope_slice`], so tools can be capped without the daemon.
+    /// Unset or empty: no `--slice`.
+    pub daemon_scope_slice: Option<String>,
     pub agent_name: Option<String>,
     pub identity: Option<String>,
     pub disabled_plugins: Vec<String>,
@@ -1575,13 +1640,17 @@ impl Default for SynapsConfig {
             request_compression: RequestCompressionMode::Auto,
             request_compression_level: DEFAULT_REQUEST_COMPRESSION_LEVEL,
             client_input: ClientInput::Shared,
+            thinking_display: ThinkingDisplay::Summarized,
             max_fps: 60,
             scroll_lines: None,
             theme: None,
             theme_transition: ThemeTransitionMode::default(),
             tui_background_opaque: true,
             tui_streaming_glow: false,
+            tui_smooth_streaming: true,
             process_scopes: true,
+            tool_scope_slice: None,
+            daemon_scope_slice: None,
             agent_name: None,
             identity: None,
             disabled_plugins: Vec::new(),
@@ -1605,6 +1674,44 @@ impl Default for SynapsConfig {
             warnings: Vec::new(),
         }
     }
+}
+
+/// Why `name` can't be a `tool_scope_slice` / `daemon_scope_slice` value, or
+/// `None` if it can. A slice unit name: at most 255 bytes, ending in
+/// `.slice`, only `[A-Za-z0-9:_.-]` (so no `/`), not starting with `-` and
+/// not the root slice `-.slice`; as in systemd's own check, the part before
+/// `.slice` is not empty, has no `--` and doesn't end in `-` (a `-` separates
+/// the parent slices: `synaps-tools.slice` nests under `synaps.slice`). The
+/// config file is not TOML, so a quoted value keeps its quotes and gets its
+/// own hint. An empty value never reaches this check: the parser takes it
+/// as "unset".
+pub fn scope_slice_problem(name: &str) -> Option<&'static str> {
+    if name.len() > 255 {
+        return Some("longer than 255 bytes");
+    }
+    if name.starts_with(['"', '\'']) || name.ends_with(['"', '\'']) {
+        return Some("write the name without quotes (the config file is not TOML)");
+    }
+    if !name.ends_with(".slice") {
+        return Some("expected a slice unit name ending in .slice");
+    }
+    if !name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b':' | b'_' | b'.' | b'-')) {
+        return Some("only letters, digits, ':', '_', '.' and '-' are allowed");
+    }
+    if name == "-.slice" {
+        return Some("the root slice -.slice is not allowed");
+    }
+    if name.starts_with('-') {
+        return Some("must not start with '-'");
+    }
+    let stem = &name[..name.len() - ".slice".len()];
+    if stem.is_empty() {
+        return Some("needs a name before .slice");
+    }
+    if stem.contains("--") || stem.ends_with('-') {
+        return Some("'-' separates parent slices: no '--' and no trailing '-'");
+    }
+    None
 }
 
 /// Upper bound for `telemetry_log_generations` (each generation of each log
@@ -1664,13 +1771,17 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "request_compression",
     "request_compression_level",
     "client_input",
+    "thinking_display",
     "max_fps",
     "scroll_lines",
     "theme",
     "theme_transition",
     "tui_background_opaque",
     "tui_streaming_glow",
+    "tui_smooth_streaming",
     "process_scopes",
+    "tool_scope_slice",
+    "daemon_scope_slice",
     "agent_name",
     "identity",
     "disabled_plugins",
@@ -2284,6 +2395,12 @@ fn apply_config_content_with(
                     "cache_keepwarm = {val} — expected off, auto, or 1h–{MAX_CACHE_KEEPWARM_HOURS}h; keep-warm stays off"
                 )),
             },
+            "thinking_display" => match ThinkingDisplay::parse(val) {
+                Some(display) => config.thinking_display = display,
+                None => config.warnings.push(format!(
+                    "thinking_display = {val} — expected summarized or omitted; using summarized"
+                )),
+            },
             "client_input" => match ClientInput::parse(val) {
                 Some(mode) => config.client_input = mode,
                 None => config.warnings.push(format!(
@@ -2381,13 +2498,38 @@ fn apply_config_content_with(
                     "tui_streaming_glow = {val} — expected on or off; using off"
                 )),
             },
+            "tui_smooth_streaming" => match val {
+                "true" | "1" | "on" | "yes" => config.tui_smooth_streaming = true,
+                "false" | "0" | "off" | "no" => config.tui_smooth_streaming = false,
+                _ => config.warnings.push(format!(
+                    "tui_smooth_streaming = {val} — expected on or off; using on"
+                )),
+            },
             "process_scopes" => match val {
                 "true" | "1" | "on" | "yes" | "auto" => config.process_scopes = true,
                 "false" | "0" | "off" | "no" => config.process_scopes = false,
                 _ => config.warnings.push(format!(
-                    "process_scopes = {val} — expected auto or off; using auto"
+                    "process_scopes = {val} — expected auto or off; keeping the previous value (default auto)"
                 )),
             },
+            "tool_scope_slice" | "daemon_scope_slice" => {
+                let field = if key == "tool_scope_slice" {
+                    &mut config.tool_scope_slice
+                } else {
+                    &mut config.daemon_scope_slice
+                };
+                // `key =` with nothing after it unsets the key (no warning),
+                // so a later line can undo an earlier one.
+                if val.is_empty() {
+                    *field = None;
+                } else if let Some(why) = scope_slice_problem(val) {
+                    config.warnings.push(format!(
+                        "{key} = {val} — {why}; keeping the previous value (default: no slice, systemd's default placement)"
+                    ));
+                } else {
+                    *field = Some(val.to_string());
+                }
+            }
             // Read directly by the keybind registry (`read_config_value`);
             // recognised here so the /settings row never trips the
             // unknown-key warning.
@@ -3178,6 +3320,127 @@ mod tests {
     }
 
     #[test]
+    fn an_invalid_repeated_process_scopes_keeps_the_previous_value() {
+        let c = super::load_config_from_str("process_scopes = off\nprocess_scopes = sometimes\n");
+        assert!(
+            c.warnings.iter().any(|w| w.starts_with("process_scopes = sometimes") && w.contains("keeping the previous value")),
+            "{:?}",
+            c.warnings
+        );
+        assert!(!c.process_scopes, "the earlier valid value is kept");
+    }
+
+    #[test]
+    fn an_invalid_repeated_scope_slice_keeps_the_previous_value() {
+        for key in ["tool_scope_slice", "daemon_scope_slice"] {
+            let c = super::load_config_from_str(&format!("{key} = a.slice\n{key} = worker\n"));
+            assert!(
+                c.warnings.iter().any(|w| w.starts_with(&format!("{key} = worker")) && w.contains("keeping the previous value")),
+                "{key}: {:?}",
+                c.warnings
+            );
+            let kept = if key == "tool_scope_slice" { &c.tool_scope_slice } else { &c.daemon_scope_slice };
+            assert_eq!(kept.as_deref(), Some("a.slice"), "{key}: the earlier valid value is kept");
+        }
+    }
+
+    #[test]
+    fn scope_slices_default_unset_and_parse_valid_names() {
+        let c = super::load_config_from_str("");
+        assert_eq!((c.tool_scope_slice, c.daemon_scope_slice), (None, None));
+        let c = super::load_config_from_str(
+            "tool_scope_slice = synaps_tools.slice\ndaemon_scope_slice = synaps:daemon_1.slice\n",
+        );
+        assert!(c.warnings.is_empty(), "{:?}", c.warnings);
+        assert_eq!(c.tool_scope_slice.as_deref(), Some("synaps_tools.slice"));
+        assert_eq!(c.daemon_scope_slice.as_deref(), Some("synaps:daemon_1.slice"));
+        // A nested name is valid too (the docs say why a flat one is better).
+        let c = super::load_config_from_str("tool_scope_slice = synaps-tools.slice\n");
+        assert_eq!((c.warnings.len(), c.tool_scope_slice.as_deref()), (0, Some("synaps-tools.slice")));
+        // Each key sets only its own field.
+        let c = super::load_config_from_str("tool_scope_slice = a.slice\n");
+        assert_eq!((c.tool_scope_slice.as_deref(), c.daemon_scope_slice.as_deref()), (Some("a.slice"), None));
+        let c = super::load_config_from_str("daemon_scope_slice = d.slice\n");
+        assert_eq!((c.tool_scope_slice.as_deref(), c.daemon_scope_slice.as_deref()), (None, Some("d.slice")));
+        let longest = format!("{}.slice", "a".repeat(255 - ".slice".len()));
+        assert_eq!(super::scope_slice_problem(&longest), None);
+        for k in ["tool_scope_slice", "daemon_scope_slice"] {
+            assert!(super::KNOWN_CONFIG_KEYS.contains(&k), "{k} not in KNOWN_CONFIG_KEYS");
+        }
+    }
+
+    #[test]
+    fn an_invalid_scope_slice_warns_and_keeps_the_default() {
+        let too_long = format!("{}.slice", "a".repeat(256 - ".slice".len()));
+        // Every invalid value the function or the parser lets through.
+        let mut accepted: Vec<String> = Vec::new();
+        for bad in [
+            "worker",            // no .slice suffix
+            "worker.service",    // another unit type
+            "a/b.slice",         // a path
+            "work er.slice",     // a space
+            "work@er.slice",     // outside [A-Za-z0-9:_.-]
+            "-.slice",           // the root slice
+            "-worker.slice",     // a leading '-'
+            "--worker.slice",
+            ".slice",            // no name
+            "worker--agent.slice",
+            "worker-.slice",
+            too_long.as_str(),   // 256 bytes
+            "wörker.slice",      // non-ASCII
+            "worker\0.slice",    // NUL
+            "\"worker-agent.slice\"", // quoted: the file is not TOML
+            "'worker-agent.slice'",
+            "5",                 // other types: a number, a boolean
+            "true",
+        ] {
+            if super::scope_slice_problem(bad).is_none() {
+                accepted.push(bad.to_string());
+            }
+            for key in ["tool_scope_slice", "daemon_scope_slice"] {
+                let c = super::load_config_from_str(&format!("{key} = {bad}\n"));
+                let unset = (c.tool_scope_slice.as_deref(), c.daemon_scope_slice.as_deref()) == (None, None);
+                if !unset || !c.warnings.iter().any(|w| w.starts_with(&format!("{key} = "))) {
+                    accepted.push(format!("{key} = {bad}"));
+                }
+            }
+        }
+        assert!(accepted.is_empty(), "accepted: {accepted:?}");
+    }
+
+    #[test]
+    fn an_empty_scope_slice_unsets_the_key_without_a_warning() {
+        for key in ["tool_scope_slice", "daemon_scope_slice"] {
+            for empty in [format!("{key} ="), format!("{key} =   "), format!("  {key}=")] {
+                // Alone: unset, silently.
+                let c = super::load_config_from_str(&format!("{empty}\n"));
+                assert!(c.warnings.is_empty(), "{empty:?}: {:?}", c.warnings);
+                assert_eq!((c.tool_scope_slice.as_deref(), c.daemon_scope_slice.as_deref()), (None, None), "{empty:?}");
+                // After a valid line: that line is undone, the other key kept.
+                let c = super::load_config_from_str(&format!(
+                    "tool_scope_slice = synaps_tools.slice\ndaemon_scope_slice = synaps_daemon.slice\n{empty}\n"
+                ));
+                assert!(c.warnings.is_empty(), "{empty:?}: {:?}", c.warnings);
+                let (unset, kept) = if key == "tool_scope_slice" {
+                    (&c.tool_scope_slice, c.daemon_scope_slice.as_deref())
+                } else {
+                    (&c.daemon_scope_slice, c.tool_scope_slice.as_deref())
+                };
+                assert_eq!(unset, &None, "{empty:?}");
+                assert!(kept.is_some_and(|k| k.starts_with("synaps_")), "{empty:?}: {kept:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_quoted_scope_slice_says_to_drop_the_quotes() {
+        for quoted in ["\"worker-agent.slice\"", "'worker-agent.slice'", "\"worker-agent.slice", "worker-agent.slice'"] {
+            let why = super::scope_slice_problem(quoted);
+            assert!(why.is_some_and(|w| w.contains("without quotes")), "{quoted}: {why:?}");
+        }
+    }
+
+    #[test]
     fn startup_quick_start_accepts_on() {
         let c = super::load_config_from_str("startup.quick_start = on\n");
         assert!(c.startup.quick_start);
@@ -3441,6 +3704,37 @@ mod tests {
             assess_context(&config.context_management, &state, budget).action,
             ContextAction::Rollover
         );
+    }
+
+    #[test]
+    fn thinking_display_defaults_summarized_and_parses() {
+        use super::ThinkingDisplay;
+        assert_eq!(super::load_config_from_str("").thinking_display, ThinkingDisplay::Summarized);
+        assert_eq!(
+            super::load_config_from_str("thinking_display = omitted\n").thinking_display,
+            ThinkingDisplay::Omitted
+        );
+        assert_eq!(
+            super::load_config_from_str("thinking_display = Summarized\n").thinking_display,
+            ThinkingDisplay::Summarized
+        );
+        let invalid = super::load_config_from_str("thinking_display = raw\n");
+        assert_eq!(invalid.thinking_display, ThinkingDisplay::Summarized, "invalid keeps the default");
+        assert!(invalid.warnings.iter().any(|w| w.contains("thinking_display")));
+        assert_eq!(ThinkingDisplay::Omitted.as_str(), "omitted");
+    }
+
+    #[test]
+    fn tui_smooth_streaming_defaults_on_and_parses() {
+        assert!(super::load_config_from_str("").tui_smooth_streaming);
+        assert!(!super::load_config_from_str("tui_smooth_streaming = off\n").tui_smooth_streaming);
+        assert!(super::load_config_from_str("tui_smooth_streaming = on\n").tui_smooth_streaming);
+        let invalid = super::load_config_from_str("tui_smooth_streaming = jerky\n");
+        assert!(invalid.tui_smooth_streaming, "invalid keeps the default (on)");
+        assert!(invalid
+            .warnings
+            .iter()
+            .any(|w| w.contains("tui_smooth_streaming")));
     }
 
     #[test]

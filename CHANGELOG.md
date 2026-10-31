@@ -6,6 +6,64 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **`multi_edit` tool** (#268, by JR; review fixes in this PR): anchored
+  edits to up to 16 files in one call, all or nothing. Every edit is checked
+  against in-memory copies first and nothing is written if any fails; files
+  are then published through verified directory handles, with best-effort
+  rollback. Ops `replace`, `insert_before`, `insert_after`, `append`,
+  `append_jsonl`; anchors `exact`, `line_prefix` or `line_regex`; each must
+  match once unless `occurrence` picks one; `unless_present` makes re-runs
+  no-ops; opt-in clock/mtime placeholders. On by default, in the
+  progressive-disclosure core next to `edit`, and on workers;
+  `disabled_tools = multi_edit` removes it everywhere. Final behaviour:
+  - `insert_before`/`insert_after` text that ends in a newline is whole
+    lines in every anchor mode: it lands before the anchor's line or after
+    it, never glued into it (`insert_after "line one"` + `"line 1.5\n"` used
+    to give `line oneline 1.5`). Other text goes right at the match.
+  - `append` adds a missing final newline first, like `append_jsonl`.
+  - A CRLF file stays CRLF: `\n` in `text`, an `exact` anchor and
+    `unless_present` means `\r\n` there, and so does every newline an edit
+    adds. LF files are written as given.
+  - The description states every hard limit (64 edits, 16 files, 16 MiB
+    per file, 64 MiB total, 1 MiB per field, UTF-8). Description and schema
+    were tightened from 747 to 671 tokens per request (Opus 5.5,
+    `count_tokens`).
+  - A `before_tool_call` hook filtered to `edit` or `write` also runs for
+    `multi_edit`, so existing write guards still block or confirm it.
+  - Read dedupe treats it like `edit`/`write` (a "no need to re-read" note;
+    a later read is compared against the new content). Its result is never
+    spilled. See [docs/multi-edit.md](docs/multi-edit.md).
+- **Smooth response start in the TUI.** Sending a message no longer shows
+  `◇ thinking` for a moment, then nothing, then a block of text at once.
+  The live `◇ thinking` header (with its timer, counting from the send)
+  now stays from the send until the first thinking or agent text. It is no
+  longer dropped when the provider response starts. It turns into the
+  thought in place, or gives way to the agent text in the same frame.
+  When a provider flushes a burst of text at once (summarized thinking
+  holds the answer back until its summary is written, then sends a
+  kilobyte in one instant), the TUI reveals it over a few frames. The pace
+  is about normal streaming speed, faster the more is queued. A 1 KB burst
+  takes ~0.4 s, and nothing waits more than 0.5 s. Thinking that arrives
+  with the answer reads in first. Turn end, abort, tool calls, any other
+  session event, scroll/Ctrl+O/Esc/click input, a session switch and
+  turning the setting off show everything queued at once, so the
+  transcript is never truncated or reordered. Settings → Appearance →
+  "Smooth streaming" (`tui_smooth_streaming`, default on; off = text paints
+  as it arrives, as before).
+- **`thinking_display = summarized | omitted`.** Sets the foreground
+  session's Anthropic `thinking.display`. `summarized` (default) is the
+  behaviour so far. `omitted` streams no thinking text. The reply starts
+  sooner and evenly (measured on Opus 5.5: first text 1.8–2.1 s vs
+  2.9–4.8 s at `high`, 7.9–9.0 s vs 11–12 s at `xhigh`), and the TUI shows
+  a timed `◇ thinking` header that seals to `◇ thought for 8s`. Thinking
+  effort is unchanged. Each thinking block's signature still carries the
+  full reasoning and goes back with the history unchanged. Switching keeps
+  the prompt cache (measured: the cached prefix read in full across
+  summarized ↔ omitted). Applies to new sessions. Workers, keep-warm pings
+  of worker rounds and compaction always send `summarized`: a worker's
+  thinking summaries are its record in `/watch` and its archived
+  transcripts. Settings → Model → "Thinking display".
+
 - **Tool output virtualisation.** A big tool result no longer rides every
   later request in full. When a text result of `bash`, `grep`, `find`,
   `ls`, the shell and subagent tools, or an MCP/extension/plugin tool is
@@ -104,6 +162,23 @@ All notable changes to this project will be documented in this file.
   to qualified, so headless sessions never pinged. `Observe` attaches still
   never qualify. `synaps rpc` (stdin/stdout) has no session actor and is
   not covered; drive a daemon session instead.
+- **Slices for process scopes** (#267, by JR): `tool_scope_slice =
+  synaps_tools.slice` puts the systemd scopes of bash tool commands and PTY
+  shells in that slice, and `daemon_scope_slice` does the same for the
+  daemon's own scope, so an operator can cap agent tool work apart from the
+  desktop's `app.slice` (a `~/.config/systemd/user/<name>.slice` unit or
+  `systemctl --user set-property`; Synaps sets no limits itself). Use a
+  top-level name without `-`: a `-` nests the slice, and `CPUWeight` only
+  weighs siblings. Unset or empty (`tool_scope_slice =`), nothing changes;
+  an empty value also undoes an earlier line. An invalid name warns and is
+  ignored. A missing slice is not refused (systemd creates it, uncapped), so
+  the first launch into a slice looks up its limits off the command's path
+  and warns once if it sets none. A failed probe (user manager unreachable,
+  or the slice refused) starts the command without a scope, with one
+  warning. Tool commands pick up a change at the next command; the daemon's
+  slice applies at its next fresh start (a reload re-execs in the same
+  scope). Recipe and checks: `docs/daemon-mode.md`, "Capping tool commands
+  with a slice".
 
 ### Changed
 
@@ -193,6 +268,43 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Automatic Anthropic account selection keeps a turn on an account that
+  serves.** Fixes to the mid-turn failover of #273: an account whose
+  short usage limit the ordinary retry outlived loses its cooldown, so the
+  next round no longer moves the turn to a cold-cache account (or, with one
+  account, ends it with `all_cooling_down` after its tools ran); when every
+  account is cooling down mid-turn, the turn keeps its account. Keep-warm
+  pings (idle and tool-round) never select, switch or re-bind an account
+  and send no switch notices; a ping on a cooling account stops. Only a
+  refused token refresh (a login or an action needed) moves an automatic
+  selection to another account; a transient one fails with its own kind
+  (`refresh_transient`, not `usage_read_failed`). The mid-turn re-vend
+  honours a refused refresh's hold, and cooldown lookups read auth.json
+  once per version of the file instead of on every request.
+- **macOS: no "install developer tools" dialog from Git.** `/usr/bin/git`
+  on macOS is Apple's `xcrun` shim, and without the Command Line Tools
+  running it opens that dialog (`GIT_TERMINAL_PROMPT=0` does not stop it).
+  Synaps now runs Git by absolute path and never the shim. The host runs the
+  first `git` on `PATH`, as a shell would, so Homebrew, Nix and MacPorts Git
+  keep working; where `PATH` reaches the shim it runs the developer Git the
+  shim would have run (`DEVELOPER_DIR`, the `xcode-select` choice, Xcode,
+  the Command Line Tools; a `.app` bundle works too), or skips the shim if
+  there is none. The Axel memory service, started with an empty
+  environment, never consults `PATH` and runs that developer Git. With no
+  Git at all, repository memory fails closed with `git unavailable: run
+  xcode-select --install` (now shown, not dropped), and plugin install,
+  update and update checks refuse with the same request. Repository memory
+  with a Git older than 2.31 says it needs 2.31 instead of failing on a
+  "relative path". Linux and Windows run `git` from `PATH` as before.
+  (#343, by @JR-Morton)
+- **Thinking blocks with empty text but a signature are kept in history.**
+  The stream parser and the request sanitizer dropped any thinking block
+  with empty text. That is every block under `display: "omitted"`, and
+  any summarized-mode progress update the model wrote no summary for. The
+  block's reasoning was lost from the next request, and a tool loop sent
+  its turn with thinking blocks partially dropped. Now only a block with
+  neither text nor signature is dropped (the one the API rejects with
+  "each thinking block must contain thinking", verified live).
 - **A closed session or stopped quota keeper frees its lock at once.**
   Session journal locks and quota-keeper locks were released by closing the
   lock file. A `flock` belongs to the open file, and a process that a

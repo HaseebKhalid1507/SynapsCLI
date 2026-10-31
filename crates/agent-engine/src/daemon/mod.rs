@@ -619,6 +619,22 @@ pub fn signal_ready() {
     }
 }
 
+/// The detached daemon's program and argv: `exe cmd_args`, wrapped in the
+/// daemon's own scope (in `daemon_scope_slice` when that is set) when scopes
+/// are available for `effective_env`.
+#[cfg(unix)]
+fn daemon_launch(
+    effective_env: &[(std::ffi::OsString, std::ffi::OsString)],
+    exe: PathBuf,
+    cmd_args: Vec<std::ffi::OsString>,
+) -> (std::ffi::OsString, Vec<std::ffi::OsString>) {
+    let kind = crate::process_scope::ScopeKind::Daemon;
+    match crate::process_scope::launcher_for_effective_env(effective_env, None, kind) {
+        Some(launcher) => launcher.wrap("synaps daemon", exe, cmd_args),
+        None => (exe.into_os_string(), cmd_args),
+    }
+}
+
 /// Parent side: `current_exe daemon --foreground …` in its own session
 /// (`setsid`), stdout → null, stderr → pipe; waits ≤ [`SPAWN_READY_TIMEOUT`]
 /// (15 s: the daemon's ≤ 10 s extension wait plus margin) for `R` on the
@@ -649,10 +665,7 @@ pub fn spawn_detached(opts: &DaemonOpts) -> anyhow::Result<u32> {
     let mut effective_env = crate::process_scope::inherited_env();
     crate::process_scope::set_env(&mut effective_env, "SYNAPS_DAEMON", "1");
     effective_env.retain(|(k, _)| k != READY_FD_ENV);
-    let (program, cmd_args) = match crate::process_scope::launcher_for_effective_env(&effective_env, None) {
-        Some(launcher) => launcher.wrap("synaps daemon", exe, cmd_args),
-        None => (exe.into_os_string(), cmd_args),
-    };
+    let (program, cmd_args) = daemon_launch(&effective_env, exe, cmd_args);
     let mut fds = [0i32; 2];
     // SAFETY: plain pipe(2) on a valid 2-slot array.
     if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
@@ -1078,6 +1091,74 @@ mod flag_tests {
         assert!(env_is_off(Some("NO")));
         assert!(!env_is_off(Some("1")));
         assert!(!env_is_off(None));
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod scope_tests {
+    use super::*;
+    use crate::process_scope::test_support::{fake_env, fake_systemd_run, recorded};
+
+    fn launch(env: &[(String, String)]) -> (std::ffi::OsString, Vec<String>) {
+        let env: Vec<(std::ffi::OsString, std::ffi::OsString)> =
+            env.iter().map(|(k, v)| (k.into(), v.into())).collect();
+        let exe = PathBuf::from("/opt/synaps/bin/synaps");
+        let (program, args) = daemon_launch(&env, exe, vec!["daemon".into(), "--foreground".into()]);
+        (program, args.iter().map(|a| a.to_string_lossy().into_owned()).collect())
+    }
+
+    /// The daemon's scope goes in `daemon_scope_slice`, never in the tools'
+    /// `tool_scope_slice`; with neither key set its argv is today's.
+    #[test]
+    #[serial_test::serial(synaps_base_dir)]
+    fn the_daemon_scope_goes_in_the_daemon_slice_only() {
+        let base = crate::test_env::BaseDirGuard::new();
+        let _scopes = crate::test_env::EnvVarGuard::remove("SYNAPS_PROCESS_SCOPES");
+        let dir = tempfile::tempdir().unwrap();
+        let fake = fake_systemd_run(dir.path());
+        let env = fake_env(&fake);
+        let today = [
+            "--user",
+            "--scope",
+            "--quiet",
+            "--collect",
+            "--description=synaps daemon",
+            "--",
+            "/opt/synaps/bin/synaps",
+            "daemon",
+            "--foreground",
+        ];
+        let (program, args) = launch(&env);
+        assert_eq!(program, fake.clone().into_os_string());
+        assert_eq!(args, today);
+        let config = base.path().join("config");
+        std::fs::write(&config, "tool_scope_slice = t_tools.slice\ndaemon_scope_slice = d_daemon.slice\n").unwrap();
+        let (program, args) = launch(&env);
+        assert_eq!(program, fake.clone().into_os_string());
+        assert_eq!(
+            args,
+            [
+                "--user",
+                "--scope",
+                "--quiet",
+                "--collect",
+                "--slice=d_daemon.slice",
+                "--description=synaps daemon",
+                "--",
+                "/opt/synaps/bin/synaps",
+                "daemon",
+                "--foreground",
+            ]
+        );
+        assert!(recorded(dir.path(), "probe.args").contains(&"--slice=d_daemon.slice".to_string()));
+        // Only the tools' key: the daemon's scope stays where it was.
+        std::fs::write(&config, "tool_scope_slice = t_tools.slice\n").unwrap();
+        assert_eq!(launch(&env).1, today);
+        // Scopes off: the daemon starts directly.
+        std::fs::write(&config, "process_scopes = off\ndaemon_scope_slice = d_daemon.slice\n").unwrap();
+        let (program, args) = launch(&env);
+        assert_eq!(program, std::ffi::OsString::from("/opt/synaps/bin/synaps"));
+        assert_eq!(args, ["daemon", "--foreground"]);
     }
 }
 

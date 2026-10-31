@@ -69,6 +69,22 @@ fn accept_context_phase(
     Some(phase)
 }
 
+/// Whether a handler's `tool` filter covers `ev`. A filter matches the
+/// tool's API name or runtime name (MCP tools with sanitized names still
+/// match). Before a call, a filter for `edit` or `write` also covers the
+/// builtin `multi_edit`, which changes files the same way: a guard written
+/// before `multi_edit` existed must still block or confirm it. Output
+/// transforms (`after_tool_call`) stay exact; their rewrite is per-format.
+fn tool_filter_matches(filter: &str, ev: &HookEvent) -> bool {
+    let (api, runtime) = (ev.tool_name.as_deref(), ev.tool_runtime_name.as_deref());
+    if api == Some(filter) || runtime == Some(filter) {
+        return true;
+    }
+    ev.kind == HookKind::BeforeToolCall
+        && matches!(filter, "edit" | "write")
+        && runtime.or(api) == Some("multi_edit")
+}
+
 /// A registered hook handler with its metadata.
 #[derive(Clone)]
 pub struct HandlerRegistration {
@@ -324,13 +340,7 @@ impl HookBus {
             // Check both API name and runtime name so MCP tools with
             // sanitized names (slashes→underscores) still match.
             if let Some(ref filter) = reg.tool_filter {
-                let matches = match (&ev.tool_name, &ev.tool_runtime_name) {
-                    (Some(api), Some(runtime)) => filter == api || filter == runtime,
-                    (Some(api), None) => filter == api,
-                    (None, Some(runtime)) => filter == runtime,
-                    (None, None) => false,
-                };
-                if !matches {
+                if !tool_filter_matches(filter, ev) {
                     continue;
                 }
             }
@@ -620,16 +630,9 @@ impl HookBus {
                 .iter()
                 .filter(|reg| {
                     // Apply tool filter before spawning.
-                    if let Some(ref filter) = reg.tool_filter {
-                        match (&event.tool_name, &event.tool_runtime_name) {
-                            (Some(api), Some(runtime)) => filter == api || filter == runtime,
-                            (Some(api), None) => filter == api,
-                            (None, Some(runtime)) => filter == runtime,
-                            (None, None) => false,
-                        }
-                    } else {
-                        true
-                    }
+                    reg.tool_filter
+                        .as_deref()
+                        .is_none_or(|filter| tool_filter_matches(filter, event))
                 })
                 .filter(|reg| reg.matcher.as_ref().is_none_or(|m| m.matches(event)))
                 .map(|reg| {
@@ -1709,6 +1712,38 @@ mod tests {
         let event = HookEvent::after_tool_call("bash", serde_json::json!({}), "output".into());
         bus.emit(&event).await;
         assert_eq!(handler.calls(), 1);
+    }
+
+    /// A guard written for `edit`/`write` (from before `multi_edit`
+    /// existed) still sees `multi_edit` before the call, so it can block or
+    /// confirm it. Output transforms stay exact.
+    #[tokio::test]
+    async fn edit_and_write_filters_also_guard_multi_edit_before_the_call() {
+        for filter in ["edit", "write"] {
+            let bus = HookBus::new();
+            let guard = TestHandler::new(
+                "guard",
+                HookResult::Block {
+                    reason: "guarded".into(),
+                },
+            );
+            let after = TestHandler::new("after", HookResult::Continue);
+            let perms = perms_with(&[Permission::ToolsIntercept]);
+            bus.subscribe(HookKind::BeforeToolCall, guard.clone(), Some(filter.into()), None, perms.clone())
+                .await
+                .unwrap();
+            bus.subscribe(HookKind::AfterToolCall, after.clone(), Some(filter.into()), None, perms)
+                .await
+                .unwrap();
+            let input = serde_json::json!({"edits": [{"path": "/etc/hosts", "op": "append", "text": "x"}]});
+            let blocked = bus.emit(&HookEvent::before_tool_call("multi_edit", input.clone())).await;
+            assert!(matches!(blocked, HookResult::Block { reason } if reason == "guarded"), "{filter}");
+            assert_eq!(guard.calls(), 1, "{filter}");
+            let other = bus.emit(&HookEvent::before_tool_call("read", serde_json::json!({}))).await;
+            assert!(matches!(other, HookResult::Continue), "{filter}: only the file-changing tool");
+            bus.emit(&HookEvent::after_tool_call("multi_edit", input, "ok".into())).await;
+            assert_eq!(after.calls(), 0, "{filter}: after_tool_call filters stay exact");
+        }
     }
 
     #[tokio::test]

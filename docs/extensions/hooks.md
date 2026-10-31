@@ -21,6 +21,13 @@ The `tool` filter is supported only for `before_tool_call` and
 `after_tool_call`. It matches either the API-safe tool name or the runtime tool
 name.
 
+A filter matches one tool name exactly, with one exception: a
+`before_tool_call` filter for `edit` or `write` also matches `multi_edit`,
+which changes files the same way, so a guard written for those tools still
+blocks or confirms it. It sees `multi_edit`'s own input (`edits[].path`
+per file); see [multi-edit.md](../multi-edit.md#hooks). `after_tool_call`
+filters stay exact.
+
 ## Hook catalog and action matrix
 
 | Hook | Required permission | Tool filter? | Allowed result actions | Purpose |

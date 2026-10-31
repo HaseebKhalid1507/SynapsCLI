@@ -159,7 +159,8 @@ fn moved_main_and_worktree_retain_key_and_historical_aliases() {
         ],
     );
     resolve(&moved_worker);
-    let moved_main = tmp.path().join("new-main");
+    // Canonical: on macOS the temp dir is /var/..., which resolves to /private/var/...
+    let moved_main = tmp.path().canonicalize().unwrap().join("new-main");
     fs::rename(&main, &moved_main).unwrap();
     git(
         &moved_main,
@@ -312,7 +313,8 @@ fn untrusted_common_directory_is_not_chmod_repaired() {
 fn separate_gitdir_worktree_first_shares_random_key_and_common_directory_root() {
     let tmp = TempDir::new().unwrap();
     let main = tmp.path().join("main");
-    let common = tmp.path().join("separate.git");
+    // Canonical: on macOS the temp dir is /var/..., which resolves to /private/var/...
+    let common = tmp.path().canonicalize().unwrap().join("separate.git");
     fs::create_dir(&main).unwrap();
     git(
         &main,
@@ -453,7 +455,8 @@ fn repository_identity_child() {
     let root = PathBuf::from(root);
     let result = ProjectScope::discover_repository(&root);
     if let Ok(expected) = std::env::var("SYNTHETIC_EXPECTED_ERROR") {
-        assert!(result.unwrap_err().to_string().contains(&expected));
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains(&expected), "{error:?} lacks {expected:?}");
         return;
     }
     let identity = result.unwrap();
@@ -651,6 +654,8 @@ fn synthetic_git_failure(script: &str, expected: &str, timeout: bool) {
     )
     .unwrap();
     fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+    // PATH supplies the synthetic Git on every platform: macOS runs the first
+    // real `git` on PATH too (`agent_core::git_program`).
     let started = Instant::now();
     let mut process = child(&main, "")
         .env("PATH", tmp.path())
@@ -686,6 +691,16 @@ fn synthetic_git_failure(script: &str, expected: &str, timeout: bool) {
         assert!(started.elapsed() >= Duration::from_millis(4500));
     }
     assert!(!main.join(".git").join(MARKER).exists());
+}
+
+#[test]
+fn git_without_path_format_is_named() {
+    // Git 2.30 echoes the unknown `--path-format=absolute` and exits 0.
+    synthetic_git_failure(
+        "echo --path-format=absolute\necho \"$PWD\"\nexit 0",
+        "Git 2.31 or newer is required",
+        false,
+    );
 }
 
 #[test]

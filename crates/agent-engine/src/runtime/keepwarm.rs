@@ -572,7 +572,9 @@ impl Runtime {
         self.validate_request_preflight().await?;
         let anthropic_execution_plan = self.authorized_anthropic_plan().await?;
         if matches!(mode, KeepWarmMode::Send { .. }) {
-            self.refresh_if_needed().await?;
+            // Never selects, switches or re-binds an account; a cooling
+            // account ends the period (the ping fails before sending).
+            self.refresh_for_keepwarm().await?;
         }
 
         // System prompt: run_stream_tracked → run_stream_internal, verbatim.
@@ -687,6 +689,8 @@ impl Runtime {
             request_compression: self.request_compression.clone(),
             anthropic_execution_plan,
             codex_request_role: self.codex_request_role(),
+            // The turns' own `thinking` object: the ping's prefix is theirs.
+            thinking_display: self.wire_thinking_display(),
             retention_frontier: round_images.applied_frontier(),
             // The base context: a ping must never consume `/trace next`.
             trace: self.trace_ctx.clone(),
@@ -1514,6 +1518,42 @@ mod tests {
                 &crate::auth::CredentialRef::default_for(crate::auth::OAuthProviderId::Anthropic),
             )),
         }));
+    }
+
+    /// Review fix 2: an idle keep-warm ping never selects, switches or
+    /// re-binds an account. The session's account cooling down (a limit met
+    /// elsewhere) stops it before anything is sent, saying so; the session
+    /// stays bound to its account.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn an_idle_ping_on_a_cooling_account_sends_nothing() {
+        let _base = crate::test_env::BaseDirGuard::new();
+        let (url, mock) = spawn_mock().await;
+        let _url = crate::test_env::EnvVarGuard::set("SYNAPS_ANTHROPIC_BASE_URL", &url);
+        let mut rt = opus(CacheTtl::OneHour);
+        bind_oauth(&mut rt);
+        let history = real_turn(&rt, vec![user("hello")]).await;
+        let fingerprint = rt.cache_keepwarm_probe(&history).await.unwrap().fingerprint;
+        let seat = crate::auth::CredentialRef::default_for(crate::auth::OAuthProviderId::Anthropic);
+        crate::auth::broker_from_source(&rt.credential_source, &rt.token_cache, reqwest::Client::new())
+            .report_cooldown(&seat, Some(crate::epoch_millis() + 3_600_000), "test")
+            .await
+            .unwrap();
+        let bound = rt.auth.read().await.bound_credential.clone();
+
+        let tap = PingTap::default();
+        let report = rt
+            .cache_keepwarm_ping(&history, fingerprint, &CancellationToken::new(), &tap)
+            .await;
+        match &report.result {
+            Err(PingFailure::Fatal(why)) => assert!(why.contains("account cooling"), "{why}"),
+            other => panic!("the ping stops on the cooling account: {other:?}"),
+        }
+        assert!(!tap.was_sent());
+        assert!(report.notices.is_empty(), "{:?}", report.notices);
+        assert_eq!(mock.bodies.lock().unwrap().len(), 1, "only the turn was sent");
+        assert_eq!(rt.auth.read().await.bound_credential, bound, "not re-bound");
+        assert_eq!(rt.auth.read().await.auth_token, "oauth-test-token");
     }
 
     /// Every `cache_control` value in a request body, in document order.
