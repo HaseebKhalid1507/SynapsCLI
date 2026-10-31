@@ -7649,6 +7649,18 @@ mod rich_output_tests {
             assert!(!next.event("toolu_r2").deduped);
         }
 
+        /// Pins the session's tools to `read` and `big_out`, so a test that
+        /// depends on the request footprint (the tool schema is part of it)
+        /// sees the same footprint in every build: `--no-default-features`
+        /// drops `bash` and `shell_*` from `ToolRegistry::new()`, and any
+        /// new built-in tool would grow it.
+        fn pin_tools(s: &mut StreamSession) {
+            let mut registry = ToolRegistry::empty();
+            registry.register(Arc::new(crate::tools::read::ReadTool));
+            registry.register(Arc::new(WorkerBigOutputTool(Arc::new(AtomicUsize::new(0)))));
+            s.tools = Arc::new(RwLock::new(registry));
+        }
+
         fn rollover_worker(sink_dir: std::path::PathBuf, reports: Arc<AtomicUsize>) -> impl FnOnce(&mut StreamSession) {
             use crate::runtime::worker_context::{
                 WorkerContext, WorkerContextSettings, WorkerTranscriptSink,
@@ -7657,7 +7669,7 @@ mod rich_output_tests {
                 s.context_window = 200_000;
                 s.options.codex_request_role = crate::runtime::openai::catalog::CodexRequestRole::Worker;
                 s.worker_context = WorkerContext {
-                    settings: Some(WorkerContextSettings { enabled: true, rollover_tokens: 30_000 }),
+                    settings: Some(WorkerContextSettings { enabled: true, rollover_tokens: 20_000 }),
                     sink: Some(WorkerTranscriptSink {
                         dir: sink_dir,
                         stem: "sa_1".into(),
@@ -7680,8 +7692,13 @@ mod rich_output_tests {
             let dir = tempfile::tempdir().unwrap();
             let file = dir.path().join("a.py");
             std::fs::write(&file, source(100, "a")).unwrap();
-            // ~1.5k tokens each. Six keep r1 in context for r2; three more
-            // cross the 30k band, and the cut lands between r1 and r2.
+            // ~2.5k tokens each. Six keep r1 in context for r2; the next one
+            // crosses the 20k band, and the cut lands between r1 and r2.
+            // The band depends on the request footprint, the tool schema
+            // included, so both runs pin their tools (`pin_tools`): with the
+            // full registry, a `--no-default-features` build (no `bash`,
+            // `shell_*`) crossed one round later. Pinned, the footprint is
+            // ~18.6k at r2's request and ~21.1k at the next, in every build.
             const BEFORE: [&str; 6] =
                 ["toolu_f0", "toolu_f1", "toolu_f2", "toolu_f3", "toolu_f4", "toolu_f5"];
             const AFTER: [&str; 3] = ["toolu_f6", "toolu_f7", "toolu_f8"];
@@ -7696,17 +7713,28 @@ mod rich_output_tests {
             let stub = Value::String(unchanged_stub("toolu_r1"));
 
             // Control: no rollover, r1 stays in context → both re-reads stub.
-            let kept = drive_rounds(go(), &rounds, true, |_| {}).await;
+            let kept = drive_rounds(go(), &rounds, true, pin_tools).await;
             assert_eq!(kept.result("toolu_r2"), stub);
             assert_eq!(kept.result("toolu_r3"), stub);
 
             let transcripts = tempfile::tempdir().unwrap();
             let reports = Arc::new(AtomicUsize::new(0));
             let worker = rollover_worker(transcripts.path().to_path_buf(), Arc::clone(&reports));
-            let rolled = drive_rounds(go(), &rounds, true, worker).await;
+            let rolled = drive_rounds(go(), &rounds, true, |s| {
+                pin_tools(s);
+                worker(s);
+            })
+            .await;
             assert!(reports.load(Ordering::SeqCst) >= 1, "the worker rolled over");
             // Before the rollover: r1 and its stub, as written.
             let r2_request = BEFORE.len() + 2;
+            // The rollover lands where the band is calibrated for: r1's read
+            // leaves the request right after r2's.
+            let evicted = (1..rolled.bodies.len()).find(|&body| {
+                find_result(rolled.bodies[body]["messages"].as_array().unwrap().iter(), "toolu_r1")
+                    .is_none()
+            });
+            assert_eq!(evicted, Some(r2_request + 1), "the request r1's read is gone from");
             assert!(rolled.bodies[r2_request].to_string().contains("toolu_r1"));
             assert_eq!(rolled.wire(r2_request, "toolu_r2"), stub);
             // From the cut on: r1 is gone and r2 carries the fixed rewrite,
