@@ -4,8 +4,72 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.11.1] — 2026-10-31
+
+Synaps runs on Windows now, with prebuilt x64 binaries and a PowerShell
+installer. Long sessions cost less: the prompt cache lasts an hour on a
+Claude subscription, big tool output stays out of every later request,
+re-reads of unchanged files are deduplicated, keep-warm covers long tool
+calls, and request bodies go out gzip-compressed. Subagent workers roll
+their context over instead of filling the window, follow more of the
+session's config, and run in the session's folder. This release also adds
+`multi_edit` and smoother streaming in the TUI.
+
+Read the Upgrade notes first: several defaults changed, workers no longer
+get tools listed in `disabled_tools`, and the bash tool no longer answers
+password prompts other than sudo's. Full notes:
+[docs/upgrading/0.11.md](docs/upgrading/0.11.md#upgrading-from-0110-to-0111).
+
+### Upgrade notes
+
+- **Reload the daemon after installing:** `synaps daemon reload`, then
+  restart attached TUIs. A reload stops running subagents (they can be
+  resumed), so let them finish first. Daemon protocol (v3) and extension
+  protocol (1) are unchanged.
+- **`cache_ttl` defaults to `auto`:** 1h on a Claude subscription login,
+  5m on an API key. `cache_ttl = 5m` keeps the old behaviour.
+- **New defaults, each with an off switch:** worker context rollover
+  (`subagent_context_management = off`), output spill
+  (`tool_output_spill_bytes = 0`), read dedupe (`read_dedupe = off`),
+  keep-warm during tool calls (`cache_keepwarm_tools = off`), extension
+  output transforms in workers (`subagent_transform_hooks = off`),
+  `multi_edit` (`disabled_tools = multi_edit`), request compression
+  (`request_compression = off`) and smooth streaming
+  (`tui_smooth_streaming = off`).
+- **Workers think at `subagent_thinking` (default `xhigh`)**, independent
+  of the foreground `thinking`. Lower it, or pass `thinking` per call, for
+  cheaper workers.
+- **`disabled_tools` now applies to workers too.** A worker that relied
+  on a disabled tool (say `bash` under a no-shell profile) gets "Unknown
+  tool" for it.
+- **The bash tool answers only sudo's password prompt** (Linux, through an
+  askpass helper; macOS fails closed with `sudo -n`). The command's stdin is
+  empty, and prompts from `mysql -p`, `psql` and the like are no longer
+  answered.
+- **Crate users:** `synaps-engine` has a few public API changes:
+  `Runtime::cache_ttl()` returns `CacheTtlSetting`,
+  `daemon::listener::bind` returns a platform `Listener`,
+  `daemon::reload::adopt_from_env` takes `&DaemonPaths` and returns
+  `Adopted`, and some public structs gained fields, which breaks struct
+  literals. Pin `=0.11.0` until you've updated.
+
 ### Added
 
+- **Windows 10/11 (x64).** The daemon runs natively on a named pipe with an
+  owner-only DACL, and a client refuses a pipe served by another user's
+  process (the Windows analogue of the `0600` socket). The detached daemon
+  gets a hidden console and its own process group, so tool calls don't
+  flash windows and closing the terminal doesn't stop it. `daemon reload`
+  hands the daemon lock straight to the new image (Windows has no
+  `execv`), and `daemon stop --force` falls back to `taskkill /T /F`.
+  Releases ship `synaps-x86_64-pc-windows-msvc.zip` and a PowerShell
+  installer (`synaps-installer.ps1`). The `powershell` tool is built in;
+  the `bash` tool uses Git Bash or WSL's `bash.exe` when it finds one.
+  TUI fixes for the Windows console: pasted text and characters not on the
+  keyboard layout no longer vanish, AltGr characters (`@ { \ €` on German
+  and similar layouts) type instead of firing shortcuts, and `plugins.json`
+  and `trust.json` save (a read-only handle can't be flushed there, os
+  error 5). (#277, #326, #328, by JR and Haseeb)
 - **`multi_edit` tool** (#268, by JR; review fixes in this PR): anchored
   edits to up to 16 files in one call, all or nothing. Every edit is checked
   against in-memory copies first and nothing is written if any fails; files
@@ -182,6 +246,23 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- **Subagent thinking has its own setting** (#319, by JR):
+  `subagent_thinking` (default `xhigh`, /settings row), independent of the
+  foreground `thinking`, and an optional `thinking: low | medium | high |
+  xhigh | max` on `subagent`, `subagent_start` and `subagent_resume`. A
+  resumed worker keeps its recorded effort unless the call overrides it.
+  Unsupported model/effort pairs are refused, not lowered.
+  [docs/subagent-thinking.md](docs/subagent-thinking.md)
+- **TUI polish from a user walkthrough** (#316). Wrapped paragraphs keep
+  inline code and bold. Subagent tool cards show status, name, elapsed time
+  and tool count, then the worker's answer, instead of raw JSON, and the
+  finished event reads `✓ name finished · 3.6s` plus a preview. grep/find
+  cards show paths relative to the session folder. `/stats` shows the full
+  session id, `/theme` marks the current theme and applies at once,
+  `/clear` resets the context gauge and cache-write counters, and `/help`
+  lists `/sessions` and `/theme`. A first `synaps` without credentials
+  shows the `synaps login` hint in daemon mode too, and `--attach <NAME>`
+  works for a session started with `--name`.
 - **The stock system prompt now steers working habits.** With only the
   ~200-byte default, the model rewrote whole files, re-read files it had
   just read or written, wrote heavy docs and ran verbose commands, and those
@@ -268,6 +349,16 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Subagent workers run in the session's folder and environment.** Under
+  the daemon they ran in the daemon process's working directory with its
+  environment, so a worker could edit files in the wrong tree. `subagent`,
+  `subagent_start` and `subagent_resume` now use the parent session's cwd
+  and env; a resumed worker continues in the folder it ran in if it still
+  exists. (#317)
+- **Transcript times survive resume, attach and rebuild.** After
+  `--attach --continue`, attaching to a live session, `/resync` or a
+  compaction rebuild, every message showed the current time. Each message
+  now keeps the time it was written. (#320)
 - **Automatic Anthropic account selection keeps a turn on an account that
   serves.** Fixes to the mid-turn failover of #273: an account whose
   short usage limit the ordinary retry outlived loses its cooldown, so the
@@ -440,6 +531,25 @@ All notable changes to this project will be documented in this file.
   password prompts (`Password:` from `mysql -p`, `psql`, …) are no longer
   answered. macOS fails closed (`sudo -n`).
   [docs/sudo-askpass.md](docs/sudo-askpass.md)
+
+### Credits
+
+- **Haseeb Khalid**: tool output virtualisation, read dedupe, worker
+  rollover and config inheritance, keep-warm for tool calls and headless
+  sessions, the 1h cache default, request compression, smooth streaming
+  and thinking display, sudo askpass, the Windows fixes, telemetry and
+  review fixes, integration and merges.
+- **JR Morton**: the Windows-native daemon and Windows CI, `multi_edit`,
+  process-scope slices, mid-turn account failover, the macOS Git fix and
+  subagent thinking.
+
+### Internal
+
+- CI has a Windows job: clippy in both feature sets and the daemon and
+  TUI suites. (#278)
+- Flaky and platform-bound tests fixed: bash hand-off accounting, PTY,
+  auth, keep-warm timing, Windows paths and the hardened-build steps.
+  (#327, #328, #350)
 
 ## [0.11.0] — 2026-10-26
 
