@@ -823,7 +823,7 @@ impl TranscriptStore {
         let ago = self.event_time.map_or(std::time::Duration::ZERO, |t| {
             self.clock.now().saturating_duration_since(t)
         });
-        chrono::Local::now() - chrono::Duration::from_std(ago).unwrap_or(chrono::Duration::zero())
+        self.clock.wall_now() - chrono::Duration::from_std(ago).unwrap_or(chrono::Duration::zero())
     }
 
     /// Before a message dated `at`: a day line when the local date changed
@@ -929,7 +929,7 @@ impl TranscriptStore {
                 "{SCROLLBACK_SENTINEL_PREFIX}{} earlier message(s) hidden {SCROLLBACK_SENTINEL_MARK}{}; {reload})",
                 self.scrollback_dropped, self.max_msgs
             )),
-            time: chrono::Local::now().format("%H:%M").to_string(),
+            time: self.clock.wall_now().format("%H:%M").to_string(),
             thought: None,
         };
         self.messages.insert(0, sentinel);
@@ -1341,7 +1341,7 @@ impl TranscriptStore {
                 msg: ChatMessage::System(format!(
                     "… {omitted} earlier message(s) hidden to speed resume — full history is still in the model's context"
                 )),
-                time: chrono::Local::now().format("%H:%M").to_string(),
+                time: self.clock.wall_now().format("%H:%M").to_string(),
                 thought: None,
             },
         );
