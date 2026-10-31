@@ -1132,7 +1132,7 @@ mod scope_tests {
         assert_eq!(program, fake.clone().into_os_string());
         assert_eq!(args, today);
         let config = base.path().join("config");
-        std::fs::write(&config, "tool_scope_slice = t-agent.slice\ndaemon_scope_slice = d-agent.slice\n").unwrap();
+        std::fs::write(&config, "tool_scope_slice = t_tools.slice\ndaemon_scope_slice = d_daemon.slice\n").unwrap();
         let (program, args) = launch(&env);
         assert_eq!(program, fake.clone().into_os_string());
         assert_eq!(
@@ -1142,7 +1142,7 @@ mod scope_tests {
                 "--scope",
                 "--quiet",
                 "--collect",
-                "--slice=d-agent.slice",
+                "--slice=d_daemon.slice",
                 "--description=synaps daemon",
                 "--",
                 "/opt/synaps/bin/synaps",
@@ -1150,12 +1150,12 @@ mod scope_tests {
                 "--foreground",
             ]
         );
-        assert!(recorded(dir.path(), "probe.args").contains(&"--slice=d-agent.slice".to_string()));
+        assert!(recorded(dir.path(), "probe.args").contains(&"--slice=d_daemon.slice".to_string()));
         // Only the tools' key: the daemon's scope stays where it was.
-        std::fs::write(&config, "tool_scope_slice = t-agent.slice\n").unwrap();
+        std::fs::write(&config, "tool_scope_slice = t_tools.slice\n").unwrap();
         assert_eq!(launch(&env).1, today);
         // Scopes off: the daemon starts directly.
-        std::fs::write(&config, "process_scopes = off\ndaemon_scope_slice = d-agent.slice\n").unwrap();
+        std::fs::write(&config, "process_scopes = off\ndaemon_scope_slice = d_daemon.slice\n").unwrap();
         let (program, args) = launch(&env);
         assert_eq!(program, std::ffi::OsString::from("/opt/synaps/bin/synaps"));
         assert_eq!(args, ["daemon", "--foreground"]);

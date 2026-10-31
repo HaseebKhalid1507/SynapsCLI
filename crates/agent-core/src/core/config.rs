@@ -1488,15 +1488,18 @@ pub struct SynapsConfig {
     /// env `SYNAPS_PROCESS_SCOPES` overrides. Default on.
     pub process_scopes: bool,
     /// The systemd slice for every scope Synaps makes for a tool command
-    /// (bash tool commands, PTY shells): `tool_scope_slice = worker-agent.slice`
-    /// passes `--slice=worker-agent.slice` to `systemd-run`, so an operator
+    /// (bash tool commands, PTY shells): `tool_scope_slice = synaps_tools.slice`
+    /// passes `--slice=synaps_tools.slice` to `systemd-run`, so an operator
     /// can cap tool work on that slice apart from the desktop's
-    /// `app.slice`. Unset (the default) leaves systemd's placement as it is.
-    /// Read with the config each spawn loads. Synaps sets no limits itself.
+    /// `app.slice`. Unset or empty (the default) leaves systemd's placement
+    /// as it is. Read with the config each spawn loads. Synaps sets no limits
+    /// itself. Use a top-level (dash-free) name: `CPUWeight` only weighs a
+    /// slice against its siblings (`docs/daemon-mode.md`).
     pub tool_scope_slice: Option<String>,
     /// The systemd slice for the daemon's own scope, applied when the daemon
     /// starts (a reload re-execs in the same scope). Separate from
     /// [`Self::tool_scope_slice`], so tools can be capped without the daemon.
+    /// Unset or empty: no `--slice`.
     pub daemon_scope_slice: Option<String>,
     pub agent_name: Option<String>,
     pub identity: Option<String>,
@@ -1625,9 +1628,10 @@ impl Default for SynapsConfig {
 /// `.slice`, only `[A-Za-z0-9:_.-]` (so no `/`), not starting with `-` and
 /// not the root slice `-.slice`; as in systemd's own check, the part before
 /// `.slice` is not empty, has no `--` and doesn't end in `-` (a `-` separates
-/// the parent slices: `worker-agent.slice` nests under `worker.slice`). The
+/// the parent slices: `synaps-tools.slice` nests under `synaps.slice`). The
 /// config file is not TOML, so a quoted value keeps its quotes and gets its
-/// own hint.
+/// own hint. An empty value never reaches this check: the parser takes it
+/// as "unset".
 pub fn scope_slice_problem(name: &str) -> Option<&'static str> {
     if name.len() > 255 {
         return Some("longer than 255 bytes");
@@ -2440,13 +2444,24 @@ fn apply_config_content_with(
                     "process_scopes = {val} — expected auto or off; keeping the previous value (default auto)"
                 )),
             },
-            "tool_scope_slice" | "daemon_scope_slice" => match scope_slice_problem(val) {
-                None if key == "tool_scope_slice" => config.tool_scope_slice = Some(val.to_string()),
-                None => config.daemon_scope_slice = Some(val.to_string()),
-                Some(why) => config.warnings.push(format!(
-                    "{key} = {val} — {why}; keeping the previous value (default: no slice, systemd's default placement)"
-                )),
-            },
+            "tool_scope_slice" | "daemon_scope_slice" => {
+                let field = if key == "tool_scope_slice" {
+                    &mut config.tool_scope_slice
+                } else {
+                    &mut config.daemon_scope_slice
+                };
+                // `key =` with nothing after it unsets the key (no warning),
+                // so a later line can undo an earlier one.
+                if val.is_empty() {
+                    *field = None;
+                } else if let Some(why) = scope_slice_problem(val) {
+                    config.warnings.push(format!(
+                        "{key} = {val} — {why}; keeping the previous value (default: no slice, systemd's default placement)"
+                    ));
+                } else {
+                    *field = Some(val.to_string());
+                }
+            }
             // Read directly by the keybind registry (`read_config_value`);
             // recognised here so the /settings row never trips the
             // unknown-key warning.
@@ -3266,11 +3281,14 @@ mod tests {
         let c = super::load_config_from_str("");
         assert_eq!((c.tool_scope_slice, c.daemon_scope_slice), (None, None));
         let c = super::load_config_from_str(
-            "tool_scope_slice = worker-agent.slice\ndaemon_scope_slice = synaps:daemon_1.slice\n",
+            "tool_scope_slice = synaps_tools.slice\ndaemon_scope_slice = synaps:daemon_1.slice\n",
         );
         assert!(c.warnings.is_empty(), "{:?}", c.warnings);
-        assert_eq!(c.tool_scope_slice.as_deref(), Some("worker-agent.slice"));
+        assert_eq!(c.tool_scope_slice.as_deref(), Some("synaps_tools.slice"));
         assert_eq!(c.daemon_scope_slice.as_deref(), Some("synaps:daemon_1.slice"));
+        // A nested name is valid too (the docs say why a flat one is better).
+        let c = super::load_config_from_str("tool_scope_slice = synaps-tools.slice\n");
+        assert_eq!((c.warnings.len(), c.tool_scope_slice.as_deref()), (0, Some("synaps-tools.slice")));
         // Each key sets only its own field.
         let c = super::load_config_from_str("tool_scope_slice = a.slice\n");
         assert_eq!((c.tool_scope_slice.as_deref(), c.daemon_scope_slice.as_deref()), (Some("a.slice"), None));
@@ -3301,7 +3319,6 @@ mod tests {
             "worker--agent.slice",
             "worker-.slice",
             too_long.as_str(),   // 256 bytes
-            "",                  // empty
             "wörker.slice",      // non-ASCII
             "worker\0.slice",    // NUL
             "\"worker-agent.slice\"", // quoted: the file is not TOML
@@ -3321,6 +3338,30 @@ mod tests {
             }
         }
         assert!(accepted.is_empty(), "accepted: {accepted:?}");
+    }
+
+    #[test]
+    fn an_empty_scope_slice_unsets_the_key_without_a_warning() {
+        for key in ["tool_scope_slice", "daemon_scope_slice"] {
+            for empty in [format!("{key} ="), format!("{key} =   "), format!("  {key}=")] {
+                // Alone: unset, silently.
+                let c = super::load_config_from_str(&format!("{empty}\n"));
+                assert!(c.warnings.is_empty(), "{empty:?}: {:?}", c.warnings);
+                assert_eq!((c.tool_scope_slice.as_deref(), c.daemon_scope_slice.as_deref()), (None, None), "{empty:?}");
+                // After a valid line: that line is undone, the other key kept.
+                let c = super::load_config_from_str(&format!(
+                    "tool_scope_slice = synaps_tools.slice\ndaemon_scope_slice = synaps_daemon.slice\n{empty}\n"
+                ));
+                assert!(c.warnings.is_empty(), "{empty:?}: {:?}", c.warnings);
+                let (unset, kept) = if key == "tool_scope_slice" {
+                    (&c.tool_scope_slice, c.daemon_scope_slice.as_deref())
+                } else {
+                    (&c.daemon_scope_slice, c.tool_scope_slice.as_deref())
+                };
+                assert_eq!(unset, &None, "{empty:?}");
+                assert!(kept.is_some_and(|k| k.starts_with("synaps_")), "{empty:?}: {kept:?}");
+            }
+        }
     }
 
     #[test]
