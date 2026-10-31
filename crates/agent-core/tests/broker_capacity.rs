@@ -650,6 +650,79 @@ async fn a_cooldown_survives_a_token_rotation_of_a_login_without_an_account_id()
     );
 }
 
+/// Review fix 5: while a cooldown is active, a turn asks for its account's
+/// cooldown before every request. The stored login is read once per
+/// version of auth.json, not per lookup or twice per account per
+/// selection; a write (a rotation) is read again, and the cooldown still
+/// follows the login.
+#[tokio::test]
+#[serial_test::serial]
+async fn cooldown_lookups_read_the_stored_login_once_per_version_of_auth_json() {
+    let home = install_accounts(&[("a", FAR_FUTURE), ("b", FAR_FUTURE)]);
+    let script: Script = Arc::default();
+    for label in ["a", "b"] {
+        script.lock().unwrap().insert(label, roomy());
+    }
+    let broker = auto_broker(&spawn_usage(script).await);
+    // Nothing cooling: no read at all.
+    assert_eq!(broker.active_cooldown(&anthropic("a")), None);
+    assert_eq!(broker.cooldown_seat_loads_for_tests(), 0);
+
+    let until = agent_core::epoch_millis() + 3_600_000;
+    broker
+        .report_cooldown(&anthropic("a"), Some(until), "anthropic_quota_exhausted")
+        .await
+        .unwrap();
+    let after_report = broker.cooldown_seat_loads_for_tests();
+    assert_eq!(after_report, 1, "a's login, read once");
+    for _ in 0..10 {
+        assert_eq!(broker.active_cooldown(&anthropic("a")), Some(until));
+        assert_eq!(broker.active_cooldown(&anthropic("b")), None);
+    }
+    assert_eq!(broker.cooldown_seat_loads_for_tests(), 2, "plus b's, once");
+    // A selection looks both accounts up without reading either again.
+    assert_eq!(turn(&broker).await, anthropic("b"));
+    broker.plan(OAuthProviderId::Anthropic, None).await.unwrap();
+    assert_eq!(broker.cooldown_seat_loads_for_tests(), 2);
+
+    // Another process rotates a's login: a new version, read again.
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    store_tokens(
+        &home,
+        "a",
+        "rotated-anthropic-a-access",
+        "refresh-anth-a-rotated-SECRET",
+        FAR_FUTURE,
+    );
+    assert_eq!(broker.active_cooldown(&anthropic("a")), Some(until));
+    assert_eq!(broker.cooldown_seat_loads_for_tests(), 3);
+    assert_eq!(broker.active_cooldown(&anthropic("a")), Some(until));
+    assert_eq!(broker.cooldown_seat_loads_for_tests(), 3);
+}
+
+/// Review fix 1: `clear_cooldown` drops a cooldown only for a request sent
+/// after it was reported (one sent before proves nothing about it), and
+/// only the account's own.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_cooldown_is_cleared_only_by_a_request_sent_after_it() {
+    let _home = install_accounts(&[("a", FAR_FUTURE), ("b", FAR_FUTURE)]);
+    let broker = auto_broker(&spawn_usage(Arc::default()).await);
+    let until = agent_core::epoch_millis() + 3_600_000;
+    let before = agent_core::epoch_millis() - 1_000;
+    for label in ["a", "b"] {
+        broker
+            .report_cooldown(&anthropic(label), Some(until), "anthropic_quota_exhausted")
+            .await
+            .unwrap();
+    }
+    broker.clear_cooldown(&anthropic("a"), before);
+    assert_eq!(broker.active_cooldown(&anthropic("a")), Some(until), "sent before the report");
+    broker.clear_cooldown(&anthropic("a"), agent_core::epoch_millis());
+    assert_eq!(broker.active_cooldown(&anthropic("a")), None);
+    assert_eq!(broker.active_cooldown(&anthropic("b")), Some(until), "b's stays");
+}
+
 /// Log `label` in again: new tokens, and `account_id` (None: no id).
 fn relogin(home: &tempfile::TempDir, label: &str, tag: &str, account_id: Option<&str>) {
     store_tokens(
@@ -1522,13 +1595,15 @@ async fn a_refused_refresh_of_the_chosen_account_moves_the_selection_to_another(
     assert_secret_free(&report.to_string());
 }
 
-/// S2 (ruled: ANY refresh kind, not only a refused login): a transient
-/// refresh failure of the chosen account (the token endpoint answers 503)
-/// also moves the selection to another account with proven capacity. One
-/// refresh attempt, one WARN with the transient kind, no selection failure.
+/// Review fix 3: a retryable refresh failure (here the token endpoint is
+/// overloaded) of the chosen account does not move the selection: it says
+/// nothing against the account, and moving would cost the turn its cache.
+/// The selection fails with the refresh's own kind (not a selection
+/// failure such as `usage_read_failed`) after one refresh attempt; b is
+/// never vended.
 #[tokio::test]
 #[serial_test::serial]
-async fn a_transient_refresh_failure_of_the_chosen_account_also_moves_the_selection() {
+async fn a_transient_refresh_failure_of_the_chosen_account_fails_without_moving() {
     let home = install_accounts(&[("a", FAR_FUTURE), ("b", FAR_FUTURE)]);
     let script: Script = Arc::default();
     for label in ["a", "b"] {
@@ -1551,13 +1626,13 @@ async fn a_transient_refresh_failure_of_the_chosen_account_also_moves_the_select
             .await
             .expect("the selection terminates")
     };
-    let second = second.expect("b has proven capacity");
-    assert_eq!(second.credential, anthropic("b"));
-    assert_eq!(
-        token_hits.load(Ordering::SeqCst),
-        1,
-        "one refresh attempt, for a"
-    );
+    let err = second.expect_err("a's refresh failed; b is not tried");
+    let BrokerError::Refresh(f) = &err else {
+        panic!("the refresh's own failure: {err:?}");
+    };
+    assert_eq!(f.kind, agent_core::auth::RefreshFailureKind::Transient, "{err:?}");
+    assert!(err.to_string().contains("account 'a'"), "{err}");
+    assert_eq!(token_hits.load(Ordering::SeqCst), 1, "one refresh attempt, for a");
     let log = capture.take();
     let failed: Vec<_> = log
         .lines()
@@ -1570,11 +1645,42 @@ async fn a_transient_refresh_failure_of_the_chosen_account_also_moves_the_select
             && failed[0].contains("kind=refresh_transient"),
         "{log}"
     );
-    assert!(
-        !log.contains("auth_selection_failed"),
-        "the selection did not fail: {log}"
-    );
+    assert!(!log.contains("selecting again"), "{log}");
     assert_secret_free(&log);
+    let state = serde_json::to_value(broker.auth_state(&anthropic_query()).unwrap()).unwrap();
+    assert!(
+        state.to_string().contains("refresh_transient"),
+        "auth state records the vend failure: {state}"
+    );
+}
+
+/// Review fix 3, one account: a served, then its token expired (its
+/// reading stays cached, so the vend must refresh) and the token endpoint
+/// is overloaded. The selection reports the refresh's own kind
+/// (`refresh_transient`), not a selection failure (`usage_read_failed`).
+#[tokio::test]
+#[serial_test::serial]
+async fn the_only_accounts_transient_refresh_failure_keeps_its_kind() {
+    let home = install_accounts(&[("a", FAR_FUTURE)]);
+    let script: Script = Arc::default();
+    script.lock().unwrap().insert("a", roomy());
+    let (token_url, token_hits) = spawn_token(503, r#"{"error":"overloaded"}"#).await;
+    let broker =
+        auto_broker(&spawn_usage(script).await).with_anthropic_token_url_for_tests(token_url);
+    assert_eq!(turn(&broker).await, anthropic("a"));
+    expire_stored(&home, "a");
+    let err = tokio::time::timeout(
+        SELECTION_DEADLINE,
+        broker.access_token_pinned(OAuthProviderId::Anthropic),
+    )
+    .await
+    .expect("the selection terminates")
+    .expect_err("a's refresh fails");
+    assert_eq!(token_hits.load(Ordering::SeqCst), 1);
+    let BrokerError::Refresh(f) = &err else {
+        panic!("the refresh's own kind, not a selection failure: {err:?}");
+    };
+    assert_eq!(f.kind, agent_core::auth::RefreshFailureKind::Transient, "{err:?}");
 }
 
 /// Every chosen account's refresh is refused: the selection ends (no loop)
@@ -1874,7 +1980,10 @@ async fn a_changed_stored_login_ends_the_hold() {
 async fn a_retryable_refresh_failure_is_not_held() {
     let (_home, broker, token_hits) =
         a_served_then_expired(503, r#"{"error":"overloaded"}"#).await;
-    assert_eq!(turn(&broker).await, anthropic("b"));
+    // A retryable failure does not move the selection (review fix 3).
+    lookup_without_b(&broker)
+        .await
+        .expect_err("a's refresh fails");
     assert_eq!(token_hits.load(Ordering::SeqCst), 1);
     assert!(account_state(&broker, "a").get("refresh_hold").is_none());
 

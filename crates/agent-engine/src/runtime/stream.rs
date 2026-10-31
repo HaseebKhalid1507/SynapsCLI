@@ -7862,6 +7862,10 @@ mod rich_output_tests {
             /// Release the held ping when the round's end starts waiting
             /// for it.
             release_held_on_finish: bool,
+            /// The turn runs on a subscription login whose account is
+            /// cooling down (an explicit selector: the turn itself is not
+            /// moved, only its pings are concerned).
+            account_cooling: bool,
         }
 
         /// `(input, read, write)` of a request or a `Usage` event.
@@ -7923,6 +7927,32 @@ mod rich_output_tests {
                 "claude-sonnet-4-6",
             );
             session.cancel = cancel;
+            if opts.account_cooling {
+                let seat = crate::auth::CredentialRef::default_for(crate::auth::OAuthProviderId::Anthropic);
+                session.auth = Arc::new(RwLock::new(AuthState {
+                    auth_token: "oauth-test-token".into(),
+                    auth_type: "oauth".into(),
+                    refresh_token: None,
+                    token_expires: Some(9_999_999_999_999),
+                    auth_file_mtime: None,
+                    bound_credential: Some(crate::runtime::auth::anthropic_binding(
+                        &session.credential_source,
+                        &seat,
+                    )),
+                }));
+                // One credential authority for the turn and its requests,
+                // as in production (the harness builds two).
+                session.options.token_cache = session.token_cache.clone();
+                session.options.credential_source = session.credential_source.clone();
+                crate::auth::broker_from_source(
+                    &session.credential_source,
+                    &session.token_cache,
+                    reqwest::Client::new(),
+                )
+                .report_cooldown(&seat, Some(crate::epoch_millis() + 3_600_000), "test")
+                .await
+                .unwrap();
+            }
             session.system_prompt = Some(format!("a worker\n{}", "context ".repeat(4000)));
             let hook = Arc::new(tokio::sync::Notify::new());
             session.tool_keepwarm = opts.interval.map(|interval| ToolKeepWarm {
@@ -8030,6 +8060,28 @@ mod rich_output_tests {
             .await;
             assert_eq!(run.requests.len(), 2, "no ping: {:?}", run.pings().len());
             assert!(run.requests[1].read >= run.requests[0].cached_prefix());
+            run.assert_quiet().await;
+        }
+
+        /// Review fix 2: a tool-round ping never selects or re-binds an
+        /// account, and stops when the turn's account is cooling down. The
+        /// round still runs (an explicit selector keeps the turn on it); no
+        /// ping goes out.
+        #[tokio::test]
+        #[serial_test::serial(synaps_base_dir)]
+        async fn a_round_on_a_cooling_account_sends_no_ping() {
+            let _base = crate::test_env::BaseDirGuard::new();
+            let run = run(
+                Script::short(),
+                Opts {
+                    interval: Some(INTERVAL),
+                    tool_tail: Duration::from_millis(300),
+                    account_cooling: true,
+                    ..Default::default()
+                },
+            )
+            .await;
+            assert_eq!(run.requests.len(), 2, "no ping: {:?}", run.pings().len());
             run.assert_quiet().await;
         }
 
