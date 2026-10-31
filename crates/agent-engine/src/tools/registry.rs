@@ -1368,6 +1368,22 @@ mod tests {
         }
     }
 
+    /// `disabled_tools = multi_edit` removes it from workers too, on both
+    /// worker paths (host `worker_set`, legacy `subagent_tools`), while
+    /// `edit`/`write` stay.
+    #[tokio::test]
+    async fn disabled_multi_edit_is_gone_from_workers_too() {
+        let disabled = vec!["multi_edit".to_string()];
+        let worker = ToolRegistry::worker_set(&ToolRegistry::empty(), &disabled);
+        let legacy = crate::tools::subagent::subagent_tools(&disabled).await;
+        for registry in [worker, legacy] {
+            assert!(registry.get("multi_edit").is_none());
+            assert!(!registry.tools_schema().iter().any(|t| t["name"] == "multi_edit"));
+            assert!(registry.get("edit").is_some() && registry.get("write").is_some());
+        }
+        assert!(ToolRegistry::worker_set(&ToolRegistry::empty(), &[]).get("multi_edit").is_some());
+    }
+
     #[cfg(feature = "command-exec")]
     #[test]
     fn forum_membership_preserves_worker_bounds_and_foreground_disclosure() {

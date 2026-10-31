@@ -32,7 +32,7 @@ Per edit:
 | `anchor` | replace, insert_* | What to find. Never expanded. |
 | `anchor_mode` | replace, insert_* | `exact` (default), `line_prefix`, `line_regex` |
 | `occurrence` | replace, insert_* | 1-based: use the Nth match instead of requiring exactly one |
-| `text` | all but append_jsonl | Inserted or replacement text, verbatim |
+| `text` | all but append_jsonl | Inserted or replacement text (see [Inserting](#inserting) and [Line endings](#line-endings)) |
 | `value` | append_jsonl | The row, a JSON object |
 | `timestamp_field` | append_jsonl | Field set to the call's clock (ISO 8601, local) |
 | `unless_present` | all | Skip this edit if this text is already in the file |
@@ -46,9 +46,8 @@ silently ignored. Unused optional fields may be omitted or `null`.
 - `exact`: substring match. Overlapping matches count (`aa` occurs twice in
   `aaa`).
 - `line_prefix`: lines that start with the anchor. The span is the line
-  without its terminator (`\n` or `\r\n`), so `replace` keeps the line ending,
-  and `insert_after` inserts after the terminator (a `\n` is added after an
-  unterminated last line first).
+  without its terminator (`\n` or `\r\n`), so `replace` keeps the line
+  ending.
 - `line_regex`: a regex tried on each line separately, so it never matches
   across a newline. With one capture group only the group is the span (use
   this to replace an unknown value inside a known line); more than one group
@@ -65,6 +64,45 @@ of each edit.
 `unless_present` is checked against the file's content at that point in the
 call. A hit makes the edit a reported skip, not a failure, so re-running the
 same call is safe.
+
+## Inserting
+
+`insert_before` and `insert_after` follow one rule in every anchor mode:
+
+- **Text that ends in a newline is whole lines.** It goes in at a line
+  boundary: `insert_before` at the start of the line where the match starts,
+  `insert_after` after the line where the match ends (after its terminator).
+  An anchor that already ends with its newline (`"line one\n"`) is already at
+  a boundary. `insert_after` on an unterminated last line adds the newline
+  first (reported as "added newline after the last line"). When the
+  insertion moves off a mid-line match, the result line says so ("text ends
+  in a newline: inserted after the anchor's line").
+- **Other text goes right at the match**: before its first byte or after its
+  last. For `line_prefix` the match is the line's content, so that is the
+  start or end of the line (before its terminator).
+
+So `{"op": "insert_after", "anchor": "line one", "text": "line 1.5\n"}` on
+`line one\nline two\n` gives `line one\nline 1.5\nline two\n`, and
+`"text": "!"` gives `line one!\nline two\n`. To split a line mid-way, use
+`replace`.
+
+`append` adds a missing final newline before its text, like `append_jsonl`
+does before its row ("added missing newline before the text"), unless the
+text starts with a newline itself. An empty file gets nothing extra.
+
+## Line endings
+
+A file whose dominant line ending is CRLF (more `\r\n` than bare `\n`,
+counted once when the file is read) gets CRLF wherever an edit writes a
+newline: every `\n` in `text` that isn't already part of `\r\n` is written as
+`\r\n`, and so is every newline an edit adds itself (`append`'s and
+`append_jsonl`'s repair and row terminator, `insert_after`'s newline after
+an unterminated last line). An `exact` anchor and `unless_present` are read
+the same way, so an anchor or guard written with `\n` matches the file's
+`\r\n`. `line_prefix` and `line_regex` see one line at a time without its
+terminator, so they are unaffected. An LF file (or a tie, or a new file) is
+written as given. `edit` and `write` do no line-ending handling; their text
+is always written verbatim.
 
 ## Placeholders
 
@@ -183,7 +221,8 @@ written per call. The read limits are checked from each file's size before
 it is read, and at most one byte past a limit is read, so a file that grows
 in between is still refused. These are input limits, not a bound on the
 process's memory: planning holds each file's original and edited copies and
-the anchor matches. Files must be UTF-8.
+the anchor matches. Files must be UTF-8. The tool's description states every one of these limits, so a
+call that would exceed them isn't sent in the first place.
 
 ## Classification
 
@@ -196,11 +235,27 @@ the anchor matches. Files must be UTF-8.
   path, as given, as resolved, or as its real target with symlinks followed,
   overlaps that scope.
 - Compaction lists every `edits[].path` among the modified files.
+- Read dedupe (`read_dedupe`) treats it like `edit` and `write`: a
+  successful result ends with "Every edit above was applied as reported; no
+  need to re-read the files to verify.", and a `read` after it is compared
+  against the file's new content, so it is never answered with an
+  "unchanged" stub of an earlier read.
+- Tool-output spill: not in `SPILL_BUILTINS`. Like `edit`/`write`, its
+  result (one short line per edit) stays whole in history.
+- `disabled_tools = multi_edit` removes it from the foreground and from
+  every worker.
 
 ## Hooks
 
-Extension `before_tool_call` / `after_tool_call` hooks with a `tool` filter
-match by tool name. A hook registered for `edit` or `write` does not see
-`multi_edit` calls; add `{"hook": "before_tool_call", "tool": "multi_edit"}`
-to cover it. The arguments are plain fields (`edits[].path`, `op`, `anchor`,
-`text`) so a hook can summarise them per file.
+Extension hooks with a `tool` filter match by tool name, with one
+exception: a `before_tool_call` hook filtered to `edit` or `write` also runs
+for `multi_edit`, so a guard written before `multi_edit` existed still
+blocks or confirms it (and a headless confirm still fails closed). That
+hook sees the `multi_edit` call (`tool_name` `multi_edit`, its own input),
+not an `edit`-shaped one: the paths are in `edits[].path`, with `op`,
+`anchor` and `text` per edit, so a hook can check each file. A `modify`
+written for `edit`'s input shape (a top-level `path`) is refused by
+`multi_edit` as an unknown parameter, so nothing is written. `after_tool_call`
+filters stay exact: an output transform for `edit` does not see
+`multi_edit`; register `{"hook": "after_tool_call", "tool": "multi_edit"}`
+for that.
