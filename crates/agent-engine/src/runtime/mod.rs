@@ -725,6 +725,10 @@ pub struct Runtime {
     /// Current worker handle for bounded delegation-tree accounting. `None`
     /// for foreground roots.
     delegation_parent: Option<String>,
+    /// Where tool calls report the processes they spawn: the owning daemon
+    /// session's route (a worker's carries its handle id). `None` outside a
+    /// session actor.
+    child_route: Option<crate::session::child_events::ChildRoute>,
     /// Session-scoped, per-extension "Allow all" latch for extension
     /// `Confirm` gates (`before_tool_call`). An extension id is added when
     /// the user picks "Allow all from <ext>" in the Confirm dialog; shared by
@@ -1313,6 +1317,7 @@ impl Runtime {
             deferred_tool_loading: true,
             activation_confirm: agent_core::config::ActivationConfirm::default(),
             delegation_parent: None,
+            child_route: None,
             session_allow_all: std::sync::Arc::new(crate::tools::SessionConfirmLatch::new()),
             mcp_runtime: None,
             mcp_session_scope: None,
@@ -1684,6 +1689,16 @@ impl Runtime {
 
     pub fn set_delegation_parent(&mut self, parent: Option<String>) {
         self.delegation_parent = parent;
+    }
+
+    /// Route spawned-child reports to a daemon session (see
+    /// `session::child_events`). Clones share it.
+    pub fn set_child_route(&mut self, route: Option<crate::session::child_events::ChildRoute>) {
+        self.child_route = route;
+    }
+
+    pub fn child_route(&self) -> Option<&crate::session::child_events::ChildRoute> {
+        self.child_route.as_ref()
     }
 
     pub fn orchestration(&self) -> Option<&Arc<crate::orchestration::OrchestrationRuntime>> {
@@ -2882,6 +2897,15 @@ impl Runtime {
         self.apply_config_inner(config, false);
     }
 
+    /// The step of `apply_config` that picks the model: the config's `model`,
+    /// else the runtime default. `EngineHost::new_session_model` runs the
+    /// same step, so it names what a new session gets.
+    pub(crate) fn apply_config_model(&mut self, config: &crate::config::SynapsConfig) {
+        if let Some(ref model) = config.model {
+            self.set_model(model.clone());
+        }
+    }
+
     fn apply_config_inner(&mut self, config: &crate::config::SynapsConfig, disable_tools: bool) {
         // #112: apply memory backend config early (binding is immutable once set).
         self.apply_memory_backend_config(&config.memory_backend);
@@ -2898,9 +2922,7 @@ impl Runtime {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         }
-        if let Some(ref model) = config.model {
-            self.set_model(model.clone());
-        }
+        self.apply_config_model(config);
         // Named level takes priority over raw budget.
         // Config-specified thinking is an explicit user choice — preserve across model switches.
         if let Some(level) = config.thinking_level {
@@ -4825,6 +4847,7 @@ impl Runtime {
             telemetry_level: self.telemetry_level,
             orchestration: self.orchestration.clone(),
             delegation_parent: self.delegation_parent.clone(),
+            child_route: self.child_route.clone(),
             turn_correlation_id: turn_correlation_id.clone(),
             progressive_tool_disclosure: self.progressive_tool_disclosure,
             deferred_tool_loading: self.deferred_tool_loading,
@@ -4964,6 +4987,7 @@ impl Clone for Runtime {
             deferred_tool_loading: self.deferred_tool_loading,
             activation_confirm: self.activation_confirm,
             delegation_parent: self.delegation_parent.clone(),
+            child_route: self.child_route.clone(),
             session_allow_all: self.session_allow_all.clone(),
             mcp_runtime: self.mcp_runtime.clone(),
             // Clones SHARE the durable session scope: dropping one clone or

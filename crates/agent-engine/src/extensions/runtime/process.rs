@@ -845,6 +845,10 @@ impl ProcessExtension {
         let mut child = cmd
             .spawn()
             .map_err(|e| format!("Failed to spawn extension '{}': {}", id, e))?;
+        // Host list of the `children` query (labels only).
+        if let Some(pid) = child.id() {
+            crate::session::children::record_host(crate::session::children::HostOwnerKind::Extension, id, pid);
+        }
 
         let stdin = child
             .stdin

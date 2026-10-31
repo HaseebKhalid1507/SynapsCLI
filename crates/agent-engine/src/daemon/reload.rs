@@ -168,6 +168,10 @@ pub struct ReloadState {
     /// carried workers only.
     #[serde(default)]
     pub next_subagent_id: u64,
+    /// The spawned-child ledger (`session::children`), within its caps. An
+    /// older image ignores the field; a state without it restores none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub children: Vec<crate::session::children::ChildRecord>,
 }
 
 impl ReloadState {
@@ -479,6 +483,7 @@ pub async fn prepare(
         expected_clients: state.connections.load(Ordering::SeqCst),
         // After every checkpoint: no session can launch a worker any more.
         next_subagent_id: crate::tools::peek_next_subagent_id(),
+        children: crate::session::children::snapshot_for_reload(),
     };
     let rs_path = reload_state_path(paths);
     // If either write fails we early-return WITHOUT reaching exec() (which is the
@@ -1062,6 +1067,7 @@ mod tests {
             sessions: vec![session(vec![worker("sa_288"), worker("sa_286")]), session(vec![])],
             expected_clients: 0,
             next_subagent_id: 0,
+            children: Vec::new(),
         };
         assert_eq!(rs.subagent_id_floor(), 289);
         rs.next_subagent_id = 300;
@@ -1300,5 +1306,55 @@ mod tests {
         let (stuck, _ep) = SessionHandle::new(meta_for(&id), view_for());
         while stuck.send(SessionCommand::Save).await.is_ok() {}
         assert!(!send_reload_aborted(&stuck, Duration::from_millis(100)).await);
+    }
+
+    /// The child ledger rides in the reload state, and the state stays
+    /// readable both ways: the previous image's struct (no `children`, no
+    /// `deny_unknown_fields`) reads a new state, and a state written by the
+    /// previous image reads as no children.
+    #[test]
+    fn the_child_ledger_rides_in_the_reload_state_and_old_images_ignore_it() {
+        use crate::session::children::{ChildIdentity, ChildRecord, ChildState};
+        /// `ReloadState` as of the image before the child ledger.
+        #[derive(Deserialize, Serialize)]
+        struct PreviousReloadState {
+            generation: u64,
+            written_at: chrono::DateTime<chrono::Utc>,
+            sessions: Vec<ReloadSession>,
+            expected_clients: usize,
+            #[serde(default)]
+            next_subagent_id: u64,
+        }
+        let record = ChildRecord {
+            session_id: "s1".into(),
+            tool_id: "toolu_1".into(),
+            tool_name: "bash".into(),
+            handle_id: Some("sa_2".into()),
+            shell_session_id: None,
+            child: ChildIdentity { pid: 42, start_ticks: 7, boot_id: "b".into(), sid: 42, pgid: 42 },
+            state: ChildState::Ended,
+            exit_code: Some(0),
+            signal: None,
+        };
+        let new = ReloadState {
+            generation: 3,
+            written_at: chrono::Utc::now(),
+            sessions: Vec::new(),
+            expected_clients: 1,
+            next_subagent_id: 9,
+            children: vec![record.clone()],
+        };
+        let body = serde_json::to_string(&new).unwrap();
+        assert!(body.contains("\"children\""), "{body}");
+        let back: ReloadState = serde_json::from_str(&body).unwrap();
+        assert_eq!(back.children, vec![record]);
+        let previous: PreviousReloadState = serde_json::from_str(&body).expect("the previous image reads a new state");
+        assert_eq!((previous.generation, previous.expected_clients, previous.next_subagent_id), (3, 1, 9));
+        let old_body = serde_json::to_string(&previous).unwrap();
+        let from_old: ReloadState = serde_json::from_str(&old_body).expect("a new image reads an old state");
+        assert!(from_old.children.is_empty());
+        assert_eq!(from_old.next_subagent_id, 9);
+        let empty = ReloadState { children: Vec::new(), ..back };
+        assert!(!serde_json::to_string(&empty).unwrap().contains("children"), "an empty ledger is omitted");
     }
 }

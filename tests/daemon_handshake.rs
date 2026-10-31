@@ -374,3 +374,274 @@ fn auth_state_cli_without_a_daemon_lists_accounts_and_refuses_to_clear() {
         "auth state wrote the credential store"
     );
 }
+
+/// `Welcome.features` lists "children", and the `children` query is a
+/// control frame answered before Attach and on an attached connection, from
+/// the process-wide ledger (session filter, sid filter, unknown session).
+/// Linux only, like the ledger: it reads identities from `/proc` and runs
+/// `setsid`.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[serial]
+async fn children_query_is_answered_before_and_after_attach() {
+    use agent_engine::session::children;
+    let guard = HomeGuard::new();
+    let d = start(&guard.base_dir().join("run")).await;
+    let sock = d.paths.sock.clone();
+    let me = children::identify(std::process::id()).expect("own stat");
+    // A live process leading its own session, for the second session's
+    // record. A made-up identity would be dropped by the ledger's sweep
+    // (a live pid with other start_ticks is a reused pid).
+    let mut sleeper = std::process::Command::new("setsid").args(["sleep", "30"]).spawn().expect("setsid sleep");
+    let other = {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(id) = children::identify(sleeper.id()).filter(|id| id.sid == id.pid) {
+                break id;
+            }
+            assert!(std::time::Instant::now() < deadline, "the setsid child never led its session");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+    assert_ne!(other.sid, me.sid);
+    let spawn = |tool_id: &str, child: children::ChildIdentity| children::ChildSpawn {
+        tool_id: tool_id.into(),
+        tool_name: "bash".into(),
+        handle_id: None,
+        shell_session_id: None,
+        child,
+    };
+    assert!(children::record_spawn("hs-children-a", spawn("t-me", me.clone())));
+    assert!(children::record_spawn("hs-children-b", spawn("t-other", other.clone())));
+
+    let mut c = Raw::connect(&sock).await;
+    c.send(&ClientFrame::Hello(Hello::new(ClientKind::Test))).await;
+    match c.recv().await {
+        Some(DaemonFrame::Welcome(w)) => assert!(w.features.iter().any(|f| f == "children"), "{:?}", w.features),
+        other => panic!("{other:?}"),
+    }
+    c.send(&ClientFrame::Children { id: Some(11), session_id: Some("hs-children-a".into()), sid: None, members: true })
+        .await;
+    match c.recv().await {
+        Some(DaemonFrame::ChildList(r)) => {
+            assert_eq!((r.id, r.supported, r.boot_id.as_deref()), (Some(11), true, Some(me.boot_id.as_str())));
+            assert_eq!(r.sessions.len(), 1);
+            let entry = &r.sessions[0].children[0];
+            assert_eq!((entry.tool_id.as_str(), &entry.child), ("t-me", &me));
+            let members = entry.members.as_ref().expect("members asked for");
+            assert!(members.iter().any(|m| m.pid == me.pid && m.start_ticks == me.start_ticks));
+            assert!(r.host.is_empty(), "the host list comes only without a session filter");
+        }
+        other => panic!("{other:?}"),
+    }
+    c.send(&ClientFrame::Children { id: None, session_id: None, sid: Some(me.sid), members: false }).await;
+    match c.recv().await {
+        Some(DaemonFrame::ChildList(r)) => {
+            let ids: Vec<&str> = r.sessions.iter().map(|s| s.session_id.as_str()).collect();
+            assert!(ids.contains(&"hs-children-a") && !ids.contains(&"hs-children-b"), "{ids:?}");
+            assert!(r.sessions.iter().flat_map(|s| &s.children).all(|e| e.child.sid == me.sid && e.members.is_none()));
+        }
+        other => panic!("{other:?}"),
+    }
+    c.send(&ClientFrame::Children { id: Some(12), session_id: Some("hs-no-such".into()), sid: None, members: false })
+        .await;
+    assert!(matches!(c.recv().await, Some(DaemonFrame::ChildList(r)) if r.id == Some(12) && r.sessions.is_empty()));
+
+    // On an attached connection too.
+    c.send(&ClientFrame::Attach(Attach::Create { config: SessionConfig::default(), mode: AttachMode::Mirror })).await;
+    assert!(matches!(c.recv().await, Some(DaemonFrame::Attached(_))));
+    c.send(&ClientFrame::Children { id: Some(13), session_id: Some("hs-children-b".into()), sid: None, members: false })
+        .await;
+    loop {
+        match c.recv().await {
+            Some(DaemonFrame::Event(_)) => continue,
+            Some(DaemonFrame::ChildList(r)) => {
+                assert_eq!(r.id, Some(13));
+                let entry = &r.sessions[0].children[0];
+                assert_eq!((entry.tool_id.as_str(), &entry.child, entry.state), ("t-other", &other, children::ChildState::Running));
+                break;
+            }
+            frame => panic!("{frame:?}"),
+        }
+    }
+    c.send(&ClientFrame::Bye).await;
+    d.shutdown_token().cancel();
+    d.wait().await;
+    let _ = sleeper.kill();
+    let _ = sleeper.wait();
+}
+
+/// Where the ledger is not supported (off Linux), `Welcome.features` omits
+/// "children" and a `children` query is still answered, with
+/// `supported: false` and nothing listed. Runs everywhere: on Linux the
+/// feature and the reply agree with `children::supported()`.
+#[tokio::test]
+#[serial]
+async fn the_children_feature_and_reply_follow_ledger_support() {
+    use agent_engine::session::children;
+    let supported = children::supported();
+    if !cfg!(target_os = "linux") {
+        assert!(!supported, "the ledger is Linux only");
+    }
+    let guard = HomeGuard::new();
+    let d = start(&guard.base_dir().join("run")).await;
+    let mut c = Raw::connect(&d.paths.sock).await;
+    c.send(&ClientFrame::Hello(Hello::new(ClientKind::Test))).await;
+    match c.recv().await {
+        Some(DaemonFrame::Welcome(w)) => assert_eq!(w.features.iter().any(|f| f == "children"), supported, "{:?}", w.features),
+        other => panic!("{other:?}"),
+    }
+    c.send(&ClientFrame::Children { id: Some(31), session_id: Some("hs-no-such".into()), sid: None, members: true })
+        .await;
+    match c.recv().await {
+        Some(DaemonFrame::ChildList(r)) => {
+            assert_eq!((r.id, r.supported, r.boot_id.is_some()), (Some(31), supported, supported));
+            assert!(r.sessions.is_empty() && r.host.is_empty(), "{r:?}");
+        }
+        other => panic!("{other:?}"),
+    }
+    c.send(&ClientFrame::Bye).await;
+    d.shutdown_token().cancel();
+    d.wait().await;
+}
+
+/// `thinking_options` is a control frame (before Attach and attached).
+/// No model = what a new session on this daemon gets; a malformed id gets
+/// `options: null`; "thinking_options" is in `Welcome.features`.
+#[tokio::test]
+#[serial]
+async fn thinking_options_query_is_answered_before_and_after_attach() {
+    use agent_engine::runtime::openai::catalog::validation::{thinking_options_for_model, OptionsBasis};
+    let guard = HomeGuard::new();
+    let d = start(&guard.base_dir().join("run")).await;
+    let sock = d.paths.sock.clone();
+    let mut c = Raw::connect(&sock).await;
+    c.send(&ClientFrame::Hello(Hello::new(ClientKind::Test))).await;
+    match c.recv().await {
+        Some(DaemonFrame::Welcome(w)) => assert!(w.features.iter().any(|f| f == "thinking_options"), "{:?}", w.features),
+        other => panic!("{other:?}"),
+    }
+    c.send(&ClientFrame::ThinkingOptions { id: Some(21), model: None, warm: false }).await;
+    match c.recv().await {
+        Some(DaemonFrame::ThinkingOptionsResult { id, model, options }) => {
+            assert_eq!(id, Some(21));
+            assert_eq!(model, d.state.host.new_session_model());
+            assert_eq!(options.expect("answered").levels, thinking_options_for_model(&model));
+        }
+        other => panic!("{other:?}"),
+    }
+    c.send(&ClientFrame::ThinkingOptions { id: Some(22), model: Some("a b".into()), warm: false }).await;
+    assert!(matches!(
+        c.recv().await,
+        Some(DaemonFrame::ThinkingOptionsResult { id: Some(22), options: None, model }) if model == "a b"
+    ));
+    c.send(&ClientFrame::Attach(Attach::Create { config: SessionConfig::default(), mode: AttachMode::Mirror })).await;
+    assert!(matches!(c.recv().await, Some(DaemonFrame::Attached(_))));
+    c.send(&ClientFrame::ThinkingOptions { id: Some(23), model: Some("xai-auth/grok-4.5".into()), warm: false }).await;
+    loop {
+        match c.recv().await {
+            Some(DaemonFrame::Event(_)) => continue,
+            Some(DaemonFrame::ThinkingOptionsResult { id, options, .. }) => {
+                let options = options.expect("answered");
+                assert_eq!((id, options.basis, options.exact), (Some(23), OptionsBasis::Static, true));
+                assert_eq!(options.default_level.as_deref(), Some("high"));
+                break;
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    c.send(&ClientFrame::Bye).await;
+    d.shutdown_token().cancel();
+    d.wait().await;
+}
+
+/// C4a: `Welcome.accepted_events` is computed per connection, from that
+/// connection's own Hello: unknown names never appear in it, and a second
+/// connection's opt-in is its own.
+/// Optional events reach only the connections that listed them, one kind
+/// per name: three connections on one session, asking for nothing, for
+/// `tool_child_ended` only (plus an unknown name), and for both.
+#[tokio::test]
+#[serial]
+async fn optional_events_reach_only_the_connections_that_listed_them() {
+    use agent_engine::session::handle::echo::CHILD_EVENTS_PROMPT;
+    let guard = HomeGuard::new();
+    let d = start(&guard.base_dir().join("run")).await;
+    let sock = d.paths.sock.clone();
+    let hello = |names: &[&str]| ClientFrame::Hello(Hello::new(ClientKind::Test).with_accepted_events(names.iter().copied()));
+
+    let mut owner = Raw::connect(&sock).await;
+    owner.send(&hello(&[])).await;
+    assert!(matches!(owner.recv().await, Some(DaemonFrame::Welcome(_))));
+    owner.send(&ClientFrame::Attach(Attach::Create { config: SessionConfig::default(), mode: AttachMode::Mirror })).await;
+    let session_id = match owner.recv().await {
+        Some(DaemonFrame::Attached(a)) => a.meta.id,
+        other => panic!("{other:?}"),
+    };
+    let mut joined = Vec::new();
+    for names in [&["tool_child_ended", "bogus"][..], OPTIONAL_EVENTS] {
+        let mut c = Raw::connect(&sock).await;
+        c.send(&hello(names)).await;
+        assert!(matches!(c.recv().await, Some(DaemonFrame::Welcome(_))));
+        c.send(&ClientFrame::Attach(Attach::Existing { session_id: session_id.clone(), mode: AttachMode::Mirror })).await;
+        assert!(matches!(c.recv().await, Some(DaemonFrame::Attached(_))));
+        joined.push(c);
+    }
+    owner
+        .send(&ClientFrame::Cmd {
+            session_id: session_id.clone(),
+            cmd: SessionCommand::Submit { text: CHILD_EVENTS_PROMPT.into(), attachments: vec![] },
+        })
+        .await;
+    async fn child_events_until_done(c: &mut Raw) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        loop {
+            match c.recv().await {
+                Some(DaemonFrame::Event(env)) => match env.event {
+                    WireSessionEvent::ToolChild { .. } => out.push("tool_child"),
+                    WireSessionEvent::ToolChildEnded { .. } => out.push("tool_child_ended"),
+                    WireSessionEvent::Stream { event: WireStreamEvent::Session(WireSessionStreamEvent::Done) } => {
+                        return out
+                    }
+                    _ => {}
+                },
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+    assert!(child_events_until_done(&mut owner).await.is_empty(), "not asked for: none");
+    assert_eq!(child_events_until_done(&mut joined[0]).await, ["tool_child_ended"], "only the kind it named");
+    assert_eq!(child_events_until_done(&mut joined[1]).await, ["tool_child", "tool_child_ended"]);
+    for c in std::iter::once(&mut owner).chain(joined.iter_mut()) {
+        c.send(&ClientFrame::Bye).await;
+    }
+    d.shutdown_token().cancel();
+    d.wait().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn accepted_events_echo_is_per_connection_and_drops_unknown_names() {
+    let guard = HomeGuard::new();
+    let d = start(&guard.base_dir().join("run")).await;
+    let sock = d.paths.sock.clone();
+    let echo = |f: Option<DaemonFrame>| match f {
+        Some(DaemonFrame::Welcome(w)) => w.accepted_events,
+        other => panic!("{other:?}"),
+    };
+    let mut unknown = Raw::connect(&sock).await;
+    unknown.send(&ClientFrame::Hello(Hello::new(ClientKind::Test).with_accepted_events(["bogus", "tool_child_zz"]))).await;
+    assert!(echo(unknown.recv().await).is_empty());
+    let mut all = Raw::connect(&sock).await;
+    all.send(&ClientFrame::Hello(Hello::new(ClientKind::Test).with_accepted_events(OPTIONAL_EVENTS.iter().copied().chain(["bogus"])))).await;
+    let want: Vec<String> = OPTIONAL_EVENTS.iter().map(|s| s.to_string()).collect();
+    assert_eq!(echo(all.recv().await), want);
+    let mut none = Raw::connect(&sock).await;
+    none.send(&ClientFrame::Hello(Hello::new(ClientKind::Test))).await;
+    assert!(echo(none.recv().await).is_empty());
+    for c in [&mut unknown, &mut all, &mut none] {
+        c.send(&ClientFrame::Bye).await;
+    }
+    d.shutdown_token().cancel();
+    d.wait().await;
+}

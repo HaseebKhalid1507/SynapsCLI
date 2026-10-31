@@ -362,6 +362,32 @@ pub mod echo {
         }
     }
 
+    /// A `Submit` of this text also emits one `tool_child` and one
+    /// `tool_child_ended` before the echo (for the opt-in filter tests).
+    pub const CHILD_EVENTS_PROMPT: &str = "echo:child-events";
+
+    fn child_events() -> [SessionEventWire; 2] {
+        use crate::session::child_events::ChildProcessEvent;
+        use crate::session::children::{ChildIdentity, ChildSpawn};
+        let child = ChildIdentity { pid: 1, start_ticks: 1, boot_id: "echo".into(), sid: 1, pgid: 1 };
+        [
+            SessionEventWire::ChildProcess(ChildProcessEvent::Spawned(ChildSpawn {
+                tool_id: "toolu_echo".into(),
+                tool_name: "bash".into(),
+                handle_id: None,
+                shell_session_id: None,
+                child: child.clone(),
+            })),
+            SessionEventWire::ChildProcess(ChildProcessEvent::Ended {
+                tool_id: "toolu_echo".into(),
+                handle_id: None,
+                child,
+                exit_code: Some(0),
+                signal: None,
+            }),
+        ]
+    }
+
     pub fn spawn(id: SessionId) -> (SessionHandle, tokio::task::JoinHandle<()>) {
         let (handle, ep) = SessionHandle::new(meta_for(&id), view_for());
         let task = tokio::spawn(run(id, ep));
@@ -448,6 +474,11 @@ pub mod echo {
                     }
                 }
                 SessionCommand::Submit { text, .. } => {
+                    if text == CHILD_EVENTS_PROMPT {
+                        for event in child_events() {
+                            self.emit(event);
+                        }
+                    }
                     let baseline = self.conv.api_messages.len();
                     self.conv.api_messages.push(Arc::new(serde_json::json!({
                         "role": "user", "content": text

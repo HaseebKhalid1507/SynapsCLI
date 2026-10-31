@@ -373,6 +373,7 @@ impl SessionManager {
         let mut pty = PtyHandle::spawn_prepared(
             &command, opts.working_directory.as_deref(), rows, cols, prepared,
         )?;
+        pty.watch_child(tx_delta.and_then(|delta| delta.child_sink()), &id);
 
         // --- Build readiness detector (with per-session overrides) ---
         let silence_ms = opts
@@ -675,6 +676,53 @@ mod tests {
             cols: None,
             readiness_timeout_ms: None,
             idle_timeout: None,
+        }
+    }
+
+    /// shell_start reports its PTY child with the shell session id; the end
+    /// comes once, at shell_end (a kill) or at the child's own exit.
+    /// shell_end's hang-up is portable-pty's SIGHUP: an interactive bash
+    /// dies of it and reads signal 1, or, if it isn't reaped within the
+    /// drop's bounded wait, ends with its status unknown.
+    /// Serial with the PTY accounting tests: its unread prompt is retained
+    /// output while it runs.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_shell_child_is_reported_with_its_session_id_and_ends_once() {
+        use crate::session::child_events::{ChildProcessEvent, ChildRoute};
+        let (route, mut rx) = ChildRoute::channel("shell-test-session");
+        let mut tx = crate::tools::output::delta_channel().sender;
+        tx.set_child_sink(route.sink("toolu_shell", "shell_start"));
+        let mgr = default_manager();
+
+        let (id, _, _) = mgr.create_session(opts_for("bash --norc --noprofile"), Some(&tx), 256 * 1024).await.unwrap();
+        let spawned = match rx.try_recv().expect("tool_child at start") {
+            ChildProcessEvent::Spawned(spawn) => spawn,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!((spawned.tool_id.as_str(), spawned.tool_name.as_str()), ("toolu_shell", "shell_start"));
+        assert_eq!(spawned.shell_session_id.as_deref(), Some(id.as_str()));
+        assert_eq!((spawned.child.sid, spawned.child.pgid), (spawned.child.pid, spawned.child.pid), "a session leader");
+        assert!(rx.try_recv().is_err(), "nothing else while it runs");
+        mgr.close_session(&id).await.unwrap();
+        match rx.try_recv().expect("ended at shell_end") {
+            ChildProcessEvent::Ended { tool_id, child, exit_code, signal, .. } => {
+                assert_eq!((tool_id.as_str(), &child), ("toolu_shell", &spawned.child));
+                assert_eq!(exit_code, None);
+                assert!(matches!(signal, Some(1) | None), "the hang-up's signal, got {signal:?}");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(rx.try_recv().is_err(), "exactly once");
+
+        // A child that exits on its own reports its code.
+        let (id, _, _) = mgr.create_session(opts_for("false"), Some(&tx), 256 * 1024).await.unwrap();
+        assert!(matches!(rx.try_recv(), Ok(ChildProcessEvent::Spawned(_))));
+        mgr.close_session(&id).await.unwrap();
+        match rx.try_recv().expect("ended") {
+            ChildProcessEvent::Ended { exit_code, signal, .. } => assert_eq!((exit_code, signal), (Some(1), None)),
+            other => panic!("{other:?}"),
         }
     }
 

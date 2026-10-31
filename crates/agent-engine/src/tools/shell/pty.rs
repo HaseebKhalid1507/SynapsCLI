@@ -160,6 +160,8 @@ pub struct PtyHandle {
     alive: Arc<AtomicBool>,
     /// Separate killer handle so Drop can kill even if child is borrowed.
     killer: Box<dyn ChildKiller + Send + Sync>,
+    /// The child's report to its session (`session::child_events`).
+    watch: crate::session::child_events::ChildWatch,
 }
 
 type PreparedScope = (
@@ -336,7 +338,14 @@ impl PtyHandle {
             child,
             alive,
             killer,
+            watch: Default::default(),
         })
+    }
+
+    /// Report this shell's child to the session behind `sink` (`tool_child`
+    /// with the shell session id); its end is reported once, at the reap.
+    pub(crate) fn watch_child(&mut self, sink: Option<&crate::session::child_events::ChildSink>, shell_session_id: &str) {
+        self.watch = crate::session::child_events::ChildWatch::start(sink, self.child.process_id(), Some(shell_session_id));
     }
 
     /// Write raw bytes to the PTY (reaches the child's stdin).
@@ -410,15 +419,17 @@ impl PtyHandle {
             return false;
         }
         match self.child.try_wait() {
-            Ok(Some(_status)) => {
+            Ok(Some(status)) => {
                 // Child exited.
                 self.alive.store(false, Ordering::SeqCst);
+                report_exit(&mut self.watch, &status);
                 false
             }
             Ok(None) => true,
             Err(_) => {
                 // If we can't query, assume dead.
                 self.alive.store(false, Ordering::SeqCst);
+                self.watch.end(None, None);
                 false
             }
         }
@@ -436,17 +447,50 @@ impl Drop for PtyHandle {
         self.accounting.finish_party();
         if self.alive.load(Ordering::SeqCst) {
             let _ = self.killer.kill();
-            // Reap the child after kill — without a wait(), the SIGKILL'd
-            // child lingers as a zombie until the parent process exits.
-            // SIGKILL takes effect near-instantly; bound the reap attempts
-            // so Drop can never hang on a pathological child.
+            // Reap the child after the kill — without a wait(), it lingers
+            // as a zombie until the parent process exits. The kill is
+            // portable-pty's SIGHUP; bound the reap attempts so Drop can
+            // never hang on a child that ignores it.
             for _ in 0..5 {
                 match self.child.try_wait() {
-                    Ok(Some(_)) | Err(_) => break, // reaped (or unreapable)
+                    Ok(Some(status)) => {
+                        // Reaped: its own exit if it ended before the kill.
+                        report_exit(&mut self.watch, &status);
+                        break;
+                    }
+                    Err(_) => break, // unreapable
                     Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
                 }
             }
+        } else if self.watch.identity().is_some() {
+            // The reader saw EOF first: reap the watched child for its status.
+            if let Ok(Some(status)) = self.child.try_wait() {
+                report_exit(&mut self.watch, &status);
+            }
         }
+        // Not reaped (yet): ended, with its status unknown. The hang-up above
+        // is portable-pty's SIGHUP, not a SIGKILL, so claim no signal.
+        self.watch.end(None, None);
+    }
+}
+
+/// Report a PTY child's exit. portable-pty keeps only a signal's
+/// strsignal(3) name; the ones a shell usually dies of map back to their
+/// numbers, any other is an unknown signal.
+fn report_exit(watch: &mut crate::session::child_events::ChildWatch, status: &portable_pty::ExitStatus) {
+    match status.signal() {
+        None => watch.end(i32::try_from(status.exit_code()).ok(), None),
+        Some(name) => watch.end(None, signal_number(name)),
+    }
+}
+
+fn signal_number(name: &str) -> Option<i32> {
+    match name {
+        "Hangup" => Some(1),
+        "Interrupt" => Some(2),
+        "Killed" => Some(9),
+        "Terminated" => Some(15),
+        _ => name.strip_prefix("Signal ").and_then(|n| n.parse().ok()),
     }
 }
 
@@ -694,6 +738,70 @@ mod tests {
             text.contains("test"),
             "expected 'test' in output, got: {text:?}"
         );
+    }
+
+    /// A shell that exits while a background job still holds the terminal
+    /// is "alive" to the reader when its handle drops: the drop's reap
+    /// reports the shell's own exit, not a kill.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[serial(synaps_base_dir)]
+    async fn a_dropped_handle_reports_the_exit_it_reaped() {
+        use crate::session::child_events::{ChildProcessEvent, ChildRoute};
+        let (route, mut rx) = ChildRoute::channel("pty-test-session");
+        let sink = route.sink("toolu_pty", "shell_start");
+        let mut handle = PtyHandle::spawn("bash --norc --noprofile", None, HashMap::new(), 24, 80)
+            .expect("spawn");
+        handle.watch_child(Some(&sink), "shell_t");
+        let pid = match rx.try_recv() {
+            Ok(ChildProcessEvent::Spawned(spawn)) => spawn.child.pid,
+            other => panic!("{other:?}"),
+        };
+        handle.write(b"sleep 2 & exit 5\n").unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while crate::session::children::read_stat(pid).is_some_and(|stat| stat.is_live()) {
+            assert!(std::time::Instant::now() < deadline, "the shell never exited");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(handle.alive.load(Ordering::SeqCst), "the background job keeps the terminal open");
+        drop(handle);
+        match rx.try_recv() {
+            Ok(ChildProcessEvent::Ended { exit_code, signal, .. }) => {
+                assert_eq!((exit_code, signal), (Some(5), None));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(rx.try_recv().is_err(), "exactly once");
+    }
+
+    /// A child that ignores the drop's hang-up isn't reaped in time: it
+    /// ends with its status unknown, never with a kill it didn't get.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[serial(synaps_base_dir)]
+    async fn a_dropped_handle_claims_no_signal_it_did_not_see() {
+        use crate::session::child_events::{ChildProcessEvent, ChildRoute};
+        let (route, mut rx) = ChildRoute::channel("pty-test-session");
+        let sink = route.sink("toolu_pty", "shell_start");
+        let mut handle = PtyHandle::spawn("bash --norc --noprofile", None, HashMap::new(), 24, 80)
+            .expect("spawn");
+        handle.watch_child(Some(&sink), "shell_t");
+        assert!(matches!(rx.try_recv(), Ok(ChildProcessEvent::Spawned(_))));
+        // The typed line can be echoed twice (the terminal, then readline)
+        // before bash runs it, so wait for text only the output contains.
+        handle.write(b"trap '' HUP; echo trap'-is-'set\n").unwrap();
+        let mut seen = String::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !seen.contains("trap-is-set") {
+            assert!(std::time::Instant::now() < deadline, "no prompt: {seen:?}");
+            seen.push_str(&String::from_utf8_lossy(&handle.try_read_output(Duration::from_millis(100)).await));
+        }
+        drop(handle);
+        match rx.try_recv() {
+            Ok(ChildProcessEvent::Ended { exit_code, signal, .. }) => assert_eq!((exit_code, signal), (None, None)),
+            other => panic!("{other:?}"),
+        }
+        assert!(rx.try_recv().is_err(), "exactly once");
     }
 
     #[tokio::test]

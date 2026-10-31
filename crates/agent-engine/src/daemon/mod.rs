@@ -14,6 +14,7 @@
 
 pub mod close;
 pub mod conn;
+pub mod control_queries;
 pub mod extension_reload;
 pub mod lifecycle;
 pub mod listener;
@@ -464,6 +465,9 @@ impl Daemon {
 
         // C3: rehydrate BEFORE accepting so a reconnecting client finds its session.
         if let Some(rs) = &reload_state {
+            // The child ledger first: restored sessions' new spawns follow
+            // the older records (see `session::children` for the drop rules).
+            crate::session::children::restore_after_reload(rs.children.clone());
             reload::rehydrate(&state, rs).await;
         }
 

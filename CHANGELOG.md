@@ -6,6 +6,27 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Daemon child-process ledger.** On Linux the daemon records each process
+  a tool spawns (`bash`, `shell_start`, also a worker's calls, under its
+  `sa_N` handle) with the session that spawned it, by
+  `(boot_id, pid, start_ticks)`, never by pid alone, and lists extension and
+  MCP stdio server processes as host children. The ledger is carried across
+  `daemon reload`. A client sends `{"type":"children"}` (optionally
+  `session_id`, `sid`, `members`) and gets one `child_list` reply; each
+  running leader is checked fresh before the reply. `refused_records` and
+  `ledger_full` say when a cap (256 records per session, 4096 in all)
+  refused a record or will refuse the next. A connection that names
+  `tool_child` / `tool_child_ended` in `Hello.accepted_events` also gets an
+  event when a tool's child starts and when it is reaped; no other
+  connection does. `Welcome.features` lists the optional control frames the
+  daemon answers (`children`, `thinking_options`), so a client detects an
+  older daemon by the missing name. An older client sends neither the query
+  nor the opt-in, and sees nothing new. See
+  [docs/daemon-mode.md](docs/daemon-mode.md).
+- **`thinking_options` control query.** `{"type":"thinking_options"}`
+  (optionally `model`; omitted means the model a new session gets) answers
+  without a session with the thinking levels the daemon offers for that
+  model, its default level and the basis of the answer.
 - **`synaps daemon rename <ID|NAME> <NEW_NAME>`** (or `--clear`) names a
   daemon session from any shell without attaching, so a tool can name a
   session it only observes. Same rules as `/saveas`; attached clients see the

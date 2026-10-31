@@ -1393,3 +1393,27 @@ async fn submit_with_image_is_refused_on_text_model_and_accepted_on_image_model(
     drop(b);
     handle.closed().await;
 }
+
+/// `thinking_options` with no model names what a new session gets: the
+/// model a session created right after carries. Both read the host's config
+/// snapshot, so an edit after boot (without a reload) changes neither.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn new_session_model_is_what_a_created_session_gets() {
+    let _h = Home::new();
+    let config_path = std::path::PathBuf::from(std::env::var("SYNAPS_BASE_DIR").unwrap()).join("config");
+    std::fs::write(&config_path, "model = claude-haiku-4-5\n").unwrap();
+    let host = host().await;
+    let predicted = host.new_session_model();
+    assert_eq!(predicted, "claude-haiku-4-5");
+    let fresh = SessionConfig { persist: false, ..SessionConfig::default() };
+    let handle = host.create_session(fresh.clone()).await.unwrap();
+    assert_eq!(handle.meta_live().model, predicted);
+
+    std::fs::write(&config_path, "model = claude-opus-4-7\n").unwrap();
+    assert_eq!(host.new_session_model(), predicted, "no re-read at query time");
+    let second = host.create_session(fresh).await.unwrap();
+    assert_eq!(second.meta_live().model, predicted, "nor at create");
+    host.reload_config();
+    assert_eq!(host.new_session_model(), "claude-opus-4-7");
+}

@@ -1369,6 +1369,10 @@ pub enum SessionEventWire {
         cost: f64,
         cap: f64,
     },
+    /// A tool call spawned or reaped a child process (`tool_child` /
+    /// `tool_child_ended`). Optional: sent only to connections that list it
+    /// in `Hello.accepted_events`; never replayed on Attach.
+    ChildProcess(super::child_events::ChildProcessEvent),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
