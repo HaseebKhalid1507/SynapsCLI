@@ -392,6 +392,7 @@ pub fn reload_registry(registry: &CommandRegistry, config: &crate::SynapsConfig)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::skills::registry::Resolution;
 
     fn write_skill(dir: &std::path::Path, name: &str) {
         std::fs::create_dir_all(dir.join(name)).unwrap();
@@ -446,5 +447,156 @@ mod tests {
             (1, 4),
             "counted before the filters"
         );
+    }
+
+    /// A plugin carrying every non-skill part, each of which would touch
+    /// `marker` if it ran: a shell command, a keybind, an extension with a
+    /// hook, a sidecar with a lifecycle claim, help, settings, MCP servers
+    /// (in plugin.json and `.mcp.json`) and Claude Code `hooks/hooks.json`.
+    fn write_full_plugin(dir: &std::path::Path, name: &str, marker: &std::path::Path) {
+        const MANIFEST: &str = r#"{
+            "name": "NAME",
+            "keybinds": [{"key": "F7", "action": "slash_command", "command": "/NAME:touch"}],
+            "commands": [{"name": "touch", "command": "touch", "args": ["MARKER"]}],
+            "extension": {
+                "protocol_version": 1, "runtime": "process",
+                "command": "touch", "args": ["MARKER"],
+                "permissions": ["tools.intercept"], "hooks": [{"hook": "before_tool_call"}]
+            },
+            "help": [{
+                "id": "NAME-help", "command": "/NAME:touch", "title": "t", "summary": "s",
+                "category": "Plugin", "topic": "Branch", "protected": false, "common": false
+            }],
+            "provides": {"sidecar": {
+                "command": "bin/sidecar", "protocol_version": 1,
+                "lifecycle": {"command": "NAMEcap", "settings_category": "NAME", "importance": 50}
+            }},
+            "settings": {"category": [{"id": "NAME", "label": "L", "fields": []}]},
+            "mcpServers": {"m": {"command": "touch", "args": ["MARKER"]}}
+        }"#;
+        let marker = marker.to_str().unwrap();
+        let manifest = MANIFEST.replace("NAME", name).replace("MARKER", marker);
+        let touch = format!(r#"{{"command": "touch", "args": ["{marker}"]}}"#);
+        let hook = format!(r#"{{"type": "command", "command": "touch {marker}"}}"#);
+        let files = [
+            (".synaps-plugin/plugin.json", manifest),
+            (
+                ".mcp.json",
+                format!(r#"{{"mcpServers": {{"m": {touch}}}}}"#),
+            ),
+            (
+                "hooks/hooks.json",
+                format!(r#"{{"hooks": {{"PreToolUse": [{{"hooks": [{hook}]}}]}}}}"#),
+            ),
+            ("bin/sidecar", format!("#!/bin/sh\ntouch {marker}\n")),
+        ];
+        for (file, content) in files {
+            let path = dir.join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, content).unwrap();
+        }
+        write_skill(&dir.join("skills"), "s1");
+    }
+
+    /// Flag 1 (skills v1, 790d): a plugin under `skills.extra_root` gives
+    /// its skills only. The same plugin under the home plugins root (the
+    /// control) keeps its command, keybind, extension, sidecar, help and
+    /// settings; from the extra root none of them reaches the command
+    /// registry (so nothing can be spawned or run) and the report names
+    /// what was ignored.
+    #[test]
+    #[serial_test::serial(synaps_base_dir)]
+    fn an_extra_root_plugin_gives_its_skills_only() {
+        let _base = crate::test_env::BaseDirGuard::new();
+        let extra = tempfile::TempDir::new().unwrap();
+        let marker = extra.path().join("ran");
+        write_full_plugin(&extra.path().join("remote"), "remote", &marker);
+        let home_plugins = loader::discovery_roots(None)[3].path.clone().unwrap();
+        write_full_plugin(&home_plugins.join("local"), "local", &marker);
+        let keys = agent_core::config::SkillsKeys {
+            extra_root: Some(extra.path().to_path_buf()),
+            ..Default::default()
+        };
+        let found = discover(&keys);
+        let ignored = [
+            "remote:commands",
+            "remote:keybinds",
+            "remote:extension",
+            "remote:hooks",
+            "remote:sidecar",
+            "remote:help",
+            "remote:settings",
+            "remote:mcp",
+        ];
+        assert_eq!(found.pass.ignored_non_skill, ignored.len());
+        assert_eq!(found.pass.ignored_non_skill_names, ignored);
+        let report = status::SkillsReport::of(1, &found);
+        assert_eq!(report.ignored_non_skill, ignored.len());
+        assert_eq!(report.ignored_non_skill_names, ignored);
+
+        let qualified: Vec<String> = found
+            .pass
+            .skills
+            .iter()
+            .map(|s| format!("{}:{}", s.plugin.as_deref().unwrap_or("?"), s.name))
+            .collect();
+        assert_eq!(qualified, ["remote:s1", "local:s1"]);
+        let plugin = |name: &str| found.pass.plugins.iter().find(|p| p.name == name).unwrap();
+        let remote = plugin("remote");
+        assert!(remote.extension.is_none());
+        let m = remote.manifest.as_ref().unwrap();
+        assert!(m.commands.is_empty() && m.keybinds.is_empty() && m.help_entries.is_empty());
+        assert!(m.extension.is_none() && m.provides.is_none() && m.settings.is_none());
+        let local = plugin("local").manifest.as_ref().unwrap();
+        assert!(
+            plugin("local").extension.is_some(),
+            "home roots are unchanged"
+        );
+        assert_eq!((local.commands.len(), local.keybinds.len()), (1, 1));
+
+        let commands = CommandRegistry::new_with_plugins(
+            BUILTIN_COMMANDS,
+            found.pass.skills,
+            found.pass.plugins,
+        );
+        assert!(matches!(
+            commands.resolve("remote:s1"),
+            Resolution::Skill(_)
+        ));
+        assert!(matches!(
+            commands.resolve("remote:touch"),
+            Resolution::Unknown
+        ));
+        assert!(matches!(
+            commands.resolve("local:touch"),
+            Resolution::PluginCommand(_)
+        ));
+        let sidecars: Vec<String> = commands
+            .sidecars()
+            .into_iter()
+            .map(|s| s.plugin_name)
+            .collect();
+        assert_eq!(sidecars, ["local"]);
+        assert!(!commands.sidecar_has_extension("remote"));
+        assert!(commands.sidecar_has_extension("local"));
+        let claims: Vec<String> = commands
+            .lifecycle_claims()
+            .into_iter()
+            .map(|c| c.plugin)
+            .collect();
+        assert_eq!(claims, ["local"]);
+        let help: Vec<Option<String>> = commands
+            .plugin_help_entries()
+            .into_iter()
+            .map(|h| h.source)
+            .collect();
+        assert_eq!(help, [Some("local".to_string())]);
+        let settings: Vec<String> = commands
+            .plugin_settings_categories()
+            .into_iter()
+            .map(|c| c.plugin)
+            .collect();
+        assert_eq!(settings, ["local"]);
+        assert!(!marker.exists(), "nothing ran");
     }
 }

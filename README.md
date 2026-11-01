@@ -175,7 +175,7 @@ thinking = high
 theme = tokyo-night
 identity = You are a senior engineer who writes clean, tested code.
 disabled_tools = bash, ls          # remove built-ins at boot (read-only profiles)
-skills.extra_root = /opt/team/skills  # a third skill root, between project and home; `synaps skills reload` picks it up
+skills.extra_root = /opt/team/skills  # a third skill root (skills only), between project and home; `synaps skills reload` picks it up
 ```
 
 Every key, the multi-machine auth broker and more are in the [Wiki](https://github.com/HaseebKhalid1507/SynapsCLI/wiki).

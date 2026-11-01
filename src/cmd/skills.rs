@@ -153,6 +153,13 @@ fn text(report: &SkillsReport) -> String {
         report.disabled,
         report.shadowed_total,
     ));
+    if report.ignored_non_skill > 0 {
+        out.push_str(&format!(
+            "ignored (the extra root gives skills only) {}: {}\n",
+            report.ignored_non_skill,
+            report.ignored_non_skill_names.join(", "),
+        ));
+    }
     out
 }
 

@@ -451,6 +451,10 @@ pub struct ShadowedSkill {
 /// How many [`ShadowedSkill`]s a [`DiscoveryPass`] keeps; it counts them all.
 pub const SHADOWED_REPORT_MAX: usize = 64;
 
+/// How many ignored non-skill part names a [`DiscoveryPass`] keeps; it
+/// counts them all.
+pub const IGNORED_NON_SKILL_REPORT_MAX: usize = 16;
+
 /// One whole discovery pass over a list of [`DiscoveryRoot`]s.
 #[derive(Debug, Clone)]
 pub struct DiscoveryPass {
@@ -465,6 +469,12 @@ pub struct DiscoveryPass {
     /// The first [`SHADOWED_REPORT_MAX`] shadowed skills, in walk order.
     pub shadowed: Vec<ShadowedSkill>,
     pub shadowed_total: usize,
+    /// Non-skill parts of extra-root plugins that the walk ignored, one per
+    /// (plugin, part); see [`RootKind::Extra`].
+    pub ignored_non_skill: usize,
+    /// The first [`IGNORED_NON_SKILL_REPORT_MAX`] of them, in walk order,
+    /// as `<plugin>:<part>` (e.g. `p:commands`, `p:sidecar`, `p:mcp`).
+    pub ignored_non_skill_names: Vec<String>,
 }
 
 /// [`load_all`] over [`DiscoveryRoot`]s, with a report: each root is resolved
@@ -490,6 +500,7 @@ fn load_all_reported_with(
             .filter(|p| p.is_dir());
         let (plugins, skills) = (walk.plugins.len(), walk.skills.len());
         walk.root = index;
+        walk.skills_only = root.kind == RootKind::Extra;
         if let Some(dir) = resolved.as_deref() {
             walk_root(dir, &mut walk);
         }
@@ -523,6 +534,8 @@ fn load_all_reported_with(
         skipped: walk.budget.skipped,
         shadowed,
         shadowed_total: walk.shadowed_total,
+        ignored_non_skill: walk.ignored_non_skill,
+        ignored_non_skill_names: walk.ignored_non_skill_names,
     }
 }
 
@@ -560,6 +573,11 @@ struct Walk<'h> {
     root: usize,
     shadowed: Vec<ShadowedAt>,
     shadowed_total: usize,
+    /// The root being walked is the extra root: its plugins give skills
+    /// only ([`skills_only`]).
+    skills_only: bool,
+    ignored_non_skill: usize,
+    ignored_non_skill_names: Vec<String>,
     after_plugin: &'h mut dyn FnMut(&str),
 }
 
@@ -573,7 +591,31 @@ impl<'h> Walk<'h> {
             root: 0,
             shadowed: Vec::new(),
             shadowed_total: 0,
+            skills_only: false,
+            ignored_non_skill: 0,
+            ignored_non_skill_names: Vec::new(),
             after_plugin,
+        }
+    }
+
+    /// Count (and name, up to [`IGNORED_NON_SKILL_REPORT_MAX`]) the parts
+    /// of extra-root plugin `plugin` that the walk ignored.
+    fn ignore_non_skill(&mut self, plugin: &str, parts: &[&'static str]) {
+        if parts.is_empty() {
+            return;
+        }
+        let plugin = agent_core::BoundedText::new(plugin, SKILL_NAME_MAX_BYTES).text;
+        tracing::warn!(
+            plugin = plugin.as_str(),
+            ignored = ?parts,
+            "extra skill root: a plugin's parts other than skills are ignored"
+        );
+        for part in parts {
+            self.ignored_non_skill += 1;
+            if self.ignored_non_skill_names.len() < IGNORED_NON_SKILL_REPORT_MAX {
+                self.ignored_non_skill_names
+                    .push(format!("{plugin}:{part}"));
+            }
         }
     }
 
@@ -752,14 +794,20 @@ fn load_plugin(plugin_root: &Path, marketplace: Option<&str>, walk: &mut Walk<'_
     if walk.plugins.iter().any(|p| p.root == root_abs) {
         return;
     }
+    let manifest = if walk.skills_only {
+        walk.ignore_non_skill(&m.name, &non_skill_parts(&m, &content, plugin_root));
+        skills_only(&m)
+    } else {
+        m.clone()
+    };
     walk.plugins.push(Plugin {
         name: m.name.clone(),
         root: root_abs,
         marketplace: marketplace.map(str::to_string),
         version: m.version.clone(),
         description: m.description.clone(),
-        extension: m.extension.clone(),
-        manifest: Some(m.clone()),
+        extension: manifest.extension.clone(),
+        manifest: Some(manifest),
     });
 
     let skills_dir = plugin_root.join("skills");
@@ -778,6 +826,59 @@ fn load_plugin(plugin_root: &Path, marketplace: Option<&str>, walk: &mut Walk<'_
         }
     }
     (walk.after_plugin)(&m.name);
+}
+
+/// The plugin.json identity of an extra-root plugin: the extra root gives
+/// skills only, so commands, keybinds, the extension (and its hooks), the
+/// sidecar (and its lifecycle claim), help and settings are dropped here,
+/// before any registry sees them. A literal on purpose: a new manifest
+/// field must be decided here.
+fn skills_only(m: &PluginManifest) -> PluginManifest {
+    PluginManifest {
+        name: m.name.clone(),
+        version: m.version.clone(),
+        description: m.description.clone(),
+        keybinds: Vec::new(),
+        compatibility: m.compatibility.clone(),
+        commands: Vec::new(),
+        extension: None,
+        help_entries: Vec::new(),
+        provides: None,
+        settings: None,
+    }
+}
+
+/// What an extra-root plugin carries besides skills, in a fixed order.
+/// Synaps loads no plugin hooks or MCP servers from any root; a plugin that
+/// declares them (Claude Code style) is still reported.
+fn non_skill_parts(m: &PluginManifest, raw: &str, plugin_root: &Path) -> Vec<&'static str> {
+    let raw: serde_json::Value = serde_json::from_str(raw).unwrap_or_default();
+    let has_key = |key: &str| raw.get(key).is_some_and(|v| !v.is_null());
+    let extension_hooks = m.extension.as_ref().is_some_and(|e| !e.hooks.is_empty());
+    [
+        ("commands", !m.commands.is_empty()),
+        ("keybinds", !m.keybinds.is_empty()),
+        ("extension", m.extension.is_some()),
+        (
+            "hooks",
+            extension_hooks
+                || has_key("hooks")
+                || plugin_root.join("hooks").join("hooks.json").exists(),
+        ),
+        (
+            "sidecar",
+            m.provides.as_ref().is_some_and(|p| p.sidecar.is_some()),
+        ),
+        ("help", !m.help_entries.is_empty()),
+        ("settings", m.settings.is_some()),
+        (
+            "mcp",
+            has_key("mcpServers") || plugin_root.join(".mcp.json").exists(),
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(part, present)| present.then_some(part))
+    .collect()
 }
 
 #[cfg(test)]

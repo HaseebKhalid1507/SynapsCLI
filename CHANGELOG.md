@@ -31,10 +31,14 @@ All notable changes to this project will be documented in this file.
   quotes, no `~`) adds a root walked after the project roots and before
   `~/.synaps-cli/plugins` and `skills`; a `current` symlink in it is
   resolved once per walk, and `disabled_plugins` / `disabled_skills` apply
-  to it. `synaps skills status [--json]` prints the running daemon's last
+  to it. The extra root gives skills only: from its plugins Synaps takes
+  `skills/<name>/SKILL.md` and the plugin.json identity, never commands,
+  keybinds, extensions, hooks, sidecars, help, settings or MCP servers.
+  `synaps skills status [--json]` prints the running daemon's last
   discovery pass: each root's configured and resolved path, plugin and
   skill counts, the 2048-skill and 4 MiB metadata caps with what was
-  skipped, and shadowed skills. `synaps skills reload [--json]` re-reads
+  skipped, shadowed skills, and the extra-root plugin parts ignored
+  (`ignored_non_skill`, with the first 16 `<plugin>:<part>` names). `synaps skills reload [--json]` re-reads
   the skill keys from the config file, walks the roots again and swaps the
   new set in without a daemon restart (extensions, hooks, MCP servers and
   keybinds still need `synaps daemon reload`). Both ask a running daemon

@@ -103,15 +103,32 @@ fn json_of(out: &str) -> Value {
 }
 
 /// A store laid out like P's: `versions/<v>/<plugin>/...` and a `current`
-/// symlink to the version. Returns (`current`, the version dir).
+/// symlink to the version. The plugin also carries a command, an extension
+/// with a hook and an MCP server, each of which would touch `<home>/ran`;
+/// the extra root takes its skills only. Returns (`current`, the version
+/// dir).
 fn store(home: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
     let skills = home.join("Library/Application Support/pria.desktop.dev/skills");
     let version = skills.join("versions/1.0.0-abcd1234");
     let plugin = version.join("pria-skills");
     std::fs::create_dir_all(plugin.join(".synaps-plugin")).unwrap();
+    let touch = json!({"command": "touch", "args": [home.join("ran")]});
+    let manifest = json!({
+        "name": "pria-skills",
+        "commands": [{"name": "hi", "command": "touch", "args": [home.join("ran")]}],
+        "extension": {
+            "protocol_version": 1,
+            "runtime": "process",
+            "command": "touch",
+            "args": [home.join("ran")],
+            "permissions": ["tools.intercept"],
+            "hooks": [{"hook": "before_tool_call"}]
+        },
+        "mcpServers": {"m": touch},
+    });
     std::fs::write(
         plugin.join(".synaps-plugin/plugin.json"),
-        r#"{"name":"pria-skills"}"#,
+        manifest.to_string(),
     )
     .unwrap();
     let skill = plugin.join("skills/doctor-check");
@@ -242,6 +259,30 @@ async fn skills_reload_walks_a_root_set_after_boot_and_is_refused_when_attached(
         loaded.contains(&(Some("pria-skills".into()), "doctor-check".into())),
         "{loaded:?}"
     );
+    // The extra root gives skills only (790d flag 1).
+    assert_eq!(
+        (
+            &reloaded["ignored_non_skill"],
+            &reloaded["ignored_non_skill_names"]
+        ),
+        (
+            &json!(4),
+            &json!([
+                "pria-skills:commands",
+                "pria-skills:extension",
+                "pria-skills:hooks",
+                "pria-skills:mcp"
+            ])
+        ),
+        "{reloaded}"
+    );
+    assert!(matches!(
+        host.command_registry().resolve("pria-skills:hi"),
+        agent_engine::skills::registry::Resolution::Unknown
+    ));
+    assert!(host.command_registry().sidecars().is_empty());
+    assert!(!host.command_registry().sidecar_has_extension("pria-skills"));
+    assert!(!guard.home.path().join("ran").exists(), "nothing ran");
     assert_eq!(
         host.config().skills_extra_root,
         None,

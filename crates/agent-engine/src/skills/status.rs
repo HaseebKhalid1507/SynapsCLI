@@ -39,6 +39,15 @@ pub struct SkillsReport {
     /// order.
     pub shadowed: Vec<ShadowedReport>,
     pub shadowed_total: usize,
+    /// Non-skill parts of `skills.extra_root` plugins that were ignored
+    /// (that root gives skills only), one per (plugin, part).
+    #[serde(default)]
+    pub ignored_non_skill: usize,
+    /// The first [`loader::IGNORED_NON_SKILL_REPORT_MAX`] of them, as
+    /// `<plugin>:<part>`; parts are `commands`, `keybinds`, `extension`,
+    /// `hooks`, `sidecar`, `help`, `settings` and `mcp`.
+    #[serde(default)]
+    pub ignored_non_skill_names: Vec<String>,
 }
 
 /// One root of a [`SkillsReport`]. Paths are UTF-8 (lossy).
@@ -113,6 +122,8 @@ impl SkillsReport {
             disabled: found.disabled,
             shadowed,
             shadowed_total: pass.shadowed_total,
+            ignored_non_skill: pass.ignored_non_skill,
+            ignored_non_skill_names: pass.ignored_non_skill_names.clone(),
         }
     }
 }
@@ -394,6 +405,46 @@ mod tests {
         assert!(report.metadata_bytes > report.metadata_cap - 4096);
     }
 
+    /// Flag 5 (skills v1): only the report is lossy. The walk keeps the real
+    /// `OsStr` path (the skill's source and base dir are under the exact
+    /// non-UTF-8 version dir), and the report shows the U+FFFD form. The
+    /// load never uses a lossy path either: it opens the exact `PathBuf`,
+    /// and since the body names its base dir as text (`{baseDir}`), a base
+    /// dir that is not UTF-8 is refused (loader.rs `load_body_with_evidence`,
+    /// as before skills v1) rather than substituted lossily.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_non_utf8_root_is_walked_exactly_and_only_the_report_is_lossy() {
+        use std::os::unix::ffi::OsStrExt;
+        let store = tempfile::TempDir::new().unwrap();
+        let version = store.path().join(std::ffi::OsStr::from_bytes(b"v-\xff"));
+        write_skill(&version, "doctor-check", "raw path body");
+        let current = store.path().join("current");
+        std::os::unix::fs::symlink(&version, &current).unwrap();
+        let found = pass_of(&current);
+        let resolved = found.pass.roots[0].resolved.clone().unwrap();
+        assert_eq!(resolved, version.canonicalize().unwrap());
+        assert!(resolved.to_str().is_none(), "the walk keeps the raw bytes");
+
+        let registry = CommandRegistry::new(&[], found.pass.skills.clone());
+        let skill = registry.all_skills().pop().unwrap();
+        assert_eq!(skill.name, "doctor-check");
+        assert_eq!(skill.base_dir, resolved.join("doctor-check"));
+        assert_eq!(
+            skill.source_path,
+            resolved.join("doctor-check").join("SKILL.md")
+        );
+        assert!(std::fs::read(&skill.source_path).is_ok());
+        let err = crate::skills::tool::LoadSkillTool::format_body(&skill).unwrap_err();
+        assert!(err.contains("no longer readable"), "{err}");
+        assert!(!err.contains('\u{fffd}'), "{err}");
+
+        let report = SkillsReport::of(1, &found);
+        let shown = report.roots[0].resolved.clone().unwrap();
+        assert!(shown.ends_with("/v-\u{fffd}"), "{shown}");
+        assert_eq!(shown, resolved.to_string_lossy());
+    }
+
     /// The report's JSON is the contract's: field names, snake_case root
     /// kinds, `null` for an unset or absent root, the shadowed skills.
     #[test]
@@ -438,6 +489,8 @@ mod tests {
                 "at_unix_ms",
                 "disabled",
                 "generation",
+                "ignored_non_skill",
+                "ignored_non_skill_names",
                 "metadata_bytes",
                 "metadata_cap",
                 "roots",
@@ -467,6 +520,8 @@ mod tests {
             }])
         );
         assert_eq!(json["shadowed_total"], 1);
+        assert_eq!(json["ignored_non_skill"], 0);
+        assert_eq!(json["ignored_non_skill_names"], serde_json::json!([]));
         let back: SkillsReport = serde_json::from_value(json).unwrap();
         assert_eq!(back.generation, 4);
     }

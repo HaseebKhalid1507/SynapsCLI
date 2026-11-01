@@ -256,8 +256,14 @@ bare: spaces are kept, `~` is not expanded, and a quoted or relative path is
 a config warning (the key keeps an earlier valid value, else stays unset).
 The root is resolved (realpath) once per walk, so a `current` symlink
 swapped mid-walk cannot mix two versions. `disabled_plugins` and
-`disabled_skills` apply to it as to every root. Its plugins are full plugins
-(commands, keybinds, sidecars, settings). One pass keeps at most 2048 skills
+`disabled_skills` apply to it as to every root. The extra root gives
+**skills only**: from a plugin under it Synaps takes `skills/<name>/SKILL.md`
+and the plugin.json identity (name, version, description), and never loads
+or runs its commands, keybinds, extension (or its hooks), sidecar (or its
+lifecycle claim), help, settings, hooks or MCP servers; each ignored part is
+counted in `ignored_non_skill` and logged. The root takes remotely updated
+content, so this is a second check after the store's own admission. The
+project and home roots are unchanged. One pass keeps at most 2048 skills
 and 4 MiB of skill metadata; what is past a cap is counted as `skipped`.
 
 - `synaps skills status [--json]` / `SkillsStatus{id}` (also accepted on an
@@ -280,8 +286,13 @@ Both answer `SkillsResult{id, report}`: `generation` (1 = boot),
 (paths as text; `null` = not set, or absent / not a directory; counts are
 before the disable filters), `skills_total`/`skills_cap`,
 `metadata_bytes`/`metadata_cap`, `skipped`, `disabled`, `shadowed[]`
-`{plugin, name, kept_root_kind, dropped_root_kind}` (the first 64) and
-`shadowed_total`. The CLI asks a running daemon and never starts one. Exit
+`{plugin, name, kept_root_kind, dropped_root_kind}` (the first 64),
+`shadowed_total`, `ignored_non_skill` (one per extra-root plugin and part)
+and `ignored_non_skill_names` (the first 16, as `<plugin>:<part>`, parts
+`commands`, `keybinds`, `extension`, `hooks`, `sidecar`, `help`, `settings`,
+`mcp`). Paths are lossy UTF-8 in the report only: the walk uses the real
+path, and `load_skill` opens it but refuses a skill whose directory is not
+UTF-8 (the body names it as text). The CLI asks a running daemon and never starts one. Exit
 codes: 0 report; 1 no daemon, I/O error, or no answer in time (10 s status,
 60 s reload); 3 refused (an `Error` answer, or a daemon whose `Welcome` does
 not list `skills_v1`). `--json` prints the report on one line, or

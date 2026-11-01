@@ -3508,6 +3508,8 @@ mod tests {
                 dropped_root_kind: RootKind::HomeSkills,
             }],
             shadowed_total: 1,
+            ignored_non_skill: 2,
+            ignored_non_skill_names: vec!["pria-skills:commands".into(), "pria-skills:mcp".into()],
         }
     }
 
