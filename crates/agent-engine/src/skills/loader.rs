@@ -366,6 +366,8 @@ use crate::skills::{
 };
 
 /// The four default discovery roots, in priority order (local first, global second).
+/// Read-only listings (the TUI, sidecar discovery) walk these; the skill
+/// registry walks [`discovery_roots`], which adds `skills.extra_root`.
 pub fn default_roots() -> Vec<PathBuf> {
     let mut roots = vec![
         PathBuf::from(".synaps-cli/plugins"),
@@ -378,6 +380,152 @@ pub fn default_roots() -> Vec<PathBuf> {
     roots
 }
 
+/// Which skill discovery root something came from (`skills.status`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RootKind {
+    /// `.synaps-cli/plugins` under the process cwd.
+    ProjectPlugins,
+    /// `.synaps-cli/skills` under the process cwd.
+    ProjectSkills,
+    /// `skills.extra_root` from config.
+    Extra,
+    /// `plugins` under the synaps base dir.
+    HomePlugins,
+    /// `skills` under the synaps base dir.
+    HomeSkills,
+}
+
+/// One skill discovery root. `path` is `None` only for the extra root when
+/// `skills.extra_root` is unset (or was ignored with a config warning).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveryRoot {
+    pub kind: RootKind,
+    pub path: Option<PathBuf>,
+}
+
+/// The five roots the skill registry walks, in priority order (first wins):
+/// project plugins, project skills, `skills.extra_root`, home plugins,
+/// home skills.
+pub fn discovery_roots(extra_root: Option<&Path>) -> Vec<DiscoveryRoot> {
+    let [project_plugins, project_skills, home_plugins, home_skills] =
+        <[PathBuf; 4]>::try_from(default_roots()).expect("four default roots");
+    let root = |kind, path| DiscoveryRoot { kind, path };
+    vec![
+        root(RootKind::ProjectPlugins, Some(project_plugins)),
+        root(RootKind::ProjectSkills, Some(project_skills)),
+        root(RootKind::Extra, extra_root.map(Path::to_path_buf)),
+        root(RootKind::HomePlugins, Some(home_plugins)),
+        root(RootKind::HomeSkills, Some(home_skills)),
+    ]
+}
+
+/// What one root of a [`DiscoveryPass`] gave.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RootPass {
+    pub kind: RootKind,
+    /// The configured path, made absolute (the project roots are relative
+    /// to the process cwd). `None`: the extra root is not configured.
+    pub configured: Option<PathBuf>,
+    /// The configured path resolved (realpath) once at the start of this
+    /// root's walk; the walk reads only this directory, so a symlink swapped
+    /// mid-walk cannot mix two versions. `None`: absent, or not a directory.
+    pub resolved: Option<PathBuf>,
+    /// Plugins this root added (before the disable filters).
+    pub plugins: usize,
+    /// Skills this root added within the caps (before the disable filters).
+    pub skills: usize,
+}
+
+/// A skill dropped because an earlier root (or an earlier place in the same
+/// root) already had its (plugin, name).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShadowedSkill {
+    /// Bounded to [`SKILL_NAME_MAX_BYTES`].
+    pub plugin: Option<String>,
+    pub name: String,
+    pub kept: RootKind,
+    pub dropped: RootKind,
+}
+
+/// How many [`ShadowedSkill`]s a [`DiscoveryPass`] keeps; it counts them all.
+pub const SHADOWED_REPORT_MAX: usize = 64;
+
+/// One whole discovery pass over a list of [`DiscoveryRoot`]s.
+#[derive(Debug, Clone)]
+pub struct DiscoveryPass {
+    pub plugins: Vec<Plugin>,
+    pub skills: Vec<LoadedSkill>,
+    /// One entry per root, in walk order.
+    pub roots: Vec<RootPass>,
+    /// Retained metadata bytes (counted against [`DISCOVERY_MAX_METADATA_BYTES`]).
+    pub metadata_bytes: usize,
+    /// Skills skipped at a cap.
+    pub skipped: usize,
+    /// The first [`SHADOWED_REPORT_MAX`] shadowed skills, in walk order.
+    pub shadowed: Vec<ShadowedSkill>,
+    pub shadowed_total: usize,
+}
+
+/// [`load_all`] over [`DiscoveryRoot`]s, with a report: each root is resolved
+/// (realpath) once and then only the resolved directory is walked; per-root
+/// counts, the cap counters and the shadowed skills are recorded.
+pub fn load_all_reported(roots: &[DiscoveryRoot]) -> DiscoveryPass {
+    load_all_reported_with(roots, &mut |_: &str| {})
+}
+
+/// [`load_all_reported`], calling `after_plugin` with each loaded plugin's
+/// name once its skills are in (the mid-walk swap test's seam).
+fn load_all_reported_with(
+    roots: &[DiscoveryRoot],
+    after_plugin: &mut dyn FnMut(&str),
+) -> DiscoveryPass {
+    let mut walk = Walk::new(after_plugin);
+    let mut passes = Vec::with_capacity(roots.len());
+    for (index, root) in roots.iter().enumerate() {
+        let resolved = root
+            .path
+            .as_deref()
+            .and_then(|p| p.canonicalize().ok())
+            .filter(|p| p.is_dir());
+        let (plugins, skills) = (walk.plugins.len(), walk.skills.len());
+        walk.root = index;
+        if let Some(dir) = resolved.as_deref() {
+            walk_root(dir, &mut walk);
+        }
+        passes.push(RootPass {
+            kind: root.kind,
+            configured: root
+                .path
+                .as_deref()
+                .map(|p| std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf())),
+            resolved,
+            plugins: walk.plugins.len() - plugins,
+            skills: walk.skills.len() - skills,
+        });
+    }
+    walk.warn_skipped();
+    let shadowed = walk
+        .shadowed
+        .into_iter()
+        .map(|(plugin, name, kept, dropped)| ShadowedSkill {
+            plugin,
+            name,
+            kept: roots[kept].kind,
+            dropped: roots[dropped].kind,
+        })
+        .collect();
+    DiscoveryPass {
+        plugins: walk.plugins,
+        skills: walk.skills,
+        roots: passes,
+        metadata_bytes: walk.budget.metadata_bytes,
+        skipped: walk.budget.skipped,
+        shadowed,
+        shadowed_total: walk.shadowed_total,
+    }
+}
+
 /// Walk the given roots and discover all plugins and skills.
 /// Deduplicates on (plugin_name, skill_name); first occurrence wins.
 ///
@@ -387,22 +535,76 @@ pub fn default_roots() -> Vec<PathBuf> {
 /// candidates are skipped (first-wins order preserved) and only COUNTS
 /// are reported.
 pub fn load_all(roots: &[PathBuf]) -> (Vec<Plugin>, Vec<LoadedSkill>) {
-    let mut plugins: Vec<Plugin> = Vec::new();
-    let mut skills: Vec<LoadedSkill> = Vec::new();
-    let mut seen: std::collections::HashSet<(Option<String>, String)> =
-        std::collections::HashSet::new();
-    let mut budget = DiscoveryBudget::default();
+    let mut no_hook = |_: &str| {};
+    let mut walk = Walk::new(&mut no_hook);
+    for (index, root) in roots.iter().enumerate() {
+        walk.root = index;
+        walk_root(root, &mut walk);
+    }
+    walk.warn_skipped();
+    (walk.plugins, walk.skills)
+}
 
-    for root in roots {
-        walk_root(root, &mut plugins, &mut skills, &mut seen, &mut budget);
+/// A shadowed skill as the walk records it: (plugin, name, index of the
+/// root that kept it, index of the root it was dropped from).
+type ShadowedAt = (Option<String>, String, usize, usize);
+
+/// The state of one discovery walk across its roots.
+struct Walk<'h> {
+    plugins: Vec<Plugin>,
+    skills: Vec<LoadedSkill>,
+    /// (plugin, skill name) → index of the root that kept it.
+    seen: std::collections::HashMap<(Option<String>, String), usize>,
+    budget: DiscoveryBudget,
+    /// Index of the root being walked.
+    root: usize,
+    shadowed: Vec<ShadowedAt>,
+    shadowed_total: usize,
+    after_plugin: &'h mut dyn FnMut(&str),
+}
+
+impl<'h> Walk<'h> {
+    fn new(after_plugin: &'h mut dyn FnMut(&str)) -> Self {
+        Self {
+            plugins: Vec::new(),
+            skills: Vec::new(),
+            seen: std::collections::HashMap::new(),
+            budget: DiscoveryBudget::default(),
+            root: 0,
+            shadowed: Vec::new(),
+            shadowed_total: 0,
+            after_plugin,
+        }
     }
-    if budget.skipped > 0 {
-        tracing::warn!(
-            skipped = budget.skipped,
-            "skill discovery caps reached; later candidates skipped (count only)"
-        );
+
+    /// Keep `skill` unless its (plugin, name) is already kept (then it is
+    /// shadowed, never counted as skipped) or a cap is reached.
+    fn offer(&mut self, skill: LoadedSkill) {
+        let key = (skill.plugin.clone(), skill.name.clone());
+        if let Some(&kept) = self.seen.get(&key) {
+            self.shadowed_total += 1;
+            if self.shadowed.len() < SHADOWED_REPORT_MAX {
+                let bound = |s: &str| agent_core::BoundedText::new(s, SKILL_NAME_MAX_BYTES).text;
+                self.shadowed
+                    .push((key.0.as_deref().map(bound), key.1, kept, self.root));
+            }
+            return;
+        }
+        if !self.budget.admit(self.skills.len(), &skill) {
+            return;
+        }
+        self.seen.insert(key, self.root);
+        self.skills.push(skill);
     }
-    (plugins, skills)
+
+    fn warn_skipped(&self) {
+        if self.budget.skipped > 0 {
+            tracing::warn!(
+                skipped = self.budget.skipped,
+                "skill discovery caps reached; later candidates skipped (count only)"
+            );
+        }
+    }
 }
 
 /// Running discovery caps. Metadata cost counts the bounded retained
@@ -466,13 +668,7 @@ fn sorted_dir_entries(dir: &Path) -> Vec<PathBuf> {
     paths
 }
 
-fn walk_root(
-    root: &Path,
-    plugins: &mut Vec<Plugin>,
-    skills: &mut Vec<LoadedSkill>,
-    seen: &mut std::collections::HashSet<(Option<String>, String)>,
-    budget: &mut DiscoveryBudget,
-) {
+fn walk_root(root: &Path, walk: &mut Walk<'_>) {
     if !root.exists() {
         return;
     }
@@ -489,7 +685,7 @@ fn walk_root(
                         continue;
                     };
                     let plugin_root = root.join(source);
-                    load_plugin(&plugin_root, Some(&m.name), plugins, skills, seen, budget);
+                    load_plugin(&plugin_root, Some(&m.name), walk);
                 }
                 Some(m.name)
             }
@@ -511,16 +707,9 @@ fn walk_root(
             continue;
         }
         if marketplace_json_for(&path).is_some() {
-            walk_root(&path, plugins, skills, seen, budget);
+            walk_root(&path, walk);
         } else if plugin_json_for(&path).is_some() {
-            load_plugin(
-                &path,
-                marketplace_name.as_deref(),
-                plugins,
-                skills,
-                seen,
-                budget,
-            );
+            load_plugin(&path, marketplace_name.as_deref(), walk);
         }
     }
 
@@ -536,26 +725,14 @@ fn walk_root(
             let skill_md = path.join("SKILL.md");
             if skill_md.exists() {
                 if let Some(s) = load_skill_file(&skill_md, None, None) {
-                    let key = (None, s.name.clone());
-                    if seen.contains(&key) || !budget.admit(skills.len(), &s) {
-                        continue;
-                    }
-                    seen.insert(key);
-                    skills.push(s);
+                    walk.offer(s);
                 }
             }
         }
     }
 }
 
-fn load_plugin(
-    plugin_root: &Path,
-    marketplace: Option<&str>,
-    plugins: &mut Vec<Plugin>,
-    skills: &mut Vec<LoadedSkill>,
-    seen: &mut std::collections::HashSet<(Option<String>, String)>,
-    budget: &mut DiscoveryBudget,
-) {
+fn load_plugin(plugin_root: &Path, marketplace: Option<&str>, walk: &mut Walk<'_>) {
     let Some(manifest_path) = plugin_json_for(plugin_root) else {
         tracing::warn!("no plugin.json under {}", plugin_root.display());
         return;
@@ -572,10 +749,10 @@ fn load_plugin(
     let Ok(root_abs) = plugin_root.canonicalize() else {
         return;
     };
-    if plugins.iter().any(|p| p.root == root_abs) {
+    if walk.plugins.iter().any(|p| p.root == root_abs) {
         return;
     }
-    plugins.push(Plugin {
+    walk.plugins.push(Plugin {
         name: m.name.clone(),
         root: root_abs,
         marketplace: marketplace.map(str::to_string),
@@ -586,26 +763,21 @@ fn load_plugin(
     });
 
     let skills_dir = plugin_root.join("skills");
-    if !skills_dir.is_dir() {
-        return;
-    }
-    for path in sorted_dir_entries(&skills_dir) {
-        if !path.is_dir() {
-            continue;
-        }
-        let skill_md = path.join("SKILL.md");
-        if !skill_md.exists() {
-            continue;
-        }
-        if let Some(s) = load_skill_file(&skill_md, Some(&m.name), Some(plugin_root)) {
-            let key = (Some(m.name.clone()), s.name.clone());
-            if seen.contains(&key) || !budget.admit(skills.len(), &s) {
+    if skills_dir.is_dir() {
+        for path in sorted_dir_entries(&skills_dir) {
+            if !path.is_dir() {
                 continue;
             }
-            seen.insert(key);
-            skills.push(s);
+            let skill_md = path.join("SKILL.md");
+            if !skill_md.exists() {
+                continue;
+            }
+            if let Some(s) = load_skill_file(&skill_md, Some(&m.name), Some(plugin_root)) {
+                walk.offer(s);
+            }
         }
     }
+    (walk.after_plugin)(&m.name);
 }
 
 #[cfg(test)]
@@ -1131,6 +1303,239 @@ mod tests {
         assert_eq!(skills[0].plugin.as_deref(), Some("good"));
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    fn write_plugin(dir: &Path, name: &str) {
+        fs::create_dir_all(dir.join(".synaps-plugin")).unwrap();
+        fs::write(
+            dir.join(".synaps-plugin").join("plugin.json"),
+            format!(r#"{{"name":"{name}"}}"#),
+        )
+        .unwrap();
+    }
+
+    fn skill_md(name: &str, description: &str) -> String {
+        format!("---\nname: {name}\ndescription: {description}\n---\nBody")
+    }
+
+    fn root(kind: RootKind, path: &Path) -> DiscoveryRoot {
+        DiscoveryRoot {
+            kind,
+            path: Some(path.to_path_buf()),
+        }
+    }
+
+    /// Pin 1 (skills v1): a root is resolved once per pass and only the
+    /// resolved directory is walked, so `current` swapped from v1 to v2
+    /// right after the first plugin still gives every plugin and skill
+    /// from v1, and the report names v1.
+    #[cfg(unix)]
+    #[test]
+    fn extra_root_resolves_once_so_a_mid_walk_swap_keeps_one_version() {
+        let tmp = tempdir();
+        for version in ["v1", "v2"] {
+            for plugin in ["p-a", "p-b"] {
+                let dir = tmp.join("versions").join(version).join(plugin);
+                write_plugin(&dir, plugin);
+                write_skill(&dir.join("skills").join("s"), &skill_md("s", version));
+            }
+        }
+        let current = tmp.join("current");
+        std::os::unix::fs::symlink(tmp.join("versions").join("v1"), &current).unwrap();
+        let mut swapped = false;
+        let mut swap = |plugin: &str| {
+            if plugin == "p-a" && !swapped {
+                let next = tmp.join("current.next");
+                std::os::unix::fs::symlink(tmp.join("versions").join("v2"), &next).unwrap();
+                fs::rename(&next, &current).unwrap();
+                swapped = true;
+            }
+        };
+        let pass = load_all_reported_with(&[root(RootKind::Extra, &current)], &mut swap);
+        assert!(swapped, "the swap ran mid-walk");
+        let v1 = tmp.join("versions").join("v1").canonicalize().unwrap();
+        let v2 = tmp.join("versions").join("v2").canonicalize().unwrap();
+        assert_eq!(
+            current.canonicalize().unwrap(),
+            v2,
+            "current points at v2 now"
+        );
+        assert_eq!(pass.roots[0].configured.as_deref(), Some(current.as_path()));
+        assert_eq!(pass.roots[0].resolved.as_deref(), Some(v1.as_path()));
+        let plugins: Vec<&str> = pass.plugins.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(plugins, ["p-a", "p-b"]);
+        assert!(pass.plugins.iter().all(|p| p.root.starts_with(&v1)));
+        assert_eq!(pass.skills.len(), 2);
+        for skill in &pass.skills {
+            assert!(
+                skill.source_path.starts_with(&v1),
+                "every skill from one version"
+            );
+            assert!(skill.base_dir.starts_with(&v1));
+            assert_eq!(skill.description, "v1");
+        }
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// Pin 2 (skills v1): the five roots are walked in order, the first
+    /// (plugin, name) wins, and every dropped duplicate is reported with
+    /// the root that kept it; a shadowed skill is never a skipped one.
+    #[test]
+    fn five_roots_first_wins_and_report_the_shadowed() {
+        use RootKind::*;
+        let tmp = tempdir();
+        let kinds = [
+            ProjectPlugins,
+            ProjectSkills,
+            Extra,
+            HomePlugins,
+            HomeSkills,
+        ];
+        let dirs: Vec<PathBuf> = kinds.iter().map(|k| tmp.join(format!("{k:?}"))).collect();
+        let plugin_skill = |dir: &Path, description: &str| {
+            write_plugin(&dir.join("pl"), "pl");
+            write_skill(
+                &dir.join("pl").join("skills").join("x"),
+                &skill_md("x", description),
+            );
+        };
+        plugin_skill(&dirs[0], "project_plugins");
+        write_skill(&dirs[1].join("dup"), &skill_md("dup", "project_skills"));
+        plugin_skill(&dirs[2], "extra");
+        write_skill(&dirs[2].join("dup"), &skill_md("dup", "extra"));
+        write_skill(&dirs[2].join("e"), &skill_md("e", "extra"));
+        plugin_skill(&dirs[3], "home_plugins");
+        write_skill(&dirs[4].join("dup"), &skill_md("dup", "home_skills"));
+        write_skill(&dirs[4].join("e"), &skill_md("e", "home_skills"));
+
+        let roots: Vec<DiscoveryRoot> = kinds.iter().zip(&dirs).map(|(k, d)| root(*k, d)).collect();
+        let pass = load_all_reported(&roots);
+
+        let kept: Vec<(Option<&str>, &str, &str)> = pass
+            .skills
+            .iter()
+            .map(|s| (s.plugin.as_deref(), s.name.as_str(), s.description.as_str()))
+            .collect();
+        assert_eq!(
+            kept,
+            [
+                (Some("pl"), "x", "project_plugins"),
+                (None, "dup", "project_skills"),
+                (None, "e", "extra"),
+            ]
+        );
+        let counts: Vec<(RootKind, usize, usize)> = pass
+            .roots
+            .iter()
+            .map(|r| (r.kind, r.plugins, r.skills))
+            .collect();
+        assert_eq!(
+            counts,
+            [
+                (ProjectPlugins, 1, 1),
+                (ProjectSkills, 0, 1),
+                (Extra, 1, 1),
+                (HomePlugins, 1, 0),
+                (HomeSkills, 0, 0),
+            ]
+        );
+        let shadow = |plugin: Option<&str>, name: &str, kept, dropped| ShadowedSkill {
+            plugin: plugin.map(str::to_string),
+            name: name.to_string(),
+            kept,
+            dropped,
+        };
+        assert_eq!(
+            pass.shadowed,
+            [
+                shadow(Some("pl"), "x", ProjectPlugins, Extra),
+                shadow(None, "dup", ProjectSkills, Extra),
+                shadow(Some("pl"), "x", ProjectPlugins, HomePlugins),
+                shadow(None, "dup", ProjectSkills, HomeSkills),
+                shadow(None, "e", Extra, HomeSkills),
+            ]
+        );
+        assert_eq!(pass.shadowed_total, 5);
+        assert_eq!(pass.skipped, 0, "a shadowed skill is not a skipped one");
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// The report keeps the first [`SHADOWED_REPORT_MAX`] shadowed skills
+    /// and counts every one.
+    #[test]
+    fn shadowed_report_keeps_the_first_64_and_counts_all() {
+        let tmp = tempdir();
+        let (first, second) = (tmp.join("first"), tmp.join("second"));
+        for i in 0..70 {
+            let name = format!("s{i:02}");
+            for dir in [&first, &second] {
+                write_skill(&dir.join(&name), &skill_md(&name, "d"));
+            }
+        }
+        let pass = load_all_reported(&[
+            root(RootKind::ProjectSkills, &first),
+            root(RootKind::HomeSkills, &second),
+        ]);
+        assert_eq!(pass.skills.len(), 70);
+        assert_eq!(pass.shadowed.len(), SHADOWED_REPORT_MAX);
+        assert_eq!(pass.shadowed_total, 70);
+        assert_eq!(pass.shadowed[0].name, "s00");
+        assert_eq!(pass.shadowed[63].name, "s63");
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// An absent root is skipped and reported unresolved; an unset extra
+    /// root is reported with neither path.
+    #[test]
+    fn an_absent_root_is_skipped_and_reported_unresolved() {
+        let tmp = tempdir();
+        let gone = tmp.join("missing");
+        let unset = DiscoveryRoot {
+            kind: RootKind::Extra,
+            path: None,
+        };
+        let pass = load_all_reported(&[root(RootKind::Extra, &gone), unset]);
+        assert_eq!(pass.roots[0].configured.as_deref(), Some(gone.as_path()));
+        assert_eq!(pass.roots[0].resolved, None);
+        assert_eq!(
+            (
+                pass.roots[1].configured.as_deref(),
+                pass.roots[1].resolved.as_deref()
+            ),
+            (None, None)
+        );
+        assert!(pass.skills.is_empty() && pass.plugins.is_empty());
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// The registry's five roots, in order: the four default roots with
+    /// `skills.extra_root` third, kept whole (inner spaces included).
+    #[test]
+    #[serial_test::serial(synaps_base_dir)]
+    fn discovery_roots_put_the_extra_root_third() {
+        use RootKind::*;
+        let extra =
+            Path::new("/Users/me/Library/Application Support/pria.desktop.dev/skills/current");
+        let roots = discovery_roots(Some(extra));
+        let kinds: Vec<RootKind> = roots.iter().map(|r| r.kind).collect();
+        assert_eq!(
+            kinds,
+            [
+                ProjectPlugins,
+                ProjectSkills,
+                Extra,
+                HomePlugins,
+                HomeSkills
+            ]
+        );
+        assert_eq!(roots[2].path.as_deref(), Some(extra));
+        let others: Vec<PathBuf> = roots
+            .iter()
+            .filter(|r| r.kind != Extra)
+            .filter_map(|r| r.path.clone())
+            .collect();
+        assert_eq!(others, default_roots());
+        assert_eq!(discovery_roots(None)[2].path, None);
     }
 
     /// Create a unique tempdir under /tmp for tests.

@@ -2027,6 +2027,11 @@ pub struct SynapsConfig {
     pub disabled_plugins: Vec<String>,
     pub favorite_models: Vec<String>,
     pub disabled_skills: Vec<String>,
+    /// `skills.extra_root`: one more skill discovery root, walked after the
+    /// project roots and before the home roots. One absolute path on one
+    /// line (inner spaces are part of it, `~` is not expanded); any other
+    /// value is ignored with a warning. See [`check_skills_extra_root`].
+    pub skills_extra_root: Option<PathBuf>,
     /// Opt-in progressive tool disclosure (Task 18). When false, providers
     /// receive the existing full tool schema byte-for-byte. When true, each
     /// stream starts with the small essential local core plus discovery and
@@ -2161,6 +2166,7 @@ impl Default for SynapsConfig {
             disabled_plugins: Vec::new(),
             favorite_models: Vec::new(),
             disabled_skills: Vec::new(),
+            skills_extra_root: None,
             progressive_tool_disclosure: false,
             capacity_wait: true,
             capacity_resume: true,
@@ -2309,6 +2315,7 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "disabled_plugins",
     "favorite_models",
     "disabled_skills",
+    "skills.extra_root",
     "disabled_tools",
     "memory_only_tools",
     "progressive_tool_disclosure",
@@ -3141,6 +3148,14 @@ fn apply_config_content_with(
             "disabled_skills" => {
                 config.disabled_skills = parse_comma_list(val);
             }
+            // An empty value unsets it; a bad one keeps the previous value.
+            "skills.extra_root" if val.is_empty() => config.skills_extra_root = None,
+            "skills.extra_root" => match check_skills_extra_root(val) {
+                Ok(path) => config.skills_extra_root = Some(path),
+                Err(why) => config
+                    .warnings
+                    .push(format!("skills.extra_root — {why}; ignoring it")),
+            },
             "progressive_tool_disclosure" => {
                 config.progressive_tool_disclosure = matches!(val, "true" | "1" | "on" | "yes");
             }
@@ -3489,6 +3504,61 @@ pub fn read_auth_config() -> AuthConfig {
     let mut config = SynapsConfig::default();
     apply_config_content_with(&mut config, &content, &mut |_diagnostic: String| {});
     config.auth
+}
+
+/// Check one `skills.extra_root` value (already trimmed, as the parser
+/// trims): a single absolute path. Inner spaces are kept as they are
+/// ("…/Application Support/…"); a control character, a leading `~` (never
+/// expanded), quotes or a relative path are refused. The reason never
+/// echoes the value.
+pub fn check_skills_extra_root(val: &str) -> Result<PathBuf, &'static str> {
+    if val.is_empty() {
+        return Err("empty value");
+    }
+    if val.chars().any(char::is_control) {
+        return Err("the path has a control character");
+    }
+    if val.starts_with('~') {
+        return Err("~ is not expanded; write the absolute path");
+    }
+    if val.starts_with('"') || val.starts_with('\'') {
+        return Err("write the path without quotes; spaces in it are kept");
+    }
+    let path = std::path::Path::new(val);
+    if !path.is_absolute() {
+        return Err("not an absolute path");
+    }
+    Ok(path.to_path_buf())
+}
+
+/// The config keys one skill discovery pass reads.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SkillsKeys {
+    pub extra_root: Option<PathBuf>,
+    pub disabled_plugins: Vec<String>,
+    pub disabled_skills: Vec<String>,
+}
+
+impl SynapsConfig {
+    /// This snapshot's [`SkillsKeys`].
+    pub fn skills_keys(&self) -> SkillsKeys {
+        SkillsKeys {
+            extra_root: self.skills_extra_root.clone(),
+            disabled_plugins: self.disabled_plugins.clone(),
+            disabled_skills: self.disabled_skills.clone(),
+        }
+    }
+}
+
+/// The [`SkillsKeys`] of the active config file, read fresh now and parsed
+/// without any diagnostics output (`skills.reload`); the caller's own
+/// config snapshot is untouched. A missing or unreadable file reads as
+/// empty, exactly like [`load_config`].
+pub fn read_skills_keys() -> SkillsKeys {
+    let content = std::fs::read_to_string(resolve_read_path("config")).unwrap_or_default();
+    let mut config = SynapsConfig::default();
+    apply_config_content_with(&mut config, &content, &mut |_diagnostic: String| {});
+    config.skills_keys()
 }
 
 /// The config write lock held across a caller's compare-and-set (the
@@ -7840,5 +7910,69 @@ api_retries = 5
                 "{key}"
             );
         }
+    }
+
+    /// `skills.extra_root`: one absolute path, kept whole with its inner
+    /// spaces; a relative path, `~`, quotes or a control character warn
+    /// (without echoing the value) and the line is ignored.
+    #[test]
+    fn skills_extra_root_takes_one_absolute_path() {
+        let mac = "/Users/me/Library/Application Support/pria.desktop.dev/skills/current";
+        let config = load_config_from_str(&format!("skills.extra_root = {mac}\n"));
+        assert_eq!(
+            config.skills_extra_root.as_deref(),
+            Some(std::path::Path::new(mac))
+        );
+        assert!(config.warnings.is_empty(), "{:?}", config.warnings);
+        assert_eq!(config.skills_keys().extra_root, config.skills_extra_root);
+        for bad in [
+            "relative/skills",
+            "~/skills",
+            "\"/quoted path\"",
+            "/a\u{7}b",
+        ] {
+            let config = load_config_from_str(&format!(
+                "skills.extra_root = /kept\nskills.extra_root = {bad}\n"
+            ));
+            assert_eq!(
+                config.skills_extra_root.as_deref(),
+                Some(std::path::Path::new("/kept")),
+                "{bad:?}"
+            );
+            assert_eq!(config.warnings.len(), 1, "{bad:?}: {:?}", config.warnings);
+            assert!(
+                config.warnings[0].starts_with("skills.extra_root — "),
+                "{:?}",
+                config.warnings
+            );
+            assert!(!config.warnings[0].contains(bad), "{:?}", config.warnings);
+        }
+        let unset = load_config_from_str("skills.extra_root = /kept\nskills.extra_root =\n");
+        assert_eq!(unset.skills_extra_root, None);
+        assert!(unset.warnings.is_empty(), "{:?}", unset.warnings);
+        assert!(KNOWN_CONFIG_KEYS.contains(&"skills.extra_root"));
+    }
+
+    /// `read_skills_keys` reads the file as it is now: the three skill keys.
+    #[test]
+    #[serial]
+    fn read_skills_keys_reads_the_file_now() {
+        let home = make_test_home("skills-keys");
+        with_home(&home, || {
+            assert_eq!(read_skills_keys(), SkillsKeys::default());
+            std::fs::write(
+                home.join(".synaps-cli/config"),
+                "skills.extra_root = /x y/z\ndisabled_plugins = a, b\ndisabled_skills = p:s\nmodel = m\n",
+            )
+            .unwrap();
+            let keys = read_skills_keys();
+            assert_eq!(
+                keys.extra_root.as_deref(),
+                Some(std::path::Path::new("/x y/z"))
+            );
+            assert_eq!(keys.disabled_plugins, ["a", "b"]);
+            assert_eq!(keys.disabled_skills, ["p:s"]);
+        });
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

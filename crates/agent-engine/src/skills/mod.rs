@@ -1,7 +1,8 @@
 //! Skills and plugins subsystem.
 //!
-//! Discovers plugins under `.synaps-cli/plugins/` (project-local) and
-//! `~/.synaps-cli/plugins/` (global), registers each skill as a dynamic
+//! Discovers plugins under `.synaps-cli/plugins/` (project-local),
+//! `skills.extra_root` (one configured path) and `~/.synaps-cli/plugins/`
+//! (global), registers each skill as a dynamic
 //! slash command, and exposes the same skills to the model via the
 //! `load_skill` tool. Submodules: `manifest` (plugin/marketplace JSON
 //! parsing), `loader` (discovery walk + frontmatter parsing), `config`
@@ -248,6 +249,34 @@ pub const BUILTIN_COMMANDS: &[&str] = &[
     "watch",
 ];
 
+/// One filtered discovery pass over [`loader::discovery_roots`].
+pub struct Discovered {
+    /// The pass, with the disable filters applied to its `plugins` and
+    /// `skills` (its per-root counts are from before them).
+    pub pass: loader::DiscoveryPass,
+    /// Skills the disable filters removed.
+    pub disabled: usize,
+}
+
+/// Walk the five discovery roots for `keys` and apply its disable lists to
+/// the skills and to the plugins (commands, keybinds, help).
+pub fn discover(keys: &agent_core::config::SkillsKeys) -> Discovered {
+    let roots = loader::discovery_roots(keys.extra_root.as_deref());
+    let mut pass = loader::load_all_reported(&roots);
+    let found = pass.skills.len();
+    pass.skills = config::filter_disabled(
+        std::mem::take(&mut pass.skills),
+        &keys.disabled_plugins,
+        &keys.disabled_skills,
+    );
+    let disabled = found - pass.skills.len();
+    if !keys.disabled_plugins.is_empty() {
+        pass.plugins
+            .retain(|p| !keys.disabled_plugins.iter().any(|d| d == &p.name));
+    }
+    Discovered { pass, disabled }
+}
+
 /// Load all skills, apply disable filters, build the command registry,
 /// build the keybind registry, and register the `load_skill` tool.
 /// Returns (command_registry, keybind_registry).
@@ -261,17 +290,13 @@ pub async fn register(
     // The fs-walk (read_dir + read_to_string + canonicalize across multiple roots)
     // is fully synchronous std::fs; do it on a blocking pool so we don't park a
     // tokio worker during boot. Behavior is identical — same inputs, same output.
-    let (mut plugins, mut skills) =
-        tokio::task::spawn_blocking(|| loader::load_all(&loader::default_roots()))
-            .await
-            .expect("skills::loader::load_all panicked");
-    skills = config::filter_disabled(skills, &config.disabled_plugins, &config.disabled_skills);
-
-    // Filter disabled plugins from commands, keybinds, and help too — not just skills
-    if !config.disabled_plugins.is_empty() {
-        plugins.retain(|p| !config.disabled_plugins.iter().any(|d| d == &p.name));
-    }
-
+    let keys = config.skills_keys();
+    let found = tokio::task::spawn_blocking(move || discover(&keys))
+        .await
+        .expect("skills::loader::load_all panicked");
+    let loader::DiscoveryPass {
+        plugins, skills, ..
+    } = found.pass;
     tracing::info!(
         plugins = plugins.len(),
         skills = skills.len(),
@@ -330,11 +355,69 @@ pub async fn register(
 /// Re-walks discovery roots and swaps in the new skill set atomically.
 /// Built-ins and the existing `load_skill` tool registration are unchanged.
 pub fn reload_registry(registry: &CommandRegistry, config: &crate::SynapsConfig) {
-    let (mut plugins, mut skills) = loader::load_all(&loader::default_roots());
-    skills = config::filter_disabled(skills, &config.disabled_plugins, &config.disabled_skills);
-    if !config.disabled_plugins.is_empty() {
-        plugins.retain(|p| !config.disabled_plugins.iter().any(|d| d == &p.name));
-    }
+    let loader::DiscoveryPass {
+        plugins, skills, ..
+    } = discover(&config.skills_keys()).pass;
     tracing::info!(skills = skills.len(), "reloaded skills");
     registry.rebuild_with_plugins(skills, plugins);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_skill(dir: &std::path::Path, name: &str) {
+        std::fs::create_dir_all(dir.join(name)).unwrap();
+        std::fs::write(
+            dir.join(name).join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: d\n---\nBody"),
+        )
+        .unwrap();
+    }
+
+    /// Pin 3 (skills v1): `disabled_plugins` (and `disabled_skills`) apply
+    /// to the plugins and skills of `skills.extra_root` like any other root.
+    #[test]
+    #[serial_test::serial(synaps_base_dir)]
+    fn disable_lists_apply_to_the_extra_root() {
+        let _base = crate::test_env::BaseDirGuard::new();
+        let extra = tempfile::TempDir::new().unwrap();
+        let plugin = extra.path().join("pria-skills");
+        std::fs::create_dir_all(plugin.join(".synaps-plugin")).unwrap();
+        std::fs::write(
+            plugin.join(".synaps-plugin").join("plugin.json"),
+            r#"{"name":"pria-skills"}"#,
+        )
+        .unwrap();
+        write_skill(&plugin.join("skills"), "a");
+        write_skill(&plugin.join("skills"), "b");
+        write_skill(extra.path(), "loose");
+        write_skill(extra.path(), "other");
+        let mut keys = agent_core::config::SkillsKeys {
+            extra_root: Some(extra.path().to_path_buf()),
+            ..Default::default()
+        };
+        let all = discover(&keys);
+        assert_eq!(all.pass.skills.len(), 4);
+        assert_eq!(all.disabled, 0);
+        assert_eq!(all.pass.plugins.len(), 1);
+
+        keys.disabled_plugins = vec!["pria-skills".into()];
+        keys.disabled_skills = vec!["other".into()];
+        let found = discover(&keys);
+        let names: Vec<&str> = found.pass.skills.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["loose"]);
+        assert!(
+            found.pass.plugins.is_empty(),
+            "the disabled plugin is gone too"
+        );
+        assert_eq!(found.disabled, 3);
+        let extra_root = &found.pass.roots[2];
+        assert_eq!(extra_root.kind, loader::RootKind::Extra);
+        assert_eq!(
+            (extra_root.plugins, extra_root.skills),
+            (1, 4),
+            "counted before the filters"
+        );
+    }
 }

@@ -73,6 +73,7 @@ pub(crate) const EXCLUDED_CONFIG_KEYS: &[(&str, &str)] = &[
     ("subagent.resume_refuse_tokens", "operator context limit: a token count or off, set in the config file"),
     ("favorite_models", "owned by the model picker (/models favorites)"),
     ("disabled_plugins", "owned by the Plugins tab"),
+    ("skills.extra_root", "installer-owned skill root (`synaps config set --if-unset`), shown by `synaps skills status`"),
     ("memory_only_tools", "data-handling policy for extension/MCP tool results, set in the config file or by the app per session"),
     ("tool_scope_slice", "operator cgroup placement, set by hand together with the slice's limits"),
     ("daemon_scope_slice", "operator cgroup placement, set by hand together with the slice's limits"),
