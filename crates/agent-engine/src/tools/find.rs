@@ -161,7 +161,7 @@ mod tests {
             let cmd = build_command(&json!({"pattern": "*", "path": p}), &ctx).unwrap();
             let first = first_arg(&cmd);
             assert!(!first.starts_with('-'), "{p} became argv[1] {first:?}");
-            assert_eq!(first, format!("./{p}"));
+            assert_eq!(first, format!(".{}{p}", std::path::MAIN_SEPARATOR));
         }
         // Ordinary paths are untouched.
         let cmd = build_command(&json!({"pattern": "*", "path": "src"}), &ctx).unwrap();
@@ -176,7 +176,11 @@ mod tests {
         let ctx = create_tool_context();
         for p in ["!", "(", ")", ",", "!foo", "(x"] {
             let cmd = build_command(&json!({"pattern": "*", "path": p}), &ctx).unwrap();
-            assert_eq!(first_arg(&cmd), format!("./{p}"), "path {p:?}");
+            assert_eq!(
+                first_arg(&cmd),
+                format!(".{}{p}", std::path::MAIN_SEPARATOR),
+                "path {p:?}"
+            );
         }
     }
 

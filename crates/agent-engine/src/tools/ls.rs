@@ -117,7 +117,8 @@ mod tests {
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
-        assert_eq!(args, ["-lah", "./-R"]);
+        let dashed = format!(".{}-R", std::path::MAIN_SEPARATOR);
+        assert_eq!(args, ["-lah", dashed.as_str()]);
     }
 
     #[tokio::test]
