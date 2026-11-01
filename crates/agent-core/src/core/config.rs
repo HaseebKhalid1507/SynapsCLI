@@ -3671,12 +3671,46 @@ fn replace_config_line(existing: &str, key: &str, value: &str) -> String {
     out
 }
 
-/// Keys that `synaps config set` ([`write_config_values_checked`]) may write.
+/// Keys that `synaps config set` ([`write_config_values_checked`]) may write
+/// in any mode (the `--if-unset`-only keys are [`IF_UNSET_ONLY_CONFIG_KEYS`]).
 ///
 /// An explicit allowlist, not "any known key": each entry becomes a public,
 /// scriptable write surface (installers set these unattended), so growing
 /// this list is a deliberate product decision, never a convenience.
 pub const SETTABLE_CONFIG_KEYS: &[&str] = &["memory.backend", "memory.axel.executable"];
+
+/// Keys that `synaps config set --if-unset` may write, and no other mode:
+/// the setup doctor fills them in when the user has not chosen, and never
+/// replaces a choice. A plain set ([`ConfigSetMode::Overwrite`]) or a
+/// compare-and-set ([`ConfigSetMode::Expect`]) of one is refused as not
+/// settable. Values get the normal parser check. Besides these, the
+/// `auth.account.<provider>` family takes `--if-unset` with the value
+/// [`IF_UNSET_ACCOUNT_VALUE`] for a known provider, and nothing else (see
+/// [`config_set_allows`]).
+pub const IF_UNSET_ONLY_CONFIG_KEYS: &[&str] = &["context_management.mode", "skills.extra_root"];
+
+/// The only value `config set --if-unset` may write to
+/// `auth.account.<provider>`: never a specific account, never a clear.
+pub const IF_UNSET_ACCOUNT_VALUE: &str = crate::core::auth::AUTO_ACCOUNT_NAME;
+
+/// Whether `synaps config set` in `mode` may write `value` to `key`:
+/// [`SETTABLE_CONFIG_KEYS`] in any mode; under [`ConfigSetMode::IfUnset`]
+/// only, [`IF_UNSET_ONLY_CONFIG_KEYS`] and `auth.account.<provider> = auto`
+/// for a provider synaps knows.
+pub fn config_set_allows(key: &str, value: &str, mode: &ConfigSetMode) -> bool {
+    if SETTABLE_CONFIG_KEYS.contains(&key) {
+        return true;
+    }
+    if !matches!(mode, ConfigSetMode::IfUnset) {
+        return false;
+    }
+    if IF_UNSET_ONLY_CONFIG_KEYS.contains(&key) {
+        return true;
+    }
+    use crate::core::auth::OAuthProviderId;
+    let known = |provider: &str| provider.parse::<OAuthProviderId>().is_ok();
+    key.strip_prefix("auth.account.").is_some_and(known) && value.trim() == IF_UNSET_ACCOUNT_VALUE
+}
 
 /// How [`write_config_values_checked`] treats keys that already have a value.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3723,7 +3757,7 @@ pub enum ConfigKeyStatus {
     Conflict,
     /// [`ConfigSetMode::Expect`]: the key does not have the expected value.
     ExpectFailed,
-    /// The key is not in [`SETTABLE_CONFIG_KEYS`].
+    /// [`config_set_allows`] refuses the key (with its value, in this mode).
     NotSettable,
     /// The `expect_path` given to [`write_config_values_checked`] is not the
     /// config file's canonical path; no key was checked or written.
@@ -3795,8 +3829,9 @@ impl From<std::io::Error> for ConfigSetError {
 /// Under a single [`ConfigLock`] hold: one read of the config file, every
 /// check, then one temp-file + rename write (owner-only) or no write at all.
 /// With `expect_path`, the canonical config path must equal it exactly (no
-/// canonicalization of `expect_path`) before anything else is decided. Keys
-/// outside [`SETTABLE_CONFIG_KEYS`] refuse the call before the file is read.
+/// canonicalization of `expect_path`) before anything else is decided. A key
+/// that [`config_set_allows`] rejects refuses the call before the file is
+/// read.
 /// A value the real parser would warn about is rejected the way
 /// [`validate_config_edit`] rejects it, whatever the file holds now. A key is
 /// present by the rule [`replace_config_line`] uses (its first non-comment
@@ -3844,7 +3879,11 @@ pub fn write_config_values_checked(
     }
     let mut not_settable = false;
     for (key, status) in &mut keys {
-        if !SETTABLE_CONFIG_KEYS.contains(&key.as_str()) {
+        let value = pairs
+            .iter()
+            .find(|(k, _)| k == key)
+            .map_or("", |(_, v)| v.as_str());
+        if !config_set_allows(key, value, mode) {
             *status = ConfigKeyStatus::NotSettable;
             not_settable = true;
         }
@@ -3958,7 +3997,9 @@ fn check_config_set_request(
                     "value for {key} must be one line with no control characters"
                 ));
             }
-            if !is_expect && value.trim().is_empty() {
+            // Clearing an account choice is a refusal (not settable), not
+            // bad input.
+            if !is_expect && value.trim().is_empty() && !key.starts_with("auth.account.") {
                 return invalid(format!("empty value for {key}"));
             }
             if list.iter().filter(|(k, _)| k == key).count() > 1 {
@@ -7904,7 +7945,7 @@ api_retries = 5
     /// Every allowlisted key is one the parser knows, so its value is checked.
     #[test]
     fn settable_config_keys_are_known_parser_keys() {
-        for key in SETTABLE_CONFIG_KEYS {
+        for key in SETTABLE_CONFIG_KEYS.iter().chain(IF_UNSET_ONLY_CONFIG_KEYS) {
             assert!(
                 KNOWN_CONFIG_KEYS.contains(key) || FAMILY_CONFIG_KEYS.contains(key),
                 "{key}"
@@ -7916,6 +7957,7 @@ api_retries = 5
     /// spaces; a relative path, `~`, quotes or a control character warn
     /// (without echoing the value) and the line is ignored.
     #[test]
+    #[cfg(unix)]
     fn skills_extra_root_takes_one_absolute_path() {
         let mac = "/Users/me/Library/Application Support/pria.desktop.dev/skills/current";
         let config = load_config_from_str(&format!("skills.extra_root = {mac}\n"));
@@ -7956,6 +7998,7 @@ api_retries = 5
     /// `read_skills_keys` reads the file as it is now: the three skill keys.
     #[test]
     #[serial]
+    #[cfg(unix)]
     fn read_skills_keys_reads_the_file_now() {
         let home = make_test_home("skills-keys");
         with_home(&home, || {
@@ -7972,6 +8015,98 @@ api_retries = 5
             );
             assert_eq!(keys.disabled_plugins, ["a", "b"]);
             assert_eq!(keys.disabled_skills, ["p:s"]);
+        });
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The `--if-unset`-only keys: a plain set or a compare-and-set of each
+    /// is refused; `auth.account.<provider>` takes only `auto` for a known
+    /// provider; a refusal or a bad value writes nothing; and `--if-unset`
+    /// never replaces a value the user chose.
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn config_set_if_unset_only_keys_refuse_every_other_write() {
+        let home = make_test_home("set-if-unset-only");
+        let cfg = home.join(".synaps-cli/config");
+        let extra = "/Users/me/Library/Application Support/pria.desktop.dev/skills/current";
+        let three = [
+            ("context_management.mode", "auto"),
+            ("skills.extra_root", extra),
+            ("auth.account.anthropic", "auto"),
+        ];
+        let if_unset = ConfigSetMode::IfUnset;
+        let not_settable = |pairs: &[(&str, &str)], mode: &ConfigSetMode| {
+            let outcome = config_set(pairs, mode).unwrap();
+            assert_eq!(
+                outcome.result,
+                ConfigSetResult::Refused,
+                "{pairs:?} {mode:?}"
+            );
+            let want = format!("{}=not_settable", pairs[0].0);
+            assert!(key_statuses(&outcome).contains(&want), "{pairs:?} {mode:?}");
+        };
+        with_home(&home, || {
+            // A plain set, or a compare-and-set, of each of the three.
+            for pair in three {
+                not_settable(&[pair], &ConfigSetMode::Overwrite);
+                not_settable(&[pair], &expect(&[(pair.0, "")]));
+            }
+            // Under auth.account.*, only `auto` for a known provider: never a
+            // specific account, a clear, or an unknown provider.
+            for pair in [
+                ("auth.account.anthropic", "work"),
+                ("auth.account.anthropic", "default"),
+                ("auth.account.anthropic", "AUTO"),
+                ("auth.account.anthropic", ""),
+                ("auth.account.openai", "auto"),
+                ("auth.account.", "auto"),
+            ] {
+                not_settable(&[pair], &if_unset);
+            }
+            not_settable(
+                &[
+                    ("auth.account.anthropic", "work"),
+                    ("memory.backend", "axel"),
+                ],
+                &if_unset,
+            );
+            assert!(!cfg.exists(), "a refusal writes nothing");
+            // Bad values are the parser's (usage) errors.
+            for pair in [
+                ("context_management.mode", "on"),
+                ("skills.extra_root", "rel/skills"),
+            ] {
+                let result = config_set(&[pair], &if_unset);
+                assert!(
+                    matches!(result, Err(ConfigSetError::Invalid(_))),
+                    "{pair:?}"
+                );
+            }
+            assert!(!cfg.exists());
+
+            let outcome = config_set(&three, &if_unset).unwrap();
+            assert_eq!(outcome.result, ConfigSetResult::Written);
+            let written = std::fs::read_to_string(&cfg).unwrap();
+            assert_eq!(
+                written,
+                format!(
+                    "context_management.mode = auto\nskills.extra_root = {extra}\n\
+                     auth.account.anthropic = auto\n"
+                )
+            );
+            assert!(config_content_problems(&written).is_empty());
+            let outcome = config_set(&three, &if_unset).unwrap();
+            assert_eq!(outcome.result, ConfigSetResult::Unchanged);
+
+            // The user's own choices stay: --if-unset is a conflict.
+            let user = "context_management.mode = off\nauth.account.anthropic = work\n";
+            std::fs::write(&cfg, user).unwrap();
+            for pair in [three[0], three[2]] {
+                let outcome = config_set(&[pair], &if_unset).unwrap();
+                assert_eq!(key_statuses(&outcome), [format!("{}=conflict", pair.0)]);
+            }
+            assert_eq!(std::fs::read_to_string(&cfg).unwrap(), user);
         });
         let _ = std::fs::remove_dir_all(&home);
     }

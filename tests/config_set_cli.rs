@@ -217,3 +217,67 @@ fn profile_config_is_written_only_when_it_exists() {
     let base = std::fs::read_to_string(sandbox.config()).unwrap();
     assert_eq!(base, "memory.backend = legacy\n");
 }
+
+/// The setup doctor's three keys take `--if-unset` only: a plain set or an
+/// `--expect` of each is refused (3), as is anything under auth.account.*
+/// but `auto` for a known provider, and a refusal writes nothing. A root path
+/// with spaces is written whole, and reads back equal.
+#[test]
+#[cfg(unix)]
+fn if_unset_only_keys_refuse_every_other_write_and_keep_a_spaced_path_whole() {
+    let sandbox = Sandbox::new();
+    let extra = "/Users/me/Library/Application Support/pria.desktop.dev/skills/current";
+    let extra_pair = format!("skills.extra_root={extra}");
+    let three = [
+        "context_management.mode=auto",
+        extra_pair.as_str(),
+        "auth.account.anthropic=auto",
+    ];
+    let mut refused: Vec<Vec<String>> = Vec::new();
+    for pair in three {
+        let key = pair.split_once('=').unwrap().0;
+        refused.push(vec![pair.into()]);
+        refused.push(vec!["--expect".into(), format!("{key}="), pair.into()]);
+    }
+    for pair in [
+        "auth.account.anthropic=work",
+        "auth.account.anthropic=",
+        "auth.account.openai=auto",
+    ] {
+        refused.push(vec!["--if-unset".into(), pair.into()]);
+    }
+    for args in &refused {
+        let key = args.last().unwrap().split_once('=').unwrap().0;
+        let mut argv = vec!["--json"];
+        argv.extend(args.iter().map(String::as_str));
+        let output = sandbox.run(&argv);
+        assert_eq!(output.status.code(), Some(3), "{argv:?}");
+        let report = json_line(&output);
+        assert_eq!(report["result"], "refused", "{argv:?}");
+        assert_eq!(report["keys"], json!({ key: "not_settable" }), "{argv:?}");
+        assert!(!sandbox.config().exists(), "{argv:?}");
+    }
+
+    let mut argv = vec!["--json", "--if-unset"];
+    argv.extend(three);
+    let output = sandbox.run(&argv);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(json_line(&output)["result"], "written");
+    let written = std::fs::read_to_string(sandbox.config()).unwrap();
+    let want = format!(
+        "context_management.mode = auto\nskills.extra_root = {extra}\nauth.account.anthropic = auto\n"
+    );
+    assert_eq!(written, want);
+    let again = sandbox.run(&argv);
+    assert_eq!(again.status.code(), Some(0));
+    assert_eq!(
+        json_line(&again)["result"],
+        "unchanged",
+        "the spaced path reads back equal"
+    );
+}

@@ -10,7 +10,7 @@ use std::io::Write as _;
 use std::path::PathBuf;
 use synaps_cli::config::{
     write_config_values_checked, ConfigKeyStatus, ConfigSetError, ConfigSetMode,
-    ConfigSetOutcome, ConfigSetResult, SETTABLE_CONFIG_KEYS,
+    ConfigSetOutcome, ConfigSetResult, IF_UNSET_ONLY_CONFIG_KEYS, SETTABLE_CONFIG_KEYS,
 };
 
 /// Written, or every value was already set.
@@ -32,9 +32,11 @@ const APPLIES: &str = "next daemon start";
 pub enum ConfigAction {
     /// Set config keys in one atomic write, or write nothing.
     ///
-    /// Settable keys: memory.backend, memory.axel.executable. Exit codes:
-    /// 0 written or unchanged, 3 refused, 2 usage or invalid value, 1 I/O
-    /// error. Applies from the next daemon start.
+    /// Settable keys: memory.backend, memory.axel.executable. With
+    /// --if-unset only: context_management.mode, skills.extra_root and
+    /// auth.account.<provider>=auto. Exit codes: 0 written or unchanged,
+    /// 3 refused, 2 usage or invalid value, 1 I/O error. Applies from the
+    /// next daemon start.
     Set(SetArgs),
 }
 
@@ -176,6 +178,10 @@ fn outcome_report(json: bool, outcome: &ConfigSetOutcome) -> Report {
         .collect();
     if has_not_settable(outcome) {
         text.push_str(&format!("settable keys: {}\n", SETTABLE_CONFIG_KEYS.join(", ")));
+        text.push_str(&format!(
+            "--if-unset only: {}, auth.account.<provider>=auto\n",
+            IF_UNSET_ONLY_CONFIG_KEYS.join(", ")
+        ));
     }
     let path = outcome.path.display();
     text.push_str(&match outcome.result {
@@ -408,6 +414,10 @@ mod tests {
         let not_settable = outcome(ConfigSetResult::Refused, &[("model", NotSettable)]);
         let stderr = report(false, &Ok(not_settable)).stderr;
         assert!(stderr.contains("settable keys: memory.backend, memory.axel.executable"));
+        assert!(stderr.contains(
+            "--if-unset only: context_management.mode, skills.extra_root, \
+             auth.account.<provider>=auto\n"
+        ));
 
         let invalid = ConfigSetError::Invalid("empty value for memory.backend".into());
         let text = "synaps config set: empty value for memory.backend\n";
