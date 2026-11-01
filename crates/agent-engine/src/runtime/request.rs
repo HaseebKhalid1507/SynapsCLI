@@ -162,6 +162,17 @@ impl<'a> RequestBody<'a> {
         self.max_tokens = self.max_tokens.min(cap);
     }
 
+    /// Cap `max_tokens` for a worker rollover summary: the reply text plus the
+    /// thinking the request may spend (its budget, or the adaptive reserve).
+    /// Not part of the cache key. Never raises `max_tokens`.
+    pub(super) fn apply_rollover_summary_max_tokens(&mut self, text_tokens: u64) {
+        let cap = text_tokens
+            + self
+                .enabled_thinking_budget()
+                .unwrap_or(super::context::ZERO_BUDGET_THINKING_RESERVE_TOKENS);
+        self.max_tokens = self.max_tokens.min(cap);
+    }
+
     /// The `budget_tokens` of budgeted thinking (`type: "enabled"`), if any.
     fn enabled_thinking_budget(&self) -> Option<u64> {
         self.thinking

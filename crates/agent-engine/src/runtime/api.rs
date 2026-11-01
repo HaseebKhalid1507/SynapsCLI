@@ -939,6 +939,21 @@ pub struct ApiOptions {
     /// `rollover_window` / `rollover` fields. `None` (default) before any
     /// rollover and on every non-turn request: records stay unchanged.
     pub context_rollover: Option<super::telemetry::RolloverStamp>,
+    /// Marks the one extra request of a worker rollover summary
+    /// (`runtime::rollover_summary`): the worker's own next request plus a
+    /// request-only instruction, with `max_tokens` capped to the summary and
+    /// the telemetry record stamped `"rollover_summary": true`. `None` on
+    /// every other request, which keeps their bytes unchanged. Native
+    /// Anthropic transport only (the caller checks).
+    pub rollover_summary: Option<RolloverSummaryRequest>,
+}
+
+/// Wire knobs for a rollover-summary request (see
+/// [`ApiOptions::rollover_summary`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RolloverSummaryRequest {
+    /// Output tokens the reply text may take; thinking is allowed on top.
+    pub max_text_tokens: u64,
 }
 
 /// What a keep-warm request does once its body is built.
@@ -1520,6 +1535,12 @@ impl ApiMethods {
                     "keepwarm_max_tokens": body.max_tokens(),
                 }));
             }
+        }
+        // A rollover summary caps only the output (not part of the cache key);
+        // tools, system, thinking and `tool_choice` stay the worker's own so the
+        // whole prefix is a cache read.
+        if let Some(summary) = &options.rollover_summary {
+            body.apply_rollover_summary_max_tokens(summary.max_text_tokens);
         }
         let translation_report = parts.report;
 
@@ -2491,10 +2512,23 @@ impl ApiMethods {
                         breakpoints,
                     },
                     keepwarm: options.keepwarm.is_some(),
+                    rollover_summary: options.rollover_summary.is_some(),
                     worker: options.codex_request_role
                         == crate::runtime::openai::catalog::CodexRequestRole::Worker,
                     rollover_window: options.context_rollover.map(|r| r.window),
                     rollover: options.context_rollover.is_some_and(|r| r.first_request),
+                    rollover_summary_tokens: options
+                        .context_rollover
+                        .and_then(|r| r.summary)
+                        .and_then(|s| s.tokens),
+                    rollover_successor_tokens: options
+                        .context_rollover
+                        .and_then(|r| r.summary)
+                        .map(|s| s.successor_tokens),
+                    rollover_summary_fallback: options
+                        .context_rollover
+                        .and_then(|r| r.summary)
+                        .and_then(|s| s.fallback),
                     ..Default::default()
                 };
                 record.set_correlation(
