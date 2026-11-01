@@ -36,6 +36,11 @@ All notable changes to this project will be documented in this file.
   refuses a provider whose `auth.account.<provider>` has more than one line
   and writes nothing (`--json`: `config_unwritable`).
 
+- **`synaps config set` makes a missing base dir `0700`.** On a fresh
+  install the base dir is created owner-only, set explicitly whatever the
+  umask (its missing parents get the umask's mode, as before). An existing
+  base dir keeps its mode; nothing is repaired.
+
 - **A third skill root, `skills.extra_root`, and `synaps skills
   status|reload`.** `skills.extra_root = /absolute/path` (spaces kept, no
   quotes, no `~`) adds a root walked after the project roots and before

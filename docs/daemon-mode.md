@@ -257,6 +257,8 @@ a config warning (the key keeps an earlier valid value, else stays unset).
 `synaps config set --if-unset skills.extra_root=<path>` writes it only when
 the key has no line: `skills.extra_root =` is refused as `empty`, another
 path as `conflict`, and two lines as `duplicate` (exit 3, nothing written).
+On a fresh install it creates the base dir `0700` and the config `0600`; an
+existing base dir keeps its mode.
 The root is resolved (realpath) once per walk, so a `current` symlink
 swapped mid-walk cannot mix two versions. `disabled_plugins` and
 `disabled_skills` apply to it as to every root. The extra root gives

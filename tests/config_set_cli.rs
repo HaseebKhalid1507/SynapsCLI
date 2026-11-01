@@ -2,7 +2,7 @@
 //! does not exist yet, as on a machine where Synaps never ran. No daemon is
 //! started or contacted and no provider is involved.
 use serde_json::{json, Value};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
 struct Sandbox {
@@ -32,16 +32,31 @@ impl Sandbox {
 
     /// `synaps config set <args>`.
     fn run(&self, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_synaps"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_synaps"));
+        command.args(["config", "set"]);
+        self.output(command, &self.base(), args)
+    }
+
+    /// `synaps config set <args>` under umask 022 (a common default), with
+    /// `base` as the base dir.
+    #[cfg(unix)]
+    fn run_umask_022(&self, base: &Path, args: &[&str]) -> Output {
+        let mut command = Command::new("/bin/sh");
+        let script = "umask 022 && exec \"$0\" config set \"$@\"";
+        command.args(["-c", script, env!("CARGO_BIN_EXE_synaps")]);
+        self.output(command, base, args)
+    }
+
+    fn output(&self, mut command: Command, base: &Path, args: &[&str]) -> Output {
+        command
             .env_clear()
             .env("HOME", self.dir.path())
             .env("USERPROFILE", self.dir.path())
-            .env("SYNAPS_BASE_DIR", self.base())
+            .env("SYNAPS_BASE_DIR", base)
             .env("PATH", "/usr/bin:/bin")
             .env("TERM", "dumb")
             .current_dir(self.dir.path())
             .stdin(Stdio::null())
-            .args(["config", "set"])
             .args(args)
             .output()
             .unwrap()
@@ -375,4 +390,51 @@ fn a_fresh_install_is_filled_by_if_unset_with_expect_path() {
     use std::os::unix::fs::PermissionsExt;
     let metadata = std::fs::metadata(sandbox.config()).unwrap();
     assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+}
+
+/// Under umask 022, the base dir the doctor's fill makes is 0700, and only
+/// that one: its missing parents get the umask's 0755, and an existing 0755
+/// base dir stays 0755.
+#[test]
+#[cfg(unix)]
+fn a_base_dir_config_set_makes_is_0700_and_an_existing_one_keeps_its_mode() {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+    let sandbox = Sandbox::new();
+    let root = std::fs::canonicalize(sandbox.dir.path()).unwrap();
+    let fill = |base: &Path| {
+        let expected = base.join("config");
+        let args = [
+            "--json",
+            "--if-unset",
+            "--expect-path",
+            expected.to_str().unwrap(),
+            "context_management.mode=auto",
+        ];
+        let output = sandbox.run_umask_022(base, &args);
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert_eq!(output.status.code(), Some(0), "{stderr}");
+        assert_eq!(json_line(&output)["result"], "written");
+        assert_eq!(mode(&expected), 0o600);
+    };
+
+    // A fresh install: no base dir.
+    let base = root.join(".synaps-cli");
+    assert!(!base.exists());
+    fill(&base);
+    assert_eq!(mode(&base), 0o700);
+
+    // A base dir under two missing parents.
+    let parents = root.join("a").join("b");
+    fill(&parents.join(".synaps-cli"));
+    assert_eq!(mode(&parents.join(".synaps-cli")), 0o700);
+    assert_eq!(mode(&root.join("a")), 0o755);
+    assert_eq!(mode(&parents), 0o755);
+
+    // An existing 0755 base dir.
+    let base = root.join("existing");
+    std::fs::create_dir(&base).unwrap();
+    std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o755)).unwrap();
+    fill(&base);
+    assert_eq!(mode(&base), 0o755);
 }

@@ -3895,7 +3895,8 @@ impl From<std::io::Error> for ConfigSetError {
 /// `key = value` line); values compare trimmed. A key with more than one
 /// such line refuses the call in every mode ([`ConfigKeyStatus::Duplicate`]),
 /// and under `--if-unset` a line with an empty value is
-/// [`ConfigKeyStatus::Empty`], not a conflict.
+/// [`ConfigKeyStatus::Empty`], not a conflict. A missing base dir is made
+/// `0700` ([`create_config_dir`]).
 ///
 /// `Err(Invalid)` is bad input; a policy or state refusal is `Ok` with
 /// [`ConfigSetResult::Refused`] and a reason per key.
@@ -3923,6 +3924,11 @@ pub fn write_config_values_checked(
         keys,
     };
 
+    // A fresh install: make the base dir 0700 here, before the lock step
+    // would make it with the umask's mode.
+    if let Some(dir) = path.parent() {
+        create_config_dir(dir)?;
+    }
     let _guard = ConfigLock::acquire()?;
     // Read and replace the file itself, never a symlink to it: the path
     // reported (and compared by --expect-path) is then the file that changes,
@@ -4018,9 +4024,9 @@ pub fn write_config_values_checked(
     } else if changed.is_empty() {
         ConfigSetResult::Unchanged
     } else {
-        // As `resolve_write_path` would; only missing when the lock is off.
+        // Made above; only missing if it was removed since.
         if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
+            create_config_dir(dir)?;
         }
         publish_config_locked(&path, &apply(&changed))?;
         for (key, _) in &changed {
@@ -4093,6 +4099,34 @@ fn config_set_target() -> Result<PathBuf, ConfigSetError> {
         )));
     }
     Ok(target)
+}
+
+/// Make the config file's directory (the base dir: under a profile it
+/// exists already, see [`config_set_target`]) when it is missing, `0700`
+/// set explicitly, so the umask does not decide it. Missing parents get
+/// what `create_dir_all` gives them (the umask's mode), as before. An
+/// existing directory is left as it is, mode and all; so is one another
+/// process makes in between.
+fn create_config_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    if dir.as_os_str().is_empty() || dir.is_dir() {
+        return Ok(());
+    }
+    if let Some(parent) = dir.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+            // Made here, so its mode is ours to set (mkdir's is masked).
+            Ok(()) => std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?,
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(err) => return Err(err),
+        }
+    }
+    #[cfg(not(unix))]
+    std::fs::create_dir_all(dir)?;
+    Ok(())
 }
 
 /// The canonical absolute path of the config file [`load_config`] reads now
@@ -8317,6 +8351,58 @@ api_retries = 5
                 written,
                 "model = a\nmodel = b\nauth.account.anthropic = auto\n"
             );
+        });
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// `config set`'s base dir: a missing one is made 0700 (and its missing
+    /// parent too, as `create_dir_all` makes it); an existing one keeps its
+    /// mode, whatever it is.
+    #[test]
+    #[cfg(unix)]
+    fn create_config_dir_makes_a_missing_dir_0700_and_leaves_an_existing_one() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode =
+            |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        let root = tempfile::tempdir().unwrap();
+        let base = root.path().join("parent").join(".synaps-cli");
+        create_config_dir(&base).unwrap();
+        assert_eq!(mode(&base), 0o700);
+        assert!(root.path().join("parent").is_dir());
+        for existing in [0o755, 0o750, 0o711] {
+            let permissions = std::fs::Permissions::from_mode(existing);
+            std::fs::set_permissions(&base, permissions).unwrap();
+            create_config_dir(&base).unwrap();
+            assert_eq!(mode(&base), existing);
+        }
+    }
+
+    /// A fresh install's base dir, made by `config set` itself, is 0700
+    /// with the config lock on or off, and the reply's path is the file
+    /// written.
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn config_set_makes_a_fresh_base_dir_0700_with_the_lock_on_or_off() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = make_test_home("set-fresh-base-dir");
+        let base = home.join(".synaps-cli");
+        let pairs = [("context_management.mode".to_string(), "auto".to_string())];
+        with_home(&home, || {
+            for lock_off in [false, true] {
+                std::fs::remove_dir_all(&base).unwrap();
+                if lock_off {
+                    std::env::set_var("SYNAPS_CONFIG_LOCK", "0");
+                }
+                let outcome = write_config_values_checked(&pairs, &ConfigSetMode::IfUnset, None);
+                std::env::remove_var("SYNAPS_CONFIG_LOCK");
+                let outcome = outcome.unwrap();
+                assert_eq!(outcome.result, ConfigSetResult::Written, "{lock_off}");
+                let config = std::fs::canonicalize(base.join("config")).unwrap();
+                assert_eq!(outcome.path, config);
+                let mode = std::fs::metadata(&base).unwrap().permissions().mode();
+                assert_eq!(mode & 0o777, 0o700, "lock off: {lock_off}");
+            }
         });
         let _ = std::fs::remove_dir_all(&home);
     }
