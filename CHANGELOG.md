@@ -41,6 +41,12 @@ All notable changes to this project will be documented in this file.
   umask (its missing parents get the umask's mode, as before). An existing
   base dir keeps its mode; nothing is repaired.
 
+- **`synaps config set --contract N`** requires config-set contract N: this
+  build implements 2, and any other N is a usage error (exit 2, nothing
+  written); every `--json` reply carries `"contract": 2` (schema still
+  `synaps.config-set/1`), and the setup doctor passes `--contract 2` and
+  requires the echo, so a synaps without the flag refuses it at parse time.
+
 - **A third skill root, `skills.extra_root`, and `synaps skills
   status|reload`.** `skills.extra_root = /absolute/path` (spaces kept, no
   quotes, no `~`) adds a root walked after the project roots and before

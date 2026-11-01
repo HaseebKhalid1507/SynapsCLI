@@ -259,6 +259,9 @@ the key has no line: `skills.extra_root =` is refused as `empty`, another
 path as `conflict`, and two lines as `duplicate` (exit 3, nothing written).
 On a fresh install it creates the base dir `0700` and the config `0600`; an
 existing base dir keeps its mode.
+`--contract N` requires config-set contract N (this build: 2; another N exits
+2, nothing written) and every `--json` reply says `"contract": 2`; the setup
+doctor passes `--contract 2` and requires the echo.
 The root is resolved (realpath) once per walk, so a `current` symlink
 swapped mid-walk cannot mix two versions. `disabled_plugins` and
 `disabled_skills` apply to it as to every root. The extra root gives

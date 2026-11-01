@@ -25,6 +25,10 @@ const EXIT_REFUSED: i32 = 3;
 
 /// `schema` of every `--json` line.
 const SCHEMA: &str = "synaps.config-set/1";
+/// The config-set contract this build implements: `--contract` accepts only
+/// this, and every `--json` line says it as `contract`. 2: the `empty` and
+/// `duplicate` key results, a base dir it makes is 0700, and `--contract`.
+const CONTRACT: u32 = 2;
 /// When a written value takes effect.
 const APPLIES: &str = "next daemon start";
 
@@ -58,6 +62,11 @@ pub struct SetArgs {
     /// Refuse unless the config file's canonical path is exactly this one.
     #[arg(long, value_name = "ABS_PATH")]
     expect_path: Option<PathBuf>,
+    /// Require config-set contract N (this build: 2; any other N exits 2,
+    /// nothing written); the setup doctor passes --contract 2 and requires
+    /// "contract":2 in the --json line.
+    #[arg(long, value_name = "N")]
+    contract: Option<String>,
     /// Keys and values to set.
     #[arg(value_name = "KEY=VALUE", required = true)]
     pairs: Vec<String>,
@@ -79,6 +88,13 @@ pub fn run(action: ConfigAction) -> i32 {
 
 /// The pairs and mode `args` ask for.
 fn request(args: &SetArgs) -> Result<(Vec<(String, String)>, ConfigSetMode), ConfigSetError> {
+    // First, so another contract reads, locks and writes nothing. Exactly
+    // "2" (not "02"), and the value is not echoed.
+    if matches!(&args.contract, Some(n) if *n != CONTRACT.to_string()) {
+        return Err(ConfigSetError::Invalid(format!(
+            "--contract: this synaps implements config-set contract {CONTRACT} only"
+        )));
+    }
     let pairs = parse_pairs("argument", &args.pairs)?;
     let mode = if args.if_unset {
         ConfigSetMode::IfUnset
@@ -166,6 +182,7 @@ fn outcome_report(json: bool, outcome: &ConfigSetOutcome) -> Report {
     if json {
         let line = json_line(&JsonOutcome {
             schema: SCHEMA,
+            contract: CONTRACT,
             result: outcome.result.as_str(),
             path: outcome.path.to_string_lossy().into_owned(),
             keys: JsonKeys(&outcome.keys),
@@ -207,6 +224,7 @@ fn error_report(json: bool, err: &ConfigSetError) -> Report {
     if json {
         let line = json_line(&JsonError {
             schema: SCHEMA,
+            contract: CONTRACT,
             result: "error",
             error: kind,
             message,
@@ -228,6 +246,7 @@ fn json_line(value: &impl serde::Serialize) -> String {
 #[derive(serde::Serialize)]
 struct JsonOutcome<'a> {
     schema: &'static str,
+    contract: u32,
     result: &'static str,
     path: String,
     keys: JsonKeys<'a>,
@@ -247,6 +266,7 @@ impl serde::Serialize for JsonKeys<'_> {
 #[derive(serde::Serialize)]
 struct JsonError {
     schema: &'static str,
+    contract: u32,
     result: &'static str,
     error: &'static str,
     message: String,
@@ -334,13 +354,33 @@ mod tests {
     }
 
     #[test]
+    fn contract_2_is_the_only_one_accepted_and_others_are_usage_errors() {
+        let two = parse(&["--contract", "2", "--if-unset", "memory.backend=axel"]).unwrap();
+        assert_eq!(two.contract.as_deref(), Some("2"));
+        assert_eq!(request(&two).unwrap().1, ConfigSetMode::IfUnset);
+        assert!(parse(&["--contract=2", "memory.backend=axel"]).is_ok());
+        assert_eq!(parse(&["memory.backend=axel"]).unwrap().contract, None);
+        for other in ["3", "1", "02", " 2", "", "sk-secret"] {
+            // Checked before the pairs: a malformed one does not hide it.
+            let args = parse(&["--contract", other, "memory.backend"]).unwrap();
+            let Err(ConfigSetError::Invalid(message)) = request(&args) else {
+                panic!("{other:?} accepted");
+            };
+            let want = "--contract: this synaps implements config-set contract 2 only";
+            assert_eq!(message, want);
+        }
+        let no_n = parse(&["memory.backend=axel", "--contract"]);
+        assert!(no_n.is_err(), "N is required");
+    }
+
+    #[test]
     fn json_report_matches_the_schema() {
         let written = outcome(
             ConfigSetResult::Written,
             &[("memory.backend", Written), ("memory.axel.executable", Unchanged)],
         );
         let expected = concat!(
-            r#"{"schema":"synaps.config-set/1","result":"written","#,
+            r#"{"schema":"synaps.config-set/1","contract":2,"result":"written","#,
             r#""path":"/home/u/.synaps-cli/config","#,
             r#""keys":{"memory.backend":"written","memory.axel.executable":"unchanged"},"#,
             r#""applies":"next daemon start"}"#,
@@ -355,7 +395,8 @@ mod tests {
         let invalid = ConfigSetError::Invalid("bad \"value\"\nfor memory.backend".into());
         let usage = report(true, &Err(invalid));
         let expected = concat!(
-            r#"{"schema":"synaps.config-set/1","result":"error","error":"usage","#,
+            r#"{"schema":"synaps.config-set/1","contract":2,"result":"error","#,
+            r#""error":"usage","#,
             r#""message":"bad \"value\"\nfor memory.backend"}"#,
             "\n",
         );
@@ -364,7 +405,8 @@ mod tests {
         let denied = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
         let io = report(true, &Err(ConfigSetError::Io(denied)));
         let expected = concat!(
-            r#"{"schema":"synaps.config-set/1","result":"error","error":"io","#,
+            r#"{"schema":"synaps.config-set/1","contract":2,"result":"error","#,
+            r#""error":"io","#,
             r#""message":"config file: denied"}"#,
             "\n",
         );
@@ -393,6 +435,7 @@ mod tests {
             let value: serde_json::Value = serde_json::from_str(&line).unwrap();
             assert_eq!(value["result"], result.as_str());
             assert_eq!(value["keys"]["memory.backend"], status.as_str());
+            assert_eq!(value["contract"], 2, "{status:?}");
         }
         let invalid = ConfigSetError::Invalid("x".into());
         assert_eq!(report(false, &Err(invalid)).code, EXIT_USAGE);

@@ -88,6 +88,7 @@ fn if_unset_two_keys_writes_once_then_unchanged_then_refuses_a_user_value() {
         json_line(&first),
         json!({
             "schema": "synaps.config-set/1",
+            "contract": 2,
             "result": "written",
             "path": canonical.to_str().unwrap(),
             "keys": {"memory.backend": "written", "memory.axel.executable": "written"},
@@ -379,6 +380,7 @@ fn a_fresh_install_is_filled_by_if_unset_with_expect_path() {
         json_line(&output),
         json!({
             "schema": "synaps.config-set/1",
+            "contract": 2,
             "result": "written",
             "path": expected,
             "keys": {"context_management.mode": "written"},
@@ -437,4 +439,112 @@ fn a_base_dir_config_set_makes_is_0700_and_an_existing_one_keeps_its_mode() {
     std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o755)).unwrap();
     fill(&base);
     assert_eq!(mode(&base), 0o755);
+}
+
+/// The setup doctor's marker: `--contract 2` is accepted, and every `--json`
+/// reply says `"contract": 2`: written, unchanged, refused and error, with
+/// the flag or without it.
+#[test]
+fn contract_2_is_accepted_and_every_json_reply_echoes_it() {
+    let sandbox = Sandbox::new();
+    let auto = "context_management.mode=auto";
+    let off = "context_management.mode=off";
+    let fill = ["--json", "--contract", "2", "--if-unset", auto];
+    let output = sandbox.run(&fill);
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert_eq!(output.status.code(), Some(0), "{stderr}");
+    let report = json_line(&output);
+    assert_eq!(report["contract"], 2);
+    assert_eq!(report["result"], "written");
+    let keys = json!({"context_management.mode": "written"});
+    assert_eq!(report["keys"], keys);
+    let written = "context_management.mode = auto\n";
+    assert_eq!(std::fs::read_to_string(sandbox.config()).unwrap(), written);
+
+    // A conflict (the user's `auto` is kept), and an invalid value.
+    let conflict = ["--json", "--contract", "2", "--if-unset", off];
+    let invalid = ["--json", "--contract", "2", "memory.backend=bogus"];
+    let runs: [(&[&str], i32, &str); 5] = [
+        (&fill, 0, "unchanged"),
+        (&["--json", "--if-unset", auto], 0, "unchanged"),
+        (&conflict, 3, "refused"),
+        (&["--json", "--if-unset", off], 3, "refused"),
+        (&invalid, 2, "error"),
+    ];
+    for (args, code, result) in runs {
+        let output = sandbox.run(args);
+        assert_eq!(output.status.code(), Some(code), "{args:?}");
+        let report = json_line(&output);
+        assert_eq!(report["contract"], 2, "{args:?}");
+        assert_eq!(report["result"], result, "{args:?}");
+        assert_eq!(std::fs::read_to_string(sandbox.config()).unwrap(), written);
+    }
+    let report = json_line(&sandbox.run(&conflict));
+    let keys = json!({"context_management.mode": "conflict"});
+    assert_eq!(report["keys"], keys);
+}
+
+/// Any contract but 2 is a usage error (2) before the config is read or
+/// locked: no base dir, lock or config file is made, an existing config
+/// keeps its bytes, and the `--json` reply still says what this build is.
+#[test]
+fn another_contract_exits_2_and_writes_and_creates_nothing() {
+    let sandbox = Sandbox::new();
+    let auto = "context_management.mode=auto";
+    for contract in ["3", "1", "02", ""] {
+        let args = ["--json", "--contract", contract, "--if-unset", auto];
+        let output = sandbox.run(&args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        let report = json_line(&output);
+        assert_eq!(report["result"], "error", "{args:?}");
+        assert_eq!(report["error"], "usage", "{args:?}");
+        assert_eq!(report["contract"], 2, "{args:?}");
+        assert!(!sandbox.base().exists(), "{args:?}");
+    }
+
+    std::fs::create_dir_all(sandbox.base()).unwrap();
+    let original = "# mine\nmemory.backend = legacy\n";
+    std::fs::write(sandbox.config(), original).unwrap();
+    let runs: [&[&str]; 3] = [
+        &["--json", "--contract", "3", "memory.backend=axel"],
+        &["--json", "--contract", "3", "--if-unset", auto],
+        &["--contract", "3", "memory.backend=axel"],
+    ];
+    for args in runs {
+        let output = sandbox.run(args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert_eq!(std::fs::read_to_string(sandbox.config()).unwrap(), original);
+        let entries: Vec<_> = std::fs::read_dir(sandbox.base()).unwrap().collect();
+        assert_eq!(entries.len(), 1, "only the config, no lock: {args:?}");
+    }
+    let plain = sandbox.run(runs[2]);
+    assert!(plain.stdout.is_empty());
+    let stderr = String::from_utf8(plain.stderr).unwrap();
+    let want = "synaps config set: --contract: this synaps implements config-set contract 2 only\n";
+    assert_eq!(stderr, want);
+}
+
+/// How a synaps from before `--contract` refuses it: clap rejects a flag it
+/// does not know at parse time (2, no JSON line), so nothing is written and
+/// no config file is made. `--contract-next` stands in for `--contract`.
+#[test]
+fn an_unknown_flag_is_refused_at_parse_time_and_nothing_is_written() {
+    let sandbox = Sandbox::new();
+    let auto = "context_management.mode=auto";
+    let args = ["--json", "--contract-next", "1", "--if-unset", auto];
+    let output = sandbox.run(&args);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty(), "no JSON reply");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let refusal = "unexpected argument '--contract-next'";
+    assert!(stderr.contains(refusal), "{stderr}");
+    assert!(!sandbox.config().exists());
+    assert!(!sandbox.base().exists());
+
+    std::fs::create_dir_all(sandbox.base()).unwrap();
+    let original = "memory.backend = legacy\n";
+    std::fs::write(sandbox.config(), original).unwrap();
+    let args = ["--json", "--contract-next", "1", "memory.backend=axel"];
+    assert_eq!(sandbox.run(&args).status.code(), Some(2));
+    assert_eq!(std::fs::read_to_string(sandbox.config()).unwrap(), original);
 }
