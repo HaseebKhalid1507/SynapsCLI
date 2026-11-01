@@ -2,7 +2,6 @@ use super::{resolve_path_in, Tool, ToolContext};
 use crate::{Result, RuntimeError};
 use serde_json::{json, Value};
 use std::time::Duration;
-use tokio::process::Command;
 
 pub struct GrepTool;
 
@@ -60,10 +59,7 @@ impl Tool for GrepTool {
         let include = params["include"].as_str();
         let context = params["context"].as_u64();
 
-        let mut cmd = Command::new("grep");
-        if let Some(env) = &ctx.capabilities.env {
-            cmd.env_clear().envs(env.iter().map(|(k, v)| (k, v)));
-        }
+        let mut cmd = super::unix_programs::unix_tool_command("grep", &ctx)?;
         cmd.arg("-rn");
         cmd.arg("--color=never");
 

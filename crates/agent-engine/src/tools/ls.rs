@@ -38,7 +38,7 @@ impl Tool for LsTool {
     }
 
     async fn execute(&self, params: Value, ctx: ToolContext) -> Result<String> {
-        let output = build_command(&params, &ctx)
+        let output = build_command(&params, &ctx)?
             .output()
             .await
             .map_err(|e| RuntimeError::Tool(format!("Failed to execute ls: {}", e)))?;
@@ -57,17 +57,14 @@ impl Tool for LsTool {
 }
 
 /// Build the `ls` argv (split out for tests).
-fn build_command(params: &Value, ctx: &ToolContext) -> Command {
+fn build_command(params: &Value, ctx: &ToolContext) -> Result<Command> {
     let path = path_arg_never_option(resolve_path_in(
         params["path"].as_str().unwrap_or("."),
         ctx.capabilities.cwd.as_deref(),
     ));
-    let mut cmd = Command::new("ls");
-    if let Some(env) = &ctx.capabilities.env {
-        cmd.env_clear().envs(env.iter().map(|(k, v)| (k, v)));
-    }
+    let mut cmd = super::unix_programs::unix_tool_command("ls", ctx)?;
     cmd.arg("-lah").arg(&path);
-    cmd
+    Ok(cmd)
 }
 
 #[cfg(test)]
@@ -114,7 +111,7 @@ mod tests {
     #[test]
     fn leading_dash_path_is_never_an_option() {
         let ctx = create_tool_context();
-        let cmd = build_command(&json!({"path": "-R"}), &ctx);
+        let cmd = build_command(&json!({"path": "-R"}), &ctx).unwrap();
         let args: Vec<String> = cmd
             .as_std()
             .get_args()
@@ -129,7 +126,7 @@ mod tests {
         std::fs::write(dir.path().join("-x"), "").unwrap();
         std::fs::write(dir.path().join("other.txt"), "").unwrap();
         let ctx = create_tool_context();
-        let mut cmd = build_command(&json!({"path": "-x"}), &ctx);
+        let mut cmd = build_command(&json!({"path": "-x"}), &ctx).unwrap();
         cmd.current_dir(dir.path());
         let out = cmd.output().await.unwrap();
         assert!(

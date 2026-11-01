@@ -82,10 +82,7 @@ fn build_command(params: &Value, ctx: &ToolContext) -> Result<Command> {
         }
     }
 
-    let mut cmd = Command::new("find");
-    if let Some(env) = &ctx.capabilities.env {
-        cmd.env_clear().envs(env.iter().map(|(k, v)| (k, v)));
-    }
+    let mut cmd = super::unix_programs::unix_tool_command("find", ctx)?;
     cmd.arg(&path);
 
     cmd.args(["-not", "-path", "*/.git/*"]);
