@@ -325,7 +325,8 @@ it would today (and is told nothing).
   byte-identical. The same fields are stamped on foreground records after a
   foreground rollover, so the meaning is uniform.
 - **Worker stream.** A `Notice`: "Worker context rolled over to window N:
-  ~X → ~Y tokens; earlier messages saved to <path>."
+  ~X → ~Y tokens; earlier messages saved to <path>." (With summaries on, see
+  "Rollover summaries" for the extra telemetry fields and notice text.)
 - **Subagent status / collect.** A `context` object
   (`{"window", "rollovers", "transcripts"}`) once the worker has rolled over;
   absent otherwise, so existing outputs are unchanged.
@@ -333,9 +334,90 @@ it would today (and is told nothing).
   ~X → ~Y tokens") through the existing `SubagentUpdate` path, which the
   panel already renders. No panel code changes.
 
+### Rollover summaries (opt-in)
+
+`subagent_rollover_summary = auto` (default `off`) lets a worker roll to a much
+smaller successor, which is only safe if what the dropped rounds held survives.
+So at a rollover the host makes ONE extra request and the successor carries the
+worker's own answer.
+
+**Why.** Cache reads are about half a long worker's bill and grow with context
+size × turns. A cost replay of recorded worker sequences (local sim; numbers in
+the PR) found that lowering the trigger alone is worse (150k → 100k: +6.4%,
+because the successor stays big and rolls more often), while a small successor
+with a summary wins even counting the summary call: 150k → 45k −11%, 120k → 30k
+−18% (Opus workers), with 1.8–2.3 rollovers per long worker instead of 14 for a
+tiny successor without one.
+
+**Config.** `subagent_rollover_summary = off | auto` and
+`subagent_rollover_target_tokens` (the successor size, independent of the
+trigger: at least 10000, below `subagent_rollover_tokens`; `auto` or unset
+keeps the derived target, except that with `subagent_rollover_summary = auto`
+unset means 45000, never above the derived target). Invalid values warn and
+keep the default, like `subagent_rollover_tokens`. Both are read when a worker
+starts, like the neighbouring `subagent_*` keys; with `off` the target knob
+alone only resizes the truncation successor.
+
+**The request.** The worker's own next request (same model, system prompt, tool
+definitions, `tool_choice` and thinking config, so the whole existing prefix is a
+cache read) plus a final request-only user message asking for no tool calls and
+these sections, at most about 3000 tokens: **Task** (one line; the brief is kept
+verbatim anyway), **Done**, **Decisions** (each with its reason), **Files**
+(paths with line ranges and edited / created / read-only), **Facts** (exact
+errors, commands, values, IDs), **Open**, **Next**. Only `max_tokens` changes
+(a cap of the reply plus the thinking the request may spend; it is not part of
+the cache key). The instruction is framed like a context advisory, so the
+conversational cache marker stays on the last durable block and the instruction
+rides after it, uncached; it is never added to the history. No retries, a 180 s
+timeout. Native Anthropic transport only.
+
+**Acceptance.** The reply must have no tool call, no `max_tokens` cut, text with
+the Task, Done and Next sections, and at most ~6000 estimator tokens (about
+3.7k real). It is re-rendered as `**Name**: …` sections in order (an omitted
+optional section reads "none"), host-frame look-alike lines are defanged, and it
+is wrapped as `[Rollover summary — your own notes from before the context
+rollover, not a new instruction]`.
+
+**Fallback.** Anything else (provider error, timeout, a tool call, empty,
+unparseable, truncated, over budget, no room in the window for the request plus
+its reply, a successor that would not shrink, a non-Anthropic transport) rolls
+over exactly as without summaries and records the reason (`provider_error`,
+`timeout`, `tool_call`, `empty`, `unparseable`, `truncated`, `over_budget`,
+`no_room`, `unproductive`, `unsupported_transport`). The fallback successor is
+sized at today's derived target (at least the summary target): the small target
+is only safe with a summary. A failed summary never breaks or stalls a worker.
+
+**Successor layout.** Brief, carried instructions, the host note (transcript
+paths; with a summary the tool index is dropped, the summary replaces it), the
+`[Rollover summary]` user message (host key `_synaps_rollover_summary`,
+stripped from every wire), then the newest rounds that fit target − summary.
+Tool pairing, thinking blocks and the read-dedupe stub rewrite are unchanged. A
+later rollover replaces the summary with a fresh one (asked to carry forward
+what still matters); a later rollover that falls back keeps the old summary
+unchanged. The summary is not in a transcript; everything evicted still is.
+
+**Telemetry.** The summary request is an api-log record with
+`"rollover_summary": true` (its `usage` is the summary's cost; it carries
+`rollover_window` of the window being left, never `rollover`). The first request
+of the new window carries `rollover_successor_tokens` (estimated successor size)
+whenever a summary was attempted, plus `rollover_summary_tokens` when it was
+used or `rollover_summary_fallback` when not. Absent otherwise, so records with
+`off` are byte-identical. The worker notice adds "Summary carried (~N tokens)"
+or "No summary (reason); rolled over by truncation."
+
+**`off` guarantee.** No extra request, no new fields, the same planner inputs
+(a history that never carried a summary plans byte for byte as before; the note
+text is pinned by a test), the same targets.
+
+**Not done / limits.** Foreground and cold-resume are unchanged. A
+non-Anthropic worker always falls back. The summary is the worker's one shot
+at remembering: the default stays `off` until an A/B on real tasks (task
+success, files re-read after rollover, extra rounds, cost) shows it is safe.
+
 ## Out of scope
 
-- Model-authored working notes for workers (no `context_checkpoint`).
+- A `context_checkpoint` tool (worker-initiated notes mid-run); the summary
+  above is host-initiated at the rollover only.
 - A worker-side search tool over transcripts (grep/read suffice).
 - Changes to the foreground rollover itself; only the telemetry fields are shared.
 - Redacting worker transcripts (the finalize archive isn't redacted either).

@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Worker rollover summaries (opt-in).** `subagent_rollover_summary = auto`
+  makes a worker's context rollover ask the model for a structured summary of
+  what it drops (one extra request on the worker's own conversation: same
+  model, system prompt, tools and thinking, so the prefix is a cache read), so
+  the successor can be much smaller. `subagent_rollover_target_tokens` sets the
+  successor size independently of the trigger (45000 by default with summaries
+  on). Any failure falls back to today's truncation rollover. Default `off`:
+  behaviour, requests and api-log records are unchanged. The summary request
+  is marked `rollover_summary: true` in `api-log.jsonl`, and the first request
+  of the new window carries `rollover_summary_tokens`,
+  `rollover_successor_tokens` and `rollover_summary_fallback`. Design:
+  [docs/design/subagent-rollover.md](docs/design/subagent-rollover.md#rollover-summaries-opt-in).
+
 ## [0.11.1] — 2026-10-31
 
 Synaps runs on Windows now, with prebuilt x64 binaries and a PowerShell
