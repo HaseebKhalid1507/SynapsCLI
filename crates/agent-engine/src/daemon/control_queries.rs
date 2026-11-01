@@ -18,6 +18,8 @@ pub const FEATURE_THINKING_OPTIONS: &str = "thinking_options";
 pub const FEATURE_MODEL_FAVORITES: &str = "model_favorites";
 /// Feature name for the `sandbox_status` query.
 pub const FEATURE_SANDBOX_STATUS: &str = "sandbox_status";
+/// Feature name for the `skills_reload` and `skills_status` frames.
+pub const FEATURE_SKILLS_V1: &str = "skills_v1";
 /// How long the `model_favorites` query waits for the extension manager (a
 /// discovery walk holds it) before it answers without plugin rows. This
 /// bounds the plugin step only, not the whole answer: the file reads before
@@ -45,6 +47,18 @@ pub fn daemon_features() -> Vec<String> {
     features.push("memory_only_results_v1".to_string());
     features.push(crate::session::client_tools::FEATURE.to_string());
     features
+}
+
+/// The `skills_reload` reply: the new pass's report, or a session-less
+/// `Error` when the walk failed (the last pass stays published).
+pub async fn skills_reload_answer(host: &EngineHost, id: Option<u64>) -> DaemonFrame {
+    match host.reload_skills().await {
+        Ok(report) => DaemonFrame::SkillsResult { id, report },
+        Err(message) => DaemonFrame::Error {
+            session_id: None,
+            message,
+        },
+    }
 }
 
 /// The `sandbox_status` reply for a [`crate::sandbox::Status`].

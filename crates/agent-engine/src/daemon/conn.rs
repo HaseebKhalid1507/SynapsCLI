@@ -497,6 +497,20 @@ pub async fn serve(state: Arc<DaemonState>, stream: ServerStream, shutdown: Canc
             Ok(Read::Frame(ClientFrame::Hello(_))) => {
                 let _ = tx.send(DaemonFrame::Error { session_id: None, message: "duplicate hello".into() }).await;
             }
+            // `skills.reload`: an unattached connection only (refused below).
+            Ok(Read::Frame(ClientFrame::SkillsReload { id })) => {
+                let _ = tx
+                    .send(super::control_queries::skills_reload_answer(&state.host, id).await)
+                    .await;
+            }
+            Ok(Read::Frame(ClientFrame::SkillsStatus { id })) => {
+                let _ = tx
+                    .send(DaemonFrame::SkillsResult {
+                        id,
+                        report: state.host.skills_status(),
+                    })
+                    .await;
+            }
             Ok(Read::Frame(ClientFrame::Bye)) | Ok(Read::Eof) | Err(_) => {
                 favorites.cancel().await;
                 let _ = tx.send(DaemonFrame::Bye { reason: None }).await;
@@ -822,6 +836,14 @@ pub async fn serve(state: Arc<DaemonState>, stream: ServerStream, shutdown: Canc
             Ok(Read::Frame(ClientFrame::SandboxStatus { id, session })) => {
                 let _ = tx.send(super::control_queries::sandbox_status_answer(id, session).await).await;
             }
+            Ok(Read::Frame(ClientFrame::SkillsStatus { id })) => {
+                let _ = tx
+                    .send(DaemonFrame::SkillsResult {
+                        id,
+                        report: state.host.skills_status(),
+                    })
+                    .await;
+            }
             Ok(Read::Frame(ClientFrame::Shutdown { force })) => {
                 let _ = tx.send(DaemonFrame::Bye { reason: None }).await;
                 state.request_shutdown(force);
@@ -838,7 +860,8 @@ pub async fn serve(state: Arc<DaemonState>, stream: ServerStream, shutdown: Canc
             | Ok(Read::Frame(ClientFrame::Pin { .. }))
             | Ok(Read::Frame(ClientFrame::Rename { .. }))
             | Ok(Read::Frame(ClientFrame::ReloadExtension { .. }))
-            | Ok(Read::Frame(ClientFrame::AuthState(_))) => {
+            | Ok(Read::Frame(ClientFrame::AuthState(_)))
+            | Ok(Read::Frame(ClientFrame::SkillsReload { .. })) => {
                 let _ = tx.send(DaemonFrame::Error { session_id: Some(sid.clone()), message: "control frames are not accepted on an attached connection".into() }).await;
             }
             Ok(Read::Frame(ClientFrame::Bye)) | Ok(Read::Eof) | Err(_) => break,

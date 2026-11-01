@@ -20,6 +20,7 @@ pub mod plugin_index;
 pub mod post_install;
 pub mod registry;
 pub mod state;
+pub mod status;
 pub mod tool;
 pub mod trust;
 pub mod update_diff;
@@ -277,6 +278,15 @@ pub fn discover(keys: &agent_core::config::SkillsKeys) -> Discovered {
     Discovered { pass, disabled }
 }
 
+/// What [`register_reported`] built.
+pub struct Registered {
+    pub commands: Arc<CommandRegistry>,
+    pub keybinds: Arc<std::sync::RwLock<keybinds::KeybindRegistry>>,
+    /// The boot pass's report (generation 1), for `skills.status` and
+    /// `skills.reload`.
+    pub state: status::SkillsState,
+}
+
 /// Load all skills, apply disable filters, build the command registry,
 /// build the keybind registry, and register the `load_skill` tool.
 /// Returns (command_registry, keybind_registry).
@@ -287,6 +297,18 @@ pub async fn register(
     Arc<CommandRegistry>,
     Arc<std::sync::RwLock<keybinds::KeybindRegistry>>,
 ) {
+    let Registered {
+        commands, keybinds, ..
+    } = register_reported(tools, config).await;
+    (commands, keybinds)
+}
+
+/// [`register`], keeping the boot pass's report and the reload state (the
+/// daemon host's `skills.status` / `skills.reload`).
+pub async fn register_reported(
+    tools: &Arc<tokio::sync::RwLock<crate::ToolRegistry>>,
+    config: &crate::SynapsConfig,
+) -> Registered {
     // The fs-walk (read_dir + read_to_string + canonicalize across multiple roots)
     // is fully synchronous std::fs; do it on a blocking pool so we don't park a
     // tokio worker during boot. Behavior is identical — same inputs, same output.
@@ -294,6 +316,7 @@ pub async fn register(
     let found = tokio::task::spawn_blocking(move || discover(&keys))
         .await
         .expect("skills::loader::load_all panicked");
+    let state = status::SkillsState::new(status::SkillsReport::of(1, &found));
     let loader::DiscoveryPass {
         plugins, skills, ..
     } = found.pass;
@@ -349,7 +372,11 @@ pub async fn register(
         // compact descriptions only; no bodies, no source paths).
         tools.register(Arc::new(tool::SearchSkillsTool::new(registry.clone())));
     }
-    (registry, Arc::new(std::sync::RwLock::new(kb_registry)))
+    Registered {
+        commands: registry,
+        keybinds: Arc::new(std::sync::RwLock::new(kb_registry)),
+        state,
+    }
 }
 
 /// Re-walks discovery roots and swaps in the new skill set atomically.

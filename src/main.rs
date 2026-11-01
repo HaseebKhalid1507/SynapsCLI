@@ -391,6 +391,12 @@ enum Command {
         #[command(subcommand)]
         action: cmd::config::ConfigAction,
     },
+    /// The running daemon's skills: its last discovery pass (`status`), or
+    /// walk the skill roots again (`reload`). Never starts a daemon.
+    Skills {
+        #[command(subcommand)]
+        action: cmd::skills::SkillsAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1234,6 +1240,13 @@ async fn async_main() -> anyhow::Result<()> {
         Some(Command::Config { action }) => {
             // 0 written/unchanged, 1 I/O, 2 usage, 3 refused.
             let code = cmd::config::run(action);
+            if code != 0 {
+                std::process::exit(code);
+            }
+        }
+        Some(Command::Skills { action }) => {
+            // 0 report, 1 no daemon or I/O, 3 refused.
+            let code = cmd::skills::run(active_profile, action).await;
             if code != 0 {
                 std::process::exit(code);
             }

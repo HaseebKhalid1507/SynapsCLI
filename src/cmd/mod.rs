@@ -15,6 +15,7 @@ pub(crate) mod rpc;
 pub(crate) mod sandbox;
 pub(crate) mod send;
 pub(crate) mod server;
+pub(crate) mod skills;
 pub(crate) mod status;
 pub(crate) mod tools;
 pub(crate) mod trace;

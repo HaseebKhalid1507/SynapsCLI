@@ -342,6 +342,8 @@ pub struct EngineHost {
     config: arc_swap::ArcSwap<crate::SynapsConfig>,
     command_registry: Arc<crate::skills::registry::CommandRegistry>,
     keybind_registry: Arc<std::sync::RwLock<crate::skills::keybinds::KeybindRegistry>>,
+    /// `skills.status` / `skills.reload` (skills v1) on `command_registry`.
+    skills: crate::skills::status::SkillsState,
     ext_manager: Arc<RwLock<crate::extensions::manager::ExtensionManager>>,
     mcp_server_count: usize,
     /// WELCOME's `config_path`: the canonical path of the config file the
@@ -465,7 +467,11 @@ impl EngineHost {
         }
 
         // Discover plugins/skills, build command registry, register load_skill tool.
-        let (command_registry, keybind_registry) = crate::skills::register(&tools, &config).await;
+        let crate::skills::Registered {
+            commands: command_registry,
+            keybinds: keybind_registry,
+            state: skills,
+        } = crate::skills::register_reported(&tools, &config).await;
 
         // MCP (if configured): descriptor-backed tools, executed through
         // per-session leases in every mode. With progressive disclosure they
@@ -518,6 +524,7 @@ impl EngineHost {
             config: arc_swap::ArcSwap::from_pointee(config),
             command_registry,
             keybind_registry,
+            skills,
             ext_manager,
             mcp_server_count,
             started_config_path,
@@ -686,6 +693,20 @@ impl EngineHost {
         &self,
     ) -> &Arc<std::sync::RwLock<crate::skills::keybinds::KeybindRegistry>> {
         &self.keybind_registry
+    }
+
+    /// `skills.status`: the last skill discovery pass (boot or reload).
+    pub fn skills_status(&self) -> crate::skills::status::SkillsReport {
+        self.skills.status()
+    }
+
+    /// `skills.reload`: walk the skill roots again with the skill keys read
+    /// fresh from the config file (this host's config snapshot is kept) and
+    /// swap the new set into the command registry, one reload at a time.
+    pub async fn reload_skills(
+        &self,
+    ) -> std::result::Result<crate::skills::status::SkillsReport, String> {
+        self.skills.reload(&self.command_registry).await
     }
 
     pub fn mcp_server_count(&self) -> usize {

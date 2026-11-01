@@ -255,6 +255,26 @@ pub enum ClientFrame {
         /// The session (journal) id whose policy file to read.
         session: String,
     },
+    /// Control frame (no session; an unattached connection only, refused
+    /// on an attached one like `Reload`): walk the skill roots again with
+    /// the skill keys read fresh from the config file and swap the new set
+    /// in (`skills.reload`). Reply: `SkillsResult` (match it by `id`), or a
+    /// session-less `Error`. Feature "skills_v1"; an older daemon answers
+    /// `Error` "malformed frame: unknown variant `skills_reload`, ...".
+    SkillsReload {
+        /// Echoed in the reply.
+        #[serde(default)]
+        id: Option<u64>,
+    },
+    /// Control query (no session, also on an attached connection): the
+    /// report of this daemon's last skill discovery pass, boot or reload
+    /// (`skills.status`); no disk walk. Reply: `SkillsResult`. Feature
+    /// "skills_v1".
+    SkillsStatus {
+        /// Echoed in the reply.
+        #[serde(default)]
+        id: Option<u64>,
+    },
     Bye,
 }
 
@@ -318,6 +338,8 @@ impl std::fmt::Debug for ClientFrame {
             Self::SandboxStatus { id, session } => {
                 f.debug_struct("SandboxStatus").field("id", id).field("session", session).finish()
             }
+            Self::SkillsReload { id } => f.debug_struct("SkillsReload").field("id", id).finish(),
+            Self::SkillsStatus { id } => f.debug_struct("SkillsStatus").field("id", id).finish(),
             Self::Bye => f.write_str("Bye"),
         }
     }
@@ -543,6 +565,12 @@ pub enum DaemonFrame {
         /// already held; every other provider's rows are its static seeds.
         #[serde(default)]
         live_providers: Vec<String>,
+    },
+    /// Answer to `SkillsReload` and `SkillsStatus`. Only sent on request.
+    SkillsResult {
+        #[serde(default)]
+        id: Option<u64>,
+        report: crate::skills::status::SkillsReport,
     },
 }
 
@@ -2869,6 +2897,8 @@ mod tests {
             ClientFrame::ReloadExtension { extension: "subconscious".into() },
             ClientFrame::ModelFavorites { id: Some(10) },
             ClientFrame::ModelFavorites { id: None },
+            ClientFrame::SkillsReload { id: Some(11) },
+            ClientFrame::SkillsStatus { id: None },
             ClientFrame::Bye,
         ];
         for f in frames {
@@ -2961,6 +2991,10 @@ mod tests {
             DaemonFrame::AuthState { report: auth_state_report() },
             model_favorites_sample(),
             DaemonFrame::ModelFavoritesResult { id: None, models: vec![], plugins_loaded: false, live_providers: vec![] },
+            DaemonFrame::SkillsResult {
+                id: Some(11),
+                report: skills_report_sample(),
+            },
         ];
         for f in frames {
             let line = encode_line(&f).unwrap();
@@ -3444,6 +3478,84 @@ mod tests {
         ] {
             let line = encode_line(&query).unwrap();
             let err = decode_line::<OldClientFrame>(line.trim_end()).unwrap_err();
+            assert!(err.contains("unknown variant"), "{err}");
+        }
+    }
+
+    fn skills_report_sample() -> crate::skills::status::SkillsReport {
+        use crate::skills::loader::RootKind;
+        use crate::skills::status::{ShadowedReport, SkillsReport, SkillsRootReport};
+        SkillsReport {
+            generation: 2,
+            at_unix_ms: 1_762_000_000_000,
+            roots: vec![SkillsRootReport {
+                kind: RootKind::Extra,
+                configured: Some("/Users/j/Library/Application Support/p/skills/current".into()),
+                resolved: None,
+                plugins: 1,
+                skills: 3,
+            }],
+            skills_total: 3,
+            skills_cap: 2048,
+            metadata_bytes: 900,
+            metadata_cap: 4194304,
+            skipped: 0,
+            disabled: 1,
+            shadowed: vec![ShadowedReport {
+                plugin: None,
+                name: "x".into(),
+                kept_root_kind: RootKind::Extra,
+                dropped_root_kind: RootKind::HomeSkills,
+            }],
+            shadowed_total: 1,
+        }
+    }
+
+    /// `skills_reload` / `skills_status` (feature "skills_v1"; the protocol
+    /// stays 3): the frames and their reply round-trip, a missing id
+    /// decodes as `None`, and a daemon that predates them rejects them as
+    /// unknown variants (conn answers `Error` and keeps the connection).
+    #[test]
+    fn skills_frames_round_trip_and_are_additive() {
+        let line = encode_line(&ClientFrame::SkillsReload { id: Some(3) }).unwrap();
+        assert_eq!(line.trim_end(), r#"{"type":"skills_reload","id":3}"#);
+        assert!(matches!(
+            decode_line::<ClientFrame>(r#"{"type":"skills_status"}"#).unwrap(),
+            ClientFrame::SkillsStatus { id: None }
+        ));
+        let reply = DaemonFrame::SkillsResult {
+            id: Some(3),
+            report: skills_report_sample(),
+        };
+        let line = encode_line(&reply).unwrap();
+        assert!(
+            line.starts_with(r#"{"type":"skills_result","id":3,"report":{"generation":2,"#),
+            "{line}"
+        );
+        assert!(
+            line.contains(
+                r#""configured":"/Users/j/Library/Application Support/p/skills/current""#
+            ),
+            "{line}"
+        );
+        match decode_line::<DaemonFrame>(line.trim_end()).unwrap() {
+            DaemonFrame::SkillsResult { id, report } => {
+                assert_eq!((id, report), (Some(3), skills_report_sample()))
+            }
+            other => panic!("{other:?}"),
+        }
+        #[derive(Deserialize, Debug)]
+        #[serde(tag = "type", rename_all = "snake_case")]
+        #[allow(dead_code)]
+        enum OldClientFrame {
+            Ping,
+        }
+        for frame in [
+            ClientFrame::SkillsReload { id: None },
+            ClientFrame::SkillsStatus { id: Some(1) },
+        ] {
+            let err =
+                decode_line::<OldClientFrame>(encode_line(&frame).unwrap().trim_end()).unwrap_err();
             assert!(err.contains("unknown variant"), "{err}");
         }
     }
