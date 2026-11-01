@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Windows: the `powershell` tool can run scripts.** A stock Windows
+  client has the `Restricted` execution policy, so `.\test.ps1` failed with
+  "running scripts is disabled on this system" and the model had to retry
+  with `powershell -ExecutionPolicy Bypass -File …`. The tool now starts
+  PowerShell with `-ExecutionPolicy Bypass` (process scope, inherited by the
+  PowerShells a command starts; a Group Policy setting still wins). Its
+  description says which PowerShell runs (7 when installed, else 5.1), not
+  to start another one inside it, and to call scripts directly; on a
+  machine without PowerShell 7 the model had first tried `pwsh`.
+
 ## [0.11.1] — 2026-10-31
 
 Synaps runs on Windows now, with prebuilt x64 binaries and a PowerShell
