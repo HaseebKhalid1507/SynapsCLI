@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Windows: grep and find cards show short paths.** Card rows kept full
+  `C:\Users\…\project\./src\file` paths, and grep rows were not
+  highlighted (the row was split at the drive colon). Paths under the
+  session folder now show relative to it and paths under the user profile
+  as `~\…`, matched case-insensitively with either separator, as on Linux.
+  On every platform, the `./` a tool given the path `.` leaves after the
+  session folder is dropped (`src/main.rs`, not `./src/main.rs`). Display
+  only: the tool result is unchanged.
+
 ## [0.11.1] — 2026-10-31
 
 Synaps runs on Windows now, with prebuilt x64 binaries and a PowerShell
