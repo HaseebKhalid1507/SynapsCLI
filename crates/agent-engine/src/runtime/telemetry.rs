@@ -330,6 +330,27 @@ pub struct TelemetryRecord {
     /// that writes the successor's prompt cache. Absent otherwise.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub rollover: bool,
+    /// `true` only on the one extra request a worker rollover makes to have
+    /// the model summarise its context (`subagent_rollover_summary = auto`).
+    /// Its usage is the summary's cost; absent on every other record.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub rollover_summary: bool,
+    /// On the `rollover: true` request of a window that was entered through a
+    /// summary: the summary's size in the host estimator's units (the
+    /// summary request's own `usage` has the provider's counts).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rollover_summary_tokens: Option<u64>,
+    /// Whenever a summary was attempted at the rollover (`auto`): the
+    /// successor's estimated size, so cost can be compared with summary-off
+    /// windows. Absent when summaries are off.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rollover_successor_tokens: Option<u64>,
+    /// Why the attempted summary was not used and the rollover fell back to
+    /// truncation (`provider_error`, `timeout`, `tool_call`, `empty`,
+    /// `unparseable`, `truncated`, `over_budget`, `no_room`, `unproductive`,
+    /// `unsupported_transport`). Absent when it was used or not attempted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rollover_summary_fallback: Option<&'static str>,
 }
 
 /// What a turn request tells its telemetry record about context rollover
@@ -340,6 +361,22 @@ pub struct RolloverStamp {
     pub window: u64,
     /// The first request of that window.
     pub first_request: bool,
+    /// How this window's rollover used a summary; `None` unless
+    /// `subagent_rollover_summary = auto` attempted one. Stamped on the first
+    /// request of the window only.
+    pub summary: Option<SummaryStamp>,
+}
+
+/// What a worker rollover did with a summary (see
+/// [`TelemetryRecord::rollover_summary_tokens`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SummaryStamp {
+    /// Summary size (estimator units); `None` on a fallback.
+    pub tokens: Option<u64>,
+    /// The successor's estimated footprint after the rollover.
+    pub successor_tokens: u64,
+    /// Why the summary was not used.
+    pub fallback: Option<&'static str>,
 }
 
 impl TelemetryRecord {
@@ -536,8 +573,14 @@ mod tests {
         assert!(!json.contains("request_id"));
         assert!(!json.contains("ratelimit"));
         assert!(!json.contains("cache_diag"));
-        assert!(!json.contains("keepwarm"), "turn records carry no keepwarm field");
-        assert!(!json.contains("worker"), "foreground records carry no worker field");
+        assert!(
+            !json.contains("keepwarm"),
+            "turn records carry no keepwarm field"
+        );
+        assert!(
+            !json.contains("worker"),
+            "foreground records carry no worker field"
+        );
         assert!(json.contains("\"model\":\"claude-sonnet-4-6\""));
     }
 
@@ -561,6 +604,55 @@ mod tests {
         let json = serde_json::to_string(&later).unwrap();
         assert!(json.contains("\"rollover_window\":2"), "{json}");
         assert!(!json.contains("\"rollover\":"), "{json}");
+    }
+
+    #[test]
+    fn rollover_summary_fields_are_absent_unless_set() {
+        let plain = serde_json::to_string(&TelemetryRecord::default()).unwrap();
+        assert!(
+            !plain.contains("rollover_summary") && !plain.contains("rollover_successor"),
+            "{plain}"
+        );
+        let request = TelemetryRecord {
+            rollover_summary: true,
+            worker: true,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("\"rollover_summary\":true"), "{json}");
+        assert!(
+            !json.contains("rollover_successor") && !json.contains("\"rollover\":"),
+            "{json}"
+        );
+        let used = TelemetryRecord {
+            rollover_window: Some(2),
+            rollover: true,
+            rollover_summary_tokens: Some(2_400),
+            rollover_successor_tokens: Some(44_000),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&used).unwrap();
+        assert!(json.contains("\"rollover_summary_tokens\":2400"), "{json}");
+        assert!(
+            json.contains("\"rollover_successor_tokens\":44000"),
+            "{json}"
+        );
+        assert!(
+            !json.contains("rollover_summary_fallback") && !json.contains("\"rollover_summary\""),
+            "{json}"
+        );
+        let fell_back = TelemetryRecord {
+            rollover: true,
+            rollover_successor_tokens: Some(90_000),
+            rollover_summary_fallback: Some("provider_error"),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&fell_back).unwrap();
+        assert!(
+            json.contains("\"rollover_summary_fallback\":\"provider_error\""),
+            "{json}"
+        );
+        assert!(!json.contains("rollover_summary_tokens"), "{json}");
     }
 
     #[test]

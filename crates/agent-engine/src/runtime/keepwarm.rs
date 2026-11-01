@@ -715,6 +715,7 @@ impl Runtime {
             // warm); a ping never sends `diagnostics` nor moves the chain.
             cache_diagnosis: self.cache_diagnosis(),
             context_rollover: None,
+            rollover_summary: None,
         };
 
         let (tx, mut rx) = mpsc::unbounded_channel();

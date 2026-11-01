@@ -56,6 +56,7 @@ pub mod telemetry;
 mod read_dedupe;
 pub mod tool_spill;
 pub mod trace;
+pub mod rollover_summary;
 pub mod worker_context;
 pub(crate) mod transport;
 mod types;
@@ -4463,6 +4464,7 @@ impl Runtime {
                     // The non-stream transport never sends diagnostics.
                     cache_diagnosis: None,
                     context_rollover: None,
+                    rollover_summary: None,
                 },
             )
             .await?;
@@ -5041,6 +5043,7 @@ impl Runtime {
             // `diagnostics.previous_message_id`.
             cache_diagnosis: self.cache_diagnosis(),
             context_rollover: None,
+            rollover_summary: None,
         };
 
         let final_capture_history: Arc<Mutex<Option<Vec<crate::SharedMessage>>>> = Arc::new(Mutex::new(None));

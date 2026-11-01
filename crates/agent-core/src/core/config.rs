@@ -163,6 +163,39 @@ impl ContextManagementMode {
     }
 }
 
+/// Whether a worker's rollover carries a model-written summary of what it
+/// evicts (`subagent_rollover_summary = off | auto`, default `off`).
+///
+/// - `Off`: today's host-only truncation rollover, byte for byte.
+/// - `Auto`: at a rollover the worker makes ONE extra request on its own
+///   conversation (same model, system prompt, tools and thinking, so the
+///   whole prefix is a cache read) asking for a structured summary, and the
+///   successor carries that summary instead of a large tail of rounds. Any
+///   failure falls back to the truncation rollover.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RolloverSummaryMode {
+    #[default]
+    Off,
+    Auto,
+}
+
+impl RolloverSummaryMode {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "off" => Some(Self::Off),
+            "auto" => Some(Self::Auto),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Auto => "auto",
+        }
+    }
+}
+
 /// Task-aware soft context bands, parsed from `context_management.*` keys.
 ///
 /// Missing thresholds use window-aware defaults (200k: 140k/180k;
@@ -596,6 +629,18 @@ pub const DEFAULT_SUBAGENT_ROLLOVER_TOKENS: u64 = 200_000;
 /// successor target is smaller than a typical brief plus last round, so
 /// rollovers could not shrink the context and would only churn the cache.
 pub const MIN_SUBAGENT_ROLLOVER_TOKENS: u64 = 20_000;
+
+/// Smallest accepted `subagent_rollover_target_tokens`: a successor must hold
+/// the brief, a summary and the last round (the system prompt and tool
+/// schemas alone are ~10k). Lower values could not shrink anything.
+pub const MIN_SUBAGENT_ROLLOVER_TARGET_TOKENS: u64 = 10_000;
+
+/// The successor size a worker rolls over to when `subagent_rollover_summary =
+/// auto` and `subagent_rollover_target_tokens` is unset. Capped at the
+/// derived target (min(100k, 2/3 of pressure)) so a small window never aims
+/// above what plain truncation would. A cost replay of recorded worker
+/// sequences found 150k -> 45k cheaper than today's 200k -> ~90k.
+pub const DEFAULT_SUBAGENT_ROLLOVER_SUMMARY_TARGET_TOKENS: u64 = 45_000;
 
 /// Prompt-cache keep-warm policy (`cache_keepwarm`, task #444). See
 /// docs/specs/cache-ttl-spec.md §7.
@@ -1458,6 +1503,17 @@ pub struct SynapsConfig {
     /// rollover band wins when it is lower; the successor target is derived
     /// like the foreground's (min(100k, 2/3 of pressure)).
     pub subagent_rollover_tokens: u64,
+    /// Worker rollover summaries (`subagent_rollover_summary = off | auto`,
+    /// default `off`; see [`RolloverSummaryMode`]).
+    pub subagent_rollover_summary: RolloverSummaryMode,
+    /// Footprint (tokens) a worker's rollover successor aims for
+    /// (`subagent_rollover_target_tokens`), independent of the trigger. At
+    /// least [`MIN_SUBAGENT_ROLLOVER_TARGET_TOKENS`] and below
+    /// `subagent_rollover_tokens`. `None` keeps the derived target
+    /// (min(100k, 2/3 of pressure)), except that with
+    /// `subagent_rollover_summary = auto` it defaults to
+    /// [`DEFAULT_SUBAGENT_ROLLOVER_SUMMARY_TARGET_TOKENS`].
+    pub subagent_rollover_target_tokens: Option<u64>,
     /// Subagent workers run the host's `after_tool_call` output transforms
     /// (extensions holding `tools.transform_output`: compression,
     /// redaction) on their own tool results, as the foreground does. Off =
@@ -1625,6 +1681,8 @@ impl Default for SynapsConfig {
             subagent_cold_resume_compact_tokens: DEFAULT_SUBAGENT_COLD_RESUME_COMPACT_TOKENS,
             subagent_context_management: ContextManagementMode::Auto,
             subagent_rollover_tokens: DEFAULT_SUBAGENT_ROLLOVER_TOKENS,
+            subagent_rollover_summary: RolloverSummaryMode::Off,
+            subagent_rollover_target_tokens: None,
             subagent_transform_hooks: true,
             subagent_thinking: crate::core::reasoning::ReasoningLevel::XHigh,
             api_retries: 3,
@@ -1750,6 +1808,8 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "subagent_cold_resume_compact_tokens",
     "subagent_context_management",
     "subagent_rollover_tokens",
+    "subagent_rollover_summary",
+    "subagent_rollover_target_tokens",
     "subagent_transform_hooks",
     "subagent_thinking",
     "subagent.max_concurrent",
@@ -2345,6 +2405,26 @@ fn apply_config_content_with(
                     "subagent_rollover_tokens = {val} — expected a token count of at least {MIN_SUBAGENT_ROLLOVER_TOKENS}; using {DEFAULT_SUBAGENT_ROLLOVER_TOKENS}"
                 )),
             },
+            "subagent_rollover_summary" => match RolloverSummaryMode::parse(val) {
+                Some(mode) => config.subagent_rollover_summary = mode,
+                None => config.warnings.push(format!(
+                    "subagent_rollover_summary = {val} — expected auto or off; using off"
+                )),
+            },
+            "subagent_rollover_target_tokens" => {
+                if val.eq_ignore_ascii_case("auto") {
+                    config.subagent_rollover_target_tokens = None;
+                } else {
+                    match val.parse::<u64>() {
+                        Ok(tokens) if tokens >= MIN_SUBAGENT_ROLLOVER_TARGET_TOKENS => {
+                            config.subagent_rollover_target_tokens = Some(tokens)
+                        }
+                        _ => config.warnings.push(format!(
+                            "subagent_rollover_target_tokens = {val} — expected auto or a token count of at least {MIN_SUBAGENT_ROLLOVER_TARGET_TOKENS}, below subagent_rollover_tokens; using the derived target"
+                        )),
+                    }
+                }
+            }
             "subagent_transform_hooks" => match val {
                 "true" | "1" | "on" | "yes" => config.subagent_transform_hooks = true,
                 "false" | "0" | "off" | "no" => config.subagent_transform_hooks = false,
@@ -2729,6 +2809,17 @@ fn apply_config_content_with(
             config.subagent.max_concurrent, config.subagent.max_total, config.subagent.max_total
         ));
         config.subagent.max_concurrent = config.subagent.max_total;
+    }
+    // The successor must be smaller than the footprint that triggers the
+    // rollover. Checked after the loop so key order never matters.
+    if let Some(target) = config.subagent_rollover_target_tokens {
+        if target >= config.subagent_rollover_tokens {
+            config.warnings.push(format!(
+                "subagent_rollover_target_tokens = {target} — must be below subagent_rollover_tokens ({}); using the derived target",
+                config.subagent_rollover_tokens
+            ));
+            config.subagent_rollover_target_tokens = None;
+        }
     }
     if invalid_context_management {
         config.context_management = ContextManagementConfig::default();
@@ -3158,6 +3249,70 @@ mod tests {
                 super::KNOWN_CONFIG_KEYS.contains(&k),
                 "{k} not in KNOWN_CONFIG_KEYS"
             );
+        }
+    }
+
+    #[test]
+    fn subagent_rollover_summary_keys_parse_default_and_warn() {
+        use super::RolloverSummaryMode::{Auto, Off};
+        let c = super::load_config_from_str("");
+        assert_eq!(c.subagent_rollover_summary, Off, "opt-in: off by default");
+        assert_eq!(c.subagent_rollover_target_tokens, None);
+        let d = super::SynapsConfig::default();
+        assert_eq!(d.subagent_rollover_summary, Off);
+        assert_eq!(d.subagent_rollover_target_tokens, None);
+
+        let c = super::load_config_from_str(
+            "subagent_rollover_summary = AUTO\nsubagent_rollover_target_tokens = 30000\n",
+        );
+        assert_eq!(c.subagent_rollover_summary, Auto);
+        assert_eq!(c.subagent_rollover_target_tokens, Some(30_000));
+        assert!(c.warnings.is_empty(), "warnings: {:?}", c.warnings);
+
+        // The floor is accepted; `auto` clears an earlier value.
+        let c = super::load_config_from_str("subagent_rollover_target_tokens = 10000\n");
+        assert_eq!(c.subagent_rollover_target_tokens, Some(10_000));
+        let c = super::load_config_from_str(
+            "subagent_rollover_target_tokens = 30000\nsubagent_rollover_target_tokens = auto\n",
+        );
+        assert_eq!(c.subagent_rollover_target_tokens, None);
+        assert!(c.warnings.is_empty(), "warnings: {:?}", c.warnings);
+
+        for (line, key) in [
+            ("subagent_rollover_summary = maybe", "subagent_rollover_summary"),
+            ("subagent_rollover_target_tokens = lots", "subagent_rollover_target_tokens"),
+            ("subagent_rollover_target_tokens = 9999", "subagent_rollover_target_tokens"),
+            ("subagent_rollover_target_tokens = 0", "subagent_rollover_target_tokens"),
+            // Not below the (default 200k) trigger.
+            ("subagent_rollover_target_tokens = 200000", "subagent_rollover_target_tokens"),
+            ("subagent_rollover_target_tokens = 250000", "subagent_rollover_target_tokens"),
+            // Below the configured trigger, in either key order.
+            (
+                "subagent_rollover_target_tokens = 60000\nsubagent_rollover_tokens = 50000",
+                "subagent_rollover_target_tokens",
+            ),
+            (
+                "subagent_rollover_tokens = 50000\nsubagent_rollover_target_tokens = 60000",
+                "subagent_rollover_target_tokens",
+            ),
+        ] {
+            let c = super::load_config_from_str(line);
+            assert!(
+                c.warnings.iter().any(|w| w.contains(key)),
+                "{line}: {:?}",
+                c.warnings
+            );
+            assert_eq!(c.subagent_rollover_target_tokens, None, "{line}");
+            assert_eq!(c.subagent_rollover_summary, Off, "{line}");
+        }
+        let c = super::load_config_from_str(
+            "subagent_rollover_tokens = 50000\nsubagent_rollover_target_tokens = 49999\n",
+        );
+        assert_eq!(c.subagent_rollover_target_tokens, Some(49_999));
+        assert!(c.warnings.is_empty(), "warnings: {:?}", c.warnings);
+
+        for key in ["subagent_rollover_summary", "subagent_rollover_target_tokens"] {
+            assert!(super::KNOWN_CONFIG_KEYS.contains(&key), "{key}");
         }
     }
 

@@ -1877,7 +1877,7 @@ mod worker_rollover_tests {
         apply_subagent_runtime_policy(&mut runtime, &Default::default(), None, None, None, &Default::default());
         assert_eq!(
             runtime.worker_context().settings,
-            Some(WorkerContextSettings { enabled: true, rollover_tokens: 200_000 })
+            Some(WorkerContextSettings { enabled: true, rollover_tokens: 200_000, ..Default::default() })
         );
         assert!(runtime.worker_context().sink.is_none(), "inert until a spawn attaches a sink");
         assert_eq!(runtime.cache_ttl(), CacheTtl::FiveMinutes.into());
@@ -2017,6 +2017,8 @@ mod worker_rollover_tests {
                 "/a/sa_1.window-2.md".into(),
                 "/a/sa_9.window-3.md".into(),
             ],
+            summary_tokens: None,
+            summary_fallback: None,
         };
         (sink.observer.unwrap())(&report);
         let s = state.read().unwrap();

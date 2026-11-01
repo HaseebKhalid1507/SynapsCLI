@@ -570,6 +570,7 @@ pub(super) fn is_ephemeral_turn_context_block(block: &Value) -> bool {
         let text = text.trim_start();
         (text.starts_with(EXTENSION_CONTEXT_OPEN) && text.ends_with(EXTENSION_CONTEXT_CLOSE))
             || super::continuation::is_advisory_text(text)
+            || super::rollover_summary::is_request_text(text)
     })
 }
 
@@ -866,6 +867,8 @@ impl StreamMethods {
         // Set by a committed rollover (worker or foreground): the next request
         // is the first of its window (telemetry `rollover: true`).
         let mut first_request_of_window = false;
+        // What the rollover that set it did with a summary (telemetry).
+        let mut rollover_summary_stamp: Option<super::telemetry::SummaryStamp> = None;
         // Tracks whether this context segment has made at least one provider
         // call (wall-clock checkpoint skips an un-exercised segment).
         let mut segment_has_provider_round = false;
@@ -1286,9 +1289,15 @@ impl StreamMethods {
                 } else {
                     1
                 };
-                (window > 1).then(|| super::telemetry::RolloverStamp {
-                    window,
-                    first_request: std::mem::take(&mut first_request_of_window),
+                (window > 1).then(|| {
+                    let first_request = std::mem::take(&mut first_request_of_window);
+                    super::telemetry::RolloverStamp {
+                        window,
+                        first_request,
+                        summary: first_request
+                            .then(|| rollover_summary_stamp.take())
+                            .flatten(),
+                    }
                 })
             };
             let projected_options;
@@ -1632,24 +1641,105 @@ impl StreamMethods {
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .calibration_for(&model);
-                    let mut target = worker_policy.successor_budget(overhead, calibration);
-                    if hard_capacity {
-                        target = super::worker_context::hard_capacity_budget(
-                            target,
-                            context_window,
-                            required,
-                            overhead,
-                        );
+                    let fit = |budget| {
+                        if hard_capacity {
+                            super::worker_context::hard_capacity_budget(
+                                budget,
+                                context_window,
+                                required,
+                                overhead,
+                            )
+                        } else {
+                            budget
+                        }
+                    };
+                    let target = fit(worker_policy.successor_budget(overhead, calibration));
+                    let hard_line = hard_capacity.then(|| context_window.saturating_sub(required));
+                    // `subagent_rollover_summary = auto`: one extra request on
+                    // this worker's own conversation, then a successor around
+                    // its answer. Any failure leaves `prepared` empty and the
+                    // rollover below proceeds by truncation, at today's target.
+                    let mut summary_fallback = None;
+                    let mut prepared = None;
+                    if worker_policy.summary_enabled() {
+                        use super::rollover_summary::{self, Fallback};
+                        let viable = super::worker_context::prepare_roll_over(
+                            &messages, target, used, overhead, worker_policy, worker_sink,
+                            hard_line, None,
+                        )
+                        .is_some();
+                        if !viable {
+                            summary_fallback = Some(Fallback::Unproductive);
+                        } else if !rollover_summary::has_room(used, context_window) {
+                            summary_fallback = Some(Fallback::NoRoom);
+                        } else {
+                            let asked = rollover_summary::request(rollover_summary::SummaryCall {
+                                auth: &auth,
+                                client: &client,
+                                model: &model,
+                                tools: &tools_snapshot,
+                                system_prompt: &injected_system,
+                                thinking_budget,
+                                reasoning_level,
+                                messages: request_messages,
+                                options: round_options,
+                                telemetry_level,
+                                tx: &tx,
+                                cancel: &cancel,
+                                timeout: rollover_summary::TIMEOUT,
+                            })
+                            .await;
+                            // The summary booked usage of its own: the probe
+                            // for this round's request starts after it.
+                            if let Some(probe) = calibration_probe.as_mut() {
+                                probe.records_before = usage_counters.records();
+                            }
+                            match asked {
+                                Ok(summary) => {
+                                    prepared = super::worker_context::prepare_roll_over(
+                                        &messages, target, used, overhead, worker_policy,
+                                        worker_sink, hard_line, Some(&summary),
+                                    );
+                                    if prepared.is_none() {
+                                        summary_fallback = Some(Fallback::Unproductive);
+                                    }
+                                }
+                                Err(Fallback::Cancelled) => {
+                                    send_history!();
+                                    return Err(crate::RuntimeError::Canceled);
+                                }
+                                Err(why) => summary_fallback = Some(why),
+                            }
+                        }
+                        if let Some(why) = summary_fallback {
+                            tracing::warn!(
+                                event = "worker_rollover_summary_fallback",
+                                reason = why.as_str(),
+                                "worker rollover summary not used; rolling over by truncation"
+                            );
+                        }
                     }
-                    match super::worker_context::roll_over(
-                        &messages,
-                        target,
-                        used,
-                        overhead,
-                        worker_policy,
-                        worker_sink,
-                        hard_capacity.then(|| context_window.saturating_sub(required)),
-                    ) {
+                    let fallback_target =
+                        fit(worker_policy.fallback_successor_budget(overhead, calibration));
+                    let rolled = match prepared {
+                        Some(p) => p.commit().map(Some),
+                        None => super::worker_context::roll_over(
+                            &messages,
+                            fallback_target,
+                            used,
+                            overhead,
+                            worker_policy,
+                            worker_sink,
+                            hard_line,
+                        )
+                        .map(|rolled| {
+                            rolled.map(|(successor, mut report)| {
+                                report.summary_fallback = summary_fallback.map(|why| why.as_str());
+                                (successor, report)
+                            })
+                        }),
+                    };
+                    match rolled {
                         Ok(Some((successor, report))) => {
                             tracing::info!(
                                 event = "worker_context_rollover",
@@ -1658,12 +1748,21 @@ impl StreamMethods {
                                 after_tokens = report.after_tokens,
                                 evicted_messages = report.evicted_messages,
                                 hard_capacity,
+                                summary_tokens = report.summary_tokens,
+                                summary_fallback = report.summary_fallback,
                                 "worker context rolled over"
                             );
                             messages = successor;
                             worker_policy_state.reset();
                             worker_window = report.window;
                             first_request_of_window = true;
+                            rollover_summary_stamp = worker_policy.summary_enabled().then_some(
+                                super::telemetry::SummaryStamp {
+                                    tokens: report.summary_tokens,
+                                    successor_tokens: report.after_tokens,
+                                    fallback: report.summary_fallback,
+                                },
+                            );
                             send_history!(clone);
                             // Already published: the next round checkpoint
                             // must not re-send the identical head.
@@ -6793,12 +6892,74 @@ mod rich_output_tests {
         s
     }
 
+    /// How the mock answers a rollover-summary request (recognised by the
+    /// request-only instruction as the last message).
+    #[derive(Clone, Copy, PartialEq)]
+    enum SummaryReply {
+        /// Summaries are off: such a request is a bug (answered 500).
+        NoneExpected,
+        Good,
+        /// Provider error.
+        Error,
+        /// The reply asks for a tool call.
+        ToolCall,
+        /// Not in the asked layout.
+        Garbage,
+    }
+
+    const SUMMARY_FACT: &str = "E0308 at parser.rs:42";
+
+    fn sse_summary_reply(kind: SummaryReply, input: u64) -> String {
+        let block = match kind {
+            SummaryReply::ToolCall => r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"tu_s","name":"big_out"}}
+
+data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{}"}}"#
+                .to_string(),
+            _ => {
+                let text = if kind == SummaryReply::Good {
+                    format!("**Task**: refactor the parser\n**Done**: rounds 0..n\n**Decisions**: keep the AST (tests)\n**Files**: src/parser.rs:10-90 edited\n**Facts**: {SUMMARY_FACT}\n**Open**: none\n**Next**: run cargo test")
+                } else {
+                    "I would rather not.".to_string()
+                };
+                let text = serde_json::to_string(&text).unwrap();
+                format!(
+                    r#"data: {{"type":"content_block_start","index":0,"content_block":{{"type":"text","text":""}}}}
+
+data: {{"type":"content_block_delta","index":0,"delta":{{"type":"text_delta","text":{text}}}}}"#
+                )
+            }
+        };
+        let stop = if kind == SummaryReply::ToolCall { "tool_use" } else { "end_turn" };
+        format!(
+            r#"data: {{"type":"message_start","message":{{"id":"msg_sum","type":"message","role":"assistant","content":[],"model":"claude-sonnet-4-6","stop_reason":null,"stop_sequence":null,"usage":{{"input_tokens":{input},"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}}}}
+
+{block}
+
+data: {{"type":"content_block_stop","index":0}}
+
+data: {{"type":"message_delta","delta":{{"stop_reason":"{stop}","stop_sequence":null}},"usage":{{"input_tokens":{input},"output_tokens":120,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}}
+
+data: {{"type":"message_stop"}}
+
+"#
+        )
+    }
+
+    fn is_summary_request(body: &Value) -> bool {
+        body["messages"]
+            .as_array()
+            .and_then(|m| m.last())
+            .is_some_and(|m| wire_text(m).contains(crate::runtime::rollover_summary::REQUEST_PREFIX))
+    }
+
     /// Anthropic stand-in: `rounds` tool rounds, then `end_turn`. Each round
     /// bills `body bytes × n / d` input tokens when `bill` is `Some((n, d))`,
-    /// else a token 10 (implausibly low: no usage anchor).
-    async fn spawn_billing_rounds_mock(
+    /// else a token 10 (implausibly low: no usage anchor). A rollover-summary
+    /// request is answered per `summary` and is not a round.
+    async fn spawn_rounds_mock(
         rounds: usize,
         bill: Option<(u64, u64)>,
+        summary: SummaryReply,
     ) -> (String, Arc<Mutex<Vec<Value>>>) {
         let bodies = Arc::new(Mutex::new(Vec::new()));
         let calls = Arc::new(AtomicUsize::new(0));
@@ -6809,11 +6970,30 @@ mod rich_output_tests {
                 post(move |body: String| {
                     let (b, c) = (Arc::clone(&b), Arc::clone(&c));
                     async move {
-                        let n = c.fetch_add(1, Ordering::SeqCst);
-                        if let Ok(v) = serde_json::from_str::<Value>(&body) {
+                        let parsed = serde_json::from_str::<Value>(&body).ok();
+                        let input = bill.map_or(10, |(num, den)| body.len() as u64 * num / den);
+                        let summary_request = parsed.as_ref().is_some_and(is_summary_request);
+                        if let Some(v) = parsed {
                             b.lock().unwrap().push(v);
                         }
-                        let input = bill.map_or(10, |(num, den)| body.len() as u64 * num / den);
+                        if summary_request {
+                            return match summary {
+                                SummaryReply::NoneExpected | SummaryReply::Error => (
+                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                    [("content-type", "application/json")],
+                                    r#"{"type":"error","error":{"type":"api_error","message":"boom"}}"#
+                                        .to_string(),
+                                )
+                                    .into_response(),
+                                kind => (
+                                    StatusCode::OK,
+                                    [("content-type", "text/event-stream")],
+                                    sse_summary_reply(kind, input),
+                                )
+                                    .into_response(),
+                            };
+                        }
+                        let n = c.fetch_add(1, Ordering::SeqCst);
                         let sse = if n < rounds {
                             sse_thinking_tool_round_billed(n, input)
                         } else {
@@ -6865,7 +7045,7 @@ mod rich_output_tests {
         drive_billed_worker(model, initial, rounds, window, rollover_tokens, dir, stem, None).await
     }
 
-    /// [`drive_worker_on`] against [`spawn_billing_rounds_mock`].
+    /// [`drive_worker_on`] against [`spawn_rounds_mock`].
     #[allow(clippy::too_many_arguments)]
     async fn drive_billed_worker(
         model: &str,
@@ -6877,10 +7057,32 @@ mod rich_output_tests {
         stem: &str,
         bill: Option<(u64, u64)>,
     ) -> WorkerRun {
-        use crate::runtime::worker_context::{
-            WorkerContext, WorkerContextSettings, WorkerRolloverReport, WorkerTranscriptSink,
+        let settings = crate::runtime::worker_context::WorkerContextSettings {
+            enabled: true,
+            rollover_tokens,
+            ..Default::default()
         };
-        let (base_url, bodies) = spawn_billing_rounds_mock(rounds, bill).await;
+        drive_worker_with(model, initial, rounds, window, settings, dir, stem, bill, SummaryReply::NoneExpected)
+            .await
+    }
+
+    /// [`drive_billed_worker`] with full settings and a summary behaviour.
+    #[allow(clippy::too_many_arguments)]
+    async fn drive_worker_with(
+        model: &str,
+        initial: Vec<SharedMessage>,
+        rounds: usize,
+        window: u64,
+        settings: crate::runtime::worker_context::WorkerContextSettings,
+        dir: &std::path::Path,
+        stem: &str,
+        bill: Option<(u64, u64)>,
+        summary: SummaryReply,
+    ) -> WorkerRun {
+        use crate::runtime::worker_context::{
+            WorkerContext, WorkerRolloverReport, WorkerTranscriptSink,
+        };
+        let (base_url, bodies) = spawn_rounds_mock(rounds, bill, summary).await;
         let mut registry = ToolRegistry::new();
         registry.register(Arc::new(WorkerBigOutputTool(Arc::new(AtomicUsize::new(0)))));
         let tools = Arc::new(RwLock::new(registry));
@@ -6920,7 +7122,7 @@ mod rich_output_tests {
         let reports: Arc<Mutex<Vec<WorkerRolloverReport>>> = Default::default();
         let seen = Arc::clone(&reports);
         session.worker_context = WorkerContext {
-            settings: Some(WorkerContextSettings { enabled: true, rollover_tokens }),
+            settings: Some(settings),
             sink: Some(WorkerTranscriptSink {
                 dir: dir.to_path_buf(),
                 stem: stem.into(),
@@ -6974,6 +7176,7 @@ mod rich_output_tests {
         let pressure = crate::runtime::worker_context::WorkerContextSettings {
             enabled: true,
             rollover_tokens: 60_000,
+            ..Default::default()
         }
         .policy(200_000)
         .unwrap()
@@ -7039,6 +7242,7 @@ mod rich_output_tests {
         let target = crate::runtime::worker_context::WorkerContextSettings {
             enabled: true,
             rollover_tokens: 30_000,
+            ..Default::default()
         }
         .policy(200_000)
         .unwrap()
@@ -7113,6 +7317,263 @@ mod rich_output_tests {
         assert!(run.records.iter().all(|r| r["worker"] == true));
     }
 
+    fn strip_cache_control(v: &Value) -> Value {
+        match v {
+            Value::Object(m) => Value::Object(
+                m.iter()
+                    .filter(|(k, _)| *k != "cache_control")
+                    .map(|(k, v)| (k.clone(), strip_cache_control(v)))
+                    .collect(),
+            ),
+            Value::Array(a) => Value::Array(a.iter().map(strip_cache_control).collect()),
+            other => other.clone(),
+        }
+    }
+
+    fn summary_settings(
+        rollover_tokens: u64,
+        target_tokens: Option<u64>,
+    ) -> crate::runtime::worker_context::WorkerContextSettings {
+        crate::runtime::worker_context::WorkerContextSettings {
+            enabled: true,
+            rollover_tokens,
+            summary: agent_core::config::RolloverSummaryMode::Auto,
+            target_tokens,
+        }
+    }
+
+    async fn drive_summary_worker(
+        reply: SummaryReply,
+        dir: &std::path::Path,
+        stem: &str,
+    ) -> WorkerRun {
+        let initial = vec![Arc::new(json!({"role":"user","content":BRIEF})) as SharedMessage];
+        drive_worker_with(
+            "claude-sonnet-4-6",
+            initial,
+            40,
+            200_000,
+            summary_settings(60_000, Some(25_000)),
+            dir,
+            stem,
+            None,
+            reply,
+        )
+        .await
+    }
+
+    /// `auto`: each rollover makes ONE extra request that is the worker's own
+    /// next request plus the instruction (the same prefix, tools, system and
+    /// thinking, so it is a cache read), and the successor is brief + host
+    /// note + `[Rollover summary]` + the newest rounds, within the target.
+    #[tokio::test]
+    async fn summary_rollover_reuses_the_prefix_and_rolls_to_a_small_successor() {
+        use crate::runtime::rollover_summary::{REQUEST_PREFIX, SUMMARY_KEY};
+        use crate::runtime::worker_context::{unpaired_tool_ids, MARKER_KEY};
+        let tmp = tempfile::tempdir().unwrap();
+        let run = drive_summary_worker(SummaryReply::Good, tmp.path(), "sa_21").await;
+
+        let summaries: Vec<usize> =
+            (0..run.bodies.len()).filter(|&i| is_summary_request(&run.bodies[i])).collect();
+        let rounds: Vec<&Value> = run.bodies.iter().filter(|b| !is_summary_request(b)).collect();
+        assert_eq!(rounds.len(), 41, "every round still reached the provider");
+        assert!(run.reports.len() >= 2, "rolled over repeatedly: {:?}", run.reports);
+        assert_eq!(summaries.len(), run.reports.len(), "one summary request per rollover");
+
+        for &i in &summaries {
+            let body = &run.bodies[i];
+            let prev = &run.bodies[i - 1];
+            assert!(!is_summary_request(prev));
+            // Same model, system, tools, tool_choice and thinking: the cache key.
+            for key in ["model", "system", "tools", "tool_choice", "thinking"] {
+                assert_eq!(body.get(key), prev.get(key), "{key} differs on the summary request");
+            }
+            // Capped output (the worker's own requests carry a much larger cap).
+            assert!(body["max_tokens"].as_u64().unwrap() < prev["max_tokens"].as_u64().unwrap());
+            // Everything the previous request sent is a prefix of this one,
+            // up to the cache marker; the last message carries the instruction.
+            let (a, b) = (
+                strip_cache_control(&prev["messages"]),
+                strip_cache_control(&body["messages"]),
+            );
+            let (a, b) = (a.as_array().unwrap(), b.as_array().unwrap());
+            // The previous request, then the round it just got (the assistant
+            // turn and its tool result): the worker's own next request. The
+            // instruction rides in the tool-result user turn (the builder
+            // merges adjacent user turns).
+            assert_eq!(b.len(), a.len() + 2);
+            assert_eq!(a[..], b[..a.len()], "history prefix is byte-identical");
+            assert_eq!(b[a.len()]["role"], "assistant");
+            let b_last = b.last().unwrap()["content"].as_array().unwrap();
+            assert_eq!(b_last.len(), 2);
+            assert_eq!(b_last[0]["type"], "tool_result");
+            let instruction = b_last.last().unwrap();
+            let text = instruction["text"].as_str().unwrap();
+            assert!(text.contains(REQUEST_PREFIX) && text.contains("Do NOT call any tools"));
+            // The cache marker never sits on the instruction (nothing could
+            // read it back).
+            let raw = body["messages"].as_array().unwrap().last().unwrap()["content"]
+                .as_array()
+                .unwrap()
+                .last()
+                .unwrap();
+            assert!(raw.get("cache_control").is_none(), "{raw}");
+        }
+
+        // The successor: brief, note, summary, then the newest rounds.
+        for r in &run.reports {
+            assert_eq!(r.summary_fallback, None, "{r:?}");
+            assert!(r.summary_tokens.is_some_and(|t| t > 0), "{r:?}");
+            assert!(r.after_tokens <= 25_000, "within the 25k target: {r:?}");
+            assert!(r.notice_has_summary(), "{r:?}");
+        }
+        let firsts: Vec<usize> = summaries.iter().map(|i| i + 1).collect();
+        for &i in &firsts {
+            let msgs = run.bodies[i]["messages"].as_array().unwrap();
+            assert_eq!(msgs[0]["content"][0]["text"], BRIEF, "request {i}");
+            let head = wire_text(&msgs[0]);
+            assert!(head.contains("Worker context rollover"), "{head}");
+            assert!(head.contains("[Rollover summary"), "{head}");
+            assert!(head.contains(SUMMARY_FACT), "the fact survives: {head}");
+            assert!(head.contains("**Next**: run cargo test"));
+            assert!(!wire_text(&run.bodies[i]).contains(SUMMARY_KEY));
+            assert!(!wire_text(&run.bodies[i]).contains(MARKER_KEY));
+            assert_eq!(msgs[1]["role"], "assistant", "newest rounds follow");
+            assert_eq!(msgs.last().unwrap()["content"][0]["type"], "tool_result");
+            assert!(!wire_text(&run.bodies[i]).contains(REQUEST_PREFIX));
+        }
+        // Smaller than the 30k-trigger run's 19,999 target could ever keep
+        // alongside this much history: strictly under the explicit target.
+        assert!(firsts.iter().all(|&i| run.bodies[i]["messages"].as_array().unwrap().len() < 20));
+
+        // Final history: one note, one summary, all calls paired, no instruction.
+        assert_eq!(run.history[0]["content"], BRIEF);
+        assert_eq!(run.history.iter().filter(|m| m.get(MARKER_KEY).is_some()).count(), 1);
+        assert_eq!(run.history.iter().filter(|m| m.get(SUMMARY_KEY).is_some()).count(), 1);
+        assert!(unpaired_tool_ids(&run.history).is_empty());
+        assert!(!wire_text(&Value::Array(run.history.iter().map(|m| (**m).clone()).collect()))
+            .contains(REQUEST_PREFIX));
+
+        // Telemetry: the summary request is marked; the first request of the
+        // window carries the summary / successor sizes; nothing else does.
+        let marked: Vec<&Value> = run.records.iter().filter(|r| r["rollover_summary"] == true).collect();
+        assert_eq!(marked.len(), run.reports.len(), "{:?}", run.records);
+        assert!(marked.iter().all(|r| r["worker"] == true && r.get("rollover").is_none()));
+        let firsts: Vec<&Value> = run.records.iter().filter(|r| r["rollover"] == true).collect();
+        assert_eq!(firsts.len(), run.reports.len());
+        for (rec, rep) in firsts.iter().zip(&run.reports) {
+            assert_eq!(rec["rollover_summary_tokens"], rep.summary_tokens.unwrap());
+            assert_eq!(rec["rollover_successor_tokens"], rep.after_tokens);
+            assert!(rec.get("rollover_summary_fallback").is_none());
+            assert!(rec.get("rollover_summary").is_none());
+        }
+        assert_eq!(
+            run.records.iter().filter(|r| r.get("rollover_successor_tokens").is_some()).count(),
+            run.reports.len()
+        );
+        assert_eq!(run.records.len(), 41 + summaries.len());
+    }
+
+    /// The successor is smaller than the same worker's summary-off successor.
+    #[tokio::test]
+    async fn summary_successor_is_smaller_than_the_truncation_successor() {
+        let off_dir = tempfile::tempdir().unwrap();
+        let on_dir = tempfile::tempdir().unwrap();
+        let initial = || vec![Arc::new(json!({"role":"user","content":BRIEF})) as SharedMessage];
+        let off = drive_worker_with(
+            "claude-sonnet-4-6", initial(), 40, 200_000,
+            crate::runtime::worker_context::WorkerContextSettings {
+                enabled: true,
+                rollover_tokens: 60_000,
+                ..Default::default()
+            },
+            off_dir.path(), "sa_22", None, SummaryReply::NoneExpected,
+        )
+        .await;
+        let on = drive_summary_worker(SummaryReply::Good, on_dir.path(), "sa_23").await;
+        let (off_after, on_after) = (off.reports[0].after_tokens, on.reports[0].after_tokens);
+        assert!(on_after + 8_000 < off_after, "{on_after} vs {off_after}");
+        // And it is not a windfall of fewer rounds: the same work was done.
+        assert_eq!(
+            off.bodies.len(),
+            on.bodies.iter().filter(|b| !is_summary_request(b)).count()
+        );
+    }
+
+    /// Every way the summary can fail rolls over by truncation, records why,
+    /// and the worker finishes.
+    #[tokio::test]
+    async fn a_failed_summary_falls_back_to_truncation_and_the_worker_continues() {
+        for (reply, why) in [
+            (SummaryReply::Error, "provider_error"),
+            (SummaryReply::ToolCall, "tool_call"),
+            (SummaryReply::Garbage, "unparseable"),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let run = drive_summary_worker(reply, tmp.path(), "sa_24").await;
+            let rounds = run.bodies.iter().filter(|b| !is_summary_request(b)).count();
+            assert_eq!(rounds, 41, "{why}: the worker ran to the end");
+            assert!(!run.reports.is_empty(), "{why}");
+            assert_eq!(run.history[0]["content"], BRIEF);
+            assert!(
+                run.history.iter().all(|m| m.get("_synaps_rollover_summary").is_none()),
+                "{why}: no summary in the history"
+            );
+            for r in &run.reports {
+                assert_eq!(r.summary_fallback, Some(why), "{r:?}");
+                assert_eq!(r.summary_tokens, None);
+                // Today's truncation target: min(100k, 2/3 of pressure) = 39,999.
+                assert!(r.after_tokens <= 39_999, "{why}: {r:?}");
+                assert!(r.after_tokens > 25_000, "{why}: truncation keeps more than the summary target: {r:?}");
+            }
+            assert!(run.notices.iter().any(|n| n.contains("No summary") && n.contains(why)), "{why}");
+            let firsts: Vec<&Value> = run.records.iter().filter(|r| r["rollover"] == true).collect();
+            assert_eq!(firsts.len(), run.reports.len(), "{why}");
+            for rec in firsts {
+                assert_eq!(rec["rollover_summary_fallback"], why);
+                assert!(rec.get("rollover_summary_tokens").is_none());
+                assert!(rec["rollover_successor_tokens"].as_u64().unwrap() > 0);
+            }
+            // The failed attempts are still marked, so their cost is visible.
+            let attempts = run.records.iter().filter(|r| r["rollover_summary"] == true).count();
+            assert_eq!(attempts == run.reports.len(), reply != SummaryReply::Error, "{why}");
+            assert!(!wire_text(&Value::Array(run.bodies.iter().filter(|b| !is_summary_request(b)).cloned().collect()))
+                .contains(crate::runtime::rollover_summary::REQUEST_PREFIX));
+        }
+    }
+
+    /// `off` (the default) neither asks for a summary nor stamps anything: the
+    /// same rollover as before the feature, with the same sizes.
+    #[tokio::test]
+    async fn summary_off_makes_no_extra_request_and_stamps_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let initial = vec![Arc::new(json!({"role":"user","content":BRIEF})) as SharedMessage];
+        // `target_tokens` alone (summary off) is a size knob and nothing more.
+        let settings = crate::runtime::worker_context::WorkerContextSettings {
+            enabled: true,
+            rollover_tokens: 60_000,
+            ..Default::default()
+        };
+        let run = drive_worker_with(
+            "claude-sonnet-4-6", initial, 40, 200_000, settings, tmp.path(), "sa_25", None,
+            SummaryReply::NoneExpected,
+        )
+        .await;
+        assert_eq!(run.bodies.len(), 41, "no extra request at a rollover");
+        assert!(run.bodies.iter().all(|b| !is_summary_request(b)));
+        assert!(!run.reports.is_empty());
+        for r in &run.reports {
+            assert_eq!((r.summary_tokens, r.summary_fallback), (None, None));
+            assert!(r.after_tokens <= 39_999 && r.after_tokens > 25_000, "{r:?}");
+            assert!(!r.notice().contains("ummary"));
+        }
+        let log = std::fs::read_to_string(tmp.path().join("api-log.jsonl")).unwrap();
+        assert!(!log.contains("rollover_summary") && !log.contains("rollover_successor"), "{log}");
+        assert!(run.history.iter().all(|m| m.get("_synaps_rollover_summary").is_none()));
+        let wire = wire_text(&Value::Array(run.bodies.clone()));
+        assert!(!wire.contains("Rollover summary") && wire.contains("nothing was summarized"));
+    }
+
     /// Rounds of `run` at which the history shrank (a rollover's first request).
     fn rollover_rounds(run: &WorkerRun) -> Vec<usize> {
         let len = |b: &Value| b["messages"].as_array().map_or(0, Vec::len);
@@ -7171,6 +7632,7 @@ mod rich_output_tests {
         let target = crate::runtime::worker_context::WorkerContextSettings {
             enabled: true,
             rollover_tokens: 100_000,
+            ..Default::default()
         }
         .policy(200_000)
         .unwrap()
@@ -7201,6 +7663,7 @@ mod rich_output_tests {
             let policy = crate::runtime::worker_context::WorkerContextSettings {
                 enabled: true,
                 rollover_tokens: 200_000,
+                ..Default::default()
             }
             .policy(window)
             .unwrap();
@@ -7236,6 +7699,7 @@ mod rich_output_tests {
         let target = crate::runtime::worker_context::WorkerContextSettings {
             enabled: true,
             rollover_tokens: 60_000,
+            ..Default::default()
         }
         .policy(1_000_000)
         .unwrap()
@@ -7750,7 +8214,7 @@ mod rich_output_tests {
                 s.context_window = 200_000;
                 s.options.codex_request_role = crate::runtime::openai::catalog::CodexRequestRole::Worker;
                 s.worker_context = WorkerContext {
-                    settings: Some(WorkerContextSettings { enabled: true, rollover_tokens: 20_000 }),
+                    settings: Some(WorkerContextSettings { enabled: true, rollover_tokens: 20_000, ..Default::default() }),
                     sink: Some(WorkerTranscriptSink {
                         dir: sink_dir,
                         stem: "sa_1".into(),

@@ -783,6 +783,23 @@ pub(crate) fn config_row_display(key: &str) -> Option<String> {
             .filter(|n| *n >= cfg::MIN_SUBAGENT_ROLLOVER_TOKENS)
             .unwrap_or(cfg::DEFAULT_SUBAGENT_ROLLOVER_TOKENS)
             .to_string(),
+        "subagent_rollover_summary" => raw_config(key)
+            .and_then(|v| cfg::RolloverSummaryMode::parse(&v))
+            .unwrap_or_default()
+            .as_str()
+            .to_string(),
+        "subagent_rollover_target_tokens" => {
+            // Shown as the parser resolves it: out-of-range or not below the
+            // trigger reads `auto`.
+            let trigger = raw_config("subagent_rollover_tokens")
+                .and_then(|v| v.parse::<u64>().ok())
+                .filter(|n| *n >= cfg::MIN_SUBAGENT_ROLLOVER_TOKENS)
+                .unwrap_or(cfg::DEFAULT_SUBAGENT_ROLLOVER_TOKENS);
+            raw_config(key)
+                .and_then(|v| v.parse::<u64>().ok())
+                .filter(|n| (cfg::MIN_SUBAGENT_ROLLOVER_TARGET_TOKENS..trigger).contains(n))
+                .map_or_else(|| "auto".to_string(), |n| n.to_string())
+        }
         "subagent_transform_hooks" => bool_config_display(key, true),
         "context_management.mode" => raw_config(key)
             .and_then(|v| cfg::ContextManagementMode::parse(&v))
