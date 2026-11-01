@@ -141,8 +141,27 @@ pub(crate) struct SettleProbe {
     pub target_tokens: u64,
     /// Provider calls in the window so far that returned or reported usage.
     pub rounds: u64,
+    /// Set only on a worker run's windows: the operator's worker successor
+    /// target as configured (`subagent.context_target_tokens`), logged as
+    /// the settle line's `worker_target` (the worker marker).
+    pub worker_target: Option<WorkerTarget>,
     epoch: uuid::Uuid,
     model: String,
+}
+
+/// A worker run's configured successor target: the tokens of
+/// `subagent.context_target_tokens`, or `None` when unset or `auto`.
+/// Displays as the number or `auto`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct WorkerTarget(pub Option<u64>);
+
+impl std::fmt::Display for WorkerTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            Some(tokens) => write!(f, "{tokens}"),
+            None => f.write_str("auto"),
+        }
+    }
 }
 
 /// Per-session rate-limit and settle bookkeeping. Lives in the continuation
@@ -186,7 +205,8 @@ impl WindowTelemetry {
 
     /// A rollover into `window` committed under binding `epoch` while
     /// `model` was selected; arm its settle probe. Called from the
-    /// epoch-checked commit, under the same lock.
+    /// epoch-checked commit, under the same lock. `worker_target` is set
+    /// only for a worker run's windows.
     pub(crate) fn rolled_over(
         &mut self,
         window: u64,
@@ -194,6 +214,7 @@ impl WindowTelemetry {
         model: &str,
         successor_tokens: u64,
         target_tokens: u64,
+        worker_target: Option<WorkerTarget>,
     ) {
         self.window = window;
         self.deferred.clear();
@@ -202,6 +223,7 @@ impl WindowTelemetry {
             successor_tokens,
             target_tokens,
             rounds: 0,
+            worker_target,
             epoch,
             model: model.to_owned(),
         });
@@ -410,6 +432,7 @@ pub(crate) fn emit_settled(
         successor_tokens = probe.successor_tokens,
         target_tokens = probe.target_tokens,
         rounds_since_rollover = probe.rounds,
+        worker_target = probe.worker_target.map(tracing::field::display),
         "context window settled"
     );
 }
@@ -619,7 +642,7 @@ mod tests {
     fn armed(window: u64) -> (WindowTelemetry, uuid::Uuid) {
         let mut t = WindowTelemetry::default();
         let epoch = uuid::Uuid::new_v4();
-        t.rolled_over(window, epoch, M, 90_000, 100_000);
+        t.rolled_over(window, epoch, M, 90_000, 100_000, None);
         (t, epoch)
     }
 
@@ -755,7 +778,7 @@ mod tests {
         assert!(t.watch(2, old, M), "the old call watched");
         // Reset and a new rollover before the old call completes.
         let new = uuid::Uuid::new_v4();
-        t.rolled_over(2, new, M, 50_000, 60_000);
+        t.rolled_over(2, new, M, 50_000, 60_000, None);
         assert_eq!(t.provider_round(2, old, M, Some(1), true), None);
         assert_eq!(
             t.provider_round(1, new, M, Some(1), true),
@@ -817,18 +840,36 @@ mod tests {
             successor_tokens: 92_000,
             target_tokens: 100_000,
             rounds: 1,
+            worker_target: None,
             epoch: e,
             model: M.into(),
+        };
+        // A worker run's window: the same line plus the worker marker.
+        let worker = |target| SettleProbe {
+            successor_tokens: 40_000,
+            target_tokens: 48_000,
+            worker_target: Some(WorkerTarget(target)),
+            ..probe.clone()
         };
         tracing::subscriber::with_default(subscriber, || {
             emit_deferred(&generated, 3, DeferReason::WorkersPending, 2, 410_000, None);
             emit_settled(&generated, &probe, 97_500, 95_000);
             emit_deferred(&opaque, 3, DeferReason::Admission, 0, 1, Some(2));
             emit_refused(&opaque, 3, DeferReason::Admission, 0, 1, Some(2));
+            emit_settled(&opaque, &worker(Some(48_000)), 41_000, 40_000);
+            emit_settled(&opaque, &worker(None), 41_000, 40_000);
         });
         let out = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
         let lines: Vec<&str> = out.lines().collect();
-        assert_eq!(lines.len(), 4, "{out}");
+        assert_eq!(lines.len(), 6, "{out}");
+        assert!(
+            lines[4].ends_with(&format!("synaps::context: context window settled session_ref={r} window=4 provider_context_tokens=41000 request_tokens=40000 successor_tokens=40000 target_tokens=48000 rounds_since_rollover=1 worker_target=48000")),
+            "{out}"
+        );
+        assert!(
+            lines[5].ends_with(&format!("synaps::context: context window settled session_ref={r} window=4 provider_context_tokens=41000 request_tokens=40000 successor_tokens=40000 target_tokens=48000 rounds_since_rollover=1 worker_target=auto")),
+            "{out}"
+        );
         assert!(
             lines[0].ends_with(&format!("synaps::context: context rollover deferred session={id} window=3 reason=workers_pending workers=2 footprint_tokens=410000")),
             "{out}"
@@ -853,7 +894,7 @@ mod tests {
     fn a_rollover_resets_deferral_marks() {
         let mut t = WindowTelemetry::default();
         assert!(t.should_log_deferral(1, DeferReason::WorkersPending, 1));
-        t.rolled_over(2, uuid::Uuid::new_v4(), M, 1, 1);
+        t.rolled_over(2, uuid::Uuid::new_v4(), M, 1, 1, None);
         assert!(t.should_log_deferral(2, DeferReason::WorkersPending, 1));
     }
 }

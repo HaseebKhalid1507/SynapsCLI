@@ -47,6 +47,11 @@ pub struct WorkerContextPolicy {
     /// ([`clamp_below_resume_refusal`]), so a run that ends near its
     /// trigger can still be resumed.
     pub resume_refuse_tokens: Option<u64>,
+    /// The operator's worker successor target
+    /// (`subagent.context_target_tokens`; `None`: `auto`): a worker's
+    /// rollover aims for it instead of the parent's `target_tokens`, when it
+    /// fits the worker's window ([`WorkerContextPolicy::resolve`]).
+    pub worker_target_tokens: Option<u64>,
 }
 
 /// A context-window override and the model identity it belongs to.
@@ -74,8 +79,12 @@ pub(crate) struct WorkerContext {
     /// The parent's window override, when it was set for the same model
     /// identity as the worker's.
     pub(crate) context_window: Option<u64>,
-    /// The caller-visible notice when the thresholds were reset.
+    /// The caller-visible notice when the thresholds were reset, or the
+    /// worker target did not fit.
     pub(crate) notice: Option<String>,
+    /// `subagent.context_target_tokens` as configured (`None`: `auto`),
+    /// whether or not it fit: the worker's settle lines log it.
+    pub(crate) worker_target: Option<u64>,
 }
 
 impl WorkerContextPolicy {
@@ -91,7 +100,12 @@ impl WorkerContextPolicy {
     /// with a notice that says why. When even the defaults don't fit, the
     /// worker runs with rollover off. Then, with a resume refusal line, the
     /// rollover trigger is clamped below it ([`clamp_below_resume_refusal`];
-    /// no notice). A worker's thresholds therefore
+    /// no notice). Last, the operator's worker target
+    /// (`subagent.context_target_tokens`) replaces the target when it is
+    /// below the resulting pressure threshold and any explicit summary size
+    /// is below it ([`with_worker_target`]); otherwise the worker keeps the
+    /// target it would have had without it, with one notice. Unset, nothing
+    /// changes. A worker's thresholds therefore
     /// always resolve for its window: never the unvalidated settings that
     /// the stream would treat as unbounded with no summary. The summary,
     /// compaction and disclosure settings are copied as configured; the
@@ -133,6 +147,16 @@ impl WorkerContextPolicy {
         if let Some(refuse) = self.resume_refuse_tokens {
             clamp_below_resume_refusal(&mut context_management, window, refuse)?;
         }
+        let notice = match self.worker_target_tokens {
+            Some(target) => match with_worker_target(&mut context_management, window, target) {
+                Ok(()) => notice,
+                Err(why) => Some(match notice {
+                    Some(reset) => format!("{reset}; {why}"),
+                    None => why,
+                }),
+            },
+            None => notice,
+        };
         Ok(WorkerContext {
             context_management,
             summary_model: self.summary_model.clone(),
@@ -142,7 +166,43 @@ impl WorkerContextPolicy {
             compaction_exclusions: self.compaction_exclusions.clone(),
             context_window,
             notice,
+            worker_target: self.worker_target_tokens,
         })
+    }
+}
+
+/// Make `target` the successor footprint of `config`, already resolved for
+/// the worker's `window`, when it fits there: below the pressure threshold
+/// and above an explicit summary size (the rule of
+/// `context_management.target_tokens`). The summary keeps its auto size
+/// (15% of the target, at most 15,000) unless it is set. When `target`
+/// does not fit, `config` is left as it was (the target the worker has
+/// without the key: the parent's, or `auto`) and the error is the one-line
+/// notice: never a refusal, never a value other than `target` or that one.
+fn with_worker_target(
+    config: &mut agent_core::config::ContextManagementConfig,
+    window: u64,
+    target: u64,
+) -> Result<(), String> {
+    let candidate = agent_core::config::ContextManagementConfig {
+        target_tokens: Some(target),
+        ..*config
+    };
+    match candidate.validate_for_window(window) {
+        Ok(()) => {
+            *config = candidate;
+            Ok(())
+        }
+        Err(why) => {
+            let fallback = match config.target_tokens {
+                Some(inherited) => format!("the inherited target ({inherited} tokens)"),
+                None => "the auto target".to_owned(),
+            };
+            Err(format!(
+                "subagent.context_target_tokens ({target}) does not fit this worker: {why} \
+                 (window {window} tokens); using {fallback}"
+            ))
+        }
     }
 }
 

@@ -580,6 +580,17 @@ pub struct SubagentLimits {
     /// `subagent.context_rollover`: the operator's opt-out of worker
     /// context rollover. Default: inherit.
     pub context_rollover: ContextRollover,
+    /// `subagent.context_target_tokens`: the successor footprint a worker's
+    /// rollover aims for. It replaces the inherited
+    /// `context_management.target_tokens` for workers only; main sessions
+    /// never read it. `None` (`auto`, the default) is the inherited policy
+    /// unchanged. Checked against each worker's own window: a value not
+    /// below its pressure threshold, or with a summary that does not fit
+    /// below it, falls back to the target the worker has without the key
+    /// (the inherited one, or auto) with one notice. The summary keeps
+    /// its auto size (15% of the target, at most 15,000) unless
+    /// `context_management.summary_tokens` is set: 48,000 gives 7,200.
+    pub context_target_tokens: Option<u64>,
 }
 
 impl Default for SubagentLimits {
@@ -592,6 +603,7 @@ impl Default for SubagentLimits {
             resume_refuse_tokens: Some(250_000),
             tool_hooks: true,
             context_rollover: ContextRollover::Inherit,
+            context_target_tokens: None,
         }
     }
 }
@@ -655,6 +667,21 @@ fn parse_subagent_config_key(
                 return Err("expected inherit or off; worker context rollover is off");
             }
         },
+        "subagent.context_target_tokens" => {
+            let value = value.trim();
+            // A malformed value is `auto`, never an earlier line's.
+            config.context_target_tokens = None;
+            if !value.eq_ignore_ascii_case("auto") {
+                match value.parse::<u64>() {
+                    Ok(n) if n > 0 => config.context_target_tokens = Some(n),
+                    _ => {
+                        return Err(
+                            "expected a whole number of tokens of at least 1, or auto; using auto",
+                        )
+                    }
+                }
+            }
+        }
         _ => return Err("unknown subagent key"),
     }
     Ok(())
@@ -2283,6 +2310,9 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "subagent.resume_refuse_tokens",
     "subagent.tool_hooks",
     "subagent.context_rollover",
+    // Worker successor footprint (`<tokens>` | `auto`, default auto): a
+    // worker's rollover target instead of `context_management.target_tokens`.
+    "subagent.context_target_tokens",
     // Legacy flat spellings of `subagent.max_concurrent` / `subagent.max_total`.
     "subagent_max_concurrent",
     "subagent_max_total",
@@ -4790,6 +4820,51 @@ mod tests {
             assert!(c.warnings.is_empty(), "{text:?}: {:?}", c.warnings);
         }
         assert!(super::KNOWN_CONFIG_KEYS.contains(&"subagent.context_rollover"));
+    }
+
+    /// Pin d (config side): `subagent.context_target_tokens` is unset
+    /// (`auto`) by default; a positive count sets it and `auto` clears it;
+    /// `0`, a negative number and junk warn like the sibling keys and leave
+    /// `auto`, never an earlier line's value. A known key, but not one
+    /// `config set` may write.
+    #[test]
+    fn subagent_context_target_tokens_parses_and_rejects_zero_negative_and_junk() {
+        assert_eq!(
+            super::load_config_from_str("")
+                .subagent
+                .context_target_tokens,
+            None
+        );
+        for (text, want) in [
+            ("subagent.context_target_tokens = 48000\n", Some(48_000)),
+            ("subagent.context_target_tokens =  45000 \n", Some(45_000)),
+            ("subagent.context_target_tokens = auto\n", None),
+            (
+                "subagent.context_target_tokens = 48000\nsubagent.context_target_tokens = AUTO\n",
+                None,
+            ),
+        ] {
+            let c = super::load_config_from_str(text);
+            assert_eq!(c.subagent.context_target_tokens, want, "{text:?}");
+            assert!(c.warnings.is_empty(), "{text:?}: {:?}", c.warnings);
+        }
+        for value in ["0", "-48000", "48k", "lots", ""] {
+            let c = super::load_config_from_str(&format!(
+                "subagent.context_target_tokens = 50000\nsubagent.context_target_tokens = {value}\n"
+            ));
+            assert_eq!(c.subagent.context_target_tokens, None, "{value:?} is auto");
+            assert_eq!(
+                c.warnings
+                    .iter()
+                    .filter(|w| w.starts_with("subagent.context_target_tokens"))
+                    .count(),
+                1,
+                "{value:?}: {:?}",
+                c.warnings
+            );
+        }
+        assert!(super::KNOWN_CONFIG_KEYS.contains(&"subagent.context_target_tokens"));
+        assert!(!super::SETTABLE_CONFIG_KEYS.contains(&"subagent.context_target_tokens"));
     }
 
     /// A malformed opt-out is never read as "inherit": worker rollover is

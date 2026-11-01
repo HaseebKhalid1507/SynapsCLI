@@ -117,6 +117,7 @@ fn auto_policy() -> crate::tools::WorkerContextPolicy {
         window_override: None,
         operator_rollover: agent_core::config::ContextRollover::Inherit,
         resume_refuse_tokens: None,
+        worker_target_tokens: None,
     }
 }
 

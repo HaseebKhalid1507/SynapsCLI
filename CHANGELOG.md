@@ -6,6 +6,18 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **`subagent.context_target_tokens = <tokens> | auto`** (default `auto`,
+  off): a smaller successor for workers only. When set, a worker's rollover
+  aims for this many tokens instead of the inherited
+  `context_management.target_tokens`; main sessions are never affected. The
+  summary keeps its auto size (15% of the target, at most 15,000: 48000
+  gives about 7,200) unless `context_management.summary_tokens` is set. A
+  value that does not fit the worker (at or above its pressure threshold,
+  or not above a set summary size) falls back to the target it has without
+  the key, with one notice; `0`, negative and malformed values warn and
+  mean `auto`. Unset or `auto` is exactly today's behaviour. A worker's
+  `context window settled` log line now ends with
+  `worker_target=<tokens|auto>`; main sessions' lines are unchanged.
 - **`synaps config set KEY=VALUE ...`** writes config keys for scripts and
   installers without starting or contacting the daemon: every pair in one
   locked read and one atomic owner-only write, or nothing at all.

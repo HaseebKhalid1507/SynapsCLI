@@ -199,6 +199,7 @@ fn m11_the_snapshot_is_the_parents_live_setting_and_a_copy() {
             }),
             operator_rollover: Default::default(),
             resume_refuse_tokens: Some(250_000),
+            worker_target_tokens: None,
         }
     );
     parent.set_summary_model(None);
@@ -293,6 +294,80 @@ async fn starting_a_worker_run_binds_its_runtime_to_the_run_and_nothing_else() {
     assert_eq!(s.config, context.context_management, "then the settings");
     drop(s);
     assert_eq!(format!("{:?}", rt.memory_backend_for_test().scope().map(|s| s.key().to_owned())), binding, "the archive scope is unchanged");
+}
+
+/// Worker successor trial (pins c, e): `subagent.context_target_tokens`
+/// reaches the snapshot workers inherit and nothing of the main session:
+/// its own continuation settings (an explicit target included) are what
+/// they are without the key, and its windows carry no worker marker. A
+/// worker run's runtime gets the key's target over the inherited one and
+/// the marker, which a reset of its binding keeps; unset, the marker says
+/// `auto`.
+#[tokio::test]
+#[serial_test::serial(synaps_base_dir)]
+async fn the_worker_successor_target_reaches_worker_runs_only() {
+    use crate::runtime::context_telemetry::WorkerTarget;
+    let _base = crate::test_env::BaseDirGuard::new();
+    let config = |key| crate::config::SynapsConfig {
+        context_management: ContextManagementConfig {
+            mode: ContextManagementMode::Auto,
+            target_tokens: Some(90_000),
+            ..Default::default()
+        },
+        subagent: crate::config::SubagentLimits {
+            context_target_tokens: key,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let main_on = |key| {
+        let mut rt = crate::Runtime::new_headless();
+        rt.apply_config(&config(key));
+        rt.set_model(SONNET.to_string());
+        rt
+    };
+    let (today, main) = (main_on(None), main_on(Some(48_000)));
+    let main_config = main.continuation.lock().unwrap().config;
+    assert_eq!(
+        main_config,
+        today.continuation.lock().unwrap().config,
+        "the main session's own"
+    );
+    assert_eq!(main_config.target_tokens, Some(90_000));
+    assert_eq!(
+        main.continuation.lock().unwrap().worker_target,
+        None,
+        "no worker marker"
+    );
+    assert_eq!(
+        main.worker_context_policy(),
+        WorkerContextPolicy {
+            worker_target_tokens: Some(48_000),
+            ..today.worker_context_policy()
+        }
+    );
+    for (parent, marker, target) in [(&main, Some(48_000), 48_000), (&today, None, 90_000)] {
+        let context = parent
+            .worker_context_policy()
+            .resolve(SONNET)
+            .expect("resolves");
+        let mut worker = crate::Runtime::new_headless();
+        worker.set_model(SONNET.to_string());
+        worker.start_worker_run("worker-run:0123", &context, &[]);
+        worker.reset_context_continuation("worker-run:0123", &[]);
+        let s = worker.continuation.lock().unwrap();
+        assert_eq!(s.config.target_tokens, Some(target));
+        assert_eq!(
+            s.worker_target,
+            Some(WorkerTarget(marker)),
+            "kept across a reset"
+        );
+    }
+    assert_eq!(
+        main.continuation.lock().unwrap().config,
+        main_config,
+        "untouched by its workers"
+    );
 }
 
 /// The old silent path is gone. A parent's thresholds that don't fit the

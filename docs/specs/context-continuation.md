@@ -643,7 +643,10 @@ that can log chosen ids could test guesses.
   `successor_tokens` and `target_tokens` (from the rollover),
   `rounds_since_rollover` (provider calls in the window that returned or
   reported usage, this one included; a call canceled before sending or
-  failed without usage is not counted and does not settle). If the model
+  failed without usage is not counted and does not settle), and, only on a
+  worker run's windows, `worker_target` (its configured
+  `subagent.context_target_tokens`, or `auto`; absent on a main session's
+  line, which is otherwise unchanged). If the model
   changes before the window settles, the window is not settled at all: the
   pending comparison is dropped, since another model's tokenizer and limits
   do not measure this rollover. A session reset likewise drops it.

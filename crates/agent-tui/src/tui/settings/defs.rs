@@ -71,6 +71,7 @@ pub(crate) const EXCLUDED_CONFIG_KEYS: &[(&str, &str)] = &[
     ("subagent_max_total", "legacy flat alias of subagent.max_total (edit that row)"),
     ("subagent.context_warn_tokens", "operator context limit: a token count or off, set in the config file"),
     ("subagent.resume_refuse_tokens", "operator context limit: a token count or off, set in the config file"),
+    ("subagent.context_target_tokens", "worker successor trial: a token count or auto, set in the config file"),
     ("favorite_models", "owned by the model picker (/models favorites)"),
     ("disabled_plugins", "owned by the Plugins tab"),
     ("skills.extra_root", "installer-owned skill root (`synaps config set --if-unset`), shown by `synaps skills status`"),

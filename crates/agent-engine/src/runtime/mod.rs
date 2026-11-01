@@ -2977,6 +2977,7 @@ impl Runtime {
                 }),
             operator_rollover: self.subagent_limits.context_rollover,
             resume_refuse_tokens: self.subagent_limits.resume_refuse_tokens,
+            worker_target_tokens: self.subagent_limits.context_target_tokens,
         }
     }
 
@@ -3008,10 +3009,15 @@ impl Runtime {
     /// worker that runs without rollover never gets them.
     pub(crate) fn apply_worker_context(&mut self, context: &crate::tools::WorkerContext) {
         self.set_context_window(context.context_window);
-        self.continuation
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .config = context.context_management;
+        {
+            let mut continuation = self
+                .continuation
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            continuation.config = context.context_management;
+            continuation.worker_target =
+                Some(context_telemetry::WorkerTarget(context.worker_target));
+        }
         self.compaction_model = context.compaction_model.clone();
         if context.summary_model_invalid {
             self.set_summary_model_invalid();

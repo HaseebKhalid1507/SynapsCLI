@@ -461,3 +461,211 @@ fn c5_a_clamped_context_resolves_for_its_window_below_the_refusal_line() {
     }
     assert!(clamped > 0, "some shapes were clamped");
 }
+
+// ── The operator's worker successor target (`subagent.context_target_tokens`) ──
+
+/// A parent with `config`'s thresholds and the default resume refusal line
+/// (250k), with the operator's worker target `key` (`None`: unset or
+/// `auto`), resolved for a worker on a `tokens` window (`None`: its
+/// model's own, 200k).
+fn with_key(
+    config: ContextManagementConfig,
+    tokens: Option<u64>,
+    key: Option<u64>,
+) -> WorkerContext {
+    WorkerContextPolicy {
+        window_override: tokens.and_then(|t| window(t, SONNET)),
+        resume_refuse_tokens: Some(250_000),
+        worker_target_tokens: key,
+        ..parent(config)
+    }
+    .resolve(SONNET)
+    .expect("resolves")
+}
+
+/// The (target, summary) a resolved worker's rollover aims for.
+fn aims(resolved: &WorkerContext) -> (u64, u64) {
+    let config = &resolved.context_management;
+    let at = ContextThresholds::resolve(config, resolved.context_window.unwrap_or(200_000))
+        .expect("resolves for its window");
+    (at.target_tokens(config), at.summary_tokens(config))
+}
+
+/// Pin a: unset (`auto` parses to the same `None`), a worker's policy is
+/// today's exactly: on 1M the clamped thresholds aiming for the 100k
+/// target and a 15k summary; on its model's 200k window the parent's
+/// settings as they are, aiming for 93,333 and 13,999; an inherited target
+/// is kept; no notice.
+#[test]
+fn worker_target_unset_or_auto_gives_todays_worker_policy() {
+    let wide = with_key(Default::default(), Some(1_000_000), None);
+    assert_eq!((wide.notice.as_deref(), wide.worker_target), (None, None));
+    let c = wide.context_management;
+    assert_eq!(
+        (
+            c.pressure_tokens,
+            c.rollover_tokens,
+            c.target_tokens,
+            c.summary_tokens
+        ),
+        (Some(157_111), Some(202_000), None, None)
+    );
+    assert_eq!(aims(&wide), (100_000, 15_000));
+    let on_200k = with_key(Default::default(), None, None);
+    assert_eq!(on_200k.notice, None);
+    assert_eq!(
+        on_200k.context_management,
+        parent(Default::default()).context_management,
+        "as configured"
+    );
+    assert_eq!(aims(&on_200k), (93_333, 13_999));
+    let inherited = ContextManagementConfig {
+        target_tokens: Some(90_000),
+        ..Default::default()
+    };
+    assert_eq!(
+        with_key(inherited, None, None)
+            .context_management
+            .target_tokens,
+        Some(90_000)
+    );
+}
+
+/// Pin b: 48,000 is the worker's successor target on its model's window
+/// and on a 1M window (below the clamped pressure, 157,111); the summary
+/// keeps its auto size, 15% of the target (48k: 7,200; 45k: 6,750; 50k:
+/// 7,500) unless it is set; the thresholds are otherwise today's; no
+/// notice; the configured value is kept for the settle lines.
+#[test]
+fn worker_target_48000_sets_the_successor_target_and_the_auto_summary() {
+    for (tokens, pressure, rollover) in [
+        (None, 140_000, 180_000),
+        (Some(1_000_000), 157_111, 202_000),
+    ] {
+        let today = with_key(Default::default(), tokens, None);
+        let resolved = with_key(Default::default(), tokens, Some(48_000));
+        assert_eq!(
+            (resolved.notice.as_deref(), resolved.worker_target),
+            (None, Some(48_000))
+        );
+        assert_eq!(
+            resolved.context_management,
+            ContextManagementConfig {
+                target_tokens: Some(48_000),
+                ..today.context_management
+            }
+        );
+        assert_eq!(aims(&resolved), (48_000, 7_200));
+        let window = resolved.context_window.unwrap_or(200_000);
+        let at = ContextThresholds::resolve(&resolved.context_management, window).unwrap();
+        assert_eq!(
+            (at.pressure_tokens, at.rollover_tokens),
+            (pressure, rollover)
+        );
+    }
+    for (key, summary) in [(45_000, 6_750), (50_000, 7_500)] {
+        assert_eq!(
+            aims(&with_key(Default::default(), None, Some(key))),
+            (key, summary)
+        );
+    }
+    let summary = ContextManagementConfig {
+        summary_tokens: Some(5_000),
+        ..Default::default()
+    };
+    assert_eq!(
+        aims(&with_key(summary, None, Some(48_000))),
+        (48_000, 5_000),
+        "a set summary"
+    );
+}
+
+/// Pin d: a worker target at or above the worker's pressure threshold (a
+/// 50k window: 35,000), or not above a set summary size, does not fit: one
+/// notice says so and the worker keeps the target it has without the key
+/// (auto, or the inherited one). Never a refusal, never a larger value.
+#[test]
+fn a_worker_target_that_does_not_fit_warns_once_and_falls_back() {
+    let small = Some(50_000);
+    let today = with_key(Default::default(), small, None);
+    assert_eq!(aims(&today), (23_333, 3_499));
+    for key in [35_000, 48_000, 400_000] {
+        let resolved = with_key(Default::default(), small, Some(key));
+        assert_eq!(
+            resolved.notice,
+            Some(format!(
+                "subagent.context_target_tokens ({key}) does not fit this worker: target_tokens \
+                 must be below pressure_tokens (window 50000 tokens); using the auto target"
+            ))
+        );
+        assert_eq!(
+            resolved.context_management, today.context_management,
+            "auto"
+        );
+        assert_eq!(aims(&resolved), (23_333, 3_499));
+        assert_eq!(resolved.worker_target, Some(key), "logged as configured");
+    }
+    assert_eq!(
+        aims(&with_key(Default::default(), small, Some(34_999))),
+        (34_999, 5_249),
+        "fits"
+    );
+    let inherited = ContextManagementConfig {
+        target_tokens: Some(90_000),
+        summary_tokens: Some(48_000),
+        ..Default::default()
+    };
+    let resolved = with_key(inherited, None, Some(48_000));
+    assert_eq!(
+        resolved.notice.as_deref(),
+        Some(
+            "subagent.context_target_tokens (48000) does not fit this worker: summary_tokens \
+             must be below target_tokens (window 200000 tokens); using the inherited target \
+             (90000 tokens)"
+        )
+    );
+    assert_eq!(
+        resolved.context_management,
+        with_key(inherited, None, None).context_management
+    );
+    // Thresholds reset for the window, then the key does not fit either:
+    // both said, in one notice.
+    let reset = with_key(
+        thresholds(600_000, 800_000, 300_000, 20_000),
+        small,
+        Some(48_000),
+    );
+    let notice = reset.notice.as_deref().expect("a notice");
+    assert!(
+        notice.starts_with("rollover thresholds reset to this worker's defaults: "),
+        "{notice}"
+    );
+    assert!(notice.ends_with("; subagent.context_target_tokens (48000) does not fit this worker: target_tokens must be below pressure_tokens (window 50000 tokens); using the auto target"), "{notice}");
+    assert_eq!(aims(&reset), (23_333, 3_499));
+}
+
+/// Pin e: the key wins over an inherited `context_management.target_tokens`
+/// (larger or smaller) for the worker; the parent's own settings are left
+/// as they are.
+#[test]
+fn the_worker_target_wins_over_an_inherited_target() {
+    for inherited in [90_000, 30_000] {
+        let config = ContextManagementConfig {
+            target_tokens: Some(inherited),
+            ..Default::default()
+        };
+        let policy = WorkerContextPolicy {
+            worker_target_tokens: Some(48_000),
+            ..parent(config)
+        };
+        let resolved = policy.resolve(SONNET).expect("resolves");
+        assert_eq!(resolved.notice, None);
+        assert_eq!(resolved.context_management.target_tokens, Some(48_000));
+        assert_eq!(aims(&resolved), (48_000, 7_200));
+        assert_eq!(
+            policy.context_management.target_tokens,
+            Some(inherited),
+            "the parent's"
+        );
+    }
+}

@@ -174,6 +174,10 @@ pub struct ContinuationState {
     pub(crate) summary_skips_noticed: super::rolling_summary::SummaryNotices,
     /// Rate limits and the settle probe for metadata-only context telemetry.
     pub(crate) telemetry: super::context_telemetry::WindowTelemetry,
+    /// Set only on a worker run's runtime (`Runtime::apply_worker_context`):
+    /// its configured successor target, which marks its settle lines.
+    /// `None` on a main session. Survives a reset, like `config`.
+    pub(crate) worker_target: Option<super::context_telemetry::WorkerTarget>,
     /// The chain's last native-Anthropic conversation request, for a warm
     /// rolling summary (`warm_summary`); one per chain.
     pub(crate) warm_record: Option<Arc<super::warm_summary::RequestRecord>>,
@@ -216,6 +220,7 @@ impl Default for ContinuationState {
             turn_start: None,
             summary_skips_noticed: Default::default(),
             telemetry: Default::default(),
+            worker_target: None,
             warm_record: None,
             warm_sequence: 0,
             warm_policy: 0,
@@ -1104,12 +1109,14 @@ impl PreparedRollover {
             ));
         }
         if let Some((model, successor_tokens, target_tokens)) = &self.settle {
+            let worker_target = s.worker_target;
             s.telemetry.rolled_over(
                 self.window,
                 self.epoch,
                 model,
                 *successor_tokens,
                 *target_tokens,
+                worker_target,
             );
         }
         s.window = self.window;
@@ -1732,6 +1739,7 @@ impl crate::Runtime {
             *state = ContinuationState {
                 logical_id: session_id.to_owned(),
                 config,
+                worker_target: state.worker_target,
                 // Generations are monotonic across resets.
                 warm_policy: state.warm_policy,
                 warm_prefix: state.warm_prefix,
@@ -2050,6 +2058,35 @@ mod tests {
         let head = prepared(&state);
         head.commit(&state).unwrap();
         assert_eq!(state.lock().unwrap().last_band, None);
+    }
+
+    /// Worker successor trial: a worker run's window settles with its
+    /// configured target (the settle line's `worker_target`, `auto` when
+    /// unset); a main session's window carries none.
+    #[test]
+    fn the_settle_probe_carries_the_worker_target_of_a_worker_run_only() {
+        use crate::runtime::context_telemetry::WorkerTarget;
+        const M: &str = "claude-sonnet-4-6";
+        for marker in [
+            None,
+            Some(WorkerTarget(None)),
+            Some(WorkerTarget(Some(48_000))),
+        ] {
+            let state = Arc::new(Mutex::new(ContinuationState {
+                worker_target: marker,
+                ..Default::default()
+            }));
+            let mut head = prepared(&state);
+            head.arm_settle(M, 40_000, 48_000);
+            head.commit(&state).unwrap();
+            let mut s = state.lock().unwrap();
+            let epoch = s.epoch();
+            let (probe, tokens) = s
+                .telemetry
+                .provider_round(2, epoch, M, Some(41_000), true)
+                .expect("settled");
+            assert_eq!((probe.worker_target, tokens), (marker, 41_000));
+        }
     }
 
     #[tokio::test]
