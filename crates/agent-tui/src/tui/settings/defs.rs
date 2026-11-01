@@ -267,13 +267,23 @@ define_settings! {
 
     "subagent_context_management", "Subagent rollover", Agent,
         EditorKind::Cycler(&["auto", "off"]),
-        "Automatic context rollover for subagent workers: auto moves a worker's older rounds out of its context once it reaches the rollover size (saved as plain text beside its resume archive, nothing summarized; the task and recent rounds stay); off lets a worker's context grow until the window is full (default auto). Applies to workers started afterwards.",
+        "Automatic context rollover for subagent workers: auto moves a worker's older rounds out of its context once it reaches the rollover size (saved as plain text beside its resume archive; the task and recent rounds stay, and with subagent_rollover_summary = auto a model-written summary stays too); off lets a worker's context grow until the window is full (default auto). Applies to workers started afterwards.",
         |_app, value| config_edit("subagent_context_management", value);
 
     "subagent_rollover_tokens", "Subagent rollover at", Agent,
         EditorKind::Text { numeric: true },
         "Context size, in tokens, at which a worker rolls over to a ~100k successor (default 200000, at least 20000; a smaller model window's own threshold wins). Applies to workers started afterwards.",
         |_app, value| whole_number("subagent_rollover_tokens", value);
+
+    "subagent_rollover_summary", "Rollover summary", Agent,
+        EditorKind::Cycler(&["off", "auto"]),
+        "auto: when a worker rolls over it makes one extra request asking the model to summarise its context (same model, prompt and tools, so the prefix is a cache read) and rolls to a much smaller successor (default 45000 tokens, see the next row) carrying that summary. Any failure falls back to the plain truncation rollover. off (default): truncation only, no extra request. Applies to workers started afterwards.",
+        |_app, value| config_edit("subagent_rollover_summary", value);
+
+    "subagent_rollover_target_tokens", "Worker rollover size", Agent,
+        EditorKind::Text { numeric: false },
+        "Size, in tokens, a worker's context rolls over to (at least 10000, below the rollover size). auto (default): the usual ~100k successor, or 45000 when rollover summaries are on. Applies to workers started afterwards.",
+        |_app, value| config_edit("subagent_rollover_target_tokens", value);
 
     "subagent_transform_hooks", "Subagent output hooks", Agent, EditorKind::Cycler(&["on", "off"]),
         "Extensions that rewrite tool output (after_tool_call replace with tools.transform_output: compression, redaction) also see subagent workers' tool results, as they see the main session's; no other hook runs in a worker, so a worker never asks for confirmation (default on; off = worker tool results reach history untransformed). Applies to workers started afterwards.",
@@ -1205,8 +1215,28 @@ mod tests {
             assert!(is_ok(d("subagent_rollover_tokens", "20000")));
             assert!(is_err(d("subagent_rollover_tokens", "19999")));
             assert!(is_err(d("subagent_rollover_tokens", "lots")));
+            assert!(is_ok(d("subagent_rollover_summary", "auto")));
+            assert!(is_ok(d("subagent_rollover_summary", "off")));
+            assert!(is_err(d("subagent_rollover_summary", "sometimes")));
+            assert!(is_ok(d("subagent_rollover_target_tokens", "45000")));
+            assert!(is_ok(d("subagent_rollover_target_tokens", "auto")));
+            assert!(is_err(d("subagent_rollover_target_tokens", "9999")));
+            assert!(is_err(d("subagent_rollover_target_tokens", "lots")));
+            // Not below the trigger: refused by the parser's cross-key check.
+            assert!(is_err(d("subagent_rollover_target_tokens", "200000")));
         }
         drop(temp);
+        for (content, mode, target) in [
+            ("", "off", "auto"),
+            ("subagent_rollover_summary = AUTO\nsubagent_rollover_target_tokens = 30000\n", "auto", "30000"),
+            ("subagent_rollover_summary = maybe\nsubagent_rollover_target_tokens = 5\n", "off", "auto"),
+            ("subagent_rollover_target_tokens = 250000\n", "off", "auto"),
+        ] {
+            let temp = TempConfig::new(content);
+            assert_eq!(config_row_display("subagent_rollover_summary").as_deref(), Some(mode), "{content}");
+            assert_eq!(config_row_display("subagent_rollover_target_tokens").as_deref(), Some(target), "{content}");
+            drop(temp);
+        }
     }
 
     #[test]

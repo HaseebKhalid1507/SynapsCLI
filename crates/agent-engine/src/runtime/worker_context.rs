@@ -29,7 +29,10 @@ use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use agent_core::config::{ContextManagementConfig, ContextManagementMode, SynapsConfig};
+use agent_core::config::{
+    ContextManagementConfig, ContextManagementMode, RolloverSummaryMode, SynapsConfig,
+    DEFAULT_SUBAGENT_ROLLOVER_SUMMARY_TARGET_TOKENS,
+};
 use agent_core::core::context_policy::ContextThresholds;
 use serde_json::{json, Value};
 
@@ -37,6 +40,7 @@ use super::continuation::{
     message_tokens, neutral_note, tool_groups, SuccessorBudget, TokenCalibration,
     DROPPED_INDEX_TOKENS, PINNED_SHARE_PERCENT,
 };
+use super::rollover_summary::{self, RolloverSummary};
 use crate::SharedMessage;
 
 /// Host-only key on the rollover note (stripped from every provider wire like
@@ -57,10 +61,17 @@ const MIN_SHRINK_TOKENS: u64 = 1024;
 
 /// What config says about worker rollover. Set on every worker runtime by
 /// `apply_subagent_runtime_policy`; inert until a transcript sink is attached.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct WorkerContextSettings {
     pub enabled: bool,
     pub rollover_tokens: u64,
+    /// `subagent_rollover_summary`: `Auto` makes one extra model request at a
+    /// rollover and rolls to a smaller successor around its answer.
+    pub summary: RolloverSummaryMode,
+    /// `subagent_rollover_target_tokens`: the successor size, independent of
+    /// the trigger. `None` = the derived target (or, with a summary, the
+    /// summary default).
+    pub target_tokens: Option<u64>,
 }
 
 impl WorkerContextSettings {
@@ -68,6 +79,8 @@ impl WorkerContextSettings {
         Self {
             enabled: config.subagent_context_management == ContextManagementMode::Auto,
             rollover_tokens: config.subagent_rollover_tokens,
+            summary: config.subagent_rollover_summary,
+            target_tokens: config.subagent_rollover_target_tokens,
         }
     }
 
@@ -91,7 +104,12 @@ impl WorkerContextSettings {
             ..base
         };
         let thresholds = ContextThresholds::resolve(&config, window).ok()?;
-        Some(WorkerPolicy { config, thresholds })
+        Some(WorkerPolicy {
+            config,
+            thresholds,
+            summary: self.summary,
+            target_override: self.target_tokens,
+        })
     }
 }
 
@@ -100,11 +118,51 @@ impl WorkerContextSettings {
 pub struct WorkerPolicy {
     pub config: ContextManagementConfig,
     pub thresholds: ContextThresholds,
+    pub summary: RolloverSummaryMode,
+    /// `subagent_rollover_target_tokens`, as configured.
+    pub target_override: Option<u64>,
 }
 
 impl WorkerPolicy {
-    pub fn target_tokens(&self) -> u64 {
+    /// Today's host-only target, derived like the foreground's:
+    /// min(100k, 2/3 of pressure).
+    pub fn derived_target_tokens(&self) -> u64 {
         self.thresholds.target_tokens(&self.config)
+    }
+
+    /// Whether rollovers ask the model for a summary.
+    pub fn summary_enabled(&self) -> bool {
+        self.summary == RolloverSummaryMode::Auto
+    }
+
+    /// The footprint a rollover successor aims for. An explicit
+    /// `subagent_rollover_target_tokens` wins (kept below pressure, so a
+    /// successor never starts inside the band that would roll it again).
+    /// Unset: the derived target, except with a summary, where it is
+    /// [`DEFAULT_SUBAGENT_ROLLOVER_SUMMARY_TARGET_TOKENS`] (never above the
+    /// derived target, so a small window does not aim past what truncation
+    /// would).
+    pub fn target_tokens(&self) -> u64 {
+        let derived = self.derived_target_tokens();
+        match self.target_override {
+            Some(target) => target.clamp(1, self.thresholds.pressure_tokens.saturating_sub(1).max(1)),
+            None if self.summary_enabled() => {
+                derived.min(DEFAULT_SUBAGENT_ROLLOVER_SUMMARY_TARGET_TOKENS)
+            }
+            None => derived,
+        }
+    }
+
+    /// The target of a rollover that has no summary to lean on (summaries off,
+    /// or the summary request failed): today's derived target, and never
+    /// smaller than the one a summary would have used. The small target is
+    /// only safe because the summary carries what the dropped rounds held.
+    pub fn fallback_target_tokens(&self) -> u64 {
+        if self.summary_enabled() {
+            self.target_tokens().max(self.derived_target_tokens())
+        } else {
+            self.target_tokens()
+        }
     }
 
     /// Message budget for the successor (estimator units), exactly as the
@@ -114,8 +172,26 @@ impl WorkerPolicy {
         overhead_tokens: u64,
         calibration: Option<TokenCalibration>,
     ) -> SuccessorBudget {
+        self.budget_for(self.target_tokens(), overhead_tokens, calibration)
+    }
+
+    /// [`Self::successor_budget`] for [`Self::fallback_target_tokens`].
+    pub fn fallback_successor_budget(
+        &self,
+        overhead_tokens: u64,
+        calibration: Option<TokenCalibration>,
+    ) -> SuccessorBudget {
+        self.budget_for(self.fallback_target_tokens(), overhead_tokens, calibration)
+    }
+
+    fn budget_for(
+        &self,
+        target_tokens: u64,
+        overhead_tokens: u64,
+        calibration: Option<TokenCalibration>,
+    ) -> SuccessorBudget {
         super::continuation::successor_budget(
-            self.target_tokens(),
+            target_tokens,
             self.thresholds.pressure_tokens,
             overhead_tokens,
             calibration,
@@ -214,19 +290,36 @@ pub struct WorkerRolloverReport {
     pub transcript: PathBuf,
     /// Every earlier window's transcript, oldest first, this one last.
     pub transcripts: Vec<PathBuf>,
+    /// The summary this rollover carried, in estimator tokens. `None`
+    /// without one (summaries off, or fell back).
+    pub summary_tokens: Option<u64>,
+    /// Why a summary was attempted but not used (`rollover_summary::Fallback`
+    /// name). `None` when none was attempted or it was used.
+    pub summary_fallback: Option<&'static str>,
 }
 
 impl WorkerRolloverReport {
     /// The worker stream's notice.
     pub fn notice(&self) -> String {
-        format!(
+        let mut notice = format!(
             "Worker context rolled over to window {}: ~{}k → ~{}k tokens; {} earlier messages saved to {}.",
             self.window,
             self.before_tokens / 1000,
             self.after_tokens / 1000,
             self.evicted_messages,
             self.transcript.display()
-        )
+        );
+        if let Some(tokens) = self.summary_tokens {
+            notice.push_str(&format!(" Summary carried (~{tokens} tokens)."));
+        } else if let Some(why) = self.summary_fallback {
+            notice.push_str(&format!(" No summary ({why}); rolled over by truncation."));
+        }
+        notice
+    }
+
+    /// Whether this rollover's successor carries a model-written summary.
+    pub fn notice_has_summary(&self) -> bool {
+        self.summary_tokens.is_some() && self.notice().contains("Summary carried")
     }
 
     /// One line for the subagent panel.
@@ -289,8 +382,11 @@ pub fn carried_marker(history: &[Value]) -> Option<Value> {
     Some(json!({"schema": SCHEMA, "window": window, "transcripts": transcripts}))
 }
 
+/// Host bookkeeping a rollover wrote: the note, and the summary message that
+/// follows it. Neither is an instruction, and neither is evicted into a
+/// transcript (a summary is carried or superseded, see [`plan_rollover_with`]).
 fn is_note(message: &Value) -> bool {
-    message.get(MARKER_KEY).is_some()
+    message.get(MARKER_KEY).is_some() || rollover_summary::is_summary(message)
 }
 
 fn has_tool_result(message: &Value) -> bool {
@@ -366,6 +462,25 @@ pub fn plan_rollover(
     before_tokens: u64,
     transcript_path: impl Fn(u64) -> PathBuf,
 ) -> Option<RolloverPlan> {
+    plan_rollover_with(messages, budget, before_tokens, transcript_path, None)
+}
+
+/// [`plan_rollover`] with a model-written `summary` of the evicted history.
+///
+/// With a summary the successor is the brief; later orchestrator
+/// instructions; the host note (transcript paths, no tool index: the summary
+/// replaces it); the `[Rollover summary]` message; and the newest rounds that
+/// fit the rest of the budget. Without one it is exactly [`plan_rollover`]'s
+/// successor, except that the summary an earlier rollover left in the history
+/// (if any) is carried forward unchanged rather than silently dropped; a
+/// history that never had a summary plans byte-identically to before.
+pub fn plan_rollover_with(
+    messages: &[SharedMessage],
+    budget: SuccessorBudget,
+    before_tokens: u64,
+    transcript_path: impl Fn(u64) -> PathBuf,
+    summary: Option<&RolloverSummary>,
+) -> Option<RolloverPlan> {
     let n = messages.len();
     if n < 3 || messages[0]["role"] != "user" {
         return None;
@@ -416,10 +531,24 @@ pub fn plan_rollover(
         .collect();
     let instruction_reserve = instructions.iter().map(|(_, _, c)| c).sum::<u64>().min(share);
     let (_, prior) = window_state(messages);
-    let note_reserve =
-        DROPPED_INDEX_TOKENS + NOTE_FRAME_TOKENS + 60 * (prior.len() as u64 + 1);
-    let available =
-        total.saturating_sub(costs[0] + instruction_reserve + note_reserve);
+    // The summary message that travels: the fresh one, else the one an earlier
+    // rollover left (its notes outlive a rollover that has no new summary).
+    let (summary_message, summary_kind) = match summary {
+        Some(s) => (Some(s.message()), SummaryKind::Fresh),
+        None => match rollover_summary::carried(messages) {
+            Some(m) => (Some(m), SummaryKind::Carried),
+            None => (None, SummaryKind::None),
+        },
+    };
+    let summary_reserve = summary_message.as_ref().map_or(0, message_tokens);
+    // The summary replaces the tool index, the biggest part of the note.
+    let note_reserve = if summary_kind == SummaryKind::Fresh {
+        NOTE_FRAME_TOKENS + 60 * (prior.len() as u64 + 1)
+    } else {
+        DROPPED_INDEX_TOKENS + NOTE_FRAME_TOKENS + 60 * (prior.len() as u64 + 1)
+    };
+    let available = total
+        .saturating_sub(costs[0] + instruction_reserve + note_reserve + summary_reserve);
     // First cut whose suffix fits the reserve estimate; then measure the
     // real successor (the note grows with the index and every earlier
     // window) and step to the next boundary while it is over target.
@@ -442,6 +571,7 @@ pub fn plan_rollover(
             &path,
             before_tokens,
             &costs,
+            summary_message.as_ref().map(|m| (summary_kind, m)),
         )?;
         let size = super::context::estimate_history(&built.successor);
         plan = Some(built);
@@ -476,6 +606,7 @@ fn build_successor(
     path: &Path,
     before_tokens: u64,
     costs: &[u64],
+    summary: Option<(SummaryKind, &SharedMessage)>,
 ) -> Option<RolloverPlan> {
     // Instructions evicted by this cut, newest first within the share.
     let mut pinned = Vec::new();
@@ -517,7 +648,12 @@ fn build_successor(
         kept,
         carried_instructions: !pinned.is_empty(),
         transcripts: &transcripts,
-        tool_index: tool_index(messages, &evicted),
+        summary: summary.map_or(SummaryKind::None, |(kind, _)| kind),
+        // The summary replaces the index of what was moved.
+        tool_index: match summary {
+            Some((SummaryKind::Fresh, _)) => Vec::new(),
+            _ => tool_index(messages, &evicted),
+        },
         unpinned: &unpinned
             .iter()
             .map(|&i| (i, preview(&messages[i])))
@@ -528,6 +664,7 @@ fn build_successor(
     successor.push(Arc::clone(&messages[0]));
     successor.extend(pinned.into_iter().map(|(_, m)| m));
     successor.push(Arc::new(note));
+    successor.extend(summary.map(|(_, m)| Arc::clone(m)));
     successor.extend(messages[cut..].iter().cloned());
     // A retained read-dedupe stub must not point at an evicted read.
     super::read_dedupe::rewrite_dangling_stubs(&mut successor);
@@ -579,6 +716,16 @@ pub fn unpaired_tool_ids(messages: &[SharedMessage]) -> BTreeSet<String> {
     unpaired
 }
 
+/// Which summary, if any, travels in a successor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SummaryKind {
+    None,
+    /// Written for this rollover.
+    Fresh,
+    /// Left by an earlier rollover; this one has none of its own.
+    Carried,
+}
+
 struct NoteFacts<'a> {
     window: u64,
     before_tokens: u64,
@@ -587,16 +734,27 @@ struct NoteFacts<'a> {
     kept: usize,
     carried_instructions: bool,
     transcripts: &'a [TranscriptRef],
+    summary: SummaryKind,
     tool_index: Vec<String>,
     unpinned: &'a [(usize, String)],
 }
 
 fn note_message(f: NoteFacts<'_>) -> Value {
+    let summarized = match f.summary {
+        SummaryKind::None => "nothing was summarized.",
+        SummaryKind::Fresh => {
+            "they are summarized in your own notes (the [Rollover summary] message after this note)."
+        }
+        SummaryKind::Carried => {
+            "nothing was summarized this time; your own notes from the earlier rollover \
+             (the [Rollover summary] message after this note) are kept unchanged."
+        }
+    };
     let mut text = format!(
         "[Worker context rollover — host note, not a new instruction]\n\
          Your context reached about {} tokens, so the host started context window {}. \
          {} earlier messages (about {} tokens) were moved out of your context unchanged; \
-         nothing was summarized. Your task (the first message){} and your most recent {} \
+         {summarized} Your task (the first message){} and your most recent {} \
          messages are kept verbatim.\n\
          The moved messages are saved as plain text you can search with grep or read by line range:",
         f.before_tokens,
@@ -803,6 +961,36 @@ fn render_block(out: &mut String, b: &Value) {
     }
 }
 
+/// A rollover that passed every check and only needs its transcript written.
+#[derive(Debug)]
+pub struct PreparedRollover {
+    plan: RolloverPlan,
+    report: WorkerRolloverReport,
+}
+
+impl PreparedRollover {
+    /// The report this rollover will produce (its summary fields are final).
+    pub fn report(&self) -> &WorkerRolloverReport {
+        &self.report
+    }
+
+    /// The successor's estimated size (overhead included).
+    pub fn after_tokens(&self) -> u64 {
+        self.report.after_tokens
+    }
+
+    /// Save the evicted messages, then hand over the successor. An error
+    /// writing the transcript means no rollover: nothing is evicted that was
+    /// not saved.
+    pub fn commit(self) -> std::io::Result<(Vec<SharedMessage>, WorkerRolloverReport)> {
+        crate::tools::write_window_transcript(
+            &self.plan.transcript_path,
+            &self.plan.transcript,
+        )?;
+        Ok((self.plan.successor, self.report))
+    }
+}
+
 /// Apply one worker rollover: plan it, refuse one that cannot shrink the
 /// context or would start where the next round triggers another rollover
 /// (the pressure band below hard capacity, the hard-capacity line at it),
@@ -822,36 +1010,65 @@ pub fn roll_over(
     sink: &WorkerTranscriptSink,
     hard_capacity: Option<u64>,
 ) -> std::io::Result<Option<(Vec<SharedMessage>, WorkerRolloverReport)>> {
-    let Some(plan) = plan_rollover(messages, budget, before_tokens, |window| {
-        transcript_path(&sink.dir, &sink.stem, window)
-    }) else {
-        return Ok(None);
-    };
+    prepare_roll_over(
+        messages,
+        budget,
+        before_tokens,
+        overhead_tokens,
+        policy,
+        sink,
+        hard_capacity,
+        None,
+    )
+    .map(|p| p.commit())
+    .transpose()
+}
+
+/// The checks of [`roll_over`] without writing anything. With `summary` the
+/// successor is built around it (see [`plan_rollover_with`]) and the report
+/// says so. Pure: a caller can ask whether a rollover would pass before it
+/// spends a model request on a summary.
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_roll_over(
+    messages: &[SharedMessage],
+    budget: SuccessorBudget,
+    before_tokens: u64,
+    overhead_tokens: u64,
+    policy: &WorkerPolicy,
+    sink: &WorkerTranscriptSink,
+    hard_capacity: Option<u64>,
+    summary: Option<&RolloverSummary>,
+) -> Option<PreparedRollover> {
+    let plan = plan_rollover_with(
+        messages,
+        budget,
+        before_tokens,
+        |window| transcript_path(&sink.dir, &sink.stem, window),
+        summary,
+    )?;
     if !plan_is_productive(messages, &plan) {
-        return Ok(None);
+        return None;
     }
     let after_tokens =
         overhead_tokens.saturating_add(super::context::estimate_history(&plan.successor));
     if after_tokens >= hard_capacity.unwrap_or(policy.thresholds.pressure_tokens) {
-        return Ok(None);
+        return None;
     }
-    crate::tools::write_window_transcript(
-        &plan.transcript_path,
-        &plan.transcript,
-    )?;
     let report = WorkerRolloverReport {
         window: plan.window,
         before_tokens,
         after_tokens,
         evicted_messages: plan.evicted_messages,
-        transcript: plan.transcript_path,
+        transcript: plan.transcript_path.clone(),
         transcripts: plan
             .transcripts
             .iter()
             .map(|t| PathBuf::from(&t.path))
             .collect(),
+        summary_tokens: summary.map(|s| s.tokens),
+        summary_fallback: None,
     };
-    Ok(Some((plan.successor, report)))
+    Some(PreparedRollover { plan, report })
 }
 
 /// `<dir>/<stem>.window-<window>.md`.
@@ -905,7 +1122,7 @@ mod tests {
 
     #[test]
     fn policy_lowers_the_band_and_derives_pressure_and_target_like_the_foreground() {
-        let on = WorkerContextSettings { enabled: true, rollover_tokens: 200_000 };
+        let on = WorkerContextSettings { enabled: true, rollover_tokens: 200_000, ..Default::default() };
         let p = on.policy(1_000_000).unwrap();
         assert_eq!(p.thresholds.rollover_tokens, 200_000);
         assert_eq!(p.thresholds.pressure_tokens, 199_999);
@@ -928,7 +1145,7 @@ mod tests {
     #[test]
     fn policy_engine_admits_then_rolls_at_the_worker_band() {
         use agent_core::core::context_policy::{assess_context, ContextAction, ContextBudget, ContextState};
-        let p = WorkerContextSettings { enabled: true, rollover_tokens: 200_000 }
+        let p = WorkerContextSettings { enabled: true, rollover_tokens: 200_000, ..Default::default() }
             .policy(1_000_000)
             .unwrap();
         let at = |used: u64| ContextBudget {
@@ -973,7 +1190,7 @@ mod tests {
     #[test]
     fn hard_capacity_has_room_only_when_the_target_fits_below_it() {
         use agent_core::core::context_policy::{assess_context, ContextAction, ContextBudget, ContextState};
-        let on = WorkerContextSettings { enabled: true, rollover_tokens: 200_000 };
+        let on = WorkerContextSettings { enabled: true, rollover_tokens: 200_000, ..Default::default() };
         let p = on.policy(200_000).unwrap();
         assert_eq!(p.target_tokens(), 93_333);
         for model in ["claude-opus-5-5", "claude-sonnet-4-6"] {
@@ -1015,7 +1232,7 @@ mod tests {
     fn a_successor_at_the_line_that_triggered_it_is_refused() {
         let tmp = tempfile::tempdir().unwrap();
         let sink = WorkerTranscriptSink { dir: tmp.path().into(), stem: "sa_1".into(), observer: None };
-        let policy = WorkerContextSettings { enabled: true, rollover_tokens: 200_000 }
+        let policy = WorkerContextSettings { enabled: true, rollover_tokens: 200_000, ..Default::default() }
             .policy(200_000)
             .unwrap();
         let mut m = worker_history(20, 3_000);
@@ -1027,6 +1244,197 @@ mod tests {
         assert!(report.after_tokens < 100_000 && successor.len() < m.len());
         // Below hard capacity the pressure band (140k) is the line.
         assert!(roll(None).is_some());
+    }
+
+    fn summary_of(body_len: usize) -> RolloverSummary {
+        RolloverSummary::new(format!(
+            "**Task**: t\n**Done**: {}\n**Decisions**: none\n**Files**: none\n**Facts**: E0308 at a.rs:1\n**Open**: none\n**Next**: n",
+            "d".repeat(body_len)
+        ))
+    }
+
+    #[test]
+    fn summary_target_derivation_with_the_summary_on_and_off() {
+        let base = WorkerContextSettings { enabled: true, rollover_tokens: 200_000, ..Default::default() };
+        let auto = WorkerContextSettings { summary: RolloverSummaryMode::Auto, ..base };
+        // Off, unset: today's derived target (min(100k, 2/3 pressure)).
+        let p = base.policy(1_000_000).unwrap();
+        assert_eq!((p.target_tokens(), p.fallback_target_tokens()), (100_000, 100_000));
+        assert!(!p.summary_enabled());
+        // Auto, unset: 45k; a failed summary still truncates to today's target.
+        let p = auto.policy(1_000_000).unwrap();
+        assert_eq!(p.target_tokens(), 45_000);
+        assert_eq!(p.derived_target_tokens(), 100_000);
+        assert_eq!(p.fallback_target_tokens(), 100_000);
+        // Auto never aims past what truncation would on a small window.
+        let small = WorkerContextSettings { rollover_tokens: 30_000, ..auto };
+        assert_eq!(small.policy(200_000).unwrap().target_tokens(), 19_999);
+        // An explicit target wins, with the summary on or off, and is kept
+        // below pressure.
+        for settings in [base, auto] {
+            let p = WorkerContextSettings { target_tokens: Some(30_000), ..settings }.policy(1_000_000).unwrap();
+            assert_eq!(p.target_tokens(), 30_000);
+            let p = WorkerContextSettings { target_tokens: Some(150_000), ..settings }.policy(200_000).unwrap();
+            assert_eq!(p.target_tokens(), p.thresholds.pressure_tokens - 1);
+        }
+        // Off + explicit: the knob applies to plain truncation too, and the
+        // fallback target is the same (there is no summary to fall back from).
+        let p = WorkerContextSettings { target_tokens: Some(30_000), ..base }.policy(1_000_000).unwrap();
+        assert_eq!(p.fallback_target_tokens(), 30_000);
+        // Auto + explicit: a failed summary rolls to the larger derived target.
+        let p = WorkerContextSettings { target_tokens: Some(30_000), ..auto }.policy(1_000_000).unwrap();
+        assert_eq!(p.fallback_target_tokens(), 100_000);
+        assert!(p.fallback_successor_budget(0, None).history_tokens > p.successor_budget(0, None).history_tokens);
+        // from_config carries both keys.
+        let config = SynapsConfig {
+            subagent_rollover_summary: RolloverSummaryMode::Auto,
+            subagent_rollover_target_tokens: Some(33_000),
+            ..Default::default()
+        };
+        let s = WorkerContextSettings::from_config(&config);
+        assert_eq!((s.summary, s.target_tokens), (RolloverSummaryMode::Auto, Some(33_000)));
+        let s = WorkerContextSettings::from_config(&SynapsConfig::default());
+        assert_eq!((s.summary, s.target_tokens), (RolloverSummaryMode::Off, None));
+    }
+
+    #[test]
+    fn a_summary_successor_is_brief_note_summary_then_the_newest_rounds_within_budget() {
+        let messages = worker_history(40, 4_000);
+        let before = super::super::context::estimate_history(&messages);
+        let summary = summary_of(3_000);
+        assert!(summary.tokens > 500);
+        let plain = plan_rollover(&messages, budget(20_000), before, path).unwrap();
+        let plan = plan_rollover_with(&messages, budget(20_000), before, path, Some(&summary)).unwrap();
+        let s = &plan.successor;
+        assert!(Arc::ptr_eq(&s[0], &messages[0]), "the brief verbatim");
+        assert!(s[1].get(MARKER_KEY).is_some(), "the host note");
+        assert!(rollover_summary::is_summary(&s[2]), "then the summary");
+        assert_eq!(s[2]["role"], "user");
+        assert_eq!(s[3]["role"], "assistant", "then the newest rounds");
+        assert!(Arc::ptr_eq(s.last().unwrap(), messages.last().unwrap()));
+        assert!(unpaired_tool_ids(s).is_empty());
+        let after = super::super::context::estimate_history(s);
+        assert!(after <= 20_000, "within budget, summary included: {after}");
+        // The summary's tokens come out of the budget the rounds share, not on
+        // top of it (it replaces the tool index, so the round count is close).
+        let plain_after = super::super::context::estimate_history(&plain.successor);
+        assert!(after <= 20_000 && plain_after <= 20_000);
+        assert!(s.len().abs_diff(plain.successor.len()) <= 4, "{} vs {}", s.len(), plain.successor.len());
+        // The note says so and has no tool index.
+        let note = s[1]["content"][0]["text"].as_str().unwrap();
+        assert!(note.contains("summarized in your own notes"), "{note}");
+        assert!(!note.contains("nothing was summarized."));
+        assert!(!note.contains("bash: cargo test step"), "the summary replaces the index");
+        assert!(note.contains("/tmp/x/sa_1.window-1.md"));
+        // Everything evicted is still saved.
+        assert!(plan.transcript.contains("cargo test step0"));
+        assert!(plan_is_productive(&messages, &plan));
+        // On the wire the host key is gone and the summary reads as notes.
+        let wire = serde_json::to_string(&super::super::continuation::WireMessages(s)).unwrap();
+        assert!(!wire.contains(rollover_summary::SUMMARY_KEY) && !wire.contains(MARKER_KEY));
+        assert!(wire.contains("E0308 at a.rs:1") && wire.contains("your own notes"));
+    }
+
+    /// The next rollover supersedes the old summary with a fresh one (which
+    /// carries it forward), and without one keeps the old unchanged; neither
+    /// pushes the old summary into a transcript or leaves two behind.
+    #[test]
+    fn a_later_rollover_replaces_or_carries_the_summary() {
+        let first = plan_rollover_with(
+            &worker_history(40, 4_000),
+            budget(20_000),
+            1,
+            path,
+            Some(&summary_of(100)),
+        )
+        .unwrap();
+        let mut grown = first.successor.clone();
+        for i in 100..140 {
+            grown.extend(round(i, 4_000));
+        }
+        let count = |m: &[SharedMessage]| m.iter().filter(|m| rollover_summary::is_summary(m)).count();
+        assert_eq!(count(&grown), 1);
+
+        let fresh = summary_of(200);
+        let next = plan_rollover_with(&grown, budget(20_000), 1, path, Some(&fresh)).unwrap();
+        assert_eq!(count(&next.successor), 1, "superseded, not stacked");
+        assert_eq!(*next.successor[2], *fresh.message());
+        assert_eq!(next.window, 3);
+        assert!(!next.transcript.contains("E0308"), "the old summary is not 'evicted history'");
+
+        let carried = plan_rollover(&grown, budget(20_000), 1, path).unwrap();
+        assert_eq!(count(&carried.successor), 1, "carried unchanged");
+        assert!(Arc::ptr_eq(&carried.successor[2], &grown[2]));
+        let note = carried.successor[1]["content"][0]["text"].as_str().unwrap();
+        assert!(note.contains("nothing was summarized this time"), "{note}");
+        assert!(unpaired_tool_ids(&carried.successor).is_empty());
+    }
+
+    /// A history that never had a summary plans byte for byte as before: the
+    /// guarantee behind `subagent_rollover_summary = off`. The note text is
+    /// pinned.
+    #[test]
+    fn without_a_summary_the_plan_is_unchanged_and_the_note_is_pinned() {
+        let messages = worker_history(12, 2_000);
+        let a = plan_rollover(&messages, budget(8_000), 150_000, path).unwrap();
+        let b = plan_rollover_with(&messages, budget(8_000), 150_000, path, None).unwrap();
+        assert_eq!(serde_json::to_string(&a.successor).unwrap(), serde_json::to_string(&b.successor).unwrap());
+        assert_eq!(a.transcript, b.transcript);
+        assert!(a.successor.iter().all(|m| !rollover_summary::is_summary(m)));
+        let note = a.successor[1]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            note.starts_with(
+                "[Worker context rollover — host note, not a new instruction]\n\
+                 Your context reached about 150000 tokens, so the host started context window 2. "
+            ),
+            "{note}"
+        );
+        assert!(
+            note.contains(
+                "were moved out of your context unchanged; nothing was summarized. \
+                 Your task (the first message) and your most recent "
+            ),
+            "{note}"
+        );
+        assert!(note.contains("bash: cargo test step"));
+        assert!(note.ends_with("[End worker context rollover]"));
+    }
+
+    /// A summary that leaves no room to shrink is refused (the caller falls
+    /// back), and a prepared rollover reports the summary it carries.
+    #[test]
+    fn prepare_roll_over_refuses_an_unproductive_summary_and_reports_a_used_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sink = WorkerTranscriptSink { dir: tmp.path().into(), stem: "sa_1".into(), observer: None };
+        let policy = WorkerContextSettings {
+            enabled: true,
+            rollover_tokens: 200_000,
+            summary: RolloverSummaryMode::Auto,
+            target_tokens: Some(20_000),
+        }
+        .policy(1_000_000)
+        .unwrap();
+        let messages = worker_history(40, 4_000);
+        let before = super::super::context::estimate_history(&messages);
+        let ok = prepare_roll_over(&messages, budget(20_000), before, 1_000, &policy, &sink, None, Some(&summary_of(2_000)))
+            .expect("fits");
+        assert_eq!(ok.report().summary_tokens, Some(summary_of(2_000).tokens));
+        assert_eq!(ok.report().summary_fallback, None);
+        assert!(ok.after_tokens() < 21_001);
+        // Nothing was written yet; commit saves the transcript, then hands over.
+        assert!(!tmp.path().join("sa_1.window-1.md").exists());
+        let (successor, report) = ok.commit().unwrap();
+        assert!(tmp.path().join("sa_1.window-1.md").exists());
+        assert!(rollover_summary::is_summary(&successor[2]));
+        assert_eq!(report.window, 2);
+        assert!(report.notice().contains("Summary carried"));
+        // A short history the summary cannot beat.
+        let short = worker_history(3, 100);
+        let b = super::super::context::estimate_history(&short);
+        assert!(
+            prepare_roll_over(&short, budget(20_000), b, 1_000, &policy, &sink, None, Some(&summary_of(2_000)))
+                .is_none()
+        );
     }
 
     #[test]
@@ -1109,6 +1517,16 @@ mod tests {
             assert!(m.iter().any(|o| Arc::ptr_eq(o, x)), "nothing edited");
         }
         assert!(plan.successor.iter().any(|x| x["content"][0]["content"] == unchanged_stub("toolu_r1")));
+
+        // A summary rolling along changes nothing about the stub rewrite.
+        let m = history(false);
+        let plan = plan_rollover_with(&m, budget(8_000), 1, path, Some(&summary_of(300))).unwrap();
+        let s = &plan.successor;
+        assert!(rollover_summary::is_summary(&s[2]));
+        assert!(!s.iter().any(|x| x.to_string().contains("toolu_r1")), "r1 evicted");
+        let at = s.iter().position(|x| x["content"][0]["tool_use_id"] == "toolu_r2").unwrap();
+        assert_eq!(s[at]["content"][0]["content"], DROPPED_STUB);
+        assert!(unpaired_tool_ids(s).is_empty() && plan_is_productive(&m, &plan));
     }
 
     #[test]
@@ -1214,6 +1632,7 @@ mod tests {
             kept: 30,
             carried_instructions: false,
             transcripts: &transcripts,
+            summary: SummaryKind::None,
             tool_index: (0..5_000).map(|i| format!("bash: step {i}")).collect(),
             unpinned: &[],
         });
