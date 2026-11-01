@@ -163,6 +163,7 @@ Method, tool versions, latency numbers, caveats and how to reproduce: [BENCHMARK
 | `synaps server` | WebSocket API with token auth and streaming |
 | `synaps login` · `auth` · `status` | Sign in, manage several accounts per provider, see usage and reset windows |
 | `synaps config set` | Set config keys from a script or installer in one atomic write (`--if-unset`, `--expect`, `--json`); no daemon needed |
+| `synaps skills` | The running daemon's skills: `status` (roots, counts, caps, shadowed skills) and `reload` (walk the skill roots again, no restart); `--json` |
 
 ## Configuration
 
@@ -174,6 +175,7 @@ thinking = high
 theme = tokyo-night
 identity = You are a senior engineer who writes clean, tested code.
 disabled_tools = bash, ls          # remove built-ins at boot (read-only profiles)
+skills.extra_root = /opt/team/skills  # a third skill root, between project and home; `synaps skills reload` picks it up
 ```
 
 Every key, the multi-machine auth broker and more are in the [Wiki](https://github.com/HaseebKhalid1507/SynapsCLI/wiki).

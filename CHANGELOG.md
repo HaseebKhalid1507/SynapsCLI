@@ -18,6 +18,32 @@ All notable changes to this project will be documented in this file.
   or unchanged, 3 refused, 2 usage or invalid value, 1 I/O error. Only
   `memory.backend` and `memory.axel.executable` are settable for now;
   values take effect on the next daemon start.
+
+- **`synaps config set --if-unset` can fill in three more keys for setup
+  tools:** `context_management.mode`, `skills.extra_root`, and
+  `auth.account.<provider>` with the value `auto` only, for a provider
+  Synaps knows. They are `--if-unset` only: a plain set, an `--expect`, an
+  unknown provider, or any other account value is refused (exit 3), so a
+  user's own choice is never replaced. Values get the normal config check.
+
+- **A third skill root, `skills.extra_root`, and `synaps skills
+  status|reload`.** `skills.extra_root = /absolute/path` (spaces kept, no
+  quotes, no `~`) adds a root walked after the project roots and before
+  `~/.synaps-cli/plugins` and `skills`; a `current` symlink in it is
+  resolved once per walk, and `disabled_plugins` / `disabled_skills` apply
+  to it. `synaps skills status [--json]` prints the running daemon's last
+  discovery pass: each root's configured and resolved path, plugin and
+  skill counts, the 2048-skill and 4 MiB metadata caps with what was
+  skipped, and shadowed skills. `synaps skills reload [--json]` re-reads
+  the skill keys from the config file, walks the roots again and swaps the
+  new set in without a daemon restart (extensions, hooks, MCP servers and
+  keybinds still need `synaps daemon reload`). Both ask a running daemon
+  and never start one; exit 0 report, 1 no daemon or I/O error, 3 refused
+  or a daemon too old. New daemon frames `skills_reload` (unattached
+  connections only) and `skills_status`, reply `skills_result`, behind the
+  feature `skills_v1`; the protocol stays 3. See
+  [docs/daemon-mode.md](docs/daemon-mode.md#skills-feature-skills_v1).
+
 - **Workers roll over their own context.** When this session's context
   management is `auto`, a subagent (`subagent`, `subagent_start`,
   `subagent_resume`) now rolls over to a fresh window of its own as it

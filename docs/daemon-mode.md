@@ -204,6 +204,8 @@ synaps daemon close <ID|NAME> [--force] [--attached] [--json]   # end one sessio
 synaps daemon pin <ID|NAME> [--off] [--json]       # pin/unpin one session without attaching (§Pinning a session); exit 0/1/2/3
 synaps daemon rename <ID|NAME> <NEW_NAME> | --clear [--force] [--json]   # name/unname one session without attaching (§Renaming a session); exit 0/1/2/3
 synaps daemon reload-extension <NAME> [--json]     # restart one extension in place, sessions untouched (§Reloading one extension); exit 0/1/2/3
+synaps skills status [--json]        # SkillsStatus → the last skill discovery pass (§Skills below); never starts a daemon
+synaps skills reload [--json]        # SkillsReload → walk the skill roots again with the skill keys read fresh
 synaps attach [ID] [--create] [--continue NAME_OR_ID] [-s PROMPT] [--observe|--takeover] [--keep-warm] [--as NAME]
 synaps --attach [ID] [--observe|--takeover] [--keep-warm] [--no-confirm-answers] [--as NAME]   # thin TUI client over the socket (phase 4); starts the daemon if none is running
 ```
@@ -237,6 +239,53 @@ override an operator's `SYNAPS_PROCESS_SCOPES=off`.
 `[compacted N messages]`, `[refused cmd: reason]`, `[input owner → …]`, `[session Parked]`.
 Prompts render as `[prompt #id] title: prompt > `; `Secret` prompts turn terminal echo off.
 With no ID: attaches to the single live session, creates one if none, lists if several.
+
+## Skills (feature `skills_v1`)
+
+The daemon walks five skill roots at boot, in this order. A skill (plugin
+and name) met again later in the walk is dropped and reported as shadowed:
+
+1. `project_plugins`: `.synaps-cli/plugins` (relative to the daemon's cwd)
+2. `project_skills`: `.synaps-cli/skills`
+3. `extra`: the config key `skills.extra_root` (default unset)
+4. `home_plugins`: `<base>/plugins`
+5. `home_skills`: `<base>/skills`
+
+`skills.extra_root = /absolute/path` adds the third root. Write the path
+bare: spaces are kept, `~` is not expanded, and a quoted or relative path is
+a config warning (the key keeps an earlier valid value, else stays unset).
+The root is resolved (realpath) once per walk, so a `current` symlink
+swapped mid-walk cannot mix two versions. `disabled_plugins` and
+`disabled_skills` apply to it as to every root. Its plugins are full plugins
+(commands, keybinds, sidecars, settings). One pass keeps at most 2048 skills
+and 4 MiB of skill metadata; what is past a cap is counted as `skipped`.
+
+- `synaps skills status [--json]` / `SkillsStatus{id}` (also accepted on an
+  attached connection): the report of the last pass, boot or reload. No
+  disk walk.
+- `synaps skills reload [--json]` / `SkillsReload{id}` (an unattached
+  connection only; an attached one gets `Error` "control frames are not
+  accepted on an attached connection"): reads `skills.extra_root`,
+  `disabled_plugins` and `disabled_skills` fresh from the config file,
+  walks the roots again, swaps the new set into the command registry and
+  publishes its report with the next generation. Reloads run one at a time,
+  in order. The rest of the daemon's config snapshot is kept: extensions,
+  hooks, MCP servers and keybinds still need `synaps daemon reload`. A walk
+  that fails answers a session-less `Error`, and the last report stays.
+  A `load_skill` whose source changed or went away since the pass (the old
+  version was deleted) fails with "… reload skills and retry".
+
+Both answer `SkillsResult{id, report}`: `generation` (1 = boot),
+`at_unix_ms`, `roots[]` `{kind, configured, resolved, plugins, skills}`
+(paths as text; `null` = not set, or absent / not a directory; counts are
+before the disable filters), `skills_total`/`skills_cap`,
+`metadata_bytes`/`metadata_cap`, `skipped`, `disabled`, `shadowed[]`
+`{plugin, name, kept_root_kind, dropped_root_kind}` (the first 64) and
+`shadowed_total`. The CLI asks a running daemon and never starts one. Exit
+codes: 0 report; 1 no daemon, I/O error, or no answer in time (10 s status,
+60 s reload); 3 refused (an `Error` answer, or a daemon whose `Welcome` does
+not list `skills_v1`). `--json` prints the report on one line, or
+`{"error": "no_daemon"|"io"|"timeout"|"refused"|"daemon_predates", "message": …}`.
 
 ## Detach vs abort (F27)
 
