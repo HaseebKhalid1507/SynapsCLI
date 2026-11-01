@@ -281,3 +281,98 @@ fn if_unset_only_keys_refuse_every_other_write_and_keep_a_spaced_path_whole() {
         "the spaced path reads back equal"
     );
 }
+
+/// Under `--if-unset` a key whose one line is `key =` is `empty` (in the JSON,
+/// and as `<key>: empty` on stderr), and a key with two lines is `duplicate`
+/// in every mode and in either order. Both refuse (3) and write nothing.
+#[test]
+#[cfg(unix)]
+fn an_empty_line_is_empty_and_two_lines_are_duplicate_and_nothing_is_written() {
+    let sandbox = Sandbox::new();
+    std::fs::create_dir_all(sandbox.base()).unwrap();
+    let extra = "/Users/me/Library/Application Support/pria.desktop.dev/skills/current";
+    let extra_pair = format!("skills.extra_root={extra}");
+    for (key, pair) in [
+        ("skills.extra_root", extra_pair.as_str()),
+        ("auth.account.anthropic", "auth.account.anthropic=auto"),
+    ] {
+        let original = format!("{key} =\n");
+        std::fs::write(sandbox.config(), &original).unwrap();
+        let output = sandbox.run(&["--json", "--if-unset", pair]);
+        assert_eq!(output.status.code(), Some(3));
+        let report = json_line(&output);
+        assert_eq!(report["result"], "refused");
+        assert_eq!(report["keys"], json!({ key: "empty" }));
+
+        let output = sandbox.run(&["--if-unset", pair]);
+        assert_eq!(output.status.code(), Some(3));
+        assert!(output.stdout.is_empty());
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stderr.starts_with(&format!("{key}: empty\n")), "{stderr}");
+        assert_eq!(std::fs::read_to_string(sandbox.config()).unwrap(), original);
+    }
+
+    for (key, pair, value) in [
+        ("skills.extra_root", extra_pair.as_str(), extra),
+        ("memory.backend", "memory.backend=axel", "axel"),
+    ] {
+        let mut runs = vec![vec!["--json", "--if-unset", pair]];
+        if key == "memory.backend" {
+            runs.push(vec!["--json", pair]);
+            runs.push(vec!["--json", "--expect", "memory.backend=axel", pair]);
+        }
+        for original in [
+            format!("{key} = {value}\n{key} =\n"),
+            format!("{key} =\n{key} = {value}\n"),
+        ] {
+            std::fs::write(sandbox.config(), &original).unwrap();
+            for argv in &runs {
+                let output = sandbox.run(argv);
+                assert_eq!(output.status.code(), Some(3), "{argv:?}");
+                let report = json_line(&output);
+                assert_eq!(report["result"], "refused", "{argv:?}");
+                assert_eq!(report["keys"], json!({ key: "duplicate" }), "{argv:?}");
+                assert_eq!(std::fs::read_to_string(sandbox.config()).unwrap(), original);
+            }
+        }
+    }
+}
+
+/// A fresh install (no base dir, no config file, no profile): the doctor's
+/// `--if-unset ... --expect-path P` call creates `<base>/config`, owner-only.
+/// P is the canonical path of `<base>`'s existing parent joined with the rest,
+/// which is what the reply's "path" says.
+#[test]
+#[cfg(unix)]
+fn a_fresh_install_is_filled_by_if_unset_with_expect_path() {
+    let sandbox = Sandbox::new();
+    assert!(!sandbox.base().exists());
+    let parent = std::fs::canonicalize(sandbox.dir.path()).unwrap();
+    let expected = parent.join(".synaps-cli").join("config");
+    let expected = expected.to_str().unwrap();
+    let args = [
+        "--json",
+        "--if-unset",
+        "--expect-path",
+        expected,
+        "context_management.mode=auto",
+    ];
+    let output = sandbox.run(&args);
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert_eq!(output.status.code(), Some(0), "{stderr}");
+    assert_eq!(
+        json_line(&output),
+        json!({
+            "schema": "synaps.config-set/1",
+            "result": "written",
+            "path": expected,
+            "keys": {"context_management.mode": "written"},
+            "applies": "next daemon start",
+        })
+    );
+    let written = std::fs::read_to_string(sandbox.config()).unwrap();
+    assert_eq!(written, "context_management.mode = auto\n");
+    use std::os::unix::fs::PermissionsExt;
+    let metadata = std::fs::metadata(sandbox.config()).unwrap();
+    assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+}

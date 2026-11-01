@@ -254,6 +254,9 @@ and name) met again later in the walk is dropped and reported as shadowed:
 `skills.extra_root = /absolute/path` adds the third root. Write the path
 bare: spaces are kept, `~` is not expanded, and a quoted or relative path is
 a config warning (the key keeps an earlier valid value, else stays unset).
+`synaps config set --if-unset skills.extra_root=<path>` writes it only when
+the key has no line: `skills.extra_root =` is refused as `empty`, another
+path as `conflict`, and two lines as `duplicate` (exit 3, nothing written).
 The root is resolved (realpath) once per walk, so a `current` symlink
 swapped mid-walk cannot mix two versions. `disabled_plugins` and
 `disabled_skills` apply to it as to every root. The extra root gives

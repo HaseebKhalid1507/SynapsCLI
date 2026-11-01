@@ -26,6 +26,16 @@ All notable changes to this project will be documented in this file.
   unknown provider, or any other account value is refused (exit 3), so a
   user's own choice is never replaced. Values get the normal config check.
 
+- **`synaps config set` names two more per-key refusals.** `empty`: under
+  `--if-unset`, the key's one line has an empty value (`key =`); the parser
+  reads that as unset, but the line is the user's, so it is kept and named
+  apart from `conflict`. `duplicate`: the key has more than one line in the
+  file, in every mode (the parser takes the last line, while a write would
+  replace the first). Both exit 3 and write nothing; without `--json`
+  stderr says `<key>: empty` or `<key>: duplicate`. `synaps auth use` also
+  refuses a provider whose `auth.account.<provider>` has more than one line
+  and writes nothing (`--json`: `config_unwritable`).
+
 - **A third skill root, `skills.extra_root`, and `synaps skills
   status|reload`.** `skills.extra_root = /absolute/path` (spaces kept, no
   quotes, no `~`) adds a root walked after the project roots and before

@@ -3587,6 +3587,12 @@ impl ConfigWriteGuard {
     pub fn write_values(&self, pairs: &[(&str, &str)]) -> std::io::Result<()> {
         write_config_values_locked(pairs)
     }
+
+    /// [`Self::write_values`], refused with nothing written when a key has
+    /// more than one line (see [`write_config_value_no_duplicates`]).
+    pub fn write_values_no_duplicates(&self, pairs: &[(&str, &str)]) -> std::io::Result<()> {
+        write_config_values_locked_with(pairs, true)
+    }
 }
 
 /// Write a single `key = value` pair to `~/.synaps-cli/config` (or profile config).
@@ -3595,6 +3601,15 @@ impl ConfigWriteGuard {
 pub fn write_config_value(key: &str, value: &str) -> std::io::Result<()> {
     let _guard = ConfigLock::acquire()?;
     write_config_value_locked(key, value)
+}
+
+/// [`write_config_value`], but refused with nothing written (an
+/// `InvalidData` error naming the key) when the file has more than one
+/// `key = …` line: a write replaces the first, while the parser reads the
+/// last, so the new value would not take effect (`synaps auth use`).
+pub fn write_config_value_no_duplicates(key: &str, value: &str) -> std::io::Result<()> {
+    let _guard = ConfigLock::acquire()?;
+    write_config_values_locked_with(&[(key, value)], true)
 }
 
 /// The RMW body; caller holds [`ConfigLock`].
@@ -3606,8 +3621,29 @@ fn write_config_value_locked(key: &str, value: &str) -> std::io::Result<()> {
 /// [`ConfigLock`]. Each pair lands exactly as [`write_config_value`] would
 /// write it alone.
 fn write_config_values_locked(pairs: &[(&str, &str)]) -> std::io::Result<()> {
+    write_config_values_locked_with(pairs, false)
+}
+
+/// [`write_config_values_locked`]; with `refuse_duplicates`, a key that has
+/// more than one line refuses the whole write.
+fn write_config_values_locked_with(
+    pairs: &[(&str, &str)],
+    refuse_duplicates: bool,
+) -> std::io::Result<()> {
     let path = resolve_write_path("config");
     let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let duplicate = pairs
+        .iter()
+        .find(|(key, _)| refuse_duplicates && config_key_lines(&existing, key.trim()) > 1);
+    if let Some((key, _)) = duplicate {
+        let message = format!(
+            "{} has more than one line in {}; keep one and retry",
+            key.trim(),
+            path.display()
+        );
+        let kind = std::io::ErrorKind::InvalidData;
+        return Err(std::io::Error::new(kind, message));
+    }
     let out = pairs
         .iter()
         .fold(existing, |text, (key, value)| replace_config_line(&text, key, value));
@@ -3639,6 +3675,16 @@ fn config_line_value<'a>(line: &'a str, key: &str) -> Option<&'a str> {
     }
     let (k, v) = t.split_once('=')?;
     (k.trim() == key).then_some(v.trim())
+}
+
+/// How many lines of `content` are `key = …` lines for `key`, by
+/// [`config_line_value`]. The parser takes the last of them and a write
+/// replaces the first, so more than one is refused by the checked writes.
+fn config_key_lines(content: &str, key: &str) -> usize {
+    content
+        .lines()
+        .filter(|line| config_line_value(line, key).is_some())
+        .count()
 }
 
 /// `existing` with the first `key = …` line replaced by `key = value` (or
@@ -3717,7 +3763,8 @@ pub fn config_set_allows(key: &str, value: &str, mode: &ConfigSetMode) -> bool {
 pub enum ConfigSetMode {
     /// Write every pair, replacing current values.
     Overwrite,
-    /// Write absent keys; a key set to a different value refuses the call.
+    /// Write absent keys; a key set to a different value, or to an empty
+    /// one, refuses the call.
     IfUnset,
     /// Compare-and-set: each `(key, value)` must match the current value (an
     /// empty value means "must be unset"), or the call is refused.
@@ -3755,6 +3802,14 @@ pub enum ConfigKeyStatus {
     Unchanged,
     /// [`ConfigSetMode::IfUnset`]: the key is set to a different value.
     Conflict,
+    /// [`ConfigSetMode::IfUnset`]: the key's one line has an empty value
+    /// (`key =`). The parser reads that as unset, but it is the user's line,
+    /// so it is refused like a [`Self::Conflict`] and named apart from one.
+    Empty,
+    /// The key has more than one line in the file, in any mode: the parser
+    /// takes the last and a write replaces the first, so neither the check
+    /// nor the write would mean what it says.
+    Duplicate,
     /// [`ConfigSetMode::Expect`]: the key does not have the expected value.
     ExpectFailed,
     /// [`config_set_allows`] refuses the key (with its value, in this mode).
@@ -3770,6 +3825,8 @@ impl ConfigKeyStatus {
             Self::Written => "written",
             Self::Unchanged => "unchanged",
             Self::Conflict => "conflict",
+            Self::Empty => "empty",
+            Self::Duplicate => "duplicate",
             Self::ExpectFailed => "expect_failed",
             Self::NotSettable => "not_settable",
             Self::PathMismatch => "path_mismatch",
@@ -3834,8 +3891,11 @@ impl From<std::io::Error> for ConfigSetError {
 /// read.
 /// A value the real parser would warn about is rejected the way
 /// [`validate_config_edit`] rejects it, whatever the file holds now. A key is
-/// present by the rule [`replace_config_line`] uses (its first non-comment
-/// `key = value` line); values compare trimmed.
+/// present by the rule [`replace_config_line`] uses (a non-comment
+/// `key = value` line); values compare trimmed. A key with more than one
+/// such line refuses the call in every mode ([`ConfigKeyStatus::Duplicate`]),
+/// and under `--if-unset` a line with an empty value is
+/// [`ConfigKeyStatus::Empty`], not a conflict.
 ///
 /// `Err(Invalid)` is bad input; a policy or state refusal is `Ok` with
 /// [`ConfigSetResult::Refused`] and a reason per key.
@@ -3923,18 +3983,24 @@ pub fn write_config_values_checked(
     }
 
     let current = |key: &str| existing.lines().find_map(|line| config_line_value(line, key));
+    let duplicate = |key: &str| config_key_lines(&existing, key) > 1;
+    for (key, status) in &mut keys {
+        if duplicate(key) {
+            *status = ConfigKeyStatus::Duplicate;
+        }
+    }
+    let if_unset = matches!(mode, ConfigSetMode::IfUnset);
     let mut changed: Vec<&(String, String)> = Vec::new();
-    for pair in pairs {
+    for pair in pairs.iter().filter(|(key, _)| !duplicate(key)) {
         let (key, value) = (pair.0.as_str(), pair.1.trim());
         match current(key) {
             Some(now) if now == value => {}
-            Some(_) if matches!(mode, ConfigSetMode::IfUnset) => {
-                set_key_status(&mut keys, key, ConfigKeyStatus::Conflict)
-            }
+            Some("") if if_unset => set_key_status(&mut keys, key, ConfigKeyStatus::Empty),
+            Some(_) if if_unset => set_key_status(&mut keys, key, ConfigKeyStatus::Conflict),
             _ => changed.push(pair),
         }
     }
-    for (key, want) in expects {
+    for (key, want) in expects.iter().filter(|(key, _)| !duplicate(key)) {
         let (now, want) = (current(key), want.trim());
         // "Unset" means no line at all: `key =` with nothing after is set.
         let met = if want.is_empty() {
@@ -8107,6 +8173,150 @@ api_retries = 5
                 assert_eq!(key_statuses(&outcome), [format!("{}=conflict", pair.0)]);
             }
             assert_eq!(std::fs::read_to_string(&cfg).unwrap(), user);
+        });
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// `--if-unset` names a key whose one line is `key =` `empty`, apart
+    /// from a conflict: still refused, nothing written.
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn config_set_if_unset_names_an_explicit_empty_line_empty() {
+        let home = make_test_home("set-empty");
+        let cfg = home.join(".synaps-cli/config");
+        let extra = "/Users/me/Library/Application Support/pria.desktop.dev/skills/current";
+        with_home(&home, || {
+            for (key, value) in [
+                ("skills.extra_root", extra),
+                ("auth.account.anthropic", "auto"),
+            ] {
+                for line in [format!("{key} ="), format!("  {key}=   ")] {
+                    let original = format!("# mine\n{line}\nmodel = claude-opus-4-6\n");
+                    std::fs::write(&cfg, &original).unwrap();
+                    let pairs = [(key, value), ("memory.backend", "axel")];
+                    let outcome = config_set(&pairs, &ConfigSetMode::IfUnset).unwrap();
+                    assert_eq!(outcome.result, ConfigSetResult::Refused, "{line:?}");
+                    let want = [format!("{key}=empty"), "memory.backend=unchanged".into()];
+                    assert_eq!(key_statuses(&outcome), want, "{line:?}");
+                    assert_eq!(std::fs::read_to_string(&cfg).unwrap(), original);
+                }
+            }
+            // A real value is still a conflict, and an empty line under
+            // --expect is still set (expect_failed), not empty.
+            std::fs::write(&cfg, "skills.extra_root = /other\nmemory.backend =\n").unwrap();
+            let outcome = config_set(&[("skills.extra_root", extra)], &ConfigSetMode::IfUnset);
+            assert_eq!(
+                key_statuses(&outcome.unwrap()),
+                ["skills.extra_root=conflict"]
+            );
+            let mode = expect(&[("memory.backend", "")]);
+            let outcome = config_set(&[("memory.backend", "axel")], &mode).unwrap();
+            assert_eq!(key_statuses(&outcome), ["memory.backend=expect_failed"]);
+        });
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A key with two lines (the parser reads the last, a write would replace
+    /// the first) is `duplicate` in every mode, in either order, and the call
+    /// writes nothing.
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn config_set_refuses_a_key_with_two_lines_in_every_mode() {
+        let home = make_test_home("set-duplicate-lines");
+        let cfg = home.join(".synaps-cli/config");
+        let extra = "/Users/me/Library/Application Support/pria.desktop.dev/skills/current";
+        let both_orders = |key: &str, value: &str| {
+            [
+                format!("{key} = {value}\n# between\n{key} =\n"),
+                format!("{key} =\n# between\n {key}={value}\n"),
+            ]
+        };
+        let calls: Vec<(&str, &str, ConfigSetMode)> = vec![
+            ("memory.backend", "axel", ConfigSetMode::Overwrite),
+            ("memory.backend", "axel", ConfigSetMode::IfUnset),
+            (
+                "memory.backend",
+                "axel",
+                expect(&[("memory.backend", "axel")]),
+            ),
+            (
+                "memory.backend",
+                "legacy",
+                expect(&[("memory.backend", "")]),
+            ),
+            ("skills.extra_root", extra, ConfigSetMode::IfUnset),
+            ("auth.account.anthropic", "auto", ConfigSetMode::IfUnset),
+        ];
+        with_home(&home, || {
+            for (key, value, mode) in &calls {
+                for original in both_orders(key, value) {
+                    std::fs::write(&cfg, &original).unwrap();
+                    let pairs = [
+                        (*key, *value),
+                        ("memory.axel.executable", ABSOLUTE_SAMPLE_PATH),
+                    ];
+                    let outcome = config_set(&pairs, mode).unwrap();
+                    assert_eq!(
+                        outcome.result,
+                        ConfigSetResult::Refused,
+                        "{original:?} {mode:?}"
+                    );
+                    let want = [
+                        format!("{key}=duplicate"),
+                        "memory.axel.executable=unchanged".into(),
+                    ];
+                    assert_eq!(key_statuses(&outcome), want, "{original:?} {mode:?}");
+                    assert_eq!(std::fs::read_to_string(&cfg).unwrap(), original);
+                }
+            }
+            // An expect-only key with two lines is refused the same way.
+            let original = "memory.axel.executable = /a\nmemory.axel.executable = /b\n";
+            std::fs::write(&cfg, original).unwrap();
+            let mode = expect(&[("memory.axel.executable", "/b")]);
+            let outcome = config_set(&[("memory.backend", "axel")], &mode).unwrap();
+            assert_eq!(
+                key_statuses(&outcome),
+                [
+                    "memory.backend=unchanged",
+                    "memory.axel.executable=duplicate"
+                ]
+            );
+            assert_eq!(std::fs::read_to_string(&cfg).unwrap(), original);
+        });
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// `auth use`'s write: a key with two lines is refused with nothing
+    /// written, in either order; other keys' duplicates do not matter.
+    #[test]
+    #[serial]
+    fn write_config_value_no_duplicates_refuses_a_key_with_two_lines() {
+        let home = make_test_home("write-no-duplicates");
+        let cfg = home.join(".synaps-cli/config");
+        let key = "auth.account.anthropic";
+        with_home(&home, || {
+            for original in [
+                format!("{key} = work\n{key} =\n"),
+                format!("{key} =\n# x\n{key} = work\n"),
+            ] {
+                std::fs::write(&cfg, &original).unwrap();
+                let err = write_config_value_no_duplicates(key, "auto").unwrap_err();
+                assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+                let message = err.to_string();
+                assert!(message.starts_with(&format!("{key} has more than one line in ")));
+                assert!(!message.contains("work"), "{message}");
+                assert_eq!(std::fs::read_to_string(&cfg).unwrap(), original);
+            }
+            let original = "model = a\nmodel = b\nauth.account.anthropic = work\n";
+            std::fs::write(&cfg, original).unwrap();
+            write_config_value_no_duplicates(key, "auto").unwrap();
+            let written = std::fs::read_to_string(&cfg).unwrap();
+            assert_eq!(
+                written,
+                "model = a\nmodel = b\nauth.account.anthropic = auto\n"
+            );
         });
         let _ = std::fs::remove_dir_all(&home);
     }

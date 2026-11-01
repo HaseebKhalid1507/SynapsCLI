@@ -571,7 +571,8 @@ pub fn remove(cred: &CredentialRef, expect: Option<&str>) -> Result<RemoveReply,
 /// Under the config lock with an unlocked snapshot of auth.json: compare the
 /// revision, validate like the plain `use` (`not_found` for a missing slot
 /// or `auto` with no slot, `bad_request` for `auto` without a usage
-/// adapter), write `auth.account.<P>`, answer with the new revision.
+/// adapter), write `auth.account.<P>`, answer with the new revision. A
+/// key with more than one config line is `config_unwritable`, nothing written.
 pub fn use_selector(
     provider: OAuthProviderId,
     selector: &AccountSelector,
@@ -606,7 +607,7 @@ pub fn use_selector(
     let key = super::account::account_config_key(provider);
     let value = selector.as_config_value();
     guard
-        .write_values(&[(key.as_str(), value.as_str())])
+        .write_values_no_duplicates(&[(key.as_str(), value.as_str())])
         .map_err(|_| ApiError::code(ErrorCode::ConfigUnwritable))?;
     let revision = revision_of_rows(&rows, &guard.read_auth());
     Ok(UseReply {
@@ -1005,6 +1006,26 @@ mod tests {
             Err(ApiError::conflict(auto.revision.clone()))
         );
         assert_eq!(sb.auth_bytes(), STORE.as_bytes());
+    }
+
+    /// A key with two config lines (a write replaces the first, the parser
+    /// reads the last) is refused in either order, with nothing written.
+    #[test]
+    #[serial]
+    fn use_refuses_a_key_with_two_lines_and_writes_nothing() {
+        let claude3 = AccountSelector::parse("claude3").unwrap();
+        for config in [
+            "auth.account.anthropic = claude2\nauth.account.anthropic =\n",
+            "auth.account.anthropic =\n# x\nauth.account.anthropic = claude2\n",
+        ] {
+            let sb = Sandbox::new(STORE, config);
+            assert_eq!(
+                use_selector(anthropic(), &claude3, None),
+                Err(ApiError::code(ErrorCode::ConfigUnwritable))
+            );
+            assert_eq!(sb.config_text(), config);
+            assert_eq!(sb.auth_bytes(), STORE.as_bytes());
+        }
     }
 
     #[test]

@@ -34,7 +34,8 @@ pub enum ConfigAction {
     ///
     /// Settable keys: memory.backend, memory.axel.executable. With
     /// --if-unset only: context_management.mode, skills.extra_root and
-    /// auth.account.<provider>=auto. Exit codes: 0 written or unchanged,
+    /// auth.account.<provider>=auto. A key with more than one line in the
+    /// file is always refused. Exit codes: 0 written or unchanged,
     /// 3 refused, 2 usage or invalid value, 1 I/O error. Applies from the
     /// next daemon start.
     Set(SetArgs),
@@ -46,7 +47,8 @@ pub struct SetArgs {
     /// current value.
     #[arg(long)]
     json: bool,
-    /// Write only unset keys; a key set to another value refuses the call.
+    /// Write only unset keys; a key set to another value, or to an empty
+    /// one (`key =`), refuses the call.
     #[arg(long, conflicts_with = "expect")]
     if_unset: bool,
     /// Compare-and-set: KEY must currently be VALUE (empty VALUE: unset).
@@ -254,7 +256,7 @@ struct JsonError {
 mod tests {
     use super::*;
     use synaps_cli::config::ConfigKeyStatus::{
-        Conflict, ExpectFailed, NotSettable, PathMismatch, Unchanged, Written,
+        Conflict, Duplicate, Empty, ExpectFailed, NotSettable, PathMismatch, Unchanged, Written,
     };
 
     #[derive(clap::Parser)]
@@ -375,6 +377,8 @@ mod tests {
             (ConfigSetResult::Written, Written, EXIT_OK),
             (ConfigSetResult::Unchanged, Unchanged, EXIT_OK),
             (ConfigSetResult::Refused, Conflict, EXIT_REFUSED),
+            (ConfigSetResult::Refused, Empty, EXIT_REFUSED),
+            (ConfigSetResult::Refused, Duplicate, EXIT_REFUSED),
             (ConfigSetResult::Refused, ExpectFailed, EXIT_REFUSED),
             (ConfigSetResult::Refused, PathMismatch, EXIT_REFUSED),
             (ConfigSetResult::Refused, NotSettable, EXIT_REFUSED),
@@ -408,6 +412,14 @@ mod tests {
             &[("memory.backend", Conflict), ("memory.axel.executable", Unchanged)],
         );
         let text = "memory.backend: conflict\nmemory.axel.executable: unchanged\n\
+                    refused: nothing written to /home/u/.synaps-cli/config\n";
+        assert_eq!(report(false, &Ok(refused)), Report::on_stderr(EXIT_REFUSED, text.into()));
+
+        let refused = outcome(
+            ConfigSetResult::Refused,
+            &[("skills.extra_root", Empty), ("memory.backend", Duplicate)],
+        );
+        let text = "skills.extra_root: empty\nmemory.backend: duplicate\n\
                     refused: nothing written to /home/u/.synaps-cli/config\n";
         assert_eq!(report(false, &Ok(refused)), Report::on_stderr(EXIT_REFUSED, text.into()));
 

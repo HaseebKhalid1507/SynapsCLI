@@ -576,7 +576,8 @@ async fn identify_one(
 ///
 /// Writes `auth.account.<provider>` to the active profile config. Never
 /// touches auth.json. An explicit account must exist; `auto` is accepted
-/// only when at least one account is stored.
+/// only when at least one account is stored. A key with more than one line
+/// in the config is refused and nothing is written.
 pub async fn use_account(provider: String, account: String) -> Result<(), String> {
     let provider_id = parse_provider(&provider)?;
     let selector = AccountSelector::parse(&account)?;
@@ -611,7 +612,7 @@ pub async fn use_account(provider: String, account: String) -> Result<(), String
         AccountSelector::Invalid { .. } => unreachable!("parse never yields Invalid"),
     }
     let key = auth::account_config_key(provider_id);
-    config::write_config_value(&key, &selector.as_config_value())
+    config::write_config_value_no_duplicates(&key, &selector.as_config_value())
         .map_err(|e| format!("failed to write {key}: {e}"))?;
     let env = auth::account_env_var(provider_id);
     println!(
