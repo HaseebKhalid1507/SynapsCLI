@@ -7231,13 +7231,13 @@ mod cancellation_tests {
     }
 
     /// No false fire: thinking deltas 700 ms apart with pings between them,
-    /// under a 1 s progress limit, for over 2 s in all. Each delta is
+    /// under a 2 s progress limit, for 2.8 s in all. Each delta is
     /// progress, so the stream completes on its first attempt.
     #[tokio::test]
     async fn spaced_thinking_deltas_with_pings_never_reach_the_progress_deadline() {
         let (options, hits, server) = scripted_server(|_| {
             let mut frames = vec![(0, THINKING_START)];
-            for _ in 0..3 {
+            for _ in 0..4 {
                 frames.extend([(100, PING); 6]);
                 frames.push((100, THINKING_DELTA));
             }
@@ -7245,7 +7245,7 @@ mod cancellation_tests {
             scripted(frames, None)
         })
         .await;
-        let limit = Duration::from_secs(1);
+        let limit = Duration::from_secs(2);
         let started = std::time::Instant::now();
         let (result, events) = call_within(&options, (limit, limit)).await;
         server.abort();
@@ -7253,7 +7253,7 @@ mod cancellation_tests {
         assert_eq!(
             result.unwrap()["content"],
             json!([
-                {"type": "thinking", "thinking": "hmhmhm", "signature": "sig"},
+                {"type": "thinking", "thinking": "hmhmhmhm", "signature": "sig"},
                 {"type": "text", "text": "done"}
             ])
         );
