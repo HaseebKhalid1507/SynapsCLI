@@ -493,7 +493,11 @@ Mapping (`crates/agent-core/src/core/models.rs::thinking_level_for_budget`):
 | `subagent.max_concurrent` | int | 16 | Workers running at once across the session's delegation tree |
 | `subagent.max_total` | int | 64 | Dispatched workers not yet reconciled |
 | `subagent.max_depth` | int | 4 | Maximum nesting depth; 1 means foreground-only delegation |
+| `subagent.context_warn_tokens` | int or `off` | 150000 | Worker start/resume/oneshot whose first request is at least this many tokens gets a `context_warning` |
+| `subagent.resume_refuse_tokens` | int or `off` | 250000 | `subagent_resume` refuses a resume whose first request would be above this; start fresh instead. Read on every call; context limits, not spend caps |
 | `api_retries` | int | 3 | Max API retries on transient errors |
+| `capacity_wait` | bool | true | With `auth.account.anthropic = auto`, a turn that finds no account with capacity waits in place for a reset within 5 h 15 min (unreadable usage: at most 30 min); `false` ends the turn at once |
+| `capacity_resume` | bool | true | Daemon only, needs `daemon.crash_restore = on`: a turn that stopped for capacity with a known reset within 8 days resumes by itself once at that reset (see docs/daemon-mode.md); `false` turns it off |
 | `favorite_models` | comma list | — | Pinned models in model picker |
 | `disabled_plugins` | comma list | — | Plugins to skip on boot |
 | `disabled_skills` | comma list | — | Skills to skip on boot |
@@ -715,6 +719,8 @@ Dispatch a specialist. **Not available to subagents.**
 *Must provide `agent` OR `system_prompt`.
 
 Runs in isolated thread with its own tokio runtime, in the parent session's cwd and environment (under the daemon too). Core tools only (no subagent/MCP). Logs to `~/.synaps-cli/logs/subagents/`. Output prefixed `[subagent:{name}]`. Returns partial results on timeout.
+
+**Context admission** (`tools/subagent/request_size.rs`): before a worker starts, resumes or runs as a oneshot, its first request (system prompt + exposed tool schemas + history) is measured with the request-aware estimator, in provider tokens (`calibrated` with the session's own sample for that model, else `estimate` = estimator / 1.2). No provider call. `subagent_start` and `subagent_resume` replies carry `context_tokens`, `context_basis` and, at or above `subagent.context_warn_tokens`, `context_warning`; a oneshot appends the warning to its result and logs the size. `subagent_resume` above `subagent.resume_refuse_tokens` fails with `subagent_resume refused (context limit): ...` before anything is allocated. `admit_resume` is the one resume check: any other resume path must call it before allocating an id or handle.
 
 ### `connect_mcp_server`
 Connect to an MCP server defined in `~/.synaps-cli/mcp.json`. Tools registered as `ext__{server}__{tool}`. 30s request timeout.

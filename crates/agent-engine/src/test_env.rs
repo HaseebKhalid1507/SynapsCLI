@@ -20,6 +20,77 @@
 //!    to ambient churn even outside the lock.
 
 use std::path::Path;
+use std::sync::PoisonError;
+
+/// Serializes every engine lib test that writes a script and then executes
+/// it (28b review finding 7; was commit 2's mutex in `memory_backend/process.rs`).
+/// Writing holds the script open for writing; a child that another test forks
+/// meanwhile inherits that descriptor until its own exec closes it, and
+/// executing the script in that window fails with ETXTBSY ("Axel service
+/// could not start", 28b sa_1879 B1). Every participant holds this from
+/// before its first script write until its last exec, so no participant
+/// forks inside another's write window. Reentrant on one thread (one test may
+/// build several fakes); blocking, so a test on a multi-thread runtime takes
+/// it once, up front. Take it after every other guard (innermost lock).
+/// Residual: a fork by a test outside this lock can still copy the descriptor.
+pub(crate) static SCRIPT_EXEC_LOCK: ScriptExecLock = ScriptExecLock::new();
+
+/// See [`SCRIPT_EXEC_LOCK`]: the holding thread and its depth.
+pub(crate) struct ScriptExecLock {
+    owner: std::sync::Mutex<Option<(std::thread::ThreadId, usize)>>,
+    free: std::sync::Condvar,
+}
+
+impl ScriptExecLock {
+    const fn new() -> Self {
+        Self {
+            owner: std::sync::Mutex::new(None),
+            free: std::sync::Condvar::new(),
+        }
+    }
+
+    /// Blocks until the calling thread holds the lock (at once if it already does).
+    pub(crate) fn lock(&'static self) -> ScriptExecGuard {
+        let me = std::thread::current().id();
+        let owner = self.owner.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut owner = self
+            .free
+            .wait_while(owner, |o| matches!(o, Some((id, _)) if *id != me))
+            .unwrap_or_else(PoisonError::into_inner);
+        owner.get_or_insert((me, 0)).1 += 1;
+        ScriptExecGuard { lock: self }
+    }
+
+    /// Whether the calling thread holds the lock (script-writing helpers assert it).
+    pub(crate) fn held(&self) -> bool {
+        let me = std::thread::current().id();
+        let owner = self.owner.lock().unwrap_or_else(PoisonError::into_inner);
+        matches!(*owner, Some((id, _)) if id == me)
+    }
+}
+
+/// One hold of [`SCRIPT_EXEC_LOCK`]; the lock is free once every hold drops.
+#[must_use = "the script lock is released when the guard drops"]
+pub(crate) struct ScriptExecGuard {
+    lock: &'static ScriptExecLock,
+}
+
+impl Drop for ScriptExecGuard {
+    fn drop(&mut self) {
+        let mut owner = self.lock.owner.lock().unwrap_or_else(PoisonError::into_inner);
+        let released = match owner.as_mut() {
+            Some((_, depth)) => {
+                *depth -= 1;
+                *depth == 0
+            }
+            None => false,
+        };
+        if released {
+            *owner = None;
+            self.lock.free.notify_all();
+        }
+    }
+}
 
 /// RAII guard: point `SYNAPS_BASE_DIR` at a fresh private temp dir and
 /// restore the previous value on drop (panic-safe), byte for byte.
@@ -151,6 +222,31 @@ mod tests {
             None => std::env::remove_var("SYNAPS_BASE_DIR"),
         }
         assert_eq!(restored, Some(non_utf8()));
+    }
+
+    /// The script lock nests on one thread (several fakes in one test) and
+    /// keeps every other thread out until the last hold drops.
+    #[test]
+    fn the_script_lock_nests_on_one_thread_and_excludes_others() {
+        use super::SCRIPT_EXEC_LOCK;
+        let outer = SCRIPT_EXEC_LOCK.lock();
+        let inner = SCRIPT_EXEC_LOCK.lock();
+        assert!(SCRIPT_EXEC_LOCK.held());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let other = std::thread::spawn(move || {
+            assert!(!SCRIPT_EXEC_LOCK.held());
+            let _held = SCRIPT_EXEC_LOCK.lock();
+            tx.send(SCRIPT_EXEC_LOCK.held()).unwrap();
+        });
+        drop(inner);
+        assert!(SCRIPT_EXEC_LOCK.held());
+        let waited = rx.recv_timeout(std::time::Duration::from_millis(300));
+        assert!(waited.is_err(), "another thread took a held lock");
+        drop(outer);
+        assert!(!SCRIPT_EXEC_LOCK.held());
+        let took = rx.recv_timeout(std::time::Duration::from_secs(120));
+        assert_eq!(took, Ok(true));
+        other.join().unwrap();
     }
 
     /// Setting over a value that is not UTF-8 restores the exact bytes.

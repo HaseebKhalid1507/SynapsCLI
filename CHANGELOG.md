@@ -4,6 +4,94 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **`synaps config set KEY=VALUE ...`** writes config keys for scripts and
+  installers without starting or contacting the daemon: every pair in one
+  locked read and one atomic owner-only write, or nothing at all.
+  `--if-unset` writes only absent keys and refuses the whole call if one is
+  set to another value (a user's own setting is never overwritten);
+  `--expect KEY=VALUE` is compare-and-set (empty VALUE: must be unset);
+  `--expect-path` refuses unless the config file is exactly that path.
+  `--json` prints one line (`synaps.config-set/1`) with the canonical config
+  path and a status per key, never a current value. Exit codes: 0 written
+  or unchanged, 3 refused, 2 usage or invalid value, 1 I/O error. Only
+  `memory.backend` and `memory.axel.executable` are settable for now;
+  values take effect on the next daemon start.
+- **Workers roll over their own context.** When this session's context
+  management is `auto`, a subagent (`subagent`, `subagent_start`,
+  `subagent_resume`) now rolls over to a fresh window of its own as it
+  fills, as the session does, and can find its earlier windows with
+  `memory_search` / `memory_fetch` (its own lineage only, never the
+  session's or another worker's). Its run is recorded under
+  `<base>/subagent-history`, and a resume continues its lineage. Opt out
+  for every worker with `subagent.context_rollover = off` (also a row in
+  the TUI's Agent settings), or for one worker with the tools'
+  `context_rollover: "off"`. A worker that can't roll over (a route that
+  can't book its requests, a memory backend that can't confine retrieval
+  to a lineage, a disabled `memory_search` or `memory_fetch`) runs as
+  before, and its status, collect and completion say why in one line
+  ("rollover disabled for this worker: ..."). On the Axel memory backend
+  every worker falls back this way, with that notice, until the Axel
+  sidecar is rebuilt with `history_owned` (from this release). Workers
+  started outside a session's turn (from an extension, a hook or a
+  one-shot `run_single`) don't roll over.
+- **A daemon session stopped for Anthropic account capacity resumes by
+  itself at the reset.** When a turn ends because no account has capacity
+  and a limited account comes back at a known time (within 8 days), the
+  session shows `Stopped: no Anthropic account has capacity until HH:MM UTC.
+  This session continues by itself then; send a message to continue sooner,
+  or Esc to cancel the resume.` At that time, plus a random delay of up to a
+  minute, it starts one turn with a `resume:` prompt. The resume survives a
+  daemon reload, a stop and start and a crash, and a parked session is kept
+  from eviction until then. A message, Esc, `/new` or closing the session
+  cancels it; a session whose history changed meanwhile is not resumed; a
+  message or event that was waiting behind the stopped turn is sent instead
+  of the resume. A resumed turn that stops again resumes again only for a
+  later reset, three times in a row at most. Unreadable usage with no known
+  reset is never resumed. Each resume is given at most once: it is recorded
+  as taken before the turn starts, so a crash in between loses that resume
+  (the stop notice stays). It needs `daemon.crash_restore` on (the default);
+  without a crash record nothing is armed. `capacity_resume = false` turns it
+  off.
+
+### Changed
+
+- **Automatic context management is on by default on Linux and macOS.** An
+  unset `context_management.mode` (or no config file) now means `auto`: a
+  session plans a wrap-up and hands over to a fresh context window before the
+  window fills, archiving its eligible history locally as `/context auto`
+  does. Windows keeps `off` (the context archive is Unix-only). Set
+  `context_management.mode = off` to opt out; an explicit value is always
+  kept. An invalid `context_management` block still falls back to off, with a
+  warning.
+- **At start on macOS, the Synaps daemon raises its own open-files soft limit
+  from 256 to min(hard, 10240); it never touches the hard limit or other
+  processes.** Processes the daemon starts afterwards (tool shells,
+  terminals, extensions, MCP servers) inherit the higher soft limit;
+  processes already running are untouched.
+- **A turn waits for Anthropic account capacity instead of ending.** With
+  `auth.account.anthropic = auto`, a turn that finds no account with
+  capacity, for a reason that ends by itself, now waits in place: every
+  account at a usage limit that resets within 5 h 15 min, or account usage
+  that couldn't be read. It shows `⏸ … waiting until HH:MM UTC, then
+  continuing. Esc stops.`, checks again at least every 10 min and carries on
+  as soon as an account has capacity. A random delay of up to a minute
+  spreads the checks of sessions waiting on the same reset; it stays inside
+  the 10 min and the bound, never added on top. Unreadable usage with no
+  reset in sight waits at most 30 min. A check still running at the next
+  10 min mark is dropped and the next one starts at once, and one still
+  running at the bound is cut and the turn ends as before. If the host
+  sleeps or its clock jumps while a check runs, an account that check finds
+  is still used, even if the bound has passed meanwhile. A request waits
+  and is sent again at most once.
+  Accounts that need a new login or an action outside synaps don't stop the
+  wait for another account's reset; the notice names them and what to do.
+  An explicit account, a remote broker, a reset further away (a weekly
+  limit) with nothing else to wait for, and a request that already streamed
+  output never wait. `capacity_wait = false` ends the turn at once, as
+  before.
+
 ### Fixed
 
 - **Windows: the `grep`, `find` and `ls` tools work.** They ran the bare
@@ -39,6 +127,8 @@ All notable changes to this project will be documented in this file.
   the result (what the parent model reads, and the subagent card) ran
   sentences together: "…read them all.Found 2 files…". Each response now
   starts a new paragraph, as `subagent_start` workers already did.
+- Anthropic streams that stay connected but send only keep-alive pings are
+  now retried: no first event in 3 minutes, or no progress for 10 minutes.
 
 ## [0.11.1] — 2026-10-31
 

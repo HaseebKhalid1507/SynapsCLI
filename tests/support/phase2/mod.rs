@@ -180,6 +180,14 @@ pub enum Script {
     /// SSE bodies answered per arrival order; the last body repeats for any
     /// further hits (tool-loop fixtures: tool-use turn, then continuation).
     SeqSse(&'static [&'static str]),
+    /// One tool round per user turn, chosen by content rather than arrival
+    /// order: a request whose last message carries a `tool_result` gets
+    /// `done`, any other request gets `tool_use`. Holds for any number of
+    /// turns and sessions against the same stub.
+    ToolRound {
+        tool_use: &'static str,
+        done: &'static str,
+    },
     /// `body` split on the SSE frame boundary (`\n\n`), each frame preceded
     /// by `frame_delay` — a deterministic mid-stream window for steer /
     /// event-injection differential scenarios.
@@ -236,6 +244,18 @@ fn scripted_response(script: &Script, hit: usize, req_body: &[u8]) -> Response {
                 .or_else(|| bodies.last())
                 .expect("SeqSse requires at least one body");
             sse((*body).to_string())
+        }
+        Script::ToolRound { tool_use, done } => {
+            let answered = serde_json::from_slice::<serde_json::Value>(req_body)
+                .ok()
+                .and_then(|v| v.get("messages")?.as_array()?.last().cloned())
+                .and_then(|m| m.get("content")?.as_array().cloned())
+                .is_some_and(|blocks| {
+                    blocks
+                        .iter()
+                        .any(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_result"))
+                });
+            sse((if answered { *done } else { *tool_use }).to_string())
         }
         Script::FailThen { fails, status, then } => {
             if hit < *fails {

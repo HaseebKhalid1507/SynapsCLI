@@ -162,6 +162,7 @@ Method, tool versions, latency numbers, caveats and how to reproduce: [BENCHMARK
 | `synaps rpc` | JSON-RPC over stdio, to embed the engine in other software |
 | `synaps server` | WebSocket API with token auth and streaming |
 | `synaps login` · `auth` · `status` | Sign in, manage several accounts per provider, see usage and reset windows |
+| `synaps config set` | Set config keys from a script or installer in one atomic write (`--if-unset`, `--expect`, `--json`); no daemon needed |
 
 ## Configuration
 
