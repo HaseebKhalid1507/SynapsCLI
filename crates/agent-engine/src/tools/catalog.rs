@@ -519,12 +519,25 @@ pub enum DiscoveryQueryError {
     ControlCharacters,
 }
 
+/// Characters that split query keywords besides whitespace. Tool ids and
+/// names join words with them (`web_fetch`, `web-fetch`,
+/// `ext.web-tools:fetch`), so `web fetch` and `web_fetch` search alike.
+const TERM_SEPARATORS: [char; 4] = ['_', '-', ':', '.'];
+
+/// The words of `text`, split at whitespace and [`TERM_SEPARATORS`].
+fn words(text: &str) -> impl Iterator<Item = &str> {
+    text.split(|c: char| c.is_whitespace() || TERM_SEPARATORS.contains(&c))
+        .filter(|word| !word.is_empty())
+}
+
 /// A validated, bounded, case-folded discovery query. Parse-at-boundary:
 /// empty (or whitespace-only), oversized, and control-character-bearing
 /// input fails typed before any search runs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DiscoveryQuery {
     needle: String,
+    /// Distinct keywords of `needle` in query order (see [`words`]).
+    terms: Vec<String>,
 }
 
 impl DiscoveryQuery {
@@ -546,14 +559,28 @@ impl DiscoveryQuery {
         if trimmed.chars().any(char::is_control) {
             return Err(DiscoveryQueryError::ControlCharacters);
         }
-        Ok(Self {
-            needle: trimmed.to_lowercase(),
-        })
+        let needle = trimmed.to_lowercase();
+        let mut terms: Vec<String> = Vec::new();
+        for word in words(&needle) {
+            if !terms.iter().any(|term| term == word) {
+                terms.push(word.to_string());
+            }
+        }
+        Ok(Self { needle, terms })
     }
 
-    /// The case-folded needle actually matched against descriptors.
+    /// The whole trimmed, case-folded query. [`DiscoveryIndex::search`]
+    /// ranks descriptors containing it as one substring above keyword-only
+    /// hits; `search_skills` matches it literally.
     pub fn needle(&self) -> &str {
         &self.needle
+    }
+
+    /// The distinct case-folded keywords of the query: split at whitespace
+    /// and at `_`, `-`, `:` and `.`, empty pieces dropped. Empty when the
+    /// query is all separators.
+    pub fn terms(&self) -> &[String] {
+        &self.terms
     }
 }
 
@@ -804,26 +831,44 @@ impl DiscoveryIndex {
         self.generation != catalog.generation()
     }
 
-    /// Deterministic, bounded, pure substring search over compact
-    /// descriptors. Entries are visited in ToolId order; a matching entry is
-    /// returned only if it fits both the remaining count budget and the
-    /// remaining serialized byte budget. The byte budget accounts the exact
-    /// compact-JSON array serialization of the returned hits — container
-    /// brackets (2 bytes even when empty) plus one comma per additional
-    /// entry — so `serde_json::to_vec` of the hit collection can never
-    /// exceed it. The first match that does not fit stops the scan
-    /// (documented bounded behavior; `truncated` reports it).
+    /// Deterministic, bounded, pure keyword search over compact descriptors.
+    ///
+    /// A descriptor matches when its id, summary or tags contain the whole
+    /// query or any of its [`DiscoveryQuery::terms`] (case-insensitive
+    /// substrings, any order). Matches are ranked:
+    ///
+    /// 1. exact id or name: the query equals the id, the name segment, or
+    ///    spells the name's words (`web fetch` for `web_fetch`);
+    /// 2. the whole query as one substring (the pre-keyword behaviour, so a
+    ///    query that matched before still matches, ahead of partial hits);
+    /// 3. keyword hits only.
+    ///
+    /// Within a rank, more distinct terms matched comes first, then the
+    /// higher weight (a term found in the id counts 2, one found only in the
+    /// summary or tags counts 1), then ToolId order.
+    ///
+    /// Ranked matches are returned while they fit both the remaining count
+    /// budget and the remaining serialized byte budget. The byte budget
+    /// accounts the exact compact-JSON array serialization of the returned
+    /// hits — container brackets (2 bytes even when empty) plus one comma
+    /// per additional entry — so `serde_json::to_vec` of the hit collection
+    /// can never exceed it. The first ranked match that does not fit stops
+    /// the walk (documented bounded behavior; `truncated` reports it).
     pub fn search(&self, query: &DiscoveryQuery, limits: &SearchLimits) -> SearchResults<'_> {
+        // Rows are in ToolId order and the sort is stable: ties keep it.
+        let mut ranked: Vec<(SearchRank, &IndexRow)> = self
+            .rows
+            .iter()
+            .filter_map(|row| SearchRank::of(row, query).map(|rank| (rank, row)))
+            .collect();
+        ranked.sort_by_key(|(rank, _)| *rank);
         let mut hits = Vec::new();
         // Serialized cost so far of `hits` as a compact JSON array: `[]` is
         // 2 bytes; each entry adds its own bytes plus a comma when it is not
         // the first.
         let mut used_bytes = SEARCH_MIN_RESULT_BYTES;
         let mut truncated = false;
-        for row in &self.rows {
-            if !row.haystack.contains(query.needle()) {
-                continue;
-            }
+        for (_, row) in ranked {
             let separator = usize::from(!hits.is_empty());
             let next_bytes = used_bytes
                 .checked_add(separator)
@@ -846,5 +891,51 @@ impl DiscoveryIndex {
             serialized_bytes: used_bytes,
             truncated,
         }
+    }
+}
+
+/// Sort key of one matching row (ascending = better), see
+/// [`DiscoveryIndex::search`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct SearchRank {
+    /// 0 exact id/name, 1 whole-query substring, 2 keyword hits only.
+    tier: u8,
+    terms_matched: std::cmp::Reverse<usize>,
+    weight: std::cmp::Reverse<usize>,
+}
+
+impl SearchRank {
+    fn of(row: &IndexRow, query: &DiscoveryQuery) -> Option<Self> {
+        let id = row.entry.id.as_str();
+        let needle = query.needle();
+        let name = row.entry.id.name();
+        let exact = needle == id || needle == name || words(needle).eq(words(name));
+        let mut terms_matched = 0;
+        let mut weight = 0;
+        // Terms hold no whitespace or control characters, so a hit in the
+        // `\n`-joined haystack is a hit inside one field.
+        for term in query.terms() {
+            if id.contains(term.as_str()) {
+                terms_matched += 1;
+                weight += 2;
+            } else if row.haystack.contains(term.as_str()) {
+                terms_matched += 1;
+                weight += 1;
+            }
+        }
+        let tier = if exact {
+            0
+        } else if row.haystack.contains(needle) {
+            1
+        } else if terms_matched > 0 {
+            2
+        } else {
+            return None;
+        };
+        Some(Self {
+            tier,
+            terms_matched: std::cmp::Reverse(terms_matched),
+            weight: std::cmp::Reverse(weight),
+        })
     }
 }

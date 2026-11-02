@@ -290,6 +290,124 @@ async fn search_tools_fails_typed_on_empty_malformed_oversized_and_missing_conte
     );
 }
 
+async fn search_json(registry: &ToolRegistry, set: &SharedSessionToolSet, query: &str) -> Value {
+    let out = SearchToolsTool
+        .execute(
+            json!({"query": query}),
+            ctx(Some(capability(
+                registry,
+                set,
+                ActivationAuthority::Unauthorized,
+            ))),
+        )
+        .await
+        .expect("search succeeds");
+    serde_json::from_str(&out).expect("search output is JSON")
+}
+
+fn result_ids(body: &Value) -> Vec<&str> {
+    body["tools"]
+        .as_array()
+        .expect("tools array")
+        .iter()
+        .map(|tool| tool["id"].as_str().expect("tool id"))
+        .collect()
+}
+
+#[tokio::test]
+async fn search_tools_matches_keywords_and_explains_an_empty_result() {
+    let registry = fixture_registry();
+    let set = shared(minimal_set(&registry));
+
+    // Multi-word and separator variants: no literal substring "beta tool"
+    // exists, yet the exact name ranks first.
+    for query in ["beta tool", "tool beta", "beta-tool", "BETA_TOOL"] {
+        let body = search_json(&registry, &set, query).await;
+        assert_eq!(result_ids(&body)[0], "builtin:beta_tool", "{query}");
+        assert!(body.get("hint").is_none(), "{query}: hits carry no hint");
+    }
+    // A single-substring query still returns every literal hit in ToolId
+    // order, with the envelope unchanged.
+    let body = search_json(&registry, &set, "tool").await;
+    assert_eq!(
+        result_ids(&body),
+        [
+            "builtin:alpha_tool",
+            "builtin:beta_tool",
+            "builtin:gamma_tool"
+        ]
+    );
+    let mut keys: Vec<&str> = body
+        .as_object()
+        .expect("object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["generation", "tools", "truncated"]);
+
+    // No match: still an empty result, plus how to recover.
+    let body = search_json(&registry, &set, "Zzz qqq").await;
+    assert!(result_ids(&body).is_empty());
+    assert_eq!(body["truncated"], json!(false));
+    let hint = body["hint"].as_str().expect("empty result carries a hint");
+    assert!(hint.starts_with("No tools matched 'zzz qqq'."), "{hint}");
+    assert!(hint.contains("one shorter keyword"), "{hint}");
+    assert!(hint.contains("activate_tools needs an exact id"), "{hint}");
+}
+
+#[test]
+fn search_tools_describes_keyword_matching() {
+    let description = SearchToolsTool.description();
+    assert!(
+        description.contains("keywords, in any order"),
+        "{description}"
+    );
+    assert!(description.contains("Ranked"), "{description}");
+    let params = SearchToolsTool.parameters();
+    let query = params["properties"]["query"]["description"]
+        .as_str()
+        .expect("query description");
+    assert!(query.contains("keywords"), "{query}");
+    assert!(query.contains("web_fetch and web fetch"), "{query}");
+}
+
+async fn activation_error(registry: &ToolRegistry, set: &SharedSessionToolSet, id: &str) -> String {
+    ActivateToolsTool
+        .execute(
+            json!({"tools": [id]}),
+            ctx(Some(capability(
+                registry,
+                set,
+                ActivationAuthority::ModelConfirmed,
+            ))),
+        )
+        .await
+        .expect_err("activation is denied")
+        .to_string()
+}
+
+#[tokio::test]
+async fn activate_tools_unknown_or_malformed_id_points_at_search_tools() {
+    let registry = fixture_registry();
+    let set = shared(minimal_set(&registry));
+    let before = set_fingerprint(&set.read().unwrap());
+
+    let unknown = activation_error(&registry, &set, "ext.web-tools:fetch").await;
+    assert!(
+        unknown.contains("unknown tool id 'ext.web-tools:fetch'"),
+        "{unknown}"
+    );
+    assert!(unknown.contains("nothing was activated"), "{unknown}");
+    assert!(unknown.contains("exact ids"), "{unknown}");
+    assert!(unknown.contains("search_tools"), "{unknown}");
+
+    let malformed = activation_error(&registry, &set, "web_fetch").await;
+    assert!(malformed.contains("exact namespace:name"), "{malformed}");
+    assert!(malformed.contains("search_tools"), "{malformed}");
+    assert_eq!(before, set_fingerprint(&set.read().unwrap()));
+}
+
 // ── activate_tools (model-initiated) ────────────────────────────────────────
 
 #[tokio::test]

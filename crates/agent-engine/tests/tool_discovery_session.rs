@@ -850,3 +850,269 @@ fn discovery_query_rejects_control_characters_typed() {
     // Ordinary queries (with trimmable outer whitespace) still parse.
     assert!(DiscoveryQuery::parse("  searchword  ").is_ok());
 }
+
+// ── DiscoveryIndex: keyword search and ranking ──────────────────────────────
+
+/// Catalog shaped like the real one: words joined by `_`, `-`, `:` and `.`
+/// in ids, plain prose in summaries.
+fn keyword_catalog(spy: Arc<AtomicUsize>) -> ToolCatalog {
+    let mut catalog = ToolCatalog::empty();
+    for (id, summary, tags) in [
+        ("builtin:bash", "Run a shell command.", vec![]),
+        (
+            "builtin:shell_start",
+            "Open an interactive shell in a PTY session.",
+            vec![],
+        ),
+        (
+            "builtin:shell_send",
+            "Send input to a running session's shell.",
+            vec![],
+        ),
+        (
+            "builtin:subagent",
+            "Run a one-shot worker and wait for its result.",
+            vec![],
+        ),
+        (
+            "builtin:subagent_start",
+            "Launch a reactive worker in the background.",
+            vec![],
+        ),
+        (
+            "ext.web-tools:fetch",
+            "Fetch a public web page and extract its readable text.",
+            vec![],
+        ),
+        (
+            "ext.web-tools:search",
+            "Search the public web.",
+            vec!["internet".to_string()],
+        ),
+    ] {
+        catalog
+            .insert(spy_record(id, summary, tags, Arc::clone(&spy)))
+            .expect("insert keyword fixture");
+    }
+    catalog
+}
+
+fn hit_ids(index: &DiscoveryIndex, raw: &str) -> Vec<String> {
+    index
+        .search(
+            &query(raw),
+            &limits(SEARCH_MAX_RESULTS_CAP, SEARCH_MAX_RESULT_BYTES_CAP),
+        )
+        .hits()
+        .iter()
+        .map(|hit| hit.id().to_string())
+        .collect()
+}
+
+/// The pre-keyword predicate: the whole case-folded query as one substring
+/// of the id, summary or a tag.
+fn literal_hits(catalog: &ToolCatalog, raw: &str) -> std::collections::BTreeSet<String> {
+    let needle = raw.trim().to_lowercase();
+    catalog
+        .iter()
+        .filter(|record| {
+            record.id().as_str().contains(&needle)
+                || record.summary().to_lowercase().contains(&needle)
+                || record
+                    .tags()
+                    .iter()
+                    .any(|tag| tag.to_lowercase().contains(&needle))
+        })
+        .map(|record| record.id().to_string())
+        .collect()
+}
+
+#[test]
+fn discovery_query_splits_keywords_at_whitespace_and_id_separators() {
+    let q = query("  Web_Fetch  web-fetch:X.y ");
+    assert_eq!(q.needle(), "web_fetch  web-fetch:x.y");
+    assert_eq!(q.terms(), ["web", "fetch", "x", "y"]);
+    // All separators: no keywords, the whole query is still the needle.
+    let q = query("_-:.");
+    assert_eq!(q.needle(), "_-:.");
+    assert!(q.terms().is_empty());
+}
+
+#[test]
+fn multi_word_queries_find_tools_in_any_order() {
+    let spy = Arc::new(AtomicUsize::new(0));
+    let catalog = keyword_catalog(Arc::clone(&spy));
+    let index = DiscoveryIndex::build(&catalog).expect("build index");
+
+    // Each of these matched nothing as one literal substring.
+    for raw in ["web fetch", "subagent start", "shell session", "fetch web"] {
+        assert!(literal_hits(&catalog, raw).is_empty(), "{raw}");
+    }
+    assert_eq!(hit_ids(&index, "web fetch")[0], "ext.web-tools:fetch");
+    assert_eq!(hit_ids(&index, "fetch web")[0], "ext.web-tools:fetch");
+    assert_eq!(
+        hit_ids(&index, "subagent start")[0],
+        "builtin:subagent_start"
+    );
+    // Both shell-session tools match both keywords; bash only `shell`.
+    assert_eq!(
+        hit_ids(&index, "shell session"),
+        ["builtin:shell_send", "builtin:shell_start", "builtin:bash"]
+    );
+    assert_eq!(
+        hit_ids(&index, "internet search")[0],
+        "ext.web-tools:search"
+    );
+    assert!(hit_ids(&index, "no such capability").is_empty());
+    assert_eq!(spy.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn separator_variants_of_a_query_search_alike() {
+    let spy = Arc::new(AtomicUsize::new(0));
+    let catalog = keyword_catalog(spy);
+    let index = DiscoveryIndex::build(&catalog).expect("build index");
+
+    let expected = hit_ids(&index, "web fetch");
+    assert_eq!(expected[0], "ext.web-tools:fetch");
+    for raw in [
+        "web_fetch",
+        "web-fetch",
+        "web:fetch",
+        "web.fetch",
+        "WEB  Fetch",
+    ] {
+        assert_eq!(hit_ids(&index, raw), expected, "query {raw:?}");
+    }
+    // The ids the model invented after a miss find the real tool.
+    assert_eq!(
+        hit_ids(&index, "ext.web-tools:web_fetch")[0],
+        "ext.web-tools:fetch"
+    );
+    assert_eq!(
+        hit_ids(&index, "subagent-start")[0],
+        "builtin:subagent_start"
+    );
+}
+
+#[test]
+fn ranking_puts_exact_then_whole_query_then_most_keywords() {
+    let spy = Arc::new(AtomicUsize::new(0));
+    let mut catalog = ToolCatalog::empty();
+    // Inserted (and ToolId-ordered) opposite to the expected ranking.
+    for (id, summary) in [
+        ("builtin:a_file", "Unrelated summary."),
+        ("builtin:already_read", "Mark a message as seen."),
+        ("builtin:file_reader", "Stream bytes."),
+        ("builtin:grep", "Search file contents."),
+        ("builtin:notes", "Append to the read file log."),
+        ("builtin:read", "Show one document."),
+        ("builtin:read_file", "Show one document."),
+    ] {
+        catalog
+            .insert(spy_record(id, summary, vec![], Arc::clone(&spy)))
+            .expect("insert ranking fixture");
+    }
+    let index = DiscoveryIndex::build(&catalog).expect("build index");
+
+    assert_eq!(
+        hit_ids(&index, "read file"),
+        [
+            // exact name, spelled as words
+            "builtin:read_file",
+            // the whole query as one substring (summary)
+            "builtin:notes",
+            // both keywords, in the id
+            "builtin:file_reader",
+            // one keyword in the id beats one keyword in the summary;
+            // equal ranks keep ToolId order
+            "builtin:a_file",
+            "builtin:already_read",
+            "builtin:read",
+            "builtin:grep",
+        ]
+    );
+    // Exact name beats an id-substring hit with a smaller ToolId.
+    assert_eq!(
+        hit_ids(&index, "read"),
+        [
+            "builtin:read",
+            "builtin:already_read",
+            "builtin:file_reader",
+            "builtin:read_file",
+            "builtin:notes",
+        ]
+    );
+    // An exact full id is ranked first too.
+    assert_eq!(hit_ids(&index, "builtin:notes")[0], "builtin:notes");
+    assert_eq!(hit_ids(&index, "FILE_READER")[0], "builtin:file_reader");
+    assert_eq!(spy.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn keyword_search_keeps_every_literal_substring_hit_first() {
+    let spy = Arc::new(AtomicUsize::new(0));
+    let catalog = keyword_catalog(spy);
+    let index = DiscoveryIndex::build(&catalog).expect("build index");
+
+    for raw in [
+        "shell",
+        "session",
+        "web-tools",
+        "public web",
+        "worker",
+        "ext.web-tools:fetch",
+        "a",
+    ] {
+        let literal = literal_hits(&catalog, raw);
+        assert!(!literal.is_empty(), "fixture query {raw:?} must hit");
+        let hits = hit_ids(&index, raw);
+        let head: std::collections::BTreeSet<String> =
+            hits.iter().take(literal.len()).cloned().collect();
+        assert_eq!(head, literal, "query {raw:?}: literal hits must lead");
+        // A query that is one keyword selects exactly the literal hits.
+        if query(raw).terms().len() == 1 {
+            assert_eq!(hits.len(), literal.len(), "query {raw:?}");
+        }
+    }
+}
+
+#[test]
+fn keyword_search_is_deterministic_with_ties_in_tool_id_order() {
+    let spy = Arc::new(AtomicUsize::new(0));
+    let catalog = keyword_catalog(spy);
+    let index = DiscoveryIndex::build(&catalog).expect("build index");
+
+    for raw in ["shell session", "web", "start", "public web page"] {
+        let first = hit_ids(&index, raw);
+        let second = hit_ids(&index, raw);
+        assert_eq!(first, second, "{raw}");
+    }
+    // `web` is in both web-tools ids: a tie, so ToolId order.
+    assert_eq!(
+        hit_ids(&index, "web"),
+        ["ext.web-tools:fetch", "ext.web-tools:search"]
+    );
+    // `start` is in two ids: a tie again.
+    assert_eq!(
+        hit_ids(&index, "start"),
+        ["builtin:shell_start", "builtin:subagent_start"]
+    );
+}
+
+#[test]
+fn keyword_ranking_applies_before_the_count_budget() {
+    let spy = Arc::new(AtomicUsize::new(0));
+    let catalog = keyword_catalog(spy);
+    let index = DiscoveryIndex::build(&catalog).expect("build index");
+
+    // The best match is ToolId-last but survives a one-result budget.
+    let results = index.search(&query("web fetch"), &limits(1, SEARCH_MAX_RESULT_BYTES_CAP));
+    let ids: Vec<&str> = results.hits().iter().map(|h| h.id().as_str()).collect();
+    assert_eq!(ids, ["ext.web-tools:fetch"]);
+    assert!(results.truncated(), "withheld keyword hits are reported");
+    assert_eq!(
+        results.serialized_bytes(),
+        serde_json::to_vec(results.hits()).unwrap().len()
+    );
+}
