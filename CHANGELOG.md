@@ -34,6 +34,11 @@ All notable changes to this project will be documented in this file.
   On every platform, the `./` a tool given the path `.` leaves after the
   session folder is dropped (`src/main.rs`, not `./src/main.rs`). Display
   only: the tool result is unchanged.
+- **A one-shot `subagent` result keeps its responses apart.** Text from
+  each of the worker's responses was joined with nothing between them, so
+  the result (what the parent model reads, and the subagent card) ran
+  sentences together: "…read them all.Found 2 files…". Each response now
+  starts a new paragraph, as `subagent_start` workers already did.
 
 ## [0.11.1] — 2026-10-31
 

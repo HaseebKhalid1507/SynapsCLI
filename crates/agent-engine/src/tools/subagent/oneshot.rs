@@ -219,6 +219,8 @@ impl Tool for SubagentTool {
                 let mut tool_count = 0u32;
                 let mut tool_log: Vec<String> = Vec::new();
                 let mut response_baseline: (usize, usize, u32) = (0, 0, 0);
+                // A new response's first text starts a new paragraph.
+                let mut new_response = false;
                 let mut total_input_tokens = 0u64;
                 let mut total_output_tokens = 0u64;
                 let mut total_cache_read = 0u64;
@@ -256,14 +258,16 @@ impl Tool for SubagentTool {
                                 }
                                 crate::StreamEvent::Llm(LlmEvent::ResponseStart) => {
                                     response_baseline = (final_text.len(), tool_log.len(), tool_count);
+                                    new_response = true;
                                 }
                                 crate::StreamEvent::Llm(LlmEvent::ResponseReset) => {
                                     final_text.truncate(response_baseline.0);
                                     tool_log.truncate(response_baseline.1);
                                     tool_count = response_baseline.2;
+                                    new_response = true;
                                 }
                                 crate::StreamEvent::Llm(LlmEvent::Text(text)) => {
-                                    final_text.push_str(&text);
+                                    append_response_text(&mut final_text, &mut new_response, &text);
                                 }
                                 crate::StreamEvent::Llm(LlmEvent::ToolUseStart { tool_name: name, .. }) => {
                                     tool_count += 1;
@@ -537,9 +541,44 @@ impl Tool for SubagentTool {
     }
 }
 
+/// Append streamed text to the one-shot result. A new response's first
+/// non-empty text is set off from the previous response's narration by a
+/// blank line, as the reactive drive does: "…read them all." then "Found 2
+/// files…" used to arrive glued as "…read them all.Found 2 files…".
+fn append_response_text(out: &mut String, new_response: &mut bool, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    if std::mem::take(new_response) && !out.is_empty() && !out.ends_with('\n') {
+        out.push_str("\n\n");
+    }
+    out.push_str(text);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn each_response_starts_a_new_paragraph() {
+        let mut out = String::new();
+        let mut new_response = true;
+        for (start, text) in [
+            (true, "Let me find the files"),
+            (false, " and read them all."),
+            (true, ""),
+            (false, "Found 2 files."),
+            (true, "Here are the results:\n"),
+            (true, "Total: 14"),
+        ] {
+            new_response |= start;
+            append_response_text(&mut out, &mut new_response, text);
+        }
+        assert_eq!(
+            out,
+            "Let me find the files and read them all.\n\nFound 2 files.\n\nHere are the results:\nTotal: 14"
+        );
+    }
     use crate::tools::test_helpers::create_tool_context;
     use crate::tools::Tool;
     use serde_json::json;
