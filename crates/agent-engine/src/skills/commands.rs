@@ -149,6 +149,7 @@ fn empty_tool_context() -> ToolContext {
             launch_cancel: None,
             memory_backend: None,
             telemetry: None,
+            continuation: None,
             watcher_exit_path: None,
             tool_register_tx: None,
             session_manager: None,
@@ -156,6 +157,7 @@ fn empty_tool_context() -> ToolContext {
             event_queue: None,
             delegation_parent: None,
             codex_parent_plan: None,
+            worker_context: None,
             secret_prompt: None,
             orchestration: None,
             tool_activation: None,
@@ -166,15 +168,13 @@ fn empty_tool_context() -> ToolContext {
             env: None,
             env_stripped: Vec::new(),
             env_warned: Default::default(),
+            sandbox: None,
             session_id: None,
+            tool_use_id: None,
+            turn_correlation_id: None,
+            spend: None,
         },
-        limits: ToolLimits {
-            max_tool_output: 30_000,
-            max_tool_buffer: 256 * 1024,
-            bash_timeout: 30,
-            bash_max_timeout: 300,
-            subagent_timeout: 300,
-        },
+        limits: ToolLimits::configured(),
     }
 }
 
@@ -290,5 +290,71 @@ mod tests {
 
         assert_eq!(output.status, Some(0));
         assert_eq!(output.stdout, "echo hello");
+    }
+
+    /// (max_tool_output, bash_timeout, bash_max_timeout, subagent_timeout)
+    type SeenLimits = (usize, u64, u64, u64);
+
+    /// Records the limits of the context it is called with.
+    struct LimitsTool(Arc<std::sync::Mutex<Option<SeenLimits>>>);
+
+    #[async_trait]
+    impl Tool for LimitsTool {
+        fn name(&self) -> &str {
+            "p:limits"
+        }
+        fn description(&self) -> &str {
+            "limits"
+        }
+        fn parameters(&self) -> Value {
+            serde_json::json!({"type":"object"})
+        }
+        async fn execute(&self, _params: Value, ctx: ToolContext) -> crate::Result<String> {
+            let l = &ctx.limits;
+            *self.0.lock().unwrap() = Some((
+                l.max_tool_output,
+                l.bash_timeout,
+                l.bash_max_timeout,
+                l.subagent_timeout,
+            ));
+            Ok("ok".to_string())
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn an_extension_tool_command_runs_under_the_configured_limits() {
+        let base = crate::test_env::BaseDirGuard::new();
+        std::fs::write(
+            base.path().join("config"),
+            "max_tool_output = 12345\nbash_timeout = 7\nbash_max_timeout = 0\nsubagent_timeout = 111\n",
+        )
+        .unwrap();
+        let command = RegisteredPluginCommand {
+            plugin: "p".to_string(),
+            name: "limits".to_string(),
+            description: None,
+            backend: RegisteredPluginCommandBackend::ExtensionTool {
+                tool: "limits".to_string(),
+                input: serde_json::json!({}),
+            },
+            plugin_root: PathBuf::from("/tmp/p"),
+        };
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let registry = Arc::new(tokio::sync::RwLock::new(ToolRegistry::without_subagent()));
+        registry
+            .write()
+            .await
+            .register(Arc::new(LimitsTool(seen.clone())));
+
+        execute_plugin_command_with_tools(&command, "", registry)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            *seen.lock().unwrap(),
+            Some((12_345, 7, 0, 111)),
+            "(max_tool_output, bash_timeout, bash_max_timeout, subagent_timeout)"
+        );
     }
 }

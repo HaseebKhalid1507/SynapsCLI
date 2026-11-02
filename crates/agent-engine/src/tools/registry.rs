@@ -49,6 +49,7 @@ impl ToolRegistry {
             Arc::new(crate::tools::grep::GrepTool),
             Arc::new(crate::tools::find::FindTool),
             Arc::new(crate::tools::ls::LsTool),
+            Arc::new(crate::tools::wait::WaitTool::default()),
             Arc::new(crate::tools::subagent::SubagentTool),
             Arc::new(crate::tools::subagent::authorize_model::SubagentModelAuthorizeTool),
             Arc::new(crate::tools::subagent::models::SubagentModelsTool),
@@ -154,6 +155,7 @@ impl ToolRegistry {
             Arc::new(crate::tools::grep::GrepTool),
             Arc::new(crate::tools::find::FindTool),
             Arc::new(crate::tools::ls::LsTool),
+            Arc::new(crate::tools::wait::WaitTool::default()),
             Arc::new(crate::tools::forum::ForumPostTool),
             Arc::new(crate::tools::forum::ForumReadTool),
             Arc::new(crate::tools::forum::ForumForgetTool),
@@ -605,6 +607,33 @@ impl ToolRegistry {
         Arc::clone(&self.cached_schema)
     }
 
+    /// Request schema for a session with progressive disclosure off. `None`
+    /// (use [`Self::tools_schema`], the unchanged byte-identical path) unless
+    /// the session withholds a tool the cached schema exposes; then the
+    /// cached schema without exactly those entries, every other entry in
+    /// its cached order and bytes.
+    pub fn schema_withholding(
+        &self,
+        session: &crate::tools::activation::SessionToolSet,
+    ) -> Option<Arc<Vec<Value>>> {
+        let withheld = |entry: &Value| {
+            entry["name"]
+                .as_str()
+                .and_then(|api_name| self.tools.get(self.runtime_name_for_api(api_name)))
+                .is_some_and(|tool| session.is_withheld(&tool_id_for(tool.as_ref())))
+        };
+        if !self.cached_schema.iter().any(withheld) {
+            return None;
+        }
+        Some(Arc::new(
+            self.cached_schema
+                .iter()
+                .filter(|entry| !withheld(entry))
+                .cloned()
+                .collect(),
+        ))
+    }
+
     /// Deterministic session schema projection (Task 17, spec §7.7): select
     /// from the EXISTING cached exposed schema exactly the entries whose
     /// capability identity is core or exactly-activated in `session`,
@@ -665,10 +694,11 @@ impl ToolRegistry {
                 } else {
                     split.deferred.push(deferred_entry(entry));
                 }
-            } else if self
-                .catalog
-                .get(&id)
-                .is_some_and(crate::tools::activation::is_activatable_record)
+            } else if !session.is_withheld(&id)
+                && self
+                    .catalog
+                    .get(&id)
+                    .is_some_and(crate::tools::activation::is_activatable_record)
             {
                 split.deferred.push(deferred_entry(entry));
             } else {
@@ -1101,7 +1131,7 @@ mod tests {
         // tools remain outside the progressive essential foreground core.
         assert_eq!(
             registry.tools_schema().len(),
-            29 + usize::from(cfg!(windows))
+            30 + usize::from(cfg!(windows))
         );
         for name in ["forum_post", "forum_read", "forum_forget"] {
             assert!(registry.get(name).is_some(), "missing {name}");
@@ -1161,10 +1191,10 @@ mod tests {
     fn test_tool_registry_without_subagent() {
         let registry = ToolRegistry::without_subagent();
 
-        // 8 base + 3 shell + 3 forum tools (plus PowerShell on Windows).
+        // 9 base + 3 shell + 3 forum tools (plus PowerShell on Windows).
         assert_eq!(
             registry.tools_schema().len(),
-            14 + usize::from(cfg!(windows))
+            15 + usize::from(cfg!(windows))
         );
         for name in ["forum_post", "forum_read", "forum_forget"] {
             assert!(registry.get(name).is_some(), "missing {name}");
@@ -1393,7 +1423,7 @@ mod tests {
         let mut extensions = ToolRegistry::empty();
         extensions.register(Arc::new(OwnedTool("peer:probe", Some("peer"))));
         let merged = ToolRegistry::without_subagent_with_extensions(&extensions);
-        assert_eq!(merged.tools_schema().len(), 15 + usize::from(cfg!(windows)));
+        assert_eq!(merged.tools_schema().len(), 16 + usize::from(cfg!(windows)));
         assert!(merged.get("peer:probe").is_some());
         for registry in [&main, &ToolRegistry::without_subagent(), &merged] {
             for (name, effect) in [
@@ -1606,5 +1636,60 @@ mod tests {
             Arc::new(McpTwin("twin_one")),
             Arc::new(McpTwin("twin_two")),
         ]);
+    }
+}
+
+#[cfg(test)]
+mod withheld_schema_tests {
+    use super::*;
+    use crate::tools::activation::{SessionId, SessionToolSet};
+    use crate::tools::catalog::ToolId;
+
+    const FORUM: [&str; 3] = ["forum_post", "forum_read", "forum_forget"];
+
+    #[test]
+    fn flag_off_schema_is_unchanged_unless_an_exposed_tool_is_withheld() {
+        let registry = ToolRegistry::new();
+        let session = SessionId::parse("withheld-schema-test").unwrap();
+        let full = SessionToolSet::default_core_for_catalog(session, registry.catalog());
+        assert!(registry.schema_withholding(&full).is_none(), "nothing withheld");
+        let absent = full.clone().withholding([ToolId::builtin("not_registered_here")]);
+        assert!(
+            registry.schema_withholding(&absent).is_none(),
+            "withholding an unexposed tool keeps the unchanged path"
+        );
+        let set = full.withholding(FORUM.map(ToolId::builtin));
+        let projected = registry.schema_withholding(&set).expect("projection");
+        let cached = registry.tools_schema();
+        let expected: Vec<Value> = cached
+            .iter()
+            .filter(|entry| !FORUM.contains(&entry["name"].as_str().unwrap()))
+            .cloned()
+            .collect();
+        assert_eq!(cached.len() - FORUM.len(), expected.len(), "precondition: all three exposed");
+        assert_eq!(*projected, expected, "cached order and bytes, minus exactly the withheld");
+    }
+
+    #[test]
+    fn deferred_loading_leaves_out_a_sessions_withheld_tools() {
+        let registry = ToolRegistry::new();
+        let session = SessionToolSet::progressive_core_for_catalog(
+            SessionId::parse("withheld-deferred-test").unwrap(),
+            registry.catalog(),
+        );
+        let before = registry.deferred_tool_split(&session, &HashSet::new());
+        assert!(
+            before.deferred.iter().any(|entry| entry["name"] == "forum_read"),
+            "precondition: deferred-loadable"
+        );
+        let withheld = session.withholding([ToolId::builtin("forum_read")]);
+        let split = registry.deferred_tool_split(&withheld, &HashSet::new());
+        assert!(!split
+            .loaded
+            .iter()
+            .chain(split.deferred.iter())
+            .any(|entry| entry["name"] == "forum_read"));
+        assert!(!split.id_to_api.contains_key(ToolId::builtin("forum_read").as_str()));
+        assert!(split.deferred.iter().any(|entry| entry["name"] == "forum_post"));
     }
 }

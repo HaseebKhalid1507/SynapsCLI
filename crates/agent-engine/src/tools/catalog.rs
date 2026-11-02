@@ -798,6 +798,13 @@ impl DiscoveryIndex {
         self.generation
     }
 
+    /// The same snapshot without the rows `exclude` selects (a session's
+    /// withheld tools); the pinned generation is unchanged.
+    pub fn without(mut self, exclude: impl Fn(&ToolId) -> bool) -> Self {
+        self.rows.retain(|row| !exclude(&row.entry.id));
+        self
+    }
+
     /// True when the catalog has mutated since this snapshot was built. A
     /// stale index must be rebuilt, not silently served.
     pub fn is_stale(&self, catalog: &ToolCatalog) -> bool {

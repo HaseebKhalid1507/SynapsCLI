@@ -4,7 +4,27 @@ use serde_json::Value;
 
 use crate::extensions::runtime::process::RegisteredExtensionToolSpec;
 use crate::extensions::runtime::ExtensionHandler;
+use crate::tools::ToolOutput;
 use crate::{Result, RuntimeError, ToolContext};
+
+/// Render an extension `tool.call` result value: a plain string, the
+/// `content` string field, or the serialized value. A result object carrying
+/// `_meta["synaps/memory_only"] == true` is a memory-only result
+/// (`runtime::memory_only`). Shared by the eager and the deferred tool.
+pub(crate) fn extension_tool_output(value: &Value) -> ToolOutput {
+    let text = if let Some(text) = value.as_str() {
+        text.to_string()
+    } else if let Some(text) = value.get("content").and_then(Value::as_str) {
+        text.to_string()
+    } else {
+        value.to_string()
+    };
+    if crate::runtime::memory_only::meta_marked(value) {
+        ToolOutput::MemoryOnly(text)
+    } else {
+        ToolOutput::Text(text)
+    }
+}
 
 pub struct ExtensionTool {
     runtime_name: String,
@@ -47,29 +67,24 @@ impl crate::tools::Tool for ExtensionTool {
     }
 
     async fn execute(&self, params: Value, ctx: ToolContext) -> Result<String> {
+        self.execute_rich(params, ctx).await.map(ToolOutput::into_summary)
+    }
+
+    async fn execute_rich(&self, params: Value, ctx: ToolContext) -> Result<ToolOutput> {
         let binding = ctx
             .capabilities
             .memory_backend
+            .clone()
             .unwrap_or_else(crate::memory_backend::MemoryBinding::configured_current);
         if binding.exclusive() && crate::memory_backend::competing_memory_tool(self) {
             return Err(RuntimeError::Tool("independent extension memory is disabled by the selected host backend; use short memory tools".into()));
         }
         let value = self
             .handler
-            .call_tool_for(
-                &self.tool_name,
-                params,
-                ctx.capabilities.session_id.as_deref(),
-            )
+            .call_tool_in(&self.tool_name, params, &ctx.capabilities)
             .await
             .map_err(RuntimeError::Tool)?;
-        if let Some(text) = value.as_str() {
-            Ok(text.to_string())
-        } else if let Some(text) = value.get("content").and_then(Value::as_str) {
-            Ok(text.to_string())
-        } else {
-            Ok(value.to_string())
-        }
+        Ok(extension_tool_output(&value))
     }
 
     fn extension_id(&self) -> Option<&str> {
@@ -203,6 +218,113 @@ mod tests {
             REFUSAL
         );
         assert_eq!(handler.0.load(Ordering::SeqCst), 0);
+    }
+
+    /// An extension marks one result memory-only with `_meta`; the text the
+    /// model gets is unchanged, the variant tells the stream to keep it in RAM.
+    #[tokio::test]
+    async fn memory_only_meta_on_an_extension_result_marks_it() {
+        struct Marked;
+        #[async_trait::async_trait]
+        impl ExtensionHandler for Marked {
+            fn id(&self) -> &str {
+                "memfix"
+            }
+            async fn handle(&self, _event: &HookEvent) -> HookResult {
+                HookResult::Continue
+            }
+            async fn shutdown(&self) {}
+            async fn call_tool(&self, name: &str, _input: Value) -> std::result::Result<Value, String> {
+                Ok(match name {
+                    "vault_fetch" => json!({"content": "VAULT-TEXT", "_meta": {"synaps/memory_only": true}}),
+                    _ => json!({"content": "PLAIN-TEXT"}),
+                })
+            }
+        }
+        let handler: Arc<dyn ExtensionHandler> = Arc::new(Marked);
+        let spec = |name: &str| RegisteredExtensionToolSpec {
+            name: name.into(),
+            description: name.into(),
+            input_schema: json!({"type": "object"}),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = || context_with_memory(memory_binding(MemoryBackendKind::Legacy, dir.path()));
+        let marked = ExtensionTool::new("memfix", spec("vault_fetch"), handler.clone());
+        match marked.execute_rich(json!({}), ctx()).await.unwrap() {
+            ToolOutput::MemoryOnly(text) => assert_eq!(text, "VAULT-TEXT"),
+            other => panic!("expected a memory-only output, got {other:?}"),
+        }
+        assert_eq!(marked.execute(json!({}), ctx()).await.unwrap(), "VAULT-TEXT");
+        let plain = ExtensionTool::new("memfix", spec("other"), handler);
+        assert!(matches!(
+            plain.execute_rich(json!({}), ctx()).await.unwrap(),
+            ToolOutput::Text(text) if text == "PLAIN-TEXT"
+        ));
+    }
+
+    /// The two name forms a memory-only glob matches for an extension tool:
+    /// the runtime name `<plugin>:<tool>` and the wire name the model sees,
+    /// `<plugin>_<tool>` (characters outside `[A-Za-z0-9_-]` become `_`).
+    #[test]
+    fn memory_only_globs_match_an_extension_tool_by_runtime_or_wire_name() {
+        let handler = Arc::new(Counting::default());
+        let registry = ToolRegistry::from_tools_for_tests(vec![Arc::new(tool(
+            "pria-vault",
+            "fetch",
+            &handler,
+        ))]);
+        let wire = registry
+            .tools_schema()
+            .iter()
+            .find_map(|t| t["name"].as_str().filter(|n| n.contains("fetch")).map(String::from))
+            .expect("extension tool exposed");
+        assert_eq!(wire, "pria-vault_fetch");
+        assert_eq!(registry.runtime_name_for_api(&wire), "pria-vault:fetch");
+        let ext = registry.get(&wire).expect("registered");
+        for glob in ["pria-vault:*", "pria-vault_*", "pria-vault:fetch", "pria-vault_fetch"] {
+            let mut policy = crate::runtime::memory_only::Policy::default();
+            policy.set_session(vec![glob.into()]);
+            assert!(policy.marks(&ext.origin(), ext.name(), &wire), "{glob}");
+        }
+        let mut other = crate::runtime::memory_only::Policy::default();
+        other.set_session(vec!["vault:*".into()]);
+        assert!(!other.marks(&ext.origin(), ext.name(), &wire));
+    }
+
+    /// A glob also matches the tool's OWN name, the one the extension
+    /// registered (`pria_vault_get`), whatever the extension id: here the
+    /// runtime name is `pria-desktop:pria_vault_get` and the wire name
+    /// `pria-desktop_pria_vault_get`, which `pria_vault_*` matches neither of.
+    #[test]
+    fn memory_only_globs_match_an_extension_tool_by_its_own_name() {
+        let handler = Arc::new(Counting::default());
+        let registry = ToolRegistry::from_tools_for_tests(vec![Arc::new(tool(
+            "pria-desktop",
+            "pria_vault_get",
+            &handler,
+        ))]);
+        let wire = registry
+            .tools_schema()
+            .iter()
+            .find_map(|t| t["name"].as_str().filter(|n| n.contains("pria_vault_get")).map(String::from))
+            .expect("extension tool exposed");
+        assert_eq!(wire, "pria-desktop_pria_vault_get");
+        assert_eq!(registry.runtime_name_for_api(&wire), "pria-desktop:pria_vault_get");
+        let ext = registry.get(&wire).expect("registered");
+        let globs = vec!["pria_vault_*".to_string(), "pria_memory_*".to_string()];
+        let mut policy = crate::runtime::memory_only::Policy::default();
+        policy.set_session(globs.clone());
+        assert!(policy.marks(&ext.origin(), ext.name(), &wire), "the IK1 globs mark pria_vault_get");
+        let mut config = crate::runtime::memory_only::Policy::default();
+        config.set_config(globs);
+        assert!(config.marks(&ext.origin(), ext.name(), &wire), "the same from the config key");
+        let mut pinned = crate::runtime::memory_only::Policy::default();
+        pinned.set_session(vec!["other:pria_vault_*".into()]);
+        assert!(!pinned.marks(&ext.origin(), ext.name(), &wire), "a runtime-form glob pins the extension");
+        // Never a built-in, even one with a matching name.
+        let mut builtin = crate::runtime::memory_only::Policy::default();
+        builtin.set_session(vec!["pria_vault_*".into()]);
+        assert!(!builtin.marks(&crate::tools::ToolOrigin::Builtin, "pria_vault_get", "pria_vault_get"));
     }
 
     /// No behaviour change without an exclusive binding.

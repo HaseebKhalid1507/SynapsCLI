@@ -122,7 +122,11 @@ async fn record(
     reason: CheckpointReason,
 ) -> SessionReloadRecord {
     handle
-        .send(SessionCommand::Checkpoint { reason })
+        .send(SessionCommand::Checkpoint {
+            reason,
+            deadline: None,
+            skip_quiesce_grace: false,
+        })
         .await
         .unwrap();
     let seen = until(
@@ -322,6 +326,8 @@ async fn a_parked_sessions_reload_record_carries_its_activations() {
     handle
         .send(SessionCommand::Checkpoint {
             reason: CheckpointReason::Reload,
+            deadline: None,
+            skip_quiesce_grace: false,
         })
         .await
         .unwrap();
@@ -330,7 +336,7 @@ async fn a_parked_sessions_reload_record_carries_its_activations() {
             .await
             .expect("timely")
             .expect("alive");
-        if let SessionEventWire::QueryResult { id, value } = env.event {
+        if let SessionEventWire::QueryResult { id, value, .. } = env.event {
             if id == CHECKPOINT_QUERY_ID {
                 assert_eq!(value["parked"], true, "answered without unparking");
                 break serde_json::from_value(value["record"].clone()).unwrap();

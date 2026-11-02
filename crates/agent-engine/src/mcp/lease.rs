@@ -362,6 +362,56 @@ impl McpRuntimeManager {
         expected_digest: &SchemaDigest,
         params: Value,
     ) -> Result<String, McpLeaseError> {
+        let mut marked = false;
+        self.call_exact_inner(
+            session,
+            server,
+            expected_fingerprint,
+            server_tool_name,
+            expected_digest,
+            params,
+            &mut marked,
+        )
+        .await
+    }
+
+    /// [`Self::call_exact`], also saying whether the server marked the
+    /// result memory-only (`_meta["synaps/memory_only"] == true`).
+    pub async fn call_exact_marked(
+        &self,
+        session: &SessionId,
+        server: &str,
+        expected_fingerprint: &str,
+        server_tool_name: &str,
+        expected_digest: &SchemaDigest,
+        params: Value,
+    ) -> (Result<String, McpLeaseError>, bool) {
+        let mut marked = false;
+        let result = self
+            .call_exact_inner(
+                session,
+                server,
+                expected_fingerprint,
+                server_tool_name,
+                expected_digest,
+                params,
+                &mut marked,
+            )
+            .await;
+        (result, marked)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn call_exact_inner(
+        &self,
+        session: &SessionId,
+        server: &str,
+        expected_fingerprint: &str,
+        server_tool_name: &str,
+        expected_digest: &SchemaDigest,
+        params: Value,
+        marked: &mut bool,
+    ) -> Result<String, McpLeaseError> {
         // 1. Current config + fingerprint (pure local; no lock held).
         let Some(config) = (self.config_source)(server) else {
             self.revoke_server_lease(session, server);
@@ -531,7 +581,8 @@ impl McpRuntimeManager {
         if inner.cancelled() {
             return Err(McpLeaseError::Revoked(server.to_string()));
         }
-        let result = conn.call_tool(server_tool_name, params).await;
+        let (result, is_marked) = conn.call_tool_marked(server_tool_name, params).await;
+        *marked = is_marked;
         if inner.cancelled() {
             // Revoked while this already-started call ran: shut the child
             // down (graceful EOF, bounded kill fallback) before releasing.
@@ -557,6 +608,10 @@ impl McpRuntimeManager {
         config: &McpServerConfig,
     ) -> Result<Arc<LeaseInner>, String> {
         let mut conn = McpConnection::start(server, config).await?;
+        // Host list of the `children` query (labels only).
+        if let Some(pid) = conn.pid() {
+            crate::session::children::record_host(crate::session::children::HostOwnerKind::McpServer, server, pid);
+        }
         let defs = match conn.list_tools().await {
             Ok(defs) => defs,
             Err(e) => {
@@ -683,6 +738,27 @@ impl McpLeaseCapability {
     ) -> Result<String, McpLeaseError> {
         self.manager
             .call_exact(
+                &self.session,
+                server,
+                expected_fingerprint,
+                server_tool_name,
+                expected_digest,
+                params,
+            )
+            .await
+    }
+
+    /// [`Self::call_exact`] plus the server's memory-only mark.
+    pub async fn call_exact_marked(
+        &self,
+        server: &str,
+        expected_fingerprint: &str,
+        server_tool_name: &str,
+        expected_digest: &SchemaDigest,
+        params: Value,
+    ) -> (Result<String, McpLeaseError>, bool) {
+        self.manager
+            .call_exact_marked(
                 &self.session,
                 server,
                 expected_fingerprint,

@@ -176,6 +176,7 @@ fn production_core_first_request_fits_documented_budget() {
         "grep",
         "find",
         "ls",
+        "wait",
         "search_tools",
         "activate_tools",
     ] {

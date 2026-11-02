@@ -250,6 +250,14 @@ impl Tool for SearchToolsTool {
             .expect("static search_tools budgets are within caps");
         let index = DiscoveryIndex::build(capability.catalog())
             .map_err(|err| RuntimeError::Tool(format!("tool discovery unavailable: {err}")))?;
+        // A session's withheld tools are not discoverable in it.
+        let index = {
+            let set = capability
+                .session_set()
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            index.without(|id| set.is_withheld(id))
+        };
         let results = index.search(&query, &limits);
         let body = json!({
             "generation": results.generation(),

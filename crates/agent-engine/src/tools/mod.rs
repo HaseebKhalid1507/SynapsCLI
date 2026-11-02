@@ -14,7 +14,7 @@ mod bash;
 mod confirm_latch;
 pub(crate) mod context_checkpoint;
 mod edit;
-mod extension;
+pub(crate) mod extension;
 mod find;
 pub mod forum;
 mod grep;
@@ -33,7 +33,22 @@ pub mod sudo_askpass;
 pub(crate) use subagent::archive::write_window_transcript;
 #[cfg(test)]
 pub(crate) use subagent::archive::resume_messages;
-pub(crate) use subagent::finalize::build_reload_carry_event;
+pub(crate) use subagent::finalize::{
+    build_reload_carry_event, build_reload_left_event, build_reload_resumed_event,
+};
+/// The worker-record writer table, for a daemon reload's check
+/// (`docs/specs/subagent-context-rollover.md` §5).
+pub(crate) mod worker_records {
+    pub(crate) use super::subagent::record_store::{
+        mark_waived, record_waived, writers_snapshot, WriterEntry, WriterVerdict,
+    };
+    #[cfg(any(test, feature = "testing"))]
+    pub(crate) use super::subagent::checkpoint::{PendingOp, PublicationState};
+    #[cfg(test)]
+    pub(crate) use super::subagent::record::RunId;
+    #[cfg(feature = "testing")]
+    pub(crate) use super::subagent::record_store::TestWriter;
+}
 #[doc(hidden)]
 pub use subagent::{legacy_fresh_runtime, spawn_runtime};
 mod write;
@@ -51,6 +66,7 @@ pub mod send_channel;
 pub mod shell;
 pub(crate) mod util;
 pub(crate) mod utf8_stream;
+pub mod wait;
 pub(crate) use util::expand_path;
 pub mod watcher_exit;
 
@@ -105,6 +121,17 @@ pub use subagent::{
     SubagentCollectTool, SubagentModelAuthorizeTool, SubagentModelsTool, SubagentResumeTool,
     SubagentStartTool, SubagentStatusTool, SubagentSteerTool, SubagentTool,
 };
+// The parent's context settings a worker inherits (§2, §7.2).
+pub use subagent::context_policy::{InheritedWindow, WorkerContextPolicy};
+pub(crate) use subagent::context_policy::{same_model_identity, WorkerContext};
+pub(crate) use subagent::WORKER_ROLLOVER;
+pub(crate) use subagent::lineage::WORKER_LOGICAL_PREFIX;
+// A worker run's request ledger, for the runtime and its transports (§6).
+pub(crate) use subagent::ledger::{self as request_ledger, LedgerSlot, RequestLedgerHandle};
+#[cfg(test)]
+pub(crate) use subagent::record as ledger_record;
+#[cfg(test)]
+pub(crate) use subagent::apply_subagent_runtime_policy;
 pub use watcher_exit::{WatcherExitTool, WATCHER_EXIT_ACK};
 pub use write::WriteTool;
 
@@ -117,6 +144,45 @@ pub(crate) use util::{
 // subagent module pub. Tests import `agent_engine::tools::{build_completion_event, finalize_subagent}`.
 #[doc(hidden)]
 pub use subagent::finalize::{build_completion_event, finalize_subagent};
+
+// The calling turn's before_tool_call route, set by the stream around each
+// tool execution and read by the subagent spawn paths.
+pub(crate) use subagent::{CallerHooks, CALLER_HOOKS};
+pub(crate) use subagent::resume::resume_for_daemon;
+// A reload-stopped worker's head left without its final: the adopting
+// image marks it cancelled (train30 item 4b).
+pub(crate) use subagent::archive::archive_root;
+pub(crate) use subagent::crash_head::{mark_left as mark_left_crash_heads, Marked as CrashHeadMarked};
+/// Test-only (`cfg(test)` / the `testing` feature): write worker
+/// `handle_id`'s v2 head record, status "running" and no final, into this
+/// process's archive directory, as a run the reload stopped before its
+/// final record was published leaves it, and return its path.
+#[cfg(any(test, feature = "testing"))]
+#[doc(hidden)]
+pub use subagent::crash_head::write_test_crash_head;
+
+/// Test-only (`cfg(test)` / the `testing` feature): write worker
+/// `handle_id`'s v1 resume archive into this process's archive directory,
+/// as its finalizer would, and return its path.
+#[cfg(any(test, feature = "testing"))]
+#[doc(hidden)]
+pub fn write_test_archive(
+    handle_id: &str,
+    meta: &crate::runtime::subagent::SubagentArchiveMeta,
+    status: &str,
+    history: &[serde_json::Value],
+) -> std::io::Result<PathBuf> {
+    let history: Vec<crate::SharedMessage> = history.iter().cloned().map(Arc::new).collect();
+    subagent::archive::write_archive(
+        &subagent::archive::process_dir(),
+        handle_id,
+        meta,
+        status,
+        None,
+        "",
+        &history,
+    )
+}
 
 // ── Tool Trait ──────────────────────────────────────────────────────────────────
 
@@ -161,6 +227,11 @@ pub struct ToolCapabilities {
     /// Host-built foreground Codex plan for exact-model Ultra inheritance.
     /// Not a model-supplied tool parameter or an authorization grant.
     pub codex_parent_plan: Option<crate::runtime::openai::catalog::CodexExecutionPlan>,
+    /// Host-built snapshot of the calling runtime's live context settings,
+    /// for a worker it starts or resumes (subagent rollover §2, §7.2). Not a
+    /// model-supplied parameter. `None` (every context today) means no
+    /// worker inherits context settings.
+    pub worker_context: Option<WorkerContextPolicy>,
     pub secret_prompt: Option<SecretPromptHandle>,
     /// Runtime-enforced delegation/lifecycle policy. When present, every spawn
     /// path must authorize before creating channels, threads, or provider runtimes.
@@ -187,6 +258,14 @@ pub struct ToolCapabilities {
     /// while `status`/`disable` still answer deterministically `Off`
     /// (memory off requires no infrastructure).
     pub memory_context: Option<crate::runtime::memory_context::MemoryContextCapability>,
+    /// The calling session's own context-continuation state: the state a
+    /// `context_checkpoint` call records into. The stream fills it from its
+    /// own session for every tool call; it is never taken from the
+    /// (possibly host-shared) tool registry, so sessions sharing one
+    /// registry cannot reach each other's state. `None` (manual fixtures,
+    /// routes without a session) makes `context_checkpoint` fail typed and
+    /// touch nothing.
+    pub continuation: Option<crate::runtime::continuation::SharedContinuation>,
     /// Per-session working directory (Phase 2 daemons serve sessions from N
     /// directories in one process). `None` = inherit the process cwd — the
     /// only value Phase 1 ever sets, so behaviour is byte-identical.
@@ -209,9 +288,28 @@ pub struct ToolCapabilities {
     /// `params.session_id` so a daemon-shared plugin knows its caller.
     /// Not the lease scope (`tool_session_id`, a random runtime id).
     pub session_id: Option<String>,
+    /// The model's `tool_use` id of this call (the history block's
+    /// `tool_use_id`). The stream sets it at both dispatch sites; `None` in
+    /// every context outside a provider round (fixtures, the extension
+    /// provider tool loop, plugin and skill commands).
+    pub tool_use_id: Option<String>,
+    /// The stream's per-turn correlation id (spec §5.2), opaque. Set with
+    /// `tool_use_id` at both dispatch sites; `None` elsewhere.
+    pub turn_correlation_id: Option<String>,
+    /// Where a subagent launch from this context takes its run lease (child
+    /// spend): the session's sink in a root turn, the worker's own run in a
+    /// worker's. `None` in a host without a sink and in contexts that launch
+    /// no workers: a oneshot then keeps today's aggregate Usage.
+    pub spend: Option<crate::runtime::child_spend::SpendParent>,
+    /// The session's write-sandbox binding (`crate::sandbox`), consulted at
+    /// every bash/PTY spawn. Bound from the conversation id where there is
+    /// one; `None` (workers, fixtures, contexts with no conversation) means
+    /// no sandbox, exactly as before.
+    pub sandbox: Option<std::sync::Arc<crate::sandbox::SandboxBinding>>,
 }
 
 /// Configuration limits and timeouts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ToolLimits {
     /// Context-budget ceiling — final tool output entering history is truncated
     /// to this. Applied AFTER the `after_tool_call` hook so compression
@@ -224,6 +322,34 @@ pub struct ToolLimits {
     pub bash_timeout: u64,
     pub bash_max_timeout: u64,
     pub subagent_timeout: u64,
+}
+
+impl ToolLimits {
+    /// The internal buffer bound every production context uses; not a
+    /// config key.
+    pub const MAX_TOOL_BUFFER: usize = 256 * 1024;
+
+    /// The configured `max_tool_output`, `bash_timeout`, `bash_max_timeout`
+    /// and `subagent_timeout`.
+    pub fn from_config(config: &crate::SynapsConfig) -> Self {
+        Self {
+            max_tool_output: config.max_tool_output,
+            max_tool_buffer: Self::MAX_TOOL_BUFFER,
+            bash_timeout: config.bash_timeout,
+            bash_max_timeout: config.bash_max_timeout,
+            subagent_timeout: config.subagent_timeout,
+        }
+    }
+
+    /// The limits for a tool call with no runtime in reach (the
+    /// extension-provider tool loop, a plugin command's extension tool): the
+    /// installed host's current config, else the config file.
+    pub(crate) fn configured() -> Self {
+        match crate::EngineHost::current() {
+            Some(host) => Self::from_config(&host.config()),
+            None => Self::from_config(&crate::config::load_config()),
+        }
+    }
 }
 
 /// Context passed to tool execution — composition of channels, capabilities, and limits.
@@ -279,12 +405,16 @@ pub enum ConcurrencyKey {
 pub enum ToolOutput {
     Text(String),
     Blocks { blocks: Vec<Value>, summary: String },
+    /// A memory-only result (`_meta["synaps/memory_only"] == true` on an
+    /// extension or MCP result). The stream keeps this text in RAM only and
+    /// puts a fixed placeholder in the history; see `runtime::memory_only`.
+    MemoryOnly(String),
 }
 
 impl ToolOutput {
     pub fn summary(&self) -> &str {
         match self {
-            Self::Text(s) => s,
+            Self::Text(s) | Self::MemoryOnly(s) => s,
             Self::Blocks { summary, .. } => summary,
         }
     }
@@ -297,7 +427,7 @@ impl ToolOutput {
     /// assert that an existing leading text block matches `summary`.
     pub fn into_parts(self) -> (String, Option<Vec<Value>>) {
         match self {
-            Self::Text(s) => (s, None),
+            Self::Text(s) | Self::MemoryOnly(s) => (s, None),
             Self::Blocks {
                 mut blocks,
                 summary,
@@ -399,6 +529,12 @@ pub trait Tool: Send + Sync {
 
 #[cfg(test)]
 pub(crate) mod test_helpers;
+
+#[cfg(all(test, target_os = "linux"))]
+mod protected_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+mod confine_tests;
 
 #[cfg(test)]
 mod tool_output_tests {

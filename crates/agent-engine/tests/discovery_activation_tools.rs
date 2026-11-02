@@ -128,6 +128,7 @@ fn ctx_with_prompt(
             launch_cancel: None,
             memory_backend: None,
             telemetry: None,
+            continuation: None,
             watcher_exit_path: None,
             tool_register_tx: None,
             session_manager: None,
@@ -135,6 +136,7 @@ fn ctx_with_prompt(
             event_queue: None,
             delegation_parent: None,
             codex_parent_plan: None,
+            worker_context: None,
             secret_prompt,
             orchestration: None,
             tool_activation: cap,
@@ -145,7 +147,11 @@ fn ctx_with_prompt(
             env: None,
             env_stripped: Vec::new(),
             env_warned: Default::default(),
+            sandbox: None,
             session_id: None,
+            tool_use_id: None,
+            turn_correlation_id: None,
+            spend: None,
         },
         limits: ToolLimits {
             max_tool_output: 30000,
@@ -1002,4 +1008,35 @@ fn route_session_set_consumes_retained_set_and_survives_drift() {
     let fallback = route_session_set(None, registry.catalog(), session_id);
     assert_eq!(fallback.activated().count(), 0);
     assert!(!fallback.is_stale(registry.catalog()));
+}
+
+/// A session's withheld tools are neither discoverable nor activatable in it
+/// (the registry, possibly shared by a whole host, still holds them).
+#[tokio::test]
+async fn search_and_activation_leave_out_a_sessions_withheld_tools() {
+    let registry = fixture_registry();
+    let set = shared(minimal_set(&registry).withholding([ToolId::builtin("beta_tool")]));
+    let found = SearchToolsTool
+        .execute(
+            json!({"query": "tool"}),
+            ctx(Some(capability(&registry, &set, ActivationAuthority::ModelConfirmed))),
+        )
+        .await
+        .expect("search succeeds");
+    assert!(found.contains("builtin:gamma_tool"), "{found}");
+    assert!(!found.contains("builtin:beta_tool"), "{found}");
+    let err = ActivateToolsTool
+        .execute(
+            json!({"tools": ["builtin:beta_tool"]}),
+            ctx(Some(capability(&registry, &set, ActivationAuthority::ModelConfirmed))),
+        )
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("not available in this session"), "{err}");
+    assert!(set
+        .read()
+        .unwrap()
+        .activation(&ToolId::builtin("beta_tool"))
+        .is_none());
+    assert!(registry.get("beta_tool").is_some(), "registry untouched");
 }

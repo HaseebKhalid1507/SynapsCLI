@@ -159,6 +159,7 @@ fn ctx_with(cap: Option<McpLeaseCapability>) -> ToolContext {
             launch_cancel: None,
             memory_backend: None,
             telemetry: None,
+            continuation: None,
             watcher_exit_path: None,
             tool_register_tx: None,
             session_manager: None,
@@ -166,6 +167,7 @@ fn ctx_with(cap: Option<McpLeaseCapability>) -> ToolContext {
             event_queue: None,
             delegation_parent: None,
             codex_parent_plan: None,
+            worker_context: None,
             secret_prompt: None,
             orchestration: None,
             tool_activation: None,
@@ -176,7 +178,11 @@ fn ctx_with(cap: Option<McpLeaseCapability>) -> ToolContext {
             env: None,
             env_stripped: Vec::new(),
             env_warned: Default::default(),
+            sandbox: None,
             session_id: None,
+            tool_use_id: None,
+            turn_correlation_id: None,
+            spend: None,
         },
         limits: ToolLimits {
             max_tool_output: 30000,
@@ -266,6 +272,19 @@ async fn exact_execute_starts_once_reuses_and_calls_only_exact_tool() {
     assert_eq!(fx.count("request:tools/call:echo_tool"), 2);
     assert_eq!(fx.count("request:tools/call:sibling_tool"), 0);
     assert_eq!(manager.lease_count(), 1);
+    // The leased server is in the `children` host list under its name (the
+    // ledger is process-wide: pick this test's child by its environment).
+    #[cfg(target_os = "linux")]
+    {
+        use agent_engine::session::children;
+        let ours = children::list(None, None).host.into_iter().find(|h| {
+            std::fs::read(format!("/proc/{}/environ", h.child.pid))
+                .is_ok_and(|env| env.windows(fx.spy.as_os_str().len()).any(|w| w == fx.spy.as_os_str().as_encoded_bytes()))
+        });
+        let ours = ours.expect("the leased MCP server is listed");
+        assert_eq!((ours.owner_kind, ours.owner_id.as_str()), (children::HostOwnerKind::McpServer, "srv"));
+        assert_eq!(children::identify(ours.child.pid), Some(ours.child));
+    }
     manager.terminate_all();
     fx.cleanup();
 }

@@ -16,7 +16,7 @@
 //!   mutation);
 //! - catalog drift is represented (`is_stale`), never silently absorbed.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use agent_core::BoundedText;
@@ -115,6 +115,8 @@ pub enum ActivationError {
     AlreadyActivated(ToolId),
     #[error("tool is already in this session's configured core set: {0}")]
     AlreadyCore(ToolId),
+    #[error("tool is not available in this session: {0}")]
+    Withheld(ToolId),
     #[error(
         "session tool set snapshot at generation {} is stale against catalog generation {}; rebuild it",
         set.value(),
@@ -156,6 +158,8 @@ pub enum DropReason {
     Removed,
     /// The record's schema digest or trust provenance changed.
     Drifted,
+    /// The rebuilt set withholds the tool from this session.
+    Withheld,
 }
 
 /// One activation dropped by [`SessionToolSet::rebuilt_for_catalog`].
@@ -231,6 +235,8 @@ pub enum RestoreDropReason {
     Denied,
     /// The target set was not built against the current catalog.
     StaleSet,
+    /// The restoring set withholds the tool from this session.
+    Withheld,
 }
 
 /// Outcome of [`SessionToolSet::restore_carried`]: what was restored and
@@ -252,6 +258,9 @@ pub struct SessionToolSet {
     catalog_generation: CatalogGeneration,
     core: BTreeMap<ToolId, CorePin>,
     activated: BTreeMap<ToolId, ActivatedTool>,
+    /// Tools this session must not be offered or run (see
+    /// [`Self::withholding`]). Empty unless a builder withholds something.
+    withheld: BTreeSet<ToolId>,
     /// Session schema-generation counter (spec §7.7): advances by exactly
     /// one for every successful nonempty activation batch (a single
     /// activation is a batch of one). Deterministic bookkeeping only; it
@@ -288,12 +297,34 @@ impl SessionToolSet {
             catalog_generation: catalog.generation(),
             core: validated,
             activated: BTreeMap::new(),
+            withheld: BTreeSet::new(),
             schema_generation: 0,
         })
     }
 
     pub fn session(&self) -> &SessionId {
         &self.session
+    }
+
+    /// Withhold `ids` from this session: they leave the core and any exact
+    /// activation, every later activation of them is refused, discovery and
+    /// deferred loading leave them out, and a set rebuilt from this one keeps
+    /// withholding them. This is per-session visibility over a registry
+    /// that may be shared by every session of a host: one session's
+    /// conditions (context management off, a non-Axel memory backend) must
+    /// never be applied by mutating that shared registry.
+    pub fn withholding(mut self, ids: impl IntoIterator<Item = ToolId>) -> Self {
+        for id in ids {
+            self.core.remove(&id);
+            self.activated.remove(&id);
+            self.withheld.insert(id);
+        }
+        self
+    }
+
+    /// Whether this session withholds `id` (see [`Self::withholding`]).
+    pub fn is_withheld(&self, id: &ToolId) -> bool {
+        self.withheld.contains(id)
     }
 
     /// Default per-stream-session set (Task 16 behavior preservation): the
@@ -329,6 +360,7 @@ impl SessionToolSet {
             "grep",
             "find",
             "ls",
+            "wait",
             "search_tools",
             "activate_tools",
             "search_skills",
@@ -363,7 +395,8 @@ impl SessionToolSet {
             Self::progressive_core_for_catalog(self.session.clone(), catalog)
         } else {
             Self::default_core_for_catalog(self.session.clone(), catalog)
-        };
+        }
+        .withholding(self.withheld.iter().cloned());
         self.carry_activations_into(next, catalog)
     }
 
@@ -371,7 +404,8 @@ impl SessionToolSet {
     /// for the SAME session against `catalog` — with exactly the checks
     /// [`Self::rebuilt_for_catalog`] applies (pinned digest + provenance
     /// unchanged and source trust intact; promoted-to-core ids are not
-    /// carried; drifted/removed ones are dropped and reported). Shared by the
+    /// carried; drifted/removed ones, and ones `next` withholds, are dropped
+    /// and reported). Shared by the
     /// round-top rebuild and the turn-start reconciliation of a retained
     /// set, so the two paths can never drift.
     ///
@@ -407,6 +441,8 @@ impl SessionToolSet {
     /// ([`Self::restore_carried`]), so the two can never drift:
     ///
     /// - uncataloged → `Removed`;
+    /// - withheld from this session ([`Self::withholding`]) → `Withheld`,
+    ///   never granted back by a carry or a restore;
     /// - already core → `Ok` (still on the wire, nothing to record);
     /// - `pin_matches(record)` (the pinned schema digest AND trust
     ///   provenance are unchanged) AND the record's source still agrees with
@@ -425,6 +461,9 @@ impl SessionToolSet {
         let Some(rec) = catalog.get(id) else {
             return Err(DropReason::Removed);
         };
+        if self.withheld.contains(id) {
+            return Err(DropReason::Withheld);
+        }
         if self.core.contains_key(id) || self.activated.contains_key(id) {
             return Ok(());
         }
@@ -523,6 +562,11 @@ impl SessionToolSet {
                         .dropped
                         .push((c.tool_id.clone(), RestoreDropReason::Drifted));
                 }
+                Err(DropReason::Withheld) => {
+                    report
+                        .dropped
+                        .push((c.tool_id.clone(), RestoreDropReason::Withheld));
+                }
             }
         }
         if !report.restored.is_empty() {
@@ -607,6 +651,9 @@ impl SessionToolSet {
             return Err(ActivationError::SessionMismatch);
         }
         let tool_id = grant.tool_id().clone();
+        if self.withheld.contains(&tool_id) {
+            return Err(ActivationError::Withheld(tool_id));
+        }
         let record = catalog
             .get(&tool_id)
             .ok_or_else(|| ActivationError::UnknownTool(tool_id.clone()))?;
@@ -809,10 +856,12 @@ pub enum ActivationBasis {
 }
 
 /// A fully authorized tool call: exact resolved identity plus the acquired
-/// implementation. The implementation field is private and the ONLY
-/// constructor is [`ExecutionGate::authorize`], which acquires it strictly
-/// after every check passes — the safe path cannot reach an implementation
-/// without passing the gate.
+/// implementation. The implementation field is private and the constructors
+/// are [`ExecutionGate::authorize`], which acquires it strictly after every
+/// check passes — the safe path cannot reach an implementation without
+/// passing the gate — and, for the one session's client tools only,
+/// [`Self::client_tool`] (crate-private), used by a root stream for a wire
+/// name the gate does not resolve and that stream offered in its round.
 pub struct AuthorizedToolCall {
     resolved: ResolvedToolCall,
     implementation: Arc<dyn Tool>,
@@ -820,6 +869,13 @@ pub struct AuthorizedToolCall {
 }
 
 impl AuthorizedToolCall {
+    /// A client tool call (`runtime::client_tools`): never in the shared
+    /// registry or catalog, always offered (core) on the root stream that
+    /// holds the registration. Its handler runs the root-only dispatch gate.
+    pub(crate) fn client_tool(resolved: ResolvedToolCall, implementation: Arc<dyn Tool>) -> Self {
+        Self { resolved, implementation, activation_basis: ActivationBasis::Core }
+    }
+
     pub fn resolved(&self) -> &ResolvedToolCall {
         &self.resolved
     }
@@ -1335,6 +1391,11 @@ pub fn activate_model_initiated(
 /// to a fresh default-core set with zero activations under a locally minted
 /// session.
 ///
+/// That fallback is unscoped: it is not the calling session's tool set, so
+/// it carries none of that session's withheld tools (`withholding`) or
+/// activations. It is not for session tool loops; a stream turn always
+/// passes its retained set.
+///
 /// Generation drift is deliberately SURVIVED here (per-tool digest
 /// validation fix): the retained set is served as-is even when the catalog
 /// generation moved past its snapshot, because every actual execution still
@@ -1365,5 +1426,118 @@ pub fn route_session_set(
             guard.clone()
         }
         None => SessionToolSet::default_core_for_catalog(fallback_session(), catalog),
+    }
+}
+
+#[cfg(test)]
+mod withheld_tests {
+    use super::*;
+
+    fn grant_for(session: &SessionId, catalog: &ToolCatalog, id: &ToolId) -> SessionActivationGrant {
+        let record = catalog.get(id).expect("cataloged");
+        SessionActivationGrant::new(
+            session.as_str(),
+            id.clone(),
+            catalog.generation(),
+            record.schema_digest().clone(),
+        )
+        .expect("valid grant")
+    }
+
+    #[test]
+    fn a_withheld_tool_leaves_the_core_and_is_refused_by_the_gate_and_every_activation() {
+        let registry = ToolRegistry::new();
+        let catalog = registry.catalog();
+        let session = SessionId::parse("withheld-set-test").unwrap();
+        let forum = ToolId::builtin("forum_read");
+        let full = SessionToolSet::default_core_for_catalog(session.clone(), catalog);
+        assert!(full.is_core(&forum), "precondition: a default core member");
+        assert!(ExecutionGate::authorize_wire_call(&registry, &full, "forum_read").is_ok());
+        let set = full.withholding([forum.clone()]);
+        assert!(!set.is_core(&forum));
+        assert!(set.is_withheld(&forum));
+        assert!(ExecutionGate::authorize_wire_call(&registry, &set, "forum_read").is_err());
+        assert!(ExecutionGate::authorize_wire_call(&registry, &set, "forum_post").is_ok());
+
+        let mut progressive =
+            SessionToolSet::progressive_core_for_catalog(session.clone(), catalog)
+                .withholding([forum.clone()]);
+        let grant = grant_for(&session, catalog, &forum);
+        assert_eq!(
+            progressive.activate(grant.clone(), catalog),
+            Err(ActivationError::Withheld(forum.clone()))
+        );
+        assert!(matches!(
+            progressive.activate_many(vec![grant], catalog),
+            Err(BulkActivationError::Grant(ActivationError::Withheld(_)))
+        ));
+        assert!(matches!(
+            activate_model_initiated(
+                ActivationAuthority::ModelConfirmed,
+                &mut progressive,
+                catalog,
+                std::slice::from_ref(&forum),
+            ),
+            Err(HostActivationError::Bulk(BulkActivationError::Grant(
+                ActivationError::Withheld(_)
+            )))
+        ));
+        assert!(progressive.activation(&forum).is_none());
+        assert_eq!(progressive.schema_generation(), 0, "nothing applied");
+    }
+
+    #[test]
+    fn rebuilds_drop_a_withheld_activation_and_keep_withholding_it() {
+        let registry = ToolRegistry::new();
+        let catalog = registry.catalog();
+        let session = SessionId::parse("withheld-carry-test").unwrap();
+        let forum = ToolId::builtin("forum_read");
+        let mut old = SessionToolSet::progressive_core_for_catalog(session.clone(), catalog);
+        old.activate(grant_for(&session, catalog, &forum), catalog)
+            .unwrap();
+        let next = SessionToolSet::progressive_core_for_catalog(session.clone(), catalog)
+            .withholding([forum.clone()]);
+        let (carried, dropped) = old.carry_activations_into(next, catalog);
+        assert!(carried.activation(&forum).is_none());
+        assert_eq!(
+            dropped,
+            vec![DroppedActivation {
+                id: forum.clone(),
+                reason: DropReason::Withheld,
+            }]
+        );
+        for progressive in [false, true] {
+            let (rebuilt, _) = carried.rebuilt_for_catalog(catalog, progressive);
+            assert!(rebuilt.is_withheld(&forum));
+            assert!(!rebuilt.is_core(&forum));
+        }
+    }
+
+    /// A restore (daemon reload, park) shares the carry's admission check,
+    /// so it can never grant back a tool the restoring set withholds.
+    #[test]
+    fn a_restore_drops_a_withheld_activation_and_never_grants_it() {
+        let registry = ToolRegistry::new();
+        let catalog = registry.catalog();
+        let session = SessionId::parse("withheld-restore-test").unwrap();
+        let forum = ToolId::builtin("forum_read");
+        let mut old = SessionToolSet::progressive_core_for_catalog(session.clone(), catalog);
+        old.activate(grant_for(&session, catalog, &forum), catalog)
+            .unwrap();
+        let carried = old.carried_activations();
+        assert_eq!(carried.len(), 1, "precondition: forum_read is carried");
+
+        let mut next = SessionToolSet::progressive_core_for_catalog(session.clone(), catalog)
+            .withholding([forum.clone()]);
+        let report = next.restore_carried(&carried, catalog);
+        assert!(report.restored.is_empty());
+        assert_eq!(
+            report.dropped,
+            vec![(forum.as_str().to_string(), RestoreDropReason::Withheld)]
+        );
+        assert!(next.activation(&forum).is_none());
+        assert!(next.is_withheld(&forum));
+        assert_eq!(next.schema_generation(), 0, "nothing restored");
+        assert!(ExecutionGate::authorize_wire_call(&registry, &next, "forum_read").is_err());
     }
 }

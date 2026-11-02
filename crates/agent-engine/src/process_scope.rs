@@ -644,6 +644,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn version_query_and_probe_use_exactly_the_launch_options() {
+        let _exec = crate::test_env::SCRIPT_EXEC_LOCK.lock();
         let dir = tempfile::tempdir().unwrap();
         // An old systemd-run: rejects the unknown option like the real one.
         let binary = fake_script(
@@ -745,9 +746,11 @@ exit 0
 
     // These tests execute only synthetic scripts in private tempdirs, never a
     // manager or a host systemd-run. No production marker-file protocol.
+    // Every caller holds `test_env::SCRIPT_EXEC_LOCK` through its last exec.
     #[cfg(target_os = "linux")]
     fn fake_script(dir: &std::path::Path, name: &str, body: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
+        assert!(crate::test_env::SCRIPT_EXEC_LOCK.held(), "take SCRIPT_EXEC_LOCK first");
         let path = dir.join(name);
         std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -757,6 +760,7 @@ exit 0
     #[cfg(target_os = "linux")]
     #[test]
     fn fresh_probe_uses_exact_env_cwd_and_observes_availability_changes() {
+        let _exec = crate::test_env::SCRIPT_EXEC_LOCK.lock();
         let dir = tempfile::tempdir().unwrap();
         let binary = fake_script(
             dir.path(),
@@ -802,6 +806,7 @@ exit 0
     fn post_probe_failure_never_replays_and_exec_preserves_pid_and_stdio() {
         use std::io::Write;
         use std::process::{Command, Stdio};
+        let _exec = crate::test_env::SCRIPT_EXEC_LOCK.lock();
         let dir = tempfile::tempdir().unwrap();
         let command = fake_script(
             dir.path(),
@@ -895,7 +900,10 @@ printf 'wrapper=%s\n' "$$"
                 < spawn.find("launcher_for_effective_env").unwrap()
         );
         assert!(spawn.contains("cmd.env_clear();"));
-        assert_eq!(spawn.matches(".spawn_command(cmd)").count(), 1);
+        // One spawn in each sandbox arm (none / confined), never a retry.
+        let (plain, confined) = spawn.split_once("SpawnSandbox::Apply(p) =>").unwrap();
+        assert_eq!(plain.matches(".spawn_command(cmd)").count(), 1);
+        assert_eq!(confined.matches(".spawn_command(cmd)").count(), 1);
         let daemon = include_str!("daemon/mod.rs");
         let spawn = daemon.split("pub fn spawn_detached(").nth(1).unwrap();
         assert!(spawn.find("daemon_launch(").unwrap() < spawn.find("libc::pipe(").unwrap());
@@ -967,6 +975,7 @@ printf 'wrapper=%s\n' "$$"
     #[cfg(target_os = "linux")]
     #[test]
     fn the_probe_runs_with_the_launch_slice_and_a_refused_slice_launches_direct() {
+        let _exec = crate::test_env::SCRIPT_EXEC_LOCK.lock();
         let dir = tempfile::tempdir().unwrap();
         let fake = test_support::fake_systemd_run(dir.path());
         let env = vec![("DBUS_SESSION_BUS_ADDRESS".into(), "fake:good".into())];
@@ -1023,6 +1032,7 @@ exit 0"#,
     fn each_kind_launches_in_its_configured_slice() {
         let base = crate::test_env::BaseDirGuard::new();
         let _scopes = crate::test_env::EnvVarGuard::remove("SYNAPS_PROCESS_SCOPES");
+        let _exec = crate::test_env::SCRIPT_EXEC_LOCK.lock();
         let dir = tempfile::tempdir().unwrap();
         let fake = test_support::fake_systemd_run(dir.path());
         let env: Vec<(OsString, OsString)> = test_support::fake_env(&fake)
@@ -1133,6 +1143,7 @@ exit 0"#,
     #[cfg(target_os = "linux")]
     #[test]
     fn a_launch_with_a_slice_asks_the_manager_for_its_limits_once() {
+        let _exec = crate::test_env::SCRIPT_EXEC_LOCK.lock();
         let dir = tempfile::tempdir().unwrap();
         let fake = test_support::fake_systemd_run(dir.path());
         let log = dir.path().join("systemctl.log");
@@ -1180,9 +1191,11 @@ pub(crate) mod test_support {
 
     /// A fake `systemd-run` in `dir`. The probe (`… -- /bin/true`) writes its
     /// arguments to `dir/probe.args` and succeeds; a launch writes them to
-    /// `dir/launch.args` and execs the command after `--`.
+    /// `dir/launch.args` and execs the command after `--`. The caller holds
+    /// `test_env::SCRIPT_EXEC_LOCK` from before this write through its last exec.
     pub(crate) fn fake_systemd_run(dir: &Path) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
+        assert!(crate::test_env::SCRIPT_EXEC_LOCK.held(), "take SCRIPT_EXEC_LOCK first");
         let path = dir.join("systemd-run");
         let body = format!(
             "#!/bin/sh\nfor a in \"$@\"; do last=$a; done\n\

@@ -18,6 +18,11 @@ pub(super) struct McpConnection {
 }
 
 impl McpConnection {
+    /// The server process id while it runs.
+    pub(super) fn pid(&self) -> Option<u32> {
+        self.child.id()
+    }
+
     /// Spawn and initialize an MCP server.
     pub(super) async fn start(
         server: &str,
@@ -365,13 +370,14 @@ impl McpConnection {
         Ok(defs)
     }
 
-    /// Call a tool on the server.
-    pub(super) async fn call_tool(
+    /// Call a tool on the server, and say whether the result carried
+    /// `_meta["synaps/memory_only"] == true` (also on an `isError` result).
+    pub(super) async fn call_tool_marked(
         &mut self,
         name: &str,
         arguments: Value,
-    ) -> std::result::Result<String, String> {
-        let result = self
+    ) -> (std::result::Result<String, String>, bool) {
+        match self
             .request(
                 "tools/call",
                 json!({
@@ -379,8 +385,22 @@ impl McpConnection {
                     "arguments": arguments
                 }),
             )
-            .await?;
+            .await
+        {
+            Ok(result) => (
+                call_result_text(&result),
+                crate::runtime::memory_only::meta_marked(&result),
+            ),
+            Err(e) => (Err(e), false),
+        }
+    }
+}
 
+/// The text of an MCP `CallToolResult`: text, `[image content]` and
+/// resource-text blocks; `isError` makes it an error; no `content` array
+/// falls back to the pretty-printed result.
+fn call_result_text(result: &Value) -> std::result::Result<String, String> {
+    {
         // Extract text content from the result
         let content = result.get("content").and_then(|c| c.as_array());
 
@@ -426,8 +446,34 @@ impl McpConnection {
             }
             None => {
                 // Fallback: stringify the whole result
-                Ok(serde_json::to_string_pretty(&result).unwrap_or_default())
+                Ok(serde_json::to_string_pretty(result).unwrap_or_default())
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod memory_only_tests {
+    use super::*;
+    use crate::runtime::memory_only::meta_marked;
+
+    #[test]
+    fn memory_only_meta_on_an_mcp_call_result_is_read_with_its_text() {
+        let marked = json!({
+            "content": [{"type": "text", "text": "VAULT-TEXT"}],
+            "_meta": {"synaps/memory_only": true}
+        });
+        assert_eq!(call_result_text(&marked), Ok("VAULT-TEXT".to_string()));
+        assert!(meta_marked(&marked));
+        let marked_error = json!({
+            "content": [{"type": "text", "text": "VAULT-ERR"}],
+            "isError": true,
+            "_meta": {"synaps/memory_only": true}
+        });
+        assert_eq!(call_result_text(&marked_error), Err("VAULT-ERR".to_string()));
+        assert!(meta_marked(&marked_error));
+        let plain = json!({"content": [{"type": "text", "text": "a"}, {"type": "image"}]});
+        assert_eq!(call_result_text(&plain), Ok("a[image content]".to_string()));
+        assert!(!meta_marked(&plain));
     }
 }

@@ -629,6 +629,16 @@ impl Tool for DeferredMcpTool {
     }
 
     async fn execute(&self, params: Value, ctx: ToolContext) -> crate::Result<String> {
+        self.execute_rich(params, ctx)
+            .await
+            .map(crate::tools::ToolOutput::into_summary)
+    }
+
+    async fn execute_rich(
+        &self,
+        params: Value,
+        ctx: ToolContext,
+    ) -> crate::Result<crate::tools::ToolOutput> {
         // Runs strictly AFTER the ExecutionGate authorized this exact call.
         let binding = ctx
             .capabilities
@@ -647,15 +657,25 @@ impl Tool for DeferredMcpTool {
                 self.runtime_name, self.server_name
             )));
         };
-        leases
-            .call_exact(
+        let (result, marked) = leases
+            .call_exact_marked(
                 &self.server_name,
                 &self.expected_fingerprint,
                 &self.server_tool_name,
                 &self.expected_digest,
                 params,
             )
-            .await
+            .await;
+        // A memory-only mark covers the server's error text too: it is the
+        // server's own output, so the stream keeps it in RAM only.
+        if marked {
+            return Ok(crate::tools::ToolOutput::MemoryOnly(match result {
+                Ok(text) => text,
+                Err(err) => err.to_string(),
+            }));
+        }
+        result
+            .map(crate::tools::ToolOutput::Text)
             .map_err(|err| {
                 // Grant invalidation (spec 7.4): config removal, fingerprint
                 // drift, and live name/schema mismatch poison the pinned
