@@ -213,7 +213,7 @@ pub fn cfg() -> SessionConfig {
 }
 
 /// [`cfg`] with `client_input = exclusive`: only the input owner drives,
-/// the others are read-only until they take input (the default is shared).
+/// the others are read-only until they take input (also the config default).
 pub fn exclusive_cfg() -> SessionConfig {
     SessionConfig {
         client_input: Some(agent_engine::session::ClientInput::Exclusive),

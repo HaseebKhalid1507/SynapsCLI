@@ -120,6 +120,10 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- **`client_input` defaults to `exclusive`** (the 0.10.2 owner rule): only
+  the input owner types until another client uses `--takeover` or
+  `/takeover`. Set `client_input = shared` for 0.11.0's every-client-types
+  mode. A missing value on the wire still means `exclusive`.
 - **Automatic context management is on by default on Linux and macOS.** An
   unset `context_management.mode` (or no config file) now means `auto`: a
   session plans a wrap-up and hands over to a fresh context window before the

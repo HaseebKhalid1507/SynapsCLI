@@ -100,8 +100,9 @@ struct Cli {
     /// (the daemon is started on first use). Optionally a session ID (prefix
     /// ok) or name (`--name`); with no live session a new one is created
     /// (`--continue` continues); --new (alias --create) forces a fresh
-    /// session even if one is live. Every attached client can type (config
-    /// `client_input = shared`, the default). Modifiers: --observe
+    /// session even if one is live. By default only the input owner types
+    /// (config `client_input = exclusive`); with `client_input = shared`
+    /// every attached client can. Modifiers: --observe
     /// (read-only), --takeover (take input under `client_input = exclusive`),
     /// --keep-warm (never parked), --new (fresh session);
     /// SYNAPS_ATTACH_MODE=observe|takeover sets the default mode.
@@ -114,7 +115,7 @@ struct Cli {
 
     /// With --attach: take input ownership from the current owner (the
     /// previous owner is told). Only matters under `client_input =
-    /// exclusive`; with the default `shared` every client can already type.
+    /// exclusive` (the default); with `shared` every client can already type.
     #[arg(long, global = true)]
     takeover: bool,
 

@@ -107,7 +107,7 @@ A client picks its role at attach time. The role never changes during the attach
 ## 6. Input modes and the active client
 
 A session setting `client_input`, `shared | exclusive`:
-- It starts from config: `client_input = shared` is the config default.
+- It starts from config. The config default is `exclusive` (the 0.10.2 rule); `client_input = shared` opts in.
 - `/settings` changes it live through `SessionSetting::ClientInput`, echoed in `SettingChanged`. That new nested variant is sent only to clients declaring the `client_input` capability. Older clients just don't hear about the change.
 - **Wire default ≠ config default.** A snapshot from an older daemon has no `client_input` field, and a client must read that as `exclusive`, which was the old behaviour.
 
@@ -118,7 +118,7 @@ Both modes keep `input_owner`, renamed *active client* in docs and UI. Wire name
 - inbox accepting,
 - in `exclusive` mode, who may drive.
 
-### `shared` (default)
+### `shared`
 
 - **Drive clients may send every input command**, subject to §7. Observe and status clients are refused with "this client is read-only (observe)", not "input owned by …".
 - **Activity moves the active marker.**
@@ -131,7 +131,7 @@ Both modes keep `input_owner`, renamed *active client* in docs and UI. Wire name
 - **Attaching never moves the active marker** if someone already holds it, as in Mirror today. A new tab becomes active when you type in it. `--takeover` still makes the joiner active immediately.
 - **Concurrency is ordinary:** two tabs submitting at once is one user submitting twice. The actor already serialises commands, and a submit during a stream follows the existing queue and steer rules.
 
-### `exclusive`
+### `exclusive` (default)
 
 Exactly today's behaviour, with names in the texts. `/takeover` (#296) is the explicit handoff.
 

@@ -967,8 +967,8 @@ impl std::fmt::Display for CacheKeepWarm {
 ///   one that did last is the *active* client.
 /// - `Exclusive` (default): only the input owner may; the others are
 ///   read-only until they `/takeover` (the behaviour before
-///   `client_input`). PARITY: 790d R6, until JR answers E4 (upstream:
-///   `Shared` is the default).
+///   `client_input`). PARITY: the fork keeps the 0.10.2 owner rule as the
+///   default (790d R6, E4); upstream's default is `Shared`.
 ///
 /// On the wire a missing value means `Exclusive`: an older daemon enforces
 /// the owner.
@@ -976,7 +976,7 @@ impl std::fmt::Display for CacheKeepWarm {
 #[serde(rename_all = "snake_case")]
 pub enum ClientInput {
     Shared,
-    // PARITY: 790d R6, until JR answers E4 (upstream: `#[default]` on Shared).
+    // PARITY: 790d R6, E4 (upstream: `#[default]` on Shared).
     #[default]
     Exclusive,
 }
@@ -2176,7 +2176,7 @@ impl Default for SynapsConfig {
             cache_keepwarm_tools: true,
             request_compression: RequestCompressionMode::Auto,
             request_compression_level: DEFAULT_REQUEST_COMPRESSION_LEVEL,
-            client_input: ClientInput::Exclusive, // PARITY: 790d R6, until JR answers E4 (upstream: Shared)
+            client_input: ClientInput::Exclusive, // PARITY: 790d R6, E4 (upstream: Shared)
             thinking_display: ThinkingDisplay::Summarized,
             max_fps: 60,
             scroll_lines: None,
@@ -5950,7 +5950,7 @@ mod tests {
 
     #[test]
     fn test_client_input_is_exclusive_by_default_and_parses() {
-        // PARITY: the default is Exclusive (790d R6, until JR answers E4).
+        // PARITY: the default is Exclusive (790d R6, E4).
         assert_eq!(SynapsConfig::default().client_input, ClientInput::Exclusive);
         assert_eq!(load_config_from_str("").client_input, ClientInput::Exclusive);
         assert_eq!(load_config_from_str("client_input = exclusive\n").client_input, ClientInput::Exclusive);

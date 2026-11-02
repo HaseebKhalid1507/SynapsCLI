@@ -196,7 +196,7 @@ Messages/View/PromptInspection answer, summary request, fork-child request,
 reload record or restored-session request, no log line at TRACE, and zero bytes
 of any file under the temp home.
 
-The sentinel test runs with `context_management = off`. Rollover, the warm
+The sentinel test runs with `context_management.mode = off`. Rollover, the warm
 summary and rollover archives are covered by the shared code path (the
 history, which holds only the placeholder), not by this test.
 
