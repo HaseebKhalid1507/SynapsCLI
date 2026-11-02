@@ -43,6 +43,7 @@ pub fn daemon_features() -> Vec<String> {
     features.push(FEATURE_THINKING_OPTIONS.to_string());
     features.push(FEATURE_MODEL_FAVORITES.to_string());
     features.push(FEATURE_SANDBOX_STATUS.to_string());
+    features.push(FEATURE_SKILLS_V1.to_string());
     features.push("ephemeral_layer_v1".to_string());
     features.push("memory_only_results_v1".to_string());
     features.push(crate::session::client_tools::FEATURE.to_string());
@@ -480,6 +481,11 @@ mod tests {
 
         favorites.cancel().await;
         assert!(favorites.start(async {}), "the slot is free again");
+    }
+
+    #[test]
+    fn the_daemon_lists_the_skills_v1_feature() {
+        assert!(daemon_features().iter().any(|f| f == FEATURE_SKILLS_V1));
     }
 
     #[test]

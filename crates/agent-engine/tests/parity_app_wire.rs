@@ -110,6 +110,7 @@ fn today_features() -> Vec<String> {
         "thinking_options",
         "model_favorites",
         "sandbox_status",
+        "skills_v1",
         "ephemeral_layer_v1",
         "memory_only_results_v1",
         "client_tools_v1",
