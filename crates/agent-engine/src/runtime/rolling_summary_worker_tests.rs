@@ -296,37 +296,129 @@ async fn starting_a_worker_run_binds_its_runtime_to_the_run_and_nothing_else() {
     assert_eq!(format!("{:?}", rt.memory_backend_for_test().scope().map(|s| s.key().to_owned())), binding, "the archive scope is unchanged");
 }
 
-/// Worker successor trial (pins c, e): `subagent.context_target_tokens`
-/// reaches the snapshot workers inherit and nothing of the main session:
-/// its own continuation settings (an explicit target included) are what
-/// they are without the key, and its windows carry no worker marker. A
-/// worker run's runtime gets the key's target over the inherited one and
-/// the marker, which a reset of its binding keeps; unset, the marker says
-/// `auto`.
+/// The (target, summary) `rt`'s rollovers aim for, on the settings they
+/// run with on its window (`config_for_window`, as the stream takes them).
+fn runtime_aims(rt: &crate::Runtime) -> Result<(u64, u64), &'static str> {
+    let window = rt.context_window();
+    let config = rt
+        .continuation
+        .lock()
+        .unwrap()
+        .config_for_window(rt.context_window_override(), window);
+    ContextThresholds::resolve(&config, window)
+        .map(|t| (t.target_tokens(&config), t.summary_tokens(&config)))
+}
+
+/// `rt`'s whole settled context policy, as text: its configured settings,
+/// its window and window setting, the settings its rollovers run with on
+/// that window, their thresholds and aims, its worker marker and the
+/// `/context-management status` text.
+fn settled(rt: &crate::Runtime) -> String {
+    let window = rt.context_window();
+    let setting = rt.context_window_override();
+    let mut s = rt.continuation.lock().unwrap();
+    let running = s.config_for_window(setting, window);
+    let (configured, marker) = (s.config, s.worker_target);
+    drop(s);
+    format!(
+        "configured {configured:?}\nwindow {window} (setting {setting:?})\nrunning {running:?}\n\
+         thresholds {:?}\naims {:?}\nmarker {marker:?}\n{}\n",
+        ContextThresholds::resolve(&running, window),
+        runtime_aims(rt),
+        rt.context_management_status()
+    )
+}
+
+/// The main session's whole settled policy and the snapshot its workers
+/// inherit, then for each worker model the context a worker run started
+/// from it resolves (refusals included) and that run's runtime settled
+/// after the run's start and a reset of its binding.
+fn settled_with_workers(main: &crate::Runtime) -> String {
+    let mut out = format!(
+        "main {}snapshot {:?}\n",
+        settled(main),
+        main.worker_context_policy()
+    );
+    for model in [SONNET, "claude-opus-4-6", CODEX] {
+        let context = main.worker_context_policy().resolve(model);
+        out += &format!("worker on {model}: {context:?}\n");
+        if let Ok(context) = &context {
+            let mut worker = crate::Runtime::new_headless();
+            worker.set_model(model.to_string());
+            worker.start_worker_run("worker-run:0123", context, &[]);
+            worker.reset_context_continuation("worker-run:0123", &[]);
+            out += &settled(&worker);
+        }
+    }
+    out
+}
+
+/// Worker successor trial (pins c, e; 790d i, ii):
+/// `subagent.context_target_tokens` reaches the snapshot workers inherit
+/// and nothing of the main session. Unset or `auto` (any case, or after a
+/// number) is no key at all: for several shapes (defaults, an inherited
+/// target, a 1M window, thresholds a worker's window resets, context
+/// management off) the parsed config and the whole settled context
+/// policy of the main session and of every worker run (configured and
+/// running settings, thresholds, aims, notice, marker, status) are
+/// byte-identical to the config without the line. Set alongside
+/// `context_management.target_tokens`, the main session settles exactly
+/// as without the key and aims for its own target, and its windows carry
+/// no worker marker. A worker run's runtime gets the key's target over the
+/// inherited one and the marker, which a reset of its binding keeps;
+/// unset, the marker says `auto`.
 #[tokio::test]
 #[serial_test::serial(synaps_base_dir)]
 async fn the_worker_successor_target_reaches_worker_runs_only() {
     use crate::runtime::context_telemetry::WorkerTarget;
     let _base = crate::test_env::BaseDirGuard::new();
-    let config = |key| crate::config::SynapsConfig {
-        context_management: ContextManagementConfig {
-            mode: ContextManagementMode::Auto,
-            target_tokens: Some(90_000),
-            ..Default::default()
-        },
-        subagent: crate::config::SubagentLimits {
-            context_target_tokens: key,
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-    let main_on = |key| {
+    let main_on = |text: &str| {
         let mut rt = crate::Runtime::new_headless();
-        rt.apply_config(&config(key));
+        rt.apply_config(&crate::config::load_config_from_str(text));
         rt.set_model(SONNET.to_string());
         rt
     };
-    let (today, main) = (main_on(None), main_on(Some(48_000)));
+    let reset = "context_window = 1m\ncontext_management.pressure_tokens = 600000\n\
+                 context_management.rollover_tokens = 800000\n\
+                 context_management.target_tokens = 300000\n\
+                 context_management.summary_tokens = 20000\n";
+    for shape in [
+        "",
+        "context_management.target_tokens = 90000\n",
+        "context_window = 1m\n",
+        reset,
+        "context_management.mode = off\n",
+    ] {
+        let parsed = format!("{:?}", crate::config::load_config_from_str(shape));
+        let no_key = settled_with_workers(&main_on(shape));
+        for key in [
+            "auto",
+            "AUTO",
+            " Auto ",
+            "48000\nsubagent.context_target_tokens = auto",
+        ] {
+            let text = format!("{shape}subagent.context_target_tokens = {key}\n");
+            assert_eq!(
+                format!("{:?}", crate::config::load_config_from_str(&text)),
+                parsed,
+                "{text:?}"
+            );
+            assert_eq!(settled_with_workers(&main_on(&text)), no_key, "{text:?}");
+        }
+    }
+    assert!(
+        settled_with_workers(&main_on(reset)).contains("rollover thresholds reset"),
+        "the shapes include a worker's reset notice"
+    );
+    let inherited = "context_management.mode = auto\ncontext_management.target_tokens = 90000\n";
+    let (today, main) = (
+        main_on(inherited),
+        main_on(&format!(
+            "{inherited}subagent.context_target_tokens = 48000\n"
+        )),
+    );
+    assert_eq!(settled(&main), settled(&today), "the main session's own");
+    assert_eq!(runtime_aims(&main), Ok((90_000, 13_500)));
     let main_config = main.continuation.lock().unwrap().config;
     assert_eq!(
         main_config,
@@ -346,7 +438,10 @@ async fn the_worker_successor_target_reaches_worker_runs_only() {
             ..today.worker_context_policy()
         }
     );
-    for (parent, marker, target) in [(&main, Some(48_000), 48_000), (&today, None, 90_000)] {
+    for (parent, marker, target, summary) in [
+        (&main, Some(48_000), 48_000, 7_200),
+        (&today, None, 90_000, 13_500),
+    ] {
         let context = parent
             .worker_context_policy()
             .resolve(SONNET)
@@ -355,6 +450,7 @@ async fn the_worker_successor_target_reaches_worker_runs_only() {
         worker.set_model(SONNET.to_string());
         worker.start_worker_run("worker-run:0123", &context, &[]);
         worker.reset_context_continuation("worker-run:0123", &[]);
+        assert_eq!(runtime_aims(&worker), Ok((target, summary)));
         let s = worker.continuation.lock().unwrap();
         assert_eq!(s.config.target_tokens, Some(target));
         assert_eq!(

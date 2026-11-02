@@ -1044,6 +1044,86 @@ async fn o5b_e9_a_worker_under_ours_rolls_over_once_and_upstreams_rollover_never
     assert!(transcripts.is_empty(), "upstream's transcripts: {transcripts:?}");
 }
 
+/// Worker successor trial (790d iii, pin d end to end): a worker target
+/// that does not fit (60,000 is not below the parent's 60k pressure
+/// threshold) is said once per worker, not once per rollover. The worker
+/// is resolved once, at its launch: it rolls over three times on the
+/// inherited 25k target and its result carries the one `[rollover]` line
+/// saying so, never a `[rollover notice]` per window; nothing of it is
+/// sent live, and its log has it once (the result's).
+#[tokio::test]
+#[serial_test::serial(synaps_base_dir)]
+async fn o5c_a_worker_target_that_does_not_fit_is_said_once_per_worker_not_per_rollover() {
+    let script = |n: usize, summaries: usize| {
+        if summaries >= 3 {
+            Reply::Text("gate ok".into())
+        } else if n >= 60 {
+            Reply::Text("no third rollover".into())
+        } else {
+            Reply::ToolUse(long_round(n))
+        }
+    };
+    let env = env(Summary::Answer, script).await;
+    let policy = crate::tools::WorkerContextPolicy {
+        worker_target_tokens: Some(60_000),
+        ..rollover_policy()
+    };
+    let planned = run(&env, Some(policy), 240, true).await;
+    assert_eq!(
+        env.stand.summaries(),
+        3,
+        "three rollovers: {}",
+        short(&planned.result)
+    );
+    assert!(
+        planned.result.contains("gate ok"),
+        "{}",
+        short(&planned.result)
+    );
+    let fin = final_of(&env, &planned.handle);
+    assert_eq!(fin.status, "completed");
+    assert_eq!((fin.window_ordinal, fin.rollovers_this_run), (4, 3));
+    const KEY: &str = "subagent.context_target_tokens";
+    assert_eq!(
+        planned.result.matches(KEY).count(),
+        1,
+        "{}",
+        short(&planned.result)
+    );
+    let lines = trailer_lines(&planned.result);
+    let said = lines[0]
+        .strip_prefix("[rollover]: ")
+        .unwrap_or_else(|| panic!("{lines:?}"));
+    assert!(
+        said.starts_with(
+            "subagent.context_target_tokens (60000) does not fit this worker: target_tokens \
+             must be below pressure_tokens (window "
+        ) && said.ends_with(" tokens); using the inherited target (25000 tokens)"),
+        "{said}"
+    );
+    assert_eq!(
+        lines[1], "[rollover windows]: window 4; rollovers this run: 3",
+        "{lines:?}"
+    );
+    assert!(
+        lines[2..].iter().all(|line| !line.contains(KEY)),
+        "{lines:?}"
+    );
+    let updates = planned.updates();
+    assert!(updates.iter().all(|u| !u.contains(KEY)), "{updates:?}");
+    let events = planned.events_text();
+    assert!(
+        events.matches(KEY).count() <= 1,
+        "at most the completion's preview: {events}"
+    );
+    assert_eq!(
+        planned.log.matches(KEY).count(),
+        1,
+        "{}",
+        short(&planned.log)
+    );
+}
+
 /// o6: a run whose deadline falls inside its rollover's summary times out
 /// at the deadline, well inside the summary's own timeout: the summary
 /// waits at most until the run deadline (§5) and is never adopted. Its
