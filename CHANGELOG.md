@@ -6,6 +6,17 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Windows: the `grep`, `find` and `ls` tools work.** They ran the bare
+  program names: a stock Windows has no `grep` or `ls` ("program not
+  found"), and `find` resolved to `System32\find.exe`, an unrelated string
+  search, so the find tool reported "No files found" for files that exist.
+  They now run GNU builds: from a `PATH` directory outside the Windows
+  directory, else from Git for Windows' `usr\bin` (found next to `git.exe`
+  on `PATH` or in the standard install folders). Without one, the call says
+  to install Git for Windows or use the `powershell` tool. Git's tools are
+  MSYS programs, which expand wildcards in their own arguments when started
+  from a non-MSYS process (`-name "*.txt"` became file names), so they run
+  with `noglob` added to `MSYS`. Linux and macOS are unchanged.
 - **Windows: the `powershell` tool can run scripts.** A stock Windows
   client has the `Restricted` execution policy, so `.\test.ps1` failed with
   "running scripts is disabled on this system" and the model had to retry

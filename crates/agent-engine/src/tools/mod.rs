@@ -25,6 +25,7 @@ mod multi_edit;
 #[cfg(feature = "command-exec")]
 mod powershell;
 pub(crate) mod read;
+mod unix_programs;
 mod secret_prompt;
 mod subagent;
 #[cfg(target_os = "linux")]
