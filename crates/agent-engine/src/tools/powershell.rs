@@ -1,7 +1,7 @@
 //! `powershell` tool — Windows-native shell execution.
 //!
 //! Registered only on Windows. Wraps the shared `run_shell_command` core with
-//! the PowerShell invocation (`-NoProfile -Command`). This gives the model a
+//! the PowerShell invocation (`-NoProfile -ExecutionPolicy Bypass -Command`). This gives the model a
 //! native shell on Windows hosts: no quoting translation through bash, no
 //! WSL/Git-Bash path impedance, native cmdlets (`Get-Process`, `Get-ChildItem`),
 //! and direct access to Windows paths.
@@ -30,9 +30,12 @@ impl Tool for PowerShellTool {
     fn description(&self) -> &str {
         "Execute a PowerShell command on the Windows host. Use this for Windows-native tasks: \
          file system operations on C:\\ paths, registry, services, processes, Windows APIs. \
-         PowerShell quoting rules apply — single quotes are literal, double quotes interpolate \
-         ($var, `n). Native cmdlets like Get-Process, Get-ChildItem, Test-Path are available. \
-         Commands time out after 30 seconds by default; pass a larger timeout when needed."
+         Runs in PowerShell 7 (pwsh) when installed, else Windows PowerShell 5.1; don't start \
+         another powershell or pwsh inside it. Scripts may run: call them directly, e.g. \
+         .\\test.ps1. PowerShell quoting rules apply — single quotes are literal, double quotes \
+         interpolate ($var, `n). Native cmdlets like Get-Process, Get-ChildItem, Test-Path are \
+         available. Commands time out after 30 seconds by default; pass a larger timeout when \
+         needed."
     }
 
     fn parameters(&self) -> Value {

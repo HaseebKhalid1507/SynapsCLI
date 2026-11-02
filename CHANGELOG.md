@@ -6,6 +6,34 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Windows: the `grep`, `find` and `ls` tools work.** They ran the bare
+  program names: a stock Windows has no `grep` or `ls` ("program not
+  found"), and `find` resolved to `System32\find.exe`, an unrelated string
+  search, so the find tool reported "No files found" for files that exist.
+  They now run GNU builds: from a `PATH` directory outside the Windows
+  directory, else from Git for Windows' `usr\bin` (found next to `git.exe`
+  on `PATH` or in the standard install folders). Without one, the call says
+  to install Git for Windows or use the `powershell` tool. Git's tools are
+  MSYS programs, which expand wildcards in their own arguments when started
+  from a non-MSYS process (`-name "*.txt"` became file names), so they run
+  with `noglob` added to `MSYS`. Linux and macOS are unchanged.
+- **Windows: the `powershell` tool can run scripts.** A stock Windows
+  client has the `Restricted` execution policy, so `.\test.ps1` failed with
+  "running scripts is disabled on this system" and the model had to retry
+  with `powershell -ExecutionPolicy Bypass -File …`. The tool now starts
+  PowerShell with `-ExecutionPolicy Bypass` (process scope, inherited by the
+  PowerShells a command starts; a Group Policy setting still wins). Its
+  description says which PowerShell runs (7 when installed, else 5.1), not
+  to start another one inside it, and to call scripts directly; on a
+  machine without PowerShell 7 the model had first tried `pwsh`.
+- **Windows: grep and find cards show short paths.** Card rows kept full
+  `C:\Users\…\project\./src\file` paths, and grep rows were not
+  highlighted (the row was split at the drive colon). Paths under the
+  session folder now show relative to it and paths under the user profile
+  as `~\…`, matched case-insensitively with either separator, as on Linux.
+  On every platform, the `./` a tool given the path `.` leaves after the
+  session folder is dropped (`src/main.rs`, not `./src/main.rs`). Display
+  only: the tool result is unchanged.
 - **A one-shot `subagent` result keeps its responses apart.** Text from
   each of the worker's responses was joined with nothing between them, so
   the result (what the parent model reads, and the subagent card) ran

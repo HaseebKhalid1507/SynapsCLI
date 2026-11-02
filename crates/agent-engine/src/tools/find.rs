@@ -82,10 +82,7 @@ fn build_command(params: &Value, ctx: &ToolContext) -> Result<Command> {
         }
     }
 
-    let mut cmd = Command::new("find");
-    if let Some(env) = &ctx.capabilities.env {
-        cmd.env_clear().envs(env.iter().map(|(k, v)| (k, v)));
-    }
+    let mut cmd = super::unix_programs::unix_tool_command("find", ctx)?;
     cmd.arg(&path);
 
     cmd.args(["-not", "-path", "*/.git/*"]);
@@ -164,7 +161,7 @@ mod tests {
             let cmd = build_command(&json!({"pattern": "*", "path": p}), &ctx).unwrap();
             let first = first_arg(&cmd);
             assert!(!first.starts_with('-'), "{p} became argv[1] {first:?}");
-            assert_eq!(first, format!("./{p}"));
+            assert_eq!(first, format!(".{}{p}", std::path::MAIN_SEPARATOR));
         }
         // Ordinary paths are untouched.
         let cmd = build_command(&json!({"pattern": "*", "path": "src"}), &ctx).unwrap();
@@ -179,7 +176,11 @@ mod tests {
         let ctx = create_tool_context();
         for p in ["!", "(", ")", ",", "!foo", "(x"] {
             let cmd = build_command(&json!({"pattern": "*", "path": p}), &ctx).unwrap();
-            assert_eq!(first_arg(&cmd), format!("./{p}"), "path {p:?}");
+            assert_eq!(
+                first_arg(&cmd),
+                format!(".{}{p}", std::path::MAIN_SEPARATOR),
+                "path {p:?}"
+            );
         }
     }
 
@@ -209,6 +210,29 @@ mod tests {
         cmd.current_dir(dir.path());
         let _ = cmd.output().await.unwrap();
         assert!(victim.exists(), "find path:-delete removed files");
+    }
+
+    /// Run from a folder whose own names match the patterns. Git for
+    /// Windows' find is an MSYS program, which expands wildcards in its argv
+    /// against its cwd unless MSYS has `noglob`: `-name *.txt` became
+    /// `-name a.txt b.txt` and `*/.git/*` became file names, so find failed.
+    #[tokio::test]
+    async fn patterns_reach_find_unexpanded_and_git_stays_excluded() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("sub/.git")).unwrap();
+        for f in ["a.txt", "b.txt", "sub/c.txt", "sub/.git/d.txt"] {
+            std::fs::write(dir.path().join(f), "").unwrap();
+        }
+        let ctx = create_tool_context();
+        let mut cmd = build_command(&json!({"pattern": "*.txt", "path": "."}), &ctx).unwrap();
+        cmd.current_dir(dir.path());
+        let out = cmd.output().await.unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout).replace('\\', "/");
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        for f in ["a.txt", "b.txt", "sub/c.txt"] {
+            assert!(stdout.contains(f), "{f} missing from {stdout}");
+        }
+        assert!(!stdout.contains("d.txt"), ".git leaked: {stdout}");
     }
 
     #[test]
