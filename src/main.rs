@@ -578,6 +578,11 @@ fn thin_client_from<I: IntoIterator<Item = String>>(
                 continue;
             }
         }
+        if matches!(a.as_str(), "--help" | "-h" | "--version" | "-V") {
+            // Help and version print and exit in clap; they must never start
+            // or adopt a daemon (`synaps attach --help` spawned one).
+            return None;
+        }
         if a == "--attach" || a.starts_with("--attach=") {
             attach_flag = true;
             maybe_value = a == "--attach";
@@ -1109,6 +1114,33 @@ mod worker_threads_tests {
         // `--attach` next to a subcommand is not the TUI attach path
         assert_eq!(thin_client_from(v(&["daemon", "status", "--attach"]), true, false), None);
         assert_eq!(thin_client_from(v(&[]), true, false), None);
+    }
+
+    /// `synaps attach --help` started a daemon before clap printed the help.
+    /// Help and version never take the thin-client path (which spawns one).
+    #[test]
+    fn help_and_version_never_take_the_daemon_path() {
+        use super::ThinClient::Line;
+        for flag in ["--help", "-h", "--version", "-V"] {
+            for argv in [
+                &["attach", flag][..],
+                &[flag, "attach"],
+                &["attach", "--create", flag],
+                &["--attach", flag],
+                &["--attach", "abc", flag],
+                &["--profile", "x", "attach", flag],
+                &[flag],
+            ] {
+                for adopt in [false, true] {
+                    assert_eq!(thin_client_from(v(argv), true, adopt), None, "{argv:?} adopt={adopt}");
+                }
+            }
+        }
+        // a value that looks like a help flag is still a value
+        assert_eq!(
+            thin_client_from(v(&["--system", "-h", "attach"]), true, false),
+            Some(Line { profile: None })
+        );
     }
 
     #[test]
