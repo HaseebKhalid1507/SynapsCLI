@@ -40,7 +40,7 @@ fn fixed_now() -> chrono::DateTime<chrono::Local> {
 
 fn run_with(params: Value, hooks: &mut dyn commit::Hooks) -> std::result::Result<String, String> {
     let req = parse_request(&params)?;
-    run(req, fixed_now(), None, &|_: &str| false, hooks)
+    run(req, fixed_now(), None, &|_: &str| false, &|_, _, _| Ok(()), hooks)
 }
 
 // A.1: a missing anchor anywhere refuses the whole call; no file changes.
@@ -625,7 +625,7 @@ impl SwapParent {
     fn call(&mut self, edit: Value) -> std::result::Result<String, String> {
         let req = parse_request(&json!({ "edits": [edit] })).unwrap();
         let denied = p(&self.denied);
-        run(req, fixed_now(), None, &|s: &str| s.starts_with(&denied), self)
+        run(req, fixed_now(), None, &|s: &str| s.starts_with(&denied), &|_, _, _| Ok(()), self)
     }
 }
 

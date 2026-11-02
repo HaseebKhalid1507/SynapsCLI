@@ -181,6 +181,12 @@ mod imp {
             Dir::open(&self.path).is_ok_and(|now| now.identity == self.identity)
         }
 
+        /// The handle itself (owner rule 27c checks it).
+        pub(crate) fn fd(&self) -> std::os::fd::BorrowedFd<'_> {
+            use std::os::fd::AsFd;
+            self.fd.as_fd()
+        }
+
         /// `fstatat(name, AT_SYMLINK_NOFOLLOW)`.
         pub(crate) fn lstat(&self, name: &OsStr) -> io::Result<Meta> {
             let name = cstr(name)?;

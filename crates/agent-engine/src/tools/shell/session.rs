@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::sandbox::{OutputCheck, SpawnSandbox};
 use crate::tools::strip_ansi;
 use crate::{Result, RuntimeError};
 
@@ -45,6 +46,9 @@ struct ShellSession {
     last_active: Instant,
     idle_timeout: Duration,
     status: SessionStatus,
+    /// The write sandbox's check of everything the shell prints (`None`:
+    /// the shell runs unsandboxed).
+    sandbox: Option<OutputCheck>,
 }
 
 /// Lifecycle status of a session.
@@ -190,6 +194,31 @@ fn status_string(status: &SessionStatus) -> String {
     }
 }
 
+/// A sandboxed shell's output with the sandbox's hint appended when it
+/// shows a refused write or sudo (each finding logged, as for `bash`);
+/// unchanged otherwise, and for an unsandboxed shell. `input` is what
+/// produced the output (the shell's command, the text sent to it, or
+/// nothing): a refused sudo counts only when it runs sudo. A streamed
+/// call's model history is its delta lane, not this return value: the hint
+/// goes there too.
+fn checked(
+    check: Option<&OutputCheck>,
+    tx_delta: Option<&crate::tools::output::DeltaSender>,
+    input: &str,
+    mut output: String,
+) -> String {
+    if let Some(check) = check {
+        let hint = check.hint(input, &output);
+        if let Some(tx) = tx_delta {
+            if !hint.is_empty() {
+                tx.send(hint.clone());
+            }
+        }
+        output.push_str(&hint);
+    }
+    output
+}
+
 /// Wait for output from the PTY until the readiness detector signals completion.
 ///
 /// Returns `(normalized_output, status_string)` where status is one of
@@ -305,14 +334,25 @@ impl SessionManager {
         tx_delta: Option<&crate::tools::output::DeltaSender>,
         max_output: usize,
     ) -> Result<(String, String, String)> {
-        self.create_session_cancellable(opts, tx_delta, max_output, None).await
+        self.create_session_cancellable(opts, tx_delta, max_output, None, &SpawnSandbox::None).await
     }
 
+    /// [`SessionManager::create_session`], abandoned before the spawn when
+    /// `cancel` fires, with the session's write-sandbox decision for the
+    /// shell: `Apply` starts it confined (and everything sent to it runs
+    /// inside), `Refuse` creates nothing. A confined shell's output (this
+    /// first output, each [`SessionManager::send_input`]'s and the final
+    /// one read at [`SessionManager::close_session`]) is checked as bash's
+    /// is: a refused write or sudo gets the hint and its log lines.
     pub(crate) async fn create_session_cancellable(
         &self, opts: SessionOpts,
         tx_delta: Option<&crate::tools::output::DeltaSender>, max_output: usize,
         cancel: Option<&crate::CancellationToken>,
+        sandbox: &SpawnSandbox,
     ) -> Result<(String, String, String)> {
+        if let SpawnSandbox::Refuse(msg) = sandbox {
+            return Err(RuntimeError::Tool(msg.clone()));
+        }
         // --- Check session limit ---
         {
             let sessions = self
@@ -371,8 +411,9 @@ impl SessionManager {
             return Err(RuntimeError::Tool("Shell canceled before launch".into()));
         }
         let mut pty = PtyHandle::spawn_prepared(
-            &command, opts.working_directory.as_deref(), rows, cols, prepared,
+            &command, opts.working_directory.as_deref(), rows, cols, prepared, sandbox,
         )?;
+        pty.watch_child(tx_delta.and_then(|delta| delta.child_sink()), &id);
 
         // --- Build readiness detector (with per-session overrides) ---
         let silence_ms = opts
@@ -400,6 +441,8 @@ impl SessionManager {
             max_output,
         )
         .await;
+        let check = sandbox.output_check();
+        let initial_output = checked(check.as_ref(), tx_delta, &command, initial_output);
 
         let now = Instant::now();
         let status = if status_str.starts_with("exited") {
@@ -416,6 +459,7 @@ impl SessionManager {
             last_active: now,
             idle_timeout,
             status,
+            sandbox: check,
         };
 
         // --- Insert into map ---
@@ -488,7 +532,8 @@ impl SessionManager {
         }
 
         let result = SendResult {
-            output,
+            // The bytes the shell got (escapes processed), not the raw input.
+            output: checked(session.sandbox.as_ref(), tx_delta, &processed, output),
             status: status_str,
         };
 
@@ -531,6 +576,9 @@ impl SessionManager {
         } else {
             strip_ansi(&final_text)
         };
+        // Not streamed: the return value is the model's history. Nothing
+        // was sent, so a refused sudo here is not attributed to one.
+        let final_output = checked(session.sandbox.as_ref(), None, "", final_output);
 
         // PtyHandle::drop will kill the child process.
         drop(session);
@@ -678,13 +726,60 @@ mod tests {
         }
     }
 
+    /// shell_start reports its PTY child with the shell session id; the end
+    /// comes once, at shell_end (a kill) or at the child's own exit.
+    /// shell_end's hang-up is portable-pty's SIGHUP: an interactive bash
+    /// dies of it and reads signal 1, or, if it isn't reaped within the
+    /// drop's bounded wait, ends with its status unknown.
+    /// Serial with the PTY accounting tests: its unread prompt is retained
+    /// output while it runs.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_shell_child_is_reported_with_its_session_id_and_ends_once() {
+        use crate::session::child_events::{ChildProcessEvent, ChildRoute};
+        let (route, mut rx) = ChildRoute::channel("shell-test-session");
+        let mut tx = crate::tools::output::delta_channel().sender;
+        tx.set_child_sink(route.sink("toolu_shell", "shell_start"));
+        let mgr = default_manager();
+
+        let (id, _, _) = mgr.create_session(opts_for("bash --norc --noprofile"), Some(&tx), 256 * 1024).await.unwrap();
+        let spawned = match rx.try_recv().expect("tool_child at start") {
+            ChildProcessEvent::Spawned(spawn) => spawn,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!((spawned.tool_id.as_str(), spawned.tool_name.as_str()), ("toolu_shell", "shell_start"));
+        assert_eq!(spawned.shell_session_id.as_deref(), Some(id.as_str()));
+        assert_eq!((spawned.child.sid, spawned.child.pgid), (spawned.child.pid, spawned.child.pid), "a session leader");
+        assert!(rx.try_recv().is_err(), "nothing else while it runs");
+        mgr.close_session(&id).await.unwrap();
+        match rx.try_recv().expect("ended at shell_end") {
+            ChildProcessEvent::Ended { tool_id, child, exit_code, signal, .. } => {
+                assert_eq!((tool_id.as_str(), &child), ("toolu_shell", &spawned.child));
+                assert_eq!(exit_code, None);
+                assert!(matches!(signal, Some(1) | None), "the hang-up's signal, got {signal:?}");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(rx.try_recv().is_err(), "exactly once");
+
+        // A child that exits on its own reports its code.
+        let (id, _, _) = mgr.create_session(opts_for("false"), Some(&tx), 256 * 1024).await.unwrap();
+        assert!(matches!(rx.try_recv(), Ok(ChildProcessEvent::Spawned(_))));
+        mgr.close_session(&id).await.unwrap();
+        match rx.try_recv().expect("ended") {
+            ChildProcessEvent::Ended { exit_code, signal, .. } => assert_eq!((exit_code, signal), (Some(1), None)),
+            other => panic!("{other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn canceled_creation_never_spawns_or_registers_a_shell() {
         let mgr = default_manager();
         let token = crate::CancellationToken::new();
         token.cancel();
         let error = mgr.create_session_cancellable(opts_for("echo should-not-run"), None,
-            256 * 1024, Some(&token)).await.unwrap_err().to_string();
+            256 * 1024, Some(&token), &SpawnSandbox::None).await.unwrap_err().to_string();
         assert!(error.contains("canceled before launch"), "{error}");
         assert!(mgr.sessions.lock().unwrap().is_empty());
     }

@@ -1,4 +1,5 @@
 use super::{strip_ansi, Tool, ToolContext};
+use crate::sandbox::SpawnSandbox;
 use crate::{Result, RuntimeError};
 use serde_json::{json, Value};
 use zeroize::Zeroizing;
@@ -292,7 +293,7 @@ impl Tool for BashTool {
     }
 
     fn description(&self) -> &str {
-        "Execute a bash command and return its output. Use for running programs, installing packages, git operations, and any shell commands. Commands time out after 30 seconds by default; pass a larger timeout when needed. Stdin is empty. On Linux, if sudo needs a password, the user is asked in the TUI, shown the command sudo will run, and the password goes only to sudo, never to the model. Other password prompts are not answered."
+        "Execute a bash command and return its output. Use for running programs, installing packages, git operations, and any shell commands. Commands time out after the configured default (30 seconds unless changed); pass a larger timeout when needed. Stdin is empty. On Linux, if sudo needs a password, the user is asked in the TUI, shown the command sudo will run, and the password goes only to sudo, never to the model. Other password prompts are not answered."
     }
 
     fn parameters(&self) -> Value {
@@ -305,7 +306,7 @@ impl Tool for BashTool {
                 },
                 "timeout": {
                     "type": "integer",
-                    "description": "Timeout in seconds (default: 30). Use a larger value for long-running commands."
+                    "description": "Timeout in seconds (default: the configured bash_timeout, 30 unless changed). Use a larger value for long-running commands. A request above the configured bash_max_timeout (300 unless changed; 0 means no cap) is lowered to it, and the result says so."
                 }
             },
             "required": ["command"]
@@ -317,7 +318,26 @@ impl Tool for BashTool {
             .as_str()
             .ok_or_else(|| RuntimeError::Tool("Missing command parameter".to_string()))?;
 
-        run_bash(command, params["timeout"].as_u64(), ctx, prepare_askpass()).await
+        let timeout = params["timeout"].as_u64();
+        // Per-session write sandbox (crate::sandbox): decided at every spawn.
+        let sandbox = match ctx.capabilities.sandbox.as_ref() {
+            Some(binding) => binding.prepare("bash"),
+            None => SpawnSandbox::None,
+        };
+        match &sandbox {
+            // Unsandboxed: sudo asks only through the verified askpass
+            // helper (Linux), or never (`-n`).
+            SpawnSandbox::None => run_bash(command, timeout, ctx, prepare_askpass()).await,
+            // The sandbox wins over askpass: no broker is prepared. The
+            // prelude's `sudo` refuses at once (under no_new_privs setuid
+            // can't raise privileges anyway), and the result gets the hint.
+            #[cfg(target_os = "linux")]
+            SpawnSandbox::Apply(p) => {
+                let script = p.bash_script(command);
+                run_shell_command(&script, ShellSpec::Bash, timeout, ctx, None, &sandbox).await
+            }
+            SpawnSandbox::Refuse(msg) => Err(RuntimeError::Tool(msg.clone())),
+        }
     }
 }
 
@@ -341,6 +361,9 @@ fn prepare_askpass() -> Option<Askpass> {
     }
 }
 
+/// The unsandboxed bash run (`SpawnSandbox::None`): `sudo` asks through
+/// `askpass` when there is one, else never. A sandboxed spawn does not come
+/// here (see `BashTool::execute`): under the sandbox sudo is refused.
 pub(crate) async fn run_bash(
     command: &str,
     timeout: Option<u64>,
@@ -348,7 +371,7 @@ pub(crate) async fn run_bash(
     askpass: Option<Askpass>,
 ) -> Result<String> {
     let script = bash_script_with_secure_sudo(command, askpass.is_some());
-    run_shell_command(&script, ShellSpec::Bash, timeout, ctx, askpass).await
+    run_shell_command(&script, ShellSpec::Bash, timeout, ctx, askpass, &SpawnSandbox::None).await
 }
 
 /// Kills the command's whole process group unless the command finished on
@@ -439,14 +462,23 @@ impl ShellSpec {
 /// sudo askpass broker (bash on Linux), truncation, timeout. The only
 /// per-shell differences are which program is spawned and which args it
 /// takes. Nothing the command prints can raise a password prompt: only a
-/// verified sudo can, through `askpass`.
+/// verified sudo can, through `askpass`. `sandbox` is the spawn's
+/// write-sandbox decision: `Apply` restricts the child (a second `pre_exec`
+/// hook, after setsid) and annotates its output, and never runs with
+/// `askpass` (the sandbox wins: sudo is refused inside it); `None` changes
+/// nothing. (`Refuse` never gets here: the caller returns its text.)
 pub(crate) async fn run_shell_command(
     script: &str,
     spec: ShellSpec,
     requested_timeout: Option<u64>,
     ctx: ToolContext,
     askpass: Option<Askpass>,
+    sandbox: &SpawnSandbox,
 ) -> Result<String> {
+    // The sandbox wins: a restricted child gets no askpass broker, whoever
+    // the caller is (no `SUDO_ASKPASS`, no password prompt).
+    #[cfg(target_os = "linux")]
+    let askpass = if matches!(sandbox, SpawnSandbox::Apply(_)) { None } else { askpass };
     {
         let requested_timeout = requested_timeout.unwrap_or(ctx.limits.bash_timeout);
         // H5: enforce bash_max_timeout cap — prevent DoS via prompt injection
@@ -456,24 +488,37 @@ pub(crate) async fn run_shell_command(
         } else {
             requested_timeout
         };
+        // Once the command has launched, the agent learns that its timeout
+        // was lowered, whatever the outcome: the notice leads the returned
+        // text and the delta lane. Not covered: a command that never
+        // launches (spawn or I/O error; it ran under no timeout), an
+        // `after_tool_call` hook that replaces the result (a Replace is
+        // final; the hook receives the notice and decides), and a
+        // `max_tool_output` shorter than the notice itself.
+        let clamped = clamp_notice(requested_timeout, timeout_secs);
         let max_output = ctx.limits.max_tool_buffer;
 
         let (program, args) = spec.invocation(script);
-        let effective_env = ctx.capabilities.env.as_ref()
+        let mut effective_env: Vec<(std::ffi::OsString, std::ffi::OsString)> = ctx.capabilities.env.as_ref()
             .map(|env| env.iter().map(|(k, v)| (k.into(), v.into())).collect())
             .unwrap_or_else(crate::process_scope::inherited_env);
-        let probe_env = effective_env.clone();
         let probe_cwd = ctx.capabilities.cwd.clone();
         // This worker can only launch a bounded throwaway probe. Abandoning
         // this future can never launch the real command from the worker.
         if ctx.capabilities.launch_cancel.as_ref().is_some_and(|c| c.is_cancelled()) {
             return Err(RuntimeError::Tool("Command canceled before launch".into()));
         }
+        // The kill guard joins the env on the same worker (its first use
+        // writes the shim); probe and child see the guarded env, sandbox on
+        // or off (crate::killguard). Its macOS stand-in is decided here too
+        // (its first use probes sandbox-exec; crate::seatbelt).
         let probe_task = tokio::task::spawn_blocking(move || {
-            crate::process_scope::launcher_for_effective_env(
-                &probe_env, probe_cwd.as_deref(), crate::process_scope::ScopeKind::Tool)
+            crate::killguard::apply_env(&mut effective_env);
+            let launcher = crate::process_scope::launcher_for_effective_env(
+                &effective_env, probe_cwd.as_deref(), crate::process_scope::ScopeKind::Tool);
+            (launcher, effective_env, crate::seatbelt::tool_child())
         });
-        let launcher = if let Some(cancel) = &ctx.capabilities.launch_cancel {
+        let (launcher, effective_env, seatbelt) = if let Some(cancel) = &ctx.capabilities.launch_cancel {
             tokio::select! {
                 biased;
                 _ = cancel.cancelled() => return Err(RuntimeError::Tool("Command canceled before launch".into())),
@@ -488,6 +533,16 @@ pub(crate) async fn run_shell_command(
                     ctx.capabilities.cwd.as_deref()).map_err(|e| RuntimeError::Tool(e.to_string()))?, args),
             None => (program, args),
         };
+        // macOS: under sandbox-exec, the kill guard's stand-in. Elsewhere
+        // (process scopes are Linux-only) unchanged.
+        let (program, args) = seatbelt
+            .apply(
+                program,
+                args,
+                &effective_env,
+                ctx.capabilities.cwd.as_deref(),
+            )
+            .map_err(|e| RuntimeError::Tool(e.to_string()))?;
         let mut cmd = tokio::process::Command::new(program);
         if let Some(cwd) = ctx.capabilities.cwd.as_deref() {
             cmd.current_dir(cwd);
@@ -517,14 +572,42 @@ pub(crate) async fn run_shell_command(
             });
         }
 
+        // Per-session write sandbox: a second pre_exec hook, after setsid,
+        // sets no_new_privs and restricts the child before exec. If that
+        // fails, the spawn fails: nothing runs unrestricted.
+        #[cfg(target_os = "linux")]
+        if let SpawnSandbox::Apply(p) = sandbox {
+            p.install(cmd.as_std_mut()).map_err(|e| RuntimeError::Tool(format!("sandbox: {e}")))?;
+        }
+
         if ctx.capabilities.launch_cancel.as_ref().is_some_and(|c| c.is_cancelled()) {
             return Err(RuntimeError::Tool("Command canceled before launch".into()));
         }
-        let mut child = cmd.spawn().map_err(|e| RuntimeError::Tool(e.to_string()))?;
+        let mut child = cmd.spawn().map_err(|e| spawn_error(sandbox, e))?;
+        #[cfg(target_os = "linux")]
+        if let SpawnSandbox::Apply(p) = sandbox {
+            p.log_spawned(child.id());
+        }
         // Armed until the command finishes on its own: a timeout, a cancel,
         // the output cap or an abandoned password prompt kills the whole
         // process group, not just the shell.
         let mut group = KillGroupUnlessFinished::new(child.id());
+        // Report the child to its session (ledger first, then `tool_child`)
+        // before any output; its end is reported once at the reap, or as a
+        // kill when this future is dropped (timeout, cancel).
+        let mut watch = crate::session::child_events::ChildWatch::start(
+            ctx.channels.tx_delta.as_ref().and_then(|delta| delta.child_sink()),
+            child.id(),
+            None,
+        );
+        // In a streamed call the model's copy of a result that succeeds is
+        // this lane, not the returned text, so a lowered timeout is said
+        // here too: first, as in the returned text.
+        if let Some(ref txd) = ctx.channels.tx_delta {
+            if !clamped.is_empty() {
+                txd.send(clamped.clone());
+            }
+        }
 
         let stdout = child
             .stdout
@@ -573,6 +656,7 @@ pub(crate) async fn run_shell_command(
                     _ = password_cancel.cancelled() => {
                         group.kill_now();
                         let _ = child.kill().await;
+                        watch.killed();
                         return Err(RuntimeError::Tool(
                             "Command canceled while waiting for password".to_string(),
                         ));
@@ -623,6 +707,10 @@ pub(crate) async fn run_shell_command(
             // wait errors may mean the leader was already reaped externally;
             // never signal a potentially recycled process-group ID afterwards.
             group.finished();
+            match &status {
+                Ok(status) => watch.exited(status),
+                Err(_) => watch.end(None, None),
+            }
             let status = status.map_err(|e| RuntimeError::Tool(e.to_string()))?;
             // Finished on its own: leave anything it deliberately started in
             // the background (`server &`) running, as before.
@@ -634,8 +722,17 @@ pub(crate) async fn run_shell_command(
 
         match result {
             Ok(Ok((status, output, was_truncated))) => {
+                let hint = sandbox_hint(sandbox, script, &output);
                 if status.success() || was_truncated {
-                    Ok(output)
+                    // A successful command's model history is the delta lane
+                    // when it has one, not this return value: the hint goes
+                    // there too (like the truncation notice above).
+                    if let Some(ref txd) = ctx.channels.tx_delta {
+                        if !hint.is_empty() {
+                            txd.send(hint.clone());
+                        }
+                    }
+                    Ok(format!("{clamped}{output}{hint}"))
                 } else {
                     let mut notice = String::new();
                     // T5: when a command fails and references a stripped secret,
@@ -660,7 +757,7 @@ pub(crate) async fn run_shell_command(
                         }
                     }
                     Err(RuntimeError::Tool(format!(
-                        "Command failed (exit {}):\n{}{notice}",
+                        "{clamped}Command failed (exit {}):\n{}{notice}{hint}",
                         status.code().unwrap_or(-1),
                         output
                     )))
@@ -671,10 +768,53 @@ pub(crate) async fn run_shell_command(
                 e
             ))),
             Err(_) => Err(RuntimeError::Tool(format!(
-                "Command timed out after {}s",
+                "{clamped}Command timed out after {}s",
                 timeout_secs
             ))),
         }
+    }
+}
+
+/// The spawn error. A sandboxed spawn's failure (the restrict itself, or
+/// anything else) is also logged; nothing ran either way.
+fn spawn_error(sandbox: &SpawnSandbox, e: std::io::Error) -> RuntimeError {
+    #[cfg(target_os = "linux")]
+    if let SpawnSandbox::Apply(p) = sandbox {
+        crate::sandbox::log_line(&p.spawn_failed_line(&e));
+    }
+    let _ = sandbox;
+    RuntimeError::Tool(e.to_string())
+}
+
+/// `\n` + the sandbox hint for the output of a sandboxed `script` (built by
+/// `bash_script`), logging what was found; empty without a sandbox or a
+/// finding.
+fn sandbox_hint(sandbox: &SpawnSandbox, script: &str, output: &str) -> String {
+    #[cfg(target_os = "linux")]
+    if let SpawnSandbox::Apply(p) = sandbox {
+        if let Some(a) = p.annotate(p.command_in(script), output) {
+            for line in &a.lines {
+                crate::sandbox::log_line(line);
+            }
+            if !a.hint.is_empty() {
+                return format!("\n{}", a.hint);
+            }
+        }
+    }
+    let _ = (sandbox, script, output);
+    String::new()
+}
+
+/// The line a result starts with when `bash_max_timeout` lowered the timeout
+/// the command ran under (`requested` is the call's timeout, or the
+/// configured default when it gave none). First, so that output cut to the
+/// output limit (which keeps the head) still carries it. Empty when nothing
+/// was lowered.
+fn clamp_notice(requested: u64, effective: u64) -> String {
+    if effective < requested {
+        format!("[timeout clamped from {requested} s to {effective} s by bash_max_timeout]\n")
+    } else {
+        String::new()
     }
 }
 
@@ -697,6 +837,9 @@ fn references_env_name(script: &str, name: &str) -> bool {
     }
     false
 }
+
+#[cfg(all(test, target_os = "linux"))]
+mod sandbox_tests;
 
 #[cfg(test)]
 mod tests {
@@ -743,6 +886,57 @@ mod tests {
             .await.unwrap_err().to_string();
         assert!(error.contains("canceled before launch"), "{error}");
         assert!(!marker.exists());
+    }
+
+    /// (f) A bash tool command runs under the kill guard (`crate::killguard`):
+    /// kill(-1, 0) fails with EPERM, signalling itself still works. Signal 0
+    /// sends nothing, so a run without the guard is harmless.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[tokio::test]
+    async fn a_bash_tool_command_cannot_signal_pid_minus_one() {
+        let out = BashTool
+            .execute(
+                json!({ "command": "kill -0 -1; echo rc=$?; kill -0 $$ && echo self=ok", "timeout": 30 }),
+                create_tool_context(),
+            )
+            .await
+            .unwrap();
+        assert!(out.contains("Operation not permitted"), "{out}");
+        assert!(out.contains("rc=1"), "{out}");
+        assert!(out.contains("self=ok"), "{out}");
+    }
+
+    /// The kill guard's macOS stand-in (`crate::seatbelt`): under Seatbelt a
+    /// bash tool command can't signal a process outside its sandbox (its
+    /// parent, this test) but still itself and its own child. Elsewhere, or
+    /// with Seatbelt unavailable, it reaches its parent as before. Signal 0
+    /// sends nothing; the one real signal goes to the command's own `sleep`.
+    /// Runs on macOS only (it sends signals); compiled everywhere.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[cfg_attr(not(target_os = "macos"), ignore = "macOS only: the Seatbelt guard")]
+    async fn a_bash_tool_command_reaches_its_parent_only_without_seatbelt() {
+        let script = "kill -0 $PPID; echo parent_rc=$?; kill -0 $$ && echo self=ok; \
+                      sleep 30 >/dev/null 2>&1 & kill $! && echo child=ok";
+        let out = BashTool
+            .execute(
+                json!({ "command": script, "timeout": 30 }),
+                create_tool_context(),
+            )
+            .await
+            .unwrap();
+        // Asked after the run: the run made the process's one probe.
+        let seatbelt = crate::seatbelt::tool_child() == crate::seatbelt::Launch::Seatbelt;
+        assert!(out.contains("self=ok") && out.contains("child=ok"), "{out}");
+        if seatbelt {
+            assert!(out.contains("parent_rc=1"), "{out}");
+            assert!(
+                out.to_lowercase().contains("operation not permitted"),
+                "{out}"
+            );
+        } else {
+            assert!(out.contains("parent_rc=0"), "{out}");
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -792,6 +986,7 @@ mod tests {
         use crate::process_scope::test_support::{fake_env, fake_systemd_run, recorded};
         let base = crate::test_env::BaseDirGuard::new();
         let _scopes = crate::test_env::EnvVarGuard::remove("SYNAPS_PROCESS_SCOPES");
+        let _exec = crate::test_env::SCRIPT_EXEC_LOCK.lock();
         std::fs::write(
             base.path().join("config"),
             "tool_scope_slice = t_tools.slice\ndaemon_scope_slice = d_daemon.slice\n",
@@ -1016,6 +1211,114 @@ mod tests {
         );
     }
 
+    /// `text` carries `notice`, before `rest`.
+    fn says_first(text: &str, notice: &str, rest: &str) {
+        let at = text.find(notice).unwrap_or_else(|| panic!("no notice in {text:?}"));
+        let rest_at = text.find(rest).unwrap_or_else(|| panic!("no {rest:?} in {text:?}"));
+        assert!(at < rest_at, "the notice comes first: {text:?}");
+    }
+
+    /// The agent learns that its timeout was lowered: in a result, a failure
+    /// and a timeout alike. The notice comes first, so a long output that is
+    /// cut to the output limit keeps it (unless the limit is shorter than the
+    /// notice itself).
+    #[tokio::test]
+    async fn a_clamped_timeout_says_so_in_the_result() {
+        let tool = BashTool;
+
+        // Lowered, and the command finishes inside the cap.
+        let mut ctx = create_tool_context();
+        ctx.limits.bash_max_timeout = 300;
+        let out = tool
+            .execute(json!({"command": "echo ok", "timeout": 400}), ctx)
+            .await
+            .unwrap();
+        assert_eq!(
+            out,
+            "[timeout clamped from 400 s to 300 s by bash_max_timeout]\nok\n"
+        );
+
+        // Lowered, and the command runs into the cap.
+        let mut ctx = create_tool_context();
+        ctx.limits.bash_max_timeout = 1;
+        let err = tool
+            .execute(json!({"command": "sleep 5", "timeout": 10}), ctx)
+            .await
+            .unwrap_err()
+            .to_string();
+        says_first(
+            &err,
+            "[timeout clamped from 10 s to 1 s by bash_max_timeout]\n",
+            "Command timed out after 1s",
+        );
+
+        // Lowered, and the command fails on its own.
+        let mut ctx = create_tool_context();
+        ctx.limits.bash_max_timeout = 300;
+        let err = tool
+            .execute(json!({"command": "exit 3", "timeout": 400}), ctx)
+            .await
+            .unwrap_err()
+            .to_string();
+        says_first(
+            &err,
+            "[timeout clamped from 400 s to 300 s by bash_max_timeout]\n",
+            "Command failed (exit 3)",
+        );
+    }
+
+    /// In a streamed call the model's copy of a result that succeeded is the
+    /// delta lane's model history, not the returned text
+    /// (`select_tool_result_content`), so the notice goes into the lane too,
+    /// ahead of the command's output. A call that is not lowered adds nothing
+    /// there.
+    #[tokio::test]
+    async fn a_clamped_timeout_says_so_first_in_the_streamed_output() {
+        let tool = BashTool;
+        for (cap, want) in [
+            (300, "[timeout clamped from 400 s to 300 s by bash_max_timeout]\nok\n"),
+            (0, "ok\n"),
+        ] {
+            let channel = crate::tools::output::delta_channel();
+            let history = channel.output_handle();
+            let _rx = channel.receiver;
+            let mut ctx = create_tool_context();
+            ctx.channels.tx_delta = Some(channel.sender);
+            ctx.limits.bash_max_timeout = cap;
+            let out = tool
+                .execute(json!({"command": "echo ok", "timeout": 400}), ctx)
+                .await
+                .unwrap();
+            assert_eq!(history.model_history().text, want, "cap {cap}");
+            assert_eq!(out, want, "cap {cap}");
+        }
+    }
+
+    /// No cap, a request under the cap and the default add nothing.
+    #[tokio::test]
+    async fn an_unclamped_timeout_adds_no_notice() {
+        let tool = BashTool;
+        let mut ctx = create_tool_context();
+        ctx.limits.bash_max_timeout = 0;
+        let out = tool
+            .execute(json!({"command": "echo ok", "timeout": 400}), ctx)
+            .await
+            .unwrap();
+        assert!(out.starts_with("ok") && !out.contains("clamped"), "{out}");
+
+        let out = tool
+            .execute(json!({"command": "echo ok", "timeout": 300}), create_tool_context())
+            .await
+            .unwrap();
+        assert!(out.starts_with("ok") && !out.contains("clamped"), "{out}");
+
+        let out = tool
+            .execute(json!({"command": "echo ok"}), create_tool_context())
+            .await
+            .unwrap();
+        assert!(out.starts_with("ok") && !out.contains("clamped"), "{out}");
+    }
+
     fn prompt_channel() -> (
         crate::tools::SecretPromptHandle,
         tokio::sync::mpsc::UnboundedReceiver<crate::tools::SecretPromptRequest>,
@@ -1069,6 +1372,8 @@ if read -r got; then echo "stdin gave: $got"; else echo stdin-eof; fi"#;
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn without_askpass_sudo_never_asks() {
+        // Writes the fake sudo, then execs it.
+        let _exec = crate::test_env::SCRIPT_EXEC_LOCK.lock();
         let fake = tempfile::tempdir().unwrap();
         crate::tools::sudo_askpass::testing::write_fixtures(fake.path()).unwrap();
         let (handle, mut prompts) = prompt_channel();

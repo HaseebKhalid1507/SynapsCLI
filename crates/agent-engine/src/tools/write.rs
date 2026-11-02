@@ -71,6 +71,14 @@ impl Tool for WriteTool {
 
         let path = resolve_path_in(raw_path, ctx.capabilities.cwd.as_deref());
 
+        // Owner rule 27c: an enforcing session writes through a checked
+        // parent handle (same results everywhere else).
+        if let Some(binding) = &ctx.capabilities.sandbox {
+            if let Some(guard) = binding.tool_guard() {
+                return write_checked(binding, guard, path, content.to_string()).await;
+            }
+        }
+
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
                 tokio::fs::create_dir_all(parent).await.map_err(|e| {
@@ -109,6 +117,43 @@ impl Tool for WriteTool {
             content.len(),
             path.display()
         ))
+    }
+}
+
+/// `write` in a session under owner rule 27c: the same steps and texts as
+/// the unchecked path (missing parents made, the existing mode kept, a temp
+/// file renamed into place), through the parent handle the check opened.
+async fn write_checked(
+    binding: &crate::sandbox::SandboxBinding,
+    guard: crate::sandbox::protected::ToolGuard,
+    path: std::path::PathBuf,
+    content: String,
+) -> Result<String> {
+    use crate::sandbox::protected::WriteError;
+    let target = path.clone();
+    let (lines, bytes) = (content.lines().count(), content.len());
+    let contact = guard.confine_contact().unwrap_or_default().to_string();
+    let done = tokio::task::spawn_blocking(move || -> std::result::Result<(), WriteError> {
+        let t = guard.open_target(&target, true)?;
+        let mode = t.mode();
+        let tmp = super::util::unique_tmp_path(&target);
+        t.replace(tmp.file_name().unwrap_or_default(), content.as_bytes(), mode)
+    })
+    .await
+    .map_err(|e| RuntimeError::Tool(format!("write task failed: {e}")))?;
+    match done {
+        Ok(()) => Ok(format!("Wrote {} lines ({} bytes) to {}", lines, bytes, path.display())),
+        Err(WriteError::Protected) => Err(RuntimeError::Tool(binding.refuse_protected("write", &path))),
+        Err(WriteError::Confined) => Err(RuntimeError::Tool(binding.refuse_confined("write", &path, &contact))),
+        Err(WriteError::CreateDirs(e)) => Err(RuntimeError::Tool(format!("Failed to create directories: {}", e))),
+        Err(WriteError::Check(e)) => Err(RuntimeError::Tool(format!(
+            "Failed to write file: the target could not be checked against owner rule 27c: {}",
+            e
+        ))),
+        Err(WriteError::Open(e) | WriteError::Write(e)) => {
+            Err(RuntimeError::Tool(format!("Failed to write file: {}", e)))
+        }
+        Err(WriteError::Finalize(e)) => Err(RuntimeError::Tool(format!("Failed to finalize write: {}", e))),
     }
 }
 #[cfg(test)]

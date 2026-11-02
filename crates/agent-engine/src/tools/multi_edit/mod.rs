@@ -195,6 +195,11 @@ fn check_shape(spec: &EditSpec) -> std::result::Result<(), String> {
 /// the real target (symlinks followed), overlaps an active worker's scope.
 pub(crate) type ScopeCheck<'a> = &'a dyn Fn(&str) -> bool;
 
+/// Owner rule 27c (an enforcing session): `Err` = the refusal text for a
+/// target, given its verified parent handle, its file name there and the
+/// resolved path. Checked before the target is read or planned.
+pub(crate) type ProtectCheck<'a> = &'a dyn Fn(&dir::Dir, &std::ffi::OsStr, &Path) -> std::result::Result<(), String>;
+
 /// One file touched by the call, with its in-memory content.
 struct FileEntry {
     display: String,
@@ -330,6 +335,7 @@ fn run(
     now: chrono::DateTime<chrono::Local>,
     cwd: Option<&Path>,
     scope_refuses: ScopeCheck<'_>,
+    protect: ProtectCheck<'_>,
     hooks: &mut dyn commit::Hooks,
 ) -> std::result::Result<String, String> {
     let mut expander = placeholders::Expander::new(now);
@@ -364,6 +370,7 @@ fn run(
                     return Err(at(format!("more than {MAX_FILES} files in one call")));
                 }
                 let (dir, name) = open_parent(&target).map_err(at)?;
+                protect(&dir, &name, &target).map_err(at)?;
                 let entry = if exists {
                     let Loaded {
                         content,
@@ -630,7 +637,49 @@ impl Tool for MultiEditTool {
         let now = chrono::Local::now();
         let cwd = ctx.capabilities.cwd.clone();
         let orchestration = ctx.capabilities.orchestration.clone();
-        tokio::task::spawn_blocking(move || {
+        // Owner rule 27c: the session's check, if its policy enforces. A
+        // refusal is logged here, on the caller's side of the blocking task.
+        let binding = ctx.capabilities.sandbox.clone();
+        let guard = binding.as_ref().and_then(|b| b.tool_guard());
+        // What refused the call, if anything: 0 nothing, 1 owner rule 27c,
+        // 2 the confined write set (the call stops at its first refusal).
+        let refused = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0));
+        let flag = std::sync::Arc::clone(&refused);
+        let result = tokio::task::spawn_blocking(move || {
+            let protect = |dir: &dir::Dir, name: &std::ffi::OsStr, target: &Path| -> std::result::Result<(), String> {
+                #[cfg(unix)]
+                if let Some(g) = &guard {
+                    use crate::sandbox::protected::{refusal, WriteError};
+                    return match g.check_opened(dir.fd(), name, target) {
+                        Ok(()) => Ok(()),
+                        Err(WriteError::Protected) => {
+                            flag.store(1, std::sync::atomic::Ordering::SeqCst);
+                            Err(refusal(target))
+                        }
+                        Err(WriteError::Confined) => {
+                            flag.store(2, std::sync::atomic::Ordering::SeqCst);
+                            Err(crate::sandbox::confine::path_refusal(
+                                "multi_edit",
+                                target,
+                                g.confine_contact().unwrap_or_default(),
+                            ))
+                        }
+                        Err(WriteError::Check(e)) => Err(format!("the target could not be checked against owner rule 27c: {e}")),
+                        Err(other) => Err(format!("the target could not be checked against owner rule 27c: {other:?}")),
+                    };
+                }
+                // Off Unix there is no directory descriptor to check through:
+                // a session with a guard fails closed, as `write` and `edit`
+                // do there (`ToolGuard::open_target`).
+                #[cfg(not(unix))]
+                if guard.is_some() {
+                    return Err("the target could not be checked against owner rule 27c: \
+                        this OS has no directory descriptors to check a write through"
+                        .to_string());
+                }
+                let _ = (dir, name, target, &flag, &guard);
+                Ok(())
+            };
             let refuses = |path: &str| {
                 orchestration.as_ref().is_some_and(|o| {
                     matches!(
@@ -639,11 +688,18 @@ impl Tool for MultiEditTool {
                     )
                 })
             };
-            run(req, now, cwd.as_deref(), &refuses, &mut commit::RealHooks)
+            run(req, now, cwd.as_deref(), &refuses, &protect, &mut commit::RealHooks)
         })
         .await
-        .map_err(|e| RuntimeError::Tool(format!("multi_edit task failed: {e}")))?
-        .map_err(RuntimeError::Tool)
+        .map_err(|e| RuntimeError::Tool(format!("multi_edit task failed: {e}")))?;
+        if let Some(b) = &binding {
+            match refused.load(std::sync::atomic::Ordering::SeqCst) {
+                1 => b.log_protected("multi_edit"),
+                2 => b.log_confined("multi_edit"),
+                _ => {}
+            }
+        }
+        result.map_err(RuntimeError::Tool)
     }
 }
 

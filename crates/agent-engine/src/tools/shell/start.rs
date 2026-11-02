@@ -1,5 +1,6 @@
 //! `shell_start` tool — create a new interactive shell session.
 
+use crate::sandbox::SpawnSandbox;
 use crate::tools::{Tool, ToolContext};
 use crate::{Result, RuntimeError};
 use serde_json::{json, Value};
@@ -99,12 +100,24 @@ impl Tool for ShellStartTool {
             idle_timeout,
         };
 
+        // Per-session write sandbox (crate::sandbox): decided at every
+        // shell_start, before the shell exists. Commands sent to the shell
+        // later run inside the domain it started with.
+        let sandbox = match ctx.capabilities.sandbox.as_ref() {
+            Some(binding) => binding.prepare("shell_start"),
+            None => SpawnSandbox::None,
+        };
+        if let SpawnSandbox::Refuse(msg) = &sandbox {
+            return Err(RuntimeError::Tool(msg.clone()));
+        }
+
         let (session_id, output, status) = mgr
             .create_session_cancellable(
                 opts,
                 ctx.channels.tx_delta.as_ref(),
                 ctx.limits.max_tool_buffer,
                 ctx.capabilities.launch_cancel.as_ref(),
+                &sandbox,
             )
             .await?;
 

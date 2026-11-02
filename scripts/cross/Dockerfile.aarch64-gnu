@@ -1,0 +1,35 @@
+# Cross-compile image for the HARDENED synaps binary targeting
+# aarch64-unknown-linux-gnu from an x86_64 host.
+#
+# Why bookworm: the media-library bridge runtime is node:24-bookworm-slim
+# (glibc 2.36). Linking against bookworm's arm64 cross libc (libc6-dev-arm64-cross
+# = 2.36) guarantees the produced binary never needs a newer glibc symbol than
+# the runtime provides — the same guarantee the ubuntu-22.04 (glibc 2.35) CI
+# runners give the official `Hardened release` workflow.
+#
+# Native C deps in the workspace (all cross-compile with a plain GNU
+# cross-gcc): ring, aws-lc-sys (cmake), tikv-jemalloc-sys (autoconf/make).
+#
+# Usage: scripts/cross/build-in-bookworm.sh [<target>]  (builds this image, then
+# runs scripts/build-hardened.sh <target> inside it; default aarch64).
+FROM rust:1-bookworm
+
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+      gcc-aarch64-linux-gnu g++-aarch64-linux-gnu libc6-dev-arm64-cross \
+      binutils-aarch64-linux-gnu cmake pkg-config make perl xz-utils \
+      qemu-user-static ca-certificates git; \
+    rm -rf /var/lib/apt/lists/*; \
+    rustup target add aarch64-unknown-linux-gnu
+
+ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
+    CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc \
+    CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++ \
+    AR_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ar \
+    # Let `synaps --version` run under user-mode emulation for the smoke check.
+    SYNAPS_CROSS_RUNNER=qemu-aarch64-static
+
+# The build runs as the invoking host uid (see build-aarch64-gnu.sh) so the
+# produced dist/ is host-owned; make the toolchain dirs world-readable/usable.
+RUN chmod -R a+rwX /usr/local/cargo /usr/local/rustup

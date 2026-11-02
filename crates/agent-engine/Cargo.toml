@@ -43,7 +43,7 @@ flate2             = "1"
 
 # Serialisation
 serde              = { version = "1.0", features = ["derive", "rc"] }
-serde_json         = { version = "1.0", features = ["float_roundtrip"] }
+serde_json         = { version = "1.0", features = ["float_roundtrip", "raw_value"] }
 toml               = "0.8"
 
 # Tracing / logging
@@ -118,6 +118,10 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Threading",
 ] }
 
+# build.rs compiles the kill guard shim (shim/killguard.c) on Linux targets.
+[build-dependencies]
+cc = "1"
+
 [dev-dependencies]
 serial_test = "3.4.0"
 tempfile    = "3"
@@ -128,3 +132,11 @@ tokio       = { version = "1.0", features = ["full", "test-util"] }
 # default-features = false so `--no-default-features` (hardened) test builds
 # are not silently re-unified back to `default` = command-exec by this edge.
 synaps-engine = { path = ".", features = ["testing"], default-features = false }
+
+# Real daemon processes for the capacity resume (kill -9, stop and start, a
+# real reload): its own `main` is both the test and, run as `daemon
+# --print-version` / `daemon --foreground`, the daemon under test with a
+# scripted credential broker. Test build only; no production entry point.
+[[test]]
+name = "daemon_capacity_resume"
+harness = false

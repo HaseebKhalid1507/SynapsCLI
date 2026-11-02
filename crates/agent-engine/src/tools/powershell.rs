@@ -34,8 +34,8 @@ impl Tool for PowerShellTool {
          another powershell or pwsh inside it. Scripts may run: call them directly, e.g. \
          .\\test.ps1. PowerShell quoting rules apply — single quotes are literal, double quotes \
          interpolate ($var, `n). Native cmdlets like Get-Process, Get-ChildItem, Test-Path are \
-         available. Commands time out after 30 seconds by default; pass a larger timeout when \
-         needed."
+         available. Commands time out after the configured default (30 seconds unless \
+         changed); pass a larger timeout when needed."
     }
 
     fn parameters(&self) -> Value {
@@ -48,7 +48,7 @@ impl Tool for PowerShellTool {
                 },
                 "timeout": {
                     "type": "integer",
-                    "description": "Timeout in seconds (default: 30). Use a larger value for long-running commands."
+                    "description": "Timeout in seconds (default: the configured bash_timeout, 30 unless changed). Use a larger value for long-running commands. A request above the configured bash_max_timeout (300 unless changed; 0 means no cap) is lowered to it, and the result says so."
                 }
             },
             "required": ["command"]
@@ -65,7 +65,9 @@ impl Tool for PowerShellTool {
             ShellSpec::PowerShell,
             params["timeout"].as_u64(),
             ctx,
+            // No sudo askpass and no write sandbox: Windows only.
             None,
+            &crate::sandbox::SpawnSandbox::None,
         )
         .await
     }

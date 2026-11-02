@@ -78,27 +78,19 @@ impl Tool for EditTool {
 
         let path = resolve_path_in(raw_path, ctx.capabilities.cwd.as_deref());
 
+        // Owner rule 27c: an enforcing session reads and writes through a
+        // checked parent handle (same results everywhere else).
+        if let Some(binding) = &ctx.capabilities.sandbox {
+            if let Some(guard) = binding.tool_guard() {
+                return edit_checked(binding, guard, path, old_string.to_string(), new_string.to_string()).await;
+            }
+        }
+
         let content = tokio::fs::read_to_string(&path).await.map_err(|e| {
             RuntimeError::Tool(format!("Failed to read file '{}': {}", path.display(), e))
         })?;
 
-        let count = content.matches(old_string).count();
-
-        if count == 0 {
-            return Err(RuntimeError::Tool(format!(
-                "old_string not found in '{}'. Make sure it matches exactly, including whitespace and indentation.",
-                path.display()
-            )));
-        }
-
-        if count > 1 {
-            return Err(RuntimeError::Tool(format!(
-                "old_string found {} times in '{}'. It must be unique — include more surrounding context.",
-                count, path.display()
-            )));
-        }
-
-        let new_content = content.replacen(old_string, new_string, 1);
+        let new_content = replace_once(&content, old_string, new_string, &path)?;
 
         // Preserve original file permissions (executable bits, etc.)
         let original_perms = tokio::fs::metadata(&path)
@@ -124,14 +116,89 @@ impl Tool for EditTool {
             RuntimeError::Tool(format!("Failed to finalize edit: {}", e))
         })?;
 
-        let old_lines: Vec<&str> = old_string.lines().collect();
-        let new_lines: Vec<&str> = new_string.lines().collect();
-        Ok(format!(
-            "Edited {} — replaced {} line(s) with {} line(s)",
+        Ok(edited(&path, old_string, new_string))
+    }
+}
+
+/// `content` with its one `old_string` replaced, or the error for none or
+/// several.
+fn replace_once(content: &str, old_string: &str, new_string: &str, path: &std::path::Path) -> Result<String> {
+    let count = content.matches(old_string).count();
+
+    if count == 0 {
+        return Err(RuntimeError::Tool(format!(
+            "old_string not found in '{}'. Make sure it matches exactly, including whitespace and indentation.",
+            path.display()
+        )));
+    }
+
+    if count > 1 {
+        return Err(RuntimeError::Tool(format!(
+            "old_string found {} times in '{}'. It must be unique — include more surrounding context.",
+            count, path.display()
+        )));
+    }
+
+    Ok(content.replacen(old_string, new_string, 1))
+}
+
+/// The result text of a done edit.
+fn edited(path: &std::path::Path, old_string: &str, new_string: &str) -> String {
+    let old_lines: Vec<&str> = old_string.lines().collect();
+    let new_lines: Vec<&str> = new_string.lines().collect();
+    format!(
+        "Edited {} — replaced {} line(s) with {} line(s)",
+        path.display(),
+        old_lines.len(),
+        new_lines.len()
+    )
+}
+
+/// `edit` in a session under owner rule 27c: the same steps and texts as
+/// the unchecked path (read through a final symlink, the existing mode
+/// kept, a temp file renamed into place), through the parent handle the
+/// check opened.
+async fn edit_checked(
+    binding: &crate::sandbox::SandboxBinding,
+    guard: crate::sandbox::protected::ToolGuard,
+    path: std::path::PathBuf,
+    old_string: String,
+    new_string: String,
+) -> Result<String> {
+    use crate::sandbox::protected::WriteError;
+    enum Failed {
+        Write(WriteError),
+        Read(std::io::Error),
+        Text(RuntimeError),
+    }
+    let target = path.clone();
+    let (old, new) = (old_string.clone(), new_string.clone());
+    let contact = guard.confine_contact().unwrap_or_default().to_string();
+    let done = tokio::task::spawn_blocking(move || -> std::result::Result<(), Failed> {
+        let t = guard.open_target(&target, false).map_err(Failed::Write)?;
+        let content = t.read_to_string().map_err(Failed::Read)?;
+        let new_content = replace_once(&content, &old, &new, &target).map_err(Failed::Text)?;
+        let mode = t.mode();
+        let tmp = super::util::unique_tmp_path(&target);
+        t.replace(tmp.file_name().unwrap_or_default(), new_content.as_bytes(), mode).map_err(Failed::Write)
+    })
+    .await
+    .map_err(|e| RuntimeError::Tool(format!("edit task failed: {e}")))?;
+    let read_failed = |e: std::io::Error| RuntimeError::Tool(format!("Failed to read file '{}': {}", path.display(), e));
+    match done {
+        Ok(()) => Ok(edited(&path, &old_string, &new_string)),
+        Err(Failed::Text(e)) => Err(e),
+        Err(Failed::Read(e)) => Err(read_failed(e)),
+        Err(Failed::Write(WriteError::Protected)) => Err(RuntimeError::Tool(binding.refuse_protected("edit", &path))),
+        Err(Failed::Write(WriteError::Confined)) => Err(RuntimeError::Tool(binding.refuse_confined("edit", &path, &contact))),
+        Err(Failed::Write(WriteError::Open(e) | WriteError::CreateDirs(e))) => Err(read_failed(e)),
+        Err(Failed::Write(WriteError::Check(e))) => Err(RuntimeError::Tool(format!(
+            "Failed to read file '{}': the target could not be checked against owner rule 27c: {}",
             path.display(),
-            old_lines.len(),
-            new_lines.len()
-        ))
+            e
+        ))),
+        Err(Failed::Write(WriteError::Write(e))) => Err(RuntimeError::Tool(format!("Failed to write file: {}", e))),
+        Err(Failed::Write(WriteError::Finalize(e))) => Err(RuntimeError::Tool(format!("Failed to finalize edit: {}", e))),
     }
 }
 #[cfg(test)]

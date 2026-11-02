@@ -17,6 +17,7 @@ use portable_pty::{native_pty_system, Child, ChildKiller, CommandBuilder, Master
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
+use crate::sandbox::SpawnSandbox;
 use crate::{Result, RuntimeError};
 
 const PTY_OUTPUT_CHANNEL_CAPACITY: usize = 64;
@@ -160,6 +161,8 @@ pub struct PtyHandle {
     alive: Arc<AtomicBool>,
     /// Separate killer handle so Drop can kill even if child is borrowed.
     killer: Box<dyn ChildKiller + Send + Sync>,
+    /// The child's report to its session (`session::child_events`).
+    watch: crate::session::child_events::ChildWatch,
 }
 
 type PreparedScope = (
@@ -184,7 +187,7 @@ impl PtyHandle {
         cols: u16,
     ) -> Result<Self> {
         let prepared = Self::prepare_scope(working_dir, &env);
-        Self::spawn_prepared(command, working_dir, rows, cols, prepared)
+        Self::spawn_prepared(command, working_dir, rows, cols, prepared, &SpawnSandbox::None)
     }
 
     pub(crate) fn prepare_scope(working_dir: Option<&str>, env: &HashMap<String, String>) -> PreparedScope {
@@ -193,6 +196,12 @@ impl PtyHandle {
         let mut effective_env = crate::process_scope::inherited_env();
         crate::process_scope::set_env(&mut effective_env, "TERM", "xterm-256color");
         for (k, v) in env { crate::process_scope::set_env(&mut effective_env, k, v); }
+        // The kill guard joins after the overrides (it keeps their
+        // LD_PRELOAD and ASAN_OPTIONS), sandbox on or off (crate::killguard).
+        crate::killguard::apply_env(&mut effective_env);
+        // Its macOS stand-in probes sandbox-exec here, off the async runtime;
+        // spawn_prepared asks for the answer (crate::seatbelt).
+        crate::seatbelt::prepare();
         let scope_cwd = working_dir.map(std::path::PathBuf::from)
             .filter(|p| p.is_dir())
             .or_else(|| effective_env.iter().find(|(k, _)| k == "HOME")
@@ -203,10 +212,19 @@ impl PtyHandle {
         (effective_env, scope_cwd, launcher)
     }
 
+    /// Spawn on a new PTY with a prepared environment and scope. `sandbox` is
+    /// the session's write-sandbox decision: `Apply` spawns the command from
+    /// a fresh thread restricted by the session's domain, so the command and
+    /// everything it starts inherit it (portable-pty has no pre-exec hook of
+    /// ours); `None` spawns exactly as without a sandbox; `Refuse` spawns
+    /// nothing.
     pub(crate) fn spawn_prepared(
         command: &str, working_dir: Option<&str>, rows: u16, cols: u16,
-        prepared: PreparedScope,
+        prepared: PreparedScope, sandbox: &SpawnSandbox,
     ) -> Result<Self> {
+        if let SpawnSandbox::Refuse(msg) = sandbox {
+            return Err(RuntimeError::Tool(msg.clone()));
+        }
         // 1. Open a PTY pair with the requested size.
         let pty_system = native_pty_system();
         let pair = pty_system
@@ -232,10 +250,15 @@ impl PtyHandle {
                 .skip(1)
                 .map(std::ffi::OsString::from)
                 .collect::<Vec<_>>();
-            match launcher {
+            let (program, args) = match launcher {
                 Some(launcher) => launcher.wrap("synaps tool: shell", crate::process_scope::resolve_program(program, &effective_env, scope_cwd.as_deref()).map_err(|e| RuntimeError::Tool(e.to_string()))?, args),
                 None => (program, args),
-            }
+            };
+            // macOS: under sandbox-exec, the kill guard's stand-in. Elsewhere
+            // (process scopes are Linux-only) unchanged.
+            crate::seatbelt::tool_child()
+                .apply(program, args, &effective_env, scope_cwd.as_deref())
+                .map_err(|e| RuntimeError::Tool(e.to_string()))?
         };
         let mut cmd = CommandBuilder::new(program);
         for arg in &args {
@@ -250,14 +273,46 @@ impl PtyHandle {
         cmd.env_clear();
         for (k, v) in &effective_env { cmd.env(k, v); }
 
-        // 3. Spawn the child on the slave side.
-        let child = pair
-            .slave
-            .spawn_command(cmd)
-            .map_err(|e| RuntimeError::Tool(format!("Failed to spawn command: {e}")))?;
-
-        // Drop the slave — the child process owns its end now.
-        drop(pair.slave);
+        // 3. Spawn the child on the slave side, then drop the slave: the
+        //    child process owns its end now.
+        let child = match sandbox {
+            SpawnSandbox::None => {
+                let child = pair
+                    .slave
+                    .spawn_command(cmd)
+                    .map_err(|e| RuntimeError::Tool(format!("Failed to spawn command: {e}")))?;
+                drop(pair.slave);
+                child
+            }
+            // The slave isn't Sync, so it moves into the confined thread,
+            // which spawns and drops it there.
+            #[cfg(target_os = "linux")]
+            SpawnSandbox::Apply(p) => {
+                let slave = pair.slave;
+                let spawned = p.run_confined(move || {
+                    let child = slave.spawn_command(cmd);
+                    drop(slave);
+                    child
+                });
+                match spawned {
+                    Ok(Ok(child)) => {
+                        p.log_spawned(child.process_id());
+                        child
+                    }
+                    Ok(Err(e)) => {
+                        crate::sandbox::log_line(&p.spawn_failed_line(&e));
+                        return Err(RuntimeError::Tool(format!("Failed to spawn command: {e}")));
+                    }
+                    // The confined thread couldn't start or restrict itself:
+                    // nothing ran.
+                    Err(e) => {
+                        crate::sandbox::log_line(&p.spawn_failed_line(&e));
+                        return Err(RuntimeError::Tool(format!("sandbox: {e}")));
+                    }
+                }
+            }
+            SpawnSandbox::Refuse(msg) => return Err(RuntimeError::Tool(msg.clone())),
+        };
 
         // 4. Obtain writer and reader from the master.
         let writer = pair
@@ -337,7 +392,14 @@ impl PtyHandle {
             child,
             alive,
             killer,
+            watch: Default::default(),
         })
+    }
+
+    /// Report this shell's child to the session behind `sink` (`tool_child`
+    /// with the shell session id); its end is reported once, at the reap.
+    pub(crate) fn watch_child(&mut self, sink: Option<&crate::session::child_events::ChildSink>, shell_session_id: &str) {
+        self.watch = crate::session::child_events::ChildWatch::start(sink, self.child.process_id(), Some(shell_session_id));
     }
 
     /// Write raw bytes to the PTY (reaches the child's stdin).
@@ -411,15 +473,17 @@ impl PtyHandle {
             return false;
         }
         match self.child.try_wait() {
-            Ok(Some(_status)) => {
+            Ok(Some(status)) => {
                 // Child exited.
                 self.alive.store(false, Ordering::SeqCst);
+                report_exit(&mut self.watch, &status);
                 false
             }
             Ok(None) => true,
             Err(_) => {
                 // If we can't query, assume dead.
                 self.alive.store(false, Ordering::SeqCst);
+                self.watch.end(None, None);
                 false
             }
         }
@@ -437,17 +501,50 @@ impl Drop for PtyHandle {
         self.accounting.finish_party();
         if self.alive.load(Ordering::SeqCst) {
             let _ = self.killer.kill();
-            // Reap the child after kill — without a wait(), the SIGKILL'd
-            // child lingers as a zombie until the parent process exits.
-            // SIGKILL takes effect near-instantly; bound the reap attempts
-            // so Drop can never hang on a pathological child.
+            // Reap the child after the kill — without a wait(), it lingers
+            // as a zombie until the parent process exits. The kill is
+            // portable-pty's SIGHUP; bound the reap attempts so Drop can
+            // never hang on a child that ignores it.
             for _ in 0..5 {
                 match self.child.try_wait() {
-                    Ok(Some(_)) | Err(_) => break, // reaped (or unreapable)
+                    Ok(Some(status)) => {
+                        // Reaped: its own exit if it ended before the kill.
+                        report_exit(&mut self.watch, &status);
+                        break;
+                    }
+                    Err(_) => break, // unreapable
                     Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
                 }
             }
+        } else if self.watch.identity().is_some() {
+            // The reader saw EOF first: reap the watched child for its status.
+            if let Ok(Some(status)) = self.child.try_wait() {
+                report_exit(&mut self.watch, &status);
+            }
         }
+        // Not reaped (yet): ended, with its status unknown. The hang-up above
+        // is portable-pty's SIGHUP, not a SIGKILL, so claim no signal.
+        self.watch.end(None, None);
+    }
+}
+
+/// Report a PTY child's exit. portable-pty keeps only a signal's
+/// strsignal(3) name; the ones a shell usually dies of map back to their
+/// numbers, any other is an unknown signal.
+fn report_exit(watch: &mut crate::session::child_events::ChildWatch, status: &portable_pty::ExitStatus) {
+    match status.signal() {
+        None => watch.end(i32::try_from(status.exit_code()).ok(), None),
+        Some(name) => watch.end(None, signal_number(name)),
+    }
+}
+
+fn signal_number(name: &str) -> Option<i32> {
+    match name {
+        "Hangup" => Some(1),
+        "Interrupt" => Some(2),
+        "Killed" => Some(9),
+        "Terminated" => Some(15),
+        _ => name.strip_prefix("Signal ").and_then(|n| n.parse().ok()),
     }
 }
 
@@ -470,6 +567,7 @@ mod tests {
         use crate::process_scope::test_support::{fake_env, fake_systemd_run, recorded};
         let base = crate::test_env::BaseDirGuard::new();
         let _scopes = crate::test_env::EnvVarGuard::remove("SYNAPS_PROCESS_SCOPES");
+        let _exec = crate::test_env::SCRIPT_EXEC_LOCK.lock();
         let dir = tempfile::tempdir().unwrap();
         let fake = fake_systemd_run(dir.path());
         let env: HashMap<String, String> = fake_env(&fake).into_iter().collect();
@@ -522,6 +620,75 @@ mod tests {
                 accounting.retained()
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Every PTY shell's env carries the kill guard (`crate::killguard`), after
+    /// the caller's overrides: a caller's own LD_PRELOAD is kept, ours added.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    fn a_pty_shell_env_carries_the_kill_guard() {
+        let env: HashMap<String, String> =
+            [("LD_PRELOAD".to_string(), "/x/libmine.so".to_string())].into();
+        let (effective, _, _) = PtyHandle::prepare_scope(None, &env);
+        let get = |key: &str| {
+            effective.iter().rev().find(|(k, _)| k == key)
+                .map(|(_, v)| v.to_string_lossy().into_owned())
+        };
+        let preload = get("LD_PRELOAD").unwrap_or_default();
+        let (mine, ours) = preload.split_once(':').unwrap_or_else(|| panic!("{preload}"));
+        assert_eq!(mine, "/x/libmine.so");
+        let name = std::path::Path::new(ours).file_name().unwrap_or_default().to_string_lossy();
+        assert!(name.starts_with("synaps-killguard-") && name.ends_with(".so"), "{preload}");
+        assert!(std::path::Path::new(ours).is_file(), "{preload}");
+        let asan = get("ASAN_OPTIONS").unwrap_or_default();
+        assert!(asan.contains(crate::killguard::ASAN_LINK_ORDER_OFF), "{asan}");
+    }
+
+    /// The kill guard's macOS stand-in (`crate::seatbelt`) on a PTY shell:
+    /// under Seatbelt it can't signal a process outside its sandbox (its
+    /// parent, this test). Elsewhere, or with Seatbelt unavailable, it can,
+    /// as before. Signal 0 sends nothing. Runs on macOS only; compiled
+    /// everywhere.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    #[cfg_attr(not(target_os = "macos"), ignore = "macOS only: the Seatbelt guard")]
+    async fn a_pty_shell_reaches_its_parent_only_without_seatbelt() {
+        let before = pty_output_snapshot();
+        let mut handle = PtyHandle::spawn("bash --norc --noprofile", None, HashMap::new(), 24, 80)
+            .expect("spawn");
+        handle
+            .write(b"kill -0 $PPID; echo parent_rc=$?; exit\n")
+            .expect("write");
+        let mut out = Vec::new();
+        let answered = |out: &[u8]| {
+            let text = String::from_utf8_lossy(out);
+            text.contains("parent_rc=0") || text.contains("parent_rc=1")
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline && !answered(&out) {
+            out.extend(handle.try_read_output(Duration::from_millis(200)).await);
+        }
+        // Settle the process-global PTY accounting before the next #[serial]
+        // test snapshots it (as pty_shell_gets_its_own_scope_when_available).
+        drop(handle);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while (pty_output_snapshot().active_readers > before.active_readers
+            || pty_output_snapshot().retained_bytes != before.retained_bytes)
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let text = String::from_utf8_lossy(&out).replace('\r', "");
+        if crate::seatbelt::tool_child() == crate::seatbelt::Launch::Seatbelt {
+            assert!(text.contains("parent_rc=1"), "{text}");
+            assert!(
+                text.to_lowercase().contains("operation not permitted"),
+                "{text}"
+            );
+        } else {
+            assert!(text.contains("parent_rc=0"), "{text}");
         }
     }
 
@@ -726,6 +893,70 @@ mod tests {
             text.contains("test"),
             "expected 'test' in output, got: {text:?}"
         );
+    }
+
+    /// A shell that exits while a background job still holds the terminal
+    /// is "alive" to the reader when its handle drops: the drop's reap
+    /// reports the shell's own exit, not a kill.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[serial]
+    async fn a_dropped_handle_reports_the_exit_it_reaped() {
+        use crate::session::child_events::{ChildProcessEvent, ChildRoute};
+        let (route, mut rx) = ChildRoute::channel("pty-test-session");
+        let sink = route.sink("toolu_pty", "shell_start");
+        let mut handle = PtyHandle::spawn("bash --norc --noprofile", None, HashMap::new(), 24, 80)
+            .expect("spawn");
+        handle.watch_child(Some(&sink), "shell_t");
+        let pid = match rx.try_recv() {
+            Ok(ChildProcessEvent::Spawned(spawn)) => spawn.child.pid,
+            other => panic!("{other:?}"),
+        };
+        handle.write(b"sleep 2 & exit 5\n").unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while crate::proc_identity::ProcessIdentity::identify(pid).is_ok_and(|now| now.is_live()) {
+            assert!(std::time::Instant::now() < deadline, "the shell never exited");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(handle.alive.load(Ordering::SeqCst), "the background job keeps the terminal open");
+        drop(handle);
+        match rx.try_recv() {
+            Ok(ChildProcessEvent::Ended { exit_code, signal, .. }) => {
+                assert_eq!((exit_code, signal), (Some(5), None));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(rx.try_recv().is_err(), "exactly once");
+    }
+
+    /// A child that ignores the drop's hang-up isn't reaped in time: it
+    /// ends with its status unknown, never with a kill it didn't get.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[serial]
+    async fn a_dropped_handle_claims_no_signal_it_did_not_see() {
+        use crate::session::child_events::{ChildProcessEvent, ChildRoute};
+        let (route, mut rx) = ChildRoute::channel("pty-test-session");
+        let sink = route.sink("toolu_pty", "shell_start");
+        let mut handle = PtyHandle::spawn("bash --norc --noprofile", None, HashMap::new(), 24, 80)
+            .expect("spawn");
+        handle.watch_child(Some(&sink), "shell_t");
+        assert!(matches!(rx.try_recv(), Ok(ChildProcessEvent::Spawned(_))));
+        // The typed line can be echoed twice (the terminal, then readline)
+        // before bash runs it, so wait for text only the output contains.
+        handle.write(b"trap '' HUP; echo trap'-is-'set\n").unwrap();
+        let mut seen = String::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !seen.contains("trap-is-set") {
+            assert!(std::time::Instant::now() < deadline, "no prompt: {seen:?}");
+            seen.push_str(&String::from_utf8_lossy(&handle.try_read_output(Duration::from_millis(100)).await));
+        }
+        drop(handle);
+        match rx.try_recv() {
+            Ok(ChildProcessEvent::Ended { exit_code, signal, .. }) => assert_eq!((exit_code, signal), (None, None)),
+            other => panic!("{other:?}"),
+        }
+        assert!(rx.try_recv().is_err(), "exactly once");
     }
 
     #[tokio::test]

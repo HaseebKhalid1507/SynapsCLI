@@ -17,3 +17,6 @@ pub use pty::{pty_output_snapshot, PtyOutputSnapshot};
 pub use send::ShellSendTool;
 pub use session::{start_reaper, SendResult, SessionManager, SessionOpts};
 pub use start::ShellStartTool;
+
+#[cfg(all(test, target_os = "linux"))]
+mod sandbox_tests;
