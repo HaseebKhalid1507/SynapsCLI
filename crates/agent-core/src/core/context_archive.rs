@@ -25,6 +25,16 @@
 //! operation scans at most 128 files / 256 MiB; the cross-process lock never waits.
 //! Budget exhaustion and corruption fail closed, never silently truncate seal.
 //!
+//! Worker segments (a store opened [`ArchiveStore::with_class`]
+//! [`SegmentClass::Worker`]) share these budgets under a ceiling of their own:
+//! at most [`MAX_WORKER_SEGMENTS`] slots and [`MAX_WORKER_BYTES`], counting
+//! every worker segment in the store (tombstones, and segments of runs that
+//! are gone, included), checked under the same lock before anything is
+//! written. Nothing is evicted. A segment's class is recorded in its id (the
+//! UUID version nibble, [`SegmentClass::of_id`]), so the stored record format
+//! is the same for both classes and an older binary reads a worker segment
+//! as an ordinary one.
+//!
 //! Unix-only private, handle-relative no-symlink filesystem; other platforms
 //! fail Unsupported. Live records are immutable; forget atomically replaces a
 //! record with a content-free id/digest/scope tombstone. The digest covers ONLY
@@ -66,6 +76,52 @@ pub const MAX_MESSAGES: usize = 4096;
 pub const MAX_NOTE_BYTES: usize = 8192;
 pub const MAX_FETCH_MESSAGES: usize = 128;
 pub const MAX_SEARCH_RESULTS: usize = 32;
+/// Most slots worker segments take, of [`MAX_SEGMENTS`] (tombstones and
+/// segments of runs that are gone included).
+pub const MAX_WORKER_SEGMENTS: usize = 64;
+/// Most bytes worker segments take, of [`MAX_STORE_BYTES`].
+pub const MAX_WORKER_BYTES: usize = 128 * 1024 * 1024;
+
+/// Which budget a new segment counts against. A store seals under one class
+/// ([`ArchiveStore::with_class`]); a stored segment's class is its id's
+/// ([`SegmentClass::of_id`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SegmentClass {
+    /// The store's own budget only (every segment written before worker
+    /// segments existed is one).
+    #[default]
+    Session,
+    /// A worker run's window: also under [`MAX_WORKER_SEGMENTS`] and
+    /// [`MAX_WORKER_BYTES`].
+    Worker,
+}
+
+impl SegmentClass {
+    /// The class recorded in a segment id: a worker segment's id is a UUID of
+    /// version 8, every other id (version 4, as every id was before worker
+    /// segments) is a session segment's.
+    pub fn of_id(id: &str) -> Self {
+        if id.as_bytes().get(12) == Some(&b'8') {
+            Self::Worker
+        } else {
+            Self::Session
+        }
+    }
+
+    /// A fresh random segment id of this class (32 lowercase hex, like every
+    /// id: readers check nothing else).
+    fn new_id(self) -> String {
+        match self {
+            Self::Session => uuid::Uuid::new_v4().simple().to_string(),
+            Self::Worker => {
+                let mut bytes = *uuid::Uuid::new_v4().as_bytes();
+                // RFC 9562 version 8; the variant bits stay as version 4 set them.
+                bytes[6] = (bytes[6] & 0x0f) | 0x80;
+                uuid::Uuid::from_bytes(bytes).simple().to_string()
+            }
+        }
+    }
+}
 /// Longest an operation waits for earlier operations on the same archive in
 /// this process before failing closed as busy.
 pub const LOCK_WAIT: Duration = Duration::from_secs(30);
@@ -95,6 +151,26 @@ pub struct ArchiveDescriptor {
     pub source_message_count: usize,
     /// A bounded excerpt of eligible source JSON, never the hidden note.
     pub snippet: String,
+}
+
+/// Host-only ownership view of one stored segment (never model-facing).
+/// `logical_id` is the stored hashed logical identity ([`logical_digest`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArchiveEntry {
+    pub id: String,
+    pub logical_id: String,
+    /// False for a permanent tombstone.
+    pub live: bool,
+}
+
+/// The hashed logical identity a store records for a raw host logical ID:
+/// SHA-256 over the ID's byte length (u64 big-endian) followed by its bytes,
+/// lowercase hex. [`ArchiveStore::new`] and [`project_archive`] use exactly
+/// this derivation, so a stored segment's owner is compared hash to hash.
+pub fn logical_digest(logical_id: &str) -> io::Result<String> {
+    validate_key(logical_id)?;
+    Ok(digest_parts(&[logical_id.as_bytes()]))
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -187,6 +263,11 @@ pub struct ArchiveStore {
     redactor: Option<Arc<ArchiveRedactor>>,
     abort: Option<Arc<AtomicBool>>,
     wait: Duration,
+    /// The class this store's seals count against.
+    class: SegmentClass,
+    /// [`MAX_WORKER_SEGMENTS`] and [`MAX_WORKER_BYTES`]; tests lower them.
+    worker_segments_max: usize,
+    worker_bytes_max: usize,
 }
 
 /// Process-local mutual exclusion for one archive directory. The advisory
@@ -361,7 +442,17 @@ impl ArchiveStore {
             redactor: None,
             abort: None,
             wait: LOCK_WAIT,
+            class: SegmentClass::Session,
+            worker_segments_max: MAX_WORKER_SEGMENTS,
+            worker_bytes_max: MAX_WORKER_BYTES,
         })
+    }
+
+    /// Seal new segments as `class` (a worker run's windows:
+    /// [`SegmentClass::Worker`]). Reads are unaffected.
+    pub fn with_class(mut self, class: SegmentClass) -> Self {
+        self.class = class;
+        self
     }
 
     /// Opt in to screened tool evidence. Install the SAME trusted policy when
@@ -419,7 +510,7 @@ impl ArchiveStore {
             ..
         } = projection;
         let _lock = self.exclusive()?;
-        let (records, used) = self.scan()?;
+        let (records, used, sizes) = self.scan_sized(false)?;
         if let Some((_, record)) = records.iter().find(|(_, r)| r.digest == digest) {
             let Body::Live { note: stored, .. } = &record.body else {
                 return Err(io::Error::new(
@@ -431,6 +522,24 @@ impl ArchiveStore {
             self.fs.sync()?;
             return Ok((record.reference()?, stored.clone()));
         }
+        // A worker segment's ceiling, counted over every worker segment the
+        // scan found (live or tombstone, whoever owns it). A retry of a sealed
+        // projection returned above and takes nothing.
+        let (worker_segments, worker_bytes) = records
+            .iter()
+            .zip(&sizes)
+            .filter(|((_, r), _)| SegmentClass::of_id(&r.id) == SegmentClass::Worker)
+            .fold((0, 0), |(n, total), (_, size)| (n + 1, total + size));
+        if self.class == SegmentClass::Worker && worker_segments >= self.worker_segments_max {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "worker history ceiling reached ({} of {MAX_SEGMENTS} segments, \
+                     tombstones retained)",
+                    self.worker_segments_max
+                ),
+            ));
+        }
         let slot = (0..MAX_SEGMENTS)
             .find(|slot| !records.iter().any(|(s, _)| s == slot))
             .ok_or_else(|| invalid("archive segment budget exhausted (tombstones retained)"))?;
@@ -438,7 +547,7 @@ impl ArchiveStore {
             version: 1,
             scope: self.scope.clone(),
             logical: self.logical.clone(),
-            id: uuid::Uuid::new_v4().simple().to_string(),
+            id: self.class.new_id(),
             digest,
             body: Body::Live {
                 source_message_count,
@@ -449,6 +558,16 @@ impl ArchiveStore {
         let bytes = bounded_json(&record, MAX_SEGMENT_BYTES)?;
         if used + bytes.len() > MAX_STORE_BYTES {
             return Err(invalid("archive storage byte budget exhausted"));
+        }
+        if self.class == SegmentClass::Worker && worker_bytes + bytes.len() > self.worker_bytes_max
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "worker history byte ceiling reached ({} of {} bytes)",
+                    self.worker_bytes_max, MAX_STORE_BYTES
+                ),
+            ));
         }
         self.fs.publish(slot, &bytes)?;
         Ok((record.reference()?, note))
@@ -501,6 +620,49 @@ impl ArchiveStore {
     /// publication-slot order. Empty query lists descriptors. Not an exhaustive
     /// ranking service: output is bounded by limit, with no hidden-note matches.
     pub fn search(&self, query: &str, limit: usize) -> io::Result<Vec<ArchiveDescriptor>> {
+        self.search_filtered(query, limit, None)
+    }
+
+    /// [`Self::search`] restricted to the segments in `allow`. Segments outside
+    /// it are skipped during the scan, before matching, the result limit and
+    /// snippets, so foreign segments can neither match nor take a result slot.
+    /// An empty allowlist finds nothing.
+    pub fn search_in(
+        &self,
+        query: &str,
+        limit: usize,
+        allow: &[String],
+    ) -> io::Result<Vec<ArchiveDescriptor>> {
+        let allow = exact_ids(allow)?;
+        self.search_filtered(query, limit, Some(&allow))
+    }
+
+    /// Host-only ownership lookup of exact segment IDs: the stored hashed
+    /// logical identity and whether each is live. Unknown IDs are omitted.
+    pub fn inspect(&self, ids: &[String]) -> io::Result<Vec<ArchiveEntry>> {
+        let wanted = exact_ids(ids)?;
+        if wanted.is_empty() {
+            return Ok(Vec::new());
+        }
+        let _lock = self.exclusive()?;
+        let (records, _) = self.scan()?;
+        Ok(records
+            .into_iter()
+            .filter(|(_, r)| wanted.contains(r.id.as_str()))
+            .map(|(_, r)| ArchiveEntry {
+                live: matches!(r.body, Body::Live { .. }),
+                id: r.id,
+                logical_id: r.logical,
+            })
+            .collect())
+    }
+
+    fn search_filtered(
+        &self,
+        query: &str,
+        limit: usize,
+        allow: Option<&std::collections::BTreeSet<&str>>,
+    ) -> io::Result<Vec<ArchiveDescriptor>> {
         if query.len() > 512 || limit > MAX_SEARCH_RESULTS {
             return Err(invalid("archive search query/result budget exceeded"));
         }
@@ -512,6 +674,9 @@ impl ArchiveStore {
         let (records, _) = self.scan()?;
         let mut result = Vec::new();
         for (_, record) in records {
+            if allow.is_some_and(|allow| !allow.contains(record.id.as_str())) {
+                continue;
+            }
             if let Body::Live {
                 messages,
                 source_message_count,
@@ -599,7 +764,15 @@ impl ArchiveStore {
     }
 
     fn scan_with(&self, readonly: bool) -> io::Result<(Vec<(usize, Record)>, usize)> {
+        self.scan_sized(readonly)
+            .map(|(records, used, _)| (records, used))
+    }
+
+    /// [`Self::scan_with`], plus each record's stored size in bytes (in the
+    /// same order as the records).
+    fn scan_sized(&self, readonly: bool) -> io::Result<(SlottedRecords, usize, Vec<usize>)> {
         let mut records = Vec::new();
+        let mut sizes = Vec::new();
         let mut used = 0;
         for slot in 0..MAX_SEGMENTS {
             let Some(bytes) = self.fs.read_with(slot, MAX_STORE_BYTES - used, readonly)? else {
@@ -645,10 +818,14 @@ impl ArchiveStore {
                 return Err(corrupt());
             }
             records.push((slot, record));
+            sizes.push(bytes.len());
         }
-        Ok((records, used))
+        Ok((records, used, sizes))
     }
 }
+
+/// A store's records, each with its slot.
+type SlottedRecords = Vec<(usize, Record)>;
 
 impl Projector {
     fn screen(&self, text: &str, class: DisclosureClass) -> io::Result<String> {
@@ -822,6 +999,9 @@ pub fn export_in(base: &Path, scope_key: &str) -> io::Result<Vec<Value>> {
         redactor: None,
         abort: None,
         wait: LOCK_WAIT,
+        class: SegmentClass::Session, // never seals
+        worker_segments_max: MAX_WORKER_SEGMENTS,
+        worker_bytes_max: MAX_WORKER_BYTES,
     }
     .export_records()
 }
@@ -1191,6 +1371,15 @@ fn validate_id(id: &str) -> io::Result<()> {
     } else {
         Ok(())
     }
+}
+/// A bounded set of exact, valid segment IDs (at most one per slot).
+fn exact_ids(ids: &[String]) -> io::Result<std::collections::BTreeSet<&str>> {
+    if ids.len() > MAX_SEGMENTS {
+        return Err(invalid("archive id list exceeds the segment count"));
+    }
+    ids.iter()
+        .map(|id| validate_id(id).map(|()| id.as_str()))
+        .collect()
 }
 fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
@@ -2369,6 +2558,107 @@ mod tests {
         store.forget(&descriptors[0].id).unwrap();
         assert!(store.seal(&[msg("user", json!("still full"))], "").is_err());
     }
+
+    #[test]
+    fn logical_digest_is_the_stored_owner_derivation() {
+        let (tmp, store) = setup();
+        let reference = store.seal(&[msg("user", json!("owned"))], "").unwrap();
+        let expected = logical_digest("synthetic-logical").unwrap();
+        assert_eq!(expected.len(), 64);
+        assert!(expected
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
+        assert_eq!(expected, digest_parts(&[b"synthetic-logical"]));
+        assert_ne!(expected, logical_digest("synthetic-logica").unwrap());
+        // Same derivation as a projection sent to another backend.
+        let projection =
+            project_archive("synthetic-logical", &[msg("user", json!("x"))], "", None).unwrap();
+        assert_eq!(projection.logical_id, expected);
+        let entries = store.inspect(std::slice::from_ref(&reference.id)).unwrap();
+        assert_eq!(
+            entries,
+            vec![ArchiveEntry {
+                id: reference.id,
+                logical_id: expected,
+                live: true
+            }]
+        );
+        assert!(logical_digest("").is_err());
+        drop(tmp);
+    }
+
+    #[test]
+    fn inspect_reports_owner_and_tombstones_and_omits_unknown_ids() {
+        let tmp = tempfile::tempdir().unwrap();
+        let own = ArchiveStore::new(tmp.path(), "synthetic-project", "worker-run:a").unwrap();
+        let other = ArchiveStore::new(tmp.path(), "synthetic-project", "worker-run:b").unwrap();
+        let mine = own.seal(&[msg("user", json!("mine"))], "").unwrap();
+        let theirs = other.seal(&[msg("user", json!("theirs"))], "").unwrap();
+        let gone = own.seal(&[msg("user", json!("gone"))], "").unwrap();
+        own.forget(&gone.id).unwrap();
+        let unknown = "f".repeat(32);
+        let entries = own
+            .inspect(&[
+                unknown.clone(),
+                theirs.id.clone(),
+                gone.id.clone(),
+                mine.id.clone(),
+            ])
+            .unwrap();
+        let find = |id: &str| entries.iter().find(|e| e.id == id).cloned();
+        assert_eq!(entries.len(), 3);
+        assert!(find(&unknown).is_none());
+        let a = logical_digest("worker-run:a").unwrap();
+        let b = logical_digest("worker-run:b").unwrap();
+        assert_eq!(find(&mine.id).unwrap().logical_id, a);
+        assert!(find(&mine.id).unwrap().live);
+        assert_eq!(find(&theirs.id).unwrap().logical_id, b);
+        assert_eq!(find(&gone.id).unwrap().logical_id, a);
+        assert!(!find(&gone.id).unwrap().live);
+        assert!(own.inspect(&["../x".into()]).is_err());
+        assert!(own
+            .inspect(&vec![mine.id.clone(); MAX_SEGMENTS + 1])
+            .is_err());
+    }
+
+    #[test]
+    fn search_in_filters_before_matching_limits_and_snippets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let foreign = ArchiveStore::new(tmp.path(), "synthetic-project", "session").unwrap();
+        // Foreign segments take the earliest slots and match the query.
+        for n in 0..4 {
+            foreign
+                .seal(&[msg("user", json!(format!("NEEDLE foreign {n}")))], "")
+                .unwrap();
+        }
+        let own = ArchiveStore::new(tmp.path(), "synthetic-project", "worker-run:a").unwrap();
+        let first = own
+            .seal(&[msg("user", json!("NEEDLE own first"))], "")
+            .unwrap();
+        let second = own
+            .seal(&[msg("user", json!("NEEDLE own second"))], "")
+            .unwrap();
+        let allow = vec![second.id.clone(), first.id.clone()];
+        let hits = own.search_in("needle", 1, &allow).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, first.id);
+        assert!(hits[0].snippet.contains("own first"));
+        let all = own.search_in("", 32, &allow).unwrap();
+        assert_eq!(
+            all.iter().map(|d| d.id.clone()).collect::<Vec<_>>(),
+            vec![first.id.clone(), second.id.clone()]
+        );
+        assert!(all.iter().all(|d| !d.snippet.contains("foreign")));
+        assert!(own.search_in("needle", 8, &[]).unwrap().is_empty());
+        assert!(own.search_in("needle", 8, &["nope".into()]).is_err());
+        assert!(own
+            .search_in("needle", 8, &vec![first.id.clone(); MAX_SEGMENTS + 1])
+            .is_err());
+        // Unfiltered search is unchanged and still sees foreign segments first.
+        assert!(own.search("needle", 1).unwrap()[0]
+            .snippet
+            .contains("foreign"));
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -2656,5 +2946,436 @@ mod lock_tests {
         store.forget(&first.id).unwrap();
         let error = store.seal_with_note(&messages, "").unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    /// The owned-history lookups take the same locks as every other
+    /// operation: a foreign lock refuses them at once, and within this process
+    /// they queue behind the operation in progress.
+    #[test]
+    fn owned_lookups_fail_closed_under_a_foreign_lock_and_queue_in_process() {
+        let (tmp, store) = setup();
+        let reference = store.seal(&[msg("user", json!("owned"))], "").unwrap();
+        let allow = vec![reference.id.clone()];
+        let foreign = store.fs.lock().unwrap();
+        let busy = [
+            store.inspect(&allow).map(drop).unwrap_err(),
+            store.search_in("", 8, &allow).map(drop).unwrap_err(),
+        ];
+        for error in busy {
+            assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+            assert_eq!(error.to_string(), BUSY);
+        }
+        drop(foreign);
+        assert_eq!(store.inspect(&allow).unwrap().len(), 1);
+
+        let held = store.exclusive().unwrap();
+        let queued = other(&tmp);
+        let ids = allow.clone();
+        let waiter = std::thread::spawn(move || queued.inspect(&ids));
+        let gate = gate_of(&store);
+        wait_until(|| gate.waited.load(Ordering::Acquire) == 1);
+        assert!(!waiter.is_finished());
+        drop(held);
+        assert_eq!(waiter.join().unwrap().unwrap().len(), 1);
+    }
+}
+
+/// Worker segments' ceiling inside the shared store (subagent rollover §9).
+#[cfg(all(test, unix))]
+mod worker_ceiling_tests {
+    use super::*;
+
+    fn msg(text: &str) -> SharedMessage {
+        Arc::new(json!({"role": "assistant", "content": text}))
+    }
+    fn worker(tmp: &tempfile::TempDir, run: &str) -> ArchiveStore {
+        worker_at(tmp.path(), run)
+    }
+    fn worker_at(base: &Path, run: &str) -> ArchiveStore {
+        ArchiveStore::new(base, "synthetic-project", &format!("worker-run:{run}"))
+            .unwrap()
+            .with_class(SegmentClass::Worker)
+    }
+    fn session(tmp: &tempfile::TempDir) -> ArchiveStore {
+        ArchiveStore::new(tmp.path(), "synthetic-project", "synthetic-session").unwrap()
+    }
+    fn count(store: &ArchiveStore) -> (usize, usize) {
+        let (records, _) = store.scan().unwrap();
+        let workers = records
+            .iter()
+            .filter(|(_, r)| SegmentClass::of_id(&r.id) == SegmentClass::Worker)
+            .count();
+        (records.len(), workers)
+    }
+    fn ceiling(error: io::Error) -> String {
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        error.to_string()
+    }
+
+    #[test]
+    fn worker_seals_stop_at_the_worker_slot_ceiling() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = worker(&tmp, "a");
+        for n in 0..MAX_WORKER_SEGMENTS {
+            let reference = store.seal(&[msg(&format!("window {n}"))], "").unwrap();
+            assert_eq!(SegmentClass::of_id(&reference.id), SegmentClass::Worker);
+        }
+        let refused = store.seal(&[msg("one too many")], "").unwrap_err();
+        assert_eq!(
+            ceiling(refused),
+            "worker history ceiling reached (64 of 128 segments, tombstones retained)"
+        );
+        // Another worker run is refused as well: the ceiling is the store's.
+        assert!(worker(&tmp, "b").seal(&[msg("another run")], "").is_err());
+        assert_eq!(count(&store), (MAX_WORKER_SEGMENTS, MAX_WORKER_SEGMENTS));
+    }
+
+    #[test]
+    fn session_seals_ignore_the_worker_ceiling() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workers = worker(&tmp, "a");
+        for n in 0..MAX_WORKER_SEGMENTS {
+            workers.seal(&[msg(&format!("window {n}"))], "").unwrap();
+        }
+        let sessions = session(&tmp);
+        for n in MAX_WORKER_SEGMENTS..MAX_SEGMENTS {
+            let reference = sessions.seal(&[msg(&format!("session {n}"))], "").unwrap();
+            assert_eq!(SegmentClass::of_id(&reference.id), SegmentClass::Session);
+            assert_eq!(uuid::Uuid::parse_str(&reference.id).unwrap().get_version_num(), 4);
+        }
+        // The store's own budget, with its own message, as before.
+        let full = sessions.seal(&[msg("session overflow")], "").unwrap_err();
+        assert_eq!(
+            full.to_string(),
+            "archive segment budget exhausted (tombstones retained)"
+        );
+        assert_eq!(count(&sessions), (MAX_SEGMENTS, MAX_WORKER_SEGMENTS));
+    }
+
+    #[test]
+    fn worker_ceiling_counts_tombstones_and_orphans() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut gone = worker(&tmp, "gone");
+        gone.worker_segments_max = 3;
+        let first = gone.seal(&[msg("first")], "").unwrap();
+        gone.seal(&[msg("second")], "").unwrap();
+        gone.seal(&[msg("third")], "").unwrap();
+        // A tombstone keeps its slot, and its id keeps its class.
+        gone.forget(&first.id).unwrap();
+        drop(gone);
+        // The run that sealed them is gone (nothing references its segments
+        // any more): they still count for the next run.
+        let mut next = worker(&tmp, "next");
+        next.worker_segments_max = 3;
+        let refused = next.seal(&[msg("next run")], "").unwrap_err();
+        assert!(ceiling(refused).starts_with("worker history ceiling reached (3 of 128"));
+        assert_eq!(count(&next), (3, 3));
+    }
+
+    #[test]
+    fn worker_byte_ceiling_refuses_before_writing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = worker(&tmp, "a");
+        store.seal(&[msg("window-1")], "note").unwrap();
+        let (_, _, sizes) = store.scan_sized(false).unwrap();
+        // Same-length content: every one of these records has the same size.
+        store.worker_bytes_max = sizes[0] * 2;
+        store.seal(&[msg("window-2")], "note").unwrap();
+        let refused = store.seal(&[msg("window-3")], "note").unwrap_err();
+        assert_eq!(
+            ceiling(refused),
+            format!(
+                "worker history byte ceiling reached ({} of {MAX_STORE_BYTES} bytes)",
+                sizes[0] * 2
+            )
+        );
+        assert_eq!(count(&store), (2, 2), "nothing was written");
+        // Session segments neither count nor are limited by it.
+        session(&tmp).seal(&[msg("session evidence")], "note").unwrap();
+        assert_eq!(count(&store), (3, 2));
+    }
+
+    /// Every byte test lowers `worker_bytes_max`; this pins the ceiling a
+    /// store starts with.
+    #[test]
+    fn the_worker_byte_ceiling_is_128_mib() {
+        assert_eq!(MAX_WORKER_BYTES, 128 << 20);
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(worker(&tmp, "a").worker_bytes_max, 128 << 20);
+    }
+
+    /// The byte ceiling counts every worker segment in the store, as the slot
+    /// ceiling does: here the bytes over the line are a forgotten window's
+    /// tombstone and a window of a run that is gone.
+    #[test]
+    fn worker_byte_ceiling_counts_tombstones_and_orphans() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gone = worker(&tmp, "gone");
+        let forgotten = gone.seal(&[msg("window-1")], "note").unwrap();
+        gone.seal(&[msg("window-2")], "note").unwrap();
+        gone.forget(&forgotten.id).unwrap();
+        drop(gone);
+        let mut next = worker(&tmp, "next");
+        let (records, _, sizes) = next.scan_sized(false).unwrap();
+        let size_of = |live: bool| {
+            records
+                .iter()
+                .zip(&sizes)
+                .find(|((_, r), _)| matches!(r.body, Body::Live { .. }) == live)
+                .map(|(_, size)| *size)
+                .unwrap()
+        };
+        let (tombstone, orphan) = (size_of(false), size_of(true));
+        // Same-length content: the next run's window is the orphan's size.
+        let line = tombstone + orphan + orphan;
+        next.worker_bytes_max = line - 1;
+        let refused = next.seal(&[msg("window-3")], "note").unwrap_err();
+        assert_eq!(
+            ceiling(refused),
+            format!(
+                "worker history byte ceiling reached ({} of {MAX_STORE_BYTES} bytes)",
+                line - 1
+            )
+        );
+        assert_eq!(count(&next), (2, 2), "nothing was written");
+        // Exactly at the line, the same window is admitted.
+        next.worker_bytes_max = line;
+        next.seal(&[msg("window-3")], "note").unwrap();
+        assert_eq!(count(&next), (3, 3));
+        let (_, _, sizes) = next.scan_sized(false).unwrap();
+        assert_eq!(sizes.iter().sum::<usize>(), line);
+    }
+
+    #[test]
+    fn a_retried_worker_seal_at_the_ceiling_dedups() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = worker(&tmp, "a");
+        store.worker_segments_max = 2;
+        let first = store.seal(&[msg("first")], "note").unwrap();
+        store.seal(&[msg("second")], "note").unwrap();
+        // A retry of a sealed window is that window: no slot, no refusal.
+        assert_eq!(store.seal(&[msg("first")], "other note").unwrap(), first);
+        assert!(store.seal(&[msg("third")], "note").is_err());
+        assert_eq!(count(&store), (2, 2));
+    }
+
+    #[test]
+    fn concurrent_worker_seals_at_the_boundary_admit_exactly_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let filler = worker(&tmp, "filler");
+        for n in 0..MAX_WORKER_SEGMENTS - 1 {
+            filler.seal(&[msg(&format!("window {n}"))], "").unwrap();
+        }
+        let racers = 8;
+        let barrier = Arc::new(std::sync::Barrier::new(racers));
+        let handles: Vec<_> = (0..racers)
+            .map(|n| {
+                let base = tmp.path().to_path_buf();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let store = ArchiveStore::new(
+                        &base,
+                        "synthetic-project",
+                        &format!("worker-run:racer-{n}"),
+                    )
+                    .unwrap()
+                    .with_class(SegmentClass::Worker);
+                    barrier.wait();
+                    store.seal(&[msg(&format!("racer {n}"))], "")
+                })
+            })
+            .collect();
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1);
+        for refused in results.into_iter().filter_map(Result::err) {
+            assert!(ceiling(refused).starts_with("worker history ceiling reached"));
+        }
+        assert_eq!(count(&filler), (MAX_WORKER_SEGMENTS, MAX_WORKER_SEGMENTS));
+    }
+
+    /// The racer child's environment variable: the archive base it seals in.
+    const RACER_BASE: &str = "SYNAPS_TEST_WORKER_CEILING_RACER_BASE";
+    const RACER_READY: &str = "worker-ceiling-racer-ready";
+    const RACER_RESULT: &str = "worker-ceiling-racer-result: ";
+
+    /// A seal's outcome, as both racers report it.
+    fn outcome(sealed: io::Result<ArchiveRef>) -> String {
+        match sealed {
+            Ok(reference) => format!("admitted {}", reference.id),
+            Err(error) => format!("refused {:?}: {error}", error.kind()),
+        }
+    }
+
+    /// [`concurrent_worker_seals_at_the_boundary_admit_exactly_one`] across
+    /// processes, where the gate is not shared and the archive's flock is the
+    /// only exclusion. The forked child execs this test binary into
+    /// `worker_ceiling_racer_child` (between fork and exec only
+    /// async-signal-safe calls are allowed, and a seal makes others). With
+    /// 63 worker segments used: (A) while the parent holds the flock, the
+    /// child's seal is refused busy and writes nothing; (B) the parent and
+    /// the child seal at once and exactly one is admitted. The other is
+    /// refused busy (it met the winner's lock) or at the ceiling (it scanned
+    /// after the winner published); which one depends on timing, and the test
+    /// names it.
+    #[test]
+    fn a_forked_child_racing_at_the_worker_ceiling_admits_exactly_one() {
+        use std::io::BufRead;
+        use std::process::{Child, Command, Stdio};
+        /// Kills and reaps the child on every path, unwinding included.
+        struct Racer(Child);
+        impl Drop for Racer {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let busy = format!("refused WouldBlock: {BUSY}");
+        let at_ceiling = format!(
+            "refused InvalidInput: worker history ceiling reached \
+             ({MAX_WORKER_SEGMENTS} of {MAX_SEGMENTS} segments, tombstones retained)"
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let filler = worker(&tmp, "filler");
+        for n in 0..MAX_WORKER_SEGMENTS - 1 {
+            filler.seal(&[msg(&format!("window {n}"))], "").unwrap();
+        }
+        let (_, module) = module_path!().split_once("::").unwrap();
+        let child_test = format!("{module}::worker_ceiling_racer_child");
+        let mut racer = Racer(
+            Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", child_test.as_str(), "--nocapture"])
+                .env(RACER_BASE, tmp.path())
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        let mut go = racer.0.stdin.take().unwrap();
+        let stdout = racer.0.stdout.take().unwrap();
+        let (lines_tx, lines) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for line in io::BufReader::new(stdout).lines() {
+                if lines_tx.send(line).is_err() {
+                    return;
+                }
+            }
+        });
+        // Bounded: a child that never reports fails the test (the guard
+        // kills and reaps it).
+        let reported = |marker: &str| -> String {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                let left = deadline.saturating_duration_since(Instant::now());
+                let line = lines
+                    .recv_timeout(left)
+                    .unwrap_or_else(|error| panic!("the child never reported {marker:?}: {error}"))
+                    .unwrap();
+                if let Some((_, rest)) = line.split_once(marker) {
+                    return rest.to_string();
+                }
+            }
+        };
+        reported(RACER_READY);
+
+        // (A) Contended: the parent holds the lock, so the child's seal is
+        // refused at once and writes nothing.
+        let held = filler.fs.lock().unwrap();
+        go.write_all(b"g").unwrap();
+        assert_eq!(reported(RACER_RESULT), busy);
+        drop(held);
+        let used = MAX_WORKER_SEGMENTS - 1;
+        assert_eq!(count(&filler), (used, used));
+
+        // (B) The race for the last worker slot.
+        let parent = worker(&tmp, "parent");
+        go.write_all(b"g").unwrap();
+        let ours = outcome(parent.seal(&[msg("parent racer")], ""));
+        let theirs = reported(RACER_RESULT);
+        drop(go);
+        assert!(racer.0.wait().unwrap().success());
+        let (winner, loser, refusal) = match (
+            ours.strip_prefix("admitted "),
+            theirs.strip_prefix("admitted "),
+        ) {
+            (Some(id), None) => (id, "child", &theirs),
+            (None, Some(id)) => (id, "parent", &ours),
+            _ => panic!("not exactly one admitted: parent {ours:?}, child {theirs:?}"),
+        };
+        let why = if *refusal == busy {
+            "busy"
+        } else if *refusal == at_ceiling {
+            "at the ceiling"
+        } else {
+            panic!("the {loser} was refused neither busy nor at the ceiling: {refusal}")
+        };
+        eprintln!("the {loser} lost the race for the last worker slot: refused {why}");
+        assert_eq!(count(&filler), (MAX_WORKER_SEGMENTS, MAX_WORKER_SEGMENTS));
+        assert!(filler.inspect(&[winner.to_string()]).unwrap()[0].live);
+    }
+
+    /// The child half of
+    /// `a_forked_child_racing_at_the_worker_ceiling_admits_exactly_one`, in
+    /// its own process; a no-op anywhere else. It seals one window per byte
+    /// on stdin and reports each outcome on stdout; EOF ends it.
+    #[test]
+    fn worker_ceiling_racer_child() {
+        let Some(base) = std::env::var_os(RACER_BASE) else {
+            return;
+        };
+        let store = worker_at(Path::new(&base), "child");
+        let mut stdin = io::stdin().lock();
+        println!("{RACER_READY}");
+        let mut go = [0; 1];
+        loop {
+            match stdin.read_exact(&mut go) {
+                Ok(()) => {
+                    let sealed = store.seal(&[msg("child racer")], "");
+                    println!("{RACER_RESULT}{}", outcome(sealed));
+                }
+                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return,
+                Err(error) => panic!("the parent's pipe failed: {error}"),
+            }
+        }
+    }
+
+    /// Stands in for a rollback to a binary from before worker segments, with
+    /// the current code opened without a class (no older binary runs here):
+    /// the stored record has exactly the fields it always had, and a store
+    /// opened without a class reads, finds, dedups and forgets a worker
+    /// segment as an ordinary one. Dedup and the digest never look at the id.
+    #[test]
+    fn a_worker_record_reads_as_a_legacy_segment() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = worker(&tmp, "a");
+        let reference = store.seal(&[msg("worker evidence")], "note").unwrap();
+        assert_eq!(uuid::Uuid::parse_str(&reference.id).unwrap().get_version_num(), 8);
+        validate_id(&reference.id).unwrap();
+        let path = tmp
+            .path()
+            .join("context-archives")
+            .join(&store.scope)
+            .join("000.json");
+        let raw: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let mut keys: Vec<&str> = raw.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["body", "digest", "id", "logical", "scope", "version"]);
+        assert_eq!(raw["version"], 1);
+        let stored = store.fetch_with_provenance(&reference.id, 0, 1).unwrap();
+        assert_eq!(
+            raw["digest"],
+            projection_digest(&store.logical, 1, &stored).unwrap().as_str()
+        );
+
+        // The current code opened without a class, standing in for an older
+        // binary.
+        let legacy = ArchiveStore::new(tmp.path(), "synthetic-project", "worker-run:a").unwrap();
+        assert_eq!(legacy.fetch(&reference.id, 0, 1).unwrap(), vec![msg("worker evidence")]);
+        assert_eq!(legacy.search("worker evidence", 1).unwrap()[0].id, reference.id);
+        // Dedup is by digest: the same window from a classless store is the
+        // same segment, whatever class wrote it.
+        assert_eq!(legacy.seal(&[msg("worker evidence")], "").unwrap(), reference);
+        legacy.forget(&reference.id).unwrap();
+        assert!(!legacy.inspect(std::slice::from_ref(&reference.id)).unwrap()[0].live);
+        assert_eq!(count(&legacy), (1, 1), "the tombstone keeps its class");
     }
 }

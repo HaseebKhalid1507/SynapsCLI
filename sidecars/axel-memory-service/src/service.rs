@@ -22,6 +22,24 @@ pub struct Service {
     pub(crate) members: Vec<String>,
     pub(crate) shared: bool,
     pub(crate) project: String,
+    pub(crate) clock: Clock,
+}
+/// History time source (row `created_ms` and eviction ages). Production always
+/// reads the wall clock; only this crate's unit tests can pin it, so there is
+/// no runtime override.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Clock {
+    #[cfg(test)]
+    pub(crate) fixed_ms: Option<i64>,
+}
+impl Clock {
+    pub(crate) fn now_ms(self) -> i64 {
+        #[cfg(test)]
+        if let Some(ms) = self.fixed_ms {
+            return ms;
+        }
+        Utc::now().timestamp_millis()
+    }
 }
 impl Service {
     pub fn open(path: &Path, project: &str) -> Result<Self> {
@@ -63,6 +81,13 @@ impl Service {
             )?;
         }
         crate::database::initialize(c)?;
+        if !exists {
+            // A new brain counts its history deletions from zero: the counter
+            // row and its trigger (on synaps_history, so after initialize).
+            // A brain created before the counter has neither ("unknown") and
+            // never gains them.
+            crate::history::track_evictions(c)?;
+        }
         let (shared, canonical, members) = crate::scope::initialize(c, project)?;
         // Every stored title/abstract is empty. Axel's secret FTS row therefore
         // contains no indexed tokens (only its UNINDEXED mem_id).
@@ -100,6 +125,7 @@ impl Service {
             canonical,
             members,
             project: project.to_owned(),
+            clock: Clock::default(),
         };
         service.durable()?;
         Ok(service)

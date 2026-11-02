@@ -82,6 +82,7 @@ enum Operation {
     ForumForget(Forget),
     HistorySeal(crate::history::Seal),
     HistorySearch(crate::history::HistorySearch),
+    HistoryInspect(crate::history::HistoryInspect),
     HistoryFetch(crate::history::HistoryFetch),
     HistoryNote(Forget),
     HistoryForget(Forget),
@@ -202,6 +203,9 @@ fn parse(request: Request, project: &str, operator: bool) -> Result<Operation> {
         "history_search" => Ok(Operation::HistorySearch(serde_json::from_value(
             request.payload,
         )?)),
+        "history_inspect" => Ok(Operation::HistoryInspect(serde_json::from_value(
+            request.payload,
+        )?)),
         "history_fetch" => Ok(Operation::HistoryFetch(serde_json::from_value(
             request.payload,
         )?)),
@@ -283,7 +287,7 @@ pub fn run_with_options(
                 );
             }
             return Ok(
-                json!({"operations":["store","search","fetch","forget","forum_post","forum_read","forum_forget","history_seal","history_search","history_fetch","history_note","history_forget","capture","capture_query","migration_apply","stats","sweep","export","legacy_export","scope_info"],"operator_operations":["scope_upgrade","scope_alias"],"scope_model":"immutable_membership/1","user_project":USER_PROJECT,"record_schema":RECORD_SCHEMA,"max_frame_bytes":MAX_FRAME,"max_large_frame_bytes":MAX_LARGE_FRAME,"history_logical_id":"sha256_length_prefixed","history_fetch":"archived_message_array","forum":{"schema":1}}),
+                json!({"operations":["store","search","fetch","forget","forum_post","forum_read","forum_forget","history_seal","history_search","history_inspect","history_fetch","history_note","history_forget","capture","capture_query","migration_apply","stats","sweep","export","legacy_export","scope_info"],"operator_operations":["scope_upgrade","scope_alias"],"scope_model":"immutable_membership/1","user_project":USER_PROJECT,"record_schema":RECORD_SCHEMA,"max_frame_bytes":MAX_FRAME,"max_large_frame_bytes":MAX_LARGE_FRAME,"history_logical_id":"sha256_length_prefixed","history_fetch":"archived_message_array","history_owned":{"versions":[1,2],"max_ids":crate::history::MAX_OWNED_IDS},"forum":{"schema":1}}),
             );
         }
         if let Operation::LegacyExport(q) = op {
@@ -306,6 +310,7 @@ pub fn run_with_options(
             Operation::ForumForget(q) => Ok(json!(service.forum_forget(&q.id)?)),
             Operation::HistorySeal(q) => service.history_seal(q),
             Operation::HistorySearch(q) => service.history_search(q),
+            Operation::HistoryInspect(q) => service.history_inspect(q),
             Operation::HistoryFetch(q) => Ok(serde_json::to_value(service.history_fetch(q)?)?),
             Operation::HistoryNote(q) => Ok(json!(service.history_note(&q.id)?)),
             Operation::HistoryForget(q) => Ok(json!(service.history_forget(&q.id)?)),

@@ -14,6 +14,13 @@ use std::sync::Arc;
 mod competing;
 pub mod forum;
 mod history;
+/// The archive's screening redactor, shared with derived projections (the
+/// rollover summary) so they never see more than the archive keeps.
+pub(crate) use history::redactor as archive_redactor;
+pub use history::{
+    HistoryInspection, OwnedHistorySupport, MAX_OWNED_IDS, OWNED_HISTORY_CAPABILITY,
+    OWNED_HISTORY_EVICTIONS_VERSION, OWNED_HISTORY_VERSION,
+};
 pub mod migration;
 mod process;
 mod provisioning;
@@ -64,6 +71,17 @@ enum Backend {
 }
 fn error(message: impl Into<String>) -> RuntimeError {
     RuntimeError::Tool(format!("memory: {}", message.into()))
+}
+
+/// Is this exactly the Axel service's `not_found` answer? The text is
+/// host-authored (the service's own message is never echoed), so an exact
+/// match can't be produced by a transport, storage or protocol failure.
+pub fn is_not_found(e: &RuntimeError) -> bool {
+    matches!(e, RuntimeError::Tool(m) if m.strip_prefix("memory: ") == Some(process::NOT_FOUND))
+}
+#[cfg(test)]
+pub(crate) fn process_not_found_for_tests() -> &'static str {
+    process::NOT_FOUND
 }
 
 impl MemoryBinding {
@@ -148,6 +166,15 @@ impl MemoryBinding {
             backend,
         }))
     }
+    /// Test-only constructor over an explicit base and scope.
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        base: PathBuf,
+        scope: ProjectScope,
+        config: &MemoryBackendConfig,
+    ) -> Self {
+        Self::new(base, Ok(scope), config)
+    }
     /// Captured host identity; metadata only. Never grants an alias merge.
     pub fn repository_identity(
         &self,
@@ -208,8 +235,25 @@ impl MemoryBinding {
             _ => Err(error("Axel backend is not configured; no fallback")),
         }
     }
+    /// The backend this binding selected: "axel", "legacy" or "unavailable"
+    /// (Axel selected without usable absolute paths, or an unknown backend
+    /// value). Selection only: "axel" does not mean the service has answered;
+    /// it is spawned per operation.
+    pub fn backend_name(&self) -> &'static str {
+        match self.0.backend {
+            Backend::Legacy => "legacy",
+            Backend::Axel { .. } => "axel",
+            Backend::Unavailable => "unavailable",
+        }
+    }
     pub fn exclusive(&self) -> bool {
         !matches!(self.0.backend, Backend::Legacy)
+    }
+    /// Test-only identity check: the very same host binding, not merely the
+    /// same backend kind or project scope.
+    #[cfg(test)]
+    pub(crate) fn same_binding_for_tests(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
     }
     pub fn scope(&self) -> Result<&ProjectScope> {
         self.0
@@ -518,6 +562,28 @@ struct Descriptor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn backend_name_reports_the_selection() {
+        let name = |config: MemoryBackendConfig| {
+            MemoryBinding::new(PathBuf::from("/base"), Err("no scope".to_owned()), &config)
+                .backend_name()
+        };
+        let axel = |executable: &str| MemoryBackendConfig {
+            kind: MemoryBackendKind::Axel,
+            executable: Some(PathBuf::from(executable)),
+            brain: Some(PathBuf::from("/base/memory/axel/brain.r8")),
+            user_scope: false,
+        };
+        assert_eq!(name(MemoryBackendConfig::default()), "legacy");
+        assert_eq!(name(axel("/opt/synaps-axel-memory-service")), "axel");
+        assert_eq!(name(axel("relative/synaps-axel-memory-service")), "unavailable");
+        let unknown = MemoryBackendConfig {
+            kind: MemoryBackendKind::Unavailable,
+            ..MemoryBackendConfig::default()
+        };
+        assert_eq!(name(unknown), "unavailable");
+    }
 
     fn assert_same_storage(parent: &MemoryBinding, child: &MemoryBinding) {
         assert_eq!(child.0.base, parent.0.base);

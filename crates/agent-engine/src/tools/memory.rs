@@ -143,6 +143,64 @@ fn retention_label(r: MemoryRetention) -> String {
     }
 }
 
+/// Model-facing listing of history descriptors (shared with the owned-history
+/// worker tools).
+pub(crate) fn render_history_descriptors(
+    rows: Vec<agent_core::context_archive::ArchiveDescriptor>,
+) -> String {
+    let mut out = LOWER_AUTHORITY_HEADER.to_owned();
+    for row in rows {
+        out.push_str(&format!(
+            "\nctx-{} messages={} source_messages={} snippet={}",
+            row.id, row.message_count, row.source_message_count, row.snippet
+        ));
+    }
+    out
+}
+
+/// Model-facing page of one history range, bounded to about 24 KiB with
+/// intra-message byte pagination (shared with the owned-history worker tools).
+pub(crate) fn render_history_rows(
+    rows: &[agent_core::context_archive::ArchivedMessage],
+    start: usize,
+    offset_bytes: usize,
+) -> Result<String> {
+    let mut out = LOWER_AUTHORITY_HEADER.to_owned();
+    for (offset, row) in rows.iter().enumerate() {
+        let serialized = row.message.to_string();
+        let requested = if offset == 0 { offset_bytes } else { 0 };
+        if requested > serialized.len() {
+            return Err(RuntimeError::Tool(
+                "offset_bytes exceeds message length".into(),
+            ));
+        }
+        let mut from = requested;
+        while !serialized.is_char_boundary(from) {
+            from += 1;
+        }
+        let available = (24 * 1024usize).saturating_sub(out.len() + 300);
+        let excerpt = agent_core::truncate_str(&serialized[from..], available);
+        out.push_str(&format!(
+            "\n[eligible_index={} source_index={} bytes={}..{} of {}] {}",
+            start + offset,
+            row.source_index,
+            from,
+            from + excerpt.len(),
+            serialized.len(),
+            excerpt
+        ));
+        if from + excerpt.len() < serialized.len() {
+            out.push_str(&format!(
+                "\n[next fetch: start={} offset_bytes={}]",
+                start + offset,
+                from + excerpt.len()
+            ));
+            break;
+        }
+    }
+    Ok(out)
+}
+
 // ─── memory_search ───────────────────────────────────────────────────────────
 
 pub struct MemorySearchTool;
@@ -195,14 +253,7 @@ impl Tool for MemorySearchTool {
             let query = params["query"].as_str().unwrap_or("").to_owned();
             let limit = params["limit"].as_u64().unwrap_or(8).min(25) as usize;
             let rows = binding.history_search(&query, limit).await?;
-            let mut out = LOWER_AUTHORITY_HEADER.to_owned();
-            for row in rows {
-                out.push_str(&format!(
-                    "\nctx-{} messages={} source_messages={} snippet={}",
-                    row.id, row.message_count, row.source_message_count, row.snippet
-                ));
-            }
-            return Ok(out);
+            return Ok(render_history_descriptors(rows));
         }
         if params
             .get("source")
@@ -342,44 +393,8 @@ impl Tool for MemoryFetchTool {
             let start = params["start"].as_u64().unwrap_or(0) as usize;
             let limit = params["limit"].as_u64().unwrap_or(8).clamp(1, 32) as usize;
             let rows = binding.history_fetch(&id, start, limit).await?;
-            let mut out = LOWER_AUTHORITY_HEADER.to_owned();
-            for (offset, row) in rows.iter().enumerate() {
-                let serialized = row.message.to_string();
-                let requested = if offset == 0 {
-                    params["offset_bytes"].as_u64().unwrap_or(0) as usize
-                } else {
-                    0
-                };
-                if requested > serialized.len() {
-                    return Err(RuntimeError::Tool(
-                        "offset_bytes exceeds message length".into(),
-                    ));
-                }
-                let mut from = requested;
-                while !serialized.is_char_boundary(from) {
-                    from += 1;
-                }
-                let available = (24 * 1024usize).saturating_sub(out.len() + 300);
-                let excerpt = agent_core::truncate_str(&serialized[from..], available);
-                out.push_str(&format!(
-                    "\n[eligible_index={} source_index={} bytes={}..{} of {}] {}",
-                    start + offset,
-                    row.source_index,
-                    from,
-                    from + excerpt.len(),
-                    serialized.len(),
-                    excerpt
-                ));
-                if from + excerpt.len() < serialized.len() {
-                    out.push_str(&format!(
-                        "\n[next fetch: start={} offset_bytes={}]",
-                        start + offset,
-                        from + excerpt.len()
-                    ));
-                    break;
-                }
-            }
-            return Ok(out);
+            let offset_bytes = params["offset_bytes"].as_u64().unwrap_or(0) as usize;
+            return render_history_rows(&rows, start, offset_bytes);
         }
         let records = binding.fetch(&ids).await?;
         let mut out = LOWER_AUTHORITY_HEADER.to_string();

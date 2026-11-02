@@ -137,6 +137,8 @@ fn fixture_session(id: &str, system_prompt: Option<&str>, api_messages: Vec<Valu
         keepwarm_tokens: Default::default(),
         total_cache_read_tokens: 0,
         total_cache_creation_tokens: 0,
+        child_cost: 0.0,
+        child_tokens: Default::default(),
         message_count: 0,
         api_messages: api_messages.into_iter().map(Arc::new).collect(),
         abort_context: None,
@@ -144,8 +146,10 @@ fn fixture_session(id: &str, system_prompt: Option<&str>, api_messages: Vec<Valu
         compacted_into: None,
         env: None,
         env_stripped: Vec::new(),
+        forked_from: None,
         prompt_provenance: None,
         compaction: None,
+        client_tool_stamps: Default::default(),
     }
 }
 

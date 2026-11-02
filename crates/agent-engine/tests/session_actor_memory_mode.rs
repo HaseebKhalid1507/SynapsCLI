@@ -142,7 +142,7 @@ async fn memory_off_survives_a_daemon_reload() {
 
     // What `daemon reload` records for the session…
     handle
-        .send(SessionCommand::Checkpoint { reason: CheckpointReason::Reload })
+        .send(SessionCommand::Checkpoint { reason: CheckpointReason::Reload, deadline: None, skip_quiesce_grace: false })
         .await
         .unwrap();
     let seen = until(&mut t, |e| {
@@ -213,7 +213,7 @@ async fn consent_revoked_outside_slash_memory_survives_park_and_reload() {
     drop(runtime);
 
     handle
-        .send(SessionCommand::Checkpoint { reason: CheckpointReason::Reload })
+        .send(SessionCommand::Checkpoint { reason: CheckpointReason::Reload, deadline: None, skip_quiesce_grace: false })
         .await
         .unwrap();
     let seen = until(&mut t, |e| {
@@ -264,7 +264,7 @@ async fn recorded_memory_mode(
     t: &mut LocalTransport,
 ) -> Option<agent_engine::session::SessionMemoryMode> {
     handle
-        .send(SessionCommand::Checkpoint { reason: CheckpointReason::HostRequest })
+        .send(SessionCommand::Checkpoint { reason: CheckpointReason::HostRequest, deadline: None, skip_quiesce_grace: false })
         .await
         .unwrap();
     let seen = until(t, |e| {

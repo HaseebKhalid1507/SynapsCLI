@@ -72,7 +72,7 @@ impl Service {
             return Err(Error::Invalid);
         }
         if q.records.len() + q.tombstones.len() > 16384
-            || q.histories.len() > 128
+            || q.histories.len() > crate::history::MAX_HISTORY_RECORDS
             || q.captures.len() > 16384
             || q.fingerprints.len() > 32768
         {
@@ -97,6 +97,15 @@ impl Service {
                 if manifest!=q.manifest_digest||digest!=request_digest{return Err(Error::Conflict)}
                 return Ok(serde_json::from_str(&counts)?)
             }
+            // Every applied migration makes the eviction count unknown, for
+            // good. Its inventory may come from a brain that evicted windows
+            // it no longer holds, and may even carry no history though the
+            // source evicted (victims are picked across the scope group, an
+            // export takes one project). Removing the row here, first in the
+            // import transaction, makes `history_inspect` v2 read null and
+            // rolls back with a failed apply; nothing creates the row for an
+            // existing brain. An exact replay returned above.
+            c.execute("DELETE FROM brain_meta WHERE key=?1",[crate::history::EVICTIONS_KEY])?;
             for fp in &q.fingerprints {
                 if !matches!(fp.kind.as_str(),"note"|"capture"|"history")||!hex(&fp.digest,64){return Err(Error::Invalid)}
                 c.execute("INSERT OR IGNORE INTO synaps_fingerprints VALUES(?1,?2,?3)",params![self.project,fp.kind,fp.digest])?;

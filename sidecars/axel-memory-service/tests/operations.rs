@@ -16,6 +16,22 @@ fn envelope(project: &str, op: &str, payload: Value) -> Value {
     json!({"schema":SCHEMA,"project":project,"operation":op,"payload":payload})
 }
 fn raw(path: &Path, project: &str, input: &[u8]) -> Vec<Value> {
+    raw_with_stderr(path, project, input).0
+}
+/// The only stderr the service writes: one line per seal capacity eviction
+/// with a scope-key prefix, class, whole hours of age and the row ID.
+fn eviction_line(line: &str) -> bool {
+    let fields: Vec<&str> = line.split(' ').collect();
+    let hex = |s: &str, n: usize| s.len() == n && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+    matches!(fields.as_slice(), ["axel_history_evict", scope, class, age, id]
+        if scope.strip_prefix("scope=p").is_some_and(|s| hex(s, 8))
+            && ["tombstoned", "stale", "superseded", "newest", "floor"]
+                .iter()
+                .any(|c| class.strip_prefix("class=") == Some(*c))
+            && age.strip_prefix("age_h=").is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+            && id.strip_prefix("id=").is_some_and(|s| hex(s, 32)))
+}
+fn raw_with_stderr(path: &Path, project: &str, input: &[u8]) -> (Vec<Value>, String) {
     let mut child = Command::new(env!("CARGO_BIN_EXE_synaps-axel-memory-service"))
         .args(["--brain", path.to_str().unwrap(), "--project", project])
         .env_clear()
@@ -38,8 +54,9 @@ fn raw(path: &Path, project: &str, input: &[u8]) -> Vec<Value> {
         output.status,
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(output.stderr.is_empty());
-    output
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.lines().all(eviction_line), "{stderr}");
+    let replies = output
         .stdout
         .split(|b| *b == b'\n')
         .filter(|s| !s.is_empty())
@@ -47,7 +64,32 @@ fn raw(path: &Path, project: &str, input: &[u8]) -> Vec<Value> {
             assert!(s.len() < 24 * MAX_FRAME);
             serde_json::from_slice(s).unwrap()
         })
-        .collect()
+        .collect();
+    (replies, stderr)
+}
+fn call_with_stderr(path: &Path, op: &str, payload: Value) -> (Value, String) {
+    let input = format!(
+        "{}\n{}\n",
+        envelope(PROJECT, "hello", json!({})),
+        envelope(PROJECT, op, payload)
+    );
+    let (replies, stderr) = raw_with_stderr(path, PROJECT, input.as_bytes());
+    assert_eq!(replies.len(), 2);
+    (replies[1].clone(), stderr)
+}
+/// Stored history row IDs, oldest first (read-only; no service running).
+fn history_ids(path: &Path) -> Vec<Value> {
+    let c = rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .unwrap();
+    let mut stmt = c
+        .prepare("SELECT id FROM synaps_history ORDER BY created_ms,id")
+        .unwrap();
+    let ids = stmt
+        .query_map([], |r| r.get::<_, String>(0))
+        .unwrap()
+        .map(|id| json!(id.unwrap()))
+        .collect();
+    ids
 }
 fn call_scope(path: &Path, project: &str, op: &str, payload: Value) -> Value {
     let input = format!(
@@ -831,29 +873,81 @@ fn tombstone_first_capture_worker_recovers_source_before_acknowledgement() {
     }
 }
 #[test]
+fn history_seal_eviction_spares_active_sessions_first_and_newest_archives() {
+    // Every session here is active (newest archive < 24 h old), so each one's
+    // FIRST and newest archive are floor-protected: an idle session's single
+    // archive survives a busy session filling the scope, and so does the busy
+    // session's first window. Its superseded middle windows go, oldest first.
+    let (_d, p) = temp();
+    let idle = ok(call(&p, "history_seal", seal("idle", json!({"role":"user","content":"idle 0"}))))["id"].clone();
+    let mut busy = Vec::new();
+    for i in 0..255 {
+        let q = seal("busy", json!({"role":"user","content":format!("busy {i}")}));
+        busy.push(ok(call(&p, "history_seal", q))["id"].clone());
+    }
+    assert_eq!(history_ids(&p).len(), 256);
+    for i in 255..268 {
+        let q = seal("busy", json!({"role":"user","content":format!("busy {i}")}));
+        let (reply, stderr) = call_with_stderr(&p, "history_seal", q);
+        busy.push(ok(reply)["id"].clone());
+        assert_eq!(stderr.lines().count(), 1, "seal {i}: {stderr}");
+        assert!(stderr.contains(" class=superseded "), "seal {i}: {stderr}");
+    }
+    let kept = history_ids(&p);
+    assert_eq!(kept.len(), 256);
+    assert!(kept.contains(&idle), "the idle session's newest archive was evicted");
+    assert!(kept.contains(&busy[0]), "the busy session's first archive was evicted");
+    assert!(busy[1..14].iter().all(|id| !kept.contains(id)), "exactly the oldest middle windows went");
+    assert!(busy[14..].iter().all(|id| kept.contains(id)));
+    // A newer idle archive makes idle 0 that active session's FIRST row:
+    // both stay, and each seal takes the busy session's next middle window.
+    let idle1 = ok(call(&p, "history_seal", seal("idle", json!({"role":"user","content":"idle 1"}))))["id"].clone();
+    ok(call(&p, "history_seal", seal("busy", json!({"role":"user","content":"busy 268"}))));
+    let kept = history_ids(&p);
+    assert_eq!(kept.len(), 256);
+    assert!(kept.contains(&idle) && kept.contains(&idle1) && kept.contains(&busy[0]));
+    assert!(!kept.contains(&busy[14]) && !kept.contains(&busy[15]) && kept.contains(&busy[16]));
+}
+#[test]
 fn history_seal_evicts_oldest_to_fit_capacity() {
     // docs/specs/archive-size-fit.md: a full inventory never fails a seal.
     let (_d, p) = temp();
     let mut ids = Vec::new();
-    for i in 0..128 {
+    for i in 0..256 {
         let q = seal(
             &format!("session-{i}"),
             json!({"role":"user","content":format!("evidence {i}")}),
         );
-        ids.push(ok(call(&p, "history_seal", q))["id"].clone());
+        // Rows 1..=256 fit the cap without any eviction.
+        let (reply, stderr) = call_with_stderr(&p, "history_seal", q);
+        assert!(stderr.is_empty(), "row {}: {stderr}", i + 1);
+        ids.push(ok(reply)["id"].clone());
     }
+    assert_eq!(history_ids(&p).len(), 256);
     // Forget one live row: the tombstone is the first eviction candidate.
     ok(call(&p, "history_forget", json!({"id":ids[5]})));
-    let q = seal("session-128", json!({"role":"user","content":"evidence 128"}));
-    let newest = ok(call(&p, "history_seal", q.clone()));
+    let q = seal("session-256", json!({"role":"user","content":"evidence 256"}));
+    let (reply, stderr) = call_with_stderr(&p, "history_seal", q.clone());
+    let newest = ok(reply);
+    assert_eq!(
+        stderr,
+        format!("axel_history_evict scope=p01234567 class=tombstoned age_h=0 id={}\n", ids[5].as_str().unwrap())
+    );
     // Tombstone evicted, oldest live row (ids[0]) still present.
     assert_eq!(
         ok(call(&p, "history_fetch", json!({"id":ids[0],"start":0,"limit":1}))).as_array().unwrap().len(),
         1
     );
-    // Next seal evicts the oldest live row.
-    let q2 = seal("session-129", json!({"role":"user","content":"evidence 129"}));
-    ok(call(&p, "history_seal", q2));
+    // Every row left is an active session's only (first and newest) archive:
+    // the next seal evicts exactly one, the oldest floor row.
+    let q2 = seal("session-257", json!({"role":"user","content":"evidence 257"}));
+    let (reply, stderr) = call_with_stderr(&p, "history_seal", q2);
+    ok(reply);
+    assert_eq!(
+        stderr,
+        format!("axel_history_evict scope=p01234567 class=floor age_h=0 id={}\n", ids[0].as_str().unwrap())
+    );
+    assert_eq!(history_ids(&p).len(), 256);
     assert_eq!(
         call(&p, "history_fetch", json!({"id":ids[0],"start":0,"limit":1}))["error"]["code"],
         "not_found"
@@ -869,13 +963,197 @@ fn history_seal_evicts_oldest_to_fit_capacity() {
     // Forgotten evidence stays suppressed after eviction of its tombstone.
     let again = seal("session-5", json!({"role":"user","content":"evidence 5"}));
     assert_eq!(call(&p, "history_seal", again)["error"]["code"], "id_conflict");
-    // Imports remain strict: an export with 128 rows into a full scope still fails.
+    // One apply may carry a full scope (256 rows) into an empty scope, but
+    // imports remain strict: the same export into a non-empty scope fails.
+    let export = ok(call(&p, "export", json!({"full":true})));
+    assert_eq!(export["histories"].as_array().unwrap().len(), 256);
     let (_d2, p2) = temp();
-    for i in 0..128 {
-        ok(call(&p2, "history_seal", seal(&format!("x-{i}"), json!({"role":"user","content":format!("x {i}")}))));
-    }
+    ok(call(&p2, "migration_apply", apply(export.clone())));
+    assert_eq!(history_ids(&p2).len(), 256);
+    let (_d3, p3) = temp();
+    ok(call(&p3, "history_seal", seal("x-0", json!({"role":"user","content":"x 0"}))));
     assert_eq!(
-        call(&p2, "migration_apply", apply(ok(call(&p, "export", json!({"full":true})))))["error"]["code"],
+        call(&p3, "migration_apply", apply(export))["error"]["code"],
         "size_limit"
     );
+    assert_eq!(history_ids(&p3).len(), 1);
+}
+#[test]
+fn history_owned_ids_filter_before_limit_and_inspect_owner() {
+    let (_d, p) = temp();
+    let caps = ok(call(&p, "capabilities", json!({})));
+    assert_eq!(caps["history_owned"], json!({"versions":[1,2],"max_ids":128}));
+    assert!(caps["operations"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("history_inspect")));
+    // Own windows first; newer foreign windows would win the ordering.
+    let own = ok(call(
+        &p,
+        "history_seal",
+        seal(
+            "worker-run:a",
+            json!({"role":"user","content":"NEEDLE own one"}),
+        ),
+    ))["id"]
+        .clone();
+    let gone = ok(call(
+        &p,
+        "history_seal",
+        seal(
+            "worker-run:a",
+            json!({"role":"user","content":"NEEDLE own two"}),
+        ),
+    ))["id"]
+        .clone();
+    let mut foreign = Vec::new();
+    for (n, logical) in ["worker-run:b", "parent-session", "worker-run:b"]
+        .iter()
+        .enumerate()
+    {
+        let text = format!("NEEDLE foreign {n}");
+        foreign.push(
+            ok(call(
+                &p,
+                "history_seal",
+                seal(logical, json!({"role":"user","content":text})),
+            ))["id"]
+                .clone(),
+        );
+    }
+    let wide = ok(call(
+        &p,
+        "history_search",
+        json!({"query":"needle","limit":1}),
+    ));
+    assert_ne!(wide[0]["id"], own);
+    let hits = ok(call(
+        &p,
+        "history_search",
+        json!({"query":"needle","limit":1,"ids":[own]}),
+    ));
+    assert_eq!(hits.as_array().unwrap().len(), 1);
+    assert_eq!(hits[0]["id"], own);
+    assert!(hits[0]["snippet"].as_str().unwrap().contains("own one"));
+    let both = ok(call(
+        &p,
+        "history_search",
+        json!({"query":"","limit":8,"ids":[gone, own]}),
+    ));
+    assert_eq!(both.as_array().unwrap().len(), 2);
+    assert_eq!(
+        ok(call(
+            &p,
+            "history_search",
+            json!({"query":"needle","ids":[]})
+        )),
+        json!([])
+    );
+    let own_str = own.as_str().unwrap().to_owned();
+    for bad in [
+        json!([own_str.to_uppercase()]),
+        json!([own_str, own_str]),
+        json!(["not-hex"]),
+        json!((0..129).map(|n| format!("{n:032x}")).collect::<Vec<_>>()),
+        json!("x"),
+    ] {
+        assert_eq!(
+            call(&p, "history_search", json!({"query":"","ids":bad}))["error"]["code"],
+            "invalid_request",
+            "{bad}"
+        );
+        assert_eq!(
+            call(&p, "history_inspect", json!({"ids":bad}))["error"]["code"],
+            "invalid_request",
+            "{bad}"
+        );
+    }
+    ok(call(&p, "history_forget", json!({"id":gone})));
+    let unknown = "f".repeat(32);
+    let rows = ok(call(
+        &p,
+        "history_inspect",
+        json!({"ids":[unknown, foreign[1], gone, own]}),
+    ));
+    let a = hash(&[b"worker-run:a"]);
+    let parent = hash(&[b"parent-session"]);
+    let find = |id: &Value| {
+        rows.as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"] == *id)
+            .cloned()
+    };
+    assert_eq!(rows.as_array().unwrap().len(), 3);
+    assert!(find(&json!(unknown)).is_none());
+    assert_eq!(
+        find(&own).unwrap(),
+        json!({"id":own,"logical_id":a,"live":true})
+    );
+    assert_eq!(
+        find(&gone).unwrap(),
+        json!({"id":gone,"logical_id":a,"live":false})
+    );
+    assert_eq!(
+        find(&foreign[1]).unwrap(),
+        json!({"id":foreign[1],"logical_id":parent,"live":true})
+    );
+    assert_eq!(
+        ok(call(&p, "history_inspect", json!({"ids":[]}))),
+        json!([])
+    );
+    // A forgotten window no longer matches even when allowed.
+    assert_eq!(
+        ok(call(&p, "history_search", json!({"query":"","ids":[gone]}))),
+        json!([])
+    );
+    // Another repository's scope sees nothing of this one.
+    assert_eq!(
+        ok(call_scope(
+            &p,
+            FOREIGN,
+            "history_inspect",
+            json!({"ids":[own]})
+        )),
+        json!([])
+    );
+    assert_eq!(
+        call(&p, "history_inspect", json!({"ids":[own],"extra":1}))["error"]["code"],
+        "invalid_request"
+    );
+}
+/// `history_owned/2`: `version:2` wraps the version 1 rows with the brain's
+/// seal-eviction count; without `version` the reply is the version 1 array.
+#[test]
+fn history_inspect_version_2_reports_the_eviction_count_beside_v1_rows() {
+    let (_d, p) = temp();
+    let own = ok(call(
+        &p,
+        "history_seal",
+        seal("worker-run:a", json!({"role":"user","content":"own"})),
+    ))["id"]
+        .clone();
+    let a = hash(&[b"worker-run:a"]);
+    let v1 = ok(call(&p, "history_inspect", json!({"ids":[own]})));
+    assert_eq!(v1, json!([{"id":own,"logical_id":a,"live":true}]));
+    assert_eq!(
+        ok(call(&p, "history_inspect", json!({"ids":[own],"version":1}))),
+        v1
+    );
+    // A new brain starts its count at zero.
+    assert_eq!(
+        ok(call(&p, "history_inspect", json!({"ids":[own],"version":2}))),
+        json!({"entries":v1,"evictions":0})
+    );
+    assert_eq!(
+        ok(call(&p, "history_inspect", json!({"ids":[],"version":2}))),
+        json!({"entries":[],"evictions":0})
+    );
+    for bad in [json!({"ids":[own],"version":3}), json!({"ids":[own],"version":2,"extra":1})] {
+        assert_eq!(
+            call(&p, "history_inspect", bad.clone())["error"]["code"],
+            "invalid_request",
+            "{bad}"
+        );
+    }
 }
