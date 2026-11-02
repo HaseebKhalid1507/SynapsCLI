@@ -169,7 +169,11 @@ async fn marked_call(t: &mut LocalTransport, bodies: &Arc<Mutex<Vec<String>>>, p
 /// `pria-desktop_pria_vault_get`. `pria_vault_*` matches neither; it
 /// matches the tool's own name.
 async fn rig(h: &Home) -> (Arc<Mutex<Vec<String>>>, Arc<agent_engine::EngineHost>, ExtensionManager) {
-    std::fs::write(h.dir.path().join(".synaps-cli/config"), "context_management = off\n").unwrap();
+    std::fs::write(
+        h.dir.path().join(".synaps-cli/config"),
+        "context_management.mode = off\n",
+    )
+    .unwrap();
     let bodies = Arc::new(Mutex::new(Vec::<String>::new()));
     let captured = bodies.clone();
     let app = axum::Router::new().fallback(move |body: String| {

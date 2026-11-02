@@ -163,7 +163,11 @@ fn request_after(bodies: &Arc<Mutex<Vec<String>>>, call_id: &str) -> Option<Stri
 #[serial]
 async fn memory_only_set_mid_turn_marks_the_same_turn_and_workers() {
     let h = Home::new();
-    std::fs::write(h.dir.path().join(".synaps-cli/config"), "context_management = off\n").unwrap();
+    std::fs::write(
+        h.dir.path().join(".synaps-cli/config"),
+        "context_management.mode = off\n",
+    )
+    .unwrap();
     let bodies = Arc::new(Mutex::new(Vec::<String>::new()));
     let held = Arc::new(AtomicUsize::new(0));
     let (release_tx, release_rx) = tokio::sync::watch::channel(false);

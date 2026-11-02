@@ -172,7 +172,11 @@ async fn memory_only_no_disk_sentinel() {
     )
     .expect("the only subscriber in this test binary");
     let h = Home::new();
-    std::fs::write(h.dir.path().join(".synaps-cli/config"), "context_management = off\n").unwrap();
+    std::fs::write(
+        h.dir.path().join(".synaps-cli/config"),
+        "context_management.mode = off\n",
+    )
+    .unwrap();
     let bodies = Arc::new(Mutex::new(Vec::<String>::new()));
     let captured = bodies.clone();
     let app = axum::Router::new().fallback(move |body: String| {

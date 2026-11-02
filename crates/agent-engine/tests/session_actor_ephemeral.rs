@@ -35,7 +35,11 @@ fn scan(dir: &std::path::Path, sentinel: &str) {
 async fn ephemeral_layer_no_disk_sentinel() {
     const SENTINEL: &str = "EPHEMERAL_LAYER_SENTINEL_9a71_DO_NOT_PERSIST";
     let h = Home::new();
-    std::fs::write(h.dir.path().join(".synaps-cli/config"), "context_management = off\n").unwrap();
+    std::fs::write(
+        h.dir.path().join(".synaps-cli/config"),
+        "context_management.mode = off\n",
+    )
+    .unwrap();
     let bodies = Arc::new(Mutex::new(Vec::<String>::new()));
     let captured = bodies.clone();
     let app = axum::Router::new().fallback(move |body: String| {
