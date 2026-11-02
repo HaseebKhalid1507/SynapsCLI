@@ -39,6 +39,16 @@ All notable changes to this project will be documented in this file.
   the result (what the parent model reads, and the subagent card) ran
   sentences together: "…read them all.Found 2 files…". Each response now
   starts a new paragraph, as `subagent_start` workers already did.
+- **`subagent` and `subagent_start` no longer offer `role` and
+  `write_policy`.** Both tools advertised a worker role and a write policy
+  (`read_only`, `isolated_worktree`, or `non_overlapping_paths` with
+  scopes), but neither was ever read or enforced: every worker was
+  dispatched as an implementer, and a worker asked to be `read_only` could
+  still write files and run any command. Both parameters are gone from the
+  two schemas, about 1 KB off every request that lists the tools. A call
+  that still sends them runs as before: they are ignored, not refused. A
+  real read-only mode would have to restrict `bash` as well as the file
+  tools; that is tracked separately.
 
 ## [0.11.1] — 2026-10-31
 
