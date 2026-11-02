@@ -17,6 +17,8 @@ use super::types::{Addressed, ClientId, Envelope, SessionCommand, SessionConfig,
 pub struct Presence {
     pub clients: usize,
     pub input_owner: Option<ClientId>,
+    /// `input_owner`'s declared kind (`SessionMeta::input_owner_kind`).
+    pub input_owner_kind: Option<super::types::ClientKind>,
     pub awaiting_input: usize,
     /// Every attached client, named (`synaps daemon sessions`).
     pub roster: Vec<super::types::ClientInfo>,
@@ -63,11 +65,45 @@ pub fn events_cap() -> usize {
         .unwrap_or(DEFAULT_EVENTS_CAP)
 }
 
+/// Default capacity of the optional events channel (child spend frames);
+/// `SYNAPS_SESSION_OPTIONAL_EVENTS_CAP` overrides.
+pub const DEFAULT_OPTIONAL_EVENTS_CAP: usize = 1024;
+
+/// Optional channel capacity from `SYNAPS_SESSION_OPTIONAL_EVENTS_CAP`
+/// (min 16) or the default.
+pub fn optional_events_cap() -> usize {
+    std::env::var("SYNAPS_SESSION_OPTIONAL_EVENTS_CAP")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .map(|n| n.max(16))
+        .unwrap_or(DEFAULT_OPTIONAL_EVENTS_CAP)
+}
+
+/// Publish one envelope: optional events
+/// ([`SessionEventWire::is_optional`]) on the optional channel, everything
+/// else on the main one. A booking pass can publish thousands of child
+/// spend frames; on their own ring they can't evict an ordinary event from
+/// a reader that is behind. No receivers is not an error: streams are not
+/// tied to clients.
+pub(crate) fn publish(
+    events: &broadcast::Sender<Envelope>,
+    optional: &broadcast::Sender<Envelope>,
+    env: Envelope,
+) {
+    if env.event.is_optional() {
+        let _ = optional.send(env);
+    } else {
+        let _ = events.send(env);
+    }
+}
+
 #[derive(Clone)]
 pub struct SessionHandle {
     pub id: SessionId,
     cmd_tx: mpsc::Sender<Addressed>,
     events: broadcast::Sender<Envelope>,
+    /// Optional events (child spend frames), apart from `events`.
+    optional_events: broadcast::Sender<Envelope>,
     meta: Arc<SessionMeta>,
     /// Sync, lock-free read of the last published RuntimeView (§2.7).
     view: Arc<arc_swap::ArcSwap<RuntimeView>>,
@@ -91,9 +127,16 @@ pub struct SessionHandle {
     /// for the same reason as `cache_keepwarm`: a reload whose checkpoint
     /// did not confirm must not re-grant memory the user turned off.
     memory_mode: MemoryModeSlot,
+    /// The session queue's quiesce flag: the daemon's reload
+    /// sets it on every live session before its drain, with no command and
+    /// without unparking anyone. A running `wait` returns `interrupted`.
+    quiesce: crate::events::queue::QuiesceSlot,
     /// F23: only on a lock-held placeholder — the config to retry the real
     /// `create` with on the next attach. `None` for real actors.
     placeholder_config: Option<Arc<SessionConfig>>,
+    /// The session's crash-record entry (`session::live`), written by the
+    /// actor, read by the daemon's crash-record writer.
+    live: super::live::LiveSlot,
 }
 
 impl std::fmt::Debug for SessionHandle {
@@ -109,6 +152,7 @@ impl std::fmt::Debug for SessionHandle {
 pub struct SessionEndpoints {
     pub cmd_rx: mpsc::Receiver<Addressed>,
     pub events: broadcast::Sender<Envelope>,
+    pub optional_events: broadcast::Sender<Envelope>,
     pub view: Arc<arc_swap::ArcSwap<RuntimeView>>,
     pub lifecycle: Arc<AtomicU8>,
     pub journal_id: Arc<arc_swap::ArcSwap<String>>,
@@ -117,6 +161,7 @@ pub struct SessionEndpoints {
     pub keep_warm: Arc<AtomicBool>,
     pub cache_keepwarm: super::cache_keepwarm::OverrideSlot,
     pub memory_mode: MemoryModeSlot,
+    pub live: super::live::LiveSlot,
 }
 
 /// The session's explicit `/memory` choice, readable without the actor.
@@ -126,8 +171,19 @@ impl SessionHandle {
     /// Mint a handle + the actor's ends. Used by `SessionActor` (A1) and the
     /// test `EchoActor`.
     pub fn new(meta: SessionMeta, view: RuntimeView) -> (Self, SessionEndpoints) {
+        let quiesce = std::sync::Arc::new(tokio::sync::watch::channel(None).0);
+        Self::with_quiesce_slot(meta, view, quiesce)
+    }
+
+    /// [`Self::new`] sharing the session queue's quiesce flag.
+    pub fn with_quiesce_slot(
+        meta: SessionMeta,
+        view: RuntimeView,
+        quiesce: crate::events::queue::QuiesceSlot,
+    ) -> (Self, SessionEndpoints) {
         let (cmd_tx, cmd_rx) = mpsc::channel(CMD_CHAN_CAP);
         let (events, _) = broadcast::channel(events_cap());
+        let (optional_events, _) = broadcast::channel(optional_events_cap());
         let view = Arc::new(arc_swap::ArcSwap::from_pointee(view));
         let lifecycle = Arc::new(AtomicU8::new(SessionLifecycle::Live as u8));
         let journal_id = Arc::new(arc_swap::ArcSwap::from_pointee(meta.id.0.clone()));
@@ -136,10 +192,12 @@ impl SessionHandle {
         let keep_warm = Arc::new(AtomicBool::new(meta.pinned));
         let cache_keepwarm = super::cache_keepwarm::OverrideSlot::default();
         let memory_mode = MemoryModeSlot::default();
+        let live = super::live::LiveSlot::default();
         let handle = Self {
             id: meta.id.clone(),
             cmd_tx,
             events: events.clone(),
+            optional_events: optional_events.clone(),
             meta: Arc::new(meta),
             view: Arc::clone(&view),
             lifecycle: Arc::clone(&lifecycle),
@@ -149,13 +207,16 @@ impl SessionHandle {
             keep_warm: Arc::clone(&keep_warm),
             cache_keepwarm: Arc::clone(&cache_keepwarm),
             memory_mode: Arc::clone(&memory_mode),
+            quiesce,
             placeholder_config: None,
+            live: live.clone(),
         };
         (
             handle,
             SessionEndpoints {
                 cmd_rx,
                 events,
+                optional_events,
                 view,
                 lifecycle,
                 journal_id,
@@ -164,6 +225,7 @@ impl SessionHandle {
                 keep_warm,
                 cache_keepwarm,
                 memory_mode,
+                live,
             },
         )
     }
@@ -204,6 +266,12 @@ impl SessionHandle {
         (**self.presence.load()).clone()
     }
 
+    /// Tests: publish a presence as the actor would.
+    #[cfg(test)]
+    pub(crate) fn set_presence_for_test(&self, p: Presence) {
+        self.presence.store(Arc::new(p));
+    }
+
     /// Current session name (create `--name` or a later `saveas`).
     pub fn name(&self) -> Option<String> {
         (**self.name.load()).clone()
@@ -223,12 +291,35 @@ impl SessionHandle {
             .map(|m| m.to_string())
     }
 
+    /// Set (or clear) the session's quiesce flag. Sync, no command: the
+    /// actor need not be awake.
+    pub fn quiesce(&self, reason: Option<crate::events::queue::Quiesce>) {
+        self.quiesce.send_replace(reason);
+    }
+
+    /// Why the session is quiescing, if it is.
+    pub fn quiesced(&self) -> Option<crate::events::queue::Quiesce> {
+        *self.quiesce.borrow()
+    }
+
     /// The session's explicit `/memory` choice, if it made one.
     pub fn memory_mode(&self) -> Option<super::SessionMemoryMode> {
         *self
             .memory_mode
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The actor's last crash-record entry (`session::live`), if it has
+    /// published one.
+    pub fn live_entry(&self) -> Option<Arc<super::live::LiveEntry>> {
+        self.live.load_full()
+    }
+
+    /// The crash-record cell itself, for the writer's acknowledgement
+    /// (`LiveSlot::stamp_durable`).
+    pub fn live_slot(&self) -> &super::live::LiveSlot {
+        &self.live
     }
 
     /// `meta()` with the live cells filled in (lifecycle, clients, owner,
@@ -240,6 +331,7 @@ impl SessionHandle {
         m.lifecycle = self.lifecycle();
         m.clients = p.clients;
         m.input_owner = p.input_owner;
+        m.input_owner_kind = p.input_owner_kind;
         m.awaiting_input = p.awaiting_input;
         m.roster = p.roster;
         m.client_input = p.client_input;
@@ -260,6 +352,13 @@ impl SessionHandle {
 
     pub fn subscribe(&self) -> broadcast::Receiver<Envelope> {
         self.events.subscribe()
+    }
+
+    /// The optional events (child spend frames), which never go out on the
+    /// main channel ([`Self::subscribe`]). Both take their `seq` from one
+    /// counter: a reader of both merges them by seq.
+    pub fn subscribe_optional(&self) -> broadcast::Receiver<Envelope> {
+        self.optional_events.subscribe()
     }
 
     /// F23: the retry config carried by a lock-held placeholder.
@@ -312,6 +411,32 @@ pub mod echo {
     use crate::session::types::*;
     use crate::{LlmEvent, SessionEvent, StreamEvent};
 
+    /// A `Submit` of this text also emits one `child_spend` before the
+    /// echo (for the daemon's child_spend filter tests).
+    pub const CHILD_SPEND_PROMPT: &str = "echo:child-spend";
+
+    pub fn child_spend() -> SessionEventWire {
+        SessionEventWire::ChildSpend(ChildSpendEvent {
+            handle: "sa_1".into(),
+            run: "00000000000000ab".into(),
+            spend_seq: 0,
+            agent: "echo".into(),
+            parent_handle: None,
+            kind: "turn".into(),
+            model: "echo".into(),
+            input_tokens: 1,
+            output_tokens: 1,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+            cache_creation_5m: None,
+            cache_creation_1h: None,
+            cost_usd: 0.000001,
+            cost_nanousd: 1_000,
+            session_cost_usd: 0.000001,
+            child_cost_usd: 0.000001,
+        })
+    }
+
     pub fn meta_for(id: &SessionId) -> SessionMeta {
         SessionMeta {
             id: id.clone(),
@@ -325,6 +450,7 @@ pub mod echo {
             lifecycle: SessionLifecycle::Live,
             clients: 0,
             input_owner: None,
+            input_owner_kind: None,
             awaiting_input: 0,
             roster: Vec::new(),
             client_input: None,
@@ -338,6 +464,7 @@ pub mod echo {
             title: None,
             cost_usd: 0.0,
             messages: 0,
+            restoring: false,
         }
     }
 
@@ -362,6 +489,33 @@ pub mod echo {
         }
     }
 
+    /// A `Submit` of this text also emits one `tool_child` and one
+    /// `tool_child_ended` before the echo (for the opt-in filter tests).
+    pub const CHILD_EVENTS_PROMPT: &str = "echo:child-events";
+
+    fn child_events() -> [SessionEventWire; 2] {
+        use crate::session::child_events::ChildProcessEvent;
+        use crate::session::children::{ChildIdentity, ChildSpawn};
+        let instance = crate::proc_identity::InstanceKey::Linux { boot_id: "echo".into(), start_ticks: 1 };
+        let child = ChildIdentity::new(1, 1, 1, instance);
+        [
+            SessionEventWire::ChildProcess(ChildProcessEvent::Spawned(ChildSpawn {
+                tool_id: "toolu_echo".into(),
+                tool_name: "bash".into(),
+                handle_id: None,
+                shell_session_id: None,
+                child: child.clone(),
+            })),
+            SessionEventWire::ChildProcess(ChildProcessEvent::Ended {
+                tool_id: "toolu_echo".into(),
+                handle_id: None,
+                child,
+                exit_code: Some(0),
+                signal: None,
+            }),
+        ]
+    }
+
     pub fn spawn(id: SessionId) -> (SessionHandle, tokio::task::JoinHandle<()>) {
         let (handle, ep) = SessionHandle::new(meta_for(&id), view_for());
         let task = tokio::spawn(run(id, ep));
@@ -371,6 +525,7 @@ pub mod echo {
     struct Echo {
         id: SessionId,
         events: broadcast::Sender<Envelope>,
+        optional_events: broadcast::Sender<Envelope>,
         view: Arc<arc_swap::ArcSwap<RuntimeView>>,
         seq: u64,
         next_client: u64,
@@ -387,8 +542,7 @@ pub mod echo {
                 event,
             };
             self.seq += 1;
-            // No receivers is not an error: streams are not tied to clients.
-            let _ = self.events.send(env);
+            super::publish(&self.events, &self.optional_events, env);
         }
 
         fn conv_snapshot(&self) -> ConversationSnapshot {
@@ -418,6 +572,8 @@ pub mod echo {
                 client_input: ClientInput::wire_default(),
                 input_owner: None,
                 display_tail,
+                // A mock session has no client tools.
+                client_tools: Default::default(),
             }
         }
 
@@ -448,6 +604,11 @@ pub mod echo {
                     }
                 }
                 SessionCommand::Submit { text, .. } => {
+                    if text == CHILD_EVENTS_PROMPT {
+                        for event in child_events() {
+                            self.emit(event);
+                        }
+                    }
                     let baseline = self.conv.api_messages.len();
                     self.conv.api_messages.push(Arc::new(serde_json::json!({
                         "role": "user", "content": text
@@ -457,6 +618,9 @@ pub mod echo {
                         trigger: TurnTrigger::User,
                         user_text: None,
                     });
+                    if text == CHILD_SPEND_PROMPT {
+                        self.emit(child_spend());
+                    }
                     self.emit(SessionEventWire::Stream(StreamEvent::Llm(LlmEvent::Text(
                         text.clone(),
                     ))));
@@ -497,7 +661,7 @@ pub mod echo {
                         .unwrap_or_default(),
                         other => serde_json::json!({ "unsupported": format!("{other:?}") }),
                     };
-                    self.emit(SessionEventWire::QueryResult { id, value });
+                    self.emit(SessionEventWire::QueryResult { id, value, client_tools: None });
                 }
                 SessionCommand::Set { id, setting } => {
                     let mut view = (**self.view.load()).clone();
@@ -512,6 +676,7 @@ pub mod echo {
                         message: None,
                         view,
                         clamp: None,
+                        memory_only_tools: None,
                     }));
                 }
                 SessionCommand::End { reason } => {
@@ -530,6 +695,7 @@ pub mod echo {
         let mut echo = Echo {
             id,
             events: ep.events,
+            optional_events: ep.optional_events,
             view: ep.view,
             seq: 0,
             next_client: 1,
@@ -575,6 +741,7 @@ pub mod locked_placeholder {
             lifecycle: SessionLifecycle::Parked,
             clients: 0,
             input_owner: None,
+            input_owner_kind: None,
             awaiting_input: 0,
             roster: Vec::new(),
             client_input: None,
@@ -588,6 +755,7 @@ pub mod locked_placeholder {
             title: None,
             cost_usd: 0.0,
             messages: 0,
+            restoring: false,
         };
         let view = crate::session::view::RuntimeView {
             model: config.model_override.clone().unwrap_or_else(|| "unknown".into()),
@@ -670,6 +838,7 @@ pub mod locked_placeholder {
                                 "streaming": false,
                                 "pending_prompts": 0,
                             }),
+                            client_tools: None,
                         },
                     );
                 }
@@ -700,6 +869,41 @@ mod tests {
             .await
             .expect("timely")
             .expect("open")
+    }
+
+    /// A child spend frame goes out on the optional channel only; the two
+    /// channels share one seq counter and are gapless together.
+    #[tokio::test]
+    async fn a_child_spend_goes_out_on_the_optional_channel_only() {
+        let (handle, task) = SessionHandle::echo_for_test(SessionId::from("echo-opt"));
+        let mut rx = handle.subscribe();
+        let mut optional = handle.subscribe_optional();
+        handle
+            .send(SessionCommand::Submit {
+                text: echo::CHILD_SPEND_PROMPT.into(),
+                attachments: vec![],
+            })
+            .await
+            .unwrap();
+        let mut main_seqs = Vec::new();
+        loop {
+            let e = next(&mut rx).await;
+            assert!(!e.event.is_optional(), "an optional event on the main channel: {:?}", e.event);
+            main_seqs.push(e.seq);
+            if matches!(e.event, SessionEventWire::Conversation(_)) {
+                break;
+            }
+        }
+        let f = next(&mut optional).await;
+        assert!(matches!(f.event, SessionEventWire::ChildSpend(_)));
+        assert!(optional.try_recv().is_err(), "one frame");
+        let mut all = main_seqs.clone();
+        all.push(f.seq);
+        all.sort_unstable();
+        assert_eq!(all, (0..all.len() as u64).collect::<Vec<_>>(), "one counter, gapless together");
+        assert!(!main_seqs.contains(&f.seq));
+        drop(handle);
+        task.await.unwrap();
     }
 
     #[tokio::test]
@@ -743,7 +947,7 @@ mod tests {
             SessionEventWire::Conversation(c) => assert_eq!(c.api_messages.len(), 2),
             other => panic!("unexpected {other:?}"),
         }
-        // gapless seq, same session id on every envelope
+        // gapless seq (no optional event here), same session id on every envelope
         assert_eq!(
             [e0.seq, e1.seq, e2.seq, e3.seq, e4.seq],
             [0, 1, 2, 3, 4]

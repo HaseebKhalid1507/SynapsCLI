@@ -63,7 +63,13 @@ async fn first_mirror_owns_second_mirror_is_read_only_with_notice() {
         } => {
             assert_eq!(*client, b.client_id());
             assert_eq!(command, "submit");
-            assert_eq!(reason, "input owned by tui (#1)");
+            // 790d R6: the Pria app reads only this prefix as
+            // not_input_owner (pria-apps drive/track.rs:1341); upstream's
+            // label may follow it, e.g. "input owned by client #1 (tui)".
+            assert!(
+                reason == "input owned by client #1" || reason.starts_with("input owned by client #1 "),
+                "{reason}"
+            );
         }
         _ => unreachable!(),
     }
@@ -486,6 +492,8 @@ async fn checkpoint_cancels_turn_saves_closes_ptys_answers_prompts_none() {
 
     a.send(SessionCommand::Checkpoint {
         reason: CheckpointReason::Reload,
+        deadline: None,
+        skip_quiesce_grace: false,
     })
     .await
     .unwrap();
@@ -551,6 +559,8 @@ async fn checkpoint_is_owner_only_from_clients() {
 
     b.send_from_self(SessionCommand::Checkpoint {
         reason: CheckpointReason::HostRequest,
+        deadline: None,
+        skip_quiesce_grace: false,
     })
     .await
     .unwrap();
@@ -584,6 +594,8 @@ async fn checkpoint_is_owner_only_from_clients() {
     handle
         .send(SessionCommand::Checkpoint {
             reason: CheckpointReason::HostRequest,
+            deadline: None,
+            skip_quiesce_grace: false,
         })
         .await
         .unwrap();
@@ -634,7 +646,14 @@ async fn take_input_moves_ownership_without_reattaching() {
     let seen = until(&mut a, |e| matches!(e, SessionEventWire::Refused { .. })).await;
     match &seen.last().unwrap().event {
         SessionEventWire::Refused { reason, .. } => {
-            assert!(reason.contains(&format!("(#{})", idb.0)), "{reason}");
+            // PARITY: 790d R6: the new owner is named by the
+            // "input owned by client #<id>" prefix the app maps to
+            // not_input_owner (upstream: "input owned by tui (#<id>)").
+            let prefix = format!("input owned by client #{}", idb.0);
+            assert!(
+                reason == &prefix || reason.starts_with(&format!("{prefix} ")),
+                "{reason}"
+            );
         }
         _ => unreachable!(),
     }
@@ -870,4 +889,128 @@ async fn an_engine_command_that_changes_the_view_reaches_every_client() {
     // a still gets its reply.
     until(&mut a, |e| matches!(e, SessionEventWire::QueryResult { id: 5, .. })).await;
     end(&mut a).await;
+}
+
+// ── D1: the input owner's declared kind in listings (`daemon sessions --json`) ──
+// (`client_input = exclusive`: the kind of the one input owner.)
+
+/// The listed meta once presence shows `want` (or after 5 s): the actor
+/// emits `InputOwnerChanged` just before it publishes presence.
+async fn listed_with_kind(
+    handle: &agent_engine::session::SessionHandle,
+    want: Option<ClientKind>,
+) -> agent_engine::session::SessionMeta {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let m = handle.meta_live();
+        if m.input_owner_kind == want || tokio::time::Instant::now() >= deadline {
+            return m;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn listing_names_a_chat_takeover_owners_kind() {
+    let _h = Home::new();
+    let (url, _) = stub(SSE_HI, false).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+    let handle = host.create_session(exclusive_cfg()).await.unwrap();
+
+    let (_a, _) = attach(&handle, ClientKind::Tui, AttachMode::Mirror).await;
+    let (mut b, snap_b) = attach(&handle, ClientKind::Chat, AttachMode::Takeover).await;
+    let m = listed_with_kind(&handle, Some(ClientKind::Chat)).await;
+    assert_eq!(m.input_owner, Some(b.client_id()));
+    assert_eq!(m.input_owner_kind, Some(ClientKind::Chat), "the app's drive took input");
+    let v = serde_json::to_value(&m).unwrap();
+    assert_eq!(v["input_owner_kind"], "chat", "what `daemon sessions --json` prints: {v}");
+    // The Attached frame's frozen meta carries no kind, so that frame is unchanged.
+    let frozen = serde_json::to_value(&snap_b.meta).unwrap();
+    assert!(frozen.get("input_owner_kind").is_none(), "{frozen}");
+    end(&mut b).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn listing_names_a_tui_takeover_owners_kind() {
+    let _h = Home::new();
+    let (url, _) = stub(SSE_HI, false).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+    let handle = host.create_session(exclusive_cfg()).await.unwrap();
+
+    let (a, _) = attach(&handle, ClientKind::Chat, AttachMode::Mirror).await;
+    assert_eq!(listed_with_kind(&handle, Some(ClientKind::Chat)).await.input_owner, Some(a.client_id()));
+    let (mut b, _) = attach(&handle, ClientKind::Tui, AttachMode::Takeover).await;
+    let m = listed_with_kind(&handle, Some(ClientKind::Tui)).await;
+    assert_eq!(m.input_owner, Some(b.client_id()));
+    assert_eq!(m.input_owner_kind, Some(ClientKind::Tui), "a terminal took input from the app");
+    // A client that only mirrors changes nothing.
+    let (_c, _) = attach(&handle, ClientKind::Chat, AttachMode::Mirror).await;
+    let m = handle.meta_live();
+    assert_eq!((m.input_owner, m.input_owner_kind), (Some(b.client_id()), Some(ClientKind::Tui)));
+    end(&mut b).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn owner_leaving_lists_the_next_owners_kind() {
+    let _h = Home::new();
+    let (url, _) = stub(SSE_HI, false).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+    let handle = host.create_session(exclusive_cfg()).await.unwrap();
+
+    let (a, _) = attach(&handle, ClientKind::Chat, AttachMode::Mirror).await;
+    let (_o, _) = attach(&handle, ClientKind::Attach, AttachMode::Observe).await;
+    let (mut b, _) = attach(&handle, ClientKind::Tui, AttachMode::Mirror).await;
+    assert_eq!(listed_with_kind(&handle, Some(ClientKind::Chat)).await.input_owner, Some(a.client_id()));
+
+    a.send_from_self(SessionCommand::Detach {
+        client: a.client_id(),
+    })
+    .await
+    .unwrap();
+    until(&mut b, |e| matches!(e, SessionEventWire::InputOwnerChanged { .. })).await;
+    let m = listed_with_kind(&handle, Some(ClientKind::Tui)).await;
+    assert_eq!(m.input_owner, Some(b.client_id()), "oldest non-observer");
+    assert_eq!(m.input_owner_kind, Some(ClientKind::Tui), "the next owner's kind, not the leaver's or the observer's");
+    end(&mut b).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn no_owner_lists_no_kind() {
+    let _h = Home::new();
+    let (url, _) = stub(SSE_HI, false).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+    let handle = host.create_session(exclusive_cfg()).await.unwrap();
+
+    let m = handle.meta_live();
+    assert_eq!((m.input_owner, m.input_owner_kind), (None, None), "nobody attached");
+    let v = serde_json::to_value(&m).unwrap();
+    assert!(v.get("input_owner_kind").is_none(), "absent with no owner: {v}");
+    // An older daemon's listing (no field) still reads.
+    let older: agent_engine::session::SessionMeta = serde_json::from_value(v).unwrap();
+    assert_eq!(older.input_owner_kind, None);
+
+    let (mut o, _) = attach(&handle, ClientKind::Chat, AttachMode::Observe).await;
+    let m = handle.meta_live();
+    assert_eq!(m.clients, 1);
+    assert_eq!((m.input_owner, m.input_owner_kind), (None, None), "an observer never owns");
+
+    let (a, _) = attach(&handle, ClientKind::Tui, AttachMode::Mirror).await;
+    assert_eq!(listed_with_kind(&handle, Some(ClientKind::Tui)).await.input_owner, Some(a.client_id()));
+    a.send_from_self(SessionCommand::Detach {
+        client: a.client_id(),
+    })
+    .await
+    .unwrap();
+    until(&mut o, |e| matches!(e, SessionEventWire::InputOwnerChanged { .. })).await;
+    let m = listed_with_kind(&handle, None).await;
+    assert_eq!((m.input_owner, m.input_owner_kind), (None, None), "the owner left and only an observer stays");
+    end(&mut o).await;
 }

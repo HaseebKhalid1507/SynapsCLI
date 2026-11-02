@@ -67,7 +67,7 @@ async fn close(t: &mut LocalTransport, id: u64, arg: &str) {
 fn reply(seen: &[Envelope], want: u64) -> serde_json::Value {
     seen.iter()
         .find_map(|e| match &e.event {
-            SessionEventWire::QueryResult { id, value } if *id == want => Some(value.clone()),
+            SessionEventWire::QueryResult { id, value, .. } if *id == want => Some(value.clone()),
             _ => None,
         })
         .unwrap_or_else(|| panic!("no QueryResult {want}: {seen:#?}"))
@@ -333,7 +333,9 @@ async fn a_parked_session_closes_without_unparking() {
             .unwrap();
         match env.event {
             SessionEventWire::Lifecycle(l) => lifecycles.push(l),
-            SessionEventWire::QueryResult { id: 14, value: v } => value = Some(v),
+            SessionEventWire::QueryResult {
+                id: 14, value: v, ..
+            } => value = Some(v),
             SessionEventWire::Ended { reason } => break reason,
             _ => {}
         }

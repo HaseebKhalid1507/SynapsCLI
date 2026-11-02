@@ -81,6 +81,8 @@ async fn refused_continue_leaves_the_live_owners_card_alone() {
         socket_path: run.join("owner.sock").to_string_lossy().into_owned(),
         pid: std::process::id(),
         started_at: chrono::Utc::now(),
+        receipts: 0,
+        start_ticks: None,
     };
     let card = run.join(format!("{id}.json"));
     std::fs::write(&card, serde_json::to_string(&owner).unwrap()).unwrap();

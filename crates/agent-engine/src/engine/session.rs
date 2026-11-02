@@ -97,15 +97,28 @@ pub struct ConversationState {
     /// Keep-warm ping tokens, already INCLUDED in the `total_*` counters
     /// above and shown separately so `/stats` adds up.
     pub keepwarm_tokens: crate::session::ConversationTokens,
+    /// Spend of the session's subagents, at any depth (child spend),
+    /// already INCLUDED in `session_cost` and the `total_*` counters and
+    /// shown separately, like the keep-warm share.
+    pub child_cost: f64,
+    /// The child share's tokens, already INCLUDED in the `total_*` counters.
+    pub child_tokens: crate::session::ConversationTokens,
+    /// Whether the child share is exact: true for a conversation created in
+    /// this process (and after a clear); false for the rest of a load that
+    /// restored it. The share is snapshot-only, so a restore takes it from
+    /// the last saved snapshot, clamped under the totals, and it can be low
+    /// by what was booked after that save (wire `child_share_exact`).
+    pub child_share_exact: bool,
     /// Message queued to send after current stream completes.
     pub queued_message: Option<String>,
     /// Events buffered during streaming — drained on stream completion.
     pub pending_events: Vec<String>,
 }
 
-/// The keep-warm token subtotal as persisted in the snapshot
-/// (`Session::keepwarm_tokens`, snapshot-only — never journaled).
-fn persisted_keepwarm_tokens(
+/// A token subtotal (the keep-warm or the child share) as persisted in the
+/// snapshot (`Session::keepwarm_tokens` / `Session::child_tokens`,
+/// snapshot-only — never journaled).
+fn persisted_subtotal(
     t: &crate::session::ConversationTokens,
 ) -> agent_core::core::session::KeepwarmTokens {
     agent_core::core::session::KeepwarmTokens {
@@ -116,12 +129,15 @@ fn persisted_keepwarm_tokens(
     }
 }
 
-/// The keep-warm subtotal a resumed conversation starts with: each bucket
-/// clamped under the total it is part of, so `/stats` still adds up. The
-/// cache totals persist with the session (snapshot-only); a session saved
-/// before they did resumes them at 0, and its keep-warm cache buckets too.
-fn resumed_keepwarm_tokens(session: &Session) -> crate::session::ConversationTokens {
-    let kw = session.keepwarm_tokens;
+/// A token subtotal (the keep-warm or the child share) a resumed
+/// conversation starts with: each bucket clamped under the total it is part
+/// of, so `/stats` still adds up. The cache totals persist with the session
+/// (snapshot-only); a session saved before they did resumes them at 0, and
+/// the subtotal's cache buckets too.
+fn resumed_subtotal(
+    kw: agent_core::core::session::KeepwarmTokens,
+    session: &Session,
+) -> crate::session::ConversationTokens {
     crate::session::ConversationTokens {
         input: kw.input.min(session.total_input_tokens),
         output: kw.output.min(session.total_output_tokens),
@@ -144,6 +160,9 @@ impl ConversationState {
             session_cost: 0.0,
             keepwarm_cost: 0.0,
             keepwarm_tokens: Default::default(),
+            child_cost: 0.0,
+            child_tokens: Default::default(),
+            child_share_exact: true,
             queued_message: None,
             pending_events: Vec::new(),
         }
@@ -166,7 +185,12 @@ impl ConversationState {
             total_cache_creation_tokens: session.total_cache_creation_tokens,
             session_cost: session.session_cost,
             keepwarm_cost: session.keepwarm_cost.min(session.session_cost).max(0.0),
-            keepwarm_tokens: resumed_keepwarm_tokens(&session),
+            keepwarm_tokens: resumed_subtotal(session.keepwarm_tokens, &session),
+            // The child share as of the last save, clamped under the totals
+            // it is part of; never added back into them.
+            child_cost: session.child_cost.min(session.session_cost).max(0.0),
+            child_tokens: resumed_subtotal(session.child_tokens, &session),
+            child_share_exact: false,
             queued_message: None,
             pending_events: Vec::new(),
             session,
@@ -207,7 +231,9 @@ impl ConversationState {
         self.session.total_cache_creation_tokens = self.total_cache_creation_tokens;
         self.session.session_cost = self.session_cost;
         self.session.keepwarm_cost = self.keepwarm_cost;
-        self.session.keepwarm_tokens = persisted_keepwarm_tokens(&self.keepwarm_tokens);
+        self.session.keepwarm_tokens = persisted_subtotal(&self.keepwarm_tokens);
+        self.session.child_cost = self.child_cost;
+        self.session.child_tokens = persisted_subtotal(&self.child_tokens);
         // Legacy field: an interrupted turn now lives in `api_messages`
         // (`engine::interrupt`); never write a recap back.
         self.session.abort_context = None;
@@ -232,7 +258,9 @@ impl ConversationState {
         candidate.total_cache_creation_tokens = self.total_cache_creation_tokens;
         candidate.session_cost = self.session_cost;
         candidate.keepwarm_cost = self.keepwarm_cost;
-        candidate.keepwarm_tokens = persisted_keepwarm_tokens(&self.keepwarm_tokens);
+        candidate.keepwarm_tokens = persisted_subtotal(&self.keepwarm_tokens);
+        candidate.child_cost = self.child_cost;
+        candidate.child_tokens = persisted_subtotal(&self.child_tokens);
         candidate.abort_context = None;
         candidate.updated_at = chrono::Utc::now();
         candidate.auto_title();
@@ -258,6 +286,9 @@ impl ConversationState {
         self.session_cost = 0.0;
         self.keepwarm_cost = 0.0;
         self.keepwarm_tokens = Default::default();
+        self.child_cost = 0.0;
+        self.child_tokens = Default::default();
+        self.child_share_exact = true;
         self.queued_message = None;
         self.pending_events.clear();
         self.session = Session::new(
@@ -288,6 +319,9 @@ impl ConversationState {
             cost: self.session_cost,
             keepwarm_cost: self.keepwarm_cost,
             keepwarm_tokens: self.keepwarm_tokens.clone(),
+            child_cost: self.child_cost,
+            child_tokens: self.child_tokens.clone(),
+            child_share_exact: self.child_share_exact,
             // Wire-compat field (protocol v3); always `None` now.
             abort_context: None,
             queued_message: self.queued_message.clone(),
@@ -295,6 +329,26 @@ impl ConversationState {
             consecutive_auto_turns,
             messages_hash_memo: Default::default(),
         }
+    }
+
+    /// Book one paid request of the session's subagents (child spend): into
+    /// the inclusive cost and token totals and the child share, at the
+    /// price it was booked at. Never the last request, the context or a
+    /// request count: those are the foreground's own.
+    pub fn book_child_spend(&mut self, report: &crate::runtime::child_spend::SpendReport) {
+        let t = &report.tokens;
+        let cost = report.cost_usd();
+        self.total_input_tokens += t.input;
+        self.total_output_tokens += t.output;
+        self.total_cache_read_tokens += t.cache_read;
+        self.total_cache_creation_tokens += t.cache_creation;
+        self.session_cost += cost;
+        self.child_cost += cost;
+        let c = &mut self.child_tokens;
+        c.input += t.input;
+        c.output += t.output;
+        c.cache_read += t.cache_read;
+        c.cache_creation += t.cache_creation;
     }
 
     /// Add usage from a model turn.
@@ -547,3 +601,7 @@ mod context_head_tests {
         assert_eq!(messages, session.api_messages);
     }
 }
+
+#[cfg(test)]
+#[path = "session_child_share_tests.rs"]
+mod child_share_tests;

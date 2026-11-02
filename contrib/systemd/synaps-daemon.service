@@ -1,0 +1,74 @@
+# synaps daemon — supervised session daemon (systemd USER service)
+#
+# Nothing here is installed or enabled automatically. See
+# docs/daemon-mode.md, "Running under systemd".
+#
+# Install (runs as you, uses your ~/.synaps-cli):
+#   mkdir -p ~/.config/systemd/user ~/.synaps-cli/logs
+#   cp contrib/systemd/synaps-daemon.service ~/.config/systemd/user/
+#   (umask 077; echo "PATH=$PATH" > ~/.synaps-cli/daemon.env)
+#   systemctl --user daemon-reload
+#   systemctl --user start synaps-daemon
+#   systemctl --user enable synaps-daemon        # start at login (optional)
+#
+# ~/.synaps-cli/logs must exist: StandardError=append: below cannot create
+# it, and every start then fails with status 209/STDERR. daemon.env is
+# optional (see EnvironmentFile= below).
+#
+# Clients need no change: `synaps` and `synaps --attach` find this daemon by
+# its lock and socket and spawn none of their own.
+#
+# Stop it for good:   systemctl --user stop synaps-daemon
+#                     (or `synaps daemon stop`: a clean exit is not restarted)
+# Detect it:          systemctl --user show -p LoadState --value synaps-daemon.service
+#                     prints `loaded` when this unit is installed.
+#
+# Restart policy: on-failure only. A crash (panic -> abort, SIGKILL, a
+# non-zero exit, including a failed start) restarts after 1 s; a clean
+# stop (`synaps daemon stop`, or SIGTERM from `systemctl --user stop`)
+# stays stopped. At most 5 starts a minute: after that the unit stays
+# `failed` until `systemctl --user reset-failed synaps-daemon`.
+#
+# Local overrides go in a drop-in (`systemctl --user edit synaps-daemon`),
+# e.g. another binary path or stderr file.
+
+[Unit]
+Description=synaps session daemon
+Documentation=https://github.com/HaseebKhalid1507/SynapsCLI/blob/main/docs/daemon-mode.md
+# A crash loop must not spin forever: at most 5 starts per minute.
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+# Adjust the binary path to your installation. `--foreground` without
+# `--idle-exit`: a supervised daemon never exits on idle.
+ExecStart=%h/.cargo/bin/synaps daemon --foreground
+# Belt and braces for anything this daemon spawns that auto-spawns a daemon
+# of its own: no idle exit there either.
+Environment=SYNAPS_DAEMON_IDLE_EXIT_SECS=0
+# A user manager's PATH is minimal (no ~/.cargo/bin, no ~/.local/bin), and
+# the tools sessions run need your shell's PATH: put it (and anything else
+# the daemon needs from your shell's environment) in this file, one
+# KEY=VALUE per line. Optional (`-`); its values override Environment= above.
+EnvironmentFile=-%h/.synaps-cli/daemon.env
+Restart=on-failure
+RestartSec=1
+# SIGTERM ends the daemon gracefully (sessions saved, extensions shut
+# down); `mixed` sends it to the daemon only, then SIGKILLs whatever is
+# left in this unit after TimeoutStopSec — extension and MCP processes of
+# a crashed daemon, so a restart never runs beside them. Tool commands run
+# in their own transient scopes (process_scopes, when available): those
+# are separate units and are not touched by stopping or restarting this
+# one.
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=60
+# stdout carries nothing; stderr APPENDS to a fixed file that is never
+# truncated (systemd cannot date a path; Synaps does not rotate it). The
+# daemon leaves a regular-file stderr alone.
+StandardOutput=null
+StandardError=append:%h/.synaps-cli/logs/daemon-stderr.log
+
+[Install]
+WantedBy=default.target

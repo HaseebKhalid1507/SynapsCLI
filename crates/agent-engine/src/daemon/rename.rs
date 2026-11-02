@@ -88,7 +88,7 @@ pub async fn rename_session(
         loop {
             match rx.recv().await {
                 Ok(env) => match env.event {
-                    SessionEventWire::QueryResult { id, value } if id == query_id => return Some(value),
+                    SessionEventWire::QueryResult { id, value, .. } if id == query_id => return Some(value),
                     SessionEventWire::Ended { .. } => return None,
                     _ => {}
                 },

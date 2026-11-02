@@ -107,7 +107,7 @@ pub async fn close_session(state: &DaemonState, id: &SessionId, force: bool, att
         loop {
             match rx.recv().await {
                 Ok(env) => match env.event {
-                    SessionEventWire::QueryResult { id, value } if id == query_id => {
+                    SessionEventWire::QueryResult { id, value, .. } if id == query_id => {
                         let text = value.get("text").and_then(|t| t.as_str()).unwrap_or_default().to_string();
                         let ok = value.get("kind").and_then(|k| k.as_str()) != Some("error");
                         return Reply::Answered { ok, text };

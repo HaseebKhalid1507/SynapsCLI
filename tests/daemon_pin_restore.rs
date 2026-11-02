@@ -96,7 +96,7 @@ async fn wait_listed(sock: &Path, sid: &str, budget: Duration) -> Option<Session
 async fn restored(d: &Daemon) {
     tokio::time::sleep(Duration::from_millis(100)).await;
     let t0 = std::time::Instant::now();
-    while d.state.restoring.load(Ordering::SeqCst) && t0.elapsed() < Duration::from_secs(20) {
+    while d.state.pins_restoring.load(Ordering::SeqCst) && t0.elapsed() < Duration::from_secs(20) {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }

@@ -191,6 +191,11 @@ fn compare_versions(a: &str, b: &str) -> Option<std::cmp::Ordering> {
 pub const ATTACH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// Attach budget when the listed lifecycle is `Parked` (unpark ≤ 20 s, B3).
 pub const ATTACH_TIMEOUT_PARKED: std::time::Duration = std::time::Duration::from_secs(25);
+/// Attach budget for a session the daemon lists `restoring` (a fresh start
+/// still restoring it from its crash record): the daemon's gate holds the
+/// attach up to 30 s (`crash_record::GATE_WAIT`) and answers with its own
+/// error after that; the session it hands back may be a parked one.
+pub const ATTACH_TIMEOUT_RESTORING: std::time::Duration = std::time::Duration::from_secs(30 + 25);
 
 pub struct LocalTransport {
     handle: SessionHandle,
@@ -523,7 +528,7 @@ mod tests {
         .unwrap();
         let q = next(&mut t).await;
         match q.event {
-            SessionEventWire::QueryResult { id, value } => {
+            SessionEventWire::QueryResult { id, value, .. } => {
                 assert_eq!(id, 7);
                 assert_eq!(value["model"], "echo");
             }

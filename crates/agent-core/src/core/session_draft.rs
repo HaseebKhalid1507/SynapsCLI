@@ -50,6 +50,12 @@ pub struct TurnDraft {
     /// Text streamed so far in the in-flight response.
     #[serde(default)]
     pub partial_text: String,
+    /// The process that runs the turn (`pid:start_ticks:boot_id`; the
+    /// daemon's crash record names its writer the same way), so that a
+    /// restore can tell the draft of the turn a crash cut from one a later
+    /// process left. `None`: an older writer, or no process identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub writer: Option<String>,
 }
 
 fn artifact(id: &str) -> String {
@@ -175,6 +181,7 @@ mod tests {
         TurnDraft {
             base_len,
             partial_text: text.into(),
+            writer: None,
         }
     }
 

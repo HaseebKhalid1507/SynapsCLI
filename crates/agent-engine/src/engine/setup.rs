@@ -139,6 +139,7 @@ pub async fn boot(opts: EngineOpts) -> Result<EngineBoot> {
     let sb = resolve_session_and_prompt(
         &mut runtime,
         &opts.continue_session,
+        crate::session::ContinueLookup::Query,
         opts.system.as_deref(),
         opts.prompt_manifest.as_deref(),
     )?;
@@ -193,12 +194,13 @@ pub async fn boot(opts: EngineOpts) -> Result<EngineBoot> {
 pub(crate) fn resolve_session_and_prompt(
     runtime: &mut Runtime,
     continue_session: &Option<Option<String>>,
+    lookup: crate::session::ContinueLookup,
     system: Option<&str>,
     prompt_manifest: Option<&std::path::Path>,
 ) -> Result<SessionBootResult> {
     // Resolve the final foreground route before compiling immutable delegation
     // policy. Continuing a session may replace the configured model.
-    let sb = resolve_or_create_session(runtime, continue_session)?;
+    let sb = resolve_or_create_session(runtime, continue_session, lookup)?;
     runtime.set_session_id(Some(sb.session.id.clone()));
     // merge(112): seed continuation state from the resolved session so a
     // --continue resume picks up the context-continuation high-water mark.
@@ -302,6 +304,9 @@ pub(crate) fn spawn_session_background_gated(
     session: &Session,
     inbox_gate: Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<BackgroundTasks> {
+    // The session the inbox watcher and the socket below deliver to, for
+    // their intake logs.
+    runtime.event_queue().set_session_label(&session.id);
     // Start inbox watcher
     let watcher_shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let watcher_task = {
@@ -454,7 +459,15 @@ pub fn lock_session(
 /// The draft is removed only once the recovered history is on disk; if that
 /// save fails the draft stays, and the next holder retries (recovery is
 /// idempotent through its own marker).
-pub async fn recover_turn_draft(conv: &mut crate::engine::session::ConversationState) {
+///
+/// Returns `Some(writer)` when this call folded a cut turn in (the `Crash`
+/// marker is now the history's last message), `writer` being the draft's
+/// `TurnDraft::writer` (the process that ran that turn); `None` when there
+/// was nothing to recover. A daemon's crash restore resumes a turn only
+/// when the draft it folded was written by the crashed daemon.
+pub async fn recover_turn_draft(
+    conv: &mut crate::engine::session::ConversationState,
+) -> Option<Option<String>> {
     let dir = agent_core::session_lock::sessions_dir();
     let id = conv.session.id.clone();
     let read = {
@@ -466,18 +479,20 @@ pub async fn recover_turn_draft(conv: &mut crate::engine::session::ConversationS
         .map_err(std::io::Error::other)
         .and_then(|r| r)
     };
-    let recovered = match read {
-        Ok(None) => return,
-        Ok(Some(draft)) => {
-            crate::engine::interrupt::recover_crashed_turn(&mut conv.api_messages, &draft)
-        }
+    let (recovered, writer) = match read {
+        Ok(None) => return None,
+        Ok(Some(draft)) => (
+            crate::engine::interrupt::recover_crashed_turn(&mut conv.api_messages, &draft),
+            draft.writer,
+        ),
         Err(e) => {
             // Unreadable draft: never block the load. The history stays
             // exactly as saved; the draft is removed below.
             tracing::warn!(session = %id, "unreadable turn draft, removing it: {e}");
-            false
+            (false, None)
         }
     };
+    let folded = recovered.then_some(writer);
     if recovered {
         tracing::warn!(
             session = %id,
@@ -488,7 +503,7 @@ pub async fn recover_turn_draft(conv: &mut crate::engine::session::ConversationS
                 session = %id,
                 "could not save the recovered history; keeping the turn draft"
             );
-            return;
+            return folded;
         }
     } else {
         // The turn had concluded (or the draft was unreadable): the saved
@@ -502,25 +517,73 @@ pub async fn recover_turn_draft(conv: &mut crate::engine::session::ConversationS
     if let Ok(Err(e)) | Err(e) = removed.map_err(std::io::Error::other) {
         tracing::warn!(session = %conv.session.id, "failed to remove turn draft: {e}");
     }
+    folded
+}
+
+/// Whether `q` can only be a session file's own id: non-empty, letters,
+/// digits, `-` and `_` (no `/`, no `.`), so `<q>.json` stays inside the
+/// sessions directory.
+fn is_plain_session_id(q: &str) -> bool {
+    !q.is_empty()
+        && q.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// Look up a create's `continue_session` query on disk, before F24's
+/// `follow_compaction_chain`. `None` (a bare `--continue`) is the latest
+/// session by mtime. A [`ContinueLookup::Query`] (every user path) is a
+/// chain name, then a session name, then a (partial) id: `resolve_session`,
+/// unchanged. A [`ContinueLookup::ExactJournalId`] (the daemon's restore of
+/// a journal it recorded) loads `<id>.json` directly, with no chain look-up
+/// and no header scan of the sessions directory; when that file is not
+/// there it is looked up as a `Query`, so it resolves or fails exactly as
+/// a user's `--continue <id>` does.
+///
+/// The one look-up both `EngineHost::create_session` (its reservation key)
+/// and [`resolve_or_create_session`] (the build) use, so both pick the same
+/// session.
+///
+/// [`ContinueLookup::Query`]: crate::session::ContinueLookup::Query
+/// [`ContinueLookup::ExactJournalId`]: crate::session::ContinueLookup::ExactJournalId
+pub(crate) fn find_continue_session(
+    query: Option<&str>,
+    lookup: crate::session::ContinueLookup,
+) -> std::io::Result<Session> {
+    let Some(q) = query else {
+        return latest_session();
+    };
+    if lookup == crate::session::ContinueLookup::ExactJournalId && is_plain_session_id(q) {
+        match Session::load(q) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            found => return found,
+        }
+    }
+    resolve_session(q)
 }
 
 fn resolve_or_create_session(
     runtime: &mut Runtime,
     continue_session: &Option<Option<String>>,
+    lookup: crate::session::ContinueLookup,
 ) -> Result<SessionBootResult> {
     match continue_session {
         Some(ref maybe_id) => {
             let raw_session = match maybe_id {
-                Some(ref id) => resolve_session(id).map_err(|e| {
+                Some(ref id) => find_continue_session(Some(id), lookup).map_err(|e| {
                     crate::error::RuntimeError::Tool(format!(
                         "Failed to load session '{}': {}",
                         id, e
                     ))
                 })?,
-                None => latest_session().map_err(|e| {
+                None => find_continue_session(None, lookup).map_err(|e| {
                     crate::error::RuntimeError::Tool(format!("No sessions to continue: {}", e))
                 })?,
             };
+            // A restore that loaded its journal by its own id (the file's id
+            // is the query) was not reached by a chain or a name: skip those
+            // look-ups below (each would scan the sessions directory).
+            let exact_hit = lookup == crate::session::ContinueLookup::ExactJournalId
+                && maybe_id.as_deref() == Some(raw_session.id.as_str());
             // F24: follow compacted_into forward so --continue <old> lands
             // on the final successor, never on a pre-compaction fork point.
             let resolved = agent_core::session::follow_compaction_chain(raw_session)
@@ -548,7 +611,9 @@ fn resolve_or_create_session(
             let continue_info = {
                 let (resolved_via, query) = match maybe_id {
                     Some(ref q) => {
-                        let via = if *q != session.id {
+                        let via = if exact_hit {
+                            compaction_notice.as_ref().map(|_| "compacted".to_string())
+                        } else if *q != session.id {
                             if crate::chain::load_chain(q).is_ok() {
                                 Some("chain".to_string())
                             } else if agent_core::session::find_session_by_name(q).is_ok() {
@@ -687,6 +752,8 @@ mod tests {
             socket_path: crate::events::registry::socket_path_for_session("20200101-000000-dead"),
             pid: 999_999,
             started_at: chrono::Utc::now(),
+            receipts: 0,
+            start_ticks: None,
         };
         crate::events::registry::register_session(&dead).unwrap();
         let _stale = std::os::unix::net::UnixListener::bind(&dead.socket_path).unwrap();
@@ -722,11 +789,17 @@ mod tests {
         let draft = TurnDraft {
             base_len: 1,
             partial_text: "partial".into(),
+            writer: None,
         };
         write_turn_draft(&dir, &session.id, &draft).unwrap();
 
         let mut runtime = Runtime::new_headless();
-        let sb = resolve_or_create_session(&mut runtime, &Some(Some(session.id.clone()))).unwrap();
+        let sb = resolve_or_create_session(
+            &mut runtime,
+            &Some(Some(session.id.clone())),
+            crate::session::ContinueLookup::Query,
+        )
+        .unwrap();
         assert_eq!(sb.api_messages.len(), 1, "history exactly as saved");
         assert_eq!(
             read_turn_draft(&dir, &session.id).unwrap(),
@@ -750,6 +823,7 @@ mod tests {
             &TurnDraft {
                 base_len: 1,
                 partial_text: "partial".into(),
+                writer: None,
             },
         )
         .unwrap();
@@ -796,6 +870,7 @@ mod tests {
         let draft = TurnDraft {
             base_len: 1,
             partial_text: "partial".into(),
+            writer: None,
         };
         write_turn_draft(&dir, &id, &draft).unwrap();
         // Make the snapshot unwritable: a non-empty directory where the

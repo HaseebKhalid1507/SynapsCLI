@@ -108,21 +108,21 @@ impl SessionActor {
         // journal): `saveas` names/unnames + force-saves.
         if cmd == "saveas" {
             let value = self.session_name(&arg).await;
-            self.emit(SessionEventWire::QueryResult { id, value });
+            self.emit(SessionEventWire::QueryResult { id, value, client_tools: None });
             return;
         }
         // `/keepwarm [status|off|auto|<N>h]`: actor-owned prompt-cache
         // keep-warm state (task #444).
         if cmd == "keepwarm" {
             let value = self.cache_keepwarm_command(&arg).await;
-            self.emit(SessionEventWire::QueryResult { id, value });
+            self.emit(SessionEventWire::QueryResult { id, value, client_tools: None });
             return;
         }
         // `/auth reload` is async (broker round-trip), so it cannot live in
         // the sync `handle_engine_command`. Never echoes a token.
         if cmd == "auth" {
             let value = auth_command_reply(&arg, &self.runtime).await;
-            self.emit(SessionEventWire::QueryResult { id, value });
+            self.emit(SessionEventWire::QueryResult { id, value, client_tools: None });
             return;
         }
         crate::engine::commands::prepare_engine_command(&cmd, &arg, &self.runtime).await;
@@ -160,6 +160,7 @@ impl SessionActor {
                 message: None,
                 view,
                 clamp: None,
+                memory_only_tools: None,
             }));
         }
         if let Some(CommandResult::Compact {
@@ -168,7 +169,7 @@ impl SessionActor {
         {
             self.compact(custom_instructions, "manual").await;
         }
-        self.emit(SessionEventWire::QueryResult { id, value });
+        self.emit(SessionEventWire::QueryResult { id, value, client_tools: None });
     }
 
     /// The memory choice a rebuilt runtime must honour: the recorded one,
@@ -268,6 +269,7 @@ impl SessionActor {
         let reply = |text: String, kind: &str| SessionEventWire::QueryResult {
             id,
             value: serde_json::json!({ "kind": kind, "text": text }),
+            client_tools: None,
         };
         let force = match arg.trim() {
             "" => false,
@@ -473,7 +475,7 @@ impl SessionActor {
                 Err(e) => serde_json::json!({ "kind": "error", "text": e.to_string() }),
             },
         };
-        self.emit(SessionEventWire::QueryResult { id, value });
+        self.emit(SessionEventWire::QueryResult { id, value, client_tools: None });
     }
 
     fn find_plugin_command(
@@ -491,13 +493,18 @@ impl SessionActor {
     /// model/reasoning/system prompt, swap conversation. Reply `Resumed{id}`
     /// then `Conversation`; error → `QueryResult{id, {kind:"error", text}}`.
     pub(crate) async fn resume(&mut self, id: u64, query: String) {
+        self.ephemeral_layer.invalidate(crate::runtime::ephemeral::Reason::NewSession);
         if self.streaming {
             self.emit(SessionEventWire::QueryResult {
                 id,
                 value: serde_json::json!({ "kind": "error", "text": "cannot resume while streaming" }),
+                client_tools: None,
             });
             return;
         }
+        // A resumed conversation is a reload: memory-only results come back
+        // only through a new call.
+        self.memory_only.clear();
         // Queued saves first: resuming the CURRENT session reloads it from
         // disk, which must hold its latest state.
         self.persister.flush().await;
@@ -507,6 +514,7 @@ impl SessionActor {
                 self.emit(SessionEventWire::QueryResult {
                     id,
                     value: serde_json::json!({ "kind": "error", "text": e.to_string() }),
+                    client_tools: None,
                 });
                 return;
             }
@@ -531,6 +539,7 @@ impl SessionActor {
                             "kind": "error",
                             "text": format!("cannot resume: {e}"),
                         }),
+                        client_tools: None,
                     });
                     return;
                 }
@@ -545,6 +554,9 @@ impl SessionActor {
         // Committed to the swap: end keep-warm now, booking any ping in
         // flight to the conversation being left (saved just below).
         self.cache_keepwarm_conversation_replaced();
+        // Client tools belong to the conversation being left (no call is
+        // live: resume is refused while streaming).
+        self.drop_client_tools(crate::runtime::client_tools::DropReason::NewConversation);
         self.runtime.set_model(session.model.clone());
         // A resumed session owns its saved choice. Preserve that explicit
         // provenance across later model switches.

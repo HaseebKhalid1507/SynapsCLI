@@ -108,6 +108,34 @@ impl PartialEq for SnapshotKey {
     }
 }
 
+/// Test-only counts (`cfg(test)` / the `testing` feature).
+#[cfg(any(test, feature = "testing"))]
+pub mod testing {
+    use std::sync::Mutex;
+
+    /// Snapshot saves queued, per session id, in this process.
+    static SAVES: Mutex<Vec<(String, u64)>> = Mutex::new(Vec::new());
+
+    pub(super) fn note_save(id: &str) {
+        let mut saves = SAVES.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        match saves.iter_mut().find(|(i, _)| i == id) {
+            Some((_, n)) => *n += 1,
+            None => saves.push((id.to_string(), 1)),
+        }
+    }
+
+    /// How many snapshot saves of session `id` were queued on any actor's
+    /// persister in this process (requests, before latest-wins merging).
+    pub fn saves_requested(id: &str) -> u64 {
+        SAVES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .find(|(i, _)| i == id)
+            .map_or(0, |(_, n)| *n)
+    }
+}
+
 pub(crate) struct Persister {
     shared: Arc<Shared>,
     progress: watch::Receiver<Progress>,
@@ -134,6 +162,8 @@ impl Persister {
 
     /// Queue `session` for saving (replaces a queued snapshot of the same id).
     pub(crate) fn save(&self, session: Session) {
+        #[cfg(any(test, feature = "testing"))]
+        testing::note_save(&session.id);
         {
             let mut p = self.shared.lock();
             match p.saves.iter_mut().find(|s| s.id == session.id) {
@@ -318,6 +348,7 @@ mod tests {
         TurnDraft {
             base_len,
             partial_text: "partial".into(),
+            writer: None,
         }
     }
 
@@ -472,6 +503,15 @@ mod tests {
         let mut costed = s.clone();
         costed.session_cost += 0.01;
         assert!(SnapshotKey::of(&s) != SnapshotKey::of(&costed));
+
+        // The child share is snapshot-only: a change to it alone is a
+        // different snapshot too.
+        let mut child = s.clone();
+        child.child_cost += 0.01;
+        assert!(SnapshotKey::of(&s) != SnapshotKey::of(&child));
+        let mut child_tokens = s.clone();
+        child_tokens.child_tokens.output += 1;
+        assert!(SnapshotKey::of(&s) != SnapshotKey::of(&child_tokens));
 
         // Same content, rebuilt message: conservatively a different state.
         let mut rebuilt = s.clone();

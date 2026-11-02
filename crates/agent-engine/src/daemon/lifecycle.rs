@@ -33,8 +33,10 @@ pub async fn shutdown_all(state: &Arc<DaemonState>, force: bool) {
 
     let ext = Arc::clone(state.host.ext_manager());
     let ext_shutdown = async move { ext.write().await.shutdown_all().await };
-    if tokio::time::timeout(Duration::from_secs(5), ext_shutdown).await.is_err() {
+    let ext_budget = Duration::from_secs(crate::session::budgets::STOP_EXT_SHUTDOWN_SECS);
+    if tokio::time::timeout(ext_budget, ext_shutdown).await.is_err() {
         tracing::warn!("daemon: extension shutdown budget exceeded");
     }
+    crate::sandbox::stop_audit();
     state.host.flush_logs();
 }

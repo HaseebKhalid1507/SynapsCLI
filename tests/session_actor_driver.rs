@@ -4,6 +4,116 @@
 #[path = "support/hermetic_base_dir.rs"]
 mod hermetic_base_dir;
 
+/// This binary's sessions bind real Unix sockets in the registry dir. The
+/// pinned base dir sits under `CARGO_TARGET_TMPDIR`, and its `run/` path is
+/// too long for `sun_path` in any realistic target (about 148 bytes on
+/// g1pro, about 116 in a local target; the limit is 107). So the sockets and
+/// registration files go to a short private dir in the temp dir, through
+/// `SYNAPS_RUNTIME_DIR`, which controls only those (`registry_dir`).
+/// Config and persistent state stay in the pinned base dir.
+///
+/// A load-time initializer sets it, as for the base dir, before `main` and
+/// so before libtest starts any thread. `HomeGuard` doesn't touch it, so
+/// guarded tests use it too. A normal exit (libtest's included) removes the
+/// dir this process made, and nothing else.
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+mod short_runtime_dir {
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::OnceLock;
+
+    /// `sun_path`'s size, its terminating NUL included.
+    const SUN_PATH_BYTES: usize = if cfg!(target_vendor = "apple") { 104 } else { 108 };
+
+    static DIR: OnceLock<PathBuf> = OnceLock::new();
+
+    /// Set only by the load-time initializer.
+    static RAN_BEFORE_MAIN: AtomicBool = AtomicBool::new(false);
+
+    #[used]
+    #[cfg_attr(target_os = "linux", link_section = ".init_array")]
+    #[cfg_attr(target_vendor = "apple", link_section = "__DATA,__mod_init_func")]
+    static INIT_BEFORE_MAIN: extern "C" fn() = init_before_main;
+
+    #[cfg(target_os = "linux")]
+    #[used]
+    #[link_section = ".fini_array"]
+    static REMOVE_AT_EXIT: extern "C" fn() = remove_at_exit;
+
+    extern "C" fn init_before_main() {
+        DIR.get_or_init(create);
+        RAN_BEFORE_MAIN.store(true, Ordering::SeqCst);
+    }
+
+    /// A new dir under a random name (`mkdir`, never an existing path),
+    /// exactly 0700 whatever the umask, named by its canonical path:
+    /// `registry_dir` canonicalizes, and binds there.
+    fn create() -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let private = || std::fs::Permissions::from_mode(0o700);
+        let made = tempfile::Builder::new()
+            .prefix("sad-")
+            .permissions(private())
+            .tempdir()
+            .expect("short runtime dir")
+            .keep();
+        std::fs::set_permissions(&made, private()).expect("short runtime dir mode");
+        let dir = std::fs::canonicalize(&made).expect("short runtime dir canonical path");
+        std::env::set_var("SYNAPS_RUNTIME_DIR", &dir);
+        dir
+    }
+
+    /// Removes the dir this process made, if it is still a real dir.
+    #[cfg(target_os = "linux")]
+    extern "C" fn remove_at_exit() {
+        if let Some(dir) = DIR.get() {
+            if std::fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir()) {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+        }
+    }
+
+    /// The initializer ran before `main`; the engine resolves the dir; it
+    /// is private and in the temp dir; a real session's socket in it fits
+    /// `sun_path`.
+    #[tokio::test]
+    async fn set_before_main_private_and_fits_sun_path() {
+        use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+        super::hermetic_base_dir::pin();
+        assert!(RAN_BEFORE_MAIN.load(Ordering::SeqCst), "load-time initializer never ran");
+        let dir = DIR.get().expect("created by the initializer");
+        assert_eq!(std::env::var_os("SYNAPS_RUNTIME_DIR").as_deref(), Some(dir.as_os_str()));
+        assert_eq!(agent_engine::events::registry::registry_dir(), *dir);
+        let tmp = std::fs::canonicalize(std::env::temp_dir()).expect("temp dir");
+        assert!(dir.starts_with(&tmp), "{dir:?} is not under {tmp:?}");
+        let meta = std::fs::symlink_metadata(dir).expect("short runtime dir");
+        assert!(meta.is_dir(), "{dir:?}");
+        assert_eq!(meta.permissions().mode() & 0o7777, 0o700, "{dir:?}");
+
+        let host = super::host().await;
+        let actor = super::session(&host).await;
+        let sockets: Vec<PathBuf> = std::fs::read_dir(dir)
+            .expect("short runtime dir")
+            .flatten()
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_socket()))
+            .map(|e| e.path())
+            .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("s-")))
+            .collect();
+        assert!(!sockets.is_empty(), "no session socket in {dir:?}");
+        for socket in &sockets {
+            let name = socket.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+            let hex = name.strip_prefix("s-").and_then(|n| n.strip_suffix(".sock"));
+            assert!(
+                hex.is_some_and(|h| h.len() == 32 && h.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))),
+                "{name}"
+            );
+            let bytes = socket.as_os_str().len();
+            assert!(bytes < SUN_PATH_BYTES, "{bytes} bytes: {socket:?}");
+        }
+        actor.end().await;
+    }
+}
+
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -305,6 +415,8 @@ async fn checkpoint_reload_revokes_and_notifies() {
     actor
         .send(SessionCommand::Checkpoint {
             reason: agent_engine::session::CheckpointReason::Reload,
+            deadline: None,
+            skip_quiesce_grace: false,
         })
         .await;
     let ev = actor
@@ -1519,7 +1631,8 @@ fn s3_pollrequest_serializes_session_cost_so_far() {
 }
 
 /// S3: the new `CostCapReached` wire event survives the SessionEventWire ↔
-/// WireSessionEvent mirror (both `From` arms), preserving its fields.
+/// WireSessionEvent mirror (`for_client` and the `From` back), preserving
+/// its fields.
 #[test]
 fn s3_costcapreached_wire_mirror_roundtrips() {
     hermetic_base_dir::pin();
@@ -1529,7 +1642,7 @@ fn s3_costcapreached_wire_mirror_roundtrips() {
         cost: 1.25,
         cap: 0.75,
     };
-    let wire: WireSessionEvent = ev.into();
+    let wire = WireSessionEvent::for_client(ev).expect("CostCapReached has a client form");
     let back: SessionEventWire = wire.into();
     match back {
         SessionEventWire::CostCapReached { scope, cost, cap } => {

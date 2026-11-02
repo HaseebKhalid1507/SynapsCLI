@@ -179,7 +179,8 @@ async fn clients_are_named_in_the_roster_listing_and_refusals() {
     b.send_from_self(SessionCommand::Submit { text: "from b".into(), attachments: vec![] }).await.unwrap();
     let r = until(&mut b, |e| matches!(e, SessionEventWire::Refused { .. })).await;
     let SessionEventWire::Refused { reason, .. } = r else { unreachable!() };
-    assert_eq!(reason, format!("input owned by terminal (#{})", a.client_id().0));
+    // PARITY: 790d R6 refusal text: "input owned by client #<id>", then the name.
+    assert_eq!(reason, format!("input owned by client #{} (terminal)", a.client_id().0));
 
     // `daemon sessions` sees the roster.
     let list = SocketTransport::sessions(&paths.sock).await.unwrap();

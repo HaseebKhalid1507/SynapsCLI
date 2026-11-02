@@ -76,8 +76,15 @@ pub async fn accept_loop(state: Arc<DaemonState>, mut listener: Listener, shutdo
                 let shutdown = shutdown.clone();
                 state.connections.fetch_add(1, Ordering::SeqCst);
                 tokio::spawn(async move {
+                    // Decrement on drop: a panicking `serve` (panic =
+                    // "unwind") ends only this task, and a count left high
+                    // would keep idle-exit off and the reload announce
+                    // waiting for a client that is gone.
+                    let counted = Arc::clone(&state);
+                    let _count = OnDrop(move || {
+                        counted.connections.fetch_sub(1, Ordering::SeqCst);
+                    });
                     super::conn::serve(Arc::clone(&state), stream, shutdown).await;
-                    state.connections.fetch_sub(1, Ordering::SeqCst);
                 });
             }
             Err(e) => {
@@ -100,6 +107,15 @@ fn admit(stream: &tokio::net::UnixStream, own_uid: u32) -> Result<(), String> {
         Ok(cred) if cred.uid() == own_uid => Ok(()),
         Ok(cred) => Err(format!("peer uid {} is not the daemon's uid {own_uid}", cred.uid())),
         Err(e) => Err(format!("peer credentials unreadable: {e}")),
+    }
+}
+
+/// Runs its closure when dropped: on return and on unwind alike.
+struct OnDrop<F: FnMut()>(F);
+
+impl<F: FnMut()> Drop for OnDrop<F> {
+    fn drop(&mut self) {
+        (self.0)()
     }
 }
 
@@ -126,5 +142,29 @@ mod tests {
         let other = own_uid().wrapping_add(1);
         let err = admit(&a, other).unwrap_err();
         assert!(err.contains("is not the daemon's uid"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod on_drop_tests {
+    use super::OnDrop;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn a_panicking_connection_task_still_gives_its_count_back() {
+        let connections = Arc::new(AtomicUsize::new(0));
+        connections.fetch_add(1, Ordering::SeqCst);
+        let counted = Arc::clone(&connections);
+        let task = tokio::spawn(async move {
+            let counted = Arc::clone(&counted);
+            let _count = OnDrop(move || {
+                counted.fetch_sub(1, Ordering::SeqCst);
+            });
+            tokio::task::yield_now().await;
+            panic!("serve panicked");
+        });
+        assert!(task.await.expect_err("the task panics").is_panic());
+        assert_eq!(connections.load(Ordering::SeqCst), 0);
     }
 }

@@ -101,6 +101,8 @@ fn texts(items: &[DisplayItem]) -> Vec<String> {
             DisplayItem::Text { text } => format!("A:{text}"),
             DisplayItem::Thinking { text } => format!("T:{text}"),
             DisplayItem::ToolUse { tool_name, .. } => format!("tool:{tool_name}"),
+            DisplayItem::Held { source, .. } => format!("held:{source:?}"),
+            DisplayItem::Unknown => "unknown".to_string(),
         })
         .collect()
 }

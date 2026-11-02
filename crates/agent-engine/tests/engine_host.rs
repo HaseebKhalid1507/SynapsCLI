@@ -98,6 +98,67 @@ async fn worker_runtime_fresh_hookbus_and_private_registry() {
     assert_eq!(reg.get("bash").is_some(), cfg!(feature = "command-exec"));
 }
 
+/// The host-built worker takes the host's configured tool limits (the
+/// legacy spawn path is pinned in the engine's worker_limits_tests). Uses
+/// its own, uninstalled host so the shared host's config stays as it is.
+#[tokio::test]
+async fn worker_runtime_takes_the_configured_tool_limits() {
+    let _ = host().await; // base dir configured
+    let h = EngineHost::boot(HostOpts {
+        profile: None,
+        no_extensions: true,
+        mcp_discovery: agent_engine::McpDiscovery::Inline,
+    })
+    .await
+    .unwrap();
+    for (cap, default, output, subagent) in [(0u64, 7u64, 12_345usize, 111u64), (2, 3, 4_321, 222)] {
+        let mut config = (**h.config()).clone();
+        config.bash_max_timeout = cap;
+        config.bash_timeout = default;
+        config.max_tool_output = output;
+        config.subagent_timeout = subagent;
+        h.set_config_for_test(config);
+        let w = h.worker_runtime().await.unwrap();
+        assert_eq!(w.bash_max_timeout(), cap, "bash_max_timeout");
+        assert_eq!(w.bash_timeout(), default, "bash_timeout");
+        assert_eq!(w.max_tool_output(), output, "max_tool_output");
+        assert_eq!(w.subagent_timeout(), subagent, "subagent_timeout");
+        // Retries come from the same config, as before.
+        assert_eq!(w.api_retries(), 8);
+        assert_eq!(w.refusal_retries(), 5);
+    }
+}
+
+/// The host-built worker leaves out every tool the operator disabled, not
+/// only the forum tools. The registry follows the host's current config: with
+/// the list emptied again, the tool is back. Own, uninstalled host, as above.
+#[tokio::test]
+async fn worker_registry_leaves_out_the_configured_disabled_tools() {
+    let _ = host().await; // base dir configured
+    let h = EngineHost::boot(HostOpts {
+        profile: None,
+        no_extensions: true,
+        mcp_discovery: agent_engine::McpDiscovery::Inline,
+    })
+    .await
+    .unwrap();
+    for (disabled, present) in [(vec!["bash", "ls"], false), (vec![], true)] {
+        let mut config = (**h.config()).clone();
+        config.disabled_tools = disabled.iter().map(|name| name.to_string()).collect();
+        h.set_config_for_test(config);
+        let w = h.worker_runtime().await.unwrap();
+        let reg = w.tools_shared();
+        let reg = reg.read().await;
+        assert_eq!(reg.get("ls").is_some(), present, "ls with {disabled:?} disabled");
+        assert_eq!(
+            reg.get("bash").is_some(),
+            present && cfg!(feature = "command-exec"),
+            "bash with {disabled:?} disabled"
+        );
+        assert!(reg.get("read").is_some(), "read stays");
+    }
+}
+
 #[tokio::test]
 async fn worker_registry_cached_by_generation() {
     let h = host().await;

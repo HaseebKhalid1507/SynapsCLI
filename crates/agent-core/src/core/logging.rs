@@ -18,29 +18,72 @@ pub fn init_logging() -> Option<WorkerGuard> {
         .finish(file_appender);
 
     if let Err(e) = tracing_subscriber::fmt()
-        .with_env_filter(with_crate_directives(tracing_subscriber::EnvFilter::from_default_env()))
+        .with_env_filter(default_env_filter(
+            std::env::var("RUST_LOG").ok().as_deref(),
+        ))
         .with_writer(non_blocking)
         .with_target(false)
         .with_thread_ids(true)
         .with_ansi(false)
         .try_init()
     {
-        eprintln!("Failed to initialize logging: {}", e);
+        crate::eprintln_lossy!("Failed to initialize logging: {}", e);
+        tracing::warn!(error = %e, "failed to initialize logging");
     }
 
     Some(guard)
 }
 
-/// The log file's directives on top of `base` (the `RUST_LOG` filter, which
-/// is ERROR when unset): debug for Synaps's own crates. An event whose
-/// target is outside these crates is kept only at ERROR unless `RUST_LOG`
-/// says otherwise. Public so a test can check what reaches the log.
+/// Target of the engine's metadata-only context telemetry. The file
+/// formatter hides targets, so its lines are identified by their messages
+/// (`context rollover`, `context window settled`, `context rollover
+/// deferred`).
+pub const CONTEXT_TELEMETRY_TARGET: &str = "synaps::context";
+
+/// The log filter: `rust_log` (the value of `RUST_LOG`; `error` when unset
+/// or invalid) plus the crate directives, and `synaps::context=info` unless
+/// `rust_log` itself has a directive for that target. Public so a test can
+/// check what reaches the log (`default_env_filter(None)` is the daemon's
+/// filter with `RUST_LOG` unset).
+pub fn default_env_filter(rust_log: Option<&str>) -> tracing_subscriber::EnvFilter {
+    let raw = rust_log.unwrap_or_default();
+    let mut filter = tracing_subscriber::EnvFilter::builder()
+        .with_default_directive(tracing_subscriber::filter::LevelFilter::ERROR.into())
+        .parse_lossy(raw);
+    if !names_target(raw, CONTEXT_TELEMETRY_TARGET) {
+        filter = filter.add_directive(
+            format!("{CONTEXT_TELEMETRY_TARGET}=info")
+                .parse()
+                .expect("valid directive"),
+        );
+    }
+    with_crate_directives(filter)
+}
+
+/// The log file's directives on top of `base`: debug for Synaps's own
+/// crates. An event whose target is outside these crates (and outside
+/// `synaps::context`, see [`default_env_filter`]) is kept only at ERROR
+/// unless `RUST_LOG` says otherwise.
 pub fn with_crate_directives(base: tracing_subscriber::EnvFilter) -> tracing_subscriber::EnvFilter {
     base.add_directive("synaps_cli=debug".parse().expect("valid directive"))
         .add_directive("agent_core=debug".parse().expect("valid directive"))
         .add_directive("agent_engine=debug".parse().expect("valid directive"))
         .add_directive("agent_tui=debug".parse().expect("valid directive"))
         .add_directive("tracing=info".parse().expect("valid directive"))
+}
+
+/// Whether a directive in `directives` names a target that covers `target`
+/// (filter targets match by prefix). A bare level names no target.
+fn names_target(directives: &str, target: &str) -> bool {
+    directives.split(',').any(|d| {
+        let d = d.trim();
+        let name = d.split(['[', '=']).next().unwrap_or_default().trim();
+        let bare_level = !d.contains(['[', '='])
+            && name
+                .parse::<tracing_subscriber::filter::LevelFilter>()
+                .is_ok();
+        !name.is_empty() && !bare_level && target.starts_with(name)
+    })
 }
 
 /// Default bounded-channel capacity for the non-blocking log writer.
@@ -72,5 +115,54 @@ mod tests {
             log_buffer_lines_from(Some("nope")),
             DEFAULT_LOG_BUFFER_LINES
         );
+    }
+
+    fn context_enabled(rust_log: Option<&str>) -> bool {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let subscriber = tracing_subscriber::registry().with(default_env_filter(rust_log));
+        tracing::subscriber::with_default(
+            subscriber,
+            || tracing::enabled!(target: "synaps::context", tracing::Level::INFO),
+        )
+    }
+
+    fn other_warn_enabled(rust_log: Option<&str>) -> bool {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let subscriber = tracing_subscriber::registry().with(default_env_filter(rust_log));
+        tracing::subscriber::with_default(
+            subscriber,
+            || tracing::enabled!(target: "some_dependency", tracing::Level::WARN),
+        )
+    }
+
+    /// The context telemetry reaches the log file by default; `RUST_LOG`
+    /// still decides when it names the target.
+    #[test]
+    fn context_telemetry_is_on_by_default_and_rust_log_overrides_it() {
+        assert_eq!(CONTEXT_TELEMETRY_TARGET, "synaps::context");
+        assert!(context_enabled(None));
+        assert!(context_enabled(Some("")));
+        assert!(context_enabled(Some("warn")));
+        assert!(context_enabled(Some("off")), "a bare level names no target");
+        assert!(context_enabled(Some("hyper=debug")));
+        assert!(!context_enabled(Some("synaps::context=off")));
+        assert!(!context_enabled(Some("synaps::context=warn")));
+        assert!(!context_enabled(Some("warn,synaps=off")));
+        assert!(context_enabled(Some("synaps::context=debug")));
+        // The rest of the default is unchanged: errors only elsewhere.
+        assert!(!other_warn_enabled(None));
+        assert!(other_warn_enabled(Some("warn")));
+    }
+
+    #[test]
+    fn directive_targets_are_recognized() {
+        let t = CONTEXT_TELEMETRY_TARGET;
+        assert!(names_target("synaps::context=info", t));
+        assert!(names_target("info, synaps::context[span]=debug", t));
+        assert!(names_target("synaps", t), "a target alone means trace");
+        assert!(!names_target("", t));
+        assert!(!names_target("info", t));
+        assert!(!names_target("synaps_cli=debug", t));
+        assert!(!names_target("synaps::context_other=info", t));
     }
 }

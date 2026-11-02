@@ -27,6 +27,7 @@ pub mod session_journal;
 pub mod session_lock;
 mod session_save_order;
 pub mod shell_config;
+pub mod stdio;
 pub mod stream_types;
 pub mod tool_spill;
 pub mod watcher_types;

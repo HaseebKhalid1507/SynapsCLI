@@ -53,11 +53,20 @@ static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 // jemalloc reads the config from `_rjem_malloc_conf` — NOT `malloc_conf`. An
 // earlier revision exported the unmangled name, which jemalloc silently ignored
 // (verified: opt.dirty_decay_ms sat at the 10000ms default). Keep this mangled.
-#[cfg(all(unix, not(target_env = "musl")))]
+#[cfg(all(unix, not(target_env = "musl"), not(target_os = "macos")))]
 #[allow(non_upper_case_globals)]
 #[export_name = "_rjem_malloc_conf"]
 pub static MALLOC_CONF: &[u8] =
     b"background_thread:true,narenas:4,dirty_decay_ms:1000,muzzy_decay_ms:0\0";
+
+// macOS: jemalloc has no background thread there. Asking for one prints
+// "<jemalloc>: option background_thread currently supports pthread only" on
+// stderr at every start (every `synaps … --json` call the app makes), and does
+// nothing. The same conf without it: decay still purges, on allocator activity.
+#[cfg(target_os = "macos")]
+#[allow(non_upper_case_globals)]
+#[export_name = "_rjem_malloc_conf"]
+pub static MALLOC_CONF: &[u8] = b"narenas:4,dirty_decay_ms:1000,muzzy_decay_ms:0\0";
 
 #[derive(Parser)]
 #[command(
@@ -296,8 +305,8 @@ enum Command {
     },
     /// Send an event to a running session (its socket), or to the shared inbox
     Send {
-        /// Message text
-        message: String,
+        /// Message text (with --strict, or --body-file instead)
+        message: Option<String>,
         #[arg(long, default_value = "cli")]
         source: String,
         #[arg(long, default_value = "medium")]
@@ -308,7 +317,8 @@ enum Command {
         content_type: String,
         /// Target a specific session by ID, name, or prefix. A miss, or a
         /// socket that still refuses after 3 tries, is an error (exit 1,
-        /// nothing delivered) unless --inbox is given
+        /// nothing delivered) unless --inbox is given (with --strict: exact
+        /// ID or name only)
         #[arg(long, value_name = "SESSION")]
         session: Option<String>,
         /// Send to all active sessions
@@ -317,8 +327,19 @@ enum Command {
         /// With --session: when nothing matches or the socket refuses, leave
         /// the event in the shared inbox instead of failing. Only a session with an attached input
         /// owner takes inbox files, exactly once
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["strict", "json", "body_file"])]
         inbox: bool,
+        /// Deliver to exactly one live session, matched by exact ID or name,
+        /// and confirm it from the session's receipt. Never writes the inbox.
+        /// Exit 0 sent, 2 usage, 3 not sent, 5 uncertain.
+        #[arg(long)]
+        strict: bool,
+        /// With --strict: print the result as one JSON line on stdout
+        #[arg(long)]
+        json: bool,
+        /// With --strict: read the message from this file, or stdin for `-`
+        #[arg(long = "body-file", value_name = "PATH")]
+        body_file: Option<std::path::PathBuf>,
     },
     /// Generate shell completions (bash, zsh, fish, elvish, powershell)
     Completions {
@@ -330,6 +351,23 @@ enum Command {
     Prompt {
         #[command(subcommand)]
         action: cmd::prompt::PromptAction,
+    },
+    /// Sandbox policy tools for operators (`synaps sandbox check <file>`).
+    #[command(hide = true)]
+    Sandbox {
+        #[command(subcommand)]
+        action: cmd::sandbox::SandboxAction,
+    },
+    /// The model picker's Favorites view: the favorites of every usable
+    /// provider, in the picker's order. Asks the running daemon (never
+    /// starts one); without one, answers locally without plugin providers.
+    Models {
+        /// List the favorites (the only listing today).
+        #[arg(long)]
+        favorites: bool,
+        /// Print JSON: {source, reason?, plugins_loaded, live_providers, models: [{id, label, provider_key, provider_name, badges?}]}.
+        #[arg(long)]
+        json: bool,
     },
     /// Tool-surface utilities (schema export, etc.)
     Tools {
@@ -347,6 +385,12 @@ enum Command {
         #[command(subcommand)]
         action: cmd::retention::RetentionAction,
     },
+    /// Edit the config file without starting the daemon (`set`: atomic,
+    /// allowlisted keys, for scripts and installers).
+    Config {
+        #[command(subcommand)]
+        action: cmd::config::ConfigAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -360,6 +404,26 @@ enum AuthAction {
         /// Requires --provider. The default slot is never touched.
         #[arg(long, requires = "provider", value_name = "LABEL")]
         account: Option<String>,
+    },
+    /// Machine-driven browser sign-in for the app: JSON lines on stdout
+    /// (anthropic, openai-codex). Requires --json; never opens a browser.
+    Connect {
+        /// Provider to sign in with: anthropic or openai-codex.
+        #[arg(long)]
+        provider: String,
+        /// Account slot to fill (`default` for the default slot).
+        #[arg(long, value_name = "LABEL")]
+        account: String,
+        /// Sign in again into an existing slot whose seat fingerprint is FP
+        /// (`none` for a slot without one). Omit to add a new slot.
+        #[arg(long, value_name = "FP")]
+        expect_seat: Option<String>,
+        /// Seconds before the attempt gives up (default 600, clamped to 30..=1800).
+        #[arg(long, value_name = "SECS")]
+        timeout: Option<u64>,
+        /// Print JSON lines (required).
+        #[arg(long)]
+        json: bool,
     },
     /// List stored OAuth accounts (labels and non-secret metadata only)
     List {
@@ -388,6 +452,12 @@ enum AuthAction {
         /// Account label, `default`, or `auto` (opt-in capacity-based selection)
         #[arg(long, value_name = "LABEL|default|auto")]
         account: String,
+        /// Print one JSON reply (accounts contract v1)
+        #[arg(long)]
+        json: bool,
+        /// Write only if the accounts revision still equals REV (`conflict` otherwise)
+        #[arg(long, value_name = "REV", requires = "json")]
+        expect: Option<String>,
     },
     /// Remove one stored account slot (never touches other slots)
     Remove {
@@ -400,6 +470,12 @@ enum AuthAction {
         /// Skip confirmation (required for the default slot and non-interactive use)
         #[arg(long, short = 'y')]
         yes: bool,
+        /// Print one JSON reply (accounts contract v1); requires -y
+        #[arg(long)]
+        json: bool,
+        /// Remove only if the accounts revision still equals REV (`conflict` otherwise)
+        #[arg(long, value_name = "REV", requires = "json")]
+        expect_rev: Option<String>,
     },
     /// Verify which provider account each stored slot holds and flag slots that
     /// share one seat (backfills identity for logins that predate this check).
@@ -442,6 +518,34 @@ enum AuthAction {
         /// --account also drops it.
         #[arg(long)]
         clear: bool,
+    },
+    /// The accounts API level this binary speaks (the app's version probe)
+    Capabilities {
+        /// Machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show or set the order automatic selection tries a provider's accounts
+    /// in (auth.order.<provider>) and whether that order is strict
+    Order {
+        /// OAuth provider (e.g. claude, openai-codex)
+        #[arg(long)]
+        provider: String,
+        /// Machine-readable JSON (accounts contract v1)
+        #[arg(long)]
+        json: bool,
+        /// The new order: every stored label of the provider, each once
+        #[arg(long, value_name = "L1,L2,...")]
+        set: Option<String>,
+        /// Try accounts strictly in this order (auth.auto.strategy.<provider> = preference_order)
+        #[arg(long, conflicts_with = "tie_break")]
+        strict: bool,
+        /// Soonest reset first; the order only breaks ties (strategy soonest_reset)
+        #[arg(long)]
+        tie_break: bool,
+        /// Write only if the accounts revision still equals REV (`conflict` otherwise)
+        #[arg(long, value_name = "REV")]
+        expect: Option<String>,
     },
 }
 
@@ -757,6 +861,10 @@ fn main() -> anyhow::Result<()> {
     if let Some(code) = agent_engine::tools::run_sudo_askpass_helper_if_invoked() {
         std::process::exit(code);
     }
+    // First after that: a panic anywhere below (daemon boot, plugin load, a
+    // reload's next image) leaves its ERROR line in synaps.log once logging
+    // is up.
+    synaps_cli::panic_hook::install();
     // Before anything can report it (daemon `Welcome`, the client's skew check).
     agent_engine::session::wire::set_build_id(env!("SYNAPS_BUILD_ID"));
     let mut thin = false;
@@ -803,15 +911,17 @@ fn main() -> anyhow::Result<()> {
     }
     // The log-appender guard lives on the process `EngineHost` (a static —
     // never dropped by Rust). Flush it on every exit path so the teardown
-    // burst (session save, hooks, extension shutdown) reaches disk.
-    let default_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        default_hook(info);
-        synaps_cli::EngineHost::flush_installed_logs();
-    }));
-    let result = rt.block_on(async_main());
+    // burst (session save, hooks, extension shutdown) reaches disk. The
+    // panic hook (installed first thing above) logs one ERROR line and
+    // flushes when the panic aborts; a panic that unwinds out of
+    // `async_main` ends the process too, so it flushes here before the
+    // unwind goes on.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rt.block_on(async_main())));
     synaps_cli::EngineHost::flush_installed_logs();
-    result
+    match result {
+        Ok(result) => result,
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
 }
 
 async fn async_main() -> anyhow::Result<()> {
@@ -823,6 +933,16 @@ async fn async_main() -> anyhow::Result<()> {
     if matches!(cli.command, Some(Command::Prompt { .. })) {
         if let Some(Command::Prompt { action }) = cli.command {
             return cmd::prompt::run(action);
+        }
+        unreachable!();
+    }
+    // Offline and write-free: before profile setup, logging or any daemon.
+    if matches!(cli.command, Some(Command::Sandbox { .. })) {
+        if let Some(Command::Sandbox { action }) = cli.command {
+            let code = cmd::sandbox::run(action);
+            use std::io::Write as _;
+            let _ = std::io::stdout().flush();
+            std::process::exit(code);
         }
         unreachable!();
     }
@@ -929,6 +1049,26 @@ async fn async_main() -> anyhow::Result<()> {
                     .await
                     .map_err(anyhow::Error::msg)?
             }
+            AuthAction::Connect {
+                provider,
+                account,
+                expect_seat,
+                timeout,
+                json,
+            } => {
+                let args = synaps_cli::auth::connect::ConnectArgs {
+                    provider,
+                    account,
+                    expect_seat,
+                    timeout_secs: timeout,
+                };
+                let code = cmd::auth_connect::run(args, json).await;
+                // Exit here: a pending stdin read must not hold up runtime
+                // shutdown, and `done` is already flushed.
+                use std::io::Write as _;
+                let _ = std::io::stdout().flush();
+                std::process::exit(code);
+            }
             AuthAction::List { provider, json } => {
                 cmd::auth_accounts::list(cmd::auth_accounts::ListOptions { provider, json })
                     .await
@@ -941,15 +1081,31 @@ async fn async_main() -> anyhow::Result<()> {
             } => cmd::auth_accounts::plan(provider, model, json)
                 .await
                 .map_err(anyhow::Error::msg)?,
-            AuthAction::Use { provider, account } => {
-                cmd::auth_accounts::use_account(provider, account)
-                    .await
-                    .map_err(anyhow::Error::msg)?
-            }
+            AuthAction::Use {
+                provider,
+                account,
+                json: true,
+                expect,
+            } => cmd::auth_accounts::use_account_json(&provider, &account, expect.as_deref())
+                .map_err(anyhow::Error::msg)?,
+            AuthAction::Use {
+                provider, account, ..
+            } => cmd::auth_accounts::use_account(provider, account)
+                .await
+                .map_err(anyhow::Error::msg)?,
             AuthAction::Remove {
                 provider,
                 account,
                 yes,
+                json: true,
+                expect_rev,
+            } => cmd::auth_accounts::remove_json(&provider, &account, yes, expect_rev.as_deref())
+                .map_err(anyhow::Error::msg)?,
+            AuthAction::Remove {
+                provider,
+                account,
+                yes,
+                ..
             } => cmd::auth_accounts::remove(provider, account, yes).map_err(anyhow::Error::msg)?,
             AuthAction::Identify {
                 provider,
@@ -981,6 +1137,25 @@ async fn async_main() -> anyhow::Result<()> {
                 },
             )
             .await
+            .map_err(anyhow::Error::msg)?,
+            AuthAction::Capabilities { json } => {
+                cmd::auth_accounts::capabilities(json).map_err(anyhow::Error::msg)?
+            }
+            AuthAction::Order {
+                provider,
+                json,
+                set,
+                strict,
+                tie_break,
+                expect,
+            } => cmd::auth_accounts::order(cmd::auth_accounts::OrderOptions {
+                provider,
+                json,
+                set,
+                strict,
+                tie_break,
+                expect,
+            })
             .map_err(anyhow::Error::msg)?,
         },
         Some(Command::Status {
@@ -1041,14 +1216,27 @@ async fn async_main() -> anyhow::Result<()> {
         Some(Command::Prompt { .. }) => {
             unreachable!("prompt dispatched before profile initialization")
         }
+        Some(Command::Sandbox { .. }) => {
+            unreachable!("sandbox dispatched before profile initialization")
+        }
         Some(Command::Tools { action }) => {
             cmd::tools::run(action).await?;
+        }
+        Some(Command::Models { favorites, json }) => {
+            cmd::models::run(active_profile, favorites, json).await?;
         }
         Some(Command::Trace { action }) => {
             cmd::trace::run(action)?;
         }
         Some(Command::Retention { action }) => {
             cmd::retention::run(action)?;
+        }
+        Some(Command::Config { action }) => {
+            // 0 written/unchanged, 1 I/O, 2 usage, 3 refused.
+            let code = cmd::config::run(action);
+            if code != 0 {
+                std::process::exit(code);
+            }
         }
         Some(Command::Daemon(args)) => {
             cmd::daemon::run(active_profile, args).await?;
@@ -1073,7 +1261,30 @@ async fn async_main() -> anyhow::Result<()> {
             session,
             broadcast,
             inbox,
+            strict,
+            json,
+            body_file,
         }) => {
+            if strict || json || body_file.is_some() {
+                let code = cmd::send::run_strict(cmd::send::StrictArgs {
+                    message,
+                    body_file,
+                    source,
+                    severity,
+                    channel,
+                    content_type,
+                    session,
+                    broadcast,
+                    strict,
+                    json,
+                })
+                .await;
+                std::process::exit(code);
+            }
+            let Some(message) = message else {
+                eprintln!("error: a message is required");
+                std::process::exit(2);
+            };
             cmd::send::run(
                 message,
                 source,

@@ -12,12 +12,14 @@
 //!    group (the shell AND its background job) is killed, not orphaned,
 //!    while a job the command deliberately detached (`setsid`) lives on;
 //! 2. leaves a resumable archive (`status: cancelled`);
-//! 3. wakes the parent in the new image ("stopped … by a daemon reload, not
-//!    by the user"), and `subagent_status` on the OLD id answers from the
-//!    archive (`stopped_by_reload: true`);
-//! 4. hands the next worker a NEW id (`sa_2`, never `sa_1` again);
-//! 5. never repeats the wake: a second reload, after the parent had it,
-//!    stays silent about `sa_1`.
+//! 3. resumes the worker in the new image itself, from its archive, as a
+//!    NEW id (`sa_2`), and tells the parent once ("stopped by a daemon
+//!    reload and resumed by the daemon as sa_2"); `subagent_status` on the
+//!    OLD id answers from the archive (`stopped_by_reload: true`), and the
+//!    resumed run's completion arrives as `sa_2`;
+//! 4. hands the next worker a NEW id (`sa_3`, never `sa_1` or `sa_2` again);
+//! 5. never repeats the wake or the resume: a second reload, after the
+//!    parent had it, stays silent about `sa_1`.
 //!
 //! Unix only (execv + flock). Needs the `command-exec` feature: the worker's
 //! in-flight command is a `bash` tool call, and the hardened
@@ -148,12 +150,15 @@ fn handle_in(text: &str) -> Option<String> {
 /// `subagent_status` about the old id, then start a second (quick) worker.
 /// Worker 1 runs one long shell command that records the pids of its shell,
 /// a background `sleep` it waits on (same process group), and a job it
-/// detached with `setsid` (own session: meant to outlive the command);
-/// worker 2 answers at once.
+/// detached with `setsid` (own session: meant to outlive the command); the
+/// daemon's resume of it answers at once. Worker 2 answers at once.
 fn respond(body: &Value, pids: &Path) -> String {
     let system = body["system"].to_string();
     let last = body["messages"].as_array().and_then(|m| m.last()).map(|m| m.to_string()).unwrap_or_default();
     if system.contains(WORKER_MARK) {
+        if last.contains("this resume was started by the daemon") {
+            return sse_text("worker one resumed and done");
+        }
         if last_tool_result(body).is_some() {
             return sse_text("worker one done");
         }
@@ -263,7 +268,7 @@ fn tool_result_json(bodies: &[Value], tool_use_id: &str) -> Option<Value> {
 }
 
 /// The parent's model calls (not the workers') whose newest message is the
-/// reload wake for a stopped worker.
+/// reload wake for a stopped worker (resumed by the daemon or not).
 fn reload_wakes(bodies: &[Value]) -> Vec<String> {
     bodies
         .iter()
@@ -272,8 +277,25 @@ fn reload_wakes(bodies: &[Value]) -> Vec<String> {
             !system.contains(WORKER_MARK) && !system.contains(WORKER2_MARK)
         })
         .filter_map(|b| b["messages"].as_array()?.last().map(|m| m.to_string()))
-        .filter(|m| m.contains("by a daemon reload, not by the user"))
+        .filter(|m| {
+            // Not the `subagent_status` note ("Stopped by a daemon reload
+            // (not by the user)"): the wake's own words, resumed or not.
+            m.contains("was stopped by a daemon reload") || m.contains("by a daemon reload, not by the user")
+        })
         .collect()
+}
+
+/// The parent's model calls whose newest message carries `needle`.
+fn parent_last_with(bodies: &[Value], needle: &str) -> usize {
+    bodies
+        .iter()
+        .filter(|b| {
+            let system = b["system"].to_string();
+            !system.contains(WORKER_MARK) && !system.contains(WORKER2_MARK)
+        })
+        .filter_map(|b| b["messages"].as_array()?.last().map(|m| m.to_string()))
+        .filter(|m| m.contains(needle))
+        .count()
 }
 
 /// SIGKILLs a pid on drop: the detached job must not outlive the test.
@@ -377,8 +399,9 @@ async fn reload_stops_running_workers_resumably_and_never_reuses_their_ids() {
     assert_eq!(archive["status"], "cancelled");
     assert!(archive["history"].as_array().is_some_and(|h| !h.is_empty()), "history kept for resume");
 
-    // 3. The new image woke the parent, which asked about the OLD id and
-    //    got the archived answer; then 4. started a worker with a NEW id.
+    // 3. The new image resumed the worker itself and told the parent, which
+    //    asked about the OLD id and got the archived answer; then 4. started
+    //    a worker with a NEW id.
     let status = wait_for("subagent_status of the old id", Duration::from_secs(30), || {
         tool_result_json(&bodies.lock().unwrap(), "toolu_status")
     })
@@ -390,14 +413,24 @@ async fn reload_stops_running_workers_resumably_and_never_reuses_their_ids() {
         assert_eq!(wakes.len(), 1, "the parent was woken once about the reload: {wakes:?}");
         let wake = &wakes[0];
         assert!(wake.contains(&format!("({old_id})")), "{wake}");
-        assert!(wake.contains("subagent_resume"), "{wake}");
+        assert!(
+            wake.contains("was stopped by a daemon reload and resumed by the daemon as sa_2"),
+            "{wake}"
+        );
+        assert!(!wake.contains("subagent_resume with handle_id"), "{wake}");
     }
+    // The resumed run continued the archived conversation and finished; its
+    // completion reached the parent as sa_2's.
+    wait_for("the resumed run's completion", Duration::from_secs(30), || {
+        (parent_last_with(&bodies.lock().unwrap(), "(sa_2) finished with status") > 0).then_some(())
+    })
+    .await;
     let second = wait_for("the second worker's start", Duration::from_secs(30), || {
         tool_result_text(&bodies.lock().unwrap(), "toolu_start2")
     })
     .await;
     let new_id = handle_in(&second).expect("handle id in the second start result");
-    assert_eq!(new_id, "sa_2", "ids continue across the reload: {second}");
+    assert_eq!(new_id, "sa_3", "ids continue across the reload and its resume: {second}");
 
     // 5. A second reload, after the parent got (and acted on) its wake: the
     //    old id still rides along as a record, but the parent is not told
@@ -442,7 +475,22 @@ async fn reload_stops_running_workers_resumably_and_never_reuses_their_ids() {
             .filter_map(|b| b["messages"].as_array()?.last().map(|m| m.to_string()))
             .filter(|m| m.contains("worker two done"))
             .count();
-        assert_eq!(completions, 1, "sa_2's completion wake");
+        assert_eq!(completions, 1, "sa_3's completion wake");
+        assert_eq!(
+            parent_last_with(&bodies, "(sa_2) finished with status"),
+            1,
+            "the daemon-resumed run's completion wake, once"
+        );
+        let resumed = bodies
+            .iter()
+            .filter(|b| b["system"].to_string().contains(WORKER_MARK))
+            .filter(|b| {
+                b["messages"].as_array().and_then(|m| m.last()).is_some_and(|m| {
+                    m.to_string().contains("this resume was started by the daemon")
+                })
+            })
+            .count();
+        assert_eq!(resumed, 1, "the daemon resumed worker one once");
     }
 
     t.detach().await;

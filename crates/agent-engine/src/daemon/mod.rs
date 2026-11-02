@@ -14,16 +14,24 @@
 
 pub mod close;
 pub mod conn;
+pub mod control_queries;
+pub mod crash_record;
 pub mod extension_reload;
+pub mod fd_watch;
 pub mod lifecycle;
 pub mod listener;
+pub(crate) mod merge;
 pub mod pin;
 pub mod pins;
+pub mod reap;
 pub mod registry;
 pub mod reload;
 pub mod rename;
+pub mod stdio;
+pub mod umask;
 #[cfg(windows)]
 pub(crate) mod win;
+pub(crate) mod worker_check;
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -225,7 +233,15 @@ pub struct DaemonState {
     /// The pin book: pinned journals that come back on the next cold start.
     pub pins: Arc<pins::PinBook>,
     /// A cold start's pin restore is running (holds the idle exit).
-    pub restoring: AtomicBool,
+    /// (Upstream's `restoring`; renamed in the parity merge because ours
+    /// `restoring` below is the crash restore.)
+    pub pins_restoring: AtomicBool,
+    /// The crash record's writer (`crash_record`); `None` when
+    /// `daemon.crash_restore = off` or this process can't be named.
+    pub crash_record: Option<Arc<crash_record::Recorder>>,
+    /// A fresh start's restore from the crash record: the sessions it still
+    /// holds (listed `restoring`, gated) and the ones it gave up.
+    pub restoring: crash_record::Restoring,
 }
 
 impl DaemonState {
@@ -293,9 +309,18 @@ impl DaemonState {
     }
 
     /// Listing metas with lifecycle / clients / input_owner / journal_id
-    /// (B4: `EngineHost::sessions()` fills the handle cells).
+    /// (B4: `EngineHost::sessions()` fills the handle cells), then the
+    /// sessions a crash restore still holds (`restoring: true`, from the
+    /// record) that no live session shows, by id or by journal id
+    /// (`crash_record::merge_listing`).
+    ///
+    /// The restore set is read FIRST: a restored session's actor is
+    /// registered before its entry settles, so a session that comes back
+    /// between the two reads is listed from its actor (or from both, and
+    /// deduplicated), never from neither.
     pub fn session_metas(&self) -> Vec<SessionMeta> {
-        self.host.sessions()
+        let restoring = self.restoring.metas();
+        crash_record::merge_listing(self.host.sessions(), restoring)
     }
 
     /// Live handle by id; falls back to the C3 reload alias
@@ -413,6 +438,9 @@ impl Daemon {
             }
         };
         let generation = reload_state.as_ref().map_or(1, |rs| rs.generation);
+        // Client tools v1: `register_client_tools` and `tool_invoke` name
+        // this image's generation (= `Welcome.generation`).
+        crate::session::client_tools::set_daemon_generation(generation);
         let listener = listener::bind(&paths.sock)?;
 
         let info = DaemonInfo {
@@ -428,6 +456,15 @@ impl Daemon {
         let meta = registry::Metadata::start(paths.clone(), info.clone())?;
 
         let factory = opts.factory.clone().unwrap_or_else(|| host_factory(&host));
+        let crash_restore = host.config().daemon.crash_restore;
+        let recorder = if crash_restore {
+            crash_record::Recorder::new(&paths).map(Arc::new)
+        } else {
+            None
+        };
+        // Capacity resumes are consumed by an acknowledged record write:
+        // without a record there is none (no arm, hold or dispatch).
+        host.set_record_link(recorder.as_ref().map(|_| Arc::new(crate::session::live::RecordLink::new())));
         let state = Arc::new(DaemonState {
             host,
             paths: paths.clone(),
@@ -445,9 +482,35 @@ impl Daemon {
             reload_aliases: Mutex::new(HashMap::new()),
             meta,
             pins: Arc::new(pins::PinBook::for_active_profile()),
-            restoring: AtomicBool::new(false),
+            pins_restoring: AtomicBool::new(false),
+            crash_record: recorder,
+            restoring: crash_record::Restoring::default(),
         });
         state.host.set_pin_sink(Arc::clone(&state.pins) as Arc<dyn crate::session::PinSink>);
+
+        // `daemon.crash_restore = off`: the record is never read or written,
+        // and a leftover one (a reload's hand-off too) is removed.
+        if !crash_restore {
+            crash_record::discard_when_off(&paths);
+        }
+        // A fresh start (no reload hand-off) after a daemon died or stopped:
+        // read its crash record and put the sessions it names in the restore
+        // set, so the first connection already finds them listed (restoring)
+        // and a request naming one waits for it. Nothing is touched yet: the
+        // restore itself runs once the daemon listens (below).
+        let restore = if reload_state.is_none() && crash_restore {
+            crash_record::prepare_restore(&state)
+        } else {
+            None
+        };
+
+        // This process asks to write the saved usage readings (their lease):
+        // it holds the daemon lock now, and no restored turn has read usage
+        // yet (rehydrate is below). A CLI, a TUI or a start that failed
+        // above never does; a daemon that doesn't get the lease (another
+        // profile's daemon on the same store holds it) only loads them, and
+        // the start goes on either way.
+        agent_core::auth::usage_reads::save_readings_in_this_process();
 
         // Before any session of this image registers: drop registrations no
         // running session owns (dead owner pid). After a reload, also every
@@ -455,7 +518,9 @@ impl Daemon {
         // sessions, and the ones still live re-register when they rehydrate
         // below, under their current (e.g. post-compaction) id. On a fresh
         // start our pid may already own live registrations (a daemon hosted
-        // in a process that runs other sessions), so it is left alone.
+        // in a process that runs other sessions), so it is left alone; the
+        // sessions a crash restore brings back register as they come back,
+        // after this sweep.
         let own_pid = reload_state.as_ref().map(|_| info.pid);
         let swept = crate::events::registry::sweep_stale_registrations(own_pid);
         if swept > 0 {
@@ -464,19 +529,46 @@ impl Daemon {
 
         // C3: rehydrate BEFORE accepting so a reconnecting client finds its session.
         if let Some(rs) = &reload_state {
+            // The child ledger first: restored sessions' new spawns follow
+            // the older records (see `session::children` for the drop rules).
+            crate::session::children::restore_after_reload(rs.children.clone());
             reload::rehydrate(&state, rs).await;
+        }
+        // The record from here on is this image's own (its first write
+        // replaces the dead daemon's or the reload's hand-off).
+        if let Some(rec) = &state.crash_record {
+            crash_record::spawn_writer(Arc::clone(&state), Arc::clone(rec));
         }
 
         let accept = tokio::spawn(listener::accept_loop(Arc::clone(&state), listener, state.shutdown.clone()));
         if let Some(idle) = opts.idle_exit {
             tokio::spawn(idle_monitor(Arc::clone(&state), idle));
         }
+        // Open files against the soft limit: one WARN before EMFILE. Each
+        // start (a reload's new image too) runs its own, fresh.
+        tokio::spawn(fd_watch::run(state.shutdown.clone()));
         signal_ready();
         // Cold start only: a reload hands its live sessions over already.
+        // E1 (parity merge): a crash restore (every live session) goes
+        // first; the pin restore (#306) waits for it to finish, so a pinned
+        // session the crash restore brought back is found live
+        // (`pins::live_for`) and is never created twice. With no crash
+        // restore (`running()` false) it starts at once, as before.
         if reload_state.is_none() && pins::restore_enabled() {
-            tokio::spawn(pins::restore_all(Arc::clone(&state)));
+            let state = Arc::clone(&state);
+            tokio::spawn(async move {
+                while state.restoring.running() && !state.shutdown.is_cancelled() {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                pins::restore_all(state).await;
+            });
         }
         tracing::info!(sock = %paths.sock.display(), pid = info.pid, generation, "daemon: listening");
+        // Ready and accepting first: an autospawn's ready wait and a
+        // client's handshake never wait on the restore.
+        if let Some(plan) = restore {
+            crash_record::spawn_restore(&state, plan);
+        }
         Ok(Self { paths, state, accept })
     }
 
@@ -489,6 +581,10 @@ impl Daemon {
     pub async fn wait(self) {
         self.state.shutdown.cancelled().await;
         let force = self.state.force_shutdown.load(Ordering::SeqCst);
+        // Keep the crash record for the next start: written from each
+        // session's checkpoint (a running turn is cut and recorded as cut),
+        // before the sessions end. The next start restores them.
+        crash_record::record_stop(&self.state, force).await;
         lifecycle::shutdown_all(&self.state, force).await;
         self.accept.abort();
         let _ = self.accept.await;
@@ -500,6 +596,10 @@ impl Daemon {
             }
         }
         tracing::info!("daemon: stopped");
+        // Every session has ended: stop writing the saved usage readings and
+        // free their lease (a save in flight finishes first), before the
+        // daemon lock, so the next daemon can take both.
+        agent_core::auth::usage_reads::stop_saving_readings();
         // Release the flock last.
         drop(self.state.lock_fd.lock().unwrap_or_else(|e| e.into_inner()).take());
     }
@@ -528,7 +628,7 @@ pub async fn session_is_idle(handle: &SessionHandle) -> bool {
         loop {
             match rx.recv().await {
                 Ok(env) => {
-                    if let SessionEventWire::QueryResult { id, value } = env.event {
+                    if let SessionEventWire::QueryResult { id, value, .. } = env.event {
                         if id == IDLE_PROBE_QUERY_ID {
                             // Real actor: {"streaming": bool, "pending_prompts": n}. A backend that
                             // does not implement Status (echo) has no turns to protect.
@@ -554,7 +654,12 @@ pub async fn daemon_is_idle(state: &DaemonState) -> bool {
     if state.connections.load(Ordering::SeqCst) > 0 {
         return false;
     }
-    if state.restoring.load(Ordering::SeqCst) {
+    // A cold start's pin restore still running is not idle.
+    if state.pins_restoring.load(Ordering::SeqCst) {
+        return false;
+    }
+    // A crash restore still bringing sessions back is not idle.
+    if state.restoring.running() {
         return false;
     }
     let sessions = state.live_sessions();
@@ -636,9 +741,11 @@ fn daemon_launch(
 }
 
 /// Parent side: `current_exe daemon --foreground …` in its own session
-/// (`setsid`), stdout → null, stderr → pipe; waits ≤ [`SPAWN_READY_TIMEOUT`]
-/// (15 s: the daemon's ≤ 10 s extension wait plus margin) for `R` on the
-/// ready pipe. EOF before `R` = child died → error with its stderr tail.
+/// (`setsid`), stdout → null, stderr → the append-only
+/// [`stdio::stderr_log_path`] file (a pipe only if that cannot be opened);
+/// waits ≤ [`SPAWN_READY_TIMEOUT`] (15 s: the daemon's ≤ 10 s extension
+/// wait plus margin) for `R` on the ready pipe. EOF before `R` = child died
+/// → error with the tail of what it wrote to stderr.
 #[cfg(unix)]
 pub fn spawn_detached(opts: &DaemonOpts) -> anyhow::Result<u32> {
     use std::io::Read;
@@ -666,6 +773,27 @@ pub fn spawn_detached(opts: &DaemonOpts) -> anyhow::Result<u32> {
     crate::process_scope::set_env(&mut effective_env, "SYNAPS_DAEMON", "1");
     effective_env.retain(|(k, _)| k != READY_FD_ENV);
     let (program, cmd_args) = daemon_launch(&effective_env, exe, cmd_args);
+    // stderr is an append-only file, never a pipe: the daemon outlives this
+    // client, and a pipe nobody reads any more turned its next stderr write
+    // into a fatal panic (see `stdio`). A failure before `R` is read back
+    // from what the child appended. No file → a pipe, as before; the daemon
+    // then moves its stderr onto the file itself once it is ready.
+    let stderr_log = stdio::stderr_log_path(opts.profile.as_deref());
+    let stderr_file = match stdio::open_append(&stderr_log) {
+        Ok(f) => {
+            let start = f.metadata().map(|m| m.len()).unwrap_or(0);
+            Some((f, start))
+        }
+        Err(e) => {
+            tracing::warn!(path = %stderr_log.display(), "daemon spawn: no stderr file ({e}); using a pipe");
+            None
+        }
+    };
+    let stderr_start = stderr_file.as_ref().map(|(_, start)| *start);
+    let child_stderr = match stderr_file {
+        Some((f, _)) => std::process::Stdio::from(f),
+        None => std::process::Stdio::piped(),
+    };
     let mut fds = [0i32; 2];
     // SAFETY: plain pipe(2) on a valid 2-slot array.
     if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
@@ -686,7 +814,7 @@ pub fn spawn_detached(opts: &DaemonOpts) -> anyhow::Result<u32> {
     cmd.env_clear().envs(effective_env)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped());
+        .stderr(child_stderr);
     // SAFETY: pre_exec runs in the forked child before exec; only async-signal-safe calls.
     unsafe {
         cmd.pre_exec(move || {
@@ -755,7 +883,10 @@ pub fn spawn_detached(opts: &DaemonOpts) -> anyhow::Result<u32> {
         let _ = child.kill();
         child.wait().ok()
     });
-    let mut tail = String::new();
+    let mut tail = match stderr_start {
+        Some(start) => stdio::read_tail(&stderr_log, start, stdio::SPAWN_TAIL_BYTES),
+        None => String::new(),
+    };
     if let Some(mut err) = child.stderr.take() {
         use std::os::fd::AsRawFd;
         let fd = err.as_raw_fd();
@@ -966,6 +1097,27 @@ pub async fn run_foreground(opts: DaemonOpts) -> anyhow::Result<()> {
     // replaced it, so nothing below ever runs beside it.
     #[cfg(windows)]
     reload::take_over_from_env(&opts.paths())?;
+    // First, before this image can start any process (the snapshot below,
+    // the host boot and everything after it): a real reload's lock fd gets
+    // close-on-exec back, so no child inherits daemon.lock (and its flock).
+    // (Unix only: the Windows hand-off is the take-over above.)
+    #[cfg(unix)]
+    reload::seal_hand_off_lock(&opts.paths());
+    // macOS: launchd starts the daemon with a soft open-files limit of 256,
+    // which a busy daemon outgrows (EMFILE: a session save, a journal lock).
+    // Raise it to min(hard, 10240) before the host boot opens anything and
+    // before any session restore; the hard limit is passed through as read,
+    // and a soft limit already there is left alone. Logged once logging is
+    // up (below); never fails the start. No call on Linux.
+    #[cfg(target_os = "macos")]
+    let nofile = fd_watch::raise_at_start();
+    // Before this image starts any process of its own: after a reload exec
+    // these are the old image's children, which only this image can reap
+    // (see `reap`). The reaper starts once logging is up.
+    let inherited = reap::snapshot();
+    // Only the daemon reads the kernel audit log, and before any session
+    // binds its sandbox (a CLI or test binary's spawns get no reader).
+    crate::sandbox::enable_audit();
     // Background MCP discovery: a hung/dead MCP server must never delay the
     // ready byte (the spawner waits only SPAWN_READY_TIMEOUT).
     let host = EngineHost::boot_and_install(crate::HostOpts {
@@ -975,6 +1127,28 @@ pub async fn run_foreground(opts: DaemonOpts) -> anyhow::Result<()> {
     })
     .await?;
     host.report_config_warnings();
+    // Logging is up (the host's boot) and nothing has read the reload
+    // hand-off yet (the carried mask below, then `Daemon::start`):
+    // hand-off variables that are not a real reload's (an environment
+    // copied from a reloaded daemon into a fresh start) are reported and
+    // removed, so this start is fresh.
+    #[cfg(unix)]
+    reload::discard_stale_hand_off(&opts.paths());
+    // `daemon.umask`: the host's config is loaded and nothing has been
+    // started yet (extensions, MCP servers and sessions all come below), so
+    // everything the daemon starts inherits the mask. One line in the log.
+    {
+        let config = host.config();
+        umask::apply_at_start(
+            config.daemon.umask,
+            config.daemon_umask_warning().map(str::to_string),
+            reload::carried_base_umask(),
+        );
+    }
+    umask::log_start();
+    #[cfg(target_os = "macos")]
+    nofile.emit();
+    reap::spawn_reaper(inherited);
     // Sidecars spawn once per daemon: discover before accepting (bounded by
     // EXTENSION_DISCOVERY_WAIT, which SPAWN_READY_TIMEOUT outwaits).
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1002,7 +1176,43 @@ pub async fn run_foreground(opts: DaemonOpts) -> anyhow::Result<()> {
         opts.factory = Some(host_factory(&host));
     }
     let mcp_host = Arc::clone(&host);
+    let profile = opts.profile.clone();
+    // SIGTERM / SIGINT handlers in place BEFORE the start (whose crash
+    // restore runs once it listens): a signal from here on is held for the
+    // task below and stops the daemon cleanly, keeping the sessions the
+    // restore had not finished in the stop's record.
+    #[cfg(unix)]
+    let (mut term, mut int) = {
+        use tokio::signal::unix::{signal, SignalKind};
+        (signal(SignalKind::terminate()).ok(), signal(SignalKind::interrupt()).ok())
+    };
     let daemon = Daemon::start(host, opts).await?;
+    // Ready (`R` written): from here nobody is bound to read our stderr. A
+    // pipe or terminal there (an older client's spawn, a reload of one, a
+    // terminal that may close) moves onto the append-only stderr file.
+    #[cfg(unix)]
+    {
+        let moved = stdio::detach_stdio(profile.as_deref());
+        if moved != stdio::Detached::default() {
+            tracing::info!(
+                stderr_was = moved.stderr_was.unwrap_or("kept"),
+                stderr_to = ?moved.stderr_to,
+                stderr_to_null = moved.stderr_to_null,
+                stdout_was = moved.stdout_was.unwrap_or("kept"),
+                stdout_to_null = moved.stdout_to_null,
+                errors = ?moved.errors,
+                "daemon: detached stdio from its starter"
+            );
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = profile;
+    // Debug builds only, opt-in: a test makes one daemon task panic and
+    // checks the panic line in synaps.log and that the daemon lives on.
+    #[cfg(debug_assertions)]
+    if std::env::var_os("SYNAPS_TEST_PANIC_TASK").is_some() {
+        tokio::spawn(async { panic!("synaps test: forced panic in a daemon task") });
+    }
     // Accepting and ready: now discover uncached MCP servers. New servers'
     // tools join the shared registry when it finishes (see
     // `EngineHost::spawn_background_mcp_discovery` for live-session effects).
@@ -1012,10 +1222,17 @@ pub async fn run_foreground(opts: DaemonOpts) -> anyhow::Result<()> {
     tokio::spawn(async move {
         #[cfg(unix)]
         {
-            let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
+            async fn recv(s: &mut Option<tokio::signal::unix::Signal>) {
+                match s.as_mut() {
+                    Some(s) => {
+                        s.recv().await;
+                    }
+                    None => std::future::pending::<()>().await,
+                }
+            }
             tokio::select! {
-                _ = tokio::signal::ctrl_c() => {}
-                _ = async { match term.as_mut() { Some(t) => { t.recv().await; } None => std::future::pending::<()>().await } } => {}
+                _ = recv(&mut int) => {}
+                _ = recv(&mut term) => {}
                 _ = state.shutdown.cancelled() => return,
             }
         }
@@ -1114,6 +1331,7 @@ mod scope_tests {
     fn the_daemon_scope_goes_in_the_daemon_slice_only() {
         let base = crate::test_env::BaseDirGuard::new();
         let _scopes = crate::test_env::EnvVarGuard::remove("SYNAPS_PROCESS_SCOPES");
+        let _exec = crate::test_env::SCRIPT_EXEC_LOCK.lock();
         let dir = tempfile::tempdir().unwrap();
         let fake = fake_systemd_run(dir.path());
         let env = fake_env(&fake);

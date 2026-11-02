@@ -44,6 +44,9 @@ pub use watcher_types::{
 
 pub mod watcher_session;
 
+/// The panic hook's last words in `synaps.log` (see the module docs).
+pub mod panic_hook;
+
 // Re-export for convenience
 pub use serde_json::Value;
 pub use tokio_util::sync::CancellationToken;

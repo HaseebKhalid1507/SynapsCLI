@@ -119,6 +119,15 @@ pub struct SessionConfig {
     /// (soak F21) — `double_option` keeps the two levels apart on the wire.
     #[serde(default, with = "double_option", skip_serializing_if = "Option::is_none")]
     pub continue_session: Option<Option<String>>,
+    /// Non-content admission policy; restored before automatic turns. No layer text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ephemeral_layer_wait_ms: Option<u64>,
+    /// Memory-only tool globs (`*`, `?`), added to config `memory_only_tools`.
+    /// Matched against an extension or MCP tool's runtime name
+    /// (`plugin:tool`, `ext__server__tool`) or its wire name (`plugin_tool`).
+    /// Policy only, never result text; see docs/memory-only-results.md.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub memory_only_tools: Vec<String>,
     /// `EngineOpts.system`.
     #[serde(default)]
     pub system: Option<String>,
@@ -206,6 +215,39 @@ pub struct SessionConfig {
     /// `None` = the wall clock; tests inject a clock to advance time.
     #[serde(skip)]
     pub message_clock: Option<crate::runtime::message_time::MessageClock>,
+    /// Set by a crash or stop restore for a session it restores Parked
+    /// (never on the wire): when it parked, so its eviction timer continues
+    /// from there instead of starting over.
+    #[serde(skip)]
+    pub restore_parked_since: Option<chrono::DateTime<chrono::Utc>>,
+    /// How `continue_session` is looked up on disk. Set by the daemon's
+    /// restore for the sessions it brings back (never on the wire, so no
+    /// client create can take it). It is `pub` only because SessionConfig is
+    /// built by struct literal across the workspace; nothing outside the
+    /// daemon's restore (`daemon::reload::restore_config`) should set
+    /// `ExactJournalId`.
+    #[serde(skip)]
+    pub continue_lookup: ContinueLookup,
+    /// Set by `fork` on the parent (never on the wire): the new session is
+    /// that parent's fork, built from this copy of its state
+    /// (`session::fork`) instead of a fresh conversation.
+    #[serde(skip)]
+    pub fork: Option<std::sync::Arc<super::fork::ForkSeed>>,
+}
+
+/// How a create's `continue_session` query is looked up on disk
+/// (`SessionConfig::continue_lookup`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ContinueLookup {
+    /// A user's `--continue <query>`: a chain name, then a session name,
+    /// then a (partial) session id.
+    #[default]
+    Query,
+    /// The query is the exact journal id of a session the daemon recorded
+    /// itself (a crash or stop restore, a reload's rehydrate): loaded by that
+    /// id when its file is on disk, with no chain or name scan; looked up as
+    /// a [`Self::Query`] when it is not.
+    ExactJournalId,
 }
 
 /// A durable `/memory` mode the user chose for a session
@@ -288,6 +330,8 @@ impl Default for SessionConfig {
     fn default() -> Self {
         Self {
             continue_session: None,
+            ephemeral_layer_wait_ms: None,
+            memory_only_tools: Vec::new(),
             system: None,
             prompt_manifest: None,
             cwd: None,
@@ -306,6 +350,9 @@ impl Default for SessionConfig {
             memory_mode: None,
             restore_parked: false,
             message_clock: None,
+            restore_parked_since: None,
+            continue_lookup: ContinueLookup::Query,
+            fork: None,
         }
     }
 }
@@ -349,8 +396,23 @@ pub struct SessionMeta {
     pub lifecycle: SessionLifecycle,
     #[serde(default)]
     pub clients: usize,
+    /// Its meaning depends on `client_input`: with `Exclusive`, or with
+    /// `client_input` absent, the only client that may type; with `Shared`,
+    /// the client that typed last. Never infer exclusivity from this field
+    /// alone (790d R6).
     #[serde(default)]
     pub input_owner: Option<ClientId>,
+    /// The kind the input owner declared in its `Hello` (`chat` = the app's
+    /// drive, `tui` = a terminal). Set at list time with `input_owner`, and
+    /// absent when nobody owns input. An `input_owner` with no kind beside
+    /// it comes from a daemon that does not report one: it says nothing about
+    /// the owner. Declared, not proven: the same trust as the socket itself.
+    /// Absent from a frozen meta (an `Attached` snapshot's), so that frame's
+    /// bytes are unchanged. Follows `input_owner`'s rule: with `Exclusive`
+    /// (or `client_input` absent) the kind of the only client that may
+    /// type, with `Shared` the kind of the client that typed last.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_owner_kind: Option<ClientKind>,
     #[serde(default)]
     pub awaiting_input: usize,
     /// Every attached client, named. Empty from an older daemon.
@@ -398,6 +460,15 @@ pub struct SessionMeta {
     /// API message count, as of the last publish.
     #[serde(default)]
     pub messages: usize,
+    /// Listed by a daemon whose start is still restoring this session from
+    /// its crash record (not attachable yet; an attach waits for it). The
+    /// other fields come from the record, `lifecycle` as recorded.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub restoring: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// Where a session is in its park/unpark life (`SessionHandle::lifecycle`).
@@ -771,6 +842,13 @@ pub struct ConfirmScope {
     /// client's transcript, that an approved call ran rewritten input.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rewritten_by: Vec<String>,
+    /// The provider's id for the call this prompt confirms (`tool_use.id`),
+    /// the same id that call's `before_tool_call` event carries, so a client
+    /// pairs the prompt with its call by identity. Absent when the dispatch
+    /// site has none; omitted from the JSON then, so old clients see the
+    /// shape they knew.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
 }
 
 impl ConfirmScope {
@@ -849,6 +927,20 @@ pub enum CheckpointReason {
     HostRequest,
 }
 
+/// Whether a session's actor resumes the workers a daemon reload stopped
+/// (`SessionCommand::AdoptWorkers`), instead of telling the model to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkerResume {
+    /// Resume each one the daemon may (see
+    /// [`crate::runtime::subagent::plan_daemon_resumes`]).
+    Auto,
+    /// Leave them to the model, saying why (e.g. the session was parked).
+    Off(&'static str),
+    /// Leave them to the model as before, saying nothing more (a crash or
+    /// stop restore: not built for these yet).
+    Never,
+}
+
 /// The entire client→session control surface (SEAMS §5.2/§5.3).
 ///
 /// `Debug` is manual: `Submit`/`Steer`/`SubmitPrepared`/`Answer`/`Resume`
@@ -883,6 +975,14 @@ pub enum SessionCommand {
     Answer { prompt_id: u64, value: Option<String> },
     /// `id` is client-chosen and echoed in `SettingChanged.id`.
     Set { id: u64, setting: SessionSetting },
+    /// Request-only material, never added to settings_replay.
+    EphemeralLayer {
+        id: u64,
+        epoch: String,
+        generation: u64,
+        #[serde(flatten)]
+        operation: crate::runtime::ephemeral::Operation,
+    },
     Compact { instructions: Option<String> },
     /// `/new`: ConversationState::clear.
     NewSession,
@@ -917,7 +1017,20 @@ pub enum SessionCommand {
     /// (B1, used by C3 reload) cancel any turn (partial history + marker),
     /// abort compaction, save, close PTYs, emit Notice. Never ends the
     /// session. Reply = `QueryResult{id: CHECKPOINT_QUERY_ID, {ok:true}}`.
-    Checkpoint { reason: CheckpointReason },
+    Checkpoint {
+        reason: CheckpointReason,
+        /// Host-only (never wire): the absolute deadline the caller waits
+        /// for this checkpoint until (the reload coordinator's). `None`:
+        /// the actor's own bound from receipt (`budgets::CHECKPOINT_BUDGET`).
+        #[serde(skip)]
+        deadline: Option<tokio::time::Instant>,
+        /// Host-only (never wire): the reload's drain ran to its cap, so a
+        /// quiesced turn has had its chance to end at a round boundary and
+        /// gets no [`crate::session::budgets::QUIESCE_GRACE`] on top. `false`
+        /// (and every checkpoint read from the wire): the grace as before.
+        #[serde(skip)]
+        skip_quiesce_grace: bool,
+    },
     /// (B3) pin/unpin (`/pin on|off`, `--keep-warm`, `/keep-warm on|off`,
     /// `synaps daemon pin`). Published on `SessionHandle::pinned()`.
     KeepWarm { on: bool },
@@ -927,6 +1040,37 @@ pub enum SessionCommand {
     /// client, a no-op from the owner. Emits `InputOwnerChanged{Takeover}`
     /// (`Attach` when nobody owned input).
     TakeInput,
+    /// (S1, Focus) Delivery mode: `hold` sends every event that would reach
+    /// the context to the held store instead, for `lease_secs` (30..=3600,
+    /// required with hold; ignored with auto); hold again renews. `auto`
+    /// releases nothing by itself. Not a `SessionSetting`: the mode lives in
+    /// the held store, never in a reload record. Reply = `DeliveryChanged`
+    /// to every client. Open to every attached client.
+    Delivery {
+        mode: super::held::DeliveryMode,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        lease_secs: Option<u64>,
+    },
+    /// (S1) Release held items: `ids` null = every held, join_next or
+    /// handled_on_side item. `as`: digest (ONE user message, at most one
+    /// turn), join_next (in front of the next user message, no turn),
+    /// individual (back into the queue; auto mode only). `text` (at most
+    /// 16384 bytes): the app's own digest/join text, refused with
+    /// individual. Reply = `HeldUpdated`; refusal = `Refused`.
+    HeldRelease {
+        #[serde(default)]
+        ids: Option<Vec<String>>,
+        #[serde(rename = "as")]
+        release_as: super::held::ReleaseAs,
+        #[serde(default)]
+        text: Option<String>,
+    },
+    /// (S1) Mark items dismissed; nothing is deleted (the store keeps the
+    /// text for 7 days). Reply = `HeldUpdated`.
+    HeldDismiss { ids: Vec<String> },
+    /// (S1) Mark one item handled in the side session `side_session`.
+    /// Reply = `HeldUpdated`.
+    HeldMark { id: String, side_session: String },
     /// Host-only (never wire): park now if `can_park()` (reload rehydrates
     /// a Parked session Parked). A no-op otherwise.
     #[serde(skip)]
@@ -935,8 +1079,13 @@ pub enum SessionCommand {
     /// workers the old image stopped or still owed a wake
     /// (`SessionReloadRecord::workers`). The actor re-registers their ids
     /// against their archives and wakes the parent once per worker.
+    /// `resume`: whether the actor resumes the workers the reload stopped
+    /// itself, or leaves them to the model.
     #[serde(skip)]
-    AdoptWorkers { workers: Vec<crate::runtime::subagent::CarriedWorker> },
+    AdoptWorkers {
+        workers: Vec<crate::runtime::subagent::CarriedWorker>,
+        resume: WorkerResume,
+    },
     /// Host-only (never wire): reload's rehydrate hands the new image the
     /// exact tool activations the session held in the previous image
     /// (`SessionReloadRecord::tool_activations`). The runtime re-validates
@@ -954,12 +1103,78 @@ pub enum SessionCommand {
     /// A no-op on a parked session.
     #[serde(skip)]
     ArmPark,
+    /// Host-only (never wire): a reload's or a crash restore's rehydrate
+    /// hands the new actor the capacity resume its record carried
+    /// (`ReloadSession::capacity_stop`), after the resume decision and the
+    /// carried workers, before any Park. The actor arms it only while its
+    /// restore window is open (nothing started a turn, the owner did not
+    /// cancel or replace the session, no checkpoint, no arm before), and
+    /// only a stop that validates; never when a client loaded the session
+    /// first (the daemon does not send it then).
+    #[serde(skip)]
+    ArmCapacityResume { stop: CapacityStop },
     /// Host-only (never wire): the reload this session checkpointed for
     /// did not exec (the exec failed, or the reload stopped after the
     /// checkpoints). The checkpoint's reload fence lifts, and the workers
     /// the reload stopped are announced to this same image.
     #[serde(skip)]
     ReloadAborted,
+    /// Host-only (never wire): a reload refused after its drain, before
+    /// anything was stopped (spec §5; nothing checkpointed). The session's
+    /// quiesce lifts, and a turn the drain paused at a round boundary
+    /// resumes in place: ONE message ("resume: a daemon reload was
+    /// refused ...") starts a new turn, unless something re-prompted the
+    /// turn since. `refused_at`: when the reload was refused.
+    #[serde(skip)]
+    ReloadRefused { refused_at: chrono::DateTime<chrono::Utc> },
+    /// Host-only (never wire): reload's rehydrate, in the NEW image, for a
+    /// session that came back Live. When its history shows the reload cut
+    /// its turn (the latest interruption marker is the reload's
+    /// `Restart` marker and nothing answered it), the actor queues ONE
+    /// message that starts a new turn ("resume: ..."), at most once per
+    /// `generation`. `turn_cut`: what the old image's checkpoint recorded
+    /// (`Some(false)`: it cut nothing); `None` (an older image that does not
+    /// record it, or no checkpoint reply) resumes nothing: the history
+    /// can't tell this reload's marker from an earlier one's.
+    /// `stopped`: not a reload but a clean stop whose record a later start
+    /// restored (`daemon::crash_record`); the stop checkpointed the turns
+    /// the same way, only the message says so. `cut_tail`: how many
+    /// messages followed the cut turn's marker at the checkpoint (that
+    /// turn's own tail, `SessionReloadRecord::cut_tail`); a user message
+    /// past them re-prompted the turn, and nothing is queued. `None` (an
+    /// older image's record): no re-prompt check. `reply`: the actor's
+    /// decision ("resumed", "skip", "none"), for a restore's summary line.
+    #[serde(skip)]
+    ResumeAfterReload {
+        generation: u64,
+        reloaded_at: chrono::DateTime<chrono::Utc>,
+        turn_cut: Option<bool>,
+        cut_tail: Option<u32>,
+        stopped: bool,
+        reply: Option<tokio::sync::oneshot::Sender<&'static str>>,
+    },
+    /// Host-only (never wire): a fresh daemon's crash restore, for a
+    /// session it brought back Live from the dead daemon's crash record
+    /// (`daemon::crash_record`). When the record says a turn was in flight,
+    /// THIS load folded that turn's draft in (the `Crash` marker it wrote),
+    /// nothing answered it and nothing re-prompted it since, the actor
+    /// queues ONE message that starts a new turn ("resume: the daemon
+    /// restarted after a crash ..."), at most once per `crash` (the dead
+    /// writer's pid and start time). `lost_workers`: subagents the record
+    /// saw running, named in the message (they died with the daemon); a
+    /// session that was idle while they ran gets one note naming them in
+    /// place of the completion wakes the crash ate.
+    #[serde(skip)]
+    ResumeAfterCrash {
+        crash: String,
+        crashed_at: chrono::DateTime<chrono::Utc>,
+        turn_in_flight: bool,
+        lost_workers: Vec<String>,
+        /// The actor's decision ("resumed", "skip", "none"), for the
+        /// restore's summary line. Dropped unanswered by a parked or
+        /// ending actor.
+        reply: Option<tokio::sync::oneshot::Sender<&'static str>>,
+    },
     /// Host→session (never wire): the actor re-emits as `SessionEventWire`.
     #[serde(skip)]
     HostEvent(HostEvent),
@@ -971,6 +1186,36 @@ pub enum SessionCommand {
         plugin: String,
         command: String,
         arg: String,
+    },
+    /// Fork this session (side chats): a new live session starts from its
+    /// state as sent (`session::fork`). Reply = `Forked` to THIS client
+    /// only, or `Refused{command: "fork"}`.
+    Fork { label: String },
+    /// Client tools v1 (docs/client-tools.md): the input owner registers
+    /// tools it answers itself. The fields are checked by the actor
+    /// (`session::client_tools`), so a bad shape is an `invalid` reply.
+    /// Reply = `ClientTools` to THIS client only.
+    RegisterClientTools {
+        id: u64,
+        #[serde(flatten)]
+        fields: serde_json::Map<String, serde_json::Value>,
+    },
+    /// Client tools v1: the installer answers one `tool_invoke`. Reply =
+    /// `ToolReturnAck` to THIS client only. Content is never traced.
+    ToolReturn {
+        id: u64,
+        #[serde(flatten)]
+        fields: serde_json::Map<String, serde_json::Value>,
+    },
+    /// Host-only (never wire): the fork's create finished (`session::fork`);
+    /// the parent answers the client that asked. `result`: the fork's
+    /// session id, or why the create failed.
+    #[serde(skip)]
+    ForkDone {
+        client: Option<ClientId>,
+        label: String,
+        message_count: usize,
+        result: Result<String, String>,
     },
 }
 
@@ -999,6 +1244,52 @@ pub struct SessionReloadRecord {
     /// prefix starts with. Pins only, re-validated on restore.
     #[serde(default)]
     pub tool_activations: Vec<crate::tools::activation::CarriedActivation>,
+    /// A reload checkpoint cut this session's running turn (it was
+    /// streaming, and the cancel left the `Restart` marker unanswered). The
+    /// next image resumes such a session (`ResumeAfterReload`).
+    #[serde(default)]
+    pub turn_cut: bool,
+    /// With `turn_cut`: how many messages followed the `Restart` marker
+    /// when the checkpoint saved the session (the cut turn's own tail:
+    /// events that arrived during the turn, a host note). The next image
+    /// counts only user messages past them as a re-prompt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cut_tail: Option<u32>,
+    /// The session's last turn stopped on a reset-based capacity limit and
+    /// is owed one automatic resume (`session::capacity_resume`). Older
+    /// images ignore the field; a rollback loses a pending resume. Read
+    /// leniently: one that does not parse drops only itself
+    /// (`capacity_resume::lenient_stop`).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::session::capacity_resume::lenient_stop"
+    )]
+    pub capacity_stop: Option<CapacityStop>,
+    /// When the session parked (`None`: Live, or an older image's record),
+    /// so the next image continues its eviction clock instead of starting
+    /// it over.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parked_since: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// A turn that ended on a reset-based capacity stop (no Anthropic account
+/// had capacity, and a limited one comes back at `resume_at`): what the
+/// session resumes from, once, at that time. It carries no identity, token,
+/// account label or text: the failure kind and a digest of the history.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapacityStop {
+    /// The reset the turn stopped on (no jitter).
+    pub resume_at: chrono::DateTime<chrono::Utc>,
+    pub stopped_at: chrono::DateTime<chrono::Utc>,
+    /// The selection-failure kind (a closed set; validated on load).
+    pub kind: String,
+    /// The history's length when the turn stopped.
+    pub history_len: u32,
+    /// sha256 of the history's last message, 64 lowercase hex.
+    pub last_digest: String,
+    /// Capacity resumes already dispatched in this chain (0..=2).
+    pub attempt: u8,
 }
 
 /// What a session tells a client whose command a daemon reload refused.
@@ -1026,7 +1317,10 @@ impl SessionCommand {
                 | Self::PluginCommand { .. }
                 | Self::DriverStart { .. }
                 | Self::Set { .. }
+                | Self::EphemeralLayer { .. }
                 | Self::KeepWarm { .. }
+                | Self::HeldRelease { .. }
+                | Self::Fork { .. }
         )
     }
 }
@@ -1069,6 +1363,11 @@ impl std::fmt::Debug for SessionCommand {
                 .field("query", &format_args!("<redacted>"))
                 .finish(),
             Self::Cancel => f.write_str("Cancel"),
+            Self::EphemeralLayer { id, .. } => f.debug_struct("EphemeralLayer").field("id", id).finish_non_exhaustive(),
+            Self::RegisterClientTools { id, .. } => {
+                f.debug_struct("RegisterClientTools").field("id", id).finish_non_exhaustive()
+            }
+            Self::ToolReturn { id, .. } => f.debug_struct("ToolReturn").field("id", id).finish_non_exhaustive(),
             Self::Set { id, setting } => {
                 f.debug_struct("Set").field("id", id).field("setting", setting).finish()
             }
@@ -1079,9 +1378,15 @@ impl std::fmt::Debug for SessionCommand {
             Self::Save => f.write_str("Save"),
             Self::TakeInput => f.write_str("TakeInput"),
             Self::Park => f.write_str("Park"),
-            Self::AdoptWorkers { workers } => f
+            Self::AdoptWorkers { workers, resume } => f
                 .debug_struct("AdoptWorkers")
                 .field("workers", &workers.iter().map(|w| w.id.as_str()).collect::<Vec<_>>())
+                .field("resume", resume)
+                .finish(),
+            Self::ArmCapacityResume { stop } => f
+                .debug_struct("ArmCapacityResume")
+                .field("resume_at", &stop.resume_at)
+                .field("attempt", &stop.attempt)
                 .finish(),
             Self::RestoreToolActivations { activations } => f
                 .debug_struct("RestoreToolActivations")
@@ -1092,6 +1397,24 @@ impl std::fmt::Debug for SessionCommand {
                 .finish(),
             Self::ReloadAborted => f.write_str("ReloadAborted"),
             Self::ArmPark => f.write_str("ArmPark"),
+            Self::ReloadRefused { refused_at } => {
+                f.debug_struct("ReloadRefused").field("refused_at", refused_at).finish()
+            }
+            Self::ResumeAfterReload { generation, reloaded_at, turn_cut, cut_tail, stopped, .. } => f
+                .debug_struct("ResumeAfterReload")
+                .field("generation", generation)
+                .field("reloaded_at", reloaded_at)
+                .field("turn_cut", turn_cut)
+                .field("cut_tail", cut_tail)
+                .field("stopped", stopped)
+                .finish(),
+            Self::ResumeAfterCrash { crash, crashed_at, turn_in_flight, lost_workers, .. } => f
+                .debug_struct("ResumeAfterCrash")
+                .field("crash", crash)
+                .field("crashed_at", crashed_at)
+                .field("turn_in_flight", turn_in_flight)
+                .field("lost_workers", lost_workers)
+                .finish(),
             Self::Query { id, query } => {
                 f.debug_struct("Query").field("id", id).field("query", query).finish()
             }
@@ -1118,16 +1441,46 @@ impl std::fmt::Debug for SessionCommand {
                 .field("name", name)
                 .field("arg", arg)
                 .finish(),
-            Self::Checkpoint { reason } => {
-                f.debug_struct("Checkpoint").field("reason", reason).finish()
-            }
+            Self::Checkpoint { reason, deadline, skip_quiesce_grace } => f
+                .debug_struct("Checkpoint")
+                .field("reason", reason)
+                .field("deadline", deadline)
+                .field("skip_quiesce_grace", skip_quiesce_grace)
+                .finish(),
             Self::KeepWarm { on } => f.debug_struct("KeepWarm").field("on", on).finish(),
+            Self::Delivery { mode, lease_secs } => f
+                .debug_struct("Delivery")
+                .field("mode", mode)
+                .field("lease_secs", lease_secs)
+                .finish(),
+            Self::HeldRelease { ids, release_as, text } => f
+                .debug_struct("HeldRelease")
+                .field("ids", ids)
+                .field("as", release_as)
+                .field("text", &format_args!("{}", if text.is_some() { "<redacted>" } else { "None" }))
+                .finish(),
+            Self::HeldDismiss { ids } => f.debug_struct("HeldDismiss").field("ids", ids).finish(),
+            Self::HeldMark { id, side_session } => f
+                .debug_struct("HeldMark")
+                .field("id", id)
+                .field("side_session", side_session)
+                .finish(),
             Self::HostEvent(ev) => f.debug_tuple("HostEvent").field(ev).finish(),
             Self::DriverStart { plugin, command, .. } => f
                 .debug_struct("DriverStart")
                 .field("plugin", plugin)
                 .field("command", command)
                 .field("arg", &format_args!("<redacted>"))
+                .finish(),
+            Self::Fork { .. } => f
+                .debug_struct("Fork")
+                .field("label", &format_args!("<redacted>"))
+                .finish(),
+            Self::ForkDone { client, message_count, result, .. } => f
+                .debug_struct("ForkDone")
+                .field("client", client)
+                .field("message_count", message_count)
+                .field("ok", &result.is_ok())
                 .finish(),
         }
     }
@@ -1169,6 +1522,14 @@ pub enum SessionSetting {
     ReloadPrompt,
     /// grant_worker_model
     GrantWorkerModel { model: String },
+    /// Add to this session's memory-only tool globs
+    /// (`SessionConfig.memory_only_tools`, docs/memory-only-results.md).
+    /// Add-only: `globs` must hold every glob the session already has (a
+    /// superset adds, an identical resend is ok); a list that drops one is
+    /// refused (`ok:false`, the message names the dropped globs). Marks every
+    /// later check, in the turn in flight and in running workers too; a
+    /// result already held stays held. The reply echoes the effective list.
+    MemoryOnlyTools { globs: Vec<String> },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1184,6 +1545,10 @@ pub struct SettingApplied {
     /// TUI renders `reasoning_clamp_notice` byte-for-byte.
     #[serde(default)]
     pub clamp: Option<ReasoningClampWire>,
+    /// `memory_only_tools` replies only (ok or refused): every glob in force
+    /// on the session after the Set, config globs first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_only_tools: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1195,6 +1560,12 @@ pub struct ReasoningClampWire {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "query", rename_all = "snake_case")]
 pub enum SessionQuery {
+    EphemeralLayer,
+    /// `{kind:"memory_only", live, live_bytes, per_result_cap, session_cap,
+    /// evicted, refused, set_refused}` — counts only, never result text
+    /// (docs/memory-only-results.md). `set_refused` counts live
+    /// `memory_only_tools` Sets refused for dropping a glob.
+    MemoryOnly,
     /// {session, model, tokens, cost, streaming, auto_turns, attached, pending_prompts}
     Status,
     /// Vec<SharedMessage> (api_messages)
@@ -1225,6 +1596,12 @@ pub enum SessionQuery {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         tool_queue: bool,
     },
+    /// (S1) `held::HeldList`: the mode, the lease and the items not released
+    /// or dismissed (no text).
+    HeldList,
+    /// (S1) `held::HeldItemWithText` for one id, or
+    /// `{"error": "unknown held id"}`.
+    HeldShow { held_id: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1248,6 +1625,7 @@ pub enum EndReason {
 #[derive(Debug, Clone)]
 #[allow(clippy::large_enum_variant)] // Attached carries the full snapshot by design (§2.4)
 pub enum SessionEventWire {
+    EphemeralLayerChanged { status: crate::runtime::ephemeral::Status },
     Stream(crate::StreamEvent),
     /// Actor bookkeeping the client needs to mirror `App` fields exactly.
     /// `user_text` = the prompt that started the turn: the queued text on
@@ -1285,7 +1663,14 @@ pub enum SessionEventWire {
         params: serde_json::Value,
     },
     SettingChanged(SettingApplied),
-    QueryResult { id: u64, value: serde_json::Value },
+    /// `client_tools`: only on the `Messages` answer, and only when a tool
+    /// result in that history came from a client tool (its stamp, by
+    /// `tool_use_id`); `None` otherwise, so the frame is unchanged.
+    QueryResult {
+        id: u64,
+        value: serde_json::Value,
+        client_tools: Option<ClientToolStamps>,
+    },
     /// Only to the attaching client.
     Attached {
         client: ClientId,
@@ -1369,6 +1754,121 @@ pub enum SessionEventWire {
         cost: f64,
         cap: f64,
     },
+    /// A tool call spawned or reaped a child process (`tool_child` /
+    /// `tool_child_ended`). Optional: sent only to connections that list it
+    /// in `Hello.accepted_events`; never replayed on Attach.
+    ChildProcess(super::child_events::ChildProcessEvent),
+    /// A subagent's paid request was booked into the session's totals
+    /// (`child_spend`, child spend). Optional: it goes out on the session's
+    /// optional channel ([`SessionHandle::subscribe_optional`]), never the
+    /// main one, and the daemon forwards it only to connections whose Hello
+    /// accepted "child_spend"; never replayed on attach.
+    ///
+    /// [`SessionHandle::subscribe_optional`]: super::SessionHandle::subscribe_optional
+    ChildSpend(ChildSpendEvent),
+    /// A connection's optional receiver fell behind and `dropped`
+    /// child_spend frames were overwritten before it read them. Made by the
+    /// daemon's forwarder for its own connection (envelope seq `u64::MAX`),
+    /// never by the actor, and sent only on a connection that accepted
+    /// "child_spend", right before the first frame that survived the gap
+    /// (child spend §7.4). `dropped` counts child_spend frames only.
+    ChildSpendLagged { dropped: u64 },
+    /// (S1) An event went to the held store instead of the context.
+    EventHeld { item: super::held::HeldItem },
+    /// (S1) The delivery mode or its lease changed.
+    DeliveryChanged {
+        mode: super::held::DeliveryMode,
+        lease_until_ms: Option<u64>,
+        reason: super::held::DeliveryReason,
+    },
+    /// (S1) Held items changed state.
+    HeldUpdated {
+        ids: Vec<String>,
+        state: super::held::HeldState,
+    },
+    /// A `Fork` made session `session_id` with `message_count`
+    /// messages. Addressed to the client that asked (`None`: a host
+    /// sender, every in-process client): the daemon sends it on that
+    /// client's connection only, without the client field.
+    Forked {
+        client: Option<ClientId>,
+        session_id: String,
+        label: String,
+        message_count: usize,
+    },
+    /// Client tools v1: a `register_client_tools` reply or notice, for
+    /// `client` only (sent without the field, like `Forked`). Never
+    /// replayed.
+    ClientTools {
+        client: Option<ClientId>,
+        ack: Box<super::client_tools::ClientToolsAck>,
+    },
+    /// Client tools v1: one call for the installer only. Never replayed.
+    ToolInvoke {
+        client: Option<ClientId>,
+        invoke: Box<super::client_tools::ToolInvokeFrame>,
+    },
+    /// Client tools v1: a pending call ended, for the installer only.
+    ToolCancel {
+        client: Option<ClientId>,
+        cancel: super::client_tools::ToolCancelFrame,
+    },
+    /// Client tools v1: a `tool_return` reply, for its sender only.
+    ToolReturnAck {
+        client: Option<ClientId>,
+        ack: super::client_tools::ToolReturnAckFrame,
+    },
+}
+
+impl SessionEventWire {
+    /// Whether the event goes out on the session's optional channel: events
+    /// a client must opt in to, published apart so that their volume never
+    /// evicts an ordinary event from the main channel's ring.
+    pub fn is_optional(&self) -> bool {
+        matches!(self, Self::ChildSpend(_))
+    }
+}
+
+/// One paid request of the session's subagents (any depth), right after the
+/// session booked it into its totals: the `child_spend` frame (draft 2,
+/// frozen names). Display only: the snapshots' `cost`/`tokens` already
+/// include it, and it is no request of the session's own.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChildSpendEvent {
+    /// The worker's handle ("sa_N"); a resume is a new handle.
+    pub handle: String,
+    /// The launch the request belongs to: 16 lowercase hex digits.
+    pub run: String,
+    /// 0, 1, 2… per (handle, run), one step per booked report.
+    pub spend_seq: u64,
+    /// The worker's agent label, bounded and flattened.
+    pub agent: String,
+    /// The worker that delegated it; `None` when the session's own turn did.
+    #[serde(default)]
+    pub parent_handle: Option<String>,
+    /// What was paid for: "turn" or "summary" (an open set: a client maps
+    /// an unknown kind to "other").
+    pub kind: String,
+    /// The qualified model id the request was priced at.
+    pub model: String,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_input_tokens: u64,
+    pub cache_creation_input_tokens: u64,
+    /// The TTL split of `cache_creation_input_tokens`; `None` when the
+    /// route reports none.
+    #[serde(default)]
+    pub cache_creation_5m: Option<u64>,
+    #[serde(default)]
+    pub cache_creation_1h: Option<u64>,
+    /// This request's price in USD, for display.
+    pub cost_usd: f64,
+    /// The same price in integer nanodollars, exactly as booked.
+    pub cost_nanousd: u64,
+    /// The session's inclusive total right after this booking.
+    pub session_cost_usd: f64,
+    /// The session's child share right after this booking.
+    pub child_cost_usd: f64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1397,8 +1897,11 @@ pub enum TurnTrigger {
     DriverAuto,
 }
 
-/// Per-session, gapless `seq` assigned at the single emit site
-/// (`SessionActor::emit`); `ts` from the host clock.
+/// Per-session `seq` assigned at the single emit site
+/// (`SessionActor::emit`) from one counter for both of the session's
+/// channels: strictly increasing on each, gapless across the two together
+/// (the main channel alone has gaps where optional events went); `ts` from
+/// the host clock.
 #[derive(Debug, Clone)]
 pub struct Envelope {
     pub session_id: SessionId,
@@ -1475,6 +1978,19 @@ pub struct ConversationSnapshot {
     /// Keep-warm ping tokens, already included in `tokens` (task #444).
     #[serde(default)]
     pub keepwarm_tokens: ConversationTokens,
+    /// The session's subagents' spend (child spend, any depth), already
+    /// included in `cost`; labelled separately, like the keep-warm share.
+    #[serde(default)]
+    pub child_cost: f64,
+    /// The child share's tokens, already included in `tokens`.
+    #[serde(default)]
+    pub child_tokens: ConversationTokens,
+    /// Whether the child share is exact: true for a session created in this
+    /// process; false for the rest of a load that restored it (the share
+    /// is snapshot-only: as of the last save, clamped under the totals).
+    /// Absent (an older daemon) reads as false.
+    #[serde(default)]
+    pub child_share_exact: bool,
     /// Legacy (protocol v3 shape kept): always `None` — an interrupted turn
     /// is recorded in `api_messages` (`engine::interrupt`), never as a recap.
     pub abort_context: Option<String>,
@@ -1538,7 +2054,14 @@ pub struct AttachSnapshot {
     /// Daemon-projected display tail — `Some` iff the client attached with
     /// `HistoryMode::Digest` (`conversation.api_messages` is then empty).
     pub display_tail: Option<crate::session::display::DisplayTail>,
+    /// The client tool stamps of the tool results in the conversation's
+    /// history, by `tool_use_id` (empty when there are none).
+    pub client_tools: ClientToolStamps,
 }
+
+/// Client tool stamps by `tool_use_id`: the side table a client is given
+/// with a history (`Attached`, the `Messages` answer).
+pub type ClientToolStamps = std::collections::BTreeMap<String, agent_core::ClientToolStamp>;
 
 impl AttachSnapshot {
     /// For the client this snapshot was made for (`me`): who owns input, if
@@ -1648,6 +2171,27 @@ mod tests {
             PromptKind::Confirm
         );
         assert_eq!(PromptKind::from_title("API key"), PromptKind::Secret);
+    }
+
+    /// `tool_call_id` is additive on the wire. A scope from an older daemon
+    /// (no key) reads as `None`; `None` writes no key, so an older client
+    /// sees the shape it knew; `Some` round-trips.
+    #[test]
+    fn confirm_scope_tool_call_id_is_additive_on_the_wire() {
+        let old = r#"{"extensions":["jev"],"tool":"bash"}"#;
+        let read: ConfirmScope = serde_json::from_str(old).unwrap();
+        assert_eq!(read.tool_call_id, None);
+        assert_eq!(serde_json::to_string(&read).unwrap(), old, "None writes no key");
+        let with_id = ConfirmScope {
+            tool_call_id: Some("toolu_01".into()),
+            ..read
+        };
+        let wire = serde_json::to_string(&with_id).unwrap();
+        assert_eq!(
+            wire,
+            r#"{"extensions":["jev"],"tool":"bash","tool_call_id":"toolu_01"}"#
+        );
+        assert_eq!(serde_json::from_str::<ConfirmScope>(&wire).unwrap(), with_id);
     }
 
     #[test]
@@ -1850,7 +2394,11 @@ mod tests {
             },
             SessionCommand::PluginCommand { id: 1, plugin: "p".into(), name: "n".into(), arg: "a".into() },
             SessionCommand::Resume { id: 2, query: "q".into() },
-            SessionCommand::Checkpoint { reason: CheckpointReason::Reload },
+            SessionCommand::Checkpoint {
+                reason: CheckpointReason::Reload,
+                deadline: None,
+                skip_quiesce_grace: false,
+            },
             SessionCommand::KeepWarm { on: true },
             SessionCommand::Query { id: 3, query: SessionQuery::ContextReport },
             SessionCommand::Query {
@@ -1869,7 +2417,33 @@ mod tests {
         let take: SessionCommand = serde_json::from_str(r#"{"cmd":"take_input"}"#).unwrap();
         assert!(matches!(take, SessionCommand::TakeInput));
         let cp: SessionCommand = serde_json::from_str(r#"{"cmd":"checkpoint","reason":"host_request"}"#).unwrap();
-        assert!(matches!(cp, SessionCommand::Checkpoint { reason: CheckpointReason::HostRequest }));
+        assert!(matches!(
+            cp,
+            SessionCommand::Checkpoint {
+                reason: CheckpointReason::HostRequest,
+                deadline: None,
+                skip_quiesce_grace: false,
+            }
+        ));
+        // The deadline and the grace flag are host-only: never written,
+        // never read (a wire checkpoint keeps the grace).
+        let with = SessionCommand::Checkpoint {
+            reason: CheckpointReason::Reload,
+            deadline: Some(tokio::time::Instant::now()),
+            skip_quiesce_grace: true,
+        };
+        assert_eq!(
+            serde_json::to_string(&with).unwrap(),
+            r#"{"cmd":"checkpoint","reason":"reload"}"#
+        );
+        let read: SessionCommand = serde_json::from_str(
+            r#"{"cmd":"checkpoint","reason":"reload","deadline":5,"skip_quiesce_grace":true}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            read,
+            SessionCommand::Checkpoint { deadline: None, skip_quiesce_grace: false, .. }
+        ));
     }
 
     #[test]

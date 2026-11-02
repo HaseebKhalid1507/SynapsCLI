@@ -636,6 +636,7 @@ mod tier1 {
             &synaps_cli::core::session_draft::TurnDraft {
                 base_len: 1,
                 partial_text: "Once upon a".into(),
+                writer: None,
             },
         )
         .expect("seed draft");

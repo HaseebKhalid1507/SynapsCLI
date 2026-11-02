@@ -129,6 +129,121 @@ async fn one_turn(t: &mut SocketTransport, text: &str) -> Vec<agent_engine::Shar
     msgs.expect("conversation after the turn")
 }
 
+/// Evidence kept when a test fails: while it is alive, a panic (any failed
+/// assertion) makes its drop copy the regular files of the test's OWN
+/// scratch base dir (the daemon's logs, the session journals, a leftover
+/// reload state; never `auth.json`) into a fresh `mktemp` dir under TMPDIR,
+/// then print that dir, the tail of every daemon log and the notes the test
+/// recorded (the history the client got). It only reads the scratch HOME,
+/// writes only the new dir and deletes nothing. Declare it AFTER the
+/// `HomeGuard`, so it runs before the guard removes the scratch HOME.
+struct KeepOnFailure {
+    base: PathBuf,
+    notes: std::sync::Mutex<Vec<String>>,
+}
+
+impl KeepOnFailure {
+    const MAX_FILE: u64 = 8 << 20;
+    const TAIL_LINES: usize = 80;
+
+    fn new(guard: &HomeGuard) -> Self {
+        Self {
+            base: guard.base_dir(),
+            notes: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn note(&self, what: &str, value: &dyn std::fmt::Debug) {
+        self.notes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(format!("{what}: {value:#?}"));
+    }
+
+    fn keep(&self) -> std::io::Result<PathBuf> {
+        let out = tempfile::Builder::new()
+            .prefix("daemon-reload-failure-")
+            .tempdir()?
+            .keep();
+        let mut manifest = String::new();
+        let mut logs = Vec::new();
+        let mut dirs = vec![self.base.clone()];
+        let mut depth = 0;
+        while depth < 5 && !dirs.is_empty() {
+            let mut next = Vec::new();
+            for dir in dirs {
+                let Ok(rd) = std::fs::read_dir(&dir) else {
+                    continue;
+                };
+                for e in rd.flatten() {
+                    let p = e.path();
+                    let Ok(meta) = std::fs::symlink_metadata(&p) else {
+                        continue;
+                    };
+                    let rel = p
+                        .strip_prefix(&self.base)
+                        .unwrap_or(&p)
+                        .display()
+                        .to_string();
+                    manifest.push_str(&format!(
+                        "{rel}\t{}\t{:?}\n",
+                        meta.len(),
+                        meta.modified().ok()
+                    ));
+                    if meta.is_dir() {
+                        next.push(p);
+                        continue;
+                    }
+                    let name = e.file_name().to_string_lossy().into_owned();
+                    if !meta.is_file() || name == "auth.json" || meta.len() > Self::MAX_FILE {
+                        continue;
+                    }
+                    let flat = out.join(rel.replace('/', "__"));
+                    if std::fs::copy(&p, &flat).is_ok() && name.starts_with("synaps.log") {
+                        logs.push(flat);
+                    }
+                }
+            }
+            dirs = next;
+            depth += 1;
+        }
+        std::fs::write(out.join("MANIFEST.txt"), manifest)?;
+        let notes = self
+            .notes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .join("\n");
+        std::fs::write(out.join("NOTES.txt"), &notes)?;
+        eprintln!(
+            "=== kept the failed test's scratch evidence in {} ===",
+            out.display()
+        );
+        logs.sort();
+        for log in &logs {
+            let text = std::fs::read_to_string(log).unwrap_or_default();
+            let lines: Vec<&str> = text.lines().collect();
+            let from = lines.len().saturating_sub(Self::TAIL_LINES);
+            eprintln!(
+                "=== tail of {} ===\n{}",
+                log.display(),
+                lines[from..].join("\n")
+            );
+        }
+        eprintln!("=== notes ===\n{notes}");
+        Ok(out)
+    }
+}
+
+impl Drop for KeepOnFailure {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            if let Err(e) = self.keep() {
+                eprintln!("could not keep the failed test's evidence: {e}");
+            }
+        }
+    }
+}
+
 #[cfg(unix)]
 fn fake_older_binary(dir: &Path) -> PathBuf {
     let p = dir.join("synaps-old");
@@ -247,12 +362,18 @@ async fn reload_keeps_pid_sessions_and_reconnects_clients() {
 #[serial]
 async fn reload_with_turn_in_flight_checkpoints_and_keeps_the_partial_turn() {
     let guard = HomeGuard::new();
+    // This test reads the checkpointed journal as the reload left it; the
+    // resume of the cut turn (on by default) is daemon_reload_resume.rs's.
+    std::fs::write(guard.base_dir().join("config"), "daemon.reload_resume = off\n").unwrap();
     let (url, _hits, _) = spawn_stub(Script::Endless(ANTHROPIC_SSE_PREFIX)).await;
     let d = spawn_daemon(&guard, &url).await;
+    // After `guard` and `d`: dropped first, so a failure keeps the logs.
+    let keep = KeepOnFailure::new(&guard);
     let pid_before = d.child.id();
 
     let (mut t, _snap) = attach_create(&d.paths, guard.home.path()).await;
     let sid = t.session_id().clone();
+    keep.note("session before the reload", &sid);
     t.send_from_self(SessionCommand::Submit { text: "never finishes".into(), attachments: vec![] }).await.unwrap();
     // Wait for the partial text so the checkpoint has partial work to keep.
     loop {
@@ -280,8 +401,11 @@ async fn reload_with_turn_in_flight_checkpoints_and_keeps_the_partial_turn() {
     }
     assert!(aborted, "typed Aborted expected; notices: {notices:?}");
     assert!(notices.iter().any(|n| n.contains("daemon reloading")), "{notices:?}");
+    keep.note("notices before the reconnect", &notices);
 
     let snap = tokio::time::timeout(Duration::from_secs(15), t.reconnect(AttachMode::Mirror)).await.unwrap().expect("reconnected");
+    keep.note("session after the reconnect", t.session_id());
+    keep.note("history the client got", &snap.conversation.api_messages);
     assert_reload_pid(t.welcome.pid, pid_before);
     assert_eq!(t.session_id(), &sid);
     assert!(!snap.streaming, "the turn was checkpointed, not resumed");
@@ -292,6 +416,134 @@ async fn reload_with_turn_in_flight_checkpoints_and_keeps_the_partial_turn() {
     assert_eq!(msgs.len(), 3, "{msgs:#?}");
     assert_eq!(msgs[0]["content"], "never finishes");
     assert_eq!(msgs[1]["role"], "assistant");
+    assert_eq!(msgs[1]["content"][0]["text"], "partial");
+    assert_eq!(
+        msgs[2]["content"],
+        agent_engine::engine::interrupt::InterruptReason::Restart.marker()
+    );
+
+    t.detach().await;
+    SocketTransport::shutdown(&d.paths.sock, true).await.unwrap();
+}
+
+/// Makes the test's OWN scratch sessions dir read-only (0500) until
+/// `restore` or drop (a panic included), so a session save there fails.
+/// Refuses any path outside the test's scratch HOME, or one that is not a
+/// plain directory. Echoes the path before the chmod.
+#[cfg(unix)]
+struct ReadOnlySessionsDir {
+    path: PathBuf,
+    mode: u32,
+    restored: bool,
+}
+
+#[cfg(unix)]
+impl ReadOnlySessionsDir {
+    fn new(guard: &HomeGuard, path: PathBuf) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        assert!(path.starts_with(guard.home.path()), "refused: {} is outside the scratch HOME", path.display());
+        let meta = std::fs::symlink_metadata(&path).expect("the sessions dir exists");
+        assert!(meta.is_dir(), "refused: {} is not a plain directory", path.display());
+        let mode = meta.permissions().mode() & 0o7777;
+        eprintln!("chmod 0500 (was {mode:o}): {}", path.display());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o500)).unwrap();
+        Self { path, mode, restored: false }
+    }
+
+    fn restore(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        if std::mem::replace(&mut self.restored, true) {
+            return;
+        }
+        eprintln!("chmod {:o} (restored): {}", self.mode, self.path.display());
+        if let Err(e) = std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(self.mode)) {
+            eprintln!("could not restore the mode of {}: {e}", self.path.display());
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ReadOnlySessionsDir {
+    fn drop(&mut self) {
+        self.restore();
+    }
+}
+
+/// A brand-new session's first save is the reload checkpoint's (a first
+/// turn is saved at its first round boundary, and this one never reaches
+/// it). When that save fails, the exec must not leave the client on a
+/// fresh session: the same id comes back, with the partial reply and the
+/// restart marker, as when the save works
+/// (`reload_with_turn_in_flight_checkpoints_and_keeps_the_partial_turn`).
+///
+/// The sessions dir is read-only from after the partial text until the
+/// checkpoint's notice, which the session emits right after its save
+/// returned; the mode is back before the reload's announce and exec, so
+/// only that save fails.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn reload_whose_first_save_fails_keeps_the_session() {
+    let guard = HomeGuard::new();
+    // This test reads the journal as the reload left it; the resume of the
+    // cut turn (on by default) is daemon_reload_resume.rs's.
+    std::fs::write(guard.base_dir().join("config"), "daemon.reload_resume = off\n").unwrap();
+    let (url, _hits, _) = spawn_stub(Script::Endless(ANTHROPIC_SSE_PREFIX)).await;
+    let d = spawn_daemon(&guard, &url).await;
+    // After `guard` and `d`: dropped first, so a failure keeps the logs.
+    let keep = KeepOnFailure::new(&guard);
+    let pid_before = d.child.id();
+
+    let (mut t, _snap) = attach_create(&d.paths, guard.home.path()).await;
+    let sid = t.session_id().clone();
+    keep.note("session before the reload", &sid);
+    t.send_from_self(SessionCommand::Submit { text: "never finishes".into(), attachments: vec![] }).await.unwrap();
+    loop {
+        let env = tokio::time::timeout(Duration::from_secs(20), t.next_event()).await.unwrap().unwrap();
+        if matches!(env.event, SessionEventWire::Stream(agent_engine::StreamEvent::Llm(agent_engine::LlmEvent::Text(_)))) {
+            break;
+        }
+    }
+    let sessions = guard.base_dir().join("sessions");
+    let listing = |dir: &Path| -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .map(|rd| rd.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect())
+            .unwrap_or_default();
+        names.sort();
+        names
+    };
+    keep.note("sessions dir before the chmod", &listing(&sessions));
+    assert!(
+        !sessions.join(format!("{}.json", sid.as_str())).exists(),
+        "precondition: the session has no snapshot yet: {:?}",
+        listing(&sessions)
+    );
+    // Declared after `keep`: restored before the evidence is copied.
+    let mut read_only = ReadOnlySessionsDir::new(&guard, sessions.clone());
+
+    let gen = SocketTransport::reload(&d.paths.sock, true, None, None).await.expect("reload accepted");
+    assert_eq!(gen, 2);
+    let mut notices = Vec::new();
+    while let Some(env) = tokio::time::timeout(Duration::from_secs(10), t.next_event()).await.expect("announce") {
+        if let SessionEventWire::SystemNotice(n) = env.event {
+            if n.contains("the turn was checkpointed") {
+                read_only.restore();
+            }
+            notices.push(n);
+        }
+    }
+    read_only.restore();
+    keep.note("notices before the reconnect", &notices);
+    keep.note("sessions dir after the reload", &listing(&sessions));
+
+    let snap = tokio::time::timeout(Duration::from_secs(15), t.reconnect(AttachMode::Mirror)).await.unwrap().expect("reconnected");
+    keep.note("session after the reconnect", t.session_id());
+    keep.note("history the client got", &snap.conversation.api_messages);
+    assert_eq!(t.welcome.pid, pid_before);
+    assert_eq!(t.session_id(), &sid, "the session whose checkpoint save failed comes back");
+    let msgs = &snap.conversation.api_messages;
+    assert_eq!(msgs.len(), 3, "{msgs:#?}");
+    assert_eq!(msgs[0]["content"], "never finishes");
     assert_eq!(msgs[1]["content"][0]["text"], "partial");
     assert_eq!(
         msgs[2]["content"],
@@ -386,6 +638,12 @@ async fn reload_preserves_model_keep_warm_settings_and_parked() {
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert!(wait_listed_lifecycle(&d.paths, &a_id, SessionLifecycle::Live, Duration::from_secs(1)).await, "A keep-warm survived (not parked after grace)");
     assert_eq!(listed_pins(&d.paths, &a_id, &b_id).await, (true, false), "the listing shows the pin after reload");
+
+    // Before the reload each session ran its hook once. After it: A (Live)
+    // once more; B (Parked) not until it is unparked.
+    assert!(wait_hook_count(&plugin, &a_id, 2, Duration::from_secs(10)).await, "A's hook after the restore");
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(hook_count(&plugin, &b_id), 1, "B is parked: no hook since the reload");
 
     // Before the reload each session ran its hook once. After it: A (Live)
     // once more; B (Parked) not until it is unparked.
@@ -942,5 +1200,243 @@ async fn successor_dying_before_the_handoff_keeps_serving() {
     assert!(matches!(r, Err(TransportError::Refused(ref m)) if m.contains("older")), "{r:?}");
 
     t.detach().await;
+    SocketTransport::shutdown(&d.paths.sock, true).await.unwrap();
+}
+
+/// One assistant response calling `bash` with `command` as `tool_id`.
+#[cfg(unix)]
+fn bash_round(tool_id: &str, command: &str) -> &'static str {
+    let usage = serde_json::json!({"input_tokens": 10, "output_tokens": 0, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0});
+    let events = [
+        serde_json::json!({"type": "message_start", "message": {"id": format!("msg_{tool_id}"), "type": "message",
+            "role": "assistant", "content": [], "model": "claude-sonnet-4-5", "stop_reason": null,
+            "stop_sequence": null, "usage": usage}}),
+        serde_json::json!({"type": "content_block_start", "index": 0,
+            "content_block": {"type": "tool_use", "id": tool_id, "name": "bash"}}),
+        serde_json::json!({"type": "content_block_delta", "index": 0,
+            "delta": {"type": "input_json_delta", "partial_json": serde_json::json!({"command": command}).to_string()}}),
+        serde_json::json!({"type": "content_block_stop", "index": 0}),
+        serde_json::json!({"type": "message_delta", "delta": {"stop_reason": "tool_use", "stop_sequence": null}, "usage": usage}),
+        serde_json::json!({"type": "message_stop"}),
+    ];
+    Box::leak(events.iter().map(|e| format!("data: {e}\n\n")).collect::<String>().into_boxed_str())
+}
+
+/// Everything up to the next `Idle` (a turn's events on any attached client).
+#[cfg(unix)]
+async fn until_idle(t: &mut SocketTransport) -> Vec<SessionEventWire> {
+    let mut out = Vec::new();
+    loop {
+        let env = tokio::time::timeout(Duration::from_secs(20), t.next_event()).await.expect("turn hung").expect("alive");
+        if let SessionEventWire::Refused { reason, .. } = &env.event {
+            panic!("refused: {reason}");
+        }
+        let idle = matches!(env.event, SessionEventWire::Idle);
+        out.push(env.event);
+        if idle {
+            return out;
+        }
+    }
+}
+
+/// The child events seen for `tool_id`: ("tool_child" | "tool_child_ended", exit code).
+#[cfg(unix)]
+fn child_events(events: &[SessionEventWire], tool_id: &str) -> Vec<(&'static str, Option<i32>)> {
+    use agent_engine::session::child_events::ChildProcessEvent;
+    events
+        .iter()
+        .filter_map(|e| match e {
+            SessionEventWire::ChildProcess(ChildProcessEvent::Spawned(s)) if s.tool_id == tool_id => Some(("tool_child", None)),
+            SessionEventWire::ChildProcess(ChildProcessEvent::Ended { tool_id: t, exit_code, .. }) if t == tool_id => {
+                Some(("tool_child_ended", *exit_code))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// `children` for one session, on a fresh control connection.
+#[cfg(unix)]
+async fn children_of(paths: &registry::DaemonPaths, sid: &SessionId) -> ChildListReply {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let (r, mut w) = agent_engine::ipc::split_client(agent_engine::ipc::connect(&paths.sock).await.unwrap());
+    let mut r = BufReader::new(r);
+    let mut line = String::new();
+    w.write_all(encode_line(&ClientFrame::Hello(Hello::new(ClientKind::Test))).unwrap().as_bytes()).await.unwrap();
+    r.read_line(&mut line).await.unwrap();
+    line.clear();
+    let query = ClientFrame::Children { id: Some(1), session_id: Some(sid.clone()), sid: None, members: false };
+    w.write_all(encode_line(&query).unwrap().as_bytes()).await.unwrap();
+    r.read_line(&mut line).await.unwrap();
+    match decode_line::<DaemonFrame>(line.trim_end()).unwrap() {
+        DaemonFrame::ChildList(reply) => reply,
+        other => panic!("{other:?}"),
+    }
+}
+
+/// 4/4b across a reload: the child ledger is carried in the reload state,
+/// `features` is on the new image's Welcome, and each connection's optional
+/// events come from its own (new) Hello, never from state kept across the
+/// exec.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn reload_carries_the_child_ledger_and_takes_the_opt_in_from_each_new_hello() {
+    if !agent_engine::session::children::supported() {
+        return;
+    }
+    let guard = HomeGuard::new();
+    let bodies: &'static [&'static str] = Box::leak(Box::new([
+        // The background sleep keeps the record's sid alive, so no sweep
+        // drops the ended record before the reload carries it.
+        bash_round("toolu_r1", "sleep 20 >/dev/null 2>&1 & exit 6"),
+        ANTHROPIC_SSE,
+        bash_round("toolu_r2", "exit 7"),
+        ANTHROPIC_SSE,
+    ]));
+    let (url, _hits, _) = spawn_stub(Script::SeqSse(bodies)).await;
+    let d = spawn_daemon(&guard, &url).await;
+    let features = |w: &Welcome| ["children", "thinking_options"].iter().all(|f| w.features.iter().any(|g| g == f));
+
+    let hello = Hello::new(ClientKind::Test).with_accepted_events(["tool_child_ended"]);
+    let conn = SocketTransport::connect(&d.paths.sock, hello).await.unwrap();
+    let config = SessionConfig {
+        cwd: Some(guard.home.path().to_path_buf()),
+        model_override: Some("claude-sonnet-4-5".into()),
+        ..Default::default()
+    };
+    let (mut t, _) = SocketTransport::attach(conn, Attach::Create { config, mode: AttachMode::Mirror }).await.unwrap();
+    assert!(features(&t.welcome), "{:?}", t.welcome.features);
+    assert_eq!(t.welcome.accepted_events, ["tool_child_ended"]);
+    let sid = t.session_id().clone();
+    t.send_from_self(SessionCommand::Submit { text: "run".into(), attachments: vec![] }).await.unwrap();
+    assert_eq!(child_events(&until_idle(&mut t).await, "toolu_r1"), [("tool_child_ended", Some(6))], "only what it asked for");
+    let before = children_of(&d.paths, &sid).await;
+    let carried = before.sessions[0].children.iter().find(|c| c.tool_id == "toolu_r1").expect("recorded").clone();
+
+    assert_eq!(SocketTransport::reload(&d.paths.sock, true, None, None).await.expect("reload accepted"), 2);
+    while tokio::time::timeout(Duration::from_secs(10), t.next_event()).await.expect("announce").is_some() {}
+    tokio::time::timeout(Duration::from_secs(15), t.reconnect(AttachMode::Mirror)).await.expect("budget").expect("reconnected");
+    assert_eq!(t.welcome.generation, 2);
+    assert!(features(&t.welcome), "features after the reload: {:?}", t.welcome.features);
+    assert_eq!(t.welcome.accepted_events, ["tool_child_ended"], "from the re-sent Hello");
+
+    // The ledger came across.
+    let after = children_of(&d.paths, &sid).await;
+    let entry = after.sessions[0].children.iter().find(|c| c.tool_id == "toolu_r1").expect("carried across the reload");
+    assert_eq!((&entry.child, entry.state, entry.exit_code), (&carried.child, carried.state, Some(6)));
+
+    // New connections on the new image: the list each one names, nothing kept.
+    let mut joined = Vec::new();
+    for names in [&[][..], &["tool_child", "tool_child_ended"][..]] {
+        let conn = SocketTransport::connect(&d.paths.sock, Hello::new(ClientKind::Test).with_accepted_events(names.iter().copied()))
+            .await
+            .unwrap();
+        assert!(features(&conn.welcome));
+        assert_eq!(conn.welcome.accepted_events, names);
+        let (c, _) = SocketTransport::attach(conn, Attach::Existing { session_id: sid.clone(), mode: AttachMode::Mirror }).await.unwrap();
+        joined.push(c);
+    }
+    t.send_from_self(SessionCommand::Submit { text: "again".into(), attachments: vec![] }).await.unwrap();
+    assert_eq!(child_events(&until_idle(&mut t).await, "toolu_r2"), [("tool_child_ended", Some(7))]);
+    assert!(child_events(&until_idle(&mut joined[0]).await, "toolu_r2").is_empty(), "asked for none");
+    assert_eq!(
+        child_events(&until_idle(&mut joined[1]).await, "toolu_r2"),
+        [("tool_child", None), ("tool_child_ended", Some(7))]
+    );
+
+    for c in &joined {
+        c.detach().await;
+    }
+    t.detach().await;
+    SocketTransport::shutdown(&d.paths.sock, false).await.unwrap();
+}
+
+/// The session cards in the daemon's runtime directory, by session id.
+#[cfg(target_os = "linux")]
+fn session_cards(run: &Path) -> std::collections::BTreeMap<String, serde_json::Value> {
+    let mut cards = std::collections::BTreeMap::new();
+    for entry in std::fs::read_dir(run).unwrap().flatten() {
+        let path = entry.path();
+        if path.extension() != Some(std::ffi::OsStr::new("json")) {
+            continue;
+        }
+        let Ok(card) = serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(&path).unwrap_or_default()) else {
+            continue;
+        };
+        if card["kind"] == "session" {
+            cards.insert(card["session_id"].as_str().unwrap_or_default().to_string(), card);
+        }
+    }
+    cards
+}
+
+/// The start time of process `pid` (field 22 of its /proc stat), read here
+/// rather than through the code under test.
+#[cfg(target_os = "linux")]
+fn start_ticks_of(pid: u32) -> u64 {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+    let after_comm = &stat[stat.rfind(')').unwrap() + 1..];
+    after_comm.split_whitespace().nth(19).unwrap().parse().unwrap()
+}
+
+/// Every session a reload carries is re-registered by the new image, so
+/// each card advertises the receipt protocol and its process's start time,
+/// even if the image before it wrote cards without them (simulated here by
+/// removing both).
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn reload_rewrites_every_carried_session_card_with_receipts_and_start_ticks() {
+    let guard = HomeGuard::new();
+    let run = guard.base_dir().join("run");
+    let (url, _hits, _) = spawn_stub(Script::Sse(ANTHROPIC_SSE)).await;
+    let d = spawn_daemon_env(&guard, &url, &[("SYNAPS_DAEMON_PARK_GRACE_SECS", "0")]).await;
+    let pid = d.child.id();
+    let start = start_ticks_of(pid);
+
+    // A stays Live (keep-warm); B parks.
+    let (mut a, _) = attach_create(&d.paths, guard.home.path()).await;
+    let a_id = a.session_id().to_string();
+    one_turn(&mut a, "hello").await;
+    a.send_from_self(SessionCommand::KeepWarm { on: true }).await.unwrap();
+    a.detach().await;
+    let (mut b, _) = attach_create(&d.paths, guard.home.path()).await;
+    let b_id = b.session_id().clone();
+    one_turn(&mut b, "park me").await;
+    b.detach().await;
+    assert!(wait_listed_lifecycle(&d.paths, &b_id, SessionLifecycle::Parked, Duration::from_secs(10)).await, "B parks");
+    let b_id = b_id.to_string();
+
+    // The image before this one wrote cards without either field.
+    let before = session_cards(&run);
+    assert!(before.contains_key(&a_id) && before.contains_key(&b_id), "{before:?}");
+    for (id, mut card) in before {
+        let card_fields = card.as_object_mut().unwrap();
+        card_fields.remove("receipts");
+        card_fields.remove("start_ticks");
+        std::fs::write(run.join(format!("{id}.json")), card.to_string()).unwrap();
+    }
+
+    let gen = SocketTransport::reload(&d.paths.sock, true, None, None).await.expect("reload accepted");
+    assert_eq!(gen, 2);
+    let t0 = std::time::Instant::now();
+    loop {
+        let cards = session_cards(&run);
+        let done = [&a_id, &b_id].iter().all(|id| {
+            cards.get(*id).is_some_and(|c| {
+                c["receipts"] == 1 && c["pid"] == pid && c["start_ticks"] == start
+            })
+        });
+        if done {
+            break;
+        }
+        assert!(
+            t0.elapsed() < Duration::from_secs(20),
+            "after the reload, not every carried session's card has the receipt flag and its process's start time ({start}): {cards:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(registry::read_daemon_json(&d.paths).unwrap().generation, 2);
     SocketTransport::shutdown(&d.paths.sock, true).await.unwrap();
 }

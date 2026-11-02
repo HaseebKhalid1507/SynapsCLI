@@ -372,6 +372,7 @@ impl agent_engine::Tool for ConfirmFixtureTool {
             Some(&handle),
             false,
             ctx.capabilities.session_allow_all.as_deref(),
+            None,
         )
         .await;
         Ok(match result {
@@ -426,6 +427,7 @@ impl agent_engine::Tool for RewrittenConfirmFixtureTool {
             Some(&handle),
             false,
             ctx.capabilities.session_allow_all.as_deref(),
+            None,
         )
         .await;
         Ok(match result {

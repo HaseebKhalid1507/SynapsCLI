@@ -91,11 +91,17 @@ fn sse_text_then_tool(text: &str, id: &str, name: &str, input: &str) -> &'static
     )
 }
 
-/// A started reply whose usage (`message_delta`) arrives between its text
-/// deltas: "A", then usage, then "B" and "C", and no terminal event. With a
-/// tiny `max_session_cost` the actor cancels on that usage from INSIDE its
-/// stream handler, so "B" and "C" can only reach it through the cancel's
-/// drain — deterministically, whether they are already queued or not.
+/// A started reply whose usage arrives between its text deltas: "A", then
+/// the counted `message_delta` and `message_stop`, then "B" and "C", and no
+/// end of stream. A native stream sends its one root Usage at
+/// `message_stop` (from its last counted delta), and the parser reads on
+/// after it, so the actor sees "A", the Usage, "B", "C" in that order. Real
+/// streams put `message_delta`/`message_stop` after the last content block;
+/// this order is synthetic, kept so that the cancel comes from inside the
+/// stream with text queued behind it. With a tiny `max_session_cost` the
+/// actor cancels on that usage from INSIDE its stream handler, so "B" and
+/// "C" can only reach it through the cancel's drain — deterministically,
+/// whether they are already queued or not.
 const SSE_TEXT_USAGE_TEXT: &str = concat!(
     "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_utu\",\"type\":\"message\",",
     "\"role\":\"assistant\",\"content\":[],\"model\":\"claude-sonnet-4-5\",\"stop_reason\":null,",
@@ -108,6 +114,7 @@ const SSE_TEXT_USAGE_TEXT: &str = concat!(
     "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":null,",
     "\"stop_sequence\":null},\"usage\":{\"input_tokens\":10,\"output_tokens\":5,",
     "\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0}}\n\n",
+    "data: {\"type\":\"message_stop\"}\n\n",
     "data: {\"type\":\"content_block_delta\",\"index\":0,",
     "\"delta\":{\"type\":\"text_delta\",\"text\":\"B\"}}\n\n",
     "data: {\"type\":\"content_block_delta\",\"index\":0,",
@@ -1073,6 +1080,8 @@ async fn a_tool_cut_by_a_reload_says_so_not_by_user() {
     .await;
     a.send(SessionCommand::Checkpoint {
         reason: CheckpointReason::Reload,
+        deadline: None,
+        skip_quiesce_grace: false,
     })
     .await
     .unwrap();

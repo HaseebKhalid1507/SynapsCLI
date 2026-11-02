@@ -10,11 +10,31 @@ pub mod actor;
 pub mod actor_cmds;
 pub mod budgets;
 pub mod cache_keepwarm;
+mod actor_capacity;
+mod actor_held;
+pub mod capacity_resume;
+pub mod child_events;
+mod child_spend;
+/// Test-only controls of the actor's child-spend passes (`cfg(test)` / the
+/// `testing` feature).
+#[cfg(any(test, feature = "testing"))]
+pub use child_spend::testing as child_spend_testing;
+pub mod children;
 pub mod client_args;
+pub mod client_tools;
+mod actor_client_tools;
 pub mod display;
 pub mod driver;
+pub mod fork;
 pub mod handle;
+pub mod held;
+pub mod held_store;
+pub mod live;
 mod persister;
+/// Test-only counts of the actor's queued saves (`cfg(test)` / the
+/// `testing` feature).
+#[cfg(any(test, feature = "testing"))]
+pub use persister::testing as persister_testing;
 pub(crate) mod session_start;
 /// Test-only controls of `on_session_start` scheduling (`cfg(test)` / the
 /// `testing` feature).

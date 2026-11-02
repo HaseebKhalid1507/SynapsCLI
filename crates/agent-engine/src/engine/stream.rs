@@ -232,7 +232,7 @@ pub fn process_stream_event_with_terminal_capture(
             EngineStreamEvent::ToolResultDelta { tool_id, delta },
             StreamCompletion::Continue,
         ),
-        StreamEvent::Llm(LlmEvent::ToolResult { result, tool_id }) => (
+        StreamEvent::Llm(LlmEvent::ToolResult { result, tool_id, .. }) => (
             EngineStreamEvent::ToolResult { tool_id, result },
             StreamCompletion::Continue,
         ),
@@ -379,6 +379,24 @@ pub fn process_stream_event_with_terminal_capture(
             // line, never recorded into message history.
             (EngineStreamEvent::Notice(text), StreamCompletion::Continue)
         }
+        // A run's request-ledger events are host-internal: a ledgered
+        // attempt's usage is the plain `Usage` it stands in for; a liability
+        // is nothing to show. Only a runtime with a request ledger (a worker
+        // run) emits them.
+        StreamEvent::Session(
+            event @ (SessionEvent::UsageAttempt { .. } | SessionEvent::UsageLiability { .. }),
+        ) => match event.for_clients() {
+            Some(plain) => process_stream_event_with_terminal_capture(
+                StreamEvent::Session(plain),
+                messages,
+                subagents,
+                queued_message,
+                pending_events,
+                turn_baseline,
+                terminal_capture,
+            ),
+            None => (EngineStreamEvent::Noop, StreamCompletion::Continue),
+        },
         StreamEvent::Session(SessionEvent::Error(err)) => {
             subagents.clear();
             // Repair history: remove only invalid messages appended by the
@@ -444,6 +462,60 @@ mod tests {
         );
         assert!(matches!(event, EngineStreamEvent::Done));
         assert!(matches!(completion, StreamCompletion::Done));
+    }
+
+    /// A run's request-ledger events: a ledgered attempt's usage is shown as
+    /// the plain usage it stands in for; a liability shows nothing.
+    #[test]
+    fn ledger_events_are_shown_as_their_plain_usage_or_not_at_all() {
+        let mut messages = Vec::new();
+        let mut subagents = Vec::new();
+        let mut queued = None;
+        let mut pending = Vec::new();
+        let request = agent_core::UsageRequest {
+            request_id: "req-1".into(),
+            purpose: agent_core::UsagePurpose::Conversation,
+            model: "provider/model-b".into(),
+        };
+        let (event, completion) = process_stream_event(
+            StreamEvent::Session(SessionEvent::UsageAttempt {
+                request: request.clone(),
+                usage: agent_core::UsageCounts {
+                    input_tokens: 7,
+                    output_tokens: 3,
+                    ..Default::default()
+                },
+            }),
+            &mut messages,
+            &mut subagents,
+            &mut queued,
+            &mut pending,
+            0,
+        );
+        match event {
+            EngineStreamEvent::Usage {
+                input_tokens: 7,
+                output_tokens: 3,
+                model: Some(model),
+                ..
+            } => assert_eq!(model, "provider/model-b"),
+            other => panic!("expected the plain usage, got {other:?}"),
+        }
+        assert!(matches!(completion, StreamCompletion::Continue));
+        let (event, completion) = process_stream_event(
+            StreamEvent::Session(SessionEvent::UsageLiability {
+                request,
+                estimate_micro_usd: 9,
+                state: agent_core::LiabilityState::Open,
+            }),
+            &mut messages,
+            &mut subagents,
+            &mut queued,
+            &mut pending,
+            0,
+        );
+        assert!(matches!(event, EngineStreamEvent::Noop));
+        assert!(matches!(completion, StreamCompletion::Continue));
     }
 
     /// T3 criterion 4: a pre-existing trailing user message (the prompt that

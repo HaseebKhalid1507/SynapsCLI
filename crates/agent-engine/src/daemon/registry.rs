@@ -414,15 +414,15 @@ impl Drop for SpawnLock {
 
 /// Liveness probe: try to take the lock; success means nobody holds it
 /// (dead or never started) — release immediately. Never unlinks anything.
+/// Opens the lock read-only and never creates it: flock needs no write
+/// access, and a session under a write sandbox may not open the lock
+/// read-write (it would then read a live daemon as dead).
 pub fn is_alive(paths: &DaemonPaths) -> bool {
-    if !paths.lock.exists() {
+    let Ok(file) = File::open(&paths.lock) else {
         return false;
-    }
-    match DaemonLock::try_acquire(paths) {
-        Ok(Some(_guard)) => false,
-        Ok(None) => true,
-        Err(_) => false,
-    }
+    };
+    // Taking the lock means nobody holds it; dropping `file` releases it.
+    matches!(FileExt::try_lock_exclusive(&file), Ok(false))
 }
 
 /// Remove only the daemon's two metadata files, while its lock is held.
@@ -474,6 +474,33 @@ mod tests {
         assert!(DaemonLock::try_acquire(&p).unwrap().is_none(), "second holder refused");
         drop(guard);
         assert!(!is_alive(&p));
+    }
+
+    /// Under a real Landlock domain that refuses every write (LOCAL kernel
+    /// only, opt in with SYNAPS_TEST_LANDLOCK=1): a held lock still reads as
+    /// a live daemon and a free one as dead. A read-write probe got EACCES
+    /// there and read every daemon as dead ("stale (pid dead)").
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn daemon_local_confined_probe_reads_the_lock() {
+        use crate::sandbox::landlock::{abi_version, run_confined, Ruleset, Tag, MIN_ABI};
+        if std::env::var("SYNAPS_TEST_LANDLOCK").as_deref() != Ok("1") {
+            return;
+        }
+        match abi_version() {
+            Ok(abi) if abi >= MIN_ABI => {}
+            other => panic!("SYNAPS_TEST_LANDLOCK=1 but Landlock is unusable here: {other:?}"),
+        }
+        let (_d, p) = paths();
+        assert!(!is_alive(&p));
+        assert!(!p.lock.exists(), "the probe creates no lock file");
+        let rs = Ruleset::new().expect("ruleset");
+        let probe = || run_confined(&rs, &Tag::next(), || is_alive(&p)).expect("confined thread");
+        let guard = DaemonLock::try_acquire(&p).unwrap().expect("holder");
+        assert!(probe(), "a held lock is a live daemon");
+        drop(guard);
+        assert!(!probe(), "a free lock is a dead daemon");
+        assert!(DaemonLock::try_acquire(&p).unwrap().is_some(), "the probe left the lock free");
     }
 
     #[test]

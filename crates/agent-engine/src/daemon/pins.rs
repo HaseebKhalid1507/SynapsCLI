@@ -414,7 +414,7 @@ pub async fn restore_all(state: Arc<DaemonState>) {
     if entries.is_empty() {
         return;
     }
-    state.restoring.store(true, Ordering::SeqCst);
+    state.pins_restoring.store(true, Ordering::SeqCst);
     tracing::info!(pins = entries.len(), "daemon: restoring pinned sessions");
     for entry in entries {
         if state.shutdown.is_cancelled() {
@@ -427,7 +427,7 @@ pub async fn restore_all(state: Arc<DaemonState>) {
             }
         }
     }
-    state.restoring.store(false, Ordering::SeqCst);
+    state.pins_restoring.store(false, Ordering::SeqCst);
 }
 
 /// `daemon pin` for a journal that is not live here: `--off` drops its

@@ -79,6 +79,11 @@ pub(crate) enum DaemonAction {
         /// Binary to exec (default: the one recorded in daemon.json).
         #[arg(long, value_name = "PATH")]
         exe: Option<PathBuf>,
+        /// Go ahead even when a worker's record is not durable or still
+        /// being written (those records are not preserved); every other
+        /// refusal stays.
+        #[arg(long)]
+        force: bool,
         #[arg(long)]
         json: bool,
     },
@@ -169,7 +174,7 @@ pub(crate) fn require_enabled(what: &str) -> Result<(), i32> {
     if daemon::enabled() {
         return Ok(());
     }
-    eprintln!("{what}: {}", daemon::DISABLED_NOTICE);
+    agent_core::eprintln_lossy!("{what}: {}", daemon::DISABLED_NOTICE);
     Err(EXIT_REFUSED)
 }
 
@@ -181,7 +186,9 @@ pub(crate) async fn run(profile: Option<String>, args: DaemonArgs) -> anyhow::Re
         Some(DaemonAction::Stop { force }) => stop(profile, force).await,
         Some(DaemonAction::Sessions { json }) => sessions(profile, json).await,
         Some(DaemonAction::Purge) => purge(profile).await,
-        Some(DaemonAction::Reload { now, drain_secs, exe, json }) => reload(profile, now, drain_secs, exe, json).await,
+        Some(DaemonAction::Reload { now, drain_secs, exe, force, json }) => {
+            reload(profile, now, drain_secs, exe, force, json).await
+        }
         Some(DaemonAction::Close { target, force, attached, json }) => close(profile, target, force, attached, json).await,
         Some(DaemonAction::Pin { target, off, json }) => pin(profile, target, !off, json).await,
         Some(DaemonAction::Rename { target, name, clear, force, json }) => {
@@ -573,6 +580,7 @@ async fn reload(
     now: bool,
     drain_secs: Option<u64>,
     exe: Option<PathBuf>,
+    force: bool,
     json: bool,
 ) -> anyhow::Result<()> {
     let paths = registry::daemon_paths(profile.as_deref());
@@ -583,9 +591,15 @@ async fn reload(
     let _ = SocketTransport::ping(&paths.sock).await;
     let before = registry::read_daemon_json(&paths);
     let exe = exe.map(|p| p.canonicalize().unwrap_or(p));
-    let outcome = SocketTransport::reload(&paths.sock, now, drain_secs, exe).await;
+    let outcome = SocketTransport::reload_with(&paths.sock, now, drain_secs, exe, force).await;
     match outcome {
-        Ok(gen) => {
+        Ok(reloaded) => {
+            let gen = reloaded.generation;
+            if !json {
+                if let Some(line) = daemon::reload::forced_line(&reloaded.waived) {
+                    eprintln!("{line}");
+                }
+            }
             // Wait for the new image to answer (≤ 15 s).
             let t0 = std::time::Instant::now();
             let mut pong = None;
@@ -598,19 +612,21 @@ async fn reload(
             }
             let after = registry::read_daemon_json(&paths);
             if json {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "ok": pong.is_some(),
-                        "pid": pong.as_ref().map(|p| p.pid),
-                        "generation": after.as_ref().map(|i| i.generation),
-                        "announced_generation": gen,
-                        "sessions": pong.as_ref().map(|p| p.sessions),
-                        "exe": after.as_ref().and_then(|i| i.exe.clone()),
-                        "previous_version": before.as_ref().map(|i| i.daemon_version.clone()),
-                        "version": after.as_ref().map(|i| i.daemon_version.clone()),
-                    })
-                );
+                let mut reply = serde_json::json!({
+                    "ok": pong.is_some(),
+                    "pid": pong.as_ref().map(|p| p.pid),
+                    "generation": after.as_ref().map(|i| i.generation),
+                    "announced_generation": gen,
+                    "sessions": pong.as_ref().map(|p| p.sessions),
+                    "exe": after.as_ref().and_then(|i| i.exe.clone()),
+                    "previous_version": before.as_ref().map(|i| i.daemon_version.clone()),
+                    "version": after.as_ref().map(|i| i.daemon_version.clone()),
+                });
+                // Only a forced reload that went ahead without some records.
+                if !reloaded.waived.is_empty() {
+                    reply["waived"] = serde_json::json!(reloaded.waived);
+                }
+                println!("{reply}");
             } else if let Some(p) = &pong {
                 println!(
                     "reloaded (pid {}, generation {}, sessions {})",
@@ -671,7 +687,9 @@ async fn start(profile: Option<String>, a: StartArgs) -> anyhow::Result<()> {
     match daemon::run_foreground(opts).await {
         Ok(()) => Ok(()),
         Err(e) => {
-            eprintln!("synaps daemon: {e}");
+            // The spawner reads this line as the failure reason; after the
+            // ready byte nobody may be reading, so it must not panic.
+            agent_core::eprintln_lossy!("synaps daemon: {e}");
             std::process::exit(EXIT_REFUSED);
         }
     }
@@ -720,6 +738,20 @@ async fn status(profile: Option<String>, json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `synaps daemon stop`: how long to wait for a clean stop (the daemon's
+/// worst case plus a margin) before reporting that it did not stop.
+const STOP_GRACE_SECS: u64 = agent_engine::session::budgets::DAEMON_STOP_WORST_CASE_SECS + 10;
+/// `--force`: no checkpoints, a running restore's stop (2 s), a 0.5 s
+/// session budget and the extension shutdown; then SIGTERM, then SIGKILL.
+const FORCE_STOP_GRACE_SECS: u64 = 10;
+const _: () = assert!(STOP_GRACE_SECS > agent_engine::session::budgets::DAEMON_STOP_WORST_CASE_SECS);
+const _: () = assert!(
+    FORCE_STOP_GRACE_SECS
+        > agent_engine::session::budgets::RESTORE_STOP_WAIT_SECS
+            + agent_engine::session::budgets::STOP_EXT_SHUTDOWN_SECS
+            + 1
+);
+
 async fn stop(profile: Option<String>, force: bool) -> anyhow::Result<()> {
     let paths = registry::daemon_paths(profile.as_deref());
     if !registry::is_alive(&paths) {
@@ -735,8 +767,10 @@ async fn stop(profile: Option<String>, force: bool) -> anyhow::Result<()> {
         Ok(()) => {}
         Err(e) => eprintln!("shutdown request failed: {e}"),
     }
-    // Wait for the flock to be released.
-    let grace = Duration::from_secs(if force { 10 } else { 30 });
+    // Wait for the flock to be released: a clean stop checkpoints every
+    // session for the crash record before the sessions end, so it can take
+    // up to `DAEMON_STOP_WORST_CASE_SECS`.
+    let grace = Duration::from_secs(if force { FORCE_STOP_GRACE_SECS } else { STOP_GRACE_SECS });
     let t0 = std::time::Instant::now();
     while registry::is_alive(&paths) {
         if t0.elapsed() > grace {
@@ -891,9 +925,10 @@ async fn sessions(profile: Option<String>, json: bool) -> anyhow::Result<()> {
                 "owner"
             };
             println!(
-                "{}  {:?}  {}{}  clients={}  {owner_key}={}  model={}  cwd={}  created={}{}{}{}",
+                "{}  {:?}{}  {}{}  clients={}  {owner_key}={}  model={}  cwd={}  created={}{}{}{}",
                 m.id,
                 m.lifecycle,
+                if m.restoring { " (restoring)" } else { "" },
                 state_phrase(&m, now),
                 if m.pinned { "  pinned" } else { "" },
                 clients_field(&m),

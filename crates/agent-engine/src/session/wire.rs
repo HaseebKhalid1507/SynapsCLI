@@ -131,6 +131,12 @@ pub enum ClientFrame {
         drain_secs: Option<u64>,
         #[serde(default)]
         exe: Option<PathBuf>,
+        /// Go ahead without the records of workers the reload's check
+        /// finds not durable or still being written (spec §5); every other
+        /// refusal stays. Omitted when false, so the frame is unchanged for
+        /// a normal reload; an older daemon ignores it.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        force: bool,
     },
     /// Control fast path: `memstat::purge_arenas()` in the daemon (bench
     /// hygiene). Reply: `Pong`. (C2)
@@ -174,6 +180,38 @@ pub enum ClientFrame {
         #[serde(default, deserialize_with = "present_option", skip_serializing_if = "Option::is_none")]
         expect: Option<Option<String>>,
     },
+    /// Control query (no session, also on an attached connection): the
+    /// daemon's child-process ledger. Reply: `ChildList`. Feature "children".
+    Children {
+        /// Echoed in the reply.
+        #[serde(default)]
+        id: Option<u64>,
+        /// One session's records; `None` = every session plus the host list.
+        #[serde(default)]
+        session_id: Option<SessionId>,
+        /// Only records whose `child.sid` equals this (filters, attributes nothing).
+        #[serde(default)]
+        sid: Option<u32>,
+        /// Also scan `/proc` for the live processes in each record's sid.
+        #[serde(default)]
+        members: bool,
+    },
+    /// Control query (no session, also on an attached connection): the
+    /// thinking levels this daemon would offer for `model`. Reply:
+    /// `ThinkingOptionsResult`. Feature "thinking_options".
+    ThinkingOptions {
+        /// Echoed in the reply.
+        #[serde(default)]
+        id: Option<u64>,
+        /// `None` = the model a new session on this daemon gets (the config
+        /// as of the last boot or reload; the reply echoes the resolved id).
+        #[serde(default)]
+        model: Option<String>,
+        /// Opt-in: first run the bounded Muse catalog warm-up for a `muse/`
+        /// id with no live row (the reply then comes from a task).
+        #[serde(default)]
+        warm: bool,
+    },
     /// Control fast path (no session): the in-memory account state of the
     /// broker every session of this daemon shares (`synaps auth state`),
     /// cleared first when `clear` is set. Reply: `AuthState`. A daemon that
@@ -191,6 +229,32 @@ pub enum ClientFrame {
     ReloadExtension {
         extension: String,
     },
+    /// Control query (no session, also on an attached connection): the
+    /// model picker's Favorites view as this daemon sees it (its config,
+    /// broker, extensions and the live catalogs it already holds). Reads
+    /// only: no catalog fetch, no token refresh. Reply:
+    /// `ModelFavoritesResult` (match it by `id`). Feature
+    /// "model_favorites"; an older daemon answers `Error` "malformed frame:
+    /// unknown variant `model_favorites`, ..." and keeps the connection.
+    ModelFavorites {
+        /// Echoed in the reply.
+        #[serde(default)]
+        id: Option<u64>,
+    },
+    /// Control query (no session, also on an attached connection): the
+    /// sandbox state this daemon would apply to session `session` now, from
+    /// the same read and validation its spawns make, against the daemon's
+    /// own base dir (a session that never spawned included). Reads only; logs
+    /// nothing. Reply: `SandboxStatusResult` (match it by `id`). Feature
+    /// "sandbox_status"; an older daemon answers `Error` "malformed frame:
+    /// unknown variant `sandbox_status`, ..." and keeps the connection.
+    SandboxStatus {
+        /// Echoed in the reply.
+        #[serde(default)]
+        id: Option<u64>,
+        /// The session (journal) id whose policy file to read.
+        session: String,
+    },
     Bye,
 }
 
@@ -207,11 +271,12 @@ impl std::fmt::Debug for ClientFrame {
             Self::Cmd { session_id, cmd } => {
                 f.debug_struct("Cmd").field("session_id", session_id).field("cmd", cmd).finish()
             }
-            Self::Reload { now, drain_secs, exe } => f
+            Self::Reload { now, drain_secs, exe, force } => f
                 .debug_struct("Reload")
                 .field("now", now)
                 .field("drain_secs", drain_secs)
                 .field("exe", exe)
+                .field("force", force)
                 .finish(),
             Self::Purge => f.write_str("Purge"),
             Self::Close { session_id, force, attached } => f
@@ -236,6 +301,23 @@ impl std::fmt::Debug for ClientFrame {
                 .debug_struct("ReloadExtension")
                 .field("extension", extension)
                 .finish(),
+            Self::Children { id, session_id, sid, members } => f
+                .debug_struct("Children")
+                .field("id", id)
+                .field("session_id", session_id)
+                .field("sid", sid)
+                .field("members", members)
+                .finish(),
+            Self::ThinkingOptions { id, model, warm } => f
+                .debug_struct("ThinkingOptions")
+                .field("id", id)
+                .field("model", model)
+                .field("warm", warm)
+                .finish(),
+            Self::ModelFavorites { id } => f.debug_struct("ModelFavorites").field("id", id).finish(),
+            Self::SandboxStatus { id, session } => {
+                f.debug_struct("SandboxStatus").field("id", id).field("session", session).finish()
+            }
             Self::Bye => f.write_str("Bye"),
         }
     }
@@ -259,6 +341,12 @@ pub struct Hello {
     /// Set when re-connecting after `Reloading`/EOF (C3/A4).
     #[serde(default)]
     pub reconnect_of: Option<ClientReconnect>,
+    /// Optional event kinds this connection wants, one name per kind
+    /// ([`OPTIONAL_EVENTS`]). Unknown names are ignored; an optional event
+    /// not listed here is never sent on this connection. Legacy frames
+    /// decode as empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accepted_events: Vec<String>,
 }
 
 /// Who this connection used to be, so the daemon can restore ownership by
@@ -285,12 +373,23 @@ impl Hello {
             env: Some(env),
             env_stripped,
             reconnect_of: None,
+            accepted_events: Vec::new(),
         }
     }
 
     /// Ask to be called `name` in the session ([`ClientMeta::name`]).
     pub fn with_name(mut self, name: Option<String>) -> Self {
         self.client.name = name;
+        self
+    }
+
+    /// Opt in to optional event kinds by name (see [`OPTIONAL_EVENTS`]).
+    pub fn with_accepted_events<I, S>(mut self, names: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.accepted_events = names.into_iter().map(Into::into).collect();
         self
     }
 
@@ -309,7 +408,9 @@ impl Hello {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "attach", rename_all = "snake_case")]
-#[allow(clippy::large_enum_variant)] // one-shot handshake payload; Create carries the full config
+// One frame per attach, decoded once; `Create` carries the session's whole
+// config by design (it grew past the lint with `restore_parked_since`).
+#[allow(clippy::large_enum_variant)]
 pub enum Attach {
     Existing {
         session_id: SessionId,
@@ -408,17 +509,144 @@ pub enum DaemonFrame {
         #[serde(default)]
         reason: Option<ByeReason>,
     },
+    /// Answer to `Children`. Only sent on request, so an old client (whose
+    /// `DaemonFrame` has no catch-all) never receives one.
+    ChildList(ChildListReply),
+    /// Answer to `ThinkingOptions`. Only sent on request.
+    ThinkingOptionsResult {
+        #[serde(default)]
+        id: Option<u64>,
+        /// The id asked about (the resolved one when the query had none).
+        model: String,
+        /// `None` for a malformed id.
+        options: Option<ThinkingOptionsWire>,
+    },
     /// Reply to `ClientFrame::AuthState`. Labels, kinds and times only:
     /// never token material, emails, account ids or identity hashes.
     AuthState {
         report: agent_core::auth::AuthStateReport,
     },
+    /// Answer to `SandboxStatus`. Only sent on request.
+    SandboxStatusResult(SandboxStatusReply),
+    /// Answer to `ModelFavorites`. Only sent on request.
+    ModelFavoritesResult {
+        #[serde(default)]
+        id: Option<u64>,
+        /// The favorites of every usable provider, in the picker's order.
+        models: Vec<crate::model_picker::FavoriteModel>,
+        /// True when the plugin rows are final: no extension discovery was
+        /// running and the extension manager was read in time. False while
+        /// discovery runs, or when the manager stayed busy past the bound
+        /// (then `models` has no plugin rows).
+        plugins_loaded: bool,
+        /// Usable providers whose rows came from a live catalog this daemon
+        /// already held; every other provider's rows are its static seeds.
+        #[serde(default)]
+        live_providers: Vec<String>,
+    },
+}
+
+/// The levels a model offers, with the evidence behind them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ThinkingOptionsWire {
+    /// Canonical level names, in the order the settings UI shows them.
+    pub levels: Vec<String>,
+    /// True when an exact row decided (`basis` live or static).
+    pub exact: bool,
+    pub basis: crate::runtime::openai::catalog::validation::OptionsBasis,
+    /// The level a model switch applies when none was chosen, if any.
+    #[serde(default)]
+    pub default_level: Option<String>,
+}
+
+/// The `sandbox_status_result` reply: what the daemon would apply to one
+/// session now. Never a path, the policy's contact sentence or its text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SandboxStatusReply {
+    #[serde(default)]
+    pub id: Option<u64>,
+    /// The session asked about, as asked.
+    pub session: String,
+    /// `none` (no policy file: unsandboxed), `off` (`mode = off`), `enforce`,
+    /// or `invalid` (the file can't be read, parsed or validated: every
+    /// spawn is refused), or `unavailable` (`mode = enforce` on an OS without
+    /// Landlock: every spawn is refused). Read even while the kill switch is
+    /// present.
+    pub state: String,
+    /// `<base>/sandbox/OFF` exists: every sandbox is off, whatever `state` says.
+    pub kill_switch: bool,
+    /// `open` or `confined` (`tools = confined`; an `invalid` file that has
+    /// that line stays confined).
+    pub tools: String,
+    /// First 16 hex digits of the file's SHA-256 (as in `sandbox.policy`);
+    /// `None` for `none` and `invalid`.
+    pub policy_hash: Option<String>,
+    /// Rules as applied, the baseline included (0 for `none` and `invalid`).
+    pub rules: usize,
+    /// Paths skipped because they don't exist.
+    pub skipped: usize,
+    /// The usable Landlock ABI on this host; `None` when unavailable.
+    pub abi: Option<u32>,
+}
+
+/// The `child_list` reply: the ledger view plus what a client needs to
+/// compare identities (`boot_id`) and display start times (`clk_tck`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChildListReply {
+    #[serde(default)]
+    pub id: Option<u64>,
+    /// False off Linux and macOS (or without a boot key): no records are
+    /// kept.
+    pub supported: bool,
+    /// The Linux boot id, for older clients; `None` elsewhere
+    /// (`host_instance` names any platform's boot).
+    #[serde(default)]
+    pub boot_id: Option<String>,
+    pub clk_tck: u64,
+    #[serde(default)]
+    pub sessions: Vec<super::children::SessionChildren>,
+    #[serde(default)]
+    pub host: Vec<super::children::HostChild>,
+    /// Records refused at a cap since this daemon image started (live spawns
+    /// and records carried across a reload).
+    #[serde(default)]
+    pub refused_records: u64,
+    /// At reply time the total cap is reached with no ended record left to
+    /// evict: the next spawn's record will be refused.
+    #[serde(default)]
+    pub ledger_full: bool,
+    /// This host's boot, tagged by platform (`{"kind":"linux","boot_id":…}`
+    /// or `{"kind":"darwin","boot_session":…}`),
+    /// which every listed `instance` is in. Absent when unsupported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_instance: Option<crate::proc_identity::BootKey>,
+}
+
+/// A worker whose record a forced reload went ahead without (spec §5).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WaivedWorker {
+    /// The worker's handle (`sa_3`).
+    pub worker: String,
+    /// The conversation that launched it, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
+    /// Why its record was not durable: `publishing`, `starting` or
+    /// `unresolved`.
+    pub why: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "bye", rename_all = "snake_case")]
 pub enum ByeReason {
-    Reloading { generation: u64, retry_after_ms: u64 },
+    Reloading {
+        generation: u64,
+        retry_after_ms: u64,
+        /// To the client that asked for a forced reload: the workers whose
+        /// records it went ahead without. Omitted when empty (every other
+        /// `Bye`), so the frame is unchanged; an older client ignores it.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        waived: Vec<WaivedWorker>,
+    },
     Shutdown,
     Detached,
 }
@@ -523,6 +751,85 @@ pub struct Welcome {
     /// semver the reload gate parses.
     #[serde(default)]
     pub daemon_build: String,
+    /// Optional control frames this daemon answers ("children", ...), on
+    /// every Welcome including the ones after a reload. Old daemons omit it.
+    #[serde(default)]
+    pub features: Vec<String>,
+    /// The optional events this daemon will send on this connection: the
+    /// known subset of `Hello.accepted_events`, in [`OPTIONAL_EVENTS`] order.
+    /// Omitted when empty (and by old daemons).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accepted_events: Vec<String>,
+    /// Canonical absolute path of the config file this daemon image read at
+    /// start, in the form `synaps config set --json` reports as "path".
+    /// Omitted by older daemons: unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_path: Option<String>,
+    /// The memory backend this daemon image bound at start: "axel",
+    /// "legacy" or "unavailable". Selection, not health: the Axel service is
+    /// spawned per operation. Omitted by older daemons: unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_backend: Option<String>,
+}
+
+/// Event kinds sent only to connections that name them in
+/// `Hello.accepted_events`: one name per kind, no groups. Every other event
+/// goes to every attached client as before, so an old client (which shows
+/// an unknown event as "unknown event from a newer daemon") never sees one.
+pub const OPTIONAL_EVENTS: &[&str] = &[EVENT_TOOL_CHILD, EVENT_TOOL_CHILD_ENDED, EVENT_CHILD_SPEND, "ephemeral_layer_changed"];
+
+/// A tool spawned a child process.
+pub const EVENT_TOOL_CHILD: &str = "tool_child";
+/// A tool's spawned child was reaped.
+pub const EVENT_TOOL_CHILD_ENDED: &str = "tool_child_ended";
+/// A subagent's paid request was booked (child spend). The same name covers
+/// `child_spend_lagged`, which only an opted-in connection can need.
+pub const EVENT_CHILD_SPEND: &str = "child_spend";
+
+/// The opt-in name of an optional event kind; `None` = always sent.
+pub fn optional_event_name(event: &SessionEventWire) -> Option<&'static str> {
+    use super::child_events::ChildProcessEvent;
+    match event {
+        SessionEventWire::EphemeralLayerChanged { .. } => Some("ephemeral_layer_changed"),
+        SessionEventWire::ChildProcess(ChildProcessEvent::Spawned(_)) => Some(EVENT_TOOL_CHILD),
+        SessionEventWire::ChildProcess(ChildProcessEvent::Ended { .. }) => Some(EVENT_TOOL_CHILD_ENDED),
+        SessionEventWire::ChildSpend(_) | SessionEventWire::ChildSpendLagged { .. } => Some(EVENT_CHILD_SPEND),
+        _ => None,
+    }
+}
+
+/// The optional events one connection gets, negotiated from its Hello.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AcceptedEvents(Vec<&'static str>);
+
+impl AcceptedEvents {
+    pub fn negotiate(requested: &[String]) -> Self {
+        Self::from_known(requested, OPTIONAL_EVENTS)
+    }
+
+    /// What was asked for and is known, in `known` order, once each.
+    fn from_known(requested: &[String], known: &[&'static str]) -> Self {
+        Self(known.iter().copied().filter(|k| requested.iter().any(|r| r == k)).collect())
+    }
+
+    /// The Welcome echo.
+    pub fn names(&self) -> Vec<String> {
+        self.0.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    fn allows_name(&self, name: Option<&str>) -> bool {
+        name.is_none_or(|n| self.0.contains(&n))
+    }
+
+    /// Whether this connection accepted the optional kind `name`.
+    pub fn accepts(&self, name: &str) -> bool {
+        self.0.contains(&name)
+    }
+
+    /// Whether `event` may be sent on this connection.
+    pub fn allows(&self, event: &SessionEventWire) -> bool {
+        self.allows_name(optional_event_name(event))
+    }
 }
 
 fn one() -> u64 {
@@ -537,14 +844,20 @@ pub struct WireEnvelope {
     pub event: WireSessionEvent,
 }
 
-impl From<Envelope> for WireEnvelope {
-    fn from(e: Envelope) -> Self {
-        Self {
+impl WireEnvelope {
+    /// The frame a client receives for `e`, or `None` when its event has no
+    /// client form ([`WireSessionEvent::for_client`]). This is the only
+    /// conversion from host envelopes to the wire, so a host-internal event
+    /// never becomes a frame. The actor's `emit` (its only `seq` site) drops
+    /// such events before it numbers an envelope, so every envelope the actor
+    /// emits converts and the frames' `seq`s stay gapless.
+    pub fn for_client(e: Envelope) -> Option<Self> {
+        Some(Self {
             session_id: e.session_id,
             seq: e.seq,
             ts: e.ts,
-            event: e.event.into(),
-        }
+            event: WireSessionEvent::for_client(e.event)?,
+        })
     }
 }
 
@@ -580,6 +893,10 @@ pub struct AttachedWire {
     pub input_owner: Option<ClientId>,
     #[serde(default)]
     pub display_tail: Option<crate::session::display::DisplayTail>,
+    /// Client tool stamps of the history's tool results, by `tool_use_id`;
+    /// absent when there are none.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub client_tools: crate::session::types::ClientToolStamps,
 }
 
 impl AttachedWire {
@@ -590,13 +907,16 @@ impl AttachedWire {
             view: s.view,
             conversation: s.conversation,
             streaming: s.streaming,
-            replay: s.replay.into_iter().map(Into::into).collect(),
+            // The replay ring holds envelopes the actor emitted, which all
+            // have a client form (`WireEnvelope::for_client`).
+            replay: s.replay.into_iter().filter_map(WireEnvelope::for_client).collect(),
             pending_prompts: s.pending_prompts,
             clients: s.clients,
             roster: s.roster,
             client_input: s.client_input,
             input_owner: s.input_owner,
             display_tail: s.display_tail,
+            client_tools: s.client_tools,
         }
     }
 
@@ -615,6 +935,7 @@ impl AttachedWire {
                 client_input: self.client_input,
                 input_owner: self.input_owner,
                 display_tail: self.display_tail,
+                client_tools: self.client_tools,
             },
         )
     }
@@ -637,6 +958,12 @@ pub struct ConversationDigest {
     pub keepwarm_cost: f64,
     #[serde(default)]
     pub keepwarm_tokens: ConversationTokens,
+    #[serde(default)]
+    pub child_cost: f64,
+    #[serde(default)]
+    pub child_tokens: ConversationTokens,
+    #[serde(default)]
+    pub child_share_exact: bool,
     pub abort_context: Option<String>,
     pub queued_message: Option<String>,
     pub pending_events_len: usize,
@@ -672,6 +999,9 @@ impl ConversationDigest {
             cost: s.cost,
             keepwarm_cost: s.keepwarm_cost,
             keepwarm_tokens: s.keepwarm_tokens.clone(),
+            child_cost: s.child_cost,
+            child_tokens: s.child_tokens.clone(),
+            child_share_exact: s.child_share_exact,
             abort_context: s.abort_context.clone(),
             queued_message: s.queued_message.clone(),
             pending_events_len: s.pending_events_len,
@@ -693,6 +1023,9 @@ impl ConversationDigest {
             cost: self.cost,
             keepwarm_cost: self.keepwarm_cost,
             keepwarm_tokens: self.keepwarm_tokens,
+            child_cost: self.child_cost,
+            child_tokens: self.child_tokens,
+            child_share_exact: self.child_share_exact,
             abort_context: self.abort_context,
             queued_message: self.queued_message,
             pending_events_len: self.pending_events_len,
@@ -708,6 +1041,7 @@ impl ConversationDigest {
 #[serde(tag = "ev", rename_all = "snake_case")]
 #[allow(clippy::large_enum_variant)] // mirrors SessionEventWire by design
 pub enum WireSessionEvent {
+    EphemeralLayerChanged { status: crate::runtime::ephemeral::Status },
     Stream { event: WireStreamEvent },
     TurnStarted {
         turn_baseline: usize,
@@ -728,7 +1062,14 @@ pub enum WireSessionEvent {
     LoaderProgress { event: WireLoaderEvent },
     ExtensionNotification { extension_id: String, method: String, params: serde_json::Value },
     SettingChanged { applied: SettingApplied },
-    QueryResult { id: u64, value: serde_json::Value },
+    QueryResult {
+        id: u64,
+        value: serde_json::Value,
+        /// The `Messages` answer's client tool stamps by `tool_use_id`;
+        /// absent unless that history holds a client tool result.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_tools: Option<crate::session::types::ClientToolStamps>,
+    },
     Attached { client: ClientId, snapshot: AttachedWire },
     ClientJoined {
         client: ClientId,
@@ -797,6 +1138,55 @@ pub enum WireSessionEvent {
         cost: f64,
         cap: f64,
     },
+    /// A tool call spawned a child process (opt-in: `tool_child`).
+    ToolChild {
+        tool_id: String,
+        tool_name: String,
+        #[serde(default)]
+        handle_id: Option<String>,
+        #[serde(default)]
+        shell_session_id: Option<String>,
+        child: super::children::ChildIdentity,
+    },
+    /// A tool call's spawned child was reaped (opt-in: `tool_child_ended`).
+    ToolChildEnded {
+        tool_id: String,
+        #[serde(default)]
+        handle_id: Option<String>,
+        child: super::children::ChildIdentity,
+        #[serde(default)]
+        exit_code: Option<i32>,
+        #[serde(default)]
+        signal: Option<i32>,
+    },
+    /// A subagent's paid request was booked (opt-in: `child_spend`).
+    ChildSpend(ChildSpendEvent),
+    /// This connection lost `dropped` child_spend frames to lag (opt-in:
+    /// `child_spend`); envelope seq `u64::MAX`, right before the first frame
+    /// that survived.
+    ChildSpendLagged { dropped: u64 },
+    /// (S1) An event went to the held store instead of the context.
+    EventHeld { item: super::held::HeldItem },
+    /// (S1) The delivery mode or its lease changed.
+    DeliveryChanged {
+        mode: super::held::DeliveryMode,
+        lease_until_ms: Option<u64>,
+        reason: super::held::DeliveryReason,
+    },
+    /// (S1) Held items changed state.
+    HeldUpdated { ids: Vec<String>, state: super::held::HeldState },
+    /// A `fork` made `session_id`: sent only on the connection
+    /// of the client that asked.
+    Forked { session_id: String, label: String, message_count: usize },
+    /// Client tools v1 (`client_tools`): a registration reply or notice,
+    /// sent only on the connection of the client it names.
+    ClientTools(Box<super::client_tools::ClientToolsAck>),
+    /// Client tools v1 (`tool_invoke`): only on the installer's connection.
+    ToolInvoke(Box<super::client_tools::ToolInvokeFrame>),
+    /// Client tools v1 (`tool_cancel`): only on the installer's connection.
+    ToolCancel(super::client_tools::ToolCancelFrame),
+    /// Client tools v1 (`tool_return_ack`): only on the sender's connection.
+    ToolReturnAck(super::client_tools::ToolReturnAckFrame),
     /// Forward-compat: an additive variant from a newer daemon.
     #[serde(other)]
     Unknown,
@@ -818,7 +1208,19 @@ pub enum WireLlmEvent {
     ToolUseStart { tool_name: String, tool_id: String },
     ToolUseDelta { tool_id: String, delta: String },
     ToolUse { tool_name: String, tool_id: String, input: serde_json::Value },
-    ToolResult { tool_id: String, result: String },
+    ToolResult {
+        tool_id: String,
+        result: String,
+        /// The result is memory-only: `result` is the engine's fixed
+        /// placeholder, the raw text went to the model only (v1 sends no raw
+        /// text to clients). The typed flag of the engine's take; absent = false.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        memory_only: bool,
+        /// The client tool stamp when the result came from a client tool
+        /// (`register_client_tools`); absent for every other tool.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_tool: Option<Box<agent_core::ClientToolStamp>>,
+    },
     ToolResultDelta { tool_id: String, delta: String },
     ResponseStart,
     ResponseReset,
@@ -925,16 +1327,23 @@ impl From<WireLoaderEvent> for LoaderEvent {
     }
 }
 
-impl From<StreamEvent> for WireStreamEvent {
-    fn from(e: StreamEvent) -> Self {
-        match e {
+impl WireStreamEvent {
+    /// The client-wire form of a host stream event, or `None` when it has
+    /// none: a run's request-ledger liability
+    /// (`SessionEvent::UsageLiability`) is host-internal and never becomes
+    /// a frame. A ledgered attempt's usage has exactly the wire form of the
+    /// plain `Usage` it stands in for (`SessionEvent::for_clients`).
+    pub fn for_client(e: StreamEvent) -> Option<Self> {
+        Some(match e {
             StreamEvent::Llm(l) => Self::Llm(match l {
                 LlmEvent::Thinking(text) => WireLlmEvent::Thinking { text },
                 LlmEvent::Text(text) => WireLlmEvent::Text { text },
                 LlmEvent::ToolUseStart { tool_name, tool_id } => WireLlmEvent::ToolUseStart { tool_name, tool_id },
                 LlmEvent::ToolUseDelta { tool_id, delta } => WireLlmEvent::ToolUseDelta { tool_id, delta },
                 LlmEvent::ToolUse { tool_name, tool_id, input } => WireLlmEvent::ToolUse { tool_name, tool_id, input },
-                LlmEvent::ToolResult { tool_id, result } => WireLlmEvent::ToolResult { tool_id, result },
+                LlmEvent::ToolResult { tool_id, result, memory_only, client_tool } => {
+                    WireLlmEvent::ToolResult { tool_id, result, memory_only, client_tool }
+                }
                 LlmEvent::ToolResultDelta { tool_id, delta } => WireLlmEvent::ToolResultDelta { tool_id, delta },
                 LlmEvent::ResponseStart => WireLlmEvent::ResponseStart,
                 LlmEvent::ResponseReset => WireLlmEvent::ResponseReset,
@@ -964,6 +1373,22 @@ impl From<StreamEvent> for WireStreamEvent {
                 SessionEvent::Error(TurnError { message, outcome }) => WireSessionStreamEvent::Error { message, outcome },
                 SessionEvent::Notice(text) => WireSessionStreamEvent::Notice { text, retry: false },
                 SessionEvent::Retry(text) => WireSessionStreamEvent::Notice { text, retry: true },
+                // A run's request-ledger events are host-internal: only a
+                // runtime with a request ledger (a worker run, consumed by its
+                // drive) emits them, and the actor normalizes every stream
+                // event (`SessionEvent::for_clients`) before it emits one. Were
+                // one converted anyway, a ledgered attempt's usage is the plain
+                // `Usage` it stands in for, and a liability has no frame.
+                SessionEvent::UsageAttempt { request, usage } => WireSessionStreamEvent::Usage {
+                    input_tokens: usage.input_tokens,
+                    output_tokens: usage.output_tokens,
+                    cache_read_input_tokens: usage.cache_read_input_tokens,
+                    cache_creation_input_tokens: usage.cache_creation_input_tokens,
+                    cache_creation_5m: usage.cache_creation_5m,
+                    cache_creation_1h: usage.cache_creation_1h,
+                    model: Some(request.model),
+                },
+                SessionEvent::UsageLiability { .. } => return None,
                 // merge(112): ContextHeadCheckpoint is actor-internal (Wall 1); never crosses the wire.
                 // Drop it silently — the actor handles persistence before forwarding.
                 SessionEvent::ContextHeadCheckpoint { .. } => WireSessionStreamEvent::Done,
@@ -980,7 +1405,7 @@ impl From<StreamEvent> for WireStreamEvent {
                 }
                 AgentEvent::SteeringDelivered { message } => WireAgentEvent::SteeringDelivered { message },
             }),
-        }
+        })
     }
 }
 
@@ -993,7 +1418,9 @@ impl From<WireStreamEvent> for StreamEvent {
                 WireLlmEvent::ToolUseStart { tool_name, tool_id } => LlmEvent::ToolUseStart { tool_name, tool_id },
                 WireLlmEvent::ToolUseDelta { tool_id, delta } => LlmEvent::ToolUseDelta { tool_id, delta },
                 WireLlmEvent::ToolUse { tool_name, tool_id, input } => LlmEvent::ToolUse { tool_name, tool_id, input },
-                WireLlmEvent::ToolResult { tool_id, result } => LlmEvent::ToolResult { tool_id, result },
+                WireLlmEvent::ToolResult { tool_id, result, memory_only, client_tool } => {
+                    LlmEvent::ToolResult { tool_id, result, memory_only, client_tool }
+                }
                 WireLlmEvent::ToolResultDelta { tool_id, delta } => LlmEvent::ToolResultDelta { tool_id, delta },
                 WireLlmEvent::ResponseStart => LlmEvent::ResponseStart,
                 WireLlmEvent::ResponseReset => LlmEvent::ResponseReset,
@@ -1040,11 +1467,14 @@ impl From<WireStreamEvent> for StreamEvent {
     }
 }
 
-impl From<SessionEventWire> for WireSessionEvent {
-    fn from(e: SessionEventWire) -> Self {
+impl WireSessionEvent {
+    /// The client-wire form of a session event, or `None` for a stream
+    /// event without one ([`WireStreamEvent::for_client`]).
+    pub fn for_client(e: SessionEventWire) -> Option<Self> {
         use SessionEventWire as S;
-        match e {
-            S::Stream(ev) => Self::Stream { event: ev.into() },
+        Some(match e {
+            S::EphemeralLayerChanged { status } => Self::EphemeralLayerChanged { status },
+            S::Stream(ev) => Self::Stream { event: WireStreamEvent::for_client(ev)? },
             S::TurnStarted { turn_baseline, trigger, user_text } => {
                 Self::TurnStarted { turn_baseline, trigger, user_text }
             }
@@ -1062,7 +1492,7 @@ impl From<SessionEventWire> for WireSessionEvent {
                 Self::ExtensionNotification { extension_id, method, params }
             }
             S::SettingChanged(applied) => Self::SettingChanged { applied },
-            S::QueryResult { id, value } => Self::QueryResult { id, value },
+            S::QueryResult { id, value, client_tools } => Self::QueryResult { id, value, client_tools },
             S::Attached { client, snapshot } => Self::Attached { client, snapshot: AttachedWire::new(client, snapshot) },
             S::ClientJoined { client, kind, name, mode } => Self::ClientJoined { client, kind, name, mode: Some(mode) },
             S::ClientLeft { client } => Self::ClientLeft { client },
@@ -1096,7 +1526,35 @@ impl From<SessionEventWire> for WireSessionEvent {
             S::CostCapReached { scope, cost, cap } => {
                 Self::CostCapReached { scope, cost, cap }
             }
-        }
+            S::ChildProcess(super::child_events::ChildProcessEvent::Spawned(spawn)) => Self::ToolChild {
+                tool_id: spawn.tool_id,
+                tool_name: spawn.tool_name,
+                handle_id: spawn.handle_id,
+                shell_session_id: spawn.shell_session_id,
+                child: spawn.child,
+            },
+            S::ChildProcess(super::child_events::ChildProcessEvent::Ended {
+                tool_id,
+                handle_id,
+                child,
+                exit_code,
+                signal,
+            }) => Self::ToolChildEnded { tool_id, handle_id, child, exit_code, signal },
+            S::ChildSpend(event) => Self::ChildSpend(event),
+            S::ChildSpendLagged { dropped } => Self::ChildSpendLagged { dropped },
+            S::EventHeld { item } => Self::EventHeld { item },
+            S::DeliveryChanged { mode, lease_until_ms, reason } => {
+                Self::DeliveryChanged { mode, lease_until_ms, reason }
+            }
+            S::HeldUpdated { ids, state } => Self::HeldUpdated { ids, state },
+            S::Forked { session_id, label, message_count, .. } => {
+                Self::Forked { session_id, label, message_count }
+            }
+            S::ClientTools { ack, .. } => Self::ClientTools(ack),
+            S::ToolInvoke { invoke, .. } => Self::ToolInvoke(invoke),
+            S::ToolCancel { cancel, .. } => Self::ToolCancel(cancel),
+            S::ToolReturnAck { ack, .. } => Self::ToolReturnAck(ack),
+        })
     }
 }
 
@@ -1123,8 +1581,9 @@ impl From<WireSessionEvent> for SessionEventWire {
             W::ExtensionNotification { extension_id, method, params } => {
                 Self::ExtensionNotification { extension_id, method, params }
             }
+            W::EphemeralLayerChanged { status } => Self::EphemeralLayerChanged { status },
             W::SettingChanged { applied } => Self::SettingChanged(applied),
-            W::QueryResult { id, value } => Self::QueryResult { id, value },
+            W::QueryResult { id, value, client_tools } => Self::QueryResult { id, value, client_tools },
             W::Attached { snapshot, .. } => {
                 let (client, snapshot) = snapshot.into_snapshot();
                 Self::Attached { client, snapshot }
@@ -1163,6 +1622,38 @@ impl From<WireSessionEvent> for SessionEventWire {
             W::CostCapReached { scope, cost, cap } => {
                 Self::CostCapReached { scope, cost, cap }
             }
+            W::ToolChild { tool_id, tool_name, handle_id, shell_session_id, child } => {
+                Self::ChildProcess(super::child_events::ChildProcessEvent::Spawned(super::children::ChildSpawn {
+                    tool_id,
+                    tool_name,
+                    handle_id,
+                    shell_session_id,
+                    child,
+                }))
+            }
+            W::ToolChildEnded { tool_id, handle_id, child, exit_code, signal } => {
+                Self::ChildProcess(super::child_events::ChildProcessEvent::Ended {
+                    tool_id,
+                    handle_id,
+                    child,
+                    exit_code,
+                    signal,
+                })
+            }
+            W::ChildSpend(event) => Self::ChildSpend(event),
+            W::ChildSpendLagged { dropped } => Self::ChildSpendLagged { dropped },
+            W::EventHeld { item } => Self::EventHeld { item },
+            W::DeliveryChanged { mode, lease_until_ms, reason } => {
+                Self::DeliveryChanged { mode, lease_until_ms, reason }
+            }
+            W::HeldUpdated { ids, state } => Self::HeldUpdated { ids, state },
+            W::Forked { session_id, label, message_count } => {
+                Self::Forked { client: None, session_id, label, message_count }
+            }
+            W::ClientTools(ack) => Self::ClientTools { client: None, ack },
+            W::ToolInvoke(invoke) => Self::ToolInvoke { client: None, invoke },
+            W::ToolCancel(cancel) => Self::ToolCancel { client: None, cancel },
+            W::ToolReturnAck(ack) => Self::ToolReturnAck { client: None, ack },
             W::Unknown => Self::SystemNotice("unknown event from a newer daemon (ignored)".into()),
         }
     }
@@ -1291,6 +1782,246 @@ mod tests {
         crate::session::handle::echo::meta_for(&SessionId::from("wire-1"))
     }
 
+    fn thinking_options_sample() -> DaemonFrame {
+        DaemonFrame::ThinkingOptionsResult {
+            id: Some(8),
+            model: "muse/muse-wonder-1.0".into(),
+            options: Some(ThinkingOptionsWire {
+                levels: ["adaptive", "low", "medium", "high", "xhigh"].map(String::from).to_vec(),
+                exact: true,
+                basis: crate::runtime::openai::catalog::validation::OptionsBasis::Live,
+                default_level: Some("high".into()),
+            }),
+        }
+    }
+
+    fn child_list_sample() -> ChildListReply {
+        use crate::proc_identity::{BootKey, InstanceKey};
+        use crate::session::children::*;
+        let instance = InstanceKey::Linux { boot_id: "b".into(), start_ticks: 26981650 };
+        let child =
+            ChildIdentity::new(3646188, 3646188, 3646188, instance);
+        let member_instance = Some(InstanceKey::Linux { boot_id: "b".into(), start_ticks: 26981702 });
+        ChildListReply {
+            id: Some(7),
+            supported: true,
+            boot_id: Some("b".into()),
+            clk_tck: 100,
+            sessions: vec![SessionChildren {
+                session_id: "s".into(),
+                truncated: false,
+                children: vec![ChildEntry {
+                    tool_id: "toolu_1".into(),
+                    tool_name: "bash".into(),
+                    handle_id: Some("sa_12".into()),
+                    shell_session_id: None,
+                    child: child.clone(),
+                    state: ChildState::Running,
+                    exit_code: None,
+                    signal: None,
+                    members: Some(vec![ChildMember { pid: 3646201, start_ticks: Some(26981702), instance: member_instance }]),
+                }],
+            }],
+            host: vec![HostChild { owner_kind: HostOwnerKind::McpServer, owner_id: "figma".into(), child }],
+            refused_records: 3,
+            ledger_full: true,
+            host_instance: Some(BootKey::Linux { boot_id: "b".into() }),
+        }
+    }
+
+    /// The child shapes as text, byte for byte: the `child_list` reply (a
+    /// supported one and the unsupported one) and the `tool_child` /
+    /// `tool_child_ended` events. The reads behind them moved (row 22); the
+    /// old fields' text did not. `instance` (on each child and member) and
+    /// `host_instance` (on a supported reply) only add to it.
+    #[test]
+    fn the_child_frames_are_pinned_as_text() {
+        use super::super::child_events::ChildProcessEvent;
+        use super::super::children::{ChildIdentity, ChildSpawn};
+        use crate::proc_identity::{BootKey, InstanceKey};
+        // The text as it was before `instance` and `host_instance` came.
+        let old_fields = |text: &str| {
+            [
+                r#","instance":{"kind":"linux","boot_id":"b","start_ticks":26981650}"#,
+                r#","instance":{"kind":"linux","boot_id":"b","start_ticks":26981702}"#,
+                r#","instance":{"kind":"linux","boot_id":"680bd989","start_ticks":26981644}"#,
+                r#","host_instance":{"kind":"linux","boot_id":"b"}"#,
+            ]
+            .iter()
+            .fold(text.to_string(), |text, added| text.replace(added, ""))
+        };
+        let listed = encode_line(&DaemonFrame::ChildList(child_list_sample())).unwrap();
+        assert_eq!(
+            listed,
+            concat!(
+                r#"{"type":"child_list","id":7,"supported":true,"boot_id":"b","clk_tck":100,"sessions":[{"#,
+                r#""session_id":"s","truncated":false,"children":[{"tool_id":"toolu_1","tool_name":"bash","#,
+                r#""handle_id":"sa_12","shell_session_id":null,"#,
+                r#""child":{"pid":3646188,"start_ticks":26981650,"boot_id":"b","sid":3646188,"pgid":3646188,"#,
+                r#""instance":{"kind":"linux","boot_id":"b","start_ticks":26981650}},"#,
+                r#""state":"running","exit_code":null,"signal":null,"#,
+                r#""members":[{"pid":3646201,"start_ticks":26981702,"#,
+                r#""instance":{"kind":"linux","boot_id":"b","start_ticks":26981702}}]}]}],"#,
+                r#""host":[{"owner_kind":"mcp_server","owner_id":"figma","#,
+                r#""child":{"pid":3646188,"start_ticks":26981650,"boot_id":"b","sid":3646188,"pgid":3646188,"#,
+                r#""instance":{"kind":"linux","boot_id":"b","start_ticks":26981650}}}],"#,
+                r#""refused_records":3,"ledger_full":true,"host_instance":{"kind":"linux","boot_id":"b"}}"#,
+                "\n"
+            )
+        );
+        assert_eq!(
+            old_fields(&listed),
+            concat!(
+                r#"{"type":"child_list","id":7,"supported":true,"boot_id":"b","clk_tck":100,"sessions":[{"#,
+                r#""session_id":"s","truncated":false,"children":[{"tool_id":"toolu_1","tool_name":"bash","#,
+                r#""handle_id":"sa_12","shell_session_id":null,"#,
+                r#""child":{"pid":3646188,"start_ticks":26981650,"boot_id":"b","sid":3646188,"pgid":3646188},"#,
+                r#""state":"running","exit_code":null,"signal":null,"#,
+                r#""members":[{"pid":3646201,"start_ticks":26981702}]}]}],"#,
+                r#""host":[{"owner_kind":"mcp_server","owner_id":"figma","#,
+                r#""child":{"pid":3646188,"start_ticks":26981650,"boot_id":"b","sid":3646188,"pgid":3646188}}],"#,
+                r#""refused_records":3,"ledger_full":true}"#,
+                "\n"
+            ),
+            "the old fields, byte for byte"
+        );
+        // An older daemon's reply (no `instance`, no `host_instance`) still
+        // decodes; each child gets the Linux key its fields name.
+        let old: DaemonFrame = decode_line(old_fields(&listed).trim_end()).unwrap();
+        let DaemonFrame::ChildList(old) = old else { panic!("not a child_list") };
+        let mut want = child_list_sample();
+        want.host_instance = None;
+        want.sessions[0].children[0].members.as_mut().unwrap()[0].instance = None;
+        assert_eq!(old, want);
+        // The Darwin forms, once a Darwin backend fills them.
+        let darwin = BootKey::Darwin { boot_session: "9F1C".into() };
+        assert_eq!(serde_json::to_string(&darwin).unwrap(), r#"{"kind":"darwin","boot_session":"9F1C"}"#);
+        let darwin = InstanceKey::Darwin { boot_session: "9F1C".into(), unique_id: 4_000_000_123 };
+        assert_eq!(
+            serde_json::to_string(&darwin).unwrap(),
+            r#"{"kind":"darwin","boot_session":"9F1C","unique_id":4000000123}"#
+        );
+        let unsupported = ChildListReply {
+            id: None,
+            supported: false,
+            boot_id: None,
+            clk_tck: 100,
+            sessions: Vec::new(),
+            host: Vec::new(),
+            refused_records: 0,
+            ledger_full: false,
+            host_instance: None,
+        };
+        assert_eq!(
+            encode_line(&DaemonFrame::ChildList(unsupported)).unwrap(),
+            concat!(
+                r#"{"type":"child_list","id":null,"supported":false,"boot_id":null,"clk_tck":100,"#,
+                r#""sessions":[],"host":[],"refused_records":0,"ledger_full":false}"#,
+                "\n"
+            )
+        );
+
+        let instance = InstanceKey::Linux { boot_id: "680bd989".into(), start_ticks: 26981644 };
+        let child = ChildIdentity::new(3646158, 3646158, 3646158, instance);
+        let spawned = SessionEventWire::ChildProcess(ChildProcessEvent::Spawned(ChildSpawn {
+            tool_id: "toolu_01ABC".into(),
+            tool_name: "bash".into(),
+            handle_id: None,
+            shell_session_id: None,
+            child: child.clone(),
+        }));
+        let ended = SessionEventWire::ChildProcess(ChildProcessEvent::Ended {
+            tool_id: "toolu_01ABC".into(),
+            handle_id: Some("sa_3".into()),
+            child,
+            exit_code: None,
+            signal: Some(9),
+        });
+        let text = |e: SessionEventWire| serde_json::to_string(&WireSessionEvent::for_client(e).unwrap()).unwrap();
+        let spawned = text(spawned);
+        assert_eq!(
+            spawned,
+            concat!(
+                r#"{"ev":"tool_child","tool_id":"toolu_01ABC","tool_name":"bash","handle_id":null,"#,
+                r#""shell_session_id":null,"#,
+                r#""child":{"pid":3646158,"start_ticks":26981644,"boot_id":"680bd989","sid":3646158,"pgid":3646158,"#,
+                r#""instance":{"kind":"linux","boot_id":"680bd989","start_ticks":26981644}}}"#
+            )
+        );
+        assert_eq!(
+            old_fields(&spawned),
+            concat!(
+                r#"{"ev":"tool_child","tool_id":"toolu_01ABC","tool_name":"bash","handle_id":null,"#,
+                r#""shell_session_id":null,"#,
+                r#""child":{"pid":3646158,"start_ticks":26981644,"boot_id":"680bd989","sid":3646158,"pgid":3646158}}"#
+            )
+        );
+        let ended = text(ended);
+        assert_eq!(
+            ended,
+            concat!(
+                r#"{"ev":"tool_child_ended","tool_id":"toolu_01ABC","handle_id":"sa_3","#,
+                r#""child":{"pid":3646158,"start_ticks":26981644,"boot_id":"680bd989","sid":3646158,"pgid":3646158,"#,
+                r#""instance":{"kind":"linux","boot_id":"680bd989","start_ticks":26981644}},"#,
+                r#""exit_code":null,"signal":9}"#
+            )
+        );
+        assert_eq!(
+            old_fields(&ended),
+            concat!(
+                r#"{"ev":"tool_child_ended","tool_id":"toolu_01ABC","handle_id":"sa_3","#,
+                r#""child":{"pid":3646158,"start_ticks":26981644,"boot_id":"680bd989","sid":3646158,"pgid":3646158},"#,
+                r#""exit_code":null,"signal":9}"#
+            )
+        );
+    }
+
+    /// A `child_list` reply or `tool_child` event from a newer daemon, with
+    /// `instance` and `host_instance` of a kind this build doesn't know,
+    /// still decodes; those keys match nothing, themselves included.
+    #[test]
+    fn a_child_frame_with_a_future_kind_decodes_and_never_matches() {
+        use crate::proc_identity::{BootKey, InstanceKey};
+        let listed = encode_line(&DaemonFrame::ChildList(child_list_sample())).unwrap();
+        let future = listed
+            .replace(
+                r#"{"kind":"linux","boot_id":"b","start_ticks":26981650}"#,
+                r#"{"kind":"future","boot_epoch":"b","serial":26981650}"#,
+            )
+            .replace(
+                r#"{"kind":"linux","boot_id":"b","start_ticks":26981702}"#,
+                r#"{"kind":"future","boot_epoch":"b","serial":26981702,"more":[1]}"#,
+            )
+            .replace(r#""host_instance":{"kind":"linux","boot_id":"b"}"#, r#""host_instance":{"kind":"future","boot_epoch":"b"}"#);
+        assert_eq!(future.matches(r#""kind":"future""#).count(), 4, "{future}");
+        let DaemonFrame::ChildList(reply) = decode_line(future.trim_end()).unwrap() else { panic!("not a child_list") };
+        assert!(matches!(reply.host_instance, Some(BootKey::Unknown)), "{:?}", reply.host_instance);
+        assert_ne!(reply.host_instance, reply.host_instance.clone(), "not even itself");
+        let entry = &reply.sessions[0].children[0];
+        assert!(matches!(entry.child.instance, InstanceKey::Unknown));
+        assert_ne!(entry.child.instance, entry.child.instance.clone());
+        let members = entry.members.as_ref().unwrap();
+        assert!(matches!(members[0].instance, Some(InstanceKey::Unknown)));
+        assert!(matches!(reply.host[0].child.instance, InstanceKey::Unknown));
+        assert_ne!(reply, reply.clone());
+        // Everything else reads as sent.
+        assert_eq!((reply.id, reply.supported, reply.boot_id.as_deref(), reply.clk_tck), (Some(7), true, Some("b"), 100));
+        assert_eq!((entry.child.pid, entry.child.start_ticks, members[0].pid), (3646188, Some(26981650), 3646201));
+        assert_eq!((reply.refused_records, reply.ledger_full, reply.host[0].owner_id.as_str()), (3, true, "figma"));
+
+        let event = concat!(
+            r#"{"ev":"tool_child","tool_id":"toolu_01ABC","tool_name":"bash","handle_id":null,"#,
+            r#""shell_session_id":null,"#,
+            r#""child":{"pid":3646158,"start_ticks":26981644,"boot_id":"680bd989","sid":3646158,"pgid":3646158,"#,
+            r#""instance":{"kind":"future","boot_epoch":"680bd989","serial":26981644}}}"#
+        );
+        let WireSessionEvent::ToolChild { child, .. } = serde_json::from_str::<WireSessionEvent>(event).unwrap() else {
+            panic!("not a tool_child")
+        };
+        assert!(matches!(child.instance, InstanceKey::Unknown));
+        assert_ne!(child.instance, child.instance.clone());
+    }
+
     fn prompt() -> PromptRequest {
         PromptRequest {
             id: 3,
@@ -1321,6 +2052,9 @@ mod tests {
             cost: 0.5,
             keepwarm_cost: 0.125,
             keepwarm_tokens: ConversationTokens { input: 0, output: 0, cache_read: 9, cache_creation: 0 },
+            child_cost: 0.0625,
+            child_tokens: ConversationTokens { input: 2, output: 1, cache_read: 3, cache_creation: 0 },
+            child_share_exact: true,
             abort_context: Some("ctx".into()),
             queued_message: None,
             pending_events_len: 2,
@@ -1368,7 +2102,12 @@ mod tests {
                 tool_id: "id1".into(),
                 input: serde_json::json!({"command":"pwd"}),
             }),
-            StreamEvent::Llm(LlmEvent::ToolResult { tool_id: "id1".into(), result: "/tmp".into() }),
+            StreamEvent::Llm(LlmEvent::ToolResult {
+                tool_id: "id1".into(),
+                result: "/tmp".into(),
+                memory_only: false,
+                client_tool: None,
+            }),
             StreamEvent::Llm(LlmEvent::ToolResultDelta { tool_id: "id1".into(), delta: "/t".into() }),
             StreamEvent::Llm(LlmEvent::ToolQueued { tool_id: "id2".into() }),
             StreamEvent::Llm(LlmEvent::ToolStarted { tool_id: "id2".into() }),
@@ -1406,7 +2145,7 @@ mod tests {
     #[test]
     fn a_retry_is_a_flagged_notice_on_the_wire() {
         let retry = StreamEvent::Session(SessionEvent::Retry("⚠ Rate limited — retrying (1/5)".into()));
-        let json = serde_json::to_value(WireStreamEvent::from(retry)).unwrap();
+        let json = serde_json::to_value(WireStreamEvent::for_client(retry).unwrap()).unwrap();
         assert_eq!(json["session"], "notice", "{json}");
         assert_eq!(json["retry"], true, "{json}");
         let back: WireStreamEvent = serde_json::from_value(json).unwrap();
@@ -1415,12 +2154,165 @@ mod tests {
             "a retry stays a retry"
         );
         let plain = StreamEvent::Session(SessionEvent::Notice("n".into()));
-        let json = serde_json::to_value(WireStreamEvent::from(plain)).unwrap();
+        let json = serde_json::to_value(WireStreamEvent::for_client(plain).unwrap()).unwrap();
         assert!(json.get("retry").is_none(), "a plain notice is unchanged: {json}");
         // An older daemon's notice has no flag: a plain notice.
         let old: WireStreamEvent =
             serde_json::from_value(serde_json::json!({"kind": "session", "session": "notice", "text": "x"})).unwrap();
         assert!(matches!(StreamEvent::from(old), StreamEvent::Session(SessionEvent::Notice(t)) if t == "x"));
+    }
+
+    /// A memory-only result reaches clients as the placeholder with a flag;
+    /// ordinary results keep their exact bytes (no flag key). The flag is the
+    /// engine's typed take, not the text's shape.
+    #[test]
+    fn memory_only_tool_result_is_flagged_on_the_wire() {
+        let text = crate::runtime::memory_only::placeholder("memfix_vault_fetch", "toolu_1");
+        let event = StreamEvent::Llm(LlmEvent::ToolResult {
+            tool_id: "toolu_1".into(),
+            result: text.clone(),
+            memory_only: true,
+            client_tool: None,
+        });
+        let json = serde_json::to_value(WireStreamEvent::for_client(event).unwrap()).unwrap();
+        assert_eq!(json["llm"], "tool_result", "{json}");
+        assert_eq!(json["memory_only"], true, "{json}");
+        assert_eq!(json["result"], text.as_str());
+        let back: WireStreamEvent = serde_json::from_value(json).unwrap();
+        assert!(matches!(
+            StreamEvent::from(back),
+            StreamEvent::Llm(LlmEvent::ToolResult { result, memory_only: true, client_tool: None, .. }) if result == text
+        ));
+        let plain = StreamEvent::Llm(LlmEvent::ToolResult {
+            tool_id: "t".into(),
+            result: "ok".into(),
+            memory_only: false,
+            client_tool: None,
+        });
+        let json = serde_json::to_value(WireStreamEvent::for_client(plain).unwrap()).unwrap();
+        assert!(json.get("memory_only").is_none(), "{json}");
+        assert!(json.get("client_tool").is_none(), "{json}");
+        // A result whose text merely looks like a placeholder is not flagged:
+        // the flag comes only from the typed take.
+        let lookalike = StreamEvent::Llm(LlmEvent::ToolResult {
+            tool_id: "toolu_1".into(),
+            result: text.clone(),
+            memory_only: false,
+            client_tool: None,
+        });
+        let json = serde_json::to_value(WireStreamEvent::for_client(lookalike).unwrap()).unwrap();
+        assert!(json.get("memory_only").is_none(), "{json}");
+        let old: WireStreamEvent = serde_json::from_value(
+            serde_json::json!({"kind": "llm", "llm": "tool_result", "tool_id": "t", "result": "ok"}),
+        )
+        .unwrap();
+        assert!(matches!(
+            old,
+            WireStreamEvent::Llm(WireLlmEvent::ToolResult { memory_only: false, client_tool: None, .. })
+        ));
+    }
+
+    /// A client tool result carries its stamp to clients and back; the
+    /// invocation id is an explicit null when no invoke was sent.
+    #[test]
+    fn client_tool_stamp_round_trips_on_the_wire() {
+        let stamp = agent_core::ClientToolStamp {
+            registration_id: "cr_1".into(),
+            invocation_id: None,
+            extension_id: "pria-desktop".into(),
+            tool: "pria_vault_get".into(),
+            family: "pria.vault.v1".into(),
+            outcome: "synaps_busy".into(),
+            memory_only: false,
+        };
+        let event = StreamEvent::Llm(LlmEvent::ToolResult {
+            tool_id: "toolu_9".into(),
+            result: "busy".into(),
+            memory_only: false,
+            client_tool: Some(Box::new(stamp.clone())),
+        });
+        let json = serde_json::to_value(WireStreamEvent::for_client(event).unwrap()).unwrap();
+        assert_eq!(
+            json["client_tool"],
+            serde_json::json!({
+                "registration_id": "cr_1",
+                "invocation_id": null,
+                "extension_id": "pria-desktop",
+                "tool": "pria_vault_get",
+                "family": "pria.vault.v1",
+                "outcome": "synaps_busy",
+                "memory_only": false,
+            }),
+            "{json}"
+        );
+        assert!(json.get("memory_only").is_none(), "{json}");
+        let back: WireStreamEvent = serde_json::from_value(json).unwrap();
+        assert!(matches!(
+            StreamEvent::from(back),
+            StreamEvent::Llm(LlmEvent::ToolResult { client_tool: Some(s), .. }) if *s == stamp
+        ));
+    }
+
+    #[test]
+    fn client_tool_stamps_ride_the_messages_answer_and_attached() {
+        use SessionEventWire as S;
+        let stamp = agent_core::ClientToolStamp {
+            registration_id: "cr_1".into(),
+            invocation_id: Some("ci_1".into()),
+            extension_id: "pria-desktop".into(),
+            tool: "pria_vault_get".into(),
+            family: "pria.vault".into(),
+            outcome: "ok".into(),
+            memory_only: true,
+        };
+        let stamps: ClientToolStamps = [("toolu_1".to_string(), stamp.clone())].into();
+
+        // No stamps: the frame is the one a client always got.
+        let plain = WireSessionEvent::for_client(S::QueryResult {
+            id: 4,
+            value: serde_json::json!([]),
+            client_tools: None,
+        })
+        .unwrap();
+        assert_eq!(
+            serde_json::to_string(&plain).unwrap(),
+            r#"{"ev":"query_result","id":4,"value":[]}"#
+        );
+
+        let answer = WireSessionEvent::for_client(S::QueryResult {
+            id: 4,
+            value: serde_json::json!([]),
+            client_tools: Some(stamps.clone()),
+        })
+        .unwrap();
+        let json = serde_json::to_value(&answer).unwrap();
+        assert_eq!(json["client_tools"]["toolu_1"]["invocation_id"], "ci_1", "{json}");
+        let back: WireSessionEvent = serde_json::from_value(json).unwrap();
+        assert!(matches!(
+            SessionEventWire::from(back),
+            S::QueryResult { client_tools: Some(m), .. } if m == stamps
+        ));
+
+        let snapshot = |client_tools: ClientToolStamps| AttachSnapshot {
+            meta: meta(),
+            view: view(),
+            conversation: conv(),
+            streaming: false,
+            replay: vec![],
+            pending_prompts: vec![],
+            clients: vec![],
+            roster: Vec::new(),
+            client_input: ClientInput::wire_default(),
+            input_owner: None,
+            display_tail: None,
+            client_tools,
+        };
+        let none = serde_json::to_value(AttachedWire::new(ClientId(1), snapshot(Default::default()))).unwrap();
+        assert!(none.get("client_tools").is_none(), "{none}");
+        let some = serde_json::to_value(AttachedWire::new(ClientId(1), snapshot(stamps.clone()))).unwrap();
+        assert_eq!(some["client_tools"]["toolu_1"]["outcome"], "ok", "{some}");
+        let wire: AttachedWire = serde_json::from_value(some).unwrap();
+        assert_eq!(wire.into_snapshot().1.client_tools, stamps);
     }
 
     fn fixtures() -> Vec<SessionEventWire> {
@@ -1457,8 +2349,9 @@ mod tests {
                 message: None,
                 view: view(),
                 clamp: Some(ReasoningClampWire { from: "ultra".into(), to: "high".into() }),
+                memory_only_tools: None,
             }),
-            S::QueryResult { id: 1, value: serde_json::json!([1, 2]) },
+            S::QueryResult { id: 1, value: serde_json::json!([1, 2]), client_tools: None },
             S::Attached {
                 client: ClientId(2),
                 snapshot: AttachSnapshot {
@@ -1473,6 +2366,7 @@ mod tests {
                     client_input: ClientInput::Shared,
                     input_owner: Some(ClientId(1)),
                     display_tail: None,
+                    client_tools: Default::default(),
                 },
             },
             S::ClientJoined { client: ClientId(1), kind: ClientKind::Attach, name: "discord".into(), mode: AttachMode::Observe },
@@ -1531,7 +2425,7 @@ mod tests {
 
     fn queued_frame() -> String {
         let ev = env(SessionEventWire::Stream(StreamEvent::Llm(LlmEvent::ToolQueued { tool_id: "toolu_2".into() })));
-        encode_line(&DaemonFrame::Event(ev.into())).unwrap()
+        encode_line(&DaemonFrame::Event(WireEnvelope::for_client(ev).unwrap())).unwrap()
     }
 
     /// What an OLDER client does with a new nested `llm` variant: its
@@ -1563,6 +2457,7 @@ mod tests {
                 client_input: ClientInput::Shared,
                 input_owner: None,
                 display_tail: None,
+                client_tools: Default::default(),
             },
         );
         let line = encode_line(&DaemonFrame::Attached(attached)).unwrap();
@@ -1597,6 +2492,7 @@ mod tests {
             client_input,
             input_owner: Some(ClientId(1)),
             display_tail: None,
+            client_tools: Default::default(),
         };
         let line = encode_line(&DaemonFrame::Attached(AttachedWire::new(ClientId(2), snap(ClientInput::Shared)))).unwrap();
         assert!(line.contains(r#""client_input":"shared""#), "{line}");
@@ -1716,7 +2612,7 @@ mod tests {
             let is_conv = matches!(ev, SessionEventWire::Conversation(_));
             let e = env(ev);
             let before = format!("{e:?}");
-            let wire: WireEnvelope = e.into();
+            let wire = WireEnvelope::for_client(e).expect("every fixture has a client form");
             let line = encode_line(&wire).unwrap();
             assert_eq!(line.matches('\n').count(), 1, "one line per frame");
             let back: WireEnvelope = decode_line(line.trim_end()).unwrap();
@@ -1774,6 +2670,64 @@ mod tests {
         // stable across runs/binaries: FNV-1a offset basis for the empty list
         assert_eq!(messages_hash(&[]), 0xcbf2_9ce4_8422_2325);
         assert_ne!(messages_hash(&c.api_messages), messages_hash(&[]));
+    }
+
+    /// A run's request-ledger events are host-internal (the actor never
+    /// emits them). Were a ledgered attempt's usage converted anyway, its
+    /// wire form is exactly the plain `Usage` it stands in for: no new wire
+    /// variant, nothing an older client must learn to skip.
+    #[test]
+    fn a_ledgered_attempt_has_the_wire_form_of_its_plain_usage() {
+        let attempt = SessionEvent::UsageAttempt {
+            request: agent_core::UsageRequest {
+                request_id: "req-1".into(),
+                purpose: agent_core::UsagePurpose::RolloverSummary,
+                model: "provider/model-b".into(),
+            },
+            usage: agent_core::UsageCounts {
+                input_tokens: 1,
+                output_tokens: 2,
+                cache_read_input_tokens: 3,
+                cache_creation_input_tokens: 4,
+                cache_creation_5m: Some(5),
+                cache_creation_1h: None,
+            },
+        };
+        let plain = attempt.clone().for_clients().unwrap();
+        let line = |e: SessionEvent| {
+            let wire = WireEnvelope::for_client(env(SessionEventWire::Stream(StreamEvent::Session(e))))
+                .expect("a ledgered attempt has a client form");
+            let line = encode_line(&wire).unwrap();
+            // The envelope's timestamp differs; compare the event alone.
+            serde_json::from_str::<serde_json::Value>(line.trim_end()).unwrap()["event"].clone()
+        };
+        assert_eq!(line(attempt), line(plain));
+        assert!(!line(SessionEvent::Done).to_string().contains("req-1"));
+    }
+
+    /// A run's request-ledger liability has no client form at any level of
+    /// the conversion: no frame is built for it (not even an empty notice).
+    /// Every other event still converts.
+    #[test]
+    fn a_liability_never_becomes_a_frame() {
+        let request = agent_core::UsageRequest {
+            request_id: "req-1".into(),
+            purpose: agent_core::UsagePurpose::Conversation,
+            model: "provider/model-b".into(),
+        };
+        for state in [agent_core::LiabilityState::Open, agent_core::LiabilityState::Released] {
+            let liability = StreamEvent::Session(SessionEvent::UsageLiability {
+                request: request.clone(),
+                estimate_micro_usd: 7,
+                state,
+            });
+            assert!(WireStreamEvent::for_client(liability.clone()).is_none());
+            assert!(WireSessionEvent::for_client(SessionEventWire::Stream(liability.clone())).is_none());
+            assert!(WireEnvelope::for_client(env(SessionEventWire::Stream(liability))).is_none());
+        }
+        let notice = StreamEvent::Session(SessionEvent::Notice(String::new()));
+        assert!(WireEnvelope::for_client(env(SessionEventWire::Stream(notice))).is_some());
+        assert!(WireEnvelope::for_client(env(SessionEventWire::Idle)).is_some());
     }
 
     #[test]
@@ -1887,12 +2841,13 @@ mod tests {
             ClientFrame::Cmd { session_id: "s".into(), cmd: SessionCommand::EngineCommand { id: 4, name: "model".into(), arg: "x".into() } },
             ClientFrame::Cmd { session_id: "s".into(), cmd: SessionCommand::Query { id: 5, query: SessionQuery::Status } },
             ClientFrame::Cmd { session_id: "s".into(), cmd: SessionCommand::Set { id: 6, setting: SessionSetting::ReloadPrompt } },
-            ClientFrame::Cmd { session_id: "s".into(), cmd: SessionCommand::Checkpoint { reason: CheckpointReason::Reload } },
+            ClientFrame::Cmd { session_id: "s".into(), cmd: SessionCommand::Checkpoint { reason: CheckpointReason::Reload, deadline: None, skip_quiesce_grace: false } },
             ClientFrame::Cmd { session_id: "s".into(), cmd: SessionCommand::KeepWarm { on: true } },
             ClientFrame::Cmd { session_id: "s".into(), cmd: SessionCommand::DriverStart {
                 plugin: "autonomous".into(), command: "auto".into(), arg: "start -- do stuff".into(),
             }},
-            ClientFrame::Reload { now: true, drain_secs: Some(3), exe: Some(PathBuf::from("/bin/synaps")) },
+            ClientFrame::Reload { now: true, drain_secs: Some(3), exe: Some(PathBuf::from("/bin/synaps")), force: false },
+            ClientFrame::Reload { now: false, drain_secs: None, exe: None, force: true },
             ClientFrame::Purge,
             ClientFrame::Close { session_id: "s".into(), force: true, attached: true },
             ClientFrame::Close { session_id: "s".into(), force: false, attached: false },
@@ -1901,6 +2856,10 @@ mod tests {
             ClientFrame::Rename { session_id: "s".into(), name: Some("axon".into()), expect: None },
             ClientFrame::Rename { session_id: "s".into(), name: None, expect: Some(Some("axon".into())) },
             ClientFrame::Rename { session_id: "s".into(), name: Some("axon".into()), expect: Some(None) },
+            ClientFrame::Children { id: Some(7), session_id: Some("s".into()), sid: Some(42), members: true },
+            ClientFrame::Children { id: None, session_id: None, sid: None, members: false },
+            ClientFrame::ThinkingOptions { id: Some(8), model: Some("muse/muse-wonder-1.0".into()), warm: true },
+            ClientFrame::ThinkingOptions { id: None, model: None, warm: false },
             ClientFrame::AuthState(agent_core::auth::AuthStateQuery::default()),
             ClientFrame::AuthState(agent_core::auth::AuthStateQuery {
                 provider: Some("anthropic".into()),
@@ -1908,6 +2867,8 @@ mod tests {
                 clear: true,
             }),
             ClientFrame::ReloadExtension { extension: "subconscious".into() },
+            ClientFrame::ModelFavorites { id: Some(10) },
+            ClientFrame::ModelFavorites { id: None },
             ClientFrame::Bye,
         ];
         for f in frames {
@@ -1925,6 +2886,10 @@ mod tests {
                 progressive_tool_disclosure: true,
                 generation: 1,
                 daemon_build: "abc1234".into(),
+                features: vec!["children".into()],
+                accepted_events: vec![],
+                config_path: Some("/home/u/.synaps-cli/config".into()),
+                memory_backend: Some("axel".into()),
             }),
             DaemonFrame::Refused { reason: RefuseReason::Version { daemon_version: 2, min: 2, max: 2 }, message: "no".into() },
             DaemonFrame::Refused { reason: RefuseReason::ReloadRefused { why: "older".into() }, message: "no".into() },
@@ -1944,9 +2909,10 @@ mod tests {
                     client_input: ClientInput::Shared,
                     input_owner: None,
                     display_tail: None,
+                    client_tools: Default::default(),
                 },
             )),
-            DaemonFrame::Event(env(SessionEventWire::SystemNotice("x".into())).into()),
+            DaemonFrame::Event(WireEnvelope::for_client(env(SessionEventWire::SystemNotice("x".into()))).unwrap()),
             DaemonFrame::Error { session_id: None, message: "e".into() },
             DaemonFrame::Closed { session_id: "s".into(), text: "closed".into() },
             DaemonFrame::Pinned { session_id: "s".into(), on: true },
@@ -1979,15 +2945,67 @@ mod tests {
             },
             DaemonFrame::ExtensionReloadFailed { extension: "x".into(), message: "boom".into(), unloaded: true },
             DaemonFrame::Bye { reason: None },
-            DaemonFrame::Bye { reason: Some(ByeReason::Reloading { generation: 2, retry_after_ms: 500 }) },
+            DaemonFrame::Bye { reason: Some(ByeReason::Reloading { generation: 2, retry_after_ms: 500, waived: vec![] }) },
+            DaemonFrame::Bye { reason: Some(ByeReason::Reloading {
+                generation: 3,
+                retry_after_ms: 500,
+                waived: vec![
+                    WaivedWorker { worker: "sa_3".into(), session: Some("s".into()), why: "publishing".into() },
+                    WaivedWorker { worker: "sa_4".into(), session: None, why: "unresolved".into() },
+                ],
+            }) },
             DaemonFrame::Bye { reason: Some(ByeReason::Shutdown) },
+            DaemonFrame::ChildList(child_list_sample()),
+            thinking_options_sample(),
+            DaemonFrame::ThinkingOptionsResult { id: None, model: "a b".into(), options: None },
             DaemonFrame::AuthState { report: auth_state_report() },
+            model_favorites_sample(),
+            DaemonFrame::ModelFavoritesResult { id: None, models: vec![], plugins_loaded: false, live_providers: vec![] },
         ];
         for f in frames {
             let line = encode_line(&f).unwrap();
             let back: DaemonFrame = decode_line(line.trim_end()).unwrap();
             assert_eq!(serde_json::to_string(&back).unwrap(), line.trim_end());
         }
+    }
+
+    /// A normal reload's frame and every `Bye{Reloading}` without waived
+    /// workers keep their bytes; `force` and `waived` appear only when set,
+    /// and an older peer's bytes (no such fields) still decode.
+    #[test]
+    fn reload_force_and_waived_leave_the_old_frames_unchanged() {
+        let normal = ClientFrame::Reload { now: true, drain_secs: Some(3), exe: None, force: false };
+        assert_eq!(
+            serde_json::to_string(&normal).unwrap(),
+            r#"{"type":"reload","now":true,"drain_secs":3,"exe":null}"#
+        );
+        let forced = ClientFrame::Reload { now: false, drain_secs: None, exe: None, force: true };
+        assert_eq!(
+            serde_json::to_string(&forced).unwrap(),
+            r#"{"type":"reload","now":false,"drain_secs":null,"exe":null,"force":true}"#
+        );
+        let old: ClientFrame = serde_json::from_str(r#"{"type":"reload","now":true}"#).unwrap();
+        assert!(matches!(old, ClientFrame::Reload { now: true, force: false, .. }), "{old:?}");
+
+        let bye = DaemonFrame::Bye {
+            reason: Some(ByeReason::Reloading { generation: 2, retry_after_ms: 500, waived: vec![] }),
+        };
+        assert_eq!(
+            serde_json::to_string(&bye).unwrap(),
+            r#"{"type":"bye","reason":{"bye":"reloading","generation":2,"retry_after_ms":500}}"#
+        );
+        let waived = ByeReason::Reloading {
+            generation: 2,
+            retry_after_ms: 500,
+            waived: vec![WaivedWorker { worker: "sa_3".into(), session: Some("s1".into()), why: "publishing".into() }],
+        };
+        assert_eq!(
+            serde_json::to_string(&waived).unwrap(),
+            r#"{"bye":"reloading","generation":2,"retry_after_ms":500,"waived":[{"worker":"sa_3","session":"s1","why":"publishing"}]}"#
+        );
+        let old: ByeReason =
+            serde_json::from_str(r#"{"bye":"reloading","generation":2,"retry_after_ms":500}"#).unwrap();
+        assert_eq!(old, ByeReason::Reloading { generation: 2, retry_after_ms: 500, waived: vec![] });
     }
 
     #[test]
@@ -2155,6 +3173,24 @@ mod tests {
     }
 
     #[test]
+    fn welcome_config_path_and_memory_backend_are_optional() {
+        // An older daemon's Welcome has neither field: both read as unknown.
+        let old = r#"{"protocol_version":3,"daemon_version":"0.9.0","pid":1,"profile":null,"sessions":[],"progressive_tool_disclosure":true}"#;
+        let mut w: Welcome = serde_json::from_str(old).unwrap();
+        assert_eq!(w.config_path, None);
+        assert_eq!(w.memory_backend, None);
+        // Unknown stays unknown on the wire: no null keys.
+        let json = serde_json::to_value(&w).unwrap();
+        assert!(json.get("config_path").is_none(), "{json}");
+        assert!(json.get("memory_backend").is_none(), "{json}");
+        w.config_path = Some("/home/u/.synaps-cli/config".into());
+        w.memory_backend = Some("axel".into());
+        let json = serde_json::to_value(&w).unwrap();
+        assert_eq!(json["config_path"], "/home/u/.synaps-cli/config");
+        assert_eq!(json["memory_backend"], "axel");
+    }
+
+    #[test]
     fn no_secret_bearing_fields_on_handshake_frames() {
         // Structural guard: the JSON of Welcome/Attached must not contain key-ish names.
         let w = serde_json::to_string(&Welcome {
@@ -2166,11 +3202,452 @@ mod tests {
             progressive_tool_disclosure: false,
             generation: 1,
             daemon_build: String::new(),
+            features: vec![],
+            accepted_events: vec![],
+            config_path: Some("/home/u/.synaps-cli/config".into()),
+            memory_backend: Some("legacy".into()),
         })
         .unwrap()
         .to_lowercase();
         for bad in ["token", "secret", "api_key", "apikey", "password", "credential"] {
             assert!(!w.contains(bad), "{bad} in Welcome");
+        }
+    }
+
+    /// The names PD vendors (4/4b v1.1). Changing one breaks the app.
+    #[test]
+    fn children_frames_keep_the_agreed_names() {
+        let q: serde_json::Value = serde_json::to_value(&ClientFrame::Children {
+            id: Some(7),
+            session_id: Some("s".into()),
+            sid: Some(42),
+            members: true,
+        })
+        .unwrap();
+        assert_eq!(q, serde_json::json!({"type":"children","id":7,"session_id":"s","sid":42,"members":true}));
+        // Every field is optional on the way in.
+        let bare: ClientFrame = decode_line(r#"{"type":"children"}"#).unwrap();
+        assert!(matches!(bare, ClientFrame::Children { id: None, session_id: None, sid: None, members: false }));
+
+        let r = serde_json::to_value(DaemonFrame::ChildList(child_list_sample())).unwrap();
+        let child = serde_json::json!({
+            "pid":3646188,"start_ticks":26981650,"boot_id":"b","sid":3646188,"pgid":3646188,
+            "instance":{"kind":"linux","boot_id":"b","start_ticks":26981650}
+        });
+        let member = serde_json::json!({
+            "pid":3646201,"start_ticks":26981702,"instance":{"kind":"linux","boot_id":"b","start_ticks":26981702}
+        });
+        assert_eq!(
+            r,
+            serde_json::json!({
+                "type":"child_list","id":7,"supported":true,"boot_id":"b","clk_tck":100,
+                "sessions":[{"session_id":"s","truncated":false,"children":[{
+                    "tool_id":"toolu_1","tool_name":"bash","handle_id":"sa_12","shell_session_id":null,
+                    "child":child,"state":"running","exit_code":null,"signal":null,
+                    "members":[member]}]}],
+                "host":[{"owner_kind":"mcp_server","owner_id":"figma","child":child}],
+                "refused_records":3,"ledger_full":true,"host_instance":{"kind":"linux","boot_id":"b"}
+            })
+        );
+        // Always written, and an older reply without them decodes as 0/false.
+        let mut quiet = child_list_sample();
+        quiet.refused_records = 0;
+        quiet.ledger_full = false;
+        let q = serde_json::to_value(DaemonFrame::ChildList(quiet)).unwrap();
+        assert_eq!((q["refused_records"].clone(), q["ledger_full"].clone()), (serde_json::json!(0), serde_json::json!(false)));
+        let old: DaemonFrame =
+            decode_line(r#"{"type":"child_list","supported":true,"clk_tck":100,"sessions":[],"host":[]}"#).unwrap();
+        assert!(matches!(old, DaemonFrame::ChildList(ChildListReply { refused_records: 0, ledger_full: false, .. })));
+        let w = serde_json::to_value(&Welcome {
+            protocol_version: PROTOCOL_VERSION,
+            daemon_version: "v".into(),
+            pid: 1,
+            profile: None,
+            sessions: vec![],
+            progressive_tool_disclosure: false,
+            generation: 2,
+            daemon_build: String::new(),
+            features: vec![crate::daemon::control_queries::FEATURE_CHILDREN.into()],
+            accepted_events: vec![],
+            config_path: None,
+            memory_backend: None,
+        })
+        .unwrap();
+        assert_eq!(w["features"], serde_json::json!(["children"]));
+    }
+
+    fn model_favorites_sample() -> DaemonFrame {
+        DaemonFrame::ModelFavoritesResult {
+            id: Some(7),
+            models: vec![
+                crate::model_picker::FavoriteModel {
+                    id: "anthropic/claude-x".into(),
+                    label: Some("Claude X".into()),
+                    provider_key: "anthropic".into(),
+                    provider_name: "Anthropic".into(),
+                    badges: vec![],
+                },
+                crate::model_picker::FavoriteModel {
+                    id: "plug:prov:m1".into(),
+                    label: None,
+                    provider_key: "plug:prov".into(),
+                    provider_name: "Plug".into(),
+                    badges: vec!["tool-use".into(), "streaming".into()],
+                },
+            ],
+            plugins_loaded: true,
+            live_providers: vec!["xai-auth".into()],
+        }
+    }
+
+    /// The `model_favorites` names the app uses (W24), and an older
+    /// daemon's answer: its `ClientFrame` has no such variant, so it fails
+    /// with "unknown variant `model_favorites`" (conn.rs answers that with
+    /// `Error{"malformed frame: ..."}` and keeps the connection).
+    #[test]
+    fn model_favorites_frames_keep_the_agreed_names() {
+        assert_eq!(
+            serde_json::to_value(&ClientFrame::ModelFavorites { id: Some(7) }).unwrap(),
+            serde_json::json!({"type": "model_favorites", "id": 7})
+        );
+        let bare: ClientFrame = decode_line(r#"{"type":"model_favorites"}"#).unwrap();
+        assert!(matches!(bare, ClientFrame::ModelFavorites { id: None }));
+        assert_eq!(
+            serde_json::to_value(model_favorites_sample()).unwrap(),
+            serde_json::json!({"type": "model_favorites_result", "id": 7, "models": [
+                {"id": "anthropic/claude-x", "label": "Claude X", "provider_key": "anthropic", "provider_name": "Anthropic"},
+                {"id": "plug:prov:m1", "label": null, "provider_key": "plug:prov", "provider_name": "Plug", "badges": ["tool-use", "streaming"]}
+            ], "plugins_loaded": true, "live_providers": ["xai-auth"]})
+        );
+        // A reply without live_providers (or a row without badges) decodes.
+        let lean: DaemonFrame = decode_line(
+            r#"{"type":"model_favorites_result","models":[{"id":"a/b","provider_key":"a","provider_name":"A"}],"plugins_loaded":false}"#,
+        )
+        .unwrap();
+        match lean {
+            DaemonFrame::ModelFavoritesResult { id, models, plugins_loaded, live_providers } => {
+                assert_eq!((id, models.len(), plugins_loaded, live_providers.len()), (None, 1, false, 0));
+                assert_eq!((models[0].label.as_deref(), models[0].badges.len()), (None, 0));
+            }
+            other => panic!("{other:?}"),
+        }
+        #[derive(Deserialize, Debug)]
+        #[serde(tag = "type", rename_all = "snake_case")]
+        #[allow(dead_code)]
+        enum OldClientFrame {
+            Ping,
+            Sessions,
+            ThinkingOptions {
+                #[serde(default)]
+                id: Option<u64>,
+            },
+            Bye,
+        }
+        let line = encode_line(&ClientFrame::ModelFavorites { id: Some(3) }).unwrap();
+        let err = decode_line::<OldClientFrame>(line.trim_end()).unwrap_err();
+        let reply = format!("malformed frame: {err}");
+        assert!(crate::session::socket_transport::predates_model_favorites(&reply), "{reply}");
+        assert_eq!(crate::daemon::control_queries::FEATURE_MODEL_FAVORITES, "model_favorites");
+    }
+
+    /// The `thinking_options` names PD vendors (4/4b v1.1 §3.1).
+    #[test]
+    fn thinking_options_frames_keep_the_agreed_names() {
+        let q = serde_json::to_value(&ClientFrame::ThinkingOptions {
+            id: Some(8),
+            model: Some("muse/muse-wonder-1.0".into()),
+            warm: false,
+        })
+        .unwrap();
+        assert_eq!(q, serde_json::json!({"type":"thinking_options","id":8,"model":"muse/muse-wonder-1.0","warm":false}));
+        let bare: ClientFrame = decode_line(r#"{"type":"thinking_options","model":null}"#).unwrap();
+        assert!(matches!(bare, ClientFrame::ThinkingOptions { id: None, model: None, warm: false }));
+        assert_eq!(
+            serde_json::to_value(thinking_options_sample()).unwrap(),
+            serde_json::json!({"type":"thinking_options_result","id":8,"model":"muse/muse-wonder-1.0",
+                "options":{"levels":["adaptive","low","medium","high","xhigh"],"exact":true,"basis":"live","default_level":"high"}})
+        );
+        for (basis, name) in [
+            (crate::runtime::openai::catalog::validation::OptionsBasis::Live, "live"),
+            (crate::runtime::openai::catalog::validation::OptionsBasis::Static, "static"),
+            (crate::runtime::openai::catalog::validation::OptionsBasis::Fallback, "fallback"),
+        ] {
+            assert_eq!(serde_json::to_value(basis).unwrap(), serde_json::json!(name));
+        }
+        let none = serde_json::to_value(&DaemonFrame::ThinkingOptionsResult { id: Some(9), model: "a b".into(), options: None }).unwrap();
+        assert_eq!(none, serde_json::json!({"type":"thinking_options_result","id":9,"model":"a b","options":null}));
+        assert_eq!(crate::daemon::control_queries::FEATURE_THINKING_OPTIONS, "thinking_options");
+    }
+
+    /// Old peers: a pre-4/4b client decodes the new Welcome (it ignores
+    /// `features`), a new client reads an old Welcome as no features, and a
+    /// pre-4/4b daemon rejects `children` as an unknown variant (conn.rs
+    /// answers that with `Error{"malformed frame: ..."}` and keeps the
+    /// connection).
+    #[test]
+    fn children_and_features_are_compatible_with_old_decoders() {
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        struct OldWelcome {
+            protocol_version: u32,
+            daemon_version: String,
+            pid: u32,
+            profile: Option<String>,
+            sessions: Vec<SessionMeta>,
+            progressive_tool_disclosure: bool,
+            #[serde(default = "one")]
+            generation: u64,
+        }
+        #[derive(Deserialize)]
+        #[serde(tag = "type", rename_all = "snake_case")]
+        #[allow(dead_code)]
+        enum OldDaemonFrame {
+            Welcome(OldWelcome),
+            Pong { pid: u32, uptime_s: u64, sessions: usize },
+        }
+        #[derive(Deserialize, Debug)]
+        #[serde(tag = "type", rename_all = "snake_case")]
+        #[allow(dead_code)]
+        enum OldClientFrame {
+            Ping,
+            Sessions,
+            Purge,
+            Bye,
+        }
+        let new = encode_line(&DaemonFrame::Welcome(Welcome {
+            protocol_version: PROTOCOL_VERSION,
+            daemon_version: "v".into(),
+            pid: 1,
+            profile: None,
+            sessions: vec![meta()],
+            progressive_tool_disclosure: true,
+            generation: 3,
+            daemon_build: String::new(),
+            features: vec!["children".into()],
+            accepted_events: vec![],
+            config_path: None,
+            memory_backend: None,
+        }))
+        .unwrap();
+        match decode_line::<OldDaemonFrame>(new.trim_end()).unwrap() {
+            OldDaemonFrame::Welcome(w) => assert_eq!((w.generation, w.sessions.len()), (3, 1)),
+            OldDaemonFrame::Pong { .. } => panic!("welcome expected"),
+        }
+        let old = r#"{"type":"welcome","protocol_version":3,"daemon_version":"v","pid":1,"profile":null,"sessions":[],"progressive_tool_disclosure":true,"generation":1}"#;
+        match decode_line::<DaemonFrame>(old).unwrap() {
+            DaemonFrame::Welcome(w) => assert!(w.features.is_empty()),
+            other => panic!("{other:?}"),
+        }
+        for query in [
+            ClientFrame::Children { id: Some(1), session_id: None, sid: None, members: false },
+            ClientFrame::ThinkingOptions { id: Some(2), model: None, warm: false },
+        ] {
+            let line = encode_line(&query).unwrap();
+            let err = decode_line::<OldClientFrame>(line.trim_end()).unwrap_err();
+            assert!(err.contains("unknown variant"), "{err}");
+        }
+    }
+
+    /// `sandbox_status` (feature "sandbox_status"; the protocol stays 3):
+    /// the query and its reply round-trip, a missing id decodes as `None`, a
+    /// daemon that predates it rejects the query as an unknown variant (conn
+    /// answers `Error` and keeps the connection), and this reply's decoder
+    /// ignores a field a later daemon adds.
+    #[test]
+    fn sandbox_status_round_trips_and_is_additive() {
+        let q = ClientFrame::SandboxStatus { id: Some(4), session: "20261022-1-abcd".into() };
+        let line = encode_line(&q).unwrap();
+        assert_eq!(line.trim_end(), r#"{"type":"sandbox_status","id":4,"session":"20261022-1-abcd"}"#);
+        match decode_line::<ClientFrame>(r#"{"type":"sandbox_status","session":"s1"}"#).unwrap() {
+            ClientFrame::SandboxStatus { id, session } => assert_eq!((id, session.as_str()), (None, "s1")),
+            other => panic!("{other:?}"),
+        }
+        let reply = SandboxStatusReply {
+            id: Some(4),
+            session: "s1".into(),
+            state: "enforce".into(),
+            kill_switch: false,
+            tools: "confined".into(),
+            policy_hash: Some("0123456789abcdef".into()),
+            rules: 9,
+            skipped: 1,
+            abi: Some(6),
+        };
+        let line = encode_line(&DaemonFrame::SandboxStatusResult(reply.clone())).unwrap();
+        assert_eq!(
+            line.trim_end(),
+            r#"{"type":"sandbox_status_result","id":4,"session":"s1","state":"enforce","kill_switch":false,"tools":"confined","policy_hash":"0123456789abcdef","rules":9,"skipped":1,"abi":6}"#
+        );
+        match decode_line::<DaemonFrame>(line.trim_end()).unwrap() {
+            DaemonFrame::SandboxStatusResult(r) => assert_eq!(r, reply),
+            other => panic!("{other:?}"),
+        }
+        let later = r#"{"type":"sandbox_status_result","id":1,"session":"s1","state":"none","kill_switch":true,"tools":"open","policy_hash":null,"rules":0,"skipped":0,"abi":null,"net":"off"}"#;
+        match decode_line::<DaemonFrame>(later).unwrap() {
+            DaemonFrame::SandboxStatusResult(r) => {
+                assert_eq!((r.state.as_str(), r.kill_switch, r.policy_hash, r.abi), ("none", true, None, None))
+            }
+            other => panic!("{other:?}"),
+        }
+        #[derive(Deserialize, Debug)]
+        #[serde(tag = "type", rename_all = "snake_case")]
+        #[allow(dead_code)]
+        enum OldClientFrame {
+            Ping,
+            ModelFavorites {
+                #[serde(default)]
+                id: Option<u64>,
+            },
+            Bye,
+        }
+        let err = decode_line::<OldClientFrame>(encode_line(&q).unwrap().trim_end()).unwrap_err();
+        assert!(err.contains("unknown variant `sandbox_status`"), "{err}");
+    }
+
+    /// C4a: `accepted_events` (the names PD vendors), the negotiation rule
+    /// and old peers.
+    /// The frozen `tool_child` / `tool_child_ended` shapes, their opt-in
+    /// names, and an old client's decode (`Unknown`, then the usual notice).
+    #[test]
+    fn tool_child_events_keep_the_agreed_names_and_old_clients_skip_them() {
+        use super::super::child_events::ChildProcessEvent;
+        use super::super::children::{ChildIdentity, ChildSpawn};
+        let instance = crate::proc_identity::InstanceKey::Linux { boot_id: "680bd989".into(), start_ticks: 26981644 };
+        let child = ChildIdentity::new(3646158, 3646158, 3646158, instance);
+        let spawned = SessionEventWire::ChildProcess(ChildProcessEvent::Spawned(ChildSpawn {
+            tool_id: "toolu_01ABC".into(),
+            tool_name: "bash".into(),
+            handle_id: None,
+            shell_session_id: None,
+            child: child.clone(),
+        }));
+        let ended = SessionEventWire::ChildProcess(ChildProcessEvent::Ended {
+            tool_id: "toolu_01ABC".into(),
+            handle_id: Some("sa_3".into()),
+            child: child.clone(),
+            exit_code: None,
+            signal: Some(9),
+        });
+        assert_eq!(OPTIONAL_EVENTS, &["tool_child", "tool_child_ended", "child_spend", "ephemeral_layer_changed"]);
+        assert_eq!(optional_event_name(&spawned), Some("tool_child"));
+        assert_eq!(optional_event_name(&ended), Some("tool_child_ended"));
+        assert_eq!(optional_event_name(&SessionEventWire::ChildSpendLagged { dropped: 3 }), Some("child_spend"));
+        assert_eq!(optional_event_name(&SessionEventWire::Idle), None);
+        // The ephemeral layer's status is opt-in by its own name: an old
+        // client (no `accepted_events`) is not sent it, nor is one that
+        // accepted only the other optional kinds.
+        let layer = SessionEventWire::EphemeralLayerChanged { status: crate::runtime::ephemeral::Layer::new(false).status() };
+        assert_eq!(optional_event_name(&layer), Some("ephemeral_layer_changed"));
+        assert!(!AcceptedEvents::negotiate(&[]).allows(&layer), "an old client never receives ephemeral_layer_changed");
+        let others: Vec<String> = ["tool_child", "tool_child_ended", "child_spend"].map(String::from).into();
+        assert!(!AcceptedEvents::negotiate(&others).allows(&layer), "no implied groups");
+        assert!(AcceptedEvents::negotiate(&["ephemeral_layer_changed".into()]).allows(&layer));
+
+        let inner = |e: SessionEventWire| match e {
+            SessionEventWire::ChildProcess(event) => event,
+            other => panic!("not a child event: {other:?}"),
+        };
+        let keys = |v: &serde_json::Value| {
+            let mut k: Vec<String> = v.as_object().unwrap().keys().cloned().collect();
+            k.sort();
+            k
+        };
+        let v = serde_json::to_value(WireSessionEvent::for_client(spawned.clone()).unwrap()).unwrap();
+        assert_eq!(v["ev"], "tool_child");
+        assert_eq!(keys(&v), ["child", "ev", "handle_id", "shell_session_id", "tool_id", "tool_name"]);
+        assert!(v["handle_id"].is_null() && v["shell_session_id"].is_null(), "nulls are sent: {v}");
+        assert_eq!(keys(&v["child"]), ["boot_id", "instance", "pgid", "pid", "sid", "start_ticks"]);
+        assert_eq!(keys(&v["child"]["instance"]), ["boot_id", "kind", "start_ticks"]);
+        assert_eq!(v["child"]["start_ticks"], 26981644);
+        let back: WireSessionEvent = serde_json::from_value(v).unwrap();
+        assert_eq!(inner(SessionEventWire::from(back)), inner(spawned.clone()), "round trip");
+
+        let v = serde_json::to_value(WireSessionEvent::for_client(ended.clone()).unwrap()).unwrap();
+        assert_eq!(v["ev"], "tool_child_ended");
+        assert_eq!(keys(&v), ["child", "ev", "exit_code", "handle_id", "signal", "tool_id"]);
+        assert_eq!((v["handle_id"].as_str(), v["signal"].as_i64(), v["exit_code"].is_null()), (Some("sa_3"), Some(9), true));
+        let back: WireSessionEvent = serde_json::from_value(v.clone()).unwrap();
+        assert_eq!(inner(SessionEventWire::from(back)), inner(ended), "round trip");
+
+        // An old client: a v0.10.2-shaped event enum with `#[serde(other)]`.
+        #[derive(Deserialize)]
+        #[serde(tag = "ev", rename_all = "snake_case")]
+        #[allow(dead_code)]
+        enum OldEvent {
+            Idle,
+            SystemNotice { text: String },
+            CostCapReached { scope: String, cost: f64, cap: f64 },
+            #[serde(other)]
+            Unknown,
+        }
+        for json in [
+            serde_json::to_value(WireSessionEvent::for_client(spawned).unwrap()).unwrap(),
+            v,
+            serde_json::to_value(WireSessionEvent::for_client(layer).unwrap()).unwrap(),
+        ] {
+            assert!(matches!(serde_json::from_value::<OldEvent>(json).unwrap(), OldEvent::Unknown));
+        }
+    }
+
+    #[test]
+    fn accepted_events_are_exact_names_and_compatible_with_old_peers() {
+        let known: &[&'static str] = &["tool_child", "tool_child_ended"];
+        let ask = |names: &[&str]| {
+            AcceptedEvents::from_known(&names.iter().map(|s| s.to_string()).collect::<Vec<_>>(), known).names()
+        };
+        assert_eq!(ask(&["tool_child_ended", "bogus", "tool_child_ended"]), vec!["tool_child_ended"]);
+        assert_eq!(ask(&["tool_child_ended", "tool_child"]), vec!["tool_child", "tool_child_ended"], "daemon order");
+        assert!(ask(&["bogus", ""]).is_empty());
+        let only_ended = AcceptedEvents::from_known(&["tool_child_ended".to_string()], known);
+        assert!(only_ended.allows_name(None), "ordinary events always pass");
+        assert!(only_ended.allows_name(Some("tool_child_ended")));
+        assert!(!only_ended.allows_name(Some("tool_child")), "no implied groups");
+        assert!(!AcceptedEvents::default().allows_name(Some("tool_child_ended")));
+        assert!(AcceptedEvents::default().allows(&SessionEventWire::SystemNotice("x".into())));
+        // Every optional event this daemon knows has a distinct name.
+        let mut names = OPTIONAL_EVENTS.to_vec();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), OPTIONAL_EVENTS.len());
+
+        // Hello: the field name; empty is omitted; a legacy Hello is empty;
+        // Hello stays lenient (no deny_unknown_fields), so a released daemon,
+        // whose Hello is this one without the field, accepts the new frame.
+        let mut v = serde_json::to_value(Hello::new(ClientKind::Test).with_accepted_events(["tool_child"])).unwrap();
+        assert_eq!(v["accepted_events"], serde_json::json!(["tool_child"]));
+        let plain = serde_json::to_value(Hello::new(ClientKind::Test)).unwrap();
+        assert!(plain.get("accepted_events").is_none(), "{plain}");
+        let legacy: Hello = serde_json::from_value(plain).unwrap();
+        assert!(legacy.accepted_events.is_empty());
+        v["zz_from_a_newer_client"] = serde_json::json!(1);
+        let lenient: Hello = serde_json::from_value(v).unwrap();
+        assert_eq!(lenient.accepted_events, vec!["tool_child".to_string()]);
+
+        // Welcome: the echo is present when non-empty and omitted when empty;
+        // an old Welcome decodes as no echo.
+        let welcome = |accepted_events: Vec<String>| {
+            serde_json::to_value(&Welcome {
+                protocol_version: PROTOCOL_VERSION,
+                daemon_version: "v".into(),
+                pid: 1,
+                profile: None,
+                sessions: vec![],
+                progressive_tool_disclosure: false,
+                generation: 1,
+                daemon_build: String::new(),
+                features: vec![],
+                accepted_events,
+                config_path: None,
+                memory_backend: None,
+            })
+            .unwrap()
+        };
+        assert_eq!(welcome(vec!["tool_child_ended".into()])["accepted_events"], serde_json::json!(["tool_child_ended"]));
+        assert!(welcome(vec![]).get("accepted_events").is_none());
+        let old = r#"{"type":"welcome","protocol_version":3,"daemon_version":"v","pid":1,"profile":null,"sessions":[],"progressive_tool_disclosure":true,"generation":1}"#;
+        match decode_line::<DaemonFrame>(old).unwrap() {
+            DaemonFrame::Welcome(w) => assert!(w.accepted_events.is_empty()),
+            other => panic!("{other:?}"),
         }
     }
 }
@@ -2192,5 +3669,242 @@ mod float_roundtrip_tests {
         let back: ConversationDigest = decode_line(line.trim_end()).unwrap();
         assert_eq!(back.cost.to_bits(), cost.to_bits(), "{line}");
         assert_eq!(format!("{:.4}", back.cost), format!("{:.4}", cost));
+    }
+}
+
+#[cfg(test)]
+mod child_share_tests {
+    use super::*;
+
+    /// The child share crosses the wire in the Conversation digest, and
+    /// back into a client's snapshot.
+    #[test]
+    fn the_digest_carries_the_child_share_both_ways() {
+        let snap = ConversationSnapshot {
+            cost: 1.5,
+            child_cost: 0.25,
+            child_tokens: ConversationTokens { input: 7, output: 3, cache_read: 11, cache_creation: 2 },
+            child_share_exact: true,
+            ..Default::default()
+        };
+        let d = ConversationDigest::of(&snap);
+        let line = encode_line(&d).unwrap();
+        let back: ConversationDigest = decode_line(line.trim_end()).unwrap();
+        assert_eq!(back, d, "{line}");
+        let s = back.into_snapshot(Vec::new());
+        assert_eq!(s.child_cost, 0.25);
+        assert_eq!(s.child_tokens, snap.child_tokens);
+        assert!(s.child_share_exact);
+    }
+
+    /// An older daemon's digest has no child keys: no share, not exact (a
+    /// client shows it as unknown, "as of last save").
+    #[test]
+    fn an_older_digest_reads_as_no_share_and_not_exact() {
+        let old = ConversationDigest::of(&ConversationSnapshot { cost: 1.0, ..Default::default() });
+        let mut v = serde_json::to_value(&old).unwrap();
+        for k in ["child_cost", "child_tokens", "child_share_exact"] {
+            assert!(v.as_object_mut().unwrap().remove(k).is_some(), "{k}");
+        }
+        let back: ConversationDigest = serde_json::from_value(v).unwrap();
+        assert_eq!(back.child_cost, 0.0);
+        assert_eq!(back.child_tokens, ConversationTokens::default());
+        assert!(!back.child_share_exact);
+        assert_eq!(back.cost, 1.0);
+    }
+}
+
+/// The `child_spend` frame (P1j): the frozen draft-2 names, its exact
+/// name, and what an old client makes of it.
+#[cfg(test)]
+mod child_spend_wire_tests {
+    use super::*;
+
+    fn frame(parent: Option<&str>, ttl: Option<(u64, u64)>) -> ChildSpendEvent {
+        ChildSpendEvent {
+            handle: "sa_12".into(),
+            run: "9f3c2a71d04e6b85".into(),
+            spend_seq: 3,
+            agent: "reviewer".into(),
+            parent_handle: parent.map(Into::into),
+            kind: "turn".into(),
+            model: "anthropic/claude-sonnet-4-6".into(),
+            input_tokens: 1200,
+            output_tokens: 340,
+            cache_read_input_tokens: 45000,
+            cache_creation_input_tokens: 2100,
+            cache_creation_5m: ttl.map(|t| t.0),
+            cache_creation_1h: ttl.map(|t| t.1),
+            cost_usd: 0.031245,
+            cost_nanousd: 31_245_000,
+            session_cost_usd: 4.517032,
+            child_cost_usd: 1.204118,
+        }
+    }
+
+    /// The draft-2 example frame, as the spec shows it and PD vendors it.
+    const DRAFT2: &str = r#"{"type":"event","session_id":"20261018-091203-a1b2","seq":4182,"ts":"2026-10-18T14:12:03.512Z","event":{"ev":"child_spend","handle":"sa_12","run":"9f3c2a71d04e6b85","spend_seq":3,"agent":"reviewer","parent_handle":null,"kind":"turn","model":"anthropic/claude-sonnet-4-6","input_tokens":1200,"output_tokens":340,"cache_read_input_tokens":45000,"cache_creation_input_tokens":2100,"cache_creation_5m":2100,"cache_creation_1h":0,"cost_usd":0.031245,"cost_nanousd":31245000,"session_cost_usd":4.517032,"child_cost_usd":1.204118}}"#;
+
+    fn draft2_event() -> serde_json::Value {
+        serde_json::from_str::<serde_json::Value>(DRAFT2).unwrap()["event"].clone()
+    }
+
+    #[test]
+    fn the_frame_has_exactly_the_frozen_names() {
+        let v = serde_json::to_value(WireSessionEvent::ChildSpend(frame(None, Some((2100, 0))))).unwrap();
+        let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        let mut want = vec![
+            "ev",
+            "handle",
+            "run",
+            "spend_seq",
+            "agent",
+            "parent_handle",
+            "kind",
+            "model",
+            "input_tokens",
+            "output_tokens",
+            "cache_read_input_tokens",
+            "cache_creation_input_tokens",
+            "cache_creation_5m",
+            "cache_creation_1h",
+            "cost_usd",
+            "cost_nanousd",
+            "session_cost_usd",
+            "child_cost_usd",
+        ];
+        want.sort_unstable();
+        assert_eq!(keys, want);
+        assert_eq!(v, draft2_event(), "the draft-2 example, value for value");
+
+        // The foreground's worker and a route without a TTL split: null, not
+        // absent.
+        let v = serde_json::to_value(WireSessionEvent::ChildSpend(frame(None, None))).unwrap();
+        for key in ["parent_handle", "cache_creation_5m", "cache_creation_1h"] {
+            assert!(v.get(key).is_some_and(serde_json::Value::is_null), "{key}: {v}");
+        }
+        let v = serde_json::to_value(WireSessionEvent::ChildSpend(frame(Some("sa_3"), None))).unwrap();
+        assert_eq!(v["parent_handle"], "sa_3");
+    }
+
+    #[test]
+    fn the_frame_round_trips_through_the_socket_and_the_in_process_mirror() {
+        // The draft-2 example decodes, envelope and all.
+        match decode_line::<DaemonFrame>(DRAFT2).unwrap() {
+            DaemonFrame::Event(env) => match env.event {
+                WireSessionEvent::ChildSpend(e) => assert_eq!(e, frame(None, Some((2100, 0)))),
+                other => panic!("{other:?}"),
+            },
+            other => panic!("{other:?}"),
+        }
+        let summary = ChildSpendEvent {
+            kind: "summary".into(),
+            cost_nanousd: u64::MAX,
+            ..frame(Some("sa_12"), None)
+        };
+        for f in [frame(None, Some((2100, 0))), frame(Some("sa_3"), None), summary] {
+            let line = encode_line(&WireSessionEvent::ChildSpend(f.clone())).unwrap();
+            assert!(line.starts_with(r#"{"ev":"child_spend","#), "{line}");
+            match decode_line::<WireSessionEvent>(line.trim_end()).unwrap() {
+                WireSessionEvent::ChildSpend(back) => assert_eq!(back, f),
+                other => panic!("{other:?}"),
+            }
+            match WireSessionEvent::for_client(SessionEventWire::ChildSpend(f.clone())).unwrap() {
+                WireSessionEvent::ChildSpend(back) => assert_eq!(back, f),
+                other => panic!("{other:?}"),
+            }
+            match SessionEventWire::from(WireSessionEvent::ChildSpend(f.clone())) {
+                SessionEventWire::ChildSpend(back) => assert_eq!(back, f),
+                other => panic!("{other:?}"),
+            }
+        }
+        // An unknown kind is a string like any other (the set is open).
+        let mut v = draft2_event();
+        v["kind"] = "batch".into();
+        match serde_json::from_value::<WireSessionEvent>(v).unwrap() {
+            WireSessionEvent::ChildSpend(e) => assert_eq!(e.kind, "batch"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// An old client's decoder: the same tag and catch-all as
+    /// `WireSessionEvent`, without `child_spend`.
+    #[derive(Debug, Deserialize)]
+    #[serde(tag = "ev", rename_all = "snake_case")]
+    enum OldWireSessionEvent {
+        Idle,
+        CostCapReached {
+            #[allow(dead_code)]
+            scope: String,
+        },
+        #[serde(other)]
+        Unknown,
+    }
+
+    #[test]
+    fn an_old_client_reads_the_frame_as_unknown_and_the_rest_as_before() {
+        let line = encode_line(&WireSessionEvent::ChildSpend(frame(Some("sa_1"), None))).unwrap();
+        assert!(matches!(
+            decode_line::<OldWireSessionEvent>(line.trim_end()).unwrap(),
+            OldWireSessionEvent::Unknown
+        ));
+        let idle = encode_line(&WireSessionEvent::Idle).unwrap();
+        assert!(matches!(decode_line::<OldWireSessionEvent>(idle.trim_end()).unwrap(), OldWireSessionEvent::Idle));
+        let cap = encode_line(&WireSessionEvent::CostCapReached { scope: "session".into(), cost: 1.0, cap: 1.0 }).unwrap();
+        assert!(matches!(
+            decode_line::<OldWireSessionEvent>(cap.trim_end()).unwrap(),
+            OldWireSessionEvent::CostCapReached { .. }
+        ));
+        // A newer kind still is Unknown to this build.
+        assert!(matches!(
+            decode_line::<WireSessionEvent>(r#"{"ev":"child_spend_zz","handle":"sa_1"}"#).unwrap(),
+            WireSessionEvent::Unknown
+        ));
+    }
+
+    #[test]
+    fn the_frame_is_named_exactly_child_spend() {
+        assert_eq!(EVENT_CHILD_SPEND, "child_spend");
+        let v = serde_json::to_value(WireSessionEvent::ChildSpend(frame(None, None))).unwrap();
+        assert_eq!(v["ev"], EVENT_CHILD_SPEND);
+    }
+
+    /// §7.4: the lag notice is exactly `{"ev":"child_spend_lagged","dropped":N}`,
+    /// round-trips both ways, and an old decoder reads it as Unknown.
+    #[test]
+    fn the_lag_notice_is_child_spend_lagged_with_dropped_only() {
+        let v = serde_json::to_value(WireSessionEvent::ChildSpendLagged { dropped: 7 }).unwrap();
+        assert_eq!(v, serde_json::json!({"ev": "child_spend_lagged", "dropped": 7}));
+        let line = encode_line(&WireSessionEvent::for_client(SessionEventWire::ChildSpendLagged { dropped: 7 }).unwrap()).unwrap();
+        match decode_line::<WireSessionEvent>(line.trim_end()).unwrap() {
+            WireSessionEvent::ChildSpendLagged { dropped } => assert_eq!(dropped, 7),
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            SessionEventWire::from(WireSessionEvent::ChildSpendLagged { dropped: 7 }),
+            SessionEventWire::ChildSpendLagged { dropped: 7 }
+        ));
+        assert!(matches!(
+            decode_line::<OldWireSessionEvent>(line.trim_end()).unwrap(),
+            OldWireSessionEvent::Unknown
+        ));
+    }
+
+    /// The opt-in: "child_spend" is negotiated like the other optional
+    /// names, and it covers both the frame and the lag notice.
+    #[test]
+    fn child_spend_is_negotiated_per_connection() {
+        let none = AcceptedEvents::negotiate(&[]);
+        let spend = AcceptedEvents::negotiate(&["child_spend".into(), "bogus".into()]);
+        assert_eq!(spend.names(), vec!["child_spend".to_string()]);
+        assert!(spend.accepts(EVENT_CHILD_SPEND) && !none.accepts(EVENT_CHILD_SPEND));
+        for ev in [
+            SessionEventWire::ChildSpend(frame(None, None)),
+            SessionEventWire::ChildSpendLagged { dropped: 1 },
+        ] {
+            assert!(spend.allows(&ev) && !none.allows(&ev), "{ev:?}");
+        }
+        assert!(none.allows(&SessionEventWire::Idle));
     }
 }

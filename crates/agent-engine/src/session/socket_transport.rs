@@ -15,7 +15,9 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 
 use super::handle::CMD_CHAN_CAP;
-use super::transport::{ClientTransport, TransportError, ATTACH_TIMEOUT, ATTACH_TIMEOUT_PARKED};
+use super::transport::{
+    ClientTransport, TransportError, ATTACH_TIMEOUT, ATTACH_TIMEOUT_PARKED, ATTACH_TIMEOUT_RESTORING,
+};
 use super::types::*;
 use super::view::RuntimeView;
 use super::wire::*;
@@ -66,6 +68,14 @@ pub struct Pong {
     pub sessions: usize,
 }
 
+/// A reload the daemon accepted ([`SocketTransport::reload_with`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reloaded {
+    pub generation: u64,
+    /// The workers whose records a forced reload went ahead without.
+    pub waived: Vec<WaivedWorker>,
+}
+
 /// What `synaps auth state` got from the daemon.
 #[derive(Debug)]
 pub enum AuthStateReply {
@@ -80,6 +90,106 @@ pub enum AuthStateReply {
 /// unknown-variant error behind "malformed frame: "), and nothing else.
 pub fn predates_auth_state(message: &str) -> bool {
     message.starts_with("malformed frame: unknown variant `auth_state`")
+}
+
+/// What `synaps models --favorites` got from the daemon.
+#[derive(Debug)]
+pub enum ModelFavoritesReply {
+    Answer {
+        models: Vec<crate::model_picker::FavoriteModel>,
+        plugins_loaded: bool,
+        live_providers: Vec<String>,
+    },
+    /// The daemon predates `ModelFavorites`: its `Welcome` does not list the
+    /// feature, or it answered the frame as an old daemon answers any frame
+    /// it cannot decode. Its version and build, from its `Welcome`.
+    DaemonPredates { daemon_version: String, daemon_build: String },
+}
+
+/// An old daemon's reply to `ModelFavorites` (daemon/conn.rs `Read::Bad`),
+/// and nothing else.
+pub fn predates_model_favorites(message: &str) -> bool {
+    message.starts_with("malformed frame: unknown variant `model_favorites`")
+}
+
+/// Why a control query with one deadline for the whole exchange got no
+/// answer.
+#[derive(Debug, thiserror::Error)]
+pub enum QueryError {
+    /// Nothing came back by the deadline (connect, handshake and reply
+    /// together): the daemon is busy or silent.
+    #[error("no answer by the deadline")]
+    TimedOut,
+    #[error(transparent)]
+    Transport(TransportError),
+}
+
+impl QueryError {
+    /// For a step bounded by its own budget, which never ends in `TimedOut`.
+    fn into_transport(self) -> TransportError {
+        match self {
+            QueryError::Transport(e) => e,
+            QueryError::TimedOut => TransportError::Protocol("timed out".into()),
+        }
+    }
+}
+
+/// How long one step of a control connection may take: its own budget (an
+/// elapsed one is the `Protocol` error "<step> timed out", as always), or
+/// the one deadline a caller set for the whole query.
+#[derive(Clone, Copy)]
+enum Bound {
+    Own,
+    Until(tokio::time::Instant),
+}
+
+impl Bound {
+    async fn run<T>(
+        self,
+        own: Duration,
+        step: &'static str,
+        fut: impl std::future::Future<Output = Result<T, TransportError>>,
+    ) -> Result<T, QueryError> {
+        match self {
+            Bound::Own => match tokio::time::timeout(own, fut).await {
+                Ok(result) => result.map_err(QueryError::Transport),
+                Err(_) => Err(QueryError::Transport(TransportError::Protocol(format!("{step} timed out")))),
+            },
+            Bound::Until(deadline) => match tokio::time::timeout_at(deadline, fut).await {
+                Ok(result) => result.map_err(QueryError::Transport),
+                Err(_) => Err(QueryError::TimedOut),
+            },
+        }
+    }
+}
+
+/// A daemon frame named by its kind (and a reply's id), never by its
+/// payload: for a diagnostic about a frame that was not the answer.
+fn frame_summary(frame: &DaemonFrame) -> String {
+    let kind = match frame {
+        DaemonFrame::Welcome(_) => "welcome",
+        DaemonFrame::Refused { .. } => "refused",
+        DaemonFrame::Pong { .. } => "pong",
+        DaemonFrame::SessionList { .. } => "session_list",
+        DaemonFrame::Attached(_) => "attached",
+        DaemonFrame::Event(_) => "event",
+        DaemonFrame::Error { session_id: Some(_), .. } => "a session's error",
+        DaemonFrame::Error { session_id: None, .. } => "error",
+        DaemonFrame::Closed { .. } => "closed",
+        DaemonFrame::Pinned { .. } => "pinned",
+        DaemonFrame::Renamed { .. } => "renamed",
+        DaemonFrame::RenameFailed { .. } => "rename_failed",
+        DaemonFrame::ExtensionReloaded { .. } => "extension_reloaded",
+        DaemonFrame::ExtensionReloadFailed { .. } => "extension_reload_failed",
+        DaemonFrame::Bye { .. } => "bye",
+        DaemonFrame::ChildList(_) => "child_list",
+        DaemonFrame::ThinkingOptionsResult { .. } => "thinking_options_result",
+        DaemonFrame::AuthState { .. } => "auth_state",
+        DaemonFrame::ModelFavoritesResult { id: Some(id), .. } => return format!("model_favorites_result {id}"),
+        DaemonFrame::ModelFavoritesResult { id: None, .. } => "model_favorites_result without an id",
+        DaemonFrame::SandboxStatusResult(_) => "sandbox_status_result",
+    };
+    kind.to_string()
 }
 
 /// Reused line buffer for `read_frame`: a big `Attached`/`MessageHistory`
@@ -105,7 +215,25 @@ impl FrameBuf {
     }
 }
 
+/// How much a diagnostic about a frame may say.
+#[derive(Clone, Copy)]
+enum Detail {
+    /// The decoder's own message (it may quote a value from the frame).
+    Full,
+    /// The frame's size only, never a value from it.
+    SizeOnly,
+}
+
 async fn read_frame(reader: &mut BufReader<ClientReadHalf>, buf: &mut FrameBuf) -> Result<Option<DaemonFrame>, TransportError> {
+    read_frame_as(reader, buf, Detail::Full).await
+}
+
+/// [`read_frame`], a frame that does not decode reported as `detail` allows.
+async fn read_frame_as(
+    reader: &mut BufReader<ClientReadHalf>,
+    buf: &mut FrameBuf,
+    detail: Detail,
+) -> Result<Option<DaemonFrame>, TransportError> {
     // Cancel-safe: the TUI polls this inside `select!`, so a partial line
     // stays in `buf.line` across a dropped future and is cleared only once
     // a whole frame has been taken out of it.
@@ -128,7 +256,15 @@ async fn read_frame(reader: &mut BufReader<ClientReadHalf>, buf: &mut FrameBuf) 
                 .map(str::trim_end);
             match t {
                 Ok("") => None,
-                Ok(t) => Some((decode_line::<DaemonFrame>(t).map(Some).map_err(TransportError::Protocol), t.len())),
+                Ok(t) => Some((
+                    decode_line::<DaemonFrame>(t).map(Some).map_err(|e| match detail {
+                        Detail::Full => TransportError::Protocol(e),
+                        Detail::SizeOnly => {
+                            TransportError::Protocol(format!("a frame that does not decode ({} bytes)", t.len()))
+                        }
+                    }),
+                    t.len(),
+                )),
                 Err(e) => Some((Err(e), 0)),
             }
         };
@@ -167,9 +303,15 @@ impl Connected {
     /// Hello/Welcome only. `Refused{Version}` → `TransportError::Version`;
     /// any other refusal → `Protocol`.
     pub async fn connect(path: &Path, hello: Hello) -> Result<Self, TransportError> {
-        let stream = tokio::time::timeout(CONNECT_TIMEOUT, crate::ipc::connect(path))
-            .await
-            .map_err(|_| TransportError::Protocol("connect timed out".into()))??;
+        Self::connect_bounded(path, hello, Bound::Own, Detail::Full).await.map_err(QueryError::into_transport)
+    }
+
+    /// [`Connected::connect`], each step bounded by `bound`, a `Welcome`
+    /// that does not decode reported as `detail` allows.
+    async fn connect_bounded(path: &Path, hello: Hello, bound: Bound, detail: Detail) -> Result<Self, QueryError> {
+        let stream = bound
+            .run(CONNECT_TIMEOUT, "connect", async { Ok::<_, TransportError>(crate::ipc::connect(path).await?) })
+            .await?;
         let (r, w) = crate::ipc::split_client(stream);
         let mut reader = BufReader::new(r);
         let (writer, writer_task) = spawn_writer(w);
@@ -179,15 +321,13 @@ impl Connected {
         writer
             .send(ClientFrame::Hello(hello))
             .await
-            .map_err(|_| TransportError::Closed)?;
-        let frame = tokio::time::timeout(HANDSHAKE_TIMEOUT, read_frame(&mut reader, &mut buf))
-            .await
-            .map_err(|_| TransportError::Protocol("handshake timed out".into()))??;
-        match frame {
+            .map_err(|_| QueryError::Transport(TransportError::Closed))?;
+        let frame = bound.run(HANDSHAKE_TIMEOUT, "handshake", read_frame_as(&mut reader, &mut buf, detail)).await?;
+        let connected = match frame {
+            Some(DaemonFrame::Welcome(welcome)) if welcome.protocol_version != client_version => {
+                Err(TransportError::Version { client: client_version, daemon: welcome.protocol_version })
+            }
             Some(DaemonFrame::Welcome(welcome)) => {
-                if welcome.protocol_version != client_version {
-                    return Err(TransportError::Version { client: client_version, daemon: welcome.protocol_version });
-                }
                 Ok(Self { reader, writer, writer_task, welcome, path: path.to_path_buf(), hello: hello_copy, buf })
             }
             Some(DaemonFrame::Refused { reason: RefuseReason::Version { daemon_version, .. }, .. }) => {
@@ -196,17 +336,29 @@ impl Connected {
             Some(DaemonFrame::Refused { reason, message }) => {
                 Err(TransportError::Protocol(format!("refused ({reason:?}): {message}")))
             }
-            Some(other) => Err(TransportError::Protocol(format!("expected welcome, got {other:?}"))),
+            // The daemon's own word on this connection.
+            Some(DaemonFrame::Error { session_id: None, message }) => {
+                Err(TransportError::Protocol(format!("expected welcome, got error: {message}")))
+            }
+            // Anything else by its kind only, never its payload.
+            Some(other) => Err(TransportError::Protocol(format!("expected welcome, got {}", frame_summary(&other)))),
             None => Err(TransportError::Closed),
-        }
+        };
+        connected.map_err(QueryError::Transport)
     }
 
     async fn request(&mut self, frame: ClientFrame) -> Result<DaemonFrame, TransportError> {
-        self.writer.send(frame).await.map_err(|_| TransportError::Closed)?;
-        tokio::time::timeout(HANDSHAKE_TIMEOUT, read_frame(&mut self.reader, &mut self.buf))
-            .await
-            .map_err(|_| TransportError::Protocol("reply timed out".into()))??
-            .ok_or(TransportError::Closed)
+        self.request_bounded(frame, Bound::Own, Detail::Full).await.map_err(QueryError::into_transport)
+    }
+
+    /// [`Connected::request`], the reply bounded by `bound`, a reply that
+    /// does not decode reported as `detail` allows.
+    async fn request_bounded(&mut self, frame: ClientFrame, bound: Bound, detail: Detail) -> Result<DaemonFrame, QueryError> {
+        self.writer.send(frame).await.map_err(|_| QueryError::Transport(TransportError::Closed))?;
+        bound
+            .run(HANDSHAKE_TIMEOUT, "reply", read_frame_as(&mut self.reader, &mut self.buf, detail))
+            .await?
+            .ok_or(QueryError::Transport(TransportError::Closed))
     }
 
     pub async fn ping(&mut self) -> Result<Pong, TransportError> {
@@ -246,6 +398,33 @@ impl Connected {
             }
             DaemonFrame::Error { message, .. } => Err(TransportError::Protocol(message)),
             other => Err(TransportError::Protocol(format!("expected auth state, got {other:?}"))),
+        }
+    }
+
+    /// `ModelFavorites` → the daemon's Favorites view, by `deadline`. A
+    /// daemon whose `Welcome` lacks the feature is not asked; it and a
+    /// daemon that answers "unknown variant" are
+    /// [`ModelFavoritesReply::DaemonPredates`]. The answer is the result
+    /// with this `id`; a session-less `Error` is the daemon's failure of
+    /// this query. Any other frame is an error that names only its kind
+    /// (and id), and a reply that does not decode one that names only its
+    /// size: never a value it carries.
+    pub async fn model_favorites(&mut self, id: u64, deadline: tokio::time::Instant) -> Result<ModelFavoritesReply, QueryError> {
+        let (daemon_version, daemon_build) = (self.welcome.daemon_version.clone(), self.welcome.daemon_build.clone());
+        let predates = move || ModelFavoritesReply::DaemonPredates { daemon_version, daemon_build };
+        if !self.welcome.features.iter().any(|f| f == crate::daemon::control_queries::FEATURE_MODEL_FAVORITES) {
+            return Ok(predates());
+        }
+        match self.request_bounded(ClientFrame::ModelFavorites { id: Some(id) }, Bound::Until(deadline), Detail::SizeOnly).await? {
+            DaemonFrame::ModelFavoritesResult { id: Some(got), models, plugins_loaded, live_providers } if got == id => {
+                Ok(ModelFavoritesReply::Answer { models, plugins_loaded, live_providers })
+            }
+            DaemonFrame::Error { session_id: None, message } if predates_model_favorites(&message) => Ok(predates()),
+            DaemonFrame::Error { session_id: None, message } => Err(QueryError::Transport(TransportError::Protocol(message))),
+            other => Err(QueryError::Transport(TransportError::Protocol(format!(
+                "expected model favorites {id}, got {}",
+                frame_summary(&other)
+            )))),
         }
     }
 
@@ -513,23 +692,37 @@ impl SocketTransport {
 
     /// Attach (existing or create) on a handshaken connection. `AttachRefused`
     /// and `DaemonFrame::Error` alike → `TransportError::Refused`. Waits
-    /// `ATTACH_TIMEOUT_PARKED` when the daemon lists the session as `Parked`.
+    /// `ATTACH_TIMEOUT_PARKED` when the daemon lists the session as `Parked`,
+    /// and `ATTACH_TIMEOUT_RESTORING` when it lists the session (or the
+    /// `--continue` target) as `restoring`.
     pub async fn attach(mut conn: Connected, attach: Attach) -> Result<(Self, AttachSnapshot), TransportError> {
-        let (mode, parked) = match &attach {
-            Attach::Existing { session_id, mode } => (
+        let listed = |id: &str| conn.welcome.sessions.iter().find(|m| m.id.as_str() == id || m.journal_id == id);
+        let (mode, parked, restoring) = match &attach {
+            Attach::Existing { session_id, mode } => {
+                let m = listed(session_id.as_str());
+                (
+                    *mode,
+                    m.is_some_and(|m| m.lifecycle == SessionLifecycle::Parked),
+                    m.is_some_and(|m| m.restoring),
+                )
+            }
+            Attach::Create { mode, config } => (
                 *mode,
-                conn.welcome
-                    .sessions
-                    .iter()
-                    .any(|m| &m.id == session_id && m.lifecycle == SessionLifecycle::Parked),
+                false,
+                matches!(&config.continue_session, Some(Some(id)) if listed(id).is_some_and(|m| m.restoring)),
             ),
-            Attach::Create { mode, .. } => (*mode, false),
         };
         conn.writer
             .send(ClientFrame::Attach(attach))
             .await
             .map_err(|_| TransportError::Closed)?;
-        let budget = if parked { ATTACH_TIMEOUT_PARKED } else { ATTACH_TIMEOUT };
+        let budget = if restoring {
+            ATTACH_TIMEOUT_RESTORING
+        } else if parked {
+            ATTACH_TIMEOUT_PARKED
+        } else {
+            ATTACH_TIMEOUT
+        };
         let deadline = tokio::time::Instant::now() + budget;
         let attached = loop {
             let frame = tokio::time::timeout_at(deadline, read_frame(&mut conn.reader, &mut conn.buf))
@@ -703,13 +896,42 @@ impl SocketTransport {
         reply
     }
 
+    /// `ModelFavorites` on a control connection (see
+    /// [`Connected::model_favorites`]). `deadline` bounds the query:
+    /// connect, handshake and reply, not the caller's whole command. Past
+    /// it the answer is [`QueryError::TimedOut`] and the connection is
+    /// dropped; after any other outcome, saying goodbye adds at most
+    /// 200 ms. A `Welcome` that does not decode is reported by its size
+    /// only, as a reply is.
+    pub async fn model_favorites(path: &Path, deadline: tokio::time::Instant) -> Result<ModelFavoritesReply, QueryError> {
+        let mut c = Connected::connect_bounded(path, Hello::new(ClientKind::Attach), Bound::Until(deadline), Detail::SizeOnly).await?;
+        let reply = c.model_favorites(1, deadline).await;
+        if !matches!(reply, Err(QueryError::TimedOut)) {
+            c.bye().await;
+        }
+        reply
+    }
+
     /// `Reload{..}` on a control connection. `Ok(generation)` once the daemon
     /// answered `Bye{Reloading{generation}}` (it is about to exec);
     /// `Refused{ReloadRefused}` / `Error` → `Err`.
     pub async fn reload(path: &Path, now: bool, drain_secs: Option<u64>, exe: Option<PathBuf>) -> Result<u64, TransportError> {
+        Self::reload_with(path, now, drain_secs, exe, false).await.map(|r| r.generation)
+    }
+
+    /// [`Self::reload`], `force`d or not (spec §5: a forced reload goes
+    /// ahead without the records of workers its check finds not durable;
+    /// an older daemon ignores the flag). The reply names those workers.
+    pub async fn reload_with(
+        path: &Path,
+        now: bool,
+        drain_secs: Option<u64>,
+        exe: Option<PathBuf>,
+        force: bool,
+    ) -> Result<Reloaded, TransportError> {
         let mut c = Connected::connect(path, Hello::new(ClientKind::Attach)).await?;
         c.writer
-            .send(ClientFrame::Reload { now, drain_secs, exe })
+            .send(ClientFrame::Reload { now, drain_secs, exe, force })
             .await
             .map_err(|_| TransportError::Closed)?;
         // Drain + checkpoint can take a while: wait up to drain + 60 s.
@@ -718,7 +940,9 @@ impl SocketTransport {
             .await
             .map_err(|_| TransportError::Protocol("reload reply timed out".into()))??;
         match frame {
-            Some(DaemonFrame::Bye { reason: Some(ByeReason::Reloading { generation, .. }) }) => Ok(generation),
+            Some(DaemonFrame::Bye { reason: Some(ByeReason::Reloading { generation, waived, .. }) }) => {
+                Ok(Reloaded { generation, waived })
+            }
             Some(DaemonFrame::Bye { .. }) => Err(TransportError::Protocol("daemon said bye without a reload reason".into())),
             Some(DaemonFrame::Refused { reason: RefuseReason::ReloadRefused { why }, .. }) => Err(TransportError::Refused(why)),
             Some(DaemonFrame::Refused { message, .. }) | Some(DaemonFrame::Error { message, .. }) => Err(TransportError::Refused(message)),
@@ -786,7 +1010,7 @@ impl SocketTransport {
                 }
                 None
             }
-            WireSessionEvent::QueryResult { id, value } if id == DIGEST_RESYNC_QUERY_ID => {
+            WireSessionEvent::QueryResult { id, value, .. } if id == DIGEST_RESYNC_QUERY_ID => {
                 if let Ok(msgs) = serde_json::from_value::<Vec<serde_json::Value>>(value) {
                     self.messages = msgs.into_iter().map(Arc::new).collect();
                 }
@@ -1053,6 +1277,10 @@ mod tests {
                         progressive_tool_disclosure: true,
                         generation: 1,
                         daemon_build: String::new(),
+                        features: vec![],
+                        accepted_events: vec![],
+                        config_path: None,
+                        memory_backend: None,
                     })
                 }
                 ClientFrame::Ping => DaemonFrame::Pong { pid: 1, uptime_s: 0, sessions: 0 },
@@ -1070,6 +1298,7 @@ mod tests {
                         client_input: ClientInput::wire_default(),
                         input_owner: Some(ClientId(7)),
                         display_tail: None,
+                        client_tools: Default::default(),
                     },
                 )),
                 ClientFrame::Cmd { cmd: SessionCommand::Submit { text, .. }, .. } => {
@@ -1078,7 +1307,8 @@ mod tests {
                         session_id: sid.clone(),
                         seq,
                         ts: chrono::Utc::now(),
-                        event: SessionEventWire::Stream(StreamEvent::Llm(LlmEvent::Text(text))).into(),
+                        event: WireSessionEvent::for_client(SessionEventWire::Stream(StreamEvent::Llm(LlmEvent::Text(text))))
+                            .unwrap(),
                     })
                 }
                 ClientFrame::Cmd { cmd: SessionCommand::Set { id, .. }, .. } => {
@@ -1089,15 +1319,16 @@ mod tests {
                         session_id: sid.clone(),
                         seq,
                         ts: chrono::Utc::now(),
-                        event: SessionEventWire::SettingChanged(SettingApplied {
+                        event: WireSessionEvent::for_client(SessionEventWire::SettingChanged(SettingApplied {
                             id,
                             setting: "model".into(),
                             ok: true,
                             message: None,
                             view,
                             clamp: None,
-                        })
-                        .into(),
+                            memory_only_tools: None,
+                        }))
+                        .unwrap(),
                     })
                 }
                 // Checkpoint = "the daemon is about to reload": Reloading event, then Bye{Reloading}.
@@ -1110,7 +1341,9 @@ mod tests {
                         event: WireSessionEvent::Reloading { generation: 2, retry_after_ms: 500 },
                     });
                     w.write_all(encode_line(&ev).unwrap().as_bytes()).await.unwrap();
-                    let bye = DaemonFrame::Bye { reason: Some(ByeReason::Reloading { generation: 2, retry_after_ms: 500 }) };
+                    let bye = DaemonFrame::Bye {
+                        reason: Some(ByeReason::Reloading { generation: 2, retry_after_ms: 500, waived: Vec::new() }),
+                    };
                     w.write_all(encode_line(&bye).unwrap().as_bytes()).await.unwrap();
                     break;
                 }
@@ -1140,7 +1373,7 @@ mod tests {
                         session_id: sid.clone(),
                         seq,
                         ts: chrono::Utc::now(),
-                        event: SessionEventWire::Conversation(snap).into(),
+                        event: WireSessionEvent::for_client(SessionEventWire::Conversation(snap)).unwrap(),
                     })
                 }
                 ClientFrame::Cmd { cmd: SessionCommand::Query { id, query: SessionQuery::Messages }, .. } => {
@@ -1152,6 +1385,7 @@ mod tests {
                         event: WireSessionEvent::QueryResult {
                             id,
                             value: serde_json::json!([{"role":"user","content":"drifted"}]),
+                            client_tools: None,
                         },
                     })
                 }
@@ -1254,6 +1488,20 @@ mod tests {
         let _ = srv.await;
     }
 
+    #[test]
+    fn predates_model_favorites_matches_only_its_own_unknown_variant() {
+        assert!(predates_model_favorites("malformed frame: unknown variant `model_favorites`, expected one of `hello`, `ping`"));
+        for other in [
+            "malformed frame: unknown variant `auth_state`, expected one of `hello`, `ping`",
+            "malformed frame: unknown variant `model_favorites_v2`",
+            "model favorites: task failed",
+            "control frames are not accepted on an attached connection",
+            "",
+        ] {
+            assert!(!predates_model_favorites(other), "{other:?}");
+        }
+    }
+
     #[tokio::test]
     async fn socket_transport_handshake_attach_pump() {
         let (_d, path) = sock();
@@ -1342,7 +1590,11 @@ mod tests {
             .unwrap();
         assert_eq!(t.mode(), AttachMode::Observe);
         assert!(t.last_error().is_none());
-        t.send(SessionCommand::Checkpoint { reason: CheckpointReason::Reload }).await.unwrap();
+        t.send(SessionCommand::Checkpoint {
+            reason: CheckpointReason::Reload,
+            deadline: None,
+            skip_quiesce_grace: false,
+        }).await.unwrap();
         let e = t.next_event().await.unwrap();
         assert!(matches!(e.event, SessionEventWire::Reloading { generation: 2, .. }));
         assert!(t.next_event().await.is_none());
@@ -1375,6 +1627,10 @@ mod tests {
                 progressive_tool_disclosure: true,
                 generation: 1,
                 daemon_build: String::new(),
+                features: vec![],
+                accepted_events: vec![],
+                config_path: None,
+                memory_backend: None,
             });
             w.write_all(encode_line(&welcome).unwrap().as_bytes()).await.unwrap();
             line.clear();

@@ -830,7 +830,7 @@ mod actor {
                         })
                         .await;
                 }
-                SessionEventWire::QueryResult { id, value } if id == COMPACT_TOKENS_QUERY => {
+                SessionEventWire::QueryResult { id, value, .. } if id == COMPACT_TOKENS_QUERY => {
                     eprintln!(
                         "\x1b[2m[compacted → ~{} tokens]\x1b[0m",
                         value["used_tokens"].as_u64().unwrap_or(0)
@@ -925,7 +925,7 @@ mod actor {
         /// Pump events until the reply for query `id` arrives.
         async fn reply(&mut self, t: &mut LocalTransport, id: u64) -> serde_json::Value {
             while let Some(env) = t.next_event().await {
-                if let SessionEventWire::QueryResult { id: rid, value } = &env.event {
+                if let SessionEventWire::QueryResult { id: rid, value, .. } = &env.event {
                     if *rid == id {
                         return value.clone();
                     }

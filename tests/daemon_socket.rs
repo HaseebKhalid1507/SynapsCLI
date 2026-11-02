@@ -357,7 +357,7 @@ async fn idle_exit_counts_clientless_idle_sessions_and_never_a_running_turn() {
                 assert_eq!(id, IDLE_PROBE_QUERY_ID);
                 assert!(cmd.from.is_none(), "idle probe is host-originated");
                 let value = serde_json::json!({ "streaming": s2.load(std::sync::atomic::Ordering::SeqCst), "pending_prompts": 0 });
-                let _ = events.send(Envelope { session_id: sid.clone(), seq: 0, ts: chrono::Utc::now(), event: SessionEventWire::QueryResult { id, value } });
+                let _ = events.send(Envelope { session_id: sid.clone(), seq: 0, ts: chrono::Utc::now(), event: SessionEventWire::QueryResult { id, value, client_tools: None } });
             }
         }
     });

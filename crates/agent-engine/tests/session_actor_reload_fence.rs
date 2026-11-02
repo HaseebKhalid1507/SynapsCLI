@@ -144,6 +144,8 @@ fn worker_finishing_during_the_checkpoint(f: &Fixture) {
             "SA7-RESULT",
             1.0,
             None,
+            None,
+            0,
         );
         queue.push(ev).unwrap();
         settle(&state);
@@ -152,7 +154,7 @@ fn worker_finishing_during_the_checkpoint(f: &Fixture) {
 
 async fn checkpoint_for_reload(f: &mut Fixture) -> Vec<CarriedWorker> {
     f.handle
-        .send(SessionCommand::Checkpoint { reason: CheckpointReason::Reload })
+        .send(SessionCommand::Checkpoint { reason: CheckpointReason::Reload, deadline: None, skip_quiesce_grace: false })
         .await
         .unwrap();
     let seen = until(&mut f.client, |e| {
@@ -373,7 +375,7 @@ async fn a_client_cannot_send_a_reload_checkpoint() {
     fake_worker(&f, "sa_3", "busy", &worker);
 
     f.client
-        .send_from_self(SessionCommand::Checkpoint { reason: CheckpointReason::Reload })
+        .send_from_self(SessionCommand::Checkpoint { reason: CheckpointReason::Reload, deadline: None, skip_quiesce_grace: false })
         .await
         .unwrap();
     let seen = until(&mut f.client, |e| matches!(e, SessionEventWire::Refused { .. })).await;

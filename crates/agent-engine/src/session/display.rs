@@ -1,10 +1,17 @@
 //! Daemon-side display projection of `api_messages` (PLAN-phase4 §2.3).
 //!
-//! EXACTLY the filter the TUI's `rebuild_display_messages` applied at
-//! 741b6b60 (helpers.rs:170-224): skip `<context-summary>` messages, skip
+//! The filter the TUI's `rebuild_display_messages` applied at 741b6b60
+//! (helpers.rs:170-224): skip `<context-summary>` messages, skip
 //! `<event …>…</event>` payloads, project user text and assistant
 //! thinking/text/tool_use blocks. Both `LocalTransport` and Digest socket
 //! clients build their transcript from this, so they cannot drift.
+//!
+//! Focus hold mode (S1, wire contract v1.3 §3.1): a released digest and
+//! the join block in front of a user message are event payloads too, but
+//! they come out as a [`DisplayItem::Held`] item (keyed on the envelope's
+//! `type` attribute, read structurally). A user message whose content is
+//! an array of blocks gives one item per text block (the join block, then
+//! the user's own text); tool results and attachments give none.
 //!
 //! No TUI types here — this crate never depends on agent-tui.
 
@@ -19,6 +26,22 @@ pub enum DisplayItem {
     Thinking { text: String },
     Text { text: String },
     ToolUse { tool_id: String, tool_name: String, input: String },
+    /// (S1) A released hold digest, or the join block in front of a user
+    /// message: `text` is the envelope exactly as in history.
+    Held { source: HeldSource, text: String },
+    /// A kind from a newer daemon.
+    #[serde(other)]
+    Unknown,
+}
+
+/// [`DisplayItem::Held`]'s `source`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HeldSource {
+    /// A `held_digest` user message.
+    Digest,
+    /// A `held_join` block.
+    Join,
 }
 
 /// The last `items.len()` display items of a history; `omitted` = how many
@@ -63,17 +86,87 @@ pub fn is_event_payload(content: &str) -> bool {
     content.starts_with("<event ") && content.ends_with("</event>")
 }
 
+/// The `type` and `severity` attributes of a canonical event payload, read
+/// structurally: the envelope opens `<event id="…" type="…" severity="…"`,
+/// and no attribute value holds a `"` (events/format.rs `attr`), so neither
+/// the id nor the text can pass for them.
+fn payload_head(content: &str) -> Option<(&str, &str)> {
+    if !is_event_payload(content) {
+        return None;
+    }
+    let rest = content.strip_prefix("<event id=\"")?;
+    let rest = &rest[rest.find('"')? + 1..];
+    let rest = rest.strip_prefix(" type=\"")?;
+    let end = rest.find('"')?;
+    let (kind, rest) = (&rest[..end], &rest[end + 1..]);
+    let rest = rest.strip_prefix(" severity=\"")?;
+    Some((kind, &rest[..rest.find('"')?]))
+}
+
+/// See [`payload_head`].
+pub fn event_payload_type(content: &str) -> Option<&str> {
+    payload_head(content).map(|(kind, _)| kind)
+}
+
+/// See [`payload_head`].
+pub fn event_payload_severity(content: &str) -> Option<&str> {
+    payload_head(content).map(|(_, severity)| severity)
+}
+
+/// What a user text (a string content, or one text block) shows as.
+enum UserText {
+    Skip,
+    User,
+    Held(HeldSource),
+}
+
+fn classify_user_text(text: &str) -> UserText {
+    if is_event_payload(text) {
+        return match event_payload_type(text) {
+            Some(super::held::HELD_DIGEST_TYPE) => UserText::Held(HeldSource::Digest),
+            Some(super::held::HELD_JOIN_TYPE) => UserText::Held(HeldSource::Join),
+            _ => UserText::Skip,
+        };
+    }
+    if text.contains("<context-summary>") {
+        return UserText::Skip;
+    }
+    UserText::User
+}
+
+fn push_user_text(text: &str, out: &mut Vec<DisplayItem>) {
+    match classify_user_text(text) {
+        UserText::Skip => {}
+        UserText::User => out.push(DisplayItem::User { text: text.to_string() }),
+        UserText::Held(source) => out.push(DisplayItem::Held {
+            source,
+            text: text.to_string(),
+        }),
+    }
+}
+
+/// A user message's texts: its string content, or each of its text blocks.
+fn user_texts(content: &serde_json::Value) -> impl Iterator<Item = &str> {
+    let (one, blocks) = match content {
+        serde_json::Value::String(s) => (Some(s.as_str()), None),
+        serde_json::Value::Array(blocks) => (None, Some(blocks.iter())),
+        _ => (None, None),
+    };
+    one.into_iter().chain(
+        blocks
+            .into_iter()
+            .flatten()
+            .filter(|b| b["type"] == "text")
+            .filter_map(|b| b["text"].as_str()),
+    )
+}
+
 /// Display items of ONE api message, in order. Empty for skipped messages.
 fn items_of(msg: &serde_json::Value, out: &mut Vec<DisplayItem>) {
-    if let Some(content) = msg["content"].as_str() {
-        if content.contains("<context-summary>") || is_event_payload(content) {
-            return;
-        }
-    }
     match msg["role"].as_str() {
         Some("user") => {
-            if let Some(content) = msg["content"].as_str() {
-                out.push(DisplayItem::User { text: content.to_string() });
+            for text in user_texts(&msg["content"]) {
+                push_user_text(text, out);
             }
         }
         Some("assistant") => {
@@ -110,13 +203,10 @@ fn items_of(msg: &serde_json::Value, out: &mut Vec<DisplayItem>) {
 /// no string clones (M4 — the daemon runs this over the whole history on
 /// every attach/compaction/resync).
 fn count_items_of(msg: &serde_json::Value) -> usize {
-    if let Some(content) = msg["content"].as_str() {
-        if content.contains("<context-summary>") || is_event_payload(content) {
-            return 0;
-        }
-    }
     match msg["role"].as_str() {
-        Some("user") => usize::from(msg["content"].is_string()),
+        Some("user") => user_texts(&msg["content"])
+            .filter(|t| !matches!(classify_user_text(t), UserText::Skip))
+            .count(),
         Some("assistant") => msg["content"]
             .as_array()
             .map(|blocks| {
@@ -251,6 +341,18 @@ mod tests {
             ]}),
             serde_json::json!({"role": "system", "content": "s"}),
             serde_json::json!({}),
+            // (S1, v1.3) a digest, a joined user message, an attachment submit.
+            serde_json::json!({"role": "user", "content": envelope("held_digest", "- [low] w: x (h-1)", Severity::Low)}),
+            serde_json::json!({"role": "user", "content": [
+                {"type": "text", "text": envelope("held_join", "", Severity::Medium)},
+                {"type": "text", "text": "q"}
+            ]}),
+            serde_json::json!({"role": "user", "content": [
+                {"type": "text", "text": "look"},
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AA=="}},
+                {"type": "text", "text": envelope("message", "steered", Severity::Low)},
+                {"type": "text"}
+            ]}),
         ];
         for m in &msgs {
             let mut v = Vec::new();
@@ -354,5 +456,86 @@ mod tests {
         assert_eq!(old.time(0), None);
         let round: DisplayTail = serde_json::from_value(serde_json::to_value(&all).unwrap()).unwrap();
         assert_eq!(round, all);
+    }
+
+    use crate::events::types::{Event, Severity};
+
+    /// An event payload as history holds it.
+    fn envelope(content_type: &str, text: &str, severity: Severity) -> String {
+        let mut e = Event::simple("synaps", text, Some(severity));
+        e.content.content_type = content_type.into();
+        crate::events::format_event_for_agent(&e)
+    }
+
+    fn user_blocks(texts: &[&str]) -> SharedMessage {
+        let blocks: Vec<serde_json::Value> =
+            texts.iter().map(|t| serde_json::json!({"type": "text", "text": t})).collect();
+        Arc::new(serde_json::json!({"role": "user", "content": blocks}))
+    }
+
+    /// (S1, v1.3) A digest and a join block come out as `held` items, keyed
+    /// on the envelope's type attribute; a joined user message gives the
+    /// held item, then the user's own text. Other events stay skipped, and
+    /// an event's text can't pass for the attribute.
+    #[test]
+    fn a_digest_and_a_join_block_are_held_items() {
+        let digest = envelope("held_digest", "- [low] w: x (h-1)", Severity::High);
+        let join = envelope("held_join", "", Severity::Medium);
+        let other = envelope("message", "type=\"held_digest\" severity=\"high\" is just text", Severity::Low);
+        let msgs = vec![
+            user(&digest),
+            user_blocks(&[&join, "my question"]),
+            user(&other),
+            user_blocks(&[&other, "after an event block"]),
+        ];
+        assert_eq!(
+            display_items(&msgs),
+            vec![
+                DisplayItem::Held { source: HeldSource::Digest, text: digest.clone() },
+                DisplayItem::Held { source: HeldSource::Join, text: join.clone() },
+                DisplayItem::User { text: "my question".into() },
+                DisplayItem::User { text: "after an event block".into() },
+            ]
+        );
+        assert_eq!(event_payload_type(&digest), Some("held_digest"));
+        assert_eq!(event_payload_severity(&digest), Some("high"));
+        assert_eq!(event_payload_type(&other), Some("message"));
+        assert_eq!(event_payload_severity(&other), Some("low"));
+        assert_eq!(event_payload_type("<event id=\"1\">e</event>"), None);
+        assert_eq!(event_payload_type("plain text"), None);
+    }
+
+    /// (S1, v1.3) A user message with array content gives one user item per
+    /// text block (an attachment submit's text was hidden before); images,
+    /// tool results and a context summary give none.
+    #[test]
+    fn array_user_content_gives_its_text_blocks() {
+        let msgs = vec![Arc::new(serde_json::json!({"role": "user", "content": [
+            {"type": "text", "text": "look at this"},
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AA=="}},
+            {"type": "text", "text": "<context-summary>s</context-summary>"},
+            {"type": "tool_result", "tool_use_id": "t", "content": "x"}
+        ]}))];
+        assert_eq!(display_items(&msgs), vec![DisplayItem::User { text: "look at this".into() }]);
+    }
+
+    /// (S1, v1.3) The `held` item's wire shape; a kind from a newer daemon
+    /// decodes as `Unknown` instead of failing the whole tail.
+    #[test]
+    fn the_held_item_shape_and_unknown_kinds() {
+        let item = DisplayItem::Held { source: HeldSource::Join, text: "<event>".into() };
+        assert_eq!(
+            serde_json::to_value(&item).unwrap(),
+            serde_json::json!({"kind": "held", "source": "join", "text": "<event>"})
+        );
+        let digest: DisplayItem =
+            serde_json::from_value(serde_json::json!({"kind": "held", "source": "digest", "text": "t"})).unwrap();
+        assert_eq!(digest, DisplayItem::Held { source: HeldSource::Digest, text: "t".into() });
+        let tail: DisplayTail = serde_json::from_value(serde_json::json!({
+            "items": [{"kind": "user", "text": "a"}, {"kind": "later_kind", "x": 1}],
+            "omitted": 0
+        }))
+        .unwrap();
+        assert_eq!(tail.items, vec![DisplayItem::User { text: "a".into() }, DisplayItem::Unknown]);
     }
 }

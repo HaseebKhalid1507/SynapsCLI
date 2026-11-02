@@ -736,6 +736,7 @@ async fn stale_draft_of_a_completed_turn_is_just_removed() {
         &TurnDraft {
             base_len: 1,
             partial_text: "hi".into(),
+            writer: None,
         },
     )
     .unwrap();

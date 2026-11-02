@@ -61,8 +61,11 @@ fn reference_reactor_ext_is_frozen() {
     // LF-normalised so a Windows `core.autocrlf` checkout hashes the same.
     let src = include_str!("support/reference_reactor_ext.rs").replace("\r\n", "\n");
     let hex = format!("{:x}", Sha256::digest(src.as_bytes()));
+    // Re-pinned for 945138c6e's compile-only `ToolResult { tool_id, result, .. }`
+    // (LlmEvent::ToolResult gained typed memory_only/client_tool); the
+    // oracle's behaviour is unchanged.
     assert_eq!(
-        hex, "b5a5f51210616157b53e655df41182afcd618f963f7def7753f5aee1aeff78ce",
+        hex, "895b0df4d828e4d57e4eb75fb6430ed972c3a5119330c538b5a8a701d80a5815",
         "tests/support/reference_reactor_ext.rs is a frozen oracle — do not edit"
     );
 }
@@ -274,21 +277,49 @@ impl ActorRun {
 
 /// Without the host-only message times (`_synaps_at`): wall-clock bytes,
 /// and the actor stamps the request it admits while the frozen reference
-/// predates message times.
+/// predates message times. Turn ids as in [`turn_ordinals`].
 fn msgs_json(m: &[synaps_cli::SharedMessage]) -> String {
     let re = regex::Regex::new(r#""_synaps_at":"[^"]*","#).unwrap();
-    re.replace_all(&serde_json::to_string(m).unwrap(), "").into_owned()
+    let turn = regex::Regex::new(r#"("_synaps_turn":\{"id":")([^"]*)("\})"#).unwrap();
+    let json = re
+        .replace_all(&serde_json::to_string(m).unwrap(), "")
+        .into_owned();
+    turn_ordinals(&json, &turn, &mut Vec::new())
+}
+
+/// Upstream's turn ids (`_synaps_turn.id`: a fresh UUID per new turn,
+/// host metadata stripped from every provider wire; context management is
+/// on by default here, so both sides stamp them) are run-random as well.
+/// Each distinct id becomes its first-seen ordinal, so which messages
+/// share a turn is still compared.
+fn turn_ordinals(s: &str, re: &regex::Regex, ids: &mut Vec<String>) -> String {
+    re.replace_all(s, |c: &regex::Captures| {
+        let n = match ids.iter().position(|id| *id == c[2]) {
+            Some(n) => n,
+            None => {
+                ids.push(c[2].to_string());
+                ids.len() - 1
+            }
+        };
+        format!("{}turn-{n}{}", &c[1], &c[3])
+    })
+    .into_owned()
 }
 
 /// `TurnError.correlation_id` comes from a process-global counter
-/// (`next_turn_correlation_id`) and message times (`_synaps_at`) from the
-/// wall clock — the only legitimately run-dependent bytes.
+/// (`next_turn_correlation_id`), message times (`_synaps_at`) from the
+/// wall clock and turn ids from a UUID ([`turn_ordinals`]) — the only
+/// legitimately run-dependent bytes.
 fn normalise(seen: &[String]) -> Vec<String> {
     let re = regex::Regex::new(r#"correlation_id: "turn-[0-9]+-[0-9]+""#).unwrap();
     let at = regex::Regex::new(r#""_synaps_at": String\("[^"]*"\), "#).unwrap();
+    let turn =
+        regex::Regex::new(r#"("_synaps_turn": Object \{"id": String\(")([^"]*)("\)\})"#).unwrap();
+    let mut ids = Vec::new();
     seen.iter()
         .map(|s| re.replace_all(s, r#"correlation_id: "turn-N-N""#).into_owned())
         .map(|s| at.replace_all(&s, "").into_owned())
+        .map(|s| turn_ordinals(&s, &turn, &mut ids))
         .collect()
 }
 
@@ -316,6 +347,18 @@ fn fixed_event(i: usize) -> synaps_cli::events::types::Event {
     ev.timestamp = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
         .unwrap()
         .with_timezone(&chrono::Utc);
+    ev
+}
+
+/// `fixed_event(i)` as the session socket queues it when it comes from
+/// this process with no sender named: the socket records that verdict as
+/// the event's peer, so the oracle, which takes the queue directly, gets
+/// the same event.
+fn socket_queued(i: usize) -> synaps_cli::events::types::Event {
+    let mut ev = fixed_event(i);
+    ev.peer = Some(synaps_cli::events::EventPeer::unverified(
+        synaps_cli::events::PeerReason::NoClaim,
+    ));
     ev
 }
 
@@ -392,7 +435,7 @@ async fn event_injection_idle_autoturn_until_cap() {
     // Oracle: push into the queue directly, wake, drive — 6×; the 6th parks.
     let mut o = oracle(&host).await;
     for i in 0..6 {
-        o.runtime.event_queue().push(fixed_event(i)).unwrap();
+        o.runtime.event_queue().push(socket_queued(i)).unwrap();
         o.on_queue_wake().await;
         o.drive_to_idle().await;
     }
@@ -791,7 +834,7 @@ async fn event_injection_busy_steered() {
     let o_path = oracle_journal_path(&o, &guard);
     o.submit("start".into()).await;
     pump_until_text(&mut o).await;
-    o.r.runtime.event_queue().push(fixed_event(0)).unwrap();
+    o.r.runtime.event_queue().push(socket_queued(0)).unwrap();
     o.on_queue_wake().await;
     assert!(o.r.pending_events.is_empty(), "live steer channel ⇒ Steered, not Buffered");
     o.drive_to_idle(None).await;

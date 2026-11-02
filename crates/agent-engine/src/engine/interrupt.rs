@@ -145,6 +145,71 @@ pub fn append_marker(messages: &mut Vec<SharedMessage>, reason: InterruptReason)
     true
 }
 
+/// Whether the history's last turn was interrupted for `reason` and nothing
+/// has answered since: the latest interruption marker is `reason`'s, and no
+/// assistant message follows it. What may follow it is what an interrupted
+/// turn leaves behind (events flushed after the marker, a host note), never
+/// a reply. A daemon reload's rehydrate uses it with
+/// [`InterruptReason::Restart`] to find the sessions whose turn the reload
+/// cut.
+pub fn ends_unanswered_after(messages: &[SharedMessage], reason: InterruptReason) -> bool {
+    for message in messages.iter().rev() {
+        if message["role"] == "assistant" {
+            return false;
+        }
+        if marker_of(message) {
+            return message["content"].as_str() == Some(reason.marker());
+        }
+    }
+    false
+}
+
+/// Whether a user message follows the history's latest interruption marker:
+/// something (a resume line, a nudge, an event, a prompt) reached the
+/// session after the interruption. A generated host note
+/// ([`is_tool_in_flight_note`]) does not count. A daemon's crash restore
+/// uses it so that a turn another sender already re-prompted is not resumed
+/// a second time. `false` when the history has no marker.
+pub fn prompted_after_latest_marker(messages: &[SharedMessage]) -> bool {
+    prompted_after_cut_tail(messages, 0)
+}
+
+/// How many messages follow the history's latest interruption marker
+/// (`None`: no marker). A reload's checkpoint records it once the cut
+/// turn's own tail (events that arrived during the turn, a host note) is
+/// in, so the next image can tell that tail from what came after the cut
+/// ([`prompted_after_cut_tail`]).
+pub fn after_latest_marker(messages: &[SharedMessage]) -> Option<usize> {
+    messages.iter().rev().position(|m| marker_of(m))
+}
+
+/// [`prompted_after_latest_marker`], not counting the first `tail` messages
+/// after the marker: the cut turn's own tail, recorded at the cut
+/// ([`after_latest_marker`]). A user message past that tail (a nudge, a
+/// resume, an event that arrived after the cut) counts.
+pub fn prompted_after_cut_tail(messages: &[SharedMessage], tail: usize) -> bool {
+    let Some(after) = after_latest_marker(messages) else {
+        return false;
+    };
+    messages[messages.len() - after..]
+        .iter()
+        .skip(tail)
+        .any(|m| m["role"] == "user" && !is_tool_in_flight_note(m))
+}
+
+/// Whether the history holds a user message whose text is exactly `text`
+/// (a plain string content, or a text block). A crash restore uses it so a
+/// note it sends once is not sent again from the same record.
+pub fn has_user_text(messages: &[SharedMessage], text: &str) -> bool {
+    messages.iter().rev().any(|m| {
+        m["role"] == "user"
+            && (m["content"].as_str() == Some(text)
+                || m["content"]
+                    .as_array()
+                    .is_some_and(|parts| parts.iter().any(|p| p["text"].as_str() == Some(text))))
+    })
+}
+
 /// Load-time migration for sessions saved before this change. A non-`None`
 /// `abort_context` means the saved history ends at the interrupted turn and
 /// the recap was waiting to be prepended to the next user message. The recap
@@ -207,6 +272,94 @@ pub fn recover_crashed_turn(
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn a_prompt_after_the_latest_marker_is_seen_and_a_host_note_is_not() {
+        let m = |v: Value| -> SharedMessage { Arc::new(v) };
+        let user = |t: &str| m(json!({"role": "user", "content": t}));
+        let crash = InterruptReason::Crash;
+        let mut h = vec![user("build it"), m(json!({"role": "assistant", "content": "on it"}))];
+        assert!(!prompted_after_latest_marker(&h), "no marker");
+        append_marker(&mut h, crash);
+        assert!(!prompted_after_latest_marker(&h), "the marker is last");
+        h.push(tool_in_flight_note_message(crash, &["bash".into()]));
+        assert!(!prompted_after_latest_marker(&h), "a host note is no prompt");
+        h.push(user("resume: someone already nudged this session"));
+        assert!(prompted_after_latest_marker(&h));
+        assert!(ends_unanswered_after(&h, crash), "still unanswered: the two checks differ");
+        // A newer marker: only what follows IT counts.
+        append_marker(&mut h, InterruptReason::User);
+        assert!(!prompted_after_latest_marker(&h), "{h:#?}");
+    }
+
+    /// A reload's cut turn leaves its own tail after the marker (events
+    /// that arrived during the turn, flushed at the cut); only what follows
+    /// that recorded tail counts as a re-prompt, an event-shaped one too.
+    #[test]
+    fn the_cut_turns_own_tail_is_no_reprompt_and_anything_after_it_is() {
+        let m = |v: Value| -> SharedMessage { Arc::new(v) };
+        let user = |t: &str| m(json!({"role": "user", "content": t}));
+        let restart = InterruptReason::Restart;
+        let mut h = vec![user("build it"), m(json!({"role": "assistant", "content": "on it"}))];
+        assert_eq!(after_latest_marker(&h), None);
+        assert!(!prompted_after_cut_tail(&h, 0), "no marker");
+        append_marker(&mut h, restart);
+        assert_eq!(after_latest_marker(&h), Some(0));
+        h.push(user("<event source=\"subagent\">sa_3 finished</event>"));
+        h.push(tool_in_flight_note_message(restart, &["bash".into()]));
+        let tail = after_latest_marker(&h).unwrap();
+        assert_eq!(tail, 2);
+        assert!(prompted_after_latest_marker(&h), "without the tail, the event looks like a prompt");
+        assert!(!prompted_after_cut_tail(&h, tail), "the cut turn's own tail");
+        h.push(user("<event source=\"fleet\">resume: pick up the cut turn</event>"));
+        assert!(prompted_after_cut_tail(&h, tail), "an event after the cut is a re-prompt");
+        assert!(ends_unanswered_after(&h, restart));
+        // A host note past the tail is still no prompt.
+        let mut noted = h[..h.len() - 1].to_vec();
+        noted.push(tool_in_flight_note_message(restart, &["read".into()]));
+        assert!(!prompted_after_cut_tail(&noted, tail));
+    }
+
+    #[test]
+    fn a_user_text_is_found_as_a_string_or_a_text_block_only_exactly() {
+        let m = |v: Value| -> SharedMessage { Arc::new(v) };
+        let h = vec![
+            m(json!({"role": "user", "content": "resume: note A"})),
+            m(json!({"role": "assistant", "content": "resume: note B"})),
+            m(json!({"role": "user", "content": [{"type": "text", "text": "resume: note C"}]})),
+        ];
+        assert!(has_user_text(&h, "resume: note A"));
+        assert!(has_user_text(&h, "resume: note C"));
+        assert!(!has_user_text(&h, "resume: note B"), "an assistant text is not a user one");
+        assert!(!has_user_text(&h, "resume: note"), "only an exact match");
+    }
+
+    #[test]
+    fn a_restart_cut_turn_is_found_until_something_answers_it() {
+        let m = |v: Value| -> SharedMessage { Arc::new(v) };
+        let user = |t: &str| m(json!({"role": "user", "content": t}));
+        let assistant = |t: &str| m(json!({"role": "assistant", "content": t}));
+        let restart = InterruptReason::Restart;
+        let mut h = vec![user("build it"), assistant("on it")];
+        assert!(!ends_unanswered_after(&h, restart), "no marker");
+        assert!(!ends_unanswered_after(&[], restart));
+        append_marker(&mut h, restart);
+        assert!(ends_unanswered_after(&h, restart));
+        assert!(!ends_unanswered_after(&h, InterruptReason::User), "another reason's marker");
+        // What a cut turn leaves after its marker (flushed events, a tool
+        // result, a host note) is not an answer.
+        h.push(user("<event source=\"x\">a wake</event>"));
+        h.push(m(json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t", "content": "x"}]})));
+        assert!(ends_unanswered_after(&h, restart));
+        // A reply is.
+        h.push(assistant("continuing"));
+        assert!(!ends_unanswered_after(&h, restart));
+        // A user interrupt after the reload's marker: the latest marker wins.
+        let mut h = vec![user("a"), user(restart.marker()), user("b"), user(InterruptReason::User.marker())];
+        assert!(!ends_unanswered_after(&h, restart));
+        h.push(user(restart.marker()));
+        assert!(ends_unanswered_after(&h, restart));
+    }
 
     #[test]
     fn tool_note_names_the_tools_hedges_like_the_engine_and_is_recognised() {
@@ -361,6 +514,7 @@ mod tests {
         agent_core::core::session_draft::TurnDraft {
             base_len,
             partial_text: text.into(),
+            writer: None,
         }
     }
 

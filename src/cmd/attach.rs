@@ -76,6 +76,7 @@ impl Client {
 
     fn render(&mut self, env: &Envelope) {
         match &env.event {
+            SessionEventWire::EphemeralLayerChanged { .. } => {},
             SessionEventWire::Stream(StreamEvent::Llm(LlmEvent::Text(t))) => self.out(t),
             SessionEventWire::Stream(StreamEvent::Llm(LlmEvent::Thinking(_))) => {}
             SessionEventWire::Stream(StreamEvent::Llm(LlmEvent::ToolUse { tool_name, .. })) => {
@@ -151,9 +152,25 @@ impl Client {
             SessionEventWire::DriverArmed { plugin_id, .. } => self.out(&format!("[driver armed: {plugin_id}]\n")),
             SessionEventWire::DriverRevoked { reason, .. } => self.out(&format!("[driver revoked: {reason}]\n")),
             SessionEventWire::DriverTurnOutcome { .. } => {}
+            // Optional (opt-in per connection); this client does not ask for it.
+            SessionEventWire::ChildSpend(_) | SessionEventWire::ChildSpendLagged { .. } => {}
             SessionEventWire::CostCapReached { scope, cost, cap } => self.out(&format!(
                 "[{scope} cost cap reached: ${cost:.4} ≥ ${cap:.4} — turn cancelled, driver revoked]\n"
             )),
+            // Optional (`accepted_events`); this client does not ask for it.
+            SessionEventWire::ChildProcess(_) => {}
+            // Focus hold mode (S1): the app's; a terminal attach shows nothing.
+            SessionEventWire::EventHeld { .. }
+            | SessionEventWire::DeliveryChanged { .. }
+            | SessionEventWire::HeldUpdated { .. } => {}
+            // Answers a `fork`, which this client never sends.
+            SessionEventWire::Forked { .. } => {}
+            // Client tools v1: addressed to a registering client; this one
+            // never registers.
+            SessionEventWire::ClientTools { .. }
+            | SessionEventWire::ToolInvoke { .. }
+            | SessionEventWire::ToolCancel { .. }
+            | SessionEventWire::ToolReturnAck { .. } => {}
         }
     }
 

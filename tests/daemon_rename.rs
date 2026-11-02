@@ -110,7 +110,7 @@ async fn attach_mirror(sock: &Path, sid: &SessionId) -> SocketTransport {
 async fn saveas(t: &mut SocketTransport, id: u64, name: &str) -> serde_json::Value {
     t.send_from_self(SessionCommand::EngineCommand { id, name: "saveas".into(), arg: name.into() }).await.unwrap();
     loop {
-        if let SessionEventWire::QueryResult { id: got, value } = next(t).await.event {
+        if let SessionEventWire::QueryResult { id: got, value, .. } = next(t).await.event {
             if got == id {
                 return value;
             }
@@ -656,7 +656,7 @@ async fn rename_from_an_attached_connection_or_as_plain_text_is_refused() {
     handle.send(SessionCommand::EngineCommand { id: 11, name: "rename".into(), arg: "nope".into() }).await.unwrap();
     let value = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            if let SessionEventWire::QueryResult { id: 11, value } = rx.recv().await.unwrap().event {
+            if let SessionEventWire::QueryResult { id: 11, value, .. } = rx.recv().await.unwrap().event {
                 return value;
             }
         }

@@ -574,7 +574,7 @@ async fn no_duplicate_index_start_record_on_unpark_and_status_never_wakes() {
             .await
             .unwrap()
             .unwrap();
-        if let SessionEventWire::QueryResult { id: 42, value } = env.event {
+        if let SessionEventWire::QueryResult { id: 42, value, .. } = env.event {
             break value;
         }
     };
@@ -684,9 +684,15 @@ async fn reloaded_live_session(host: &Arc<agent_engine::EngineHost>) -> agent_en
             input_owner_kind: None,
             workers: Vec::new(),
             tool_activations: Vec::new(),
+            turn_cut: None,
+            cut_tail: None,
+            capacity_stop: None,
+            parked_at: None,
         }],
         expected_clients: 1,
         next_subagent_id: 0,
+        base_umask: None,
+        children: Vec::new(),
     }
 }
 
@@ -1264,4 +1270,252 @@ async fn a_park_that_happens_takes_the_hook_out_of_line_and_the_unpark_runs_it_o
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(start_seam::calls(&sid), calls + 1, "the hook ran once");
     handle.send(SessionCommand::End { reason: EndReason::HostShutdown }).await.unwrap();
+}
+
+// ── a daemon reload keeps a parked session's eviction clock ────────────
+
+use agent_engine::daemon::reload::{ReloadSession, ReloadState};
+use agent_engine::session::wire::CHECKPOINT_QUERY_ID;
+use agent_engine::session::CheckpointReason;
+
+type Time = chrono::DateTime<chrono::Utc>;
+
+/// The eviction age these tests park under (`SYNAPS_DAEMON_PARKED_EVICT_SECS`).
+const EVICT_SECS: i64 = 3600;
+
+struct Evict;
+impl Evict {
+    fn set() -> Self {
+        std::env::set_var("SYNAPS_DAEMON_PARKED_EVICT_SECS", EVICT_SECS.to_string());
+        Self
+    }
+}
+impl Drop for Evict {
+    fn drop(&mut self) {
+        std::env::remove_var("SYNAPS_DAEMON_PARKED_EVICT_SECS");
+    }
+}
+
+/// An in-process daemon on `host`, its registry in `run`.
+async fn daemon(host: &Arc<agent_engine::EngineHost>, run: &tempfile::TempDir) -> agent_engine::daemon::Daemon {
+    agent_engine::daemon::Daemon::start(
+        Arc::clone(host),
+        agent_engine::daemon::DaemonOpts {
+            runtime_dir: Some(run.path().to_path_buf()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap()
+}
+
+async fn stop(d: agent_engine::daemon::Daemon) {
+    d.shutdown_token().cancel();
+    d.wait().await;
+}
+
+/// A journal with one turn whose session then ended (as the old image's
+/// exec leaves it), so the new image can load it.
+async fn ended_journal(host: &Arc<agent_engine::EngineHost>) -> String {
+    let handle = host.create_session(pcfg()).await.unwrap();
+    let (mut a, _) = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Tui))
+        .await
+        .unwrap();
+    a.send(submit("hi")).await.unwrap();
+    until(&mut a, |e| matches!(e, SessionEventWire::Idle)).await;
+    let journal = handle.journal_id();
+    handle.send(SessionCommand::End { reason: EndReason::HostShutdown }).await.unwrap();
+    drop(a);
+    tokio::time::timeout(Duration::from_secs(10), handle.closed()).await.expect("ended");
+    journal
+}
+
+/// What the old image recorded for `journal` (`reload::record`): its
+/// lifecycle and park time (`None`: never parked, or an older image's
+/// record without one).
+fn recorded(journal: &str, lifecycle: SessionLifecycle, parked_at: Option<Time>) -> ReloadSession {
+    let mut v = serde_json::json!({
+        "id": journal, "journal_id": journal, "config": {}, "keep_warm": false,
+        "lifecycle": lifecycle, "input_owner_kind": null
+    });
+    if let Some(t) = parked_at {
+        v["parked_at"] = serde_json::json!(t);
+    }
+    let s: ReloadSession = serde_json::from_value(v).unwrap();
+    ReloadSession {
+        config: SessionConfig {
+            continue_session: Some(Some(journal.to_string())),
+            ..pcfg()
+        },
+        ..s
+    }
+}
+
+/// The new image's rehydrate of `sessions` (`reload::rehydrate`).
+async fn rehydrate(d: &agent_engine::daemon::Daemon, sessions: Vec<ReloadSession>) {
+    let rs: ReloadState = serde_json::from_value(serde_json::json!({
+        "generation": 1, "written_at": chrono::Utc::now(), "sessions": [], "expected_clients": 0
+    }))
+    .unwrap();
+    agent_engine::daemon::reload::rehydrate(&d.state, &ReloadState { sessions, ..rs }).await;
+}
+
+/// The live session rehydrated from `journal`, if any.
+fn restored(d: &agent_engine::daemon::Daemon, journal: &str) -> Option<SessionHandle> {
+    d.state.live_sessions().into_iter().find(|h| h.journal_id() == journal && h.is_alive())
+}
+
+/// When the session last parked, as its actor published it.
+fn parked_since(h: &SessionHandle) -> Option<Time> {
+    h.live_entry().and_then(|e| e.parked_since)
+}
+
+/// What a reload's checkpoint of a parked session records: when it parked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_parked_sessions_reload_record_carries_when_it_parked() {
+    let _h = Home::new();
+    let _g = Grace::set("0");
+    let (url, _) = stub(SSE_HI, false).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+    let handle = host.create_session(pcfg()).await.unwrap();
+    let (mut a, _) = LocalTransport::attach(handle.clone(), ClientMeta::new(ClientKind::Tui))
+        .await
+        .unwrap();
+    a.send(submit("hi")).await.unwrap();
+    until(&mut a, |e| matches!(e, SessionEventWire::Idle)).await;
+    detach(&mut a).await;
+    assert!(wait_lifecycle(&handle, SessionLifecycle::Parked, Duration::from_secs(5)).await);
+    let since = parked_since(&handle).expect("parked since");
+
+    let mut rx = handle.subscribe();
+    handle
+        .send(SessionCommand::Checkpoint { reason: CheckpointReason::Reload, deadline: None, skip_quiesce_grace: false })
+        .await
+        .unwrap();
+    let record = loop {
+        match tokio::time::timeout(Duration::from_secs(10), rx.recv()).await.expect("a checkpoint reply") {
+            Ok(env) => {
+                if let SessionEventWire::QueryResult { id: CHECKPOINT_QUERY_ID, value, .. } = env.event {
+                    break value["record"].clone();
+                }
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(e) => panic!("{e}"),
+        }
+    };
+    let recorded: Option<Time> = serde_json::from_value(record["parked_since"].clone()).unwrap();
+    assert_eq!(recorded, Some(since), "{record}");
+    handle.send(SessionCommand::End { reason: EndReason::HostShutdown }).await.unwrap();
+}
+
+/// A daemon reload keeps a parked session's eviction clock. Parked 40 min
+/// before the reload under a 60 min age, it comes back parked since then,
+/// so it is evicted about 20 min after the reload, not 60; one recorded 5 s
+/// short of its age is evicted about 5 s after the reload.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_reload_continues_a_parked_sessions_eviction_clock() {
+    let _h = Home::new();
+    let _g = Grace::set("0");
+    let _e = Evict::set();
+    let (url, _) = stub(SSE_HI, false).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+    let run = tempfile::TempDir::new().unwrap();
+    let d = daemon(&host, &run).await;
+    let forty = ended_journal(&host).await;
+    let near = ended_journal(&host).await;
+
+    let now = chrono::Utc::now();
+    let at = now - chrono::Duration::minutes(40);
+    rehydrate(
+        &d,
+        vec![
+            recorded(&forty, SessionLifecycle::Parked, Some(at)),
+            recorded(&near, SessionLifecycle::Parked, Some(now - chrono::Duration::seconds(EVICT_SECS - 5))),
+        ],
+    )
+    .await;
+    let forty_h = restored(&d, &forty).expect("restored");
+    let near_h = restored(&d, &near).expect("restored");
+    assert!(wait_lifecycle(&forty_h, SessionLifecycle::Parked, Duration::from_secs(5)).await);
+    assert_eq!(parked_since(&forty_h), Some(at), "parked since its first park, not since the reload");
+    tokio::time::timeout(Duration::from_secs(20), near_h.closed())
+        .await
+        .expect("5 s short of its age at the reload: evicted about 5 s after it, not a full age later");
+    assert!(forty_h.is_alive(), "20 min of its age left: not evicted yet");
+    stop(d).await;
+}
+
+/// One recorded parked past its eviction age is evicted right after the
+/// reload, not a full age later; its journal stays. (On a build that
+/// restarts the clock, the same rehydrate leaves it parked for the age.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_session_parked_past_its_age_is_evicted_right_after_the_reload() {
+    let _h = Home::new();
+    let _g = Grace::set("0");
+    let _e = Evict::set();
+    let (url, _) = stub(SSE_HI, false).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+    let run = tempfile::TempDir::new().unwrap();
+    let d = daemon(&host, &run).await;
+    let past = ended_journal(&host).await;
+
+    rehydrate(&d, vec![recorded(&past, SessionLifecycle::Parked, Some(chrono::Utc::now() - chrono::Duration::hours(2)))])
+        .await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while restored(&d, &past).is_some() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "parked 2 h before the reload under a 1 h age: evicted right after it"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(agent_engine::core::session::Session::load(&past).is_ok(), "journal kept");
+    stop(d).await;
+}
+
+/// A session recorded Live parks on its own clock (a stale recorded time is
+/// not its park time), and one an older image recorded parked without a
+/// time starts the clock at the restore's park, as before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_live_session_or_an_older_record_starts_the_clock_at_its_park() {
+    let _h = Home::new();
+    let _g = Grace::set("0");
+    let _e = Evict::set();
+    let (url, _) = stub(SSE_HI, false).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let host = host().await;
+    let run = tempfile::TempDir::new().unwrap();
+    let d = daemon(&host, &run).await;
+    let live = ended_journal(&host).await;
+    let old = ended_journal(&host).await;
+
+    let stale = chrono::Utc::now() - chrono::Duration::minutes(40);
+    let now = chrono::Utc::now();
+    rehydrate(
+        &d,
+        vec![
+            recorded(&live, SessionLifecycle::Live, Some(stale)),
+            recorded(&old, SessionLifecycle::Parked, None),
+        ],
+    )
+    .await;
+    let old_h = restored(&d, &old).expect("restored");
+    assert!(wait_lifecycle(&old_h, SessionLifecycle::Parked, Duration::from_secs(5)).await);
+    assert!(parked_since(&old_h).is_some_and(|t| t >= now), "an older record: the clock starts at the restore");
+
+    let live_h = restored(&d, &live).expect("restored");
+    let (mut a, _) = LocalTransport::attach(live_h.clone(), ClientMeta::new(ClientKind::Tui))
+        .await
+        .unwrap();
+    detach(&mut a).await;
+    assert!(wait_lifecycle(&live_h, SessionLifecycle::Parked, Duration::from_secs(5)).await);
+    assert!(parked_since(&live_h).is_some_and(|t| t >= now), "a Live session parks on its own clock");
+    stop(d).await;
 }
