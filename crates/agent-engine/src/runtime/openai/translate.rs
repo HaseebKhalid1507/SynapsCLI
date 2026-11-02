@@ -601,10 +601,13 @@ pub fn oai_event_to_llm(event: &OaiEvent) -> Option<StreamEvent> {
             // prompt_tokens INCLUDES the cached slice (OpenAI semantics);
             // downstream accounting sums input + cache_read (Anthropic
             // semantics), so subtract to avoid double-counting the hits.
-            let cached = (*cached_tokens).min(*prompt_tokens) as u64;
+            // Display/turn accounting counts an unreported counter as zero;
+            // settlement uses the reply's presence-preserving `usage`.
+            let prompt_tokens = prompt_tokens.unwrap_or(0);
+            let cached = (*cached_tokens).min(prompt_tokens) as u64;
             Some(StreamEvent::Session(SessionEvent::Usage {
-                input_tokens: *prompt_tokens as u64 - cached,
-                output_tokens: *completion_tokens as u64,
+                input_tokens: prompt_tokens as u64 - cached,
+                output_tokens: completion_tokens.unwrap_or(0) as u64,
                 cache_read_input_tokens: cached,
                 cache_creation_input_tokens: 0,
                 cache_creation_5m: None,

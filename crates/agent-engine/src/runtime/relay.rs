@@ -530,6 +530,8 @@ mod tests {
             StreamEvent::Llm(LlmEvent::ToolResult {
                 tool_id: "toolu_s1".into(),
                 result: "ok".into(),
+                memory_only: false,
+                client_tool: None,
             }),
             StreamEvent::Session(crate::runtime::types::SessionEvent::Done),
         ];
@@ -590,6 +592,8 @@ mod tests {
         tx.send(StreamEvent::Llm(LlmEvent::ToolResult {
             tool_id: "toolu_first".into(),
             result: "ok".into(),
+            memory_only: false,
+            client_tool: None,
         }))
         .unwrap();
         tx.send(StreamEvent::Llm(LlmEvent::ToolStarted { tool_id: "toolu_q".into() }))

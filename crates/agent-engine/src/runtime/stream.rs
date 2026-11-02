@@ -2,10 +2,10 @@ use super::api::ApiMethods;
 use super::helpers::HelperMethods;
 use super::types::{AuthState, LlmEvent, SessionEvent, StreamEvent};
 use super::{
-    emit_after_tool_call_outcome, emit_before_tool_call, resolve_before_tool_call_decision,
-    BeforeToolCallDecision,
+    emit_after_tool_call_outcome, emit_before_tool_call_with, emit_before_tool_call_withheld,
+    resolve_before_tool_call_decision, BeforeToolCallDecision,
 };
-use crate::extensions::hooks::events::{HookEvent, HookResult};
+use crate::extensions::hooks::events::{HookEvent, HookResult, ToolCallHookContext};
 use crate::{Result, RuntimeError, SharedMessage, ToolRegistry};
 use reqwest::Client;
 use serde_json::{json, Value};
@@ -129,6 +129,21 @@ fn validated_tool_output(model: &str, output: crate::ToolOutput) -> (String, Opt
     (summary, blocks)
 }
 
+/// The settings a worker started or resumed by a tool call now inherits
+/// (subagent rollover §2): the turn's `settings` with the live
+/// continuation settings at this moment.
+fn worker_context_now(
+    settings: &crate::tools::WorkerContextPolicy,
+    continuation: &super::continuation::SharedContinuation,
+) -> crate::tools::WorkerContextPolicy {
+    let mut now = settings.clone();
+    now.context_management = continuation
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .config;
+    now
+}
+
 pub(super) struct StreamSession {
     // Context continuation
     pub(super) memory_backend: crate::memory_backend::MemoryBinding,
@@ -138,10 +153,33 @@ pub(super) struct StreamSession {
     pub(super) final_capture_history: Arc<Mutex<Option<Vec<SharedMessage>>>>,
     /// Marked at the turn's normal end (see `TurnCompletion`).
     pub(super) turn_completion: super::types::TurnCompletion,
+    /// The session's effective window (`Runtime::context_window`).
     pub(super) context_window: u64,
+    /// The explicit `context_window` setting that window was clamped from,
+    /// if any (`ContinuationState::config_for_window`).
+    pub(super) context_window_setting: Option<u64>,
+    /// The session's native-window latch (1M entitlement fallback, see
+    /// `runtime::native_window`): a request that carried the 1M beta and was
+    /// refused for it latches the model, rolls over at the native window and
+    /// is retried once.
+    pub(super) native_window: Arc<super::native_window::NativeWindowLatch>,
     pub(super) continuation: super::continuation::SharedContinuation,
     /// Workers only: host-only context rollover (inert on the foreground).
     pub(super) worker_context: super::worker_context::WorkerContext,
+    /// Rolling-summary transport for rollovers; `None` carries the previous
+    /// summary forward unchanged.
+    pub(super) rollover_summarizer: std::result::Result<
+        super::rolling_summary::RolloverSummarizer,
+        Option<super::rolling_summary::SummarySkip>,
+    >,
+    /// The runtime's context settings for the workers its tool calls start
+    /// or resume (subagent rollover §2); each call reads the continuation
+    /// settings as they are then ([`worker_context_now`]). `None` while
+    /// worker rollover is off ([`crate::tools::WORKER_ROLLOVER`]): no worker
+    /// would inherit them, so no call copies them.
+    /// PARITY: ours' field, renamed from `worker_context` (upstream's
+    /// host-side worker rollover above keeps that name).
+    pub(super) worker_context_policy: Option<crate::tools::WorkerContextPolicy>,
 
     // Auth & network
     pub(super) auth: Arc<RwLock<AuthState>>,
@@ -158,6 +196,12 @@ pub(super) struct StreamSession {
     // Model config
     pub(super) model: String,
     pub(super) tools: Arc<RwLock<ToolRegistry>>,
+    pub(super) ephemeral_layer: super::ephemeral::Layer,
+    pub(super) memory_only: super::memory_only::Store,
+    pub(super) memory_only_policy: super::memory_only::Policy,
+    /// The session's client tools; offered and dispatched only on the root
+    /// stream (no delegation parent, a conversation id).
+    pub(super) client_tools: super::client_tools::Overlay,
     pub(super) system_prompt: Option<String>,
     pub(super) thinking_budget: u32,
     pub(super) reasoning_level: agent_core::reasoning::ReasoningLevel,
@@ -199,11 +243,20 @@ pub(super) struct StreamSession {
     pub(super) env_warned: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     pub(super) secret_prompt: Option<crate::tools::SecretPromptHandle>,
     pub(super) auto_approve_confirms: bool,
+    /// The prompt and auto-approve policy that answer a `before_tool_call`
+    /// `Confirm`: `secret_prompt` / `auto_approve_confirms`, except on a
+    /// worker with routed hooks, where they are its caller's (see
+    /// [`crate::runtime::WorkerConfirm`]). Used only at the two hook
+    /// resolve sites; the tools' capabilities keep `secret_prompt`.
+    pub(super) hook_confirm_prompt: Option<crate::tools::SecretPromptHandle>,
+    pub(super) hook_auto_approve: bool,
     /// Session "Allow all" latch shared with the owning [`Runtime`].
     pub(super) session_allow_all: Arc<crate::tools::SessionConfirmLatch>,
     pub(super) telemetry_level: crate::runtime::telemetry::TelemetryLevel,
     pub(super) orchestration: Option<Arc<crate::orchestration::OrchestrationRuntime>>,
     pub(super) delegation_parent: Option<String>,
+    /// The session route spawned children are reported to (per-call sinks).
+    pub(super) child_route: Option<crate::session::child_events::ChildRoute>,
     /// Per-turn correlation ID carried by typed terminal outcomes (spec §5.2).
     pub(super) turn_correlation_id: String,
     /// Opt-in Task 18 policy. False preserves the full-schema request path.
@@ -244,6 +297,9 @@ pub(super) struct StreamSession {
     pub(super) owner_steer_budget: Option<Arc<crate::runtime::budget::OwnerSteerBudget>>,
     /// Source of the times stamped on this turn's new messages.
     pub(super) message_clock: crate::runtime::message_time::MessageClock,
+    /// Where the turn's subagent launches take their run leases (child
+    /// spend); `None` in a host without a sink.
+    pub(super) spend_parent: Option<crate::runtime::child_spend::SpendParent>,
 }
 
 pub(super) struct StreamMethods;
@@ -401,15 +457,202 @@ impl CalibrationProbe {
     }
 }
 
+/// How one request is sized and admitted (R1, "usable 200K"): the input
+/// footprint it is admitted on, the reserves next to it, and the
+/// `max_tokens` it sends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct RequestSizing {
+    /// The input the request is admitted on: the conservative estimate, or,
+    /// once the current context window has a provider-reported input, that
+    /// input plus a conservative estimate of what was appended since.
+    pub(super) footprint_tokens: u64,
+    /// The reserves admitted next to the footprint. `output_tokens` is the
+    /// wire's `max_tokens` ([`HelperMethods::output_tokens_for_request`]).
+    pub(super) reserves: super::context::ContextReserves,
+    /// The `max_tokens` the request must send when it is sized to the room
+    /// left (in scope only); `None` sends the static cap, which is then
+    /// `reserves.output_tokens` as before.
+    pub(super) wire_max_tokens: Option<u64>,
+}
+
+impl RequestSizing {
+    /// The budget `assess_context` admits this request on: the sized
+    /// footprint against the sized reserves plus the advisory reserve. With
+    /// the output from [`HelperMethods::output_tokens_for_request`] it is
+    /// admitted exactly while the room left covers the output floor.
+    pub(super) fn admission_budget(
+        &self,
+        context_window: u64,
+    ) -> agent_core::core::context_policy::ContextBudget {
+        agent_core::core::context_policy::ContextBudget {
+            context_window_tokens: context_window,
+            used_tokens: self.footprint_tokens,
+            hard_remaining_tokens: context_window.saturating_sub(self.footprint_tokens),
+            required_next_round_tokens: self
+                .reserves
+                .total()
+                .saturating_add(super::continuation::ADVISORY_RESERVE_TOKENS),
+        }
+    }
+}
+
+/// Size one request from its uncalibrated `assessment` (R1).
+///
+/// Out of scope ([`HelperMethods::dynamic_output_in_scope`]: windows above
+/// 200K, every provider and wire other than the native Anthropic one) this
+/// is the assessment as is: its footprint ([`ContextAssessment::used_tokens`](super::context::ContextAssessment::used_tokens),
+/// anchored to the provider's count when the request extends the anchored
+/// one), its expected output reserve (#341) and the flat
+/// [`SAFETY_MARGIN_PERCENT`](super::context::SAFETY_MARGIN_PERCENT); the
+/// wire sends the static cap.
+///
+/// In scope the footprint and the margin are chosen first:
+/// - before the current window's first provider-reported input
+///   (`calibration` is `None`): the assessment's footprint and the flat 15%;
+/// - after it: the anchored footprint when the request extends the
+///   anchored one, else the provider-reported input of the sample's request
+///   plus what was appended since, and
+///   [`CALIBRATED_SAFETY_MARGIN_PERCENT`](super::context::CALIBRATED_SAFETY_MARGIN_PERCENT).
+///   The sample records only the two totals (provider-reported and
+///   estimated) of one request, not which messages it covered, so "appended
+///   since" is the growth of the estimate since that request, scaled up by
+///   the sample's provider/estimate ratio when the estimator read low. That
+///   is exact for an append-only history. When the estimate shrank instead
+///   (an in-place compaction, a rewind, less request-only framing) nothing
+///   was appended and the sample may be stale (too high): the request is
+///   admitted on whichever pair leaves more room, the calibrated one (the
+///   sample bounds a history that only lost content) or the flat one (as
+///   before the window's first provider-reported input).
+///
+/// The output is then [`HelperMethods::output_tokens_for_request`] of the
+/// room left (window - footprint - tool result - margin - advisory), and the
+/// reserves carry that same value, so `max_tokens` on the wire IS the
+/// reserved output.
+pub(super) fn size_request(
+    model: &str,
+    assessment: &super::context::ContextAssessment,
+    thinking_budget_tokens: u64,
+    calibration: Option<super::continuation::TokenCalibration>,
+) -> RequestSizing {
+    use super::context::{CALIBRATED_SAFETY_MARGIN_PERCENT, SAFETY_MARGIN_PERCENT};
+    let window = assessment.provider_window;
+    // PARITY E2: the footprint as upstream measures it (anchored when the
+    // request extends the anchored one); ours' calibration math stays on
+    // the estimate's scale.
+    let measured = assessment.used_tokens();
+    let estimated = assessment.estimated_tokens();
+    if !HelperMethods::dynamic_output_in_scope(model, window) {
+        return RequestSizing {
+            footprint_tokens: measured,
+            reserves: assessment.reserves,
+            wire_max_tokens: None,
+        };
+    }
+    let flat = (measured, window * SAFETY_MARGIN_PERCENT / 100);
+    let (footprint_tokens, safety_margin_tokens) = match calibration {
+        None => flat,
+        Some(sample) => {
+            let calibrated = (
+                assessment.anchored_tokens.unwrap_or_else(|| {
+                    sample
+                        .provider_tokens
+                        .saturating_add(appended_since(sample, estimated))
+                }),
+                window * CALIBRATED_SAFETY_MARGIN_PERCENT / 100,
+            );
+            let charge = |(footprint, margin): (u64, u64)| footprint.saturating_add(margin);
+            if estimated >= sample.estimated_tokens || charge(calibrated) <= charge(flat) {
+                calibrated
+            } else {
+                flat
+            }
+        }
+    };
+    let room = window.saturating_sub(
+        footprint_tokens
+            .saturating_add(assessment.reserves.tool_result_tokens)
+            .saturating_add(safety_margin_tokens)
+            .saturating_add(super::continuation::ADVISORY_RESERVE_TOKENS),
+    );
+    let output_tokens =
+        HelperMethods::output_tokens_for_request(model, window, thinking_budget_tokens, room);
+    RequestSizing {
+        footprint_tokens,
+        reserves: super::context::ContextReserves {
+            output_tokens,
+            safety_margin_tokens,
+            ..assessment.reserves
+        },
+        wire_max_tokens: Some(output_tokens),
+    }
+}
+
+/// A conservative estimate of the input appended since the request that
+/// produced `sample`, given the current request's estimate: the growth of
+/// the estimate, scaled up by the sample's provider/estimate ratio when the
+/// estimator read below the provider on that request.
+fn appended_since(sample: super::continuation::TokenCalibration, estimated: u64) -> u64 {
+    let grown = estimated.saturating_sub(sample.estimated_tokens);
+    if sample.estimated_tokens == 0 || sample.provider_tokens <= sample.estimated_tokens {
+        return grown;
+    }
+    let scaled = (u128::from(grown) * u128::from(sample.provider_tokens))
+        .div_ceil(u128::from(sample.estimated_tokens));
+    u64::try_from(scaled).unwrap_or(u64::MAX)
+}
+
+/// The pre-request context assessment of one request, sized (R1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct RequestContextBudget {
+    /// The uncalibrated assessment (upstream #341: anchored footprint,
+    /// expected output reserve under the request's cap, flat safety margin):
+    /// telemetry, the calibration probe and the rollover's successor budget
+    /// read it, unchanged by R1.
+    pub(super) assessment: super::context::ContextAssessment,
+    /// How the request is sized ([`size_request`]).
+    pub(super) sizing: RequestSizing,
+    /// What `assess_context` decides on: the sized footprint against the
+    /// sized reserves plus the advisory reserve.
+    pub(super) budget: agent_core::core::context_policy::ContextBudget,
+}
+
+impl RequestContextBudget {
+    /// The unsized budget (upstream #341): the assessment's footprint
+    /// against its expected reserves plus the advisory reserve, whatever
+    /// the request's sizing. The worker rollover path (its successor sizing
+    /// and reserve-dominance check) decides on this one; out of scope it
+    /// equals [`Self::budget`].
+    pub(super) fn expected_budget(&self) -> agent_core::core::context_policy::ContextBudget {
+        let window = self.assessment.provider_window;
+        let used = self.assessment.used_tokens();
+        agent_core::core::context_policy::ContextBudget {
+            context_window_tokens: window,
+            used_tokens: used,
+            hard_remaining_tokens: window.saturating_sub(used),
+            required_next_round_tokens: self
+                .assessment
+                .reserves
+                .total()
+                .saturating_add(super::continuation::ADVISORY_RESERVE_TOKENS),
+        }
+    }
+}
+
 /// The pre-request context assessment of a stream round over the round's
 /// final `request_messages` (after injection and the history image cap):
-/// the estimate and the budget `assess_context` decides on. Shared with the
-/// keep-warm probe (`runtime::keepwarm`) so the two can never drift.
+/// the estimate, the request's sizing and the budget `assess_context`
+/// decides on. Shared with the keep-warm probe (`runtime::keepwarm`) so the
+/// two can never drift. `calibration` is the current window's sample
+/// ([`ContinuationState::window_calibration_for`](super::continuation::ContinuationState::window_calibration_for)).
 ///
 /// `required_next_round_tokens` is the next round's realistic need (its
 /// thinking + expected response within `max_tokens`, the next tool result,
 /// the safety margin, the advisory), not the `max_tokens` ceiling: see
-/// [`super::context::EXPECTED_RESPONSE_TOKENS`].
+/// [`super::context::EXPECTED_RESPONSE_TOKENS`]. In scope (R1) the reserved
+/// output is the room left, never below that expected reserve
+/// ([`HelperMethods::output_floor_tokens`]), so a request is admitted exactly
+/// while the room covers it; [`RequestContextBudget::expected_budget`] is
+/// the unsized form.
 ///
 /// `usage_anchor` (the provider's count of an earlier request on `model`)
 /// measures the footprint when `request_messages` extend that request's;
@@ -424,10 +667,8 @@ pub(super) fn pre_request_context_budget(
     thinking_budget_tokens: u64,
     next_tool_result_bytes: u64,
     usage_anchor: Option<&super::context::UsageAnchor>,
-) -> (
-    super::context::ContextAssessment,
-    agent_core::core::context_policy::ContextBudget,
-) {
+    calibration: Option<super::continuation::TokenCalibration>,
+) -> RequestContextBudget {
     let assessment = super::context::assess(&super::context::ContextBudgetInputs {
         model,
         provider_window: context_window,
@@ -438,19 +679,17 @@ pub(super) fn pre_request_context_budget(
         memory_contents: &[],
         thinking_budget_tokens,
         next_tool_result_bytes,
-        max_output_tokens: HelperMethods::max_tokens_for_model(model),
+        // PARITY E2: the request's own cap (CTXWIN: 64K at <= 200K) bounds
+        // upstream's expected output reserve.
+        max_output_tokens: HelperMethods::max_tokens_for_request(model, context_window),
     })
     .anchored(usage_anchor, request_messages);
-    let budget = agent_core::core::context_policy::ContextBudget {
-        context_window_tokens: context_window,
-        used_tokens: assessment.used_tokens(),
-        hard_remaining_tokens: context_window.saturating_sub(assessment.used_tokens()),
-        required_next_round_tokens: assessment
-            .reserves
-            .total()
-            .saturating_add(super::continuation::ADVISORY_RESERVE_TOKENS),
-    };
-    (assessment, budget)
+    let sizing = size_request(model, &assessment, thinking_budget_tokens, calibration);
+    RequestContextBudget {
+        assessment,
+        sizing,
+        budget: sizing.admission_budget(context_window),
+    }
 }
 
 /// The pure half of [`retain_session_tool_set`]: the set a turn starting now
@@ -501,12 +740,18 @@ pub(super) fn rebuild_stale_tool_set(
     catalog: &crate::tools::catalog::ToolCatalog,
     progressive: bool,
     context_enabled: bool,
+    forum_enabled: bool,
 ) -> (
     crate::tools::activation::SessionToolSet,
     Vec<crate::tools::activation::DroppedActivation>,
 ) {
-    let fresh =
-        super::continuation::context_tool_set(session, catalog, progressive, context_enabled);
+    let fresh = super::continuation::context_tool_set(
+        session,
+        catalog,
+        progressive,
+        context_enabled,
+        forum_enabled,
+    );
     if crate::tools::activation::carry_forward_enabled() {
         set.carry_activations_into(fresh, catalog)
     } else {
@@ -675,9 +920,14 @@ impl StreamMethods {
             memory_context,
             final_capture_history,
             turn_completion,
-            context_window,
+            // Lowered to the native window by the 1M entitlement fallback.
+            mut context_window,
+            context_window_setting,
+            native_window,
             continuation,
+            rollover_summarizer,
             worker_context,
+            worker_context_policy,
             auth,
             client,
             credential_source,
@@ -692,6 +942,10 @@ impl StreamMethods {
             reasoning_level,
             tx,
             cancel,
+            ephemeral_layer,
+            memory_only,
+            memory_only_policy,
+            client_tools,
             mut steering_rx,
             watcher_exit_path,
             max_tool_output,
@@ -712,10 +966,13 @@ impl StreamMethods {
             env_warned,
             secret_prompt,
             auto_approve_confirms,
+            hook_confirm_prompt,
+            hook_auto_approve,
             session_allow_all,
             telemetry_level,
             orchestration,
             delegation_parent,
+            child_route,
             turn_correlation_id,
             progressive_tool_disclosure,
             deferred_tool_loading,
@@ -730,6 +987,7 @@ impl StreamMethods {
             turn_budget,
             owner_steer_budget,
             message_clock,
+            spend_parent,
         } = session;
         // Handed to every subagent this turn spawns (see `inherit_telemetry`).
         let worker_telemetry = crate::runtime::telemetry::WorkerTelemetry {
@@ -793,11 +1051,13 @@ impl StreamMethods {
             }
             state.enabled()
         };
-        prepare_or_cancel!(super::continuation::validate_restored_history(
+        if let Some(notice) = prepare_or_cancel!(super::continuation::validate_restored_history(
             &messages,
             &continuation,
             &memory_backend
-        ))?;
+        ))? {
+            let _ = tx.send(StreamEvent::Session(SessionEvent::Notice(notice.to_owned())));
+        }
         // Host-owned identity of the request that started this turn; later
         // steered/pushed messages must not displace it at rollover.
         // Tags a genuinely new turn's request with a stable id (host metadata,
@@ -812,12 +1072,24 @@ impl StreamMethods {
         }
         if context_enabled {
             if !memory_backend.exclusive() {
-                super::continuation::restore_window(&messages, &continuation);
+                super::continuation::restore_window(&messages, &continuation, &memory_backend);
             }
             let mut registry = prepare_or_cancel!(tools.write());
-            registry.register(Arc::new(
-                crate::tools::context_checkpoint::ContextCheckpointTool(continuation.clone()),
-            ));
+            // The tool is stateless: a call records into the CALLING
+            // session's state, taken from its ToolContext. The registry may
+            // be shared by every session of a host, so never bind session
+            // state into it. Register only when missing (no context-managed
+            // turn has run on this registry yet) or shadowed by a
+            // non-builtin; an already registered builtin is left alone, so
+            // repeated turns do not advance the catalog generation. A
+            // context-off session withholds it through its own tool set and
+            // never removes it from the registry.
+            if registry
+                .get("context_checkpoint")
+                .is_none_or(|tool| tool.origin() != crate::tools::ToolOrigin::Builtin)
+            {
+                registry.register(Arc::new(crate::tools::context_checkpoint::ContextCheckpointTool));
+            }
             for name in ["memory_search", "memory_fetch"] {
                 if registry.get(name).is_none_or(|tool| {
                     tool.origin() != crate::tools::ToolOrigin::Builtin
@@ -826,22 +1098,22 @@ impl StreamMethods {
                 }
             }
         } else {
-            prepare_or_cancel!(tools.write()).disable(&["context_checkpoint".into()]);
+            // Context management off for THIS session: the session tool set
+            // withholds `context_checkpoint` (`continuation::withheld_tools`).
+            // Never disable it on the registry, which may be shared by every
+            // session of a host.
             continuation
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .update_advisory(None);
         }
         // DARK (§7): the project forum lives in the Axel backend. Under the
-        // legacy backend every forum_* call errors in `require_forum`, so do
-        // not spend catalog tokens advertising tools the model can never use.
-        if !memory_backend.is_axel() {
-            prepare_or_cancel!(tools.write()).disable(&[
-                "forum_post".into(),
-                "forum_read".into(),
-                "forum_forget".into(),
-            ]);
-        }
+        // legacy backend every forum_* call errors in `require_forum`, so
+        // such a session's tool set withholds the forum tools
+        // (`continuation::withheld_tools`): no catalog tokens for tools it can
+        // never use, and no registry mutation that would hide them from the
+        // host's Axel sessions.
+        let forum_enabled = memory_backend.is_axel();
         let system_prompt = if context_enabled {
             Some(format!(
                 "{}\n\n{}",
@@ -889,6 +1161,7 @@ impl StreamMethods {
                 registry.catalog(),
                 progressive_tool_disclosure,
                 context_enabled,
+                forum_enabled,
             );
             retain_session_tool_set(
                 &retained_tool_set,
@@ -905,7 +1178,15 @@ impl StreamMethods {
         // minting a fresh set.
         let mut options = options;
         options.session_tool_set = Some(std::sync::Arc::clone(&session_tool_set));
-        let options = options;
+        // 1M entitlement fallback (`runtime::native_window`): the transport
+        // reports a long-context refusal of a request that carried the 1M
+        // beta here. `options` stays mutable: the fallback stops the beta
+        // for the rest of the turn.
+        let long_context_slot = super::native_window::LongContextSlot::default();
+        options.long_context_refusal = Some(long_context_slot.clone());
+        // Set by the fallback: the next assessment rolls over at the native
+        // window (cold summary only) before the request is retried.
+        let mut native_window_rollover = false;
         // Host activation policy for MODEL-INITIATED `activate_tools`:
         // confirmation authority comes exclusively from host configuration
         // (explicit server auto-approve), never from model-authored JSON.
@@ -1005,6 +1286,43 @@ impl StreamMethods {
                 return Ok(());
             }
 
+            // ═══ QUIESCE ═══
+            // A session that is quiescing (a reload's drain, a host
+            // checkpoint) starts no new provider round after a tool round:
+            // a `wait` it ran has returned `interrupted`, and asking the
+            // model to end would cost a round. History here ends on paired
+            // tool_results, so the turn ends as a cancel at this point does.
+            // Checked BEFORE steering is drained: undelivered steering stays
+            // the actor's (a queued message it re-sends as a new turn, or
+            // returns as `Dequeued` inside a checkpoint's grace), never
+            // buried in history with no round to answer it. A turn's first
+            // round is exempt, so a wake or a queued message that starts a
+            // turn during the drain is handled; the checkpoint's cancel stays
+            // the backstop.
+            if budget_meter.rounds_used() > 0 || budget_meter.round_renewals_used() > 0 {
+                if let Some(reason) = event_queue.quiesced() {
+                    event_queue.note_quiesce_stop(reason);
+                    tracing::info!(
+                        event = "turn_quiesced",
+                        reason = reason.as_str(),
+                        rounds_used = budget_meter.rounds_used(),
+                        tool_calls_used = budget_meter.tool_calls_used(),
+                        "turn ended at a round boundary: session quiescing"
+                    );
+                    send_history!();
+                    let _ = tx.send(StreamEvent::Session(SessionEvent::Notice(format!(
+                        "Turn stopped at a round boundary: {}.",
+                        match reason {
+                            crate::events::queue::Quiesce::Reload => "the daemon is reloading",
+                            crate::events::queue::Quiesce::Checkpoint => {
+                                "the session is checkpointing"
+                            }
+                        }
+                    ))));
+                    return Ok(());
+                }
+            }
+
             // Steering accepted while async stream setup was connecting must
             // reach the FIRST request, not wait until its tools have executed.
             // Subsequent rounds use the same path and normal request validation.
@@ -1041,8 +1359,10 @@ impl StreamMethods {
             // it sets `time_checkpoint` so the context assessment can archive
             // the head and start a fresh context segment with renewed time.
             // An un-exercised segment (no provider round yet) still hard-stops.
+            // A worker on its run clock never checkpoints on time (§5): its
+            // deadline stops the run.
             time_checkpoint = context_enabled
-                && budget_meter.budget().has_time_limit()
+                && budget_meter.time_checkpoints()
                 && budget_meter.wall_clock_exceeded();
             if time_checkpoint && !segment_has_provider_round {
                 finish_budget_exceeded!(agent_core::BudgetDimension::WallClock);
@@ -1076,7 +1396,7 @@ impl StreamMethods {
                                 Err(agent_core::BudgetDimension::WallClock)
                                     if context_enabled
                                         && segment_has_provider_round
-                                        && budget_meter.budget().has_time_limit() =>
+                                        && budget_meter.time_checkpoints() =>
                                 {
                                     time_checkpoint = true;
                                 }
@@ -1088,7 +1408,7 @@ impl StreamMethods {
                         }
                     }
                     Err(agent_core::BudgetDimension::WallClock)
-                        if context_enabled && budget_meter.budget().has_time_limit() =>
+                        if context_enabled && budget_meter.time_checkpoints() =>
                     {
                         if !segment_has_provider_round {
                             finish_budget_exceeded!(agent_core::BudgetDimension::WallClock);
@@ -1105,16 +1425,34 @@ impl StreamMethods {
             // mid-stream FROM THE BROKER, never the (absent) local auth.json. (#157)
             // Skip for non-Anthropic models — the OpenAI/codex path self-serves
             // its provider token (incl. via the broker). (#158 #7)
+            // An automatic selection that finds no capacity for a reason that
+            // ends by itself waits here, under the turn's cancel; a cancel
+            // during that wait ends the turn as one at this boundary does.
+            // This wait comes before a NEW request whose input already holds
+            // the last round's tool results, so nothing is resent and no tool
+            // runs twice (the never-wait rule for streamed output or a tool
+            // call guards resending the same request, in api.rs).
             if super::auth::model_is_anthropic(&model) {
-                super::auth::AuthMethods::refresh_if_needed(
+                match super::auth::AuthMethods::refresh_or_wait(
                     Arc::clone(&auth),
                     &client,
                     &credential_source,
                     &token_cache,
                     Some(&model),
                     super::auth::RefreshPoint::WithinTurn,
+                    options.capacity_wait.as_ref(),
+                    &tx,
+                    &cancel,
                 )
-                .await?;
+                .await
+                {
+                    Ok(()) => {}
+                    Err(crate::RuntimeError::Canceled) => {
+                        send_history!();
+                        return Ok(());
+                    }
+                    Err(e) => return Err(e),
+                }
             }
 
             // Round-top set maintenance: if dynamic registration advanced
@@ -1142,6 +1480,7 @@ impl StreamMethods {
                             registry.catalog(),
                             progressive_tool_disclosure,
                             context_enabled,
+                            forum_enabled,
                         );
                         for d in &dropped {
                             tracing::warn!(
@@ -1270,6 +1609,25 @@ impl StreamMethods {
             let (request_messages, estimate_messages) = round_images.views(request_messages);
             let retention_frontier = round_images.applied_frontier();
 
+            // Memory-only results: the durable history holds placeholders;
+            // the raw text goes back in on this request copy only. Before the
+            // context assessment, so pressure counts the real bytes. A
+            // request carrying raw text is never traced, tapped or recorded.
+            let memory_only_messages: Vec<SharedMessage>;
+            let memory_only_substituted;
+            let request_messages: &[SharedMessage] =
+                match memory_only.substitute(&messages, request_messages) {
+                    Some(swapped) => {
+                        memory_only_messages = swapped;
+                        memory_only_substituted = true;
+                        &memory_only_messages
+                    }
+                    None => {
+                        memory_only_substituted = false;
+                        request_messages
+                    }
+                };
+
             // Flag-off: borrow the turn's options untouched — no per-round
             // clone, exactly the pre-Task-18 request path. Flag-on: build one
             // per-round options value carrying the session projection.
@@ -1330,7 +1688,17 @@ impl StreamMethods {
                 };
                 &projected_options
             } else {
+                // Flag-off: the registry's cached schema unchanged, unless
+                // this session withholds a tool it exposes; then exactly
+                // those entries are left out (see `context_tool_set`).
+                let withheld_schema = tools_snapshot.schema_withholding(
+                    &session_tool_set
+                        .read()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner),
+                );
                 metered_options = super::api::ApiOptions {
+                    request_tools_schema: withheld_schema
+                        .or_else(|| options.request_tools_schema.clone()),
                     usage_counters: Some(std::sync::Arc::clone(&usage_counters)),
                     request_correlation: request_correlation.clone(),
                     retention_frontier,
@@ -1340,11 +1708,35 @@ impl StreamMethods {
                 &metered_options
             };
 
+            // Client tools (`runtime::client_tools`): the root stream of a
+            // conversation offers its session's registered tools after every
+            // other tool, never under a name the request already holds.
+            // Workers, conversation-less streams and extension-hosted
+            // provider models (whose own loop dispatches only from the shared
+            // registry) never see them; without a registration nothing
+            // changes. The snapshot also serves this round's dispatch.
+            let client_offer = client_tools.offer();
+            let client_options;
+            let round_options: &super::api::ApiOptions = if !client_offer.is_empty()
+                && delegation_parent.is_none()
+                && session_id.is_some()
+                && crate::extensions::providers::ProviderRegistry::parse_model_id(&model).is_none()
+            {
+                client_options =
+                    client_offer.round_options(round_options, &tools_snapshot.tools_schema());
+                client_options.as_ref().unwrap_or(round_options)
+            } else {
+                round_options
+            };
+
             // ═══ CONTEXT CONTINUATION: pre-request assessment ═══
             let mut context_advisory = None;
             // This round's request as estimated; pairs with the
             // provider-reported usage below.
             let mut calibration_probe: Option<CalibrationProbe> = None;
+            // The `max_tokens` this round's request was sized to and admitted
+            // on (R1); `None` sends the static cap.
+            let mut wire_max_tokens = None;
             if context_enabled {
                 use super::continuation::{ContextAdvisory, ADVISORY_RESERVE_TOKENS};
                 use agent_core::core::context_policy::{assess_context, ContextAction};
@@ -1359,7 +1751,15 @@ impl StreamMethods {
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .usage_anchor_for(&model)
                     .cloned();
-                let (assessment, budget) = pre_request_context_budget(
+                let calibration = continuation
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .window_calibration_for(&model);
+                let RequestContextBudget {
+                    assessment,
+                    sizing,
+                    budget,
+                } = pre_request_context_budget(
                     &model,
                     context_window,
                     injected_system.as_deref(),
@@ -1368,24 +1768,54 @@ impl StreamMethods {
                     thinking_budget as u64,
                     max_tool_output as u64,
                     anchor.as_ref(),
+                    calibration,
                 );
+                wire_max_tokens = sizing.wire_max_tokens;
                 calibration_probe = Some(CalibrationProbe::new(
                     &assessment,
                     usage_counters.records(),
                     estimate_messages,
                 ));
+                // Latest provider-reported footprint: this turn's booked usage,
+                // else the session's sample for this model (telemetry only).
+                let provider_context_tokens = (usage_counters.records() > 0)
+                    .then(|| usage_counters.latest_context_tokens())
+                    .filter(|&tokens| tokens > 0)
+                    .or_else(|| {
+                        continuation
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .calibration_for(&model)
+                            .map(|c| c.provider_tokens)
+                    });
+                let log_deferral = |reason: super::context_telemetry::DeferReason,
+                                    workers: usize| {
+                    super::context_telemetry::log_deferral(
+                        &continuation,
+                        reason,
+                        workers as u64,
+                        assessment.used_tokens(),
+                        provider_context_tokens,
+                    )
+                };
                 let decision = {
                     let mut s = continuation
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    let d = assess_context(&s.config, &s.policy, budget);
+                    let config = s.config_for_window(context_window_setting, context_window);
+                    let d = assess_context(&config, &s.policy, budget);
                     s.policy = d.next_state;
                     // Informational only: surfaced to on_message_complete hooks.
                     s.last_band = Some(d.band);
                     d
                 };
+                // The 1M entitlement fallback's rollover is due now, as hard
+                // capacity: it never waits and never defers.
+                let native_rollover = std::mem::take(&mut native_window_rollover);
+                let hard_capacity = native_rollover || decision.action == ContextAction::HardStop;
                 let current_advisory;
                 if time_checkpoint
+                    || native_rollover
                     || matches!(
                         decision.action,
                         ContextAction::Rollover | ContextAction::HardStop
@@ -1407,6 +1837,10 @@ impl StreamMethods {
                         })
                     };
                     if !readable {
+                        log_deferral(
+                            super::context_telemetry::DeferReason::RetrievalUnavailable,
+                            0,
+                        );
                         send_history!();
                         return Err(crate::RuntimeError::Config("rollover requires admitted builtin history retrieval tools; history retained".into()));
                     }
@@ -1417,18 +1851,21 @@ impl StreamMethods {
                     // capacity never waits: refusing there used to deadlock
                     // the session, since collecting needs the very model
                     // round being refused (incident 2026-10-13).
-                    let pending_workers = super::subagent::pending_workers(
+                    let pending_workers = super::subagent::pending_workers_for(
                         &subagent_registry,
                         orchestration.as_deref(),
+                        delegation_parent.as_deref(),
                     );
                     let gate = continuation
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .worker_gate(
-                            !pending_workers.is_empty(),
-                            decision.action == ContextAction::HardStop,
-                            time_checkpoint,
+                        .worker_gate(!pending_workers.is_empty(), hard_capacity, time_checkpoint);
+                    if gate != super::continuation::WorkerGate::Proceed {
+                        log_deferral(
+                            super::context_telemetry::DeferReason::WorkersPending,
+                            pending_workers.len(),
                         );
+                    }
                     if gate == super::continuation::WorkerGate::EndTurnForTime {
                         finish_budget_exceeded!(agent_core::BudgetDimension::WallClock);
                     }
@@ -1442,42 +1879,62 @@ impl StreamMethods {
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
                             .config
                             .reserve_tokens;
-                        let history_budget =
-                            context_window.saturating_sub(
-                                assessment
-                                    .reserves
-                                    .total()
-                                    .saturating_add(ADVISORY_RESERVE_TOKENS)
-                                    .max(minimum_reserve)
-                                    .saturating_add(assessment.estimated_tokens().saturating_sub(
-                                        super::context::estimate_history(&messages),
-                                    )),
-                            );
+                        // System prompt + tool schemas (+ request-only framing),
+                        // in estimate units (`used_tokens` may be anchored).
+                        let overhead_tokens = assessment
+                            .estimated_tokens()
+                            .saturating_sub(super::context::estimate_history(&messages));
+                        let history_budget = context_window.saturating_sub(
+                            assessment
+                                .reserves
+                                .total()
+                                .saturating_add(ADVISORY_RESERVE_TOKENS)
+                                .max(minimum_reserve)
+                                .saturating_add(overhead_tokens),
+                        );
                         // Aim the successor at the configured footprint, measured
                         // like `used_tokens` (system + schemas + messages) and
                         // calibrated to the provider-reported count when known.
-                        let target = {
-                            let s = continuation
+                        // The rolling summary's cap is reserved inside it.
+                        let (target, summary_tokens, target_tokens, calibration) = {
+                            let mut s = continuation
                                 .lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            let config =
+                                s.config_for_window(context_window_setting, context_window);
                             let thresholds =
                                 agent_core::core::context_policy::ContextThresholds::resolve(
-                                    &s.config,
+                                    &config,
                                     context_window,
                                 );
+                            let calibration = s.calibration_for(&model);
                             match thresholds {
-                                Ok(t) => super::continuation::successor_budget(
-                                    t.target_tokens(&s.config),
-                                    t.pressure_tokens,
-                                    assessment.estimated_tokens().saturating_sub(
-                                        super::context::estimate_history(&messages),
+                                Ok(t) => (
+                                    super::continuation::successor_budget(
+                                        t.target_tokens(&config),
+                                        t.pressure_tokens,
+                                        overhead_tokens,
+                                        calibration,
                                     ),
-                                    s.calibration_for(&model),
+                                    t.summary_tokens(&config),
+                                    t.target_tokens(&config),
+                                    calibration,
                                 ),
-                                Err(_) => super::continuation::SuccessorBudget::UNBOUNDED,
+                                Err(_) => (
+                                    super::continuation::SuccessorBudget::UNBOUNDED,
+                                    0,
+                                    0,
+                                    calibration,
+                                ),
                             }
                         };
-                        match super::continuation::rollover_for_boundary(
+                        // The 1M entitlement fallback's summarizer: cold only.
+                        let cold_summarizer = rollover_summarizer
+                            .as_ref()
+                            .ok()
+                            .filter(|_| native_rollover)
+                            .map(|summarizer| summarizer.clone().with_warm(None));
+                        match super::continuation::prepare_rollover(
                             &messages,
                             &continuation,
                             &memory_backend,
@@ -1485,27 +1942,61 @@ impl StreamMethods {
                             target,
                             &cancel,
                             time_checkpoint,
+                            super::rolling_summary::SummaryPlan {
+                                // The fallback's summary never goes warm:
+                                // that resends the refused prefix.
+                                summarizer: if native_rollover {
+                                    cold_summarizer.as_ref()
+                                } else {
+                                    rollover_summarizer.as_ref().ok()
+                                },
+                                skip: match &rollover_summarizer {
+                                    Ok(summarizer) => summarizer.notice(),
+                                    Err(skip) => *skip,
+                                },
+                                tokens: summary_tokens,
+                                accounting: Some(super::rolling_summary::SummaryAccounting {
+                                    usage: &usage_counters,
+                                    max_cost_usd: budget_meter.budget().max_cost_usd,
+                                    events: &tx,
+                                    tap: options.spend_tap.as_ref(),
+                                    // A v2 worker run's summaries are booked
+                                    // in its request ledger (§6).
+                                    ledger: options.request_ledger.as_ref(),
+                                }),
+                                run_clock: budget_meter.budget().run_clock,
+                            },
                             &worker_manifest,
                         )
                         .await
                         {
                             Ok(super::continuation::RolloverPreparation::Unproductive)
-                                if !time_checkpoint
-                                    && decision.action != ContextAction::HardStop =>
+                                if !time_checkpoint && !hard_capacity =>
                             {
                                 let mut state = continuation
                                     .lock()
                                     .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                // On the scale `assess_context` compares it
+                                // with: the request's admitted footprint.
                                 state
                                     .policy
-                                    .defer_unproductive_rollover(assessment.used_tokens());
+                                    .defer_unproductive_rollover(budget.used_tokens);
+                                drop(state);
+                                log_deferral(
+                                    super::context_telemetry::DeferReason::UnproductiveNoShrink,
+                                    0,
+                                );
                                 current_advisory = Some(ContextAdvisory::Unproductive);
                             }
                             Ok(super::continuation::RolloverPreparation::Unproductive) => {
+                                log_deferral(
+                                    super::context_telemetry::DeferReason::UnproductiveNoShrink,
+                                    0,
+                                );
                                 send_history!();
                                 return Err(super::continuation::unproductive_rollover_error());
                             }
-                            Ok(super::continuation::RolloverPreparation::Ready(prepared)) => {
+                            Ok(super::continuation::RolloverPreparation::Ready(mut prepared)) => {
                                 // A cancel that landed while the successor was
                                 // being prepared must stop HERE: `persist_head`
                                 // latches `durability_blocked` before it asks
@@ -1517,9 +2008,92 @@ impl StreamMethods {
                                     send_history!();
                                     return Ok(());
                                 }
-                                super::continuation::persist_head(&prepared, &continuation, &tx)
-                                    .await?;
+                                if let Err(error) =
+                                    super::continuation::persist_head(&prepared, &continuation, &tx)
+                                        .await
+                                {
+                                    log_deferral(
+                                        super::context_telemetry::DeferReason::HeadNotAcknowledged,
+                                        0,
+                                    );
+                                    return Err(error);
+                                }
+                                // Sizes exist only if measured at preparation
+                                // (interest can appear during the head ack).
+                                let successor_tokens = prepared.stats.measured.then(|| {
+                                    overhead_tokens.saturating_add(prepared.stats.history_tokens)
+                                });
+                                if let Some(successor_tokens) = successor_tokens {
+                                    prepared.arm_settle(&model, successor_tokens, target_tokens);
+                                }
+                                let (session, archive, window_to, stats, summary_code) = (
+                                    super::context_telemetry::SessionLabel::of(
+                                        &prepared.logical_id,
+                                    ),
+                                    prepared.archive_id().to_owned(),
+                                    prepared.window(),
+                                    *prepared.stats,
+                                    prepared.summary.code(),
+                                );
+                                let summary = prepared.summary;
+                                let summary_attempt = prepared.summary_report.take();
+                                let produced =
+                                    matches!(summary, super::continuation::SummaryOutcome::Updated);
+                                // Each notice is said once per session binding,
+                                // per reason and summary model.
+                                let skip_notice = prepared.summary_skip.and_then(|skip| {
+                                    let summary_model = rollover_summarizer
+                                        .as_ref()
+                                        .map_or("", |summarizer| summarizer.model());
+                                    continuation
+                                        .lock()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                        .summary_skips_noticed
+                                        .first(skip, summary_model)
+                                        .then(|| {
+                                            format!(" {}", skip.notice(summary_model, produced))
+                                        })
+                                });
                                 messages = prepared.commit(&continuation)?;
+                                super::context_telemetry::RolloverEvent {
+                                    session: &session,
+                                    window_from: window_to.saturating_sub(1),
+                                    window_to,
+                                    archive: &archive,
+                                    trigger: if native_rollover {
+                                        super::context_telemetry::NATIVE_WINDOW_TRIGGER
+                                    } else {
+                                        super::context_telemetry::rollover_trigger(
+                                            time_checkpoint,
+                                            &decision,
+                                        )
+                                    },
+                                    footprint_tokens: assessment.used_tokens(),
+                                    provider_context_tokens,
+                                    calibration_ratio: calibration.map(|c| {
+                                        c.estimated_tokens as f64 / c.provider_tokens as f64
+                                    }),
+                                    target_tokens,
+                                    target_history_tokens: target.history_tokens,
+                                    history_budget_tokens: history_budget,
+                                    history_target_tokens: stats.history_target_tokens,
+                                    overhead_tokens,
+                                    successor_tokens,
+                                    retained_messages: stats.retained_messages,
+                                    dropped_messages: stats.dropped_messages,
+                                    must_keep_tokens: stats.must_keep_tokens,
+                                    workers_carried: pending_workers.len() as u64,
+                                    continuation_tokens: stats
+                                        .measured
+                                        .then_some(stats.continuation_tokens),
+                                    summary: summary_code,
+                                    summary_reason: stats.summary_reason,
+                                    summary_tokens: stats.measured.then_some(stats.summary_tokens),
+                                    summary_attempt: summary_attempt.as_deref(),
+                                }
+                                .emit();
+                                ephemeral_layer.invalidate(super::ephemeral::Reason::Rollover);
+                                memory_only.clear();
                                 budget_meter.start_context_segment();
                                 segment_has_provider_round = false;
                                 let window = continuation
@@ -1530,6 +2104,12 @@ impl StreamMethods {
                                 // Already published: the next round checkpoint
                                 // must not re-send the identical head.
                                 round_checkpoint.mark_published(&messages);
+                                let summary = match summary {
+                                    super::continuation::SummaryOutcome::Updated => "Dropped messages were folded into the rolling summary.",
+                                    super::continuation::SummaryOutcome::Carried => "The rolling summary was carried forward unchanged.",
+                                    super::continuation::SummaryOutcome::None => "No rolling summary.",
+                                };
+                                let skip_notice = skip_notice.unwrap_or_default();
                                 let carried = if pending_workers.is_empty() {
                                     String::new()
                                 } else {
@@ -1539,18 +2119,41 @@ impl StreamMethods {
                                         if pending_workers.len() == 1 { "" } else { "s" }
                                     )
                                 };
-                                let _=tx.send(StreamEvent::Session(SessionEvent::Notice(format!("Continued automatically in context window {window} with a fresh wall-clock allowance; earlier eligible source evidence remains searchable. Other resource limits remain unchanged. No summarizing compaction.{carried}"))));
+                                let allowance = if budget_meter.on_run_clock() {
+                                    "; the run deadline is unchanged. Earlier"
+                                } else {
+                                    " with a fresh wall-clock allowance; earlier"
+                                };
+                                let _=tx.send(StreamEvent::Session(SessionEvent::Notice(format!("Continued automatically in context window {window}{allowance} eligible source evidence remains searchable. Other resource limits remain unchanged. {summary}{skip_notice}{carried}"))));
                                 first_request_of_window = true;
                                 continue;
                             }
-                            Err(error) => {
+                            Err(refusal) => {
+                                // The turn ends here (history retained): a
+                                // refusal, not a deferral.
+                                if let Some(reason) = refusal.reason {
+                                    super::context_telemetry::log_refusal(
+                                        &continuation,
+                                        reason,
+                                        0,
+                                        assessment.used_tokens(),
+                                        provider_context_tokens,
+                                    );
+                                }
                                 send_history!();
-                                return Err(error);
+                                return Err(refusal.error);
                             }
                         }
                     }
                 } else {
                     current_advisory = ContextAdvisory::from_assessment(&decision);
+                    // The no-shrink cooldown is a continuing deferral.
+                    if current_advisory == Some(ContextAdvisory::Unproductive) {
+                        log_deferral(
+                            super::context_telemetry::DeferReason::UnproductiveNoShrink,
+                            0,
+                        );
+                    }
                 }
                 let transition = continuation
                     .lock()
@@ -1582,7 +2185,9 @@ impl StreamMethods {
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .usage_anchor_for(&model)
                     .cloned();
-                let (assessment, budget) = pre_request_context_budget(
+                // PARITY E2: a worker request is not sized (R1 is the
+                // foreground's); its policy decides on the unsized budget.
+                let sized = pre_request_context_budget(
                     &model,
                     context_window,
                     injected_system.as_deref(),
@@ -1591,7 +2196,9 @@ impl StreamMethods {
                     thinking_budget as u64,
                     max_tool_output as u64,
                     anchor.as_ref(),
+                    None,
                 );
+                let (assessment, budget) = (sized.assessment, sized.expected_budget());
                 let used = assessment.used_tokens();
                 calibration_probe = Some(CalibrationProbe::new(
                     &assessment,
@@ -1695,6 +2302,19 @@ impl StreamMethods {
                 }
             }
 
+            // The request sends the output it was sized to and admitted on
+            // (R1): the same value the assessment reserved.
+            let sized_options;
+            let round_options = if let Some(max_tokens) = wire_max_tokens {
+                sized_options = super::api::ApiOptions {
+                    request_output_tokens: Some(max_tokens),
+                    ..round_options.clone()
+                };
+                &sized_options
+            } else {
+                round_options
+            };
+
             // Request-only advisory: once per state transition, or every
             // round while a due rollover waits on workers.
             let pressure_request;
@@ -1711,27 +2331,154 @@ impl StreamMethods {
                 request_messages
             };
 
+            // Warm rolling summary: this native-Anthropic round becomes the
+            // chain's request record (refcounted inputs, no copies).
+            let tapped_options;
+            let round_options = if context_enabled && !ephemeral_layer.opted_in() && !memory_only_substituted && super::warm_summary::recordable(&model) {
+                let scope = super::warm_summary::RecordScope::of(&model, round_options);
+                let inputs = super::warm_summary::RecordInputs {
+                    durable: messages.clone(),
+                    messages: request_messages.to_vec(),
+                    system_prompt: injected_system.clone(),
+                    tools_schema: round_options
+                        .request_tools_schema
+                        .clone()
+                        .unwrap_or_else(|| tools_snapshot.tools_schema()),
+                    tool_split: round_options.anthropic_tool_split.clone(),
+                    thinking_budget,
+                    reasoning_level,
+                    execution_plan: round_options.anthropic_execution_plan.clone(),
+                    registry_schema: tools_snapshot.tools_schema(),
+                };
+                let tap = continuation
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .record_request(scope, inputs);
+                tapped_options = super::api::ApiOptions {
+                    prefix_tap: Some(tap),
+                    ..round_options.clone()
+                };
+                &tapped_options
+            } else {
+                round_options
+            };
+
+            // A window waiting to settle watches this call's first reported
+            // usage (any attempt). Bound to the binding and model it was
+            // armed under; a probe for another model is dropped.
+            let settle_watch = calibration_probe.as_ref().and_then(|probe| {
+                let mut s = continuation
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let (window, epoch) = (s.window, s.epoch());
+                s.telemetry
+                    .watch(window, epoch, &model)
+                    .then_some(((window, epoch), probe.estimated_tokens))
+            });
+            if settle_watch.is_some() {
+                usage_counters.watch_first_context();
+            }
+            // Last-mile admission: material never enters summary records or history.
+            let Some(ephemeral_permit) = ephemeral_layer.admit(&cancel).await else {
+                send_history!();
+                return Ok(());
+            };
+            let request_system = ephemeral_permit.compose(&injected_system);
+            let private_options;
+            let round_options = if ephemeral_permit.has_text() || memory_only_substituted {
+                private_options = super::api::ApiOptions {
+                    trace: super::trace::TraceContext::disabled(),
+                    prefix_tap: None,
+                    ..round_options.clone()
+                };
+                &private_options
+            } else { round_options };
+            // PARITY: upstream tool keep-warm marks the round just before its
+            // provider call; a private round (ephemeral text or memory-only
+            // substitution) is never kept warm (its prefix must not be resent).
+            let private_round = ephemeral_permit.has_text() || memory_only_substituted;
             let round_mark = super::tool_keepwarm::RoundMark::new(&usage_counters);
-            let response = match await_provider_call(&cancel, ApiMethods::call_api_stream_inner(
-                &auth,
-                &client,
-                &model,
-                &tools_snapshot,
-                &injected_system,
-                thinking_budget,
-                reasoning_level,
-                request_messages,
-                tx.clone(),
+            let response = await_provider_call(
                 &cancel,
-                api_retries,
-                refusal_retries,
-                round_options,
-                telemetry_level,
-            ))
-            .await
-            {
+                ApiMethods::call_api_stream_inner(
+                    &auth,
+                    &client,
+                    &model,
+                    &tools_snapshot,
+                    &request_system,
+                    thinking_budget,
+                    reasoning_level,
+                    request_messages,
+                    tx.clone(),
+                    &cancel,
+                    api_retries,
+                    refusal_retries,
+                    round_options,
+                    telemetry_level,
+                ),
+            )
+            .await;
+            drop(ephemeral_permit);
+            if let Some((watched, request_tokens)) = settle_watch {
+                let reported = usage_counters.take_first_context();
+                let settled = super::context_telemetry::settle_after_call(
+                    &continuation,
+                    watched,
+                    &model,
+                    reported,
+                    response.is_ok(),
+                );
+                if let Some(((probe, provider_tokens), session)) = settled {
+                    super::context_telemetry::emit_settled(
+                        &session,
+                        &probe,
+                        provider_tokens,
+                        request_tokens,
+                    );
+                }
+            }
+            // Taken every round: a report belongs to this call only.
+            let long_context_refusal = long_context_slot.take();
+            let response = match response {
                 Ok(r) => r,
                 Err(e) => {
+                    // 1M entitlement fallback (`runtime::native_window`): a
+                    // request that carried the 1M beta, over the native
+                    // window, refused with a long-context class. Once per
+                    // (session, model): after the latch the beta is no
+                    // longer sent, so a later failure ends the turn here.
+                    let native = crate::models::context_window_for_model(&model);
+                    let input_tokens = calibration_probe.as_ref().map_or_else(
+                        || super::context::estimate_history(&messages),
+                        |probe| probe.estimated_tokens,
+                    );
+                    let refused = long_context_refusal.filter(|_| {
+                        options.use_1m_context
+                            && crate::core::models::model_supports_1m(&model)
+                            && input_tokens > native
+                            && context_window > native
+                    });
+                    if let Some(failure) = refused.filter(|_| native_window.latch(&model)) {
+                        super::context_telemetry::log_native_window_fallback(
+                            &continuation,
+                            failure.status,
+                            failure.class.code(),
+                            context_window,
+                            native,
+                        );
+                        let _ = tx.send(StreamEvent::Session(SessionEvent::Notice(
+                            super::native_window::fallback_notice(native),
+                        )));
+                        context_window = native;
+                        options.use_1m_context = false;
+                        options.diagnostic_context_window = Some(native);
+                        if context_enabled {
+                            // Roll over sized for the native window, then
+                            // retry the request once on the new context.
+                            native_window_rollover = true;
+                            continue;
+                        }
+                    }
                     // Send whatever history we have so far, so context isn't lost
                     send_history!();
                     return Err(e);
@@ -1747,10 +2494,19 @@ impl StreamMethods {
             // A round that asks for tools: keep its prefix warm while they
             // run (`runtime::tool_keepwarm`). Stopped once their results are
             // in; dropped (stopped) on every other way out of this round.
+            let keepwarm_options;
             let mut round_keepwarm = match &tool_keepwarm {
                 Some(settings)
-                    if !response_cancelled && super::tool_keepwarm::has_tool_use(&response) =>
+                    if !response_cancelled
+                        && !private_round
+                        && super::tool_keepwarm::has_tool_use(&response) =>
                 {
+                    // PARITY: pings must not feed the warm-summary record's
+                    // evidence (ours `prefix_tap`): they carry their own body.
+                    keepwarm_options = super::api::ApiOptions {
+                        prefix_tap: None,
+                        ..round_options.clone()
+                    };
                     super::tool_keepwarm::ToolRoundKeepWarm::start(
                         settings,
                         round_mark,
@@ -1763,7 +2519,7 @@ impl StreamMethods {
                             thinking_budget,
                             reasoning_level,
                             messages: request_messages,
-                            options: round_options,
+                            options: &keepwarm_options,
                             telemetry_level,
                         },
                         super::tool_keepwarm::Turn {
@@ -1832,7 +2588,11 @@ impl StreamMethods {
                         finish_budget_exceeded!(dimension);
                     }
                     let after_tool_result = budget_meter.rounds_used() > 1;
-                    if after_tool_result && !cancel.is_cancelled() {
+                    // `reason` is stamped by the Codex transport, not copied
+                    // from a provider's finish_reason. Provenance is per turn.
+                    let event_noop = options.event_triggered
+                        && response["reason"].as_str() == Some("event_noop");
+                    if (after_tool_result || event_noop) && !cancel.is_cancelled() {
                         // Legitimate empty end_turn after tool results — clean finish.
                         // A clean finish is a terminal completion: publish the
                         // history for memory capture like the normal end_turn path.
@@ -1889,6 +2649,8 @@ impl StreamMethods {
                                 let _ = tx.send(StreamEvent::Llm(LlmEvent::ToolResult {
                                     tool_id: tool_id.to_string(),
                                     result: content.clone(),
+                                    memory_only: false,
+                                    client_tool: None,
                                 }));
                                 json!({
                                     "type": "tool_result",
@@ -1945,14 +2707,21 @@ impl StreamMethods {
                 if tool_uses.is_empty() {
                     // A cancelled turn takes no new input: steering still in
                     // the channel stays undelivered (the frontend dequeues it)
-                    // instead of entering history after the cancel.
+                    // instead of entering history after the cancel. Neither
+                    // does a quiescing one: the loop top would end the turn
+                    // before any round answered it, so it stays the actor's
+                    // to re-send or return (as at the tool-round drain).
+                    let quiescing = event_queue.quiesced().is_some();
                     let steered = !cancel.is_cancelled()
+                        && !quiescing
                         && drain_steering!();
                     // Muse ended on an announced-but-unperformed action ("Blocking
                     // question before I build anything:"). Continue ONCE with a
                     // visible harness note instead of silently ending the turn.
-                    // Only the Muse route sets the sidecar; steering wins.
-                    if !steered {
+                    // Only the Muse route sets the sidecar; steering wins. Not
+                    // while quiescing: the loop top would stop the turn with
+                    // the note unanswered.
+                    if !steered && !quiescing {
                         if let Some(reason) = crate::runtime::openai::stream::take_preamble_nudge(
                             &response,
                             &mut preamble_nudged,
@@ -1974,11 +2743,25 @@ impl StreamMethods {
                             continue;
                         }
                     }
+                    if !steered
+                        && !quiescing
+                        && !response_cancelled
+                        && !cancel.is_cancelled()
+                        && delegation_parent.is_some()
+                        && matches!(context_advisory, Some(super::continuation::ContextAdvisory::WorkersPending))
+                    {
+                        // The host asked for bookkeeping, not a final answer
+                        // to the worker's task. A text-only advisory reply must
+                        // not complete the job. The existing four-round grace
+                        // forces rollover, and ordinary budgets/cancel still
+                        // bound this continuation; no text matching or replay.
+                        continue;
+                    }
                     if !steered {
                         // No steering, truly done. Completion is still subject to the
                         // session orchestration policy (including streamed runs).
                         if let Some(orchestration) = &orchestration {
-                            match orchestration.completion_gate() {
+                            match orchestration.completion_gate_for(delegation_parent.as_deref()) {
                                 agent_core::orchestration::CompletionGate::Allowed => {}
                                 agent_core::orchestration::CompletionGate::Warning { workers } => {
                                     let _ = tx.send(StreamEvent::Session(SessionEvent::Notice(
@@ -2080,6 +2863,8 @@ impl StreamMethods {
                         let _ = tx.send(StreamEvent::Llm(LlmEvent::ToolResult {
                             tool_id,
                             result: err.to_string(),
+                            memory_only: false,
+                            client_tool: None,
                         }));
                     } else if !tool_id.is_empty() && !tool_name.is_empty() {
                         // ═══ EXECUTION GATE (Task 16, spec §7.1) ═══
@@ -2100,16 +2885,26 @@ impl StreamMethods {
                             let session_set = session_tool_set
                                 .read()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-                            crate::tools::activation::ExecutionGate::authorize_wire_call(
+                            match crate::tools::activation::ExecutionGate::authorize_wire_call(
                                 &registry,
                                 &session_set,
                                 &tool_name,
-                            )
-                            .map(|authorized| {
-                                let input =
-                                    registry.translate_input_for_api_tool(&tool_name, input);
-                                (authorized, input)
-                            })
+                            ) {
+                                Ok(authorized) => {
+                                    let input =
+                                        registry.translate_input_for_api_tool(&tool_name, input);
+                                    Ok((authorized, input))
+                                }
+                                // A client tool this round offered: never one
+                                // the registry resolves (no shadowing).
+                                Err(
+                                    unknown @ crate::tools::activation::ToolAuthorizationError::UnknownTool { .. },
+                                ) => client_offer
+                                    .authorize(&tool_name)
+                                    .map(|authorized| (authorized, input))
+                                    .ok_or(unknown),
+                                Err(denied) => Err(denied),
+                            }
                         };
                         let tool_call_started = std::time::Instant::now();
                         let execution_correlation = request_correlation.as_ref().map(|request| {
@@ -2128,6 +2923,10 @@ impl StreamMethods {
                         // successful plain-text result (never errors,
                         // cancels or rich output).
                         let mut shaping: Option<super::read_dedupe::Shaping> = None;
+                        // A client tool call's stamp (contract §8), and whether
+                        // the result was taken memory-only (the typed flag).
+                        let mut client_tool: Option<agent_core::ClientToolStamp> = None;
+                        let mut kept = false;
                         let (result, rich_blocks) = match gate_outcome {
                             Ok((authorized, input)) => {
                                 let tool = authorized.implementation();
@@ -2166,27 +2965,61 @@ impl StreamMethods {
                                         ));
                                     },
                                 );
-                                let tx_d = delta_channel.sender;
+                                let mut tx_d = delta_channel.sender;
+                                if let Some(route) = &child_route {
+                                    tx_d.set_child_sink(route.sink(&tool_id, &tool_name));
+                                }
                                 production_output = Some(output_handle.clone());
 
                                 // ═══ HOOK: before_tool_call (stream single) ═══
                                 let runtime_name = authorized.runtime_name().to_string();
-                                let decision = resolve_before_tool_call_decision(
-                                    input.clone(),
-                                    emit_before_tool_call(
-                                        &hook_bus,
-                                        &tool_name,
-                                        Some(&runtime_name),
-                                        input.clone(),
-                                        session_id.as_deref(),
-                                    )
-                                    .await,
-                                    secret_prompt.as_ref(),
-                                    auto_approve_confirms,
-                                    Some(&session_allow_all),
+                                let hook_call = ToolCallHookContext::for_tool_call(
+                                    session_id.as_deref(),
+                                    Some(tool_id.as_str()),
+                                    cwd.as_deref(),
+                                );
+                                // Decision 18(a): a memory-only call (a client
+                                // tool of a memory-only registration, or a tool
+                                // the session's globs mark) reaches the hooks by
+                                // name only, and a hook's Confirm of args nobody
+                                // was shown never prompts: it stands only on
+                                // auto-approve or the allow-all latch.
+                                let hooks_withheld = client_offer.memory_only(&tool_name)
+                                    || memory_only_policy.marks(&tool.origin(), &runtime_name, &tool_name);
+                                // Sandbox `tools = confined`: a refused call
+                                // reaches no hook and never runs.
+                                let refused = crate::sandbox::gate_tool(
+                                    crate::sandbox::SandboxBinding::for_session(session_id.as_deref()).as_deref(),
+                                    &runtime_name,
                                 )
-                                .await;
-                                if let BeforeToolCallDecision::Block { reason } = decision {
+                                .err();
+                                let decision = if refused.is_some() {
+                                    BeforeToolCallDecision::Block { reason: String::new() }
+                                } else {
+                                resolve_before_tool_call_decision(
+                                    input.clone(),
+                                    if hooks_withheld {
+                                        emit_before_tool_call_withheld(&hook_bus, &tool_name, Some(&runtime_name), &hook_call).await
+                                    } else {
+                                        emit_before_tool_call_with(
+                                            &hook_bus,
+                                            &tool_name,
+                                            Some(&runtime_name),
+                                            input.clone(),
+                                            &hook_call,
+                                        )
+                                        .await
+                                    },
+                                    if hooks_withheld { None } else { hook_confirm_prompt.as_ref() },
+                                    hook_auto_approve,
+                                    Some(&session_allow_all),
+                                    hook_call.tool_call_id,
+                                )
+                                .await
+                                };
+                                if let Some(text) = refused {
+                                    (text, None)
+                                } else if let BeforeToolCallDecision::Block { reason } = decision {
                                     (format!("Tool call blocked by extension: {}", reason), None)
                                 } else {
                                     let BeforeToolCallDecision::Continue { input } = decision
@@ -2208,12 +3041,44 @@ impl StreamMethods {
                                         &input,
                                         cwd.as_deref(),
                                     );
-                                    match await_tool_call(&cancel, tool.execute_rich(input, crate::ToolContext {
+                                    let caller_hooks = crate::tools::CallerHooks { bus: hook_bus.clone(), auto_approve: hook_auto_approve, memory_only: memory_only_policy.clone() };
+                                    match await_tool_call(&cancel, crate::tools::CALLER_HOOKS.scope(caller_hooks, tool.execute_rich(input, crate::ToolContext {
                                             channels: crate::tools::ToolChannels { tx_delta: Some(tx_d), tx_events: Some(tx.clone()) },
-                                            capabilities: crate::tools::ToolCapabilities { session_allow_all: Some(session_allow_all.clone()), launch_cancel: Some(cancel.clone()), memory_backend: Some(memory_backend.clone()), telemetry: Some(worker_telemetry.clone()), watcher_exit_path: watcher_exit_path.clone(), tool_register_tx: Some(tool_reg_tx.clone()), session_manager: Some(session_manager.clone()), subagent_registry: Some(subagent_registry.clone()), event_queue: Some(event_queue.clone()), delegation_parent: delegation_parent.clone(), codex_parent_plan: codex_parent_plan.clone(), secret_prompt: secret_prompt.clone(), orchestration: orchestration.clone(), tool_activation: Some(crate::tools::discovery::ActivationCapability::new(catalog_snapshot.clone(), std::sync::Arc::clone(&session_tool_set), activation_authority).with_host_prompt(activation_prompt_allowed)), mcp_leases: mcp_lease_capability.clone(), extension_leases: extension_lease_capability.clone(), memory_context: memory_context.clone(), cwd: cwd.clone(), env: env.clone(), env_stripped: env_stripped.clone(), env_warned: env_warned.clone(), session_id: session_id.clone() },
+                                            capabilities: crate::tools::ToolCapabilities { session_allow_all: Some(session_allow_all.clone()), launch_cancel: Some(cancel.clone()), memory_backend: Some(memory_backend.clone()), telemetry: Some(worker_telemetry.clone()), continuation: Some(continuation.clone()), watcher_exit_path: watcher_exit_path.clone(), tool_register_tx: Some(tool_reg_tx.clone()), session_manager: Some(session_manager.clone()), subagent_registry: Some(subagent_registry.clone()), event_queue: Some(event_queue.clone()), delegation_parent: delegation_parent.clone(), codex_parent_plan: codex_parent_plan.clone(), worker_context: worker_context_policy.as_ref().map(|w| worker_context_now(w, &continuation)), secret_prompt: secret_prompt.clone(), orchestration: orchestration.clone(), tool_activation: Some(crate::tools::discovery::ActivationCapability::new(catalog_snapshot.clone(), std::sync::Arc::clone(&session_tool_set), activation_authority).with_host_prompt(activation_prompt_allowed)), mcp_leases: mcp_lease_capability.clone(), extension_leases: extension_lease_capability.clone(), memory_context: memory_context.clone(), cwd: cwd.clone(), env: env.clone(), env_stripped: env_stripped.clone(), env_warned: env_warned.clone(), sandbox: crate::sandbox::SandboxBinding::for_session(session_id.as_deref()), session_id: session_id.clone(), tool_use_id: Some(tool_id.clone()), turn_correlation_id: Some(turn_correlation_id.clone()), spend: spend_parent.clone() },
                                             limits: crate::tools::ToolLimits { max_tool_output, max_tool_buffer: 256 * 1024, bash_timeout, bash_max_timeout, subagent_timeout },
-                                        })).await {
-                                        (Some(res), _) => {
+                                        }))).await {
+                                        (Some(res), _) => 'result: {
+                                            // Client tools: the stamp the call left marks it
+                                            // as one (contract §8). R4: a client tool's
+                                            // memory-only result is never cut or withheld
+                                            // by max_tool_output.
+                                            client_tool = client_offer.take_stamp(&tool_id);
+                                            let result_cap = if client_tool.is_some() { usize::MAX } else { max_tool_output };
+                                            // Memory-only: the raw text stays in RAM; history,
+                                            // events and the after_tool_call hook get the fixed
+                                            // placeholder, and a hook cannot replace it. The
+                                            // session's globs are read now, at the check, so a
+                                            // live Set made during this turn applies.
+                                            let memory_only_marked = memory_only_policy.marks(&tool.origin(), &runtime_name, &tool_name);
+                                            let res = match memory_only.take(memory_only_marked, &tool_name, &tool_id, res, result_cap) {
+                                                super::memory_only::Taken::Plain(res) => res,
+                                                super::memory_only::Taken::Kept(text) => {
+                                                    kept = true;
+                                                    production_output = None;
+                                                    let _ = emit_after_tool_call_outcome(
+                                                        &hook_bus,
+                                                        &tool_name,
+                                                        Some(&runtime_name),
+                                                        input_for_hook,
+                                                        text.clone(),
+                                                        result_cap,
+                                                        &hook_call,
+                                                        true,
+                                                        false,
+                                                    ).await;
+                                                    break 'result (text, None);
+                                                }
+                                            };
                                             let plain_success = matches!(res, Ok(crate::ToolOutput::Text(_)));
                                             let (output, rich_blocks) = match res {
                                                 Ok(o) => validated_tool_output(&model, o),
@@ -2232,7 +3097,8 @@ impl StreamMethods {
                                                 input_for_hook,
                                                 output.clone(),
                                                 max_tool_output,
-                                                session_id.as_deref(),
+                                                &hook_call,
+                                                hooks_withheld,
                                                 tool_spill.is_enabled(),
                                             ).await;
                                             // Hook policy: a Replace transform wins over the rich
@@ -2255,6 +3121,8 @@ impl StreamMethods {
                                         }
                                         (None, started) => {
                                             canceled = true;
+                                            // A cancelled client call gets no stamp.
+                                            let _ = client_offer.take_stamp(&tool_id);
                                             // Ledger: this call STARTED but
                                             // never recorded a result. A
                                             // NonIdempotent call is now an
@@ -2280,6 +3148,8 @@ impl StreamMethods {
                             Err(denial) => (denial.to_string(), None),
                         };
 
+                        // R4: a kept client result's placeholder stays whole.
+                        let history_cap = if kept && client_tool.is_some() { usize::MAX } else { max_tool_output };
                         let history_result = production_output
                             .as_ref()
                             .map(crate::tools::output::OutputHandle::model_history)
@@ -2291,7 +3161,7 @@ impl StreamMethods {
                                 history_result
                                     .as_ref()
                                     .map(|bounded| bounded.retained_bytes)
-                                    .unwrap_or_else(|| result.len().min(max_tool_output)),
+                                    .unwrap_or_else(|| result.len().min(history_cap)),
                             ),
                         };
                         let was_virtualised = virtualised.is_some();
@@ -2312,7 +3182,7 @@ impl StreamMethods {
                                 rich_blocks,
                                 history_result.map(|bounded| bounded.text),
                                 &result,
-                                max_tool_output,
+                                history_cap,
                             )
                         };
                         // Read dedupe compares the FINAL history form
@@ -2361,6 +3231,11 @@ impl StreamMethods {
                         let _ = tx.send(StreamEvent::Llm(LlmEvent::ToolResult {
                             tool_id: tool_id.clone(),
                             result: ui_result,
+                            memory_only: kept,
+                            client_tool: client_tool.map(|mut stamp| {
+                                stamp.memory_only = kept;
+                                Box::new(stamp)
+                            }),
                         }));
 
                         tool_results.push(json!({
@@ -2439,16 +3314,26 @@ impl StreamMethods {
                                     (PreparedCall::ParseError(err.to_string()), LaneKind::Concurrent)
                                 } else {
                                     let gate =
-                                        crate::tools::activation::ExecutionGate::authorize_wire_call(
+                                        match crate::tools::activation::ExecutionGate::authorize_wire_call(
                                             &registry,
                                             &session_set,
                                             &tool_name,
-                                        )
-                                        .map(|authorized| {
-                                            let input = registry
-                                                .translate_input_for_api_tool(&tool_name, input);
-                                            (authorized, input)
-                                        });
+                                        ) {
+                                            Ok(authorized) => {
+                                                let input = registry
+                                                    .translate_input_for_api_tool(&tool_name, input);
+                                                Ok((authorized, input))
+                                            }
+                                            // A client tool this round offered
+                                            // (never one the registry resolves).
+                                            Err(
+                                                unknown @ crate::tools::activation::ToolAuthorizationError::UnknownTool { .. },
+                                            ) => client_offer
+                                                .authorize(&tool_name)
+                                                .map(|authorized| (authorized, input))
+                                                .ok_or(unknown),
+                                            Err(denied) => Err(denied),
+                                        };
                                     let lane = match &gate {
                                         Ok((authorized, _))
                                             if authorized.implementation().runs_independently() =>
@@ -2553,7 +3438,10 @@ impl StreamMethods {
                         let request_correlation_inner = request_correlation.clone();
                         let trace_inner = round_options.trace.clone();
                         let delegation_parent_inner = delegation_parent.clone();
+                        let child_route_inner = child_route.clone();
+                        let spend_parent_inner = spend_parent.clone();
                         let codex_parent_plan_inner = codex_parent_plan.clone();
+                        let worker_context_inner = worker_context_policy.as_ref().map(|w| worker_context_now(w, &continuation));
                         let cancel_token = cancel.clone();
                         let turn_completion_inner = turn_completion.clone();
                         let exit_path = watcher_exit_path.clone();
@@ -2562,6 +3450,9 @@ impl StreamMethods {
                         let registry_inner = subagent_registry.clone();
                         let eq_inner = event_queue.clone();
                         let hook_bus_inner = hook_bus.clone();
+                        let memory_only_inner = memory_only.clone();
+                        let client_offer_inner = std::sync::Arc::clone(&client_offer);
+                        let memory_only_policy_inner = memory_only_policy.clone();
                         let prompt_inner = secret_prompt.clone();
                         let model_inner = model.clone();
                         let cwd_inner = cwd.clone();
@@ -2573,7 +3464,10 @@ impl StreamMethods {
                         let memory_context_inner = memory_context.clone();
                         let session_id_inner = session_id.clone();
                         let tool_spill_inner = tool_spill.clone();
-                        let auto_approve_inner = auto_approve_confirms;
+                        let continuation_inner = continuation.clone();
+                        let turn_correlation_id_inner = turn_correlation_id.clone();
+                        let auto_approve_inner = hook_auto_approve;
+                        let hook_prompt_inner = hook_confirm_prompt.clone();
                         let session_allow_all_inner = session_allow_all.clone();
                         let orchestration_inner = orchestration.clone();
                         let mcp_leases_inner = mcp_lease_capability.clone();
@@ -2600,6 +3494,8 @@ impl StreamMethods {
                                     let _ = tx_stream.send(StreamEvent::Llm(LlmEvent::ToolResult {
                                         tool_id: tool_id.clone(),
                                         result: err.clone(),
+                                        memory_only: false,
+                                        client_tool: None,
                                     }));
                                     lane_results.push((tool_id, false, None, Value::String(err)));
                                     continue;
@@ -2610,6 +3506,9 @@ impl StreamMethods {
                             // Read dedupe / write-edit note: successful
                             // plain-text results only (see single-tool site).
                             let mut shaping: Option<super::read_dedupe::Shaping> = None;
+                            // Client tool stamp and the typed flag (see the single-tool site).
+                            let mut client_tool: Option<agent_core::ClientToolStamp> = None;
+                            let mut kept = false;
                             let result = match gate_outcome {
                                 Ok((authorized, input)) => {
                                     let t = authorized.implementation();
@@ -2619,20 +3518,47 @@ impl StreamMethods {
                                     let tool_call_started = std::time::Instant::now();
                                     let runtime_name_for_hook =
                                         authorized.runtime_name().to_string();
-                                    let decision = resolve_before_tool_call_decision(
+                                    let hook_call = ToolCallHookContext::for_tool_call(
+                                        session_id_inner.as_deref(),
+                                        Some(tool_id.as_str()),
+                                        cwd_inner.as_deref(),
+                                    );
+                                    // Decision 18(a): a memory-only call reaches the
+                                    // hooks by name only and never prompts (see the
+                                    // single-tool site).
+                                    let hooks_withheld = client_offer_inner.memory_only(&tool_name_for_hook)
+                                        || memory_only_policy_inner.marks(&t.origin(), &runtime_name_for_hook, &tool_name_for_hook);
+                                    // Sandbox `tools = confined` (see the single-tool site).
+                                    let refused = crate::sandbox::gate_tool(
+                                        crate::sandbox::SandboxBinding::for_session(session_id_inner.as_deref()).as_deref(),
+                                        &runtime_name_for_hook,
+                                    )
+                                    .err();
+                                    let decision = if refused.is_some() {
+                                        BeforeToolCallDecision::Block { reason: String::new() }
+                                    } else {
+                                    resolve_before_tool_call_decision(
                                         input.clone(),
-                                        emit_before_tool_call(
-                                            &hook_bus_inner,
-                                            &tool_name_for_hook,
-                                            Some(&runtime_name_for_hook),
-                                            input.clone(),
-                                            session_id_inner.as_deref(),
-                                        ).await,
-                                        prompt_inner.as_ref(),
+                                        if hooks_withheld {
+                                            emit_before_tool_call_withheld(&hook_bus_inner, &tool_name_for_hook, Some(&runtime_name_for_hook), &hook_call).await
+                                        } else {
+                                            emit_before_tool_call_with(
+                                                &hook_bus_inner,
+                                                &tool_name_for_hook,
+                                                Some(&runtime_name_for_hook),
+                                                input.clone(),
+                                                &hook_call,
+                                            ).await
+                                        },
+                                        if hooks_withheld { None } else { hook_prompt_inner.as_ref() },
                                         auto_approve_inner,
                                         Some(&session_allow_all_inner),
-                                    ).await;
-                                    if let BeforeToolCallDecision::Block { reason } = decision {
+                                        hook_call.tool_call_id,
+                                    ).await
+                                    };
+                                    if let Some(text) = refused {
+                                        (false, Some(call_effect), text, None, None, None, None)
+                                    } else if let BeforeToolCallDecision::Block { reason } = decision {
                                         (false, Some(call_effect), format!("Tool call blocked by extension: {}", reason), None, None, None, None)
                                     } else {
                                     let BeforeToolCallDecision::Continue { input } = decision else { unreachable!() };
@@ -2673,14 +3599,43 @@ impl StreamMethods {
                                             }));
                                         },
                                     );
-                                    let tx_d = delta_channel.sender;
+                                    let mut tx_d = delta_channel.sender;
+                                    if let Some(route) = &child_route_inner {
+                                        tx_d.set_child_sink(route.sink(&tool_id, &tool_name));
+                                    }
 
-                                    match await_tool_call(&cancel_token, t.execute_rich(input, crate::ToolContext {
+                                    let caller_hooks = crate::tools::CallerHooks { bus: hook_bus_inner.clone(), auto_approve: auto_approve_inner, memory_only: memory_only_policy_inner.clone() };
+                                    match await_tool_call(&cancel_token, crate::tools::CALLER_HOOKS.scope(caller_hooks, t.execute_rich(input, crate::ToolContext {
                                             channels: crate::tools::ToolChannels { tx_delta: Some(tx_d), tx_events: Some(tx_stream.clone()) },
-                                            capabilities: crate::tools::ToolCapabilities { session_allow_all: Some(session_allow_all_inner.clone()), launch_cancel: Some(cancel_token.clone()), memory_backend: Some(memory_backend_inner.clone()), telemetry: Some(worker_telemetry_inner.clone()), watcher_exit_path: exit_path.clone(), tool_register_tx: Some(tool_reg_tx_inner.clone()), session_manager: Some(session_mgr.clone()), subagent_registry: Some(registry_inner.clone()), event_queue: Some(eq_inner.clone()), delegation_parent: delegation_parent_inner.clone(), codex_parent_plan: codex_parent_plan_inner.clone(), secret_prompt: prompt_inner.clone(), orchestration: orchestration_inner.clone(), tool_activation: Some(activation_inner.clone()), mcp_leases: mcp_leases_inner.clone(), extension_leases: extension_leases_inner.clone(), memory_context: memory_context_inner.clone(), cwd: cwd_inner.clone(), env: env_inner.clone(), env_stripped: env_stripped_inner.clone(), env_warned: env_warned_inner.clone(), session_id: session_id_inner.clone() },
+                                            capabilities: crate::tools::ToolCapabilities { session_allow_all: Some(session_allow_all_inner.clone()), launch_cancel: Some(cancel_token.clone()), memory_backend: Some(memory_backend_inner.clone()), telemetry: Some(worker_telemetry_inner.clone()), continuation: Some(continuation_inner.clone()), watcher_exit_path: exit_path.clone(), tool_register_tx: Some(tool_reg_tx_inner.clone()), session_manager: Some(session_mgr.clone()), subagent_registry: Some(registry_inner.clone()), event_queue: Some(eq_inner.clone()), delegation_parent: delegation_parent_inner.clone(), codex_parent_plan: codex_parent_plan_inner.clone(), worker_context: worker_context_inner.clone(), secret_prompt: prompt_inner.clone(), orchestration: orchestration_inner.clone(), tool_activation: Some(activation_inner.clone()), mcp_leases: mcp_leases_inner.clone(), extension_leases: extension_leases_inner.clone(), memory_context: memory_context_inner.clone(), cwd: cwd_inner.clone(), env: env_inner.clone(), env_stripped: env_stripped_inner.clone(), env_warned: env_warned_inner.clone(), sandbox: crate::sandbox::SandboxBinding::for_session(session_id_inner.as_deref()), session_id: session_id_inner.clone(), tool_use_id: Some(tool_id.clone()), turn_correlation_id: Some(turn_correlation_id_inner.clone()), spend: spend_parent_inner.clone() },
                                             limits: crate::tools::ToolLimits { max_tool_output, max_tool_buffer: 256 * 1024, bash_timeout, bash_max_timeout, subagent_timeout },
-                                        })).await {
-                                        (Some(res), _) => {
+                                        }))).await {
+                                        (Some(res), _) => 'result: {
+                                            // Client tools, R4 (see the single-tool site).
+                                            client_tool = client_offer_inner.take_stamp(&tool_id);
+                                            let result_cap = if client_tool.is_some() { usize::MAX } else { max_tool_output };
+                                            // Memory-only (see the single-tool site): placeholder
+                                            // everywhere but the RAM table, no delta lane; globs
+                                            // read at the check.
+                                            let memory_only_marked = memory_only_policy_inner.marks(&t.origin(), &runtime_name_for_hook, &tool_name);
+                                            let res = match memory_only_inner.take(memory_only_marked, &tool_name, &tool_id, res, result_cap) {
+                                                super::memory_only::Taken::Plain(res) => res,
+                                                super::memory_only::Taken::Kept(text) => {
+                                                    kept = true;
+                                                    let _ = emit_after_tool_call_outcome(
+                                                        &hook_bus_inner,
+                                                        &tool_name_for_hook,
+                                                        Some(&runtime_name_for_hook),
+                                                        input_for_hook,
+                                                        text.clone(),
+                                                        result_cap,
+                                                        &hook_call,
+                                                        true,
+                                                        false,
+                                                    ).await;
+                                                    break 'result (false, Some(call_effect), text, None, Some((stable_tool_id, activation_basis, tool_call_started)), None, None);
+                                                }
+                                            };
                                             let plain_success = matches!(res, Ok(crate::ToolOutput::Text(_)));
                                             let (output, rich_blocks, errored) = match res {
                                                 Ok(o) => { let (t, b) = validated_tool_output(&model_inner, o); (t, b, false) }
@@ -2693,7 +3648,8 @@ impl StreamMethods {
                                                 input_for_hook,
                                                 output.clone(),
                                                 max_tool_output,
-                                                session_id_inner.as_deref(),
+                                                &hook_call,
+                                                hooks_withheld,
                                                 tool_spill_inner.is_enabled(),
                                             ).await;
                                             // Hook Replace wins over rich blocks (see single-tool site).
@@ -2714,6 +3670,8 @@ impl StreamMethods {
                                             (false, Some(call_effect), outcome.output, history_handle, Some((stable_tool_id, activation_basis, tool_call_started)), rich_blocks, virtualised)
                                         }
                                         (None, started) => {
+                                            // A cancelled client call gets no stamp.
+                                            let _ = client_offer_inner.take_stamp(&tool_id);
                                             (true, started.then_some(call_effect), turn_completion_inner.cancel_phrase().to_string(), Some(output_handle), Some((stable_tool_id, activation_basis, tool_call_started)), None, None)
                                         }
                                     }
@@ -2724,12 +3682,19 @@ impl StreamMethods {
                                 Err(denial) => (false, None, denial.to_string(), None, None, None, None),
                             };
 
+                            // R4: a kept client result's placeholder stays whole.
+                            let history_cap = if kept && client_tool.is_some() { usize::MAX } else { max_tool_output };
                             let _ = tx_stream.send(StreamEvent::Llm(LlmEvent::ToolResult {
                                 tool_id: tool_id.clone(),
                                 result: crate::tools::output::bounded_preview(
                                     &result.2,
                                     crate::tools::output::DEFAULT_UI_PREVIEW_BYTES,
                                 ),
+                                memory_only: kept,
+                                client_tool: client_tool.map(|mut stamp| {
+                                    stamp.memory_only = kept;
+                                    Box::new(stamp)
+                                }),
                             }));
 
                             let was_canceled = result.0;
@@ -2769,7 +3734,7 @@ impl StreamMethods {
                                     result.5,
                                     history_bounded.as_ref().map(|bounded| bounded.text.clone()),
                                     &result.2,
-                                    max_tool_output,
+                                    history_cap,
                                 )
                             };
                             // Read dedupe on the FINAL history form, against
@@ -2807,7 +3772,7 @@ impl StreamMethods {
                                         history_bounded
                                             .as_ref()
                                             .map(|bounded| bounded.retained_bytes)
-                                            .unwrap_or_else(|| result.2.len().min(max_tool_output)),
+                                            .unwrap_or_else(|| result.2.len().min(history_cap)),
                                     )
                                 });
                                 if deduped_bytes.is_some() {
@@ -2860,6 +3825,8 @@ impl StreamMethods {
                                 let _ = tx_stream.send(StreamEvent::Llm(LlmEvent::ToolResult {
                                     tool_id,
                                     result: turn_completion_inner.cancel_phrase().to_string(),
+                                    memory_only: false,
+                                    client_tool: None,
                                 }));
                             }
                             lane_results
@@ -2926,6 +3893,8 @@ impl StreamMethods {
                         let _ = tx.send(StreamEvent::Llm(LlmEvent::ToolResult {
                             tool_id: tool_id.to_string(),
                             result: content.to_string(),
+                            memory_only: false,
+                            client_tool: None,
                         }));
                         tool_results.push(json!({
                             "type": "tool_result",
@@ -3011,7 +3980,10 @@ impl StreamMethods {
                 // These get injected as user messages before the next LLM call,
                 // allowing the user to redirect the agent mid-work. Not after
                 // a cancel: the loop top returns the history as-is.
-                if !cancel.is_cancelled() {
+                // Not while quiescing either: the loop top ends the turn then,
+                // and steering left undelivered stays the
+                // actor's to re-send or return.
+                if !cancel.is_cancelled() && event_queue.quiesced().is_none() {
                     drain_steering!();
                 }
 
@@ -4147,6 +5119,95 @@ mod rich_output_tests {
         streaming_history_cases(true).await;
     }
 
+    /// Runs the real `bash` asking for 400 s, above the harness's 300 s
+    /// `bash_max_timeout`, so the command's timeout is lowered.
+    #[cfg(feature = "command-exec")]
+    struct ClampedBash;
+
+    #[cfg(feature = "command-exec")]
+    #[async_trait::async_trait]
+    impl Tool for ClampedBash {
+        fn name(&self) -> &str {
+            "clamped_bash"
+        }
+        fn description(&self) -> &str {
+            "runs `echo ok` asking for a 400 s timeout"
+        }
+        fn parameters(&self) -> Value {
+            json!({"type":"object","properties":{}})
+        }
+        fn origin(&self) -> crate::tools::ToolOrigin {
+            crate::tools::ToolOrigin::Builtin
+        }
+        fn effect(&self) -> crate::tools::catalog::ToolEffect {
+            crate::tools::catalog::ToolEffect::ReadOnly
+        }
+        async fn execute(&self, _params: Value, ctx: ToolContext) -> Result<String> {
+            crate::tools::BashTool
+                .execute(json!({"command": "echo ok", "timeout": 400}), ctx)
+                .await
+        }
+    }
+
+    /// A hook's Replace is final, the clamp notice included. With no hook the
+    /// model's copy of a lowered call (the delta lane) opens with the notice;
+    /// with a Replace hook it is the replacement alone. The notice is in the
+    /// output the hook receives, so keeping it is the hook's call.
+    #[cfg(feature = "command-exec")]
+    async fn clamped_bash_cases(parallel: bool) {
+        let calls = if parallel {
+            vec![("toolu_a", "clamped_bash"), ("toolu_b", "clamped_bash")]
+        } else {
+            vec![("toolu_a", "clamped_bash")]
+        };
+        for (hook, expected) in [
+            (
+                None,
+                "[timeout clamped from 400 s to 300 s by bash_max_timeout]\nok\n",
+            ),
+            (Some(true), "REPLACED BY HOOK"),
+        ] {
+            let d = drive(
+                vec![Arc::new(ClampedBash)],
+                &calls,
+                output_hook_bus(hook).await,
+            )
+            .await;
+            let wire = tool_result_message(&d.bodies[1]);
+            let history = d
+                .history
+                .iter()
+                .find(|m| m["role"] == "user" && m["content"][0]["type"] == "tool_result")
+                .expect("durable tool results");
+            for message in [wire, history.as_ref()] {
+                let results = message["content"].as_array().unwrap();
+                assert_eq!(results.len(), calls.len());
+                for result in results {
+                    assert_eq!(
+                        result["content"], expected,
+                        "parallel={parallel}, hook={hook:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "command-exec")]
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn a_hook_replace_is_final_for_a_clamped_bash_call() {
+        let _base = crate::test_env::BaseDirGuard::new();
+        clamped_bash_cases(false).await;
+    }
+
+    #[cfg(feature = "command-exec")]
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn a_hook_replace_is_final_for_parallel_clamped_bash_calls() {
+        let _base = crate::test_env::BaseDirGuard::new();
+        clamped_bash_cases(true).await;
+    }
+
     // Provider-free checks of the internal outcome and compatibility wrapper.
     #[tokio::test]
     #[serial_test::serial(synaps_base_dir)]
@@ -4168,7 +5229,8 @@ mod rich_output_tests {
                     json!({}),
                     summary.clone(),
                     10,
-                    None,
+                    &ToolCallHookContext::default(),
+                    false,
                     keep_uncut,
                 )
                 .await;
@@ -4334,10 +5396,14 @@ mod rich_output_tests {
             final_capture_history: Arc::new(Mutex::new(None)),
             turn_completion: Default::default(),
             context_window: 200_000,
+            context_window_setting: None,
+            native_window: Default::default(),
             continuation: std::sync::Arc::new(std::sync::Mutex::new(
                 crate::runtime::continuation::ContinuationState::default(),
             )),
+            rollover_summarizer: Err(None),
             worker_context: Default::default(),
+            worker_context_policy: None,
             auth: Arc::new(RwLock::new(AuthState {
                 auth_token: "test-token".into(),
                 auth_type: "api_key".into(),
@@ -4357,6 +5423,10 @@ mod rich_output_tests {
             refusal_retries: 0,
             model: model.into(),
             tools,
+            ephemeral_layer: crate::runtime::ephemeral::Layer::default(),
+            memory_only: Default::default(),
+            memory_only_policy: Default::default(),
+            client_tools: Default::default(),
             system_prompt: None,
             thinking_budget: 0,
             reasoning_level: agent_core::reasoning::ReasoningLevel::Adaptive,
@@ -4384,10 +5454,13 @@ mod rich_output_tests {
             env_warned: Default::default(),
             secret_prompt: None,
             auto_approve_confirms: true,
+            hook_confirm_prompt: None,
+            hook_auto_approve: true,
             session_allow_all: Arc::new(crate::tools::SessionConfirmLatch::new()),
             telemetry_level: crate::runtime::telemetry::TelemetryLevel::Off,
             orchestration: None,
             delegation_parent: None,
+            child_route: None,
             turn_correlation_id: "turn-test".into(),
             progressive_tool_disclosure: progressive,
             deferred_tool_loading: true,
@@ -4404,6 +5477,7 @@ mod rich_output_tests {
             ),
             owner_steer_budget: None,
             message_clock: Default::default(),
+            spend_parent: None,
         }
     }
 
@@ -4439,6 +5513,7 @@ mod rich_output_tests {
             std::time::Duration::from_secs(20),
             None,
             Some(continuation),
+            None,
         )
         .await
     }
@@ -4457,6 +5532,7 @@ mod rich_output_tests {
             tool_uses,
             hook_bus,
             std::time::Duration::from_secs(20),
+            None,
             None,
             None,
         )
@@ -4485,6 +5561,7 @@ mod rich_output_tests {
             deadline,
             None,
             None,
+            None,
         )
         .await;
         eprintln!(
@@ -4496,7 +5573,8 @@ mod rich_output_tests {
 
     /// `conversation_id` is the owning conversation id the stream runs
     /// under (`StreamSession.session_id`); `None` = worker/no conversation,
-    /// the harness default.
+    /// the harness default. `session_cwd` is `StreamSession.cwd` (`None`,
+    /// the harness default, = the process cwd).
     #[allow(clippy::too_many_arguments)]
     async fn drive_with_model_and_options(
         model: &str,
@@ -4507,6 +5585,7 @@ mod rich_output_tests {
         deadline: std::time::Duration,
         conversation_id: Option<&str>,
         continuation: Option<crate::runtime::continuation::SharedContinuation>,
+        session_cwd: Option<PathBuf>,
     ) -> Driven {
         drive_configured(
             model,
@@ -4517,6 +5596,7 @@ mod rich_output_tests {
             deadline,
             |session| {
                 session.session_id = conversation_id.map(str::to_string);
+                session.cwd = session_cwd;
                 if let Some(continuation) = continuation {
                     session.continuation = continuation;
                 }
@@ -4590,7 +5670,7 @@ mod rich_output_tests {
         while let Ok(ev) = rx.try_recv() {
             match ev {
                 StreamEvent::Session(SessionEvent::MessageHistory(m)) => history = m,
-                StreamEvent::Llm(LlmEvent::ToolResult { result, tool_id }) => {
+                StreamEvent::Llm(LlmEvent::ToolResult { result, tool_id, .. }) => {
                     tool_signals.push(format!("result:{tool_id}"));
                     ui_results.push(result)
                 }
@@ -4812,7 +5892,7 @@ mod rich_output_tests {
         while let Ok(ev) = rx.try_recv() {
             match ev {
                 StreamEvent::Session(SessionEvent::MessageHistory(m)) => history = m,
-                StreamEvent::Llm(LlmEvent::ToolResult { result, tool_id }) => {
+                StreamEvent::Llm(LlmEvent::ToolResult { result, tool_id, .. }) => {
                     tool_signals.push(format!("result:{tool_id}"));
                     ui_results.push(result)
                 }
@@ -5454,6 +6534,7 @@ mod rich_output_tests {
                 std::time::Duration::from_secs(20),
                 conversation,
                 None,
+                None,
             )
             .await;
             let seen = seen.lock().unwrap().clone();
@@ -5464,6 +6545,402 @@ mod rich_output_tests {
                 uses.len()
             );
         }
+    }
+
+    /// `(tool_use_id, turn_correlation_id)` pairs, in call order.
+    type SeenIds = Arc<std::sync::Mutex<Vec<(Option<String>, Option<String>)>>>;
+
+    /// Records the `(tool_use_id, turn_correlation_id)` each call's
+    /// `ToolContext` carries.
+    struct CallIdProbe(SeenIds);
+    #[async_trait::async_trait]
+    impl Tool for CallIdProbe {
+        fn name(&self) -> &str {
+            "call_id_probe"
+        }
+        fn description(&self) -> &str {
+            "records ctx.capabilities.tool_use_id and turn_correlation_id"
+        }
+        fn parameters(&self) -> Value {
+            json!({"type":"object","properties":{}})
+        }
+        fn origin(&self) -> crate::tools::ToolOrigin {
+            crate::tools::ToolOrigin::Builtin
+        }
+        fn effect(&self) -> crate::tools::catalog::ToolEffect {
+            crate::tools::catalog::ToolEffect::ReadOnly
+        }
+        async fn execute(&self, _params: Value, ctx: ToolContext) -> Result<String> {
+            self.0.lock().unwrap().push((
+                ctx.capabilities.tool_use_id.clone(),
+                ctx.capabilities.turn_correlation_id.clone(),
+            ));
+            Ok("probed".to_string())
+        }
+    }
+
+    /// Both dispatch sites (the single call and the parallel lanes) give
+    /// every tool its own `tool_use_id` and the turn's correlation id.
+    #[tokio::test]
+    async fn tool_context_carries_the_call_and_turn_ids() {
+        for uses in [
+            &[("toolu_1", "call_id_probe")][..],
+            &[("toolu_1", "call_id_probe"), ("toolu_2", "call_id_probe")][..],
+        ] {
+            let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let initial = vec![Arc::new(json!({"role":"user","content":"go"})) as SharedMessage];
+            let _ = drive_with_model_and_options(
+                "claude-sonnet-4-6",
+                initial,
+                vec![Arc::new(CallIdProbe(seen.clone()))],
+                uses,
+                Arc::new(crate::extensions::hooks::HookBus::new()),
+                std::time::Duration::from_secs(20),
+                Some("conv-1"),
+                None,
+                None,
+            )
+            .await;
+            let mut seen = seen.lock().unwrap().clone();
+            seen.sort();
+            let expected: Vec<_> = uses
+                .iter()
+                .map(|(id, _)| (Some(id.to_string()), Some("turn-test".to_string())))
+                .collect();
+            assert_eq!(seen, expected, "{} tool use(s)", uses.len());
+        }
+    }
+
+    /// Sandbox `tools = confined`: a tool that isn't on the session's list
+    /// is refused before any hook and never runs, on the single and the
+    /// parallel lane; named by a `tool =` line, it runs as before. (Scratch
+    /// policy dir; the binding is registered under the conversation id the
+    /// dispatch looks up.)
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_confined_session_refuses_an_unlisted_tool_before_any_hook() {
+        use crate::sandbox::policy::{test_scratch_parent, KillSwitch, PolicyEnv};
+        use crate::sandbox::SandboxBinding;
+        let tmp = tempfile::Builder::new()
+            .prefix("sbx-confine-stream-")
+            .tempdir_in(test_scratch_parent())
+            .unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        std::fs::create_dir_all(root.join("home/x/base/sandbox/sessions")).unwrap();
+        let env = PolicyEnv { home: root.join("home"), base_dir: root.join("home/x/base") };
+        let single = &[("toolu_1", "session_probe")][..];
+        let parallel = &[("toolu_1", "session_probe"), ("toolu_2", "session_probe")][..];
+        for (extra, runs) in [("", false), ("tool = session_probe\n", true)] {
+            for uses in [single, parallel] {
+                let id = format!("confine-stream-{}", uuid::Uuid::new_v4());
+                std::fs::write(
+                    env.policy_path(&id).unwrap(),
+                    format!("mode = enforce\ntools = confined\ncontact = Ask the desk.\n{extra}"),
+                )
+                .unwrap();
+                SandboxBinding::register_for_test(SandboxBinding::with_env(
+                    &id,
+                    env.clone(),
+                    Box::leak(Box::new(KillSwitch::new())),
+                    Some(Ok(7)),
+                ));
+                let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+                let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+                let initial = vec![Arc::new(json!({"role":"user","content":"go"})) as SharedMessage];
+                let d = drive_with_model_and_options(
+                    "claude-sonnet-4-6",
+                    initial,
+                    vec![Arc::new(SessionProbe(seen.clone()))],
+                    uses,
+                    recording_hook_bus(events.clone()).await,
+                    std::time::Duration::from_secs(20),
+                    Some(&id),
+                    None,
+                    None,
+                )
+                .await;
+                let calls = seen.lock().unwrap().len();
+                let before = events
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|e| e.kind == HookKind::BeforeToolCall)
+                    .count();
+                let history: String = d.history.iter().map(|m| m.to_string()).collect();
+                let refusals = history
+                    .matches("Refused by this session's sandbox (tools = confined): `session_probe` is not on its tool list")
+                    .count();
+                let what = format!("{} use(s), runs={runs}", uses.len());
+                if runs {
+                    assert_eq!((calls, before, refusals), (uses.len(), uses.len(), 0), "{what}: {history}");
+                } else {
+                    assert_eq!((calls, before, refusals), (0, 0, uses.len()), "{what}: {history}");
+                    assert!(history.contains("Ask the desk."), "{what}: the contact: {history}");
+                }
+            }
+        }
+    }
+
+    /// Records every hook event it sees; answers Continue.
+    struct RecordingHook(Arc<std::sync::Mutex<Vec<HookEvent>>>);
+    #[async_trait::async_trait]
+    impl crate::extensions::runtime::ExtensionHandler for RecordingHook {
+        fn id(&self) -> &str {
+            "recording-hook"
+        }
+        async fn handle(&self, event: &HookEvent) -> HookResult {
+            self.0.lock().unwrap().push(event.clone());
+            HookResult::Continue
+        }
+        async fn shutdown(&self) {}
+    }
+
+    async fn recording_hook_bus(
+        events: Arc<std::sync::Mutex<Vec<HookEvent>>>,
+    ) -> Arc<crate::extensions::hooks::HookBus> {
+        let bus = Arc::new(crate::extensions::hooks::HookBus::new());
+        let mut perms = PermissionSet::new();
+        perms.grant(crate::extensions::permissions::Permission::ToolsIntercept);
+        let handler: Arc<dyn crate::extensions::runtime::ExtensionHandler> =
+            Arc::new(RecordingHook(events));
+        for kind in [HookKind::BeforeToolCall, HookKind::AfterToolCall] {
+            bus.subscribe(kind, handler.clone(), None, None, perms.clone())
+                .await
+                .unwrap();
+        }
+        bus
+    }
+
+    /// Both tool hooks carry the provider's tool call id and the cwd a
+    /// relative tool path resolves against (the session cwd, else the
+    /// process cwd), on the single and the parallel lane.
+    #[tokio::test]
+    async fn tool_hooks_carry_the_call_id_and_the_session_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_cwd = dir.path().to_path_buf();
+        let process_cwd = std::env::current_dir().unwrap();
+        let single = &[("toolu_a", "session_probe")][..];
+        let parallel = &[("toolu_a", "session_probe"), ("toolu_b", "session_probe")][..];
+        for (cwd, expected, uses) in [
+            (Some(session_cwd.clone()), session_cwd.clone(), single),
+            (Some(session_cwd.clone()), session_cwd.clone(), parallel),
+            (None, process_cwd.clone(), single),
+            (None, process_cwd.clone(), parallel),
+        ] {
+            let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let initial = vec![Arc::new(json!({"role":"user","content":"go"})) as SharedMessage];
+            let _ = drive_with_model_and_options(
+                "claude-sonnet-4-6",
+                initial,
+                vec![Arc::new(SessionProbe(Arc::new(std::sync::Mutex::new(
+                    Vec::new(),
+                ))))],
+                uses,
+                recording_hook_bus(events.clone()).await,
+                std::time::Duration::from_secs(20),
+                Some("conv-1"),
+                None,
+                cwd.clone(),
+            )
+            .await;
+            let events = events.lock().unwrap().clone();
+            let expected = expected.to_str().unwrap().to_string();
+            for kind in [HookKind::BeforeToolCall, HookKind::AfterToolCall] {
+                let mut seen: Vec<_> = events
+                    .iter()
+                    .filter(|e| e.kind == kind)
+                    .map(|e| (e.tool_call_id.clone(), e.cwd.clone(), e.session_id.clone()))
+                    .collect();
+                seen.sort();
+                let want: Vec<_> = uses
+                    .iter()
+                    .map(|(id, _)| {
+                        (
+                            Some(id.to_string()),
+                            Some(expected.clone()),
+                            Some("conv-1".to_string()),
+                        )
+                    })
+                    .collect();
+                assert_eq!(
+                    seen,
+                    want,
+                    "{kind:?}, {} tool use(s), session cwd {cwd:?}",
+                    uses.len()
+                );
+            }
+        }
+    }
+
+    /// Records each `before_tool_call`'s call id; answers Confirm.
+    struct ConfirmingHook(Arc<std::sync::Mutex<Vec<Option<String>>>>);
+    #[async_trait::async_trait]
+    impl crate::extensions::runtime::ExtensionHandler for ConfirmingHook {
+        fn id(&self) -> &str {
+            "jev"
+        }
+        async fn handle(&self, event: &HookEvent) -> HookResult {
+            self.0.lock().unwrap().push(event.tool_call_id.clone());
+            HookResult::confirm("Run it?")
+        }
+        async fn shutdown(&self) {}
+    }
+
+    /// An extension's tool-call Confirm prompt carries the provider's call
+    /// id, the same id that call's `before_tool_call` event carries, so a
+    /// client pairs the prompt with its call by identity, not by timing. On
+    /// the single and the parallel lane; approval runs each call.
+    #[tokio::test]
+    async fn a_confirm_prompt_carries_the_call_id_of_its_before_tool_call_event() {
+        let single = &[("toolu_a", "session_probe")][..];
+        let parallel = &[("toolu_a", "session_probe"), ("toolu_b", "session_probe")][..];
+        for uses in [single, parallel] {
+            let n = uses.len();
+            let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let bus = Arc::new(crate::extensions::hooks::HookBus::new());
+            let mut perms = PermissionSet::new();
+            perms.grant(crate::extensions::permissions::Permission::ToolsIntercept);
+            let handler: Arc<dyn crate::extensions::runtime::ExtensionHandler> =
+                Arc::new(ConfirmingHook(seen.clone()));
+            bus.subscribe(HookKind::BeforeToolCall, handler, None, None, perms)
+                .await
+                .unwrap();
+            let (prompt_tx, mut prompt_rx) =
+                mpsc::unbounded_channel::<crate::tools::SecretPromptRequest>();
+            let answer = tokio::spawn(async move {
+                let mut scopes = Vec::new();
+                for _ in 0..n {
+                    let req = prompt_rx.recv().await.expect("each call's confirm prompts");
+                    scopes.push(req.confirm_scope.clone());
+                    let _ = req.response_tx.send(Some("yes".into()));
+                }
+                scopes
+            });
+
+            let (base_url, mock) = spawn_mock(sse_tool_use_round(uses)).await;
+            let ran = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let mut registry = ToolRegistry::new();
+            registry.register(Arc::new(SessionProbe(ran.clone())));
+            let (tx, _events) = mpsc::unbounded_channel::<StreamEvent>();
+            let mut session = harness_session(
+                base_url,
+                Arc::new(RwLock::new(registry)),
+                tx,
+                crate::tools::shell::SessionManager::new(
+                    crate::tools::shell::ShellConfig::default(),
+                ),
+                bus,
+                crate::tools::activation::SessionId::parse(&format!(
+                    "test-{}-{}",
+                    std::process::id(),
+                    uuid::Uuid::new_v4()
+                ))
+                .unwrap(),
+                Default::default(),
+                false,
+                "claude-sonnet-4-6",
+            );
+            session.hook_confirm_prompt = Some(crate::tools::SecretPromptHandle::new(prompt_tx));
+            session.hook_auto_approve = false;
+            let initial = vec![Arc::new(json!({"role":"user","content":"go"})) as SharedMessage];
+            let run = tokio::time::timeout(
+                std::time::Duration::from_secs(20),
+                StreamMethods::run_stream_internal(session, initial),
+            )
+            .await
+            .expect("stream loop must finish");
+            assert!(run.is_ok(), "{n} tool use(s): the stream completes");
+            let scopes = tokio::time::timeout(std::time::Duration::from_secs(5), answer)
+                .await
+                .expect("every prompt was answered")
+                .expect("the answering task");
+
+            let mut prompt_ids: Vec<_> = scopes
+                .iter()
+                .map(|scope| scope.as_ref().and_then(|s| s.tool_call_id.clone()))
+                .collect();
+            prompt_ids.sort();
+            let mut event_ids = seen.lock().unwrap().clone();
+            event_ids.sort();
+            let want: Vec<_> = uses.iter().map(|(id, _)| Some(id.to_string())).collect();
+            assert_eq!(
+                (prompt_ids, event_ids),
+                (want.clone(), want),
+                "{n} tool use(s): (prompt ids, event ids)"
+            );
+            for scope in &scopes {
+                assert_eq!(
+                    scope.as_ref().map(|s| s.extensions.clone()),
+                    Some(vec!["jev".to_string()]),
+                    "{n} tool use(s)"
+                );
+            }
+            assert_eq!(ran.lock().unwrap().len(), n, "approval runs each call");
+            assert_eq!(mock.calls.load(Ordering::SeqCst), 2, "two provider rounds");
+        }
+    }
+
+    /// Records the calling turn's hook route each call runs under
+    /// ([`crate::tools::CALLER_HOOKS`]): the bus pointer and auto-approve.
+    struct CallerHooksProbe(RoutesSeen);
+    /// One entry per call: `Some((bus pointer, auto-approve))`, or `None`
+    /// when no caller route was in scope.
+    type RoutesSeen = Arc<std::sync::Mutex<Vec<Option<(usize, bool)>>>>;
+    #[async_trait::async_trait]
+    impl Tool for CallerHooksProbe {
+        fn name(&self) -> &str {
+            "caller_hooks_probe"
+        }
+        fn description(&self) -> &str {
+            "records the caller hook route in scope"
+        }
+        fn parameters(&self) -> Value {
+            json!({"type":"object","properties":{}})
+        }
+        fn origin(&self) -> crate::tools::ToolOrigin {
+            crate::tools::ToolOrigin::Builtin
+        }
+        fn effect(&self) -> crate::tools::catalog::ToolEffect {
+            crate::tools::catalog::ToolEffect::ReadOnly
+        }
+        async fn execute(&self, _params: Value, _ctx: ToolContext) -> Result<String> {
+            let route = crate::tools::CALLER_HOOKS
+                .try_with(|c| (Arc::as_ptr(&c.bus) as usize, c.auto_approve))
+                .ok();
+            self.0.lock().unwrap().push(route);
+            Ok("probed".to_string())
+        }
+    }
+
+    /// Every tool call runs with its turn's hook route in scope (the bus the
+    /// turn's own hooks use, and its auto-approve policy), on the single and
+    /// the parallel lane: a worker started from the call routes its
+    /// `before_tool_call` hooks through it.
+    #[tokio::test]
+    async fn tool_calls_run_with_the_turns_hook_route_in_scope() {
+        let single = &[("toolu_a", "caller_hooks_probe")][..];
+        let parallel = &[
+            ("toolu_a", "caller_hooks_probe"),
+            ("toolu_b", "caller_hooks_probe"),
+        ][..];
+        for uses in [single, parallel] {
+            let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let bus = Arc::new(crate::extensions::hooks::HookBus::new());
+            let _ = drive(
+                vec![Arc::new(CallerHooksProbe(seen.clone()))],
+                uses,
+                bus.clone(),
+            )
+            .await;
+            let seen = seen.lock().unwrap().clone();
+            // The harness turn auto-approves confirms.
+            let want = Some((Arc::as_ptr(&bus) as usize, true));
+            assert_eq!(seen, vec![want; uses.len()], "{} tool use(s)", uses.len());
+        }
+        assert!(
+            crate::tools::CALLER_HOOKS.try_with(|_| ()).is_err(),
+            "out of scope outside a tool call"
+        );
     }
 
     #[tokio::test]
@@ -6171,6 +7648,125 @@ mod rich_output_tests {
         );
     }
 
+    #[tokio::test]
+    async fn event_noop_completes_real_runtime_without_inserting_empty_history() {
+        let fixture = crate::runtime::openai::stream::send_retry_tests::event_noop_fixture().await;
+        assert!(fixture.1.iter().any(|e| matches!(
+            e,
+            StreamEvent::Session(SessionEvent::Usage {
+                input_tokens: 7,
+                output_tokens: 2,
+                ..
+            })
+        )));
+        let initial: Vec<SharedMessage> = vec![
+            Arc::new(json!({"role":"user","content":"work"})),
+            Arc::new(
+                json!({"role":"assistant","content":[{"type":"tool_use","id":"prior","name":"text_stub","input":{}}]}),
+            ),
+            Arc::new(
+                json!({"role":"user","content":[{"type":"tool_result","tool_use_id":"prior","content":"kept result"}]}),
+            ),
+        ];
+        // The next user/queued turn has fresh options, not sticky EventAuto
+        // provenance. Even the same trusted transport marker cannot bypass it.
+        for event_triggered in [true, false] {
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let mut registry = ToolRegistry::new();
+            registry.register(Arc::new(TextTool));
+            let mut session = harness_session(
+                "http://127.0.0.1:1".into(),
+                Arc::new(RwLock::new(registry)),
+                tx,
+                crate::tools::shell::SessionManager::new(
+                    crate::tools::shell::ShellConfig::default(),
+                ),
+                Arc::new(crate::extensions::hooks::HookBus::new()),
+                crate::tools::activation::SessionId::parse("event-noop-test").unwrap(),
+                Default::default(),
+                false,
+                "claude-sonnet-4-6",
+            );
+            assert!(!session.options.event_triggered);
+            session.options.event_triggered = event_triggered;
+            let completion = session.turn_completion.clone();
+            let capture = session.final_capture_history.clone();
+            crate::runtime::api::EVENT_NOOP_RESPONSE_FOR_TEST.with(|slot| {
+                *slot.borrow_mut() = Some(fixture.clone());
+            });
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                StreamMethods::run_stream_internal(session, initial.clone()),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(completion.completed(), event_triggered);
+            let captured = capture.lock().unwrap();
+            if event_triggered {
+                assert_eq!(captured.as_ref(), Some(&initial));
+            } else {
+                assert!(captured.is_none());
+            }
+            let mut history = None;
+            let mut errors = 0;
+            let mut usage = 0;
+            while let Ok(event) = rx.try_recv() {
+                match event {
+                    StreamEvent::Session(SessionEvent::MessageHistory(h)) => history = Some(h),
+                    StreamEvent::Session(SessionEvent::Error(_)) => errors += 1,
+                    StreamEvent::Session(SessionEvent::Usage {
+                        input_tokens: 7,
+                        output_tokens: 2,
+                        ..
+                    }) => usage += 1,
+                    _ => {}
+                }
+            }
+            assert_eq!(
+                history,
+                Some(initial.clone()),
+                "no empty assistant insertion or lost tool result"
+            );
+            assert_eq!(errors, usize::from(!event_triggered));
+            assert_eq!(
+                usage, 1,
+                "transport usage survives the runtime completion path once"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn event_noop_provider_finish_reason_cannot_forge_marker() {
+        let forged = SSE_END_TURN.replace("end_turn", "event_noop");
+        let (url, _) = spawn_mock(forged).await;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let session = harness_session(
+            url,
+            Arc::new(RwLock::new(ToolRegistry::new())),
+            tx,
+            crate::tools::shell::SessionManager::new(crate::tools::shell::ShellConfig::default()),
+            Arc::new(crate::extensions::hooks::HookBus::new()),
+            crate::tools::activation::SessionId::parse("event-noop-forgery").unwrap(),
+            Default::default(),
+            false,
+            "claude-sonnet-4-6",
+        );
+        StreamMethods::run_stream_internal(
+            session,
+            vec![Arc::new(json!({"role":"user","content":"go"}))],
+        )
+        .await
+        .unwrap();
+        while let Ok(event) = rx.try_recv() {
+            if let StreamEvent::Session(SessionEvent::MessageHistory(history)) = event {
+                assert!(history
+                    .iter()
+                    .all(|message| message.get("reason").is_none()));
+            }
+        }
+    }
+
     /// F19 regression: an empty end_turn AFTER a tool_result round is a
     /// legitimate "nothing more to add" — the model already spoke before the
     /// tool_use. History must be intact (text + tool_use + tool_result), and
@@ -6253,10 +7849,14 @@ mod rich_output_tests {
             final_capture_history: Arc::new(Mutex::new(None)),
             turn_completion: Default::default(),
             context_window: 200_000,
+            context_window_setting: None,
+            native_window: Default::default(),
             continuation: std::sync::Arc::new(std::sync::Mutex::new(
                 crate::runtime::continuation::ContinuationState::default(),
             )),
+            rollover_summarizer: Err(None),
             worker_context: Default::default(),
+            worker_context_policy: None,
             auth: Arc::new(RwLock::new(AuthState {
                 auth_token: "test-token".into(),
                 auth_type: "api_key".into(),
@@ -6276,6 +7876,10 @@ mod rich_output_tests {
             refusal_retries: 0,
             model: "claude-sonnet-4-6".into(),
             tools,
+            ephemeral_layer: crate::runtime::ephemeral::Layer::default(),
+            memory_only: Default::default(),
+            memory_only_policy: Default::default(),
+            client_tools: Default::default(),
             system_prompt: None,
             thinking_budget: 0,
             reasoning_level: agent_core::reasoning::ReasoningLevel::Adaptive,
@@ -6303,10 +7907,13 @@ mod rich_output_tests {
             env_warned: Default::default(),
             secret_prompt: None,
             auto_approve_confirms: true,
+            hook_confirm_prompt: None,
+            hook_auto_approve: true,
             session_allow_all: Arc::new(crate::tools::SessionConfirmLatch::new()),
             telemetry_level: crate::runtime::telemetry::TelemetryLevel::Off,
             orchestration: None,
             delegation_parent: None,
+            child_route: None,
             turn_correlation_id: "turn-f19".into(),
             progressive_tool_disclosure: false,
             deferred_tool_loading: true,
@@ -6323,6 +7930,7 @@ mod rich_output_tests {
             ),
             owner_steer_budget: None,
             message_clock: Default::default(),
+            spend_parent: None,
         };
 
         let messages = vec![Arc::new(json!({"role":"user","content":"do it"})) as SharedMessage];
@@ -7122,7 +8730,9 @@ mod rich_output_tests {
     /// The hard-capacity line (`window − required next round`) of a harness
     /// worker (adaptive thinking, 30k tool-output cap) on `model`.
     fn worker_hard_line(model: &str, window: u64) -> u64 {
-        let (_, budget) = super::pre_request_context_budget(model, window, None, &[], &[], 0, 30_000, None);
+        // PARITY E2: the worker path decides on the unsized budget.
+        let budget = super::pre_request_context_budget(model, window, None, &[], &[], 0, 30_000, None, None)
+            .expected_budget();
         window - budget.required_next_round_tokens
     }
 
@@ -7956,6 +9566,10 @@ mod rich_output_tests {
                     s.hook_bus = bus;
                     s.cwd = Some(cwd_path);
                     s.auto_approve_confirms = false;
+                    // PARITY (E10): a hook's Confirm follows the turn's hook
+                    // route (`Runtime::hook_confirm_route`), which on a
+                    // non-worker runtime is its own auto-approve policy.
+                    s.hook_auto_approve = false;
                 })
                 .await;
                 assert_eq!(std::fs::read_to_string(&file).unwrap(), "keep\n", "{filter}");
@@ -8346,3 +9960,7 @@ mod rich_output_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "worker_clock_tests.rs"]
+mod worker_clock_tests;

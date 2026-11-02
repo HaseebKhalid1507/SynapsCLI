@@ -658,10 +658,11 @@ async fn compaction_call_api_simple_emits_one_record_from_exact_bytes() {
         0,
         agent_core::reasoning::ReasoningLevel::Adaptive,
         &messages,
-        0,
+        crate::runtime::api_sync::SimpleCallPolicy::compaction(0),
         &h.options,
     )
     .await
+    .text
     .expect("compaction call must succeed");
     assert_eq!(text, "summary");
 

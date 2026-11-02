@@ -635,9 +635,14 @@ impl Job {
         let options = ApiOptions {
             keepwarm: Some(KeepWarmRequest {
                 mode: KeepWarmMode::Replay,
+                purpose: super::api::TailPurpose::Ping,
+                stop_reason: Default::default(),
+                usage: Default::default(),
                 status: Arc::clone(&tap.status),
                 sent: Arc::clone(&tap.sent),
                 connect_failed: Arc::clone(&tap.connect_failed),
+                failure_kind: Default::default(),
+                lease: None,
             }),
             ..self.options.clone()
         };

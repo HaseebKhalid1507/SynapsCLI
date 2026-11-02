@@ -15,17 +15,32 @@ mod api;
 mod api_sync;
 pub mod attachments;
 mod auth;
+/// Test-only: a scripted broker for a turn's own refresh and capacity wait
+/// (`cfg(test)` / the `testing` feature).
+#[cfg(any(test, feature = "testing"))]
+pub use auth::testing as turn_broker_testing;
 mod axel_context;
 #[cfg(test)]
+pub(crate) mod background_seat_tests;
+#[cfg(test)]
 mod body_golden;
+#[cfg(test)]
+mod ledger_gate_tests;
 pub mod budget;
 mod cache_diagnosis;
+pub(crate) mod capacity_wait;
+#[cfg(test)]
+mod capacity_wait_turn_tests;
 pub mod capture_worker;
 pub mod chat_capture;
+pub mod child_spend;
+pub mod client_tools;
 pub(crate) mod cloud_invoke;
 pub mod compaction;
 pub mod context;
+pub(crate) mod context_telemetry;
 pub mod continuation;
+pub mod fork;
 pub mod google_gemini;
 pub mod google_vertex;
 pub(crate) mod helpers;
@@ -40,15 +55,28 @@ pub mod tool_keepwarm;
 #[cfg(test)]
 #[path = "../../tests/support/cache_sim.rs"]
 pub(crate) mod cache_sim;
+pub mod ephemeral;
 pub mod memory_context;
 pub mod memory_history;
+pub mod memory_only;
 pub mod message_time;
+mod native_window;
+mod net_retry;
 pub mod openai;
 pub mod relay;
 mod request;
 mod request_encoding;
+#[cfg(test)]
+mod request_max_tokens_tests;
+pub(crate) mod rolling_summary;
 mod sse;
 mod sse_types;
+#[cfg(test)]
+mod session_binding_tests;
+#[cfg(test)]
+mod spend_gate_tests;
+#[cfg(test)]
+mod spend_route_tests;
 mod stream;
 pub mod subagent;
 pub mod subagent_watch;
@@ -59,13 +87,16 @@ pub mod trace;
 pub mod worker_context;
 pub(crate) mod transport;
 mod types;
+pub(crate) mod warm_summary;
 
 use api::ApiMethods;
 use auth::AuthMethods;
 use helpers::HelperMethods;
 use stream::StreamMethods;
 use types::AuthState;
-pub use types::{AgentEvent, CancelCause, LlmEvent, SessionEvent, StreamEvent, TurnCompletion};
+pub use types::{
+    AgentEvent, CancelCause, CapacityStopAt, LlmEvent, SessionEvent, StreamEvent, TurnCompletion,
+};
 pub use stream::activation_policy;
 
 /// Result of resolving before_tool_call extension policy.
@@ -84,12 +115,72 @@ pub async fn emit_before_tool_call(
     input: Value,
     session_id: Option<&str>,
 ) -> crate::extensions::hooks::events::HookResult {
+    emit_before_tool_call_with(
+        hook_bus,
+        tool_name,
+        runtime_tool_name,
+        input,
+        &crate::extensions::hooks::events::ToolCallHookContext {
+            session_id,
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+/// [`emit_before_tool_call`] with the call's context: the owning
+/// conversation, the provider's tool call id and the resolved cwd.
+pub async fn emit_before_tool_call_with(
+    hook_bus: &Arc<crate::extensions::hooks::HookBus>,
+    tool_name: &str,
+    runtime_tool_name: Option<&str>,
+    input: Value,
+    call: &crate::extensions::hooks::events::ToolCallHookContext<'_>,
+) -> crate::extensions::hooks::events::HookResult {
     let mut event = crate::extensions::hooks::events::HookEvent::before_tool_call(tool_name, input)
-        .with_session(session_id);
+        .with_tool_call(call);
     if let Some(runtime_tool_name) = runtime_tool_name {
         event.tool_runtime_name = Some(runtime_tool_name.to_string());
     }
     hook_bus.emit(&event).await
+}
+
+/// [`emit_before_tool_call_with`] for a memory-only call (decision 18(a)):
+/// the hooks are shown the tool's name and the call's ids, never its args
+/// ([`HookEvent::withheld`](crate::extensions::hooks::events::HookEvent::withheld)).
+/// A Block stands; a rewrite of args the hook never saw is ignored, so a
+/// Modify becomes Continue and a Confirm loses its rewritten input.
+pub(crate) async fn emit_before_tool_call_withheld(
+    hook_bus: &Arc<crate::extensions::hooks::HookBus>,
+    tool_name: &str,
+    runtime_tool_name: Option<&str>,
+    call: &crate::extensions::hooks::events::ToolCallHookContext<'_>,
+) -> crate::extensions::hooks::events::HookResult {
+    use crate::extensions::hooks::events::{HookEvent, HookResult};
+    const IGNORED: &str = "memory-only call: a hook's Modify is ignored (its args are withheld)";
+    let mut event =
+        HookEvent::before_tool_call(tool_name, Value::Null).with_tool_call(call).withheld();
+    event.tool_runtime_name = runtime_tool_name.map(str::to_string);
+    match hook_bus.emit(&event).await {
+        HookResult::Modify { .. } => {
+            tracing::debug!(tool = %tool_name, "{IGNORED}");
+            HookResult::Continue
+        }
+        HookResult::Confirm { message, sources, generations, tool, modified_input, .. } => {
+            if modified_input.is_some() {
+                tracing::debug!(tool = %tool_name, "{IGNORED}");
+            }
+            HookResult::Confirm {
+                message,
+                sources,
+                generations,
+                tool,
+                modified_input: None,
+                modified_by: Vec::new(),
+            }
+        }
+        other => other,
+    }
 }
 
 /// Answer the Confirm dialog sends for its "Allow all from <ext>" button.
@@ -212,6 +303,22 @@ fn confirm_prompt_body(
     ))
 }
 
+/// A worker's (subagent's) confirm route: its caller's prompt handle and
+/// auto-approve policy, which answer a `before_tool_call` `Confirm` on the
+/// worker's calls exactly as they answer the caller's own (with the caller's
+/// "Allow all" latch, which the worker shares). Held by the worker's runtime
+/// and passed only to [`resolve_before_tool_call_decision`]; it never
+/// reaches the worker's tools, so no tool on a worker can raise a prompt
+/// (e.g. bash's sudo password prompt) through it.
+#[derive(Clone)]
+pub(crate) struct WorkerConfirm {
+    /// The caller's prompt handle (`None` when the caller has none: the
+    /// worker's `Confirm` then fails closed, as the caller's would).
+    pub(crate) prompt: Option<crate::tools::SecretPromptHandle>,
+    /// The caller's `auto_approve_confirms` for the turn that started it.
+    pub(crate) auto_approve: bool,
+}
+
 /// What an approved Confirm runs: the input as modified earlier in the hook
 /// chain, if any (`Modify`), else the original (`Continue`).
 fn approved(
@@ -231,11 +338,16 @@ fn approved(
 /// non-interactive callers with neither fail closed. "Allow all" is only
 /// offered (a `ConfirmScope` is attached) when this call site has a latch
 /// to arm; otherwise the dialog offers Allow / Deny only.
+///
+/// `tool_call_id` is the provider's id for the call (the one its
+/// `before_tool_call` event carries); the scope carries it so a client pairs
+/// the prompt with its call by identity.
 pub async fn resolve_before_tool_call_result(
     hook_result: crate::extensions::hooks::events::HookResult,
     secret_prompt: Option<&crate::tools::SecretPromptHandle>,
     auto_approve_confirms: bool,
     session_allow_all: Option<&crate::tools::SessionConfirmLatch>,
+    tool_call_id: Option<&str>,
 ) -> crate::extensions::hooks::events::HookResult {
     match hook_result {
         crate::extensions::hooks::events::HookResult::Confirm {
@@ -280,6 +392,7 @@ pub async fn resolve_before_tool_call_result(
                     } else {
                         Vec::new()
                     },
+                    tool_call_id: tool_call_id.map(str::to_string),
                 }
             });
             let response = prompt
@@ -329,18 +442,21 @@ pub async fn resolve_before_tool_call_result(
 }
 
 /// Resolve before_tool_call policy into executable input or a block reason.
+/// `tool_call_id` as for [`resolve_before_tool_call_result`].
 pub async fn resolve_before_tool_call_decision(
     original_input: Value,
     hook_result: crate::extensions::hooks::events::HookResult,
     secret_prompt: Option<&crate::tools::SecretPromptHandle>,
     auto_approve_confirms: bool,
     session_allow_all: Option<&crate::tools::SessionConfirmLatch>,
+    tool_call_id: Option<&str>,
 ) -> BeforeToolCallDecision {
     match resolve_before_tool_call_result(
         hook_result,
         secret_prompt,
         auto_approve_confirms,
         session_allow_all,
+        tool_call_id,
     )
     .await
     {
@@ -389,6 +505,32 @@ pub async fn emit_after_tool_call(
     max_tool_output: usize,
     session_id: Option<&str>,
 ) -> String {
+    emit_after_tool_call_with(
+        hook_bus,
+        tool_name,
+        runtime_tool_name,
+        input,
+        output,
+        max_tool_output,
+        &crate::extensions::hooks::events::ToolCallHookContext {
+            session_id,
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+/// [`emit_after_tool_call`] with the call's context: the owning
+/// conversation, the provider's tool call id and the resolved cwd.
+pub async fn emit_after_tool_call_with(
+    hook_bus: &Arc<crate::extensions::hooks::HookBus>,
+    tool_name: &str,
+    runtime_tool_name: Option<&str>,
+    input: Value,
+    output: String,
+    max_tool_output: usize,
+    call: &crate::extensions::hooks::events::ToolCallHookContext<'_>,
+) -> String {
     emit_after_tool_call_outcome(
         hook_bus,
         tool_name,
@@ -396,7 +538,8 @@ pub async fn emit_after_tool_call(
         input,
         output,
         max_tool_output,
-        session_id,
+        call,
+        false,
         false,
     )
     .await
@@ -422,6 +565,12 @@ impl AfterToolCallOutcome {
     }
 }
 
+/// `withheld`: a memory-only call (decision 18(a)). The hooks are shown the
+/// tool's name and the call's ids, never the args or the output
+/// ([`HookEvent::withheld`](crate::extensions::hooks::events::HookEvent::withheld)),
+/// and a Replace of output the hook never saw is ignored. `keep_uncut`:
+/// keep the post-hook output before the `max_tool_output` cut (tool output
+/// virtualisation, #334).
 #[allow(clippy::too_many_arguments)] // the hook event's fields plus the history policy
 pub(super) async fn emit_after_tool_call_outcome(
     hook_bus: &Arc<crate::extensions::hooks::HookBus>,
@@ -430,20 +579,32 @@ pub(super) async fn emit_after_tool_call_outcome(
     input: Value,
     output: String,
     max_tool_output: usize,
-    session_id: Option<&str>,
+    call: &crate::extensions::hooks::events::ToolCallHookContext<'_>,
+    withheld: bool,
     keep_uncut: bool,
 ) -> AfterToolCallOutcome {
-    use crate::extensions::hooks::events::HookResult;
+    use crate::extensions::hooks::events::{HookEvent, HookResult};
     // Keep the original to return verbatim if no transform fires.
     let original = output.clone();
-    let mut event =
-        crate::extensions::hooks::events::HookEvent::after_tool_call(tool_name, input, output)
-            .with_session(session_id);
+    let mut event = if withheld {
+        HookEvent::after_tool_call(tool_name, Value::Null, String::new())
+            .with_tool_call(call)
+            .withheld()
+    } else {
+        HookEvent::after_tool_call(tool_name, input, output).with_tool_call(call)
+    };
     if let Some(runtime_tool_name) = runtime_tool_name {
         event.tool_runtime_name = Some(runtime_tool_name.to_string());
     }
     let mut replaced = false;
     let post_hook = match hook_bus.emit(&event).await {
+        HookResult::Replace { .. } if withheld => {
+            tracing::debug!(
+                tool = %tool_name,
+                "memory-only call: a hook's Replace is ignored (its output is withheld)"
+            );
+            original
+        }
         HookResult::Replace { mut output } => {
             replaced = true;
             if output.len() > MAX_REPLACE_OUTPUT {
@@ -548,6 +709,17 @@ pub struct Runtime {
     model: String,
     tools: Arc<RwLock<ToolRegistry>>,
     system_prompt: Option<String>,
+    pub(crate) ephemeral_layer: ephemeral::Layer,
+    /// Live memory-only tool results of this session (RAM only). Like the
+    /// ephemeral layer: shared explicitly by the session owner, never by
+    /// `Runtime::clone` (a clone starts empty).
+    pub(crate) memory_only: memory_only::Store,
+    /// Which tools are memory-only by name (config + session globs).
+    pub(crate) memory_only_policy: memory_only::Policy,
+    /// This session's client tools (RAM only). Shared explicitly by the
+    /// session actor for its root runtime, never by `Runtime::clone` (a
+    /// worker, keep-warm ping or driver copy starts with an empty overlay).
+    pub(crate) client_tools: client_tools::Overlay,
     /// Compiled, content-safe effective prompt metadata retained for inspection/reload.
     effective_prompt: Option<agent_core::prompt::PromptStack>,
     prompt_generation: u64,
@@ -566,13 +738,21 @@ pub struct Runtime {
     /// Foreground by default; central subagent construction marks Worker so
     /// logical Ultra can never recursively activate proactive orchestration.
     codex_request_role: crate::runtime::openai::catalog::CodexRequestRole,
-    /// User override for context window size (tokens). When set, takes
-    /// precedence over the model's auto-detected window from
-    /// `models::context_window_for_model`. Lets users cap context at e.g.
-    /// 200k even on models that natively support 1M.
+    /// User override for context window size (tokens). When set, replaces
+    /// the model's auto-detected window from
+    /// `models::context_window_for_model`, up to the model's ceiling
+    /// ([`Runtime::context_window`]). Lets users cap context at e.g. 200k
+    /// even on models that natively support 1M.
     context_window_override: Option<u64>,
-    /// Opt-in context windows within a stable logical session (#112).
-    /// DARK by default: `ContextManagementMode::Off`.
+    /// The session's models latched to their native window after the
+    /// account refused the 1M window (see `native_window`). Runtime state
+    /// only: never written to config, and `context_window_override` keeps
+    /// the configured value. Shared by clones (the same session); a fresh
+    /// runtime (a subagent) starts unlatched.
+    native_window: Arc<native_window::NativeWindowLatch>,
+    /// Context windows within a stable logical session (#112). DARK
+    /// (`ContextManagementMode::Off`) until a config is applied; a loaded
+    /// config turns it on unless `context_management.mode = off`.
     pub(crate) continuation: continuation::SharedContinuation,
     /// Subagent workers only: automatic context rollover into the worker's
     /// archive directory (see `worker_context`). Inert by default and on
@@ -580,6 +760,16 @@ pub struct Runtime {
     worker_context: worker_context::WorkerContext,
     /// Model used for compaction. Falls back to claude-sonnet-4-6 if not set.
     compaction_model: Option<String>,
+    /// `context_management.summary_model`; `None` = auto (see
+    /// [`Runtime::rollover_summarizer`]).
+    summary_model: Option<String>,
+    /// `context_management.summary_model` is set but invalid: no summary.
+    summary_model_invalid: bool,
+    /// A v2 worker's summary-model choice (subagent rollover §7.2): the
+    /// route's capability chooses the model, and a chosen model without a
+    /// credential is skipped, never replaced. `false` (every session, every
+    /// worker without a v2 run) keeps the session choice.
+    worker_summary_choice: bool,
     /// Where compaction summarization runs (spec §9.4).
     compaction_mode: agent_core::compaction::CompactionMode,
     /// Content classes excluded from remote compaction disclosure.
@@ -624,6 +814,11 @@ pub struct Runtime {
     subagent_timeout: u64,
     api_retries: u32,
     refusal_retries: u32,
+    /// Config `capacity_wait`: a turn whose automatic Anthropic selection
+    /// finds no capacity for a reason that ends by itself waits in the turn
+    /// (see `capacity_wait`). `None` until a config is applied, and when
+    /// the key is false: the turn ends at once, as before.
+    capacity_wait: Option<capacity_wait::CapacityWaitPolicy>,
     /// Telemetry level for structured per-request API logging (opt-in).
     telemetry_level: crate::runtime::telemetry::TelemetryLevel,
     /// Rotated generations kept per log (`telemetry_log_generations`), read
@@ -776,11 +971,21 @@ pub struct Runtime {
     /// Current worker handle for bounded delegation-tree accounting. `None`
     /// for foreground roots.
     delegation_parent: Option<String>,
+    /// Where tool calls report the processes they spawn: the owning daemon
+    /// session's route (a worker's carries its handle id). `None` outside a
+    /// session actor.
+    child_route: Option<crate::session::child_events::ChildRoute>,
     /// Session-scoped, per-extension "Allow all" latch for extension
     /// `Confirm` gates (`before_tool_call`). An extension id is added when
     /// the user picks "Allow all from <ext>" in the Confirm dialog; shared by
     /// clones and delegated workers in the same session. Never persisted.
     session_allow_all: std::sync::Arc<crate::tools::SessionConfirmLatch>,
+    /// A worker's (subagent's) confirm route for its `before_tool_call`
+    /// hooks: its caller's confirm step, so a hook's `Confirm` on a worker
+    /// call gets the answer the caller would get for its own call. Used only
+    /// to resolve hook results; never handed to the worker's tools. `None`
+    /// for every runtime that is not a worker with routed hooks.
+    worker_confirm: Option<WorkerConfirm>,
     /// Shared exact MCP lease manager (Task 19). Installed at engine boot
     /// when MCP exact mode is active; streams mint per-session capabilities
     /// and RAII guards from it.
@@ -807,6 +1012,21 @@ pub struct Runtime {
     owner_steer_budget: Option<Arc<crate::runtime::budget::OwnerSteerBudget>>,
     /// Source of the per-message `_synaps_at` times (see `message_time`).
     message_clock: crate::runtime::message_time::MessageClock,
+    /// A worker runtime's spend tap (child spend): set only on a worker in a
+    /// host with a sink, so its streamed requests book their usage through
+    /// it. `None` on every other runtime. Clones share it (the same run).
+    spend_tap: Option<crate::runtime::child_spend::SpendTap>,
+    /// The session's spend sink (child spend), on a session's own runtime
+    /// in a host with one: the subagents its turns launch take their run
+    /// leases from it. `None` on worker runtimes (their launches lease
+    /// under their own run) and in hosts without a sink. Clones share it.
+    spend_sink: Option<crate::runtime::child_spend::SpendSink>,
+    /// A worker run's request ledger (§6; slice 6, dark): armed only by the
+    /// subagent launch (`launch::arm_request_ledger`), filled only once the
+    /// run is a v2 run. `None` on every other runtime (sessions, one-shot,
+    /// rpc, agent, keep-warm): their requests dispatch exactly as before.
+    /// Clones share it, like the run clock in `turn_budget`.
+    request_ledger: Option<crate::tools::LedgerSlot>,
     /// Private runtime-scoped tool-session identity (Task 16). Scopes the
     /// per-stream `SessionToolSet` the execution gate authorizes against.
     /// Minted fresh per constructed `Runtime` — two independently
@@ -1138,6 +1358,68 @@ fn dispatch_completed_terminal_capture(
 /// are never interrupted.
 const HTTP_READ_TIMEOUT: Duration = Duration::from_secs(90);
 
+/// Connection-pool and TCP keepalive settings shared by every provider
+/// conversation client: the per-Runtime Anthropic stream pool
+/// (`http_phases::client`), the runtime/host client
+/// ([`build_http_client`]: sync calls, the Codex/OpenAI-wire sends) and the
+/// bounded summary client ([`bounded_http_client`]). One value, applied by
+/// [`ProviderPool::apply`], so the clients cannot drift. The same settings
+/// on every platform. Auth/login clients are not provider conversation
+/// clients and keep reqwest's defaults.
+///
+/// PROVISIONAL: mitigation, provisional until the transport-retry WARN
+/// lines (`runtime::net_retry`: `class`, `chain`) name the cause on a Mac.
+/// The suspected cause: a send on an idle pooled HTTP/1.1 keep-alive
+/// connection that the server or a middlebox (home NAT) already closed. It
+/// fails fast with no HTTP status and costs a retry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProviderPool {
+    /// How long an idle pooled connection is kept for reuse. reqwest
+    /// 0.12.28's default is 90 s (`src/async_impl/client.rs:301`; setter
+    /// `ClientBuilder::pool_idle_timeout`, `:1489`; handed to hyper-util's
+    /// pool at `:975`). A shorter idle window drops a connection before a
+    /// server/NAT idle timeout can close it under the next request. The
+    /// cost is one new TCP+TLS handshake after a pause of more than 30 s.
+    pub(crate) idle_timeout: Duration,
+    /// Idle time before the first TCP keepalive probe (`SO_KEEPALIVE`).
+    /// reqwest 0.12.28 already defaults to 15 s (`client.rs:303`, setter
+    /// `:1750`, applied to the connector at `:919`); pinned so a reqwest
+    /// upgrade cannot change it silently. Shorter than `idle_timeout`, so a
+    /// pooled connection that is still reusable has been probed, which
+    /// refreshes NAT state and lets the OS find a dead peer. A 30 s probe
+    /// would never fire inside a 30 s pool window.
+    pub(crate) tcp_keepalive: Duration,
+    /// Gap between unanswered keepalive probes: reqwest's default 15 s
+    /// (`client.rs:304`, setter `:1761`, applied at `:920`).
+    pub(crate) tcp_keepalive_interval: Duration,
+    /// Unanswered probes before the OS drops the connection: reqwest's
+    /// default 3 (`client.rs:305`, setter `:1772`, applied at `:921`).
+    /// hyper-util 0.1.20 applies the interval and the retries on Linux and
+    /// macOS, the interval also on Windows; there the retry count is a no-op
+    /// (`src/client/legacy/connect/http.rs:124-210`).
+    pub(crate) tcp_keepalive_retries: u32,
+}
+
+/// PROVISIONAL (see [`ProviderPool`]): a 30 s idle pool, keepalive probes
+/// from 15 s idle every 15 s, 3 unanswered probes.
+pub(crate) const PROVIDER_POOL: ProviderPool = ProviderPool {
+    idle_timeout: Duration::from_secs(30),
+    tcp_keepalive: Duration::from_secs(15),
+    tcp_keepalive_interval: Duration::from_secs(15),
+    tcp_keepalive_retries: 3,
+};
+
+impl ProviderPool {
+    /// `builder` with these pool and keepalive settings.
+    pub(crate) fn apply(self, builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+        builder
+            .pool_idle_timeout(self.idle_timeout)
+            .tcp_keepalive(self.tcp_keepalive)
+            .tcp_keepalive_interval(self.tcp_keepalive_interval)
+            .tcp_keepalive_retries(self.tcp_keepalive_retries)
+    }
+}
+
 /// Build the runtime's shared HTTP client.
 ///
 /// Timeout design (incident: session 20260714-025948-3dab):
@@ -1151,12 +1433,58 @@ const HTTP_READ_TIMEOUT: Duration = Duration::from_secs(90);
 ///   stream longer than 300s and taking 300s to notice a dead connection.
 ///   Turn-level lifecycle is owned by cancellation tokens, not the client.
 fn build_http_client(read_timeout: Duration) -> reqwest::Result<Client> {
-    Client::builder()
+    PROVIDER_POOL
+        .apply(Client::builder())
         .tls_built_in_webpki_certs(true)
         .tls_built_in_native_certs(true)
         .connect_timeout(Duration::from_secs(10))
         .read_timeout(read_timeout)
         .build()
+}
+
+/// The client for bounded single-attempt requests (the rollover summary):
+/// the runtime builder, but redirects are never followed. A redirect would
+/// replay the request (weakening the single-attempt guarantee), and after
+/// one a refused connection no longer proves that nothing was sent. `None`
+/// if it cannot be built: a bounded request is then not sent at all, never
+/// sent on another client.
+pub(crate) fn bounded_http_client() -> Option<Client> {
+    static CLIENT: std::sync::OnceLock<Option<Client>> = std::sync::OnceLock::new();
+    #[cfg(test)]
+    if BOUNDED_CLIENT_FAILS_FOR_TEST.with(std::cell::Cell::get) {
+        return None;
+    }
+    CLIENT
+        .get_or_init(|| {
+            PROVIDER_POOL
+                .apply(Client::builder())
+                .tls_built_in_webpki_certs(true)
+                .tls_built_in_native_certs(true)
+                .connect_timeout(Duration::from_secs(10))
+                .read_timeout(HTTP_READ_TIMEOUT)
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .inspect_err(|error| tracing::warn!(%error, "bounded HTTP client unavailable"))
+                .ok()
+        })
+        .clone()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam: makes [`bounded_http_client`] behave as if construction
+    /// had failed, on the setting thread only. A `#[tokio::test]` runs its
+    /// whole runtime on one thread, so tests running concurrently on other
+    /// threads never observe it.
+    pub(crate) static BOUNDED_CLIENT_FAILS_FOR_TEST: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// True when bounded single-attempt requests can be sent on every summary
+/// leg: the direct Anthropic client and the local broker's client both
+/// refuse redirects.
+pub(crate) fn bounded_transport_ready() -> bool {
+    bounded_http_client().is_some() && crate::auth::redirect_free_http().is_some()
 }
 
 /// The process-global HTTP client for `EngineHost` (same builder as
@@ -1313,6 +1641,10 @@ impl Runtime {
             model: crate::models::default_model().to_string(),
             tools: host.tools,
             system_prompt: None,
+            ephemeral_layer: ephemeral::Layer::default(),
+            memory_only: memory_only::Store::default(),
+            memory_only_policy: memory_only::Policy::default(),
+            client_tools: client_tools::Overlay::default(),
             effective_prompt: None,
             prompt_generation: 0,
             prompt_reload_source: None,
@@ -1321,7 +1653,11 @@ impl Runtime {
             explicit_reasoning: false,
             codex_request_role: crate::runtime::openai::catalog::CodexRequestRole::Foreground,
             context_window_override: None,
+            native_window: Default::default(),
             compaction_model: None,
+            summary_model: None,
+            summary_model_invalid: false,
+            worker_summary_choice: false,
             compaction_mode: agent_core::compaction::CompactionMode::default(),
             compaction_exclusions: Vec::new(),
             remote_summarization_attempts: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -1343,6 +1679,7 @@ impl Runtime {
             subagent_timeout: 300,
             api_retries: 3,
             refusal_retries: 2,
+            capacity_wait: None,
             telemetry_level: crate::runtime::telemetry::TelemetryLevel::Off,
             telemetry_log_generations: crate::runtime::telemetry::DEFAULT_MAX_GENERATIONS,
             telemetry_writer: None,
@@ -1387,7 +1724,9 @@ impl Runtime {
             deferred_tool_loading: true,
             activation_confirm: agent_core::config::ActivationConfirm::default(),
             delegation_parent: None,
+            child_route: None,
             session_allow_all: std::sync::Arc::new(crate::tools::SessionConfirmLatch::new()),
+            worker_confirm: None,
             mcp_runtime: None,
             mcp_session_scope: None,
             extension_runtime: None,
@@ -1397,6 +1736,9 @@ impl Runtime {
             ),
             owner_steer_budget: None,
             message_clock: Default::default(),
+            spend_tap: None,
+            spend_sink: None,
+            request_ledger: None,
             host_tool_session: fresh_host_tool_session(),
             tool_catalog_prompt: Arc::new(std::sync::Mutex::new(None)),
             retained_tool_set: Default::default(),
@@ -1459,6 +1801,9 @@ impl Runtime {
     }
 
     pub fn set_system_prompt(&mut self, prompt: String) {
+        if self.system_prompt.as_deref() != Some(prompt.as_str()) {
+            self.invalidate_warm_prefix();
+        }
         self.system_prompt = Some(prompt);
     }
 
@@ -1521,16 +1866,16 @@ impl Runtime {
                     registry.catalog(),
                     true,
                     self.context_management_enabled(),
+                    self.memory_backend.is_axel(),
                 );
                 let core: std::collections::HashSet<String> = core_set
                     .core_ids()
                     .map(|id| id.as_str().to_string())
                     .collect();
-                crate::tools::prompt_catalog::render(
-                    registry.catalog(),
-                    &core,
-                    crate::tools::activation::is_activatable_record,
-                )
+                crate::tools::prompt_catalog::render(registry.catalog(), &core, |record| {
+                    crate::tools::activation::is_activatable_record(record)
+                        && !core_set.is_withheld(record.id())
+                })
             }
         };
         let mut slot = self
@@ -1638,6 +1983,9 @@ impl Runtime {
             current.validate_hot_reload(&candidate)?;
         }
         let composed = candidate.composed().to_owned();
+        if self.system_prompt.as_deref() != Some(composed.as_str()) {
+            self.invalidate_warm_prefix();
+        }
         self.effective_prompt = Some(candidate);
         self.system_prompt = Some(composed);
         self.prompt_generation = self.prompt_generation.saturating_add(1);
@@ -1698,9 +2046,61 @@ impl Runtime {
         self.message_clock = clock;
     }
 
+    /// Install (or clear) this runtime's spend tap. Only a worker launch in
+    /// a host with a sink sets one (child spend).
+    pub fn set_spend_tap(&mut self, tap: Option<crate::runtime::child_spend::SpendTap>) {
+        self.spend_tap = tap;
+    }
+
+    /// Install (or clear) the session's spend sink. Only a host with a sink
+    /// sets one, on the session's own runtime (child spend).
+    pub fn set_spend_sink(&mut self, sink: Option<crate::runtime::child_spend::SpendSink>) {
+        self.spend_sink = sink;
+    }
+
+    /// Where this runtime's subagent launches take their run leases: a
+    /// worker's own run, else the session's sink; `None` in a host without
+    /// a sink (a oneshot then keeps its aggregate Usage).
+    pub fn spend_parent(&self) -> Option<crate::runtime::child_spend::SpendParent> {
+        use crate::runtime::child_spend::SpendParent;
+        self.spend_tap
+            .as_ref()
+            .map(|tap| SpendParent::Run(tap.lease().clone()))
+            .or_else(|| self.spend_sink.clone().map(SpendParent::Session))
+    }
+
     /// The currently configured per-turn budget.
     pub fn turn_budget(&self) -> &crate::runtime::budget::TurnBudget {
         &self.turn_budget
+    }
+
+    /// Arm this worker runtime's request-ledger slot (§6). Only the
+    /// subagent launch calls it; the slot stays empty unless the run
+    /// becomes a v2 run.
+    pub(crate) fn arm_request_ledger(&mut self, slot: crate::tools::LedgerSlot) {
+        self.request_ledger = Some(slot);
+    }
+
+    /// The run's request ledger for this runtime's conversation requests:
+    /// `Some` only on a v2 worker run.
+    pub(crate) fn request_ledger(&self) -> Option<crate::tools::RequestLedgerHandle> {
+        self.request_ledger.as_ref().and_then(|slot| slot.get())
+    }
+
+    /// Fix this worker runtime's wall clock to its run's
+    /// (`docs/specs/subagent-context-rollover.md` §5), started now: the
+    /// run's deadline is the earlier of `timeout` and the configured
+    /// `max_elapsed`, both from this one start. Every turn checks it before
+    /// each request; a context rollover never renews it and its expiry is
+    /// never a time checkpoint.
+    pub fn fix_run_clock(
+        &mut self,
+        timeout: Option<std::time::Duration>,
+    ) -> crate::runtime::budget::RunClock {
+        let clock =
+            crate::runtime::budget::RunClock::start(timeout, self.turn_budget.max_elapsed);
+        self.turn_budget.run_clock = Some(clock);
+        clock
     }
 
     /// Install the shared exact EXTENSION lease manager (Task 20, engine
@@ -1759,6 +2159,21 @@ impl Runtime {
 
     pub fn set_delegation_parent(&mut self, parent: Option<String>) {
         self.delegation_parent = parent;
+    }
+
+    /// The worker id this runtime runs under (`None`: a root runtime).
+    pub fn delegation_parent(&self) -> Option<&str> {
+        self.delegation_parent.as_deref()
+    }
+
+    /// Route spawned-child reports to a daemon session (see
+    /// `session::child_events`). Clones share it.
+    pub fn set_child_route(&mut self, route: Option<crate::session::child_events::ChildRoute>) {
+        self.child_route = route;
+    }
+
+    pub fn child_route(&self) -> Option<&crate::session::child_events::ChildRoute> {
+        self.child_route.as_ref()
     }
 
     pub fn orchestration(&self) -> Option<&Arc<crate::orchestration::OrchestrationRuntime>> {
@@ -1847,6 +2262,12 @@ impl Runtime {
         } else {
             None
         };
+        if self.model != cleaned {
+            // The last request no longer matches the session's route: void
+            // its warm-summary record (and the history it holds) and any
+            // summary in progress.
+            self.invalidate_warm_record();
+        }
         self.model = cleaned.to_owned();
         // Replace the manifestless policy atomically after a safe model change so
         // inheritance and exact same-provider choices follow the new foreground.
@@ -2497,8 +2918,24 @@ impl Runtime {
         self.compaction_model = model;
     }
 
+    /// Set the rolling-summary model (`None` = auto).
+    pub fn set_summary_model(&mut self, model: Option<String>) {
+        self.summary_model = model;
+        self.summary_model_invalid = false;
+    }
+
+    /// Record that `context_management.summary_model` is set but invalid:
+    /// the summary is off, with a notice, until it is fixed.
+    pub fn set_summary_model_invalid(&mut self) {
+        self.summary_model = None;
+        self.summary_model_invalid = true;
+    }
+
     /// Set where compaction summarization runs (spec §9.4).
     pub fn set_compaction_mode(&mut self, mode: agent_core::compaction::CompactionMode) {
+        if self.compaction_mode != mode {
+            self.invalidate_warm_record();
+        }
         self.compaction_mode = mode;
     }
 
@@ -2507,7 +2944,102 @@ impl Runtime {
         &mut self,
         exclude: Vec<agent_core::compaction::ContentClass>,
     ) {
+        if self.compaction_exclusions != exclude {
+            self.invalidate_warm_record();
+        }
         self.compaction_exclusions = exclude;
+    }
+
+    /// This runtime's live context settings, as configured, for a worker it
+    /// starts or resumes (subagent rollover §2, §7.2): its continuation
+    /// settings at this moment, its summary-model *setting* (never the
+    /// summarizer it resolved), its compaction model as set (`None` when
+    /// unset), its disclosure mode and exclusions, and its window override
+    /// with the model it applies to.
+    pub(crate) fn worker_context_policy(&self) -> crate::tools::WorkerContextPolicy {
+        let context_management = self
+            .continuation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .config;
+        crate::tools::WorkerContextPolicy {
+            context_management,
+            summary_model: self.summary_model.clone(),
+            summary_model_invalid: self.summary_model_invalid,
+            compaction_model: self.compaction_model.clone(),
+            compaction_mode: self.compaction_mode,
+            compaction_exclusions: self.compaction_exclusions.clone(),
+            window_override: self
+                .context_window_override
+                .map(|tokens| crate::tools::InheritedWindow {
+                    tokens,
+                    model: self.model.clone(),
+                }),
+            operator_rollover: self.subagent_limits.context_rollover,
+            resume_refuse_tokens: self.subagent_limits.resume_refuse_tokens,
+        }
+    }
+
+    /// Start a v2 worker run's runtime before its first inference: bind its
+    /// continuation to the run (`logical_id`, the run's worker logical ID,
+    /// which every head it checkpoints and every window it seals carries),
+    /// then give it the
+    /// parent's settings resolved for it ([`Self::apply_worker_context`]).
+    /// The binding is [`Self::reset_context_continuation`]: a fresh state
+    /// for the run (new epoch; no note, phase or advisory; window and
+    /// latest archive from `opening`'s marker only; no warm record or
+    /// calibration), keeping only the warm generations; the archive scope
+    /// stays the run's memory binding's. Called only for `Launch::On`, by
+    /// the start closures of start, resume and the oneshot.
+    pub(crate) fn start_worker_run(
+        &mut self,
+        logical_id: &str,
+        context: &crate::tools::WorkerContext,
+        opening: &[crate::SharedMessage],
+    ) {
+        self.reset_context_continuation(logical_id, opening);
+        self.apply_worker_context(context);
+    }
+
+    /// Give a v2 worker's runtime the parent's settings resolved for it
+    /// (subagent rollover §2, §7.2): the one place a worker's context
+    /// settings are applied, by start, resume and oneshot alike (through
+    /// [`Self::start_worker_run`]), and only once its run is a v2 run. A
+    /// worker that runs without rollover never gets them.
+    pub(crate) fn apply_worker_context(&mut self, context: &crate::tools::WorkerContext) {
+        self.set_context_window(context.context_window);
+        self.continuation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .config = context.context_management;
+        self.compaction_model = context.compaction_model.clone();
+        if context.summary_model_invalid {
+            self.set_summary_model_invalid();
+        } else {
+            self.set_summary_model(context.summary_model.clone());
+        }
+        self.set_compaction_mode(context.compaction_mode);
+        self.set_compaction_exclusions(context.compaction_exclusions.clone());
+        self.worker_summary_choice = true;
+    }
+
+    /// A disclosure, compaction-mode or credential-source change: the warm
+    /// rolling-summary record (and any warm request not yet sent) is void.
+    fn invalidate_warm_record(&self) {
+        self.continuation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .invalidate_warm();
+    }
+
+    /// A change to what conversation requests' cached prefix is built from
+    /// (prompt, cache TTL, 1M context, tool disclosure or deferred loading):
+    /// no warm summary replays a request from before it.
+    fn invalidate_warm_prefix(&self) {
+        self.continuation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .invalidate_warm_prefix();
     }
 
     /// Number of times the remote-summarization transport seam was entered
@@ -2515,6 +3047,235 @@ impl Runtime {
     pub fn remote_summarization_attempts(&self) -> u64 {
         self.remote_summarization_attempts
             .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Why `model` cannot write the rolling summary, if it cannot: an
+    /// extension-hosted provider, a route without an output ceiling it is
+    /// known to enforce, a route through the remote credential broker's
+    /// proxy (which cannot yet guarantee a single upstream attempt), or no
+    /// configured credential (checked where that can be known locally).
+    /// Anthropic under a remote broker is credential vending plus a direct
+    /// Messages request from this process, not proxied inference.
+    fn summary_model_unusable(&self, model: &str) -> Option<rolling_summary::SummarySkip> {
+        match self.summary_route_capable(model) {
+            Err(reason) => Some(reason),
+            Ok(route) => self
+                .summary_credentials_missing(&route)
+                .then_some(rolling_summary::SummarySkip::MissingCredentials),
+        }
+    }
+
+    /// The route of `model` when it can write a rollover summary at all:
+    /// not extension-hosted, an output ceiling it is known to enforce, and
+    /// not proxied by the remote credential broker. These are properties of
+    /// the route and the credential source, not of the moment; whether a
+    /// credential is configured is checked apart
+    /// ([`Self::summary_credentials_missing`]).
+    fn summary_route_capable(
+        &self,
+        model: &str,
+    ) -> std::result::Result<crate::runtime::openai::ResolvedRoute, rolling_summary::SummarySkip>
+    {
+        use rolling_summary::SummarySkip;
+        if crate::extensions::providers::ProviderRegistry::parse_model_id(model).is_some() {
+            return Err(SummarySkip::ExtensionHosted);
+        }
+        let Some(route) = crate::runtime::openai::resolve_route(model) else {
+            return Err(SummarySkip::NoEnforceableCeiling);
+        };
+        if !crate::runtime::openai::output_ceiling_enforceable(&route) {
+            return Err(SummarySkip::NoEnforceableCeiling);
+        }
+        // Native Anthropic `max_tokens` counts thinking: only a model with a
+        // vetted way to keep thinking inside it (disable, or adaptive at
+        // effort low with room for it) is usable.
+        if warm_summary::recordable(model) && api_sync::CeilingThinking::of(model).is_none() {
+            return Err(SummarySkip::NoEnforceableCeiling);
+        }
+        if self.credential_source.is_remote()
+            && route.wire != crate::runtime::openai::WireProtocol::AnthropicMessages
+        {
+            return Err(SummarySkip::RemoteProxy);
+        }
+        Ok(route)
+    }
+
+    /// True only when the route's credential is known to be missing. A remote
+    /// broker owns credentials this process cannot inspect: never missing.
+    fn summary_credentials_missing(&self, route: &crate::runtime::openai::ResolvedRoute) -> bool {
+        use crate::auth::broker;
+        use crate::auth::OAuthProviderId;
+        if self.credential_source.is_remote() {
+            return false;
+        }
+        match route.auth {
+            crate::runtime::openai::AuthPolicy::OAuthAccessToken(OAuthProviderId::Anthropic) => {
+                let in_memory = self.auth.try_read().map_or(true, |auth| {
+                    auth.auth_type != "none"
+                        && (auth.auth_type != "oauth" || !auth.auth_token.is_empty())
+                });
+                !in_memory && !broker::anthropic_credential_available()
+            }
+            crate::runtime::openai::AuthPolicy::OAuthAccessToken(provider) => {
+                !broker::oauth_provider_logged_in(provider)
+            }
+            crate::runtime::openai::AuthPolicy::BrokerProxy => {
+                let oauth = match route.provider.as_str() {
+                    "github-copilot" => Some(OAuthProviderId::GitHubCopilot),
+                    "google-gemini" => Some(OAuthProviderId::GoogleGemini),
+                    "kimi-code" => Some(OAuthProviderId::KimiCode),
+                    _ => None,
+                };
+                match oauth {
+                    Some(provider) => !broker::oauth_provider_logged_in(provider),
+                    None => !broker::static_key_configured(&route.provider),
+                }
+            }
+        }
+    }
+
+    /// The model that writes the rolling summary, and a one-time notice when
+    /// the choice should be explained. An explicit
+    /// `context_management.summary_model` is used alone. `auto` uses the
+    /// session's own model when it is usable (so the summary can reuse the
+    /// session's warm prompt cache), otherwise the compaction model when one
+    /// is configured and usable; it never picks any other model. An empty
+    /// `compaction_model` only removes the fallback.
+    pub(crate) fn summary_model_choice(
+        &self,
+    ) -> std::result::Result<
+        (String, Option<rolling_summary::SummarySkip>),
+        rolling_summary::SummarySkip,
+    > {
+        if self.summary_model_invalid {
+            return Err(rolling_summary::SummarySkip::InvalidSummaryModel);
+        }
+        if self.worker_summary_choice {
+            return self.worker_summary_model_choice();
+        }
+        if let Some(model) = self.summary_model.as_deref() {
+            return match self.summary_model_unusable(model) {
+                Some(reason) => Err(reason),
+                None => Ok((model.to_owned(), None)),
+            };
+        }
+        let Some(session_reason) = self.summary_model_unusable(&self.model) else {
+            return Ok((self.model.clone(), None));
+        };
+        let compaction = self.compaction_model().trim();
+        if compaction.is_empty() || compaction == self.model {
+            return Err(session_reason);
+        }
+        match self.summary_model_unusable(compaction) {
+            None => Ok((
+                compaction.to_owned(),
+                Some(session_reason.compaction_model_fallback()),
+            )),
+            // The actionable reason: the session's own route is proxied.
+            Some(_) if session_reason == rolling_summary::SummarySkip::RemoteProxy => {
+                Err(session_reason)
+            }
+            Some(reason) => Err(reason),
+        }
+    }
+
+    /// A v2 worker's summary model (subagent rollover §7.2): the route's
+    /// capability chooses, availability doesn't re-choose. An explicit
+    /// summary model is used alone. `auto` takes the worker's own model
+    /// when its route can write a summary (so the warm path can reuse the
+    /// worker's cache), else the inherited compaction model (resolved as
+    /// the parent resolves it; one equal to the worker's own is not tried
+    /// twice), with the reason said once; never any other model, and never
+    /// the parent's own or its summarizer unless the parent configured that
+    /// model as its compaction model. Then only the chosen model's
+    /// credential is checked: a missing one skips the summary
+    /// (`MissingCredentials`) and the previous summary is carried forward.
+    fn worker_summary_model_choice(
+        &self,
+    ) -> std::result::Result<
+        (String, Option<rolling_summary::SummarySkip>),
+        rolling_summary::SummarySkip,
+    > {
+        use rolling_summary::SummarySkip;
+        let (model, route, notice) = if let Some(model) = self.summary_model.as_deref() {
+            (model.to_owned(), self.summary_route_capable(model)?, None)
+        } else {
+            match self.summary_route_capable(&self.model) {
+                Ok(route) => (self.model.clone(), route, None),
+                Err(own) => {
+                    let compaction = self.compaction_model().trim();
+                    if compaction.is_empty()
+                        || crate::tools::same_model_identity(compaction, &self.model)
+                    {
+                        return Err(own);
+                    }
+                    match self.summary_route_capable(compaction) {
+                        Ok(route) => (
+                            compaction.to_owned(),
+                            route,
+                            Some(own.compaction_model_fallback()),
+                        ),
+                        // The actionable reason: the worker's own route is
+                        // proxied.
+                        Err(_) if own == SummarySkip::RemoteProxy => return Err(own),
+                        Err(reason) => return Err(reason),
+                    }
+                }
+            }
+        };
+        if self.summary_credentials_missing(&route) {
+            return Err(SummarySkip::MissingCredentials);
+        }
+        Ok((model, notice))
+    }
+
+    /// The rollover summary transport: the `/compact` request path
+    /// (preflight, host-key stripping; one attempt, an output ceiling) on
+    /// the summary model, under the compaction disclosure policy, plus the
+    /// warm path when the session's own Anthropic model writes it.
+    /// `Err(None)` in local-only compaction mode, which must never build a
+    /// network request; `Err(Some(reason))` when no usable summary model
+    /// exists (said once to the user).
+    pub(crate) fn rollover_summarizer(
+        &self,
+    ) -> std::result::Result<
+        rolling_summary::RolloverSummarizer,
+        Option<rolling_summary::SummarySkip>,
+    > {
+        let policy = self.compaction_policy();
+        if policy.mode == agent_core::compaction::CompactionMode::LocalOnly {
+            return Err(None);
+        }
+        let (model, notice) = self.summary_model_choice().map_err(Some)?;
+        // The warm path: the session's own model on the native Anthropic
+        // transport, reusing the closing window's cached request.
+        let warm = (model == self.model && warm_summary::recordable(&model))
+            .then(|| self.warm_summarizer());
+        let runtime = self.clone();
+        let call_model = model.clone();
+        let probe_runtime = self.clone();
+        let probe_model = model.clone();
+        let seat_bound: rolling_summary::SeatProbe = Arc::new(move || {
+            let runtime = probe_runtime.clone();
+            let model = probe_model.clone();
+            Box::pin(async move { runtime.background_seat_bound(&model).await })
+        });
+        Ok(rolling_summary::RolloverSummarizer::new(
+            Arc::new(move |messages, max_output_tokens, gate| {
+                let runtime = runtime.clone();
+                let model = call_model.clone();
+                Box::pin(async move {
+                    runtime
+                        .rollover_summary_call(&model, messages, max_output_tokens, gate)
+                        .await
+                })
+            }),
+            policy,
+            model,
+        )
+        .with_notice(notice)
+        .with_seat_probe(seat_bound)
+        .with_warm(warm))
     }
 
     /// The session's compaction disclosure policy (spec §9.4) — consumed by
@@ -2527,6 +3288,9 @@ impl Runtime {
     }
 
     pub fn set_context_window(&mut self, window: Option<u64>) {
+        if self.context_window_override != window {
+            self.invalidate_warm_prefix();
+        }
         self.context_window_override = window;
     }
 
@@ -2535,17 +3299,30 @@ impl Runtime {
         self.context_window_override
     }
 
-    /// Effective context window for the current model — user override if set,
-    /// otherwise the model's native window from `models::context_window_for_model`.
+    /// The compaction model: as configured, else `claude-sonnet-4-6`.
     pub fn compaction_model(&self) -> &str {
         self.compaction_model
             .as_deref()
             .unwrap_or("claude-sonnet-4-6")
     }
 
+    /// The session's effective context window: the model's native window
+    /// when nothing is configured, else the configured window clamped to the
+    /// model's ceiling (`models::effective_context_window`). Every reader of
+    /// the session's window goes through this.
     pub fn context_window(&self) -> u64 {
-        self.context_window_override
-            .unwrap_or_else(|| crate::models::context_window_for_model(&self.model))
+        let window =
+            crate::models::effective_context_window(&self.model, self.context_window_override);
+        // 1M entitlement fallback: a model latched to its native window.
+        self.native_window.clamp(&self.model, window)
+    }
+
+    /// Whether requests ask for the 1M context window: the configured
+    /// `context_window = 1m`, unless this session's model was latched to its
+    /// native window after the account refused it.
+    pub(crate) fn uses_1m_context(&self) -> bool {
+        self.context_window_override == Some(1_000_000)
+            && !self.native_window.is_latched(&self.model)
     }
 
     /// Task 29 (spec §9.1): the ONE request-aware context assessment every
@@ -2567,7 +3344,7 @@ impl Runtime {
         messages: &[crate::SharedMessage],
     ) -> context::ContextAssessment {
         let system = self.effective_system_prompt().await;
-        let schema = self.tools.read().await.tools_schema();
+        let schema = self.exposed_tools_schema().await;
         // Task A7 (spec §10.1/§10.3): the T29 memory lane is fed by the
         // validated recall segment held for this turn, if any. No held
         // segment ⇒ the lane stays empty — byte-identical to the pre-A7
@@ -2585,9 +3362,10 @@ impl Runtime {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .usage_anchor_for(&self.model)
             .cloned();
-        context::assess(&context::ContextBudgetInputs {
+        let window = self.context_window();
+        let assessment = context::assess(&context::ContextBudgetInputs {
             model: &self.model,
-            provider_window: self.context_window(),
+            provider_window: window,
             system_prompt: system.as_deref(),
             tools_schema: &schema,
             messages,
@@ -2595,9 +3373,48 @@ impl Runtime {
             memory_contents: &memory_contents,
             thinking_budget_tokens: self.thinking_budget as u64,
             next_tool_result_bytes: self.max_tool_output as u64,
-            max_output_tokens: HelperMethods::max_tokens_for_model(&self.model),
+            // PARITY E2: the request's own cap (CTXWIN: 64K at <= 200K)
+            // bounds upstream's expected output reserve, as in the stream's
+            // `pre_request_context_budget`.
+            max_output_tokens: HelperMethods::max_tokens_for_request(&self.model, window),
         })
-        .anchored(anchor.as_ref(), messages)
+        .anchored(anchor.as_ref(), messages);
+        if !self.context_management_enabled() {
+            return assessment;
+        }
+        // Context-managed requests are sized to the room left (R1). This
+        // assessment takes no calibration sample (its `used_tokens` is the
+        // anchored footprint, else the estimate), so it reserves the output
+        // an uncalibrated request would send: the same function and margin
+        // as the stream's.
+        let sizing = stream::size_request(
+            &self.model,
+            &assessment,
+            self.thinking_budget as u64,
+            None,
+        );
+        context::ContextAssessment {
+            reserves: sizing.reserves,
+            ..assessment
+        }
+    }
+
+    /// The tool schema a flag-off request of this session exposes: the
+    /// registry's cached schema (the registry may be shared by every session
+    /// of a host) minus the tools this session withholds
+    /// (`continuation::withheld_tools`).
+    pub(crate) async fn exposed_tools_schema(&self) -> std::sync::Arc<Vec<serde_json::Value>> {
+        let registry = self.tools.read().await;
+        let set = continuation::context_tool_set(
+            self.host_tool_session.clone(),
+            registry.catalog(),
+            false,
+            self.context_management_enabled(),
+            self.memory_backend.is_axel(),
+        );
+        registry
+            .schema_withholding(&set)
+            .unwrap_or_else(|| registry.tools_schema())
     }
 
     /// Task A7: hold a validated recall contribution for the current turn as
@@ -2978,6 +3795,15 @@ impl Runtime {
         self.apply_config_inner(config, false);
     }
 
+    /// The step of `apply_config` that picks the model: the config's `model`,
+    /// else the runtime default. `EngineHost::new_session_model` runs the
+    /// same step, so it names what a new session gets.
+    pub(crate) fn apply_config_model(&mut self, config: &crate::config::SynapsConfig) {
+        if let Some(ref model) = config.model {
+            self.set_model(model.clone());
+        }
+    }
+
     fn apply_config_inner(&mut self, config: &crate::config::SynapsConfig, disable_tools: bool) {
         // #112: apply memory backend config early (binding is immutable once set).
         self.apply_memory_backend_config(&config.memory_backend);
@@ -2994,9 +3820,8 @@ impl Runtime {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         }
-        if let Some(ref model) = config.model {
-            self.set_model(model.clone());
-        }
+        self.apply_config_model(config);
+        self.memory_only_policy.set_config(config.memory_only_tools.clone());
         // Named level takes priority over raw budget.
         // Config-specified thinking is an explicit user choice — preserve across model switches.
         if let Some(level) = config.thinking_level {
@@ -3014,12 +3839,26 @@ impl Runtime {
                 "configured reasoning level not supported by model; clamped"
             );
         }
+        if self.context_window_override != config.context_window
+            || self.cache_ttl != config.cache_ttl
+            || self.progressive_tool_disclosure != config.progressive_tool_disclosure
+            || self.deferred_tool_loading != config.tools_deferred_loading
+        {
+            self.invalidate_warm_prefix();
+        }
         self.context_window_override = config.context_window;
         self.continuation
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .config = config.context_management;
         self.compaction_model = config.compaction_model.clone();
+        self.summary_model = config.summary_model.clone();
+        self.summary_model_invalid = config.summary_model_invalid;
+        if self.compaction_mode != config.compaction_mode
+            || self.compaction_exclusions != config.compaction_exclude
+        {
+            self.invalidate_warm_record();
+        }
         self.compaction_mode = config.compaction_mode;
         self.compaction_exclusions = config.compaction_exclude.clone();
         self.max_tool_output = config.max_tool_output;
@@ -3032,6 +3871,7 @@ impl Runtime {
         self.subagent_timeout = config.subagent_timeout;
         self.api_retries = config.api_retries;
         self.refusal_retries = config.refusal_retries;
+        self.capacity_wait = capacity_wait::CapacityWaitPolicy::from_config(config.capacity_wait);
         self.telemetry_level =
             crate::runtime::telemetry::TelemetryLevel::from_str_key(&config.telemetry);
         self.telemetry_log_generations = config.telemetry_log_generations;
@@ -3093,6 +3933,17 @@ impl Runtime {
         }
     }
 
+    /// Switch the credential source. A different source (local, or another
+    /// broker endpoint or machine identity) drops the cached tokens and voids
+    /// the warm rolling-summary record.
+    fn set_credential_source(&mut self, source: crate::auth::CredentialSource) {
+        if source != self.credential_source {
+            self.token_cache.invalidate("anthropic");
+            self.invalidate_warm_record();
+        }
+        self.credential_source = source;
+    }
+
     /// Apply only the credential-source portion of config. Used by subagent
     /// spawns that build a fresh `Runtime::new()` (which defaults to Local) and
     /// must inherit the user's Remote/broker setup. (#158 A3)
@@ -3101,11 +3952,7 @@ impl Runtime {
     /// A2: scrubs `AuthState` when Remote so no local `auth.json` credential is
     /// used or held (invariant 1).
     pub fn apply_auth_config(&mut self, config: &crate::config::SynapsConfig) {
-        let new_source = config.auth.credential_source();
-        if new_source != self.credential_source {
-            self.token_cache.invalidate("anthropic");
-        }
-        self.credential_source = new_source;
+        self.set_credential_source(config.auth.credential_source());
         if self.credential_source.is_remote() {
             if let Ok(mut auth) = self.auth.try_write() {
                 AuthMethods::scrub_for_remote(&mut auth);
@@ -3263,6 +4110,25 @@ impl Runtime {
     pub(crate) fn apply_retry_config(&mut self, config: &crate::SynapsConfig) {
         self.api_retries = config.api_retries;
         self.refusal_retries = config.refusal_retries;
+        // A worker's turn waits for capacity as its caller's does.
+        self.capacity_wait = capacity_wait::CapacityWaitPolicy::from_config(config.capacity_wait);
+    }
+
+    /// What a worker (subagent) runtime takes from config: the tool limits
+    /// (`max_tool_output`, `bash_timeout`, `bash_max_timeout`,
+    /// `subagent_timeout`) and the retry counts. Both worker builders,
+    /// `EngineHost::worker_runtime` and the legacy `spawn_runtime`, call
+    /// this one function so they cannot diverge. Everything else
+    /// `apply_config` sets is either worker policy
+    /// (`apply_subagent_runtime_policy`: cache TTL, turn budget, role) or
+    /// deliberately not inherited (brokers, disclosure, the model and its
+    /// reasoning, continuation, telemetry); see the worker-config inventory.
+    pub(crate) fn apply_worker_config(&mut self, config: &crate::SynapsConfig) {
+        self.max_tool_output = config.max_tool_output;
+        self.bash_timeout = config.bash_timeout;
+        self.bash_max_timeout = config.bash_max_timeout;
+        self.subagent_timeout = config.subagent_timeout;
+        self.apply_retry_config(config);
     }
 
     pub fn refusal_retries(&self) -> u32 {
@@ -4239,8 +5105,14 @@ impl Runtime {
     /// strategy never prunes old markers, so no invalidation logic needed).
     /// Accepts a fixed [`crate::core::config::CacheTtl`] or a full
     /// [`crate::core::config::CacheTtlSetting`] (including `auto`).
+    /// PARITY: a changed setting also drops the warm-summary prefix (ours):
+    /// the recorded request was marked with the old TTL.
     pub fn set_cache_ttl(&mut self, ttl: impl Into<crate::core::config::CacheTtlSetting>) {
-        self.cache_ttl = ttl.into();
+        let ttl = ttl.into();
+        if self.cache_ttl != ttl {
+            self.invalidate_warm_prefix();
+        }
+        self.cache_ttl = ttl;
     }
 
     /// Worker rollover policy from config (`apply_subagent_runtime_policy`).
@@ -4280,14 +5152,19 @@ impl Runtime {
     /// `/auth reload`: drop the in-memory Anthropic token and re-vend it
     /// through the credential broker (re-reads auth.json locally, forcing a
     /// refresh if the file still holds the token we had). Returns a
-    /// token-free status line.
+    /// token-free status line. An unbound automatic selection picks anew
+    /// for this session's model when it is an Anthropic one (else
+    /// model-less).
     pub async fn reload_auth(&self) -> Result<String> {
+        let model = crate::runtime::auth::model_is_anthropic(&self.model)
+            .then_some(self.model.as_str());
         AuthMethods::reload_after_rejection(
             Arc::clone(&self.auth),
             &self.client,
             &self.credential_source,
             &self.token_cache,
             None,
+            model,
         )
         .await?;
         let expires = self.auth.read().await.token_expires;
@@ -4307,6 +5184,10 @@ impl Runtime {
 
     /// A cache keep-warm ping's refresh: keeps the bound account or fails,
     /// never selects or switches one ([`auth::RefreshPoint::KeepWarm`]).
+    // PARITY: kept per SC/parity-authev; the ping itself uses ours'
+    // request-local `background_auth` (keepwarm.rs), so nothing calls this
+    // until JR picks one (see notes parity-hot "## 8.").
+    #[allow(dead_code)]
     pub(crate) async fn refresh_for_keepwarm(&self) -> Result<()> {
         if !crate::runtime::auth::model_is_anthropic(&self.model) {
             return Ok(());
@@ -4322,7 +5203,72 @@ impl Runtime {
         .await
     }
 
+    /// The turn-start refresh of [`Self::refresh_if_needed`], keeping a
+    /// failed automatic selection's typed failure for a capacity wait.
+    async fn refresh_turn_start(
+        &self,
+    ) -> std::result::Result<(), crate::runtime::auth::RefreshFailure> {
+        if !crate::runtime::auth::model_is_anthropic(&self.model) {
+            return Ok(());
+        }
+        AuthMethods::refresh_if_needed_typed(
+            Arc::clone(&self.auth),
+            &self.client,
+            &self.credential_source,
+            &self.token_cache,
+            Some(&self.model),
+            crate::runtime::auth::RefreshPoint::TurnStart,
+        )
+        .await
+    }
+
     async fn refresh_if_needed_for_model(&self, model: &str) -> Result<()> {
+        self.refresh_for_model(model, crate::runtime::auth::RefreshPoint::TurnStart)
+            .await
+    }
+
+    /// The credential for a request the session makes on its own (keep-warm
+    /// ping, rollover summary) on `model`: a request-local snapshot of the
+    /// bound seat, built and sent with that request only. The session's
+    /// shared auth state is never written: no account selection, no
+    /// rebind, no shared token refresh (see
+    /// [`crate::runtime::auth::RefreshPoint`]). A non-Anthropic model
+    /// resolves its own provider auth, so it gets a copy of the state as
+    /// held.
+    async fn background_auth(&self, model: &str) -> Result<Arc<RwLock<AuthState>>> {
+        let snapshot = if crate::runtime::auth::model_is_anthropic(model) {
+            AuthMethods::background_snapshot(
+                &self.auth,
+                &self.client,
+                &self.credential_source,
+                &self.token_cache,
+            )
+            .await?
+        } else {
+            self.auth.read().await.clone()
+        };
+        Ok(Arc::new(RwLock::new(snapshot)))
+    }
+
+    /// Whether a background request on `model` would have a seat to use
+    /// (see [`AuthMethods::background_seat_bound`]); non-Anthropic models
+    /// resolve their own provider auth. Nothing is vended or written.
+    async fn background_seat_bound(&self, model: &str) -> bool {
+        !crate::runtime::auth::model_is_anthropic(model)
+            || AuthMethods::background_seat_bound(
+                &self.auth,
+                &self.client,
+                &self.credential_source,
+                &self.token_cache,
+            )
+            .await
+    }
+
+    async fn refresh_for_model(
+        &self,
+        model: &str,
+        point: crate::runtime::auth::RefreshPoint,
+    ) -> Result<()> {
         // Non-Anthropic models resolve their own provider auth in the OpenAI
         // path (incl. via the broker), so skip the Anthropic pre-fetch. (#158 #7)
         if !crate::runtime::auth::model_is_anthropic(model) {
@@ -4334,7 +5280,7 @@ impl Runtime {
             &self.credential_source,
             &self.token_cache,
             Some(model),
-            crate::runtime::auth::RefreshPoint::TurnStart,
+            point,
         )
         .await
     }
@@ -4345,29 +5291,108 @@ impl Runtime {
     /// all tools, and returns the raw text response. Caller supplies the
     /// full message array including the serialized conversation.
     pub async fn compact_call(&self, messages: Vec<crate::SharedMessage>) -> Result<String> {
+        let text = self
+            .compaction_request(
+                self.compaction_model(),
+                messages,
+                api_sync::SimpleCallPolicy::compaction(self.api_retries),
+                None,
+                crate::runtime::auth::RefreshPoint::TurnStart,
+            )
+            .await
+            .text?;
+        if text.is_empty() {
+            return Err(RuntimeError::Tool(
+                "Compaction returned empty response".to_string(),
+            ));
+        }
+        Ok(text)
+    }
+
+    /// The rollover summary request: the `/compact` path with exactly one
+    /// upstream attempt on every route and `max_output_tokens` as the
+    /// provider output ceiling. Usage is returned whenever it was reported.
+    pub(crate) async fn rollover_summary_call(
+        &self,
+        model: &str,
+        messages: Vec<crate::SharedMessage>,
+        max_output_tokens: u32,
+        snapshot: Option<warm_summary::SnapshotGate>,
+    ) -> api_sync::SimpleReply {
+        // A background request: the session's bound seat only.
+        self.compaction_request(
+            model,
+            messages,
+            api_sync::SimpleCallPolicy::single(max_output_tokens),
+            snapshot,
+            crate::runtime::auth::RefreshPoint::Background,
+        )
+        .await
+    }
+
+    /// One compaction or summary request. With a snapshot gate, the
+    /// request is not sent once the gate closes (checked after preflight
+    /// and the credential refresh, and on the native Anthropic transport
+    /// again right before the send). At [`RefreshPoint::Background`] the
+    /// request is built and sent with a request-local credential snapshot
+    /// ([`Self::background_auth`]); the session's auth is never written.
+    ///
+    /// [`RefreshPoint::Background`]: crate::runtime::auth::RefreshPoint::Background
+    async fn compaction_request(
+        &self,
+        model: &str,
+        messages: Vec<crate::SharedMessage>,
+        policy: api_sync::SimpleCallPolicy,
+        snapshot: Option<warm_summary::SnapshotGate>,
+        point: crate::runtime::auth::RefreshPoint,
+    ) -> api_sync::SimpleReply {
         // Transport-construction seam: counted BEFORE preflight, auth
         // refresh, or any request assembly (CP-12 M3).
         self.remote_summarization_attempts
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let model = self.compaction_model();
-        self.validate_request_preflight_for(
-            model,
-            crate::runtime::openai::catalog::CodexRequestRole::Internal,
-        )
-        .await?;
-        self.refresh_if_needed_for_model(model).await?;
+        let ready = async {
+            self.validate_request_preflight_for(
+                model,
+                crate::runtime::openai::catalog::CodexRequestRole::Internal,
+            )
+            .await?;
+            if point == crate::runtime::auth::RefreshPoint::Background {
+                return self.background_auth(model).await;
+            }
+            self.refresh_for_model(model, point).await?;
+            Ok(Arc::clone(&self.auth))
+        };
+        let auth = match ready.await {
+            Ok(auth) => auth,
+            Err(error) => {
+                return api_sync::SimpleReply {
+                    text: Err(error),
+                    spend: api_sync::Spend::NotDispatched,
+                    failure: None,
+                    stop: None,
+                };
+            }
+        };
+        if snapshot.as_ref().is_some_and(|gate| !gate.valid()) {
+            return api_sync::SimpleReply {
+                text: Err(RuntimeError::Canceled),
+                spend: api_sync::Spend::NotDispatched,
+                failure: None,
+                stop: None,
+            };
+        }
 
         use crate::runtime::compaction::COMPACTION_SYSTEM_PROMPT;
 
         ApiMethods::call_api_simple(
-            &self.auth,
+            &auth,
             &self.client,
             model,
             COMPACTION_SYSTEM_PROMPT,
             self.thinking_budget,
             self.reasoning_level(),
             &messages,
-            self.api_retries,
+            policy,
             // Default options preserve this path's historical beta gating
             // and endpoint; only the session observability seams are wired
             // (Task 11) so compaction requests trace/persist like any other.
@@ -4375,9 +5400,17 @@ impl Runtime {
             // must not consume a user's one-shot `/trace next` arm.
             &api::ApiOptions {
                 trace: self.trace_ctx.clone(),
+                diagnostic_session_id: self.session_id.clone(),
+                diagnostic_context_window: Some(self.context_window()),
                 telemetry: self.telemetry_writer.clone(),
                 // The largest body Synaps sends: the whole transcript.
                 request_compression: self.request_compression.clone(),
+                // Credentials come from where the session's own requests
+                // get them: a remote broker is never bypassed.
+                credential_source: self.credential_source.clone(),
+                token_cache: self.token_cache.clone(),
+                snapshot_gate: snapshot,
+                sandbox: crate::sandbox::SandboxBinding::for_session(self.session_id.as_deref()),
                 ..api::ApiOptions::default()
             },
         )
@@ -4386,6 +5419,13 @@ impl Runtime {
 
     /// Run a single prompt synchronously (non-streaming). Handles tool execution
     /// internally, looping until the model produces a final text response.
+    ///
+    /// Unscoped: this legacy loop has no session tool set and no execution
+    /// gate. It offers the registry's full schema and dispatches by registry
+    /// lookup, so a session's withheld tools (context off: `context_checkpoint`;
+    /// a non-Axel backend: the forum tools) are offered and run here. Tool
+    /// calls still carry this runtime's own continuation state and memory
+    /// binding. Not for session tool loops; those use the stream path.
     pub async fn run_single(&self, prompt: &str) -> Result<String> {
         if self
             .continuation
@@ -4420,8 +5460,12 @@ impl Runtime {
                 &messages,
                 self.api_retries,
                 &api::ApiOptions {
-                    memory_backend: None,
-                    use_1m_context: self.context_window_override == Some(1_000_000),
+                    event_triggered: false,
+                    // This session's binding: an extension-provider route's
+                    // interior tool loop executes memory tools with it.
+                    memory_backend: Some(self.memory_backend.clone()),
+                    sandbox: crate::sandbox::SandboxBinding::for_session(self.session_id.as_deref()),
+                    use_1m_context: self.uses_1m_context(),
                     cache_ttl: self.cache_ttl,
                     ttl_downgrade_notified: self.ttl_downgrade_notified.clone(),
                     saw_1h_honored: self.saw_1h_honored.clone(),
@@ -4442,6 +5486,8 @@ impl Runtime {
                     // limits it to exactly one logical request).
                     trace: self.effective_trace_context(),
                     request_correlation: None,
+                    diagnostic_session_id: self.session_id.clone(),
+                    diagnostic_context_window: Some(self.context_window()),
                     suppress_stream_deltas: true,
                     telemetry: self.telemetry_writer.clone(),
                     // Non-stream path note (Task 16 review): threading the
@@ -4463,6 +5509,18 @@ impl Runtime {
                     // The non-stream transport never sends diagnostics.
                     cache_diagnosis: None,
                     context_rollover: None,
+                    prefix_tap: None,
+                    snapshot_gate: None,
+                    // Legacy foreground loop: no worker reaches it.
+                    spend_tap: None,
+                    // Not a worker run's route: no request ledger.
+                    request_ledger: None,
+                    // The legacy non-stream loop ends as before.
+                    capacity_wait: None,
+                    // Not context-managed: the static output cap.
+                    request_output_tokens: None,
+                    // No native-window fallback outside stream turns.
+                    long_context_refusal: None,
                 },
             )
             .await?;
@@ -4491,7 +5549,7 @@ impl Runtime {
                 if tool_uses.is_empty() {
                     if let Some(orchestration) = &self.orchestration {
                         if let agent_core::orchestration::CompletionGate::Blocked { workers } =
-                            orchestration.completion_gate()
+                            orchestration.completion_gate_for(self.delegation_parent.as_deref())
                         {
                             return Err(crate::RuntimeError::Tool(format!(
                                 "completion blocked: {} worker(s) require collection/reconciliation: {} (call subagent_collect with reconciled=true after inspecting each result)",
@@ -4542,6 +5600,7 @@ impl Runtime {
                                         launch_cancel: None,
                                         memory_backend: Some(self.memory_backend.clone()),
                                         telemetry: Some(self.worker_telemetry()),
+                                        continuation: Some(self.continuation.clone()),
                                         watcher_exit_path: self.watcher_exit_path.clone(),
                                         tool_register_tx: None,
                                         session_manager: Some(self.session_manager.clone()),
@@ -4552,6 +5611,7 @@ impl Runtime {
                                             self.reasoning_level(),
                                             self.codex_request_role(),
                                         ),
+                                        worker_context: None,
                                         event_queue: Some(self.event_queue.clone()),
                                         secret_prompt: None,
                                         orchestration: self.orchestration.clone(),
@@ -4563,7 +5623,11 @@ impl Runtime {
                                         env: self.env.clone(),
                                         env_stripped: self.env_stripped.clone(),
                                         env_warned: self.env_warned.clone(),
+                                        sandbox: crate::sandbox::SandboxBinding::for_session(self.session_id.as_deref()),
                                         session_id: self.session_id.clone(),
+                                        tool_use_id: None,
+                                        turn_correlation_id: None,
+                                        spend: None,
                                     },
                                     limits: crate::tools::ToolLimits {
                                         max_tool_output: self.max_tool_output,
@@ -4573,22 +5637,38 @@ impl Runtime {
                                         subagent_timeout: self.subagent_timeout,
                                     },
                                 };
-                                let decision = resolve_before_tool_call_decision(
+                                let hook_call =
+                                    crate::extensions::hooks::events::ToolCallHookContext::for_tool_call(
+                                        self.session_id.as_deref(),
+                                        Some(tool_id),
+                                        self.cwd.as_deref(),
+                                    );
+                                // Sandbox `tools = confined`: a refused call
+                                // reaches no hook and never runs.
+                                let refused = crate::sandbox::gate_tool(ctx.capabilities.sandbox.as_deref(), tool.name()).err();
+                                let decision = if refused.is_some() {
+                                    BeforeToolCallDecision::Block { reason: String::new() }
+                                } else {
+                                resolve_before_tool_call_decision(
                                     input.clone(),
-                                    emit_before_tool_call(
+                                    emit_before_tool_call_with(
                                         &self.hook_bus,
                                         tool_name,
                                         Some(&runtime_name),
                                         input.clone(),
-                                        self.session_id.as_deref(),
+                                        &hook_call,
                                     )
                                     .await,
                                     None,
                                     false,
                                     Some(&self.session_allow_all),
+                                    hook_call.tool_call_id,
                                 )
-                                .await;
-                                if let BeforeToolCallDecision::Block { reason } = decision {
+                                .await
+                                };
+                                if let Some(text) = refused {
+                                    (text, None)
+                                } else if let BeforeToolCallDecision::Block { reason } = decision {
                                     (format!("Tool call blocked by extension: {}", reason), None)
                                 } else {
                                     let BeforeToolCallDecision::Continue { input } = decision
@@ -4600,14 +5680,14 @@ impl Runtime {
                                         Ok(output) => validated_single_tool_output(&self.model, output),
                                         Err(e) => (e.to_string(), None),
                                     };
-                                    let hooked_output = emit_after_tool_call(
+                                    let hooked_output = emit_after_tool_call_with(
                                         &self.hook_bus,
                                         tool_name,
                                         Some(&runtime_name),
                                         input_for_hook,
                                         output.clone(),
                                         self.max_tool_output,
-                                        self.session_id.as_deref(),
+                                        &hook_call,
                                     )
                                     .await;
                                     let rich_blocks = retain_single_tool_blocks(rich_blocks, &output, &hooked_output);
@@ -4667,6 +5747,7 @@ impl Runtime {
                             let orchestration_inner = cfg_orchestration.clone();
                             let memory_backend_inner = self.memory_backend.clone();
                             let worker_telemetry_inner = self.worker_telemetry();
+                            let continuation_inner = self.continuation.clone();
                             let memory_context_inner = self.memory_tool_capability();
                             let codex_parent_plan_inner = codex_parent_plan.clone();
                             let cwd_inner = cfg_cwd.clone();
@@ -4679,25 +5760,43 @@ impl Runtime {
                             let runtime_name_for_hook = runtime_name.clone();
 
                             join_set.spawn(async move {
+                                let hook_call =
+                                    crate::extensions::hooks::events::ToolCallHookContext::for_tool_call(
+                                        session_id_inner.as_deref(),
+                                        Some(tool_id.as_str()),
+                                        cwd_inner.as_deref(),
+                                    );
                                 let result = match tool {
                                     Some(t) => {
-                                        let decision =
+                                        // Sandbox `tools = confined` (see the single-tool site).
+                                        let refused = crate::sandbox::gate_tool(
+                                            crate::sandbox::SandboxBinding::for_session(session_id_inner.as_deref()).as_deref(),
+                                            t.name(),
+                                        )
+                                        .err();
+                                        let decision = if refused.is_some() {
+                                            crate::runtime::BeforeToolCallDecision::Block { reason: String::new() }
+                                        } else {
                                             crate::runtime::resolve_before_tool_call_decision(
                                                 input.clone(),
-                                                crate::runtime::emit_before_tool_call(
+                                                crate::runtime::emit_before_tool_call_with(
                                                     &hook_bus_inner,
                                                     &tool_name_for_hook,
                                                     Some(&runtime_name_for_hook),
                                                     input.clone(),
-                                                    session_id_inner.as_deref(),
+                                                    &hook_call,
                                                 )
                                                 .await,
                                                 None,
                                                 false,
                                                 Some(&session_allow_all_inner),
+                                                hook_call.tool_call_id,
                                             )
-                                            .await;
-                                        if let crate::runtime::BeforeToolCallDecision::Block {
+                                            .await
+                                        };
+                                        if let Some(text) = refused {
+                                            (text, None)
+                                        } else if let crate::runtime::BeforeToolCallDecision::Block {
                                             reason,
                                         } = decision
                                         {
@@ -4719,12 +5818,14 @@ impl Runtime {
                                                     launch_cancel: None,
                                                     memory_backend: Some(memory_backend_inner),
                                                     telemetry: Some(worker_telemetry_inner),
+                                                    continuation: Some(continuation_inner),
                                                     watcher_exit_path: exit_path,
                                                     tool_register_tx: None,
                                                     session_manager: Some(session_mgr_inner),
                                                     subagent_registry: Some(registry_inner),
                                                     delegation_parent: None,
                                                     codex_parent_plan: codex_parent_plan_inner,
+                                                    worker_context: None,
                                                     event_queue: Some(event_queue_inner),
                                                     secret_prompt: None,
                                                     orchestration: orchestration_inner,
@@ -4736,7 +5837,11 @@ impl Runtime {
                                                     env: env_inner,
                                                     env_stripped: env_stripped_inner,
                                                     env_warned: env_warned_inner,
+                                                    sandbox: crate::sandbox::SandboxBinding::for_session(session_id_inner.as_deref()),
                                                     session_id: session_id_inner.clone(),
+                                                    tool_use_id: None,
+                                                    turn_correlation_id: None,
+                                                    spend: None,
                                                 },
                                                 limits: crate::tools::ToolLimits {
                                                     max_tool_output: cfg_max_tool_output,
@@ -4756,14 +5861,14 @@ impl Runtime {
                                                     Err(e) => (e.to_string(), None),
                                                 };
                                             let hooked_output =
-                                                crate::runtime::emit_after_tool_call(
+                                                crate::runtime::emit_after_tool_call_with(
                                                     &hook_bus_inner,
                                                     &tool_name_for_hook,
                                                     Some(&runtime_name_for_hook),
                                                     input_for_hook,
                                                     output.clone(),
                                                     cfg_max_tool_output,
-                                                    session_id_inner.as_deref(),
+                                                    &hook_call,
                                                 )
                                                 .await;
                                             let rich_blocks = retain_single_tool_blocks(
@@ -4848,6 +5953,76 @@ impl Runtime {
         &self.session_allow_all
     }
 
+    /// The tool context for work the session's actor does on its own, with
+    /// no turn: the daemon resuming a reload-stopped worker
+    /// (`tools::subagent::resume::resume_for_daemon`). It carries what a
+    /// turn's tool call carries for a worker launch — this session's
+    /// registry, event queue, delegation policy, spend sink, memory binding,
+    /// cwd/env and confirm prompt — and nothing only a turn holds: no stream
+    /// channels, no launch cancel (the turn's), no tool activation, MCP or
+    /// extension leases, no memory-context capability. The "Allow all"
+    /// latch is the session's own (shared, as a turn's worker shares it):
+    /// whatever the user set, nothing more; this never sets it.
+    pub(crate) fn daemon_tool_context(
+        &self,
+        secret_prompt: Option<crate::tools::SecretPromptHandle>,
+    ) -> crate::ToolContext {
+        let worker_context = crate::tools::WORKER_ROLLOVER.then(|| {
+            let mut now = self.worker_context_policy();
+            now.context_management = self
+                .continuation
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .config;
+            now
+        });
+        crate::ToolContext {
+            channels: crate::tools::ToolChannels { tx_delta: None, tx_events: None },
+            capabilities: crate::tools::ToolCapabilities {
+                session_allow_all: Some(self.session_allow_all.clone()),
+                memory_backend: Some(self.memory_backend.clone()),
+                // PARITY #303: a resumed worker reports like a turn's.
+                telemetry: Some(self.worker_telemetry()),
+                watcher_exit_path: self.watcher_exit_path.clone(),
+                tool_register_tx: None,
+                session_manager: Some(self.session_manager.clone()),
+                subagent_registry: Some(self.subagent_registry.clone()),
+                launch_cancel: None,
+                event_queue: Some(self.event_queue.clone()),
+                delegation_parent: self.delegation_parent.clone(),
+                codex_parent_plan: Self::codex_delegation_plan(
+                    &self.model,
+                    self.reasoning_level(),
+                    self.codex_request_role(),
+                ),
+                worker_context,
+                secret_prompt,
+                orchestration: self.orchestration.clone(),
+                tool_activation: None,
+                mcp_leases: None,
+                extension_leases: None,
+                memory_context: None,
+                continuation: Some(self.continuation.clone()),
+                cwd: self.cwd.clone(),
+                env: self.env.clone(),
+                env_stripped: self.env_stripped.clone(),
+                env_warned: self.env_warned.clone(),
+                session_id: self.session_id.clone(),
+                tool_use_id: None,
+                turn_correlation_id: None,
+                spend: self.spend_parent(),
+                sandbox: crate::sandbox::SandboxBinding::for_session(self.session_id.as_deref()),
+            },
+            limits: crate::tools::ToolLimits {
+                max_tool_output: self.max_tool_output,
+                max_tool_buffer: crate::tools::ToolLimits::MAX_TOOL_BUFFER,
+                bash_timeout: self.bash_timeout,
+                bash_max_timeout: self.bash_max_timeout,
+                subagent_timeout: self.subagent_timeout,
+            },
+        }
+    }
+
     /// Bind a worker to the calling session, not the process-wide host.
     pub(crate) fn inherit_session_allow_all(
         &mut self,
@@ -4855,6 +6030,81 @@ impl Runtime {
     ) {
         if let Some(parent) = parent {
             self.session_allow_all = parent.clone();
+        }
+    }
+
+    /// Route this worker's `before_tool_call` hooks to its caller: `bus`
+    /// (a [`HookBus::worker_route`](crate::extensions::hooks::HookBus::worker_route))
+    /// runs the caller's chain, and `confirm` answers a `Confirm` as the
+    /// caller's confirm step would.
+    pub(crate) fn bind_worker_hooks(
+        &mut self,
+        bus: Arc<crate::extensions::hooks::HookBus>,
+        confirm: WorkerConfirm,
+    ) {
+        self.hook_bus = bus;
+        self.worker_confirm = Some(confirm);
+    }
+
+    /// A worker takes its caller's memory-only policy (globs only): the
+    /// caller's config globs join its own, and it reads the caller's shared
+    /// session list at each check. Its raw results live in its own fresh
+    /// table, never the caller's.
+    pub(crate) fn inherit_memory_only_policy(&mut self, caller: &memory_only::Policy) {
+        self.memory_only_policy.inherit(caller);
+    }
+
+    /// A NEW session glob list (`SessionConfig.memory_only_tools`), not
+    /// shared with any other runtime's.
+    pub fn set_memory_only_session_globs(&mut self, globs: Vec<String>) {
+        self.memory_only_policy.set_session(globs);
+    }
+
+    /// Read the session's shared glob list (owned by the session actor) at
+    /// each check, so a live `Set` reaches this runtime's turns and workers.
+    pub fn share_memory_only_session(&mut self, session: &memory_only::SessionGlobs) {
+        self.memory_only_policy.share_session(session);
+    }
+
+    /// Every memory-only glob in force on this runtime.
+    pub fn memory_only_globs(&self) -> Vec<String> {
+        self.memory_only_policy.globs()
+    }
+
+    /// Counts of this runtime's live memory-only results (never their text).
+    pub fn memory_only_status(&self) -> memory_only::Status {
+        self.memory_only.status()
+    }
+
+    /// Hand this runtime the session's client tool overlay. Only the session
+    /// actor calls this, for its own root runtime; a clone never inherits it.
+    pub fn share_client_tools(&mut self, overlay: &client_tools::Overlay) {
+        self.client_tools = overlay.clone();
+    }
+
+    /// The client tool wire names this runtime's root stream would offer now
+    /// (empty on a clone, a worker, or without a registration).
+    pub fn client_tool_wire_names(&self) -> Vec<String> {
+        self.client_tools.offer().wire_names()
+    }
+
+    /// Whether this runtime's `before_tool_call` hooks are routed to a
+    /// caller (a worker bound by [`Self::bind_worker_hooks`]).
+    pub fn has_worker_hook_route(&self) -> bool {
+        self.worker_confirm.is_some()
+    }
+
+    /// The prompt and auto-approve policy that resolve a `before_tool_call`
+    /// `Confirm` on this runtime: the given (the turn's own) ones, or on a
+    /// worker with routed hooks its caller's.
+    fn hook_confirm_route(
+        &self,
+        own_prompt: Option<&crate::tools::SecretPromptHandle>,
+        own_auto_approve: bool,
+    ) -> (Option<crate::tools::SecretPromptHandle>, bool) {
+        match &self.worker_confirm {
+            Some(route) => (route.prompt.clone(), route.auto_approve),
+            None => (own_prompt.cloned(), own_auto_approve),
         }
     }
 
@@ -4891,6 +6141,31 @@ impl Runtime {
         secret_prompt: Option<crate::tools::SecretPromptHandle>,
         auto_approve_confirms: bool,
         completion: TurnCompletion,
+    ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send>> {
+        self.run_stream_tracked_for_trigger(
+            messages,
+            cancel,
+            steering_rx,
+            secret_prompt,
+            auto_approve_confirms,
+            completion,
+            false,
+        )
+        .await
+    }
+
+    /// Explicit host turn provenance. Only an event-auto turn may finish as
+    /// a successful empty Codex no-op; prompt contents never set this flag.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn run_stream_tracked_for_trigger(
+        &self,
+        messages: Vec<crate::SharedMessage>,
+        cancel: CancellationToken,
+        steering_rx: Option<mpsc::UnboundedReceiver<String>>,
+        secret_prompt: Option<crate::tools::SecretPromptHandle>,
+        auto_approve_confirms: bool,
+        completion: TurnCompletion,
+        event_triggered: bool,
     ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send>> {
         // CP-11 fix-2 (A): the caller-facing boundary is BOUNDED. The
         // internal producer keeps an unbounded sender for API stability;
@@ -4941,13 +6216,39 @@ impl Runtime {
             }
         };
 
-        // Refresh OAuth token if expired after capability preflight.
-        if let Err(e) = self.refresh_if_needed().await {
-            let _ = tx.send(StreamEvent::Session(SessionEvent::Error(
-                helpers::turn_error_for(&e, &turn_correlation_id),
-            )));
-            let _ = tx.send(StreamEvent::Session(SessionEvent::Done));
-            return Box::pin(tokio_stream::wrappers::ReceiverStream::new(bounded_rx));
+        // Refresh OAuth token if expired after capability preflight. An
+        // automatic selection that found no capacity for a reason that ends
+        // by itself waits for it in the spawned turn task (under the turn's
+        // cancel), never here: the session actor awaits this setup inline.
+        let mut turn_start_wait = None;
+        if let Err(failure) = self.refresh_turn_start().await {
+            match &self.capacity_wait {
+                Some(policy) if failure.waits() => {
+                    turn_start_wait = Some(crate::runtime::auth::TurnStartWait {
+                        first: failure,
+                        auth: Arc::clone(&self.auth),
+                        client: self.client.clone(),
+                        source: self.credential_source.clone(),
+                        cache: self.token_cache.clone(),
+                        model: self.model.clone(),
+                        policy: policy.clone(),
+                    });
+                }
+                _ => {
+                    // No wait (capacity_wait off, or nothing resets inside
+                    // its bound): the turn ends here, outside its task, so
+                    // a reset-based stop is noted on the completion itself.
+                    if let Some(stop) = failure.capacity_stop(crate::epoch_millis()) {
+                        completion.note_capacity_stop(stop);
+                    }
+                    let e = failure.into_turn_error();
+                    let _ = tx.send(StreamEvent::Session(SessionEvent::Error(
+                        helpers::turn_error_for(&e, &turn_correlation_id),
+                    )));
+                    let _ = tx.send(StreamEvent::Session(SessionEvent::Done));
+                    return Box::pin(tokio_stream::wrappers::ReceiverStream::new(bounded_rx));
+                }
+            }
         }
 
         // Task B4 (spec §7.4): resolve this turn's memory recall HERE — the
@@ -4997,14 +6298,22 @@ impl Runtime {
         // original clone above; this one is captured separately by the spawn closure.
         let reaper_registry = Arc::clone(&subagent_registry);
         let reaper_orchestration = self.orchestration.clone();
+        #[cfg(feature = "testing")]
+        let done_seam = Arc::clone(&self.event_queue);
         let capture_provider = capture_lease
             .as_ref()
             .and_then(|lease| self.extension_capture_provider(lease));
         let capture_state = self.memory_context_state.clone();
         let event_queue = self.event_queue.clone();
         let options = api::ApiOptions {
-            memory_backend: None,
-            use_1m_context: self.context_window_override == Some(1_000_000),
+            event_triggered,
+            // This session's binding: an extension-provider route's interior
+            // tool loop executes memory tools with it. `None` there made
+            // memory tools resolve a binding from process configuration and
+            // the daemon's cwd instead of this session's project.
+            memory_backend: Some(self.memory_backend.clone()),
+            sandbox: crate::sandbox::SandboxBinding::for_session(self.session_id.as_deref()),
+            use_1m_context: self.uses_1m_context(),
             cache_ttl: self.cache_ttl,
             ttl_downgrade_notified: self.ttl_downgrade_notified.clone(),
             saw_1h_honored: self.saw_1h_honored.clone(),
@@ -5021,6 +6330,8 @@ impl Runtime {
             retention_frontier: None,
             trace: self.effective_trace_context(),
             request_correlation: None,
+            diagnostic_session_id: self.session_id.clone(),
+            diagnostic_context_window: Some(self.context_window()),
             suppress_stream_deltas: false,
             telemetry: self.request_telemetry(),
             // Threads the runtime-scoped gate identity into extension-
@@ -5041,17 +6352,46 @@ impl Runtime {
             // `diagnostics.previous_message_id`.
             cache_diagnosis: self.cache_diagnosis(),
             context_rollover: None,
+            prefix_tap: None,
+            snapshot_gate: None,
+            // A worker's own requests book through its tap (child spend).
+            spend_tap: self.spend_tap.clone(),
+            // A v2 worker run's conversation requests (§6); `None` on
+            // every other runtime.
+            request_ledger: self.request_ledger(),
+            capacity_wait: self.capacity_wait.clone(),
+            // Set per round by the stream's pre-request assessment (R1).
+            request_output_tokens: None,
+            // Placeholder: the stream loop installs its own slot.
+            long_context_refusal: None,
         };
 
         let final_capture_history: Arc<Mutex<Option<Vec<crate::SharedMessage>>>> = Arc::new(Mutex::new(None));
+        // Who answers a before_tool_call Confirm: this turn's own prompt and
+        // policy, or, on a worker, its caller's (never the worker's tools).
+        let (hook_confirm_prompt, hook_auto_approve) =
+            self.hook_confirm_route(secret_prompt.as_ref(), auto_approve_confirms);
         let session = crate::runtime::stream::StreamSession {
             memory_backend: self.memory_backend.clone(),
             memory_context: self.memory_tool_capability(),
+            ephemeral_layer: self.ephemeral_layer.clone(),
+            memory_only: self.memory_only.clone(),
+            memory_only_policy: self.memory_only_policy.clone(),
+            client_tools: self.client_tools.clone(),
             final_capture_history: final_capture_history.clone(),
             turn_completion: completion,
             context_window: self.context_window(),
+            context_window_setting: self.context_window_override,
+            native_window: Arc::clone(&self.native_window),
             continuation: self.continuation.clone(),
             worker_context: self.worker_context.clone(),
+            rollover_summarizer: self.rollover_summarizer(),
+            // Only while worker rollover is built on: the dark path takes no
+            // snapshot per stream or tool call (strict r1 B-SF).
+            // PARITY: ours' policy field, renamed beside upstream's
+            // `worker_context` (runtime::worker_context) above.
+            worker_context_policy: crate::tools::WORKER_ROLLOVER
+                .then(|| self.worker_context_policy()),
             auth,
             client,
             credential_source,
@@ -5081,6 +6421,8 @@ impl Runtime {
             session_manager,
             subagent_registry,
             event_queue,
+            hook_confirm_prompt,
+            hook_auto_approve,
             secret_prompt,
             hook_bus: self.hook_bus.clone(),
             session_id: self.session_id.clone(),
@@ -5093,6 +6435,7 @@ impl Runtime {
             telemetry_level: self.telemetry_level,
             orchestration: self.orchestration.clone(),
             delegation_parent: self.delegation_parent.clone(),
+            child_route: self.child_route.clone(),
             turn_correlation_id: turn_correlation_id.clone(),
             progressive_tool_disclosure: self.progressive_tool_disclosure,
             deferred_tool_loading: self.deferred_tool_loading,
@@ -5107,10 +6450,30 @@ impl Runtime {
             turn_budget: self.turn_budget.clone(),
             owner_steer_budget: self.owner_steer_budget.clone(),
             message_clock: self.message_clock.clone(),
+            spend_parent: self.spend_parent(),
         };
 
-        tokio::spawn(async move {
-            let completed = match StreamMethods::run_stream_internal(session, messages).await {
+        let wait_cancel = session.cancel.clone();
+        // The turn task runs with its completion in scope: a capacity stop
+        // that ends the turn (a wait that ran out, a round top, a window
+        // limit) is noted there for the session to resume from.
+        let turn_completion = session.turn_completion.clone();
+        let turn = async move {
+            // A turn-start capacity wait: a cancel during it falls through,
+            // and the stream records the interrupted turn as at any cancel
+            // before its first request (nothing was sent).
+            let waited = match turn_start_wait {
+                None => Ok(()),
+                Some(wait) => match wait.run(&tx, &wait_cancel).await {
+                    Err(RuntimeError::Canceled) => Ok(()),
+                    other => other,
+                },
+            };
+            let outcome = match waited {
+                Ok(()) => StreamMethods::run_stream_internal(session, messages).await,
+                Err(e) => Err(e),
+            };
+            let completed = match outcome {
                 Ok(()) => true,
                 Err(e) => {
                     let _ = tx.send(StreamEvent::Session(SessionEvent::Error(
@@ -5137,10 +6500,74 @@ impl Runtime {
                 reaper_orchestration.as_deref(),
             );
             agent_core::core::memstat::log_turn_memory();
+            #[cfg(feature = "testing")]
+            done_seam.hold_done_after_quiesce_stop_for_test().await;
             let _ = tx.send(StreamEvent::Session(SessionEvent::Done));
-        });
+        };
+        // On the heap before the spawn: the turn future is large, and an
+        // unoptimized build copies a spawned future through several of
+        // tokio's frames by value, deep in the session actor's stack.
+        let turn: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> = Box::pin(turn);
+        let task = tokio::spawn(
+            crate::runtime::capacity_wait::TURN_COMPLETION.scope(turn_completion, turn),
+        );
+        #[cfg(test)]
+        turn_task_seam::spawned(&self.continuation, &task);
+        drop(task);
 
         Box::pin(tokio_stream::wrappers::ReceiverStream::new(bounded_rx))
+    }
+}
+
+/// Test seam: the abort handle of a turn task, so a test can drop the
+/// turn's future (the outer future of everything the turn awaits, a
+/// rollover included) while the caller's stream stays alive. Dropping the
+/// caller's stream instead cancels the turn's token through the relay.
+#[cfg(test)]
+pub(crate) mod turn_task_seam {
+    use std::sync::{mpsc, Mutex, PoisonError};
+
+    type Armed = (String, mpsc::Sender<tokio::task::AbortHandle>);
+
+    static ARMED: Mutex<Vec<Armed>> = Mutex::new(Vec::new());
+
+    /// Armed until dropped.
+    pub(crate) struct AtSpawn(String);
+
+    /// Receives the abort handle of each turn task spawned for the
+    /// continuation `logical_id` while the returned guard lives.
+    pub(crate) fn arm(logical_id: &str) -> (AtSpawn, mpsc::Receiver<tokio::task::AbortHandle>) {
+        let (tx, rx) = mpsc::channel();
+        ARMED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((logical_id.to_owned(), tx));
+        (AtSpawn(logical_id.to_owned()), rx)
+    }
+
+    impl Drop for AtSpawn {
+        fn drop(&mut self) {
+            ARMED
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .retain(|(id, _)| id != &self.0);
+        }
+    }
+
+    pub(super) fn spawned<T>(
+        continuation: &super::continuation::SharedContinuation,
+        task: &tokio::task::JoinHandle<T>,
+    ) {
+        let logical_id = continuation
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .logical_id
+            .clone();
+        for (id, tx) in ARMED.lock().unwrap_or_else(PoisonError::into_inner).iter() {
+            if *id == logical_id {
+                let _ = tx.send(task.abort_handle());
+            }
+        }
     }
 }
 
@@ -5153,6 +6580,13 @@ impl Clone for Runtime {
             model: self.model.clone(),
             tools: self.tools.clone(),
             system_prompt: self.system_prompt.clone(),
+            ephemeral_layer: ephemeral::Layer::default(),
+            // A clone (worker, keep-warm ping, driver copy) never sees this
+            // session's raw results; the policy is inherited.
+            memory_only: memory_only::Store::default(),
+            memory_only_policy: self.memory_only_policy.clone(),
+            // Client tools stay with the session actor's root runtime.
+            client_tools: client_tools::Overlay::default(),
             effective_prompt: self.effective_prompt.clone(),
             prompt_generation: self.prompt_generation,
             prompt_reload_source: self.prompt_reload_source.clone(),
@@ -5161,9 +6595,14 @@ impl Clone for Runtime {
             explicit_reasoning: self.explicit_reasoning,
             codex_request_role: self.codex_request_role,
             context_window_override: self.context_window_override,
+            // Clones are the same session: one native-window latch.
+            native_window: Arc::clone(&self.native_window),
             continuation: Arc::clone(&self.continuation),
             worker_context: self.worker_context.clone(),
             compaction_model: self.compaction_model.clone(),
+            summary_model: self.summary_model.clone(),
+            summary_model_invalid: self.summary_model_invalid,
+            worker_summary_choice: self.worker_summary_choice,
             compaction_mode: self.compaction_mode,
             compaction_exclusions: self.compaction_exclusions.clone(),
             remote_summarization_attempts: Arc::clone(&self.remote_summarization_attempts),
@@ -5183,6 +6622,7 @@ impl Clone for Runtime {
             subagent_timeout: self.subagent_timeout,
             api_retries: self.api_retries,
             refusal_retries: self.refusal_retries,
+            capacity_wait: self.capacity_wait.clone(),
             telemetry_level: self.telemetry_level,
             telemetry_log_generations: self.telemetry_log_generations,
             // Shared session observability: clones (subagents) enqueue into
@@ -5239,7 +6679,9 @@ impl Clone for Runtime {
             deferred_tool_loading: self.deferred_tool_loading,
             activation_confirm: self.activation_confirm,
             delegation_parent: self.delegation_parent.clone(),
+            child_route: self.child_route.clone(),
             session_allow_all: self.session_allow_all.clone(),
+            worker_confirm: self.worker_confirm.clone(),
             mcp_runtime: self.mcp_runtime.clone(),
             // Clones SHARE the durable session scope: dropping one clone or
             // one stream can never kill a sibling's leases.
@@ -5250,6 +6692,9 @@ impl Clone for Runtime {
             turn_budget: self.turn_budget.clone(),
             owner_steer_budget: self.owner_steer_budget.clone(),
             message_clock: self.message_clock.clone(),
+            spend_tap: self.spend_tap.clone(),
+            spend_sink: self.spend_sink.clone(),
+            request_ledger: self.request_ledger.clone(),
             // Clones share the live tool registry, so they share the SAME
             // host tool session (matching existing shared-session behavior);
             // independently constructed runtimes mint fresh identities and
@@ -5931,6 +7376,79 @@ mod tests {
             .expect("configured worker trust must survive policy replacement");
     }
 
+    /// Subagent rollover §2 (slice 8b): the operator's opt-out reaches the
+    /// snapshot workers inherit, as configured now.
+    #[test]
+    fn the_operator_opt_out_reaches_the_worker_snapshot() {
+        use agent_core::config::ContextRollover;
+        let mut runtime = Runtime::new_headless();
+        assert_eq!(
+            runtime.worker_context_policy().operator_rollover,
+            ContextRollover::Inherit
+        );
+        runtime.apply_config(&crate::config::SynapsConfig {
+            subagent: crate::config::SubagentLimits {
+                context_rollover: ContextRollover::Off,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        assert_eq!(runtime.worker_context_policy().operator_rollover, ContextRollover::Off);
+        runtime.apply_config(&crate::config::SynapsConfig::default());
+        assert_eq!(
+            runtime.worker_context_policy().operator_rollover,
+            ContextRollover::Inherit,
+            "a config without the key: inherit again"
+        );
+    }
+
+    /// Subagent rollover §12 item 9: the resume refusal line reaches the
+    /// snapshot workers inherit, as configured now, so a worker's trigger
+    /// is clamped below it ("off": no clamp; mutant: the snapshot leaves
+    /// it unset).
+    #[test]
+    fn the_resume_refusal_line_reaches_the_worker_snapshot() {
+        let mut runtime = Runtime::new_headless();
+        assert_eq!(runtime.worker_context_policy().resume_refuse_tokens, Some(250_000));
+        for refuse in [None, Some(300_000)] {
+            runtime.apply_config(&crate::config::SynapsConfig {
+                subagent: crate::config::SubagentLimits {
+                    resume_refuse_tokens: refuse,
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+            assert_eq!(runtime.worker_context_policy().resume_refuse_tokens, refuse);
+        }
+    }
+
+    /// Config `capacity_wait` (default on) reaches a foreground runtime and
+    /// a worker's, and a clone keeps it; `false` turns the wait off. A bare
+    /// runtime with no config applied never waits.
+    #[test]
+    fn capacity_wait_config_reaches_foreground_and_worker_runtimes() {
+        use super::capacity_wait::CapacityWaitPolicy;
+        let mut rt = Runtime::new_headless();
+        assert_eq!(rt.capacity_wait, None, "no wait before a config is applied");
+        rt.apply_config(&crate::config::SynapsConfig::default());
+        assert_eq!(rt.capacity_wait, Some(CapacityWaitPolicy::default()));
+        assert_eq!(rt.clone().capacity_wait, Some(CapacityWaitPolicy::default()));
+        rt.apply_config(&crate::config::SynapsConfig {
+            capacity_wait: false,
+            ..Default::default()
+        });
+        assert_eq!(rt.capacity_wait, None, "the kill switch");
+
+        let mut worker = Runtime::new_headless();
+        worker.apply_worker_config(&crate::config::SynapsConfig::default());
+        assert_eq!(worker.capacity_wait, Some(CapacityWaitPolicy::default()));
+        worker.apply_worker_config(&crate::config::SynapsConfig {
+            capacity_wait: false,
+            ..Default::default()
+        });
+        assert_eq!(worker.capacity_wait, None);
+    }
+
     #[test]
     fn configured_subagent_limits_size_the_policy_rebuilt_on_model_change() {
         let mut runtime = Runtime::new_headless();
@@ -5944,6 +7462,7 @@ mod tests {
                 max_concurrent: 24,
                 max_total: 96,
                 max_depth: 2,
+                ..Default::default()
             },
             ..Default::default()
         });
@@ -6080,6 +7599,69 @@ mod tests {
     }
 
     #[test]
+    fn astra_context_capacity_tracks_model_switches_but_preserves_explicit_caps() {
+        let mut runtime = Runtime::new_headless();
+        runtime.set_context_window(None);
+        runtime.set_model("claude-sonnet-4-6".into());
+        assert_eq!(runtime.context_window(), 200_000);
+        runtime.set_model("openai-codex/gpt-6-astra".into());
+        assert_eq!(runtime.context_window(), 1_050_000);
+        runtime.set_model("openai-codex/gpt-6.1-sol".into());
+        assert_eq!(runtime.context_window(), 200_000);
+
+        for cap in [1_000_000, 100_000] {
+            runtime.set_context_window(Some(cap));
+            runtime.set_model("openai-codex/gpt-6-astra".into());
+            assert_eq!(runtime.context_window(), cap);
+            runtime.set_model("claude-sonnet-4-6".into());
+            assert_eq!(runtime.context_window(), cap);
+        }
+        runtime.set_model("openai-codex/gpt-6-astra".into());
+        runtime.set_context_window(None);
+        assert_eq!(runtime.context_window(), 1_050_000);
+    }
+
+    /// An explicit `context_window` is clamped to the model's ceiling
+    /// (`models::effective_context_window`): `1m` budgets a 200k-only
+    /// model's real 200k, never requests its provider refuses. A model with
+    /// no known ceiling keeps the setting; no setting keeps the native window.
+    #[test]
+    fn context_window_clamp_caps_an_explicit_window_at_the_model_ceiling() {
+        let mut runtime = Runtime::new_headless();
+        runtime.set_context_window(Some(1_000_000));
+        for (model, window) in [
+            ("claude-haiku-4-5", 200_000),
+            ("claude-haiku-4-5-20251001", 200_000),
+            ("claude-opus-5-5", 1_000_000),
+            ("claude-sonnet-4-6", 1_000_000),
+            ("openai-codex/gpt-6-astra", 1_000_000),
+            // No static window in the Codex catalog: left unclamped.
+            ("openai-codex/gpt-6.1-sol", 1_000_000),
+            ("openrouter/google/gemini-2.5-pro", 1_000_000),
+        ] {
+            runtime.set_model(model.into());
+            assert_eq!(runtime.model(), model);
+            assert_eq!(runtime.context_window(), window, "{model}");
+        }
+        runtime.set_context_window(Some(2_000_000));
+        runtime.set_model("openai-codex/gpt-6-astra".into());
+        assert_eq!(runtime.context_window(), 1_050_000);
+        runtime.set_model("claude-haiku-4-5".into());
+        assert_eq!(runtime.context_window(), 200_000);
+        runtime.set_model("openrouter/google/gemini-2.5-pro".into());
+        assert_eq!(runtime.context_window(), 2_000_000);
+        runtime.set_context_window(None);
+        for (model, window) in [
+            ("claude-haiku-4-5", 200_000),
+            ("claude-sonnet-4-6", 200_000),
+            ("openai-codex/gpt-6-astra", 1_050_000),
+        ] {
+            runtime.set_model(model.into());
+            assert_eq!(runtime.context_window(), window, "{model}");
+        }
+    }
+
+    #[test]
     fn set_model_preserves_qualified_provider_ids_and_bare_claude() {
         let cases = [
             (
@@ -6127,6 +7709,7 @@ mod tests {
             None,
             false,
             None,
+            None,
         )
         .await;
 
@@ -6146,6 +7729,7 @@ mod tests {
             },
             None,
             false,
+            None,
             None,
         )
         .await;
@@ -6175,6 +7759,7 @@ mod tests {
             Some(&handle),
             false,
             None,
+            None,
         )
         .await;
 
@@ -6199,6 +7784,7 @@ mod tests {
             crate::extensions::hooks::events::HookResult::confirm("Run deploy?"),
             Some(&handle),
             false,
+            None,
             None,
         )
         .await;
@@ -6251,6 +7837,38 @@ mod tests {
         cloned.session_allow_all().allow(&key(&["jev"]));
         assert!(parent.session_allow_all().allows_all(&key(&["jev"])));
         assert!(!independent.session_allow_all().allows_all(&key(&["jev"])));
+    }
+
+    /// The context the daemon resumes a reload-stopped worker with: the
+    /// session's own "Allow all" latch, as a turn's worker shares it, and
+    /// never set by the daemon (a session whose latch is off resumes its
+    /// worker with it off; mutant: a fresh or pre-allowed latch). Nothing
+    /// only a turn holds: no activation, MCP or extension lease, no launch
+    /// cancel, no stream channels.
+    #[test]
+    fn the_daemon_tool_context_shares_the_sessions_latch_and_holds_no_turn_lease() {
+        use std::sync::Arc;
+        let session = Runtime::new_headless();
+        let ctx = session.daemon_tool_context(None);
+        let latch = ctx.capabilities.session_allow_all.as_ref().expect("the session's latch");
+        assert!(Arc::ptr_eq(latch, session.session_allow_all()));
+        assert!(!latch.allows_all(&key(&["jev"])), "off stays off");
+        let mut worker = Runtime::new_headless();
+        // As `apply_subagent_runtime_policy` binds a resumed worker.
+        worker.inherit_session_allow_all(Some(latch));
+        assert!(!worker.session_allow_all().allows_all(&key(&["jev"])));
+        // A later "Allow all" in the session reaches the worker; the
+        // daemon itself granted nothing.
+        session.session_allow_all().allow(&key(&["jev"]));
+        assert!(worker.session_allow_all().allows_all(&key(&["jev"])));
+
+        let caps = &ctx.capabilities;
+        assert!(caps.tool_activation.is_none() && caps.mcp_leases.is_none());
+        assert!(caps.extension_leases.is_none() && caps.memory_context.is_none());
+        assert!(caps.launch_cancel.is_none() && caps.tool_register_tx.is_none());
+        assert!(ctx.channels.tx_delta.is_none() && ctx.channels.tx_events.is_none());
+        assert!(Arc::ptr_eq(caps.subagent_registry.as_ref().unwrap(), session.subagent_registry()));
+        assert!(Arc::ptr_eq(caps.event_queue.as_ref().unwrap(), session.event_queue()));
     }
 
     #[test]
@@ -6352,6 +7970,7 @@ mod tests {
                     extensions: vec!["jev".into()],
                     tool: Some("bash".into()),
                     rewritten_by: vec![],
+                    tool_call_id: None,
                 })
             );
             assert!(first.prompt.starts_with("Extension: jev\nTool: bash\n"), "{}", first.prompt);
@@ -6374,6 +7993,7 @@ mod tests {
             Some(&handle),
             false,
             Some(&latch),
+            None,
         )
         .await;
         assert!(matches!(
@@ -6387,6 +8007,7 @@ mod tests {
             Some(&handle),
             false,
             Some(&latch),
+            None,
         )
         .await;
         assert!(matches!(
@@ -6399,6 +8020,7 @@ mod tests {
             Some(&handle),
             false,
             Some(&latch),
+            None,
         )
         .await;
         assert!(
@@ -6434,13 +8056,13 @@ mod tests {
             modified_input: None,
             modified_by: vec![],
         };
-        let first = resolve_before_tool_call_result(merged(), Some(&handle), false, Some(&latch)).await;
+        let first = resolve_before_tool_call_result(merged(), Some(&handle), false, Some(&latch), None).await;
         task.await.unwrap();
         assert!(matches!(first, crate::extensions::hooks::events::HookResult::Continue));
         assert!(latch.allows_all(&key(&["a", "b"])));
         // Now fully latched: no prompt (handle dropped → would block).
         drop(handle);
-        let second = resolve_before_tool_call_result(merged(), None, false, Some(&latch)).await;
+        let second = resolve_before_tool_call_result(merged(), None, false, Some(&latch), None).await;
         assert!(matches!(second, crate::extensions::hooks::events::HookResult::Continue));
     }
 
@@ -6459,6 +8081,7 @@ mod tests {
             sourced_confirm("Run?", "jev", "bash"),
             Some(&handle),
             false,
+            None,
             None,
         )
         .await;
@@ -6494,6 +8117,7 @@ mod tests {
             Some(&handle),
             false,
             Some(&latch),
+            None,
         )
         .await;
         let (body, scope) = task.await.unwrap();
@@ -6744,6 +8368,7 @@ mod tests {
             Some(&handle),
             false,
             Some(&latch),
+            None,
         )
         .await;
         task.await.unwrap();
@@ -6768,6 +8393,7 @@ mod tests {
             None,
             false,
             Some(&latch),
+            None,
         )
         .await;
         assert!(matches!(
@@ -6779,6 +8405,7 @@ mod tests {
             None,
             false,
             Some(&latch),
+            None,
         )
         .await;
         assert!(matches!(
@@ -6790,6 +8417,7 @@ mod tests {
             None,
             false,
             Some(&latch),
+            None,
         )
         .await;
         assert!(matches!(
@@ -7681,6 +9309,40 @@ mod http_client_timeout_tests {
             start.elapsed()
         );
         assert!(err.is_timeout(), "must be a timeout: {err:?}");
+    }
+
+    /// True when a pooled connection gets its first keepalive probe before
+    /// the pool drops it as idle.
+    fn probed_before_eviction(pool: super::ProviderPool) -> bool {
+        pool.tcp_keepalive < pool.idle_timeout
+    }
+
+    /// The provider clients' pool settings (PROVISIONAL, see
+    /// `ProviderPool`). reqwest's `Client`/`ClientBuilder` `Debug` does not
+    /// show pool or keepalive settings, so the values are pinned here and
+    /// the builders all go through `ProviderPool::apply`. No sockets.
+    #[test]
+    fn provider_clients_drop_idle_connections_at_30s_after_a_keepalive_probe() {
+        assert_eq!(
+            super::PROVIDER_POOL,
+            super::ProviderPool {
+                idle_timeout: Duration::from_secs(30),
+                tcp_keepalive: Duration::from_secs(15),
+                tcp_keepalive_interval: Duration::from_secs(15),
+                tcp_keepalive_retries: 3,
+            }
+        );
+        assert!(probed_before_eviction(super::PROVIDER_POOL));
+        // A 30 s keepalive (the first draft) would never probe a pooled
+        // connection before its 30 s eviction.
+        assert!(!probed_before_eviction(super::ProviderPool {
+            tcp_keepalive: Duration::from_secs(30),
+            ..super::PROVIDER_POOL
+        }));
+        assert!(super::PROVIDER_POOL
+            .apply(reqwest::Client::builder())
+            .build()
+            .is_ok());
     }
 }
 

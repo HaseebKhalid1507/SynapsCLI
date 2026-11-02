@@ -70,6 +70,25 @@ pub const EXPECTED_RESPONSE_TOKENS: u64 = 16_384;
 /// errs toward earlier rollover by at most this much.
 pub const ZERO_BUDGET_THINKING_RESERVE_TOKENS: u64 =
     crate::core::models::DEFAULT_LEGACY_ADAPTIVE_FALLBACK as u64;
+/// The safety margin, as a percentage of the window, of a request whose
+/// footprint is calibrated: the latest provider-reported input of the
+/// current context window plus a conservative estimate of what was appended
+/// since (R1, "usable 200K"; see `stream::size_request`). Only Anthropic
+/// requests on a window of at most 200K use it; every other request keeps
+/// [`SAFETY_MARGIN_PERCENT`] on the uncalibrated estimate.
+pub const CALIBRATED_SAFETY_MARGIN_PERCENT: u64 = 5;
+
+/// The answer room a request sized to the room left keeps on top of its
+/// thinking budget (R1): its `max_tokens` never drops below
+/// `thinking budget + ANSWER_FLOOR_TOKENS` (bounded by the static cap).
+/// A request with less room than that is not admitted (hard capacity).
+///
+/// PARITY E2: the same room as upstream #341's expected output reserve
+/// ([`EXPECTED_RESPONSE_TOKENS`] on top of the thinking), so an in-scope
+/// request is admitted exactly while the room covers that reserve: the
+/// rollover timing is #341's, and the wire `max_tokens` is the room left.
+/// Ours was 24_000.
+pub const ANSWER_FLOOR_TOKENS: u64 = EXPECTED_RESPONSE_TOKENS;
 
 /// Minimum history length before compaction is meaningful. A freshly
 /// compacted session (summary + acknowledgement) sits below this gate, which
@@ -1005,10 +1024,13 @@ mod tests {
     #[test]
     fn the_output_reserve_is_a_realistic_need_not_the_max_tokens_ceiling() {
         let hard_line = |model: &str, window: u64, thinking: u64| {
-            let (assessment, budget) = crate::runtime::stream::pre_request_context_budget(
-                model, window, None, &[], &[], thinking, 30_000, None,
+            // PARITY E2: the unsized (#341) budget; an in-scope request is
+            // sized to the room left on top of it (stream::size_request).
+            let sized = crate::runtime::stream::pre_request_context_budget(
+                model, window, None, &[], &[], thinking, 30_000, None, None,
             );
-            (assessment.reserves.output_tokens, window - budget.required_next_round_tokens)
+            let budget = sized.expected_budget();
+            (sized.assessment.reserves.output_tokens, window - budget.required_next_round_tokens)
         };
         // Adaptive (0) and "high" (16,384) reserve the same envelope.
         for thinking in [0, 16_384] {
@@ -1102,7 +1124,7 @@ mod tests {
         let via_runtime = runtime.assess_context(&messages).await;
 
         let system = runtime.effective_system_prompt().await;
-        let schema = runtime.tools_shared().read().await.tools_schema();
+        let schema = runtime.exposed_tools_schema().await;
         let direct = assess(&ContextBudgetInputs {
             model: runtime.model(),
             provider_window: runtime.context_window(),
@@ -1113,10 +1135,13 @@ mod tests {
             memory_contents: &[],
             thinking_budget_tokens: runtime.thinking_budget() as u64,
             next_tool_result_bytes: runtime.max_tool_output() as u64,
-            max_output_tokens: crate::runtime::helpers::HelperMethods::max_tokens_for_model(
+            // PARITY E2: the request's own cap (CTXWIN), as assess_context passes it.
+            max_output_tokens: crate::runtime::helpers::HelperMethods::max_tokens_for_request(
                 runtime.model(),
+                runtime.context_window(),
             ),
-        });
+        })
+        .anchored(None, &messages);
 
         assert_eq!(
             via_runtime, direct,
@@ -1129,6 +1154,58 @@ mod tests {
         assert!(
             via_runtime.breakdown.system_tokens > 0,
             "actual system segment must be accounted"
+        );
+    }
+
+    /// The assessment charges the schema THIS session's request exposes: a
+    /// legacy-backend session withholds the forum tools (and a context-off
+    /// session `context_checkpoint`) that a host-shared registry still
+    /// holds, so they are not charged to it.
+    #[tokio::test]
+    async fn runtime_assessment_charges_only_the_sessions_exposed_tools() {
+        let runtime = crate::Runtime::new_headless();
+        runtime
+            .tools_shared()
+            .write()
+            .await
+            .register(Arc::new(crate::tools::context_checkpoint::ContextCheckpointTool));
+        assert!(!runtime.memory_backend_for_test().is_axel(), "fixture: legacy backend");
+        assert!(!runtime.context_management_enabled(), "fixture: context off");
+        let full = runtime.tools_shared().read().await.tools_schema();
+        let exposed = runtime.exposed_tools_schema().await;
+        let names = |schema: &[Value]| -> Vec<String> {
+            schema
+                .iter()
+                .filter_map(|entry| entry["name"].as_str().map(str::to_string))
+                .collect()
+        };
+        let withheld = ["context_checkpoint", "forum_post", "forum_read", "forum_forget"];
+        for name in withheld {
+            assert!(names(&full).iter().any(|n| n == name), "precondition: {name} registered");
+            assert!(!names(&exposed).iter().any(|n| n == name), "{name} withheld");
+        }
+        assert_eq!(full.len() - withheld.len(), exposed.len());
+
+        let messages: Vec<SharedMessage> = vec![Arc::new(json!({"role": "user", "content": "hi"}))];
+        let assessment = runtime.assess_context(&messages).await;
+        let full_schema = assess(&ContextBudgetInputs {
+            model: runtime.model(),
+            provider_window: runtime.context_window(),
+            system_prompt: runtime.effective_system_prompt().await.as_deref(),
+            tools_schema: &full,
+            messages: &messages,
+            skill_contents: &[],
+            memory_contents: &[],
+            thinking_budget_tokens: runtime.thinking_budget() as u64,
+            next_tool_result_bytes: runtime.max_tool_output() as u64,
+            max_output_tokens: crate::runtime::helpers::HelperMethods::max_tokens_for_request(
+                runtime.model(),
+                runtime.context_window(),
+            ),
+        });
+        assert!(
+            assessment.breakdown.tool_schema_tokens < full_schema.breakdown.tool_schema_tokens,
+            "withheld tools are not charged"
         );
     }
 

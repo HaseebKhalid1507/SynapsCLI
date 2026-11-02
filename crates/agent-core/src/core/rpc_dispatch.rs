@@ -87,7 +87,7 @@ pub fn map_stream_event(ev: &StreamEvent) -> Option<RpcEvent> {
                 },
             })
         }
-        StreamEvent::Llm(LlmEvent::ToolResult { tool_id, result }) => {
+        StreamEvent::Llm(LlmEvent::ToolResult { tool_id, result, .. }) => {
             Some(RpcEvent::MessageUpdate {
                 event: AssistantEvent::ToolcallResult {
                     tool_id: tool_id.clone(),
@@ -428,6 +428,8 @@ mod tests {
         let ev = StreamEvent::Llm(LlmEvent::ToolResult {
             tool_id: "tid1".to_string(),
             result: "output here".to_string(),
+            memory_only: false,
+            client_tool: None,
         });
         let rpc = map_stream_event(&ev).expect("ToolResult must produce an event");
         match rpc {

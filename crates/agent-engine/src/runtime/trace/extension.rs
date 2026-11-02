@@ -62,10 +62,12 @@ pub const EXTENSION_PROVIDER_ERROR_CODE: &str = "extension_provider_error";
 
 /// Normalize an extension-reported stop reason through a closed mapping.
 /// Unknown values collapse to `Other`; the raw string is never stored.
+/// Anthropic's `model_context_window_exceeded` is a truncation, as in
+/// [`super::anthropic::stop_reason_from_wire`].
 pub fn stop_reason_from_extension(raw: &str) -> StopReason {
     match raw {
         "end_turn" => StopReason::EndTurn,
-        "max_tokens" => StopReason::MaxTokens,
+        "max_tokens" | "model_context_window_exceeded" => StopReason::MaxTokens,
         "stop_sequence" => StopReason::StopSequence,
         "tool_use" => StopReason::ToolUse,
         "pause_turn" => StopReason::PauseTurn,

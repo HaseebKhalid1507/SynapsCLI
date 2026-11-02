@@ -60,6 +60,159 @@ pub struct TurnBudget {
     /// value of `0` means no graceful continuation (immediate hard stop). Only
     /// matters when `max_provider_rounds` is configured.
     pub max_round_renewals: u32,
+    /// A worker run's fixed wall clock (`None` for every other runtime).
+    /// With one, every turn checks the run's single deadline as well as its
+    /// own `max_elapsed`. The worker's configured `max_elapsed` is already
+    /// part of the clock, so the turn's own limit only ends a turn first when
+    /// a budget was narrowed below the clock (an event turn, via
+    /// [`TurnBudget::tighter`]).
+    pub run_clock: Option<RunClock>,
+}
+
+/// A worker run's fixed wall clock (`docs/specs/subagent-context-rollover.md`
+/// §5): one monotonic run start, and the run's absolute deadline, the earlier
+/// of that start plus the worker's timeout and that start plus its
+/// configured `max_elapsed`. A context rollover never renews it and a
+/// wall-clock expiry is never a time checkpoint: the run stops.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunClock {
+    started: tokio::time::Instant,
+    deadline: Option<tokio::time::Instant>,
+    /// Test seam: a controlled clock's key ([`Self::controlled`]); 0 reads
+    /// the real time.
+    #[cfg(test)]
+    seam: u64,
+}
+
+/// Test seam: the time a controlled [`RunClock`] reads is the real time
+/// plus what its test advanced it by, so a test decides when its deadline
+/// passes (an explicit phase) instead of sleeping past it.
+#[cfg(test)]
+mod clock_seam {
+    use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Mutex, PoisonError};
+    use std::time::Duration;
+
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    static SKEW: Mutex<BTreeMap<u64, Duration>> = Mutex::new(BTreeMap::new());
+
+    pub(super) fn key() -> u64 {
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    }
+
+    pub(super) fn skew(key: u64) -> Duration {
+        if key == 0 {
+            return Duration::ZERO;
+        }
+        SKEW.lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&key)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    pub(super) fn advance(key: u64, by: Duration) {
+        *SKEW
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(key)
+            .or_default() += by;
+    }
+}
+
+impl RunClock {
+    /// Start a run's clock now. `timeout` `None` or zero is no timeout;
+    /// `max_elapsed` zero is exhausted at once, as for a turn.
+    pub fn start(timeout: Option<Duration>, max_elapsed: Option<Duration>) -> Self {
+        Self::started_at(tokio::time::Instant::now(), timeout, max_elapsed)
+    }
+
+    /// [`Self::start`] at `started`. A limit too far ahead to represent is
+    /// no limit.
+    pub fn started_at(
+        started: tokio::time::Instant,
+        timeout: Option<Duration>,
+        max_elapsed: Option<Duration>,
+    ) -> Self {
+        let limit = [timeout.filter(|d| !d.is_zero()), max_elapsed]
+            .into_iter()
+            .flatten()
+            .min();
+        Self {
+            started,
+            deadline: limit.and_then(|d| started.checked_add(d)),
+            #[cfg(test)]
+            seam: 0,
+        }
+    }
+
+    /// The time this clock reads: the monotonic now (in tests, plus what a
+    /// controlled clock was advanced by).
+    fn now(&self) -> tokio::time::Instant {
+        let now = tokio::time::Instant::now();
+        #[cfg(test)]
+        let now = now + clock_seam::skew(self.seam);
+        now
+    }
+
+    /// Test seam: this clock, controlled. Its copies (the runtime's, the
+    /// meter's) all read the same advanced time.
+    #[cfg(test)]
+    pub(crate) fn controlled(mut self) -> Self {
+        self.seam = clock_seam::key();
+        self
+    }
+
+    /// Test seam: move a [`Self::controlled`] clock's time forward by `by`.
+    #[cfg(test)]
+    pub(crate) fn advance(&self, by: Duration) {
+        assert_ne!(self.seam, 0, "advance needs a controlled clock");
+        clock_seam::advance(self.seam, by);
+    }
+
+    pub fn started(&self) -> tokio::time::Instant {
+        self.started
+    }
+
+    /// The run deadline; `None` = no limit.
+    pub fn deadline(&self) -> Option<tokio::time::Instant> {
+        self.deadline
+    }
+
+    /// The run deadline on the monotonic clock that request timers and
+    /// body gates read (`tokio::time::Instant::now()`): exactly
+    /// [`Self::deadline`], the run's own instant, never rebuilt from the
+    /// time remaining. A controlled test clock converts the time it was
+    /// advanced by (as of this call) into an earlier instant.
+    pub fn timer_deadline(&self) -> Option<tokio::time::Instant> {
+        let deadline = self.deadline;
+        #[cfg(test)]
+        let deadline = deadline.map(|d| {
+            d.checked_sub(clock_seam::skew(self.seam))
+                .unwrap_or_else(tokio::time::Instant::now)
+        });
+        deadline
+    }
+
+    /// The run's time limit, from its start to its deadline.
+    pub fn limit(&self) -> Option<Duration> {
+        self.deadline.map(|d| d.duration_since(self.started))
+    }
+
+    pub fn expired(&self) -> bool {
+        self.deadline.is_some_and(|d| self.now() >= d)
+    }
+
+    /// The time left until the deadline (zero once it has passed); `None`
+    /// = no limit.
+    pub fn remaining(&self) -> Option<Duration> {
+        self.deadline.map(|d| d.saturating_duration_since(self.now()))
+    }
+
+    pub fn elapsed(&self) -> Duration {
+        self.now().saturating_duration_since(self.started)
+    }
 }
 
 /// Execution role a turn runs under.
@@ -97,6 +250,7 @@ impl TurnBudget {
                 // A human is watching and can interrupt; let long agentic
                 // tasks continue through several checkpoints.
                 max_round_renewals: 8,
+                run_clock: None,
             },
             // Same numbers as the watcher; configured separately.
             TurnRole::Autonomous | TurnRole::Event => Self {
@@ -110,6 +264,7 @@ impl TurnBudget {
                 // Nobody is watching: no graceful extension — the round cap
                 // is a hard stop.
                 max_round_renewals: 0,
+                run_clock: None,
             },
             TurnRole::Worker => Self {
                 max_provider_rounds: Some(64),
@@ -122,6 +277,7 @@ impl TurnBudget {
                 // Bounded delegation under a supervising turn: 64 x (1 + 2)
                 // = 192 rounds.
                 max_round_renewals: 2,
+                run_clock: None,
             },
         }
     }
@@ -150,6 +306,10 @@ impl TurnBudget {
             max_cost_usd: min(self.max_cost_usd, other.max_cost_usd),
             max_total_tokens: min(self.max_total_tokens, other.max_total_tokens),
             max_round_renewals: self.max_round_renewals.min(other.max_round_renewals),
+            // Only a worker's runtime has a run clock (§5), and an event
+            // role's budget never does: whichever budget carries one keeps it,
+            // and the narrowed `max_elapsed` above still bounds the turn.
+            run_clock: self.run_clock.or(other.run_clock),
         }
     }
 
@@ -259,6 +419,31 @@ pub struct UsageCounters {
     /// Number of requests booked; lets a caller tell whether the latest
     /// footprint belongs to the request it just sent.
     records: std::sync::atomic::AtomicU64,
+    /// Cost held for side requests whose spend is not (yet) measured: an
+    /// allowance reserved before sending, released when the provider reports
+    /// usage, kept as a conservative charge when it never does. Distinct
+    /// from the measured `cost_nanodollars`.
+    reserved_nanodollars: std::sync::atomic::AtomicU64,
+    /// Context footprint of the first request booked since
+    /// [`Self::watch_first_context`] (telemetry: a request's first reported
+    /// attempt, even if that attempt then failed or was retried).
+    first_context: std::sync::Mutex<FirstContext>,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum FirstContext {
+    #[default]
+    Idle,
+    Watching,
+    Seen(u64),
+}
+
+/// A cost allowance held in [`UsageCounters`]; see
+/// [`UsageCounters::reserve`].
+#[derive(Debug)]
+#[must_use = "settle or keep the reservation explicitly"]
+pub struct CostReservation {
+    units: u64,
 }
 
 impl UsageCounters {
@@ -285,22 +470,187 @@ impl UsageCounters {
             cache_write_5m,
             cache_write_1h,
         );
-        let units = cost * 1_000_000_000.0;
-        let units = if !units.is_finite() || units < 0.0 {
-            u64::MAX
-        } else {
-            units.ceil() as u64
-        };
-        Self::saturating_add(&self.cost_nanodollars, units);
+        self.book_cost_and_tokens(cost, input, output, cache_read, cache_write);
+        let context = input.saturating_add(cache_read).saturating_add(cache_write);
+        self.latest_context_tokens.store(context, Ordering::Relaxed);
+        Self::saturating_add(&self.records, 1);
+        let mut first = self
+            .first_context
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *first == FirstContext::Watching {
+            *first = FirstContext::Seen(context);
+        }
+    }
+
+    /// Start recording the footprint of the next booked request.
+    pub fn watch_first_context(&self) {
+        *self
+            .first_context
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = FirstContext::Watching;
+    }
+
+    /// The footprint of the first request booked since the last
+    /// [`Self::watch_first_context`], if any; stops watching.
+    pub fn take_first_context(&self) -> Option<u64> {
+        match std::mem::take(
+            &mut *self
+                .first_context
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        ) {
+            FirstContext::Seen(tokens) => Some(tokens),
+            FirstContext::Idle | FirstContext::Watching => None,
+        }
+    }
+
+    /// Book a side request (a rollover summary) into the cost and token
+    /// totals only. The latest context footprint and the request count
+    /// describe the conversation's own requests (context-token budget,
+    /// calibration), so a side request leaves them unchanged.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_priced_auxiliary(
+        &self,
+        model: &str,
+        input: u64,
+        output: u64,
+        cache_read: u64,
+        cache_write: u64,
+        cache_write_5m: Option<u64>,
+        cache_write_1h: Option<u64>,
+    ) {
+        let cost = agent_core::pricing::calculate_cost_optional_split(
+            model,
+            input,
+            output,
+            cache_read,
+            cache_write,
+            cache_write_5m,
+            cache_write_1h,
+        );
+        self.book_cost_and_tokens(cost, input, output, cache_read, cache_write);
+    }
+
+    fn book_cost_and_tokens(
+        &self,
+        cost: f64,
+        input: u64,
+        output: u64,
+        cache_read: u64,
+        cache_write: u64,
+    ) {
+        Self::saturating_add(&self.cost_nanodollars, Self::nanodollars(cost));
         Self::saturating_add(&self.input_tokens, input);
         Self::saturating_add(&self.output_tokens, output);
         Self::saturating_add(&self.cache_read_tokens, cache_read);
         Self::saturating_add(&self.cache_write_tokens, cache_write);
-        self.latest_context_tokens.store(
-            input.saturating_add(cache_read).saturating_add(cache_write),
-            Ordering::Relaxed,
-        );
-        Self::saturating_add(&self.records, 1);
+    }
+
+    /// Hold `usd` of the cost budget before sending a request whose spend
+    /// is only known afterwards.
+    pub fn reserve(&self, usd: f64) -> CostReservation {
+        let units = Self::nanodollars(usd);
+        Self::saturating_add(&self.reserved_nanodollars, units);
+        CostReservation { units }
+    }
+
+    /// Hold `usd` only if measured plus reserved cost stays within
+    /// `max_usd` (no limit: always): the check and the hold are one atomic
+    /// step, so two callers can never both pass on the same remainder.
+    /// `None`: not affordable (or `usd` is not a finite non-negative cost);
+    /// nothing is held.
+    ///
+    /// What it guarantees: the caller's own worst case fits against the
+    /// measured and held cost known when it reserves. It is atomic among
+    /// reservers only, not against [`Self::record_priced`] and the other
+    /// measured writers: unreserved spend booked meanwhile (an ordinary
+    /// turn's usage) is not held off and can still take the total past the
+    /// limit, as it could without reservations; the next `try_reserve`
+    /// counts it. Settle by booking the measured spend first, then
+    /// [`Self::release`] (which saturates at zero).
+    pub fn try_reserve(&self, usd: f64, max_usd: Option<f64>) -> Option<CostReservation> {
+        use std::sync::atomic::Ordering;
+        if !usd.is_finite() || usd < 0.0 {
+            return None;
+        }
+        let units = Self::nanodollars(usd);
+        let Some(max) = max_usd else {
+            Self::saturating_add(&self.reserved_nanodollars, units);
+            return Some(CostReservation { units });
+        };
+        // Floor the limit: a remainder is never rounded up in the caller's
+        // favour.
+        let limit = if max.is_finite() && max >= 0.0 {
+            (max * 1_000_000_000.0).floor() as u64
+        } else if max == f64::INFINITY {
+            u64::MAX
+        } else {
+            return None;
+        };
+        self.reserved_nanodollars
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |held| {
+                let measured = self.cost_nanodollars.load(Ordering::Acquire);
+                let committed = measured.checked_add(held)?.checked_add(units)?;
+                (committed <= limit).then_some(held + units)
+            })
+            .ok()
+            .map(|_| CostReservation { units })
+    }
+
+    /// The provider reported the spend (booked separately): release the
+    /// held allowance.
+    pub fn release(&self, reservation: CostReservation) {
+        use std::sync::atomic::Ordering;
+        let _ =
+            self.reserved_nanodollars
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |held| {
+                    Some(held.saturating_sub(reservation.units))
+                });
+    }
+
+    /// The spend is unknown (canceled, timed out, failed without usage):
+    /// the held allowance stays charged for the rest of the turn.
+    pub fn keep(&self, reservation: CostReservation) {
+        let _ = reservation;
+    }
+
+    /// Cost still held by reservations, in USD.
+    pub fn reserved_usd(&self) -> f64 {
+        Self::usd(
+            self.reserved_nanodollars
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
+    /// Measured plus reserved cost: what the cost budget is checked against.
+    pub fn committed_cost_usd(&self) -> f64 {
+        let measured = self
+            .cost_nanodollars
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let reserved = self
+            .reserved_nanodollars
+            .load(std::sync::atomic::Ordering::Relaxed);
+        Self::usd(measured.saturating_add(reserved))
+    }
+
+    /// USD to nanodollars, rounded up; not finite or negative saturates
+    /// (fail closed against any finite budget).
+    pub(crate) fn nanodollars(usd: f64) -> u64 {
+        let units = usd * 1_000_000_000.0;
+        if !units.is_finite() || units < 0.0 {
+            u64::MAX
+        } else {
+            units.ceil() as u64
+        }
+    }
+
+    fn usd(units: u64) -> f64 {
+        if units == u64::MAX {
+            f64::MAX
+        } else {
+            units as f64 / 1_000_000_000.0
+        }
     }
 
     pub fn records(&self) -> u64 {
@@ -376,7 +726,23 @@ impl TurnBudgetMeter {
         self.budget = budget;
     }
 
+    /// Whether this turn (segment) has used its `max_elapsed`, or, on a run
+    /// clock, the run's deadline has passed: both deadlines hold (strict r1
+    /// A-SF). A worker turn starts no earlier than its run and the clock
+    /// already holds the worker's `max_elapsed`, so on a run clock the
+    /// turn's own limit comes first only when its budget was narrowed below
+    /// the clock (a worker's event turn).
     pub(crate) fn wall_clock_exceeded(&self) -> bool {
+        self.turn_time_exceeded()
+            || self
+                .budget
+                .run_clock
+                .as_ref()
+                .is_some_and(RunClock::expired)
+    }
+
+    /// Whether this turn (segment) has used its own `max_elapsed`.
+    fn turn_time_exceeded(&self) -> bool {
         self.budget
             .max_elapsed
             .is_some_and(|max| self.started.elapsed() >= max)
@@ -385,8 +751,24 @@ impl TurnBudgetMeter {
     /// A successfully committed durable context successor starts a new time
     /// segment. Never call on an attempted/failed save or a model checkpoint.
     /// Cumulative resource/cost limits and round renewals remain unchanged.
+    /// On a run clock nothing changes: a worker's rollover never renews its
+    /// run deadline.
     pub(crate) fn start_context_segment(&mut self) {
-        self.started = Instant::now();
+        if self.budget.run_clock.is_none() {
+            self.started = Instant::now();
+        }
+    }
+
+    /// Whether a wall-clock expiry may become a context time checkpoint
+    /// (archive the head, continue in a fresh segment) instead of a stop.
+    /// Never on a run clock: the run stops at its deadline.
+    pub(crate) fn time_checkpoints(&self) -> bool {
+        self.budget.run_clock.is_none() && self.budget.has_time_limit()
+    }
+
+    /// Whether this meter reads a worker run's fixed clock.
+    pub(crate) fn on_run_clock(&self) -> bool {
+        self.budget.run_clock.is_some()
     }
 
     /// Charge one provider round. Checked BEFORE the provider call:
@@ -427,22 +809,39 @@ impl TurnBudgetMeter {
         self.round_renewals
     }
 
-    /// Wall-clock consumed by this turn so far. Diagnostics only — the
-    /// enforcement path uses [`Self::wall_clock_exceeded`].
+    /// Wall-clock consumed by this turn so far (on a run clock: since the
+    /// run's start). Diagnostics only — the enforcement path uses
+    /// [`Self::wall_clock_exceeded`].
     pub fn elapsed(&self) -> Duration {
-        self.started.elapsed()
+        match &self.budget.run_clock {
+            Some(clock) => clock.elapsed(),
+            None => self.started.elapsed(),
+        }
     }
 
     /// Metadata-only diagnostic; preserve the typed outcome for every frontend
     /// and autonomous driver. Exhaustion is a local stop, not provider fallback.
     pub fn exhaustion_error(&self, dimension: BudgetDimension) -> agent_core::TurnError {
         let mut error = agent_core::TurnError::budget(dimension);
-        if dimension == BudgetDimension::WallClock {
+        // The run's deadline, unless only the turn's own (narrower) limit
+        // has run out: that stop is worded as the turn's.
+        let run_stop = self
+            .budget
+            .run_clock
+            .filter(|clock| clock.expired() || !self.turn_time_exceeded());
+        if let (BudgetDimension::WallClock, Some(clock)) = (dimension, &run_stop) {
+            error.message = format!(
+                "worker run stopped at its {}s deadline (ran {}s). A context rollover does not extend it; \
+                 the deadline is the earlier of the worker's timeout and turn_budget.worker.max_elapsed_secs.",
+                clock.limit().map_or(0, |d| d.as_secs()),
+                self.elapsed().as_secs(),
+            );
+        } else if dimension == BudgetDimension::WallClock {
             error.message = format!(
                 "turn stopped at its {}s time limit (ran {}s). History is kept; send a prompt to continue. \
                  The limit comes from turn_budget.<role>.max_elapsed_secs or /budget time; /budget time off removes it.",
                 self.budget.max_elapsed_secs().unwrap_or(0),
-                self.elapsed().as_secs(),
+                self.started.elapsed().as_secs(),
             );
         }
         error
@@ -502,7 +901,8 @@ impl TurnBudgetMeter {
             }
         }
         if let Some(max_cost) = self.budget.max_cost_usd {
-            if usage.cost_usd() > max_cost {
+            // Reservations held for unmeasured side requests count too.
+            if usage.committed_cost_usd() > max_cost {
                 return Err(BudgetDimension::CostUsd);
             }
         }
@@ -550,6 +950,129 @@ mod tests {
         assert_eq!(meter.tool_calls_used(), 3);
         meter.begin_round().unwrap();
         assert_eq!(meter.rounds_used(), 3);
+    }
+
+    #[test]
+    fn reservations_count_against_the_cost_budget_but_stay_unmeasured() {
+        let usage = UsageCounters::default();
+        let mut budget = TurnBudget::for_role(TurnRole::Foreground);
+        budget.max_cost_usd = Some(1.0);
+        let meter = TurnBudgetMeter::new(budget);
+        let held = usage.reserve(0.6);
+        assert_eq!(usage.cost_usd(), 0.0, "a reservation is not measured spend");
+        assert!((usage.committed_cost_usd() - 0.6).abs() < 1e-9);
+        assert_eq!(meter.check_usage(&usage), Ok(()));
+        let kept = usage.reserve(0.6);
+        assert_eq!(meter.check_usage(&usage), Err(BudgetDimension::CostUsd));
+        usage.release(held);
+        assert!((usage.reserved_usd() - 0.6).abs() < 1e-9);
+        usage.keep(kept);
+        assert!(
+            (usage.committed_cost_usd() - 0.6).abs() < 1e-9,
+            "unknown spend stays held"
+        );
+        assert_eq!(usage.totals(), (0, 0, 0, 0));
+    }
+
+    #[test]
+    fn a_reservation_is_checked_and_taken_in_one_step() {
+        let usage = UsageCounters::default();
+        // Without a cost limit every reservation is taken.
+        let free = usage.try_reserve(5.0, None).expect("no limit");
+        usage.release(free);
+        // Earlier reservations count, and the limit is inclusive.
+        let first = usage.try_reserve(0.5, Some(1.0)).expect("fits");
+        assert!(
+            usage.try_reserve(0.6, Some(1.0)).is_none(),
+            "over the limit"
+        );
+        assert!(
+            (usage.reserved_usd() - 0.5).abs() < 1e-9,
+            "a refusal holds nothing"
+        );
+        let second = usage.try_reserve(0.5, Some(1.0)).expect("exactly fits");
+        usage.release(first);
+        usage.release(second);
+        // Measured spend counts too (10k Sonnet output tokens: about $0.15).
+        usage.record_priced_auxiliary("claude-sonnet-4-6", 0, 10_000, 0, 0, None, None);
+        assert!(usage.cost_usd() > 0.1);
+        assert!(usage.try_reserve(0.9, Some(1.0)).is_none());
+        usage.release(usage.try_reserve(0.8, Some(1.0)).expect("fits"));
+        assert!(usage.try_reserve(f64::NAN, Some(1.0)).is_none());
+        assert!(usage.try_reserve(-1.0, Some(1.0)).is_none());
+
+        // Concurrent callers: exactly as many as fit get one.
+        let usage = std::sync::Arc::new(UsageCounters::default());
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let taken: Vec<_> = (0..8)
+            .map(|_| {
+                let usage = std::sync::Arc::clone(&usage);
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    usage.try_reserve(0.3, Some(1.0))
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|t| t.join().unwrap())
+            .collect();
+        assert_eq!(taken.iter().filter(|r| r.is_some()).count(), 3);
+        assert!((usage.reserved_usd() - 0.9).abs() < 1e-9);
+        for reservation in taken.into_iter().flatten() {
+            usage.release(reservation);
+        }
+    }
+
+    /// What a reservation guarantees, and what it does not. Settling
+    /// books, then releases: the held total drops to the other holders'
+    /// and never below zero. A measured write by another thread while a
+    /// reservation is held counts in the next `try_reserve`. Unreserved
+    /// spend is not held off: measured plus held can pass the limit, and
+    /// then nothing more is reserved.
+    #[test]
+    fn a_settled_reservation_books_then_releases_and_measured_spend_counts_next() {
+        let usage = std::sync::Arc::new(UsageCounters::default());
+        let limit = Some(1.0);
+        let a = usage.try_reserve(0.4, limit).expect("fits");
+        let b = usage.try_reserve(0.2, limit).expect("fits");
+        // Settle `a`: book its measured spend (10k Sonnet output tokens),
+        // then release its hold.
+        usage.record_priced_auxiliary("claude-sonnet-4-6", 0, 10_000, 0, 0, None, None);
+        let measured = usage.cost_usd();
+        assert!(measured > 0.1);
+        usage.release(a);
+        assert!((usage.reserved_usd() - 0.2).abs() < 1e-9, "only b is held");
+        assert!((usage.committed_cost_usd() - (measured + 0.2)).abs() < 1e-9);
+        usage.release(b);
+        assert_eq!(usage.reserved_usd(), 0.0);
+        usage.release(CostReservation { units: u64::MAX });
+        assert_eq!(usage.reserved_usd(), 0.0, "the held total never goes below zero");
+
+        // Another writer books while a reservation is held.
+        let held = usage.try_reserve(0.5, limit).expect("fits");
+        let writer = {
+            let usage = std::sync::Arc::clone(&usage);
+            std::thread::spawn(move || {
+                usage.record_priced_auxiliary("claude-sonnet-4-6", 0, 20_000, 0, 0, None, None)
+            })
+        };
+        writer.join().unwrap();
+        let measured = usage.cost_usd();
+        let remainder = 1.0 - measured - 0.5;
+        assert!(remainder > 0.02, "{remainder}");
+        assert!(
+            usage.try_reserve(remainder + 0.01, limit).is_none(),
+            "the measured write counts"
+        );
+        usage.release(usage.try_reserve(remainder - 0.01, limit).expect("the rest fits"));
+
+        // Unreserved spend is not held off by the reservation.
+        usage.record_priced_auxiliary("claude-sonnet-4-6", 0, 10_000, 0, 0, None, None);
+        assert!(usage.committed_cost_usd() > 1.0, "the limit can be passed");
+        assert!(usage.try_reserve(0.0, limit).is_none(), "then nothing more is reserved");
+        usage.release(held);
+        assert_eq!(usage.reserved_usd(), 0.0);
     }
 
     #[test]
@@ -1080,6 +1603,161 @@ mod tests {
         assert_eq!(meter.round_renewals_used(), 2);
     }
 
+    /// D (§5): a worker run's deadline is the earlier of its timeout and its
+    /// configured `max_elapsed`, both from one run start (timeout zero: none).
+    #[test]
+    fn d1_a_run_clock_ends_at_the_earlier_of_timeout_and_max_elapsed() {
+        let t0 = tokio::time::Instant::now();
+        let s = Duration::from_secs;
+        let at = |timeout, max| RunClock::started_at(t0, timeout, max).deadline();
+        assert_eq!(at(Some(s(10)), Some(s(3))), Some(t0 + s(3)));
+        assert_eq!(at(Some(s(3)), Some(s(10))), Some(t0 + s(3)));
+        assert_eq!(at(Some(s(7)), None), Some(t0 + s(7)));
+        assert_eq!(at(None, Some(s(5))), Some(t0 + s(5)));
+        assert_eq!(at(Some(s(0)), Some(s(5))), Some(t0 + s(5)), "timeout 0 is none");
+        assert_eq!(at(Some(s(0)), None), None);
+        assert_eq!(at(None, None), None);
+        assert_eq!(at(None, Some(Duration::ZERO)), Some(t0), "zero max_elapsed: at once");
+        assert_eq!(at(Some(Duration::MAX), None), None, "unrepresentable: no limit");
+        let clock = RunClock::started_at(t0, Some(s(10)), Some(s(3)));
+        assert_eq!((clock.started(), clock.limit()), (t0, Some(s(3))));
+    }
+
+    /// D (§5): a worker run's clock is never renewed by a committed
+    /// rollover, never turns into a time checkpoint, and resets no counter.
+    #[test]
+    fn d2_a_run_clock_is_never_renewed_and_never_a_time_checkpoint() {
+        let started = tokio::time::Instant::now() - Duration::from_secs(10);
+        let mut meter = TurnBudgetMeter::new(TurnBudget {
+            // Part of the clock when it is started; the meter reads the clock.
+            max_elapsed: Some(Duration::from_secs(3600)),
+            run_clock: Some(RunClock::started_at(started, Some(Duration::from_secs(5)), None)),
+            ..TurnBudget::for_role(TurnRole::Worker)
+        });
+        meter.charge_tool_calls(3);
+        meter.charge_tool_result_bytes(1234).unwrap();
+        meter.try_renew_rounds();
+        let original = meter.budget().clone();
+        assert!(meter.wall_clock_exceeded(), "the run's deadline, not a turn clock");
+        assert!(!meter.time_checkpoints());
+        assert_eq!(meter.begin_round(), Err(BudgetDimension::WallClock));
+        meter.start_context_segment();
+        assert!(meter.wall_clock_exceeded(), "a committed rollover renews nothing");
+        assert_eq!(meter.begin_round(), Err(BudgetDimension::WallClock));
+        assert_eq!(meter.budget(), &original);
+        assert_eq!(meter.tool_calls_used(), 3);
+        assert_eq!(meter.tool_result_bytes_used(), 1234);
+        assert_eq!(meter.round_renewals_used(), 1);
+        assert!(meter.elapsed() >= Duration::from_secs(10), "elapsed since the run start");
+        let error = meter.exhaustion_error(BudgetDimension::WallClock);
+        assert_eq!(
+            error.outcome,
+            agent_core::TurnOutcome::BudgetExceeded {
+                dimension: BudgetDimension::WallClock
+            }
+        );
+        assert!(error.message.contains("its 5s deadline"), "{}", error.message);
+
+        // A run clock without a deadline never runs out by itself and never
+        // checkpoints on time; a turn's own `max_elapsed` (a budget narrowed
+        // below the clock) still ends that turn (strict r1 A-SF).
+        let mut open = TurnBudgetMeter::new(TurnBudget {
+            max_elapsed: Some(Duration::from_secs(1)),
+            run_clock: Some(RunClock::started_at(started, None, None)),
+            ..TurnBudget::for_role(TurnRole::Worker)
+        });
+        assert!(!open.wall_clock_exceeded());
+        assert!(!open.time_checkpoints());
+        assert_eq!(open.begin_round(), Ok(()));
+        open.started = Instant::now() - Duration::from_secs(2);
+        assert!(open.wall_clock_exceeded(), "the turn's own limit");
+        assert!(!open.time_checkpoints());
+    }
+
+    /// Strict r1 A-SF: a clock-bearing worker's event turn keeps BOTH
+    /// deadlines. `tighter` keeps the run clock and narrows `max_elapsed` to
+    /// the event limit; whichever comes first ends the turn, and the stop is
+    /// worded by the deadline that passed.
+    #[test]
+    fn a_run_clock_turn_narrowed_below_its_clock_stops_at_the_shorter_limit() {
+        let hour = Duration::from_secs(3600);
+        let minute = Duration::from_secs(60);
+        let worker = TurnBudget {
+            max_elapsed: Some(hour),
+            run_clock: Some(RunClock::start(Some(hour), Some(hour))),
+            ..TurnBudget::for_role(TurnRole::Worker)
+        };
+        let event = TurnBudget {
+            max_elapsed: Some(minute),
+            ..TurnBudget::for_role(TurnRole::Event)
+        };
+        let narrowed = worker.tighter(&event);
+        assert_eq!(narrowed.run_clock, worker.run_clock, "the run clock is kept");
+        assert_eq!(narrowed.max_elapsed, Some(minute), "narrowed to the event limit");
+
+        // The event turn's minute passes long before the run's hour.
+        let mut meter = TurnBudgetMeter::new(narrowed.clone());
+        assert_eq!(meter.begin_round(), Ok(()));
+        meter.started = Instant::now() - Duration::from_secs(61);
+        assert!(meter.wall_clock_exceeded(), "the event turn's own limit");
+        assert_eq!(meter.begin_round(), Err(BudgetDimension::WallClock));
+        assert!(!meter.time_checkpoints(), "still never a checkpoint on a run clock");
+        let message = meter.exhaustion_error(BudgetDimension::WallClock).message;
+        assert!(message.contains("turn stopped at its 60s time limit (ran 61s)"), "{message}");
+
+        // The run's deadline still ends the turn when it comes first.
+        let clock = RunClock::start(Some(hour), Some(hour)).controlled();
+        let mut meter = TurnBudgetMeter::new(TurnBudget {
+            run_clock: Some(clock),
+            ..narrowed
+        });
+        assert_eq!(meter.begin_round(), Ok(()));
+        clock.advance(hour);
+        assert_eq!(meter.begin_round(), Err(BudgetDimension::WallClock));
+        let message = meter.exhaustion_error(BudgetDimension::WallClock).message;
+        assert!(message.contains("worker run stopped at its 3600s deadline"), "{message}");
+    }
+
+    /// The test seam: a controlled clock's deadline passes when its test
+    /// advances it, in every copy (the meter's included), and only there.
+    #[test]
+    fn a_controlled_run_clock_moves_only_when_advanced() {
+        let t0 = tokio::time::Instant::now();
+        let hour = Duration::from_secs(3600);
+        let real = RunClock::started_at(t0, Some(hour), None);
+        let clock = real.controlled();
+        let mut meter = TurnBudgetMeter::new(TurnBudget {
+            run_clock: Some(clock),
+            ..TurnBudget::for_role(TurnRole::Worker)
+        });
+        assert!(!clock.expired());
+        assert_eq!(meter.begin_round(), Ok(()));
+        clock.advance(hour);
+        assert!(clock.expired(), "at its deadline");
+        assert!(meter.wall_clock_exceeded(), "the meter's copy moved too");
+        assert_eq!(meter.begin_round(), Err(BudgetDimension::WallClock));
+        assert!(meter.elapsed() >= hour);
+        assert!(!real.expired(), "an uncontrolled clock reads the real time");
+        assert!(!real.controlled().expired(), "each controlled clock moves alone");
+    }
+
+    /// D (§5): request timers and body gates get the run's own deadline
+    /// instant. A controlled clock converts the time it was advanced by
+    /// into an earlier instant on the real monotonic clock.
+    #[test]
+    fn the_timer_deadline_is_the_run_deadline() {
+        let t0 = tokio::time::Instant::now();
+        let s = Duration::from_secs;
+        let clock = RunClock::started_at(t0, Some(s(60)), None);
+        assert_eq!(clock.timer_deadline(), clock.deadline(), "unchanged");
+        assert_eq!(RunClock::started_at(t0, None, None).timer_deadline(), None);
+        let controlled = clock.controlled();
+        assert_eq!(controlled.timer_deadline(), clock.deadline(), "not advanced yet");
+        controlled.advance(s(45));
+        assert_eq!(controlled.timer_deadline(), Some(t0 + s(15)));
+        assert_eq!(clock.timer_deadline(), clock.deadline(), "each clock alone");
+    }
+
     #[test]
     fn wall_clock_still_bounds_a_renewed_turn() {
         let mut meter = TurnBudgetMeter::new(TurnBudget {
@@ -1124,6 +1802,22 @@ mod tests {
             meter.charge_tool_result_bytes(1),
             Err(BudgetDimension::ToolResultBytes)
         );
+    }
+
+    #[test]
+    fn first_context_is_the_first_booking_after_watch_and_side_requests_do_not_count() {
+        let usage = UsageCounters::default();
+        usage.record_priced("claude-sonnet-4-5", 1, 0, 0, 0, None, None);
+        assert_eq!(usage.take_first_context(), None, "not watching");
+        usage.watch_first_context();
+        assert_eq!(usage.take_first_context(), None, "nothing booked yet");
+        usage.watch_first_context();
+        usage.record_priced_auxiliary("claude-sonnet-4-5", 9, 0, 0, 0, None, None);
+        usage.record_priced("claude-sonnet-4-5", 100, 5, 10, 5, None, None);
+        usage.record_priced("claude-sonnet-4-5", 200, 5, 0, 0, None, None);
+        assert_eq!(usage.take_first_context(), Some(115), "first attempt wins");
+        assert_eq!(usage.take_first_context(), None, "taken once");
+        assert_eq!(usage.latest_context_tokens(), 200);
     }
 
     #[test]

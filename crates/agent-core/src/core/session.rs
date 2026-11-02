@@ -42,6 +42,19 @@ pub struct Session {
     pub total_cache_read_tokens: u64,
     #[serde(default, skip_serializing_if = "is_zero_tokens")]
     pub total_cache_creation_tokens: u64,
+    /// Spend of the session's subagents, at any depth (child spend),
+    /// already INCLUDED in `session_cost`; persisted so a restored session
+    /// still labels it. Absent (0) on sessions whose subagents never booked.
+    ///
+    /// SNAPSHOT-ONLY, like `keepwarm_cost` (never journaled, for the same
+    /// reason): as of the last snapshot; load clamps it to `session_cost`.
+    #[serde(default, skip_serializing_if = "is_zero_cost")]
+    pub child_cost: f64,
+    /// The child share's tokens (the keep-warm subtotal's shape), already
+    /// INCLUDED in the token totals. SNAPSHOT-ONLY, like `keepwarm_tokens`;
+    /// clamped on load to the totals that survive a reload.
+    #[serde(default, skip_serializing_if = "KeepwarmTokens::is_zero")]
+    pub child_tokens: KeepwarmTokens,
     /// Persisted listing hint: `api_messages.len()` at save time. Declared
     /// BEFORE `api_messages` so it lands in the header that
     /// `read_session_header` reads without touching the message array.
@@ -67,7 +80,27 @@ pub struct Session {
     /// Declared before `api_messages` so `read_session_header` sees it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub env_stripped: Vec<String>,
+    /// Set on a session made by `fork` from another live session: where it
+    /// came from. A session that has it can't fork. Declared before
+    /// `api_messages` so `read_session_header` sees it.
+    ///
+    /// SNAPSHOT-ONLY, like `keepwarm_cost` (never journaled, for the same
+    /// reason). It is written once, by the fork's first save (a full
+    /// snapshot), and never changes after.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forked_from: Option<ForkedFrom>,
     pub api_messages: Vec<SharedMessage>,
+    /// Client tool stamps by `tool_use_id` (client tools contract §8), for
+    /// the tool results in `api_messages` only: saved next to the messages,
+    /// never inside them, so no provider, summary or keep-warm request can
+    /// carry one. [`Session::retain_client_tool_stamps`] drops an entry once
+    /// its id leaves the history; [`Session::client_tool_stamps_of`] is what
+    /// a client is given with a history.
+    ///
+    /// SNAPSHOT-ONLY, like `keepwarm_cost` (never journaled, for the same
+    /// reason): in journal mode, as of the last snapshot.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub client_tool_stamps: std::collections::BTreeMap<String, crate::core::stream_types::ClientToolStamp>,
     /// Legacy: the "ABORT CONTEXT" recap older Synaps saved for an
     /// interrupted turn, to prepend to the next user message. Never written
     /// now (an interrupted turn is real history plus a marker,
@@ -82,6 +115,28 @@ pub struct Session {
     /// produced by (or updated in place by) a compaction transition.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compaction: Option<crate::compaction::CompactionRecord>,
+}
+
+/// Where a forked session came from (`Session::forked_from`): the parent
+/// session's id, how many of its messages the fork copied, and when (ms since
+/// the Unix epoch). The same object is the `forked_from` value of a session's
+/// Status query.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForkedFrom {
+    pub session: String,
+    pub message_count: usize,
+    pub at_ms: u64,
+}
+
+/// The `tool_use_id` of every tool_result block in `messages`.
+fn tool_result_ids(messages: &[SharedMessage]) -> std::collections::HashSet<&str> {
+    messages
+        .iter()
+        .filter_map(|msg| msg.get("content").and_then(serde_json::Value::as_array))
+        .flatten()
+        .filter(|block| block.get("type").and_then(serde_json::Value::as_str) == Some("tool_result"))
+        .filter_map(|block| block.get("tool_use_id").and_then(serde_json::Value::as_str))
+        .collect()
 }
 
 /// Lightweight info for listing sessions without loading full message history
@@ -185,6 +240,17 @@ impl Session {
         self.keepwarm_tokens.input = self.keepwarm_tokens.input.min(self.total_input_tokens);
         self.keepwarm_tokens.output = self.keepwarm_tokens.output.min(self.total_output_tokens);
     }
+
+    /// The child share is a subset of the totals too (snapshot-only, like
+    /// the keep-warm labels): clamp it back under them the same way.
+    pub fn clamp_child_share_to_totals(&mut self) {
+        if !(self.child_cost.is_finite() && self.child_cost > 0.0) {
+            self.child_cost = 0.0;
+        }
+        self.child_cost = self.child_cost.min(self.session_cost.max(0.0));
+        self.child_tokens.input = self.child_tokens.input.min(self.total_input_tokens);
+        self.child_tokens.output = self.child_tokens.output.min(self.total_output_tokens);
+    }
 }
 
 impl Session {
@@ -211,6 +277,8 @@ impl Session {
             keepwarm_tokens: KeepwarmTokens::default(),
             total_cache_read_tokens: 0,
             total_cache_creation_tokens: 0,
+            child_cost: 0.0,
+            child_tokens: KeepwarmTokens::default(),
             message_count: 0,
             api_messages: Vec::new(),
             abort_context: None,
@@ -218,9 +286,38 @@ impl Session {
             compacted_into: None,
             env: None,
             env_stripped: Vec::new(),
+            forked_from: None,
             prompt_provenance: None,
             compaction: None,
+            client_tool_stamps: Default::default(),
         }
+    }
+
+    /// Keep only the client tool stamps of tool results in `history` (an
+    /// entry goes when its id leaves the history: rewind, edit, compaction).
+    pub fn retain_client_tool_stamps(&mut self, history: &[SharedMessage]) {
+        if self.client_tool_stamps.is_empty() {
+            return;
+        }
+        let held = tool_result_ids(history);
+        self.client_tool_stamps.retain(|id, _| held.contains(id.as_str()));
+    }
+
+    /// The stamps of the tool results in `history` (what a client is given
+    /// with that history, and what a fork of it copies).
+    pub fn client_tool_stamps_of(
+        &self,
+        history: &[SharedMessage],
+    ) -> std::collections::BTreeMap<String, crate::core::stream_types::ClientToolStamp> {
+        if self.client_tool_stamps.is_empty() {
+            return Default::default();
+        }
+        let held = tool_result_ids(history);
+        self.client_tool_stamps
+            .iter()
+            .filter(|(id, _)| held.contains(id.as_str()))
+            .map(|(id, stamp)| (id.clone(), stamp.clone()))
+            .collect()
     }
 
     /// Create a successor session from a compaction transition (spec §9.3).
@@ -243,7 +340,7 @@ impl Session {
         // continuation, so the name should follow. Parent's name will be
         // cleared when the caller saves it with compacted_into set.
         let name = parent.name.clone();
-        Session {
+        let mut successor = Session {
             id,
             title: format!(
                 "↳ {}",
@@ -266,6 +363,8 @@ impl Session {
             keepwarm_tokens: KeepwarmTokens::default(),
             total_cache_read_tokens: 0,
             total_cache_creation_tokens: 0,
+            child_cost: 0.0,
+            child_tokens: KeepwarmTokens::default(),
             message_count: 0,
             api_messages: crate::compaction::compaction_context_messages(summary_text),
             abort_context: None,
@@ -273,9 +372,16 @@ impl Session {
             compacted_into: None,
             env: parent.env.clone(),
             env_stripped: parent.env_stripped.clone(),
+            // A fork's successor is still that fork (it can't fork either).
+            forked_from: parent.forked_from.clone(),
             prompt_provenance: None,
             compaction: Some(record),
-        }
+            // Only the ids still in the successor history (archives carry
+            // no stamps in v1).
+            client_tool_stamps: Default::default(),
+        };
+        successor.client_tool_stamps = parent.client_tool_stamps_of(&successor.api_messages);
+        successor
     }
 
     /// Set title from the first user message if not already set
@@ -1066,6 +1172,62 @@ mod tests {
         assert_eq!(session_no_prompt.model, "gpt-3.5-turbo");
         assert_eq!(session_no_prompt.thinking_level, "normal");
         assert_eq!(session_no_prompt.system_prompt, None);
+    }
+
+    fn stamp(invocation: &str) -> crate::core::stream_types::ClientToolStamp {
+        crate::core::stream_types::ClientToolStamp {
+            registration_id: "cr_1".into(),
+            invocation_id: Some(invocation.into()),
+            extension_id: "pria-desktop".into(),
+            tool: "pria_vault_get".into(),
+            family: "pria.vault".into(),
+            outcome: "ok".into(),
+            memory_only: true,
+        }
+    }
+
+    #[test]
+    fn client_tool_stamps_follow_the_history() {
+        let mut session = Session::new("claude-sonnet-4-5", "brief", None);
+        let empty = serde_json::to_value(&session).unwrap();
+        assert!(empty.get("client_tool_stamps").is_none(), "no table, no key: {empty}");
+        session.api_messages = vec![
+            std::sync::Arc::new(json!({"role": "user", "content": "get it"})),
+            std::sync::Arc::new(json!({"role": "assistant", "content": [
+                {"type": "tool_use", "id": "toolu_a", "name": "pria-desktop_pria_vault_get", "input": {}}
+            ]})),
+            std::sync::Arc::new(json!({"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_a", "content": "placeholder"}
+            ]})),
+        ];
+        session.client_tool_stamps.insert("toolu_a".into(), stamp("ci_a"));
+        session.client_tool_stamps.insert("toolu_gone".into(), stamp("ci_gone"));
+
+        // Given with a history: only the ids in it.
+        let shown = session.client_tool_stamps_of(&session.api_messages);
+        assert_eq!(shown.keys().collect::<Vec<_>>(), vec!["toolu_a"]);
+        assert_eq!(shown["toolu_a"], stamp("ci_a"));
+        assert!(session.client_tool_stamps_of(&[]).is_empty());
+
+        // Persisted beside the messages (never inside them) and read back.
+        let json = serde_json::to_value(&session).unwrap();
+        assert_eq!(json["client_tool_stamps"]["toolu_a"]["invocation_id"], "ci_a");
+        assert!(!serde_json::to_string(&json["api_messages"]).unwrap().contains("ci_a"));
+        let back: Session = serde_json::from_value(json).unwrap();
+        assert_eq!(back.client_tool_stamps, session.client_tool_stamps);
+
+        // An entry goes when its id leaves the history.
+        let history = session.api_messages.clone();
+        session.retain_client_tool_stamps(&history);
+        assert_eq!(session.client_tool_stamps.keys().collect::<Vec<_>>(), vec!["toolu_a"]);
+        session.retain_client_tool_stamps(&history[..1]);
+        assert!(session.client_tool_stamps.is_empty());
+
+        // A compaction successor keeps only the ids in its own history.
+        session.client_tool_stamps.insert("toolu_a".into(), stamp("ci_a"));
+        let successor =
+            Session::from_compaction_record(&session, "summary", test_record(&session));
+        assert!(successor.client_tool_stamps.is_empty());
     }
 
     #[test]

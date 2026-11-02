@@ -987,6 +987,7 @@ fn gemini_usage_preserves_absent_counts() {
         prompt_tokens: Some(5),
         candidates_tokens: None,
         cached_tokens: None,
+        thoughts_tokens: None,
     });
     assert_eq!(usage.input_tokens, Some(5));
     assert_eq!(usage.output_tokens, None, "no fabricated zeros");

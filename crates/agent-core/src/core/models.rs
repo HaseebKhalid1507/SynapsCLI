@@ -181,21 +181,86 @@ pub fn model_rejects_output_overflow(model: &str) -> bool {
 /// Used as the denominator for the chatui context-usage bar and anywhere
 /// else the client needs to know how much prompt the model will accept.
 ///
-/// **All models default to 200k** — matching Anthropic's claude-code
-/// behavior. Models that support a larger window (Opus 4.6+, Sonnet 4)
-/// require explicit opt-in via the `context-1m-2025-08-07` beta header.
-/// Without the header, the model operates in 200k mode (better inference
-/// quality — context rot at long contexts is real).
+/// Codex Astra has a native 1,050,000-token window. Other models keep the
+/// conservative 200k fallback. In particular, Anthropic models that support
+/// a larger window require explicit opt-in via the `context-1m-2025-08-07`
+/// beta header; see [`model_supports_1m`].
 ///
-/// Use [`model_supports_1m`] to check whether a model *can* opt into 1M;
-/// the actual decision happens at request time based on the user's
-/// `context_window` setting.
-pub fn context_window_for_model(_model: &str) -> u64 {
-    200_000
+/// An explicit `context_window` setting replaces this native default, down
+/// to a user-selected lower cap and up to the model's ceiling; see
+/// [`effective_context_window`].
+pub fn context_window_for_model(model: &str) -> u64 {
+    match model {
+        "gpt-6-astra" | "openai-codex/gpt-6-astra" => 1_050_000,
+        _ => 200_000,
+    }
+}
+
+/// The largest input window `model` is known to accept, in tokens, or
+/// `None` when it is not known.
+///
+/// - Codex Astra (the exact ids [`context_window_for_model`] matches):
+///   its native 1,050,000.
+/// - Anthropic models (`claude-*`, bare or `anthropic/`-qualified):
+///   1,000,000 when [`model_supports_1m`], else 200,000.
+/// - Every other model (other Codex models, OpenRouter, Groq, NVIDIA,
+///   extension and local routes, unknown ids): `None`. The static Codex
+///   catalog publishes no window for them, and a route may well accept more
+///   than synaps's 200k native default, so an explicit setting is trusted.
+pub fn model_context_ceiling(model: &str) -> Option<u64> {
+    if matches!(model, "gpt-6-astra" | "openai-codex/gpt-6-astra") {
+        return Some(1_050_000);
+    }
+    let m = model.to_ascii_lowercase();
+    let m = m.strip_prefix("anthropic/").unwrap_or(&m);
+    if !m.starts_with("claude-") {
+        return None;
+    }
+    Some(if model_supports_1m(m) {
+        1_000_000
+    } else {
+        200_000
+    })
+}
+
+/// The context window a session on `model` budgets with, in tokens: the
+/// model's native window ([`context_window_for_model`]) when nothing is
+/// configured, else the configured window clamped to the model's ceiling
+/// ([`model_context_ceiling`]). A configured window below the ceiling is
+/// kept (a deliberate lower cap); a model with no known ceiling keeps the
+/// configured window unchanged. Every reader of a session's window goes
+/// through this, so `context_window = 1m` never budgets a 200k model for
+/// requests its provider will refuse.
+pub fn effective_context_window(model: &str, configured: Option<u64>) -> u64 {
+    let Some(tokens) = configured else {
+        return context_window_for_model(model);
+    };
+    match model_context_ceiling(model) {
+        Some(ceiling) => tokens.min(ceiling),
+        None => tokens,
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn astra_context_capacity_is_exact_and_other_models_keep_the_fallback() {
+        for model in ["gpt-6-astra", "openai-codex/gpt-6-astra"] {
+            assert_eq!(super::context_window_for_model(model), 1_050_000, "{model}");
+        }
+        for model in [
+            "",
+            "unknown",
+            "gpt-6-astra-wm",
+            "gpt-6-astra-preview",
+            "other/gpt-6-astra",
+            "openai-codex/gpt-6.1-sol",
+            "claude-opus-4-7",
+        ] {
+            assert_eq!(super::context_window_for_model(model), 200_000, "{model}");
+        }
+    }
+
     #[test]
     fn tool_search_support_follows_anthropic_compatibility_table() {
         for m in [
@@ -357,6 +422,112 @@ mod tests {
     fn context_window_unknown_defaults_200k() {
         assert_eq!(context_window_for_model("some-future-model"), 200_000);
         assert_eq!(context_window_for_model(""), 200_000);
+    }
+
+    #[test]
+    fn context_window_clamp_caps_an_explicit_window_at_the_model_ceiling() {
+        // 200k-only Anthropic models: `1m` budgets their real 200k.
+        for model in [
+            "claude-haiku-4-5",
+            "claude-haiku-4-5-20251001",
+            "anthropic/claude-haiku-4-5-20251001",
+            "claude-opus-4-5-20251101",
+        ] {
+            assert_eq!(model_context_ceiling(model), Some(200_000), "{model}");
+            assert_eq!(
+                effective_context_window(model, Some(1_000_000)),
+                200_000,
+                "{model}"
+            );
+        }
+        // 1M-capable Anthropic models keep `1m`; more is capped at 1M.
+        for model in [
+            "claude-opus-5-5",
+            "claude-sonnet-4-6",
+            "anthropic/claude-sonnet-4-6",
+            "CLAUDE-OPUS-4-7",
+            "claude-fable-5-1",
+        ] {
+            assert_eq!(model_context_ceiling(model), Some(1_000_000), "{model}");
+            assert_eq!(
+                effective_context_window(model, Some(1_000_000)),
+                1_000_000,
+                "{model}"
+            );
+            assert_eq!(
+                effective_context_window(model, Some(2_000_000)),
+                1_000_000,
+                "{model}"
+            );
+        }
+        // Astra: `1m` is below its 1.05M ceiling; more is capped at it.
+        for model in ["gpt-6-astra", "openai-codex/gpt-6-astra"] {
+            assert_eq!(model_context_ceiling(model), Some(1_050_000), "{model}");
+            assert_eq!(
+                effective_context_window(model, Some(1_000_000)),
+                1_000_000,
+                "{model}"
+            );
+            assert_eq!(
+                effective_context_window(model, Some(2_000_000)),
+                1_050_000,
+                "{model}"
+            );
+        }
+        // A deliberate lower cap is kept.
+        for model in ["claude-haiku-4-5", "claude-sonnet-4-6", "gpt-6-astra"] {
+            assert_eq!(
+                effective_context_window(model, Some(100_000)),
+                100_000,
+                "{model}"
+            );
+        }
+    }
+
+    #[test]
+    fn context_window_clamp_keeps_unknown_models_and_the_native_default() {
+        // No known ceiling: the configured window is trusted as-is.
+        for model in [
+            "openrouter/google/gemini-2.5-pro",
+            "groq/llama-3.3-70b-versatile",
+            "nvidia/llama-3.1-nemotron-ultra",
+            "plugin:provider:claude-sonnet-4-6",
+            "github-copilot/claude-opus-4.8",
+            "local/test-model",
+            "openai-codex/gpt-6.1-sol",
+            "gpt-6-astra-preview",
+            "some-future-model",
+            "",
+        ] {
+            assert_eq!(model_context_ceiling(model), None, "{model}");
+            assert_eq!(
+                effective_context_window(model, Some(2_000_000)),
+                2_000_000,
+                "{model}"
+            );
+            assert_eq!(
+                effective_context_window(model, Some(1_000_000)),
+                1_000_000,
+                "{model}"
+            );
+        }
+        // Nothing configured: the native default, exactly as before.
+        for model in [
+            "claude-sonnet-4-6",
+            "claude-haiku-4-5-20251001",
+            "gpt-6-astra",
+            "openai-codex/gpt-6-astra",
+            "openai-codex/gpt-6.1-sol",
+            "openrouter/google/gemini-2.5-pro",
+        ] {
+            assert_eq!(
+                effective_context_window(model, None),
+                context_window_for_model(model),
+                "{model}"
+            );
+        }
+        assert_eq!(effective_context_window("claude-opus-4-7", None), 200_000);
+        assert_eq!(effective_context_window("gpt-6-astra", None), 1_050_000);
     }
 
     #[test]

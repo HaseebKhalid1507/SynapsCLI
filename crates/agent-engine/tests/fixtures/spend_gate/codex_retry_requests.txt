@@ -1,0 +1,39 @@
+=== request 0
+POST /codex/responses
+accept: text/event-stream
+authorization: Bearer h.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiYWNjdF9nYXRlIn19.s
+chatgpt-account-id: acct_gate
+content-length: 1287
+content-type: application/json
+openai-beta: responses=experimental
+originator: synaps
+session-id: synaps-b13f8e47547c4bf9caa48662c5c124a6ec98e40de742cd53e8a0ded7db9e2a75
+thread-id: synaps-b13f8e47547c4bf9caa48662c5c124a6ec98e40de742cd53e8a0ded7db9e2a75
+--- body (1287 bytes)
+{"include":["reasoning.encrypted_content"],"input":[{"content":[{"text":"<multi_agent_mode>Do not spawn sub-agents unless the user or applicable AGENTS.md/skill instructions explicitly ask for sub-agents, delegation, or parallel agent work.</multi_agent_mode>","type":"input_text"}],"role":"developer","type":"message"},{"content":"What's the capital of France?","role":"user"},{"content":"Paris.","role":"assistant"},{"content":"And of Japan?","role":"user"}],"instructions":"You are a gate.\n\n[Synaps autonomous harness policy]\nThis harness is non-interactive after the user has provided the task/spec. Do not stop at phase boundaries, milestones, checkpoints, or after presenting a plan unless the full requested job is complete. Do not ask the user whether to continue. When a phase/checkpoint is reached, run any relevant verification and continue autonomously until the full requested job is complete, blocked by an unrecoverable error, or explicit user instructions require stopping.\n[End Synaps autonomous harness policy]","model":"gpt-5.6-sol","parallel_tool_calls":true,"prompt_cache_key":"synaps-b13f8e47547c4bf9caa48662c5c124a6ec98e40de742cd53e8a0ded7db9e2a75","reasoning":{"effort":"medium"},"store":false,"stream":true,"text":{"verbosity":"medium"},"tool_choice":"auto"}
+=== request 1
+POST /codex/responses
+accept: text/event-stream
+authorization: Bearer h.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiYWNjdF9nYXRlIn19.s
+chatgpt-account-id: acct_gate
+content-length: 1287
+content-type: application/json
+openai-beta: responses=experimental
+originator: synaps
+session-id: synaps-b13f8e47547c4bf9caa48662c5c124a6ec98e40de742cd53e8a0ded7db9e2a75
+thread-id: synaps-b13f8e47547c4bf9caa48662c5c124a6ec98e40de742cd53e8a0ded7db9e2a75
+--- body (1287 bytes)
+{"include":["reasoning.encrypted_content"],"input":[{"content":[{"text":"<multi_agent_mode>Do not spawn sub-agents unless the user or applicable AGENTS.md/skill instructions explicitly ask for sub-agents, delegation, or parallel agent work.</multi_agent_mode>","type":"input_text"}],"role":"developer","type":"message"},{"content":"What's the capital of France?","role":"user"},{"content":"Paris.","role":"assistant"},{"content":"And of Japan?","role":"user"}],"instructions":"You are a gate.\n\n[Synaps autonomous harness policy]\nThis harness is non-interactive after the user has provided the task/spec. Do not stop at phase boundaries, milestones, checkpoints, or after presenting a plan unless the full requested job is complete. Do not ask the user whether to continue. When a phase/checkpoint is reached, run any relevant verification and continue autonomously until the full requested job is complete, blocked by an unrecoverable error, or explicit user instructions require stopping.\n[End Synaps autonomous harness policy]","model":"gpt-5.6-sol","parallel_tool_calls":true,"prompt_cache_key":"synaps-b13f8e47547c4bf9caa48662c5c124a6ec98e40de742cd53e8a0ded7db9e2a75","reasoning":{"effort":"medium"},"store":false,"stream":true,"text":{"verbosity":"medium"},"tool_choice":"auto"}
+=== request 2
+POST /codex/responses
+accept: text/event-stream
+authorization: Bearer h.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiYWNjdF9nYXRlIn19.s
+chatgpt-account-id: acct_gate
+content-length: 1287
+content-type: application/json
+openai-beta: responses=experimental
+originator: synaps
+session-id: synaps-b13f8e47547c4bf9caa48662c5c124a6ec98e40de742cd53e8a0ded7db9e2a75
+thread-id: synaps-b13f8e47547c4bf9caa48662c5c124a6ec98e40de742cd53e8a0ded7db9e2a75
+--- body (1287 bytes)
+{"include":["reasoning.encrypted_content"],"input":[{"content":[{"text":"<multi_agent_mode>Do not spawn sub-agents unless the user or applicable AGENTS.md/skill instructions explicitly ask for sub-agents, delegation, or parallel agent work.</multi_agent_mode>","type":"input_text"}],"role":"developer","type":"message"},{"content":"What's the capital of France?","role":"user"},{"content":"Paris.","role":"assistant"},{"content":"And of Japan?","role":"user"}],"instructions":"You are a gate.\n\n[Synaps autonomous harness policy]\nThis harness is non-interactive after the user has provided the task/spec. Do not stop at phase boundaries, milestones, checkpoints, or after presenting a plan unless the full requested job is complete. Do not ask the user whether to continue. When a phase/checkpoint is reached, run any relevant verification and continue autonomously until the full requested job is complete, blocked by an unrecoverable error, or explicit user instructions require stopping.\n[End Synaps autonomous harness policy]","model":"gpt-5.6-sol","parallel_tool_calls":true,"prompt_cache_key":"synaps-b13f8e47547c4bf9caa48662c5c124a6ec98e40de742cd53e8a0ded7db9e2a75","reasoning":{"effort":"medium"},"store":false,"stream":true,"text":{"verbosity":"medium"},"tool_choice":"auto"}

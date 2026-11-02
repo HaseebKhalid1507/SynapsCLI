@@ -541,6 +541,10 @@ const SNAPSHOT_ONLY_FIELDS: &[&str] = &[
     "keepwarm_tokens",
     "total_cache_read_tokens",
     "total_cache_creation_tokens",
+    "child_cost",
+    "child_tokens",
+    "forked_from",
+    "client_tool_stamps",
 ];
 
 /// Mirror of [`Session`] WITHOUT `api_messages` and the
@@ -995,6 +999,10 @@ struct SessionSnapshotRef<'a> {
     total_cache_read_tokens: u64,
     #[serde(skip_serializing_if = "is_zero_tokens")]
     total_cache_creation_tokens: u64,
+    #[serde(skip_serializing_if = "is_zero_cost")]
+    child_cost: f64,
+    #[serde(skip_serializing_if = "KeepwarmTokens::is_zero")]
+    child_tokens: KeepwarmTokens,
     message_count: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     parent_session: &'a Option<String>,
@@ -1006,7 +1014,11 @@ struct SessionSnapshotRef<'a> {
     env: Option<Vec<(String, String)>>,
     #[serde(skip_serializing_if = "<[String]>::is_empty")]
     env_stripped: &'a [String],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    forked_from: &'a Option<crate::core::session::ForkedFrom>,
     api_messages: StoredMessages<'a>,
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    client_tool_stamps: &'a std::collections::BTreeMap<String, crate::core::stream_types::ClientToolStamp>,
     #[serde(skip_serializing_if = "Option::is_none")]
     abort_context: &'a Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1040,12 +1052,16 @@ impl<'a> SessionSnapshotRef<'a> {
             keepwarm_tokens: s.keepwarm_tokens,
             total_cache_read_tokens: s.total_cache_read_tokens,
             total_cache_creation_tokens: s.total_cache_creation_tokens,
+            child_cost: s.child_cost,
+            child_tokens: s.child_tokens,
             message_count: s.api_messages.len(),
             parent_session: &s.parent_session,
             compacted_into: &s.compacted_into,
             env: scrub_secret_env(s.env.as_ref()),
             env_stripped: &s.env_stripped,
+            forked_from: &s.forked_from,
             api_messages: StoredMessages(&s.api_messages),
+            client_tool_stamps: &s.client_tool_stamps,
             abort_context: &s.abort_context,
             prompt_provenance: &s.prompt_provenance,
             compaction: &s.compaction,
@@ -1175,6 +1191,7 @@ pub fn load_session_in_dir(dir: &Path, id: &str) -> std::io::Result<Session> {
         serde_json::from_slice(&snapshot).map_err(std::io::Error::other)?;
     let mut session: Session = serde_json::from_slice(&snapshot).map_err(std::io::Error::other)?;
     session.clamp_keepwarm_to_totals();
+    session.clamp_child_share_to_totals();
     for (i, id) in stored_turn_ids(binding.turn_ids) {
         if let Some(message) = session.api_messages.get_mut(i) {
             set_turn_id(std::sync::Arc::make_mut(message), id);
@@ -1229,9 +1246,10 @@ pub fn load_session_in_dir(dir: &Path, id: &str) -> std::io::Result<Session> {
             Ok(JournalRecord::Open { .. }) | Err(_) => break, // torn tail
         }
     }
-    // Keep-warm labels are snapshot-only (SNAPSHOT_ONLY_FIELDS): keep them
-    // under the journal-replayed totals.
+    // Keep-warm labels and the child share are snapshot-only
+    // (SNAPSHOT_ONLY_FIELDS): keep them under the journal-replayed totals.
     session.clamp_keepwarm_to_totals();
+    session.clamp_child_share_to_totals();
     Ok(session)
 }
 
@@ -1338,6 +1356,11 @@ mod tests {
         s.abort_context = Some("ctx".into());
         s.parent_session = Some("parent".into());
         s.compacted_into = Some("child".into());
+        s.forked_from = Some(crate::core::session::ForkedFrom {
+            session: "parent".into(),
+            message_count: 3,
+            at_ms: 7,
+        });
         s.api_messages.push(std::sync::Arc::new(
             serde_json::json!({"role": "user", "content": "hi"}),
         ));
@@ -1368,6 +1391,13 @@ mod tests {
         s.compacted_into = Some("child".into());
         s.keepwarm_cost = 0.25;
         s.keepwarm_tokens.cache_read = 9;
+        s.child_cost = 0.5;
+        s.child_tokens.output = 3;
+        s.forked_from = Some(crate::core::session::ForkedFrom {
+            session: "parent".into(),
+            message_count: 3,
+            at_ms: 7,
+        });
         let mut value = serde_json::to_value(&s).unwrap();
         value.as_object_mut().unwrap().remove("api_messages");
         for f in SNAPSHOT_ONLY_FIELDS {
@@ -1394,6 +1424,55 @@ mod tests {
         assert_eq!(b.total_input_tokens, 7);
         assert_eq!(b.session_cost, 0.5);
         assert_eq!(b.updated_at, a.updated_at);
+    }
+
+    /// A fork's `forked_from` is snapshot-only: the first save (a full
+    /// snapshot in either mode) writes it, a later save (in journal mode a
+    /// delta plus a meta record) keeps it, and a load returns it exactly.
+    #[test]
+    fn forked_from_round_trips_through_the_journal() {
+        use crate::core::session::ForkedFrom;
+        let from = ForkedFrom {
+            session: "20261021-001500-ab12".into(),
+            message_count: 1,
+            at_ms: 1_761_026_400_000,
+        };
+        for mode in [SessionPersistence::Json, SessionPersistence::Journal] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let dir = tmp.path().join("sessions");
+            let mut s = Session::new("m", "medium", None);
+            s.api_messages
+                .push(std::sync::Arc::new(serde_json::json!({"role": "user", "content": "one"})));
+            s.forked_from = Some(from.clone());
+            save_session_in_dir(&dir, &s, mode).unwrap();
+            s.api_messages.push(std::sync::Arc::new(
+                serde_json::json!({"role": "assistant", "content": "two"}),
+            ));
+            s.updated_at = chrono::Utc::now();
+            save_session_in_dir(&dir, &s, mode).unwrap();
+            let loaded = load_session_in_dir(&dir, &s.id).unwrap();
+            assert_eq!(loaded.forked_from.as_ref(), Some(&from), "{mode:?}");
+            assert_eq!(loaded.api_messages.len(), 2, "{mode:?}");
+            let snap: serde_json::Value = serde_json::from_str(
+                &std::fs::read_to_string(dir.join(format!("{}.json", s.id))).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                snap["forked_from"],
+                serde_json::json!({
+                    "session": "20261021-001500-ab12",
+                    "message_count": 1,
+                    "at_ms": 1_761_026_400_000u64
+                }),
+                "{mode:?}"
+            );
+            // A session that was not forked writes no such key.
+            let plain = Session::new("m", "medium", None);
+            save_session_in_dir(&dir, &plain, mode).unwrap();
+            let raw = std::fs::read_to_string(dir.join(format!("{}.json", plain.id))).unwrap();
+            assert!(!raw.contains("forked_from"), "{mode:?}");
+            assert_eq!(load_session_in_dir(&dir, &plain.id).unwrap().forked_from, None);
+        }
     }
 
     #[test]
@@ -2104,6 +2183,9 @@ mod snapshot_only_fields {
         s.keepwarm_tokens.cache_read = 1_000;
         s.total_cache_read_tokens = 2_000;
         s.total_cache_creation_tokens = 300;
+        s.child_cost = 0.25;
+        s.child_tokens.input = 4;
+        s.child_tokens.cache_read = 700;
         // First save publishes the snapshot; the next two append deltas
         // (messages + meta records carrying every non-zero field).
         save_session_in_dir(&dir, &s, SessionPersistence::Journal).unwrap();
@@ -2114,6 +2196,7 @@ mod snapshot_only_fields {
             s.session_cost += 0.25;
             s.keepwarm_cost += 0.125;
             s.total_cache_read_tokens += 1_000;
+            s.child_cost += 0.0625;
             let receipt = save_session_in_dir(&dir, &s, SessionPersistence::Journal).unwrap();
             assert!(matches!(receipt.mode, SaveMode::Append { .. }));
         }
@@ -2133,6 +2216,10 @@ mod snapshot_only_fields {
                 !line.contains("total_cache_"),
                 "journaled a snapshot-only field: {line}"
             );
+            assert!(
+                !line.contains("child_cost") && !line.contains("child_tokens"),
+                "journaled the child share: {line}"
+            );
         }
         assert_eq!(metas, 2);
         // And this build still reads back the full history, with the
@@ -2141,6 +2228,7 @@ mod snapshot_only_fields {
         assert_eq!(loaded.api_messages.len(), 3);
         assert_eq!(loaded.session_cost, 1.5);
         assert_eq!(loaded.keepwarm_cost, 0.5);
+        assert_eq!(loaded.child_cost, 0.25, "the child share as of the snapshot");
         assert_eq!(loaded.total_cache_read_tokens, 2_000);
         assert_eq!(loaded.total_cache_creation_tokens, 300);
     }
@@ -2585,3 +2673,7 @@ mod snapshot_only_fields {
         assert_eq!(message_time(&loaded.api_messages[1]), None);
     }
 }
+
+#[cfg(test)]
+#[path = "session_journal_child_share_tests.rs"]
+mod child_share_tests;

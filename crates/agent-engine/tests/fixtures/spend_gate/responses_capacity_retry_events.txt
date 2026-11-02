@@ -1,0 +1,6 @@
+Llm(ResponseStart)
+Llm(ResponseStart)
+Llm(Text("gate "))
+Llm(Text("ok"))
+Session(Usage { input_tokens: 6, output_tokens: 3, cache_read_input_tokens: 4, cache_creation_input_tokens: 0, cache_creation_5m: None, cache_creation_1h: None, model: None })
+=> Ok(Object {"content": Array [Object {"text": String("gate ok"), "type": String("text")}], "role": String("assistant"), "usage": Object {"cache_read_input_tokens": Number(4), "input_tokens": Number(6), "output_tokens": Number(3)}})

@@ -1,0 +1,108 @@
+=== proxy
+{
+  "provider": "google-gemini",
+  "method": "post",
+  "path": "/v1internal:loadCodeAssist",
+  "body": {
+    "metadata": {
+      "ideType": "IDE_UNSPECIFIED",
+      "platform": "PLATFORM_UNSPECIFIED",
+      "pluginType": "GEMINI"
+    }
+  },
+  "stream": false
+}
+=== proxy_stream
+{
+  "provider": "google-gemini",
+  "method": "post",
+  "path": "/v1internal:streamGenerateContent",
+  "body": {
+    "model": "gemini-2.5-pro",
+    "project": "gate-proj",
+    "request": {
+      "contents": [
+        {
+          "parts": [
+            {
+              "text": "What's the capital of France?"
+            }
+          ],
+          "role": "user"
+        },
+        {
+          "parts": [
+            {
+              "text": "Paris."
+            }
+          ],
+          "role": "model"
+        },
+        {
+          "parts": [
+            {
+              "text": "And of Japan?"
+            }
+          ],
+          "role": "user"
+        }
+      ],
+      "systemInstruction": {
+        "parts": [
+          {
+            "text": "You are a gate."
+          }
+        ],
+        "role": "user"
+      }
+    }
+  },
+  "stream": true
+}
+=== proxy_stream
+{
+  "provider": "google-gemini",
+  "method": "post",
+  "path": "/v1internal:streamGenerateContent",
+  "body": {
+    "model": "gemini-2.5-pro",
+    "project": "gate-proj",
+    "request": {
+      "contents": [
+        {
+          "parts": [
+            {
+              "text": "What's the capital of France?"
+            }
+          ],
+          "role": "user"
+        },
+        {
+          "parts": [
+            {
+              "text": "Paris."
+            }
+          ],
+          "role": "model"
+        },
+        {
+          "parts": [
+            {
+              "text": "And of Japan?"
+            }
+          ],
+          "role": "user"
+        }
+      ],
+      "systemInstruction": {
+        "parts": [
+          {
+            "text": "You are a gate."
+          }
+        ],
+        "role": "user"
+      }
+    }
+  },
+  "stream": true
+}

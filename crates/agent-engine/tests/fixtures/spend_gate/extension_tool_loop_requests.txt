@@ -1,0 +1,100 @@
+=== provider.complete
+{
+  "provider_id": "prov",
+  "model_id": "model-x",
+  "model": "plug:prov:model-x",
+  "messages": [
+    {
+      "content": "What's the capital of France?",
+      "role": "user"
+    },
+    {
+      "content": [
+        {
+          "text": "Paris.",
+          "type": "text"
+        }
+      ],
+      "role": "assistant"
+    },
+    {
+      "content": "And of Japan?",
+      "role": "user"
+    }
+  ],
+  "system_prompt": "You are a gate.",
+  "tools": [
+    {
+      "description": "a tool the host doesn't have",
+      "input_schema": {
+        "type": "object"
+      },
+      "name": "not_a_registered_tool"
+    }
+  ],
+  "temperature": null,
+  "max_tokens": null,
+  "thinking_budget": 0
+}
+=== provider.complete
+{
+  "provider_id": "prov",
+  "model_id": "model-x",
+  "model": "plug:prov:model-x",
+  "messages": [
+    {
+      "content": "What's the capital of France?",
+      "role": "user"
+    },
+    {
+      "content": [
+        {
+          "text": "Paris.",
+          "type": "text"
+        }
+      ],
+      "role": "assistant"
+    },
+    {
+      "content": "And of Japan?",
+      "role": "user"
+    },
+    {
+      "content": [
+        {
+          "id": "toolu_gate",
+          "input": {
+            "query": "gate"
+          },
+          "name": "not_a_registered_tool",
+          "type": "tool_use"
+        }
+      ],
+      "role": "assistant"
+    },
+    {
+      "content": [
+        {
+          "content": "Unknown tool: not_a_registered_tool",
+          "is_error": true,
+          "tool_use_id": "toolu_gate",
+          "type": "tool_result"
+        }
+      ],
+      "role": "user"
+    }
+  ],
+  "system_prompt": "You are a gate.",
+  "tools": [
+    {
+      "description": "a tool the host doesn't have",
+      "input_schema": {
+        "type": "object"
+      },
+      "name": "not_a_registered_tool"
+    }
+  ],
+  "temperature": null,
+  "max_tokens": null,
+  "thinking_budget": 0
+}

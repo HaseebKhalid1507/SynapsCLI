@@ -1,0 +1,5 @@
+=== request 0
+github-copilot Post /responses stream=true
+--- body bytes (232 bytes)
+{"input":[{"content":"You are a gate.","role":"system"},{"content":"What's the capital of France?","role":"user"},{"content":"Paris.","role":"assistant"},{"content":"And of Japan?","role":"user"}],"model":"gpt-5-mini","stream":true}
+--- body matches its bytes: true

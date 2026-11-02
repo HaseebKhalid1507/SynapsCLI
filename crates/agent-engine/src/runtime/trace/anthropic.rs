@@ -40,10 +40,17 @@ pub fn retry_class_for_stream_error(error_type: Option<&str>) -> RetryClass {
 
 /// Normalize an Anthropic wire `stop_reason` into the trace enum. Unknown
 /// values collapse to `Other` — the raw string is never stored.
+///
+/// `model_context_window_exceeded` (Claude 4.5+: generation stopped at the
+/// context window, which `input + max_tokens` may exceed on those models)
+/// is an output truncation like `max_tokens` and maps to it, so every
+/// consumer of the normalized reason (the live stream's trace and warm
+/// summaries, the sync and rolling-summary routes) treats it as one.
+/// Defensive: a request sized to its reserved output never reaches it.
 pub fn stop_reason_from_wire(raw: &str) -> StopReason {
     match raw {
         "end_turn" => StopReason::EndTurn,
-        "max_tokens" => StopReason::MaxTokens,
+        "max_tokens" | "model_context_window_exceeded" => StopReason::MaxTokens,
         "stop_sequence" => StopReason::StopSequence,
         "tool_use" => StopReason::ToolUse,
         "pause_turn" => StopReason::PauseTurn,
@@ -253,6 +260,19 @@ mod tests {
 
     fn message_boundaries(messages: &[crate::SharedMessage]) -> Vec<CacheBoundaryMeta> {
         cache_meta(messages, 0, None, false, false).boundaries
+    }
+
+    /// A generation stopped at the context window (Claude 4.5+) is an
+    /// output truncation, normalized exactly like `max_tokens`.
+    #[test]
+    fn model_context_window_exceeded_is_a_truncation_like_max_tokens() {
+        assert_eq!(stop_reason_from_wire("max_tokens"), StopReason::MaxTokens);
+        assert_eq!(
+            stop_reason_from_wire("model_context_window_exceeded"),
+            StopReason::MaxTokens
+        );
+        assert_eq!(stop_reason_from_wire("end_turn"), StopReason::EndTurn);
+        assert_eq!(stop_reason_from_wire("context_window"), StopReason::Other);
     }
 
     #[test]

@@ -92,7 +92,20 @@ pub fn build_stream_request(
     turns: &[ChatTurn],
     tools: &[ToolSpec],
 ) -> Result<(ProxyRequest, bytes::Bytes), StreamError> {
-    let body = translate_generate_content_request(model, project, system_prompt, turns, tools);
+    build_stream_request_with(model, project, system_prompt, turns, tools, None)
+}
+
+/// [`build_stream_request`] with an optional `generationConfig`.
+pub(crate) fn build_stream_request_with(
+    model: impl Into<String>,
+    project: Option<String>,
+    system_prompt: Option<String>,
+    turns: &[ChatTurn],
+    tools: &[ToolSpec],
+    generation_config: Option<serde_json::Value>,
+) -> Result<(ProxyRequest, bytes::Bytes), StreamError> {
+    let mut body = translate_generate_content_request(model, project, system_prompt, turns, tools);
+    body.request.generation_config = generation_config;
     let body = serde_json::to_value(&body)
         .map_err(|e| StreamError::Decode(format!("failed to serialize request: {e}")))?;
     ProxyRequest::post_json_exact(

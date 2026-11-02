@@ -711,3 +711,270 @@ async fn non_429_broker_error_never_surfaces_provider_body() {
         );
     }
 }
+
+#[tokio::test]
+async fn an_empty_reply_still_returns_normalized_usage_including_thinking() {
+    let broker: Arc<dyn CredentialBroker> = Arc::new(StubBroker::new(vec![chunk(
+        "data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":50,\"candidatesTokenCount\":0,\"thoughtsTokenCount\":7,\"cachedContentTokenCount\":10}}}\n",
+    )]));
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let msgs: Vec<crate::SharedMessage> = vec![Arc::new(json!({"role":"user","content":"hi"}))];
+    let out = call_google_gemini_stream_inner(
+        &cfg(),
+        &broker,
+        &[],
+        &None,
+        &msgs,
+        &tx,
+        &tokio_util::sync::CancellationToken::new(),
+        &test_trace(),
+        true,
+    )
+    .await
+    .expect("an empty reply is not a transport failure");
+    assert_eq!(out["content"], json!([]));
+    assert_eq!(
+        out["usage"],
+        json!({"input_tokens":40,"output_tokens":7,"cache_read_input_tokens":10,"cache_creation_input_tokens":0})
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_single_attempt_sends_the_output_ceiling_and_never_retries_429() {
+    let limits = GeminiLimits {
+        max_output_tokens: Some(1_234),
+        max_429_retries: 0,
+    };
+    let stub = Arc::new(RateLimitedBroker::new(3, vec![]));
+    let broker: Arc<dyn CredentialBroker> = stub.clone();
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let msgs: Vec<crate::SharedMessage> = vec![Arc::new(json!({"role":"user","content":"hi"}))];
+    let err = call_google_gemini_stream_limited(
+        &cfg(),
+        &broker,
+        &[],
+        &None,
+        &msgs,
+        &tx,
+        &tokio_util::sync::CancellationToken::new(),
+        &test_trace(),
+        true,
+        limits,
+        RouteSpend::NONE,
+    )
+    .await
+    .expect_err("a 429 fails the single attempt");
+    assert!(err.to_string().contains("429"), "{err}");
+    assert_eq!(stub.calls(), 1, "exactly one upstream attempt");
+
+    let seen = Arc::new(StubBroker::new(vec![chunk(
+        "data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"ok\"}]},\"finishReason\":\"STOP\"}]}}\n",
+    )]));
+    let broker: Arc<dyn CredentialBroker> = seen.clone();
+    call_google_gemini_stream_limited(
+        &cfg(),
+        &broker,
+        &[],
+        &None,
+        &msgs,
+        &tx,
+        &tokio_util::sync::CancellationToken::new(),
+        &test_trace(),
+        true,
+        limits,
+        RouteSpend::NONE,
+    )
+    .await
+    .unwrap();
+    let request = seen.seen.lock().unwrap().clone().expect("request seen");
+    let body = request.body.expect("json body");
+    assert_eq!(
+        body["request"]["generationConfig"]["maxOutputTokens"],
+        1_234
+    );
+}
+
+/// Fails setup (`loadCodeAssist`) or the generation request as scripted, and
+/// counts generation requests.
+struct FailingBroker {
+    setup: Option<BrokerError>,
+    stream: BrokerError,
+    streams: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait]
+impl CredentialBroker for FailingBroker {
+    async fn access_token(&self, _p: OAuthProviderId) -> Result<AccessToken, BrokerError> {
+        Err(BrokerError::NotConfigured("stub".into()))
+    }
+    async fn proxy(&self, _r: ProxyRequest) -> Result<ProxyResponse, BrokerError> {
+        match &self.setup {
+            Some(error) => Err(error.clone()),
+            None => Ok(ProxyResponse {
+                status: 200,
+                body: r#"{"cloudaicompanionProject":"test-proj","currentTier":{"id":"STANDARD","name":"Std","hasOnboardedPreviously":true}}"#.to_string(),
+            }),
+        }
+    }
+    async fn proxy_stream(&self, _request: ProxyRequest) -> Result<ProxyByteStream, BrokerError> {
+        self.streams
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err(self.stream.clone())
+    }
+    async fn anthropic_usage(&self) -> Result<Value, BrokerError> {
+        Err(BrokerError::Denied("not implemented".into()))
+    }
+    async fn capabilities(&self) -> Result<Vec<ProviderStatus>, BrokerError> {
+        Ok(vec![])
+    }
+}
+
+/// Settlement of one failed single-attempt Gemini request.
+async fn failed_spend(
+    setup: Option<BrokerError>,
+    stream: BrokerError,
+) -> (crate::runtime::api_sync::Spend, usize) {
+    let failing = Arc::new(FailingBroker {
+        setup,
+        stream,
+        streams: Default::default(),
+    });
+    let broker: Arc<dyn CredentialBroker> = failing.clone();
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let msgs: Vec<crate::SharedMessage> = vec![Arc::new(json!({"role":"user","content":"hi"}))];
+    let error = call_google_gemini_stream_limited(
+        &cfg(),
+        &broker,
+        &[],
+        &None,
+        &msgs,
+        &tx,
+        &tokio_util::sync::CancellationToken::new(),
+        &test_trace(),
+        true,
+        GeminiLimits {
+            max_output_tokens: Some(1_000),
+            max_429_retries: 0,
+        },
+        RouteSpend::NONE,
+    )
+    .await
+    .expect_err("scripted failure");
+    (
+        crate::runtime::api_sync::routed_failure_spend(error.as_ref()),
+        failing.streams.load(std::sync::atomic::Ordering::SeqCst),
+    )
+}
+
+#[tokio::test]
+async fn failures_before_the_generation_request_are_not_dispatched() {
+    use crate::runtime::api_sync::Spend;
+    let (spend, streams) = failed_spend(
+        Some(BrokerError::Transport("setup unavailable".into())),
+        BrokerError::Denied("unused".into()),
+    )
+    .await;
+    assert_eq!((spend, streams), (Spend::NotDispatched, 0), "setup failure");
+    let (spend, streams) = failed_spend(None, BrokerError::ConnectFailed("refused".into())).await;
+    assert_eq!(
+        (spend, streams),
+        (Spend::NotDispatched, 1),
+        "never connected"
+    );
+    let (spend, streams) = failed_spend(
+        None,
+        BrokerError::Transport("provider request failed: 400 Bad Request".into()),
+    )
+    .await;
+    assert_eq!((spend, streams), (Spend::Unknown, 1), "an answered request");
+}
+
+/// The reply's `usage` keeps only reported counters, so settlement can tell
+/// a full report from a partial one.
+#[tokio::test]
+async fn reply_usage_keeps_only_reported_counters() {
+    use crate::runtime::api_sync::reported_usage;
+    for (metadata, settled) in [
+        (
+            r#"{"promptTokenCount":50,"candidatesTokenCount":4,"thoughtsTokenCount":7}"#,
+            Some(
+                json!({"input_tokens":50,"output_tokens":11,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}),
+            ),
+        ),
+        (r#"{"promptTokenCount":50}"#, None),
+        (r#"{"promptTokenCount":50,"thoughtsTokenCount":7}"#, None),
+        (r#"{"thoughtsTokenCount":7}"#, None),
+        (r#"{"candidatesTokenCount":4}"#, None),
+    ] {
+        let broker: Arc<dyn CredentialBroker> = Arc::new(StubBroker::new(vec![chunk(&format!(
+            "data: {{\"response\":{{\"candidates\":[{{\"content\":{{\"parts\":[{{\"text\":\"ok\"}}]}},\"finishReason\":\"STOP\"}}],\"usageMetadata\":{metadata}}}}}\n"
+        ))]));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let msgs: Vec<crate::SharedMessage> = vec![Arc::new(json!({"role":"user","content":"hi"}))];
+        let out = call_google_gemini_stream_inner(
+            &cfg(),
+            &broker,
+            &[],
+            &None,
+            &msgs,
+            &tx,
+            &tokio_util::sync::CancellationToken::new(),
+            &test_trace(),
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(reported_usage(out.get("usage")), settled, "{metadata}");
+    }
+}
+
+/// A stream error after the final usage report (the one sent with or after
+/// the finish reason) keeps that usage for settlement; after only a running
+/// report, nothing is claimed.
+#[tokio::test]
+async fn a_stream_error_after_the_final_usage_report_keeps_that_usage() {
+    use crate::runtime::api_sync::failure_reported_usage;
+    let metadata = r#"{"promptTokenCount":50,"candidatesTokenCount":4,"thoughtsTokenCount":7}"#;
+    for (finish, expected) in [
+        (
+            r#","finishReason":"MAX_TOKENS""#,
+            Some(
+                json!({"input_tokens":50,"output_tokens":11,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}),
+            ),
+        ),
+        ("", None),
+    ] {
+        let broker: Arc<dyn CredentialBroker> = Arc::new(StubBroker::new(vec![
+            chunk(&format!(
+                "data: {{\"response\":{{\"candidates\":[{{\"content\":{{\"parts\":[{{\"text\":\"partial\"}}]}}{finish}}}],\"usageMetadata\":{metadata}}}}}\n"
+            )),
+            Err(BrokerError::Transport("connection reset".into())),
+        ]));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let msgs: Vec<crate::SharedMessage> = vec![Arc::new(json!({"role":"user","content":"hi"}))];
+        let error = call_google_gemini_stream_inner(
+            &cfg(),
+            &broker,
+            &[],
+            &None,
+            &msgs,
+            &tx,
+            &tokio_util::sync::CancellationToken::new(),
+            &test_trace(),
+            true,
+        )
+        .await
+        .expect_err("the stream fails");
+        assert!(error.to_string().starts_with("google-gemini: "), "{error}");
+        assert_eq!(
+            failure_reported_usage(error.as_ref()),
+            expected,
+            "{finish:?}"
+        );
+        assert_eq!(
+            crate::runtime::api_sync::routed_failure_spend(error.as_ref()),
+            crate::runtime::api_sync::Spend::Unknown,
+            "without its usage the failure stays unknown"
+        );
+    }
+}

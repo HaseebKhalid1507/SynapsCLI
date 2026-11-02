@@ -186,16 +186,224 @@ pub struct PingReport {
     pub notices: Vec<String>,
 }
 
+/// Whether a request's body went out, decided once between the body stream
+/// that publishes it (`api::gated_body`, right before it yields the body), a
+/// response (proof the request was sent) and a caller that gives up on the
+/// request ([`Publication::withdraw`]).
+///
+/// The HTTP client polls the body on its own connection task, which can
+/// still hold it after the caller dropped the request, so a caller that
+/// only *reads* "not published" may be contradicted a moment later. A
+/// caller that withdraws first wins for good: the body stream then yields
+/// an error and no body byte. A caller that loses knows the body was (or is
+/// being) published.
+#[derive(Debug, Default)]
+pub struct Publication {
+    state: std::sync::atomic::AtomicU8,
+    #[cfg(test)]
+    seam: std::sync::Mutex<Option<Arc<PublicationSeam>>>,
+}
+
+const PENDING: u8 = 0;
+const PUBLISHED: u8 = 1;
+const WITHDRAWN: u8 = 2;
+
+impl Publication {
+    fn advance(&self, to: u8) -> std::result::Result<(), u8> {
+        self.state
+            .compare_exchange(PENDING, to, Ordering::AcqRel, Ordering::Acquire)
+            .map(drop)
+    }
+
+    /// The body stream, right before it yields the body: true when the
+    /// body may go out (it is published now), false when the request was
+    /// withdrawn first.
+    pub(crate) fn publish(&self) -> bool {
+        match self.advance(PUBLISHED) {
+            Ok(()) => true,
+            Err(state) => state == PUBLISHED,
+        }
+    }
+
+    /// A response arrived: the request was sent.
+    ///
+    /// Ownership invariant: responses are handled inside the caller's own
+    /// request future, and a caller withdraws only after that future ended
+    /// or was dropped, so a response never meets a withdrawn state. Should
+    /// it ever, debug builds assert and release builds overwrite the
+    /// withdrawal with published (a response proves a send).
+    pub(crate) fn answered(&self) {
+        if let Err(state) = self.advance(PUBLISHED) {
+            // A withdrawn body is never produced, and a request is only
+            // withdrawn once its caller stopped reading responses; a
+            // response still proves a send.
+            debug_assert_eq!(state, PUBLISHED, "a response to a withdrawn request");
+            self.state.store(PUBLISHED, Ordering::Release);
+        }
+    }
+
+    /// The caller gives up on the request: true when it is withdrawn (it
+    /// was not published, and now never will be), false when it was
+    /// published first.
+    pub(crate) fn withdraw(&self) -> bool {
+        match self.advance(WITHDRAWN) {
+            Ok(()) => true,
+            Err(state) => state == WITHDRAWN,
+        }
+    }
+
+    /// Published (or answered) by now. An observation: unlike
+    /// [`Publication::withdraw`], "no" can change later.
+    pub fn is_published(&self) -> bool {
+        self.state.load(Ordering::Acquire) == PUBLISHED
+    }
+
+    /// Test seam: block the body stream at `seam`'s point.
+    #[cfg(test)]
+    pub(crate) fn install_seam(&self, seam: Arc<PublicationSeam>) {
+        *self
+            .seam
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(seam);
+    }
+
+    /// Test seam: when installed for `point`, signal that the body stream
+    /// got here and block its thread until released (bounded). Blocking,
+    /// not awaiting, holds the HTTP client's connection task inside the
+    /// body poll, where the race with a withdrawing caller lives.
+    #[cfg(test)]
+    pub(crate) fn pause(&self, point: SeamPoint) {
+        let seam = self
+            .seam
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(seam) = seam.filter(|seam| seam.at == point) {
+            let _ = seam
+                .reached
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .send(());
+            let _ = seam
+                .release
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .recv_timeout(std::time::Duration::from_secs(10));
+        }
+    }
+}
+
+/// Withdraws a request's [`Publication`] when dropped. Held by the call
+/// that owns a gated body: a call that ends, or that is dropped unfinished
+/// (its caller timed out, was canceled or gave up the whole rollover),
+/// leaves no pending body for the HTTP client's connection task to produce
+/// later. A body published first stays sent; after a published or answered
+/// request the withdrawal changes nothing.
+pub(crate) struct WithdrawOnDrop(pub(crate) Arc<Publication>);
+
+impl Drop for WithdrawOnDrop {
+    fn drop(&mut self) {
+        self.0.withdraw();
+    }
+}
+
+/// Where a [`PublicationSeam`] holds the body stream.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SeamPoint {
+    /// Immediately before the body gate's last check and the publication
+    /// compare-exchange.
+    BeforePublish,
+    /// After a won publication, immediately before the body is yielded.
+    BeforeYield,
+}
+
+/// A test hold on one [`Publication`]'s body stream.
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct PublicationSeam {
+    at: SeamPoint,
+    reached: std::sync::Mutex<std::sync::mpsc::Sender<()>>,
+    release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+/// The test's side of a [`PublicationSeam`]: `reached` receives once the
+/// body stream is held; dropping `release` lets it go.
+#[cfg(test)]
+pub(crate) struct SeamControl {
+    pub reached: std::sync::mpsc::Receiver<()>,
+    pub release: std::sync::mpsc::Sender<()>,
+}
+
+#[cfg(test)]
+impl PublicationSeam {
+    pub(crate) fn new(at: SeamPoint) -> (Arc<Self>, SeamControl) {
+        let (reached_tx, reached) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let seam = Arc::new(Self {
+            at,
+            reached: std::sync::Mutex::new(reached_tx),
+            release: std::sync::Mutex::new(release_rx),
+        });
+        (seam, SeamControl { reached, release })
+    }
+}
+
+/// Test seam: a [`PublicationSeam`] for the rollover summary bodies of one
+/// continuation, warm or native cold, picked up where the stream's own
+/// rollover builds them (no test wrapper around the call): the warm
+/// attempt's publication, and the snapshot gate of a native cold one.
+#[cfg(test)]
+pub(crate) mod armed_seam {
+    use std::sync::{Arc, Mutex, PoisonError};
+
+    use super::PublicationSeam;
+
+    static ARMED: Mutex<Vec<(String, bool, Arc<PublicationSeam>)>> = Mutex::new(Vec::new());
+
+    /// Armed until dropped.
+    pub(crate) struct Armed(String);
+
+    /// Hold the warm (`warm`) or native cold summary bodies of the
+    /// continuation `logical_id` at `seam` while the guard lives.
+    pub(crate) fn arm(logical_id: &str, warm: bool, seam: Arc<PublicationSeam>) -> Armed {
+        ARMED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((logical_id.to_owned(), warm, seam));
+        Armed(logical_id.to_owned())
+    }
+
+    impl Drop for Armed {
+        fn drop(&mut self) {
+            ARMED
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .retain(|(id, ..)| id != &self.0);
+        }
+    }
+
+    /// The seam armed for `logical_id`'s warm or cold bodies, if any.
+    pub(crate) fn armed(logical_id: &str, warm: bool) -> Option<Arc<PublicationSeam>> {
+        ARMED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .find(|(id, w, _)| id == logical_id && *w == warm)
+            .map(|(.., seam)| Arc::clone(seam))
+    }
+}
+
 /// Live view of an in-flight ping, shared with the actor so an ABORTED ping
-/// (a turn started, the session ended) can still be booked: `sent` flips once
-/// the request is dispatched (the HTTP client pulls the body over an
-/// established connection, or a response arrives — never for a refused
-/// connection), `connect_failed` when `send()` could not connect, `status`
-/// holds the last HTTP status (0 = none), and `usage` accumulates Usage
-/// events as they stream in.
+/// (a turn started, the session ended) can still be booked: `sent` is
+/// published once the request is dispatched (the HTTP client pulls the body
+/// over an established connection, or a response arrives — never for a
+/// refused connection), `connect_failed` when `send()` could not connect,
+/// `status` holds the last HTTP status (0 = none), and `usage` accumulates
+/// Usage events as they stream in.
 #[derive(Debug, Clone, Default)]
 pub struct PingTap {
-    pub sent: Arc<std::sync::atomic::AtomicBool>,
+    pub sent: Arc<Publication>,
     pub connect_failed: Arc<std::sync::atomic::AtomicBool>,
     pub status: Arc<AtomicU16>,
     pub usage: Arc<std::sync::Mutex<KeepWarmUsage>>,
@@ -203,7 +411,7 @@ pub struct PingTap {
 
 impl PingTap {
     pub fn was_sent(&self) -> bool {
-        self.sent.load(Ordering::Relaxed)
+        self.sent.is_published()
     }
 
     pub fn usage(&self) -> KeepWarmUsage {
@@ -437,6 +645,14 @@ impl Runtime {
     /// Only the native Anthropic transport carries `cache_control`; every
     /// TTL (5m, 1h, hybrid) and every thinking mode is supported.
     pub fn cache_keepwarm_ineligibility(&self) -> Option<String> {
+        if self.ephemeral_layer.opted_in() {
+            return Some("request-only prompt layer: background cache warming is unavailable".into());
+        }
+        // A ping replays the durable history (placeholders), never the
+        // RAM-only raw text: it could not warm the real prefix.
+        if self.memory_only.has_live() {
+            return Some("memory-only tool results are live: background cache warming is unavailable".into());
+        }
         if !super::auth::model_is_anthropic(&self.model) {
             return Some(format!(
                 "model {} is not on the native Anthropic transport",
@@ -571,11 +787,25 @@ impl Runtime {
         // nothing, so it never needs a token refresh.
         self.validate_request_preflight().await?;
         let anthropic_execution_plan = self.authorized_anthropic_plan().await?;
-        if matches!(mode, KeepWarmMode::Send { .. }) {
-            // Never selects, switches or re-binds an account; a cooling
-            // account ends the period (the ping fails before sending).
-            self.refresh_for_keepwarm().await?;
-        }
+        // A ping is built and sent with a request-local credential for the
+        // bound seat (the one whose cache the last turn wrote): it never
+        // selects, binds or writes the session's auth, and is not sent when
+        // that seat is unbound or cannot be vended. A probe sends nothing,
+        // so it reads a copy of the state as held.
+        // PARITY: ours' request-local credential replaces upstream's
+        // `refresh_for_keepwarm` (#354), which refreshed the SHARED auth;
+        // `background_snapshot` keeps #354's rule (bound seat only, a
+        // cooling seat is not sent) without writing the session's auth.
+        // `Replay` (upstream's tool-round keep-warm) never comes through this
+        // path; it sends, so it would get the sending arm's credential.
+        let auth = match mode {
+            KeepWarmMode::Send { .. } | KeepWarmMode::Replay => {
+                self.background_auth(&self.model).await?
+            }
+            KeepWarmMode::Probe => {
+                Arc::new(tokio::sync::RwLock::new(self.auth.read().await.clone()))
+            }
+        };
 
         // System prompt: run_stream_tracked → run_stream_internal, verbatim.
         let system_prompt = self.effective_system_prompt().await;
@@ -624,6 +854,7 @@ impl Runtime {
                 tools_snapshot.catalog(),
                 true,
                 context_enabled,
+                self.memory_backend.is_axel(),
             );
             // The SAME selection a turn start makes (`retain_session_tool_set`),
             // through its pure half: nothing is written back.
@@ -670,12 +901,23 @@ impl Runtime {
             });
             (Some(Arc::new(schema)), split)
         } else {
-            (None, None)
+            // Flag-off: exactly the schema a stream round sends — the cached
+            // schema, minus what this session withholds (if it exposes any).
+            let set = super::continuation::context_tool_set(
+                self.host_tool_session.clone(),
+                tools_snapshot.catalog(),
+                false,
+                context_enabled,
+                self.memory_backend.is_axel(),
+            );
+            (tools_snapshot.schema_withholding(&set), None)
         };
 
         let options = ApiOptions {
+            event_triggered: false,
             memory_backend: None,
-            use_1m_context: self.context_window_override == Some(1_000_000),
+            sandbox: crate::sandbox::SandboxBinding::for_session(self.session_id.as_deref()),
+            use_1m_context: self.uses_1m_context(),
             cache_ttl: self.cache_ttl,
             // The SESSION's latch: a ping that sees the silent 1h→5m
             // downgrade raises the one notice (the actor surfaces it) and
@@ -695,6 +937,8 @@ impl Runtime {
             // The base context: a ping must never consume `/trace next`.
             trace: self.trace_ctx.clone(),
             request_correlation: None,
+            diagnostic_session_id: self.session_id.clone(),
+            diagnostic_context_window: Some(self.context_window()),
             suppress_stream_deltas: true,
             telemetry: self.request_telemetry(),
             tool_session_id: Some(self.host_tool_session.clone()),
@@ -707,19 +951,38 @@ impl Runtime {
             cache_anchor: Some(Arc::clone(&self.cache_anchor)),
             keepwarm: Some(KeepWarmRequest {
                 mode,
+                purpose: super::api::TailPurpose::Ping,
+                stop_reason: Default::default(),
+                usage: Default::default(),
                 status: Arc::clone(&tap.status),
                 sent: Arc::clone(&tap.sent),
                 connect_failed: Arc::clone(&tap.connect_failed),
+                failure_kind: Default::default(),
+                lease: None,
             }),
             // Header only (cache-key parity with the turns this ping keeps
             // warm); a ping never sends `diagnostics` nor moves the chain.
             cache_diagnosis: self.cache_diagnosis(),
             context_rollover: None,
+            prefix_tap: None,
+            snapshot_gate: None,
+            // Keep-warm is root-only: never a worker's spend.
+            spend_tap: None,
+            // A ping is a session's request: never booked in a worker
+            // run's ledger, whatever runtime it is made on (workers are
+            // never kept warm).
+            request_ledger: None,
+            // A ping never waits for account capacity.
+            capacity_wait: None,
+            // A ping keeps its own output cap (`apply_keepwarm_max_tokens`).
+            request_output_tokens: None,
+            // A ping never falls back: the next turn's request decides.
+            long_context_refusal: None,
         };
 
         let (tx, mut rx) = mpsc::unbounded_channel();
         let call = ApiMethods::call_api_stream_inner(
-            &self.auth,
+            &auth,
             &self.client,
             &self.model,
             &tools_snapshot,
@@ -790,7 +1053,14 @@ impl Runtime {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .usage_anchor_for(&self.model)
             .cloned();
-        let (assessment, budget) = super::stream::pre_request_context_budget(
+        // The next turn is sized like a stream round: from this window's
+        // provider-reported input when there is one.
+        let calibration = self
+            .continuation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .window_calibration_for(&self.model);
+        let sized = super::stream::pre_request_context_budget(
             &self.model,
             self.context_window(),
             system_prompt,
@@ -799,12 +1069,15 @@ impl Runtime {
             self.thinking_budget as u64,
             self.max_tool_output as u64,
             anchor.as_ref(),
+            calibration,
         );
-        let state = self
+        let assessment = sized.assessment;
+        let mut state = self
             .continuation
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let decision = assess_context(&state.config, &state.policy, budget);
+        let config = state.config_for_window(self.context_window_override, self.context_window());
+        let decision = assess_context(&config, &state.policy, sized.budget);
         match decision.action {
             ContextAction::Rollover => Some(format!(
                 "the next turn would roll the context over ({} tokens used)",
@@ -1224,7 +1497,7 @@ mod tests {
     /// the key) is `budget + 1`, the API's minimum; the ping is costed from
     /// its measured usage. Under 5m TTL here.
     #[tokio::test]
-    #[serial_test::serial(synaps_base_dir)]
+    #[serial_test::serial(synaps_base_dir, stream_relay)]
     async fn budgeted_thinking_ping_keeps_budget_and_is_costed() {
         let _base = crate::test_env::BaseDirGuard::new();
         let mut rt = Runtime::new_headless();
@@ -1821,6 +2094,32 @@ mod tests {
         assert!(!rt.clone().cache_diagnosis().unwrap().active());
     }
 
+    /// Publication is decided once: whichever of the body stream and a
+    /// withdrawing caller comes first wins, and the other learns it.
+    #[test]
+    fn publication_is_decided_once() {
+        let withdrawn = Publication::default();
+        assert!(!withdrawn.is_published());
+        assert!(withdrawn.withdraw(), "nothing published: withdrawn");
+        assert!(withdrawn.withdraw(), "stays withdrawn");
+        assert!(!withdrawn.publish(), "a withdrawn body is never produced");
+        assert!(!withdrawn.is_published());
+
+        let published = Publication::default();
+        assert!(published.publish());
+        assert!(published.publish(), "publishing again is harmless");
+        assert!(!published.withdraw(), "published first: the caller loses");
+        assert!(published.is_published());
+        published.answered();
+        assert!(published.is_published());
+
+        // An early response (before the body was pulled) proves a send.
+        let answered = Publication::default();
+        answered.answered();
+        assert!(!answered.withdraw());
+        assert!(answered.publish());
+    }
+
     /// The ping shares the session's silent-downgrade latch (not a fresh
     /// one): a downgrade it observes is the session's one notice.
     #[test]
@@ -2023,7 +2322,7 @@ mod tests {
         // And the bill prices each booking.
         let tap = PingTap::default();
         assert_eq!(tap.bill("claude-opus-4-7", 0.5).cost_usd, 0.0);
-        tap.sent.store(true, Ordering::Relaxed);
+        tap.sent.answered();
         let bill = tap.bill("claude-opus-4-7", 0.5);
         assert_eq!((bill.booking, bill.cost_usd), (WorstCase, 0.5));
         tap.usage.lock().unwrap().cache_read_tokens = 1_000_000;

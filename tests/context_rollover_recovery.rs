@@ -80,6 +80,20 @@ fn untagged(message: &SharedMessage) -> serde_json::Value {
     message
 }
 
+/// Provider requests that are conversation rounds (streaming), as opposed to
+/// a rollover's non-streaming summary request.
+fn conversation_rounds(bodies: &Bodies) -> usize {
+    bodies
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|body| {
+            serde_json::from_slice::<serde_json::Value>(body)
+                .is_ok_and(|request| request["stream"] == true)
+        })
+        .count()
+}
+
 fn final_history(events: &[StreamEvent]) -> &[SharedMessage] {
     events
         .iter()
@@ -192,7 +206,15 @@ async fn retained_over_capacity_history_stops_before_network() {
 async fn productive_rollover_still_waits_for_ack_and_failed_ack_blocks_inference() {
     for accept in [false, true] {
         let _home = HomeGuard::new();
-        let (url, hits, _) = spawn_stub(Script::Sse(ANTHROPIC_SSE)).await;
+        // Streaming requests are conversation rounds; the one non-streaming
+        // request is the rollover's rolling-summary call.
+        let (url, _, bodies) = spawn_stub(Script::SseOrJson {
+            sse: ANTHROPIC_SSE,
+            json: ANTHROPIC_MESSAGES_JSON,
+            json_delay: Duration::ZERO,
+        })
+        .await;
+        let rounds = || conversation_rounds(&bodies);
         std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", url);
         let rt = runtime(6).await;
         // Force soft rollover at a threshold, without a model checkpoint round.
@@ -200,7 +222,10 @@ async fn productive_rollover_still_waits_for_ack_and_failed_ack_blocks_inference
         // prompt + tool schemas, assessed over no history), not from the
         // default tool registry's size: the successor target (2/3 of
         // pressure) then leaves ~10k tokens for its messages, room for the
-        // pinned first request beside the continuation envelope.
+        // pinned first request beside the continuation envelope (dropped
+        // index, note, rolling-summary reserve). At a fixed 20000/30000 that
+        // budget was below the envelope, so the first request could only
+        // become an archive stub.
         let base = rt.assess_context(&[]).await.used_tokens();
         let pressure = (base + 10_000) * 3 / 2;
         let rollover = pressure + 10_000;
@@ -215,6 +240,13 @@ async fn productive_rollover_still_waits_for_ack_and_failed_ack_blocks_inference
             user("Continue only remaining work.".into()),
             Arc::new(json!({"role":"assistant", "content":"Last bounded result."})),
         ];
+        // Precondition: the input reaches the rollover band (used >= rollover),
+        // so schema drift fails here rather than as a missing rollover.
+        let input = rt.assess_context(&history).await.used_tokens();
+        assert!(
+            input >= rollover,
+            "input footprint {input} must reach the rollover threshold {rollover}"
+        );
         let mut stream = rt
             .run_stream_with_messages(history.clone(), CancellationToken::new(), None, None, false)
             .await;
@@ -229,7 +261,8 @@ async fn productive_rollover_still_waits_for_ack_and_failed_ack_blocks_inference
             }) = event
             {
                 heads += 1;
-                assert_eq!(hits.load(Ordering::SeqCst), 0, "no inference before ack");
+                assert_eq!(rounds(), 0, "no inference before ack");
+                assert_eq!(bodies.lock().unwrap().len(), 1, "one summary request");
                 // Model the frontend's ACK contract; persistence is covered by
                 // separate durable-head tests. Never acknowledge a real save here.
                 if accept {
@@ -245,7 +278,7 @@ async fn productive_rollover_still_waits_for_ack_and_failed_ack_blocks_inference
             }
         }
         assert_eq!(heads, 1);
-        assert_eq!(hits.load(Ordering::SeqCst), usize::from(accept));
+        assert_eq!(rounds(), usize::from(accept));
         if accept {
             assert!(rt.context_management_status().contains("window 2"));
             let retained: Vec<_> = final_history(&events).iter().map(untagged).collect();
@@ -265,14 +298,29 @@ async fn productive_rollover_still_waits_for_ack_and_failed_ack_blocks_inference
 #[serial]
 async fn foreground_rollover_marks_the_first_request_of_the_new_window() {
     let home = HomeGuard::new();
-    let (url, hits, _) = spawn_stub(Script::Sse(ANTHROPIC_SSE)).await;
+    // PARITY: the rollover also sends one non-streaming rolling-summary
+    // request (not in the api-log), so the stub answers it with JSON and the
+    // count below is of conversation rounds, as in the test above.
+    let (url, _, bodies) = spawn_stub(Script::SseOrJson {
+        sse: ANTHROPIC_SSE,
+        json: ANTHROPIC_MESSAGES_JSON,
+        json_delay: Duration::ZERO,
+    })
+    .await;
     std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", url);
     let mut rt = runtime(6).await;
     rt.set_telemetry_level(synaps_cli::runtime::telemetry::TelemetryLevel::Basic);
-    rt.context_management_command("auto 20000 30000").unwrap();
+    // PARITY: bands sized from the fixed request part, as in the test above.
+    let base = rt.assess_context(&[]).await.used_tokens();
+    let pressure = (base + 10_000) * 3 / 2;
+    let rollover = pressure + 10_000;
+    rt.context_management_command(&format!("auto {pressure} {rollover}"))
+        .unwrap();
     let history = vec![
         user("Do not deploy.".into()),
-        Arc::new(json!({"role":"assistant", "content":"Archivable prior evidence. ".repeat(4000)})),
+        Arc::new(
+            json!({"role":"assistant", "content":"Archivable prior evidence. ".repeat(rollover as usize / 10)}),
+        ),
         user("Continue only remaining work.".into()),
         Arc::new(json!({"role":"assistant", "content":"Last bounded result."})),
     ];
@@ -290,7 +338,7 @@ async fn foreground_rollover_marks_the_first_request_of_the_new_window() {
             break;
         }
     }
-    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    assert_eq!(conversation_rounds(&bodies), 1);
     rt.telemetry_writer().unwrap().shutdown(Duration::from_secs(5));
     let log = std::fs::read_to_string(home.home.path().join(".cache/synaps/api-log.jsonl")).unwrap();
     let records: Vec<serde_json::Value> = log.lines().map(|l| serde_json::from_str(l).unwrap()).collect();

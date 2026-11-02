@@ -7,6 +7,7 @@
 
 use super::api::{ApiMethods, ApiOptions};
 use super::helpers::HelperMethods;
+use super::net_retry::{warn_transport, TransportDiag};
 use super::types::AuthState;
 use crate::{Result, RuntimeError, ToolRegistry};
 use reqwest::Client;
@@ -113,29 +114,42 @@ impl ApiMethods {
         let tools_schema = tools.tools_schema();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
-        if let Some(result) = crate::runtime::openai::try_route_with_memory_backend(
-            model,
-            client,
-            &tools_schema,
-            system_prompt,
-            messages,
-            &tx,
-            None,
-            None,
-            thinking_budget,
-            reasoning_level,
-            &tokio_util::sync::CancellationToken::new(),
-            &options.credential_source,
-            &options.token_cache,
-            max_retries,
-            options.codex_request_role,
-            options.tool_session_id.as_ref(),
-            options.session_tool_set.as_ref(),
-            options.memory_backend.as_ref(),
-            &options.trace,
-            options.suppress_stream_deltas,
-        )
-        .await
+        let diagnostic_context = crate::runtime::openai::terminal_diagnostics::Context {
+            session: options.diagnostic_session_id.clone(),
+            window: options.diagnostic_context_window,
+        };
+        if let Some(result) = crate::runtime::openai::terminal_diagnostics::CONTEXT
+            .scope(
+                diagnostic_context,
+                crate::runtime::openai::try_route_with_memory_backend(
+                    model,
+                    client,
+                    &tools_schema,
+                    system_prompt,
+                    messages,
+                    &tx,
+                    None,
+                    None,
+                    thinking_budget,
+                    reasoning_level,
+                    &tokio_util::sync::CancellationToken::new(),
+                    &options.credential_source,
+                    &options.token_cache,
+                    max_retries,
+                    options.codex_request_role,
+                    options.tool_session_id.as_ref(),
+                    options.session_tool_set.as_ref(),
+                    options.memory_backend.as_ref(),
+                    options.sandbox.as_ref(),
+                    &options.trace,
+                    options.suppress_stream_deltas,
+                    crate::runtime::openai::AttemptPolicy::Configured,
+                    // Only the legacy `run_single` loop sends this; it books no
+                    // child spend (workers drive the streaming path).
+                    None,
+                ),
+            )
+            .await
         {
             drop(tx);
             let _ = drain.await;
@@ -237,6 +251,7 @@ impl ApiMethods {
             Some(&execution_plan),
             cache_ttl,
             false,
+            options.effective_context_window(model),
         );
         let mut body = parts.body;
         body.set_thinking_display(options.thinking_display);
@@ -405,7 +420,10 @@ impl ApiMethods {
                                     last_err = e.to_string();
                                     let delay =
                                         super::telemetry::network_retry_delay(non_429_attempts);
-                                    tracing::warn!(
+                                    warn_transport!(
+                                        TransportDiag::from_reqwest(&e, "response_decode"),
+                                        non_429_attempts,
+                                        max_retries,
                                         "API retry {}/{} after {:?}: {}",
                                         non_429_attempts,
                                         max_retries,
@@ -528,11 +546,19 @@ impl ApiMethods {
                     Err(e) => {
                         options.request_compression.settle(&mut wire, false);
                         non_429_attempts += 1;
+                        let diag = TransportDiag::from_reqwest(&e, "transport");
                         if non_429_attempts > max_retries {
                             if let Some(t) = tracer.take() {
                                 let terminal = t.failed_terminal("network");
                                 t.finish(clock, None, None, None, None, terminal);
                             }
+                            warn_transport!(
+                                diag,
+                                non_429_attempts,
+                                max_retries,
+                                error = %crate::core::error::humanize_network_error(&e),
+                                "API network retries exhausted"
+                            );
                             return Err(RuntimeError::Api(e));
                         }
                         last_err = e.to_string();
@@ -547,12 +573,17 @@ impl ApiMethods {
                                 "network",
                             );
                         }
-                        tracing::warn!(
+                        // `last_err` carries reqwest's ` for url (…)`; the
+                        // line logs the URL-free humanized text instead.
+                        warn_transport!(
+                            diag,
+                            non_429_attempts,
+                            max_retries,
                             "API retry {}/{} after {:?}: {}",
                             non_429_attempts,
                             max_retries,
                             delay,
-                            last_err
+                            crate::core::error::humanize_network_error(&e)
                         );
                         tokio::time::sleep(delay).await;
                     }
@@ -583,10 +614,14 @@ impl ApiMethods {
         Ok(json)
     }
 
-    /// Simple non-streaming API call without tools (used for compaction).
-    /// Uses a caller-supplied system prompt (replaces the runtime's) and forces
-    /// "low" effort on adaptive models — summarization doesn't benefit from
-    /// heavy reasoning budgets.
+    /// Simple non-streaming API call without tools (compaction and the
+    /// rollover summary). Uses a caller-supplied system prompt (replaces the
+    /// runtime's). Without an output ceiling it forces "low" effort on
+    /// adaptive models — summarization doesn't benefit from heavy reasoning
+    /// budgets; with one, thinking is off so the ceiling bounds all output.
+    /// Retry bounds come from `policy`; [`SimpleCallPolicy::single`] makes
+    /// exactly one upstream attempt on every route. The reply's usage is
+    /// reported separately from its text, on every route that reports it.
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn call_api_simple(
         auth: &Arc<RwLock<AuthState>>,
@@ -596,54 +631,142 @@ impl ApiMethods {
         thinking_budget: u32,
         reasoning_level: agent_core::reasoning::ReasoningLevel,
         messages: &[crate::SharedMessage],
-        max_retries: u32,
+        policy: SimpleCallPolicy,
         options: &ApiOptions,
-    ) -> Result<String> {
+    ) -> SimpleReply {
         // Host-only message metadata never reaches any provider, whatever
         // history the caller passes in; strip before routing/serializing.
         let wire_messages = super::continuation::wire_messages(messages);
         let messages = wire_messages.as_deref().unwrap_or(messages);
         let tools_schema = Arc::new(Vec::new());
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        // Display events are not needed here; routed transports return the
+        // provider-reported usage, as reported, in the reply's `usage`.
         let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
         let routed_system_prompt = Some(system_prompt.to_string());
-        if let Some(result) = crate::runtime::openai::try_route_with_memory_backend(
-            model,
-            client,
-            &tools_schema,
-            &routed_system_prompt,
-            messages,
-            &tx,
-            None,
-            None,
-            thinking_budget,
-            reasoning_level,
-            &tokio_util::sync::CancellationToken::new(),
-            // call_api_simple is an internal helper without ApiOptions; codex here
-            // uses the Local credential. (Broker-routed codex goes via the stream path.)
-            &crate::auth::CredentialSource::Local,
-            &crate::auth::TokenCache::new(),
-            max_retries,
-            crate::runtime::openai::catalog::CodexRequestRole::Internal,
-            // Internal text-only helper: no tool session identity here, so
-            // an extension route (which cannot execute tools from this
-            // empty-schema path anyway) fails closed to a local
-            // default-core gate identity — never to ungated execution.
-            None,
-            None,
-            options.memory_backend.as_ref(),
-            &options.trace,
-            options.suppress_stream_deltas,
-        )
-        .await
+        let diagnostic_context = crate::runtime::openai::terminal_diagnostics::Context {
+            session: options.diagnostic_session_id.clone(),
+            window: options.diagnostic_context_window,
+        };
+        if let Some(result) = crate::runtime::openai::terminal_diagnostics::CONTEXT
+            .scope(
+                diagnostic_context,
+                crate::runtime::openai::try_route_with_memory_backend(
+                    model,
+                    client,
+                    &tools_schema,
+                    &routed_system_prompt,
+                    messages,
+                    &tx,
+                    None,
+                    policy.max_output_tokens,
+                    thinking_budget,
+                    reasoning_level,
+                    &tokio_util::sync::CancellationToken::new(),
+                    // The runtime's credential source and token cache, as for any
+                    // conversation request: a remote broker owns these credentials.
+                    &options.credential_source,
+                    &options.token_cache,
+                    policy.max_retries,
+                    crate::runtime::openai::catalog::CodexRequestRole::Internal,
+                    // Internal text-only helper: no tool session identity here, so
+                    // an extension route (which cannot execute tools from this
+                    // empty-schema path anyway) fails closed to a local
+                    // default-core gate identity — never to ungated execution.
+                    None,
+                    None,
+                    options.memory_backend.as_ref(),
+                    options.sandbox.as_ref(),
+                    &options.trace,
+                    options.suppress_stream_deltas,
+                    policy.attempts,
+                    // A summary's spend is booked at its own settlement, never here.
+                    None,
+                ),
+            )
+            .await
         {
             drop(tx);
             let _ = drain.await;
-            let response = result.map_err(|e| {
-                crate::runtime::openai::net::provider_error_to_runtime_for(model, e)
-            })?;
-            return Ok(Self::concat_response_text(&response));
+            // Usage is settled independently of the text: a failed reply
+            // that reported its usage is charged that usage.
+            let usage = match &result {
+                Ok(reply) => reported_usage(reply.get("usage")),
+                Err(error) => failure_reported_usage(error.as_ref()),
+            };
+            let spend = match (usage, &result) {
+                (Some(usage), _) => Spend::Reported(usage),
+                (None, Ok(_)) => Spend::Unknown,
+                (None, Err(error)) => routed_failure_spend(error.as_ref()),
+            };
+            return SimpleReply {
+                text: result
+                    .map(|response| Self::concat_response_text(&response))
+                    .map_err(|e| {
+                        crate::runtime::openai::net::provider_error_to_runtime_for(model, e)
+                    }),
+                spend,
+                failure: None,
+                stop: None,
+            };
         }
+        drop(tx);
+        let _ = drain.await;
+        let mut spend = Spend::NotDispatched;
+        let mut failure = None;
+        match Self::anthropic_simple(
+            auth,
+            client,
+            model,
+            system_prompt,
+            thinking_budget,
+            messages,
+            policy,
+            options,
+            &mut spend,
+            &mut failure,
+        )
+        .await
+        {
+            Ok((text, usage, stop)) => SimpleReply {
+                text: Ok(text),
+                spend: reported_usage(usage.as_ref()).map_or(Spend::Unknown, Spend::Reported),
+                failure: None,
+                stop,
+            },
+            Err(error) => SimpleReply {
+                text: Err(error),
+                spend,
+                failure,
+                stop: None,
+            },
+        }
+    }
+
+    /// The Anthropic Messages leg of [`Self::call_api_simple`]. An empty
+    /// reply is `Ok("")`, so its usage is still returned, and so is its
+    /// stop reason. On failure `spend`
+    /// says what the failure is known to have cost; it starts
+    /// [`Spend::NotDispatched`]. `failure` says how the last attempt failed
+    /// once it had a response or lost its connection.
+    #[allow(clippy::too_many_arguments)]
+    async fn anthropic_simple(
+        auth: &Arc<RwLock<AuthState>>,
+        client: &Client,
+        model: &str,
+        system_prompt: &str,
+        thinking_budget: u32,
+        messages: &[crate::SharedMessage],
+        policy: SimpleCallPolicy,
+        options: &ApiOptions,
+        spend: &mut Spend,
+        failure: &mut Option<SentFailure>,
+    ) -> Result<(
+        String,
+        Option<Value>,
+        Option<crate::runtime::trace::StopReason>,
+    )> {
+        let (max_retries, max_429_retries) = (policy.max_retries, policy.max_429_retries);
         let model = model.strip_prefix("anthropic/").unwrap_or(model);
 
         let (auth_header_name, auth_header_value, auth_type) = Self::build_auth_header(auth).await;
@@ -655,53 +778,36 @@ impl ApiMethods {
             ));
         }
 
-        // System blocks + translation report come from one helper, in one
-        // branch: the report is derived from the actual assembly decision
-        // (OAuth synthesizes transport identity + product identity +
-        // guidance; api_key is lossless) and can never drift from the wire.
-        let (system_blocks, compaction_report) =
-            compaction_system_blocks(&auth_type, system_prompt);
-        let adaptive = crate::core::models::model_supports_adaptive_thinking(model);
-        let budget = if thinking_budget == 0 {
-            crate::core::models::DEFAULT_LEGACY_ADAPTIVE_FALLBACK
-        } else {
-            thinking_budget
-        };
-        // A model that rejects input + `max_tokens` over the window gets the
-        // room the input leaves (no-op on Claude 4.5 and later). Measured
-        // against the window this path's beta set (default options) opens.
-        let max_tokens = HelperMethods::fit_max_tokens_to_window(
+        let Some((mut body, compaction_report)) = simple_body(
             model,
-            HelperMethods::max_tokens_for_model(model),
+            messages,
+            thinking_budget,
+            policy.max_output_tokens,
+            &auth_type,
+            system_prompt,
+            options.effective_context_window(model),
+        ) else {
+            // Not sent: `spend` stays NotDispatched.
+            return Err(RuntimeError::Config(
+                "bounded request not sent: no verified output ceiling for this model".into(),
+            ));
+        };
+        // PARITY (upstream fit): a model that rejects input + `max_tokens`
+        // over the window gets the room the input leaves (no-op on Claude
+        // 4.5 and later), never raised. Measured against the window this
+        // path's beta set (default options) opens; the floor keeps
+        // `max_tokens > budget_tokens` where the body budgets thinking.
+        let fitted = HelperMethods::fit_max_tokens_to_window(
+            model,
+            body["max_tokens"].as_u64().unwrap_or_default(),
             Self::provider_window(&ApiOptions::default(), model),
-            (!adaptive).then_some(u64::from(budget)),
+            body["thinking"]["budget_tokens"].as_u64(),
             || {
-                super::context::conservative_token_estimate(&system_blocks.to_string())
+                super::context::conservative_token_estimate(&body["system"].to_string())
                     .saturating_add(super::context::estimate_history(messages))
             },
         );
-        let mut body = json!({
-            "model": model,
-            "max_tokens": max_tokens,
-            "messages": messages,
-            "thinking": if adaptive {
-                json!({ "type": "adaptive", "display": "summarized" })
-            } else {
-                json!({
-                    "type": "enabled",
-                    "budget_tokens": budget,
-                    "display": "summarized"
-                })
-            }
-        });
-
-        // Force low effort on adaptive models — compaction is a structured
-        // summarization task; heavy reasoning wastes tokens.
-        if crate::core::models::model_supports_adaptive_thinking(model) {
-            body["output_config"] = json!({"effort": "low"});
-        }
-
-        body["system"] = system_blocks;
+        body["max_tokens"] = json!(fitted);
 
         // Serialize once up-front (exact-bytes contract, spec 6.2): the
         // same buffer is sent on every retry and is the sole source for the
@@ -722,6 +828,32 @@ impl ApiMethods {
             .or_else(|| std::env::var("SYNAPS_ANTHROPIC_BASE_URL").ok())
             .unwrap_or_else(|| "https://api.anthropic.com".into());
         let anthropic_url = format!("{}/v1/messages", anthropic_base.trim_end_matches('/'));
+        // A bounded single attempt goes out only on a client that never
+        // follows redirects; only there does a refused connection prove
+        // not-sent. Without one it is not sent at all (`spend` stays
+        // NotDispatched), never on the caller's client.
+        let bounded = policy.attempts == crate::runtime::openai::AttemptPolicy::Single;
+        let bounded_client = if bounded {
+            match super::bounded_http_client() {
+                Some(client) => Some(client),
+                None => {
+                    return Err(RuntimeError::Config(
+                        "bounded request not sent: no HTTP client that refuses redirects".into(),
+                    ))
+                }
+            }
+        } else {
+            None
+        };
+        let redirect_free = bounded_client.is_some();
+        let client = bounded_client.as_ref().unwrap_or(client);
+        // First-party rejection provenance only holds when no redirect can
+        // have taken the request to another host.
+        let settlement = if redirect_free && anthropic_base == "https://api.anthropic.com" {
+            SettlementRoute::AnthropicFirstParty
+        } else {
+            SettlementRoute::Unverified
+        };
 
         // ═══ TRACE (Task 8): compaction requests are traced too ═══
         // Report built above alongside the system blocks (Task 9 fix): OAuth
@@ -748,10 +880,25 @@ impl ApiMethods {
             .request_compression
             .encode(&anthropic_url, &body_bytes)
             .await;
+        // A gated (rollover summary) body goes out as one chunk, published
+        // only if the snapshot is still valid when the client pulls it: a
+        // session that changed while the request was connecting gets no
+        // body. Published once any attempt's body was published or answered.
+        let published_or_answered =
+            std::sync::Arc::new(super::keepwarm::Publication::default());
+        // A gated body is withdrawn when this call ends or is dropped
+        // unfinished (its caller timed out or gave up): the client's
+        // connection task, which can still hold it, then never produces it.
+        let _withdraw_on_drop = options.snapshot_gate.as_ref().map(|_| {
+            super::keepwarm::WithdrawOnDrop(std::sync::Arc::clone(&published_or_answered))
+        });
+        #[cfg(test)]
+        if let Some(seam) = options.snapshot_gate.as_ref().and_then(|gate| gate.seam()) {
+            published_or_answered.install_seam(seam);
+        }
 
         // Retry loop for transient errors (compaction path).
         // Same header-aware 429 handling as the main call_api loop.
-        const MAX_429_RETRIES_COMPACT: u32 = 8;
         let json: Value = {
             let mut last_err = String::new();
             let mut last_reset_hint: Option<String> = None;
@@ -761,7 +908,18 @@ impl ApiMethods {
             let mut attempt: u32 = 0;
 
             loop {
+                // A rollover summary whose session changed while it was
+                // prepared is not sent (spend stays NotDispatched).
+                if options
+                    .snapshot_gate
+                    .as_ref()
+                    .is_some_and(|gate| !gate.valid())
+                {
+                    return Err(RuntimeError::Canceled);
+                }
                 clock = crate::runtime::trace::AttemptClock::start();
+                // From here on a failure may have cost something.
+                *spend = Spend::Unknown;
                 let mut req = client
                     .post(&anthropic_url)
                     .header(auth_header_name.clone(), auth_header_value.clone())
@@ -773,8 +931,21 @@ impl ApiMethods {
                     req = req.header("anthropic-beta", beta);
                 }
 
-                match wire.encoding_header(req).body(wire.bytes.clone()).send().await {
+                // PARITY: ours' gated body carries upstream's encoded `wire`
+                // bytes (#321), like the streaming path (api.rs).
+                let req = wire.encoding_header(req);
+                let req = match &options.snapshot_gate {
+                    Some(gate) => super::api::gated_body(
+                        req,
+                        wire.bytes.clone(),
+                        &published_or_answered,
+                        Some(super::warm_summary::BodyGate::Snapshot(gate.clone())),
+                    ),
+                    None => req.body(wire.bytes.clone()),
+                };
+                match req.send().await {
                     Ok(resp) => {
+                        published_or_answered.answered();
                         let status = resp.status();
                         options
                             .request_compression
@@ -789,9 +960,15 @@ impl ApiMethods {
                                         // SECURITY (spec §5.1): untrusted envelope —
                                         // surface only a vetted static class label.
                                         if let Some(error_type) = j["error"]["type"].as_str() {
-                                            let vetted =
-                                                crate::core::error::sanitize_error_type(error_type)
-                                                    .unwrap_or("unrecognized_error");
+                                            let known =
+                                                crate::core::error::sanitize_error_type(error_type);
+                                            *failure = Some(SentFailure {
+                                                class: FailureClass::Envelope,
+                                                error_type: known,
+                                            });
+                                            #[cfg(test)]
+                                            set_error_body_for_test(&j.to_string());
+                                            let vetted = known.unwrap_or("unrecognized_error");
                                             if let Some(t) = tracer.take() {
                                                 clock.mark_stream_end();
                                                 let terminal = t.failed_terminal(vetted);
@@ -830,6 +1007,10 @@ impl ApiMethods {
                                 Err(e) => {
                                     non_429_attempts += 1;
                                     if non_429_attempts > max_retries {
+                                        *failure = Some(SentFailure {
+                                            class: FailureClass::Decode,
+                                            error_type: None,
+                                        });
                                         if let Some(t) = tracer.take() {
                                             let terminal = t.failed_terminal("response_decode");
                                             t.finish(
@@ -856,7 +1037,10 @@ impl ApiMethods {
                                             "response_decode",
                                         );
                                     }
-                                    tracing::warn!(
+                                    warn_transport!(
+                                        TransportDiag::from_reqwest(&e, "response_decode"),
+                                        non_429_attempts,
+                                        max_retries,
                                         "Compaction retry {}/{} after {:?}: {}",
                                         non_429_attempts,
                                         max_retries,
@@ -906,12 +1090,31 @@ impl ApiMethods {
                             }
 
                             let retry_exhausted = if is_429 {
-                                attempt >= MAX_429_RETRIES_COMPACT
+                                attempt >= max_429_retries
                             } else {
                                 non_429_attempts >= max_retries
                             };
 
                             if !is_retryable || retry_exhausted {
+                                *failure = Some(SentFailure {
+                                    class: FailureClass::Status(status.as_u16()),
+                                    error_type: vetted_error_type(&error_text),
+                                });
+                                #[cfg(test)]
+                                set_error_body_for_test(&error_text);
+                                // Only the first attempt: an earlier retried
+                                // failure may have generated something.
+                                *spend = failure_spend(
+                                    settlement,
+                                    if attempt == 0 {
+                                        FailureStage::HttpError {
+                                            status: status.as_u16(),
+                                            error_type: anthropic_error_type(&error_text),
+                                        }
+                                    } else {
+                                        FailureStage::AfterSend
+                                    },
+                                );
                                 let log_rid = trace_rid.clone();
                                 if let Some(t) = tracer.take() {
                                     let terminal =
@@ -965,8 +1168,41 @@ impl ApiMethods {
                     }
                     Err(e) => {
                         options.request_compression.settle(&mut wire, false);
+                        // A gated body no attempt published, withdrawn
+                        // so none can be published later by the client's
+                        // connection task: the provider never had a
+                        // complete request. Withdrawn only where no retry
+                        // follows.
+                        let gated = options.snapshot_gate.is_some();
+                        let withdrawn = || gated && published_or_answered.withdraw();
+                        // Withheld because the session changed: not sent,
+                        // and not retried.
+                        if options
+                            .snapshot_gate
+                            .as_ref()
+                            .is_some_and(|gate| !gate.valid())
+                            && withdrawn()
+                        {
+                            *spend = failure_spend(settlement, FailureStage::NotSent);
+                            if let Some(t) = tracer.take() {
+                                let terminal = t.failed_terminal("withdrawn");
+                                t.finish(clock, None, None, None, None, terminal);
+                            }
+                            return Err(RuntimeError::Canceled);
+                        }
                         non_429_attempts += 1;
                         if non_429_attempts > max_retries {
+                            // A refused connection on the only attempt, with
+                            // no redirect followed, sent nothing, and so did
+                            // a gated body never published; any other
+                            // transport failure may have.
+                            if (e.is_connect() && attempt == 0 && redirect_free) || withdrawn() {
+                                *spend = failure_spend(settlement, FailureStage::NotSent);
+                            }
+                            *failure = Some(SentFailure {
+                                class: FailureClass::Network,
+                                error_type: None,
+                            });
                             if let Some(t) = tracer.take() {
                                 let terminal = t.failed_terminal("network");
                                 t.finish(clock, None, None, None, None, terminal);
@@ -985,12 +1221,17 @@ impl ApiMethods {
                                 "network",
                             );
                         }
-                        tracing::warn!(
+                        // `last_err` carries reqwest's ` for url (…)`; the
+                        // line logs the URL-free humanized text instead.
+                        warn_transport!(
+                            TransportDiag::from_reqwest(&e, "transport"),
+                            non_429_attempts,
+                            max_retries,
                             "Compaction API retry {}/{} after {:?}: {}",
                             non_429_attempts,
                             max_retries,
                             delay,
-                            last_err
+                            crate::core::error::humanize_network_error(&e)
                         );
                         tokio::time::sleep(delay).await;
                     }
@@ -1025,15 +1266,427 @@ impl ApiMethods {
             }
         }
 
-        if out.is_empty() {
-            return Err(RuntimeError::Tool(
-                "Compaction returned empty response".to_string(),
-            ));
-        }
-
-        Ok(out)
+        let stop = json["stop_reason"]
+            .as_str()
+            .map(crate::runtime::trace::anthropic::stop_reason_from_wire);
+        Ok((out, json.get("usage").cloned(), stop))
     }
 }
+
+/// Retry and output limits for one [`ApiMethods::call_api_simple`] call.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SimpleCallPolicy {
+    pub max_retries: u32,
+    pub max_429_retries: u32,
+    pub attempts: crate::runtime::openai::AttemptPolicy,
+    /// Provider output ceiling (`max_tokens`), including any reasoning.
+    pub max_output_tokens: Option<u32>,
+}
+
+impl SimpleCallPolicy {
+    /// `/compact`: the configured retries and the model's full output.
+    pub(crate) fn compaction(max_retries: u32) -> Self {
+        Self {
+            max_retries,
+            max_429_retries: MAX_429_RETRIES_COMPACT,
+            attempts: crate::runtime::openai::AttemptPolicy::Configured,
+            max_output_tokens: None,
+        }
+    }
+
+    /// Exactly one upstream attempt on every route, with an output ceiling.
+    pub(crate) fn single(max_output_tokens: u32) -> Self {
+        Self {
+            max_retries: 0,
+            max_429_retries: 0,
+            attempts: crate::runtime::openai::AttemptPolicy::Single,
+            max_output_tokens: Some(max_output_tokens),
+        }
+    }
+}
+
+/// Outcome of one simple call: the reply text (an empty reply is `Ok("")`)
+/// and, separately, what is known about its spend.
+#[derive(Debug)]
+pub(crate) struct SimpleReply {
+    pub text: Result<String>,
+    pub spend: Spend,
+    /// How a request that was sent failed, when the transport knows
+    /// (native Anthropic); `None` otherwise.
+    pub failure: Option<SentFailure>,
+    /// The stop reason the reply reported (native Anthropic); `None`
+    /// otherwise. A reply that stopped with a refusal may still carry the
+    /// text written before it.
+    pub stop: Option<crate::runtime::trace::StopReason>,
+}
+
+/// How a sent request failed (telemetry `summary_error_status`): the HTTP
+/// status, or what went wrong after a 200. Never provider text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FailureClass {
+    /// A non-success HTTP status.
+    Status(u16),
+    /// A 200 whose body is an error envelope.
+    Envelope,
+    /// A 200 whose body did not decode.
+    Decode,
+    /// A streamed 200 that ended in an error or broke off.
+    Stream,
+    /// No response: the connection failed after the request may have gone
+    /// out.
+    Network,
+}
+
+impl FailureClass {
+    /// The telemetry value: the status number, or the class name.
+    pub(crate) fn label(self) -> String {
+        match self {
+            Self::Status(status) => status.to_string(),
+            Self::Envelope => "envelope".into(),
+            Self::Decode => "decode".into(),
+            Self::Stream => "stream".into(),
+            Self::Network => "network".into(),
+        }
+    }
+}
+
+/// [`FailureClass`] plus the provider's error type, when it is one of our
+/// vetted static labels (never the provider's bytes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SentFailure {
+    pub class: FailureClass,
+    pub error_type: Option<&'static str>,
+}
+
+/// How a native Anthropic request with an output ceiling keeps thinking
+/// inside it (thinking tokens count toward `max_tokens`). Vetted per model
+/// from the provider's thinking table ("Configuring thinking" and the
+/// per-model notes, platform.claude.com/docs/en/build-with-claude/thinking);
+/// a model not listed has no verified ceiling and is not sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CeilingThinking {
+    /// Thinking is off unless requested (models before 4.5): no thinking
+    /// field.
+    OffWhenOmitted,
+    /// The documented disable: `thinking: {"type": "disabled"}` (at the
+    /// default effort, which is high or below on every listed model).
+    Disabled,
+    /// Claude Sonnet 5.5 rejects `disabled`; `between_tools` turns
+    /// up-front thinking off, and without tools the reply is text only.
+    BetweenTools,
+    /// Thinking can't be turned off: explicit adaptive at effort low, and
+    /// the limit leaves the cap again for thinking.
+    AdaptiveLow,
+}
+
+impl CeilingThinking {
+    /// The vetted class of `model` (an `anthropic/` prefix, a `-YYYYMMDD`
+    /// date or `-latest` suffix ignored); `None` for any model not listed.
+    pub(crate) fn of(model: &str) -> Option<Self> {
+        let id = model.to_ascii_lowercase();
+        let id = id.strip_prefix("anthropic/").unwrap_or(&id);
+        let id = id.strip_suffix("-latest").unwrap_or(id);
+        let id = match id.rsplit_once('-') {
+            Some((base, date)) if date.len() == 8 && date.bytes().all(|b| b.is_ascii_digit()) => {
+                base
+            }
+            _ => id,
+        };
+        // Thinking can't be turned off (the table's "disabled" column is a
+        // 400 error, and so is every other off switch).
+        const ADAPTIVE_ONLY: &[&str] = &[
+            "claude-opus-5-5",
+            "claude-fable-5-1",
+            "claude-mythos-5-1",
+            "claude-fable-5",
+            "claude-mythos-5",
+            "claude-mythos-preview",
+        ];
+        // `disabled` turns thinking off (Opus 5 and Haiku 5.5 at effort
+        // high or below; their defaults are high and medium).
+        const DISABLE: &[&str] = &[
+            "claude-haiku-5-5",
+            "claude-opus-5",
+            "claude-sonnet-5",
+            "claude-opus-4-8",
+            "claude-opus-4-7",
+            "claude-opus-4-6",
+            "claude-sonnet-4-6",
+            "claude-opus-4-5",
+            "claude-sonnet-4-5",
+            "claude-haiku-4-5",
+        ];
+        // Before 4.5: extended thinking is opt-in (`enabled` with a
+        // budget) or absent.
+        const OFF_WHEN_OMITTED: &[&str] = &[
+            "claude-opus-4-1",
+            "claude-opus-4-0",
+            "claude-opus-4",
+            "claude-sonnet-4-0",
+            "claude-sonnet-4",
+            "claude-3-7-sonnet",
+            "claude-3-5-sonnet",
+            "claude-3-5-haiku",
+            "claude-3-opus",
+            "claude-3-haiku",
+        ];
+        if ADAPTIVE_ONLY.contains(&id) {
+            Some(Self::AdaptiveLow)
+        } else if id == "claude-sonnet-5-5" {
+            Some(Self::BetweenTools)
+        } else if DISABLE.contains(&id) {
+            Some(Self::Disabled)
+        } else if OFF_WHEN_OMITTED.contains(&id) {
+            Some(Self::OffWhenOmitted)
+        } else {
+            None
+        }
+    }
+
+    /// The `max_tokens` for a reply of `cap` tokens on a model whose largest
+    /// output is `model_max`: the cap, or the cap plus as much again for
+    /// thinking where it can't be off; never above `model_max`.
+    pub(crate) fn limit(self, cap: u64, model_max: u64) -> u64 {
+        let limit = match self {
+            Self::AdaptiveLow => cap.saturating_add(cap),
+            Self::OffWhenOmitted | Self::Disabled | Self::BetweenTools => cap,
+        };
+        limit.min(model_max)
+    }
+
+    /// Sets the body's `thinking` and `output_config` for this class.
+    fn apply(self, body: &mut Value) {
+        let Some(fields) = body.as_object_mut() else {
+            return;
+        };
+        fields.remove("thinking");
+        fields.remove("output_config");
+        let thinking = match self {
+            Self::OffWhenOmitted => return,
+            Self::Disabled => json!({"type": "disabled"}),
+            Self::BetweenTools => json!({"type": "between_tools"}),
+            Self::AdaptiveLow => {
+                fields.insert("output_config".into(), json!({"effort": "low"}));
+                json!({"type": "adaptive"})
+            }
+        };
+        fields.insert("thinking".into(), thinking);
+    }
+}
+
+
+/// The Anthropic Messages body of a simple request (`/compact`, the
+/// screened rollover summary) and its system translation report, without
+/// the transport. `model` has no `anthropic/` prefix; `context_window` is
+/// the runtime's effective window, which sizes an unbounded request's
+/// `max_tokens` ([`HelperMethods::max_tokens_for_request`]). `None`: not
+/// sent.
+fn simple_body(
+    model: &str,
+    messages: &[crate::SharedMessage],
+    thinking_budget: u32,
+    max_output_tokens: Option<u32>,
+    auth_type: &str,
+    system_prompt: &str,
+    context_window: u64,
+) -> Option<(Value, crate::runtime::transport::report::TranslationReport)> {
+    let request_max = HelperMethods::max_tokens_for_request(model, context_window);
+    let mut body = json!({
+        "model": model,
+        "max_tokens": max_output_tokens
+            .map_or(request_max, u64::from),
+        "messages": messages,
+        "thinking": if crate::core::models::model_supports_adaptive_thinking(model) {
+            json!({ "type": "adaptive", "display": "summarized" })
+        } else {
+            // An explicit ceiling replaces this field below.
+            let budget = HelperMethods::anthropic_thinking_budget(thinking_budget, request_max);
+            json!({
+                "type": "enabled",
+                "budget_tokens": budget,
+                "display": "summarized"
+            })
+        }
+    });
+
+    // Force low effort on adaptive models — compaction is a structured
+    // summarization task; heavy reasoning wastes tokens.
+    if crate::core::models::model_supports_adaptive_thinking(model) {
+        body["output_config"] = json!({"effort": "low"});
+    }
+    // An explicit output ceiling bounds every output token, thinking
+    // included: the model's vetted way to keep thinking inside it, or no
+    // request.
+    if max_output_tokens.is_some() {
+        CeilingThinking::of(model)?.apply(&mut body);
+    }
+
+    // System blocks + translation report come from one helper, in one
+    // branch: the report is derived from the actual assembly decision
+    // (OAuth synthesizes transport identity + product identity +
+    // guidance; api_key is lossless) and can never drift from the wire.
+    let (system_blocks, compaction_report) =
+        compaction_system_blocks(auth_type, system_prompt);
+    body["system"] = system_blocks;
+    Some((body, compaction_report))
+}
+
+/// Test seam (the live probe only, never built outside tests): the last
+/// error body a native Anthropic simple request received, so a live probe
+/// can read why a request was rejected. The product keeps only the status
+/// and a vetted label.
+#[cfg(test)]
+pub(crate) static ERROR_BODY_FOR_TEST: std::sync::Mutex<Option<String>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn set_error_body_for_test(body: &str) {
+    *ERROR_BODY_FOR_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(body.to_owned());
+}
+
+/// The vetted static label for an Anthropic error body's `error.type`.
+pub(super) fn vetted_error_type(body: &str) -> Option<&'static str> {
+    let parsed: Value = serde_json::from_str(body).ok()?;
+    crate::core::error::sanitize_error_type(parsed["error"]["type"].as_str()?)
+}
+
+/// What a simple call is known to have cost.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Spend {
+    /// Nothing reached the provider (preflight, routing or local refusal,
+    /// connection refused): no cost.
+    NotDispatched,
+    /// A first-party endpoint positively identified the request as rejected
+    /// before generation (see [`failure_spend`]): no cost.
+    RejectedBeforeGeneration,
+    /// Provider-reported usage, in Anthropic fields.
+    Reported(Value),
+    /// Dispatched, but the cost is not known (timeout, disconnect, server
+    /// error, a reply without usage).
+    Unknown,
+}
+
+/// Provider-reported usage (Anthropic field names) normalized for
+/// settlement, or `None` when the report does not show what the call cost:
+/// an absent, `null` or empty report, or one without a numeric input or
+/// output counter (a missing output count is not free output). Explicit
+/// zeros are a report. Missing cache counters are zero.
+pub(crate) fn reported_usage(usage: Option<&Value>) -> Option<Value> {
+    let usage = usage?.as_object()?;
+    let count = |key: &str| usage.get(key).and_then(Value::as_u64);
+    Some(json!({
+        "input_tokens": count("input_tokens")?,
+        "output_tokens": count("output_tokens")?,
+        "cache_read_input_tokens": count("cache_read_input_tokens").unwrap_or(0),
+        "cache_creation_input_tokens": count("cache_creation_input_tokens").unwrap_or(0),
+    }))
+}
+
+/// The endpoint a simple call reached, as far as evidence about its spend
+/// goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SettlementRoute {
+    /// Anthropic Messages on the official `https://api.anthropic.com` host,
+    /// not overridden: its documented error types say what was rejected.
+    AnthropicFirstParty,
+    /// Anything else: an overridden or proxied endpoint, a router, a
+    /// compatible server, or a broker-routed provider. Its error statuses
+    /// are not evidence that nothing was generated.
+    Unverified,
+}
+
+/// How far one failed request got.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FailureStage {
+    /// Refused locally or never connected: nothing was sent.
+    NotSent,
+    /// The first and only attempt was sent and answered with an HTTP error
+    /// status; `error_type` is the provider's error type when it parsed to
+    /// one this host recognizes.
+    HttpError {
+        status: u16,
+        error_type: Option<&'static str>,
+    },
+    /// Sent, then failed some other way (timeout, disconnect, decode, an
+    /// earlier retried attempt): what it cost is unknown.
+    AfterSend,
+}
+
+/// Anthropic error types (Messages API, non-streaming) returned while
+/// validating or authorizing a request, before any generation. Rate limits
+/// (`rate_limit_error`), size limits (`request_too_large`), overload and
+/// server errors are excluded: they are not shown to be free.
+const ANTHROPIC_PRE_GENERATION_REJECTIONS: &[(u16, &str)] = &[
+    (400, "invalid_request_error"),
+    (401, "authentication_error"),
+    (403, "permission_error"),
+];
+
+/// The recognized Anthropic error type of an error body, if any. Only a
+/// static label leaves this function; the body is untrusted.
+pub(crate) fn anthropic_error_type(body: &str) -> Option<&'static str> {
+    let parsed: Value = serde_json::from_str(body).ok()?;
+    let error_type = parsed["error"]["type"].as_str()?;
+    ANTHROPIC_PRE_GENERATION_REJECTIONS
+        .iter()
+        .map(|(_, t)| *t)
+        .find(|t| *t == error_type)
+}
+
+/// What a failed request is known to have cost. Only a positively
+/// identified pre-generation rejection from a first-party endpoint, or a
+/// request that was never sent, is free; every other failure after sending
+/// (any status on an unverified endpoint, 409/413/429/5xx everywhere) keeps
+/// its spend unknown.
+pub(crate) fn failure_spend(route: SettlementRoute, stage: FailureStage) -> Spend {
+    match (route, stage) {
+        (_, FailureStage::NotSent) => Spend::NotDispatched,
+        (
+            SettlementRoute::AnthropicFirstParty,
+            FailureStage::HttpError {
+                status,
+                error_type: Some(error_type),
+            },
+        ) if ANTHROPIC_PRE_GENERATION_REJECTIONS.contains(&(status, error_type)) => {
+            Spend::RejectedBeforeGeneration
+        }
+        _ => Spend::Unknown,
+    }
+}
+
+/// Spend of a routed request that failed without reporting usage. Routed
+/// transports mark a request [`NotDispatched`](crate::runtime::openai::NotDispatched)
+/// when they know nothing was sent; any other routed failure (including
+/// every HTTP error status through the broker) is unverified.
+pub(crate) fn routed_failure_spend(error: &(dyn std::error::Error + 'static)) -> Spend {
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(e) = current {
+        if e.is::<crate::runtime::openai::NotDispatched>() {
+            return failure_spend(SettlementRoute::Unverified, FailureStage::NotSent);
+        }
+        current = e.source();
+    }
+    failure_spend(SettlementRoute::Unverified, FailureStage::AfterSend)
+}
+
+/// Usage a failed routed request reported for its only attempt (see
+/// [`FailedWithUsage`](crate::runtime::openai::FailedWithUsage)), normalized
+/// like [`reported_usage`]: `None` when absent or partial.
+pub(crate) fn failure_reported_usage(error: &(dyn std::error::Error + 'static)) -> Option<Value> {
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(e) = current {
+        if let Some(failed) = e.downcast_ref::<crate::runtime::openai::FailedWithUsage>() {
+            return reported_usage(Some(&failed.usage));
+        }
+        current = e.source();
+    }
+    None
+}
+
+/// Rate-limit retries on the compaction path (`/compact`).
+pub(super) const MAX_429_RETRIES_COMPACT: u32 = 8;
 
 #[cfg(test)]
 mod compaction_system_blocks_tests {
@@ -1196,5 +1849,291 @@ mod concat_response_text_tests {
     fn returns_empty_for_non_array_content() {
         let v = json!({"content": "stringified"});
         assert_eq!(ApiMethods::concat_response_text(&v), "");
+    }
+}
+
+#[cfg(test)]
+mod settlement_tests {
+    use super::*;
+
+    fn http(status: u16, body: &str) -> FailureStage {
+        FailureStage::HttpError {
+            status,
+            error_type: anthropic_error_type(body),
+        }
+    }
+
+    #[test]
+    fn only_a_first_party_pre_generation_rejection_is_free() {
+        use SettlementRoute::{AnthropicFirstParty as First, Unverified};
+        let typed =
+            |t: &str| format!(r#"{{"type":"error","error":{{"type":"{t}","message":"m"}}}}"#);
+        for (status, error_type) in [
+            (400, "invalid_request_error"),
+            (401, "authentication_error"),
+            (403, "permission_error"),
+        ] {
+            assert_eq!(
+                failure_spend(First, http(status, &typed(error_type))),
+                Spend::RejectedBeforeGeneration,
+                "{status} {error_type}"
+            );
+            assert_eq!(
+                failure_spend(Unverified, http(status, &typed(error_type))),
+                Spend::Unknown,
+                "unverified endpoint, {status}"
+            );
+        }
+        for (status, body) in [
+            (409, typed("invalid_request_error")),
+            (413, typed("request_too_large")),
+            (429, typed("rate_limit_error")),
+            (400, "{}".to_string()),
+            (400, typed("overloaded_error")),
+            (401, typed("invalid_request_error")),
+            (500, typed("api_error")),
+            (529, typed("overloaded_error")),
+        ] {
+            assert_eq!(
+                failure_spend(First, http(status, &body)),
+                Spend::Unknown,
+                "{status} {body}"
+            );
+        }
+        for route in [First, Unverified] {
+            assert_eq!(
+                failure_spend(route, FailureStage::NotSent),
+                Spend::NotDispatched
+            );
+            assert_eq!(
+                failure_spend(route, FailureStage::AfterSend),
+                Spend::Unknown
+            );
+        }
+    }
+
+    #[test]
+    fn routed_failures_are_free_only_when_marked_not_dispatched() {
+        let marked = crate::runtime::openai::NotDispatched::boxed("refused");
+        assert_eq!(routed_failure_spend(marked.as_ref()), Spend::NotDispatched);
+        for text in [
+            "openai request failed: broker transport error: provider request failed: 400 Bad Request",
+            "openai request failed: broker transport error: provider request failed: 429 Too Many Requests",
+            "codex request failed: 413",
+        ] {
+            let error: Box<dyn std::error::Error + Send + Sync> = text.into();
+            assert_eq!(routed_failure_spend(error.as_ref()), Spend::Unknown, "{text}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod simple_body_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn body(model: &str, ceiling: Option<u32>, auth: &str) -> Option<String> {
+        let messages = vec![Arc::new(json!({"role":"user","content":"TRANSCRIPT"}))];
+        simple_body(model, &messages, 0, ceiling, auth, "PROMPT", 200_000)
+            .map(|(b, _)| b.to_string())
+    }
+
+    /// An unbounded (`/compact`) body for `thinking_budget` at `window`.
+    fn unbounded(model: &str, thinking_budget: u32, window: u64) -> Value {
+        let messages = vec![Arc::new(json!({"role":"user","content":"TRANSCRIPT"}))];
+        simple_body(model, &messages, thinking_budget, None, "api_key", "PROMPT", window)
+            .unwrap()
+            .0
+    }
+
+    /// Goldens of the bounded (rollover summary) body per thinking class:
+    /// the ceiling is `max_tokens` as given; thinking is the model's
+    /// documented disable, absent where it is off when omitted, or explicit
+    /// adaptive at effort low where it cannot be turned off.
+    #[test]
+    fn bounded_bodies_per_thinking_class() {
+        let prefix = r#"{"max_tokens":"#;
+        let msgs = r#""messages":[{"content":"TRANSCRIPT","role":"user"}]"#;
+        let system = r#""system":[{"text":"PROMPT","type":"text"}]"#;
+        let golden = |max: u32, model: &str, middle: &str, thinking: &str| {
+            format!("{prefix}{max},{msgs},\"model\":\"{model}\",{middle}{system}{thinking}}}")
+        };
+        // Thinking cannot be off: adaptive, effort low.
+        assert_eq!(
+            body("claude-opus-5-5", Some(5038), "api_key").as_deref(),
+            Some(
+                golden(
+                    5038,
+                    "claude-opus-5-5",
+                    r#""output_config":{"effort":"low"},"#,
+                    r#","thinking":{"type":"adaptive"}"#
+                )
+                .as_str()
+            )
+        );
+        // Sonnet 5.5 rejects `disabled`; `between_tools` is its off switch.
+        assert_eq!(
+            body("claude-sonnet-5-5", Some(2519), "api_key").as_deref(),
+            Some(
+                golden(
+                    2519,
+                    "claude-sonnet-5-5",
+                    "",
+                    r#","thinking":{"type":"between_tools"}"#
+                )
+                .as_str()
+            )
+        );
+        // The documented disable.
+        for model in ["claude-sonnet-4-6", "claude-haiku-4-5-20251001", "claude-opus-5"] {
+            assert_eq!(
+                body(model, Some(2519), "api_key").as_deref(),
+                Some(golden(2519, model, "", r#","thinking":{"type":"disabled"}"#).as_str()),
+                "{model}"
+            );
+        }
+        // Off when omitted (before the 4.5 models): no thinking field.
+        assert_eq!(
+            body("claude-opus-4-1-20250805", Some(2519), "api_key").as_deref(),
+            Some(golden(2519, "claude-opus-4-1-20250805", "", "").as_str())
+        );
+        // No verified ceiling: not built, so not sent.
+        for model in ["claude-opus-6", "claude-opus-5-5-preview", "claude-next", ""] {
+            assert_eq!(body(model, Some(2519), "api_key"), None, "{model:?}");
+        }
+    }
+
+    /// The OAuth bounded body: the turn's transport identity first, then the
+    /// thinking class (golden over the whole body).
+    #[test]
+    fn the_oauth_bounded_body() {
+        let messages = vec![Arc::new(json!({"role":"user","content":"TRANSCRIPT"}))];
+        let (body, _) =
+            simple_body("claude-opus-5-5", &messages, 0, Some(5038), "oauth", "PROMPT", 200_000)
+                .unwrap();
+        let expected = json!({
+            "max_tokens": 5038,
+            "messages": [{"role":"user","content":"TRANSCRIPT"}],
+            "model": "claude-opus-5-5",
+            "output_config": {"effort": "low"},
+            "system": [
+                {"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."},
+                {"type":"text","text": crate::core::config::get_identity()},
+                {"type":"text","text":"You are a helpful AI assistant with access to tools. Use them when needed."},
+                {"type":"text","text":"PROMPT"},
+            ],
+            "thinking": {"type": "adaptive"},
+        });
+        assert_eq!(body.to_string(), expected.to_string());
+    }
+
+    /// `/compact` (no ceiling) is unchanged: adaptive at effort low with the
+    /// request's output cap at the window (B32: 64K at 200K), or the legacy
+    /// budget.
+    #[test]
+    fn the_unbounded_compaction_body_is_unchanged() {
+        let opus = body("claude-opus-5-5", None, "api_key").unwrap();
+        let max = HelperMethods::max_tokens_for_request("claude-opus-5-5", 200_000);
+        assert_eq!(max, 64_000);
+        assert!(opus.starts_with(&format!(r#"{{"max_tokens":{max},"#)), "{opus}");
+        assert!(
+            opus.ends_with(r#""output_config":{"effort":"low"},"system":[{"text":"PROMPT","type":"text"}],"thinking":{"display":"summarized","type":"adaptive"}}"#),
+            "{opus}"
+        );
+        let legacy = body("claude-sonnet-4-5", None, "api_key").unwrap();
+        assert!(
+            legacy.contains(r#""thinking":{"budget_tokens":"#) && !legacy.contains("output_config"),
+            "{legacy}"
+        );
+    }
+
+    /// B32: the unbounded body's `max_tokens` is the window-aware request
+    /// cap (Opus: 64K at 200K, 128K above it), and a budgeted body's
+    /// thinking stays strictly below it at every named level, with a custom
+    /// budget at or over the cap clamped to `max_tokens - 1`.
+    #[test]
+    fn the_unbounded_body_sizes_output_by_the_window_and_keeps_thinking_below_it() {
+        for (model, window, want) in [
+            ("claude-opus-5-5", 200_000, 64_000),
+            ("claude-opus-5-5", 1_000_000, 128_000),
+            ("claude-opus-4-6", 200_000, 64_000),
+            ("claude-opus-4-6", 1_000_000, 128_000),
+            ("claude-sonnet-4-5", 200_000, 64_000),
+            ("claude-sonnet-4-5", 1_000_000, 64_000),
+        ] {
+            let wire = unbounded(model, 0, window);
+            assert_eq!(wire["max_tokens"], json!(want), "{model}@{window}");
+        }
+        for budget in [0, 2_048, 4_096, 16_384, 32_768] {
+            let wire = unbounded("claude-opus-4-6", budget, 200_000);
+            let sent = wire["thinking"]["budget_tokens"].as_u64().unwrap();
+            assert!(sent < 64_000, "{budget}: {wire}");
+        }
+        let wire = unbounded("claude-opus-4-6", 100_000, 200_000);
+        assert_eq!(wire["thinking"]["budget_tokens"], json!(63_999), "{wire}");
+        let wire = unbounded("claude-opus-4-6", 100_000, 1_000_000);
+        assert_eq!(wire["thinking"]["budget_tokens"], json!(100_000), "{wire}");
+    }
+}
+
+#[cfg(test)]
+mod ceiling_thinking_tests {
+    use super::CeilingThinking::{self, *};
+
+    /// Every listed id, with the prefix and suffixes it may carry; anything
+    /// else (future, malformed, near misses) has no class.
+    #[test]
+    fn the_vetted_classes() {
+        let cases = [
+            ("claude-opus-5-5", Some(AdaptiveLow)),
+            ("anthropic/claude-opus-5-5", Some(AdaptiveLow)),
+            ("Claude-Opus-5-5", Some(AdaptiveLow)),
+            ("claude-opus-5-5-20260301", Some(AdaptiveLow)),
+            ("claude-fable-5-1", Some(AdaptiveLow)),
+            ("claude-mythos-5-1", Some(AdaptiveLow)),
+            ("claude-fable-5", Some(AdaptiveLow)),
+            ("claude-mythos-5", Some(AdaptiveLow)),
+            ("claude-mythos-preview", Some(AdaptiveLow)),
+            ("claude-sonnet-5-5", Some(BetweenTools)),
+            ("claude-haiku-5-5", Some(Disabled)),
+            ("claude-opus-5", Some(Disabled)),
+            ("claude-sonnet-5", Some(Disabled)),
+            ("claude-opus-4-8", Some(Disabled)),
+            ("claude-opus-4-7", Some(Disabled)),
+            ("claude-opus-4-6", Some(Disabled)),
+            ("claude-sonnet-4-6", Some(Disabled)),
+            ("claude-opus-4-5-20251101", Some(Disabled)),
+            ("claude-sonnet-4-5-20250929", Some(Disabled)),
+            ("claude-haiku-4-5-20251001", Some(Disabled)),
+            ("claude-opus-4-1-20250805", Some(OffWhenOmitted)),
+            ("claude-opus-4-20250514", Some(OffWhenOmitted)),
+            ("claude-sonnet-4-20250514", Some(OffWhenOmitted)),
+            ("claude-3-7-sonnet-latest", Some(OffWhenOmitted)),
+            ("claude-3-5-haiku-20241022", Some(OffWhenOmitted)),
+            ("claude-opus-6", None),
+            ("claude-opus-5-6", None),
+            ("claude-opus-5-5-preview", None),
+            ("claude-opus-5-5-2026030", None),
+            ("claude-opus-999-0", None),
+            ("claude-sonnet-5-5-x", None),
+            ("openai/gpt-5", None),
+            ("anthropic/", None),
+            ("", None),
+        ];
+        for (model, class) in cases {
+            assert_eq!(CeilingThinking::of(model), class, "{model:?}");
+        }
+    }
+
+    #[test]
+    fn the_limit_is_twice_the_cap_only_where_thinking_cannot_be_off() {
+        assert_eq!(AdaptiveLow.limit(2_519, 128_000), 5_038);
+        for class in [Disabled, BetweenTools, OffWhenOmitted] {
+            assert_eq!(class.limit(2_519, 128_000), 2_519, "{class:?}");
+        }
+        // Clamped to the model's maximum, without overflow.
+        assert_eq!(AdaptiveLow.limit(70_000, 128_000), 128_000);
+        assert_eq!(AdaptiveLow.limit(u64::MAX, 64_000), 64_000);
+        assert_eq!(Disabled.limit(70_000, 64_000), 64_000);
     }
 }

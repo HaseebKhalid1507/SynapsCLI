@@ -327,9 +327,14 @@ mod tests {
         let ping = ApiOptions {
             keepwarm: Some(KeepWarmRequest {
                 mode: KeepWarmMode::Probe,
+                purpose: crate::runtime::api::TailPurpose::Ping,
+                stop_reason: Default::default(),
+                usage: Default::default(),
                 status: Default::default(),
                 sent: Default::default(),
                 connect_failed: Default::default(),
+                failure_kind: Default::default(),
+                lease: None,
             }),
             ..on(&c)
         };
@@ -424,6 +429,7 @@ mod tests {
             None,
             crate::core::config::CacheTtl::FiveMinutes,
             true,
+            crate::core::models::context_window_for_model(model),
         );
         if let Some(d) = diag {
             body.set_diagnostics(d);

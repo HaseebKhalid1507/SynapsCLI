@@ -1,0 +1,3 @@
+{"kind":"session","session":"notice","text":"⚠ Gemini rate limited — resuming in 2s (1/4)","retry":true}
+{"kind":"llm","llm":"text","text":"gate "}
+{"kind":"llm","llm":"text","text":"ok"}

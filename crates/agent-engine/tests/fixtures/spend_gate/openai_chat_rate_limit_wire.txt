@@ -1,0 +1,4 @@
+{"kind":"session","session":"message_history","messages":[{"content":"What's the capital of France?","role":"user"},{"content":[{"text":"Paris.","type":"text"}],"role":"assistant"},{"content":"And of Japan?","role":"user"}]}
+{"kind":"session","session":"message_history","messages":[{"content":"What's the capital of France?","role":"user"},{"content":[{"text":"Paris.","type":"text"}],"role":"assistant"},{"content":"And of Japan?","role":"user"}]}
+{"kind":"session","session":"error","message":"local: rate limited (HTTP 429). Wait for the limit to reset, or switch models with /model.","outcome":{"kind":"provider_failed","code":"api_status","correlation_id":"turn-<pid>-<n>"}}
+{"kind":"session","session":"done"}

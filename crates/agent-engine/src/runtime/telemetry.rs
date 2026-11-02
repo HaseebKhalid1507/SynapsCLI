@@ -330,6 +330,16 @@ pub struct TelemetryRecord {
     /// that writes the successor's prompt cache. Absent otherwise.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub rollover: bool,
+    /// Set only on a warm rolling-summary request: the `summary_id` of the
+    /// `context rollover` event it belongs to. Absent on every turn record.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rollover_summary: Option<String>,
+}
+
+/// The opaque id correlating a warm summary request's record with its
+/// rollover event: 64 random bits as 16 lowercase hex digits.
+pub(crate) fn summary_id(correlation: u64) -> String {
+    format!("{correlation:016x}")
 }
 
 /// What a turn request tells its telemetry record about context rollover

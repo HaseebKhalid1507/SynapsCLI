@@ -1,0 +1,18 @@
+=== request 0
+POST /v1/messages
+accept: */*
+anthropic-version: 2023-06-01
+content-length: 1328
+content-type: application/json
+x-api-key: test-token
+--- body (1328 bytes)
+{"max_tokens":64000,"messages":[{"content":"What's the capital of France?","role":"user"},{"content":[{"text":"Paris.","type":"text"}],"role":"assistant"},{"content":[{"cache_control":{"type":"ephemeral"},"text":"And of Japan?","type":"text"}],"role":"user"}],"model":"claude-sonnet-4-6","stream":true,"thinking":{"budget_tokens":4096,"display":"summarized","type":"enabled"},"tools":[{"description":"List directory contents with details (permissions, size, modification date). Defaults to current directory.","input_schema":{"properties":{"path":{"description":"Directory path to list (default: current directory)","type":"string"}},"required":[],"type":"object"},"name":"ls"},{"cache_control":{"type":"ephemeral"},"description":"Read the contents of a file. Returns lines with line numbers. Reads up to 500 lines by default. For large files, use offset and limit to read in sections. Image files (PNG, JPEG, GIF, WebP) are returned as an image the model can see, up to 3.5 MB.","input_schema":{"properties":{"limit":{"description":"Maximum number of lines to read (default: all lines)","type":"integer"},"offset":{"description":"Line number to start reading from (0-indexed, default: 0)","type":"integer"},"path":{"description":"Path to the file to read","type":"string"}},"required":["path"],"type":"object"},"name":"read"}]}
+=== request 1
+POST /v1/messages
+accept: */*
+anthropic-version: 2023-06-01
+content-length: 1328
+content-type: application/json
+x-api-key: test-token
+--- body (1328 bytes)
+{"max_tokens":64000,"messages":[{"content":"What's the capital of France?","role":"user"},{"content":[{"text":"Paris.","type":"text"}],"role":"assistant"},{"content":[{"cache_control":{"type":"ephemeral"},"text":"And of Japan?","type":"text"}],"role":"user"}],"model":"claude-sonnet-4-6","stream":true,"thinking":{"budget_tokens":4096,"display":"summarized","type":"enabled"},"tools":[{"description":"List directory contents with details (permissions, size, modification date). Defaults to current directory.","input_schema":{"properties":{"path":{"description":"Directory path to list (default: current directory)","type":"string"}},"required":[],"type":"object"},"name":"ls"},{"cache_control":{"type":"ephemeral"},"description":"Read the contents of a file. Returns lines with line numbers. Reads up to 500 lines by default. For large files, use offset and limit to read in sections. Image files (PNG, JPEG, GIF, WebP) are returned as an image the model can see, up to 3.5 MB.","input_schema":{"properties":{"limit":{"description":"Maximum number of lines to read (default: all lines)","type":"integer"},"offset":{"description":"Line number to start reading from (0-indexed, default: 0)","type":"integer"},"path":{"description":"Path to the file to read","type":"string"}},"required":["path"],"type":"object"},"name":"read"}]}

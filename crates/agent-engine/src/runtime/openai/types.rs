@@ -387,9 +387,11 @@ pub enum OaiEvent {
         calls: Vec<ToolCall>,
         truncated: bool,
     },
+    /// Provider-reported counters; `None` = not reported (never zero-filled
+    /// here). Emitted only when at least one of the two is reported.
     Usage {
-        prompt_tokens: u32,
-        completion_tokens: u32,
+        prompt_tokens: Option<u32>,
+        completion_tokens: Option<u32>,
         cached_tokens: u32,
     },
     Warning(String),

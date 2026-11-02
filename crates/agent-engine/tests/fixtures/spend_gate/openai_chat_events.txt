@@ -1,0 +1,7 @@
+Session(MessageHistory([Object {"content": String("What's the capital of France?"), "role": String("user")}, Object {"content": Array [Object {"text": String("Paris."), "type": String("text")}], "role": String("assistant")}, Object {"content": String("And of Japan?"), "role": String("user")}]))
+Llm(ResponseStart)
+Llm(Text("gate "))
+Llm(Text("ok"))
+Session(Usage { input_tokens: 8, output_tokens: 3, cache_read_input_tokens: 4, cache_creation_input_tokens: 0, cache_creation_5m: None, cache_creation_1h: None, model: None })
+Session(MessageHistory([Object {"content": String("What's the capital of France?"), "role": String("user")}, Object {"content": Array [Object {"text": String("Paris."), "type": String("text")}], "role": String("assistant")}, Object {"content": String("And of Japan?"), "role": String("user")}, Object {"_synaps_at": String("2026-01-01T00:00:00Z"), "content": Array [Object {"text": String("gate ok"), "type": String("text")}], "role": String("assistant")}]))
+Session(Done)

@@ -255,6 +255,9 @@ pub struct GeminiUsage {
     pub candidates_tokens: Option<u64>,
     #[serde(default, rename = "cachedContentTokenCount")]
     pub cached_tokens: Option<u64>,
+    /// Thinking tokens, billed as output.
+    #[serde(default, rename = "thoughtsTokenCount")]
+    pub thoughts_tokens: Option<u64>,
 }
 
 /// A single `data: ...` payload as decoded from the Code Assist SSE stream.
@@ -355,6 +358,7 @@ pub fn from_stream_line(line: &str) -> Result<Vec<GeminiStreamEvent>, String> {
         if usage.prompt_tokens.is_some()
             || usage.candidates_tokens.is_some()
             || usage.cached_tokens.is_some()
+            || usage.thoughts_tokens.is_some()
         {
             out.push(GeminiStreamEvent::Usage(usage));
         }
@@ -562,6 +566,7 @@ mod tests {
                     prompt_tokens: Some(12),
                     candidates_tokens: Some(5),
                     cached_tokens: None,
+                    thoughts_tokens: None,
                 }),
             ]
         );
@@ -574,5 +579,20 @@ mod tests {
         let line = r#"data: {"response":{"usageMetadata":{}}}"#;
         let events = from_stream_line(line).unwrap();
         assert_eq!(events, vec![GeminiStreamEvent::Ignored]);
+    }
+
+    #[test]
+    fn sse_thoughts_only_usage_metadata_is_surfaced() {
+        let line = r#"data: {"response":{"usageMetadata":{"thoughtsTokenCount":9}}}"#;
+        let events = from_stream_line(line).unwrap();
+        assert_eq!(
+            events,
+            vec![GeminiStreamEvent::Usage(GeminiUsage {
+                prompt_tokens: None,
+                candidates_tokens: None,
+                cached_tokens: None,
+                thoughts_tokens: Some(9),
+            })]
+        );
     }
 }

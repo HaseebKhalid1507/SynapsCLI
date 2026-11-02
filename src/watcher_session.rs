@@ -123,6 +123,7 @@ impl SessionAllowance<'_> {
             max_cost_usd: Some(session_cost_left.min(daily_cost_left).max(0.0)),
             max_total_tokens: Some(limits.max_session_tokens.saturating_sub(totals.tokens)),
             max_round_renewals: u32::MAX,
+            run_clock: None,
         };
         role.tighter(&remaining)
     }
@@ -182,7 +183,7 @@ where
             {
                 exit_call = Some(tool_id.clone());
             }
-            StreamEvent::Llm(LlmEvent::ToolResult { tool_id, result }) => {
+            StreamEvent::Llm(LlmEvent::ToolResult { tool_id, result, .. }) => {
                 // Calls a budget refused, and calls a cancel cut short, did
                 // not run to completion and are not counted.
                 if !result.starts_with(TOOL_CALL_NOT_EXECUTED) && !result.starts_with("Canceled") {
@@ -532,10 +533,14 @@ mod tests {
             StreamEvent::Llm(LlmEvent::ToolResult {
                 tool_id: "t1".into(),
                 result: "ok".into(),
+                memory_only: false,
+                client_tool: None,
             }),
             StreamEvent::Llm(LlmEvent::ToolResult {
                 tool_id: "t2".into(),
                 result: TOOL_CALL_BUDGET_REFUSAL.into(),
+                memory_only: false,
+                client_tool: None,
             }),
         ];
         let mut totals = SessionTotals::default();
@@ -572,6 +577,8 @@ mod tests {
                     StreamEvent::Llm(LlmEvent::ToolResult {
                         tool_id: "x1".into(),
                         result,
+                        memory_only: false,
+                        client_tool: None,
                     }),
                 ]),
                 "claude-sonnet-4-5",

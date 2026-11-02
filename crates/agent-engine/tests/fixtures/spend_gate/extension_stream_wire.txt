@@ -1,0 +1,2 @@
+{"kind":"llm","llm":"text","text":"gate "}
+{"kind":"llm","llm":"text","text":"ok"}

@@ -1,0 +1,8 @@
+=== request 0
+POST /v1/chat/completions
+accept: text/event-stream
+authorization: Bearer local
+content-length: 1202
+content-type: application/json
+--- body (1202 bytes)
+{"messages":[{"content":"What's the capital of France?","role":"user"},{"content":"Paris.","role":"assistant"},{"content":"And of Japan?","role":"user"}],"model":"test-model","stream":true,"stream_options":{"include_usage":true},"tools":[{"function":{"description":"List directory contents with details (permissions, size, modification date). Defaults to current directory.","name":"ls","parameters":{"properties":{"path":{"description":"Directory path to list (default: current directory)","type":"string"}},"required":[],"type":"object"}},"type":"function"},{"function":{"description":"Read the contents of a file. Returns lines with line numbers. Reads up to 500 lines by default. For large files, use offset and limit to read in sections. Image files (PNG, JPEG, GIF, WebP) are returned as an image the model can see, up to 3.5 MB.","name":"read","parameters":{"properties":{"limit":{"description":"Maximum number of lines to read (default: all lines)","type":"integer"},"offset":{"description":"Line number to start reading from (0-indexed, default: 0)","type":"integer"},"path":{"description":"Path to the file to read","type":"string"}},"required":["path"],"type":"object"}},"type":"function"}]}

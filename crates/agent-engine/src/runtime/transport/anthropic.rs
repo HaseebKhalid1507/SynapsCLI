@@ -43,6 +43,7 @@ pub(in crate::runtime) fn build_anthropic_request<'a>(
     execution_plan: Option<&crate::runtime::openai::catalog::AnthropicExecutionPlan>,
     ttl: CacheTtl,
     stream: bool,
+    context_window: u64,
 ) -> AnthropicRequestParts<'a> {
     let ir = NormalizedRequest::from_anthropic_history(system_prompt.as_deref(), messages);
     let report = anthropic_translation_report(&ir, auth_type);
@@ -58,6 +59,7 @@ pub(in crate::runtime) fn build_anthropic_request<'a>(
         execution_plan,
         ttl,
         stream,
+        context_window,
     );
     AnthropicRequestParts { body, report }
 }

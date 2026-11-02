@@ -32,6 +32,14 @@ use crate::SharedMessage;
 /// `system` only when `build_system_blocks` returns Some. Guarded by
 /// `runtime::body_golden` — do not reorder fields or change skip conditions
 /// without regenerating fixtures (and accepting fleet-wide cache invalidation).
+/// Headers every native Anthropic Messages request carries besides the
+/// authorization (checked as an opaque scope) and `anthropic-beta`; part of
+/// [`RequestBody::prefix_fingerprint`].
+pub(super) const ANTHROPIC_FIXED_HEADERS: [(&str, &str); 2] = [
+    ("anthropic-version", "2023-06-01"),
+    ("content-type", "application/json"),
+];
+
 #[derive(serde::Serialize)]
 pub(super) struct RequestBody<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -56,6 +64,9 @@ impl<'a> RequestBody<'a> {
     /// cache-annotated (`sanitize_thinking_blocks` / `annotate_cache_breakpoint`).
     /// `stream: true` → streaming transport (`"stream":true`); `false` → sync
     /// transport (key absent, matching the legacy api_sync body).
+    /// `context_window` is the runtime's effective window; it sizes
+    /// `max_tokens` exactly as the context assessment reserves it
+    /// ([`HelperMethods::max_tokens_for_request`]).
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         model: &'a str,
@@ -69,8 +80,10 @@ impl<'a> RequestBody<'a> {
         execution_plan: Option<&crate::runtime::openai::catalog::AnthropicExecutionPlan>,
         ttl: CacheTtl,
         stream: bool,
+        context_window: u64,
     ) -> Self {
         use agent_core::reasoning::ReasoningLevel;
+        let max_tokens = HelperMethods::max_tokens_for_request(model, context_window);
         let adaptive = crate::core::models::model_supports_adaptive_thinking(model);
         let thinking = if reasoning_level == ReasoningLevel::Off {
             // Off: omit the thinking field entirely (safest; no unsupported wire shape).
@@ -78,54 +91,15 @@ impl<'a> RequestBody<'a> {
         } else if adaptive {
             Some(json!({ "type": "adaptive", "display": "summarized" }))
         } else {
-            let budget = if thinking_budget == 0 {
-                crate::core::models::DEFAULT_LEGACY_ADAPTIVE_FALLBACK
-            } else {
-                thinking_budget
-            };
+            let budget = HelperMethods::anthropic_thinking_budget(thinking_budget, max_tokens);
             Some(json!({ "type": "enabled", "budget_tokens": budget, "display": "summarized" }))
         };
-        let output_config = if adaptive && reasoning_level != ReasoningLevel::Off {
-            if let Some(plan) = execution_plan {
-                plan.wire_effort
-                    .map(|effort| json!({ "effort": effort.as_str() }))
-            } else {
-                match reasoning_level {
-                    // Adaptive: model decides — omit output_config.effort.
-                    ReasoningLevel::Adaptive => None,
-                    // The NAMED level is authoritative for the exact effort value.
-                    ReasoningLevel::Low
-                    | ReasoningLevel::Medium
-                    | ReasoningLevel::High
-                    | ReasoningLevel::XHigh => Some(json!({ "effort": reasoning_level.as_str() })),
-                    // Max/Ultra are rejected upstream for Anthropic models; if a
-                    // stale value leaks here, fall back to the legacy
-                    // budget-derived mapping rather than inventing an unsupported
-                    // named effort on the wire. Loud in debug builds — this is a
-                    // validation-layer bug, not a valid wire state.
-                    _ => {
-                        debug_assert!(
-                            !matches!(
-                                reasoning_level,
-                                ReasoningLevel::Max
-                                    | ReasoningLevel::Ultra
-                                    | ReasoningLevel::UltraCode
-                            ),
-                            "reasoning level '{reasoning_level}' must be rejected upstream \
-                         before reaching the Anthropic request body for {model}"
-                        );
-                        let level = crate::core::models::thinking_level_for_budget(thinking_budget);
-                        crate::core::models::effort_for_thinking_level(level)
-                            .map(|effort| json!({ "effort": effort }))
-                    }
-                }
-            }
-        } else {
-            None
-        };
+        let output_config =
+            anthropic_wire_effort(model, thinking_budget, reasoning_level, execution_plan)
+                .map(|effort| json!({ "effort": effort }));
         Self {
             diagnostics: None,
-            max_tokens: HelperMethods::max_tokens_for_model(model),
+            max_tokens,
             messages: super::continuation::WireMessages(messages),
             model,
             output_config,
@@ -202,47 +176,130 @@ impl<'a> RequestBody<'a> {
             .saturating_add(estimate_history(self.messages.0))
     }
 
+    /// Output cap for a warm rolling summary: `max_tokens` bounds thinking
+    /// and text together on this route, so `limit` must leave room after any
+    /// thinking budget, and it never exceeds what the real turn would send.
+    /// `false` (body unchanged): the limit is not valid for this body.
+    pub(super) fn apply_summary_max_tokens(&mut self, limit: u64) -> bool {
+        self.lower_max_tokens(limit)
+    }
+
+    /// The output a conversation request was sized to and admitted on (R1,
+    /// [`HelperMethods::output_tokens_for_request`]): the wire then sends
+    /// exactly the reserved output. Only ever lowers the static cap, and only
+    /// to a value above any thinking `budget_tokens` (which, like the rest
+    /// of the cache key, is unchanged; `max_tokens` is not part of it).
+    /// `false` (body unchanged): `reserved` is not valid for this body.
+    pub(super) fn apply_reserved_max_tokens(&mut self, reserved: u64) -> bool {
+        self.lower_max_tokens(reserved)
+    }
+
+    /// Lower `max_tokens` to `limit` when the wire accepts it: above an
+    /// enabled thinking budget (a budget that cannot be read refuses), at
+    /// least 1 otherwise, and never above the current cap.
+    fn lower_max_tokens(&mut self, limit: u64) -> bool {
+        let budget = self
+            .thinking
+            .as_ref()
+            .filter(|t| t["type"] == "enabled")
+            .map(|t| t["budget_tokens"].as_u64());
+        let valid = match budget {
+            Some(Some(budget)) => limit > budget,
+            Some(None) => false,
+            None => limit >= 1,
+        };
+        if !valid || limit > self.max_tokens {
+            return false;
+        }
+        self.max_tokens = limit;
+        true
+    }
+
     /// FNV-1a 64 over the serialized cache-key prefix of this request:
-    /// model, `output_config` (effort), `system`, `thinking`, `tools` and the
-    /// first `history_len` messages exactly as they go on the wire (cache
-    /// markers included), plus the `anthropic-beta` header (`beta`: 1M
-    /// context and the like select the serving configuration). `max_tokens`
-    /// and `stream` are excluded: neither is rendered into the prompt. Two
-    /// requests with equal fingerprints send byte-identical prefixes through
-    /// the last history breakpoint.
+    /// every body field except `max_tokens` (model, `output_config`
+    /// (effort), `stream`, `system`, `thinking`, `tools`, with their cache
+    /// markers and TTLs), the first `history_len` messages exactly as they
+    /// go on the wire, every fixed header ([`ANTHROPIC_FIXED_HEADERS`]) and
+    /// the `anthropic-beta` header (`beta`: 1M context and the like select
+    /// the serving configuration). The credential and the endpoint are
+    /// checked separately. Two requests with equal fingerprints send
+    /// byte-identical prefixes through the last history breakpoint.
     pub(super) fn prefix_fingerprint(&self, history_len: usize, beta: Option<&str>) -> u64 {
-        struct Fnv(u64);
-        impl std::io::Write for Fnv {
+        let n = history_len.min(self.messages.0.len());
+        self.prefix_fingerprint_over(&self.messages.0[..n], beta)
+    }
+
+    /// [`Self::prefix_fingerprint`] with `messages` in place of this body's
+    /// own (the first 8 bytes of [`Self::prefix_digest_over`]).
+    pub(super) fn prefix_fingerprint_over(
+        &self,
+        messages: &[crate::SharedMessage],
+        beta: Option<&str>,
+    ) -> u64 {
+        let digest = self.prefix_digest_over(messages, beta);
+        let mut first = [0u8; 8];
+        first.copy_from_slice(&digest[..8]);
+        u64::from_le_bytes(first)
+    }
+
+    /// SHA-256 over the cache-key prefix (see [`Self::prefix_fingerprint`])
+    /// with `messages` in place of this body's own: this body's fields, then
+    /// `messages` exactly as given (a warm summary compares the recorded
+    /// request's wire messages this way). JSON never contains a raw 0x1f, so
+    /// the separators are unambiguous.
+    pub(super) fn prefix_digest_over(
+        &self,
+        messages: &[crate::SharedMessage],
+        beta: Option<&str>,
+    ) -> [u8; 32] {
+        use sha2::Digest as _;
+        struct Sha(sha2::Sha256);
+        impl std::io::Write for Sha {
             fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                for b in buf {
-                    self.0 ^= u64::from(*b);
-                    self.0 = self.0.wrapping_mul(0x0000_0100_0000_01b3);
-                }
+                self.0.update(buf);
                 Ok(buf.len())
             }
             fn flush(&mut self) -> std::io::Result<()> {
                 Ok(())
             }
         }
-        let mut h = Fnv(0xcbf2_9ce4_8422_2325);
-        let sep = |h: &mut Fnv| {
-            let _ = std::io::Write::write_all(h, &[0x1f]);
-        };
-        let _ = serde_json::to_writer(&mut h, self.model);
+        // Exhaustive on purpose: a new body field does not compile until it
+        // is either hashed here or argued out of the cache key.
+        let Self {
+            // Request metadata, not rendered into the prompt; the
+            // fail-soft path strips it as a byte prefix.
+            diagnostics: _,
+            max_tokens: _,
+            messages: _,
+            model,
+            output_config,
+            stream,
+            system,
+            thinking,
+            tools,
+        } = self;
+        let mut h = Sha(sha2::Sha256::new());
+        let sep = |h: &mut Sha| h.0.update([0x1f]);
+        let _ = serde_json::to_writer(&mut h, model);
         sep(&mut h);
-        let _ = serde_json::to_writer(&mut h, &self.output_config);
+        let _ = serde_json::to_writer(&mut h, output_config);
         sep(&mut h);
-        let _ = serde_json::to_writer(&mut h, &self.system);
+        let _ = serde_json::to_writer(&mut h, stream);
         sep(&mut h);
-        let _ = serde_json::to_writer(&mut h, &self.thinking);
+        let _ = serde_json::to_writer(&mut h, system);
         sep(&mut h);
-        let _ = serde_json::to_writer(&mut h, &self.tools);
+        let _ = serde_json::to_writer(&mut h, thinking);
         sep(&mut h);
-        let n = history_len.min(self.messages.0.len());
-        let _ = serde_json::to_writer(&mut h, &super::continuation::WireMessages(&self.messages.0[..n]));
+        let _ = serde_json::to_writer(&mut h, tools);
+        sep(&mut h);
+        // As they go on the wire: host `_synaps_*` keys (a host time on
+        // every stamped message) are never part of the prefix.
+        let _ = serde_json::to_writer(&mut h, &super::continuation::WireMessages(messages));
+        sep(&mut h);
+        let _ = serde_json::to_writer(&mut h, &ANTHROPIC_FIXED_HEADERS);
         sep(&mut h);
         let _ = serde_json::to_writer(&mut h, &beta);
-        h.0
+        h.0.finalize().into()
     }
 
     /// Send `thinking.display = display` (`thinking_display`). Summarized
@@ -339,6 +396,52 @@ impl Serialize for MarkedTools<'_> {
             seq.serialize_element(tool)?;
         }
         seq.end()
+    }
+}
+
+
+/// The `output_config.effort` an Anthropic Messages request sends for these
+/// settings (`None`: no effort field). The warm summary reads a recorded
+/// request's effort through this same function.
+pub(super) fn anthropic_wire_effort(
+    model: &str,
+    thinking_budget: u32,
+    reasoning_level: agent_core::reasoning::ReasoningLevel,
+    execution_plan: Option<&crate::runtime::openai::catalog::AnthropicExecutionPlan>,
+) -> Option<&'static str> {
+    use agent_core::reasoning::ReasoningLevel;
+    let adaptive = crate::core::models::model_supports_adaptive_thinking(model);
+    if !adaptive || reasoning_level == ReasoningLevel::Off {
+        return None;
+    }
+    if let Some(plan) = execution_plan {
+        return plan.wire_effort.map(|effort| effort.as_str());
+    }
+    match reasoning_level {
+        // Adaptive: model decides — omit output_config.effort.
+        ReasoningLevel::Adaptive => None,
+        // The NAMED level is authoritative for the exact effort value.
+        ReasoningLevel::Low
+        | ReasoningLevel::Medium
+        | ReasoningLevel::High
+        | ReasoningLevel::XHigh => Some(reasoning_level.as_str()),
+        // Max/Ultra are rejected upstream for Anthropic models; if a
+        // stale value leaks here, fall back to the legacy
+        // budget-derived mapping rather than inventing an unsupported
+        // named effort on the wire. Loud in debug builds — this is a
+        // validation-layer bug, not a valid wire state.
+        _ => {
+            debug_assert!(
+                !matches!(
+                    reasoning_level,
+                    ReasoningLevel::Max | ReasoningLevel::Ultra | ReasoningLevel::UltraCode
+                ),
+                "reasoning level '{reasoning_level}' must be rejected upstream \
+             before reaching the Anthropic request body for {model}"
+            );
+            let level = crate::core::models::thinking_level_for_budget(thinking_budget);
+            crate::core::models::effort_for_thinking_level(level)
+        }
     }
 }
 
@@ -562,6 +665,7 @@ mod window_clamp_tests {
             None,
             CacheTtl::FiveMinutes,
             true,
+            200_000,
         )
     }
 
@@ -629,6 +733,7 @@ mod anthropic_reasoning_body_tests {
             plan,
             CacheTtl::FiveMinutes,
             false,
+            200_000,
         );
         serde_json::to_value(&body).expect("serialize")
     }
@@ -721,7 +826,7 @@ mod anthropic_reasoning_body_tests {
         let build = |model, level, display| {
             let mut body = RequestBody::new(
                 model, &messages, &[], &[], &None, "api_key", 8192, level, None,
-                CacheTtl::FiveMinutes, true,
+                CacheTtl::FiveMinutes, true, 200_000,
             );
             body.set_thinking_display(display);
             serde_json::to_vec(&body).unwrap()
@@ -733,7 +838,7 @@ mod anthropic_reasoning_body_tests {
             let summarized = build(model, level, ThinkingDisplay::Summarized);
             let plain = serde_json::to_vec(&RequestBody::new(
                 model, &messages, &[], &[], &None, "api_key", 8192, level, None,
-                CacheTtl::FiveMinutes, true,
+                CacheTtl::FiveMinutes, true, 200_000,
             ))
             .unwrap();
             assert_eq!(summarized, plain, "{model}: summarized = the body as built");
@@ -759,5 +864,135 @@ mod anthropic_reasoning_body_tests {
             json!({"type": "enabled", "budget_tokens": 8192, "display": "summarized"})
         );
         assert!(v.get("output_config").is_none());
+    }
+}
+
+#[cfg(test)]
+mod prefix_fingerprint_tests {
+    use super::*;
+    use agent_core::reasoning::ReasoningLevel;
+
+    struct Shape {
+        model: &'static str,
+        system: Option<String>,
+        tools: Vec<Value>,
+        budget: u32,
+        level: ReasoningLevel,
+        ttl: CacheTtl,
+        stream: bool,
+    }
+
+    impl Default for Shape {
+        fn default() -> Self {
+            Self {
+                model: "claude-sonnet-4-6",
+                system: Some("system".into()),
+                tools: vec![json!({"name": "read", "input_schema": {"type": "object"}})],
+                budget: 4_096,
+                level: ReasoningLevel::Medium,
+                ttl: CacheTtl::FiveMinutes,
+                stream: true,
+            }
+        }
+    }
+
+    fn fingerprint(shape: &Shape, messages: &[SharedMessage], beta: Option<&str>) -> u64 {
+        RequestBody::new(
+            shape.model,
+            messages,
+            &shape.tools,
+            &[],
+            &shape.system,
+            "api_key",
+            shape.budget,
+            shape.level,
+            None,
+            shape.ttl,
+            shape.stream,
+            200_000,
+        )
+        .prefix_fingerprint(messages.len(), beta)
+    }
+
+    /// Every body field but `max_tokens`, the messages, the cache TTL of the
+    /// markers and the beta header each change the fingerprint; the output
+    /// limit does not.
+    #[test]
+    fn every_cache_relevant_field_changes_the_fingerprint() {
+        let messages: Vec<SharedMessage> = vec![Arc::new(json!({"role": "user", "content": "hi"}))];
+        let base = fingerprint(&Shape::default(), &messages, None);
+        let variants = [
+            Shape {
+                model: "claude-opus-4-6",
+                ..Shape::default()
+            },
+            Shape {
+                system: Some("other".into()),
+                ..Shape::default()
+            },
+            Shape {
+                system: None,
+                ..Shape::default()
+            },
+            Shape {
+                tools: vec![json!({"name": "write", "input_schema": {"type": "object"}})],
+                ..Shape::default()
+            },
+            Shape {
+                budget: 8_192,
+                ..Shape::default()
+            },
+            Shape {
+                level: ReasoningLevel::Off,
+                ..Shape::default()
+            },
+            Shape {
+                ttl: CacheTtl::OneHour,
+                ..Shape::default()
+            },
+            Shape {
+                stream: false,
+                ..Shape::default()
+            },
+        ];
+        for (i, shape) in variants.iter().enumerate() {
+            assert_ne!(fingerprint(shape, &messages, None), base, "variant {i}");
+        }
+        let effort = |level| {
+            fingerprint(
+                &Shape {
+                    model: "claude-opus-4-7",
+                    level,
+                    ..Shape::default()
+                },
+                &messages,
+                None,
+            )
+        };
+        assert_ne!(effort(ReasoningLevel::Low), effort(ReasoningLevel::High));
+        let other: Vec<SharedMessage> = vec![Arc::new(json!({"role": "user", "content": "ho"}))];
+        assert_ne!(fingerprint(&Shape::default(), &other, None), base);
+        assert_ne!(
+            fingerprint(&Shape::default(), &messages, Some("context-1m-2025-08-07")),
+            base
+        );
+
+        let shape = Shape::default();
+        let mut body = RequestBody::new(
+            shape.model,
+            &messages,
+            &shape.tools,
+            &[],
+            &shape.system,
+            "api_key",
+            shape.budget,
+            shape.level,
+            None,
+            shape.ttl,
+            shape.stream,
+            200_000,
+        );
+        assert!(body.apply_summary_max_tokens(u64::from(shape.budget) + 100));
+        assert_eq!(body.prefix_fingerprint(messages.len(), None), base);
     }
 }

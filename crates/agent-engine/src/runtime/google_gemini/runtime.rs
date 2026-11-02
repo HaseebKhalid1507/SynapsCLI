@@ -18,9 +18,10 @@ use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
 use super::setup::setup_user;
-use super::stream::{build_stream_request, stream_gemini_request, StreamError};
+use super::stream::{stream_gemini_request, StreamError};
 use super::translate::{ChatTurn, GeminiStreamEvent, ToolSpec};
 use crate::auth::CredentialBroker;
+use crate::runtime::child_spend::{ReportedUsage, RouteSpend};
 use crate::runtime::openai::types::ProviderConfig;
 use crate::runtime::types::{LlmEvent, SessionEvent, StreamEvent};
 
@@ -221,6 +222,7 @@ fn messages_to_gemini_turns(messages: &[crate::SharedMessage]) -> Vec<ChatTurn> 
 /// `TransportKind::CloudProxy`. Project setup (`setup_user`) precedes the
 /// generateContent attempt and emits no attempt record.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(crate) async fn call_google_gemini_stream_inner(
     cfg: &ProviderConfig,
     broker: &Arc<dyn CredentialBroker>,
@@ -231,6 +233,59 @@ pub(crate) async fn call_google_gemini_stream_inner(
     cancel: &tokio_util::sync::CancellationToken,
     trace: &crate::runtime::trace::TraceContext,
     exact_wire_bytes: bool,
+) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+    call_google_gemini_stream_limited(
+        cfg,
+        broker,
+        tools_schema,
+        system_prompt,
+        messages,
+        tx,
+        cancel,
+        trace,
+        exact_wire_bytes,
+        GeminiLimits::default(),
+        RouteSpend::NONE,
+    )
+    .await
+}
+
+/// Per-request limits for a Code Assist call.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct GeminiLimits {
+    /// `generationConfig.maxOutputTokens` (includes thinking tokens);
+    /// `None` keeps the provider default.
+    pub max_output_tokens: Option<u32>,
+    /// Reset-honoring 429 retries; `0` makes exactly one attempt.
+    pub max_429_retries: u32,
+}
+
+impl Default for GeminiLimits {
+    fn default() -> Self {
+        Self {
+            max_output_tokens: None,
+            max_429_retries: MAX_GEMINI_429_RETRIES,
+        }
+    }
+}
+
+/// [`call_google_gemini_stream_inner`] with explicit limits. The returned
+/// response carries the provider-reported usage normalized to Anthropic
+/// fields (`input_tokens` excludes the cached slice; `output_tokens` includes
+/// thinking), or no `usage` when the stream reported none.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn call_google_gemini_stream_limited(
+    cfg: &ProviderConfig,
+    broker: &Arc<dyn CredentialBroker>,
+    tools_schema: &[Value],
+    system_prompt: &Option<String>,
+    messages: &[crate::SharedMessage],
+    tx: &mpsc::UnboundedSender<StreamEvent>,
+    cancel: &tokio_util::sync::CancellationToken,
+    trace: &crate::runtime::trace::TraceContext,
+    exact_wire_bytes: bool,
+    limits: GeminiLimits,
+    spend: RouteSpend<'_>,
 ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
     use crate::runtime::trace::google as trg;
     use crate::runtime::trace::openai as tro;
@@ -244,9 +299,10 @@ pub(crate) async fn call_google_gemini_stream_inner(
     // secrets directly. We honor GOOGLE_CLOUD_PROJECT / GOOGLE_CLOUD_PROJECT_ID
     // as an override, matching the reference client.
     let env_project = gemini_project_env();
+    // Setup precedes the generation request: a failure here sent none.
     let user = setup_user(broker.as_ref(), env_project)
         .await
-        .map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(format!("{e}")))?;
+        .map_err(crate::runtime::openai::NotDispatched::boxed)?;
     let project_id = user.project_id;
 
     tracing::debug!(
@@ -259,13 +315,17 @@ pub(crate) async fn call_google_gemini_stream_inner(
     // Serialize the envelope ONCE; every retry attempt sends this same
     // request, so the digested bytes describe each attempt's wire body on
     // the local-broker path.
-    let (proxy_request, body_bytes) = build_stream_request(
+    let (proxy_request, body_bytes) = super::stream::build_stream_request_with(
         cfg.model.clone(),
         Some(project_id.clone()),
         system_prompt.clone(),
         &turns,
         &tools,
-    )?;
+        limits
+            .max_output_tokens
+            .map(|max| json!({ "maxOutputTokens": max })),
+    )
+    .map_err(crate::runtime::openai::NotDispatched::boxed)?;
     let tracer = trg::begin_gemini_tracer(
         trace,
         &cfg.provider,
@@ -293,6 +353,8 @@ pub(crate) async fn call_google_gemini_stream_inner(
     }
     let mut attempt = tro::StreamAttempt::new(tracer);
 
+    // Attempts already made; > 0 once a 429 was retried.
+    let mut attempt_no: u32 = 0;
     let mut stream = {
         // ═══ RESET-HONORING 429 RETRY ═══════════════════════════════════════
         // Code Assist enforces small per-model windows and reports the reset
@@ -301,7 +363,6 @@ pub(crate) async fn call_google_gemini_stream_inner(
         // and extend the reset. So: honor the reported reset (plus a small
         // buffer), bounded by MAX_GEMINI_429_RETRIES / MAX_GEMINI_429_WAIT.
         // Non-429 errors keep failing fast — they are not capacity.
-        let mut attempt_no: u32 = 0;
         loop {
             match stream_gemini_request(broker.as_ref(), proxy_request.clone(), cancel.clone())
                 .await
@@ -321,9 +382,16 @@ pub(crate) async fn call_google_gemini_stream_inner(
                             .map(|s| format!("http_{s}"))
                             .unwrap_or_else(|| "transport_error".to_string());
                         attempt.finish_failed(&code, status, None);
-                        return Err(Box::<dyn std::error::Error + Send + Sync>::from(redacted));
+                        return Err(match &e {
+                            StreamError::Broker(error) => crate::runtime::openai::broker_failure(
+                                error,
+                                attempt_no == 0,
+                                redacted,
+                            ),
+                            _ => redacted.into(),
+                        });
                     };
-                    if attempt_no >= MAX_GEMINI_429_RETRIES {
+                    if attempt_no >= limits.max_429_retries {
                         attempt.finish_failed("http_429", Some(429), None);
                         return Err(Box::<dyn std::error::Error + Send + Sync>::from(redacted));
                     }
@@ -346,7 +414,7 @@ pub(crate) async fn call_google_gemini_stream_inner(
                         "⚠ Gemini rate limited — resuming in {}s ({}/{})",
                         wait.as_secs(),
                         attempt_no,
-                        MAX_GEMINI_429_RETRIES
+                        limits.max_429_retries
                     );
                     tracing::warn!(
                         provider = %cfg.provider,
@@ -368,11 +436,21 @@ pub(crate) async fn call_google_gemini_stream_inner(
         }
     };
 
+    // One paid attempt per opened stream (a 429 opens none). The last report
+    // with counts is booked once, at whichever exit comes: the result, or the
+    // guard's drop on a cancel or a stream error (a running count is then
+    // booked as the lower bound it is).
+    let attempt_spend = spend.attempt();
     let mut assembled_text = String::new();
     let mut content_blocks: Vec<Value> = Vec::new();
     let mut stop_reason: Option<String> = None;
     let mut trace_stop: Option<crate::runtime::trace::StopReason> = None;
     let mut trace_usage: Option<crate::runtime::trace::UsageMeta> = None;
+    let mut reported_usage: Option<super::translate::GeminiUsage> = None;
+    // A finish reason was seen: a usage report from then on is final, not a
+    // running count.
+    let mut finished = false;
+    let mut final_usage = false;
     let mut tool_seq: u64 = 0;
 
     while let Some(event) = stream.next().await {
@@ -421,11 +499,15 @@ pub(crate) async fn call_google_gemini_stream_inner(
                 if let Some(r) = reason {
                     trace_stop = Some(trg::stop_reason_from_gemini(&r));
                     stop_reason = Some(map_finish_reason(&r));
+                    finished = true;
                 }
             }
             Ok(GeminiStreamEvent::Usage(usage)) => {
                 // Provider-reported accounting; last observation wins.
+                attempt_spend.observe(&ReportedUsage::from_anthropic_json(&usage_report(&usage)));
                 trace_usage = Some(trg::usage_from_gemini(&usage));
+                reported_usage = Some(usage);
+                final_usage = finished;
             }
             Ok(GeminiStreamEvent::Ignored) => {}
             Err(StreamError::Cancelled) => {
@@ -438,11 +520,19 @@ pub(crate) async fn call_google_gemini_stream_inner(
                 // provider-controlled (spec §5.1).
                 let text = e.to_string();
                 attempt.finish_failed("stream_error", tro::broker_error_status(&text), None);
-                return Err(format!(
-                    "google-gemini: {}",
-                    crate::runtime::openai::net::redact_provider_proxy_error(&text)
-                )
-                .into());
+                // The final usage report of the only attempt is its spend,
+                // whatever failed after it; a running count is not.
+                let usage = (final_usage && attempt_no == 0)
+                    .then(|| reported_usage.as_ref().map(usage_report))
+                    .flatten();
+                return Err(crate::runtime::openai::failed_with_usage(
+                    format!(
+                        "google-gemini: {}",
+                        crate::runtime::openai::net::redact_provider_proxy_error(&text)
+                    )
+                    .into(),
+                    usage,
+                ));
             }
         }
     }
@@ -454,13 +544,40 @@ pub(crate) async fn call_google_gemini_stream_inner(
         }));
     }
 
+    // The stream is over: book the attempt before the result.
+    attempt_spend.settle();
     attempt.finish_success(None, None, trace_stop, trace_usage);
 
-    Ok(json!({
+    let mut response = json!({
         "content": content_blocks,
         "stop_reason": stop_reason.unwrap_or_else(|| "end_turn".to_string()),
         "usage": {},
-    }))
+    });
+    if let Some(usage) = reported_usage {
+        response["usage"] = usage_report(&usage);
+    }
+    Ok(response)
+}
+
+/// A Gemini usage report in Anthropic field names, with only reported
+/// counters: output is known when the candidate count was reported (thinking
+/// tokens, billed as output, are added to it); input when the prompt count
+/// was.
+fn usage_report(usage: &super::translate::GeminiUsage) -> Value {
+    let mut report = serde_json::Map::new();
+    if let Some(prompt) = usage.prompt_tokens {
+        let cached = usage.cached_tokens.unwrap_or(0).min(prompt);
+        report.insert("input_tokens".into(), json!(prompt - cached));
+        report.insert("cache_read_input_tokens".into(), json!(cached));
+        report.insert("cache_creation_input_tokens".into(), json!(0));
+    }
+    if let Some(candidates) = usage.candidates_tokens {
+        report.insert(
+            "output_tokens".into(),
+            json!(candidates.saturating_add(usage.thoughts_tokens.unwrap_or(0))),
+        );
+    }
+    Value::Object(report)
 }
 
 /// Read `GOOGLE_CLOUD_PROJECT` (or the `_ID` alias) if set, matching the
@@ -494,7 +611,7 @@ fn map_finish_reason(reason: &str) -> String {
 /// OAuth Code Assist quotas reset on short windows (observed 14–53s), so a
 /// bounded reset-honoring retry converts tiny-quota accounts from hard
 /// failure into slow-but-working sessions.
-const MAX_GEMINI_429_RETRIES: u32 = 4;
+pub(crate) const MAX_GEMINI_429_RETRIES: u32 = 4;
 /// Cap on any single reset wait so a hostile/garbled hint cannot stall us.
 const MAX_GEMINI_429_WAIT: Duration = Duration::from_secs(120);
 /// Wait used when a 429 carries no parsable reset hint.

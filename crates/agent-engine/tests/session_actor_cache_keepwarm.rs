@@ -232,7 +232,8 @@ fn classify(cmd: &SessionCommand) -> Effect {
             | SessionSetting::SubagentTimeout { .. }
             | SessionSetting::MaxToolOutput { .. }
             | SessionSetting::BashTimeout { .. }
-            | SessionSetting::BashMaxTimeout { .. } => Effect::Untouched,
+            | SessionSetting::BashMaxTimeout { .. }
+            | SessionSetting::MemoryOnlyTools { .. } => Effect::Untouched,
         },
         SessionCommand::Cancel
         | SessionCommand::Answer { .. }
@@ -253,7 +254,35 @@ fn classify(cmd: &SessionCommand) -> Effect {
         | SessionCommand::ReloadAborted
         // Re-arms the park timer, which an active period already defers.
         | SessionCommand::ArmPark
-        | SessionCommand::HostEvent(_) => Effect::Untouched,
+        // Arms a timer only; the resume it may start later is a turn start
+        // of its own, at its time.
+        | SessionCommand::ArmCapacityResume { .. }
+        | SessionCommand::HostEvent(_)
+        // Hold mode: the held store and the mode only.
+        | SessionCommand::Delivery { .. }
+        | SessionCommand::HeldDismiss { .. }
+        | SessionCommand::HeldMark { .. }
+        // A fork copies this session; it changes nothing here.
+        | SessionCommand::Fork { .. }
+        | SessionCommand::ForkDone { .. } => Effect::Untouched,
+        // A digest goes into history like an event (a turn may follow, by
+        // the event-wake rule); join_next waits for the next Submit;
+        // individual re-queues the events.
+        SessionCommand::HeldRelease { .. } => Effect::Fingerprint,
+        // The request-only ephemeral layer joins the next request's system
+        // text, so it may change the prefix: the fingerprint decides.
+        SessionCommand::EphemeralLayer { .. } => Effect::Fingerprint,
+        // Client tools join the next request's tool list (a new tool may
+        // change the prefix: the fingerprint decides); a return answers a
+        // call inside a turn and changes nothing idle.
+        SessionCommand::RegisterClientTools { .. } => Effect::Fingerprint,
+        SessionCommand::ToolReturn { .. } => Effect::Untouched,
+        // Starts a turn when the reload cut the last one.
+        SessionCommand::ResumeAfterReload { .. } => Effect::TurnStart,
+        // Starts a turn when a daemon crash cut the last one.
+        SessionCommand::ResumeAfterCrash { .. } => Effect::TurnStart,
+        // Starts a turn when the refused reload's drain paused the last one.
+        SessionCommand::ReloadRefused { .. } => Effect::TurnStart,
         SessionCommand::DriverStart { .. } => Effect::DriverOwned,
         SessionCommand::End { .. } => Effect::SessionEnd,
     }
@@ -425,6 +454,8 @@ async fn command_matrix_read_only_keeps_period_prefix_changes_end_it() {
             "checkpoint",
             SessionCommand::Checkpoint {
                 reason: CheckpointReason::HostRequest,
+                deadline: None,
+                skip_quiesce_grace: false,
             },
         ),
         (
@@ -1566,6 +1597,8 @@ async fn fence_for_reload(t: &mut LocalTransport, handle: &SessionHandle) {
     handle
         .send(SessionCommand::Checkpoint {
             reason: agent_engine::session::CheckpointReason::Reload,
+            deadline: None,
+            skip_quiesce_grace: false,
         })
         .await
         .unwrap();

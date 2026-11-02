@@ -326,6 +326,7 @@ fn adapter_bytes(s: &body_golden::Scenario) -> (Vec<u8>, TranslationReport) {
         None,
         s.ttl,
         s.stream,
+        body_golden::GOLDEN_WINDOW,
     );
     let bytes = serde_json::to_vec(&parts.body).expect("serialize adapter body");
     (bytes, parts.report)

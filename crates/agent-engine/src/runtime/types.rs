@@ -27,6 +27,19 @@ pub struct TurnCompletion {
     cancel_cause: std::sync::Arc<std::sync::atomic::AtomicU8>,
     /// Used when nothing was noted; `None` = the user.
     default_cause: Option<CancelCause>,
+    /// Engine → host: the turn ended on a reset-based capacity stop (no
+    /// account had capacity, and the earliest reset was out of the wait's
+    /// reach): when that limit resets. Noted by the engine as the turn
+    /// ends; taken once by the host.
+    capacity_stop: std::sync::Arc<std::sync::Mutex<Option<CapacityStopAt>>>,
+}
+
+/// A reset-based capacity stop: when the limit that stopped the turn
+/// resets (epoch ms, no jitter) and the selection failure's kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CapacityStopAt {
+    pub resume_at_ms: u64,
+    pub kind: &'static str,
 }
 
 /// Why a host cancelled a turn, as far as a canceled tool result says.
@@ -97,6 +110,16 @@ impl TurnCompletion {
             std::sync::atomic::Ordering::AcqRel,
             std::sync::atomic::Ordering::Acquire,
         );
+    }
+
+    /// Note the turn's reset-based capacity stop (the last one noted wins).
+    pub(crate) fn note_capacity_stop(&self, stop: CapacityStopAt) {
+        *self.capacity_stop.lock().unwrap_or_else(|p| p.into_inner()) = Some(stop);
+    }
+
+    /// The turn's reset-based capacity stop, if one was noted (taken once).
+    pub fn take_capacity_stop(&self) -> Option<CapacityStopAt> {
+        self.capacity_stop.lock().unwrap_or_else(|p| p.into_inner()).take()
     }
 
     /// Leading words of this turn's canceled tool results.

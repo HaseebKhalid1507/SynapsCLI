@@ -209,14 +209,18 @@ impl StreamDecoder {
                 }
             }
         }
-        if let Some(u) = chunk.usage {
+        // An empty `usage: {}` reports nothing; it is not a zero report.
+        if let Some(u) = chunk
+            .usage
+            .filter(|u| u.prompt_tokens.is_some() || u.completion_tokens.is_some())
+        {
             let cached = u
                 .prompt_tokens_details
                 .and_then(|d| d.cached_tokens)
                 .unwrap_or(0);
             sink.extend(Some(OaiEvent::Usage {
-                prompt_tokens: u.prompt_tokens.unwrap_or(0),
-                completion_tokens: u.completion_tokens.unwrap_or(0),
+                prompt_tokens: u.prompt_tokens,
+                completion_tokens: u.completion_tokens,
                 cached_tokens: cached,
             }));
         }

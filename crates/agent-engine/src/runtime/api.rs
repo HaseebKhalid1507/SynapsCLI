@@ -1,4 +1,5 @@
 use super::helpers::HelperMethods;
+use super::net_retry::{show_transport_retry_notice, warn_transport, TransportDiag};
 use super::sse_types::{AnthropicEvent, ContentBlock, Delta};
 use super::types::{AuthState, LlmEvent, SessionEvent, StreamEvent};
 use crate::runtime::telemetry::{self, TelemetryLevel};
@@ -76,26 +77,33 @@ struct ParseState {
     telem_stop_reason: Option<String>,
     telem_usage: telemetry::UsageRecord,
     first_event_seen: bool,
+    /// Liveness, counts and timings only: the progress deadlines and the
+    /// end-of-stream DEBUG line.
+    progress: super::http_phases::StreamProgress,
     // ── Usage captured from message_start (single-emission protocol) ──
     // Live API shape (probed 2024+): message_start carries the full
     // `cache_creation` sub-object; message_delta carries ONLY the aggregate
     // (but repeats input/cache_read/cache_create and brings the final
-    // output count). The start arm CAPTURES ONLY — the delta arm emits THE
-    // single authoritative Usage event, falling back to these values for
-    // anything the delta doesn't carry. Emitting from both arms double-counts
-    // input/cache in every accumulating consumer (the pre-cache-ttl
-    // double-billing bug).
+    // output count). The start arm CAPTURES ONLY — the delta arm records
+    // the effective counts, falling back to these values for anything the
+    // delta doesn't carry, and THE single authoritative Usage event is sent
+    // once, at message_stop or at the stream's end (`emit_final_usage`).
+    // Emitting from both arms double-counts input/cache in every
+    // accumulating consumer (the pre-cache-ttl double-billing bug).
     msg_start_input: Option<u64>,
     msg_start_output: Option<u64>,
     msg_start_cache_read: Option<u64>,
     msg_start_cache_create: Option<u64>,
     msg_start_cache_5m: Option<u64>,
     msg_start_cache_1h: Option<u64>,
-    /// Set once the authoritative Usage event has been emitted. The residual
-    /// path (stream died between start and delta) checks this so dead streams
-    /// still bill what message_start reported — exactly one emission per
-    /// request in all paths.
+    /// Set once the authoritative Usage event has been emitted
+    /// (`emit_final_usage`): exactly one emission per request in all paths.
     usage_emitted: bool,
+    /// The last counted message_delta's effective counts. A stream can carry
+    /// more than one message_delta and their counts are cumulative, so each
+    /// counted delta replaces the last, and the one Usage emission sends
+    /// these. `None` until a delta reports a count.
+    final_usage: Option<FinalUsage>,
     /// Captured from an in-stream Anthropic `error` event. When set, the stream
     /// produced a failure (e.g. `overloaded_error`, `request_too_large`) the API
     /// delivered inside a 200 response. `classify_stream_outcome` turns this into
@@ -123,6 +131,21 @@ struct ParseState {
     /// Cache-diagnosis verdict from message_start (only when this request
     /// sent `diagnostics`); `None` = no divergence / not requested.
     server_diagnosis: Option<crate::runtime::trace::ServerCacheDiagnosis>,
+    /// The same usage with presence kept (absent counters are `None`, not
+    /// zero): the warm rolling summary's evidence and booking.
+    wire_usage: super::warm_summary::WireUsage,
+}
+
+/// One request's effective usage: what the Usage event carries and the
+/// root prices.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FinalUsage {
+    input: u64,
+    output: u64,
+    cache_read: u64,
+    cache_create: u64,
+    cache_create_5m: Option<u64>,
+    cache_create_1h: Option<u64>,
 }
 
 /// A failure surfaced as an in-stream Anthropic `error` event under a 200
@@ -185,6 +208,7 @@ impl ParseState {
             telem_stop_reason: None,
             telem_usage: telemetry::UsageRecord::default(),
             first_event_seen: false,
+            progress: super::http_phases::StreamProgress::new(),
             msg_start_input: None,
             msg_start_output: None,
             msg_start_cache_read: None,
@@ -192,6 +216,7 @@ impl ParseState {
             msg_start_cache_5m: None,
             msg_start_cache_1h: None,
             usage_emitted: false,
+            final_usage: None,
             stream_error: None,
             stop_reason_seen: false,
             stop_reason_is_refusal: false,
@@ -199,6 +224,7 @@ impl ParseState {
             trace_stop_reason: None,
             trace_usage: None,
             server_diagnosis: None,
+            wire_usage: Default::default(),
         }
     }
 
@@ -237,7 +263,9 @@ impl ParseState {
 
     /// The content handed to `classify_stream_outcome`.
     ///
-    /// Uncancelled streams: exactly `accumulated_content`, unchanged.
+    /// Every stream drops unsigned thinking: an EOF before signature_delta
+    /// cannot leave a replayable thinking block, even without cancellation.
+    /// Otherwise uncancelled streams retain the existing content semantics.
     ///
     /// Cancelled streams keep only what the model verifiably produced, so the
     /// interrupted assistant turn can stay in history as a REAL message
@@ -251,17 +279,16 @@ impl ParseState {
     ///   loop pairs them with a canceled result).
     fn take_outcome_content(&mut self, cancelled: bool) -> Vec<Value> {
         let mut content = std::mem::take(&mut self.accumulated_content);
-        if cancelled {
-            if self.flushed_partial_tool
-                && content.last().and_then(|b| b["type"].as_str()) == Some("tool_use")
-            {
-                content.pop();
-            }
-            content.retain(|b| {
-                b["type"].as_str() != Some("thinking")
-                    || b["signature"].as_str().is_some_and(|s| !s.is_empty())
-            });
+        if cancelled
+            && self.flushed_partial_tool
+            && content.last().and_then(|b| b["type"].as_str()) == Some("tool_use")
+        {
+            content.pop();
         }
+        content.retain(|b| {
+            b["type"].as_str() != Some("thinking")
+                || b["signature"].as_str().is_some_and(|s| !s.is_empty())
+        });
         self.flushed_partial_tool = false;
         content
     }
@@ -301,6 +328,14 @@ struct EventCtx<'t> {
     /// This request sent `diagnostics`: capture the message id (chain) and
     /// the server's verdict from message_start.
     cache_diagnosis: bool,
+    /// This attempt's spend guard (child spend), observe-only: it sees the
+    /// message_start capture and the Usage emission's values. Inert unless
+    /// the request carries a worker's spend tap.
+    spend: super::child_spend::AttemptObserver,
+    /// A ledgered attempt's identity (§6): its usage is reported as the
+    /// attempt's (`UsageAttempt`) in place of the plain `Usage`. `None`
+    /// (every request without a ledger) emits exactly the plain `Usage`.
+    usage_request: Option<agent_core::UsageRequest>,
 }
 
 /// THE TEST SEAM. Strips SSE framing, skips non-data lines and the `[DONE]`
@@ -320,6 +355,32 @@ fn process_data_line(line: &str, state: &mut ParseState, ctx: &EventCtx) {
     process_event(event, data_part, state, ctx);
 }
 
+/// A usage object's counters with presence kept.
+fn usage_presence(
+    usage: Option<super::sse_types::UsagePresence>,
+) -> Option<super::warm_summary::UsageCounts> {
+    let usage = usage?;
+    let split = usage.cache_creation.as_ref();
+    Some(super::warm_summary::UsageCounts {
+        input: usage.input_tokens,
+        output: usage.output_tokens,
+        cache_read: usage.cache_read_input_tokens,
+        cache_write: usage.cache_creation_input_tokens,
+        cache_write_5m: split.and_then(|c| c.ephemeral_5m_input_tokens),
+        cache_write_1h: split.and_then(|c| c.ephemeral_1h_input_tokens),
+    })
+}
+
+/// True for Anthropic's keep-alive `ping` frame (it parses as `Unknown`).
+fn is_ping(raw: &str) -> bool {
+    #[derive(serde::Deserialize)]
+    struct Tag<'a> {
+        #[serde(rename = "type")]
+        kind: &'a str,
+    }
+    serde_json::from_str::<Tag>(raw).is_ok_and(|tag| tag.kind == "ping")
+}
+
 /// Handle one parsed SSE event. The TTFT capture rides along so the main and
 /// tail paths are uniform. `raw` is the un-parsed data line — `#[serde(other)]`
 /// discards the tag on Unknown events, so the raw line is the only forensics.
@@ -329,6 +390,13 @@ fn process_event(event: AnthropicEvent<'_>, raw: &str, state: &mut ParseState, c
     if !state.first_event_seen {
         state.first_event_seen = true;
         state.first_event_elapsed_ms = Some(ctx.request_start.elapsed().as_millis() as u64);
+    }
+    // Liveness: every parsed event but a ping is progress.
+    match &event {
+        AnthropicEvent::Unknown if is_ping(raw) => state.progress.ping(),
+        event => state
+            .progress
+            .event(matches!(event, AnthropicEvent::MessageStart { .. })),
     }
 
     match event {
@@ -445,6 +513,14 @@ fn process_event(event: AnthropicEvent<'_>, raw: &str, state: &mut ParseState, c
             }
         }
         AnthropicEvent::MessageDelta { delta, usage } => {
+            if let Some(counts) = usage_presence(
+                serde_json::from_str::<super::sse_types::DeltaUsagePresence>(raw)
+                    .ok()
+                    .and_then(|d| d.usage),
+            ) {
+                let earlier = state.wire_usage.delta.unwrap_or_default();
+                state.wire_usage.delta = Some(earlier.overlay(counts));
+            }
             // Capture stop_reason UNCONDITIONALLY — classify_stream_outcome relies
             // on it to tell a valid empty end_turn from a silent stop, and that
             // decision must NOT depend on whether telemetry is enabled (default off).
@@ -551,14 +627,6 @@ fn process_event(event: AnthropicEvent<'_>, raw: &str, state: &mut ParseState, c
                 }
 
                 if input_t > 0 || output_t > 0 || cache_read > 0 || cache_create > 0 {
-                    HelperMethods::log_usage(input_t, cache_read, cache_create, output_t);
-                    tracing::debug!(
-                        "Token Usage: {} input | {} output | {} cache_read | {} cache_create",
-                        input_t,
-                        output_t,
-                        cache_read,
-                        cache_create
-                    );
                     // ═══ TELEMETRY: accumulate usage (message_delta carries final counts) ═══
                     if ctx.telemetry_level.enabled() {
                         state.telem_usage.input = input_t;
@@ -569,11 +637,23 @@ fn process_event(event: AnthropicEvent<'_>, raw: &str, state: &mut ParseState, c
                         state.telem_usage.cache_write_1h = cache_create_1h;
                         state.telem_usage.compute_hit_pct();
                     }
-                    // THE single authoritative Usage emission for this
-                    // request. The message_start arm captures only — every
-                    // downstream consumer is an accumulator, so a second
-                    // emission double-bills input/cache.
-                    state.usage_emitted = true;
+                    // A stream carries "one or more message_delta events",
+                    // and "the token counts shown in the usage field of the
+                    // message_delta event are cumulative" (Anthropic,
+                    // Streaming Messages). So this delta's counts replace any
+                    // earlier delta's, and THE single authoritative Usage
+                    // emission for the request is sent once, at message_stop
+                    // or at the stream's end (`emit_final_usage`). Every
+                    // downstream consumer is an accumulator, so an emission
+                    // per delta double-bills.
+                    state.final_usage = Some(FinalUsage {
+                        input: input_t,
+                        output: output_t,
+                        cache_read,
+                        cache_create,
+                        cache_create_5m,
+                        cache_create_1h,
+                    });
                     state.trace_usage = Some(crate::runtime::trace::UsageMeta {
                         provenance: crate::runtime::trace::UsageProvenance::ProviderReported,
                         input_tokens: Some(input_t),
@@ -581,25 +661,24 @@ fn process_event(event: AnthropicEvent<'_>, raw: &str, state: &mut ParseState, c
                         cache_read_tokens: Some(cache_read),
                         cache_write_tokens: Some(cache_create),
                     });
-                    if let Some(counters) = &ctx.usage_counters {
-                        counters.record_priced(
-                            ctx.model, input_t, output_t, cache_read, cache_create,
-                            cache_create_5m, cache_create_1h,
-                        );
-                    }
-                    let _ = ctx.tx.send(StreamEvent::Session(SessionEvent::Usage {
-                        input_tokens: input_t,
-                        output_tokens: output_t,
-                        cache_read_input_tokens: cache_read,
-                        cache_creation_input_tokens: cache_create,
+                    ctx.spend.observe(&super::child_spend::ReportedUsage {
+                        input: Some(input_t),
+                        output: Some(output_t),
+                        cache_read: Some(cache_read),
+                        cache_creation: Some(cache_create),
                         cache_creation_5m: cache_create_5m,
                         cache_creation_1h: cache_create_1h,
-                        model: None,
-                    }));
+                    });
                 }
             }
         }
         AnthropicEvent::MessageStart { message } => {
+            state.wire_usage.start = usage_presence(
+                serde_json::from_str::<super::sse_types::StartUsagePresence>(raw)
+                    .ok()
+                    .and_then(|s| s.message)
+                    .and_then(|m| m.usage),
+            );
             // ═══ TELEMETRY: capture msg_id (also the diagnostics chain) ═══
             if ctx.telemetry_level.enabled() || ctx.cache_diagnosis {
                 if let Some(id) = message.id {
@@ -615,9 +694,10 @@ fn process_event(event: AnthropicEvent<'_>, raw: &str, state: &mut ParseState, c
                 // message_delta repeats all aggregates and carries the final
                 // output count, so emitting here too double-counts
                 // input/cache_read/cache_create in every accumulating
-                // consumer (TUI, engine, server, RPC, subagents). The delta
-                // arm emits the single authoritative event; the residual
-                // path covers streams that die before their delta.
+                // consumer (TUI, engine, server, RPC, subagents). The one
+                // authoritative event is sent at message_stop or at the
+                // stream's end; for a stream that dies before its delta,
+                // from these values.
                 state.msg_start_input = Some(usage.input_tokens);
                 state.msg_start_output = Some(usage.output_tokens);
                 state.msg_start_cache_read = Some(usage.cache_read_input_tokens);
@@ -630,6 +710,25 @@ fn process_event(event: AnthropicEvent<'_>, raw: &str, state: &mut ParseState, c
                     .cache_creation
                     .as_ref()
                     .and_then(|cc| cc.ephemeral_1h_input_tokens);
+                // The spend guard retains the start's counts, so an attempt
+                // that ends before its delta (a cancel, a dropped future)
+                // still books what the provider reported. A start that
+                // states only zeros is "never saw usage" here, as it is for
+                // the root's residual below: nothing is retained.
+                if usage.input_tokens > 0
+                    || usage.output_tokens > 0
+                    || usage.cache_read_input_tokens > 0
+                    || usage.cache_creation_input_tokens > 0
+                {
+                    ctx.spend.observe(&super::child_spend::ReportedUsage {
+                        input: state.msg_start_input,
+                        output: state.msg_start_output,
+                        cache_read: state.msg_start_cache_read,
+                        cache_creation: state.msg_start_cache_create,
+                        cache_creation_5m: state.msg_start_cache_5m,
+                        cache_creation_1h: state.msg_start_cache_1h,
+                    });
+                }
                 // Latch 1h-honored HERE, not only in the delta arm: a stream
                 // that dies between start and delta on turn 1 must not lose
                 // the latch — that would arm a false downgrade notice on a
@@ -640,7 +739,8 @@ fn process_event(event: AnthropicEvent<'_>, raw: &str, state: &mut ParseState, c
                 }
             }
         }
-        AnthropicEvent::MessageStop => {}
+        // The stream's last event: the request's one Usage emission.
+        AnthropicEvent::MessageStop => emit_final_usage(state, ctx),
         AnthropicEvent::Error { error } => {
             // Anthropic delivers some failures (overloaded, context-overflow)
             // as an in-stream `error` event under a 200 response. Capture +
@@ -691,55 +791,137 @@ fn process_event(event: AnthropicEvent<'_>, raw: &str, state: &mut ParseState, c
     }
 }
 
-/// Residual Usage emission for dead streams: if message_start reported usage
-/// but the stream terminated before message_delta could emit the single
-/// authoritative event, bill what the start reported. Idempotent via
-/// `usage_emitted` — exactly one emission per request in all paths.
-fn emit_residual_usage(state: &mut ParseState, ctx: &EventCtx) {
+/// End a ledgered attempt that failed (§6) by the transports' typed
+/// classification: released only when it provably cost nothing; otherwise
+/// its liability stays open. The conversation client follows redirects, so
+/// this route is `Unverified`: no error status releases an attempt, and the
+/// attempt is reserved after every local check, so only the send can fail.
+fn settle_failed_attempt(
+    report: crate::tools::request_ledger::AttemptReport,
+    stage: super::api_sync::FailureStage,
+) {
+    match super::api_sync::failure_spend(super::api_sync::SettlementRoute::Unverified, stage) {
+        super::api_sync::Spend::NotDispatched => {
+            report.release();
+        }
+        _ => {
+            report.finish();
+        }
+    }
+}
+
+/// An attempt's spend as its final report states it (§6): output on a
+/// `message_delta` (the start's is a running count), input and cache reads
+/// and writes on the delta or else on `message_start`, explicit zeros kept.
+/// `None` (the attempt stays open) when any of them was not reported. Read
+/// from the presence-kept capture, never from the display emission, which
+/// zero-fills absent counts and falls back to the start's for a zero.
+fn settled_usage(wire: &super::warm_summary::WireUsage) -> Option<agent_core::UsageCounts> {
+    let usage = wire.complete()?;
+    Some(agent_core::UsageCounts {
+        input_tokens: usage.input,
+        output_tokens: usage.output,
+        cache_read_input_tokens: usage.cache_read,
+        cache_creation_input_tokens: usage.cache_write,
+        cache_creation_5m: usage.cache_write_5m,
+        cache_creation_1h: usage.cache_write_1h,
+    })
+}
+
+/// The request's one Usage emission. It sends the last counted
+/// message_delta's counts; a stream that ended before any counted delta (a
+/// cancel, a transport death after message_start) sends what message_start
+/// reported, since the API already processed the input. Called at
+/// message_stop and at every stream end, so a stream cut after its delta
+/// still bills it. Idempotent via `usage_emitted`: exactly one emission per
+/// request in all paths.
+fn emit_final_usage(state: &mut ParseState, ctx: &EventCtx) {
     if state.usage_emitted {
         return;
     }
-    let input_t = state.msg_start_input.unwrap_or(0);
-    let output_t = state.msg_start_output.unwrap_or(0);
-    let cache_read = state.msg_start_cache_read.unwrap_or(0);
-    let cache_create = state.msg_start_cache_create.unwrap_or(0);
-    if input_t == 0 && output_t == 0 && cache_read == 0 && cache_create == 0 {
+    if let Some(usage) = state.final_usage {
+        // The delta arm already set the telemetry, the trace usage and the
+        // spend observation from these counts.
+        state.usage_emitted = true;
+        tracing::debug!(
+            "Token Usage: {} input | {} output | {} cache_read | {} cache_create",
+            usage.input,
+            usage.output,
+            usage.cache_read,
+            usage.cache_create
+        );
+        send_usage(ctx, usage);
+        return;
+    }
+    let usage = FinalUsage {
+        input: state.msg_start_input.unwrap_or(0),
+        output: state.msg_start_output.unwrap_or(0),
+        cache_read: state.msg_start_cache_read.unwrap_or(0),
+        cache_create: state.msg_start_cache_create.unwrap_or(0),
+        cache_create_5m: state.msg_start_cache_5m,
+        cache_create_1h: state.msg_start_cache_1h,
+    };
+    if usage.input == 0 && usage.output == 0 && usage.cache_read == 0 && usage.cache_create == 0
+    {
         return; // never saw usage (or all-zero) — nothing to bill
     }
-    HelperMethods::log_usage(input_t, cache_read, cache_create, output_t);
-    tracing::debug!("Token Usage (residual, dead stream): {} input | {} output | {} cache_read | {} cache_create", input_t, output_t, cache_read, cache_create);
+    tracing::debug!("Token Usage (residual, dead stream): {} input | {} output | {} cache_read | {} cache_create", usage.input, usage.output, usage.cache_read, usage.cache_create);
     if ctx.telemetry_level.enabled() {
-        state.telem_usage.input = input_t;
-        state.telem_usage.output = output_t;
-        state.telem_usage.cache_read = cache_read;
-        state.telem_usage.cache_write = cache_create;
-        state.telem_usage.cache_write_5m = state.msg_start_cache_5m;
-        state.telem_usage.cache_write_1h = state.msg_start_cache_1h;
+        state.telem_usage.input = usage.input;
+        state.telem_usage.output = usage.output;
+        state.telem_usage.cache_read = usage.cache_read;
+        state.telem_usage.cache_write = usage.cache_create;
+        state.telem_usage.cache_write_5m = usage.cache_create_5m;
+        state.telem_usage.cache_write_1h = usage.cache_create_1h;
         state.telem_usage.compute_hit_pct();
     }
     state.usage_emitted = true;
     state.trace_usage = Some(crate::runtime::trace::UsageMeta {
         provenance: crate::runtime::trace::UsageProvenance::ProviderReported,
-        input_tokens: Some(input_t),
-        output_tokens: Some(output_t),
-        cache_read_tokens: Some(cache_read),
-        cache_write_tokens: Some(cache_create),
+        input_tokens: Some(usage.input),
+        output_tokens: Some(usage.output),
+        cache_read_tokens: Some(usage.cache_read),
+        cache_write_tokens: Some(usage.cache_create),
     });
+    ctx.spend.observe(&super::child_spend::ReportedUsage {
+        input: Some(usage.input),
+        output: Some(usage.output),
+        cache_read: Some(usage.cache_read),
+        cache_creation: Some(usage.cache_create),
+        cache_creation_5m: usage.cache_create_5m,
+        cache_creation_1h: usage.cache_create_1h,
+    });
+    send_usage(ctx, usage);
+}
+
+/// The emission itself: the usage log, the root's priced booking and the
+/// one Usage event.
+fn send_usage(ctx: &EventCtx, usage: FinalUsage) {
+    HelperMethods::log_usage(usage.input, usage.cache_read, usage.cache_create, usage.output);
     if let Some(counters) = &ctx.usage_counters {
         counters.record_priced(
-            ctx.model, input_t, output_t, cache_read, cache_create,
-            state.msg_start_cache_5m, state.msg_start_cache_1h,
+            ctx.model,
+            usage.input,
+            usage.output,
+            usage.cache_read,
+            usage.cache_create,
+            usage.cache_create_5m,
+            usage.cache_create_1h,
         );
     }
-    let _ = ctx.tx.send(StreamEvent::Session(SessionEvent::Usage {
-        input_tokens: input_t,
-        output_tokens: output_t,
-        cache_read_input_tokens: cache_read,
-        cache_creation_input_tokens: cache_create,
-        cache_creation_5m: state.msg_start_cache_5m,
-        cache_creation_1h: state.msg_start_cache_1h,
-        model: None,
-    }));
+    // A ledgered attempt's usage goes out as the attempt's (§6), never also
+    // as the plain usage; without a ledger this is exactly the plain `Usage`.
+    let counts = agent_core::UsageCounts {
+        input_tokens: usage.input,
+        output_tokens: usage.output,
+        cache_read_input_tokens: usage.cache_read,
+        cache_creation_input_tokens: usage.cache_create,
+        cache_creation_5m: usage.cache_create_5m,
+        cache_creation_1h: usage.cache_create_1h,
+    };
+    let _ = ctx.tx.send(StreamEvent::Session(
+        crate::tools::request_ledger::usage_event(ctx.usage_request.as_ref(), counts, None),
+    ));
 }
 
 /// Decide the fate of a finished stream. Pure (no I/O) so it is unit tested
@@ -808,12 +990,66 @@ fn classify_stream_outcome(
     StreamOutcome::Done(json!({ "content": content }))
 }
 
+/// How a streamed 200 failed, as a static label: the vetted type of an
+/// in-stream error frame (else `unrecognized_error`), a broken body
+/// (`transport`), a body that went quiet (`idle_timeout`), or no content and
+/// no stop reason (`empty_response`).
+fn stream_failure_label(
+    stream_error: Option<&StreamError>,
+    transport_error: Option<&RuntimeError>,
+) -> &'static str {
+    match (stream_error, transport_error) {
+        (_, Some(RuntimeError::NetworkTimeout(_))) => "idle_timeout",
+        (_, Some(_)) => "transport",
+        (Some(error), None) => error
+            .error_type
+            .as_deref()
+            .and_then(crate::core::error::sanitize_error_type)
+            .unwrap_or("unrecognized_error"),
+        (None, None) => "empty_response",
+    }
+}
+
+/// How a send that may have reached the provider failed without a
+/// response, as a static label.
+fn send_failure_label(error: &RuntimeError) -> &'static str {
+    match error {
+        RuntimeError::NetworkTimeout(_) => "header_timeout",
+        _ => "transport",
+    }
+}
+
+/// The label a keep-warm request's transport stamps when it takes its
+/// refusal exit (stop reason `refusal`, no in-stream error frame before the
+/// stream ended, refusal budget spent). The warm summary classifies a
+/// refusal on this exit, not on the recorded stop reason alone: an error
+/// frame after a refusal stop takes precedence and is stamped with its own
+/// label.
+pub(crate) const REFUSAL_EXIT: &str = "refusal";
+
+/// Record `label` as how a keep-warm request (ping or warm summary) failed.
+fn stamp_failure(options: &ApiOptions, label: &'static str) {
+    if let Some(keepwarm) = &options.keepwarm {
+        *keepwarm
+            .failure_kind
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(label);
+    }
+}
+
 /// Extensible — new flags go here instead of adding parameters to 4 signatures.
 #[derive(Debug, Clone, Default)]
 pub struct ApiOptions {
+    /// Host-set turn provenance; never inferred from messages or event text.
+    pub event_triggered: bool,
     /// Immutable host binding for extension-provider interior tool execution.
     /// `None` is only for internal/test callers without a runtime capability.
     pub memory_backend: Option<crate::memory_backend::MemoryBinding>,
+    /// The session's write-sandbox binding (`crate::sandbox`): bash/PTY
+    /// commands an extension provider's interior tool loop runs are
+    /// sandboxed like the session's own. `None`: no sandbox (internal and
+    /// test callers without a session), exactly as before.
+    pub sandbox: Option<std::sync::Arc<crate::sandbox::SandboxBinding>>,
     /// Opt into the 1M context window beta header.
     pub use_1m_context: bool,
     /// Configured prompt-cache TTL (spec: cache-ttl). Resolved to a wire
@@ -872,6 +1108,12 @@ pub struct ApiOptions {
     /// transport starts and consumed by both RequestTracer and the stream's
     /// tool lifecycle recorder.
     pub request_correlation: Option<crate::runtime::trace::RequestCorrelation>,
+    /// Journal identity and the runtime's effective window. The window also
+    /// sizes the request's output cap (`ApiOptions::effective_context_window`,
+    /// B32), so the wire's `max_tokens` is what the context assessment
+    /// reserved; `None` falls back to the 1M flag, then the model's window.
+    pub diagnostic_session_id: Option<String>,
+    pub diagnostic_context_window: Option<u64>,
     /// Internal sync routes can suppress high-volume display-only deltas at
     /// the producer boundary; final text/tool results are still returned in
     /// the normal response value.
@@ -939,6 +1181,64 @@ pub struct ApiOptions {
     /// `rollover_window` / `rollover` fields. `None` (default) before any
     /// rollover and on every non-turn request: records stay unchanged.
     pub context_rollover: Option<super::telemetry::RolloverStamp>,
+    /// Evidence slot of a recorded conversation request (warm rolling
+    /// summary): the native Anthropic transport writes the built prefix's
+    /// fingerprint, the authorization's opaque credential scope, the accepted
+    /// attempt's send time and the completed response's cache usage here.
+    /// Ignored on keep-warm requests. Never changes the request.
+    pub prefix_tap: Option<std::sync::Arc<super::warm_summary::PrefixTap>>,
+    /// A rollover summary's snapshot gate: the bounded native Anthropic
+    /// request is not sent once it closes (checked right before the send).
+    pub snapshot_gate: Option<super::warm_summary::SnapshotGate>,
+    /// A worker runtime's spend tap (child spend): each paid attempt books
+    /// the usage its provider reported through it, once, at the attempt's
+    /// end. `None` (default) books nothing: the root session's own requests,
+    /// summaries (their settlement books), keep-warm pings and every host
+    /// without a sink.
+    pub spend_tap: Option<super::child_spend::SpendTap>,
+    /// A v2 worker run's request ledger (§6; slice 6, dark), attributed to
+    /// this request's model and purpose. `None` (default: every session,
+    /// keep-warm ping, one-shot and v1 worker) changes nothing about the
+    /// request or its events.
+    pub(crate) request_ledger: Option<crate::tools::RequestLedgerHandle>,
+    /// The turn's capacity wait (config `capacity_wait`): a window-limit 429
+    /// with a long reset and no other account waits in the request for the
+    /// reset instead of ending the turn (see `capacity_wait`). `None`
+    /// (default): never waits, as for keep-warm pings, summaries and
+    /// compaction.
+    pub(crate) capacity_wait: Option<super::capacity_wait::CapacityWaitPolicy>,
+    /// The `max_tokens` a native Anthropic conversation request was sized to
+    /// and admitted on (R1, `stream::size_request`): the transport lowers the
+    /// body's static cap to it, so the wire sends exactly the output the
+    /// pre-request assessment reserved. Never raises the cap; ignored by
+    /// keep-warm pings and warm summaries (their own ceilings) and by every
+    /// other transport. `None` (default): the static cap.
+    pub(crate) request_output_tokens: Option<u64>,
+    /// The stream turn's long-context refusal slot: a request that carried
+    /// the 1M beta and was refused with a long-context class (see
+    /// [`classify_long_context_refusal`](crate::core::error::classify_long_context_refusal))
+    /// is reported here (status and class only, never the body) so the turn
+    /// can fall back to the native window. The error itself is unchanged.
+    /// `None` (default): nothing is classified, as for one-shots, keep-warm
+    /// pings, summaries and compaction.
+    pub(crate) long_context_refusal: Option<super::native_window::LongContextSlot>,
+}
+
+impl ApiOptions {
+    /// The window that sizes this request's output cap
+    /// ([`HelperMethods::max_tokens_for_request`](super::helpers::HelperMethods::max_tokens_for_request)):
+    /// the runtime's effective window when the caller set it, otherwise 1M
+    /// (clamped to `model`'s ceiling) when the 1M context was asked for,
+    /// otherwise `model`'s native window.
+    pub(crate) fn effective_context_window(&self, model: &str) -> u64 {
+        self.diagnostic_context_window.unwrap_or_else(|| {
+            if self.use_1m_context {
+                crate::core::models::effective_context_window(model, Some(1_000_000))
+            } else {
+                crate::core::models::context_window_for_model(model)
+            }
+        })
+    }
 }
 
 /// What a keep-warm request does once its body is built.
@@ -958,37 +1258,156 @@ pub enum KeepWarmMode {
     Replay,
 }
 
+/// What a request with a trailing request-local message is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TailPurpose {
+    /// Keep-warm ping: output cut to the thinking mode's minimum.
+    Ping,
+    /// Warm rolling summary: total output (thinking included) capped at
+    /// `max_tokens`, which must exceed any thinking budget; sent only while
+    /// the authorization and the resolved endpoint still have the recorded
+    /// scopes; never re-sent with a refetched credential.
+    Summary {
+        max_tokens: u64,
+        credential: u64,
+        endpoint: u64,
+        /// The recorded request's prefix digest
+        /// ([`super::request::RequestBody::prefix_digest_over`]); the
+        /// summary is sent only when the rebuilt prefix has the same one.
+        digest: [u8; 32],
+        /// Written to this request's telemetry record as
+        /// `rollover_summary`, matching the rollover event's `summary_id`.
+        correlation: u64,
+    },
+}
+
 /// Wire knobs for a keep-warm request (see [`ApiOptions::keepwarm`]).
 #[derive(Debug, Clone)]
 pub struct KeepWarmRequest {
     pub mode: KeepWarmMode,
+    pub purpose: TailPurpose,
+    /// The response's stop reason, once one arrived.
+    pub stop_reason: std::sync::Arc<std::sync::Mutex<Option<crate::runtime::trace::StopReason>>>,
+    /// The response's usage with presence kept, once its stream ended.
+    pub usage: std::sync::Arc<std::sync::Mutex<super::warm_summary::WireUsage>>,
     /// Last HTTP status the transport saw (0 = none), so the caller can tell
     /// a 4xx (stop) from a 5xx/429 (bounded retry).
     pub status: std::sync::Arc<std::sync::atomic::AtomicU16>,
-    /// Set once the request is actually dispatched: when the HTTP client,
-    /// over an established connection with the head written, pulls the body
-    /// (see [`keepwarm_body`]), or when `send()` returns a response. From then
-    /// on the ping may be billed even if it is aborted. A refused connection
-    /// never sets it.
-    pub sent: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Published once the request is actually dispatched: when the HTTP
+    /// client, over an established connection with the head written, pulls
+    /// the body (see [`gated_body`]), or when `send()` returns a response.
+    /// From then on the ping may be billed even if it is aborted. A refused
+    /// connection never publishes it; a caller that withdraws it first
+    /// keeps the body from ever being produced.
+    pub sent: std::sync::Arc<super::keepwarm::Publication>,
     /// Set when `send()` failed to connect (no HTTP status, nothing sent).
     pub connect_failed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// How the request failed once it may have reached the provider, as a
+    /// static label (never provider text), stamped at the error exit: see
+    /// [`stream_failure_label`], [`send_failure_label`] and, for an HTTP
+    /// error status, the vetted type of its body.
+    pub failure_kind: std::sync::Arc<std::sync::Mutex<Option<&'static str>>>,
+    /// Warm summary: the right to send, checked at the dispatch boundary
+    /// after every await of request preparation; a revoked lease returns
+    /// `{"keepwarm_refused":"revoked"}` with nothing sent.
+    pub lease: Option<super::warm_summary::WarmLease>,
 }
 
-/// A keep-warm request body that flips `sent` when the HTTP client first
-/// pulls it: hyper only polls a request body once the connection is
-/// established and the request head is written, so a ping that never
-/// connected is never marked sent. `Content-Length` is set explicitly so the
-/// wire framing matches a buffered body's (no chunked encoding).
-fn keepwarm_body(
+#[cfg(test)]
+thread_local! {
+    /// Transfer a real local Codex transport result into the runtime completion
+    /// path without routing a test through production credential discovery.
+    pub(crate) static EVENT_NOOP_RESPONSE_FOR_TEST: std::cell::RefCell<Option<(Value, Vec<StreamEvent>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Live-acceptance seam (test builds only): when set, a warm summary's
+    /// body gets this salt in front of its last system text block AFTER the
+    /// prefix checks, so the provider sees a prefix it has not cached (a
+    /// controlled cache miss). Set on the test's runtime thread only.
+    pub(crate) static WARM_BODY_SALT_FOR_TEST: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn salt_summary_body_for_test(body: bytes::Bytes, keepwarm: &Option<KeepWarmRequest>) -> bytes::Bytes {
+    let Some(salt) = WARM_BODY_SALT_FOR_TEST.with(std::cell::Cell::get) else {
+        return body;
+    };
+    if !matches!(
+        keepwarm,
+        Some(KeepWarmRequest {
+            purpose: TailPurpose::Summary { .. },
+            ..
+        })
+    ) {
+        return body;
+    }
+    let mut value: Value = serde_json::from_slice(&body).expect("a JSON request body");
+    let salted = |text: &str| Value::String(format!("[cache salt {salt:016x}]\n{text}"));
+    match &mut value["system"] {
+        Value::String(text) => {
+            let s = salted(text);
+            value["system"] = s;
+        }
+        Value::Array(blocks) => {
+            let block = blocks
+                .iter_mut()
+                .rev()
+                .find(|b| b["text"].is_string())
+                .expect("a system text block");
+            let s = salted(block["text"].as_str().unwrap_or_default());
+            block["text"] = s;
+        }
+        _ => panic!("a warm summary body has a system prompt"),
+    }
+    serde_json::to_vec(&value).expect("serializable").into()
+}
+
+/// A request body (keep-warm ping, warm or screened rollover summary) that
+/// flips `sent` when the HTTP client first pulls it: hyper only polls a
+/// request body once the connection is established and the request head
+/// is written, so a request that never connected is never marked sent.
+/// `Content-Length` is set explicitly so the wire framing matches a
+/// buffered body's (no chunked encoding).
+///
+/// A summary's `gate` (its lease or snapshot and, on a worker run's clock,
+/// the run deadline, read last) is checked right before the publication
+/// below, before the first (only) body chunk is yielded: the last check that
+/// authorizes publishing it, the request's linearization point. Closed there, the body
+/// is not produced and the request fails before any body byte is written
+/// (the head may already be on the wire, a request the provider never
+/// receives in full); after it, the bytes cannot be retracted and the
+/// request runs to its end.
+///
+/// `publication` is published here, by compare-exchange, right before the
+/// chunk is yielded (callers also mark it answered when `send()` returns any
+/// response). The client may still hold this body on its connection task
+/// after the caller dropped the request; a caller that withdrew
+/// `publication` first gets no body byte out, here or later.
+pub(super) fn gated_body(
     req: reqwest::RequestBuilder,
     body: bytes::Bytes,
-    sent: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    publication: &std::sync::Arc<super::keepwarm::Publication>,
+    gate: Option<super::warm_summary::BodyGate>,
 ) -> reqwest::RequestBuilder {
-    let flag = std::sync::Arc::clone(sent);
+    let publication = std::sync::Arc::clone(publication);
     let len = body.len();
     let stream = futures::stream::once(async move {
-        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(test)]
+        publication.pause(super::keepwarm::SeamPoint::BeforePublish);
+        if gate.is_some_and(|gate| !gate.open()) {
+            return Err(std::io::Error::other(
+                "rollover summary withdrawn before its body",
+            ));
+        }
+        if !publication.publish() {
+            return Err(std::io::Error::other("request withdrawn before its body"));
+        }
+        #[cfg(test)]
+        publication.pause(super::keepwarm::SeamPoint::BeforeYield);
         Ok::<bytes::Bytes, std::io::Error>(body)
     });
     req.header(reqwest::header::CONTENT_LENGTH, len)
@@ -1175,6 +1594,15 @@ impl ApiMethods {
         if cancel.is_cancelled() {
             return Err(RuntimeError::Canceled);
         }
+        #[cfg(test)]
+        if let Some((response, events)) =
+            EVENT_NOOP_RESPONSE_FOR_TEST.with(|slot| slot.borrow_mut().take())
+        {
+            for event in events {
+                let _ = tx.send(event);
+            }
+            return Ok(response);
+        }
         // Keep-warm pings exist only for the native Anthropic transport: every
         // other route would ignore the output cap and the marker placement.
         if options.keepwarm.is_some() && !super::auth::model_is_anthropic(model) {
@@ -1193,6 +1621,14 @@ impl ApiMethods {
             .request_tools_schema
             .clone()
             .unwrap_or_else(|| tools.tools_schema());
+        // §6 backstop: a ledgered request (a v2 worker run) goes only to a
+        // transport that books its attempts; any other route refuses it
+        // before anything is sent.
+        if options.request_ledger.is_some() && !crate::runtime::openai::books_requests(model) {
+            return Err(RuntimeError::Config(
+                crate::runtime::openai::unbooked_route(model),
+            ));
+        }
         // Cloud models always dispatch through the typed credential broker.
         // Text-only pre-flight, invocation, cancellation, and Task 10B trace
         // wiring live in `runtime::cloud_invoke` (extracted for testability).
@@ -1242,30 +1678,43 @@ impl ApiMethods {
                 .usage_counters
                 .clone()
                 .filter(|_| !super::auth::model_is_anthropic(model));
+            let diagnostic_context = crate::runtime::openai::terminal_diagnostics::Context {
+                session: options.diagnostic_session_id.clone(),
+                window: options.diagnostic_context_window,
+            };
             with_usage_metering(model, counters, &tx, |tx| async move {
-                crate::runtime::openai::try_route_with_memory_backend(
-                    model,
-                    client,
-                    tools_schema,
-                    system_prompt,
-                    messages,
-                    &tx,
-                    None,
-                    None,
-                    thinking_budget,
-                    reasoning_level,
-                    cancel,
-                    &options.credential_source,
-                    &options.token_cache,
-                    max_retries,
-                    options.codex_request_role,
-                    options.tool_session_id.as_ref(),
-                    options.session_tool_set.as_ref(),
-                    options.memory_backend.as_ref(),
-                    &options.trace,
-                    options.suppress_stream_deltas,
-                )
-                .await
+                crate::runtime::openai::terminal_diagnostics::CONTEXT
+                    .scope(
+                        diagnostic_context,
+                        crate::runtime::openai::try_route_with_request_ledger_for_event(
+                            model,
+                            client,
+                            tools_schema,
+                            system_prompt,
+                            messages,
+                            &tx,
+                            None,
+                            None,
+                            thinking_budget,
+                            reasoning_level,
+                            cancel,
+                            &options.credential_source,
+                            &options.token_cache,
+                            max_retries,
+                            options.codex_request_role,
+                            options.tool_session_id.as_ref(),
+                            options.session_tool_set.as_ref(),
+                            options.memory_backend.as_ref(),
+                            options.sandbox.as_ref(),
+                            &options.trace,
+                            options.suppress_stream_deltas,
+                            crate::runtime::openai::AttemptPolicy::Configured,
+                            options.spend_tap.as_ref(),
+                            options.event_triggered,
+                            options.request_ledger.as_ref(),
+                        ),
+                    )
+                    .await
             })
             .await
         };
@@ -1361,7 +1810,17 @@ impl ApiMethods {
             })?;
         let model = model.strip_prefix("anthropic/").unwrap_or(model);
 
-        let streaming_client = super::http_phases::client(&options.anthropic_stream_client)?;
+        // A rollover summary is sent once, on the caller's client, which
+        // refuses redirects; the conversation pool follows them (a POST
+        // 301/302/303 would become a second, body-less GET). The phase
+        // deadlines below apply to either client.
+        let streaming_client = match &options.keepwarm {
+            Some(KeepWarmRequest {
+                purpose: TailPurpose::Summary { .. },
+                ..
+            }) => client,
+            _ => super::http_phases::client(&options.anthropic_stream_client)?,
+        };
 
         // Read auth state for this API call
         let (mut auth_header_name, mut auth_header_value, auth_type, mut auth_binding) =
@@ -1417,6 +1876,19 @@ impl ApiMethods {
         .map_err(RuntimeError::Config)?;
         super::attachments::validate_messages(model, &cleaned_messages)
             .map_err(RuntimeError::Config)?;
+        // Warm summary: the trailing instruction is held back while the
+        // recorded history is projected exactly as its own request was
+        // (retention anchor, sanitize, tool references, cache marker on its
+        // last block); then it is appended after that marked block, as a
+        // trailing text block of the last user message (the wire merges
+        // adjacent user turns).
+        let summary_tail = match &options.keepwarm {
+            Some(KeepWarmRequest {
+                purpose: TailPurpose::Summary { .. },
+                ..
+            }) if cleaned_messages.len() >= 2 => cleaned_messages.pop(),
+            _ => None,
+        };
         // The frontier is a position in `messages`: anchor before sanitation
         // merges messages. A worker round arrives already retired upstream
         // (its frontier rides in the options) and replays as a no-op here.
@@ -1431,7 +1903,27 @@ impl ApiMethods {
         HelperMethods::wire_tool_references(&mut cleaned_messages, &|id: &str| {
             split.and_then(|split| split.id_to_api.get(id).cloned())
         });
+        // The recorded request's wire messages, for the prefix comparison.
+        let mut summary_history: Option<Vec<crate::SharedMessage>> = None;
         let keepwarm_prefix_len = match &options.keepwarm {
+            // Warm summary: the recorded history, projected and marked as its
+            // own request was, then the held-back instruction as its tail.
+            Some(_) if summary_tail.is_some() => {
+                HelperMethods::annotate_cache_breakpoint(&mut cleaned_messages, cache_ttl);
+                // Whole blocks after the marker were request-local (turn
+                // context): cut them, then the final protocol guard.
+                if !HelperMethods::cut_after_marker(&mut cleaned_messages)
+                    || !super::warm_summary::protocol_complete(&cleaned_messages)
+                {
+                    return Ok(serde_json::json!({ "keepwarm_refused": "protocol" }));
+                }
+                summary_history = Some(cleaned_messages.clone());
+                let prefix_len = cleaned_messages.len();
+                if let Some(tail) = summary_tail {
+                    HelperMethods::append_tail_message(&mut cleaned_messages, tail);
+                }
+                prefix_len
+            }
             // Tool-round replay (`runtime::tool_keepwarm`): `messages` are the
             // round's own request messages, so they are processed and marked
             // exactly as that round's request was; the ping text is appended
@@ -1486,14 +1978,28 @@ impl ApiMethods {
             Some(&execution_plan),
             cache_ttl,
             true,
+            options.effective_context_window(model),
         );
         let mut body = parts.body;
         // Before the keep-warm fingerprint below: a ping's prefix is the
         // turn's, `thinking` included.
         body.set_thinking_display(options.thinking_display);
+        // A conversation request sized to the room left (R1) sends the
+        // output its assessment reserved. Keep-warm pings and warm summaries
+        // keep their own ceilings below (applied to the static cap).
+        if let (None, Some(reserved)) = (&options.keepwarm, options.request_output_tokens) {
+            if !body.apply_reserved_max_tokens(reserved) {
+                tracing::warn!(
+                    reserved,
+                    max_tokens = body.max_tokens(),
+                    "reserved output does not fit this request body; static cap kept"
+                );
+            }
+        }
         // A model that rejects input + `max_tokens` over the window gets the
-        // room the input leaves (no-op on Claude 4.5 and later). Before the
-        // keep-warm cut below, which only lowers it further.
+        // room the input leaves (no-op on Claude 4.5 and later). After the
+        // reserved output (both only lower the cap) and before the keep-warm
+        // cut below, which only lowers it further.
         body.fit_max_tokens_to_window(Self::provider_window(options, model));
         // Cache diagnostics (`cache_diagnostics = true`): the foreground
         // chain only — pings and the setting-off path send no field.
@@ -1506,13 +2012,41 @@ impl ApiMethods {
         // or a ping whose prefix no longer matches what is cached — returns
         // here, before any trace, telemetry or network I/O.
         if let Some(keepwarm) = &options.keepwarm {
-            body.apply_keepwarm_max_tokens();
+            match keepwarm.purpose {
+                TailPurpose::Ping => body.apply_keepwarm_max_tokens(),
+                TailPurpose::Summary {
+                    max_tokens,
+                    credential,
+                    ..
+                } => {
+                    if !body.apply_summary_max_tokens(max_tokens) {
+                        return Ok(serde_json::json!({ "keepwarm_refused": "output_limit" }));
+                    }
+                    if super::warm_summary::credential_scope(&auth_header_value) != credential {
+                        return Ok(serde_json::json!({ "keepwarm_refused": "credential" }));
+                    }
+                }
+            }
             let beta = Self::build_beta_header(&auth_type, options, model);
-            let actual = body.prefix_fingerprint(keepwarm_prefix_len, beta.as_deref());
-            let send = match keepwarm.mode {
-                KeepWarmMode::Probe => false,
-                KeepWarmMode::Send { expect } => expect == actual,
-                KeepWarmMode::Replay => true,
+            let (actual, send) = match (&summary_history, keepwarm.purpose) {
+                (Some(history), TailPurpose::Summary { digest, .. }) => {
+                    let actual = body.prefix_digest_over(history, beta.as_deref());
+                    (
+                        body.prefix_fingerprint_over(history, beta.as_deref()),
+                        matches!(keepwarm.mode, KeepWarmMode::Send { .. }) && actual == digest,
+                    )
+                }
+                // A summary without its recorded history is never sent.
+                (None, TailPurpose::Summary { .. }) => (0, false),
+                _ => {
+                    let actual = body.prefix_fingerprint(keepwarm_prefix_len, beta.as_deref());
+                    let send = match keepwarm.mode {
+                        KeepWarmMode::Probe => false,
+                        KeepWarmMode::Send { expect } => expect == actual,
+                        KeepWarmMode::Replay => true,
+                    };
+                    (actual, send)
+                }
             };
             if !send {
                 return Ok(serde_json::json!({
@@ -1520,6 +2054,17 @@ impl ApiMethods {
                     "keepwarm_max_tokens": body.max_tokens(),
                 }));
             }
+        }
+        if let (None, Some(tap)) = (&options.keepwarm, &options.prefix_tap) {
+            let beta = Self::build_beta_header(&auth_type, options, model);
+            // The cached prefix ends at the marker: request-local blocks
+            // after it are not part of what a warm summary re-sends.
+            let mut prefix = cleaned_messages.clone();
+            if HelperMethods::cut_after_marker(&mut prefix) {
+                tap.built(body.prefix_digest_over(&prefix, beta.as_deref()));
+            }
+            tap.authorized(super::warm_summary::credential_scope(&auth_header_value));
+            tap.resolved_ttl(cache_ttl);
         }
         let translation_report = parts.report;
 
@@ -1549,6 +2094,19 @@ impl ApiMethods {
                 RuntimeError::ApiStatus(format!("failed to serialize request body: {}", e))
             })?
             .into();
+        #[cfg(test)]
+        {
+            body_bytes = salt_summary_body_for_test(body_bytes, &options.keepwarm);
+        }
+        // A ledgered request's liability estimate (§6), the same for every
+        // attempt: its bytes and output allowance do not change.
+        let ledger_estimate = options.request_ledger.as_ref().map(|ledger| {
+            crate::tools::request_ledger::request_estimate(
+                ledger.model(),
+                &body_bytes,
+                body.max_tokens(),
+            )
+        });
         // The derived request body is dead weight for the whole network wait
         // (retries reuse `body_bytes`): release it — and its owned `system`
         // block copy — before the first send (§3.6 f3).
@@ -1583,6 +2141,20 @@ impl ApiMethods {
             .or_else(|| std::env::var("SYNAPS_ANTHROPIC_BASE_URL").ok())
             .unwrap_or_else(|| "https://api.anthropic.com".into());
         let anthropic_url = format!("{}/v1/messages", anthropic_base.trim_end_matches('/'));
+        let endpoint_scope = super::warm_summary::scope_hash(&anthropic_url);
+        match (&options.keepwarm, &options.prefix_tap) {
+            (
+                Some(KeepWarmRequest {
+                    purpose: TailPurpose::Summary { endpoint, .. },
+                    ..
+                }),
+                _,
+            ) if *endpoint != endpoint_scope => {
+                return Ok(serde_json::json!({ "keepwarm_refused": "endpoint" }));
+            }
+            (None, Some(tap)) => tap.endpoint(endpoint_scope),
+            _ => {}
+        }
 
         // ═══ TRACE (Task 8): one record per actual attempt ════════════════════
         // Emission rule documented in `trace::emit`. Tracing is metadata-only
@@ -1638,6 +2210,10 @@ impl ApiMethods {
         let mut output_started = false;
         let mut tool_activity = false;
         let mut anthropic_failovers: u32 = 0;
+        // `capacity_resend_left`: this request may still wait for capacity
+        // once at a window limit and be sent again; taken when that wait
+        // begins, before the resend, so a second window limit ends the turn.
+        let mut capacity_resend_left = true;
         let mut anthropic_attempted: Vec<crate::auth::CredentialRef> = Vec::new();
         let mut quota_headers_logged = false;
         // Accounts this request reported exhausted: if one of them then
@@ -1649,8 +2225,15 @@ impl ApiMethods {
         // notice about it reaches the session.
         let keepwarm_ping = options.keepwarm.is_some();
         let mut sent_at_ms;
+        // `first_event_relaxed`: an attempt of this request ended at the
+        // first-event deadline, so every later attempt waits the progress
+        // window for `message_start` (a cold prefill can be that slow).
+        let mut first_event_relaxed = false;
 
         loop {
+            // §6: the ledgered attempt in flight, reserved right before each
+            // send; it ends with its answer or its stream.
+            let mut ledgered: Option<crate::tools::request_ledger::AttemptReport> = None;
             let response = {
                 #[allow(unused_assignments)]
                 let mut response = None;
@@ -1667,9 +2250,10 @@ impl ApiMethods {
                     // Rebuild request (consumed on send)
                     let mut req = streaming_client
                         .post(&anthropic_url)
-                        .header(auth_header_name.clone(), auth_header_value.clone())
-                        .header("anthropic-version", "2023-06-01")
-                        .header("content-type", "application/json");
+                        .header(auth_header_name.clone(), auth_header_value.clone());
+                    for (name, value) in super::request::ANTHROPIC_FIXED_HEADERS {
+                        req = req.header(name, value);
+                    }
                     // Build the anthropic-beta header. The 1M-context opt-in
                     // (`context-1m-2025-08-07`) is only added when the user
                     // explicitly requested 1M AND the model supports it. Without
@@ -1685,14 +2269,59 @@ impl ApiMethods {
                     if cancel.is_cancelled() {
                         return Err(RuntimeError::Canceled);
                     }
+                    // A warm summary whose record was replaced, reset or
+                    // invalidated, or whose prefix inputs changed, while the
+                    // request was prepared is not sent.
+                    if let Some(KeepWarmRequest {
+                        lease: Some(lease), ..
+                    }) = &options.keepwarm
+                    {
+                        match lease.state() {
+                            super::warm_summary::LeaseState::Valid => {}
+                            super::warm_summary::LeaseState::PrefixChanged => {
+                                return Ok(
+                                    serde_json::json!({ "keepwarm_refused": "prefix_policy" }),
+                                );
+                            }
+                            super::warm_summary::LeaseState::Revoked => {
+                                return Ok(serde_json::json!({ "keepwarm_refused": "revoked" }));
+                            }
+                        }
+                    }
                     clock = crate::runtime::trace::AttemptClock::start();
                     let sent_at = super::keepwarm::CacheAnchor::now();
                     sent_at_ms = crate::epoch_millis();
                     let req = wire.encoding_header(req);
                     let req = match &options.keepwarm {
-                        Some(keepwarm) => keepwarm_body(req, wire.bytes.clone(), &keepwarm.sent),
+                        Some(keepwarm) => gated_body(
+                            req,
+                            wire.bytes.clone(),
+                            &keepwarm.sent,
+                            keepwarm
+                                .lease
+                                .clone()
+                                .map(super::warm_summary::BodyGate::Lease),
+                        ),
                         None => req.body(wire.bytes.clone()),
                     };
+                    // §6: a ledgered attempt is booked before it is sent; a
+                    // run at its request cap sends nothing more.
+                    if let (Some(ledger), Some(estimate)) =
+                        (&options.request_ledger, ledger_estimate)
+                    {
+                        ledgered = Some(
+                            crate::tools::request_ledger::AttemptReport::reserve(
+                                ledger,
+                                estimate,
+                                crate::tools::request_ledger::UsageReports::Cumulative,
+                                &tx,
+                            )
+                            .map_err(|e| RuntimeError::Config(e.to_string()))?,
+                        );
+                    }
+                    // When this attempt was sent: a transport failure's
+                    // retry notice counts the time the user already waited.
+                    let attempt_started = std::time::Instant::now();
                     match await_or_cancel(
                         cancel,
                         super::http_phases::send(
@@ -1708,9 +2337,7 @@ impl ApiMethods {
                                 .request_compression
                                 .settle(&mut wire, status.is_success());
                             if let Some(keepwarm) = &options.keepwarm {
-                                keepwarm
-                                    .sent
-                                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                                keepwarm.sent.answered();
                                 keepwarm
                                     .status
                                     .store(status.as_u16(), std::sync::atomic::Ordering::Relaxed);
@@ -1739,8 +2366,25 @@ impl ApiMethods {
                                         anthropic_cooled.retain(|c| c != &seat);
                                     }
                                 }
+                                if let (None, Some(tap)) = (&options.keepwarm, &options.prefix_tap)
+                                {
+                                    tap.accepted(sent_at);
+                                }
                                 response = Some(resp);
                                 break;
+                            }
+
+                            // §6: an error status from this client (which
+                            // follows redirects) is no evidence of zero
+                            // spend: the attempt stays open.
+                            if let Some(report) = ledgered.take() {
+                                settle_failed_attempt(
+                                    report,
+                                    super::api_sync::FailureStage::HttpError {
+                                        status: status.as_u16(),
+                                        error_type: None,
+                                    },
+                                );
                             }
 
                             // C1: a 401 means the token we sent was rejected —
@@ -1750,9 +2394,12 @@ impl ApiMethods {
                             // so nothing has streamed yet. Invalidate, re-vend,
                             // and retry ONCE. Local API-key mode is excluded:
                             // there is no managed credential to reload.
+                            // Never for a keep-warm ping or summary: one request,
+                            // and a background request leaves auth to the turns.
                             if status.as_u16() == 401
                                 && !auth_retried
                                 && (options.credential_source.is_remote() || auth_type == "oauth")
+                                && options.keepwarm.is_none()
                             {
                                 auth_retried = true;
                                 clock.mark_headers();
@@ -1810,6 +2457,12 @@ impl ApiMethods {
                                 auth_header_name = n;
                                 auth_header_value = v;
                                 auth_binding = binding;
+                                if let (None, Some(tap)) = (&options.keepwarm, &options.prefix_tap)
+                                {
+                                    tap.authorized(super::warm_summary::credential_scope(
+                                        &auth_header_value,
+                                    ));
+                                }
                                 continue;
                             }
 
@@ -1877,6 +2530,9 @@ impl ApiMethods {
                                     body_prefix(&error_text, QUOTA_PROBE_BODY_CAP),
                                     now_ms,
                                 ) {
+                                    // A limit of another model's requests can't be
+                                    // what refused this one: the whole seat's.
+                                    let evidence = evidence.for_request_model(model);
                                     // The seat this request is pinned to on THIS
                                     // source. `None` = legacy/unbound state: nothing
                                     // to report or switch, but the long-reset rule
@@ -1914,11 +2570,17 @@ impl ApiMethods {
                                         output_started,
                                         tool_activity,
                                         failovers_so_far: anthropic_failovers,
+                                        // Pings and summaries: one request,
+                                        // on the session's own seat.
+                                        single_attempt: options.keepwarm.is_some(),
                                     };
                                     let mut hop = None;
                                     // Why there is no hop, when there isn't one.
                                     // An unbound request never switches.
                                     let mut no_hop = NoHop::Explicit;
+                                    // The broker's reason when no other account
+                                    // has capacity (a capacity wait plans from it).
+                                    let mut no_hop_failure = None;
                                     if let Some(seat) = seat.as_ref() {
                                         // The exhausted account goes last in the
                                         // attempted set (once).
@@ -1933,17 +2595,21 @@ impl ApiMethods {
                                             Ok(()) => {
                                                 match await_or_cancel(
                                                     cancel,
-                                                    router.failover(model, &anthropic_attempted),
+                                                    router.failover_detailed(
+                                                        model,
+                                                        &anthropic_attempted,
+                                                    ),
                                                 )
                                                 .await?
                                                 {
-                                                    Ok(Some(next))
+                                                    Ok(Ok(next))
                                                         if !anthropic_attempted
                                                             .contains(&next.credential) =>
                                                     {
                                                         hop = Some(next);
                                                     }
-                                                    Ok(_) => {
+                                                    Ok(none) => {
+                                                        no_hop_failure = none.err().flatten();
                                                         no_hop = NoHop::NoOtherAccount;
                                                         tracing::info!(
                                                             account = %seat,
@@ -2037,6 +2703,154 @@ impl ApiMethods {
                                         )));
                                     }
                                     if evidence.reset_is_long(now_ms) {
+                                        // Capacity wait: nothing streamed, automatic
+                                        // selection, no other account (the gate passed
+                                        // and the broker found none), a local source,
+                                        // and this request hasn't waited before. Wait
+                                        // in the request for the earliest reset (this
+                                        // account's or another's), then select again
+                                        // with nothing excluded and send the same
+                                        // request once on that account.
+                                        // The stop in a wait's terms, whether or not
+                                        // one may run here: what the turn is marked
+                                        // with when it ends on this limit.
+                                        let stopped = match (no_hop, evidence.resets_at_ms) {
+                                            (NoHop::NoOtherAccount, Some(reset))
+                                                if !options.credential_source.is_remote() =>
+                                            {
+                                                super::capacity_wait::Waitable::window_limit(
+                                                    reset,
+                                                    no_hop_failure.as_ref(),
+                                                    now_ms,
+                                                )
+                                            }
+                                            _ => None,
+                                        };
+                                        let waitable = stopped.clone().filter(|_| capacity_resend_left);
+                                        let waiter = match (options.capacity_wait.as_ref(), waitable) {
+                                            (Some(policy), Some(w)) => super::capacity_wait::CapacityWaiter::begin(
+                                                policy,
+                                                "window_limit",
+                                                w,
+                                                &tx,
+                                            ),
+                                            _ => None,
+                                        };
+                                        // No wait ran (capacity_wait off, this
+                                        // request's one wait already used, or
+                                        // nothing resets inside the bound): the turn
+                                        // ends on this limit. A wait that runs out
+                                        // marks its own last failure.
+                                        if waiter.is_none() {
+                                            if let Some(w) = stopped.as_ref() {
+                                                super::capacity_wait::note_stop(w, now_ms);
+                                            }
+                                        }
+                                        if let Some(mut waiter) = waiter {
+                                            // One wait (and one resend) per request.
+                                            capacity_resend_left = false;
+                                            let wait_started = tokio::time::Instant::now();
+                                            let resumed = loop {
+                                                match waiter.sleep(cancel).await {
+                                                    super::capacity_wait::Wake::Check => {}
+                                                    super::capacity_wait::Wake::Canceled => {
+                                                        return Err(RuntimeError::Canceled)
+                                                    }
+                                                    super::capacity_wait::Wake::Ended => break None,
+                                                }
+                                                // Cut at the bound and at the
+                                                // cadence: a check still running at
+                                                // the next cadence point is dropped
+                                                // and the next starts at once; one
+                                                // still running at the bound ends
+                                                // the turn as before.
+                                                let Some(checked) = waiter
+                                                    .bounded(|| {
+                                                        await_or_cancel(
+                                                            cancel,
+                                                            router.failover_detailed(model, &[]),
+                                                        )
+                                                    })
+                                                    .await
+                                                else {
+                                                    break None;
+                                                };
+                                                let still = match checked? {
+                                                    Ok(Ok(next)) => {
+                                                        waiter.resumed();
+                                                        break Some(next);
+                                                    }
+                                                    Ok(Err(failure)) => {
+                                                        // This account's own reset counts
+                                                        // until it passes; then only the
+                                                        // broker's reason does.
+                                                        let now = waiter.now_ms();
+                                                        match evidence.resets_at_ms.filter(|r| *r > now) {
+                                                            Some(own) => super::capacity_wait::Waitable::window_limit(
+                                                                own,
+                                                                failure.as_ref(),
+                                                                now,
+                                                            ),
+                                                            None => failure.as_ref().and_then(|f| {
+                                                                super::capacity_wait::Waitable::from_selection(f, now)
+                                                            }),
+                                                        }
+                                                    }
+                                                    Err(_) => {
+                                                        // A fixed class, never the error's
+                                                        // text (it can carry a token or an
+                                                        // identity).
+                                                        tracing::warn!(
+                                                            error_class = "lookup_failed",
+                                                            "capacity wait: looking up an account failed; ending the wait"
+                                                        );
+                                                        None
+                                                    }
+                                                };
+                                                if !waiter.still(still) {
+                                                    break None;
+                                                }
+                                            };
+                                            if let Some(next) = resumed {
+                                                if let Some(t) = tracer.as_mut() {
+                                                    t.attempt_failed(
+                                                        clock,
+                                                        crate::runtime::trace::RetryClass::RateLimited,
+                                                        wait_started.elapsed(),
+                                                        Some(429),
+                                                        trace_rid.clone(),
+                                                        "capacity_wait",
+                                                    );
+                                                }
+                                                // Bind the selected account as a hop does,
+                                                // then rebuild the header from it.
+                                                await_or_cancel(
+                                                    cancel,
+                                                    super::auth::AuthMethods::bind_pinned(
+                                                        auth,
+                                                        &options.credential_source,
+                                                        next,
+                                                    ),
+                                                )
+                                                .await?;
+                                                let (n, v, _t, binding) = await_or_cancel(
+                                                    cancel,
+                                                    Self::build_auth_snapshot(auth),
+                                                )
+                                                .await?;
+                                                auth_header_name = n;
+                                                auth_header_value = v;
+                                                auth_binding = binding;
+                                                // Send again at once, without using a
+                                                // 429 retry slot.
+                                                continue;
+                                            }
+                                        }
+                                        stamp_failure(
+                                            options,
+                                            super::api_sync::vetted_error_type(&error_text)
+                                                .unwrap_or("unrecognized_error"),
+                                        );
                                         if let Some(t) = tracer.take() {
                                             let terminal = t.failed_terminal("quota_exhausted");
                                             t.finish(clock, Some(429), trace_rid, None, None, terminal);
@@ -2134,7 +2948,30 @@ impl ApiMethods {
                                 non_429_attempts >= max_retries
                             };
 
-                            if !is_retryable || retry_exhausted {
+                            // A refusal of the 1M window (classified from the
+                            // body, which stays here) ends the attempt without
+                            // retries; the stream turn decides the fallback.
+                            let long_context = options
+                                .long_context_refusal
+                                .as_ref()
+                                .filter(|_| {
+                                    options.use_1m_context
+                                        && crate::core::models::model_supports_1m(model)
+                                })
+                                .and_then(|slot| {
+                                    crate::core::error::classify_long_context_refusal(
+                                        status.as_u16(),
+                                        &error_text,
+                                    )
+                                    .map(|class| (slot, class))
+                                });
+
+                            if !is_retryable || retry_exhausted || long_context.is_some() {
+                                stamp_failure(
+                                    options,
+                                    super::api_sync::vetted_error_type(&error_text)
+                                        .unwrap_or("unrecognized_error"),
+                                );
                                 let log_rid = trace_rid.clone();
                                 if let Some(t) = tracer.take() {
                                     let terminal =
@@ -2147,6 +2984,12 @@ impl ApiMethods {
                                         None,
                                         terminal,
                                     );
+                                }
+                                if let Some((slot, class)) = long_context {
+                                    slot.report(super::native_window::LongContextFailure {
+                                        status: status.as_u16(),
+                                        class,
+                                    });
                                 }
                                 let hint = reset_hint.as_deref().or(last_reset_hint.as_deref());
                                 return Err(RuntimeError::ApiStatus(terminal_http_error(
@@ -2217,6 +3060,16 @@ impl ApiMethods {
                         }
                         Err(e) => {
                             options.request_compression.settle(&mut wire, false);
+                            // §6: this client follows redirects, so even a
+                            // refused connection may come after a first hop
+                            // that received the request (the broker types it
+                            // the same way): the attempt stays open.
+                            if let Some(report) = ledgered.take() {
+                                settle_failed_attempt(
+                                    report,
+                                    super::api_sync::FailureStage::AfterSend,
+                                );
+                            }
                             if let Some(keepwarm) = &options.keepwarm {
                                 if matches!(&e, RuntimeError::Api(error) if error.is_connect()) {
                                     keepwarm
@@ -2225,29 +3078,50 @@ impl ApiMethods {
                                 }
                             }
                             non_429_attempts += 1;
+                            let diag = TransportDiag::from_runtime(&e, send_failure_label(&e));
                             if non_429_attempts > max_retries {
+                                stamp_failure(options, send_failure_label(&e));
                                 if let Some(t) = tracer.take() {
                                     let terminal = t.failed_terminal("network");
                                     t.finish(clock, None, None, None, None, terminal);
                                 }
-                                tracing::warn!(error = %e.user_message(), "API network retries exhausted");
+                                warn_transport!(
+                                    diag,
+                                    non_429_attempts,
+                                    max_retries,
+                                    error = %e.user_message(),
+                                    "API network retries exhausted"
+                                );
                                 return Err(e);
                             }
                             last_err = e.user_message();
                             last_status = None;
                             // No headers on network error — plain exponential back-off.
                             let delay = super::telemetry::network_retry_delay(non_429_attempts);
-                            tracing::warn!(
+                            warn_transport!(
+                                diag,
+                                non_429_attempts,
+                                max_retries,
                                 "API retry {}/{} after {:?}: {}",
                                 non_429_attempts,
                                 max_retries,
                                 delay,
                                 last_err
                             );
-                            let _ = tx.send(StreamEvent::Session(SessionEvent::Retry(format!(
-                                "⏳ API error, retrying ({}/{})…",
-                                non_429_attempts, max_retries
-                            ))));
+                            // Display only: a fast first transport retry
+                            // (usually a stale pooled connection) is silent;
+                            // the WARN above, the count and the backoff are not.
+                            // A slow failure (a header timeout) plus its
+                            // backoff counts as a long wait and is shown.
+                            if show_transport_retry_notice(
+                                non_429_attempts,
+                                attempt_started.elapsed().saturating_add(delay),
+                            ) {
+                                let _ = tx.send(StreamEvent::Session(SessionEvent::Retry(format!(
+                                    "⏳ API error, retrying ({}/{})…",
+                                    non_429_attempts, max_retries
+                                ))));
+                            }
                             if let Some(t) = tracer.as_mut() {
                                 t.attempt_failed(
                                     clock,
@@ -2313,6 +3187,19 @@ impl ApiMethods {
                 let _ = tx.send(StreamEvent::Llm(LlmEvent::ResponseStart));
             }
             let mut state = ParseState::new();
+            if first_event_relaxed {
+                state.progress.relax_first_event();
+            }
+            // Child spend: one guard per accepted attempt (an HTTP error
+            // answer has no body usage, so it gets none). Settled below once
+            // the body has ended, before any retry, refusal retry or
+            // failover dispatches again; its Drop covers a cancel, an error
+            // return and a dropped future. Inert without a worker's tap.
+            let spend = super::child_spend::AttemptSpend::new(
+                options.spend_tap.as_ref(),
+                super::child_spend::SpendKind::Turn,
+                model,
+            );
             let ctx = EventCtx {
                 model,
                 tx: &tx,
@@ -2325,6 +3212,10 @@ impl ApiMethods {
                 request_has_1h_marker,
                 usage_counters: options.usage_counters.clone(),
                 cache_diagnosis: diagnostics.is_some(),
+                spend: spend.observer(),
+                usage_request: ledgered
+                    .as_ref()
+                    .map(|report| report.request().clone()),
             };
 
             // SSE can split across chunk boundaries (even mid-UTF-8-codepoint), so
@@ -2334,19 +3225,26 @@ impl ApiMethods {
 
             // Cancellation exits through the normal finalization below: partial
             // content, residual Usage and attempt telemetry must not be dropped.
-            while let Ok(Some(chunk)) = await_or_cancel(
-                cancel,
-                super::http_phases::next(&mut stream, super::http_phases::STREAM_IDLE),
-            )
-            .await
-            {
+            // Besides the raw-byte idle timer, a progress deadline (no first
+            // event, no progress: pings only) ends a read as a timeout, and
+            // the transport arm below retries it like a lost connection.
+            loop {
+                let read = super::http_phases::next_or_deadline(
+                    &mut stream,
+                    super::http_phases::STREAM_IDLE,
+                    &mut state.progress,
+                );
+                let Ok(Some(chunk)) = await_or_cancel(cancel, read).await else {
+                    break;
+                };
                 if cancel.is_cancelled() {
                     break;
                 }
                 // A transport error mid-stream means connection loss. It's the same
                 // transient class as an HTTP 5xx or an in-stream overloaded_error, so
                 // route it through the unified retry budget instead of hard-failing
-                // the turn. Bill any start-captured usage first: the API already
+                // the turn. Bill what the stream reported first (its last counted
+                // delta, else the start's capture): the API already
                 // processed the input even if the stream died on us.
                 let chunk = match chunk {
                     Ok(c) => {
@@ -2357,7 +3255,7 @@ impl ApiMethods {
                         if state.stop_reason_seen || state.stream_error.is_some() {
                             break;
                         }
-                        emit_residual_usage(&mut state, &ctx);
+                        emit_final_usage(&mut state, &ctx);
                         state.stream_error = Some(StreamError {
                             error_type: None,
                             message: e.user_message(),
@@ -2380,6 +3278,23 @@ impl ApiMethods {
             // partial final line are handled.
             let remaining = line_buffer.take_remaining().unwrap_or_default();
             process_data_line(&remaining, &mut state, &ctx);
+            // One line per stream, however it ended: counts and timings only.
+            let progress = &state.progress;
+            tracing::debug!(
+                "Stream ended: chunks={} pings={} events={} message_start={} first_event_ms={} max_event_gap_ms={} deadline={}",
+                progress.chunks,
+                progress.pings,
+                progress.events,
+                progress.message_start_seen,
+                progress
+                    .message_start_after
+                    .map_or_else(|| "none".to_owned(), |d| d.as_millis().to_string()),
+                progress.max_gap.as_millis(),
+                progress
+                    .fired
+                    .map_or("none", super::http_phases::Deadline::label),
+            );
+            first_event_relaxed |= progress.fired == Some(super::http_phases::Deadline::FirstEvent);
 
             // Flush any partial block and return accumulated content
             state.finalize();
@@ -2393,10 +3308,23 @@ impl ApiMethods {
                 .iter()
                 .any(|b| b.get("type").and_then(Value::as_str) == Some("tool_use"));
 
-            // Dead-stream billing: if the stream terminated before message_delta
-            // (cancel, transport death mid-stream), emit the one Usage event from
-            // the message_start capture. No-op when the delta already emitted.
-            emit_residual_usage(&mut state, &ctx);
+            // The one Usage event, if message_stop didn't send it: a stream cut
+            // after its last counted delta (cancel, transport death) sends that
+            // delta's counts; one cut before any delta sends the message_start
+            // capture. No-op once sent.
+            emit_final_usage(&mut state, &ctx);
+            // The attempt's body has ended: book what it reported, now.
+            spend.settle();
+
+            // §6: the attempt ends with its stream: measured by its final
+            // report when that states every count, open otherwise (a running
+            // count is not its spend, an absent count is not a zero).
+            if let Some(mut report) = ledgered.take() {
+                if let Some(usage) = settled_usage(&state.wire_usage) {
+                    report.observe(&usage);
+                }
+                report.finish();
+            }
 
             // Capture the failure signals BEFORE the telemetry block — it moves
             // `state.telem_stop_reason` into the record when telemetry is enabled.
@@ -2405,6 +3333,24 @@ impl ApiMethods {
             let stop_reason_is_refusal = state.stop_reason_is_refusal;
             let cancelled = cancel.is_cancelled();
             let outcome_content = state.take_outcome_content(cancelled);
+            if let Some(keepwarm) = &options.keepwarm {
+                *keepwarm
+                    .stop_reason
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = state.trace_stop_reason;
+                *keepwarm
+                    .usage
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = state.wire_usage;
+            }
+            if let (None, Some(tap), None, false) = (
+                &options.keepwarm,
+                &options.prefix_tap,
+                &stream_error,
+                cancelled,
+            ) {
+                tap.completed(state.wire_usage.complete());
+            }
 
             // ═══ TRACE: finish this attempt's monotonic clock + captures ═══
             clock.mark_stream_end();
@@ -2490,11 +3436,24 @@ impl ApiMethods {
                         system_bytes,
                         breakpoints,
                     },
-                    keepwarm: options.keepwarm.is_some(),
+                    keepwarm: matches!(
+                        &options.keepwarm,
+                        Some(KeepWarmRequest {
+                            purpose: TailPurpose::Ping,
+                            ..
+                        })
+                    ),
                     worker: options.codex_request_role
                         == crate::runtime::openai::catalog::CodexRequestRole::Worker,
                     rollover_window: options.context_rollover.map(|r| r.window),
                     rollover: options.context_rollover.is_some_and(|r| r.first_request),
+                    rollover_summary: match &options.keepwarm {
+                        Some(KeepWarmRequest {
+                            purpose: TailPurpose::Summary { correlation, .. },
+                            ..
+                        }) => Some(telemetry::summary_id(*correlation)),
+                        _ => None,
+                    },
                     ..Default::default()
                 };
                 record.set_correlation(
@@ -2509,6 +3468,8 @@ impl ApiMethods {
                 }
             }
 
+            let failure_label =
+                stream_failure_label(stream_error.as_ref(), transport_error.as_ref());
             match classify_stream_outcome(
                 stream_error,
                 outcome_content,
@@ -2535,6 +3496,7 @@ impl ApiMethods {
                     return Ok(v);
                 }
                 StreamOutcome::Fail(msg) => {
+                    stamp_failure(options, failure_label);
                     if let Some(t) = tracer.take() {
                         let terminal = t.failed_terminal(stream_error_code);
                         t.finish(
@@ -2572,6 +3534,7 @@ impl ApiMethods {
                     {
                         // Budget exhausted (or user cancelled) — surface terminally
                         // rather than silently. Still loud, never the silent stop.
+                        stamp_failure(options, failure_label);
                         if let Some(t) = tracer.take() {
                             let terminal = t.failed_terminal(stream_error_code);
                             t.finish(
@@ -2584,7 +3547,13 @@ impl ApiMethods {
                             );
                         }
                         if let Some(error) = transport_error {
-                            tracing::warn!(error = %error.user_message(), "API stream network retries exhausted");
+                            warn_transport!(
+                                TransportDiag::from_runtime(&error, failure_label),
+                                retries_used.saturating_add(1),
+                                retry_budget,
+                                error = %error.user_message(),
+                                "API stream network retries exhausted"
+                            );
                             return Err(error);
                         }
                         return Err(RuntimeError::ApiStatus(msg));
@@ -2601,13 +3570,26 @@ impl ApiMethods {
                     attempt += 1;
                     last_err = msg.clone();
                     last_status = None;
-                    tracing::warn!(
-                        "in-stream API error, retrying {}/{} after {:?}: {}",
-                        retry_index,
-                        retry_budget,
-                        delay,
-                        msg
-                    );
+                    if let Some(error) = transport_error.as_ref() {
+                        warn_transport!(
+                            TransportDiag::from_runtime(error, failure_label),
+                            retry_index,
+                            retry_budget,
+                            "in-stream API error, retrying {}/{} after {:?}: {}",
+                            retry_index,
+                            retry_budget,
+                            delay,
+                            msg
+                        );
+                    } else {
+                        tracing::warn!(
+                            "in-stream API error, retrying {}/{} after {:?}: {}",
+                            retry_index,
+                            retry_budget,
+                            delay,
+                            msg
+                        );
+                    }
                     let _ = tx.send(StreamEvent::Session(SessionEvent::Retry(format!(
                         "⏳ API stream error — retrying ({}/{})…",
                         retry_index, retry_budget
@@ -2639,6 +3621,7 @@ impl ApiMethods {
                     // Check budget before sleeping so an immediate exhaustion is
                     // surfaced without a pointless delay.
                     if refusal_attempts >= refusal_retries || cancel.is_cancelled() {
+                        stamp_failure(options, REFUSAL_EXIT);
                         if let Some(t) = tracer.take() {
                             let terminal = t.failed_terminal("refusal");
                             t.finish(
@@ -2740,6 +3723,18 @@ where
                 *cache_creation_5m,
                 *cache_creation_1h,
             );
+        } else if let StreamEvent::Session(SessionEvent::UsageAttempt { usage, .. }) = &event {
+            // A ledgered attempt (§6) reports in place of the plain usage
+            // above, never as well: price it the same way.
+            counters.record_priced(
+                model,
+                usage.input_tokens,
+                usage.output_tokens,
+                usage.cache_read_input_tokens,
+                usage.cache_creation_input_tokens,
+                usage.cache_creation_5m,
+                usage.cache_creation_1h,
+            );
         }
         let _ = tx.send(event);
     };
@@ -2816,6 +3811,32 @@ mod tests {
         ));
     }
 
+    /// A failed keep-warm request names its exit with one of our static
+    /// labels, never the provider's bytes.
+    #[test]
+    fn failure_labels_name_the_exit() {
+        let frame = |kind: Option<&str>| StreamError {
+            error_type: kind.map(str::to_owned),
+            message: String::new(),
+            retryable: true,
+        };
+        let idle = RuntimeError::NetworkTimeout("waiting for response body bytes");
+        let broken = RuntimeError::Tool("connection reset".into());
+        for (error, transport, label) in [
+            (Some(frame(Some("overloaded_error"))), None, "overloaded_error"),
+            (Some(frame(Some("api_error"))), None, "api_error"),
+            (Some(frame(Some("ECHOED-PROVIDER-TEXT"))), None, "unrecognized_error"),
+            (Some(frame(None)), None, "unrecognized_error"),
+            (Some(frame(None)), Some(&idle), "idle_timeout"),
+            (Some(frame(None)), Some(&broken), "transport"),
+            (None, None, "empty_response"),
+        ] {
+            assert_eq!(stream_failure_label(error.as_ref(), transport), label);
+        }
+        assert_eq!(send_failure_label(&idle), "header_timeout");
+        assert_eq!(send_failure_label(&broken), "transport");
+    }
+
     /// Test harness: fresh ParseState + unbounded channel + EventCtx (Full
     /// telemetry so capture paths run). Returns (state, rx, ctx-parts).
     fn harness() -> (
@@ -2840,6 +3861,8 @@ mod tests {
             request_has_1h_marker: true,
             usage_counters: None,
             cache_diagnosis: false,
+            spend: crate::runtime::child_spend::AttemptObserver::inert(),
+            usage_request: None,
         }
     }
 
@@ -2873,6 +3896,8 @@ mod tests {
             request_has_1h_marker: true,
             usage_counters: None,
             cache_diagnosis: false,
+            spend: crate::runtime::child_spend::AttemptObserver::inert(),
+            usage_request: None,
         }
     }
 
@@ -2898,6 +3923,8 @@ mod tests {
             request_has_1h_marker: true,
             usage_counters: None,
             cache_diagnosis: false,
+            spend: crate::runtime::child_spend::AttemptObserver::inert(),
+            usage_request: None,
         }
     }
 
@@ -3174,6 +4201,7 @@ mod tests {
         feed(
             &[
                 r#"data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":300,"cache_creation_input_tokens":100,"cache_creation":{"ephemeral_5m_input_tokens":60,"ephemeral_1h_input_tokens":40}}}"#,
+                r#"data: {"type":"message_stop"}"#,
             ],
             &mut state,
             &ctx,
@@ -3215,6 +4243,7 @@ mod tests {
             &[
                 r#"data: {"type":"message_start","message":{"id":"msg_live","usage":{"input_tokens":4,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":1282,"cache_creation":{"ephemeral_5m_input_tokens":5,"ephemeral_1h_input_tokens":1277}}}}"#,
                 r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":4,"output_tokens":42,"cache_read_input_tokens":0,"cache_creation_input_tokens":1282}}"#,
+                r#"data: {"type":"message_stop"}"#,
             ],
             &mut state,
             &ctx,
@@ -3223,12 +4252,12 @@ mod tests {
         assert_eq!(state.telem_usage.cache_write, 1282);
         assert_eq!(state.telem_usage.cache_write_5m, Some(5));
         assert_eq!(state.telem_usage.cache_write_1h, Some(1277));
-        // The delta-arm Usage emission (final counts) carries the split too.
+        // The one Usage emission (message_stop, final counts) carries the split too.
         let events = drain(&mut rx);
         let last_usage = events
             .iter()
             .rfind(|e| matches!(e, StreamEvent::Session(SessionEvent::Usage { .. })))
-            .expect("delta must emit a Usage event");
+            .expect("message_stop must emit the Usage event");
         assert!(matches!(
             last_usage,
             StreamEvent::Session(SessionEvent::Usage {
@@ -3277,6 +4306,7 @@ mod tests {
     /// with the final output and NO split sub-object.
     const PROBED_LIVE_START: &str = r#"data: {"type":"message_start","message":{"id":"msg_probe","usage":{"input_tokens":3,"cache_creation_input_tokens":1103,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":6,"ephemeral_1h_input_tokens":1097},"output_tokens":1}}}"#;
     const PROBED_LIVE_DELTA: &str = r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":3,"cache_creation_input_tokens":1103,"cache_read_input_tokens":0,"output_tokens":11}}"#;
+    const LIVE_STOP: &str = r#"data: {"type":"message_stop"}"#;
 
     #[test]
     fn one_usage_emission_per_request_live_shapes() {
@@ -3287,6 +4317,13 @@ mod tests {
         let (mut state, tx, mut rx) = harness();
         let ctx = make_ctx(&tx);
         feed(&[PROBED_LIVE_START, PROBED_LIVE_DELTA], &mut state, &ctx);
+        assert!(
+            !drain(&mut rx)
+                .iter()
+                .any(|e| matches!(e, StreamEvent::Session(SessionEvent::Usage { .. }))),
+            "a delta's counts may be replaced by a later delta's: nothing is emitted before message_stop"
+        );
+        feed(&[LIVE_STOP], &mut state, &ctx);
         let events = drain(&mut rx);
         let usages: Vec<_> = events
             .iter()
@@ -3305,11 +4342,11 @@ mod tests {
                 model: None,
             })
         ));
-        // Residual path must be a no-op after the delta emitted.
-        emit_residual_usage(&mut state, &ctx);
+        // The stream-end call must be a no-op after message_stop emitted.
+        emit_final_usage(&mut state, &ctx);
         assert!(
             drain(&mut rx).is_empty(),
-            "residual emission must be a no-op when the delta already emitted"
+            "the stream-end emission must be a no-op once message_stop emitted"
         );
     }
 
@@ -3318,7 +4355,8 @@ mod tests {
         for final_delta in [false, true] {
             for model in ["claude-opus-4.1", "claude-opus-4.8", "claude-haiku-5.5"] {
                 let (mut state, tx, mut rx) = harness();
-                let counters = std::sync::Arc::new(crate::runtime::budget::UsageCounters::default());
+                let counters =
+                    std::sync::Arc::new(crate::runtime::budget::UsageCounters::default());
                 let mut ctx = make_ctx_telemetry_off(&tx);
                 ctx.model = model;
                 ctx.usage_counters = Some(counters.clone());
@@ -3327,17 +4365,24 @@ mod tests {
                 if final_delta {
                     feed(&[PROBED_LIVE_DELTA], &mut state, &ctx);
                 }
-                emit_residual_usage(&mut state, &ctx);
-                emit_residual_usage(&mut state, &ctx);
+                emit_final_usage(&mut state, &ctx);
+                emit_final_usage(&mut state, &ctx);
                 let output = if final_delta { 11 } else { 1 };
-                let expected = agent_core::pricing::calculate_cost_split(
-                    model, 3, output, 0, 6, 1097,
-                );
+                let expected =
+                    agent_core::pricing::calculate_cost_split(model, 3, output, 0, 6, 1097);
                 assert!((counters.cost_usd() - expected).abs() < 2e-9);
                 assert_eq!(counters.totals(), (3, output, 0, 1103));
                 assert_eq!(counters.latest_context_tokens(), 1106);
-                assert_eq!(drain(&mut rx).iter().filter(|event| matches!(event,
-                    StreamEvent::Session(SessionEvent::Usage { .. }))).count(), 1);
+                assert_eq!(
+                    drain(&mut rx)
+                        .iter()
+                        .filter(|event| matches!(
+                            event,
+                            StreamEvent::Session(SessionEvent::Usage { .. })
+                        ))
+                        .count(),
+                    1
+                );
             }
         }
     }
@@ -3347,25 +4392,38 @@ mod tests {
         for final_delta in [false, true] {
             for (input, aggregate, known5) in [(0, 100_001, 0), (60_000, 40_001, 10_000)] {
                 let (mut state, tx, mut rx) = harness();
-                let counters = std::sync::Arc::new(crate::runtime::budget::UsageCounters::default());
+                let counters =
+                    std::sync::Arc::new(crate::runtime::budget::UsageCounters::default());
                 let mut ctx = make_ctx_telemetry_off(&tx);
                 ctx.model = "claude-haiku-5.5";
                 ctx.usage_counters = Some(counters.clone());
-                let start = format!("data: {}", json!({
-                    "type": "message_start", "message": {"id": "msg_partial", "usage": {
-                        "input_tokens": input, "output_tokens": 0,
-                        "cache_creation_input_tokens": aggregate,
-                        "cache_creation": {"ephemeral_5m_input_tokens": known5}
-                    }}
-                }));
+                let start = format!(
+                    "data: {}",
+                    json!({
+                        "type": "message_start", "message": {"id": "msg_partial", "usage": {
+                            "input_tokens": input, "output_tokens": 0,
+                            "cache_creation_input_tokens": aggregate,
+                            "cache_creation": {"ephemeral_5m_input_tokens": known5}
+                        }}
+                    })
+                );
                 feed(&[start.as_str()], &mut state, &ctx);
                 assert_eq!(counters.cost_usd(), 0.0);
                 if final_delta {
-                    feed(&[r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":0}}"#], &mut state, &ctx);
-                    assert!(state.usage_emitted, "final delta must book before residual fallback");
+                    feed(
+                        &[
+                            r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":0}}"#,
+                        ],
+                        &mut state,
+                        &ctx,
+                    );
+                    assert!(
+                        state.final_usage.is_some(),
+                        "the final delta's counts are kept for the one emission"
+                    );
                 }
-                emit_residual_usage(&mut state, &ctx);
-                emit_residual_usage(&mut state, &ctx);
+                emit_final_usage(&mut state, &ctx);
+                emit_final_usage(&mut state, &ctx);
                 let expected = if input == 0 { 0.100001 } else { 0.066251 };
                 assert!((counters.cost_usd() - expected).abs() < 2e-9);
                 assert_eq!(counters.totals(), (input, 0, 0, aggregate));
@@ -3373,15 +4431,26 @@ mod tests {
                 let mut usage_count = 0;
                 for event in events {
                     if let StreamEvent::Session(SessionEvent::Usage {
-                        input_tokens, output_tokens, cache_read_input_tokens,
-                        cache_creation_input_tokens, cache_creation_5m, cache_creation_1h, ..
-                    }) = event {
+                        input_tokens,
+                        output_tokens,
+                        cache_read_input_tokens,
+                        cache_creation_input_tokens,
+                        cache_creation_5m,
+                        cache_creation_1h,
+                        ..
+                    }) = event
+                    {
                         usage_count += 1;
                         assert_eq!(cache_creation_5m, Some(known5));
                         assert_eq!(cache_creation_1h, None);
                         let display_cost = agent_core::pricing::calculate_cost_optional_split(
-                            ctx.model, input_tokens, output_tokens, cache_read_input_tokens,
-                            cache_creation_input_tokens, cache_creation_5m, cache_creation_1h,
+                            ctx.model,
+                            input_tokens,
+                            output_tokens,
+                            cache_read_input_tokens,
+                            cache_creation_input_tokens,
+                            cache_creation_5m,
+                            cache_creation_1h,
                         );
                         assert!((display_cost - expected).abs() < 1e-12);
                     }
@@ -3401,7 +4470,7 @@ mod tests {
         assert!(drain(&mut rx)
             .iter()
             .all(|e| !matches!(e, StreamEvent::Session(SessionEvent::Usage { .. }))));
-        emit_residual_usage(&mut state, &ctx);
+        emit_final_usage(&mut state, &ctx);
         let events = drain(&mut rx);
         let usages: Vec<_> = events
             .iter()
@@ -3421,7 +4490,7 @@ mod tests {
             })
         ));
         // Idempotent: a second residual call emits nothing.
-        emit_residual_usage(&mut state, &ctx);
+        emit_final_usage(&mut state, &ctx);
         assert!(drain(&mut rx).is_empty(), "residual must be idempotent");
     }
 
@@ -3494,6 +4563,19 @@ mod tests {
             state.first_event_elapsed_ms, first,
             "TTFT must not be overwritten by later events"
         );
+    }
+
+    /// A lone ping is a parsed frame (a later 429 must not hop accounts)
+    /// but never progress: no event, no message_start.
+    #[test]
+    fn ping_sets_first_event_seen_but_is_not_progress() {
+        let (mut state, tx, _rx) = harness();
+        let ctx = make_ctx(&tx);
+        feed(&[r#"data: {"type":"ping"}"#], &mut state, &ctx);
+        assert!(state.first_event_seen);
+        assert_eq!(state.progress.pings, 1);
+        assert_eq!(state.progress.events, 0);
+        assert!(!state.progress.message_start_seen);
     }
 
     /// Regression test for the double-emit bug fixed in the slice-2 pre-work
@@ -3635,6 +4717,45 @@ mod tests {
     }
 
     #[test]
+    fn unsigned_thinking_replay_is_not_retained_after_uncancelled_eof() {
+        let content = outcome_after(&[THINK_START, THINK_DELTA], false);
+        assert!(content.is_empty());
+        assert!(matches!(
+            classify_stream_outcome(None, content, false, false, false),
+            StreamOutcome::Fail(_)
+        ));
+    }
+
+    #[test]
+    fn unsigned_thinking_replay_removes_only_unsigned_blocks_at_eof() {
+        let content = outcome_after(
+            &[
+                THINK_START,
+                THINK_DELTA,
+                THINK_SIG,
+                STOP0,
+                TEXT_START1,
+                TEXT_DELTA1,
+                STOP1,
+                TOOL_START2,
+                TOOL_DELTA2,
+                STOP2,
+                THINK_START,
+                THINK_DELTA,
+            ],
+            false,
+        );
+        assert_eq!(
+            content,
+            vec![
+                json!({"type":"thinking","thinking":"weighing it","signature":"sig_ok"}),
+                json!({"type":"text","text":"Let me check"}),
+                json!({"type":"tool_use","id":"toolu_done","name":"grep","input":{"pattern":"x"}}),
+            ]
+        );
+    }
+
+    #[test]
     fn cancelled_outcome_keeps_partial_text_verbatim() {
         let content = outcome_after(&[TEXT_START1, TEXT_DELTA1], true);
         assert_eq!(content, vec![json!({"type":"text","text":"Let me check"})]);
@@ -3643,13 +4764,24 @@ mod tests {
     #[test]
     fn cancelled_outcome_drops_unsigned_thinking() {
         let content = outcome_after(&[THINK_START, THINK_DELTA], true);
-        assert!(content.is_empty(), "unsigned thinking must not survive a cancel: {content:?}");
+        assert!(
+            content.is_empty(),
+            "unsigned thinking must not survive a cancel: {content:?}"
+        );
     }
 
     #[test]
     fn cancelled_outcome_keeps_signed_thinking_and_completed_blocks() {
         let content = outcome_after(
-            &[THINK_START, THINK_DELTA, THINK_SIG, STOP0, TEXT_START1, TEXT_DELTA1, STOP1],
+            &[
+                THINK_START,
+                THINK_DELTA,
+                THINK_SIG,
+                STOP0,
+                TEXT_START1,
+                TEXT_DELTA1,
+                STOP1,
+            ],
             true,
         );
         assert_eq!(
@@ -3665,9 +4797,14 @@ mod tests {
     fn cancelled_outcome_drops_only_the_in_flight_tool_call() {
         let content = outcome_after(
             &[
-                TEXT_START1, TEXT_DELTA1, STOP1,
-                TOOL_START2, TOOL_DELTA2, STOP2,
-                TOOL_START3, TOOL_DELTA3,
+                TEXT_START1,
+                TEXT_DELTA1,
+                STOP1,
+                TOOL_START2,
+                TOOL_DELTA2,
+                STOP2,
+                TOOL_START3,
+                TOOL_DELTA3,
             ],
             true,
         );
@@ -3682,16 +4819,22 @@ mod tests {
     }
 
     #[test]
-    fn uncancelled_outcome_is_byte_identical_to_accumulated_content() {
-        // Same inputs, not cancelled: nothing filtered (existing finalize
-        // semantics and every non-cancel path stay exactly as before).
-        let lines = [THINK_START, THINK_DELTA, STOP0, TOOL_START3, TOOL_DELTA3];
+    fn uncancelled_outcome_keeps_signed_thinking_and_existing_tool_semantics() {
+        // Replayable thinking and the existing non-cancel partial-tool
+        // semantics stay unchanged; unsigned thinking is tested separately.
+        let lines = [
+            THINK_START, THINK_DELTA, THINK_SIG, STOP0, TOOL_START3, TOOL_DELTA3,
+        ];
         let (mut state, tx, _rx) = harness();
         let ctx = make_ctx(&tx);
         feed(&lines, &mut state, &ctx);
         state.finalize();
         let expected = state.accumulated_content.clone();
-        assert_eq!(expected.len(), 2, "fixture: unsigned thinking + partial tool");
+        assert_eq!(
+            expected.len(),
+            2,
+            "fixture: signed thinking + partial tool"
+        );
         assert_eq!(state.take_outcome_content(false), expected);
     }
 
@@ -4463,6 +5606,8 @@ mod tests {
             request_has_1h_marker: false,
             usage_counters: None,
             cache_diagnosis: false,
+            spend: crate::runtime::child_spend::AttemptObserver::inert(),
+            usage_request: None,
         };
         feed(&[DOWNGRADE_START, LIVE_DELTA], &mut state, &ctx);
         assert_eq!(
@@ -5301,6 +6446,7 @@ mod anthropic_failover_tests {
     };
     use reqwest::Client;
     use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use tokio::sync::{mpsc, RwLock};
 
@@ -5357,8 +6503,22 @@ mod anthropic_failover_tests {
         Rejected429 { reset_in_secs: u64 },
         /// Ordinary 429: `retry-after` only, no exhaustion signal.
         Plain429 { retry_after: u64 },
+        /// Only Fable's weekly limit (`7d_oi`) rejected, until this many
+        /// seconds from now; the five-hour and weekly windows allowed.
+        FableOnly429 { reset_in_secs: u64 },
+        /// [`Reply::FableOnly429`] with a unified reset five days out, and
+        /// the header `name` set to the raw bytes `value`: replacing one
+        /// (or added), or, with `append`, sent once more after it.
+        FableOnlyWith429 {
+            reset_in_secs: u64,
+            name: &'static str,
+            value: &'static [u8],
+            append: bool,
+        },
         SseOk,
         SsePartialThenOverloaded,
+        /// 529 `overloaded_error` with `retry-after: 0`.
+        Overloaded529,
     }
 
     struct MockUpstream {
@@ -5414,6 +6574,70 @@ mod anthropic_failover_tests {
                     })
                     .to_string();
                     match reply {
+                        Reply::FableOnly429 { reset_in_secs } => (
+                            StatusCode::TOO_MANY_REQUESTS,
+                            [
+                                ("content-type", "application/json".to_string()),
+                                ("anthropic-ratelimit-unified-status", "rejected".to_string()),
+                                ("anthropic-ratelimit-unified-5h-status", "allowed".to_string()),
+                                (
+                                    "anthropic-ratelimit-unified-5h-utilization",
+                                    "0.36".to_string(),
+                                ),
+                                ("anthropic-ratelimit-unified-7d-status", "allowed".to_string()),
+                                (
+                                    "anthropic-ratelimit-unified-7d-utilization",
+                                    "0.5".to_string(),
+                                ),
+                                (
+                                    "anthropic-ratelimit-unified-7d_oi-status",
+                                    "rejected".to_string(),
+                                ),
+                                (
+                                    "anthropic-ratelimit-unified-7d_oi-reset",
+                                    (now_secs + reset_in_secs).to_string(),
+                                ),
+                            ],
+                            body_429,
+                        )
+                            .into_response(),
+                        Reply::FableOnlyWith429 {
+                            reset_in_secs,
+                            name,
+                            value,
+                            append,
+                        } => {
+                            let mut response = (
+                                StatusCode::TOO_MANY_REQUESTS,
+                                [("content-type", "application/json".to_string())],
+                                body_429,
+                            )
+                                .into_response();
+                            let unified_reset = (now_secs + 5 * 86400).to_string();
+                            let fable_reset = (now_secs + reset_in_secs).to_string();
+                            for (header, header_value) in [
+                                ("anthropic-ratelimit-unified-status", "rejected"),
+                                ("anthropic-ratelimit-unified-reset", unified_reset.as_str()),
+                                ("anthropic-ratelimit-unified-5h-status", "allowed"),
+                                ("anthropic-ratelimit-unified-5h-utilization", "0.36"),
+                                ("anthropic-ratelimit-unified-7d-status", "allowed"),
+                                ("anthropic-ratelimit-unified-7d-utilization", "0.5"),
+                                ("anthropic-ratelimit-unified-7d_oi-status", "rejected"),
+                                ("anthropic-ratelimit-unified-7d_oi-reset", fable_reset.as_str()),
+                            ] {
+                                response.headers_mut().insert(
+                                    header,
+                                    axum::http::HeaderValue::from_str(header_value).unwrap(),
+                                );
+                            }
+                            let value = axum::http::HeaderValue::from_bytes(value).unwrap();
+                            if append {
+                                response.headers_mut().append(name, value);
+                            } else {
+                                response.headers_mut().insert(name, value);
+                            }
+                            response
+                        }
                         Reply::Rejected429 { reset_in_secs } => (
                             StatusCode::TOO_MANY_REQUESTS,
                             [
@@ -5446,6 +6670,19 @@ mod anthropic_failover_tests {
                             StatusCode::OK,
                             [("content-type", "text/event-stream")],
                             SSE_PARTIAL_THEN_OVERLOADED.to_string(),
+                        )
+                            .into_response(),
+                        Reply::Overloaded529 => (
+                            StatusCode::from_u16(529).unwrap(),
+                            [
+                                ("content-type", "application/json".to_string()),
+                                ("retry-after", "0".to_string()),
+                            ],
+                            json!({
+                                "type": "error",
+                                "error": {"type": "overloaded_error", "message": "Overloaded"}
+                            })
+                            .to_string(),
                         )
                             .into_response(),
                     }
@@ -5585,6 +6822,80 @@ mod anthropic_failover_tests {
         max_retries: u32,
         base: ApiOptions,
     ) -> Outcome {
+        drive_options(upstream, auth, router, max_retries, base, "claude-haiku-4-5").await
+    }
+
+    /// [`drive`] for a request for `model`.
+    async fn drive_model(
+        upstream: &MockUpstream,
+        auth: Arc<RwLock<AuthState>>,
+        router: &ScriptedRouter,
+        max_retries: u32,
+        model: &str,
+    ) -> Outcome {
+        drive_request(upstream, auth, router, max_retries, None, None, model).await
+    }
+
+    /// [`drive`], as a keep-warm request when `keepwarm` is given.
+    async fn drive_keepwarm(
+        upstream: &MockUpstream,
+        auth: Arc<RwLock<AuthState>>,
+        router: &ScriptedRouter,
+        max_retries: u32,
+        keepwarm: Option<super::KeepWarmRequest>,
+    ) -> Outcome {
+        drive_router(upstream, auth, router, max_retries, keepwarm, None).await
+    }
+
+    /// [`drive_keepwarm`] through any router, with the turn's capacity wait.
+    async fn drive_router(
+        upstream: &MockUpstream,
+        auth: Arc<RwLock<AuthState>>,
+        router: &dyn AnthropicAccountRouter,
+        max_retries: u32,
+        keepwarm: Option<super::KeepWarmRequest>,
+        capacity_wait: Option<crate::runtime::capacity_wait::CapacityWaitPolicy>,
+    ) -> Outcome {
+        drive_request(
+            upstream,
+            auth,
+            router,
+            max_retries,
+            keepwarm,
+            capacity_wait,
+            "claude-haiku-4-5",
+        )
+        .await
+    }
+
+    /// [`drive_router`] for a request for `model`.
+    async fn drive_request(
+        upstream: &MockUpstream,
+        auth: Arc<RwLock<AuthState>>,
+        router: &dyn AnthropicAccountRouter,
+        max_retries: u32,
+        keepwarm: Option<super::KeepWarmRequest>,
+        capacity_wait: Option<crate::runtime::capacity_wait::CapacityWaitPolicy>,
+        model: &str,
+    ) -> Outcome {
+        let base = ApiOptions {
+            keepwarm,
+            capacity_wait,
+            ..Default::default()
+        };
+        drive_options(upstream, auth, router, max_retries, base, model).await
+    }
+
+    /// The one driver: a request for `model` with `base` options, sent to
+    /// `upstream` through `router`.
+    async fn drive_options(
+        upstream: &MockUpstream,
+        auth: Arc<RwLock<AuthState>>,
+        router: &dyn AnthropicAccountRouter,
+        max_retries: u32,
+        base: ApiOptions,
+        model: &str,
+    ) -> Outcome {
         let options = ApiOptions {
             anthropic_base_url: Some(upstream.base_url.clone()),
             credential_source: CredentialSource::Local,
@@ -5599,7 +6910,7 @@ mod anthropic_failover_tests {
         let result = ApiMethods::anthropic_stream_with_router(
             &auth,
             &client,
-            "claude-haiku-4-5",
+            model,
             tools.tools_schema(),
             &None,
             0,
@@ -5680,9 +6991,14 @@ mod anthropic_failover_tests {
         let ping = ApiOptions {
             keepwarm: Some(super::KeepWarmRequest {
                 mode: super::KeepWarmMode::Replay,
+                purpose: super::TailPurpose::Ping,
+                stop_reason: Default::default(),
+                usage: Default::default(),
                 status: Default::default(),
                 sent: Default::default(),
                 connect_failed: Default::default(),
+                failure_kind: Default::default(),
+                lease: None,
             }),
             ..Default::default()
         };
@@ -5991,6 +7307,105 @@ mod anthropic_failover_tests {
         );
     }
 
+    /// Read one HTTP/1.1 request (head, then its `content-length` body) in
+    /// full, so a close afterwards is a clean FIN rather than a reset.
+    async fn read_one_request(socket: &mut tokio::net::TcpStream) {
+        use tokio::io::AsyncReadExt;
+        let mut request: Vec<u8> = Vec::new();
+        let mut chunk = [0u8; 8192];
+        loop {
+            if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                let head = String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
+                let body = head
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length:"))
+                    .and_then(|value| value.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                if request.len() >= end + 4 + body {
+                    return;
+                }
+            }
+            match socket.read(&mut chunk).await {
+                Ok(0) | Err(_) => return,
+                Ok(n) => request.extend_from_slice(&chunk[..n]),
+            }
+        }
+    }
+
+    /// A raw HTTP/1.1 provider that reads each request in full, then closes
+    /// the connection without a reply for the first `drops` requests (hyper:
+    /// "connection closed before message completed", a transport failure
+    /// with no HTTP status) and answers every later one with the SSE
+    /// success and `connection: close`. Returns it and its request count.
+    async fn spawn_dropping_upstream(drops: usize) -> (MockUpstream, Arc<AtomicUsize>) {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&requests);
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let counted = Arc::clone(&counted);
+                tokio::spawn(async move {
+                    read_one_request(&mut socket).await;
+                    if counted.fetch_add(1, Ordering::SeqCst) < drops {
+                        return;
+                    }
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+                         content-length: {}\r\nconnection: close\r\n\r\n",
+                        SSE_SUCCESS.len()
+                    );
+                    let _ = socket.write_all(head.as_bytes()).await;
+                    let _ = socket.write_all(SSE_SUCCESS.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+        let upstream = MockUpstream {
+            base_url: format!("http://{addr}"),
+            auth_seen: Arc::new(Mutex::new(Vec::new())),
+            bodies: Arc::new(Mutex::new(Vec::new())),
+        };
+        (upstream, requests)
+    }
+
+    /// [`drive`] (retry budget 3) against [`spawn_dropping_upstream`] under
+    /// a fresh log capture; with `legacy`, inside the seam that shows every
+    /// transport retry notice (the display before the first one went
+    /// silent). Returns the outcome, the request count and the logs.
+    async fn drive_dropping(drops: usize, legacy: bool) -> (Outcome, usize, String) {
+        let (upstream, requests) = spawn_dropping_upstream(drops).await;
+        let router = ScriptedRouter::new(true, Ok(None));
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&buf);
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(move || LogCapture(Arc::clone(&sink)))
+            .with_ansi(false)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        let run = drive(&upstream, oauth_auth_pinned_to("claude4"), &router, 3);
+        let out = if legacy {
+            crate::runtime::net_retry::LEGACY_TRANSPORT_NOTICES_FOR_TEST
+                .scope(true, run)
+                .await
+        } else {
+            run.await
+        };
+        drop(guard);
+        let logs = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        (out, requests.load(Ordering::SeqCst), logs)
+    }
+
+    /// The transport retry WARN lines, from the message on (the timestamp
+    /// before it differs per run).
+    fn retry_warns(logs: &str) -> Vec<String> {
+        logs.lines()
+            .filter_map(|line| line.find("API retry ").map(|at| line[at..].to_string()))
+            .collect()
+    }
+
     #[tokio::test]
     #[serial_test::serial(anthropic_429_log_capture)]
     async fn pre_output_rejected_429_hops_once_and_succeeds_on_seat_2() {
@@ -6040,6 +7455,115 @@ mod anthropic_failover_tests {
         );
         for n in &out.notices {
             assert_no_body_leak(n, "notice");
+        }
+    }
+
+    /// A4: a Fable limit (only 7d_oi rejected) on a Fable request is
+    /// reported as a limit of Fable's requests, and the request fails over
+    /// for the same model. On a request for another model it can't be what
+    /// refused it: the report cools the whole account (the 7d_oi window
+    /// named), with the same reset.
+    #[tokio::test]
+    #[serial_test::serial(anthropic_429_log_capture)]
+    async fn a_fable_limit_is_reported_for_fable_requests_and_seat_wide_for_another_model() {
+        for (model, signal) in [
+            (
+                "claude-fable-5-1",
+                AnthropicQuotaSignal::ModelWindowRejected {
+                    window: "7d_oi",
+                    model: "fable",
+                },
+            ),
+            (
+                "claude-haiku-4-5",
+                AnthropicQuotaSignal::WindowStatusRejected { window: "7d_oi" },
+            ),
+        ] {
+            let upstream = spawn_upstream(vec![
+                Reply::FableOnly429 {
+                    reset_in_secs: 2 * 86400,
+                },
+                Reply::SseOk,
+            ])
+            .await;
+            let router = ScriptedRouter::new(true, Ok(Some(pinned("claude2"))));
+            let auth = oauth_auth_pinned_to("claude4");
+            let out = drive_model(&upstream, Arc::clone(&auth), &router, 0, model).await;
+            let reports = router.reports();
+            assert_eq!(reports.len(), 1, "{model}");
+            assert_eq!(reports[0].0, seat("claude4"), "{model}");
+            assert_eq!(reports[0].1.signal, signal, "{model}");
+            assert!(reports[0].1.resets_at_ms.is_some(), "{model}");
+            out.result.expect("success on the second seat");
+            assert_eq!(
+                router.failovers(),
+                vec![(model.to_string(), vec![seat("claude4")])],
+                "{model}"
+            );
+        }
+    }
+
+    /// A4 r2/r3: a Fable request refused with an unknown five-hour status,
+    /// a claim that names neither a shared window nor the 7d_oi bucket, a
+    /// claim that can't be read (byte 0xff), or the five-hour status sent
+    /// twice (`allowed`, then `rejected`) is reported as a limit of the
+    /// whole account, with the unified reset, and the request fails over
+    /// for Fable.
+    ///
+    /// Coverage is COMPOSED, not end to end: this test drives the production
+    /// classifier, the request-model guard and the report on the request
+    /// path (the router here is scripted, so no Opus selection runs);
+    /// broker_capacity's `a_whole_account_limit_stops_opus_requests_too`
+    /// pins that the local broker keeps an account with a whole-account
+    /// cooldown from Opus requests.
+    #[tokio::test]
+    #[serial_test::serial(anthropic_429_log_capture)]
+    async fn a_fable_request_refused_with_unknown_headers_is_a_limit_of_the_whole_account() {
+        for (name, value, append) in [
+            ("anthropic-ratelimit-unified-5h-status", &b"garbage"[..], false),
+            ("anthropic-ratelimit-unified-representative-claim", &b"overage"[..], false),
+            (
+                "anthropic-ratelimit-unified-representative-claim",
+                &b"seven_day_oi\xff"[..],
+                false,
+            ),
+            ("anthropic-ratelimit-unified-5h-status", &b"rejected"[..], true),
+        ] {
+            let case = format!("{name}: {value:?}, append {append}");
+            let upstream = spawn_upstream(vec![
+                Reply::FableOnlyWith429 {
+                    reset_in_secs: 2 * 86400,
+                    name,
+                    value,
+                    append,
+                },
+                Reply::SseOk,
+            ])
+            .await;
+            let router = ScriptedRouter::new(true, Ok(Some(pinned("claude2"))));
+            let auth = oauth_auth_pinned_to("claude4");
+            let model = "claude-fable-5-1";
+            let out = drive_model(&upstream, Arc::clone(&auth), &router, 0, model).await;
+            let reports = router.reports();
+            assert_eq!(reports.len(), 1, "{case}");
+            assert_eq!(reports[0].0, seat("claude4"), "{case}");
+            assert_eq!(
+                reports[0].1.signal,
+                AnthropicQuotaSignal::UnifiedStatusRejected,
+                "{case}"
+            );
+            assert_eq!(reports[0].1.model_scope(), None, "{case}: the whole account");
+            let reset = reports[0].1.resets_at_ms.expect("the unified reset");
+            assert!(
+                reset > crate::epoch_millis() + 4 * 86400 * 1000,
+                "{case}: the unified reset, not 7d_oi's"
+            );
+            out.result.expect("success on the second seat");
+            assert_eq!(
+                router.failovers(),
+                vec![(model.to_string(), vec![seat("claude4")])],
+                "{case}"
+            );
         }
     }
 
@@ -6398,6 +7922,70 @@ mod anthropic_failover_tests {
         }
     }
 
+    /// A keep-warm ping on an exhausted seat fails as a ping does: one
+    /// request, no account hop, and the session's seat binding (token and
+    /// bound credential) is untouched. The seat's exhaustion is still
+    /// reported, as for any request, so the next turn boundary selects away.
+    #[tokio::test]
+    #[serial_test::serial(anthropic_429_log_capture)]
+    async fn a_keepwarm_ping_on_an_exhausted_seat_never_hops() {
+        use super::{KeepWarmMode, KeepWarmRequest, TailPurpose};
+        let upstream =
+            spawn_upstream(vec![Reply::Rejected429 { reset_in_secs: 3 * 3600 }, Reply::SseOk])
+                .await;
+        let router = ScriptedRouter::new(true, Ok(Some(pinned("claude2"))));
+        let auth = oauth_auth_pinned_to("claude4");
+        let binding = |g: &AuthState| (g.auth_token.clone(), g.bound_credential.clone());
+        let before = binding(&*auth.read().await);
+        let ping = |mode| KeepWarmRequest {
+            mode,
+            purpose: TailPurpose::Ping,
+            stop_reason: Default::default(),
+            usage: Default::default(),
+            status: Default::default(),
+            sent: Default::default(),
+            connect_failed: Default::default(),
+            failure_kind: Default::default(),
+            lease: None,
+        };
+        let probe = drive_keepwarm(
+            &upstream,
+            Arc::clone(&auth),
+            &router,
+            0,
+            Some(ping(KeepWarmMode::Probe)),
+        )
+        .await;
+        let expect = probe.result.expect("probe")["keepwarm_prefix"]
+            .as_u64()
+            .expect("the probe returns the prefix");
+        assert_eq!(upstream.calls(), 0, "a probe sends nothing");
+
+        let out = drive_keepwarm(
+            &upstream,
+            Arc::clone(&auth),
+            &router,
+            0,
+            Some(ping(KeepWarmMode::Send { expect })),
+        )
+        .await;
+
+        assert!(out.result.is_err(), "the ping fails: {:?}", out.result);
+        assert_eq!(
+            upstream.auth_seen(),
+            vec!["Bearer tok-claude4".to_string()],
+            "one request, on the session's seat"
+        );
+        assert!(router.failovers().is_empty(), "no candidate lookup");
+        assert_eq!(router.reports().len(), 1, "the exhaustion is reported");
+        assert_eq!(binding(&*auth.read().await), before, "binding untouched");
+        assert!(
+            !out.notices.iter().any(|n| n.contains("switching to")),
+            "{:?}",
+            out.notices
+        );
+    }
+
     /// A long wait on a 429 with no usage-limit header is not called a usage
     /// limit: the notice and the error say it is a rate limit, and how we
     /// know.
@@ -6470,6 +8058,85 @@ mod anthropic_failover_tests {
         );
     }
 
+    /// One transport failure (no HTTP status), then success: the first
+    /// retry, after today's 1 s backoff, shows no notice. Display only: the
+    /// same failure under the legacy seam shows it, and both runs make the
+    /// same attempts and log the same retry WARN.
+    #[tokio::test]
+    #[serial_test::serial(anthropic_429_log_capture)]
+    async fn a_fast_first_transport_retry_is_silent_and_nothing_else_changes() {
+        let (out, requests, logs) = drive_dropping(1, false).await;
+        let (legacy, legacy_requests, legacy_logs) = drive_dropping(1, true).await;
+
+        assert!(out.result.is_ok(), "{:?}", out.result.err());
+        assert!(legacy.result.is_ok(), "{:?}", legacy.result.err());
+        assert!(out.retries.is_empty(), "{:?}", out.notices);
+        assert_eq!(
+            legacy.retries,
+            vec!["⏳ API error, retrying (1/3)…".to_string()],
+            "{:?}",
+            legacy.notices
+        );
+        assert_eq!((requests, legacy_requests), (2, 2), "one failed send, one retry");
+        let warns = retry_warns(&logs);
+        assert_eq!(warns.len(), 1, "{logs}");
+        assert!(
+            warns[0].starts_with("API retry 1/3 after 1s: Network request failed"),
+            "{}",
+            warns[0]
+        );
+        for field in [
+            "attempt=1",
+            "max_attempts=3",
+            "class=\"incomplete_message\"",
+            "reused=\"unknown\"",
+        ] {
+            assert!(warns[0].contains(field), "{field} missing: {}", warns[0]);
+        }
+        assert_eq!(retry_warns(&legacy_logs), warns);
+    }
+
+    /// A second consecutive transport failure shows its notice; every retry
+    /// still logs its WARN.
+    #[tokio::test]
+    #[serial_test::serial(anthropic_429_log_capture)]
+    async fn a_second_consecutive_transport_failure_shows_its_notice() {
+        let (out, requests, logs) = drive_dropping(2, false).await;
+
+        assert!(out.result.is_ok(), "{:?}", out.result.err());
+        assert_eq!(
+            out.retries,
+            vec!["⏳ API error, retrying (2/3)…".to_string()],
+            "{:?}",
+            out.notices
+        );
+        assert_eq!(requests, 3);
+        let warns = retry_warns(&logs);
+        assert_eq!(warns.len(), 2, "a WARN on every retry: {logs}");
+        assert!(warns[0].starts_with("API retry 1/3 after 1s: "), "{}", warns[0]);
+        assert!(warns[1].starts_with("API retry 2/3 after 2s: "), "{}", warns[1]);
+    }
+
+    /// An HTTP-status retry keeps its first notice: only transport retries
+    /// went quiet.
+    #[tokio::test]
+    #[serial_test::serial(anthropic_429_log_capture)]
+    async fn an_overloaded_529_first_retry_keeps_its_notice() {
+        let upstream = spawn_upstream(vec![Reply::Overloaded529, Reply::SseOk]).await;
+        let router = ScriptedRouter::new(true, Ok(None));
+
+        let out = drive(&upstream, oauth_auth_pinned_to("claude4"), &router, 3).await;
+
+        assert!(out.result.is_ok(), "{:?}", out.result.err());
+        assert_eq!(upstream.calls(), 2);
+        assert_eq!(
+            out.retries,
+            vec!["⏳ API error, retrying (1/3)…".to_string()],
+            "{:?}",
+            out.notices
+        );
+    }
+
     #[tokio::test]
     #[serial_test::serial(anthropic_429_log_capture)]
     async fn short_reset_exhaustion_without_hop_falls_through_to_retry() {
@@ -6486,6 +8153,483 @@ mod anthropic_failover_tests {
         assert_eq!(upstream.calls(), 2);
         assert_eq!(router.reports().len(), 1);
         assert!(router.failovers().is_empty());
+    }
+
+    // ── Capacity wait on a window-limit 429 (site 2) ─────────────────────
+
+    type Lookup = Result<Result<PinnedToken, Option<crate::auth::SelectionFailure>>, String>;
+
+    /// Automatic-selection router for capacity waits: answers lookup N with
+    /// answer N (the last repeats) and records each lookup's attempted set
+    /// and time. With `pause_on_no_account`, the first lookup that finds no
+    /// account pauses tokio's clock (the wait then sleeps on the paused
+    /// clock) and a lookup that finds one resumes it (the resend is real
+    /// loopback I/O, never under a paused clock).
+    struct WaitRouter {
+        answers: Mutex<Vec<Lookup>>,
+        lookups: Mutex<Vec<(String, Vec<CredentialRef>, tokio::time::Instant)>>,
+        reports: Mutex<usize>,
+        pause_on_no_account: bool,
+        paused: Mutex<bool>,
+        /// A wait's re-check (nothing attempted) hangs this long first.
+        stall_rechecks: Option<std::time::Duration>,
+    }
+
+    impl WaitRouter {
+        fn new(answers: Vec<Lookup>, pause_on_no_account: bool) -> Self {
+            Self {
+                answers: Mutex::new(answers),
+                lookups: Mutex::new(Vec::new()),
+                reports: Mutex::new(0),
+                pause_on_no_account,
+                paused: Mutex::new(false),
+                stall_rechecks: None,
+            }
+        }
+        fn attempted(&self) -> Vec<(String, Vec<CredentialRef>)> {
+            self.lookups
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(m, a, _)| (m.clone(), a.clone()))
+                .collect()
+        }
+        fn times(&self) -> Vec<tokio::time::Instant> {
+            self.lookups.lock().unwrap().iter().map(|(_, _, t)| *t).collect()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AnthropicAccountRouter for WaitRouter {
+        fn auto_selected(&self) -> bool {
+            true
+        }
+        async fn report_exhausted(&self, _failed: &CredentialRef, _evidence: &AnthropicQuotaEvidence) {
+            *self.reports.lock().unwrap() += 1;
+        }
+        async fn report_served(&self, _seat: &CredentialRef, _sent_at_ms: u64) {}
+        async fn failover(
+            &self,
+            model: &str,
+            attempted: &[CredentialRef],
+        ) -> Result<Option<PinnedToken>, String> {
+            Ok(self.failover_detailed(model, attempted).await?.ok())
+        }
+        async fn failover_detailed(&self, model: &str, attempted: &[CredentialRef]) -> Lookup {
+            self.lookups.lock().unwrap().push((
+                model.to_string(),
+                attempted.to_vec(),
+                tokio::time::Instant::now(),
+            ));
+            if let (Some(hang), true) = (self.stall_rechecks, attempted.is_empty()) {
+                tokio::time::sleep(hang).await;
+            }
+            let answer = {
+                let mut answers = self.answers.lock().unwrap();
+                if answers.len() > 1 {
+                    answers.remove(0)
+                } else {
+                    answers[0].clone()
+                }
+            };
+            if self.pause_on_no_account {
+                let mut paused = self.paused.lock().unwrap();
+                match (&answer, *paused) {
+                    (Ok(Err(_)), false) => {
+                        tokio::time::pause();
+                        *paused = true;
+                    }
+                    (Ok(Ok(_)) | Err(_), true) => {
+                        tokio::time::resume();
+                        *paused = false;
+                    }
+                    _ => {}
+                }
+            }
+            answer
+        }
+    }
+
+    fn wait_on() -> Option<crate::runtime::capacity_wait::CapacityWaitPolicy> {
+        Some(crate::runtime::capacity_wait::CapacityWaitPolicy {
+            jitter: crate::runtime::capacity_wait::Jitter::Fixed(std::time::Duration::ZERO),
+            ..Default::default()
+        })
+    }
+
+    /// `drive` must end within 30 s of real time: a request that must not
+    /// wait fails here (rather than sleeping for its reset) if it waits.
+    async fn no_wait(drive: impl std::future::Future<Output = Outcome>) -> Outcome {
+        tokio::time::timeout(std::time::Duration::from_secs(30), drive)
+            .await
+            .expect("the request waited; it must end at once")
+    }
+
+    /// Every other account is cooling down too, resetting in `secs`.
+    fn others_cooling(secs: u64) -> crate::auth::SelectionFailure {
+        let until = crate::epoch_millis() + secs * 1000;
+        crate::auth::SelectionFailure {
+            kind: crate::auth::SelectionFailureKind::AllCoolingDown,
+            accounts: vec![crate::auth::AccountFailure {
+                account: "claude2".into(),
+                kind: crate::auth::AccountFailureKind::Exhausted,
+                http_status: None,
+                retry_after_s: None,
+                until_ms: Some(until),
+                cooling_down: true,
+            }],
+            earliest_reset_ms: Some(until),
+            usage_read_retry_ms: None,
+        }
+    }
+
+    /// Design test 5: a window limit 20 min from now on the request's
+    /// account, nothing streamed, no other account. The request waits for
+    /// the reset (checking every 10 min), selects again with nothing
+    /// excluded, and sends the same request once more on the account found,
+    /// without spending a 429 retry.
+    #[tokio::test]
+    #[serial_test::serial(anthropic_429_log_capture)]
+    async fn a_window_limit_20_min_away_waits_for_the_reset_then_resends_once() {
+        let upstream =
+            spawn_upstream(vec![Reply::Rejected429 { reset_in_secs: 20 * 60 }, Reply::SseOk]).await;
+        let router = WaitRouter::new(
+            vec![
+                Ok(Err(Some(others_cooling(40 * 60)))),
+                Ok(Err(Some(others_cooling(40 * 60)))),
+                Ok(Ok(pinned("claude2"))),
+            ],
+            true,
+        );
+        let auth = oauth_auth_pinned_to("claude4");
+
+        let out = drive_router(&upstream, Arc::clone(&auth), &router, 0, None, wait_on()).await;
+
+        let value = out.result.expect("the request carries on after the reset");
+        assert_eq!(value["content"][0]["text"], "hi");
+        assert_eq!(
+            upstream.auth_seen(),
+            vec!["Bearer tok-claude4".to_string(), "Bearer tok-claude2".to_string()],
+            "one resend, on the account found"
+        );
+        let model = "claude-haiku-4-5".to_string();
+        assert_eq!(
+            router.attempted(),
+            vec![
+                (model.clone(), vec![seat("claude4")]),
+                (model.clone(), vec![]),
+                (model.clone(), vec![]),
+            ],
+            "the failover lookup, then a check every 10 min with nothing excluded"
+        );
+        let t = router.times();
+        let waited = t[2] - t[0];
+        assert!(
+            waited >= std::time::Duration::from_secs(20 * 60 - 1)
+                && waited <= std::time::Duration::from_secs(20 * 60 + 1),
+            "waited {waited:?}"
+        );
+        assert!(t[1] - t[0] <= std::time::Duration::from_secs(10 * 60 + 1), "{t:?}");
+        assert_eq!(*router.reports.lock().unwrap(), 1);
+        let waits: Vec<_> = out.notices.iter().filter(|n| n.starts_with("⏸ ")).collect();
+        assert_eq!(waits.len(), 1, "{:?}", out.notices);
+        assert!(
+            waits[0].starts_with("⏸ Every Anthropic account is cooling down or at a usage limit [claude2: "),
+            "{}",
+            waits[0]
+        );
+        assert!(waits[0].contains("; waiting until "), "{}", waits[0]);
+        let g = auth.read().await;
+        assert_eq!(g.auth_token, "tok-claude2");
+        assert_eq!(
+            g.bound_credential.as_deref(),
+            Some(anthropic_binding(&CredentialSource::Local, &seat("claude2")).as_str())
+        );
+        for n in &out.notices {
+            assert_no_body_leak(n, "notice");
+        }
+    }
+
+    /// Pin: a window limit 4 min away (under the long-reset threshold)
+    /// stays on the 429 retry path, with no capacity wait.
+    #[tokio::test]
+    #[serial_test::serial(anthropic_429_log_capture)]
+    async fn a_window_limit_4_min_away_keeps_the_retry_path_and_never_waits() {
+        let upstream =
+            spawn_upstream(vec![Reply::Rejected429 { reset_in_secs: 4 * 60 }, Reply::SseOk]).await;
+        let router = WaitRouter::new(vec![Ok(Err(Some(others_cooling(40 * 60))))], false);
+        let auth = oauth_auth_pinned_to("claude4");
+
+        let out = no_wait(drive_router(&upstream, Arc::clone(&auth), &router, 0, None, wait_on())).await;
+
+        assert!(out.result.is_ok(), "{:?}", out.result.err());
+        assert_eq!(
+            upstream.auth_seen(),
+            vec!["Bearer tok-claude4".to_string(), "Bearer tok-claude4".to_string()],
+            "today's backoff retry, on the same account"
+        );
+        assert_eq!(router.attempted().len(), 1, "the failover lookup only");
+        assert!(!out.notices.iter().any(|n| n.starts_with("⏸ ")), "{:?}", out.notices);
+    }
+
+    /// A request that already streamed output never waits (and never
+    /// resends): its window-limit 429 ends it as today.
+    #[tokio::test]
+    #[serial_test::serial(anthropic_429_log_capture)]
+    async fn a_window_limit_after_output_streamed_never_waits() {
+        let upstream = spawn_upstream(vec![
+            Reply::SsePartialThenOverloaded,
+            Reply::Rejected429 { reset_in_secs: 20 * 60 },
+        ])
+        .await;
+        let router = WaitRouter::new(vec![Ok(Ok(pinned("claude2")))], false);
+        let auth = oauth_auth_pinned_to("claude4");
+
+        let out = no_wait(drive_router(&upstream, Arc::clone(&auth), &router, 1, None, wait_on())).await;
+
+        let msg = out.result.expect_err("ends as today").to_string();
+        assert!(msg.contains("usage limit reached on account 'claude4'"), "{msg}");
+        assert_eq!(upstream.calls(), 2, "no resend after the 429");
+        assert!(router.attempted().is_empty(), "no lookup at all");
+        assert!(!out.notices.iter().any(|n| n.starts_with("⏸ ")), "{:?}", out.notices);
+        assert_eq!(auth.read().await.auth_token, "tok-claude4");
+    }
+
+    /// A keep-warm ping never waits, even with the wait on: one request, on
+    /// the session's seat.
+    #[tokio::test]
+    #[serial_test::serial(anthropic_429_log_capture)]
+    async fn a_keepwarm_ping_on_a_window_limit_never_waits() {
+        use super::{KeepWarmMode, KeepWarmRequest, TailPurpose};
+        let upstream =
+            spawn_upstream(vec![Reply::Rejected429 { reset_in_secs: 20 * 60 }, Reply::SseOk]).await;
+        let router = WaitRouter::new(vec![Ok(Ok(pinned("claude2")))], false);
+        let auth = oauth_auth_pinned_to("claude4");
+        let ping = |mode| KeepWarmRequest {
+            mode,
+            purpose: TailPurpose::Ping,
+            stop_reason: Default::default(),
+            usage: Default::default(),
+            status: Default::default(),
+            sent: Default::default(),
+            connect_failed: Default::default(),
+            failure_kind: Default::default(),
+            lease: None,
+        };
+        let probe =
+            drive_router(&upstream, Arc::clone(&auth), &router, 0, Some(ping(KeepWarmMode::Probe)), wait_on())
+                .await;
+        let expect = probe.result.expect("probe")["keepwarm_prefix"]
+            .as_u64()
+            .expect("the probe returns the prefix");
+        let out = no_wait(drive_router(
+            &upstream,
+            Arc::clone(&auth),
+            &router,
+            0,
+            Some(ping(KeepWarmMode::Send { expect })),
+            wait_on(),
+        ))
+        .await;
+
+        assert!(out.result.is_err(), "the ping fails: {:?}", out.result);
+        assert_eq!(upstream.calls(), 1);
+        assert!(router.attempted().is_empty(), "no lookup");
+        assert!(!out.notices.iter().any(|n| n.starts_with("⏸ ")), "{:?}", out.notices);
+    }
+
+    /// Review B2: one capacity-wait resend per request. After the wait, the
+    /// resend (on the same seat, found again by the re-check) meets another
+    /// window limit, and no other account has capacity: the request ends as
+    /// today, with no second wait. Two sends with the same body, no failover
+    /// counted, no 429 retry slot used (none are left: `max_retries = 0`).
+    #[tokio::test]
+    #[serial_test::serial(anthropic_429_log_capture)]
+    async fn a_second_window_limit_after_the_capacity_resend_ends_the_request_as_today() {
+        let upstream = spawn_upstream(vec![
+            Reply::Rejected429 { reset_in_secs: 20 * 60 },
+            Reply::Rejected429 { reset_in_secs: 20 * 60 },
+        ])
+        .await;
+        let router = WaitRouter::new(
+            vec![
+                Ok(Err(Some(others_cooling(40 * 60)))),
+                Ok(Ok(pinned("claude4"))),
+                Ok(Err(Some(others_cooling(40 * 60)))),
+                Ok(Ok(pinned("claude4"))),
+            ],
+            true,
+        );
+        let auth = oauth_auth_pinned_to("claude4");
+
+        let out = drive_router(&upstream, Arc::clone(&auth), &router, 0, None, wait_on()).await;
+
+        let msg = out.result.expect_err("ends as today").to_string();
+        assert!(msg.contains("usage limit reached on account 'claude4'"), "{msg}");
+        assert_eq!(upstream.calls(), 2, "the request and one resend, no more");
+        let bodies = upstream.bodies();
+        assert_eq!(bodies[0], bodies[1], "the resend is the same request");
+        assert_eq!(
+            upstream.auth_seen(),
+            vec!["Bearer tok-claude4".to_string(), "Bearer tok-claude4".to_string()]
+        );
+        let model = "claude-haiku-4-5".to_string();
+        assert_eq!(
+            router.attempted(),
+            vec![
+                (model.clone(), vec![seat("claude4")]),
+                (model.clone(), vec![]),
+                (model.clone(), vec![seat("claude4")]),
+            ],
+            "the lookup, one re-check, then the second 429's lookup and no wait"
+        );
+        let waits: Vec<_> = out.notices.iter().filter(|n| n.starts_with("⏸ ")).collect();
+        assert_eq!(waits.len(), 1, "one wait: {:?}", out.notices);
+        assert!(!out.notices.iter().any(|n| n.contains("switching to")), "no failover: {:?}", out.notices);
+        assert!(out.retries.is_empty(), "no retry slot used: {:?}", out.retries);
+    }
+
+    /// Phase 2, E2: a window limit with no other account, beyond the wait's
+    /// bound (3 days), or one the wait would reach (20 min) with
+    /// `capacity_wait` off: the request ends as today, and the turn's
+    /// completion holds the stop with the earlier reset (here the request's
+    /// own; every other account resets in 4 days).
+    #[tokio::test]
+    #[serial_test::serial(anthropic_429_log_capture)]
+    async fn a_window_limit_stop_is_marked_with_its_reset() {
+        for (reset_in_secs, wait) in [(3 * 24 * 3600, wait_on()), (20 * 60, None)] {
+            let upstream = spawn_upstream(vec![Reply::Rejected429 { reset_in_secs }]).await;
+            let router = WaitRouter::new(vec![Ok(Err(Some(others_cooling(4 * 24 * 3600))))], false);
+            let auth = oauth_auth_pinned_to("claude4");
+            let completion = crate::runtime::TurnCompletion::new();
+
+            let out = no_wait(crate::runtime::capacity_wait::TURN_COMPLETION.scope(
+                completion.clone(),
+                drive_router(&upstream, Arc::clone(&auth), &router, 0, None, wait),
+            ))
+            .await;
+
+            let msg = out.result.expect_err("ends as today").to_string();
+            assert!(msg.contains("usage limit reached on account 'claude4'"), "{msg}");
+            assert_eq!(upstream.calls(), 1, "no resend");
+            assert!(!out.notices.iter().any(|n| n.starts_with("⏸ ")), "{:?}", out.notices);
+            let stop = completion.take_capacity_stop().expect("the stop is marked");
+            let want = crate::epoch_millis() + reset_in_secs * 1000;
+            assert!(stop.resume_at_ms.abs_diff(want) <= 5_000, "{stop:?} vs {want}");
+            assert_eq!(stop.kind, "all_cooling_down");
+        }
+    }
+
+    /// Phase 2, E3 at site 2: a request that already streamed output ends
+    /// on its window limit as today, and is no capacity stop to resume.
+    #[tokio::test]
+    #[serial_test::serial(anthropic_429_log_capture)]
+    async fn a_window_limit_after_output_streamed_is_not_marked() {
+        let upstream = spawn_upstream(vec![
+            Reply::SsePartialThenOverloaded,
+            Reply::Rejected429 { reset_in_secs: 3 * 24 * 3600 },
+        ])
+        .await;
+        let router = WaitRouter::new(vec![Ok(Ok(pinned("claude2")))], false);
+        let auth = oauth_auth_pinned_to("claude4");
+        let completion = crate::runtime::TurnCompletion::new();
+
+        let out = no_wait(crate::runtime::capacity_wait::TURN_COMPLETION.scope(
+            completion.clone(),
+            drive_router(&upstream, Arc::clone(&auth), &router, 1, None, None),
+        ))
+        .await;
+
+        assert!(out.result.is_err(), "ends as today");
+        assert_eq!(upstream.calls(), 2, "no resend after the 429");
+        assert_eq!(completion.take_capacity_stop(), None);
+    }
+
+    /// Review B1 at site 2, and r2 B1b: re-checks that hang are each dropped
+    /// at the next cadence point and the next starts at once, so they start
+    /// 10 min apart; the last is cut at the wait's bound (5 h 15 min) and
+    /// the request ends as today, with no resend.
+    #[tokio::test]
+    #[serial_test::serial(anthropic_429_log_capture)]
+    async fn a_stalled_window_limit_check_is_cut_at_the_bound() {
+        let upstream = spawn_upstream(vec![Reply::Rejected429 { reset_in_secs: 20 * 60 }]).await;
+        let router = WaitRouter {
+            stall_rechecks: Some(std::time::Duration::from_secs(6 * 3600)),
+            ..WaitRouter::new(
+                vec![Ok(Err(Some(others_cooling(40 * 60)))), Ok(Ok(pinned("claude2")))],
+                true,
+            )
+        };
+        let auth = oauth_auth_pinned_to("claude4");
+
+        let out = drive_router(&upstream, Arc::clone(&auth), &router, 0, None, wait_on()).await;
+
+        let msg = out.result.expect_err("ends as today").to_string();
+        assert!(msg.contains("usage limit reached on account 'claude4'"), "{msg}");
+        assert_eq!(upstream.calls(), 1, "no resend after the cut");
+        // The lookup, then a re-check every 10 min from 10 min to 5 h 10 min
+        // (each dropped while it hangs); the one at 5 h 10 min is cut at the
+        // bound.
+        let times = router.times();
+        assert_eq!(router.attempted().len(), 32, "the lookup and 31 stalled re-checks");
+        let ten_min = std::time::Duration::from_secs(600);
+        for pair in times.windows(2) {
+            let gap = pair[1] - pair[0];
+            assert!(gap <= ten_min + std::time::Duration::from_secs(1), "a gap of {gap:?}");
+        }
+        for pair in times[1..].windows(2) {
+            // Tokio's timers fire on whole milliseconds: a cut can land up
+            // to 1 ms after its deadline.
+            let gap = pair[1] - pair[0];
+            assert!(
+                gap >= ten_min && gap <= ten_min + std::time::Duration::from_millis(1),
+                "re-checks start 10 min apart: {gap:?}"
+            );
+        }
+        assert_eq!(auth.read().await.auth_token, "tok-claude4", "no late answer is bound");
+    }
+
+    /// Review S2: a re-check that fails logs a fixed class, never the
+    /// broker's error text (which may carry anything).
+    #[tokio::test]
+    #[serial_test::serial(anthropic_429_log_capture)]
+    async fn a_failed_window_limit_check_logs_a_fixed_class_and_never_the_error_text() {
+        const SECRET: &str =
+            "sk-ant-oat01-SECRETTOKEN0123 for alice@example.com acct_9f8e7d seat 4c1d0a9b";
+        let upstream = spawn_upstream(vec![Reply::Rejected429 { reset_in_secs: 20 * 60 }]).await;
+        let router = WaitRouter::new(
+            vec![Ok(Err(Some(others_cooling(40 * 60)))), Err(SECRET.to_string())],
+            true,
+        );
+        let auth = oauth_auth_pinned_to("claude4");
+
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&buf);
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(move || LogCapture(Arc::clone(&sink)))
+            .with_ansi(false)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        let out = drive_router(&upstream, Arc::clone(&auth), &router, 0, None, wait_on()).await;
+        drop(guard);
+
+        let msg = out.result.expect_err("ends as today").to_string();
+        assert!(msg.contains("usage limit reached on account 'claude4'"), "{msg}");
+        assert_eq!(upstream.calls(), 1);
+        let logs = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        let line = logs
+            .lines()
+            .find(|l| l.contains("capacity wait: looking up an account failed"))
+            .unwrap_or_else(|| panic!("the failed check is logged: {logs}"));
+        assert!(line.contains("error_class=\"lookup_failed\"") || line.contains("error_class=lookup_failed"), "{line}");
+        for leak in ["sk-ant", "SECRETTOKEN", "alice@example.com", "acct_9f8e7d", "4c1d0a9b"] {
+            assert!(!logs.contains(leak), "{leak} reached the log: {logs}");
+        }
+        for n in &out.notices {
+            assert!(!n.contains("sk-ant") && !n.contains('@'), "{n}");
+        }
+        assert!(!msg.contains("sk-ant") && !msg.contains('@'), "{msg}");
     }
 
     /// `std::io::Write` sink appending to a shared buffer (in-process
@@ -6735,7 +8879,26 @@ mod cancellation_tests {
         ErrorBody,
         Retry,
         Sse,
+        /// [`SSE_AFTER_DELTA`], then the stream stays open.
+        SseAfterDelta,
     }
+
+    /// message_start (12/1, cache 5/3), a counted message_delta (cumulative
+    /// 12/7, cache 5/3, no stop_reason), then the text "partial"; no
+    /// message_stop. The delta is sent before the text so that receiving the
+    /// text proves the delta was parsed, however the bytes are chunked.
+    const SSE_AFTER_DELTA: &str = concat!(
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"offline\",",
+        "\"usage\":{\"input_tokens\":12,\"output_tokens\":1,",
+        "\"cache_read_input_tokens\":5,\"cache_creation_input_tokens\":3}}}\n\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,",
+        "\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":null},",
+        "\"usage\":{\"input_tokens\":12,\"output_tokens\":7,",
+        "\"cache_read_input_tokens\":5,\"cache_creation_input_tokens\":3}}\n\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,",
+        "\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n",
+    );
 
     /// Loopback only, no credentials/config/environment changes. All streams
     /// deliberately stay open so cancellation, not EOF/client timeout, wins.
@@ -6768,7 +8931,9 @@ mod cancellation_tests {
                             .body(Body::from("{}"))
                             .unwrap();
                     }
-                    let prefix = if matches!(stall, Stall::Sse) {
+                    let prefix = if matches!(stall, Stall::SseAfterDelta) {
+                        SSE_AFTER_DELTA
+                    } else if matches!(stall, Stall::Sse) {
                         concat!(
                             "data: {\"type\":\"message_start\",\"message\":{\"id\":\"offline\",",
                             "\"usage\":{\"input_tokens\":12,\"output_tokens\":1,",
@@ -6786,7 +8951,11 @@ mod cancellation_tests {
                     })
                     .chain(futures::stream::pending());
                     Response::builder()
-                        .status(if matches!(stall, Stall::Sse) { 200 } else { 500 })
+                        .status(if matches!(stall, Stall::Sse | Stall::SseAfterDelta) {
+                            200
+                        } else {
+                            500
+                        })
                         .header("content-type", "text/event-stream")
                         .body(Body::from_stream(chunks))
                         .unwrap()
@@ -6931,5 +9100,322 @@ mod cancellation_tests {
         assert_eq!(usage_events, 1);
         assert_eq!(counters.totals(), (12, 1, 5, 3));
         assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    /// A user cancel after a counted message_delta and before message_stop
+    /// (the token, as cancel_turn sends it): the read loop ends and the end of
+    /// the stream sends the one Usage, with the delta's counts, not the
+    /// start's. Only a dropped future (an abort) skips it.
+    #[tokio::test]
+    async fn cancelled_sse_after_a_counted_delta_sends_the_deltas_usage_once() {
+        let (mut options, hits, _seen, server) = stalled_server(Stall::SseAfterDelta).await;
+        let counters = Arc::new(crate::runtime::budget::UsageCounters::default());
+        options.usage_counters = Some(counters.clone());
+        let auth = test_auth();
+        let cancel = CancellationToken::new();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let result = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(call(&auth, &cancel, tx, &options), async {
+                let mut usage = Vec::new();
+                while let Some(event) = rx.recv().await {
+                    match event {
+                        StreamEvent::Llm(LlmEvent::Text(text)) => {
+                            assert_eq!(text, "partial");
+                            assert!(usage.is_empty(), "nothing is sent before the end");
+                            cancel.cancel();
+                        }
+                        StreamEvent::Session(SessionEvent::Usage {
+                            input_tokens,
+                            output_tokens,
+                            cache_read_input_tokens,
+                            cache_creation_input_tokens,
+                            ..
+                        }) => usage.push((
+                            input_tokens,
+                            output_tokens,
+                            cache_read_input_tokens,
+                            cache_creation_input_tokens,
+                        )),
+                        _ => {}
+                    }
+                }
+                usage
+            })
+        })
+        .await;
+        server.abort();
+        let (response, usage) = result.expect("cancel must finish a stalled SSE stream");
+        assert_eq!(response.unwrap()["content"][0]["text"], "partial");
+        assert_eq!(usage, vec![(12, 7, 5, 3)], "one Usage, the delta's counts");
+        assert_eq!(counters.totals(), (12, 7, 5, 3), "the root counted it once");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    // ── Progress deadlines: a stream that only pings is retried ──────────
+
+    /// Anthropic's keep-alive frame.
+    const PING: &str = "event: ping\ndata: {\"type\":\"ping\"}\n\n";
+
+    /// A complete reply: the text "second attempt", end_turn.
+    const COMPLETE: &str = concat!(
+        r#"data: {"type":"message_start","message":{"id":"offline","usage":{"input_tokens":12,"output_tokens":1}}}"#,
+        "\n\n",
+        r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+        "\n\n",
+        r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"second attempt"}}"#,
+        "\n\n",
+        r#"data: {"type":"content_block_stop","index":0}"#,
+        "\n\n",
+        r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":3}}"#,
+        "\n\n",
+        r#"data: {"type":"message_stop"}"#,
+        "\n\n",
+    );
+
+    /// Text, then a tool_use whose input is cut off mid-JSON.
+    const PARTIAL_TOOL: &str = concat!(
+        r#"data: {"type":"message_start","message":{"id":"offline","usage":{"input_tokens":12,"output_tokens":1}}}"#,
+        "\n\n",
+        r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+        "\n\n",
+        r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"first attempt"}}"#,
+        "\n\n",
+        r#"data: {"type":"content_block_stop","index":0}"#,
+        "\n\n",
+        r#"data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_partial","name":"bash"}}"#,
+        "\n\n",
+        r#"data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"command\": \"rm"}}"#,
+        "\n\n",
+    );
+
+    const THINKING_START: &str = concat!(
+        r#"data: {"type":"message_start","message":{"id":"offline","usage":{"input_tokens":12,"output_tokens":1}}}"#,
+        "\n\n",
+        r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#,
+        "\n\n",
+    );
+
+    const THINKING_DELTA: &str = concat!(
+        r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"hm"}}"#,
+        "\n\n",
+    );
+
+    const THINKING_END: &str = concat!(
+        r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig"}}"#,
+        "\n\n",
+        r#"data: {"type":"content_block_stop","index":0}"#,
+        "\n\n",
+        r#"data: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}"#,
+        "\n\n",
+        r#"data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"done"}}"#,
+        "\n\n",
+        r#"data: {"type":"content_block_stop","index":1}"#,
+        "\n\n",
+        r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":3}}"#,
+        "\n\n",
+        r#"data: {"type":"message_stop"}"#,
+        "\n\n",
+    );
+
+    /// One attempt's body: each frame after its delay in ms; then, when
+    /// `pings` is set, a ping every `pings` ms forever, else the body's end.
+    fn scripted(frames: Vec<(u64, &'static str)>, pings: Option<u64>) -> Body {
+        let script = futures::stream::iter(frames).then(|(ms, frame)| async move {
+            tokio::time::sleep(Duration::from_millis(ms)).await;
+            Ok::<_, std::io::Error>(bytes::Bytes::from_static(frame.as_bytes()))
+        });
+        let pings = futures::stream::unfold((), move |()| async move {
+            let every = match pings {
+                Some(every) => every,
+                None => return None,
+            };
+            tokio::time::sleep(Duration::from_millis(every)).await;
+            Some((Ok(bytes::Bytes::from_static(PING.as_bytes())), ()))
+        });
+        Body::from_stream(script.chain(pings))
+    }
+
+    /// Loopback only: answers attempt `n` (from 0) with a 200 SSE body,
+    /// `script(n)`.
+    async fn scripted_server(
+        script: fn(usize) -> Body,
+    ) -> (ApiOptions, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        let app = Router::new().route(
+            "/v1/messages",
+            post(move || {
+                let body = script(counter.fetch_add(1, Ordering::SeqCst));
+                async move {
+                    Response::builder()
+                        .status(200)
+                        .header("content-type", "text/event-stream")
+                        .body(body)
+                        .unwrap()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (
+            ApiOptions {
+                anthropic_base_url: Some(url),
+                ..Default::default()
+            },
+            hits,
+            task,
+        )
+    }
+
+    /// `call` under shrunk (first event, progress) deadlines: its result
+    /// and every event it sent, in order.
+    async fn call_within(
+        options: &ApiOptions,
+        limits: (Duration, Duration),
+    ) -> (Result<Value>, Vec<StreamEvent>) {
+        let auth = test_auth();
+        let cancel = CancellationToken::new();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            crate::runtime::http_phases::STREAM_PROGRESS_FOR_TEST
+                .scope(limits, call(&auth, &cancel, tx, options)),
+        )
+        .await
+        .expect("the request must end well within 10 s");
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        (result, events)
+    }
+
+    /// The live symptom: headers, then only pings, which keep the raw-byte
+    /// idle timer alive. The first-event deadline (the only limit in reach:
+    /// progress is 60 s) ends the attempt, the request is retried, and the
+    /// result is the second attempt's reply.
+    #[tokio::test]
+    async fn ping_only_stream_is_retried_after_the_first_event_deadline() {
+        let (options, hits, server) = scripted_server(|attempt| match attempt {
+            0 => scripted(Vec::new(), Some(20)),
+            _ => scripted(vec![(0, COMPLETE)], None),
+        })
+        .await;
+        let limits = (Duration::from_millis(300), Duration::from_secs(60));
+        let (result, events) = call_within(&options, limits).await;
+        server.abort();
+        assert_eq!(
+            result.unwrap()["content"],
+            json!([{"type": "text", "text": "second attempt"}])
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, StreamEvent::Llm(LlmEvent::ResponseReset))));
+    }
+
+    /// The first-event deadline is spent once per request: a cold prefill of
+    /// a huge prompt may outlast it, so later attempts wait the progress
+    /// window for message_start. Attempt 2 pings past the first-event limit,
+    /// under the progress one, then replies: two requests, one retry.
+    #[tokio::test]
+    async fn first_event_deadline_relaxes_after_it_fires_once() {
+        let (options, hits, server) = scripted_server(|attempt| match attempt {
+            0 => scripted(Vec::new(), Some(20)),
+            _ => {
+                let mut frames = vec![(100, PING); 7];
+                frames.push((0, COMPLETE));
+                scripted(frames, None)
+            }
+        })
+        .await;
+        let limits = (Duration::from_millis(300), Duration::from_secs(2));
+        let (result, events) = call_within(&options, limits).await;
+        server.abort();
+        assert_eq!(
+            result.unwrap()["content"],
+            json!([{"type": "text", "text": "second attempt"}])
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        let retries = events
+            .iter()
+            .filter(|e| matches!(e, StreamEvent::Session(SessionEvent::Retry(_))))
+            .count();
+        assert_eq!(retries, 1, "no second deadline");
+    }
+
+    /// Text and a tool_use cut off mid-input, then only pings: the progress
+    /// deadline (the only limit in reach once message_start came) ends the
+    /// attempt and it is retried. The result is the second attempt's reply
+    /// alone, the previews are reset before the retry, and the partial call
+    /// never completed: no ToolUse event and no tool_use block for the tool
+    /// loop to run.
+    #[tokio::test]
+    async fn partial_tool_use_then_pings_is_retried_after_the_progress_deadline() {
+        let (options, hits, server) = scripted_server(|attempt| match attempt {
+            0 => scripted(vec![(0, PARTIAL_TOOL)], Some(20)),
+            _ => scripted(vec![(0, COMPLETE)], None),
+        })
+        .await;
+        let limits = (Duration::from_secs(60), Duration::from_millis(300));
+        let (result, events) = call_within(&options, limits).await;
+        server.abort();
+        assert_eq!(
+            result.unwrap()["content"],
+            json!([{"type": "text", "text": "second attempt"}])
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        let at = |wanted: fn(&StreamEvent) -> bool| events.iter().position(wanted).unwrap();
+        let first =
+            at(|e| matches!(e, StreamEvent::Llm(LlmEvent::Text(t)) if t == "first attempt"));
+        let tool_start = at(
+            |e| matches!(e, StreamEvent::Llm(LlmEvent::ToolUseStart { tool_id, .. }) if tool_id == "toolu_partial"),
+        );
+        let reset = at(|e| matches!(e, StreamEvent::Llm(LlmEvent::ResponseReset)));
+        let second =
+            at(|e| matches!(e, StreamEvent::Llm(LlmEvent::Text(t)) if t == "second attempt"));
+        assert!(first < tool_start && tool_start < reset && reset < second);
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::Llm(LlmEvent::ToolUse { .. }))),
+            "the partial call never completed"
+        );
+    }
+
+    /// No false fire: thinking deltas 700 ms apart with pings between them,
+    /// under a 1 s progress limit, for over 2 s in all. Each delta is
+    /// progress, so the stream completes on its first attempt.
+    #[tokio::test]
+    async fn spaced_thinking_deltas_with_pings_never_reach_the_progress_deadline() {
+        let (options, hits, server) = scripted_server(|_| {
+            let mut frames = vec![(0, THINKING_START)];
+            for _ in 0..3 {
+                frames.extend([(100, PING); 6]);
+                frames.push((100, THINKING_DELTA));
+            }
+            frames.push((0, THINKING_END));
+            scripted(frames, None)
+        })
+        .await;
+        let limit = Duration::from_secs(1);
+        let started = std::time::Instant::now();
+        let (result, events) = call_within(&options, (limit, limit)).await;
+        server.abort();
+        assert!(started.elapsed() > limit, "the stream outlasted the limit");
+        assert_eq!(
+            result.unwrap()["content"],
+            json!([
+                {"type": "thinking", "thinking": "hmhmhm", "signature": "sig"},
+                {"type": "text", "text": "done"}
+            ])
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert!(!events.iter().any(|e| matches!(
+            e,
+            StreamEvent::Llm(LlmEvent::ResponseReset)
+                | StreamEvent::Session(SessionEvent::Retry(_))
+        )));
     }
 }

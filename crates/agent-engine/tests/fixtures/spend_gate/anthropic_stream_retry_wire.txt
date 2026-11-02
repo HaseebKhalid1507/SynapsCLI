@@ -1,0 +1,11 @@
+{"kind":"session","session":"message_history","messages":[{"content":"What's the capital of France?","role":"user"},{"content":[{"text":"Paris.","type":"text"}],"role":"assistant"},{"content":"And of Japan?","role":"user"}]}
+{"kind":"llm","llm":"response_start"}
+{"kind":"session","session":"usage","input_tokens":12,"output_tokens":0,"cache_read_input_tokens":4,"cache_creation_input_tokens":5,"cache_creation_5m":5,"cache_creation_1h":0,"model":null}
+{"kind":"session","session":"notice","text":"⏳ API stream error — retrying (1/1)…","retry":true}
+{"kind":"llm","llm":"response_reset"}
+{"kind":"llm","llm":"response_start"}
+{"kind":"llm","llm":"text","text":"gate "}
+{"kind":"llm","llm":"text","text":"ok"}
+{"kind":"session","session":"usage","input_tokens":12,"output_tokens":3,"cache_read_input_tokens":4,"cache_creation_input_tokens":5,"cache_creation_5m":5,"cache_creation_1h":0,"model":null}
+{"kind":"session","session":"message_history","messages":[{"content":"What's the capital of France?","role":"user"},{"content":[{"text":"Paris.","type":"text"}],"role":"assistant"},{"content":"And of Japan?","role":"user"},{"_synaps_at":"2026-01-01T00:00:00Z","content":[{"text":"gate ok","type":"text"}],"role":"assistant"}]}
+{"kind":"session","session":"done"}

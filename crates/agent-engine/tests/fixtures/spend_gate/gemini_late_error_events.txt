@@ -1,0 +1,2 @@
+Llm(Text("gate "))
+=> Err(google-gemini: gemini stream error: broker transport error: connection reset)

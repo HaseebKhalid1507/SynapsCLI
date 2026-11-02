@@ -110,6 +110,9 @@ pub fn codex_static_catalog_models() -> Vec<CatalogModel> {
         m.provider_kind = CatalogProviderKind::OpenAiCodex;
         m.label = Some(label.to_string());
         m.reasoning = codex_static_capability(id).unwrap_or(ReasoningSupport::Unknown);
+        if id == "gpt-6-astra" {
+            m.context_tokens = Some(agent_core::models::context_window_for_model(id));
+        }
         // Exact input-modality evidence from the official local Codex cache,
         // verified 2026-09-05. Do not infer from generation/family names:
         // gpt-5.4 was not observed, and spark explicitly advertises text only.
@@ -1266,7 +1269,24 @@ mod tests {
     // ── Reasoning level parsing from fixture ──────────────────────────────────
 
     #[test]
-    fn parse_fixture_astra_is_first_with_full_ladder_and_v2() {
+    fn astra_context_capacity_static_catalog_matches_the_core_helper() {
+        let models = codex_static_catalog_models();
+        let astra = models.iter().find(|m| m.id == "gpt-6-astra").unwrap();
+        assert_eq!(astra.context_tokens, Some(1_050_000));
+        assert_eq!(
+            astra.context_tokens,
+            Some(agent_core::models::context_window_for_model(
+                &astra.runtime_id()
+            ))
+        );
+        assert!(models
+            .iter()
+            .filter(|m| m.id != "gpt-6-astra")
+            .all(|m| m.context_tokens.is_none()));
+    }
+
+    #[test]
+    fn astra_context_capacity_fixture_is_first_with_full_ladder_and_v2() {
         let models = parse_codex_catalog_models(FIXTURE).expect("parse fixture");
         let astra = &models[0];
         assert_eq!(
@@ -1274,7 +1294,7 @@ mod tests {
             "astra is priority 1 in the live catalog"
         );
         assert_eq!(astra.label.as_deref(), Some("GPT-6-Astra"));
-        assert_eq!(astra.context_tokens, Some(272_000));
+        assert_eq!(astra.context_tokens, Some(1_050_000));
         for level in [
             ReasoningLevel::Low,
             ReasoningLevel::Medium,

@@ -7,7 +7,7 @@
 use super::openai::StreamAttempt;
 use super::{CollectingTraceSink, RequestTrace, StopReason, TraceContext, TransportKind};
 use crate::runtime::openai::stream::{
-    call_codex_stream_inner, call_oai_stream_inner, call_xai_responses_stream_inner,
+    call_codex_stream_inner, call_oai_stream_inner, call_responses_stream_inner,
 };
 use crate::runtime::openai::types::ProviderConfig;
 use crate::{LlmEvent, StreamEvent};
@@ -230,6 +230,8 @@ async fn drive_chat_with_events(
         exact,
         false,
         0,
+        crate::runtime::child_spend::RouteSpend::NONE,
+        None,
     )
     .await
 }
@@ -622,7 +624,7 @@ async fn drive_responses(
         upstream: upstream.to_string(),
     });
     let (tx, _rx) = mpsc::unbounded_channel::<StreamEvent>();
-    call_xai_responses_stream_inner(
+    call_responses_stream_inner(
         &cfg,
         &broker,
         &[],
@@ -635,6 +637,7 @@ async fn drive_responses(
         0,
         trace,
         true,
+        crate::runtime::child_spend::RouteSpend::NONE,
     )
     .await
 }
@@ -844,6 +847,8 @@ async fn drive_codex_with_events(
         cancel,
         max_retries,
         trace,
+        crate::runtime::child_spend::RouteSpend::NONE,
+        None,
     )
     .await
 }
@@ -929,6 +934,8 @@ async fn codex_system_guidance_is_sent_once_and_preserves_history_prefix() {
             &CancellationToken::new(),
             0,
             &h.trace,
+            crate::runtime::child_spend::RouteSpend::NONE,
+            None,
         )
         .await
         .expect("loopback Codex request");
@@ -1190,6 +1197,8 @@ async fn astra_ultra_posts_xhigh_for_foreground_and_worker_without_recursive_mod
             &CancellationToken::new(),
             1,
             &h.trace,
+            crate::runtime::child_spend::RouteSpend::NONE,
+            None,
         )
         .await
         .unwrap();
@@ -1281,6 +1290,8 @@ async fn astra_ultra_live_smoke() {
                 &CancellationToken::new(),
                 0,
                 &TraceContext::disabled(),
+                crate::runtime::child_spend::RouteSpend::NONE,
+                None,
             ),
         )
         .await
@@ -1389,6 +1400,8 @@ async fn drive_codex_model_tools(
         &CancellationToken::new(),
         3,
         trace,
+        crate::runtime::child_spend::RouteSpend::NONE,
+        None,
     )
     .await;
     drop(tx);

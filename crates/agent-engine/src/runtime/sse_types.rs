@@ -132,6 +132,42 @@ pub(super) struct UsagePayload {
     pub cache_creation: Option<CacheCreationDetail>,
 }
 
+/// A usage object with presence kept: an absent (or `null`) counter is
+/// `None`, never zero. A counter of any other type fails the whole parse.
+#[derive(Debug, Default, Deserialize)]
+pub(super) struct UsagePresence {
+    #[serde(default)]
+    pub input_tokens: Option<u64>,
+    #[serde(default)]
+    pub output_tokens: Option<u64>,
+    #[serde(default)]
+    pub cache_read_input_tokens: Option<u64>,
+    #[serde(default)]
+    pub cache_creation_input_tokens: Option<u64>,
+    #[serde(default)]
+    pub cache_creation: Option<CacheCreationDetail>,
+}
+
+/// `message_start`'s usage, with presence.
+#[derive(Debug, Deserialize)]
+pub(super) struct StartUsagePresence {
+    #[serde(default)]
+    pub message: Option<MessageUsagePresence>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct MessageUsagePresence {
+    #[serde(default)]
+    pub usage: Option<UsagePresence>,
+}
+
+/// `message_delta`'s usage, with presence.
+#[derive(Debug, Deserialize)]
+pub(super) struct DeltaUsagePresence {
+    #[serde(default)]
+    pub usage: Option<UsagePresence>,
+}
+
 #[derive(Debug, Deserialize)]
 pub(super) struct CacheCreationDetail {
     #[serde(default)]

@@ -81,19 +81,41 @@ Use this EXACT format:
 
 Keep each section concise. Preserve exact file paths, function names, and error messages."#;
 
+/// Paths touched by file tools, each with the sequence number of its latest
+/// touch, so records list deterministically, newest-touched first.
 struct FileOps {
-    read: std::collections::HashSet<String>,
-    written: std::collections::HashSet<String>,
-    edited: std::collections::HashSet<String>,
+    read: std::collections::HashMap<String, usize>,
+    written: std::collections::HashMap<String, usize>,
+    edited: std::collections::HashMap<String, usize>,
+    seq: usize,
 }
 
 impl FileOps {
     fn new() -> Self {
         Self {
-            read: std::collections::HashSet::new(),
-            written: std::collections::HashSet::new(),
-            edited: std::collections::HashSet::new(),
+            read: Default::default(),
+            written: Default::default(),
+            edited: Default::default(),
+            seq: 0,
         }
+    }
+
+    fn touch(&mut self, name: &str, path: &str) {
+        self.seq += 1;
+        let set = match name {
+            "read" => &mut self.read,
+            "write" => &mut self.written,
+            "edit" => &mut self.edited,
+            _ => return,
+        };
+        set.insert(path.to_owned(), self.seq);
+    }
+
+    /// Newest-touched first; ties (none in practice) break lexically.
+    fn ordered(paths: std::collections::HashMap<String, usize>) -> Vec<String> {
+        let mut paths: Vec<(String, usize)> = paths.into_iter().collect();
+        paths.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        paths.into_iter().map(|(path, _)| path).collect()
     }
 }
 
@@ -133,14 +155,19 @@ pub struct RenderedCompactionInput {
     pub base_prompt: &'static str,
 }
 
-/// Render the summarization request under a disclosure policy. Pure — no
-/// network, no provider dependence. Sentinel-tested per class: excluded
-/// classes must not appear in `prompt_text`.
-pub fn render_compaction_input(
+/// Policy-filtered text projection of a message range: one labeled entry per
+/// rendered block plus the structured file-operations record. Pure; shared by
+/// `/compact` and the rollover summary so both disclose the same classes.
+pub(crate) struct TranscriptProjection {
+    pub parts: Vec<String>,
+    pub file_section: String,
+    present: std::collections::HashSet<agent_core::compaction::ContentClass>,
+}
+
+pub(crate) fn project_transcript(
     api_messages: &[crate::SharedMessage],
-    custom_instructions: Option<&str>,
     policy: &DisclosurePolicy,
-) -> RenderedCompactionInput {
+) -> TranscriptProjection {
     use agent_core::compaction::ContentClass;
 
     let mut parts: Vec<String> = Vec::new();
@@ -234,22 +261,11 @@ pub fn render_compaction_input(
                                 let input = &block["input"];
                                 if track_paths && name == "multi_edit" {
                                     for path in crate::tools::multi_edit_paths(input) {
-                                        file_ops.edited.insert(path.to_string());
+                                        file_ops.touch("edit", path);
                                     }
                                 } else if track_paths {
                                     if let Some(path) = input["path"].as_str() {
-                                        match name {
-                                            "read" => {
-                                                file_ops.read.insert(path.to_string());
-                                            }
-                                            "write" => {
-                                                file_ops.written.insert(path.to_string());
-                                            }
-                                            "edit" => {
-                                                file_ops.edited.insert(path.to_string());
-                                            }
-                                            _ => {}
-                                        }
+                                        file_ops.touch(name, path);
                                     }
                                 }
                                 if policy.excludes(ContentClass::ToolCalls) {
@@ -283,15 +299,25 @@ pub fn render_compaction_input(
         }
     }
 
-    let conversation_text = parts.join("\n\n");
-
     // Build file-operations summary (read-only = read but not modified).
     let mut file_section = String::new();
     if track_paths {
-        let modified: std::collections::HashSet<String> =
-            file_ops.written.union(&file_ops.edited).cloned().collect();
-        let read_only: Vec<String> = file_ops.read.difference(&modified).cloned().collect();
-        let modified_list: Vec<String> = modified.into_iter().collect();
+        let FileOps {
+            read,
+            written,
+            mut edited,
+            ..
+        } = file_ops;
+        for (path, seq) in written {
+            let latest = edited.entry(path).or_insert(seq);
+            *latest = (*latest).max(seq);
+        }
+        let read_only: Vec<String> = FileOps::ordered(
+            read.into_iter()
+                .filter(|(path, _)| !edited.contains_key(path))
+                .collect(),
+        );
+        let modified_list: Vec<String> = FileOps::ordered(edited);
         if !read_only.is_empty() {
             file_section.push_str(&format!(
                 "\n\n<read-files>\n{}\n</read-files>",
@@ -305,6 +331,30 @@ pub fn render_compaction_input(
             ));
         }
     }
+    if !file_section.is_empty() {
+        present.insert(ContentClass::FilePaths);
+    }
+    TranscriptProjection {
+        parts,
+        file_section,
+        present,
+    }
+}
+
+/// Render the summarization request under a disclosure policy. Pure — no
+/// network, no provider dependence. Sentinel-tested per class: excluded
+/// classes must not appear in `prompt_text`.
+pub fn render_compaction_input(
+    api_messages: &[crate::SharedMessage],
+    custom_instructions: Option<&str>,
+    policy: &DisclosurePolicy,
+) -> RenderedCompactionInput {
+    let TranscriptProjection {
+        parts,
+        file_section,
+        present,
+    } = project_transcript(api_messages, policy);
+    let conversation_text = parts.join("\n\n");
 
     // Iterative compaction — if the first user message already contains a
     // summary wrapper, we're compacting on top of a previous compaction.
@@ -335,10 +385,6 @@ pub fn render_compaction_input(
             "\n\nAlso append these file operation records to the end of your summary:{}",
             file_section
         ));
-    }
-
-    if !file_section.is_empty() {
-        present.insert(ContentClass::FilePaths);
     }
 
     let excluded_classes: Vec<agent_core::compaction::ContentClass> = policy.exclude.clone();
@@ -836,6 +882,19 @@ pub async fn apply_compaction(
                 Session::from_compaction_record(current, &outcome.summary_text, record);
             successor.api_messages.extend(extra_messages);
 
+            // Step 0: carry the session's sandbox policy file (if it has one)
+            // to the successor's id BEFORE the successor exists, so a
+            // successor never runs without its predecessor's policy. Failure
+            // changes nothing: the session stays on the predecessor, under
+            // its own policy. Until `keep()`, any failure below drops
+            // `carried`, which removes the file this carry created.
+            let carried =
+                crate::sandbox::carry_to_successor(&current.id, &successor.id).map_err(|reason| {
+                    crate::error::RuntimeError::Session(format!(
+                        "sandbox policy could not be carried to the new session id: {reason}"
+                    ))
+                })?;
+
             // Step 1: save the successor. Failure here changes nothing.
             successor.save().await.map_err(|e| {
                 crate::error::RuntimeError::Session(format!(
@@ -908,6 +967,7 @@ pub async fn apply_compaction(
                      (transition rolled back): {e}"
                 )));
             }
+            carried.keep();
             (successor, advanced)
         }
         CompactionPolicy::InPlace => {
@@ -915,6 +975,8 @@ pub async fn apply_compaction(
             updated.api_messages =
                 agent_core::compaction::compaction_context_messages(&outcome.summary_text);
             updated.api_messages.extend(extra_messages);
+            // Client tool stamps follow the history: only ids still in it.
+            updated.client_tool_stamps = updated.client_tool_stamps_of(&updated.api_messages);
             updated.compaction = Some(record);
             updated.updated_at = chrono::Utc::now();
             updated.save().await.map_err(|e| {
@@ -2154,5 +2216,258 @@ mod disclosure_tests {
         observed_rx
             .recv_timeout(std::time::Duration::from_secs(10))
             .expect("remote compaction must hit the spy listener");
+    }
+}
+
+/// The sandbox policy carry inside the transition (`crate::sandbox::carry`,
+/// docs/sandbox.md). Every base dir is a scratch tree outside the baseline
+/// directories (`test_scratch_parent`); `HOME` is the process's own (only
+/// read). The `_local_` test runs a command under a real Landlock domain:
+/// LOCAL kernel only (not g1pro/WSL), opt in with SYNAPS_TEST_LANDLOCK=1.
+#[cfg(all(test, target_os = "linux"))]
+mod sandbox_carry_tests {
+    use super::*;
+    use agent_core::session::Session;
+    use serde_json::json;
+    use serial_test::serial;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+
+    use crate::sandbox::policy::test_scratch_parent;
+    use crate::test_env::BaseDirGuard;
+
+    /// Field order is drop order: the base-dir override is undone first,
+    /// then the scratch tree goes.
+    struct Fx {
+        _guard: BaseDirGuard,
+        _tmp: tempfile::TempDir,
+        root: PathBuf,
+        base: PathBuf,
+    }
+
+    fn fx() -> Fx {
+        let guard = BaseDirGuard::new();
+        let tmp = tempfile::Builder::new().prefix("sbx-compact-").tempdir_in(test_scratch_parent()).expect("tempdir");
+        let root = std::fs::canonicalize(tmp.path()).expect("canonical tempdir");
+        for d in ["base/sandbox/sessions", "lane", "other"] {
+            std::fs::create_dir_all(root.join(d)).expect("mkdir");
+        }
+        let base = root.join("base");
+        agent_core::config::set_base_dir_for_tests(base.clone());
+        Fx { _guard: guard, _tmp: tmp, root, base }
+    }
+
+    impl Fx {
+        fn conf(&self, id: &str) -> PathBuf {
+            self.base.join("sandbox/sessions").join(format!("{id}.conf"))
+        }
+        fn valid(&self) -> String {
+            format!("mode = enforce\nwrite = {}\ncontact = Ask your foreman.\n", self.root.join("lane").display())
+        }
+    }
+
+    fn names(dir: &Path) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(dir)
+            .expect("read_dir")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        v.sort();
+        v
+    }
+
+    async fn seeded_parent() -> Session {
+        let mut parent = Session::new("claude-sonnet-4-6", "high", Some("You are the household policy."));
+        parent.api_messages = vec![
+            Arc::new(json!({"role": "user", "content": "step one"})),
+            Arc::new(json!({"role": "assistant", "content": "done one"})),
+        ];
+        parent.save().await.expect("seed parent");
+        parent
+    }
+
+    async fn compact(parent: &Session, policy: CompactionPolicy) -> Result<AppliedCompaction> {
+        apply_compaction(
+            &crate::Runtime::new_headless(),
+            parent,
+            &parent.api_messages.clone(),
+            &CompactionOutcome::new("## Goal\nFinish.".to_string(), "claude-sonnet-4-6", &["system"]),
+            CompactionTransition {
+                policy,
+                pending_events: Vec::new(),
+                queued_message: None,
+                hook_source: "manual".to_string(),
+            },
+        )
+        .await
+    }
+
+    #[tokio::test]
+    #[serial(synaps_base_dir)]
+    async fn linked_compaction_carries_the_policy_to_the_successor() {
+        let fx = fx();
+        let parent = seeded_parent().await;
+        std::fs::write(fx.conf(&parent.id), fx.valid()).unwrap();
+        let applied = compact(&parent, CompactionPolicy::LinkedSuccessor).await.expect("transition");
+        let new_id = applied.session.id.clone();
+        assert_ne!(new_id, parent.id);
+        assert_eq!(std::fs::read_to_string(fx.conf(&new_id)).unwrap(), fx.valid(), "the successor has the policy");
+        assert_eq!(std::fs::read_to_string(fx.conf(&parent.id)).unwrap(), fx.valid(), "the predecessor keeps its own");
+        assert_eq!(
+            names(&fx.base.join("sandbox/sessions")),
+            {
+                let mut v = vec![format!("{}.conf", parent.id), format!("{new_id}.conf")];
+                v.sort();
+                v
+            },
+            "no temp file is left"
+        );
+    }
+
+    #[tokio::test]
+    #[serial(synaps_base_dir)]
+    async fn linked_compaction_fails_whole_when_the_policy_cannot_be_carried() {
+        let fx = fx();
+        let parent = seeded_parent().await;
+        std::fs::write(fx.conf(&parent.id), "mode = enforce\nbogus = 1\n").unwrap();
+        let err = compact(&parent, CompactionPolicy::LinkedSuccessor).await.expect_err("the carry fails").to_string();
+        assert!(err.contains("sandbox policy could not be carried to the new session id: "), "{err}");
+        assert!(err.contains("the predecessor's policy is invalid"), "{err}");
+        // Nothing changed: no successor journal, no successor policy, the
+        // parent without a forward link.
+        assert_eq!(names(&fx.base.join("sessions")), [format!("{}.json", parent.id)], "no successor journal");
+        assert_eq!(names(&fx.base.join("sandbox/sessions")), [format!("{}.conf", parent.id)], "no successor policy");
+        let reloaded = Session::load(&parent.id).expect("parent");
+        assert!(reloaded.compacted_into.is_none());
+    }
+
+    #[tokio::test]
+    #[serial(synaps_base_dir)]
+    async fn compaction_without_a_policy_or_in_place_carries_nothing() {
+        let fx = fx();
+        let parent = seeded_parent().await;
+        let applied = compact(&parent, CompactionPolicy::LinkedSuccessor).await.expect("transition");
+        assert_ne!(applied.session.id, parent.id);
+        assert!(names(&fx.base.join("sandbox/sessions")).is_empty(), "unsandboxed stays unsandboxed");
+
+        let in_place = seeded_parent().await;
+        std::fs::write(fx.conf(&in_place.id), fx.valid()).unwrap();
+        let applied = compact(&in_place, CompactionPolicy::InPlace).await.expect("transition");
+        assert_eq!(applied.session.id, in_place.id);
+        assert_eq!(names(&fx.base.join("sandbox/sessions")), [format!("{}.conf", in_place.id)], "same id, same file");
+    }
+
+    #[tokio::test]
+    #[serial(synaps_base_dir)]
+    async fn a_rolled_back_compaction_removes_the_carried_policy() {
+        struct Failpoint;
+        impl Drop for Failpoint {
+            fn drop(&mut self) {
+                set_transition_failpoint(None);
+            }
+        }
+        let fx = fx();
+        let parent = seeded_parent().await;
+        std::fs::write(fx.conf(&parent.id), fx.valid()).unwrap();
+        set_transition_failpoint(Some((TransitionFailpoint::AtParentSave, 0)));
+        let fp = Failpoint;
+        let result = compact(&parent, CompactionPolicy::LinkedSuccessor).await;
+        drop(fp);
+        assert!(result.is_err(), "the injected parent-save failure surfaces");
+        assert_eq!(names(&fx.base.join("sessions")), [format!("{}.json", parent.id)], "the successor is rolled back");
+        assert_eq!(
+            names(&fx.base.join("sandbox/sessions")),
+            [format!("{}.conf", parent.id)],
+            "so is its carried policy, and only that"
+        );
+        assert_eq!(std::fs::read_to_string(fx.conf(&parent.id)).unwrap(), fx.valid());
+    }
+
+    /// A step of the carry that fails after the rename (the sessions dir's
+    /// fsync, injected on this thread: the transition runs on the test's
+    /// current-thread runtime) fails the compaction and leaves no successor
+    /// journal and no successor policy; so does a failed stat before it.
+    #[tokio::test]
+    #[serial(synaps_base_dir)]
+    async fn linked_compaction_a_carry_failing_after_the_rename_leaves_nothing() {
+        use crate::sandbox::carry::{inject, Fault};
+        struct Armed;
+        impl Drop for Armed {
+            fn drop(&mut self) {
+                inject(None);
+            }
+        }
+        for (fault, says) in [(Fault::DirSync, "; the copy was removed"), (Fault::TempStat, "cannot stat the copy")] {
+            let fx = fx();
+            let parent = seeded_parent().await;
+            std::fs::write(fx.conf(&parent.id), fx.valid()).unwrap();
+            inject(Some(fault));
+            let armed = Armed;
+            let result = compact(&parent, CompactionPolicy::LinkedSuccessor).await;
+            drop(armed);
+            let err = result.expect_err("the carry fails").to_string();
+            assert!(err.contains("sandbox policy could not be carried to the new session id: "), "{fault:?}: {err}");
+            assert!(err.contains(says), "{fault:?}: {err}");
+            assert_eq!(names(&fx.base.join("sessions")), [format!("{}.json", parent.id)], "{fault:?}: no successor journal");
+            assert_eq!(
+                names(&fx.base.join("sandbox/sessions")),
+                [format!("{}.conf", parent.id)],
+                "{fault:?}: no successor policy, no temp file"
+            );
+            assert!(Session::load(&parent.id).expect("parent").compacted_into.is_none(), "{fault:?}");
+        }
+    }
+
+    /// The compaction error names the bad line of an invalid predecessor
+    /// policy, but never quotes it.
+    #[tokio::test]
+    #[serial(synaps_base_dir)]
+    async fn linked_compaction_error_never_quotes_the_policy_text() {
+        for text in ["mode = enforce\nSENTINEL-c4b1 without an equals sign\n", "mode = SENTINEL-c4b1\n"] {
+            let fx = fx();
+            let parent = seeded_parent().await;
+            std::fs::write(fx.conf(&parent.id), text).unwrap();
+            let err = compact(&parent, CompactionPolicy::LinkedSuccessor).await.expect_err("the carry fails").to_string();
+            assert!(err.contains("the predecessor's policy is invalid: "), "{err}");
+            assert!(err.contains(": invalid line (`synaps sandbox check "), "{err}");
+            assert!(!err.contains("SENTINEL"), "{err}");
+            let (_, report) = crate::sandbox::policy::check_report(
+                &fx.conf(&parent.id),
+                &crate::sandbox::policy::PolicyEnv::from_process(),
+                Ok(7),
+            );
+            assert!(report.contains("SENTINEL"), "the validator gives the full reason: {report}");
+        }
+    }
+
+    #[cfg(feature = "command-exec")]
+    #[tokio::test]
+    #[serial(synaps_base_dir)]
+    async fn compaction_local_successor_first_spawn_runs_under_the_carried_policy() {
+        use crate::sandbox::landlock::{abi_version, MIN_ABI};
+        use crate::tools::Tool;
+        if std::env::var("SYNAPS_TEST_LANDLOCK").as_deref() != Ok("1") {
+            return;
+        }
+        match abi_version() {
+            Ok(abi) if abi >= MIN_ABI => {}
+            other => panic!("SYNAPS_TEST_LANDLOCK=1 but Landlock is unusable here: {other:?}"),
+        }
+        let fx = fx();
+        let parent = seeded_parent().await;
+        std::fs::write(fx.conf(&parent.id), fx.valid()).unwrap();
+        let applied = compact(&parent, CompactionPolicy::LinkedSuccessor).await.expect("transition");
+        // The successor's first spawn, through its binding, as a turn makes it.
+        let run = |command: String| {
+            let mut ctx = crate::tools::test_helpers::create_tool_context();
+            ctx.capabilities.sandbox = crate::sandbox::SandboxBinding::for_session(Some(&applied.session.id));
+            async move { crate::tools::BashTool.execute(json!({"command": command, "timeout": 30}), ctx).await }
+        };
+        let inside = fx.root.join("lane/ok");
+        let out = run(format!("echo a > {0} && cat {0}", inside.display())).await.expect("a write inside works");
+        assert_eq!(out.trim(), "a");
+        let outside = fx.root.join("other/x");
+        let err = run(format!("export LC_ALL=C; echo b > {}", outside.display())).await.expect_err("refused");
+        assert!(err.to_string().contains("Permission denied"), "{err}");
+        assert!(!outside.exists(), "nothing was written outside the carried write set");
     }
 }

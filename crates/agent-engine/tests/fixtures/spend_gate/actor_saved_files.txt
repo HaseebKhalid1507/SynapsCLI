@@ -1,0 +1,8 @@
+=== <session>.json
+{"id":"<session>","title":"hello","model":"claude-sonnet-4-6","thinking_level":"medium","system_prompt":null,"created_at":"<ts>","updated_at":"<ts>","total_input_tokens":10,"total_output_tokens":1,"session_cost":0.000045,"message_count":2,"api_messages":[{"content":"hello","role":"user"},{"content":[{"text":"hi","type":"text"}],"role":"assistant"}],"_turn_ids":[[0,"<uuid>"]],"_message_times":[[0,"<ts>"],[1,"<ts>"]]}
+=== <session>.lock
+<pid>
+daemon
+=== index.jsonl
+{"schema_version":1,"session_id":"<session>","event":"start","timestamp":"<ts>","cwd":"<CWD>","model":"claude-sonnet-4-6"}
+{"schema_version":1,"session_id":"<session>","event":"end","timestamp":"<ts>","turns":2}

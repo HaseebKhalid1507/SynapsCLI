@@ -10,8 +10,9 @@ pub mod pricing;
 // cleanly as `agent_core::{StreamEvent, LlmEvent, ...}` without digging
 // into the internal module path.
 pub use core::stream_types::{
-    next_turn_correlation_id, AgentEvent, BudgetDimension, LlmEvent, SessionEvent, SharedMessage,
-    StreamEvent, TurnError, TurnOutcome,
+    next_turn_correlation_id, AgentEvent, BudgetDimension, ClientToolStamp, LiabilityState, LlmEvent,
+    SessionEvent, SharedMessage, StreamEvent, TurnError, TurnOutcome, UsageCounts, UsagePurpose,
+    UsageRequest,
 };
 
 // Replicate the root lib.rs aliases so internal `crate::config`,

@@ -154,14 +154,17 @@ pub(crate) fn broker_error_label(msg: &str) -> Option<&str> {
 }
 
 /// Responses-API terminal stream failures are `"{label}{suffix}"` where the
-/// label is a provider display name ("Codex", "xAI") and the suffix is one of
-/// the static templates in `stream.rs`. Match label-independently on the
-/// suffix so every provider label classifies as an API failure.
+/// label is one of the transport's own display names
+/// ([`RESPONSES_PROVIDER_LABELS`](super::stream::RESPONSES_PROVIDER_LABELS):
+/// "Codex", "xAI", "GitHub Copilot", …) and the suffix is one of the static
+/// templates in `stream.rs`. Both halves are matched against explicit
+/// allowlists, so every trusted label (spaced or not) classifies as an API
+/// failure and no other prefix does.
 fn is_responses_terminal_failure_message(msg: &str) -> bool {
     use super::stream::{
         RESPONSES_AUTH_SUFFIX, RESPONSES_CAPACITY_SUFFIX, RESPONSES_CONTEXT_SUFFIX,
         RESPONSES_EMPTY_SUFFIX, RESPONSES_FAILED_SUFFIX, RESPONSES_INCOMPLETE_SUFFIX,
-        RESPONSES_MISSING_TERMINAL_SUFFIX, RESPONSES_QUOTA_SUFFIX,
+        RESPONSES_MISSING_TERMINAL_SUFFIX, RESPONSES_PROVIDER_LABELS, RESPONSES_QUOTA_SUFFIX,
     };
     const SUFFIXES: &[&str] = &[
         RESPONSES_AUTH_SUFFIX,
@@ -175,7 +178,7 @@ fn is_responses_terminal_failure_message(msg: &str) -> bool {
     ];
     SUFFIXES.iter().any(|suffix| {
         msg.strip_suffix(suffix)
-            .is_some_and(|label| !label.is_empty() && !label.contains(char::is_whitespace))
+            .is_some_and(|label| RESPONSES_PROVIDER_LABELS.contains(&label))
     })
 }
 
@@ -378,6 +381,64 @@ mod tests {
                 "Responses terminal must classify as ApiStatus: {err:?}"
             );
             assert!(!err.to_string().starts_with("Config error"));
+        }
+    }
+
+    /// Every terminal template classifies the same under every provider label
+    /// the Responses transport can produce, including the spaced
+    /// "GitHub Copilot" label.
+    #[test]
+    fn responses_terminal_suffixes_classify_alike_under_every_provider_label() {
+        use super::super::stream::{
+            RESPONSES_AUTH_SUFFIX, RESPONSES_CAPACITY_SUFFIX, RESPONSES_CONTEXT_SUFFIX,
+            RESPONSES_EMPTY_SUFFIX, RESPONSES_FAILED_SUFFIX, RESPONSES_INCOMPLETE_SUFFIX,
+            RESPONSES_MISSING_TERMINAL_SUFFIX, RESPONSES_QUOTA_SUFFIX,
+        };
+        for (label, model) in [
+            ("Codex", "openai-codex/gpt-5.5"),
+            ("xAI", "xai-auth/grok-4.5"),
+            ("GitHub Copilot", "github-copilot/gpt-5-mini"),
+            ("Meta Muse", "muse/muse-wonder-1.0"),
+            ("Responses provider", ""),
+        ] {
+            for suffix in [
+                RESPONSES_AUTH_SUFFIX,
+                RESPONSES_QUOTA_SUFFIX,
+                RESPONSES_FAILED_SUFFIX,
+                RESPONSES_CAPACITY_SUFFIX,
+                RESPONSES_CONTEXT_SUFFIX,
+                RESPONSES_INCOMPLETE_SUFFIX,
+                RESPONSES_EMPTY_SUFFIX,
+                RESPONSES_MISSING_TERMINAL_SUFFIX,
+            ] {
+                let msg = format!("{label}{suffix}");
+                let err = provider_error_to_runtime_for(model, msg.clone().into());
+                assert!(
+                    matches!(err, RuntimeError::ApiStatus(ref m) if *m == msg),
+                    "{label}: {err:?}"
+                );
+            }
+        }
+    }
+
+    /// Only labels the transport itself produces are trusted; an arbitrary
+    /// (possibly provider-influenced) prefix is not a Responses terminal.
+    #[test]
+    fn responses_terminal_matcher_trusts_only_known_labels() {
+        use super::super::stream::RESPONSES_CAPACITY_SUFFIX;
+        for label in [
+            "Evil Corp",
+            "github copilot",
+            "Copilot",
+            "x",
+            "GitHub  Copilot",
+        ] {
+            assert!(
+                !is_responses_terminal_failure_message(&format!(
+                    "{label}{RESPONSES_CAPACITY_SUFFIX}"
+                )),
+                "{label}"
+            );
         }
     }
 

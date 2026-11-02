@@ -1,0 +1,4 @@
+Session(MessageHistory([Object {"content": String("What's the capital of France?"), "role": String("user")}, Object {"content": Array [Object {"text": String("Paris."), "type": String("text")}], "role": String("assistant")}, Object {"content": String("And of Japan?"), "role": String("user")}]))
+Session(MessageHistory([Object {"content": String("What's the capital of France?"), "role": String("user")}, Object {"content": Array [Object {"text": String("Paris."), "type": String("text")}], "role": String("assistant")}, Object {"content": String("And of Japan?"), "role": String("user")}]))
+Session(Error(TurnError { message: "local: rate limited (HTTP 429). Wait for the limit to reset, or switch models with /model.", outcome: ProviderFailed { code: "api_status", correlation_id: "turn-<pid>-<n>" } }))
+Session(Done)

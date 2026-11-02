@@ -172,10 +172,23 @@ impl ContextThresholds {
             .unwrap_or_else(|| DEFAULT_TARGET_TOKENS.min(self.pressure_tokens * 2 / 3))
             .clamp(1, self.pressure_tokens.saturating_sub(1).max(1))
     }
+
+    /// Cap of the rolling summary a successor carries, counted inside the
+    /// target: the explicit `summary_tokens` (validated below the target),
+    /// otherwise min(15,000, 15% of the target). Zero disables the summary.
+    pub fn summary_tokens(&self, config: &ContextManagementConfig) -> u64 {
+        let target = self.target_tokens(config);
+        config
+            .summary_tokens
+            .unwrap_or_else(|| DEFAULT_SUMMARY_TOKENS.min(target * 15 / 100))
+            .min(target.saturating_sub(1))
+    }
 }
 
 /// Default successor footprint: a rolled-over context starts at about 100k.
 pub const DEFAULT_TARGET_TOKENS: u64 = 100_000;
+/// Default rolling-summary cap, reached at the default 100k target.
+pub const DEFAULT_SUMMARY_TOKENS: u64 = 15_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContextBand {
@@ -436,6 +449,26 @@ mod tests {
             let t = ContextThresholds::resolve(&config, window).unwrap();
             assert_eq!(t.target_tokens(&config), target, "window {window}");
             assert!(t.target_tokens(&config) < t.pressure_tokens);
+            assert_eq!(
+                t.summary_tokens(&config),
+                (target * 15 / 100).min(15_000),
+                "summary scales with the target, window {window}"
+            );
+        }
+        for (summary, ok) in [
+            (Some(99_999), true),
+            (Some(100_000), false),
+            (Some(0), true),
+        ] {
+            let c = ContextManagementConfig {
+                summary_tokens: summary,
+                ..config
+            };
+            assert_eq!(
+                ContextThresholds::resolve(&c, 1_000_000).is_ok(),
+                ok,
+                "summary {summary:?} against the auto 100k target"
+            );
         }
         let explicit = ContextManagementConfig {
             target_tokens: Some(120_000),
@@ -443,6 +476,13 @@ mod tests {
         };
         let t = ContextThresholds::resolve(&explicit, 1_000_000).unwrap();
         assert_eq!(t.target_tokens(&explicit), 120_000);
+        assert_eq!(t.summary_tokens(&config), 15_000, "auto at the 100k target");
+        assert_eq!(t.summary_tokens(&explicit), 15_000);
+        let disabled = ContextManagementConfig {
+            summary_tokens: Some(0),
+            ..config
+        };
+        assert_eq!(t.summary_tokens(&disabled), 0);
         for bad in [Some(0), Some(250_000), Some(300_000)] {
             let invalid = ContextManagementConfig {
                 target_tokens: bad,

@@ -8,6 +8,8 @@ use super::types::{
     ChatContentPart, ChatMessage, OaiEvent, ProviderConfig, StreamOptions, ToolCall,
 };
 use super::wire::StreamDecoder;
+use crate::runtime::child_spend::{AttemptObserver, AttemptSpend, ReportedUsage, RouteSpend};
+use crate::runtime::net_retry::{warn_transport, TransportDiag};
 use crate::runtime::trace::openai as tr;
 use crate::runtime::types::StreamEvent;
 use futures::StreamExt;
@@ -33,12 +35,83 @@ fn capture_oai_trace_signals(
         } = ev
         {
             *usage = Some(tr::provider_usage(
-                u64::from(*prompt_tokens),
-                u64::from(*completion_tokens),
+                u64::from(prompt_tokens.unwrap_or(0)),
+                u64::from(completion_tokens.unwrap_or(0)),
                 u64::from(*cached_tokens),
             ));
         }
     }
+}
+
+/// The last Chat Completions usage report, in Anthropic field names, with
+/// only the counters the provider reported (`prompt_tokens` includes the
+/// cached slice, which is split out as a cache read).
+fn record_reported_usage(events: &[OaiEvent], usage: &mut Option<Value>) {
+    for ev in events {
+        if let OaiEvent::Usage {
+            prompt_tokens,
+            completion_tokens,
+            cached_tokens,
+        } = ev
+        {
+            let mut report = serde_json::Map::new();
+            if let Some(prompt) = prompt_tokens {
+                let cached = (*cached_tokens).min(*prompt);
+                report.insert("input_tokens".into(), json!(prompt - cached));
+                report.insert("cache_read_input_tokens".into(), json!(cached));
+            }
+            if let Some(completion) = completion_tokens {
+                report.insert("output_tokens".into(), json!(completion));
+            }
+            *usage = Some(Value::Object(report));
+        }
+    }
+}
+
+/// Show each Chat Completions usage report to the attempt's spend guard,
+/// with the same split as [`record_reported_usage`]: the cached slice of a
+/// reported prompt is a cache read, and an unreported counter stays unstated.
+fn observe_reported_spend(events: &[OaiEvent], spend: &AttemptSpend) {
+    for ev in events {
+        if let OaiEvent::Usage {
+            prompt_tokens,
+            completion_tokens,
+            cached_tokens,
+        } = ev
+        {
+            let (input, cache_read) = match prompt_tokens {
+                Some(prompt) => {
+                    let cached = (*cached_tokens).min(*prompt);
+                    (Some(u64::from(prompt - cached)), Some(u64::from(cached)))
+                }
+                None => (None, None),
+            };
+            spend.observe(&ReportedUsage {
+                input,
+                output: completion_tokens.map(u64::from),
+                cache_read,
+                ..ReportedUsage::default()
+            });
+        }
+    }
+}
+
+/// A ledgered Chat Completions attempt's spend (§6) from its last report:
+/// the reports are running totals, so the last states the request's usage.
+/// Only a report with both counts states it; `None` keeps the attempt open.
+fn reported_spend(usage: Option<&Value>) -> Option<agent_core::UsageCounts> {
+    let usage = usage?;
+    Some(agent_core::UsageCounts {
+        input_tokens: usage.get("input_tokens")?.as_u64()?,
+        output_tokens: usage.get("output_tokens")?.as_u64()?,
+        cache_read_input_tokens: usage
+            .get("cache_read_input_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        cache_creation_input_tokens: 0,
+        cache_creation_5m: None,
+        cache_creation_1h: None,
+    })
 }
 
 /// Persistent retry posture for the Codex transport, mirroring the Anthropic
@@ -61,6 +134,60 @@ const RETRY_BACKOFF_EXP_CAP: u32 = 6;
 /// inject exact budgets.
 pub(crate) fn codex_retry_budget(configured_retries: u32) -> u32 {
     configured_retries.max(CODEX_PERSISTENT_RETRIES)
+}
+
+/// True for the official OpenAI API host (including regional hosts such as
+/// `eu.api.openai.com`) and Azure OpenAI resource hosts, over HTTPS.
+fn official_openai_host(base_url: &str) -> bool {
+    reqwest::Url::parse(base_url).is_ok_and(|url| {
+        url.scheme() == "https"
+            && url.host_str().is_some_and(|host| {
+                host == "api.openai.com"
+                    || host.ends_with(".api.openai.com")
+                    || host.ends_with(".openai.azure.com")
+            })
+    })
+}
+
+/// The output-limit field a Chat Completions endpoint documents for
+/// `model`, or `None` when no ceiling is known to be accepted and enforced
+/// there.
+///
+/// - The official OpenAI and Azure OpenAI hosts (whatever the provider key,
+///   so also an endpoint override): `max_completion_tokens` for every
+///   model; it replaces the deprecated `max_tokens`, is required by
+///   reasoning models, bounds their reasoning tokens, and is accepted by the
+///   others. No model-name guessing.
+/// - Groq and Cerebras document `max_completion_tokens`.
+/// - GitHub Copilot: from the curated catalog's vendor — OpenAI-family
+///   models take `max_completion_tokens`, the others `max_tokens`.
+/// - Providers whose Chat Completions reference documents `max_tokens`, and
+///   the user's own local endpoint.
+/// - Any other provider: `None`.
+pub(crate) fn chat_completion_limit_field(
+    provider: &str,
+    base_url: &str,
+    model: &str,
+) -> Option<&'static str> {
+    if official_openai_host(base_url) {
+        return Some("max_completion_tokens");
+    }
+    match provider {
+        "groq" | "cerebras" => Some("max_completion_tokens"),
+        "github-copilot" => {
+            crate::runtime::openai::catalog::copilot_model(model).map(|descriptor| match descriptor
+                .vendor
+            {
+                "OpenAI" | "Azure OpenAI" => "max_completion_tokens",
+                _ => "max_tokens",
+            })
+        }
+        "local" | "openrouter" | "google" | "kimi" | "kimi-code" | "together" | "fireworks"
+        | "deepinfra" | "nvidia" | "codestral" | "perplexity" | "sambanova" | "huggingface" => {
+            Some("max_tokens")
+        }
+        _ => None,
+    }
 }
 
 /// Backoff for retry attempt *n* (1-based): 1s·2^(n−1), capped at 64s.
@@ -131,6 +258,14 @@ struct SendTarget<'a> {
 /// provider text) and the per-attempt clock restarts right before each
 /// re-send. Terminal failures emit their final record here; on success the
 /// caller finishes the attempt after consuming the stream.
+///
+/// Ledger (§6): with `ledger` set, every send is its own attempt in the
+/// run's request ledger, reserved right before it. The client follows
+/// redirects, so no failure proves a send reached no provider: an error
+/// status, a transport failure (a refused connection included) or a cancel
+/// leaves that attempt an open liability. The answered send's attempt is
+/// handed to the caller in `booked`, to settle once its stream ends.
+#[allow(clippy::too_many_arguments)]
 async fn send_with_retries(
     target: SendTarget<'_>,
     build: impl Fn() -> reqwest::RequestBuilder,
@@ -138,6 +273,8 @@ async fn send_with_retries(
     max_retries: u32,
     retries_used: &mut u32,
     trace_attempt: &mut tr::StreamAttempt,
+    ledger: Option<&SendLedger<'_>>,
+    booked: &mut Option<crate::tools::request_ledger::AttemptReport>,
 ) -> Result<reqwest::Response, Box<dyn std::error::Error + Send + Sync>> {
     use super::account_routing::{
         classify_codex_429, read_body_for_classification, Codex429, CodexQuotaExhausted,
@@ -152,6 +289,27 @@ async fn send_with_retries(
         if cancel.is_cancelled() {
             return Err("request canceled".into());
         }
+        // §6: booked before it is sent; a run at its request cap sends
+        // nothing more (not dispatched only when no earlier send of this
+        // request was made). A cancel during the send drops it open.
+        let mut report = match ledger {
+            Some(ledger) => Some(
+                crate::tools::request_ledger::AttemptReport::reserve(
+                    ledger.ledger,
+                    ledger.estimate_micro_usd,
+                    crate::tools::request_ledger::UsageReports::Cumulative,
+                    ledger.tx,
+                )
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                    if *retries_used == 0 {
+                        super::NotDispatched::boxed(&e)
+                    } else {
+                        e.to_string().into()
+                    }
+                })?,
+            ),
+            None => None,
+        };
         let sent = tokio::select! {
             biased;
             _ = cancel.cancelled() => { trace_attempt.finish_canceled(None, None); return Err("request canceled".into()); }
@@ -160,9 +318,14 @@ async fn send_with_retries(
         match sent {
             Ok(resp) if resp.status().is_success() => {
                 trace_attempt.mark_headers();
+                *booked = report;
                 return Ok(resp);
             }
             Ok(resp) => {
+                // §6: an error status is no proof of zero spend.
+                if let Some(report) = report.take() {
+                    report.finish();
+                }
                 // A complete HTTP response was observed even when its status
                 // is non-success. Preserve that timing for retried and
                 // terminal failure records just as the success branch does.
@@ -269,12 +432,24 @@ async fn send_with_retries(
                 trace_attempt.restart_clock();
             }
             Err(e) => {
+                // §6: nor is a transport failure on this redirect-following
+                // client.
+                if let Some(report) = report.take() {
+                    report.finish();
+                }
                 let localhost_refusal = e.is_connect() && url.contains("localhost");
                 let transient = e.is_timeout() || e.is_connect() || e.is_request();
+                // The cause goes in the fields (URL-free, scrubbed, capped),
+                // never `error_chain_string(&e)`: reqwest's top level
+                // carries ` for url (…)`.
+                let diag = TransportDiag::from_reqwest(&e, "transport");
                 if localhost_refusal || !transient || *retries_used >= max_retries {
-                    tracing::warn!(
-                        "{label} request failed (no retry): {}",
-                        crate::core::error::error_chain_string(&e)
+                    warn_transport!(
+                        diag,
+                        (*retries_used).saturating_add(1),
+                        max_retries,
+                        "{} request failed (no retry)",
+                        label
                     );
                     trace_attempt.finish_failed("transport_error", None, None);
                     return Err(e.into());
@@ -292,9 +467,15 @@ async fn send_with_retries(
                     None,
                     "transport_error",
                 );
-                tracing::warn!(
-                    "{label} transport retry {retries_used}/{max_retries} after {delay:?}: {}",
-                    crate::core::error::error_chain_string(&e)
+                warn_transport!(
+                    diag,
+                    *retries_used,
+                    max_retries,
+                    "{} transport retry {}/{} after {:?}",
+                    label,
+                    *retries_used,
+                    max_retries,
+                    delay
                 );
                 tokio::select! {
                     _ = tokio::time::sleep(delay) => {}
@@ -310,11 +491,42 @@ async fn send_with_retries(
     }
 }
 
+/// §6: the run's request ledger a direct-HTTP route books each send in,
+/// with the request's liability estimate and the stream its attempts
+/// report on.
+struct SendLedger<'a> {
+    ledger: &'a crate::tools::RequestLedgerHandle,
+    estimate_micro_usd: u64,
+    tx: &'a mpsc::UnboundedSender<StreamEvent>,
+}
+
+/// The output allowance a ledgered request that sets no `max_tokens` is
+/// estimated at (B32): the host's per-request cap
+/// ([`HelperMethods::max_tokens_for_request`](crate::runtime::helpers::HelperMethods::max_tokens_for_request)),
+/// the value the pre-request context assessment reserves, on the runtime's
+/// effective window when the routed call carries it (the
+/// `terminal_diagnostics::CONTEXT` scoped from `ApiOptions` around every
+/// routed call), else the model's native window.
+fn ledger_output_allowance(model: &str) -> u64 {
+    let window = super::terminal_diagnostics::CONTEXT
+        .try_with(|context| context.window)
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| crate::models::context_window_for_model(model));
+    crate::runtime::helpers::HelperMethods::max_tokens_for_request(model, window)
+}
+
 /// Run a single streaming request against an OpenAI-compatible endpoint.
 ///
 /// Returns the final assistant response as an Anthropic-shaped content Value
 /// (`{"content": [..text.., ..tool_use..]}`) so the outer agent loop can keep
 /// using the same handling as the native Anthropic path.
+///
+/// Each opened stream is one paid attempt with its own spend guard: it
+/// keeps the attempt's last usage report and books it once, when the
+/// attempt ends (before a stream retry waits, or before the reply returns;
+/// its drop covers a cancel, an error return and a dropped future). A
+/// failed request opens no stream and has no usage to book.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn call_oai_stream_inner(
     cfg: &ProviderConfig,
@@ -332,6 +544,8 @@ pub(crate) async fn call_oai_stream_inner(
     exact_wire_bytes: bool,
     suppress_stream_deltas: bool,
     max_retries: u32,
+    spend: RouteSpend<'_>,
+    request_ledger: Option<&crate::tools::RequestLedgerHandle>,
 ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
     let (oai_tools, name_map) = translate::tools_to_oai(tools_schema);
     let oai_messages = translate::messages_to_oai(messages, system_prompt, &name_map);
@@ -352,7 +566,10 @@ pub(crate) async fn call_oai_stream_inner(
 
     let mut body = serde_json::Map::new();
     body.insert("model".to_string(), json!(cfg.model.clone()));
-    body.insert("messages".to_string(), serde_json::to_value(oai_messages)?);
+    body.insert(
+        "messages".to_string(),
+        serde_json::to_value(oai_messages).map_err(super::NotDispatched::boxed)?,
+    );
     body.insert("stream".to_string(), json!(true));
     // ZDR: OpenAI's Zero Data Retention requires `store:false` on the wire.
     // Chat Completions already defaults to false, but we assert it explicitly so the
@@ -366,17 +583,28 @@ pub(crate) async fn call_oai_stream_inner(
     if let Some(stream_options) = stream_options {
         body.insert(
             "stream_options".to_string(),
-            serde_json::to_value(stream_options)?,
+            serde_json::to_value(stream_options).map_err(super::NotDispatched::boxed)?,
         );
     }
     if let Some(max_tokens) = max_tokens {
-        body.insert("max_tokens".to_string(), json!(max_tokens));
+        body.insert(
+            // A single-attempt bounded request never reaches a route without
+            // a documented field (`dispatch_route` refuses it); otherwise the
+            // conventional field is sent.
+            chat_completion_limit_field(&cfg.provider, &cfg.base_url, &cfg.model)
+                .unwrap_or("max_tokens")
+                .to_string(),
+            json!(max_tokens),
+        );
     }
     if let Some(temperature) = temperature {
         body.insert("temperature".to_string(), json!(temperature));
     }
     if let Some(tools) = tools_opt {
-        body.insert("tools".to_string(), serde_json::to_value(tools)?);
+        body.insert(
+            "tools".to_string(),
+            serde_json::to_value(tools).map_err(super::NotDispatched::boxed)?,
+        );
     }
     super::reasoning::apply_openai_reasoning_params(
         &mut body,
@@ -399,7 +627,8 @@ pub(crate) async fn call_oai_stream_inner(
         "/chat/completions",
         body,
         true,
-    )?;
+    )
+    .map_err(super::NotDispatched::boxed)?;
     // ═══ TRACE (Task 10A): one record per actual attempt ═══════════════════
     // A remote broker re-serializes the JSON out of process: honest kind
     // `CloudProxy`, no wire-byte claim. Rule documented in `trace::emit`.
@@ -429,12 +658,44 @@ pub(crate) async fn call_oai_stream_inner(
         tr::capture_request_content(trace, tracer.request_id(), body_bytes.as_ref(), messages);
     }
     let mut attempt = tr::StreamAttempt::new(tracer);
+    // §6: a ledgered request's liability estimate, the same for every
+    // attempt: its bytes and output allowance do not change (the host's
+    // allowance for the model when the request sets none).
+    let ledger_estimate = request_ledger.map(|ledger| {
+        crate::tools::request_ledger::request_estimate(
+            ledger.model(),
+            &body_bytes,
+            max_tokens.map_or_else(|| ledger_output_allowance(ledger.model()), u64::from),
+        )
+    });
 
     let mut stream_retry = 0u32;
     loop {
         if cancel.is_cancelled() {
             return Err("request canceled".into());
         }
+        // §6: a ledgered attempt is booked before it is sent; a run at its
+        // request cap sends nothing more (not dispatched only when no
+        // earlier attempt was sent).
+        let mut ledgered = match (request_ledger, ledger_estimate) {
+            (Some(ledger), Some(estimate)) => Some(
+                crate::tools::request_ledger::AttemptReport::reserve(
+                    ledger,
+                    estimate,
+                    crate::tools::request_ledger::UsageReports::Cumulative,
+                    tx,
+                )
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                    if stream_retry == 0 {
+                        super::NotDispatched::boxed(&e)
+                    } else {
+                        e.to_string().into()
+                    }
+                })?,
+            ),
+            _ => None,
+        };
+        let usage_request = ledgered.as_ref().map(|report| report.request().clone());
         // The broker owns the API key and executes/signs the request; this path
         // never resolves or attaches a credential.
         let stream = crate::runtime::api::await_or_cancel(
@@ -442,30 +703,40 @@ pub(crate) async fn call_oai_stream_inner(
             broker.proxy_stream(proxy_request.clone()),
         )
         .await
-        .map_err(|_| "request canceled")?
-        // Privacy (spec §5.1): a broker proxy error may carry an upstream
-        // response-body snippet; redact it to status-only before surfacing.
-        .map_err(|e| {
-            format!(
-                "openai request failed: {}",
-                super::net::redact_provider_proxy_error(&e.to_string())
-            )
-        });
+        .map_err(|_| "request canceled")?;
         let mut stream = match stream {
             Ok(stream) => {
                 attempt.mark_headers();
                 stream
             }
-            Err(msg) => {
+            Err(error) => {
+                // Privacy (spec §5.1): a broker proxy error may carry an
+                // upstream response-body snippet; redact it to status-only
+                // before surfacing.
+                let msg = format!(
+                    "openai request failed: {}",
+                    super::net::redact_provider_proxy_error(&error.to_string())
+                );
                 // Status parsed from the redacted static-prefix message only;
                 // codes are `http_<status>` or the static `broker_error`.
                 let status = tr::broker_error_status(&msg);
                 let code =
                     status.map_or_else(|| "broker_error".to_string(), |s| format!("http_{s}"));
                 attempt.finish_failed(&code, status, None);
-                return Err(msg.into());
+                // §6: only the broker's typed pre-send failure proves the
+                // attempt reached no provider; any other failure, an error
+                // status included, leaves it open.
+                if let Some(report) = ledgered.take() {
+                    if error.request_not_sent() {
+                        report.release();
+                    } else {
+                        report.finish();
+                    }
+                }
+                return Err(super::broker_failure(&error, stream_retry == 0, msg));
             }
         };
+        let attempt_spend = spend.attempt();
 
         if !suppress_stream_deltas {
             let _ = tx.send(StreamEvent::Llm(crate::LlmEvent::ResponseStart));
@@ -478,6 +749,7 @@ pub(crate) async fn call_oai_stream_inner(
         let mut buf = bytes::BytesMut::with_capacity(8 * 1024);
         let mut sink: Vec<OaiEvent> = Vec::with_capacity(4);
         let mut trace_usage: Option<crate::runtime::trace::UsageMeta> = None;
+        let mut reported_usage: Option<Value> = None;
 
         while let Some(chunk) = tokio::select! {
             biased;
@@ -512,6 +784,8 @@ pub(crate) async fn call_oai_stream_inner(
                 decoder.push_line(line, &mut sink);
                 saw_done |= sink.iter().any(|e| matches!(e, OaiEvent::Done));
                 capture_oai_trace_signals(&sink, &mut attempt, &mut trace_usage);
+                record_reported_usage(&sink, &mut reported_usage);
+                observe_reported_spend(&sink, &attempt_spend);
                 handle_events(
                     &sink,
                     tx,
@@ -519,6 +793,7 @@ pub(crate) async fn call_oai_stream_inner(
                     &mut tool_use_blocks,
                     &name_map,
                     suppress_stream_deltas,
+                    usage_request.as_ref(),
                 );
             }
         }
@@ -530,6 +805,8 @@ pub(crate) async fn call_oai_stream_inner(
             decoder.push_line(line, &mut sink);
             saw_done |= sink.iter().any(|e| matches!(e, OaiEvent::Done));
             capture_oai_trace_signals(&sink, &mut attempt, &mut trace_usage);
+            record_reported_usage(&sink, &mut reported_usage);
+            observe_reported_spend(&sink, &attempt_spend);
             handle_events(
                 &sink,
                 tx,
@@ -537,9 +814,18 @@ pub(crate) async fn call_oai_stream_inner(
                 &mut tool_use_blocks,
                 &name_map,
                 suppress_stream_deltas,
+                usage_request.as_ref(),
             );
         }
         if interrupted || (!saw_done && decoder.finish_reason.is_none()) {
+            // The cut attempt is over: book what it reported before the
+            // retry waits and is sent.
+            attempt_spend.settle();
+            // §6: a stream cut off before it completed: whatever it
+            // reported is no final count; the attempt stays open.
+            if let Some(report) = ledgered.take() {
+                report.finish();
+            }
             if stream_retry >= max_retries {
                 attempt.finish_failed("stream_error", None, None);
                 return Err(STREAM_INTERRUPTED.into());
@@ -569,6 +855,8 @@ pub(crate) async fn call_oai_stream_inner(
         sink.clear();
         decoder.finish(&mut sink);
         capture_oai_trace_signals(&sink, &mut attempt, &mut trace_usage);
+        record_reported_usage(&sink, &mut reported_usage);
+        observe_reported_spend(&sink, &attempt_spend);
         handle_events(
             &sink,
             tx,
@@ -576,7 +864,18 @@ pub(crate) async fn call_oai_stream_inner(
             &mut tool_use_blocks,
             &name_map,
             suppress_stream_deltas,
+            usage_request.as_ref(),
         );
+        // §6: the attempt completed: measured by its last report when that
+        // states both counts (the reports are running totals), else open.
+        if let Some(mut report) = ledgered.take() {
+            if let Some(usage) = reported_spend(reported_usage.as_ref()) {
+                report.observe(&usage);
+            }
+            report.finish();
+        }
+
+        attempt_spend.settle();
 
         // Normalized stop reason: only when a finish_reason was actually
         // observed on the wire — never inferred.
@@ -594,13 +893,18 @@ pub(crate) async fn call_oai_stream_inner(
         }
         content.extend(tool_use_blocks);
 
-        return Ok(json!({
+        let mut reply = json!({
             "role": "assistant",
             "content": content,
-        }));
+        });
+        if let Some(usage) = reported_usage {
+            reply["usage"] = usage;
+        }
+        return Ok(reply);
     }
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn call_codex_stream_inner(
     cfg: &ProviderConfig,
@@ -617,12 +921,56 @@ pub(crate) async fn call_codex_stream_inner(
     cancel: &tokio_util::sync::CancellationToken,
     max_retries: u32,
     trace: &crate::runtime::trace::TraceContext,
+    spend: RouteSpend<'_>,
+    request_ledger: Option<&crate::tools::RequestLedgerHandle>,
+) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+    call_codex_stream_inner_for_event(
+        cfg,
+        client,
+        broker,
+        tools_schema,
+        system_prompt,
+        messages,
+        tx,
+        temperature,
+        max_tokens,
+        reasoning_level,
+        codex_request_role,
+        cancel,
+        max_retries,
+        trace,
+        spend,
+        false,
+        request_ledger,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn call_codex_stream_inner_for_event(
+    cfg: &ProviderConfig,
+    client: &reqwest::Client,
+    broker: &std::sync::Arc<dyn crate::auth::CredentialBroker>,
+    tools_schema: &[Value],
+    system_prompt: &Option<String>,
+    messages: &[crate::SharedMessage],
+    tx: &mpsc::UnboundedSender<StreamEvent>,
+    temperature: Option<f32>,
+    max_tokens: Option<u32>,
+    reasoning_level: agent_core::reasoning::ReasoningLevel,
+    codex_request_role: crate::runtime::openai::catalog::CodexRequestRole,
+    cancel: &tokio_util::sync::CancellationToken,
+    max_retries: u32,
+    trace: &crate::runtime::trace::TraceContext,
+    spend: RouteSpend<'_>,
+    event_triggered: bool,
+    request_ledger: Option<&crate::tools::RequestLedgerHandle>,
 ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
     // Account selection crosses the broker boundary through the router seam:
     // the broker vends one (credential, access token) pair, never a refresh
     // token, and this path never opens auth.json.
     let router = super::account_routing::BrokerCodexRouter::new(std::sync::Arc::clone(broker));
-    call_codex_stream_with_router(
+    call_codex_stream_with_router_for_event(
         cfg,
         client,
         &router,
@@ -637,6 +985,9 @@ pub(crate) async fn call_codex_stream_inner(
         cancel,
         max_retries,
         trace,
+        spend,
+        event_triggered,
+        request_ledger,
     )
     .await
 }
@@ -736,6 +1087,7 @@ async fn try_codex_account_failover(
     }
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn call_codex_stream_with_router(
     cfg: &ProviderConfig,
@@ -752,6 +1104,50 @@ pub(crate) async fn call_codex_stream_with_router(
     cancel: &tokio_util::sync::CancellationToken,
     max_retries: u32,
     trace: &crate::runtime::trace::TraceContext,
+    spend: RouteSpend<'_>,
+    request_ledger: Option<&crate::tools::RequestLedgerHandle>,
+) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+    call_codex_stream_with_router_for_event(
+        cfg,
+        client,
+        router,
+        tools_schema,
+        system_prompt,
+        messages,
+        tx,
+        temperature,
+        max_tokens,
+        reasoning_level,
+        codex_request_role,
+        cancel,
+        max_retries,
+        trace,
+        spend,
+        false,
+        request_ledger,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn call_codex_stream_with_router_for_event(
+    cfg: &ProviderConfig,
+    client: &reqwest::Client,
+    router: &dyn super::account_routing::CodexAccountRouter,
+    tools_schema: &[Value],
+    system_prompt: &Option<String>,
+    messages: &[crate::SharedMessage],
+    tx: &mpsc::UnboundedSender<StreamEvent>,
+    temperature: Option<f32>,
+    max_tokens: Option<u32>,
+    reasoning_level: agent_core::reasoning::ReasoningLevel,
+    codex_request_role: crate::runtime::openai::catalog::CodexRequestRole,
+    cancel: &tokio_util::sync::CancellationToken,
+    max_retries: u32,
+    trace: &crate::runtime::trace::TraceContext,
+    spend: RouteSpend<'_>,
+    event_triggered: bool,
+    request_ledger: Option<&crate::tools::RequestLedgerHandle>,
 ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
     // Build the exact provider-qualified plan before any credential or network
     // access. Logical Ultra is lowered here, never in the generic level enum.
@@ -897,6 +1293,18 @@ pub(crate) async fn call_codex_stream_with_router(
     // the one-shot gate): only then may a web_search resend reopen it.
     let traced = tracer.is_some();
     let mut attempt = tr::StreamAttempt::new(tracer);
+    // §6: a ledgered request's liability estimate, the same for every send:
+    // its bytes and output allowance do not change (the host's allowance
+    // for the model when the request sets none).
+    let send_ledger = request_ledger.map(|ledger| SendLedger {
+        ledger,
+        estimate_micro_usd: crate::tools::request_ledger::request_estimate(
+            ledger.model(),
+            &body_bytes,
+            max_tokens.map_or_else(|| ledger_output_allowance(ledger.model()), u64::from),
+        ),
+        tx,
+    });
     let mut stream_retry = 0u32;
     // Account switches spent on this logical request. Bounded by
     // `MAX_CODEX_ACCOUNT_FAILOVERS`; independent of the transport retry
@@ -907,6 +1315,12 @@ pub(crate) async fn call_codex_stream_with_router(
         if cancel.is_cancelled() {
             return Err("request canceled".into());
         }
+        let diagnostic_request = super::terminal_diagnostics::Request::new(
+            body_bytes.len(),
+            &qualified_model,
+            plan.wire_effort_label(),
+        );
+        let mut ledgered = None;
         let sent = send_with_retries(
             SendTarget {
                 label: "codex",
@@ -935,6 +1349,8 @@ pub(crate) async fn call_codex_stream_with_router(
             max_retries,
             &mut stream_retry,
             &mut attempt,
+            send_ledger.as_ref(),
+            &mut ledgered,
         )
         .await;
         let resp = match sent {
@@ -985,6 +1401,14 @@ pub(crate) async fn call_codex_stream_with_router(
                     }
                 }
                 Err(other) => {
+                    if let Some(rejected) =
+                        other.downcast_ref::<super::codex_wire::CodexRequestRejected>()
+                    {
+                        super::terminal_diagnostics::Observation::http_rejected(
+                            rejected.detail.code.as_deref().or(rejected.detail.kind.as_deref()),
+                        )
+                        .emit(&diagnostic_request, &pinned.credential.to_string(), false);
+                    }
                     // A pre-inference 400 pointing at hosted web_search: drop
                     // it, re-serialize, and resend once under a fresh trace
                     // record (one-shot `/trace next` gates are reopened for
@@ -1019,14 +1443,26 @@ pub(crate) async fn call_codex_stream_with_router(
                 }
             },
         };
+        // §6: the answered send's attempt reports its usage as its own; a
+        // cancel or an error before it settles leaves it open.
+        let usage_request = ledgered.as_ref().map(|report| report.request().clone());
         // Direct HTTP: upstream status and provider request id are observed.
         let http_status = Some(resp.status().as_u16());
         let trace_rid = tr::provider_request_id_from_headers(resp.headers());
 
+        // One paid attempt per answered send (an error answer carries no
+        // body usage): its guard goes with the body into the decoder.
+        let attempt_spend = spend.attempt();
         let _ = tx.send(StreamEvent::Llm(crate::LlmEvent::ResponseStart));
         let mut interrupted = false;
+        let mut transport_error = false;
         let mut accumulated_text = String::new();
-        let mut parser = CodexSseDecoder::default();
+        let mut parser = CodexSseDecoder {
+            spend: attempt_spend.observer(),
+            usage_request,
+            diagnostics: Some(super::terminal_diagnostics::Observation::default()),
+            ..CodexSseDecoder::default()
+        };
         let mut buf = bytes::BytesMut::with_capacity(8 * 1024);
         let mut stream = resp.bytes_stream();
 
@@ -1044,6 +1480,7 @@ pub(crate) async fn call_codex_stream_with_router(
                     chunk
                 }
                 Err(_) => {
+                    transport_error = true;
                     interrupted = !parser.terminal_success && parser.terminal_failure.is_none();
                     break;
                 }
@@ -1063,6 +1500,12 @@ pub(crate) async fn call_codex_stream_with_router(
             parser.push_line(line, tx, &mut accumulated_text);
         }
         if interrupted || (!parser.terminal_success && parser.terminal_failure.is_none()) {
+            // The cut attempt is over: book what it reported first.
+            attempt_spend.settle();
+            // §6: no terminal report: the attempt stays open.
+            if let Some(report) = ledgered.take() {
+                report.finish();
+            }
             if stream_retry >= max_retries {
                 attempt.finish_failed("stream_error", http_status, trace_rid);
                 return Err(format!("Codex{RESPONSES_MISSING_TERMINAL_SUFFIX}").into());
@@ -1084,11 +1527,42 @@ pub(crate) async fn call_codex_stream_with_router(
             continue;
         }
         parser.finish();
+        // The body is consumed: book the attempt before a failover, a retry
+        // or the result.
+        attempt_spend.settle();
         // Trailing-buffer flush and finish() can surface the first (or only)
         // model event — e.g. a payload dispatched by the tail line. Mark it so
         // first_model_event_ms is honest even for tail-only streams.
         if parser.saw_model_event {
             attempt.mark_first_model_event();
+        }
+        // §6: the response reached its terminal event (completed, failed
+        // or incomplete): the attempt is measured by the last terminal
+        // event's usage report when that states both counts (a repeated
+        // report restates the same response's usage), else it stays open:
+        // an empty last report, or a last terminal event without usage,
+        // does not fall back to an earlier one.
+        if let Some(mut report) = ledgered.take() {
+            if let Some(usage) = reported_spend(parser.terminal_usage.as_ref()) {
+                report.observe(&usage);
+            }
+            report.finish();
+        }
+        if let Some(diagnostics) = &parser.diagnostics {
+            diagnostics.emit(
+                &diagnostic_request,
+                &pinned.credential.to_string(),
+                parser.emitted_output || !parser.completed_tools.is_empty(),
+            );
+        }
+        if !transport_error && parser.event_noop(event_triggered) {
+            tracing::debug!(
+                reason = "event_noop",
+                provider = "openai-codex",
+                "successful event response has no output"
+            );
+            attempt.finish_success(http_status, trace_rid, None, parser.trace_usage());
+            return Ok(json!({"role":"assistant", "content":[], "reason":"event_noop"}));
         }
         if let Err(failure) = parser.terminal_result() {
             if failure.code == "responses_quota" {
@@ -1532,6 +2006,8 @@ fn is_capacity_failure(error_code: &str, message: Option<&str>) -> bool {
 }
 
 struct CodexSseDecoder {
+    /// Opt-in only at the Codex transport; inert for other Responses routes.
+    diagnostics: Option<super::terminal_diagnostics::Observation>,
     /// Provider display label used in user-facing terminal messages
     /// ("Codex", "xAI"). Static, ours — never provider-supplied.
     provider_label: &'static str,
@@ -1545,6 +2021,8 @@ struct CodexSseDecoder {
     /// take precedence over completion and are surfaced after the stream is
     /// drained; provider-controlled text is never retained.
     terminal_success: bool,
+    successful_terminal_event: bool,
+    noop_disqualified: bool,
     terminal_failure: Option<ResponsesStreamFailure>,
     emitted_output: bool,
     /// The model produced ANY content on this attempt — including events the
@@ -1566,15 +2044,36 @@ struct CodexSseDecoder {
     /// Text streamed via `output_text.delta`, per `output_index`. Bounded by
     /// what the UI already received (it duplicates `text_acc`, split by item).
     message_text: std::collections::BTreeMap<usize, String>,
-    /// Muse only: when a completed message item carries text that extends
-    /// what was streamed for it, emit the missing suffix as a text delta.
-    /// Off for every other provider so their decoding stays unchanged.
+    /// Emitted text per content part; terminal text events describe one part,
+    /// not the concatenation of every part in an output item.
+    message_parts: std::collections::BTreeMap<(usize, usize), String>,
+    done_part_bytes: std::collections::BTreeMap<(usize, usize), usize>,
+    /// Codex and Muse: emit only the missing suffix of terminal message text.
     backfill_message_text: bool,
+    /// Diagnostics retain sizes only, never terminal text or provider IDs.
+    done_text_bytes: std::collections::BTreeMap<usize, usize>,
+    text_delta_count: usize,
+    /// The usage report as sent (Anthropic field names, reported counters
+    /// only), for settlement.
+    reported_usage: Option<Value>,
+    /// The attempt's spend guard (inert unless a worker's tap is installed):
+    /// shown each report with counts as it arrives, so a cancel or a drop
+    /// still books what was reported.
+    spend: AttemptObserver,
+    /// §6: the last terminal event's usage report as sent, presence kept,
+    /// for a ledgered attempt's settlement: every terminal event replaces
+    /// it, an empty or count-less usage object with an empty report and one
+    /// without usage (absent or `null`) with `None`. (`reported_usage`, the
+    /// reply's usage, keeps the last non-empty report, as before.)
+    terminal_usage: Option<Value>,
+    /// §6: the ledgered attempt whose usage this decoder reports (`None`:
+    /// the plain `Usage`, as always).
+    usage_request: Option<agent_core::UsageRequest>,
 }
 
 impl Default for CodexSseDecoder {
     fn default() -> Self {
-        Self::for_provider("Codex")
+        Self::for_provider(RESPONSES_LABEL_CODEX)
     }
 }
 
@@ -1635,6 +2134,27 @@ pub(crate) fn sanitize_error_identifier(raw: Option<&str>) -> &str {
         }
     }
 }
+
+const RESPONSES_LABEL_CODEX: &str = "Codex";
+const RESPONSES_LABEL_XAI: &str = "xAI";
+const RESPONSES_LABEL_COPILOT: &str = "GitHub Copilot";
+const RESPONSES_LABEL_MUSE: &str = "Meta Muse";
+const RESPONSES_LABEL_FALLBACK: &str = "Responses provider";
+/// Historical label still recognised by the error classifiers.
+const RESPONSES_LABEL_OPENAI: &str = "OpenAI";
+
+/// Every provider display label a Responses decoder can be constructed
+/// with. Static and ours — `net.rs` trusts a terminal-failure message only
+/// when it is exactly one of these labels followed by a static suffix, so
+/// arbitrary provider text can never be promoted to an API status.
+pub(crate) const RESPONSES_PROVIDER_LABELS: &[&str] = &[
+    RESPONSES_LABEL_CODEX,
+    RESPONSES_LABEL_XAI,
+    RESPONSES_LABEL_COPILOT,
+    RESPONSES_LABEL_MUSE,
+    RESPONSES_LABEL_OPENAI,
+    RESPONSES_LABEL_FALLBACK,
+];
 
 /// Static message suffixes for Responses terminal failures. The provider
 /// display label is prefixed at construction; `net.rs` classifies on these
@@ -1711,12 +2231,15 @@ impl CodexSseDecoder {
     /// Decoder whose user-facing messages name `label` as the provider.
     fn for_provider(label: &'static str) -> Self {
         Self {
+            diagnostics: None,
             provider_label: label,
             buffer: String::new(),
             active_tools: Vec::new(),
             completed_tools: Vec::new(),
             saw_model_event: false,
             terminal_success: false,
+            successful_terminal_event: false,
+            noop_disqualified: false,
             terminal_failure: None,
             emitted_output: false,
             saw_content_output: false,
@@ -1724,7 +2247,15 @@ impl CodexSseDecoder {
             last_message_phase: None,
             last_message_index: None,
             message_text: std::collections::BTreeMap::new(),
-            backfill_message_text: false,
+            message_parts: std::collections::BTreeMap::new(),
+            done_part_bytes: std::collections::BTreeMap::new(),
+            backfill_message_text: label == RESPONSES_LABEL_CODEX,
+            done_text_bytes: std::collections::BTreeMap::new(),
+            text_delta_count: 0,
+            reported_usage: None,
+            spend: AttemptObserver::inert(),
+            terminal_usage: None,
+            usage_request: None,
         }
     }
 
@@ -1747,7 +2278,7 @@ impl CodexSseDecoder {
             .map(String::as_str)
     }
 
-    /// Muse-only (C): a completed message item whose text extends what was
+    /// A completed message item whose text extends what was
     /// streamed for it (and starts with it) gets the missing suffix emitted
     /// as a normal text delta. Never rewrites or duplicates streamed text.
     fn backfill_message_suffix(
@@ -1757,20 +2288,39 @@ impl CodexSseDecoder {
         tx: &mpsc::UnboundedSender<StreamEvent>,
         text_acc: &mut String,
     ) {
-        if !self.backfill_message_text
-            || item.get("type").and_then(Value::as_str) != Some("message")
-        {
+        if item.get("type").and_then(Value::as_str) != Some("message") {
             return;
         }
         let Some(parts) = item.get("content").and_then(Value::as_array) else {
             return;
         };
-        let full: String = parts
-            .iter()
-            .filter(|part| part.get("type").and_then(Value::as_str) == Some("output_text"))
-            .filter_map(|part| part.get("text").and_then(Value::as_str))
-            .collect();
-        let streamed = self.message_text.entry(idx).or_default();
+        for (part_idx, part) in parts.iter().enumerate() {
+            if part.get("type").and_then(Value::as_str) == Some("output_text") {
+                if let Some(text) = part.get("text").and_then(Value::as_str) {
+                    self.backfill_text_suffix(idx, part_idx, text, tx, text_acc);
+                }
+            }
+        }
+    }
+
+    fn backfill_text_suffix(
+        &mut self,
+        idx: usize,
+        part_idx: usize,
+        full: &str,
+        tx: &mpsc::UnboundedSender<StreamEvent>,
+        text_acc: &mut String,
+    ) {
+        let old_bytes = self
+            .done_part_bytes
+            .insert((idx, part_idx), full.len())
+            .unwrap_or(0);
+        let total = self.done_text_bytes.entry(idx).or_default();
+        *total = total.saturating_sub(old_bytes).saturating_add(full.len());
+        if !self.backfill_message_text {
+            return;
+        }
+        let streamed = self.message_parts.entry((idx, part_idx)).or_default();
         if full.len() <= streamed.len() || !full.starts_with(streamed.as_str()) {
             return;
         }
@@ -1781,6 +2331,7 @@ impl CodexSseDecoder {
             "backfilling message text missing from the delta stream"
         );
         streamed.push_str(&suffix);
+        self.message_text.entry(idx).or_default().push_str(&suffix);
         self.emitted_output = true;
         text_acc.push_str(&suffix);
         let _ = tx.send(StreamEvent::Llm(crate::runtime::types::LlmEvent::Text(
@@ -1843,6 +2394,9 @@ impl CodexSseDecoder {
             );
             return;
         };
+        if let Some(diagnostics) = &mut self.diagnostics {
+            diagnostics.observe(&event);
+        }
         let event_type = event
             .get("type")
             .and_then(Value::as_str)
@@ -1878,9 +2432,51 @@ impl CodexSseDecoder {
         {
             self.saw_content_output = true;
         }
+        if event_type.starts_with("response.refusal")
+            || event_type.starts_with("response.function_call_arguments")
+            || event
+                .get("item")
+                .is_some_and(|item| item["type"] == "function_call")
+            || event
+                .get("part")
+                .is_some_and(|part| part["type"] == "refusal")
+        {
+            self.noop_disqualified = true;
+        }
+        if matches!(event_type, "response.completed" | "response.done") {
+            let response = &event["response"];
+            self.successful_terminal_event =
+                response["status"].as_str().is_none_or(|s| s == "completed");
+            if !self.successful_terminal_event
+                || response.get("error").is_some_and(|e| !e.is_null())
+            {
+                self.noop_disqualified = true;
+            }
+            if response["output"].as_array().is_some_and(|items| {
+                items.iter().any(|item| {
+                    item["type"] == "function_call"
+                        || item["content"]
+                            .as_array()
+                            .is_some_and(|parts| parts.iter().any(|part| part["type"] == "refusal"))
+                })
+            }) {
+                self.noop_disqualified = true;
+            }
+        }
         match event_type {
+            "response.output_text.done" => {
+                if let Some(text) = event.get("text").and_then(Value::as_str) {
+                    let idx = event
+                        .get("output_index")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0) as usize;
+                    let part_idx = event.get("content_index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                    self.backfill_text_suffix(idx, part_idx, text, tx, text_acc);
+                }
+            }
             "response.output_text.delta" => {
                 if let Some(delta) = event.get("delta").and_then(Value::as_str) {
+                    self.text_delta_count = self.text_delta_count.saturating_add(1);
                     if !delta.is_empty() {
                         self.emitted_output = true;
                     }
@@ -1888,6 +2484,8 @@ impl CodexSseDecoder {
                         .get("output_index")
                         .and_then(Value::as_u64)
                         .unwrap_or(0) as usize;
+                    let part_idx = event.get("content_index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                    self.message_parts.entry((idx, part_idx)).or_default().push_str(delta);
                     self.message_text.entry(idx).or_default().push_str(delta);
                     text_acc.push_str(delta);
                     let _ = tx.send(StreamEvent::Llm(crate::runtime::types::LlmEvent::Text(
@@ -2043,6 +2641,15 @@ impl CodexSseDecoder {
         }
     }
 
+    fn event_noop(&self, event_triggered: bool) -> bool {
+        event_triggered
+            && self.successful_terminal_event
+            && self.terminal_failure.is_none()
+            && !self.noop_disqualified
+            && !self.emitted_output
+            && self.completed_tools.is_empty()
+    }
+
     fn terminal_result(&self) -> Result<(), ResponsesStreamFailure> {
         if let Some(failure) = &self.terminal_failure {
             return Err(failure.clone());
@@ -2051,6 +2658,16 @@ impl CodexSseDecoder {
             if self.emitted_output || !self.completed_tools.is_empty() {
                 Ok(())
             } else {
+                // Codex emits the richer fixed-field terminal record once at
+                // the transport seam; retain the legacy line for other routes.
+                if self.diagnostics.is_none() {
+                    tracing::debug!(
+                        provider = self.provider_label,
+                        done_text_bytes = ?self.done_text_bytes,
+                        text_delta_count = self.text_delta_count,
+                        "responses_empty: terminal text sizes by output index"
+                    );
+                }
                 Err(ResponsesStreamFailure {
                     code: "responses_empty",
                     message: format!("{}{RESPONSES_EMPTY_SUFFIX}", self.provider_label),
@@ -2183,6 +2800,39 @@ impl CodexSseDecoder {
             .get("response")
             .and_then(|r| r.get("usage"))
             .or_else(|| event.get("usage"));
+        // §6: the last terminal event decides a ledgered attempt's spend,
+        // with what it states (nothing, when it has no usage object). Only
+        // a ledgered attempt (one with its identity) keeps it: without a
+        // ledger nothing reads it, so nothing is captured.
+        let ledgered = self.usage_request.is_some();
+        if ledgered {
+            self.terminal_usage = None;
+        }
+        if let Some(fields) = usage.and_then(Value::as_object) {
+            let count = |key: &str| fields.get(key).and_then(Value::as_u64);
+            let mut report = serde_json::Map::new();
+            if let Some(input) = count("input_tokens") {
+                let cached = usage
+                    .and_then(|u| u.pointer("/input_tokens_details/cached_tokens"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0)
+                    .min(input);
+                report.insert("input_tokens".into(), json!(input - cached));
+                report.insert("cache_read_input_tokens".into(), json!(cached));
+            }
+            if let Some(output) = count("output_tokens") {
+                report.insert("output_tokens".into(), json!(output));
+            }
+            if ledgered {
+                self.terminal_usage = Some(Value::Object(report.clone()));
+            }
+            if !report.is_empty() {
+                let report = Value::Object(report);
+                self.spend
+                    .observe(&ReportedUsage::from_anthropic_json(&report));
+                self.reported_usage = Some(report);
+            }
+        }
         let input = usage
             .and_then(|u| u.get("input_tokens"))
             .and_then(Value::as_u64)
@@ -2208,8 +2858,8 @@ impl CodexSseDecoder {
             if self.observed_usage.is_none() {
                 self.observed_usage = Some((input, output, cached));
             }
-            let _ = tx.send(StreamEvent::Session(
-                crate::runtime::types::SessionEvent::Usage {
+            let _ = tx.send(crate::tools::request_ledger::attempt_event(
+                StreamEvent::Session(crate::runtime::types::SessionEvent::Usage {
                     input_tokens: input - cached,
                     output_tokens: output,
                     cache_read_input_tokens: cached,
@@ -2217,7 +2867,8 @@ impl CodexSseDecoder {
                     cache_creation_5m: None,
                     cache_creation_1h: None,
                     model: None,
-                },
+                }),
+                self.usage_request.as_ref(),
             ));
         }
     }
@@ -2255,6 +2906,7 @@ fn handle_events(
     tool_blocks: &mut Vec<Value>,
     name_map: &translate::ToolNameMap,
     suppress_stream_deltas: bool,
+    usage_request: Option<&agent_core::UsageRequest>,
 ) {
     for ev in events {
         if let OaiEvent::TextDelta(t) = ev {
@@ -2265,7 +2917,8 @@ fn handle_events(
         }
         if !suppress_stream_deltas {
             if let Some(se) = translate::oai_event_to_llm(ev) {
-                let _ = tx.send(se);
+                // A ledgered attempt's usage is the attempt's (§6).
+                let _ = tx.send(crate::tools::request_ledger::attempt_event(se, usage_request));
             }
         }
     }
@@ -2606,6 +3259,42 @@ mod codex_decoder_tests {
     use super::*;
     use crate::runtime::types::{LlmEvent, SessionEvent, StreamEvent};
 
+    #[test]
+    fn terminal_diagnostics_do_not_change_decoder_results() {
+        for lines in [
+            vec![
+                r#"data: {"type":"response.output_text.delta","output_index":0,"delta":"hello"}"#,
+                "",
+                r#"data: {"type":"response.completed","response":{"status":"completed","output":[]}}"#,
+                "",
+            ],
+            vec![
+                r#"data: {"type":"response.completed","response":{"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"terminal only"}]}]}}"#,
+                "",
+            ],
+            vec![
+                r#"data: {"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[{"type":"reasoning"}],"usage":{"output_tokens":10,"output_tokens_details":{"reasoning_tokens":10}}}}"#,
+                "",
+            ],
+        ] {
+            let (plain, text, events) = drive_with(CodexSseDecoder::default(), &lines);
+            let instrumented = CodexSseDecoder {
+                diagnostics: Some(super::super::terminal_diagnostics::Observation::default()),
+                ..CodexSseDecoder::default()
+            };
+            let (observed, observed_text, observed_events) = drive_with(instrumented, &lines);
+            assert_eq!(text, observed_text);
+            assert_eq!(format!("{events:?}"), format!("{observed_events:?}"));
+            assert_eq!(
+                plain.terminal_result().map_err(|e| e.code),
+                observed.terminal_result().map_err(|e| e.code)
+            );
+            let metadata = format!("{:?}", observed.diagnostics.as_ref().unwrap());
+            assert!(!metadata.contains("terminal only"));
+            assert!(!metadata.contains("hello"));
+        }
+    }
+
     fn collect_events(rx: &mut mpsc::UnboundedReceiver<StreamEvent>) -> Vec<StreamEvent> {
         let mut out = Vec::new();
         while let Ok(ev) = rx.try_recv() {
@@ -2671,6 +3360,130 @@ mod codex_decoder_tests {
         assert_eq!(decoder.last_message_text(), Some("Answer"));
     }
 
+    #[test]
+    fn codex_done_only_short_answer_is_not_empty() {
+        let (decoder, text, events) = drive(&[
+            r#"data: {"type":"response.output_item.done","output_index":0,"item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Yes."}]}}"#,
+            "",
+            r#"data: {"type":"response.completed","response":{}}"#,
+            "",
+        ]);
+        assert_eq!(text, "Yes.");
+        assert!(decoder.terminal_result().is_ok());
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, StreamEvent::Llm(LlmEvent::Text(t)) if t == "Yes."))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn codex_done_text_backfills_per_index_without_replaying_deltas() {
+        for prefix in ["", "Ye", "Yes."] {
+            let wire = [
+                json!({"type":"response.output_text.delta","output_index":0,"delta":prefix}),
+                json!({"type":"response.output_text.done","output_index":0,"text":"Yes."}),
+                json!({"type":"response.output_item.done","output_index":0,"item":{"type":"message","content":[{"type":"output_text","text":"Yes."}]}}),
+                json!({"type":"response.output_text.done","output_index":2,"text":"é"}),
+                json!({"type":"response.output_text.done","output_index":2,"text":"é"}),
+                json!({"type":"response.output_item.done","output_index":2,"item":{"type":"message","content":[{"type":"output_text","text":"é!"}]}}),
+                json!({"type":"response.output_item.done","output_index":1,"item":{"type":"function_call","call_id":"call_1","name":"bash","arguments":"{}"}}),
+                json!({"type":"response.completed","response":{}}),
+            ];
+            let lines: Vec<String> = wire
+                .iter()
+                .flat_map(|v| [format!("data: {v}"), String::new()])
+                .collect();
+            let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+            let (decoder, text, events) = drive(&refs);
+            assert_eq!(text, "Yes.é!", "prefix {prefix:?}");
+            let emitted: String = events
+                .iter()
+                .filter_map(|e| match e {
+                    StreamEvent::Llm(LlmEvent::Text(t)) => Some(t.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(emitted, text);
+            assert!(decoder.terminal_result().is_ok());
+            assert_eq!(decoder.completed_tools.len(), 1);
+            assert_eq!(decoder.done_text_bytes.get(&0), Some(&4));
+            assert_eq!(decoder.done_text_bytes.get(&2), Some(&3));
+            assert_eq!(decoder.text_delta_count, 1);
+        }
+    }
+
+    #[test]
+    fn codex_empty_done_text_remains_empty() {
+        let (decoder, text, _) = drive(&[
+            r#"data: {"type":"response.output_text.done","output_index":3,"text":""}"#,
+            "",
+            r#"data: {"type":"response.completed","response":{}}"#,
+            "",
+        ]);
+        assert!(text.is_empty());
+        assert_eq!(
+            decoder.terminal_result().unwrap_err().code,
+            "responses_empty"
+        );
+        assert_eq!(decoder.done_text_bytes.get(&3), Some(&0));
+        assert_eq!(decoder.text_delta_count, 0);
+    }
+
+    #[test]
+    fn codex_done_text_keeps_identical_content_parts_distinct() {
+        for prefix in ["", "Ye", "Yes."] {
+            let mut wire = Vec::new();
+            for part in 0..2 {
+                wire.push(json!({"type":"response.output_text.delta","output_index":0,"content_index":part,"delta":prefix}));
+                wire.push(json!({"type":"response.output_text.done","output_index":0,"content_index":part,"text":"Yes."}));
+            }
+            wire.push(json!({"type":"response.output_item.done","output_index":0,"item":{"type":"message","content":[{"type":"output_text","text":"Yes."},{"type":"output_text","text":"Yes."}]}}));
+            wire.push(json!({"type":"response.completed","response":{}}));
+            let lines: Vec<String> = wire
+                .iter()
+                .flat_map(|v| [format!("data: {v}"), String::new()])
+                .collect();
+            let (decoder, text, events) =
+                drive(&lines.iter().map(String::as_str).collect::<Vec<_>>());
+            assert_eq!(text, "Yes.Yes.");
+            let emitted: String = events
+                .iter()
+                .filter_map(|e| match e {
+                    StreamEvent::Llm(LlmEvent::Text(t)) => Some(t.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(emitted, text);
+            assert_eq!(decoder.done_text_bytes.get(&0), Some(&8));
+            assert!(decoder.terminal_result().is_ok());
+        }
+    }
+
+    #[test]
+    fn codex_done_preview_does_not_override_terminal_failure() {
+        for (terminal, code) in [
+            ("response.failed", "responses_failed"),
+            ("response.incomplete", "responses_incomplete"),
+        ] {
+            let wire = [
+                json!({"type":"response.output_text.done","output_index":0,"text":"Preview"}),
+                json!({"type":"response.completed","response":{}}),
+                json!({"type":terminal,"response":{}}),
+            ];
+            let lines: Vec<String> = wire
+                .iter()
+                .flat_map(|v| [format!("data: {v}"), String::new()])
+                .collect();
+            let (decoder, text, _) = drive(&lines.iter().map(String::as_str).collect::<Vec<_>>());
+            assert_eq!(text, "Preview");
+            assert!(decoder.emitted_any_output());
+            assert_eq!(decoder.terminal_result().unwrap_err().code, code);
+        }
+    }
+
     const TRUNCATED_STREAM: [&str; 6] = [
         r#"data: {"type":"response.output_item.added","output_index":0,"item":{"type":"message","role":"assistant","content":[]}}"#,
         "",
@@ -2704,13 +3517,11 @@ mod codex_decoder_tests {
     }
 
     #[test]
-    fn backfill_is_off_by_default_and_never_rewrites_divergent_text() {
-        // Default (Codex) decoder: decoding unchanged.
-        let (_, text, _) = drive(&TRUNCATED_STREAM);
+    fn backfill_is_off_for_other_providers_and_never_rewrites_divergent_text() {
+        let (_, text, _) = drive_with(CodexSseDecoder::for_provider("xAI"), &TRUNCATED_STREAM);
         assert_eq!(text, "Key facts:");
-        // Muse decoder: final text that does not extend the stream is ignored.
-        let mut decoder = CodexSseDecoder::for_provider("Meta Muse");
-        decoder.backfill_message_text = true;
+        // Codex: final text that does not extend the stream is ignored.
+        let decoder = CodexSseDecoder::default();
         let (_, text, _) = drive_with(
             decoder,
             &[
@@ -3019,6 +3830,43 @@ mod codex_decoder_tests {
             _ => None,
         });
         assert_eq!(usage, Some((42, 17)));
+    }
+
+    /// Strict r1 B-B1: a terminal report is kept for the request ledger only
+    /// on a ledgered attempt (one with its identity). A dark (unledgered)
+    /// Codex response keeps none, while P1's observation and the reported
+    /// usage stay as they were.
+    #[test]
+    fn only_a_ledgered_attempt_keeps_its_terminal_usage() {
+        let lines = [
+            r#"data: {"type":"response.completed","response":{"usage":{"input_tokens":1000,"input_tokens_details":{"cached_tokens":900},"output_tokens":17}}}"#,
+            "",
+        ];
+        let (dark, _text, events) = drive(&lines);
+        assert_eq!(dark.terminal_usage, None, "no ledger: nothing captured");
+        assert_eq!(
+            dark.reported_usage,
+            Some(json!({"input_tokens":100,"cache_read_input_tokens":900,"output_tokens":17})),
+            "the reported usage is unchanged"
+        );
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, StreamEvent::Session(SessionEvent::Usage { .. }))));
+
+        let ledgered = CodexSseDecoder {
+            usage_request: Some(agent_core::UsageRequest {
+                request_id: "req-1".into(),
+                purpose: agent_core::UsagePurpose::Conversation,
+                model: "openai-codex/gpt-5.6-sol".into(),
+            }),
+            ..CodexSseDecoder::default()
+        };
+        let (ledgered, _text, _events) = drive_with(ledgered, &lines);
+        assert_eq!(
+            ledgered.terminal_usage,
+            Some(json!({"input_tokens":100,"cache_read_input_tokens":900,"output_tokens":17}))
+        );
+        assert_eq!(ledgered.reported_usage, dark.reported_usage);
     }
 
     /// Responses-API usage nests cache hits under input_tokens_details, and
@@ -3446,6 +4294,8 @@ mod broker_stream_tests {
             true,
             false,
             0,
+            crate::runtime::child_spend::RouteSpend::NONE,
+            None,
         )
         .await
         .expect("stream must complete");
@@ -3498,6 +4348,8 @@ mod broker_stream_tests {
             true,
             true,
             0,
+            crate::runtime::child_spend::RouteSpend::NONE,
+            None,
         )
         .await
         .expect("stream must complete");
@@ -3535,6 +4387,8 @@ mod broker_stream_tests {
             true,
             false,
             0,
+            crate::runtime::child_spend::RouteSpend::NONE,
+            None,
         )
         .await
         .unwrap_err()
@@ -3602,6 +4456,8 @@ mod broker_stream_tests {
             true,
             false,
             0,
+            crate::runtime::child_spend::RouteSpend::NONE,
+            None,
         )
         .await
         .expect_err("500 must fail")
@@ -3617,8 +4473,14 @@ mod broker_stream_tests {
     }
 }
 
-/// Provider display label for the xai-auth Responses route.
-const XAI_PROVIDER_LABEL: &str = "xAI";
+/// Display label of a provider served by the OpenAI Responses transport.
+fn responses_provider_label(provider: &str) -> &'static str {
+    match provider {
+        "xai-auth" => RESPONSES_LABEL_XAI,
+        "github-copilot" => RESPONSES_LABEL_COPILOT,
+        _ => RESPONSES_LABEL_FALLBACK,
+    }
+}
 
 /// Broker identity + display label for one OpenAI-Responses-wire provider
 /// routed through the shared streaming loop
@@ -3636,18 +4498,45 @@ pub(crate) struct ResponsesProfile {
 pub(crate) const XAI_RESPONSES: ResponsesProfile = ResponsesProfile {
     broker_provider: "xai-auth",
     path: "/responses",
-    label: XAI_PROVIDER_LABEL,
+    label: RESPONSES_LABEL_XAI,
 };
+
+/// GitHub Copilot GPT models on the Responses wire.
+pub(crate) const COPILOT_RESPONSES: ResponsesProfile = ResponsesProfile {
+    broker_provider: "github-copilot",
+    path: "/responses",
+    label: RESPONSES_LABEL_COPILOT,
+};
+
+/// The broker profile for a resolved provider on the plain Responses
+/// transport: the request is proxied under that provider's identity, never
+/// another's. A provider without a profile is refused before any credential
+/// access.
+pub(crate) fn responses_profile(provider: &str) -> Result<ResponsesProfile, String> {
+    match provider {
+        "xai-auth" => Ok(XAI_RESPONSES),
+        "github-copilot" => Ok(COPILOT_RESPONSES),
+        other => Err(format!(
+            "{} has no Responses transport profile",
+            responses_provider_label(other)
+        )),
+    }
+}
 
 /// Meta Muse: `https://api.meta.ai` origin, Responses at `/v1/responses`.
 pub(crate) const MUSE_RESPONSES: ResponsesProfile = ResponsesProfile {
     broker_provider: "muse",
     path: "/v1/responses",
-    label: "Meta Muse",
+    label: RESPONSES_LABEL_MUSE,
 };
 
+/// The OpenAI Responses transport through the credential broker, for every
+/// provider whose route selects that wire (xAI, GitHub Copilot). The proxy
+/// request names the resolved provider (`cfg.provider`), so the broker
+/// attaches that provider's credential and base URL; reasoning validation
+/// uses the provider-qualified model id.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn call_xai_responses_stream_inner(
+pub(crate) async fn call_responses_stream_inner(
     cfg: &ProviderConfig,
     broker: &std::sync::Arc<dyn crate::auth::CredentialBroker>,
     tools_schema: &[Value],
@@ -3660,21 +4549,24 @@ pub(crate) async fn call_xai_responses_stream_inner(
     max_retries: u32,
     trace: &crate::runtime::trace::TraceContext,
     exact_wire_bytes: bool,
+    spend: RouteSpend<'_>,
 ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+    let profile = responses_profile(&cfg.provider).map_err(super::NotDispatched::boxed)?;
     let (tools, names) = translate::tools_to_responses(tools_schema);
     let input = codex_input_messages(translate::messages_to_oai(messages, system_prompt, &names));
     // Pure, validated body construction — rejects unsupported reasoning
     // combinations BEFORE any broker credential access or network I/O.
-    let body = build_xai_body(
+    let body = build_responses_body(
+        &cfg.provider,
         &cfg.model,
         reasoning_level,
-        serde_json::to_value(input)?,
+        serde_json::to_value(input).map_err(super::NotDispatched::boxed)?,
         tools,
         max_tokens,
     )
-    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+    .map_err(super::NotDispatched::boxed)?;
     stream_broker_responses(
-        XAI_RESPONSES,
+        profile,
         cfg,
         broker,
         body,
@@ -3687,12 +4579,14 @@ pub(crate) async fn call_xai_responses_stream_inner(
         max_retries,
         trace,
         exact_wire_bytes,
+        spend,
     )
     .await
 }
 
 /// Dispatch a resolved `OpenAiResponses` route to its provider body builder:
-/// `muse` → [`call_muse_responses_stream_inner`], otherwise xAI.
+/// `muse` → [`call_muse_responses_stream_inner`], otherwise
+/// [`call_responses_stream_inner`] under the route's own provider.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn call_responses_route_inner(
     route_provider: &str,
@@ -3708,6 +4602,7 @@ pub(crate) async fn call_responses_route_inner(
     max_retries: u32,
     trace: &crate::runtime::trace::TraceContext,
     exact_wire_bytes: bool,
+    spend: RouteSpend<'_>,
 ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
     if route_provider == MUSE_RESPONSES.broker_provider {
         call_muse_responses_stream_inner(
@@ -3723,10 +4618,11 @@ pub(crate) async fn call_responses_route_inner(
             max_retries,
             trace,
             exact_wire_bytes,
+            spend,
         )
         .await
     } else {
-        call_xai_responses_stream_inner(
+        call_responses_stream_inner(
             cfg,
             broker,
             tools_schema,
@@ -3739,6 +4635,7 @@ pub(crate) async fn call_responses_route_inner(
             max_retries,
             trace,
             exact_wire_bytes,
+            spend,
         )
         .await
     }
@@ -3762,6 +4659,7 @@ pub(crate) async fn call_muse_responses_stream_inner(
     max_retries: u32,
     trace: &crate::runtime::trace::TraceContext,
     exact_wire_bytes: bool,
+    spend: RouteSpend<'_>,
 ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
     let (tools, names) = translate::tools_to_responses(tools_schema);
     let instructions = system_prompt.clone().unwrap_or_default();
@@ -3778,7 +4676,7 @@ pub(crate) async fn call_muse_responses_stream_inner(
         max_tokens,
         &cache_key,
     )
-    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+    .map_err(super::NotDispatched::boxed)?;
     stream_broker_responses(
         MUSE_RESPONSES,
         cfg,
@@ -3793,6 +4691,7 @@ pub(crate) async fn call_muse_responses_stream_inner(
         max_retries,
         trace,
         exact_wire_bytes,
+        spend,
     )
     .await
 }
@@ -3867,6 +4766,7 @@ async fn stream_broker_responses(
     max_retries: u32,
     trace: &crate::runtime::trace::TraceContext,
     exact_wire_bytes: bool,
+    spend: RouteSpend<'_>,
 ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
     // Serialize ONCE via the sanctioned constructor: the digested bytes are
     // the very bytes the broker sends upstream (`body_bytes` handoff,
@@ -3880,7 +4780,8 @@ async fn stream_broker_responses(
         profile.path,
         body,
         true,
-    )?;
+    )
+    .map_err(super::NotDispatched::boxed)?;
     let tracer = tr::begin_openai_tracer(
         trace,
         &cfg.provider,
@@ -3919,34 +4820,41 @@ async fn stream_broker_responses(
         )
         .await
         .map_err(|_| "request canceled")?;
-        // A credential refresh failure keeps its kind as a type (retryable /
-        // action-required vs credential); its text is ours, no upstream bytes.
-        let stream = match stream {
-            Err(crate::auth::BrokerError::Refresh(f)) => {
-                attempt.finish_failed("broker_error", None, None);
-                return Err(Box::new(super::net::BrokerRefreshError::new(f)));
-            }
-            // Privacy (spec §5.1): a broker proxy error may carry an upstream
-            // response-body snippet; redact it to status-only before surfacing.
-            other => other.map_err(|e| super::net::redact_provider_proxy_error(&e.to_string())),
-        };
         let mut stream = match stream {
             Ok(stream) => {
                 attempt.mark_headers();
                 stream
             }
-            Err(msg) => {
+            // A credential refresh failure keeps its kind as a type (retryable /
+            // action-required vs credential); its text is ours, no upstream bytes.
+            Err(crate::auth::BrokerError::Refresh(f)) => {
+                attempt.finish_failed("broker_error", None, None);
+                return Err(Box::new(super::net::BrokerRefreshError::new(f)));
+            }
+            Err(error) => {
+                // Privacy (spec §5.1): a broker proxy error may carry an
+                // upstream response-body snippet; redact it to status-only
+                // before surfacing.
+                let msg = super::net::redact_provider_proxy_error(&error.to_string());
                 let status = tr::broker_error_status(&msg);
                 let code =
                     status.map_or_else(|| "broker_error".to_string(), |s| format!("http_{s}"));
                 attempt.finish_failed(&code, status, None);
-                return Err(super::net::normalize_broker_http_error(msg).into());
+                return Err(super::broker_failure(
+                    &error,
+                    stream_retry == 0,
+                    super::net::normalize_broker_http_error(msg),
+                ));
             }
         };
+        // One paid attempt per opened stream (a refused request carries no
+        // usage): its guard goes with the stream into the decoder.
+        let attempt_spend = spend.attempt();
         let _ = tx.send(StreamEvent::Llm(crate::LlmEvent::ResponseStart));
         let mut interrupted = false;
         let mut text = String::new();
         let mut parser = CodexSseDecoder::for_provider(profile.label);
+        parser.spend = attempt_spend.observer();
         parser.backfill_message_text = profile.broker_provider == MUSE_RESPONSES.broker_provider;
         let mut buf = bytes::BytesMut::new();
         while let Some(chunk) = tokio::select! {
@@ -3984,6 +4892,8 @@ async fn stream_broker_responses(
             parser.push_line(std::str::from_utf8(&buf).unwrap_or(""), tx, &mut text);
         }
         if interrupted || (!parser.terminal_success && parser.terminal_failure.is_none()) {
+            // The cut attempt is over: book what it reported first.
+            attempt_spend.settle();
             if stream_retry >= max_retries {
                 attempt.finish_failed("stream_error", None, None);
                 return Err(STREAM_INTERRUPTED.into());
@@ -4005,6 +4915,9 @@ async fn stream_broker_responses(
             continue;
         }
         parser.finish();
+        // The stream is consumed: book the attempt before a retry or the
+        // result.
+        attempt_spend.settle();
         // Trailing-buffer flush and finish() can surface the first (or only)
         // model event; mark it so first_model_event_ms is honest for tail-only
         // streams (mirrors the Codex direct path above).
@@ -4047,7 +4960,14 @@ async fn stream_broker_responses(
                 continue;
             }
             attempt.finish_failed(failure.code, None, None);
-            return Err(failure.message.into());
+            // The terminal event's usage is the whole spend only when this
+            // was the only attempt; keep it for settlement.
+            let usage = if stream_retry == 0 {
+                parser.reported_usage.take()
+            } else {
+                None
+            };
+            return Err(super::failed_with_usage(failure.message.into(), usage));
         }
         attempt.finish_success(None, None, None, parser.trace_usage());
         let mut content = Vec::new();
@@ -4074,6 +4994,9 @@ async fn stream_broker_responses(
                 // persists only `content`, so nothing reaches stored history.
                 response[DANGLING_PREAMBLE_KEY] = json!(reason);
             }
+        }
+        if let Some(usage) = parser.reported_usage.take() {
+            response["usage"] = usage;
         }
         return Ok(response);
     }
@@ -4169,7 +5092,23 @@ pub(crate) fn take_preamble_nudge(
 /// - `Adaptive` omits the `reasoning` field → documented provider default.
 /// - Named levels are emitted as exact `reasoning:{effort:"..."}` only when
 ///   the exact model id documents them; otherwise `Err` (fail closed).
+#[cfg(test)]
 pub(crate) fn build_xai_body(
+    model: &str,
+    level: agent_core::reasoning::ReasoningLevel,
+    input: Value,
+    tools: Vec<Value>,
+    max_tokens: Option<u32>,
+) -> Result<Value, String> {
+    build_responses_body("xai-auth", model, level, input, tools, max_tokens)
+}
+
+/// Pure, validated Responses body for `provider`'s `model`: the reasoning
+/// level is checked against that provider-qualified id (xAI's exact matrix
+/// for `xai-auth`, the shared per-provider rules otherwise) before any
+/// credential or network access.
+pub(crate) fn build_responses_body(
+    provider: &str,
     model: &str,
     level: agent_core::reasoning::ReasoningLevel,
     input: Value,
@@ -4178,7 +5117,7 @@ pub(crate) fn build_xai_body(
 ) -> Result<Value, String> {
     use agent_core::reasoning::ReasoningLevel;
     crate::runtime::openai::catalog::validation::validate_reasoning_mutation(
-        &format!("xai-auth/{model}"),
+        &format!("{provider}/{model}"),
         level,
     )?;
     let mut body = serde_json::Map::new();
@@ -4478,7 +5417,12 @@ mod xai_capacity_retry_tests {
                 provider: "muse".to_string(),
             };
             let (tx, _rx) = mpsc::unbounded_channel::<StreamEvent>();
-            let err = call_xai_responses_stream_inner(
+            // Through the route dispatcher, as production sends a `muse/`
+            // route: call_responses_stream_inner refuses a provider with no
+            // Responses profile before any credential access, so a direct
+            // call with this Muse config never reaches the broker.
+            let err = call_responses_route_inner(
+                "muse",
                 &cfg,
                 &broker,
                 &[],
@@ -4491,6 +5435,7 @@ mod xai_capacity_retry_tests {
                 0,
                 &crate::runtime::trace::TraceContext::disabled(),
                 true,
+                crate::runtime::child_spend::RouteSpend::NONE,
             )
             .await
             .unwrap_err();
@@ -4527,7 +5472,7 @@ mod xai_capacity_retry_tests {
             provider: "xai-auth".to_string(),
         };
         let (tx, mut rx) = mpsc::unbounded_channel::<StreamEvent>();
-        let result = call_xai_responses_stream_inner(
+        let result = call_responses_stream_inner(
             &cfg,
             &broker,
             &[],
@@ -4540,6 +5485,7 @@ mod xai_capacity_retry_tests {
             max_retries,
             &crate::runtime::trace::TraceContext::disabled(),
             true,
+            crate::runtime::child_spend::RouteSpend::NONE,
         )
         .await;
         drop(tx);
@@ -4660,7 +5606,7 @@ mod xai_capacity_retry_tests {
             ("quota_exceeded", RESPONSES_QUOTA_SUFFIX, "quota"),
             ("billing_error", RESPONSES_QUOTA_SUFFIX, "quota"),
         ] {
-            for label in ["Codex", "OpenAI", "xAI"] {
+            for label in ["Codex", "OpenAI", "GitHub Copilot", "xAI"] {
                 let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
                 let mut decoder = CodexSseDecoder::for_provider(label);
                 let frame = format!(
@@ -5149,6 +6095,87 @@ mod codex_wire_tests {
     }
 
     #[test]
+    fn chat_completion_limit_field_follows_the_endpoint_contract() {
+        use crate::runtime::openai::stream::chat_completion_limit_field as field;
+        // Official OpenAI and Azure OpenAI hosts: every model, including
+        // future families, aliases and deployment names, and an endpoint
+        // override that points at them.
+        for (provider, base) in [
+            ("openai", "https://api.openai.com/v1"),
+            ("openai", "https://eu.api.openai.com/v1"),
+            ("azure-openai", "https://contoso.openai.azure.com/openai/v1"),
+            ("local", "https://api.openai.com/v1"),
+        ] {
+            for model in [
+                "gpt-5.4",
+                "gpt-5.6-sol",
+                "gpt-6-preview",
+                "o1",
+                "o3-mini",
+                "o4-mini",
+                "gpt-4o",
+                "gpt-4.1",
+                "chatgpt-4o-latest",
+                "my-summary-deployment",
+            ] {
+                assert_eq!(
+                    field(provider, base, model),
+                    Some("max_completion_tokens"),
+                    "{provider} {base} {model}"
+                );
+            }
+        }
+        // Hosts that only look like OpenAI's are not OpenAI.
+        for base in [
+            "http://api.openai.com/v1",
+            "https://api.openai.com.example.net/v1",
+            "http://127.0.0.1:8080/api.openai.com/v1",
+        ] {
+            assert_eq!(
+                field("local", base, "gpt-5.4"),
+                Some("max_tokens"),
+                "{base}"
+            );
+        }
+        assert_eq!(field("openai", "https://example.net/v1", "gpt-5.4"), None);
+        // Groq documents max_completion_tokens for every model.
+        for model in ["openai/gpt-oss-120b", "llama-3.3-70b-versatile"] {
+            assert_eq!(
+                field("groq", "https://api.groq.com/openai/v1", model),
+                Some("max_completion_tokens")
+            );
+        }
+        // Copilot: by the curated catalog's vendor; unknown ids fail closed.
+        let copilot = "https://api.githubcopilot.com";
+        assert_eq!(
+            field("github-copilot", copilot, "gpt-5-mini"),
+            Some("max_completion_tokens")
+        );
+        assert_eq!(
+            field("github-copilot", copilot, "claude-sonnet-4.6"),
+            Some("max_tokens")
+        );
+        assert_eq!(
+            field("github-copilot", copilot, "gemini-3.5-flash"),
+            Some("max_tokens")
+        );
+        assert_eq!(field("github-copilot", copilot, "o9-unlisted"), None);
+        // Providers that document max_tokens keep it, whatever the model.
+        for model in ["openai/o3", "openai/gpt-5.4", "gpt-6-preview"] {
+            assert_eq!(
+                field("openrouter", "https://openrouter.ai/api/v1", model),
+                Some("max_tokens")
+            );
+            assert_eq!(
+                field("local", "http://127.0.0.1:11434/v1", model),
+                Some("max_tokens")
+            );
+        }
+        // No documented ceiling verified: none claimed.
+        assert_eq!(field("chutes", "https://llm.chutes.ai/v1", "m"), None);
+    }
+
+    #[test]
     fn body_includes_temperature_and_max_tokens_when_some() {
         let body = body_for_level(
             "gpt-5.6-sol",
@@ -5173,7 +6200,11 @@ mod codex_wire_tests {
 }
 
 #[cfg(test)]
-mod send_retry_tests {
+#[path = "codex_ledger_tests.rs"]
+mod codex_ledger_tests;
+
+#[cfg(test)]
+pub(crate) mod send_retry_tests {
     //! Regression tests for transient-failure retry on the codex send path
     //! (incident: session 20260714-025948-3dab — a single transport failure
     //! against chatgpt.com aborted a whole autonomous turn because the codex
@@ -5407,6 +6438,8 @@ mod send_retry_tests {
             &tokio_util::sync::CancellationToken::new(),
             max_retries,
             &crate::runtime::trace::TraceContext::disabled(),
+            crate::runtime::child_spend::RouteSpend::NONE,
+            None,
         )
         .await
     }
@@ -5506,6 +6539,8 @@ mod send_retry_tests {
             cancel,
             retries,
             &crate::runtime::trace::TraceContext::disabled(),
+            crate::runtime::child_spend::RouteSpend::NONE,
+            None,
         )
         .await
     }
@@ -5639,6 +6674,8 @@ mod send_retry_tests {
             &tokio_util::sync::CancellationToken::new(),
             0,
             &crate::runtime::trace::TraceContext::disabled(),
+            crate::runtime::child_spend::RouteSpend::NONE,
+            None,
         )
         .await
         .expect_err("foreground Ultra without delegation tools must fail closed");
@@ -5679,6 +6716,8 @@ mod send_retry_tests {
             &tokio_util::sync::CancellationToken::new(),
             0,
             &crate::runtime::trace::TraceContext::disabled(),
+            crate::runtime::child_spend::RouteSpend::NONE,
+            None,
         )
         .await
         .expect_err("the Codex seam must validate provider-qualified identity");
@@ -5931,6 +6970,16 @@ mod send_retry_tests {
     }
 
     #[tokio::test]
+    async fn codex_single_attempt_policy_makes_one_connection() {
+        use crate::runtime::openai::{route_retry_budget, AttemptPolicy, WireProtocol};
+        let (base_url, counter) =
+            spawn_mock_codex(usize::MAX, StatusCode::SERVICE_UNAVAILABLE).await;
+        let budget = route_retry_budget(WireProtocol::CodexResponses, 3, AttemptPolicy::Single);
+        let err = run_codex(&base_url, budget).await.expect_err("503 fails");
+        assert_eq!(counter.load(Ordering::SeqCst), 1, "{err}");
+    }
+
+    #[tokio::test]
     async fn codex_does_not_retry_client_errors() {
         let (base_url, counter) = spawn_mock_codex(usize::MAX, StatusCode::BAD_REQUEST).await;
         let err = run_codex(&base_url, 3).await.expect_err("must fail");
@@ -6125,8 +7174,229 @@ mod send_retry_tests {
             &tokio_util::sync::CancellationToken::new(),
             max_retries,
             &crate::runtime::trace::TraceContext::disabled(),
+            crate::runtime::child_spend::RouteSpend::NONE,
+            None,
         )
         .await
+    }
+
+    #[tokio::test]
+    async fn event_noop_real_retry_seam_distinguishes_explicit_event_from_user() {
+        const EMPTY: &str = "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n";
+        for event_triggered in [true, false] {
+            let (url, seen) = spawn_scripted_codex(vec![
+                (StatusCode::OK, vec![], EMPTY),
+                (StatusCode::OK, vec![], CODEX_SSE_SUCCESS),
+            ])
+            .await;
+            let router = ScriptedRouter::new(pinned("astra1", "acct_A", false), vec![]);
+            let (tx, _rx) = mpsc::unbounded_channel();
+            let result = call_codex_stream_with_router_for_event(
+                &ProviderConfig {
+                    base_url: url,
+                    model: "gpt-6-astra".into(),
+                    provider: "openai-codex".into(),
+                },
+                &reqwest::Client::new(),
+                &router,
+                &[],
+                &Some("test".into()),
+                &[],
+                &tx,
+                None,
+                None,
+                ReasoningLevel::High,
+                crate::runtime::openai::catalog::CodexRequestRole::Foreground,
+                &tokio_util::sync::CancellationToken::new(),
+                1,
+                &crate::runtime::trace::TraceContext::disabled(),
+                crate::runtime::child_spend::RouteSpend::NONE,
+                event_triggered,
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                seen.lock().unwrap().len(),
+                if event_triggered { 1 } else { 2 }
+            );
+            assert_eq!(
+                result.get("reason").and_then(Value::as_str),
+                event_triggered.then_some("event_noop")
+            );
+            assert_eq!(
+                result["content"].as_array().unwrap().is_empty(),
+                event_triggered
+            );
+        }
+    }
+
+    pub(crate) async fn event_noop_fixture() -> (Value, Vec<StreamEvent>) {
+        let (url, seen) = spawn_scripted_codex(vec![(
+            StatusCode::OK, vec![],
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":7,\"output_tokens\":2}}}\n\n",
+        )]).await;
+        let router = ScriptedRouter::new(pinned("astra1", "acct_A", false), vec![]);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let result = call_codex_stream_with_router_for_event(
+            &ProviderConfig {
+                base_url: url,
+                model: "gpt-6-astra".into(),
+                provider: "openai-codex".into(),
+            },
+            &reqwest::Client::new(),
+            &router,
+            &[],
+            &None,
+            &[],
+            &tx,
+            None,
+            None,
+            ReasoningLevel::High,
+            crate::runtime::openai::catalog::CodexRequestRole::Foreground,
+            &tokio_util::sync::CancellationToken::new(),
+            1,
+            &crate::runtime::trace::TraceContext::disabled(),
+            crate::runtime::child_spend::RouteSpend::NONE,
+            true,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        assert_eq!(result["reason"], "event_noop");
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        (result, events)
+    }
+
+    #[tokio::test]
+    async fn event_noop_tool_only_response_keeps_tool_output() {
+        const TOOL: &str = concat!(
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_x\",\"name\":\"bash\",\"arguments\":\"{}\"}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n"
+        );
+        let (url, seen) = spawn_scripted_codex(vec![(StatusCode::OK, vec![], TOOL)]).await;
+        let router = ScriptedRouter::new(pinned("astra1", "acct_A", false), vec![]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let out = call_codex_stream_with_router_for_event(
+            &ProviderConfig {
+                base_url: url,
+                model: "gpt-6-astra".into(),
+                provider: "openai-codex".into(),
+            },
+            &reqwest::Client::new(),
+            &router,
+            &[],
+            &None,
+            &[],
+            &tx,
+            None,
+            None,
+            ReasoningLevel::High,
+            crate::runtime::openai::catalog::CodexRequestRole::Foreground,
+            &tokio_util::sync::CancellationToken::new(),
+            1,
+            &crate::runtime::trace::TraceContext::disabled(),
+            crate::runtime::child_spend::RouteSpend::NONE,
+            true,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out["content"][0]["type"], "tool_use");
+        assert_eq!(out["content"][0]["id"], "call_x");
+        assert!(out.get("reason").is_none());
+        assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn event_noop_transport_error_after_terminal_is_not_success() {
+        let (url, seen, server) = broken_chunk_server(vec![(
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n",
+            true,
+        )])
+        .await;
+        let router = ScriptedRouter::new(pinned("astra1", "acct_A", false), vec![]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let result = call_codex_stream_with_router_for_event(
+            &ProviderConfig {
+                base_url: url,
+                model: "gpt-6-astra".into(),
+                provider: "openai-codex".into(),
+            },
+            &reqwest::Client::new(),
+            &router,
+            &[],
+            &None,
+            &[],
+            &tx,
+            None,
+            None,
+            ReasoningLevel::High,
+            crate::runtime::openai::catalog::CodexRequestRole::Foreground,
+            &tokio_util::sync::CancellationToken::new(),
+            0,
+            &crate::runtime::trace::TraceContext::disabled(),
+            crate::runtime::child_spend::RouteSpend::NONE,
+            true,
+            None,
+        )
+        .await;
+        server.abort();
+        assert!(result.is_err());
+        assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn event_noop_never_hides_terminal_errors_unfinished_tools_or_eof() {
+        const CASES: &[&str] = &[
+            "data: {\"type\":\"response.failed\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n",
+            "data: {\"type\":\"response.incomplete\"}\n\n",
+            "data: {\"type\":\"response.refusal.done\",\"refusal\":\"no\"}\n\ndata: {\"type\":\"response.completed\"}\n\n",
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"c\",\"name\":\"bash\"}}\n\ndata: {\"type\":\"response.completed\"}\n\n",
+            "data: {\"type\":\"response.created\"}\n\n",
+            "data: [DONE]\n\n",
+        ];
+        for body in CASES {
+            let (url, seen) = spawn_scripted_codex(vec![(StatusCode::OK, vec![], body)]).await;
+            let router = ScriptedRouter::new(pinned("astra1", "acct_A", false), vec![]);
+            let (tx, _rx) = mpsc::unbounded_channel();
+            let result = call_codex_stream_with_router_for_event(
+                &ProviderConfig {
+                    base_url: url,
+                    model: "gpt-6-astra".into(),
+                    provider: "openai-codex".into(),
+                },
+                &reqwest::Client::new(),
+                &router,
+                &[],
+                &None,
+                &[],
+                &tx,
+                None,
+                None,
+                ReasoningLevel::High,
+                crate::runtime::openai::catalog::CodexRequestRole::Foreground,
+                &tokio_util::sync::CancellationToken::new(),
+                0,
+                &crate::runtime::trace::TraceContext::disabled(),
+                crate::runtime::child_spend::RouteSpend::NONE,
+                true,
+                None,
+            )
+            .await;
+            if let Ok(value) = &result {
+                assert_ne!(value["reason"], "event_noop");
+                assert!(
+                    !value["content"].as_array().unwrap().is_empty(),
+                    "unfinished tool must never be empty no-op"
+                );
+            }
+            assert_eq!(seen.lock().unwrap().len(), 1);
+        }
     }
 
     const QUOTA_429: &str = r#"{"error":{"type":"usage_limit_reached","message":"ECHOED prompt","plan_type":"plus","resets_in_seconds":3600}}"#;
@@ -6846,6 +8116,8 @@ mod send_retry_tests {
             3,
             &mut 0,
             &mut tr::StreamAttempt::new(None),
+            None,
+            &mut None,
         )
         .await
         .expect_err("400 must fail fast");
@@ -6916,6 +8188,8 @@ mod send_retry_tests {
                 3,
                 &mut 0,
                 &mut tr::StreamAttempt::new(None),
+                None,
+                &mut None,
             )
             .await
             .expect_err("400 must fail fast");
@@ -6964,6 +8238,8 @@ mod send_retry_tests {
             1,
             &mut 0,
             &mut tr::StreamAttempt::new(None),
+            None,
+            &mut None,
         )
         .await
         .expect_err("persistent 503 must exhaust the budget");
@@ -7061,7 +8337,7 @@ mod interrupted_broker_tests {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let trace = crate::runtime::trace::TraceContext::disabled();
         let result = if xai {
-            call_xai_responses_stream_inner(
+            call_responses_stream_inner(
                 &cfg,
                 &broker,
                 &[],
@@ -7074,6 +8350,7 @@ mod interrupted_broker_tests {
                 retries,
                 &trace,
                 true,
+                crate::runtime::child_spend::RouteSpend::NONE,
             )
             .await
         } else {
@@ -7093,6 +8370,8 @@ mod interrupted_broker_tests {
                 true,
                 suppressed,
                 retries,
+                crate::runtime::child_spend::RouteSpend::NONE,
+                None,
             )
             .await
         };
@@ -7210,6 +8489,19 @@ mod muse_tests {
     //! Meta Muse Responses route: exact body shape (mirrors the official
     //! Muse Code client) and an end-to-end turn through a capturing broker.
     use super::*;
+
+    /// Every broker profile's display label is one the terminal-failure
+    /// classifier trusts, so its in-stream failures stay API statuses.
+    #[test]
+    fn every_responses_profile_label_is_trusted() {
+        for profile in [XAI_RESPONSES, COPILOT_RESPONSES, MUSE_RESPONSES] {
+            assert!(
+                RESPONSES_PROVIDER_LABELS.contains(&profile.label),
+                "{}",
+                profile.label
+            );
+        }
+    }
     use crate::auth::{
         AccessToken, BrokerError, CredentialBroker, ProxyByteStream, ProxyMethod, ProxyRequest,
         ProxyResponse,
@@ -7435,6 +8727,7 @@ mod muse_tests {
             0,
             &crate::runtime::trace::TraceContext::disabled(),
             true,
+            crate::runtime::child_spend::RouteSpend::NONE,
         )
         .await
         .expect("muse turn completes");
@@ -7601,6 +8894,7 @@ mod muse_tests {
             0,
             &crate::runtime::trace::TraceContext::disabled(),
             true,
+            crate::runtime::child_spend::RouteSpend::NONE,
         )
         .await
         .expect("muse turn completes");

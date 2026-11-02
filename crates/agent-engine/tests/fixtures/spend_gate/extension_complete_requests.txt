@@ -1,0 +1,30 @@
+=== provider.complete
+{
+  "provider_id": "prov",
+  "model_id": "model-x",
+  "model": "plug:prov:model-x",
+  "messages": [
+    {
+      "content": "What's the capital of France?",
+      "role": "user"
+    },
+    {
+      "content": [
+        {
+          "text": "Paris.",
+          "type": "text"
+        }
+      ],
+      "role": "assistant"
+    },
+    {
+      "content": "And of Japan?",
+      "role": "user"
+    }
+  ],
+  "system_prompt": "You are a gate.",
+  "tools": [],
+  "temperature": null,
+  "max_tokens": null,
+  "thinking_budget": 0
+}

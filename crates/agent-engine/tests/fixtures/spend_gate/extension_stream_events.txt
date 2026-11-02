@@ -1,0 +1,3 @@
+Llm(Text("gate "))
+Llm(Text("ok"))
+=> {"content":[{"text":"gate ok","type":"text"}],"stop_reason":"end_turn","usage":{"input_tokens":3,"output_tokens":5}}

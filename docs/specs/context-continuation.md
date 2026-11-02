@@ -30,7 +30,8 @@ network, deployment, or delegation action.
 
 ## Enablement
 
-Default is off. On supported Unix hosts:
+Default is `auto` on Unix hosts (Linux, macOS), where the context archive is
+supported, and `off` elsewhere. On supported Unix hosts:
 
 ```text
 /context auto
@@ -38,7 +39,8 @@ Default is off. On supported Unix hosts:
 /context off
 ```
 
-These commands change only the current runtime. For persistent opt-in:
+These commands change only the current runtime. To set it persistently
+(`context_management.mode = off` opts out):
 
 ```text
 context_management.mode = auto
@@ -49,6 +51,12 @@ context_management.reserve_tokens = 16000
 context_management.finish_rounds = 2
 # Successor footprint after a rollover; auto = min(100000, 2/3 of pressure):
 context_management.target_tokens = auto
+# Rolling summary cap, inside the target; auto = min(15000, 15% of target), 0 = off:
+context_management.summary_tokens = auto
+# Bound on the one summary request per rollover (1–600 s):
+context_management.summary_timeout_secs = 300
+# Model that writes the rolling summary (see "Rolling summary"):
+context_management.summary_model = auto
 ```
 
 `target_tokens` is the size a rolled-over context aims for, measured over the
@@ -134,8 +142,22 @@ Invalid config disables the policy with a warning. Model tools cannot enable
 it. Opt-in authorizes local archival of eligible content from the session;
 this is independent of continuous-memory capture/recall consent.
 
-`context_checkpoint(phase, note?)` is registered only in enabled streams. The
-host assesses before provider rounds and rolls over automatically at a safe
+`context_checkpoint(phase, note?)` is offered only to enabled streams. The tool
+is stateless: a call records into the calling session's own state, which its
+tool context carries; without one it fails and records nothing. The first
+enabled turn registers it in the host's tool registry, which every session of
+a host may share. A session with context management off withholds it through
+its own session tool set (not offered, not activatable, refused if called) and
+never removes it from that registry; likewise a session whose memory backend
+is not Axel withholds the forum tools. Session conditions never mutate the
+shared registry. Two paths are unscoped and not for session tool loops:
+`Runtime::run_single` (the non-streaming legacy loop: no session tool set or
+execution gate, so withheld tools are offered and run there, recording only
+into the calling runtime's own state) and the extension-provider route's
+fallback when no retained session set is passed (a fresh default core
+without the session's withheld tools). (Skills are different: `load_skill`/`search_skills` read one
+host-wide command registry built at boot, so skill discovery is host-wide,
+not per session.) The host assesses before provider rounds and rolls over automatically at a safe
 tool boundary. `memory_search` and `memory_fetch` must remain executable and
 present in the actual schema; disabled or revoked retrieval prevents rollover.
 
@@ -143,10 +165,14 @@ present in the actual schema; disabled or revoked retrieval prevents rollover.
 
 The **same persisted session and live environment** continue. The active
 provider context advances to another window. It does not restart the process,
-reset spend or turn limits, migrate workers, acquire new permissions, or call a
-summarizer. Headless chat's old automatic in-place compaction is suppressed in
-this mode; manual `/compact` is unchanged. `run_single` rejects this mode rather
-than silently behaving differently; the TUI/chat streaming engine supports it.
+reset spend or turn limits, migrate workers or acquire new permissions. It
+makes at most one summarizer request (see *Rolling summary* below). Headless chat's old automatic in-place compaction is suppressed in
+this mode; manual `/compact` is unchanged. The TUI/chat streaming engine
+supports this mode. `run_single` does not reject it: it checks only for an
+unresolved head save (`durability_blocked`), and with context management on a
+`context_checkpoint` call there records into its own runtime's state. It has no
+session tool set or execution gate and never assesses or rolls over (see
+above: it is unscoped and not for session tool loops).
 
 1. If workers are running or finished-but-unreconciled, wait up to four admitted
    rounds (`WORKER_ROLLOVER_GRACE_ROUNDS`) for the model to collect them, then
@@ -178,7 +204,11 @@ than silently behaving differently; the TUI/chat streaming engine supports it.
    tool-call/result groups; no tool result is synthesized. The continuation
    message lists what was not retained (count plus one line per recent item,
    bounded to ~2k tokens) and points to `memory_search(source=history)`; the
-   archive still seals the full eligible history.
+   archive still seals the full eligible history. When a rolling summary is
+   on, its cap (`summary_tokens`) is reserved inside the target first, so the
+   successor with its summary still lands at about the target. The cap never
+   exceeds a fifth of the successor's message budget (target minus system and
+   tool-schema overhead), so a small target still leaves room for turns.
 3. If retained material cannot meaningfully shrink at a soft boundary, keep the
    current history and continue only if the full request still passes hard
    admission. Reassess after four admitted rounds or an 8,192-token footprint
@@ -199,9 +229,13 @@ than silently behaving differently; the TUI/chat streaming engine supports it.
 Archive retry deduplication is bound to the persisted session ID, while retrieval
 remains project-scoped. Independent sessions therefore do not accidentally
 share a retry/tombstone identity. Resume restores the saved window before the
-first request; clear/session switches/manual compaction discard the previous
-task note and phase without changing the host opt-in setting. Hidden checkpoint
-notes and synthetic continuation envelopes are excluded from source indexing.
+first request. On a legacy binding the marker's archive is verified in the
+store that session's own binding seals into (its base directory and project
+scope; for a daemon session that is its client's working directory, not the
+daemon's), and a miss restores nothing. Clear/session switches/manual
+compaction discard the previous task note and phase without changing the host
+opt-in setting. Hidden checkpoint notes and synthetic continuation envelopes
+are excluded from source indexing.
 
 The source projection excludes system/developer prompts, private reasoning,
 restricted/sensitive content and binary blocks. Ordinary text and eligible tool
@@ -246,6 +280,418 @@ event handler; RPC holds its state lock while saving. A stalled filesystem can
 therefore delay cancellation/UI handling. A timeout must never clear the durability
 block or permit inference; moving save ownership out of those control paths is
 follow-up work.
+
+## Rolling summary
+
+Each successor also carries a rolling summary of the history earlier rollovers
+dropped, so a new window reads like a fresh second window with a short record
+of roughly the last ten. After the archive is sealed and before the head is
+published, the host makes one request to the summary model
+through the `/compact` transport (preflight, host keys stripped) with every
+transport retry disabled: exactly one upstream attempt, including on HTTP 429,
+5xx and connection failures. The single-attempt policy is passed through
+routing, so it also skips the Codex persistent retry floor and Gemini's
+reset-honoring 429 loop. The request never follows an HTTP redirect (a
+redirect would replay it): routed requests use a broker whose client refuses
+redirects, and the Anthropic leg a redirect-free client. A 3xx is an answered
+request. This fails closed: when no redirect-free client can be built, the
+summary is skipped with a one-time notice before anything is reserved or
+sent, and a bounded request is never sent on another client. The request
+uses the session's credential source and token cache. With a remote
+credential source, local credentials are never consulted. With a remote
+credential broker, a summary route that
+would be proxied through the broker's `/proxy` operation is skipped before
+dispatch with a one-time notice ("the remote credential broker can't yet
+guarantee a single attempt"): the daemon dispatches proxied requests on an
+ordinary broker that follows redirects, so a single upstream attempt cannot
+be guaranteed there. Nothing is reserved or sent. Anthropic under a remote
+broker is not proxied inference: the broker only vends the credential and
+this process sends one direct Messages request on its redirect-free client,
+so that route stays allowed. Under `auto`, a session model whose route
+would be proxied falls back to the compaction model when that is usable,
+and otherwise the summary is skipped with the proxy reason. A typed
+bounded-attempt policy that the daemon acknowledges is follow-up work.
+`/compact` is unchanged.
+
+The summary model is `context_management.summary_model` (default `auto`). A
+model is usable when it is not extension-hosted, its route has an enforceable
+output ceiling (table below), and its provider's credential is not known to
+be missing (Anthropic login or `ANTHROPIC_API_KEY`, the provider's OAuth
+login, or its static key; with a remote credential broker the host cannot
+tell and assumes it is present), and, with a remote credential broker, its
+route is not proxied (above). `auto` uses the session's own model when it is
+usable, with no notice. When that model is native Anthropic, the request is
+the warm one when the warm path admits it
+([rolling-summary-warm-cache.md](rolling-summary-warm-cache.md)), otherwise
+the screened request above; an explicit `summary_model` naming the session's
+model behaves the same. A summary on native Anthropic, the fallback
+included, uses the Anthropic account already bound to the session and never
+selects one (`no_bound_seat` below). When the session's model is not usable
+(for example ChatGPT-Codex, which has no enforceable ceiling), `auto` falls
+back to the compaction model (`compaction_model`, default
+`claude-sonnet-4-6`), always as the screened request, with a one-time notice
+naming the compaction model and why the session's model was not used
+("Rolling summary model: <model> (the session model has no enforceable
+output ceiling)", or "Attempted rolling summary with <model> (…)" when that
+rollover's summary was not produced).
+When the compaction model is not usable either, is empty, or is the
+session's model, the summary is skipped with a notice giving the reason of
+the last model tried. It never picks any other model or vendor. An empty
+`compaction_model` removes only the fallback; it does not turn `auto` off.
+An explicit model is used alone, with or without a compaction model: when it
+is not usable the summary is skipped with a notice saying why. A
+`summary_model` value that is neither `auto` nor a single model id turns the
+summary off with a notice; it never falls back to `auto`. The summary is
+billed at the rates of the model that served it. A ChatGPT-Codex session (no
+enforceable ceiling) whose compaction model is also unusable, for example the
+default Anthropic model without an Anthropic login, gets plain rollovers unless an
+explicit `summary_model` is usable. Notices are said once per session
+binding per reason and summary model (so a later model change is told again);
+they can reappear after a reload. Model ids in notices have control and
+whitespace characters removed and are cut at 80 characters.
+
+The request carries a real output ceiling equal to
+the summary cap, in the field the route's endpoint documents. A route with no
+ceiling known to be accepted and enforced is never used as a summarizer: the
+rollover is a plain one that carries the previous summary forward, and a
+one-time notice says why. Coverage of the routes this router reaches:
+
+Under a remote credential broker every route except Anthropic Messages is
+proxied, so it is skipped with a notice (follow-up: a typed bounded policy
+acknowledged by the daemon); the table describes local credentials.
+
+| Route | Summary | Output ceiling sent | Live-verified |
+|---|---|---|---|
+| Anthropic Messages (`claude-*`, `anthropic/*`) | attempted (also under a remote broker: vended credential, direct request) | `max_tokens`, which counts thinking: thinking disabled where the model documents it (`between_tools` on Sonnet 5.5), omitted where it is off unless requested (before 4.5), adaptive at effort low with `max_tokens` = 2 × cap where it can't be off (Opus 5.5, Fable/Mythos 5.x); other Anthropic models are not used for the summary. Over OAuth the first system block is the transport identity, as on turns | no |
+| xAI (`xai-auth/*`), Responses | attempted | `max_output_tokens` | no |
+| GitHub Copilot, OpenAI/Azure-vendor models (Responses) | attempted | `max_output_tokens`, proxied under the Copilot identity | no |
+| GitHub Copilot, Anthropic/Google-vendor models (Chat) | attempted | `max_tokens` (catalog vendor decides; unlisted ids do not route) | no |
+| Gemini Code Assist (`google-gemini/*`) | attempted | `generationConfig.maxOutputTokens` (includes thinking) | no |
+| Groq, Cerebras (Chat) | attempted | `max_completion_tokens` | no |
+| Gemini API OpenAI-compatible (`google/*`), OpenRouter, Kimi platform and Kimi Code, Together, Fireworks, DeepInfra, NVIDIA, Mistral Codestral, Perplexity, SambaNova, Hugging Face (Chat) | attempted | `max_tokens` | no |
+| `local/*` (the user's own OpenAI-compatible server) | attempted | `max_tokens`, or `max_completion_tokens` when the endpoint is an official OpenAI/Azure host | no |
+| Any Chat route whose endpoint is the official OpenAI host (`api.openai.com`, regional `*.api.openai.com`) or an Azure OpenAI host (`*.openai.azure.com`) over HTTPS | attempted | `max_completion_tokens` for every model, without guessing model families | no |
+| Other static OpenAI-compatible providers (Hyperbolic, Scaleway, SiliconFlow, Chutes, OVHcloud, InferX) | skipped, notice | no documented ceiling verified for them here | no |
+| ChatGPT-Codex (`openai-codex/*`) | skipped, notice | none: the official Codex client sends no output limit to that backend and nothing available shows it accepting `max_output_tokens`; a bounded single-attempt request to it is also refused before sending | no |
+| Extension-hosted providers | skipped, notice | none: the extension owns its transport, so a single attempt, a ceiling and usage reporting cannot be enforced | no |
+
+Native `openai/*`, `azure-openai/*`, `google-vertex/*` and Muse routes are not
+reachable through this summary router; they are unsupported for summaries, not
+covered. "Attempted" means the request is sent with that field. "Live-verified"
+says whether a live smoke test against the provider confirmed that it accepts
+the field, enforces it on all billed output (including reasoning), makes one
+attempt, and reports usage matching the host's booking; every route above is
+unverified ("no") until such a test is recorded here.
+
+The request holds the previous summary (from the
+current continuation metadata) and a text projection of the messages this
+successor does not retain. The projection is the archive's own screened,
+redacted projection, rendered under `compaction_exclude`, with thinking always
+excluded and no attachment or binary payloads. All bounds are in bytes after
+escaping: 8,000 per entry, 32,000 for the file-operations record (paths
+listed newest-touched first, so the cut drops the oldest), 96,000 for
+the previous summary (its newest end kept), and a 400,000-byte ceiling on the
+whole request input; the newest dropped messages are kept and every cut is
+marked. A request over the ceiling is not sent.
+
+This request is a narrow exception to "no provider request before the
+durable-head acknowledgement". It is sent only after the source archive is
+sealed, it carries no tools and cannot act, and it never continues the
+conversation: the successor's first inference still waits for the durable-head
+acknowledgement, and a missing or failed acknowledgement still blocks it.
+
+The reply is Markdown organized by window: the window just closed in the most
+detail, older windows progressively shorter, windows more than ten back folded
+into one short "Earlier windows" paragraph. It records state, decisions, open
+items, identifiers (IDs, paths, commits), who asked for what and what is
+pending, and leaves out chit-chat and repeated status. The host enforces the
+shape: it drops sections headed with a window after the one being closed
+(window numbers are untrusted; arithmetic on them is checked), folds windows
+more than ten back (about 400 characters each, the paragraph bounded at 4,000),
+compresses the oldest detailed windows while the summary is over
+`summary_tokens` (conservative-estimator tokens), and cuts hard only as a last
+resort. The cut's marker is shortened or omitted when it does not fit, so the
+result always fits the cap, even a cap of zero. The summary is escaped like the working note. It enters
+the continuation message as untrusted historical data, and it is stored in the
+continuation metadata (`summary.text`) for the next rollover. Each window's
+full detail stays in that window's archive. The summary text itself is
+persisted with the durable head, not inside the archive record: the archive
+excludes derived continuation content, and its note field is capped at 8 KiB.
+
+Failure is never fatal and is never retried in a loop. The one exception is
+a refusal (stop reason `refusal`) of a sent warm request: one screened request
+follows through the usual cold path and summary model, with its own
+admission, reservation and booking, but only while at least 90 s of the
+summary timeout are left, and it gets what is left as its own limit. A
+refusal tends to repeat on the same content, so the warm request is never
+retried, and no other failure gets a second request. A reply that stopped
+with a refusal is never used as the summary, even with text before the
+refusal. With no remote summarizer
+(`compaction_mode = local`), nothing dropped, a projection or provider error,
+an empty reply, a timeout (`summary_timeout_secs`, default 300 s), or a cancel,
+the rollover proceeds as before and carries the previous summary forward
+unchanged, alongside the dropped index. A cancel still stops the rollover
+before head publication, with history retained. `summary_tokens = 0` disables
+the summary; nothing is requested or carried. The timeout default is 300 s
+because a warm summary at xhigh or max effort may write up to cap + 32,000
+output tokens, and about 110 tokens/s was observed live; 120 s, the earlier
+default, ended long ones early.
+
+The summary request is billed like any other call. Usage is taken from the
+reply of every route that reports it (the Anthropic response, the last usage
+report of Chat Completions and Responses streams, Gemini's `usageMetadata`
+with thinking tokens counted as output), separately from whether the reply
+text was usable, so an empty reply is still billed. A failed reply that
+reported its final usage is charged that usage too: a Responses
+`response.incomplete` (for example at the output ceiling), `response.failed`
+or a completion without text, and a Gemini stream error after the report sent
+with its finish reason. The previous summary is carried forward. A running
+Gemini count before the finish reason is not a final report. Usage counts as reported
+only when it carries numeric input and output counters; explicit zeros are a
+report, while an absent, `null` or empty usage object, or a partial one
+without an output count, is not (missing output is not free output). It is
+booked into the turn's cost and token totals, priced at the summary model's
+rates, and so counts against `max_cost_usd`. It is also emitted as a session
+usage event tagged with that model. It does not replace the conversation's
+latest context footprint or request count, which bound and calibrate the
+conversation's own requests.
+
+Before sending, the host prices the request's upper bound: the conservative
+input estimate plus the output ceiling it actually sends, at the model's
+rates. If that exceeds what remains of the turn's cost budget (measured spend
+plus held reservations), the host skips the summary, performs a plain
+rollover that carries the previous summary forward, and says why once.
+Otherwise it reserves that amount before sending, then settles it by the
+request's typed failure stage and route:
+- reported usage: the measured cost is booked and the reservation released;
+- not dispatched: nothing reached the provider (preflight or routing refusal,
+  local body or reasoning validation, Gemini setup, a broker refusal such as
+  a missing credential or policy denial, or a connection that could not be
+  established on the only attempt with no redirect followed). The broker
+  reports a failed connection as a typed `ConnectFailed` only on a client
+  that refuses redirects (after a followed redirect an earlier hop already
+  received the request), and routed transports keep that type rather than
+  flattening it to text. Which broker errors are pre-send is an explicit list.
+  The reservation is released;
+- rejected before generation: only on the official, non-overridden Anthropic
+  host, only on the only attempt, and only for a parsed
+  `invalid_request_error` (400), `authentication_error` (401) or
+  `permission_error` (403). The reservation is released;
+- unknown: everything else after the request was sent — any HTTP error from an
+  overridden Anthropic endpoint, a router, a proxy, Copilot or another
+  broker-routed or OpenAI-compatible provider; 409, 413 and 429 on every
+  route; 408 and 5xx; any 3xx; a timeout, cancel or disconnect after sending;
+  a reply without usable usage (including a failed reply without a final
+  report, or with only a partial one). The reservation stays held for the rest of the turn
+  as a conservative charge, so repeated failures use up the allowance.
+Reservations count against `max_cost_usd` but are kept apart from measured
+spend and token totals. The request's wall-clock time
+falls in the closing window's segment, before the successor's fresh allowance
+starts.
+
+## Observability
+
+Three `info` events under the tracing target `synaps::context`, with flat
+`key=value` fields (no nesting, no quoting of codes). They carry metadata only:
+a session label, window numbers, the archive id, counts, token numbers and
+fixed reason codes — never message content, titles, prompts, file paths, tool
+arguments or model names. Token numbers are conservative estimates unless
+named `provider_*`; a `provider_*` field or `calibration_ratio` is absent when
+no provider count is known.
+
+**Enabling.** The events are written to the daemon's log file
+(`synaps.log` in the active config directory) by default: the standard
+logging setup enables `synaps::context=info`. `RUST_LOG` can override that
+target (`RUST_LOG=synaps::context=off` silences it;
+`RUST_LOG=synaps::context=info` enables it under a custom setup). Bare
+global levels such as `RUST_LOG=warn` or `RUST_LOG=off` do not override
+this built-in target default; to suppress context telemetry use
+`RUST_LOG=synaps::context=off` or a covering directive such as
+`RUST_LOG=synaps=off`. The standard file formatter hides targets, so a line is identified by its
+message (`context rollover`, `context window settled`, `context rollover
+deferred`); the example lines below use a formatter that shows the target.
+Interest must exist when a rollover is prepared: the successor's sizes are
+measured, and its settle comparison armed, only then. Enabling the target
+mid-window does not retroactively arm a comparison, and disabling it can
+drop a pending event. The file writer is non-blocking and lossy under
+backlog. These events are diagnostics, not an audit trail: a missing line
+proves nothing.
+
+**Session label.** A logical session id is supplied by whoever binds the
+session, so it is logged only when it is *generated-shaped*: it has a shape
+the runtime itself generates — `YYYYMMDD-HHMMSS-xxxx` (four lowercase hex
+digits), a canonical lowercase UUID, or `ephemeral-<uuid>` — and is then
+logged as `session=<id>`. The shape is checked, not the provenance: a caller
+can bind an id of that shape, which is then logged as-is (the shapes admit
+only digits, lowercase hex and fixed separators, so no free text, paths or
+control characters). Any other id — including any non-ASCII id — is logged
+as `session_ref=<12 hex>` instead: the first 48 bits of an HMAC-SHA256 of
+the id under a random key made once per process. This is process-local
+pseudonymous correlation, not anonymity: it correlates events of one session
+within one process, is not stable across restarts, and does not expose the
+raw id or allow offline guessing without the key; 48 bits are not
+collision-proof across very many distinct ids, and code in the same process
+that can log chosen ids could test guesses.
+
+- `context rollover`, once per committed rollover (after the durable head is
+  acknowledged and the commit's binding check passes):
+  - `session`/`session_ref`, `window_from`, `window_to`, `archive`;
+  - `trigger`: `hard_capacity|wall_clock|phase_boundary|rollover_band|rollover_pending|other`;
+  - `footprint_tokens`: the pre-rollover assessment (system + tool schemas +
+    messages);
+  - `provider_context_tokens`: latest provider input + cache read + cache
+    write (this turn's last booked request, else the session's sample for
+    this model);
+  - `calibration_ratio`: estimate/provider of the sample used, if any;
+  - `target_tokens`: the configured successor footprint, in provider units
+    when calibrated (the one number here that is not an estimate);
+  - `target_history_tokens`: the estimator budget for the successor's
+    messages: the target minus overhead, converted to estimator units at the
+    sample's messages-only ratio (or the whole target at `calibration_ratio`
+    when that does not apply, see `target_tokens` above), with overhead plus
+    messages capped at 2/3 of the pressure threshold; it includes the room for the
+    continuation envelope (archive pointer, dropped index, note) and the
+    rolling summary, not only retained messages;
+  - `history_budget_tokens`: the safe history allowance — the context window
+    minus the larger of the request reserves (output, thinking, tool growth,
+    safety margin, advisory room) and the configured `reserve_tokens`, and
+    minus overhead; a successor at or above it is refused (`admission`);
+  - `history_target_tokens`: what the successor was sized to:
+    `target_history_tokens` clamped below `history_budget_tokens`, less room
+    for the rolling summary's second copy (admission's estimate also counts
+    the copy in the continuation message's metadata) and 512 tokens of
+    slack for a pinned stub (equal to `target_history_tokens` when the
+    budget exceeds it by that room, as in every 1M window). The admission
+    check counts the metadata copy too;
+  - `overhead_tokens`: the assessment minus the estimate of the original
+    messages (saturating). This is mainly system prompt and tool schemas but
+    can include request-only transformations; it is not measured separately;
+  - `successor_tokens`: `overhead_tokens` + the estimate of the rendered
+    successor messages, envelope included;
+  - `retained_messages`, `dropped_messages`: original messages kept / not
+    kept (the new envelope message is not counted);
+  - `must_keep_tokens`: the mandatory set (framing, protocol tail, turn
+    start, attachment turns) before optional fill;
+  - `workers_carried`: the pending workers the successor's manifest lists
+    (the same union as the deferral's `workers`; `0` when none). Nonzero
+    after the worker grace ran out or at hard capacity;
+  - `continuation_tokens`: the whole continuation message as sent (envelope
+    text, summary block, metadata); `summary_tokens` is the summary text
+    alone, so it is part of `continuation_tokens`;
+  - `summary`: `written|carried_forward|skipped`; `summary_reason`:
+    `ok|disabled|nothing_dropped|no_summarizer|extension_hosted|no_enforceable_ceiling|missing_credentials|invalid_summary_model|remote_proxy|no_bounded_transport|no_bound_seat|not_admitted|unaffordable|run_deadline|failed`
+    (`no_bound_seat`: the summary would go to native Anthropic but the
+    session has no Anthropic account bound on its credential source that
+    the selection still names; a background request never selects one, so
+    nothing is reserved, vended or sent and the previous summary is
+    carried; `run_deadline`: a worker run's deadline had passed at the
+    seal, so no summary request was started; a deadline that passes later
+    ends the attempt as a timeout or failure, `failed`);
+  - the summary attempt (design: `rolling-summary-warm-cache.md` §9):
+    `summary_attempted_path` (`warm|cold|none`; `warm` means a warm
+    request was sent — its body published or a response received — not
+    that it hit the cache; a warm attempt that timed out or was canceled
+    before that reports `none` with terminal `timeout`/`canceled` and no
+    id: the reporter withdraws the unpublished body, so no body byte can
+    leave afterwards; `cold` means the screened request was started,
+    also as the one attempt after a refused warm request, when
+    `summary_cold_reason=warm_refusal` says so and the line's id and
+    `summary_warm_settled_microusd` belong to that warm request while its
+    other attempt fields describe the screened one); `summary_warm_miss`, why
+    the warm path was not used when it was considered (`no_record`,
+    `scope`, `stale`, `no_cache_evidence`, `thinking`, `limit`,
+    `admission`, `prefix_policy`, `superseded`, …); `summary_terminal`
+    (`written|empty|empty_after_fold|length|tool_call|refusal|missing_terminal|other_stop|error|timeout|canceled|not_sent|discarded`;
+    `discarded` = answered after the session changed, text not used;
+    `empty_after_fold` = the reply had text but nothing was left after
+    the host's shape enforcement, e.g. its only section was for a later
+    window: a failed summary, the previous one is carried forward);
+    `summary_limit_tokens` (the request's output ceiling);
+    `summary_cache_age_s` (the warm record's cache age at the decision);
+    `summary_reserved_microusd`, `summary_settled_microusd` (worst case
+    held, measured cost booked; rounded up); `summary_duration_ms`
+    (always, sent or not; after a refusal, both attempts);
+    `summary_cold_reason` (`warm_refusal`, only when the screened request
+    followed a sent warm request); `summary_warm_settled_microusd` (that
+    warm request's measured cost, only then and only when measured); `summary_error_status`, only with terminal
+    `error` on a request that was sent: the HTTP status number, or
+    `envelope` (a 200 whose body is an error), `decode` (a 200 that did
+    not decode), `stream` (a streamed 200 that failed), `network` (no
+    response); absent when the transport does not report it (routed
+    providers); never provider text (the `rollover summary request
+    failed` log line adds the failure's static kind as `error_type`: an
+    in-stream error frame's vetted type or `unrecognized_error`,
+    `transport`, `idle_timeout`, `empty_response`, `header_timeout`, or an
+    HTTP error body's vetted type); `summary_id`, 64 random bits as 16 hex digits,
+    present only for a warm request that was sent; that request's own
+    telemetry record carries it as `rollover_summary`. Provider
+    counters appear only when the provider reported them, never
+    zero-filled: `provider_summary_input_tokens` (uncached),
+    `…_output_tokens`, `…_cache_read_tokens`, `…_cache_write_tokens`
+    (`_5m`/`_1h` where reported); `summary_cache_read_pct` =
+    floor(100 · read / (input + read + write)), only when all three were
+    reported and their sum is positive. The screened (cold) request's
+    normalized usage fills missing cache counts with zero, so it reports
+    input and output only and no read share.
+- `context window settled`, once per window: the first provider usage booked
+  after the rollover, on any attempt of any request — including an attempt
+  that then failed or was retried; within one request with retries, the
+  first attempt that reported usage counts. `session`/`session_ref`,
+  `window`, `provider_context_tokens` (that attempt's input + cache read +
+  cache write), `request_tokens` (the host's assessment of that request,
+  taken before any request-only context advisory is appended),
+  `successor_tokens` and `target_tokens` (from the rollover),
+  `rounds_since_rollover` (provider calls in the window that returned or
+  reported usage, this one included; a call canceled before sending or
+  failed without usage is not counted and does not settle). If the model
+  changes before the window settles, the window is not settled at all: the
+  pending comparison is dropped, since another model's tokenizer and limits
+  do not measure this rollover. A session reset likewise drops it.
+- `context rollover deferred`, when a wanted rollover did not happen:
+  `session`/`session_ref`, `window`, `reason`, `workers`, `footprint_tokens`,
+  `provider_context_tokens`, with `reason` one of `workers_pending`,
+  `unproductive_no_shrink` (including the cooldown rounds that follow),
+  `retrieval_unavailable` or `head_not_acknowledged`. `workers` is the number of distinct pending
+  workers: the union of the orchestration's unreconciled handles (running,
+  or finished and not yet reconciled) and the registry's running handles
+  (0 for other reasons). Logged once per reason per window, and again only
+  when the footprint reaches a further absolute multiple of 50,000 tokens
+  (a first event at 449,999 can repeat at 450,000).
+- `context rollover refused: successor over the hard budget` (`reason=admission`)
+  or `context rollover refused: archive commit failed`
+  (`reason=archive_failure`), when a needed rollover could not be prepared
+  and the turn ends with the error (history retained): the deferral's
+  fields, under the same rate limit.
+
+The token sizes of the successor (`successor_tokens`, `continuation_tokens`,
+`summary_tokens`) cost one extra estimate pass over the successor; it is
+skipped when no subscriber has `synaps::context` enabled at `info` while the
+rollover is prepared, and then no settle comparison is armed either. If
+interest appears after preparation (for example while the frontend is
+acknowledging the head), the `context rollover` event is still logged, but
+with `measured=false` and without those three fields — never with zeros. A
+measured event carries no `measured` field.
+
+Example lines (values illustrative):
+
+```text
+INFO synaps::context: context rollover session=20260916-101112-a3f9 window_from=3 window_to=4 archive=9f2c… trigger=rollover_band footprint_tokens=402311 provider_context_tokens=398020 calibration_ratio=1.01 target_tokens=100000 target_history_tokens=74210 history_budget_tokens=930000 history_target_tokens=74210 overhead_tokens=26800 successor_tokens=96400 retained_messages=41 dropped_messages=388 must_keep_tokens=12040 workers_carried=0 continuation_tokens=16900 summary=written summary_reason=ok summary_tokens=14200
+INFO synaps::context: context window settled session=20260916-101112-a3f9 window=4 provider_context_tokens=97500 request_tokens=98100 successor_tokens=96400 target_tokens=100000 rounds_since_rollover=1
+INFO synaps::context: context rollover deferred session_ref=4be0c19a7d23 window=4 reason=workers_pending workers=2 footprint_tokens=410000 provider_context_tokens=405000
+```
+
+To check that sessions settle near the target, pair each `context rollover`
+with the next `context window settled` of the same session label and window
+and compare `provider_context_tokens` with `target_tokens` (and with
+`successor_tokens` to see the estimate's error). A rollover with no settled
+event had its model changed, its session reset, no provider-reported usage
+since, was not measured (`measured=false`), or its event was lost: the
+target was disabled when it would have been logged, or the lossy writer
+dropped the line. A provider footprint in the rollover band of a managed session
+is either followed by a `context rollover` or covered by an earlier `context
+rollover deferred` for that session and window (deferrals are rate-limited,
+not repeated per request); one with neither most likely came from a request
+outside context management, such as a worker or a session with the mode off.
 
 ## Short retrieval tools
 

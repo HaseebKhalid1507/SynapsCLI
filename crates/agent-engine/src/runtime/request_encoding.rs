@@ -544,6 +544,7 @@ mod tests {
 mod transport_tests {
     use super::RequestCompression;
     use crate::runtime::api::{ApiMethods, ApiOptions};
+    use crate::runtime::api_sync::SimpleCallPolicy;
     use crate::runtime::telemetry::TelemetryLevel;
     use crate::runtime::types::AuthState;
     use crate::{StreamEvent, ToolRegistry};
@@ -787,10 +788,11 @@ mod transport_tests {
                 0,
                 agent_core::reasoning::ReasoningLevel::Adaptive,
                 &near,
-                0,
+                SimpleCallPolicy::compaction(0),
                 &opts,
             )
             .await
+            .text
             .expect("compaction");
             let seen = seen.lock().unwrap();
             assert_eq!(seen.len(), 3, "{model}");
@@ -833,9 +835,18 @@ mod transport_tests {
         .await
         .expect("sync");
         ApiMethods::call_api_simple(
-            &auth(), &reqwest::Client::new(), model, "summarize", 0, level, &messages(), 0, &opts,
+            &auth(),
+            &reqwest::Client::new(),
+            model,
+            "summarize",
+            0,
+            level,
+            &messages(),
+            SimpleCallPolicy::compaction(0),
+            &opts,
         )
         .await
+        .text
         .expect("compaction");
         let seen = seen.lock().unwrap();
         let displays: Vec<&Value> = seen.iter().map(|(_, b)| &b["thinking"]["display"]).collect();
@@ -873,10 +884,11 @@ mod transport_tests {
             0,
             agent_core::reasoning::ReasoningLevel::Adaptive,
             &messages(),
-            0,
+            SimpleCallPolicy::compaction(0),
             &options(&url, c.clone()),
         )
         .await
+        .text
         .expect("compaction survives the refusal");
         assert_eq!(text, "summary");
         assert!(c.refused());

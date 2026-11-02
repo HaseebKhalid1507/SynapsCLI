@@ -63,6 +63,15 @@ pub(super) const MIN_WINDOW_CLAMPED_RESPONSE_TOKENS: u64 = 4_096;
 
 pub(crate) struct HelperMethods;
 
+/// The standard native window (B32): a request on a window this size or
+/// smaller is held to [`STANDARD_WINDOW_MAX_TOKENS`] of output whatever the
+/// model's maximum (see [`HelperMethods::max_tokens_for_request`]).
+pub(super) const NATIVE_WINDOW_TOKENS: u64 = 200_000;
+
+/// The output cap of every request on a window of at most
+/// [`NATIVE_WINDOW_TOKENS`].
+pub(super) const STANDARD_WINDOW_MAX_TOKENS: u64 = 64_000;
+
 /// Map a terminal [`crate::RuntimeError`] to the spec §5.2 typed
 /// [`agent_core::TurnError`]. This is the SINGLE derivation point: every
 /// frontend receives the resulting typed outcome (variant + correlation ID)
@@ -101,13 +110,15 @@ pub(crate) fn turn_error_for(
 /// assistant message left with none is dropped whole).
 fn sanitation_keeps_block(block: &Value) -> bool {
     match block["type"].as_str() {
-        // Text, or an omitted-display block's signature alone (empty text,
-        // the reasoning in the signature): the API takes those back. One
-        // with neither is a 400 ("each thinking block must contain thinking").
+        // A `thinking` string with a non-empty signature: text, or an
+        // omitted-display block's signature alone (empty text, the
+        // reasoning in the signature). One with neither is a 400 ("each
+        // thinking block must contain thinking"), and an unsigned one (an
+        // interrupted stream) is never replayed.
+        // PARITY: upstream's omitted-display keep + ours' signature rule.
         Some("thinking") => {
-            block["thinking"].as_str().is_some_and(|s| !s.is_empty())
-                || (block["thinking"].is_string()
-                    && block["signature"].as_str().is_some_and(|s| !s.is_empty()))
+            block["thinking"].is_string()
+                && block["signature"].as_str().is_some_and(|s| !s.is_empty())
         }
         Some("redacted_thinking") => block["data"].as_str().is_some_and(|s| !s.is_empty()),
         Some("text") => block["text"].as_str().is_some_and(|s| !s.is_empty()),
@@ -274,8 +285,9 @@ impl HelperMethods {
     /// can't permanently brick a session.
     ///
     /// Algorithm:
-    ///   1. For each assistant message, retain only valid (`thinking` non-empty,
-    ///      `redacted_thinking` data non-empty, or any other type).
+    ///   1. For each assistant message, retain only valid (`thinking` a string
+    ///      with a non-empty signature, `redacted_thinking` data non-empty, or
+    ///      any other type).
     ///   2. Also drop any text blocks that are empty/whitespace-only — those would
     ///      trigger the "text content blocks must be non-empty" error.
     ///   3. If an assistant message ends up with no content at all, mark it for
@@ -352,6 +364,46 @@ impl HelperMethods {
             out.push(msg);
         }
         *messages = out;
+    }
+
+    /// Cut the last message after its last cache-marked block, whole blocks
+    /// only: what follows the marker is request-local (turn context) and not
+    /// part of the cached prefix. `false` (unchanged): the last message has
+    /// no marked block.
+    pub(super) fn cut_after_marker(messages: &mut [SharedMessage]) -> bool {
+        let Some(last) = messages.last_mut() else {
+            return false;
+        };
+        let Some(pos) = last["content"]
+            .as_array()
+            .and_then(|blocks| blocks.iter().rposition(|b| b.get("cache_control").is_some()))
+        else {
+            return false;
+        };
+        if last["content"].as_array().is_some_and(|b| b.len() > pos + 1) {
+            if let Some(blocks) = Arc::make_mut(last)["content"].as_array_mut() {
+                blocks.truncate(pos + 1);
+            }
+        }
+        true
+    }
+
+    /// Append a request-local `tail` message after projected history: as
+    /// trailing blocks of the last message when it has the same role (the
+    /// alternation rule), otherwise as its own message. Earlier blocks,
+    /// including a cache marker on the last one, are left exactly as they are.
+    pub(super) fn append_tail_message(messages: &mut Vec<SharedMessage>, tail: SharedMessage) {
+        match messages.last_mut() {
+            Some(last) if last["role"] == tail["role"] => {
+                let tail_content = Self::coerce_content_to_blocks(tail["content"].clone());
+                let last = Arc::make_mut(last);
+                let prev = std::mem::take(&mut last["content"]);
+                let mut merged = Self::coerce_content_to_blocks(prev);
+                merged.extend(tail_content);
+                last["content"] = Value::Array(merged);
+            }
+            _ => messages.push(tail),
+        }
     }
 
     /// Normalize a `content` value to a Vec of content blocks. Anthropic accepts
@@ -609,9 +661,15 @@ impl HelperMethods {
         )
     }
 
-    /// Returns the max output tokens for a given model.
-    /// Opus-class models support 128K, Sonnet/Haiku cap at 64K.
+    /// The model's maximum output, whatever the window: Opus-class models
+    /// support 128K, Sonnet/Haiku cap at 64K. Only the summary routes'
+    /// ceilings (`rolling_summary`, `warm_summary`) read it directly; a real
+    /// request's output cap is [`Self::max_tokens_for_request`].
     pub(super) fn max_tokens_for_model(model: &str) -> u64 {
+        #[cfg(test)]
+        if let Some(limit) = MAX_TOKENS_FOR_TEST.with(std::cell::Cell::get) {
+            return limit;
+        }
         if model.contains("opus") {
             128000
         } else {
@@ -644,6 +702,149 @@ impl HelperMethods {
             .unwrap_or(0)
             .saturating_add(MIN_WINDOW_CLAMPED_RESPONSE_TOKENS);
         max_tokens.min(room.max(floor))
+    }
+
+    /// THE static per-request output cap (B32): the `max_tokens` a request
+    /// sends out of R1's scope (then fit by [`Self::fit_max_tokens_to_window`]
+    /// on models that reject input + `max_tokens` over the window), the cap
+    /// its context assessment bounds the expected output by
+    /// (`stream::pre_request_context_budget`, `Runtime::assess_context`, the
+    /// ledger estimates), and the ceiling of
+    /// [`Self::output_tokens_for_request`] in scope. Every site reads this one
+    /// function. `context_window` is the EFFECTIVE window: the configured
+    /// override when set, the model's native window otherwise.
+    ///
+    /// Opus-class models may emit 128K, but reserving 128K on a 200K window
+    /// left a ~31.5K request ceiling (and a ~18.9K history budget), so the
+    /// 128K cap applies only above 200K; at or below it every model gets
+    /// 64K. The live-acceptance test override is honoured as is.
+    ///
+    /// PARITY (E2): out of R1's scope the assessment reserves upstream's
+    /// expected output (#341:
+    /// [`EXPECTED_RESPONSE_TOKENS`](super::context::EXPECTED_RESPONSE_TOKENS)
+    /// on top of the thinking, bounded by this cap), not the cap itself.
+    ///
+    /// R1 ("usable 200K"): a native Anthropic request on a window of at most
+    /// 200K ([`Self::dynamic_output_in_scope`]) reserves and sends
+    /// [`Self::output_tokens_for_request`]: this cap lowered to the room
+    /// left, never below its thinking budget +
+    /// [`ANSWER_FLOOR_TOKENS`](super::context::ANSWER_FLOOR_TOKENS) (16,384).
+    /// One value sizes both the reserve and the wire, so estimated input +
+    /// `max_tokens` <= window - tool reserve - safety - advisory. With xhigh
+    /// thinking (32,768) and the default 30,000-byte tool cap the input
+    /// ceiling at 200K is 200,000 - (49,152 + 10,000 + 30,000 + 512) =
+    /// 110,336 before the window's first provider-reported input, and
+    /// 200,000 - (49,152 + 10,000 + 10,000 + 512) = 130,336 after it (5%
+    /// margin). Every summary and keep-warm ceiling keeps this cap.
+    pub(super) fn max_tokens_for_request(model: &str, context_window: u64) -> u64 {
+        #[cfg(test)]
+        if let Some(limit) = MAX_TOKENS_FOR_TEST.with(std::cell::Cell::get) {
+            return limit;
+        }
+        let model_max = Self::max_tokens_for_model(model);
+        if context_window > NATIVE_WINDOW_TOKENS {
+            model_max
+        } else {
+            model_max.min(STANDARD_WINDOW_MAX_TOKENS)
+        }
+    }
+
+    /// Whether a request's output is sized to the room left (R1): only a
+    /// native Anthropic Messages request (bare `claude-*` ids and
+    /// `anthropic/…`) on an effective window of at most
+    /// [`NATIVE_WINDOW_TOKENS`]. Larger windows (a 1M configuration), every
+    /// other provider and wire (including Anthropic models served through
+    /// another provider's transport, which builds its own body) and the
+    /// cloud routes keep [`Self::max_tokens_for_request`] and the flat
+    /// safety margin exactly.
+    pub(super) fn dynamic_output_in_scope(model: &str, context_window: u64) -> bool {
+        use crate::runtime::openai::WireProtocol;
+        if context_window > NATIVE_WINDOW_TOKENS {
+            return false;
+        }
+        // Other providers' routes never reach the native transport; do not
+        // resolve them (local routing may read endpoint configuration).
+        if model.contains('/') && !model.starts_with("anthropic/") {
+            return false;
+        }
+        crate::runtime::openai::resolve_route(model).is_some_and(|route| {
+            route.provider == "anthropic" && route.wire == WireProtocol::AnthropicMessages
+        })
+    }
+
+    /// The least output an in-scope request is sized to (R1): its thinking
+    /// budget (0, the adaptive sentinel, counts as the legacy fallback the
+    /// wire would send; a budget at or over the cap counts as the clamped
+    /// `cap - 1`, see [`Self::anthropic_thinking_budget`]) plus
+    /// [`ANSWER_FLOOR_TOKENS`](super::context::ANSWER_FLOOR_TOKENS) of
+    /// answer room, never above `cap`. Always above the `budget_tokens` the
+    /// wire sends, so `max_tokens > budget_tokens` holds and the budget (part
+    /// of the prompt-cache key) is never clamped by the lower output.
+    pub(super) fn output_floor_tokens(cap: u64, thinking_budget_tokens: u64) -> u64 {
+        let thinking = if thinking_budget_tokens == 0 {
+            u64::from(crate::core::models::DEFAULT_LEGACY_ADAPTIVE_FALLBACK)
+        } else {
+            thinking_budget_tokens
+        };
+        thinking
+            .min(cap.saturating_sub(1))
+            .saturating_add(super::context::ANSWER_FLOOR_TOKENS)
+            .min(cap)
+    }
+
+    /// THE output of a request (R1): the `max_tokens` it sends AND the output
+    /// its admission reserves. In scope ([`Self::dynamic_output_in_scope`])
+    /// it is [`Self::max_tokens_for_request`] lowered to `room_tokens` (the
+    /// window minus the input footprint, the next tool result, the safety
+    /// margin and the advisory reserve), never below
+    /// [`Self::output_floor_tokens`]. Out of scope it is the cap, whatever
+    /// the room.
+    ///
+    /// Admission follows from the same value: the reserve is this output, so
+    /// a request is admitted exactly while `room_tokens >= output`, i.e.
+    /// while the room left is at least the floor; below it the existing
+    /// hard-capacity rollover fires. Admitted, footprint + max_tokens <=
+    /// window - tool reserve - safety margin - advisory.
+    pub(super) fn output_tokens_for_request(
+        model: &str,
+        context_window: u64,
+        thinking_budget_tokens: u64,
+        room_tokens: u64,
+    ) -> u64 {
+        let cap = Self::max_tokens_for_request(model, context_window);
+        if !Self::dynamic_output_in_scope(model, context_window) {
+            return cap;
+        }
+        room_tokens.clamp(Self::output_floor_tokens(cap, thinking_budget_tokens), cap)
+    }
+
+    /// The `budget_tokens` a budgeted-thinking Anthropic request sends for
+    /// `thinking_budget` (0, the adaptive sentinel, becomes the legacy
+    /// fallback) under an output cap of `max_tokens`. The API requires
+    /// `max_tokens > budget_tokens`. Every named level fits (at most 32,768
+    /// < 64K); only a custom budget (`/thinking N`, config, resume) can
+    /// reach the cap, and it is clamped to `max_tokens - 1`, logged once
+    /// per process.
+    pub(super) fn anthropic_thinking_budget(thinking_budget: u32, max_tokens: u64) -> u32 {
+        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        let budget = if thinking_budget == 0 {
+            crate::core::models::DEFAULT_LEGACY_ADAPTIVE_FALLBACK
+        } else {
+            thinking_budget
+        };
+        if u64::from(budget) < max_tokens {
+            return budget;
+        }
+        let clamped = u32::try_from(max_tokens.saturating_sub(1)).unwrap_or(u32::MAX);
+        if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            tracing::warn!(
+                budget,
+                max_tokens,
+                clamped,
+                "thinking budget does not fit below the request's max_tokens; clamped"
+            );
+        }
+        clamped
     }
 
     /// Append a single-line usage record to the per-call log — opt-in via the
@@ -1007,6 +1208,58 @@ mod tests {
             assert!(
                 foreign.iter().zip(&before).all(|(a, b)| Arc::ptr_eq(a, b)),
                 "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn unsigned_thinking_replay_is_projected_out_without_mutating_history() {
+        let user = Arc::new(json!({"role":"user","content":"task"}));
+        let broken = Arc::new(json!({"role":"assistant","content":[
+            {"type":"thinking","thinking":"synthetic partial","signature":""}
+        ]}));
+        let next = Arc::new(json!({"role":"user","content":"continue"}));
+        let original = vec![user, broken, next];
+        let before = serde_json::to_value(&original).unwrap();
+        let mut projected = original.clone();
+        HelperMethods::sanitize_thinking_blocks(&mut projected);
+        assert_eq!(serde_json::to_value(&original).unwrap(), before);
+        assert_eq!(projected.len(), 1);
+        assert_eq!(projected[0]["role"], "user");
+        assert_eq!(
+            projected[0]["content"],
+            json!([
+                {"type":"text","text":"task"}, {"type":"text","text":"continue"}
+            ])
+        );
+    }
+
+    #[test]
+    fn unsigned_thinking_replay_keeps_signed_blocks_text_and_tool_pairs() {
+        for signature in [None, Some(json!(null)), Some(json!("")), Some(json!(3))] {
+            let mut bad = json!({"type":"thinking","thinking":"synthetic partial"});
+            if let Some(signature) = signature {
+                bad["signature"] = signature;
+            }
+            let signed =
+                json!({"type":"thinking","thinking":"synthetic complete","signature":"sig_ok"});
+            let redacted = json!({"type":"redacted_thinking","data":"opaque"});
+            let text = json!({"type":"text","text":"visible answer"});
+            let call = json!({"type":"tool_use","id":"toolu_fixture","name":"read","input":{}});
+            let result = json!({"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_fixture","content":"done"}]});
+            let mut messages = vec![
+                json!({"role":"assistant","content":[
+                    bad, signed.clone(), redacted.clone(), text.clone(), call.clone()
+                ]}),
+                result.clone(),
+            ];
+            sanitize_vals(&mut messages);
+            assert_eq!(
+                messages,
+                vec![
+                    json!({"role":"assistant","content":[signed,redacted,text,call]}),
+                    result
+                ]
             );
         }
     }
@@ -1720,4 +1973,14 @@ mod tests {
             assert_eq!(mode_of(&path), 0o600, "usage file must be 0600");
         }
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Live-acceptance seam (test builds only): when set, every model's
+    /// output limit on this thread, so a live harness can bound its
+    /// worst-case spend. `max_tokens` is not part of Anthropic's cached
+    /// prefix (the warm summary itself lowers it).
+    pub(crate) static MAX_TOKENS_FOR_TEST: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
 }

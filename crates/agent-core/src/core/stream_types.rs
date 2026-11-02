@@ -20,6 +20,17 @@ pub enum StreamEvent {
     Agent(AgentEvent),
 }
 
+impl StreamEvent {
+    /// How a client sees this event: [`SessionEvent::for_clients`] for a
+    /// session event; every other event unchanged.
+    pub fn for_clients(self) -> Option<Self> {
+        match self {
+            Self::Session(event) => event.for_clients().map(Self::Session),
+            other => Some(other),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum LlmEvent {
     /// Marks a new uncommitted provider response (not a new turn).
@@ -47,6 +58,13 @@ pub enum LlmEvent {
     ToolResult {
         tool_id: String,
         result: String,
+        /// The result is memory-only (the typed take result): `result` is
+        /// the engine's fixed placeholder or notice, and the raw text went
+        /// to the live provider request only.
+        memory_only: bool,
+        /// Set only on a client tool's result (contract §8): who answered
+        /// and how. `None` for every other tool.
+        client_tool: Option<Box<ClientToolStamp>>,
     },
     ToolResultDelta {
         tool_id: String,
@@ -65,6 +83,24 @@ pub enum LlmEvent {
     ToolStarted {
         tool_id: String,
     },
+}
+
+/// A client tool result's stamp (client tools contract §8). Built by the
+/// daemon from the pending invocation's registration and the validated
+/// return code, never from result text or any other reply field. It holds
+/// no arguments and no content.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ClientToolStamp {
+    pub registration_id: String,
+    /// `None` when no invoke was sent (busy, unregistered, not_root,
+    /// args_too_large).
+    pub invocation_id: Option<String>,
+    pub extension_id: String,
+    pub tool: String,
+    pub family: String,
+    /// A declared outcome code, or a `synaps_*` code.
+    pub outcome: String,
+    pub memory_only: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -88,6 +124,23 @@ pub enum SessionEvent {
         cache_creation_1h: Option<u64>,
         model: Option<String>,
     },
+    /// One billable upstream attempt's usage, emitted by a runtime that
+    /// keeps a run's request ledger (a worker run with rollover on) in
+    /// place of the `Usage` it would otherwise send for that attempt, never
+    /// both. Host-internal: clients see the plain `Usage`
+    /// ([`SessionEvent::for_clients`]); it is never serialized.
+    UsageAttempt {
+        request: UsageRequest,
+        usage: UsageCounts,
+    },
+    /// A ledgered attempt whose spend is not measured: an open liability
+    /// (unknown spend) or its release (it provably cost nothing).
+    /// Host-internal: clients never see it ([`SessionEvent::for_clients`]).
+    UsageLiability {
+        request: UsageRequest,
+        estimate_micro_usd: u64,
+        state: LiabilityState,
+    },
     Done,
     Error(TurnError),
     /// Transient status line — display-only, never persisted.
@@ -98,6 +151,70 @@ pub enum SessionEvent {
     /// they must not infer from notice text. On the session wire it is a
     /// `notice` with `retry: true`, so older peers read it as a notice.
     Retry(String),
+}
+
+impl SessionEvent {
+    /// How a client (a session, the wire, a frontend) sees this event. A
+    /// run's request-ledger events are host-internal: a ledgered attempt's
+    /// usage is the plain `Usage` it stands in for, attributed to the
+    /// attempt's model; a liability is not shown (`None`). Every other
+    /// event is returned unchanged.
+    pub fn for_clients(self) -> Option<Self> {
+        match self {
+            Self::UsageAttempt { request, usage } => Some(Self::Usage {
+                input_tokens: usage.input_tokens,
+                output_tokens: usage.output_tokens,
+                cache_read_input_tokens: usage.cache_read_input_tokens,
+                cache_creation_input_tokens: usage.cache_creation_input_tokens,
+                cache_creation_5m: usage.cache_creation_5m,
+                cache_creation_1h: usage.cache_creation_1h,
+                model: Some(request.model),
+            }),
+            Self::UsageLiability { .. } => None,
+            other => Some(other),
+        }
+    }
+}
+
+/// Why a ledgered request was made: a same-model summary's usage stays
+/// attributable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsagePurpose {
+    Conversation,
+    RolloverSummary,
+}
+
+/// The host identity of one billable upstream attempt in a run's request
+/// ledger.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsageRequest {
+    /// Host-assigned, unique within the run.
+    pub request_id: String,
+    pub purpose: UsagePurpose,
+    /// The model the attempt is priced against.
+    pub model: String,
+}
+
+/// Provider-reported token counts of one attempt (the counters of
+/// [`SessionEvent::Usage`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UsageCounts {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_input_tokens: u64,
+    pub cache_creation_input_tokens: u64,
+    /// Cache-write TTL split. `None` when the API omits the breakdown.
+    pub cache_creation_5m: Option<u64>,
+    pub cache_creation_1h: Option<u64>,
+}
+
+/// The state a [`SessionEvent::UsageLiability`] reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LiabilityState {
+    /// Unknown spend: the estimate is held.
+    Open,
+    /// The attempt provably cost nothing: the liability ended.
+    Released,
 }
 
 /// Budget dimension placeholder (spec §5.2). The full turn-budget system is
@@ -285,4 +402,88 @@ pub enum AgentEvent {
     SteeringDelivered {
         message: String,
     },
+}
+
+#[cfg(test)]
+mod ledger_event_tests {
+    use super::*;
+
+    fn request(purpose: UsagePurpose) -> UsageRequest {
+        UsageRequest {
+            request_id: "req-1".into(),
+            purpose,
+            model: "provider/model-b".into(),
+        }
+    }
+
+    /// A ledgered attempt's usage reaches clients as the plain `Usage` it
+    /// stands in for, attributed to its model.
+    #[test]
+    fn a_usage_attempt_reaches_clients_as_the_plain_usage() {
+        let usage = UsageCounts {
+            input_tokens: 10,
+            output_tokens: 2,
+            cache_read_input_tokens: 3,
+            cache_creation_input_tokens: 4,
+            cache_creation_5m: Some(1),
+            cache_creation_1h: None,
+        };
+        for purpose in [UsagePurpose::Conversation, UsagePurpose::RolloverSummary] {
+            let event = SessionEvent::UsageAttempt {
+                request: request(purpose),
+                usage: usage.clone(),
+            };
+            match event.for_clients() {
+                Some(SessionEvent::Usage {
+                    input_tokens: 10,
+                    output_tokens: 2,
+                    cache_read_input_tokens: 3,
+                    cache_creation_input_tokens: 4,
+                    cache_creation_5m: Some(1),
+                    cache_creation_1h: None,
+                    model: Some(model),
+                }) => assert_eq!(model, "provider/model-b"),
+                other => panic!("expected the plain usage, got {other:?}"),
+            }
+        }
+    }
+
+    /// A liability is host-internal: no client event, open or released.
+    #[test]
+    fn a_liability_never_reaches_clients() {
+        for state in [LiabilityState::Open, LiabilityState::Released] {
+            let event = SessionEvent::UsageLiability {
+                request: request(UsagePurpose::Conversation),
+                estimate_micro_usd: 7,
+                state,
+            };
+            assert!(event.for_clients().is_none());
+        }
+    }
+
+    /// Every other event passes through unchanged.
+    #[test]
+    fn other_events_pass_through() {
+        assert!(matches!(
+            SessionEvent::Done.for_clients(),
+            Some(SessionEvent::Done)
+        ));
+        assert!(matches!(
+            SessionEvent::Usage {
+                input_tokens: 1,
+                output_tokens: 1,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+                cache_creation_5m: None,
+                cache_creation_1h: None,
+                model: None,
+            }
+            .for_clients(),
+            Some(SessionEvent::Usage { model: None, .. })
+        ));
+        assert!(matches!(
+            SessionEvent::Notice("n".into()).for_clients(),
+            Some(SessionEvent::Notice(t)) if t == "n"
+        ));
+    }
 }

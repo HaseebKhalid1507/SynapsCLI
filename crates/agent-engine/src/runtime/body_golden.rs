@@ -31,6 +31,10 @@ use std::sync::Arc;
 const EXPECTED_DEFAULT_IDENTITY: &str =
     "You are an AI assistant running in SynapsCLI, an open-source agent runtime.";
 
+/// The window every golden body is built for: both scenario models' native
+/// window (B32: it sizes `max_tokens`, so Opus-class bodies carry 64K).
+pub(super) const GOLDEN_WINDOW: u64 = 200_000;
+
 pub(super) struct Scenario {
     pub(super) name: &'static str,
     pub(super) model: &'static str,
@@ -304,9 +308,11 @@ pub(super) fn old_body_bytes(s: &Scenario) -> Vec<u8> {
 
     let mut body = if s.reasoning_level == ReasoningLevel::Off {
         // Off: omit thinking field entirely.
+        // B32: the replica sizes `max_tokens` as the live code does (the
+        // window-aware per-request cap), not the pre-B32 model maximum.
         json!({
             "model": s.model,
-            "max_tokens": HelperMethods::max_tokens_for_model(s.model),
+            "max_tokens": HelperMethods::max_tokens_for_request(s.model, GOLDEN_WINDOW),
             "messages": cleaned_messages,
             "tools": &s.tools,
             "stream": true,
@@ -314,7 +320,7 @@ pub(super) fn old_body_bytes(s: &Scenario) -> Vec<u8> {
     } else {
         json!({
             "model": s.model,
-            "max_tokens": HelperMethods::max_tokens_for_model(s.model),
+            "max_tokens": HelperMethods::max_tokens_for_request(s.model, GOLDEN_WINDOW),
             "messages": cleaned_messages,
             "tools": &s.tools,
             "stream": true,
@@ -373,6 +379,7 @@ fn new_body_bytes(s: &Scenario) -> (Vec<u8>, bool, bool) {
         None,
         s.ttl,
         s.stream,
+        GOLDEN_WINDOW,
     );
     (
         serde_json::to_vec(&body).expect("new body serialization"),
@@ -514,6 +521,7 @@ fn golden_thinking_display_is_one_value_on_the_fixture() {
                     None,
                     s.ttl,
                     s.stream,
+                    GOLDEN_WINDOW,
                 );
                 body.set_thinking_display(display);
                 let got = String::from_utf8(serde_json::to_vec(&body).unwrap()).unwrap();
@@ -573,6 +581,7 @@ fn golden_cache_diagnostics_is_one_leading_member_on_the_fixture() {
                     None,
                     s.ttl,
                     s.stream,
+                    GOLDEN_WINDOW,
                 );
                 body.set_diagnostics(param.clone());
                 let on = serde_json::to_vec(&body).unwrap();
@@ -648,6 +657,7 @@ fn anthropic_special_modes_wire_goldens() {
                 Some(&plan),
                 CacheTtl::FiveMinutes,
                 stream,
+                GOLDEN_WINDOW,
             );
             let bytes = serde_json::to_vec(&body).unwrap();
             let wire = std::str::from_utf8(&bytes).unwrap();
