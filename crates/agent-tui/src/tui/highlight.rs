@@ -491,7 +491,12 @@ pub(crate) fn try_highlight_grep_line(
 ) -> Option<Vec<Span<'static>>> {
     // Grep format: filepath:linenum:content  or  filepath-linenum-content (context)
     // Also: filepath:linenum:  (empty match line)
-    let first_colon = line.find(':')?;
+    // A Windows drive colon (`C:\…`, `C:/…`) belongs to the path.
+    let skip = match line.as_bytes() {
+        [d, b':', b'\\' | b'/', ..] if d.is_ascii_alphabetic() => 2,
+        _ => 0,
+    };
+    let first_colon = skip + line[skip..].find(':')?;
     let filepath = &line[..first_colon];
 
     // Filepath should look like a path (contain / or .)
@@ -636,6 +641,25 @@ mod tests {
         style::Style,
         text::{Line, Span},
     };
+
+    /// A Windows grep row splits after the drive colon: path, line, content.
+    #[test]
+    fn grep_row_with_a_drive_path_is_highlighted() {
+        let text = |spans: Vec<Span<'static>>| -> Vec<String> {
+            spans.into_iter().map(|s| s.content.into_owned()).collect()
+        };
+        let row = r"C:\proj\./src/calc.ps1:12:function Add-Numbers";
+        let spans = try_highlight_grep_line(row, "", &|p| p.to_string()).expect("highlighted");
+        let parts = text(spans);
+        assert_eq!(parts[1], r"C:\proj\./src/calc.ps1");
+        assert_eq!(parts[3], "12");
+        assert!(parts.iter().any(|p| p.contains("function Add-Numbers")), "{parts:?}");
+        // Unix rows are unchanged.
+        let parts = text(try_highlight_grep_line("/p/src/a.rs:3:fn x", "", &|p| p.to_string()).unwrap());
+        assert_eq!((parts[1].as_str(), parts[3].as_str()), ("/p/src/a.rs", "3"));
+        // A bare drive colon is not a grep row.
+        assert!(try_highlight_grep_line(r"C:\Windows", "", &|p| p.to_string()).is_none());
+    }
 
     #[test]
     fn clamp_line_truncates_by_display_width_not_char_count() {

@@ -26,6 +26,14 @@ All notable changes to this project will be documented in this file.
   description says which PowerShell runs (7 when installed, else 5.1), not
   to start another one inside it, and to call scripts directly; on a
   machine without PowerShell 7 the model had first tried `pwsh`.
+- **Windows: grep and find cards show short paths.** Card rows kept full
+  `C:\Users\…\project\./src\file` paths, and grep rows were not
+  highlighted (the row was split at the drive colon). Paths under the
+  session folder now show relative to it and paths under the user profile
+  as `~\…`, matched case-insensitively with either separator, as on Linux.
+  On every platform, the `./` a tool given the path `.` leaves after the
+  session folder is dropped (`src/main.rs`, not `./src/main.rs`). Display
+  only: the tool result is unchanged.
 
 ## [0.11.1] — 2026-10-31
 
