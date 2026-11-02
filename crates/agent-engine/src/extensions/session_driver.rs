@@ -654,7 +654,7 @@ pub fn classify_error(error: &str) -> (Outcome, String) {
             return provider_error("transient");
         }
     }
-    for label in ["Codex", "OpenAI", "xAI"] {
+    for label in crate::runtime::openai::stream::RESPONSES_PROVIDER_LABELS {
         use crate::runtime::openai::stream::{
             RESPONSES_AUTH_SUFFIX, RESPONSES_CAPACITY_SUFFIX, RESPONSES_EMPTY_SUFFIX,
             RESPONSES_MISSING_TERMINAL_SUFFIX, RESPONSES_QUOTA_SUFFIX,
@@ -1425,7 +1425,13 @@ mod tests {
             assert_eq!(classify_error(&format!("API stream error ({kind}). Provider error details withheld — they can echo request content.")), blocked());
         }
         use crate::runtime::openai::stream::*;
-        for label in ["Codex", "OpenAI", "xAI"] {
+        for label in [
+            "Codex",
+            "OpenAI",
+            "xAI",
+            "GitHub Copilot",
+            "Responses provider",
+        ] {
             for (suffix, expected) in [
                 (RESPONSES_AUTH_SUFFIX, "auth"),
                 (RESPONSES_QUOTA_SUFFIX, "quota"),

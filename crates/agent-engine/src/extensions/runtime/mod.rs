@@ -151,6 +151,20 @@ pub trait ExtensionHandler: Send + Sync {
         self.call_tool(name, input).await
     }
 
+    /// Call an extension-provided tool with the whole calling context (the
+    /// model's call id, the turn, the delegation parent). Only the in-process
+    /// client tool handler needs more than the conversation id; the default
+    /// calls [`Self::call_tool_for`], so every other handler keeps its exact
+    /// behaviour.
+    async fn call_tool_in(
+        &self,
+        name: &str,
+        input: Value,
+        caps: &crate::tools::ToolCapabilities,
+    ) -> Result<Value, String> {
+        self.call_tool_for(name, input, caps.session_id.as_deref()).await
+    }
+
     /// Complete a chat request through an extension-provided model provider.
     async fn provider_complete(
         &self,

@@ -103,6 +103,7 @@ fn test_context() -> ToolContext {
             launch_cancel: None,
             memory_backend: None,
             telemetry: None,
+            continuation: None,
             watcher_exit_path: None,
             tool_register_tx: None,
             session_manager: None,
@@ -110,6 +111,7 @@ fn test_context() -> ToolContext {
             event_queue: None,
             delegation_parent: None,
             codex_parent_plan: None,
+            worker_context: None,
             secret_prompt: None,
             orchestration: None,
             tool_activation: None,
@@ -120,7 +122,11 @@ fn test_context() -> ToolContext {
             env: None,
             env_stripped: Vec::new(),
             env_warned: Default::default(),
+            sandbox: None,
             session_id: None,
+            tool_use_id: None,
+            turn_correlation_id: None,
+            spend: None,
         },
         limits: synaps_cli::tools::ToolLimits {
             max_tool_output: 1000,
@@ -172,6 +178,7 @@ async fn provider_tool_loop_returns_final_text_after_tool_result_turn() {
         1000,
         4,
         &mut tools_requested,
+        synaps_cli::runtime::child_spend::RouteSpend::NONE,
     )
     .await
     .expect("provider loop succeeds");
@@ -355,6 +362,7 @@ async fn provider_loop_denies_unverified_tool_before_hooks_and_execution() {
         1000,
         4,
         &mut tools_requested,
+        synaps_cli::runtime::child_spend::RouteSpend::NONE,
     )
     .await
     .expect("loop terminates with the final text turn");

@@ -367,6 +367,8 @@ mod tests {
         StreamEvent::Llm(LlmEvent::ToolResult {
             tool_id: id.into(),
             result: output.into(),
+            memory_only: false,
+            client_tool: None,
         })
     }
 

@@ -76,6 +76,10 @@ Unsupported result actions are ignored fail-open and logged as warnings.
     handler is fail-safe: the **original output is preserved unchanged**.
   - `replace` does **not** clear the `is_error` flag — replacing the content of
     a failed tool call leaves it marked as an error.
+  - A `replace` output is final: it is what the model sees, and the host adds
+    nothing to it afterwards. A host notice in the original output (such as
+    bash's `[timeout clamped from … by bash_max_timeout]` line) reaches the
+    model only if the replacement keeps it.
   - Replacement output larger than 1 MiB is clamped.
 
 `on_message_complete` fires after an assistant response is added to session
@@ -97,13 +101,27 @@ you accept this ordering behavior.
 
 ## Subagent workers
 
-A subagent worker's tool calls run only one kind of hook: `after_tool_call`
-for extensions that hold **`tools.transform_output`**, so output transforms
-(compression, redaction) see worker tool results the way they see the main
-session's. Nothing else fires for a worker's tool calls: no `before_tool_call`
-(so a worker never raises a confirm prompt and an extension can't block or
-modify its input), no observe-only `after_tool_call` (`tools.intercept`
-without `tools.transform_output`), no message or session hooks.
+A subagent worker's tool calls run two kinds of hook, each with its own
+switch:
+
+- **Its caller's `before_tool_call` hooks** (`subagent.tool_hooks`, default
+  on, read at each worker spawn). A worker's call goes through the chain its
+  caller's own calls go through, so `block`, `modify` and `confirm` apply to
+  it the same way (chain order included). The event carries the caller's
+  `session_id` and the worker's `subagent_id`. A `confirm` is asked through
+  the caller's prompt, with the caller's auto-approve and "Allow all" latch;
+  it fails closed when the caller has no prompt. A chain that cannot run
+  (the caller's runtime is gone, or a handler panicked) blocks the call.
+  With `subagent.tool_hooks = off` no `before_tool_call` hook runs for a
+  worker.
+- **The host's output transforms:** `after_tool_call` for extensions that
+  hold **`tools.transform_output`** (`subagent_transform_hooks`, default on),
+  so compression and redaction see worker tool results the way they see the
+  main session's. The rules for them follow the next paragraph.
+
+Nothing else fires for a worker's tool calls: no observe-only
+`after_tool_call` (`tools.intercept` without `tools.transform_output`), no
+message or session hooks.
 
 - **Same rules as the main session:** the handler chain order, the first
   `replace` wins, the two-key permission gate, the 5 s timeout, the 1 MiB
@@ -111,18 +129,22 @@ without `tools.transform_output`), no message or session hooks.
   leaves the original output). The order inside the worker's tool loop is the
   main session's too: your `replace`, then tool output virtualisation (the
   spill file holds your output), then read dedupe.
-- **`session_id` is `null`.** A worker has no conversation id (see
-  `session-id.md`). Treat `null` as "a worker or no session".
+- **`session_id` is `null`** on a worker's `after_tool_call`. A worker has
+  no conversation id (see `session-id.md`). Treat `null` as "a worker or no
+  session".
 - **One process for everyone.** The main session and all its workers call the
   same extension process; calls are serialized per extension and matched by
   JSON-RPC id, so parallel workers each get the reply to their own call. A
   call that waits behind a slow one still has its own 5 s budget, then passes
   through.
-- **Workers never start or restart your process.** While it is down
+- **Output transforms never start or restart your process.** While it is down
   (crashed, or deferred and not yet started by the main session), a worker's
   tool result passes through untransformed; the main session's next call
   starts it as before. A call in flight when a reload stops the old instance
   passes through; a reloaded or newly loaded extension applies to running
-  workers from their next tool call.
+  workers from their next tool call. (A worker's `before_tool_call` runs on
+  the caller's chain, as the caller's own call would.)
 - **Opt-out:** `subagent_transform_hooks = off` (default on; a /settings
-  row) runs no hooks at all for workers, as before.
+  row) runs no output transforms for workers. It leaves their
+  `before_tool_call` hooks alone; `subagent.tool_hooks = off` turns those
+  off.

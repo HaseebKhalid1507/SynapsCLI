@@ -6,6 +6,8 @@
 //! Tool-specific hooks filter by tool name before dispatching.
 
 pub mod events;
+#[cfg(test)]
+mod worker_route_tests;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -124,6 +126,62 @@ pub struct HookBus {
     /// `Some(host)`: this bus is a subagent worker's view of `host`
     /// ([`Self::worker_transforms`]) and has no handlers of its own.
     transforms_of: Option<Arc<HookBus>>,
+    /// Set on a worker's (subagent's) bus only: where its `before_tool_call`
+    /// events go. `None` everywhere else. Independent of `transforms_of`:
+    /// a worker bus may carry both ([`Self::with_worker_transforms_of`]).
+    worker_route: Option<WorkerRoute>,
+}
+
+/// A worker's route to its caller's `before_tool_call` hooks (see
+/// [`HookBus::worker_route`]).
+struct WorkerRoute {
+    /// The calling session's bus (the host's, in a daemon).
+    caller: Arc<HookBus>,
+    /// The caller's tokio runtime. A worker runs on its own current-thread
+    /// runtime, which is dropped when the worker ends. An extension process
+    /// started or restarted from inside it would tie its pipes and reader
+    /// task to that runtime and lose them with the worker, so the caller's
+    /// handlers always run here.
+    host: tokio::runtime::Handle,
+    /// The conversation that started the worker (`None` when its caller
+    /// has none).
+    session_id: Option<String>,
+    /// The worker's id as its caller sees it (`sa_N`).
+    subagent_id: String,
+}
+
+impl WorkerRoute {
+    /// Run the caller's `before_tool_call` chain for one of the worker's
+    /// calls, stamped with the caller's conversation and the worker's id.
+    /// A chain that cannot run (the caller's runtime is gone, or a handler
+    /// panicked) blocks the call: the guard is not skipped.
+    async fn before_tool_call(&self, event: &HookEvent) -> HookResult {
+        let mut event = event.clone();
+        if event.session_id.is_none() {
+            event = event.with_session(self.session_id.as_deref());
+        }
+        event.subagent_id = Some(self.subagent_id.clone());
+        let caller = Arc::clone(&self.caller);
+        match self
+            .host
+            .spawn(async move { caller.emit_to_own_handlers(&event).await })
+            .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                tracing::warn!(
+                    subagent_id = %self.subagent_id,
+                    error = %error,
+                    "before_tool_call hooks could not run for a subagent tool call; blocking it"
+                );
+                HookResult::Block {
+                    reason: format!(
+                        "the before_tool_call hooks could not run for this subagent tool call ({error})"
+                    ),
+                }
+            }
+        }
+    }
 }
 
 impl HookBus {
@@ -134,15 +192,19 @@ impl HookBus {
             session_injection: RwLock::new(HashMap::new()),
             generations: std::sync::Mutex::new(HashMap::new()),
             transforms_of: None,
+            worker_route: None,
         }
     }
 
     /// The hook bus a subagent worker runs with: a read-only view of
     /// `host`'s `after_tool_call` subscriptions from extensions that hold
     /// `tools.transform_output`, so output transforms (compression,
-    /// redaction) see worker tool results too. Nothing else fires in a
-    /// worker: no `before_tool_call` (no confirm prompt, block or modify),
-    /// no message or session hooks, no observe-only `after_tool_call`.
+    /// redaction) see worker tool results too. Nothing else fires on the
+    /// view itself: no `before_tool_call` (no confirm prompt, block or
+    /// modify), no message or session hooks, no observe-only
+    /// `after_tool_call`. A worker's `before_tool_call` reaches its
+    /// caller's chain only through a [`Self::worker_route`] layered on
+    /// this view ([`Self::with_worker_transforms_of`]).
     ///
     /// Live, not a snapshot: every [`Self::emit`] reads `host`'s current
     /// handler list, so an extension loaded, reloaded or unloaded while a
@@ -187,6 +249,51 @@ impl HookBus {
             .cloned()
             .collect();
         (!regs.is_empty()).then_some(regs)
+    }
+
+    /// A worker's (subagent's) bus. It has no handlers of its own: each
+    /// `before_tool_call` the worker emits runs `caller`'s chain instead, on
+    /// `host` (the caller's runtime), with `session_id` set to the caller's
+    /// conversation when the event has none (subject to
+    /// `SYNAPS_HOOK_SESSION_ID=0`) and `subagent_id` set to the worker's id.
+    /// The result, a `Confirm` included, is the caller's chain's; who answers
+    /// a `Confirm` is the worker runtime's confirm route. Every other hook
+    /// kind finds no handlers here, as on an empty bus, unless the host's
+    /// output transforms are layered on ([`Self::with_worker_transforms_of`]).
+    pub fn worker_route(
+        caller: Arc<HookBus>,
+        host: tokio::runtime::Handle,
+        session_id: Option<String>,
+        subagent_id: String,
+    ) -> Self {
+        Self {
+            worker_route: Some(WorkerRoute {
+                caller,
+                host,
+                session_id,
+                subagent_id,
+            }),
+            ..Self::new()
+        }
+    }
+
+    /// Whether this is a worker's bus routed to a caller's hooks.
+    pub fn is_worker_route(&self) -> bool {
+        self.worker_route.is_some()
+    }
+
+    /// This worker route ([`Self::worker_route`]) plus the host output
+    /// transforms `view` dispatches, so one worker bus runs both its
+    /// caller's `before_tool_call` chain and the host's `after_tool_call`
+    /// transforms (`subagent.tool_hooks` and `subagent_transform_hooks`).
+    ///
+    /// Only ever narrows: `view` contributes its host only when it is a
+    /// worker view ([`Self::worker_transforms`]). A plain bus (the
+    /// detached `subagent_transform_hooks = off` bus, or a full host bus)
+    /// contributes nothing, so this never hands a worker a full host bus.
+    pub fn with_worker_transforms_of(mut self, view: &HookBus) -> Self {
+        self.transforms_of = view.transforms_of.clone();
+        self
     }
 
     /// Current load generation of `extension_id` (0 until first unloaded).
@@ -296,8 +403,23 @@ impl HookBus {
     ///
     /// On a worker view ([`Self::worker_transforms`]) only the host's
     /// `after_tool_call` transform handlers run, each through
-    /// `handle_no_spawn`; every other kind returns `Continue` at once.
+    /// `handle_no_spawn`; every other kind returns `Continue` at once. On
+    /// a worker route ([`Self::worker_route`]) a `before_tool_call` runs the
+    /// caller's chain instead; the other kinds dispatch as above (a route
+    /// with a view layered on runs both).
     pub async fn emit(&self, event: &HookEvent) -> HookResult {
+        if let Some(route) = &self.worker_route {
+            if event.kind == HookKind::BeforeToolCall {
+                return route.before_tool_call(event).await;
+            }
+        }
+        self.emit_to_own_handlers(event).await
+    }
+
+    /// [`Self::emit`] on this bus's own handlers, never through a worker
+    /// route. A worker route runs its caller's chain with it (not with
+    /// `emit`, so the spawned future does not contain itself).
+    async fn emit_to_own_handlers(&self, event: &HookEvent) -> HookResult {
         // Snapshot the handler list and drop the lock immediately.
         // This prevents holding the RwLock across async handler calls
         // (which could block subscribe/unsubscribe for the entire
@@ -433,6 +555,17 @@ impl HookBus {
                     injections.push(content);
                 }
                 Ok(HookResult::Modify { input }) => {
+                    if ev.input_withheld {
+                        // A memory-only call: the hook never saw the args,
+                        // so it cannot rewrite them; later handlers keep
+                        // the withheld event.
+                        tracing::debug!(
+                            hook = %ev.kind.as_str(),
+                            extension = %reg.handler.id(),
+                            "Extension Modify of a memory-only call IGNORED: its args are withheld"
+                        );
+                        continue;
+                    }
                     if !confirms.is_empty() {
                         // The user is asked about the input as it stood at
                         // the first Confirm; a rewrite after that point
@@ -1393,6 +1526,7 @@ mod tests {
             None,
             false,
             Some(&latch),
+            None,
         )
         .await;
         assert_eq!(blocker.calls(), 1);
@@ -1495,6 +1629,7 @@ mod tests {
             None,
             true,
             None,
+            None,
         )
         .await;
         assert!(matches!(
@@ -1551,6 +1686,7 @@ mod tests {
             None,
             false,
             Some(&latch),
+            None,
         )
         .await;
         assert_eq!(gens(result), vec![1]);
@@ -1897,6 +2033,7 @@ mod tests {
                 launch_cancel: None,
                 memory_backend: None,
                 telemetry: None,
+                continuation: None,
                 watcher_exit_path: None,
                 tool_register_tx: None,
                 session_manager: None,
@@ -1904,6 +2041,7 @@ mod tests {
                 event_queue: None,
                 delegation_parent: None,
                 codex_parent_plan: None,
+                worker_context: None,
                 secret_prompt: None,
                 orchestration: None,
                 tool_activation: None,
@@ -1914,7 +2052,11 @@ mod tests {
                 env: None,
                 env_stripped: Vec::new(),
                 env_warned: Default::default(),
+                sandbox: None,
                 session_id: None,
+                tool_use_id: None,
+                turn_correlation_id: None,
+                spend: None,
             },
             limits: crate::tools::ToolLimits {
                 max_tool_output: 30_000,
@@ -2277,6 +2419,7 @@ mod worker_view_tests {
             None,
             false,
             None,
+            None,
         )
         .await;
         assert!(matches!(decision, crate::runtime::BeforeToolCallDecision::Continue { .. }));
@@ -2440,5 +2583,70 @@ mod worker_view_tests {
         assert!(nested.is_worker_view());
         assert!(Arc::ptr_eq(nested.transforms_of.as_ref().unwrap(), &host));
         assert_eq!(nested.handler_count().await, 0);
+    }
+
+    /// Both worker paths on one bus (parity E10): a route to the caller's
+    /// `before_tool_call` chain (`subagent.tool_hooks`) with the host's
+    /// output transforms layered on (`subagent_transform_hooks`). The
+    /// caller's guard runs before the call, through `handle` on the
+    /// caller's runtime; the host's transform runs after it, through
+    /// `handle_no_spawn`. Layering only narrows: a plain bus or a full host
+    /// bus contributes no transforms.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn a_routed_worker_with_transforms_runs_the_callers_guard_and_the_hosts_transform() {
+        let _base = crate::test_env::BaseDirGuard::new();
+        let host = Arc::new(HookBus::new());
+        let guard = Probe::new("guard", HookResult::Block { reason: "no".into() });
+        let crush = Probe::new("crush", HookResult::Replace { output: "CRUSHED".into() });
+        host.subscribe(
+            HookKind::BeforeToolCall,
+            guard.clone(),
+            None,
+            None,
+            perms(&[Permission::ToolsIntercept]),
+        )
+        .await
+        .unwrap();
+        host.subscribe(HookKind::AfterToolCall, crush.clone(), None, None, transform())
+            .await
+            .unwrap();
+        let view = HookBus::worker_transforms(&host);
+        let worker = Arc::new(
+            HookBus::worker_route(
+                Arc::clone(&host),
+                tokio::runtime::Handle::current(),
+                Some("sess-parent".into()),
+                "sa_1".into(),
+            )
+            .with_worker_transforms_of(&view),
+        );
+        assert!(worker.is_worker_route() && worker.is_worker_view());
+
+        let before = worker
+            .emit(&HookEvent::before_tool_call(
+                "bash",
+                serde_json::json!({"command": "rm -rf /"}),
+            ))
+            .await;
+        assert!(matches!(before, HookResult::Block { ref reason } if reason == "no"), "{before:?}");
+        assert_eq!(guard.calls(), (1, 0), "the caller's chain, through handle");
+        assert_eq!(after(&worker, "RAW").await, "CRUSHED");
+        assert_eq!(crush.calls(), (0, 1), "the host's transform, through handle_no_spawn");
+
+        for plain in [Arc::new(HookBus::new()), Arc::clone(&host)] {
+            let routed = Arc::new(
+                HookBus::worker_route(
+                    Arc::clone(&host),
+                    tokio::runtime::Handle::current(),
+                    None,
+                    "sa_2".into(),
+                )
+                .with_worker_transforms_of(&plain),
+            );
+            assert!(routed.is_worker_route() && !routed.is_worker_view());
+            assert_eq!(after(&routed, "RAW").await, "RAW", "no transform layered");
+        }
+        assert_eq!(crush.calls(), (0, 1));
     }
 }

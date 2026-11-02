@@ -20,7 +20,11 @@ environment, so ALL behavior is driven by argv:
            contribution shape) |
            recall-cross-project (recall calls return a valid-shaped
            contribution claiming a DIFFERENT project id, so the host's
-           validate_contribution must reject it)
+           validate_contribution must reject it) |
+           memory-only (tool `vault_fetch` returns a sentinel marked
+           `_meta["synaps/memory_only"] = true`; any other tool returns a
+           second, unmarked sentinel; both are made HERE, so the test
+           never writes them anywhere)
   argv[4]  optional path to a JSON array of providers to register at
            initialize (RegisteredProviderSpec-shaped objects)
   argv[5]  optional path to a JSON array of context providers
@@ -289,6 +293,13 @@ while True:
             # kills this child. A blocked producer must never keep the lease.
             time.sleep(30.0)
             respond(request, {"ok": True})
+        elif MODE == "memory-only" and name == "vault_fetch":
+            respond(request, {
+                "content": "MEMONLY_META_SENTINEL_" + "5c1e" * 4,
+                "_meta": {"synaps/memory_only": True},
+            })
+        elif MODE == "memory-only":
+            respond(request, {"content": "MEMONLY_GLOB_SENTINEL_" + "9d2b" * 4})
         elif MODE == "hostile-error":
             respond_error(request, -32000,
                           "HOSTILE_EXTENSION_MARKER " + ("s3cr3t" * 64))

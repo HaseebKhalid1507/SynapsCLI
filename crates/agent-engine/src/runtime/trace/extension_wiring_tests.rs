@@ -54,6 +54,9 @@ struct FakeProvider {
     stream_entered: tokio::sync::Notify,
     complete_calls: AtomicUsize,
     stream_calls: AtomicUsize,
+    /// Every `provider.complete` call's messages, in call order: an interior
+    /// round's tool results are the last message of the next call.
+    complete_messages: Mutex<Vec<Vec<crate::SharedMessage>>>,
 }
 
 #[async_trait]
@@ -70,9 +73,10 @@ impl ExtensionHandler for FakeProvider {
 
     async fn provider_complete(
         &self,
-        _params: ProviderCompleteParams,
+        params: ProviderCompleteParams,
     ) -> Result<ProviderCompleteResult, String> {
         self.complete_calls.fetch_add(1, Ordering::SeqCst);
+        self.complete_messages.lock().unwrap().push(params.messages);
         if let Some(token) = &self.cancel_during_complete {
             token.cancel();
         }
@@ -160,7 +164,16 @@ async fn manager_with(
     tool_use: bool,
     with_tools: bool,
 ) -> Arc<tokio::sync::RwLock<ExtensionManager>> {
-    let hook_bus = Arc::new(HookBus::new());
+    manager_with_bus(handler, streaming, tool_use, with_tools, Arc::new(HookBus::new())).await
+}
+
+async fn manager_with_bus(
+    handler: Arc<FakeProvider>,
+    streaming: bool,
+    tool_use: bool,
+    with_tools: bool,
+    hook_bus: Arc<HookBus>,
+) -> Arc<tokio::sync::RwLock<ExtensionManager>> {
     let mut manager = if with_tools {
         ExtensionManager::new_with_tools(
             hook_bus,
@@ -189,6 +202,17 @@ async fn route(
     cancel: &CancellationToken,
     tools_schema: Arc<Vec<Value>>,
 ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+    route_sandboxed(manager, trace, cancel, tools_schema, None).await
+}
+
+#[allow(clippy::type_complexity)]
+async fn route_sandboxed(
+    manager: &Arc<tokio::sync::RwLock<ExtensionManager>>,
+    trace: &TraceContext,
+    cancel: &CancellationToken,
+    tools_schema: Arc<Vec<Value>>,
+    sandbox: Option<&Arc<crate::sandbox::SandboxBinding>>,
+) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
     route_extension_provider(
         manager.clone(),
@@ -207,7 +231,9 @@ async fn route(
         None,
         None,
         None,
+        sandbox,
         trace,
+        crate::runtime::child_spend::RouteSpend::NONE,
     )
     .await
 }
@@ -347,7 +373,15 @@ async fn streaming_cancel_while_ipc_active_emits_canceled_record() {
     let canceller = cancel.clone();
     let entered = handler.clone();
     tokio::spawn(async move {
-        entered.stream_entered.notified().await;
+        // The route's setup before the stream call (the trace digest key's
+        // first write among it) can outlast any fixed delay on a loaded
+        // machine. Bounded, so a route that never reaches the provider
+        // still ends and fails the call-count check below.
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            entered.stream_entered.notified(),
+        )
+        .await;
         canceller.cancel();
     });
     let err = tokio::time::timeout(
@@ -580,6 +614,157 @@ async fn tool_loop_with_multiple_interior_calls_emits_exactly_one_record() {
     assert_schema_valid_and_content_free(&records);
 }
 
+// ═══ Tool loop: the configured tool limits ══════════════════════════════════
+
+/// A scripted `bash` call from the extension provider.
+#[cfg(feature = "command-exec")]
+fn bash_use(id: &str, input: Value) -> Result<ProviderCompleteResult, String> {
+    Ok(ProviderCompleteResult {
+        content: vec![json!({"type": "tool_use", "id": id, "name": "bash", "input": input})],
+        stop_reason: Some("tool_use".to_string()),
+        usage: None,
+    })
+}
+
+/// The tool result an interior round sent back: the `content` of the one
+/// `tool_result` in the last message of the next `provider.complete` call.
+#[cfg(feature = "command-exec")]
+fn round_result(handler: &FakeProvider, call: usize) -> String {
+    let calls = handler.complete_messages.lock().unwrap();
+    let last = calls[call].last().expect("a tool-result message");
+    last["content"][0]["content"]
+        .as_str()
+        .expect("tool_result content is text")
+        .to_string()
+}
+
+/// The extension-provider tool loop runs our own `bash`: it runs under the
+/// configured `bash_timeout` and `bash_max_timeout`, and its results are cut
+/// at the configured `max_tool_output`.
+#[cfg(feature = "command-exec")]
+#[tokio::test]
+#[serial_test::serial(synaps_base_dir)]
+async fn the_tool_loop_runs_bash_under_the_configured_limits() {
+    let h = harness();
+    std::fs::write(
+        h._base.path().join("config"),
+        "bash_max_timeout = 2\nbash_timeout = 1\nmax_tool_output = 100\n",
+    )
+    .unwrap();
+    let handler = Arc::new(FakeProvider {
+        complete_results: Mutex::new(vec![
+            bash_use("t1", json!({"command": "echo hi", "timeout": 400})),
+            bash_use("t2", json!({"command": "sleep 3; echo late"})),
+            bash_use("t3", json!({"command": "printf 'x%.0s' $(seq 300)"})),
+            Ok(ok_result("end_turn")),
+        ]),
+        ..Default::default()
+    });
+    let manager = manager_with(handler.clone(), false, true, true).await;
+    let tools: Arc<Vec<Value>> = Arc::new(vec![json!({
+        "name": "bash",
+        "description": "bash",
+        "input_schema": {"type": "object"},
+    })]);
+    let cancel = CancellationToken::new();
+    route(&manager, &h.trace, &cancel, tools)
+        .await
+        .expect("tool loop completes");
+    assert_eq!(handler.complete_calls.load(Ordering::SeqCst), 4);
+
+    let capped = round_result(&handler, 1);
+    assert!(
+        capped.contains("[timeout clamped from 400 s to 2 s by bash_max_timeout]"),
+        "a timeout above the configured cap is lowered to it: {capped}"
+    );
+    let defaulted = round_result(&handler, 2);
+    assert!(
+        defaulted.contains("timed out after 1s") && !defaulted.contains("late"),
+        "a call with no timeout runs under the configured bash_timeout: {defaulted}"
+    );
+    let long = round_result(&handler, 3);
+    assert_eq!(
+        long,
+        "x".repeat(100),
+        "a result is cut at the configured max_tool_output"
+    );
+}
+
+/// An `after_tool_call` hook that replaces every tool result.
+#[cfg(feature = "command-exec")]
+struct ReplaceEveryResult;
+
+#[cfg(feature = "command-exec")]
+#[async_trait]
+impl ExtensionHandler for ReplaceEveryResult {
+    fn id(&self) -> &str {
+        "replace-every-result"
+    }
+
+    async fn handle(&self, _event: &HookEvent) -> HookResult {
+        HookResult::Replace {
+            output: "REPLACED BY HOOK".to_string(),
+        }
+    }
+
+    async fn shutdown(&self) {}
+}
+
+/// A hook's Replace is final in the tool loop, the clamp notice included.
+/// With no hook a lowered call's result opens with the notice; with a
+/// Replace hook the provider gets the replacement alone. The notice is in the
+/// output the hook receives, so keeping it is the hook's call.
+#[cfg(feature = "command-exec")]
+#[tokio::test]
+#[serial_test::serial(synaps_base_dir)]
+async fn a_hook_replace_is_final_for_a_clamped_call_in_the_tool_loop() {
+    let h = harness();
+    std::fs::write(h._base.path().join("config"), "bash_max_timeout = 2\n").unwrap();
+    for (replace, expected) in [
+        (
+            false,
+            "[timeout clamped from 400 s to 2 s by bash_max_timeout]\nok\n",
+        ),
+        (true, "REPLACED BY HOOK"),
+    ] {
+        let hook_bus = Arc::new(HookBus::new());
+        if replace {
+            let mut perms = crate::extensions::permissions::PermissionSet::new();
+            perms.grant(crate::extensions::permissions::Permission::ToolsIntercept);
+            perms.grant(crate::extensions::permissions::Permission::ToolsTransformOutput);
+            hook_bus
+                .subscribe(
+                    crate::extensions::hooks::events::HookKind::AfterToolCall,
+                    Arc::new(ReplaceEveryResult),
+                    None,
+                    None,
+                    perms,
+                )
+                .await
+                .unwrap();
+        }
+        let handler = Arc::new(FakeProvider {
+            complete_results: Mutex::new(vec![
+                bash_use("t1", json!({"command": "echo ok", "timeout": 400})),
+                Ok(ok_result("end_turn")),
+            ]),
+            ..Default::default()
+        });
+        let manager = manager_with_bus(handler.clone(), false, true, true, hook_bus).await;
+        let tools: Arc<Vec<Value>> = Arc::new(vec![json!({
+            "name": "bash",
+            "description": "bash",
+            "input_schema": {"type": "object"},
+        })]);
+        let cancel = CancellationToken::new();
+        route(&manager, &h.trace, &cancel, tools)
+            .await
+            .expect("tool loop completes");
+        assert_eq!(handler.complete_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(round_result(&handler, 1), expected, "replace={replace}");
+    }
+}
+
 // ═══ Capability-driven translation report ═══════════════════════════════════
 
 #[tokio::test]
@@ -652,6 +837,10 @@ fn stop_reason_mapping_is_closed_and_usage_parsing_is_typed() {
     use super::extension::{stop_reason_from_extension, usage_from_extension_value};
     assert_eq!(stop_reason_from_extension("end_turn"), StopReason::EndTurn);
     assert_eq!(stop_reason_from_extension("tool_use"), StopReason::ToolUse);
+    assert_eq!(
+        stop_reason_from_extension("model_context_window_exceeded"),
+        StopReason::MaxTokens
+    );
     assert_eq!(stop_reason_from_extension(SENTINEL), StopReason::Other);
 
     // Non-numeric or hostile shapes yield no usage — never copied values.
@@ -663,4 +852,63 @@ fn stop_reason_mapping_is_closed_and_usage_parsing_is_typed() {
             .expect("one valid metric suffices");
     assert_eq!(usage.input_tokens, Some(7));
     assert_eq!(usage.output_tokens, None);
+}
+
+// ═══ Sandbox: the interior tool loop runs bash under the session's binding ══
+
+/// The provider asks for `bash` `touch <marker>`, once per case. Without a
+/// binding the command runs (so this loop really executes bash); with the
+/// session's binding, whose policy file is invalid, it is refused and nothing
+/// runs. No kernel support needed: an invalid policy refuses before any
+/// domain is built. Scratch tree only (`test_scratch_parent`).
+#[cfg(all(target_os = "linux", feature = "command-exec"))]
+#[tokio::test]
+#[serial_test::serial(synaps_base_dir)]
+async fn tool_loop_bash_runs_under_the_sessions_sandbox_binding() {
+    use crate::sandbox::policy::{test_scratch_parent, KillSwitch, PolicyEnv};
+    use crate::sandbox::SandboxBinding;
+
+    let h = harness();
+    let tmp = tempfile::Builder::new().prefix("sbx-ext-").tempdir_in(test_scratch_parent()).expect("tempdir");
+    let root = std::fs::canonicalize(tmp.path()).expect("canonical tempdir");
+    std::fs::create_dir_all(root.join("home/x/base/sandbox/sessions")).expect("mkdir");
+    let env = PolicyEnv { home: root.join("home"), base_dir: root.join("home/x/base") };
+    std::fs::write(env.policy_path("s1").expect("valid id"), "mode = enforce\ncontact = Ask your foreman.\nbogus = 1\n")
+        .expect("write policy");
+    let binding = SandboxBinding::with_env("s1", env, Box::leak(Box::new(KillSwitch::new())), Some(Ok(7)));
+    let tools: Arc<Vec<Value>> = Arc::new(vec![json!({
+        "name": "bash",
+        "description": "run a command",
+        "input_schema": {"type": "object"},
+    })]);
+
+    for (sandbox, name) in [(None, "unbound"), (Some(&binding), "bound")] {
+        let marker = root.join(name);
+        let handler = Arc::new(FakeProvider {
+            complete_results: Mutex::new(vec![
+                Ok(ProviderCompleteResult {
+                    content: vec![json!({
+                        "type": "tool_use",
+                        "id": "t1",
+                        "name": "bash",
+                        "input": {"command": format!("touch {}", marker.display())},
+                    })],
+                    stop_reason: Some("tool_use".to_string()),
+                    usage: None,
+                }),
+                Ok(ok_result("end_turn")),
+            ]),
+            ..Default::default()
+        });
+        let manager = manager_with(handler.clone(), false, true, true).await;
+        route_sandboxed(&manager, &h.trace, &CancellationToken::new(), tools.clone(), sandbox)
+            .await
+            .expect("tool loop completes");
+        assert_eq!(
+            handler.complete_calls.load(Ordering::SeqCst),
+            2,
+            "{name}: the tool ran, then the provider ended the turn"
+        );
+        assert_eq!(marker.exists(), sandbox.is_none(), "{name}: only the command without a binding ran");
+    }
 }

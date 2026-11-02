@@ -627,6 +627,16 @@ impl Tool for DeferredExtensionTool {
     }
 
     async fn execute(&self, params: Value, ctx: ToolContext) -> crate::Result<String> {
+        self.execute_rich(params, ctx)
+            .await
+            .map(crate::tools::ToolOutput::into_summary)
+    }
+
+    async fn execute_rich(
+        &self,
+        params: Value,
+        ctx: ToolContext,
+    ) -> crate::Result<crate::tools::ToolOutput> {
         // Runs strictly AFTER the ExecutionGate authorized this exact call.
         let binding = ctx
             .capabilities
@@ -655,7 +665,7 @@ impl Tool for DeferredExtensionTool {
             )
             .await
         {
-            Ok(value) => Ok(render_tool_result(&value)),
+            Ok(value) => Ok(crate::tools::extension::extension_tool_output(&value)),
             Err(err) => {
                 // Grant invalidation (spec §7.5): record removal, manifest/
                 // permission re-validation failure, launch-record (config)
@@ -680,19 +690,6 @@ impl Tool for DeferredExtensionTool {
                 Err(crate::RuntimeError::Tool(err.to_string()))
             }
         }
-    }
-}
-
-/// Render an extension tool-call result value exactly like the eager
-/// `ExtensionTool` path: plain string, `content` string field, or the
-/// serialized value.
-fn render_tool_result(value: &Value) -> String {
-    if let Some(text) = value.as_str() {
-        text.to_string()
-    } else if let Some(text) = value.get("content").and_then(Value::as_str) {
-        text.to_string()
-    } else {
-        value.to_string()
     }
 }
 

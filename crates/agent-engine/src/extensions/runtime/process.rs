@@ -254,17 +254,33 @@ pub async fn execute_provider_tool_use(
     let tool = authorized.implementation();
 
     let runtime_name = authorized.runtime_name().to_string();
+    // Sandbox `tools = confined`, on the session's binding this loop runs
+    // under: a refused call reaches no hook and never runs.
+    if let Err(text) = crate::sandbox::gate_tool(ctx.capabilities.sandbox.as_deref(), &runtime_name) {
+        return serde_json::json!({
+            "type": "tool_result",
+            "tool_use_id": tool_id,
+            "content": text,
+            "is_error": true,
+        });
+    }
     let input = registry.translate_input_for_api_tool(&tool_name, input);
+    // Extension-originated tool.invoke: no owning conversation on this path
+    // (ToolContext carries none) → `null`, as before. The provider's call id
+    // and the tool's cwd are known, so the hooks get them.
+    let hook_call = crate::extensions::hooks::events::ToolCallHookContext::for_tool_call(
+        None,
+        Some(tool_id.as_str()),
+        ctx.capabilities.cwd.as_deref(),
+    );
     let decision = crate::runtime::resolve_before_tool_call_decision(
         input.clone(),
-        crate::runtime::emit_before_tool_call(
+        crate::runtime::emit_before_tool_call_with(
             hook_bus,
             &tool_name,
             Some(&runtime_name),
             input.clone(),
-            // Extension-originated tool.invoke: no owning conversation on this
-            // path (ToolContext carries none) → `null`, as before.
-            None,
+            &hook_call,
         )
         .await,
         ctx.capabilities.secret_prompt.as_ref(),
@@ -272,6 +288,9 @@ pub async fn execute_provider_tool_use(
         // The session's latch, so "Allow all" here arms (and honours) the
         // same per-extension consent as the main tool path.
         ctx.capabilities.session_allow_all.as_deref(),
+        // The id the event carries, for the prompt's scope (none without a
+        // latch: no scope is built then).
+        hook_call.tool_call_id,
     )
     .await;
 
@@ -292,14 +311,14 @@ pub async fn execute_provider_tool_use(
         Ok(output) => (output, false),
         Err(error) => (format!("Tool execution failed: {}", error), true),
     };
-    let result = crate::runtime::emit_after_tool_call(
+    let result = crate::runtime::emit_after_tool_call_with(
         hook_bus,
         &tool_name,
         Some(&runtime_name),
         input_for_hook,
         result,
         max_tool_output,
-        None,
+        &hook_call,
     )
     .await;
 
@@ -334,6 +353,8 @@ pub async fn complete_provider_with_tools<F>(
     // count is still observable on the error paths below — the audit
     // record must stay honest when the iteration limit is hit.
     tools_requested: &mut u32,
+    // Books each interior call's reported usage (inert without a tap).
+    spend: crate::runtime::child_spend::RouteSpend<'_>,
 ) -> Result<ProviderCompleteResult, String>
 where
     F: FnMut() -> crate::ToolContext,
@@ -342,6 +363,9 @@ where
     *tools_requested = 0;
     for iteration in 0..max_iterations {
         let result = handler.provider_complete(params.clone()).await?;
+        // Each interior call is one paid attempt: book it now, before its
+        // tools run or the iteration limit ends the loop.
+        spend.book_returned(result.usage.as_ref());
         let tool_uses = extract_provider_tool_uses(&result.content)?;
         if tool_uses.is_empty() {
             return Ok(result);
@@ -735,6 +759,12 @@ pub(crate) fn is_application_error(error: &str) -> bool {
     error.starts_with(APPLICATION_ERROR_PREFIX)
 }
 
+/// `shutdown`: how long to wait for the extension's reply.
+const SHUTDOWN_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+/// `shutdown`: how long, after the reply (or its timeout), the child may take
+/// to exit before it is killed. An exit ends the wait at once.
+const SHUTDOWN_EXIT_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
+
 impl ProcessExtension {
     /// Abort the child transport immediately. Cancellation uses this rather
     /// than waiting for the per-call permit; draining pending responders
@@ -845,6 +875,10 @@ impl ProcessExtension {
         let mut child = cmd
             .spawn()
             .map_err(|e| format!("Failed to spawn extension '{}': {}", id, e))?;
+        // Host list of the `children` query (labels only).
+        if let Some(pid) = child.id() {
+            crate::session::children::record_host(crate::session::children::HostOwnerKind::Extension, id, pid);
+        }
 
         let stdin = child
             .stdin
@@ -2520,17 +2554,37 @@ impl ExtensionHandler for ProcessExtension {
         // call path would then spawn an unvalidated replacement solely to
         // shut it down.
         let _ = tokio::time::timeout(
-            std::time::Duration::from_millis(500),
+            SHUTDOWN_REPLY_TIMEOUT,
             self.call_no_spawn("shutdown", Value::Null),
         )
         .await;
 
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        let mut state_guard = self.state.lock().await;
-        if let Some(state) = state_guard.take() {
-            state.reader_handle.abort();
+        // Out of the slot first: callers see a stopped extension at once.
+        let state = self.state.lock().await.take();
+        if let Some(state) = state {
             state.lifecycle.invalidate();
-            let _ = state.lifecycle.child.lock().await.kill().await;
+            {
+                // A child that honours `shutdown` exits right after its
+                // reply: wait for that exit, up to the grace, instead of
+                // sleeping the whole grace. Still running then: kill it.
+                // Normally the child is reaped here either way (a failed
+                // wait or kill is ignored, as before). The reader stays up
+                // during the wait, but teardown does not guarantee that the
+                // child's last output is read or its final notifications
+                // delivered: the reader is backpressured by its subscribers
+                // and is aborted after the wait (the old abort after a fixed
+                // sleep did not guarantee it either). An early exit normally
+                // ends the reply wait above too: the reader sees EOF and
+                // fails the pending call.
+                let mut child = state.lifecycle.child.lock().await;
+                if tokio::time::timeout(SHUTDOWN_EXIT_GRACE, child.wait())
+                    .await
+                    .is_err()
+                {
+                    let _ = child.kill().await;
+                }
+            }
+            state.reader_handle.abort();
         }
         // Drop all active notification subscribers and signal pending callers.
         self.inbox.notification_sinks.lock().await.clear();
@@ -3469,5 +3523,438 @@ done"#
         assert_eq!(bounded(ext.handle_no_spawn(&event)).await, HookResult::Continue);
         assert!(ext.state.lock().await.is_none(), "no process was respawned");
         assert_eq!(ext.total_restarts.load(Ordering::Relaxed), 1);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod shutdown_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// Replies to `shutdown`; mode `exit` then exits, `linger` keeps running;
+    /// mode `quit` exits without a reply.
+    const FIXTURE: &str = "tests/fixtures/shutdown_extension.py";
+
+    async fn started(mode: &str) -> (ProcessExtension, Arc<ProcessLifecycle>) {
+        let ext = ProcessExtension::spawn(
+            &format!("shutdown-{mode}"),
+            "python3",
+            &[FIXTURE.into(), mode.into()],
+        )
+        .await
+        .expect("spawn the shutdown fixture");
+        tokio::time::timeout(Duration::from_secs(10), ext.initialize_for_test(None))
+            .await
+            .expect("bounded initialize")
+            .expect("initialize");
+        let lifecycle = ext
+            .state
+            .lock()
+            .await
+            .as_ref()
+            .expect("running")
+            .lifecycle
+            .clone();
+        (ext, lifecycle)
+    }
+
+    /// The child's pid, taken while it runs.
+    async fn child_pid(lifecycle: &ProcessLifecycle) -> u32 {
+        lifecycle.child.lock().await.id().expect("the child runs")
+    }
+
+    /// Whether shutdown itself reaped the child, checked without a wait API
+    /// (which would reap a zombie and hide a shutdown that did not): tokio
+    /// drops the pid once the child has been waited to completion, and on
+    /// Linux an exited child that nobody reaped keeps its /proc entry (state
+    /// Z) while a reaped one has none.
+    async fn assert_reaped_by_shutdown(lifecycle: &ProcessLifecycle, pid: u32) {
+        #[cfg(target_os = "linux")]
+        {
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"));
+            assert!(stat.is_err(), "pid {pid} is still in the process table: {stat:?}");
+        }
+        let _ = pid;
+        assert!(
+            lifecycle.child.lock().await.id().is_none(),
+            "the child handle was waited to completion"
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_returns_once_a_compliant_child_has_exited() {
+        let (ext, lifecycle) = started("exit").await;
+        let pid = child_pid(&lifecycle).await;
+        let t0 = Instant::now();
+        ext.shutdown().await;
+        let took = t0.elapsed();
+        assert!(
+            took < Duration::from_millis(300),
+            "shutdown took {took:?} for a child that exits on its reply"
+        );
+        assert_reaped_by_shutdown(&lifecycle, pid).await;
+        // The status, now cached: read after the check above.
+        let status = lifecycle.child.lock().await.try_wait().expect("child status");
+        assert!(
+            status.is_some_and(|s| s.success()),
+            "the child exited on its own and was reaped: {status:?}"
+        );
+        assert!(ext.state.lock().await.is_none(), "the transport is gone");
+    }
+
+    #[tokio::test]
+    async fn shutdown_returns_once_a_child_exits_without_a_reply() {
+        let (ext, lifecycle) = started("quit").await;
+        let pid = child_pid(&lifecycle).await;
+        let t0 = Instant::now();
+        ext.shutdown().await;
+        let took = t0.elapsed();
+        assert!(
+            took < Duration::from_millis(300),
+            "shutdown took {took:?} for a child that exits instead of replying"
+        );
+        assert_reaped_by_shutdown(&lifecycle, pid).await;
+        // The status, now cached: read after the check above.
+        let status = lifecycle.child.lock().await.try_wait().expect("child status");
+        assert!(
+            status.is_some_and(|s| s.success()),
+            "the child exited on its own and was reaped: {status:?}"
+        );
+        assert!(ext.state.lock().await.is_none(), "the transport is gone");
+    }
+
+    #[tokio::test]
+    async fn shutdown_kills_a_child_that_stays_after_its_reply() {
+        let (ext, lifecycle) = started("linger").await;
+        let pid = child_pid(&lifecycle).await;
+        let t0 = Instant::now();
+        ext.shutdown().await;
+        let took = t0.elapsed();
+        assert!(
+            took >= Duration::from_millis(400) && took < Duration::from_secs(2),
+            "the exit grace bounds the wait: {took:?}"
+        );
+        assert_reaped_by_shutdown(&lifecycle, pid).await;
+        // The status, now cached: read after the check above.
+        let status = lifecycle.child.lock().await.try_wait().expect("child status");
+        assert!(
+            status.is_some_and(|s| !s.success()),
+            "the lingering child was killed and reaped: {status:?}"
+        );
+        assert!(ext.state.lock().await.is_none(), "the transport is gone");
+    }
+}
+
+#[cfg(test)]
+mod provider_tool_hook_context_tests {
+    use super::*;
+    use crate::extensions::hooks::events::{HookEvent, HookKind, HookResult};
+    use crate::extensions::hooks::HookBus;
+    use crate::extensions::permissions::{Permission, PermissionSet};
+    use crate::tools::activation::{SessionId, SessionToolSet};
+    use crate::tools::{Tool, ToolContext, ToolOrigin, ToolRegistry};
+    use serde_json::json;
+
+    struct EchoTool;
+    #[async_trait::async_trait]
+    impl Tool for EchoTool {
+        fn name(&self) -> &str {
+            "echo_test"
+        }
+        fn description(&self) -> &str {
+            "echo test tool"
+        }
+        fn parameters(&self) -> Value {
+            json!({"type": "object"})
+        }
+        fn origin(&self) -> ToolOrigin {
+            ToolOrigin::Builtin
+        }
+        async fn execute(&self, params: Value, _ctx: ToolContext) -> crate::Result<String> {
+            Ok(params["message"].as_str().unwrap_or_default().to_string())
+        }
+    }
+
+    /// Records every hook event it sees; answers Continue.
+    struct RecordingHook(Arc<std::sync::Mutex<Vec<HookEvent>>>);
+    #[async_trait::async_trait]
+    impl ExtensionHandler for RecordingHook {
+        fn id(&self) -> &str {
+            "recording-hook"
+        }
+        async fn handle(&self, event: &HookEvent) -> HookResult {
+            self.0.lock().unwrap().push(event.clone());
+            HookResult::Continue
+        }
+        async fn shutdown(&self) {}
+    }
+
+    fn context_with_cwd(cwd: Option<std::path::PathBuf>) -> ToolContext {
+        ToolContext {
+            channels: crate::tools::ToolChannels {
+                tx_delta: None,
+                tx_events: None,
+            },
+            capabilities: crate::tools::ToolCapabilities {
+                session_allow_all: None,
+                launch_cancel: None,
+                memory_backend: None,
+                continuation: None,
+                watcher_exit_path: None,
+                tool_register_tx: None,
+                session_manager: None,
+                subagent_registry: None,
+                event_queue: None,
+                delegation_parent: None,
+                codex_parent_plan: None,
+                worker_context: None,
+                secret_prompt: None,
+                orchestration: None,
+                tool_activation: None,
+                mcp_leases: None,
+                extension_leases: None,
+                memory_context: None,
+                cwd,
+                env: None,
+                env_stripped: Vec::new(),
+                env_warned: Default::default(),
+                sandbox: None,
+                session_id: None,
+                tool_use_id: None,
+                turn_correlation_id: None,
+                spend: None,
+                telemetry: None,
+            },
+            limits: crate::tools::ToolLimits {
+                max_tool_output: 1000,
+                max_tool_buffer: 256 * 1024,
+                bash_timeout: 1,
+                bash_max_timeout: 1,
+                subagent_timeout: 1,
+            },
+        }
+    }
+
+    /// Records each `before_tool_call`'s call id; answers Confirm.
+    struct ConfirmingHook(Arc<std::sync::Mutex<Vec<Option<String>>>>);
+    #[async_trait::async_trait]
+    impl ExtensionHandler for ConfirmingHook {
+        fn id(&self) -> &str {
+            "jev"
+        }
+        async fn handle(&self, event: &HookEvent) -> HookResult {
+            self.0.lock().unwrap().push(event.tool_call_id.clone());
+            HookResult::confirm("Run it?")
+        }
+        async fn shutdown(&self) {}
+    }
+
+    /// A Confirm on the extension-provider path names its call when the
+    /// context has a latch: the prompt's scope carries the id the call's
+    /// `before_tool_call` event carries. With no latch no scope is built, so
+    /// the prompt carries no id (the known gap; the only production caller
+    /// passes neither a prompt nor a latch, so it raises no prompt today).
+    #[tokio::test]
+    async fn a_provider_tool_confirm_carries_the_call_id_only_with_a_latch() {
+        for latched in [true, false] {
+            let mut registry = ToolRegistry::empty();
+            registry.register(Arc::new(EchoTool));
+            let session_tools = SessionToolSet::default_core_for_catalog(
+                SessionId::parse("provider-confirm-id-test").unwrap(),
+                registry.catalog(),
+            );
+            let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let bus = Arc::new(HookBus::new());
+            let mut perms = PermissionSet::new();
+            perms.grant(Permission::ToolsIntercept);
+            let handler: Arc<dyn ExtensionHandler> = Arc::new(ConfirmingHook(seen.clone()));
+            bus.subscribe(HookKind::BeforeToolCall, handler, None, None, perms)
+                .await
+                .unwrap();
+            let (prompt_tx, mut prompt_rx) =
+                tokio::sync::mpsc::unbounded_channel::<crate::tools::SecretPromptRequest>();
+            let answer = tokio::spawn(async move {
+                let req = prompt_rx.recv().await.expect("the confirm prompts");
+                let scope = req.confirm_scope.clone();
+                let _ = req.response_tx.send(Some("yes".into()));
+                scope
+            });
+            let mut ctx = context_with_cwd(None);
+            ctx.capabilities.secret_prompt = Some(crate::tools::SecretPromptHandle::new(prompt_tx));
+            if latched {
+                ctx.capabilities.session_allow_all =
+                    Some(Arc::new(crate::tools::SessionConfirmLatch::new()));
+            }
+            let result = execute_provider_tool_use(
+                &registry,
+                &session_tools,
+                &bus,
+                ProviderToolUse {
+                    id: "call-1".to_string(),
+                    name: "echo_test".to_string(),
+                    input: json!({"message": "hello"}),
+                },
+                ctx,
+                1000,
+            )
+            .await;
+            assert_eq!(result["content"], "hello", "approved, latched {latched}: {result}");
+            let scope = answer.await.unwrap();
+            assert_eq!(seen.lock().unwrap().clone(), vec![Some("call-1".to_string())]);
+            if latched {
+                let scope = scope.expect("a latch gives the prompt its scope");
+                assert_eq!(
+                    (scope.extensions, scope.tool_call_id.as_deref()),
+                    (vec!["jev".to_string()], Some("call-1"))
+                );
+            } else {
+                assert_eq!(scope, None, "no latch: no scope, so no id (the known gap)");
+            }
+        }
+    }
+
+    /// The provider's call id and the tool's cwd reach both tool hooks on
+    /// the extension-provider path; there is no owning conversation here.
+    #[tokio::test]
+    async fn provider_tool_hooks_carry_the_call_id_and_the_tool_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let process_cwd = std::env::current_dir().unwrap();
+        for (cwd, expected) in [
+            (Some(dir.path().to_path_buf()), dir.path().to_path_buf()),
+            (None, process_cwd),
+        ] {
+            let mut registry = ToolRegistry::empty();
+            registry.register(Arc::new(EchoTool));
+            let session_tools = SessionToolSet::default_core_for_catalog(
+                SessionId::parse("provider-hook-context-test").unwrap(),
+                registry.catalog(),
+            );
+            let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let bus = Arc::new(HookBus::new());
+            let mut perms = PermissionSet::new();
+            perms.grant(Permission::ToolsIntercept);
+            let handler: Arc<dyn ExtensionHandler> = Arc::new(RecordingHook(events.clone()));
+            for kind in [HookKind::BeforeToolCall, HookKind::AfterToolCall] {
+                bus.subscribe(kind, handler.clone(), None, None, perms.clone())
+                    .await
+                    .unwrap();
+            }
+            let result = execute_provider_tool_use(
+                &registry,
+                &session_tools,
+                &bus,
+                ProviderToolUse {
+                    id: "call-1".to_string(),
+                    name: "echo_test".to_string(),
+                    input: json!({"message": "hello"}),
+                },
+                context_with_cwd(cwd.clone()),
+                1000,
+            )
+            .await;
+            assert_eq!(result["content"], "hello");
+            let events = events.lock().unwrap().clone();
+            let seen: Vec<_> = events
+                .iter()
+                .map(|e| {
+                    (
+                        e.kind,
+                        e.tool_call_id.clone(),
+                        e.cwd.clone(),
+                        e.session_id.clone(),
+                    )
+                })
+                .collect();
+            let want = Some(expected.to_str().unwrap().to_string());
+            assert_eq!(
+                seen,
+                vec![
+                    (
+                        HookKind::BeforeToolCall,
+                        Some("call-1".to_string()),
+                        want.clone(),
+                        None
+                    ),
+                    (
+                        HookKind::AfterToolCall,
+                        Some("call-1".to_string()),
+                        want,
+                        None
+                    ),
+                ],
+                "tool cwd {cwd:?}"
+            );
+        }
+    }
+
+    /// Sandbox `tools = confined` on the extension-provider loop: a tool
+    /// that isn't on the session's list is refused before any hook and never
+    /// runs; named by a `tool =` line, it runs as before. (Scratch policy dir.)
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_confined_session_refuses_an_unlisted_provider_tool_before_any_hook() {
+        use crate::sandbox::policy::{test_scratch_parent, KillSwitch, PolicyEnv};
+        let tmp = tempfile::Builder::new()
+            .prefix("sbx-confine-provider-")
+            .tempdir_in(test_scratch_parent())
+            .unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        std::fs::create_dir_all(root.join("home/x/base/sandbox/sessions")).unwrap();
+        let env = PolicyEnv { home: root.join("home"), base_dir: root.join("home/x/base") };
+        for (id, extra, runs) in [("unlisted", "", false), ("named", "tool = echo_test\n", true)] {
+            std::fs::write(
+                env.policy_path(id).unwrap(),
+                format!("mode = enforce\ntools = confined\ncontact = Ask the desk.\n{extra}"),
+            )
+            .unwrap();
+            let mut registry = ToolRegistry::empty();
+            registry.register(Arc::new(EchoTool));
+            let session_tools = SessionToolSet::default_core_for_catalog(
+                SessionId::parse("provider-confine-test").unwrap(),
+                registry.catalog(),
+            );
+            let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let bus = Arc::new(HookBus::new());
+            let mut perms = PermissionSet::new();
+            perms.grant(Permission::ToolsIntercept);
+            let handler: Arc<dyn ExtensionHandler> = Arc::new(RecordingHook(events.clone()));
+            for kind in [HookKind::BeforeToolCall, HookKind::AfterToolCall] {
+                bus.subscribe(kind, handler.clone(), None, None, perms.clone())
+                    .await
+                    .unwrap();
+            }
+            let mut ctx = context_with_cwd(None);
+            ctx.capabilities.sandbox = Some(crate::sandbox::SandboxBinding::with_env(
+                id,
+                env.clone(),
+                Box::leak(Box::new(KillSwitch::new())),
+                Some(Ok(7)),
+            ));
+            let result = execute_provider_tool_use(
+                &registry,
+                &session_tools,
+                &bus,
+                ProviderToolUse {
+                    id: "call-1".to_string(),
+                    name: "echo_test".to_string(),
+                    input: json!({"message": "hello"}),
+                },
+                ctx,
+                1000,
+            )
+            .await;
+            let hooks = events.lock().unwrap().len();
+            if runs {
+                assert_eq!((result["content"].as_str(), hooks), (Some("hello"), 2), "{result}");
+            } else {
+                let text = result["content"].as_str().unwrap_or_default();
+                assert_eq!((result["is_error"].as_bool(), result["tool_use_id"].as_str(), hooks), (Some(true), Some("call-1"), 0), "{result}");
+                assert!(
+                    text.starts_with("Refused by this session's sandbox (tools = confined): `echo_test` is not on its tool list")
+                        && text.ends_with("Ask the desk."),
+                    "{result}"
+                );
+            }
+        }
     }
 }

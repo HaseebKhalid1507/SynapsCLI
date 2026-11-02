@@ -16,12 +16,19 @@
 //! immediately before the actual `provider_stream` / `provider_complete`
 //! IPC; one outer extension turn is one transport attempt; the wire section
 //! is always `None`; trace failure can never change provider behavior.
+//!
+//! Child spend (a worker's tap; inert otherwise): the streamed call books
+//! its last report with counts once, when it returns or its guard drops; the
+//! direct call books its result when it returns; the host tool loop books
+//! each interior `provider_complete` and never the outer result. Retries
+//! inside one extension RPC are the extension's own and stay invisible.
 
 use std::sync::Arc;
 
 use serde_json::Value;
 
 use crate::extensions::manager::ExtensionManager;
+use crate::runtime::child_spend::{ReportedUsage, RouteSpend};
 use crate::runtime::trace::extension as trace_ext;
 use crate::tools::{ToolCapabilities, ToolChannels, ToolContext, ToolLimits};
 
@@ -47,7 +54,9 @@ fn local_gate_session() -> crate::tools::activation::SessionId {
 /// routing manager. `tool_session_id` is the runtime-scoped tool-session
 /// identity (Task 16) scoping the execution gate inside the interior tool
 /// loop; `None` (internal/sync callers) fails closed to a locally minted
-/// identity with the same default-core policy.
+/// identity with the same default-core policy. `sandbox` is the session's
+/// write-sandbox binding: bash/PTY commands the interior loop runs are
+/// sandboxed exactly as in the session's own turns (`None`: no sandbox).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn route_extension_provider(
     manager: Arc<tokio::sync::RwLock<ExtensionManager>>,
@@ -66,7 +75,9 @@ pub(crate) async fn route_extension_provider(
     tool_session_id: Option<&crate::tools::activation::SessionId>,
     session_tool_set: Option<&crate::tools::activation::SharedSessionToolSet>,
     memory_backend: Option<&crate::memory_backend::MemoryBinding>,
+    sandbox: Option<&Arc<crate::sandbox::SandboxBinding>>,
     trace: &crate::runtime::trace::TraceContext,
+    spend: RouteSpend<'_>,
 ) -> RouteResult {
     let provider_runtime_id = format!("{}:{}", plugin_id, provider_id);
     let Some((handler, hook_bus, tools_shared, streaming, model_tool_use)) = ({
@@ -208,6 +219,13 @@ pub(crate) async fn route_extension_provider(
         // asked for, even though we discard it.
         let stream_tool_uses = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let stream_tool_uses_fwd = std::sync::Arc::clone(&stream_tool_uses);
+        // One paid attempt. The forwarder shows the guard each streamed
+        // report (a snapshot: the last with counts is kept) and the call's
+        // own final usage is shown when it returns; only this route books it.
+        // Booking fences the forwarder: a report it handles later (a cancel
+        // aborts it) is ignored, and the forwarder never books.
+        let attempt_spend = spend.attempt();
+        let stream_spend = attempt_spend.observer();
         let forwarder = tokio::spawn(async move {
             use crate::extensions::runtime::process::ProviderStreamEvent;
             while let Some(event) = sink_rx.recv().await {
@@ -223,11 +241,15 @@ pub(crate) async fn route_extension_provider(
                         stream_tool_uses_fwd.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         tracing::warn!("provider.stream tool_use event ignored (streaming tool-use not yet wired)");
                     }
-                    ProviderStreamEvent::ThinkingDelta { .. }
-                    | ProviderStreamEvent::Usage { .. } => {
+                    ProviderStreamEvent::ThinkingDelta { .. } => {
                         // Model-authored events: mark first-event timing, then
                         // absorb — the final result aggregates them.
                         first_event.mark();
+                    }
+                    ProviderStreamEvent::Usage { usage } => {
+                        // Absorbed as above; the attempt's guard keeps it.
+                        first_event.mark();
+                        stream_spend.observe(&ReportedUsage::from_anthropic_json(&usage));
                     }
                     // Done / Error are transport markers, not model events.
                     _ => {}
@@ -238,6 +260,8 @@ pub(crate) async fn route_extension_provider(
         let result = tokio::select! {
             biased;
             _ = cancel.cancelled() => {
+                // The guard's drop at this return books what the forwarder
+                // has shown it.
                 forwarder.abort();
                 attempt.finish_canceled();
                 emit_audit(
@@ -251,6 +275,15 @@ pub(crate) async fn route_extension_provider(
             res = stream_fut => res,
         };
         let _ = forwarder.await;
+        // The call returned and was paid: its own final usage (with counts it
+        // wins over the streamed snapshots) is booked now, before the cancel
+        // check below could discard it.
+        if let Ok(complete) = &result {
+            if let Some(usage) = &complete.usage {
+                attempt_spend.observe(&ReportedUsage::from_anthropic_json(usage));
+            }
+        }
+        attempt_spend.settle();
         // Forwarder joined: the counter is final.
         let stream_tool_uses = stream_tool_uses.load(std::sync::atomic::Ordering::Relaxed);
         if cancel.is_cancelled() {
@@ -327,6 +360,9 @@ pub(crate) async fn route_extension_provider(
                 registry.catalog(),
                 || tool_session_id.cloned().unwrap_or_else(local_gate_session),
             );
+            // The configured limits: this loop runs our own tools (bash among
+            // them) with no runtime in reach.
+            let tool_limits = ToolLimits::configured();
             crate::extensions::runtime::process::complete_provider_with_tools(
                 handler.clone(),
                 params,
@@ -343,6 +379,10 @@ pub(crate) async fn route_extension_provider(
                         launch_cancel: None,
                         memory_backend: memory_backend.cloned(),
                         telemetry: None,
+                        // Deliberately none: this route carries no session
+                        // continuation, so `context_checkpoint` fails typed
+                        // here instead of reaching any other state.
+                        continuation: None,
                         watcher_exit_path: None,
                         tool_register_tx: None,
                         session_manager: None,
@@ -350,6 +390,7 @@ pub(crate) async fn route_extension_provider(
                         event_queue: None,
                         delegation_parent: None,
                         codex_parent_plan: None,
+                        worker_context: None,
                         secret_prompt: None,
                         orchestration: None,
                         tool_activation: None,
@@ -360,23 +401,28 @@ pub(crate) async fn route_extension_provider(
                         env: None,
                         env_stripped: Vec::new(),
                         env_warned: Default::default(),
+                        sandbox: sandbox.cloned(),
                         session_id: None,
+                        tool_use_id: None,
+                        turn_correlation_id: None,
+                        spend: None,
                     },
-                    limits: ToolLimits {
-                        max_tool_output: 30000,
-                        max_tool_buffer: 256 * 1024,
-                        bash_timeout: 30,
-                        bash_max_timeout: 300,
-                        subagent_timeout: 300,
-                    },
+                    limits: tool_limits,
                 },
-                30000,
+                tool_limits.max_tool_output,
                 8,
                 &mut tools_requested,
+                // Each interior call books itself; this outer result is never
+                // booked again.
+                spend,
             )
             .await
         } else {
-            handler.provider_complete(params).await
+            let result = handler.provider_complete(params).await;
+            // The call returned and was paid: book its usage now, before the
+            // cancel check below could discard it.
+            spend.book_returned(result.as_ref().ok().and_then(|c| c.usage.as_ref()));
+            result
         };
         if cancel.is_cancelled() {
             attempt.finish_canceled();

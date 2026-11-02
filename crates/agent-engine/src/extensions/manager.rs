@@ -21,6 +21,11 @@ use super::runtime::process::ProcessExtension;
 use super::runtime::{ExtensionHandler, ExtensionHealth};
 use serde_json::{Map, Value};
 
+/// At most this many extensions shut down at once in
+/// [`ExtensionManager::shutdown_all`]: enough to overlap a reload's exit
+/// graces, few enough not to fork a burst of teardown work.
+const SHUTDOWN_CONCURRENCY: usize = 8;
+
 fn project_plugins_disabled() -> bool {
     std::env::var("SYNAPS_DISABLE_PROJECT_PLUGINS")
         .map(|value| {
@@ -98,6 +103,17 @@ fn kept_entries(registry: &crate::ToolRegistry, names: &[String]) -> Vec<(String
 /// The same tool object (data pointer; vtables may differ per codegen unit).
 fn same_tool(a: &Arc<dyn crate::Tool>, b: &Arc<dyn crate::Tool>) -> bool {
     std::ptr::eq(Arc::as_ptr(a) as *const (), Arc::as_ptr(b) as *const ())
+}
+
+/// A live extension taken out of the manager by
+/// [`ExtensionManager::detach_live`], its handler still running.
+struct DetachedLive {
+    /// To be shut down by the caller (alone, or batched by `shutdown_all`).
+    handler: Arc<dyn ExtensionHandler>,
+    /// A reload's kept registry entries (empty unless `keep_tools`).
+    kept: Vec<(String, Arc<dyn crate::Tool>)>,
+    /// Why its tools could not be deregistered, if they could not.
+    tool_error: Option<String>,
 }
 
 /// The directory discovery would load plugin `name` from: the last root
@@ -1449,6 +1465,30 @@ impl ExtensionManager {
             tracing::info!(extension = %id, "Deferred extension unloaded");
             return Ok(kept);
         }
+        let DetachedLive {
+            handler,
+            kept,
+            tool_error,
+        } = self.detach_live(id, keep_tools).await?;
+        handler.shutdown().await;
+
+        if let Some(error) = tool_error {
+            // Fail-closed like the deferred path: the extension is gone
+            // either way; surface the partial cleanup.
+            return Err(format!(
+                "Extension '{}' unloaded but its tools could not be deregistered: {}",
+                id, error
+            ));
+        }
+        tracing::info!(extension = %id, "Extension unloaded");
+        Ok(kept)
+    }
+
+    /// The bookkeeping half of unloading a live extension: take it out of
+    /// the manager (hooks, providers, tools, capabilities, context
+    /// providers) and return its handler, still running, for the caller to
+    /// shut down. `keep_tools` as in [`Self::unload_inner`].
+    async fn detach_live(&mut self, id: &str, keep_tools: bool) -> Result<DetachedLive, String> {
         let handler = self
             .extensions
             .remove(id)
@@ -1475,7 +1515,7 @@ impl ExtensionManager {
             Some(tools) => {
                 let mut registry = tools.write().await;
                 let names = registry.tool_names_for_extension(id);
-                registry.try_disable(&names).err()
+                registry.try_disable(&names).err().map(|e| e.to_string())
             }
             None => None,
         };
@@ -1484,18 +1524,11 @@ impl ExtensionManager {
         self.capabilities.remove(id);
         self.plugin_info.remove(id);
         self.manifest_theme_tokens.remove(id);
-        handler.shutdown().await;
-
-        if let Some(error) = tool_error {
-            // Fail-closed like the deferred path: the extension is gone
-            // either way; surface the partial cleanup.
-            return Err(format!(
-                "Extension '{}' unloaded but its tools could not be deregistered: {}",
-                id, error
-            ));
-        }
-        tracing::info!(extension = %id, "Extension unloaded");
-        Ok(kept)
+        Ok(DetachedLive {
+            handler,
+            kept,
+            tool_error,
+        })
     }
 
     /// After a reload's load: remove each kept entry the new instance did
@@ -1518,6 +1551,19 @@ impl ExtensionManager {
         registry
             .try_disable(&stale)
             .map_err(|e| format!("Extension '{id}' reloaded but its stale tools could not be deregistered: {e}"))
+    }
+
+    /// Shut down detached handlers, up to [`SHUTDOWN_CONCURRENCY`] at a
+    /// time: each may wait out its own exit grace, and those waits overlap
+    /// instead of adding up.
+    async fn shut_down_detached(handlers: Vec<(String, Arc<dyn ExtensionHandler>)>) {
+        use futures::StreamExt;
+        futures::stream::iter(handlers)
+            .for_each_concurrent(SHUTDOWN_CONCURRENCY, |(id, handler)| async move {
+                handler.shutdown().await;
+                tracing::info!(extension = %id, "Extension unloaded");
+            })
+            .await;
     }
 
     /// Reload one extension by unloading any existing instance first, then loading
@@ -1725,13 +1771,21 @@ impl ExtensionManager {
     }
 
     /// Shut down all extensions gracefully. Resets discovery so a later
-    /// `discover_and_load` on this manager walks the roots again.
+    /// `discover_and_load` on this manager walks the roots again. Live
+    /// extensions are detached one by one, then shut down concurrently
+    /// (bounded), so a daemon reload does not wait for them in turn.
     pub async fn shutdown_all(&mut self) {
         self.discovery = DiscoveryState::NotStarted;
         let ids: Vec<String> = self.extensions.keys().cloned().collect();
+        let mut detached = Vec::with_capacity(ids.len());
         for id in ids {
-            let _ = self.unload(&id).await;
+            // As `unload` here before: a tool deregistration error is not
+            // surfaced (the extension is gone either way).
+            if let Ok(live) = self.detach_live(&id, false).await {
+                detached.push((id, live.handler));
+            }
         }
+        Self::shut_down_detached(detached).await;
         // Deferred extensions (Task 20): unload each retained record so
         // dormant catalog batches and any live runtime leases go with it.
         let deferred_ids: Vec<String> = {
@@ -2227,6 +2281,17 @@ impl ExtensionManager {
     /// Get the shared tool registry, when this manager was constructed with one.
     pub fn tools_shared(&self) -> Option<Arc<tokio::sync::RwLock<crate::ToolRegistry>>> {
         self.tools.clone()
+    }
+
+    /// Test-only: register a provider spec with no handler (a listing
+    /// fixture: the model picker's plugin rows).
+    #[cfg(test)]
+    pub(crate) fn register_provider_for_tests(
+        &mut self,
+        plugin_id: &str,
+        spec: crate::extensions::runtime::process::RegisteredProviderSpec,
+    ) -> Result<String, String> {
+        self.providers.register(plugin_id, spec)
     }
 
     /// Test-only: register a provider spec + in-process handler directly,
@@ -3641,5 +3706,75 @@ mod secret_env_allowlist_tests {
             !err.contains("lower_case"),
             "dropped name is not suggested: {err}"
         );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod shutdown_all_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// Replies to `shutdown`; mode `exit` then exits, `linger` keeps running
+    /// until killed after the exit grace.
+    fn shutdown_manifest(mode: &str) -> ExtensionManifest {
+        ExtensionManifest {
+            theme_tokens: Default::default(),
+            deferred: None,
+            protocol_version: 1,
+            runtime: crate::extensions::manifest::ExtensionRuntime::Process,
+            command: "python3".to_string(),
+            setup: None,
+            prebuilt: HashMap::new(),
+            args: vec![
+                "tests/fixtures/shutdown_extension.py".to_string(),
+                mode.to_string(),
+            ],
+            permissions: vec!["tools.intercept".to_string()],
+            hooks: vec![crate::extensions::manifest::HookSubscription {
+                hook: "before_tool_call".to_string(),
+                tool: Some("bash".to_string()),
+                matcher: None,
+            }],
+            config: vec![],
+        }
+    }
+
+    async fn loaded(mode: &str, n: usize) -> ExtensionManager {
+        let mut mgr = ExtensionManager::new(Arc::new(HookBus::new()));
+        for i in 0..n {
+            mgr.load(&format!("shutdown-{mode}-{i}"), &shutdown_manifest(mode))
+                .await
+                .expect("load the shutdown fixture");
+        }
+        assert_eq!(mgr.count(), n);
+        mgr
+    }
+
+    #[tokio::test]
+    async fn shutdown_all_returns_as_soon_as_compliant_extensions_have_exited() {
+        let mut mgr = loaded("exit", 6).await;
+        let t0 = Instant::now();
+        mgr.shutdown_all().await;
+        let took = t0.elapsed();
+        eprintln!("shutdown_all, 6 extensions that exit on shutdown: {took:?}");
+        assert!(
+            took < Duration::from_millis(600),
+            "six extensions that exit on their reply took {took:?}"
+        );
+        assert_eq!(mgr.count(), 0);
+    }
+
+    #[tokio::test]
+    async fn shutdown_all_waits_out_the_exit_grace_once_not_per_extension() {
+        let mut mgr = loaded("linger", 6).await;
+        let t0 = Instant::now();
+        mgr.shutdown_all().await;
+        let took = t0.elapsed();
+        eprintln!("shutdown_all, 6 extensions that stay after shutdown: {took:?}");
+        assert!(
+            took < Duration::from_millis(1500),
+            "six lingering extensions took {took:?}; their graces should overlap"
+        );
+        assert_eq!(mgr.count(), 0);
     }
 }
