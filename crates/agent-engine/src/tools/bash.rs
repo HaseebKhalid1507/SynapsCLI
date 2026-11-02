@@ -403,6 +403,28 @@ pub(crate) enum ShellSpec {
 }
 
 impl ShellSpec {
+    /// The program and argv that run `script`.
+    ///
+    /// PowerShell gets `-ExecutionPolicy Bypass`: a stock Windows client has
+    /// the `Restricted` policy, so `.\script.ps1` failed with "running
+    /// scripts is disabled on this system". The flag is process-scoped, and
+    /// PowerShells the command starts inherit it (through
+    /// `PSExecutionPolicyPreference`). A policy set by Group Policy still
+    /// wins. The policy is not a security boundary: the tool already runs any
+    /// command as the user.
+    fn invocation(self, script: &str) -> (std::ffi::OsString, Vec<std::ffi::OsString>) {
+        match self {
+            ShellSpec::Bash => (bash_program(), vec!["-c".into(), script.into()]),
+            ShellSpec::PowerShell => (
+                powershell_program(),
+                ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script]
+                    .into_iter()
+                    .map(Into::into)
+                    .collect(),
+            ),
+        }
+    }
+
     /// Names the command's systemd scope (`systemctl --user list-units --type=scope`).
     fn scope_description(self) -> &'static str {
         match self {
@@ -436,13 +458,7 @@ pub(crate) async fn run_shell_command(
         };
         let max_output = ctx.limits.max_tool_buffer;
 
-        let (program, args): (std::ffi::OsString, Vec<std::ffi::OsString>) = match spec {
-            ShellSpec::Bash => (bash_program(), vec!["-c".into(), script.into()]),
-            ShellSpec::PowerShell => (
-                powershell_program(),
-                vec!["-NoProfile".into(), "-Command".into(), script.into()],
-            ),
-        };
+        let (program, args) = spec.invocation(script);
         let effective_env = ctx.capabilities.env.as_ref()
             .map(|env| env.iter().map(|(k, v)| (k.into(), v.into())).collect())
             .unwrap_or_else(crate::process_scope::inherited_env);
@@ -685,6 +701,18 @@ fn references_env_name(script: &str, name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A stock Windows client has the `Restricted` execution policy: without
+    /// Bypass the powershell tool could not run `.\script.ps1`. The script is
+    /// the last argument, after `-Command`, exactly as given.
+    #[test]
+    fn powershell_runs_with_execution_policy_bypass() {
+        let (_, args) = ShellSpec::PowerShell.invocation(r".\test.ps1");
+        let args: Vec<_> = args.iter().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert_eq!(args, ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", r".\test.ps1"]);
+        let (_, args) = ShellSpec::Bash.invocation("echo hi");
+        assert_eq!(args, [std::ffi::OsString::from("-c"), "echo hi".into()]);
+    }
 
     #[test]
     fn explicit_child_kills_signal_and_disarm_group_before_reaping() {

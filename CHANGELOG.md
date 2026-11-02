@@ -17,6 +17,15 @@ All notable changes to this project will be documented in this file.
   MSYS programs, which expand wildcards in their own arguments when started
   from a non-MSYS process (`-name "*.txt"` became file names), so they run
   with `noglob` added to `MSYS`. Linux and macOS are unchanged.
+- **Windows: the `powershell` tool can run scripts.** A stock Windows
+  client has the `Restricted` execution policy, so `.\test.ps1` failed with
+  "running scripts is disabled on this system" and the model had to retry
+  with `powershell -ExecutionPolicy Bypass -File …`. The tool now starts
+  PowerShell with `-ExecutionPolicy Bypass` (process scope, inherited by the
+  PowerShells a command starts; a Group Policy setting still wins). Its
+  description says which PowerShell runs (7 when installed, else 5.1), not
+  to start another one inside it, and to call scripts directly; on a
+  machine without PowerShell 7 the model had first tried `pwsh`.
 
 ## [0.11.1] — 2026-10-31
 
