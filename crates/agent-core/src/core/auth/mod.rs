@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
 pub mod account;
+pub mod accounts_api;
 pub mod anthropic_profile;
 pub mod auth_state;
 pub mod aws_bedrock;
@@ -22,12 +23,14 @@ mod browser;
 mod callback;
 pub mod cloud;
 pub mod cloud_login;
+pub mod connect;
 mod credential_source;
 pub mod github_copilot;
 pub mod google_gemini;
 pub mod google_vertex;
 pub mod identity;
 pub mod kimi_code;
+mod login_flow;
 pub mod muse;
 mod openai_codex;
 mod pkce;
@@ -59,12 +62,15 @@ pub use anthropic_profile::{
     fetch_anthropic_profile, parse_anthropic_profile, AnthropicProfile, ANTHROPIC_PROFILE_URL,
 };
 pub use broker::{
-    broker_from_source, global_broker, global_broker_install_count, local_auth_state,
-    preflight_cloud_capability, set_global_broker, AccessToken, BrokerError, CredentialBroker,
-    CredentialKind, LocalBroker, PinnedToken, ProviderStatus, ProxyByteStream, ProxyMethod,
-    ProxyRequest, ProxyResponse, RemoteBroker, StaticKeyStatus, MAX_PROXY_REQUEST_BYTES,
+    bounded_broker_from_source, broker_from_source, global_broker, global_broker_install_count,
+    local_auth_state, preflight_cloud_capability, redirect_free_http, set_global_broker,
+    AccessToken, BrokerError, CredentialBroker, CredentialKind, LocalBroker, PinnedToken,
+    ProviderStatus, ProxyByteStream, ProxyMethod, ProxyRequest, ProxyResponse, RateLimitedRead,
+    RemoteBroker, StaticKeyStatus, UsageReadFailure, MAX_PROXY_REQUEST_BYTES,
     MAX_PROXY_RESPONSE_BYTES, MAX_UPSTREAM_ERROR_BYTES, PROXY_REQUEST_TIMEOUT,
 };
+#[cfg(any(test, feature = "testing"))]
+pub use broker::TestClock;
 pub use broker_token::{
     is_loopback_endpoint, load_or_create_broker_token, local_broker_token_path,
     read_local_broker_token, unauthorized_hint, BrokerTokenOrigin, MachineToken,
@@ -265,91 +271,10 @@ pub async fn login() -> std::result::Result<OAuthCredentials, String> {
 pub async fn login_into(
     persist_key: Option<&str>,
 ) -> std::result::Result<OAuthCredentials, String> {
-    let port = CALLBACK_PORT;
-
-    // 1. Generate PKCE
-    let verifier = generate_code_verifier();
-    let challenge = generate_code_challenge(&verifier);
-    let state = generate_state();
-
-    // 2. Start callback server
-    let (rx, server_handle) = start_callback_server(state.clone(), port).await?;
-
-    // 3. Build URL and open browser
-    let auth_url = build_auth_url(&challenge, &state, port);
-
-    eprintln!("\n\x1b[1mOpening browser to sign in...\x1b[0m\n");
-
-    if let Err(e) = open_browser(&auth_url) {
-        eprintln!("Could not open browser automatically: {}", e);
-    }
-
-    eprintln!("\x1b[2mIf the browser didn't open, visit this URL:\x1b[0m");
-    eprintln!("\x1b[36m{}\x1b[0m\n", auth_url);
-
-    // Also provide manual paste option
-    let (manual_tx, manual_rx) = oneshot::channel::<CallbackResult>();
-    let stdin_task = tokio::spawn(async move {
-        eprintln!("\x1b[2mOr paste the redirect URL here (must include `state`):\x1b[0m");
-
-        let mut line = String::new();
-        let result = tokio::task::spawn_blocking(move || {
-            std::io::stdin().read_line(&mut line).ok();
-            line.trim().to_string()
-        })
-        .await;
-
-        if let Ok(input) = result {
-            match manual_paste_to_callback(&input) {
-                Some(callback) => {
-                    let _ = manual_tx.send(callback);
-                }
-                None if !input.is_empty() => {
-                    eprintln!(
-                        "\x1b[31m✗ Pasted input did not contain both `code` and `state`.\x1b[0m"
-                    );
-                    eprintln!(
-                        "\x1b[2m  Paste the full redirect URL (e.g. http://localhost:53692/callback?code=…&state=…).\x1b[0m"
-                    );
-                }
-                None => {}
-            }
-        }
-    });
-
-    // 4. Wait for either callback or manual input
-    let result = tokio::select! {
-        callback = rx => {
-            match callback {
-                Ok(CallbackOutcome::Authorized(result)) => result,
-                Ok(CallbackOutcome::Denied { error, description }) => return Err(format!("OAuth denied: {}{}", error, description.map(|d| format!(": {d}")).unwrap_or_default())),
-                Ok(CallbackOutcome::Invalid) => return Err("Invalid OAuth callback".to_string()),
-                Err(_) => return Err("Callback channel closed".to_string()),
-            }
-        }
-        manual = manual_rx => {
-            match manual {
-                Ok(result) => result,
-                Err(_) => return Err("Manual input channel closed".to_string()),
-            }
-        }
+    let mut sink = login_flow::TerminalSink {
+        opening: "Opening browser to sign in...",
     };
-
-    stdin_task.abort();
-
-    // 5. Verify state
-    if result.state != state {
-        server_handle.shutdown().await;
-        return Err("OAuth state mismatch — possible CSRF attack".to_string());
-    }
-
-    eprintln!("\n\x1b[1mExchanging code for tokens...\x1b[0m");
-
-    // 6. Exchange code for tokens
-    let creds = exchange_code_for_tokens(&result.code, &result.state, &verifier, port).await?;
-
-    // 7. Shut down callback server
-    server_handle.shutdown().await;
+    let creds = browser_login(&mut sink, &login_flow::BrowserEndpoints::anthropic()).await?;
 
     // 8. Save to auth.json — exactly one slot (or none: caller persists).
     if let Some(key) = persist_key {
@@ -357,6 +282,125 @@ pub async fn login_into(
     }
 
     Ok(creds)
+}
+
+/// Steps 1-7 of the Anthropic login (everything but persistence), with the
+/// progress going to `sink` and the endpoints from `ep`.
+pub(crate) async fn browser_login(
+    sink: &mut dyn login_flow::LoginSink,
+    ep: &login_flow::BrowserEndpoints,
+) -> std::result::Result<OAuthCredentials, login_flow::LoginFailure> {
+    use login_flow::{LoginFailure, LoginFailureKind};
+
+    // 1. Generate PKCE
+    let verifier = generate_code_verifier();
+    let challenge = generate_code_challenge(&verifier);
+    let state = generate_state();
+
+    // 2. Start callback server
+    let (rx, server_handle) = callback::start_callback_server_typed(
+        state.clone(),
+        &ep.callback_host,
+        ep.callback_port,
+        &ep.callback_path,
+    )
+    .await?;
+
+    // 3. Build URL and open browser
+    let auth_url = pkce::build_auth_url_at(&ep.authorize_url, &ep.redirect_uri, &challenge, &state);
+    sink.authorize(&auth_url, &ep.authorize_url)?;
+
+    // Also provide manual paste option (interactive only; otherwise the
+    // sender is held so the manual branch never fires).
+    let (manual_tx, manual_rx) = oneshot::channel::<CallbackResult>();
+    let (stdin_task, held_manual_tx) = if sink.paste_fallback() {
+        let task = tokio::spawn(async move {
+            eprintln!("\x1b[2mOr paste the redirect URL here (must include `state`):\x1b[0m");
+
+            let mut line = String::new();
+            let result = tokio::task::spawn_blocking(move || {
+                std::io::stdin().read_line(&mut line).ok();
+                line.trim().to_string()
+            })
+            .await;
+
+            if let Ok(input) = result {
+                match manual_paste_to_callback(&input) {
+                    Some(callback) => {
+                        let _ = manual_tx.send(callback);
+                    }
+                    None if !input.is_empty() => {
+                        eprintln!(
+                            "\x1b[31m✗ Pasted input did not contain both `code` and `state`.\x1b[0m"
+                        );
+                        eprintln!(
+                            "\x1b[2m  Paste the full redirect URL (e.g. http://localhost:53692/callback?code=…&state=…).\x1b[0m"
+                        );
+                    }
+                    None => {}
+                }
+            }
+        });
+        (Some(task), None)
+    } else {
+        (None, Some(manual_tx))
+    };
+
+    // 4. Wait for either callback or manual input
+    let result = tokio::select! {
+        callback = rx => {
+            match callback {
+                Ok(hit) => match hit.outcome {
+                    CallbackOutcome::Authorized(result) => result,
+                    CallbackOutcome::Denied { error, description } => return Err(LoginFailure::new(LoginFailureKind::Denied, format!("OAuth denied: {}{}", error, description.map(|d| format!(": {d}")).unwrap_or_default()))),
+                    CallbackOutcome::Invalid => return Err(LoginFailure::new(invalid_callback_kind(hit.state_matched), "Invalid OAuth callback")),
+                },
+                Err(_) => return Err(LoginFailure::internal("Callback channel closed")),
+            }
+        }
+        manual = manual_rx => {
+            match manual {
+                Ok(result) => result,
+                Err(_) => return Err(LoginFailure::internal("Manual input channel closed")),
+            }
+        }
+    };
+
+    if let Some(stdin_task) = stdin_task {
+        stdin_task.abort();
+    }
+    drop(held_manual_tx);
+
+    // 5. Verify state
+    if result.state != state {
+        server_handle.shutdown().await;
+        return Err(LoginFailure::new(
+            LoginFailureKind::StateMismatch,
+            "OAuth state mismatch — possible CSRF attack",
+        ));
+    }
+
+    sink.exchanging();
+
+    // 6. Exchange code for tokens
+    let creds =
+        token::exchange_code_at(&ep.token_url, &ep.redirect_uri, &result.code, &result.state, &verifier)
+            .await?;
+
+    // 7. Shut down callback server
+    server_handle.shutdown().await;
+
+    Ok(creds)
+}
+
+/// An invalid callback whose `state` matched is the provider's problem (no
+/// usable code); any other is a forged or stale callback.
+pub(crate) fn invalid_callback_kind(state_matched: bool) -> login_flow::LoginFailureKind {
+    if state_matched {
+        login_flow::LoginFailureKind::ProviderError
+    } else {
+        login_flow::LoginFailureKind::StateMismatch
+    }
 }
 
 // ── Anthropic-specific CSRF regression tests ─────────────────────────────────

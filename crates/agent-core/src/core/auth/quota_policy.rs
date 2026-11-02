@@ -250,6 +250,14 @@ pub struct AccountCapacity {
     /// so the failure can be named instead of a bare "quota unknown".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure: Option<ObservationFailure>,
+    /// What the reading says about the account's paid extra usage
+    /// (Anthropic's `extra_usage.is_enabled`): `Some(false)` only when the
+    /// provider said it is off; `None` when the reading says nothing (or
+    /// for another provider). Never capacity: it only decides how long a
+    /// last good reading may stand in for failed reads (see
+    /// [`SelectionRequest::grace`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extra_usage_enabled: Option<bool>,
 }
 
 impl AccountCapacity {
@@ -261,6 +269,7 @@ impl AccountCapacity {
             observation: QuotaObservation::Unknown,
             cooldown_until_ms: None,
             failure: None,
+            extra_usage_enabled: None,
         }
     }
 
@@ -524,11 +533,20 @@ pub struct SelectionRequest<'a> {
     /// failed transiently (usage-endpoint 429, 5xx, timeout, transport).
     /// Such an account (observation [`QuotaObservation::Unknown`]) is
     /// evaluated on its reading here instead: strictly younger than
-    /// [`grace_max_age_ms`](Self::grace_max_age_ms), never past an exhausted
-    /// window, an exclusion or a cooldown. Graced seats rank after every
-    /// fresh one, but a graced sticky seat stays (a read failure alone is no
-    /// reason to switch: the sticky rule judges the graced reading exactly
-    /// as it would a fresh one). Empty in [`new`](Self::new).
+    /// [`grace_max_age_ms`](Self::grace_max_age_ms), or of any age when the
+    /// reading shows the account's paid extra usage off and the read failed
+    /// because the usage endpoint limited it (a usage 429, or a read the
+    /// 429's pause held back), never past an exclusion or a cooldown. A
+    /// window the reading shows used up has started again once its reset
+    /// has passed since the reading (room of unknown use); one used up
+    /// until a reset still ahead rejects the account as exhausted until
+    /// then; one used up with no reset, or a reset that had passed when it
+    /// was read, rejects it with the read failure. Graced seats rank after
+    /// every fresh one, and a seat graced on a window that started again
+    /// (an unknown use) after every seat with a known use, whatever the
+    /// strategy's own order; but a graced sticky seat stays (a read failure
+    /// alone is no reason to switch: the sticky rule judges the graced
+    /// reading exactly as it would a fresh one). Empty in [`new`](Self::new).
     pub grace: &'a [AccountCapacity],
     /// Oldest graced reading that still counts. Default
     /// [`USAGE_READ_GRACE`](super::usage_reads::USAGE_READ_GRACE).
@@ -1018,6 +1036,10 @@ pub struct Eligible {
     /// Eligible on a last good reading because its current usage read
     /// failed transiently (see [`SelectionRequest::grace`]).
     pub graced: bool,
+    /// Graced on a reading with a window that started again since it was
+    /// read: room of an unknown use. Choosing anew, such a seat ranks after
+    /// every seat with a known use, before the strategy's own order.
+    pub restarted: bool,
 }
 
 /// Tier for an eligible seat; see [`Eligible::tier`].
@@ -1135,47 +1157,112 @@ pub fn evaluate(
         anchored,
         tier,
         graced: false,
+        restarted: false,
     })
 }
 
 /// An account whose current read gave no reading: eligible only on its
-/// last good reading in [`SelectionRequest::grace`], judged by the same
-/// rules (windows, models) against the grace age, with the account's own
-/// cooldown (already checked by the caller, kept for the re-check). Any
+/// last good reading in [`SelectionRequest::grace`] ([`graced_reading`]),
+/// judged by the same rules (windows, models), with the account's own
+/// cooldown (already checked by the caller, kept for the re-check). A
+/// window of it used up until a reset still ahead rejects the account as
+/// exhausted until then (every window it shows used up has such a reset):
+/// it can't serve before that, whatever the read failure. Any other
 /// rejection of that reading reports the read failure, not the old reading.
 fn evaluate_graced(
     req: &SelectionRequest<'_>,
     cap: &AccountCapacity,
 ) -> Result<Eligible, RejectReason> {
-    let key = cap.credential.storage_key();
-    let Some(good) = req
-        .grace
-        .iter()
-        .find(|g| g.credential.storage_key() == key)
-        .filter(|g| matches!(g.observation, QuotaObservation::Ok { .. }))
-    else {
+    let Some((reading, restarted)) = graced_reading(req, cap) else {
         return Err(RejectReason::Unknown);
     };
-    // Strictly younger than the grace age (a reading exactly that old no
-    // longer counts); `evaluate` below re-checks with its inclusive bound.
-    let young = good
-        .observed_at_ms
-        .is_some_and(|t| req.now_ms.saturating_sub(t) < req.grace_max_age_ms);
-    if !young {
-        return Err(RejectReason::Unknown);
-    }
+    // `graced_reading` judged the reading's age.
     let graced_req = SelectionRequest {
-        max_snapshot_age_ms: req.grace_max_age_ms,
+        max_snapshot_age_ms: u64::MAX,
         grace: &[],
         ..req.clone()
     };
-    let reading = AccountCapacity {
+    match evaluate(&graced_req, &reading) {
+        Ok(e) => Ok(Eligible {
+            graced: true,
+            restarted,
+            // A window that started again has an unknown use.
+            utilization: e.utilization.filter(|_| !restarted),
+            ..e
+        }),
+        Err(reason @ RejectReason::Exhausted { .. })
+            if matches!(spent_until(req, &reading), SpentUntil::Reset(_)) =>
+        {
+            Err(reason)
+        }
+        Err(_) => Err(RejectReason::Unknown),
+    }
+}
+
+/// The last good reading in [`SelectionRequest::grace`] an account whose
+/// current read gave no reading is judged on, with the account's cooldown,
+/// and whether a window of it started again since it was read; `None`
+/// when it has none that still counts. It counts while strictly younger
+/// than the grace age (a reading exactly that old no longer does), or at
+/// any age when it shows the account's paid extra usage off and the read
+/// failed with a usage 429 ([`outlasts_grace`]). A window it shows used up
+/// whose reset has passed since it was read (`observed < reset <= now`)
+/// has started again: it counts as room of unknown use. Not one whose
+/// reset had passed when it was read: that is no evidence of a new window.
+fn graced_reading(
+    req: &SelectionRequest<'_>,
+    cap: &AccountCapacity,
+) -> Option<(AccountCapacity, bool)> {
+    let key = cap.credential.storage_key();
+    let good = req
+        .grace
+        .iter()
+        .find(|g| g.credential.storage_key() == key)
+        .filter(|g| matches!(g.observation, QuotaObservation::Ok { .. }))?;
+    let young = good
+        .observed_at_ms
+        .is_some_and(|t| req.now_ms.saturating_sub(t) < req.grace_max_age_ms);
+    if !young && !outlasts_grace(good, cap) {
+        return None;
+    }
+    let mut reading = AccountCapacity {
         cooldown_until_ms: cap.cooldown_until_ms,
         ..good.clone()
     };
-    evaluate(&graced_req, &reading)
-        .map(|e| Eligible { graced: true, ..e })
-        .map_err(|_| RejectReason::Unknown)
+    let mut restarted = false;
+    if let (Some(observed), QuotaObservation::Ok { windows, .. }) =
+        (reading.observed_at_ms, &mut reading.observation)
+    {
+        for w in windows.iter_mut().filter(|w| w.applies_to(req.model)) {
+            if let WindowVerdict::Exhausted {
+                resets_at_ms: Some(reset),
+            } = w.verdict(req.exhausted_at_percent)
+            {
+                if observed < reset && reset <= req.now_ms {
+                    w.used_percent = None;
+                    w.limit_reached = Some(false);
+                    restarted = true;
+                }
+            }
+        }
+    }
+    Some((reading, restarted))
+}
+
+/// Whether the last good reading `good` still counts past the grace age
+/// for `cap`, whose read failed: only when it shows the account's paid
+/// extra usage off (a window that fills up then answers the message
+/// request with a limit, which cools the account, never with a bill) and
+/// the read failed because the usage endpoint limited it (a usage 429, a
+/// held one, or a read the 429's pause held back). A 5xx, a timeout or a
+/// transport failure keeps the grace age, and so does extra usage on or
+/// unknown.
+fn outlasts_grace(good: &AccountCapacity, cap: &AccountCapacity) -> bool {
+    good.extra_usage_enabled == Some(false)
+        && cap
+            .failure
+            .as_ref()
+            .is_some_and(|f| f.kind == AccountFailureKind::UsageRateLimited)
 }
 
 /// Lowest-utilization ordering: known before unknown, then ascending.
@@ -1214,18 +1301,47 @@ fn observation_cause(reason: &RejectReason, cap: &AccountCapacity) -> Option<Obs
 /// far as its cooldown and its reading know: the latest of its future
 /// cooldown end and the resets of every applicable exhausted window, since
 /// all of them must be over. `None` when it has neither, or an exhausted
-/// window has no future reset (the time is unknown).
+/// window has no future reset (the time is unknown). The reading of an
+/// account whose read failed is the last good one it is judged on
+/// ([`graced_reading`]), if any.
 fn usable_after_ms(req: &SelectionRequest<'_>, cap: &AccountCapacity) -> Option<u64> {
-    let mut latest = cap.cooldown_until_ms.filter(|t| *t > req.now_ms);
-    if let QuotaObservation::Ok { windows, .. } = &cap.observation {
-        for w in windows.iter().filter(|w| w.applies_to(req.model)) {
-            if let WindowVerdict::Exhausted { resets_at_ms } = w.verdict(req.exhausted_at_percent) {
-                let reset = resets_at_ms.filter(|t| *t > req.now_ms)?;
-                latest = Some(latest.map_or(reset, |l| l.max(reset)));
-            }
+    let cooldown = cap.cooldown_until_ms.filter(|t| *t > req.now_ms);
+    let graced = match cap.observation {
+        QuotaObservation::Unknown => graced_reading(req, cap),
+        _ => None,
+    };
+    let reading = graced.as_ref().map_or(cap, |(reading, _)| reading);
+    match spent_until(req, reading) {
+        SpentUntil::NotSpent => cooldown,
+        SpentUntil::Reset(reset) => Some(cooldown.map_or(reset, |c| c.max(reset))),
+        SpentUntil::Unknown => None,
+    }
+}
+
+/// When the applicable windows a reading shows used up have all reset.
+enum SpentUntil {
+    /// None is used up (or there is no reading).
+    NotSpent,
+    /// The latest of their resets, every one of them in the future.
+    Reset(u64),
+    /// One has no reset, or one at or before now: the time is unknown.
+    Unknown,
+}
+
+fn spent_until(req: &SelectionRequest<'_>, cap: &AccountCapacity) -> SpentUntil {
+    let QuotaObservation::Ok { windows, .. } = &cap.observation else {
+        return SpentUntil::NotSpent;
+    };
+    let mut latest = None;
+    for w in windows.iter().filter(|w| w.applies_to(req.model)) {
+        if let WindowVerdict::Exhausted { resets_at_ms } = w.verdict(req.exhausted_at_percent) {
+            let Some(reset) = resets_at_ms.filter(|t| *t > req.now_ms) else {
+                return SpentUntil::Unknown;
+            };
+            latest = Some(latest.map_or(reset, |l: u64| l.max(reset)));
         }
     }
-    latest
+    latest.map_or(SpentUntil::NotSpent, SpentUntil::Reset)
 }
 
 /// Pick the best eligible account for `req` among `candidates`.
@@ -1286,13 +1402,17 @@ pub fn select(req: &SelectionRequest<'_>, candidates: &[AccountCapacity]) -> Sel
 
     // Deterministic ordering. Fresh readings first: a graced seat (last good
     // reading, current read failed) never outranks a fresh one when choosing
-    // anew; stickiness below may still keep a graced current seat.
+    // anew, and a graced seat with a window that started again since its
+    // reading (an unknown use) never outranks one with a known use, whatever
+    // the strategy's tier, deadline or preference; stickiness below may still
+    // keep a graced current seat.
     eligible.sort_by(|(a, ea), (b, eb)| {
         let ka = a.credential.storage_key();
         let kb = b.credential.storage_key();
         let pa = preference_rank(req, &a.credential);
         let pb = preference_rank(req, &b.credential);
-        ea.graced.cmp(&eb.graced).then_with(|| match req.strategy {
+        let known_first = ea.graced.cmp(&eb.graced).then_with(|| ea.restarted.cmp(&eb.restarted));
+        known_first.then_with(|| match req.strategy {
             Strategy::PreferenceOrder => pa.cmp(&pb).then_with(|| ka.cmp(&kb)),
             Strategy::LowestUtilization => utilization_cmp(ea.utilization, eb.utilization)
                 .then_with(|| pa.cmp(&pb))
@@ -1576,6 +1696,7 @@ mod tests {
             },
             cooldown_until_ms: None,
             failure: None,
+            extra_usage_enabled: None,
         }
     }
 
@@ -1743,7 +1864,15 @@ mod tests {
         let inside = [good("a", grace_ms - 1, 20.0, NOW + DAY)];
         assert!(one(&inside, &failed("a")).unwrap().graced, "just under it");
         let exhausted = [good("a", 60_000, 100.0, NOW + HOUR)];
-        assert_eq!(one(&exhausted, &failed("a")), Err(RejectReason::Unknown), "exhausted window");
+        // Used up until a reset still ahead: exhausted until then (Part 2).
+        assert_eq!(
+            one(&exhausted, &failed("a")),
+            Err(RejectReason::Exhausted {
+                window: "primary".into(),
+                resets_at_ms: Some(NOW + HOUR)
+            }),
+            "exhausted window"
+        );
         let cooling = AccountCapacity {
             cooldown_until_ms: Some(NOW + HOUR),
             ..failed("a")
@@ -1795,6 +1924,342 @@ mod tests {
             }
         }
         assert!(switched > 0 && switched < 12, "the cases cover staying and switching: {switched}");
+    }
+
+    /// Part 2: a graced reading's windows and age. A window used up until a
+    /// reset still ahead rejects as exhausted until then; one whose reset
+    /// passed since the reading has started again (room of unknown use);
+    /// one used up with no reset, or a reset at or before the reading,
+    /// rejects with the read failure. Past the grace age a reading counts
+    /// only with extra usage known off and a usage 429.
+    #[test]
+    fn graced_readings_restart_wait_for_resets_and_outlast_the_grace_only_with_extra_usage_off() {
+        use AccountFailureKind as K;
+        let minute = 60_000;
+        let reading = |age: u64, windows: Vec<WindowLimit>, extra: Option<bool>| AccountCapacity {
+            observed_at_ms: Some(NOW - age),
+            extra_usage_enabled: extra,
+            ..ok("a", windows)
+        };
+        let spent = |reset: Option<u64>| WindowLimit {
+            resets_at_ms: reset,
+            ..win("five_hour", 5 * HOUR, 100.0, 0)
+        };
+        let weekly = || win("seven_day", 7 * DAY, 40.0, NOW + 3 * DAY);
+        let base = SelectionRequest::soonest_reset(OAuthProviderId::OpenAiCodex, NOW, 60_000);
+        let judge = |good: AccountCapacity, kind: AccountFailureKind| {
+            let grace = [good];
+            let req = SelectionRequest {
+                grace: &grace,
+                ..base.clone()
+            };
+            let cap = AccountCapacity::failed(cred("a"), ObservationFailure::new(kind));
+            (evaluate(&req, &cap), usable_after_ms(&req, &cap))
+        };
+        let young = 10 * minute;
+        let old = 45 * minute;
+
+        // S2: used up until a reset still ahead.
+        let (verdict, until) = judge(
+            reading(young, vec![spent(Some(NOW + HOUR)), weekly()], None),
+            K::UsageRateLimited,
+        );
+        let five_hour = RejectReason::Exhausted {
+            window: "five_hour".into(),
+            resets_at_ms: Some(NOW + HOUR),
+        };
+        assert_eq!(verdict, Err(five_hour.clone()));
+        assert_eq!(until, Some(NOW + HOUR));
+        // S1: its reset passed since the reading.
+        let (verdict, _) = judge(
+            reading(young, vec![spent(Some(NOW - minute)), weekly()], None),
+            K::UsageRateLimited,
+        );
+        let e = verdict.unwrap();
+        assert!(e.graced);
+        assert_eq!(e.utilization, None, "a window that started again has an unknown use");
+        let (verdict, _) = judge(reading(young, vec![weekly()], None), K::UsageRateLimited);
+        assert_eq!(verdict.unwrap().utilization, Some(40.0), "no window restarted");
+        // S3: no reset, or one at or before the reading.
+        for reset in [None, Some(NOW - young), Some(NOW - young - minute)] {
+            let (verdict, until) = judge(
+                reading(young, vec![spent(reset), weekly()], None),
+                K::UsageRateLimited,
+            );
+            assert_eq!(verdict, Err(RejectReason::Unknown), "{reset:?}");
+            assert_eq!(until, None, "{reset:?}");
+        }
+        // One window until a reset ahead, another with none: unknown.
+        let no_reset = WindowLimit {
+            id: "seven_day".into(),
+            ..spent(None)
+        };
+        let (verdict, until) = judge(
+            reading(young, vec![spent(Some(NOW + HOUR)), no_reset], None),
+            K::UsageRateLimited,
+        );
+        assert_eq!(verdict, Err(RejectReason::Unknown));
+        assert_eq!(until, None);
+
+        // S4: past the grace age, extra usage off and a usage 429 only.
+        let off = |windows| reading(old, windows, Some(false));
+        assert!(judge(off(vec![weekly()]), K::UsageRateLimited).0.unwrap().graced);
+        for extra in [Some(true), None] {
+            let (verdict, _) = judge(reading(old, vec![weekly()], extra), K::UsageRateLimited);
+            assert_eq!(verdict, Err(RejectReason::Unknown), "{extra:?}");
+        }
+        for kind in [
+            K::UsageUpstream,
+            K::UsageTimeout,
+            K::UsageTransport,
+            K::RefreshTransient,
+            K::QuotaUnknown,
+        ] {
+            let (verdict, _) = judge(off(vec![weekly()]), kind);
+            assert_eq!(verdict, Err(RejectReason::Unknown), "{kind}");
+        }
+        // Inside the grace age every transient failure and flag count.
+        let (verdict, _) = judge(reading(young, vec![weekly()], Some(true)), K::UsageUpstream);
+        assert!(verdict.unwrap().graced);
+        // S1-S3 hold past the grace age too.
+        let (verdict, until) = judge(off(vec![spent(Some(NOW + HOUR)), weekly()]), K::UsageRateLimited);
+        assert_eq!(verdict, Err(five_hour));
+        assert_eq!(until, Some(NOW + HOUR));
+        let (verdict, _) = judge(off(vec![spent(Some(NOW - minute)), weekly()]), K::UsageRateLimited);
+        assert!(verdict.unwrap().graced);
+        let (verdict, _) = judge(off(vec![spent(None), weekly()]), K::UsageRateLimited);
+        assert_eq!(verdict, Err(RejectReason::Unknown));
+        // A reading from the future never counts.
+        let future = AccountCapacity {
+            observed_at_ms: Some(NOW + HOUR),
+            ..off(vec![weekly()])
+        };
+        assert_eq!(judge(future, K::UsageRateLimited).0, Err(RejectReason::Unknown));
+    }
+
+    /// Part 2 (Q2): when every account's graced reading is used up until a
+    /// reset still ahead, the selection fails as `all_cooling_down` with the
+    /// earliest of those resets, not `usage_read_failed`.
+    #[test]
+    fn all_graced_readings_used_up_until_a_reset_ahead_are_all_cooling_down() {
+        let spent_until = |label: &str, reset: u64| AccountCapacity {
+            observed_at_ms: Some(NOW - 10 * 60_000),
+            ..ok(
+                label,
+                vec![win("five_hour", 5 * HOUR, 100.0, reset), win("seven_day", 7 * DAY, 40.0, NOW + DAY)],
+            )
+        };
+        let grace = [spent_until("a", NOW + 3 * HOUR), spent_until("b", NOW + HOUR)];
+        let limited = ObservationFailure::new(AccountFailureKind::UsageRateLimited).with_status(429);
+        let caps = [
+            AccountCapacity::failed(cred("a"), limited.clone()),
+            AccountCapacity::failed(cred("b"), limited),
+        ];
+        let req = SelectionRequest {
+            grace: &grace,
+            ..SelectionRequest::soonest_reset(OAuthProviderId::OpenAiCodex, NOW, 60_000)
+        };
+        let Selection::NoCapacity {
+            rejections,
+            earliest_reset_ms,
+        } = select(&req, &caps)
+        else {
+            panic!("no capacity expected");
+        };
+        assert_eq!(earliest_reset_ms, Some(NOW + HOUR));
+        let failure = SelectionFailure::from_rejections(&rejections, NOW);
+        assert_eq!(failure.kind, SelectionFailureKind::AllCoolingDown, "{failure:?}");
+        assert_eq!(failure.earliest_reset_ms, Some(NOW + HOUR));
+        let until: Vec<_> = failure.accounts.iter().map(|a| (a.kind, a.until_ms)).collect();
+        assert_eq!(
+            until,
+            [
+                (AccountFailureKind::Exhausted, Some(NOW + 3 * HOUR)),
+                (AccountFailureKind::Exhausted, Some(NOW + HOUR))
+            ]
+        );
+    }
+
+    /// Part 2 (S1, review r1 SF1): a graced seat with a window that started
+    /// again since its reading has an unknown use, so when choosing anew it
+    /// ranks after every seat with a known use, before the strategy's own
+    /// order: an urgent tier or a sooner deadline doesn't lift it. A pinned
+    /// seat that stays is not demoted by it.
+    #[test]
+    fn a_restarted_graced_seat_ranks_after_every_seat_with_a_known_use() {
+        let minute = 60_000;
+        let reading = |label: &str, windows: Vec<WindowLimit>| AccountCapacity {
+            observed_at_ms: Some(NOW - 10 * minute),
+            ..ok(label, windows)
+        };
+        // a: its five-hour window was used up and reset a minute ago; its
+        // week resets in 10 hours (urgent).
+        let a = reading(
+            "a",
+            vec![
+                win("five_hour", 5 * HOUR, 100.0, NOW - minute),
+                win("seven_day", 7 * DAY, 40.0, NOW + 10 * HOUR),
+            ],
+        );
+        // b: room of a known use; its week resets later.
+        let b = |week_reset: u64| {
+            reading(
+                "b",
+                vec![
+                    win("five_hour", 5 * HOUR, 20.0, NOW + 3 * HOUR),
+                    win("seven_day", 7 * DAY, 40.0, week_reset),
+                ],
+            )
+        };
+        let limited = ObservationFailure::new(AccountFailureKind::UsageRateLimited).with_status(429);
+        let caps = [
+            AccountCapacity::failed(cred("a"), limited.clone()),
+            AccountCapacity::failed(cred("b"), limited),
+        ];
+        let winner = |sel: Selection| match sel {
+            Selection::Selected { credential, .. } => credential.account.label_str().to_string(),
+            Selection::NoCapacity { rejections, .. } => panic!("no capacity: {rejections:?}"),
+        };
+        let pref = vec!["a".to_string(), "b".to_string()];
+        let current = cred("a");
+        // b's week beyond the urgent horizon (a lower tier than a's), and
+        // inside it but later than a's (the same tier, a later deadline).
+        for week in [NOW + 3 * DAY, NOW + 20 * HOUR] {
+            let grace = [a.clone(), b(week)];
+            let anew = SelectionRequest {
+                grace: &grace,
+                ..SelectionRequest::soonest_reset(OAuthProviderId::OpenAiCodex, NOW, 60_000)
+            };
+            assert_eq!(winner(select(&anew, &caps)), "b", "soonest reset, b's week at {week}");
+            for strategy in [Strategy::PreferenceOrder, Strategy::LowestUtilization] {
+                let r = SelectionRequest {
+                    strategy,
+                    preference: &pref,
+                    ..anew.clone()
+                };
+                assert_eq!(winner(select(&r, &caps)), "b", "{strategy:?}, b's week at {week}");
+            }
+            // The pinned seat that stays is not demoted.
+            let pinned = SelectionRequest {
+                current: Some(&current),
+                ..anew.clone()
+            };
+            assert_eq!(winner(select(&pinned, &caps)), "a", "pinned a, b's week at {week}");
+        }
+        // Alone, the restarted seat serves.
+        let grace = [a];
+        let alone = SelectionRequest {
+            grace: &grace,
+            ..SelectionRequest::soonest_reset(OAuthProviderId::OpenAiCodex, NOW, 60_000)
+        };
+        assert_eq!(winner(select(&alone, &caps[..1])), "a");
+    }
+
+    /// Part 2 (guard, review r1): a five-hour window that started again is
+    /// no room while the week is still used up until a reset ahead: the
+    /// account is exhausted until the week's reset, and alone it makes the
+    /// selection `all_cooling_down` with that reset.
+    #[test]
+    fn a_restarted_five_hour_window_under_a_spent_week_waits_for_the_week() {
+        let minute = 60_000;
+        let week_reset = NOW + 2 * DAY;
+        let grace = [AccountCapacity {
+            observed_at_ms: Some(NOW - 10 * minute),
+            ..ok(
+                "a",
+                vec![
+                    win("five_hour", 5 * HOUR, 100.0, NOW - minute),
+                    win("seven_day", 7 * DAY, 100.0, week_reset),
+                ],
+            )
+        }];
+        let req = SelectionRequest {
+            grace: &grace,
+            ..SelectionRequest::soonest_reset(OAuthProviderId::OpenAiCodex, NOW, 60_000)
+        };
+        let limited = ObservationFailure::new(AccountFailureKind::UsageRateLimited).with_status(429);
+        let cap = AccountCapacity::failed(cred("a"), limited);
+        assert_eq!(
+            evaluate(&req, &cap),
+            Err(RejectReason::Exhausted {
+                window: "seven_day".into(),
+                resets_at_ms: Some(week_reset)
+            })
+        );
+        assert_eq!(usable_after_ms(&req, &cap), Some(week_reset));
+        let Selection::NoCapacity { rejections, .. } = select(&req, &[cap]) else {
+            panic!("no capacity expected");
+        };
+        let failure = SelectionFailure::from_rejections(&rejections, NOW);
+        assert_eq!(failure.kind, SelectionFailureKind::AllCoolingDown, "{failure:?}");
+        assert_eq!(failure.earliest_reset_ms, Some(week_reset));
+    }
+
+    /// Part 2 (guard, review r1): past the grace age, mixed accounts. `a`'s
+    /// reading has room but shows extra usage on, so it no longer counts;
+    /// `b`'s shows extra usage off and a window used up until a reset ahead.
+    /// Nothing serves, and the failure stays `usage_read_failed` (`a` is not
+    /// known to be limited), not `all_cooling_down`.
+    #[test]
+    fn past_the_grace_a_seat_with_extra_usage_on_keeps_the_failure_a_failed_read() {
+        let old = NOW - 45 * 60_000;
+        let grace = [
+            AccountCapacity {
+                observed_at_ms: Some(old),
+                extra_usage_enabled: Some(true),
+                ..ok("a", vec![win("seven_day", 7 * DAY, 40.0, NOW + 3 * DAY)])
+            },
+            AccountCapacity {
+                observed_at_ms: Some(old),
+                extra_usage_enabled: Some(false),
+                ..ok(
+                    "b",
+                    vec![
+                        win("five_hour", 5 * HOUR, 100.0, NOW + HOUR),
+                        win("seven_day", 7 * DAY, 40.0, NOW + 3 * DAY),
+                    ],
+                )
+            },
+        ];
+        let limited = ObservationFailure::new(AccountFailureKind::UsageRateLimited).with_status(429);
+        let caps = [
+            AccountCapacity::failed(cred("a"), limited.clone()),
+            AccountCapacity::failed(cred("b"), limited),
+        ];
+        let req = SelectionRequest {
+            grace: &grace,
+            ..SelectionRequest::soonest_reset(OAuthProviderId::OpenAiCodex, NOW, 60_000)
+        };
+        let Selection::NoCapacity { rejections, .. } = select(&req, &caps) else {
+            panic!("nothing serves");
+        };
+        let failure = SelectionFailure::from_rejections(&rejections, NOW);
+        assert_eq!(failure.kind, SelectionFailureKind::UsageReadFailed, "{failure:?}");
+        let kinds: Vec<_> = failure.accounts.iter().map(|a| a.kind).collect();
+        assert_eq!(
+            kinds,
+            [AccountFailureKind::UsageRateLimited, AccountFailureKind::Exhausted],
+            "{failure:?}"
+        );
+        assert_eq!(failure.accounts[1].until_ms, Some(NOW + HOUR), "{failure:?}");
+    }
+
+    /// The extra usage flag on the wire: absent loads as `None`, `None` is
+    /// not written (today's bytes), and a value round-trips.
+    #[test]
+    fn the_extra_usage_flag_is_optional_on_the_wire() {
+        let none = ok("a", vec![]);
+        let bytes = serde_json::to_value(&none).unwrap();
+        assert!(bytes.get("extra_usage_enabled").is_none(), "{bytes}");
+        let back: AccountCapacity = serde_json::from_value(bytes).unwrap();
+        assert_eq!(back, none);
+        let off = AccountCapacity {
+            extra_usage_enabled: Some(false),
+            ..ok("a", vec![])
+        };
+        let bytes = serde_json::to_value(&off).unwrap();
+        assert_eq!(bytes["extra_usage_enabled"], false);
+        assert_eq!(serde_json::from_value::<AccountCapacity>(bytes).unwrap(), off);
     }
 
     #[test]
@@ -2317,6 +2782,57 @@ mod tests {
         let t1 = ok("t1", vec![anchored(30.0, NOW + 3 * DAY)]);
         let t2 = ok("t2", vec![anchored(20.0, NOW + 3 * DAY)]);
         assert_eq!(label_of(&select(&sr_req(), &[t1, t2])), "t2");
+    }
+
+    /// `auth.order.<provider>` as the broker builds it: the configured
+    /// order decides the pick under `preference_order`, and only breaks ties
+    /// under `soonest_reset`.
+    #[test]
+    fn configured_order_decides_preference_order_and_breaks_soonest_reset_ties() {
+        let listed = vec!["a".to_string(), "b".to_string()];
+        let preference = |raw: &str| {
+            let map = std::collections::BTreeMap::from([("openai-codex".to_string(), raw.to_string())]);
+            crate::auth::AutoSelectionPolicy::default()
+                .with_order_config(&map)
+                .preference_for(OAuthProviderId::OpenAiCodex, &listed)
+        };
+        assert_eq!(preference("b, zz, b"), vec!["b", "a"]);
+        assert_eq!(preference(""), vec!["a", "b"]);
+
+        let a = ok("a", vec![win("primary", 7 * DAY, 90.0, NOW + DAY)]);
+        let b = ok("b", vec![win("primary", 7 * DAY, 10.0, NOW + DAY)]);
+        for (order, want) in [("b,a", "b"), ("a,b", "a")] {
+            let pref = preference(order);
+            let r = SelectionRequest {
+                preference: &pref,
+                strategy: Strategy::PreferenceOrder,
+                ..req()
+            };
+            assert_eq!(label_of(&select(&r, &[a.clone(), b.clone()])), want, "{order}");
+        }
+
+        // Soonest reset first, whatever the order says.
+        let a = ok("a", vec![anchored(90.0, NOW + 2 * HOUR)]);
+        let b = ok("b", vec![anchored(1.0, NOW + 3 * HOUR)]);
+        for order in ["b,a", "a,b"] {
+            let pref = preference(order);
+            let r = SelectionRequest {
+                preference: &pref,
+                ..sr_req()
+            };
+            assert_eq!(label_of(&select(&r, &[a.clone(), b.clone()])), "a", "{order}");
+        }
+        // A tie (two idle unanchored seats): the order breaks it.
+        let a = ok("a", vec![unanchored()]);
+        let b = ok("b", vec![unanchored()]);
+        for (order, want) in [("b,a", "b"), ("a,b", "a")] {
+            let pref = preference(order);
+            let r = SelectionRequest {
+                preference: &pref,
+                ..sr_req()
+            };
+            assert_eq!(label_of(&select(&r, &[a.clone(), b.clone()])), want, "{order}");
+        }
     }
 
     #[test]

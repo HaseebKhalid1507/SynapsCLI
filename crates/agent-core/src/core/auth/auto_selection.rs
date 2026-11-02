@@ -15,6 +15,9 @@ pub struct AutoSelectionPolicy {
     pub overrides: BTreeMap<OAuthProviderId, Strategy>,
     pub urgent_horizon_ms: u64,
     pub sticky: bool,
+    /// Configured try order per provider (`auth.order.<provider>`), already
+    /// parsed leniently; see [`Self::preference_for`].
+    pub order: BTreeMap<OAuthProviderId, Vec<String>>,
 }
 impl Default for AutoSelectionPolicy {
     fn default() -> Self {
@@ -23,6 +26,7 @@ impl Default for AutoSelectionPolicy {
             overrides: BTreeMap::new(),
             urgent_horizon_ms: quota::DEFAULT_URGENT_HORIZON_MS,
             sticky: true,
+            order: BTreeMap::new(),
         }
     }
 }
@@ -32,6 +36,24 @@ impl AutoSelectionPolicy {
             .get(&provider)
             .copied()
             .unwrap_or(self.strategy)
+    }
+    /// Attach the raw `auth.order.<provider>` map (keys relative to
+    /// `auth.order.`). Unknown provider keys are ignored.
+    pub fn with_order_config(mut self, map: &BTreeMap<String, String>) -> Self {
+        self.order = map
+            .iter()
+            .filter_map(|(provider, raw)| {
+                let provider = provider.trim().parse::<OAuthProviderId>().ok()?;
+                Some((provider, super::accounts_api::parse_order(raw)))
+            })
+            .collect();
+        self
+    }
+    /// The selection `preference` for `provider`: configured labels that
+    /// exist in `listed`, then the rest of `listed` in its own order.
+    pub fn preference_for(&self, provider: OAuthProviderId, listed: &[String]) -> Vec<String> {
+        let configured = self.order.get(&provider).map(Vec::as_slice).unwrap_or(&[]);
+        super::accounts_api::effective_order(configured, listed)
     }
     /// Invalid values warn and retain the documented default, never an
     /// unvalidated strategy. Keys are relative to `auth.auto.`.

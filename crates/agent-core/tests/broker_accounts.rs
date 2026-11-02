@@ -722,6 +722,67 @@ async fn chooser_ranks_deadlines_keeps_sticky_seat_and_preview_is_non_spending()
 
 #[tokio::test]
 #[serial_test::serial]
+async fn configured_order_is_the_preference_and_goes_live_on_the_next_selection() {
+    use agent_core::auth::{quota_policy::Strategy, AutoSelectionPolicy};
+    use std::collections::BTreeMap;
+    let home = install_store();
+    // Both seats equally healthy: only the preference decides.
+    let app = Router::new().route("/usage", get(|| async {
+        let time = chrono::DateTime::<chrono::Utc>::from_timestamp_millis((agent_core::epoch_millis() + 48 * 3_600_000) as i64).unwrap().to_rfc3339();
+        Json(json!({"seven_day": {"utilization": 10.0, "resets_at": time}, "extra_usage": {"utilization": null, "is_enabled": false}}))
+    }));
+    let upstream = spawn(app).await;
+    let auto = AccountPolicy::new().with(OAuthProviderId::Anthropic, AccountSelector::Auto);
+    async fn first_choice(broker: &LocalBroker) -> String {
+        let plan = broker.plan(OAuthProviderId::Anthropic, None).await.unwrap();
+        plan.rows[0].credential.account.label_str().to_string()
+    }
+    let pinned = |order: &[&str]| {
+        LocalBroker::new(reqwest::Client::new())
+            .with_account_policy(auto.clone())
+            .with_auto_policy(AutoSelectionPolicy {
+                strategy: Strategy::PreferenceOrder,
+                order: BTreeMap::from([(
+                    OAuthProviderId::Anthropic,
+                    order.iter().map(|l| l.to_string()).collect(),
+                )]),
+                ..Default::default()
+            })
+            .with_usage_endpoint_override(format!("{upstream}/usage"))
+    };
+    assert_eq!(first_choice(&pinned(&[])).await, "a", "no order: listing order");
+    assert_eq!(first_choice(&pinned(&["b", "a"])).await, "b");
+    assert_eq!(first_choice(&pinned(&["ghost", "b"])).await, "b", "unknown labels are skipped");
+
+    // From the config file: a changed `auth.order.<provider>` applies to the
+    // same broker's next selection.
+    let config = home.path().join("config");
+    let write_config = |text: &str, mtime_secs: u64| {
+        std::fs::write(&config, text).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&config)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(mtime_secs))
+            .unwrap();
+    };
+    write_config(
+        "auth.auto.strategy.anthropic = preference_order\nauth.order.anthropic = b,a\n",
+        1_000_000,
+    );
+    let live = LocalBroker::new(reqwest::Client::new())
+        .with_account_policy(auto.clone())
+        .with_usage_endpoint_override(format!("{upstream}/usage"));
+    assert_eq!(first_choice(&live).await, "b");
+    write_config(
+        "auth.auto.strategy.anthropic = preference_order\nauth.order.anthropic = a,b\n",
+        2_000_000,
+    );
+    assert_eq!(first_choice(&live).await, "a", "the new order is live on the next selection");
+}
+
+#[tokio::test]
+#[serial_test::serial]
 async fn runtime_broker_cache_retains_limits_but_separates_profiles_and_principals() {
     use agent_core::auth::{broker_from_source, CredentialSource};
     let _home = install_store();

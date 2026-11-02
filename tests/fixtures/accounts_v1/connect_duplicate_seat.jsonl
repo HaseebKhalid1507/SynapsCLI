@@ -1,0 +1,4 @@
+{"v":1,"event":"started","provider":"anthropic","account":"claude3","mode":"add","flow":"browser","expires_at_ms":1800000600000}
+{"v":1,"event":"open_url","url":"https://claude.ai/oauth/authorize?code=true&client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e&response_type=code&redirect_uri=http%3A%2F%2Flocalhost%3A53692%2Fcallback&scope=org%3Acreate_api_key%20user%3Aprofile%20user%3Ainference%20user%3Asessions%3Aclaude_code%20user%3Amcp_servers%20user%3Afile_upload&code_challenge=fixture&code_challenge_method=S256&state=fixture","allow":"https://claude.ai/oauth/authorize"}
+{"v":1,"event":"exchanging"}
+{"v":1,"event":"done","ok":false,"reason":"duplicate_seat","existing":"work"}

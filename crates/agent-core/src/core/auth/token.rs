@@ -6,6 +6,7 @@ use tokio::sync::Mutex;
 use reqwest::Client;
 
 use super::account::{CredentialRef, SeatIdentity};
+use super::login_flow::{LoginFailure, LoginFailureKind};
 use super::provider::RefreshEndpoints;
 use super::storage::{
     auth_file_path, load_provider_auth_typed_at, save_provider_auth_if_refresh_matches_typed_at,
@@ -21,7 +22,20 @@ pub async fn exchange_code_for_tokens(
     port: u16,
 ) -> std::result::Result<OAuthCredentials, String> {
     let redirect_uri = format!("http://localhost:{}/callback", port);
+    exchange_code_at(TOKEN_URL, &redirect_uri, code, state, verifier)
+        .await
+        .map_err(String::from)
+}
 
+/// [`exchange_code_for_tokens`] against an explicit token endpoint and
+/// redirect, failures typed for `auth connect` (same messages).
+pub(crate) async fn exchange_code_at(
+    token_url: &str,
+    redirect_uri: &str,
+    code: &str,
+    state: &str,
+    verifier: &str,
+) -> std::result::Result<OAuthCredentials, LoginFailure> {
     let body = serde_json::json!({
         "grant_type": "authorization_code",
         "client_id": CLIENT_ID,
@@ -37,15 +51,20 @@ pub async fn exchange_code_for_tokens(
         .connect_timeout(std::time::Duration::from_secs(10))
         .timeout(std::time::Duration::from_secs(30))
         .build()
-        .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
+        .map_err(|e| LoginFailure::internal(format!("Failed to build HTTP client: {}", e)))?;
     let resp = client
-        .post(TOKEN_URL)
+        .post(token_url)
         .header("Content-Type", "application/json")
         .header("Accept", "application/json")
         .json(&body)
         .send()
         .await
-        .map_err(|e| format!("Token exchange request failed: {}", e))?;
+        .map_err(|e| {
+            LoginFailure::new(
+                LoginFailureKind::Network,
+                format!("Token exchange request failed: {}", e),
+            )
+        })?;
 
     if !resp.status().is_success() {
         let status = resp.status();
@@ -53,17 +72,22 @@ pub async fn exchange_code_for_tokens(
         // code/verifier, internal errors): keep only the OAuth error fields.
         // Byte slicing here also panicked on a non-ASCII body.
         let text = resp.text().await.unwrap_or_default();
-        return Err(format!(
-            "Token exchange failed ({}): {}",
-            status,
-            sanitize_oauth_error_body(&text)
+        return Err(LoginFailure::new(
+            LoginFailureKind::ProviderError,
+            format!(
+                "Token exchange failed ({}): {}",
+                status,
+                sanitize_oauth_error_body(&text)
+            ),
         ));
     }
 
-    let token_resp: TokenResponse = resp
-        .json()
-        .await
-        .map_err(|e| format!("Failed to parse token response: {}", e))?;
+    let token_resp: TokenResponse = resp.json().await.map_err(|e| {
+        LoginFailure::new(
+            LoginFailureKind::ProviderError,
+            format!("Failed to parse token response: {}", e),
+        )
+    })?;
 
     // expires_in is seconds; store as epoch millis with 5-minute buffer (matches Pi/Claude Code)
     let expires = now_millis() + (token_resp.expires_in * 1000) - (5 * 60 * 1000);
@@ -460,12 +484,13 @@ pub(crate) async fn ensure_fresh_credential_checked_at(
 
 /// Recovery is broker-owned: no refresh credentials cross into the runtime.
 /// Typed so the caller can tell a cooldown / busy lock / network failure
-/// from an unusable login.
+/// from an unusable login. `memory` is told of a refusal (it may hold none).
 pub(super) async fn recover_rejected_credential(
     client: &Client,
     cred: &CredentialRef,
     rejected: &str,
     endpoints: &RefreshEndpoints,
+    memory: Option<Arc<dyn RefusalMemory>>,
 ) -> std::result::Result<OAuthCredentials, RefreshFailure> {
     ensure_credential_checked_at(
         client,
@@ -474,7 +499,7 @@ pub(super) async fn recover_rejected_credential(
         None,
         Some(rejected),
         endpoints,
-        None,
+        memory,
     )
     .await
 }

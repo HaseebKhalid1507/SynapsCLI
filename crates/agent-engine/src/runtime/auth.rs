@@ -1,3 +1,4 @@
+use super::capacity_wait::{CapacityWaitPolicy, CapacityWaiter, Wake};
 use super::types::AuthState;
 use crate::auth::{
     broker_from_source, is_expired_with_margin, AccountSelector, CredentialBroker, CredentialRef,
@@ -6,7 +7,8 @@ use crate::auth::{
 use crate::{Result, RuntimeError};
 use reqwest::Client;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, RwLock};
+use tokio_util::sync::CancellationToken;
 
 pub(super) struct AuthMethods;
 
@@ -62,12 +64,18 @@ impl AuthMethods {
     /// token we hold now"). Local only: if shared state already holds a
     /// *different* non-empty token, a concurrent stream has recovered since
     /// that request was built — reuse it, spend nothing.
+    ///
+    /// `model` is the session's Anthropic model when known: a re-selection
+    /// then needs capacity for that model only (a limit of another model's
+    /// requests doesn't block it). `None` selects model-less, which treats
+    /// every model's limit as blocking.
     pub(super) async fn reload_after_rejection(
         auth: Arc<RwLock<AuthState>>,
         client: &Client,
         source: &CredentialSource,
         cache: &TokenCache,
         sent: Option<&str>,
+        model: Option<&str>,
     ) -> Result<()> {
         let (rejected, bound) = {
             let mut g = auth.write().await;
@@ -89,11 +97,27 @@ impl AuthMethods {
         };
         if source.is_remote() {
             cache.invalidate("anthropic");
-            return Self::refresh_if_needed(auth, client, source, cache, None, RefreshPoint::TurnStart)
+            return Self::refresh_if_needed(auth, client, source, cache, model, RefreshPoint::TurnStart)
                 .await;
         }
         let broker = broker_from_source(source, cache, client.clone());
-        let credential = turn_pinned_credential(source, bound.as_deref()).or_else(|| {
+        Self::reload_with_broker(auth, source, broker.as_ref(), &rejected, bound.as_deref(), model)
+            .await
+    }
+
+    /// Broker-injected local half of [`Self::reload_after_rejection`]: the
+    /// account this session is bound to (or the configured one) is recovered
+    /// by its own credential; otherwise the automatic selector picks one
+    /// anew, for `model`.
+    pub(super) async fn reload_with_broker(
+        auth: Arc<RwLock<AuthState>>,
+        source: &CredentialSource,
+        broker: &dyn CredentialBroker,
+        rejected: &str,
+        bound: Option<&str>,
+        model: Option<&str>,
+    ) -> Result<()> {
+        let credential = turn_pinned_credential(source, bound).or_else(|| {
             match broker.account_selector(OAuthProviderId::Anthropic) {
                 AccountSelector::Account(account) => {
                     Some(CredentialRef::new(OAuthProviderId::Anthropic, account))
@@ -104,11 +128,10 @@ impl AuthMethods {
         match credential {
             Some(credential) if !rejected.is_empty() => {
                 tracing::info!("Reloading Anthropic credentials after rejection");
-                Self::recover_credential(&auth, source, broker.as_ref(), credential, &rejected)
-                    .await
+                Self::recover_credential(&auth, source, broker, credential, rejected).await
             }
             _ => {
-                Self::refresh_with_broker(auth, source, broker.as_ref(), None, RefreshPoint::TurnStart)
+                Self::refresh_with_broker(auth, source, broker, model, RefreshPoint::TurnStart)
                     .await
             }
         }
@@ -221,11 +244,56 @@ pub(super) enum BindingCheck {
 /// keeps the cache of the account the session is on, so it never selects,
 /// switches or re-binds an account (see
 /// [`AuthMethods::refresh_for_keepwarm`]).
+///
+/// `Background` is for requests the session makes on its own (a keep-warm
+/// ping, a rollover summary): they use the seat the session is bound to,
+/// whose prompt cache the last turn wrote, through a request-local snapshot
+/// ([`AuthMethods::background_snapshot`]); they never refresh or write the
+/// shared state, so [`AuthMethods::refresh_with_broker`] refuses this
+/// point. No seat is ever selected or bound: with no seat bound on this
+/// source (under `Auto` or an explicit selector), a selection that no
+/// longer names the bound seat, or a seat that can no longer be vended,
+/// the request is not sent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum RefreshPoint {
     TurnStart,
     WithinTurn,
     KeepWarm,
+    Background,
+}
+
+/// The credential a background request may use: the one `held` is bound
+/// to on `source`, if the selection (`Auto` or explicit) still names it.
+/// `None` when nothing is bound on this source, the selection names
+/// another seat, or the selector is invalid.
+fn background_credential(
+    source: &CredentialSource,
+    selector: &AccountSelector,
+    held: &AuthState,
+) -> Option<CredentialRef> {
+    let bound = held.bound_credential.as_deref();
+    match check_binding(source, selector, bound, RefreshPoint::Background) {
+        BindingCheck::Matches => turn_pinned_credential(source, bound),
+        BindingCheck::Switched | BindingCheck::AutoRepin => None,
+    }
+}
+
+/// True if the held token may be served without a vend: present and
+/// unexpired. A remote source must use the SAME predicate as its cache
+/// (`is_expired_with_margin` + `DEFAULT_MARGIN_MS`) so the fast path and
+/// the `TokenCache` agree on freshness (board #1).
+fn still_fresh(source: &CredentialSource, held: &AuthState) -> bool {
+    let Some(exp) = held.token_expires else {
+        return false;
+    };
+    if held.auth_token.is_empty() {
+        return false;
+    }
+    if source.is_remote() {
+        !is_expired_with_margin(exp, DEFAULT_MARGIN_MS)
+    } else {
+        crate::epoch_millis() < exp
+    }
 }
 
 /// Pure binding comparison used by the fast path.
@@ -237,17 +305,26 @@ pub(super) fn check_binding(
 ) -> BindingCheck {
     match selector {
         AccountSelector::Auto => match (point, bound) {
-            (RefreshPoint::TurnStart, _) | (_, None) => BindingCheck::AutoRepin,
-            // Mid-turn: keep the seat this turn pinned — but only a seat
-            // vended by THIS source. A binding from another endpoint or
-            // machine principal is a switched source, never a kept seat.
-            (RefreshPoint::WithinTurn | RefreshPoint::KeepWarm, Some(_)) => {
+            // A keep-warm ping with no seat bound keeps upstream's answer
+            // (it never reaches a vend: `refresh_for_keepwarm` stops it).
+            (RefreshPoint::TurnStart, _)
+            | (RefreshPoint::WithinTurn, None)
+            | (RefreshPoint::KeepWarm, None) => BindingCheck::AutoRepin,
+            // Mid-turn, keep-warm or background: keep the seat this session
+            // pinned — but only a seat vended by THIS source. A binding from
+            // another endpoint or machine principal is a switched source,
+            // never a kept seat (and a background request then selects none).
+            (
+                RefreshPoint::WithinTurn | RefreshPoint::KeepWarm | RefreshPoint::Background,
+                Some(_),
+            ) => {
                 if turn_pinned_credential(source, bound).is_some() {
                     BindingCheck::Matches
                 } else {
                     BindingCheck::Switched
                 }
             }
+            (RefreshPoint::Background, None) => BindingCheck::Switched,
         },
         AccountSelector::Account(account) => {
             let expected = anthropic_binding(
@@ -324,6 +401,37 @@ impl AuthMethods {
         model: Option<&str>,
         point: RefreshPoint,
     ) -> Result<()> {
+        Self::refresh_if_needed_typed(auth, client, source, cache, model, point)
+            .await
+            .map_err(RefreshFailure::into_turn_error)
+    }
+
+    /// [`Self::refresh_if_needed`], keeping a failed automatic selection's
+    /// typed failure (and its `turn_auth_failed` line still to log) for a
+    /// capacity wait to plan from.
+    pub(super) async fn refresh_if_needed_typed(
+        auth: Arc<RwLock<AuthState>>,
+        client: &Client,
+        source: &CredentialSource,
+        cache: &TokenCache,
+        model: Option<&str>,
+        point: RefreshPoint,
+    ) -> std::result::Result<(), RefreshFailure> {
+        Self::refresh_if_needed_keeping(auth, client, source, cache, model, point, true).await
+    }
+
+    /// [`Self::refresh_if_needed_typed`]; `keep_cooling_seat` false leaves
+    /// a cooling pinned seat in the failure for [`Self::refresh_or_wait`]
+    /// (see [`RefreshFailure::cooling_pin`]).
+    async fn refresh_if_needed_keeping(
+        auth: Arc<RwLock<AuthState>>,
+        client: &Client,
+        source: &CredentialSource,
+        cache: &TokenCache,
+        model: Option<&str>,
+        point: RefreshPoint,
+        keep_cooling_seat: bool,
+    ) -> std::result::Result<(), RefreshFailure> {
         {
             let auth_guard = auth.read().await;
             // A non-OAuth local auth mode (e.g. a stubbed api_key harness)
@@ -333,8 +441,331 @@ impl AuthMethods {
                 return Ok(());
             }
         }
+        let broker = turn_broker(&auth, source, cache, client);
+        Self::refresh_with_broker_keeping(
+            auth,
+            source,
+            broker.as_ref(),
+            model,
+            point,
+            keep_cooling_seat,
+        )
+        .await
+    }
+
+    /// [`Self::refresh_if_needed`] for a turn's own request (turn start or a
+    /// round top). With `wait` set, an automatic selection that found no
+    /// capacity for a reason that ends by itself waits in the turn (see
+    /// `capacity_wait`) under `cancel`, then selects again; a cancel during
+    /// the wait is `RuntimeError::Canceled`. Without `wait`, or for any
+    /// other failure, this is [`Self::refresh_if_needed`].
+    ///
+    /// Mid-turn, with every account cooling down (the pinned seat too), a
+    /// wait that can start comes first; only when none starts is the
+    /// pinned seat kept, as [`Self::refresh_if_needed`] keeps it.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn refresh_or_wait(
+        auth: Arc<RwLock<AuthState>>,
+        client: &Client,
+        source: &CredentialSource,
+        cache: &TokenCache,
+        model: Option<&str>,
+        point: RefreshPoint,
+        wait: Option<&CapacityWaitPolicy>,
+        tx: &mpsc::UnboundedSender<crate::StreamEvent>,
+        cancel: &CancellationToken,
+    ) -> Result<()> {
+        match Self::refresh_if_needed_keeping(
+            Arc::clone(&auth),
+            client,
+            source,
+            cache,
+            model,
+            point,
+            false,
+        )
+        .await
+        {
+            Ok(()) => Ok(()),
+            Err(first) => {
+                Self::capacity_wait_refresh(
+                    first, auth, client, source, cache, model, point, wait, tx, cancel,
+                )
+                .await
+            }
+        }
+    }
+
+    /// Wait for capacity after `first` (a failed refresh at `point`), then
+    /// select again; see [`Self::refresh_or_wait`]. A failure that doesn't
+    /// wait ends the turn at once, exactly as [`Self::refresh_if_needed`].
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn capacity_wait_refresh(
+        first: RefreshFailure,
+        auth: Arc<RwLock<AuthState>>,
+        client: &Client,
+        source: &CredentialSource,
+        cache: &TokenCache,
+        model: Option<&str>,
+        point: RefreshPoint,
+        wait: Option<&CapacityWaitPolicy>,
+        tx: &mpsc::UnboundedSender<crate::StreamEvent>,
+        cancel: &CancellationToken,
+    ) -> Result<()> {
+        if (wait.is_none() || first.selection.is_none()) && first.cooling_pin.is_none() {
+            return Err(first.ends_turn(point, source));
+        }
+        let broker = turn_broker(&auth, source, cache, client);
+        Self::capacity_wait_with_broker(
+            first,
+            auth,
+            source,
+            broker.as_ref(),
+            model,
+            point,
+            wait,
+            tx,
+            cancel,
+        )
+        .await
+    }
+
+    /// Broker-injected core of [`Self::capacity_wait_refresh`]. Each check
+    /// is one [`Self::refresh_with_broker`] at the same `point` (mid-turn,
+    /// the pinned seat is re-vended once its cooldown ends, keeping its
+    /// prompt cache), under `cancel`. Never for a remote source or a
+    /// background request.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn capacity_wait_with_broker(
+        first: RefreshFailure,
+        auth: Arc<RwLock<AuthState>>,
+        source: &CredentialSource,
+        broker: &dyn CredentialBroker,
+        model: Option<&str>,
+        point: RefreshPoint,
+        wait: Option<&CapacityWaitPolicy>,
+        tx: &mpsc::UnboundedSender<crate::StreamEvent>,
+        cancel: &CancellationToken,
+    ) -> Result<()> {
+        let site = match point {
+            RefreshPoint::TurnStart => "turn_start",
+            RefreshPoint::WithinTurn => "round_top",
+            // A keep-warm ping never waits (it never selects either).
+            RefreshPoint::KeepWarm | RefreshPoint::Background => {
+                return Err(first.into_turn_error())
+            }
+        };
+        // Where no wait starts, a cooling pinned seat is kept (mid-turn,
+        // every account cooling: see `RefreshFailure::cooling_pin`) before
+        // the turn ends.
+        let (Some(policy), false) = (wait, source.is_remote()) else {
+            return Self::keep_or_end(first, &auth, source, broker, point, true).await;
+        };
+        let Some(waitable) = first.waitable(crate::epoch_millis()) else {
+            return Self::keep_or_end(first, &auth, source, broker, point, false).await;
+        };
+        // No wait can start (nothing resets inside the bound): the turn
+        // ends now, marked when its stop is reset-based. A wait that runs
+        // out marks its own last failure (`CapacityWaiter`).
+        let Some(mut waiter) = CapacityWaiter::begin(policy, site, waitable, tx) else {
+            return Self::keep_or_end(first, &auth, source, broker, point, true).await;
+        };
+        // The failure the turn ends with when the bound runs out.
+        let mut last = first;
+        loop {
+            match waiter.sleep(cancel).await {
+                Wake::Check => {}
+                Wake::Canceled => return Err(RuntimeError::Canceled),
+                Wake::Ended => return Err(last.into_turn_error()),
+            }
+            // Cut at the bound and at the cadence: a check still running at
+            // the next cadence point is dropped and the next starts at once;
+            // one still running at the bound ends the turn as before. A
+            // dropped check's answer is dropped with it (it never binds).
+            let Some(checked) = waiter
+                .bounded(|| {
+                    super::api::await_or_cancel(
+                        cancel,
+                        // A check never keeps a cooling seat: the wait
+                        // is for capacity.
+                        Self::refresh_with_broker_keeping(
+                            Arc::clone(&auth),
+                            source,
+                            broker,
+                            model,
+                            point,
+                            false,
+                        ),
+                    )
+                })
+                .await
+            else {
+                return Err(last.into_turn_error());
+            };
+            match checked? {
+                Ok(()) => {
+                    waiter.resumed();
+                    return Ok(());
+                }
+                Err(next) => {
+                    let still = next.waitable(waiter.now_ms());
+                    if !waiter.still(still) {
+                        return Err(next.into_turn_error());
+                    }
+                    last = next;
+                }
+            }
+        }
+    }
+
+    /// A failure no capacity wait takes: keep its cooling pinned seat if it
+    /// carries one that can still be re-vended, else end the turn (`mark`:
+    /// noting a reset-based stop, see [`RefreshFailure::ends_turn`]).
+    async fn keep_or_end(
+        failure: RefreshFailure,
+        auth: &Arc<RwLock<AuthState>>,
+        source: &CredentialSource,
+        broker: &dyn CredentialBroker,
+        point: RefreshPoint,
+        mark: bool,
+    ) -> Result<()> {
+        match Self::keep_cooling_seat(failure, auth, source, broker).await {
+            Ok(()) => Ok(()),
+            Err(failure) if mark => Err(failure.ends_turn(point, source)),
+            Err(failure) => Err(failure.into_turn_error()),
+        }
+    }
+
+    /// [`Self::refresh_or_wait`] with an injected broker (tests).
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn refresh_or_wait_with_broker(
+        auth: Arc<RwLock<AuthState>>,
+        source: &CredentialSource,
+        broker: &dyn CredentialBroker,
+        model: Option<&str>,
+        point: RefreshPoint,
+        wait: Option<&CapacityWaitPolicy>,
+        tx: &mpsc::UnboundedSender<crate::StreamEvent>,
+        cancel: &CancellationToken,
+    ) -> Result<()> {
+        match Self::refresh_with_broker_keeping(
+            Arc::clone(&auth),
+            source,
+            broker,
+            model,
+            point,
+            false,
+        )
+        .await
+        {
+            Ok(()) => Ok(()),
+            Err(first) => {
+                Self::capacity_wait_with_broker(
+                    first, auth, source, broker, model, point, wait, tx, cancel,
+                )
+                .await
+            }
+        }
+    }
+
+    /// The credential for one request the session makes on its own (a
+    /// keep-warm ping, a cold rollover summary), as a request-local auth
+    /// snapshot. The shared auth state is only read: nothing here writes
+    /// it, so a concurrent foreground rebind is never undone.
+    ///
+    /// A local non-OAuth mode (an `api_key` harness) is served as held. An
+    /// OAuth request needs an existing binding on this source that the
+    /// selection (`Auto` or explicit) still names: a fresh bound token is
+    /// served from memory, a stale one is re-vended by name for the bound
+    /// credential (never a selection) and used for this request only. No
+    /// binding, a selection naming another seat, or a seat that can no
+    /// longer be vended is an error: the request is not sent.
+    pub(super) async fn background_snapshot(
+        auth: &Arc<RwLock<AuthState>>,
+        client: &Client,
+        source: &CredentialSource,
+        cache: &TokenCache,
+    ) -> Result<AuthState> {
+        let held = auth.read().await.clone();
+        if !source.is_remote() && held.auth_type != "oauth" {
+            return Ok(held);
+        }
         let broker = broker_from_source(source, cache, client.clone());
-        Self::refresh_with_broker(auth, source, broker.as_ref(), model, point).await
+        Self::background_snapshot_with_broker(held, source, broker.as_ref()).await
+    }
+
+    /// Whether a background request would find a seat to use: local
+    /// non-OAuth auth, or an OAuth binding on this source that the current
+    /// selection still names. Reads the shared state and the selector only;
+    /// nothing is vended or written (a stale bound token still needs its
+    /// named vend at send time, which may fail).
+    pub(super) async fn background_seat_bound(
+        auth: &Arc<RwLock<AuthState>>,
+        client: &Client,
+        source: &CredentialSource,
+        cache: &TokenCache,
+    ) -> bool {
+        let held = auth.read().await.clone();
+        if !source.is_remote() && held.auth_type != "oauth" {
+            return true;
+        }
+        let broker = broker_from_source(source, cache, client.clone());
+        let selector = broker.account_selector(OAuthProviderId::Anthropic);
+        background_credential(source, &selector, &held).is_some()
+    }
+
+    /// Broker-injected core of [`Self::background_snapshot`]: `held` is a
+    /// copy of the shared state taken once; the result is derived from it.
+    pub(super) async fn background_snapshot_with_broker(
+        held: AuthState,
+        source: &CredentialSource,
+        broker: &dyn CredentialBroker,
+    ) -> Result<AuthState> {
+        let selector = broker.account_selector(OAuthProviderId::Anthropic);
+        let credential = background_credential(source, &selector, &held).ok_or_else(|| {
+            RuntimeError::Auth(
+                "the session has no usable Anthropic account binding; a background request is not sent".into(),
+            )
+        })?;
+        // A seat that is cooling down (the whole account) is not used:
+        // the request would meet the same limit, and a background request
+        // never moves to another account (the same rule as a keep-warm
+        // ping, #354).
+        if let Some(until_ms) = broker.active_cooldown(&credential) {
+            return Err(RuntimeError::Auth(format!(
+                "account cooling: '{}' is cooling down until {}; a background request never \
+                 switches accounts and is not sent",
+                credential.account.label_str(),
+                super::anthropic_quota::describe_reset_utc(until_ms, crate::epoch_millis())
+            )));
+        }
+        // Fresh by expiry, and (local) auth.json unchanged since the held
+        // token was loaded: the same mtime rule as the shared fast path
+        // (#237). A rotated file re-vends the bound seat by name for this
+        // request only; the shared state is still only read. Under `auto`
+        // the re-vend honours a held refused refresh (#354).
+        if still_fresh(source, &held) && !auth_file_changed(held.auth_file_mtime) {
+            return Ok(held);
+        }
+        let vended = match selector {
+            AccountSelector::Auto => broker.access_token_for_auto(&credential).await,
+            _ => broker.access_token_for(&credential).await,
+        };
+        let token = vended.map_err(|e| {
+            RuntimeError::Auth(format!(
+                "the session's Anthropic account could not be re-vended for a background request: {e}"
+            ))
+        })?;
+        Ok(AuthState {
+            auth_token: token.token,
+            auth_type: "oauth".to_string(),
+            refresh_token: None,
+            token_expires: Some(token.expires),
+            // Request-local: never written back, so never consulted.
+            auth_file_mtime: None,
+            bound_credential: held.bound_credential,
+        })
     }
 
     /// Broker-injected core of [`Self::refresh_if_needed`]; `source` is the
@@ -348,9 +779,49 @@ impl AuthMethods {
         model: Option<&str>,
         point: RefreshPoint,
     ) -> Result<()> {
+        Self::refresh_with_broker_typed(auth, source, broker, model, point)
+            .await
+            .map_err(RefreshFailure::into_turn_error)
+    }
+
+    /// [`Self::refresh_with_broker`], keeping a failed automatic
+    /// selection's typed failure (see [`RefreshFailure`]).
+    pub(super) async fn refresh_with_broker_typed(
+        auth: Arc<RwLock<AuthState>>,
+        source: &CredentialSource,
+        broker: &dyn CredentialBroker,
+        model: Option<&str>,
+        point: RefreshPoint,
+    ) -> std::result::Result<(), RefreshFailure> {
+        Self::refresh_with_broker_keeping(auth, source, broker, model, point, true).await
+    }
+
+    /// [`Self::refresh_with_broker_typed`]. With `keep_cooling_seat`, a
+    /// mid-turn `Auto` selection that fails because every account is
+    /// cooling down, the pinned seat too, keeps that seat (re-vended);
+    /// without it, the failure carries the seat for the caller to keep
+    /// once no capacity wait starts ([`RefreshFailure::cooling_pin`]).
+    async fn refresh_with_broker_keeping(
+        auth: Arc<RwLock<AuthState>>,
+        source: &CredentialSource,
+        broker: &dyn CredentialBroker,
+        model: Option<&str>,
+        point: RefreshPoint,
+        keep_cooling_seat: bool,
+    ) -> std::result::Result<(), RefreshFailure> {
+        if point == RefreshPoint::Background {
+            // Background requests never write the shared state; they
+            // resolve a request-local snapshot instead.
+            return Err(RefreshFailure::ended(RuntimeError::Auth(
+                "a background request resolves its own credential snapshot; it never refreshes the session's".into(),
+            )));
+        }
         let selector = broker.account_selector(OAuthProviderId::Anthropic);
         if point == RefreshPoint::KeepWarm {
-            return Self::refresh_for_keepwarm(auth, source, broker, &selector).await;
+            // Already logged where it fails; a ping never waits.
+            return Self::refresh_for_keepwarm(auth, source, broker, &selector, model)
+                .await
+                .map_err(RefreshFailure::ended);
         }
         // Auto mid-turn: a seat this turn pinned that is now cooling down
         // (another session met its limit) is not kept; the request would
@@ -358,8 +829,11 @@ impl AuthMethods {
         let cooling = match (&selector, point) {
             (AccountSelector::Auto, RefreshPoint::WithinTurn) => {
                 let bound = auth.read().await.bound_credential.clone();
-                turn_pinned_credential(source, bound.as_deref())
-                    .is_some_and(|cred| broker.active_cooldown(&cred).is_some())
+                turn_pinned_credential(source, bound.as_deref()).is_some_and(|cred| {
+                    broker
+                        .active_cooldown_for(&cred, model.map(quota_model_key))
+                        .is_some()
+                })
             }
             _ => false,
         };
@@ -373,25 +847,12 @@ impl AuthMethods {
                 auth_guard.bound_credential.as_deref(),
                 point,
             );
-            if let Some(exp) = auth_guard.token_expires {
-                let still_fresh = if source.is_remote() {
-                    // Must use the SAME predicate as the remote cache
-                    // (is_expired_with_margin + DEFAULT_MARGIN_MS) so the
-                    // fast-path and TokenCache agree on freshness (board #1).
-                    !auth_guard.auth_token.is_empty()
-                        && !is_expired_with_margin(exp, DEFAULT_MARGIN_MS)
-                } else {
-                    !auth_guard.auth_token.is_empty() && crate::epoch_millis() < exp
-                };
-                if still_fresh && binding == BindingCheck::Matches && !cooling {
-                    if source.is_remote() {
-                        return Ok(());
-                    }
-                    // Fresh by expiry and binding; the mtime check decides.
-                    Some(auth_guard.auth_file_mtime)
-                } else {
-                    None
+            if still_fresh(source, &auth_guard) && binding == BindingCheck::Matches && !cooling {
+                if source.is_remote() {
+                    return Ok(());
                 }
+                // Fresh by expiry and binding; the mtime check decides.
+                Some(auth_guard.auth_file_mtime)
             } else {
                 None
             }
@@ -437,7 +898,11 @@ impl AuthMethods {
                 // Explicit: exactly this credential, never a fallback.
                 let cred = CredentialRef::new(OAuthProviderId::Anthropic, account.clone());
                 let token = broker.access_token_for(&cred).await.map_err(|e| {
-                    turn_auth_failed(broker_error_kind(&e), Some(&cred), vend_error(&cred, &e))
+                    RefreshFailure::ended(turn_auth_failed(
+                        broker_error_kind(&e),
+                        Some(&cred),
+                        vend_error(&cred, &e),
+                    ))
                 })?;
                 PinnedToken {
                     credential: cred,
@@ -445,12 +910,18 @@ impl AuthMethods {
                 }
             }
             AccountSelector::Auto => {
-                Self::vend_auto(broker, source, bound.as_deref(), model, point).await?
+                match Self::vend_auto(broker, source, bound.as_deref(), model, point).await {
+                    Ok(pinned) => pinned,
+                    Err(failure) if keep_cooling_seat => {
+                        return Self::keep_cooling_seat(failure, &auth, source, broker).await
+                    }
+                    Err(failure) => return Err(failure),
+                }
             }
             AccountSelector::Invalid { source, reason } => {
-                return Err(turn_auth_failed("invalid_selector", None, RuntimeError::Auth(format!(
+                return Err(RefreshFailure::ended(turn_auth_failed("invalid_selector", None, RuntimeError::Auth(format!(
                     "Anthropic account selector from {source} is invalid ({reason}); refusing to fall back to another account. Fix it or run `synaps auth use --provider anthropic --account <label|default>`."
-                ))));
+                )))));
             }
         };
         // Update shared auth state so all clones (including spawned stream
@@ -468,13 +939,15 @@ impl AuthMethods {
     /// served from memory while its token is fresh (and, locally, auth.json
     /// is unchanged), else re-vended by credential, honouring a held
     /// refused refresh. No bound account, an account the selector no longer
-    /// names, an account that is cooling down, or a failed re-vend stops
-    /// the ping with an error, never another account.
+    /// names, an account that is cooling down (the whole account, or a
+    /// limit of the ping's `model`), or a failed re-vend stops the ping
+    /// with an error, never another account.
     async fn refresh_for_keepwarm(
         auth: Arc<RwLock<AuthState>>,
         source: &CredentialSource,
         broker: &dyn CredentialBroker,
         selector: &AccountSelector,
+        model: Option<&str>,
     ) -> Result<()> {
         let (bound, fresh, recorded_mtime) = {
             let g = auth.read().await;
@@ -503,7 +976,7 @@ impl AuthMethods {
                     .into(),
             ));
         };
-        if let Some(until_ms) = broker.active_cooldown(&cred) {
+        if let Some(until_ms) = broker.active_cooldown_for(&cred, model.map(quota_model_key)) {
             let now = crate::epoch_millis();
             tracing::info!(
                 credential = %cred,
@@ -587,15 +1060,19 @@ impl AuthMethods {
         bound: Option<&str>,
         model: Option<&str>,
         point: RefreshPoint,
-    ) -> Result<PinnedToken> {
+    ) -> std::result::Result<PinnedToken, RefreshFailure> {
         let mut cooling_pin = None;
         if point == RefreshPoint::WithinTurn {
             if let Some(cred) = turn_pinned_credential(source, bound) {
-                // A pinned seat that is cooling down is not re-vended: the
+                // A pinned seat that is cooling down (the whole account, or
+                // a limit of this turn's model) is not re-vended: the
                 // selection below never picks it while the cooldown lasts.
-                // If no account can serve (every one cooling), the turn
-                // keeps it (below) rather than dying after its tools ran.
-                if let Some(until_ms) = broker.active_cooldown(&cred) {
+                // If no account can serve (every one cooling), the failure
+                // carries it and the caller keeps it rather than ending a
+                // turn whose tools ran (after a capacity wait, if one starts).
+                if let Some(until_ms) =
+                    broker.active_cooldown_for(&cred, model.map(quota_model_key))
+                {
                     tracing::info!(
                         credential = %cred,
                         until_ms,
@@ -627,34 +1104,69 @@ impl AuthMethods {
             Ok(pinned) => return Ok(pinned),
             Err(e) => e,
         };
-        // Mid-turn, every account is cooling down, the pinned one too: keep
-        // it (the turn's cache is there) instead of ending a turn whose
-        // tools already ran. A limit that is real meets its 429 again and
-        // the request path handles it.
-        if let Some(cred) = cooling_pin.filter(|_| all_cooling_down(&e)) {
-            match broker.access_token_for_auto(&cred).await {
-                Ok(token) => {
-                    tracing::info!(
-                        credential = %cred,
-                        "Anthropic auto selection: every account is cooling down; keeping the seat pinned for this turn"
-                    );
-                    return Ok(PinnedToken {
+        // The typed failure (a capacity wait plans from it; its
+        // `turn_auth_failed` WARN is logged when it ends the turn). Mid-turn,
+        // with every account cooling down, the pinned one too, it carries
+        // that seat: the caller keeps it ([`Self::keep_cooling_seat`]) when
+        // no capacity wait starts.
+        Err(RefreshFailure {
+            cooling_pin: cooling_pin.filter(|_| all_cooling_down(&e)),
+            // A remote broker's refusal never waits: its host decides.
+            selection: match &e {
+                crate::auth::BrokerError::NoAccountAvailable {
+                    failure: Some(f), ..
+                } if !source.is_remote() => Some(f.clone()),
+                _ => None,
+            },
+            warn_kind: Some(auto_selection_kind(&e)),
+            error: RuntimeError::Auth(auto_selection_text(&e, crate::epoch_millis())),
+        })
+    }
+}
+
+impl AuthMethods {
+    /// Mid-turn, every account is cooling down, the pinned one too: keep
+    /// it (the turn's cache is there) instead of ending a turn whose tools
+    /// already ran. A limit that is real meets its 429 again and the
+    /// request path handles it. `failure` comes back (without its seat)
+    /// when it carries none or the seat can't be re-vended.
+    async fn keep_cooling_seat(
+        mut failure: RefreshFailure,
+        auth: &Arc<RwLock<AuthState>>,
+        source: &CredentialSource,
+        broker: &dyn CredentialBroker,
+    ) -> std::result::Result<(), RefreshFailure> {
+        let Some(cred) = failure.cooling_pin.take() else {
+            return Err(failure);
+        };
+        let mtime = local_mtime_for(source);
+        match broker.access_token_for_auto(&cred).await {
+            Ok(token) => {
+                tracing::info!(
+                    credential = %cred,
+                    "Anthropic auto selection: every account is cooling down; keeping the seat pinned for this turn"
+                );
+                Self::bind_pinned_at(
+                    auth,
+                    source,
+                    PinnedToken {
                         credential: cred,
                         token,
-                    });
-                }
-                Err(revend) => tracing::warn!(
+                    },
+                    mtime,
+                )
+                .await;
+                Ok(())
+            }
+            Err(revend) => {
+                tracing::warn!(
                     credential = %cred,
                     error = %revend,
                     "Anthropic auto selection: the seat pinned for this turn could not be re-vended"
-                ),
+                );
+                Err(failure)
             }
         }
-        Err(turn_auth_failed(
-            auto_selection_kind(&e),
-            None,
-            RuntimeError::Auth(auto_selection_text(&e, crate::epoch_millis())),
-        ))
     }
 }
 
@@ -665,6 +1177,207 @@ fn all_cooling_down(e: &crate::auth::BrokerError) -> bool {
         crate::auth::BrokerError::NoAccountAvailable { failure: Some(f), .. }
             if f.kind == crate::auth::SelectionFailureKind::AllCoolingDown
     )
+}
+
+/// A failed refresh, before it ends the turn: the error, the automatic
+/// selection's typed failure on a local source (what a capacity wait plans
+/// from), and the `turn_auth_failed` kind still to log. The automatic
+/// selection logs that WARN only when its failure ends the turn, so a turn
+/// that waits and then carries on logs none.
+pub(super) struct RefreshFailure {
+    error: RuntimeError,
+    selection: Option<crate::auth::SelectionFailure>,
+    warn_kind: Option<&'static str>,
+    /// Mid-turn under `Auto`, every account cooling down, the seat this
+    /// turn pinned too: that seat, kept (re-vended) instead of ending the
+    /// turn when no capacity wait starts.
+    cooling_pin: Option<CredentialRef>,
+}
+
+impl RefreshFailure {
+    /// A failure already logged (or that logs nothing), carrying no
+    /// selection.
+    fn ended(error: RuntimeError) -> Self {
+        Self {
+            error,
+            selection: None,
+            warn_kind: None,
+            cooling_pin: None,
+        }
+    }
+
+    /// This failure in a capacity wait's terms; `None` when it never waits.
+    fn waitable(&self, now_ms: u64) -> Option<super::capacity_wait::Waitable> {
+        self.selection
+            .as_ref()
+            .and_then(|f| super::capacity_wait::Waitable::from_selection(f, now_ms))
+    }
+
+    /// The capacity stop a turn ending on this failure at `now_ms` is
+    /// marked with (see [`super::capacity_wait::stop_at`]): only a local
+    /// automatic selection's reset-based failure has one.
+    pub(super) fn capacity_stop(&self, now_ms: u64) -> Option<super::types::CapacityStopAt> {
+        self.waitable(now_ms)
+            .and_then(|w| super::capacity_wait::stop_at(&w, now_ms))
+    }
+
+    /// The error that ends the turn at `point` without a wait (or after
+    /// none could start), noting a reset-based stop on the running turn
+    /// first. A background request or a remote source marks nothing.
+    fn ends_turn(self, point: RefreshPoint, source: &CredentialSource) -> RuntimeError {
+        if point != RefreshPoint::Background && !source.is_remote() {
+            let now = crate::epoch_millis();
+            if let Some(w) = self.waitable(now) {
+                super::capacity_wait::note_stop(&w, now);
+            }
+        }
+        self.into_turn_error()
+    }
+
+    /// Whether a capacity wait would start for this failure now.
+    pub(super) fn waits(&self) -> bool {
+        let now = crate::epoch_millis();
+        self.waitable(now).is_some_and(|w| {
+            super::capacity_wait::plan(
+                &w,
+                now,
+                now.saturating_add(super::capacity_wait::RESET_BOUND.as_millis() as u64),
+            )
+            .is_some()
+        })
+    }
+
+    /// The error that ends the turn, logging its `turn_auth_failed` WARN
+    /// if that is still due. The WARN names the accounts the failed
+    /// selection says need a login or an action (labels and kinds only).
+    pub(super) fn into_turn_error(self) -> RuntimeError {
+        match self.warn_kind {
+            Some(kind) => {
+                let needs = self.selection.as_ref().and_then(needs_login_or_action);
+                log_turn_auth_failed(kind, None, needs.as_deref(), self.error)
+            }
+            None => self.error,
+        }
+    }
+}
+
+/// A turn-start selection failure handed to the spawned turn task, which
+/// waits for capacity under the turn's cancel: the session actor awaits
+/// the turn's setup inline, so a wait there would block it (no Esc, no
+/// commands).
+pub(super) struct TurnStartWait {
+    pub(super) first: RefreshFailure,
+    pub(super) auth: Arc<RwLock<AuthState>>,
+    pub(super) client: Client,
+    pub(super) source: CredentialSource,
+    pub(super) cache: TokenCache,
+    pub(super) model: String,
+    pub(super) policy: CapacityWaitPolicy,
+}
+
+impl TurnStartWait {
+    /// Wait, then select again at turn start. `Err(Canceled)`: the turn
+    /// was stopped during the wait (nothing was sent); any other error
+    /// ends the turn as the failed selection did before.
+    pub(super) async fn run(
+        self,
+        tx: &mpsc::UnboundedSender<crate::StreamEvent>,
+        cancel: &CancellationToken,
+    ) -> Result<()> {
+        AuthMethods::capacity_wait_refresh(
+            self.first,
+            self.auth,
+            &self.client,
+            &self.source,
+            &self.cache,
+            Some(&self.model),
+            RefreshPoint::TurnStart,
+            Some(&self.policy),
+            tx,
+            cancel,
+        )
+        .await
+    }
+}
+
+/// The broker a turn's own refresh and its capacity wait use:
+/// [`broker_from_source`], or under `cfg(test)` / the `testing` feature a
+/// scripted broker a test installed ([`testing`]).
+fn turn_broker(
+    _auth: &Arc<RwLock<AuthState>>,
+    source: &CredentialSource,
+    cache: &TokenCache,
+    client: &Client,
+) -> Arc<dyn CredentialBroker> {
+    #[cfg(any(test, feature = "testing"))]
+    if let Some(broker) = testing::broker_for(_auth) {
+        return broker;
+    }
+    broker_from_source(source, cache, client.clone())
+}
+
+/// Test-only (`cfg(test)` / the `testing` feature): a scripted broker in
+/// place of [`broker_from_source`] for a turn's own refresh (turn start,
+/// round top) and its capacity wait, so a whole turn can wait on a scripted
+/// selection. Every other broker use is unchanged.
+#[cfg(any(test, feature = "testing"))]
+pub mod testing {
+    use super::{AuthState, CredentialBroker};
+    use std::sync::{Arc, Mutex};
+    use tokio::sync::RwLock;
+
+    /// `None`: every session in the process.
+    type Key = Option<usize>;
+
+    static BROKERS: Mutex<Vec<(Key, Arc<dyn CredentialBroker>)>> = Mutex::new(Vec::new());
+
+    /// Removes its broker when dropped.
+    pub struct TurnBrokerGuard(Key);
+
+    impl Drop for TurnBrokerGuard {
+        fn drop(&mut self) {
+            let mut brokers = BROKERS.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(at) = brokers.iter().position(|(k, _)| *k == self.0) {
+                brokers.remove(at);
+            }
+        }
+    }
+
+    fn install(key: Key, broker: Arc<dyn CredentialBroker>) -> TurnBrokerGuard {
+        let mut brokers = BROKERS.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            brokers.iter().all(|(k, _)| *k != key),
+            "a turn broker is already installed for this key"
+        );
+        brokers.push((key, broker));
+        TurnBrokerGuard(key)
+    }
+
+    /// For the one session whose auth state is `auth` (lib tests, which
+    /// run side by side).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(in crate::runtime) fn install_for(
+        auth: &Arc<RwLock<AuthState>>,
+        broker: Arc<dyn CredentialBroker>,
+    ) -> TurnBrokerGuard {
+        install(Some(Arc::as_ptr(auth) as usize), broker)
+    }
+
+    /// For every session in this process: only for a test binary whose
+    /// tests all want it (an integration test file of its own).
+    pub fn install_global(broker: Arc<dyn CredentialBroker>) -> TurnBrokerGuard {
+        install(None, broker)
+    }
+
+    pub(super) fn broker_for(auth: &Arc<RwLock<AuthState>>) -> Option<Arc<dyn CredentialBroker>> {
+        let key = Some(Arc::as_ptr(auth) as usize);
+        let brokers = BROKERS.lock().unwrap_or_else(|e| e.into_inner());
+        brokers
+            .iter()
+            .find(|(k, _)| *k == key)
+            .or_else(|| brokers.iter().find(|(k, _)| k.is_none()))
+            .map(|(_, b)| Arc::clone(b))
+    }
 }
 
 /// Fixed kind of a failed automatic selection. In automatic Anthropic
@@ -685,13 +1398,38 @@ fn turn_auth_failed(
     account: Option<&CredentialRef>,
     err: RuntimeError,
 ) -> RuntimeError {
+    log_turn_auth_failed(kind, account, None, err)
+}
+
+/// [`turn_auth_failed`], also naming the accounts that need a login or an
+/// action outside synaps (`needs_login_or_action`: S1's `label:kind` log
+/// form, comma-separated; `-` when none).
+fn log_turn_auth_failed(
+    kind: &str,
+    account: Option<&CredentialRef>,
+    needs: Option<&str>,
+    err: RuntimeError,
+) -> RuntimeError {
     tracing::warn!(
         provider = %"anthropic",
         kind = %kind,
         account = %account.map_or("-", |c| c.account.label_str()),
+        needs_login_or_action = %needs.unwrap_or("-"),
         "turn_auth_failed"
     );
     err
+}
+
+/// The accounts a failed selection says need a login or an action outside
+/// synaps, in S1's log form (`label:kind[:status][:cooling]`), or `None`.
+fn needs_login_or_action(f: &crate::auth::SelectionFailure) -> Option<String> {
+    let needs: Vec<_> = f
+        .accounts
+        .iter()
+        .filter(|a| a.kind.needs_login() || a.kind.needs_action())
+        .map(|a| a.log_form())
+        .collect();
+    (!needs.is_empty()).then(|| needs.join(","))
 }
 
 /// Fixed kind of a broker error for the `turn_auth_failed` WARN.
@@ -788,9 +1526,10 @@ fn account_failure_part(a: &crate::auth::AccountFailure, now_ms: u64) -> String 
     }
 }
 
-fn selection_failure_text(f: &crate::auth::SelectionFailure, now_ms: u64) -> String {
+/// What a failed automatic selection of this kind means, in S1's words.
+fn selection_failure_what(kind: crate::auth::SelectionFailureKind) -> &'static str {
     use crate::auth::SelectionFailureKind as K;
-    let what = match f.kind {
+    match kind {
         K::NoCredentials => "no Anthropic account is logged in",
         K::UsageReadFailed => "reading account usage failed, so capacity is unproven (not used up)",
         K::CredentialRejected => {
@@ -808,16 +1547,40 @@ fn selection_failure_text(f: &crate::auth::SelectionFailure, now_ms: u64) -> Str
         }
         K::CredentialStore => "the credential store could not be read, so no account was checked",
         K::Unknown => "the daemon reported a reason this synaps build does not know",
-    };
-    let mut text = format!("Automatic account selection failed ({}): {what}", f.kind);
-    if !f.accounts.is_empty() {
-        let parts: Vec<_> = f
-            .accounts
-            .iter()
-            .map(|a| account_failure_part(a, now_ms))
-            .collect();
-        text.push_str(&format!(" [{}]", parts.join("; ")));
     }
+}
+
+/// ` [label: kind (...); ...]`, or nothing when no account is named.
+fn selection_failure_parts(f: &crate::auth::SelectionFailure, now_ms: u64) -> String {
+    if f.accounts.is_empty() {
+        return String::new();
+    }
+    let parts: Vec<_> = f
+        .accounts
+        .iter()
+        .map(|a| account_failure_part(a, now_ms))
+        .collect();
+    format!(" [{}]", parts.join("; "))
+}
+
+/// The head of a capacity-wait notice for a failed automatic selection:
+/// what the failure means and each account's part, in S1's words (labels
+/// only).
+pub(super) fn selection_failure_head(f: &crate::auth::SelectionFailure, now_ms: u64) -> String {
+    let what = selection_failure_what(f.kind);
+    let mut chars = what.chars();
+    let what = match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect::<String>(),
+        None => String::new(),
+    };
+    format!("{what}{}", selection_failure_parts(f, now_ms))
+}
+
+fn selection_failure_text(f: &crate::auth::SelectionFailure, now_ms: u64) -> String {
+    use crate::auth::SelectionFailureKind as K;
+    let what = selection_failure_what(f.kind);
+    let mut text = format!("Automatic account selection failed ({}): {what}", f.kind);
+    text.push_str(&selection_failure_parts(f, now_ms));
     let earliest = f
         .earliest_reset_ms
         .filter(|t| *t > now_ms)
@@ -832,23 +1595,10 @@ fn selection_failure_text(f: &crate::auth::SelectionFailure, now_ms: u64) -> Str
         );
         return text;
     }
-    let login = f.login_labels();
-    if !login.is_empty() {
-        let commands: Vec<_> = login.iter().map(|l| login_command(l)).collect();
-        text.push_str(&format!(
-            " {} need{} a new login: {}.",
-            login.join(", "),
-            if login.len() == 1 { "s" } else { "" },
-            commands.join(", ")
-        ));
-    }
-    for a in f.accounts.iter().filter(|a| a.kind.needs_action()) {
-        text.push(' ');
-        text.push_str(&action_remedy(a));
-    }
+    text.push_str(&selection_failure_remedies(f));
     // "No login needed" only when no account needs a login or an action;
     // "send again" only when sending again can help.
-    let nothing_to_fix = login.is_empty() && f.action_labels().is_empty();
+    let nothing_to_fix = f.login_labels().is_empty() && f.action_labels().is_empty();
     match f.kind {
         K::NoCredentials | K::CredentialRejected | K::ActionRequired | K::CredentialStore => {}
         K::RemoteNoCapacity => text.push_str(
@@ -884,6 +1634,30 @@ fn selection_failure_text(f: &crate::auth::SelectionFailure, now_ms: u64) -> Str
         }
         _ if nothing_to_fix => text.push_str(" Send again to retry; no login needed."),
         _ => text.push_str(" Send again to retry."),
+    }
+    text
+}
+
+/// What the user can do about the accounts a failed selection names: one
+/// sentence for those a new login fixes (with the commands), and each
+/// account's remedy when it needs an action outside synaps. Each sentence
+/// starts with a space; empty when no account needs either. A capacity
+/// wait's notice carries it too.
+pub(super) fn selection_failure_remedies(f: &crate::auth::SelectionFailure) -> String {
+    let mut text = String::new();
+    let login = f.login_labels();
+    if !login.is_empty() {
+        let commands: Vec<_> = login.iter().map(|l| login_command(l)).collect();
+        text.push_str(&format!(
+            " {} need{} a new login: {}.",
+            login.join(", "),
+            if login.len() == 1 { "s" } else { "" },
+            commands.join(", ")
+        ));
+    }
+    for a in f.accounts.iter().filter(|a| a.kind.needs_action()) {
+        text.push(' ');
+        text.push_str(&action_remedy(a));
     }
     text
 }
@@ -1704,6 +2478,9 @@ mod tests {
         auto_error: Mutex<Option<BrokerError>>,
         /// Storage keys of seats that are cooling down.
         cooling: Vec<String>,
+        /// Storage keys of seats cooling down for one model's requests only,
+        /// with that model.
+        model_cooling: Vec<(String, &'static str)>,
     }
 
     impl ScriptedBroker {
@@ -1716,6 +2493,7 @@ mod tests {
                 auto_pick: "auto-pick",
                 auto_error: Mutex::new(None),
                 cooling: Vec::new(),
+                model_cooling: Vec::new(),
             }
         }
         fn explicit(&self) -> Vec<String> {
@@ -1741,6 +2519,20 @@ mod tests {
             self.cooling
                 .contains(&cred.storage_key())
                 .then_some(FRESH)
+        }
+        fn active_cooldown_for(&self, cred: &CredentialRef, model: Option<&str>) -> Option<u64> {
+            let for_model = self.model_cooling.iter().any(|(key, cooling)| {
+                *key == cred.storage_key()
+                    && match model {
+                        Some(model) => crate::auth::quota_policy::model_matches(cooling, model),
+                        None => true,
+                    }
+            });
+            if for_model {
+                Some(FRESH)
+            } else {
+                self.active_cooldown(cred)
+            }
         }
         async fn access_token_for(
             &self,
@@ -1810,6 +2602,18 @@ mod tests {
         CredentialRef::new(
             OAuthProviderId::Anthropic,
             crate::auth::Account::parse("work").unwrap(),
+        )
+    }
+
+    /// Every field of an auth state, for whole-state comparisons.
+    type Fields = (String, String, Option<String>, Option<u64>, Option<String>);
+    fn fields(s: &AuthState) -> Fields {
+        (
+            s.auth_token.clone(),
+            s.auth_type.clone(),
+            s.refresh_token.clone(),
+            s.token_expires,
+            s.bound_credential.clone(),
         )
     }
 
@@ -2012,6 +2816,154 @@ mod tests {
         assert_eq!(broker.auto().len(), 1);
     }
 
+    /// A background request's credential: a request-local snapshot of a
+    /// copy of `held`, resolved through `broker`.
+    async fn background(
+        held: &Arc<RwLock<AuthState>>,
+        source: &CredentialSource,
+        broker: &ScriptedBroker,
+    ) -> Result<AuthState> {
+        let copy = held.read().await.clone();
+        AuthMethods::background_snapshot_with_broker(copy, source, broker).await
+    }
+
+    /// A background request (ping, rollover summary) under Auto keeps the
+    /// session's bound seat: served from memory while fresh, re-vended by
+    /// explicit credential when stale, never a selection. The re-vended
+    /// token is the request's own: every shared field stays as it was. A
+    /// seat that can no longer be vended, or no seat bound, fails without
+    /// selecting.
+    #[tokio::test]
+    async fn background_refresh_keeps_the_bound_seat_or_fails() {
+        let source = remote("principal-A");
+        let work = anthropic_binding(&source, &work_cred());
+
+        // Fresh: nothing vended; the held token is used.
+        let auth = bound_state(&source, &work_cred(), FRESH);
+        let broker = ScriptedBroker::new(AccountSelector::Auto);
+        let snapshot = background(&auth, &source, &broker).await.unwrap();
+        assert!(broker.explicit().is_empty() && broker.auto().is_empty());
+        assert_eq!(fields(&snapshot), fields(&*auth.read().await));
+
+        // Stale: the same seat, re-vended for this request only.
+        let auth = bound_state(&source, &work_cred(), STALE);
+        let broker = ScriptedBroker::new(AccountSelector::Auto);
+        let snapshot = background(&auth, &source, &broker).await.unwrap();
+        assert_eq!(broker.explicit(), vec!["anthropic@work"]);
+        assert!(broker.auto().is_empty(), "no selection");
+        assert_eq!(
+            fields(&snapshot),
+            (
+                "tok-explicit-anthropic@work".to_string(),
+                "oauth".to_string(),
+                None,
+                Some(u64::MAX),
+                Some(work.clone())
+            ),
+            "the request carries the re-vended token of the bound seat"
+        );
+        assert_eq!(
+            fields(&*auth.read().await),
+            fields(&*bound_state(&source, &work_cred(), STALE).read().await),
+            "a background vend never writes the shared auth state"
+        );
+
+        // Stale and the seat is gone: an error, no selection.
+        let auth = bound_state(&source, &work_cred(), STALE);
+        let mut broker = ScriptedBroker::new(AccountSelector::Auto);
+        broker.explicit_denied = vec!["anthropic@work".into()];
+        let err = background(&auth, &source, &broker).await.unwrap_err();
+        assert!(matches!(err, RuntimeError::Auth(_)), "{err:?}");
+        assert!(broker.auto().is_empty(), "no selection");
+
+        // Nothing bound (or bound on another source): no selection.
+        for bound in [None, Some(anthropic_binding(&remote("principal-B"), &work_cred()))] {
+            let auth = bound_state(&source, &work_cred(), FRESH);
+            auth.write().await.bound_credential = bound.clone();
+            let broker = ScriptedBroker::new(AccountSelector::Auto);
+            let err = background(&auth, &source, &broker).await.unwrap_err();
+            assert!(matches!(err, RuntimeError::Auth(_)), "{err:?}");
+            assert!(broker.explicit().is_empty() && broker.auto().is_empty());
+        }
+
+        // The shared refresh refuses the background point outright.
+        let auth = bound_state(&source, &work_cred(), STALE);
+        let before = fields(&*auth.read().await);
+        let broker = ScriptedBroker::new(AccountSelector::Auto);
+        let err = AuthMethods::refresh_with_broker(
+            Arc::clone(&auth),
+            &source,
+            &broker,
+            Some("claude-opus-4-7"),
+            RefreshPoint::Background,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, RuntimeError::Auth(_)), "{err:?}");
+        assert!(broker.explicit().is_empty() && broker.auto().is_empty());
+        assert_eq!(fields(&*auth.read().await), before);
+    }
+
+    /// Parity (#354 on our background point): a background request on a
+    /// seat whose whole account is cooling down is not sent and never
+    /// selects; a limit of another model's requests does not stop it.
+    #[tokio::test]
+    async fn background_snapshot_on_a_cooling_seat_is_not_sent() {
+        let source = remote("principal-A");
+        let auth = bound_state(&source, &work_cred(), STALE);
+        let mut broker = ScriptedBroker::new(AccountSelector::Auto);
+        broker.cooling = vec!["anthropic@work".into()];
+        let err = background(&auth, &source, &broker).await.unwrap_err();
+        assert!(err.to_string().contains("account cooling"), "{err}");
+        assert!(broker.explicit().is_empty() && broker.auto().is_empty());
+
+        let mut broker = ScriptedBroker::new(AccountSelector::Auto);
+        broker.model_cooling = vec![("anthropic@work".into(), "fable")];
+        let snapshot = background(&auth, &source, &broker).await.unwrap();
+        assert_eq!(snapshot.auth_token, "tok-explicit-anthropic@work");
+    }
+
+    /// Under an explicit selector a background request never binds: a
+    /// selection that no longer names the bound seat (e.g. `auth use` since
+    /// the last turn), or nothing bound yet, fails without vending. A
+    /// matching binding is served (fresh) or re-vended by name (stale).
+    #[tokio::test]
+    async fn background_refresh_under_an_explicit_selector_never_rebinds() {
+        let source = remote("principal-A");
+        let other = CredentialRef::new(
+            OAuthProviderId::Anthropic,
+            crate::auth::Account::parse("other").unwrap(),
+        );
+        let mismatched = bound_state(&source, &other, FRESH);
+        let unbound = bound_state(&source, &work_cred(), FRESH);
+        unbound.write().await.bound_credential = None;
+        for auth in [mismatched, unbound] {
+            let broker = ScriptedBroker::new(AccountSelector::Account(work_cred().account));
+            let err = background(&auth, &source, &broker).await.unwrap_err();
+            assert!(matches!(err, RuntimeError::Auth(_)), "{err:?}");
+            assert!(
+                broker.explicit().is_empty() && broker.auto().is_empty(),
+                "nothing vended"
+            );
+        }
+
+        let auth = bound_state(&source, &work_cred(), STALE);
+        let broker = ScriptedBroker::new(AccountSelector::Account(work_cred().account));
+        let snapshot = background(&auth, &source, &broker).await.unwrap();
+        assert_eq!(broker.explicit(), vec!["anthropic@work"]);
+        assert_eq!(snapshot.auth_token, "tok-explicit-anthropic@work");
+        assert_eq!(auth.read().await.auth_token, "sk-HELD", "shared untouched");
+
+        // An invalid selector never serves a token.
+        let auth = bound_state(&source, &work_cred(), FRESH);
+        let broker = ScriptedBroker::new(AccountSelector::Invalid {
+            source: "test".into(),
+            reason: "bad".into(),
+        });
+        assert!(background(&auth, &source, &broker).await.is_err());
+        assert!(broker.explicit().is_empty() && broker.auto().is_empty());
+    }
+
     /// S4: a seat this turn pinned that is now cooling down (another
     /// session met its limit) is not kept mid-turn, fresh or stale: Auto
     /// re-selects without re-vending it, so the turn's next request does
@@ -2076,6 +3028,66 @@ mod tests {
         .unwrap();
         assert_eq!(auth.read().await.auth_token, "sk-HELD");
         assert!(broker.explicit().is_empty() && broker.auto().is_empty());
+    }
+
+    /// A4: a seat this turn pinned that is cooling down for Fable's requests
+    /// only is left mid-turn by a Fable turn, fresh or stale (Auto
+    /// re-selects for that model), and kept by an Opus turn: fresh with no
+    /// broker call, stale by re-vending exactly that seat.
+    #[tokio::test]
+    async fn auto_within_turn_leaves_a_seat_cooling_for_fable_only_on_a_fable_turn() {
+        const FABLE: &str = "claude-fable-5-1";
+        const OPUS: &str = "claude-opus-5-5";
+        let source = remote("principal-A");
+        let cooling = || {
+            let mut broker = ScriptedBroker::new(AccountSelector::Auto);
+            broker.model_cooling = vec![("anthropic@work".into(), "fable")];
+            broker
+        };
+        for expires in [FRESH, STALE] {
+            let auth = bound_state(&source, &work_cred(), expires);
+            let broker = cooling();
+            AuthMethods::refresh_with_broker(
+                Arc::clone(&auth),
+                &source,
+                &broker,
+                Some(FABLE),
+                RefreshPoint::WithinTurn,
+            )
+            .await
+            .unwrap();
+            assert_eq!(auth.read().await.auth_token, "tok-auto-auto-pick", "expires {expires}");
+            assert!(broker.explicit().is_empty(), "the cooling seat is not re-vended");
+            assert_eq!(broker.auto(), vec![Some(FABLE.to_string())]);
+        }
+
+        let auth = bound_state(&source, &work_cred(), FRESH);
+        let broker = cooling();
+        AuthMethods::refresh_with_broker(
+            Arc::clone(&auth),
+            &source,
+            &broker,
+            Some(OPUS),
+            RefreshPoint::WithinTurn,
+        )
+        .await
+        .unwrap();
+        assert_eq!(auth.read().await.auth_token, "sk-HELD");
+        assert!(broker.explicit().is_empty() && broker.auto().is_empty());
+
+        let auth = bound_state(&source, &work_cred(), STALE);
+        let broker = cooling();
+        AuthMethods::refresh_with_broker(
+            Arc::clone(&auth),
+            &source,
+            &broker,
+            Some(OPUS),
+            RefreshPoint::WithinTurn,
+        )
+        .await
+        .unwrap();
+        assert_eq!(broker.explicit(), vec!["anthropic@work".to_string()]);
+        assert!(broker.auto().is_empty(), "the Opus turn keeps its seat");
     }
 
     /// An explicit selector with a stale token re-vends exactly that
@@ -3237,6 +4249,76 @@ mod tests {
         assert_eq!(g.auth_file_mtime, auth_file_mtime_now());
     }
 
+    /// A local reload with no account to recover (unbound, `Auto`) selects
+    /// anew FOR THE SESSION'S MODEL, so a limit of another model's requests
+    /// only (Fable's) does not fail an Opus session's `/auth reload`. With
+    /// no model known the selection stays model-less, which fails closed.
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn an_unbound_reload_selects_for_the_sessions_model() {
+        let _base = crate::test_env::BaseDirGuard::new();
+        let source = CredentialSource::Local;
+        for (model, expected) in [
+            (Some("claude-opus-4-7"), Some("claude-opus-4-7")),
+            (Some("anthropic/claude-opus-4-7"), Some("claude-opus-4-7")),
+            (None, None),
+        ] {
+            let auth = unloaded_local_oauth();
+            let broker = ScriptedBroker::new(AccountSelector::Auto);
+            AuthMethods::reload_with_broker(
+                Arc::clone(&auth),
+                &source,
+                &broker,
+                "sk-rejected",
+                None,
+                model,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                broker.auto(),
+                vec![expected.map(str::to_string)],
+                "model {model:?}"
+            );
+            assert!(broker.explicit().is_empty(), "model {model:?}");
+            assert_eq!(
+                auth.read().await.auth_token,
+                "tok-auto-auto-pick",
+                "model {model:?}"
+            );
+        }
+    }
+
+    /// A background snapshot follows the same mtime rule as the shared fast
+    /// path: while auth.json is unchanged the held token is used as is; once
+    /// it changed on disk, the bound seat is re-vended by name for this
+    /// request only (no selection, nothing written back).
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn background_snapshot_revends_the_bound_seat_when_auth_json_changed() {
+        let base = crate::test_env::BaseDirGuard::new();
+        write_creds_with_mtime(base.path(), "unused", 1_000_000);
+        let source = CredentialSource::Local;
+        let auth = bound_state(&source, &work_cred(), FRESH);
+        auth.write().await.auth_file_mtime = auth_file_mtime_now();
+        let broker = ScriptedBroker::new(AccountSelector::Auto);
+        let held = auth.read().await.clone();
+        let snap = AuthMethods::background_snapshot_with_broker(held.clone(), &source, &broker)
+            .await
+            .unwrap();
+        assert_eq!(snap.auth_token, "sk-HELD");
+        assert!(broker.explicit().is_empty() && broker.auto().is_empty());
+
+        write_creds_with_mtime(base.path(), "unused", 2_000_000);
+        let snap = AuthMethods::background_snapshot_with_broker(held, &source, &broker)
+            .await
+            .unwrap();
+        assert_eq!(snap.auth_token, "tok-explicit-anthropic@work");
+        assert_eq!(broker.explicit(), vec!["anthropic@work"]);
+        assert!(broker.auto().is_empty(), "no selection");
+        assert_eq!(auth.read().await.auth_token, "sk-HELD", "shared state untouched");
+    }
+
     #[tokio::test]
     #[serial_test::serial(synaps_base_dir)]
     async fn local_fast_path_keeps_token_when_auth_json_disappears() {
@@ -3292,6 +4374,7 @@ mod tests {
             &CredentialSource::Local,
             &TokenCache::new(),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -3328,6 +4411,7 @@ mod tests {
             &offline,
             &CredentialSource::Local,
             &TokenCache::new(),
+            None,
             None,
         )
         .await
@@ -3493,6 +4577,7 @@ mod tests {
             &CredentialSource::Local,
             &TokenCache::new(),
             Some("sk-old"),
+            None,
         )
         .await
         .expect("a concurrent reload already fixed it: no refresh attempted");
@@ -3524,6 +4609,7 @@ mod tests {
             &CredentialSource::Local,
             &TokenCache::new(),
             Some("sk-old"),
+            None,
         )
         .await
         .unwrap();
@@ -3553,7 +4639,8 @@ mod tests {
             &offline,
             &src,
             &cache,
-            Some("sk-revoked")
+            Some("sk-revoked"),
+            None,
         )
         .await
         .is_err());
@@ -3617,6 +4704,7 @@ mod tests {
             &source,
             &cache,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -3650,6 +4738,7 @@ mod tests {
             &source,
             &TokenCache::new(),
             Some("sk-sent"),
+            None,
         )
         .await
         .unwrap();
@@ -3671,6 +4760,7 @@ mod tests {
             &Client::new(),
             &CredentialSource::Local,
             &TokenCache::new(),
+            None,
             None,
         )
         .await
@@ -3741,6 +4831,7 @@ mod tests {
                     &CredentialSource::Local,
                     &TokenCache::new(),
                     Some("sk-revoked"),
+                    None,
                 )
                 .await
             })
@@ -3790,5 +4881,968 @@ mod tests {
         drop(lock);
         task.await.unwrap().expect("adopts the rotated token");
         assert_eq!(auth.read().await.auth_token, "sk-rotated");
+    }
+
+    // ── Capacity wait at turn start and at a round top (site 1) ──────────
+
+    use super::super::capacity_wait::{CapacityWaitPolicy, Jitter};
+    use std::time::Duration;
+    use tokio_util::sync::CancellationToken;
+
+    type Script =
+        Box<dyn Fn(Duration) -> std::result::Result<&'static str, BrokerError> + Send + Sync>;
+
+    /// Broker whose automatic selection answers by the (paused) clock's time
+    /// since the broker was made, and records when each selection ran.
+    struct ClockBroker {
+        selector: AccountSelector,
+        t0: tokio::time::Instant,
+        script: Script,
+        /// The seat this turn pinned is cooling down until this time.
+        pinned_cooling_until: Option<Duration>,
+        /// The explicit vend fails with this error.
+        explicit_error: Option<BrokerError>,
+        /// From this time on, a selection hangs this long before it
+        /// answers (by the time it answers).
+        stall: Option<(Duration, Duration)>,
+        /// The first selection at or after this time hangs this long before
+        /// it answers (by the time it answers); later ones answer at once.
+        stall_once: Option<(Duration, Duration)>,
+        stalled_once: std::sync::atomic::AtomicBool,
+        auto_at: Mutex<Vec<Duration>>,
+        explicit_calls: Mutex<Vec<String>>,
+    }
+
+    impl ClockBroker {
+        fn new(selector: AccountSelector, script: Script) -> Self {
+            Self {
+                selector,
+                t0: tokio::time::Instant::now(),
+                script,
+                pinned_cooling_until: None,
+                explicit_error: None,
+                stall: None,
+                stall_once: None,
+                stalled_once: std::sync::atomic::AtomicBool::new(false),
+                auto_at: Mutex::new(Vec::new()),
+                explicit_calls: Mutex::new(Vec::new()),
+            }
+        }
+        fn auto(script: Script) -> Self {
+            Self::new(AccountSelector::Auto, script)
+        }
+        fn auto_at(&self) -> Vec<Duration> {
+            self.auto_at.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl CredentialBroker for ClockBroker {
+        async fn access_token(
+            &self,
+            _p: OAuthProviderId,
+        ) -> std::result::Result<AccessToken, BrokerError> {
+            Err(BrokerError::Denied("legacy path must not be used".into()))
+        }
+        fn account_selector(&self, _p: OAuthProviderId) -> AccountSelector {
+            self.selector.clone()
+        }
+        fn active_cooldown(&self, _cred: &CredentialRef) -> Option<u64> {
+            self.pinned_cooling_until
+                .filter(|until| self.t0.elapsed() < *until)
+                .map(|_| FRESH)
+        }
+        async fn access_token_for(
+            &self,
+            cred: &CredentialRef,
+        ) -> std::result::Result<AccessToken, BrokerError> {
+            self.explicit_calls.lock().unwrap().push(cred.storage_key());
+            if let Some(e) = &self.explicit_error {
+                return Err(e.clone());
+            }
+            Ok(AccessToken {
+                token: format!("tok-explicit-{}", cred.storage_key()),
+                expires: u64::MAX,
+            })
+        }
+        async fn access_token_pinned_for(
+            &self,
+            provider: OAuthProviderId,
+            _model: Option<&str>,
+        ) -> std::result::Result<PinnedToken, BrokerError> {
+            let mut at = self.t0.elapsed();
+            self.auto_at.lock().unwrap().push(at);
+            if let Some((from, hang)) = self.stall {
+                if at >= from {
+                    tokio::time::sleep(hang).await;
+                    at = self.t0.elapsed();
+                }
+            }
+            if let Some((from, hang)) = self.stall_once {
+                if at >= from
+                    && !self
+                        .stalled_once
+                        .swap(true, std::sync::atomic::Ordering::SeqCst)
+                {
+                    tokio::time::sleep(hang).await;
+                    at = self.t0.elapsed();
+                }
+            }
+            let label = (self.script)(at)?;
+            Ok(PinnedToken {
+                credential: CredentialRef::new(provider, crate::auth::Account::parse(label).unwrap()),
+                token: AccessToken {
+                    token: format!("tok-auto-{label}"),
+                    expires: u64::MAX,
+                },
+            })
+        }
+        async fn proxy(&self, _r: ProxyRequest) -> std::result::Result<ProxyResponse, BrokerError> {
+            Err(BrokerError::Denied("not implemented in stub".into()))
+        }
+        async fn proxy_stream(
+            &self,
+            _r: ProxyRequest,
+        ) -> std::result::Result<ProxyByteStream, BrokerError> {
+            Err(BrokerError::Denied("not implemented in stub".into()))
+        }
+        async fn anthropic_usage(&self) -> std::result::Result<serde_json::Value, BrokerError> {
+            Err(BrokerError::Denied("not implemented in stub".into()))
+        }
+        async fn capabilities(
+            &self,
+        ) -> std::result::Result<Vec<agent_core::auth::ProviderStatus>, BrokerError> {
+            Ok(vec![])
+        }
+    }
+
+    fn wait_on() -> CapacityWaitPolicy {
+        CapacityWaitPolicy {
+            jitter: Jitter::Fixed(Duration::ZERO),
+            ..Default::default()
+        }
+    }
+
+    /// [`wait_on`] with the wait's wall clock starting at `base` and
+    /// ticking with the paused clock, as the scripted broker does: a
+    /// scripted reset at `base + 120 s` is checked exactly at 120 s, however
+    /// long the host takes between the test reading the time and the wait
+    /// starting.
+    fn wait_at(base: u64) -> CapacityWaitPolicy {
+        CapacityWaitPolicy {
+            wall_start_ms: Some(base),
+            ..wait_on()
+        }
+    }
+
+    /// The wait with the most jitter there is (60 s) on every wake-up.
+    fn max_jitter() -> CapacityWaitPolicy {
+        CapacityWaitPolicy {
+            jitter: Jitter::Fixed(crate::runtime::capacity_wait::MAX_JITTER),
+            ..Default::default()
+        }
+    }
+
+    fn cooling_until(label: &str, until_ms: u64) -> AccountFailure {
+        let mut a = account(label, AK::Exhausted);
+        a.until_ms = Some(until_ms);
+        a.cooling_down = true;
+        a
+    }
+
+    fn all_cooling(reset_ms: u64) -> BrokerError {
+        no_account(SelectionFailure {
+            kind: SK::AllCoolingDown,
+            accounts: vec![cooling_until("claude4", reset_ms)],
+            earliest_reset_ms: Some(reset_ms),
+            usage_read_retry_ms: None,
+        })
+    }
+
+    fn usage_read_failed(reset_ms: Option<u64>, retry_ms: Option<u64>) -> BrokerError {
+        let mut c2 = account("claude2", AK::UsageRateLimited);
+        c2.http_status = Some(429);
+        let mut accounts = vec![c2];
+        accounts.extend(reset_ms.map(|r| cooling_until("claude4", r)));
+        no_account(SelectionFailure {
+            kind: SK::UsageReadFailed,
+            accounts,
+            earliest_reset_ms: reset_ms,
+            usage_read_retry_ms: retry_ms,
+        })
+    }
+
+    fn seat(label: &str) -> CredentialRef {
+        CredentialRef::new(
+            OAuthProviderId::Anthropic,
+            crate::auth::Account::parse(label).unwrap(),
+        )
+    }
+
+    /// A local session with no seat pinned yet (turn start re-selects).
+    fn unbound_local() -> Arc<RwLock<AuthState>> {
+        Arc::new(RwLock::new(AuthState {
+            auth_token: "sk-HELD".into(),
+            auth_type: "oauth".into(),
+            refresh_token: None,
+            token_expires: Some(FRESH),
+            auth_file_mtime: None,
+            bound_credential: None,
+        }))
+    }
+
+    fn near(actual: Duration, expected: Duration) -> bool {
+        let gap = actual.abs_diff(expected);
+        gap <= Duration::from_secs(1)
+    }
+
+    struct Waited {
+        result: Result<()>,
+        notices: Vec<String>,
+        log: String,
+        took: Duration,
+    }
+
+    /// One refresh-or-wait through the daemon log filter. A foreign-target
+    /// INFO line is logged in the same subscriber, as a control: it must
+    /// never reach the capture.
+    async fn run_wait(
+        broker: &ClockBroker,
+        source: &CredentialSource,
+        point: RefreshPoint,
+        auth: Arc<RwLock<AuthState>>,
+        wait: Option<&CapacityWaitPolicy>,
+        cancel: &CancellationToken,
+    ) -> Waited {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let capture = LogCapture::default();
+        let t0 = tokio::time::Instant::now();
+        let result = {
+            let _guard = tracing::subscriber::set_default(capture.subscriber());
+            let result = AuthMethods::refresh_or_wait_with_broker(
+                auth,
+                source,
+                broker,
+                Some("claude-opus-4-7"),
+                point,
+                wait,
+                &tx,
+                cancel,
+            )
+            .await;
+            tracing::info!(target: "unrelated_crate::x", "foreign_info_control");
+            result
+        };
+        let took = t0.elapsed();
+        drop(tx);
+        let mut notices = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let crate::StreamEvent::Session(crate::SessionEvent::Notice(n)) = ev {
+                notices.push(n);
+            }
+        }
+        let log = capture.take();
+        assert!(!log.contains("foreign_info_control"), "the capture must filter:\n{log}");
+        assert!(!log.contains("tok-"), "a token reached the log:\n{log}");
+        Waited {
+            result,
+            notices,
+            log,
+            took,
+        }
+    }
+
+    /// `capacity_wait` lines at `phase`, in the daemon log.
+    fn wait_lines<'a>(log: &'a str, phase: &str) -> Vec<&'a str> {
+        log.lines()
+            .filter(|l| {
+                l.contains("agent_engine::runtime::capacity_wait")
+                    && (l.contains(&format!("phase=\"{phase}\"")) || l.contains(&format!("phase={phase} ")))
+            })
+            .collect()
+    }
+
+    fn has_field(line: &str, name: &str, value: &str) -> bool {
+        line.contains(&format!("{name}=\"{value}\"")) || line.contains(&format!("{name}={value}"))
+    }
+
+    /// Design test 1: every account is cooling down and one resets in
+    /// 2 min. The turn waits (one notice), selects again at the reset and
+    /// carries on bound to the new seat, logging a start and an end line
+    /// and no `turn_auth_failed`.
+    #[tokio::test(start_paused = true)]
+    async fn turn_start_with_every_account_cooling_waits_for_the_reset_then_carries_on() {
+        let base = crate::epoch_millis();
+        let reset = base + 120_000;
+        let broker = ClockBroker::auto(Box::new(move |at| {
+            if at < Duration::from_secs(120) {
+                Err(all_cooling(reset))
+            } else {
+                Ok("claude5")
+            }
+        }));
+        let source = CredentialSource::Local;
+        let auth = unbound_local();
+        let w = run_wait(
+            &broker,
+            &source,
+            RefreshPoint::TurnStart,
+            Arc::clone(&auth),
+            Some(&wait_at(base)),
+            &CancellationToken::new(),
+        )
+        .await;
+        w.result.expect("the turn carries on after the reset");
+        let at = broker.auto_at();
+        assert_eq!(at, vec![Duration::ZERO, Duration::from_secs(120)]);
+        assert_eq!(w.notices.len(), 1, "{:?}", w.notices);
+        assert!(
+            w.notices[0].starts_with("⏸ Every Anthropic account is cooling down or at a usage limit [claude4: "),
+            "{}",
+            w.notices[0]
+        );
+        assert!(w.notices[0].ends_with(", then continuing. Esc stops."), "{}", w.notices[0]);
+        let g = auth.read().await;
+        assert_eq!(g.auth_token, "tok-auto-claude5");
+        assert_eq!(
+            g.bound_credential.as_deref(),
+            Some(anthropic_binding(&source, &seat("claude5")).as_str())
+        );
+        assert!(!w.log.contains("turn_auth_failed"), "{}", w.log);
+        let start = wait_lines(&w.log, "start");
+        assert_eq!(start.len(), 1, "{}", w.log);
+        assert!(start[0].contains("INFO"), "{}", start[0]);
+        for (name, value) in [
+            ("site", "turn_start"),
+            ("kind", "all_cooling_down"),
+            ("basis", "reset"),
+            ("accounts", "claude4=exhausted"),
+        ] {
+            assert!(has_field(start[0], name, value), "{name}: {}", start[0]);
+        }
+        let end = wait_lines(&w.log, "end");
+        assert_eq!(end.len(), 1, "{}", w.log);
+        assert!(has_field(end[0], "outcome", "resumed"), "{}", end[0]);
+        assert!(has_field(end[0], "checks", "1"), "{}", end[0]);
+        assert!(has_field(end[0], "waited_s", "120"), "{}", end[0]);
+    }
+
+    /// Design test 2: Esc during the wait stops the turn at once, with no
+    /// further selection and no `turn_auth_failed`.
+    #[tokio::test(start_paused = true)]
+    async fn esc_during_the_wait_stops_the_turn_at_once() {
+        let reset = crate::epoch_millis() + 2 * 3600 * 1000;
+        let broker = ClockBroker::auto(Box::new(move |_| Err(all_cooling(reset))));
+        let cancel = CancellationToken::new();
+        let stopper = {
+            let cancel = cancel.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                cancel.cancel();
+            })
+        };
+        let w = run_wait(
+            &broker,
+            &CredentialSource::Local,
+            RefreshPoint::TurnStart,
+            unbound_local(),
+            Some(&wait_on()),
+            &cancel,
+        )
+        .await;
+        assert!(matches!(w.result, Err(RuntimeError::Canceled)), "{:?}", w.result);
+        assert!(near(w.took, Duration::from_secs(30)), "{:?}", w.took);
+        assert_eq!(broker.auto_at().len(), 1, "no selection after Esc");
+        assert_eq!(w.notices.len(), 1);
+        assert!(!w.log.contains("turn_auth_failed"), "{}", w.log);
+        let end = wait_lines(&w.log, "end");
+        assert_eq!(end.len(), 1, "{}", w.log);
+        assert!(has_field(end[0], "outcome", "canceled"), "{}", end[0]);
+        stopper.await.unwrap();
+    }
+
+    /// The error a turn ends with today (no capacity wait) for `error`.
+    async fn todays_text(error: BrokerError) -> String {
+        let broker = ClockBroker::auto(Box::new(move |_| Err(error.clone())));
+        AuthMethods::refresh_with_broker(
+            unbound_local(),
+            &CredentialSource::Local,
+            &broker,
+            Some("claude-opus-4-7"),
+            RefreshPoint::TurnStart,
+        )
+        .await
+        .expect_err("fails")
+        .to_string()
+    }
+
+    /// Design test 3: a reset days away (a weekly limit) ends the turn at
+    /// once, with today's text and no notice.
+    #[tokio::test(start_paused = true)]
+    async fn a_reset_beyond_the_bound_ends_the_turn_at_once_as_today() {
+        let reset = crate::epoch_millis() + 3 * 24 * 3600 * 1000;
+        let broker = ClockBroker::auto(Box::new(move |_| Err(all_cooling(reset))));
+        let w = run_wait(
+            &broker,
+            &CredentialSource::Local,
+            RefreshPoint::TurnStart,
+            unbound_local(),
+            Some(&wait_on()),
+            &CancellationToken::new(),
+        )
+        .await;
+        let err = w.result.expect_err("ends the turn");
+        assert_eq!(err.to_string(), todays_text(all_cooling(reset)).await);
+        assert_eq!(w.took, Duration::ZERO);
+        assert_eq!(broker.auto_at().len(), 1);
+        assert!(w.notices.is_empty(), "{:?}", w.notices);
+        assert!(turn_warn(&w.log).contains("kind=all_cooling_down"), "{}", w.log);
+        assert!(wait_lines(&w.log, "start").is_empty(), "{}", w.log);
+    }
+
+    /// Design test 4 (rulings): an explicit account, a remote broker's
+    /// refusal, a background request and a session with
+    /// `capacity_wait = false` never wait, even when a limited account
+    /// resets in 2 min. (A refused login or an action outside synaps beside
+    /// such an account waits: see the next tests.)
+    #[tokio::test(start_paused = true)]
+    async fn failures_that_never_wait_end_the_turn_at_once() {
+        let reset = crate::epoch_millis() + 120_000;
+        let explicit = AccountSelector::Account(crate::auth::Account::parse("work").unwrap());
+        let cases: Vec<(&str, ClockBroker, CredentialSource, RefreshPoint, bool)> = vec![
+            (
+                "explicit account",
+                ClockBroker {
+                    explicit_error: Some(all_cooling(reset)),
+                    ..ClockBroker::new(explicit, Box::new(move |_| Err(all_cooling(reset))))
+                },
+                CredentialSource::Local,
+                RefreshPoint::TurnStart,
+                true,
+            ),
+            (
+                "remote broker",
+                ClockBroker::auto(Box::new(move |_| Err(all_cooling(reset)))),
+                remote("principal-A"),
+                RefreshPoint::TurnStart,
+                true,
+            ),
+            (
+                "background request",
+                ClockBroker::auto(Box::new(move |_| Err(all_cooling(reset)))),
+                CredentialSource::Local,
+                RefreshPoint::Background,
+                true,
+            ),
+            (
+                "capacity_wait = false",
+                ClockBroker::auto(Box::new(move |_| Err(all_cooling(reset)))),
+                CredentialSource::Local,
+                RefreshPoint::TurnStart,
+                false,
+            ),
+        ];
+        for (case, broker, source, point, wait) in cases {
+            let policy = wait_on();
+            let w = run_wait(
+                &broker,
+                &source,
+                point,
+                unbound_local(),
+                wait.then_some(&policy),
+                &CancellationToken::new(),
+            )
+            .await;
+            assert!(w.result.is_err(), "{case}: must end the turn");
+            assert_eq!(w.took, Duration::ZERO, "{case}");
+            assert!(w.notices.is_empty(), "{case}: {:?}", w.notices);
+            assert!(wait_lines(&w.log, "start").is_empty(), "{case}: {}", w.log);
+            assert!(broker.auto_at().len() <= 1, "{case}: {:?}", broker.auto_at());
+        }
+    }
+
+    /// A refused login (`credential_rejected`) or an action outside synaps
+    /// (`action_required`) on claude5, beside claude4 at a limit until
+    /// `reset`: the failure the broker builds for it (`from_rejections`
+    /// names the kind from the accounts that are not limited).
+    fn needs_user_beside_limited(kind: SK, reset: u64) -> BrokerError {
+        let other = match kind {
+            SK::CredentialRejected => AK::RefreshRejected,
+            _ => AK::RefreshActionRequired,
+        };
+        no_account(SelectionFailure {
+            kind,
+            accounts: vec![cooling_until("claude4", reset), account("claude5", other)],
+            earliest_reset_ms: Some(reset),
+            usage_read_retry_ms: None,
+        })
+    }
+
+    /// What the notice and the WARN must say about claude5, per kind.
+    fn needs_user_words(kind: SK) -> (&'static str, &'static str) {
+        match kind {
+            SK::CredentialRejected => (
+                "claude5 needs a new login: `synaps login --provider anthropic --account claude5`.",
+                "claude5:refresh_rejected",
+            ),
+            _ => (
+                "claude5: the token refresh needs an action outside synaps;",
+                "claude5:refresh_action_required",
+            ),
+        }
+    }
+
+    /// Ruling (flip): claude4 resets in 2 min while claude5 needs a login
+    /// (or an action). The turn waits for the reset (one notice, which also
+    /// names claude5 and what it needs), selects again then and carries on,
+    /// with no `turn_auth_failed`.
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_login_or_an_action_beside_a_reset_inside_the_bound_waits_for_the_reset() {
+        for kind in [SK::CredentialRejected, SK::ActionRequired] {
+            let base = crate::epoch_millis();
+            let reset = base + 120_000;
+            let broker = ClockBroker::auto(Box::new(move |at| {
+                if at < Duration::from_secs(120) {
+                    Err(needs_user_beside_limited(kind, reset))
+                } else {
+                    Ok("claude4")
+                }
+            }));
+            let auth = unbound_local();
+            let w = run_wait(
+                &broker,
+                &CredentialSource::Local,
+                RefreshPoint::TurnStart,
+                Arc::clone(&auth),
+                Some(&wait_at(base)),
+                &CancellationToken::new(),
+            )
+            .await;
+            assert!(w.result.is_ok(), "{kind:?}: carries on after the reset: {:?}", w.result);
+            let at = broker.auto_at();
+            assert_eq!(at, vec![Duration::ZERO, Duration::from_secs(120)], "{kind:?}");
+            assert_eq!(auth.read().await.auth_token, "tok-auto-claude4", "{kind:?}");
+            assert_eq!(w.notices.len(), 1, "{kind:?}: {:?}", w.notices);
+            let (remedy, _) = needs_user_words(kind);
+            assert!(w.notices[0].contains("; waiting until "), "{kind:?}: {}", w.notices[0]);
+            assert!(w.notices[0].contains(remedy), "{kind:?}: {}", w.notices[0]);
+            assert!(w.notices[0].ends_with(" Esc stops."), "{kind:?}: {}", w.notices[0]);
+            assert!(!w.log.contains("turn_auth_failed"), "{kind:?}: {}", w.log);
+            let start = wait_lines(&w.log, "start");
+            assert_eq!(start.len(), 1, "{kind:?}: {}", w.log);
+            assert!(has_field(start[0], "kind", kind.as_str()), "{}", start[0]);
+            assert!(has_field(start[0], "basis", "reset"), "{}", start[0]);
+        }
+    }
+
+    /// Ruling (flip): the same with claude4's reset 3 days away ends the
+    /// turn at once with today's text, and its one WARN names claude5 and
+    /// what it needs.
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_login_or_an_action_beside_a_reset_days_away_ends_the_turn_at_once() {
+        for kind in [SK::CredentialRejected, SK::ActionRequired] {
+            let reset = crate::epoch_millis() + 3 * 24 * 3600 * 1000;
+            let broker =
+                ClockBroker::auto(Box::new(move |_| Err(needs_user_beside_limited(kind, reset))));
+            let w = run_wait(
+                &broker,
+                &CredentialSource::Local,
+                RefreshPoint::TurnStart,
+                unbound_local(),
+                Some(&wait_on()),
+                &CancellationToken::new(),
+            )
+            .await;
+            let err = w.result.expect_err("ends the turn");
+            assert_eq!(
+                err.to_string(),
+                todays_text(needs_user_beside_limited(kind, reset)).await,
+                "{kind:?}"
+            );
+            assert_eq!(w.took, Duration::ZERO, "{kind:?}");
+            assert_eq!(broker.auto_at().len(), 1, "{kind:?}");
+            assert!(w.notices.is_empty(), "{kind:?}: {:?}", w.notices);
+            assert!(wait_lines(&w.log, "start").is_empty(), "{kind:?}: {}", w.log);
+            let warn = turn_warn(&w.log);
+            let (_, needs) = needs_user_words(kind);
+            assert!(has_field(&warn, "kind", kind.as_str()), "{warn}");
+            assert!(has_field(&warn, "needs_login_or_action", needs), "{warn}");
+        }
+    }
+
+    /// Design test 6: usage reads failed and are held for 90 s. The turn
+    /// checks again exactly when they go to the network again, and carries
+    /// on.
+    #[tokio::test(start_paused = true)]
+    async fn unproven_capacity_checks_again_at_the_held_reads_retry_time() {
+        let base = crate::epoch_millis();
+        let retry = base + 90_000;
+        let broker = ClockBroker::auto(Box::new(move |at| {
+            if at < Duration::from_secs(90) {
+                Err(usage_read_failed(None, Some(retry)))
+            } else {
+                Ok("claude2")
+            }
+        }));
+        let auth = unbound_local();
+        let w = run_wait(
+            &broker,
+            &CredentialSource::Local,
+            RefreshPoint::TurnStart,
+            Arc::clone(&auth),
+            Some(&wait_at(base)),
+            &CancellationToken::new(),
+        )
+        .await;
+        w.result.expect("carries on once capacity is proven");
+        let at = broker.auto_at();
+        assert_eq!(at, vec![Duration::ZERO, Duration::from_secs(90)]);
+        assert_eq!(auth.read().await.auth_token, "tok-auto-claude2");
+        assert_eq!(w.notices.len(), 1);
+        assert!(
+            w.notices[0].starts_with("⏸ Reading account usage failed, so capacity is unproven"),
+            "{}",
+            w.notices[0]
+        );
+        assert!(w.notices[0].contains("checking again for up to 30 min"), "{}", w.notices[0]);
+    }
+
+    /// Ruling: unproven capacity with no reset inside the bound waits at
+    /// most 30 min, then the turn ends as today (one WARN, today's text).
+    #[tokio::test(start_paused = true)]
+    async fn unproven_capacity_ends_the_turn_after_30_min() {
+        let broker = ClockBroker::auto(Box::new(move |_| Err(usage_read_failed(None, None))));
+        let w = run_wait(
+            &broker,
+            &CredentialSource::Local,
+            RefreshPoint::TurnStart,
+            unbound_local(),
+            Some(&wait_on()),
+            &CancellationToken::new(),
+        )
+        .await;
+        let err = w.result.expect_err("the turn ends after 30 min");
+        assert_eq!(err.to_string(), todays_text(usage_read_failed(None, None)).await);
+        // The last check starts 5 s before the 30 min, and the turn ends
+        // after it.
+        assert!(near(w.took, Duration::from_secs(30 * 60 - 5)), "{:?}", w.took);
+        assert_eq!(broker.auto_at().len(), 31, "the first selection and a check a minute");
+        assert_eq!(w.notices.len(), 1, "{:?}", w.notices);
+        assert!(turn_warn(&w.log).contains("kind=usage_read_failed"), "{}", w.log);
+        let end = wait_lines(&w.log, "end");
+        assert_eq!(end.len(), 1, "{}", w.log);
+        assert!(has_field(end[0], "outcome", "bound"), "{}", end[0]);
+        assert!(has_field(end[0], "basis", "unproven"), "{}", end[0]);
+    }
+
+    /// The mixed case (ruling): usage reads failed while a limited account
+    /// resets in 2 h. The turn is still waiting after 30 (and 40) min,
+    /// checks at least every 10 min, and carries on at the reset.
+    #[tokio::test(start_paused = true)]
+    async fn unproven_capacity_beside_a_reset_inside_the_bound_waits_for_the_reset() {
+        let base = crate::epoch_millis();
+        let reset = base + 2 * 3600 * 1000;
+        let broker = ClockBroker::auto(Box::new(move |at| {
+            if at < Duration::from_secs(2 * 3600) {
+                Err(usage_read_failed(Some(reset), None))
+            } else {
+                Ok("claude4")
+            }
+        }));
+        let w = run_wait(
+            &broker,
+            &CredentialSource::Local,
+            RefreshPoint::TurnStart,
+            unbound_local(),
+            Some(&wait_at(base)),
+            &CancellationToken::new(),
+        )
+        .await;
+        w.result.expect("carries on at the reset");
+        let at = broker.auto_at();
+        assert_eq!(*at.last().unwrap(), Duration::from_secs(2 * 3600), "{at:?}");
+        let max_gap = at.windows(2).map(|p| p[1] - p[0]).max().unwrap();
+        assert!(max_gap <= Duration::from_secs(10 * 60), "a gap of {max_gap:?}");
+        assert!(at.len() >= 13, "{at:?}");
+        assert_eq!(w.notices.len(), 1, "{:?}", w.notices);
+        assert!(w.notices[0].contains("; waiting until "), "{}", w.notices[0]);
+        let start = wait_lines(&w.log, "start");
+        assert!(has_field(start[0], "basis", "reset"), "{}", start[0]);
+        assert!(has_field(start[0], "kind", "usage_read_failed"), "{}", start[0]);
+    }
+
+    /// A round top whose pinned seat is cooling down, with no other
+    /// account: the turn waits, and once the cooldown ends it keeps the
+    /// pinned seat (and its prompt cache).
+    #[tokio::test(start_paused = true)]
+    async fn a_round_top_waits_for_its_pinned_seat_and_keeps_it() {
+        let base = crate::epoch_millis();
+        let reset = base + 120_000;
+        let broker = ClockBroker {
+            pinned_cooling_until: Some(Duration::from_secs(120)),
+            ..ClockBroker::auto(Box::new(move |_| Err(all_cooling(reset))))
+        };
+        let source = CredentialSource::Local;
+        let auth = bound_state(&source, &work_cred(), FRESH);
+        let w = run_wait(
+            &broker,
+            &source,
+            RefreshPoint::WithinTurn,
+            Arc::clone(&auth),
+            Some(&wait_at(base)),
+            &CancellationToken::new(),
+        )
+        .await;
+        w.result.expect("carries on with the pinned seat");
+        assert_eq!(w.took, Duration::from_secs(120));
+        assert_eq!(broker.auto_at().len(), 1, "no re-selection once the seat is back");
+        let g = auth.read().await;
+        assert_eq!(g.auth_token, "sk-HELD", "the pinned seat's token is kept");
+        assert_eq!(
+            g.bound_credential.as_deref(),
+            Some(anthropic_binding(&source, &work_cred()).as_str())
+        );
+        let start = wait_lines(&w.log, "start");
+        assert_eq!(start.len(), 1, "{}", w.log);
+        assert!(has_field(start[0], "site", "round_top"), "{}", start[0]);
+    }
+
+    // ── The wait's hard bounds (review B1) ───────────────────────────────
+
+    const TEN_MIN: Duration = Duration::from_secs(10 * 60);
+    const HALF_HOUR: Duration = Duration::from_secs(30 * 60);
+
+    /// No two checks (selection starts) more than 10 min apart.
+    fn assert_cadence(at: &[Duration]) {
+        for pair in at.windows(2) {
+            assert!(pair[1] - pair[0] <= TEN_MIN, "a gap of {:?} in {at:?}", pair[1] - pair[0]);
+        }
+    }
+
+    /// B1: with the most jitter there is on every wake-up, unproven
+    /// capacity still ends the turn within its 30 min, with no check after
+    /// them, and the turn ends as today.
+    #[tokio::test(start_paused = true)]
+    async fn max_jitter_keeps_an_unproven_wait_inside_its_30_min() {
+        let broker = ClockBroker::auto(Box::new(move |_| Err(usage_read_failed(None, None))));
+        let w = run_wait(
+            &broker,
+            &CredentialSource::Local,
+            RefreshPoint::TurnStart,
+            unbound_local(),
+            Some(&max_jitter()),
+            &CancellationToken::new(),
+        )
+        .await;
+        let err = w.result.expect_err("the turn ends");
+        assert_eq!(err.to_string(), todays_text(usage_read_failed(None, None)).await);
+        assert!(w.took <= HALF_HOUR, "took {:?}", w.took);
+        assert!(w.took >= HALF_HOUR - Duration::from_secs(120), "took {:?}", w.took);
+        let at = broker.auto_at();
+        assert!(at.iter().all(|t| *t <= HALF_HOUR), "{at:?}");
+        assert_cadence(&at);
+        assert!(turn_warn(&w.log).contains("kind=usage_read_failed"), "{}", w.log);
+        let end = wait_lines(&w.log, "end");
+        assert_eq!(end.len(), 1, "{}", w.log);
+        assert!(has_field(end[0], "outcome", "bound"), "{}", end[0]);
+    }
+
+    /// B1: with the most jitter on every wake-up, a reset-based wait checks
+    /// at least every 10 min and ends within 5 h 15 min (the reset sits at
+    /// the bound's edge and the account never comes back).
+    #[tokio::test(start_paused = true)]
+    async fn max_jitter_keeps_a_reset_wait_inside_5_h_15_min_and_10_min_checks() {
+        let bound = crate::runtime::capacity_wait::RESET_BOUND;
+        let reset = crate::epoch_millis() + bound.as_millis() as u64 - 1_000;
+        let broker = ClockBroker::auto(Box::new(move |_| Err(all_cooling(reset))));
+        let w = run_wait(
+            &broker,
+            &CredentialSource::Local,
+            RefreshPoint::TurnStart,
+            unbound_local(),
+            Some(&max_jitter()),
+            &CancellationToken::new(),
+        )
+        .await;
+        let err = w.result.expect_err("the turn ends at the bound");
+        assert_eq!(err.to_string(), todays_text(all_cooling(reset)).await);
+        assert!(w.took <= bound, "took {:?}", w.took);
+        assert!(w.took >= bound - Duration::from_secs(120), "took {:?}", w.took);
+        let at = broker.auto_at();
+        assert!(at.iter().all(|t| *t <= bound), "{at:?}");
+        assert_cadence(&at);
+        assert!(at.len() >= 32, "{} checks: {at:?}", at.len());
+        let end = wait_lines(&w.log, "end");
+        assert_eq!(end.len(), 1, "{}", w.log);
+        assert!(has_field(end[0], "outcome", "bound"), "{}", end[0]);
+    }
+
+    /// B1: a check that hangs is cut at the bound, and its answer (a
+    /// success) doesn't count: the turn ends as today at 30 min, with the
+    /// held state untouched.
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_check_is_cut_at_the_bound_and_its_late_success_does_not_count() {
+        let late = Duration::from_secs(25 * 60);
+        let broker = ClockBroker {
+            stall: Some((late, Duration::from_secs(2 * 3600))),
+            ..ClockBroker::auto(Box::new(move |at| {
+                if at < late {
+                    Err(usage_read_failed(None, None))
+                } else {
+                    Ok("claude2")
+                }
+            }))
+        };
+        let auth = unbound_local();
+        let w = run_wait(
+            &broker,
+            &CredentialSource::Local,
+            RefreshPoint::TurnStart,
+            Arc::clone(&auth),
+            Some(&wait_on()),
+            &CancellationToken::new(),
+        )
+        .await;
+        let err = w.result.expect_err("the stalled check is cut at the bound");
+        assert_eq!(err.to_string(), todays_text(usage_read_failed(None, None)).await);
+        assert!(near(w.took, HALF_HOUR), "took {:?}", w.took);
+        assert!(near(*broker.auto_at().last().unwrap(), late), "{:?}", broker.auto_at());
+        assert_eq!(auth.read().await.auth_token, "sk-HELD", "the late success is not bound");
+        assert!(turn_warn(&w.log).contains("kind=usage_read_failed"), "{}", w.log);
+        let end = wait_lines(&w.log, "end");
+        assert_eq!(end.len(), 1, "{}", w.log);
+        assert!(has_field(end[0], "outcome", "bound"), "{}", end[0]);
+    }
+
+    /// Review r2 B1b: a check that stalls at ~minute 9 of a reset-based wait
+    /// is dropped at the next cadence point (10 min after it started, less
+    /// the jitter), and the next check starts at once: no two selections
+    /// start more than 10 min apart, with no jitter or the most there is.
+    /// The dropped check never answers, so its late success never binds;
+    /// the wait carries on at the reset with the account found then.
+    #[tokio::test(start_paused = true)]
+    async fn a_check_that_stalls_is_dropped_at_the_cadence_and_its_late_answer_never_binds() {
+        let s = Duration::from_secs;
+        for (jitter, expected) in [
+            (Duration::ZERO, vec![s(0), s(600), s(1200), s(1800), s(2400)]),
+            (
+                crate::runtime::capacity_wait::MAX_JITTER,
+                vec![s(0), s(540), s(1080), s(1620), s(2160), s(2460)],
+            ),
+        ] {
+            let base = crate::epoch_millis();
+            let reset = base + 40 * 60_000;
+            let broker = ClockBroker {
+                stall_once: Some((s(8 * 60), s(2 * 3600))),
+                ..ClockBroker::auto(Box::new(move |at| {
+                    if at >= s(2 * 3600) {
+                        // Only the stalled check could answer this late.
+                        Ok("claude2")
+                    } else if at >= s(40 * 60) {
+                        Ok("claude3")
+                    } else {
+                        Err(all_cooling(reset))
+                    }
+                }))
+            };
+            let policy = CapacityWaitPolicy {
+                jitter: Jitter::Fixed(jitter),
+                ..wait_at(base)
+            };
+            let auth = unbound_local();
+            let w = run_wait(
+                &broker,
+                &CredentialSource::Local,
+                RefreshPoint::TurnStart,
+                Arc::clone(&auth),
+                Some(&policy),
+                &CancellationToken::new(),
+            )
+            .await;
+            w.result.expect("the wait carries on at the reset");
+            let at = broker.auto_at();
+            assert_eq!(at, expected, "selection starts with jitter {jitter:?}");
+            assert_cadence(&at);
+            assert_eq!(auth.read().await.auth_token, "tok-auto-claude3", "jitter {jitter:?}");
+            let cut = wait_lines(&w.log, "check_timeout");
+            assert_eq!(cut.len(), 1, "{}", w.log);
+            assert!(cut[0].contains("INFO"), "{}", cut[0]);
+            assert!(has_field(cut[0], "site", "turn_start"), "{}", cut[0]);
+            assert!(has_field(cut[0], "kind", "all_cooling_down"), "{}", cut[0]);
+            let end = wait_lines(&w.log, "end");
+            assert_eq!(end.len(), 1, "{}", w.log);
+            assert!(has_field(end[0], "outcome", "resumed"), "{}", end[0]);
+            // Long past the time the stalled check would have answered,
+            // nothing else has run or bound.
+            tokio::time::sleep(s(3 * 3600)).await;
+            assert_eq!(auth.read().await.auth_token, "tok-auto-claude3", "jitter {jitter:?}");
+            assert_eq!(broker.auto_at(), expected, "jitter {jitter:?}");
+        }
+    }
+
+    /// B1: the host sleeps through the bound (the wall clock jumps 6 h
+    /// ahead while the monotonic one stands still). The wait ends at its
+    /// next wake-up, without another check.
+    #[tokio::test(start_paused = true)]
+    async fn a_suspend_past_the_bound_ends_the_wait_without_another_check() {
+        let policy = wait_on();
+        let jump = {
+            let shift = policy.wall_shift.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(150)).await;
+                shift.set(6 * 3600 * 1000);
+            })
+        };
+        let broker = ClockBroker::auto(Box::new(move |_| Err(usage_read_failed(None, None))));
+        let w = run_wait(
+            &broker,
+            &CredentialSource::Local,
+            RefreshPoint::TurnStart,
+            unbound_local(),
+            Some(&policy),
+            &CancellationToken::new(),
+        )
+        .await;
+        jump.await.unwrap();
+        let err = w.result.expect_err("the turn ends");
+        assert_eq!(err.to_string(), todays_text(usage_read_failed(None, None)).await);
+        let at = broker.auto_at();
+        assert!(
+            at.iter().all(|t| *t < Duration::from_secs(150)),
+            "no check after the jump: {at:?}"
+        );
+        assert!(w.took <= Duration::from_secs(150) + Duration::from_secs(61), "took {:?}", w.took);
+        let end = wait_lines(&w.log, "end");
+        assert_eq!(end.len(), 1, "{}", w.log);
+        assert!(has_field(end[0], "outcome", "bound"), "{}", end[0]);
+    }
+
+    /// B1: a wall clock stepped back 2 h doesn't stretch the wait: the
+    /// monotonic clock keeps the 30 min.
+    #[tokio::test(start_paused = true)]
+    async fn a_clock_stepped_back_keeps_the_30_min_bound() {
+        let policy = wait_on();
+        let step = {
+            let shift = policy.wall_shift.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(150)).await;
+                shift.set(-2 * 3600 * 1000);
+            })
+        };
+        let broker = ClockBroker::auto(Box::new(move |_| Err(usage_read_failed(None, None))));
+        let w = run_wait(
+            &broker,
+            &CredentialSource::Local,
+            RefreshPoint::TurnStart,
+            unbound_local(),
+            Some(&policy),
+            &CancellationToken::new(),
+        )
+        .await;
+        step.await.unwrap();
+        assert!(w.result.is_err(), "the turn ends");
+        assert!(w.took <= HALF_HOUR, "took {:?}", w.took);
+        assert!(w.took >= HALF_HOUR - Duration::from_secs(60), "took {:?}", w.took);
+        assert_cadence(&broker.auto_at());
     }
 }

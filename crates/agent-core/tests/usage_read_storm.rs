@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use agent_core::auth::{
     AccountFailureKind, AccountPolicy, AccountSelector, BrokerError, CredentialBroker, LocalBroker,
-    OAuthProviderId, SelectionFailure, SelectionFailureKind,
+    OAuthProviderId, SelectionFailure, SelectionFailureKind, TestClock,
 };
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
@@ -199,8 +199,9 @@ const LATER: Answer = Answer::Ok {
 const LIMITED: Answer = Answer::Status(429);
 
 /// The wall: the usage endpoint answers 429 for every account. An account
-/// with a good reading from minutes ago stays selectable (it was a real
-/// request each time), and the chosen account stays chosen.
+/// with a good reading from minutes ago stays selectable, and the chosen
+/// account stays chosen. The first 429 (a real request) pauses every other
+/// usage read, so b is not asked at all.
 #[tokio::test]
 #[serial_test::serial]
 async fn every_usage_read_rate_limited_with_a_recent_good_reading_still_selects() {
@@ -219,7 +220,11 @@ async fn every_usage_read_rate_limited_with_a_recent_good_reading_still_selects(
             .expect("a usage-endpoint 429 must not end the turn while a recent good reading exists"),
         "a"
     );
-    assert_eq!((up.hits("a"), up.hits("b")), (2, 2), "the failed reads were real requests");
+    assert_eq!(
+        (up.hits("a"), up.hits("b")),
+        (2, 1),
+        "a's failed read was a real request; b's waits for the pause"
+    );
 }
 
 /// No good reading to fall back on: the selection refuses, typed as a
@@ -276,11 +281,12 @@ async fn every_usage_read_failing_and_no_good_reading_refuses_with_the_read_time
     assert!(f.login_labels().is_empty(), "{f:?}");
     assert!(!err.to_string().contains("SECRET"));
 
-    // A 5xx on one account: still a held read failure with a read time.
+    // A 5xx on one account: still a held read failure with a read time. (The
+    // 429 comes second: it pauses every later usage read.)
     let _home = install(&["a", "b"]);
     let up = Upstream::default();
-    up.set("a", LIMITED);
-    up.set("b", Answer::Status(503));
+    up.set("a", Answer::Status(503));
+    up.set("b", LIMITED);
     let broker = auto_broker(&up.spawn().await);
     let err = chosen(&broker).await.unwrap_err();
     let f = failure_of(&err);
@@ -288,8 +294,8 @@ async fn every_usage_read_failing_and_no_good_reading_refuses_with_the_read_time
     assert_eq!(
         kinds(f),
         vec![
-            ("a".into(), AccountFailureKind::UsageRateLimited, Some(429)),
-            ("b".into(), AccountFailureKind::UsageUpstream, Some(503)),
+            ("a".into(), AccountFailureKind::UsageUpstream, Some(503)),
+            ("b".into(), AccountFailureKind::UsageRateLimited, Some(429)),
         ]
     );
     assert!(f.usage_read_retry_ms.is_some(), "a 503 is held too: {f:?}");
@@ -298,13 +304,13 @@ async fn every_usage_read_failing_and_no_good_reading_refuses_with_the_read_time
     // time, and only the refused account needs a login.
     let _home = install(&["a", "b"]);
     let up = Upstream::default();
-    up.set("a", LIMITED);
-    up.set("b", Answer::Status(401));
+    up.set("a", Answer::Status(401));
+    up.set("b", LIMITED);
     let broker = auto_broker(&up.spawn().await);
     let err = chosen(&broker).await.unwrap_err();
     let f = failure_of(&err);
     assert_eq!(f.kind, SelectionFailureKind::UsageReadFailed, "{f:?}");
-    assert_eq!(f.login_labels(), vec!["b"], "{f:?}");
+    assert_eq!(f.login_labels(), vec!["a"], "{f:?}");
     assert!(f.usage_read_retry_ms.is_some(), "{f:?}");
 }
 
@@ -338,8 +344,9 @@ async fn a_good_reading_with_an_exhausted_window_is_never_graced() {
 }
 
 /// Concurrent failing reads of one account from TWO brokers in one process
-/// send ONE request; a later read inside the hold (same or a new broker)
-/// sends none. Concurrent successful reads are shared the same way.
+/// send ONE request (and its 429 pauses the other account's read: one in
+/// all); a later read inside the hold (same or a new broker) sends none.
+/// Concurrent successful reads are shared the same way.
 #[tokio::test]
 #[serial_test::serial]
 async fn concurrent_failing_reads_from_two_brokers_send_one_request_per_account() {
@@ -353,7 +360,7 @@ async fn concurrent_failing_reads_from_two_brokers_send_one_request_per_account(
         one.plan(OAuthProviderId::Anthropic, None),
         two.plan(OAuthProviderId::Anthropic, None)
     );
-    assert_eq!((up.hits("a"), up.hits("b")), (1, 1), "one request per account");
+    assert_eq!((up.hits("a"), up.hits("b")), (1, 0), "one request in all");
     for plan in [p1.unwrap(), p2.unwrap()] {
         assert!(plan.rows.iter().all(|r| r.rank.is_none()), "both saw the failure");
     }
@@ -363,7 +370,7 @@ async fn concurrent_failing_reads_from_two_brokers_send_one_request_per_account(
     assert!(chosen(&three).await.is_err());
     assert_eq!(
         (up.hits("a"), up.hits("b")),
-        (1, 1),
+        (1, 0),
         "a held failed read sends no request, whichever broker asks"
     );
 
@@ -404,12 +411,12 @@ async fn a_slot_re_logged_to_another_account_is_never_graced_on_the_old_reading(
         "a",
         "the same account after a token rotation is still graced"
     );
-    assert_eq!((up.hits("a"), up.hits("b")), (2, 2));
+    assert_eq!((up.hits("a"), up.hits("b")), (2, 1), "a's 429 pauses b's read");
 
     write_slots(home.path(), &[("a", Some("acct-other"), "3"), ("b", Some("acct-b"), "1")]);
     assert_eq!(chosen(&broker).await.unwrap(), "b");
     assert_eq!(chosen(&auto_broker(&url)).await.unwrap(), "b", "a new broker too");
-    assert_eq!((up.hits("a"), up.hits("b")), (2, 2), "no request inside the hold");
+    assert_eq!((up.hits("a"), up.hits("b")), (2, 1), "no request inside the hold");
 }
 
 /// Unidentified Anthropic slots (no account id stored: an older login, or a
@@ -436,13 +443,28 @@ async fn an_unidentified_slot_is_graced_only_for_the_credential_that_was_read() 
         "a",
         "the same credential is graced on its own reading"
     );
+    // Merged rule (ours): the first 429 pauses every other usage read, as
+    // in a_slot_re_logged_to_another_account_is_never_graced_on_the_old_reading.
+    assert_eq!(
+        (up.hits("a"), up.hits("b")),
+        (2, 1),
+        "a's 429 pauses b's read"
+    );
 
     // Slot `a` now holds other refresh material (a re-login to another
     // Anthropic account looks exactly like this without an account id).
     write_slots(home.path(), &[("a", None, "2"), ("b", None, "1")]);
     assert_eq!(chosen(&broker).await.unwrap(), "b");
-    assert_eq!(chosen(&auto_broker(&url)).await.unwrap(), "b", "a new broker too");
-    assert_eq!((up.hits("a"), up.hits("b")), (2, 2), "no request inside the hold");
+    assert_eq!(
+        chosen(&auto_broker(&url)).await.unwrap(),
+        "b",
+        "a new broker too"
+    );
+    assert_eq!(
+        (up.hits("a"), up.hits("b")),
+        (2, 1),
+        "no request inside the hold"
+    );
 }
 
 /// Codex: a good reading that does not list the requested model (a generic
@@ -517,4 +539,35 @@ async fn auth_state_clear_releases_a_held_usage_read() {
     broker.auth_state(&agent_core::auth::AuthStateQuery { clear: true, ..query }).unwrap();
     assert_eq!(chosen(&auto_broker(&url)).await.unwrap(), "a");
     assert_eq!((up.hits("a"), up.hits("b")), (2, 3));
+}
+
+/// p1-r1 LOW2: the pinned account's 10 min reuse, the pause and the saved
+/// readings are Anthropic's only. A Codex account that automatic selection
+/// is pinned to is read again once its reading is over 60 s old, and its
+/// readings are never saved, even by the table that writes them.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_pinned_codex_account_is_read_again_after_60s_and_never_saved() {
+    let codex = OAuthProviderId::OpenAiCodex;
+    let home = install_codex("x", "acct-x");
+    let up = Upstream::default();
+    up.set("acct-x", LATER);
+    let clock = TestClock::default();
+    let broker = LocalBroker::new(reqwest::Client::new())
+        .with_usage_endpoint_override(up.spawn().await)
+        .with_test_clock(&clock)
+        .with_new_saving_usage_table();
+    let label = |p: agent_core::auth::PinnedToken| p.credential.account.label_str().to_string();
+    assert_eq!(label(broker.access_token_auto(codex, None).await.unwrap()), "x");
+    assert_eq!(up.hits("acct-x"), 1);
+    clock.advance(Duration::from_secs(59));
+    assert_eq!(label(broker.access_token_auto(codex, None).await.unwrap()), "x");
+    assert_eq!(up.hits("acct-x"), 1, "reused under 60 s");
+    clock.advance(Duration::from_secs(2));
+    assert_eq!(label(broker.access_token_auto(codex, None).await.unwrap()), "x");
+    assert_eq!(up.hits("acct-x"), 2, "read again past 60 s");
+    assert!(
+        !home.path().join("usage-last-good.json").exists(),
+        "a Codex reading was saved"
+    );
 }

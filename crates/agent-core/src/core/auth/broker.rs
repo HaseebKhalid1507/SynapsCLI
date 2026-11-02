@@ -191,8 +191,12 @@ pub enum BrokerError {
         provider: String,
         capability: String,
     },
-    /// Transport-level failure talking to the broker or the provider.
+    /// Transport-level failure talking to the broker or the provider, after
+    /// the request may have been sent (or with that unknown).
     Transport(String),
+    /// No connection to the broker or the provider could be established:
+    /// no byte of the request was sent.
+    ConnectFailed(String),
     /// Credential storage/refresh failure (message is already secret-free).
     Credential(String),
     /// An explicitly requested account slot does not exist. Never a fallback.
@@ -216,6 +220,45 @@ pub enum BrokerError {
     /// a busy refresh lock or a transient network/provider failure apart
     /// from an unusable login. Message is secret-free.
     Refresh(super::token::RefreshFailure),
+}
+
+impl BrokerError {
+    /// True when the broker failed or refused the request before any byte
+    /// of it reached the upstream provider (unknown provider, policy, missing
+    /// or failed credential, broker machine auth, no connection). An explicit
+    /// allowlist: a new variant must be classified here, never free by
+    /// default. [`BrokerError::ConnectFailed`] is only produced where no
+    /// redirect can have been followed first.
+    pub fn request_not_sent(&self) -> bool {
+        match self {
+            Self::UnknownProvider(_)
+            | Self::RegistrationRequired { .. }
+            | Self::NotConfigured(_)
+            | Self::Unauthorized
+            | Self::Denied(_)
+            | Self::UnsupportedCapability { .. }
+            | Self::ConnectFailed(_)
+            | Self::Credential(_) => true,
+            // Account resolution and selection (including the remote
+            // broker's token vend reporting no capacity) fail before any
+            // upstream request exists. A path that recovers after sending
+            // (Muse's 401 re-mint) returns the upstream 401 when recovery
+            // fails, and its later failures (bearer, retry), these and
+            // `Credential` included, as `Transport`.
+            Self::UnknownAccount { .. }
+            | Self::UnsupportedAccount { .. }
+            | Self::InvalidAccount(_)
+            | Self::NoAccountAvailable { .. } => true,
+            Self::Transport(_) => false,
+            // Only `recover_rejected_token` produces it, after the upstream
+            // answered 401: the request was sent (as 1e4fa8ac types a Muse
+            // recovery failure after a sent request).
+            Self::Refresh(_) => false,
+            // Dev #253: a remote broker without an account-listing or usage
+            // operation answers before any upstream request exists.
+            Self::BrokerTooOld(_) => true,
+        }
+    }
 }
 
 impl std::fmt::Display for BrokerError {
@@ -242,7 +285,9 @@ impl std::fmt::Display for BrokerError {
                 "cloud provider '{provider}' is text-only: {capability} are not supported yet \
                  (no credential was used and no network request was made)"
             ),
-            Self::Transport(msg) => write!(f, "broker transport error: {msg}"),
+            Self::Transport(msg) | Self::ConnectFailed(msg) => {
+                write!(f, "broker transport error: {msg}")
+            }
             Self::Credential(msg) => write!(f, "credential error: {msg}"),
             Self::Refresh(failure) => {
                 use super::token::RefreshFailureKind as K;
@@ -630,6 +675,40 @@ pub enum CloudEvent {
 }
 pub type CloudEventStream = Pin<Box<dyn Stream<Item = Result<CloudEvent, BrokerError>> + Send>>;
 
+/// A failed [`CredentialBroker::usage_or_last_known`] read.
+#[derive(Debug)]
+pub struct UsageReadFailure {
+    /// The error [`CredentialBroker::usage`] gives for the same read.
+    pub error: BrokerError,
+    /// Set when the usage endpoint rate-limited the read (HTTP 429): this
+    /// read's own 429, a held one, or the pause another account's 429
+    /// started. Times and a reading only, no token material.
+    pub rate_limited: Option<RateLimitedRead>,
+}
+
+impl UsageReadFailure {
+    /// A failure that carries nothing but its error.
+    pub fn plain(error: BrokerError) -> Self {
+        Self {
+            error,
+            rate_limited: None,
+        }
+    }
+}
+
+/// What a rate-limited usage read ([`UsageReadFailure::rate_limited`])
+/// can still show.
+#[derive(Debug, Clone)]
+pub struct RateLimitedRead {
+    /// When this process sends the account's next usage request (epoch
+    /// ms): the end of the read's hold, or of the pause.
+    pub retry_at_ms: u64,
+    /// The account's last good reading, only if it was read from the
+    /// account stored in the slot now. It keeps the time it was read
+    /// (`observed_at`).
+    pub last_good: Option<super::usage::UsageSnapshot>,
+}
+
 /// The typed credential broker protocol. One implementation runs in-process
 /// ([`LocalBroker`]) so normal local use needs no daemon; the other talks to a
 /// remote `synaps auth-broker` over authenticated HTTP(S) ([`RemoteBroker`]).
@@ -744,6 +823,21 @@ pub trait CredentialBroker: Send + Sync {
         })
     }
 
+    /// [`usage`](Self::usage) as `synaps status` shows it: a broker may
+    /// answer with a recent reading it holds instead of a request, and a
+    /// read the usage endpoint rate-limited may come with when the next
+    /// request goes out and the account's last good reading
+    /// ([`UsageReadFailure`]). Default: [`usage`](Self::usage), with a
+    /// failure that carries nothing more.
+    async fn usage_or_last_known(
+        &self,
+        cred: &CredentialRef,
+    ) -> Result<super::usage::UsageSnapshot, Box<UsageReadFailure>> {
+        self.usage(cred)
+            .await
+            .map_err(|error| Box::new(UsageReadFailure::plain(error)))
+    }
+
     /// Report that `cred` hit a provider limit so automatic selection stops
     /// advertising it until `until_ms` (epoch ms; `None` = a short default).
     /// Best effort; default implementation is a no-op.
@@ -783,6 +877,32 @@ pub trait CredentialBroker: Send + Sync {
     /// [`access_token_for`]: Self::access_token_for
     async fn access_token_for_auto(&self, cred: &CredentialRef) -> Result<AccessToken, BrokerError> {
         self.access_token_for(cred).await
+    }
+
+    /// Report that `cred` hit a provider limit that applies only to requests
+    /// for `model` (a token of the model id the provider names, such as
+    /// `fable`), until `until_ms`, so automatic selection stops choosing it
+    /// for those requests; other models keep it. Best effort. Default: the
+    /// whole account cools down ([`report_cooldown`](Self::report_cooldown)),
+    /// which never chooses an account more often than before.
+    async fn report_model_cooldown(
+        &self,
+        cred: &CredentialRef,
+        model: &str,
+        until_ms: Option<u64>,
+        reason: &str,
+    ) -> Result<(), BrokerError> {
+        let _ = model;
+        self.report_cooldown(cred, until_ms, reason).await
+    }
+
+    /// When `cred`'s active cooldown for a request for `model` ends (epoch
+    /// ms): the whole account's, or one reported for a model the request
+    /// names; with no model, any of them. No network request and no token
+    /// refresh. Default: [`active_cooldown`](Self::active_cooldown).
+    fn active_cooldown_for(&self, cred: &CredentialRef, model: Option<&str>) -> Option<u64> {
+        let _ = model;
+        self.active_cooldown(cred)
     }
 
     /// Execute a non-streaming provider request with the broker-owned key.
@@ -1752,19 +1872,36 @@ pub struct LocalBroker {
     >,
     /// Successful vends only, scoped by model and immutable seat identity.
     current_accounts: SharedMap<(CredentialRef, SeatIdentity)>,
-    /// In-memory cooldowns for automatic selection, keyed by storage key.
-    cooldowns: Arc<std::sync::Mutex<BTreeMap<String, Cooldown>>>,
+    /// In-memory cooldowns for automatic selection, keyed by storage key:
+    /// the whole account's, and limits of one model's requests.
+    cooldowns: Arc<std::sync::Mutex<BTreeMap<String, KeyCooldowns>>>,
     /// Test seam: overrides the usage endpoint for typed usage snapshots.
     usage_endpoint_override: Option<String>,
-    /// Max age of a usage observation that still counts as capacity.
+    /// Max age of a reused reading of an account a selection is about to
+    /// switch to, and of the pinned account near its limit.
     max_snapshot_age: Duration,
+    /// Max age of a reused reading of any other account, before its share of
+    /// `idle_snapshot_spread`.
+    idle_snapshot_age: Duration,
+    /// Spread of the idle accounts' max age over the provider's listing.
+    idle_snapshot_spread: Duration,
+    /// Max age of a reused reading of the account a selection is pinned to
+    /// while it shows room (near its limit: `max_snapshot_age`).
+    pinned_snapshot_age: Duration,
+    /// A test clock: when set, automatic selection and its usage cache take
+    /// the time from it instead of the wall clock (only a `TestClock` sets
+    /// it, with the `testing` feature).
+    clock: Option<Arc<std::sync::atomic::AtomicU64>>,
     /// Short-lived cache of the last usage snapshot per *seat key* (credential
     /// file + storage key + [`SeatIdentity`] of the stored credential) so
     /// automatic selection does not re-poll every provider on every token
     /// vend. A re-login, removal or profile switch changes the key, so a
     /// reading can never be attributed to a different seat than the one it
-    /// was taken from. Entries older than `max_snapshot_age` are never reused.
-    snapshots: SharedMap<super::usage::UsageSnapshot>,
+    /// was taken from. An entry past its account's max age, or one with a
+    /// reset that has passed since it was read, is never reused, and
+    /// neither is one cached before the slot's reading was dropped (its
+    /// epoch in the usage-read table moved, through any broker).
+    snapshots: SharedMap<CachedReading>,
     /// Process-wide usage-read table (single-flight per slot, held failed
     /// reads, last good readings); see [`super::usage_reads`].
     usage_reads: Arc<super::usage_reads::UsageReads>,
@@ -1773,6 +1910,8 @@ pub struct LocalBroker {
     /// Cached account policy keyed by the config file's modification time
     /// (env overlay is applied on every read; it is cheap and has no I/O).
     policy_cache: Arc<std::sync::Mutex<Option<CachedPolicy>>>,
+    /// `http` is known never to follow redirects ([`Self::without_redirects`]).
+    redirect_free: bool,
     /// What `synaps auth state` shows per slot (credential file + storage
     /// key): the last usage read and the last successful one. Diagnostic
     /// only; selection never reads it.
@@ -1822,6 +1961,16 @@ struct SlotObservations {
 /// Process-shared map keyed by storage key or seat key.
 type SharedMap<T> = Arc<std::sync::Mutex<BTreeMap<String, T>>>;
 
+/// A broker's cached usage reading of a seat, and the slot's epoch in the
+/// usage-read table ([`super::usage_reads::UsageReads::epoch`]) when the
+/// broker looked it up, before the reading was taken: a drop of the slot's
+/// reading since then ends the copy.
+#[derive(Clone)]
+struct CachedReading {
+    snapshot: super::usage::UsageSnapshot,
+    epoch: u64,
+}
+
 /// The accounts that failed earlier in one automatic selection (storage key
 /// → why): a failed refresh of the chosen seat or a failed usage read. They
 /// count as failed for the rest of that selection, without a new request.
@@ -1838,6 +1987,66 @@ struct Cooldown {
     /// When it was reported (epoch ms): only a request sent after this
     /// clears it ([`CredentialBroker::clear_cooldown`]).
     reported_at_ms: u64,
+}
+
+impl Cooldown {
+    /// A limit reported until `until_ms`: a missing or past one lasts the
+    /// default length from now, and none lasts longer than the maximum. The
+    /// reason is bounded.
+    fn reported(until_ms: Option<u64>, reason: &str) -> Self {
+        let now_ms = crate::epoch_millis();
+        let max_until = now_ms.saturating_add(MAX_COOLDOWN.as_millis() as u64);
+        Self {
+            until_ms: until_ms
+                .filter(|t| *t > now_ms)
+                .unwrap_or(now_ms + DEFAULT_COOLDOWN.as_millis() as u64)
+                .min(max_until),
+            reason: crate::truncate_str(reason, 64).to_string(),
+            reported_at_ms: now_ms,
+        }
+    }
+
+    fn active_at(&self, now_ms: u64) -> bool {
+        self.until_ms > now_ms
+    }
+}
+
+/// The limits reported under one cooldown key: the whole account's, and
+/// limits of one model's requests by the model token the provider names
+/// (`fable`: Fable's weekly limit). In memory only, as every cooldown.
+#[derive(Debug, Clone, Default)]
+struct KeyCooldowns {
+    all: Option<Cooldown>,
+    models: BTreeMap<String, Cooldown>,
+}
+
+impl KeyCooldowns {
+    /// The whole account's cooldown, while active at `now_ms`.
+    fn account_at(&self, now_ms: u64) -> Option<&Cooldown> {
+        self.all.as_ref().filter(|c| c.active_at(now_ms))
+    }
+
+    /// The latest cooldown active at `now_ms` that stops a request for
+    /// `model`: the whole account's, or one of a model the request names
+    /// ([`super::quota_policy::model_matches`]). With no model (the CLI's
+    /// token, the keeper) every one counts: a request of an unknown model
+    /// never passes a limit, as for a model's usage window.
+    fn for_request_at(&self, model: Option<&str>, now_ms: u64) -> Option<&Cooldown> {
+        let models = self
+            .models
+            .iter()
+            .filter(move |(limited, _)| {
+                model.is_none_or(|model| {
+                    super::quota_policy::model_matches(limited.as_str(), model)
+                })
+            })
+            .map(|(_, cooldown)| cooldown);
+        self.all
+            .iter()
+            .chain(models)
+            .filter(|c| c.active_at(now_ms))
+            .max_by_key(|c| c.until_ms)
+    }
 }
 
 /// The keys one account's cooldown is kept under
@@ -1905,6 +2114,8 @@ struct SlotHold {
     provider: OAuthProviderId,
     /// Set when this call was answered from the hold (no exchange).
     answered: std::sync::atomic::AtomicBool,
+    /// A refusal drops the slot's usage reading too.
+    drop: ReadingDrop,
 }
 
 impl SlotHold {
@@ -1931,8 +2142,9 @@ impl super::token::RefusalMemory for SlotHold {
         None
     }
 
-    /// Holds a refusal (`Credential` / `ActionRequired`) of `creds`; a
-    /// retryable kind is never held. Store failures never arrive here.
+    /// Holds a refusal (`Credential` / `ActionRequired`) of `creds`, and
+    /// drops the slot's usage reading ([`ReadingDrop`]); a retryable kind is
+    /// never held. Store failures never arrive here.
     fn refused(&self, creds: &super::OAuthCredentials, failure: &super::token::RefreshFailure) {
         use super::token::RefreshFailureKind as R;
         if !matches!(failure.kind, R::Credential | R::ActionRequired) {
@@ -1947,15 +2159,128 @@ impl super::token::RefusalMemory for SlotHold {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(self.key.clone(), hold);
+        self.drop.drop_reading();
+    }
+}
+
+/// Drops one slot's usage reading when the provider refuses its login
+/// (p1-r1 B6): the broker's cached readings of the slot, its last good
+/// reading in the usage-read table, and, in the writer, its saved copy, so
+/// neither a reuse nor the grace outlives the refusal, across a reload too.
+/// As a [`super::token::RefusalMemory`] of its own (an explicit account, a
+/// rejected token's recovery) it holds nothing: it only drops.
+struct ReadingDrop {
+    reads: Arc<super::usage_reads::UsageReads>,
+    /// [`LocalBroker::read_key`] of the slot.
+    key: String,
+    scope: super::usage_reads::ReadScope,
+    snapshots: SharedMap<CachedReading>,
+    /// The slot's part of a [`LocalBroker::seat_key`].
+    seat_part: String,
+    /// The broker's test clock, if it has one.
+    clock: Option<Arc<std::sync::atomic::AtomicU64>>,
+}
+
+impl ReadingDrop {
+    /// Drop the reading. The saved readings are loaded first, so a saved
+    /// one is dropped even if this process has not read the slot; the save
+    /// is synchronous (the writer's file follows the drop at once).
+    fn drop_reading(&self) {
+        self.snapshots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|k, _| !k.contains(&self.seat_part));
+        let now_ms = match &self.clock {
+            Some(clock) => clock.load(std::sync::atomic::Ordering::SeqCst),
+            None => crate::epoch_millis(),
+        };
+        self.reads.load_saved(&self.scope, now_ms);
+        if self.reads.forget_last_good(&self.key, now_ms) {
+            self.reads.save(&self.scope, now_ms);
+        }
+    }
+}
+
+impl super::token::RefusalMemory for ReadingDrop {
+    fn held(&self, _creds: &super::OAuthCredentials) -> Option<super::token::RefreshFailure> {
+        None
+    }
+
+    /// A refusal (`Credential` / `ActionRequired`) drops the reading.
+    fn refused(&self, _creds: &super::OAuthCredentials, failure: &super::token::RefreshFailure) {
+        use super::token::RefreshFailureKind as R;
+        if matches!(failure.kind, R::Credential | R::ActionRequired) {
+            self.drop_reading();
+        }
     }
 }
 
 /// Longest cooldown a client report may impose (a weekly window plus slack);
 /// anything longer is clamped so a bad report cannot bench a seat forever.
 const MAX_COOLDOWN: Duration = Duration::from_secs(8 * 24 * 60 * 60);
-/// Default staleness bound for automatic selection. Short on purpose: a
-/// selection is a spend decision and should rest on a fresh reading.
+/// Default staleness bound for an account automatic selection is about to
+/// switch to, and for the account it is pinned to once that one is near its
+/// limit ([`DEFAULT_NEAR_LIMIT_PERCENT`]). Short on purpose: a switch is a
+/// spend decision and should rest on a fresh reading.
 pub const DEFAULT_MAX_SNAPSHOT_AGE: Duration = Duration::from_secs(60);
+/// Default age up to which a reading of any other account is reused. Such a
+/// reading only ranks the account: before a selection switches to it, the
+/// account is read again under [`DEFAULT_MAX_SNAPSHOT_AGE`].
+pub const DEFAULT_IDLE_SNAPSHOT_AGE: Duration = Duration::from_secs(10 * 60);
+/// Default spread over the idle accounts' re-read clocks: account `i` of `n`
+/// in the provider's listing is reused up to
+/// `DEFAULT_IDLE_SNAPSHOT_AGE + spread * i / n`, so their re-reads fall on
+/// different turn starts instead of in one burst.
+pub const DEFAULT_IDLE_SNAPSHOT_SPREAD: Duration = Duration::from_secs(2 * 60);
+/// Default age up to which the reading of the Anthropic account automatic
+/// selection is pinned to is reused while it shows room (no window of the
+/// request at [`DEFAULT_NEAR_LIMIT_PERCENT`] or more). Another provider's
+/// pinned account is read again past [`DEFAULT_MAX_SNAPSHOT_AGE`]. A
+/// provider limit on the message request itself still cools the account
+/// down at once.
+pub const DEFAULT_PINNED_SNAPSHOT_AGE: Duration = Duration::from_secs(10 * 60);
+/// Utilization (percent) of a window of the request at which the pinned
+/// account is near its limit: its reading is then reused only up to
+/// [`DEFAULT_NEAR_LIMIT_SNAPSHOT_AGE`], unless it shows the account's paid
+/// extra usage off.
+pub const DEFAULT_NEAR_LIMIT_PERCENT: f64 = 90.0;
+/// Default age up to which the pinned account's reading is reused near its
+/// limit (a spent window can be billed as extra usage instead of limited).
+/// Not for a reading that shows extra usage off: a spent window then
+/// answers the message request with a limit, which cools the account and
+/// moves the request on, so it keeps the pinned age.
+pub const DEFAULT_NEAR_LIMIT_SNAPSHOT_AGE: Duration = DEFAULT_MAX_SNAPSHOT_AGE;
+
+/// A manual clock for automatic-selection tests
+/// ([`LocalBroker::with_test_clock`]): it starts at the wall clock's time
+/// and moves only when the test advances it. Only with the `testing`
+/// feature; a production build has neither the type nor the setter.
+#[cfg(any(test, feature = "testing"))]
+#[derive(Debug, Clone)]
+pub struct TestClock(Arc<std::sync::atomic::AtomicU64>);
+
+#[cfg(any(test, feature = "testing"))]
+impl Default for TestClock {
+    fn default() -> Self {
+        Self(Arc::new(std::sync::atomic::AtomicU64::new(
+            crate::epoch_millis(),
+        )))
+    }
+}
+
+#[cfg(any(test, feature = "testing"))]
+impl TestClock {
+    /// The clock's time (epoch ms).
+    pub fn now_ms(&self) -> u64 {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Move the clock forward by `by`.
+    pub fn advance(&self, by: Duration) {
+        self.0
+            .fetch_add(by.as_millis() as u64, std::sync::atomic::Ordering::SeqCst);
+    }
+}
 
 /// Idle timeout between bytes on the broker's per-request no-redirect
 /// client (Muse, Kimi, Gemini, Codex/Anthropic catalog). Matches the runtime
@@ -1977,6 +2302,7 @@ impl LocalBroker {
     pub fn new(http: reqwest::Client) -> Self {
         let cloud_backend = Arc::new(ProductionCloudBackend::new(http.clone()));
         Self {
+            redirect_free: false,
             http,
             local_base_url: None,
             anthropic_usage_url: None,
@@ -1995,6 +2321,10 @@ impl LocalBroker {
             cooldowns: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
             usage_endpoint_override: None,
             max_snapshot_age: DEFAULT_MAX_SNAPSHOT_AGE,
+            idle_snapshot_age: DEFAULT_IDLE_SNAPSHOT_AGE,
+            idle_snapshot_spread: DEFAULT_IDLE_SNAPSHOT_SPREAD,
+            pinned_snapshot_age: DEFAULT_PINNED_SNAPSHOT_AGE,
+            clock: None,
             snapshots: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
             usage_reads: super::usage_reads::process_table(),
             instance: next_broker_instance(),
@@ -2005,6 +2335,33 @@ impl LocalBroker {
             seat_cache: Arc::new(std::sync::Mutex::new(None)),
             seat_loads: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
+    }
+
+    /// The same broker on a client that never follows redirects, for
+    /// bounded single-attempt requests: a 3xx is returned as an (answered)
+    /// error status, and a refused connection can then only mean that no
+    /// byte of the request was sent. Without this a refused connection is
+    /// not typed as not-sent, because a redirect may already have delivered
+    /// the request to an earlier hop.
+    ///
+    /// Fails closed: when no such client can be built the broker is not
+    /// returned at all, so a bounded request is never sent on a client that
+    /// follows redirects.
+    pub fn without_redirects(self) -> Result<Self, BrokerError> {
+        self.with_redirect_free_http(redirect_free_http())
+    }
+
+    /// [`Self::without_redirects`] with the result of
+    /// [`redirect_free_http`] (`None`: it could not be built). Private: only
+    /// that factory's client may be marked redirect-free.
+    fn with_redirect_free_http(
+        mut self,
+        http: Option<reqwest::Client>,
+    ) -> Result<Self, BrokerError> {
+        let http = http.ok_or_else(redirect_free_unavailable)?;
+        self.http = http;
+        self.redirect_free = true;
+        Ok(self)
     }
 
     pub fn with_cloud_backend(mut self, backend: Arc<dyn CloudBackend>) -> Self {
@@ -2039,8 +2396,9 @@ impl LocalBroker {
                 return policy.clone();
             }
         }
-        let (policy, warnings) =
-            super::AutoSelectionPolicy::from_config_map(&crate::config::load_config().auth.auto);
+        let auth = crate::config::load_config().auth;
+        let (policy, warnings) = super::AutoSelectionPolicy::from_config_map(&auth.auto);
+        let policy = policy.with_order_config(&auth.order);
         for warning in warnings {
             tracing::warn!(%warning, "automatic account policy");
         }
@@ -2132,10 +2490,80 @@ impl LocalBroker {
         self
     }
 
-    /// Bound on usage-snapshot age for automatic selection.
+    /// Bound on usage-snapshot age for automatic selection, the same for
+    /// every account (no longer idle bound, no spread).
     pub fn with_max_snapshot_age(mut self, age: Duration) -> Self {
         self.max_snapshot_age = age;
+        self.idle_snapshot_age = age;
+        self.idle_snapshot_spread = Duration::ZERO;
+        self.pinned_snapshot_age = age;
         self
+    }
+
+    /// Age up to which the pinned account's reading is reused while it
+    /// shows room ([`DEFAULT_PINNED_SNAPSHOT_AGE`]).
+    pub fn with_pinned_snapshot_age(mut self, age: Duration) -> Self {
+        self.pinned_snapshot_age = age;
+        self
+    }
+
+    /// Test seam: automatic selection and its usage cache take the time
+    /// from `clock` instead of the wall clock, and every usage reading this
+    /// broker takes is stamped with the clock's time (the resets a reading
+    /// reports stay absolute times). The usage-read table's holds and pauses
+    /// take this broker's time too; a last good reading keeps the wall
+    /// clock's time of its read. Only with the `testing` feature.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn with_test_clock(mut self, clock: &TestClock) -> Self {
+        self.clock = Some(clock.0.clone());
+        self
+    }
+
+    /// Test seam: this broker reads usage through a usage-read table of its
+    /// own, empty, instead of the process's: what a broker sees after a
+    /// daemon reload. Only with the `testing` feature.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn with_new_usage_table(mut self) -> Self {
+        self.usage_reads = Arc::new(super::usage_reads::UsageReads::default());
+        self
+    }
+
+    /// Test seam: [`with_new_usage_table`](Self::with_new_usage_table), and
+    /// that table asks to write the saved readings of this store, as the
+    /// daemon's does (it writes them if no other table holds their lease).
+    /// Only with the `testing` feature.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn with_new_saving_usage_table(self) -> Self {
+        let broker = self.with_new_usage_table();
+        let saved = storage::auth_file_path().with_file_name(super::usage_reads::SAVED_READINGS_FILE);
+        broker.usage_reads.write_saved_readings(&saved);
+        broker
+    }
+
+    /// Test seam: this broker's usage-read table stops writing the saved
+    /// readings and frees their lease, as the daemon's does at its shutdown.
+    /// Only with the `testing` feature.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn stop_saving_usage_readings(&self) {
+        self.usage_reads.stop_writing();
+    }
+
+    /// Test seam: this broker reads usage through `other`'s usage-read
+    /// table, as two brokers of one process do. Only with the `testing`
+    /// feature.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn sharing_usage_table_with(mut self, other: &LocalBroker) -> Self {
+        self.usage_reads = other.usage_reads.clone();
+        self
+    }
+
+    /// Now (epoch ms) for automatic selection and its usage cache: the test
+    /// clock's time when one is set, else the wall clock's.
+    fn now_ms(&self) -> u64 {
+        match &self.clock {
+            Some(clock) => clock.load(std::sync::atomic::Ordering::SeqCst),
+            None => crate::epoch_millis(),
+        }
     }
 
     /// Effective policy: injected, else env > config > default. The config
@@ -2232,31 +2660,65 @@ impl LocalBroker {
         self.seat_loads.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Whether any cooldown is active at `now_ms`.
+    /// Whether any cooldown is active at `now_ms`: a whole account's, or a
+    /// limit of one model's requests.
     fn any_cooldown_active(&self, now_ms: u64) -> bool {
         self.cooldowns
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .values()
-            .any(|c| c.until_ms > now_ms)
+            .any(|key| key.for_request_at(None, now_ms).is_some())
     }
 
-    /// `cred`'s active cooldown: the latest one under its keys.
+    /// `cred`'s active cooldown of the whole account: the latest one under
+    /// its keys. A limit of one model's requests is not one (the listing
+    /// and `auth state` show the whole account's only).
     fn active_cooldown_at(&self, cred: &CredentialRef, now_ms: u64) -> Option<Cooldown> {
+        self.latest_cooldown(cred, |key| key.account_at(now_ms))
+    }
+
+    /// `cred`'s active cooldown for a request for `model`
+    /// ([`KeyCooldowns::for_request_at`]): the latest one under its keys.
+    fn cooldown_for_at(
+        &self,
+        cred: &CredentialRef,
+        model: Option<&str>,
+        now_ms: u64,
+    ) -> Option<Cooldown> {
+        self.latest_cooldown(cred, |key| key.for_request_at(model, now_ms))
+    }
+
+    /// The latest of the cooldowns `pick` takes from `cred`'s keys.
+    fn latest_cooldown(
+        &self,
+        cred: &CredentialRef,
+        pick: impl Fn(&KeyCooldowns) -> Option<&Cooldown>,
+    ) -> Option<Cooldown> {
         // Nothing cooling, nothing to look up: no read of the stored login
         // (a turn asks before every request).
-        if !self.any_cooldown_active(now_ms) {
+        if !self
+            .cooldowns
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .any(|key| pick(key).is_some())
+        {
             return None;
         }
-        self.cooldown_for_keys(&self.cooldown_keys(cred), now_ms)
+        self.cooldown_for_keys(&self.cooldown_keys(cred), pick)
     }
 
-    /// The latest active cooldown under `keys`.
-    fn cooldown_for_keys(&self, keys: &CooldownKeys, now_ms: u64) -> Option<Cooldown> {
+    /// The latest of the cooldowns `pick` takes under `keys` (worked out
+    /// once per selection: [`Self::selection_plan`]).
+    fn cooldown_for_keys(
+        &self,
+        keys: &CooldownKeys,
+        pick: impl Fn(&KeyCooldowns) -> Option<&Cooldown>,
+    ) -> Option<Cooldown> {
         let cooldowns = self.cooldowns.lock().unwrap_or_else(|e| e.into_inner());
         keys.read()
             .filter_map(|key| cooldowns.get(key))
-            .filter(|c| c.until_ms > now_ms)
+            .filter_map(&pick)
             .max_by_key(|c| c.until_ms)
             .cloned()
     }
@@ -2314,6 +2776,9 @@ impl LocalBroker {
         }
         for cred in creds {
             self.forget_snapshots(cred);
+            // The last good reading through the drop path (its saved copy
+            // too, so a restart does not bring it back), then the hold.
+            self.reading_drop(cred).drop_reading();
             self.usage_reads.forget(&self.read_key(cred));
         }
         {
@@ -2608,14 +3073,28 @@ impl LocalBroker {
         }
     }
 
-    fn cached_snapshot(&self, key: &str) -> Option<super::usage::UsageSnapshot> {
-        let max_age_ms = self.max_snapshot_age.as_millis() as u64;
-        let now_ms = crate::epoch_millis();
-        self.snapshots
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+    /// The cached reading for `key` while it is no older than `max_age` and
+    /// no reset it reports has passed since it was read (that window has
+    /// started again, so the reading is out of date). A reading cached at
+    /// another epoch than the slot's `epoch` now (its reading was dropped
+    /// since, through any broker of the process) is removed, never used.
+    fn cached_snapshot(
+        &self,
+        key: &str,
+        max_age: Duration,
+        epoch: u64,
+    ) -> Option<super::usage::UsageSnapshot> {
+        let max_age_ms = max_age.as_millis() as u64;
+        let now_ms = self.now_ms();
+        let mut snapshots = self.snapshots.lock().unwrap_or_else(|e| e.into_inner());
+        if snapshots.get(key).is_some_and(|cached| cached.epoch != epoch) {
+            snapshots.remove(key);
+            return None;
+        }
+        snapshots
             .get(key)
-            .filter(|s| !s.is_stale(now_ms, max_age_ms))
+            .map(|cached| &cached.snapshot)
+            .filter(|s| !s.is_stale(now_ms, max_age_ms) && !s.reset_since_observed(now_ms))
             .cloned()
     }
 
@@ -2630,6 +3109,56 @@ impl LocalBroker {
         )
     }
 
+    /// Where `cred`'s readings are saved (beside its credential store), and
+    /// which reads a usage 429 on it pauses: every Anthropic slot of the
+    /// store at the same usage endpoint. No other provider has the pause.
+    fn read_scope(&self, cred: &CredentialRef) -> super::usage_reads::ReadScope {
+        self.store_scope(cred.provider)
+    }
+
+    /// [`Self::read_scope`] of any slot of `provider` in the credential store.
+    fn store_scope(&self, provider: OAuthProviderId) -> super::usage_reads::ReadScope {
+        let store = storage::auth_file_path();
+        let endpoint = self.usage_endpoint_override.as_deref().unwrap_or("");
+        let prefix = format!("{}|", store.display());
+        let anthropic = provider == OAuthProviderId::Anthropic;
+        super::usage_reads::ReadScope {
+            saved: store.with_file_name(super::usage_reads::SAVED_READINGS_FILE),
+            pause: anthropic.then(|| format!("{prefix}{}|{endpoint}", provider.as_str())),
+            store: prefix,
+            persisted: anthropic,
+        }
+    }
+
+    /// Prune the usage readings of `provider`'s slots (at this broker's
+    /// usage endpoint) that the store's listing `listed` no longer has, so
+    /// the writer's next saves leave them out (p1-r1 SF4). The store's saved
+    /// readings are loaded first (p1-r2 SF1), so a saved reading of a slot
+    /// that left the store is pruned too; a reading such a slot gets after
+    /// this (a direct usage read, or a first read in flight) stays until a
+    /// later selection prunes it (see `usage_reads::UsageReads::keep_listed`).
+    /// Providers without saved readings are left alone.
+    fn keep_listed_readings(&self, provider: OAuthProviderId, listed: &[AccountSummary]) {
+        if provider != OAuthProviderId::Anthropic {
+            return;
+        }
+        let keys: std::collections::HashSet<String> = listed
+            .iter()
+            .filter_map(AccountSummary::credential_ref)
+            .map(|cred| self.read_key(&cred))
+            .collect();
+        let prefix = format!("{}|", storage::auth_file_path().display());
+        let suffix = format!("|{}", self.usage_endpoint_override.as_deref().unwrap_or(""));
+        let covers = |key: &str| {
+            key.strip_prefix(prefix.as_str())
+                .and_then(|rest| rest.strip_suffix(suffix.as_str()))
+                .and_then(CredentialRef::parse_storage_key)
+                .is_some_and(|cred| cred.provider == provider)
+        };
+        self.usage_reads
+            .keep_listed(&self.store_scope(provider), covers, &keys, self.now_ms());
+    }
+
     /// Drop every cached reading for `cred`'s slot (any seat). The
     /// single-flight gate lives in the process-wide usage-read table and is
     /// never dropped, so this cannot open a second flight.
@@ -2642,7 +3171,7 @@ impl LocalBroker {
     }
 
     /// Fresh usage snapshot for `cred` plus the seat it was read from: the
-    /// short-lived cache is consulted first (never past `max_snapshot_age`,
+    /// cache is consulted first (never past `max_age` or a passed reset,
     /// and only for the seat currently stored in the slot), otherwise the
     /// process-wide usage-read table: ONE read per slot at a time across
     /// every broker in the process, and a held failed read is answered
@@ -2652,7 +3181,8 @@ impl LocalBroker {
     async fn fresh_usage(
         &self,
         cred: &CredentialRef,
-    ) -> Result<(super::usage::UsageSnapshot, SeatIdentity), super::usage_reads::ReadError> {
+        max_age: Duration,
+    ) -> Result<(super::usage::UsageSnapshot, SeatIdentity, u64), super::usage_reads::ReadError> {
         if let Some(held) = self.held_refresh(cred) {
             return Err(Self::held_read(cred, held).into_read_error());
         }
@@ -2660,19 +3190,55 @@ impl LocalBroker {
             .stored_seat(cred)
             .map_err(|e| UsageReadError::slot(e).into_read_error())?;
         let key = Self::seat_key(cred, &seat);
-        if let Some(cached) = self.cached_snapshot(&key) {
-            return Ok((cached, seat));
+        // The slot's epoch before anything is looked up or read: a cached
+        // copy is used, and the reading this returns is cached and handed
+        // back, only at it. A drop between here and a read's admission
+        // costs at most one extra read later (the copy is cached at the
+        // older epoch), and a selection holding the reading treats it as
+        // superseded.
+        let read_key = self.read_key(cred);
+        let epoch = self.usage_reads.epoch(&read_key);
+        if let Some(cached) = self.cached_snapshot(&key, max_age, epoch) {
+            return Ok((cached, seat, epoch));
         }
-        let (snapshot, used) = self.shared_read(cred).await?;
+        // A reading saved before this process started (a restart, a
+        // reload) counts as a cached one, at its original age, until this
+        // process reads the slot.
+        let now_ms = self.now_ms();
+        self.usage_reads.load_saved(&self.read_scope(cred), now_ms);
+        if let Some(saved) = self
+            .usage_reads
+            .saved_reading(&read_key, &seat)
+            .filter(|s| {
+                !s.is_stale(now_ms, max_age.as_millis() as u64) && !s.reset_since_observed(now_ms)
+            })
+        {
+            self.snapshots.lock().unwrap_or_else(|e| e.into_inner()).insert(
+                key,
+                CachedReading {
+                    snapshot: saved.clone(),
+                    epoch,
+                },
+            );
+            return Ok((saved, seat, epoch));
+        }
+        let (mut snapshot, used) = self.shared_read(cred).await?;
+        if self.clock.is_some() {
+            // Under a test clock, a reading is taken at the clock's time.
+            snapshot.observed_at = self.now_ms();
+        }
         // One slot holds one seat: a reading for its current content
         // supersedes anything cached for a previous occupant.
         self.forget_snapshots(cred);
         let used_key = Self::seat_key(cred, &used);
-        self.snapshots
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(used_key, snapshot.clone());
-        Ok((snapshot, used))
+        self.snapshots.lock().unwrap_or_else(|e| e.into_inner()).insert(
+            used_key,
+            CachedReading {
+                snapshot: snapshot.clone(),
+                epoch,
+            },
+        );
+        Ok((snapshot, used, epoch))
     }
 
     /// Read-only usage for `cred` through the process-wide usage-read table,
@@ -2688,6 +3254,107 @@ impl LocalBroker {
         self.shared_read(cred)
             .await
             .map_err(|e| UsageReadError::from_read(&e))
+    }
+
+    /// [`CredentialBroker::usage_or_last_known`]: what `synaps status`
+    /// shows of `cred`'s usage. A saved reading of the account stored in
+    /// the slot now, at most [`Self::status_reuse_age`] old (the inclusive
+    /// bound of [`UsageSnapshot::is_stale`]) and with no reset passed
+    /// since, is shown without a request, unless the slot's failed read is
+    /// held or the reads are paused. Otherwise one read as
+    /// [`CredentialBroker::usage`] does, through the process-wide
+    /// usage-read table, which sends nothing while the slot's failed read
+    /// is held or the reads are paused. A read the usage endpoint
+    /// rate-limited (its own 429, a held one, or the pause) also gives when
+    /// this process reads the slot next and the slot's last good reading,
+    /// only if it was read from the account stored there now: during the
+    /// pause, a saved reading recent enough to show is that last good
+    /// reading, so the row doesn't turn on the reading's age. Writes no
+    /// saved readings itself: only the table holding their lease (the
+    /// daemon's) writes them.
+    ///
+    /// [`UsageSnapshot::is_stale`]: super::usage::UsageSnapshot::is_stale
+    async fn last_known_usage(
+        &self,
+        cred: &CredentialRef,
+    ) -> Result<super::usage::UsageSnapshot, Box<UsageReadFailure>> {
+        use super::usage_reads::ReadError;
+        let plain = |error: BrokerError| Box::new(UsageReadFailure::plain(error));
+        if let Some(held) = self.held_refresh(cred) {
+            return Err(plain(Self::held_read(cred, held).error));
+        }
+        let key = self.read_key(cred);
+        let scope = self.read_scope(cred);
+        let now_ms = self.now_ms();
+        self.usage_reads.load_saved(&scope, now_ms);
+        // While the slot's failed read is held or the reads are paused, no
+        // saved reading is shown as a success: the read below sends nothing
+        // and gives the hold's or the pause's failure (a usage 429: the
+        // rate-limited form, with the saved reading as the last good one).
+        // An unreadable or empty slot is not reused; its read below fails
+        // as `usage` does.
+        let held = self.usage_reads.held_at(&key, now_ms).is_some()
+            || self.usage_reads.paused_at(&scope, now_ms).is_some();
+        let recent = if held {
+            None
+        } else {
+            self.stored_seat(cred).ok().and_then(|seat| {
+                self.usage_reads.saved_reading(&key, &seat).filter(|s| {
+                    !s.is_stale(now_ms, self.status_reuse_age(cred, s).as_millis() as u64)
+                        && !s.reset_since_observed(now_ms)
+                })
+            })
+        };
+        if let Some(saved) = recent {
+            tracing::debug!(
+                credential = %cred,
+                "usage read not sent: the saved reading is recent enough to show"
+            );
+            return Ok(saved);
+        }
+        match self.shared_read(cred).await {
+            Ok((snapshot, _)) => Ok(snapshot),
+            Err(ReadError::Transient {
+                failure,
+                retry_at_ms,
+            }) if failure.is_rate_limited() => {
+                // The account stored now (it may have changed during the
+                // read): never another account's reading.
+                let last_good = self
+                    .stored_seat(cred)
+                    .ok()
+                    .and_then(|seat| self.usage_reads.last_good_for(&key, &seat));
+                Err(Box::new(UsageReadFailure {
+                    error: failure.to_broker_error(),
+                    rate_limited: Some(RateLimitedRead {
+                        retry_at_ms,
+                        last_good,
+                    }),
+                }))
+            }
+            Err(e) => Err(plain(e.to_broker_error())),
+        }
+    }
+
+    /// How old a saved reading of `cred` may be when `synaps status` shows
+    /// it instead of a request: the age at which automatic selection reads
+    /// the account it is pinned to again. For an Anthropic account that is
+    /// [`DEFAULT_PINNED_SNAPSHOT_AGE`] while the reading shows room, or
+    /// shows the account's paid extra usage off; near its limit
+    /// ([`DEFAULT_NEAR_LIMIT_PERCENT`] on any window) with extra usage on
+    /// or unknown, and for any other provider's account,
+    /// `max_snapshot_age`.
+    fn status_reuse_age(
+        &self,
+        cred: &CredentialRef,
+        snapshot: &super::usage::UsageSnapshot,
+    ) -> Duration {
+        let capacity = capacity_from_snapshot(cred, snapshot);
+        if near_its_limit(&capacity, None) && capacity.extra_usage_enabled != Some(false) {
+            self.max_snapshot_age
+        } else {
+            self.pinned_age_for(cred.provider)
+        }
     }
 
     /// Key of a slot's `auth state` records: credential file + storage key.
@@ -2741,7 +3408,21 @@ impl LocalBroker {
             key: Self::state_key(cred),
             provider: cred.provider,
             answered: std::sync::atomic::AtomicBool::new(false),
+            drop: self.reading_drop(cred),
         })
+    }
+
+    /// What drops `cred`'s usage reading when its login is refused
+    /// ([`ReadingDrop`]).
+    fn reading_drop(&self, cred: &CredentialRef) -> ReadingDrop {
+        ReadingDrop {
+            reads: self.usage_reads.clone(),
+            key: self.read_key(cred),
+            scope: self.read_scope(cred),
+            snapshots: self.snapshots.clone(),
+            seat_part: format!("|{}|", cred.storage_key()),
+            clock: self.clock.clone(),
+        }
     }
 
     /// A usage read of an account whose refused refresh is held: no refresh
@@ -2823,24 +3504,34 @@ impl LocalBroker {
     /// INFO line (account label, outcome, failure kind/status; no token).
     /// A read that went to the network (or joined one in flight) is
     /// recorded for `synaps auth state`; a held read sends nothing and is
-    /// not a new read.
+    /// not a new read, and a superseded one (a good reading that landed
+    /// after the slot's reading was dropped) is no observation: its line
+    /// says `outcome=superseded`, and nothing is recorded.
     async fn shared_read(&self, cred: &CredentialRef) -> super::usage_reads::ReadResult {
         use super::usage_reads::{ReadError, ReadPath, USAGE_READ_TARGET};
         let key = self.read_key(cred);
         let (result, path) = self
             .usage_reads
-            .read(&key, || self.network_read(cred))
+            .read(
+                &key,
+                &self.read_scope(cred),
+                || self.now_ms(),
+                || self.network_read(cred),
+            )
             .await;
-        if path != ReadPath::NegativeCacheHit {
+        let superseded = matches!(result, Err(ReadError::Superseded));
+        if !superseded && !matches!(path, ReadPath::NegativeCacheHit | ReadPath::Paused) {
             self.record_usage(cred, result.as_ref().err().map(ReadError::cause));
         }
         let outcome = match (path, &result) {
+            (_, Err(ReadError::Superseded)) => "superseded",
             (ReadPath::Network, Ok(_)) => "ok",
             (ReadPath::Network, Err(_)) => "failed",
             (ReadPath::Joined, _) => "joined",
             (ReadPath::NegativeCacheHit, _) => "negative_cache_hit",
+            (ReadPath::Paused, _) => "paused",
         };
-        let now_ms = crate::epoch_millis();
+        let now_ms = self.now_ms();
         let (kind, status, retry_in_s) = match &result {
             Ok(_) => ("none", String::new(), 0),
             Err(ReadError::Transient {
@@ -2851,11 +3542,14 @@ impl LocalBroker {
                 failure.status.map(|s| s.to_string()).unwrap_or_default(),
                 retry_at_ms.saturating_sub(now_ms) / 1000,
             ),
-            Err(ReadError::Other { cause, .. }) => (
-                cause.kind.as_str(),
-                cause.http_status.map(|s| s.to_string()).unwrap_or_default(),
-                0,
-            ),
+            Err(read @ (ReadError::Other { .. } | ReadError::Superseded)) => {
+                let cause = read.cause();
+                (
+                    cause.kind.as_str(),
+                    cause.http_status.map(|s| s.to_string()).unwrap_or_default(),
+                    0,
+                )
+            }
         };
         tracing::info!(
             target: USAGE_READ_TARGET,
@@ -2908,6 +3602,18 @@ impl LocalBroker {
             endpoint_override: self.usage_endpoint_override.clone(),
             ..UsageFetchOptions::default()
         };
+        // p1-r1 B4: the pause is checked again at the dispatch, after the
+        // token refresh above: a usage 429 on another slot while this read
+        // waited for its token sends nothing here.
+        if let Some((failure, retry_at_ms)) = self
+            .usage_reads
+            .paused_at(&self.read_scope(cred), self.now_ms())
+        {
+            return Fetched::Paused {
+                failure,
+                retry_at_ms,
+            };
+        }
         match fetch_usage(
             &client,
             cred.provider,
@@ -2922,22 +3628,24 @@ impl LocalBroker {
         }
     }
 
-    /// Capacity view for one account from a fresh, read-only usage snapshot,
+    /// Capacity view for one account from a read-only usage snapshot no
+    /// older than `max_age`,
     /// with the seat it was read from. Anything that is not a well-formed,
     /// fresh reading is NOT capacity; a failed read keeps its typed cause. A
     /// read that failed transiently also reports that failure (and when
     /// reads resume) and, when the slot has one read from the account stored
     /// there now, its last good reading for the policy's grace, paired with
     /// that stored seat.
-    async fn capacity_for(&self, cred: &CredentialRef) -> CandidateRead {
+    async fn capacity_for(&self, cred: &CredentialRef, max_age: Duration) -> CandidateRead {
         use super::quota_policy::AccountCapacity;
         use super::usage_reads::ReadError;
-        match self.fresh_usage(cred).await {
-            Ok((snapshot, seat)) => CandidateRead {
+        match self.fresh_usage(cred, max_age).await {
+            Ok((snapshot, seat, epoch)) => CandidateRead {
                 capacity: capacity_from_snapshot(cred, &snapshot),
                 seat: Some(seat),
                 transient: None,
                 grace: None,
+                epoch: Some(epoch),
             },
             Err(read_err) => {
                 let err = UsageReadError::from_read(&read_err);
@@ -2965,41 +3673,131 @@ impl LocalBroker {
                         seat: None,
                         transient: None,
                         grace: None,
+                        epoch: None,
                     };
                 };
                 // Grace only on a reading of the account in the slot now: a
-                // re-login to another account id never inherits it.
+                // re-login to another account id never inherits it. The
+                // slot's epoch is taken before the last good reading, so a
+                // drop after this ends the grace for the selection too.
+                let read_key = self.read_key(cred);
+                let epoch = self.usage_reads.epoch(&read_key);
                 let graced = self.stored_seat(cred).ok().and_then(|seat| {
-                    let good = self
-                        .usage_reads
-                        .last_good_for(&self.read_key(cred), &seat)?;
+                    let good = self.usage_reads.last_good_for(&read_key, &seat)?;
                     Some((good, seat))
                 });
-                let (grace, seat) = match graced {
-                    Some((good, seat)) => (Some(capacity_from_snapshot(cred, &good)), Some(seat)),
-                    None => (None, None),
+                let (grace, seat, epoch) = match graced {
+                    Some((good, seat)) => (
+                        Some(capacity_from_snapshot(cred, &good)),
+                        Some(seat),
+                        Some(epoch),
+                    ),
+                    None => (None, None, None),
                 };
                 CandidateRead {
                     capacity,
                     seat,
                     transient: Some((failure, retry_at_ms)),
                     grace,
+                    epoch,
                 }
             }
         }
     }
 
-    /// Preview the exact ranking without vending inference credentials or
-    /// changing stickiness/cooldowns. Usage reads may refresh expired OAuth
-    /// tokens through the ordinary rotation-safe credential path.
+    /// Ends this selection's copies of readings dropped since the selection
+    /// took them (p1-r3 B1). Each read in `reads` (a reading, or the last
+    /// good one offered to grace) carries the slot's epoch it was taken at;
+    /// when that epoch has moved (a reported limit, a refused login), the
+    /// account counts as failed for the rest of the selection exactly as a
+    /// [`ReadError::Superseded`](super::usage_reads::ReadError::Superseded)
+    /// read: no grace, no hold, no cooldown, and not read again in this
+    /// selection (a re-read queued for it is dropped unsent). True when a
+    /// copy ended.
+    fn revalidate(&self, reads: &mut SelectionReads, failed: &mut FailedThisSelection) -> bool {
+        let ended: Vec<String> = reads
+            .reads
+            .iter()
+            .filter(|(key, read)| !failed.contains_key(*key) && self.is_superseded(key, read))
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in &ended {
+            self.end_copy(key, reads, failed);
+        }
+        !ended.is_empty()
+    }
+
+    /// [`Self::revalidate`] for `key` alone, right before the selection
+    /// reuses its read or takes the re-read queued for it (p1-r4 B1): a
+    /// drop since the copy was taken ends it there, so neither a reuse nor
+    /// a re-read can replace the only evidence of the drop. True when the
+    /// copy ended (the account is then failed for this selection).
+    fn revalidate_key(
+        &self,
+        key: &str,
+        reads: &mut SelectionReads,
+        failed: &mut FailedThisSelection,
+    ) -> bool {
+        let ended = !failed.contains_key(key)
+            && reads
+                .reads
+                .get(key)
+                .is_some_and(|read| self.is_superseded(key, read));
+        if ended {
+            self.end_copy(key, reads, failed);
+        }
+        ended
+    }
+
+    /// Whether `read`, this selection's copy of `key`'s evidence, was taken
+    /// at an epoch of the slot that has moved since.
+    fn is_superseded(&self, key: &str, read: &CandidateRead) -> bool {
+        read.epoch.is_some_and(|epoch| {
+            CredentialRef::parse_storage_key(key)
+                .is_some_and(|cred| self.usage_reads.epoch(&self.read_key(&cred)) != epoch)
+        })
+    }
+
+    /// End this selection's copy of `key`'s evidence: the account counts as
+    /// failed with a superseded read's cause for the rest of the selection,
+    /// and any re-read queued for it is dropped unsent.
+    fn end_copy(&self, key: &str, reads: &mut SelectionReads, failed: &mut FailedThisSelection) {
+        use super::usage_reads::{ReadError, USAGE_READ_TARGET};
+        reads.forget(key);
+        failed.insert(key.to_string(), ReadError::Superseded.cause());
+        let account = CredentialRef::parse_storage_key(key)
+            .map(|cred| cred.account.label_str().to_string())
+            .unwrap_or_default();
+        tracing::debug!(
+            target: USAGE_READ_TARGET,
+            broker = self.instance,
+            account = %account,
+            "selection evidence superseded"
+        );
+    }
+
+    /// Preview the ranking without vending inference credentials or
+    /// changing stickiness/cooldowns. This is one ranking pass on the
+    /// readings a selection starts from: a vend may then read again the
+    /// account it would choose (its reading being over `max_snapshot_age`),
+    /// or, before it reports no capacity, the accounts rejected on such
+    /// readings, so its final choice can differ from this preview. Usage
+    /// reads may refresh expired OAuth tokens through the ordinary
+    /// rotation-safe credential path.
     pub async fn plan(
         &self,
         provider: OAuthProviderId,
         model: Option<&str>,
     ) -> Result<super::SelectionPlan, BrokerError> {
-        self.selection_plan(provider, model, &[], &mut FailedThisSelection::new())
-            .await
-            .map(|(plan, ..)| plan)
+        self.selection_plan(
+            provider,
+            model,
+            &[],
+            &mut FailedThisSelection::new(),
+            &mut SelectionReads::new(self.now_ms()),
+        )
+        .await
+        .map(|planned| planned.plan)
     }
 
     /// Read every account's capacity and rank them; an account whose
@@ -3008,52 +3806,77 @@ impl LocalBroker {
     /// earlier in this selection: it counts as failed with that kind and is
     /// not read again; a read that fails now (other than a held transient
     /// read, which the usage-read table answers without a request) is added.
-    #[allow(clippy::type_complexity)]
+    /// `reads` holds this selection's reads: an account read in an earlier
+    /// ranking pass of the same selection is not read again, except for the
+    /// one re-read under `max_snapshot_age` that `reads` asks for.
+    /// A cached reading is reused up to its account's max age: the pinned
+    /// age for the account this provider/model is pinned to (a reading near
+    /// the limit is read again past `max_snapshot_age` before it is used:
+    /// [`Self::old_choice`]), else `idle_snapshot_age` plus the account's
+    /// share of `idle_snapshot_spread` by its place in the listing. A reading
+    /// saved before this process started counts, at its original age. The
+    /// spread only separates the accounts' due times: a first selection with
+    /// no saved readings, or one after every account's max age has passed,
+    /// still reads every account (one usage 429 pauses the rest).
     async fn selection_plan(
         &self,
         provider: OAuthProviderId,
         model: Option<&str>,
         exclude: &[CredentialRef],
         failed: &mut FailedThisSelection,
-    ) -> Result<
-        (
-            super::SelectionPlan,
-            BTreeMap<String, SeatIdentity>,
-            BTreeMap<String, (super::usage_reads::TransientReadFailure, u64)>,
-        ),
-        BrokerError,
-    > {
+        reads: &mut SelectionReads,
+    ) -> Result<PlannedSelection, BrokerError> {
         use super::quota_policy::{AccountCapacity, SelectionRequest};
-        let summaries = storage::list_accounts(provider).map_err(BrokerError::Credential)?;
+        let listed = storage::list_accounts(provider).map_err(BrokerError::Credential)?;
+        self.keep_listed_readings(provider, &listed);
+        let summaries = reads.keep_inventory(listed);
         let mut candidates = Vec::with_capacity(summaries.len());
         let mut seats = BTreeMap::new();
         let mut transient = BTreeMap::new();
         let mut grace = Vec::new();
         let mut seen = std::collections::BTreeSet::new();
         let mut exclude = exclude.to_vec();
+        let previous = self
+            .current_accounts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&Self::current_key(provider, model))
+            .cloned();
+        let pinned = previous.as_ref().map(|(cred, _)| cred.storage_key());
         // Each account's cooldown keys, worked out once for both lookups
         // below (and only while some cooldown is active: they read the
         // stored login).
-        let cooling_any = self.any_cooldown_active(crate::epoch_millis());
+        let cooling_any = self.any_cooldown_active(self.now_ms());
         let mut keys = BTreeMap::new();
-        for summary in &summaries {
+        // First this pass's evidence: read (or reused from an earlier pass)
+        // for each account not already failed in this selection. `None`
+        // marks an account that failed earlier in this selection.
+        let mut gathered = Vec::with_capacity(summaries.len());
+        for (index, summary) in summaries.iter().enumerate() {
             let Some(cred) = summary.credential_ref() else {
                 continue;
             };
+            let key = cred.storage_key();
             if cooling_any {
-                keys.insert(cred.storage_key(), self.cooldown_keys(&cred));
+                keys.insert(key.clone(), self.cooldown_keys(&cred));
             }
-            if let Some(failure) = failed.get(&cred.storage_key()) {
-                candidates.push(AccountCapacity::failed(cred, failure.clone()));
+            // Failed earlier in this selection, or its copy of the account's
+            // evidence predates a drop: checked right before the copy is
+            // reused or a re-read queued for it is taken (p1-r4 B1), so the
+            // account is not read again in this selection.
+            if failed.contains_key(&key) || self.revalidate_key(&key, reads, failed) {
+                gathered.push((cred, None));
                 continue;
             }
-            // An account whose cooldown is active can't be chosen, so its
+            // An account whose cooldown is active (the whole account's, or
+            // a limit of this request's model) can't be chosen, so its
             // usage is not read (no usage request, no token refresh). It
             // keeps its stored seat, for stickiness and the duplicate-seat
             // check; the policy rejects it as cooling down.
+            let now_ms = self.now_ms();
             let read = if keys
-                .get(&cred.storage_key())
-                .and_then(|k| self.cooldown_for_keys(k, crate::epoch_millis()))
+                .get(&key)
+                .and_then(|k| self.cooldown_for_keys(k, |c| c.for_request_at(model, now_ms)))
                 .is_some()
             {
                 CandidateRead {
@@ -3061,9 +3884,47 @@ impl LocalBroker {
                     seat: self.stored_seat(&cred).ok(),
                     transient: None,
                     grace: None,
+                    epoch: None,
                 }
+            } else if let Some(read) = reads.reuse(&key) {
+                // Read earlier in this selection: not read again.
+                read
             } else {
-                self.capacity_for(&cred).await
+                let max_age = if reads.take_reread(&key) {
+                    self.max_snapshot_age
+                } else {
+                    self.reuse_age(&cred, pinned.as_deref(), index, summaries.len())
+                };
+                // A re-read never replaces a copy taken at an older epoch:
+                // a drop between the check above and the re-read's own
+                // epoch still fails the account for this selection.
+                let replaced = reads.epoch_of(&key);
+                let read = self.capacity_for(&cred, max_age).await;
+                if replaced.is_some_and(|old| read.epoch.is_some_and(|new| new != old)) {
+                    self.end_copy(&key, reads, failed);
+                    gathered.push((cred, None));
+                    continue;
+                }
+                reads.record(key, &read);
+                read
+            };
+            gathered.push((cred, Some(read)));
+        }
+        // The reads above awaited: a reading dropped meanwhile (a reported
+        // limit, a refused login) ends this selection's copy of it too.
+        self.revalidate(reads, failed);
+        for (cred, read) in gathered {
+            let read = match (read, failed.get(&cred.storage_key())) {
+                (Some(read), None) => read,
+                (_, failure) => {
+                    // Failed earlier in this selection (not read), or its
+                    // evidence was superseded just now: it counts as failed
+                    // with that kind.
+                    candidates.extend(
+                        failure.map(|failure| AccountCapacity::failed(cred, failure.clone())),
+                    );
+                    continue;
+                }
             };
             let (mut capacity, seat) = (read.capacity, read.seat);
             match (read.transient, &capacity.failure) {
@@ -3090,7 +3951,7 @@ impl LocalBroker {
             }
             candidates.push(capacity);
         }
-        let now_ms = crate::epoch_millis();
+        let now_ms = self.now_ms();
         // A cooldown reported while the reads ran counts too.
         if !cooling_any && self.any_cooldown_active(now_ms) {
             for capacity in &candidates {
@@ -3101,20 +3962,17 @@ impl LocalBroker {
         for capacity in &mut candidates {
             capacity.cooldown_until_ms = keys
                 .get(&capacity.credential.storage_key())
-                .and_then(|k| self.cooldown_for_keys(k, now_ms))
+                .and_then(|k| self.cooldown_for_keys(k, |c| c.for_request_at(model, now_ms)))
                 .map(|c| c.until_ms);
         }
-        let previous = self
-            .current_accounts
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&Self::current_key(provider, model))
-            .cloned();
         let current = previous
             .filter(|(cred, seat)| seats.get(&cred.storage_key()) == Some(seat))
             .map(|(cred, _)| cred);
         let policy = self.auto_policy();
-        let preference: Vec<_> = summaries.iter().map(|s| s.label.clone()).collect();
+        // `auth.order.<provider>` first (labels that exist), then the rest in
+        // listing order; the policy is re-read when the config changes.
+        let listed: Vec<_> = summaries.iter().map(|s| s.label.clone()).collect();
+        let preference = policy.preference_for(provider, &listed);
         let request = SelectionRequest {
             model,
             preference: &preference,
@@ -3124,13 +3982,92 @@ impl LocalBroker {
             urgent_horizon_ms: policy.urgent_horizon_ms,
             sticky: policy.sticky,
             grace: &grace,
-            ..SelectionRequest::new(provider, now_ms, self.max_snapshot_age.as_millis() as u64)
+            // Each reading was reused only up to its own account's max age;
+            // the policy's bound is the widest of them.
+            ..SelectionRequest::new(provider, now_ms, self.widest_reuse_age().as_millis() as u64)
         };
-        Ok((
-            super::SelectionPlan::from_candidates(&request, &candidates),
+        let resets_ahead = candidates
+            .iter()
+            .filter(|capacity| waits_for_reset(&request, capacity))
+            .map(|capacity| capacity.credential.storage_key())
+            .collect();
+        Ok(PlannedSelection {
+            plan: super::SelectionPlan::from_candidates(&request, &candidates),
             seats,
             transient,
-        ))
+            excluded: exclude.iter().map(CredentialRef::storage_key).collect(),
+            resets_ahead,
+            pinned,
+        })
+    }
+
+    /// How old a cached reading of `cred` (at `index` of `listed` in the
+    /// provider's listing) may be when this selection reuses it.
+    fn reuse_age(
+        &self,
+        cred: &CredentialRef,
+        pinned: Option<&str>,
+        index: usize,
+        listed: usize,
+    ) -> Duration {
+        if pinned == Some(cred.storage_key().as_str()) {
+            return self.pinned_age_for(cred.provider);
+        }
+        let share = self.idle_snapshot_spread.mul_f64(index as f64 / listed.max(1) as f64);
+        self.idle_snapshot_age.max(self.max_snapshot_age) + share
+    }
+
+    /// How old the pinned account's reading may be while it shows room.
+    fn pinned_age(&self) -> Duration {
+        self.pinned_snapshot_age.max(self.max_snapshot_age)
+    }
+
+    /// [`Self::pinned_age`] for an Anthropic account; `max_snapshot_age`
+    /// for any other provider's (p1-r1 LOW2: the pinned 10 minutes, the
+    /// pause and the saved readings are Anthropic's only).
+    fn pinned_age_for(&self, provider: OAuthProviderId) -> Duration {
+        if provider == OAuthProviderId::Anthropic {
+            self.pinned_age()
+        } else {
+            self.max_snapshot_age
+        }
+    }
+
+    /// The oldest any account's reading may be when a selection reuses it.
+    fn widest_reuse_age(&self) -> Duration {
+        (self.idle_snapshot_age.max(self.max_snapshot_age) + self.idle_snapshot_spread)
+            .max(self.pinned_age())
+    }
+
+    /// The chosen account's storage key when the plan chose it on a reading
+    /// that is old at `now_ms` ([`SelectionReads::is_old`]) and that this
+    /// selection has not read again. A graced account (its read failed
+    /// transiently and is held) is not read again here. Old means over
+    /// `max_snapshot_age` for an account the selection would switch to;
+    /// for the account it is pinned to (or the first choice of a selection
+    /// pinned to none), over the pinned age while the reading shows room on
+    /// every window of the request or shows the account's paid extra usage
+    /// off, and over `max_snapshot_age` near the limit
+    /// ([`DEFAULT_NEAR_LIMIT_PERCENT`]) otherwise.
+    fn old_choice(
+        &self,
+        planned: &PlannedSelection,
+        reads: &SelectionReads,
+        model: Option<&str>,
+        now_ms: u64,
+    ) -> Option<String> {
+        let chosen = planned.plan.selection.selected()?;
+        let key = chosen.storage_key();
+        if planned.transient.contains_key(&key) {
+            return None;
+        }
+        let stays = planned.pinned.as_deref().is_none_or(|pinned| pinned == key);
+        let max_age = if stays && (!reads.near_limit(&key, model) || reads.extra_usage_off(&key)) {
+            self.pinned_age_for(chosen.provider)
+        } else {
+            self.max_snapshot_age
+        };
+        reads.is_old(&key, now_ms, max_age).then_some(key)
     }
 
     async fn select_auto(
@@ -3142,22 +4079,78 @@ impl LocalBroker {
     ) -> Result<(CredentialRef, SeatIdentity), BrokerError> {
         use super::quota_policy::{Selection, SelectionFailure, SelectionFailureKind};
         use super::usage_reads::USAGE_READ_TARGET;
-        let (plan, mut seats, transient) = match self
-            .selection_plan(provider, model, exclude, failed)
-            .await
-        {
-            Ok(planned) => planned,
-            // The account list itself could not be read (the only error
-            // `selection_plan` returns): still exactly one WARN for this
-            // failed selection, and the caller gets the store's own error.
-            Err(e) => {
-                log_selection_failure(
-                    provider,
-                    model,
-                    &SelectionFailure::new(SelectionFailureKind::CredentialStore),
-                );
-                return Err(e);
+        let mut reads = SelectionReads::new(self.now_ms());
+        let mut rechecked = false;
+        let PlannedSelection {
+            plan,
+            mut seats,
+            transient,
+            ..
+        } = loop {
+            let planned = match self
+                .selection_plan(provider, model, exclude, failed, &mut reads)
+                .await
+            {
+                Ok(planned) => planned,
+                // The account list itself could not be read (the only error
+                // `selection_plan` returns): still exactly one WARN for this
+                // failed selection, and the caller gets the store's own error.
+                Err(e) => {
+                    log_selection_failure(
+                        provider,
+                        model,
+                        &SelectionFailure::new(SelectionFailureKind::CredentialStore),
+                    );
+                    return Err(e);
+                }
+            };
+            // A reading older than `max_snapshot_age` only ranks an account;
+            // it never decides the choice: the chosen account is read again
+            // (once per selection) and the ranking redone on this
+            // selection's reads (no other account is read again for it).
+            // Ages are judged now, after this pass's reads: a cache hit that
+            // was young when the pass took it is old by now if another
+            // account's read was slow.
+            let now_ms = self.now_ms();
+            if let Some(key) = self.old_choice(&planned, &reads, model, now_ms) {
+                if reads.ask_reread(key) {
+                    continue;
+                }
             }
+            // Before it reports no capacity, the selection reads again, once,
+            // each account it rejected on an old reading (taken before the
+            // selection began and over `max_snapshot_age` old now) that
+            // names no reset still ahead for a window it is used up on (no
+            // reset, or one already past when read): one read each at most,
+            // never an excluded or failed account (a cooling one is not
+            // read, and a held read is answered without a request). An
+            // account used up until a reset ahead is not read: it can't have
+            // room before that reset, and its reading is read again once the
+            // reset has passed. Only a selection in which every account
+            // looks unusable gets here.
+            if !rechecked && planned.plan.selection.selected().is_none() {
+                rechecked = true;
+                let old = reads.old_readings(now_ms, self.max_snapshot_age, |key| {
+                    planned.excluded.contains(key)
+                        || failed.contains_key(key)
+                        || planned.resets_ahead.contains(key)
+                });
+                if !old.is_empty() {
+                    for key in old {
+                        reads.ask_reread(key);
+                    }
+                    continue;
+                }
+            }
+            // Nothing above awaited since the plan's last revalidation, but
+            // another task can still drop a reading the plan rests on: the
+            // selection returns only on evidence still current, else it
+            // ranks again without it (each time one more account fails, so
+            // this ends).
+            if self.revalidate(&mut reads, failed) {
+                continue;
+            }
+            break planned;
         };
         match plan.selection {
             Selection::Selected {
@@ -3192,7 +4185,7 @@ impl LocalBroker {
                         outcome = %"grace",
                         kind = %failure.kind,
                         status = %failure.status.map(|s| s.to_string()).unwrap_or_default(),
-                        retry_in_s = retry_at_ms.saturating_sub(crate::epoch_millis()) / 1000,
+                        retry_in_s = retry_at_ms.saturating_sub(self.now_ms()) / 1000,
                         "usage read"
                     );
                 }
@@ -3433,14 +4426,21 @@ impl LocalBroker {
                 tracing::info!(credential = %rejected.credential, "muse key rejected (401); re-minting once");
                 match self.recover_rejected_token(&rejected.credential, &key).await {
                     Ok(fresh) => {
+                        // The rejected request was sent: a failure from here
+                        // on (the bearer, the retry) fails after a dispatch,
+                        // so it is never a not-sent error.
+                        let after_dispatch = |e: BrokerError| {
+                            BrokerError::Transport(format!("after a sent request: {e}"))
+                        };
                         let pinned = Some(PinnedToken {
                             credential: rejected.credential.clone(),
                             token: fresh,
                         });
-                        let key = bearer(&pinned)?;
+                        let key = bearer(&pinned).map_err(after_dispatch)?;
                         return self
                             .dispatch(request, provider_key, &key, &base, &pinned)
-                            .await;
+                            .await
+                            .map_err(after_dispatch);
                     }
                     // A transient mint failure, a busy refresh lock, a local
                     // failure or something the user must fix elsewhere (a
@@ -3485,12 +4485,16 @@ impl LocalBroker {
         let url = format!("{base}{}", request.path);
         // Deny redirects for credential-bearing OAuth catalog traffic and
         // google-gemini: a 3xx must not replay the bearer token off-origin.
-        let mut builder = if provider_key == "google-gemini"
+        let pinned_no_redirect = provider_key == "google-gemini"
             || provider_key == "openai-codex"
             || provider_key == "anthropic"
             || provider_key == "kimi-code"
-            || provider_key == "muse"
-        {
+            || provider_key == "muse";
+        // A refused connection proves nothing was sent only when no redirect
+        // can have been followed first (an earlier hop may have received the
+        // request).
+        let redirect_free = pinned_no_redirect || self.redirect_free;
+        let mut builder = if pinned_no_redirect {
             // `read_timeout` is an IDLE timer (reset on every read), so a
             // long SSE stream that keeps sending is never cut; a stalled one
             // (silent NAT drop, hung edge) fails instead of hanging the turn.
@@ -3597,10 +4601,20 @@ impl LocalBroker {
             builder = builder.timeout(self.request_timeout);
         }
         builder.send().await.map_err(|e| {
+            let connect_failure = |message: String| {
+                if redirect_free {
+                    BrokerError::ConnectFailed(message)
+                } else {
+                    BrokerError::Transport(message)
+                }
+            };
             if e.is_connect() && provider_key == LOCAL_PROVIDER_KEY {
-                BrokerError::Transport(format!(
+                connect_failure(format!(
                     "can't reach local endpoint at {url} — is Ollama/LM Studio running?"
                 ))
+            } else if e.is_connect() {
+                // reqwest errors do not include the bearer header.
+                connect_failure(format!("request to {} failed: {e}", request.provider))
             } else {
                 // reqwest errors do not include the bearer header.
                 BrokerError::Transport(format!("request to {} failed: {e}", request.provider))
@@ -3676,6 +4690,7 @@ pub fn capacity_from_snapshot(
         observation: QuotaObservation::Ok { windows, models },
         cooldown_until_ms: None,
         failure: None,
+        extra_usage_enabled: snapshot.extra_usage_enabled,
     }
 }
 
@@ -3687,7 +4702,209 @@ struct UsageReadError {
     failure: super::quota_policy::ObservationFailure,
 }
 
+/// One automatic selection's ranking and what the broker needs to act on it.
+struct PlannedSelection {
+    plan: super::SelectionPlan,
+    /// The seat each read account's reading belongs to, by storage key.
+    seats: BTreeMap<String, SeatIdentity>,
+    /// Accounts whose read failed transiently: the failure and when reads
+    /// resume, by storage key.
+    transient: BTreeMap<String, (super::usage_reads::TransientReadFailure, u64)>,
+    /// Storage keys the selection may not choose: the accounts the request
+    /// already used, and a second login to a seat listed earlier.
+    excluded: std::collections::BTreeSet<String>,
+    /// Storage keys of the accounts used up, on a window that applies to
+    /// the request, until a reset still ahead ([`waits_for_reset`]).
+    resets_ahead: std::collections::BTreeSet<String>,
+    /// Storage key of the account the selection is pinned to, if any.
+    pinned: Option<String>,
+}
+
+/// Whether `capacity`'s reading has a window that applies to `request`,
+/// used up until a reset after `request.now_ms`. No reading can show room
+/// on that window before the reset, and once the reset has passed the
+/// cached reading is out of date and read again
+/// ([`UsageSnapshot::reset_since_observed`](super::usage::UsageSnapshot::reset_since_observed)).
+fn waits_for_reset(
+    request: &super::quota_policy::SelectionRequest<'_>,
+    capacity: &super::quota_policy::AccountCapacity,
+) -> bool {
+    use super::quota_policy::{QuotaObservation, WindowVerdict};
+    let QuotaObservation::Ok { windows, .. } = &capacity.observation else {
+        return false;
+    };
+    windows
+        .iter()
+        .filter(|w| w.applies_to(request.model))
+        .any(|w| {
+            matches!(
+                w.verdict(request.exhausted_at_percent),
+                WindowVerdict::Exhausted { resets_at_ms: Some(at) } if at > request.now_ms
+            )
+        })
+}
+
+/// Whether `capacity`'s reading has a window that applies to the request
+/// (`model`; `None`: every window) at [`DEFAULT_NEAR_LIMIT_PERCENT`] or more.
+fn near_its_limit(capacity: &super::quota_policy::AccountCapacity, model: Option<&str>) -> bool {
+    use super::quota_policy::{QuotaObservation, WindowVerdict};
+    let QuotaObservation::Ok { windows, .. } = &capacity.observation else {
+        return false;
+    };
+    windows.iter().filter(|w| w.applies_to(model)).any(|w| {
+        matches!(
+            w.verdict(DEFAULT_NEAR_LIMIT_PERCENT),
+            WindowVerdict::Exhausted { .. }
+        )
+    })
+}
+
+/// One automatic selection's usage reads, by storage key. Each account is
+/// read at most once per selection: a later ranking pass of the same
+/// selection reuses its read, except for one re-read under
+/// `max_snapshot_age` of an account whose reading is old
+/// ([`SelectionReads::is_old`]) when a pass would rest a decision on it.
+/// The selection keeps to the accounts of its first listing.
+struct SelectionReads {
+    /// When the selection began, on the broker's clock: a reading observed
+    /// since then was taken in this selection.
+    started_ms: u64,
+    /// The storage keys of the selection's first listing.
+    inventory: Option<std::collections::BTreeSet<String>>,
+    reads: BTreeMap<String, CandidateRead>,
+    /// Accounts to read again under `max_snapshot_age` at the next pass.
+    pending: std::collections::BTreeSet<String>,
+    /// Accounts read again under `max_snapshot_age` in this selection.
+    reread: std::collections::BTreeSet<String>,
+}
+
+impl SelectionReads {
+    fn new(started_ms: u64) -> Self {
+        Self {
+            started_ms,
+            inventory: None,
+            reads: BTreeMap::new(),
+            pending: Default::default(),
+            reread: Default::default(),
+        }
+    }
+
+    /// The accounts of `listed` this selection considers: the first listing
+    /// sets them, and a later pass keeps to them, so an account added while
+    /// the selection runs waits for the next selection (one removed meanwhile
+    /// drops out). With a fixed set of accounts the passes are bounded: each
+    /// account is read again at most once, and the check before no capacity
+    /// runs once. An entry that names no account is kept (the plan skips
+    /// it). The set is kept by storage key, not by position: the places and
+    /// the count that spread the reuse ages ([`LocalBroker::reuse_age`]) are
+    /// those of the kept entries. They match the first listing only while
+    /// nothing in it is removed: a removal moves the later entries up one
+    /// place and lowers the count, and an entry that names no account is kept
+    /// whether or not the first listing had it.
+    fn keep_inventory(&mut self, mut listed: Vec<AccountSummary>) -> Vec<AccountSummary> {
+        let key = |s: &AccountSummary| s.credential_ref().map(|c| c.storage_key());
+        match &self.inventory {
+            Some(keys) => listed.retain(|s| match key(s) {
+                Some(k) => keys.contains(&k),
+                None => true,
+            }),
+            None => self.inventory = Some(listed.iter().filter_map(key).collect()),
+        }
+        listed
+    }
+
+    /// This selection's read of `key`, unless its re-read is due.
+    fn reuse(&self, key: &str) -> Option<CandidateRead> {
+        if self.pending.contains(key) {
+            return None;
+        }
+        self.reads.get(key).cloned()
+    }
+
+    /// Whether `key`'s re-read is due now; it then counts as re-read.
+    fn take_reread(&mut self, key: &str) -> bool {
+        let due = self.pending.remove(key);
+        if due {
+            self.reread.insert(key.to_string());
+        }
+        due
+    }
+
+    /// Keep `read` of `key`.
+    fn record(&mut self, key: String, read: &CandidateRead) {
+        self.reads.insert(key, read.clone());
+    }
+
+    /// The slot epoch of this selection's copy of `key`'s evidence, if any.
+    fn epoch_of(&self, key: &str) -> Option<u64> {
+        self.reads.get(key).and_then(|read| read.epoch)
+    }
+
+    /// Forget `key`'s read and any re-read queued for it: its evidence was
+    /// superseded, and the account is failed for the rest of the selection.
+    fn forget(&mut self, key: &str) {
+        self.reads.remove(key);
+        self.pending.remove(key);
+    }
+
+    /// Whether a decision on `key` at `now_ms` would rest on an old reading:
+    /// a good reading (not a failed or held read) observed before this
+    /// selection began and over `max_age` old now, that this selection has
+    /// not read again. Judged when the decision is made, not when the pass
+    /// took the reading, since another account's slow read can age it. A
+    /// reading taken in this selection is never old here.
+    fn is_old(&self, key: &str, now_ms: u64, max_age: Duration) -> bool {
+        let max_age_ms = max_age.as_millis() as u64;
+        !self.reread.contains(key)
+            && self.reads.get(key).is_some_and(|read| {
+                read.transient.is_none()
+                    && read.capacity.failure.is_none()
+                    && read.capacity.observed_at_ms.is_some_and(|at| {
+                        at < self.started_ms && now_ms.saturating_sub(at) > max_age_ms
+                    })
+            })
+    }
+
+    /// Ask for `key`'s one re-read at the next pass; false when it already
+    /// had it or is waiting for it.
+    fn ask_reread(&mut self, key: String) -> bool {
+        !self.reread.contains(&key) && self.pending.insert(key)
+    }
+
+    /// Whether `key`'s reading in this selection shows the account's paid
+    /// extra usage switched off (unknown counts as on).
+    fn extra_usage_off(&self, key: &str) -> bool {
+        self.reads
+            .get(key)
+            .is_some_and(|read| read.capacity.extra_usage_enabled == Some(false))
+    }
+
+    /// Whether `key`'s reading in this selection has a window that applies
+    /// to the request (`model`) at [`DEFAULT_NEAR_LIMIT_PERCENT`] or more.
+    fn near_limit(&self, key: &str, model: Option<&str>) -> bool {
+        self.reads
+            .get(key)
+            .is_some_and(|read| near_its_limit(&read.capacity, model))
+    }
+
+    /// The accounts whose reading is old at `now_ms`
+    /// ([`is_old`](Self::is_old)), except those `skip` names.
+    fn old_readings(
+        &self,
+        now_ms: u64,
+        max_age: Duration,
+        skip: impl Fn(&str) -> bool,
+    ) -> Vec<String> {
+        self.reads
+            .keys()
+            .filter(|key| self.is_old(key.as_str(), now_ms, max_age) && !skip(key.as_str()))
+            .cloned()
+            .collect()
+    }
+}
+
 /// One account's read for automatic selection.
+#[derive(Clone)]
 struct CandidateRead {
     capacity: super::quota_policy::AccountCapacity,
     /// Seat the reading belongs to (for a graced account: the seat stored now).
@@ -3696,6 +4913,11 @@ struct CandidateRead {
     transient: Option<(super::usage_reads::TransientReadFailure, u64)>,
     /// Last good reading offered to the policy's grace.
     grace: Option<super::quota_policy::AccountCapacity>,
+    /// The slot's epoch ([`UsageReads::epoch`](super::usage_reads::UsageReads::epoch))
+    /// the evidence (the reading, or the last good one offered to grace)
+    /// was taken at; `None` when there is none. A selection uses the
+    /// evidence only while the epoch stays the same (p1-r3 B1).
+    epoch: Option<u64>,
 }
 
 impl UsageReadError {
@@ -4099,11 +5321,15 @@ impl CredentialBroker for LocalBroker {
         rejected: &str,
     ) -> Result<AccessToken, BrokerError> {
         self.check_slot_exists(cred)?;
+        // Never held (a rejected token's recovery); a refusal of the login
+        // still drops its usage reading ([`ReadingDrop`]).
+        let memory: Arc<dyn super::token::RefusalMemory> = Arc::new(self.reading_drop(cred));
         let creds = super::token::recover_rejected_credential(
             &self.http,
             cred,
             rejected,
             &self.refresh_endpoints,
+            Some(memory),
         )
         .await
         .map_err(BrokerError::Refresh)?;
@@ -4123,12 +5349,14 @@ impl CredentialBroker for LocalBroker {
 
     async fn access_token_for(&self, cred: &CredentialRef) -> Result<AccessToken, BrokerError> {
         self.check_slot_exists(cred)?;
-        // An account the user chose is never held (no memory).
+        // An account the user chose is never held; a refusal of its login
+        // still drops its usage reading ([`ReadingDrop`]).
+        let memory: Arc<dyn super::token::RefusalMemory> = Arc::new(self.reading_drop(cred));
         let creds = super::token::ensure_fresh_credential_via(
             &self.http,
             cred,
             &self.refresh_endpoints,
-            None,
+            Some(memory),
         )
         .await
         .map_err(|f| match f.kind {
@@ -4191,14 +5419,35 @@ impl CredentialBroker for LocalBroker {
             .map_err(|e| e.error)
     }
 
+    async fn usage_or_last_known(
+        &self,
+        cred: &CredentialRef,
+    ) -> Result<super::usage::UsageSnapshot, Box<UsageReadFailure>> {
+        self.last_known_usage(cred).await
+    }
+
     fn active_cooldown(&self, cred: &CredentialRef) -> Option<u64> {
         self.active_cooldown_at(cred, crate::epoch_millis())
             .map(|c| c.until_ms)
     }
 
+    fn active_cooldown_for(&self, cred: &CredentialRef, model: Option<&str>) -> Option<u64> {
+        self.cooldown_for_at(cred, model, crate::epoch_millis())
+            .map(|c| c.until_ms)
+    }
+
+    /// Clears the whole account's cooldown only: a limit of one model's
+    /// requests (Fable's weekly limit) stays, since the accepted request
+    /// (whose model this call does not name) proves nothing about it.
     fn clear_cooldown(&self, cred: &CredentialRef, sent_at_ms: u64) {
         let now_ms = crate::epoch_millis();
-        if !self.any_cooldown_active(now_ms) {
+        let account_cooling = self
+            .cooldowns
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .any(|key| key.account_at(now_ms).is_some());
+        if !account_cooling {
             return;
         }
         let keys = self.cooldown_keys(cred);
@@ -4206,11 +5455,18 @@ impl CredentialBroker for LocalBroker {
         {
             let mut cooldowns = self.cooldowns.lock().unwrap_or_else(|e| e.into_inner());
             for key in keys.read() {
-                if cooldowns
-                    .get(key)
-                    .is_some_and(|c| c.until_ms > now_ms && c.reported_at_ms <= sent_at_ms)
+                let Some(entry) = cooldowns.get_mut(key) else {
+                    continue;
+                };
+                if entry
+                    .all
+                    .as_ref()
+                    .is_some_and(|c| c.active_at(now_ms) && c.reported_at_ms <= sent_at_ms)
                 {
-                    cleared = cooldowns.remove(key).or(cleared);
+                    cleared = entry.all.take().or(cleared);
+                    if entry.models.is_empty() {
+                        cooldowns.remove(key);
+                    }
                 }
             }
         }
@@ -4251,33 +5507,71 @@ impl CredentialBroker for LocalBroker {
         until_ms: Option<u64>,
         reason: &str,
     ) -> Result<(), BrokerError> {
-        let now_ms = crate::epoch_millis();
-        let max_until = now_ms.saturating_add(MAX_COOLDOWN.as_millis() as u64);
-        let until_ms = until_ms
-            .filter(|t| *t > now_ms)
-            .unwrap_or(now_ms + DEFAULT_COOLDOWN.as_millis() as u64)
-            .min(max_until);
-        let reason = crate::truncate_str(reason, 64).to_string();
-        tracing::info!(credential = %cred, until_ms, reason = %reason, "account cooldown reported");
+        let cooldown = Cooldown::reported(until_ms, reason);
+        tracing::info!(
+            credential = %cred,
+            until_ms = cooldown.until_ms,
+            reason = %cooldown.reason,
+            "account cooldown reported"
+        );
         let keys = self.cooldown_keys(cred);
         {
             let mut cooldowns = self.cooldowns.lock().unwrap_or_else(|e| e.into_inner());
             for key in keys.written() {
-                cooldowns.insert(
-                    key.to_string(),
-                    Cooldown {
-                        until_ms,
-                        reason: reason.clone(),
-                        reported_at_ms: now_ms,
-                    },
-                );
+                cooldowns.entry(key.to_string()).or_default().all = Some(cooldown.clone());
             }
         }
         // The cached reading predates the limit report; drop it so the next
         // selection re-reads instead of trusting stale headroom, and drop
-        // the slot's last good reading so grace can never outlive the limit.
-        self.forget_snapshots(cred);
-        self.usage_reads.forget_last_good(&self.read_key(cred));
+        // the slot's last good reading so grace can never outlive the limit
+        // (its saved copy too: loaded first, so a saved one is dropped even
+        // if this process has not read the slot).
+        self.reading_drop(cred).drop_reading();
+        Ok(())
+    }
+
+    /// A limit of `model`'s requests only (Fable's weekly limit), under the
+    /// same keys as a whole-account report: automatic selection stops
+    /// choosing the account for that model's requests (and for a request
+    /// with no model) until `until_ms`; other models keep it. The reading
+    /// is kept: its shared windows are still true, and this cooldown stops
+    /// the model's requests whatever room the reading shows for it. A model
+    /// that is not one plain word cools the whole account instead.
+    async fn report_model_cooldown(
+        &self,
+        cred: &CredentialRef,
+        model: &str,
+        until_ms: Option<u64>,
+        reason: &str,
+    ) -> Result<(), BrokerError> {
+        let model = model.trim().to_ascii_lowercase();
+        if model.is_empty()
+            || model.len() > 32
+            || !model
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+        {
+            return self.report_cooldown(cred, until_ms, reason).await;
+        }
+        let cooldown = Cooldown::reported(until_ms, reason);
+        tracing::info!(
+            credential = %cred,
+            model = %model,
+            until_ms = cooldown.until_ms,
+            reason = %cooldown.reason,
+            "account cooldown reported"
+        );
+        let keys = self.cooldown_keys(cred);
+        {
+            let mut cooldowns = self.cooldowns.lock().unwrap_or_else(|e| e.into_inner());
+            for key in keys.written() {
+                cooldowns
+                    .entry(key.to_string())
+                    .or_default()
+                    .models
+                    .insert(model.clone(), cooldown.clone());
+            }
+        }
         Ok(())
     }
 
@@ -4665,7 +5959,14 @@ impl RemoteBroker {
                 .json(request)
             })
             .await
-            .map_err(|e| BrokerError::Transport(format!("broker request failed: {e}")))?;
+            .map_err(|e| {
+                let message = format!("broker request failed: {e}");
+                if e.is_connect() {
+                    BrokerError::ConnectFailed(message)
+                } else {
+                    BrokerError::Transport(message)
+                }
+            })?;
         match resp.status().as_u16() {
             401 => Err(BrokerError::Unauthorized),
             s @ (400 | 403) => {
@@ -5243,6 +6544,48 @@ pub fn broker_from_source(
     }
 }
 
+/// [`broker_from_source`] for bounded single-attempt requests: a local
+/// broker never follows redirects ([`LocalBroker::without_redirects`]), and
+/// fails closed when that cannot be guaranteed. The remote broker's own RPC
+/// refuses redirects, but its daemon dispatches upstream with an ordinary
+/// broker, so callers must not send bounded inference through its proxy.
+pub fn bounded_broker_from_source(
+    source: &super::CredentialSource,
+    cache: &super::TokenCache,
+    http: reqwest::Client,
+) -> Result<Arc<dyn CredentialBroker>, BrokerError> {
+    match source {
+        super::CredentialSource::Local => Ok(Arc::new(LocalBroker::new(http).without_redirects()?)),
+        super::CredentialSource::Remote { .. } => Ok(broker_from_source(source, cache, http)),
+    }
+}
+
+/// The process's HTTP client that never follows redirects, for bounded
+/// single-attempt requests; `None` when it cannot be built (then no bounded
+/// request may be sent).
+pub fn redirect_free_http() -> Option<reqwest::Client> {
+    static CLIENT: std::sync::OnceLock<Option<reqwest::Client>> = std::sync::OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .connect_timeout(Duration::from_secs(10))
+                .build()
+                .inspect_err(
+                    |error| tracing::warn!(%error, "redirect-free broker client unavailable"),
+                )
+                .ok()
+        })
+        .clone()
+}
+
+fn redirect_free_unavailable() -> BrokerError {
+    BrokerError::UnsupportedCapability {
+        provider: "broker".into(),
+        capability: "an HTTP client that refuses redirects".into(),
+    }
+}
+
 static GLOBAL_BROKER: std::sync::RwLock<Option<Arc<dyn CredentialBroker>>> =
     std::sync::RwLock::new(None);
 
@@ -5315,6 +6658,31 @@ pub fn static_key_status_map() -> BTreeMap<String, StaticKeyStatus> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A selection keeps the accounts of its first listing by storage key:
+    /// an account added later is left out, one removed later drops out (the
+    /// later entries move up a place), and an entry that names no account is
+    /// kept in every pass.
+    #[test]
+    fn a_selection_keeps_its_first_listing_by_storage_key_through_churn() {
+        let provider = OAuthProviderId::Anthropic;
+        let named = |label: &str| AccountSummary::new(provider, &Account::named(label).unwrap());
+        let nameless = AccountSummary {
+            provider: "no-such-provider".to_string(),
+            label: "work".to_string(),
+            ..AccountSummary::default()
+        };
+        assert!(nameless.credential_ref().is_none());
+        let mut reads = SelectionReads::new(0);
+        let first = reads.keep_inventory(vec![named("a"), named("b"), nameless.clone()]);
+        assert_eq!(first, vec![named("a"), named("b"), nameless.clone()]);
+        // "b" is removed and "c" is added while the selection runs.
+        let later = reads.keep_inventory(vec![named("a"), named("c"), nameless.clone()]);
+        assert_eq!(later, vec![named("a"), nameless.clone()]);
+        // "b" comes back: it is in the first listing, so it is kept again.
+        let back = reads.keep_inventory(vec![named("a"), named("b"), named("c"), nameless.clone()]);
+        assert_eq!(back, vec![named("a"), named("b"), nameless]);
+    }
 
     #[test]
     fn login_availability_handles_named_only_and_explicit_policy() {
@@ -6044,6 +7412,202 @@ mod tests {
         assert!(text.contains("[DONE]"));
         // Key applied broker-side (default local key), not by the caller.
         assert_eq!(&*seen_auth.lock().unwrap(), "Bearer local");
+    }
+
+    /// A refused connection is known not to have sent the request; an
+    /// upstream error status after sending is not.
+    #[tokio::test]
+    async fn a_refused_connection_is_typed_as_not_sent() {
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/v1", closed.local_addr().unwrap());
+        drop(closed);
+        let broker = LocalBroker::with_local_base_url(reqwest::Client::new(), url)
+            .without_redirects()
+            .unwrap();
+        let request = ProxyRequest {
+            provider: LOCAL_PROVIDER_KEY.into(),
+            method: ProxyMethod::Post,
+            path: "/chat/completions".into(),
+            body: Some(serde_json::json!({"model": "m"})),
+            stream: true,
+            body_bytes: None,
+        };
+        let error = match broker.proxy_stream(request).await {
+            Ok(_) => panic!("nothing listens there"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, BrokerError::ConnectFailed(_)), "{error:?}");
+        assert!(error.request_not_sent());
+        assert!(
+            error.to_string().starts_with("broker transport error: "),
+            "display unchanged: {error}"
+        );
+
+        for refused in [
+            BrokerError::UnknownProvider("p".into()),
+            BrokerError::NotConfigured("p".into()),
+            BrokerError::Denied("policy".into()),
+            BrokerError::Credential("expired".into()),
+            BrokerError::Unauthorized,
+        ] {
+            assert!(refused.request_not_sent(), "{refused:?}");
+        }
+        assert!(!BrokerError::Transport("provider request failed: 400".into()).request_not_sent());
+    }
+
+    /// A loopback endpoint that reads one request and answers it with a
+    /// redirect to `location`. Returns its base URL and the number of
+    /// request bytes it received.
+    async fn spawn_redirector(location: String) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let received = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = received.clone();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 65_536];
+                let n = socket.read(&mut buf).await.unwrap_or(0);
+                seen.fetch_add(n, std::sync::atomic::Ordering::SeqCst);
+                let reply = format!(
+                    "HTTP/1.1 307 Temporary Redirect\r\nlocation: {location}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                );
+                let _ = socket.write_all(reply.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+        (format!("http://{addr}/v1"), received)
+    }
+
+    fn local_stream_request() -> ProxyRequest {
+        ProxyRequest {
+            provider: LOCAL_PROVIDER_KEY.into(),
+            method: ProxyMethod::Post,
+            path: "/chat/completions".into(),
+            body: Some(serde_json::json!({"model": "m"})),
+            stream: true,
+            body_bytes: None,
+        }
+    }
+
+    fn closed_port_url() -> String {
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!(
+            "http://{}/v1/chat/completions",
+            closed.local_addr().unwrap()
+        );
+        drop(closed);
+        url
+    }
+
+    /// A refused connection after a followed redirect is not proof that
+    /// nothing was sent: the first hop already received the request.
+    #[tokio::test]
+    async fn a_refused_connection_after_a_redirect_is_not_typed_as_not_sent() {
+        let (url, received) = spawn_redirector(closed_port_url()).await;
+        let broker = LocalBroker::with_local_base_url(reqwest::Client::new(), url);
+        let error = match broker.proxy_stream(local_stream_request()).await {
+            Ok(_) => panic!("the redirect target refuses"),
+            Err(error) => error,
+        };
+        assert!(
+            received.load(std::sync::atomic::Ordering::SeqCst) > 0,
+            "the first hop received the request"
+        );
+        assert!(!error.request_not_sent(), "{error:?}");
+        assert!(
+            error.to_string().starts_with("broker transport error: "),
+            "display unchanged: {error}"
+        );
+    }
+
+    /// A redirect-free broker never follows the redirect: the 3xx is an
+    /// answered (sent) request, and a direct refusal is still not-sent.
+    #[tokio::test]
+    async fn a_redirect_free_broker_types_only_a_direct_refusal_as_not_sent() {
+        let (url, received) = spawn_redirector(closed_port_url()).await;
+        let broker = LocalBroker::with_local_base_url(reqwest::Client::new(), url)
+            .without_redirects()
+            .unwrap();
+        let error = match broker.proxy_stream(local_stream_request()).await {
+            Ok(_) => panic!("a redirect is not a stream"),
+            Err(error) => error,
+        };
+        assert!(received.load(std::sync::atomic::Ordering::SeqCst) > 0);
+        assert!(matches!(error, BrokerError::Transport(_)), "{error:?}");
+        assert!(!error.request_not_sent());
+
+        let refused = closed_port_url();
+        let base = refused.trim_end_matches("/chat/completions").to_string();
+        let broker = LocalBroker::with_local_base_url(reqwest::Client::new(), base)
+            .without_redirects()
+            .unwrap();
+        let error = match broker.proxy_stream(local_stream_request()).await {
+            Ok(_) => panic!("nothing listens there"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, BrokerError::ConnectFailed(_)), "{error:?}");
+        assert!(error.request_not_sent());
+    }
+
+    /// Without a redirect-free client there is no bounded broker at all: the
+    /// failure is a pre-send refusal, never the original redirect-following
+    /// broker.
+    #[test]
+    fn a_bounded_broker_fails_closed_without_a_redirect_free_client() {
+        let error = match LocalBroker::new(reqwest::Client::new()).with_redirect_free_http(None) {
+            Ok(_) => panic!("no broker without a redirect-free client"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error, BrokerError::UnsupportedCapability { .. }),
+            "{error:?}"
+        );
+        assert!(error.request_not_sent());
+        // The public path uses the verified factory's client.
+        assert!(redirect_free_http().is_some());
+        let broker = LocalBroker::new(reqwest::Client::new())
+            .without_redirects()
+            .expect("the factory's redirect-free client");
+        assert!(broker.redirect_free);
+    }
+
+    /// `request_not_sent` is an explicit allowlist of pre-send variants.
+    #[test]
+    fn only_typed_pre_send_failures_are_not_sent() {
+        for refused in [
+            BrokerError::UnknownProvider("p".into()),
+            BrokerError::RegistrationRequired {
+                provider: "p".into(),
+                remediation: "r".into(),
+            },
+            BrokerError::NotConfigured("p".into()),
+            BrokerError::Unauthorized,
+            BrokerError::Denied("policy".into()),
+            BrokerError::UnsupportedCapability {
+                provider: "p".into(),
+                capability: "tools".into(),
+            },
+            BrokerError::ConnectFailed("refused".into()),
+            BrokerError::Credential("expired".into()),
+            BrokerError::UnknownAccount {
+                provider: "p".into(),
+                label: "a".into(),
+            },
+            BrokerError::UnsupportedAccount {
+                provider: "p".into(),
+                label: "a".into(),
+            },
+            BrokerError::InvalidAccount("a".into()),
+            BrokerError::NoAccountAvailable {
+                provider: "p".into(),
+                reason: "none".into(),
+                failure: None,
+            },
+        ] {
+            assert!(refused.request_not_sent(), "{refused:?}");
+        }
+        assert!(!BrokerError::Transport("reset".into()).request_not_sent());
     }
 
     /// A non-2xx upstream response never yields a stream — it becomes a typed

@@ -495,6 +495,12 @@ pub struct UsageSnapshot {
     /// `Some(true)` blocks subscribed availability exactly like `limit_reached`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spend_control_reached: Option<bool>,
+    /// Whether the account's paid extra usage is switched on (Anthropic
+    /// `extra_usage.is_enabled`, when that is a JSON bool). `None` when the
+    /// reading says nothing usable (absent, null, another type), for every
+    /// other provider, and for a reading saved before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extra_usage_enabled: Option<bool>,
     pub windows: Vec<UsageWindow>,
     pub model_availability: Vec<ModelAvailability>,
     pub credits: Option<CreditBalance>,
@@ -519,6 +525,7 @@ impl UsageSnapshot {
             plan: None,
             limit_reached: None,
             spend_control_reached: None,
+            extra_usage_enabled: None,
             windows: Vec::new(),
             model_availability: Vec::new(),
             credits: None,
@@ -533,6 +540,16 @@ impl UsageSnapshot {
     /// Stale readings are never capacity.
     pub fn is_stale(&self, now_ms: u64, max_age_ms: u64) -> bool {
         now_ms < self.observed_at || now_ms - self.observed_at > max_age_ms
+    }
+
+    /// A reset this reading reports has passed since it was read: that
+    /// window has started again, so the reading is out of date.
+    pub fn reset_since_observed(&self, now_ms: u64) -> bool {
+        self.windows
+            .iter()
+            .filter_map(|w| w.reset_at)
+            .chain(self.model_availability.iter().filter_map(|m| m.reset_at))
+            .any(|at| at > self.observed_at && at <= now_ms)
     }
 
     pub fn window(&self, id: &str) -> Option<&UsageWindow> {
@@ -666,8 +683,16 @@ impl UsageSnapshot {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum AccountUsageOutcome {
-    Ok { snapshot: Box<UsageSnapshot> },
-    Error { error: UsageErrorSummary },
+    Ok {
+        snapshot: Box<UsageSnapshot>,
+    },
+    Error {
+        error: UsageErrorSummary,
+        /// For a read the usage endpoint rate-limited: the account's last
+        /// good reading (with the time it was read), when one is known.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        last_good: Option<Box<UsageSnapshot>>,
+    },
 }
 
 impl AccountUsageOutcome {
@@ -679,6 +704,7 @@ impl AccountUsageOutcome {
     pub fn error(error: &UsageError) -> Self {
         Self::Error {
             error: error.into(),
+            last_good: None,
         }
     }
     pub fn snapshot(&self) -> Option<&UsageSnapshot> {
@@ -696,6 +722,10 @@ pub struct UsageErrorSummary {
     pub message: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub http_status: Option<u16>,
+    /// For a read the usage endpoint rate-limited: when the reporting
+    /// process sends the account's next usage request (epoch ms).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_at_ms: Option<u64>,
 }
 
 impl From<&UsageError> for UsageErrorSummary {
@@ -711,6 +741,7 @@ impl From<&UsageError> for UsageErrorSummary {
             kind: e.kind().to_string(),
             message: e.to_string(),
             http_status,
+            retry_at_ms: None,
         }
     }
 }
@@ -722,6 +753,7 @@ impl UsageErrorSummary {
             kind: kind.to_string(),
             message: message.into(),
             http_status: None,
+            retry_at_ms: None,
         }
     }
 }
@@ -928,12 +960,22 @@ pub fn parse_anthropic_usage(
     let mut snap = UsageSnapshot::empty(OAuthProviderId::Anthropic, account_label, observed_at);
     let mut skipped_null = 0usize;
     let mut unrecognized = 0usize;
+    let mut limits: Option<&Vec<Value>> = None;
     for (key, val) in &map {
+        // The `limits` list: read after the top-level windows, which win.
+        if let ("limits", Value::Array(entries)) = (key.as_str(), val) {
+            limits = Some(entries);
+            continue;
+        }
         // Paid extra usage is a window only when the account has it switched
         // on and reports a number; otherwise the entry is omitted, with no
-        // note: a feature that is off is not a gap in the reading.
-        if key == "extra_usage" && !extra_usage_shown(val) {
-            continue;
+        // note: a feature that is off is not a gap in the reading. Whether it
+        // is on is kept either way, when the reading says so.
+        if key == "extra_usage" {
+            snap.extra_usage_enabled = val.get("is_enabled").and_then(Value::as_bool);
+            if !extra_usage_shown(val) {
+                continue;
+            }
         }
         match val {
             Value::Object(w) if w.contains_key("utilization") || w.contains_key("resets_at") => {
@@ -974,11 +1016,93 @@ pub fn parse_anthropic_usage(
     if unrecognized > 0 {
         snap.note("unrecognized fields ignored");
     }
+    if let Some(entries) = limits {
+        anthropic_limit_windows(&mut snap, entries);
+    }
     if snap.windows.is_empty() {
         snap.note("no usage windows in response");
     }
     snap.derive_model_availability();
     Ok(snap)
+}
+
+/// Longest model name a `limits` entry may give its window (bytes).
+const LIMIT_MODEL_NAME_MAX: usize = 32;
+
+/// The windows of Anthropic's `limits` list (the shape other clients read,
+/// not a documented schema): a `weekly_scoped` entry that names one model
+/// (`scope.model.display_name`, one plain word) is that model's weekly
+/// window, `seven_day_<name>`, as a top-level `seven_day_opus` is; a
+/// top-level window of the same id wins. The repeats of the shared windows
+/// (`session`, `weekly_all`) are skipped quietly. Every other entry is left
+/// out with one fixed note that names no key or value.
+fn anthropic_limit_windows(snap: &mut UsageSnapshot, entries: &[Value]) {
+    let mut ignored = false;
+    for entry in entries {
+        match entry.get("kind").and_then(Value::as_str) {
+            Some("session" | "weekly_all") => continue,
+            Some("weekly_scoped") => {}
+            _ => {
+                ignored = true;
+                continue;
+            }
+        }
+        match anthropic_limit_window(entry) {
+            Some(window) => {
+                if snap.window(&window.id).is_none() {
+                    snap.windows.push(window);
+                }
+            }
+            None => ignored = true,
+        }
+    }
+    if ignored {
+        snap.note("unrecognized limit entries ignored");
+    }
+}
+
+/// One `weekly_scoped` entry of `limits` as its model's weekly window, or
+/// `None` when it can't be read: a model name that is not one plain word
+/// (ASCII letters and digits, lowercased, at most [`LIMIT_MODEL_NAME_MAX`]
+/// bytes), no usable percent, or a reset that can't be read (no reset is
+/// fine). The percent is read as `utilization` is ([`UsedPercent`]).
+fn anthropic_limit_window(entry: &Value) -> Option<UsageWindow> {
+    let name = entry
+        .pointer("/scope/model/display_name")?
+        .as_str()?
+        .to_ascii_lowercase();
+    if name.is_empty()
+        || name.len() > LIMIT_MODEL_NAME_MAX
+        || !name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+    {
+        return None;
+    }
+    let used_percent = UsedPercent::from_json(entry.get("percent"));
+    if !used_percent.is_known() {
+        return None;
+    }
+    let reset_at = match entry.get("resets_at") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(epoch_ms_from_value(Some(v))?),
+    };
+    let id = format!("seven_day_{name}");
+    let duration_secs = anthropic_duration_hint(&id);
+    Some(UsageWindow {
+        label: duration_secs
+            .map(duration_label)
+            .unwrap_or_else(|| "unknown".into()),
+        scope: anthropic_scope(&id),
+        id,
+        duration_secs,
+        used_percent,
+        used: None,
+        limit: None,
+        reset_at,
+        reset_kind: ResetKind::QuotaWindow,
+        limit_reached: None,
+    })
 }
 
 // ── Codex parser ────────────────────────────────────────────────────────────
@@ -1909,6 +2033,151 @@ mod tests {
         assert_eq!(s.earliest_reset_at(), epoch_ms_from_rfc3339("2025-09-20T22:00:00Z"));
     }
 
+    // ── A4: the `limits` list (Fable's weekly limit) ────────────────────────
+
+    /// A reading with the shared windows at 40 % and this `limits` value (the
+    /// shape other clients read; not a documented schema).
+    fn with_limits(limits: &str) -> String {
+        format!(
+            r#"{{"five_hour": {{"utilization": 40, "resets_at": "2025-09-20T22:00:00Z"}},
+                "seven_day": {{"utilization": 40, "resets_at": "2025-09-24T00:00:00Z"}},
+                "limits": {limits}}}"#
+        )
+    }
+
+    /// Fable's weekly limit, spent.
+    const FABLE_LIMIT: &str = r#"{"kind": "weekly_scoped", "scope": {"model": {"display_name": "Fable"}}, "percent": 100, "resets_at": "2025-09-23T00:00:00Z"}"#;
+
+    /// A weekly limit of one model's requests in `limits` is that model's
+    /// window, as a top-level `seven_day_opus` is: `seven_day_<model>`, 7
+    /// days, scoped to the model, with its percent and reset. A spent Fable
+    /// limit makes Fable unavailable and leaves the account's capacity (and
+    /// Opus) alone. The repeats of the shared windows (`session`,
+    /// `weekly_all`) are skipped, with no note.
+    #[test]
+    fn anthropic_limits_give_a_weekly_window_of_the_named_model() {
+        let body = with_limits(&format!(
+            r#"[{{"kind": "session", "percent": 40, "resets_at": "2025-09-20T22:00:00Z"}},
+                {{"kind": "weekly_all", "percent": 40, "resets_at": "2025-09-24T00:00:00Z"}},
+                {FABLE_LIMIT},
+                {{"kind": "weekly_scoped", "scope": {{"model": {{"display_name": "Opus"}}}}, "percent": 30, "resets_at": null}}]"#
+        ));
+        let s = parse_anthropic_usage(&body, "a", T0).unwrap();
+        assert_eq!(s.windows.len(), 4, "{:?}", s.windows);
+        let fable = s.window("seven_day_fable").expect("Fable's weekly window");
+        assert_eq!(fable.scope, WindowScope::Model { model: "fable".into() });
+        assert_eq!(fable.duration_secs, Some(7 * 86400));
+        assert_eq!(fable.label, "7d");
+        assert_eq!(fable.used_percent.valid(), Some(100.0));
+        assert_eq!(fable.reset_at, epoch_ms_from_rfc3339("2025-09-23T00:00:00Z"));
+        assert_eq!(fable.reset_kind, ResetKind::QuotaWindow);
+        assert!(fable.is_exhausted());
+        let opus = s.window("seven_day_opus").expect("another named model");
+        assert_eq!(opus.scope, WindowScope::Model { model: "opus".into() });
+        assert_eq!((opus.used_percent.valid(), opus.reset_at), (Some(30.0), None));
+        let fable_model = s
+            .model_availability_for("claude-fable-5-1")
+            .expect("Fable's availability");
+        assert_eq!(fable_model.availability, Availability::Exhausted);
+        assert!(s.has_proven_capacity(T0 + 1000, 60_000));
+        assert!(s.has_proven_capacity_for_model("claude-opus-5-5", T0 + 1000, 60_000));
+        assert!(!s.has_proven_capacity_for_model("claude-fable-5-1", T0 + 1000, 60_000));
+        assert!(s.notes.is_empty(), "{:?}", s.notes);
+    }
+
+    /// A `percent` is read as a percentage, as `utilization` is: 1 is 1 %
+    /// (not a full fraction), an overrun is spent, and a numeric string
+    /// counts.
+    #[test]
+    fn anthropic_limits_percent_is_read_as_a_percentage() {
+        for (percent, used) in [("1", 1.0), ("0.5", 0.5), ("250", 100.0), (r#""42""#, 42.0)] {
+            let entry = format!(
+                r#"[{{"kind": "weekly_scoped", "scope": {{"model": {{"display_name": "Fable"}}}}, "percent": {percent}}}]"#
+            );
+            let s = parse_anthropic_usage(&with_limits(&entry), "a", T0).unwrap();
+            let fable = s.window("seven_day_fable").unwrap_or_else(|| panic!("{percent}"));
+            assert_eq!(fable.used_percent.valid(), Some(used), "{percent}");
+        }
+    }
+
+    /// Without `limits` the reading is today's: the same windows, no model
+    /// entry, no note; a `limits` that is not a list is an unrecognized
+    /// field, as before.
+    #[test]
+    fn anthropic_reading_without_limits_is_unchanged() {
+        let body = r#"{"five_hour": {"utilization": 40, "resets_at": "2025-09-20T22:00:00Z"},
+                       "seven_day": {"utilization": 40, "resets_at": "2025-09-24T00:00:00Z"}}"#;
+        let s = parse_anthropic_usage(body, "a", T0).unwrap();
+        let ids: Vec<&str> = s.windows.iter().map(|w| w.id.as_str()).collect();
+        assert_eq!(ids, ["five_hour", "seven_day"]);
+        assert!(s.model_availability.is_empty());
+        assert!(s.notes.is_empty(), "{:?}", s.notes);
+        let s = parse_anthropic_usage(&with_limits(r#"{"kind": "weekly_scoped"}"#), "a", T0).unwrap();
+        assert_eq!(s.windows.len(), 2);
+        assert_eq!(s.notes, ["unrecognized fields ignored"]);
+    }
+
+    /// Every other entry in `limits` is left out with one fixed note that
+    /// names no key or value: an unknown kind, a name that is not one plain
+    /// word (or longer than 32 bytes), no usable percent, an unreadable
+    /// reset, no model scope, not an object. Fable's entry beside it still
+    /// counts. An empty list, or only the repeats of the shared windows,
+    /// says nothing.
+    #[test]
+    fn anthropic_limits_entries_it_cannot_read_are_ignored_with_one_note() {
+        let scoped = |name: &str, rest: &str| {
+            format!(
+                r#"{{"kind": "weekly_scoped", "scope": {{"model": {{"display_name": "{name}"}}}}{rest}}}"#
+            )
+        };
+        for entry in [
+            r#"{"kind": "monthly_scoped", "scope": {"model": {"display_name": "Fable"}}, "percent": 5}"#
+                .to_string(),
+            scoped("Fable Max", r#", "percent": 5"#),
+            scoped("fable_oi", r#", "percent": 5"#),
+            scoped("F\u{e4}ble", r#", "percent": 5"#),
+            scoped("", r#", "percent": 5"#),
+            scoped("Abcdefghijklmnopqrstuvwxyzabcdefg", r#", "percent": 5"#),
+            scoped("Fable", ""),
+            scoped("Fable", r#", "percent": null"#),
+            scoped("Fable", r#", "percent": -3"#),
+            scoped("Fable", r#", "percent": 5, "resets_at": "soon""#),
+            r#"{"kind": "weekly_scoped", "scope": {"plan": "max"}, "percent": 5}"#.to_string(),
+            r#"{"percent": 5}"#.to_string(),
+            r#""weekly_scoped""#.to_string(),
+        ] {
+            let body = with_limits(&format!("[{entry}, {FABLE_LIMIT}]"));
+            let s = parse_anthropic_usage(&body, "a", T0).unwrap();
+            let ids: Vec<&str> = s.windows.iter().map(|w| w.id.as_str()).collect();
+            assert_eq!(ids, ["five_hour", "seven_day", "seven_day_fable"], "{entry}");
+            assert_eq!(s.notes, ["unrecognized limit entries ignored"], "{entry}");
+        }
+        for quiet in [
+            "[]",
+            r#"[{"kind": "session", "percent": 40}, {"kind": "weekly_all", "percent": 40}]"#,
+        ] {
+            let s = parse_anthropic_usage(&with_limits(quiet), "a", T0).unwrap();
+            assert_eq!(s.windows.len(), 2, "{quiet}");
+            assert!(s.notes.is_empty(), "{quiet}: {:?}", s.notes);
+        }
+    }
+
+    /// A top-level window of the same id wins over the `limits` entry: one
+    /// window, the top-level one, and no note.
+    #[test]
+    fn anthropic_limits_never_duplicate_a_top_level_window() {
+        let body = format!(
+            r#"{{"five_hour": {{"utilization": 40, "resets_at": "2025-09-20T22:00:00Z"}},
+                "seven_day_fable": {{"utilization": 20, "resets_at": "2025-09-23T00:00:00Z"}},
+                "limits": [{FABLE_LIMIT}]}}"#
+        );
+        let s = parse_anthropic_usage(&body, "a", T0).unwrap();
+        let fable: Vec<_> = s.windows.iter().filter(|w| w.id == "seven_day_fable").collect();
+        assert_eq!(fable.len(), 1);
+        assert_eq!(fable[0].used_percent.valid(), Some(20.0));
+        assert!(s.notes.is_empty(), "{:?}", s.notes);
+    }
+
     /// Paid extra usage is a window only when the account has it switched on
     /// and reports a numeric utilization (0 counts). Every other shape is
     /// omitted with no note, so no status row can show it.
@@ -1958,6 +2227,57 @@ mod tests {
         )
         .unwrap();
         assert!(s.notes.iter().any(|n| n == "unrecognized fields ignored"));
+    }
+
+    /// Part 2 (F): the reading keeps what `extra_usage.is_enabled` says when
+    /// it is a JSON bool, whatever the window rule above did; anything else
+    /// (absent, null, a string) is unknown. Unknown is not written (today's
+    /// bytes); a reading without the field loads as unknown; and a reader
+    /// refuses no field it doesn't know (so an older build reads a newer
+    /// reading).
+    #[test]
+    fn anthropic_extra_usage_flag_is_read_only_from_a_json_bool() {
+        let parse = |extra: Option<&str>| {
+            let body = match extra {
+                Some(extra) => {
+                    format!(r#"{{"five_hour": {{"utilization": 10}}, "extra_usage": {extra}}}"#)
+                }
+                None => r#"{"five_hour": {"utilization": 10}}"#.to_string(),
+            };
+            parse_anthropic_usage(&body, "a", T0).unwrap()
+        };
+        let real_off =
+            r#"{"is_enabled": false, "monthly_limit": null, "used_credits": null, "utilization": null}"#;
+        for (extra, flag) in [
+            (Some(real_off), Some(false)),
+            (Some(r#"{"is_enabled": false}"#), Some(false)),
+            (Some(r#"{"is_enabled": true, "utilization": null}"#), Some(true)),
+            (Some(r#"{"is_enabled": true, "utilization": 42}"#), Some(true)),
+            (Some(r#"{"is_enabled": "false"}"#), None),
+            (Some(r#"{"is_enabled": null}"#), None),
+            (Some(r#"{"utilization": 7}"#), None),
+            (Some("null"), None),
+            (None, None),
+        ] {
+            assert_eq!(parse(extra).extra_usage_enabled, flag, "{extra:?}");
+        }
+        // The window rule is unchanged: shown only when on with a number.
+        let on_null = parse(Some(r#"{"is_enabled": true, "utilization": null}"#));
+        assert!(on_null.window("extra_usage").is_none());
+        let on_42 = parse(Some(r#"{"is_enabled": true, "utilization": 42}"#));
+        assert!(on_42.window("extra_usage").is_some());
+
+        let unknown = serde_json::to_value(parse(None)).unwrap();
+        assert!(unknown.get("extra_usage_enabled").is_none(), "{unknown}");
+        let off = parse(Some(real_off));
+        let mut bytes = serde_json::to_value(&off).unwrap();
+        assert_eq!(bytes["extra_usage_enabled"], false);
+        assert_eq!(serde_json::from_value::<UsageSnapshot>(bytes.clone()).unwrap(), off);
+        bytes["a_field_from_a_newer_build"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<UsageSnapshot>(bytes.clone()).is_ok());
+        bytes.as_object_mut().unwrap().remove("extra_usage_enabled");
+        let older: UsageSnapshot = serde_json::from_value(bytes).unwrap();
+        assert_eq!(older.extra_usage_enabled, None);
     }
 
     #[test]

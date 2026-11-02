@@ -54,14 +54,64 @@ pub async fn start_callback_server_at(
     port: u16,
     path: &str,
 ) -> Result<(oneshot::Receiver<CallbackOutcome>, CallbackServerHandle), String> {
+    start_listener(expected_state, host, port, path, |hit| hit.outcome)
+        .await
+        .map_err(String::from)
+}
+
+/// One callback request: what it carried and whether its `state` matched
+/// the expected one (an [`CallbackOutcome::Invalid`] with a matching state
+/// is a provider-side problem, not a forged callback).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CallbackHit {
+    pub(crate) outcome: CallbackOutcome,
+    pub(crate) state_matched: bool,
+}
+
+/// Why the callback listener did not start.
+#[derive(Debug)]
+pub(crate) enum CallbackStartError {
+    /// Host or path refused (a caller bug).
+    Config(&'static str),
+    /// The port could not be bound (in use, or not permitted).
+    Bind(String),
+}
+
+impl From<CallbackStartError> for String {
+    fn from(e: CallbackStartError) -> Self {
+        match e {
+            CallbackStartError::Config(m) => m.to_string(),
+            CallbackStartError::Bind(m) => m,
+        }
+    }
+}
+
+/// [`start_callback_server_at`] with typed start errors and the
+/// state-match flag on the delivered hit.
+pub(crate) async fn start_callback_server_typed(
+    expected_state: String,
+    host: &str,
+    port: u16,
+    path: &str,
+) -> Result<(oneshot::Receiver<CallbackHit>, CallbackServerHandle), CallbackStartError> {
+    start_listener(expected_state, host, port, path, |hit| hit).await
+}
+
+async fn start_listener<T: Send + 'static>(
+    expected_state: String,
+    host: &str,
+    port: u16,
+    path: &str,
+    deliver: fn(CallbackHit) -> T,
+) -> Result<(oneshot::Receiver<T>, CallbackServerHandle), CallbackStartError> {
     if !path.starts_with('/') || path.contains("..") {
-        return Err("invalid callback path".into());
+        return Err(CallbackStartError::Config("invalid callback path"));
     }
     let host_ip: std::net::IpAddr = host
         .parse()
-        .map_err(|_| "callback host must be a loopback IP address")?;
+        .map_err(|_| CallbackStartError::Config("callback host must be a loopback IP address"))?;
     if !host_ip.is_loopback() {
-        return Err("callback host must be loopback".into());
+        return Err(CallbackStartError::Config("callback host must be loopback"));
     }
     let (tx, rx) = oneshot::channel();
     let tx = Arc::new(Mutex::new(Some(tx)));
@@ -93,10 +143,14 @@ pub async fn start_callback_server_at(
                 } else {
                     CallbackOutcome::Invalid
                 };
+                let authorized = matches!(outcome, CallbackOutcome::Authorized(_));
                 if let Some(sender) = tx.lock().await.take() {
-                    let _ = sender.send(outcome.clone());
+                    let _ = sender.send(deliver(CallbackHit {
+                        outcome,
+                        state_matched: state_matches,
+                    }));
                 }
-                axum::response::Html(if matches!(outcome, CallbackOutcome::Authorized(_)) {
+                axum::response::Html(if authorized {
                     SUCCESS_HTML
                 } else {
                     ERROR_HTML
@@ -108,7 +162,7 @@ pub async fn start_callback_server_at(
     let addr = format!("{host}:{port}");
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
-        .map_err(|e| format!("Failed to bind callback server on {addr}: {e}"))?;
+        .map_err(|e| CallbackStartError::Bind(format!("Failed to bind callback server on {addr}: {e}")))?;
     let (shutdown, stop) = oneshot::channel();
     let task = tokio::spawn(async move {
         let _ = axum::serve(listener, app)

@@ -72,6 +72,34 @@ const H_5H_STATUS: &str = "anthropic-ratelimit-unified-5h-status";
 const H_5H_RESET: &str = "anthropic-ratelimit-unified-5h-reset";
 const H_7D_STATUS: &str = "anthropic-ratelimit-unified-7d-status";
 const H_7D_RESET: &str = "anthropic-ratelimit-unified-7d-reset";
+/// How much of the five-hour / weekly window is spent, as a fraction (1.0 =
+/// the limit). A window can be spent behind an `allowed` status while extra
+/// usage pays for it.
+const H_5H_UTILIZATION: &str = "anthropic-ratelimit-unified-5h-utilization";
+const H_7D_UTILIZATION: &str = "anthropic-ratelimit-unified-7d-utilization";
+/// `7d_oi`: Fable's weekly limit, a limit of Fable's requests only (9 of
+/// 193 captured 429s carried it, all on Fable requests).
+const H_7D_OI_STATUS: &str = "anthropic-ratelimit-unified-7d_oi-status";
+const H_7D_OI_RESET: &str = "anthropic-ratelimit-unified-7d_oi-reset";
+/// The window the provider names as the reason for the limit.
+const H_REPRESENTATIVE_CLAIM: &str = "anthropic-ratelimit-unified-representative-claim";
+/// The claims that name Fable's weekly bucket. Unverified: no 429 seen so
+/// far named it; any other claim is a limit of the whole account.
+const FABLE_WEEKLY_CLAIMS: [&str; 2] = ["seven_day_oi", "7d_oi"];
+/// The longest claim a log line names as itself; a longer one is `other`.
+const CLAIM_WORD_MAX: usize = 32;
+/// The unrecognized-claim line's limiter admits at most one line per this
+/// many milliseconds, process-wide, on its own monotonic clock (never the
+/// response's time); the next one says how many were left out. A thread
+/// that stalls between its admission and its write can write its line
+/// late, so in rare cases two lines land close together; lines never
+/// outnumber admissions, so a storm of such 429s can't flood the log.
+const CLAIM_LINE_INTERVAL_MS: u64 = 60_000;
+/// The signal of a 429 refused by Fable's weekly limit alone.
+const FABLE_WEEKLY_LIMIT: AnthropicQuotaSignal = AnthropicQuotaSignal::ModelWindowRejected {
+    window: "7d_oi",
+    model: "fable",
+};
 const H_RETRY_AFTER: &str = "retry-after";
 const RATELIMIT_PREFIX: &str = "anthropic-ratelimit-";
 
@@ -85,6 +113,13 @@ pub(crate) enum AnthropicQuotaSignal {
     /// `error.type == "rate_limit_error"` body plus a reset/retry-after at
     /// least [`LONG_RESET_MIN_SECS`] away.
     LongResetWithRateLimitBody,
+    /// `anthropic-ratelimit-unified-<window>-status: rejected` for a window
+    /// that limits one model's requests only (`7d_oi`: Fable's weekly
+    /// limit), while the shared five-hour and weekly windows are allowed.
+    ModelWindowRejected {
+        window: &'static str,
+        model: &'static str,
+    },
 }
 
 /// Recognized window exhaustion for the seat that made the request.
@@ -115,6 +150,36 @@ impl AnthropicQuotaEvidence {
     pub(crate) fn reset_is_long(&self, now_ms: u64) -> bool {
         self.resets_at_ms
             .is_some_and(|t| t > now_ms.saturating_add(LONG_RESET_MIN_SECS * 1000))
+    }
+
+    /// The model whose requests alone this limit stops (a token of the
+    /// model id, `fable`), or `None` when it stops the whole account.
+    pub(crate) fn model_scope(&self) -> Option<&'static str> {
+        match self.signal {
+            AnthropicQuotaSignal::ModelWindowRejected { model, .. } => Some(model),
+            _ => None,
+        }
+    }
+
+    /// This evidence for a request for `model`: a limit of another model's
+    /// requests can't be what refused it, so it stops the whole account.
+    pub(crate) fn for_request_model(self, model: &str) -> Self {
+        match self.signal {
+            AnthropicQuotaSignal::ModelWindowRejected {
+                window,
+                model: limited,
+            } if !crate::auth::quota_policy::model_matches(
+                limited,
+                super::auth::quota_model_key(model),
+            ) =>
+            {
+                Self {
+                    signal: AnthropicQuotaSignal::WindowStatusRejected { window },
+                    ..self
+                }
+            }
+            _ => self,
+        }
     }
 }
 
@@ -196,6 +261,130 @@ fn effective_reset_ms(headers: &HeaderMap, now_ms: u64) -> Option<u64> {
         .min()
 }
 
+/// A representative claim as a log-safe word: lowercased, 1 to
+/// [`CLAIM_WORD_MAX`] bytes of `[a-z0-9_]`, else `other`.
+fn claim_word(claim: &str) -> String {
+    let word = claim.to_ascii_lowercase();
+    if !word.is_empty()
+        && word.len() <= CLAIM_WORD_MAX
+        && word
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+    {
+        word
+    } else {
+        "other".to_string()
+    }
+}
+
+/// One rule-0 input, read conservatively: absent; one value that is
+/// visible ASCII (trimmed); or unusable: present but not visible ASCII, or
+/// sent more than once. An unusable input is unknown, never absent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SoleHeader<'h> {
+    Absent,
+    Value(&'h str),
+    Unusable,
+}
+
+fn sole_header<'h>(headers: &'h HeaderMap, name: &str) -> SoleHeader<'h> {
+    let mut values = headers.get_all(name).iter();
+    let Some(first) = values.next() else {
+        return SoleHeader::Absent;
+    };
+    if values.next().is_some() {
+        return SoleHeader::Unusable;
+    }
+    match first.to_str() {
+        Ok(value) => SoleHeader::Value(value.trim()),
+        Err(_) => SoleHeader::Unusable,
+    }
+}
+
+/// Rate state of the unrecognized-claim line, process-wide: when it was
+/// last logged, on the limiter's own clock ([`claim_line_clock_ms`]), and
+/// how many were left out since.
+struct ClaimLineState {
+    last_ms: Option<u64>,
+    suppressed: u64,
+}
+
+static CLAIM_LINE: std::sync::Mutex<ClaimLineState> = std::sync::Mutex::new(ClaimLineState {
+    last_ms: None,
+    suppressed: 0,
+});
+
+/// The clock the unrecognized-claim line's limiter reads: monotonic
+/// milliseconds since its first read in this process (a test may set it).
+/// The limiter reads it under its own lock, so admissions follow this
+/// clock's order; the response's time is never used, so a wall clock
+/// stepped back, or a caller that took its time before another one did,
+/// can't get a line admitted early.
+fn claim_line_clock_ms() -> u64 {
+    #[cfg(test)]
+    if let Some(ms) = *CLAIM_LINE_TEST_CLOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    {
+        return ms;
+    }
+    static ORIGIN: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let origin = *ORIGIN.get_or_init(std::time::Instant::now);
+    u64::try_from(origin.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Whether the unrecognized-claim line may be logged now: `Some` with how
+/// many were left out since the last admission, or `None` (counted) inside
+/// [`CLAIM_LINE_INTERVAL_MS`] of it, on the limiter's own clock, read
+/// under the lock. A reading earlier than the last line's (which a
+/// monotonic clock never gives) counts as inside the interval. The line is
+/// written after the lock is released, so a thread that stalls between its
+/// admission and its write can write its line late, and in rare cases two
+/// lines land close together; lines never outnumber admissions, so a storm
+/// of such 429s can't flood the log.
+fn admit_claim_line() -> Option<u64> {
+    let mut state = CLAIM_LINE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let now_ms = claim_line_clock_ms();
+    if let Some(last) = state.last_ms {
+        if now_ms.saturating_sub(last) < CLAIM_LINE_INTERVAL_MS {
+            state.suppressed = state.suppressed.saturating_add(1);
+            return None;
+        }
+    }
+    state.last_ms = Some(now_ms);
+    Some(std::mem::take(&mut state.suppressed))
+}
+
+/// Test seam: forget the unrecognized-claim line's rate state and any
+/// clock a test set, so a test that captures the line sees its own.
+#[cfg(test)]
+fn reset_claim_line_limiter() {
+    let mut state = CLAIM_LINE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    state.last_ms = None;
+    state.suppressed = 0;
+    drop(state);
+    *CLAIM_LINE_TEST_CLOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+}
+
+/// A clock a test set for the limiter, in place of the monotonic one.
+#[cfg(test)]
+static CLAIM_LINE_TEST_CLOCK: std::sync::Mutex<Option<u64>> = std::sync::Mutex::new(None);
+
+/// Test seam: the clock the unrecognized-claim line's limiter reads, in
+/// milliseconds.
+#[cfg(test)]
+fn set_claim_line_clock(ms: u64) {
+    *CLAIM_LINE_TEST_CLOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(ms);
+}
+
 /// Identifier-shaped `error.type` only (lowercase snake_case, ≤ 64 bytes).
 fn body_error_type(body_prefix: &str) -> Option<String> {
     let json: Value = serde_json::from_str(body_prefix).ok()?;
@@ -212,6 +401,29 @@ fn body_error_type(body_prefix: &str) -> Option<String> {
 /// prefix. Fails closed: anything not matching the table is `RateLimited`.
 ///
 /// Decision table (first match wins):
+/// 0. Only Fable's weekly limit refused it. Each input is read once
+///    ([`sole_header`]): absent, one visible-ASCII value (trimmed), or
+///    unusable (not visible ASCII, or sent more than once), which fails its
+///    condition. `…-unified-7d_oi-status == rejected`; the `…5h-status` and
+///    `…7d-status` each exactly `allowed` or `allowed_warning` (any case);
+///    the `…5h-utilization` and `…7d-utilization` both sent and in
+///    [0, 1); and `…-representative-claim` absent or naming the 7d_oi
+///    bucket (`seven_day_oi` / `7d_oi`, any case) ⇒ a limit of Fable's
+///    requests ([`AnthropicQuotaSignal::ModelWindowRejected`]), whatever
+///    the unified status says; reset from `…7d_oi-reset`, else
+///    `retry-after`. The shape is unverified (the captured 429s had `7d_oi`
+///    allowed); anything short of every condition falls through to today's
+///    rules, and [`AnthropicQuotaEvidence::for_request_model`] makes it the
+///    whole account's on a request for another model. Any other claim, or
+///    an unusable one, with the rest met, leaves an INFO line naming the
+///    claim as a plain word ([`claim_word`]) or `other`, and no other
+///    header value; the limiter admits at most one such line per
+///    [`CLAIM_LINE_INTERVAL_MS`] process-wide, on its own monotonic clock
+///    (the next line carries how many were left out; a thread that stalls
+///    between its admission and its write can write its line late, so two
+///    lines can rarely land close together, but lines never outnumber
+///    admissions). Rules 1-4 read a repeated header's first value, as
+///    before.
 /// 1. `anthropic-ratelimit-unified-status == rejected` (case-insensitive,
 ///    trimmed) ⇒ exhausted; reset from `…-unified-reset`, else the rejected
 ///    window's reset, else `retry-after`.
@@ -231,6 +443,56 @@ pub(crate) fn classify_anthropic_429(
     let five_h_rejected = header_status_is(headers, H_5H_STATUS, "rejected");
     let seven_d_rejected = header_status_is(headers, H_7D_STATUS, "rejected");
 
+    // Rule 0: every input sent once and readable; each shared window
+    // reported with a status the provider sends for a window with room,
+    // and its utilization known and below the limit.
+    let fable_rejected = matches!(
+        sole_header(headers, H_7D_OI_STATUS),
+        SoleHeader::Value(v) if v.eq_ignore_ascii_case("rejected")
+    );
+    let allowed = |name: &str| {
+        matches!(
+            sole_header(headers, name),
+            SoleHeader::Value(v)
+                if v.eq_ignore_ascii_case("allowed") || v.eq_ignore_ascii_case("allowed_warning")
+        )
+    };
+    let below_limit = |name: &str| match sole_header(headers, name) {
+        SoleHeader::Value(v) => v.parse::<f64>().is_ok_and(|u| (0.0..1.0).contains(&u)),
+        SoleHeader::Absent | SoleHeader::Unusable => false,
+    };
+    if fable_rejected
+        && allowed(H_5H_STATUS)
+        && allowed(H_7D_STATUS)
+        && below_limit(H_5H_UTILIZATION)
+        && below_limit(H_7D_UTILIZATION)
+    {
+        let claim = sole_header(headers, H_REPRESENTATIVE_CLAIM);
+        let names_the_fable_bucket = match claim {
+            SoleHeader::Absent => true,
+            SoleHeader::Value(claim) => FABLE_WEEKLY_CLAIMS
+                .iter()
+                .any(|bucket| claim.eq_ignore_ascii_case(bucket)),
+            SoleHeader::Unusable => false,
+        };
+        if names_the_fable_bucket {
+            return Anthropic429::QuotaExhausted(AnthropicQuotaEvidence {
+                signal: FABLE_WEEKLY_LIMIT,
+                resets_at_ms: first_reset_ms(headers, &[H_7D_OI_RESET], now_ms),
+            });
+        }
+        if let Some(suppressed) = admit_claim_line() {
+            let word = match claim {
+                SoleHeader::Value(claim) => claim_word(claim),
+                SoleHeader::Absent | SoleHeader::Unusable => "other".to_string(),
+            };
+            tracing::info!(
+                claim = %word,
+                suppressed,
+                "7d_oi rejected but claim not recognized; rule 0 not applied; today's rules decide"
+            );
+        }
+    }
     if header_status_is(headers, H_UNIFIED_STATUS, "rejected") {
         let mut names: Vec<&str> = vec![H_UNIFIED_RESET];
         if five_h_rejected {
@@ -336,11 +598,18 @@ pub(crate) struct AnthropicFailoverGate {
     pub(crate) tool_activity: bool,
     /// Account switches already spent on this request.
     pub(crate) failovers_so_far: u32,
+    /// The request may be sent once only (a keep-warm ping or a rollover
+    /// summary): a hop would be a second, speculative request at full
+    /// cache-write price on another account's cold prompt cache, and would
+    /// rebind the session's seat from a background request.
+    pub(crate) single_attempt: bool,
 }
 
 /// Why the gate refused an account switch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FailoverRefusal {
+    /// A keep-warm ping or a rollover summary: sent once, on its own seat.
+    SingleAttempt,
     ExplicitSelection,
     OutputAlreadyStreamed,
     ToolActivity,
@@ -353,6 +622,7 @@ impl FailoverRefusal {
     /// Static reason label for logs.
     pub(crate) fn label(self) -> &'static str {
         match self {
+            Self::SingleAttempt => "single_attempt",
             Self::ExplicitSelection => "explicit_selection",
             Self::OutputAlreadyStreamed => "output_already_streamed",
             Self::ToolActivity => "tool_activity",
@@ -366,6 +636,9 @@ impl FailoverRefusal {
 /// before any candidate lookup so an explicit account or a partially
 /// streamed request never triggers usage fetches or token vends.
 pub(crate) fn failover_permitted(gate: &AnthropicFailoverGate) -> Result<(), FailoverRefusal> {
+    if gate.single_attempt {
+        return Err(FailoverRefusal::SingleAttempt);
+    }
     if !gate.auto_selector {
         return Err(FailoverRefusal::ExplicitSelection);
     }
@@ -402,7 +675,11 @@ pub(crate) enum NoHop {
 impl NoHop {
     pub(crate) fn from_refusal(refusal: FailoverRefusal) -> Self {
         match refusal {
-            FailoverRefusal::ExplicitSelection | FailoverRefusal::KeepWarmPing => Self::Explicit,
+            // A ping or a summary on its own seat: the neutral form, which
+            // claims nothing about other accounts.
+            FailoverRefusal::SingleAttempt
+            | FailoverRefusal::ExplicitSelection
+            | FailoverRefusal::KeepWarmPing => Self::Explicit,
             FailoverRefusal::OutputAlreadyStreamed | FailoverRefusal::ToolActivity => {
                 Self::OutputStreamed
             }
@@ -555,6 +832,18 @@ pub(crate) trait AnthropicAccountRouter: Send + Sync {
         model: &str,
         attempted: &[CredentialRef],
     ) -> Result<Option<PinnedToken>, String>;
+
+    /// [`Self::failover`] that keeps why no account was found: `Ok(Err(f))`
+    /// carries the broker's selection failure, when it gave one, for a
+    /// capacity wait to plan from. A capacity wait's re-check calls it with
+    /// nothing attempted. Default: [`Self::failover`], no failure.
+    async fn failover_detailed(
+        &self,
+        model: &str,
+        attempted: &[CredentialRef],
+    ) -> Result<Result<PinnedToken, Option<crate::auth::SelectionFailure>>, String> {
+        Ok(self.failover(model, attempted).await?.ok_or(None))
+    }
 }
 
 /// Adapter over the credential broker. Vends through the broker boundary
@@ -621,11 +910,22 @@ impl AnthropicAccountRouter for BrokerAnthropicRouter {
     async fn report_exhausted(&self, failed: &CredentialRef, evidence: &AnthropicQuotaEvidence) {
         let now_ms = crate::epoch_millis();
         let until_ms = evidence.cooldown_until_ms(now_ms);
-        if let Err(e) = self
-            .broker()
-            .report_cooldown(failed, until_ms, COOLDOWN_REASON_QUOTA)
-            .await
-        {
+        // A limit of one model's requests (Fable's weekly limit) cools the
+        // account for that model only; a broker that keeps no such
+        // cooldowns cools the whole account (the trait's default).
+        let reported = match evidence.model_scope() {
+            Some(model) => {
+                self.broker()
+                    .report_model_cooldown(failed, model, until_ms, COOLDOWN_REASON_QUOTA)
+                    .await
+            }
+            None => {
+                self.broker()
+                    .report_cooldown(failed, until_ms, COOLDOWN_REASON_QUOTA)
+                    .await
+            }
+        };
+        if let Err(e) = reported {
             tracing::warn!(
                 account = %failed,
                 error = %e,
@@ -650,11 +950,19 @@ impl AnthropicAccountRouter for BrokerAnthropicRouter {
         model: &str,
         attempted: &[CredentialRef],
     ) -> Result<Option<PinnedToken>, String> {
+        Ok(self.failover_detailed(model, attempted).await?.ok())
+    }
+
+    async fn failover_detailed(
+        &self,
+        model: &str,
+        attempted: &[CredentialRef],
+    ) -> Result<Result<PinnedToken, Option<crate::auth::SelectionFailure>>, String> {
         let provider = OAuthProviderId::Anthropic;
         // The gate already established `Auto`; re-check so a policy that
         // became explicit mid-request is honoured (never overridden).
         if !matches!(self.broker().account_selector(provider), AccountSelector::Auto) {
-            return Ok(None);
+            return Ok(Err(None));
         }
         match self
             .broker()
@@ -665,9 +973,9 @@ impl AnthropicAccountRouter for BrokerAnthropicRouter {
             )
             .await
         {
-            Ok(next) if !attempted.contains(&next.credential) => Ok(Some(next)),
-            Ok(_attempted_seat) => Ok(None),
-            Err(BrokerError::NoAccountAvailable { .. }) => Ok(None),
+            Ok(next) if !attempted.contains(&next.credential) => Ok(Ok(next)),
+            Ok(_attempted_seat) => Ok(Err(None)),
+            Err(BrokerError::NoAccountAvailable { failure, .. }) => Ok(Err(failure)),
             Err(e) => Err(e.to_string()),
         }
     }
@@ -1072,8 +1380,17 @@ mod tests {
             output_started: false,
             tool_activity: false,
             failovers_so_far: 0,
+            single_attempt: false,
         };
         assert_eq!(failover_permitted(&ok), Ok(()));
+        assert_eq!(
+            failover_permitted(&AnthropicFailoverGate {
+                single_attempt: true,
+                ..ok
+            }),
+            Err(FailoverRefusal::SingleAttempt),
+            "a keep-warm ping or rollover summary is sent once, on its own account"
+        );
         assert_eq!(
             failover_permitted(&AnthropicFailoverGate {
                 auto_selector: false,
@@ -1110,12 +1427,14 @@ mod tests {
                 output_started: true,
                 tool_activity: true,
                 failovers_so_far: 5,
+                single_attempt: false,
             }),
             Err(FailoverRefusal::ExplicitSelection)
         );
         // The log labels are unchanged.
         assert_eq!(
             [
+                FailoverRefusal::SingleAttempt,
                 FailoverRefusal::ExplicitSelection,
                 FailoverRefusal::OutputAlreadyStreamed,
                 FailoverRefusal::ToolActivity,
@@ -1123,6 +1442,7 @@ mod tests {
             ]
             .map(FailoverRefusal::label),
             [
+                "single_attempt",
                 "explicit_selection",
                 "output_already_streamed",
                 "tool_activity",
@@ -1246,6 +1566,555 @@ mod tests {
         }
     }
 
+    // ── A4: a limit of Fable's requests only (`7d_oi`) ───────────────────────
+
+    const FABLE_OI: AnthropicQuotaSignal = AnthropicQuotaSignal::ModelWindowRejected {
+        window: "7d_oi",
+        model: "fable",
+    };
+
+    /// A 429 where only Fable's weekly limit (`7d_oi`) is spent and the
+    /// shared windows are allowed, with their utilization below the limit
+    /// (the shape is unverified: the 429s seen so far had 7d_oi allowed),
+    /// with `changes` applied: a header set to a value, or removed (`None`).
+    fn fable_only(changes: &[(&'static str, Option<&str>)]) -> HeaderMap {
+        let (r5h, r7d, roi) = (
+            epoch_secs_in(1800),
+            epoch_secs_in(5 * 86400),
+            epoch_secs_in(2 * 86400),
+        );
+        let base: [(&'static str, &str); 11] = [
+            ("anthropic-ratelimit-unified-status", "rejected"),
+            ("anthropic-ratelimit-unified-reset", &r7d),
+            ("anthropic-ratelimit-unified-5h-status", "allowed"),
+            ("anthropic-ratelimit-unified-5h-reset", &r5h),
+            ("anthropic-ratelimit-unified-5h-utilization", "0.36"),
+            ("anthropic-ratelimit-unified-7d-status", "allowed"),
+            ("anthropic-ratelimit-unified-7d-reset", &r7d),
+            ("anthropic-ratelimit-unified-7d-utilization", "0.5"),
+            ("anthropic-ratelimit-unified-7d_oi-status", "rejected"),
+            ("anthropic-ratelimit-unified-7d_oi-reset", &roi),
+            ("anthropic-ratelimit-unified-7d_oi-utilization", "1.0"),
+        ];
+        let mut pairs: Vec<(&'static str, &str)> = base
+            .into_iter()
+            .filter(|(name, _)| !changes.iter().any(|(changed, _)| changed == name))
+            .collect();
+        pairs.extend(changes.iter().filter_map(|(name, value)| value.map(|v| (*name, v))));
+        headers(&pairs)
+    }
+
+    /// The whole account, as today: the unified status rejected, until the
+    /// unified reset (the shared weekly one in [`fable_only`]).
+    fn whole_account() -> Anthropic429 {
+        Anthropic429::QuotaExhausted(AnthropicQuotaEvidence {
+            signal: AnthropicQuotaSignal::UnifiedStatusRejected,
+            resets_at_ms: Some(NOW_MS + 5 * 86400 * 1000),
+        })
+    }
+
+    /// Rule 0: only Fable's weekly limit refused the request (7d_oi
+    /// rejected, the five-hour and weekly windows reported allowed, no claim
+    /// naming either): a limit of Fable's requests, until 7d_oi's reset,
+    /// whatever the unified status says.
+    #[test]
+    fn only_fables_weekly_limit_rejected_is_a_fable_limit_until_its_reset() {
+        let fable = Anthropic429::QuotaExhausted(AnthropicQuotaEvidence {
+            signal: FABLE_OI,
+            resets_at_ms: Some(NOW_MS + 2 * 86400 * 1000),
+        });
+        let claim = "anthropic-ratelimit-unified-representative-claim";
+        for changes in [
+            vec![],
+            vec![("anthropic-ratelimit-unified-status", None)],
+            vec![("anthropic-ratelimit-unified-status", Some("allowed"))],
+            vec![(claim, Some("seven_day_oi"))],
+            vec![("anthropic-ratelimit-unified-5h-status", Some("allowed_warning"))],
+        ] {
+            let h = fable_only(&changes);
+            assert_eq!(classify_anthropic_429(&h, "", NOW_MS), fable, "{changes:?}");
+        }
+        let Anthropic429::QuotaExhausted(evidence) = fable else {
+            unreachable!()
+        };
+        assert_eq!(evidence.model_scope(), Some("fable"));
+        assert_eq!(
+            AnthropicQuotaEvidence {
+                signal: AnthropicQuotaSignal::UnifiedStatusRejected,
+                resets_at_ms: None,
+            }
+            .model_scope(),
+            None
+        );
+    }
+
+    /// The 10-12 and 10-14 captures: a Fable request refused by a SHARED
+    /// window (7d_oi allowed) stops the whole account, as today; and so does
+    /// a shared window spent together with Fable's.
+    #[test]
+    fn a_fable_request_refused_by_a_shared_window_stops_the_whole_account() {
+        let claim = "anthropic-ratelimit-unified-representative-claim";
+        let seven_day_capture = fable_only(&[
+            (claim, Some("seven_day")),
+            ("anthropic-ratelimit-unified-7d-status", Some("rejected")),
+            ("anthropic-ratelimit-unified-7d_oi-status", Some("allowed")),
+            ("anthropic-ratelimit-unified-7d_oi-utilization", Some("0.05")),
+        ]);
+        assert_eq!(classify_anthropic_429(&seven_day_capture, "", NOW_MS), whole_account());
+        let five_hour_capture = fable_only(&[
+            (claim, Some("five_hour")),
+            ("anthropic-ratelimit-unified-5h-status", Some("rejected")),
+            ("anthropic-ratelimit-unified-7d_oi-status", Some("allowed")),
+        ]);
+        assert_eq!(classify_anthropic_429(&five_hour_capture, "", NOW_MS), whole_account());
+        for shared in [
+            "anthropic-ratelimit-unified-5h-status",
+            "anthropic-ratelimit-unified-7d-status",
+        ] {
+            let both = fable_only(&[(shared, Some("rejected"))]);
+            assert_eq!(classify_anthropic_429(&both, "", NOW_MS), whole_account(), "{shared}");
+        }
+    }
+
+    /// A claim naming a shared window wins over 7d_oi: the whole account.
+    #[test]
+    #[serial_test::serial(anthropic_429_log_capture)]
+    fn a_claim_naming_a_shared_window_stops_the_whole_account() {
+        for claim in ["five_hour", "seven_day"] {
+            let h = fable_only(&[(
+                "anthropic-ratelimit-unified-representative-claim",
+                Some(claim),
+            )]);
+            assert_eq!(classify_anthropic_429(&h, "", NOW_MS), whole_account(), "{claim}");
+        }
+    }
+
+    /// Rule 0 needs both shared windows reported, and allowed: with either
+    /// status missing, today's rules apply (the unified status: the whole
+    /// account; without one, an ordinary 429).
+    #[test]
+    fn a_fable_limit_needs_both_shared_windows_reported_allowed() {
+        for missing in [
+            "anthropic-ratelimit-unified-5h-status",
+            "anthropic-ratelimit-unified-7d-status",
+        ] {
+            let h = fable_only(&[(missing, None)]);
+            assert_eq!(classify_anthropic_429(&h, "", NOW_MS), whole_account(), "{missing}");
+        }
+        let h = fable_only(&[
+            ("anthropic-ratelimit-unified-status", None),
+            ("anthropic-ratelimit-unified-7d-status", None),
+        ]);
+        assert_eq!(classify_anthropic_429(&h, "", NOW_MS), Anthropic429::RateLimited);
+    }
+
+    const CLAIM: &str = "anthropic-ratelimit-unified-representative-claim";
+
+    /// The fixed text of the line a 7d_oi rejection with any other claim
+    /// leaves in the log.
+    const UNRECOGNIZED_CLAIM_LINE: &str =
+        "7d_oi rejected but claim not recognized; rule 0 not applied; today's rules decide";
+
+    /// The lines of `logs` that are the unrecognized-claim line.
+    fn claim_lines(logs: &str) -> Vec<&str> {
+        logs.lines()
+            .filter(|line| line.contains(UNRECOGNIZED_CLAIM_LINE))
+            .collect()
+    }
+
+    /// Rule 0's result on [`fable_only`]: a limit of Fable's requests until
+    /// the 7d_oi reset.
+    fn fable_limit() -> Anthropic429 {
+        Anthropic429::QuotaExhausted(AnthropicQuotaEvidence {
+            signal: FABLE_OI,
+            resets_at_ms: Some(NOW_MS + 2 * 86400 * 1000),
+        })
+    }
+
+    /// `std::io::Write` sink appending to a shared buffer. Every test that
+    /// can reach the unrecognized-claim line runs in the serial group of
+    /// the failover tests that capture logs (`anthropic_429_log_capture`):
+    /// tracing caches a callsite's interest globally, and a first hit on a
+    /// thread with no subscriber can hide the line from a capture running
+    /// at the same time (see the note on `anthropic_failover_tests`).
+    struct SharedLog(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for SharedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// [`classify_logged_at`] at [`NOW_MS`], with the line's rate state
+    /// forgotten first.
+    fn classify_logged(h: &HeaderMap) -> (Anthropic429, String) {
+        reset_claim_line_limiter();
+        classify_logged_at(h, NOW_MS)
+    }
+
+    /// Classify `h` at `now_ms`, and what the daemon's log file keeps of it:
+    /// the log file's own filter (`with_crate_directives` over the ERROR
+    /// default an unset `RUST_LOG` gives, as `init_logging` builds it).
+    fn classify_logged_at(h: &HeaderMap, now_ms: u64) -> (Anthropic429, String) {
+        use tracing_subscriber::filter::{EnvFilter, LevelFilter};
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&buf);
+        let unset = EnvFilter::builder()
+            .with_default_directive(LevelFilter::ERROR.into())
+            .parse_lossy("");
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter(crate::logging::with_crate_directives(unset))
+            .with_writer(move || SharedLog(Arc::clone(&sink)))
+            .with_ansi(false)
+            .finish();
+        let out = tracing::subscriber::with_default(subscriber, || {
+            classify_anthropic_429(h, "", now_ms)
+        });
+        let logs = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        (out, logs)
+    }
+
+    /// [`classify_logged_at`] at `now_ms`, the response's time, with the
+    /// limiter's own clock set to `limiter_ms` first.
+    fn classify_logged_on(h: &HeaderMap, now_ms: u64, limiter_ms: u64) -> (Anthropic429, String) {
+        set_claim_line_clock(limiter_ms);
+        classify_logged_at(h, now_ms)
+    }
+
+    /// Rule 0 needs each shared status to be one the provider sends for a
+    /// window with room, `allowed` or `allowed_warning` (any case): any
+    /// other value, or an empty one, is today's rejection of the whole
+    /// account, with its reset.
+    #[test]
+    fn a_fable_limit_needs_a_known_allowed_status_on_both_shared_windows() {
+        for shared in [
+            "anthropic-ratelimit-unified-5h-status",
+            "anthropic-ratelimit-unified-7d-status",
+        ] {
+            for value in ["garbage", "", "allowed-ish", "not_rejected", "warning"] {
+                let h = fable_only(&[(shared, Some(value))]);
+                assert_eq!(
+                    classify_anthropic_429(&h, "", NOW_MS),
+                    whole_account(),
+                    "{shared}: {value:?}"
+                );
+            }
+        }
+        for value in ["allowed", "allowed_warning", "ALLOWED_WARNING", "Allowed"] {
+            let h = fable_only(&[
+                ("anthropic-ratelimit-unified-5h-status", Some(value)),
+                ("anthropic-ratelimit-unified-7d-status", Some(value)),
+            ]);
+            assert_eq!(classify_anthropic_429(&h, "", NOW_MS), fable_limit(), "{value}");
+        }
+    }
+
+    /// A shared window can be spent behind an allowed status (while extra
+    /// usage pays for it): a five-hour or weekly utilization of 1.0 or
+    /// more, or one that can't be read, is today's rejection of the whole
+    /// account. From 0 to below 1.0, rule 0 holds.
+    #[test]
+    fn a_fable_limit_needs_both_shared_windows_below_their_limit() {
+        for utilization in [
+            "anthropic-ratelimit-unified-5h-utilization",
+            "anthropic-ratelimit-unified-7d-utilization",
+        ] {
+            for value in ["1.0", "1", "1.5", "full", "NaN", ""] {
+                let h = fable_only(&[(utilization, Some(value))]);
+                assert_eq!(
+                    classify_anthropic_429(&h, "", NOW_MS),
+                    whole_account(),
+                    "{utilization}: {value:?}"
+                );
+            }
+            for value in ["0.99", "0", "0.36"] {
+                let h = fable_only(&[(utilization, Some(value))]);
+                assert_eq!(
+                    classify_anthropic_429(&h, "", NOW_MS),
+                    fable_limit(),
+                    "{utilization}: {value}"
+                );
+            }
+        }
+    }
+
+    /// Rule 0 takes no claim, or one naming the 7d_oi bucket
+    /// (`seven_day_oi`, `7d_oi`, any case), and logs nothing more then.
+    #[test]
+    #[serial_test::serial(anthropic_429_log_capture)]
+    fn a_fable_limit_takes_no_claim_or_one_naming_its_bucket() {
+        for claim in [None, Some("seven_day_oi"), Some("7d_oi"), Some("SEVEN_DAY_OI")] {
+            let (out, logs) = classify_logged(&fable_only(&[(CLAIM, claim)]));
+            assert_eq!(out, fable_limit(), "{claim:?}");
+            assert!(!logs.contains(UNRECOGNIZED_CLAIM_LINE), "{claim:?}: {logs}");
+        }
+    }
+
+    /// Any other claim on a 7d_oi rejection (what one names there was never
+    /// seen): rule 0 is not applied and today's rules decide (here the
+    /// unified rejection: the whole account), with one INFO line in the
+    /// daemon's log that names the claim only as a plain word (`[a-z0-9_]`,
+    /// at most 32 bytes, lowercased), else `other`, and no header value;
+    /// nothing was left out before it (`suppressed=0`). The 429s seen so
+    /// far (7d_oi allowed, a shared window claimed) leave no such line.
+    #[test]
+    #[serial_test::serial(anthropic_429_log_capture)]
+    fn a_fable_limit_with_any_other_claim_stops_the_whole_account_with_one_line() {
+        let long = "a".repeat(33);
+        for (claim, word) in [
+            ("overage", "overage"),
+            ("seven_day_opus", "seven_day_opus"),
+            ("zork9", "zork9"),
+            ("Overage", "overage"),
+            ("five_hour", "five_hour"),
+            ("weird value!", "other"),
+            ("seven-day-oi", "other"),
+            (long.as_str(), "other"),
+            ("", "other"),
+        ] {
+            let (out, logs) = classify_logged(&fable_only(&[(CLAIM, Some(claim))]));
+            assert_eq!(out, whole_account(), "{claim:?}");
+            let lines: Vec<&str> = logs
+                .lines()
+                .filter(|line| line.contains(UNRECOGNIZED_CLAIM_LINE))
+                .collect();
+            assert_eq!(lines.len(), 1, "{claim:?}: {logs}");
+            let line = lines[0];
+            assert!(line.contains("INFO"), "{line}");
+            assert!(
+                line.ends_with(&format!("claim={word} suppressed=0")),
+                "{claim:?}: {line}"
+            );
+            assert!(!line.contains("anthropic-ratelimit"), "{line}");
+            if word == "other" && !claim.is_empty() {
+                assert!(!line.contains(claim), "{line}");
+            }
+        }
+        let capture = fable_only(&[
+            (CLAIM, Some("seven_day")),
+            ("anthropic-ratelimit-unified-7d-status", Some("rejected")),
+            ("anthropic-ratelimit-unified-7d_oi-status", Some("allowed")),
+        ]);
+        let (out, logs) = classify_logged(&capture);
+        assert_eq!(out, whole_account());
+        assert!(!logs.contains(UNRECOGNIZED_CLAIM_LINE), "{logs}");
+    }
+
+    /// Every rule-0 input must be readable: a value that isn't visible
+    /// ASCII (here byte 0xff) is unknown, never absent, so rule 0 is not
+    /// applied and today's rules decide (the unified rejection here).
+    #[test]
+    #[serial_test::serial(anthropic_429_log_capture)]
+    fn a_fable_limit_needs_every_input_readable() {
+        for (name, bytes) in [
+            ("anthropic-ratelimit-unified-7d_oi-status", &b"rejected\xff"[..]),
+            ("anthropic-ratelimit-unified-5h-status", &b"allowed\xff"[..]),
+            ("anthropic-ratelimit-unified-7d-status", &b"allowed\xff"[..]),
+            ("anthropic-ratelimit-unified-5h-utilization", &b"0.36\xff"[..]),
+            ("anthropic-ratelimit-unified-7d-utilization", &b"0.5\xff"[..]),
+            (CLAIM, &b"seven_day_oi\xff"[..]),
+        ] {
+            let mut h = fable_only(&[]);
+            h.insert(name, HeaderValue::from_bytes(bytes).unwrap());
+            assert!(h.get(name).unwrap().to_str().is_err(), "{name}");
+            assert_eq!(classify_anthropic_429(&h, "", NOW_MS), whole_account(), "{name}");
+        }
+    }
+
+    /// Every rule-0 input must be sent once: a header repeated, with
+    /// another value or the same one, is unknown, so rule 0 is not applied
+    /// and today's rules decide (the unified rejection here; those rules
+    /// read a repeated header's first value, as before).
+    #[test]
+    #[serial_test::serial(anthropic_429_log_capture)]
+    fn a_fable_limit_needs_every_input_sent_once() {
+        for (name, first, second) in [
+            ("anthropic-ratelimit-unified-7d_oi-status", "rejected", "allowed"),
+            ("anthropic-ratelimit-unified-5h-status", "allowed", "rejected"),
+            ("anthropic-ratelimit-unified-7d-status", "allowed", "rejected"),
+            ("anthropic-ratelimit-unified-5h-utilization", "0.36", "1.0"),
+            ("anthropic-ratelimit-unified-7d-utilization", "0.5", "1.0"),
+            (CLAIM, "seven_day_oi", "seven_day"),
+            (CLAIM, "seven_day_oi", "seven_day_oi"),
+        ] {
+            let mut h = fable_only(&[(name, Some(first))]);
+            h.append(name, HeaderValue::from_static(second));
+            assert_eq!(h.get_all(name).iter().count(), 2, "{name}");
+            assert_eq!(
+                classify_anthropic_429(&h, "", NOW_MS),
+                whole_account(),
+                "{name}: {first}, then {second}"
+            );
+        }
+    }
+
+    /// A shared utilization that isn't sent, or is below 0, is unknown, not
+    /// room: rule 0 is not applied and today's rules decide.
+    #[test]
+    fn a_fable_limit_needs_both_shared_utilizations_reported() {
+        for utilization in [
+            "anthropic-ratelimit-unified-5h-utilization",
+            "anthropic-ratelimit-unified-7d-utilization",
+        ] {
+            for value in [None, Some("-0.1")] {
+                let h = fable_only(&[(utilization, value)]);
+                assert_eq!(
+                    classify_anthropic_429(&h, "", NOW_MS),
+                    whole_account(),
+                    "{utilization}: {value:?}"
+                );
+            }
+        }
+    }
+
+    /// The unrecognized-claim line is admitted process-wide once a minute:
+    /// a second 429 inside 60 s leaves no line, and the next line, a minute
+    /// after the last one, says how many were left out.
+    #[test]
+    #[serial_test::serial(anthropic_429_log_capture)]
+    fn the_unrecognized_claim_line_is_limited_to_one_a_minute() {
+        let h = fable_only(&[(CLAIM, Some("overage"))]);
+        reset_claim_line_limiter();
+        let (out, logs) = classify_logged_on(&h, NOW_MS, 0);
+        assert_eq!(out, whole_account());
+        let lines = claim_lines(&logs);
+        assert_eq!(lines.len(), 1, "{logs}");
+        assert!(lines[0].ends_with("claim=overage suppressed=0"), "{logs}");
+
+        let (out, logs) = classify_logged_on(&h, NOW_MS + 59_999, 59_999);
+        assert_eq!(out, whole_account(), "the classification is unchanged");
+        assert!(claim_lines(&logs).is_empty(), "{logs}");
+
+        let (_, logs) = classify_logged_on(&h, NOW_MS + 60_000, 60_000);
+        let lines = claim_lines(&logs);
+        assert_eq!(lines.len(), 1, "{logs}");
+        assert!(lines[0].ends_with("claim=overage suppressed=1"), "{logs}");
+    }
+
+    /// The limiter keeps its own time, not the response's: a 429 whose
+    /// time is earlier than the last line's (a clock stepped back, or a
+    /// caller that took its time before another one did) or a minute later
+    /// is counted, not logged, while the limiter's own clock is inside the
+    /// minute; so is one when that clock reads earlier than its last line
+    /// (which a monotonic clock never does). Only the limiter's own minute
+    /// lets the next line out.
+    #[test]
+    #[serial_test::serial(anthropic_429_log_capture)]
+    fn the_unrecognized_claim_line_keeps_its_own_time() {
+        let h = fable_only(&[(CLAIM, Some("overage"))]);
+        reset_claim_line_limiter();
+        let (_, logs) = classify_logged_on(&h, NOW_MS, 10_000);
+        assert_eq!(claim_lines(&logs).len(), 1, "{logs}");
+        for (now_ms, limiter_ms, case) in [
+            (NOW_MS - 1, 10_001, "a response 1 ms earlier"),
+            (NOW_MS - 3_600_000, 10_002, "a response an hour earlier"),
+            (NOW_MS + 60_000, 10_003, "a response a minute later"),
+            (NOW_MS, 9_000, "the limiter's clock earlier than its last line"),
+        ] {
+            let (out, logs) = classify_logged_on(&h, now_ms, limiter_ms);
+            assert!(
+                matches!(
+                    out,
+                    Anthropic429::QuotaExhausted(AnthropicQuotaEvidence {
+                        signal: AnthropicQuotaSignal::UnifiedStatusRejected,
+                        ..
+                    })
+                ),
+                "{case}: the classification is unchanged: {out:?}"
+            );
+            assert!(claim_lines(&logs).is_empty(), "{case}: {logs}");
+        }
+        let (_, logs) = classify_logged_on(&h, NOW_MS - 2, 70_000);
+        let lines = claim_lines(&logs);
+        assert_eq!(lines.len(), 1, "{logs}");
+        assert!(lines[0].ends_with("claim=overage suppressed=4"), "{logs}");
+    }
+
+    /// Each line's count starts again from 0: after a line that says how
+    /// many were left out, the next one counts only those left out since.
+    #[test]
+    #[serial_test::serial(anthropic_429_log_capture)]
+    fn the_unrecognized_claim_lines_count_starts_again_after_each_line() {
+        let h = fable_only(&[(CLAIM, Some("overage"))]);
+        reset_claim_line_limiter();
+        let mut lines = Vec::new();
+        for offset in [0, 1_000, 2_000, 60_000, 61_000, 120_000] {
+            let (_, logs) = classify_logged_on(&h, NOW_MS + offset, offset);
+            for line in claim_lines(&logs) {
+                let count = line.rsplit(' ').next().unwrap_or_default().to_string();
+                lines.push((offset, count));
+            }
+        }
+        let expected: Vec<(u64, String)> = [(0, 0), (60_000, 2), (120_000, 1)]
+            .into_iter()
+            .map(|(offset, n)| (offset, format!("suppressed={n}")))
+            .collect();
+        assert_eq!(lines, expected);
+    }
+
+    /// What the router does with the evidence of a Fable request refused
+    /// with an unknown shared status or an unrecognized claim: it reports a
+    /// whole-account cooldown, not one of Fable's requests only. (The local
+    /// broker applies a whole-account cooldown to every model's requests:
+    /// broker_capacity's `a_whole_account_limit_stops_opus_requests_too`.)
+    #[tokio::test]
+    #[serial_test::serial(anthropic_429_log_capture)]
+    async fn unknown_headers_on_a_fable_request_cool_the_whole_account() {
+        for change in [
+            ("anthropic-ratelimit-unified-5h-status", Some("garbage")),
+            (CLAIM, Some("overage")),
+            ("anthropic-ratelimit-unified-5h-utilization", Some("1.0")),
+        ] {
+            let Anthropic429::QuotaExhausted(evidence) =
+                classify_anthropic_429(&fable_only(&[change]), "", NOW_MS)
+            else {
+                panic!("{change:?}: a recognized limit");
+            };
+            let evidence = evidence.for_request_model("claude-fable-5-1");
+            let broker = ScriptedBroker::new(AccountSelector::Auto, Some("claude2"));
+            BrokerAnthropicRouter::new(broker.clone())
+                .report_exhausted(&seat("claude4"), &evidence)
+                .await;
+            assert!(broker.model_cooldowns.lock().unwrap().is_empty(), "{change:?}");
+            let cooldowns = broker.cooldowns.lock().unwrap().clone();
+            assert_eq!(cooldowns.len(), 1, "{change:?}");
+            assert_eq!(cooldowns[0].0, "anthropic@claude4", "{change:?}");
+        }
+    }
+
+    /// A Fable limit on a request for another model can't be what refused
+    /// it: it stops the whole account (the 7d_oi window named), with the
+    /// same reset. A Fable request keeps it; other evidence is unchanged.
+    #[test]
+    fn a_fable_limit_on_another_models_request_stops_the_whole_account() {
+        let fable = AnthropicQuotaEvidence {
+            signal: FABLE_OI,
+            resets_at_ms: Some(NOW_MS + 1000),
+        };
+        for model in ["claude-fable-5-1", "anthropic/claude-fable-5-1"] {
+            assert_eq!(fable.for_request_model(model), fable, "{model}");
+        }
+        for model in ["claude-opus-5-5", "claude-haiku-4-5", "claude-fablelike-1"] {
+            let seat = fable.for_request_model(model);
+            assert_eq!(
+                seat.signal,
+                AnthropicQuotaSignal::WindowStatusRejected { window: "7d_oi" },
+                "{model}"
+            );
+            assert_eq!(seat.resets_at_ms, fable.resets_at_ms, "{model}");
+            assert_eq!(seat.model_scope(), None, "{model}");
+        }
+        let unified = AnthropicQuotaEvidence {
+            signal: AnthropicQuotaSignal::UnifiedStatusRejected,
+            resets_at_ms: None,
+        };
+        assert_eq!(unified.for_request_model("claude-opus-5-5"), unified);
+    }
+
     // ── router over a scripted broker ───────────────────────────────────────
 
     struct ScriptedBroker {
@@ -1255,6 +2124,8 @@ mod tests {
         /// Force a non-availability broker error from the auto vend.
         vend_error: Mutex<Option<BrokerError>>,
         cooldowns: Mutex<Vec<(String, Option<u64>, String)>>,
+        /// Cooldowns of one model's requests: the account, the model, until.
+        model_cooldowns: Mutex<Vec<(String, String, Option<u64>)>>,
         auto_calls: Mutex<Vec<Option<String>>>,
         /// The `exclude` list of every excluding vend.
         excluded: Mutex<Vec<Vec<CredentialRef>>>,
@@ -1267,6 +2138,7 @@ mod tests {
                 pick: Mutex::new(pick),
                 vend_error: Mutex::new(None),
                 cooldowns: Mutex::new(Vec::new()),
+                model_cooldowns: Mutex::new(Vec::new()),
                 auto_calls: Mutex::new(Vec::new()),
                 excluded: Mutex::new(Vec::new()),
             })
@@ -1339,6 +2211,19 @@ mod tests {
                 .push((cred.storage_key(), until_ms, reason.to_string()));
             Ok(())
         }
+        async fn report_model_cooldown(
+            &self,
+            cred: &CredentialRef,
+            model: &str,
+            until_ms: Option<u64>,
+            _reason: &str,
+        ) -> Result<(), BrokerError> {
+            self.model_cooldowns
+                .lock()
+                .unwrap()
+                .push((cred.storage_key(), model.to_string(), until_ms));
+            Ok(())
+        }
         async fn proxy(
             &self,
             _r: crate::auth::ProxyRequest,
@@ -1368,6 +2253,87 @@ mod tests {
             signal: AnthropicQuotaSignal::UnifiedStatusRejected,
             resets_at_ms: reset_ms,
         }
+    }
+
+    /// A broker that keeps no model cooldowns: the trait's defaults.
+    struct SeatOnly(Arc<ScriptedBroker>);
+
+    #[async_trait]
+    impl CredentialBroker for SeatOnly {
+        async fn access_token(&self, p: OAuthProviderId) -> Result<AccessToken, BrokerError> {
+            self.0.access_token(p).await
+        }
+        async fn report_cooldown(
+            &self,
+            cred: &CredentialRef,
+            until_ms: Option<u64>,
+            reason: &str,
+        ) -> Result<(), BrokerError> {
+            self.0.report_cooldown(cred, until_ms, reason).await
+        }
+        async fn proxy(
+            &self,
+            r: crate::auth::ProxyRequest,
+        ) -> Result<crate::auth::ProxyResponse, BrokerError> {
+            self.0.proxy(r).await
+        }
+        async fn proxy_stream(
+            &self,
+            r: crate::auth::ProxyRequest,
+        ) -> Result<crate::auth::ProxyByteStream, BrokerError> {
+            self.0.proxy_stream(r).await
+        }
+        async fn anthropic_usage(&self) -> Result<serde_json::Value, BrokerError> {
+            self.0.anthropic_usage().await
+        }
+        async fn capabilities(&self) -> Result<Vec<crate::auth::ProviderStatus>, BrokerError> {
+            self.0.capabilities().await
+        }
+    }
+
+    /// A4: a Fable limit is reported as a cooldown of Fable's requests only,
+    /// until its reset; any other evidence still cools the whole account. A
+    /// broker that keeps no model cooldowns (the trait's default) cools the
+    /// whole account for a Fable limit too.
+    #[tokio::test]
+    async fn router_reports_a_fable_limit_as_a_cooldown_of_fables_requests() {
+        let broker = ScriptedBroker::new(AccountSelector::Auto, Some("claude2"));
+        let router = BrokerAnthropicRouter::new(broker.clone());
+        let reset = crate::epoch_millis() + 2 * 3600 * 1000;
+        let fable = AnthropicQuotaEvidence {
+            signal: FABLE_OI,
+            resets_at_ms: Some(reset),
+        };
+        router.report_exhausted(&seat("claude4"), &fable).await;
+        assert_eq!(
+            broker.model_cooldowns.lock().unwrap().clone(),
+            vec![("anthropic@claude4".to_string(), "fable".to_string(), Some(reset))]
+        );
+        assert!(
+            broker.cooldowns.lock().unwrap().is_empty(),
+            "the whole account is not cooled"
+        );
+        router
+            .report_exhausted(&seat("claude4"), &evidence(Some(reset)))
+            .await;
+        assert_eq!(broker.cooldowns.lock().unwrap().len(), 1);
+        assert_eq!(broker.model_cooldowns.lock().unwrap().len(), 1);
+
+        let seat_only = Arc::new(SeatOnly(ScriptedBroker::new(
+            AccountSelector::Auto,
+            Some("claude2"),
+        )));
+        BrokerAnthropicRouter::new(seat_only.clone())
+            .report_exhausted(&seat("claude4"), &fable)
+            .await;
+        assert_eq!(
+            seat_only.0.cooldowns.lock().unwrap().clone(),
+            vec![(
+                "anthropic@claude4".to_string(),
+                Some(reset),
+                COOLDOWN_REASON_QUOTA.to_string()
+            )]
+        );
     }
 
     #[tokio::test]

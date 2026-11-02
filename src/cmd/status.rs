@@ -17,7 +17,22 @@
 //!   Per-account failures are reported inline; they never discard the accounts
 //!   that succeeded. The process exits non-zero only when *every* requested
 //!   account failed (or the selection itself was invalid).
-//! - `--json` prints a [`UsageReport`] (same schema the keeper consumes).
+//! - `--json` prints a [`UsageReport`].
+//! - The last known usage (local broker only). An Anthropic account whose
+//!   saved reading is at most as old as the broker's own reuse age for it (10 min;
+//!   60 s near its limit unless that reading shows extra usage off) is shown
+//!   from that reading, with its age, and no usage request is sent for it.
+//!   Only an account without such a reading is read, and never while a
+//!   refresh hold or the usage-read pause is active. When that read gets a
+//!   usage 429, or the pause or the account's held 429 holds it back (also
+//!   for an account whose saved reading is recent enough to show), the row
+//!   shows the last good reading bound to the same account, its age and
+//!   the table's retry time, or the plain line
+//!   "usage read rate-limited (HTTP 429)" without one; in `--json` the error
+//!   carries the kind `usage_rate_limited`, an optional `retry_at_ms` and an
+//!   optional `last_good`, and the row still counts as an error. Status only
+//!   loads the saved readings, once per run: it never writes the file. A
+//!   remote broker and other transport errors keep today's text.
 //!
 //! The `UsageBackend` seam exists so the selection/aggregation/rendering logic
 //! is unit-tested with a fake — no network, no `auth.json`.
@@ -33,6 +48,7 @@ use synaps_cli::auth::usage::{
 };
 use synaps_cli::auth::{
     Account, AccountSelector, BrokerError, CredentialBroker, CredentialRef, OAuthProviderId,
+    UsageReadFailure,
 };
 
 /// Flags for `synaps status` (usage mode). `Default` = legacy behaviour.
@@ -66,7 +82,25 @@ trait UsageBackend: Send + Sync {
     /// The account the active policy selects when none is given explicitly.
     fn resolve_default(&self, provider: OAuthProviderId) -> Result<Account, String>;
     /// Typed read-only usage for exactly this credential.
-    async fn fetch(&self, cred: &CredentialRef) -> Result<UsageSnapshot, UsageErrorSummary>;
+    async fn fetch(&self, cred: &CredentialRef) -> Result<UsageSnapshot, FetchFailure>;
+}
+
+/// A failed usage read as a report row shows it.
+#[derive(Debug, Clone)]
+struct FetchFailure {
+    error: UsageErrorSummary,
+    /// The account's last good reading, for a read the usage endpoint
+    /// rate-limited.
+    last_good: Option<UsageSnapshot>,
+}
+
+impl From<UsageErrorSummary> for FetchFailure {
+    fn from(error: UsageErrorSummary) -> Self {
+        Self {
+            error,
+            last_good: None,
+        }
+    }
 }
 
 struct BrokerBackend {
@@ -116,6 +150,29 @@ fn summary_from_broker_error(e: &BrokerError) -> UsageErrorSummary {
     UsageErrorSummary::other(kind, e.to_string())
 }
 
+/// Kind of a report row whose usage read the usage endpoint rate-limited.
+const RATE_LIMITED_KIND: &str = "usage_rate_limited";
+/// Message of such a row.
+const RATE_LIMITED_TEXT: &str = "usage read rate-limited (HTTP 429)";
+
+/// A failed [`CredentialBroker::usage_or_last_known`] read as a report row.
+/// A rate-limited read is its own kind, with the broker's retry time and
+/// the account's last good reading; any other failure keeps today's row.
+fn fetch_failure(failure: &UsageReadFailure) -> FetchFailure {
+    match &failure.rate_limited {
+        Some(limited) => FetchFailure {
+            error: UsageErrorSummary {
+                kind: RATE_LIMITED_KIND.into(),
+                message: RATE_LIMITED_TEXT.into(),
+                http_status: Some(429),
+                retry_at_ms: Some(limited.retry_at_ms),
+            },
+            last_good: limited.last_good.clone(),
+        },
+        None => summary_from_broker_error(&failure.error).into(),
+    }
+}
+
 #[async_trait]
 impl UsageBackend for BrokerBackend {
     fn source_label(&self) -> &str {
@@ -151,11 +208,11 @@ impl UsageBackend for BrokerBackend {
         }
     }
 
-    async fn fetch(&self, cred: &CredentialRef) -> Result<UsageSnapshot, UsageErrorSummary> {
+    async fn fetch(&self, cred: &CredentialRef) -> Result<UsageSnapshot, FetchFailure> {
         self.broker
-            .usage(cred)
+            .usage_or_last_known(cred)
             .await
-            .map_err(|e| summary_from_broker_error(&e))
+            .map_err(|failure| fetch_failure(&failure))
     }
 }
 
@@ -282,6 +339,17 @@ async fn select_targets(
 
 // ── Aggregation ──────────────────────────────────────────────────────────────
 
+/// One account's read as its report row's outcome.
+fn row_outcome(read: Result<UsageSnapshot, FetchFailure>) -> AccountUsageOutcome {
+    match read {
+        Ok(snapshot) => AccountUsageOutcome::ok(snapshot),
+        Err(failure) => AccountUsageOutcome::Error {
+            error: failure.error,
+            last_good: failure.last_good.map(Box::new),
+        },
+    }
+}
+
 async fn build_report(backend: &dyn UsageBackend, selection: Selection) -> UsageReport {
     let mut report = UsageReport::new(backend.source_label(), synaps_cli::epoch_millis());
     for failure in selection.listing_failures {
@@ -291,15 +359,13 @@ async fn build_report(backend: &dyn UsageBackend, selection: Selection) -> Usage
             identity: None,
             outcome: AccountUsageOutcome::Error {
                 error: UsageErrorSummary::other("account_listing", failure.message),
+                last_good: None,
             },
         });
     }
     let mut identities = std::collections::BTreeMap::new();
     for cred in selection.targets {
-        let outcome = match backend.fetch(&cred).await {
-            Ok(snapshot) => AccountUsageOutcome::ok(snapshot),
-            Err(error) => AccountUsageOutcome::Error { error },
-        };
+        let outcome = row_outcome(backend.fetch(&cred).await);
         if let std::collections::btree_map::Entry::Vacant(entry) = identities.entry(cred.provider) {
             entry.insert(backend.identities(cred.provider).await);
         }
@@ -339,6 +405,31 @@ fn absolute_time(at_ms: u64) -> String {
     chrono::DateTime::<chrono::Utc>::from_timestamp_millis(at_ms as i64)
         .map(|dt| dt.format("%Y-%m-%d %H:%M UTC").to_string())
         .unwrap_or_else(|| "?".into())
+}
+
+/// How long before `now_ms` the reading at `at_ms` was taken, in its two
+/// largest units (`45s`, `13m`, `2h 5m`, `1d 3h`).
+fn age_text(now_ms: u64, at_ms: u64) -> String {
+    let secs = now_ms.saturating_sub(at_ms) / 1000;
+    let (d, h, m) = (secs / 86_400, (secs % 86_400) / 3_600, (secs % 3_600) / 60);
+    if d > 0 {
+        format!("{d}d {h}h")
+    } else if h > 0 {
+        format!("{h}h {m}m")
+    } else if m > 0 {
+        format!("{m}m")
+    } else {
+        format!("{secs}s")
+    }
+}
+
+/// `, retry in Ns` while the broker's next usage request for the account
+/// (`retry_at_ms`) is still ahead of `now_ms`; nothing otherwise.
+fn retry_text(now_ms: u64, retry_at_ms: Option<u64>) -> String {
+    match retry_at_ms {
+        Some(at) if at > now_ms => format!(", retry in {}s", (at - now_ms).div_ceil(1000)),
+        _ => String::new(),
+    }
 }
 
 fn bar(percent: f64) -> String {
@@ -477,8 +568,30 @@ fn render_verbose(report: &UsageReport, now_ms: u64) -> String {
             inline_text(entry.identity.as_deref().unwrap_or("unknown"))
         ));
         match &entry.outcome {
-            AccountUsageOutcome::Ok { snapshot } => render_snapshot(&mut out, snapshot, now_ms),
-            AccountUsageOutcome::Error { error } => {
+            AccountUsageOutcome::Ok { snapshot } => {
+                if snapshot.observed_at < report.observed_at {
+                    out.push_str(&format!(
+                        "    read {} ago\n",
+                        age_text(now_ms, snapshot.observed_at)
+                    ));
+                }
+                render_snapshot(&mut out, snapshot, now_ms)
+            }
+            AccountUsageOutcome::Error { error, last_good } if error.kind == RATE_LIMITED_KIND => {
+                let retry = retry_text(now_ms, error.retry_at_ms);
+                match last_good {
+                    Some(s) => {
+                        out.push_str(&format!("    ✗ usage read rate-limited{retry}\n"));
+                        out.push_str(&format!(
+                            "    last good reading, read {} ago\n",
+                            age_text(now_ms, s.observed_at)
+                        ));
+                        render_snapshot(&mut out, s, now_ms);
+                    }
+                    None => out.push_str(&format!("    ✗ {RATE_LIMITED_TEXT}{retry}\n")),
+                }
+            }
+            AccountUsageOutcome::Error { error, .. } => {
                 let status = error
                     .http_status
                     .map(|s| format!(" [HTTP {s}]"))
@@ -540,6 +653,51 @@ fn compact_window(w: &UsageWindow, now_ms: u64) -> String {
     format!("{label}{scope}: {used} · {reset}{flag}")
 }
 
+/// One reading's compact lines: its limits, its main windows, the models
+/// it shows unavailable, and a provisional schema.
+fn compact_snapshot(out: &mut String, s: &UsageSnapshot, now_ms: u64) {
+    if s.limit_reached == Some(true) {
+        out.push_str("      ! Account limit reached\n");
+    }
+    if s.spend_control_reached == Some(true) {
+        out.push_str("      ! Spend control reached\n");
+    }
+    let mut shown = 0;
+    for w in &s.windows {
+        // Quiet auxiliary counters move to --verbose, not the
+        // main inference windows (even when unknown or at 0%).
+        let auxiliary = matches!(w.scope, WindowScope::Feature { .. })
+            || (w.duration_secs.is_none() && w.reset_at.is_none());
+        if auxiliary && !w.is_exhausted() {
+            continue;
+        }
+        out.push_str(&format!(
+            "      {}\n",
+            inline_text(&compact_window(w, now_ms))
+        ));
+        shown += 1;
+    }
+    if shown == 0 {
+        out.push_str("      Usage/reset unknown; see --verbose\n");
+    }
+    for model in &s.model_availability {
+        if model.availability != Availability::Available {
+            let state = if model.availability == Availability::Exhausted {
+                "unavailable"
+            } else {
+                "availability unknown"
+            };
+            out.push_str(&format!(
+                "      ! {}: {state}\n",
+                inline_text(&model.model)
+            ));
+        }
+    }
+    if s.notes.iter().any(|n| n.contains("unverified")) {
+        out.push_str("      ! Provider schema unverified; treat usage as provisional\n");
+    }
+}
+
 /// Compact stacked rows remain readable in narrow terminals, without dropping
 /// unknown/exhausted primary windows or hiding per-account failures.
 fn render_text(report: &UsageReport, now_ms: u64) -> String {
@@ -577,7 +735,21 @@ fn render_text(report: &UsageReport, now_ms: u64) -> String {
                 inline_text(identity)
             ));
             match &entry.outcome {
-                AccountUsageOutcome::Error { error } => {
+                AccountUsageOutcome::Error { error, last_good } if error.kind == RATE_LIMITED_KIND => {
+                    let retry = retry_text(now_ms, error.retry_at_ms);
+                    match last_good {
+                        Some(s) => {
+                            out.push_str(&format!("      ! usage read rate-limited{retry}\n"));
+                            out.push_str(&format!(
+                                "      last good reading, read {} ago\n",
+                                age_text(now_ms, s.observed_at)
+                            ));
+                            compact_snapshot(&mut out, s, now_ms);
+                        }
+                        None => out.push_str(&format!("      ! {RATE_LIMITED_TEXT}{retry}\n")),
+                    }
+                }
+                AccountUsageOutcome::Error { error, .. } => {
                     out.push_str(&format!(
                         "      ! {}: {}\n",
                         inline_text(&error.kind),
@@ -592,48 +764,15 @@ fn render_text(report: &UsageReport, now_ms: u64) -> String {
                     }
                 }
                 AccountUsageOutcome::Ok { snapshot: s } => {
-                    if s.limit_reached == Some(true) {
-                        out.push_str("      ! Account limit reached\n");
-                    }
-                    if s.spend_control_reached == Some(true) {
-                        out.push_str("      ! Spend control reached\n");
-                    }
-                    let mut shown = 0;
-                    for w in &s.windows {
-                        // Quiet auxiliary counters move to --verbose, not the
-                        // main inference windows (even when unknown or at 0%).
-                        let auxiliary = matches!(w.scope, WindowScope::Feature { .. })
-                            || (w.duration_secs.is_none() && w.reset_at.is_none());
-                        if auxiliary && !w.is_exhausted() {
-                            continue;
-                        }
+                    // A reading taken before this run began: a broker's
+                    // recent one, shown instead of a request.
+                    if s.observed_at < report.observed_at {
                         out.push_str(&format!(
-                            "      {}\n",
-                            inline_text(&compact_window(w, now_ms))
+                            "      read {} ago\n",
+                            age_text(now_ms, s.observed_at)
                         ));
-                        shown += 1;
                     }
-                    if shown == 0 {
-                        out.push_str("      Usage/reset unknown; see --verbose\n");
-                    }
-                    for model in &s.model_availability {
-                        if model.availability != Availability::Available {
-                            let state = if model.availability == Availability::Exhausted {
-                                "unavailable"
-                            } else {
-                                "availability unknown"
-                            };
-                            out.push_str(&format!(
-                                "      ! {}: {state}\n",
-                                inline_text(&model.model)
-                            ));
-                        }
-                    }
-                    if s.notes.iter().any(|n| n.contains("unverified")) {
-                        out.push_str(
-                            "      ! Provider schema unverified; treat usage as provisional\n",
-                        );
-                    }
+                    compact_snapshot(&mut out, s, now_ms);
                 }
             }
         }
@@ -698,7 +837,7 @@ mod usage_tests {
     struct FakeBackend {
         accounts: BTreeMap<OAuthProviderId, Result<Vec<String>, BrokerError>>,
         defaults: BTreeMap<OAuthProviderId, Result<Account, String>>,
-        results: BTreeMap<String, Result<UsageSnapshot, UsageErrorSummary>>,
+        results: BTreeMap<String, Result<UsageSnapshot, FetchFailure>>,
         identities: BTreeMap<OAuthProviderId, Vec<(String, String)>>,
     }
 
@@ -733,7 +872,11 @@ mod usage_tests {
             key: &str,
             result: Result<UsageSnapshot, UsageErrorSummary>,
         ) -> Self {
-            self.results.insert(key.into(), result);
+            self.results.insert(key.into(), result.map_err(FetchFailure::from));
+            self
+        }
+        fn with_failure(mut self, key: &str, failure: FetchFailure) -> Self {
+            self.results.insert(key.into(), Err(failure));
             self
         }
     }
@@ -758,7 +901,7 @@ mod usage_tests {
                 .cloned()
                 .unwrap_or(Ok(Account::Default))
         }
-        async fn fetch(&self, cred: &CredentialRef) -> Result<UsageSnapshot, UsageErrorSummary> {
+        async fn fetch(&self, cred: &CredentialRef) -> Result<UsageSnapshot, FetchFailure> {
             self.results
                 .get(&cred.storage_key())
                 .cloned()
@@ -766,7 +909,8 @@ mod usage_tests {
                     Err(UsageErrorSummary::other(
                         "unknown_account",
                         format!("no such account {}", cred.storage_key()),
-                    ))
+                    )
+                    .into())
                 })
         }
     }
@@ -988,6 +1132,7 @@ mod usage_tests {
                     kind: "unauthorized".into(),
                     message: "provider rejected the access token (HTTP 401)".into(),
                     http_status: Some(401),
+                    retry_at_ms: None,
                 }),
             );
         let sel = select_targets(&backend, &opts(None, None, true, true))
@@ -1101,7 +1246,7 @@ mod usage_tests {
         assert_eq!(report.ok_count(), 0);
         assert_eq!(report.accounts[0].account, "ghost");
         match &report.accounts[0].outcome {
-            AccountUsageOutcome::Error { error } => assert_eq!(error.kind, "unknown_account"),
+            AccountUsageOutcome::Error { error, .. } => assert_eq!(error.kind, "unknown_account"),
             other => panic!("expected error row, got {other:?}"),
         }
     }
@@ -1191,6 +1336,44 @@ mod usage_tests {
         assert!(text.contains("Provider schema unverified"));
     }
 
+    /// A4: Fable's weekly limit, read from the `limits` list, is a row of its
+    /// own (`7d · fable`), EXHAUSTED when spent, and Fable is listed as
+    /// unavailable; the shared windows are unchanged and no note is added
+    /// (the repeats of the shared windows are skipped quietly).
+    #[test]
+    fn compact_view_shows_fables_weekly_limit_from_the_limits_list() {
+        let snapshot = parse_anthropic_usage(
+            r#"{
+            "five_hour": {"utilization": 20, "resets_at": null},
+            "seven_day": {"utilization": 30, "resets_at": null},
+            "limits": [
+                {"kind": "session", "percent": 20},
+                {"kind": "weekly_all", "percent": 30},
+                {"kind": "weekly_scoped", "scope": {"model": {"display_name": "Fable"}},
+                 "percent": 100, "resets_at": "2025-09-24T00:00:00Z"}
+            ]
+        }"#,
+            "work",
+            T0,
+        )
+        .unwrap();
+        let mut report = UsageReport::new("local", T0);
+        report.accounts.push(AccountUsageEntry {
+            provider: "anthropic".into(),
+            account: "work".into(),
+            identity: Some("person@example.com".into()),
+            outcome: AccountUsageOutcome::ok(snapshot),
+        });
+        let text = render_text(&report, T0);
+        assert!(text.contains("5h: 20% used"), "{text}");
+        assert!(text.contains("7d: 30% used"), "{text}");
+        assert!(text.contains("7d · fable: 100% used"), "{text}");
+        assert!(text.contains("EXHAUSTED"), "{text}");
+        assert!(text.contains("! fable: unavailable"), "{text}");
+        let verbose = render_verbose(&report, T0);
+        assert!(!verbose.contains("note:"), "{verbose}");
+    }
+
     /// An account without extra usage enabled shows no extra_usage
     /// line at all. An enabled one shows a single title, and an unknown
     /// reading draws no row of '?'.
@@ -1268,6 +1451,184 @@ mod usage_tests {
         let s = summary_from_broker_error(&BrokerError::BrokerTooOld("per-account usage".into()));
         assert_eq!(s.kind, "broker_too_old");
         assert!(s.message.contains("broker is older than this client"), "{}", s.message);
+    }
+
+    // ── the last known usage ────────────────────────────────────────
+
+    const MINUTE: u64 = 60 * 1000;
+
+    /// A usage read the endpoint rate-limited, as `BrokerBackend` reports
+    /// it: `usage`'s error plus the broker's retry time and last good
+    /// reading.
+    fn rate_limited(retry_at_ms: u64, last_good: Option<UsageSnapshot>) -> FetchFailure {
+        let error = synaps_cli::auth::UsageError::RateLimited {
+            retry_after_s: Some(0),
+        }
+        .into_broker_error();
+        fetch_failure(&UsageReadFailure {
+            error,
+            rate_limited: Some(synaps_cli::auth::RateLimitedRead {
+                retry_at_ms,
+                last_good,
+            }),
+        })
+    }
+
+    /// Any other failed usage read (here a 503), as `BrokerBackend`
+    /// reports it.
+    fn upstream_503() -> FetchFailure {
+        let error = synaps_cli::auth::UsageError::UpstreamStatus {
+            status: 503,
+            retry_after_s: None,
+        }
+        .into_broker_error();
+        fetch_failure(&UsageReadFailure::plain(error))
+    }
+
+    /// A report made at `T0` with one Anthropic row per `(label, read)`.
+    fn report_of(rows: Vec<(&str, Result<UsageSnapshot, FetchFailure>)>) -> UsageReport {
+        let mut report = UsageReport::new("local", T0);
+        for (label, read) in rows {
+            report.accounts.push(AccountUsageEntry {
+                provider: "anthropic".into(),
+                account: label.into(),
+                identity: None,
+                outcome: row_outcome(read),
+            });
+        }
+        report
+    }
+
+    /// A read the usage endpoint rate-limited shows the account's last good
+    /// reading with its age, and when the next request goes out (the
+    /// broker's time, not the endpoint's "retry after 0s"); without a last
+    /// good reading one plain line. Neither shows the transport chain.
+    /// Any other failed read keeps today's text.
+    #[test]
+    fn a_rate_limited_read_shows_the_last_good_reading_its_age_and_the_retry_time() {
+        let now = T0 + 13 * MINUTE;
+        let retry_at = now + 90_000;
+        let report = report_of(vec![
+            ("work", Err(rate_limited(retry_at, Some(anthropic_snapshot("work"))))),
+            ("spare", Err(rate_limited(retry_at, None))),
+            ("late", Err(rate_limited(now - 1_000, None))),
+            ("down", Err(upstream_503())),
+        ]);
+        let text = render_text(&report, now);
+        assert!(
+            text.contains(
+                "    work · email: unknown\n      ! usage read rate-limited, retry in 90s\n      last good reading, read 13m ago\n      5h: "
+            ),
+            "{text}"
+        );
+        assert!(text.contains("sonnet: 100% used"), "the last good windows: {text}");
+        assert!(
+            text.contains(
+                "    spare · email: unknown\n      ! usage read rate-limited (HTTP 429), retry in 90s\n"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "    late · email: unknown\n      ! usage read rate-limited (HTTP 429)\n"
+            ),
+            "a retry time already past is not shown: {text}"
+        );
+        assert!(
+            text.contains("    down · email: unknown\n      ! transport: broker transport error: usage:"),
+            "{text}"
+        );
+        assert_eq!(text.matches("transport").count(), 2, "only the 503's row: {text}");
+        assert!(text.contains("4 accounts · 4 errors"), "{text}");
+
+        let verbose = render_verbose(&report, now);
+        assert!(
+            verbose.contains(
+                "    ✗ usage read rate-limited, retry in 90s\n    last good reading, read 13m ago\n    plan:"
+            ) || verbose.contains(
+                "    ✗ usage read rate-limited, retry in 90s\n    last good reading, read 13m ago\n    five_hour"
+            ),
+            "{verbose}"
+        );
+        assert!(
+            verbose.contains("    ✗ usage read rate-limited (HTTP 429), retry in 90s\n"),
+            "{verbose}"
+        );
+        assert!(verbose.contains("    ✗ usage read rate-limited (HTTP 429)\n"), "{verbose}");
+        assert!(verbose.contains("    ✗ transport: broker transport error: usage:"), "{verbose}");
+        assert_eq!(verbose.matches("transport").count(), 2, "{verbose}");
+    }
+
+    /// `--json`: a rate-limited row is still an error row (and still counts
+    /// as one: every account failing still fails the command), of kind
+    /// `usage_rate_limited`, with the optional `retry_at_ms` and
+    /// `last_good`; any other error row keeps today's bytes.
+    #[tokio::test]
+    async fn a_rate_limited_row_in_json_has_its_retry_time_and_last_good_and_stays_an_error() {
+        let backend = FakeBackend::new()
+            .with_accounts(OAuthProviderId::Anthropic, &["work", "down"])
+            .with_failure(
+                "anthropic@work",
+                rate_limited(T0 + 90_000, Some(anthropic_snapshot("work"))),
+            )
+            .with_failure("anthropic@down", upstream_503());
+        let sel = select_targets(&backend, &opts(None, None, true, true))
+            .await
+            .unwrap();
+        let report = build_report(&backend, sel).await;
+        assert_eq!((report.ok_count(), report.error_count()), (0, 2));
+        let v = serde_json::to_value(&report).unwrap();
+        let rows = v["accounts"].as_array().unwrap();
+        assert_eq!(rows[0]["account"], "work");
+        assert_eq!(rows[0]["status"], "error");
+        assert_eq!(
+            rows[0]["error"],
+            serde_json::json!({
+                "kind": "usage_rate_limited",
+                "message": "usage read rate-limited (HTTP 429)",
+                "http_status": 429,
+                "retry_at_ms": T0 + 90_000,
+            })
+        );
+        assert_eq!(rows[0]["last_good"]["observed_at"], T0);
+        assert_eq!(rows[1]["account"], "down");
+        let keys = |v: &serde_json::Value| {
+            let mut keys: Vec<String> = v.as_object().unwrap().keys().cloned().collect();
+            keys.sort();
+            keys
+        };
+        assert_eq!(keys(&rows[1]), ["account", "error", "provider", "status"]);
+        assert_eq!(keys(&rows[1]["error"]), ["kind", "message"]);
+        assert_eq!(rows[1]["error"]["kind"], "transport");
+        let back: UsageReport = serde_json::from_value(v).unwrap();
+        assert_eq!(back, report);
+        let err = run_with_backend(&backend, &opts(None, None, true, true))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("all 2 requested"), "{err}");
+    }
+
+    /// A reading taken before this status run (a broker's recent reading,
+    /// shown instead of a request) shows its age; one taken in the run
+    /// shows none.
+    #[test]
+    fn a_reading_taken_before_the_run_shows_its_age_and_one_taken_in_it_does_not() {
+        let mut saved = anthropic_snapshot("work");
+        saved.observed_at = T0 - 5 * MINUTE;
+        let report = report_of(vec![
+            ("work", Ok(saved)),
+            ("spare", Ok(anthropic_snapshot("spare"))),
+        ]);
+        let now = T0 + 2_000;
+        let text = render_text(&report, now);
+        assert!(
+            text.contains("    work · email: unknown\n      read 5m ago\n      5h: "),
+            "{text}"
+        );
+        assert_eq!(text.matches(" ago\n").count(), 1, "{text}");
+        let verbose = render_verbose(&report, now);
+        assert!(verbose.contains("    email: unknown\n    read 5m ago\n"), "{verbose}");
+        assert_eq!(verbose.matches(" ago\n").count(), 1, "{verbose}");
     }
 }
 

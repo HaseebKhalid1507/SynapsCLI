@@ -128,14 +128,31 @@ fn resolve_endpoint(override_url: Option<&str>) -> Result<String, String> {
 /// Coarse transport class; never the URL, the token or a body.
 fn classify_reqwest_error(e: &reqwest::Error) -> String {
     if e.is_timeout() {
-        "profile request timed out".into()
+        PROFILE_TIMED_OUT.into()
     } else if e.is_connect() {
-        "profile request could not connect".into()
+        PROFILE_NO_CONNECT.into()
     } else if e.is_body() || e.is_decode() {
-        "profile response body could not be read".into()
+        PROFILE_BODY_UNREADABLE.into()
     } else {
-        "profile request failed".into()
+        PROFILE_REQUEST_FAILED.into()
     }
+}
+
+const PROFILE_TIMED_OUT: &str = "profile request timed out";
+const PROFILE_NO_CONNECT: &str = "profile request could not connect";
+const PROFILE_BODY_UNREADABLE: &str = "profile response body could not be read";
+const PROFILE_REQUEST_FAILED: &str = "profile request failed";
+
+/// True when a [`fetch_anthropic_profile`] error means no usable answer
+/// arrived (transport), as opposed to an answer that was refused or bad.
+pub(crate) fn is_transport_failure(message: &str) -> bool {
+    [
+        PROFILE_TIMED_OUT,
+        PROFILE_NO_CONNECT,
+        PROFILE_BODY_UNREADABLE,
+        PROFILE_REQUEST_FAILED,
+    ]
+    .contains(&message)
 }
 
 /// Stream the body into a capped buffer. Fail closed on overflow.

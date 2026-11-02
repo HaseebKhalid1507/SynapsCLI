@@ -1,0 +1,1 @@
+{"v":1,"accounts_api":1,"connect":{"providers":["anthropic","openai-codex"],"flows":["browser"]},"verbs":["capabilities","list","state","order","remove","connect"]}

@@ -1,0 +1,92 @@
+{
+  "accounts": [
+    {
+      "account_id_prefix": "a1000001",
+      "added_at": 1760000000,
+      "expires": 1800003600000,
+      "identity": "fixture@example.invalid",
+      "label": "default",
+      "provider": "anthropic",
+      "seat_fingerprint": "db5e43fb96a35349f7ef5c782a2c7faeb12d7d171697e32508bb176460bf66d0",
+      "selected": false
+    },
+    {
+      "account_id_prefix": "b2000002",
+      "added_at": 1760000100,
+      "expires": 1800003600000,
+      "identity": "second@example.invalid",
+      "label": "claude2",
+      "provider": "anthropic",
+      "seat_fingerprint": "9d28fdf6ffa7e71c5f6815012a48f7e25e4097d5b96ec6e5af5f111d532388fb",
+      "selected": false
+    },
+    {
+      "account_id_prefix": "c3000003",
+      "added_at": 1760000200,
+      "expires": 1800003600000,
+      "identity": "third@example.invalid",
+      "label": "claude3",
+      "provider": "anthropic",
+      "seat_fingerprint": "987809bc1515fd6ebbb057b3e424346d1e081dae768d571640b79f4f37e6aaf8",
+      "selected": false
+    },
+    {
+      "account_id_prefix": "d4000004",
+      "added_at": 1760000300,
+      "expires": 1800003600000,
+      "identity": "codex@example.invalid",
+      "label": "default",
+      "provider": "openai-codex",
+      "seat_fingerprint": "53df8c6280b9f7fb7e0fc0013920d6248589fbbc28f83e871f2e59eb0bfe231a",
+      "selected": true
+    }
+  ],
+  "duplicate_identity_keys": [],
+  "malformed_keys": [],
+  "order": {
+    "anthropic": [
+      "default",
+      "claude2",
+      "claude3"
+    ],
+    "openai-codex": [
+      "default"
+    ]
+  },
+  "revision": "3e8528b167ffa2f9",
+  "schema_version": 1,
+  "selectors": {
+    "anthropic": {
+      "kind": "auto"
+    },
+    "github-copilot": {
+      "account": "default",
+      "kind": "account"
+    },
+    "google-gemini": {
+      "account": "default",
+      "kind": "account"
+    },
+    "kimi-code": {
+      "account": "default",
+      "kind": "account"
+    },
+    "muse": {
+      "account": "default",
+      "kind": "account"
+    },
+    "openai-codex": {
+      "account": "default",
+      "kind": "account"
+    },
+    "xai-auth": {
+      "account": "default",
+      "kind": "account"
+    }
+  },
+  "source": "local",
+  "strategy": {
+    "anthropic": "soonest_reset",
+    "openai-codex": "soonest_reset"
+  }
+}

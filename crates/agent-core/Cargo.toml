@@ -53,3 +53,12 @@ tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
 [dev-dependencies]
 serial_test = "3.4.0"
 tempfile    = "3"
+# Self dev-dependency (the pattern synaps-engine and synaps-tui use): turns
+# the `testing` feature on for every test target, so the integration tests
+# in tests/ see the test seams without extra cargo flags.
+synaps-core = { path = ".", features = ["testing"] }
+
+[features]
+# Test-support seams (the broker's manual test clock). Never enabled in a
+# production build.
+testing = []

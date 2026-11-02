@@ -84,6 +84,8 @@ clap_complete = "4.5.67"
 [dev-dependencies]
 # Unlocks `Runtime::new_headless()` for bin tests (feature-unified in test builds).
 agent-engine = { workspace = true, features = ["testing"] }
+# The broker's test seams (a usage-read table of its own) for the daemon tests.
+agent-core = { workspace = true, features = ["testing"] }
 serial_test = "3.4.0"
 tempfile = "3"
 rcgen = { version = "0.14", default-features = true }
@@ -132,8 +134,15 @@ assets = [
 [target.'cfg(unix)'.dependencies]
 signal-hook = { version = "0.3", features = ["iterator"] }
 
-[target.'cfg(all(unix, not(target_env = "musl")))'.dependencies]
+[target.'cfg(all(unix, not(target_env = "musl"), not(target_os = "macos")))'.dependencies]
 tikv-jemallocator = { version = "0.6", features = ["background_threads"] }
+
+# macOS: jemalloc has no background thread there, and the `background_threads`
+# feature bakes `background_thread:true` into jemalloc's compiled-in conf, which
+# prints "<jemalloc>: option background_thread currently supports pthread only"
+# on stderr at every start. Same allocator, without that feature.
+[target.'cfg(target_os = "macos")'.dependencies]
+tikv-jemallocator = "0.6"
 
 [workspace]
 members = ["crates/agent-core", "crates/agent-engine", "crates/agent-tui"]

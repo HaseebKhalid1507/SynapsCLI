@@ -382,15 +382,29 @@ pub(crate) fn list_accounts_detailed_at(
     path: &Path,
     provider: Option<OAuthProviderId>,
 ) -> std::result::Result<AccountInventory, String> {
-    let mut inventory = AccountInventory::default();
+    Ok(inventory_from_root(&read_root_at(path)?, provider))
+}
+
+/// One unlocked read of the auth.json root; a missing file is empty.
+pub(crate) fn read_root_at(
+    path: &Path,
+) -> std::result::Result<serde_json::Map<String, serde_json::Value>, String> {
     if !path.exists() {
-        return Ok(inventory);
+        return Ok(serde_json::Map::new());
     }
     let content = std::fs::read_to_string(path)
         .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
-    let root: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&content)
-        .map_err(|e| format!("Failed to parse {}: {}", path.display(), e))?;
-    for (key, entry) in &root {
+    serde_json::from_str(&content).map_err(|e| format!("Failed to parse {}: {}", path.display(), e))
+}
+
+/// The inventory of an already-read root (the listing rules of
+/// [`list_accounts_detailed_at`], usable inside the store lock).
+pub(crate) fn inventory_from_root(
+    root: &serde_json::Map<String, serde_json::Value>,
+    provider: Option<OAuthProviderId>,
+) -> AccountInventory {
+    let mut inventory = AccountInventory::default();
+    for (key, entry) in root {
         let belongs = match provider {
             Some(p) => CredentialRef::key_belongs_to(key, p),
             None => super::provider::DESCRIPTORS
@@ -448,7 +462,7 @@ pub(crate) fn list_accounts_detailed_at(
     // Duplicate seats: same provider + same full accountId in two slots.
     let mut seen: std::collections::BTreeMap<(String, String), Vec<String>> =
         std::collections::BTreeMap::new();
-    for (key, entry) in &root {
+    for (key, entry) in root {
         let Some(cred) = CredentialRef::parse_storage_key(key) else {
             continue;
         };
@@ -471,7 +485,7 @@ pub(crate) fn list_accounts_detailed_at(
         }
     }
     inventory.duplicate_identity_keys.sort();
-    Ok(inventory)
+    inventory
 }
 
 /// Bounded key text for diagnostics (keys are labels, never token material,
@@ -549,19 +563,134 @@ pub(crate) fn save_credential_unless_duplicate_at(
     creds: &OAuthCredentials,
     metadata: &AccountMetadata,
 ) -> std::result::Result<LoginPersistOutcome, String> {
+    let fields = credential_fields(creds)?;
+    with_locked_root(path, false, |root| {
+        Ok(persist_unless_duplicate(root, cred, creds, &fields, metadata))
+    })
+}
+
+/// The credential's JSON fields as stored in its slot.
+fn credential_fields(
+    creds: &OAuthCredentials,
+) -> std::result::Result<serde_json::Map<String, serde_json::Value>, String> {
     let encoded =
         serde_json::to_value(creds).map_err(|e| format!("Failed to serialize auth: {}", e))?;
-    let fields = encoded
+    encoded
         .as_object()
         .cloned()
-        .ok_or_else(|| "credential did not serialize to an object".to_string())?;
+        .ok_or_else(|| "credential did not serialize to an object".to_string())
+}
+
+/// What `auth connect` requires of the target slot when it saves.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SlotExpectation {
+    /// Add: the slot must not exist.
+    Absent,
+    /// Sign in again: the slot must hold an OAuth login whose seat
+    /// fingerprint is exactly this (`None`: a login with no seat). With
+    /// `Some(fp)` the new credential must also be that seat.
+    Seat(Option<String>),
+}
+
+/// Outcome of [`save_connect_credential_at`]. Only `Saved` wrote anything.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ConnectSave {
+    Saved,
+    /// Add, but the slot appeared meanwhile.
+    SlotExists,
+    /// Sign in again, but the slot is gone or now holds another seat.
+    Conflict,
+    /// Sign in again, but the provider returned another seat.
+    IdentityChanged,
+    /// Another slot of the provider already holds this seat.
+    Duplicate(Account),
+}
+
+/// The seat fingerprint of the OAuth login stored in `entry`, as `auth list`
+/// shows it: `None` when `entry` is not an OAuth login, `Some(None)` for a
+/// login without a seat.
+pub(crate) fn stored_seat_fingerprint(
+    provider: OAuthProviderId,
+    entry: &serde_json::Value,
+) -> Option<Option<String>> {
+    let obj = entry.as_object()?;
+    if obj.get("type").and_then(|t| t.as_str()) != Some("oauth") {
+        return None;
+    }
+    Some(obj
+        .get("accountId")
+        .and_then(|v| v.as_str())
+        .and_then(|id| super::account::seat_fingerprint(provider, id)))
+}
+
+/// `auth connect` persistence: the slot expectation, the returned seat,
+/// the duplicate guard and the write are ONE locked read-modify-write of
+/// `path` (waiting at most `wait` for the lock), so a slot that changed
+/// since the flow started is never overwritten. Nothing is written unless
+/// the outcome is [`ConnectSave::Saved`].
+pub(crate) fn save_connect_credential_at(
+    path: &Path,
+    cred: &CredentialRef,
+    creds: &OAuthCredentials,
+    metadata: &AccountMetadata,
+    expect: &SlotExpectation,
+    wait: std::time::Duration,
+) -> std::result::Result<ConnectSave, StoreError> {
+    let fields = credential_fields(creds)?;
+    let key = cred.storage_key();
+    with_locked_root_typed(path, false, wait, |root| {
+        match expect {
+            SlotExpectation::Absent => {
+                if root.contains_key(&key) {
+                    return Ok((false, ConnectSave::SlotExists));
+                }
+            }
+            SlotExpectation::Seat(want) => {
+                let stored = root
+                    .get(&key)
+                    .map(|entry| stored_seat_fingerprint(cred.provider, entry));
+                match stored {
+                    Some(Some(fp)) if fp == *want => {}
+                    _ => return Ok((false, ConnectSave::Conflict)),
+                }
+                if let Some(want) = want {
+                    let returned = creds
+                        .account_id
+                        .as_deref()
+                        .and_then(|id| super::account::seat_fingerprint(cred.provider, id));
+                    if returned.as_deref() != Some(want.as_str()) {
+                        return Ok((false, ConnectSave::IdentityChanged));
+                    }
+                }
+            }
+        }
+        let (write, outcome) = persist_unless_duplicate(root, cred, creds, &fields, metadata);
+        Ok((
+            write,
+            match outcome.evidence {
+                IdentityEvidence::Duplicate(account) => ConnectSave::Duplicate(account),
+                IdentityEvidence::NoDuplicate | IdentityEvidence::NoEvidence => ConnectSave::Saved,
+            },
+        ))
+    })
+}
+
+/// The duplicate scan and slot write shared by every login save; runs on
+/// the locked root. Returns `(write, outcome)` for [`with_locked_root`].
+fn persist_unless_duplicate(
+    root: &mut serde_json::Map<String, serde_json::Value>,
+    cred: &CredentialRef,
+    creds: &OAuthCredentials,
+    fields: &serde_json::Map<String, serde_json::Value>,
+    metadata: &AccountMetadata,
+) -> (bool, LoginPersistOutcome) {
     let key = cred.storage_key();
     let account_id = creds
         .account_id
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty());
-    with_locked_root(path, false, |root| {
+    {
         // Scan sibling slots of the same provider under the lock.
         let mut duplicate: Option<Account> = None;
         for (other_key, entry) in root.iter() {
@@ -588,20 +717,20 @@ pub(crate) fn save_credential_unless_duplicate_at(
             }
         }
         if let Some(account) = duplicate {
-            return Ok((
+            return (
                 false,
                 LoginPersistOutcome {
                     evidence: IdentityEvidence::Duplicate(account),
                     saved: false,
                 },
-            ));
+            );
         }
         let mut slot = root
             .remove(&key)
             .filter(serde_json::Value::is_object)
             .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
         if let Some(target) = slot.as_object_mut() {
-            for (k, v) in &fields {
+            for (k, v) in fields {
                 target.insert(k.clone(), v.clone());
             }
             if account_id.is_none() {
@@ -635,7 +764,7 @@ pub(crate) fn save_credential_unless_duplicate_at(
             }
         }
         root.insert(key.clone(), slot);
-        Ok((
+        (
             true,
             LoginPersistOutcome {
                 evidence: if account_id.is_some() {
@@ -645,8 +774,8 @@ pub(crate) fn save_credential_unless_duplicate_at(
                 },
                 saved: true,
             },
-        ))
-    })
+        )
+    }
 }
 
 /// Duplicate-identity guard for login: returns the account (of the same
@@ -967,7 +1096,7 @@ fn lock_store_exclusive(
     }
 }
 
-fn with_locked_root_typed<T>(
+pub(crate) fn with_locked_root_typed<T>(
     path: &std::path::Path,
     recover_corrupt: bool,
     wait: std::time::Duration,
@@ -1022,13 +1151,15 @@ fn with_locked_root_typed<T>(
                 let backup = path.with_extension(format!("json.corrupt.{}", ts));
                 match std::fs::copy(path, &backup) {
                     Ok(_) => {
-                        eprintln!(
+                        tracing::warn!(backup = %backup.display(), "auth.json was reset; backup saved");
+                        crate::eprintln_lossy!(
                             "[warn] auth.json was corrupt and has been reset. Backup saved to: {}",
                             backup.display()
                         );
                     }
                     Err(copy_err) => {
-                        eprintln!(
+                        tracing::warn!(error = %copy_err, "auth.json was reset; backup failed");
+                        crate::eprintln_lossy!(
                             "[warn] auth.json was corrupt and has been reset, but backup failed: {}",
                             copy_err
                         );

@@ -4,6 +4,7 @@
 
 use std::io::{self, IsTerminal, Write};
 
+use synaps_cli::auth::accounts_api::{self, ApiError, ErrorCode, ErrorReply};
 use synaps_cli::auth::{
     self, Account, AccountSelector, AccountSummary, CredentialRef, OAuthProviderId, SeatResolution,
 };
@@ -75,28 +76,50 @@ impl Source {
     }
 }
 
+/// Why [`gather`] failed: the remote broker, or the local store (an
+/// unreadable or unparseable auth.json).
+#[derive(Debug)]
+enum GatherError {
+    Remote(String),
+    Store(String),
+}
+
+impl From<GatherError> for String {
+    fn from(e: GatherError) -> Self {
+        match e {
+            GatherError::Remote(m) | GatherError::Store(m) => m,
+        }
+    }
+}
+
 /// Gather account rows: local storage (with policy annotation) or the
 /// remote broker's `/capabilities` account rows when this client uses a
-/// remote credential source.
+/// remote credential source. Also returns the accounts revision (contract
+/// §0) of the same read: store-wide, whatever `provider` filters.
 async fn gather(
     provider: Option<OAuthProviderId>,
-) -> Result<(Source, Vec<AccountSummary>, auth::AccountInventory), String> {
-    let cfg = config::load_config();
+    cfg: &config::SynapsConfig,
+) -> Result<(Source, Vec<AccountSummary>, auth::AccountInventory, String), GatherError> {
     let source = cfg.auth.credential_source();
     if source.is_remote() {
         let broker = auth::broker_from_source(&source, &auth::TokenCache::new(), reqwest::Client::new());
         let caps = broker
             .capabilities()
             .await
-            .map_err(|e| format!("remote broker capabilities failed: {e}"))?;
+            .map_err(|e| GatherError::Remote(format!("remote broker capabilities failed: {e}")))?;
+        let all: Vec<AccountSummary> = caps.iter().flat_map(|c| c.accounts.iter().cloned()).collect();
+        let revision = accounts_api::revision_of_rows(&all, &cfg.auth);
         let rows: Vec<AccountSummary> = caps
             .into_iter()
             .filter(|c| provider.is_none_or(|p| c.key == p.as_str()))
             .flat_map(|c| c.accounts)
             .collect();
-        return Ok((Source::Remote, rows, auth::AccountInventory::default()));
+        return Ok((Source::Remote, rows, auth::AccountInventory::default(), revision));
     }
-    let inventory = auth::list_accounts_detailed(provider)?;
+    let accounts_api::LocalListing {
+        inventory,
+        revision,
+    } = accounts_api::local_listing(provider, &cfg.auth).map_err(GatherError::Store)?;
     let policy = cfg.auth.account_policy().with_env_overlay();
     let mut rows = inventory.accounts.clone();
     for row in &mut rows {
@@ -104,14 +127,21 @@ async fn gather(
             row.selected = matches!(policy.selector(id), AccountSelector::Account(a) if a.label_str() == row.label);
         }
     }
-    Ok((Source::Local, rows, inventory))
+    Ok((Source::Local, rows, inventory, revision))
 }
 
 /// `synaps auth list [--provider <id>] [--json]`.
 pub async fn list(opts: ListOptions) -> Result<(), String> {
     let provider = opts.provider.as_deref().map(parse_provider).transpose()?;
-    let (source, rows, inventory) = gather(provider).await?;
     let cfg = config::load_config();
+    let (source, rows, inventory, revision) = match gather(provider, &cfg).await {
+        Ok(gathered) => gathered,
+        Err(GatherError::Store(e)) if opts.json => {
+            print_reply(&ErrorReply::new(ErrorCode::StoreUnreadable, None));
+            return Err(e);
+        }
+        Err(e) => return Err(e.into()),
+    };
     let policy = cfg.auth.account_policy().with_env_overlay();
 
     if opts.json {
@@ -129,6 +159,7 @@ pub async fn list(opts: ListOptions) -> Result<(), String> {
                 (d.id.as_str().to_string(), value)
             })
             .collect();
+        let (order, strategy) = accounts_api::list_order_and_strategy(&rows, &cfg.auth);
         let out = serde_json::json!({
             "schema_version": 1,
             "source": source.as_str(),
@@ -136,6 +167,9 @@ pub async fn list(opts: ListOptions) -> Result<(), String> {
             "selectors": selectors,
             "malformed_keys": inventory.malformed_keys,
             "duplicate_identity_keys": inventory.duplicate_identity_keys,
+            "order": order,
+            "strategy": strategy,
+            "revision": revision,
         });
         println!(
             "{}",
@@ -546,7 +580,7 @@ async fn identify_one(
 pub async fn use_account(provider: String, account: String) -> Result<(), String> {
     let provider_id = parse_provider(&provider)?;
     let selector = AccountSelector::parse(&account)?;
-    let (source, rows, _) = gather(Some(provider_id)).await?;
+    let (source, rows, _, _) = gather(Some(provider_id), &config::load_config()).await?;
     match &selector {
         AccountSelector::Account(account) => {
             if !rows.iter().any(|r| r.label == account.label_str()) {
@@ -651,6 +685,158 @@ pub fn remove(provider: String, account: String, yes: bool) -> Result<(), String
         }
     }
     Ok(())
+}
+
+// ── Accounts contract v1 (`--json` replies; see `accounts_api`) ─────────────
+
+/// One compact v1 document on stdout.
+fn print_reply<T: serde::Serialize>(reply: &T) {
+    println!("{}", accounts_api::to_line(reply));
+}
+
+/// Print a v1 reply. A refusal prints its closed error reply and exits 1;
+/// a failure outside the verb's enum prints nothing on stdout (the text goes
+/// to stderr, exit 1).
+fn finish_json<T: serde::Serialize>(result: Result<T, ApiError>) -> Result<(), String> {
+    match result {
+        Ok(reply) => {
+            print_reply(&reply);
+            Ok(())
+        }
+        Err(err) => {
+            if let Some(reply) = err.reply() {
+                print_reply(&reply);
+            }
+            Err(err.to_string())
+        }
+    }
+}
+
+/// The JSON verbs that read the local store refuse a remote credential
+/// source: its slots and selection live on the broker host.
+fn require_local_source() -> Result<(), ApiError> {
+    if config::load_config().auth.credential_source().is_remote() {
+        return Err(ApiError::code(ErrorCode::BadRequest));
+    }
+    Ok(())
+}
+
+/// `synaps auth capabilities [--json]`: the accounts API level (also the
+/// version probe: an older binary rejects the subcommand with exit 2).
+pub fn capabilities(json: bool) -> Result<(), String> {
+    let caps = accounts_api::capabilities();
+    if json {
+        print_reply(&caps);
+    } else {
+        println!(
+            "accounts api {}; connect: {} ({})",
+            caps.accounts_api,
+            caps.connect.providers.join(", "),
+            caps.connect.flows.join(", ")
+        );
+    }
+    Ok(())
+}
+
+/// Options for `synaps auth order`.
+#[derive(Debug, Clone, Default)]
+pub struct OrderOptions {
+    pub provider: String,
+    pub json: bool,
+    pub set: Option<String>,
+    pub strict: bool,
+    pub tie_break: bool,
+    pub expect: Option<String>,
+}
+
+/// `synaps auth order --provider <id> [--set L1,L2,...] [--strict|--tie-break]
+/// [--expect REV] [--json]`: read or write the try order and strategy.
+pub fn order(opts: OrderOptions) -> Result<(), String> {
+    let result = order_result(&opts);
+    if opts.json {
+        return finish_json(result);
+    }
+    let reply = result.map_err(|e| match e {
+        ApiError::Refused {
+            revision: Some(ref revision),
+            ..
+        } => format!("{e} (current revision {revision}); nothing written"),
+        other => other.to_string(),
+    })?;
+    println!(
+        "{} order: {} (strategy {}, revision {})",
+        reply.provider,
+        if reply.order.is_empty() {
+            "no accounts".to_string()
+        } else {
+            reply.order.join(", ")
+        },
+        accounts_api::strategy_config_value(reply.strategy),
+        reply.revision
+    );
+    Ok(())
+}
+
+fn order_result(opts: &OrderOptions) -> Result<accounts_api::OrderReply, ApiError> {
+    let provider = accounts_api::parse_provider(&opts.provider)?;
+    let set = opts.set.as_deref().map(accounts_api::parse_set).transpose()?;
+    accounts_api::check_expect(opts.expect.as_deref())?;
+    require_local_source()?;
+    let strategy = if opts.strict {
+        Some(auth::quota_policy::Strategy::PreferenceOrder)
+    } else if opts.tie_break {
+        Some(auth::quota_policy::Strategy::SoonestReset)
+    } else {
+        None
+    };
+    if set.is_none() && strategy.is_none() {
+        return accounts_api::order_read(provider, opts.expect.as_deref());
+    }
+    accounts_api::order_write(
+        provider,
+        &accounts_api::OrderWrite { set, strategy },
+        opts.expect.as_deref(),
+    )
+}
+
+/// `synaps auth use --provider <id> --account <label|default|auto> --json
+/// [--expect REV]`.
+pub fn use_account_json(provider: &str, account: &str, expect: Option<&str>) -> Result<(), String> {
+    finish_json(use_result(provider, account, expect))
+}
+
+fn use_result(
+    provider: &str,
+    account: &str,
+    expect: Option<&str>,
+) -> Result<accounts_api::UseReply, ApiError> {
+    let provider = accounts_api::parse_provider(provider)?;
+    let selector =
+        AccountSelector::parse(account).map_err(|_| ApiError::code(ErrorCode::BadRequest))?;
+    accounts_api::check_expect(expect)?;
+    require_local_source()?;
+    accounts_api::use_selector(provider, &selector, expect)
+}
+
+/// `synaps auth remove --provider <id> --account <label|default> -y --json
+/// [--expect-rev REV]`. Never prompts: `-y` is required.
+pub fn remove_json(provider: &str, account: &str, yes: bool, expect: Option<&str>) -> Result<(), String> {
+    finish_json(remove_result(provider, account, yes, expect))
+}
+
+fn remove_result(
+    provider: &str,
+    account: &str,
+    yes: bool,
+    expect: Option<&str>,
+) -> Result<accounts_api::RemoveReply, ApiError> {
+    let provider = accounts_api::parse_provider(provider)?;
+    let account = accounts_api::parse_account(account)?;
+    accounts_api::check_expect(expect)?;
+    if !yes {
+        return Err(ApiError::code(ErrorCode::BadRequest));
+    }
+    accounts_api::remove(&CredentialRef::new(provider, account), expect)
 }
 
 #[cfg(test)]
@@ -940,6 +1126,7 @@ mod chooser_tests {
                 observed_at_ms: Some(now),
                 cooldown_until_ms: None,
                 failure: None,
+                extra_usage_enabled: None,
                 observation: QuotaObservation::Ok {
                     windows: vec![WindowLimit {
                         id: "seven_day".into(),
@@ -1173,6 +1360,10 @@ mod state_tests {
                     progressive_tool_disclosure: false,
                     generation: 1,
                     daemon_build: "oldbld1".into(),
+                    features: vec![],
+                    accepted_events: vec![],
+                    config_path: None,
+                    memory_backend: None,
                 });
                 w.write_all(encode_line(&welcome).unwrap().as_bytes())
                     .await

@@ -29,11 +29,21 @@ pub fn generate_state() -> String {
 /// Build the full authorize URL for the browser.
 pub fn build_auth_url(challenge: &str, state: &str, port: u16) -> String {
     let redirect_uri = format!("http://localhost:{}/callback", port);
+    build_auth_url_at(AUTHORIZE_URL, &redirect_uri, challenge, state)
+}
+
+/// [`build_auth_url`] against an explicit authorize endpoint and redirect.
+pub(crate) fn build_auth_url_at(
+    authorize_url: &str,
+    redirect_uri: &str,
+    challenge: &str,
+    state: &str,
+) -> String {
     let params = [
         ("code", "true"),
         ("client_id", CLIENT_ID),
         ("response_type", "code"),
-        ("redirect_uri", &redirect_uri),
+        ("redirect_uri", redirect_uri),
         ("scope", SCOPES),
         ("code_challenge", challenge),
         ("code_challenge_method", "S256"),
@@ -46,5 +56,5 @@ pub fn build_auth_url(challenge: &str, state: &str, port: u16) -> String {
         .collect::<Vec<_>>()
         .join("&");
 
-    format!("{}?{}", AUTHORIZE_URL, query)
+    format!("{}?{}", authorize_url, query)
 }

@@ -456,6 +456,51 @@ async fn muse_stream_refused_remint_surfaces_the_upstream_401() {
     assert_eq!(seen.auths().len(), 1);
 }
 
+/// Upstream that rejects every key and, on the rejection, removes the
+/// login (a peer logged the account out between dispatch and recovery).
+fn vanishing_upstream(seen: Seen, home: PathBuf) -> Router {
+    Router::new().route(
+        "/v1/responses",
+        post(move |headers: HeaderMap| {
+            let seen = seen.clone();
+            let home = home.clone();
+            async move {
+                seen.push(&headers);
+                write_store(&home, json!({}));
+                (StatusCode::UNAUTHORIZED, UPSTREAM_401_BODY).into_response()
+            }
+        }),
+    )
+}
+
+/// The first request was sent and rejected; its login is gone by the time
+/// it is recovered. The recovery failure (a missing named account, or the
+/// default slot's missing credential) happens after a dispatch, so it is
+/// never reported as a "not sent" error: the caller gets the original
+/// upstream 401 (dev c0a6c262's convention), after exactly one upstream
+/// call.
+#[tokio::test]
+#[serial_test::serial]
+async fn muse_recovery_failure_after_a_sent_request_is_not_reported_as_unsent() {
+    std::env::remove_var("META_API_KEY");
+    for (slot, provider) in [("muse@work", "muse@work"), ("muse", "muse")] {
+        let home = install_store(json!({ slot: muse_slot("KEY-1") }));
+        let seen = Seen::default();
+        let upstream = spawn(vanishing_upstream(seen.clone(), home.path().to_path_buf())).await;
+        let broker = LocalBroker::new(reqwest::Client::new())
+            .with_account_policy(AccountPolicy::new())
+            .with_muse_base_url_for_tests(upstream);
+
+        let resp = broker
+            .proxy(responses_request(provider))
+            .await
+            .unwrap_or_else(|e| panic!("{provider}: the upstream 401, not a broker error: {e:?}"));
+        assert_eq!(resp.status, 401, "{provider}");
+        assert_eq!(resp.body, UPSTREAM_401_BODY, "{provider}");
+        assert_eq!(seen.auths(), vec!["Bearer KEY-1"], "{provider}: one request sent");
+    }
+}
+
 #[tokio::test]
 #[serial_test::serial]
 async fn muse_env_key_overrides_login_and_is_never_recovered() {

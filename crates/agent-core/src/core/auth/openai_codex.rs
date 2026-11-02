@@ -4,10 +4,13 @@ use serde::Deserialize;
 use serde_json::Value;
 use tokio::sync::oneshot;
 
+use super::callback::start_callback_server_typed;
+#[cfg(test)]
+use super::start_callback_server_at;
+use super::login_flow::{BrowserEndpoints, LoginFailure, LoginFailureKind, LoginSink, TerminalSink};
 use super::{
-    generate_code_challenge, generate_code_verifier, generate_state, open_browser,
-    save_provider_auth, start_callback_server_at, CallbackOutcome, CallbackResult,
-    OAuthCredentials, RefreshFailure, CALLBACK_HOST,
+    generate_code_challenge, generate_code_verifier, generate_state, save_provider_auth,
+    CallbackOutcome, CallbackResult, OAuthCredentials, RefreshFailure, CALLBACK_HOST,
 };
 
 const PROVIDER: &str = "openai-codex";
@@ -40,57 +43,96 @@ pub async fn login() -> std::result::Result<OAuthCredentials, String> {
 pub async fn login_into(
     persist_key: Option<&str>,
 ) -> std::result::Result<OAuthCredentials, String> {
+    let mut sink = TerminalSink {
+        opening: "Opening browser to sign in with ChatGPT...",
+    };
+    let creds = browser_login(&mut sink, &browser_endpoints()).await?;
+    if let Some(key) = persist_key {
+        save_provider_auth(key, &creds)?;
+    }
+    Ok(creds)
+}
+
+/// Production endpoints of the ChatGPT browser login.
+pub(crate) fn browser_endpoints() -> BrowserEndpoints {
+    BrowserEndpoints {
+        authorize_url: AUTHORIZE_URL.to_string(),
+        token_url: TOKEN_URL.to_string(),
+        callback_host: CALLBACK_HOST.to_string(),
+        callback_port: CALLBACK_PORT,
+        callback_path: CALLBACK_PATH.to_string(),
+        redirect_uri: REDIRECT_URI.to_string(),
+    }
+}
+
+/// The ChatGPT login without persistence, progress to `sink`.
+pub(crate) async fn browser_login(
+    sink: &mut dyn LoginSink,
+    ep: &BrowserEndpoints,
+) -> std::result::Result<OAuthCredentials, LoginFailure> {
     let verifier = generate_code_verifier();
     let challenge = generate_code_challenge(&verifier);
     let state = generate_state();
-    let (rx, server_handle) =
-        start_callback_server_at(state.clone(), CALLBACK_HOST, CALLBACK_PORT, CALLBACK_PATH)
-            .await?;
-    let auth_url = build_auth_url(&challenge, &state)?;
+    let (rx, server_handle) = start_callback_server_typed(
+        state.clone(),
+        &ep.callback_host,
+        ep.callback_port,
+        &ep.callback_path,
+    )
+    .await?;
+    let auth_url = build_auth_url_at(&ep.authorize_url, &ep.redirect_uri, &challenge, &state)
+        .map_err(LoginFailure::internal)?;
 
-    eprintln!("\n\x1b[1mOpening browser to sign in with ChatGPT...\x1b[0m\n");
-    if let Err(e) = open_browser(&auth_url) {
-        eprintln!("Could not open browser automatically: {}", e);
-    }
-    eprintln!("\x1b[2mIf the browser didn't open, visit this URL:\x1b[0m");
-    eprintln!("\x1b[36m{}\x1b[0m\n", auth_url);
+    sink.authorize(&auth_url, &ep.authorize_url)?;
 
     let (manual_tx, manual_rx) = oneshot::channel::<CallbackResult>();
-    let stdin_task = tokio::spawn(async move {
-        eprintln!("\x1b[2mOr paste the redirect URL here (must include `state`):\x1b[0m");
-        let mut line = String::new();
-        let result = tokio::task::spawn_blocking(move || {
-            std::io::stdin().read_line(&mut line).ok();
-            line.trim().to_string()
-        })
-        .await;
+    let (stdin_task, held_manual_tx) = if sink.paste_fallback() {
+        let task = tokio::spawn(async move {
+            eprintln!("\x1b[2mOr paste the redirect URL here (must include `state`):\x1b[0m");
+            let mut line = String::new();
+            let result = tokio::task::spawn_blocking(move || {
+                std::io::stdin().read_line(&mut line).ok();
+                line.trim().to_string()
+            })
+            .await;
 
-        if let Ok(input) = result {
-            match manual_paste_to_callback(&input) {
-                Some(callback) => {
-                    let _ = manual_tx.send(callback);
-                }
-                None => {
-                    eprintln!(
-                        "\x1b[31m✗ Pasted input did not contain both `code` and `state`.\x1b[0m"
-                    );
-                    eprintln!(
-                        "\x1b[2m  Paste the full redirect URL (e.g. http://localhost:1455/auth/callback?code=…&state=…).\x1b[0m"
-                    );
+            if let Ok(input) = result {
+                match manual_paste_to_callback(&input) {
+                    Some(callback) => {
+                        let _ = manual_tx.send(callback);
+                    }
+                    None => {
+                        eprintln!(
+                            "\x1b[31m✗ Pasted input did not contain both `code` and `state`.\x1b[0m"
+                        );
+                        eprintln!(
+                            "\x1b[2m  Paste the full redirect URL (e.g. http://localhost:1455/auth/callback?code=…&state=…).\x1b[0m"
+                        );
+                    }
                 }
             }
-        }
-    });
+        });
+        (Some(task), None)
+    } else {
+        // No paste path: hold the sender so the manual branch never fires.
+        (None, Some(manual_tx))
+    };
 
     let result = tokio::select! {
-        callback = rx => match callback.map_err(|_| "Callback channel closed".to_string())? {
-            CallbackOutcome::Authorized(result) => result,
-            CallbackOutcome::Denied { error, description } => return Err(format!("OAuth denied: {}{}", error, description.map(|d| format!(": {d}")).unwrap_or_default())),
-            CallbackOutcome::Invalid => return Err("Invalid OAuth callback".into()),
+        callback = rx => {
+            let hit = callback.map_err(|_| LoginFailure::internal("Callback channel closed"))?;
+            match hit.outcome {
+                CallbackOutcome::Authorized(result) => result,
+                CallbackOutcome::Denied { error, description } => return Err(LoginFailure::new(LoginFailureKind::Denied, format!("OAuth denied: {}{}", error, description.map(|d| format!(": {d}")).unwrap_or_default()))),
+                CallbackOutcome::Invalid => return Err(LoginFailure::new(super::invalid_callback_kind(hit.state_matched), "Invalid OAuth callback")),
+            }
         },
-        manual = manual_rx => manual.map_err(|_| "Manual input channel closed".to_string())?,
+        manual = manual_rx => manual.map_err(|_| LoginFailure::internal("Manual input channel closed"))?,
     };
-    stdin_task.abort();
+    if let Some(stdin_task) = stdin_task {
+        stdin_task.abort();
+    }
+    drop(held_manual_tx);
     // Once we have the callback result (from either path) the local server
     // has done its job. Shut it down BEFORE token exchange so that any
     // failure on the network or persistence path doesn't leak the server
@@ -98,15 +140,14 @@ pub async fn login_into(
     server_handle.shutdown().await;
 
     if result.state != state {
-        return Err("OAuth state mismatch -- possible CSRF attack".to_string());
+        return Err(LoginFailure::new(
+            LoginFailureKind::StateMismatch,
+            "OAuth state mismatch -- possible CSRF attack",
+        ));
     }
 
-    eprintln!("\n\x1b[1mExchanging code for tokens...\x1b[0m");
-    let creds = exchange_code_for_tokens(&result.code, &verifier).await?;
-    if let Some(key) = persist_key {
-        save_provider_auth(key, &creds)?;
-    }
-    Ok(creds)
+    sink.exchanging();
+    exchange_code_at(&ep.token_url, &ep.redirect_uri, &result.code, &verifier).await
 }
 
 pub async fn refresh_token(
@@ -122,35 +163,37 @@ pub async fn refresh_token(
     credentials_from_token(token).map_err(RefreshFailure::other)
 }
 
-async fn exchange_code_for_tokens(
+/// Code exchange for the ChatGPT login, failures typed for `auth connect`
+/// (same messages as always).
+async fn exchange_code_at(
+    token_url: &str,
+    redirect_uri: &str,
     code: &str,
     verifier: &str,
-) -> std::result::Result<OAuthCredentials, String> {
+) -> std::result::Result<OAuthCredentials, LoginFailure> {
     let client = Client::builder()
         .tls_built_in_webpki_certs(true)
         .tls_built_in_native_certs(true)
         .connect_timeout(std::time::Duration::from_secs(10))
         .timeout(std::time::Duration::from_secs(30))
         .build()
-        .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
+        .map_err(|e| LoginFailure::internal(format!("Failed to build HTTP client: {}", e)))?;
     let params = [
         ("grant_type", "authorization_code"),
         ("client_id", CLIENT_ID),
         ("code", code),
         ("code_verifier", verifier),
-        ("redirect_uri", REDIRECT_URI),
+        ("redirect_uri", redirect_uri),
     ];
-    let token = token_request(&client, &params).await?;
-    credentials_from_token(token)
-}
-
-async fn token_request(
-    client: &Client,
-    params: &[(&str, &str)],
-) -> std::result::Result<CodexTokenResponse, String> {
-    token_request_at(client, TOKEN_URL, params)
+    let token = token_post(&client, token_url, &params)
         .await
-        .map_err(String::from)
+        .map_err(|e| match e {
+            TokenPostError::Transport(m) => LoginFailure::new(LoginFailureKind::Network, m),
+            TokenPostError::Status(_, m) | TokenPostError::BadBody(m) => {
+                LoginFailure::new(LoginFailureKind::ProviderError, m)
+            }
+        })?;
+    credentials_from_token(token).map_err(|m| LoginFailure::new(LoginFailureKind::ProviderError, m))
 }
 
 /// Token-endpoint POST, failures typed at the source (no response or an
@@ -160,18 +203,40 @@ pub(crate) async fn token_request_at(
     url: &str,
     params: &[(&str, &str)],
 ) -> std::result::Result<CodexTokenResponse, RefreshFailure> {
+    token_post(client, url, params).await.map_err(|e| match e {
+        TokenPostError::Transport(m) => RefreshFailure::transport(m),
+        TokenPostError::Status(status, m) => RefreshFailure::status(status, m),
+        TokenPostError::BadBody(m) => RefreshFailure::bad_response(m),
+    })
+}
+
+/// How a token-endpoint POST failed (messages are log-safe).
+enum TokenPostError {
+    /// No response (connect, TLS, timeout).
+    Transport(String),
+    /// A non-success status.
+    Status(u16, String),
+    /// A success status whose body is not a token response.
+    BadBody(String),
+}
+
+async fn token_post(
+    client: &Client,
+    url: &str,
+    params: &[(&str, &str)],
+) -> std::result::Result<CodexTokenResponse, TokenPostError> {
     let resp = client
         .post(url)
         .header("Content-Type", "application/x-www-form-urlencoded")
         .form(&params)
         .send()
         .await
-        .map_err(|e| RefreshFailure::transport(format!("Token request failed: {}", e)))?;
+        .map_err(|e| TokenPostError::Transport(format!("Token request failed: {}", e)))?;
 
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        return Err(RefreshFailure::status(
+        return Err(TokenPostError::Status(
             status.as_u16(),
             // Only the RFC 6749 error fields: a proxy may echo the request,
             // which carries the refresh token / code verifier.
@@ -185,7 +250,7 @@ pub(crate) async fn token_request_at(
 
     resp.json()
         .await
-        .map_err(|e| RefreshFailure::bad_response(format!("Failed to parse token response: {}", e)))
+        .map_err(|e| TokenPostError::BadBody(format!("Failed to parse token response: {}", e)))
 }
 
 fn credentials_from_token(
@@ -202,12 +267,17 @@ fn credentials_from_token(
     })
 }
 
-fn build_auth_url(challenge: &str, state: &str) -> std::result::Result<String, String> {
-    let mut url = url::Url::parse(AUTHORIZE_URL).map_err(|e| e.to_string())?;
+fn build_auth_url_at(
+    authorize_url: &str,
+    redirect_uri: &str,
+    challenge: &str,
+    state: &str,
+) -> std::result::Result<String, String> {
+    let mut url = url::Url::parse(authorize_url).map_err(|e| e.to_string())?;
     url.query_pairs_mut()
         .append_pair("response_type", "code")
         .append_pair("client_id", CLIENT_ID)
-        .append_pair("redirect_uri", REDIRECT_URI)
+        .append_pair("redirect_uri", redirect_uri)
         .append_pair("scope", SCOPE)
         .append_pair("code_challenge", challenge)
         .append_pair("code_challenge_method", "S256")

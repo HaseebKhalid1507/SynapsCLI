@@ -1,0 +1,4 @@
+{"v":1,"event":"started","provider":"openai-codex","account":"default","mode":"reauth","flow":"browser","expires_at_ms":1800000600000}
+{"v":1,"event":"open_url","url":"https://auth.openai.com/oauth/authorize?response_type=code&client_id=app_EMoamEEZ73f0CkXaXp7hrann&redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback&scope=openid+profile+email+offline_access&code_challenge=fixture&code_challenge_method=S256&state=fixture&id_token_add_organizations=true&codex_cli_simplified_flow=true&originator=synaps","allow":"https://auth.openai.com/oauth/authorize"}
+{"v":1,"event":"exchanging"}
+{"v":1,"event":"done","ok":true,"account":{"provider":"openai-codex","label":"default","identity":"c@example.com","account_id_prefix":"acct_cod","seat_fingerprint":"7fd44f6d22e5e5823a036c8257d0bbe1b6618dc0c1914aa92f906133f97e0cc5","expires":1800003600000,"added_at":1800000000,"selected":true}}
