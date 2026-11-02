@@ -49,7 +49,10 @@ All notable changes to this project will be documented in this file.
   find the same tools, in any order. Results are ranked: an exact id or
   name first, then tools containing the whole query (everything that
   matched before still matches, ahead of the rest), then the most keywords
-  matched, id hits above summary hits. An empty result says to try one
+  matched, id hits above summary hits. In a query of several words,
+  one-letter and filler words (`a`, `the`, `for`, `tool`, …) are not
+  keywords, so "read a file" doesn't match every tool with an `a` in its
+  summary. An empty result says to try one
   shorter keyword and not to guess ids, and `activate_tools` given an
   unknown id says it needs an exact id from `search_tools`.
 

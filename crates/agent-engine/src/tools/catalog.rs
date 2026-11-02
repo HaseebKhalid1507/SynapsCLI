@@ -530,6 +530,15 @@ fn words(text: &str) -> impl Iterator<Item = &str> {
         .filter(|word| !word.is_empty())
 }
 
+/// Words too short or too common to select a tool on their own.
+const FILLER_WORDS: [&str; 14] = [
+    "an", "and", "by", "for", "from", "in", "into", "of", "on", "or", "the", "to", "tool", "with",
+];
+
+fn is_filler(term: &str) -> bool {
+    term.chars().count() < 2 || FILLER_WORDS.contains(&term)
+}
+
 /// A validated, bounded, case-folded discovery query. Parse-at-boundary:
 /// empty (or whitespace-only), oversized, and control-character-bearing
 /// input fails typed before any search runs.
@@ -566,6 +575,13 @@ impl DiscoveryQuery {
                 terms.push(word.to_string());
             }
         }
+        // In a multi-word query, one-letter words and filler (`read a file`,
+        // `tool for web search`) would match nearly every summary and fill
+        // the result budget with noise; drop them while a real keyword is
+        // left. A query made only of them keeps its words.
+        if terms.len() > 1 && terms.iter().any(|term| !is_filler(term)) {
+            terms.retain(|term| !is_filler(term));
+        }
         Ok(Self { needle, terms })
     }
 
@@ -577,7 +593,8 @@ impl DiscoveryQuery {
     }
 
     /// The distinct case-folded keywords of the query: split at whitespace
-    /// and at `_`, `-`, `:` and `.`, empty pieces dropped. Empty when the
+    /// and at `_`, `-`, `:` and `.`, empty pieces dropped, and one-letter or
+    /// filler words dropped while another keyword remains. Empty when the
     /// query is all separators.
     pub fn terms(&self) -> &[String] {
         &self.terms
@@ -906,10 +923,12 @@ struct SearchRank {
 
 impl SearchRank {
     fn of(row: &IndexRow, query: &DiscoveryQuery) -> Option<Self> {
-        let id = row.entry.id.as_str();
+        // The query is case-folded; fold the id and name the same way the
+        // haystack is (MCP and extension names may carry capitals).
+        let id = row.entry.id.as_str().to_lowercase();
         let needle = query.needle();
-        let name = row.entry.id.name();
-        let exact = needle == id || needle == name || words(needle).eq(words(name));
+        let name = row.entry.id.name().to_lowercase();
+        let exact = needle == id || needle == name || words(needle).eq(words(&name));
         let mut terms_matched = 0;
         let mut weight = 0;
         // Terms hold no whitespace or control characters, so a hit in the

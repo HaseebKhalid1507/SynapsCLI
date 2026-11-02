@@ -929,13 +929,37 @@ fn literal_hits(catalog: &ToolCatalog, raw: &str) -> std::collections::BTreeSet<
 
 #[test]
 fn discovery_query_splits_keywords_at_whitespace_and_id_separators() {
-    let q = query("  Web_Fetch  web-fetch:X.y ");
-    assert_eq!(q.needle(), "web_fetch  web-fetch:x.y");
-    assert_eq!(q.terms(), ["web", "fetch", "x", "y"]);
+    let q = query("  Web_Fetch  web-fetch:Xy.z ");
+    assert_eq!(q.needle(), "web_fetch  web-fetch:xy.z");
+    // `z` is one letter: dropped while real keywords remain.
+    assert_eq!(q.terms(), ["web", "fetch", "xy"]);
     // All separators: no keywords, the whole query is still the needle.
     let q = query("_-:.");
     assert_eq!(q.needle(), "_-:.");
     assert!(q.terms().is_empty());
+}
+
+#[test]
+fn filler_words_do_not_select_tools_in_multi_word_queries() {
+    // One-letter words and filler would match nearly every summary.
+    assert_eq!(query("read a file").terms(), ["read", "file"]);
+    assert_eq!(query("tool for the web").terms(), ["web"]);
+    // A query made only of them keeps its words.
+    assert_eq!(query("a").terms(), ["a"]);
+    assert_eq!(query("to the").terms(), ["to", "the"]);
+
+    let spy = Arc::new(AtomicUsize::new(0));
+    let catalog = keyword_catalog(spy);
+    let index = DiscoveryIndex::build(&catalog).expect("build index");
+    // `a` is in almost every fixture summary; only the web tools match `web`.
+    assert_eq!(
+        hit_ids(&index, "fetch a web page")[0],
+        "ext.web-tools:fetch"
+    );
+    assert_eq!(
+        hit_ids(&index, "a tool for the web"),
+        ["ext.web-tools:fetch", "ext.web-tools:search"]
+    );
 }
 
 #[test]
