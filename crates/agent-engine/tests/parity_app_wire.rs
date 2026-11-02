@@ -16,6 +16,9 @@
 //! - R6: an app-created session is Exclusive by default; after a TUI
 //!   takeover the app sees the owner change and its submit is refused in
 //!   the form the app parses as `not_input_owner`.
+//! - O2: on a Shared session the recorded app hello (no
+//!   `capabilities.owner_reason_input`) never hears
+//!   `OwnerChangeReason::Input` while a capable TUI and the app both type.
 //! - R7: rename/unname change only the name, never `id` or `journal_id`.
 //!
 //! Written at merge time (upstream d90ffd5fc × ours d79540b5b) and not
@@ -729,6 +732,124 @@ async fn r6_exclusive_default_and_takeover_refuses_the_app() {
         }
     }
     assert!(hits.load(Ordering::SeqCst) > before, "the owner's submit ran");
+    tui.detach().await;
+    stop(d).await;
+}
+
+// ── O2 ────────────────────────────────────────────────────────────────────────
+
+/// A capable client's events up to the end of the next turn (an `Idle`
+/// after a `TurnStarted`).
+async fn tui_turn_events(tui: &mut SocketTransport) -> Vec<SessionEventWire> {
+    let mut saw = Vec::new();
+    loop {
+        let env = tokio::time::timeout(Duration::from_secs(30), tui.next_event()).await.expect("timely").expect("open");
+        let done = matches!(env.event, SessionEventWire::Idle)
+            && saw.iter().any(|e| matches!(e, SessionEventWire::TurnStarted { .. }));
+        saw.push(env.event);
+        if done {
+            return saw;
+        }
+    }
+}
+
+/// 790d O2 end to end: `OwnerChangeReason::Input` never reaches a hello
+/// without `capabilities.owner_reason_input`. On an explicitly Shared
+/// session a capable TUI and the recorded app hello both type. The TUI
+/// hears the active client follow each typist (`reason: input`, the
+/// control). The app hears no `input_owner_changed` at all, live or in its
+/// `Attached` replay: conn.rs drops every owner change for a legacy client
+/// on a shared session (`wire::legacy_shared`, `as_owner`). What it gets
+/// today instead: an `Attached` with `client_input: "shared"` that presents
+/// it as the input owner, then both turns as ordinary turn events. (Its
+/// decoder has no `input` reason: `AppConn::push` would fail on one.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn o2_an_app_hello_never_hears_owner_change_reason_input() {
+    let home = Home::new();
+    let (url, _hits) = stub(SSE_HI, false).await;
+    std::env::set_var("SYNAPS_ANTHROPIC_BASE_URL", &url);
+    let d = start(&home, host().await).await;
+    let sock = d.paths.sock.clone();
+    let cwd = home.dir.path().to_path_buf();
+
+    let app_caps = serde_json::from_str::<Hello>(&app_hello(1)).expect("the app hello is a Hello").client.capabilities;
+    assert!(!app_caps.owner_reason_input, "the recorded app hello does not declare owner_reason_input");
+    let tui_hello = Hello::new(ClientKind::Tui);
+    assert!(tui_hello.client.capabilities.owner_reason_input, "the TUI is a capable client");
+
+    let conn = SocketTransport::connect(&sock, tui_hello).await.expect("tui connect");
+    let config = SessionConfig {
+        cwd: Some(cwd.clone()),
+        model_override: Some(MODEL.into()),
+        client_input: Some(ClientInput::Shared),
+        ..Default::default()
+    };
+    let (mut tui, snap) =
+        SocketTransport::attach(conn, Attach::Create { config, mode: AttachMode::Mirror }).await.expect("tui creates");
+    let sid = snap.meta.id.clone();
+    let tui_id = tui.client_id();
+    assert_eq!(snap.client_input, ClientInput::Shared);
+    assert_eq!(snap.input_owner, Some(tui_id), "the creator starts active");
+
+    let (mut app, _) = AppConn::open(&sock, "app-drive", &app_hello(1)).await;
+    app.send_json(existing_line(&sid, "mirror")).await;
+    let attached = app.until("attached", |v| v["type"] == "attached").await;
+    let app_id = attached["client"].as_u64().expect("attached.client");
+    assert_eq!(attached["client_input"], "shared", "{attached}");
+    assert_eq!(
+        attached["input_owner"], app_id,
+        "today: a legacy hello on a shared session is presented as the owner (as_owner)"
+    );
+
+    // The app types (Shared: accepted), then the TUI does.
+    app_turn(&mut app, &sid, "from the app").await;
+    let mut tui_saw = tui_turn_events(&mut tui).await;
+    tui.send_from_self(SessionCommand::Submit { text: "from the tui".into(), attachments: vec![] })
+        .await
+        .expect("send");
+    tui_saw.extend(tui_turn_events(&mut tui).await);
+    app.until("the tui's turn to idle", |v| is_ev(v, "idle")).await;
+    app.drain_for(Duration::from_millis(500)).await;
+
+    let owner_changes: Vec<_> = tui_saw
+        .iter()
+        .filter_map(|e| match e {
+            SessionEventWire::InputOwnerChanged { from, to, reason } => Some((*from, *to, *reason)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        owner_changes,
+        vec![
+            (Some(tui_id), Some(ClientId(app_id)), OwnerChangeReason::Input),
+            (Some(ClientId(app_id)), Some(tui_id), OwnerChangeReason::Input),
+        ],
+        "the control: a capable client hears the active client follow each typist"
+    );
+
+    let events = session_events(&app.seen);
+    assert!(
+        !events.iter().any(|e| e["ev"] == "input_owner_changed" && e["reason"] == "input"),
+        "790d O2: OwnerChangeReason::Input reached the app hello: {:?}",
+        app.types()
+    );
+    assert!(
+        !events.iter().any(|e| e["ev"] == "input_owner_changed"),
+        "today: no owner change of any reason reaches a legacy client on a shared session: {:?}",
+        app.types()
+    );
+    let turns: Vec<&Value> =
+        app.seen.iter().filter(|v| is_ev(v, "turn_started")).map(|v| &v["event"]["user_text"]).collect();
+    assert_eq!(
+        turns,
+        [&json!("from the app"), &json!("from the tui")],
+        "both turns, as ordinary turn events: {:?}",
+        app.types()
+    );
+
+    let m = listed(&sock, &sid).await;
+    assert_eq!((m.client_input, m.input_owner), (Some(ClientInput::Shared), Some(tui_id)), "the last typist is active");
     tui.detach().await;
     stop(d).await;
 }
