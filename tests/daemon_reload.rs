@@ -1136,6 +1136,156 @@ async fn a_rename_survives_a_reload() {
     assert_eq!(v["name"], "reload-proof");
 }
 
+/// Create a session with `client_input` as given (`None`: as the Pria app
+/// creates them, the daemon's config decides).
+async fn create_with_input(
+    paths: &registry::DaemonPaths,
+    cwd: &Path,
+    client_input: Option<ClientInput>,
+) -> (SocketTransport, AttachSnapshot) {
+    let conn = SocketTransport::connect(&paths.sock, Hello::new(ClientKind::Test)).await.unwrap();
+    let config = SessionConfig {
+        cwd: Some(cwd.to_path_buf()),
+        env: None,
+        model_override: Some("claude-sonnet-4-5".into()),
+        client_input,
+        ..Default::default()
+    };
+    SocketTransport::attach(conn, Attach::Create { config, mode: AttachMode::Mirror }).await.unwrap()
+}
+
+/// A drive client on an existing session.
+async fn attach_mirror(paths: &registry::DaemonPaths, sid: &SessionId) -> (SocketTransport, AttachSnapshot) {
+    let conn = SocketTransport::connect(&paths.sock, Hello::new(ClientKind::Test)).await.unwrap();
+    SocketTransport::attach(conn, Attach::Existing { session_id: sid.clone(), mode: AttachMode::Mirror }).await.unwrap()
+}
+
+/// Submit `text`: `Err(reason)` when refused, `Ok` once the turn it started
+/// is idle.
+async fn try_turn(t: &mut SocketTransport, text: &str) -> Result<(), String> {
+    t.send_from_self(SessionCommand::Submit { text: text.into(), attachments: vec![] }).await.unwrap();
+    let mut started = false;
+    loop {
+        let env = tokio::time::timeout(Duration::from_secs(20), t.next_event())
+            .await
+            .expect("no answer to the submit")
+            .expect("alive");
+        match env.event {
+            SessionEventWire::TurnStarted { .. } => started = true,
+            SessionEventWire::Idle if started => return Ok(()),
+            SessionEventWire::Refused { reason, .. } => return Err(reason),
+            _ => {}
+        }
+    }
+}
+
+/// `daemon reload`, then wait until the image of `generation` answers.
+async fn reload_to(d: &DaemonProc, generation: u64) {
+    assert_eq!(SocketTransport::reload(&d.paths.sock, true, None, None).await.expect("reload accepted"), generation);
+    let t0 = std::time::Instant::now();
+    loop {
+        if registry::read_daemon_json(&d.paths).is_some_and(|i| i.generation == generation)
+            && SocketTransport::ping(&d.paths.sock).await.is_ok()
+        {
+            break;
+        }
+        assert!(t0.elapsed() < Duration::from_secs(20), "new image never answered");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// `sid`'s `client_input` as the listing shows it, once it is listed.
+async fn listed_input(paths: &registry::DaemonPaths, sid: &SessionId) -> Option<ClientInput> {
+    let t0 = std::time::Instant::now();
+    loop {
+        let metas = SocketTransport::sessions(&paths.sock).await.unwrap_or_default();
+        if let Some(m) = metas.iter().find(|m| &m.id == sid) {
+            return m.client_input;
+        }
+        assert!(t0.elapsed() < Duration::from_secs(15), "{sid} never listed: {metas:#?}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// 790d SHOULD 1 (R6): a session created with no `client_input` (as the
+/// Pria app creates them) while the default is `exclusive` stays Exclusive
+/// across a reload whose next image reads `client_input = shared`: its
+/// record carries the mode it resolved at create. The listing and the
+/// Attached snapshot say so, and a second client's input is refused in the
+/// form the app reads as `not_input_owner`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn reload_keeps_an_implicit_exclusive_session_exclusive_when_the_default_turns_shared() {
+    let guard = HomeGuard::new();
+    let config = guard.base_dir().join("config");
+    std::fs::write(&config, "client_input = exclusive\n").unwrap();
+    let (url, _hits, _) = spawn_stub(Script::Sse(ANTHROPIC_SSE)).await;
+    let d = spawn_daemon(&guard, &url).await;
+    let (mut t, snap) = create_with_input(&d.paths, guard.home.path(), None).await;
+    assert_eq!(snap.client_input, ClientInput::Exclusive, "resolved at create");
+    let sid = t.session_id().clone();
+    one_turn(&mut t, "hello").await;
+    t.detach().await;
+
+    std::fs::write(&config, "client_input = shared\n").unwrap();
+    reload_to(&d, 2).await;
+    // The next image does read the new default: a new session is Shared.
+    let (fresh, snap) = create_with_input(&d.paths, guard.home.path(), None).await;
+    assert_eq!(snap.client_input, ClientInput::Shared, "the next image's default");
+    fresh.detach().await;
+
+    assert_eq!(listed_input(&d.paths, &sid).await, Some(ClientInput::Exclusive), "the listing after the reload");
+    let (first, snap) = attach_mirror(&d.paths, &sid).await;
+    assert_eq!(snap.client_input, ClientInput::Exclusive, "the Attached snapshot after the reload");
+    assert_eq!(snap.input_owner, Some(first.client_id()), "the first drive client owns input");
+    let (mut second, snap) = attach_mirror(&d.paths, &sid).await;
+    assert_eq!(snap.client_input, ClientInput::Exclusive);
+    let reason = try_turn(&mut second, "from the second client").await.expect_err("a non-owner's input is refused");
+    assert!(reason.starts_with(&format!("input owned by client #{}", first.client_id().0)), "{reason}");
+    second.detach().await;
+    first.detach().await;
+    SocketTransport::shutdown(&d.paths.sock, true).await.unwrap();
+}
+
+/// 790d SHOULD 1, the reverse: while the default is `shared`, a session
+/// created explicitly Shared and one created with no `client_input` (it
+/// resolves Shared) both stay Shared across a reload whose next image reads
+/// `client_input = exclusive`; a second client's input runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn reload_keeps_shared_sessions_shared_when_the_default_turns_exclusive() {
+    let guard = HomeGuard::new();
+    let config = guard.base_dir().join("config");
+    std::fs::write(&config, "client_input = shared\n").unwrap();
+    let (url, _hits, _) = spawn_stub(Script::Sse(ANTHROPIC_SSE)).await;
+    let d = spawn_daemon(&guard, &url).await;
+    let mut sids = Vec::new();
+    for client_input in [Some(ClientInput::Shared), None] {
+        let (mut t, snap) = create_with_input(&d.paths, guard.home.path(), client_input).await;
+        assert_eq!(snap.client_input, ClientInput::Shared, "{client_input:?} at create");
+        sids.push(t.session_id().clone());
+        one_turn(&mut t, "hello").await;
+        t.detach().await;
+    }
+
+    std::fs::write(&config, "client_input = exclusive\n").unwrap();
+    reload_to(&d, 2).await;
+    let (fresh, snap) = create_with_input(&d.paths, guard.home.path(), None).await;
+    assert_eq!(snap.client_input, ClientInput::Exclusive, "the next image's default");
+    fresh.detach().await;
+
+    for (sid, created) in sids.iter().zip(["explicitly Shared", "with no client_input"]) {
+        assert_eq!(listed_input(&d.paths, sid).await, Some(ClientInput::Shared), "{created}: the listing");
+        let (first, snap) = attach_mirror(&d.paths, sid).await;
+        assert_eq!(snap.client_input, ClientInput::Shared, "{created}: the Attached snapshot");
+        let (mut second, _) = attach_mirror(&d.paths, sid).await;
+        assert_eq!(try_turn(&mut second, "from the second client").await, Ok(()), "{created}: shared input runs");
+        second.detach().await;
+        first.detach().await;
+    }
+    SocketTransport::shutdown(&d.paths.sock, true).await.unwrap();
+}
+
 /// Windows: a `.cmd` that answers `--print-version` with OUR version (it
 /// passes the gate), then — started as the next image — dies before it
 /// takes `daemon.lock` over: the hand-off's failure path.

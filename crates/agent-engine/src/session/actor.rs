@@ -1106,7 +1106,8 @@ impl SessionActor {
                 live,
             },
         ) = SessionHandle::with_quiesce_slot(meta.clone(), view, event_queue.quiesce_slot());
-        // The mode is fixed for the session: seed the listing with it now.
+        // The mode is fixed for the session (its reload and crash records
+        // carry it, `reload_record`): seed the listing with it now.
         // Otherwise only a presence publish (attach, detach, input) carries
         // it, so a session restored at reload, with no client back yet,
         // listed as `owner=-`. Not `publish_presence()`: that also sets the
@@ -1543,6 +1544,10 @@ impl SessionActor {
             // A consent revocation since the last record counts.
             config: SessionConfig {
                 memory_mode: self.effective_memory_mode(),
+                // The mode `create` resolved, never `None`: the rebuild
+                // (reload, crash or stop restore) must not resolve it again
+                // from the config of that day (790d SHOULD 1, R6).
+                client_input: Some(self.client_input),
                 ..self.config.clone()
             },
             keep_warm: self.keep_warm,

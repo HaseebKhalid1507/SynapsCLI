@@ -622,6 +622,9 @@ pub(crate) fn record(handle: &SessionHandle, rec: Option<SessionReloadRecord>) -
                 // Like `/keepwarm`: the user's `/memory` choice survives a
                 // reload whose checkpoint did not confirm.
                 memory_mode: handle.memory_mode(),
+                // The resolved mode, as the actor's record has it
+                // (790d SHOULD 1): presence carries it from create on.
+                client_input: handle.presence().client_input,
                 env: None,
             env_stripped: Vec::new(),
                 ..SessionConfig::default()
@@ -2072,6 +2075,27 @@ mod tests {
         assert_eq!(s["input_owner_kind"], "chat", "the owner's declared kind");
         let back: ReloadSession = serde_json::from_value(s).unwrap();
         assert_eq!(back.input_owner_kind, Some(crate::session::ClientKind::Chat), "reads back");
+    }
+
+    /// 790d SHOULD 1: a record taken with no checkpoint reply still carries
+    /// the mode the session resolved at create (presence has it from then
+    /// on), so the next image never resolves it again from its own config.
+    /// A handle that never published one records `None`, as before.
+    #[tokio::test]
+    async fn the_record_without_a_checkpoint_keeps_the_resolved_client_input() {
+        use crate::session::ClientInput;
+        let (h, _task) = SessionHandle::echo_for_test(crate::session::SessionId::from("s-input"));
+        assert_eq!(record(&h, None).config.client_input, None, "nothing published");
+        for mode in [ClientInput::Exclusive, ClientInput::Shared] {
+            h.set_presence_for_test(crate::session::handle::Presence {
+                client_input: Some(mode),
+                ..Default::default()
+            });
+            let s = record(&h, None);
+            assert_eq!(s.config.client_input, Some(mode), "the record");
+            let back: ReloadSession = serde_json::from_value(serde_json::to_value(&s).unwrap()).unwrap();
+            assert_eq!(restore_config(&back.config, back.lifecycle).client_input, Some(mode), "the restore");
+        }
     }
 
     /// A1, the reload record: a recorded capacity resume that does not parse

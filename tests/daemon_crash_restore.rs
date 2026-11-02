@@ -25,6 +25,10 @@
 //!   session was re-attached and re-prompted (the operator's sweep line) by a
 //!   daemon with the restore off; a later start from the dead daemon's
 //!   record must not resume it.
+//! - `a_crash_restore_keeps_each_sessions_resolved_client_input`: a session
+//!   created with no `client_input` under `exclusive` comes back Exclusive
+//!   after the config turned `shared`, an explicitly Shared one Shared
+//!   (790d SHOULD 1).
 //!
 //! Unix only (`kill -9`, flock).
 
@@ -797,4 +801,105 @@ async fn a_turn_another_sender_already_reprompted_is_not_resumed_again() {
     assert_eq!(crash_resumes(&bodies, CUT_TASK), 0, "{:#?}", requests_of(&bodies, CUT_TASK));
     assert_eq!(requests_of(&bodies, CUT_TASK).len(), 2, "nothing after the sweep's turn");
     SocketTransport::shutdown(&c.paths.sock, true).await.unwrap();
+}
+
+/// Submit `text`: `Err(reason)` when refused, `Ok` once the turn it started
+/// is idle.
+async fn try_turn(t: &mut SocketTransport, text: &str) -> Result<(), String> {
+    t.send_from_self(SessionCommand::Submit { text: text.into(), attachments: vec![] }).await.unwrap();
+    let mut started = false;
+    loop {
+        let env = tokio::time::timeout(Duration::from_secs(30), t.next_event())
+            .await
+            .expect("no answer to the submit")
+            .expect("alive");
+        match env.event {
+            SessionEventWire::TurnStarted { .. } => started = true,
+            SessionEventWire::Idle if started => return Ok(()),
+            SessionEventWire::Refused { reason, .. } => return Err(reason),
+            _ => {}
+        }
+    }
+}
+
+/// `id`'s `client_input` as the listing shows it.
+fn listed_input(metas: &[SessionMeta], id: &SessionId) -> Option<ClientInput> {
+    metas.iter().find(|m| &m.id == id).and_then(|m| m.client_input)
+}
+
+/// 790d SHOULD 1 (R6) through the crash record: a session created with no
+/// `client_input` (as the Pria app creates them) while the default is
+/// `exclusive` comes back Exclusive after a `kill -9`, though the config
+/// the next start reads says `client_input = shared`; one created
+/// explicitly Shared comes back Shared. The listing and the Attached
+/// snapshot say so, a second client's input on the Exclusive one is
+/// refused in the form the app reads as `not_input_owner`, and the dead
+/// daemon's record carried each resolved mode.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_crash_restore_keeps_each_sessions_resolved_client_input() {
+    let guard = HomeGuard::new();
+    let config = guard.base_dir().join("config");
+    std::fs::write(&config, "client_input = exclusive\n").unwrap();
+    let (url, _bodies) = spawn_provider().await;
+    let mut a = spawn_daemon(&guard, &url, &[]).await;
+    let cwd = guard.home.path().to_path_buf();
+
+    let (mut implicit, snap) =
+        attach(&a.paths, Attach::Create { config: session_config(&cwd), mode: AttachMode::Mirror }).await;
+    assert_eq!(snap.client_input, ClientInput::Exclusive, "resolved at create");
+    let implicit_id = implicit.session_id().clone();
+    one_turn(&mut implicit, IDLE_TASK).await;
+    let shared_config = SessionConfig { client_input: Some(ClientInput::Shared), ..session_config(&cwd) };
+    let (mut shared, snap) = attach(&a.paths, Attach::Create { config: shared_config, mode: AttachMode::Mirror }).await;
+    assert_eq!(snap.client_input, ClientInput::Shared);
+    let shared_id = shared.session_id().clone();
+    one_turn(&mut shared, PARKED_TASK).await;
+    let (implicit_s, shared_s) = (implicit_id.to_string(), shared_id.to_string());
+    wait_record(&a.paths, "both sessions, no turn in flight", |r| {
+        r.sessions.len() == 2
+            && r.sessions.iter().any(|s| s.session.id == implicit_s)
+            && r.sessions.iter().any(|s| s.session.id == shared_s)
+            && r.sessions.iter().all(|s| !s.turn_in_flight)
+    })
+    .await;
+    std::fs::write(&config, "client_input = shared\n").unwrap();
+    a.kill_9();
+    let a_record = record_of(&a.paths).expect("a kill leaves the record");
+    drop(implicit);
+    drop(shared);
+
+    let b = spawn_daemon(&guard, &url, &[]).await;
+    let summary = wait_log(&guard, "crash restore: restored", 1).await;
+    assert!(
+        summary[0].contains("crash restore: restored 2 sessions, resume queued 0, given up 0, skipped 0"),
+        "{summary:#?}"
+    );
+    // The next start does read the new default: a new session is Shared.
+    let (fresh, snap) =
+        attach(&b.paths, Attach::Create { config: session_config(&cwd), mode: AttachMode::Mirror }).await;
+    assert_eq!(snap.client_input, ClientInput::Shared, "the next start's default");
+    fresh.detach().await;
+
+    let metas = SocketTransport::sessions(&b.paths.sock).await.unwrap();
+    assert_eq!(listed_input(&metas, &implicit_id), Some(ClientInput::Exclusive), "the listing: {metas:#?}");
+    assert_eq!(listed_input(&metas, &shared_id), Some(ClientInput::Shared), "the listing: {metas:#?}");
+    let existing = |sid: &SessionId| Attach::Existing { session_id: sid.clone(), mode: AttachMode::Mirror };
+    let (first, snap) = attach(&b.paths, existing(&implicit_id)).await;
+    assert_eq!(snap.client_input, ClientInput::Exclusive, "the Attached snapshot after the restore");
+    assert_eq!(snap.input_owner, Some(first.client_id()), "the first drive client owns input");
+    let (mut second, _) = attach(&b.paths, existing(&implicit_id)).await;
+    let reason = try_turn(&mut second, "from the second client").await.expect_err("a non-owner's input is refused");
+    assert!(reason.starts_with(&format!("input owned by client #{}", first.client_id().0)), "{reason}");
+    second.detach().await;
+    first.detach().await;
+    let (other, snap) = attach(&b.paths, existing(&shared_id)).await;
+    assert_eq!(snap.client_input, ClientInput::Shared, "the explicitly Shared one after the restore");
+    other.detach().await;
+
+    let recorded =
+        |id: &str| a_record.sessions.iter().find(|s| s.session.id == id).and_then(|s| s.session.config.client_input);
+    assert_eq!(recorded(&implicit_s), Some(ClientInput::Exclusive), "the record carries the resolved mode");
+    assert_eq!(recorded(&shared_s), Some(ClientInput::Shared));
+    SocketTransport::shutdown(&b.paths.sock, true).await.unwrap();
 }
