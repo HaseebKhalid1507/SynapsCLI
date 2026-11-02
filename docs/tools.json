@@ -743,17 +743,6 @@
           "description": "Short display name for an inline (system_prompt) subagent, e.g. \"gif-recorder\". Shown in the subagent panel and in status/collect output. Letters, digits, - and _ only, max 32. Ignored when agent is set; defaults to \"inline\".",
           "type": "string"
         },
-        "role": {
-          "enum": [
-            "planner",
-            "implementer",
-            "tester",
-            "reviewer",
-            "researcher",
-            "debugger"
-          ],
-          "type": "string"
-        },
         "system_prompt": {
           "description": "Inline system prompt for the subagent. Use when you don't have a named agent file.",
           "type": "string"
@@ -776,50 +765,6 @@
         "timeout": {
           "description": "Wall-clock limit in seconds. Omit for the session default (config `subagent_timeout`); 0 = no limit.",
           "type": "integer"
-        },
-        "write_policy": {
-          "oneOf": [
-            {
-              "properties": {
-                "mode": {
-                  "const": "read_only"
-                }
-              },
-              "required": [
-                "mode"
-              ],
-              "type": "object"
-            },
-            {
-              "properties": {
-                "mode": {
-                  "const": "isolated_worktree"
-                }
-              },
-              "required": [
-                "mode"
-              ],
-              "type": "object"
-            },
-            {
-              "properties": {
-                "mode": {
-                  "const": "non_overlapping_paths"
-                },
-                "scopes": {
-                  "items": {
-                    "type": "string"
-                  },
-                  "type": "array"
-                }
-              },
-              "required": [
-                "mode",
-                "scopes"
-              ],
-              "type": "object"
-            }
-          ]
         }
       },
       "required": [
@@ -937,18 +882,6 @@
           "description": "Short display name for an inline (system_prompt) subagent, e.g. \"gif-recorder\". Shown in the subagent panel and in status/collect output. Letters, digits, - and _ only, max 32. Ignored when agent is set; defaults to \"inline\".",
           "type": "string"
         },
-        "role": {
-          "description": "Typed orchestration role.",
-          "enum": [
-            "planner",
-            "implementer",
-            "tester",
-            "reviewer",
-            "researcher",
-            "debugger"
-          ],
-          "type": "string"
-        },
         "system_prompt": {
           "description": "Inline system prompt for the subagent. Use when you don't have a named agent file.",
           "type": "string"
@@ -971,51 +904,6 @@
         "timeout": {
           "description": "Wall-clock limit in seconds. Omit for the session default (config `subagent_timeout`); 0 = no limit. A timed-out worker keeps its full conversation: subagent_resume continues it where it stopped.",
           "type": "integer"
-        },
-        "write_policy": {
-          "description": "Declared write isolation and path scopes.",
-          "oneOf": [
-            {
-              "properties": {
-                "mode": {
-                  "const": "read_only"
-                }
-              },
-              "required": [
-                "mode"
-              ],
-              "type": "object"
-            },
-            {
-              "properties": {
-                "mode": {
-                  "const": "isolated_worktree"
-                }
-              },
-              "required": [
-                "mode"
-              ],
-              "type": "object"
-            },
-            {
-              "properties": {
-                "mode": {
-                  "const": "non_overlapping_paths"
-                },
-                "scopes": {
-                  "items": {
-                    "type": "string"
-                  },
-                  "type": "array"
-                }
-              },
-              "required": [
-                "mode",
-                "scopes"
-              ],
-              "type": "object"
-            }
-          ]
         }
       },
       "required": [

@@ -520,6 +520,42 @@ mod subagent_thinking_tests {
 }
 
 #[cfg(test)]
+mod retired_param_tests {
+    use super::*;
+    use crate::tools::Tool;
+
+    /// `role` and `write_policy` were advertised but never read: dispatch
+    /// always registered an implementer and nothing enforced a write policy.
+    #[test]
+    fn no_subagent_tool_advertises_role_or_write_policy() {
+        let tools: [&dyn Tool; 8] = [
+            &SubagentTool,
+            &SubagentStartTool,
+            &SubagentResumeTool,
+            &SubagentStatusTool,
+            &SubagentSteerTool,
+            &SubagentCollectTool,
+            &SubagentModelsTool,
+            &SubagentModelAuthorizeTool,
+        ];
+        for tool in tools {
+            let schema = tool.parameters();
+            let properties = schema["properties"]
+                .as_object()
+                .unwrap_or_else(|| panic!("{} has no properties", tool.name()));
+            for retired in ["role", "write_policy"] {
+                assert!(
+                    !properties.contains_key(retired),
+                    "{} advertises `{retired}`",
+                    tool.name()
+                );
+            }
+            assert!(!schema.to_string().contains("write_policy"), "{}", tool.name());
+        }
+    }
+}
+
+#[cfg(test)]
 mod cache_ttl_policy_tests {
     use super::apply_subagent_runtime_policy;
     use crate::core::config::CacheTtl;
