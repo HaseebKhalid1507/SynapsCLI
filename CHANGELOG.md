@@ -39,6 +39,10 @@ All notable changes to this project will be documented in this file.
   the result (what the parent model reads, and the subagent card) ran
   sentences together: "…read them all.Found 2 files…". Each response now
   starts a new paragraph, as `subagent_start` workers already did.
+- **Anthropic streams that send only keep-alive pings are retried.** A
+  stream that stayed connected but sent only pings waited indefinitely
+  (each ping reset the 90 s idle timer). It is now retried when no first
+  event arrives in 3 minutes, or no progress for 10 minutes.
 
 ## [0.11.1] — 2026-10-31
 

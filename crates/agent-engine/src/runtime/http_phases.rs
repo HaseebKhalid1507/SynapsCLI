@@ -1,7 +1,8 @@
-//! Anthropic upload/header deadline and independent streaming idle deadline.
-//! Never attach a reqwest total timeout: it follows the response body and
-//! kills healthy long generations. The ordinary client retains its read
-//! timeout for auth, sync calls and other providers.
+//! Anthropic upload/header deadline, independent streaming idle deadline and
+//! the stream's progress deadlines. Never attach a reqwest total timeout: it
+//! follows the response body and kills healthy long generations. The
+//! ordinary client retains its read timeout for auth, sync calls and other
+//! providers.
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -11,6 +12,10 @@ use reqwest::{Client, RequestBuilder, Response};
 use crate::{Result, RuntimeError};
 
 pub(super) const STREAM_IDLE: Duration = Duration::from_secs(90);
+/// No `message_start` this long after the stream opened.
+pub(super) const FIRST_EVENT: Duration = Duration::from_secs(180);
+/// No parsed non-ping event for this long.
+pub(super) const PROGRESS: Duration = Duration::from_secs(600);
 
 pub(super) fn header_deadline(bytes: usize) -> Duration {
     let seconds = bytes / 65536 + usize::from(!bytes.is_multiple_of(65536));
@@ -39,6 +44,133 @@ pub(super) async fn send(req: RequestBuilder, deadline: Duration) -> Result<Resp
             RuntimeError::NetworkTimeout("uploading request / waiting for response headers")
         })?
         .map_err(RuntimeError::Api)
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    /// Test seam: the (`FIRST_EVENT`, `PROGRESS`) deadlines for streams
+    /// opened inside this task, so they fire in milliseconds.
+    pub(crate) static STREAM_PROGRESS_FOR_TEST: (Duration, Duration);
+}
+
+/// A progress deadline that ended a stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Deadline {
+    FirstEvent,
+    Progress,
+}
+
+impl Deadline {
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::FirstEvent => "first_event",
+            Self::Progress => "progress",
+        }
+    }
+
+    fn message(self) -> &'static str {
+        match self {
+            Self::FirstEvent => "waiting for the stream's first event",
+            Self::Progress => "waiting for stream progress",
+        }
+    }
+}
+
+/// One stream's liveness, counts and timings only (never content). The
+/// raw-byte idle timer resets on every chunk, keep-alive pings included, so
+/// a stream that only pings never reaches it; these deadlines count parsed
+/// events, and a ping is never progress.
+#[derive(Debug)]
+pub(super) struct StreamProgress {
+    opened: tokio::time::Instant,
+    first_event: Duration,
+    progress: Duration,
+    last_event: Option<tokio::time::Instant>,
+    pub(super) chunks: u64,
+    pub(super) pings: u64,
+    /// Parsed non-ping events.
+    pub(super) events: u64,
+    pub(super) message_start_seen: bool,
+    /// The longest gap between two non-ping events.
+    pub(super) max_gap: Duration,
+    pub(super) fired: Option<Deadline>,
+}
+
+impl StreamProgress {
+    pub(super) fn new() -> Self {
+        let limits = (FIRST_EVENT, PROGRESS);
+        #[cfg(test)]
+        let limits = STREAM_PROGRESS_FOR_TEST.try_with(|l| *l).unwrap_or(limits);
+        Self {
+            opened: tokio::time::Instant::now(),
+            first_event: limits.0,
+            progress: limits.1,
+            last_event: None,
+            chunks: 0,
+            pings: 0,
+            events: 0,
+            message_start_seen: false,
+            max_gap: Duration::ZERO,
+            fired: None,
+        }
+    }
+
+    pub(super) fn ping(&mut self) {
+        self.pings += 1;
+    }
+
+    /// A parsed non-ping event: progress.
+    pub(super) fn event(&mut self, message_start: bool) {
+        let now = tokio::time::Instant::now();
+        if let Some(last) = self.last_event {
+            self.max_gap = self.max_gap.max(now.saturating_duration_since(last));
+        }
+        self.last_event = Some(now);
+        self.events += 1;
+        self.message_start_seen |= message_start;
+    }
+
+    /// The earliest deadline still armed: the first event's until
+    /// `message_start`, progress since the last event (else the open).
+    fn due(&self) -> (tokio::time::Instant, Deadline) {
+        let progress = self.last_event.unwrap_or(self.opened) + self.progress;
+        let first = self.opened + self.first_event;
+        if !self.message_start_seen && first <= progress {
+            (first, Deadline::FirstEvent)
+        } else {
+            (progress, Deadline::Progress)
+        }
+    }
+}
+
+/// [`next`] within the stream's progress deadline too. It is checked before
+/// every read and bounds the read, so it fires on time however often pings
+/// arrive. A deadline ends the read as a timeout with its own message.
+pub(super) async fn next_or_deadline<S>(
+    stream: &mut S,
+    idle: Duration,
+    progress: &mut StreamProgress,
+) -> Option<Result<bytes::Bytes>>
+where
+    S: Stream<Item = std::result::Result<bytes::Bytes, reqwest::Error>> + Unpin,
+{
+    let (due, deadline) = progress.due();
+    let read = if tokio::time::Instant::now() < due {
+        tokio::time::timeout_at(due, next(stream, idle)).await.ok()
+    } else {
+        None
+    };
+    match read {
+        Some(Some(Ok(chunk))) => {
+            progress.chunks += 1;
+            Some(Ok(chunk))
+        }
+        Some(other) => other,
+        None => {
+            progress.fired = Some(deadline);
+            Some(Err(RuntimeError::NetworkTimeout(deadline.message())))
+        }
+    }
 }
 
 /// Reset only when another raw chunk arrives, not on parsed SSE events.
