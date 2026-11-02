@@ -242,6 +242,7 @@ fn a_finished_card_is_not_ticked() {
         vec![WatchEvent::ToolResult {
             tool_id: "m1".into(),
             result: String::new(),
+            memory_only: false,
         }],
     );
     let frame = h.snapshot();
@@ -297,6 +298,7 @@ fn answer_poll(h: &mut TestHarness, p: WatchPage) {
     h.feed_event(SessionEventWire::QueryResult {
         id,
         value: serde_json::to_value(p).unwrap(),
+        client_tools: None,
     });
 }
 

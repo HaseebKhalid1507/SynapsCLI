@@ -145,6 +145,7 @@ impl FakeDaemon {
             clients: Vec::new(),
             input_owner: Some(ClientId(1)),
             display_tail: None,
+            client_tools: Default::default(),
         };
         Attached { transport: Box::new(t), snapshot, reused_live }
     }

@@ -53,6 +53,7 @@ fn answer_poll(h: &mut TestHarness, p: WatchPage) {
     h.feed_event(SessionEventWire::QueryResult {
         id,
         value: serde_json::to_value(p).unwrap(),
+        client_tools: None,
     });
 }
 
@@ -74,6 +75,7 @@ fn worker_page(n: u64) -> Vec<WatchEvent> {
         WatchEvent::ToolResult {
             tool_id: format!("t{n}"),
             result: "agent-engine\nagent-tui".into(),
+            memory_only: false,
         },
     ]
 }
@@ -504,7 +506,11 @@ fn answer_poll_timed(h: &mut TestHarness, p: WatchPage, at_ms: &[u64], now_ms: u
     let mut value = serde_json::to_value(p).unwrap();
     value["at_ms"] = serde_json::json!(at_ms);
     value["now_ms"] = serde_json::json!(now_ms);
-    h.feed_event(SessionEventWire::QueryResult { id, value });
+    h.feed_event(SessionEventWire::QueryResult {
+        id,
+        value,
+        client_tools: None,
+    });
 }
 
 fn bash_call(id: &str, command: &str) -> Vec<WatchEvent> {
@@ -595,6 +601,7 @@ fn a_finished_tool_card_in_a_worker_view_gets_its_footer_and_duration() {
     events.push(WatchEvent::ToolResult {
         tool_id: "t1".into(),
         result: "agent-engine\nagent-tui".into(),
+        memory_only: false,
     });
     events.push(WatchEvent::Text {
         text: "done".into(),
@@ -627,6 +634,7 @@ fn a_finished_tool_with_no_output_still_gets_its_footer() {
         WatchEvent::ToolResult {
             tool_id: "t1".into(),
             result: String::new(),
+            memory_only: false,
         },
         WatchEvent::Text {
             text: "done".into(),
@@ -666,6 +674,8 @@ fn the_same_card_in_the_main_thread_ticks_and_gets_its_footer() {
         LlmEvent::ToolResult {
             tool_id: "m1".into(),
             result: String::new(),
+            memory_only: false,
+            client_tool: None,
         },
     )));
     let frame = h.snapshot();

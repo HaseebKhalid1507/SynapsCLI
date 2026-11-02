@@ -8,6 +8,7 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
+use agent_engine::runtime::memory_only::SessionGlobs;
 use agent_engine::session::{
     AttachMode, AttachSnapshot, ClientId, ClientTransport, Envelope, ReasoningClampWire,
     RuntimeView, SessionCommand, SessionEventWire, SessionId, SessionMeta, SessionQuery,
@@ -52,6 +53,9 @@ pub struct ScriptedTransport {
     input_owner: Option<ClientId>,
     /// `client_input()`; `Exclusive` (an older daemon's) unless a test sets it.
     client_input: agent_engine::session::ClientInput,
+    /// = the actor's `memory_only_globs`: the session's add-only list,
+    /// shared into the runtime, which reads it at each mark check.
+    memory_only_globs: SessionGlobs,
 }
 
 impl ScriptedTransport {
@@ -60,7 +64,10 @@ impl ScriptedTransport {
         Self::with_session(runtime, session)
     }
 
-    pub fn with_session(runtime: Runtime, session: Session) -> Self {
+    pub fn with_session(mut runtime: Runtime, session: Session) -> Self {
+        // As the actor's create: the session's own list (none here), shared.
+        let memory_only_globs = SessionGlobs::default();
+        runtime.share_memory_only_session(&memory_only_globs);
         let id = SessionId::from(session.id.clone());
         let meta = SessionMeta {
             id: id.clone(),
@@ -74,6 +81,7 @@ impl ScriptedTransport {
             lifecycle: Default::default(),
             clients: 1,
             input_owner: Some(ClientId(1)),
+            input_owner_kind: None,
             awaiting_input: 0,
             roster: Vec::new(),
             client_input: None,
@@ -87,6 +95,7 @@ impl ScriptedTransport {
             title: None,
             cost_usd: 0.0,
             messages: 0,
+            restoring: false,
         };
         let view = Arc::new(RuntimeView::snapshot(&runtime, 0));
         Self {
@@ -107,6 +116,7 @@ impl ScriptedTransport {
             mode: AttachMode::Mirror,
             input_owner: Some(ClientId(1)),
             client_input: agent_engine::session::ClientInput::wire_default(),
+            memory_only_globs,
         }
     }
 
@@ -204,9 +214,11 @@ impl ScriptedTransport {
             SessionSetting::SystemPrompt { .. } => "system_prompt",
             SessionSetting::ReloadPrompt => "reload_prompt",
             SessionSetting::GrantWorkerModel { .. } => "grant_worker_model",
+            SessionSetting::MemoryOnlyTools { .. } => "memory_only_tools",
         };
         let rt = &mut self.runtime;
         let mut clamp_wire = None;
+        let mut memory_only_echo = None;
         let result: Result<Option<String>, String> = match setting {
             SessionSetting::Model { model } => rt.try_set_model(model).map(|clamp| {
                 self.session.model = rt.model().to_string();
@@ -269,6 +281,19 @@ impl ScriptedTransport {
             SessionSetting::GrantWorkerModel { model } => {
                 rt.grant_worker_model(&model).map(|_| None)
             }
+            // = the actor: add-only (a list that drops a glob is refused
+            // and changes nothing), and every reply echoes the list in force.
+            SessionSetting::MemoryOnlyTools { globs } => {
+                let outcome = match self.memory_only_globs.add(&globs) {
+                    Ok(_) => Ok(None),
+                    Err(dropped) => Err(format!(
+                        "memory-only tools are add-only: this list drops {}; nothing changed. Removing a glob takes a new session.",
+                        dropped.iter().map(|g| format!("`{g}`")).collect::<Vec<_>>().join(", ")
+                    )),
+                };
+                memory_only_echo = Some(rt.memory_only_globs());
+                outcome
+            }
         };
         self.refresh_view();
         let (ok, message) = match result {
@@ -282,6 +307,7 @@ impl ScriptedTransport {
             message,
             view: (*self.view).clone(),
             clamp: clamp_wire,
+            memory_only_tools: memory_only_echo,
         }));
     }
 
@@ -322,6 +348,7 @@ impl ScriptedTransport {
                                 "closing session {session}; resume it with: synaps --attach --continue {session}"
                             ),
                         }),
+                        client_tools: None,
                     });
                     self.push_event(SessionEventWire::Ended {
                         reason: agent_engine::session::EndReason::ClientQuit,
@@ -330,6 +357,7 @@ impl ScriptedTransport {
                     self.push_event(SessionEventWire::QueryResult {
                         id,
                         value: serde_json::json!({ "kind": "error", "text": "usage: /close [force]" }),
+                        client_tools: None,
                     });
                 }
             }
@@ -343,7 +371,7 @@ impl ScriptedTransport {
                 if view_changed {
                     self.refresh_view();
                 }
-                self.push_event(SessionEventWire::QueryResult { id, value });
+                self.push_event(SessionEventWire::QueryResult { id, value, client_tools: None });
             }
             SessionCommand::PluginCommand {
                 id,
@@ -376,7 +404,7 @@ impl ScriptedTransport {
                         "text": format!("unknown plugin command /{plugin}:{name}"),
                     }),
                 };
-                self.push_event(SessionEventWire::QueryResult { id, value });
+                self.push_event(SessionEventWire::QueryResult { id, value, client_tools: None });
             }
             SessionCommand::Query { id, query } => {
                 let value = match query {
@@ -408,11 +436,12 @@ impl ScriptedTransport {
                     .unwrap_or_default(),
                     other => serde_json::json!({ "unsupported": format!("{other:?}") }),
                 };
-                self.push_event(SessionEventWire::QueryResult { id, value });
+                self.push_event(SessionEventWire::QueryResult { id, value, client_tools: None });
             }
             SessionCommand::Resume { id, .. } => self.push_event(SessionEventWire::QueryResult {
                 id,
                 value: serde_json::json!({ "kind": "error", "text": "scripted: no sessions on disk" }),
+                client_tools: None,
             }),
             SessionCommand::NewSession => {
                 self.session = Session::new(
@@ -534,5 +563,56 @@ impl ClientTransport for ScriptedTransport {
     }
     fn daemon_pid(&self) -> u32 {
         self.daemon_pid
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn list(globs: &[&str]) -> Vec<String> {
+        globs.iter().map(|g| g.to_string()).collect()
+    }
+
+    /// `Set{MemoryOnlyTools}` and its `SettingChanged` reply.
+    async fn set_globs(t: &mut ScriptedTransport, id: u64, globs: &[&str]) -> SettingApplied {
+        let setting = SessionSetting::MemoryOnlyTools { globs: list(globs) };
+        t.send(SessionCommand::Set { id, setting }).await.unwrap();
+        match t.next_event().await.map(|env| env.event) {
+            Some(SessionEventWire::SettingChanged(applied)) => {
+                assert_eq!(applied.id, id);
+                assert_eq!(applied.setting, "memory_only_tools");
+                applied
+            }
+            other => panic!("expected SettingChanged, got {other:?}"),
+        }
+    }
+
+    /// = the actor's `SessionSetting::MemoryOnlyTools` (session/actor.rs):
+    /// the live list is add-only, a list that drops a glob is refused and
+    /// changes nothing, and every reply echoes the effective list.
+    #[tokio::test]
+    async fn memory_only_tools_are_add_only_and_echoed_like_the_actor() {
+        let mut t = ScriptedTransport::new(Runtime::new_headless());
+        let one = list(&["pria_vault_*"]);
+        let both = list(&["pria_vault_*", "pria_memory_*"]);
+
+        let applied = set_globs(&mut t, 1, &["pria_vault_*"]).await;
+        assert!(applied.ok, "{:?}", applied.message);
+        assert_eq!(applied.memory_only_tools, Some(one.clone()), "the reply echoes the list");
+        // An identical resend and a superset are accepted.
+        assert!(set_globs(&mut t, 2, &["pria_vault_*"]).await.ok);
+        let applied = set_globs(&mut t, 3, &["pria_vault_*", "pria_memory_*"]).await;
+        assert!(applied.ok, "{:?}", applied.message);
+        assert_eq!(applied.memory_only_tools, Some(both.clone()));
+
+        // Dropping a glob is refused, names it, and changes nothing.
+        let applied = set_globs(&mut t, 4, &["pria_memory_*"]).await;
+        assert!(!applied.ok, "a list that drops a glob was accepted");
+        let message = applied.message.clone().unwrap_or_default();
+        assert!(message.contains("add-only") && message.contains("`pria_vault_*`"), "{message}");
+        assert_eq!(applied.memory_only_tools, Some(both.clone()), "the refusal echoes the unchanged list");
+        assert!(!set_globs(&mut t, 5, &[]).await.ok, "an empty list drops every glob");
+        assert_eq!(t.runtime().memory_only_globs(), both, "the runtime still marks by both");
     }
 }

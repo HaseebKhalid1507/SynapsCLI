@@ -208,6 +208,7 @@ pub(super) fn rebuild_display_messages(api_messages: &[synaps_cli::SharedMessage
 /// 741b6b60 (same text, same position).
 pub(super) fn apply_display_tail(tail: &agent_engine::session::DisplayTail, app: &mut App) {
     use agent_engine::engine::interrupt::{interruption_label, tool_in_flight_note_label};
+    use agent_engine::session::display::event_payload_severity;
     use agent_engine::session::DisplayItem;
     app.transcript.clear();
     if tail.omitted > 0 {
@@ -250,6 +251,15 @@ pub(super) fn apply_display_tail(tail: &agent_engine::session::DisplayTail, app:
                 tool_name: tool_name.clone(),
                 input: input.clone(),
             },
+            // A released hold digest or a join block: an event line, as it
+            // was shown live (the daemon's own `synaps` events).
+            DisplayItem::Held { text, .. } => ChatMessage::Event {
+                source: "synaps".to_string(),
+                severity: event_payload_severity(text).unwrap_or("medium").to_string(),
+                text: text.clone(),
+            },
+            // A kind from a newer daemon: nothing this build can draw.
+            DisplayItem::Unknown => continue,
         };
         app.push_msg_at(msg, at);
     }

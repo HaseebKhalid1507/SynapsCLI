@@ -209,7 +209,7 @@ impl SessionLink {
     pub(crate) async fn query(&mut self, query: SessionQuery) -> Result<serde_json::Value, String> {
         let id = self.alloc_id();
         self.roundtrip(SessionCommand::Query { id, query }, |ev| match ev {
-            SessionEventWire::QueryResult { id: rid, value } if *rid == id => Some(value.clone()),
+            SessionEventWire::QueryResult { id: rid, value, .. } if *rid == id => Some(value.clone()),
             _ => None,
         })
         .await
@@ -229,7 +229,7 @@ impl SessionLink {
                     arg: arg.to_string(),
                 },
                 |ev| match ev {
-                    SessionEventWire::QueryResult { id: rid, value } if *rid == id => {
+                    SessionEventWire::QueryResult { id: rid, value, .. } if *rid == id => {
                         Some(value.clone())
                     }
                     _ => None,
@@ -264,7 +264,7 @@ impl SessionLink {
                 arg: arg.to_string(),
             },
             |ev| match ev {
-                SessionEventWire::QueryResult { id: rid, value } if *rid == id => {
+                SessionEventWire::QueryResult { id: rid, value, .. } if *rid == id => {
                     Some(value.clone())
                 }
                 _ => None,
@@ -295,7 +295,7 @@ impl SessionLink {
                     via: via.clone(),
                     clamp_notice: clamp_notice.clone(),
                 })),
-                SessionEventWire::QueryResult { id: rid, value } if *rid == id => Some(Err(value
+                SessionEventWire::QueryResult { id: rid, value, .. } if *rid == id => Some(Err(value
                     ["text"]
                     .as_str()
                     .unwrap_or("resume failed")
@@ -583,6 +583,7 @@ mod tests {
             extensions: vec!["guard".into()],
             tool: Some("write".into()),
             rewritten_by: vec![],
+            tool_call_id: None,
         });
         b.on_prompt(from_scope);
         assert_eq!(
@@ -604,6 +605,7 @@ mod tests {
                 extensions: vec!["jev".into()],
                 tool: None,
                 rewritten_by: vec![],
+                tool_call_id: None,
             });
             p
         };

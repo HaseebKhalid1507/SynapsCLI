@@ -3,93 +3,16 @@ pub(crate) use input::{handle_event, InputOutcome};
 
 use std::collections::{BTreeSet, HashSet};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct DevProviderSelection {
-    key: &'static str,
-    name: &'static str,
-    auth_kind: DevProviderAuth,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum DevProviderAuth {
-    OAuth(&'static str),
-    Cloud,
-    ApiKey,
-    LocalModels,
-}
-
-fn dev_model_providers() -> Vec<DevProviderSelection> {
-    let mut providers = vec![
-        DevProviderSelection {
-            key: "anthropic",
-            name: "Anthropic",
-            auth_kind: DevProviderAuth::OAuth("anthropic"),
-        },
-        DevProviderSelection {
-            key: "openai-codex",
-            name: "OpenAI Codex",
-            auth_kind: DevProviderAuth::OAuth("openai-codex"),
-        },
-        DevProviderSelection {
-            key: "xai-auth",
-            name: "xAI (Grok)",
-            auth_kind: DevProviderAuth::OAuth("xai-auth"),
-        },
-        DevProviderSelection {
-            key: "github-copilot",
-            name: "GitHub Copilot",
-            auth_kind: DevProviderAuth::OAuth("github-copilot"),
-        },
-        DevProviderSelection {
-            key: "google-gemini",
-            name: "Google Gemini (Code Assist)",
-            auth_kind: DevProviderAuth::OAuth("google-gemini"),
-        },
-        DevProviderSelection {
-            key: "kimi-code",
-            name: "Kimi Code",
-            auth_kind: DevProviderAuth::OAuth("kimi-code"),
-        },
-        DevProviderSelection {
-            key: "muse",
-            name: "Meta Muse",
-            auth_kind: DevProviderAuth::OAuth("muse"),
-        },
-        DevProviderSelection {
-            key: "azure-openai",
-            name: "Azure OpenAI",
-            auth_kind: DevProviderAuth::Cloud,
-        },
-        DevProviderSelection {
-            key: "aws-bedrock",
-            name: "AWS Bedrock",
-            auth_kind: DevProviderAuth::Cloud,
-        },
-        DevProviderSelection {
-            key: "google-vertex",
-            name: "Google Vertex",
-            auth_kind: DevProviderAuth::Cloud,
-        },
-    ];
-
-    providers.extend(
-        synaps_cli::runtime::openai::registry::providers()
-            .iter()
-            .map(|spec| DevProviderSelection {
-                key: spec.key,
-                name: spec.name,
-                auth_kind: DevProviderAuth::ApiKey,
-            }),
-    );
-
-    providers.push(DevProviderSelection {
-        key: "local",
-        name: "Local",
-        auth_kind: DevProviderAuth::LocalModels,
-    });
-
-    providers
-}
+// The picker core (providers, usability, rows, favorites and their order)
+// lives in the engine, shared with every other surface that lists models.
+pub(crate) use agent_engine::model_picker::{
+    normalize_favorite_id, ModelEntry, ModelSection, ProviderCatalogOverride,
+};
+#[cfg(test)]
+use agent_engine::model_picker::{
+    dev_model_providers, provider_model_selections, provider_static_model_seeds,
+    ProviderAvailability,
+};
 
 use ratatui::{
     layout::{Constraint, Layout, Rect},
@@ -104,21 +27,6 @@ use super::theme::{ModalKind, THEME};
 pub(crate) enum ModelsView {
     All,
     Favorites,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ModelEntry {
-    pub id: String,
-    pub display_id: String,
-    pub label: String,
-    pub tier: String,
-    pub provider_key: String,
-    pub provider_name: String,
-    pub favorite_id: String,
-    pub configured: bool,
-    pub is_current: bool,
-    pub is_favorite: bool,
-    pub order: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -222,14 +130,6 @@ pub(crate) fn sort_expanded_models(models: &mut [ExpandedModelEntry], query: &st
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ModelSection {
-    pub provider_key: String,
-    pub provider_name: String,
-    pub configured: bool,
-    pub entries: Vec<ModelEntry>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum VisibleRow {
     Section { idx: usize },
     Model { section: usize, idx: usize },
@@ -250,9 +150,6 @@ pub(crate) struct ExpandedModelsState {
     pub search: String,
     pub load_state: ExpandedLoadState,
 }
-
-/// Live catalog rows for a provider that should replace static main-section seeds.
-pub(crate) type ProviderCatalogOverride = Vec<(String, String)>; // (model_id, label)
 
 #[derive(Clone, Debug)]
 pub(crate) struct ModelsModalState {
@@ -300,18 +197,6 @@ impl ModelsModalState {
         if self.favorites.is_empty() && self.view == ModelsView::Favorites {
             self.view = ModelsView::All;
         }
-    }
-}
-
-pub(crate) fn normalize_favorite_id(model: &str) -> String {
-    if let Some(id) = model.strip_prefix("claude/") {
-        format!("anthropic/{id}")
-    } else if model.contains('/') {
-        model.to_string()
-    } else if model.starts_with("claude-") {
-        format!("anthropic/{model}")
-    } else {
-        model.to_string()
     }
 }
 
@@ -516,388 +401,41 @@ pub(crate) fn settings_model_picker_rows(
 }
 
 pub(crate) fn build_sections(current_model: &str, state: &ModelsModalState) -> Vec<ModelSection> {
-    // Non-secret availability data from the credential broker boundary — this
-    // module never reads provider keys or credential env vars.
-    let availability = ProviderAvailability {
-        configured_static: synaps_cli::auth::broker::configured_static_provider_keys(),
-        local_models: synaps_cli::auth::broker::local_model_ids(),
-    };
-    let logged_in_oauth = logged_in_oauth_providers();
-    build_sections_from_parts(current_model, state, &availability, &logged_in_oauth)
-}
-
-/// Non-secret provider availability: which static providers have a
-/// broker-held credential, and the configured local model list.
-#[derive(Clone, Debug, Default)]
-pub(crate) struct ProviderAvailability {
-    pub configured_static: BTreeSet<String>,
-    pub local_models: Vec<String>,
-}
-
-fn logged_in_oauth_providers() -> BTreeSet<&'static str> {
-    // Non-secret login-status queries via the broker boundary.
-    [
-        synaps_cli::auth::OAuthProviderId::Anthropic,
-        synaps_cli::auth::OAuthProviderId::OpenAiCodex,
-        synaps_cli::auth::OAuthProviderId::Xai,
-        synaps_cli::auth::OAuthProviderId::GitHubCopilot,
-        synaps_cli::auth::OAuthProviderId::GoogleGemini,
-        synaps_cli::auth::OAuthProviderId::KimiCode,
-        synaps_cli::auth::OAuthProviderId::Muse,
-    ]
-    .into_iter()
-    .filter(|id| {
-        synaps_cli::auth::broker::oauth_provider_logged_in(*id)
-            // Muse also runs on the official `META_API_KEY` override alone.
-            || (*id == synaps_cli::auth::OAuthProviderId::Muse
-                && synaps_cli::auth::muse::env_api_key_present())
+    // Plugin providers: a non-blocking read of this process's extension
+    // manager (none in this process, or busy right now: no plugin rows),
+    // taken after the built-in rows and released at once.
+    let manager = synaps_cli::runtime::openai::extension_manager_for_routing();
+    agent_engine::model_picker::build_sections(current_model, &picker_query(state), || {
+        manager.as_ref().and_then(|manager| manager.try_read().ok())
     })
-    .map(|id| id.as_str())
-    .collect()
 }
 
+/// The modal's state as the engine's picker query.
+fn picker_query(state: &ModelsModalState) -> agent_engine::model_picker::PickerQuery<'_> {
+    agent_engine::model_picker::PickerQuery {
+        search: &state.search,
+        favorites_only: state.view == ModelsView::Favorites,
+        favorites: &state.favorites,
+        catalog_overrides: &state.provider_catalog_overrides,
+    }
+}
+
+/// [`build_sections`] with the availability and logins given (tests).
+#[cfg(test)]
 fn build_sections_from_parts(
     current_model: &str,
     state: &ModelsModalState,
     availability: &ProviderAvailability,
     logged_in_oauth: &BTreeSet<&'static str>,
 ) -> Vec<ModelSection> {
-    let query = state.search.trim().to_lowercase();
-    let favorites_only = state.view == ModelsView::Favorites;
-    let current_fav = normalize_favorite_id(current_model);
-    let mut sections = Vec::new();
-
-    for provider in dev_model_providers() {
-        if !dev_provider_is_logged_in(&provider, availability, logged_in_oauth) {
-            continue;
-        }
-
-        let mut entries: Vec<ModelEntry> =
-            provider_model_selections(&provider, availability, &state.provider_catalog_overrides)
-                .into_iter()
-                .map(|model| {
-                    let (runtime_id, favorite_id) = if provider.key == "claude" {
-                        (model.id.clone(), format!("claude/{}", model.id))
-                    } else {
-                        let full_id = format!("{}/{}", provider.key, model.id);
-                        (full_id.clone(), full_id)
-                    };
-                    ModelEntry {
-                        id: runtime_id.clone(),
-                        display_id: model.id.clone(),
-                        label: model.label.clone(),
-                        tier: model.tier.clone(),
-                        provider_key: provider.key.to_string(),
-                        provider_name: provider.name.to_string(),
-                        configured: true,
-                        is_current: current_model == runtime_id || current_fav == favorite_id,
-                        is_favorite: state
-                            .favorites
-                            .iter()
-                            .any(|id| normalize_favorite_id(id) == favorite_id),
-                        favorite_id,
-                        order: model.order,
-                    }
-                })
-                .filter(|m| model_matches(m, &query, favorites_only))
-                .collect();
-        pin_favorites_first(&mut entries);
-        if !entries.is_empty() || provider.auth_kind == DevProviderAuth::Cloud {
-            sections.push(ModelSection {
-                provider_key: provider.key.to_string(),
-                provider_name: provider.name.to_string(),
-                configured: true,
-                entries,
-            });
-        }
-    }
-
-    if let Some(manager) = synaps_cli::runtime::openai::extension_manager_for_routing() {
-        if let Ok(manager) = manager.try_read() {
-            for provider in manager.providers() {
-                let mut entries: Vec<ModelEntry> = provider
-                    .spec
-                    .models
-                    .iter()
-                    .enumerate()
-                    .map(|(order, model)| {
-                        let runtime_id =
-                            synaps_cli::extensions::providers::ProviderRegistry::model_runtime_id(
-                                &provider.plugin_id,
-                                &provider.provider_id,
-                                &model.id,
-                            );
-                        let mut badges: Vec<&str> = Vec::new();
-                        if model
-                            .capabilities
-                            .get("tool_use")
-                            .and_then(|value| value.as_bool())
-                            .unwrap_or(false)
-                        {
-                            badges.push("tool-use");
-                        }
-                        if model
-                            .capabilities
-                            .get("streaming")
-                            .and_then(|value| value.as_bool())
-                            .unwrap_or(false)
-                        {
-                            badges.push("streaming");
-                        }
-                        let base = model
-                            .display_name
-                            .clone()
-                            .unwrap_or_else(|| model.id.clone());
-                        let label = if badges.is_empty() {
-                            base
-                        } else {
-                            let suffix = badges
-                                .iter()
-                                .map(|b| format!("[{}]", b))
-                                .collect::<Vec<_>>()
-                                .join(" ");
-                            format!("{} {}", base, suffix)
-                        };
-                        ModelEntry {
-                            id: runtime_id.clone(),
-                            display_id: model.id.clone(),
-                            label,
-                            tier: "extension".to_string(),
-                            provider_key: provider.runtime_id.clone(),
-                            provider_name: provider.spec.display_name.clone(),
-                            configured: true,
-                            is_current: current_model == runtime_id,
-                            is_favorite: state.favorites.contains(&runtime_id),
-                            favorite_id: runtime_id,
-                            order,
-                        }
-                    })
-                    .filter(|m| model_matches(m, &query, favorites_only))
-                    .collect();
-                pin_favorites_first(&mut entries);
-                if !entries.is_empty() {
-                    sections.push(ModelSection {
-                        provider_key: provider.runtime_id.clone(),
-                        provider_name: provider.spec.display_name.clone(),
-                        configured: true,
-                        entries,
-                    });
-                }
-            }
-        }
-    }
-
-    sections
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct ModelSelectionItem {
-    id: String,
-    label: String,
-    tier: String,
-    order: usize,
-}
-
-fn provider_model_selections(
-    provider: &DevProviderSelection,
-    availability: &ProviderAvailability,
-    catalog_overrides: &std::collections::BTreeMap<String, ProviderCatalogOverride>,
-) -> Vec<ModelSelectionItem> {
-    if provider.auth_kind == DevProviderAuth::LocalModels {
-        return availability
-            .local_models
-            .clone()
-            .into_iter()
-            .enumerate()
-            .map(|(order, id)| ModelSelectionItem {
-                label: local_model_label(&id),
-                id,
-                tier: "local".to_string(),
-                order,
-            })
-            .collect();
-    }
-
-    // OpenAI Codex OAuth picker rows are HARDCODED to the seven
-    // source-controlled slugs (`codex_static_catalog_models`). Live catalog
-    // overrides — however they got injected — must never replace them. This
-    // single choke point covers both /models and /settings (shared sections).
-    if provider.key != "openai-codex" {
-        if let Some(live) = catalog_overrides.get(provider.key) {
-            if !live.is_empty() {
-                return live
-                    .iter()
-                    .enumerate()
-                    .map(|(order, (id, label))| ModelSelectionItem {
-                        id: id.clone(),
-                        label: label.clone(),
-                        tier: provider_model_tier(provider.key, id).to_string(),
-                        order,
-                    })
-                    .collect();
-            }
-        }
-    }
-
-    provider_static_model_seeds(provider)
-        .into_iter()
-        .enumerate()
-        .map(|(order, (id, label, tier))| ModelSelectionItem {
-            id,
-            label,
-            tier,
-            order,
-        })
-        .collect()
-}
-
-fn provider_model_tier(provider_key: &str, model_id: &str) -> &'static str {
-    match (provider_key, model_id) {
-        ("openai-codex", "gpt-6.1-sol" | "gpt-5.6-sol") => "S+",
-        ("openai-codex", "gpt-5.6-terra" | "gpt-5.5") => "A",
-        ("openai-codex", "gpt-5.6-luna") => "B+",
-        _ => "",
-    }
-}
-
-fn provider_static_model_seeds(provider: &DevProviderSelection) -> Vec<(String, String, String)> {
-    match provider.key {
-        "anthropic" => synaps_cli::models::KNOWN_MODELS
-            .iter()
-            .enumerate()
-            .map(|(idx, (id, label))| {
-                let tier = match idx {
-                    0 => "S+",
-                    1 | 2 => "S",
-                    _ => "A",
-                };
-                ((*id).to_string(), (*label).to_string(), tier.to_string())
-            })
-            .collect(),
-        "openai-codex" => synaps_cli::runtime::openai::catalog::codex_static_catalog_models()
-            .into_iter()
-            .map(|model| {
-                let tier = provider_model_tier(provider.key, &model.id);
-                (model.id, model.label.unwrap_or_default(), tier.to_string())
-            })
-            .collect(),
-        "xai-auth" => synaps_cli::runtime::openai::catalog::xai_static_catalog_models()
-            .into_iter()
-            .map(|model| (model.id, model.label.unwrap_or_default(), String::new()))
-            .collect(),
-        // Server-driven catalog: only the documented seed ships statically;
-        // the live list replaces it once fetched (`e` / auto-refresh).
-        "muse" => synaps_cli::runtime::openai::catalog::muse_static_catalog_models()
-            .into_iter()
-            .map(|model| (model.id, model.label.unwrap_or_default(), String::new()))
-            .collect(),
-        "github-copilot" => synaps_cli::runtime::openai::catalog::copilot_static_catalog_models()
-            .into_iter()
-            .map(|model| {
-                // Tiers are UI-only hints. Every id here is fixture-selectable
-                // (see `COPILOT_FALLBACK_MODELS`); disabled/endpointless rows
-                // never reach this list.
-                let tier = match model.id.as_str() {
-                    "gpt-5.3-codex" | "gpt-5.6-luna" | "gpt-5.6-terra" => "S+",
-                    "gpt-5.4" | "gpt-5.4-mini" | "claude-sonnet-4.6" | "claude-sonnet-5"
-                    | "claude-haiku-4.5" => "S",
-                    _ => "",
-                };
-                (model.id, model.label.unwrap_or_default(), tier.to_string())
-            })
-            .collect(),
-        "google-gemini" => {
-            synaps_cli::runtime::openai::catalog::google_gemini_static_catalog_models()
-                .into_iter()
-                .map(|model| {
-                    let tier = match model.id.as_str() {
-                        "gemini-2.5-pro" => "S",
-                        "gemini-2.5-flash" => "A",
-                        _ => "",
-                    };
-                    (model.id, model.label.unwrap_or_default(), tier.to_string())
-                })
-                .collect()
-        }
-        "kimi-code" => synaps_cli::runtime::openai::catalog::kimi_code_static_catalog_models()
-            .into_iter()
-            .map(|model| {
-                // UI-only tier hints for the managed Kimi Code catalog.
-                let tier = match model.id.as_str() {
-                    "k3" | "k3-256k" => "S+",
-                    "kimi-for-coding" => "S",
-                    _ => "",
-                };
-                (model.id, model.label.unwrap_or_default(), tier.to_string())
-            })
-            .collect(),
-        key => synaps_cli::runtime::openai::registry::providers()
-            .iter()
-            .find(|spec| spec.key == key)
-            .map(|spec| {
-                spec.models
-                    .iter()
-                    .map(|(id, label, tier)| {
-                        ((*id).to_string(), (*label).to_string(), (*tier).to_string())
-                    })
-                    .collect()
-            })
-            .unwrap_or_default(),
-    }
-}
-
-fn local_model_label(id: &str) -> String {
-    id.split(':')
-        .next()
-        .unwrap_or(id)
-        .replace('-', " ")
-        .split_whitespace()
-        .map(|word| {
-            let mut chars = word.chars();
-            match chars.next() {
-                Some(first) => format!("{}{}", first.to_uppercase(), chars.as_str()),
-                None => String::new(),
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn dev_provider_is_logged_in(
-    provider: &DevProviderSelection,
-    availability: &ProviderAvailability,
-    logged_in_oauth: &BTreeSet<&'static str>,
-) -> bool {
-    match provider.auth_kind {
-        DevProviderAuth::LocalModels => !availability.local_models.is_empty(),
-        DevProviderAuth::Cloud => true,
-        DevProviderAuth::ApiKey => availability.configured_static.contains(provider.key),
-        DevProviderAuth::OAuth(storage_key) => logged_in_oauth.contains(storage_key),
-    }
-}
-
-fn model_matches(model: &ModelEntry, query: &str, favorites_only: bool) -> bool {
-    if favorites_only && !model.is_favorite {
-        return false;
-    }
-    if query.is_empty() {
-        return true;
-    }
-    let haystack = format!(
-        "{} {} {} {}",
-        model.id, model.display_id, model.label, model.provider_name
+    let manager = synaps_cli::runtime::openai::extension_manager_for_routing();
+    agent_engine::model_picker::build_sections_from_parts(
+        current_model,
+        &picker_query(state),
+        availability,
+        logged_in_oauth,
+        || manager.as_ref().and_then(|manager| manager.try_read().ok()),
     )
-    .to_lowercase();
-    haystack.contains(query)
-}
-
-fn pin_favorites_first(entries: &mut [ModelEntry]) {
-    entries.sort_by(|a, b| {
-        b.is_favorite
-            .cmp(&a.is_favorite)
-            .then_with(|| a.order.cmp(&b.order))
-            .then_with(|| a.display_id.cmp(&b.display_id))
-    });
 }
 
 pub(crate) fn visible_rows(sections: &[ModelSection], state: &ModelsModalState) -> Vec<VisibleRow> {

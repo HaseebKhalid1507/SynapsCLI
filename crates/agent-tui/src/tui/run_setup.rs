@@ -165,6 +165,7 @@ pub(crate) async fn run_setup(
     .await?;
     let handle = host
         .create_session(SessionConfig {
+            ephemeral_layer_wait_ms: None,
             continue_session,
             system,
             prompt_manifest,
@@ -184,6 +185,10 @@ pub(crate) async fn run_setup(
             memory_mode: None,
             restore_parked: false,
             message_clock: None,
+            restore_parked_since: None,
+            continue_lookup: agent_engine::session::ContinueLookup::Query,
+            fork: None,
+            memory_only_tools: Vec::new(),
         })
         .await?;
     let (transport, snapshot) =

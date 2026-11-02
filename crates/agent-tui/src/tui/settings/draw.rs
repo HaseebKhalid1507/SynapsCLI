@@ -686,6 +686,16 @@ fn raw_config(key: &str) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
+/// `context_management.summary_model` as the config parser reads it: an
+/// invalid value turns the summary off, so it is never shown as `auto`.
+fn summary_model_display(raw: Option<&str>) -> String {
+    match raw.map(synaps_cli::config::parse_summary_model) {
+        None | Some(Ok(None)) => "auto".to_string(),
+        Some(Ok(Some(model))) => model,
+        Some(Err(_)) => "invalid (summary off)".to_string(),
+    }
+}
+
 /// Read a u64 config key that must fall in `range`, defaulting otherwise.
 fn ranged_config_display(key: &str, range: std::ops::RangeInclusive<u64>, default: u64) -> String {
     raw_config(key)
@@ -786,20 +796,32 @@ pub(crate) fn config_row_display(key: &str) -> Option<String> {
         "subagent_transform_hooks" => bool_config_display(key, true),
         "context_management.mode" => raw_config(key)
             .and_then(|v| cfg::ContextManagementMode::parse(&v))
-            .unwrap_or_default()
+            .unwrap_or(cfg::ContextManagementMode::CONFIG_DEFAULT)
             .as_str()
             .to_string(),
         "context_management.pressure_tokens"
         | "context_management.rollover_tokens"
-        | "context_management.target_tokens" => {
+        | "context_management.target_tokens"
+        | "context_management.summary_tokens" => {
             match raw_config(key).and_then(|v| v.parse::<u64>().ok()) {
                 Some(n) => n.to_string(),
                 None => "auto".to_string(),
             }
         }
+        "context_management.summary_model" => summary_model_display(raw_config(key).as_deref()),
+        "daemon.umask" => match raw_config(key).map(|v| cfg::DaemonUmask::parse(&v)) {
+            None | Some(Ok(cfg::DaemonUmask::Inherit)) => "inherit".to_string(),
+            Some(Ok(cfg::DaemonUmask::Mode(mode))) => format!("{mode:04o}"),
+            Some(Err(_)) => "invalid (inherit)".to_string(),
+        },
         "context_management.reserve_tokens" => {
             ranged_config_display(key, 1..=cfg::ContextManagementConfig::MAX_RESERVE_TOKENS, 16_000)
         }
+        "context_management.summary_timeout_secs" => ranged_config_display(
+            key,
+            1..=cfg::ContextManagementConfig::MAX_SUMMARY_TIMEOUT_SECS,
+            cfg::ContextManagementConfig::DEFAULT_SUMMARY_TIMEOUT_SECS,
+        ),
         "context_management.finish_rounds" => ranged_config_display(
             key,
             0..=u64::from(cfg::ContextManagementConfig::MAX_FINISH_ROUNDS),
@@ -834,6 +856,15 @@ pub(crate) fn config_row_display(key: &str) -> Option<String> {
         "subagent.max_concurrent" => ranged_config_display(key, 1..=u64::MAX, 16),
         "subagent.max_total" => ranged_config_display(key, 1..=u64::MAX, 64),
         "subagent.max_depth" => ranged_config_display(key, 1..=u64::from(u16::MAX), 4),
+        "subagent.tool_hooks" => bool_config_display(key, true),
+        // An opt-out: a malformed value is off, as the parser reads it.
+        "subagent.context_rollover" => match raw_config(key) {
+            None => "inherit".to_string(),
+            Some(v) => match cfg::ContextRollover::parse(v.trim()) {
+                Some(cfg::ContextRollover::Inherit) => "inherit".to_string(),
+                Some(cfg::ContextRollover::Off) | None => "off".to_string(),
+            },
+        },
         "session_persistence" => checked_config_display(key, |v| v == "journal", "json"),
         "agent_name" | "identity" => raw_config(key).unwrap_or_else(|| DEFAULT_DISPLAY.to_string()),
         "events.auto_turn" => bool_config_display(key, true),
@@ -948,6 +979,22 @@ pub(crate) fn current_value_for(def: &SettingDef, snap: &RuntimeSnapshot) -> Str
         "daemon.prompt_abandon_secs" => u64_config_display("daemon.prompt_abandon_secs", 3600),
         "daemon.parked_evict_secs" => u64_config_display("daemon.parked_evict_secs", 3600),
         other => config_row_display(other).unwrap_or_else(|| "?".into()),
+    }
+}
+
+#[cfg(test)]
+mod summary_model_display_tests {
+    use super::summary_model_display;
+
+    #[test]
+    fn an_invalid_summary_model_is_shown_as_off_not_auto() {
+        assert_eq!(summary_model_display(None), "auto");
+        assert_eq!(summary_model_display(Some("AUTO")), "auto");
+        assert_eq!(summary_model_display(Some("local/m")), "local/m");
+        assert_eq!(
+            summary_model_display(Some("two words")),
+            "invalid (summary off)"
+        );
     }
 }
 

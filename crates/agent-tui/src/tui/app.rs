@@ -152,7 +152,7 @@ pub(crate) struct App {
     /// Context window size (in tokens) of the model that answered the most
     /// recent turn. Updated alongside `last_turn_context` so the bar's
     /// denominator adapts when users switch models mid-session. See
-    /// `synaps_cli::models::context_window_for_model`.
+    /// `synaps_cli::models::effective_context_window`.
     pub(crate) last_turn_context_window: u64,
     api_call_count: u32, // private: accounting, used only within app.rs
     pub(crate) session_cost: f64,
@@ -162,6 +162,15 @@ pub(crate) struct App {
     /// Keep-warm ping tokens, already included in the `total_*` counters
     /// (mirrors `ConversationSnapshot::keepwarm_tokens`).
     pub(crate) keepwarm_tokens: agent_engine::session::ConversationTokens,
+    /// The session's subagents' spend (child spend), already included in
+    /// `session_cost` (mirrors `ConversationSnapshot::child_cost`).
+    pub(crate) child_cost: f64,
+    /// The child share's tokens, already included in the `total_*`
+    /// counters (mirrors `ConversationSnapshot::child_tokens`).
+    pub(crate) child_tokens: agent_engine::session::ConversationTokens,
+    /// Whether the child share is exact, or as of the session's last save
+    /// (mirrors `ConversationSnapshot::child_share_exact`).
+    pub(crate) child_share_exact: bool,
     pub(crate) session: Session,
     pub(crate) agent_name: String,
     pub(crate) needs_redraw: bool,
@@ -479,6 +488,9 @@ impl App {
             session_cost: 0.0,
             keepwarm_cost: 0.0,
             keepwarm_tokens: Default::default(),
+            child_cost: 0.0,
+            child_tokens: Default::default(),
+            child_share_exact: true,
             session,
             agent_name: boot_config
                 .agent_name
@@ -690,6 +702,9 @@ impl App {
         self.session_cost = conv.cost;
         self.keepwarm_cost = conv.keepwarm_cost;
         self.keepwarm_tokens = conv.keepwarm_tokens.clone();
+        self.child_cost = conv.child_cost;
+        self.child_tokens = conv.child_tokens.clone();
+        self.child_share_exact = conv.child_share_exact;
         self.queued_message = conv.queued_message.clone();
         self.pending_events_len = conv.pending_events_len;
         self.consecutive_auto_turns = conv.consecutive_auto_turns;
@@ -728,9 +743,10 @@ impl App {
         // Per-turn bar denominator — the context window of the model that
         // answered this turn. Tracked alongside so mid-session model swaps
         // (e.g. main thread Opus → subagent Sonnet) recalibrate the bar.
-        // If the user configured an explicit context_window, honour it.
-        self.last_turn_context_window = context_window_override
-            .unwrap_or_else(|| synaps_cli::models::context_window_for_model(model));
+        // If the user configured an explicit context_window, honour it up to
+        // the model's ceiling, as the runtime budgets it.
+        self.last_turn_context_window =
+            synaps_cli::models::effective_context_window(model, context_window_override);
         self.api_call_count += 1;
         // Delegate cost calculation to the single source of truth in `pricing`.
         // Split-aware: 1h cache writes bill at 2.0x when the TTL split arrived.
@@ -2610,5 +2626,74 @@ mod tests {
             app.myx_last_live.is_none(),
             "the last-good cache must not survive switch-away"
         );
+    }
+}
+
+#[cfg(test)]
+mod child_share_tests {
+    use super::*;
+
+    /// A Conversation snapshot replaces the child share with the totals
+    /// (child spend reaches the TUI only this way): the inclusive totals
+    /// and the share come from the snapshot, and the request count, the
+    /// last request and the context gauge stay the foreground's own.
+    #[test]
+    fn a_conversation_replaces_the_child_share_and_leaves_the_requests_alone() {
+        let mut app = App::new(Session::new("claude-sonnet-4-5", "low", None));
+        assert!(app.child_share_exact);
+        assert_eq!(app.child_cost, 0.0);
+        // The foreground's own request.
+        app.add_usage(10, 2, 0, 0, None, None, "claude-sonnet-4-5", None);
+        let (calls, last_in, context) = (app.api_call_count, app.input_tokens, app.last_turn_context);
+
+        let conv = agent_engine::session::ConversationSnapshot {
+            tokens: agent_engine::session::ConversationTokens {
+                input: 110,
+                output: 22,
+                cache_read: 0,
+                cache_creation: 0,
+            },
+            cost: 0.5,
+            child_cost: 0.3,
+            child_tokens: agent_engine::session::ConversationTokens {
+                input: 100,
+                output: 20,
+                cache_read: 0,
+                cache_creation: 0,
+            },
+            child_share_exact: false,
+            ..Default::default()
+        };
+        app.apply_conversation(&conv);
+        assert_eq!(app.total_input_tokens, 110, "inclusive, from the snapshot");
+        assert_eq!(app.session_cost, 0.5);
+        assert_eq!(app.child_cost, 0.3);
+        assert_eq!(app.child_tokens.input, 100);
+        assert_eq!(app.child_tokens.output, 20);
+        assert!(!app.child_share_exact);
+        assert_eq!(app.api_call_count, calls, "no request of the TUI's own");
+        assert_eq!(app.input_tokens, last_in, "the last request stays the foreground's");
+        assert_eq!(app.last_turn_context, context, "the context gauge too");
+    }
+
+    /// The context gauge's denominator is the window the runtime budgets: an
+    /// explicit window clamped to the answering model's ceiling.
+    #[test]
+    fn context_window_clamp_sets_the_gauge_to_the_models_ceiling() {
+        let mut app = App::new(Session::new("claude-sonnet-4-5", "low", None));
+        let usage = |app: &mut App, model: &str, window: Option<u64>| {
+            app.add_usage(10, 2, 0, 0, None, None, model, window);
+            app.last_turn_context_window
+        };
+        assert_eq!(
+            usage(&mut app, "claude-haiku-4-5", Some(1_000_000)),
+            200_000
+        );
+        assert_eq!(
+            usage(&mut app, "claude-sonnet-4-6", Some(1_000_000)),
+            1_000_000
+        );
+        assert_eq!(usage(&mut app, "claude-haiku-4-5", Some(100_000)), 100_000);
+        assert_eq!(usage(&mut app, "claude-haiku-4-5", None), 200_000);
     }
 }

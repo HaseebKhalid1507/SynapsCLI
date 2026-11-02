@@ -776,24 +776,30 @@ async fn run_command(
                 }
             };
             if let Some(window) = window {
-                match link
+                let applied = match link
                     .set_checked(agent_engine::session::SessionSetting::ContextWindow {
                         tokens: window,
                     })
                     .await
                 {
-                    Ok(applied) => app.last_turn_context_window = applied.view.context_window,
+                    Ok(applied) => applied.view.context_window,
                     Err(e) => {
                         app.push_msg(ChatMessage::Error(e));
                         return CommandAction::None;
                     }
-                }
+                };
+                app.last_turn_context_window = applied;
                 let canonical = arg.to_ascii_lowercase();
                 let status =
                     synaps_cli::engine::commands::persist_to_config("context_window", &canonical);
+                // A window above the model's ceiling is clamped to it.
+                let clamped = window
+                    .filter(|&requested| applied < requested)
+                    .map(|_| format!(" (this model accepts {applied} tokens)"))
+                    .unwrap_or_default();
                 app.push_msg(ChatMessage::System(format!(
-                    "context window set to: {} {}",
-                    canonical, status
+                    "context window set to: {} {}{}",
+                    canonical, status, clamped
                 )));
             }
         }
@@ -1547,6 +1553,18 @@ pub(crate) fn build_stats_receipt(
             fmt_tokens(kw.output)
         ));
     }
+    // The session's subagents' requests are inside the totals too (child
+    // spend); their share is shown the same way.
+    let ch = &app.child_tokens;
+    if ch.cache_read + ch.cache_creation + ch.input + ch.output > 0 {
+        lines.push(format!(
+            "    incl. subagents  read {} / write {} / input {} / output {}",
+            fmt_tokens(ch.cache_read),
+            fmt_tokens(ch.cache_creation),
+            fmt_tokens(ch.input),
+            fmt_tokens(ch.output)
+        ));
+    }
 
     lines.push(String::new());
     lines.push(format!("  Cache hit rate {:>8}", hit_rate_str));
@@ -1555,6 +1573,17 @@ pub(crate) fn build_stats_receipt(
         lines.push(format!(
             "    incl. keep-warm ${:.4} (/keepwarm status)",
             app.keepwarm_cost
+        ));
+    }
+    if app.child_cost > 0.0 {
+        lines.push(format!(
+            "    incl. subagents ${:.4}{}",
+            app.child_cost,
+            if app.child_share_exact {
+                ""
+            } else {
+                "  (as of last save)"
+            }
         ));
     }
     stats_box(lines)
@@ -2985,6 +3014,45 @@ mod tests {
         assert!(receipt.contains("400.0K"), "the total includes pings: {receipt}");
         assert!(
             receipt.contains("incl. keep-warm  read 300.0K / write 0 / input 80 / output 2"),
+            "{receipt}"
+        );
+    }
+
+    /// The subagents' spend is labelled inside the session cost (child
+    /// spend), "as of last save" when the share was restored; no line
+    /// without it.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn stats_receipt_labels_the_child_share() {
+        let session = synaps_cli::Session::new("claude-sonnet-4-5", "medium", None);
+        let mut app = crate::tui::app::App::new(session);
+        let runtime = synaps_cli::Runtime::new_headless();
+        let receipt = build_stats_receipt(&app, &runtime);
+        assert!(!receipt.contains("subagents"), "no line without child spend: {receipt}");
+
+        app.session_cost = 1.25;
+        app.total_cache_read_tokens = 400_000;
+        app.child_cost = 0.4;
+        app.child_tokens = agent_engine::session::ConversationTokens {
+            input: 1_200,
+            output: 300,
+            cache_read: 50_000,
+            cache_creation: 2_000,
+        };
+        app.child_share_exact = true;
+        let receipt = build_stats_receipt(&app, &runtime);
+        assert!(receipt.contains("Cost            $1.2500"), "{receipt}");
+        assert!(receipt.contains("incl. subagents $0.4000"), "{receipt}");
+        assert!(!receipt.contains("as of last save"), "{receipt}");
+        assert!(
+            receipt.contains("incl. subagents  read 50.0K / write 2.0K / input 1.2K / output 300"),
+            "{receipt}"
+        );
+
+        app.child_share_exact = false;
+        let receipt = build_stats_receipt(&app, &runtime);
+        assert!(
+            receipt.contains("incl. subagents $0.4000  (as of last save)"),
             "{receipt}"
         );
     }

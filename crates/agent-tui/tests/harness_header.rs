@@ -119,6 +119,8 @@ fn each_phase_of_a_turn_names_itself_with_the_turn_clock() {
             llm(WireLlmEvent::ToolResult {
                 tool_id: "t1".into(),
                 result: "ok".into(),
+                memory_only: false,
+                client_tool: None,
             }),
             "waiting 1m05s",
         ),

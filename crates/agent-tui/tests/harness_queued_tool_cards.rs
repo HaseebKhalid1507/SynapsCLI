@@ -47,6 +47,7 @@ fn result(id: &str) -> WatchEvent {
     WatchEvent::ToolResult {
         tool_id: id.into(),
         result: String::new(),
+        memory_only: false,
     }
 }
 
@@ -199,10 +200,12 @@ fn a_queued_card_that_gets_a_result_without_starting_settles() {
             WatchEvent::ToolResult {
                 tool_id: "s1".into(),
                 result: "Interrupted".into(),
+                memory_only: false,
             },
             WatchEvent::ToolResult {
                 tool_id: "s2".into(),
                 result: "Interrupted".into(),
+                memory_only: false,
             },
         ],
     );
@@ -253,7 +256,11 @@ fn answer_poll_timed(h: &mut TestHarness, p: WatchPage, at_ms: &[u64], now_ms: u
     let mut value = serde_json::to_value(p).unwrap();
     value["at_ms"] = serde_json::json!(at_ms);
     value["now_ms"] = serde_json::json!(now_ms);
-    h.feed_event(SessionEventWire::QueryResult { id, value });
+    h.feed_event(SessionEventWire::QueryResult {
+        id,
+        value,
+        client_tools: None,
+    });
 }
 
 /// The whole story in a worker view, applied in one late page: the second

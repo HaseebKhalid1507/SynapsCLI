@@ -62,14 +62,30 @@ pub(crate) const EXCLUDED_CONFIG_KEYS: &[(&str, &str)] = &[
     ("bridge.heartbeat_mirror", "internal sidecar plumbing"),
     ("bridge.heartbeat_timeout_ms", "internal sidecar plumbing"),
     ("memory.default_mode_confirmed", "operator consent marker: must be set by hand"),
+    ("daemon.reload_resume", "operator kill switch for resuming reload-cut turns, set in the config file"),
+    ("daemon.crash_restore", "operator kill switch for restoring sessions after a daemon crash, set in the config file"),
+    ("capacity_wait", "operator kill switch for waiting in the turn for Anthropic account capacity, set in the config file"),
+    ("capacity_resume", "operator kill switch for resuming a session once a usage-limited account is back, set in the config file"),
+    ("client_tools", "operator kill switch for wire-registered client tools, set in the config file"),
     ("subagent_max_concurrent", "legacy flat alias of subagent.max_concurrent (edit that row)"),
     ("subagent_max_total", "legacy flat alias of subagent.max_total (edit that row)"),
+    ("subagent.context_warn_tokens", "operator context limit: a token count or off, set in the config file"),
+    ("subagent.resume_refuse_tokens", "operator context limit: a token count or off, set in the config file"),
     ("favorite_models", "owned by the model picker (/models favorites)"),
     ("disabled_plugins", "owned by the Plugins tab"),
+    ("memory_only_tools", "data-handling policy for extension/MCP tool results, set in the config file or by the app per session"),
     ("tool_scope_slice", "operator cgroup placement, set by hand together with the slice's limits"),
     ("daemon_scope_slice", "operator cgroup placement, set by hand together with the slice's limits"),
     ("provider.*", "owned by the Providers tab (API keys)"),
     ("keybind.*", "keybind family (keybind registry), not a single setting"),
+    ("wait.max_inline_secs", "operational bound of the wait tool, set in the config file"),
+    ("subagent.watch.small_models", "watch-worker admission, set in the config file"),
+    ("subagent.watch.admission", "operator kill switch for watch-worker admission, set in the config file"),
+    ("subagent.watch.lease_secs", "operational bound of a watch worker, set in the config file"),
+    ("subagent.watch.lease_rounds", "operational bound of a watch worker, set in the config file"),
+    ("subagent.watch.lease_cost_usd", "operator-set watch-worker cost lease, set in the config file"),
+    ("subagent.watch.advice_timeout_ms", "watch-worker admission advisor budget, set in the config file"),
+    ("subagent.watch.advice_min_confidence", "watch-worker admission advisor threshold, set in the config file"),
 ];
 
 /// Reason for dead-config exclusions (see `EXCLUDED_CONFIG_KEYS`).
@@ -425,8 +441,13 @@ define_settings! {
         };
 
     "client_input", "Client input", Daemon, EditorKind::Cycler(&["shared", "exclusive"]),
-        "Who may type in a daemon session with several clients attached (tabs, a dashboard, a bridge): shared (default) lets every client except --observe ones send input; exclusive lets only the input owner, and the others /takeover. The daemon reads it when it starts: `synaps daemon reload` applies it.",
+        "Who may type in a daemon session with several clients attached (tabs, a dashboard, a bridge): exclusive (default) lets only the input owner, and the others /takeover; shared lets every client except --observe ones send input. The daemon reads it when it starts: `synaps daemon reload` applies it.",
         |_app, value| config_edit("client_input", value);
+
+    "daemon.umask", "Daemon umask", Daemon,
+        EditorKind::Text { numeric: false },
+        "File-creation mask of the daemon and everything it starts (tools, shells, extensions): inherit (default: keep the mask the daemon was started with) or an octal mode such as 022. A malformed value warns and inherits. Takes effect at the next daemon reload or restart.",
+        |_app, value| config_edit("daemon.umask", value);
 
     // ── Context & cache ──────────────────────────────────────────────────
     // Config-only rows below validate through the real config parser
@@ -461,7 +482,7 @@ define_settings! {
 
     "context_management.mode", "Context management", Context,
         EditorKind::Cycler(&["off", "auto"]),
-        "Automatic context management: auto plans a wrap-up and hands over to a fresh context before the window fills; off disables it (default). Takes effect next launch.",
+        "Automatic context management: auto (default on Linux and macOS) plans a wrap-up and hands over to a fresh context before the window fills; off disables it. Takes effect next launch.",
         |_app, value| config_edit("context_management.mode", value);
 
     "context_management.pressure_tokens", "Pressure threshold", Context,
@@ -478,6 +499,21 @@ define_settings! {
         EditorKind::Text { numeric: false },
         "Context size a rollover aims for, as reported by the provider when known (auto = min(100k, 2/3 of pressure)). Must stay below the pressure threshold. Takes effect next launch.",
         |_app, value| config_edit("context_management.target_tokens", value);
+
+    "context_management.summary_tokens", "Rollover summary size", Context,
+        EditorKind::Text { numeric: false },
+        "Size of the rolling summary of dropped history each rolled-over context carries, counted inside the rollover target (auto = min(15k, 15% of the target); 0 = off). Must stay below the target. Takes effect next launch.",
+        |_app, value| config_edit("context_management.summary_tokens", value);
+
+    "context_management.summary_model", "Rollover summary model", Context,
+        EditorKind::Text { numeric: false },
+        "Model that writes the rollover summary (auto = this session's model if its provider enforces an output limit, else the compaction model, with a one-time notice; never another vendor). An explicit model is used alone, or the summary is skipped with a notice; an invalid value turns the summary off. Takes effect next launch.",
+        |_app, value| config_edit("context_management.summary_model", value);
+
+    "context_management.summary_timeout_secs", "Rollover summary wait", Context,
+        EditorKind::Text { numeric: true },
+        "Longest a rollover waits for its summary (1–600 s, default 300); on timeout the rollover continues without a new summary. Takes effect next launch.",
+        |_app, value| whole_number("context_management.summary_timeout_secs", value);
 
     "context_management.reserve_tokens", "Reserve tokens", Context,
         EditorKind::Text { numeric: true },
@@ -540,6 +576,14 @@ define_settings! {
     "subagent.max_depth", "Subagent depth", Agent, EditorKind::Text { numeric: true },
         "How deep workers may nest: 1 = only the foreground delegates (1–65535, default 4). Takes effect next launch.",
         |_app, value| whole_number("subagent.max_depth", value);
+
+    "subagent.tool_hooks", "Subagent tool hooks", Agent, EditorKind::Cycler(&["on", "off"]),
+        "Run your before_tool_call hooks (guard extensions) on subagents' tool calls, with their confirms asked here (default on). Off: subagents' tool calls skip every hook. Applies to subagents started after the change.",
+        |_app, value| on_off("subagent.tool_hooks", value);
+
+    "subagent.context_rollover", "Subagent own rollover", Agent, EditorKind::Cycler(&["inherit", "off"]),
+        "Workers' own context rollover: inherit (default) lets a worker roll over to a fresh window of its own, as this session does, when this session's context management is auto; off keeps every worker in one window, as before. A caller can also turn it off for one worker (the tools' context_rollover parameter). Any other value is off. Applies to workers started or resumed after the change.",
+        |_app, value| config_edit("subagent.context_rollover", value);
 
     "session_persistence", "Session persistence", Agent, EditorKind::Cycler(&["json", "journal"]),
         "How sessions are saved: json (full rewrite, default) or journal (append-only deltas with periodic snapshots). Applies from the next session save.",
@@ -1313,6 +1357,17 @@ mod tests {
             assert!(is_ok(d("context_management.target_tokens", "90000")));
             assert!(is_err(d("context_management.target_tokens", "0")));
             assert!(is_err(d("context_management.target_tokens", "lots")));
+            assert!(is_ok(d("context_management.summary_tokens", "auto")));
+            assert!(is_ok(d("context_management.summary_tokens", "12000")));
+            assert!(is_err(d("context_management.summary_tokens", "lots")));
+            assert!(is_ok(d("context_management.summary_model", "auto")));
+            assert!(is_ok(d(
+                "context_management.summary_model",
+                "groq/llama-3.3-70b-versatile"
+            )));
+            assert!(is_err(d("context_management.summary_model", "two words")));
+            assert!(is_ok(d("context_management.summary_timeout_secs", "60")));
+            assert!(is_err(d("context_management.summary_timeout_secs", "0")));
             assert!(is_err(d("context_management.finish_rounds", "9")));
             assert!(is_ok(d("compaction_exclude", "thinking, tool_results")));
             assert!(is_err(d("compaction_exclude", "thinking, secrets")));
@@ -1412,6 +1467,84 @@ mod tests {
             config_row_display("memory.default_mode").as_deref(),
             Some("off")
         );
+        drop(temp);
+    }
+
+    /// `daemon.umask` is a Daemon text row: the parser validates the edit,
+    /// and the row shows `inherit`, the four-digit mode, or that an invalid
+    /// value falls back to inherit.
+    #[test]
+    fn daemon_umask_row_validates_and_displays_the_mode() {
+        use super::super::draw::config_row_display;
+        let def = ALL_SETTINGS
+            .iter()
+            .find(|d| d.key == "daemon.umask")
+            .expect("daemon.umask should be a settings row");
+        assert_eq!(def.category, Category::Daemon);
+        assert!(matches!(def.editor, EditorKind::Text { numeric: false }));
+
+        let _lock = config_lock();
+        let shown = |content: &str| {
+            let temp = TempConfig::new(content);
+            let shown = config_row_display("daemon.umask");
+            drop(temp);
+            shown
+        };
+        assert_eq!(shown("").as_deref(), Some("inherit"));
+        assert_eq!(shown("daemon.umask = inherit\n").as_deref(), Some("inherit"));
+        assert_eq!(shown("daemon.umask = \"022\"\n").as_deref(), Some("0022"));
+        assert_eq!(shown("daemon.umask = 0027\n").as_deref(), Some("0027"));
+        assert_eq!(shown("daemon.umask = 0778\n").as_deref(), Some("invalid (inherit)"));
+
+        let temp = TempConfig::new("");
+        let mut app = app_with_model("m");
+        let mut d = |value: &str| apply_setting_dispatch("daemon.umask", value, &mut app);
+        assert!(is_ok(d("inherit")));
+        assert!(is_ok(d("022")));
+        assert!(is_ok(d("0077")));
+        assert!(is_err(d("0778")));
+        assert!(is_err(d("u=rwx")));
+        drop(temp);
+    }
+
+    /// `subagent.context_rollover` is an Agent cycler row (slice 9): the
+    /// parser validates the edit, and the row shows the opt-out as the
+    /// parser reads it: unset is inherit, and a malformed value is off.
+    #[test]
+    fn subagent_context_rollover_row_validates_and_displays_the_opt_out() {
+        use super::super::draw::config_row_display;
+        let def = ALL_SETTINGS
+            .iter()
+            .find(|d| d.key == "subagent.context_rollover")
+            .expect("subagent.context_rollover should be a settings row");
+        assert_eq!(def.category, Category::Agent);
+        assert!(matches!(def.editor, EditorKind::Cycler(&["inherit", "off"])));
+        assert!(
+            !EXCLUDED_CONFIG_KEYS
+                .iter()
+                .any(|(k, _)| *k == "subagent.context_rollover"),
+            "no longer excluded"
+        );
+
+        let _lock = config_lock();
+        let shown = |content: &str| {
+            let temp = TempConfig::new(content);
+            let shown = config_row_display("subagent.context_rollover");
+            drop(temp);
+            shown
+        };
+        assert_eq!(shown("").as_deref(), Some("inherit"));
+        assert_eq!(shown("subagent.context_rollover = inherit\n").as_deref(), Some("inherit"));
+        assert_eq!(shown("subagent.context_rollover = off\n").as_deref(), Some("off"));
+        assert_eq!(shown("subagent.context_rollover = on\n").as_deref(), Some("off"));
+
+        let temp = TempConfig::new("");
+        let mut app = app_with_model("m");
+        let mut d = |value: &str| apply_setting_dispatch("subagent.context_rollover", value, &mut app);
+        assert!(is_ok(d("inherit")));
+        assert!(is_ok(d("off")));
+        assert!(is_err(d("on")));
+        assert!(is_err(d("auto")));
         drop(temp);
     }
 }

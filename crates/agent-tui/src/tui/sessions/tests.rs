@@ -46,6 +46,8 @@ pub(super) fn meta(id: &str, name: Option<&str>) -> SessionMeta {
         title: None,
         cost_usd: 0.0,
         messages: 0,
+        input_owner_kind: None,
+        restoring: false,
     }
 }
 

@@ -86,7 +86,7 @@ pub(super) fn apply_transcript_event(
         StreamEvent::Llm(LlmEvent::ToolResultDelta { delta, tool_id }) => {
             store.on_tool_result_delta(tool_id.clone(), delta.clone());
         }
-        StreamEvent::Llm(LlmEvent::ToolResult { result, tool_id }) => {
+        StreamEvent::Llm(LlmEvent::ToolResult { result, tool_id, .. }) => {
             store.on_tool_result(tool_id.clone(), result.clone());
         }
         // Scheduler lane waits (opt-in: only calls that wait get them).
@@ -156,6 +156,11 @@ pub(super) fn apply_transcript_event(
         StreamEvent::Session(SessionEvent::Usage { .. })
         | StreamEvent::Session(SessionEvent::MessageHistory(_))
         | StreamEvent::Session(SessionEvent::ContextHeadCheckpoint { .. })
+        // A ledgered attempt's usage is re-dispatched as the plain `Usage`
+        // by `handle_stream_event`; a liability shows nothing.
+        | StreamEvent::Session(
+            SessionEvent::UsageAttempt { .. } | SessionEvent::UsageLiability { .. },
+        )
         | StreamEvent::Agent(AgentEvent::SubagentStart { .. })
         | StreamEvent::Agent(AgentEvent::SubagentUpdate { .. })
         | StreamEvent::Agent(AgentEvent::SubagentDone { .. }) => return Applied::Ignored,
@@ -342,6 +347,16 @@ pub(super) fn handle_stream_event(event: StreamEvent, app: &mut App, view: &Runt
             // actor's; it announces the next turn with `TurnStarted`. History
             // repair on Error is the actor's too (mirrored by `Conversation`).
         }
+        // A run's request-ledger events are host-internal (the daemon never
+        // forwards them): a ledgered attempt's usage is shown as the plain
+        // `Usage` it stands in for; a liability shows nothing.
+        StreamEvent::Session(
+            event @ (SessionEvent::UsageAttempt { .. } | SessionEvent::UsageLiability { .. }),
+        ) => {
+            if let Some(plain) = event.for_clients() {
+                handle_stream_event(StreamEvent::Session(plain), app, view);
+            }
+        }
         // Transcript-only events: fully handled by `apply_transcript_event`.
         StreamEvent::Llm(_)
         | StreamEvent::Session(SessionEvent::Notice(_) | SessionEvent::Retry(_))
@@ -483,6 +498,7 @@ pub(super) async fn handle_session_event_arm(
     }
     app.flush_reveal();
     match env.event {
+        SessionEventWire::EphemeralLayerChanged { .. } => {},
         SessionEventWire::Stream(ev) => {
             let do_draw = needs_immediate_draw(&ev);
             let view = std::sync::Arc::clone(link.view());
@@ -651,7 +667,7 @@ pub(super) async fn handle_session_event_arm(
                 }
             }
         }
-        SessionEventWire::QueryResult { id, value } => {
+        SessionEventWire::QueryResult { id, value, .. } => {
             // The subagent watch poll is fire-and-forget; anything else is
             // unsolicited (another client's / a host query): nothing to render.
             super::watch::on_query_result(app, id, &value, std::time::Instant::now());
@@ -708,6 +724,9 @@ pub(super) async fn handle_session_event_arm(
             app.session_cost = 0.0;
             app.keepwarm_cost = 0.0;
             app.keepwarm_tokens = Default::default();
+            app.child_cost = 0.0;
+            app.child_tokens = Default::default();
+            app.child_share_exact = true;
             app.input_tokens = 0;
             app.output_tokens = 0;
             // The footer's context gauge described the old conversation.
@@ -902,6 +921,13 @@ pub(super) async fn handle_session_event_arm(
         } => {
             super::driver_client::on_turn_outcome(app, outcome, selection, feedback);
         }
+        // Child spend frames are for spend breakdowns; the totals come with
+        // the Conversation snapshot.
+        SessionEventWire::ChildSpend(_) | SessionEventWire::ChildSpendLagged { .. } => {}
+        // Focus hold mode (S1) is the app's; the TUI shows nothing for it.
+        SessionEventWire::EventHeld { .. }
+        | SessionEventWire::DeliveryChanged { .. }
+        | SessionEventWire::HeldUpdated { .. } => {}
         // E-P7: spend ceiling breached — surface it loudly.
         SessionEventWire::CostCapReached { scope, cost, cap } => {
             app.push_msg(ChatMessage::Error(format!(
@@ -909,6 +935,15 @@ pub(super) async fn handle_session_event_arm(
             )));
             app.request_redraw();
         }
+        // Spawned-child reports are for process inspectors, not the transcript.
+        SessionEventWire::ChildProcess(_) => {}
+        // The TUI sends no `fork` (side chats are an app feature).
+        SessionEventWire::Forked { .. } => {}
+        // Client tools v1: the TUI never registers client tools.
+        SessionEventWire::ClientTools { .. }
+        | SessionEventWire::ToolInvoke { .. }
+        | SessionEventWire::ToolCancel { .. }
+        | SessionEventWire::ToolReturnAck { .. } => {}
     }
     ArmFlow::Continue
 }
@@ -1531,6 +1566,8 @@ mod transcript_split_tests {
             Llm(L::ToolResult {
                 tool_id: s("t1"),
                 result: s("a\nb"),
+                memory_only: false,
+                client_tool: None,
             }),
             Agent(A::SubagentStart {
                 subagent_id: 3,
