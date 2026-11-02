@@ -351,7 +351,7 @@ async fn budget(t: &mut LocalTransport, id: u64, arg: &str) -> String {
             .await
             .expect("actor hung")
             .expect("alive");
-        if let SessionEventWire::QueryResult { id: i, value } = env.event {
+        if let SessionEventWire::QueryResult { id: i, value, .. } = env.event {
             if i == id {
                 return value.to_string();
             }

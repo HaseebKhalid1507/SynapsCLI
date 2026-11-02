@@ -66,6 +66,7 @@ fn completion_event(
         },
         expects_response: false,
         reply_to: None,
+        peer: None,
     }
 }
 

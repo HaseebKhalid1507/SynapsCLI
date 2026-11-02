@@ -1,5 +1,7 @@
 //! `synaps send` — deliver an event via Unix socket, falling back to inbox file-drop.
 //!
+//! With `--strict` it never falls back: see [`run_strict`].
+//!
 //! ## Driver-aware remote steering (P9, C2)
 //! `send` is a dumb pipe: it delivers an [`Event`] to the target session's
 //! per-session event socket, which lands in the runtime `event_queue`. It does
@@ -33,9 +35,13 @@
 //! Only the no-flag form, which names no session, still uses the inbox.
 
 use chrono::Utc;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use synaps_cli::events::registry::{
     find_session_registration, list_active_sessions, SessionRegistration,
 };
+use synaps_cli::events::send::{send_strict, Outcome, SendResult, StrictMessage};
+use synaps_cli::events::socket::MAX_PAYLOAD;
 use synaps_cli::events::{Event, EventChannel, EventContent, EventSource, Severity};
 use uuid::Uuid;
 
@@ -151,6 +157,130 @@ fn no_match_message(query: &str, live: &[SessionRegistration]) -> String {
     msg
 }
 
+/// The arguments of `synaps send` when `--strict`, `--json` or
+/// `--body-file` is given.
+pub struct StrictArgs {
+    pub message: Option<String>,
+    pub body_file: Option<PathBuf>,
+    pub source: String,
+    pub severity: String,
+    pub channel: Option<String>,
+    pub content_type: String,
+    pub session: Option<String>,
+    pub broadcast: bool,
+    pub strict: bool,
+    pub json: bool,
+}
+
+/// `synaps send --strict`: deliver to exactly one live session, matched by
+/// exact id or name, and confirm it from the session's receipt. It never
+/// writes the inbox, never broadcasts and never matches a prefix. Returns
+/// the exit code: 0 sent, 2 usage, 3 not sent, 5 uncertain.
+pub async fn run_strict(args: StrictArgs) -> i32 {
+    let target = args.session.clone().unwrap_or_default();
+    let outcome = match strict_message(&args) {
+        Ok(msg) => send_strict(&target, &msg).await,
+        Err(BodyError::Usage(detail)) => Outcome::usage(&target, detail),
+        Err(BodyError::Oversized(detail)) => Outcome::oversized(&target, detail),
+    };
+    if args.json {
+        match serde_json::to_string(&outcome) {
+            Ok(line) => println!("{line}"),
+            Err(e) => eprintln!("cannot encode the result: {e}"),
+        }
+    }
+    eprintln!("{}", human(&outcome));
+    let _ = std::io::stdout().flush();
+    outcome.exit_code()
+}
+
+enum BodyError {
+    Usage(String),
+    Oversized(String),
+}
+
+fn usage(detail: &str) -> BodyError {
+    BodyError::Usage(detail.to_string())
+}
+
+fn strict_message(args: &StrictArgs) -> Result<StrictMessage, BodyError> {
+    if !args.strict {
+        let flag = if args.json { "--json" } else { "--body-file" };
+        return Err(BodyError::Usage(format!("{flag} needs --strict")));
+    }
+    if args.broadcast {
+        return Err(usage(
+            "--strict sends to one session; it can't be used with --broadcast",
+        ));
+    }
+    if matches!(args.session.as_deref(), None | Some("")) {
+        return Err(usage("--strict needs --session <exact session id or name>"));
+    }
+    let body = match (&args.message, &args.body_file) {
+        (Some(_), Some(_)) => return Err(usage("give the message or --body-file, not both")),
+        (None, None) => return Err(usage("give the message, or --body-file <path|->")),
+        (Some(message), None) => message.clone(),
+        (None, Some(path)) => read_body(path)?,
+    };
+    StrictMessage::new(&args.source, &args.severity, body)
+        .map(|msg| {
+            msg.with_channel(args.channel.clone())
+                .with_content_type(args.content_type.clone())
+        })
+        .map_err(BodyError::Usage)
+}
+
+/// The body file's text, or stdin's for `-`: at most [`MAX_PAYLOAD`] bytes
+/// are kept, since a session takes no larger event.
+fn read_body(path: &Path) -> Result<String, BodyError> {
+    let limit = MAX_PAYLOAD as u64;
+    let mut bytes = Vec::new();
+    let read = if path == Path::new("-") {
+        std::io::stdin()
+            .lock()
+            .take(limit + 1)
+            .read_to_end(&mut bytes)
+    } else {
+        std::fs::File::open(path).and_then(|file| file.take(limit + 1).read_to_end(&mut bytes))
+    };
+    let shown = if path == Path::new("-") {
+        "stdin".to_string()
+    } else {
+        path.display().to_string()
+    };
+    if let Err(e) = read {
+        return Err(BodyError::Usage(format!(
+            "cannot read the message from {shown}: {e}"
+        )));
+    }
+    if bytes.len() as u64 > limit {
+        return Err(BodyError::Oversized(format!(
+            "the message from {shown} is over {MAX_PAYLOAD} bytes; a session takes at most {MAX_PAYLOAD} per event"
+        )));
+    }
+    String::from_utf8(bytes)
+        .map_err(|_| BodyError::Usage(format!("the message from {shown} is not UTF-8")))
+}
+
+fn human(outcome: &Outcome) -> String {
+    let why = outcome
+        .why
+        .and_then(|why| serde_json::to_value(why).ok())
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_default();
+    let detail = outcome.detail.as_deref().unwrap_or("");
+    let session = outcome.session_id.as_deref().unwrap_or(&outcome.target);
+    let event = outcome.event_id.as_deref().unwrap_or("");
+    match outcome.result {
+        SendResult::Sent => format!("Event sent to session {session} via socket. Receipt {event}."),
+        SendResult::NotSent => format!("Event not sent to {session} ({why}): {detail}"),
+        SendResult::Uncertain => {
+            format!("Event {event} may or may not have reached session {session} ({why}): {detail}")
+        }
+        SendResult::Usage => format!("error: {detail}"),
+    }
+}
+
 // ── helpers ──────────────────────────────────────────────────────────────────
 
 fn build_event(
@@ -182,6 +312,7 @@ fn build_event(
         },
         expects_response: false,
         reply_to: None,
+        peer: None,
     }
 }
 
@@ -289,6 +420,8 @@ mod tests {
             socket_path: format!("/tmp/{id}.sock"),
             pid: 1,
             started_at: Utc::now(),
+            receipts: 0,
+            start_ticks: None,
         }
     }
 

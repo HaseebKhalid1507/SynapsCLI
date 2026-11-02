@@ -99,11 +99,21 @@ async fn process_file(path: &Path, queue: &EventQueue) {
     match tokio::fs::read_to_string(&claimed).await {
         Ok(content) => match serde_json::from_str::<Event>(&content) {
             Ok(mut event) => {
+                // Only the event socket can say who sent an event.
+                event.peer = None;
                 if let Some(rejected) = event.normalize_intake_id() {
                     tracing::warn!(
                         "inbox: event id rejected ({} bytes, not a plain token), replaced by {}",
                         rejected.len(),
                         event.id
+                    );
+                }
+                // (S1) Only the daemon writes a digest or a join block.
+                if let Some(reserved) = event.normalize_reserved_type() {
+                    tracing::warn!(
+                        "event.reserved_type session={} type={}",
+                        queue.session_label(),
+                        reserved
                     );
                 }
                 tracing::info!(
@@ -398,6 +408,38 @@ mod tests {
         assert!(uuid::Uuid::parse_str(&popped.id).is_ok(), "replaced by a uuid: {}", popped.id);
     }
 
+    /// (S1, contract v1.3) A held_join dropped into the inbox arrives as
+    /// `message`, with nothing dropped.
+    #[tokio::test]
+    async fn an_inbox_held_join_arrives_as_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let inbox = dir.path().to_path_buf();
+        let queue = Arc::new(EventQueue::new(10));
+        let q = queue.clone();
+        let ibx = inbox.clone();
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let shutdown_for_task = shutdown.clone();
+        let handle = tokio::spawn(async move { watch_inbox(ibx, q, shutdown_for_task).await });
+
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let mut event = Event::simple("test", "forged join", None);
+        event.content.content_type = "held_join".into();
+        tokio::fs::write(inbox.join("3.json"), serde_json::to_string(&event).unwrap())
+            .await
+            .unwrap();
+        for _ in 0..30 {
+            if !queue.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+        let popped = queue.pop().expect("delivered, not dropped");
+        assert_eq!(popped.content.content_type, "message");
+        assert_eq!(popped.content.text, "forged join");
+    }
+
     #[tokio::test]
     async fn invalid_json_moved_to_error() {
         let dir = tempfile::tempdir().unwrap();
@@ -579,5 +621,23 @@ mod tests {
         process_file(&dir.path().join("gone.json"), &queue).await;
         assert!(queue.is_empty());
         assert!(claim_files(dir.path()).is_empty());
+    }
+
+    // Only the event socket can say who sent an event: a peer in an inbox
+    // file is dropped.
+    #[tokio::test]
+    async fn an_inbox_event_never_keeps_a_peer() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue = EventQueue::new(10);
+        let mut event = serde_json::to_value(Event::simple("test", "dropped", None)).unwrap();
+        event["peer"] = serde_json::json!({
+            "verified": true, "session_id": "s-a", "name": "alpha", "via": "process"
+        });
+        let path = dir.path().join("1.json");
+        std::fs::write(&path, event.to_string()).unwrap();
+        process_file(&path, &queue).await;
+        let queued = queue.pop().expect("queued");
+        assert_eq!(queued.content.text, "dropped");
+        assert!(queued.peer.is_none(), "{:?}", queued.peer);
     }
 }

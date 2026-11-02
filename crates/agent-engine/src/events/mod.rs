@@ -7,8 +7,10 @@
 
 pub mod format;
 pub mod ingest;
+pub mod peer;
 pub mod queue;
 pub mod registry;
+pub mod send;
 pub mod socket;
 pub mod types;
 
@@ -16,6 +18,7 @@ pub use format::format_event_for_agent;
 pub use ingest::{
     not_watcher_notice, watch_inbox, watch_inbox_filtered, watch_inbox_gated, InboxFilter,
 };
+pub use peer::{EventPeer, PeerReason, PeerResolver, PeerVia};
 pub use queue::EventQueue;
 pub use registry::*;
 pub use types::{Event, EventChannel, EventContent, EventSender, EventSource, Severity};

@@ -304,6 +304,7 @@ pub async fn run(config_path: String, trigger_context: String) {
         chrono::Utc::now().format("%Y%m%d-%H%M%S"),
         std::process::id()
     );
+    runtime.event_queue().set_session_label(&agent_session_id);
     let endpoint = match synaps_cli::events::registry::SessionEndpoint::start(
         &agent_session_id,
         Some(agent_name.clone()),

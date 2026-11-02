@@ -31,9 +31,9 @@ regardless of which mode (chat, RPC, server) drains it.
 **Sanitising.** The rendering is a syntactic boundary: what an event carries
 cannot close its own tag or open another one that this renderer would read as
 an event tag. It is not a guarantee about how a model reads the text.
-- Every attribute value (`id`, `type`, `source`, `channel`): `"` becomes `'`,
-  `<`, `>` and invisible format characters are dropped, and control
-  characters become spaces.
+- Every attribute value (`id`, `type`, `source`, `channel`, and the sender's
+  `from_session` and `from_name`): `"` becomes `'`, `<`, `>` and invisible
+  format characters are dropped, and control characters become spaces.
 - "Invisible format characters" are the Unicode default-ignorable code
   points: zero-width characters (ZWSP, ZWNJ, ZWJ, WJ, BOM), bidi marks,
   embeddings, overrides and isolates (LRM, RLM, ALM, LRE to RLO, LRI to PDI),

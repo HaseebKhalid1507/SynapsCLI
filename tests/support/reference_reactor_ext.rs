@@ -346,7 +346,7 @@ impl ReferenceReactorExt {
                         }),
                     }
                 }
-                StreamEvent::Llm(LlmEvent::ToolResult { tool_id, result }) => {
+                StreamEvent::Llm(LlmEvent::ToolResult { tool_id, result, .. }) => {
                     match self.parts.iter_mut().rev().find_map(|p| match p {
                         Part::ToolResult { tool_id: id, content } if *id == tool_id => {
                             Some(content)
@@ -396,6 +396,7 @@ impl ReferenceReactorExt {
                 StreamEvent::Agent(_) => {}
                 StreamEvent::Session(SessionEvent::Notice(_) | SessionEvent::Retry(_)) => {}
                 StreamEvent::Session(SessionEvent::ContextHeadCheckpoint { .. }) => {} // merge(112): handled in phase 3
+                StreamEvent::Session(SessionEvent::UsageAttempt { .. } | SessionEvent::UsageLiability { .. }) => {} // host-internal ledger events: a session never sees them
                 StreamEvent::Session(SessionEvent::Done) => {
                     self.r.streaming = false;
                     let had_pending = !self.r.pending_events.is_empty();

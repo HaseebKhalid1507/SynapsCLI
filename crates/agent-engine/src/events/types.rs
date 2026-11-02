@@ -71,10 +71,16 @@ pub struct Event {
     pub timestamp: DateTime<Utc>,
     pub source: EventSource,
     pub channel: Option<EventChannel>,
+    /// Claimed by whoever built the event; never trusted.
     pub sender: Option<EventSender>,
     pub content: EventContent,
     pub expects_response: bool,
     pub reply_to: Option<String>,
+    /// The receiver's verdict on the connecting process, written only by the
+    /// event socket: any value a client sends is replaced, and events that
+    /// arrive any other way carry none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer: Option<super::peer::EventPeer>,
 }
 
 /// Longest event id accepted from outside the process.
@@ -91,6 +97,14 @@ pub fn is_valid_event_id(id: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'-'))
 }
 
+/// Content types only the daemon writes (Focus hold mode, wire contract
+/// v1.3 §3.1): a released digest and a join block. Clients key on them, so
+/// an event from outside can't carry one.
+pub const RESERVED_CONTENT_TYPES: [&str; 2] = [
+    crate::session::held::HELD_DIGEST_TYPE,
+    crate::session::held::HELD_JOIN_TYPE,
+];
+
 impl Event {
     /// Intake check for an event from outside the process (the event socket,
     /// the inbox). An id that isn't [`is_valid_event_id`] is replaced by a
@@ -101,6 +115,17 @@ impl Event {
             return None;
         }
         Some(std::mem::replace(&mut self.id, Uuid::new_v4().to_string()))
+    }
+
+    /// Intake check for an event from outside the process (the event socket,
+    /// the inbox): a content type only the daemon writes
+    /// ([`RESERVED_CONTENT_TYPES`]) becomes `message`, and the type it
+    /// carried is returned. The event is still delivered.
+    pub fn normalize_reserved_type(&mut self) -> Option<String> {
+        if !RESERVED_CONTENT_TYPES.contains(&self.content.content_type.as_str()) {
+            return None;
+        }
+        Some(std::mem::replace(&mut self.content.content_type, "message".to_string()))
     }
 
     /// Create a simple event from minimal params (for CLI / quick use).
@@ -124,6 +149,7 @@ impl Event {
             },
             expects_response: false,
             reply_to: None,
+            peer: None,
         }
     }
 }
@@ -208,5 +234,36 @@ mod tests {
         assert_eq!(e.normalize_intake_id().as_deref(), Some("x\" verified=\"true"));
         assert!(Uuid::parse_str(&e.id).is_ok(), "replaced by a uuid: {}", e.id);
         assert_eq!(e.content.text, "hi", "the event itself is kept");
+    }
+
+    /// (S1, v1.3) Only the daemon writes held_digest / held_join; from
+    /// outside they become `message`. Other types are left alone.
+    #[test]
+    fn intake_rewrites_only_the_reserved_types() {
+        for t in ["held_digest", "held_join"] {
+            let mut e = Event::simple("cli", "hi", None);
+            e.content.content_type = t.into();
+            assert_eq!(e.normalize_reserved_type().as_deref(), Some(t));
+            assert_eq!(e.content.content_type, "message");
+            assert_eq!(e.content.text, "hi", "nothing dropped");
+        }
+        for t in ["message", "subagent_completion", "held_fold", "Held_Digest"] {
+            let mut e = Event::simple("cli", "hi", None);
+            e.content.content_type = t.into();
+            assert_eq!(e.normalize_reserved_type(), None);
+            assert_eq!(e.content.content_type, t);
+        }
+    }
+
+    // P9: an event from before peers decodes without one, and an event
+    // without a peer is written without the key, as before.
+    #[test]
+    fn an_event_from_before_peers_decodes_and_writes_as_before() {
+        let mut old = serde_json::to_value(Event::simple("cli", "old", None)).unwrap();
+        old.as_object_mut().unwrap().remove("peer");
+        let back: Event = serde_json::from_value(old.clone()).unwrap();
+        assert!(back.peer.is_none());
+        assert_eq!(serde_json::to_value(&back).unwrap(), old);
+        assert!(!serde_json::to_string(&back).unwrap().contains("peer"));
     }
 }

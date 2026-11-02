@@ -23,6 +23,19 @@ pub struct SessionRegistration {
     pub socket_path: String,
     pub pid: u32,
     pub started_at: DateTime<Utc>,
+    /// The receipt protocol version the endpoint answers with
+    /// ([`super::socket::RECEIPTS_VERSION`]); 0 on cards written before
+    /// receipts existed, whose endpoints close without a reply.
+    #[serde(default)]
+    pub receipts: u32,
+    /// The registering process's start time (field 22 of its
+    /// `/proc/<pid>/stat`, in clock ticks since boot), so a receiver can
+    /// tell this process from a later one that reuses its pid. `None` on
+    /// cards from older builds and where /proc is not readable; such a
+    /// card never verifies a sender. Not part of the card's identity
+    /// (socket name, owner check): those keep the fields they always had.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_ticks: Option<u64>,
 }
 
 /// Returns the session runtime directory, creating it mode 0700 if needed.
@@ -32,9 +45,7 @@ pub struct SessionRegistration {
 /// `SYNAPS_BASE_DIR`; this avoids the 108-byte `sun_path` limit when the base
 /// directory is an EFS session path.
 pub fn registry_dir() -> PathBuf {
-    let dir = std::env::var_os("SYNAPS_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| base_dir().join("run"));
+    let dir = run_dir_path();
     if let Err(e) = std::fs::create_dir_all(&dir) {
         tracing::warn!("registry: failed to create run dir {:?}: {}", dir, e);
     }
@@ -44,6 +55,14 @@ pub fn registry_dir() -> PathBuf {
         let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
     }
     std::fs::canonicalize(&dir).unwrap_or(dir)
+}
+
+/// The session runtime directory's path, without creating it (see
+/// [`registry_dir`]).
+pub(crate) fn run_dir_path() -> PathBuf {
+    std::env::var_os("SYNAPS_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| base_dir().join("run"))
 }
 
 /// Sanitize a session ID for safe use in filenames and socket paths.
@@ -86,8 +105,35 @@ fn socket_path_in_dir(dir: &std::path::Path, session_id: &str) -> String {
 /// A permanent lock inode: never unlink this file, including during cleanup.
 /// Bounded acquisition keeps Drop and synchronous boot fail-soft under contention.
 pub(crate) fn lock_dir(dir: &std::path::Path) -> Result<std::fs::File, String> {
+    lock_registry(dir, LockMode::Writer).map_err(|f| f.reason)
+}
+
+/// How [`lock_registry`] opens and holds the registry lock.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LockMode {
+    /// Read-write, created when missing, held exclusive: may publish or
+    /// prune cards.
+    Writer,
+    /// Read-only, never created, held shared: lists cards, changes nothing.
+    /// For a process that may not write the run dir (a session under a
+    /// write sandbox): flock needs no write access.
+    Reader,
+}
+
+struct LockFailure {
+    reason: String,
+    /// A `Writer` open was refused for lack of write access (EACCES, EPERM
+    /// or EROFS), as it is for a session under a write sandbox.
+    write_denied: bool,
+}
+
+fn lock_registry(dir: &std::path::Path, mode: LockMode) -> Result<std::fs::File, LockFailure> {
+    let fail = |reason: String| LockFailure { reason, write_denied: false };
     let mut options = std::fs::OpenOptions::new();
-    options.read(true).write(true).create(true);
+    options.read(true);
+    if mode == LockMode::Writer {
+        options.write(true).create(true);
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -97,32 +143,50 @@ pub(crate) fn lock_dir(dir: &std::path::Path) -> Result<std::fs::File, String> {
     }
     let file = options
         .open(dir.join(".session-registry.lock"))
-        .map_err(|e| e.to_string())?;
-    if !file.metadata().map_err(|e| e.to_string())?.is_file() {
-        return Err("registry lock is not a regular file".into());
+        .map_err(|e| LockFailure {
+            write_denied: mode == LockMode::Writer && is_write_denial(&e),
+            reason: e.to_string(),
+        })?;
+    if !file.metadata().map_err(|e| fail(e.to_string()))?.is_file() {
+        return Err(fail("registry lock is not a regular file".into()));
     }
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        let meta = file.metadata().map_err(|e| e.to_string())?;
+        let meta = file.metadata().map_err(|e| fail(e.to_string()))?;
         // SAFETY: geteuid has no preconditions.
         if meta.uid() != unsafe { libc::geteuid() }
             || meta.nlink() != 1
             || meta.mode() & 0o777 != 0o600
         {
-            return Err("unsafe registry lock owner, links or permissions".into());
+            return Err(fail("unsafe registry lock owner, links or permissions".into()));
         }
     }
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(100);
     loop {
-        if fs4::fs_std::FileExt::try_lock_exclusive(&file).map_err(|e| e.to_string())? {
+        let locked = match mode {
+            LockMode::Writer => fs4::fs_std::FileExt::try_lock_exclusive(&file),
+            LockMode::Reader => fs4::fs_std::FileExt::try_lock_shared(&file),
+        };
+        if locked.map_err(|e| fail(e.to_string()))? {
             return Ok(file);
         }
         if std::time::Instant::now() >= deadline {
-            return Err("registry lock busy".into());
+            return Err(fail("registry lock busy".into()));
         }
         std::thread::sleep(std::time::Duration::from_millis(2));
     }
+}
+
+/// An open refused for lack of write access rather than for any other reason.
+fn is_write_denial(e: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        if e.raw_os_error() == Some(libc::EROFS) {
+            return true;
+        }
+    }
+    e.kind() == std::io::ErrorKind::PermissionDenied
 }
 
 fn same_owner(a: &SessionRegistration, b: &SessionRegistration) -> bool {
@@ -205,7 +269,7 @@ impl SessionEndpoint {
         Self::start_in(&dir, id, name, queue)
     }
 
-    fn start_in(
+    pub(crate) fn start_in(
         dir: &std::path::Path,
         id: &str,
         name: Option<String>,
@@ -220,6 +284,8 @@ impl SessionEndpoint {
             socket_path: String::new(),
             pid: std::process::id(),
             started_at: Utc::now(),
+            receipts: super::socket::RECEIPTS_VERSION,
+            start_ticks: super::peer::own_start_ticks(),
         };
         registration.socket_path = dir
             .join(generated_basename(&registration))
@@ -235,6 +301,7 @@ impl SessionEndpoint {
         let task = super::socket::serve_session_socket(
             listener,
             registration.socket_path.clone(),
+            dir.to_path_buf(),
             queue,
             shutdown.clone(),
         );
@@ -505,11 +572,13 @@ fn pid_is_alive(pid: u32) -> bool {
 }
 
 /// Files in the run dir that are never session registrations, whatever
-/// their contents: the daemon's own `daemon.json` / `daemon-<profile>.json`.
+/// their contents: the daemon's own `daemon.json` / `daemon-<profile>.json`
+/// and its `daemon[-P].<kind>.json` state files (the reload state, the
+/// crash record).
 fn is_reserved_json(path: &std::path::Path) -> bool {
-    path.file_stem()
-        .and_then(|s| s.to_str())
-        .is_some_and(|stem| stem == "daemon" || stem.starts_with("daemon-"))
+    path.file_stem().and_then(|s| s.to_str()).is_some_and(|stem| {
+        stem == "daemon" || stem.starts_with("daemon-") || stem.starts_with("daemon.")
+    })
 }
 
 /// Read all registration files, prune stale ones (dead PID), return live set.
@@ -528,19 +597,43 @@ fn list_active_sessions_in(dir: &std::path::Path) -> Vec<SessionRegistration> {
 
 /// Read every session registration in `dir`, unlink the stale ones (dead
 /// owner pid, or `own_pid` when given) and return `(live, removed)`.
+///
+/// A process that may not write `dir` (a session under a write sandbox:
+/// `synaps send`, fleet tools) can't take the writer lock. It still gets the
+/// live set, under the shared reader lock, and unlinks nothing.
 fn scan_registrations(
     dir: &std::path::Path,
     own_pid: Option<u32>,
 ) -> (Vec<SessionRegistration>, usize) {
-    let Ok(_lock) = lock_dir(dir) else {
-        return (Vec::new(), 0);
-    };
-    scan_registrations_locked(dir, own_pid)
+    match lock_registry(dir, LockMode::Writer) {
+        Ok(_lock) => scan_registrations_locked(dir, own_pid),
+        Err(f) if f.write_denied => match lock_registry(dir, LockMode::Reader) {
+            Ok(_lock) => scan_registrations_read_only(dir, own_pid),
+            Err(_) => (Vec::new(), 0),
+        },
+        Err(_) => (Vec::new(), 0),
+    }
 }
 
 fn scan_registrations_locked(
     dir: &std::path::Path,
     own_pid: Option<u32>,
+) -> (Vec<SessionRegistration>, usize) {
+    scan_cards(dir, own_pid, true)
+}
+
+/// The live set without unlinking anything (the shared reader lock is held).
+fn scan_registrations_read_only(
+    dir: &std::path::Path,
+    own_pid: Option<u32>,
+) -> (Vec<SessionRegistration>, usize) {
+    scan_cards(dir, own_pid, false)
+}
+
+fn scan_cards(
+    dir: &std::path::Path,
+    own_pid: Option<u32>,
+    prune: bool,
 ) -> (Vec<SessionRegistration>, usize) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return (Vec::new(), 0);
@@ -580,13 +673,308 @@ fn scan_registrations_locked(
             && !generated_endpoint_missing(dir, &reg)
         {
             live.push(reg);
-        } else {
+        } else if prune {
             remove_registration_files(dir, &path, &reg);
             removed += 1;
         }
     }
 
     (live, removed)
+}
+
+/// The most card files one receiver scan reads (see [`live_cards_in`]): a
+/// run dir full of cards costs a bounded amount of reading.
+pub(crate) const MAX_SCANNED_CARDS: usize = 256;
+
+/// The largest card file a receiver scan reads; a bigger one is skipped,
+/// never trusted. Real cards are a few hundred bytes.
+pub(crate) const MAX_CARD_BYTES: u64 = 64 * 1024;
+
+/// The cards a receiver scan read, and whether it read every card file in
+/// the dir.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct CardScan {
+    pub(crate) cards: Vec<SessionRegistration>,
+    /// False when the scan stopped at [`MAX_SCANNED_CARDS`], or a card file
+    /// or the dir listing couldn't be read: a card it never saw may exist.
+    pub(crate) complete: bool,
+}
+
+impl CardScan {
+    /// A scan that saw every card: exactly `cards`.
+    pub(crate) fn whole(cards: Vec<SessionRegistration>) -> Self {
+        CardScan {
+            cards,
+            complete: true,
+        }
+    }
+}
+
+/// The live cards in `dir`, read without the registry lock and without
+/// removing anything: what an event receiver matches a connecting process
+/// against. Cards are replaced by rename, so each one read is whole.
+///
+/// Bounded: at most [`MAX_SCANNED_CARDS`] card files are opened (in
+/// directory order, so beyond that some cards are never seen), and only
+/// regular files of at most [`MAX_CARD_BYTES`] are read ([`read_card_bounded`]).
+/// The scan says whether it saw every card file: not when it stopped at the
+/// limit, or when the listing or a card file couldn't be read. A file that
+/// is no card (another type, too large, not a card's JSON, gone before it was
+/// opened) is skipped and leaves the scan complete.
+pub(crate) fn live_cards_in(dir: &std::path::Path) -> CardScan {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return CardScan::whole(Vec::new()),
+        Err(_) => return CardScan::default(),
+    };
+    let mut scan = CardScan::whole(Vec::new());
+    let mut opened = 0;
+    for entry in entries {
+        let Ok(entry) = entry else {
+            scan.complete = false;
+            break;
+        };
+        let path = entry.path();
+        if path.extension().is_none_or(|e| e != "json") || is_reserved_json(&path) {
+            continue;
+        }
+        if opened == MAX_SCANNED_CARDS {
+            scan.complete = false;
+            break;
+        }
+        opened += 1;
+        match read_card_bounded(&path) {
+            CardRead::Card(reg) => {
+                if valid_card(&path, &reg) && pid_is_alive(reg.pid) {
+                    scan.cards.push(reg);
+                }
+            }
+            CardRead::NotACard => {}
+            CardRead::Unreadable => scan.complete = false,
+        }
+    }
+    scan
+}
+
+/// What reading one card file gave.
+enum CardRead {
+    Card(SessionRegistration),
+    /// No card: another file type, larger than [`MAX_CARD_BYTES`], not a
+    /// card's JSON, or gone before it was opened.
+    NotACard,
+    /// The file couldn't be opened or read: it may be a card.
+    Unreadable,
+}
+
+/// One card file, if it is a regular file (not followed through a symlink,
+/// never blocking on a FIFO) of at most [`MAX_CARD_BYTES`] that parses. The
+/// type and size come from the opened file itself, and at most one byte past
+/// the limit is read, so a card that grows after the check is still skipped.
+fn read_card_bounded(path: &std::path::Path) -> CardRead {
+    use std::io::Read;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(not(unix))]
+    if !regular_card(path) {
+        return CardRead::NotACard;
+    }
+    let file = match options.open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return CardRead::NotACard,
+        // A symlink (O_NOFOLLOW) or a socket: no card.
+        #[cfg(unix)]
+        Err(e) if matches!(e.raw_os_error(), Some(libc::ELOOP | libc::ENXIO)) => {
+            return CardRead::NotACard
+        }
+        Err(_) => return CardRead::Unreadable,
+    };
+    let Ok(meta) = file.metadata() else {
+        return CardRead::Unreadable;
+    };
+    if !meta.is_file() || meta.len() > MAX_CARD_BYTES {
+        return CardRead::NotACard;
+    }
+    let mut bytes = Vec::with_capacity(meta.len() as usize);
+    if file
+        .take(MAX_CARD_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .is_err()
+    {
+        return CardRead::Unreadable;
+    }
+    if bytes.len() as u64 > MAX_CARD_BYTES {
+        return CardRead::NotACard;
+    }
+    match serde_json::from_slice(&bytes) {
+        Ok(reg) => CardRead::Card(reg),
+        Err(_) => CardRead::NotACard,
+    }
+}
+
+/// The longest card a strict send reads; real ones are a few hundred bytes.
+const CARD_MAX: u64 = 64 * 1024;
+
+/// A card's text, from one no-follow, non-blocking open of a regular file,
+/// at most [`CARD_MAX`] bytes.
+fn read_strict_card(path: &std::path::Path) -> Option<String> {
+    use std::io::Read;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options.open(path).ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    let mut text = String::new();
+    file.take(CARD_MAX + 1).read_to_string(&mut text).ok()?;
+    (text.len() as u64 <= CARD_MAX).then_some(text)
+}
+
+/// A card value or query for a message: at most 80 characters, escaped.
+fn shown(s: &str) -> String {
+    s.chars()
+        .take(80)
+        .collect::<String>()
+        .escape_debug()
+        .to_string()
+}
+
+/// The one live session whose id or name is exactly `query`, for a strict
+/// send ([`super::send`]). Read only: no lock, and nothing is pruned,
+/// created or written.
+///
+/// Every card whose session id or name is `query` and whose owner is alive
+/// counts; a card with a dead owner is only counted for the message. Exactly
+/// one must count. Its socket must then be directly in the run dir (as the
+/// card writes it, compared as a path), be a socket (Unix; a missing one is
+/// left for the connect to report) and answer with receipts.
+pub(crate) fn resolve_exact_in(
+    query: &str,
+    dir: &std::path::Path,
+) -> Result<SessionRegistration, (super::send::Why, String)> {
+    use super::send::Why;
+    if query.is_empty() {
+        return Err((
+            Why::NoLiveSession,
+            "no session has an empty id or name".into(),
+        ));
+    }
+    let unreadable = |e: std::io::Error| {
+        let why = if e.kind() == std::io::ErrorKind::NotFound {
+            Why::NoLiveSession
+        } else {
+            Why::RegistryUnreadable
+        };
+        (
+            why,
+            format!("cannot read the session registry {}: {e}", dir.display()),
+        )
+    };
+    let run_dir = std::fs::canonicalize(dir).map_err(unreadable)?;
+    let entries = std::fs::read_dir(&run_dir).map_err(unreadable)?;
+
+    let mut live = Vec::new();
+    let mut stale = 0usize;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_none_or(|e| e != "json") || is_reserved_json(&path) {
+            continue;
+        }
+        let Some(text) = read_strict_card(&path) else {
+            continue;
+        };
+        let Ok(reg) = serde_json::from_str::<SessionRegistration>(&text) else {
+            continue;
+        };
+        if !valid_card(&path, &reg)
+            || (reg.session_id != query && reg.name.as_deref() != Some(query))
+        {
+            continue;
+        }
+        if pid_is_alive(reg.pid) {
+            live.push(reg);
+        } else {
+            stale += 1;
+        }
+    }
+
+    let reg = match live.len() {
+        0 => {
+            let note = match stale {
+                0 => String::new(),
+                1 => " (1 stale registration)".to_string(),
+                n => format!(" ({n} stale registrations)"),
+            };
+            return Err((
+                Why::NoLiveSession,
+                format!(
+                    "no live session has the id or name \"{}\"{note}",
+                    shown(query)
+                ),
+            ));
+        }
+        1 => live.remove(0),
+        n => {
+            let mut ids: Vec<String> = live.iter().map(|r| shown(&r.session_id)).collect();
+            ids.sort();
+            return Err((
+                Why::Ambiguous,
+                format!(
+                    "{n} live sessions have the id or name \"{}\": {}",
+                    shown(query),
+                    ids.join(", ")
+                ),
+            ));
+        }
+    };
+
+    let socket = std::path::Path::new(&reg.socket_path);
+    if socket.parent() != Some(run_dir.as_path()) || socket.file_name().is_none() {
+        return Err((
+            Why::SocketOutsideRunDir,
+            format!(
+                "session {}'s socket \"{}\" is not in the run dir {}",
+                shown(&reg.session_id),
+                shown(&reg.socket_path),
+                run_dir.display()
+            ),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt;
+        if let Ok(meta) = std::fs::symlink_metadata(socket) {
+            if !meta.file_type().is_socket() {
+                return Err((
+                    Why::NotASocket,
+                    format!(
+                        "session {}'s socket \"{}\" is not a socket",
+                        shown(&reg.session_id),
+                        shown(&reg.socket_path)
+                    ),
+                ));
+            }
+        }
+    }
+    if reg.receipts < super::socket::RECEIPTS_VERSION {
+        return Err((
+            Why::ReceiverTooOld,
+            format!(
+                "session {} runs a build without receipts, so a send to it can't be confirmed",
+                shown(&reg.session_id)
+            ),
+        ));
+    }
+    Ok(reg)
 }
 
 /// Resolve a query to a registration. Resolution order:
@@ -628,6 +1016,108 @@ mod tests {
     use super::*;
     use serial_test::serial;
     use tempfile::TempDir;
+
+    /// The card for `id` in `dir`, as JSON.
+    fn card_json(dir: &std::path::Path, id: &str) -> serde_json::Value {
+        let text = std::fs::read_to_string(dir.join(format!("{id}.json"))).unwrap();
+        serde_json::from_str(&text).unwrap()
+    }
+
+    #[tokio::test]
+    async fn new_cards_advertise_the_receipt_protocol() {
+        let tmp = tmp_registry();
+        let _endpoint = SessionEndpoint::start_in(
+            tmp.path(),
+            "receipts",
+            None,
+            std::sync::Arc::new(super::super::queue::EventQueue::new(10)),
+        )
+        .unwrap();
+        assert_eq!(card_json(tmp.path(), "receipts")["receipts"], 1);
+    }
+
+    #[tokio::test]
+    async fn renaming_a_session_keeps_the_receipt_flag() {
+        let tmp = tmp_registry();
+        let endpoint = SessionEndpoint::start_in(
+            tmp.path(),
+            "renamed",
+            None,
+            std::sync::Arc::new(super::super::queue::EventQueue::new(10)),
+        )
+        .unwrap();
+        endpoint.update_name(Some("new name")).unwrap();
+        let card = card_json(tmp.path(), "renamed");
+        assert_eq!(card["name"], "new name");
+        assert_eq!(card["receipts"], 1);
+    }
+
+    // A card written by a build without receipts reads as version 0, so a
+    // client that needs receipts can tell it apart.
+    #[test]
+    fn a_card_from_before_receipts_reads_as_version_0() {
+        let old = r#"{"kind":"session","session_id":"old","name":null,"socket_path":"/x.sock","pid":1,"started_at":"2024-01-01T00:00:00Z"}"#;
+        let reg: SessionRegistration = serde_json::from_str(old).unwrap();
+        assert_eq!(serde_json::to_value(&reg).unwrap()["receipts"], 0);
+    }
+
+    /// This process's start time, read from /proc here rather than through
+    /// the code under test: field 22 of /proc/self/stat.
+    #[cfg(target_os = "linux")]
+    fn start_ticks_from_proc() -> u64 {
+        let stat = std::fs::read_to_string("/proc/self/stat").unwrap();
+        let after_comm = &stat[stat.rfind(')').unwrap() + 1..];
+        after_comm.split_whitespace().nth(19).unwrap().parse().unwrap()
+    }
+
+    // A new card carries the registering process's start time, and a
+    // rename keeps it: a receiver matches a pid only together with it.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn new_cards_carry_this_processs_start_time_through_a_rename() {
+        let tmp = tmp_registry();
+        let endpoint = SessionEndpoint::start_in(
+            tmp.path(),
+            "started",
+            None,
+            std::sync::Arc::new(super::super::queue::EventQueue::new(10)),
+        )
+        .unwrap();
+        let want = start_ticks_from_proc();
+        assert_eq!(
+            card_json(tmp.path(), "started")["start_ticks"],
+            want,
+            "a new card carries its process's start time"
+        );
+        endpoint.update_name(Some("renamed")).unwrap();
+        let card = card_json(tmp.path(), "started");
+        assert_eq!(card["name"], "renamed");
+        assert_eq!(card["start_ticks"], want, "a rename keeps the start time");
+    }
+
+    // A card from an older build has no start time: it reads as None, a
+    // None is not written back as a key, and the start time is not part of
+    // a card's identity (its socket name, the owner check), so cards
+    // written before and after it existed name the same socket and owner.
+    #[test]
+    fn a_card_without_a_start_time_reads_as_none_and_keeps_its_identity() {
+        let old = r#"{"kind":"session","session_id":"old","name":null,"socket_path":"/x.sock","pid":1,"started_at":"2024-01-01T00:00:00Z","receipts":1}"#;
+        let reg: SessionRegistration = serde_json::from_str(old).unwrap();
+        assert_eq!(reg.start_ticks, None);
+        assert!(serde_json::to_value(&reg)
+            .unwrap()
+            .get("start_ticks")
+            .is_none());
+        let newer = SessionRegistration {
+            start_ticks: Some(12345),
+            ..reg.clone()
+        };
+        assert_eq!(generated_basename(&reg), generated_basename(&newer));
+        assert!(same_owner(&reg, &newer));
+        let back: SessionRegistration =
+            serde_json::from_value(serde_json::to_value(&newer).unwrap()).unwrap();
+        assert_eq!(back.start_ticks, Some(12345));
+    }
 
     #[cfg(unix)]
     #[tokio::test]
@@ -825,11 +1315,172 @@ mod tests {
             socket_path: format!("/unused/{id}.sock"),
             pid,
             started_at: Utc::now(),
+            receipts: 0,
+            start_ticks: None,
         }
     }
 
     fn dir_buf(tmp: &TempDir) -> PathBuf {
         tmp.path().to_path_buf()
+    }
+
+    // What an event receiver reads: live cards only, and nothing removed
+    // (not the dead owner's card, not a foreign file).
+    #[test]
+    fn live_cards_are_read_without_removing_anything() {
+        let tmp = tmp_registry();
+        let live = make_reg("s-live", Some("alive"), std::process::id());
+        register_session_in(&live, tmp.path()).unwrap();
+        let dead = make_reg("s-dead", None, u32::MAX);
+        register_session_in(&dead, tmp.path()).unwrap();
+        std::fs::write(tmp.path().join("notes.json"), "{}").unwrap();
+        let scan = live_cards_in(tmp.path());
+        assert!(
+            scan.complete,
+            "a file that is no card leaves the scan complete"
+        );
+        let cards = scan.cards;
+        let ids: Vec<&str> = cards.iter().map(|c| c.session_id.as_str()).collect();
+        assert_eq!(ids, ["s-live"]);
+        assert_eq!(cards[0].name.as_deref(), Some("alive"));
+        assert!(
+            tmp.path().join("s-dead.json").exists(),
+            "nothing is removed"
+        );
+        assert!(tmp.path().join("notes.json").exists());
+    }
+
+    // A receiver's scan reads at most MAX_SCANNED_CARDS card files, and says
+    // it didn't see them all.
+    #[test]
+    fn a_scan_reads_at_most_256_cards() {
+        let tmp = tmp_registry();
+        for i in 0..300 {
+            let reg = make_reg(&format!("s-{i:03}"), None, std::process::id());
+            register_session_in(&reg, tmp.path()).unwrap();
+        }
+        let scan = live_cards_in(tmp.path());
+        let n = scan.cards.len();
+        assert_eq!(n, MAX_SCANNED_CARDS, "a scan of 300 cards read {n}");
+        assert!(
+            !scan.complete,
+            "a scan that stopped at the limit says it is complete"
+        );
+    }
+
+    // B1b r2 fix: exactly MAX_SCANNED_CARDS cards are a complete scan; one
+    // more card file, even one that is no live card, makes it incomplete.
+    #[test]
+    fn a_scan_is_complete_up_to_256_cards_and_not_beyond() {
+        let tmp = tmp_registry();
+        for i in 0..MAX_SCANNED_CARDS {
+            let reg = make_reg(&format!("s-{i:03}"), None, std::process::id());
+            register_session_in(&reg, tmp.path()).unwrap();
+        }
+        std::fs::write(tmp.path().join("daemon.json"), "{}").unwrap();
+        let scan = live_cards_in(tmp.path());
+        assert_eq!(scan.cards.len(), MAX_SCANNED_CARDS);
+        assert!(
+            scan.complete,
+            "256 cards and the daemon's file: the scan saw them all"
+        );
+
+        let dead = make_reg("s-dead", None, u32::MAX);
+        register_session_in(&dead, tmp.path()).unwrap();
+        let scan = live_cards_in(tmp.path());
+        assert!(
+            !scan.complete,
+            "a 257th card file was never read, yet the scan says complete"
+        );
+    }
+
+    /// A card for `id`, owned by this process, whose file is exactly
+    /// `bytes` long (padded through its name).
+    fn card_of_size(dir: &std::path::Path, id: &str, bytes: usize) {
+        let mut reg = make_reg(id, Some(""), std::process::id());
+        let base = serde_json::to_string(&reg).unwrap().len();
+        reg.name = Some("x".repeat(bytes - base));
+        register_session_in(&reg, dir).unwrap();
+        let len = std::fs::metadata(dir.join(format!("{id}.json")))
+            .unwrap()
+            .len();
+        assert_eq!(len, bytes as u64, "the card for {id} is not {bytes} bytes");
+    }
+
+    // A card file over MAX_CARD_BYTES is skipped, never trusted; one of
+    // exactly that size is read.
+    #[test]
+    fn a_card_over_64_kib_is_skipped_and_one_at_the_limit_is_read() {
+        let tmp = tmp_registry();
+        let limit = MAX_CARD_BYTES as usize;
+        card_of_size(tmp.path(), "s-limit", limit);
+        card_of_size(tmp.path(), "s-over", limit + 1);
+        let scan = live_cards_in(tmp.path());
+        assert!(
+            scan.complete,
+            "a card file over the limit is no card; the scan saw it"
+        );
+        let cards = scan.cards;
+        let ids: Vec<&str> = cards.iter().map(|c| c.session_id.as_str()).collect();
+        assert!(!ids.contains(&"s-over"), "a card over 64 KiB was read: {ids:?}");
+        assert!(ids.contains(&"s-limit"), "a card of exactly 64 KiB was skipped: {ids:?}");
+    }
+
+    // A FIFO named like a card never blocks a scan (nothing writes to it):
+    // only regular files are read. Bounded: the scan runs on a thread, and a
+    // stuck one is released by opening the FIFO's other end.
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_named_like_a_card_never_blocks_the_scan() {
+        use std::os::unix::ffi::OsStrExt;
+        let tmp = tmp_registry();
+        let live = make_reg("s-live", None, std::process::id());
+        register_session_in(&live, tmp.path()).unwrap();
+        let fifo = tmp.path().join("s-fifo.json");
+        let c_path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: a valid NUL-terminated path inside the test's own TempDir.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0, "mkfifo");
+        let dir = tmp.path().to_path_buf();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(live_cards_in(&dir));
+        });
+        let got = rx.recv_timeout(std::time::Duration::from_secs(5));
+        if got.is_err() {
+            let _writer = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&fifo);
+        }
+        let scan = got.expect("a FIFO named like a card blocked the scan for 5 s");
+        assert!(scan.complete, "a FIFO is no card; the scan saw it");
+        let ids: Vec<&str> = scan.cards.iter().map(|c| c.session_id.as_str()).collect();
+        assert_eq!(ids, ["s-live"]);
+    }
+
+    // B1b r2 fix: a card file that can't be read may be a card, so the scan
+    // says it didn't see every card. The file is in the test's own TempDir.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_card_file_makes_the_scan_incomplete() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tmp_registry();
+        let live = make_reg("s-live", None, std::process::id());
+        register_session_in(&live, tmp.path()).unwrap();
+        let locked = tmp.path().join("s-locked.json");
+        std::fs::write(&locked, "{}").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::File::open(&locked).is_ok() {
+            println!("EACCES not real here (root?): case skipped");
+            return;
+        }
+        let scan = live_cards_in(tmp.path());
+        assert!(
+            !scan.complete,
+            "an unreadable card file left the scan complete"
+        );
+        let ids: Vec<&str> = scan.cards.iter().map(|c| c.session_id.as_str()).collect();
+        assert_eq!(ids, ["s-live"]);
     }
 
     #[test]
@@ -899,6 +1550,24 @@ mod tests {
 
         let found = find_session_registration_in("dup-aaaa", &dir);
         assert!(found.is_none(), "ambiguous prefix should return None");
+    }
+
+    /// The daemon's own run-dir files are never read as session cards.
+    #[test]
+    fn the_daemons_state_files_are_reserved_and_session_ids_are_not() {
+        let p = std::path::Path::new;
+        for reserved in [
+            "/r/daemon.json",
+            "/r/daemon-work.json",
+            "/r/daemon.live.json",
+            "/r/daemon.reload.json",
+            "/r/daemon-work.live.json",
+        ] {
+            assert!(is_reserved_json(p(reserved)), "{reserved}");
+        }
+        for card in ["/r/20261019-120800-ab12.json", "/r/daemonic.json", "/r/my.daemon.json"] {
+            assert!(!is_reserved_json(p(card)), "{card}");
+        }
     }
 
     /// Bug: `synaps send` used to unlink every `run/*.json` it could not
@@ -1038,6 +1707,8 @@ mod tests {
             socket_path: socket_path_in_dir(dir, id),
             pid,
             started_at: Utc::now(),
+            receipts: 0,
+            start_ticks: None,
         };
         let _ = std::fs::remove_file(&reg.socket_path);
         let _socket = std::os::unix::net::UnixListener::bind(&reg.socket_path).unwrap();
@@ -1201,6 +1872,67 @@ mod tests {
         let path = dir.join("perms-check-01.json");
         let perms = std::fs::metadata(&path).unwrap().permissions();
         assert_eq!(perms.mode() & 0o777, 0o600, "registry file should be 0600");
+    }
+
+    /// Under a real Landlock domain that refuses every write (LOCAL kernel
+    /// only, opt in with SYNAPS_TEST_LANDLOCK=1), as for a session under a
+    /// write sandbox: lookups still find and reach the live peer, and the
+    /// scan unlinks nothing. Without the reader lock, `synaps send` found no
+    /// session there and fell back to an inbox it couldn't write either.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn registry_local_confined_reader_finds_live_peers_and_unlinks_nothing() {
+        use crate::sandbox::landlock::{abi_version, run_confined, Ruleset, Tag, MIN_ABI};
+        if std::env::var("SYNAPS_TEST_LANDLOCK").as_deref() != Ok("1") {
+            return;
+        }
+        match abi_version() {
+            Ok(abi) if abi >= MIN_ABI => {}
+            other => panic!("SYNAPS_TEST_LANDLOCK=1 but Landlock is unusable here: {other:?}"),
+        }
+        let tmp = tmp_registry();
+        let dir = dir_buf(&tmp);
+        let peer = SessionEndpoint::start_in(
+            &dir,
+            "peer-01",
+            Some("peer".into()),
+            std::sync::Arc::new(super::super::queue::EventQueue::new(10)),
+        )
+        .unwrap();
+        register_session_in(&make_reg("stale-01", None, 999999), &dir).unwrap();
+        let stale = dir.join("stale-01.json");
+        assert!(stale.exists());
+        let socket = peer.registration.socket_path.clone();
+        let rs = Ruleset::new().expect("ruleset");
+        let got = run_confined(&rs, &Tag::next(), || {
+            let writer = std::fs::OpenOptions::new()
+                .write(true)
+                .open(dir.join(".session-registry.lock"))
+                .map(|_| ())
+                .map_err(|e| e.kind());
+            let by_id = find_session_registration_in("peer-01", &dir).map(|r| r.session_id);
+            let by_name = find_session_registration_in("peer", &dir).map(|r| r.session_id);
+            let live: Vec<String> = list_active_sessions_in(&dir)
+                .into_iter()
+                .map(|r| r.session_id)
+                .collect();
+            let connect = std::os::unix::net::UnixStream::connect(&socket)
+                .map(|_| ())
+                .map_err(|e| e.kind());
+            (writer, by_id, by_name, live, connect)
+        })
+        .expect("confined thread");
+        let (writer, by_id, by_name, live, connect) = got;
+        assert_eq!(writer, Err(std::io::ErrorKind::PermissionDenied), "the domain refuses the writer lock");
+        assert_eq!(by_id.as_deref(), Some("peer-01"));
+        assert_eq!(by_name.as_deref(), Some("peer-01"));
+        assert_eq!(live, ["peer-01"], "the stale card is not live");
+        assert_eq!(connect, Ok(()), "the peer's socket takes the connection");
+        assert!(stale.exists(), "the confined scan unlinked nothing");
+        // Control: an unconfined scan prunes it.
+        assert_eq!(list_active_sessions_in(&dir).len(), 1);
+        assert!(!stale.exists(), "an unconfined scan prunes the stale card");
+        drop(peer);
     }
 }
 
