@@ -42,7 +42,7 @@ impl Tool for SubagentStartTool {
     }
 
     fn parameters(&self) -> Value {
-        json!({
+        super::launch::with_rollover_param(json!({
             "type": "object",
             "properties": {
                 "agent": {
@@ -89,10 +89,28 @@ impl Tool for SubagentStartTool {
                 }
             },
             "required": ["task"]
-        })
+        }), super::launch::WORKER_ROLLOVER)
     }
 
     async fn execute(&self, params: Value, ctx: ToolContext) -> Result<String> {
+        self.dispatch(params, ctx, |wanted| wanted.then(super::oneshot::RecordSite::live))
+            .await
+    }
+}
+
+impl SubagentStartTool {
+    /// Start the worker. `site` is told whether the run wants worker
+    /// rollover ([`super::launch::wants_rollover`]) and says where a run
+    /// with a plan keeps its records; `None` runs it without one, as
+    /// before. In production the run gets a plan only when it wants one
+    /// (`execute`: at the live site); a test may give it one. A
+    /// start takes only the site's root and process directory.
+    pub(super) async fn dispatch(
+        &self,
+        params: Value,
+        ctx: ToolContext,
+        site: impl FnOnce(bool) -> Option<super::oneshot::RecordSite>,
+    ) -> Result<String> {
         // One config snapshot for the whole spawn (`spawn_config`).
         let config = super::spawn_config();
         let thinking = super::resolve_subagent_thinking(&params, None, &config)?;
@@ -101,6 +119,10 @@ impl Tool for SubagentStartTool {
             .as_str()
             .ok_or_else(|| RuntimeError::Tool("Missing 'task' parameter".to_string()))?
             .to_string();
+        // The caller's opt-out of worker rollover (§2), checked before
+        // anything else happens once worker rollover is built in.
+        let rollover = super::launch::context_rollover_param(&params, super::launch::WORKER_ROLLOVER)
+            .map_err(RuntimeError::Tool)?;
 
         // Treat blank / whitespace / control-char strings as absent.
         // Some model providers serialize "unset" as "" rather than omitting the field,
@@ -132,6 +154,17 @@ impl Tool for SubagentStartTool {
                 ));
             }
         };
+        // Context admission (request_size): measured and reported, never
+        // refused; before any id or reservation exists.
+        let admitted = super::request_size::admit_fresh(
+            super::request_size::Fresh::Start,
+            &ctx,
+            requested_model,
+            &system_prompt,
+            &[Arc::new(json!({"role": "user", "content": task.clone()}))],
+            &super::subagent_label(agent_name.as_deref(), params["name"].as_str()),
+        )
+        .await;
         let subagent_id = NEXT_SUBAGENT_ID.fetch_add(1, Ordering::Relaxed);
         let handle_id = format!("sa_{}", subagent_id);
         let orchestration = ctx
@@ -145,24 +178,96 @@ impl Tool for SubagentStartTool {
         let decision = orchestration
             .resolve_and_authorize(&handle_id, requested_model)
             .map_err(|error| {
-                orchestration
-                    .release_delegation(&handle_id, ctx.capabilities.delegation_parent.as_deref());
+                // Refused before launch: release the edge and drop its owner entry.
+                orchestration.abandon_delegation(&handle_id);
                 RuntimeError::Tool(error.to_string())
             })?;
         let model = decision.model.as_str().to_owned();
+        let label = super::subagent_label(agent_name.as_deref(), params["name"].as_str());
+        // Small-watcher admission, the one call here: a polling task on a large
+        // model is refused with a ready `wait`; on a small model it runs as a
+        // watch worker under a finite lease.
+        let watch_admitted = match super::watch_admission::admit_dispatch(
+            "subagent_start",
+            &super::watch_admission::Dispatch {
+                request: super::watch_admission::WatchRequest {
+                    name: Some(&label),
+                    task: &task,
+                    explicit_write_policy: params["write_policy"]["mode"].as_str(),
+                },
+                requested_model,
+                resolved_model: &model,
+            },
+            None,
+            None,
+        )
+        .await
+        {
+            Ok(watch_admitted) => watch_admitted,
+            Err(refusal) => {
+                orchestration.rollback(&handle_id);
+                orchestration
+                    .release_delegation(&handle_id, ctx.capabilities.delegation_parent.as_deref());
+                return Ok(refusal);
+            }
+        };
+        let lease = watch_admitted.watch;
         let codex_parent_plan = ctx.capabilities.codex_parent_plan.clone();
         let memory_backend = ctx.capabilities.memory_backend.clone();
         let session_allow_all = ctx.capabilities.session_allow_all.clone();
         let telemetry = ctx.capabilities.telemetry.clone();
         let workspace = super::WorkerWorkspace::from_capabilities(&ctx.capabilities);
+        let worker_hooks = super::WorkerHooks::of(&ctx.capabilities, &handle_id);
         let timeout_secs = params["timeout"]
             .as_u64()
             .unwrap_or(ctx.limits.subagent_timeout);
+        let timeout_secs = lease.map_or(timeout_secs, |(l, _)| l.clamp_timeout(timeout_secs));
 
-        let label = super::subagent_label(agent_name.as_deref(), params["name"].as_str());
         let telemetry = telemetry.map(|t| t.for_worker(&label, &handle_id));
         let task_preview: String = task.chars().take(80).collect();
         let task_full = task.clone();
+        // Child spend: the run's lease. Refused before launch (the
+        // delegating run was sealed, or the session is ending): undo the
+        // authorization and the reservation.
+        let spend_lease = super::spend_lease(&ctx, &handle_id, &label).map_err(|refused| {
+            orchestration.rollback(&handle_id);
+            orchestration.abandon_delegation(&handle_id);
+            RuntimeError::Tool(refused.to_string())
+        })?;
+        // Worker rollover (on since slice 9, when the run wants it): the
+        // run's records, on the binding the worker runs on.
+        // The parent's live context settings at this call (§2).
+        let worker_context = ctx.capabilities.worker_context.clone();
+        let site = site(super::launch::wants_rollover(worker_context.as_ref(), rollover));
+        let plan = site.map(|site| super::launch::LaunchPlan {
+            root: site.root,
+            process_dir: site.process_dir,
+            handle_id: handle_id.clone(),
+            session: ctx.capabilities.session_id.clone(),
+            // The binding the worker runs on: the policy's fallback
+            // (`apply_subagent_runtime_policy`), from this spawn's one
+            // config snapshot and the worker's cwd.
+            binding: memory_backend.clone().unwrap_or_else(|| {
+                crate::memory_backend::MemoryBinding::from_config_with_cwd(
+                    &config.memory_backend,
+                    workspace.cwd.clone().or_else(|| std::env::current_dir().ok()),
+                )
+            }),
+            meta: super::record::WorkerMeta {
+                agent_name: label.clone(),
+                model: model.clone(),
+                system_prompt: system_prompt.clone(),
+                timeout_secs,
+                thinking: Some(thinking.as_str().into()),
+                watch_usage: lease.map(|(_, used)| used.into()),
+            },
+            lineage: None,
+            ledger: Default::default(),
+            context: super::launch::worker_context(worker_context.as_ref(), &model),
+            grant: None,
+            tools: None,
+            evicted_windows: 0,
+        });
 
         tracing::info!(
             "subagent_start: dispatching '{}' (id={}) model={}",
@@ -183,6 +288,7 @@ impl Tool for SubagentStartTool {
                 .clone()
                 .or_else(|| std::env::current_dir().ok()),
             thinking: Some(thinking.as_str().into()),
+            watch_usage: lease.map(|(_, used)| used),
         });
 
         state.write().unwrap().archive_dir = Some(super::archive::process_dir());
@@ -215,6 +321,7 @@ impl Tool for SubagentStartTool {
         let parent_queue = ctx.capabilities.event_queue.clone();
         let handle_id_inner = handle_id.clone();
         let child_parent_id = handle_id.clone();
+        let child_route = crate::session::child_events::worker_route(ctx.channels.tx_delta.as_ref(), &handle_id);
 
         // ── Build and register handle BEFORE spawning ─────────────────────────
         // This closes the publish-before-register race: finalize_subagent can
@@ -251,6 +358,8 @@ impl Tool for SubagentStartTool {
         }
 
         // ── Spawn subagent thread (mirrors subagent.rs) ────────────────────────
+        let first_request =
+            admitted.first_request(super::request_size::Kind::Start, &handle_id, &model);
         let thread_handle = std::thread::spawn(move || {
             // Pre-clone for finalizer — catch_unwind moves state_t and label_inner
             let state_for_finalizer = Arc::clone(&state_t);
@@ -300,6 +409,15 @@ impl Tool for SubagentStartTool {
                             telemetry.as_ref(),
                             &workspace,
                         );
+                        let mut lease_binds_rounds = false;
+                        if let Some((lease, _)) = lease {
+                            let mut budget = runtime.turn_budget().clone();
+                            lease_binds_rounds = lease.apply_to(&mut budget);
+                            runtime.set_turn_budget(budget);
+                        }
+                        // After the policy: its transform view (or the
+                        // `subagent_transform_hooks = off` detach) is kept.
+                        worker_hooks.apply(&mut runtime, &config);
                         runtime.set_system_prompt(super::compose_system_prompt(
                             system_prompt,
                             runtime.memory_backend_is_axel(),
@@ -332,6 +450,8 @@ impl Tool for SubagentStartTool {
                             subagent_id,
                             &label_a,
                         );
+                        runtime.set_child_route(child_route.clone());
+                        super::install_spend(&mut runtime, spend_lease);
 
                         let cancel = crate::CancellationToken::new();
                         let cancel_inner = cancel.clone();
@@ -341,26 +461,59 @@ impl Tool for SubagentStartTool {
                         });
 
                         let cancel_on_timeout = cancel.clone();
-                        let stream = runtime.run_stream_with_messages(
-                                initial_messages,
+                        // A run with a plan shares one run clock with its
+                        // runtime (§5); without one nothing changes.
+                        let run_clock = super::launch::arm_run_clock(
+                            plan.as_ref(),
+                            &mut runtime,
+                            timeout_secs,
+                        );
+                        // Its requests book into the run's ledger only once
+                        // the run is a v2 run (§6).
+                        super::launch::arm_request_ledger(plan.as_ref(), &mut runtime);
+                        // A v2 run retrieves its own lineage's history
+                        // only (8g): its registry as configured, for its
+                        // own grant's tools to join.
+                        let mut plan = plan;
+                        super::launch::arm_owned_history(plan.as_mut(), &runtime, &config).await;
+                        let drive_outcome = {
+                        let runtime = &mut runtime;
+                        // A v2 run's runtime is bound to its run and gets
+                        // the parent's settings resolved for it (§2, §7.2)
+                        // before its first inference; a run without
+                        // rollover gets nothing.
+                        let start = move |opening: Vec<crate::SharedMessage>,
+                                          start: Option<super::launch::WorkerStart>| async move {
+                            if let Some(start) = start {
+                                super::launch::start_v2_runtime(runtime, start, &opening);
+                            }
+                            runtime.run_stream_with_messages(
+                                opening,
                                 cancel,
                                 Some(steer_rx),
                                 None,
                                 false,
-                            ).await;
+                            )
+                            .await
+                        };
 
-                        let drive_outcome = super::drive::WorkerDrive {
+                        let drive = super::drive::WorkerDrive {
                             state: Arc::clone(&state_a),
                             tx_events: tx_events_a.clone(),
                             subagent_id,
                             label: label_a.clone(),
                             model: model_a.clone(),
                             timeout_secs,
+                            run_clock,
                             cancel: cancel_on_timeout,
                             task: task_for_timeout,
-                        }
-                        .run(stream)
-                        .await;
+                            first_request: Some(first_request),
+                            lease,
+                            lease_binds_rounds,
+                            shape: super::drive::DriveShape::Reactive,
+                        };
+                        super::launch::run_worker(drive, initial_messages, plan, start).await
+                        };
                         // Date this run's cache for a later resume (cold check).
                         super::archive::record_cache_anchor(&state_a, runtime.cache_anchor());
                         drive_outcome
@@ -474,12 +627,13 @@ impl Tool for SubagentStartTool {
         // marked running; its own retire attempt was then too early.
         super::finalize::retire_if_cancelled(&state, orchestration, &handle_id);
 
-        Ok(json!({
+        let mut reply = json!({
             "handle_id":  handle_id,
             "agent_name": label,
             "status":     "running"
-        })
-        .to_string())
+        });
+        admitted.add_reply_fields(&mut reply);
+        Ok(reply.to_string())
     }
 }
 
@@ -514,31 +668,101 @@ mod tests {
         );
     }
 
-    /// These tests launch a real worker thread. Run unpinned, it read the
-    /// developer's real `auth.json` (and could reach the provider), and wrote
-    /// `logs/subagents` and `subagent-history` under the real `~/.synaps-cli`,
-    /// after the test returned. Pin an empty base dir and clear the
-    /// environment's provider credentials/endpoints (`OfflineProviderEnv`), so
-    /// the worker fails at auth, offline; keep both until it has exited.
-    fn join_worker(registry: &Mutex<SubagentRegistry>, handle_id: &str) {
-        let thread = registry
+    /// A test's isolated base directory and the registry of the workers it
+    /// dispatches; the one owner of joining them. These tests launch a real
+    /// worker thread: run unpinned, it read the developer's real `auth.json`
+    /// (and could reach the provider) and wrote `logs/subagents` and
+    /// `subagent-history` under the real `~/.synaps-cli` after the test
+    /// returned. So the scope pins an empty base directory and clears the
+    /// environment's provider credentials and endpoints
+    /// (`OfflineProviderEnv`): the worker fails at auth, offline. Dropping it
+    /// cancels and joins every worker (bounded), also when the test fails
+    /// first, and only then restores the environment and the ambient base
+    /// directory. A worker that does not stop in time keeps both (they are
+    /// leaked, never restored under a live worker) and is reported.
+    struct WorkerScope {
+        registry: Arc<Mutex<SubagentRegistry>>,
+        base: Option<crate::test_env::BaseDirGuard>,
+        offline: Option<crate::test_env::OfflineProviderEnv>,
+    }
+
+    impl WorkerScope {
+        fn new() -> Self {
+            Self {
+                base: Some(crate::test_env::BaseDirGuard::new()),
+                offline: Some(crate::test_env::OfflineProviderEnv::new()),
+                registry: Arc::new(Mutex::new(SubagentRegistry::new())),
+            }
+        }
+    }
+
+    impl Drop for WorkerScope {
+        fn drop(&mut self) {
+            let threads: Vec<_> = {
+                let mut reg = self.registry.lock().unwrap_or_else(|p| p.into_inner());
+                reg.iter_mut_handles()
+                    .filter_map(|handle| {
+                        handle.cancel();
+                        handle.thread_handle.take()
+                    })
+                    .collect()
+            };
+            let mut outcomes = Vec::new();
+            for thread in threads {
+                let (done_tx, done_rx) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    let _ = done_tx.send(thread.join().is_ok());
+                });
+                outcomes.push(done_rx.recv_timeout(std::time::Duration::from_secs(60)));
+            }
+            if outcomes.iter().any(|o| o.is_err()) {
+                // Still running: it may write below the isolated base or
+                // read the provider environment.
+                std::mem::forget(self.offline.take());
+                std::mem::forget(self.base.take());
+            }
+            if !std::thread::panicking() && outcomes.iter().any(|o| *o != Ok(true)) {
+                panic!("a cancelled worker did not stop cleanly: {outcomes:?}");
+            }
+        }
+    }
+
+    /// Stop a dispatched worker and wait until its thread has ended, so
+    /// everything it writes (its archive under the base directory read at
+    /// spawn) has landed. Joining stays with the [`WorkerScope`].
+    async fn stop_and_join(registry: &Mutex<SubagentRegistry>, handle_id: &str) {
+        registry
             .lock()
             .unwrap()
             .get_mut(handle_id)
-            .and_then(|h| h.thread_handle.take());
-        if let Some(thread) = thread {
-            let _ = thread.join();
+            .expect("registered")
+            .cancel();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            let finished = registry
+                .lock()
+                .unwrap()
+                .get(handle_id)
+                .and_then(|h| h.thread_handle.as_ref().map(|t| t.is_finished()))
+                .expect("the thread handle is attached before dispatch returns");
+            if finished {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a cancelled worker stops within its 1 s timeout"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
     }
 
     #[tokio::test]
     #[serial_test::serial(synaps_base_dir)]
     async fn test_subagent_start_blank_agent_uses_system_prompt() {
-        let _base = crate::test_env::BaseDirGuard::new();
-        let _offline = crate::test_env::OfflineProviderEnv::new();
+        let scope = WorkerScope::new();
+        let registry = &scope.registry;
         let tool = SubagentStartTool;
         let mut ctx = create_tool_context();
-        let registry = Arc::new(Mutex::new(SubagentRegistry::new()));
         ctx.capabilities.subagent_registry = Some(registry.clone());
 
         let params = json!({
@@ -558,17 +782,16 @@ mod tests {
         assert_eq!(body["agent_name"], "inline");
         let handle_id = body["handle_id"].as_str().unwrap_or_default();
         assert!(handle_id.starts_with("sa_"));
-        join_worker(&registry, handle_id);
+        stop_and_join(registry, handle_id).await;
     }
 
     #[tokio::test]
     #[serial_test::serial(synaps_base_dir)]
     async fn test_subagent_start_inline_name_labels_the_handle() {
-        let _base = crate::test_env::BaseDirGuard::new();
-        let _offline = crate::test_env::OfflineProviderEnv::new();
+        let scope = WorkerScope::new();
+        let registry = &scope.registry;
         let tool = SubagentStartTool;
         let mut ctx = create_tool_context();
-        let registry = Arc::new(Mutex::new(SubagentRegistry::new()));
         ctx.capabilities.subagent_registry = Some(registry.clone());
 
         let params = json!({
@@ -583,13 +806,138 @@ mod tests {
         let body: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(body["agent_name"], "gif-recorder");
         let handle_id = body["handle_id"].as_str().unwrap();
-        {
-            let reg = registry.lock().unwrap();
-            assert_eq!(
-                reg.get(handle_id).expect("registered").agent_name,
-                "gif-recorder"
-            );
-        }
-        join_worker(&registry, handle_id);
+        assert_eq!(
+            registry
+                .lock()
+                .unwrap()
+                .get(handle_id)
+                .expect("registered")
+                .agent_name,
+            "gif-recorder"
+        );
+        stop_and_join(registry, handle_id).await;
     }
+
+    /// The worker's rollover notice once its thread has ended.
+    fn notice_of(registry: &Mutex<SubagentRegistry>, handle_id: &str) -> Option<String> {
+        let reg = registry.lock().unwrap();
+        let state = &reg.get(handle_id).expect("registered").state;
+        let notice = state.read().unwrap().rollover_notice.clone();
+        drop(reg);
+        notice
+    }
+
+    /// S0 (scaffolding for slice 9): a test site gives a start a plan
+    /// whatever the run wants, as the oneshot's does; without the parent's
+    /// settings it falls back to rollover off and says why. The production
+    /// start gives none while worker rollover is off (mutants: the start
+    /// ignores its site; `execute` gives a site unasked).
+    #[tokio::test]
+    #[serial_test::serial(synaps_base_dir)]
+    async fn s0_a_test_site_gives_a_start_a_plan() {
+        let scope = WorkerScope::new();
+        let registry = &scope.registry;
+        let params = json!({
+            "system_prompt": "You are a concise test subagent. Reply with only: ok",
+            "task": "Say ok",
+            "model": "anthropic/claude-sonnet-4-6",
+            "timeout": 1
+        });
+        let mut notices = Vec::new();
+        for planned in [false, true] {
+            let mut ctx = create_tool_context();
+            ctx.capabilities.subagent_registry = Some(registry.clone());
+            assert!(ctx.capabilities.worker_context.is_none());
+            let reply = if planned {
+                SubagentStartTool
+                    .dispatch(params.clone(), ctx, |_| {
+                        Some(super::super::oneshot::RecordSite::live())
+                    })
+                    .await
+            } else {
+                SubagentStartTool.execute(params.clone(), ctx).await
+            }
+            .expect("dispatch");
+            let body: serde_json::Value = serde_json::from_str(&reply).unwrap();
+            let handle_id = body["handle_id"].as_str().unwrap().to_owned();
+            stop_and_join(registry, &handle_id).await;
+            notices.push(notice_of(registry, &handle_id));
+        }
+        assert_eq!(
+            notices,
+            [
+                None,
+                Some(
+                    "rollover disabled for this worker: the parent's context settings are not available"
+                        .to_owned()
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_polling_start_on_a_large_model_is_refused_and_registers_nothing() {
+        let mut ctx = create_tool_context();
+        let registry = Arc::new(Mutex::new(SubagentRegistry::new()));
+        ctx.capabilities.subagent_registry = Some(registry.clone());
+        let orchestration = ctx.capabilities.orchestration.clone().expect("policy");
+        // A worker dispatched earlier, and a parent the refused start would
+        // have nested under: the refusal must leave both exactly as they are.
+        orchestration
+            .resolve_and_authorize("sa_earlier", None)
+            .expect("an earlier dispatch");
+        orchestration
+            .reserve_delegation("sa_parent", None)
+            .expect("a parent edge");
+        ctx.capabilities.delegation_parent = Some("sa_parent".into());
+        let handles_before = orchestration.unreconciled_runtime_handles();
+        assert!(handles_before.contains("sa_earlier"), "{handles_before:?}");
+        let descendants_before = orchestration.delegation_descendants();
+        let gate_before = orchestration.completion_gate();
+        let params = json!({
+            "system_prompt": "You watch a build.",
+            "name": "t-build-wait",
+            "task": "sleep 60, then tail -5 /var/tmp/build/out.log and report the last line",
+            "model": "anthropic/claude-sonnet-4-6",
+        });
+        let text = SubagentStartTool
+            .execute(params, ctx)
+            .await
+            .expect("a refusal is a tool result");
+        assert!(
+            text.starts_with("subagent_start refused (polling task)"),
+            "{text}"
+        );
+        assert!(text.contains("wait"), "{text}");
+        assert!(text.contains("/var/tmp/build/out.log"), "{text}");
+        assert!(registry.lock().unwrap().list_active().is_empty());
+        // The dispatch it authorized is rolled back (a Dispatched worker is
+        // unreconciled until then), and its tree edge is released.
+        assert_eq!(
+            orchestration.unreconciled_runtime_handles(),
+            handles_before,
+            "the refused dispatch was rolled back"
+        );
+        assert_eq!(orchestration.delegation_descendants(), descendants_before);
+        assert_eq!(orchestration.completion_gate(), gate_before);
+    }
+}
+
+#[cfg(test)]
+mod worker_gate {
+    use super::*;
+    include!("worker_gate_tests.rs");
+
+    /// Child spend: a reactive worker in a host with a sink books through
+    /// its own run's tap, and a resume is a new run.
+    mod spend {
+        use super::*;
+        include!("reactive_spend_tests.rs");
+    }
+}
+
+#[cfg(test)]
+mod reactive_gate {
+    use super::*;
+    include!("reactive_gate_tests.rs");
 }

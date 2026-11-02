@@ -1,0 +1,8 @@
+text: Subagent 'worker' (sa_g1) finished with status 'completed' after <secs>. Call subagent_collect with handle_id "sa_g1" to retrieve the full result. Preview: lookingdone
+data: {
+  "agent_name": "worker",
+  "duration_secs": <secs>,
+  "handle_id": "sa_g1",
+  "status": "completed",
+  "subagent_id": 5
+}

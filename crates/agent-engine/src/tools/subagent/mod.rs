@@ -1,16 +1,32 @@
 //! Subagent tools — oneshot and reactive (start/status/steer/collect/resume).
 
+pub(crate) mod admission;
 pub(crate) mod archive;
+pub(crate) mod checkpoint;
+pub(crate) mod context_policy;
+pub(crate) mod crash_head;
 pub mod authorize_model;
 pub mod collect;
 mod drive;
 pub(crate) mod finalize;
+mod launch;
+pub(crate) mod ledger;
+pub(crate) mod lineage;
 pub mod models;
 mod oneshot;
+mod persist;
+pub(crate) mod record;
+pub(crate) mod record_file;
+mod request_size;
+pub(crate) mod record_store;
 pub mod resume;
+pub(crate) mod retrieval;
 pub mod start;
 pub mod status;
 pub mod steer;
+pub(crate) mod watch_admission;
+#[cfg(test)]
+pub(crate) mod test_fixtures;
 
 pub use authorize_model::SubagentModelAuthorizeTool;
 pub use collect::SubagentCollectTool;
@@ -20,6 +36,11 @@ pub use resume::SubagentResumeTool;
 pub use start::SubagentStartTool;
 pub use status::SubagentStatusTool;
 pub use steer::SubagentSteerTool;
+
+/// Whether worker context rollover is built on ([`launch::WORKER_ROLLOVER`]),
+/// on since slice 9. Built off, a runtime builds no worker context policy
+/// for its tool calls (strict r1 B-SF): nothing would read one.
+pub(crate) const WORKER_ROLLOVER: bool = launch::WORKER_ROLLOVER;
 
 /// Longest display name kept for an inline subagent.
 const MAX_LABEL_CHARS: usize = 32;
@@ -226,6 +247,138 @@ pub(crate) fn apply_subagent_runtime_policy(
     runtime.set_context_window(config.context_window);
 }
 
+/// The calling turn's `before_tool_call` route: its hook bus and its
+/// `auto_approve_confirms`. Carries no prompt handle (the caller's own tool
+/// context has that).
+#[derive(Clone)]
+pub(crate) struct CallerHooks {
+    pub(crate) bus: std::sync::Arc<crate::extensions::hooks::HookBus>,
+    pub(crate) auto_approve: bool,
+    /// The caller's memory-only policy (globs only, never result text). A
+    /// worker inherits it and reads the caller's shared session list at each
+    /// check; the worker's raw results stay in its own RAM.
+    pub(crate) memory_only: crate::runtime::memory_only::Policy,
+}
+
+tokio::task_local! {
+    /// In scope while one of a turn's tool calls runs: the stream wraps each
+    /// tool execution in it. A worker started by that call routes its own
+    /// `before_tool_call` hooks through it ([`WorkerHooks`]).
+    pub(crate) static CALLER_HOOKS: CallerHooks;
+}
+
+/// Where a worker's `before_tool_call` hooks go: its caller's hook chain,
+/// run on the caller's runtime, with the caller's conversation id and the
+/// worker's id on each event; and a `Confirm` is answered by the caller's
+/// confirm step (its prompt, its auto-approve policy, its "Allow all"
+/// latch, which the worker already shares). So a worker's call gets the
+/// answer its caller would get for the same call.
+///
+/// Captured from the caller's tool call (the stream's [`CALLER_HOOKS`] scope
+/// and tool context) before the worker thread starts, and applied to the
+/// worker's runtime before its stream, on both runtime paths (host-built
+/// and legacy fresh). `subagent.tool_hooks = off` leaves the worker with an
+/// empty hook bus (no hooks run for its calls, as before). A caller outside
+/// a stream tool call (no scope) also leaves it empty.
+#[derive(Clone)]
+pub(crate) struct WorkerHooks {
+    route: Option<(CallerHooks, tokio::runtime::Handle)>,
+    session_id: Option<String>,
+    prompt: Option<crate::tools::SecretPromptHandle>,
+    subagent_id: String,
+}
+
+impl WorkerHooks {
+    /// Capture the route of the calling tool call; `subagent_id` is the
+    /// worker's id as its caller sees it (`sa_N`). Must run in the calling
+    /// tool call's task (where [`CALLER_HOOKS`] is in scope), not on the
+    /// worker's thread.
+    pub(crate) fn of(caller: &crate::tools::ToolCapabilities, subagent_id: &str) -> Self {
+        let route = CALLER_HOOKS
+            .try_with(Clone::clone)
+            .ok()
+            .zip(tokio::runtime::Handle::try_current().ok());
+        Self {
+            route,
+            session_id: caller.session_id.clone(),
+            prompt: caller.secret_prompt.clone(),
+            subagent_id: subagent_id.to_string(),
+        }
+    }
+
+    /// Route `runtime`'s `before_tool_call` hooks to the caller, unless the
+    /// operator turned worker hooks off or there is no caller route.
+    pub(crate) fn apply(&self, runtime: &mut crate::Runtime, config: &crate::config::SynapsConfig) {
+        // Data-handling policy, not a hook: inherited even with worker hooks off.
+        if let Some((caller, _)) = &self.route {
+            runtime.inherit_memory_only_policy(&caller.memory_only);
+        }
+        if !config.subagent.tool_hooks {
+            return;
+        }
+        let Some((caller, host)) = &self.route else {
+            return;
+        };
+        // `bind_worker_hooks` replaces the bus wholesale, so keep the host's
+        // output-transform view already on the runtime (the spawn path's
+        // `worker_hook_bus`, or the empty bus `subagent_transform_hooks = off`
+        // left): it only ever narrows. Must run after
+        // `apply_subagent_runtime_policy`.
+        let route = crate::extensions::hooks::HookBus::worker_route(
+            std::sync::Arc::clone(&caller.bus),
+            host.clone(),
+            self.session_id.clone(),
+            self.subagent_id.clone(),
+        )
+        .with_worker_transforms_of(runtime.hook_bus());
+        runtime.bind_worker_hooks(
+            std::sync::Arc::new(route),
+            crate::runtime::WorkerConfirm {
+                prompt: self.prompt.clone(),
+                auto_approve: caller.auto_approve,
+            },
+        );
+    }
+}
+
+/// Takes the operator's `disabled_tools` out of a worker registry. Both
+/// worker paths call it on the registry they build (`EngineHost::worker_registry`
+/// and the legacy `spawn_runtime`): a worker's builtins are rebuilt from
+/// scratch, so the boot-time pass on the shared registry does not reach them.
+///
+/// Builtins only, as that boot-time pass is (it runs before any extension or
+/// skill tool registers): a disabled name that is an extension tool here is
+/// left alone, for workers as for the foreground.
+pub(crate) fn disable_configured_tools(
+    registry: &mut crate::ToolRegistry,
+    config: &crate::config::SynapsConfig,
+) {
+    let builtins: Vec<String> = config
+        .disabled_tools
+        .iter()
+        .filter(|name| {
+            registry
+                .get(name)
+                .is_some_and(|tool| tool.extension_id().is_none())
+        })
+        .cloned()
+        .collect();
+    if !builtins.is_empty() {
+        registry.disable(&builtins);
+    }
+}
+
+/// Exact Fable 5.1 worker default requested for this harness. Do not infer
+/// capability or effort for sibling IDs, other providers, or foreground calls.
+#[allow(dead_code)] // merge(112): consumed when Fable model reaches the spawn paths
+pub(crate) fn apply_anthropic_worker_reasoning(runtime: &mut crate::Runtime) {
+    if runtime.codex_request_role() == crate::runtime::openai::catalog::CodexRequestRole::Worker
+        && runtime.model() == "anthropic/claude-fable-5-1"
+    {
+        runtime.set_reasoning_level(agent_core::reasoning::ReasoningLevel::XHigh);
+    }
+}
+
 /// The window a worker on `model` runs with, given the configured
 /// `context_window`. The setting is one per user, not per model, so a worker
 /// on any model gets it, as the foreground keeps it across `/model`, except a
@@ -344,6 +497,34 @@ pub(crate) fn apply_subagent_thinking(
     runtime.set_reasoning_level_checked(thinking)
 }
 
+/// The run lease a launch of worker `handle` books its spend under (child
+/// spend): `Ok(None)` when the launching context has no lease source (a
+/// host without a sink). Refused once the delegating run is sealed or the
+/// session is ending; the caller then cleans up as for any refusal before
+/// launch.
+pub(crate) fn spend_lease(
+    ctx: &crate::tools::ToolContext,
+    handle: &str,
+    agent: &str,
+) -> std::result::Result<
+    Option<crate::runtime::child_spend::RunLease>,
+    crate::runtime::child_spend::LeaseRefused,
+> {
+    ctx.capabilities
+        .spend
+        .as_ref()
+        .map(|parent| parent.lease(handle, agent))
+        .transpose()
+}
+
+/// Give a worker runtime its launch's lease as its spend tap.
+pub(crate) fn install_spend(
+    runtime: &mut crate::Runtime,
+    lease: Option<crate::runtime::child_spend::RunLease>,
+) {
+    runtime.set_spend_tap(lease.map(crate::runtime::child_spend::SpendTap::new));
+}
+
 /// Kill-switch: `SYNAPS_SUBAGENT_FRESH_RUNTIME=1` restores the pre-engine-host
 /// spawn path (fresh `Runtime::new()`, fresh HTTP client, registry rebuilt,
 /// global broker re-installed with a fresh token cache on every spawn).
@@ -355,8 +536,11 @@ pub fn legacy_fresh_runtime() -> bool {
 /// — shares the host credential source and token cache (so NO
 /// `set_global_broker` re-install and NO token-cache eviction per spawn) and
 /// takes a clone of the cached worker registry template. Legacy path (no host
-/// installed, or kill-switch set): today's `Runtime::new()` + rebuilt tools +
-/// `apply_auth_config`, verbatim.
+/// installed, or kill-switch set): `Runtime::new()` + rebuilt tools +
+/// `apply_auth_config`. Both paths then take the configured tool limits and
+/// retries through the one `Runtime::apply_worker_config`, and leave out the
+/// configured disabled built-ins through the one `ToolRegistry::worker_set`
+/// rule (`subagent_tools(disabled)` is its legacy twin).
 ///
 /// Both paths run with the host's worker hook view
 /// (`EngineHost::worker_hook_bus`: its `after_tool_call` output transforms,
@@ -382,10 +566,23 @@ pub async fn spawn_runtime() -> crate::Result<crate::Runtime> {
     let mut rt = crate::Runtime::new().await?;
     rt.set_tools(subagent_tools(&config.disabled_tools).await);
     rt.apply_auth_config(&config);
+    rt.apply_worker_config(&config);
     if let Some(host) = &host {
         rt.set_hook_bus(host.worker_hook_bus());
     }
     Ok(rt)
+}
+
+/// The registry a worker starts from: the host's cached worker registry, or
+/// (no host, or the fresh-runtime kill-switch) [`subagent_tools`]; the same
+/// choice [`spawn_runtime`] makes.
+pub(crate) async fn worker_tools() -> crate::ToolRegistry {
+    if !legacy_fresh_runtime() {
+        if let Some(host) = crate::EngineHost::current() {
+            return host.worker_registry().await;
+        }
+    }
+    subagent_tools(&crate::config::load_config().disabled_tools).await
 }
 
 /// Build the subagent tool registry: extension tools if the routing manager
@@ -1079,6 +1276,7 @@ mod codex_ultra_worker_tests {
             None,
             false,
             Some(worker.session_allow_all()),
+            None,
         )
         .await;
         assert!(matches!(
@@ -1091,6 +1289,7 @@ mod codex_ultra_worker_tests {
             None,
             false,
             Some(worker.session_allow_all()),
+            None,
         )
         .await;
         assert!(
@@ -1105,6 +1304,7 @@ mod codex_ultra_worker_tests {
             None,
             false,
             Some(worker.session_allow_all()),
+            None,
         )
         .await;
         assert!(
@@ -2046,6 +2246,52 @@ mod worker_rollover_tests {
         assert!(summary.get("rollovers").is_none(), "unknown for an archived run");
         assert!(crate::runtime::subagent::archived_context_summary(&history[..1]).is_none());
     }
+
+    /// PARITY E9 pin (b): with the parent's context management off (the
+    /// Windows default), ours is inactive and upstream's worker rollover is
+    /// the one that runs. No worker context resolves and no run wants a
+    /// plan, so the worker runtime keeps foreground context management off
+    /// and its `worker_context` (`subagent_context_management = auto`, the
+    /// default) is armed; stream.rs then rolls it over as upstream's own
+    /// tests drive it (`worker_past_the_threshold_rolls_over_and_keeps_working`,
+    /// `worker_below_the_threshold_and_foreground_runtimes_never_roll`).
+    /// The single switch: once ours is applied (a run with a plan), context
+    /// management is on and stream.rs leaves upstream's rollover out.
+    #[test]
+    fn e9_upstreams_worker_rollover_runs_only_where_ours_is_inactive() {
+        use super::launch::{wants_rollover, worker_context};
+        use crate::tools::WorkerContextPolicy;
+        use agent_core::config::{ContextManagementConfig, ContextRollover};
+        let parent = |mode| WorkerContextPolicy {
+            context_management: ContextManagementConfig { mode, ..Default::default() },
+            ..Default::default()
+        };
+        let model = "claude-sonnet-4-6";
+        let off = parent(ContextManagementMode::Off);
+        assert!(worker_context(Some(&off), model).is_err(), "ours is inactive");
+        assert!(worker_context(None, model).is_err());
+        assert!(!wants_rollover(Some(&off), ContextRollover::Inherit));
+        assert!(!wants_rollover(None, ContextRollover::Inherit));
+
+        // The worker runtime a spawn path builds for a run without a plan.
+        let mut runtime = crate::Runtime::new_headless();
+        apply_subagent_runtime_policy(&mut runtime, &Default::default(), None, None, None, &Default::default());
+        runtime.set_model(model.into());
+        super::fit_subagent_context_window(&mut runtime);
+        attach_worker_transcripts(&mut runtime, "/a".into(), "sa_9", None, &[], None, 9, "spike");
+        assert!(!runtime.context_management_enabled(), "ours is not applied");
+        let window = runtime.context_window();
+        assert!(runtime.worker_context().resolve(window).is_some(), "upstream's rollover is armed at {window}");
+
+        // Ours active: the parent's auto resolves, the run wants a plan, and
+        // applying it turns context management on (stream.rs:
+        // `worker_rollover` is `None` while it is), so no double rollover.
+        let auto = parent(ContextManagementMode::Auto);
+        assert!(wants_rollover(Some(&auto), ContextRollover::Inherit));
+        let resolved = worker_context(Some(&auto), model).expect("ours resolves");
+        runtime.apply_worker_context(&resolved);
+        assert!(runtime.context_management_enabled(), "ours is the worker's rollover");
+    }
 }
 
 /// The live bug end to end: with `context_window = 1m` configured, a worker
@@ -2399,3 +2645,12 @@ mod worker_inherit_wire_tests {
         }
     }
 }
+#[cfg(test)]
+mod worker_limits_tests;
+
+#[cfg(test)]
+mod worker_hooks_tests;
+
+/// Slice 9 item (a): the fallback notice, end to end.
+#[cfg(all(test, unix))]
+mod notice_tests;

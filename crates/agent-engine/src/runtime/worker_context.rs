@@ -956,10 +956,24 @@ mod tests {
 
     /// The next round's required room, as `pre_request_context_budget`
     /// computes it for an empty request (adaptive thinking, 30k tool cap).
+    ///
+    /// PARITY (E2): the worker path decides on the unsized budget
+    /// (`expected_budget`); the request's `budget` is the foreground's,
+    /// sized to the room left (R1), which reserves the 64k cap here.
     fn required(model: &str, window: u64) -> u64 {
-        super::super::stream::pre_request_context_budget(model, window, None, &[], &[], 0, 30_000, None)
-            .1
-            .required_next_round_tokens
+        super::super::stream::pre_request_context_budget(
+            model,
+            window,
+            None,
+            &[],
+            &[],
+            0,
+            30_000,
+            None,
+            None,
+        )
+        .expected_budget()
+        .required_next_round_tokens
     }
 
     /// The live thrash (#332): an Opus worker on the 200k default window

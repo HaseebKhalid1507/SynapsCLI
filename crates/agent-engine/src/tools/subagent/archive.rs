@@ -13,7 +13,9 @@
 //! come from a process-wide counter, so one directory per process image
 //! cannot collide (a daemon reload starts a new directory: the uuid suffix
 //! is per image, and the reload carries the counter forward). Directories
-//! older than [`KEEP_DAYS`] are pruned on first use.
+//! older than [`KEEP_DAYS`] are pruned on the first use of the root in this
+//! process, on a thread of their own, and only while no other process holds
+//! the root's lifecycle lock (never waited for).
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -62,6 +64,20 @@ struct SubagentArchiveRef<'a> {
     cache_anchor_unix_ms: Option<u64>,
 }
 
+/// The trusted root of every process's archive directory. Resume locates
+/// records below it by spelling and opens them without following links
+/// (`record_file`).
+pub fn archive_root() -> PathBuf {
+    crate::config::base_dir().join("subagent-history")
+}
+
+/// This process's directory name below the root (`<pid>-<uuid>`), without
+/// touching the filesystem.
+pub fn process_dir_name() -> &'static str {
+    static SUFFIX: OnceLock<String> = OnceLock::new();
+    SUFFIX.get_or_init(|| format!("{}-{}", std::process::id(), uuid::Uuid::new_v4()))
+}
+
 /// This process's archive directory (created lazily by [`write_archive_anchored`]).
 pub fn process_dir() -> PathBuf {
     process_dir_for_base(&crate::config::base_dir())
@@ -69,27 +85,101 @@ pub fn process_dir() -> PathBuf {
 
 /// Resolve a base explicitly without mutating process environment (also used by tests).
 pub(super) fn process_dir_for_base(base: &Path) -> PathBuf {
-    static SUFFIX: OnceLock<String> = OnceLock::new();
-    static PRUNED: OnceLock<std::sync::Mutex<std::collections::HashSet<PathBuf>>> = OnceLock::new();
-    let suffix = SUFFIX.get_or_init(|| format!("{}-{}", std::process::id(), uuid::Uuid::new_v4()));
-    let root = base.join("subagent-history");
-    let mut pruned = PRUNED
-        .get_or_init(Default::default)
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
-    if pruned.insert(root.clone()) {
-        prune_older_than(
-            &root,
-            std::time::Duration::from_secs(KEEP_DAYS * 24 * 60 * 60),
-        );
-    }
-    root.join(suffix)
+    resolve_process_dir(base).0
 }
 
-fn prune_older_than(root: &Path, age: std::time::Duration) {
-    let Ok(entries) = std::fs::read_dir(root) else {
-        return;
+/// This process's directory below `base`, and the pruning of its root,
+/// started on the root's first use in this process on a thread of its own:
+/// resolving is called from async tool execution, which never waits for
+/// pruning (or for its lock). `None` when already started for this root, or
+/// when the thread could not start (then nothing is pruned).
+fn resolve_process_dir(base: &Path) -> (PathBuf, Option<std::thread::JoinHandle<PruneOutcome>>) {
+    static PRUNED: OnceLock<std::sync::Mutex<std::collections::HashSet<PathBuf>>> = OnceLock::new();
+    let root = base.join("subagent-history");
+    // Held for this check only, never through pruning.
+    let first = PRUNED
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(root.clone());
+    let prune = first
+        .then(|| {
+            let root = root.clone();
+            std::thread::Builder::new()
+                .name("subagent-history-prune".into())
+                .spawn(move || {
+                    prune_older_than(
+                        &root,
+                        std::time::Duration::from_secs(KEEP_DAYS * 24 * 60 * 60),
+                    )
+                })
+                .map_err(|e| tracing::warn!("subagent history: pruning did not start: {e}"))
+                .ok()
+        })
+        .flatten();
+    (root.join(process_dir_name()), prune)
+}
+
+/// What one pruning pass did.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum PruneOutcome {
+    /// There is no history root yet.
+    NoRoot,
+    /// Another process holds the root's lifecycle lock: nothing was pruned.
+    Busy,
+    /// The root's lifecycle lock cannot be used: nothing was pruned.
+    Invalid(String),
+    /// The root itself cannot be used (access, ownership): nothing was
+    /// pruned; its lock file is not the problem.
+    RootUnusable(String),
+    /// This many old process directories were removed.
+    Pruned(usize),
+}
+
+/// Remove process directories older than `age`, except one whose run lock
+/// is held (a live or unresolved owner, `record_store`). The root's
+/// lifecycle lock is tried exclusively once, without waiting, and held
+/// throughout, so no run starts in a directory between its check and its
+/// removal; when it is held elsewhere or cannot be used, nothing is pruned.
+/// An unusable lock or root gets one warning per call (once per root and
+/// process from [`process_dir`]) naming which of the two it is, and stays as
+/// it is: the host removes a bad lock file while no process uses the root,
+/// or repairs the root's access (removing the lock would not help then).
+pub(super) fn prune_older_than(root: &Path, age: std::time::Duration) -> PruneOutcome {
+    use super::record_store::{try_lifecycle_exclusive, LifecycleAttempt};
+    let clip = |reason: String| -> String { reason.chars().take(200).collect() };
+    let bad_lock = |reason: String| {
+        let reason = clip(reason);
+        tracing::warn!(
+            root = %root.display(),
+            %reason,
+            "subagent history: old worker directories are not pruned; remove the root's \
+             .lifecycle.lock while no SynapsCLI process uses it"
+        );
+        PruneOutcome::Invalid(reason)
     };
+    let bad_root = |reason: String| {
+        let reason = clip(reason);
+        tracing::warn!(
+            root = %root.display(),
+            %reason,
+            "subagent history: old worker directories are not pruned; the history root \
+             cannot be used (check its ownership and permissions)"
+        );
+        PruneOutcome::RootUnusable(reason)
+    };
+    let _lifecycle = match try_lifecycle_exclusive(root) {
+        LifecycleAttempt::Held(guard) => guard,
+        LifecycleAttempt::Busy => return PruneOutcome::Busy,
+        LifecycleAttempt::NoRoot => return PruneOutcome::NoRoot,
+        LifecycleAttempt::Invalid(reason) => return bad_lock(reason),
+        LifecycleAttempt::RootUnusable(reason) => return bad_root(reason),
+    };
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(e) => return bad_root(format!("history root: {e}")),
+    };
+    let mut pruned = 0;
     for entry in entries.flatten() {
         let old = entry
             .metadata()
@@ -97,15 +187,22 @@ fn prune_older_than(root: &Path, age: std::time::Duration) {
             .ok()
             .and_then(|t| t.elapsed().ok())
             .is_some_and(|elapsed| elapsed > age);
-        if old && entry.path().is_dir() {
-            let _ = std::fs::remove_dir_all(entry.path());
+        if old && entry.path().is_dir() && !super::record_store::dir_has_live_writer(&entry.path())
+        {
+            #[cfg(test)]
+            super::record_store::seams::prune_delete(&entry.path());
+            if std::fs::remove_dir_all(entry.path()).is_ok() {
+                pruned += 1;
+            }
         }
     }
+    PruneOutcome::Pruned(pruned)
 }
 
 /// [`write_archive_anchored`] with no cache anchor. Tests only: production
-/// archives always record the anchor.
-#[cfg(test)]
+/// archives always record the anchor. PARITY: also the `testing` feature,
+/// for ours' `tools::write_test_archive` (integration tests).
+#[cfg(any(test, feature = "testing"))]
 pub fn write_archive(
     dir: &Path,
     handle_id: &str,
@@ -175,35 +272,6 @@ pub(crate) fn write_window_transcript(path: &Path, body: &str) -> std::io::Resul
     Ok(())
 }
 
-/// Validate a caller-supplied archive path (`subagent_resume.archive_path`, for
-/// workers of an earlier or crashed session): `~` expanded, must resolve to a
-/// `.json` file under `<base>/subagent-history`.
-pub fn checked_archive_path(raw: &str) -> Result<PathBuf, String> {
-    checked_archive_path_in(raw, &crate::config::base_dir().join("subagent-history"))
-}
-
-fn checked_archive_path_in(raw: &str, root: &Path) -> Result<PathBuf, String> {
-    let expanded = match raw.strip_prefix("~/") {
-        Some(rest) => dirs::home_dir()
-            .ok_or_else(|| "no home directory to expand '~'".to_string())?
-            .join(rest),
-        None => PathBuf::from(raw),
-    };
-    let path = expanded
-        .canonicalize()
-        .map_err(|e| format!("archive_path '{raw}': {e}"))?;
-    let root = root
-        .canonicalize()
-        .map_err(|e| format!("no subagent archives at {}: {e}", root.display()))?;
-    if !path.starts_with(&root) || path.extension().and_then(|e| e.to_str()) != Some("json") {
-        return Err(format!(
-            "archive_path must be a .json archive under {}",
-            root.display()
-        ));
-    }
-    Ok(path)
-}
-
 pub fn read_archive(path: &Path) -> std::io::Result<SubagentArchive> {
     let bytes = std::fs::read(path)?;
     let archive: SubagentArchive = serde_json::from_slice(&bytes).map_err(std::io::Error::other)?;
@@ -217,7 +285,7 @@ pub fn read_archive(path: &Path) -> std::io::Result<SubagentArchive> {
 }
 
 #[cfg(unix)]
-fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+pub(super) fn create_private_dir(dir: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::DirBuilderExt;
     std::fs::DirBuilder::new()
         .recursive(true)
@@ -226,7 +294,7 @@ fn create_private_dir(dir: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(not(unix))]
-fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+pub(super) fn create_private_dir(dir: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)
 }
 
@@ -290,24 +358,175 @@ pub fn archive_finished_worker(
     }
 }
 
-/// Explicit terminal collect/resume is also a recovery attempt after disk repair.
-/// Callers hold the registry lock; finalization is already complete, so retries
-/// cannot race the worker's original write or each other.
-pub(super) fn retry_failed_archive(state: &std::sync::RwLock<SubagentState>, handle_id: &str) {
-    let dir = {
-        let s = state.read().unwrap_or_else(|p| p.into_inner());
-        if s.finalization_ready
-            && s.archive_error.is_some()
-            && s.history.is_some()
-            && s.archive_meta.is_some()
+/// A retry of a finished worker's failed v1 archive write: explicit terminal
+/// collect/resume is also a recovery attempt after disk repair.
+///
+/// [`Self::take`] snapshots it under the worker's state lock (the caller may
+/// hold the registry guard then); [`Self::run`] writes on a blocking worker
+/// with no guard held and applies the outcome there. Finalization is already
+/// complete, so a retry cannot race the worker's original write; at most one
+/// retry per worker is in flight (`SubagentState::archive_retrying`), so
+/// retries cannot race each other either. The outcome is applied only while
+/// the state is still the failed v1 record the snapshot was taken from (no
+/// archive path, no v2 records, the same history); otherwise it is dropped.
+/// A handle that already points at an archive is never taken.
+///
+/// Concurrent callers do not wait for a retry in flight; what they see is
+/// transient. A collect that finds another caller's retry writing reports
+/// the failed write as it stands (its error, no archive path) until the
+/// retry applies; a resume may continue the finalized history kept in
+/// memory (the history the retry is writing) instead of the archive. Nothing
+/// is lost and no admission rule changes: a history kept in memory is
+/// admitted only when not shortened, and a handle holding history without
+/// an archive is not reaped.
+pub(super) struct ArchiveRetry {
+    handle_id: String,
+    dir: PathBuf,
+    meta: crate::runtime::subagent::SubagentArchiveMeta,
+    status: String,
+    /// The worker's failure reason, kept in the archive as on its first
+    /// write (`archive_finished_worker`).
+    error: Option<String>,
+    output: String,
+    history: Vec<crate::SharedMessage>,
+    /// The run's cache anchor, kept in the archive as on its first write
+    /// (upstream #315: production archives always record it).
+    cache_anchor_unix_ms: Option<u64>,
+}
+
+impl ArchiveRetry {
+    /// The retry `state` needs, if any, marking it in flight.
+    pub(super) fn take(state: &std::sync::RwLock<SubagentState>, handle_id: &str) -> Option<Self> {
+        let mut s = state.write().unwrap_or_else(|p| p.into_inner());
+        // A v2 run publishes its own final; a v1 archive would take its name.
+        if !s.finalization_ready
+            || s.v2_records
+            || s.archive_retrying
+            || s.archive_path.is_some()
+            || s.archive_error.is_none()
         {
-            s.archive_dir.clone()
-        } else {
-            None
+            return None;
         }
-    };
-    if let Some(dir) = dir {
-        archive_finished_worker(state, handle_id, &dir);
+        let (Some(dir), Some(meta), Some(history)) =
+            (s.archive_dir.clone(), s.archive_meta.clone(), s.history.clone())
+        else {
+            return None;
+        };
+        s.archive_retrying = true;
+        Some(Self {
+            handle_id: handle_id.to_owned(),
+            dir,
+            meta,
+            status: s.status.as_str().to_string(),
+            error: s.status.failure_reason().map(str::to_owned),
+            output: s.partial_text.clone(),
+            history,
+            cache_anchor_unix_ms: s.cache_anchor_unix_ms,
+        })
+    }
+
+    /// Write on a blocking worker and apply the outcome to `state`. Holds
+    /// no registry guard; a dropped waiter leaves the task to finish and
+    /// apply (or drop) its outcome.
+    pub(super) async fn run(self, state: std::sync::Arc<std::sync::RwLock<SubagentState>>) {
+        let _ = tokio::task::spawn_blocking(move || self.write_and_apply(&state)).await;
+    }
+
+    /// [`Self::run`] on this thread.
+    pub(super) fn write_and_apply(self, state: &std::sync::RwLock<SubagentState>) {
+        /// Clears the in-flight mark however this ends (a panic included).
+        struct InFlight<'a>(&'a std::sync::RwLock<SubagentState>);
+        impl Drop for InFlight<'_> {
+            fn drop(&mut self) {
+                self.0
+                    .write()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .archive_retrying = false;
+            }
+        }
+        let _in_flight = InFlight(state);
+        #[cfg(test)]
+        retry_gate::wait(&self.handle_id);
+        let outcome = write_archive_anchored(
+            &self.dir,
+            &self.handle_id,
+            &self.meta,
+            &self.status,
+            self.error.as_deref(),
+            &self.output,
+            &self.history,
+            self.cache_anchor_unix_ms,
+        );
+        let mut s = state.write().unwrap_or_else(|p| p.into_inner());
+        let same = s.archive_path.is_none()
+            && !s.v2_records
+            && s.history.as_ref().is_some_and(|h| {
+                h.len() == self.history.len()
+                    && h.iter().zip(&self.history).all(|(a, b)| std::sync::Arc::ptr_eq(a, b))
+            });
+        if !same {
+            return;
+        }
+        match outcome {
+            Ok(path) => {
+                s.archive_path = Some(path);
+                s.archive_error = None;
+                s.history = None;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "subagent {}: could not write resume archive: {e}",
+                    self.handle_id
+                );
+                s.archive_error = Some(format!(
+                    "archive write failed: {e}; full history retained in memory"
+                ));
+            }
+        }
+    }
+}
+
+/// [`ArchiveRetry`] taken and written on this thread.
+#[cfg(test)]
+pub(super) fn retry_failed_archive(state: &std::sync::RwLock<SubagentState>, handle_id: &str) {
+    if let Some(retry) = ArchiveRetry::take(state, handle_id) {
+        retry.write_and_apply(state);
+    }
+}
+
+/// Test seam: hold a retry's write for one handle until released.
+#[cfg(test)]
+pub(super) mod retry_gate {
+    use std::sync::{Mutex, PoisonError};
+
+    type Gate = (String, std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>);
+
+    static GATES: Mutex<Vec<Gate>> = Mutex::new(Vec::new());
+
+    /// Hold the next retry of `handle_id` before its write. The first
+    /// receiver says it was reached; sending on the second releases it.
+    pub(crate) fn gate(
+        handle_id: &str,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+        let (open_tx, open_rx) = std::sync::mpsc::channel();
+        GATES
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((handle_id.to_owned(), reached_tx, open_rx));
+        (reached_rx, open_tx)
+    }
+
+    pub(super) fn wait(handle_id: &str) {
+        let gate = {
+            let mut gates = GATES.lock().unwrap_or_else(PoisonError::into_inner);
+            let at = gates.iter().position(|(id, ..)| id == handle_id);
+            at.map(|i| gates.remove(i))
+        };
+        if let Some((_, reached, open)) = gate {
+            let _ = reached.send(());
+            let _ = open.recv();
+        }
     }
 }
 
@@ -316,13 +535,19 @@ pub(super) fn retry_failed_archive(state: &std::sync::RwLock<SubagentState>, han
 /// new instructions as the next user turn (merged into a trailing user message,
 /// so roles still alternate).
 pub fn resume_messages(history: Vec<Value>, instructions: &str) -> Vec<crate::SharedMessage> {
-    let mut messages: Vec<crate::SharedMessage> =
-        history.into_iter().map(std::sync::Arc::new).collect();
-    crate::engine::stream::repair_history_after_failure(&mut messages, 0);
     let note = format!(
         "[Resumed by the orchestrator. Everything above is your own earlier work in this task; \
          continue from where it stopped.]\n\n{instructions}"
     );
+    resume_messages_saying(history, &note)
+}
+
+/// [`resume_messages`] whose next user turn is exactly `note` (a daemon
+/// resume after a reload says itself who resumed the worker).
+pub fn resume_messages_saying(history: Vec<Value>, note: &str) -> Vec<crate::SharedMessage> {
+    let mut messages: Vec<crate::SharedMessage> =
+        history.into_iter().map(std::sync::Arc::new).collect();
+    crate::engine::stream::repair_history_after_failure(&mut messages, 0);
     let text_block = serde_json::json!({"type": "text", "text": note});
     match messages.last().map(|m| m["role"].as_str() == Some("user")) {
         Some(true) => {
@@ -750,9 +975,28 @@ pub fn timeout_report(
     } else {
         "The conversation could not be captured; subagent_resume will start from the task."
     };
-    let mut text = format!(
-        "[TIMED OUT after {timeout_secs}s, {tool_count} tool calls. {resume_note}]\n\n[last response]:\n"
-    );
+    report_with_header(
+        format!("[TIMED OUT after {timeout_secs}s, {tool_count} tool calls. {resume_note}]"),
+        state,
+    )
+}
+
+/// What a watch worker reports when its lease runs out (`why` says which
+/// part): like a timeout, but a resume is refused, so it doesn't offer one.
+pub fn watch_lease_report(why: &str, tool_count: u32, state: &SubagentState) -> String {
+    report_with_header(
+        format!(
+            "[WATCH LEASE EXPIRED ({why}), {tool_count} tool calls. The lease is spent: \
+             subagent_resume refuses this worker; wait in your own turn or start a fresh watcher.]"
+        ),
+        state,
+    )
+}
+
+/// `header`, then the latest response and the recent tool calls.
+fn report_with_header(header: String, state: &SubagentState) -> String {
+    let mut text = header;
+    text.push_str("\n\n[last response]:\n");
     let last = state.last_response_text().trim();
     if last.is_empty() {
         text.push_str("(no text since the last tool call)\n");
@@ -813,6 +1057,7 @@ mod tests {
             timeout_secs: 3600,
             cwd: None,
             thinking: None,
+            watch_usage: None,
         }
     }
 
@@ -932,11 +1177,7 @@ mod tests {
                 read_archive(path).unwrap().history,
                 seed.iter().map(|m| (**m).clone()).collect::<Vec<_>>()
             );
-            assert!(checked_archive_path_in(
-                path.to_str().unwrap(),
-                &base_b.join("subagent-history")
-            )
-            .is_err());
+            assert!(!path.starts_with(base_b.join("subagent-history")));
         }
         assert!(
             !dir_b.exists(),
@@ -1096,15 +1337,28 @@ mod tests {
         assert!(r.contains("[last 20 of 30 tool calls]"));
         assert!(r.contains("step 29") && !r.contains("step 9\n"));
         assert!(r.contains("subagent_resume continues it"));
+        let w = watch_lease_report("40 provider rounds", 30, &s);
+        assert!(
+            w.starts_with("[WATCH LEASE EXPIRED (40 provider rounds), 30 tool calls."),
+            "{w}"
+        );
+        assert!(w.contains("Rendering pass 2 now") && w.contains("[last 20 of 30 tool calls]"));
+        assert!(
+            !w.contains("subagent_resume continues it"),
+            "a spent lease is not resumable"
+        );
     }
 
+    /// What the finalizer writes is what resume accepts: the record path
+    /// rules and the privacy checks of the record reader (`record_file`).
+    #[cfg(unix)]
     #[test]
-    fn archive_paths_must_stay_under_the_history_root() {
-        let root = tempfile::tempdir().unwrap();
-        let hist = root.path().join("subagent-history");
-        let sub = hist.join("proc");
-        let ok = write_archive(
-            &sub,
+    fn written_archives_pass_the_record_reader() {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join("subagent-history");
+        let dir = root.join(format!("{}-{}", std::process::id(), uuid::Uuid::new_v4()));
+        let path = write_archive(
+            &dir,
             "sa_1",
             &meta(),
             "failed",
@@ -1113,16 +1367,51 @@ mod tests {
             &history(),
         )
         .unwrap();
-        assert_eq!(
-            checked_archive_path_in(ok.to_str().unwrap(), &hist).unwrap(),
-            ok.canonicalize().unwrap()
-        );
-        let outside = root.path().join("x.json");
-        std::fs::write(&outside, "{}").unwrap();
-        assert!(checked_archive_path_in(outside.to_str().unwrap(), &hist).is_err());
-        let sneaky = format!("{}/../x.json", hist.display());
-        assert!(checked_archive_path_in(&sneaky, &hist).is_err());
-        assert!(checked_archive_path_in(&format!("{}/nope.json", sub.display()), &hist).is_err());
+        let location = super::super::record_file::locate(path.to_str().unwrap(), &root).unwrap();
+        let loaded = super::super::record_file::load(&location).unwrap();
+        assert!(matches!(
+            loaded.final_record,
+            super::super::record::Candidate::Present(super::super::record::FinalRecord::V1(_))
+        ));
+        assert!(matches!(
+            loaded.head,
+            super::super::record::Candidate::Absent
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn first_use_pruning_never_blocks_resolving_the_process_directory() {
+        use super::super::record_store::{try_lifecycle_exclusive, LifecycleAttempt};
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join("subagent-history");
+        let old = root.join("1-00000000-0000-4000-8000-000000000001");
+        std::fs::create_dir_all(&old).unwrap();
+        let old_time = std::time::SystemTime::now() - std::time::Duration::from_secs(30 * 86400);
+        std::fs::File::open(&old)
+            .unwrap()
+            .set_modified(old_time)
+            .unwrap();
+        // Another process holds the root's lifecycle lock.
+        let LifecycleAttempt::Held(_pruning) = try_lifecycle_exclusive(&root) else {
+            panic!("the lifecycle lock is free");
+        };
+        let (dir, prune) = resolve_process_dir(base.path());
+        assert_eq!(dir, root.join(process_dir_name()));
+        let prune = prune.expect("the first use of a root starts its pruning");
+        // Pruning runs on its own thread, gives up at once and deletes nothing.
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done_tx.send(prune.join());
+        });
+        let outcome = done_rx
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("pruning gives up at once while the lock is held elsewhere")
+            .expect("the pruning thread does not panic");
+        assert_eq!(outcome, PruneOutcome::Busy);
+        assert!(old.exists());
+        // Once per root and process.
+        assert!(resolve_process_dir(base.path()).1.is_none());
     }
 
     #[test]
@@ -1131,8 +1420,13 @@ mod tests {
         std::fs::create_dir(root.path().join("old")).unwrap();
         std::fs::create_dir(root.path().join("new")).unwrap();
         let old_time = std::time::SystemTime::now() - std::time::Duration::from_secs(30 * 86400);
+        // PARITY: upstream #328's portable backdate (Windows opens a
+        // directory only with backup semantics), ours' outcome check.
         set_mtime_for_test(&root.path().join("old"), old_time);
-        prune_older_than(root.path(), std::time::Duration::from_secs(14 * 86400));
+        assert_eq!(
+            prune_older_than(root.path(), std::time::Duration::from_secs(14 * 86400)),
+            PruneOutcome::Pruned(1)
+        );
         assert!(!root.path().join("old").exists());
         assert!(root.path().join("new").exists());
     }
@@ -1157,6 +1451,7 @@ mod cold_resume_tests {
             timeout_secs: 3600,
             cwd: None,
             thinking: None,
+            watch_usage: None,
         }
     }
 

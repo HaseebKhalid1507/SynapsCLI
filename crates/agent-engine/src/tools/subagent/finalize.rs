@@ -22,7 +22,12 @@ fn wake_disabled() -> bool {
 
 /// Build the completion event. Pure — unit-testable without threads.
 /// `resumed_from`: set by resume.rs only (the prior handle_id this run continues from).
+/// `rollover_notice`: the run's notice when it fell back to rollover off.
+/// `evicted_windows`: a resumed run's listed windows its store had evicted
+/// (0 = none): above 0 the text says so and `data.evicted_windows` counts
+/// them; counts only, never IDs.
 #[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
 pub fn build_completion_event(
     handle_id: &str,
     subagent_id: u64,
@@ -31,6 +36,8 @@ pub fn build_completion_event(
     result_preview: &str, // caller pre-truncates to ≤300 chars
     duration_secs: f64,
     resumed_from: Option<&str>,
+    rollover_notice: Option<&str>,
+    evicted_windows: u64,
 ) -> Event {
     use chrono::Utc;
     use serde_json::json;
@@ -44,9 +51,18 @@ pub fn build_completion_event(
         }
         None => String::new(),
     };
+    // A run that fell back to rollover off says so (bounded at launch).
+    let notice_suffix = rollover_notice
+        .map(|notice| format!(" Note: {notice}."))
+        .unwrap_or_default();
+    let evicted_suffix = match evicted_windows {
+        0 => String::new(),
+        1 => " Note: 1 earlier context window was no longer in memory.".to_owned(),
+        n => format!(" Note: {n} earlier context windows were no longer in memory."),
+    };
     let text = format!(
         "Subagent '{agent_name}' ({handle_id}) finished with status '{status_str}' \
-         after {duration_secs:.1}s.{reason_suffix} \
+         after {duration_secs:.1}s.{reason_suffix}{notice_suffix}{evicted_suffix} \
          Call subagent_collect with handle_id \"{handle_id}\" to retrieve the full result. \
          Preview: {result_preview}"
     );
@@ -63,6 +79,12 @@ pub fn build_completion_event(
     }
     if let Some(rf) = resumed_from {
         data_map["resumed_from"] = json!(rf);
+    }
+    if let Some(notice) = rollover_notice {
+        data_map["rollover_notice"] = json!(notice);
+    }
+    if evicted_windows > 0 {
+        data_map["evicted_windows"] = json!(evicted_windows);
     }
 
     Event {
@@ -84,6 +106,7 @@ pub fn build_completion_event(
         },
         expects_response: false,
         reply_to: None,
+        peer: None,
     }
 }
 
@@ -97,7 +120,17 @@ pub fn build_reload_carry_event(w: &crate::runtime::subagent::CarriedWorker) -> 
     let agent = if w.agent.is_empty() { "subagent" } else { w.agent.as_str() };
     let id = w.id.as_str();
     let mut ev = if w.stopped_by_reload {
-        let resume = if w.archive_path.is_some() {
+        let crash_head = super::crash_head::left_head(w);
+        let resume = if let (None, Some(head)) = (&w.archive_path, crash_head) {
+            // Its final record was lost (train30 item 4): the head the run
+            // left is what is left of it, and resumes as a crash checkpoint.
+            format!(
+                "Its final record was lost (it was not published before the reload), so its head \
+                 record is its crash checkpoint: subagent_resume with archive_path \"{}\" continues \
+                 it from there (the checkpoint may predate its last work).",
+                head.display()
+            )
+        } else if w.archive_path.is_some() {
             format!(
                 "Its conversation is archived: subagent_resume with handle_id \"{id}\" continues it \
                  where it stopped (its last tool call reads as canceled — it may have partially run); \
@@ -109,9 +142,15 @@ pub fn build_reload_carry_event(w: &crate::runtime::subagent::CarriedWorker) -> 
                  continues from its previous archive or restarts it from its task."
             )
         };
+        let waived = if w.record_waived {
+            " The reload was forced while its record was not durable, so that record was not \
+             preserved: what it did last may be missing."
+        } else {
+            ""
+        };
         let text = format!(
             "Subagent '{agent}' ({id}) was stopped after {}s by a daemon reload, not by the user, \
-             and is no longer running. {resume} Preview: {}",
+             and is no longer running.{waived} {resume} Preview: {}",
             w.elapsed_secs, w.preview
         );
         let mut ev = build_completion_event(
@@ -122,10 +161,20 @@ pub fn build_reload_carry_event(w: &crate::runtime::subagent::CarriedWorker) -> 
             &w.preview,
             w.elapsed_secs as f64,
             None,
+            // A carried worker's rollover notice does not cross a reload.
+            None,
+            0,
         );
         ev.content.text = text;
         if let Some(data) = ev.content.data.as_mut() {
             data["stopped_by"] = json!("daemon_reload");
+            if let (None, Some(head)) = (&w.archive_path, crash_head) {
+                data["archive_path"] = json!(head.to_string_lossy());
+                data["final_lost"] = json!(true);
+            }
+            if w.record_waived {
+                data["record_waived"] = json!(true);
+            }
         }
         ev
     } else {
@@ -143,12 +192,72 @@ pub fn build_reload_carry_event(w: &crate::runtime::subagent::CarriedWorker) -> 
             &w.preview,
             w.elapsed_secs as f64,
             None,
+            None,
+            // Nothing of a carried worker's resume crosses a reload.
+            0,
         )
     };
     if let (Some(data), Some(path)) = (ev.content.data.as_mut(), &w.archive_path) {
         data["archive_path"] = json!(path);
     }
     ev.content.severity = Some(Severity::High);
+    ev
+}
+
+/// The resume text a daemon resume of a reload-stopped worker sends it as
+/// its next user turn.
+pub const DAEMON_RESUME_INSTRUCTIONS: &str = "[The daemon reloaded and stopped you mid-run; this resume \
+     was started by the daemon. Check your last tool call before trusting it, then continue.]";
+
+/// The parent's wake for a reload-stopped worker the daemon resumed itself
+/// as `new` (in place of [`build_reload_carry_event`]'s "resume it"). The
+/// completion then arrives from `new`, as any resumed worker's does.
+/// `evicted_windows`: listed windows of its lineage the store had evicted
+/// (0 = none); above 0 the text and `data.evicted_windows` carry the count.
+pub fn build_reload_resumed_event(
+    w: &crate::runtime::subagent::CarriedWorker,
+    new: &str,
+    evicted_windows: u64,
+) -> Event {
+    use serde_json::json;
+    let agent = if w.agent.is_empty() { "subagent" } else { w.agent.as_str() };
+    let old = w.id.as_str();
+    let mut ev = build_completion_event(
+        old,
+        w.subagent_id,
+        agent,
+        &SubagentStatus::Running,
+        &w.preview,
+        w.elapsed_secs as f64,
+        None,
+        None,
+        evicted_windows,
+    );
+    ev.content.text = format!(
+        "Subagent '{agent}' ({old}) was stopped by a daemon reload and resumed by the daemon as \
+         {new}; its completion will arrive as {new}."
+    );
+    if let Some(note) = super::lineage::evicted_parent_note(evicted_windows as usize) {
+        ev.content.text.push_str(&format!(" {note}."));
+    }
+    ev.content.content_type = "subagent_resumed".to_string();
+    if let Some(data) = ev.content.data.as_mut() {
+        data["resumed_as"] = json!(new);
+        data["stopped_by"] = json!("daemon_reload");
+    }
+    ev.content.severity = Some(Severity::High);
+    ev
+}
+
+/// [`build_reload_carry_event`] for a reload-stopped worker the daemon did
+/// not resume itself, saying why.
+pub fn build_reload_left_event(w: &crate::runtime::subagent::CarriedWorker, reason: &str) -> Event {
+    let mut ev = build_reload_carry_event(w);
+    let reason = reason.trim().trim_end_matches('.');
+    ev.content.text.push_str(&format!(" Not resumed automatically: {reason}."));
+    if let Some(data) = ev.content.data.as_mut() {
+        data["not_resumed"] = serde_json::json!(reason);
+    }
     ev
 }
 
@@ -230,7 +339,7 @@ fn finalize_subagent_impl(
     resumed_from: Option<&str>,
     archive_dir: Option<&std::path::Path>,
 ) {
-    let (status, preview, cancelled) = {
+    let (status, preview, cancelled, rollover_notice, visibility, evicted_windows) = {
         // R6: poison-safe — if the thread panicked while holding the write lock,
         // recover the inner value rather than re-panicking outside catch_unwind.
         let mut s = state.write().unwrap_or_else(|p| p.into_inner());
@@ -256,7 +365,14 @@ fn finalize_subagent_impl(
             latest
         };
         let preview: String = source.chars().take(300).collect();
-        (s.status.clone(), preview, s.cancel_requested)
+        (
+            s.status.clone(),
+            preview,
+            s.cancel_requested,
+            s.rollover_notice.clone(),
+            s.visibility.clone(),
+            s.evicted_windows,
+        )
     };
     // However this returns from here on: settled, so a reload's checkpoint
     // knows the wake (if any) is in the queue it is about to carry.
@@ -264,7 +380,19 @@ fn finalize_subagent_impl(
 
     // Archive the full conversation (every terminal status, cancel included) so
     // subagent_resume and subagent_collect still work after the handle is reaped.
-    if let Some(dir) = archive_dir {
+    let v2_records = state.read().unwrap_or_else(|p| p.into_inner()).v2_records;
+    if v2_records {
+        // A v2 run published its final itself (`launch.rs`), or failed to and
+        // said why; a v1 archive would take the final's name.
+        let mut s = state.write().unwrap_or_else(|p| p.into_inner());
+        if s.archive_path.is_none() && s.archive_error.is_none() {
+            s.archive_error = Some(
+                "the worker ended without publishing its final record (its head record is \
+                 the crash checkpoint); history retained in memory"
+                    .into(),
+            );
+        }
+    } else if let Some(dir) = archive_dir {
         super::archive::archive_finished_worker(state, handle_id, dir);
     } else {
         let mut s = state.write().unwrap_or_else(|p| p.into_inner());
@@ -282,7 +410,28 @@ fn finalize_subagent_impl(
     if cancelled {
         // A reload's stop is re-announced by the next image (AdoptWorkers);
         // this image's queue dies with the exec.
-        if state.read().unwrap_or_else(|p| p.into_inner()).stopped_by_reload {
+        let reload_stop = {
+            let s = state.read().unwrap_or_else(|p| p.into_inner());
+            s.stopped_by_reload
+                .then(|| (s.archive_path.is_some(), s.archive_error.clone(), s.v2_head.clone()))
+        };
+        if let Some((false, error, head)) = &reload_stop {
+            // Nothing final of the run was written (its write failed, e.g.
+            // with EMFILE during the drain): never "archived".
+            let error = error.as_deref().unwrap_or("no reason recorded");
+            match head {
+                Some(head) => tracing::warn!(
+                    "subagent {handle_id}: stopped by daemon reload, but its final record was not \
+                     published ({error}); its head record {} is kept as the crash checkpoint; the \
+                     next image wakes the parent",
+                    head.display()
+                ),
+                None => tracing::warn!(
+                    "subagent {handle_id}: stopped by daemon reload, but its conversation was not \
+                     saved ({error}); the next image wakes the parent"
+                ),
+            }
+        } else if reload_stop.is_some() {
             tracing::info!("subagent {handle_id}: stopped by daemon reload — archived; the next image wakes the parent");
         } else {
             tracing::info!("subagent {handle_id}: cancelled by user — suppressing completion wake");
@@ -299,7 +448,7 @@ fn finalize_subagent_impl(
         return;
     };
 
-    let ev = build_completion_event(
+    let mut ev = build_completion_event(
         handle_id,
         subagent_id,
         agent_name,
@@ -307,7 +456,13 @@ fn finalize_subagent_impl(
         &preview,
         started_at.elapsed().as_secs_f64(),
         resumed_from,
+        rollover_notice.as_deref(),
+        evicted_windows,
     );
+    // A v2 run's counters and notices (§8); nothing for a v1 run.
+    if let (Some(visibility), Some(data)) = (&visibility, ev.content.data.as_mut()) {
+        visibility.add_to_completion(data);
+    }
 
     if let Err(e) = queue.push(ev.clone()) {
         tracing::warn!("subagent {handle_id}: event queue full ({e}) — forcing priority push");
@@ -355,7 +510,133 @@ mod tests {
             wake: stopped || wake_lost,
             elapsed_secs: 1234,
             preview: "polling the build".into(),
+            ..Default::default()
         }
+    }
+
+    /// The daemon's own resume replaces "resume it" with who continues it,
+    /// once, and a worker it left says why.
+    #[test]
+    fn reload_resumed_and_left_events_name_the_new_handle_or_the_reason() {
+        let w = carried(true, false, Some("/h/sa_288.json"));
+        let ev = build_reload_resumed_event(&w, "sa_301", 0);
+        assert_eq!(
+            ev.content.text,
+            "Subagent 'integrator' (sa_288) was stopped by a daemon reload and resumed by the daemon as \
+             sa_301; its completion will arrive as sa_301."
+        );
+        assert_eq!(ev.content.content_type, "subagent_resumed");
+        assert_eq!(ev.content.severity, Some(Severity::High));
+        let data = ev.content.data.as_ref().unwrap();
+        assert_eq!(data["handle_id"], "sa_288");
+        assert_eq!(data["resumed_as"], "sa_301");
+        assert_eq!(data["stopped_by"], "daemon_reload");
+
+        let ev = build_reload_left_event(&w, "its session was parked");
+        let text = &ev.content.text;
+        assert!(text.starts_with(&build_reload_carry_event(&w).content.text), "{text}");
+        assert!(text.ends_with(" Not resumed automatically: its session was parked."), "{text}");
+        assert_eq!(ev.content.content_type, "subagent_completion");
+        assert!(DAEMON_RESUME_INSTRUCTIONS.starts_with("[The daemon reloaded and stopped you mid-run;"));
+    }
+
+    /// Train30 item 4b: a reload-stopped worker whose final record was lost
+    /// (its head is the crash checkpoint) tells the parent so, with the
+    /// head's path to resume from, in its text and data; without a head the
+    /// wake is today's.
+    #[test]
+    fn a_reload_stopped_worker_whose_final_was_lost_names_its_crash_checkpoint() {
+        let head = "/h/1-x/sa_288.head.json";
+        let w = crate::runtime::subagent::CarriedWorker {
+            crash_head: Some(head.into()),
+            ..carried(true, false, None)
+        };
+        let ev = build_reload_left_event(&w, "its final record was lost");
+        let text = &ev.content.text;
+        assert!(text.contains("by a daemon reload, not by the user"), "{text}");
+        assert!(text.contains("Its final record was lost"), "{text}");
+        assert!(text.contains("crash checkpoint"), "{text}");
+        assert!(
+            text.contains(&format!("subagent_resume with archive_path \"{head}\"")),
+            "{text}"
+        );
+        assert!(!text.contains("did not stop in time"), "{text}");
+        let data = ev.content.data.as_ref().unwrap();
+        assert_eq!(data["archive_path"], head);
+        assert_eq!(data["final_lost"], true);
+        assert_eq!(data["stopped_by"], "daemon_reload");
+
+        let plain = build_reload_carry_event(&carried(true, false, None));
+        assert!(plain.content.text.contains("It did not stop in time to archive this run"));
+        let data = plain.content.data.as_ref().unwrap();
+        assert!(data.get("archive_path").is_none() && data.get("final_lost").is_none());
+    }
+
+    /// B31 (a): a daemon resume whose store evicted listed windows tells the
+    /// parent the count in its wake, text and data; none, nothing new.
+    #[test]
+    fn reload_resumed_event_counts_evicted_windows_only_above_zero() {
+        let w = carried(true, false, Some("/h/sa_288.json"));
+        let none = build_reload_resumed_event(&w, "sa_301", 0);
+        assert!(none.content.data.as_ref().unwrap().get("evicted_windows").is_none());
+        assert!(!none.content.text.contains("no longer in memory"));
+        let ev = build_reload_resumed_event(&w, "sa_301", 2);
+        assert_eq!(
+            ev.content.text,
+            "Subagent 'integrator' (sa_288) was stopped by a daemon reload and resumed by the daemon as \
+             sa_301; its completion will arrive as sa_301. 2 earlier context windows of the resumed \
+             worker are no longer in memory; it continues from its summary."
+        );
+        let data = ev.content.data.as_ref().unwrap();
+        assert_eq!(data["evicted_windows"], 2);
+        assert_eq!(data["resumed_as"], "sa_301");
+        let one = build_reload_resumed_event(&w, "sa_301", 1);
+        assert!(one.content.text.ends_with(
+            " 1 earlier context window of the resumed worker is no longer in memory; it continues \
+             from its summary."
+        ));
+        assert_eq!(one.content.data.as_ref().unwrap()["evicted_windows"], 1);
+    }
+
+    /// B31 (a): the completion event carries `evicted_windows` and its note
+    /// only when the resumed run's store evicted any; count only.
+    #[test]
+    fn completion_event_counts_evicted_windows_only_above_zero() {
+        let event = |evicted| {
+            build_completion_event(
+                "sa_9",
+                9,
+                "scout",
+                &SubagentStatus::Completed,
+                "done",
+                1.0,
+                Some("sa_8"),
+                None,
+                evicted,
+            )
+        };
+        let none = event(0);
+        assert!(none.content.data.as_ref().unwrap().get("evicted_windows").is_none());
+        assert!(!none.content.text.contains("no longer in memory"));
+        let one = event(1);
+        assert_eq!(one.content.data.as_ref().unwrap()["evicted_windows"], 1);
+        assert!(
+            one.content
+                .text
+                .contains("after 1.0s. Note: 1 earlier context window was no longer in memory. Call"),
+            "{}",
+            one.content.text
+        );
+        let three = event(3);
+        assert_eq!(three.content.data.as_ref().unwrap()["evicted_windows"], 3);
+        assert!(
+            three
+                .content
+                .text
+                .contains(" Note: 3 earlier context windows were no longer in memory. Call"),
+            "{}",
+            three.content.text
+        );
     }
 
     /// The reload wake says who stopped the worker (not the user), that it
@@ -379,6 +660,31 @@ mod tests {
 
         let text = build_reload_carry_event(&carried(true, false, None)).content.text;
         assert!(text.contains("did not stop in time"), "{text}");
+    }
+
+    /// Spec §5: a forced reload that went ahead without the worker's record
+    /// says so in the wake, once, and in its data; an ordinary stop does not.
+    #[test]
+    fn a_forced_reload_wake_says_the_record_was_not_preserved() {
+        let waived = crate::runtime::subagent::CarriedWorker {
+            record_waived: true,
+            ..carried(true, false, Some("/h/sa_288.json"))
+        };
+        let ev = build_reload_carry_event(&waived);
+        let text = &ev.content.text;
+        assert!(
+            text.contains(
+                "and is no longer running. The reload was forced while its record was not durable, so \
+                 that record was not preserved: what it did last may be missing. "
+            ),
+            "{text}"
+        );
+        assert_eq!(text.matches("not preserved").count(), 1, "{text}");
+        assert_eq!(ev.content.data.as_ref().unwrap()["record_waived"], true);
+
+        let ev = build_reload_carry_event(&carried(true, false, Some("/h/sa_288.json")));
+        assert!(!ev.content.text.contains("not preserved"), "{}", ev.content.text);
+        assert!(ev.content.data.unwrap().get("record_waived").is_none());
     }
 
     /// A finished worker whose wake the exec discarded gets the ordinary
@@ -419,6 +725,7 @@ mod tests {
                 timeout_secs: 1,
                 cwd: None,
                 thinking: None,
+                watch_usage: None,
             });
             s.history = Some(vec![Arc::new(
                 serde_json::json!({"role":"user", "content":"task"}),
@@ -572,6 +879,8 @@ mod tests {
             "analysis done",
             3.5,
             None,
+            None,
+            0,
         );
 
         assert_eq!(ev.source.source_type, "subagent");
@@ -730,6 +1039,8 @@ mod tests {
             "clean preview text",
             1.0,
             None,
+            None,
+            0,
         );
         assert!(ev.content.text.contains("clean preview text"));
     }
@@ -745,6 +1056,8 @@ mod tests {
             "partial output",
             2.0,
             None,
+            None,
+            0,
         );
 
         let data = ev.content.data.as_ref().unwrap();

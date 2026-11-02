@@ -1,0 +1,108 @@
+{
+  "properties": {
+    "agent": {
+      "description": "Agent name — resolves to ~/.synaps-cli/agents/<name>.md. Mutually exclusive with system_prompt.",
+      "type": "string"
+    },
+    "context_rollover": {
+      "description": "Optional. \"off\" runs this worker without context rollover; \"inherit\" (the default) follows this session's context management.",
+      "enum": [
+        "inherit",
+        "off"
+      ],
+      "type": "string"
+    },
+    "model": {
+      "description": "Omit to inherit the session foreground qualified identity. Explicit values must be one of subagent_models' listed exact choices.",
+      "type": "string"
+    },
+    "name": {
+      "description": "Short display name for an inline (system_prompt) subagent, e.g. \"gif-recorder\". Shown in the subagent panel and in status/collect output. Letters, digits, - and _ only, max 32. Ignored when agent is set; defaults to \"inline\".",
+      "type": "string"
+    },
+    "role": {
+      "description": "Typed orchestration role.",
+      "enum": [
+        "planner",
+        "implementer",
+        "tester",
+        "reviewer",
+        "researcher",
+        "debugger"
+      ],
+      "type": "string"
+    },
+    "system_prompt": {
+      "description": "Inline system prompt for the subagent. Use when you don't have a named agent file.",
+      "type": "string"
+    },
+    "task": {
+      "description": "The task/prompt to send to the subagent.",
+      "type": "string"
+    },
+    "thinking": {
+      "description": "Worker effort override. Omit for subagent_thinking (default xhigh), independent of foreground thinking. Unsupported model levels are refused.",
+      "enum": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "type": "string"
+    },
+    "timeout": {
+      "description": "Wall-clock limit in seconds. Omit for the session default (config `subagent_timeout`); 0 = no limit. A timed-out worker keeps its full conversation: subagent_resume continues it where it stopped.",
+      "type": "integer"
+    },
+    "write_policy": {
+      "description": "Declared write isolation and path scopes.",
+      "oneOf": [
+        {
+          "properties": {
+            "mode": {
+              "const": "read_only"
+            }
+          },
+          "required": [
+            "mode"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "mode": {
+              "const": "isolated_worktree"
+            }
+          },
+          "required": [
+            "mode"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "mode": {
+              "const": "non_overlapping_paths"
+            },
+            "scopes": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "mode",
+            "scopes"
+          ],
+          "type": "object"
+        }
+      ]
+    }
+  },
+  "required": [
+    "task"
+  ],
+  "type": "object"
+}

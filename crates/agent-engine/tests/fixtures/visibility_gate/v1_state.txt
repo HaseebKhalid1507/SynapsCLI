@@ -1,0 +1,8 @@
+status: Running
+partial_text: "lookingdone"
+tool_log: ["[tool_use]: read — {\"path\":\"src/lib.rs\"}", "[tool_result]: fn main() {}"]
+step: "reading lib.rs"
+tools: 1
+rollover_notice: None
+v2_records: false
+result: SubagentResult { text: "lookingdone", model: "provider/model-b", input_tokens: 150, output_tokens: 30, cache_read: 0, cache_creation: 0, cache_creation_5m: None, cache_creation_1h: None, tool_count: 1, timed_out: false }

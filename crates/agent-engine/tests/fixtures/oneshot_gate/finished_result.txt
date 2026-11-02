@@ -1,0 +1,3 @@
+[subagent:gate] looking. 
+
+gate ok

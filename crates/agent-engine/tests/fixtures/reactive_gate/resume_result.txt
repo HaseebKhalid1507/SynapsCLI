@@ -1,0 +1,1 @@
+{"agent_name":"gate","context":"full","context_basis":"estimate","context_tokens":3273,"handle_id":"sa_<n>","resumed_from":"sa_<n>","status":"running","warning":"Resume timeout is below 300s and may expire during upload or API retries; prefer at least 600s (0 disables the limit)."}

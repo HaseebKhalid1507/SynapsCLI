@@ -21,7 +21,7 @@ use super::{SubagentRegistry, SubagentState, SubagentStatus};
 /// state), and the new image re-registers each id against its archive and
 /// tells the parent, which would otherwise wait for a completion that never
 /// comes.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CarriedWorker {
     pub id: String,
     #[serde(default)]
@@ -54,6 +54,31 @@ pub struct CarriedWorker {
     /// Latest words of the worker (≤ 300 chars), for the wake preview.
     #[serde(default)]
     pub preview: String,
+    /// The daemon resumed this worker after an earlier reload: the run that
+    /// continues it. Its id keeps following that run in the next image.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resumed_as: Option<String>,
+    /// This run is the daemon's own resume of a reload-stopped worker (see
+    /// [`DAEMON_RESUME_MIN_RUN_SECS`]).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub resumed_by_daemon: bool,
+    /// A forced reload went ahead although this run's record was not
+    /// durable or still being written (spec §5): the wake says so.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub record_waived: bool,
+    /// A v2 run stopped without its final record (`archive_path` is
+    /// `None`): its head record, the crash checkpoint `subagent_resume`
+    /// continues from by this path. The next image marks it cancelled when
+    /// it leaves the worker to the model. Absent from older images.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub crash_head: Option<std::path::PathBuf>,
+    /// The run whose v2 final `archive_path` names (`ArchivedRecord::
+    /// v2_final_run`), so the next image reads that final as this run's
+    /// own. `None`: a v1 archive, or a record an older image wrote (its
+    /// path then reads as a v1 archive, which refuses a v2 final: collect
+    /// and status fail closed). Older images ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub v2_final_run: Option<String>,
 }
 
 impl CarriedWorker {
@@ -65,6 +90,101 @@ impl CarriedWorker {
 
 /// At most this many reaped archives ride along a reload (paths only).
 pub const MAX_CARRIED_ARCHIVES: usize = 1024;
+
+/// At most this many reload-stopped workers per session are resumed by the
+/// daemon after one reload, oldest handle first; the rest are left to the
+/// model with today's wake. Only a worker actually resumed counts: a
+/// launch that is refused (the resume size rule) or fails takes no slot,
+/// and the next worker in line gets the try ([`DaemonResumeSlots`]). The
+/// same as the default `subagent.max_concurrent`, so the workers the daemon
+/// resumes can all run at once.
+pub const DAEMON_RESUME_CAP: usize = 16;
+
+/// Once per reload generation: a run the daemon itself started by resuming
+/// a reload-stopped worker is resumed again by the daemon after the next
+/// reload only if it had run at least this long (10 minutes) when that
+/// reload stopped it. A worker cut again sooner (reloads in quick
+/// succession) is left to the model, so a reload loop can't keep
+/// re-launching it.
+pub const DAEMON_RESUME_MIN_RUN_SECS: u64 = 600;
+
+/// What the new image does about one worker whose wake it owes the parent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DaemonResume {
+    /// The daemon resumes it from its archive.
+    Resume,
+    /// Left to the model: today's wake, with this reason added.
+    Leave(String),
+}
+
+/// [`DaemonResume`] for each of `woken` (in order): `None` for a worker the
+/// reload did not stop (a lost completion keeps its plain wake). A worker
+/// the reload stopped is resumed when its conversation was archived and it
+/// is not a daemon resume cut again within [`DAEMON_RESUME_MIN_RUN_SECS`].
+/// The cap is not applied here: the launches are tried in
+/// [`daemon_resume_order`], and [`DaemonResumeSlots`] counts the ones that
+/// started a run.
+pub fn plan_daemon_resumes(woken: &[&CarriedWorker]) -> Vec<Option<DaemonResume>> {
+    let mut plan: Vec<Option<DaemonResume>> = vec![None; woken.len()];
+    for (i, w) in woken.iter().enumerate() {
+        if !w.stopped_by_reload {
+            continue;
+        }
+        plan[i] = Some(if w.archive_path.is_none() && w.crash_head.is_some() {
+            // Its head is the crash checkpoint: the model resumes it by
+            // that path if it wants it (it may predate the last work).
+            DaemonResume::Leave("its final record was lost".into())
+        } else if w.archive_path.is_none() {
+            DaemonResume::Leave("its conversation was not archived".into())
+        } else if w.resumed_by_daemon && w.elapsed_secs < DAEMON_RESUME_MIN_RUN_SECS {
+            DaemonResume::Leave(format!(
+                "the daemon already resumed it after the previous reload and it ran only {}s since",
+                w.elapsed_secs
+            ))
+        } else {
+            DaemonResume::Resume
+        });
+    }
+    plan
+}
+
+/// The order the daemon tries its resumes in: the indexes of `plan`'s
+/// [`DaemonResume::Resume`] entries (one per worker of `woken`), oldest
+/// handle first.
+pub fn daemon_resume_order(woken: &[&CarriedWorker], plan: &[Option<DaemonResume>]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..woken.len())
+        .filter(|&i| matches!(plan.get(i), Some(Some(DaemonResume::Resume))))
+        .collect();
+    order.sort_by_key(|&i| (handle_number(&woken[i].id), woken[i].id.clone()));
+    order
+}
+
+/// The daemon's resume slots for one session after one reload: at most
+/// [`DAEMON_RESUME_CAP`] workers resumed. Only a launch that started a run
+/// takes a slot; one refused (the resume size rule) or failed leaves it to
+/// the next worker in line.
+#[derive(Debug, Default)]
+pub struct DaemonResumeSlots {
+    resumed: usize,
+}
+
+impl DaemonResumeSlots {
+    /// `Some(why)` once every slot is taken: the next worker is left to the
+    /// model with this reason.
+    pub fn full(&self) -> Option<String> {
+        (self.resumed >= DAEMON_RESUME_CAP).then(|| {
+            format!("the daemon resumes at most {DAEMON_RESUME_CAP} workers per session after a reload")
+        })
+    }
+
+    /// A launch ended; `resumed`: it started the run that continues the
+    /// worker.
+    pub fn launched(&mut self, resumed: bool) {
+        if resumed {
+            self.resumed += 1;
+        }
+    }
+}
 
 /// `sa_12` → 12 (handle ids from `subagent_start`/`resume`/`subagent`).
 pub fn handle_number(id: &str) -> Option<u64> {
@@ -119,29 +239,51 @@ impl SubagentRegistry {
                     wake: stopped_by_reload || wake_lost,
                     elapsed_secs: h.elapsed_secs() as u64,
                     preview: source.chars().take(300).collect(),
+                    resumed_as: None,
+                    resumed_by_daemon: self.resumed_by_daemon.contains(&h.id),
+                    record_waived: crate::tools::worker_records::record_waived(&h.id),
+                    // A v2 run whose final was not published (its write
+                    // failed, or the exec comes first): its head is the
+                    // crash checkpoint the next image names and marks.
+                    crash_head: if s.v2_records && s.archive_path.is_none() {
+                        s.v2_head.clone()
+                    } else {
+                        None
+                    },
+                    // Set only with the final's path (`archived_record`).
+                    v2_final_run: s.archive_path.as_ref().and(s.v2_final_run.clone()),
                 }
             })
             .collect();
         let live: std::collections::HashSet<&String> = self.handles.keys().collect();
-        let mut reaped: Vec<(&String, &std::path::PathBuf)> = self
+        let mut reaped: Vec<(&String, &super::ArchivedRecord)> = self
             .archived
             .iter()
             .filter(|(id, _)| !live.contains(id))
             .collect();
         // Newest ids first when the cap bites.
         reaped.sort_by_key(|(id, _)| std::cmp::Reverse(handle_number(id)));
-        carried.extend(reaped.into_iter().take(MAX_CARRIED_ARCHIVES).map(|(id, path)| {
+        // A path and, for a v2 final (here or on a live handle above), the
+        // run that published it: the next image reads that final only as
+        // that run's (resume reads records by their file either way).
+        carried.extend(reaped.into_iter().take(MAX_CARRIED_ARCHIVES).map(|(id, record)| {
             CarriedWorker {
                 id: id.clone(),
                 subagent_id: handle_number(id).unwrap_or(0),
                 agent: String::new(),
                 status: "archived".into(),
-                archive_path: Some(path.clone()),
+                archive_path: Some(record.path.clone()),
                 stopped_by_reload: self.stopped_by_reload.contains(id),
                 wake_lost: false,
                 wake: false,
                 elapsed_secs: 0,
                 preview: String::new(),
+                resumed_as: None,
+                resumed_by_daemon: self.resumed_by_daemon.contains(id),
+                // An ended run: it owns nothing a reload could waive.
+                record_waived: false,
+                crash_head: None,
+                v2_final_run: record.v2_final_run.clone(),
             }
         }));
         // Wakes an earlier reload made this image post: carried again only
@@ -158,6 +300,22 @@ impl SubagentRegistry {
                 None => {}
             }
         }
+        // The daemon's own resumes: the old id keeps following the run that
+        // continues it. One still being launched when this reload came
+        // (not reached today: the actor launches before it takes another
+        // command) is announced the old way and not resumed twice.
+        for (old, resumed) in &self.daemon_resumes {
+            if let Some(w) = carried.iter_mut().find(|w| &w.id == old) {
+                match resumed {
+                    Some(new) => w.resumed_as = Some(new.clone()),
+                    None => {
+                        w.wake = true;
+                        w.resumed_by_daemon = true;
+                        w.elapsed_secs = 0;
+                    }
+                }
+            }
+        }
         carried.sort_by_key(|w| (handle_number(&w.id), w.id.clone()));
         carried
     }
@@ -170,11 +328,70 @@ impl SubagentRegistry {
             return;
         }
         if let Some(path) = &worker.archive_path {
-            self.archived.insert(worker.id.clone(), path.clone());
+            self.archived.insert(
+                worker.id.clone(),
+                super::ArchivedRecord {
+                    path: path.clone(),
+                    v2_final_run: worker.v2_final_run.clone(),
+                },
+            );
         }
         if worker.stopped_by_reload {
             self.stopped_by_reload.insert(worker.id.clone());
         }
+        if let Some(new) = &worker.resumed_as {
+            self.daemon_resumes.insert(worker.id.clone(), Some(new.clone()));
+        }
+        if worker.resumed_by_daemon {
+            self.resumed_by_daemon.insert(worker.id.clone());
+        }
+    }
+
+    /// This registry already holds `id` (a running or adopted worker),
+    /// already posted its carried wake, or already resumed it: a repeated
+    /// `AdoptWorkers` (the same record restored twice into one session)
+    /// adopts, wakes and resumes nothing.
+    pub fn adopted_already(&self, id: &str) -> bool {
+        self.handles.contains_key(id)
+            || self.reload_woken.contains_key(id)
+            || self.daemon_resumes.contains_key(id)
+    }
+
+    /// The daemon starts resuming `old` (see [`Self::resumed_as`]).
+    pub fn begin_daemon_resume(&mut self, old: &str) {
+        self.daemon_resumes.insert(old.to_string(), None);
+    }
+
+    /// The daemon's resume of `old` ended: `Some(new)` started the run that
+    /// continues it, `None` failed (the old id is the model's again).
+    pub fn finish_daemon_resume(&mut self, old: &str, new: Option<&str>) {
+        match new {
+            Some(new) => {
+                self.daemon_resumes.insert(old.to_string(), Some(new.to_string()));
+                self.resumed_by_daemon.insert(new.to_string());
+            }
+            None => {
+                self.daemon_resumes.remove(old);
+            }
+        }
+    }
+
+    /// Whether the daemon resumed `id` after a reload: `None` it did not,
+    /// `Some(None)` its launch is under way, `Some(Some(new))` the run that
+    /// continues it now (followed across later daemon resumes of that run).
+    pub fn resumed_as(&self, id: &str) -> Option<Option<String>> {
+        let Some(mut current) = self.daemon_resumes.get(id)?.clone() else {
+            return Some(None);
+        };
+        // Bounded: each hop is a later reload's resume.
+        for _ in 0..64 {
+            match self.daemon_resumes.get(&current) {
+                Some(Some(next)) => current = next.clone(),
+                Some(None) => return Some(None),
+                None => break,
+            }
+        }
+        Some(Some(current))
     }
 
     /// This image posted the parent's wake for a carried worker
@@ -384,6 +601,63 @@ mod tests {
         assert!(w.wake_lost && w.wake);
     }
 
+    /// Train30 item 4b: a reload carries a v2 run's head as its crash
+    /// checkpoint when its final record was not published (a stop whose
+    /// final write failed, or a run not finalized before the exec), never
+    /// beside a published final; the next image leaves it to the model,
+    /// saying its final was lost. The field rides the reload record and is
+    /// absent when unset.
+    #[test]
+    fn a_v2_run_without_its_final_carries_its_head_as_the_crash_checkpoint() {
+        let mut registry = SubagentRegistry::new();
+        let head = std::path::PathBuf::from("/a/1-x/sa_40.head.json");
+        let stopped_handle = |id: &str, head: &str| {
+            let h = make_handle(id);
+            {
+                let mut s = h.state.write().unwrap();
+                s.v2_records = true;
+                s.v2_head = Some(head.into());
+                s.cancel_requested = true;
+                s.stopped_by_reload = true;
+            }
+            h
+        };
+        let failed = stopped_handle("sa_40", "/a/1-x/sa_40.head.json");
+        finalize_as(&failed, SubagentStatus::Cancelled, None);
+        let published = stopped_handle("sa_41", "/a/1-x/sa_41.head.json");
+        finalize_as(&published, SubagentStatus::Cancelled, Some("/a/1-x/sa_41.json"));
+        // Still running at the exec: never finalized.
+        let unfinished = make_handle("sa_42");
+        {
+            let mut s = unfinished.state.write().unwrap();
+            s.v2_records = true;
+            s.v2_head = Some("/a/1-x/sa_42.head.json".into());
+        }
+        registry.register(failed);
+        registry.register(published);
+        registry.register(unfinished);
+        let carried = registry.reload_carry(&Default::default());
+        let by = |id: &str| carried.iter().find(|w| w.id == id).unwrap().clone();
+        let w = by("sa_40");
+        assert!(w.stopped_by_reload && w.archive_path.is_none());
+        assert_eq!(w.crash_head, Some(head.clone()));
+        assert_eq!(by("sa_41").crash_head, None, "its final is published");
+        assert_eq!(
+            by("sa_42").crash_head,
+            Some("/a/1-x/sa_42.head.json".into()),
+            "not finalized before the exec"
+        );
+        let back: CarriedWorker =
+            serde_json::from_value(serde_json::to_value(&w).unwrap()).unwrap();
+        assert_eq!(back.crash_head, Some(head));
+        assert!(serde_json::to_value(by("sa_41")).unwrap().get("crash_head").is_none());
+
+        assert_eq!(
+            plan_daemon_resumes(&[&w]),
+            vec![Some(DaemonResume::Leave("its final record was lost".into()))]
+        );
+    }
+
     /// What a reload records per worker, and how the next image's registry
     /// answers for those ids afterwards.
     #[test]
@@ -411,7 +685,13 @@ mod tests {
         for h in [stopped, stuck, owed, delivered, collected] {
             old.register(h);
         }
-        old.archived.insert("sa_3".into(), "/a/sa_3.json".into());
+        old.archived.insert(
+            "sa_3".into(),
+            super::super::ArchivedRecord {
+                path: "/a/sa_3.json".into(),
+                v2_final_run: None,
+            },
+        );
         assert_eq!(old.stop_for_reload().len(), 2);
         {
             let h = old.get("sa_10").unwrap();
@@ -570,6 +850,7 @@ mod tests {
             wake: true,
             elapsed_secs: 0,
             preview: String::new(),
+            ..Default::default()
         };
         registry.adopt_carried(&stopped_earlier);
         registry.note_reload_wake(&stopped_earlier);
@@ -589,9 +870,13 @@ mod tests {
     fn reload_carry_caps_reaped_archives_keeping_the_newest() {
         let mut registry = SubagentRegistry::new();
         for n in 0..(MAX_CARRIED_ARCHIVES as u64 + 10) {
-            registry
-                .archived
-                .insert(format!("sa_{n}"), format!("/a/sa_{n}.json").into());
+            registry.archived.insert(
+                format!("sa_{n}"),
+                super::super::ArchivedRecord {
+                    path: format!("/a/sa_{n}.json").into(),
+                    v2_final_run: None,
+                },
+            );
         }
         let carried = registry.reload_carry(&Default::default());
         assert_eq!(carried.len(), MAX_CARRIED_ARCHIVES);
@@ -607,5 +892,245 @@ mod tests {
         assert!(!w.needs_wake());
         assert_eq!(handle_number("sa_7"), Some(7));
         assert_eq!(handle_number("x_7"), None);
+    }
+
+    /// The run that published a v2 final rides along a reload with its path
+    /// (a live handle, a tombstone and a reaped record alike), through the
+    /// reload record's JSON and every later reload, so the next image reads
+    /// that final as the run's own. A v1 archive carries none, and its
+    /// record keeps the bytes an older image wrote and reads.
+    #[test]
+    fn a_v2_final_carries_its_run_across_the_reload_record() {
+        let mut old = SubagentRegistry::new();
+        let v2_final = |id: &str, run: &str| {
+            let h = make_finished_handle(id);
+            finalize_as(&h, SubagentStatus::Completed, Some(&format!("/a/{id}.json")));
+            h.state.write().unwrap().v2_final_run = Some(run.into());
+            h
+        };
+        old.register(v2_final("sa_20", "run-20"));
+        old.register(v2_final("sa_21", "run-21"));
+        old.release_finished_resources("sa_21");
+        let v1 = make_finished_handle("sa_22");
+        finalize_as(&v1, SubagentStatus::Completed, Some("/a/sa_22.json"));
+        old.register(v1);
+        for (id, run) in [("sa_3", Some("run-3")), ("sa_4", None)] {
+            old.archived.insert(
+                id.into(),
+                super::super::ArchivedRecord {
+                    path: format!("/a/{id}.json").into(),
+                    v2_final_run: run.map(String::from),
+                },
+            );
+        }
+        let record = |id: &str, run: Option<&str>| {
+            Some(super::super::ArchivedRecord {
+                path: format!("/a/{id}.json").into(),
+                v2_final_run: run.map(String::from),
+            })
+        };
+        let runs = [
+            ("sa_3", Some("run-3")),
+            ("sa_4", None),
+            ("sa_20", Some("run-20")),
+            ("sa_21", Some("run-21")),
+            ("sa_22", None),
+        ];
+
+        let carried = old.reload_carry(&Default::default());
+        let json = serde_json::to_string(&carried).unwrap();
+        let back: Vec<CarriedWorker> = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, carried);
+        let mut new = SubagentRegistry::new();
+        for w in &back {
+            new.adopt_carried(w);
+        }
+        for (id, run) in runs {
+            assert_eq!(new.archived_record(id), record(id, run), "{id}");
+        }
+        // And again at the next reload, from the adopted records.
+        let again = new.reload_carry(&Default::default());
+        let mut newer = SubagentRegistry::new();
+        for w in &again {
+            newer.adopt_carried(w);
+        }
+        for (id, run) in runs {
+            assert_eq!(newer.archived_record(id), record(id, run), "{id}");
+        }
+
+        // A v1 entry writes no key: the bytes an older image wrote.
+        for w in serde_json::to_value(&carried).unwrap().as_array().unwrap() {
+            let v2 = matches!(w["id"].as_str(), Some("sa_3" | "sa_20" | "sa_21"));
+            assert_eq!(w.get("v2_final_run").is_some(), v2, "{w}");
+        }
+        // An older image's struct (no such field) reads the new record.
+        #[derive(serde::Deserialize)]
+        struct OlderCarriedWorker {
+            id: String,
+            status: String,
+            #[serde(default)]
+            archive_path: Option<std::path::PathBuf>,
+        }
+        let older: Vec<OlderCarriedWorker> = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            older.iter().map(|w| (&w.id, &w.status, &w.archive_path)).collect::<Vec<_>>(),
+            carried.iter().map(|w| (&w.id, &w.status, &w.archive_path)).collect::<Vec<_>>()
+        );
+        // A record an older image wrote names no run: its path is adopted
+        // as a v1 archive (a v2 final there is then refused, never read).
+        let w: CarriedWorker = serde_json::from_value(serde_json::json!({
+            "id": "sa_9", "status": "archived", "archive_path": "/a/sa_9.json"
+        }))
+        .unwrap();
+        new.adopt_carried(&w);
+        assert_eq!(new.archived_record("sa_9"), record("sa_9", None));
+    }
+
+    fn stopped(id: &str, archived: bool) -> CarriedWorker {
+        CarriedWorker {
+            id: id.into(),
+            subagent_id: handle_number(id).unwrap_or(0),
+            agent: "digger".into(),
+            status: "cancelled".into(),
+            archive_path: archived.then(|| format!("/a/{id}.json").into()),
+            stopped_by_reload: true,
+            wake: true,
+            elapsed_secs: 30,
+            ..Default::default()
+        }
+    }
+
+    /// What the next image resumes itself: a reload-stopped worker with an
+    /// archive. Not a lost completion (its plain wake stays), not one with
+    /// no archive (mutant: drop the archive check). The plan caps nothing
+    /// (the cap counts the runs started, [`DaemonResumeSlots`]); the
+    /// launches go oldest handle first, whatever order the record hands
+    /// the workers over in.
+    #[test]
+    fn the_daemon_tries_every_archived_reload_stopped_worker_oldest_first() {
+        let lost = CarriedWorker { stopped_by_reload: false, wake_lost: true, ..stopped("sa_2", true) };
+        let unarchived = stopped("sa_3", false);
+        // Twenty candidates, more than the cap, out of handle order.
+        let mut candidates: Vec<CarriedWorker> = (4..24).rev().map(|n| stopped(&format!("sa_{n}"), true)).collect();
+        candidates.push(lost.clone());
+        candidates.push(unarchived.clone());
+        let woken: Vec<&CarriedWorker> = candidates.iter().collect();
+        let plan = plan_daemon_resumes(&woken);
+        let of = |id: &str| plan[candidates.iter().position(|w| w.id == id).unwrap()].clone();
+        assert_eq!(of("sa_2"), None, "a lost completion keeps its plain wake");
+        assert_eq!(
+            of("sa_3"),
+            Some(DaemonResume::Leave("its conversation was not archived".into()))
+        );
+        for n in 4..24 {
+            assert_eq!(of(&format!("sa_{n}")), Some(DaemonResume::Resume), "sa_{n}");
+        }
+        let order: Vec<&str> =
+            daemon_resume_order(&woken, &plan).into_iter().map(|i| woken[i].id.as_str()).collect();
+        let oldest_first: Vec<String> = (4..24).map(|n| format!("sa_{n}")).collect();
+        assert_eq!(order, oldest_first);
+    }
+
+    /// The cap counts workers actually resumed: sixteen per session after
+    /// one reload, and a launch refused or failed takes no slot (mutant:
+    /// every launch takes one).
+    #[test]
+    fn only_a_worker_actually_resumed_takes_one_of_sixteen_slots() {
+        let mut slots = DaemonResumeSlots::default();
+        slots.launched(false);
+        slots.launched(false);
+        for n in 0..DAEMON_RESUME_CAP {
+            assert_eq!(slots.full(), None, "slot {n} is free");
+            slots.launched(true);
+        }
+        assert_eq!(
+            slots.full().as_deref(),
+            Some("the daemon resumes at most 16 workers per session after a reload")
+        );
+        assert_eq!(DAEMON_RESUME_CAP, 16);
+    }
+
+    /// Once per reload generation: a run the daemon started is resumed by
+    /// it again only if it ran at least ten minutes before the next reload
+    /// cut it (mutant: drop the `resumed_by_daemon` check).
+    #[test]
+    fn a_daemon_resume_cut_again_within_ten_minutes_is_left_to_the_model() {
+        let quick = CarriedWorker { resumed_by_daemon: true, elapsed_secs: 599, ..stopped("sa_5", true) };
+        let long = CarriedWorker { resumed_by_daemon: true, elapsed_secs: 600, ..stopped("sa_6", true) };
+        let first = CarriedWorker { elapsed_secs: 5, ..stopped("sa_7", true) };
+        let plan = plan_daemon_resumes(&[&quick, &long, &first]);
+        let Some(DaemonResume::Leave(why)) = &plan[0] else { panic!("{plan:?}") };
+        assert!(why.contains("already resumed it after the previous reload"), "{why}");
+        assert_eq!(plan[1], Some(DaemonResume::Resume));
+        assert_eq!(plan[2], Some(DaemonResume::Resume), "a first stop is resumed however short");
+        assert_eq!(DAEMON_RESUME_MIN_RUN_SECS, 600);
+    }
+
+    /// The old id follows the run the daemon resumed it as, in this image
+    /// and the next: a repeated `AdoptWorkers` resumes nothing again, and
+    /// the resumed run is carried as the daemon's own.
+    #[test]
+    fn a_daemon_resume_alias_survives_the_next_reload() {
+        let mut registry = SubagentRegistry::new();
+        registry.adopt_carried(&stopped("sa_4", true));
+        assert_eq!(registry.resumed_as("sa_4"), None);
+        assert!(!registry.adopted_already("sa_4"));
+        registry.begin_daemon_resume("sa_4");
+        assert_eq!(registry.resumed_as("sa_4"), Some(None), "being resumed");
+        assert!(registry.adopted_already("sa_4"), "a repeated adopt launches nothing");
+        registry.finish_daemon_resume("sa_4", Some("sa_9"));
+        assert_eq!(registry.resumed_as("sa_4"), Some(Some("sa_9".into())));
+        registry.register(make_handle("sa_9"));
+
+        // The next reload stops sa_9 and carries both.
+        registry.stop_for_reload();
+        finalize_as(registry.get("sa_9").unwrap(), SubagentStatus::Completed, Some("/a/sa_9.json"));
+        let carried = registry.reload_carry(&Default::default());
+        let by = |id: &str| carried.iter().find(|w| w.id == id).unwrap().clone();
+        assert_eq!(by("sa_4").resumed_as.as_deref(), Some("sa_9"));
+        assert!(!by("sa_4").needs_wake(), "its news was delivered as sa_9's");
+        let w = by("sa_9");
+        assert!(w.resumed_by_daemon && w.stopped_by_reload && w.needs_wake(), "{w:?}");
+
+        // The image after: sa_4 still follows sa_9, and a second daemon
+        // resume of sa_9 extends the chain.
+        let mut next = SubagentRegistry::new();
+        for w in &carried {
+            next.adopt_carried(w);
+        }
+        assert_eq!(next.resumed_as("sa_4"), Some(Some("sa_9".into())));
+        assert!(next.adopted_already("sa_4"));
+        next.begin_daemon_resume("sa_9");
+        assert_eq!(next.resumed_as("sa_4"), Some(None), "the chain's run is being resumed");
+        next.finish_daemon_resume("sa_9", Some("sa_12"));
+        assert_eq!(next.resumed_as("sa_4"), Some(Some("sa_12".into())));
+        // A failed launch hands the id back to the model.
+        next.begin_daemon_resume("sa_12");
+        next.finish_daemon_resume("sa_12", None);
+        assert_eq!(next.resumed_as("sa_12"), None);
+        assert_eq!(next.resumed_as("sa_4"), Some(Some("sa_12".into())));
+
+        // An unknown or older record reads without the new fields.
+        let w: CarriedWorker = serde_json::from_value(serde_json::json!({"id": "sa_1", "status": "cancelled"})).unwrap();
+        assert_eq!((w.resumed_as, w.resumed_by_daemon), (None, false));
+        let plain = serde_json::to_value(stopped("sa_1", true)).unwrap();
+        assert!(plain.get("resumed_as").is_none() && plain.get("resumed_by_daemon").is_none(), "{plain}");
+    }
+
+    /// A launch still under way when a reload comes (not reached today: the
+    /// actor finishes its launches first) is announced the old way and
+    /// never resumed twice.
+    #[test]
+    fn a_daemon_resume_still_launching_is_carried_as_a_plain_wake() {
+        let mut registry = SubagentRegistry::new();
+        registry.adopt_carried(&stopped("sa_4", true));
+        registry.begin_daemon_resume("sa_4");
+        // `wait`/`collect`/`subagent_resume` read this as "being resumed".
+        assert_eq!(registry.resumed_as("sa_4"), Some(None));
+        assert_eq!(registry.resumed_as("sa_5"), None);
+        let carried = registry.reload_carry(&Default::default());
+        let w = carried.iter().find(|w| w.id == "sa_4").unwrap();
+        assert!(w.needs_wake() && w.resumed_by_daemon && w.resumed_as.is_none(), "{w:?}");
+        assert!(matches!(plan_daemon_resumes(&[w])[0], Some(DaemonResume::Leave(_))));
     }
 }

@@ -1,0 +1,15 @@
+=== <timestamp>-gate.md
+# Subagent: gate
+Date: <timestamp>
+Model: sonnet
+Task: Read /nonexistent/oneshot-gate.txt and report what it says.
+Duration: <secs>s
+Tokens: 24in/6out (8cr/10cw)
+Context: about 3,040 tokens (estimate)
+Tools used: 1
+
+## Result
+
+looking. 
+
+gate ok

@@ -1,0 +1,4 @@
+Agent(SubagentStart { subagent_id: <id>, agent_name: "gate", task_preview: "Read /nonexistent/reactive-gate.txt and report what it says." })
+Agent(SubagentUpdate { subagent_id: <id>, agent_name: "gate", status: "⚙ read (tool #1)" })
+Agent(SubagentUpdate { subagent_id: <id>, agent_name: "gate", status: "reading reactive-gate.txt" })
+Agent(SubagentDone { subagent_id: <id>, agent_name: "gate", result_preview: "looking. \n\nanswer 1", duration_secs: <secs> })

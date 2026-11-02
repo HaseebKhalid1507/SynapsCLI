@@ -1,0 +1,2 @@
+Agent(SubagentStart { subagent_id: <id>, agent_name: "gate", task_preview: "Now say what you would read next." })
+Agent(SubagentDone { subagent_id: <id>, agent_name: "gate", result_preview: "answer 2", duration_secs: <secs> })

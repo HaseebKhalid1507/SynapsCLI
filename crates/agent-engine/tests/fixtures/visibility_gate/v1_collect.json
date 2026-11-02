@@ -1,0 +1,18 @@
+{
+  "archiveError": null,
+  "archive_path": "<dir>/sa_g1.json",
+  "authorization": null,
+  "collected": false,
+  "handle_id": "sa_g1",
+  "model": "claude-sonnet-4-6",
+  "output": "lookingdone",
+  "status": "completed",
+  "terminal_cause": {
+    "category": "completed",
+    "code": "completed",
+    "correlation_id": "sa_g1",
+    "network_attempted": true,
+    "safe_message": "worker completed",
+    "stage": "inference"
+  }
+}

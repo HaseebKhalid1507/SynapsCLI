@@ -1,0 +1,5 @@
+=== <timestamp>-gate-error.md
+# Subagent ERROR: gate
+Task: Read /nonexistent/oneshot-gate.txt and report what it says.
+Context: about 3,040 tokens (estimate)
+Error: Bad request (HTTP 400 [invalid_request_error]). Provider error details withheld — they can echo request content. [provider_failed code=api_status correlation=turn-<pid>-<n>]

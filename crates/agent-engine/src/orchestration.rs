@@ -4,7 +4,7 @@ use agent_core::orchestration::{
 };
 use agent_core::prompt::QualifiedModelId;
 use serde::Serialize;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Mutex;
 
 /// Why a delegation was refused before any worker was built. How many
@@ -43,6 +43,15 @@ struct DelegationTreeState {
     depth_by_worker: BTreeMap<String, u16>,
     parent_by_worker: BTreeMap<String, String>,
     descendants: usize,
+    /// Who delegated each worker (`<root>` for the foreground). Unlike
+    /// `parent_by_worker` it outlives the worker's live edge: a finished
+    /// child still belongs to its parent's subtree until the policy forgets
+    /// it, which is what a worker's own completion gate counts. A refused
+    /// dispatch drops its entry at once ([`OrchestrationRuntime::abandon_delegation`]).
+    /// The policy's `max_total` does not strictly bound the retained entries
+    /// between reaper passes: a reconciled worker stops counting against it
+    /// before the reaper retires it.
+    owner_by_worker: BTreeMap<String, String>,
 }
 
 /// Session-scoped runtime enforcement shared by every subagent tool path.
@@ -54,6 +63,15 @@ pub struct OrchestrationRuntime {
 struct Inner {
     registry: WorkerRegistry,
     handles: HashMap<String, agent_core::orchestration::WorkerHandle>,
+}
+
+/// Who asks the pending-worker gate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DelegationOwner<'a> {
+    /// The top-level session: the root owner of every worker.
+    Session,
+    /// One worker, by runtime handle (`sa_*`).
+    Worker(&'a str),
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -288,14 +306,27 @@ impl OrchestrationRuntime {
     /// runtimes. `parent=None` is a foreground-root child. Only nesting depth
     /// is bounded here: fan-out and totals are the delegation policy's
     /// limits, checked right after in the same spawn path. Every denial is
-    /// fail-closed and leaves the tree unchanged.
+    /// fail-closed and leaves the tree unchanged. A worker ID the completion
+    /// registry still holds, or whose owner is still recorded, is a duplicate
+    /// even after its edge was released, so a recorded owner is never
+    /// replaced. On success the worker's owner is recorded in
+    /// `owner_by_worker`, which outlives the edge (completion-lifetime
+    /// ownership, read by `completion_gate_for` and
+    /// `unreconciled_descendants_of`). Lock order: tree, then the completion
+    /// registry.
     pub fn reserve_delegation(
         &self,
         worker_id: &str,
         parent: Option<&str>,
     ) -> Result<u16, DelegationTreeDenied> {
         let mut tree = self.tree.lock().unwrap();
-        if tree.depth_by_worker.contains_key(worker_id) {
+        // A handle the completion registry still holds is a duplicate too,
+        // also after its edge was released: its first owner is kept.
+        let held = self.inner.lock().unwrap().handles.contains_key(worker_id);
+        if tree.depth_by_worker.contains_key(worker_id)
+            || tree.owner_by_worker.contains_key(worker_id)
+            || held
+        {
             return Err(DelegationTreeDenied::DuplicateWorker);
         }
         let depth = match parent {
@@ -315,6 +346,8 @@ impl OrchestrationRuntime {
         let parent_key = parent.unwrap_or("<root>");
         tree.depth_by_worker.insert(worker_id.to_string(), depth);
         tree.parent_by_worker
+            .insert(worker_id.to_string(), parent_key.to_string());
+        tree.owner_by_worker
             .insert(worker_id.to_string(), parent_key.to_string());
         tree.descendants += 1;
         Ok(depth)
@@ -342,8 +375,63 @@ impl OrchestrationRuntime {
         }
     }
 
+    /// Runtime handles of `owner`'s running and terminal-but-unreconciled
+    /// descendants (children, grandchildren, ...), never the owner itself or
+    /// a sibling. `Session` is the root owner and reports exactly the
+    /// session-wide unreconciled set (`unreconciled_runtime_handles`).
+    ///
+    /// Ownership is the policy's owner tree (`owner_by_worker`, the same one
+    /// `completion_gate_for` reads): it outlives the live edge, a retired
+    /// worker's children pass to its owner, and a refused dispatch leaves no
+    /// entry. Lock order: the tree, then the completion registry, both held
+    /// for one consistent snapshot.
+    pub fn unreconciled_descendants_of(&self, owner: DelegationOwner<'_>) -> BTreeSet<String> {
+        let tree = self.tree.lock().unwrap();
+        let inner = self.inner.lock().unwrap();
+        let unreconciled = inner.registry.all_unreconciled_ids();
+        let in_subtree = |worker: &str, owner: &str| {
+            let mut current = worker;
+            // Owner chains end at `<root>`; the bound only guards against a
+            // corrupted map, never a real tree (depth is bounded far below).
+            for _ in 0..=usize::from(u16::MAX) {
+                match tree.owner_by_worker.get(current) {
+                    Some(parent) if parent == owner => return true,
+                    Some(parent) => current = parent,
+                    None => return false,
+                }
+            }
+            false
+        };
+        inner
+            .handles
+            .iter()
+            .filter(|(_, handle)| unreconciled.iter().any(|id| id == handle.id()))
+            .filter(|(runtime_id, _)| match owner {
+                DelegationOwner::Session => true,
+                DelegationOwner::Worker(owner) => in_subtree(runtime_id, owner),
+            })
+            .map(|(runtime_id, _)| runtime_id.clone())
+            .collect()
+    }
+
+    /// Undo a reservation whose worker never launched: its model, policy or
+    /// capacity check refused it, or anything else failed before the policy
+    /// authorized a handle for it. The live edge is released and its owner
+    /// entry dropped, so a refused dispatch leaves nothing behind. Only for
+    /// a worker the policy never authorized (it has no children).
+    pub fn abandon_delegation(&self, worker_id: &str) {
+        self.release_delegation(worker_id, None);
+        self.forget_owners([worker_id]);
+    }
+
     pub fn delegation_descendants(&self) -> usize {
         self.tree.lock().unwrap().descendants
+    }
+
+    /// How many workers the policy still remembers an owner for.
+    #[cfg(test)]
+    pub(crate) fn owner_entries(&self) -> usize {
+        self.tree.lock().unwrap().owner_by_worker.len()
     }
     pub fn preflight(&self, model: &str) -> Result<(), String> {
         let model = QualifiedModelId::parse(model)
@@ -507,10 +595,31 @@ impl OrchestrationRuntime {
     }
 
     pub fn rollback(&self, runtime_handle: &str) {
-        let mut inner = self.inner.lock().unwrap();
-        if let Some(handle) = inner.handles.get(runtime_handle).cloned() {
-            let _ = inner.registry.rollback_dispatch(&handle);
-            inner.handles.remove(runtime_handle);
+        {
+            let mut inner = self.inner.lock().unwrap();
+            if let Some(handle) = inner.handles.get(runtime_handle).cloned() {
+                let _ = inner.registry.rollback_dispatch(&handle);
+                inner.handles.remove(runtime_handle);
+            }
+        }
+        self.forget_owners([runtime_handle]);
+    }
+
+    /// Drop the owner entries of workers the policy no longer tracks. A
+    /// forgotten worker's own children pass to its owner, so a worker that
+    /// ended before its child (a running child never blocks) still leaves
+    /// that child in its parent's subtree.
+    fn forget_owners<'a>(&self, workers: impl IntoIterator<Item = &'a str>) {
+        let mut tree = self.tree.lock().unwrap();
+        for worker in workers {
+            let Some(owner) = tree.owner_by_worker.remove(worker) else {
+                continue;
+            };
+            for parent in tree.owner_by_worker.values_mut() {
+                if parent == worker {
+                    parent.clone_from(&owner);
+                }
+            }
         }
     }
 
@@ -641,14 +750,19 @@ impl OrchestrationRuntime {
     /// Reaper handoff: use exact IDs removed under the runtime registry lock,
     /// never a complement snapshot that could include newly registered workers.
     pub fn retire_reconciled(&self, removed_handles: &HashSet<String>) {
-        let mut inner = self.inner.lock().unwrap();
-        for id in removed_handles {
-            if let Some(handle) = inner.handles.get(id).cloned() {
-                if inner.registry.retire_reconciled(&handle) {
-                    inner.handles.remove(id);
+        let mut retired = Vec::new();
+        {
+            let mut inner = self.inner.lock().unwrap();
+            for id in removed_handles {
+                if let Some(handle) = inner.handles.get(id).cloned() {
+                    if inner.registry.retire_reconciled(&handle) {
+                        inner.handles.remove(id);
+                        retired.push(id.as_str());
+                    }
                 }
             }
         }
+        self.forget_owners(retired);
     }
 
     /// Snapshot runtime handle IDs still named by the completion gate. Taking this
@@ -674,6 +788,53 @@ impl OrchestrationRuntime {
     /// Whether a runtime handle is still named by the policy completion gate.
     pub fn is_unreconciled(&self, runtime_handle: &str) -> bool {
         self.unreconciled_runtime_handles().contains(runtime_handle)
+    }
+
+    /// The completion gate as one runtime sees it. `None` is the foreground
+    /// root: the session-wide gate, exactly `completion_gate()`. A worker's
+    /// own runtime (`Some(its handle)`) counts only its delegation subtree,
+    /// the workers it delegated directly or through its descendants: a
+    /// sibling the parent read but has not reconciled, or any other worker
+    /// of the session, never blocks it.
+    ///
+    /// The subtree is per run. A resume is a new handle whose subtree starts
+    /// empty: children the earlier run started stay under that run (and pass
+    /// to its owner when it retires), and the foreground always counts them.
+    /// The resumed run does not inherit them, because that would block it on
+    /// children it may not be able to reconcile.
+    pub fn completion_gate_for(&self, owner: Option<&str>) -> CompletionGate {
+        let gate = self.completion_gate();
+        let Some(owner) = owner else {
+            return gate;
+        };
+        let tree = self.tree.lock().unwrap();
+        let in_subtree = |worker: &str| {
+            let mut current = worker;
+            // Owner chains end at `<root>`; the bound only guards against a
+            // corrupted map, never a real tree (depth is bounded far below).
+            for _ in 0..=usize::from(u16::MAX) {
+                match tree.owner_by_worker.get(current) {
+                    Some(parent) if parent == owner => return true,
+                    Some(parent) => current = parent,
+                    None => return false,
+                }
+            }
+            false
+        };
+        let mine = |workers: Vec<String>| -> Vec<String> {
+            workers.into_iter().filter(|w| in_subtree(w)).collect()
+        };
+        match gate {
+            CompletionGate::Allowed => CompletionGate::Allowed,
+            CompletionGate::Warning { workers } => match mine(workers) {
+                workers if workers.is_empty() => CompletionGate::Allowed,
+                workers => CompletionGate::Warning { workers },
+            },
+            CompletionGate::Blocked { workers } => match mine(workers) {
+                workers if workers.is_empty() => CompletionGate::Allowed,
+                workers => CompletionGate::Blocked { workers },
+            },
+        }
     }
 
     pub fn completion_gate(&self) -> CompletionGate {
@@ -1210,6 +1371,7 @@ mod capacity_recovery_tests {
             max_concurrent: 16,
             max_total: 64,
             max_depth: 4,
+            ..Default::default()
         };
         let rt = OrchestrationRuntime::from_limits(
             QualifiedModelId::parse("anthropic/claude-fable-5").unwrap(),
@@ -1263,5 +1425,306 @@ mod capacity_recovery_tests {
             rt.completion_gate(),
             CompletionGate::Blocked { .. }
         ));
+    }
+}
+
+/// G*: the owner-scoped pending-worker gate over completion-lifetime
+/// ownership (the policy's owner tree).
+#[cfg(test)]
+mod descendant_gate_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn rt() -> OrchestrationRuntime {
+        OrchestrationRuntime::baseline(
+            QualifiedModelId::parse("anthropic/claude-fable-5").unwrap(),
+            16,
+            64,
+        )
+        .unwrap()
+    }
+
+    /// The start path's order: tree edge, policy authorization, lifecycle.
+    fn spawn(rt: &OrchestrationRuntime, id: &str, parent: Option<&str>) {
+        rt.reserve_delegation(id, parent).unwrap();
+        rt.resolve_and_authorize(id, None).unwrap();
+        rt.mark_starting(id).unwrap();
+        rt.mark_running(id).unwrap();
+    }
+
+    /// Terminal + collected, then the finalizer's reservation release.
+    fn finish(rt: &OrchestrationRuntime, id: &str, parent: Option<&str>) {
+        rt.terminal_and_collect(id, WorkerTerminal::Completed)
+            .unwrap();
+        rt.release_delegation(id, parent);
+    }
+
+    fn of(rt: &OrchestrationRuntime, owner: &str) -> Vec<String> {
+        rt.unreconciled_descendants_of(DelegationOwner::Worker(owner))
+            .into_iter()
+            .collect()
+    }
+
+    fn session(rt: &OrchestrationRuntime) -> Vec<String> {
+        rt.unreconciled_descendants_of(DelegationOwner::Session)
+            .into_iter()
+            .collect()
+    }
+
+    fn ids(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    #[test]
+    fn g1_running_child_counts_for_its_parent_not_for_a_sibling_or_itself() {
+        let rt = rt();
+        spawn(&rt, "sa_p", None);
+        spawn(&rt, "sa_s", None);
+        spawn(&rt, "sa_c", Some("sa_p"));
+        assert_eq!(of(&rt, "sa_p"), ids(&["sa_c"]));
+        assert_eq!(of(&rt, "sa_s"), ids(&[]), "a sibling never defers");
+        assert_eq!(of(&rt, "sa_c"), ids(&[]), "a worker never counts itself");
+        assert_eq!(of(&rt, "sa_unknown"), ids(&[]));
+        assert_eq!(session(&rt), ids(&["sa_c", "sa_p", "sa_s"]));
+    }
+
+    #[test]
+    fn g2_terminal_child_still_counts_after_its_reservation_is_released() {
+        let rt = rt();
+        spawn(&rt, "sa_p", None);
+        spawn(&rt, "sa_c", Some("sa_p"));
+        finish(&rt, "sa_c", Some("sa_p"));
+        assert_eq!(
+            rt.delegation_descendants(),
+            1,
+            "the child's reservation is really gone"
+        );
+        assert_eq!(of(&rt, "sa_p"), ids(&["sa_c"]));
+        rt.reconcile("sa_c").unwrap();
+        assert_eq!(of(&rt, "sa_p"), ids(&[]), "reconciliation removes it");
+        assert_eq!(session(&rt), ids(&["sa_p"]));
+    }
+
+    #[test]
+    fn g3_grandchild_under_a_released_edge_counts_for_the_grandparent_until_reconciled() {
+        let rt = rt();
+        spawn(&rt, "sa_p", None);
+        spawn(&rt, "sa_c", Some("sa_p"));
+        spawn(&rt, "sa_g", Some("sa_c"));
+        // The intermediate finishes; its release takes the grandchild's edge.
+        finish(&rt, "sa_c", Some("sa_p"));
+        assert_eq!(rt.delegation_descendants(), 1, "only sa_p is reserved");
+        assert_eq!(of(&rt, "sa_p"), ids(&["sa_c", "sa_g"]));
+        assert_eq!(of(&rt, "sa_c"), ids(&["sa_g"]));
+        assert_eq!(of(&rt, "sa_g"), ids(&[]));
+        rt.reconcile("sa_c").unwrap();
+        // A reconciled (even retired) intermediate does not hide the grandchild.
+        rt.retire_reconciled(&["sa_c".to_owned()].into_iter().collect());
+        assert_eq!(of(&rt, "sa_p"), ids(&["sa_g"]));
+        finish(&rt, "sa_g", Some("sa_c"));
+        assert_eq!(of(&rt, "sa_p"), ids(&["sa_g"]), "terminal, unreconciled");
+        rt.reconcile("sa_g").unwrap();
+        assert_eq!(of(&rt, "sa_p"), ids(&[]));
+        assert_eq!(session(&rt), ids(&["sa_p"]));
+    }
+
+    /// The session is the root owner: its answer is exactly today's
+    /// session-wide set in every lifecycle state, including workers that
+    /// never reserved a tree edge (oneshot) and edge-released subtrees.
+    #[test]
+    fn g4_session_owner_is_exactly_the_session_wide_unreconciled_set() {
+        let rt = rt();
+        let check = |rt: &OrchestrationRuntime| {
+            let expected: BTreeSet<String> =
+                rt.unreconciled_runtime_handles().into_iter().collect();
+            assert_eq!(
+                rt.unreconciled_descendants_of(DelegationOwner::Session),
+                expected
+            );
+        };
+        check(&rt);
+        spawn(&rt, "sa_a", None);
+        rt.resolve_and_authorize("sa_oneshot", None).unwrap();
+        check(&rt);
+        spawn(&rt, "sa_b", Some("sa_a"));
+        spawn(&rt, "sa_c", Some("sa_b"));
+        check(&rt);
+        finish(&rt, "sa_a", None);
+        check(&rt);
+        assert_eq!(session(&rt).len(), 4);
+        rt.reconcile("sa_a").unwrap();
+        rt.rollback("sa_oneshot");
+        check(&rt);
+        assert_eq!(session(&rt), ids(&["sa_b", "sa_c"]));
+    }
+
+    /// Ancestry has completion lifetime, never longer: denied, unauthorized,
+    /// rolled-back and retired handles leave nothing behind, and a duplicate
+    /// reservation cannot rewrite an existing owner.
+    #[test]
+    fn g5_ownership_is_pruned_with_the_completion_entry_and_never_rewritten() {
+        let rt = rt();
+        spawn(&rt, "sa_p", None);
+        spawn(&rt, "sa_q", None);
+        spawn(&rt, "sa_c", Some("sa_p"));
+        assert_eq!(
+            rt.reserve_delegation("sa_c", Some("sa_q")),
+            Err(DelegationTreeDenied::DuplicateWorker)
+        );
+        assert_eq!(of(&rt, "sa_p"), ids(&["sa_c"]));
+        assert_eq!(of(&rt, "sa_q"), ids(&[]));
+
+        // Reserved, then refused before authorization (start.rs error path).
+        rt.reserve_delegation("sa_denied", Some("sa_p")).unwrap();
+        rt.abandon_delegation("sa_denied");
+        // Authorized, then rolled back before running (mark_starting failure).
+        rt.reserve_delegation("sa_rolled", Some("sa_p")).unwrap();
+        rt.resolve_and_authorize("sa_rolled", None).unwrap();
+        rt.rollback("sa_rolled");
+        rt.release_delegation("sa_rolled", Some("sa_p"));
+        // Reconciled and retired by the reaper.
+        finish(&rt, "sa_c", Some("sa_p"));
+        rt.reconcile("sa_c").unwrap();
+        rt.retire_reconciled(&["sa_c".to_owned()].into_iter().collect());
+
+        let tree = rt.tree.lock().unwrap();
+        let left: Vec<_> = tree.owner_by_worker.keys().cloned().collect();
+        assert_eq!(left, ids(&["sa_p", "sa_q"]));
+        assert!(
+            tree.owner_by_worker.values().all(|owner| owner == "<root>"),
+            "root children"
+        );
+    }
+
+    /// A child reserved but not yet registered when its parent's release
+    /// sweeps the subtree keeps its owners if it still registers, and leaves
+    /// nothing behind if its own spawn then fails and releases it.
+    #[test]
+    fn g7_mid_spawn_descendant_swept_by_a_parent_release() {
+        let rt = rt();
+        spawn(&rt, "sa_p", None);
+        rt.reserve_delegation("sa_late", Some("sa_p")).unwrap();
+        rt.reserve_delegation("sa_fail", Some("sa_p")).unwrap();
+        finish(&rt, "sa_p", None);
+        rt.resolve_and_authorize("sa_late", None).unwrap();
+        assert_eq!(of(&rt, "sa_p"), ids(&["sa_late"]));
+        // Its spawn fails before authorization: start.rs abandons it.
+        rt.abandon_delegation("sa_fail");
+        assert!(!rt.tree.lock().unwrap().owner_by_worker.contains_key("sa_fail"));
+    }
+
+    /// Lock order is tree, then completion registry, and the gate holds both
+    /// for its snapshot. Concurrent spawn/finish/query must neither deadlock
+    /// nor see a worker counted for anyone but its own ancestors. Each worker thread
+    /// holds some running children until the query thread has seen them in
+    /// its owner's answer, so non-empty answers are observed while the other
+    /// thread keeps changing the registry.
+    #[test]
+    fn g6_concurrent_lifecycle_and_queries_keep_owner_scope() {
+        use std::sync::mpsc::{channel, Sender, TryRecvError};
+        type Hold = (&'static str, String, Sender<()>);
+        let rt = Arc::new(rt());
+        spawn(&rt, "sa_root_a", None);
+        spawn(&rt, "sa_root_b", None);
+        let (hold_tx, hold_rx) = channel::<Hold>();
+        let workers: Vec<_> = ["sa_root_a", "sa_root_b"]
+            .into_iter()
+            .map(|parent| {
+                let rt = Arc::clone(&rt);
+                let hold_tx = hold_tx.clone();
+                std::thread::spawn(move || {
+                    for i in 0..50 {
+                        let id = format!("{parent}_{i}");
+                        spawn(&rt, &id, Some(parent));
+                        if i % 10 == 5 {
+                            let (release_tx, release_rx) = channel();
+                            hold_tx.send((parent, id.clone(), release_tx)).unwrap();
+                            release_rx.recv().unwrap();
+                        }
+                        finish(&rt, &id, Some(parent));
+                        rt.reconcile(&id).unwrap();
+                        rt.retire_reconciled(&[id].into_iter().collect());
+                    }
+                })
+            })
+            .collect();
+        drop(hold_tx);
+        let query = {
+            let rt = Arc::clone(&rt);
+            std::thread::spawn(move || {
+                let scoped = |owner: &str, other: &str| {
+                    let answer = rt.unreconciled_descendants_of(DelegationOwner::Worker(owner));
+                    for id in &answer {
+                        assert!(id.starts_with(&format!("{owner}_")), "{id}");
+                        assert!(!id.starts_with(other));
+                    }
+                    answer
+                };
+                let mut held_seen = 0;
+                loop {
+                    scoped("sa_root_a", "sa_root_b");
+                    scoped("sa_root_b", "sa_root_a");
+                    match hold_rx.try_recv() {
+                        Ok((owner, id, release)) => {
+                            let other = if owner == "sa_root_a" {
+                                "sa_root_b"
+                            } else {
+                                "sa_root_a"
+                            };
+                            let answer = scoped(owner, other);
+                            assert!(answer.contains(&id), "{owner} must see {id}: {answer:?}");
+                            held_seen += 1;
+                            release.send(()).unwrap();
+                        }
+                        Err(TryRecvError::Empty) => {}
+                        Err(TryRecvError::Disconnected) => return held_seen,
+                    }
+                }
+            })
+        };
+        for t in workers {
+            t.join().unwrap();
+        }
+        assert_eq!(query.join().unwrap(), 10, "every held child was seen");
+        assert_eq!(of(&rt, "sa_root_a"), ids(&[]));
+        assert_eq!(session(&rt), ids(&["sa_root_a", "sa_root_b"]));
+    }
+
+    /// A reservation for a handle the completion registry still holds is
+    /// refused, also after its edge was released: the owners recorded first
+    /// are never replaced. Only once the entry is retired is the ID free.
+    #[test]
+    fn g8_duplicate_reservation_after_release_keeps_the_first_owner_chain() {
+        let rt = rt();
+        spawn(&rt, "sa_p", None);
+        spawn(&rt, "sa_q", None);
+        spawn(&rt, "sa_c", Some("sa_p"));
+        finish(&rt, "sa_c", Some("sa_p"));
+        let before = rt.delegation_descendants();
+        for parent in [Some("sa_q"), None] {
+            assert_eq!(
+                rt.reserve_delegation("sa_c", parent),
+                Err(DelegationTreeDenied::DuplicateWorker),
+                "{parent:?}"
+            );
+        }
+        assert_eq!(rt.delegation_descendants(), before, "nothing reserved");
+        assert_eq!(of(&rt, "sa_p"), ids(&["sa_c"]));
+        assert_eq!(of(&rt, "sa_q"), ids(&[]));
+        assert_eq!(rt.tree.lock().unwrap().owner_by_worker["sa_c"], "sa_p");
+
+        // An authorized handle that never reserved an edge (oneshot) is
+        // held by the completion registry too.
+        rt.resolve_and_authorize("sa_one", None).unwrap();
+        assert_eq!(
+            rt.reserve_delegation("sa_one", Some("sa_q")),
+            Err(DelegationTreeDenied::DuplicateWorker)
+        );
+        assert!(!rt.tree.lock().unwrap().owner_by_worker.contains_key("sa_one"));
+
+        rt.reconcile("sa_c").unwrap();
+        rt.retire_reconciled(&["sa_c".to_owned()].into_iter().collect());
+        rt.reserve_delegation("sa_c", Some("sa_q")).unwrap();
+        assert_eq!(rt.tree.lock().unwrap().owner_by_worker["sa_c"], "sa_q");
     }
 }

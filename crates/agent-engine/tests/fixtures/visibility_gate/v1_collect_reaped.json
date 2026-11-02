@@ -1,0 +1,10 @@
+{
+  "archive_path": "<dir>/sa_g1.json",
+  "collected": true,
+  "error": null,
+  "handle_id": "sa_g1",
+  "model": "provider/model-b",
+  "note": "Handle was reaped; result read from its resume archive. subagent_resume can still continue this worker.",
+  "output": "lookingdone",
+  "status": "completed"
+}

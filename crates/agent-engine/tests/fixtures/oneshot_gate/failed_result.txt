@@ -1,0 +1,1 @@
+[subagent:gate ERROR] Bad request (HTTP 400 [invalid_request_error]). Provider error details withheld — they can echo request content. [provider_failed code=api_status correlation=turn-<pid>-<n>]

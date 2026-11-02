@@ -76,6 +76,10 @@ pub enum WatchEvent {
     ToolResult {
         tool_id: String,
         result: String,
+        /// The worker's typed memory-only flag (`result` is the placeholder);
+        /// absent = false. Workers get no client tools, so no stamp.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        memory_only: bool,
     },
     /// The call waits behind another in its scheduler lane
     /// (`LlmEvent::ToolQueued`). Only in pages a client asked for with
@@ -127,9 +131,15 @@ impl WatchEvent {
                     delta: delta.clone(),
                 }
             }
-            StreamEvent::Llm(LlmEvent::ToolResult { tool_id, result }) => Self::ToolResult {
+            StreamEvent::Llm(LlmEvent::ToolResult {
+                tool_id,
+                result,
+                memory_only,
+                ..
+            }) => Self::ToolResult {
                 tool_id: tool_id.clone(),
                 result: cap_text(result, TOOL_PAYLOAD_MAX_BYTES),
+                memory_only: *memory_only,
             },
             StreamEvent::Llm(LlmEvent::ToolQueued { tool_id }) => Self::ToolQueued {
                 tool_id: tool_id.clone(),
@@ -178,9 +188,15 @@ impl WatchEvent {
                     delta: delta.clone(),
                 })
             }
-            Self::ToolResult { tool_id, result } => StreamEvent::Llm(LlmEvent::ToolResult {
+            Self::ToolResult {
+                tool_id,
+                result,
+                memory_only,
+            } => StreamEvent::Llm(LlmEvent::ToolResult {
                 tool_id: tool_id.clone(),
                 result: result.clone(),
+                memory_only: *memory_only,
+                client_tool: None,
             }),
             Self::ToolQueued { tool_id } => StreamEvent::Llm(LlmEvent::ToolQueued {
                 tool_id: tool_id.clone(),
@@ -211,7 +227,7 @@ impl WatchEvent {
                     input,
                 } => tool_id.len() + tool_name.len() + input.to_string().len(),
                 Self::ToolResultDelta { tool_id, delta } => tool_id.len() + delta.len(),
-                Self::ToolResult { tool_id, result } => tool_id.len() + result.len(),
+                Self::ToolResult { tool_id, result, .. } => tool_id.len() + result.len(),
                 Self::ToolQueued { tool_id } | Self::ToolStarted { tool_id } => tool_id.len(),
                 Self::Failed { category } => category.len(),
             }
@@ -473,6 +489,7 @@ mod tests {
             WatchEvent::ToolResult {
                 tool_id: "t1".into(),
                 result: "a\n".into(),
+                memory_only: false,
             },
             WatchEvent::Steered {
                 text: "focus".into(),
@@ -550,6 +567,7 @@ mod tests {
             j.push(WatchEvent::ToolResult {
                 tool_id: format!("t{i}"),
                 result: chunk.clone(),
+                memory_only: false,
             });
         }
         assert!(j.bytes <= JOURNAL_MAX_BYTES, "bounded: {}", j.bytes);
@@ -566,6 +584,7 @@ mod tests {
             j.push(WatchEvent::ToolResult {
                 tool_id: format!("t{i}"),
                 result: chunk.clone(),
+                memory_only: false,
             });
         }
         let p1 = j.read(0);
@@ -643,7 +662,7 @@ mod tests {
         j.push(WatchEvent::ToolUseStart { tool_id: "t2".into(), tool_name: "bash".into() });
         j.push(WatchEvent::ToolQueued { tool_id: "t2".into() });
         j.push(WatchEvent::ToolStarted { tool_id: "t2".into() });
-        j.push(WatchEvent::ToolResult { tool_id: "t2".into(), result: "ok".into() });
+        j.push(WatchEvent::ToolResult { tool_id: "t2".into(), result: "ok".into(), memory_only: false });
         let full = j.read(0);
         let old = full.clone().without_tool_queue();
         assert_eq!(old.next_seq, full.next_seq);
@@ -700,6 +719,7 @@ mod tests {
             WatchEvent::ToolResult {
                 tool_id: "t".into(),
                 result: String::new(),
+                memory_only: false,
             },
             41_000,
         );

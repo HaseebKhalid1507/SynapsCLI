@@ -1,0 +1,2 @@
+Agent(SubagentUpdate { subagent_id: 5, agent_name: "worker", status: "⚙ read (tool #1)" })
+Agent(SubagentUpdate { subagent_id: 5, agent_name: "worker", status: "reading lib.rs" })

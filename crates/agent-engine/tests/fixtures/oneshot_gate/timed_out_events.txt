@@ -1,0 +1,5 @@
+Agent(SubagentStart { subagent_id: <id>, agent_name: "gate", task_preview: "Read /nonexistent/oneshot-gate.txt and report what it says." })
+Agent(SubagentUpdate { subagent_id: <id>, agent_name: "gate", status: "⚙ read (tool #1)" })
+Agent(SubagentUpdate { subagent_id: <id>, agent_name: "gate", status: "reading oneshot-gate.txt" })
+Session(Usage { input_tokens: 12, output_tokens: 3, cache_read_input_tokens: 4, cache_creation_input_tokens: 5, cache_creation_5m: Some(5), cache_creation_1h: Some(0), model: Some("anthropic/claude-sonnet-4-6") })
+Agent(SubagentDone { subagent_id: <id>, agent_name: "gate", result_preview: "[TIMED OUT after 3s — partial results below]\n\n[tool_use]: read — {\"path\":\"/nonexistent/oneshot-gate.txt\"}\n[tool_result]:", duration_secs: <secs> })

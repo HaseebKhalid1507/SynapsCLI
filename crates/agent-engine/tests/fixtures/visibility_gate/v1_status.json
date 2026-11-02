@@ -1,0 +1,20 @@
+{
+  "agent_name": "worker",
+  "archiveError": null,
+  "authorization": null,
+  "elapsed_secs": <secs>,
+  "handle_id": "sa_g1",
+  "model": "claude-sonnet-4-6",
+  "output_length": 11,
+  "partial_output": "lookingdone",
+  "status": "completed",
+  "terminal_cause": {
+    "category": "completed",
+    "code": "completed",
+    "correlation_id": "sa_g1",
+    "network_attempted": true,
+    "safe_message": "worker completed",
+    "stage": "inference"
+  },
+  "tool_count": 2
+}

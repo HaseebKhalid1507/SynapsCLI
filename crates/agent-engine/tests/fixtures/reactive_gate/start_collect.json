@@ -1,0 +1,26 @@
+{
+  "archiveError": null,
+  "archive_path": "<base>/subagent-history/<pid>-<id>/sa_<n>.json",
+  "authorization": {
+    "catalog_digest": "6182a7c0b178e3071f6ea268c671ae2ec8bbe528b2f4dac6a567e03042237973",
+    "catalog_snapshot_id": "catalog-6182a7c0b178e307",
+    "correlation_id": "sa_<n>",
+    "cross_provider_grant_id": null,
+    "network_attempted": false,
+    "policy_digest": "5324fb9b63c362be2656790f63fe3a4065019cb2b910191d2c32899ba4bbe37f",
+    "selection_source": "foreground_inheritance"
+  },
+  "collected": false,
+  "handle_id": "sa_<n>",
+  "model": "anthropic/claude-sonnet-4-6",
+  "output": "looking. \n\nanswer 1",
+  "status": "completed",
+  "terminal_cause": {
+    "category": "completed",
+    "code": "completed",
+    "correlation_id": "sa_<n>",
+    "network_attempted": true,
+    "safe_message": "worker completed",
+    "stage": "inference"
+  }
+}

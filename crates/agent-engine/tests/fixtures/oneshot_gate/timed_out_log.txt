@@ -1,0 +1,21 @@
+=== <timestamp>-gate.md
+# Subagent: gate
+Date: <timestamp>
+Model: sonnet
+Task: Read /nonexistent/oneshot-gate.txt and report what it says.
+Duration: <secs>s
+Tokens: 12in/3out (4cr/5cw)
+Context: about 3,040 tokens (estimate)
+Tools used: 1
+
+## Result
+
+[TIMED OUT after 3s — partial results below]
+
+[tool_use]: read — {"path":"/nonexistent/oneshot-gate.txt"}
+[tool_result]: Tool execution failed: Failed to read file '/nonexistent/oneshot-gate.txt': No such file or directory (os error 2)
+
+[partial response]:
+looking. 
+
+partial answer

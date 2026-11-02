@@ -1,0 +1,1 @@
+{"agent_name":"gate","context_basis":"estimate","context_tokens":3040,"handle_id":"sa_<n>","status":"running"}

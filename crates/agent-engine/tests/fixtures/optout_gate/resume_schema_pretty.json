@@ -1,0 +1,48 @@
+{
+  "properties": {
+    "archive_path": {
+      "description": "Optional: a resume archive (.json under ~/.synaps-cli/subagent-history/) of a worker from an earlier or crashed session. handle_id is then only a label.",
+      "type": "string"
+    },
+    "context_rollover": {
+      "description": "Optional. \"off\" runs this worker without context rollover; \"inherit\" (the default) follows this session's context management.",
+      "enum": [
+        "inherit",
+        "off"
+      ],
+      "type": "string"
+    },
+    "full_history": {
+      "description": "Optional (default false): replay the worker's full conversation even when its prompt cache has expired. Otherwise a cold history above subagent_cold_resume_compact_tokens is resumed from a compact context (original task, last steps, final report), avoiding a full cache rewrite. A worker that inherits the session's context management always replays in full (it rolls over instead).",
+      "type": "boolean"
+    },
+    "handle_id": {
+      "description": "Handle ID of the completed subagent to resume (e.g. \"sa_3\").",
+      "type": "string"
+    },
+    "instructions": {
+      "description": "What to do next. Sent as the next user turn after the worker's own prior conversation.",
+      "type": "string"
+    },
+    "thinking": {
+      "description": "Override worker effort for this resumed run. Omit to keep its recorded effort; legacy archives use subagent_thinking (default xhigh). Unsupported model levels are refused.",
+      "enum": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "type": "string"
+    },
+    "timeout": {
+      "description": "Optional wall-clock limit in seconds for the resumed run (default: the prior run's); 0 = no limit. Positive values below 300s emit a warning; prefer at least 600s for API retries.",
+      "type": "integer"
+    }
+  },
+  "required": [
+    "handle_id",
+    "instructions"
+  ],
+  "type": "object"
+}
