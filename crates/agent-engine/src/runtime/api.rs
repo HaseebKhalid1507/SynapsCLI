@@ -1661,6 +1661,10 @@ impl ApiMethods {
         let mut anthropic_failovers: u32 = 0;
         let mut anthropic_attempted: Vec<crate::auth::CredentialRef> = Vec::new();
         let mut quota_headers_logged = false;
+        // `first_event_relaxed`: an attempt of this request ended at the
+        // first-event deadline, so every later attempt waits the progress
+        // window for `message_start` (a cold prefill can be that slow).
+        let mut first_event_relaxed = false;
         // Accounts this request reported exhausted: if one of them then
         // serves (the ordinary retry outlived a short reset), its cooldown
         // goes (`report_served`).
@@ -2334,6 +2338,9 @@ impl ApiMethods {
                 let _ = tx.send(StreamEvent::Llm(LlmEvent::ResponseStart));
             }
             let mut state = ParseState::new();
+            if first_event_relaxed {
+                state.progress.relax_first_event();
+            }
             let ctx = EventCtx {
                 model,
                 tx: &tx,
@@ -2410,16 +2417,20 @@ impl ApiMethods {
             // One line per stream, however it ended: counts and timings only.
             let progress = &state.progress;
             tracing::debug!(
-                "Stream ended: chunks={} pings={} events={} message_start={} max_event_gap_ms={} deadline={}",
+                "Stream ended: chunks={} pings={} events={} message_start={} first_event_ms={} max_event_gap_ms={} deadline={}",
                 progress.chunks,
                 progress.pings,
                 progress.events,
                 progress.message_start_seen,
+                progress
+                    .message_start_after
+                    .map_or_else(|| "none".to_owned(), |d| d.as_millis().to_string()),
                 progress.max_gap.as_millis(),
                 progress
                     .fired
                     .map_or("none", super::http_phases::Deadline::label),
             );
+            first_event_relaxed |= progress.fired == Some(super::http_phases::Deadline::FirstEvent);
 
             // Flush any partial block and return accumulated content
             state.finalize();
@@ -7148,6 +7159,36 @@ mod cancellation_tests {
         assert!(events
             .iter()
             .any(|e| matches!(e, StreamEvent::Llm(LlmEvent::ResponseReset))));
+    }
+
+    /// The first-event deadline is spent once per request: a cold prefill of
+    /// a huge prompt may outlast it, so later attempts wait the progress
+    /// window for message_start. Attempt 2 pings past the first-event limit,
+    /// under the progress one, then replies: two requests, one retry.
+    #[tokio::test]
+    async fn first_event_deadline_relaxes_after_it_fires_once() {
+        let (options, hits, server) = scripted_server(|attempt| match attempt {
+            0 => scripted(Vec::new(), Some(20)),
+            _ => {
+                let mut frames = vec![(100, PING); 7];
+                frames.push((0, COMPLETE));
+                scripted(frames, None)
+            }
+        })
+        .await;
+        let limits = (Duration::from_millis(300), Duration::from_secs(2));
+        let (result, events) = call_within(&options, limits).await;
+        server.abort();
+        assert_eq!(
+            result.unwrap()["content"],
+            json!([{"type": "text", "text": "second attempt"}])
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        let retries = events
+            .iter()
+            .filter(|e| matches!(e, StreamEvent::Session(SessionEvent::Retry(_))))
+            .count();
+        assert_eq!(retries, 1, "no second deadline");
     }
 
     /// Text and a tool_use cut off mid-input, then only pings: the progress

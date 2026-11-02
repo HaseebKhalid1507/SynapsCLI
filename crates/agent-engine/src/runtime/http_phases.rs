@@ -91,6 +91,8 @@ pub(super) struct StreamProgress {
     /// Parsed non-ping events.
     pub(super) events: u64,
     pub(super) message_start_seen: bool,
+    /// From the open to `message_start`, once it came.
+    pub(super) message_start_after: Option<Duration>,
     /// The longest gap between two non-ping events.
     pub(super) max_gap: Duration,
     pub(super) fired: Option<Deadline>,
@@ -110,9 +112,18 @@ impl StreamProgress {
             pings: 0,
             events: 0,
             message_start_seen: false,
+            message_start_after: None,
             max_gap: Duration::ZERO,
             fired: None,
         }
+    }
+
+    /// A later attempt of a request whose stream already reached the
+    /// first-event deadline: `message_start` gets the progress window, as a
+    /// cold prefill of a huge prompt may take minutes before it, so at most
+    /// one prefill is wasted. Under the test seam, its progress value.
+    pub(super) fn relax_first_event(&mut self) {
+        self.first_event = self.progress;
     }
 
     pub(super) fn ping(&mut self) {
@@ -124,6 +135,9 @@ impl StreamProgress {
         let now = tokio::time::Instant::now();
         if let Some(last) = self.last_event {
             self.max_gap = self.max_gap.max(now.saturating_duration_since(last));
+        }
+        if message_start && self.message_start_after.is_none() {
+            self.message_start_after = Some(now.saturating_duration_since(self.opened));
         }
         self.last_event = Some(now);
         self.events += 1;
