@@ -138,7 +138,14 @@ pub fn get_active_config_dir() -> PathBuf {
     base
 }
 
-/// Automatic context management is opt-in; independent of compaction disclosure.
+/// Automatic context management; independent of compaction disclosure.
+///
+/// On by default on Unix: a loaded config (or no config file at all)
+/// resolves an unset `context_management.mode` to [`Self::CONFIG_DEFAULT`]
+/// (`auto` on Unix, where the context archive is supported; `off`
+/// elsewhere); `context_management.mode = off` opts out. The enum's `Default` (`Off`) is
+/// the dark state of a runtime that has applied no config, and the fallback
+/// for an invalid `context_management` block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ContextManagementMode {
     #[default]
@@ -147,6 +154,11 @@ pub enum ContextManagementMode {
 }
 
 impl ContextManagementMode {
+    /// What an unset `context_management.mode` resolves to: `auto` on Unix,
+    /// `off` where the context archive is unsupported (`/context auto` is
+    /// refused there too).
+    pub const CONFIG_DEFAULT: Self = if cfg!(unix) { Self::Auto } else { Self::Off };
+
     pub fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "off" => Some(Self::Off),
@@ -185,6 +197,14 @@ pub struct ContextManagementConfig {
     /// retained messages). `None`/`auto` = min(100,000, 2/3 of pressure).
     /// An explicit value must be positive and below the pressure threshold.
     pub target_tokens: Option<u64>,
+    /// Size cap of the rolling summary of dropped history carried by each
+    /// successor; it counts inside `target_tokens`. `None`/`auto` =
+    /// min(15,000, 15% of the target); `0` disables the summary. An explicit
+    /// value must be below the effective target.
+    pub summary_tokens: Option<u64>,
+    /// Bound on one rollover summary request, in seconds (1–600). On timeout
+    /// the rollover proceeds without a new summary.
+    pub summary_timeout_secs: u64,
 }
 
 impl Default for ContextManagementConfig {
@@ -196,13 +216,28 @@ impl Default for ContextManagementConfig {
             reserve_tokens: 16_000,
             finish_rounds: 2,
             target_tokens: None,
+            summary_tokens: None,
+            summary_timeout_secs: Self::DEFAULT_SUMMARY_TIMEOUT_SECS,
         }
     }
 }
 
 impl ContextManagementConfig {
+    /// The settings an unset `context_management` block resolves to: every
+    /// default, with [`ContextManagementMode::CONFIG_DEFAULT`] as the mode.
+    pub fn config_default() -> Self {
+        Self {
+            mode: ContextManagementMode::CONFIG_DEFAULT,
+            ..Self::default()
+        }
+    }
+
     pub const MAX_FINISH_ROUNDS: u32 = 8;
     pub const MAX_RESERVE_TOKENS: u64 = 1_000_000;
+    /// A warm summary at xhigh/max effort may write cap + 32k output tokens;
+    /// ~110 tokens/s was observed live, so 120 s ended long ones early.
+    pub const DEFAULT_SUMMARY_TIMEOUT_SECS: u64 = 300;
+    pub const MAX_SUMMARY_TIMEOUT_SECS: u64 = 600;
 
     /// Validate independently of a model selection. Also call
     /// `validate_for_window` when the effective context window is known.
@@ -231,6 +266,14 @@ impl ContextManagementConfig {
         }
         if self.finish_rounds > Self::MAX_FINISH_ROUNDS {
             return Err("finish_rounds must be between 0 and 8");
+        }
+        if let (Some(summary @ 1..), Some(target)) = (self.summary_tokens, self.target_tokens) {
+            if summary >= target {
+                return Err("summary_tokens must be below target_tokens");
+            }
+        }
+        if !(1..=Self::MAX_SUMMARY_TIMEOUT_SECS).contains(&self.summary_timeout_secs) {
+            return Err("summary_timeout_secs must be between 1 and 600");
         }
         Ok(())
     }
@@ -261,12 +304,82 @@ impl ContextManagementConfig {
                 return Err("target_tokens must be below pressure_tokens");
             }
         }
+        if let Some(summary @ 1..) = self.summary_tokens {
+            let (pressure, _) =
+                crate::core::context_policy::ContextThresholds::bands(self, context_window_tokens);
+            let target = crate::core::context_policy::ContextThresholds {
+                pressure_tokens: pressure,
+                rollover_tokens: pressure.saturating_add(1),
+            }
+            .target_tokens(self);
+            if summary >= target {
+                return Err("summary_tokens must be below target_tokens");
+            }
+        }
         Ok(())
+    }
+
+    /// These settings for `context_window_tokens`: unchanged when they fit
+    /// it (`Ok((self, None))`); otherwise with the threshold overrides
+    /// (pressure, rollover, target and summary size) reset to the window's
+    /// defaults, and the reason they did not fit. The reserve, finish rounds
+    /// and summary timeout stay. `Err` when even the defaults don't fit.
+    pub fn fitted_to_window(
+        &self,
+        context_window_tokens: u64,
+    ) -> Result<(Self, Option<&'static str>), &'static str> {
+        let Err(why) = self.validate_for_window(context_window_tokens) else {
+            return Ok((*self, None));
+        };
+        let reset = Self {
+            pressure_tokens: None,
+            rollover_tokens: None,
+            target_tokens: None,
+            summary_tokens: None,
+            ..*self
+        };
+        reset.validate_for_window(context_window_tokens)?;
+        Ok((reset, Some(why)))
+    }
+
+    /// The settings to run on `window` when the model's ceiling clamped an
+    /// explicit `context_window` of `configured` tokens down to `window`
+    /// (`models::effective_context_window`): thresholds that fit the
+    /// configured window but not `window` are reset to `window`'s defaults
+    /// ([`Self::fitted_to_window`]), with the reason. `None` when there is
+    /// nothing to reset: no window was clamped, the thresholds fit, or they
+    /// did not fit the configured window either (an invalid policy stays
+    /// invalid and still fails closed).
+    pub fn reset_for_clamped_window(
+        &self,
+        configured: Option<u64>,
+        window: u64,
+    ) -> Option<(Self, &'static str)> {
+        let configured = configured.filter(|&configured| configured > window)?;
+        self.validate_for_window(configured).ok()?;
+        match self.fitted_to_window(window) {
+            Ok((reset, Some(why))) => Some((reset, why)),
+            Ok((_, None)) | Err(_) => None,
+        }
     }
 }
 
 /// Parse fields first; validate the complete policy after all lines so threshold
 /// ordering and an explicit context window do not depend on config key order.
+/// `context_management.summary_model`: `auto` (any case) is `None`; any
+/// other value must be a single model id (no whitespace or control
+/// characters).
+pub fn parse_summary_model(value: &str) -> Result<Option<String>, &'static str> {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("auto") {
+        return Ok(None);
+    }
+    if value.is_empty() || value.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err("expected auto or a single model id");
+    }
+    Ok(Some(value.to_string()))
+}
+
 fn parse_context_management_config_key(
     config: &mut ContextManagementConfig,
     key: &str,
@@ -278,7 +391,8 @@ fn parse_context_management_config_key(
         }
         "context_management.pressure_tokens"
         | "context_management.rollover_tokens"
-        | "context_management.target_tokens" => {
+        | "context_management.target_tokens"
+        | "context_management.summary_tokens" => {
             let tokens = if value.eq_ignore_ascii_case("auto") {
                 None
             } else {
@@ -291,6 +405,7 @@ fn parse_context_management_config_key(
             match key {
                 "context_management.pressure_tokens" => config.pressure_tokens = tokens,
                 "context_management.rollover_tokens" => config.rollover_tokens = tokens,
+                "context_management.summary_tokens" => config.summary_tokens = tokens,
                 _ => config.target_tokens = tokens,
             }
         }
@@ -303,6 +418,11 @@ fn parse_context_management_config_key(
             config.finish_rounds = value
                 .parse()
                 .map_err(|_| "expected an unsigned round count")?;
+        }
+        "context_management.summary_timeout_secs" => {
+            config.summary_timeout_secs = value
+                .parse()
+                .map_err(|_| "expected an unsigned number of seconds")?;
         }
         _ => return Err("unknown context management key"),
     }
@@ -342,6 +462,19 @@ impl Default for StartupConfig {
 /// `SYNAPS_DAEMON_*` env vars still WIN over these when set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DaemonConfig {
+    /// `daemon.reload_resume` (on/off, default on): after a daemon reload,
+    /// every session whose turn the reload cut gets one queued message that
+    /// starts a new turn ("resume: ..."). Off is the kill switch: cut
+    /// sessions stay idle, as before.
+    pub reload_resume: bool,
+    /// `daemon.crash_restore` (on/off, default on): the daemon keeps a crash
+    /// record of its sessions (`daemon.live.json` in its runtime dir), and a
+    /// fresh start after a daemon that died (or stopped cleanly) restores
+    /// every recorded session from disk right after it listens (listed as
+    /// restoring until each is back), resuming once each turn the death or
+    /// stop cut. Off is the kill switch: no record is kept or read, and a
+    /// fresh start serves only what clients re-attach.
+    pub crash_restore: bool,
     /// Seconds an auto-spawned daemon stays alive after the last client
     /// disconnects. `0` = never idle-exit. Env `SYNAPS_DAEMON_IDLE_EXIT_SECS`
     /// overrides. Default: 10.
@@ -353,15 +486,63 @@ pub struct DaemonConfig {
     /// Seconds a PARKED session row lingers before eviction. `0` = keep
     /// forever. Env `SYNAPS_DAEMON_PARKED_EVICT_SECS` overrides. Default: 3600.
     pub parked_evict_secs: u64,
+    /// File-creation mask of the daemon process (`daemon.umask`), and so of
+    /// everything it starts. Set once at daemon start, from the config the
+    /// daemon booted with (`agent_engine::daemon::umask`). Default: inherit.
+    pub umask: DaemonUmask,
 }
 
 impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
+            reload_resume: true,
+            crash_restore: true,
             idle_exit_secs: 10,
             prompt_abandon_secs: 3600,
             parked_evict_secs: 3600,
+            umask: DaemonUmask::Inherit,
         }
+    }
+}
+
+/// `daemon.umask`: keep the mask the daemon was started with, or set one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DaemonUmask {
+    /// The mask the daemon was started with (default).
+    #[default]
+    Inherit,
+    /// These permission bits (at most `0o777`).
+    Mode(u32),
+}
+
+impl DaemonUmask {
+    /// `inherit` (any case) or an octal mode of 1-4 digits up to `0777`,
+    /// optionally in one pair of matching quotes (`"022"`, `'0022'`).
+    pub fn parse(value: &str) -> Result<Self, &'static str> {
+        const EXPECTED: &str = "expected inherit or an octal mode from 000 to 0777 (e.g. 022); inheriting";
+        let value = value.trim();
+        let value = ['"', '\'']
+            .iter()
+            .find_map(|q| value.strip_prefix(*q)?.strip_suffix(*q))
+            .unwrap_or(value);
+        if value.eq_ignore_ascii_case("inherit") {
+            return Ok(Self::Inherit);
+        }
+        if value.is_empty() || value.len() > 4 || !value.bytes().all(|b| (b'0'..=b'7').contains(&b)) {
+            return Err(EXPECTED);
+        }
+        match u32::from_str_radix(value, 8) {
+            Ok(mode) if mode <= 0o777 => Ok(Self::Mode(mode)),
+            _ => Err(EXPECTED),
+        }
+    }
+}
+
+impl SynapsConfig {
+    /// The parser's warning for a malformed `daemon.umask` value (the daemon
+    /// then inherits), if any: the last one, as the last line wins.
+    pub fn daemon_umask_warning(&self) -> Option<&str> {
+        self.warnings.iter().rfind(|w| w.starts_with("daemon.umask ")).map(String::as_str)
     }
 }
 
@@ -380,6 +561,25 @@ pub struct SubagentLimits {
     /// How deep workers may nest: 1 = only the foreground delegates,
     /// 2 = its workers may delegate once more, and so on. Default: 4.
     pub max_depth: u16,
+    /// `subagent.context_warn_tokens`: a worker start, resume or oneshot
+    /// whose first request is at least this many provider tokens is
+    /// admitted with a warning the caller sees. `None` (`off`) disables
+    /// the warning. Default: 150,000. A context limit, not a spend cap.
+    pub context_warn_tokens: Option<u64>,
+    /// `subagent.resume_refuse_tokens`: `subagent_resume` refuses a resume
+    /// whose first request would be above this many provider tokens; the
+    /// caller starts a fresh worker instead. `None` (`off`) disables the
+    /// refusal. Default: 250,000. A context limit, not a spend cap.
+    pub resume_refuse_tokens: Option<u64>,
+    /// `subagent.tool_hooks` (on | off): whether a worker's tool calls run
+    /// its caller's `before_tool_call` hooks (a guard extension's checks
+    /// and confirms) as the caller's own calls do. `off` gives workers an
+    /// empty hook bus again (no hook runs for their calls). Read at each
+    /// worker spawn. Default: on.
+    pub tool_hooks: bool,
+    /// `subagent.context_rollover`: the operator's opt-out of worker
+    /// context rollover. Default: inherit.
+    pub context_rollover: ContextRollover,
 }
 
 impl Default for SubagentLimits {
@@ -388,6 +588,34 @@ impl Default for SubagentLimits {
             max_concurrent: 16,
             max_total: 64,
             max_depth: 4,
+            context_warn_tokens: Some(150_000),
+            resume_refuse_tokens: Some(250_000),
+            tool_hooks: true,
+            context_rollover: ContextRollover::Inherit,
+        }
+    }
+}
+
+/// Whether workers may have context rollover
+/// (`docs/specs/subagent-context-rollover.md` §2): opt-out only, by the
+/// operator (`subagent.context_rollover`) or the caller (the worker tools'
+/// `context_rollover` parameter). Off from either wins.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ContextRollover {
+    /// A worker follows its parent's live context management.
+    #[default]
+    Inherit,
+    /// The worker runs without context rollover.
+    Off,
+}
+
+impl ContextRollover {
+    /// `inherit` or `off`, exactly; anything else is `None`.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "inherit" => Some(Self::Inherit),
+            "off" => Some(Self::Off),
+            _ => None,
         }
     }
 }
@@ -410,9 +638,38 @@ fn parse_subagent_config_key(
             config.max_depth =
                 u16::try_from(positive()?).map_err(|_| "expected a whole number from 1 to 65535")?
         }
+        "subagent.context_warn_tokens" => config.context_warn_tokens = tokens_or_off(value)?,
+        "subagent.resume_refuse_tokens" => config.resume_refuse_tokens = tokens_or_off(value)?,
+        "subagent.tool_hooks" => {
+            config.tool_hooks = match value.trim() {
+                "on" | "true" | "1" | "yes" => true,
+                "off" | "false" | "0" | "no" => false,
+                _ => return Err("expected on or off"),
+            }
+        }
+        "subagent.context_rollover" => match ContextRollover::parse(value.trim()) {
+            Some(choice) => config.context_rollover = choice,
+            None => {
+                // An opt-out: a malformed value is off, never `inherit`.
+                config.context_rollover = ContextRollover::Off;
+                return Err("expected inherit or off; worker context rollover is off");
+            }
+        },
         _ => return Err("unknown subagent key"),
     }
     Ok(())
+}
+
+/// A token line: a whole number of at least 1, or `off` (`None`).
+fn tokens_or_off(value: &str) -> Result<Option<u64>, &'static str> {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("off") {
+        return Ok(None);
+    }
+    match value.parse::<u64>() {
+        Ok(n) if n > 0 => Ok(Some(n)),
+        _ => Err("expected a whole number of tokens of at least 1, or off"),
+    }
 }
 
 /// Parse `startup.*` keys. Unknown keys return an error (caller warns).
@@ -446,9 +703,31 @@ fn parse_daemon_config_key(
 ) -> Result<(), &'static str> {
     let secs = || value.trim().parse::<u64>().map_err(|_| "expected an unsigned second count");
     match key {
+        "daemon.reload_resume" => {
+            config.reload_resume = match value.trim() {
+                "true" | "1" | "on" | "yes" => true,
+                "false" | "0" | "off" | "no" => false,
+                _ => return Err("expected on or off"),
+            };
+        }
+        "daemon.crash_restore" => {
+            config.crash_restore = match value.trim() {
+                "true" | "1" | "on" | "yes" => true,
+                "false" | "0" | "off" | "no" => false,
+                _ => return Err("expected on or off"),
+            };
+        }
         "daemon.idle_exit_secs" => config.idle_exit_secs = secs()?,
         "daemon.prompt_abandon_secs" => config.prompt_abandon_secs = secs()?,
         "daemon.parked_evict_secs" => config.parked_evict_secs = secs()?,
+        // A malformed value inherits, also over an earlier valid line.
+        "daemon.umask" => match DaemonUmask::parse(value) {
+            Ok(umask) => config.umask = umask,
+            Err(reason) => {
+                config.umask = DaemonUmask::Inherit;
+                return Err(reason);
+            }
+        },
         _ => return Err("unknown daemon key"),
     }
     Ok(())
@@ -524,6 +803,9 @@ pub struct AuthConfig {
     pub accounts: BTreeMap<String, String>,
     /// Raw automatic chooser settings, relative to auth.auto.
     pub auto: BTreeMap<String, String>,
+    /// Raw try order per provider from `auth.order.<provider> = L1,L2,...`.
+    /// Parsed leniently by [`crate::core::auth::accounts_api::parse_order`].
+    pub order: BTreeMap<String, String>,
 }
 
 impl AuthConfig {
@@ -654,18 +936,21 @@ impl std::fmt::Display for CacheKeepWarm {
 /// (`client_input`; spec `multi-client-sessions.md` §6). Every client is
 /// the daemon's own user.
 ///
-/// - `Shared` (default): every drive client (not `--observe`) may send
-///   input; the one that did last is the *active* client.
-/// - `Exclusive`: only the input owner may; the others are read-only until
-///   they `/takeover` (the behaviour before `client_input`).
+/// - `Shared`: every drive client (not `--observe`) may send input; the
+///   one that did last is the *active* client.
+/// - `Exclusive` (default): only the input owner may; the others are
+///   read-only until they `/takeover` (the behaviour before
+///   `client_input`). PARITY: 790d R6, until JR answers E4 (upstream:
+///   `Shared` is the default).
 ///
 /// On the wire a missing value means `Exclusive`: an older daemon enforces
 /// the owner.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ClientInput {
-    #[default]
     Shared,
+    // PARITY: 790d R6, until JR answers E4 (upstream: `#[default]` on Shared).
+    #[default]
     Exclusive,
 }
 
@@ -1081,6 +1366,181 @@ fn parse_events_config_key(cfg: &mut EventsConfig, key: &str, val: &str) -> Resu
     Ok(())
 }
 
+/// `wait` tool settings, parsed from `wait.*` keys.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WaitConfig {
+    /// The longest `timeout_secs` one inline wait may ask for
+    /// (`wait.max_inline_secs`, 1 to 86400). An operational bound on one
+    /// blocking tool call, not a spend cap.
+    pub max_inline_secs: u64,
+}
+
+/// Default for `wait.max_inline_secs`.
+pub const DEFAULT_WAIT_MAX_INLINE_SECS: u64 = 3600;
+/// Largest accepted `wait.max_inline_secs` (one day).
+pub const MAX_WAIT_MAX_INLINE_SECS: u64 = 86_400;
+
+impl Default for WaitConfig {
+    fn default() -> Self {
+        Self {
+            max_inline_secs: DEFAULT_WAIT_MAX_INLINE_SECS,
+        }
+    }
+}
+
+/// Parse `wait.*` keys. `Err` carries the diagnostic; the value is kept.
+fn parse_wait_config_key(cfg: &mut WaitConfig, key: &str, val: &str) -> Result<(), String> {
+    if key == "wait.max_inline_secs" {
+        match val.trim().parse::<u64>() {
+            Ok(secs) if (1..=MAX_WAIT_MAX_INLINE_SECS).contains(&secs) => {
+                cfg.max_inline_secs = secs;
+            }
+            _ => {
+                return Err(format!(
+                    "warning: config: wait.max_inline_secs = {:?} is not a whole number of \
+                     seconds from 1 to {MAX_WAIT_MAX_INLINE_SECS} — keeping {}",
+                    val.trim(),
+                    cfg.max_inline_secs
+                ));
+            }
+        }
+    } // unknown wait.* keys ignored
+    Ok(())
+}
+
+/// Whether polling workers on large models are refused (`subagent.watch.admission`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WatchAdmission {
+    /// Refuse a polling task on a model outside `small_models` (default).
+    Refuse,
+    /// The operator's kill switch: admission allows every dispatch.
+    Off,
+}
+
+/// Small-watcher admission and the watch-worker lease, from
+/// `subagent.watch.*`. All operational bounds, none a spend cap: the cost
+/// lease is unset unless the operator sets it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WatchConfig {
+    /// Models a polling worker may run on, as a watch worker under the
+    /// lease (`subagent.watch.small_models`, comma-separated).
+    pub small_models: Vec<String>,
+    pub admission: WatchAdmission,
+    /// A watch worker's wall-clock lease, across resumes (`lease_secs`).
+    pub lease_secs: u64,
+    /// A watch worker's provider rounds, across resumes (`lease_rounds`).
+    pub lease_rounds: u32,
+    /// A watch worker's cost lease in USD (`lease_cost_usd`); unset by default.
+    pub lease_cost_usd: Option<f64>,
+    /// The advisor's budget per ambiguous dispatch (`advice_timeout_ms`;
+    /// 0 asks no advisor).
+    pub advice_timeout_ms: u64,
+    /// Advice below this confidence allows the dispatch (`advice_min_confidence`).
+    pub advice_min_confidence: f64,
+}
+
+/// The small model a refusal suggests by default.
+pub const DEFAULT_WATCH_SMALL_MODEL: &str = "muse/muse-wonder-1.0";
+pub const DEFAULT_WATCH_LEASE_SECS: u64 = 7200;
+pub const DEFAULT_WATCH_LEASE_ROUNDS: u32 = 40;
+pub const DEFAULT_WATCH_ADVICE_TIMEOUT_MS: u64 = 1000;
+pub const DEFAULT_WATCH_ADVICE_MIN_CONFIDENCE: f64 = 0.95;
+
+impl Default for WatchConfig {
+    fn default() -> Self {
+        Self {
+            small_models: vec![DEFAULT_WATCH_SMALL_MODEL.to_owned()],
+            admission: WatchAdmission::Refuse,
+            lease_secs: DEFAULT_WATCH_LEASE_SECS,
+            lease_rounds: DEFAULT_WATCH_LEASE_ROUNDS,
+            lease_cost_usd: None,
+            advice_timeout_ms: DEFAULT_WATCH_ADVICE_TIMEOUT_MS,
+            advice_min_confidence: DEFAULT_WATCH_ADVICE_MIN_CONFIDENCE,
+        }
+    }
+}
+
+/// Parse `subagent.watch.*` keys. `Err` carries the diagnostic; the value
+/// is kept.
+fn parse_watch_config_key(cfg: &mut WatchConfig, key: &str, val: &str) -> Result<(), String> {
+    let v = val.trim();
+    let bad = |what: &str, kept: String| {
+        Err(format!(
+            "warning: config: {key} = {v:?} is not {what} — keeping {kept}"
+        ))
+    };
+    match key {
+        "subagent.watch.small_models" => {
+            cfg.small_models = v
+                .split(',')
+                .map(str::trim)
+                .filter(|m| !m.is_empty())
+                .map(str::to_owned)
+                .collect();
+        }
+        "subagent.watch.admission" => match v {
+            "refuse" => cfg.admission = WatchAdmission::Refuse,
+            "off" => cfg.admission = WatchAdmission::Off,
+            _ => {
+                return bad(
+                    "refuse or off",
+                    format!("{:?}", cfg.admission).to_lowercase(),
+                )
+            }
+        },
+        "subagent.watch.lease_secs" => match v.parse::<u64>() {
+            Ok(n) if (60..=86_400).contains(&n) => cfg.lease_secs = n,
+            _ => {
+                return bad(
+                    "a whole number of seconds from 60 to 86400",
+                    cfg.lease_secs.to_string(),
+                )
+            }
+        },
+        "subagent.watch.lease_rounds" => match v.parse::<u32>() {
+            Ok(n) if (1..=10_000).contains(&n) => cfg.lease_rounds = n,
+            _ => {
+                return bad(
+                    "a whole number from 1 to 10000",
+                    cfg.lease_rounds.to_string(),
+                )
+            }
+        },
+        "subagent.watch.lease_cost_usd" => match v {
+            "" | "none" | "unset" => cfg.lease_cost_usd = None,
+            _ => match v.parse::<f64>() {
+                Ok(usd) if usd.is_finite() && usd > 0.0 => cfg.lease_cost_usd = Some(usd),
+                _ => {
+                    return bad(
+                        "a positive amount in USD, or none",
+                        format!("{:?}", cfg.lease_cost_usd),
+                    )
+                }
+            },
+        },
+        "subagent.watch.advice_timeout_ms" => match v.parse::<u64>() {
+            Ok(n) if n <= 10_000 => cfg.advice_timeout_ms = n,
+            _ => {
+                return bad(
+                    "a whole number of milliseconds from 0 to 10000",
+                    cfg.advice_timeout_ms.to_string(),
+                )
+            }
+        },
+        "subagent.watch.advice_min_confidence" => match v.parse::<f64>() {
+            Ok(c) if c > 0.0 && c <= 1.0 => cfg.advice_min_confidence = c,
+            _ => {
+                return bad(
+                    "a number above 0 and at most 1",
+                    cfg.advice_min_confidence.to_string(),
+                )
+            }
+        },
+        _ => {} // unknown subagent.watch.* keys ignored, as wait.* does
+    }
+    Ok(())
+}
+
 /// A configured per-turn count limit: a number, or `unlimited`.
 ///
 /// Used for `turn_budget.<role>.max_provider_rounds`, `max_tool_calls` and
@@ -1409,6 +1869,16 @@ pub struct SynapsConfig {
     /// Subagent fan-out limits (`subagent.*`).
     pub subagent: SubagentLimits,
     pub compaction_model: Option<String>, // model used for /compact (default: claude-sonnet-4-6)
+    /// `context_management.summary_model`: the model that writes the rolling
+    /// summary at rollover. `None` = `auto` (the compaction model when its
+    /// route has an enforceable output ceiling, otherwise the session's own
+    /// model when its route has one, otherwise no summary).
+    pub summary_model: Option<String>,
+    /// `context_management.summary_model` was set to something that is not
+    /// `auto` or a single model id. The rolling summary is then off (with a
+    /// notice), never silently `auto`: a malformed attempt to pin a model
+    /// must not send the summary to a model the user did not choose.
+    pub summary_model_invalid: bool,
     /// Where compaction summarization runs (spec §9.4): remote provider or
     /// local-only (zero network construction).
     pub compaction_mode: crate::core::compaction::CompactionMode,
@@ -1506,7 +1976,7 @@ pub struct SynapsConfig {
     /// more CPU: raise it on a slow uplink.
     pub request_compression_level: u32,
     /// Who may drive a daemon session with several clients attached
-    /// (`client_input`): `shared` (default) | `exclusive`. The daemon reads
+    /// (`client_input`): `shared` | `exclusive` (default; 790d R6). The daemon reads
     /// it at start, for every session it creates or restores. See
     /// [`ClientInput`].
     pub client_input: ClientInput,
@@ -1562,6 +2032,25 @@ pub struct SynapsConfig {
     /// stream starts with the small essential local core plus discovery and
     /// authorization gateways; exact activations are added per session.
     pub progressive_tool_disclosure: bool,
+    /// `capacity_wait` (default on): a turn whose automatic Anthropic account
+    /// selection finds no capacity for a reason that ends by itself (every
+    /// account at a usage limit that resets within 5 h 15 min, or capacity
+    /// unproven for up to 30 min) waits in the turn and then carries on.
+    /// `off` ends the turn at once with the selection's error, as before.
+    pub capacity_wait: bool,
+    /// `capacity_resume` (default on): a daemon session whose turn ended
+    /// because no Anthropic account had capacity, while a limited account
+    /// comes back at a known time (within 8 days), continues by itself ONCE
+    /// at that time: one new turn asking it to carry on (a resumed turn that
+    /// stops again arms again for a later reset, three times at most). Needs
+    /// the daemon's crash record (`daemon.crash_restore`, default on): with
+    /// it off nothing is armed. Independent of `daemon.reload_resume` and of
+    /// `capacity_wait`. `off`: no automatic resume, an armed one never fires.
+    pub capacity_resume: bool,
+    /// `client_tools` (default on): a session's input owner may register
+    /// client tools over the wire (docs/client-tools.md). `off`: every
+    /// `register_client_tools` is refused `feature_off`; read at each one.
+    pub client_tools: bool,
     /// Host confirmation policy for MODEL-INITIATED `activate_tools`
     /// (`tools.activation_confirm`). `Auto` (default) authorizes without
     /// prompting; `Prompt` asks the host (y/n confirm dialog); `Deny` never
@@ -1582,11 +2071,20 @@ pub struct SynapsConfig {
     /// Built-in tools to disable by runtime name (e.g. "bash", "ls"). Removed
     /// from the registry at boot so they're never offered to the model.
     pub disabled_tools: Vec<String>,
+    /// Memory-only tool globs (`*`, `?`): results of matching extension or
+    /// MCP tools are kept in RAM only, never in session records. Matched
+    /// against the runtime name (`plugin:tool`, `ext__server__tool`) or the
+    /// wire name (`plugin_tool`). See docs/memory-only-results.md.
+    pub memory_only_tools: Vec<String>,
     pub shell: ShellConfig,
     pub server: ServerConfig,
     pub bridge: BridgeConfig,
     pub auth: AuthConfig,
     pub events: EventsConfig,
+    /// `wait` tool bounds (`wait.*`).
+    pub wait: WaitConfig,
+    /// Small-watcher admission and the watch-worker lease (`subagent.watch.*`).
+    pub watch: WatchConfig,
     pub provider_keys: BTreeMap<String, String>,
     pub keybinds: std::collections::HashMap<String, String>,
     /// Typed per-role turn budgets (Task 23, spec §8.1).
@@ -1598,6 +2096,11 @@ pub struct SynapsConfig {
     /// Non-fatal problems found while parsing the config file (unknown keys,
     /// unparseable values). Surfaced once at startup — never block boot.
     pub warnings: Vec<String>,
+    /// The configured `(subagent.context_warn_tokens,
+    /// subagent.resume_refuse_tokens)` when the parser clamped the warn line
+    /// down to the refuse line. Subagent admission re-reads the config on
+    /// every call and logs it from there.
+    pub subagent_context_clamp: Option<(u64, u64)>,
 }
 
 impl Default for SynapsConfig {
@@ -1607,11 +2110,13 @@ impl Default for SynapsConfig {
             thinking_budget: None,
             thinking_level: None,
             context_window: None,
-            context_management: ContextManagementConfig::default(),
+            context_management: ContextManagementConfig::config_default(),
             startup: StartupConfig::default(),
             daemon: DaemonConfig::default(),
             subagent: SubagentLimits::default(),
             compaction_model: None,
+            summary_model: None,
+            summary_model_invalid: false,
             compaction_mode: crate::core::compaction::CompactionMode::default(),
             compaction_exclude: Vec::new(),
             max_tool_output: 30000,
@@ -1639,7 +2144,7 @@ impl Default for SynapsConfig {
             cache_keepwarm_tools: true,
             request_compression: RequestCompressionMode::Auto,
             request_compression_level: DEFAULT_REQUEST_COMPRESSION_LEVEL,
-            client_input: ClientInput::Shared,
+            client_input: ClientInput::Exclusive, // PARITY: 790d R6, until JR answers E4 (upstream: Shared)
             thinking_display: ThinkingDisplay::Summarized,
             max_fps: 60,
             scroll_lines: None,
@@ -1657,21 +2162,28 @@ impl Default for SynapsConfig {
             favorite_models: Vec::new(),
             disabled_skills: Vec::new(),
             progressive_tool_disclosure: false,
+            capacity_wait: true,
+            capacity_resume: true,
+            client_tools: true,
             tools_activation_confirm: ActivationConfirm::default(),
             tools_deferred_loading: true,
             session_persistence: crate::core::session_journal::SessionPersistence::default(),
             disabled_tools: Vec::new(),
+            memory_only_tools: Vec::new(),
             shell: ShellConfig::default(),
             server: ServerConfig::default(),
             bridge: BridgeConfig::default(),
             auth: AuthConfig::default(),
             events: EventsConfig::default(),
+            wait: WaitConfig::default(),
+            watch: WatchConfig::default(),
             provider_keys: BTreeMap::new(),
             keybinds: std::collections::HashMap::new(),
             turn_budgets: TurnBudgetsConfig::default(),
             memory: MemoryConfig::default(),
             memory_backend: MemoryBackendConfig::default(),
             warnings: Vec::new(),
+            subagent_context_clamp: None,
         }
     }
 }
@@ -1734,11 +2246,17 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "context_management.reserve_tokens",
     "context_management.finish_rounds",
     "context_management.target_tokens",
+    "context_management.summary_tokens",
+    "context_management.summary_timeout_secs",
+    "context_management.summary_model",
     "startup.quick_start",
     "startup.extensions_ready_timeout_secs",
+    "daemon.reload_resume",
+    "daemon.crash_restore",
     "daemon.idle_exit_secs",
     "daemon.prompt_abandon_secs",
     "daemon.parked_evict_secs",
+    "daemon.umask",
     "max_tool_output",
     "tool_output_spill_bytes",
     "tool_output_spill_head_bytes",
@@ -1755,6 +2273,10 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "subagent.max_concurrent",
     "subagent.max_total",
     "subagent.max_depth",
+    "subagent.context_warn_tokens",
+    "subagent.resume_refuse_tokens",
+    "subagent.tool_hooks",
+    "subagent.context_rollover",
     // Legacy flat spellings of `subagent.max_concurrent` / `subagent.max_total`.
     "subagent_max_concurrent",
     "subagent_max_total",
@@ -1788,7 +2310,11 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "favorite_models",
     "disabled_skills",
     "disabled_tools",
+    "memory_only_tools",
     "progressive_tool_disclosure",
+    "capacity_wait",
+    "capacity_resume",
+    "client_tools",
     "tools.activation_confirm",
     "tools.deferred_loading",
     "session_persistence",
@@ -1814,6 +2340,16 @@ pub const FAMILY_CONFIG_KEYS: &[&str] = &[
     // parse_events_config_key
     "events.auto_turn",
     "events.auto_turn_cap",
+    // parse_wait_config_key
+    "wait.max_inline_secs",
+    // parse_watch_config_key
+    "subagent.watch.small_models",
+    "subagent.watch.admission",
+    "subagent.watch.lease_secs",
+    "subagent.watch.lease_rounds",
+    "subagent.watch.lease_cost_usd",
+    "subagent.watch.advice_timeout_ms",
+    "subagent.watch.advice_min_confidence",
     // parse_turn_budget_config_key: turn_budget.<role>.<field>
     "turn_budget.foreground.max_provider_rounds",
     "turn_budget.foreground.max_tool_calls",
@@ -1979,10 +2515,11 @@ fn parse_server_config_key(server_config: &mut ServerConfig, key: &str, val: &st
             if let Ok(size) = val.parse::<usize>() {
                 server_config.max_message_size = Some(size);
             } else {
-                eprintln!(
-                    "Warning: invalid value for server.max_message_size: '{}', ignored",
-                    val
-                );
+                let msg = format!("Warning: invalid value for server.max_message_size: '{val}', ignored");
+                if first_report(&msg) {
+                    tracing::warn!(value = %val, "config: invalid server.max_message_size, ignored");
+                    crate::eprintln_lossy!("{msg}");
+                }
             }
         }
         _ => {
@@ -2008,10 +2545,11 @@ fn parse_bridge_config_key(bridge_config: &mut BridgeConfig, key: &str, val: &st
             if let Ok(ms) = val.parse::<u64>() {
                 bridge_config.heartbeat_timeout_ms = ms;
             } else {
-                eprintln!(
-                    "Warning: invalid value for bridge.heartbeat_timeout_ms: '{}', using default",
-                    val
-                );
+                let msg = format!("Warning: invalid value for bridge.heartbeat_timeout_ms: '{val}', using default");
+                if first_report(&msg) {
+                    tracing::warn!(value = %val, "config: invalid bridge.heartbeat_timeout_ms, using default");
+                    crate::eprintln_lossy!("{msg}");
+                }
             }
         }
         _ => {
@@ -2024,8 +2562,8 @@ fn parse_bridge_config_key(bridge_config: &mut BridgeConfig, key: &str, val: &st
 /// silently leave traffic on the default account), with a did-you-mean.
 fn unknown_auth_key_warning(key: &str) -> Option<String> {
     const EXACT: [&str; 2] = ["auth.remote_endpoint", "auth.machine_token"];
-    const FAMILIES: [&str; 2] = ["auth.account", "auth.auto"];
-    const PLACEHOLDERS: [&str; 2] = ["<provider>", "<key>"];
+    const FAMILIES: [&str; 3] = ["auth.account", "auth.auto", "auth.order"];
+    const PLACEHOLDERS: [&str; 3] = ["<provider>", "<key>", "<provider>"];
     if EXACT.contains(&key) {
         return None;
     }
@@ -2094,6 +2632,14 @@ fn parse_auth_config_key(auth_config: &mut AuthConfig, key: &str, val: &str) {
             }
             if let Some(key) = key.strip_prefix("auth.auto.").filter(|k| !k.trim().is_empty()) {
                 auth_config.auto.insert(key.to_string(), v.to_string());
+            }
+            if let Some(provider) = key.strip_prefix("auth.order.") {
+                let provider = provider.trim();
+                if !provider.is_empty() {
+                    // Raw value; unknown and duplicate labels are dropped
+                    // where it is used (`accounts_api::effective_order`).
+                    auth_config.order.insert(provider.to_string(), v.to_string());
+                }
             }
             // Other unknown auth.* keys preserved (not rejected)
         }
@@ -2178,8 +2724,57 @@ pub fn load_config() -> SynapsConfig {
 /// Shared by `load_config` (file path) and `load_config_from_str` (test helper).
 fn apply_config_content(config: &mut SynapsConfig, content: &str) {
     // The shell/events/turn_budget/memory families report to stderr (not
-    // `config.warnings`) — unchanged behaviour.
-    apply_config_content_with(config, content, &mut |diagnostic: String| eprintln!("{diagnostic}"));
+    // `config.warnings`), now also to the log. Never `eprintln!`: this runs
+    // on every `load_config()`, in a daemon long after its starter (the
+    // reader of its stderr pipe) may have gone, and that panic aborted the
+    // daemon (a `turn_budget.event.*` line an older binary rejected).
+    apply_config_content_once(config, content, &mut |diagnostic: &str| {
+        tracing::warn!(%diagnostic, "config diagnostic");
+        crate::eprintln_lossy!("{diagnostic}")
+    });
+}
+
+/// [`apply_config_content_with`], reporting each distinct family diagnostic
+/// to `report` only the first time this process sees it ([`first_report`]).
+fn apply_config_content_once(
+    config: &mut SynapsConfig,
+    content: &str,
+    report: &mut dyn FnMut(&str),
+) {
+    apply_config_content_with(config, content, &mut |diagnostic: String| {
+        if first_report(&diagnostic) {
+            report(&diagnostic);
+        }
+    });
+}
+
+/// Distinct config diagnostics remembered per process, at most this many.
+const MAX_REMEMBERED_REPORTS: usize = 1024;
+
+/// Whether this process has not reported `message` yet (and remember it).
+///
+/// `load_config()` runs on hot paths (session saves, auth selection, timers),
+/// and one bad line would otherwise add the same lines to `synaps.log` and to
+/// the never-rotated daemon stderr file on every call. A changed config gives
+/// new messages, and those are reported. Past [`MAX_REMEMBERED_REPORTS`]
+/// distinct messages, new ones are reported every time (not remembered).
+fn first_report(message: &str) -> bool {
+    use std::collections::HashSet;
+    use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
+    use std::sync::Mutex;
+    static SEEN: OnceLock<Mutex<HashSet<u64>>> = OnceLock::new();
+    let hash = BuildHasherDefault::<DefaultHasher>::default().hash_one(message);
+    let mut seen = SEEN
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if seen.contains(&hash) {
+        return false;
+    }
+    if seen.len() < MAX_REMEMBERED_REPORTS {
+        seen.insert(hash);
+    }
+    true
 }
 
 /// [`apply_config_content`] with the stderr-only family diagnostics routed
@@ -2404,7 +2999,8 @@ fn apply_config_content_with(
             "client_input" => match ClientInput::parse(val) {
                 Some(mode) => config.client_input = mode,
                 None => config.warnings.push(format!(
-                    "client_input = {val} — expected shared or exclusive; using shared"
+                    "client_input = {val} — expected shared or exclusive; using {}",
+                    config.client_input
                 )),
             },
             "cache_keepwarm_auto_max_hours" => {
@@ -2548,6 +3144,27 @@ fn apply_config_content_with(
             "progressive_tool_disclosure" => {
                 config.progressive_tool_disclosure = matches!(val, "true" | "1" | "on" | "yes");
             }
+            "capacity_wait" => match val {
+                "on" | "true" | "1" | "yes" => config.capacity_wait = true,
+                "off" | "false" | "0" | "no" => config.capacity_wait = false,
+                _ => config.warnings.push(format!(
+                    "capacity_wait = {val} — expected on or off; keeping the default (on)"
+                )),
+            },
+            "capacity_resume" => match val {
+                "on" | "true" | "1" | "yes" => config.capacity_resume = true,
+                "off" | "false" | "0" | "no" => config.capacity_resume = false,
+                _ => config.warnings.push(format!(
+                    "capacity_resume = {val} — expected on or off; keeping the default (on)"
+                )),
+            },
+            "client_tools" => match val {
+                "on" | "true" | "1" | "yes" => config.client_tools = true,
+                "off" | "false" | "0" | "no" => config.client_tools = false,
+                _ => config.warnings.push(format!(
+                    "client_tools = {val} — expected on or off; keeping the default (on)"
+                )),
+            },
             "tools.deferred_loading" => match val {
                 "on" | "true" | "1" | "yes" => config.tools_deferred_loading = true,
                 "off" | "false" | "0" | "no" => config.tools_deferred_loading = false,
@@ -2573,6 +3190,9 @@ fn apply_config_content_with(
             }
             "disabled_tools" => {
                 config.disabled_tools = parse_comma_list(val);
+            }
+            "memory_only_tools" => {
+                config.memory_only_tools = parse_comma_list(val);
             }
             "memory.backend" => {
                 config.memory_backend.kind = match val {
@@ -2645,6 +3265,10 @@ fn apply_config_content_with(
                     {
                         family_diagnostic(diagnostic);
                     }
+                } else if key.starts_with("wait.") {
+                    if let Err(diagnostic) = parse_wait_config_key(&mut config.wait, key, val) {
+                        family_diagnostic(diagnostic);
+                    }
                 } else if key.starts_with("turn_budget.") {
                     match parse_turn_budget_config_key(&mut config.turn_budgets, key, val) {
                         Ok(None) => {}
@@ -2668,11 +3292,32 @@ fn apply_config_content_with(
                     {
                         config.warnings.push(format!("{key} — {reason}"));
                     }
+                } else if key.starts_with("subagent.watch.") {
+                    if let Err(diagnostic) = parse_watch_config_key(&mut config.watch, key, val) {
+                        family_diagnostic(diagnostic);
+                    }
                 } else if key.starts_with("subagent.") {
                     if let Err(reason) =
                         parse_subagent_config_key(&mut config.subagent, key, val)
                     {
                         config.warnings.push(format!("{key} — {reason}"));
+                    }
+                } else if key == "context_management.summary_model" {
+                    // A model choice, not a threshold: an invalid value
+                    // turns the summary off (never silently `auto`) without
+                    // disabling context management.
+                    match parse_summary_model(val) {
+                        Ok(model) => {
+                            config.summary_model = model;
+                            config.summary_model_invalid = false;
+                        }
+                        Err(reason) => {
+                            config.summary_model = None;
+                            config.summary_model_invalid = true;
+                            config.warnings.push(format!(
+                                "{key} — {reason}; the rolling summary is off until it is fixed"
+                            ));
+                        }
                     }
                 } else if key.starts_with("context_management.") {
                     if let Err(reason) = parse_context_management_config_key(
@@ -2730,10 +3375,24 @@ fn apply_config_content_with(
         ));
         config.subagent.max_concurrent = config.subagent.max_total;
     }
+    // A warn line above the refuse line would let a resume be refused
+    // without ever having been warned about; keep the stricter number.
+    if let (Some(warn), Some(refuse)) = (
+        config.subagent.context_warn_tokens,
+        config.subagent.resume_refuse_tokens,
+    ) {
+        if warn > refuse {
+            config.warnings.push(format!(
+                "subagent.context_warn_tokens ({warn}) is above subagent.resume_refuse_tokens ({refuse}); using {refuse} for both"
+            ));
+            config.subagent.context_warn_tokens = Some(refuse);
+            config.subagent_context_clamp = Some((warn, refuse));
+        }
+    }
     if invalid_context_management {
         config.context_management = ContextManagementConfig::default();
         config.warnings.push(
-            "invalid context_management configuration — using defaults (mode off)".to_string(),
+            "invalid context_management configuration — context management is off".to_string(),
         );
     }
 
@@ -2822,6 +3481,44 @@ impl ConfigLock {
     }
 }
 
+/// The `auth.*` settings of the active config file, parsed without any
+/// diagnostics output. A missing or unreadable file reads as empty, exactly
+/// like [`load_config`].
+pub fn read_auth_config() -> AuthConfig {
+    let content = std::fs::read_to_string(resolve_read_path("config")).unwrap_or_default();
+    let mut config = SynapsConfig::default();
+    apply_config_content_with(&mut config, &content, &mut |_diagnostic: String| {});
+    config.auth
+}
+
+/// The config write lock held across a caller's compare-and-set (the
+/// accounts verbs' `--expect`): read the current values, decide, and write
+/// with no other locked writer in between. Writes are the same atomic
+/// replace as [`write_config_value`]. Not reentrant (see [`ConfigLock`]):
+/// never call [`write_config_value`] while holding it.
+pub struct ConfigWriteGuard {
+    _lock: ConfigLock,
+}
+
+impl ConfigWriteGuard {
+    /// Blocks until the lock is free (holders keep it for one RMW).
+    pub fn acquire() -> std::io::Result<Self> {
+        Ok(Self {
+            _lock: ConfigLock::acquire()?,
+        })
+    }
+
+    /// [`read_auth_config`], made while the lock is held.
+    pub fn read_auth(&self) -> AuthConfig {
+        read_auth_config()
+    }
+
+    /// Write every pair in one atomic replace.
+    pub fn write_values(&self, pairs: &[(&str, &str)]) -> std::io::Result<()> {
+        write_config_values_locked(pairs)
+    }
+}
+
 /// Write a single `key = value` pair to `~/.synaps-cli/config` (or profile config).
 /// Replaces the first existing line that matches the key, or appends if absent.
 /// Preserves comments and unknown keys. Writes atomically via temp file + rename.
@@ -2832,20 +3529,46 @@ pub fn write_config_value(key: &str, value: &str) -> std::io::Result<()> {
 
 /// The RMW body; caller holds [`ConfigLock`].
 fn write_config_value_locked(key: &str, value: &str) -> std::io::Result<()> {
+    write_config_values_locked(&[(key, value)])
+}
+
+/// Several `key = value` pairs in ONE atomic replace; caller holds
+/// [`ConfigLock`]. Each pair lands exactly as [`write_config_value`] would
+/// write it alone.
+fn write_config_values_locked(pairs: &[(&str, &str)]) -> std::io::Result<()> {
     let path = resolve_write_path("config");
     let existing = std::fs::read_to_string(&path).unwrap_or_default();
-    let out = replace_config_line(&existing, key, value);
+    let out = pairs
+        .iter()
+        .fold(existing, |text, (key, value)| replace_config_line(&text, key, value));
+    publish_config_locked(&path, &out)
+}
 
+/// Atomically replace the config file at `path` with `contents`: an
+/// owner-only temp file beside it, renamed over it. Caller holds
+/// [`ConfigLock`].
+fn publish_config_locked(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
     let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, out)?;
+    std::fs::write(&tmp, contents)?;
     // Config may contain API keys — restrict to owner-only
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
     }
-    std::fs::rename(&tmp, &path)?;
-    Ok(())
+    std::fs::rename(&tmp, path)
+}
+
+/// The trimmed value of `line` when it is a `key = value` line for `key`;
+/// comments and blank lines never are. The one matching rule shared by
+/// [`replace_config_line`] and [`write_config_values_checked`].
+fn config_line_value<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+    let t = line.trim_start();
+    if t.starts_with('#') {
+        return None;
+    }
+    let (k, v) = t.split_once('=')?;
+    (k.trim() == key).then_some(v.trim())
 }
 
 /// `existing` with the first `key = …` line replaced by `key = value` (or
@@ -2859,18 +3582,9 @@ fn replace_config_line(existing: &str, key: &str, value: &str) -> String {
     let mut new_lines: Vec<String> = existing
         .lines()
         .map(|line| {
-            if found {
-                return line.to_string();
-            }
-            let t = line.trim_start();
-            if t.starts_with('#') || t.is_empty() {
-                return line.to_string();
-            }
-            if let Some((k, _)) = t.split_once('=') {
-                if k.trim() == key_trimmed {
-                    found = true;
-                    return replacement.clone();
-                }
+            if !found && config_line_value(line, key_trimmed).is_some() {
+                found = true;
+                return replacement.clone();
             }
             line.to_string()
         })
@@ -2885,6 +3599,344 @@ fn replace_config_line(existing: &str, key: &str, value: &str) -> String {
         out.push('\n');
     }
     out
+}
+
+/// Keys that `synaps config set` ([`write_config_values_checked`]) may write.
+///
+/// An explicit allowlist, not "any known key": each entry becomes a public,
+/// scriptable write surface (installers set these unattended), so growing
+/// this list is a deliberate product decision, never a convenience.
+pub const SETTABLE_CONFIG_KEYS: &[&str] = &["memory.backend", "memory.axel.executable"];
+
+/// How [`write_config_values_checked`] treats keys that already have a value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigSetMode {
+    /// Write every pair, replacing current values.
+    Overwrite,
+    /// Write absent keys; a key set to a different value refuses the call.
+    IfUnset,
+    /// Compare-and-set: each `(key, value)` must match the current value (an
+    /// empty value means "must be unset"), or the call is refused.
+    Expect(Vec<(String, String)>),
+}
+
+/// Overall result of [`write_config_values_checked`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigSetResult {
+    /// The config file was replaced, in one atomic write.
+    Written,
+    /// Every key already had its value; nothing was written.
+    Unchanged,
+    /// A key is not settable or a check failed; nothing was written.
+    Refused,
+}
+
+impl ConfigSetResult {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Written => "written",
+            Self::Unchanged => "unchanged",
+            Self::Refused => "refused",
+        }
+    }
+}
+
+/// Per-key status in a [`ConfigSetOutcome`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigKeyStatus {
+    /// The new value was written.
+    Written,
+    /// Not written: the key already had the value, was only an expectation,
+    /// or the call was refused because of another key.
+    Unchanged,
+    /// [`ConfigSetMode::IfUnset`]: the key is set to a different value.
+    Conflict,
+    /// [`ConfigSetMode::Expect`]: the key does not have the expected value.
+    ExpectFailed,
+    /// The key is not in [`SETTABLE_CONFIG_KEYS`].
+    NotSettable,
+    /// The `expect_path` given to [`write_config_values_checked`] is not the
+    /// config file's canonical path; no key was checked or written.
+    PathMismatch,
+}
+
+impl ConfigKeyStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Written => "written",
+            Self::Unchanged => "unchanged",
+            Self::Conflict => "conflict",
+            Self::ExpectFailed => "expect_failed",
+            Self::NotSettable => "not_settable",
+            Self::PathMismatch => "path_mismatch",
+        }
+    }
+}
+
+/// What [`write_config_values_checked`] did. Never holds a config value (the
+/// file may contain secrets), so it is safe to print in full.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigSetOutcome {
+    pub result: ConfigSetResult,
+    /// Canonical absolute path of the config file — the one `load_config`
+    /// reads, which is also the one written.
+    pub path: PathBuf,
+    /// Every key the call names (pairs first, then expect-only keys).
+    pub keys: Vec<(String, ConfigKeyStatus)>,
+}
+
+/// Why [`write_config_values_checked`] could not decide.
+#[derive(Debug)]
+pub enum ConfigSetError {
+    /// Malformed, empty or duplicate input, a value the config parser
+    /// rejects, or a profile whose config file does not exist yet.
+    Invalid(String),
+    /// Reading or writing the config file failed.
+    Io(std::io::Error),
+}
+
+impl std::fmt::Display for ConfigSetError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Invalid(message) => f.write_str(message),
+            Self::Io(err) => write!(f, "config file: {err}"),
+        }
+    }
+}
+
+impl std::error::Error for ConfigSetError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Invalid(_) => None,
+            Self::Io(err) => Some(err),
+        }
+    }
+}
+
+impl From<std::io::Error> for ConfigSetError {
+    fn from(err: std::io::Error) -> Self {
+        Self::Io(err)
+    }
+}
+
+/// Set several config keys as one atomic step — the engine of
+/// `synaps config set`.
+///
+/// Under a single [`ConfigLock`] hold: one read of the config file, every
+/// check, then one temp-file + rename write (owner-only) or no write at all.
+/// With `expect_path`, the canonical config path must equal it exactly (no
+/// canonicalization of `expect_path`) before anything else is decided. Keys
+/// outside [`SETTABLE_CONFIG_KEYS`] refuse the call before the file is read.
+/// A value the real parser would warn about is rejected the way
+/// [`validate_config_edit`] rejects it, whatever the file holds now. A key is
+/// present by the rule [`replace_config_line`] uses (its first non-comment
+/// `key = value` line); values compare trimmed.
+///
+/// `Err(Invalid)` is bad input; a policy or state refusal is `Ok` with
+/// [`ConfigSetResult::Refused`] and a reason per key.
+pub fn write_config_values_checked(
+    pairs: &[(String, String)],
+    mode: &ConfigSetMode,
+    expect_path: Option<&std::path::Path>,
+) -> Result<ConfigSetOutcome, ConfigSetError> {
+    let expects: &[(String, String)] = match mode {
+        ConfigSetMode::Expect(expects) => expects.as_slice(),
+        ConfigSetMode::Overwrite | ConfigSetMode::IfUnset => &[],
+    };
+    check_config_set_request(pairs, expects)?;
+    let path = config_set_target()?;
+
+    let mut keys: Vec<(String, ConfigKeyStatus)> = Vec::new();
+    for (key, _) in pairs.iter().chain(expects) {
+        if !keys.iter().any(|(k, _)| k == key) {
+            keys.push((key.clone(), ConfigKeyStatus::Unchanged));
+        }
+    }
+    let refused = |keys: Vec<(String, ConfigKeyStatus)>| ConfigSetOutcome {
+        result: ConfigSetResult::Refused,
+        path: canonical_config_path(&path),
+        keys,
+    };
+
+    let _guard = ConfigLock::acquire()?;
+    // Read and replace the file itself, never a symlink to it: the path
+    // reported (and compared by --expect-path) is then the file that changes,
+    // and a symlinked config stays a symlink.
+    let path = canonical_config_path(&path);
+    // Checked under the lock, so the file confirmed here is the file written.
+    if let Some(expected) = expect_path {
+        if canonical_config_path(&path).as_os_str() != expected.as_os_str() {
+            for (_, status) in &mut keys {
+                *status = ConfigKeyStatus::PathMismatch;
+            }
+            return Ok(refused(keys));
+        }
+    }
+    let mut not_settable = false;
+    for (key, status) in &mut keys {
+        if !SETTABLE_CONFIG_KEYS.contains(&key.as_str()) {
+            *status = ConfigKeyStatus::NotSettable;
+            not_settable = true;
+        }
+    }
+    if not_settable {
+        return Ok(refused(keys));
+    }
+
+    let existing = match std::fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
+        // Unreadable or not UTF-8: never replace what could not be read.
+        Err(err) => return Err(err.into()),
+    };
+    // Values are compared and written trimmed, as the parser reads them.
+    let apply = |subset: &[&(String, String)]| {
+        let mut text = existing.clone();
+        for (key, value) in subset {
+            text = replace_config_line(&text, key, value.trim());
+        }
+        text
+    };
+
+    // Judge every value, not only the ones that would change, so a bad
+    // value is an error whatever the file holds now.
+    let all: Vec<&(String, String)> = pairs.iter().collect();
+    let before = config_content_problems(&existing);
+    let introduced: Vec<String> = config_content_problems(&apply(&all))
+        .into_iter()
+        .filter(|problem| !before.contains(problem))
+        .collect();
+    if !introduced.is_empty() {
+        return Err(ConfigSetError::Invalid(format!(
+            "rejected by the config parser: {}",
+            introduced.join("; ")
+        )));
+    }
+
+    let current = |key: &str| existing.lines().find_map(|line| config_line_value(line, key));
+    let mut changed: Vec<&(String, String)> = Vec::new();
+    for pair in pairs {
+        let (key, value) = (pair.0.as_str(), pair.1.trim());
+        match current(key) {
+            Some(now) if now == value => {}
+            Some(_) if matches!(mode, ConfigSetMode::IfUnset) => {
+                set_key_status(&mut keys, key, ConfigKeyStatus::Conflict)
+            }
+            _ => changed.push(pair),
+        }
+    }
+    for (key, want) in expects {
+        let (now, want) = (current(key), want.trim());
+        // "Unset" means no line at all: `key =` with nothing after is set.
+        let met = if want.is_empty() {
+            now.is_none()
+        } else {
+            now == Some(want)
+        };
+        if !met {
+            set_key_status(&mut keys, key, ConfigKeyStatus::ExpectFailed);
+        }
+    }
+
+    let result = if keys.iter().any(|(_, status)| *status != ConfigKeyStatus::Unchanged) {
+        ConfigSetResult::Refused
+    } else if changed.is_empty() {
+        ConfigSetResult::Unchanged
+    } else {
+        // As `resolve_write_path` would; only missing when the lock is off.
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        publish_config_locked(&path, &apply(&changed))?;
+        for (key, _) in &changed {
+            set_key_status(&mut keys, key, ConfigKeyStatus::Written);
+        }
+        ConfigSetResult::Written
+    };
+    Ok(ConfigSetOutcome {
+        result,
+        path: canonical_config_path(&path),
+        keys,
+    })
+}
+
+/// Record `status` for `key` in a [`ConfigSetOutcome`] key list.
+fn set_key_status(keys: &mut [(String, ConfigKeyStatus)], key: &str, status: ConfigKeyStatus) {
+    if let Some((_, slot)) = keys.iter_mut().find(|(k, _)| k == key) {
+        *slot = status;
+    }
+}
+
+/// Input checks of [`write_config_values_checked`]; they touch no file.
+fn check_config_set_request(
+    pairs: &[(String, String)],
+    expects: &[(String, String)],
+) -> Result<(), ConfigSetError> {
+    let invalid = |message: String| Err(ConfigSetError::Invalid(message));
+    if pairs.is_empty() {
+        return invalid("nothing to set".to_string());
+    }
+    let key_char = |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit() || b"_.-".contains(&b);
+    for (list, is_expect) in [(pairs, false), (expects, true)] {
+        for (key, value) in list {
+            if key.is_empty() || !key.bytes().all(key_char) {
+                return invalid(format!("invalid key {key:?}: allowed are a-z 0-9 _ . -"));
+            }
+            // Before any trimming: a trailing newline is a control character too.
+            if value.chars().any(char::is_control) {
+                return invalid(format!(
+                    "value for {key} must be one line with no control characters"
+                ));
+            }
+            if !is_expect && value.trim().is_empty() {
+                return invalid(format!("empty value for {key}"));
+            }
+            if list.iter().filter(|(k, _)| k == key).count() > 1 {
+                return invalid(format!("{key} is given more than once"));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The config file [`write_config_values_checked`] reads and writes: the
+/// write path of [`write_config_value`], which must also be the file
+/// [`load_config`] reads. They differ only under a profile whose config does
+/// not exist yet — checks would then run against another file than the one
+/// written, so that is refused.
+fn config_set_target() -> Result<PathBuf, ConfigSetError> {
+    // `resolve_write_path` without its directory creation.
+    let target = get_active_config_dir().join("config");
+    let read = resolve_read_path("config");
+    if read != target {
+        return Err(ConfigSetError::Invalid(format!(
+            "{} does not exist yet (this profile reads {}); create it first",
+            target.display(),
+            read.display()
+        )));
+    }
+    Ok(target)
+}
+
+/// The canonical absolute path of the config file [`load_config`] reads now
+/// (the active profile's when it exists, else the base dir's), in the same
+/// form `synaps config set --json` reports as "path", so the two compare
+/// exactly. The daemon records it at boot for WELCOME's `config_path`.
+pub fn canonical_config_read_path() -> PathBuf {
+    canonical_config_path(&resolve_read_path("config"))
+}
+
+/// `path` made canonical; when the file does not exist yet, its directory.
+fn canonical_config_path(path: &std::path::Path) -> PathBuf {
+    if let Ok(canonical) = std::fs::canonicalize(path) {
+        return canonical;
+    }
+    if let (Some(dir), Some(name)) = (path.parent(), path.file_name()) {
+        if let Ok(dir) = std::fs::canonicalize(dir) {
+            return dir.join(name);
+        }
+    }
+    std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// Add a favorite model id (`provider/model`) to config, preserving sort/dedup.
@@ -3032,6 +4084,72 @@ pub fn resolve_system_prompt(explicit: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn a_family_diagnostic_is_reported_once_per_process_until_the_line_changes() {
+        // Role names unique to this test: the remembered set is process-wide.
+        let bad = "turn_budget.once_per_process_a.max_tool_calls = 1\n";
+        let mut reports: Vec<String> = Vec::new();
+        for _ in 0..2 {
+            let mut config = super::SynapsConfig::default();
+            super::apply_config_content_once(&mut config, bad, &mut |d: &str| reports.push(d.to_string()));
+        }
+        assert_eq!(reports.len(), 1, "two loads of the same bad line: {reports:?}");
+        assert!(reports[0].contains("unknown turn_budget role 'once_per_process_a'"), "{reports:?}");
+
+        // A changed line is a new message: reported, once.
+        let changed = "turn_budget.once_per_process_b.max_tool_calls = 1\n";
+        for _ in 0..2 {
+            let mut config = super::SynapsConfig::default();
+            super::apply_config_content_once(&mut config, changed, &mut |d: &str| reports.push(d.to_string()));
+        }
+        assert_eq!(reports.len(), 2, "{reports:?}");
+        assert!(reports[1].contains("'once_per_process_b'"), "{reports:?}");
+    }
+
+    #[test]
+    fn first_report_remembers_a_message_and_tells_others_apart() {
+        assert!(super::first_report("first_report test: message one"));
+        assert!(!super::first_report("first_report test: message one"));
+        assert!(super::first_report("first_report test: message two"));
+    }
+    #[test]
+    fn memory_only_tools_parses_a_comma_list_of_globs() {
+        assert!(super::load_config_from_str("").memory_only_tools.is_empty());
+        let config = super::load_config_from_str("memory_only_tools = pria-vault:*, ext__kag__*\n");
+        assert_eq!(config.memory_only_tools, vec!["pria-vault:*", "ext__kag__*"]);
+        assert!(config.warnings.is_empty(), "a known key: {:?}", config.warnings);
+    }
+    #[test]
+    fn capacity_wait_defaults_on_and_parses() {
+        let default = super::load_config_from_str("");
+        assert!(default.capacity_wait);
+        assert!(default.warnings.is_empty(), "{:?}", default.warnings);
+        let off = super::load_config_from_str("capacity_wait = false\n");
+        assert!(!off.capacity_wait);
+        assert!(off.warnings.is_empty(), "a known key: {:?}", off.warnings);
+        assert!(!super::load_config_from_str("capacity_wait = off\n").capacity_wait);
+        assert!(super::load_config_from_str("capacity_wait = on\n").capacity_wait);
+        let bad = super::load_config_from_str("capacity_wait = maybe\n");
+        assert!(bad.capacity_wait, "invalid value keeps the default");
+        assert!(bad.warnings.iter().any(|w| w.contains("capacity_wait")));
+    }
+    #[test]
+    fn capacity_resume_defaults_on_and_parses_apart_from_capacity_wait() {
+        let default = super::load_config_from_str("");
+        assert!(default.capacity_resume);
+        let off = super::load_config_from_str("capacity_resume = off\n");
+        assert!(!off.capacity_resume);
+        assert!(off.capacity_wait, "the other switch is untouched");
+        assert!(off.warnings.is_empty(), "a known key: {:?}", off.warnings);
+        let wait_off = super::load_config_from_str("capacity_wait = off\n");
+        assert!(wait_off.capacity_resume, "independent of capacity_wait");
+        assert!(!super::load_config_from_str("capacity_resume = false\n").capacity_resume);
+        assert!(super::load_config_from_str("capacity_resume = on\n").capacity_resume);
+        let bad = super::load_config_from_str("capacity_resume = maybe\n");
+        assert!(bad.capacity_resume, "invalid value keeps the default");
+        assert!(bad.warnings.iter().any(|w| w.contains("capacity_resume")));
+    }
+
+    #[test]
     fn tools_deferred_loading_defaults_on_and_parses() {
         assert!(super::load_config_from_str("").tools_deferred_loading);
         assert!(
@@ -3093,6 +4211,40 @@ mod tests {
         assert!(!super::is_secret_env("DATABASE_URL", "postgres://db/prod"));
         assert!(!super::is_secret_env("HOME", "/home/u"));
     }
+
+    #[test]
+    fn daemon_reload_resume_is_on_by_default_and_off_is_the_kill_switch() {
+        assert!(super::load_config_from_str("").daemon.reload_resume);
+        let c = super::load_config_from_str("daemon.reload_resume = off\n");
+        assert!(!c.daemon.reload_resume);
+        assert!(c.warnings.is_empty(), "warnings: {:?}", c.warnings);
+        assert!(super::load_config_from_str("daemon.reload_resume = on\n").daemon.reload_resume);
+        // A malformed value warns and keeps the default (on).
+        let c = super::load_config_from_str("daemon.reload_resume = maybe\n");
+        assert!(c.daemon.reload_resume);
+        assert!(
+            c.warnings.iter().any(|w| w.starts_with("daemon.reload_resume")),
+            "warnings: {:?}",
+            c.warnings
+        );
+    }
+
+    #[test]
+    fn daemon_crash_restore_is_on_by_default_and_off_is_the_kill_switch() {
+        assert!(super::load_config_from_str("").daemon.crash_restore);
+        let c = super::load_config_from_str("daemon.crash_restore = off\n");
+        assert!(!c.daemon.crash_restore);
+        assert!(c.warnings.is_empty(), "warnings: {:?}", c.warnings);
+        assert!(super::load_config_from_str("daemon.crash_restore = on\n").daemon.crash_restore);
+        // A malformed value warns and keeps the default (on).
+        let c = super::load_config_from_str("daemon.crash_restore = maybe\n");
+        assert!(c.daemon.crash_restore);
+        assert!(
+            c.warnings.iter().any(|w| w.starts_with("daemon.crash_restore")),
+            "warnings: {:?}",
+            c.warnings
+        );
+    }
     #[test]
     fn startup_and_daemon_defaults() {
         let c = super::load_config_from_str("");
@@ -3134,6 +4286,24 @@ mod tests {
         assert_eq!(c.subagent.max_total, 64);
         assert_eq!(c.subagent.max_depth, 4);
         assert!(c.warnings.is_empty(), "warnings: {:?}", c.warnings);
+    }
+
+    #[test]
+    fn subagent_tool_hooks_defaults_on_and_parses_on_off() {
+        assert!(super::load_config_from_str("").subagent.tool_hooks);
+        for (value, expected) in [("off", false), ("on", true), ("false", false), ("true", true)] {
+            let c = super::load_config_from_str(&format!("subagent.tool_hooks = {value}\n"));
+            assert_eq!(c.subagent.tool_hooks, expected, "{value}");
+            assert!(c.warnings.is_empty(), "{value}: {:?}", c.warnings);
+        }
+        let bad = super::load_config_from_str("subagent.tool_hooks = maybe\n");
+        assert!(bad.subagent.tool_hooks, "an invalid value keeps the default");
+        assert!(
+            bad.warnings.iter().any(|w| w.contains("subagent.tool_hooks")),
+            "{:?}",
+            bad.warnings
+        );
+        assert!(super::KNOWN_CONFIG_KEYS.contains(&"subagent.tool_hooks"));
     }
 
     #[test]
@@ -3307,6 +4477,135 @@ mod tests {
     }
 
     #[test]
+    fn subagent_context_limits_default_to_150k_warn_and_250k_refuse() {
+        let c = super::load_config_from_str("");
+        assert_eq!(c.subagent.context_warn_tokens, Some(150_000));
+        assert_eq!(c.subagent.resume_refuse_tokens, Some(250_000));
+    }
+
+    #[test]
+    fn subagent_context_limits_parse_off_and_are_known_keys() {
+        let c = super::load_config_from_str(concat!(
+            "subagent.context_warn_tokens = 120000\n",
+            "subagent.resume_refuse_tokens = 400000\n",
+        ));
+        assert_eq!(c.subagent.context_warn_tokens, Some(120_000));
+        assert_eq!(c.subagent.resume_refuse_tokens, Some(400_000));
+        assert!(c.warnings.is_empty(), "warnings: {:?}", c.warnings);
+        let off = super::load_config_from_str(concat!(
+            "subagent.context_warn_tokens = off\n",
+            "subagent.resume_refuse_tokens = OFF\n",
+        ));
+        assert_eq!(off.subagent.context_warn_tokens, None);
+        assert_eq!(off.subagent.resume_refuse_tokens, None);
+        assert!(off.warnings.is_empty(), "warnings: {:?}", off.warnings);
+        for k in [
+            "subagent.context_warn_tokens",
+            "subagent.resume_refuse_tokens",
+        ] {
+            assert!(
+                super::KNOWN_CONFIG_KEYS.contains(&k),
+                "{k} not in KNOWN_CONFIG_KEYS"
+            );
+        }
+    }
+
+    #[test]
+    fn subagent_context_limits_reject_junk_and_keep_defaults() {
+        let c = super::load_config_from_str(concat!(
+            "subagent.context_warn_tokens = 0\n",
+            "subagent.resume_refuse_tokens = lots\n",
+        ));
+        assert_eq!(c.subagent.context_warn_tokens, Some(150_000));
+        assert_eq!(c.subagent.resume_refuse_tokens, Some(250_000));
+        for key in [
+            "subagent.context_warn_tokens",
+            "subagent.resume_refuse_tokens",
+        ] {
+            assert!(
+                c.warnings.iter().any(|w| w.starts_with(key)),
+                "expected a warning for {key}: {:?}",
+                c.warnings
+            );
+        }
+    }
+
+    #[test]
+    fn subagent_warn_line_above_the_refuse_line_is_clamped() {
+        // Either key order: the check runs after the whole file is parsed.
+        for text in [
+            "subagent.resume_refuse_tokens = 100000\nsubagent.context_warn_tokens = 180000\n",
+            "subagent.context_warn_tokens = 180000\nsubagent.resume_refuse_tokens = 100000\n",
+        ] {
+            let c = super::load_config_from_str(text);
+            assert_eq!(c.subagent.context_warn_tokens, Some(100_000));
+            assert_eq!(c.subagent.resume_refuse_tokens, Some(100_000));
+            assert_eq!(c.subagent_context_clamp, Some((180_000, 100_000)));
+            assert!(
+                c.warnings
+                    .iter()
+                    .any(|w| w.contains("subagent.context_warn_tokens (180000)")),
+                "{:?}",
+                c.warnings
+            );
+        }
+        // Lowering only the refuse line below the default warn line clamps.
+        let c = super::load_config_from_str("subagent.resume_refuse_tokens = 90000\n");
+        assert_eq!(c.subagent.context_warn_tokens, Some(90_000));
+        assert_eq!(c.subagent_context_clamp, Some((150_000, 90_000)));
+        // A line that is off is never clamped against.
+        let c = super::load_config_from_str(concat!(
+            "subagent.resume_refuse_tokens = off\n",
+            "subagent.context_warn_tokens = 900000\n",
+        ));
+        assert_eq!(c.subagent.context_warn_tokens, Some(900_000));
+        assert_eq!(c.subagent.resume_refuse_tokens, None);
+        assert_eq!(c.subagent_context_clamp, None);
+        assert!(c.warnings.is_empty(), "{:?}", c.warnings);
+    }
+
+    #[test]
+    fn subagent_context_rollover_is_inherit_unless_set_off() {
+        use super::ContextRollover::{Inherit, Off};
+        let c = super::load_config_from_str("");
+        assert_eq!(c.subagent.context_rollover, Inherit);
+        for (text, want) in [
+            ("subagent.context_rollover = inherit\n", Inherit),
+            ("subagent.context_rollover = off\n", Off),
+            ("subagent.context_rollover =   off  \n", Off),
+        ] {
+            let c = super::load_config_from_str(text);
+            assert_eq!(c.subagent.context_rollover, want, "{text:?}");
+            assert!(c.warnings.is_empty(), "{text:?}: {:?}", c.warnings);
+        }
+        assert!(super::KNOWN_CONFIG_KEYS.contains(&"subagent.context_rollover"));
+    }
+
+    /// A malformed opt-out is never read as "inherit": worker rollover is
+    /// off, with a warning, and the other subagent keys are untouched.
+    #[test]
+    fn a_malformed_subagent_context_rollover_is_off_with_a_warning() {
+        for value in ["of", "on", "auto", "OFF", "inherit off"] {
+            let c = super::load_config_from_str(&format!(
+                "subagent.context_rollover = {value}\nsubagent.max_total = 9\n"
+            ));
+            assert_eq!(
+                c.subagent.context_rollover,
+                super::ContextRollover::Off,
+                "{value:?}"
+            );
+            assert!(
+                c.warnings
+                    .iter()
+                    .any(|w| w.starts_with("subagent.context_rollover")),
+                "{value:?}: {:?}",
+                c.warnings
+            );
+            assert_eq!(c.subagent.max_total, 9, "{value:?}");
+        }
+    }
+
+    #[test]
     fn process_scopes_defaults_on_and_parses_auto_and_off() {
         assert!(super::load_config_from_str("").process_scopes);
         assert!(super::load_config_from_str("process_scopes = auto\n").process_scopes);
@@ -3472,12 +4771,81 @@ mod tests {
     }
 
     #[test]
-    fn context_management_defaults_off_and_parses_all_keys() {
+    fn daemon_umask_is_a_known_key() {
+        assert!(super::KNOWN_CONFIG_KEYS.contains(&"daemon.umask"));
+    }
+
+    /// `daemon.umask`: `inherit` or an octal mode of 1-4 digits up to 0777,
+    /// optionally in matching quotes (an installer may quote it).
+    #[test]
+    fn daemon_umask_accepts_inherit_and_octal_modes() {
+        for v in ["inherit", "INHERIT", "022", "0022", "\"022\"", "'0027'", "0", "0777", "7"] {
+            let problems = super::config_content_problems(&format!("daemon.umask = {v}\n"));
+            assert!(problems.is_empty(), "daemon.umask = {v}: {problems:?}");
+        }
+    }
+
+    #[test]
+    fn daemon_umask_rejects_malformed_values() {
+        for v in [
+            "", "0778", "1777", "8", "00022", "abc", "0o22", "0x12", "-022", "+022", "22a",
+            "\"022'", "\"\"", "u=rwx", "0 22",
+        ] {
+            let problems = super::config_content_problems(&format!("daemon.umask = {v}\n"));
+            assert!(
+                problems.iter().any(|p| p.starts_with("daemon.umask")),
+                "daemon.umask = {v} must warn: {problems:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn daemon_umask_parses_to_a_mode_and_a_malformed_value_inherits() {
+        use super::DaemonUmask::{Inherit, Mode};
+        assert_eq!(super::load_config_from_str("").daemon.umask, Inherit);
+        for (v, want) in [
+            ("inherit", Inherit),
+            ("022", Mode(0o022)),
+            ("\"0022\"", Mode(0o022)),
+            ("'027'", Mode(0o027)),
+            ("0", Mode(0)),
+            ("0777", Mode(0o777)),
+        ] {
+            let c = super::load_config_from_str(&format!("daemon.umask = {v}\n"));
+            assert_eq!(c.daemon.umask, want, "{v}");
+        }
+        // A malformed later line inherits, also over an earlier valid one.
+        let c = super::load_config_from_str("daemon.umask = 022\ndaemon.umask = 0778\n");
+        assert_eq!(c.daemon.umask, Inherit);
+        let c = super::load_config_from_str("model = x\ndaemon.umask = 0778\n");
+        assert_eq!(c.daemon.umask, Inherit);
+        assert!(c.daemon_umask_warning().is_some_and(|w| w.starts_with("daemon.umask — ")));
+        // Other keys' problems are not the umask's.
+        let c = super::load_config_from_str("daemon.umask = 022\nthinking = bogus\n");
+        assert_eq!((c.daemon.umask, c.daemon_umask_warning()), (Mode(0o022), None));
+        assert!(!c.warnings.is_empty(), "the thinking warning is there");
+    }
+
+    #[test]
+    fn context_management_defaults_auto_and_parses_all_keys() {
         use super::{ContextManagementConfig, ContextManagementMode};
+        // Unset (or no config file at all): on where the archive is
+        // supported (Unix), with every other default.
+        let unset = super::load_config_from_str("").context_management;
+        let expected = if cfg!(unix) { ContextManagementMode::Auto } else { ContextManagementMode::Off };
+        assert_eq!(unset.mode, expected);
+        assert_eq!(ContextManagementMode::CONFIG_DEFAULT, expected);
+        assert_eq!(unset, ContextManagementConfig::config_default());
+        assert_eq!(super::SynapsConfig::default().context_management, unset);
         assert_eq!(
-            super::load_config_from_str("").context_management,
-            ContextManagementConfig::default()
+            ContextManagementConfig { mode: ContextManagementMode::Off, ..unset },
+            ContextManagementConfig::default(),
+            "only the mode differs from the dark runtime default"
         );
+        // An explicit `off` still opts out, without a warning.
+        let off = super::load_config_from_str("context_management.mode = off\n");
+        assert_eq!(off.context_management.mode, ContextManagementMode::Off);
+        assert!(off.warnings.is_empty(), "{:?}", off.warnings);
         let parsed = super::load_config_from_str(
             "context_management.mode = AUTO\n\
              context_management.pressure_tokens = 250000\n\
@@ -3495,6 +4863,8 @@ mod tests {
                 reserve_tokens: 24_000,
                 finish_rounds: 3,
                 target_tokens: None,
+                summary_tokens: None,
+                summary_timeout_secs: ContextManagementConfig::DEFAULT_SUMMARY_TIMEOUT_SECS,
             }
         );
         assert!(parsed.warnings.is_empty(), "{:?}", parsed.warnings);
@@ -3578,11 +4948,84 @@ mod tests {
             "context_management.target_tokens = 5000\ncontext_management.target_tokens = auto\n",
         );
         assert_eq!(auto.context_management.target_tokens, None);
+        let summary = super::load_config_from_str(
+            "context_management.mode = auto\ncontext_management.summary_tokens = 20000\ncontext_management.summary_timeout_secs = 30\ncontext_window = 1m\n",
+        );
+        assert!(summary.warnings.is_empty(), "{:?}", summary.warnings);
+        assert_eq!(summary.context_management.summary_tokens, Some(20_000));
+        assert_eq!(summary.context_management.summary_timeout_secs, 30);
+        let defaults = super::load_config_from_str("").context_management;
+        assert_eq!(defaults.summary_tokens, None, "auto by default");
+        assert_eq!(super::load_config_from_str("").summary_model, None, "auto");
+        for (line, model) in [
+            ("context_management.summary_model = auto", None),
+            ("context_management.summary_model = AUTO", None),
+            (
+                "context_management.summary_model = groq/llama-3.3-70b-versatile",
+                Some("groq/llama-3.3-70b-versatile"),
+            ),
+            (
+                "context_management.summary_model = claude-haiku-4-5",
+                Some("claude-haiku-4-5"),
+            ),
+        ] {
+            let parsed =
+                super::load_config_from_str(&format!("context_management.mode = auto\n{line}\n"));
+            assert!(parsed.warnings.is_empty(), "{line}: {:?}", parsed.warnings);
+            assert_eq!(parsed.summary_model.as_deref(), model, "{line}");
+            assert!(!parsed.summary_model_invalid, "{line}");
+            assert_eq!(
+                parsed.context_management.mode,
+                super::ContextManagementMode::Auto
+            );
+        }
+        for bad in ["", "two words", "tab\there"] {
+            let parsed = super::load_config_from_str(&format!(
+                "context_management.mode = auto\ncontext_management.summary_model = {bad}\n"
+            ));
+            assert_eq!(parsed.summary_model, None, "{bad:?} names no model");
+            assert!(
+                parsed.summary_model_invalid,
+                "{bad:?} turns the summary off, never auto"
+            );
+            assert!(
+                parsed
+                    .warnings
+                    .iter()
+                    .any(|w| w.contains("context_management.summary_model")),
+                "{bad:?}: {:?}",
+                parsed.warnings
+            );
+            assert_eq!(
+                parsed.context_management.mode,
+                super::ContextManagementMode::Auto,
+                "an invalid summary model does not disable context management"
+            );
+        }
+        // Warm summaries at xhigh/max effort run to cap + 32k output tokens;
+        // ~110 tokens/s was observed, so 120 s ends long ones early.
+        assert_eq!(defaults.summary_timeout_secs, 300);
+        // An explicit key still wins, including the old default.
+        let explicit = super::load_config_from_str(
+            "context_management.mode = auto\ncontext_management.summary_timeout_secs = 120\ncontext_window = 1m\n",
+        );
+        assert!(explicit.warnings.is_empty(), "{:?}", explicit.warnings);
+        assert_eq!(explicit.context_management.summary_timeout_secs, 120);
+        let max = super::load_config_from_str(
+            "context_management.mode = auto\ncontext_management.summary_timeout_secs = 600\ncontext_window = 1m\n",
+        );
+        assert_eq!(max.context_management.summary_timeout_secs, 600);
         for fields in [
             "target_tokens = 0",
             "target_tokens = nope",
             "target_tokens = 250000",
             "pressure_tokens = 200000\ncontext_management.target_tokens = 200000",
+            "summary_tokens = nope",
+            "summary_tokens = 100000",
+            "target_tokens = 50000\ncontext_management.summary_tokens = 50000",
+            "summary_timeout_secs = 0",
+            "summary_timeout_secs = 601",
+            "summary_timeout_secs = soon",
         ] {
             let parsed = super::load_config_from_str(&format!(
                 "context_management.mode = auto\ncontext_management.{fields}\ncontext_window = 1m\n"
@@ -3660,6 +5103,78 @@ mod tests {
         assert_eq!(
             assess_context(&config.context_management, &state, budget).action,
             ContextAction::Rollover
+        );
+    }
+
+    /// `context_window = 1m` with thresholds set for 1M, on a model whose
+    /// ceiling clamps the window to 200k: the thresholds that don't fit run
+    /// as unset (200k's defaults) instead of failing every assessment closed.
+    #[test]
+    fn context_window_clamp_resets_thresholds_that_do_not_fit_the_clamped_window() {
+        use crate::core::context_policy::{
+            assess_context, ContextAction, ContextBudget, ContextReason, ContextState,
+        };
+        let config = super::load_config_from_str(
+            "context_management.mode = auto\n\
+             context_management.pressure_tokens = 300000\n\
+             context_management.rollover_tokens = 450000\n\
+             context_management.reserve_tokens = 20000\n\
+             context_window = 1m",
+        );
+        assert!(config.warnings.is_empty(), "{:?}", config.warnings);
+        let policy = config.context_management;
+        let budget = ContextBudget {
+            context_window_tokens: 200_000,
+            used_tokens: 50_000,
+            hard_remaining_tokens: 150_000,
+            required_next_round_tokens: 8_000,
+        };
+        // As configured, the policy can't resolve for 200k: a hard stop.
+        let raw = assess_context(&policy, &ContextState::default(), budget);
+        assert_eq!(raw.action, ContextAction::HardStop);
+        assert_eq!(raw.reason, ContextReason::InvalidConfig);
+
+        let (reset, why) = policy
+            .reset_for_clamped_window(Some(1_000_000), 200_000)
+            .expect("thresholds reset for the clamped window");
+        assert_eq!(why, "pressure_tokens must be below the context window");
+        assert_eq!(
+            reset,
+            super::ContextManagementConfig {
+                pressure_tokens: None,
+                rollover_tokens: None,
+                ..policy
+            }
+        );
+        assert_eq!(reset.reserve_tokens, 20_000);
+        let assessed = assess_context(&reset, &ContextState::default(), budget);
+        assert_eq!(assessed.action, ContextAction::Continue);
+        let thresholds = assessed.thresholds.expect("200k defaults");
+        assert_eq!(
+            (thresholds.pressure_tokens, thresholds.rollover_tokens),
+            (140_000, 180_000)
+        );
+
+        // Nothing to reset: no clamp, thresholds that fit, or a policy that
+        // did not fit the configured window either.
+        assert_eq!(policy.reset_for_clamped_window(None, 200_000), None);
+        assert_eq!(
+            policy.reset_for_clamped_window(Some(1_000_000), 1_000_000),
+            None
+        );
+        assert_eq!(
+            policy.reset_for_clamped_window(Some(400_000), 200_000),
+            None,
+            "rollover 450k never fit a 400k window"
+        );
+        let fits = super::ContextManagementConfig {
+            pressure_tokens: Some(100_000),
+            rollover_tokens: Some(150_000),
+            ..policy
+        };
+        assert_eq!(
+            fits.reset_for_clamped_window(Some(1_000_000), 200_000),
+            None
         );
     }
 
@@ -4148,15 +5663,17 @@ mod tests {
     }
 
     #[test]
-    fn test_client_input_is_shared_by_default_and_parses() {
-        assert_eq!(SynapsConfig::default().client_input, ClientInput::Shared);
-        assert_eq!(load_config_from_str("").client_input, ClientInput::Shared);
+    fn test_client_input_is_exclusive_by_default_and_parses() {
+        // PARITY: the default is Exclusive (790d R6, until JR answers E4).
+        assert_eq!(SynapsConfig::default().client_input, ClientInput::Exclusive);
+        assert_eq!(load_config_from_str("").client_input, ClientInput::Exclusive);
         assert_eq!(load_config_from_str("client_input = exclusive\n").client_input, ClientInput::Exclusive);
         assert_eq!(load_config_from_str("client_input = Shared\n").client_input, ClientInput::Shared);
         let c = load_config_from_str("client_input = mine\n");
-        assert_eq!(c.client_input, ClientInput::Shared);
+        assert_eq!(c.client_input, SynapsConfig::default().client_input);
         assert!(c.warnings.iter().any(|w| w.contains("client_input")), "{:?}", c.warnings);
         assert_eq!(ClientInput::wire_default(), ClientInput::Exclusive, "an older daemon enforces the owner");
+        assert_eq!(ClientInput::default(), ClientInput::Exclusive, "the enum agrees with the config");
     }
 
     // ── cache_keepwarm (task #444) ──
@@ -5355,6 +6872,85 @@ api_retries = 5
     }
 
     #[test]
+    fn watch_keys_default_parse_and_report_bad_values() {
+        let d = load_config_from_str("").watch;
+        assert_eq!(d.small_models, vec!["muse/muse-wonder-1.0".to_owned()]);
+        assert_eq!(d.admission, WatchAdmission::Refuse);
+        assert_eq!((d.lease_secs, d.lease_rounds), (7200, 40));
+        assert_eq!(d.lease_cost_usd, None, "no default spend cap");
+        assert_eq!(d.advice_timeout_ms, 1000);
+        assert_eq!(d.advice_min_confidence, 0.95);
+        let content = concat!(
+            "subagent.watch.small_models = muse/muse-wonder-1.0, local/tiny\n",
+            "subagent.watch.admission = off\n",
+            "subagent.watch.lease_secs = 600\n",
+            "subagent.watch.lease_rounds = 12\n",
+            "subagent.watch.lease_cost_usd = 0.50\n",
+            "subagent.watch.advice_timeout_ms = 0\n",
+            "subagent.watch.advice_min_confidence = 0.9\n",
+        );
+        let c = load_config_from_str(content);
+        assert!(
+            config_content_problems(content).is_empty(),
+            "{:?}",
+            config_content_problems(content)
+        );
+        assert_eq!(
+            c.watch.small_models,
+            vec!["muse/muse-wonder-1.0".to_owned(), "local/tiny".to_owned()]
+        );
+        assert_eq!(c.watch.admission, WatchAdmission::Off);
+        assert_eq!((c.watch.lease_secs, c.watch.lease_rounds), (600, 12));
+        assert_eq!(c.watch.lease_cost_usd, Some(0.5));
+        assert_eq!(c.watch.advice_timeout_ms, 0);
+        assert_eq!(c.watch.advice_min_confidence, 0.9);
+        assert_eq!(
+            c.subagent,
+            SubagentLimits::default(),
+            "not the subagent.* family"
+        );
+        for bad in [
+            "subagent.watch.admission = maybe",
+            "subagent.watch.lease_secs = 5",
+            "subagent.watch.lease_rounds = 0",
+            "subagent.watch.lease_cost_usd = -1",
+            "subagent.watch.advice_timeout_ms = 60000",
+            "subagent.watch.advice_min_confidence = 1.5",
+        ] {
+            assert_eq!(
+                load_config_from_str(bad).watch,
+                WatchConfig::default(),
+                "{bad}"
+            );
+            assert!(
+                !config_content_problems(bad).is_empty(),
+                "{bad} is reported"
+            );
+        }
+        for k in FAMILY_CONFIG_KEYS
+            .iter()
+            .filter(|k| k.starts_with("subagent.watch."))
+        {
+            assert!(!KNOWN_CONFIG_KEYS.contains(k), "{k}");
+        }
+    }
+
+    #[test]
+    fn wait_max_inline_secs_defaults_accepts_its_range_and_reports_the_rest() {
+        assert_eq!(load_config_from_str("").wait.max_inline_secs, 3600);
+        for (val, want) in [("1", 1), ("600", 600), ("86400", 86_400)] {
+            let cfg = load_config_from_str(&format!("wait.max_inline_secs = {val}"));
+            assert_eq!(cfg.wait.max_inline_secs, want, "{val}");
+        }
+        for bad in ["0", "86401", "-1", "an hour"] {
+            let content = format!("wait.max_inline_secs = {bad}");
+            assert_eq!(load_config_from_str(&content).wait.max_inline_secs, 3600, "{bad:?}");
+            assert!(!config_content_problems(&content).is_empty(), "{bad:?} is reported");
+        }
+        assert!(config_content_problems("wait.max_inline_secs = 7200").is_empty());
+    }
+
+    #[test]
     fn events_auto_turn_cap_garbage_keeps_default() {
         for val in ["banana", "-3", "5.5", "", "true"] {
             let cfg = load_config_from_str(&format!("events.auto_turn_cap = {val}"));
@@ -5424,6 +7020,7 @@ api_retries = 5
             machine_token: Some("m".into()),
             accounts: BTreeMap::new(),
             auto: BTreeMap::new(),
+            order: BTreeMap::new(),
         };
         assert_eq!(
             auth.credential_source(),
@@ -5498,6 +7095,7 @@ api_retries = 5
             machine_token: Some("config-tok".into()),
             accounts: BTreeMap::new(),
             auto: BTreeMap::new(),
+            order: BTreeMap::new(),
         };
         std::env::set_var("SYNAPS_AUTH_ENDPOINT", "https://env-host");
         std::env::set_var("SYNAPS_MACHINE_TOKEN", "env-tok");
@@ -5530,6 +7128,7 @@ api_retries = 5
                 machine_token: token.map(str::to_string),
                 accounts: BTreeMap::new(),
                 auto: BTreeMap::new(),
+                order: BTreeMap::new(),
             }
             .credential_source()
         };
@@ -5718,6 +7317,9 @@ api_retries = 5
                 "server.auto_approve_confirms" | "bridge.heartbeat_mirror" => "false",
                 "bridge.uds_path" => "/tmp/x.sock",
                 "auth.remote_endpoint" | "auth.machine_token" => "x",
+                "subagent.watch.admission" => "refuse",
+                "subagent.watch.lease_secs" => "600",
+                "subagent.watch.advice_min_confidence" => "0.5",
                 _ => "7",
             }
         };
@@ -5764,5 +7366,479 @@ api_retries = 5
             assert_eq!(std::fs::read_to_string(&cfg).unwrap(), "cache_ttl = forever\n");
         });
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // ── write_config_values_checked (`synaps config set`) ──
+
+    fn owned_pairs(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    fn config_set(
+        pairs: &[(&str, &str)],
+        mode: &ConfigSetMode,
+    ) -> Result<ConfigSetOutcome, ConfigSetError> {
+        write_config_values_checked(&owned_pairs(pairs), mode, None)
+    }
+
+    fn expect(pairs: &[(&str, &str)]) -> ConfigSetMode {
+        ConfigSetMode::Expect(owned_pairs(pairs))
+    }
+
+    /// The desktop installer's pair.
+    fn installer_pairs() -> [(&'static str, &'static str); 2] {
+        [("memory.backend", "axel"), ("memory.axel.executable", ABSOLUTE_SAMPLE_PATH)]
+    }
+
+    /// `key=status` per key, in outcome order.
+    fn key_statuses(outcome: &ConfigSetOutcome) -> Vec<String> {
+        outcome.keys.iter().map(|(key, status)| format!("{key}={}", status.as_str())).collect()
+    }
+
+    #[test]
+    #[serial]
+    fn config_set_writes_every_pair() {
+        let home = make_test_home("set-written");
+        let cfg = home.join(".synaps-cli/config");
+        std::fs::write(&cfg, "model = claude-opus-4-6\nmemory.backend = legacy\n").unwrap();
+        with_home(&home, || {
+            let outcome = config_set(&installer_pairs(), &ConfigSetMode::Overwrite).unwrap();
+            assert_eq!(outcome.result, ConfigSetResult::Written);
+            assert_eq!(
+                key_statuses(&outcome),
+                ["memory.backend=written", "memory.axel.executable=written"]
+            );
+        });
+        let contents = std::fs::read_to_string(&cfg).unwrap();
+        assert_eq!(
+            contents,
+            format!(
+                "model = claude-opus-4-6\nmemory.backend = axel\n\
+                 memory.axel.executable = {ABSOLUTE_SAMPLE_PATH}\n"
+            )
+        );
+        assert!(config_content_problems(&contents).is_empty());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    #[serial]
+    fn config_set_unchanged_when_every_value_is_already_set() {
+        let home = make_test_home("set-unchanged");
+        let cfg = home.join(".synaps-cli/config");
+        // Spaced unlike a write would space it: values compare trimmed, and
+        // an unchanged call must not rewrite the file.
+        let original =
+            format!("memory.backend=axel\nmemory.axel.executable =  {ABSOLUTE_SAMPLE_PATH}  \n");
+        std::fs::write(&cfg, &original).unwrap();
+        with_home(&home, || {
+            for mode in [ConfigSetMode::Overwrite, ConfigSetMode::IfUnset] {
+                let outcome = config_set(&installer_pairs(), &mode).unwrap();
+                assert_eq!(outcome.result, ConfigSetResult::Unchanged, "{mode:?}");
+                assert_eq!(
+                    key_statuses(&outcome),
+                    ["memory.backend=unchanged", "memory.axel.executable=unchanged"]
+                );
+            }
+            let padded = config_set(&[("memory.backend", " axel ")], &ConfigSetMode::Overwrite);
+            assert_eq!(padded.unwrap().result, ConfigSetResult::Unchanged);
+        });
+        assert_eq!(std::fs::read_to_string(&cfg).unwrap(), original);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    #[serial]
+    fn config_set_if_unset_conflict_refuses_the_whole_call() {
+        let home = make_test_home("set-conflict");
+        let cfg = home.join(".synaps-cli/config");
+        let original = "# set by hand\nmemory.backend = legacy\n";
+        std::fs::write(&cfg, original).unwrap();
+        with_home(&home, || {
+            let outcome = config_set(&installer_pairs(), &ConfigSetMode::IfUnset).unwrap();
+            assert_eq!(outcome.result, ConfigSetResult::Refused);
+            // The absent key is not written either.
+            assert_eq!(
+                key_statuses(&outcome),
+                ["memory.backend=conflict", "memory.axel.executable=unchanged"]
+            );
+        });
+        assert_eq!(std::fs::read_to_string(&cfg).unwrap(), original);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    #[serial]
+    fn config_set_expect_met_writes() {
+        let home = make_test_home("set-expect-met");
+        let cfg = home.join(".synaps-cli/config");
+        std::fs::write(&cfg, "memory.backend = legacy\n").unwrap();
+        with_home(&home, || {
+            // Compare-and-set on the written key plus an expect-only key.
+            let mode = expect(&[("memory.backend", "legacy"), ("memory.axel.executable", "")]);
+            let outcome = config_set(&[("memory.backend", "axel")], &mode).unwrap();
+            assert_eq!(outcome.result, ConfigSetResult::Written);
+            assert_eq!(
+                key_statuses(&outcome),
+                ["memory.backend=written", "memory.axel.executable=unchanged"]
+            );
+        });
+        assert_eq!(std::fs::read_to_string(&cfg).unwrap(), "memory.backend = axel\n");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    #[serial]
+    fn config_set_expect_failed_refuses() {
+        let home = make_test_home("set-expect-failed");
+        let cfg = home.join(".synaps-cli/config");
+        let original = "memory.backend = legacy\n";
+        std::fs::write(&cfg, original).unwrap();
+        with_home(&home, || {
+            let pairs = [("memory.axel.executable", ABSOLUTE_SAMPLE_PATH)];
+            let outcome = config_set(&pairs, &expect(&[("memory.backend", "axel")])).unwrap();
+            assert_eq!(outcome.result, ConfigSetResult::Refused);
+            assert_eq!(
+                key_statuses(&outcome),
+                ["memory.axel.executable=unchanged", "memory.backend=expect_failed"]
+            );
+        });
+        assert_eq!(std::fs::read_to_string(&cfg).unwrap(), original);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    #[serial]
+    fn config_set_expect_empty_means_unset() {
+        let home = make_test_home("set-expect-unset");
+        let cfg = home.join(".synaps-cli/config");
+        with_home(&home, || {
+            let mode = expect(&[("memory.backend", "")]);
+            let pairs = [("memory.backend", "axel")];
+            // No file at all: unset.
+            assert_eq!(config_set(&pairs, &mode).unwrap().result, ConfigSetResult::Written);
+            // Now it is set.
+            let again = config_set(&pairs, &mode).unwrap();
+            assert_eq!(again.result, ConfigSetResult::Refused);
+            assert_eq!(key_statuses(&again), ["memory.backend=expect_failed"]);
+            // A `key =` line with nothing after it is set too.
+            std::fs::write(&cfg, "memory.backend =\n").unwrap();
+            let empty = config_set(&pairs, &mode).unwrap();
+            assert_eq!(empty.result, ConfigSetResult::Refused);
+        });
+        assert_eq!(std::fs::read_to_string(&cfg).unwrap(), "memory.backend =\n");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    #[serial]
+    fn config_set_refuses_keys_outside_the_allowlist() {
+        let home = make_test_home("set-not-settable");
+        let base = home.join(".synaps-cli");
+        with_home(&home, || {
+            // A known key, an unknown key, and an allowlisted one.
+            let pairs = [("memory.backend", "axel"), ("model", "claude-opus-4-6"), ("nope", "1")];
+            let outcome = config_set(&pairs, &ConfigSetMode::Overwrite).unwrap();
+            assert_eq!(outcome.result, ConfigSetResult::Refused);
+            assert_eq!(
+                key_statuses(&outcome),
+                ["memory.backend=unchanged", "model=not_settable", "nope=not_settable"]
+            );
+            // An expectation is a read: still only allowlisted keys.
+            let mode = expect(&[("provider.anthropic", "")]);
+            let outcome = config_set(&installer_pairs(), &mode).unwrap();
+            assert_eq!(outcome.result, ConfigSetResult::Refused);
+            assert!(key_statuses(&outcome).contains(&"provider.anthropic=not_settable".into()));
+        });
+        // Refused before the read: no config or temp file was created.
+        assert!(!base.join("config").exists());
+        assert!(!base.join("config.tmp").exists());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    #[serial]
+    fn config_set_rejects_malformed_input() {
+        let home = make_test_home("set-malformed");
+        let cfg = home.join(".synaps-cli/config");
+        let original = "memory.backend = legacy\n";
+        std::fs::write(&cfg, original).unwrap();
+        with_home(&home, || {
+            let bad_pairs: &[&[(&str, &str)]] = &[
+                &[],
+                &[("memory.backend", "axel\n")],
+                &[("memory.backend", "ax\rel")],
+                &[("memory.axel.executable", "/opt/a\tb")],
+                &[("memory.backend", "axel\u{1b}[0m")],
+                &[("memory.backend", "")],
+                &[("memory.backend", "   ")],
+                &[("Memory.backend", "axel")],
+                &[("memory backend", "axel")],
+                &[("", "axel")],
+            ];
+            for pairs in bad_pairs {
+                let result = config_set(pairs, &ConfigSetMode::Overwrite);
+                assert!(matches!(result, Err(ConfigSetError::Invalid(_))), "{pairs:?}");
+            }
+            let bad_expects =
+                [expect(&[("memory.backend", "legacy\n")]), expect(&[("MEMORY", "")])];
+            for mode in &bad_expects {
+                let result = config_set(&installer_pairs(), mode);
+                assert!(matches!(result, Err(ConfigSetError::Invalid(_))), "{mode:?}");
+            }
+        });
+        assert_eq!(std::fs::read_to_string(&cfg).unwrap(), original);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    #[serial]
+    fn config_set_rejects_duplicate_keys() {
+        let home = make_test_home("set-duplicate");
+        let cfg = home.join(".synaps-cli/config");
+        with_home(&home, || {
+            let same = [("memory.backend", "axel"), ("memory.backend", "axel")];
+            let differ = [("memory.backend", "axel"), ("memory.backend", "legacy")];
+            for pairs in [same, differ] {
+                let result = config_set(&pairs, &ConfigSetMode::Overwrite);
+                assert!(matches!(result, Err(ConfigSetError::Invalid(_))), "{pairs:?}");
+            }
+            let mode = expect(&[("memory.backend", ""), ("memory.backend", "legacy")]);
+            let result = config_set(&[("memory.backend", "axel")], &mode);
+            assert!(matches!(result, Err(ConfigSetError::Invalid(_))));
+        });
+        assert!(!cfg.exists());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    #[serial]
+    fn config_set_rejects_values_the_parser_rejects() {
+        let home = make_test_home("set-parser");
+        let cfg = home.join(".synaps-cli/config");
+        let original = "memory.backend = legacy\n";
+        std::fs::write(&cfg, original).unwrap();
+        with_home(&home, || {
+            let message = |pairs: &[(&str, &str)], mode: &ConfigSetMode| {
+                match config_set(pairs, mode) {
+                    Err(ConfigSetError::Invalid(message)) => message,
+                    other => panic!("{pairs:?}: expected Invalid, got {other:?}"),
+                }
+            };
+            let backend = message(&[("memory.backend", "bogus")], &ConfigSetMode::Overwrite);
+            assert!(backend.contains("expected legacy or axel"), "{backend}");
+            let relative = [("memory.axel.executable", "relative/synaps-axel")];
+            let path = message(&relative, &ConfigSetMode::Overwrite);
+            assert!(path.contains("absolute path"), "{path}");
+            // A bad value is an error even where the call would be refused.
+            message(&[("memory.backend", "bogus")], &ConfigSetMode::IfUnset);
+        });
+        assert_eq!(std::fs::read_to_string(&cfg).unwrap(), original);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    #[serial]
+    fn config_set_unreadable_config_is_an_io_error_and_left_alone() {
+        let home = make_test_home("set-unreadable");
+        let cfg = home.join(".synaps-cli/config");
+        let original: &[u8] = b"model = \xff\xfe\n";
+        std::fs::write(&cfg, original).unwrap();
+        with_home(&home, || {
+            let result = config_set(&installer_pairs(), &ConfigSetMode::Overwrite);
+            assert!(matches!(result, Err(ConfigSetError::Io(_))), "{result:?}");
+        });
+        assert_eq!(std::fs::read(&cfg).unwrap(), original);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    #[serial]
+    fn config_set_preserves_comments_and_other_lines() {
+        let home = make_test_home("set-preserve");
+        let cfg = home.join(".synaps-cli/config");
+        // A commented-out key is not "set".
+        let original = "# Synaps config\n\nmodel = claude-opus-4-6\n# memory.backend = legacy\n\
+                        myplugin.colour = teal\n  # indented comment\n";
+        std::fs::write(&cfg, original).unwrap();
+        with_home(&home, || {
+            let outcome = config_set(&installer_pairs(), &ConfigSetMode::IfUnset).unwrap();
+            assert_eq!(outcome.result, ConfigSetResult::Written);
+        });
+        assert_eq!(
+            std::fs::read_to_string(&cfg).unwrap(),
+            format!(
+                "{original}memory.backend = axel\n\
+                 memory.axel.executable = {ABSOLUTE_SAMPLE_PATH}\n"
+            )
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn config_set_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = make_test_home("set-mode");
+        let cfg = home.join(".synaps-cli/config");
+        std::fs::write(&cfg, "model = claude-opus-4-6\n").unwrap();
+        std::fs::set_permissions(&cfg, std::fs::Permissions::from_mode(0o644)).unwrap();
+        with_home(&home, || {
+            let outcome = config_set(&installer_pairs(), &ConfigSetMode::Overwrite).unwrap();
+            assert_eq!(outcome.result, ConfigSetResult::Written);
+        });
+        let mode = std::fs::metadata(&cfg).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    #[serial]
+    fn config_set_outcome_never_carries_current_values() {
+        let home = make_test_home("set-no-echo");
+        let cfg = home.join(".synaps-cli/config");
+        let original =
+            "provider.anthropic = sk-ant-SECRET-other\nmemory.backend = SECRET-hand-set\n";
+        std::fs::write(&cfg, original).unwrap();
+        let mut printed = Vec::new();
+        with_home(&home, || {
+            let runs = [
+                (ConfigSetMode::IfUnset, ConfigSetResult::Refused),
+                (expect(&[("memory.backend", "legacy")]), ConfigSetResult::Refused),
+                (ConfigSetMode::Overwrite, ConfigSetResult::Written),
+            ];
+            for (mode, result) in runs {
+                let outcome = config_set(&installer_pairs(), &mode).unwrap();
+                assert_eq!(outcome.result, result, "{mode:?}");
+                printed.push(format!("{outcome:?}"));
+            }
+            // A rejected value names itself, never the value it would replace.
+            std::fs::write(&cfg, original).unwrap();
+            let err = config_set(&[("memory.backend", "bogus")], &ConfigSetMode::IfUnset);
+            let err = err.unwrap_err().to_string();
+            assert!(err.contains("bogus"), "{err}");
+            printed.push(err);
+        });
+        for text in &printed {
+            assert!(!text.contains("SECRET"), "{text}");
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    #[serial]
+    fn config_set_expect_path_met_writes() {
+        let home = make_test_home("set-expect-path-met");
+        let cfg = home.join(".synaps-cli/config");
+        // The canonical form, as the outcome reports it (on macOS /tmp is
+        // /private/tmp).
+        let canonical = std::fs::canonicalize(home.join(".synaps-cli")).unwrap().join("config");
+        with_home(&home, || {
+            let pairs = owned_pairs(&installer_pairs());
+            let mode = ConfigSetMode::IfUnset;
+            let outcome =
+                write_config_values_checked(&pairs, &mode, Some(canonical.as_path())).unwrap();
+            assert_eq!(outcome.result, ConfigSetResult::Written);
+            assert_eq!(outcome.path, canonical);
+            assert_eq!(
+                key_statuses(&outcome),
+                ["memory.backend=written", "memory.axel.executable=written"]
+            );
+        });
+        assert!(cfg.is_file());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    #[serial]
+    fn config_set_expect_path_mismatch_refuses() {
+        let home = make_test_home("set-expect-path-mismatch");
+        let base = home.join(".synaps-cli");
+        let cfg = base.join("config");
+        let original = "memory.backend = legacy\n";
+        std::fs::write(&cfg, original).unwrap();
+        let canonical = std::fs::canonicalize(&cfg).unwrap();
+        // Another file, and this file spelled non-canonically: the expected
+        // path is compared exactly as given, never resolved.
+        let others = [canonical.with_file_name("other-config"), base.join(".").join("config")];
+        with_home(&home, || {
+            let pairs = owned_pairs(&installer_pairs());
+            for other in &others {
+                let mode = ConfigSetMode::Overwrite;
+                let outcome =
+                    write_config_values_checked(&pairs, &mode, Some(other.as_path())).unwrap();
+                assert_eq!(outcome.result, ConfigSetResult::Refused, "{other:?}");
+                assert_eq!(outcome.path, canonical);
+                assert_eq!(
+                    key_statuses(&outcome),
+                    ["memory.backend=path_mismatch", "memory.axel.executable=path_mismatch"]
+                );
+            }
+        });
+        assert_eq!(std::fs::read_to_string(&cfg).unwrap(), original);
+        assert!(!base.join("config.tmp").exists());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The reported path is the real file `load_config` reads, even when the
+    /// base dir is reached through a symlink.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn config_set_path_is_the_canonical_read_path() {
+        let home = make_test_home("set-canonical");
+        let real = home.join("real-base");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::remove_dir_all(home.join(".synaps-cli")).unwrap();
+        std::os::unix::fs::symlink(&real, home.join(".synaps-cli")).unwrap();
+        let expected = std::fs::canonicalize(&real).unwrap().join("config");
+        with_home(&home, || {
+            // Before the file exists (a refusal) and after it is written.
+            let refused = config_set(&[("model", "x")], &ConfigSetMode::Overwrite).unwrap();
+            assert_eq!(refused.path, expected);
+            let written = config_set(&installer_pairs(), &ConfigSetMode::IfUnset).unwrap();
+            assert_eq!(written.result, ConfigSetResult::Written);
+            assert_eq!(written.path, expected);
+            let read = std::fs::canonicalize(resolve_read_path("config")).unwrap();
+            assert_eq!(written.path, read);
+        });
+        assert!(real.join("config").is_file());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A config file that is a symlink is written through: the link stays a
+    /// link, its target changes, and the reported path is the target.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn config_set_writes_through_a_symlinked_config_file() {
+        let home = make_test_home("set-symlink-file");
+        let target = home.join("dotfiles-config");
+        std::fs::write(&target, "model = keep-me\n").unwrap();
+        let link = home.join(".synaps-cli").join("config");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let expected = std::fs::canonicalize(&target).unwrap();
+        with_home(&home, || {
+            let written = config_set(&installer_pairs(), &ConfigSetMode::IfUnset).unwrap();
+            assert_eq!(written.result, ConfigSetResult::Written);
+            assert_eq!(written.path, expected);
+        });
+        assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        let content = std::fs::read_to_string(&target).unwrap();
+        assert!(content.contains("model = keep-me"), "{content}");
+        assert!(content.contains("memory.backend = axel"), "{content}");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Every allowlisted key is one the parser knows, so its value is checked.
+    #[test]
+    fn settable_config_keys_are_known_parser_keys() {
+        for key in SETTABLE_CONFIG_KEYS {
+            assert!(
+                KNOWN_CONFIG_KEYS.contains(key) || FAMILY_CONFIG_KEYS.contains(key),
+                "{key}"
+            );
+        }
     }
 }
