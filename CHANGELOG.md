@@ -39,6 +39,15 @@ All notable changes to this project will be documented in this file.
   the result (what the parent model reads, and the subagent card) ran
   sentences together: "…read them all.Found 2 files…". Each response now
   starts a new paragraph, as `subagent_start` workers already did.
+- **An unknown `/command` is never sent to the model.** Typed while a turn
+  was running, a `/name` the TUI didn't know (any plugin command in an
+  attached TUI) went to the model as steering text, arguments and all, so
+  `/nosuch secret-value` landed in the conversation and the session file.
+  `synaps attach` sent such lines idle too. Now nothing is sent: the TUI
+  says so (try it again when the turn ends), and `synaps attach` answers
+  "unknown command". To send text that starts with `/`, start it with
+  `//`: `//etc/hosts is wrong` sends `/etc/hosts is wrong`, idle or
+  mid-turn, in the TUI and in `synaps attach`.
 
 ## [0.11.1] — 2026-10-31
 
