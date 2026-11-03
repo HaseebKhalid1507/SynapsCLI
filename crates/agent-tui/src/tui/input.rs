@@ -453,10 +453,13 @@ fn handle_key(
             app.editor.insert_newline();
             return InputAction::None;
         }
-        // Enter with text in a worker view steers that worker; slash
-        // commands still run as usual.
+        // Enter with text in a worker view steers that worker (`//text` as
+        // `/text`); slash commands still run as usual.
         (KeyCode::Enter, _)
-            if watching && !app.input_is_empty() && !app.input_first_line().starts_with('/') =>
+            if watching
+                && !app.input_is_empty()
+                && (!app.input_first_line().starts_with('/')
+                    || super::commands::slash_escaped(app.input_first_line()).is_some()) =>
         {
             match super::watch::steer_target(app) {
                 Some(Ok(handle_id)) => return process_subagent_steer(app, handle_id),
@@ -465,9 +468,10 @@ fn handle_key(
             }
             return InputAction::None;
         }
-        // While main streams, an unknown `/word` would be sent to main as a
-        // steer; idle, a `/` with no command word would be sent to main as a
-        // prompt (prG R1). In a worker view both are refused there instead.
+        // While main streams, an unknown `/word` is answered here, not in
+        // main's transcript; idle, a `/` with no command word would be sent
+        // to main as a prompt (prG R1). In a worker view both are refused
+        // there instead.
         // Idle, a non-empty unknown `/word` still goes to the session (a
         // newer daemon's command), and its answer lands in this view.
         (KeyCode::Enter, _)
@@ -603,8 +607,8 @@ fn handle_key(
 }
 
 /// Whether the input is a `/command` the streaming dispatch would run or
-/// refuse, rather than send to the main agent as a steer (the same
-/// resolution as `dispatch`'s `StreamingInput` arm). Non-slash input: true.
+/// refuse, rather than answer as unknown (the same resolution as
+/// `dispatch`'s `StreamingInput` arm). Non-slash input: true.
 fn slash_is_known(app: &App, registry: &Arc<CommandRegistry>) -> bool {
     if !app.input_first_line().starts_with('/') {
         return true;
@@ -648,7 +652,9 @@ fn process_submit(app: &mut App, registry: &Arc<CommandRegistry>) -> InputAction
         app.transcript.scroll_to_bottom();
     }
 
-    if input.starts_with('/') && input.len() > 1 {
+    if let Some(text) = super::commands::slash_escaped(&input) {
+        InputAction::Submit(text.to_string())
+    } else if input.starts_with('/') && input.len() > 1 {
         let parts: Vec<&str> = input[1..].splitn(2, char::is_whitespace).collect();
         let raw_cmd = parts[0];
         let arg = parts.get(1).map(|s| s.trim()).unwrap_or("").to_string();
@@ -689,8 +695,11 @@ fn process_streaming_submit(app: &mut App) -> InputAction {
 /// Enter in a worker view: same input bookkeeping as a submit, but the text
 /// goes to the watched subagent.
 fn process_subagent_steer(app: &mut App, handle_id: String) -> InputAction {
-    let text = app.input_text();
-    app.input_history.push(text.clone());
+    let typed = app.input_text();
+    let text = super::commands::slash_escaped(&typed)
+        .unwrap_or(&typed)
+        .to_string();
+    app.input_history.push(typed);
     app.history_index = None;
     app.input_stash.clear();
     app.clear_input();
@@ -1541,6 +1550,33 @@ mod tests {
             _ => String::new(),
         });
         assert!(note.unwrap_or_default().contains("read-only"), "refused in the view");
+    }
+
+    /// Idle, `//text` submits `/text` and an unknown `/name` stays a
+    /// command; in a worker view `//text` steers the worker with `/text`.
+    #[test]
+    fn a_double_slash_line_is_text_starting_with_slash() {
+        let mut app = make_app();
+        app.set_input_text("//etc/hosts is wrong");
+        assert!(matches!(
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE),
+            InputAction::Submit(t) if t == "/etc/hosts is wrong"
+        ));
+        app.set_input_text("/nosuch secret-value");
+        assert!(matches!(
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE),
+            InputAction::SlashCommand(c, a) if c == "nosuch" && a == "secret-value"
+        ));
+        let clock = app.clock.clone();
+        let w = app.threads.open_worker("sa_1", 1, "scout", clock, (0, 0));
+        w.status = "running".into();
+        w.steerable = true;
+        app.threads.focus_worker("sa_1");
+        app.set_input_text("//x");
+        assert!(matches!(
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE),
+            InputAction::SubagentSteer { handle_id, text } if handle_id == "sa_1" && text == "/x"
+        ));
     }
 
     /// 04-tui I1: in a worker view, Enter on an empty box with staged

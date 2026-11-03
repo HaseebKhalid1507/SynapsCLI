@@ -1195,15 +1195,15 @@ pub(crate) async fn handle_input_action(
         }
         InputAction::StreamingInput(input) => {
             match commands::resolve_streaming_input(&input, app, registry) {
-                commands::StreamingSlash::Refused => {}
-                commands::StreamingSlash::Steer => {
+                commands::StreamingSlash::Refused | commands::StreamingSlash::Unknown => {}
+                commands::StreamingSlash::Steer(text) => {
                     if read_only_blocked(app, link, Some(&input)) {
                         return ControlFlow::Continue(());
                     }
-                    // Normal or unknown slash text during streaming —
+                    // Normal text during streaming (`//text` as `/text`) —
                     // steer/queue ("→ steering:" / "queued:" on `Steered`).
                     let _ = link
-                        .send(agent_engine::session::SessionCommand::Steer { text: input })
+                        .send(agent_engine::session::SessionCommand::Steer { text })
                         .await;
                 }
                 commands::StreamingSlash::Ran(action) => match action {
@@ -1920,5 +1920,64 @@ mod tests {
                 assert!(echoed);
             }
         }
+    }
+
+    /// Mid-turn, an unknown `/name` line (it may hold a secret) is answered
+    /// locally and sends nothing to the session; `//text` and plain text
+    /// are steered.
+    #[tokio::test]
+    async fn an_unknown_slash_line_mid_turn_sends_nothing() {
+        let transport = crate::tui::testing::scripted::ScriptedTransport::new(
+            synaps_cli::Runtime::new().await.unwrap(),
+        );
+        let log = std::sync::Arc::clone(&transport.log);
+        let mut link = crate::tui::session_link::SessionLink::new(Box::new(transport));
+        let mut app = App::new(synaps_cli::Session::new("test", "medium", None));
+        app.streaming = true;
+        let http = super::super::run_setup::LazyHttp::new();
+        let mut config = synaps_cli::SynapsConfig::default();
+        let registry = std::sync::Arc::new(
+            synaps_cli::skills::registry::CommandRegistry::new_with_plugins(&[], vec![], vec![]),
+        );
+        let keybind_registry = std::sync::Arc::new(std::sync::RwLock::new(
+            synaps_cli::skills::keybinds::KeybindRegistry::new(),
+        ));
+        let system_prompt_path = std::path::PathBuf::from("/tmp/sp");
+        let render_handle = render_thread::RenderHandle::headless();
+        let mut event_reader: Option<crossterm::event::EventStream> = None;
+        let mut exit_fx_sent = false;
+        for (typed, steers) in [
+            ("/nosuch secret-value", 0),
+            ("//etc/hosts is wrong", 1),
+            ("fix the tests", 1),
+        ] {
+            log.lock().unwrap().sent.clear();
+            let state = LoopState {
+                app: &mut app,
+                link: &mut link,
+                http: &http,
+                config: &mut config,
+                registry: &registry,
+                keybind_registry: &keybind_registry,
+                system_prompt_path: &system_prompt_path,
+                render_handle: &render_handle,
+                event_reader: &mut event_reader,
+                ext_mgr_shared: None,
+                exit_fx_sent: &mut exit_fx_sent,
+                is_socket: false,
+            };
+            let _ = handle_input_action(InputAction::StreamingInput(typed.into()), state).await;
+            let sent = log.lock().unwrap().sent.clone();
+            assert_eq!(sent.len(), steers, "{typed}: {sent:?}");
+            assert!(
+                sent.iter().all(|c| c.starts_with("Steer")),
+                "{typed}: {sent:?}"
+            );
+        }
+        let unknown =
+            app.transcript.messages().iter().any(
+                |m| matches!(&m.msg, ChatMessage::Error(s) if s == "unknown command: /nosuch"),
+            );
+        assert!(unknown, "the local unknown-command answer");
     }
 }

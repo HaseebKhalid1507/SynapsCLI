@@ -1364,7 +1364,7 @@ async fn forward_unhandled_command(
     app: &mut App,
     link: &mut super::session_link::SessionLink,
 ) -> CommandAction {
-    let unknown = || ChatMessage::Error(format!("unknown command: /{}", cmd));
+    let unknown = || unknown_command(cmd);
     let value = match link.engine_command(cmd, arg).await {
         Ok(v) => v,
         Err(_) => {
@@ -1683,22 +1683,41 @@ pub(super) enum StreamingSlash {
     /// A known command that can't run mid-turn: the refusal notice is
     /// already in the transcript; nothing is sent to the model.
     Refused,
-    /// Plain text or unknown slash text: send it as a steer.
-    Steer,
+    /// A `/name` no command answers to: "unknown command" is already in
+    /// the transcript; nothing is sent (the line may hold a secret).
+    Unknown,
+    /// Plain text, or `//text` as `/text`: send this text as a steer.
+    Steer(String),
 }
 
-/// Resolve input typed while a turn streams. Known slash commands never
-/// leak into the stream as steering text: they run (the streaming set) or
-/// are refused with a notice.
+/// `//text` is text that starts with `/`, not a command: returns it with
+/// one `/` (`//etc/hosts` → `/etc/hosts`). Submit and steer both use it.
+pub(crate) fn slash_escaped(input: &str) -> Option<&str> {
+    input.strip_prefix('/').filter(|rest| rest.starts_with('/'))
+}
+
+/// The idle answer to a `/cmd` nobody handles (also used mid-turn).
+fn unknown_command(cmd: &str) -> ChatMessage {
+    ChatMessage::Error(format!("unknown command: /{}", cmd))
+}
+
+/// Resolve input typed while a turn streams. Slash commands never leak
+/// into the stream as steering text: they run (the streaming set), are
+/// refused with a notice, or are unknown.
 pub(super) fn resolve_streaming_input(
     input: &str,
     app: &mut App,
     registry: &synaps_cli::skills::registry::CommandRegistry,
 ) -> StreamingSlash {
-    let Some(rest) = input.strip_prefix('/') else {
-        return StreamingSlash::Steer;
+    if let Some(text) = slash_escaped(input) {
+        return StreamingSlash::Steer(text.to_string());
+    }
+    // A bare `/` is text, as when idle.
+    let Some(rest) = input.strip_prefix('/').filter(|rest| !rest.is_empty()) else {
+        return StreamingSlash::Steer(input.to_string());
     };
-    let raw_cmd = rest.split_whitespace().next().unwrap_or("");
+    // The command word as the idle path reads it (`/ x` has none).
+    let raw_cmd = rest.split(char::is_whitespace).next().unwrap_or("");
     let streaming_cmds = to_owned_commands(STREAMING_COMMANDS);
     let cmd = resolve_prefix(raw_cmd, &streaming_cmds);
     match handle_streaming_command(&cmd, input, app) {
@@ -1712,7 +1731,8 @@ pub(super) fn resolve_streaming_input(
                 )));
                 StreamingSlash::Refused
             } else {
-                StreamingSlash::Steer
+                app.push_msg(unknown_command(raw_cmd));
+                StreamingSlash::Unknown
             }
         }
         action => StreamingSlash::Ran(action),
@@ -2119,6 +2139,65 @@ mod tests {
         for typed in ["/takeover", "/tak"] {
             let r = super::resolve_streaming_input(typed, &mut app, &registry);
             assert!(matches!(r, super::StreamingSlash::Ran(CommandAction::TakeOver)), "{typed}");
+        }
+    }
+
+    /// Mid-turn, a `/name` no command answers to is never steered (the line
+    /// may hold a secret): it gets the idle path's "unknown command" answer.
+    /// Known commands run or are refused as before, plain text steers, and
+    /// `//text` steers `/text`.
+    #[test]
+    fn unknown_slash_mid_turn_is_never_steered() {
+        let registry =
+            CommandRegistry::new_with_plugins(synaps_cli::skills::BUILTIN_COMMANDS, vec![], vec![]);
+        let mut app = crate::tui::app::App::new(synaps_cli::Session::new("test", "medium", None));
+        app.streaming = true;
+        let texts = |app: &crate::tui::app::App| -> Vec<String> {
+            app.transcript
+                .messages()
+                .iter()
+                .filter_map(|m| match &m.msg {
+                    ChatMessage::Error(s) | ChatMessage::System(s) | ChatMessage::User(s) => {
+                        Some(s.clone())
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+
+        let r = super::resolve_streaming_input("/nosuch secret-value", &mut app, &registry);
+        assert!(matches!(r, super::StreamingSlash::Unknown));
+        let shown = texts(&app);
+        assert!(
+            app.transcript.messages().iter().any(
+                |m| matches!(&m.msg, ChatMessage::Error(s) if s == "unknown command: /nosuch")
+            ),
+            "{shown:?}"
+        );
+        assert!(
+            !shown.iter().any(|s| s.contains("secret-value")),
+            "{shown:?}"
+        );
+
+        let r = super::resolve_streaming_input("/compact now", &mut app, &registry);
+        assert!(matches!(r, super::StreamingSlash::Refused));
+        assert!(texts(&app)
+            .iter()
+            .any(|s| s == "/compact can't run while streaming — press Esc to cancel first"));
+
+        let r = super::resolve_streaming_input("/quit", &mut app, &registry);
+        assert!(matches!(r, super::StreamingSlash::Ran(CommandAction::Quit)));
+
+        for (typed, steered) in [
+            ("fix the tests", "fix the tests"),
+            ("//x", "/x"),
+            ("//etc/hosts is wrong", "/etc/hosts is wrong"),
+            ("/", "/"),
+        ] {
+            match super::resolve_streaming_input(typed, &mut app, &registry) {
+                super::StreamingSlash::Steer(text) => assert_eq!(text, steered, "{typed}"),
+                _ => panic!("{typed}: not steered"),
+            }
         }
     }
 
