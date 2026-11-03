@@ -564,6 +564,7 @@ pub fn parse_anthropic_catalog_models(body: &str) -> Result<Vec<CatalogModel>, s
 /// never substring-based. Evidence: adaptive-thinking notes in
 /// `crates/agent-core/src/core/models.rs` (Opus 4.7+ / Opus 5.5 / Fable 5
 /// adaptive+effort; Sonnet 4.6, Opus 4.6, Haiku 4.5 fixed-budget thinking).
+/// Haiku 5.5: adaptive thinking, set with effort (its model overview page).
 /// Max/UltraCode are NOT implied here — they stay locked to the dedicated
 /// mode manifest (`anthropic_mode_capabilities`).
 pub fn anthropic_static_capability(model_id: &str) -> Option<ReasoningSupport> {
@@ -572,7 +573,8 @@ pub fn anthropic_static_capability(model_id: &str) -> Option<ReasoningSupport> {
         | "claude-opus-4-7"
         | "claude-fable-5"
         | "claude-fable-5-1"
-        | "claude-fable-5-2" => {
+        | "claude-fable-5-2"
+        | "claude-haiku-5-5" => {
             Some(ReasoningSupport::AnthropicAdaptive { adaptive: true })
         }
         "claude-sonnet-4-6" | "claude-opus-4-6" | "claude-haiku-4-5-20251001" => {
