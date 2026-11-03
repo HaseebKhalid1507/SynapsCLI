@@ -63,6 +63,11 @@ pub fn codex_static_capability(model_id: &str) -> Option<ReasoningSupport> {
             Medium,
             Some(CodexMultiAgentVersion::V2),
         ),
+        // GPT-6-Luna, from its model page: reasoning.effort none, low,
+        // medium (default), high, xhigh, max. `none` is Off, which no
+        // supported list carries; no Ultra. The page names no multi-agent
+        // support, so none is assumed.
+        "gpt-6-luna" => (&[Low, Medium, High, XHigh, Max], Medium, None),
         "gpt-5.6-sol" => (
             &[Low, Medium, High, XHigh, Max, Ultra],
             Low,
@@ -96,6 +101,7 @@ pub fn codex_static_catalog_models() -> Vec<CatalogModel> {
     [
         ("gpt-6.1-sol", "GPT-6.1-Sol"),
         ("gpt-6-astra", "GPT-6-Astra"),
+        ("gpt-6-luna", "GPT-6-Luna"),
         ("gpt-5.6-sol", "GPT-5.6-Sol"),
         ("gpt-5.6-terra", "GPT-5.6-Terra"),
         ("gpt-5.6-luna", "GPT-5.6-Luna"),
@@ -773,8 +779,9 @@ mod tests {
                     | "gpt-5.6-luna" | "gpt-5.5" | "gpt-5.4-mini" => {
                         vec![Modality::Text, Modality::Image]
                     }
-                    // 5.4 unobserved; spark explicitly text-only.
-                    "gpt-5.4" | "gpt-5.3-codex-spark" => vec![Modality::Text],
+                    // 5.4 unobserved; spark explicitly text-only; 6-luna
+                    // not observed in the local Codex cache.
+                    "gpt-5.4" | "gpt-5.3-codex-spark" | "gpt-6-luna" => vec![Modality::Text],
                     _ => panic!("unexpected selectable fixture row"),
                 };
                 assert_eq!(model.input_modalities, expected, "{}", model.id);
@@ -1869,6 +1876,7 @@ mod tests {
             vec![
                 "gpt-6.1-sol",
                 "gpt-6-astra",
+                "gpt-6-luna",
                 "gpt-5.6-sol",
                 "gpt-5.6-terra",
                 "gpt-5.6-luna",
