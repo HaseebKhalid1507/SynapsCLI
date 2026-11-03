@@ -265,6 +265,33 @@ impl ContextManagementConfig {
     }
 }
 
+/// `compaction_model = match`: the chat's own model writes its summaries.
+pub const COMPACTION_MODEL_MATCH: &str = "match";
+/// `compaction_model = provider-small`: the small model pinned for the
+/// chat's provider ([`crate::models::PROVIDER_SMALL_MODELS`]) writes its
+/// summaries, on the chat's own account.
+pub const COMPACTION_MODEL_PROVIDER_SMALL: &str = "provider-small";
+
+/// `compaction_model`: empty or `match` is `None` (the chat's own model);
+/// `provider-small`, or one model id of a routable shape: a bare `claude-`
+/// id, or `provider/model`. The words are lowercase and exact. Whether the
+/// provider is one synaps can route to is checked when a summary's model is
+/// chosen.
+pub fn parse_compaction_model(value: &str) -> Result<Option<String>, &'static str> {
+    let value = value.trim();
+    if value.is_empty() || value == COMPACTION_MODEL_MATCH {
+        return Ok(None);
+    }
+    let routable = match value.split_once('/') {
+        Some((provider, model)) => !provider.is_empty() && !model.is_empty(),
+        None => value == COMPACTION_MODEL_PROVIDER_SMALL || value.starts_with("claude-"),
+    };
+    if !routable || value.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err("expected match, provider-small or a model id (provider/model)");
+    }
+    Ok(Some(value.to_string()))
+}
+
 /// Parse fields first; validate the complete policy after all lines so threshold
 /// ordering and an explicit context window do not depend on config key order.
 fn parse_context_management_config_key(
@@ -1408,7 +1435,7 @@ pub struct SynapsConfig {
     pub daemon: DaemonConfig,
     /// Subagent fan-out limits (`subagent.*`).
     pub subagent: SubagentLimits,
-    pub compaction_model: Option<String>, // model used for /compact (default: claude-sonnet-4-6)
+    pub compaction_model: Option<String>, // who writes summaries: None = match, else provider-small or a model id
     /// Where compaction summarization runs (spec §9.4): remote provider or
     /// local-only (zero network construction).
     pub compaction_mode: crate::core::compaction::CompactionMode,
@@ -2222,7 +2249,15 @@ fn apply_config_content_with(
                     }
                 }
             }
-            "compaction_model" => config.compaction_model = Some(val.to_string()),
+            "compaction_model" => match parse_compaction_model(val) {
+                Ok(model) => config.compaction_model = model,
+                Err(why) => {
+                    config.compaction_model = None;
+                    config.warnings.push(format!(
+                        "compaction_model = {val} — {why}; the chat's own model writes summaries"
+                    ));
+                }
+            },
             "compaction_mode" => match val {
                 "remote" => {
                     config.compaction_mode = crate::core::compaction::CompactionMode::Remote
@@ -4914,6 +4949,53 @@ bridge.heartbeat_timeout_ms = 750\n\
             .warnings
             .iter()
             .any(|w| w.contains("compaction_mode")));
+    }
+
+    /// `compaction_model`: unset, empty and `match` are the chat's own
+    /// model; `provider-small` and a routable model id are kept; anything
+    /// else warns and is the chat's own model.
+    #[test]
+    fn compaction_model_parses_match_provider_small_or_one_model_id() {
+        for (value, want) in [
+            ("", None),
+            ("  ", None),
+            ("match", None),
+            (" match ", None),
+            ("provider-small", Some("provider-small")),
+            ("claude-haiku-5-5", Some("claude-haiku-5-5")),
+            ("openai-codex/gpt-6-luna", Some("openai-codex/gpt-6-luna")),
+        ] {
+            let parsed = parse_compaction_model(value);
+            assert_eq!(parsed, Ok(want.map(str::to_owned)), "{value:?}");
+        }
+        for bad in [
+            "Match",
+            "sonnet",
+            "gpt-6-luna",
+            "/x",
+            "openai/",
+            "openai/gpt 5",
+            "a b",
+        ] {
+            assert!(parse_compaction_model(bad).is_err(), "{bad:?}");
+        }
+        assert_eq!(load_config_from_str("").compaction_model, None);
+        let config = load_config_from_str("compaction_model = match\n");
+        assert_eq!(config.compaction_model, None);
+        assert!(config.warnings.is_empty(), "{:?}", config.warnings);
+        let config = load_config_from_str("compaction_model = sonnet\n");
+        assert_eq!(config.compaction_model, None);
+        assert!(
+            config
+                .warnings
+                .iter()
+                .any(|w| w.starts_with("compaction_model = sonnet")),
+            "{:?}",
+            config.warnings
+        );
+        let config = load_config_from_str("compaction_model = provider-small\n");
+        assert_eq!(config.compaction_model.as_deref(), Some("provider-small"));
+        assert!(config.warnings.is_empty(), "{:?}", config.warnings);
     }
 
     #[test]

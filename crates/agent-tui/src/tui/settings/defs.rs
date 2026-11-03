@@ -231,7 +231,7 @@ define_settings! {
 
     "compaction_model", "Compaction model", Model,
         EditorKind::ModelPicker,
-        "Model used for /compact (default: claude-sonnet-4-6).",
+        "Who writes /compact summaries: match (this chat's model; also empty, auto or default), provider-small (its provider's small model) or a model id. One that can't be used gives way to the chat's own model, with a notice.",
         |_app, value| {
             let model = if value.is_empty() || value == "auto" || value == "default" {
                 None

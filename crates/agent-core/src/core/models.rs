@@ -12,6 +12,15 @@ pub const KNOWN_MODELS: &[(&str, &str)] = &[
     ("claude-haiku-5-5", "Haiku 5.5 — fast"),
 ];
 
+/// `compaction_model = provider-small`: the small model that writes a
+/// chat's summaries, by the provider of the chat's route, on the chat's own
+/// account. One line per pin; update a pin here. A provider without a line
+/// has its chats' summaries written by the chat's own model.
+pub const PROVIDER_SMALL_MODELS: &[(&str, &str)] = &[
+    ("anthropic", "claude-haiku-5-5"),
+    ("openai-codex", "gpt-6-luna"),
+];
+
 pub fn default_model() -> &'static str {
     KNOWN_MODELS[0].0
 }

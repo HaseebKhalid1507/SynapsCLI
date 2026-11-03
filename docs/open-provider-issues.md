@@ -9,7 +9,7 @@ Tracked from S176 code review (8-agent review × 2 rounds). These require design
 ## 1. `/compact` broken on OpenAI models 🔴
 
 **Problem:** `/compact` uses `call_api_simple` which has no `try_route` — always goes to Anthropic. If a user is on `groq/llama-3.3-70b` and compacts, it either:
-- (a) Uses `compaction_model` (defaults to `claude-sonnet-4-6`) → hits Anthropic, which fails if no Anthropic key
+- (a) Uses `compaction_model` (then defaulting to `claude-sonnet-4-6`; unset now means the chat's own model) → hits Anthropic, which fails if no Anthropic key
 - (b) User sets `compaction_model = groq/llama-3.3-70b` → `call_api_simple` sends it to Anthropic → 400
 
 **Fix:** Route `call_api_simple` through `try_route`, same as the streaming path. Or better — make compaction use the streaming path with a collected result.

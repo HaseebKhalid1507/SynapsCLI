@@ -4,6 +4,22 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- **`compaction_model` chooses who writes compaction summaries.** `match`
+  (also unset or empty, the default) has the chat's own model write
+  `/compact` and auto-compaction summaries; `provider-small` uses the small
+  model pinned for the chat's provider on the chat's own account
+  (`claude-haiku-5-5` for Anthropic, `gpt-6-luna` for OpenAI Codex, the
+  chat's own model elsewhere); a model id names any routable model. A
+  summary goes to another provider only when a model there is named. A
+  named or pinned model that can't be used (no route, a reasoning level its
+  provider refuses, a smaller context window than the chat's, no
+  credential) gives way to the chat's own model, and the compaction line
+  says so. The `claude-sonnet-4-6` default and fallback are gone; any other
+  value warns at load and is `match`. Haiku 5.5 and GPT-6-Luna join the
+  known models.
+
 ### Fixed
 
 - **Windows: the `grep`, `find` and `ls` tools work.** They ran the bare

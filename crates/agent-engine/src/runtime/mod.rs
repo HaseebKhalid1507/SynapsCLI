@@ -578,7 +578,9 @@ pub struct Runtime {
     /// archive directory (see `worker_context`). Inert by default and on
     /// every foreground runtime.
     worker_context: worker_context::WorkerContext,
-    /// Model used for compaction. Falls back to claude-sonnet-4-6 if not set.
+    /// `compaction_model` as configured: who writes compaction summaries
+    /// (`None` or empty: `match`, the chat's own model; see
+    /// [`Self::compact_model_choice`]).
     compaction_model: Option<String>,
     /// Where compaction summarization runs (spec §9.4).
     compaction_mode: agent_core::compaction::CompactionMode,
@@ -1157,6 +1159,27 @@ fn build_http_client(read_timeout: Duration) -> reqwest::Result<Client> {
         .connect_timeout(Duration::from_secs(10))
         .read_timeout(read_timeout)
         .build()
+}
+
+/// The `compaction_model = provider-small` pin
+/// ([`agent_core::models::PROVIDER_SMALL_MODELS`]) for the provider of
+/// `model`'s route, if it has one.
+fn provider_small_model(model: &str) -> Option<&'static str> {
+    let provider = known_model_route(model)?.provider;
+    agent_core::models::PROVIDER_SMALL_MODELS
+        .iter()
+        .find(|(key, _)| *key == provider)
+        .map(|(_, pin)| *pin)
+}
+
+/// `model`'s provider route, when it is a model id synaps knows how to
+/// route: `provider/model` with a known provider, or a bare `claude-` id
+/// (a bare id is never another provider's model, nor an extension's).
+fn known_model_route(model: &str) -> Option<crate::runtime::openai::ResolvedRoute> {
+    if !model.contains('/') && !model.starts_with("claude-") {
+        return None;
+    }
+    crate::runtime::openai::resolve_route(model)
 }
 
 /// The process-global HTTP client for `EngineHost` (same builder as
@@ -2535,14 +2558,141 @@ impl Runtime {
         self.context_window_override
     }
 
-    /// Effective context window for the current model — user override if set,
-    /// otherwise the model's native window from `models::context_window_for_model`.
+    /// `compaction_model` as the session shows it: `match` when unset or
+    /// empty, else the word (`provider-small`) or the model id as written.
+    /// Never a model nobody configured.
     pub fn compaction_model(&self) -> &str {
-        self.compaction_model
-            .as_deref()
-            .unwrap_or("claude-sonnet-4-6")
+        match self.compaction_model.as_deref().map(str::trim) {
+            None | Some("") => agent_core::config::COMPACTION_MODEL_MATCH,
+            Some(value) => value,
+        }
     }
 
+    /// The model `compaction_model` names for summaries of a chat on `own`:
+    /// `None` under `match` (the chat's own model writes them), under
+    /// `provider-small` for a provider without a pin, and when the model
+    /// named is `own` itself. A pin keeps the chat's provider and the form
+    /// of its id (`anthropic/claude-x` gets `anthropic/claude-haiku-5-5`).
+    fn compaction_policy_model(&self, own: &str) -> Option<String> {
+        use agent_core::config::{COMPACTION_MODEL_MATCH, COMPACTION_MODEL_PROVIDER_SMALL};
+        let model = match self.compaction_model() {
+            COMPACTION_MODEL_MATCH => return None,
+            COMPACTION_MODEL_PROVIDER_SMALL => {
+                let pin = provider_small_model(own)?;
+                match own.split_once('/') {
+                    Some((prefix, _)) => format!("{prefix}/{pin}"),
+                    None => pin.to_owned(),
+                }
+            }
+            named => named.to_owned(),
+        };
+        let same = model == own
+            || matches!(
+                (known_model_route(&model), known_model_route(own)),
+                (Some(a), Some(b)) if a == b
+            );
+        (!same).then_some(model)
+    }
+
+    /// The model `/compact` and auto-compaction summarize with, and the
+    /// notice (said in the compaction disclosure line) when the model
+    /// `compaction_model` names can't be used: that model when it is
+    /// usable, else the chat's own model, as under `match`. A summary goes
+    /// to another provider only when `compaction_model` names a model there.
+    pub fn compact_model_choice(&self) -> (String, Option<String>) {
+        let Some(model) = self.compaction_policy_model(&self.model) else {
+            return (self.model.clone(), None);
+        };
+        match self.compact_model_unusable(&model) {
+            None => (model, None),
+            Some(reason) => (
+                self.model.clone(),
+                Some(format!(
+                    "The summary model {model} can't be used ({reason}); the chat's own model wrote this summary."
+                )),
+            ),
+        }
+    }
+
+    /// Why `model` can't write a compaction summary for this chat: no known
+    /// route, a reasoning level its provider refuses for it, a context
+    /// window smaller than the chat's, or no credential for its provider.
+    /// All decided locally, before anything is sent.
+    fn compact_model_unusable(&self, model: &str) -> Option<&'static str> {
+        let Some(route) = known_model_route(model) else {
+            return Some("no provider route is known for it");
+        };
+        if self.compact_level_refused(model) {
+            return Some("its provider refuses the chat's reasoning level for it");
+        }
+        if crate::models::context_window_for_model(model) < self.context_window() {
+            return Some("its context window is smaller than the chat's");
+        }
+        if self.compact_credentials_missing(&route) {
+            return Some("no credential is configured for its provider");
+        }
+        None
+    }
+
+    /// Whether `model`'s provider refuses this chat's reasoning level for
+    /// it, decided from the capability rows as the request's preflight
+    /// ([`Self::validate_request_preflight_for`]) decides it: a Codex
+    /// model's execution plan, else `validate_reasoning_mutation`, which
+    /// covers Anthropic's Max, Ultra and UltraCode rows (bare and
+    /// `anthropic/` ids alike). Only the orchestration prerequisites of
+    /// UltraCode and Codex Ultra are left to the request.
+    fn compact_level_refused(&self, model: &str) -> bool {
+        use crate::runtime::openai::catalog;
+        let level = self.reasoning_level();
+        if model.starts_with("openai-codex/") {
+            catalog::plan_codex_execution(model, level, catalog::CodexRequestRole::Internal, None)
+                .is_err()
+        } else {
+            catalog::validation::validate_reasoning_mutation(model, level).is_err()
+        }
+    }
+
+    /// True only when the route's credential is known to be missing. A
+    /// remote broker owns credentials this process can't inspect: never
+    /// missing.
+    fn compact_credentials_missing(&self, route: &crate::runtime::openai::ResolvedRoute) -> bool {
+        use crate::auth::broker;
+        use crate::auth::OAuthProviderId;
+        if self.credential_source.is_remote() {
+            return false;
+        }
+        match route.auth {
+            crate::runtime::openai::AuthPolicy::OAuthAccessToken(OAuthProviderId::Anthropic) => {
+                let in_memory = self.auth.try_read().map_or(true, |auth| {
+                    auth.auth_type != "none"
+                        && (auth.auth_type != "oauth" || !auth.auth_token.is_empty())
+                });
+                !in_memory && !broker::anthropic_credential_available()
+            }
+            crate::runtime::openai::AuthPolicy::OAuthAccessToken(provider) => {
+                !broker::oauth_provider_logged_in(provider)
+            }
+            crate::runtime::openai::AuthPolicy::BrokerProxy => {
+                let oauth = match route.provider.as_str() {
+                    "github-copilot" => Some(OAuthProviderId::GitHubCopilot),
+                    "google-gemini" => Some(OAuthProviderId::GoogleGemini),
+                    "kimi-code" => Some(OAuthProviderId::KimiCode),
+                    "muse" => Some(OAuthProviderId::Muse),
+                    _ => None,
+                };
+                match oauth {
+                    Some(provider) => {
+                        !broker::oauth_provider_logged_in(provider)
+                            && !broker::static_key_configured(&route.provider)
+                    }
+                    None => !broker::static_key_configured(&route.provider),
+                }
+            }
+        }
+    }
+
+    /// Effective context window for the current model — user override if set,
+    /// otherwise the model's native window from `models::context_window_for_model`.
     pub fn context_window(&self) -> u64 {
         self.context_window_override
             .unwrap_or_else(|| crate::models::context_window_for_model(&self.model))
@@ -4339,17 +4489,21 @@ impl Runtime {
         .await
     }
 
-    /// Make a simple non-streaming API call for compaction (no tools).
+    /// Make a simple non-streaming API call for compaction (no tools) on
+    /// `model`, the one [`Self::compact_model_choice`] picked.
     ///
     /// Uses a dedicated summarization system prompt (not the user's), omits
     /// all tools, and returns the raw text response. Caller supplies the
     /// full message array including the serialized conversation.
-    pub async fn compact_call(&self, messages: Vec<crate::SharedMessage>) -> Result<String> {
+    pub async fn compact_call(
+        &self,
+        model: &str,
+        messages: Vec<crate::SharedMessage>,
+    ) -> Result<String> {
         // Transport-construction seam: counted BEFORE preflight, auth
         // refresh, or any request assembly (CP-12 M3).
         self.remote_summarization_attempts
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let model = self.compaction_model();
         self.validate_request_preflight_for(
             model,
             crate::runtime::openai::catalog::CodexRequestRole::Internal,
@@ -7530,8 +7684,7 @@ mod codex_execution_preflight_tests {
 
     #[tokio::test]
     async fn compaction_preflight_validates_target_before_credentials() {
-        let mut runtime = ultra_runtime();
-        runtime.set_compaction_model(Some("claude-sonnet-4-6".to_string()));
+        let runtime = ultra_runtime();
         {
             let mut auth = runtime.auth.write().await;
             auth.auth_token.clear();
@@ -7541,12 +7694,33 @@ mod codex_execution_preflight_tests {
         }
 
         let error = runtime
-            .compact_call(Vec::new())
+            .compact_call("claude-sonnet-4-6", Vec::new())
             .await
             .expect_err("Codex Ultra cannot silently cross into Anthropic compaction");
         assert!(
             error.to_string().contains("authoritative exact-model"),
             "preflight must reject the target before auth access: {error}"
+        );
+    }
+
+    /// A named compaction model the chat's reasoning level can't be sent to
+    /// (Ultra on Anthropic) is not chosen: the chat's own model writes the
+    /// summary, and the disclosure says why. Decided before any credential
+    /// or network access.
+    #[test]
+    fn compaction_at_a_level_the_named_model_refuses_uses_the_chats_own_model() {
+        let mut runtime = ultra_runtime();
+        assert_eq!(runtime.compaction_model(), "match");
+        assert_eq!(
+            runtime.compact_model_choice(),
+            ("openai-codex/gpt-5.6-sol".to_string(), None)
+        );
+        runtime.set_compaction_model(Some("claude-sonnet-4-6".to_string()));
+        let (model, notice) = runtime.compact_model_choice();
+        assert_eq!(model, "openai-codex/gpt-5.6-sol");
+        assert_eq!(
+            notice.as_deref(),
+            Some("The summary model claude-sonnet-4-6 can't be used (its provider refuses the chat's reasoning level for it); the chat's own model wrote this summary.")
         );
     }
 }
