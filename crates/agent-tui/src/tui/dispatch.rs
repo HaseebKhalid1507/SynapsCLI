@@ -1125,7 +1125,13 @@ pub(crate) async fn handle_input_action(
             }
         }
         InputAction::Submit(input) => {
-            if read_only_blocked(app, link, Some(&input)) {
+            // Give back what was typed: `//x` (sent as `/x`) stays `//x`.
+            let typed = app
+                .input_history
+                .last()
+                .filter(|t| commands::slash_escaped(t) == Some(input.as_str()))
+                .cloned();
+            if read_only_blocked(app, link, Some(typed.as_deref().unwrap_or(&input))) {
                 return ControlFlow::Continue(());
             }
             // Queue input during compaction — the actor queues it (B2) and
@@ -1865,13 +1871,34 @@ mod tests {
     async fn a_read_only_client_keeps_its_text_and_sends_nothing() {
         use agent_engine::session::{AttachMode, ClientId, ClientInput};
         let cases = [
-            (AttachMode::Observe, ClientInput::Shared, true, "read-only: attach without --observe"),
-            (AttachMode::Mirror, ClientInput::Exclusive, true, "input owned by client #7; /takeover to type"),
-            (AttachMode::Mirror, ClientInput::Shared, false, ""),
+            (
+                AttachMode::Observe,
+                ClientInput::Shared,
+                true,
+                "read-only: attach without --observe",
+                "hello there",
+            ),
+            (
+                AttachMode::Mirror,
+                ClientInput::Exclusive,
+                true,
+                "input owned by client #7; /takeover to type",
+                "//etc/hosts",
+            ),
+            (
+                AttachMode::Mirror,
+                ClientInput::Shared,
+                false,
+                "",
+                "hello there",
+            ),
         ];
-        for (mode, client_input, blocked, toast) in cases {
+        for (mode, client_input, blocked, toast, typed) in cases {
             let mut app = App::new(synaps_cli::Session::new("test", "medium", None));
             app.observing = mode == AttachMode::Observe;
+            // As process_submit leaves it: the typed line in history, `//x` sent as `/x`.
+            app.input_history.push(typed.to_string());
+            let submitted = commands::slash_escaped(typed).unwrap_or(typed).to_string();
             let transport = crate::tui::testing::scripted::ScriptedTransport::new(synaps_cli::Runtime::new().await.unwrap())
                 .with_daemon_pid(4242)
                 .with_ownership(mode, Some(ClientId(7)))
@@ -1889,7 +1916,7 @@ mod tests {
             let render_handle = render_thread::RenderHandle::headless();
             let mut event_reader: Option<crossterm::event::EventStream> = None;
             let mut exit_fx_sent = false;
-            for action in [InputAction::Submit("hello there".into()), InputAction::Abort] {
+            for action in [InputAction::Submit(submitted), InputAction::Abort] {
                 let state = LoopState {
                     app: &mut app,
                     link: &mut link,
@@ -1911,7 +1938,11 @@ mod tests {
             if blocked {
                 assert!(sent.is_empty(), "{mode:?}/{client_input}: {sent:?}");
                 assert!(!echoed, "{mode:?}/{client_input}: not echoed as sent");
-                assert_eq!(app.input_text(), "hello there", "{mode:?}/{client_input}: the text is given back");
+                assert_eq!(
+                    app.input_text(),
+                    typed,
+                    "{mode:?}/{client_input}: the typed text is given back"
+                );
                 assert!(app.toasts.visible().any(|t| t.id() == "read-only"), "{mode:?}/{client_input}");
                 let shown = format!("{:?}", app.toasts.visible().collect::<Vec<_>>());
                 assert!(shown.contains(toast), "{mode:?}/{client_input}: {shown}");
@@ -1974,10 +2005,13 @@ mod tests {
                 "{typed}: {sent:?}"
             );
         }
-        let unknown =
-            app.transcript.messages().iter().any(
-                |m| matches!(&m.msg, ChatMessage::Error(s) if s == "unknown command: /nosuch"),
-            );
-        assert!(unknown, "the local unknown-command answer");
+        let answer = "/nosuch: not a command here while a turn runs; nothing was sent. \
+                      Try it again when the turn ends.";
+        let unknown = app
+            .transcript
+            .messages()
+            .iter()
+            .any(|m| matches!(&m.msg, ChatMessage::Error(s) if s == answer));
+        assert!(unknown, "the local mid-turn answer");
     }
 }

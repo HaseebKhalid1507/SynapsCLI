@@ -480,7 +480,12 @@ fn handle_key(
                 && (streaming || slash_word(app).is_empty()) =>
         {
             let word = app.input_first_line().split_whitespace().next().unwrap_or("/").to_string();
-            super::watch::notice(app, format!("unknown command: {word}"));
+            let answer = if streaming {
+                super::commands::not_checked_mid_turn(word.strip_prefix('/').unwrap_or(&word))
+            } else {
+                format!("unknown command: {word}")
+            };
+            super::watch::notice(app, answer);
             return InputAction::None;
         }
         // Staged attachments are main's; an empty Enter here never sends them.

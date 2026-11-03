@@ -1696,9 +1696,20 @@ pub(crate) fn slash_escaped(input: &str) -> Option<&str> {
     input.strip_prefix('/').filter(|rest| rest.starts_with('/'))
 }
 
-/// The idle answer to a `/cmd` nobody handles (also used mid-turn).
+/// The idle answer to a `/cmd` nobody handles.
 fn unknown_command(cmd: &str) -> ChatMessage {
     ChatMessage::Error(format!("unknown command: /{}", cmd))
+}
+
+/// The mid-turn answer to a `/cmd` this TUI doesn't know. Idle, the line
+/// goes to the session, which may know it (a plugin's or a newer daemon's
+/// command); mid-turn nothing is sent, so the session isn't asked. A `/`
+/// with no command word is unknown either way.
+pub(crate) fn not_checked_mid_turn(cmd: &str) -> String {
+    if cmd.is_empty() {
+        return "unknown command: /".to_string();
+    }
+    format!("/{cmd}: not a command here while a turn runs; nothing was sent. Try it again when the turn ends.")
 }
 
 /// Resolve input typed while a turn streams. Slash commands never leak
@@ -1731,7 +1742,7 @@ pub(super) fn resolve_streaming_input(
                 )));
                 StreamingSlash::Refused
             } else {
-                app.push_msg(unknown_command(raw_cmd));
+                app.push_msg(ChatMessage::Error(not_checked_mid_turn(raw_cmd)));
                 StreamingSlash::Unknown
             }
         }
@@ -2143,9 +2154,9 @@ mod tests {
     }
 
     /// Mid-turn, a `/name` no command answers to is never steered (the line
-    /// may hold a secret): it gets the idle path's "unknown command" answer.
-    /// Known commands run or are refused as before, plain text steers, and
-    /// `//text` steers `/text`.
+    /// may hold a secret). It isn't called unknown: the session, not asked
+    /// mid-turn, may know it. Known commands run or are refused as before,
+    /// plain text steers, and `//text` steers `/text`.
     #[test]
     fn unknown_slash_mid_turn_is_never_steered() {
         let registry =
@@ -2168,10 +2179,13 @@ mod tests {
         let r = super::resolve_streaming_input("/nosuch secret-value", &mut app, &registry);
         assert!(matches!(r, super::StreamingSlash::Unknown));
         let shown = texts(&app);
+        let answer = "/nosuch: not a command here while a turn runs; nothing was sent. \
+                      Try it again when the turn ends.";
         assert!(
-            app.transcript.messages().iter().any(
-                |m| matches!(&m.msg, ChatMessage::Error(s) if s == "unknown command: /nosuch")
-            ),
+            app.transcript
+                .messages()
+                .iter()
+                .any(|m| matches!(&m.msg, ChatMessage::Error(s) if s == answer)),
             "{shown:?}"
         );
         assert!(

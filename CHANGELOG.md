@@ -43,10 +43,11 @@ All notable changes to this project will be documented in this file.
   was running, a `/name` the TUI didn't know (any plugin command in an
   attached TUI) went to the model as steering text, arguments and all, so
   `/nosuch secret-value` landed in the conversation and the session file.
-  `synaps attach` sent such lines idle too. It now gets the local "unknown
-  command" answer and nothing is sent. To send text that starts with `/`,
-  start it with `//`: `//etc/hosts is wrong` sends `/etc/hosts is wrong`,
-  idle or mid-turn, in the TUI and in `synaps attach`.
+  `synaps attach` sent such lines idle too. Now nothing is sent: the TUI
+  says so (try it again when the turn ends), and `synaps attach` answers
+  "unknown command". To send text that starts with `/`, start it with
+  `//`: `//etc/hosts is wrong` sends `/etc/hosts is wrong`, idle or
+  mid-turn, in the TUI and in `synaps attach`.
 
 ## [0.11.1] — 2026-10-31
 
