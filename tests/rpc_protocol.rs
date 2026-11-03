@@ -470,6 +470,7 @@ mod compact_disclosure_frame {
             message_count: 6,
             included_classes: vec![ContentClass::UserText, ContentClass::AssistantText],
             excluded_classes: vec![ContentClass::Thinking],
+            notice: None,
         };
 
         let frame = RpcEvent::Response {
