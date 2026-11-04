@@ -42,7 +42,7 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 use thiserror::Error;
 
-use super::connection::McpConnection;
+use super::connection::{CallError, McpConnection};
 use super::descriptors::{self, server_config_fingerprint};
 use super::McpServerConfig;
 use crate::tools::activation::SessionId;
@@ -86,7 +86,8 @@ pub const REAP_SCAN_MAX: usize = MAX_LIVE_LEASES;
 const CLEANUP_TOTAL_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Typed lease failures. Provider-controlled content never appears here —
-/// only static text, local identities, and numeric metadata.
+/// only static text, local identities, and numeric metadata — except
+/// `ToolError`'s text, which is the tool's own answer to the call.
 #[derive(Debug, Error)]
 pub enum McpLeaseError {
     #[error("MCP server '{0}' is no longer configured; lease revoked")]
@@ -103,6 +104,10 @@ pub enum McpLeaseError {
     Revoked(String),
     #[error("MCP transport failure for server '{0}': {1}")]
     Transport(String, String),
+    /// The tool answered `isError: true`: an ordinary refusal, not a
+    /// broken server.
+    #[error("MCP tool error from server '{0}': {1}")]
+    ToolError(String, String),
     #[error(
         "MCP lease capacity of {0} live leases reached; try again after idle leases are reaped"
     )]
@@ -542,7 +547,10 @@ impl McpRuntimeManager {
             .last_used
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Instant::now();
-        result.map_err(|e| McpLeaseError::Transport(server.to_string(), e))
+        result.map_err(|e| match e {
+            CallError::Tool(text) => McpLeaseError::ToolError(server.to_string(), text),
+            CallError::Transport(e) => McpLeaseError::Transport(server.to_string(), e),
+        })
     }
 
     /// Spawn + initialize + single bounded tools/list for one server. No
