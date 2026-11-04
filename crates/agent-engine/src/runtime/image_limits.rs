@@ -22,6 +22,8 @@ const CACHE_BYTES: usize = 16 * 1024 * 1024;
 const CACHE_COUNT: usize = 16;
 const INVALID: &str = "Image projection failed: corrupt or unsupported image; export a static PNG/JPEG at most 2000 pixels per side and reattach it";
 const RESOURCE: &str = "Image projection exceeds resource limits; export a static PNG/JPEG at most 2000 pixels per side and reattach it";
+/// What a history image that cannot be sent leaves in its place.
+const UNSENDABLE: &str = "[Image omitted: it could not be sent within the image limits. Re-export it as a static PNG or JPEG at most 2000 pixels per side and attach or read it again if it is still needed.]";
 
 /// Where an image block sits: `content[block]` of message `msg`, or
 /// `content[block].content[inner]` for media nested in a `tool_result`.
@@ -138,14 +140,14 @@ fn encode(image: &image::DynamicImage, jpeg: bool, limit: usize) -> Result<Vec<u
             .encode_image(image)
             .map_err(|_| RESOURCE)?;
     } else {
-        let rgba = image.to_rgba8();
+        // An opaque raster stays RGB: an added alpha channel only adds bytes.
+        let (raw, color) = if image.color().has_alpha() {
+            (image.to_rgba8().into_raw(), image::ColorType::Rgba8)
+        } else {
+            (image.to_rgb8().into_raw(), image::ColorType::Rgb8)
+        };
         image::codecs::png::PngEncoder::new(&mut out)
-            .write_image(
-                rgba.as_raw(),
-                rgba.width(),
-                rgba.height(),
-                image::ColorType::Rgba8,
-            )
+            .write_image(&raw, image.width(), image.height(), color)
             .map_err(|_| RESOURCE)?;
     }
     Ok(out.bytes)
@@ -178,7 +180,7 @@ fn project(block: &Value, cache: &Mutex<Cache>) -> Result<Option<Arc<Projection>
         return Err(RESOURCE.into());
     }
     let mut hash = Sha256::new();
-    hash.update(b"synaps-anthropic-image-v1:2000:triangle:jpeg85:rgba-png:raster-orientation\0");
+    hash.update(b"synaps-anthropic-image-v2:2000:triangle:jpeg85:rgb-or-rgba-png:jpeg85-fallback:raster-orientation\0");
     hash.update(mime.as_bytes());
     hash.update([0]);
     hash.update(data.as_bytes());
@@ -231,8 +233,15 @@ fn project(block: &Value, cache: &Mutex<Cache>) -> Result<Option<Arc<Projection>
     let sent_w = (u64::from(w) * u64::from(MAX_SIDE) / longest).max(1) as u32;
     let sent_h = (u64::from(h) * u64::from(MAX_SIDE) / longest).max(1) as u32;
     let resized = decoded.resize_exact(sent_w, sent_h, image::imageops::FilterType::Triangle);
-    let jpeg = format == ImageFormat::Jpeg;
-    let encoded = encode(&resized, jpeg, MAX_IMAGE_BYTES)?;
+    let mut jpeg = format == ImageFormat::Jpeg;
+    // A PNG that cannot fit the cap as PNG is sent as JPEG q85, same size.
+    let encoded = match encode(&resized, jpeg, MAX_IMAGE_BYTES) {
+        Err(_) if !jpeg => {
+            jpeg = true;
+            encode(&resized, true, MAX_IMAGE_BYTES)?
+        }
+        encoded => encoded?,
+    };
     let value = Arc::new(Projection {
         data: STANDARD.encode(encoded),
         mime: if jpeg { "image/jpeg" } else { "image/png" },
@@ -256,12 +265,29 @@ fn enforce_with_retirement(
     cache: &Mutex<Cache>,
 ) -> Result<usize, String> {
     let slots = image_slots(messages);
+    // New input: the top-level images of a newest user message, the person's
+    // own attachments. Media in a tool_result is never new input.
+    let new_input = messages
+        .len()
+        .checked_sub(1)
+        .filter(|&m| messages[m]["role"] == "user");
     // Reverse order keeps original slot indices valid when adding adjacent text.
     for (occurrence, &slot) in slots.iter().enumerate().rev() {
-        let projected = project(block_at(messages, slot), cache)?;
-        // Always project/check the original, including retired occurrences.
-        // Discard retired output rather than letting later images hide errors.
-        if occurrence < retired_count || projected.is_some() {
+        // A retired image is not projected: its output would be discarded, and
+        // its error would fail every request that no longer sends it.
+        let projected = if occurrence < retired_count {
+            Err(super::image_retention::OMITTED)
+        } else {
+            match project(block_at(messages, slot), cache) {
+                // New input that cannot be sent is refused, as before.
+                Err(error) if slot.inner.is_none() && Some(slot.msg) == new_input => {
+                    return Err(error)
+                }
+                // A history image that cannot be sent never fails the request.
+                projected => projected.map_err(|_| UNSENDABLE),
+            }
+        };
+        if !matches!(projected, Ok(None)) {
             let message = Arc::make_mut(&mut messages[slot.msg]);
             let (blocks, index) = match slot.inner {
                 Some(inner) => (
@@ -272,11 +298,13 @@ fn enforce_with_retirement(
                 ),
                 None => (message["content"].as_array_mut().unwrap(), slot.block),
             };
-            if occurrence < retired_count {
-                blocks[index] = json!({"type": "text", "text": super::image_retention::OMITTED});
-                continue;
-            }
-            let projected = projected.unwrap();
+            let projected = match projected {
+                Ok(projected) => projected.unwrap(),
+                Err(note) => {
+                    blocks[index] = json!({"type": "text", "text": note});
+                    continue;
+                }
+            };
             blocks[index]["source"]["data"] = Value::String(projected.data.clone());
             blocks[index]["source"]["media_type"] = Value::String(projected.mime.into());
             blocks.insert(index + 1, json!({"type": "text", "text": projected.note}));
@@ -355,6 +383,26 @@ mod tests {
     }
     fn cache() -> Mutex<Cache> {
         Mutex::new(Cache::default())
+    }
+    /// The exact words a history image that cannot be sent leaves.
+    const NOTE: &str = "[Image omitted: it could not be sent within the image limits. Re-export it as a static PNG or JPEG at most 2000 pixels per side and attach or read it again if it is still needed.]";
+    const MODEL: &str = "anthropic/claude-sonnet-4-6";
+    /// Signature, IHDR and IEND only: the attachment preflight admits it, and
+    /// projection refuses it (16 MP rule before decoding, or no pixel data).
+    fn header_only_png(w: u32, h: u32) -> Value {
+        let valid = fixture(2, 2, false);
+        let mut bytes = STANDARD
+            .decode(valid["source"]["data"].as_str().unwrap())
+            .unwrap();
+        bytes.truncate(33);
+        bytes[16..20].copy_from_slice(&w.to_be_bytes());
+        bytes[20..24].copy_from_slice(&h.to_be_bytes());
+        bytes.extend_from_slice(b"\x00\x00\x00\x00IEND\xAE\x42\x60\x82");
+        json!({"type": "image", "source": {"type": "base64", "media_type": "image/png",
+            "data": STANDARD.encode(bytes)}})
+    }
+    fn text_message(role: &str, text: &str) -> SharedMessage {
+        Arc::new(json!({"role": role, "content": [{"type": "text", "text": text}]}))
     }
 
     #[tokio::test]
@@ -522,15 +570,21 @@ mod tests {
         assert!(project(&img, &cache()).is_err());
         img["source"]["data"] = "A".repeat(MAX_IMAGE_BYTES.div_ceil(3) * 4 + 1).into();
         assert_eq!(project(&img, &cache()).unwrap_err(), RESOURCE);
-        // Malformed oversized headers must error, never count-dependent omission.
+        // Malformed oversized headers must error, never count-dependent
+        // omission: in history every copy is the same note.
         let valid = fixture(2001, 2, false);
         let mut bytes = STANDARD
             .decode(valid["source"]["data"].as_str().unwrap())
             .unwrap();
         bytes.truncate(33);
         img["source"]["data"] = STANDARD.encode(&bytes).into();
+        assert_eq!(project(&img, &cache()).unwrap_err(), INVALID);
         for n in [1, 21, 101] {
-            assert!(enforce(&mut history(n, &img), &cache()).is_err());
+            let mut messages = history(n, &img);
+            assert_eq!(enforce(&mut messages, &cache()), Ok(0));
+            assert!(messages
+                .iter()
+                .all(|m| m["content"][0]["content"][1]["text"] == NOTE));
         }
         bytes[16..20].copy_from_slice(&8000u32.to_be_bytes());
         bytes[20..24].copy_from_slice(&8000u32.to_be_bytes());
@@ -546,7 +600,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retired_originals_still_fail_projection_at_1_and_101() {
+    async fn unprojectable_history_originals_are_omitted_at_1_and_101() {
         let mut png = fixture(2001, 2, false);
         let mut bytes = STANDARD
             .decode(png["source"]["data"].as_str().unwrap())
@@ -569,8 +623,17 @@ mod tests {
                 let retired = super::super::image_retention::plan(&original).unwrap();
                 assert_eq!(retired, if n == 101 { 40 } else { 0 });
                 let mut outgoing = original.clone();
-                assert!(enforce_image_limits(&mut outgoing, retired).await.is_err());
-                assert_eq!(outgoing, original); // failed worker never publishes partial output
+                assert_eq!(
+                    enforce_image_limits(&mut outgoing, retired).await,
+                    Ok(retired)
+                );
+                // Retired: OMITTED, never projected. Otherwise the note.
+                let note = if n == 101 {
+                    super::super::image_retention::OMITTED
+                } else {
+                    NOTE
+                };
+                assert_eq!(outgoing[0]["content"][0]["content"][1]["text"], note);
                 assert_eq!(original[0]["content"][0]["content"][1], bad);
             }
         }
@@ -716,5 +779,132 @@ mod tests {
         enforce(&mut messages, &cache()).unwrap();
         super::super::attachments::validate_messages("anthropic/claude-sonnet-4-6", &messages)
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn unprojectable_history_image_is_omitted_and_the_request_succeeds() {
+        let resource = header_only_png(4001, 4001);
+        assert_eq!(project(&resource, &cache()).unwrap_err(), RESOURCE);
+        let gif = json!({"type":"image", "source":{"type":"base64", "media_type":"image/gif",
+            "data":STANDARD.encode(b"GIF89a\xd1\x07\x02\x00\x00\x00\x00\x3b")}});
+        for bad in [resource, header_only_png(2001, 2), gif] {
+            // An old message the person sent, then an old read-tool result.
+            let mut original = vec![Arc::new(json!({"role": "user", "content": [
+                {"type": "text", "text": "old"}, bad.clone()]}))];
+            original.push(text_message("assistant", "seen"));
+            original.extend(history(1, &bad));
+            original.push(text_message("assistant", "read"));
+            original.push(text_message("user", "next"));
+            super::super::attachments::validate_history_for_request(MODEL, &original).unwrap();
+            let retired = super::super::image_retention::plan(&original).unwrap();
+            assert_eq!(retired, 0);
+            let mut outgoing = original.clone();
+            assert_eq!(enforce_image_limits(&mut outgoing, retired).await, Ok(0));
+            let note = json!({"type": "text", "text": NOTE});
+            assert_eq!(outgoing[0]["content"][1], note);
+            assert_eq!(outgoing[2]["content"][0]["content"][1], note);
+            assert_eq!(
+                outgoing[2]["content"][0]["content"][0]["text"],
+                "original summary"
+            );
+            super::super::attachments::validate_messages(MODEL, &outgoing).unwrap();
+            assert_eq!(original[2]["content"][0]["content"][1], bad);
+        }
+    }
+
+    #[tokio::test]
+    async fn new_user_attachment_is_refused_but_a_new_tool_result_is_not() {
+        let bad = header_only_png(4001, 4001);
+        // The person's own new message keeps today's refusal and text, even
+        // with an older copy in the history; nothing partial is published.
+        let mut original = history(1, &bad);
+        original.push(text_message("assistant", "read"));
+        original.push(Arc::new(json!({"role": "user", "content": [
+            {"type": "text", "text": "look"}, bad.clone()]})));
+        super::super::attachments::validate_history_for_request(MODEL, &original).unwrap();
+        let mut outgoing = original.clone();
+        assert_eq!(
+            enforce_image_limits(&mut outgoing, 0).await,
+            Err(RESOURCE.to_string())
+        );
+        assert_eq!(outgoing, original);
+        // A tool result is never new input, even as the newest message.
+        let mut outgoing = vec![text_message("user", "read it")];
+        outgoing.extend(history(1, &bad));
+        assert_eq!(enforce_image_limits(&mut outgoing, 0).await, Ok(0));
+        assert_eq!(outgoing[1]["content"][0]["content"][1]["text"], NOTE);
+    }
+
+    #[test]
+    fn retired_images_are_omitted_without_projection() {
+        let mut original = history(1, &header_only_png(4001, 4001));
+        original.extend(history(1, &fixture(2001, 2, false)));
+        original.extend(history(99, &fixture(2, 2, false)));
+        let retired = super::super::image_retention::plan(&original).unwrap();
+        assert_eq!(retired, 40);
+        let c = cache();
+        let mut outgoing = original.clone();
+        assert_eq!(enforce_with_retirement(&mut outgoing, retired, &c), Ok(40));
+        for message in &outgoing[..2] {
+            assert_eq!(
+                message["content"][0]["content"][1]["text"],
+                super::super::image_retention::OMITTED
+            );
+        }
+        // Projecting the retired 2001x2 image would have cached its output.
+        assert!(c.lock().unwrap().entries.is_empty());
+    }
+
+    /// A 2048x2048 opaque RGB PNG, a large read-tool shape. Its rows repeat
+    /// every 4, which deflate matches, so the source is small; after the
+    /// 2000 px resize no nearby rows match, and as RGBA it exceeds the cap.
+    fn opaque_2048_png() -> Value {
+        let mut seed = 0x2545_f491_4f6c_dd1d_u64;
+        let rows: Vec<u8> = (0..4 * 2048 * 3)
+            .map(|_| {
+                seed = seed
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                96 + (seed >> 61) as u8
+            })
+            .collect();
+        let mut png = Vec::new();
+        image::codecs::png::PngEncoder::new_with_quality(
+            &mut png,
+            image::codecs::png::CompressionType::Default,
+            image::codecs::png::FilterType::Adaptive,
+        )
+        .write_image(&rows.repeat(512), 2048, 2048, image::ColorType::Rgb8)
+        .unwrap();
+        assert!(png.len() < MAX_IMAGE_BYTES);
+        json!({"type": "image", "source": {"type": "base64", "media_type": "image/png",
+            "data": STANDARD.encode(png)}})
+    }
+
+    #[test]
+    fn opaque_2048_png_resizes_and_fits() {
+        let c = cache();
+        let img = opaque_2048_png();
+        let projected = project(&img, &c).unwrap().unwrap();
+        let bytes = STANDARD.decode(&projected.data).unwrap();
+        assert!(bytes.len() <= MAX_IMAGE_BYTES);
+        assert_eq!(
+            crate::tools::read::sniff_image_mime(&bytes),
+            Some(projected.mime)
+        );
+        let decoded = image::load_from_memory(&bytes).unwrap();
+        assert_eq!(decoded.dimensions(), (2000, 2000));
+        // In an old tool result it is sent resized (a cache hit), not omitted.
+        let mut messages = history(1, &img);
+        messages.push(text_message("user", "next"));
+        assert_eq!(enforce(&mut messages, &c), Ok(0));
+        let sent = &messages[0]["content"][0]["content"];
+        assert_eq!(sent[1]["source"]["media_type"], projected.mime);
+        assert_eq!(sent[2]["text"], projected.note.as_str());
+        super::super::attachments::validate_messages(MODEL, &messages).unwrap();
+        // An opaque raster is a PNG without an added alpha channel.
+        let rgb = encode(&image::DynamicImage::new_rgb8(2, 2), false, MAX_IMAGE_BYTES).unwrap();
+        let rgb = image::load_from_memory(&rgb).unwrap();
+        assert_eq!(rgb.color(), image::ColorType::Rgb8);
     }
 }
