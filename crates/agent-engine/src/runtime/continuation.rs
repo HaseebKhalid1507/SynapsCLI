@@ -4021,7 +4021,6 @@ mod calibration_transport_tests {
         let _g = crate::test_env::EnvVarGuard::set("SYNAPS_ANTHROPIC_BASE_URL", &url);
         let mut rt = runtime();
         rt.set_api_retries(0);
-        rt.set_compaction_model(Some("claude-sonnet-4-6".to_string()));
         let messages = vec![
             Arc::new(
                 json!({"role":"user","_synaps_context":{"schema":MARKER,"archive":"a","window":2},"content":"CONTINUATION"}),
@@ -4029,7 +4028,7 @@ mod calibration_transport_tests {
             Arc::new(json!({"role":"user","_synaps_turn":{"id":"t-1"},"content":"TAGGED REQUEST"})),
             Arc::new(json!({"role":"assistant","content":"ok"})),
         ];
-        let _ = rt.compact_call(messages).await; // the reply shape is irrelevant
+        let _ = rt.compact_call("claude-sonnet-4-6", messages).await; // the reply shape is irrelevant
         let bodies = mock.bodies.lock().unwrap().clone();
         assert_eq!(bodies.len(), 1, "one compaction request captured");
         assert!(bodies[0].contains("TAGGED REQUEST"));
@@ -4065,8 +4064,7 @@ mod calibration_transport_tests {
         // Compaction (`call_api_simple`) sends caller history directly.
         let mut rt = runtime();
         rt.set_api_retries(0);
-        rt.set_compaction_model(Some("claude-sonnet-4-6".to_string()));
-        let _ = rt.compact_call(stamped).await;
+        let _ = rt.compact_call("claude-sonnet-4-6", stamped).await;
         let bodies = mock.bodies.lock().unwrap().clone();
         assert_eq!(bodies.len(), 3);
         assert!(bodies[2].contains("go on") && !bodies[2].contains("_synaps_"));

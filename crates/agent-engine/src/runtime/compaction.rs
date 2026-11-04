@@ -375,6 +375,10 @@ pub struct CompactionDisclosure {
     pub message_count: usize,
     pub included_classes: Vec<agent_core::compaction::ContentClass>,
     pub excluded_classes: Vec<agent_core::compaction::ContentClass>,
+    /// Said after the line when the model `compaction_model` names can't
+    /// be used and the chat's own model writes the summary instead.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notice: Option<String>,
 }
 
 impl CompactionDisclosure {
@@ -407,13 +411,17 @@ impl CompactionDisclosure {
                 } else {
                     format!("{}/{}", self.provider, self.model)
                 };
-                format!(
+                let line = format!(
                     "compaction: sending ~{} KB of conversation ({} messages) to {} — excluded classes: {}",
                     self.approx_conversation_bytes.div_ceil(1024),
                     self.message_count,
                     target,
                     excluded
-                )
+                );
+                match &self.notice {
+                    Some(notice) => format!("{line} — {notice}"),
+                    None => line,
+                }
             }
         }
     }
@@ -429,12 +437,12 @@ pub fn preview_compaction_disclosure(
     use agent_core::compaction::CompactionMode;
     let policy = runtime.compaction_policy();
     let rendered = render_compaction_input(api_messages, None, &policy);
-    let (provider, model) = match policy.mode {
-        CompactionMode::LocalOnly => ("local".to_string(), LOCAL_SUMMARY_MODEL.to_string()),
-        CompactionMode::Remote => (
-            provider_label_for_model(runtime.compaction_model()),
-            runtime.compaction_model().to_string(),
-        ),
+    let (provider, model, notice) = match policy.mode {
+        CompactionMode::LocalOnly => ("local".to_string(), LOCAL_SUMMARY_MODEL.to_string(), None),
+        CompactionMode::Remote => {
+            let (model, notice) = runtime.compact_model_choice();
+            (provider_label_for_model(&model), model, notice)
+        }
     };
     CompactionDisclosure {
         mode: policy.mode,
@@ -444,6 +452,7 @@ pub fn preview_compaction_disclosure(
         message_count: api_messages.len(),
         included_classes: rendered.included_classes,
         excluded_classes: rendered.excluded_classes,
+        notice,
     }
 }
 
@@ -564,10 +573,13 @@ pub async fn compact_conversation(
         CompactionMode::Remote => {
             let user_msg =
                 std::sync::Arc::new(json!({"role": "user", "content": rendered.prompt_text}));
-            let summary_text = runtime.compact_call(vec![user_msg]).await?;
+            // Chosen once: the model the request goes to is the one the
+            // outcome names.
+            let (model, _notice) = runtime.compact_model_choice();
+            let summary_text = runtime.compact_call(&model, vec![user_msg]).await?;
             let mut outcome = CompactionOutcome::for_prompt_stack(
                 summary_text,
-                runtime.compaction_model(),
+                &model,
                 rendered.base_prompt,
                 custom_instructions,
             );
@@ -1893,7 +1905,9 @@ mod disclosure_tests {
         let disclosure = preview_compaction_disclosure(&runtime, &messages);
         assert_eq!(disclosure.mode, CompactionMode::Remote);
         assert_eq!(disclosure.provider, "anthropic");
-        assert_eq!(disclosure.model, runtime.compaction_model());
+        // `compaction_model` unset (match): the chat's own model.
+        assert_eq!(disclosure.model, runtime.model());
+        assert_eq!(disclosure.notice, None);
         assert_eq!(disclosure.message_count, messages.len());
         assert!(disclosure.approx_conversation_bytes > 0);
         assert!(disclosure
@@ -1906,7 +1920,7 @@ mod disclosure_tests {
         // The rendered line every frontend surfaces before dispatch.
         let line = disclosure.render_line();
         assert!(line.contains("anthropic"), "line: {line}");
-        assert!(line.contains(runtime.compaction_model()), "line: {line}");
+        assert!(line.contains(runtime.model()), "line: {line}");
 
         // Local-only preview is honest about performing no disclosure.
         runtime.set_compaction_mode(CompactionMode::LocalOnly);
@@ -2020,6 +2034,7 @@ mod disclosure_tests {
             message_count: 3,
             included_classes: Vec::new(),
             excluded_classes: Vec::new(),
+            notice: None,
         };
         let qualified = disclosure("anthropic/claude-opus-5-5").render_line();
         assert!(
@@ -2035,6 +2050,144 @@ mod disclosure_tests {
             lookalike.contains(" to anthropic/anthropicish-model "),
             "{lookalike}"
         );
+    }
+
+    /// `/compact` and auto-compaction summarize with the model
+    /// `compaction_model` names when it is usable, else the chat's own model
+    /// with the notice the disclosure line carries. Unset is the chat's own
+    /// model on every provider, never a default model; a `provider-small`
+    /// pin is the chat's own provider's.
+    #[tokio::test]
+    #[serial(synaps_base_dir)]
+    async fn compact_model_follows_compaction_model_or_else_the_chats_own() {
+        use agent_core::reasoning::ReasoningLevel;
+        let _base = crate::test_env::BaseDirGuard::new();
+        let _k = crate::test_env::EnvVarGuard::set("GROQ_API_KEY", "");
+        let choice = |own: &str, compaction: Option<&str>, level: Option<ReasoningLevel>| {
+            let mut runtime = crate::Runtime::new_headless();
+            runtime.set_model(own.to_string());
+            if let Some(level) = level {
+                runtime.set_reasoning_level_explicit(level);
+            }
+            runtime.set_compaction_model(compaction.map(str::to_owned));
+            runtime.compact_model_choice()
+        };
+        let unusable = |model: &str, reason: &str| {
+            Some(format!(
+                "The summary model {model} can't be used ({reason}); the chat's own model wrote this summary."
+            ))
+        };
+        let no_key = "no credential is configured for its provider";
+        let level = "its provider refuses the chat's reasoning level for it";
+        let opus = "claude-opus-5-5";
+        let codex = "openai-codex/gpt-5.5";
+        let luna = "openai-codex/gpt-6-luna";
+        let groq = "groq/llama-3.3-70b-versatile";
+        let own = |m: &str| (m.to_string(), None);
+        // Unset / empty / match: the chat's own model, on every provider.
+        assert_eq!(choice(opus, None, None), own(opus));
+        assert_eq!(choice(opus, Some(""), None), own(opus));
+        assert_eq!(choice(opus, Some("match"), None), own(opus));
+        assert_eq!(choice(codex, None, None), own(codex), "no default model");
+        // provider-small: the chat's own provider's pin, in its id form.
+        let small = Some("provider-small");
+        assert_eq!(choice(opus, small, None), own("claude-haiku-5-5"));
+        assert_eq!(
+            choice("anthropic/claude-opus-5-5", small, None),
+            own("anthropic/claude-haiku-5-5")
+        );
+        assert_eq!(
+            choice("local/test-model", small, None),
+            own("local/test-model"),
+            "no pin: match"
+        );
+        assert_eq!(
+            choice(codex, small, None),
+            (codex.to_string(), unusable(luna, no_key)),
+            "signed out of the chat's own provider: never another provider's pin"
+        );
+        // Named: that model, or the chat's own model with the notice.
+        assert_eq!(
+            choice(opus, Some(groq), None),
+            (opus.to_string(), unusable(groq, no_key))
+        );
+        assert_eq!(
+            choice(opus, Some("nope/model"), None),
+            (
+                opus.to_string(),
+                unusable("nope/model", "no provider route is known for it")
+            )
+        );
+        assert_eq!(choice(codex, Some(opus), None), own(opus), "cross-provider");
+        assert_eq!(
+            choice(opus, Some(luna), None),
+            (opus.to_string(), unusable(luna, no_key))
+        );
+        crate::auth::save_provider_auth(
+            "openai-codex",
+            &crate::auth::OAuthCredentials {
+                auth_type: "oauth".into(),
+                access: "test-access".into(),
+                refresh: "test-refresh".into(),
+                expires: crate::epoch_millis() + 3_600_000,
+                account_id: Some("acct_test".into()),
+            },
+        )
+        .unwrap();
+        assert_eq!(choice(codex, small, None), own(luna));
+        assert_eq!(choice(opus, Some(luna), None), own(luna), "cross-provider");
+        // A level the pin's provider refuses for it: the chat's own model.
+        let sol = "openai-codex/gpt-6.1-sol";
+        assert_eq!(
+            choice(sol, small, Some(ReasoningLevel::Ultra)),
+            (sol.to_string(), unusable(luna, level))
+        );
+        // The `anthropic/` form too, at a level only the chat's own model
+        // takes (Max on Fable 5): not left to the request's preflight.
+        let fable = "anthropic/claude-fable-5";
+        assert_eq!(
+            choice(fable, small, Some(ReasoningLevel::Max)),
+            (
+                fable.to_string(),
+                unusable("anthropic/claude-haiku-5-5", level)
+            )
+        );
+        assert_eq!(
+            choice(
+                sol,
+                Some("anthropic/claude-haiku-5-5"),
+                Some(ReasoningLevel::Ultra)
+            ),
+            (
+                sol.to_string(),
+                unusable("anthropic/claude-haiku-5-5", level)
+            )
+        );
+        // A pin whose window is smaller than the chat's (Haiku 5.5's native
+        // 200k under a 1M chat): the chat's own model. At 200k the pin.
+        let opus_q = "anthropic/claude-opus-5-5";
+        let haiku_q = "anthropic/claude-haiku-5-5";
+        let mut runtime = crate::Runtime::new_headless();
+        runtime.set_model(opus_q.to_string());
+        runtime.set_compaction_model(Some("provider-small".to_string()));
+        runtime.set_context_window(Some(1_000_000));
+        assert_eq!(
+            runtime.compact_model_choice(),
+            (
+                opus_q.to_string(),
+                unusable(haiku_q, "its context window is smaller than the chat's")
+            )
+        );
+        runtime.set_context_window(None);
+        assert_eq!(runtime.compact_model_choice(), own(haiku_q));
+        // The disclosure line says it before anything is sent.
+        let mut runtime = crate::Runtime::new_headless();
+        runtime.set_model(opus.to_string());
+        runtime.set_compaction_model(Some(groq.to_string()));
+        let disclosure = preview_compaction_disclosure(&runtime, &sentinel_messages());
+        assert_eq!(disclosure.model, opus);
+        let line = disclosure.render_line();
+        assert!(line.ends_with(&unusable(groq, no_key).unwrap()), "{line}");
     }
 
     /// M7 (CP-12 review): local summaries are byte-bounded at UTF-8 char
