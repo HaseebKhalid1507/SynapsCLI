@@ -250,6 +250,12 @@ pub struct AccountCapacity {
     /// so the failure can be named instead of a bare "quota unknown".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure: Option<ObservationFailure>,
+    /// The plan the reading names (Codex `plan_type`), if any. Never
+    /// capacity: on Codex it only decides whether a plan's generic windows
+    /// may judge a requested model the reading doesn't list (the broker's
+    /// requested-model guard).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<String>,
 }
 
 impl AccountCapacity {
@@ -261,6 +267,7 @@ impl AccountCapacity {
             observation: QuotaObservation::Unknown,
             cooldown_until_ms: None,
             failure: None,
+            plan: None,
         }
     }
 
@@ -1576,6 +1583,7 @@ mod tests {
             },
             cooldown_until_ms: None,
             failure: None,
+            plan: None,
         }
     }
 
