@@ -94,11 +94,16 @@ struct Upstream {
     answers: Arc<Mutex<HashMap<String, Answer>>>,
     hits: Arc<Mutex<HashMap<String, usize>>>,
     delay_ms: Arc<AtomicU64>,
+    /// `plan_type` of every Codex-shaped body; the body has none when unset.
+    codex_plan: Arc<Mutex<Option<&'static str>>>,
 }
 
 impl Upstream {
     fn set(&self, label: &str, answer: Answer) {
         self.answers.lock().unwrap().insert(label.into(), answer);
+    }
+    fn codex_plan(&self, plan: &'static str) {
+        *self.codex_plan.lock().unwrap() = Some(plan);
     }
     fn all(&self, labels: &[&str], answer: Answer) {
         for label in labels {
@@ -138,13 +143,18 @@ impl Upstream {
                     }
                     let answer = up.answers.lock().unwrap().get(&label).copied();
                     match answer.unwrap_or(Answer::Status(500)) {
-                        Answer::Ok { used, reset_in_s } if codex_account.is_some() => Json(json!({
-                            "rate_limit": { "allowed": true, "limit_reached": false,
-                                "primary_window": { "used_percent": used,
-                                    "limit_window_seconds": 7 * 24 * HOUR_S,
-                                    "reset_after_seconds": reset_in_s } }
-                        }))
-                        .into_response(),
+                        Answer::Ok { used, reset_in_s } if codex_account.is_some() => {
+                            let mut body = json!({
+                                "rate_limit": { "allowed": true, "limit_reached": false,
+                                    "primary_window": { "used_percent": used,
+                                        "limit_window_seconds": 7 * 24 * HOUR_S,
+                                        "reset_after_seconds": reset_in_s } }
+                            });
+                            if let Some(plan) = *up.codex_plan.lock().unwrap() {
+                                body["plan_type"] = json!(plan);
+                            }
+                            Json(body).into_response()
+                        }
                         Answer::Ok { used, reset_in_s } => {
                             let at = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(
                                 (agent_core::epoch_millis() + reset_in_s * 1000) as i64,
@@ -474,6 +484,133 @@ async fn a_codex_model_missing_from_the_good_reading_stays_ineligible_under_grac
         "graced for a request without that model"
     );
     assert_eq!(up.hits("acct-x"), 2, "one good read, one held 429");
+}
+
+/// Codex on a paid plan: a model the reading doesn't list and that isn't
+/// gated per model (GPT-6.1-Sol) is judged by the plan's generic windows,
+/// on the fresh reading and on that reading graced after a failed read
+/// alike; a model gated per model (Astra) stays ineligible on both.
+#[tokio::test]
+#[serial_test::serial]
+async fn an_unlisted_ungated_codex_model_on_a_paid_plan_is_chosen_fresh_and_graced() {
+    const SOL: &str = "gpt-6.1-sol";
+    const ASTRA: &str = "gpt-6-astra";
+    let codex = OAuthProviderId::OpenAiCodex;
+    let _home = install_codex("x", "acct-x");
+    let up = Upstream::default();
+    up.codex_plan("plus");
+    up.set("acct-x", LATER);
+    let broker = LocalBroker::new(reqwest::Client::new())
+        .with_usage_endpoint_override(up.spawn().await)
+        .with_max_snapshot_age(Duration::from_secs(1));
+    let label = |p: agent_core::auth::PinnedToken| p.credential.account.label_str().to_string();
+    let fresh = broker.access_token_auto(codex, Some(SOL)).await;
+    assert_eq!(fresh.map(label).unwrap(), "x", "fresh paid reading");
+    assert!(
+        broker.access_token_auto(codex, Some(ASTRA)).await.is_err(),
+        "gated, fresh"
+    );
+
+    up.set("acct-x", LIMITED);
+    past_fresh_age().await;
+    let graced = broker.access_token_auto(codex, Some(SOL)).await;
+    assert_eq!(graced.map(label).unwrap(), "x", "the same reading graced");
+    let err = broker
+        .access_token_auto(codex, Some(ASTRA))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, BrokerError::NoAccountAvailable { .. }),
+        "{err:?}"
+    );
+    assert_eq!(up.hits("acct-x"), 2, "one good read, one held 429");
+}
+
+/// In-process sink for formatted tracing output.
+#[derive(Clone, Default)]
+struct Capture(Arc<Mutex<Vec<u8>>>);
+
+impl Capture {
+    fn take(&self) -> String {
+        String::from_utf8(std::mem::take(&mut *self.0.lock().unwrap())).unwrap()
+    }
+}
+
+struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for CaptureWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Formats into `capture` through the daemon log file's own filter
+/// (`with_crate_directives` over the ERROR default of an unset `RUST_LOG`):
+/// a line found here is a line synaps.log keeps.
+fn capture_subscriber(capture: &Capture) -> impl tracing::Subscriber + Send + Sync {
+    use tracing_subscriber::filter::{EnvFilter, LevelFilter};
+    let unset = EnvFilter::builder()
+        .with_default_directive(LevelFilter::ERROR.into())
+        .parse_lossy("");
+    let sink = capture.0.clone();
+    tracing_subscriber::fmt()
+        .with_env_filter(agent_core::logging::with_crate_directives(unset))
+        .with_writer(move || CaptureWriter(sink.clone()))
+        .with_ansi(false)
+        .finish()
+}
+
+/// Each choice of a Codex account for a model its reading doesn't list,
+/// judged by the paid plan's windows, logs one line: the model, the
+/// account, the plan and the path, and no token, account id or secret. A
+/// request without a model, a refused gated model and a preview log none.
+#[tokio::test]
+#[serial_test::serial]
+async fn each_choice_of_an_unlisted_codex_model_by_windows_logs_one_line() {
+    const SOL: &str = "gpt-6.1-sol";
+    const ASTRA: &str = "gpt-6-astra";
+    let codex = OAuthProviderId::OpenAiCodex;
+    let _home = install_codex("x", "acct-x");
+    let up = Upstream::default();
+    up.codex_plan("plus");
+    up.set("acct-x", LATER);
+    let broker = LocalBroker::new(reqwest::Client::new())
+        .with_usage_endpoint_override(up.spawn().await)
+        .with_max_snapshot_age(Duration::from_secs(1));
+    let capture = Capture::default();
+    {
+        let _guard = tracing::subscriber::set_default(capture_subscriber(&capture));
+        for model in [Some(SOL), None, Some(SOL)] {
+            broker.access_token_auto(codex, model).await.unwrap();
+        }
+        assert!(broker.access_token_auto(codex, Some(ASTRA)).await.is_err());
+        broker.plan(codex, Some(SOL)).await.unwrap();
+    }
+    let log = capture.take();
+    let lines: Vec<&str> = log
+        .lines()
+        .filter(|line| line.contains("unlisted, judged by windows"))
+        .collect();
+    assert_eq!(lines.len(), 2, "one line per choice:\n{log}");
+    let jwt = codex_jwt("acct-x");
+    for line in lines {
+        for field in [
+            " INFO ",
+            "provider=openai-codex",
+            "model=gpt-6.1-sol",
+            "account=x",
+            "plan_type=plus",
+        ] {
+            assert!(line.contains(field), "{field}: {line}");
+        }
+        for secret in ["acct-x", "SECRET", "refresh", jwt.as_str(), "@"] {
+            assert!(!line.contains(secret), "{secret}: {line}");
+        }
+    }
 }
 
 /// `synaps auth state --clear` is the escape hatch from a held usage read:
