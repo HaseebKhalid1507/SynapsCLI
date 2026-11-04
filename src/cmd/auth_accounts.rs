@@ -940,6 +940,7 @@ mod chooser_tests {
                 observed_at_ms: Some(now),
                 cooldown_until_ms: None,
                 failure: None,
+                plan: None,
                 observation: QuotaObservation::Ok {
                     windows: vec![WindowLimit {
                         id: "seven_day".into(),

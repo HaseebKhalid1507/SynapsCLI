@@ -3020,6 +3020,7 @@ impl LocalBroker {
             super::SelectionPlan,
             BTreeMap<String, SeatIdentity>,
             BTreeMap<String, (super::usage_reads::TransientReadFailure, u64)>,
+            BTreeMap<String, String>,
         ),
         BrokerError,
     > {
@@ -3028,6 +3029,7 @@ impl LocalBroker {
         let mut candidates = Vec::with_capacity(summaries.len());
         let mut seats = BTreeMap::new();
         let mut transient = BTreeMap::new();
+        let mut by_windows = BTreeMap::new();
         let mut grace = Vec::new();
         let mut seen = std::collections::BTreeSet::new();
         let mut exclude = exclude.to_vec();
@@ -3077,11 +3079,15 @@ impl LocalBroker {
             }
             // The same entitlement guard for a fresh reading and for a last
             // good reading standing in for a failed read.
-            require_requested_model(provider, model, &mut capacity);
+            let fresh = require_requested_model(provider, model, &mut capacity);
+            let mut graced = None;
             grace.extend(read.grace.map(|mut good| {
-                require_requested_model(provider, model, &mut good);
+                graced = require_requested_model(provider, model, &mut good);
                 good
             }));
+            if let Some(plan) = fresh.or(graced) {
+                by_windows.insert(cred.storage_key(), plan);
+            }
             if let Some(seat) = seat {
                 if !seen.insert(seat.as_str().to_string()) {
                     exclude.push(cred.clone());
@@ -3130,6 +3136,7 @@ impl LocalBroker {
             super::SelectionPlan::from_candidates(&request, &candidates),
             seats,
             transient,
+            by_windows,
         ))
     }
 
@@ -3142,7 +3149,7 @@ impl LocalBroker {
     ) -> Result<(CredentialRef, SeatIdentity), BrokerError> {
         use super::quota_policy::{Selection, SelectionFailure, SelectionFailureKind};
         use super::usage_reads::USAGE_READ_TARGET;
-        let (plan, mut seats, transient) = match self
+        let (plan, mut seats, transient, by_windows) = match self
             .selection_plan(provider, model, exclude, failed)
             .await
         {
@@ -3194,6 +3201,18 @@ impl LocalBroker {
                         status = %failure.status.map(|s| s.to_string()).unwrap_or_default(),
                         retry_in_s = retry_at_ms.saturating_sub(crate::epoch_millis()) / 1000,
                         "usage read"
+                    );
+                }
+                // A model the reading doesn't list chosen on the plan's
+                // windows: a model Codex gates per model but the gated list
+                // misses is chosen this way, so each such choice is logged.
+                if let Some(plan_type) = by_windows.get(&credential.storage_key()) {
+                    tracing::info!(
+                        provider = %provider.as_str(),
+                        model = %model.unwrap_or_default(),
+                        account = %credential.account.label_str(),
+                        plan_type = %plan_type,
+                        "unlisted, judged by windows"
                     );
                 }
                 tracing::info!(%credential, ?plan.strategy, tier, ?budget_reset_ms, ?utilization, "automatic subscription choice");
@@ -3676,6 +3695,7 @@ pub fn capacity_from_snapshot(
         observation: QuotaObservation::Ok { windows, models },
         cooldown_until_ms: None,
         failure: None,
+        plan: snapshot.plan.clone(),
     }
 }
 
@@ -3759,28 +3779,59 @@ impl UsageReadError {
     }
 }
 
+/// Codex models gated per model: the usage reading must list them
+/// (`model_usage`); a plan's generic windows never prove them. Astra: the
+/// usage response gates it per model even on a paid plan with room (see
+/// usage.rs `CODEX_ASTRA_FIXTURE`). Kept by hand beside the Codex
+/// capability table (agent-engine `runtime/openai/catalog/codex.rs`,
+/// `codex_static_capability`), which agent-core can't see.
+const CODEX_GATED_MODELS: &[&str] = &["gpt-6-astra"];
+
+/// Codex `plan_type` values of a paid plan (as the usage response spells
+/// them). Any other plan, or none, proves no model the reading doesn't list.
+const CODEX_PAID_PLANS: &[&str] = &["plus", "pro", "team", "business", "enterprise", "edu"];
+
 /// A generic Codex window (including a free 30-day plan) does not prove
-/// entitlement to Astra or any other requested model: a requested model the
-/// reading does not list counts as unknown. Applied to every reading the
-/// policy judges, fresh or graced.
+/// entitlement to Astra or any other model gated per model: a requested
+/// model the reading does not list counts as unknown, unless it is not
+/// gated and the reading is of a paid plan (the plan's windows then judge
+/// it, as a request without a model; the plan is returned). Applied to
+/// every reading the policy judges, fresh or graced.
 fn require_requested_model(
     provider: OAuthProviderId,
     model: Option<&str>,
     capacity: &mut super::quota_policy::AccountCapacity,
-) {
+) -> Option<String> {
     use super::quota_policy::{model_matches, ModelAvailability, ModelState, QuotaObservation};
     if provider != OAuthProviderId::OpenAiCodex {
-        return;
+        return None;
     }
-    if let (Some(model), QuotaObservation::Ok { models, .. }) = (model, &mut capacity.observation) {
-        let availability = models.get_or_insert_with(Vec::new);
-        if !availability.iter().any(|m| model_matches(&m.model, model)) {
-            availability.push(ModelAvailability {
-                model: model.to_string(),
-                state: ModelState::Unknown,
-            });
-        }
+    let paid = capacity
+        .plan
+        .as_deref()
+        .is_some_and(|plan| CODEX_PAID_PLANS.contains(&plan));
+    let (Some(model), QuotaObservation::Ok { models, .. }) = (model, &mut capacity.observation)
+    else {
+        return None;
+    };
+    let requested = model.to_ascii_lowercase();
+    // Contained, so a prefixed or suffixed spelling stays gated too.
+    let gated = CODEX_GATED_MODELS.iter().any(|g| requested.contains(g));
+    if models
+        .iter()
+        .flatten()
+        .any(|m| model_matches(&m.model, model))
+    {
+        return None;
     }
+    if gated || !paid {
+        models.get_or_insert_with(Vec::new).push(ModelAvailability {
+            model: model.to_string(),
+            state: ModelState::Unknown,
+        });
+        return None;
+    }
+    capacity.plan.clone()
 }
 
 /// What a usage read that needs action asks of the user. A refresh that
@@ -6810,5 +6861,174 @@ mod tests {
             .retry_after_s,
             Some(9)
         );
+    }
+
+    // ── Codex: a requested model the reading doesn't list ────────────────
+
+    /// Sol: the Codex usage reading doesn't gate it per model. Astra: it does.
+    const SOL: &str = "gpt-6.1-sol";
+    const ASTRA: &str = "gpt-6-astra";
+
+    /// The policy's verdict, through the broker's own mapping and model
+    /// guard, on a synthetic Codex reading (`plan_type` `plan` when given, a
+    /// weekly window `used` percent used, `model_usage` as given) for a
+    /// request for `model`.
+    fn codex_verdict(
+        plan: Option<&str>,
+        used: f64,
+        model_usage: serde_json::Value,
+        model: &str,
+    ) -> Result<super::super::quota_policy::Eligible, super::super::quota_policy::RejectReason>
+    {
+        codex_verdict_with_limits(plan, used, model_usage, serde_json::Value::Null, model)
+    }
+
+    /// [`codex_verdict`] with the reading's `additional_rate_limits` (model
+    /// windows) as given.
+    fn codex_verdict_with_limits(
+        plan: Option<&str>,
+        used: f64,
+        model_usage: serde_json::Value,
+        limits: serde_json::Value,
+        model: &str,
+    ) -> Result<super::super::quota_policy::Eligible, super::super::quota_policy::RejectReason>
+    {
+        use super::super::quota_policy::{evaluate, SelectionRequest};
+        const AT: u64 = 1_800_000_000_000;
+        let mut body = serde_json::json!({
+            "rate_limit": {"allowed": true, "limit_reached": false,
+                "primary_window": {"used_percent": used, "limit_window_seconds": 604_800,
+                    "reset_after_seconds": 3_600}},
+            "model_usage": model_usage,
+            "additional_rate_limits": limits,
+        });
+        if let Some(plan) = plan {
+            body["plan_type"] = plan.into();
+        }
+        let snapshot =
+            super::super::usage::parse_codex_usage(&body.to_string(), "x", AT, None).unwrap();
+        let provider = OAuthProviderId::OpenAiCodex;
+        let cred = CredentialRef::new(provider, Account::named("x").unwrap());
+        let mut capacity = capacity_from_snapshot(&cred, &snapshot);
+        require_requested_model(provider, Some(model), &mut capacity);
+        let req = SelectionRequest {
+            model: Some(model),
+            ..SelectionRequest::new(provider, AT, 60_000)
+        };
+        evaluate(&req, &capacity)
+    }
+
+    fn model_unknown(model: &str) -> super::super::quota_policy::RejectReason {
+        super::super::quota_policy::RejectReason::ModelUnknown {
+            model: model.to_string(),
+        }
+    }
+
+    /// Sol on a paid plan, not listed by the reading (no `model_usage`, or
+    /// one naming only Astra): the plan's generic windows decide, as for a
+    /// request without a model. Room selects it; a spent window rejects it
+    /// as exhausted, not as an unknown model.
+    #[test]
+    fn an_unlisted_ungated_codex_model_is_judged_by_a_paid_plans_windows() {
+        use super::super::quota_policy::RejectReason;
+        let astra_only = serde_json::json!({ (ASTRA): {"available": true} });
+        for plan in ["plus", "pro", "team", "business", "enterprise", "edu"] {
+            for usage in [serde_json::Value::Null, astra_only.clone()] {
+                let room = codex_verdict(Some(plan), 10.0, usage.clone(), SOL);
+                assert!(room.is_ok(), "{plan} {usage}: {room:?}");
+                let spent = codex_verdict(Some(plan), 100.0, usage.clone(), SOL);
+                assert!(
+                    matches!(spent, Err(RejectReason::Exhausted { .. })),
+                    "{plan} {usage}: {spent:?}"
+                );
+            }
+        }
+    }
+
+    /// Astra is gated per model: unlisted, it stays unknown on a paid plan
+    /// with room, however the request spells it.
+    #[test]
+    fn an_unlisted_gated_codex_model_stays_unknown_on_a_paid_plan() {
+        let sol_only = serde_json::json!({ (SOL): {"available": true} });
+        for model in [ASTRA, "GPT-6-Astra", "openai-codex/gpt-6-astra"] {
+            for usage in [serde_json::Value::Null, sol_only.clone()] {
+                assert_eq!(
+                    codex_verdict(Some("pro"), 10.0, usage.clone(), model),
+                    Err(model_unknown(model)),
+                    "{model} {usage}"
+                );
+            }
+        }
+    }
+
+    /// A free plan, a reading without a plan, or a plan not known here as
+    /// paid (one never seen before, "platinum") proves no requested model
+    /// the reading doesn't list: the paid list is closed.
+    #[test]
+    fn an_unlisted_codex_model_stays_unknown_without_a_known_paid_plan() {
+        for plan in [
+            Some("free"),
+            Some("free_workspace"),
+            Some("unknown"),
+            Some("platinum"),
+            Some("PRO"),
+            Some(""),
+            None,
+        ] {
+            for model in [SOL, ASTRA] {
+                assert_eq!(
+                    codex_verdict(plan, 10.0, serde_json::Value::Null, model),
+                    Err(model_unknown(model)),
+                    "{plan:?} {model}"
+                );
+            }
+        }
+    }
+
+    /// A model the reading lists keeps the reading's verdict on a paid plan
+    /// with room: used up is rejected, unknown stays unknown, available is
+    /// chosen.
+    #[test]
+    fn a_listed_codex_model_keeps_the_readings_verdict_on_a_paid_plan() {
+        use super::super::quota_policy::RejectReason;
+        for model in [SOL, ASTRA] {
+            let usage = |available: serde_json::Value| -> serde_json::Value {
+                serde_json::json!({ (model): {"available": available} })
+            };
+            assert_eq!(
+                codex_verdict(Some("pro"), 10.0, usage(false.into()), model),
+                Err(RejectReason::ModelUnavailable {
+                    model: model.to_string()
+                }),
+                "{model}"
+            );
+            assert_eq!(
+                codex_verdict(Some("pro"), 10.0, usage("maybe".into()), model),
+                Err(model_unknown(model)),
+                "{model}"
+            );
+            let available = codex_verdict(Some("pro"), 10.0, usage(true.into()), model);
+            assert!(available.is_ok(), "{model}: {available:?}");
+        }
+    }
+
+    /// A listed, exhausted Sol is refused on a paid plan whose generic
+    /// windows have room: listed by its own spent model window, alone or
+    /// merged with a `model_usage` entry saying available.
+    #[test]
+    fn a_listed_exhausted_codex_model_is_refused_while_the_plans_windows_have_room() {
+        use super::super::quota_policy::RejectReason;
+        let spent = serde_json::json!([{"limit_name": "sol", "normal_model_slug": SOL,
+            "rate_limit": {"primary_window": {"used_percent": 100, "reset_after_seconds": 3_600}}}]);
+        let available = serde_json::json!({ (SOL): {"available": true} });
+        for usage in [serde_json::Value::Null, available] {
+            assert_eq!(
+                codex_verdict_with_limits(Some("pro"), 10.0, usage.clone(), spent.clone(), SOL),
+                Err(RejectReason::ModelUnavailable {
+                    model: SOL.to_string()
+                }),
+                "{usage}"
+            );
+        }
     }
 }
