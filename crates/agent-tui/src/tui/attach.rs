@@ -22,7 +22,7 @@ use synaps_cli::Result;
 use agent_core::core::memstat::ladder;
 
 use super::app::ChatMessage;
-use super::run_setup::{app_from_snapshot, finish_setup, LazyHttp, TransportMode};
+use super::run_setup::{app_from_snapshot, finish_setup, LazyHttp};
 
 /// What to attach to.
 pub struct AttachOpts {
@@ -509,13 +509,9 @@ pub async fn run_attached(mut opts: AttachOpts) -> Result<()> {
     let mut app = app_from_snapshot(&snapshot);
     app.observing = transport.mode() == AttachMode::Observe;
     app.attached_clients = transport.roster().clients().len();
-    let (msgs, bytes) = super::app::scrollback_from_env(&TransportMode::Socket);
+    let (msgs, bytes) = super::app::scrollback_from_env();
     app.transcript.set_scrollback(msgs, bytes);
     ladder("app", &"");
-    // Notices queued before boot go first.
-    for n in super::run_setup::take_boot_notices() {
-        app.push_msg(ChatMessage::System(n));
-    }
     let notices = attach_notices(AttachNoticeInputs {
         session_id: &snapshot.meta.id,
         client_id: transport.client_id().0,
@@ -537,8 +533,7 @@ pub async fn run_attached(mut opts: AttachOpts) -> Result<()> {
     for n in notices.transcript {
         app.push_msg(ChatMessage::System(n));
     }
-    // Same first-run guidance as the in-process boot: a new user's first
-    // `synaps` lands here (daemon mode is the default), and without it the
+    // First-run guidance: every `synaps` lands here, and without it the
     // first message fails with a token-refresh error.
     if let Some(n) = super::run_setup::no_credentials_notice() {
         app.push_msg(ChatMessage::System(n));
@@ -561,12 +556,10 @@ pub async fn run_attached(mut opts: AttachOpts) -> Result<()> {
         app,
         Box::new(transport),
         http,
-        TransportMode::Socket,
         config,
         registry,
         keybind_registry,
         system_prompt_path,
-        None,
     )
     .await?;
     // No extension host in this process: the loader arm never runs.
