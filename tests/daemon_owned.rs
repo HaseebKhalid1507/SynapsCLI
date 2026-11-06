@@ -411,10 +411,10 @@ async fn the_owner_lease_closing_ends_the_session_without_a_detach() {
     stop_in_process(d).await;
 }
 
-/// The connection gave up on the attach (`ATTACH_TIMEOUT`) and went away
-/// before the actor even read the claim: the claim binds a lease that is
-/// already closed, and the session ends at once instead of staying bound
-/// to nobody.
+/// The creating connection gave up on the attach (`ATTACH_TIMEOUT`) and
+/// went away before the actor even read the claim. Nobody else ever had the
+/// token: the claim never binds, nobody is attached for it, and the session
+/// ends on the spot rather than after the grace (30 s here).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn a_claim_whose_connection_is_already_gone_ends_the_session() {
@@ -425,25 +425,69 @@ async fn a_claim_whose_connection_is_already_gone_ends_the_session() {
     let mut obs = observe(&sock, &h.id).await;
     let lease = tokio_util::sync::CancellationToken::new();
     lease.cancel();
+    let t0 = std::time::Instant::now();
     bind_via_host(&h, &token, &lease).await;
     expect_owner_gone(&mut obs).await;
+    assert!(t0.elapsed() < Duration::from_secs(5), "ended at once, not after the grace: {:?}", t0.elapsed());
+    assert!(h.presence().owning_client.is_none(), "the dead claim never bound");
     wait_gone(&sock, &h.id, Duration::from_secs(5)).await;
     stop_in_process(d).await;
 }
 
 // ── restored sessions ───────────────────────────────────────────────────────
 
-struct GraceVar;
-impl GraceVar {
-    fn set(secs: &str) -> Self {
-        std::env::set_var("SYNAPS_DAEMON_OWNER_REBIND_SECS", secs);
-        Self
+struct EnvVar(&'static str);
+impl EnvVar {
+    fn set(name: &'static str, value: &str) -> Self {
+        std::env::set_var(name, value);
+        Self(name)
     }
 }
-impl Drop for GraceVar {
+impl Drop for EnvVar {
     fn drop(&mut self) {
-        std::env::remove_var("SYNAPS_DAEMON_OWNER_REBIND_SECS");
+        std::env::remove_var(self.0);
     }
+}
+
+struct GraceVar(EnvVar);
+impl GraceVar {
+    fn set(secs: &str) -> Self {
+        Self(EnvVar::set("SYNAPS_DAEMON_OWNER_REBIND_SECS", secs))
+    }
+}
+
+/// Queue an event for `h` on its session socket (an autonomous turn).
+async fn queue_event(h: &SessionHandle, id: &str) {
+    let mut ev = agent_engine::events::types::Event::simple("owned-test", "wake up", None);
+    ev.id = id.into();
+    let path = agent_engine::events::registry::find_session_registration(h.id.as_str())
+        .expect("published session endpoint")
+        .socket_path;
+    agent_engine::events::socket::send_to_session_socket(&path, serde_json::to_string(&ev).unwrap().as_bytes())
+        .await
+        .expect("session socket");
+}
+
+/// The owner re-binding over the socket with `token` (as `reconnect` does).
+async fn rebind(sock: &Path, sid: &SessionId, token: &OwnerToken) -> SocketTransport {
+    let mut hello = Hello::new(ClientKind::Test);
+    hello.reconnect_of = Some(ClientReconnect {
+        previous_client: ClientId(1),
+        session_id: sid.clone(),
+        was_owner: true,
+        generation: 1,
+        owner: Some(OwnerClaim { token: token.clone(), forward_secrets: None }),
+    });
+    let conn = SocketTransport::connect(sock, hello).await.unwrap();
+    let (owner, _) = SocketTransport::attach(conn, Attach::Existing { session_id: sid.clone(), mode: AttachMode::Mirror })
+        .await
+        .expect("the owner re-binds");
+    assert!(owner.is_session_owner());
+    owner
+}
+
+fn hits_now(hits: &std::sync::atomic::AtomicUsize) -> usize {
+    hits.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 /// A session a reload restores waits for `ArmOwnerRebind` (sent once the
@@ -474,35 +518,110 @@ async fn a_restored_owned_session_holds_its_work_until_the_owner_rebinds() {
     let (d, hits) = start_counted(&guard, Script::Sse(ANTHROPIC_SSE), None).await;
     let sock = d.paths.sock.clone();
     let (h, token) = owned_via_host(&d, guard.home.path(), true).await;
-    let mut ev = agent_engine::events::types::Event::simple("owned-test", "wake up", None);
-    ev.id = "evt-owned-hold".into();
-    let path = agent_engine::events::registry::find_session_registration(h.id.as_str())
-        .expect("published session endpoint")
-        .socket_path;
-    agent_engine::events::socket::send_to_session_socket(&path, serde_json::to_string(&ev).unwrap().as_bytes())
-        .await
-        .expect("session socket");
+    queue_event(&h, "evt-owned-hold").await;
     tokio::time::sleep(Duration::from_millis(1500)).await;
-    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0, "no turn without the owner");
+    assert_eq!(hits_now(&hits), 0, "no turn without the owner");
 
-    let mut hello = Hello::new(ClientKind::Test);
-    hello.reconnect_of = Some(ClientReconnect {
-        previous_client: ClientId(1),
-        session_id: h.id.clone(),
-        was_owner: true,
-        generation: 1,
-        owner: Some(OwnerClaim { token, forward_secrets: None }),
-    });
-    let conn = SocketTransport::connect(&sock, hello).await.unwrap();
-    let (mut owner, _) = SocketTransport::attach(conn, Attach::Existing { session_id: h.id.clone(), mode: AttachMode::Mirror })
-        .await
-        .expect("the owner re-binds");
-    assert!(owner.is_session_owner());
+    let mut owner = rebind(&sock, &h.id, &token).await;
     until(&mut owner, |e| matches!(e, SessionEventWire::TurnStarted { .. })).await;
     until(&mut owner, |e| matches!(e, SessionEventWire::Idle)).await;
     assert!(hits.load(std::sync::atomic::Ordering::SeqCst) > 0, "the held event ran");
     owner.detach().await;
     wait_gone(&sock, &h.id, Duration::from_secs(5)).await;
+    stop_in_process(d).await;
+}
+
+/// The daemon's `ArmOwnerRebind` never reaches a restored owned session (a
+/// full queue, a lost send): its fallback deadline, the restore cap plus
+/// the grace, still ends it. Nothing leaks.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_restored_owned_session_never_armed_ends_at_its_fallback_deadline() {
+    let guard = HomeGuard::new();
+    let _grace = GraceVar::set("1");
+    let _cap = EnvVar::set("SYNAPS_DAEMON_OWNER_RESTORE_CAP_SECS", "2");
+    let d = start_in_process(&guard, Script::Sse(ANTHROPIC_SSE), None).await;
+    let sock = d.paths.sock.clone();
+    let t0 = std::time::Instant::now();
+    let (h, _token) = owned_via_host(&d, guard.home.path(), true).await;
+    let mut obs = observe(&sock, &h.id).await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(listed(&sock, &h.id).await, "the grace alone (1 s) does not end an unarmed session");
+    expect_owner_gone(&mut obs).await;
+    assert!(t0.elapsed() >= Duration::from_millis(2900), "not before cap + grace: {:?}", t0.elapsed());
+    wait_gone(&sock, &h.id, Duration::from_secs(5)).await;
+    stop_in_process(d).await;
+}
+
+/// A re-bind whose connection already gave up (attempt A timed out while
+/// the actor was busy; retry B is on its way): the claim never binds,
+/// releases nothing the session holds, and the grace keeps running. B then
+/// re-binds and the held work runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_rebind_whose_connection_is_gone_is_ignored_and_the_grace_runs_on() {
+    let guard = HomeGuard::new();
+    let (d, hits) = start_counted(&guard, Script::Sse(ANTHROPIC_SSE), None).await;
+    let sock = d.paths.sock.clone();
+    let (h, token) = owned_via_host(&d, guard.home.path(), true).await;
+    h.send(SessionCommand::ArmOwnerRebind).await.unwrap();
+    queue_event(&h, "evt-owned-dead-rebind").await;
+
+    let dead = tokio_util::sync::CancellationToken::new();
+    dead.cancel();
+    bind_via_host(&h, &token, &dead).await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(listed(&sock, &h.id).await, "a stale attempt does not end the session");
+    let presence = h.presence();
+    assert!(presence.owning_client.is_none(), "it never bound");
+    assert_eq!(presence.clients, 0, "nobody was attached for it");
+    assert_eq!(hits_now(&hits), 0, "nothing held was released");
+
+    let mut owner = rebind(&sock, &h.id, &token).await;
+    until(&mut owner, |e| matches!(e, SessionEventWire::TurnStarted { .. })).await;
+    until(&mut owner, |e| matches!(e, SessionEventWire::Idle)).await;
+    assert!(hits_now(&hits) > 0, "the held event ran once the owner was back");
+    owner.detach().await;
+    wait_gone(&sock, &h.id, Duration::from_secs(5)).await;
+    stop_in_process(d).await;
+}
+
+/// The owner leaves while the session is fenced for a reload, and the exec
+/// fails (`ReloadAborted`): the fence lifts, but what queued meanwhile waits
+/// for the owner's re-bind, as on a restored session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_failed_reload_holds_the_work_until_the_owner_rebinds() {
+    let guard = HomeGuard::new();
+    let (d, hits) = start_counted(&guard, Script::Sse(ANTHROPIC_SSE), None).await;
+    let sock = d.paths.sock.clone();
+    let (h, token) = owned_via_host(&d, guard.home.path(), false).await;
+    let mut owner = rebind(&sock, &h.id, &token).await;
+    let mut obs = observe(&sock, &h.id).await;
+    let mut rx = h.subscribe();
+    h.send(SessionCommand::Checkpoint { reason: CheckpointReason::Reload }).await.unwrap();
+    loop {
+        let env = tokio::time::timeout(Duration::from_secs(10), rx.recv()).await.expect("checkpointed").unwrap();
+        if matches!(env.event, SessionEventWire::QueryResult { .. }) {
+            break;
+        }
+    }
+    owner.detach().await;
+    queue_event(&h, "evt-owned-failed-exec").await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    h.send(SessionCommand::ReloadAborted).await.unwrap();
+    until(&mut obs, |e| matches!(e, SessionEventWire::SystemNotice(n) if n.starts_with("daemon reload failed"))).await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(listed(&sock, &h.id).await, "the owner's grace is running");
+    assert_eq!(hits_now(&hits), 0, "no turn while the owner is away");
+
+    let mut owner = rebind(&sock, &h.id, &token).await;
+    until(&mut owner, |e| matches!(e, SessionEventWire::TurnStarted { .. })).await;
+    until(&mut owner, |e| matches!(e, SessionEventWire::Idle)).await;
+    assert!(hits_now(&hits) > 0, "the held event ran once the owner was back");
+    owner.detach().await;
+    expect_owner_gone(&mut obs).await;
     stop_in_process(d).await;
 }
 
@@ -595,10 +714,64 @@ async fn an_owned_continue_adopts_a_clientless_live_session_and_refuses_an_attac
     let metas = SocketTransport::sessions(&sock).await.unwrap();
     assert_eq!(metas.len(), 1, "one session: the plain one ended {metas:?}");
     owner.send_from_self(SessionCommand::Submit { text: "again".into(), attachments: vec![] }).await.unwrap();
-    until(&mut owner, |e| matches!(e, SessionEventWire::Idle)).await;
+    let seen = until(&mut owner, |e| matches!(e, SessionEventWire::Idle)).await;
+    assert!(
+        !seen.iter().any(|e| matches!(&e.event, SessionEventWire::SystemNotice(n) if n.contains("already running"))),
+        "an adopted journal is a new session, not the live one attached to"
+    );
     let owned_id = owner.session_id().clone();
     owner.detach().await;
     wait_gone(&sock, &owned_id, Duration::from_secs(5)).await;
+    stop_in_process(d).await;
+}
+
+/// A client attaches to the continue target while the owned create is
+/// adopting it: the attach reached the actor first (a parked target is
+/// still waking up for it, so the daemon's presence still says nobody is
+/// attached). The actor refuses the close; the create is refused and the
+/// session stays with its client.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn an_owned_continue_never_closes_a_session_a_client_is_attaching_to() {
+    let guard = HomeGuard::new();
+    let d = start_in_process(&guard, Script::Sse(ANTHROPIC_SSE), None).await;
+    let sock = d.paths.sock.clone();
+    let mut plain = create_plain_session(&sock, guard.home.path()).await;
+    let sid = plain.session_id().clone();
+    plain.send_from_self(SessionCommand::Submit { text: "hello".into(), attachments: vec![] }).await.unwrap();
+    until(&mut plain, |e| matches!(e, SessionEventWire::Idle)).await;
+    plain.detach().await;
+    let h = d.state.attach(&sid).expect("live");
+    let t0 = std::time::Instant::now();
+    while h.presence().clients > 0 {
+        assert!(t0.elapsed() < Duration::from_secs(10), "never detached");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    h.send(SessionCommand::Park).await.unwrap();
+    while h.lifecycle() != SessionLifecycle::Parked {
+        assert!(t0.elapsed() < Duration::from_secs(10), "never parked");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let mut rx = h.subscribe();
+    h.send(SessionCommand::Attach { client: Hello::new(ClientKind::Test).client, mode: AttachMode::Mirror, owner: None })
+        .await
+        .unwrap();
+    let cont = SessionConfig { continue_session: Some(Some(sid.as_str().to_string())), ..config(guard.home.path()) };
+    let err = SocketTransport::create_owned(&sock, Hello::new(ClientKind::Test), cont, AttachMode::Mirror, false)
+        .await
+        .err()
+        .expect("a client is attached: refused");
+    assert!(matches!(err, TransportError::Refused(ref m) if m.contains("attached by 1 client(s)")), "{err}");
+    let client = loop {
+        match tokio::time::timeout(Duration::from_secs(10), rx.recv()).await.expect("attached").unwrap().event {
+            SessionEventWire::Attached { client, .. } => break client,
+            _ => continue,
+        }
+    };
+    assert!(listed(&sock, &sid).await, "not closed under its client");
+    assert_eq!(h.presence().clients, 1);
+    h.send(SessionCommand::Detach { client }).await.unwrap();
     stop_in_process(d).await;
 }
 
