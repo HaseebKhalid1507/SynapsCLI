@@ -60,6 +60,15 @@ actor-owned message texts). What follows from the new architecture:
   checkpoint: the turn ends with `error` + `agent_end` + `response {ok:
   false}`; the child re-binds to its session and carries on (stdin is
   buffered meanwhile).
+- On exit the child keeps writing queued frames for as long as the parent
+  can read its stdout (the pipe's read end is open), at most 60 s: keep
+  reading to EOF after closing stdin or sending SIGTERM, or the cut turn's
+  `agent_end` is lost. Prefer SIGTERM (with a few seconds' grace) to
+  SIGKILL: SIGKILL writes nothing.
+- Processes: the child (a single-threaded runtime) plus one detached
+  `synaps daemon --foreground` (2 tokio workers unless
+  `SYNAPS_WORKER_THREADS` says otherwise). Engine logs go to the daemon's
+  log file; the daemon's stderr is copied to the child's stderr.
 
 ### Exit codes
 
@@ -87,7 +96,9 @@ actor-owned message texts). What follows from the new architecture:
 - The parent writes [`RpcCommand`] frames to the child's **stdin**.
 - The child writes [`RpcEvent`] frames to the child's **stdout**.
 - **stdout is reserved for protocol frames only** — no diagnostics or logging
-  ever appear there.  All `tracing::*` output goes to the log file / stderr.
+  ever appear there.  Diagnostics go to **stderr** (the child's warnings,
+  WARN and above, and whatever its private daemon prints there), written
+  lossily: a parent that never reads stderr cannot stall the child.
 
 > **v0 limitation:** the `prompt` command's `attachments` field carries file
 > paths but the rpc child does NOT read file bytes — it prepends a textual

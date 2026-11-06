@@ -209,7 +209,11 @@ with `forward_secrets` on. The private daemon has the rpc process's env,
 config, mount namespace and cgroup (the old per-process isolation), skips
 pin restore and process scopes, never serves anyone else, and exits ≤ 10 s
 after its session ends; a run dir whose rpc and daemon locks are both free
-is swept by the next `synaps rpc`. No daemon → exit 3, no in-process
+is swept by the next `synaps rpc`. It runs 2 tokio workers and one
+jemalloc background thread unless the caller set `SYNAPS_WORKER_THREADS` /
+`_RJEM_MALLOC_CONF`; its stderr is copied to the rpc's stderr. `main` takes
+`SYNAPS_DAEMON_DIR` out of the process env at start (it still applies to
+that process), so nothing the daemon spawns inherits it. No daemon → exit 3, no in-process
 fallback. Its stdin/stdout protocol is unchanged
 ([rpc-protocol.md](rpc-protocol.md)). A shared, env-keyed rpc daemon is a
 possible follow-up.

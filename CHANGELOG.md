@@ -60,6 +60,10 @@ All notable changes to this project will be documented in this file.
   process cancels the turn and ends the session. With no daemon possible
   (`SYNAPS_DAEMON=0`, `SYNAPS_DAEMON_AUTOSPAWN=0`, spawn failure) it exits 3
   with an `error` frame instead of running in-process; a lost daemon exits 4.
+  On exit, queued frames are written while the parent can still read stdout
+  (≤ 60 s). rpc runs single-threaded; its private daemon runs 2 workers
+  (`SYNAPS_WORKER_THREADS` overrides); warnings and the daemon's stderr go
+  to rpc's stderr (lossy, never blocking).
 
 ### Fixed
 
