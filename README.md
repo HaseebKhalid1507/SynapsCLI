@@ -135,6 +135,8 @@ Memory is total PSS (plus swapped-out pages) across each tool's whole process tr
 
 ![weekly prompt-cache hit rate](benchmarks/prompt-cache/charts/1-weekly-hit-rate.png)
 
+**Terminal-Bench 4.1, with Claude Opus 5.5:** 39 of 63 tasks (61.9%), one trial per task. On the public TB 4.0 leaderboard, Claude Code with the same model would be expected to pass 40.0 of the same tasks. The API refused 3 tasks for Synaps; on the other 60 it passed 65.0% against Claude Code's expected 63.7%, at a median 23 minutes per task against 55. One trial is noisy, and the benchmark version and effort level differ. [Full write-up](benchmarks/terminal-bench/README.md)
+
 Method, tool versions, latency numbers, caveats and how to reproduce: [BENCHMARKS.md](BENCHMARKS.md).
 
 ## Why Synaps
