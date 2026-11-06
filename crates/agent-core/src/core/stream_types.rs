@@ -116,7 +116,10 @@ pub enum BudgetDimension {
     ToolResultBytes,
     /// Accumulated estimated USD cost within one stream turn (spec §8.1).
     CostUsd,
-    /// Uncached input + output tokens summed over one stream turn.
+    /// Reserved: uncached input + output tokens summed over one stream
+    /// turn. No budget sets this limit any more (only `synaps watcher` did),
+    /// so nothing produces it; the variant stays because its label
+    /// (`total_tokens`) and chat-capture tag (7) are on the wire.
     TotalTokens,
 }
 

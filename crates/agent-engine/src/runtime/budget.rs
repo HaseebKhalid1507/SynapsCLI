@@ -16,8 +16,7 @@ use std::time::{Duration, Instant};
 use agent_core::BudgetDimension;
 
 /// Start of every synthetic tool_result for a call the engine did not run
-/// because a turn budget was used up. Hosts that count executed calls skip
-/// results that start with it.
+/// because a turn budget was used up.
 pub const TOOL_CALL_NOT_EXECUTED: &str = "Tool call not executed";
 
 /// The synthetic tool_result for a call refused by the turn's tool-call
@@ -48,10 +47,6 @@ pub struct TurnBudget {
     pub max_accumulated_tool_result_bytes: Option<usize>,
     pub max_context_tokens: Option<u64>,
     pub max_cost_usd: Option<f64>,
-    /// Uncached input + output tokens summed over the turn's requests (cache
-    /// reads and writes are priced into `max_cost_usd`, not counted here).
-    /// No role or config key sets it; a host can set it directly.
-    pub max_total_tokens: Option<u64>,
     /// Bounded auto-renewals of the provider-round allowance (spec §8.1).
     /// On exhaustion the stream loop may reset the round counter this many
     /// times so a long, legitimate task continues instead of hard-failing.
@@ -90,7 +85,6 @@ impl TurnBudget {
                 max_accumulated_tool_result_bytes: None,
                 max_context_tokens: None,
                 max_cost_usd: None,
-                max_total_tokens: None,
                 // A human is watching and can interrupt; let long agentic
                 // tasks continue through several checkpoints.
                 max_round_renewals: 8,
@@ -102,7 +96,6 @@ impl TurnBudget {
                 max_accumulated_tool_result_bytes: Some(8 * 1024 * 1024),
                 max_context_tokens: None,
                 max_cost_usd: None,
-                max_total_tokens: None,
                 // Nobody is watching: no graceful extension — the round cap
                 // is a hard stop.
                 max_round_renewals: 0,
@@ -114,7 +107,6 @@ impl TurnBudget {
                 max_accumulated_tool_result_bytes: None,
                 max_context_tokens: None,
                 max_cost_usd: None,
-                max_total_tokens: None,
                 // Bounded delegation under a supervising turn: 64 x (1 + 2)
                 // = 192 rounds.
                 max_round_renewals: 2,
@@ -123,9 +115,8 @@ impl TurnBudget {
     }
 
     /// The stricter of two budgets, dimension by dimension (`None` = no
-    /// limit loses to any limit). Used to narrow a role budget to what a
-    /// session has left, or to combine a session's budget with the event
-    /// role's.
+    /// limit loses to any limit). Used to combine a session's budget with
+    /// the event role's ([`Self::for_event_turn`]).
     pub fn tighter(&self, other: &TurnBudget) -> TurnBudget {
         fn min<T: PartialOrd + Copy>(a: Option<T>, b: Option<T>) -> Option<T> {
             match (a, b) {
@@ -144,7 +135,6 @@ impl TurnBudget {
             ),
             max_context_tokens: min(self.max_context_tokens, other.max_context_tokens),
             max_cost_usd: min(self.max_cost_usd, other.max_cost_usd),
-            max_total_tokens: min(self.max_total_tokens, other.max_total_tokens),
             max_round_renewals: self.max_round_renewals.min(other.max_round_renewals),
         }
     }
@@ -501,12 +491,6 @@ impl TurnBudgetMeter {
                 return Err(BudgetDimension::CostUsd);
             }
         }
-        if let Some(max_tokens) = self.budget.max_total_tokens {
-            let (input, output, _, _) = usage.totals();
-            if input.saturating_add(output) > max_tokens {
-                return Err(BudgetDimension::TotalTokens);
-            }
-        }
         Ok(())
     }
 }
@@ -722,7 +706,6 @@ mod tests {
         };
         let event = TurnBudget {
             max_cost_usd: Some(5.0),
-            max_total_tokens: Some(1_000),
             ..TurnBudget::for_role(TurnRole::Event)
         };
         let combined = session.tighter(&event);
@@ -734,25 +717,9 @@ mod tests {
         );
         assert_eq!(combined.max_elapsed, Some(Duration::from_secs(600)));
         assert_eq!(combined.max_cost_usd, Some(2.0));
-        assert_eq!(combined.max_total_tokens, Some(1_000));
         assert_eq!(combined.max_context_tokens, None);
         assert_eq!(combined.max_round_renewals, 0);
         assert_eq!(combined, event.tighter(&session));
-    }
-
-    #[test]
-    fn total_tokens_limit_counts_uncached_input_and_output() {
-        let mut meter = TurnBudgetMeter::new(TurnBudget {
-            max_total_tokens: Some(100),
-            ..TurnBudget::for_role(TurnRole::Event)
-        });
-        let usage = UsageCounters::default();
-        // Cache traffic does not count toward the token limit.
-        usage.record_priced("claude-sonnet-4-5", 40, 60, 50_000, 50_000, None, None);
-        assert_eq!(meter.check_usage(&usage), Ok(()));
-        usage.record_priced("claude-sonnet-4-5", 1, 0, 0, 0, None, None);
-        assert_eq!(meter.check_usage(&usage), Err(BudgetDimension::TotalTokens));
-        meter.charge_tool_calls(0);
     }
 
     #[test]
