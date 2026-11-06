@@ -1858,7 +1858,9 @@ mod tests {
         let secrets = client_secret_env(vars);
         let names: Vec<&str> = secrets.0.iter().map(|(k, _)| k.as_str()).collect();
         assert_eq!(names, vec!["AWS_SECRET_ACCESS_KEY", "DATABASE_URL", "GH_TOKEN"]);
-        assert_eq!(names, stripped.iter().map(String::as_str).collect::<Vec<_>>());
+        // Every stripped secret, but not the client-only knob (stripped too).
+        assert!(names.iter().all(|n| stripped.iter().any(|s| s == n)), "{stripped:?}");
+        assert!(stripped.iter().any(|s| s == "SYNAPS_CLIENT_TOKEN"), "{stripped:?}");
         assert!(secrets.0.contains(&("GH_TOKEN".to_string(), "ghp_dummy".to_string())));
         // Debug never prints a value; the token never prints at all.
         let dbg = format!("{secrets:?} {:?}", OwnerClaim { token: OwnerToken("tok-123".into()), forward_secrets: Some(secrets.clone()) });
