@@ -896,3 +896,20 @@ async fn daemon_reload_under_an_idle_chat_rebinds() {
         bodies_text(&bodies)
     );
 }
+
+/// chat's session is owned, so PR 3 refuses `/keepwarm <mode>`: the
+/// refusal prints as an error line and chat carries on (exit 0).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn keepwarm_is_refused_for_the_owned_session() {
+    let (url, _hits, _b) = phase2::spawn_stub(Script::Sse(phase2::ANTHROPIC_SSE)).await;
+    let env = Env::new(url);
+    let run = run_chat(
+        &env,
+        &[],
+        &[Step::Write("/keepwarm auto\n"), Step::Err("never keeps", 1), Step::Write("hello\n"), Step::Out("hi", 1), Step::Close],
+    )
+    .await;
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    assert!(run.stderr.contains("error: an owned session (bound to the client that created it) never keeps"), "{}", run.stderr);
+    assert!(run.stderr.contains("session saved"), "{}", run.stderr);
+}
