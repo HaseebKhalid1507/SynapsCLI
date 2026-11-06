@@ -252,7 +252,7 @@ async fn owner_detach_ends_the_session_and_the_journal_continues_unowned() {
     assert!(!t.is_session_owner());
     assert_eq!(snap2.conversation.api_messages.len(), 2, "user + assistant");
     let sid2 = t.session_id().clone();
-    assert_eq!(SocketTransport::pin(&sock, &sid2, true).await.expect("pin a continued session"), true);
+    assert!(SocketTransport::pin(&sock, &sid2, true).await.expect("pin a continued session"));
     t.detach().await;
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(listed(&sock, &sid2).await, "an unowned session outlives its client");
