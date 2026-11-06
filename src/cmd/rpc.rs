@@ -17,23 +17,33 @@
 //!
 //! # Architecture
 //!
-//! This process runs no engine. It connects to the profile's session daemon
-//! (auto-spawning it exactly as `synaps attach` does), creates an OWNED
-//! session there (this process's cwd and env, secrets forwarded for the
-//! tools), translates each [`RpcCommand`] into a `SessionCommand` /
-//! `SessionQuery`, and each daemon event back into the [`RpcEvent`] frames
-//! the in-process loop used to write. The session actor does the turn loop,
-//! saves, context-head checkpoints, event auto-turns and turn budgets.
-//! Owned: when this process goes away (EOF, `shutdown`, kill), the session
-//! ends with it and any turn is cancelled.
+//! This process runs no engine. It spawns a PRIVATE session daemon in a
+//! fresh run dir of its own (`<run>/rpc/<pid>-<rand>`, see [`PrivateDir`]):
+//! the daemon inherits this process's env, config, base dir, mount
+//! namespace and cgroup, exactly what the in-process engine had, and
+//! nothing else ever attaches to it. There it creates an OWNED session
+//! (this process's cwd and env, secrets forwarded for the tools),
+//! translates each [`RpcCommand`] into a `SessionCommand` / `SessionQuery`,
+//! and each daemon event back into the [`RpcEvent`] frames the in-process
+//! loop used to write. The session actor does the turn loop, saves,
+//! context-head checkpoints, event auto-turns and turn budgets. Owned: when
+//! this process goes away (EOF, `shutdown`, SIGTERM, kill), the session
+//! ends with it and any turn is cancelled; the daemon then exits.
+//!
+//! The daemon's events are read eagerly: frames wait for stdout in an
+//! in-memory queue ([`Out`]), so a parent that reads stdout slowly never
+//! stalls the socket (the daemon cuts an owner that lags, which would end
+//! the session and lose usage).
 
 use std::collections::{HashMap, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
+use tokio::sync::{mpsc, oneshot, Notify};
+use tokio::time::Instant;
 
 use agent_engine::daemon::{self, registry, EnsureError, EXIT_DAEMON_LOST, EXIT_REFUSED, EXIT_VERSION};
 use agent_engine::session::socket_transport::SocketTransport;
@@ -47,15 +57,28 @@ use synaps_cli::core::rpc_dispatch::{accumulate_usage, build_tools_list_body, ma
 use synaps_cli::core::rpc_protocol::{RpcAttachment, RpcCommand, RpcEvent, TurnUsage, RPC_PROTOCOL_VERSION};
 use synaps_cli::runtime::openai::registry::{list_models, list_providers};
 
-/// Capacity of the writer-task channel (frames): backpressure when the
-/// parent reads slowly.
-const WRITER_CHAN_CAP: usize = 256;
+/// Bytes of frames that may wait for a slow stdout reader before `emit`
+/// waits too (backpressure, which then reaches the daemon socket). Far
+/// above any stall seen in practice: a long answer is a few hundred KiB.
+const OUT_QUEUE_CAP: usize = 64 * 1024 * 1024;
 /// `shutdown`: how long an in-flight turn may run on before the session ends anyway.
 const SHUTDOWN_TURN_WAIT: Duration = Duration::from_secs(30);
 /// How long to wait for the daemon's `Ended` after `End{ClientQuit}`.
 const END_WAIT: Duration = Duration::from_secs(10);
-/// How long the writer may take to drain on exit.
-const WRITER_DRAIN: Duration = Duration::from_secs(1);
+/// SIGTERM: how long a cancelled turn gets to end (`Aborted`), and then the
+/// session, before this process writes the terminal frames itself.
+const TERM_WAIT: Duration = Duration::from_secs(2);
+/// On exit, give up on stdout once the parent read nothing for this long.
+const WRITER_STALL: Duration = Duration::from_secs(2);
+/// `compact`: the actor answers (`CompactionStarted` or a refusal) at once;
+/// the summarisation itself may take minutes.
+const COMPACT_START_WAIT: Duration = Duration::from_secs(30);
+const COMPACT_RUN_WAIT: Duration = Duration::from_secs(600);
+/// A private daemon idles out this soon (at most) after its session ends,
+/// e.g. when this process was SIGKILLed.
+const PRIVATE_IDLE_EXIT_MAX: Duration = Duration::from_secs(10);
+/// Exit code after SIGTERM (128 + 15).
+const EXIT_TERM: i32 = 143;
 
 // ─── stdout ──────────────────────────────────────────────────────────────────
 
@@ -67,17 +90,80 @@ fn encode_event(ev: &RpcEvent) -> String {
     })
 }
 
-/// The one task that owns stdout. A closed stdout ends it (the parent is gone).
-fn spawn_writer(mut rx: mpsc::Receiver<RpcEvent>) -> JoinHandle<()> {
-    tokio::spawn(async move {
+/// Frames bound for stdout, in order. The queue is unbounded up to
+/// [`OUT_QUEUE_CAP`] bytes, so translating daemon events never waits on the
+/// parent reading stdout.
+#[derive(Clone)]
+struct Out {
+    tx: mpsc::UnboundedSender<String>,
+    queued: Arc<AtomicUsize>,
+    drained: Arc<Notify>,
+}
+
+impl Out {
+    async fn send(&self, ev: &RpcEvent) {
+        let line = encode_event(ev);
+        let n = line.len() + 1;
+        loop {
+            let drained = self.drained.notified();
+            if self.queued.load(Ordering::Acquire) < OUT_QUEUE_CAP || self.tx.is_closed() {
+                break;
+            }
+            drained.await;
+        }
+        self.queued.fetch_add(n, Ordering::AcqRel);
+        if self.tx.send(line).is_err() {
+            self.queued.fetch_sub(n, Ordering::AcqRel);
+        }
+    }
+}
+
+/// The one thread that owns stdout (blocking writes never hold up the
+/// runtime). A closed stdout ends it (the parent is gone). `done` fires
+/// when every frame is written or stdout closed.
+fn spawn_writer() -> (Out, oneshot::Receiver<()>) {
+    let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+    let (queued, drained) = (Arc::new(AtomicUsize::new(0)), Arc::new(Notify::new()));
+    let out = Out { tx, queued: Arc::clone(&queued), drained: Arc::clone(&drained) };
+    let (done_tx, done) = oneshot::channel();
+    std::thread::spawn(move || {
         use std::io::Write;
-        let mut stdout = std::io::stdout();
-        while let Some(ev) = rx.recv().await {
-            if writeln!(stdout, "{}", encode_event(&ev)).and_then(|_| stdout.flush()).is_err() {
+        let stdout = std::io::stdout();
+        let mut stdout = stdout.lock();
+        while let Some(line) = rx.blocking_recv() {
+            let ok = writeln!(stdout, "{line}").and_then(|_| stdout.flush()).is_ok();
+            queued.fetch_sub(line.len() + 1, Ordering::AcqRel);
+            drained.notify_waiters();
+            if !ok {
                 break;
             }
         }
-    })
+        rx.close();
+        drained.notify_waiters();
+        let _ = done_tx.send(());
+    });
+    (out, done)
+}
+
+/// Let the writer finish once every sender is gone: as long as the parent
+/// keeps reading, however long that takes; give up after it read nothing
+/// for [`WRITER_STALL`].
+async fn drain_writer(out: Out, mut done: oneshot::Receiver<()>) {
+    let queued = Arc::clone(&out.queued);
+    drop(out);
+    let (mut last, mut since) = (usize::MAX, Instant::now());
+    loop {
+        if tokio::time::timeout(Duration::from_millis(100), &mut done).await.is_ok() {
+            return;
+        }
+        let now = queued.load(Ordering::Acquire);
+        if now < last {
+            (last, since) = (now, Instant::now());
+        } else if since.elapsed() >= WRITER_STALL {
+            tracing::warn!(queued_bytes = now, "rpc: stdout not read for 2 s; exiting with frames unwritten");
+            return;
+        }
+    }
 }
 
 /// Before `Ready`: say why there is no session (stderr, plus one error frame
@@ -140,6 +226,18 @@ fn submit_blocks(message: &str, content: serde_json::Value) -> Vec<serde_json::V
         }
         _ => Vec::new(),
     }
+}
+
+/// `get_messages` carries the messages as the provider sees them: the
+/// engine's own bookkeeping keys on a message (`_synaps_at`, …) are not
+/// part of the protocol.
+fn strip_internal_keys(mut messages: serde_json::Value) -> serde_json::Value {
+    if let Some(list) = messages.as_array_mut() {
+        for m in list.iter_mut().filter_map(|m| m.as_object_mut()) {
+            m.retain(|k, _| !k.starts_with("_synaps_"));
+        }
+    }
+    messages
 }
 
 // ─── the bridge ──────────────────────────────────────────────────────────────
@@ -209,11 +307,18 @@ enum PendingQuery {
 struct PendingCompact {
     id: String,
     disclosure: Option<serde_json::Value>,
-    started: bool,
+    /// No answer by then: error, and stdin is read again.
+    deadline: Instant,
 }
 
 /// Why the main loop stops.
 enum Exit {
+    /// `shutdown` (after the turn, ≤ 30 s): exit 0.
+    Shutdown,
+    /// stdin closed: the turn is cancelled, what is in flight answered, exit 0.
+    Eof,
+    /// SIGTERM: as EOF, bounded by [`TERM_WAIT`], exit 143.
+    Term,
     /// The daemon connection or the event stream failed: error frame, exit 4.
     Lost(String),
     /// The session ended under us (daemon shutdown, eviction).
@@ -222,7 +327,7 @@ enum Exit {
 
 struct Bridge {
     t: SocketTransport,
-    out: mpsc::Sender<RpcEvent>,
+    out: Out,
     turn: Option<Turn>,
     /// A prompt sent to the actor whose turn has not started. Normally the
     /// next `TurnStarted{User}`; when it crossed an event auto-turn starting
@@ -245,7 +350,7 @@ struct Bridge {
 
 impl Bridge {
     async fn emit(&self, ev: RpcEvent) {
-        let _ = self.out.send(ev).await;
+        self.out.send(&ev).await;
     }
 
     async fn error(&self, id: Option<String>, message: impl Into<String>) {
@@ -393,7 +498,7 @@ impl Bridge {
         } else if let Err(e) = self.send(SessionCommand::Compact { instructions: None }).await {
             self.error(Some(id), e).await;
         } else {
-            self.compact = Some(PendingCompact { id, disclosure: None, started: false });
+            self.compact = Some(PendingCompact { id, disclosure: None, deadline: Instant::now() + COMPACT_START_WAIT });
         }
     }
 
@@ -508,10 +613,12 @@ impl Bridge {
             }
             SessionEventWire::SettingChanged(applied) => {
                 if let Some((id, model)) = self.settings.remove(&applied.id) {
-                    if !applied.ok {
-                        tracing::warn!(model, "rpc: set_model not applied");
+                    if applied.ok {
+                        self.respond(id, "set_model", serde_json::json!({ "model": applied.view.model })).await;
+                    } else {
+                        let why = applied.message.unwrap_or_else(|| format!("model {model} not applied"));
+                        self.error(Some(id), why).await;
                     }
-                    self.respond(id, "set_model", serde_json::json!({ "model": model })).await;
                 }
             }
             SessionEventWire::Cleared { session_id } => {
@@ -521,7 +628,7 @@ impl Bridge {
             }
             SessionEventWire::CompactionStarted { detail, .. } => {
                 if let Some(c) = self.compact.as_mut() {
-                    c.started = true;
+                    c.deadline = Instant::now() + COMPACT_RUN_WAIT;
                     c.disclosure = detail;
                     let (id, body) = (c.id.clone(), c.disclosure.clone().unwrap_or_default());
                     self.respond(id, "compact.disclosure", body).await;
@@ -547,17 +654,9 @@ impl Bridge {
                     self.error(Some(c.id), "compaction cancelled").await;
                 }
             }
-            SessionEventWire::SystemNotice(text) => {
-                // Lost events would mean lost usage (billing): never go on.
-                if text.starts_with("event stream lagged") {
-                    return Err(Exit::Lost(format!("lost session events ({text})")));
-                }
-                // The actor refused the compaction before starting it.
-                if self.compact.as_ref().is_some_and(|c| !c.started) {
-                    if let Some(c) = self.compact.take() {
-                        self.error(Some(c.id), text).await;
-                    }
-                }
+            // Lost events would mean lost usage (billing): never go on.
+            SessionEventWire::SystemNotice(text) if text.starts_with("event stream lagged") => {
+                return Err(Exit::Lost(format!("lost session events ({text})")));
             }
             SessionEventWire::Refused { client, command, reason } if client == self.t.client_id() => {
                 if command == "submit" {
@@ -651,7 +750,8 @@ impl Bridge {
         let messages = || value.get("messages").cloned().unwrap_or_else(|| self.t.messages().len().into());
         match pending {
             PendingQuery::Messages(id) => {
-                self.respond(id, "get_messages", serde_json::json!({ "messages": value })).await;
+                let messages = strip_internal_keys(value);
+                self.respond(id, "get_messages", serde_json::json!({ "messages": messages })).await;
             }
             PendingQuery::State(id) => {
                 let body = serde_json::json!({
@@ -680,19 +780,23 @@ impl Bridge {
         }
     }
 
-    /// The connection was cut (a daemon reload, or the daemon lost):
-    /// whatever was in flight is gone. Close each request out so the parent
-    /// never waits on it; a running turn still gets its `agent_end` with
-    /// the usage seen so far (what Pria meters).
-    async fn cut(&mut self, why: &str) {
+    /// The connection was cut (a daemon reload, or the daemon lost), or the
+    /// session is over: whatever is still in flight is gone. Close each
+    /// request out so the parent never waits on it; a running turn still
+    /// gets its `agent_end` with the usage seen so far (what Pria meters).
+    /// Returns whether anything was answered.
+    async fn cut(&mut self, why: &str) -> bool {
+        let mut answered = false;
         // A prompt cut off before it started never ran.
         if let Some(p) = self.pending.take() {
+            answered = true;
             self.error(Some(p.id), why).await;
             for a in p.aborts {
                 self.respond(a, "abort", serde_json::json!({ "ok": true })).await;
             }
         }
         if let Some(mut turn) = self.turn.take() {
+            answered = true;
             let aborts = std::mem::take(&mut turn.aborts);
             self.error(Some(turn.id.clone()), why).await;
             self.emit(RpcEvent::AgentEnd { usage: turn.usage.clone() }).await;
@@ -703,6 +807,7 @@ impl Bridge {
         }
         let queries: Vec<PendingQuery> = self.queries.drain().map(|(_, q)| q).collect();
         for q in queries {
+            answered = true;
             let id = match q {
                 PendingQuery::Messages(i) | PendingQuery::State(i) | PendingQuery::Stats(i) => Some(i),
                 PendingQuery::Tools(i) => i,
@@ -712,39 +817,158 @@ impl Bridge {
         let settings: Vec<String> = self.settings.drain().map(|(_, (id, _))| id).collect();
         let news: Vec<String> = self.new_sessions.drain(..).collect();
         for id in settings.into_iter().chain(news) {
+            answered = true;
             self.error(Some(id), why).await;
         }
         if let Some(c) = self.compact.take() {
+            answered = true;
             self.error(Some(c.id), why).await;
+        }
+        answered
+    }
+
+    /// The parent is going (EOF, SIGTERM, `shutdown` after its wait): what
+    /// is running counts as cancelled by it, like an `abort`.
+    fn cancelled_by_parent(&mut self) {
+        for t in self.turn.iter_mut().chain(self.pending.iter_mut()) {
+            t.cancel_sent = true;
         }
     }
 
-    /// End the owned session cleanly: `End{ClientQuit}`, then wait for
-    /// `Ended` so an immediate `--continue` of it does not race the dying
-    /// session. `forward` = still write frames for what arrives meanwhile.
-    async fn end_session(&mut self, forward: bool) {
-        if self.t.send(SessionCommand::End { reason: EndReason::ClientQuit }).await.is_err() {
+    /// SIGTERM: cancel the turn and give it `wait` to end (`Aborted`), its
+    /// frames written as they come.
+    async fn cancel_turn(&mut self, wait: Duration) {
+        if self.turn.is_none() && self.pending.is_none() {
             return;
         }
-        let _ = tokio::time::timeout(END_WAIT, async {
-            while let Some(env) = self.t.next_event().await {
-                if matches!(env.event, SessionEventWire::Ended { .. }) {
-                    break;
-                }
-                if forward && self.on_event(env.event).await.is_err() {
-                    break;
+        self.cancelled_by_parent();
+        if self.t.send(SessionCommand::Cancel).await.is_err() {
+            return;
+        }
+        let _ = tokio::time::timeout(wait, async {
+            while self.busy() {
+                match self.t.next_event().await {
+                    Some(env) => {
+                        if self.on_event(env.event).await.is_err() {
+                            break;
+                        }
+                    }
+                    None => break,
                 }
             }
         })
         .await;
     }
+
+    /// End the owned session: `End{ClientQuit}`, then, for up to `wait`,
+    /// keep translating what the actor still answers (it answers in order,
+    /// before `Ended`) so an immediate `--continue` does not race the dying
+    /// session. A turn still running ends as cancelled, with its usage.
+    async fn end_session(&mut self, wait: Duration) {
+        self.cancelled_by_parent();
+        if self.t.send(SessionCommand::End { reason: EndReason::ClientQuit }).await.is_ok() {
+            let _ = tokio::time::timeout(wait, async {
+                while let Some(env) = self.t.next_event().await {
+                    if self.on_event(env.event).await.is_err() {
+                        break;
+                    }
+                }
+            })
+            .await;
+        }
+        if self.turn.is_some() {
+            self.finish(TurnEnd::Aborted).await;
+        }
+    }
 }
 
-/// Drop the frame sender and give the writer a bounded moment to drain.
-async fn drain_writer(out: mpsc::Sender<RpcEvent>, writer: JoinHandle<()>) {
-    drop(out);
-    if tokio::time::timeout(WRITER_DRAIN, writer).await.is_err() {
-        tracing::warn!("rpc: writer did not drain within 1 s; exiting anyway");
+/// The private daemon's run dir, `<run>/rpc/<pid>-<rand>` (0700). This
+/// process holds `rpc.lock` in it for its whole life; a dir whose lock and
+/// daemon locks are all free belongs to nobody and is swept by the next
+/// `synaps rpc`.
+struct PrivateDir {
+    dir: PathBuf,
+    _lock: std::fs::File,
+}
+
+const PRIVATE_LOCK: &str = "rpc.lock";
+/// A dir younger than this with no lock file yet may be mid-creation.
+const PRIVATE_SWEEP_GRACE: Duration = Duration::from_secs(60);
+
+impl PrivateDir {
+    fn create() -> std::io::Result<Self> {
+        use fs4::fs_std::FileExt;
+        let root = synaps_cli::events::registry::registry_dir().join("rpc");
+        private_mkdir(&root, true)?;
+        sweep_private_dirs(&root);
+        let dir = root.join(format!("{}-{:08x}", std::process::id(), rand::random::<u32>()));
+        private_mkdir(&dir, false)?;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.read(true).write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+        let lock = opts.open(dir.join(PRIVATE_LOCK))?;
+        if !FileExt::try_lock_exclusive(&lock)? {
+            return Err(std::io::Error::other("private run dir lock is held"));
+        }
+        Ok(Self { dir, _lock: lock })
+    }
+
+    /// Stop the daemon (its session is over) and remove the dir; what does
+    /// not go within a second is left to the next sweep.
+    async fn remove(self, paths: &registry::DaemonPaths) {
+        if registry::is_alive(paths) {
+            let _ = tokio::time::timeout(Duration::from_secs(1), SocketTransport::shutdown(&paths.sock, false)).await;
+            let t0 = Instant::now();
+            while registry::is_alive(paths) && t0.elapsed() < Duration::from_secs(1) {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            if registry::is_alive(paths) {
+                return;
+            }
+        }
+        if let Err(e) = std::fs::remove_dir_all(&self.dir) {
+            tracing::debug!(dir = %self.dir.display(), error = %e, "rpc: private run dir not removed");
+        }
+    }
+}
+
+fn private_mkdir(dir: &Path, existing_ok: bool) -> std::io::Result<()> {
+    let mut b = std::fs::DirBuilder::new();
+    b.recursive(existing_ok);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut b, 0o700);
+    b.create(dir)
+}
+
+/// Whether someone holds the flock on `path` (a missing file: nobody).
+fn lock_held(path: &Path) -> bool {
+    use fs4::fs_std::FileExt;
+    match std::fs::OpenOptions::new().read(true).write(true).open(path) {
+        Ok(f) => !matches!(FileExt::try_lock_exclusive(&f), Ok(true)),
+        Err(_) => false,
+    }
+}
+
+/// Remove private run dirs left by rpc processes that are gone (SIGKILL)
+/// once their daemon has idled out too.
+fn sweep_private_dirs(root: &Path) {
+    let Ok(entries) = std::fs::read_dir(root) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(meta) = std::fs::symlink_metadata(&path) else { continue };
+        if !meta.is_dir() {
+            continue;
+        }
+        let lock = path.join(PRIVATE_LOCK);
+        if !lock.exists() && meta.modified().ok().and_then(|m| m.elapsed().ok()).is_none_or(|age| age < PRIVATE_SWEEP_GRACE) {
+            continue;
+        }
+        let Ok(files) = std::fs::read_dir(&path) else { continue };
+        let busy = files.flatten().any(|f| f.file_name().to_string_lossy().ends_with(".lock") && lock_held(&f.path()));
+        if !busy {
+            let _ = std::fs::remove_dir_all(&path);
+        }
     }
 }
 
@@ -770,19 +994,37 @@ pub async fn run(
         );
     }
 
-    // 2. The daemon: running, or auto-spawned exactly as `synaps attach`
-    //    does. There is no in-process fallback.
+    // 2. A private daemon, spawned for this process in a run dir of its
+    //    own: never the profile's shared daemon, never adopted by anything
+    //    else. There is no in-process fallback.
     if !daemon::enabled() {
-        refuse(EXIT_REFUSED, format!("{} — synaps rpc runs on the session daemon", daemon::DISABLED_NOTICE));
+        refuse(EXIT_REFUSED, format!("{} — synaps rpc runs on a session daemon", daemon::DISABLED_NOTICE));
     }
-    let opts = daemon::DaemonOpts { profile: active.clone(), ..Default::default() };
+    if !daemon::autospawn_enabled() {
+        refuse(
+            EXIT_REFUSED,
+            "daemon autospawn is disabled (SYNAPS_DAEMON_AUTOSPAWN=0) — synaps rpc runs on a private session daemon it spawns".into(),
+        );
+    }
+    let private = match PrivateDir::create() {
+        Ok(p) => p,
+        Err(e) => refuse(EXIT_REFUSED, format!("daemon unavailable: private run dir: {e}")),
+    };
+    let idle_exit = daemon::autospawn_idle_exit().map_or(PRIVATE_IDLE_EXIT_MAX, |d| d.min(PRIVATE_IDLE_EXIT_MAX));
+    let opts = daemon::DaemonOpts {
+        profile: active.clone(),
+        runtime_dir: Some(private.dir.clone()),
+        private: true,
+        idle_exit: Some(idle_exit),
+        ..Default::default()
+    };
+    let paths = opts.paths();
     match tokio::task::spawn_blocking(move || daemon::ensure_running(&opts)).await {
         Ok(Ok(_)) => {}
-        Ok(Err(EnsureError::AutospawnDisabled)) => refuse(EXIT_REFUSED, super::attach::no_daemon_message(active.as_deref())),
+        Ok(Err(EnsureError::AutospawnDisabled)) => refuse(EXIT_REFUSED, "daemon autospawn is disabled".into()),
         Ok(Err(EnsureError::Spawn(reason))) => refuse(EXIT_REFUSED, format!("daemon unavailable: {reason}")),
         Err(e) => refuse(EXIT_REFUSED, format!("daemon unavailable: {e}")),
     }
-    let paths = registry::daemon_paths(active.as_deref());
 
     // 3. Session config: this process's cwd (and, via Hello, its env).
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
@@ -795,6 +1037,7 @@ pub async fn run(
     };
     if let Err(e) = agent_engine::session::client_args::resolve_client_session_args(&mut config, &cwd) {
         eprintln!("synaps rpc: {e}");
+        private.remove(&paths).await;
         std::process::exit(1);
     }
 
@@ -814,25 +1057,24 @@ pub async fn run(
     let (t, snap) = match SocketTransport::attach(conn, Attach::create_owned(config, AttachMode::Mirror, true)).await {
         Ok(v) => v,
         Err(e @ TransportError::DaemonTooOld { .. }) => refuse(EXIT_REFUSED, e.to_string()),
-        // `--continue` of a session another client has live, or one that
+        // `--continue` of a session another process has live, or one that
         // does not resolve: refused as before (exit 1, no Ready).
         Err(TransportError::Refused(m)) => {
             eprintln!("synaps rpc: cannot continue this session: {m}");
+            private.remove(&paths).await;
             std::process::exit(1);
         }
         Err(e) => refuse(EXIT_REFUSED, format!("session create failed: {e}")),
     };
 
     // 5. Writer, then Ready — the first byte on stdout.
-    let (out, writer_rx) = mpsc::channel::<RpcEvent>(WRITER_CHAN_CAP);
-    let writer = spawn_writer(writer_rx);
-    let _ = out
-        .send(RpcEvent::Ready {
-            session_id: snap.conversation.header.id.clone(),
-            model: snap.view.model.clone(),
-            protocol_version: RPC_PROTOCOL_VERSION,
-        })
-        .await;
+    let (out, writer) = spawn_writer();
+    out.send(&RpcEvent::Ready {
+        session_id: snap.conversation.header.id.clone(),
+        model: snap.view.model.clone(),
+        protocol_version: RPC_PROTOCOL_VERSION,
+    })
+    .await;
     tracing::info!(session = %snap.meta.id, "synaps rpc ready");
 
     let mut b = Bridge {
@@ -851,38 +1093,42 @@ pub async fn run(
     drop(snap);
 
     // 6. Translate. stdin is not read while reconnecting, compacting or
-    //    shutting down: the pipe buffers it.
+    //    shutting down: the pipe buffers it. The daemon socket is always
+    //    read: frames queue for stdout (see `Out`).
+    let mut sigterm = term_signal();
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
-    let mut shutdown: Option<tokio::time::Instant> = None;
+    let mut shutdown: Option<Instant> = None;
+    let far = || Instant::now() + Duration::from_secs(3600);
     let exit = loop {
         if shutdown.is_some() && !b.busy() {
-            break None;
+            break Exit::Shutdown;
         }
-        let deadline = shutdown.unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(3600));
+        let deadline = shutdown.unwrap_or_else(far);
+        let compact_deadline = b.compact.as_ref().map_or_else(far, |c| c.deadline);
         tokio::select! {
             ev = b.t.next_event() => match ev {
                 Some(env) => {
                     if let Err(exit) = b.on_event(env.event).await {
-                        break Some(exit);
+                        break exit;
                     }
                 }
                 None => {
                     if matches!(b.t.last_error(), Some(TransportError::Reloading { .. })) {
                         b.cut("interrupted by a session daemon reload").await;
                         if let Err(e) = b.t.reconnect(AttachMode::Mirror).await {
-                            break Some(Exit::Lost(format!("could not reconnect after a daemon reload: {e}")));
+                            break Exit::Lost(format!("could not reconnect after a daemon reload: {e}"));
                         }
                         continue;
                     }
                     // A lagging owner is cut by the daemon: its events are
                     // gone (billing), so never reconnect.
                     if let Some(TransportError::OwnerLagged { dropped }) = b.t.last_error() {
-                        break Some(Exit::Lost(format!(
+                        break Exit::Lost(format!(
                             "lost {dropped} session events: the daemon disconnected this client for lagging"
-                        )));
+                        ));
                     }
                     let why = b.t.last_error().map(|e| e.to_string()).unwrap_or_else(|| "connection closed".into());
-                    break Some(Exit::Lost(format!("lost the session daemon ({why})")));
+                    break Exit::Lost(format!("lost the session daemon ({why})"));
                 }
             },
             // Not while our `compact` runs: the old loop ran it inline, so
@@ -899,58 +1145,93 @@ pub async fn run(
                             tracing::debug!(?cmd, "received RpcCommand");
                             if b.on_command(cmd).await.is_some() {
                                 tracing::info!("shutdown received; ending the session after the turn");
-                                shutdown = Some(tokio::time::Instant::now() + SHUTDOWN_TURN_WAIT);
+                                shutdown = Some(Instant::now() + SHUTDOWN_TURN_WAIT);
                             }
                         }
                         Err(err_ev) => b.emit(err_ev).await,
                     }
                 }
-                Ok(None) | Err(_) => {
-                    // EOF (or a broken stdin): the parent is done. End the
-                    // session now — an in-flight turn is cancelled.
-                    tracing::info!("stdin closed; ending the session");
-                    b.end_session(false).await;
-                    drain_writer(out, writer).await;
-                    return Ok(());
-                }
+                // EOF (or a broken stdin): the parent is done.
+                Ok(None) | Err(_) => break Exit::Eof,
             },
+            _ = tokio::time::sleep_until(compact_deadline), if b.compact.is_some() => {
+                if let Some(c) = b.compact.take() {
+                    tracing::warn!("rpc: compaction not answered in time; cancelling it");
+                    let _ = b.t.send(SessionCommand::Cancel).await;
+                    b.error(Some(c.id), "compaction timed out").await;
+                }
+            }
+            _ = sigterm.recv() => break Exit::Term,
             _ = tokio::time::sleep_until(deadline), if shutdown.is_some() => {
                 tracing::warn!("shutdown: in-flight turn did not finish within 30 s; ending anyway");
-                break None;
+                break Exit::Shutdown;
             }
         }
     };
 
-    match exit {
-        // `shutdown`: the turn finished (or timed out); end and exit 0.
-        None => {
-            b.end_session(true).await;
-            drain_writer(out, writer).await;
-            std::process::exit(0);
+    let code = match exit {
+        Exit::Shutdown => {
+            b.end_session(END_WAIT).await;
+            b.cut("session ended").await;
+            0
         }
-        Some(Exit::Lost(message)) => {
+        Exit::Eof => {
+            tracing::info!("stdin closed; ending the session");
+            b.end_session(END_WAIT).await;
+            b.cut("session ended: stdin closed").await;
+            0
+        }
+        Exit::Term => {
+            tracing::info!("SIGTERM; cancelling and ending the session");
+            b.cancel_turn(TERM_WAIT).await;
+            b.end_session(TERM_WAIT).await;
+            b.cut("session ended: terminated").await;
+            EXIT_TERM
+        }
+        Exit::Lost(message) => {
             eprintln!("synaps rpc: {message}");
-            if b.busy() {
-                b.cut(&message).await;
-            } else {
+            if !b.cut(&message).await {
                 b.error(None, message).await;
             }
-            drop(b);
-            drain_writer(out, writer).await;
-            std::process::exit(EXIT_DAEMON_LOST);
+            EXIT_DAEMON_LOST
         }
-        Some(Exit::Ended(reason)) => {
+        Exit::Ended(reason) => {
             let message = format!("session ended by the daemon ({reason:?})");
             eprintln!("synaps rpc: {message}");
-            if b.busy() {
-                b.cut(&message).await;
-            } else {
+            if !b.cut(&message).await {
                 b.error(None, message).await;
             }
-            drop(b);
-            drain_writer(out, writer).await;
-            std::process::exit(EXIT_DAEMON_LOST);
+            EXIT_DAEMON_LOST
         }
+    };
+    drop(b);
+    drain_writer(out, writer).await;
+    private.remove(&paths).await;
+    std::process::exit(code);
+}
+
+/// SIGTERM as a stream (never fires where there is no such signal).
+struct TermSignal(#[cfg(unix)] Option<tokio::signal::unix::Signal>);
+
+impl TermSignal {
+    async fn recv(&mut self) {
+        #[cfg(unix)]
+        if let Some(s) = self.0.as_mut() {
+            s.recv().await;
+            return;
+        }
+        std::future::pending::<()>().await
+    }
+}
+
+fn term_signal() -> TermSignal {
+    #[cfg(unix)]
+    {
+        TermSignal(tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok())
+    }
+    #[cfg(not(unix))]
+    {
+        TermSignal()
     }
 }
 

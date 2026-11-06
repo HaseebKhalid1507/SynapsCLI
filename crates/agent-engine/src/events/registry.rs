@@ -1217,9 +1217,18 @@ pub struct DaemonPaths {
     pub pid: PathBuf,
 }
 
-/// Daemon file paths for a profile, under `registry_dir()`.
+/// Where a daemon keeps its files instead of `registry_dir()`: set on a
+/// private daemon (`synaps rpc` spawns one per process), so the daemon and
+/// the CLI aimed at it agree. Session sockets stay in `registry_dir()`.
+pub const DAEMON_DIR_ENV: &str = "SYNAPS_DAEMON_DIR";
+
+/// Daemon file paths for a profile, under `$SYNAPS_DAEMON_DIR` when set,
+/// else `registry_dir()`.
 pub fn daemon_paths(profile: Option<&str>) -> DaemonPaths {
-    daemon_paths_in(&registry_dir(), profile)
+    match std::env::var_os(DAEMON_DIR_ENV).filter(|d| !d.is_empty()) {
+        Some(dir) => daemon_paths_in(std::path::Path::new(&dir), profile),
+        None => daemon_paths_in(&registry_dir(), profile),
+    }
 }
 
 /// Same, rooted at an explicit dir (tests; `--socket` overrides only `.sock`).

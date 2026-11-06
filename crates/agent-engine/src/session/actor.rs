@@ -5398,9 +5398,28 @@ impl SessionActor {
             }
             SessionCommand::Answer { prompt_id, value } => self.answer(from, prompt_id, value),
             SessionCommand::Set { id, setting } => self.apply_setting(id, setting).await,
-            // `CompactionStarted` is the contract; no notice before it.
+            // `CompactionStarted` is the contract; no notice before it. An
+            // rpc client's compaction that cannot start is refused to it
+            // (it waits for exactly one answer); others get the notice.
             SessionCommand::Compact { instructions } => {
-                self.compact(instructions, "manual").await;
+                let busy = if self.compact.is_some() {
+                    Some("compaction already in progress")
+                } else if self.streaming {
+                    Some("cannot compact while a turn is running")
+                } else {
+                    None
+                };
+                let rpc = from.filter(|c| self.attached.get(c).is_some_and(|a| a.meta.kind == ClientKind::Rpc));
+                match (busy, rpc) {
+                    (Some(reason), Some(client)) if !Self::compact_inline_env() => {
+                        self.emit(SessionEventWire::Refused {
+                            client,
+                            command: "compact".into(),
+                            reason: reason.into(),
+                        });
+                    }
+                    _ => self.compact(instructions, "manual").await,
+                }
             }
             SessionCommand::NewSession => {
                 if self.driver.is_some() {

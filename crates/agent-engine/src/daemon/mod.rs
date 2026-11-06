@@ -172,8 +172,13 @@ pub struct DaemonOpts {
     /// per-session MCP leases). Still forwarded so an older client can spawn
     /// a newer daemon.
     pub allow_legacy_mcp: bool,
-    /// Test seam: `registry_dir()` replacement.
+    /// `registry_dir()` replacement for the daemon's own files (a spawned
+    /// daemon gets it as `SYNAPS_DAEMON_DIR`).
     pub runtime_dir: Option<PathBuf>,
+    /// A private daemon (`synaps rpc`): spawned without pin restore (pins
+    /// belong to the profile daemon) and without a process scope, so it
+    /// stays in its spawner's cgroup like the in-process engine did.
+    pub private: bool,
     /// Test seam / A1 hook: how `Attach::Create` builds a session.
     pub factory: Option<SessionFactory>,
 }
@@ -666,6 +671,17 @@ fn daemon_launch(
     }
 }
 
+/// What a spawned daemon must know beyond argv: its files dir, and for a
+/// private daemon, no pin restore.
+fn spawn_env(opts: &DaemonOpts, env: &mut Vec<(std::ffi::OsString, std::ffi::OsString)>) {
+    if let Some(dir) = &opts.runtime_dir {
+        crate::process_scope::set_env(env, registry::DAEMON_DIR_ENV, dir.clone().into_os_string());
+    }
+    if opts.private {
+        crate::process_scope::set_env(env, pins::RESTORE_ENV, "0");
+    }
+}
+
 /// Parent side: `current_exe daemon --foreground …` in its own session
 /// (`setsid`), stdout → null, stderr → pipe; waits ≤ [`SPAWN_READY_TIMEOUT`]
 /// (15 s: the daemon's ≤ 10 s extension wait plus margin) for `R` on the
@@ -696,7 +712,12 @@ pub fn spawn_detached(opts: &DaemonOpts) -> anyhow::Result<u32> {
     let mut effective_env = crate::process_scope::inherited_env();
     crate::process_scope::set_env(&mut effective_env, "SYNAPS_DAEMON", "1");
     effective_env.retain(|(k, _)| k != READY_FD_ENV);
-    let (program, cmd_args) = daemon_launch(&effective_env, exe, cmd_args);
+    spawn_env(opts, &mut effective_env);
+    let (program, cmd_args) = if opts.private {
+        (exe.into_os_string(), cmd_args)
+    } else {
+        daemon_launch(&effective_env, exe, cmd_args)
+    };
     let mut fds = [0i32; 2];
     // SAFETY: plain pipe(2) on a valid 2-slot array.
     if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
@@ -837,6 +858,7 @@ pub fn spawn_detached(opts: &DaemonOpts) -> anyhow::Result<u32> {
     let mut effective_env = crate::process_scope::inherited_env();
     crate::process_scope::set_env(&mut effective_env, "SYNAPS_DAEMON", "1");
     effective_env.retain(|(k, _)| k != READY_FD_ENV && k != READY_EVENT_ENV);
+    spawn_env(opts, &mut effective_env);
     let ready = win::Event::create_unique("ready")?;
     crate::process_scope::set_env(&mut effective_env, READY_EVENT_ENV, ready.name());
     let mut child = win::spawn_detached(&exe, &cmd_args, &effective_env)?;

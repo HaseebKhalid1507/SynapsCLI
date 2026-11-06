@@ -1051,9 +1051,13 @@ impl From<StreamEvent> for WireStreamEvent {
                 SessionEvent::Error(TurnError { message, outcome }) => WireSessionStreamEvent::Error { message, outcome },
                 SessionEvent::Notice(text) => WireSessionStreamEvent::Notice { text, retry: false },
                 SessionEvent::Retry(text) => WireSessionStreamEvent::Notice { text, retry: true },
-                // merge(112): ContextHeadCheckpoint is actor-internal (Wall 1); never crosses the wire.
-                // Drop it silently — the actor handles persistence before forwarding.
-                SessionEvent::ContextHeadCheckpoint { .. } => WireSessionStreamEvent::Done,
+                // merge(112): ContextHeadCheckpoint is actor-internal (Wall 1); never crosses the wire:
+                // the actor does not emit it and `daemon/conn.rs::forwarded` skips it. Should one
+                // ever get here it must not read as `Done` (that ends a socket client's turn).
+                SessionEvent::ContextHeadCheckpoint { .. } => {
+                    tracing::error!("BUG: a context-head checkpoint reached the session wire");
+                    WireSessionStreamEvent::Notice { text: "internal checkpoint (ignored)".into(), retry: false }
+                }
             }),
             StreamEvent::Agent(a) => Self::Agent(match a {
                 AgentEvent::SubagentStart { subagent_id, agent_name, task_preview } => {

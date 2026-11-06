@@ -11,7 +11,7 @@ use std::path::Path;
 use fs4::fs_std::FileExt;
 use serde::{Deserialize, Serialize};
 
-pub use crate::events::registry::{daemon_paths, daemon_paths_in, DaemonPaths};
+pub use crate::events::registry::{daemon_paths, daemon_paths_in, DaemonPaths, DAEMON_DIR_ENV};
 
 /// `daemon.json` — pid + profile + paths only. Never credentials.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

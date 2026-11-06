@@ -202,11 +202,17 @@ abort by killing their `synaps` child (Pria's guest agent, Harbor and
 synaps-bench timeouts) need the in-process semantics back. An **owned**
 session gives them: it is bound to the connection that created it.
 
-`synaps rpc` is built on it: every rpc process creates an owned session with
-`forward_secrets` on, in its profile's daemon (auto-spawned like `synaps
-attach`; no daemon → exit 3, no in-process fallback). Its stdin/stdout
-protocol is unchanged ([rpc-protocol.md](rpc-protocol.md)); in `synaps daemon
-sessions` it shows as an `rpc` client.
+`synaps rpc` is built on it: every rpc process spawns a **private** daemon in
+a run dir of its own (`<run>/rpc/<pid>-<random>`, 0700; `SYNAPS_DAEMON_DIR`
+points a `synaps daemon …` command at it) and creates an owned session there
+with `forward_secrets` on. The private daemon has the rpc process's env,
+config, mount namespace and cgroup (the old per-process isolation), skips
+pin restore and process scopes, never serves anyone else, and exits ≤ 10 s
+after its session ends; a run dir whose rpc and daemon locks are both free
+is swept by the next `synaps rpc`. No daemon → exit 3, no in-process
+fallback. Its stdin/stdout protocol is unchanged
+([rpc-protocol.md](rpc-protocol.md)). A shared, env-keyed rpc daemon is a
+possible follow-up.
 
 - **Opt-in at create**: `Attach::Create{config, mode, owned: {forward_secrets?}}`.
   Old clients never send `owned`, so they get today's session, byte for byte.

@@ -15,8 +15,7 @@
 //!   `auto:<id>` correlation ids) → `<EVT0>`…;
 //! - the temp HOME path → `<HOME>`;
 //! - timestamps: values of keys `timestamp`, `ts`, `created_at`,
-//!   `updated_at` → `<TS>`; a history message's `_synaps_at` time stamp is
-//!   dropped (which messages carry one is bookkeeping, not protocol);
+//!   `updated_at` → `<TS>`;
 //! - the per-turn `outcome.correlation_id` (a minted id) → `<CORR>`;
 //! - durations: `duration_secs` → `0`.
 //!
@@ -24,7 +23,9 @@
 //! - `get_session_stats.cost`: the in-process loop never accumulated cost
 //!   (it reported 0.0, or the cost a `--continue`d session was saved with);
 //!   the session actor reports the real session cost from the pricing
-//!   table. Compared as "a number ≥ 0" (`<COST>`). Token counts, which
+//!   table. The fixture's value is replaced by the exact price of the
+//!   stub's tokens ([`priced_cost`], computed by hand from the published
+//!   per-token prices), which the frame must carry. Token counts, which
 //!   billing reads, are compared exactly.
 //!
 //! Build note: the fixtures are from the default build. Without
@@ -43,6 +44,8 @@ mod phase2;
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::{http::StatusCode, response::IntoResponse, Router};
@@ -147,12 +150,16 @@ fn bin() -> &'static str {
 struct Env {
     home: tempfile::TempDir,
     url: String,
+    /// Provider requests the stub has answered (`Env::new` only).
+    hits: Arc<AtomicUsize>,
 }
 
 impl Env {
     async fn new(script: Script) -> Self {
-        let (url, _hits, _bodies) = spawn_stub(script).await;
-        Self::with_url(url)
+        let (url, hits, _bodies) = spawn_stub(script).await;
+        let mut env = Self::with_url(url);
+        env.hits = hits;
+        env
     }
 
     fn with_url(url: String) -> Self {
@@ -163,7 +170,7 @@ impl Env {
         std::fs::write(base.join("auth.json"), phase2::synthetic_auth_json()).unwrap();
         std::fs::create_dir_all(home.path().join("run")).unwrap();
         std::fs::create_dir_all(home.path().join("work")).unwrap();
-        Self { home, url }
+        Self { home, url, hits: Arc::default() }
     }
 
     fn base(&self) -> PathBuf {
@@ -172,6 +179,46 @@ impl Env {
 
     fn run_dir(&self) -> PathBuf {
         self.home.path().join("run")
+    }
+
+    /// The private daemon run dirs `synaps rpc` processes made
+    /// (`<run>/rpc/<pid>-<rand>`).
+    fn private_dirs(&self) -> Vec<PathBuf> {
+        let Ok(rd) = std::fs::read_dir(self.run_dir().join("rpc")) else { return Vec::new() };
+        let mut dirs: Vec<PathBuf> = rd.flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect();
+        dirs.sort();
+        dirs
+    }
+
+    /// A private daemon's files.
+    fn private_paths(dir: &Path) -> agent_engine::daemon::registry::DaemonPaths {
+        agent_engine::daemon::registry::daemon_paths_in(dir, None)
+    }
+
+    /// The one private dir with a live daemon.
+    fn live_private_dir(&self) -> PathBuf {
+        let live: Vec<PathBuf> = self
+            .private_dirs()
+            .into_iter()
+            .filter(|d| agent_engine::daemon::registry::is_alive(&Self::private_paths(d)))
+            .collect();
+        assert_eq!(live.len(), 1, "one live private daemon: {live:?}");
+        live[0].clone()
+    }
+
+    /// A `synaps` command aimed at the private daemon in `dir`.
+    fn private_cmd(&self, dir: &Path, args: &[&str]) -> Command {
+        let mut c = self.cmd(args);
+        c.env("SYNAPS_DAEMON_DIR", dir);
+        c
+    }
+
+    /// The profile's shared daemon: `synaps rpc` must never create it.
+    fn assert_no_profile_daemon(&self) {
+        let paths = agent_engine::daemon::registry::daemon_paths_in(&self.run_dir(), None);
+        for f in [&paths.sock, &paths.lock, &paths.json] {
+            assert!(!f.exists(), "the profile daemon was touched: {}", f.display());
+        }
     }
 
     fn cmd(&self, args: &[&str]) -> Command {
@@ -229,18 +276,23 @@ impl Env {
 
 impl Drop for Env {
     fn drop(&mut self) {
-        let paths = agent_engine::daemon::registry::daemon_paths_in(&self.run_dir(), None);
-        if agent_engine::daemon::registry::is_alive(&paths) {
-            let _ = std::process::Command::new(bin())
-                .args(["daemon", "stop", "--force"])
-                .env_clear()
-                .env("PATH", std::env::var_os("PATH").unwrap_or_default())
-                .env("HOME", self.home.path())
-                .env("SYNAPS_BASE_DIR", self.base())
-                .env("SYNAPS_RUNTIME_DIR", self.run_dir())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
+        let mut dirs = self.private_dirs();
+        dirs.push(self.run_dir());
+        for dir in dirs {
+            let paths = agent_engine::daemon::registry::daemon_paths_in(&dir, None);
+            if agent_engine::daemon::registry::is_alive(&paths) {
+                let _ = std::process::Command::new(bin())
+                    .args(["daemon", "stop", "--force"])
+                    .env_clear()
+                    .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+                    .env("HOME", self.home.path())
+                    .env("SYNAPS_BASE_DIR", self.base())
+                    .env("SYNAPS_RUNTIME_DIR", self.run_dir())
+                    .env("SYNAPS_DAEMON_DIR", &dir)
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+            }
         }
     }
 }
@@ -382,9 +434,6 @@ impl Norm {
             Value::Array(a) => Value::Array(a.iter().map(|x| self.value(x)).collect()),
             Value::Object(m) => Value::Object(
                 m.iter()
-                    // A message's time stamp (`_synaps_at`) is dropped, not
-                    // replaced: which messages carry one is bookkeeping.
-                    .filter(|(k, _)| k.as_str() != "_synaps_at")
                     .map(|(k, x)| {
                         let x = match k.as_str() {
                             "timestamp" | "ts" | "created_at" | "updated_at" if !x.is_null() => json!("<TS>"),
@@ -419,8 +468,8 @@ fn check(name: &str, env: &Env, frames: &[Value]) {
         return;
     }
     let want = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-    let want: Vec<String> = want.lines().map(intentional).collect();
-    let got: Vec<String> = got.iter().map(|g| intentional(g)).collect();
+    let want: Vec<String> = want.lines().map(|w| intentional(name, w, false)).collect();
+    let got: Vec<String> = got.iter().map(|g| intentional(name, g, true)).collect();
     if want != got {
         let mut report = String::new();
         for i in 0..want.len().max(got.len()) {
@@ -433,13 +482,35 @@ fn check(name: &str, env: &Env, frames: &[Value]) {
     }
 }
 
+/// The session cost a scenario's `get_session_stats` (by id) must report:
+/// the stub's tokens at the published prices ($/MTok — Sonnet 4.5: 3 in,
+/// 15 out; Opus 4.5: 5 in, 25 out; cache read 0.1×, cache write 1.25× (5m)
+/// / 2× (1h) the input price).
+fn priced_cost(scenario: &str, id: &str) -> f64 {
+    const M: f64 = 1e-6;
+    match (scenario, id) {
+        // SSE_USAGE_CACHE: 12 in, 9 out, 40 cache read, 20 (5m) + 10 (1h) written.
+        ("usage_cache_and_stats", "s1") => 12.0 * 3.0 * M + 9.0 * 15.0 * M + 40.0 * 0.3 * M + 20.0 * 3.75 * M + 10.0 * 6.0 * M,
+        // ANTHROPIC_SSE: 10 in, 1 out, on Sonnet 4.5 …
+        ("continue_resume", "s1") => 10.0 * 3.0 * M + 15.0 * M,
+        // … and after `set_model claude-opus-4-5`, priced as Opus 4.5.
+        ("set_model", "st") => 10.0 * 5.0 * M + 25.0 * M,
+        // Nothing ran in that session.
+        ("queries_fresh", "s1") | ("new_session", "s1") => 0.0,
+        other => panic!("no priced cost for {other:?}"),
+    }
+}
+
 /// The documented intentional differences (module docs), applied to a
-/// normalised frame line on both sides.
-fn intentional(line: &str) -> String {
+/// normalised frame line on both sides (`got`: this build's frame).
+fn intentional(scenario: &str, line: &str, got: bool) -> String {
     let mut v: Value = serde_json::from_str(line).unwrap_or_else(|e| panic!("bad frame {line:?}: {e}"));
     if v["type"] == "response" && v["command"] == "get_session_stats" {
         let cost = v["cost"].as_f64().unwrap_or_else(|| panic!("get_session_stats.cost is not a number: {line}"));
-        assert!(cost >= 0.0, "negative cost: {line}");
+        if got {
+            let want = priced_cost(scenario, v["id"].as_str().unwrap_or_default());
+            assert!((cost - want).abs() < 1e-12, "{scenario}: cost {cost} != priced {want}: {line}");
+        }
         v["cost"] = json!("<COST>");
     }
     // Build note (module docs): no command tools without `command-exec`.
@@ -711,13 +782,14 @@ async fn kill_mid_turn_ends_owned_session() {
     let sid = rpc.ready().await;
     rpc.send(json!({"type": "prompt", "id": "p1", "message": "go"})).await;
     rpc.until("text", |v| v["event"]["type"] == "text_delta").await;
+    let dir = env.live_private_dir();
     rpc.child.start_kill().unwrap();
     rpc.child.wait().await.unwrap();
 
-    // Gone from the daemon (or the daemon idled out with nothing left).
+    // Gone from its private daemon, which then idles out (≤ 2 s here).
     let deadline = tokio::time::Instant::now() + WAIT;
     loop {
-        let out = env.cmd(&["daemon", "sessions", "--json"]).stdin(Stdio::null()).output().await.unwrap();
+        let out = env.private_cmd(&dir, &["daemon", "sessions", "--json"]).stdin(Stdio::null()).output().await.unwrap();
         let listed = String::from_utf8_lossy(&out.stdout).into_owned();
         if !out.status.success() || !listed.contains(&sid) {
             break;
@@ -725,14 +797,21 @@ async fn kill_mid_turn_ends_owned_session() {
         assert!(tokio::time::Instant::now() < deadline, "session {sid} outlived its owner: {listed}");
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+    while agent_engine::daemon::registry::is_alive(&Env::private_paths(&dir)) {
+        assert!(tokio::time::Instant::now() < deadline, "the private daemon outlived its idle exit");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 
-    // Free to continue, with the prompt that was cut kept in the history.
+    // Free to continue, with the prompt that was cut kept in the history;
+    // the dead process' run dir is swept on the way.
     let mut again = env.rpc(&["--continue", &sid]).await;
     assert_eq!(again.ready().await, sid);
+    assert!(!dir.exists(), "stale private run dir not swept: {}", dir.display());
     again.send(json!({"type": "get_messages", "id": "m1"})).await;
     let m = again.response("m1").await;
     assert_eq!(m["messages"][0]["content"], "go", "{m}");
     again.shutdown().await;
+    env.assert_no_profile_daemon();
 }
 
 /// No daemon, no rpc: `SYNAPS_DAEMON=0`, or autospawn off with nothing
@@ -793,7 +872,8 @@ async fn reload_mid_turn_rebinds() {
     rpc.send(json!({"type": "prompt", "id": "p1", "message": "go"})).await;
     rpc.until("text", |v| v["event"]["type"] == "text_delta").await;
 
-    let out = env.cmd(&["daemon", "reload", "--now"]).stdin(Stdio::null()).output().await.unwrap();
+    let dir = env.live_private_dir();
+    let out = env.private_cmd(&dir, &["daemon", "reload", "--now"]).stdin(Stdio::null()).output().await.unwrap();
     assert!(out.status.success(), "reload: {}", String::from_utf8_lossy(&out.stderr));
 
     let r = rpc.response("p1").await;
@@ -808,4 +888,327 @@ async fn reload_mid_turn_rebinds() {
     assert_eq!(g["session_id"], sid.as_str(), "{g}");
     let frames = rpc.shutdown().await;
     assert_eq!(frames.last().unwrap()["_exit"], 0, "{frames:#?}");
+    // Its run dir goes with it.
+    assert!(!dir.exists(), "private run dir left behind: {}", dir.display());
+}
+
+/// Each `synaps rpc` gets its own private daemon (the old per-process
+/// isolation): two at once → two daemons in two run dirs, and neither
+/// creates or connects to the profile's shared daemon.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn private_daemon_per_process() {
+    let env = Env::new(Script::Sse(ANTHROPIC_SSE)).await;
+    let mut a = env.rpc(&[]).await;
+    let mut b = env.rpc(&[]).await;
+    let (sa, sb) = (a.ready().await, b.ready().await);
+    assert_ne!(sa, sb);
+    let dirs = env.private_dirs();
+    assert_eq!(dirs.len(), 2, "{dirs:?}");
+    let pids: Vec<u32> = dirs
+        .iter()
+        .map(|d| {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = std::fs::metadata(d).unwrap().permissions().mode() & 0o777;
+                assert_eq!(mode, 0o700, "{}", d.display());
+            }
+            agent_engine::daemon::registry::read_daemon_json(&Env::private_paths(d)).expect("daemon.json").pid
+        })
+        .collect();
+    assert_ne!(pids[0], pids[1]);
+    for (rpc, sid) in [(&mut a, &sa), (&mut b, &sb)] {
+        let r = rpc.turn("p1", "hi").await;
+        assert_eq!(r["ok"], true, "{r}");
+        rpc.send(json!({"type": "get_state", "id": "g"})).await;
+        assert_eq!(rpc.response("g").await["session_id"], sid.as_str());
+    }
+    env.assert_no_profile_daemon();
+    a.shutdown().await;
+    b.shutdown().await;
+    assert!(env.private_dirs().is_empty(), "{:?}", env.private_dirs());
+    env.assert_no_profile_daemon();
+}
+
+/// A parent that stops reading stdout for a while (Pria POSTs every frame
+/// in turn) loses nothing: the daemon's events are read eagerly and queue
+/// for stdout, the owner never lags, every frame arrives in order.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn slow_consumer_loses_nothing() {
+    const N: usize = 3000;
+    let mut body = String::from(concat!(
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_flood\",\"type\":\"message\",",
+        "\"role\":\"assistant\",\"content\":[],\"model\":\"claude-sonnet-4-5\",\"stop_reason\":null,",
+        "\"stop_sequence\":null,\"usage\":{\"input_tokens\":10,\"output_tokens\":0,",
+        "\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0}}}\n\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+    ));
+    for i in 0..N {
+        body.push_str(&format!(
+            "data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"<{i:04}> padding padding padding padding padding\"}}}}\n\n"
+        ));
+    }
+    body.push_str(concat!(
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},",
+        "\"usage\":{\"output_tokens\":3000}}\n\n",
+        "data: {\"type\":\"message_stop\"}\n\n",
+    ));
+    let env = Env::new(Script::Sse(Box::leak(body.into_boxed_str()))).await;
+
+    let mut child = env
+        .cmd(&["rpc", "-m", MODEL])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+    let ready: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+    assert_eq!(ready["type"], "ready");
+    stdin.write_all(b"{\"type\":\"prompt\",\"id\":\"p1\",\"message\":\"flood\"}\n").await.unwrap();
+    stdin.flush().await.unwrap();
+    // Not reading: the pipe (64 KiB) fills within the first few hundred
+    // deltas; the whole stream (~250 KiB of frames) lands meanwhile.
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    assert!(child.try_wait().unwrap().is_none(), "rpc exited while its stdout was not read");
+
+    let mut frames = Vec::new();
+    loop {
+        let line = tokio::time::timeout(WAIT, lines.next_line()).await.expect("frames").unwrap().expect("stdout open");
+        let v: Value = serde_json::from_str(&line).unwrap();
+        let done = v["type"] == "response" && v["id"] == "p1";
+        frames.push(v);
+        if done {
+            break;
+        }
+    }
+    // The engine may coalesce adjacent deltas that arrive together (as it
+    // always did); the text itself must be complete and in order.
+    let text: String = frames
+        .iter()
+        .filter(|f| f["type"] == "message_update" && f["event"]["type"] == "text_delta")
+        .map(|f| f["event"]["delta"].as_str().unwrap())
+        .collect();
+    let want: String = (0..N).map(|i| format!("<{i:04}> padding padding padding padding padding")).collect();
+    assert!(text == want, "text lost or reordered: {} of {} bytes", text.len(), want.len());
+    assert!(!frames.iter().any(|f| f["type"] == "error"), "{:?}", frames.iter().find(|f| f["type"] == "error"));
+    let end = frames.iter().rev().find(|f| f["type"] == "agent_end").expect("agent_end");
+    assert_eq!(end["usage"]["output_tokens"], 3000, "{end}");
+    assert_eq!(frames.last().unwrap()["ok"], true, "{:?}", frames.last());
+    stdin.write_all(b"{\"type\":\"shutdown\"}\n").await.unwrap();
+    drop(stdin);
+    while let Ok(Some(_)) = lines.next_line().await {}
+    assert_eq!(tokio::time::timeout(WAIT, child.wait()).await.unwrap().unwrap().code(), Some(0));
+}
+
+/// stdin EOF mid-turn: the turn is cancelled and still closed out — its
+/// `agent_end` (with the usage seen so far) and `response` — then exit 0.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn eof_mid_turn_closes_the_turn() {
+    let env = Env::new(Script::Endless(ANTHROPIC_SSE_PREFIX)).await;
+    let mut rpc = env.rpc(&[]).await;
+    rpc.ready().await;
+    rpc.send(json!({"type": "prompt", "id": "p1", "message": "go"})).await;
+    rpc.until("text", |v| v["event"]["type"] == "text_delta").await;
+    let frames = rpc.eof().await;
+    let n = frames.len();
+    assert_eq!(frames[n - 1]["_exit"], 0, "{frames:#?}");
+    assert_eq!(frames[n - 2]["type"], "response", "{frames:#?}");
+    assert_eq!(frames[n - 2]["id"], "p1", "{frames:#?}");
+    assert_eq!(frames[n - 2]["cancelled"], true, "{frames:#?}");
+    assert_eq!(frames[n - 3]["type"], "agent_end", "{frames:#?}");
+    assert_eq!(frames[n - 3]["usage"]["input_tokens"], 10, "{frames:#?}");
+}
+
+/// stdin EOF right after a query: the query is still answered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn eof_answers_a_pending_query() {
+    let env = Env::new(Script::Sse(ANTHROPIC_SSE)).await;
+    let mut rpc = env.rpc(&[]).await;
+    rpc.ready().await;
+    rpc.turn("p1", "hello").await;
+    rpc.send(json!({"type": "get_messages", "id": "m1"})).await;
+    rpc.send(json!({"type": "get_session_stats", "id": "s1"})).await;
+    let frames = rpc.eof().await;
+    let m = frames.iter().find(|f| f["id"] == "m1").expect("get_messages answered");
+    assert_eq!(m["type"], "response", "{m}");
+    assert_eq!(m["messages"].as_array().map(Vec::len), Some(2), "{m}");
+    let st = frames.iter().find(|f| f["id"] == "s1").expect("get_session_stats answered");
+    assert_eq!(st["input_tokens"], 10, "{st}");
+    assert_eq!(frames.last().unwrap()["_exit"], 0, "{frames:#?}");
+}
+
+/// SIGTERM mid-turn (Pria's `close()`): the turn is cancelled, its
+/// `agent_end` (usage so far) and `response` written, then exit 143.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sigterm_mid_turn_writes_agent_end() {
+    let env = Env::new(Script::Endless(ANTHROPIC_SSE_PREFIX)).await;
+    let mut rpc = env.rpc(&[]).await;
+    rpc.ready().await;
+    rpc.send(json!({"type": "prompt", "id": "p1", "message": "go"})).await;
+    rpc.until("text", |v| v["event"]["type"] == "text_delta").await;
+    let dir = env.live_private_dir();
+    let t0 = std::time::Instant::now();
+    let pid = rpc.child.id().unwrap() as i32;
+    assert!(std::process::Command::new("kill").args(["-TERM", &pid.to_string()]).status().unwrap().success());
+    let frames = rpc.finish().await;
+    assert!(t0.elapsed() < Duration::from_secs(5), "SIGTERM took {:?} (Pria's grace is 5 s)", t0.elapsed());
+    let n = frames.len();
+    assert_eq!(frames[n - 1]["_exit"], 143, "{frames:#?}");
+    assert_eq!(frames[n - 2]["id"], "p1", "{frames:#?}");
+    assert_eq!(frames[n - 2]["cancelled"], true, "{frames:#?}");
+    assert_eq!(frames[n - 3]["type"], "agent_end", "{frames:#?}");
+    assert_eq!(frames[n - 3]["usage"]["input_tokens"], 10, "{frames:#?}");
+    assert!(!dir.exists(), "private run dir left behind: {}", dir.display());
+}
+
+/// Two tool calls in one assistant message (read-only: they run in
+/// parallel): both start/result pairs, then the continuation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn parallel_tool_calls() {
+    const SSE_TWO_READS: &str = concat!(
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_p1\",\"type\":\"message\",",
+        "\"role\":\"assistant\",\"content\":[],\"model\":\"claude-sonnet-4-5\",\"stop_reason\":null,",
+        "\"stop_sequence\":null,\"usage\":{\"input_tokens\":20,\"output_tokens\":0,",
+        "\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0}}}\n\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,",
+        "\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_a\",\"name\":\"read\",\"input\":{}}}\n\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,",
+        "\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\": \\\"a.txt\\\"}\"}}\n\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        "data: {\"type\":\"content_block_start\",\"index\":1,",
+        "\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_b\",\"name\":\"read\",\"input\":{}}}\n\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":1,",
+        "\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\": \\\"b.txt\\\"}\"}}\n\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\",",
+        "\"stop_sequence\":null},\"usage\":{\"output_tokens\":9}}\n\n",
+        "data: {\"type\":\"message_stop\"}\n\n",
+    );
+    static BODIES: [&str; 2] = [SSE_TWO_READS, ANTHROPIC_SSE];
+    let env = Env::new(Script::SeqSse(&BODIES)).await;
+    std::fs::write(env.home.path().join("work/a.txt"), "alpha-content\n").unwrap();
+    std::fs::write(env.home.path().join("work/b.txt"), "bravo-content\n").unwrap();
+    let mut rpc = env.rpc(&[]).await;
+    rpc.ready().await;
+    let r = rpc.turn("p1", "read both").await;
+    assert_eq!(r["ok"], true, "{r}");
+    let ev = |t: &str| -> Vec<Value> {
+        rpc.frames.iter().filter(|f| f["event"]["type"] == t).map(|f| f["event"].clone()).collect()
+    };
+    let starts = ev("toolcall_start");
+    assert_eq!(starts.len(), 2, "{:#?}", rpc.frames);
+    let results = ev("toolcall_result");
+    assert_eq!(results.len(), 2, "{:#?}", rpc.frames);
+    for (id, want) in [("toolu_a", "alpha-content"), ("toolu_b", "bravo-content")] {
+        let res = results.iter().find(|r| r["tool_id"] == id).unwrap_or_else(|| panic!("{id}: {results:#?}"));
+        assert!(res.to_string().contains(want), "{res}");
+    }
+    let end = rpc.frames.iter().find(|f| f["type"] == "agent_end").expect("agent_end");
+    assert_eq!(end["usage"]["input_tokens"], 30, "{end}");
+    assert_eq!(env.hits.load(Ordering::SeqCst), 2);
+    rpc.shutdown().await;
+}
+
+/// The `subagent` tool end to end (the Slack bridge renders these): a
+/// `subagent_start`, the child's run, a `subagent_done`, then the parent's
+/// continuation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn subagent_frames() {
+    const SSE_SUBAGENT: &str = concat!(
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_s1\",\"type\":\"message\",",
+        "\"role\":\"assistant\",\"content\":[],\"model\":\"claude-sonnet-4-5\",\"stop_reason\":null,",
+        "\"stop_sequence\":null,\"usage\":{\"input_tokens\":20,\"output_tokens\":0,",
+        "\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0}}}\n\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,",
+        "\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_sub\",\"name\":\"subagent\",\"input\":{}}}\n\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,",
+        "\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"task\\\": \\\"say hi\\\", \\\"name\\\": \\\"helper\\\", \\\"system_prompt\\\": \\\"You help.\\\"}\"}}\n\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\",",
+        "\"stop_sequence\":null},\"usage\":{\"output_tokens\":9}}\n\n",
+        "data: {\"type\":\"message_stop\"}\n\n",
+    );
+    // Parent tool call, the child's answer, the parent's continuation.
+    static BODIES: [&str; 3] = [SSE_SUBAGENT, ANTHROPIC_SSE, ANTHROPIC_SSE];
+    let env = Env::new(Script::SeqSse(&BODIES)).await;
+    let mut rpc = env.rpc(&[]).await;
+    rpc.ready().await;
+    let r = rpc.turn("p1", "delegate").await;
+    assert_eq!(r["ok"], true, "{r} {:#?}", rpc.frames);
+    let pos = |t: &str| rpc.frames.iter().position(|f| f["type"] == t).unwrap_or_else(|| panic!("no {t}: {:#?}", rpc.frames));
+    let (start, done, end) = (pos("subagent_start"), pos("subagent_done"), pos("agent_end"));
+    assert!(start < done && done < end, "{:#?}", rpc.frames);
+    let s = &rpc.frames[start];
+    assert!(s["subagent_id"].is_u64(), "{s}");
+    assert!(s["task_preview"].as_str().unwrap().contains("say hi"), "{s}");
+    let d = &rpc.frames[done];
+    assert_eq!(d["subagent_id"], s["subagent_id"], "{d}");
+    assert_eq!(env.hits.load(Ordering::SeqCst), 3);
+    rpc.shutdown().await;
+}
+
+/// A large tool result arrives whole in one `toolcall_result` (result
+/// deltas are not protocol frames and never appear).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn large_tool_result() {
+    const SSE_READ_BIG: &str = concat!(
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_b1\",\"type\":\"message\",",
+        "\"role\":\"assistant\",\"content\":[],\"model\":\"claude-sonnet-4-5\",\"stop_reason\":null,",
+        "\"stop_sequence\":null,\"usage\":{\"input_tokens\":20,\"output_tokens\":0,",
+        "\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0}}}\n\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,",
+        "\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_big\",\"name\":\"read\",\"input\":{}}}\n\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,",
+        "\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\": \\\"big.txt\\\"}\"}}\n\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\",",
+        "\"stop_sequence\":null},\"usage\":{\"output_tokens\":9}}\n\n",
+        "data: {\"type\":\"message_stop\"}\n\n",
+    );
+    static BODIES: [&str; 2] = [SSE_READ_BIG, ANTHROPIC_SSE];
+    let env = Env::new(Script::SeqSse(&BODIES)).await;
+    let big: String = (0..1500).map(|i| format!("line {i:05} {}\n", "x".repeat(60))).collect();
+    std::fs::write(env.home.path().join("work/big.txt"), &big).unwrap();
+    let mut rpc = env.rpc(&[]).await;
+    rpc.ready().await;
+    let r = rpc.turn("p1", "read it").await;
+    assert_eq!(r["ok"], true, "{r}");
+    assert!(!rpc.frames.iter().any(|f| f["event"]["type"] == "toolcall_result_delta"), "{:#?}", rpc.frames);
+    let res: Vec<&Value> = rpc.frames.iter().filter(|f| f["event"]["type"] == "toolcall_result").collect();
+    assert_eq!(res.len(), 1);
+    let text = res[0]["event"].to_string();
+    // The read tool caps its output (~30 KB); still far beyond one stream chunk.
+    assert!(text.len() > 25_000, "a large result ({} bytes)", text.len());
+    assert!(text.contains("line 00000") && text.contains("line 00300"), "head and middle present");
+    rpc.shutdown().await;
+}
+
+/// The private daemon dies while idle with a `compact` in flight: the
+/// compact gets its error frame, then exit 4.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn daemon_lost_with_compact_pending() {
+    let env = Env::new(Script::SseOrJson {
+        sse: ANTHROPIC_SSE,
+        json: ANTHROPIC_MESSAGES_JSON,
+        json_delay: Duration::from_secs(120),
+    })
+    .await;
+    let mut rpc = env.rpc(&[]).await;
+    rpc.ready().await;
+    rpc.turn("p1", "hello").await;
+    rpc.send(json!({"type": "compact", "id": "c1"})).await;
+    rpc.until("disclosure", is_disclosure).await;
+    let dir = env.live_private_dir();
+    let pid = agent_engine::daemon::registry::read_daemon_json(&Env::private_paths(&dir)).unwrap().pid;
+    assert!(std::process::Command::new("kill").args(["-KILL", &pid.to_string()]).status().unwrap().success());
+    let frames = rpc.finish().await;
+    let n = frames.len();
+    assert_eq!(frames[n - 1]["_exit"], 4, "{frames:#?}");
+    let err = frames.iter().find(|f| f["type"] == "error" && f["id"] == "c1").expect("compact answered");
+    assert!(err["message"].as_str().unwrap().contains("daemon"), "{err}");
+    assert!(!frames.iter().any(|f| f["type"] == "error" && f["id"].is_null()), "{frames:#?}");
 }

@@ -10,35 +10,67 @@ child process per Slack thread and communicates with it over the child's
 
 **One process = one synaps session.**
 
-### Architecture: a daemon client
+### Architecture: a client of a private session daemon
 
-`synaps rpc` runs no engine of its own. It connects to the session daemon for
-its profile (`--profile` / `SYNAPS_PROFILE`), auto-spawning it exactly as
-`synaps attach` does (run dir `$SYNAPS_RUNTIME_DIR`, else
+`synaps rpc` runs no engine of its own. At start it spawns a **private**
+session daemon in a fresh run dir of its own,
+`<run>/rpc/<pid>-<random>/` (0700; `<run>` is `$SYNAPS_RUNTIME_DIR`, else
 `$SYNAPS_BASE_DIR/run`), and creates an **owned** session there: the
 session's cwd and environment are this process's, and the secret env vars
-the daemon normally strips are forwarded to the session's tools (in memory
+a daemon normally strips are forwarded to the session's tools (in memory
 only). It then translates each command below into a session command and
 each session event back into the frames below. The turn loop, tools,
 saves, context-head checkpoints, event auto-turns and turn budgets are the
 session actor's — the same code a TUI or `synaps attach` session runs.
 
-**The protocol is unchanged**: same frames, fields and order (a golden-
-fixture differential test, `tests/rpc_differential.rs`, holds it to the
-pre-daemon output). What follows from the new architecture:
+The private daemon gives each `synaps rpc` process the isolation the old
+in-process engine had: it inherits this process's environment (provider
+auth such as `SYNAPS_AUTH_ENDPOINT`/`SYNAPS_MACHINE_TOKEN`, extension
+staging, `SYNAPS_BASE_DIR` and config), mount namespace and cgroup, and
+nothing else connects to it: it never adopts, or is adopted by, the
+profile's shared daemon that `synaps` / `synaps attach` use. It does not
+restore pinned sessions. When the session ends the daemon exits (at most
+10 s later, also when the rpc process was SIGKILLed), and the run dir is
+removed; a run dir left behind by a killed process is swept by the next
+`synaps rpc` once its daemon is gone. Sessions are saved under
+`$SYNAPS_BASE_DIR` as before, so `--continue` works across processes.
+
+Frames on stdout are queued in memory (bounded at 64 MiB), so a parent
+that reads stdout slowly never stalls the daemon connection.
+
+**The protocol is unchanged**: the same frame types and fields. A
+golden-fixture differential test (`tests/rpc_differential.rs`) holds the
+frames to the pre-daemon output; the differences it allows are listed in
+the CHANGELOG (`get_session_stats.cost` is now the real session cost;
+`get_messages` messages carry no internal `_synaps_*` keys; some
+actor-owned message texts). What follows from the new architecture:
 
 - The session is owned by the process: when it exits or is killed, the
   daemon cancels any running turn, saves, and ends the session.
-- No daemon, no rpc: with `SYNAPS_DAEMON=0`, or autospawn off
-  (`SYNAPS_DAEMON_AUTOSPAWN=0`) and no daemon running, or a failed spawn,
+- No daemon, no rpc: with `SYNAPS_DAEMON=0` or
+  `SYNAPS_DAEMON_AUTOSPAWN=0`, or when the private daemon cannot start,
   the child writes one `error` frame (no `ready`), says why on stderr and
   exits **3**. There is no in-process fallback.
-- Losing the daemon (crash, or a lagging event stream the daemon cut off,
-  which would otherwise drop events and usage) is an `error` frame (with the
-  in-flight prompt's id, if any) and exit **4**.
-- A `synaps daemon reload` cancels an in-flight turn at its checkpoint: the
-  turn ends with `error` + `agent_end` + `response {ok: false}`; the child
-  re-binds to its session and carries on (stdin is buffered meanwhile).
+- Losing the daemon (crash, kill, or the daemon cutting this client off
+  for falling behind its event stream, which would otherwise drop events
+  and usage) answers everything in flight (see the error table) and exits
+  **4**.
+- A `synaps daemon reload` aimed at the private daemon
+  (`SYNAPS_DAEMON_DIR=<its run dir>`) cancels an in-flight turn at its
+  checkpoint: the turn ends with `error` + `agent_end` + `response {ok:
+  false}`; the child re-binds to its session and carries on (stdin is
+  buffered meanwhile).
+
+### Exit codes
+
+| Code | Meaning |
+|------|---------|
+| 0    | stdin EOF or `shutdown` |
+| 1    | startup refused: `--continue` of a session that is live elsewhere or does not resolve, bad `--system` file |
+| 2    | daemon protocol version mismatch |
+| 3    | no session daemon (disabled, autospawn off, spawn failed); also a `--profile` that cannot be applied |
+| 4    | the session daemon was lost, or ended the session |
+| 143  | SIGTERM (after writing the terminal frames, see the error table) |
 
 ---
 
@@ -174,10 +206,14 @@ never reported; otherwise it is the sum of the reported values.
 | Malformed JSON                   | Emit `error` with `id: null`; **stay alive**                 |
 | Runtime error during `prompt`    | Emit `error` with `id: <prompt-id>`, then `agent_end`, then `response {ok: false}` |
 | `prompt` while one is in flight  | Emit `error` with the new command's `id`; **do not cancel** the running stream |
-| stdin EOF                        | End the session (an in-flight turn is cancelled, the session saved) and exit 0 |
-| `shutdown`                       | Let an in-flight turn finish (≤ 30 s), end the session, exit 0 |
+| stdin EOF                        | End the session: everything already sent is answered in order (queries, `set_model`, …); an in-flight turn is cancelled and still gets `agent_end` (usage so far) + `response {ok: true, cancelled: true}`; exit 0 |
+| `shutdown`                       | Let an in-flight turn finish (≤ 30 s; then as EOF), end the session, exit 0 |
+| SIGTERM                          | As EOF, bounded: cancel the turn, wait ≤ 2 s for it to end, write its `agent_end` (usage so far) + `response`, answer the rest, exit 143 |
 | No session daemon                | Emit `error` with `id: null` (no `ready`), exit 3            |
-| Session daemon lost              | Emit `error` (in-flight prompt's `id`, else null), exit 4    |
+| Session daemon lost, or the session ended under it | Every request in flight gets a terminal frame: a turn gets `error {id}` + `agent_end` (usage so far) + `response {ok: false}`; a query, `set_model`, `new_session` or `compact` gets `error {id}`. Only when nothing was in flight: one `error` with `id: null`. Exit 4 |
+| `compact` the session refuses (turn running, compaction in progress) | `error` with the compact's `id` |
+| `compact` with no answer         | `error` with the compact's `id` after 30 s (not started) / 10 min (started); stdin is read again |
+| `set_model` the session refuses  | `error` with the command's `id`                              |
 | `--continue` of a live session   | Refused: reason on stderr, exit 1, no `ready`                |
 
 ---
