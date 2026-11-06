@@ -70,7 +70,7 @@ fn run_tui(args: &[&str], env: &[(&str, &str)]) -> (Option<std::process::ExitSta
 fn assert_refused_before_boot(status: Option<std::process::ExitStatus>, err: &str, trace: &str) {
     assert_eq!(status.and_then(|s| s.code()), Some(3), "stderr:\n{err}");
     assert!(err.contains("no in-process mode"), "{err}");
-    assert!(err.contains("daemon --detach"), "names the fix: {err}");
+    assert!(err.contains(" --detach`"), "names the fix: {err}");
     assert!(!err.contains("running in-process"), "{err}");
     for stage in ["stage=reexec", "stage=main", "stage=alloc"] {
         assert!(!trace.contains(stage), "ladder stage {stage} written before the refusal:\n{trace}");

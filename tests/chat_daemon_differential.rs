@@ -578,6 +578,7 @@ async fn daemon_unavailable_is_a_clear_error() {
 /// Install `tests/fixtures/slow_session_start_extension.py` (logs every
 /// `on_session_start` to `session-start.jsonl` in its plugin dir and injects
 /// a sentinel into the session's context).
+#[cfg(unix)]
 fn install_session_start_plugin(env: &Env) -> PathBuf {
     let dir = env.base().join("plugins/start-probe");
     std::fs::create_dir_all(dir.join(".synaps-plugin")).unwrap();
@@ -603,6 +604,7 @@ fn install_session_start_plugin(env: &Env) -> PathBuf {
     dir
 }
 
+#[cfg(unix)]
 async fn one_piped_turn(env: &Env, args: &[&str], text: &str) -> std::process::Output {
     let mut child = env
         .cmd(args)

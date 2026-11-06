@@ -25,7 +25,8 @@ fn every_compacting_frontend_uses_the_engine_transition() {
     };
 
     for rel in [
-        "src/cmd/chat.rs",
+        // `synaps chat` is a daemon client (PR 5): it compacts on the
+        // daemon's SessionActor, listed below; `chat_compacts_in_the_daemon`.
         "src/cmd/rpc.rs",
         "src/cmd/server.rs",
         // The TUI compacts on the SessionActor since phase 3 (A2); the
@@ -111,4 +112,15 @@ fn summary_wrapper_injection_cannot_escape_the_data_boundary() {
     // Sanitizer is idempotent — double application changes nothing.
     let once = sanitize_summary_text(hostile);
     assert_eq!(sanitize_summary_text(&once), once);
+}
+
+/// `synaps chat` runs over the daemon (PR 5): no compaction transition of
+/// its own — `/compact` is the session's `Compact`, run by the actor.
+#[test]
+fn chat_compacts_in_the_daemon() {
+    let chat = include_str!("../src/cmd/chat.rs");
+    for forbidden in ["apply_compaction(", "compact_conversation(", "new_from_compaction", "<context-summary>"] {
+        assert!(!chat.contains(forbidden), "src/cmd/chat.rs must not compact locally ({forbidden})");
+    }
+    assert!(chat.contains("SessionEventWire::CompactionStarted"), "chat renders the actor's typed compaction events");
 }
