@@ -30,6 +30,43 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- **Breaking: the session daemon is the only mode.** Every session runs in
+  the daemon; nothing user-facing boots the engine in-process any more.
+  - `synaps chat` is a daemon client: it connects to the profile's daemon
+    (auto-started like `--attach`; `--profile`, else `SYNAPS_PROFILE`) and
+    runs an owned session whose tools get this process's cwd and env
+    (secrets forwarded in memory). The model calls themselves use the
+    **daemon's** credentials and endpoints (`ANTHROPIC_API_KEY`,
+    `SYNAPS_ANTHROPIC_BASE_URL`, `SYNAPS_ACCOUNT_*`, `SYNAPS_MACHINE_TOKEN`,
+    cloud provider vars), not chat's: set those where the daemon starts, or
+    stop the daemon so the next chat starts one with them. stdin/stdout
+    behaviour, slash commands, auto-turns, `--continue`, `--system`,
+    `--agent`, `--profile` and exit codes are kept (differential:
+    `tests/chat_daemon_differential.rs`). Killing it cancels the turn and
+    ends the session. Its output is queued in-process, so a paused or
+    blocked terminal never makes it lag (which would end an owned
+    session); a lost daemon exits non-zero. The TUI stays an unowned
+    client.
+  - `synaps` and `synaps --attach` never fall back to an in-process TUI.
+    With no daemon to be had (auto-start failed, or
+    `SYNAPS_DAEMON_AUTOSPAWN=0` with none running) they print the reason
+    and the fix and exit 3. A socket path over the Unix limit (a deep
+    `SYNAPS_BASE_DIR`) names `SYNAPS_RUNTIME_DIR` as the fix.
+  - `--no-extensions` (TUI, `--attach`, `chat`) runs on the profile's
+    private no-extensions daemon (`synaps daemon --no-extensions`), which
+    loads no extensions, so no hook runs for its sessions.
+  - `SYNAPS_DAEMON=0` and `SYNAPS_DAEMON_ADOPT=0` no longer select an
+    in-process mode: they are ignored with a one-line warning.
+  - **Breaking: TUI features only the in-process extension host had are
+    gone** for the users who still got it (`SYNAPS_DAEMON_ADOPT=0`,
+    `SYNAPS_DAEMON=0`, a failed daemon start, flags that forced in-process).
+    The default `synaps` (adopt) and `--attach` already lacked all of them
+    before this release. Each now says "not available in daemon mode yet":
+    `/extensions` (list, `config`, `trust`; it used to say "No extensions
+    loaded"), the plugin settings editors in `/settings`, interactive
+    plugin commands, plugin session drivers (`/auto start …`: an unknown
+    command over the daemon), and `/sidecar toggle`.
+  - Migration: [docs/daemon-mode.md](docs/daemon-mode.md#no-daemon-no-session).
 - **Daemon sessions: the interactive shell (`shell_start`) starts from the
   session's env**, like `bash`, instead of the daemon's own. It no longer
   sees the env the daemon inherited, nor the secrets the daemon strips from
@@ -40,31 +77,6 @@ All notable changes to this project will be documented in this file.
 - **`synaps daemon close` without `--attached`** is now decided by the
   session itself, together with the close: a client that attaches between
   the daemon's check and the close is no longer closed under.
-
-### Changed
-
-- **Breaking: the session daemon is the only mode.** Every session runs in
-  the daemon; nothing user-facing boots the engine in-process any more.
-  - `synaps chat` is a daemon client: it connects to the profile's daemon
-    (auto-started like `--attach`), runs an owned session with this
-    process's cwd and env (secrets forwarded in memory), and keeps its
-    stdin/stdout behaviour, slash commands, auto-turns, `--continue`,
-    `--system`, `--agent`, `--profile` and exit codes (differential:
-    `tests/chat_daemon_differential.rs`). Killing it cancels the turn and
-    ends the session. Its output is queued in-process, so a paused or
-    blocked terminal never makes it lag (which would end an owned
-    session); a lost daemon exits non-zero. The TUI stays an unowned
-    client.
-  - `synaps` and `synaps --attach` never fall back to an in-process TUI.
-    With no daemon to be had (auto-start failed, or
-    `SYNAPS_DAEMON_AUTOSPAWN=0` with none running) they print the reason
-    and the fix and exit 3.
-  - `--no-extensions` (TUI, `--attach`, `chat`) runs on the profile's
-    private no-extensions daemon (`synaps daemon --no-extensions`), which
-    loads no extensions, so no hook runs for its sessions.
-  - `SYNAPS_DAEMON=0` and `SYNAPS_DAEMON_ADOPT=0` no longer select an
-    in-process mode: they are ignored with a one-line warning.
-  - Migration: [docs/daemon-mode.md](docs/daemon-mode.md#no-daemon-no-session).
 
 ### Removed
 

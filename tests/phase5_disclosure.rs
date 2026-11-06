@@ -23,8 +23,9 @@ fn every_frontend_surfaces_disclosure_before_dispatch() {
     };
 
     for rel in [
-        // `synaps chat` is a daemon client (PR 5): it compacts on the
-        // daemon's SessionActor, listed below; `chat_compacts_in_the_daemon`.
+        // `synaps chat` is a daemon client with no compaction of its own:
+        // it compacts on the daemon's SessionActor, listed here; checked by
+        // `phase5_compaction.rs` (`chat_compacts_in_the_daemon`).
         "src/cmd/rpc.rs",
         "src/cmd/server.rs",
         // The TUI compacts on the SessionActor since phase 3 (A2): the

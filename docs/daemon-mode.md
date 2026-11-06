@@ -60,6 +60,27 @@ or, when the auto-start itself failed, `daemon unavailable: could not start it:
 carried into the suggested command. Tests: `tests/attach_no_daemon.rs`,
 `tests/chat_daemon_differential.rs` (`daemon_unavailable_is_a_clear_error`).
 
+A daemon that is exiting (idle exit, `daemon stop`) stops accepting a few
+seconds before it releases its lock. A client that finds it alive but is
+refused (connect refused, or `Bye` before its session exists) waits for the
+lock to go, at most `SPAWN_LOCK_WAIT`, then starts a fresh daemon and
+retries once, so chats run a few seconds apart do not fail on an idle exit.
+
+A Unix socket path is limited to 107 bytes. When the daemon's socket path
+(under `SYNAPS_RUNTIME_DIR`, else derived from `SYNAPS_BASE_DIR`) is longer
+(a deep base dir, EFS), every client fails with `daemon unavailable: could
+not start it: the daemon socket path … is N bytes, over the 107-byte Unix
+socket limit; set SYNAPS_RUNTIME_DIR to a short directory`, exit 3.
+
+### TUI features not available in daemon mode yet
+
+The extension host runs in the daemon, and the TUI cannot reach it for
+these yet; each says "not available in daemon mode yet": `/extensions`
+(list, `config`, `trust`), the plugin settings editors in `/settings`,
+interactive plugin commands and plugin session drivers (`/auto start …`;
+an unknown command), and `/sidecar toggle`. The default `synaps` (adopt)
+and `--attach` never had them; only the removed in-process TUI did.
+
 ## `--no-extensions`: a private daemon
 
 `synaps --no-extensions`, `synaps --attach --no-extensions` and `synaps chat
@@ -73,8 +94,9 @@ advertises `features: ["no_extensions"]`, and a client refuses a daemon
 whose extension mode is not the one it asked for (a stale socket, a
 hand-started daemon on the wrong path) instead of silently running with or
 without extensions. `synaps daemon --no-extensions stop|status|…` addresses
-it. It does not restore pinned sessions (they belong to the profile's
-default daemon) and idle-exits like any auto-spawned daemon.
+it, and `synaps daemon status` / `reload` mention it when it is running. It
+does not restore pinned sessions (they belong to the profile's default
+daemon) and idle-exits like any auto-spawned daemon.
 
 Why a separate daemon rather than a per-session flag: extensions are
 process-wide in the daemon (one `ExtensionManager`, one process per
@@ -298,9 +320,14 @@ session gives them: it is bound to the connection that created it.
   lagged" notice.
   `synaps chat` is an owner that a slow terminal cannot lag: it never writes
   to stdout/stderr on its socket-reading path (an ordered in-process output
-  queue drained by a writer thread; past 64 MiB queued, output is dropped
-  with a stderr note instead), so a paused terminal or `| less` grows chat's
-  queue, not the daemon's. The TUI is never an owner: a human's session
+  queue drained by a writer thread), so a paused terminal or `| less` grows
+  chat's queue, not the daemon's. The queue is capped at 64 MiB of memory
+  (each chunk charged its allocation plus a fixed per-chunk overhead, so a
+  flood of tiny deltas cannot hold more): past the cap, new output is
+  dropped, not queued — that text is lost, later output queues again once
+  there is room, and when the queue drains chat prints `[synaps chat: N
+  bytes of output dropped while the output was blocked]` on stderr. The
+  session and the exit code are not affected. The TUI is never an owner: a human's session
   outlives its window, and a lagging TUI gets the notice.
 - **chat's exits**: stdin EOF is read only while the session is idle, so it
   never cancels a turn; EOF and `/quit` send `End{ClientQuit}` and render

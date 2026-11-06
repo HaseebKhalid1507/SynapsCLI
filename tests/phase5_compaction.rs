@@ -25,8 +25,9 @@ fn every_compacting_frontend_uses_the_engine_transition() {
     };
 
     for rel in [
-        // `synaps chat` is a daemon client (PR 5): it compacts on the
-        // daemon's SessionActor, listed below; `chat_compacts_in_the_daemon`.
+        // `synaps chat` is a daemon client with no compaction of its own:
+        // it compacts on the daemon's SessionActor, listed here; checked by
+        // `chat_compacts_in_the_daemon` below.
         "src/cmd/rpc.rs",
         "src/cmd/server.rs",
         // The TUI compacts on the SessionActor since phase 3 (A2); the
@@ -114,7 +115,7 @@ fn summary_wrapper_injection_cannot_escape_the_data_boundary() {
     assert_eq!(sanitize_summary_text(&once), once);
 }
 
-/// `synaps chat` runs over the daemon (PR 5): no compaction transition of
+/// `synaps chat` runs over the daemon: no compaction transition of
 /// its own — `/compact` is the session's `Compact`, run by the actor.
 #[test]
 fn chat_compacts_in_the_daemon() {
