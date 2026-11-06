@@ -12,13 +12,18 @@ All notable changes to this project will be documented in this file.
   (clean detach, EOF, socket error, the process killed), the daemon
   cancels a running turn as `Cancel` does, saves the journal and ends the
   session (`Ended{owner_gone}` to observers): the in-process lifetime that
-  headless callers abort and time out by. Owned sessions never park, idle-end
-  or pin. After `synaps daemon reload` the owner re-binds with a token
-  within `SYNAPS_DAEMON_OWNER_REBIND_SECS` (30 s), else the session ends.
+  headless callers abort and time out by. Only the owner drives an owned
+  session (others watch); an owner that lags is disconnected
+  (`Bye{owner_lagged}`) rather than losing frames. Owned sessions never
+  park, idle-end or pin. After `synaps daemon reload` the owner re-binds
+  with a token within `SYNAPS_DAEMON_OWNER_REBIND_SECS` (30 s, counted from
+  when the new daemon accepts connections), else the session ends.
   Daemons advertise the capability in `Welcome.features`; a client asking an
   older daemon fails loudly. Opt-in `forward_secrets` (owned only) passes
-  the secret env vars the daemon normally strips to the session's tools,
-  in memory only. Plain sessions are unchanged.
+  the secret env vars the daemon normally strips to the session's tools
+  (`bash`, `grep`/`find`/`ls`, the interactive shell), in memory only.
+  Plain sessions are unchanged, except that the interactive shell tool now
+  starts from the session's env rather than the daemon's, like `bash`.
 
 ### Fixed
 

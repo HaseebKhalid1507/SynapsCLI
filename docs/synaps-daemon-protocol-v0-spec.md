@@ -257,17 +257,27 @@ The shipped protocol is line-JSON over a UDS / named pipe (`docs/daemon-mode.md`
 - **Create**: `{"type":"attach","attach":"create",config,mode,"owned":{"forward_secrets":[[k,v],…]?}}`.
   The owner's `Attached` carries `owner_token` (nobody else's does).
 - **Lifetime**: the session ends `Ended{reason:"owner_gone"}` when the owning
-  connection goes away for any reason; a running turn is cancelled as `Cancel`
-  cancels it and the journal is saved. Observers may attach; only the owner's
+  connection goes away for any reason (the connection's liveness, not only its
+  `Detach`); a running turn is cancelled as `Cancel` cancels it and the journal
+  is saved. Others may attach `mirror`/`observe` and watch; a non-owner's
+  `takeover` attach and anything a non-owner sends that drives the session
+  (input, cancel, answers, settings, commands) are refused. Only the owner's
   departure ends it. Pin/keep-warm is refused. Clients without the
   `owner_gone` capability are told `client_quit`.
+- **Owner lag**: an owner whose event stream lags gets `Error` +
+  `{"type":"bye","bye":"owner_lagged","dropped":n}` and its connection is
+  closed (ending the session) instead of losing frames silently.
+- **Continue**: an owned create whose `continue_session` names a session live
+  in the daemon with no clients ends it (saved) and adopts its journal; with
+  clients attached it is refused.
 - **Reload**: the token rides the reload-state file; the next image restores the
-  session unbound for `SYNAPS_DAEMON_OWNER_REBIND_SECS` (30 s), and the owner
+  session unbound, starts the `SYNAPS_DAEMON_OWNER_REBIND_SECS` (30 s) grace once
+  it accepts connections, and holds the session's own work until the owner
   re-binds with `Hello.reconnect_of.owner = {token, forward_secrets?}` on an
   `attach existing`. A wrong token is refused. No re-bind → `owner_gone`.
 - **`forward_secrets`** (owned only): secret env vars the daemon otherwise strips,
-  applied to the session's tool env in memory only; never journaled, logged or
-  listed.
+  held in memory apart from the session env and merged into a tool's child env
+  at spawn; never journaled, logged or listed by Synaps.
 
 ---
 
