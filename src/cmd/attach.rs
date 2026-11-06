@@ -441,7 +441,7 @@ pub(crate) async fn run(profile: Option<String>, mut args: AttachArgs, client_na
                         c.streaming = false;
                         c.quit_guard.reset();
 
-                        let budget = c.t.reconnect_budget_here();
+                        let budget = SocketTransport::reconnect_budget();
                         let budget_secs = budget.as_secs();
                         if !is_reload {
                             c.out(&format!(

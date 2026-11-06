@@ -642,6 +642,26 @@ impl SocketTransport {
         self.last_error.as_ref()
     }
 
+    /// The daemon cut this owner for lagging (`Bye{owner_lagged}`): events
+    /// were lost, so there is nothing to reconnect to. Wins over a reload.
+    fn owner_lagged(&self) -> Option<u64> {
+        match self.last_error {
+            Some(TransportError::OwnerLagged { dropped }) => Some(dropped),
+            _ => None,
+        }
+    }
+
+    /// The stream ended: after a `Reloading`, that is the reload (unless
+    /// the owner lagged, which stays the error).
+    fn note_reload_end(&mut self) {
+        if self.owner_lagged().is_some() {
+            return;
+        }
+        if let Some(generation) = self.reload_pending {
+            self.last_error = Some(TransportError::Reloading { generation });
+        }
+    }
+
     /// `true` if the daemon announced a reload before EOF (graceful); `false`
     /// means a crash/SIGKILL (unexpected).
     pub fn is_reload_pending(&self) -> bool {
@@ -662,22 +682,13 @@ impl SocketTransport {
             .unwrap_or(Duration::from_secs(60))
     }
 
-    /// [`Self::reconnect_budget`] for this connection: an owned session's
-    /// owner retries no longer than the daemon's re-bind grace (past it the
-    /// session has ended).
-    pub fn reconnect_budget_here(&self) -> Duration {
-        let budget = Self::reconnect_budget();
-        if self.owner.is_some() {
-            budget.min(crate::session::owned::owner_rebind_grace())
-        } else {
-            budget
-        }
-    }
-
     /// One attempt at reconnecting (Hello + Attach). On success replaces
     /// `self` and returns the snapshot. On `Refused` / `Version` the error is
     /// terminal (caller should stop retrying). Other errors are transient.
     pub async fn reconnect_once(&mut self, mode: AttachMode) -> Result<AttachSnapshot, TransportError> {
+        if let Some(dropped) = self.owner_lagged() {
+            return Err(TransportError::OwnerLagged { dropped });
+        }
         let was_owner = self.input_owner == Some(self.client);
         let generation = self.reload_pending.unwrap_or(self.welcome.generation);
         let mut hello = self.hello.clone();
@@ -955,23 +966,23 @@ impl ClientTransport for SocketTransport {
                 }
                 Ok(Some(DaemonFrame::Error { message, .. })) => return Some(self.notice(message)),
                 Ok(Some(DaemonFrame::Bye { reason })) => {
-                    if let Some(ByeReason::Reloading { generation, .. }) = reason {
-                        self.reload_pending = Some(generation);
-                    }
-                    if let Some(ByeReason::OwnerLagged { dropped }) = reason {
-                        self.last_error = Some(TransportError::OwnerLagged { dropped });
+                    match reason {
+                        Some(ByeReason::Reloading { generation, .. }) => self.reload_pending = Some(generation),
+                        // Events were lost: final, whatever came first (a
+                        // `Reloading` included). Not a reload to ride out.
+                        Some(ByeReason::OwnerLagged { dropped }) => {
+                            self.reload_pending = None;
+                            self.last_error = Some(TransportError::OwnerLagged { dropped });
+                        }
+                        _ => {}
                     }
                     self.ended = true;
-                    if let Some(generation) = self.reload_pending {
-                        self.last_error = Some(TransportError::Reloading { generation });
-                    }
+                    self.note_reload_end();
                     return None;
                 }
                 Ok(None) => {
                     self.ended = true;
-                    if let Some(generation) = self.reload_pending {
-                        self.last_error = Some(TransportError::Reloading { generation });
-                    }
+                    self.note_reload_end();
                     return None;
                 }
                 Ok(Some(other)) => {
@@ -1018,6 +1029,9 @@ impl ClientTransport for SocketTransport {
     /// cannot both take over). On success `self` IS the new connection; the
     /// returned snapshot is a full re-mirror.
     async fn reconnect(&mut self, mode: AttachMode) -> Result<AttachSnapshot, TransportError> {
+        if let Some(dropped) = self.owner_lagged() {
+            return Err(TransportError::OwnerLagged { dropped });
+        }
         let was_owner = self.input_owner == Some(self.client);
         let generation = self.reload_pending.unwrap_or(self.welcome.generation);
         let mut hello = self.hello.clone();
@@ -1029,7 +1043,10 @@ impl ClientTransport for SocketTransport {
             owner: self.owner.clone(),
         });
         let mode = if was_owner { AttachMode::Takeover } else { mode };
-        let total = self.reconnect_budget_here();
+        // An owner too: a re-bind after its session ended is refused
+        // ("unknown session"), which stops the loop; capping the budget at
+        // the grace would give up while a slow restore is still running.
+        let total = Self::reconnect_budget();
         let deadline = tokio::time::Instant::now() + total;
         let mut backoff = Duration::from_millis(100);
         let mut last;
@@ -1140,6 +1157,20 @@ mod tests {
                         display_tail: None,
                     },
                 )),
+                // A reload announced, then the owner cut for lagging.
+                ClientFrame::Cmd { cmd: SessionCommand::Submit { text, .. }, .. } if text == "lag-after-reload" => {
+                    seq += 1;
+                    let ev = DaemonFrame::Event(WireEnvelope {
+                        session_id: sid.clone(),
+                        seq,
+                        ts: chrono::Utc::now(),
+                        event: WireSessionEvent::Reloading { generation: 2, retry_after_ms: 500 },
+                    });
+                    w.write_all(encode_line(&ev).unwrap().as_bytes()).await.unwrap();
+                    let bye = DaemonFrame::Bye { reason: Some(ByeReason::OwnerLagged { dropped: 3 }) };
+                    w.write_all(encode_line(&bye).unwrap().as_bytes()).await.unwrap();
+                    break;
+                }
                 ClientFrame::Cmd { cmd: SessionCommand::Submit { text, .. }, .. } => {
                     seq += 1;
                     DaemonFrame::Event(WireEnvelope {
@@ -1421,6 +1452,35 @@ mod tests {
         let r = t.reconnect(AttachMode::Observe).await;
         std::env::remove_var("SYNAPS_TUI_ATTACH_RECONNECT_SECS");
         assert!(r.is_err());
+    }
+
+    /// A reload announced, then the owner cut for lagging: events were
+    /// lost, so `OwnerLagged` wins. No reload pending, and a reconnect
+    /// refuses without dialling.
+    #[tokio::test]
+    async fn owner_lagged_after_a_reload_announce_is_final() {
+        let (_d, path) = sock();
+        let l = Listener::bind(&path).unwrap();
+        let srv = tokio::spawn(fake_daemon(l, PROTOCOL_VERSION));
+        let conn = SocketTransport::connect(&path, Hello::new(ClientKind::Test)).await.unwrap();
+        let (mut t, _) = SocketTransport::attach(conn, Attach::Existing { session_id: "fake-1".into(), mode: AttachMode::Mirror })
+            .await
+            .unwrap();
+        t.send(SessionCommand::Submit { text: "lag-after-reload".into(), attachments: vec![] }).await.unwrap();
+        let e = t.next_event().await.unwrap();
+        assert!(matches!(e.event, SessionEventWire::Reloading { generation: 2, .. }));
+        assert!(t.is_reload_pending());
+        assert!(t.next_event().await.is_none());
+        assert!(matches!(t.last_error(), Some(TransportError::OwnerLagged { dropped: 3 })), "{:?}", t.last_error());
+        assert!(!t.is_reload_pending(), "not a reload to ride out");
+        assert!(t.next_event().await.is_none());
+        assert!(matches!(t.last_error(), Some(TransportError::OwnerLagged { dropped: 3 })));
+        srv.await.unwrap();
+        assert!(matches!(t.reconnect_once(AttachMode::Mirror).await, Err(TransportError::OwnerLagged { dropped: 3 })));
+        assert!(matches!(
+            ClientTransport::reconnect(&mut t, AttachMode::Mirror).await,
+            Err(TransportError::OwnerLagged { dropped: 3 })
+        ));
     }
 
     #[tokio::test]
