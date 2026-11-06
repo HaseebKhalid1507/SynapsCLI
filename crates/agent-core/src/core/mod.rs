@@ -14,7 +14,6 @@ pub mod logging;
 pub mod memstat;
 pub mod models;
 pub mod private_fs;
-pub mod protocol;
 pub mod reasoning;
 pub mod retention;
 pub mod rpc_dispatch;

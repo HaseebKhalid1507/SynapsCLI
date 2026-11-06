@@ -23,7 +23,7 @@ pub mod tools;
 // ── agent-core facade ──────────────────────────────────────────────────────────
 // Re-export core so that internal `crate::core::X`, `crate::config`, etc.
 // resolve inside agent-engine (mirrors root lib.rs approach).
-pub use agent_core::{auth, chain, config, error, logging, models, protocol};
+pub use agent_core::{auth, chain, config, error, logging, models};
 pub use agent_core::{core, memory, pricing};
 pub use agent_core::{epoch_millis, truncate_str, BoundedText};
 
