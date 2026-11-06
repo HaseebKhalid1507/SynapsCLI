@@ -576,6 +576,31 @@ async fn profile_from_env_uses_its_daemon() {
 
 // ── daemon-only behaviour (no in-process golden: these did not exist) ──────
 
+/// A daemon that is exiting (idle exit, `daemon stop`) has stopped
+/// accepting but still holds its lock for a few seconds, so the first
+/// ensure says it is running and the dial fails. chat waits for the lock
+/// to go, starts a fresh daemon and runs the turn as usual (chats run
+/// 10–15 s apart hit an idle exit). Here the test holds the profile's
+/// daemon lock with no socket behind it and lets go after 2 s; the output
+/// is the plain turn's, exit 0.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_daemon_exiting_under_the_dial_is_waited_out() {
+    use agent_engine::daemon::registry;
+    let (url, _hits, _bodies) = phase2::spawn_stub(Script::Sse(phase2::ANTHROPIC_SSE)).await;
+    let env = Env::new(url);
+    let paths = registry::daemon_paths_in(&env.run_dir(), None);
+    std::fs::create_dir_all(&paths.dir).unwrap();
+    let dying = registry::DaemonLock::try_acquire(&paths).unwrap().expect("the lock is free");
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(2));
+        drop(dying);
+    });
+    let run = run_chat(&env, &[], &[Step::Write("hello\n"), Step::Close]).await;
+    release.join().unwrap();
+    assert!(env.daemon_alive(None), "a fresh daemon served the chat");
+    check_golden("plain_turn", &[run]);
+}
+
 /// Killing `synaps chat` mid-turn (SIGKILL: no End, no Bye) cancels the
 /// turn and ends the owned session in the daemon; the journal keeps the
 /// partial turn and the interruption marker.
