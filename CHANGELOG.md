@@ -51,8 +51,10 @@ All notable changes to this project will be documented in this file.
     stdin/stdout behaviour, slash commands, auto-turns, `--continue`,
     `--system`, `--agent`, `--profile` and exit codes (differential:
     `tests/chat_daemon_differential.rs`). Killing it cancels the turn and
-    ends the session. A lost daemon, or an owner disconnected for lagging,
-    exits non-zero.
+    ends the session. Its output is queued in-process, so a paused or
+    blocked terminal never makes it lag (which would end an owned
+    session); a lost daemon exits non-zero. The TUI stays an unowned
+    client.
   - `synaps` and `synaps --attach` never fall back to an in-process TUI.
     With no daemon to be had (auto-start failed, or
     `SYNAPS_DAEMON_AUTOSPAWN=0` with none running) they print the reason

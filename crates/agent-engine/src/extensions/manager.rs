@@ -1749,19 +1749,6 @@ impl ExtensionManager {
         }
     }
 
-    /// Start shutting down all extensions in the background.
-    ///
-    /// This is intended for process exit: the UI should not hang waiting for
-    /// extension child processes to acknowledge shutdown. Dropping the join handle
-    /// lets Tokio abort remaining work when the runtime exits.
-    pub fn shutdown_all_detached(
-        manager: Arc<tokio::sync::RwLock<Self>>,
-    ) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(async move {
-            manager.write().await.shutdown_all().await;
-        })
-    }
-
     /// List running extension IDs.
     pub fn list(&self) -> Vec<&str> {
         self.extensions.keys().map(|s| s.as_str()).collect()

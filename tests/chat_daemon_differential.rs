@@ -334,6 +334,18 @@ fn render(case: &str, runs: &[Run]) -> String {
     s
 }
 
+/// The goldens are default-feature runs. Without `command-exec` the
+/// `bash`/`shell_*` tool schemas are not sent, so the context estimates
+/// (`[compacted → ~N tokens]`, `/status`'s `context: ~N of …`) are smaller
+/// for in-process and daemon chat alike: mask just those numbers there.
+fn feature_mask(s: String) -> String {
+    if cfg!(feature = "command-exec") {
+        return s;
+    }
+    let re = regex::Regex::new(r"~\d+( tokens| of )").unwrap();
+    re.replace_all(&s, "~<TOK>${1}").into_owned()
+}
+
 fn golden_path(case: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/chat_differential")
@@ -350,6 +362,7 @@ fn check_golden(case: &str, runs: &[Run]) {
     }
     let want = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("golden {} missing ({e}); capture with SYNAPS_UPDATE_CHAT_GOLDENS=1", path.display()));
+    let (got, want) = (feature_mask(got), feature_mask(want));
     if got != want {
         panic!(
             "chat differential `{case}` diverged from the in-process golden {}\n=== want\n{want}\n=== got\n{got}",
@@ -668,6 +681,7 @@ async fn no_extensions_runs_no_extension_hooks() {
 
 /// `phase2::ANTHROPIC_SSE` with its one text delta replaced by `deltas`
 /// deltas of `text` each.
+#[cfg(unix)]
 fn flood_sse(deltas: usize, text: &str) -> String {
     let frames: Vec<&str> = phase2::ANTHROPIC_SSE.split_inclusive("\n\n").collect();
     assert!(frames[2].contains("text_delta"), "fixture shape changed");
@@ -685,22 +699,24 @@ fn flood_sse(deltas: usize, text: &str) -> String {
 /// chat drains the socket into its own output queue and never makes the
 /// daemon wait on the terminal (a paused terminal, `| less`). Here nobody
 /// reads chat's stdout while a reply far larger than the pipe and socket
-/// buffers streams, at a provider-like pace, through a 16-event session
-/// buffer; once read, all of it is there and chat exits 0. (A chat that
-/// writes on its reading path blocks on the full pipe and is disconnected:
-/// `lost the session`, exit 4.)
+/// buffers (3 MB in 1500 deltas) streams at a provider-like pace through a
+/// 256-event session buffer; once read, all of it is there and chat exits
+/// 0. (A chat that writes on its reading path blocks on the full pipe and
+/// is disconnected: `lost the session`, exit 4. The cap is cut from 1024 to
+/// keep the run short; it is not tighter, so a busy test host cannot lag a
+/// chat that keeps reading.)
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn blocked_stdout_does_not_lag_the_owner_off() {
     const DELTAS: usize = 1500;
-    const WIDTH: usize = 1000;
+    const WIDTH: usize = 2000;
     let body: &'static str = Box::leak(flood_sse(DELTAS, &"x".repeat(WIDTH)).into_boxed_str());
     let (url, _hits, _b) =
         phase2::spawn_stub(Script::Paced { body, frame_delay: Duration::from_millis(1) }).await;
     let env = Env::new(url);
     let mut child = env
         .cmd(&["chat"])
-        .env("SYNAPS_SESSION_EVENTS_CAP", "16")
+        .env("SYNAPS_SESSION_EVENTS_CAP", "256")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -717,7 +733,7 @@ async fn blocked_stdout_does_not_lag_the_owner_off() {
         s
     });
     // Nobody reads stdout while the reply streams (~1.5-3 s at 1 ms/frame).
-    tokio::time::sleep(Duration::from_secs(6)).await;
+    tokio::time::sleep(Duration::from_secs(8)).await;
     let mut out = child.stdout.take().unwrap();
     let mut stdout = Vec::new();
     tokio::time::timeout(EXIT_TIMEOUT, out.read_to_end(&mut stdout)).await.expect("stdout closes").unwrap();
