@@ -141,14 +141,6 @@ async fn process_file(path: &Path, queue: &EventQueue) {
     }
 }
 
-/// Predicate deciding whether this consumer may take an inbox file.
-pub type InboxFilter = fn(&Path) -> bool;
-
-/// Takes every file.
-pub fn accept_all(_: &Path) -> bool {
-    true
-}
-
 /// Whether the watcher may take files right now. A daemon session closes it
 /// while no client owns its input, so shared mail waits for a session someone
 /// is actually at.
@@ -156,7 +148,7 @@ fn gate_open(gate: &AtomicBool) -> bool {
     gate.load(Ordering::Acquire)
 }
 
-async fn scan_inbox(dir: &Path, queue: &EventQueue, accept: InboxFilter, gate: &AtomicBool) {
+async fn scan_inbox(dir: &Path, queue: &EventQueue, gate: &AtomicBool) {
     if !gate_open(gate) {
         return;
     }
@@ -166,10 +158,7 @@ async fn scan_inbox(dir: &Path, queue: &EventQueue, accept: InboxFilter, gate: &
             if !gate_open(gate) {
                 return;
             }
-            let path = entry.path();
-            if accept(&path) {
-                process_file(&path, queue).await;
-            }
+            process_file(&entry.path(), queue).await;
         }
     }
 }
@@ -179,42 +168,16 @@ pub async fn watch_inbox(
     queue: Arc<EventQueue>,
     shutdown: Arc<std::sync::atomic::AtomicBool>,
 ) {
-    watch_inbox_gated(
-        inbox_dir,
-        queue,
-        shutdown,
-        accept_all,
-        Arc::new(AtomicBool::new(true)),
-    )
-    .await
+    watch_inbox_gated(inbox_dir, queue, shutdown, Arc::new(AtomicBool::new(true))).await
 }
 
-/// Like [`watch_inbox`] but only consumes files for which `accept` is true;
-/// rejected files are left in place for their intended consumer.
-pub async fn watch_inbox_filtered(
-    inbox_dir: PathBuf,
-    queue: Arc<EventQueue>,
-    shutdown: Arc<std::sync::atomic::AtomicBool>,
-    accept: InboxFilter,
-) {
-    watch_inbox_gated(
-        inbox_dir,
-        queue,
-        shutdown,
-        accept,
-        Arc::new(AtomicBool::new(true)),
-    )
-    .await
-}
-
-/// Like [`watch_inbox_filtered`], and takes files only while `gate` is true.
+/// Like [`watch_inbox`], and takes files only while `gate` is true.
 /// A closed gate leaves every file on disk; the 2 s rescan picks them up
 /// once it opens, so nothing that arrived meanwhile is lost.
 pub async fn watch_inbox_gated(
     inbox_dir: PathBuf,
     queue: Arc<EventQueue>,
     shutdown: Arc<std::sync::atomic::AtomicBool>,
-    accept: InboxFilter,
     gate: Arc<AtomicBool>,
 ) {
     let _ = tokio::fs::create_dir_all(&inbox_dir).await;
@@ -227,7 +190,7 @@ pub async fn watch_inbox_gated(
             let _ = tokio::fs::set_permissions(&inbox_dir, perms).await;
         }
     }
-    scan_inbox(&inbox_dir, &queue, accept, &gate).await;
+    scan_inbox(&inbox_dir, &queue, &gate).await;
 
     // Use a tokio channel so the async runtime isn't blocked
     let (async_tx, mut async_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<PathBuf>>();
@@ -287,11 +250,11 @@ pub async fn watch_inbox_gated(
                 match result {
                     Some(paths) => {
                         if gate_open(gate_ref) {
-                            for path in paths.iter().filter(|p| accept(p)) {
+                            for path in &paths {
                                 process_file(path, queue_ref).await;
                             }
                             // Sweep for any files inotify missed in the batch
-                            scan_inbox(dir_ref, queue_ref, accept, gate_ref).await;
+                            scan_inbox(dir_ref, queue_ref, gate_ref).await;
                         }
                     }
                     None => break, // Watcher thread exited, channel closed
@@ -303,7 +266,7 @@ pub async fn watch_inbox_gated(
                 if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
                     break;
                 }
-                scan_inbox(dir_ref, queue_ref, accept, gate_ref).await;
+                scan_inbox(dir_ref, queue_ref, gate_ref).await;
             }
         }
     }
@@ -415,7 +378,7 @@ mod tests {
         gate: Arc<AtomicBool>,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
-            watch_inbox_gated(inbox, queue, shutdown, accept_all, gate).await
+            watch_inbox_gated(inbox, queue, shutdown, gate).await
         })
     }
 
