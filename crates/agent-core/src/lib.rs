@@ -32,7 +32,6 @@ pub use core::session;
 pub use core::session_catalog;
 pub use core::session_journal;
 pub use core::session_lock;
-pub use core::watcher_types;
 
 /// Current time as Unix epoch milliseconds. Panics only if system clock is before 1970.
 #[inline]

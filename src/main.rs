@@ -19,8 +19,6 @@ use clap::{Parser, Subcommand};
 
 use synaps_cli::tui;
 mod cmd;
-#[cfg(unix)]
-mod watcher;
 
 // ── Allocator ────────────────────────────────────────────────────────────────
 // Long-lived sessions serialize the ENTIRE conversation to a JSON body every
@@ -63,7 +61,7 @@ pub static MALLOC_CONF: &[u8] =
 #[command(
     name = "synaps",
     about = "SynapsCLI — terminal-native AI agent runtime (TUI, headless, server, RPC)",
-    long_about = "SynapsCLI — terminal-native AI agent runtime.\n\nRun with no arguments for the interactive TUI. Subcommands provide headless chat,\na WebSocket server, autonomous agents, and event injection into running sessions.",
+    long_about = "SynapsCLI — terminal-native AI agent runtime.\n\nRun with no arguments for the interactive TUI. Subcommands provide headless chat,\na WebSocket server, and event injection into running sessions.",
     version
 )]
 struct Cli {
@@ -183,18 +181,16 @@ enum Command {
         #[arg(long)]
         allowed_origins: Option<String>,
     },
-    /// Headless autonomous agent
+    /// Removed: prints where to go instead and exits 2 (see `cmd::removed`).
+    #[command(hide = true, disable_help_flag = true)]
     Agent {
-        #[arg(long)]
-        config: String,
-        #[arg(long, default_value = "manual start")]
-        trigger_context: String,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
     },
-    /// Agent supervisor and watcher
+    /// Removed: prints where to go instead and exits 2 (see `cmd::removed`).
+    #[command(hide = true, disable_help_flag = true)]
     Watcher {
-        #[arg(default_value = "help")]
-        subcommand: String,
-        /// Additional arguments
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
     /// OAuth login
@@ -820,6 +816,11 @@ async fn async_main() -> anyhow::Result<()> {
         cli.attach = Some(None);
         cli.new_session = true;
     }
+    match cli.command {
+        Some(Command::Agent { .. }) => cmd::removed::exit("agent"),
+        Some(Command::Watcher { .. }) => cmd::removed::exit("watcher"),
+        _ => {}
+    }
     if matches!(cli.command, Some(Command::Prompt { .. })) {
         if let Some(Command::Prompt { action }) = cli.command {
             return cmd::prompt::run(action);
@@ -909,15 +910,7 @@ async fn async_main() -> anyhow::Result<()> {
             )
             .await?;
         }
-        Some(Command::Agent {
-            config,
-            trigger_context,
-        }) => {
-            cmd::agent::run(config, trigger_context).await;
-        }
-        Some(Command::Watcher { subcommand, args }) => {
-            cmd::watcher::run(subcommand, args).await;
-        }
+        Some(Command::Agent { .. } | Command::Watcher { .. }) => unreachable!("handled above"),
         Some(Command::Login { provider, account }) => {
             cmd::login::run(cli.profile, provider, account)
                 .await

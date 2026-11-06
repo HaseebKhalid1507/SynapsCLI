@@ -137,7 +137,6 @@ pub fn tools_to_oai(schema: &[Value]) -> (Vec<ToolDefinition>, ToolNameMap) {
             if name.is_empty()
                 || name == "respond"
                 || name == "send_channel"
-                || name == "watcher_exit"
             {
                 return None;
             }

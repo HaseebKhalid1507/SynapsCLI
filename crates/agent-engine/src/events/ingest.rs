@@ -144,20 +144,9 @@ async fn process_file(path: &Path, queue: &EventQueue) {
 /// Predicate deciding whether this consumer may take an inbox file.
 pub type InboxFilter = fn(&Path) -> bool;
 
-/// Takes every file (sessions). Headless agents take no inbox files.
+/// Takes every file.
 pub fn accept_all(_: &Path) -> bool {
     true
-}
-
-/// Filter for headless watcher agents: never consume supervisor completion
-/// notices (`watcher-*.json`) — those are meant for a human's session, and an
-/// agent stealing them would both lose the notice and inject noise into the
-/// agent's own run.
-pub fn not_watcher_notice(path: &Path) -> bool {
-    !path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .is_some_and(|n| n.starts_with("watcher-"))
 }
 
 /// Whether the watcher may take files right now. A daemon session closes it
@@ -322,15 +311,6 @@ pub async fn watch_inbox_gated(
 
 #[cfg(test)]
 mod tests {
-
-    #[test]
-    fn watcher_notice_filter() {
-        use std::path::Path;
-        assert!(!super::not_watcher_notice(Path::new("/x/inbox/watcher-ev-20260925-1.json")));
-        assert!(super::not_watcher_notice(Path::new("/x/inbox/1727-abc.json")));
-        assert!(super::not_watcher_notice(Path::new("/x/inbox/alert-1.md")));
-    }
-
     use super::*;
     use crate::events::{Event, Severity};
 

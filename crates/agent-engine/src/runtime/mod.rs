@@ -532,7 +532,7 @@ fn single_tool_result_content(
 }
 
 /// The core runtime — manages API communication, tool execution, authentication,
-/// and streaming for all SynapsCLI binaries (chat, chatui, server, agent, watcher).
+/// and streaming for all SynapsCLI binaries (chat, chatui, server, rpc, daemon).
 #[derive(Clone)]
 struct PromptReloadSource {
     manifest: PathBuf,
@@ -595,8 +595,6 @@ pub struct Runtime {
     orchestration: Option<Arc<crate::orchestration::OrchestrationRuntime>>,
     /// Shared event queue — for Event Bus tooling.
     event_queue: Arc<crate::events::EventQueue>,
-    /// Path for watcher_exit tool to write handoff state (agent mode only)
-    pub watcher_exit_path: Option<PathBuf>,
     // New configurable fields
     max_tool_output: usize,
     /// Tool output virtualisation thresholds (`tool_output_spill_*`). OFF
@@ -1273,7 +1271,7 @@ impl Drop for Runtime {
 
 impl Runtime {
     pub async fn new() -> Result<Self> {
-        // UNCHANGED semantics: fresh everything (tests, `synaps agent`).
+        // UNCHANGED semantics: fresh everything (tests).
         Ok(Self::from_parts(RuntimeParts::with_reaper(
             fresh_host_parts()?,
         )))
@@ -1330,7 +1328,6 @@ impl Runtime {
             )),
             orchestration: None,
             event_queue: Arc::new(crate::events::EventQueue::new(1000)),
-            watcher_exit_path: None,
             max_tool_output: 30000,
             tool_spill_policy: tool_spill::ToolSpillPolicy::OFF,
             tool_spill_root: host.spill_root,
@@ -1673,7 +1670,7 @@ impl Runtime {
     }
 
     /// Set this runtime's per-turn budget (Task 23). The engine resolves
-    /// role + typed config at boot; subagent/watcher constructions pass
+    /// role + typed config at boot; subagent constructions pass
     /// their role's budget explicitly.
     pub fn set_turn_budget(&mut self, budget: crate::runtime::budget::TurnBudget) {
         self.turn_budget = budget;
@@ -4108,7 +4105,7 @@ impl Runtime {
     }
 
     /// Async epilogue helper for every clean process/runtime exit path that
-    /// owns a `Runtime` (headless chat, TUI teardown, autonomous agent,
+    /// owns a `Runtime` (headless chat, TUI teardown,
     /// RPC/server graceful shutdown): clones the writer handle and runs the
     /// bounded [`Self::shutdown_observability`] on the blocking pool, so an
     /// executor thread is never parked. Same `None`/no-fsync/timeout
@@ -4542,7 +4539,6 @@ impl Runtime {
                                         launch_cancel: None,
                                         memory_backend: Some(self.memory_backend.clone()),
                                         telemetry: Some(self.worker_telemetry()),
-                                        watcher_exit_path: self.watcher_exit_path.clone(),
                                         tool_register_tx: None,
                                         session_manager: Some(self.session_manager.clone()),
                                         subagent_registry: Some(self.subagent_registry.clone()),
@@ -4658,7 +4654,6 @@ impl Runtime {
                                 tools_snapshot.runtime_name_for_api(&tool_name).to_string();
                             let tool = tools_snapshot.get(&tool_name).cloned();
                             drop(tools_snapshot);
-                            let exit_path = self.watcher_exit_path.clone();
                             let session_mgr_inner = session_mgr.clone();
                             let registry_inner = cfg_subagent_registry.clone();
                             let event_queue_inner = cfg_event_queue.clone();
@@ -4719,7 +4714,6 @@ impl Runtime {
                                                     launch_cancel: None,
                                                     memory_backend: Some(memory_backend_inner),
                                                     telemetry: Some(worker_telemetry_inner),
-                                                    watcher_exit_path: exit_path,
                                                     tool_register_tx: None,
                                                     session_manager: Some(session_mgr_inner),
                                                     subagent_registry: Some(registry_inner),
@@ -4981,7 +4975,6 @@ impl Runtime {
         let system_prompt = self.effective_system_prompt().await;
         let thinking_budget = self.thinking_budget;
         let reasoning_level = self.reasoning_level();
-        let watcher_exit_path = self.watcher_exit_path.clone();
         let max_tool_output = self.max_tool_output;
         let bash_timeout = self.bash_timeout;
         let bash_max_timeout = self.bash_max_timeout;
@@ -5067,7 +5060,6 @@ impl Runtime {
             tx: tx.clone(),
             cancel,
             steering_rx,
-            watcher_exit_path,
             max_tool_output,
             tool_spill: self.tool_spill(),
             read_dedupe: self.read_dedupe,
@@ -5170,7 +5162,6 @@ impl Clone for Runtime {
             subagent_registry: self.subagent_registry.clone(),
             orchestration: self.orchestration.clone(),
             event_queue: self.event_queue.clone(),
-            watcher_exit_path: self.watcher_exit_path.clone(),
             max_tool_output: self.max_tool_output,
             tool_spill_policy: self.tool_spill_policy,
             tool_spill_root: self.tool_spill_root.clone(),

@@ -137,7 +137,7 @@ impl BudgetDimension {
 }
 
 /// Typed terminal outcome of a model turn (spec §5.2). Produced ONCE by the
-/// engine; every frontend (chat, TUI, RPC, server, watcher, subagents)
+/// engine; every frontend (chat, TUI, RPC, server, subagents)
 /// receives the same value and must never re-derive it from message text.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]

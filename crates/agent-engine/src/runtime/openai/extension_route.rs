@@ -343,7 +343,6 @@ pub(crate) async fn route_extension_provider(
                         launch_cancel: None,
                         memory_backend: memory_backend.cloned(),
                         telemetry: None,
-                        watcher_exit_path: None,
                         tool_register_tx: None,
                         session_manager: None,
                         subagent_registry: None,
