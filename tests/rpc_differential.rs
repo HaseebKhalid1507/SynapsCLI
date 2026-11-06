@@ -20,6 +20,13 @@
 //! - the per-turn `outcome.correlation_id` (a minted id) → `<CORR>`;
 //! - durations: `duration_secs` → `0`.
 //!
+//! Intentional differences (see [`intentional`], applied to both sides):
+//! - `get_session_stats.cost`: the in-process loop never accumulated cost
+//!   (it reported 0.0, or the cost a `--continue`d session was saved with);
+//!   the session actor reports the real session cost from the pricing
+//!   table. Compared as "a number ≥ 0" (`<COST>`). Token counts, which
+//!   billing reads, are compared exactly.
+//!
 //! Every test spawns real processes under one temp HOME with its own
 //! `SYNAPS_BASE_DIR` and `SYNAPS_RUNTIME_DIR`; an auto-spawned daemon is
 //! private to that HOME and stopped on drop. Nothing here can reach the
@@ -406,17 +413,30 @@ fn check(name: &str, env: &Env, frames: &[Value]) {
         return;
     }
     let want = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-    let want: Vec<&str> = want.lines().collect();
+    let want: Vec<String> = want.lines().map(intentional).collect();
+    let got: Vec<String> = got.iter().map(|g| intentional(g)).collect();
     if want != got {
         let mut report = String::new();
         for i in 0..want.len().max(got.len()) {
-            let w = want.get(i).copied().unwrap_or("<none>");
+            let w = want.get(i).map(String::as_str).unwrap_or("<none>");
             let g = got.get(i).map(String::as_str).unwrap_or("<none>");
             let mark = if w == g { "  " } else { "!!" };
             report.push_str(&format!("{mark} {i:>3} want {w}\n{mark} {i:>3} got  {g}\n"));
         }
         panic!("{name}: frames differ from the golden fixture\n{report}");
     }
+}
+
+/// The documented intentional differences (module docs), applied to a
+/// normalised frame line on both sides.
+fn intentional(line: &str) -> String {
+    let mut v: Value = serde_json::from_str(line).unwrap_or_else(|e| panic!("bad frame {line:?}: {e}"));
+    if v["type"] == "response" && v["command"] == "get_session_stats" {
+        let cost = v["cost"].as_f64().unwrap_or_else(|| panic!("get_session_stats.cost is not a number: {line}"));
+        assert!(cost >= 0.0, "negative cost: {line}");
+        v["cost"] = json!("<COST>");
+    }
+    serde_json::to_string(&v).unwrap()
 }
 
 // ── scenarios ───────────────────────────────────────────────────────────────
@@ -663,4 +683,86 @@ async fn system_file() {
     let seen = bodies.lock().unwrap().iter().any(|b| String::from_utf8_lossy(b).contains("DIFF-SYSTEM-SENTINEL-7f3a"));
     assert!(seen, "system prompt from --system file reached the provider");
     check("system_file", &env, &frames);
+}
+
+// ── daemon client behaviour (new in PR 4; not differential) ────────────────
+
+/// The session is OWNED by the rpc process: killing it mid-turn cancels the
+/// turn and ends the session in the daemon, so it can be `--continue`d.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kill_mid_turn_ends_owned_session() {
+    let env = Env::new(Script::Endless(ANTHROPIC_SSE_PREFIX)).await;
+    let mut rpc = env.rpc(&[]).await;
+    let sid = rpc.ready().await;
+    rpc.send(json!({"type": "prompt", "id": "p1", "message": "go"})).await;
+    rpc.until("text", |v| v["event"]["type"] == "text_delta").await;
+    rpc.child.start_kill().unwrap();
+    rpc.child.wait().await.unwrap();
+
+    // Gone from the daemon (or the daemon idled out with nothing left).
+    let deadline = tokio::time::Instant::now() + WAIT;
+    loop {
+        let out = env.cmd(&["daemon", "sessions", "--json"]).stdin(Stdio::null()).output().await.unwrap();
+        let listed = String::from_utf8_lossy(&out.stdout).into_owned();
+        if !out.status.success() || !listed.contains(&sid) {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "session {sid} outlived its owner: {listed}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // Free to continue, with the prompt that was cut kept in the history.
+    let mut again = env.rpc(&["--continue", &sid]).await;
+    assert_eq!(again.ready().await, sid);
+    again.send(json!({"type": "get_messages", "id": "m1"})).await;
+    let m = again.response("m1").await;
+    assert_eq!(m["messages"][0]["content"], "go", "{m}");
+    again.shutdown().await;
+}
+
+/// No daemon, no rpc: `SYNAPS_DAEMON=0`, or autospawn off with nothing
+/// running → exit 3, one error frame on stdout, the reason on stderr.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn daemon_unavailable_exits_3() {
+    let env = Env::new(Script::Sse(ANTHROPIC_SSE)).await;
+    for (var, val) in [("SYNAPS_DAEMON", "0"), ("SYNAPS_DAEMON_AUTOSPAWN", "0")] {
+        let out = env
+            .cmd(&["rpc", "-m", MODEL])
+            .env(var, val)
+            .stdin(Stdio::null())
+            .output()
+            .await
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(3), "{var}={val}: stdout {stdout} stderr {stderr}");
+        let frame: Value = serde_json::from_str(stdout.lines().next().unwrap_or("")).expect("an error frame");
+        assert_eq!(frame["type"], "error", "{frame}");
+        assert!(frame["message"].as_str().unwrap().contains("daemon"), "{frame}");
+        assert!(stderr.contains("daemon"), "{stderr}");
+        assert_eq!(stdout.lines().count(), 1, "{stdout}");
+    }
+}
+
+/// `--continue` of a session another rpc process has live is refused (exit
+/// 1, no `ready`), and the live one is not disturbed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_continue_refused() {
+    let env = Env::new(Script::Sse(ANTHROPIC_SSE)).await;
+    let mut a = env.rpc(&[]).await;
+    let sid = a.ready().await;
+
+    let out = env
+        .cmd(&["rpc", "-m", MODEL, "--continue", &sid])
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(1), "stdout {stdout} stderr {}", String::from_utf8_lossy(&out.stderr));
+    assert!(!stdout.contains("\"ready\""), "{stdout}");
+
+    let r = a.turn("p1", "still mine").await;
+    assert_eq!(r["ok"], true, "{r}");
+    a.shutdown().await;
 }
