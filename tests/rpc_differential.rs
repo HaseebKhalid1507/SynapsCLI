@@ -1287,6 +1287,10 @@ async fn subagent_frames() {
     let d = &rpc.frames[done];
     assert_eq!(d["subagent_id"], s["subagent_id"], "{d}");
     assert_eq!(env.hits.load(Ordering::SeqCst), 3);
+    // Billing: the turn's usage covers all three calls, the child's too
+    // (parent 20 in / 9 out, child and continuation 10 / 1 each).
+    let usage = &rpc.frames[end]["usage"];
+    assert_eq!((usage["input_tokens"].as_u64(), usage["output_tokens"].as_u64()), (Some(40), Some(11)), "{usage}");
     rpc.shutdown().await;
 }
 
