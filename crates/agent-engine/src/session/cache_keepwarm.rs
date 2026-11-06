@@ -962,6 +962,7 @@ impl PingTask {
 ///   driving the daemon) qualify only with `cache_keepwarm_headless = true`:
 ///   nobody may be coming back in human time, so the owner opts in.
 /// - Test clients never do.
+/// - Nothing does for an owned session (`KeepWarmState::owned`).
 ///
 /// `synaps rpc` (stdin/stdout JSON) runs its own runtime without a session
 /// actor, so neither rule reaches it; this is the daemon-side rule only.
@@ -976,6 +977,10 @@ pub(crate) fn client_qualifies(kind: ClientKind, mode: AttachMode, headless: boo
     }
 }
 
+/// Why an owned session never keeps the cache warm.
+pub(crate) const OWNED_KEEPWARM_REFUSAL: &str = "an owned session (bound to the client that created it) never keeps \
+     the cache warm: its pings would be spend that client never sees in its usage";
+
 /// Actor-owned keep-warm state.
 #[derive(Default)]
 pub(crate) struct KeepWarmState {
@@ -986,6 +991,10 @@ pub(crate) struct KeepWarmState {
     /// `cache_keepwarm_headless` from config at session create: chat, rpc
     /// and server clients qualify too (see [`client_qualifies`]).
     headless: bool,
+    /// An owned session (`SessionConfig::owned`): never keeps warm, whatever
+    /// the config, the clients or `/keepwarm` say. Its pings would bill a
+    /// session whose owner (rpc, chat) never sees them in its usage frames.
+    owned: bool,
     /// The current cache epoch's carry (see [`EpochCarry`]); `None` until a
     /// period of this epoch ended. Reset by every real request's usage, a
     /// compaction and a conversation swap.
@@ -1025,6 +1034,7 @@ impl KeepWarmState {
         auto_max_hours: u32,
         headless: bool,
         override_slot: OverrideSlot,
+        owned: bool,
     ) -> Self {
         let override_mode = *override_slot
             .lock()
@@ -1033,6 +1043,7 @@ impl KeepWarmState {
             configured,
             auto_max_hours,
             headless,
+            owned,
             override_mode,
             override_slot,
             ..Self::default()
@@ -1053,6 +1064,21 @@ impl KeepWarmState {
 
     pub(crate) fn active(&self) -> bool {
         self.period.is_some()
+    }
+
+    /// A client attached: one that [qualifies](client_qualifies) marks the
+    /// session eligible for keep-warm for the rest of its life. Never an
+    /// owned one.
+    pub(crate) fn note_attach(&mut self, kind: ClientKind, mode: AttachMode) {
+        if !self.owned && client_qualifies(kind, mode, self.headless) {
+            self.interactive_seen = true;
+        }
+    }
+
+    /// Whether a period may start at all (mode, eligibility; `pinned`: the
+    /// session is pinned). Never for an owned session.
+    pub(crate) fn may_start(&self, pinned: bool) -> bool {
+        !self.owned && !self.mode().is_off() && (self.interactive_seen || pinned)
     }
 
     /// When the actor's timer should next wake: the ping deadline, but never
@@ -1115,9 +1141,7 @@ impl SessionActor {
     /// A client attached: one that [qualifies](client_qualifies) marks the
     /// session eligible for keep-warm for the rest of its life.
     pub(crate) fn cache_keepwarm_note_attach(&mut self, kind: ClientKind, mode: AttachMode) {
-        if client_qualifies(kind, mode, self.cache_keepwarm.headless) {
-            self.cache_keepwarm.interactive_seen = true;
-        }
+        self.cache_keepwarm.note_attach(kind, mode);
     }
 
     /// A provider Usage event of the running turn (one per request): the
@@ -1257,12 +1281,16 @@ impl SessionActor {
         if self.cache_keepwarm.active() {
             return;
         }
-        let mode = self.cache_keepwarm.mode();
-        // A pin is the owner's say-so that the session is coming back (a
-        // restored pin often has no client; `synaps send` feeds it).
-        if mode.is_off() || !(self.cache_keepwarm.interactive_seen || self.keep_warm) {
+        if self.cache_keepwarm.owned {
+            self.cache_keepwarm.last_end = Some(format!("not started: {OWNED_KEEPWARM_REFUSAL}"));
             return;
         }
+        // A pin is the owner's say-so that the session is coming back (a
+        // restored pin often has no client; `synaps send` feeds it).
+        if !self.cache_keepwarm.may_start(self.keep_warm) {
+            return;
+        }
+        let mode = self.cache_keepwarm.mode();
         // Never before a real Anthropic request of THIS turn was accepted.
         let Some(anchor) = self
             .runtime
@@ -1650,6 +1678,9 @@ impl SessionActor {
     /// `/keepwarm [status|off|auto|<N>h]` (actor-owned, like `/saveas`).
     pub(crate) async fn cache_keepwarm_command(&mut self, arg: &str) -> serde_json::Value {
         let arg = arg.trim();
+        if !(arg.is_empty() || arg.eq_ignore_ascii_case("status")) && self.cache_keepwarm.owned {
+            return serde_json::json!({ "kind": "error", "text": OWNED_KEEPWARM_REFUSAL });
+        }
         if !(arg.is_empty() || arg.eq_ignore_ascii_case("status")) {
             let Some(mode) = CacheKeepWarm::parse(arg) else {
                 return serde_json::json!({
@@ -1753,6 +1784,24 @@ mod tests {
                     assert_eq!(client_qualifies(kind, mode, headless), headless, "{kind:?}");
                 }
             }
+        }
+    }
+
+    /// An owned session never keeps warm: not with the headless opt-in and
+    /// a qualifying client, not with a mode override, not pinned. The same
+    /// state unowned does (the control).
+    #[test]
+    fn an_owned_session_never_keeps_warm() {
+        for owned in [false, true] {
+            let mut kw = KeepWarmState::new(CacheKeepWarm::Auto, 4, true, OverrideSlot::default(), owned);
+            kw.note_attach(ClientKind::Rpc, AttachMode::Mirror);
+            kw.note_attach(ClientKind::Tui, AttachMode::Mirror);
+            assert_eq!(kw.interactive_seen, !owned, "owned: {owned}");
+            assert_eq!(kw.may_start(false), !owned, "owned: {owned}");
+            assert_eq!(kw.may_start(true), !owned, "pinned, owned: {owned}");
+            kw.set_override(CacheKeepWarm::Hours(2));
+            kw.interactive_seen = true;
+            assert_eq!(kw.may_start(true), !owned, "override + pin, owned: {owned}");
         }
     }
 

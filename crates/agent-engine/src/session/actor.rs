@@ -973,6 +973,7 @@ impl SessionActor {
                 config.cache_keepwarm_auto_max_hours,
                 config.cache_keepwarm_headless,
                 cache_keepwarm,
+                owned.is_some(),
             ),
             park_deadline: None,
             park_recheck_at: None,
