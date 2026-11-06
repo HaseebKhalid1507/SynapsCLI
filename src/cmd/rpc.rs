@@ -892,7 +892,8 @@ struct PrivateDir {
 }
 
 const PRIVATE_LOCK: &str = "rpc.lock";
-/// A dir younger than this with no lock file yet may be mid-creation.
+/// A dir touched more recently than this may be mid-creation (its lock not
+/// taken yet): never swept.
 const PRIVATE_SWEEP_GRACE: Duration = Duration::from_secs(60);
 
 impl PrivateDir {
@@ -960,8 +961,7 @@ fn sweep_private_dirs(root: &Path) {
         if !meta.is_dir() {
             continue;
         }
-        let lock = path.join(PRIVATE_LOCK);
-        if !lock.exists() && meta.modified().ok().and_then(|m| m.elapsed().ok()).is_none_or(|age| age < PRIVATE_SWEEP_GRACE) {
+        if meta.modified().ok().and_then(|m| m.elapsed().ok()).is_none_or(|age| age < PRIVATE_SWEEP_GRACE) {
             continue;
         }
         let Ok(files) = std::fs::read_dir(&path) else { continue };

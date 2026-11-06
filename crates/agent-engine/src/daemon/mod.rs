@@ -671,14 +671,23 @@ fn daemon_launch(
     }
 }
 
+/// Session event buffer of a private daemon: its one owner must never lag
+/// (that ends the session), and a burst (a fast stream, a chatty tool) can
+/// outrun the socket hop by more than the shared default.
+pub const PRIVATE_EVENTS_CAP: usize = 8 * 1024;
+
 /// What a spawned daemon must know beyond argv: its files dir, and for a
-/// private daemon, no pin restore.
+/// private daemon, no pin restore and a deeper event buffer (an explicit
+/// `SYNAPS_SESSION_EVENTS_CAP` wins).
 fn spawn_env(opts: &DaemonOpts, env: &mut Vec<(std::ffi::OsString, std::ffi::OsString)>) {
     if let Some(dir) = &opts.runtime_dir {
         crate::process_scope::set_env(env, registry::DAEMON_DIR_ENV, dir.clone().into_os_string());
     }
     if opts.private {
         crate::process_scope::set_env(env, pins::RESTORE_ENV, "0");
+        if !env.iter().any(|(k, _)| k == "SYNAPS_SESSION_EVENTS_CAP") {
+            crate::process_scope::set_env(env, "SYNAPS_SESSION_EVENTS_CAP", PRIVATE_EVENTS_CAP.to_string());
+        }
     }
 }
 
@@ -1137,6 +1146,16 @@ mod flag_tests {
         assert!(m.contains("synaps --profile axon daemon stop"), "{m}");
         // sanitised socket stems collide; the profile names do not
         assert!(profile_mismatch(Some("a.b"), Some("a_b")).is_some());
+    }
+
+    #[test]
+    fn private_daemon_event_buffer_stays_small() {
+        // A tokio broadcast allocates every slot up front: one private
+        // daemon's session buffer must stay ~10 MiB (an Envelope is ~1.2 KB
+        // inline).
+        let slot = std::mem::size_of::<crate::session::types::Envelope>() + 32;
+        let bytes = slot * PRIVATE_EVENTS_CAP;
+        assert!(bytes <= 12 << 20, "{bytes} bytes ({slot} per slot)");
     }
 
     #[test]

@@ -803,7 +803,10 @@ async fn kill_mid_turn_ends_owned_session() {
     }
 
     // Free to continue, with the prompt that was cut kept in the history;
-    // the dead process' run dir is swept on the way.
+    // the dead process' run dir is swept on the way (once older than the
+    // sweep's 60 s grace: age it).
+    let old = std::time::SystemTime::now() - Duration::from_secs(120);
+    std::fs::File::open(&dir).unwrap().set_modified(old).unwrap();
     let mut again = env.rpc(&["--continue", &sid]).await;
     assert_eq!(again.ready().await, sid);
     assert!(!dir.exists(), "stale private run dir not swept: {}", dir.display());
@@ -956,14 +959,17 @@ async fn slow_consumer_loses_nothing() {
     ));
     let env = Env::new(Script::Sse(Box::leak(body.into_boxed_str()))).await;
 
+    let errlog = env.home.path().join("rpc.stderr");
     let mut child = env
         .cmd(&["rpc", "-m", MODEL])
+        .env("RUST_LOG", "info")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(std::fs::File::create(&errlog).unwrap())
         .kill_on_drop(true)
         .spawn()
         .unwrap();
+    let stderr = || std::fs::read_to_string(&errlog).unwrap_or_default();
     let mut stdin = child.stdin.take().unwrap();
     let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
     let ready: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
@@ -973,7 +979,9 @@ async fn slow_consumer_loses_nothing() {
     // Not reading: the pipe (64 KiB) fills within the first few hundred
     // deltas; the whole stream (~250 KiB of frames) lands meanwhile.
     tokio::time::sleep(Duration::from_secs(6)).await;
-    assert!(child.try_wait().unwrap().is_none(), "rpc exited while its stdout was not read");
+    if let Some(st) = child.try_wait().unwrap() {
+        panic!("rpc exited ({st}) while its stdout was not read; stderr:\n{}", stderr());
+    }
 
     let mut frames = Vec::new();
     loop {
