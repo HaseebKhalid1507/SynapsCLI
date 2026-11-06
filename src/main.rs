@@ -181,13 +181,13 @@ enum Command {
         #[arg(long)]
         allowed_origins: Option<String>,
     },
-    /// Removed: prints where to go instead and exits 2 (see `cmd::removed`).
+    /// Removed in 0.12.0 (prints what to use instead).
     #[command(hide = true, disable_help_flag = true)]
     Agent {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
-    /// Removed: prints where to go instead and exits 2 (see `cmd::removed`).
+    /// Removed in 0.12.0 (prints what to use instead).
     #[command(hide = true, disable_help_flag = true)]
     Watcher {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -1027,7 +1027,7 @@ async fn async_main() -> anyhow::Result<()> {
         }
         Some(Command::Completions { shell }) => {
             use clap::CommandFactory;
-            let mut cmd = Cli::command();
+            let mut cmd = cmd::removed::without_stubs(Cli::command());
             let name = cmd.get_name().to_string();
             clap_complete::generate(shell, &mut cmd, name, &mut std::io::stdout());
         }

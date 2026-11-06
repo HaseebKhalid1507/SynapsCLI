@@ -33,3 +33,22 @@ fn removed_subcommands_print_a_pointer_and_exit_2() {
         assert_eq!(stderr, expected, "{argv:?}");
     }
 }
+
+#[test]
+fn completions_do_not_offer_the_removed_subcommands() {
+    let home = tempfile::tempdir().unwrap();
+    for shell in ["bash", "zsh", "fish", "elvish", "powershell"] {
+        let out = Command::new(env!("CARGO_BIN_EXE_synaps"))
+            .args(["completions", shell])
+            .env("HOME", home.path())
+            .env("USERPROFILE", home.path())
+            .env("SYNAPS_DAEMON_AUTOSPAWN", "0")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{shell}");
+        let script = String::from_utf8_lossy(&out.stdout);
+        assert!(script.contains("daemon"), "{shell}: no subcommands at all?");
+        assert!(!script.to_lowercase().contains("watcher"), "{shell}");
+        assert!(!script.contains("Removed in"), "{shell}");
+    }
+}
