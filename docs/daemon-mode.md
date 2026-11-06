@@ -302,6 +302,15 @@ session gives them: it is bound to the connection that created it.
   with a stderr note instead), so a paused terminal or `| less` grows chat's
   queue, not the daemon's. The TUI is never an owner: a human's session
   outlives its window, and a lagging TUI gets the notice.
+- **chat's exits**: stdin EOF is read only while the session is idle, so it
+  never cancels a turn; EOF and `/quit` send `End{ClientQuit}` and render
+  everything up to `Ended` before `session saved`, exit 0 (bounded by the
+  session's end budget + 10 s, then exit 4). Losing the daemon (not a
+  reload), being disconnected for lag, or the session ending under chat for
+  any other reason (`daemon stop`, eviction, an error) prints `synaps chat:
+  lost the session: …` / `the session ended under chat: …` with the
+  `--continue` id and exits 4 (`EXIT_DAEMON_LOST`). chat prints the TUI's
+  version-skew notice when the daemon is another build.
 - **Never parked, idle-ended or pinned**: `synaps daemon pin` and `/pin`
   (`KeepWarm{on}`) are refused ("owned by the client that created it … cannot be
   pinned or kept warm"); `synaps attach --owned --keep-warm` is a usage error.
@@ -912,11 +921,12 @@ reload-state are the same; the operating-system pieces differ:
   successor, is refused with the reason named, instead of running a second writer on the same
   history — and, as lock holders, they recover a draft their predecessor left. Legacy chat takes no
   lock. Deleting a session (and retention) removes its draft.
-- Refuse-to-start (exit 3): flag unset; another daemon holds the lock.
+- Refuse-to-start (exit 3): another daemon holds the lock.
 - Daemon lost (exit 4, `EXIT_DAEMON_LOST`): the daemon was killed/crashed, the client could not reconnect
   within `SYNAPS_TUI_ATTACH_RECONNECT_SECS` (default 60). Stderr prints `synaps: lost the daemon (pid N)
   and could not reconnect within M s — session <id>; resume with synaps --attach <id> / --continue <id>`.
-  Both TUI (`--attach`) and line client (`synaps attach`) exit this way; the in-process TUI is unaffected.
+  Both TUI (`--attach`) and line client (`synaps attach`) exit this way. `synaps chat` exits 4 at once
+  (its owned session ends with the connection; see [Owned sessions](#owned-sessions-headless-clients)).
   During the reconnect window the client shows `daemon connection lost — reconnecting (Ns left)…` and
   clears streaming/compacting state. A successful reconnect prints a notice and resumes normally.
 
