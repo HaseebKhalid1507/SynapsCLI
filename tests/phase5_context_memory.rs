@@ -189,7 +189,6 @@ fn s9_1_no_frontend_splices_summaries_locally() {
     let root = env!("CARGO_MANIFEST_DIR");
     for rel in [
         "src/cmd/chat.rs",
-        "src/cmd/rpc.rs",
         "src/cmd/server.rs",
         // The TUI compacts on the SessionActor since phase 3 (A2).
         "crates/agent-engine/src/session/actor.rs",
@@ -204,6 +203,9 @@ fn s9_1_no_frontend_splices_summaries_locally() {
             "{rel} must not splice summary wrappers locally"
         );
     }
+    // `synaps rpc` compacts on the SessionActor (above), never locally.
+    let rpc = std::fs::read_to_string(format!("{root}/src/cmd/rpc.rs")).unwrap();
+    assert!(rpc.contains("SessionCommand::Compact") && !rpc.contains("<context-summary>"));
 }
 
 #[tokio::test]

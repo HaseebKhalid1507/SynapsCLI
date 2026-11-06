@@ -24,7 +24,6 @@ fn every_frontend_surfaces_disclosure_before_dispatch() {
 
     for rel in [
         "src/cmd/chat.rs",
-        "src/cmd/rpc.rs",
         "src/cmd/server.rs",
         // The TUI compacts on the SessionActor since phase 3 (A2): the
         // disclosure is computed there and shipped as `CompactionStarted`.
@@ -48,18 +47,21 @@ fn every_frontend_surfaces_disclosure_before_dispatch() {
     }
 
     // The RPC frontend must additionally EMIT the disclosure to the client
-    // as a dedicated pre-dispatch frame (command "compact.disclosure"),
-    // before the summarization dispatch; the wire shape is pinned by
-    // tests/rpc_protocol.rs. TUI and server surface it client-visibly as a
-    // pre-dispatch System message/broadcast (asserted above by position).
+    // as a dedicated pre-dispatch frame (command "compact.disclosure"); the
+    // wire shape is pinned by tests/rpc_protocol.rs. `synaps rpc` is a
+    // daemon client: the actor (checked above) computes the disclosure and
+    // ships it in `CompactionStarted` before dispatching, and rpc answers
+    // `compact.disclosure` from that event, before the result arrives.
     let rpc = read("src/cmd/rpc.rs");
-    let frame_pos = rpc
+    let started = rpc.find("SessionEventWire::CompactionStarted").expect("rpc handles CompactionStarted");
+    let frame_pos = rpc[started..]
         .find("compact.disclosure")
+        .map(|p| p + started)
         .expect("rpc must emit the pre-dispatch disclosure frame");
-    let rpc_dispatch_pos = rpc.find("compact_conversation(").unwrap();
+    let applied = rpc.find("SessionEventWire::CompactionApplied").expect("rpc handles CompactionApplied");
     assert!(
-        frame_pos < rpc_dispatch_pos,
-        "rpc: the compact.disclosure frame must be sent before dispatch"
+        frame_pos < applied,
+        "rpc: the compact.disclosure frame must be sent on CompactionStarted"
     );
 }
 
