@@ -194,6 +194,84 @@ To avoid accidental headless turns:
 The line client (`synaps attach`) follows the same double-press rule. The notice
 is printed to stderr so scripts piping stdout are not affected.
 
+## Owned sessions (headless clients)
+
+A session normally outlives its client: a client dying only detaches (F27),
+and the daemon strips secret env vars from `Hello.env`. Headless callers that
+abort by killing their `synaps` child (Pria's guest agent, Harbor and
+synaps-bench timeouts) need the in-process semantics back. An **owned**
+session gives them: it is bound to the connection that created it.
+
+- **Opt-in at create**: `Attach::Create{config, mode, owned: {forward_secrets?}}`.
+  Old clients never send `owned`, so they get today's session, byte for byte.
+- **Capability**: a daemon that honours it lists `"owned_sessions"` in
+  `Welcome.features` (absent on older daemons → empty). `PROTOCOL_VERSION` stays
+  exact-match and is not bumped, so older TUIs still reconnect after a reload.
+  A client asking for an owned session checks the feature **before** sending
+  the attach and fails with `DaemonTooOld` ("… predates owned sessions; run
+  `synaps daemon reload`") instead of getting an unowned session. It also
+  refuses an `Attached` reply without an owner token.
+- **Lifetime**: when the owner's connection goes away for any reason (`Detach`,
+  `Bye`, EOF, socket error, its process SIGKILLed), the daemon cancels a running
+  turn as `Cancel` does (partial reply kept, `InterruptReason::User` marker),
+  saves the journal and **ends** the session: no park grace, no keep-warm, it
+  leaves the map, and every other attached client gets
+  `Ended{reason: owner_gone}`. Other clients may attach (mirror/observe/takeover
+  input); only the owner's departure ends it. The owner is the creating
+  connection, not the input owner: a takeover moves input, not ownership.
+- **Never parked, idle-ended or pinned**: `synaps daemon pin` and `/pin`
+  (`KeepWarm{on}`) are refused ("owned by the client that created it … cannot be
+  pinned or kept warm"); `synaps attach --owned --keep-warm` is a usage error.
+- **Afterwards**: the journal is an ordinary one. `--continue` loads it as a
+  normal (unowned) session.
+- **Idle exit**: a live owner counts as a client like any other. Once it leaves,
+  the session is gone, so an auto-spawned daemon idle-exits as usual.
+- **Create must be new**: `config.continue_session` naming a session that is
+  already live in this daemon is refused for an owned create (it would hand
+  back someone else's session).
+
+### Reload
+
+`synaps daemon reload` re-execs the daemon, which drops every connection,
+owners included. The owner gets a token for this: `Attached.owner_token`
+(sent to the owner only, never listed or logged). On a reload-initiated
+disconnect the session is checkpointed as usual and its token is recorded in
+the reload-state file (0600, deleted after the exec); the next image restores
+the session **unbound** and waits `SYNAPS_DAEMON_OWNER_REBIND_SECS` (default
+30 s) for the owner to re-bind: `SocketTransport::reconnect` sends the token in
+`Hello.reconnect_of.owner` and attaches to the same session. A wrong token is
+refused loudly (`owner token rejected`) and binds nothing. No re-bind within
+the grace → the session ends `OwnerGone` as above. If the exec fails, the old
+image keeps the session under the same rule. Only a reload gives a grace: any
+other disconnect ends the session at once.
+
+### Forwarding secrets (`forward_secrets`)
+
+`owned.forward_secrets` (only honoured on an owned create; `synaps attach --owned
+--forward-secrets`, `SocketTransport::create_owned(.., forward_secrets: true)`)
+sends the variables `Hello.env` strips as secrets (the `is_secret_env` rule:
+name denylist or credential-shaped value), names and values, so the session's
+tools see exactly the env an in-process run would. Daemon side they are
+applied to the runtime's tool env only, held in memory for the session's
+lifetime, and the forwarded names leave the `env_stripped` notice list. They
+are **never** copied into `SessionConfig` (the journal's env and the reload
+record come from it), never written to the session files, the reload-state
+file, logs, traces or status output, and their `Debug` prints names only. A
+re-binding owner sends them again (they do not survive the exec). Unowned
+sessions are unchanged: secrets are stripped as before.
+`tests/daemon_owned.rs::forwarded_secrets_reach_the_tools_and_never_the_disk`
+greps the whole test HOME (journals, session index, run dir, the daemon's
+`trace`-level log and stderr) for a dummy secret value after a tool printed it
+hex-encoded. This widens the security model: **DECISION NEEDED** (see the PR).
+
+### Knobs
+
+| Knob | Default | Meaning |
+|---|---|---|
+| `Attach::Create.owned` / `synaps attach --owned` | off | Create an owned session. |
+| `owned.forward_secrets` / `--forward-secrets` | off | Also forward secret env vars (owned only). |
+| `SYNAPS_DAEMON_OWNER_REBIND_SECS` | 30 | Re-bind grace after a daemon reload. |
+
 ## Closing a session (`/close`)
 
 Detaching leaves the session loaded in the daemon. It parks after the grace
@@ -475,15 +553,15 @@ first's turns (last-writer-wins).
 
 ```
 C: {"type":"hello", protocol_version, client:{kind,terminal,instance}, cwd, client_version}   ← MUST be first
-D: {"type":"welcome", protocol_version, daemon_version, pid, profile, sessions:[SessionMeta], progressive_tool_disclosure, generation, daemon_build}
+D: {"type":"welcome", protocol_version, daemon_version, pid, profile, sessions:[SessionMeta], progressive_tool_disclosure, generation, daemon_build, features?:["owned_sessions"]}
    | {"type":"refused", reason:{reason:"version",daemon_version,min,max}|"protocol"|…, message}   → daemon closes
 C: ping | sessions | shutdown{force}          → D: pong{pid,uptime_s,sessions} | session_list{sessions} | bye   (no session allocated)
 C: close{session_id, force, attached}         → D: closed{session_id, text} | refused{busy|unknown_session} (→ daemon closes) | error
 C: pin{session_id, on}                        → D: pinned{session_id, on} | refused{busy|unknown_session} (→ daemon closes) | error
 C: rename{session_id, name?, expect?}         → D: renamed{session_id, name, in_memory_only?} | rename_failed{session_id, reason, message, taken_by?, current_name?} | refused{unknown_session} (→ daemon closes)
 C: reload_extension{extension}                → D: extension_reloaded{report} | extension_reload_failed{extension, message, unloaded} | refused{busy} (→ daemon closes)
-C: {"type":"attach", attach:"existing", session_id, mode} | {"type":"attach", attach:"create", config:SessionConfig, mode}
-D: {"type":"attached", client, meta, view, conversation, streaming, replay:[WireEnvelope], pending_prompts, clients} | error
+C: {"type":"attach", attach:"existing", session_id, mode} | {"type":"attach", attach:"create", config:SessionConfig, mode, owned?:{forward_secrets?:[[k,v]]}}
+D: {"type":"attached", client, meta, view, conversation, streaming, replay:[WireEnvelope], pending_prompts, clients, owner_token?} | error
 C: {"type":"cmd", session_id, cmd:SessionCommand} …      → D: {"type":"event", session_id, seq, ts, event:WireSessionEvent} …
 C: bye | socket close = Detach (turn keeps running)
 ```
@@ -556,6 +634,12 @@ C: bye | socket close = Detach (turn keeps running)
   `synaps daemon stop` ends them all. This is a footgun guard on a same-uid 0600 socket, not an auth boundary
   (`client_commands_are_whitelisted`).
 - `Attach::Create` fills `cwd` from `Hello.cwd`; it must be absolute and exist.
+- Owned sessions (see "Owned sessions") are additive, without a protocol bump: `Welcome.features`
+  (`#[serde(default)]`) advertises `owned_sessions`; `Attach::Create.owned`, `Attached.owner_token`
+  and `Hello.reconnect_of.owner` (`{token, forward_secrets?}`) are omitted when unused, so a plain
+  create/attach/reconnect encodes exactly as before. A client must not send `owned` to a daemon
+  without the feature (an older daemon ignores the unknown field). `Ended.reason` gains `owner_gone`;
+  an older client decodes an unknown end reason as `Ended` all the same.
 
 ## Security posture
 

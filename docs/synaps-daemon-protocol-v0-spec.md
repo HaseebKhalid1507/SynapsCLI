@@ -244,6 +244,31 @@ listener reuses the existing bearer-token scheme from `synaps server`. Remote
 auth is explicitly a vNext concern; the router layering must keep it insertable
 as middleware.
 
+### 5.6 Owned sessions (as built, line-JSON protocol)
+
+The shipped protocol is line-JSON over a UDS / named pipe (`docs/daemon-mode.md`,
+"Protocol summary"); this section records the one lifetime rule it adds.
+
+- **Capability, not a version bump.** `PROTOCOL_VERSION` is exact-match, so a bump
+  would refuse every older TUI reconnecting after a reload. Instead `Welcome.features`
+  (absent → `[]`) lists `"owned_sessions"`; a client must see it before sending
+  `Attach::Create{owned}` (an older daemon would ignore the field and create an
+  unowned session) and fails loudly otherwise.
+- **Create**: `{"type":"attach","attach":"create",config,mode,"owned":{"forward_secrets":[[k,v],…]?}}`.
+  The owner's `Attached` carries `owner_token` (nobody else's does).
+- **Lifetime**: the session ends `Ended{reason:"owner_gone"}` when the owning
+  connection goes away for any reason; a running turn is cancelled as `Cancel`
+  cancels it and the journal is saved. Observers may attach; only the owner's
+  departure ends it. Pin/keep-warm is refused. Clients without the
+  `owner_gone` capability are told `client_quit`.
+- **Reload**: the token rides the reload-state file; the next image restores the
+  session unbound for `SYNAPS_DAEMON_OWNER_REBIND_SECS` (30 s), and the owner
+  re-binds with `Hello.reconnect_of.owner = {token, forward_secrets?}` on an
+  `attach existing`. A wrong token is refused. No re-bind → `owner_gone`.
+- **`forward_secrets`** (owned only): secret env vars the daemon otherwise strips,
+  applied to the session's tool env in memory only; never journaled, logged or
+  listed.
+
 ---
 
 ## 6. Contract artifact & client generation

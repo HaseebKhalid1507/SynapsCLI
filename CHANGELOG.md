@@ -4,6 +4,22 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Owned daemon sessions.** A client can create a session bound to its
+  connection (`Attach::Create{owned}`; `SocketTransport::create_owned`;
+  `synaps attach --owned`). When the owner disconnects for any reason
+  (clean detach, EOF, socket error, the process killed), the daemon
+  cancels a running turn as `Cancel` does, saves the journal and ends the
+  session (`Ended{owner_gone}` to observers): the in-process lifetime that
+  headless callers abort and time out by. Owned sessions never park, idle-end
+  or pin. After `synaps daemon reload` the owner re-binds with a token
+  within `SYNAPS_DAEMON_OWNER_REBIND_SECS` (30 s), else the session ends.
+  Daemons advertise the capability in `Welcome.features`; a client asking an
+  older daemon fails loudly. Opt-in `forward_secrets` (owned only) passes
+  the secret env vars the daemon normally strips to the session's tools,
+  in memory only. Plain sessions are unchanged.
+
 ### Fixed
 
 - **Windows: the `grep`, `find` and `ls` tools work.** They ran the bare
