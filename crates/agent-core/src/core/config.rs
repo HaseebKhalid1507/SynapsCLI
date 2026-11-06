@@ -1113,16 +1113,25 @@ pub struct TurnBudgetsConfig {
 }
 
 /// The one warning for any number of `turn_budget.autonomous.*` lines.
-const REMOVED_AUTONOMOUS_BUDGET: &str = "turn_budget.autonomous.* is ignored: `synaps agent` was \
-     removed in 0.12.0. Remove these lines (turns started by events use turn_budget.event.*)";
+fn removed_autonomous_budget_warning() -> String {
+    format!(
+        "turn_budget.autonomous.* is ignored: `synaps agent` was removed in {}. Remove these \
+         lines (turns started by events use turn_budget.event.*)",
+        crate::REMOVED_IN
+    )
+}
 
 /// Watcher-only keys (heartbeat mirroring to the bridge daemon). Ignored
 /// with one warning so an old config still loads.
 const REMOVED_BRIDGE_KEYS: [&str; 3] =
     ["bridge.uds_path", "bridge.heartbeat_mirror", "bridge.heartbeat_timeout_ms"];
-const REMOVED_BRIDGE_WARNING: &str = "bridge.uds_path, bridge.heartbeat_mirror and \
-     bridge.heartbeat_timeout_ms are ignored: they configured `synaps watcher`, removed in \
-     0.12.0. Remove these lines";
+fn removed_bridge_warning() -> String {
+    format!(
+        "bridge.uds_path, bridge.heartbeat_mirror and bridge.heartbeat_timeout_ms are ignored: \
+         they configured `synaps watcher`, removed in {}. Remove these lines",
+        crate::REMOVED_IN
+    )
+}
 
 /// Parse `turn_budget.<role>.<field>` keys. Invalid values warn and keep
 /// the default (parity with shell.* parsing). `Err` carries the stderr
@@ -1145,7 +1154,7 @@ fn parse_turn_budget_config_key(
     let overrides = match role {
         "foreground" => &mut budgets.foreground,
         // Only `synaps agent` read it: an old config still loads.
-        "autonomous" => return Ok(Some(REMOVED_AUTONOMOUS_BUDGET.to_string())),
+        "autonomous" => return Ok(Some(removed_autonomous_budget_warning())),
         "event" => &mut budgets.event,
         "worker" => &mut budgets.worker,
         other => {
@@ -2554,8 +2563,9 @@ fn apply_config_content_with(
                 } else if key.starts_with("server.") {
                     parse_server_config_key(&mut config.server, key, val);
                 } else if REMOVED_BRIDGE_KEYS.contains(&key) {
-                    if !config.warnings.iter().any(|w| w == REMOVED_BRIDGE_WARNING) {
-                        config.warnings.push(REMOVED_BRIDGE_WARNING.to_string());
+                    let warning = removed_bridge_warning();
+                    if !config.warnings.contains(&warning) {
+                        config.warnings.push(warning);
                     }
                 } else if key.starts_with("auth.") {
                     parse_auth_config_key(&mut config.auth, key, val);
@@ -3744,14 +3754,14 @@ mod tests {
                        turn_budget.autonomous.max_elapsed_secs = 90\n\
                        turn_budget.worker.max_tool_calls = 7\n";
         let config = super::load_config_from_str(content);
-        assert_eq!(config.warnings, [super::REMOVED_AUTONOMOUS_BUDGET]);
+        assert_eq!(config.warnings, [super::removed_autonomous_budget_warning()]);
         assert_eq!(
             config.turn_budgets.worker.max_tool_calls,
             Some(super::TurnLimit::Max(7))
         );
         assert_eq!(
             super::config_content_problems(content),
-            [super::REMOVED_AUTONOMOUS_BUDGET]
+            [super::removed_autonomous_budget_warning()]
         );
     }
 
@@ -4776,7 +4786,7 @@ mod tests {
              model = claude-sonnet-4-6\n",
         );
         assert_eq!(config.model.as_deref(), Some("claude-sonnet-4-6"));
-        assert_eq!(config.warnings, [REMOVED_BRIDGE_WARNING], "{:?}", config.warnings);
+        assert_eq!(config.warnings, [removed_bridge_warning()], "{:?}", config.warnings);
     }
 
     #[test]

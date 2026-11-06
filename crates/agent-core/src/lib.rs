@@ -33,6 +33,10 @@ pub use core::session_catalog;
 pub use core::session_journal;
 pub use core::session_lock;
 
+/// The release that removed `synaps agent` and `synaps watcher`. The
+/// one-release CLI stubs and the warnings for their config keys name it.
+pub const REMOVED_IN: &str = "0.12.0";
+
 /// Current time as Unix epoch milliseconds. Panics only if system clock is before 1970.
 #[inline]
 pub fn epoch_millis() -> u64 {

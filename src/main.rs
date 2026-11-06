@@ -181,18 +181,9 @@ enum Command {
         #[arg(long)]
         allowed_origins: Option<String>,
     },
-    /// Removed in 0.12.0 (prints what to use instead).
-    #[command(hide = true, disable_help_flag = true)]
-    Agent {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
-    },
-    /// Removed in 0.12.0 (prints what to use instead).
-    #[command(hide = true, disable_help_flag = true)]
-    Watcher {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
-    },
+    // Removed subcommands: hidden one-release stubs (`cmd::removed`).
+    #[command(flatten)]
+    Removed(cmd::removed::RemovedCommand),
     /// OAuth login
     Login {
         /// Non-interactive: log in directly with a named provider (skips the picker). e.g. openai-codex, claude
@@ -816,10 +807,8 @@ async fn async_main() -> anyhow::Result<()> {
         cli.attach = Some(None);
         cli.new_session = true;
     }
-    match cli.command {
-        Some(Command::Agent { .. }) => cmd::removed::exit("agent"),
-        Some(Command::Watcher { .. }) => cmd::removed::exit("watcher"),
-        _ => {}
+    if let Some(Command::Removed(stub)) = &cli.command {
+        cmd::removed::exit(stub.name());
     }
     if matches!(cli.command, Some(Command::Prompt { .. })) {
         if let Some(Command::Prompt { action }) = cli.command {
@@ -910,7 +899,7 @@ async fn async_main() -> anyhow::Result<()> {
             )
             .await?;
         }
-        Some(Command::Agent { .. } | Command::Watcher { .. }) => unreachable!("handled above"),
+        Some(Command::Removed(_)) => unreachable!("handled above"),
         Some(Command::Login { provider, account }) => {
             cmd::login::run(cli.profile, provider, account)
                 .await
