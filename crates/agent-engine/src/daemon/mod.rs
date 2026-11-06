@@ -71,18 +71,36 @@ const _: () = assert!(
     "SPAWN_READY_TIMEOUT must exceed EXTENSION_DISCOVERY_WAIT"
 );
 
-/// `SYNAPS_DAEMON` feature flag: ON unless set to `0`/`false`/`off`/`no`.
-/// `SYNAPS_DAEMON=1` is accepted (no-op, kept for older scripts).
-pub fn enabled() -> bool {
-    enabled_from(std::env::var("SYNAPS_DAEMON").ok().as_deref())
-}
-
 fn env_is_off(v: Option<&str>) -> bool {
     matches!(v.map(|s| s.trim().to_ascii_lowercase()).as_deref(), Some("0" | "false" | "off" | "no"))
 }
 
-fn enabled_from(v: Option<&str>) -> bool {
-    !env_is_off(v)
+/// `SYNAPS_DAEMON=0` and `SYNAPS_DAEMON_ADOPT=0` used to run sessions
+/// in-process. There is no in-process mode any more: every session runs in
+/// the session daemon, so both are ignored. Returns the one-line warning
+/// that says so when either is set to an "off" value, else `None`.
+pub fn legacy_env_warning() -> Option<String> {
+    legacy_env_warning_from(
+        std::env::var("SYNAPS_DAEMON").ok().as_deref(),
+        std::env::var("SYNAPS_DAEMON_ADOPT").ok().as_deref(),
+    )
+}
+
+fn legacy_env_warning_from(daemon: Option<&str>, adopt: Option<&str>) -> Option<String> {
+    let set: Vec<&str> = [("SYNAPS_DAEMON", daemon), ("SYNAPS_DAEMON_ADOPT", adopt)]
+        .into_iter()
+        .filter(|(_, v)| env_is_off(*v))
+        .map(|(k, _)| k)
+        .collect();
+    if set.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "warning: {}=0 {} ignored: sessions always run in the session daemon now (the in-process mode was removed); unset {} (docs/daemon-mode.md)",
+        set.join("=0 and "),
+        if set.len() > 1 { "are" } else { "is" },
+        if set.len() > 1 { "them" } else { "it" },
+    ))
 }
 
 /// `SYNAPS_DAEMON_AUTOSPAWN`: ON unless `0`/`false`/`off`/`no`. Off means
@@ -91,9 +109,6 @@ fn enabled_from(v: Option<&str>) -> bool {
 pub fn autospawn_enabled() -> bool {
     !env_is_off(std::env::var("SYNAPS_DAEMON_AUTOSPAWN").ok().as_deref())
 }
-
-/// One-line reason used by every attach path when the flag is off.
-pub const DISABLED_NOTICE: &str = "daemon disabled by SYNAPS_DAEMON=0";
 
 /// A client running `client` profile must never drive a daemon that serves
 /// another one: its sessions, model and config writes would land in the
@@ -176,13 +191,20 @@ pub struct DaemonOpts {
     pub runtime_dir: Option<PathBuf>,
     /// Test seam / A1 hook: how `Attach::Create` builds a session.
     pub factory: Option<SessionFactory>,
+    /// The profile's private no-extensions daemon (`--no-extensions`): its
+    /// own socket/lock/json ([`registry::daemon_paths_for`]), booted without
+    /// extension discovery, never restoring or taking pins, and saying so
+    /// in `Welcome.features` ([`crate::session::wire::FEATURE_NO_EXTENSIONS`]).
+    /// Extensions are daemon-wide (one sidecar each, shared hooks and
+    /// tools), so a session without them needs a daemon without them.
+    pub no_extensions: bool,
 }
 
 impl DaemonOpts {
     pub fn paths(&self) -> DaemonPaths {
         let mut p = match &self.runtime_dir {
-            Some(d) => registry::daemon_paths_in(d, self.profile.as_deref()),
-            None => registry::daemon_paths(self.profile.as_deref()),
+            Some(d) => registry::daemon_paths_in_for(d, self.profile.as_deref(), self.no_extensions),
+            None => registry::daemon_paths_for(self.profile.as_deref(), self.no_extensions),
         };
         if let Some(s) = &self.socket {
             p.sock = s.clone();
@@ -226,6 +248,8 @@ pub struct DaemonState {
     pub pins: Arc<pins::PinBook>,
     /// A cold start's pin restore is running (holds the idle exit).
     pub restoring: AtomicBool,
+    /// The private no-extensions daemon ([`DaemonOpts::no_extensions`]).
+    pub no_extensions: bool,
 }
 
 impl DaemonState {
@@ -450,6 +474,7 @@ impl Daemon {
             meta,
             pins: Arc::new(pins::PinBook::for_active_profile()),
             restoring: AtomicBool::new(false),
+            no_extensions: opts.no_extensions,
         });
         state.host.set_pin_sink(Arc::clone(&state.pins) as Arc<dyn crate::session::PinSink>);
 
@@ -485,7 +510,9 @@ impl Daemon {
         }
         signal_ready();
         // Cold start only: a reload hands its live sessions over already.
-        if reload_state.is_none() && pins::restore_enabled() {
+        // The no-extensions daemon never restores the profile's pins: they
+        // belong to the profile's daemon (which has the extensions).
+        if reload_state.is_none() && !opts.no_extensions && pins::restore_enabled() {
             tokio::spawn(pins::restore_all(Arc::clone(&state)));
         }
         tracing::info!(sock = %paths.sock.display(), pid = info.pid, generation, "daemon: listening");
@@ -679,6 +706,9 @@ pub fn spawn_detached(opts: &DaemonOpts) -> anyhow::Result<u32> {
 
 
     let mut cmd_args: Vec<std::ffi::OsString> = vec!["daemon".into(), "--foreground".into()];
+    if opts.no_extensions {
+        cmd_args.push("--no-extensions".into());
+    }
     if let Some(p) = &opts.profile {
         cmd_args.extend(["--profile".into(), p.into()]);
     }
@@ -822,6 +852,9 @@ pub fn spawn_detached(opts: &DaemonOpts) -> anyhow::Result<u32> {
 pub fn spawn_detached(opts: &DaemonOpts) -> anyhow::Result<u32> {
     let exe = std::env::current_exe()?;
     let mut cmd_args: Vec<std::ffi::OsString> = vec!["daemon".into(), "--foreground".into()];
+    if opts.no_extensions {
+        cmd_args.push("--no-extensions".into());
+    }
     if let Some(p) = &opts.profile {
         cmd_args.extend(["--profile".into(), p.into()]);
     }
@@ -989,9 +1022,6 @@ pub const AUTOSPAWN_IDLE_EXIT: Duration = Duration::from_secs(10);
 /// descriptors only) → extension discovery once → start → background MCP
 /// discovery → wait for SIGTERM/SIGINT/Shutdown frame/idle.
 pub async fn run_foreground(opts: DaemonOpts) -> anyhow::Result<()> {
-    if !enabled() {
-        anyhow::bail!("{DISABLED_NOTICE} (exit {EXIT_REFUSED})");
-    }
     // Windows reload: take `daemon.lock` over from the previous image before
     // booting anything. It exits on our signal, as `execv` would have
     // replaced it, so nothing below ever runs beside it.
@@ -1001,15 +1031,17 @@ pub async fn run_foreground(opts: DaemonOpts) -> anyhow::Result<()> {
     // ready byte (the spawner waits only SPAWN_READY_TIMEOUT).
     let host = EngineHost::boot_and_install(crate::HostOpts {
         profile: opts.profile.clone(),
-        no_extensions: false,
+        no_extensions: opts.no_extensions,
         mcp_discovery: crate::McpDiscovery::Background,
     })
     .await?;
     host.report_config_warnings();
     // Sidecars spawn once per daemon: discover before accepting (bounded by
-    // EXTENSION_DISCOVERY_WAIT, which SPAWN_READY_TIMEOUT outwaits).
+    // EXTENSION_DISCOVERY_WAIT, which SPAWN_READY_TIMEOUT outwaits). The
+    // no-extensions daemon never discovers any.
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    let _loader = crate::extensions::loader::spawn_discover_and_load(Arc::clone(host.ext_manager()), tx, None);
+    let _loader = (!opts.no_extensions)
+        .then(|| crate::extensions::loader::spawn_discover_and_load(Arc::clone(host.ext_manager()), tx, None));
     let wait = async {
         while let Some(ev) = rx.recv().await {
             if let crate::extensions::loader::ExtensionLoaderEvent::Finished { loaded, failed } = ev {
@@ -1018,7 +1050,9 @@ pub async fn run_foreground(opts: DaemonOpts) -> anyhow::Result<()> {
             }
         }
     };
-    if tokio::time::timeout(EXTENSION_DISCOVERY_WAIT, wait).await.is_err() {
+    if opts.no_extensions {
+        tracing::info!("daemon: --no-extensions: extension discovery skipped");
+    } else if tokio::time::timeout(EXTENSION_DISCOVERY_WAIT, wait).await.is_err() {
         tracing::warn!(
             wait = ?EXTENSION_DISCOVERY_WAIT,
             "daemon: extension discovery still running; accepting anyway"
@@ -1090,14 +1124,20 @@ mod flag_tests {
     }
 
     #[test]
-    fn enabled_env_matrix() {
-        assert!(enabled_from(None), "unset → on");
+    fn legacy_env_is_ignored_with_one_warning() {
+        assert_eq!(legacy_env_warning_from(None, None), None);
         for on in ["1", "true", "yes", "on", "", "anything"] {
-            assert!(enabled_from(Some(on)), "{on:?} → on");
+            assert_eq!(legacy_env_warning_from(Some(on), Some(on)), None, "{on:?}");
         }
         for off in ["0", "false", "off", "no", "FALSE", " 0 ", "Off"] {
-            assert!(!enabled_from(Some(off)), "{off:?} → off");
+            let w = legacy_env_warning_from(Some(off), None).expect(off);
+            assert!(w.contains("SYNAPS_DAEMON=0 is ignored") && w.contains("in-process mode was removed"), "{w}");
+            assert_eq!(w.lines().count(), 1);
+            let w = legacy_env_warning_from(None, Some(off)).expect(off);
+            assert!(w.contains("SYNAPS_DAEMON_ADOPT=0 is ignored"), "{w}");
         }
+        let w = legacy_env_warning_from(Some("0"), Some("0")).unwrap();
+        assert!(w.contains("SYNAPS_DAEMON=0 and SYNAPS_DAEMON_ADOPT=0 are ignored"), "{w}");
     }
 
     #[test]

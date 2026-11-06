@@ -245,7 +245,13 @@ pub async fn serve(state: Arc<DaemonState>, stream: ServerStream, shutdown: Canc
         progressive_tool_disclosure: state.host.parts().progressive_tool_disclosure,
         generation: state.generation,
         daemon_build: crate::session::wire::build_id().to_string(),
-        features: crate::session::wire::daemon_features(),
+        features: {
+            let mut f = crate::session::wire::daemon_features();
+            if state.no_extensions {
+                f.push(crate::session::wire::FEATURE_NO_EXTENSIONS.to_string());
+            }
+            f
+        },
     };
     if tx.send(DaemonFrame::Welcome(welcome)).await.is_err() {
         return;

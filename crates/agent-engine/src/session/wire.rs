@@ -56,6 +56,13 @@ pub const PROTOCOL_VERSION: u32 = 3;
 /// `EndReason::OwnerGone`.
 pub const FEATURE_OWNED_SESSIONS: &str = "owned_sessions";
 
+/// `Welcome.features` entry of a daemon booted with `--no-extensions` (the
+/// profile's private no-extensions daemon): no extension is loaded in it,
+/// so none of its sessions runs an extension hook or tool. A client that
+/// asked for `--no-extensions` refuses a daemon without it, and one that
+/// did not refuses a daemon with it.
+pub const FEATURE_NO_EXTENSIONS: &str = "no_extensions";
+
 /// What this daemon build advertises in `Welcome.features`.
 pub fn daemon_features() -> Vec<String> {
     vec![FEATURE_OWNED_SESSIONS.to_string()]

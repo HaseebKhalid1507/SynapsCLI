@@ -317,6 +317,16 @@ pub async fn setup_lazy_mcp_with(registry: &SharedRegistry, opts: McpDiscoveryOp
     register_dormant(registry, &config, &cache, "boot").await
 }
 
+/// How many MCP tools the descriptor cache offers for the configured
+/// servers (what the daemon registers at boot; never spawns a server).
+/// `synaps chat`'s "MCP servers available" banner line.
+pub fn cached_tool_count() -> usize {
+    let Some(config) = load_nonempty_config() else {
+        return 0;
+    };
+    descriptors::dormant_tools_for_config(&config, &load_cache_or_empty()).len()
+}
+
 /// Background-mode phase 1 ([`McpDiscovery::Background`]): register the
 /// cached descriptors only — never spawns — and hand back the discovery
 /// still owed for servers without a fingerprint-matching entry (`None` when

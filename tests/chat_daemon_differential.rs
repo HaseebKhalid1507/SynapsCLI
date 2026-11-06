@@ -506,3 +506,160 @@ async fn profile_and_no_extensions() {
     let n = run_chat(&env, &["--no-extensions"], &[Step::Write("hello\n"), Step::Close]).await;
     check_golden("profile_and_no_extensions", &[p, n]);
 }
+
+// ── daemon-only behaviour (no in-process golden: these did not exist) ──────
+
+/// Killing `synaps chat` mid-turn (SIGKILL: no End, no Bye) cancels the
+/// turn and ends the owned session in the daemon; the journal keeps the
+/// partial turn and the interruption marker.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kill_mid_turn_ends_the_owned_session() {
+    use agent_engine::session::socket_transport::SocketTransport;
+    let (url, hits, _b) = phase2::spawn_stub(Script::Endless(phase2::ANTHROPIC_SSE_PREFIX)).await;
+    let env = Env::new(url);
+    let mut child = env
+        .cmd(&["chat"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(b"CHATDIFF-KILL never finishes\n").await.unwrap();
+    stdin.flush().await.unwrap();
+    let mut out = child.stdout.take().unwrap();
+    let mut first = [0u8; 1];
+    tokio::time::timeout(STEP_TIMEOUT, out.read_exact(&mut first)).await.expect("partial reply").unwrap();
+    assert!(hits.load(std::sync::atomic::Ordering::SeqCst) >= 1);
+
+    let sock = agent_engine::daemon::registry::daemon_paths_in(&env.run_dir(), None).sock;
+    let live = SocketTransport::sessions(&sock).await.expect("daemon lists sessions");
+    assert_eq!(live.len(), 1, "chat's session is live in the daemon");
+    child.start_kill().unwrap();
+    let _ = child.wait().await;
+
+    let t0 = std::time::Instant::now();
+    while !SocketTransport::sessions(&sock).await.unwrap_or_default().is_empty() {
+        assert!(t0.elapsed() < Duration::from_secs(10), "owned session outlived its killed owner");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let journal = env.sessions_text();
+    assert!(journal.contains("CHATDIFF-KILL never finishes"), "user turn kept: {journal}");
+    assert!(
+        journal.contains(agent_engine::engine::interrupt::InterruptReason::User.marker()),
+        "the turn was cancelled (interruption marker): {journal}"
+    );
+}
+
+/// No daemon and autospawn off: a clear error naming the fix, non-zero
+/// exit, and no in-process session (nothing journaled, no provider call).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn daemon_unavailable_is_a_clear_error() {
+    let (url, hits, _b) = phase2::spawn_stub(Script::Sse(phase2::ANTHROPIC_SSE)).await;
+    let env = Env::new(url);
+    let mut c = env.cmd(&["chat"]);
+    c.env("SYNAPS_DAEMON_AUTOSPAWN", "0").stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = c.spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(b"hello\n").await.unwrap();
+    drop(stdin);
+    let out = tokio::time::timeout(EXIT_TIMEOUT, child.wait_with_output()).await.unwrap().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(agent_engine::daemon::EXIT_REFUSED), "stderr: {err}");
+    assert!(err.contains("no daemon running") && err.contains("SYNAPS_DAEMON_AUTOSPAWN"), "stderr: {err}");
+    assert!(err.contains("no in-process mode"), "stderr: {err}");
+    assert!(err.contains("daemon --detach"), "names the fix: {err}");
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0, "no in-process turn ran");
+    assert!(env.sessions_text().is_empty(), "no in-process session was journaled");
+}
+
+/// Install `tests/fixtures/slow_session_start_extension.py` (logs every
+/// `on_session_start` to `session-start.jsonl` in its plugin dir and injects
+/// a sentinel into the session's context).
+fn install_session_start_plugin(env: &Env) -> PathBuf {
+    let dir = env.base().join("plugins/start-probe");
+    std::fs::create_dir_all(dir.join(".synaps-plugin")).unwrap();
+    std::fs::create_dir_all(dir.join("extensions")).unwrap();
+    std::fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/slow_session_start_extension.py"),
+        dir.join("extensions/slow_session_start_extension.py"),
+    )
+    .unwrap();
+    let manifest = serde_json::json!({
+        "name": "start-probe",
+        "version": "0.1.0",
+        "extension": {
+            "protocol_version": 1,
+            "runtime": "process",
+            "command": "python3",
+            "args": ["extensions/slow_session_start_extension.py"],
+            "permissions": ["session.lifecycle"],
+            "hooks": [{"hook": "on_session_start"}]
+        }
+    });
+    std::fs::write(dir.join(".synaps-plugin/plugin.json"), serde_json::to_string_pretty(&manifest).unwrap()).unwrap();
+    dir
+}
+
+async fn one_piped_turn(env: &Env, args: &[&str], text: &str) -> std::process::Output {
+    let mut child = env
+        .cmd(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(text.as_bytes()).await.unwrap();
+    drop(stdin);
+    tokio::time::timeout(EXIT_TIMEOUT, child.wait_with_output()).await.expect("chat exits").unwrap()
+}
+
+/// `--no-extensions` runs over the daemon: chat uses the profile's private
+/// no-extensions daemon, where no extension is loaded, so no hook runs for
+/// that session. Control: the same plugin's hook runs (and injects) for a
+/// plain `synaps chat` on the profile daemon.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn no_extensions_runs_no_extension_hooks() {
+    use agent_engine::session::socket_transport::SocketTransport;
+    let (url, _hits, bodies) = phase2::spawn_stub(Script::Sse(phase2::ANTHROPIC_SSE)).await;
+    let env = Env::new(url);
+    let plugin = install_session_start_plugin(&env);
+    let log = plugin.join("session-start.jsonl");
+    let sentinel = "SLOW-START-SENTINEL";
+
+    let out = one_piped_turn(&env, &["chat", "--no-extensions"], "CHATDIFF-NOEXT one\n").await;
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr: {err}");
+    let noext = agent_engine::daemon::registry::daemon_paths_in_for(&env.run_dir(), None, true);
+    assert!(agent_engine::daemon::registry::is_alive(&noext), "the private no-extensions daemon serves it");
+    let probe = SocketTransport::ping(&noext.sock).await;
+    assert!(probe.is_ok(), "{:?}", probe.err());
+    let profile_daemon = agent_engine::daemon::registry::daemon_paths_in(&env.run_dir(), None);
+    assert!(!agent_engine::daemon::registry::is_alive(&profile_daemon), "the profile daemon was not started");
+    assert!(!log.exists(), "on_session_start ran for a --no-extensions session: {:?}", std::fs::read_to_string(&log));
+    {
+        let b = bodies.lock().unwrap();
+        let body = String::from_utf8_lossy(b.last().expect("one provider request"));
+        assert!(body.contains("CHATDIFF-NOEXT one"), "{body}");
+        assert!(!body.contains(sentinel), "a hook injected into a --no-extensions session: {body}");
+    }
+
+    // Control: without the flag the same plugin's hook runs and injects.
+    let out = one_piped_turn(&env, &["chat"], "CHATDIFF-NOEXT two\n").await;
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr: {err}");
+    assert!(agent_engine::daemon::registry::is_alive(&profile_daemon));
+    let t0 = std::time::Instant::now();
+    while !log.exists() {
+        assert!(t0.elapsed() < Duration::from_secs(10), "control: the hook never ran (fixture broken?)");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let b = bodies.lock().unwrap();
+    let body = String::from_utf8_lossy(b.last().unwrap());
+    assert!(body.contains("CHATDIFF-NOEXT two") && body.contains(sentinel), "control injected: {body}");
+}

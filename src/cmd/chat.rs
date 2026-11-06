@@ -1,63 +1,316 @@
-//! `synaps chat` — fully-featured headless mode.
+//! `synaps chat` — fully-featured headless mode, hosted by the session daemon.
 //!
 //! Same engine as the TUI (MCP, extensions, skills, session persistence,
-//! compaction) but renders to stdin/stdout. Built for scripting,
-//! piping, SSH, CI, and agent benchmark frameworks like Harbor.
+//! compaction), rendered to stdin/stdout. Built for scripting, piping, SSH,
+//! CI, and agent benchmark frameworks like Harbor.
+//!
+//! The session runs in the profile's daemon (started on demand, exactly as
+//! `synaps --attach` does) and is OWNED by this process: it is created with
+//! this process's cwd and full environment (secret env vars forwarded to the
+//! daemon's memory only, for the session's tools), and it ends — any running
+//! turn cancelled, the journal kept — when chat exits, is killed or loses its
+//! connection. stdin EOF and `/quit` end it cleanly first (`End` → `Ended`),
+//! so an immediate `--continue` never races the dying session.
+//! `--no-extensions` uses a private daemon booted without extensions.
 //!
 //! C4a: chat continues turns when pending runtime events are injected at
-//! turn end (AutoTriggerEvents), bounded by AUTO_TURN_CAP.
+//! turn end (AutoTriggerEvents, the actor's wake path), bounded by
+//! AUTO_TURN_CAP.
 //!
-//! C4b: blocking read_line replaced with tokio::io::stdin + select! against
-//! event_queue.notified(), so runtime events wake the prompt immediately.
-//! Exactly ONE waiter on notified() exists while idle at the prompt.
-//! Piped stdin, EOF, and CRLF behaviour are preserved.
+//! C4b: the event stream and stdin are selected together, so a runtime event
+//! wakes the idle prompt at once. stdin is only polled while the session is
+//! idle, so a piped line is always a `Submit`. Piped stdin, EOF, and CRLF
+//! behaviour are preserved.
 
-#[cfg(feature = "legacy_inline")]
-use futures::StreamExt;
-#[cfg(feature = "legacy_inline")]
-use serde_json::json;
-#[cfg(feature = "legacy_inline")]
 use std::io::{self, Write};
-#[cfg(feature = "legacy_inline")]
-use synaps_cli::engine::commands::{self, CommandResult};
-#[cfg(feature = "legacy_inline")]
-use synaps_cli::engine::reactor::{
-    claim_auto_turn_with_cap, drain_event_queue, wake_action_with_cap, WakeAction,
-    AUTO_TURN_CAP_CONFIG_KEY,
+
+use agent_engine::daemon::{self, DaemonOpts, EnsureError, EXIT_DAEMON_LOST, EXIT_REFUSED, EXIT_VERSION};
+use agent_engine::session::socket_transport::SocketTransport;
+use agent_engine::session::wire::{Attach, Hello, FEATURE_NO_EXTENSIONS, MAX_FRAME_BYTES};
+use agent_engine::session::{
+    AttachMode, ClientKind, ClientTransport, EndReason, Envelope, SessionCommand, SessionConfig,
+    SessionEventWire, SessionQuery, SessionSetting, TransportError,
 };
-#[cfg(feature = "legacy_inline")]
-use synaps_cli::engine::session::ConversationState;
-#[cfg(feature = "legacy_inline")]
-use synaps_cli::engine::setup::{self, EngineOpts};
-#[cfg(feature = "legacy_inline")]
-use synaps_cli::engine::stream::{self, EngineStreamEvent, StreamCompletion, SubagentTracker};
-#[cfg(feature = "legacy_inline")]
-use synaps_cli::runtime::compaction::{
-    apply_compaction, compact_conversation, preview_compaction_disclosure, CompactionPolicy,
-    CompactionTransition,
-};
-#[cfg(feature = "legacy_inline")]
-use synaps_cli::{flush_stdout, CancellationToken};
-#[cfg(feature = "legacy_inline")]
+use synaps_cli::engine::commands;
+use synaps_cli::flush_stdout;
+use synaps_cli::{AgentEvent, LlmEvent, SessionEvent, StreamEvent};
 use tokio::io::{AsyncBufReadExt, BufReader as TokioBufReader};
 
-/// What was read while waiting at the prompt.
-#[cfg(feature = "legacy_inline")]
-enum PromptRead {
-    /// User typed (or pipe delivered) a line.
-    Line(String),
-    /// EOF on stdin.
-    Eof,
-    /// A runtime event woke us; drain + wake_action already ran.
-    /// `run_turn` = true when wake_action said RunTurn.
-    EventWake { run_turn: bool },
-    /// I/O error.
-    Error(std::io::Error),
+/// Query id for the post-compaction token readout (user queries start at 1
+/// and count up). Below `wire::RESERVED_QUERY_ID_BASE`: the socket
+/// transport swallows the results of ids at or above it.
+const COMPACT_TOKENS_QUERY: u64 = agent_engine::session::wire::RESERVED_QUERY_ID_BASE - 1;
+
+/// Headroom for the frame envelope around a command (session id, tags).
+const FRAME_OVERHEAD: usize = 4096;
+
+struct Render {
+    is_tty: bool,
+    in_thinking: bool,
+    streaming: bool,
+    idle: bool,
+    fatal: Option<synaps_cli::TurnError>,
+    cost: f64,
+    ended: bool,
+    /// A `Confirm` prompt waiting for a y/n line from a TTY user (the
+    /// next stdin line answers it). Secret prompts are never held here:
+    /// the line client has no masked input and cancels them.
+    pending_confirm: Option<agent_engine::session::PromptRequest>,
 }
 
-/// Entry point. Runs on the `SessionActor` via `LocalTransport` (A2); the
-/// pre-actor inline loop is kept behind `--features legacy_inline` +
-/// `SYNAPS_CHAT_INLINE=1` until day 3.
+impl Render {
+    fn end_thinking(&mut self) {
+        if self.in_thinking {
+            eprintln!("\x1b[0m");
+            self.in_thinking = false;
+        }
+    }
+
+    async fn on_event(&mut self, transport: &SocketTransport, env: Envelope) {
+        match env.event {
+            SessionEventWire::Stream(ev) => self.on_stream(ev),
+            SessionEventWire::TurnStarted { .. } => {
+                self.streaming = true;
+                self.idle = false;
+            }
+            SessionEventWire::Conversation(c) => self.cost = c.cost,
+            SessionEventWire::Idle => self.idle = true,
+            SessionEventWire::Prompt(pr) => {
+                if pr.kind == agent_engine::session::PromptKind::Confirm
+                    && self.is_tty
+                    && self.pending_confirm.is_none()
+                {
+                    // Confirm (e.g. `activate_tools`): show the FULL body
+                    // and take one y/n line. Anything but y/yes denies.
+                    self.end_thinking();
+                    // Sanitized (prA I-R4-3): no cursor moves or bidi tricks.
+                    eprint!(
+                        "\n[confirm] {}\n{}\n(y/n): ",
+                        agent_engine::session::sanitize_prompt_text(&pr.title),
+                        agent_engine::session::sanitize_prompt_text(&pr.prompt)
+                    );
+                    io::stderr().flush().ok();
+                    self.pending_confirm = Some(pr);
+                    return;
+                }
+                // Headless chat has no masked prompt UI: cancel it.
+                let _ = transport
+                    .send(SessionCommand::Answer {
+                        prompt_id: pr.id,
+                        value: None,
+                    })
+                    .await;
+            }
+            SessionEventWire::PromptResolved { prompt_id } => {
+                if self.pending_confirm.as_ref().is_some_and(|p| p.id == prompt_id) {
+                    self.pending_confirm = None;
+                }
+            }
+            SessionEventWire::External(event) => {
+                eprintln!(
+                    "\x1b[36m⚡ [event] {}\x1b[0m",
+                    synaps_cli::events::format_event_for_agent(&event)
+                );
+            }
+            SessionEventWire::AutoTurnCapReached { cap } => {
+                eprintln!(
+                    "\x1b[2m[auto-turn cap ({}) reached — waiting for user input]\x1b[0m",
+                    cap
+                );
+            }
+            SessionEventWire::SystemNotice(text) => eprintln!("\x1b[2m{}\x1b[0m", text),
+            SessionEventWire::Aborted { context_saved } => eprintln!(
+                "\x1b[2m{}\x1b[0m",
+                if context_saved {
+                    "aborted — partial work kept"
+                } else {
+                    "aborted"
+                }
+            ),
+            SessionEventWire::Cleared { session_id } => eprintln!(
+                "session cleared → {}",
+                &session_id[..8.min(session_id.len())]
+            ),
+            // B2: spawned compaction reports through typed events — each
+            // rendered exactly once.
+            SessionEventWire::CompactionStarted { disclosure, .. } => {
+                eprintln!("compacting...");
+                eprintln!("{}", disclosure);
+            }
+            SessionEventWire::CompactionApplied { .. } => {
+                // `compacted → ~N tokens` needs the post-apply assessment.
+                let _ = transport
+                    .send(SessionCommand::Query {
+                        id: COMPACT_TOKENS_QUERY,
+                        query: SessionQuery::ContextAssessment,
+                    })
+                    .await;
+            }
+            SessionEventWire::QueryResult { id, value } if id == COMPACT_TOKENS_QUERY => {
+                eprintln!(
+                    "\x1b[2m[compacted → ~{} tokens]\x1b[0m",
+                    value["used_tokens"].as_u64().unwrap_or(0)
+                )
+            }
+            SessionEventWire::CompactionFailed { message, .. } => {
+                eprintln!("\x1b[2m[compaction failed: {}]\x1b[0m", message)
+            }
+            SessionEventWire::CompactionCancelled => {
+                eprintln!("\x1b[2m[compaction cancelled]\x1b[0m")
+            }
+            SessionEventWire::Ended { .. } => self.ended = true,
+            _ => {}
+        }
+    }
+
+    fn on_stream(&mut self, ev: StreamEvent) {
+        match ev {
+            StreamEvent::Llm(LlmEvent::Thinking(text)) => {
+                if !self.in_thinking {
+                    eprint!("\x1b[2m");
+                    self.in_thinking = true;
+                }
+                eprint!("{}", text);
+                io::stderr().flush().ok();
+            }
+            StreamEvent::Llm(LlmEvent::Text(text)) => {
+                self.end_thinking();
+                print!("{}", text);
+                flush_stdout();
+            }
+            StreamEvent::Llm(LlmEvent::ToolUseStart { tool_name, .. }) => {
+                self.end_thinking();
+                eprint!("\x1b[33m⚙ {}\x1b[0m", tool_name);
+                io::stderr().flush().ok();
+            }
+            StreamEvent::Llm(LlmEvent::ToolUse {
+                tool_name, input, ..
+            }) => {
+                let input_preview = serde_json::to_string(&input).unwrap_or_default();
+                let preview: String = input_preview.chars().take(60).collect();
+                eprintln!("\x1b[33m ⚙ {} ({})\x1b[0m", tool_name, preview);
+            }
+            StreamEvent::Llm(LlmEvent::ToolResult { result, .. }) => {
+                let preview: String = result.chars().take(80).collect();
+                eprintln!("\x1b[32m  → {}\x1b[0m", preview);
+            }
+            StreamEvent::Agent(AgentEvent::SubagentStart {
+                agent_name,
+                task_preview,
+                ..
+            }) => eprintln!("\x1b[35m🎭 [{}] {}\x1b[0m", agent_name, task_preview),
+            StreamEvent::Agent(AgentEvent::SubagentDone {
+                result_preview,
+                duration_secs,
+                ..
+            }) => {
+                let status = if result_preview.starts_with("[TIMED OUT") {
+                    "\u{26a0} timed out".to_string()
+                } else if result_preview.starts_with("ERROR") {
+                    let preview: String = result_preview.chars().take(40).collect();
+                    format!("\u{2718} {}", preview)
+                } else {
+                    let preview: String = result_preview.chars().take(40).collect();
+                    format!("\u{2714} {}", preview)
+                };
+                eprintln!("\x1b[32m✔ {} ({:.1}s)\x1b[0m", status, duration_secs);
+            }
+            StreamEvent::Agent(AgentEvent::SteeringDelivered { message }) => {
+                eprintln!("\x1b[33m→ [steering] {}\x1b[0m", message);
+            }
+            StreamEvent::Session(SessionEvent::Notice(text) | SessionEvent::Retry(text)) => {
+                eprintln!("\x1b[2m{}\x1b[0m", text);
+            }
+            StreamEvent::Session(SessionEvent::Done) => {
+                self.end_thinking();
+                println!();
+                self.streaming = false;
+            }
+            StreamEvent::Session(SessionEvent::Error(err)) => {
+                eprintln!("\x1b[31m❌ {}\x1b[0m", err.message);
+                self.end_thinking();
+                println!();
+                eprintln!("\x1b[31m❌ turn failed [{}]\x1b[0m", err.category_label());
+                self.fatal = Some(err);
+                self.streaming = false;
+            }
+            _ => {}
+        }
+    }
+
+    /// Pump events until the reply for query `id` arrives.
+    async fn reply(&mut self, t: &mut SocketTransport, id: u64) -> serde_json::Value {
+        loop {
+            let Some(env) = next(t, self).await else { break };
+            if let SessionEventWire::QueryResult { id: rid, value } = &env.event {
+                if *rid == id {
+                    return value.clone();
+                }
+            }
+            self.on_event(t, env).await;
+            if self.ended {
+                break;
+            }
+        }
+        serde_json::Value::Null
+    }
+}
+
+/// The next session event. A daemon reload (`Reloading`) re-binds this
+/// owned session within the owner grace; any other loss of the connection
+/// is fatal: the owned session is gone with it, so chat says why and exits
+/// [`EXIT_DAEMON_LOST`]. `None` = the session ended (`Ended` was seen).
+async fn next(t: &mut SocketTransport, r: &mut Render) -> Option<Envelope> {
+    loop {
+        if let Some(env) = t.next_event().await {
+            return Some(env);
+        }
+        if r.ended {
+            return None;
+        }
+        match t.last_error() {
+            Some(TransportError::Reloading { .. }) => match t.reconnect(AttachMode::Mirror).await {
+                Ok(snap) => {
+                    r.streaming = snap.streaming;
+                    r.idle = !snap.streaming;
+                    continue;
+                }
+                Err(e) => lost(&format!("the daemon reloaded and the session could not be re-bound: {e}")),
+            },
+            Some(e) => lost(&e.to_string()),
+            None => lost("the daemon closed the connection"),
+        }
+    }
+}
+
+fn lost(why: &str) -> ! {
+    r_end_thinking_raw();
+    eprintln!(
+        "synaps chat: lost the session: {why}\n  the session ended with this connection (its journal is kept); \
+         resume it with `synaps chat --continue <id>`"
+    );
+    std::process::exit(EXIT_DAEMON_LOST);
+}
+
+/// Reset any open dim (thinking) attribute before a fatal line.
+fn r_end_thinking_raw() {
+    eprint!("\x1b[0m");
+}
+
+/// `cmd` fits in one daemon frame (the daemon drops a connection that sends
+/// an oversize frame, which would end this owned session).
+fn fits_frame(cmd: &SessionCommand) -> bool {
+    serde_json::to_vec(cmd).map(|v| v.len() + FRAME_OVERHEAD <= MAX_FRAME_BYTES).unwrap_or(false)
+}
+
+/// What chat prints when no daemon can be had, and how to fix it.
+fn no_daemon(profile: Option<&str>, no_extensions: bool, error: Option<&str>) -> ! {
+    eprintln!("synaps chat: {}", super::attach::daemon_unavailable_message(profile, no_extensions, error));
+    std::process::exit(EXIT_REFUSED);
+}
+
+/// Entry point: connect to (or start) the profile's daemon and run an owned
+/// session over its socket.
 pub async fn run(
     continue_session: Option<String>,
     system: Option<String>,
@@ -65,281 +318,301 @@ pub async fn run(
     profile: Option<String>,
     no_extensions: bool,
 ) -> synaps_cli::Result<()> {
-    #[cfg(feature = "legacy_inline")]
-    if std::env::var("SYNAPS_CHAT_INLINE").map(|v| v == "1").unwrap_or(false) {
-        return run_inline(continue_session, system, agent, profile, no_extensions).await;
-    }
-    actor::run(continue_session, system, agent, profile, no_extensions).await
-}
-
-#[cfg(feature = "legacy_inline")]
-async fn run_inline(
-    continue_session: Option<String>,
-    system: Option<String>,
-    agent: Option<String>,
-    profile: Option<String>,
-    no_extensions: bool,
-) -> synaps_cli::Result<()> {
-    // ── Boot engine ──
-    let boot = setup::boot(EngineOpts {
-        continue_session: continue_session.map(Some),
-        system,
-        prompt_manifest: None,
-        profile,
-        no_extensions,
-    })
-    .await?;
-
-    let mut runtime = boot.runtime;
-    let mut conv = if boot.continued {
-        ConversationState::from_resumed(boot.session)
-    } else {
-        ConversationState::new(boot.session)
-    };
-
-    // Load agent prompt if specified
-    if let Some(ref agent_name) = agent {
-        match synaps_cli::tools::resolve_agent_prompt(agent_name) {
+    // Agent prompt resolves before any session work (exit 1).
+    let agent_prompt = match agent {
+        Some(ref agent_name) => match synaps_cli::tools::resolve_agent_prompt(agent_name) {
             Ok(p) => {
                 eprintln!("🎭 Agent: {}", agent_name);
-                runtime.set_system_prompt(p);
+                Some(p)
             }
             Err(e) => {
                 eprintln!("❌ {}", e);
                 std::process::exit(1);
             }
+        },
+        None => None,
+    };
+    if let Some(w) = daemon::legacy_env_warning() {
+        eprintln!("synaps chat: {w}");
+    }
+    let config = synaps_cli::load_config();
+    agent_engine::host::report_config_warnings(&config);
+
+    // ── the daemon: running, or started now (`--attach`'s autospawn) ──
+    let opts = DaemonOpts { profile: profile.clone(), no_extensions, ..Default::default() };
+    let paths = opts.paths();
+    let spawn_opts = opts.clone();
+    let ensured = tokio::task::spawn_blocking(move || daemon::ensure_running(&spawn_opts))
+        .await
+        .map_err(|e| synaps_cli::RuntimeError::Session(format!("daemon start: {e}")))?;
+    match ensured {
+        Ok(_) => {}
+        Err(EnsureError::AutospawnDisabled) => {
+            no_daemon(profile.as_deref(), no_extensions, None)
+        }
+        Err(EnsureError::Spawn(reason)) => {
+            no_daemon(profile.as_deref(), no_extensions, Some(&format!("could not start it: {reason}")))
         }
     }
-
-    // Extension discovery — await completion before entering the read loop.
-    //
-    // In pipe/headless mode (echo "..." | synaps chat ...) stdin is immediately
-    // ready, so the old fire-and-forget approach caused a race: the first API
-    // call fired before extension processes finished spawning, and the model
-    // never saw extension-registered tools. Awaiting here ensures all extensions
-    // are loaded before we read stdin.
-    //
-    // The TUI is unaffected — it has its own extension loader path that runs
-    // concurrently with the event loop (human typing provides natural latency).
-    if !boot.no_extensions {
-        boot.ext_manager.write().await.discover_and_load().await;
+    let conn = match SocketTransport::connect(&paths.sock, Hello::new(ClientKind::Chat)).await {
+        Ok(c) => c,
+        Err(TransportError::Version { client, daemon }) => {
+            eprintln!(
+                "synaps chat: protocol version mismatch (client {client}, daemon {daemon}); \
+                 run `synaps daemon reload` to restart the daemon on this binary"
+            );
+            std::process::exit(EXIT_VERSION);
+        }
+        Err(e) => no_daemon(profile.as_deref(), no_extensions, Some(&format!("{}: {e}", paths.sock.display()))),
+    };
+    if let Some(msg) = daemon::profile_mismatch(conn.welcome.profile.as_deref(), profile.as_deref()) {
+        eprintln!("synaps chat: {msg}");
+        std::process::exit(EXIT_REFUSED);
+    }
+    if conn.welcome.supports(FEATURE_NO_EXTENSIONS) != no_extensions {
+        eprintln!(
+            "synaps chat: the daemon at {} {} extensions; refusing to run this session there",
+            paths.sock.display(),
+            if no_extensions { "runs" } else { "does not run" }
+        );
+        std::process::exit(EXIT_REFUSED);
     }
 
+    // The session runs where chat runs. `--system` keeps its in-process
+    // meaning: an existing file (relative to this cwd) is read here, any
+    // other value is the prompt text itself.
+    let cwd = std::env::current_dir()
+        .map_err(|e| synaps_cli::RuntimeError::Session(format!("current directory: {e}")))?;
+    let system = system.map(|v| match std::path::Path::new(&v).is_file() {
+        true => std::fs::read_to_string(&v).unwrap_or(v),
+        false => v,
+    });
+    let session_cfg = SessionConfig {
+        continue_session: continue_session.map(Some),
+        system,
+        auto_compact: true,
+        cwd: Some(cwd),
+        ..SessionConfig::default()
+    };
+    let (mut t, snap) = match SocketTransport::attach(
+        conn,
+        Attach::create_owned(session_cfg, AttachMode::Mirror, true),
+    )
+    .await
+    {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("synaps chat: could not create the session in the daemon: {e}");
+            std::process::exit(EXIT_REFUSED);
+        }
+    };
+    if let Some(p) = agent_prompt {
+        let _ = t
+            .send(SessionCommand::Set { id: 0, setting: SessionSetting::SystemPrompt { text: p } })
+            .await;
+    }
+
+    let session_id = snap.meta.id.as_str().to_string();
     eprintln!(
         "synaps {} | {} | session {}",
         env!("CARGO_PKG_VERSION"),
-        runtime.model(),
-        &conv.session.id[..8]
+        snap.view.model,
+        &session_id[..8.min(session_id.len())]
     );
-    if boot.continued {
-        eprintln!("↳ resumed session ({} messages)", conv.api_messages.len());
+    if snap.meta.continued {
+        eprintln!(
+            "↳ resumed session ({} messages)",
+            snap.conversation.api_messages.len()
+        );
     }
-    if boot.mcp_server_count > 0 {
-        eprintln!("↳ {} MCP servers available", boot.mcp_server_count);
+    let mcp_tools = agent_engine::mcp::cached_tool_count();
+    if mcp_tools > 0 {
+        eprintln!("↳ {} MCP servers available", mcp_tools);
     }
     eprintln!();
 
-    // ── Main loop ──
-    let is_tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
-    let mut subagents: Vec<SubagentTracker> = Vec::new();
-    // Typed spec §5.2 terminal failure of the last turn. In headless (piped)
-    // mode an unrecovered failure aborts the read loop and the process exits
-    // nonzero — after the session (with valid partial history) is saved.
-    let mut fatal_failure: Option<synaps_cli::TurnError> = None;
-
-    // C4a: consecutive auto-turn counter; reset to 0 on real user input.
-    // Initial value doesn't matter — always reset before first turn.
-    #[allow(unused_assignments)]
-    let mut consecutive_auto_turns: u32 = 0;
-    // Configured `events.auto_turn_cap` (default 5; 0 = unlimited).
-    let auto_turn_cap = synaps_cli::core::config::load_config().events.auto_turn_cap;
-
-    // C4b: async tokio stdin — lets us select! against event_queue.notified()
-    // while idle at the prompt so runtime events can wake us immediately.
-    //
-    // For piped stdin (is_tty=false) this is identical in behaviour to the
-    // old blocking read_line: lines() returns Ok(None) on EOF, each poll
-    // returns one complete line without blocking the executor.
-    let async_stdin = tokio::io::stdin();
-    let mut stdin_lines = TokioBufReader::new(async_stdin).lines();
+    let mut r = Render {
+        is_tty: std::io::IsTerminal::is_terminal(&std::io::stdin()),
+        in_thinking: false,
+        streaming: snap.streaming,
+        idle: !snap.streaming,
+        fatal: None,
+        cost: snap.conversation.cost,
+        ended: false,
+        pending_confirm: None,
+    };
+    let mut pending_attachments = agent_engine::attachments::PendingAttachments::default();
+    let mut stdin_lines = TokioBufReader::new(tokio::io::stdin()).lines();
+    let mut next_query: u64 = 1;
+    let mut prompt_shown = false;
 
     loop {
-        // ── Prompt ──
-        if is_tty {
+        if r.idle && r.is_tty && !prompt_shown {
             eprint!("❯ ");
             io::stderr().flush().ok();
+            prompt_shown = true;
         }
-
-        // C4b: Select between a new stdin line and a runtime event notification.
-        // Exactly ONE waiter on event_queue.notified() exists while we are idle.
-        let read = {
-            let event_queue = runtime.event_queue().clone();
-            tokio::select! {
-                // Branch 1: user typed a line (or pipe delivered one).
-                line = stdin_lines.next_line() => {
-                    match line {
-                        Ok(Some(l)) => PromptRead::Line(l),
-                        Ok(None)    => PromptRead::Eof,
-                        Err(e)      => PromptRead::Error(e),
-                    }
-                }
-                // Branch 2: a runtime event arrived while we were idle.
-                _ = event_queue.notified() => {
-                    let drained = drain_event_queue(
-                        &event_queue,
-                        &mut conv.api_messages,
-                        &mut conv.pending_events,
-                        false, // idle
-                        None,  // no steer channel
-                    );
-                    for d in &drained {
-                        eprintln!("\x1b[36m⚡ [event] {}\x1b[0m", d.formatted);
-                    }
-                    let action = wake_action_with_cap(
-                        &drained,
-                        &conv.api_messages,
-                        false,
-                        true,  // auto_turn_enabled in chat mode
-                        consecutive_auto_turns,
-                        auto_turn_cap,
-                    );
-                    PromptRead::EventWake { run_turn: action == WakeAction::RunTurn }
-                }
-            }
-        };
-
-        match read {
-            PromptRead::Error(e) => {
-                eprintln!("input error: {}", e);
-                break;
-            }
-            PromptRead::Eof => break,
-
-            PromptRead::EventWake { run_turn: false } => {
-                // Forward/Nothing — redraw prompt and wait for real input.
-                if is_tty {
-                    eprint!("❯ ");
-                    io::stderr().flush().ok();
-                }
-                continue;
-            }
-
-            PromptRead::EventWake { run_turn: true } => {
-                // A runtime event was injected; policy says RunTurn.
-                // Events were already drained + injected by drain_event_queue above.
-                // claim_auto_turn: increment only if allowed; if denied (cap) we
-                // got run_turn=true from wake_action which already checked < cap,
-                // so this should always succeed here — but use the gate for safety.
-                let _ = claim_auto_turn_with_cap(&mut consecutive_auto_turns, auto_turn_cap);
-            }
-
-            PromptRead::Line(raw_line) => {
-                let trimmed = raw_line.trim_end_matches('\r').trim();
-
-                if trimmed.is_empty() {
+        // stdin only while idle: a piped line is always a Submit.
+        let line = tokio::select! {
+            biased;
+            ev = next(&mut t, &mut r) => match ev {
+                Some(env) => {
+                    r.on_event(&t, env).await;
+                    if r.ended { break; }
+                    // Headless (piped): an unrecovered failure terminates
+                    // after the turn settles; TTY users keep their session.
+                    if r.idle && r.fatal.is_some() && !r.is_tty { break; }
+                    if r.idle && r.fatal.is_some() { r.fatal = None; }
                     continue;
                 }
+                None => break,
+            },
+            line = stdin_lines.next_line(), if r.idle || r.pending_confirm.is_some() => match line {
+                Ok(Some(l)) => l,
+                Ok(None) => break,
+                Err(e) => { eprintln!("input error: {}", e); break; }
+            },
+        };
+        prompt_shown = false;
 
-                // Real user input — reset auto-turn counter.
-                consecutive_auto_turns = 0;
+        // A pending confirm owns the next line: `y`/`yes` allows, anything
+        // else (including empty) denies — fail-closed, never a Submit.
+        if let Some(pr) = r.pending_confirm.take() {
+            let answer = line.trim();
+            let value = if answer.is_empty() { None } else { Some(answer.to_string()) };
+            let _ = t
+                .send(SessionCommand::Answer { prompt_id: pr.id, value })
+                .await;
+            continue;
+        }
 
-                // ── Slash commands ──
-                if let Some((cmd, arg)) = commands::parse_command(trimmed) {
-                    // Try engine-level command first
-                    commands::prepare_engine_command(cmd, arg, &runtime).await;
-                    if let Some(result) = commands::handle_engine_command(cmd, arg, &mut runtime) {
-                        match result {
-                            CommandResult::Quit => break,
-                            CommandResult::ModelChanged {
-                                model,
-                                reasoning_clamped,
-                            } => {
-                                conv.session.model = runtime.model().to_string();
-                                eprintln!("model → {}", model);
-                                if let Some(clamp) = reasoning_clamped {
-                                    conv.session.thinking_level =
-                                        runtime.thinking_level().to_string();
-                                    eprintln!(
-                                        "thinking → {} (clamped from {}: not supported by {})",
-                                        clamp.to.as_str(),
-                                        clamp.from.as_str(),
-                                        runtime.model()
-                                    );
-                                }
-                            }
-                            CommandResult::ThinkingChanged { spec } => {
-                                conv.session.thinking_level = spec.config_value();
-                                eprintln!("thinking → {}", spec.level());
-                            }
-                            CommandResult::Compact {
-                                custom_instructions,
-                            } => {
-                                eprintln!("compacting...");
-                                // Spec §9.4: surface provider/model and the
-                                // approximate disclosure BEFORE dispatch.
-                                eprintln!(
-                                    "{}",
-                                    preview_compaction_disclosure(&runtime, &conv.api_messages)
-                                        .render_line()
-                                );
-                                match compact_conversation(
-                                    &conv.api_messages,
-                                    &runtime,
-                                    custom_instructions.as_deref(),
-                                )
-                                .await
-                                {
-                                    Ok(outcome) => match apply_compaction(
-                                        &runtime,
-                                        &conv.session,
-                                        &conv.api_messages,
-                                        &outcome,
-                                        CompactionTransition {
-                                            policy: CompactionPolicy::InPlace,
-                                            pending_events: Vec::new(),
-                                            queued_message: None,
-                                            hook_source: "manual".to_string(),
-                                        },
-                                    )
-                                    .await
-                                    {
-                                        Ok(applied) => {
-                                            conv.session = applied.session;
-                                            conv.api_messages = applied.api_messages;
-                                            let after =
-                                                runtime.assess_context(&conv.api_messages).await;
-                                            eprintln!(
-                                                "compacted → ~{} tokens",
-                                                after.used_tokens()
-                                            );
-                                        }
-                                        Err(e) => eprintln!("compaction failed: {}", e),
-                                    },
-                                    Err(e) => eprintln!("compaction failed: {}", e),
-                                }
-                            }
-                            CommandResult::Error(e) => eprintln!("error: {}", e),
-                            CommandResult::Output(text) => println!("{}", text),
-                            _ => {} // Other results handled by TUI only
-                        }
+        let trimmed = line.trim_end_matches('\r').trim();
+        // Blank-line attachment-only submit.
+        if trimmed.is_empty() {
+            if !pending_attachments.is_empty() {
+                let summaries = pending_attachments.summaries();
+                for s in &summaries {
+                    eprintln!("📎 {s}");
+                }
+                let cmd = SessionCommand::Submit {
+                    text: String::new(),
+                    attachments: pending_attachments.take_blocks(),
+                };
+                if !fits_frame(&cmd) {
+                    oversize();
+                    continue;
+                }
+                r.idle = false;
+                if t.send(cmd).await.is_err() {
+                    break;
+                }
+            }
+            continue;
+        }
+
+        if let Some((cmd, arg)) = commands::parse_command(trimmed) {
+            // Client-side attachment commands — never reach the session.
+            match cmd {
+                "attach" => {
+                    if arg.is_empty() {
+                        eprintln!("usage: /attach <path>");
                         continue;
                     }
-
-                    // Commands not handled by engine — headless-specific handling
-                    match cmd {
-                        "clear" => {
-                            conv.clear(&runtime).await;
-                            runtime.begin_conversation(Some(conv.session.id.clone()));
-                            eprintln!("session cleared → {}", &conv.session.id[..8]);
+                    let path_str = arg.trim_matches(|c| c == '"' || c == '\'');
+                    let path = std::path::PathBuf::from(path_str);
+                    match agent_engine::attachments::load_attachment_sync(&path) {
+                        Ok(loaded) => match pending_attachments.add(loaded) {
+                            Ok(()) => {
+                                let s = pending_attachments.summaries();
+                                eprintln!("📎 staged: {}", s.last().unwrap_or(&String::new()));
+                            }
+                            Err(e) => eprintln!("error: {e}"),
+                        },
+                        Err(e) => {
+                            eprintln!("error: {path_str}: {e}");
+                            if !r.is_tty {
+                                // Piped: fail-stop (the session still ends cleanly).
+                                end_session(&mut t, &mut r).await;
+                                return Err(synaps_cli::RuntimeError::Session(
+                                    format!("attachment failed: {path_str}: {e}"),
+                                ));
+                            }
                         }
-                        "sessions" => match synaps_cli::list_recent_sessions(20) {
+                    }
+                    continue;
+                }
+                "attachments" => {
+                    let summaries = pending_attachments.summaries();
+                    if summaries.is_empty() {
+                        eprintln!("no pending attachments");
+                    } else {
+                        for (i, s) in summaries.iter().enumerate() {
+                            eprintln!("  [{i}] {s}");
+                        }
+                    }
+                    continue;
+                }
+                "detach" => {
+                    let n = pending_attachments.len();
+                    if arg.is_empty() || arg == "all" || arg == "clear" {
+                        pending_attachments.clear();
+                        if n > 0 {
+                            eprintln!("detached {n} file(s)");
+                        } else {
+                            eprintln!("no pending attachments");
+                        }
+                    } else if let Ok(idx) = arg.parse::<usize>() {
+                        if idx < n {
+                            pending_attachments.remove(idx);
+                            eprintln!("detached [{idx}]");
+                        } else {
+                            eprintln!("no attachment at index {idx}");
+                        }
+                    } else {
+                        eprintln!("usage: /detach [n|all]");
+                    }
+                    continue;
+                }
+                _ => {} // fall through to EngineCommand
+            }
+
+            let id = next_query;
+            next_query += 1;
+            let _ = t
+                .send(SessionCommand::EngineCommand {
+                    id,
+                    name: cmd.to_string(),
+                    arg: arg.to_string(),
+                })
+                .await;
+            let reply = r.reply(&mut t, id).await;
+            if r.ended {
+                break;
+            }
+            match reply["kind"].as_str().unwrap_or("none") {
+                "quit" => break,
+                "notice" => eprintln!("{}", reply["text"].as_str().unwrap_or("")),
+                "error" => eprintln!("error: {}", reply["text"].as_str().unwrap_or("")),
+                "output" => println!("{}", reply["text"].as_str().unwrap_or("")),
+                "unhandled" => match cmd {
+                    "clear" => {
+                        let _ = t.send(SessionCommand::NewSession).await;
+                    }
+                    "sessions" => {
+                        let id = next_query;
+                        next_query += 1;
+                        let _ = t
+                            .send(SessionCommand::Query {
+                                id,
+                                query: SessionQuery::Status,
+                            })
+                            .await;
+                        let status = r.reply(&mut t, id).await;
+                        let current = status["session"].as_str().unwrap_or("");
+                        match synaps_cli::list_recent_sessions(20) {
                             Ok(sessions) => {
                                 for s in sessions.iter().take(20) {
-                                    let marker = if s.id == conv.session.id {
-                                        "→ "
-                                    } else {
-                                        "  "
-                                    };
+                                    let marker = if s.id == current { "→ " } else { "  " };
                                     eprintln!(
                                         "{}{} {} ({}, ${:.4})",
                                         marker,
@@ -351,349 +624,102 @@ async fn run_inline(
                                 }
                             }
                             Err(e) => eprintln!("error: {}", e),
-                        },
-                        "status" => {
-                            eprintln!("session: {}", &conv.session.id[..8]);
-                            eprintln!("model: {}", runtime.model());
-                            eprintln!(
-                                "tokens: {}↑ {}↓",
-                                conv.total_input_tokens, conv.total_output_tokens
-                            );
-                            eprintln!("cost: ${:.4}", conv.session_cost);
-                            eprintln!("messages: {}", conv.api_messages.len());
-                            let assessment = runtime.assess_context(&conv.api_messages).await;
-                            eprintln!(
-                                "context: ~{} of {} budget tokens ({} window)",
-                                assessment.used_tokens(),
-                                assessment.budget_tokens(),
-                                assessment.provider_window
-                            );
-                        }
-                        "help" => {
-                            eprintln!("commands: /model /thinking /compact /clear /sessions /status /quit");
-                        }
-                        _ => {
-                            eprintln!("unknown command: /{} (try /help)", cmd);
                         }
                     }
-                    continue;
-                }
-
-                // ── Regular user message ── (an interrupted turn is already
-                // in history as partial messages + marker; never folded here)
-                conv.api_messages.push(std::sync::Arc::new(
-                    json!({"role": "user", "content": trimmed}),
-                ));
-            }
-        }
-
-        // ── C4a: turn loop — run until no pending events or cap reached ──
-        'turn_loop: loop {
-            let cancel = CancellationToken::new();
-            // Vec<SharedMessage> clone = pointer bumps only.
-            let msgs_in: Vec<synaps_cli::SharedMessage> = conv.api_messages.clone();
-            // Failure repair may only remove messages appended by this turn.
-            let turn_baseline = msgs_in.len();
-            let mut stream = runtime
-                .run_stream_with_messages(msgs_in, cancel, None, None, false)
-                .await;
-
-            let mut in_thinking = false;
-
-            let turn_completion = loop {
-                let Some(event) = stream.next().await else {
-                    break StreamCompletion::Done;
-                };
-                // Round checkpoints (and the final history) are persisted as
-                // they arrive, like the session actor does.
-                let is_history =
-                    matches!(event, synaps_cli::StreamEvent::Session(synaps_cli::SessionEvent::MessageHistory(_)));
-                let (engine_event, completion) = stream::process_stream_event(
-                    event,
-                    &mut conv.api_messages,
-                    &mut subagents,
-                    &mut conv.queued_message,
-                    &mut conv.pending_events,
-                    turn_baseline,
-                );
-                if is_history {
-                    conv.save().await;
-                }
-
-                match engine_event {
-                    EngineStreamEvent::Thinking(text) => {
-                        if !in_thinking {
-                            eprint!("\x1b[2m"); // dim
-                            in_thinking = true;
-                        }
-                        eprint!("{}", text);
-                        io::stderr().flush().ok();
-                    }
-                    EngineStreamEvent::Text(text) => {
-                        if in_thinking {
-                            eprintln!("\x1b[0m"); // reset
-                            in_thinking = false;
-                        }
-                        print!("{}", text);
-                        flush_stdout();
-                    }
-                    EngineStreamEvent::ToolStart { tool_name, .. } => {
-                        if in_thinking {
-                            eprintln!("\x1b[0m");
-                            in_thinking = false;
-                        }
-                        eprint!("\x1b[33m⚙ {}\x1b[0m", tool_name);
-                        io::stderr().flush().ok();
-                    }
-                    EngineStreamEvent::ToolFinalized {
-                        tool_name, input, ..
-                    } => {
-                        let input_preview = serde_json::to_string(&input).unwrap_or_default();
-                        let preview: String = input_preview.chars().take(60).collect();
-                        eprintln!("\x1b[33m ⚙ {} ({})\x1b[0m", tool_name, preview);
-                    }
-                    EngineStreamEvent::ToolResult { result, .. } => {
-                        let preview: String = result.chars().take(80).collect();
-                        eprintln!("\x1b[32m  → {}\x1b[0m", preview);
-                    }
-                    EngineStreamEvent::SubagentStart { name, task, .. } => {
-                        eprintln!("\x1b[35m🎭 [{}] {}\x1b[0m", name, task);
-                    }
-                    EngineStreamEvent::SubagentDone {
-                        status,
-                        duration_secs,
-                        ..
-                    } => {
-                        eprintln!("\x1b[32m✔ {} ({:.1}s)\x1b[0m", status, duration_secs);
-                    }
-                    EngineStreamEvent::Usage {
-                        input_tokens,
-                        output_tokens,
-                        cache_read,
-                        cache_creation,
-                        cache_creation_5m,
-                        cache_creation_1h,
-                        model,
-                    } => {
-                        let model_name = model.as_deref().unwrap_or(runtime.model());
-                        conv.add_usage(
-                            input_tokens,
-                            output_tokens,
-                            cache_read,
-                            cache_creation,
-                            cache_creation_5m,
-                            cache_creation_1h,
-                            model_name,
+                    "status" => {
+                        let id = next_query;
+                        next_query += 1;
+                        let _ = t
+                            .send(SessionCommand::Query {
+                                id,
+                                query: SessionQuery::Status,
+                            })
+                            .await;
+                        let st = r.reply(&mut t, id).await;
+                        let id2 = next_query;
+                        next_query += 1;
+                        let _ = t
+                            .send(SessionCommand::Query {
+                                id: id2,
+                                query: SessionQuery::ContextAssessment,
+                            })
+                            .await;
+                        let ctx = r.reply(&mut t, id2).await;
+                        let sid = st["session"].as_str().unwrap_or("");
+                        eprintln!("session: {}", &sid[..8.min(sid.len())]);
+                        eprintln!("model: {}", st["model"].as_str().unwrap_or(""));
+                        eprintln!(
+                            "tokens: {}↑ {}↓",
+                            st["tokens"]["input"].as_u64().unwrap_or(0),
+                            st["tokens"]["output"].as_u64().unwrap_or(0)
+                        );
+                        eprintln!("cost: ${:.4}", st["cost"].as_f64().unwrap_or(0.0));
+                        eprintln!("messages: {}", st["messages"].as_u64().unwrap_or(0));
+                        eprintln!(
+                            "context: ~{} of {} budget tokens ({} window)",
+                            ctx["used_tokens"].as_u64().unwrap_or(0),
+                            ctx["budget_tokens"].as_u64().unwrap_or(0),
+                            ctx["provider_window"].as_u64().unwrap_or(0)
                         );
                     }
-                    EngineStreamEvent::SteeringDelivered { message } => {
-                        eprintln!("\x1b[33m→ [steering] {}\x1b[0m", message);
+                    "help" => {
+                        eprintln!("commands: /model /thinking /compact /clear /sessions /status /attach /attachments /detach /quit");
+                        eprintln!("quitting (or EOF) mid-turn cancels the turn; its partial work is kept in history for the next --continue");
                     }
-                    EngineStreamEvent::Notice(text) => {
-                        eprintln!("\x1b[2m{}\x1b[0m", text);
-                    }
-                    EngineStreamEvent::Done | EngineStreamEvent::Noop => {}
-                    EngineStreamEvent::Error(e) => {
-                        eprintln!("\x1b[31m❌ {}\x1b[0m", e);
-                    }
-                    _ => {}
-                }
-
-                match completion {
-                    StreamCompletion::Done => {
-                        if in_thinking {
-                            eprintln!("\x1b[0m");
-                        }
-                        println!();
-                        break StreamCompletion::Done;
-                    }
-                    StreamCompletion::Error(err) => {
-                        // Typed spec §5.2 outcome — do NOT collapse into Done.
-                        if in_thinking {
-                            eprintln!("\x1b[0m");
-                        }
-                        println!();
-                        break StreamCompletion::Error(err);
-                    }
-                    StreamCompletion::AutoSendQueued(queued) => {
-                        if in_thinking {
-                            eprintln!("\x1b[0m");
-                        }
-                        conv.api_messages.push(std::sync::Arc::new(
-                            json!({"role": "user", "content": queued}),
-                        ));
-                        break StreamCompletion::AutoSendQueued(String::new());
-                    }
-                    StreamCompletion::AutoTriggerEvents => {
-                        if in_thinking {
-                            eprintln!("\x1b[0m");
-                        }
-                        break StreamCompletion::AutoTriggerEvents;
-                    }
-                    StreamCompletion::Continue => {}
-                }
-            };
-
-            // Post-turn: save + auto-compact. The trigger decision is the
-            // engine's request-aware budget (T29, spec §9.1) — no local
-            // token math.
-            conv.save().await;
-            let assessment = runtime.assess_context(&conv.api_messages).await;
-            if assessment.should_compact() {
-                eprintln!(
-                    "\x1b[2m[auto-compacting ~{} tokens...]\x1b[0m",
-                    assessment.used_tokens()
-                );
-                // Spec §9.4: pre-dispatch disclosure (provider/model/bytes).
-                eprintln!(
-                    "\x1b[2m[{}]\x1b[0m",
-                    preview_compaction_disclosure(&runtime, &conv.api_messages).render_line()
-                );
-                match compact_conversation(&conv.api_messages, &runtime, None).await {
-                    Ok(outcome) => match apply_compaction(
-                        &runtime,
-                        &conv.session,
-                        &conv.api_messages,
-                        &outcome,
-                        CompactionTransition {
-                            policy: CompactionPolicy::InPlace,
-                            pending_events: Vec::new(),
-                            queued_message: None,
-                            hook_source: "auto".to_string(),
-                        },
-                    )
-                    .await
-                    {
-                        Ok(applied) => {
-                            conv.session = applied.session;
-                            conv.api_messages = applied.api_messages;
-                            let after = runtime.assess_context(&conv.api_messages).await;
-                            eprintln!(
-                                "\x1b[2m[compacted → ~{} tokens]\x1b[0m",
-                                after.used_tokens()
-                            );
-                        }
-                        Err(e) => eprintln!("\x1b[2m[compaction failed: {}]\x1b[0m", e),
-                    },
-                    Err(e) => eprintln!("\x1b[2m[compaction failed: {}]\x1b[0m", e),
-                }
+                    _ => eprintln!("unknown command: /{} (try /help)", cmd),
+                },
+                _ => {}
             }
+            continue;
+        }
 
-            // C4a: decide whether to continue for another auto-turn.
-            match turn_completion {
-                StreamCompletion::AutoSendQueued(_) => {
-                    // User-driven queued message — reset cap and loop.
-                    consecutive_auto_turns = 0;
-                    continue 'turn_loop;
-                }
-                StreamCompletion::AutoTriggerEvents => {
-                    // Pending events were injected by process_stream_event; drain any
-                    // remaining queue items and decide via central wake_action.
-                    let drained = drain_event_queue(
-                        runtime.event_queue(),
-                        &mut conv.api_messages,
-                        &mut conv.pending_events,
-                        false, // idle after turn
-                        None,
-                    );
-                    for d in &drained {
-                        eprintln!("\x1b[36m⚡ [event] {}\x1b[0m", d.formatted);
-                    }
-                    let action = wake_action_with_cap(
-                        &drained,
-                        &conv.api_messages,
-                        false,
-                        true, // auto_turn_enabled
-                        consecutive_auto_turns,
-                        auto_turn_cap,
-                    );
-                    match action {
-                        WakeAction::RunTurn => {
-                            if claim_auto_turn_with_cap(&mut consecutive_auto_turns, auto_turn_cap)
-                            {
-                                continue 'turn_loop;
-                            } else {
-                                // claim denied: counter was already at cap.
-                                // fall through to park (treated as Forward).
-                                eprintln!(
-                                    "\x1b[2m[auto-turn cap ({}) reached — waiting for user input; raise with `{} = N`, 0 = unlimited]\x1b[0m",
-                                    auto_turn_cap, AUTO_TURN_CAP_CONFIG_KEY
-                                );
-                                break 'turn_loop;
-                            }
-                        }
-                        WakeAction::Forward | WakeAction::Nothing => {
-                            // Cap reached or nothing more — park at prompt.
-                            break 'turn_loop;
-                        }
-                    }
-                }
-                StreamCompletion::Error(err) => {
-                    // Unrecovered turn failure. History was already repaired
-                    // (turn-appended invalid messages only) and saved above.
-                    eprintln!("\x1b[31m❌ turn failed [{}]\x1b[0m", err.category_label());
-                    fatal_failure = Some(err);
-                    break 'turn_loop;
-                }
-                _ => {
-                    // Done — exit turn loop normally.
-                    break 'turn_loop;
-                }
+        // Regular user message.
+        let attachment_blocks = if pending_attachments.is_empty() {
+            Vec::new()
+        } else {
+            let summaries = pending_attachments.summaries();
+            for s in &summaries {
+                eprintln!("📎 {s}");
             }
-        } // end 'turn_loop
-
-        // Headless (piped) mode: an unrecovered failure must terminate with a
-        // nonzero exit instead of silently waiting for more input. In
-        // interactive (TTY) mode the user keeps their session and can retry.
-        if fatal_failure.is_some() {
-            if !is_tty {
-                break;
+            pending_attachments.take_blocks()
+        };
+        let cmd = SessionCommand::Submit {
+            text: trimmed.to_string(),
+            attachments: attachment_blocks,
+        };
+        if !fits_frame(&cmd) {
+            oversize();
+            if !r.is_tty {
+                end_session(&mut t, &mut r).await;
+                return Err(synaps_cli::RuntimeError::Session(
+                    "message too large for one daemon frame".into(),
+                ));
             }
-            fatal_failure = None;
+            continue;
+        }
+        r.idle = false;
+        if t.send(cmd).await.is_err() {
+            break;
         }
     }
 
-    // ── Shutdown ──
-    conv.save().await;
+    // ── Shutdown: End → the session saves, fires on_session_end, ends ──
+    end_session(&mut t, &mut r).await;
 
-    // Fire on_session_end hook
-    let hook_event =
-        synaps_cli::extensions::hooks::events::HookEvent::on_session_end(&conv.session.id, None);
-    let _ = runtime.hook_bus().emit(&hook_event).await;
-
-    boot.background.shutdown();
-
-    // Bounded observability flush (Task 11): stop intake on the session's
-    // telemetry/trace writer and drain it before the process exits. Runs
-    // after session save + hooks, and BEFORE the success/failure branch
-    // below so the fatal-failure return path flushes too. Telemetry `off`
-    // → no writer → `None`, a true no-op. "Flushed" means appended into OS
-    // file buffers (no fsync — best-effort diagnostic logs). A timeout
-    // logs metadata-only stats and continues; trace loss never changes the
-    // exit outcome.
-    if let Some(outcome) = runtime
-        .shutdown_observability_async(
-            synaps_cli::runtime::telemetry::DEFAULT_SHUTDOWN_FLUSH_TIMEOUT,
-        )
-        .await
-    {
-        if !outcome.is_flushed() {
-            tracing::warn!(
-                stats = ?outcome.stats(),
-                "observability flush timed out — detached worker keeps draining"
-            );
-        }
+    if !pending_attachments.is_empty() {
+        eprintln!(
+            "warning: {} unsent attachment(s) discarded",
+            pending_attachments.len()
+        );
     }
 
     eprintln!(
         "session saved: {} (${:.4})",
-        &conv.session.id[..8],
-        conv.session_cost
+        &session_id[..8.min(session_id.len())],
+        r.cost
     );
 
-    // Criterion: headless `synaps chat` exits nonzero on an unrecovered
-    // provider/tool failure — after the partial history was saved above.
-    if let Some(err) = fatal_failure {
+    if let Some(err) = r.fatal {
         return Err(synaps_cli::RuntimeError::Session(format!(
             "turn failed: {} [{}]",
             err.message,
@@ -703,608 +729,29 @@ async fn run_inline(
     Ok(())
 }
 
-// ── A2: `synaps chat` on the SessionActor ─────────────────────────────────────
+fn oversize() {
+    eprintln!(
+        "error: message too large for one daemon frame ({} MiB limit); not sent",
+        MAX_FRAME_BYTES / (1024 * 1024)
+    );
+}
 
-mod actor {
-    //! Same stdin/stdout/stderr rendering as the inline loop; the turn
-    //! machine (submit, usage, save, auto-turns, compaction) lives in the
-    //! actor. stdin is only polled while the session is idle, so a piped
-    //! line is always a `Submit` — exactly the inline loop's sequencing.
-
-    use std::io::{self, Write};
-
-    use synaps_cli::engine::commands;
-    use agent_engine::session::{
-        ClientKind, ClientMeta, ClientTransport, EndReason, Envelope, LocalTransport,
-        SessionCommand, SessionConfig, SessionEventWire, SessionQuery, SessionSetting,
-    };
-    use agent_engine::{EngineHost, HostOpts};
-    use synaps_cli::flush_stdout;
-    use synaps_cli::{AgentEvent, LlmEvent, SessionEvent, StreamEvent};
-    use tokio::io::{AsyncBufReadExt, BufReader as TokioBufReader};
-
-    /// Reserved query id for the post-compaction token readout (user
-    /// queries start at 1 and count up).
-    const COMPACT_TOKENS_QUERY: u64 = u64::MAX - 1;
-
-    struct Render {
-        is_tty: bool,
-        in_thinking: bool,
-        streaming: bool,
-        idle: bool,
-        fatal: Option<synaps_cli::TurnError>,
-        cost: f64,
-        ended: bool,
-        /// A `Confirm` prompt waiting for a y/n line from a TTY user (the
-        /// next stdin line answers it). Secret prompts are never held here:
-        /// the line client has no masked input and cancels them.
-        pending_confirm: Option<agent_engine::session::PromptRequest>,
+/// `End{ClientQuit}` and wait for `Ended`: the session is saved (and its
+/// `on_session_end` ran) before chat prints "session saved" and exits, so
+/// an immediate `--continue` never races the dying session.
+async fn end_session(t: &mut SocketTransport, r: &mut Render) {
+    if r.ended {
+        return;
     }
-
-    impl Render {
-        fn end_thinking(&mut self) {
-            if self.in_thinking {
-                eprintln!("\x1b[0m");
-                self.in_thinking = false;
-            }
-        }
-
-        async fn on_event(&mut self, transport: &LocalTransport, env: Envelope) {
-            match env.event {
-                SessionEventWire::Stream(ev) => self.on_stream(ev),
-                SessionEventWire::TurnStarted { .. } => {
-                    self.streaming = true;
-                    self.idle = false;
-                }
-                SessionEventWire::Conversation(c) => self.cost = c.cost,
-                SessionEventWire::Idle => self.idle = true,
-                SessionEventWire::Prompt(pr) => {
-                    if pr.kind == agent_engine::session::PromptKind::Confirm
-                        && self.is_tty
-                        && self.pending_confirm.is_none()
-                    {
-                        // Confirm (e.g. `activate_tools`): show the FULL body
-                        // and take one y/n line. Anything but y/yes denies.
-                        self.end_thinking();
-                        // Sanitized (prA I-R4-3): no cursor moves or bidi tricks.
-                        eprint!(
-                            "\n[confirm] {}\n{}\n(y/n): ",
-                            agent_engine::session::sanitize_prompt_text(&pr.title),
-                            agent_engine::session::sanitize_prompt_text(&pr.prompt)
-                        );
-                        io::stderr().flush().ok();
-                        self.pending_confirm = Some(pr);
-                        return;
-                    }
-                    // Headless chat has no masked prompt UI: cancel, as the
-                    // inline loop did by passing no SecretPromptHandle.
-                    let _ = transport
-                        .send(SessionCommand::Answer {
-                            prompt_id: pr.id,
-                            value: None,
-                        })
-                        .await;
-                }
-                SessionEventWire::PromptResolved { prompt_id } => {
-                    if self.pending_confirm.as_ref().is_some_and(|p| p.id == prompt_id) {
-                        self.pending_confirm = None;
-                    }
-                }
-                SessionEventWire::External(event) => {
-                    eprintln!(
-                        "\x1b[36m⚡ [event] {}\x1b[0m",
-                        synaps_cli::events::format_event_for_agent(&event)
-                    );
-                }
-                SessionEventWire::AutoTurnCapReached { cap } => {
-                    eprintln!(
-                        "\x1b[2m[auto-turn cap ({}) reached — waiting for user input]\x1b[0m",
-                        cap
-                    );
-                }
-                SessionEventWire::SystemNotice(text) => eprintln!("\x1b[2m{}\x1b[0m", text),
-                SessionEventWire::Aborted { context_saved } => eprintln!(
-                    "\x1b[2m{}\x1b[0m",
-                    if context_saved {
-                        "aborted — partial work kept"
-                    } else {
-                        "aborted"
-                    }
-                ),
-                SessionEventWire::Cleared { session_id } => eprintln!(
-                    "session cleared → {}",
-                    &session_id[..8.min(session_id.len())]
-                ),
-                // B2: spawned compaction reports through typed events — each
-                // rendered exactly once (the inline loop's three lines).
-                SessionEventWire::CompactionStarted { disclosure, .. } => {
-                    eprintln!("compacting...");
-                    eprintln!("{}", disclosure);
-                }
-                SessionEventWire::CompactionApplied { .. } => {
-                    // `compacted → ~N tokens` needs the post-apply assessment.
-                    let _ = transport
-                        .send(SessionCommand::Query {
-                            id: COMPACT_TOKENS_QUERY,
-                            query: SessionQuery::ContextAssessment,
-                        })
-                        .await;
-                }
-                SessionEventWire::QueryResult { id, value } if id == COMPACT_TOKENS_QUERY => {
-                    eprintln!(
-                        "\x1b[2m[compacted → ~{} tokens]\x1b[0m",
-                        value["used_tokens"].as_u64().unwrap_or(0)
-                    )
-                }
-                SessionEventWire::CompactionFailed { message, .. } => {
-                    eprintln!("\x1b[2m[compaction failed: {}]\x1b[0m", message)
-                }
-                SessionEventWire::CompactionCancelled => {
-                    eprintln!("\x1b[2m[compaction cancelled]\x1b[0m")
-                }
-                SessionEventWire::Ended { .. } => self.ended = true,
-                _ => {}
-            }
-        }
-
-        fn on_stream(&mut self, ev: StreamEvent) {
-            match ev {
-                StreamEvent::Llm(LlmEvent::Thinking(text)) => {
-                    if !self.in_thinking {
-                        eprint!("\x1b[2m");
-                        self.in_thinking = true;
-                    }
-                    eprint!("{}", text);
-                    io::stderr().flush().ok();
-                }
-                StreamEvent::Llm(LlmEvent::Text(text)) => {
-                    self.end_thinking();
-                    print!("{}", text);
-                    flush_stdout();
-                }
-                StreamEvent::Llm(LlmEvent::ToolUseStart { tool_name, .. }) => {
-                    self.end_thinking();
-                    eprint!("\x1b[33m⚙ {}\x1b[0m", tool_name);
-                    io::stderr().flush().ok();
-                }
-                StreamEvent::Llm(LlmEvent::ToolUse {
-                    tool_name, input, ..
-                }) => {
-                    let input_preview = serde_json::to_string(&input).unwrap_or_default();
-                    let preview: String = input_preview.chars().take(60).collect();
-                    eprintln!("\x1b[33m ⚙ {} ({})\x1b[0m", tool_name, preview);
-                }
-                StreamEvent::Llm(LlmEvent::ToolResult { result, .. }) => {
-                    let preview: String = result.chars().take(80).collect();
-                    eprintln!("\x1b[32m  → {}\x1b[0m", preview);
-                }
-                StreamEvent::Agent(AgentEvent::SubagentStart {
-                    agent_name,
-                    task_preview,
-                    ..
-                }) => eprintln!("\x1b[35m🎭 [{}] {}\x1b[0m", agent_name, task_preview),
-                StreamEvent::Agent(AgentEvent::SubagentDone {
-                    result_preview,
-                    duration_secs,
-                    ..
-                }) => {
-                    let status = if result_preview.starts_with("[TIMED OUT") {
-                        "\u{26a0} timed out".to_string()
-                    } else if result_preview.starts_with("ERROR") {
-                        let preview: String = result_preview.chars().take(40).collect();
-                        format!("\u{2718} {}", preview)
-                    } else {
-                        let preview: String = result_preview.chars().take(40).collect();
-                        format!("\u{2714} {}", preview)
-                    };
-                    eprintln!("\x1b[32m✔ {} ({:.1}s)\x1b[0m", status, duration_secs);
-                }
-                StreamEvent::Agent(AgentEvent::SteeringDelivered { message }) => {
-                    eprintln!("\x1b[33m→ [steering] {}\x1b[0m", message);
-                }
-                StreamEvent::Session(SessionEvent::Notice(text) | SessionEvent::Retry(text)) => {
-                    eprintln!("\x1b[2m{}\x1b[0m", text);
-                }
-                StreamEvent::Session(SessionEvent::Done) => {
-                    self.end_thinking();
-                    println!();
-                    self.streaming = false;
-                }
-                StreamEvent::Session(SessionEvent::Error(err)) => {
-                    eprintln!("\x1b[31m❌ {}\x1b[0m", err.message);
-                    self.end_thinking();
-                    println!();
-                    eprintln!("\x1b[31m❌ turn failed [{}]\x1b[0m", err.category_label());
-                    self.fatal = Some(err);
-                    self.streaming = false;
-                }
-                _ => {}
-            }
-        }
-
-        /// Pump events until the reply for query `id` arrives.
-        async fn reply(&mut self, t: &mut LocalTransport, id: u64) -> serde_json::Value {
-            while let Some(env) = t.next_event().await {
-                if let SessionEventWire::QueryResult { id: rid, value } = &env.event {
-                    if *rid == id {
-                        return value.clone();
-                    }
-                }
-                self.on_event(t, env).await;
-                if self.ended {
-                    break;
-                }
-            }
-            serde_json::Value::Null
-        }
-    }
-
-    pub(super) async fn run(
-        continue_session: Option<String>,
-        system: Option<String>,
-        agent: Option<String>,
-        profile: Option<String>,
-        no_extensions: bool,
-    ) -> synaps_cli::Result<()> {
-        // Agent prompt resolves before any session work (inline loop: exit 1).
-        let agent_prompt = match agent {
-            Some(ref agent_name) => match synaps_cli::tools::resolve_agent_prompt(agent_name) {
-                Ok(p) => {
-                    eprintln!("🎭 Agent: {}", agent_name);
-                    Some(p)
-                }
-                Err(e) => {
-                    eprintln!("❌ {}", e);
-                    std::process::exit(1);
-                }
-            },
-            None => None,
-        };
-
-        let host = EngineHost::boot_and_install(HostOpts {
-            profile,
-            no_extensions,
-            mcp_discovery: agent_engine::McpDiscovery::Inline,
+    let _ = t
+        .send(SessionCommand::End {
+            reason: EndReason::ClientQuit,
         })
-        .await?;
-        host.report_config_warnings();
-        // Extension discovery completes BEFORE the session exists, so
-        // `on_session_start` reaches subscribers and the first API call sees
-        // extension-registered tools (piped stdin is ready immediately).
-        if !no_extensions {
-            host.ext_manager().write().await.discover_and_load().await;
+        .await;
+    while !r.ended {
+        match t.next_event().await {
+            Some(env) => r.on_event(t, env).await,
+            None => break,
         }
-
-        let handle = host
-            .create_session(SessionConfig {
-                continue_session: continue_session.map(Some),
-                system,
-                auto_compact: true,
-                ..SessionConfig::default()
-            })
-            .await?;
-        let (mut t, snap) = LocalTransport::attach(handle, ClientMeta::new(ClientKind::Chat))
-            .await
-            .map_err(|e| synaps_cli::RuntimeError::Session(e.to_string()))?;
-        if let Some(p) = agent_prompt {
-            let _ = t
-                .send(SessionCommand::Set { id: 0, setting: SessionSetting::SystemPrompt { text: p } })
-                .await;
-        }
-
-        let session_id = snap.meta.id.as_str().to_string();
-        eprintln!(
-            "synaps {} | {} | session {}",
-            env!("CARGO_PKG_VERSION"),
-            snap.view.model,
-            &session_id[..8.min(session_id.len())]
-        );
-        if snap.meta.continued {
-            eprintln!(
-                "↳ resumed session ({} messages)",
-                snap.conversation.api_messages.len()
-            );
-        }
-        if host.mcp_server_count() > 0 {
-            eprintln!("↳ {} MCP servers available", host.mcp_server_count());
-        }
-        eprintln!();
-
-        let mut r = Render {
-            is_tty: std::io::IsTerminal::is_terminal(&std::io::stdin()),
-            in_thinking: false,
-            streaming: false,
-            idle: true,
-            fatal: None,
-            cost: snap.conversation.cost,
-            ended: false,
-            pending_confirm: None,
-        };
-        let mut pending_attachments = agent_engine::attachments::PendingAttachments::default();
-        let mut stdin_lines = TokioBufReader::new(tokio::io::stdin()).lines();
-        let mut next_query: u64 = 1;
-        let mut prompt_shown = false;
-
-        loop {
-            if r.idle && r.is_tty && !prompt_shown {
-                eprint!("❯ ");
-                io::stderr().flush().ok();
-                prompt_shown = true;
-            }
-            // stdin only while idle: a piped line is always a Submit.
-            let line = tokio::select! {
-                biased;
-                ev = t.next_event() => match ev {
-                    Some(env) => {
-                        r.on_event(&t, env).await;
-                        if r.ended { break; }
-                        // Headless (piped): an unrecovered failure terminates
-                        // after the turn settles; TTY users keep their session.
-                        if r.idle && r.fatal.is_some() && !r.is_tty { break; }
-                        if r.idle && r.fatal.is_some() { r.fatal = None; }
-                        continue;
-                    }
-                    None => break,
-                },
-                line = stdin_lines.next_line(), if r.idle || r.pending_confirm.is_some() => match line {
-                    Ok(Some(l)) => l,
-                    Ok(None) => break,
-                    Err(e) => { eprintln!("input error: {}", e); break; }
-                },
-            };
-            prompt_shown = false;
-
-            // A pending confirm owns the next line: `y`/`yes` allows, anything
-            // else (including empty) denies — fail-closed, never a Submit.
-            if let Some(pr) = r.pending_confirm.take() {
-                let answer = line.trim();
-                let value = if answer.is_empty() { None } else { Some(answer.to_string()) };
-                let _ = t
-                    .send(SessionCommand::Answer { prompt_id: pr.id, value })
-                    .await;
-                continue;
-            }
-
-            let trimmed = line.trim_end_matches('\r').trim();
-            // Blank-line attachment-only submit.
-            if trimmed.is_empty() {
-                if !pending_attachments.is_empty() {
-                    let summaries = pending_attachments.summaries();
-                    for s in &summaries {
-                        eprintln!("📎 {s}");
-                    }
-                    let blocks = pending_attachments.take_blocks();
-                    r.idle = false;
-                    if t.send(SessionCommand::Submit {
-                        text: String::new(),
-                        attachments: blocks,
-                    }).await.is_err() {
-                        break;
-                    }
-                }
-                continue;
-            }
-
-            if let Some((cmd, arg)) = commands::parse_command(trimmed) {
-                // Client-side attachment commands — never reach the actor.
-                match cmd {
-                    "attach" => {
-                        if arg.is_empty() {
-                            eprintln!("usage: /attach <path>");
-                            continue;
-                        }
-                        let path_str = arg.trim_matches(|c| c == '"' || c == '\'');
-                        let path = std::path::PathBuf::from(path_str);
-                        match agent_engine::attachments::load_attachment_sync(&path) {
-                            Ok(loaded) => match pending_attachments.add(loaded) {
-                                Ok(()) => {
-                                    let s = pending_attachments.summaries();
-                                    eprintln!("📎 staged: {}", s.last().unwrap_or(&String::new()));
-                                }
-                                Err(e) => eprintln!("error: {e}"),
-                            },
-                            Err(e) => {
-                                eprintln!("error: {path_str}: {e}");
-                                if !r.is_tty {
-                                    // Piped: fail-stop.
-                                    return Err(synaps_cli::RuntimeError::Session(
-                                        format!("attachment failed: {path_str}: {e}"),
-                                    ));
-                                }
-                            }
-                        }
-                        continue;
-                    }
-                    "attachments" => {
-                        let summaries = pending_attachments.summaries();
-                        if summaries.is_empty() {
-                            eprintln!("no pending attachments");
-                        } else {
-                            for (i, s) in summaries.iter().enumerate() {
-                                eprintln!("  [{i}] {s}");
-                            }
-                        }
-                        continue;
-                    }
-                    "detach" => {
-                        let n = pending_attachments.len();
-                        if arg.is_empty() || arg == "all" || arg == "clear" {
-                            pending_attachments.clear();
-                            if n > 0 {
-                                eprintln!("detached {n} file(s)");
-                            } else {
-                                eprintln!("no pending attachments");
-                            }
-                        } else if let Ok(idx) = arg.parse::<usize>() {
-                            if idx < n {
-                                pending_attachments.remove(idx);
-                                eprintln!("detached [{idx}]");
-                            } else {
-                                eprintln!("no attachment at index {idx}");
-                            }
-                        } else {
-                            eprintln!("usage: /detach [n|all]");
-                        }
-                        continue;
-                    }
-                    _ => {} // fall through to EngineCommand
-                }
-
-                let id = next_query;
-                next_query += 1;
-                let _ = t
-                    .send(SessionCommand::EngineCommand {
-                        id,
-                        name: cmd.to_string(),
-                        arg: arg.to_string(),
-                    })
-                    .await;
-                let reply = r.reply(&mut t, id).await;
-                if r.ended {
-                    break;
-                }
-                match reply["kind"].as_str().unwrap_or("none") {
-                    "quit" => break,
-                    "notice" => eprintln!("{}", reply["text"].as_str().unwrap_or("")),
-                    "error" => eprintln!("error: {}", reply["text"].as_str().unwrap_or("")),
-                    "output" => println!("{}", reply["text"].as_str().unwrap_or("")),
-                    "unhandled" => match cmd {
-                        "clear" => {
-                            let _ = t.send(SessionCommand::NewSession).await;
-                        }
-                        "sessions" => {
-                            let id = next_query;
-                            next_query += 1;
-                            let _ = t
-                                .send(SessionCommand::Query {
-                                    id,
-                                    query: SessionQuery::Status,
-                                })
-                                .await;
-                            let status = r.reply(&mut t, id).await;
-                            let current = status["session"].as_str().unwrap_or("");
-                            match synaps_cli::list_recent_sessions(20) {
-                                Ok(sessions) => {
-                                    for s in sessions.iter().take(20) {
-                                        let marker = if s.id == current { "→ " } else { "  " };
-                                        eprintln!(
-                                            "{}{} {} ({}, ${:.4})",
-                                            marker,
-                                            &s.id[..8],
-                                            s.title,
-                                            s.model,
-                                            s.session_cost
-                                        );
-                                    }
-                                }
-                                Err(e) => eprintln!("error: {}", e),
-                            }
-                        }
-                        "status" => {
-                            let id = next_query;
-                            next_query += 1;
-                            let _ = t
-                                .send(SessionCommand::Query {
-                                    id,
-                                    query: SessionQuery::Status,
-                                })
-                                .await;
-                            let st = r.reply(&mut t, id).await;
-                            let id2 = next_query;
-                            next_query += 1;
-                            let _ = t
-                                .send(SessionCommand::Query {
-                                    id: id2,
-                                    query: SessionQuery::ContextAssessment,
-                                })
-                                .await;
-                            let ctx = r.reply(&mut t, id2).await;
-                            let sid = st["session"].as_str().unwrap_or("");
-                            eprintln!("session: {}", &sid[..8.min(sid.len())]);
-                            eprintln!("model: {}", st["model"].as_str().unwrap_or(""));
-                            eprintln!(
-                                "tokens: {}↑ {}↓",
-                                st["tokens"]["input"].as_u64().unwrap_or(0),
-                                st["tokens"]["output"].as_u64().unwrap_or(0)
-                            );
-                            eprintln!("cost: ${:.4}", st["cost"].as_f64().unwrap_or(0.0));
-                            eprintln!("messages: {}", st["messages"].as_u64().unwrap_or(0));
-                            eprintln!(
-                                "context: ~{} of {} budget tokens ({} window)",
-                                ctx["used_tokens"].as_u64().unwrap_or(0),
-                                ctx["budget_tokens"].as_u64().unwrap_or(0),
-                                ctx["provider_window"].as_u64().unwrap_or(0)
-                            );
-                        }
-                        "help" => {
-                            eprintln!("commands: /model /thinking /compact /clear /sessions /status /attach /attachments /detach /quit");
-                            eprintln!("quitting (or EOF) mid-turn cancels the turn; its partial work is kept in history for the next --continue");
-                        }
-                        _ => eprintln!("unknown command: /{} (try /help)", cmd),
-                    },
-                    _ => {}
-                }
-                continue;
-            }
-
-            // Regular user message.
-            let attachment_blocks = if pending_attachments.is_empty() {
-                Vec::new()
-            } else {
-                let summaries = pending_attachments.summaries();
-                for s in &summaries {
-                    eprintln!("📎 {s}");
-                }
-                pending_attachments.take_blocks()
-            };
-            r.idle = false;
-            if t
-                .send(SessionCommand::Submit {
-                    text: trimmed.to_string(),
-                    attachments: attachment_blocks,
-                })
-                .await
-                .is_err()
-            {
-                break;
-            }
-        }
-
-        // ── Shutdown: End → actor saves, fires on_session_end, unregisters ──
-        if !r.ended {
-            let _ = t
-                .send(SessionCommand::End {
-                    reason: EndReason::ClientQuit,
-                })
-                .await;
-            while !r.ended {
-                match t.next_event().await {
-                    Some(env) => r.on_event(&t, env).await,
-                    None => break,
-                }
-            }
-        }
-
-        if !pending_attachments.is_empty() {
-            eprintln!(
-                "warning: {} unsent attachment(s) discarded",
-                pending_attachments.len()
-            );
-        }
-
-        eprintln!(
-            "session saved: {} (${:.4})",
-            &session_id[..8.min(session_id.len())],
-            r.cost
-        );
-
-        if let Some(err) = r.fatal {
-            return Err(synaps_cli::RuntimeError::Session(format!(
-                "turn failed: {} [{}]",
-                err.message,
-                err.category_label()
-            )));
-        }
-        Ok(())
     }
 }
