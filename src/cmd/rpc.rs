@@ -348,6 +348,8 @@ impl PendingQuery {
 
 struct PendingCompact {
     id: String,
+    /// `CompactionStarted` seen: the actor runs it (a timeout cancels it).
+    started: bool,
     disclosure: Option<serde_json::Value>,
     /// No answer by then: error, and stdin is read again.
     deadline: Instant,
@@ -382,6 +384,8 @@ struct Bridge {
     settings: HashMap<u64, (String, String)>,
     new_sessions: VecDeque<String>,
     compact: Option<PendingCompact>,
+    /// A `compact` timed out: its outcome may still arrive (logged only).
+    compact_late: bool,
     next_id: u64,
     /// First event that arrived while idle since the last turn: names the
     /// auto-turn it starts (`auto:<id>`).
@@ -534,7 +538,7 @@ impl Bridge {
         } else if let Err(e) = self.send(SessionCommand::Compact { instructions: None }).await {
             self.error(Some(id), e).await;
         } else {
-            self.compact = Some(PendingCompact { id, disclosure: None, deadline: Instant::now() + COMPACT_START_WAIT });
+            self.compact = Some(PendingCompact { id, started: false, disclosure: None, deadline: Instant::now() + COMPACT_START_WAIT });
         }
     }
 
@@ -664,6 +668,7 @@ impl Bridge {
             }
             SessionEventWire::CompactionStarted { detail, .. } => {
                 if let Some(c) = self.compact.as_mut() {
+                    c.started = true;
                     c.deadline = Instant::now() + COMPACT_RUN_WAIT;
                     c.disclosure = detail;
                     let (id, body) = (c.id.clone(), c.disclosure.clone().unwrap_or_default());
@@ -671,6 +676,9 @@ impl Bridge {
                 }
             }
             SessionEventWire::CompactionApplied { summary, .. } => {
+                if self.compact.is_none() && std::mem::take(&mut self.compact_late) {
+                    tracing::warn!("a compaction finished after its request had timed out");
+                }
                 if let Some(c) = self.compact.take() {
                     self.respond(
                         c.id,
@@ -1125,6 +1133,7 @@ pub async fn run(
         settings: HashMap::new(),
         new_sessions: VecDeque::new(),
         compact: None,
+        compact_late: false,
         next_id: 0,
         idle_event: None,
         interrupt_note: None,
@@ -1198,8 +1207,15 @@ pub async fn run(
             },
             _ = tokio::time::sleep_until(compact_deadline), if b.compact.is_some() => {
                 if let Some(c) = b.compact.take() {
-                    tracing::warn!("rpc: compaction not answered in time; cancelling it");
-                    let _ = b.t.send(SessionCommand::Cancel).await;
+                    // Not started: nothing to cancel (a Cancel would hit
+                    // whatever runs next).
+                    if c.started {
+                        tracing::warn!("compaction not finished in time; cancelling it");
+                        let _ = b.t.send(SessionCommand::Cancel).await;
+                    } else {
+                        tracing::warn!("compaction not answered in time");
+                    }
+                    b.compact_late = true;
                     b.error(Some(c.id), "compaction timed out").await;
                 }
             }
