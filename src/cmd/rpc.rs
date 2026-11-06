@@ -126,6 +126,8 @@ fn spawn_writer() -> (Out, oneshot::Receiver<()>) {
     let (queued, drained) = (Arc::new(AtomicUsize::new(0)), Arc::new(Notify::new()));
     let out = Out { tx, queued: Arc::clone(&queued), drained: Arc::clone(&drained) };
     let (done_tx, done) = oneshot::channel();
+    // A thread, not the (current-thread) runtime: a blocking stdout write
+    // must never hold up reading the daemon socket.
     std::thread::spawn(move || {
         use std::io::Write;
         let stdout = std::io::stdout();

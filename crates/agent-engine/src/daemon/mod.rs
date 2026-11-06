@@ -676,17 +676,33 @@ fn daemon_launch(
 /// outrun the socket hop by more than the shared default.
 pub const PRIVATE_EVENTS_CAP: usize = 8 * 1024;
 
+/// Tokio workers of a private daemon: it serves one session. Units with a
+/// task cap (`TasksMax`) run one rpc process + daemon per conversation.
+pub const PRIVATE_WORKER_THREADS: usize = 2;
+
+/// jemalloc background threads of a private daemon (default: one per CPU
+/// up to the arenas in use).
+const PRIVATE_MALLOC_CONF: &str = "max_background_threads:1";
+
 /// What a spawned daemon must know beyond argv: its files dir, and for a
-/// private daemon, no pin restore and a deeper event buffer (an explicit
-/// `SYNAPS_SESSION_EVENTS_CAP` wins).
+/// private daemon, no pin restore, a deeper event buffer, fewer workers and
+/// allocator threads (an explicit `SYNAPS_SESSION_EVENTS_CAP`,
+/// `SYNAPS_WORKER_THREADS` or `_RJEM_MALLOC_CONF` wins).
 fn spawn_env(opts: &DaemonOpts, env: &mut Vec<(std::ffi::OsString, std::ffi::OsString)>) {
     if let Some(dir) = &opts.runtime_dir {
         crate::process_scope::set_env(env, registry::DAEMON_DIR_ENV, dir.clone().into_os_string());
     }
     if opts.private {
         crate::process_scope::set_env(env, pins::RESTORE_ENV, "0");
-        if !env.iter().any(|(k, _)| k == "SYNAPS_SESSION_EVENTS_CAP") {
-            crate::process_scope::set_env(env, "SYNAPS_SESSION_EVENTS_CAP", PRIVATE_EVENTS_CAP.to_string());
+        let defaults = [
+            ("SYNAPS_SESSION_EVENTS_CAP", PRIVATE_EVENTS_CAP.to_string()),
+            ("SYNAPS_WORKER_THREADS", PRIVATE_WORKER_THREADS.to_string()),
+            ("_RJEM_MALLOC_CONF", PRIVATE_MALLOC_CONF.to_string()),
+        ];
+        for (key, value) in defaults {
+            if !env.iter().any(|(k, _)| k == key) {
+                crate::process_scope::set_env(env, key, value);
+            }
         }
     }
 }
@@ -1156,6 +1172,21 @@ mod flag_tests {
         let slot = std::mem::size_of::<crate::session::types::Envelope>() + 32;
         let bytes = slot * PRIVATE_EVENTS_CAP;
         assert!(bytes <= 12 << 20, "{bytes} bytes ({slot} per slot)");
+    }
+
+    #[test]
+    fn private_daemon_env_defaults_yield_to_explicit_values() {
+        let opts = DaemonOpts { private: true, runtime_dir: Some("/r/p".into()), ..Default::default() };
+        let mut env = vec![("SYNAPS_WORKER_THREADS".into(), "6".into())];
+        spawn_env(&opts, &mut env);
+        let get = |k: &str| env.iter().find(|(key, _)| key == k).map(|(_, v)| v.to_string_lossy().into_owned());
+        assert_eq!(get("SYNAPS_WORKER_THREADS").as_deref(), Some("6"));
+        assert_eq!(get("_RJEM_MALLOC_CONF").as_deref(), Some(PRIVATE_MALLOC_CONF));
+        assert_eq!(get("SYNAPS_SESSION_EVENTS_CAP"), Some(PRIVATE_EVENTS_CAP.to_string()));
+        assert_eq!(get(registry::DAEMON_DIR_ENV).as_deref(), Some("/r/p"));
+        let mut shared = Vec::new();
+        spawn_env(&DaemonOpts::default(), &mut shared);
+        assert!(shared.is_empty(), "{shared:?}");
     }
 
     #[test]
