@@ -108,7 +108,7 @@ Local models: Synaps targets Ollama's default `http://localhost:11434/v1`. LM St
 - **Long sessions stay cheap.** The prompt cache lasts an hour on a Claude subscription, large tool output waits on disk behind a short preview, re-reads of unchanged files are deduplicated, and workers roll their context over instead of filling the window.
 - **Memory that survives.** Project memory, `/compact` checkpoints, sessions that chain across days.
 - **Sees what you see.** The model reads images, and `/attach` adds images, PDFs and text to a turn. [More](docs/multimodal.md)
-- **Build on it.** Extensions in any language, MCP servers, and the engine over [JSON-RPC](docs/rpc-protocol.md) or WebSocket.
+- **Build on it.** Extensions in any language, MCP servers, and the engine over [JSON-RPC](docs/rpc-protocol.md) or the [daemon socket](docs/daemon-mode.md).
 
 <p align="center">
   <img src="https://github.com/user-attachments/assets/9f907e06-46ff-46b3-87d5-36f53783e795" alt="Two terminals attached to one live session: one asks, the other steers mid-turn" width="100%" />
@@ -160,7 +160,6 @@ Method, tool versions, latency numbers, caveats and how to reproduce: [BENCHMARK
 | `synaps send` | Send a message to a running session from a script |
 | `synaps chat` | The same engine on stdin/stdout, for pipes, scripts and CI |
 | `synaps rpc` | JSON-RPC over stdio, to embed the engine in other software |
-| `synaps server` | WebSocket API with token auth and streaming |
 | `synaps login` · `auth` · `status` | Sign in, manage several accounts per provider, see usage and reset windows |
 
 ## Configuration

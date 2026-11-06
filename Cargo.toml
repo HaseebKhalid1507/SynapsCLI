@@ -59,8 +59,8 @@ urlencoding = "2"
 url = "2"
 
 
-# Server deps
-axum = { version = "0.7", features = ["ws"] }
+# HTTP server deps (`synaps auth-broker`)
+axum = "0.7"
 axum-server = { version = "0.8", features = ["tls-rustls"] }
 rustls = { version = "0.23", features = ["ring"], default-features = false }
 rustls-pki-types = "1"

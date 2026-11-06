@@ -401,8 +401,8 @@ pub(crate) struct SessionBootResult {
     pub(crate) continue_info: Option<ContinueInfo>,
 }
 
-/// The session lock for a `boot()` host that drives `Runtime` itself (rpc,
-/// `synaps server`). Continuing a session that another process (a TUI, the
+/// The session lock for a `boot()` host that drives `Runtime` itself
+/// (`synaps rpc`). Continuing a session that another process (a TUI, the
 /// daemon, another rpc) holds is REFUSED: two writers would fork its history
 /// and the older one's saves would overwrite the newer's. So is continuing
 /// a session already compacted into a successor (its history is closed). A
@@ -439,8 +439,7 @@ pub fn lock_session(
 /// the draft.
 ///
 /// Run ONLY by the holder of the session lock, after taking it (actor
-/// create, unpark and `/resume`; rpc and `synaps server` after
-/// `lock_session`): a draft under a lock held elsewhere belongs to a turn
+/// create, unpark and `/resume`; rpc after `lock_session`): a draft under a lock held elsewhere belongs to a turn
 /// that is running right now. Legacy chat takes no lock and never recovers.
 /// Loading itself (`resolve_or_create_session`) leaves the draft alone.
 ///

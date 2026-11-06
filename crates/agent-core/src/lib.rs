@@ -25,7 +25,6 @@ pub use core::error;
 pub use core::logging;
 pub use core::models;
 pub use core::private_fs;
-pub use core::protocol;
 pub use core::reasoning;
 pub use core::retention;
 pub use core::session;

@@ -454,19 +454,24 @@ fn parse_daemon_config_key(
     Ok(())
 }
 
-/// Server security configuration parsed from `server.*` keys.
+/// Configuration parsed from `server.*` keys. The family outlived the
+/// removed `synaps server`: only `auto_approve_confirms` is read.
 #[derive(Debug, Clone, Default)]
 pub struct ServerConfig {
-    /// Comma-separated list of allowed Origin headers. Empty = allow all (localhost-only protection).
-    pub allowed_origins: Vec<String>,
-    /// Pre-shared authentication token. If set, clients must provide it on WebSocket upgrade
-    /// via `?token=X` query param or `Authorization: Bearer X` header. If None, auto-generated on boot.
-    pub token: Option<String>,
     /// When true, `HookResult::Confirm` is auto-approved without prompting (useful for headless clients).
     pub auto_approve_confirms: bool,
-    /// Maximum inbound message size in bytes. Defaults to context_window * 4 (rough token→byte estimate).
-    /// None means no artificial cap.
-    pub max_message_size: Option<usize>,
+}
+
+/// Keys only `synaps server` read. Ignored with one warning so an old
+/// config still loads.
+const REMOVED_SERVER_KEYS: [&str; 3] =
+    ["server.allowed_origins", "server.token", "server.max_message_size"];
+fn removed_server_warning() -> String {
+    format!(
+        "server.allowed_origins, server.token and server.max_message_size are ignored: they \
+         configured `synaps server`, removed in {}. Remove these lines",
+        crate::REMOVED_IN
+    )
 }
 
 /// Auth configuration parsed from `auth.*` keys. Controls whether this client
@@ -1837,10 +1842,7 @@ pub const FAMILY_CONFIG_KEYS: &[&str] = &[
     "memory.local_embeddings",
     "memory.gliner",
     // parse_server_config_key
-    "server.allowed_origins",
-    "server.token",
     "server.auto_approve_confirms",
-    "server.max_message_size",
     // parse_auth_config_key
     "auth.remote_endpoint",
     "auth.machine_token",
@@ -1933,34 +1935,22 @@ fn parse_shell_config_key(shell_config: &mut ShellConfig, key: &str, val: &str) 
 }
 
 /// Parse server.* configuration keys and update the ServerConfig.
-#[allow(clippy::collapsible_match)]
-fn parse_server_config_key(server_config: &mut ServerConfig, key: &str, val: &str) {
-    match key {
-        "server.allowed_origins" => {
-            server_config.allowed_origins = parse_comma_list(val);
-        }
-        "server.token" => {
-            if !val.is_empty() {
-                server_config.token = Some(val.to_string());
-            }
-        }
-        "server.auto_approve_confirms" => {
-            server_config.auto_approve_confirms = matches!(val, "true" | "1" | "yes");
-        }
-        "server.max_message_size" => {
-            if let Ok(size) = val.parse::<usize>() {
-                server_config.max_message_size = Some(size);
-            } else {
-                eprintln!(
-                    "Warning: invalid value for server.max_message_size: '{}', ignored",
-                    val
-                );
-            }
-        }
-        _ => {
-            // Unknown server.* keys preserved (not rejected)
-        }
+/// `Some(warning)`: a key of the removed `synaps server`, ignored; the
+/// caller must surface it (once) in `config.warnings`.
+#[must_use]
+fn parse_server_config_key(
+    server_config: &mut ServerConfig,
+    key: &str,
+    val: &str,
+) -> Option<String> {
+    if REMOVED_SERVER_KEYS.contains(&key) {
+        return Some(removed_server_warning());
     }
+    if key == "server.auto_approve_confirms" {
+        server_config.auto_approve_confirms = matches!(val, "true" | "1" | "yes");
+    }
+    // Unknown server.* keys preserved (not rejected)
+    None
 }
 
 /// Warning for an `auth.*` key no parser reads (a typo would otherwise
@@ -2561,7 +2551,11 @@ fn apply_config_content_with(
                         family_diagnostic(diagnostic);
                     }
                 } else if key.starts_with("server.") {
-                    parse_server_config_key(&mut config.server, key, val);
+                    if let Some(warning) = parse_server_config_key(&mut config.server, key, val) {
+                        if !config.warnings.contains(&warning) {
+                            config.warnings.push(warning);
+                        }
+                    }
                 } else if REMOVED_BRIDGE_KEYS.contains(&key) {
                     let warning = removed_bridge_warning();
                     if !config.warnings.contains(&warning) {
@@ -2704,14 +2698,6 @@ fn apply_config_content_with(
             config.memory.default_mode
         ));
         config.memory.default_mode = "off".to_string();
-    }
-
-    // Derive max_message_size from context_window if not explicitly set.
-    // Rough estimate: 1 token ≈ 4 bytes. Context window in tokens → bytes.
-    if config.server.max_message_size.is_none() {
-        if let Some(ctx_tokens) = config.context_window {
-            config.server.max_message_size = Some((ctx_tokens as usize) * 4);
-        }
     }
 }
 
@@ -4667,10 +4653,7 @@ mod tests {
         assert_eq!(config.shell.max_sessions, 5);
         assert_eq!(config.shell.idle_timeout.as_secs(), 600);
         // Server config defaults
-        assert!(config.server.allowed_origins.is_empty());
-        assert_eq!(config.server.token, None);
         assert!(!config.server.auto_approve_confirms);
-        assert_eq!(config.server.max_message_size, None);
     }
 
     #[test]
@@ -4847,34 +4830,21 @@ context_window = 200k\n\
         .unwrap();
 
         with_home(&home, || {
+            // A config written for the removed `synaps server` still loads:
+            // its keys are ignored with one deprecation warning for all of
+            // them, and every other key (here context_window) still applies.
             let config = load_config();
-            assert_eq!(
-                config.server.allowed_origins,
-                vec![
-                    "http://localhost:3000".to_string(),
-                    "http://localhost:5193".to_string(),
-                ]
-            );
-            assert_eq!(config.server.token, Some("my-secret-token".to_string()));
             assert!(config.server.auto_approve_confirms);
-            // Explicit max_message_size takes precedence over context_window derivation
-            assert_eq!(config.server.max_message_size, Some(65536));
-        });
-
-        let _ = std::fs::remove_dir_all(&home);
-    }
-
-    #[test]
-    #[serial]
-    fn test_server_max_message_size_derived_from_context_window() {
-        let home = make_test_home("server-derive");
-        let cfg = home.join(".synaps-cli/config");
-        std::fs::write(&cfg, "context_window = 200k\n").unwrap();
-
-        with_home(&home, || {
-            let config = load_config();
-            // 200_000 tokens * 4 bytes/token = 800_000 bytes
-            assert_eq!(config.server.max_message_size, Some(800_000));
+            assert_eq!(config.context_window, Some(200_000));
+            assert_eq!(config.warnings, [removed_server_warning()], "{:?}", config.warnings);
+            // The warning names keys, never their values (the token is a secret).
+            for value in ["my-secret-token", "localhost:3000", "localhost:5193", "65536"] {
+                assert!(
+                    !config.warnings.iter().any(|w| w.contains(value)),
+                    "{value} echoed: {:?}",
+                    config.warnings
+                );
+            }
         });
 
         let _ = std::fs::remove_dir_all(&home);
@@ -5627,7 +5597,6 @@ api_retries = 5
                 "memory.auto_consolidate" | "memory.local_embeddings" | "memory.gliner" => "off",
                 "memory.axel.executable" | "memory.axel.brain" => ABSOLUTE_SAMPLE_PATH,
                 "events.auto_turn" => "on",
-                "server.allowed_origins" | "server.token" => "x",
                 "server.auto_approve_confirms" => "false",
                 "auth.remote_endpoint" | "auth.machine_token" => "x",
                 _ => "7",

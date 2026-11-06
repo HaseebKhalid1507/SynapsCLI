@@ -60,8 +60,8 @@ pub static MALLOC_CONF: &[u8] =
 #[derive(Parser)]
 #[command(
     name = "synaps",
-    about = "SynapsCLI — terminal-native AI agent runtime (TUI, headless, server, RPC)",
-    long_about = "SynapsCLI — terminal-native AI agent runtime.\n\nRun with no arguments for the interactive TUI. Subcommands provide headless chat,\na WebSocket server, and event injection into running sessions.",
+    about = "SynapsCLI — terminal-native AI agent runtime (TUI, daemon, headless, RPC)",
+    long_about = "SynapsCLI — terminal-native AI agent runtime.\n\nRun with no arguments for the interactive TUI. Subcommands provide the session daemon,\nheadless chat, JSON-RPC, and event injection into running sessions.",
     version
 )]
 struct Cli {
@@ -160,26 +160,6 @@ enum Command {
         /// Disable extensions
         #[arg(long)]
         no_extensions: bool,
-    },
-    /// WebSocket API server
-    Server {
-        #[arg(long, short, default_value = "3145")]
-        port: u16,
-        #[arg(long, default_value = "127.0.0.1")]
-        host: String,
-        #[arg(long = "system", short = 's')]
-        system: Option<String>,
-        #[arg(long = "continue", value_name = "NAME_OR_ID")]
-        continue_session: Option<Option<String>>,
-        /// Auth token (overrides config). Empty string disables auth.
-        #[arg(long)]
-        token: Option<String>,
-        /// Auto-approve extension confirm hooks without prompting.
-        #[arg(long)]
-        auto_approve_confirms: bool,
-        /// Comma-separated allowed origins (overrides config).
-        #[arg(long)]
-        allowed_origins: Option<String>,
     },
     // Removed subcommands: hidden one-release stubs (`cmd::removed`).
     #[command(flatten)]
@@ -877,27 +857,6 @@ async fn async_main() -> anyhow::Result<()> {
             no_extensions,
         }) => {
             cmd::chat::run(continue_session, system, agent, profile, no_extensions).await?;
-        }
-        Some(Command::Server {
-            port,
-            host,
-            system,
-            continue_session,
-            token,
-            auto_approve_confirms,
-            allowed_origins,
-        }) => {
-            cmd::server::run(
-                port,
-                host,
-                system,
-                continue_session,
-                cli.profile,
-                token,
-                auto_approve_confirms,
-                allowed_origins,
-            )
-            .await?;
         }
         Some(Command::Removed(_)) => unreachable!("handled above"),
         Some(Command::Login { provider, account }) => {
