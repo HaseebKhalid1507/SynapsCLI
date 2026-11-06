@@ -655,9 +655,11 @@ pub mod locked_placeholder {
     ) {
         // An owned session's placeholder ends like the session would: its
         // owner gets the re-bind grace (armed once the daemon accepts
-        // connections), then it is gone. Only a re-bind that finds the
-        // journal released replaces it with the real session.
-        let mut rebind_deadline: Option<tokio::time::Instant> = None;
+        // connections; the fallback deadline if that never arrives), then it
+        // is gone. Only a re-bind that finds the journal released replaces
+        // it with the real session.
+        let mut rebind_deadline: Option<tokio::time::Instant> =
+            config.owned.as_ref().map(|o| crate::session::owned::initial_rebind_deadline(o.restored));
         let mut seq: u64 = 0;
         let emit = |seq: &mut u64, events: &broadcast::Sender<Envelope>, event: SessionEventWire| {
             let env = Envelope {
@@ -681,8 +683,8 @@ pub mod locked_placeholder {
             };
             let Some(Addressed { cmd, .. }) = next else { break };
             match cmd {
-                SessionCommand::ArmOwnerRebind if config.owned.is_some() && rebind_deadline.is_none() => {
-                    rebind_deadline = Some(tokio::time::Instant::now() + crate::session::owned::owner_rebind_grace());
+                SessionCommand::ArmOwnerRebind if config.owned.is_some() => {
+                    rebind_deadline = Some(crate::session::owned::armed_rebind_deadline(rebind_deadline));
                 }
                 SessionCommand::Attach { .. } => {
                     let msg = format!(

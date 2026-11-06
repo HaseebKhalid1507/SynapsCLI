@@ -472,6 +472,11 @@ pub const PIN_OFF_NOTICE: &str = "unpinned: this session parks again when idle a
 
 /// The engine command behind `/close` (`SessionActor::close_command`).
 pub(crate) const CLOSE_COMMAND: &str = "close";
+/// Host-only `close` argument: end the session only if no client is
+/// attached, decided by the actor itself so an attach queued ahead of the
+/// close is never closed under (`synaps daemon close` without `--attached`,
+/// an owned create adopting a live session's journal).
+pub(crate) const CLOSE_UNATTACHED_ARG: &str = "unattached";
 
 fn is_close_command(cmd: &SessionCommand) -> bool {
     matches!(cmd, SessionCommand::EngineCommand { name, .. } if name == CLOSE_COMMAND)
@@ -4764,6 +4769,11 @@ impl SessionActor {
     /// `InputOwnerChanged{reason: Takeover}` to everyone (the old owner's
     /// client renders the toast).
     async fn attach(&mut self, client: ClientMeta, mode: AttachMode, owner: Option<super::types::OwnerBind>) {
+        // An owner claim whose connection already gave up: nobody to attach,
+        // nothing binds, nothing held is released.
+        if owner.as_ref().is_some_and(|b| self.drop_dead_claim(b)) {
+            return;
+        }
         if let Err(e) = self.ensure_live().await {
             self.emit(SessionEventWire::AttachRefused { message: e });
             return;
@@ -5179,7 +5189,9 @@ impl SessionActor {
         tracing::info!(session = %self.id, "reload did not exec: fence lifted");
         self.adopt_carried_workers(workers, true);
         self.rearm_park();
-        if !self.event_queue.is_empty() {
+        // An owned session whose owner left for the reload holds them until
+        // it re-binds (`attach` wakes the queue then).
+        if !self.event_queue.is_empty() && !self.holds(WorkSource::QueueWake) {
             self.on_queue_wake().await;
         }
     }
@@ -5418,7 +5430,7 @@ impl SessionActor {
             SessionCommand::Query { id, query } => self.query(id, query).await,
             // `/close` ends the session, which no other engine command can.
             SessionCommand::EngineCommand { id, name, arg } if name == CLOSE_COMMAND => {
-                if let Some(reason) = self.close_command(id, &arg) {
+                if let Some(reason) = self.close_command(id, &arg, from.is_none()) {
                     return ControlFlow::Break(reason);
                 }
             }
@@ -5631,6 +5643,11 @@ impl SessionActor {
 
         // Inbox watcher, per-session UDS, registry entry, keyed injection.
         self.background.shutdown();
+        // The journal is final: release its lock now, before the command
+        // channel closes (`cmd_rx` drops ahead of `session_lock`), so whoever
+        // waited for `SessionHandle::closed` (a `daemon close`, an owned
+        // continue adopting this journal) can take it.
+        self.session_lock = None;
         self.emit(SessionEventWire::Ended { reason });
     }
 

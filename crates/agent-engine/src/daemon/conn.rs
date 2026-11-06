@@ -456,6 +456,9 @@ pub async fn serve(state: Arc<DaemonState>, stream: ServerStream, shutdown: Canc
             };
             let retry = owner_claim.is_some().then(|| config.clone());
             let mut created = state.create(config).await;
+            // The owned create ended the live target and made its own
+            // session from the journal: not the live one handed back.
+            let mut adopted = false;
             // An owned session is never someone else's live session handed
             // back by attach-if-live. A continue target nobody is attached
             // to (parked, or idle) is ended (saved) and its journal adopted
@@ -467,7 +470,10 @@ pub async fn serve(state: Arc<DaemonState>, stream: ServerStream, shutdown: Canc
                         // a session someone else runs: refused.
                         Ok(()) => match state.create(cfg).await {
                             Ok(h2) if !h2.is_owned() => Err(format!("{} is running in this daemon again", h2.id)),
-                            other => other,
+                            other => {
+                                adopted = true;
+                                other
+                            }
                         },
                         Err(why) => Err(why),
                     }
@@ -475,7 +481,7 @@ pub async fn serve(state: Arc<DaemonState>, stream: ServerStream, shutdown: Canc
                 }
             }
             match created {
-                Ok(h) if before.contains(&h.id) => {
+                Ok(h) if before.contains(&h.id) && !adopted => {
                     tracing::info!(session = %h.id, "daemon: continue target is live — attaching, not creating");
                     attached_to_live = true;
                     (h, mode)
@@ -631,12 +637,26 @@ pub async fn serve(state: Arc<DaemonState>, stream: ServerStream, shutdown: Canc
                 // notice, Conversation with the kept partial history) are already in
                 // the broadcast; drain what is there, then stop.
                 _ = fwd_announce.cancelled() => {
-                    while let Ok(env) = rx.try_recv() {
-                        if skip(&env) {
-                            continue;
-                        }
-                        if fwd_tx.send(DaemonFrame::Event(ended_for(caps, env).into())).await.is_err() {
-                            break;
+                    loop {
+                        match rx.try_recv() {
+                            Ok(env) => {
+                                if skip(&env) {
+                                    continue;
+                                }
+                                if fwd_tx.send(DaemonFrame::Event(ended_for(caps, env).into())).await.is_err() {
+                                    break;
+                                }
+                            }
+                            // The owner lost events here too: never a
+                            // silent gap it would re-bind across.
+                            Err(broadcast::error::TryRecvError::Lagged(n)) if owner => {
+                                tracing::warn!(session = %fwd_handle.id, dropped = n, "daemon: the owner lagged during a reload");
+                                fwd_lag_dropped.store(n, Ordering::SeqCst);
+                                fwd_lag.cancel();
+                                break;
+                            }
+                            Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
+                            Err(_) => break,
                         }
                     }
                     break;
@@ -783,6 +803,15 @@ pub async fn serve(state: Arc<DaemonState>, stream: ServerStream, shutdown: Canc
             forward.abort();
             let _ = forward.await;
         }
+        // The owner lost events (before the announce, or draining after
+        // it): `owner_lagged` wins over the reload, so it never re-binds
+        // across the gap. Its session, fenced, ends when the grace passes.
+        if owner && owner_lag.is_cancelled() {
+            send_owner_lagged(&tx, &sid, owner_lag_dropped.load(Ordering::SeqCst)).await;
+            drop(tx);
+            let _ = tokio::time::timeout(Duration::from_secs(1), writer).await;
+            return;
+        }
         let (generation, retry_after_ms) = match reload_bye(&state) {
             ByeReason::Reloading { generation, retry_after_ms } => (generation, retry_after_ms),
             _ => unreachable!(),
@@ -828,53 +857,51 @@ pub async fn serve(state: Arc<DaemonState>, stream: ServerStream, shutdown: Canc
     if !handle.is_alive() {
         state.remove(&sid);
     }
-    let reason = if lagged {
-        let dropped = owner_lag_dropped.load(Ordering::SeqCst);
-        let _ = tx
-            .send(DaemonFrame::Error {
-                session_id: Some(sid.clone()),
-                message: format!(
-                    "owned session: this connection (the owner) fell behind the session's event stream and \
-                     {dropped} event(s) were dropped; the connection is closed, ending the session, rather than \
-                     lose them silently"
-                ),
-            })
-            .await;
-        Some(ByeReason::OwnerLagged { dropped })
+    if lagged {
+        send_owner_lagged(&tx, &sid, owner_lag_dropped.load(Ordering::SeqCst)).await;
     } else {
-        None
-    };
-    let _ = tx.send(DaemonFrame::Bye { reason }).await;
+        let _ = tx.send(DaemonFrame::Bye { reason: None }).await;
+    }
     drop(tx);
     let _ = tokio::time::timeout(Duration::from_millis(500), writer).await;
     tracing::debug!(session = %sid, client = client.0, "daemon: client detached");
+}
+
+/// The owner fell behind: `Error` (why), then `Bye{owner_lagged}`.
+async fn send_owner_lagged(tx: &mpsc::Sender<DaemonFrame>, sid: &SessionId, dropped: u64) {
+    let _ = tx
+        .send(DaemonFrame::Error {
+            session_id: Some(sid.clone()),
+            message: format!(
+                "owned session: this connection (the owner) fell behind the session's event stream and {dropped} \
+                 event(s) were dropped; the connection is closed, ending the session, rather than lose them silently"
+            ),
+        })
+        .await;
+    let _ = tx.send(DaemonFrame::Bye { reason: Some(ByeReason::OwnerLagged { dropped }) }).await;
 }
 
 /// An owned create's `continue_session` names `live`, running in this
 /// daemon. Nobody attached (parked, or idle between clients): end it the
 /// way `synaps daemon close` would (saved, never mid-turn) so the create
 /// adopts its journal. Clients attached, another owner's session, or a
-/// session that will not close: refused, with why.
+/// session that will not close: refused, with why. Whether anyone is
+/// attached is the actor's call, made with the close (an attach that gets
+/// there first is never closed under).
 async fn adopt_live_continue_target(state: &DaemonState, live: &SessionHandle) -> Result<(), String> {
     let sid = live.id.clone();
     if live.is_owned() {
         return Err(format!("{sid} is another client's owned session"));
     }
-    let clients = live.presence().clients;
-    if clients > 0 {
-        return Err(format!(
-            "{sid} is running in this daemon, attached by {clients} client(s); an owned session cannot take over a \
-             session others use (attach to it instead, or detach them first)"
-        ));
-    }
-    match super::close::close_session(state, &sid, false, false).await {
+    match super::close::close_if_unattached(state, live).await {
         DaemonFrame::Closed { .. } => {
             tracing::info!(session = %sid, "daemon: owned create adopts a client-less live session's journal");
             Ok(())
         }
-        DaemonFrame::Refused { message, .. } | DaemonFrame::Error { message, .. } => {
-            Err(format!("{sid} is running in this daemon and could not be ended to adopt it: {message}"))
-        }
+        DaemonFrame::Refused { message, .. } | DaemonFrame::Error { message, .. } => Err(format!(
+            "{sid} is running in this daemon and could not be ended to adopt it: {message}; an owned session cannot \
+             take over a session others use (attach to it instead, or detach them first)"
+        )),
         other => Err(format!("{sid} is running in this daemon; ending it returned {other:?}")),
     }
 }
