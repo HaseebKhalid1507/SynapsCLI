@@ -776,6 +776,8 @@ fn main() -> anyhow::Result<()> {
     }
     // Before anything can report it (daemon `Welcome`, the client's skew check).
     agent_engine::session::wire::set_build_id(env!("SYNAPS_BUILD_ID"));
+    // Single-threaded here: nothing we spawn inherits a private daemon's dir.
+    agent_engine::daemon::registry::scope_daemon_dir_env();
     let mut thin = false;
     if let Some(mut kind) = thin_client() {
         // Before `ensure_daemon`: it reads config (idle-exit, process scopes).

@@ -1222,10 +1222,33 @@ pub struct DaemonPaths {
 /// the CLI aimed at it agree. Session sockets stay in `registry_dir()`.
 pub const DAEMON_DIR_ENV: &str = "SYNAPS_DAEMON_DIR";
 
+static SCOPED_DAEMON_DIR: std::sync::OnceLock<Option<std::ffi::OsString>> = std::sync::OnceLock::new();
+
+/// Take `$SYNAPS_DAEMON_DIR` out of the environment into this process
+/// alone: a private daemon (or a CLI aimed at one) keeps using it, but
+/// nothing it spawns (extension sidecars, MCP servers, tools) inherits it
+/// and lands on that daemon. Call once from `main`, before any thread.
+pub fn scope_daemon_dir_env() {
+    let dir = std::env::var_os(DAEMON_DIR_ENV).filter(|d| !d.is_empty());
+    if std::env::var_os(DAEMON_DIR_ENV).is_some() {
+        std::env::remove_var(DAEMON_DIR_ENV);
+    }
+    let _ = SCOPED_DAEMON_DIR.set(dir);
+}
+
+/// The daemon files dir this process was given (`$SYNAPS_DAEMON_DIR`, as
+/// scoped by [`scope_daemon_dir_env`], else the live environment).
+pub fn daemon_dir_override() -> Option<std::ffi::OsString> {
+    match SCOPED_DAEMON_DIR.get() {
+        Some(dir) => dir.clone(),
+        None => std::env::var_os(DAEMON_DIR_ENV).filter(|d| !d.is_empty()),
+    }
+}
+
 /// Daemon file paths for a profile, under `$SYNAPS_DAEMON_DIR` when set,
 /// else `registry_dir()`.
 pub fn daemon_paths(profile: Option<&str>) -> DaemonPaths {
-    match std::env::var_os(DAEMON_DIR_ENV).filter(|d| !d.is_empty()) {
+    match daemon_dir_override() {
         Some(dir) => daemon_paths_in(std::path::Path::new(&dir), profile),
         None => daemon_paths_in(&registry_dir(), profile),
     }
