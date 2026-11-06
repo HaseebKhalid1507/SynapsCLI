@@ -58,7 +58,7 @@ to the independently built Axel sidecar; do not multiply parallel build jobs.
 ```
 src/
 ├── main.rs               — CLI entry point, subcommand dispatch, --profile pinning
-└── cmd/                  — subcommand handlers (chat, server, login, send, status, rpc, daemon, attach, auth-broker, …)
+└── cmd/                  — subcommand handlers (chat, login, send, status, rpc, daemon, attach, auth-broker, …)
     ├── auth_accounts.rs  — `synaps auth list|use|remove|identify|plan`
     ├── quota_keeper.rs   — `synaps quota-keeper` (reset-window watcher, opt-in Codex activation)
     └── status.rs         — `synaps status` (per-account usage, --provider/--account/--all/--json)

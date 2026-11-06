@@ -17,11 +17,17 @@ const PIN_A_SESSION: &str = "pin a daemon session (synaps --attach --keep-warm, 
      pin) and drive it with synaps send --session <name>. See \
      https://github.com/HaseebKhalid1507/SynapsCLI/blob/dev/docs/daemon-mode.md#pinning-a-session-pin";
 
+// By URL: docs/ ships in neither the crate nor the .deb.
+const DAEMON_IS_THE_API: &str = "the session daemon is the API (synaps daemon; protocol: \
+     https://github.com/HaseebKhalid1507/SynapsCLI/blob/dev/docs/daemon-mode.md). For a browser UI \
+     use synaps-dash. See CHANGELOG.";
+
 /// Every removed subcommand. Each row has a hidden variant in
 /// [`RemovedCommand`]; a unit test keeps the two in step.
 pub(crate) const REMOVED: &[Removed] = &[
     Removed { name: "agent", instead: PIN_A_SESSION },
     Removed { name: "watcher", instead: PIN_A_SESSION },
+    Removed { name: "server", instead: DAEMON_IS_THE_API },
 ];
 
 /// The hidden stubs, flattened into the top-level `Command`.
@@ -37,6 +43,11 @@ pub(crate) enum RemovedCommand {
         #[arg(hide = true, trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    #[command(hide = true, disable_help_flag = true, about = about("server"))]
+    Server {
+        #[arg(hide = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
 }
 
 impl RemovedCommand {
@@ -44,6 +55,7 @@ impl RemovedCommand {
         match self {
             Self::Agent { .. } => "agent",
             Self::Watcher { .. } => "watcher",
+            Self::Server { .. } => "server",
         }
     }
 }
