@@ -874,6 +874,13 @@ pub async fn run(
                         }
                         continue;
                     }
+                    // A lagging owner is cut by the daemon: its events are
+                    // gone (billing), so never reconnect.
+                    if let Some(TransportError::OwnerLagged { dropped }) = b.t.last_error() {
+                        break Some(Exit::Lost(format!(
+                            "lost {dropped} session events: the daemon disconnected this client for lagging"
+                        )));
+                    }
                     let why = b.t.last_error().map(|e| e.to_string()).unwrap_or_else(|| "connection closed".into());
                     break Some(Exit::Lost(format!("lost the session daemon ({why})")));
                 }
