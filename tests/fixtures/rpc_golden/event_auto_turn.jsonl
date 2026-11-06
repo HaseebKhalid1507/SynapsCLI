@@ -1,0 +1,8 @@
+{"model":"claude-sonnet-4-5","protocol_version":1,"session_id":"<SID0>","type":"ready"}
+{"payload":{"content_type":"message","formatted":"<event id=\"<EVT0>\" type=\"message\" severity=\"medium\" source=\"diff\">ping from outside</event>","id":"<EVT0>","severity":"medium","source":"diff","text":"ping from outside","timestamp":"<TS>"},"type":"event"}
+{"event":{"type":"response_start"},"type":"message_update"}
+{"event":{"delta":"hi","type":"text_delta"},"type":"message_update"}
+{"type":"agent_end","usage":{"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"input_tokens":10,"output_tokens":1}}
+{"command":"auto_turn","id":"auto:<EVT0>","ok":true,"type":"response"}
+{"command":"get_messages","id":"m1","messages":[{"content":"<event id=\"<EVT0>\" type=\"message\" severity=\"medium\" source=\"diff\">ping from outside</event>","role":"user"},{"content":[{"text":"hi","type":"text"}],"role":"assistant"}],"type":"response"}
+{"_exit":0}
