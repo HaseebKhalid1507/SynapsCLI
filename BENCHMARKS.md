@@ -203,8 +203,12 @@ and raw data: [`benchmarks/terminal-bench/`](benchmarks/terminal-bench/README.md
 | List-price cost per trial | $7.94 | $13.77 |
 
 The refusals (`uefi-bootkit`, `formal-crypto`, `kv-live-surgery`) cost 1.8
-expected passes, more than the whole 1.0 gap. Most of the other losses fail
-one check, where the agent verified its work differently from the grader.
+expected passes, more than the whole 1.0 gap. Claude Code was refused at the
+same steps and passes those tasks by falling back to Claude Opus 5; Synaps
+ends the turn. Most other failures miss one or two checks, and in 13 of 21 the
+agent's own summary named the decision that failed. Every failure has a
+write-up with general fixes in
+[`benchmarks/terminal-bench/failures/`](benchmarks/terminal-bench/failures/README.md).
 One trial per task is noisy, and versions, effort and hosts differ.
 
 ## Caveats (read these)
