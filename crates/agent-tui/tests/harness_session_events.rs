@@ -284,6 +284,7 @@ fn session_compaction_lines() {
         W::CompactionStarted {
             source: "manual".into(),
             disclosure: "[compaction: model x, ~10 tokens]".into(),
+            detail: None,
         },
         W::CompactionFailed {
             message: "boom".into(),
@@ -321,6 +322,7 @@ fn session_compaction_digest_matches_full() {
         chains_advanced: vec!["main".into()],
         queued_restored: None,
         msg_count: 40,
+        summary: None,
     };
 
     // Full mode: the Conversation carries the history.

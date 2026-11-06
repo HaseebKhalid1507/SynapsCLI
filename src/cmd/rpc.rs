@@ -1,169 +1,65 @@
-//! `synaps rpc` — headless line-JSON server on stdin/stdout.
+//! `synaps rpc` — the line-JSON protocol on stdin/stdout, served by the
+//! session daemon.
 //!
-//! One process = one synaps session. The bridge daemon spawns one of these per
-//! Slack thread and communicates via LDJSON frames on the child's
-//! `stdin` / `stdout` pipes.
+//! One process = one synaps session. Bridges (Pria guest-agent, the Slack
+//! bridge, synaps-bench) spawn one of these per conversation and speak LDJSON
+//! frames on its `stdin` / `stdout`.
 //!
 //! # Protocol
 //!
-//! See `docs/rpc-protocol.md` and `synaps-bridge.SPEC.md §4` for the full
-//! wire-format specification. In brief:
+//! See `docs/rpc-protocol.md`. In brief:
 //!
-//! * Parent → child: [`synaps_cli::core::rpc_protocol::RpcCommand`] frames (line-JSON on stdin)
-//! * Child → parent: [`synaps_cli::core::rpc_protocol::RpcEvent`] frames (line-JSON on stdout)
+//! * Parent → child: [`RpcCommand`] frames (line-JSON on stdin)
+//! * Child → parent: [`RpcEvent`] frames (line-JSON on stdout)
 //! * First byte on stdout is always `{` — the `Ready` frame.
 //! * Max inbound frame: 1 MiB.
-//! * **stdout is reserved for protocol frames only.** All `tracing::*` output
-//!   goes to the log file / stderr.
+//! * **stdout is reserved for protocol frames only.**
+//!
+//! # Architecture
+//!
+//! This process runs no engine. It connects to the profile's session daemon
+//! (auto-spawning it exactly as `synaps attach` does), creates an OWNED
+//! session there (this process's cwd and env, secrets forwarded for the
+//! tools), translates each [`RpcCommand`] into a `SessionCommand` /
+//! `SessionQuery`, and each daemon event back into the [`RpcEvent`] frames
+//! the in-process loop used to write. The session actor does the turn loop,
+//! saves, context-head checkpoints, event auto-turns and turn budgets.
+//! Owned: when this process goes away (EOF, `shutdown`, kill), the session
+//! ends with it and any turn is cancelled.
 
-use anyhow::Context;
-use futures::StreamExt;
-use std::sync::Arc;
+use std::collections::{HashMap, VecDeque};
+use std::path::PathBuf;
+use std::time::Duration;
+
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tokio_util::sync::CancellationToken;
 
-use synaps_cli::core::config::load_config;
-use synaps_cli::runtime::openai::registry::{list_models, list_providers};
-use synaps_cli::{
-    core::rpc_dispatch::{
-        accumulate_usage, build_tools_list_body, map_stream_event, parse_frame,
-        MAX_FRAME_BYTES,
-    },
-    core::rpc_protocol::{RpcAttachment, RpcCommand, RpcEvent, TurnUsage, RPC_PROTOCOL_VERSION},
-    engine::reactor::{
-        auto_turn_cap_reached, claim_auto_turn_with_cap, drain_event_queue,
-        event_payload_from_drained, spawn_prompt_registration_check, wake_action_with_cap,
-        WakeAction,
-    },
-    engine::setup::{self, EngineOpts},
-    Runtime, Session, SessionEvent, StreamEvent,
+use agent_engine::daemon::{self, registry, EnsureError, EXIT_DAEMON_LOST, EXIT_REFUSED, EXIT_VERSION};
+use agent_engine::session::socket_transport::SocketTransport;
+use agent_engine::session::wire::{Attach, Hello};
+use agent_engine::session::{
+    AttachMode, ClientKind, ClientTransport, EndReason, HistoryMode, SessionCommand, SessionConfig,
+    SessionEventWire, SessionQuery, SessionSetting, TransportError, TurnTrigger,
 };
+use agent_engine::{SessionEvent, StreamEvent, TurnError};
+use synaps_cli::core::rpc_dispatch::{accumulate_usage, build_tools_list_body, map_stream_event, parse_frame, MAX_FRAME_BYTES};
+use synaps_cli::core::rpc_protocol::{RpcAttachment, RpcCommand, RpcEvent, TurnUsage, RPC_PROTOCOL_VERSION};
+use synaps_cli::runtime::openai::registry::{list_models, list_providers};
 
-// ─── Constants ───────────────────────────────────────────────────────────────
-
-/// Capacity of the writer-task channel (frames). Provides backpressure when the
+/// Capacity of the writer-task channel (frames): backpressure when the
 /// parent reads slowly.
 const WRITER_CHAN_CAP: usize = 256;
+/// `shutdown`: how long an in-flight turn may run on before the session ends anyway.
+const SHUTDOWN_TURN_WAIT: Duration = Duration::from_secs(30);
+/// How long to wait for the daemon's `Ended` after `End{ClientQuit}`.
+const END_WAIT: Duration = Duration::from_secs(10);
+/// How long the writer may take to drain on exit.
+const WRITER_DRAIN: Duration = Duration::from_secs(1);
 
-// ─── State ───────────────────────────────────────────────────────────────────
+// ─── stdout ──────────────────────────────────────────────────────────────────
 
-/// Tracks a currently in-flight streaming prompt.
-struct InFlight {
-    /// Correlation id of the originating Prompt/FollowUp command.
-    /// Retained for diagnostics and future Task 3 e2e introspection.
-    prompt_id: String,
-    cancel: CancellationToken,
-    handle: JoinHandle<()>,
-}
-
-/// Full runtime state for the RPC session.
-struct RpcState {
-    runtime: Runtime,
-    session: Session,
-    /// Wall 1 for the headless bridge: rpc drives `Runtime` directly (no
-    /// `SessionActor`), so IT must answer `ContextHeadCheckpoint` and honour
-    /// the durability latch — otherwise a rollover latches `durability_blocked`
-    /// with nobody to complete the receipt.
-    context_head: synaps_cli::engine::session::ContextHeadPersistence,
-    api_messages: Vec<synaps_cli::SharedMessage>,
-    total_input_tokens: u64,
-    total_output_tokens: u64,
-    session_cost: f64,
-    in_flight: Option<InFlight>,
-    /// Events buffered while streaming is in flight. Flushed as `Event` frames
-    /// when the turn completes (Done path), then injected for the next turn.
-    pending_events: Vec<String>,
-    /// Number of consecutive auto-triggered turns since the last real user message.
-    /// Reset to 0 on every real Prompt / FollowUp. Capped at `auto_turn_cap`.
-    consecutive_auto_turns: u32,
-    /// `true` while an auto-turn has been reserved but its `spawn_prompt` call
-    /// has not yet registered `in_flight`.  Counts as busy so concurrent Prompt
-    /// commands are rejected during the narrow window between reservation and
-    /// actual task start.
-    auto_turn_pending: bool,
-    /// Mirror of `config.events.auto_turn` — loaded once at boot.
-    events_auto_turn: bool,
-    /// Mirror of `config.events.auto_turn_cap` (0 = unlimited) — loaded once at boot.
-    auto_turn_cap: u32,
-    /// `config.turn_budgets` at boot: auto (event-triggered) turns run under
-    /// the event turn budget.
-    turn_budgets: synaps_cli::config::TurnBudgetsConfig,
-    /// A round-checkpoint save timed out (bounded: it holds this state's
-    /// lock): `terminal_flush` saves at the turn's end instead.
-    save_owed: bool,
-    /// The session lock (`setup::lock_session`): follows `session` to a new
-    /// id (`new_session`); `None` = proceeding unlocked (best-effort).
-    #[allow(dead_code)] // held for RAII
-    session_lock: Option<synaps_cli::core::session_lock::SessionLock>,
-}
-
-impl RpcState {
-    /// Persist the current conversation to the session file. No-op if the
-    /// message list is empty.
-    async fn save_session(&mut self) {
-        if self.context_head.is_blocked(&self.session) || self.api_messages.is_empty() {
-            return;
-        }
-        self.session.api_messages = self.api_messages.clone();
-        self.session.total_input_tokens = self.total_input_tokens;
-        self.session.total_output_tokens = self.total_output_tokens;
-        self.session.session_cost = self.session_cost;
-        self.session.model = self.runtime.model().to_string();
-        self.session.system_prompt = self.runtime.system_prompt().map(|s| s.to_string());
-        self.session.thinking_level = self.runtime.thinking_level().to_string();
-        self.session.updated_at = chrono::Utc::now();
-        self.session.auto_title();
-        if let Err(e) = self.session.save().await {
-            tracing::error!(error = %e, "failed to save session");
-        }
-    }
-
-    async fn persist_context_head(
-        &mut self,
-        session_id: &str,
-        messages: Vec<synaps_cli::SharedMessage>,
-    ) -> std::io::Result<()> {
-        let mut candidate = self.session.clone();
-        candidate.api_messages = messages;
-        candidate.total_input_tokens = self.total_input_tokens;
-        candidate.total_output_tokens = self.total_output_tokens;
-        candidate.session_cost = self.session_cost;
-        candidate.model = self.runtime.model().to_string();
-        candidate.system_prompt = self.runtime.system_prompt().map(str::to_string);
-        candidate.thinking_level = self.runtime.thinking_level().to_string();
-        candidate.updated_at = chrono::Utc::now();
-        candidate.auto_title();
-        self.context_head
-            .persist(
-                &mut self.session,
-                &mut self.api_messages,
-                session_id,
-                candidate,
-            )
-            .await
-    }
-
-    /// Returns `true` if the session is busy — either a streaming task is
-    /// running **or** an auto-turn has been reserved but not yet started.
-    /// All Prompt / FollowUp / NewSession commands must reject when busy.
-    fn is_busy(&self) -> bool {
-        self.in_flight.is_some() || self.auto_turn_pending
-    }
-
-    /// Convenience alias kept for the `GetState` body (legacy field name).
-    fn is_streaming(&self) -> bool {
-        self.in_flight.is_some()
-    }
-}
-
-// ─── Frame serialisation ──────────────────────────────────────────────────────
-
-/// Serialise an [`RpcEvent`] to a JSON string (no trailing newline).
-///
-/// Serialisation of well-typed enum variants should never fail. If it does, a
-/// fallback error frame is returned so the writer task never silently drops data.
+/// Serialise an [`RpcEvent`] (no trailing newline). Never fails silently.
 fn encode_event(ev: &RpcEvent) -> String {
     serde_json::to_string(ev).unwrap_or_else(|e| {
         tracing::error!(error = %e, "BUG: failed to serialise RpcEvent");
@@ -171,501 +67,34 @@ fn encode_event(ev: &RpcEvent) -> String {
     })
 }
 
-// ─── Writer task ──────────────────────────────────────────────────────────────
-
-/// Spawn a dedicated task that owns stdout and serialises frames from a channel.
-///
-/// All code paths must route frames through the returned sender; nothing else
-/// may write to stdout so protocol frames never interleave with diagnostics.
+/// The one task that owns stdout. A closed stdout ends it (the parent is gone).
 fn spawn_writer(mut rx: mpsc::Receiver<RpcEvent>) -> JoinHandle<()> {
     tokio::spawn(async move {
+        use std::io::Write;
+        let mut stdout = std::io::stdout();
         while let Some(ev) = rx.recv().await {
-            // println! is correct here — stdout IS the protocol channel.
-            println!("{}", encode_event(&ev));
+            if writeln!(stdout, "{}", encode_event(&ev)).and_then(|_| stdout.flush()).is_err() {
+                break;
+            }
         }
     })
 }
 
-// ─── Streaming task ───────────────────────────────────────────────────────────
-
-// ─── Terminal-path helper ─────────────────────────────────────────────────────
-
-/// A cancelled turn: the engine's cancel-path history (partial assistant
-/// message, completed tool rounds, canceled results) was already adopted
-/// from `MessageHistory`; append the interruption marker after it (before
-/// `terminal_flush` injects buffered events), exactly like the session
-/// actor. Append-only, so the provider's cached prefix is untouched.
-///
-/// A turn the engine had already finished when the cancel reached it
-/// (`TurnCompletion`) is not interrupted: nothing is appended.
-async fn mark_interrupted(
-    state: &Mutex<RpcState>,
-    completion: &agent_engine::runtime::TurnCompletion,
-) {
-    if completion.completed() {
-        return;
-    }
-    let mut st = state.lock().await;
-    if agent_engine::engine::interrupt::append_marker(
-        &mut st.api_messages,
-        agent_engine::engine::interrupt::InterruptReason::User,
-    ) {
-        st.save_session().await;
-    }
+/// Before `Ready`: say why there is no session (stderr, plus one error frame
+/// so a parent reading only stdout sees it) and exit `code`.
+fn refuse(code: i32, message: String) -> ! {
+    eprintln!("synaps rpc: {message}");
+    println!("{}", encode_event(&RpcEvent::Error { id: None, message }));
+    std::process::exit(code);
 }
 
-/// Atomically close out a terminal path: clear `in_flight`, clear
-/// `auto_turn_pending`, and flush any buffered `pending_events` into
-/// `api_messages` — all under **one** mutex acquisition.
-///
-/// # `allow_chain` flag
-///
-/// Controls whether a post-flush auto-turn may be reserved:
-///
-/// * **`true`** (Done path): if all conditions are met (`events_auto_turn` enabled,
-///   buffered events present, `consecutive_auto_turns` under `auto_turn_cap` (0 = unlimited), last
-///   message is `role=user`), atomically claim the cap slot, set
-///   `auto_turn_pending = true`, and return `Some(auto_id)`.  The caller
-///   **must** forward the id to the scheduler without holding the lock.
-///
-/// * **`false`** (error / cancel / silent-drop paths): atomically clear
-///   `in_flight` and `auto_turn_pending`, flush `pending_events` into
-///   `api_messages` (so buffered events are not lost from history), but
-///   **never** claim a cap slot or set `auto_turn_pending`.  Returns `None`.
-///   The cap counter (`consecutive_auto_turns`) is left unchanged.
-///
-/// This eliminates the critical bug where error/cancel/drop paths previously
-/// allowed `terminal_flush` to increment `consecutive_auto_turns` and set
-/// `auto_turn_pending = true` while returning `Some(auto_id)` that was then
-/// silently discarded — leaving the session permanently stuck in busy state.
-async fn terminal_flush(state: &Mutex<RpcState>, allow_chain: bool) -> Option<String> {
-    let mut st = state.lock().await;
-    st.in_flight = None;
-    st.auto_turn_pending = false;
-    let to_inject = std::mem::take(&mut st.pending_events);
-    let had_buffered = !to_inject.is_empty();
-    for formatted in to_inject {
-        st.api_messages.push(std::sync::Arc::new(
-            serde_json::json!({"role": "user", "content": formatted}),
-        ));
-    }
-    // The injected events are history now, and a timed-out round save is
-    // still owed: persist the turn's end.
-    if had_buffered || std::mem::take(&mut st.save_owed) {
-        st.save_session().await;
-    }
-
-    // Only attempt to reserve a post-flush auto-turn on the Done path.
-    if allow_chain
-        && had_buffered
-        && st.events_auto_turn
-        && !st.context_head.is_blocked(&st.session)
-        && !auto_turn_cap_reached(st.consecutive_auto_turns, st.auto_turn_cap)
-        && st
-            .api_messages
-            .last()
-            .map(|m| m["role"].as_str() == Some("user"))
-            .unwrap_or(false)
-    {
-        // Atomically claim the turn and reserve pending flag.
-        let cap = st.auto_turn_cap;
-        if claim_auto_turn_with_cap(&mut st.consecutive_auto_turns, cap) {
-            st.auto_turn_pending = true;
-            let auto_id = format!("auto:post-flush-{}", chrono::Utc::now().timestamp_millis());
-            return Some(auto_id);
-        }
-    }
-    None
-}
-
-// ─── Streaming task ───────────────────────────────────────────────────────────
-
-/// Spawn a streaming task for a `Prompt` or `FollowUp` command.
-///
-/// **Race fix — oneshot start barrier (issue 1):**
-/// The spawned task must NOT touch shared state or call `terminal_flush` until
-/// `in_flight` has been set, otherwise a fast error path can call
-/// `terminal_flush` (clearing `in_flight = None`) before `in_flight` is even
-/// written — leaving a zombie `JoinHandle` in the slot.
-///
-/// Protocol:
-/// 1. Create a `oneshot` channel `(start_tx, start_rx)`.
-/// 2. Spawn the task — it immediately awaits `start_rx` before any state work.
-/// 3. Re-validate reservation under registration lock (see bug-1 fix below).
-/// 4. Set `in_flight = Some(InFlight { handle, … })` under the lock.
-/// 5. Send `start_tx` to release the task.
-///
-/// This guarantees: `terminal_flush` cannot run until `in_flight` is set, so
-/// every `in_flight = None` from inside the task sees a previously-set handle
-/// and leaves state consistent. Abort can always find the handle.
-///
-/// **Bug 1 fix — Abort-between-snapshot-and-registration:**
-/// There is a narrow window between the snapshot-guard lock release and the
-/// registration lock acquisition during which `Abort` can run and clear
-/// `auto_turn_pending`. Without the re-check, the task would be registered
-/// regardless — leaving a ghost `InFlight` that Abort already acknowledged as
-/// gone. The fix: re-validate `auto_turn_pending` (and `in_flight`) inside the
-/// registration lock. If the reservation was revoked, `start_tx` is dropped
-/// (task sees `Err` on `start_rx.await` and exits cleanly) and we return
-/// without registering `in_flight`.
-///
-/// **Bug 2 fix — guard-fail leaves `auto_turn_pending` set:**
-/// If the snapshot-guard check fails we now clear `auto_turn_pending` before
-/// returning so the session is never left permanently busy by a phantom
-/// reservation.
-///
-/// `auto_turn_tx`: channel to the scheduler task in `run()`. Terminal paths
-/// that want to chain an additional auto-turn send the reserved `auto_id` here
-/// instead of calling `spawn_prompt` recursively (which would create a
-/// non-`Send` recursive async future).
-async fn spawn_prompt(
-    prompt_id: String,
-    state: Arc<Mutex<RpcState>>,
-    writer_tx: mpsc::Sender<RpcEvent>,
-    auto_turn_tx: mpsc::UnboundedSender<String>,
-) {
-    let cancel = CancellationToken::new();
-    let cancel_clone = cancel.clone();
-    let cancel_check = cancel.clone();
-    let turn_completion = agent_engine::runtime::TurnCompletion::new();
-    let pid = prompt_id.clone();
-    let wtx = writer_tx.clone();
-    let is_auto_turn = prompt_id.starts_with("auto:");
-
-    // Snapshot messages under the lock.
-    // For auto: IDs we also re-validate the reservation atomically — same lock
-    // acquisition for both the guard check and the snapshot so there is no
-    // window between "reservation still valid" and "messages snapshotted".
-    // Normal client prompts skip the guard (they were already validated by
-    // handle_prompt's is_busy() check before reaching here).
-    let messages: Vec<synaps_cli::SharedMessage> = {
-        let mut st = state.lock().await;
-        if prompt_id.starts_with("auto:") && (!st.auto_turn_pending || st.in_flight.is_some()) {
-            tracing::warn!(
-                prompt_id,
-                auto_turn_pending = st.auto_turn_pending,
-                in_flight_live = st.in_flight.is_some(),
-                "rpc: spawn_prompt: auto-turn reservation invalidated at snapshot — aborting"
-            );
-            // Bug 2 fix: defensively clear auto_turn_pending before returning so
-            // the session is never left in a permanently-busy phantom state when
-            // the guard check here fails.
-            st.auto_turn_pending = false;
-            return;
-        }
-        if st.context_head.is_blocked(&st.session) {
-            st.auto_turn_pending = false;
-            let _ = wtx
-                .send(RpcEvent::Error {
-                    id: Some(prompt_id.clone()),
-                    message: "context head is unverified — start a new session or restart/resume"
-                        .into(),
-                })
-                .await;
-            return;
-        }
-        st.api_messages.clone()
-    };
-
-    // Start barrier: task awaits this before touching any state/stream work.
-    let (start_tx, start_rx) = oneshot::channel::<()>();
-
-    let state_task = Arc::clone(&state);
-    let handle = tokio::spawn(async move {
-        let state = state_task;
-
-        // Wait until in_flight has been registered so terminal_flush is safe.
-        // If the sender is dropped (caller panicked), just exit cleanly.
-        if start_rx.await.is_err() {
-            return;
-        }
-
-        // Acquire lock only long enough to start the stream future.
-        let mut stream = {
-            let mut st = state.lock().await;
-            // Auto turns were started by events, not the client: they run
-            // under the event turn budget for this turn only.
-            let session_budget = is_auto_turn.then(|| {
-                let event_budget = st.runtime.turn_budget().for_event_turn(&st.turn_budgets);
-                let session_budget = st.runtime.turn_budget().clone();
-                st.runtime.set_turn_budget(event_budget);
-                session_budget
-            });
-            let stream = st
-                .runtime
-                .run_stream_tracked(
-                    messages,
-                    cancel_clone,
-                    None,
-                    None,
-                    false,
-                    turn_completion.clone(),
-                )
-                .await;
-            if let Some(session_budget) = session_budget {
-                st.runtime.set_turn_budget(session_budget);
-            }
-            stream
-        };
-
-        let mut usage_acc = TurnUsage {
-            input_tokens: 0,
-            output_tokens: 0,
-            cache_read_input_tokens: 0,
-            cache_creation_input_tokens: 0,
-            cache_creation_5m: None,
-            cache_creation_1h: None,
-            model: None,
-        };
-
-        while let Some(ev) = stream.next().await {
-            if let StreamEvent::Session(SessionEvent::ContextHeadCheckpoint {
-                session_id,
-                messages,
-                receipt,
-            }) = ev
-            {
-                let mut st = state.lock().await;
-                receipt.complete(st.persist_context_head(&session_id, messages).await);
-                continue;
-            }
-            // Peel off MessageHistory first so we can MOVE the payload into
-            // state instead of cloning it (the vec can be several MB).
-            if let StreamEvent::Session(SessionEvent::MessageHistory(msgs)) = ev {
-                let mut st = state.lock().await;
-                st.api_messages = msgs;
-                // Round checkpoint, bounded: it holds the state lock every
-                // command (Abort included) waits on. A write already handed
-                // to the disk still lands, in order; otherwise the turn's end
-                // saves (`terminal_flush`).
-                if tokio::time::timeout(
-                    agent_engine::session::budgets::SAVE_TIMEOUT,
-                    st.save_session(),
-                )
-                .await
-                .is_err()
-                {
-                    tracing::warn!("rpc: round checkpoint save timed out");
-                    st.save_owed = true;
-                }
-                continue;
-            }
-            match &ev {
-                StreamEvent::Session(
-                    se @ SessionEvent::Usage {
-                        input_tokens,
-                        output_tokens,
-                        ..
-                    },
-                ) => {
-                    accumulate_usage(&mut usage_acc, se);
-                    let mut st = state.lock().await;
-                    st.total_input_tokens += input_tokens;
-                    st.total_output_tokens += output_tokens;
-                    continue;
-                }
-                // ── Turn complete ───────────────────────────────────────────
-                StreamEvent::Session(SessionEvent::Done) => {
-                    // A cancelled Anthropic turn ends Ok (history, then Done):
-                    // it is still an abort — mark it and never chain an
-                    // auto-turn onto it.
-                    let cancelled = cancel_check.is_cancelled();
-                    let _ = wtx
-                        .send(RpcEvent::AgentEnd {
-                            usage: usage_acc.clone(),
-                        })
-                        .await;
-                    if cancelled {
-                        mark_interrupted(&state, &turn_completion).await;
-                    }
-                    // terminal_flush(allow_chain=true): Done path — eligible to
-                    // reserve a post-flush auto-turn if conditions are met.
-                    let post_flush_id = terminal_flush(&state, !cancelled).await;
-                    let resp_command = if pid.starts_with("auto:") {
-                        "auto_turn"
-                    } else {
-                        "prompt"
-                    };
-                    let body = if cancelled {
-                        serde_json::json!({ "ok": true, "cancelled": true })
-                    } else {
-                        serde_json::json!({ "ok": true })
-                    };
-                    let _ = wtx
-                        .send(RpcEvent::Response {
-                            id: pid.clone(),
-                            command: resp_command.to_string(),
-                            body,
-                        })
-                        .await;
-                    // Schedule post-flush auto-turn via the scheduler channel.
-                    // We must NOT call spawn_prompt(...).await here — that creates
-                    // a recursive async Send cycle. The scheduler task in run()
-                    // owns the call site.
-                    if let Some(auto_id) = post_flush_id {
-                        let _ = auto_turn_tx.send(auto_id);
-                    }
-                    return;
-                }
-                // ── Turn error (always returns early) ───────────────────────
-                StreamEvent::Session(SessionEvent::Error(msg)) => {
-                    // If we requested cancellation, the engine surfaces the
-                    // cancel as a downstream `SessionEvent::Error` (typically
-                    // "operation canceled" from the OpenAI stream layer). That
-                    // is a benign abort, not a failure — report ok: true,
-                    // cancelled: true exactly as the stream-exhausted branch
-                    // below would, and skip the noisy Error frame.
-                    if cancel_check.is_cancelled() {
-                        let _ = wtx
-                            .send(RpcEvent::AgentEnd {
-                                usage: usage_acc.clone(),
-                            })
-                            .await;
-                        let resp_command = if pid.starts_with("auto:") {
-                            "auto_turn"
-                        } else {
-                            "prompt"
-                        };
-                        let _ = wtx
-                            .send(RpcEvent::Response {
-                                id: pid.clone(),
-                                command: resp_command.to_string(),
-                                body: serde_json::json!({ "ok": true, "cancelled": true }),
-                            })
-                            .await;
-                        mark_interrupted(&state, &turn_completion).await;
-                        // Cancel path: terminal_flush(allow_chain=false) — never reserve auto-turn.
-                        let _ = terminal_flush(&state, false).await;
-                        return;
-                    }
-                    let _ = wtx
-                        .send(RpcEvent::Error {
-                            id: Some(pid.clone()),
-                            message: msg.message.clone(),
-                        })
-                        .await;
-                    let _ = wtx
-                        .send(RpcEvent::AgentEnd {
-                            usage: usage_acc.clone(),
-                        })
-                        .await;
-                    let resp_command = if pid.starts_with("auto:") {
-                        "auto_turn"
-                    } else {
-                        "prompt"
-                    };
-                    // Typed spec §5.2 outcome: forward the engine's terminal
-                    // category + correlation ID verbatim — never re-derived.
-                    let _ = wtx
-                        .send(RpcEvent::Response {
-                            id: pid.clone(),
-                            command: resp_command.to_string(),
-                            body: serde_json::json!({
-                                "ok": false,
-                                "error": msg.message,
-                                "outcome": msg.outcome,
-                            }),
-                        })
-                        .await;
-                    // Error path: terminal_flush(allow_chain=false) — never reserve auto-turn.
-                    let _ = terminal_flush(&state, false).await;
-                    return;
-                }
-                _ => {}
-            }
-
-            // Forward mapped LLM / Agent events to the parent.
-            if let Some(rpc_ev) = map_stream_event(&ev) {
-                if wtx.send(rpc_ev).await.is_err() {
-                    tracing::warn!("writer channel closed; aborting stream early");
-                    break;
-                }
-            }
-        }
-
-        // Stream ended without Session::Done. If we requested cancellation, that's an
-        // orderly abort; otherwise it's a silent failure (provider drop, extension
-        // crash, etc.) and the parent must be told.
-        let cancelled = cancel_check.is_cancelled();
-        let _ = wtx
-            .send(RpcEvent::AgentEnd {
-                usage: usage_acc.clone(),
-            })
-            .await;
-        let body = if cancelled {
-            serde_json::json!({ "ok": true, "cancelled": true })
-        } else {
-            serde_json::json!({
-                "ok": false,
-                "error": "stream ended without Done"
-            })
-        };
-        let resp_command = if pid.starts_with("auto:") {
-            "auto_turn"
-        } else {
-            "prompt"
-        };
-        let _ = wtx
-            .send(RpcEvent::Response {
-                id: pid.clone(),
-                command: resp_command.to_string(),
-                body,
-            })
-            .await;
-        if cancelled {
-            mark_interrupted(&state, &turn_completion).await;
-        }
-        // Silent-drop / abort path: terminal_flush(allow_chain=false) — never reserve auto-turn.
-        let _ = terminal_flush(&state, false).await;
-    });
-
-    // Register in_flight BEFORE releasing the start barrier.
-    // Bug 1 fix — Abort-between-snapshot-and-registration:
-    // Between the snapshot guard above and this lock, Abort may have run and
-    // cleared auto_turn_pending (+ taken in_flight if any). Re-validate here
-    // under the same registration lock before writing in_flight. If the
-    // reservation was revoked, drop start_tx (the waiting task sees Err on
-    // start_rx.await and exits cleanly) and return without leaving a ghost.
-    {
-        let mut st = state.lock().await;
-        let is_auto = prompt_id.starts_with("auto:");
-        let in_flight_live = st.in_flight.is_some();
-        if !spawn_prompt_registration_check(is_auto, &mut st.auto_turn_pending, in_flight_live) {
-            tracing::warn!(
-                prompt_id,
-                auto_turn_pending = st.auto_turn_pending,
-                in_flight_live,
-                "rpc: spawn_prompt: Abort cleared reservation between snapshot and registration — dropping task"
-            );
-            // Defensively clear pending so the session is not stuck busy.
-            st.auto_turn_pending = false;
-            // Drop start_tx here — the spawned task's start_rx.await returns
-            // Err and the task exits without touching any state.
-            drop(start_tx);
-            // Drop the JoinHandle — task will finish immediately on start_rx Err.
-            drop(handle);
-            return;
-        }
-        st.in_flight = Some(InFlight {
-            prompt_id,
-            cancel,
-            handle,
-        });
-        st.auto_turn_pending = false;
-    }
-
-    // Release the task. From this point the task may proceed with stream work.
-    // If send fails the task already exited (should never happen in practice).
-    let _ = start_tx.send(());
-}
-
-// ─── Per-command handlers ─────────────────────────────────────────────────────
+// ─── attachments ─────────────────────────────────────────────────────────────
 
 /// Validate RPC attachment paths: must be absolute, no `..` components.
-fn rpc_attachment_paths(attachments: &[RpcAttachment]) -> Result<Vec<std::path::PathBuf>, String> {
+fn rpc_attachment_paths(attachments: &[RpcAttachment]) -> Result<Vec<PathBuf>, String> {
     let mut paths = Vec::with_capacity(attachments.len());
     for a in attachments {
-        let path = std::path::PathBuf::from(&a.path);
+        let path = PathBuf::from(&a.path);
         if !path.is_absolute() {
             return Err(format!("attachment path must be absolute: {}", a.path));
         }
@@ -678,988 +107,730 @@ fn rpc_attachment_paths(attachments: &[RpcAttachment]) -> Result<Vec<std::path::
 }
 
 /// Load RPC user content: validate paths, load files, build content blocks,
-/// validate against the session model. Returns the content Value for the
-/// user message.
+/// validate the proposed history against the session model. Returns the
+/// user message content and the attachment count.
 async fn load_rpc_user_content(
     message: &str,
     attachments: &[RpcAttachment],
     model: &str,
-    existing_messages: &[std::sync::Arc<serde_json::Value>],
+    existing_messages: &[synaps_cli::SharedMessage],
 ) -> Result<(serde_json::Value, usize), String> {
     let paths = rpc_attachment_paths(attachments)?;
     if paths.is_empty() {
         return Ok((serde_json::Value::String(message.to_string()), 0));
     }
     let content = agent_engine::attachments::build_user_content(message, &paths).await?;
-    let count = paths.len();
-    // Validate the complete history with the proposed message.
     let candidate = std::sync::Arc::new(serde_json::json!({"role": "user", "content": content}));
     let mut proposed = existing_messages.to_vec();
     proposed.push(candidate);
     agent_engine::runtime::attachments::validate_messages(model, &proposed)?;
-    // Return the content (not the full message) — caller wraps it.
-    Ok((content, count))
+    Ok((content, paths.len()))
 }
 
-/// Handle a `Prompt` or `FollowUp` command (same engine path, no attachments on FollowUp).
-async fn handle_prompt(
-    id: String,
-    message: String,
-    attachments: Vec<RpcAttachment>,
-    state: Arc<Mutex<RpcState>>,
-    writer_tx: mpsc::Sender<RpcEvent>,
-    auto_turn_tx: mpsc::UnboundedSender<String>,
-) {
-    // Reject concurrent prompt.
-    {
-        let st = state.lock().await;
-        if st.is_busy() {
-            tracing::warn!(id, "rejected concurrent prompt — session busy");
-            let _ = writer_tx
-                .send(RpcEvent::Error {
-                    id: Some(id),
-                    message: "another prompt is in flight; abort first".to_string(),
-                })
-                .await;
-            return;
-        }
-    }
-
-    // Load and validate attachments (before acquiring the state lock for push).
-    let (content, attachment_count) = if attachments.is_empty() {
-        (serde_json::Value::String(message.clone()), 0)
-    } else {
-        let (model, msgs) = {
-            let st = state.lock().await;
-            (st.runtime.model().to_string(), st.api_messages.clone())
-        };
-        match load_rpc_user_content(&message, &attachments, &model, &msgs).await {
-            Ok(result) => result,
-            Err(e) => {
-                let _ = writer_tx
-                    .send(RpcEvent::Error {
-                        id: Some(id),
-                        message: e,
-                    })
-                    .await;
-                return;
+/// The attachment blocks of a built user content, for `Submit`: the actor
+/// rebuilds `[text block (non-empty text only), ...attachments]`, which is
+/// exactly what `build_user_content` produced.
+fn submit_blocks(message: &str, content: serde_json::Value) -> Vec<serde_json::Value> {
+    match content {
+        serde_json::Value::Array(mut blocks) => {
+            if !message.is_empty() && !blocks.is_empty() {
+                blocks.remove(0);
             }
+            blocks
         }
-    };
-
-    // Session-busy recheck after the async load.
-    {
-        let st = state.lock().await;
-        if st.is_busy() {
-            let _ = writer_tx
-                .send(RpcEvent::Error {
-                    id: Some(id),
-                    message: "session became busy during attachment load".to_string(),
-                })
-                .await;
-            return;
-        }
+        _ => Vec::new(),
     }
-
-    // Emit attachment disclosure before pushing.
-    if attachment_count > 0 {
-        let _ = writer_tx
-            .send(RpcEvent::Response {
-                id: id.clone(),
-                command: "attachments.disclosure".to_string(),
-                body: serde_json::json!({
-                    "count": attachment_count,
-                    "message": format!("{attachment_count} attachment(s) loaded from local filesystem"),
-                }),
-            })
-            .await;
-    }
-
-    // Push user message and reset the auto-turn counter (real user input).
-    {
-        let mut st = state.lock().await;
-        st.consecutive_auto_turns = 0;
-        st.api_messages.push(std::sync::Arc::new(
-            serde_json::json!({"role": "user", "content": content}),
-        ));
-    }
-
-    // spawn_prompt snapshots messages, sets in_flight atomically (issue 1 fix),
-    // and spawns the streaming task.  No separate write-back needed here.
-    spawn_prompt(id, state.clone(), writer_tx, auto_turn_tx).await;
 }
 
-/// Handle the `Compact` command.
-///
-/// The lock is held only for brief snapshot and write-back phases; the slow
-/// LLM round-trip in `compact_conversation` runs with **no lock held** so
-/// that `Abort`, `GetState`, and `GetSessionStats` remain responsive. The
-/// transition itself goes through the ONE engine operation (T30, spec §9.2)
-/// with the in-place policy.
-async fn handle_compact(
+// ─── the bridge ──────────────────────────────────────────────────────────────
+
+fn empty_usage() -> TurnUsage {
+    TurnUsage {
+        input_tokens: 0,
+        output_tokens: 0,
+        cache_read_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+        cache_creation_5m: None,
+        cache_creation_1h: None,
+        model: None,
+    }
+}
+
+/// The turn in flight, as the parent knows it.
+struct Turn {
+    /// The `Prompt`/`FollowUp` id, or `auto:<first-event-id>` /
+    /// `auto:post-flush-<ms>` for an event-started turn.
     id: String,
-    state: Arc<Mutex<RpcState>>,
-    writer_tx: mpsc::Sender<RpcEvent>,
-) {
-    use synaps_cli::runtime::compaction::{
-        apply_compaction, CompactionPolicy, CompactionTransition,
-    };
-
-    // 1. Brief lock: snapshot what the transition needs, then drop guard.
-    let (msgs, runtime, session) = {
-        let st = state.lock().await;
-        if st.context_head.is_blocked(&st.session) {
-            let _ = writer_tx
-                .send(RpcEvent::Error {
-                    id: Some(id),
-                    message: "cannot compact while the context head is unverified".into(),
-                })
-                .await;
-            return;
-        }
-        (
-            st.api_messages.clone(),
-            st.runtime.clone(),
-            st.session.clone(),
-        )
-    };
-
-    // Spec §9.4 / CP-12 M4: the disclosure is CLIENT-VISIBLE before any
-    // summarization dispatch — a dedicated Response frame (command
-    // "compact.disclosure", same correlation id) precedes the LLM call, and
-    // the disclosure also rides the final compact response.
-    let disclosure =
-        synaps_cli::runtime::compaction::preview_compaction_disclosure(&runtime, &msgs);
-    tracing::info!(disclosure = %disclosure.render_line(), "compaction disclosure");
-    let _ = writer_tx
-        .send(RpcEvent::Response {
-            id: id.clone(),
-            command: "compact.disclosure".to_string(),
-            body: serde_json::to_value(&disclosure).unwrap_or_default(),
-        })
-        .await;
-
-    // 2. Long-running LLM call + engine transition — no lock held.
-    let applied =
-        match synaps_cli::runtime::compaction::compact_conversation(&msgs, &runtime, None).await {
-            Ok(outcome) => apply_compaction(
-                &runtime,
-                &session,
-                &msgs,
-                &outcome,
-                CompactionTransition {
-                    policy: CompactionPolicy::InPlace,
-                    pending_events: Vec::new(),
-                    queued_message: None,
-                    hook_source: "manual".to_string(),
-                },
-            )
-            .await
-            .map(|applied| (applied, outcome.summary_text)),
-            Err(e) => Err(e),
-        };
-
-    match applied {
-        Ok((applied, summary)) => {
-            {
-                let mut st = state.lock().await;
-                st.session = applied.session;
-                st.api_messages = applied.api_messages;
-                st.save_session().await;
-            }
-            let _ = writer_tx
-                .send(RpcEvent::Response {
-                    id,
-                    command: "compact".to_string(),
-                    body: serde_json::json!({ "summary": summary, "disclosure": disclosure }),
-                })
-                .await;
-        }
-        Err(e) => {
-            tracing::error!(error = %e, "compaction failed");
-            let _ = writer_tx
-                .send(RpcEvent::Error {
-                    id: Some(id),
-                    message: e.to_string(),
-                })
-                .await;
-        }
-    }
+    usage: TurnUsage,
+    /// `abort` ids, answered after the turn's own terminal frames.
+    aborts: Vec<String>,
+    cancel_sent: bool,
 }
 
-/// Handle the `NewSession` command.
-async fn handle_new_session(
-    id: String,
-    state: Arc<Mutex<RpcState>>,
-    writer_tx: mpsc::Sender<RpcEvent>,
-) {
-    // Reject if session is busy (streaming or auto-turn pending).
-    {
-        let st = state.lock().await;
-        if st.is_busy() {
-            tracing::warn!(id, "rejected new_session — session busy");
-            let _ = writer_tx
-                .send(RpcEvent::Error {
-                    id: Some(id),
-                    message: "another prompt is in flight; abort first".to_string(),
-                })
-                .await;
-            return;
-        }
+impl Turn {
+    fn new(id: String) -> Self {
+        Self { id, usage: empty_usage(), aborts: Vec::new(), cancel_sent: false }
     }
 
-    let new_session_id = {
-        let mut st = state.lock().await;
-        st.save_session().await;
-        let new_sess = Session::new(
-            st.runtime.model(),
-            st.runtime.thinking_level(),
-            st.runtime.system_prompt(),
-        );
-        let sid = new_sess.id.clone();
-        // The lock follows the conversation: new one first, then the old
-        // one is released (assignment drops it).
-        st.session_lock = setup::lock_session(&sid, false, "rpc").unwrap_or(None);
-        st.session = new_sess;
-        st.context_head = Default::default();
-        st.api_messages.clear();
-        st.runtime.reset_context_continuation(&sid, &[]);
-        st.total_input_tokens = 0;
-        st.total_output_tokens = 0;
-        st.session_cost = 0.0;
-        sid
-    };
-
-    let _ = writer_tx
-        .send(RpcEvent::Response {
-            id,
-            command: "new_session".to_string(),
-            body: serde_json::json!({ "session_id": new_session_id }),
-        })
-        .await;
-}
-
-/// Handle the `GetMessages` command.
-async fn handle_get_messages(
-    id: String,
-    state: Arc<Mutex<RpcState>>,
-    writer_tx: mpsc::Sender<RpcEvent>,
-) {
-    let messages = state.lock().await.api_messages.clone();
-    let _ = writer_tx
-        .send(RpcEvent::Response {
-            id,
-            command: "get_messages".to_string(),
-            body: serde_json::json!({ "messages": messages }),
-        })
-        .await;
-}
-
-/// Handle the `SetModel` command.
-async fn handle_set_model(
-    id: String,
-    model: String,
-    state: Arc<Mutex<RpcState>>,
-    writer_tx: mpsc::Sender<RpcEvent>,
-) {
-    state.lock().await.runtime.set_model(model.clone());
-    let _ = writer_tx
-        .send(RpcEvent::Response {
-            id,
-            command: "set_model".to_string(),
-            body: serde_json::json!({ "model": model }),
-        })
-        .await;
-}
-
-/// Handle the `GetAvailableModels` command.
-async fn handle_get_available_models(id: String, writer_tx: mpsc::Sender<RpcEvent>) {
-    let providers = list_providers();
-
-    let mut models_list: Vec<serde_json::Value> = Vec::new();
-    for (provider_key, _provider_name, _has_key, _count) in &providers {
-        if let Some(models) = list_models(provider_key) {
-            for (model_id, model_name, _default_flag) in models {
-                models_list.push(serde_json::json!({
-                    "provider": provider_key,
-                    "model_id": model_id,
-                    "model_name": model_name,
-                }));
-            }
-        }
-    }
-
-    let _ = writer_tx
-        .send(RpcEvent::Response {
-            id,
-            command: "get_available_models".to_string(),
-            body: serde_json::json!({ "models": models_list }),
-        })
-        .await;
-}
-
-/// Handle the `Abort` command.
-///
-/// Cancels the in-flight stream (if any) via its `CancellationToken`, awaits
-/// the task so it can clean up `in_flight`, then always replies `{ ok: true }`.
-async fn handle_abort(id: String, state: Arc<Mutex<RpcState>>, writer_tx: mpsc::Sender<RpcEvent>) {
-    let handle_opt = {
-        let mut st = state.lock().await;
-        // Clear auto_turn_pending so a reserved-but-not-started auto-turn is cancelled.
-        st.auto_turn_pending = false;
-        if let Some(inf) = st.in_flight.take() {
-            tracing::info!(prompt_id = %inf.prompt_id, abort_id = %id, "aborted in-flight stream");
-            inf.cancel.cancel();
-            Some(inf.handle)
+    fn command(&self) -> &'static str {
+        if self.id.starts_with("auto:") {
+            "auto_turn"
         } else {
-            None
+            "prompt"
         }
-    };
+    }
+}
 
-    if let Some(handle) = handle_opt {
-        if let Err(e) = handle.await {
-            tracing::warn!(error = ?e, "streaming task panicked during abort");
+/// How a turn ended.
+enum TurnEnd {
+    Done,
+    Aborted,
+    Failed(TurnError),
+    /// `Idle` with no `Done`/`Error`: the stream ended early.
+    NoDone,
+}
+
+/// A query in flight, by the parent's id.
+enum PendingQuery {
+    Messages(String),
+    State(String),
+    Stats(String),
+    Tools(Option<String>),
+}
+
+struct PendingCompact {
+    id: String,
+    disclosure: Option<serde_json::Value>,
+    started: bool,
+}
+
+/// Why the main loop stops.
+enum Exit {
+    /// The daemon connection or the event stream failed: error frame, exit 4.
+    Lost(String),
+    /// The session ended under us (daemon shutdown, eviction).
+    Ended(EndReason),
+}
+
+struct Bridge {
+    t: SocketTransport,
+    out: mpsc::Sender<RpcEvent>,
+    turn: Option<Turn>,
+    queries: HashMap<u64, PendingQuery>,
+    /// `Set` id → (parent id, requested model).
+    settings: HashMap<u64, (String, String)>,
+    new_sessions: VecDeque<String>,
+    compact: Option<PendingCompact>,
+    next_id: u64,
+    /// First event that arrived while idle since the last turn: names the
+    /// auto-turn it starts (`auto:<id>`).
+    idle_event: Option<String>,
+}
+
+impl Bridge {
+    async fn emit(&self, ev: RpcEvent) {
+        let _ = self.out.send(ev).await;
+    }
+
+    async fn error(&self, id: Option<String>, message: impl Into<String>) {
+        self.emit(RpcEvent::Error { id, message: message.into() }).await;
+    }
+
+    async fn respond(&self, id: String, command: &str, body: serde_json::Value) {
+        self.emit(RpcEvent::Response { id, command: command.to_string(), body }).await;
+    }
+
+    fn next(&mut self) -> u64 {
+        self.next_id += 1;
+        self.next_id
+    }
+
+    async fn send(&self, cmd: SessionCommand) -> Result<(), String> {
+        self.t.send(cmd).await.map_err(|e| format!("session daemon unavailable: {e}"))
+    }
+
+    async fn query(&mut self, query: SessionQuery, pending: PendingQuery) {
+        let id = self.next();
+        match self.send(SessionCommand::Query { id, query }).await {
+            Ok(()) => {
+                self.queries.insert(id, pending);
+            }
+            Err(e) => {
+                let rid = match pending {
+                    PendingQuery::Messages(i) | PendingQuery::State(i) | PendingQuery::Stats(i) => Some(i),
+                    PendingQuery::Tools(i) => i,
+                };
+                self.error(rid, e).await;
+            }
         }
     }
 
-    let _ = writer_tx
-        .send(RpcEvent::Response {
-            id,
-            command: "abort".to_string(),
-            body: serde_json::json!({ "ok": true }),
+    // ── commands ──
+
+    /// `Some(())` = `shutdown`.
+    async fn on_command(&mut self, cmd: RpcCommand) -> Option<()> {
+        match cmd {
+            RpcCommand::Prompt { id, message, attachments } => self.prompt(id, message, attachments).await,
+            RpcCommand::FollowUp { id, message } => self.prompt(id, message, Vec::new()).await,
+            RpcCommand::Compact { id } => self.compact(id).await,
+            RpcCommand::NewSession { id } => {
+                if self.turn.is_some() {
+                    self.error(Some(id), "another prompt is in flight; abort first").await;
+                } else if let Err(e) = self.send(SessionCommand::NewSession).await {
+                    self.error(Some(id), e).await;
+                } else {
+                    self.new_sessions.push_back(id);
+                }
+            }
+            RpcCommand::GetMessages { id } => self.query(SessionQuery::Messages, PendingQuery::Messages(id)).await,
+            RpcCommand::SetModel { id, model } => {
+                let set = self.next();
+                match self.send(SessionCommand::Set { id: set, setting: SessionSetting::Model { model: model.clone() } }).await {
+                    Ok(()) => {
+                        self.settings.insert(set, (id, model));
+                    }
+                    Err(e) => self.error(Some(id), e).await,
+                }
+            }
+            RpcCommand::GetAvailableModels { id } => self.available_models(id).await,
+            RpcCommand::Abort { id } => {
+                let cancel = match self.turn.as_mut() {
+                    Some(turn) => {
+                        turn.aborts.push(id);
+                        !std::mem::replace(&mut turn.cancel_sent, true)
+                    }
+                    None => {
+                        self.respond(id, "abort", serde_json::json!({ "ok": true })).await;
+                        false
+                    }
+                };
+                if cancel {
+                    if let Err(e) = self.send(SessionCommand::Cancel).await {
+                        tracing::warn!(error = %e, "rpc: cancel not delivered");
+                    }
+                }
+            }
+            RpcCommand::GetSessionStats { id } => self.query(SessionQuery::Status, PendingQuery::Stats(id)).await,
+            RpcCommand::GetState { id } => self.query(SessionQuery::Status, PendingQuery::State(id)).await,
+            RpcCommand::ToolsList { id } => self.query(SessionQuery::ToolsSchema, PendingQuery::Tools(id)).await,
+            RpcCommand::Shutdown => return Some(()),
+        }
+        None
+    }
+
+    async fn prompt(&mut self, id: String, message: String, attachments: Vec<RpcAttachment>) {
+        if self.turn.is_some() {
+            tracing::warn!(id, "rejected concurrent prompt — session busy");
+            self.error(Some(id), "another prompt is in flight; abort first").await;
+            return;
+        }
+        let blocks = if attachments.is_empty() {
+            Vec::new()
+        } else {
+            let model = self.t.view().model.clone();
+            match load_rpc_user_content(&message, &attachments, &model, self.t.messages()).await {
+                Ok((content, count)) => {
+                    self.respond(
+                        id.clone(),
+                        "attachments.disclosure",
+                        serde_json::json!({
+                            "count": count,
+                            "message": format!("{count} attachment(s) loaded from local filesystem"),
+                        }),
+                    )
+                    .await;
+                    submit_blocks(&message, content)
+                }
+                Err(e) => {
+                    self.error(Some(id), e).await;
+                    return;
+                }
+            }
+        };
+        let cmd = SessionCommand::Submit { text: message, attachments: blocks };
+        // The daemon closes a connection that sends an oversize frame (and
+        // with it this owned session): refuse it here instead.
+        let bytes = serde_json::to_vec(&cmd).map(|v| v.len()).unwrap_or(usize::MAX);
+        if bytes > agent_engine::session::wire::MAX_FRAME_BYTES - 4096 {
+            self.error(Some(id), format!("prompt too large for the session daemon ({bytes} bytes)")).await;
+            return;
+        }
+        match self.send(cmd).await {
+            Ok(()) => self.turn = Some(Turn::new(id)),
+            Err(e) => self.error(Some(id), e).await,
+        }
+    }
+
+    async fn compact(&mut self, id: String) {
+        if self.turn.is_some() {
+            self.error(Some(id), "cannot compact while a turn is running").await;
+        } else if self.compact.is_some() {
+            self.error(Some(id), "compaction already in progress").await;
+        } else if let Err(e) = self.send(SessionCommand::Compact { instructions: None }).await {
+            self.error(Some(id), e).await;
+        } else {
+            self.compact = Some(PendingCompact { id, disclosure: None, started: false });
+        }
+    }
+
+    async fn available_models(&self, id: String) {
+        let mut models: Vec<serde_json::Value> = Vec::new();
+        for (provider_key, _name, _has_key, _count) in &list_providers() {
+            if let Some(list) = list_models(provider_key) {
+                for (model_id, model_name, _default) in list {
+                    models.push(serde_json::json!({
+                        "provider": provider_key,
+                        "model_id": model_id,
+                        "model_name": model_name,
+                    }));
+                }
+            }
+        }
+        self.respond(id, "get_available_models", serde_json::json!({ "models": models })).await;
+    }
+
+    // ── events ──
+
+    async fn on_event(&mut self, ev: SessionEventWire) -> Result<(), Exit> {
+        match ev {
+            SessionEventWire::Stream(se) => self.on_stream(se).await,
+            SessionEventWire::TurnStarted { trigger, .. } => {
+                let idle_event = self.idle_event.take();
+                if self.turn.is_none() {
+                    let id = match (trigger, idle_event) {
+                        (TurnTrigger::EventAuto, Some(event)) => format!("auto:{event}"),
+                        (TurnTrigger::EventAuto, None) => {
+                            format!("auto:post-flush-{}", chrono::Utc::now().timestamp_millis())
+                        }
+                        (other, _) => format!("auto:{other:?}-{}", chrono::Utc::now().timestamp_millis()).to_lowercase(),
+                    };
+                    self.turn = Some(Turn::new(id));
+                }
+            }
+            SessionEventWire::External(event) => {
+                if self.turn.is_none() && self.idle_event.is_none() {
+                    self.idle_event = Some(event.id.clone());
+                }
+                let formatted = agent_engine::events::format_event_for_agent(&event);
+                let drained = agent_engine::engine::reactor::DrainedEvent {
+                    event,
+                    formatted,
+                    disposition: agent_engine::engine::reactor::EventDisposition::Injected,
+                };
+                let payload = agent_engine::engine::reactor::event_payload_from_drained(&drained);
+                self.emit(RpcEvent::Event { payload: Box::new(payload) }).await;
+            }
+            SessionEventWire::Aborted { .. } => self.finish(TurnEnd::Aborted).await,
+            SessionEventWire::Idle => self.finish(TurnEnd::NoDone).await,
+            SessionEventWire::QueryResult { id, value } => {
+                if let Some(pending) = self.queries.remove(&id) {
+                    self.on_query_result(pending, value).await;
+                }
+            }
+            SessionEventWire::SettingChanged(applied) => {
+                if let Some((id, model)) = self.settings.remove(&applied.id) {
+                    if !applied.ok {
+                        tracing::warn!(model, "rpc: set_model not applied");
+                    }
+                    self.respond(id, "set_model", serde_json::json!({ "model": model })).await;
+                }
+            }
+            SessionEventWire::Cleared { session_id } => {
+                if let Some(id) = self.new_sessions.pop_front() {
+                    self.respond(id, "new_session", serde_json::json!({ "session_id": session_id })).await;
+                }
+            }
+            SessionEventWire::CompactionStarted { detail, .. } => {
+                if let Some(c) = self.compact.as_mut() {
+                    c.started = true;
+                    c.disclosure = detail;
+                    let (id, body) = (c.id.clone(), c.disclosure.clone().unwrap_or_default());
+                    self.respond(id, "compact.disclosure", body).await;
+                }
+            }
+            SessionEventWire::CompactionApplied { summary, .. } => {
+                if let Some(c) = self.compact.take() {
+                    self.respond(
+                        c.id,
+                        "compact",
+                        serde_json::json!({ "summary": summary.unwrap_or_default(), "disclosure": c.disclosure }),
+                    )
+                    .await;
+                }
+            }
+            SessionEventWire::CompactionFailed { message, .. } => {
+                if let Some(c) = self.compact.take() {
+                    self.error(Some(c.id), message).await;
+                }
+            }
+            SessionEventWire::CompactionCancelled => {
+                if let Some(c) = self.compact.take() {
+                    self.error(Some(c.id), "compaction cancelled").await;
+                }
+            }
+            SessionEventWire::SystemNotice(text) => {
+                // Lost events would mean lost usage (billing): never go on.
+                if text.starts_with("event stream lagged") {
+                    return Err(Exit::Lost(format!("lost session events ({text})")));
+                }
+                // The actor refused the compaction before starting it.
+                if self.compact.as_ref().is_some_and(|c| !c.started) {
+                    if let Some(c) = self.compact.take() {
+                        self.error(Some(c.id), text).await;
+                    }
+                }
+            }
+            SessionEventWire::Refused { client, command, reason } if client == self.t.client_id() => {
+                if command == "submit" {
+                    if let Some(turn) = self.turn.take() {
+                        self.error(Some(turn.id), reason).await;
+                        for a in turn.aborts {
+                            self.respond(a, "abort", serde_json::json!({ "ok": true })).await;
+                        }
+                        return Ok(());
+                    }
+                }
+                self.error(None, format!("{command} refused: {reason}")).await;
+            }
+            // Headless: nobody can answer a confirm/secret prompt — deny it,
+            // fail-closed, so the turn never waits on it.
+            SessionEventWire::Prompt(p) => {
+                let _ = self.t.send(SessionCommand::Answer { prompt_id: p.id, value: None }).await;
+            }
+            SessionEventWire::Ended { reason } => return Err(Exit::Ended(reason)),
+            _ => {}
+        }
+        Ok(())
+    }
+
+    async fn on_stream(&mut self, se: StreamEvent) {
+        let Some(turn) = self.turn.as_mut() else { return };
+        match se {
+            StreamEvent::Session(SessionEvent::Usage { .. }) => {
+                if let StreamEvent::Session(ref usage) = se {
+                    accumulate_usage(&mut turn.usage, usage);
+                }
+            }
+            StreamEvent::Session(SessionEvent::Done) => self.finish(TurnEnd::Done).await,
+            StreamEvent::Session(SessionEvent::Error(e)) => self.finish(TurnEnd::Failed(e)).await,
+            other => {
+                if let Some(frame) = map_stream_event(&other) {
+                    self.emit(frame).await;
+                }
+            }
+        }
+    }
+
+    /// The turn's terminal frames, exactly as the in-process loop wrote
+    /// them: [error], agent_end, the prompt/auto_turn response, then any
+    /// abort responses.
+    async fn finish(&mut self, end: TurnEnd) {
+        let Some(turn) = self.turn.take() else { return };
+        let cancelled = !turn.aborts.is_empty() || matches!(end, TurnEnd::Aborted);
+        let command = turn.command();
+        let body = match end {
+            _ if cancelled => serde_json::json!({ "ok": true, "cancelled": true }),
+            TurnEnd::Failed(e) => {
+                self.error(Some(turn.id.clone()), e.message.clone()).await;
+                serde_json::json!({ "ok": false, "error": e.message, "outcome": e.outcome })
+            }
+            TurnEnd::NoDone => serde_json::json!({ "ok": false, "error": "stream ended without Done" }),
+            TurnEnd::Done | TurnEnd::Aborted => serde_json::json!({ "ok": true }),
+        };
+        self.emit(RpcEvent::AgentEnd { usage: turn.usage.clone() }).await;
+        self.respond(turn.id.clone(), command, body).await;
+        for a in turn.aborts {
+            self.respond(a, "abort", serde_json::json!({ "ok": true })).await;
+        }
+    }
+
+    async fn on_query_result(&self, pending: PendingQuery, value: serde_json::Value) {
+        if let Some(err) = value.get("error").and_then(|e| e.as_str()) {
+            let id = match pending {
+                PendingQuery::Messages(i) | PendingQuery::State(i) | PendingQuery::Stats(i) => Some(i),
+                PendingQuery::Tools(i) => i,
+            };
+            self.error(id, err.to_string()).await;
+            return;
+        }
+        let messages = || value.get("messages").cloned().unwrap_or_else(|| self.t.messages().len().into());
+        match pending {
+            PendingQuery::Messages(id) => {
+                self.respond(id, "get_messages", serde_json::json!({ "messages": value })).await;
+            }
+            PendingQuery::State(id) => {
+                let body = serde_json::json!({
+                    "streaming":     value["streaming"],
+                    "model":         value["model"],
+                    "session_id":    value["session"],
+                    "message_count": messages(),
+                });
+                self.respond(id, "get_state", body).await;
+            }
+            PendingQuery::Stats(id) => {
+                let body = serde_json::json!({
+                    "input_tokens":  value["tokens"]["input"],
+                    "output_tokens": value["tokens"]["output"],
+                    "cost":          value["cost"],
+                    "message_count": messages(),
+                    "model":         value["model"],
+                    "session_id":    value["session"],
+                });
+                self.respond(id, "get_session_stats", body).await;
+            }
+            PendingQuery::Tools(id) => {
+                let schema = value.as_array().cloned().unwrap_or_default();
+                self.respond(id.unwrap_or_default(), "tools_list", build_tools_list_body(&schema)).await;
+            }
+        }
+    }
+
+    /// A daemon reload cut the connection: whatever was in flight is gone
+    /// (the checkpoint cancelled the turn). Close each request out so the
+    /// parent never waits on it.
+    async fn cut_by_reload(&mut self) {
+        const CUT: &str = "interrupted by a session daemon reload";
+        if let Some(mut turn) = self.turn.take() {
+            let aborts = std::mem::take(&mut turn.aborts);
+            self.error(Some(turn.id.clone()), CUT).await;
+            self.emit(RpcEvent::AgentEnd { usage: turn.usage.clone() }).await;
+            self.respond(turn.id.clone(), turn.command(), serde_json::json!({ "ok": false, "error": CUT })).await;
+            for a in aborts {
+                self.respond(a, "abort", serde_json::json!({ "ok": true })).await;
+            }
+        }
+        let queries: Vec<PendingQuery> = self.queries.drain().map(|(_, q)| q).collect();
+        for q in queries {
+            let id = match q {
+                PendingQuery::Messages(i) | PendingQuery::State(i) | PendingQuery::Stats(i) => Some(i),
+                PendingQuery::Tools(i) => i,
+            };
+            self.error(id, CUT).await;
+        }
+        let settings: Vec<String> = self.settings.drain().map(|(_, (id, _))| id).collect();
+        let news: Vec<String> = self.new_sessions.drain(..).collect();
+        for id in settings.into_iter().chain(news) {
+            self.error(Some(id), CUT).await;
+        }
+        if let Some(c) = self.compact.take() {
+            self.error(Some(c.id), CUT).await;
+        }
+    }
+
+    /// End the owned session cleanly: `End{ClientQuit}`, then wait for
+    /// `Ended` so an immediate `--continue` of it does not race the dying
+    /// session. `forward` = still write frames for what arrives meanwhile.
+    async fn end_session(&mut self, forward: bool) {
+        if self.t.send(SessionCommand::End { reason: EndReason::ClientQuit }).await.is_err() {
+            return;
+        }
+        let _ = tokio::time::timeout(END_WAIT, async {
+            while let Some(env) = self.t.next_event().await {
+                if matches!(env.event, SessionEventWire::Ended { .. }) {
+                    break;
+                }
+                if forward && self.on_event(env.event).await.is_err() {
+                    break;
+                }
+            }
         })
         .await;
+    }
 }
 
-/// Handle the `GetSessionStats` command.
-async fn handle_get_session_stats(
-    id: String,
-    state: Arc<Mutex<RpcState>>,
-    writer_tx: mpsc::Sender<RpcEvent>,
-) {
-    let body = {
-        let st = state.lock().await;
-        serde_json::json!({
-            "input_tokens":  st.total_input_tokens,
-            "output_tokens": st.total_output_tokens,
-            "cost":          st.session_cost,
-            "message_count": st.api_messages.len(),
-            "model":         st.runtime.model(),
-            "session_id":    st.session.id,
-        })
-    };
-    let _ = writer_tx
-        .send(RpcEvent::Response {
-            id,
-            command: "get_session_stats".to_string(),
-            body,
-        })
-        .await;
+/// Drop the frame sender and give the writer a bounded moment to drain.
+async fn drain_writer(out: mpsc::Sender<RpcEvent>, writer: JoinHandle<()>) {
+    drop(out);
+    if tokio::time::timeout(WRITER_DRAIN, writer).await.is_err() {
+        tracing::warn!("rpc: writer did not drain within 1 s; exiting anyway");
+    }
 }
 
-/// Handle the `GetState` command.
-async fn handle_get_state(
-    id: String,
-    state: Arc<Mutex<RpcState>>,
-    writer_tx: mpsc::Sender<RpcEvent>,
-) {
-    let body = {
-        let st = state.lock().await;
-        serde_json::json!({
-            "streaming":     st.is_streaming(),
-            "model":         st.runtime.model(),
-            "session_id":    st.session.id,
-            "message_count": st.api_messages.len(),
-        })
-    };
-    let _ = writer_tx
-        .send(RpcEvent::Response {
-            id,
-            command: "get_state".to_string(),
-            body,
-        })
-        .await;
-}
+// ─── entry point ─────────────────────────────────────────────────────────────
 
-/// Handle the `ToolsList` command.
-///
-/// Reads the current tool schema from the runtime's shared `ToolRegistry`
-/// (built-ins + any MCP / extension tools loaded at boot time) and returns
-/// `{ ok: true, tools: [{name, description, input_schema}, ...] }`.
-///
-/// The response uses the existing [`RpcEvent::Response`] frame with
-/// `command: "tools_list"`, which the bridge Phase 8
-/// `SynapsRpcSessionRouter.listTools()` validates as:
-///   `response.ok === true && Array.isArray(response.tools)`.
-async fn handle_tools_list(
-    id: Option<String>,
-    state: Arc<Mutex<RpcState>>,
-    writer_tx: mpsc::Sender<RpcEvent>,
-) {
-    let schema = {
-        let st = state.lock().await;
-        let registry = st.runtime.tools_shared();
-        let guard = registry.read().await;
-        guard.tools_schema().as_ref().clone()
-    };
-
-    let body = build_tools_list_body(&schema);
-    let response_id = id.unwrap_or_default();
-    let _ = writer_tx
-        .send(RpcEvent::Response {
-            id: response_id,
-            command: "tools_list".to_string(),
-            body,
-        })
-        .await;
-}
-
-// ─── Entry point ──────────────────────────────────────────────────────────────
-
-/// Run the `synaps rpc` headless server.
-///
-/// Reads [`RpcCommand`] frames from stdin (line-delimited JSON) and writes
-/// [`RpcEvent`] frames to stdout. The very first frame emitted is always a
-/// [`RpcEvent::Ready`] event advertising the session id, active model, and
-/// protocol version.
-///
-/// All flags are optional. With no `--continue` a fresh [`Session`] is created.
+/// Run `synaps rpc`: connect, create the owned session, write `Ready`, then
+/// translate until stdin EOF, `shutdown`, or the session ends.
 pub async fn run(
     continue_id: Option<String>,
     system: Option<String>,
     model: Option<String>,
     profile: Option<String>,
 ) -> anyhow::Result<()> {
-    // 1. Boot the engine via the shared setup path. This handles profile,
-    //    logging, Runtime + config, system prompt, skills/MCP registration,
-    //    session resolution, inbox watcher, and per-session socket. Mirrors
-    //    `cmd/chat.rs::run` so RPC mode picks up the same provider extensions
-    //    (Groq, OpenAI-compat, etc.) as the TUI and chat modes.
-    let boot = setup::boot(EngineOpts {
+    // 1. Profile: the daemon socket is chosen by it.
+    if profile.is_some() {
+        synaps_cli::config::set_profile(profile.clone());
+    }
+    let active = synaps_cli::config::get_profile();
+    if let Some(want) = profile.as_deref().filter(|w| active.as_deref() != Some(*w)) {
+        refuse(
+            EXIT_REFUSED,
+            format!("--profile {want} could not be applied (profile `{}` already in effect)", active.as_deref().unwrap_or("default")),
+        );
+    }
+
+    // 2. The daemon: running, or auto-spawned exactly as `synaps attach`
+    //    does. There is no in-process fallback.
+    if !daemon::enabled() {
+        refuse(EXIT_REFUSED, format!("{} — synaps rpc runs on the session daemon", daemon::DISABLED_NOTICE));
+    }
+    let opts = daemon::DaemonOpts { profile: active.clone(), ..Default::default() };
+    match tokio::task::spawn_blocking(move || daemon::ensure_running(&opts)).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(EnsureError::AutospawnDisabled)) => refuse(EXIT_REFUSED, super::attach::no_daemon_message(active.as_deref())),
+        Ok(Err(EnsureError::Spawn(reason))) => refuse(EXIT_REFUSED, format!("daemon unavailable: {reason}")),
+        Err(e) => refuse(EXIT_REFUSED, format!("daemon unavailable: {e}")),
+    }
+    let paths = registry::daemon_paths(active.as_deref());
+
+    // 3. Session config: this process's cwd (and, via Hello, its env).
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+    let mut config = SessionConfig {
         continue_session: continue_id.map(Some),
         system,
-        prompt_manifest: None,
-        profile,
-        no_extensions: false,
-    })
-    .await
-    .context("engine boot failed")?;
-    agent_engine::host::report_config_warnings(&boot.config);
-
-    // Refuse to continue a session another process has live; lock ours.
-    let session_lock = setup::lock_session(&boot.session.id, boot.continued, "rpc")
-        .context("cannot continue this session")?;
-    let mut runtime = boot.runtime;
-    // The lock holder recovers a turn the previous holder died in.
-    let (session, initial_messages) = if boot.continued && session_lock.is_some() {
-        let mut conv = synaps_cli::engine::session::ConversationState::from_resumed(boot.session);
-        conv.api_messages = boot.api_messages;
-        setup::recover_turn_draft(&mut conv).await;
-        (conv.session, conv.api_messages)
-    } else {
-        (boot.session, boot.api_messages)
+        cwd: Some(cwd.clone()),
+        model_override: model,
+        ..Default::default()
     };
-    let initial_in = boot.total_input_tokens;
-    let initial_out = boot.total_output_tokens;
-    let initial_cost = boot.session_cost;
-    let ext_manager = boot.ext_manager;
-    let background = boot.background;
-
-    // 2. CLI --model overrides whatever was persisted in the resumed session.
-    if let Some(ref m) = model {
-        runtime.set_model(m.clone());
+    if let Err(e) = agent_engine::session::client_args::resolve_client_session_args(&mut config, &cwd) {
+        eprintln!("synaps rpc: {e}");
+        std::process::exit(1);
     }
 
-    // 3. Discover and load planted process extensions (provider plugins live
-    //    here). We block Ready on the loader's `Finished` event so the bridge
-    //    cannot send a Prompt before extension-backed providers have
-    //    registered. Bounded by a 2 s grace period — extension loading is
-    //    best-effort, not a hard fail.
-    let session_id_for_hook = session.id.clone();
-    let (loader_tx, mut loader_rx) = mpsc::unbounded_channel();
-    synaps_cli::extensions::loader::spawn_discover_and_load(
-        Arc::clone(&ext_manager),
-        loader_tx,
-        Some(session_id_for_hook.clone()),
-    );
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        while let Some(ev) = loader_rx.recv().await {
-            if matches!(
-                ev,
-                synaps_cli::extensions::loader::ExtensionLoaderEvent::Finished { .. }
-            ) {
-                break;
-            }
+    // 4. Connect and create the OWNED session (secrets forwarded for tools).
+    let hello = Hello::new(ClientKind::Rpc).with_history(HistoryMode::Full);
+    let conn = match SocketTransport::connect(&paths.sock, hello).await {
+        Ok(c) => c,
+        Err(TransportError::Version { client, daemon }) => refuse(
+            EXIT_VERSION,
+            format!("protocol version mismatch (client {client}, daemon {daemon}); restart the daemon with this binary"),
+        ),
+        Err(e) => refuse(EXIT_REFUSED, format!("daemon unavailable: {e}")),
+    };
+    if let Some(msg) = daemon::profile_mismatch(conn.welcome.profile.as_deref(), active.as_deref()) {
+        refuse(EXIT_REFUSED, msg);
+    }
+    let (t, snap) = match SocketTransport::attach(conn, Attach::create_owned(config, AttachMode::Mirror, true)).await {
+        Ok(v) => v,
+        Err(e @ TransportError::DaemonTooOld { .. }) => refuse(EXIT_REFUSED, e.to_string()),
+        // `--continue` of a session another client has live, or one that
+        // does not resolve: refused as before (exit 1, no Ready).
+        Err(TransportError::Refused(m)) => {
+            eprintln!("synaps rpc: cannot continue this session: {m}");
+            std::process::exit(1);
         }
-    })
-    .await;
-    // Any straggler events after this point are simply dropped when the
-    // receiver is dropped; the loader task will exit when its sender drops.
+        Err(e) => refuse(EXIT_REFUSED, format!("session create failed: {e}")),
+    };
 
-    // Capture session_id + model for the Ready frame before state is consumed.
-    let ready_session_id = session.id.clone();
-    let ready_model = runtime.model().to_string();
-
-    // Load config for events_auto_turn (default: true per SynapsConfig defaults)
-    // and the consecutive auto-turn cap (default 5; 0 = unlimited).
-    let boot_config = load_config();
-    let events_auto_turn = boot_config.events.auto_turn;
-    let auto_turn_cap = boot_config.events.auto_turn_cap;
-
-    // 4. Build shared state.
-    let state = Arc::new(Mutex::new(RpcState {
-        runtime,
-        session,
-        context_head: Default::default(),
-        api_messages: initial_messages,
-        total_input_tokens: initial_in,
-        total_output_tokens: initial_out,
-        session_cost: initial_cost,
-        in_flight: None,
-        pending_events: Vec::new(),
-        consecutive_auto_turns: 0,
-        auto_turn_pending: false,
-        events_auto_turn,
-        auto_turn_cap,
-        turn_budgets: boot_config.turn_budgets.clone(),
-        save_owed: false,
-        session_lock,
-    }));
-
-    // 5. Spawn the writer task that owns stdout.
-    let (writer_tx, writer_rx) = mpsc::channel::<RpcEvent>(WRITER_CHAN_CAP);
-    let writer_handle = spawn_writer(writer_rx);
-
-    // 6a. Auto-turn scheduler channel.
-    //
-    // Terminal paths (Done branch in spawned task) and the drainer send a
-    // reserved `auto_id` here instead of calling `spawn_prompt` directly.
-    // Calling `spawn_prompt(...).await` inside `tokio::spawn` creates a
-    // recursive async future that is not `Send`; routing through an unbounded
-    // mpsc channel eliminates the cycle entirely.  The scheduler task below
-    // is the single call site for `spawn_prompt` on auto-turn IDs.
-    let (auto_turn_tx, mut auto_turn_rx) = mpsc::unbounded_channel::<String>();
-
-    // 6. Spawn the exactly-one event-drainer task.
-    //
-    // Policy (per C2 spec):
-    //   * Always build Event frames from drained events.
-    //   * Idle + events_auto_turn + wake_action=RunTurn + claim_auto_turn:
-    //     atomically reserve auto_turn_pending=true, then schedule auto-turn
-    //     with synthetic id `auto:<first-event-id>` after releasing lock.
-    //   * Busy: drain → buffer in pending_events (flushed at Done via terminal_flush).
-    //   * One auto-turn per drained batch (coalesced).
-    //   * Opt-out: events_auto_turn=false → Event frames only, no turn.
-    {
-        let state_d = Arc::clone(&state);
-        let writer_d = writer_tx.clone();
-        let auto_turn_tx_d = auto_turn_tx.clone();
-        tokio::spawn(async move {
-            // Snapshot the event queue handle ONCE (Arc clone, cheap).
-            let eq = {
-                let st = state_d.lock().await;
-                st.runtime.event_queue().clone()
-            };
-            loop {
-                // Wait for at least one event (notify_one pattern).
-                eq.notified().await;
-
-                // Drain without holding the mutex across the await above.
-                // Lock briefly: snapshot busy flag + drain + mutate messages/pending
-                // + atomically reserve auto-turn if conditions met.
-                let (frames, auto_turn_id): (Vec<RpcEvent>, Option<String>) = {
-                    let mut st = state_d.lock().await;
-                    let busy = st.is_busy();
-                    let events_auto_turn = st.events_auto_turn;
-                    let auto_turn_cap = st.auto_turn_cap;
-                    let consecutive = st.consecutive_auto_turns;
-                    // Drain: split borrows explicitly to satisfy the borrow checker
-                    // for the drain call, then drop the split borrow before
-                    // accessing st.consecutive_auto_turns / st.auto_turn_pending.
-                    let drained = {
-                        let RpcState {
-                            ref mut api_messages,
-                            ref mut pending_events,
-                            ..
-                        } = *st;
-                        drain_event_queue(
-                            &eq,
-                            api_messages,
-                            pending_events,
-                            busy,
-                            None, // RPC has no steer channel
-                        )
-                    };
-
-                    let frames: Vec<RpcEvent> = drained
-                        .iter()
-                        .map(|d| RpcEvent::Event {
-                            payload: Box::new(event_payload_from_drained(d)),
-                        })
-                        .collect();
-
-                    // Decide auto-turn: only when idle + enabled + wake says RunTurn.
-                    let auto_id = if !busy && events_auto_turn {
-                        let action = wake_action_with_cap(
-                            &drained,
-                            &st.api_messages,
-                            false,
-                            true,
-                            consecutive,
-                            auto_turn_cap,
-                        );
-                        if action == WakeAction::RunTurn {
-                            // Atomically claim and reserve — one turn per batch.
-                            if claim_auto_turn_with_cap(
-                                &mut st.consecutive_auto_turns,
-                                auto_turn_cap,
-                            ) {
-                                st.auto_turn_pending = true;
-                                let first_id = drained
-                                    .first()
-                                    .map(|d| d.event.id.clone())
-                                    .unwrap_or_else(|| "unknown".to_string());
-                                Some(format!("auto:{first_id}"))
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    };
-
-                    (frames, auto_id)
-                }; // mutex released here
-
-                // Forward ALL Event frames through the writer channel.
-                for frame in frames {
-                    if writer_d.send(frame).await.is_err() {
-                        tracing::warn!(
-                            "rpc: event drainer: writer channel closed — exiting drainer"
-                        );
-                        return;
-                    }
-                }
-
-                // Schedule auto-turn if reserved.  Send auto_id to the scheduler
-                // task — do NOT call spawn_prompt directly here as that would
-                // require awaiting it inside tokio::spawn which creates a
-                // non-Send recursive future cycle.
-                if let Some(auto_id) = auto_turn_id {
-                    tracing::debug!(auto_id, "rpc: scheduling auto-turn for runtime events");
-                    let _ = auto_turn_tx_d.send(auto_id);
-                }
-            }
-        });
-    }
-
-    // 7. Spawn the exactly-one auto-turn scheduler task.
-    //
-    // This is the ONLY place `spawn_prompt` is called for auto-generated turns.
-    // Both the drainer and the terminal Done-path send reserved `auto_id` strings
-    // here via `auto_turn_tx` (unbounded, so send never blocks).
-    // The task simply awaits each id in order — no lock is held across the await.
-    {
-        let state_s = Arc::clone(&state);
-        let writer_s = writer_tx.clone();
-        let auto_turn_tx_s = auto_turn_tx.clone();
-        tokio::spawn(async move {
-            while let Some(auto_id) = auto_turn_rx.recv().await {
-                // ── Stale-reservation guard ───────────────────────────────────
-                // An Abort or new Prompt can clear `auto_turn_pending` between
-                // the drainer/Done-path reserving the id and the scheduler
-                // receiving it.  Validate under lock before proceeding so we
-                // never overwrite a live `in_flight` with a ghost auto-turn.
-                {
-                    let mut st = state_s.lock().await;
-                    if !st.auto_turn_pending || st.in_flight.is_some() {
-                        tracing::warn!(
-                            auto_id,
-                            auto_turn_pending = st.auto_turn_pending,
-                            in_flight_live = st.in_flight.is_some(),
-                            "rpc: scheduler: stale auto-turn reservation — dropping"
-                        );
-                        // Clear the pending flag in case it's still set but
-                        // in_flight raced in from a concurrent real prompt.
-                        st.auto_turn_pending = false;
-                        continue;
-                    }
-                }
-                tracing::debug!(auto_id, "rpc: auto-turn scheduler: calling spawn_prompt");
-                spawn_prompt(
-                    auto_id,
-                    Arc::clone(&state_s),
-                    writer_s.clone(),
-                    auto_turn_tx_s.clone(),
-                )
-                .await;
-            }
-        });
-    }
-
-    // 9. Emit Ready — guaranteed to be the first byte on stdout.
-    writer_tx
+    // 5. Writer, then Ready — the first byte on stdout.
+    let (out, writer_rx) = mpsc::channel::<RpcEvent>(WRITER_CHAN_CAP);
+    let writer = spawn_writer(writer_rx);
+    let _ = out
         .send(RpcEvent::Ready {
-            session_id: ready_session_id,
-            model: ready_model,
+            session_id: snap.conversation.header.id.clone(),
+            model: snap.view.model.clone(),
             protocol_version: RPC_PROTOCOL_VERSION,
         })
-        .await
-        .context("writer channel closed before Ready frame could be sent")?;
+        .await;
+    tracing::info!(session = %snap.meta.id, "synaps rpc ready");
 
-    tracing::info!("synaps rpc ready");
+    let mut b = Bridge {
+        t,
+        out: out.clone(),
+        turn: None,
+        queries: HashMap::new(),
+        settings: HashMap::new(),
+        new_sessions: VecDeque::new(),
+        compact: None,
+        next_id: 0,
+        idle_event: None,
+    };
+    drop(snap);
 
-    // 10. Reader loop: one line = one RpcCommand frame.
-    let stdin = tokio::io::stdin();
-    let mut lines = BufReader::new(stdin).lines();
-
-    loop {
-        match lines.next_line().await {
-            Err(e) => {
-                tracing::error!(error = %e, "stdin read error; exiting");
-                break;
-            }
-            Ok(None) => {
-                // EOF — parent closed stdin; treat the same as Shutdown.
-                tracing::info!("stdin EOF; saving session and exiting");
-                state.lock().await.save_session().await;
-                background.shutdown();
-                break;
-            }
-            Ok(Some(line)) => {
-                let line = line.trim_end_matches('\r'); // tolerate CRLF
-                if line.trim().is_empty() {
-                    continue;
+    // 6. Translate. stdin is not read while reconnecting or shutting down:
+    //    the pipe buffers it.
+    let mut lines = BufReader::new(tokio::io::stdin()).lines();
+    let mut shutdown: Option<tokio::time::Instant> = None;
+    let exit = loop {
+        if shutdown.is_some() && b.turn.is_none() {
+            break None;
+        }
+        let deadline = shutdown.unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(3600));
+        tokio::select! {
+            ev = b.t.next_event() => match ev {
+                Some(env) => {
+                    if let Err(exit) = b.on_event(env.event).await {
+                        break Some(exit);
+                    }
                 }
-
-                let cmd = match parse_frame(line, MAX_FRAME_BYTES) {
-                    Ok(c) => c,
-                    Err(err_ev) => {
-                        tracing::warn!("frame parse error");
-                        let _ = writer_tx.send(err_ev).await;
+                None => {
+                    if matches!(b.t.last_error(), Some(TransportError::Reloading { .. })) {
+                        b.cut_by_reload().await;
+                        if let Err(e) = b.t.reconnect(AttachMode::Mirror).await {
+                            break Some(Exit::Lost(format!("could not reconnect after a daemon reload: {e}")));
+                        }
                         continue;
                     }
-                };
-
-                tracing::debug!(?cmd, "received RpcCommand");
-
-                match cmd {
-                    RpcCommand::Prompt {
-                        id,
-                        message,
-                        attachments,
-                    } => {
-                        handle_prompt(
-                            id,
-                            message,
-                            attachments,
-                            state.clone(),
-                            writer_tx.clone(),
-                            auto_turn_tx.clone(),
-                        )
-                        .await;
+                    let why = b.t.last_error().map(|e| e.to_string()).unwrap_or_else(|| "connection closed".into());
+                    break Some(Exit::Lost(format!("lost the session daemon ({why})")));
+                }
+            },
+            line = lines.next_line(), if shutdown.is_none() => match line {
+                Ok(Some(line)) => {
+                    let line = line.trim_end_matches('\r');
+                    if line.trim().is_empty() {
+                        continue;
                     }
-                    RpcCommand::FollowUp { id, message } => {
-                        // Same engine path as Prompt — no attachments.
-                        handle_prompt(
-                            id,
-                            message,
-                            Vec::new(),
-                            state.clone(),
-                            writer_tx.clone(),
-                            auto_turn_tx.clone(),
-                        )
-                        .await;
-                    }
-                    RpcCommand::Compact { id } => {
-                        handle_compact(id, state.clone(), writer_tx.clone()).await;
-                    }
-                    RpcCommand::NewSession { id } => {
-                        handle_new_session(id, state.clone(), writer_tx.clone()).await;
-                    }
-                    RpcCommand::GetMessages { id } => {
-                        handle_get_messages(id, state.clone(), writer_tx.clone()).await;
-                    }
-                    RpcCommand::SetModel { id, model: m } => {
-                        handle_set_model(id, m, state.clone(), writer_tx.clone()).await;
-                    }
-                    RpcCommand::GetAvailableModels { id } => {
-                        handle_get_available_models(id, writer_tx.clone()).await;
-                    }
-                    RpcCommand::Abort { id } => {
-                        handle_abort(id, state.clone(), writer_tx.clone()).await;
-                    }
-                    RpcCommand::GetSessionStats { id } => {
-                        handle_get_session_stats(id, state.clone(), writer_tx.clone()).await;
-                    }
-                    RpcCommand::GetState { id } => {
-                        handle_get_state(id, state.clone(), writer_tx.clone()).await;
-                    }
-                    RpcCommand::ToolsList { id } => {
-                        handle_tools_list(id, state.clone(), writer_tx.clone()).await;
-                    }
-                    RpcCommand::Shutdown => {
-                        tracing::info!("Shutdown received; draining and exiting");
-
-                        // Spec: let an in-flight stream finish naturally (no cancel).
-                        // Poll in_flight until the streaming task clears it.
-                        // Bounded by 30 s to prevent a zombie stream from hanging shutdown.
-                        let shutdown_poll = async {
-                            loop {
-                                let done = state.lock().await.in_flight.is_none();
-                                if done {
-                                    break;
-                                }
-                                tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-                            }
-                        };
-                        match tokio::time::timeout(
-                            tokio::time::Duration::from_secs(30),
-                            shutdown_poll,
-                        )
-                        .await
-                        {
-                            Ok(()) => {}
-                            Err(_) => {
-                                tracing::warn!(
-                                    "Shutdown: in-flight stream did not finish within 30 s; \
-                                     proceeding with shutdown anyway"
-                                );
+                    match parse_frame(line, MAX_FRAME_BYTES) {
+                        Ok(cmd) => {
+                            tracing::debug!(?cmd, "received RpcCommand");
+                            if b.on_command(cmd).await.is_some() {
+                                tracing::info!("shutdown received; ending the session after the turn");
+                                shutdown = Some(tokio::time::Instant::now() + SHUTDOWN_TURN_WAIT);
                             }
                         }
-
-                        state.lock().await.save_session().await;
-
-                        // Bounded observability flush (Task 11) — before
-                        // `process::exit`, which bypasses all destructors.
-                        // In-flight streams already drained above, so the
-                        // shared writer is safe to close. `off` → `None`
-                        // no-op; "flushed" = OS file buffers, no fsync; a
-                        // timeout logs metadata-only stats and shutdown
-                        // proceeds regardless.
-                        if let Some(outcome) = state
-                            .lock()
-                            .await
-                            .runtime
-                            .shutdown_observability_async(
-                                synaps_cli::runtime::telemetry::DEFAULT_SHUTDOWN_FLUSH_TIMEOUT,
-                            )
-                            .await
-                        {
-                            if !outcome.is_flushed() {
-                                tracing::warn!(
-                                    stats = ?outcome.stats(),
-                                    "observability flush timed out — detached worker keeps draining"
-                                );
-                            }
-                        }
-
-                        // Signal background tasks (inbox watcher, session
-                        // socket listener) to stop. The `BackgroundTasks`
-                        // value is dropped at function exit, which aborts
-                        // the join handles as a hard backstop.
-                        background.shutdown();
-
-                        // Drop the sender so the writer task drains its queue and exits.
-                        drop(writer_tx);
-
-                        // Bounded wait: 1 s is plenty for 256 buffered frames over a stdio pipe.
-                        // Replaces the former unconditional sleep(20 ms) which could drop frames.
-                        match tokio::time::timeout(
-                            tokio::time::Duration::from_secs(1),
-                            writer_handle,
-                        )
-                        .await
-                        {
-                            Ok(Ok(())) => {} // writer finished cleanly
-                            Ok(Err(e)) => {
-                                tracing::warn!(error = ?e, "writer task panicked during shutdown")
-                            }
-                            Err(_) => tracing::warn!(
-                                "writer task did not drain within 1s; exiting anyway"
-                            ),
-                        }
-
-                        std::process::exit(0);
+                        Err(err_ev) => b.emit(err_ev).await,
                     }
                 }
+                Ok(None) | Err(_) => {
+                    // EOF (or a broken stdin): the parent is done. End the
+                    // session now — an in-flight turn is cancelled.
+                    tracing::info!("stdin closed; ending the session");
+                    b.end_session(false).await;
+                    drain_writer(out, writer).await;
+                    return Ok(());
+                }
+            },
+            _ = tokio::time::sleep_until(deadline), if shutdown.is_some() => {
+                tracing::warn!("shutdown: in-flight turn did not finish within 30 s; ending anyway");
+                break None;
             }
         }
-    }
+    };
 
-    // Reached via `break` (stdin EOF or read error) — the only graceful
-    // return path that does not `process::exit`. Same bounded observability
-    // flush as the Shutdown frame: `off` → `None` no-op; idempotent, so a
-    // future refactor routing Shutdown through here double-flushes safely.
-    if let Some(outcome) = state
-        .lock()
-        .await
-        .runtime
-        .shutdown_observability_async(
-            synaps_cli::runtime::telemetry::DEFAULT_SHUTDOWN_FLUSH_TIMEOUT,
-        )
-        .await
-    {
-        if !outcome.is_flushed() {
-            tracing::warn!(
-                stats = ?outcome.stats(),
-                "observability flush timed out — detached worker keeps draining"
-            );
+    match exit {
+        // `shutdown`: the turn finished (or timed out); end and exit 0.
+        None => {
+            b.end_session(true).await;
+            drain_writer(out, writer).await;
+            std::process::exit(0);
         }
-    }
-
-    Ok(())
-}
-
-#[cfg(test)]
-mod context_head_tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn context_head_rejection_blocks_shutdown_save_and_auto_chain() {
-        let mut session = Session::new("synthetic", "medium", Some("host authority"));
-        session.id = "synthetic-rpc-context-head".into();
-        session.api_messages = vec![Arc::new(serde_json::json!({
-            "role":"user", "content":"original synthetic head"
-        }))];
-        let old_messages = session.api_messages.clone();
-        let mut st = RpcState {
-            runtime: Runtime::new_headless(),
-            session,
-            context_head: Default::default(),
-            api_messages: old_messages.clone(),
-            total_input_tokens: 0,
-            total_output_tokens: 0,
-            session_cost: 0.0,
-            in_flight: None,
-            pending_events: vec!["synthetic pending event".into()],
-            consecutive_auto_turns: 0,
-            auto_turn_pending: false,
-            events_auto_turn: true,
-            auto_turn_cap: 5,
-            turn_budgets: Default::default(),
-            save_owed: false,
-            session_lock: None,
-        };
-        let (receipt, acknowledged) = synaps_cli::core::context_head::ContextHeadReceipt::channel();
-        receipt.complete(st.persist_context_head("wrong-session", Vec::new()).await);
-        assert!(acknowledged.await.unwrap().is_err());
-        assert_eq!(st.api_messages, old_messages);
-        let state = Mutex::new(st);
-        assert!(terminal_flush(&state, true).await.is_none());
-        let mut st = state.lock().await;
-        assert!(!st.auto_turn_pending);
-        assert_eq!(st.consecutive_auto_turns, 0);
-        assert_eq!(st.api_messages.len(), 2); // buffered event retained, not inferred
-        st.save_session().await; // blocked, no real filesystem access
-        assert_eq!(st.session.api_messages, old_messages);
-        let (writer, mut frames) = mpsc::channel(8);
-        drop(st);
-        let state = Arc::new(state);
-        handle_compact("compact-test".into(), state, writer).await;
-        assert!(matches!(frames.recv().await, Some(RpcEvent::Error { .. })));
+        Some(Exit::Lost(message)) => {
+            let id = b.turn.as_ref().map(|t| t.id.clone());
+            eprintln!("synaps rpc: {message}");
+            b.error(id, message).await;
+            drop(b);
+            drain_writer(out, writer).await;
+            std::process::exit(EXIT_DAEMON_LOST);
+        }
+        Some(Exit::Ended(reason)) => {
+            let message = format!("session ended by the daemon ({reason:?})");
+            let id = b.turn.as_ref().map(|t| t.id.clone());
+            eprintln!("synaps rpc: {message}");
+            b.error(id, message).await;
+            drop(b);
+            drain_writer(out, writer).await;
+            std::process::exit(EXIT_DAEMON_LOST);
+        }
     }
 }
 
@@ -1669,53 +840,27 @@ mod rpc_attachment_tests {
 
     #[test]
     fn rpc_attachment_paths_validates_absolute_and_no_parent() {
-        // Absolute path without .. → ok
-        let good = vec![RpcAttachment {
-            path: "/tmp/image.png".into(),
-            name: None,
-            mime: None,
-        }];
+        let good = vec![RpcAttachment { path: "/tmp/image.png".into(), name: None, mime: None }];
         assert!(rpc_attachment_paths(&good).is_ok());
-
-        // Relative path → error
-        let relative = vec![RpcAttachment {
-            path: "relative/image.png".into(),
-            name: None,
-            mime: None,
-        }];
+        let relative = vec![RpcAttachment { path: "relative/image.png".into(), name: None, mime: None }];
         assert!(rpc_attachment_paths(&relative).is_err());
-
-        // Path with .. → error
-        let dotdot = vec![RpcAttachment {
-            path: "/tmp/../etc/passwd".into(),
-            name: None,
-            mime: None,
-        }];
+        let dotdot = vec![RpcAttachment { path: "/tmp/../etc/passwd".into(), name: None, mime: None }];
         assert!(rpc_attachment_paths(&dotdot).is_err());
-
-        // Empty → ok
         assert!(rpc_attachment_paths(&[]).is_ok());
     }
 
     #[tokio::test]
     async fn load_rpc_user_content_text_only() {
-        let (content, count) =
-            load_rpc_user_content("hello", &[], "claude-sonnet-4-20250514", &[])
-                .await
-                .unwrap();
+        let (content, count) = load_rpc_user_content("hello", &[], "claude-sonnet-4-20250514", &[]).await.unwrap();
         assert_eq!(content, "hello");
         assert_eq!(count, 0);
     }
 
     #[tokio::test]
     async fn load_rpc_user_content_missing_file_fails() {
-        let attachments = vec![RpcAttachment {
-            path: "/tmp/nonexistent_rpc_test_file.png".into(),
-            name: None,
-            mime: None,
-        }];
-        let result =
-            load_rpc_user_content("hello", &attachments, "claude-sonnet-4-20250514", &[]).await;
+        let attachments =
+            vec![RpcAttachment { path: "/tmp/nonexistent_rpc_test_file.png".into(), name: None, mime: None }];
+        let result = load_rpc_user_content("hello", &attachments, "claude-sonnet-4-20250514", &[]).await;
         assert!(result.is_err());
     }
 
@@ -1724,23 +869,17 @@ mod rpc_attachment_tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.txt");
         std::fs::write(&path, "file body").unwrap();
-        let attachments = vec![RpcAttachment {
-            path: path.to_str().unwrap().into(),
-            name: None,
-            mime: None,
-        }];
-        let (content, count) = load_rpc_user_content(
-            "explain",
-            &attachments,
-            "claude-sonnet-4-20250514",
-            &[],
-        )
-        .await
-        .unwrap();
+        let attachments = vec![RpcAttachment { path: path.to_str().unwrap().into(), name: None, mime: None }];
+        let (content, count) =
+            load_rpc_user_content("explain", &attachments, "claude-sonnet-4-20250514", &[]).await.unwrap();
         assert_eq!(count, 1);
-        // Content should be an array with text block + document block.
         let arr = content.as_array().unwrap();
         assert_eq!(arr[0]["text"], "explain");
         assert_eq!(arr[1]["type"], "document");
+        // Submit carries the attachment blocks only; the actor re-adds the text.
+        let blocks = submit_blocks("explain", content.clone());
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0]["type"], "document");
+        assert_eq!(submit_blocks("", serde_json::json!([{"type": "document"}])).len(), 1);
     }
 }
