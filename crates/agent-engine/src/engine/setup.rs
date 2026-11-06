@@ -310,14 +310,7 @@ pub(crate) fn spawn_session_background_gated(
         let shutdown = watcher_shutdown.clone();
         let gate = Arc::clone(&inbox_gate);
         tokio::spawn(async move {
-            crate::events::watch_inbox_gated(
-                inbox_dir,
-                event_queue,
-                shutdown,
-                crate::events::ingest::accept_all,
-                gate,
-            )
-            .await;
+            crate::events::watch_inbox_gated(inbox_dir, event_queue, shutdown, gate).await;
         })
     };
 

@@ -757,8 +757,8 @@ Two transports carry an external `Event` into a session; they differ in who
 receives it.
 
 - **Per-session socket (targeted).** `synaps send --session <id|name|prefix>`,
-  the only-session case of a bare `synaps send`, `--broadcast`, agent-comms
-  and watcher `notify_session` all write to the socket on the session's
+  the only-session case of a bare `synaps send`, `--broadcast` and
+  agent-comms all write to the socket on the session's
   registry card. It always reaches that session, and wakes it even when
   parked (unpark, then an `EventAuto` turn as under Remote steering above).
 - **Shared inbox (untargeted).** `~/.synaps-cli/inbox/*.json`. A daemon
@@ -768,9 +768,7 @@ receives it.
   a session rehydrated by a reload takes none until a client reattaches. Each
   file is claimed by rename first, so exactly one session takes it. An
   in-process session (`synaps chat` without the daemon) takes inbox files
-  while it runs. A headless `synaps agent` never takes them: nobody is at
-  it, and it would race the session someone is at for the one copy. Reach
-  an agent through its socket (`synaps send --session <agent>`).
+  while it runs.
 - **`synaps send` and the inbox.** A `--session` that matches nothing is an
   error (exit 1, nothing written) that lists the running sessions; `--inbox`
   opts in to leaving it in the shared inbox instead. With no flag and zero or

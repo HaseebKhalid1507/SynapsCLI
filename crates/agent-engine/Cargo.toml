@@ -15,10 +15,10 @@ path = "src/lib.rs"
 # `shell_*` PTY tools. ON by default so a normal build is unchanged.
 # `--no-default-features` compiles `bash`/`powershell` out and never registers
 # `shell_*`. It removes those tools only and is NOT a sandbox: `write`/`edit`
-# (which can change shell rc files, `mcp.json`, plugin manifests and watcher
-# configs), watcher `wake_if` (`sh -c`), extensions, MCP servers and plugin
-# commands still start processes. `ShellStartTool` and friends stay exported,
-# so an embedder can still register them.
+# (which can change shell rc files, `mcp.json` and plugin manifests),
+# extensions, MCP servers and plugin commands still start processes.
+# `ShellStartTool` and friends stay exported, so an embedder can still
+# register them.
 default = ["command-exec"]
 command-exec = []
 # Test-support surface: offline Runtime construction for headless harnesses.

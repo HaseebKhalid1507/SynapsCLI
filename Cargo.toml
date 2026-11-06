@@ -4,7 +4,7 @@ version.workspace = true
 edition = "2021"
 authors = ["Haseeb Khalid <haseebkhalid1507@gmail.com>"]
 license = "Apache-2.0"
-description = "Terminal-native AI agent runtime — parallel orchestration, reactive subagents, MCP, autonomous supervision"
+description = "Terminal-native AI agent runtime — parallel orchestration, reactive subagents, MCP, session daemon"
 repository = "https://github.com/HaseebKhalid1507/SynapsCLI"
 homepage = "https://github.com/HaseebKhalid1507/SynapsCLI"
 keywords = ["ai", "agent", "terminal", "cli", "rust"]
@@ -17,9 +17,9 @@ rust-version = "1.88"
 # `cargo build --release --no-default-features` compiles the `bash`/`powershell`
 # tools out of the binary and never registers the interactive `shell_*` tools.
 # That is ALL it does; it is not a sandbox. The binary can still start
-# processes: `write`/`edit` can change shell rc files, `mcp.json`, plugin
-# manifests or watcher configs; watcher `wake_if` runs through `sh -c`; and
-# extensions, MCP servers and plugin commands all spawn processes.
+# processes: `write`/`edit` can change shell rc files, `mcp.json` or plugin
+# manifests; and extensions, MCP servers and plugin commands all spawn
+# processes.
 default = ["command-exec"]
 command-exec = ["agent-engine/command-exec"]
 testing = ["agent-tui/testing", "agent-engine/testing"]
@@ -42,7 +42,6 @@ serde_json = "1.0"
 clap = { version = "4.0", features = ["derive"] }
 uuid = { version = "1.0", features = ["v4"] }
 anyhow = "1.0"
-thiserror = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
@@ -58,10 +57,6 @@ rand = "0.9"
 base64 = "0.22"
 urlencoding = "2"
 url = "2"
-fs4 = "0.13"
-toml = "0.8"
-notify = "6.1"
-globset = "0.4"
 
 
 # Server deps
@@ -121,7 +116,7 @@ lto = "thin"
 maintainer = "Haseeb Khalid <haseebkhalid1507@gmail.com>"
 copyright = "2026, Haseeb Khalid"
 license-file = ["LICENSE", "0"]
-extended-description = "Terminal-native AI agent runtime. Parallel orchestration, reactive subagents, MCP client, autonomous watcher daemon."
+extended-description = "Terminal-native AI agent runtime. Parallel orchestration, reactive subagents, MCP client, session daemon."
 section = "utils"
 priority = "optional"
 assets = [

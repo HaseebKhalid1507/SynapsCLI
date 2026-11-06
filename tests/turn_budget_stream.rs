@@ -250,11 +250,8 @@ async fn tool_call_budget_synthesizes_results_beyond_exact_allowance() {
     assert_eq!(results[0].0, "toolu_c1");
     assert_eq!(results[1].0, "toolu_c2");
     assert_eq!(results[2].0, "toolu_c3");
-    assert!(
-        results[2].1.contains("budget"),
-        "synthetic result names the budget: {}",
-        results[2].1
-    );
+    assert_eq!(results[2].1, synaps_cli::runtime::budget::TOOL_CALL_BUDGET_REFUSAL);
+    assert!(!results[2].1.contains("Canceled by user"));
     assert!(!results[0].1.contains("budget"));
 }
 
@@ -382,17 +379,17 @@ async fn wall_clock_exhaustion_can_resume_retained_history_after_explicit_extens
 #[test]
 fn per_role_defaults_and_auto_turn_composition() {
     let fg = TurnBudget::for_role(TurnRole::Foreground);
-    let auto = TurnBudget::for_role(TurnRole::Autonomous);
+    let event = TurnBudget::for_role(TurnRole::Event);
     let worker = TurnBudget::for_role(TurnRole::Worker);
     // Interactive turns are unlimited by default (#219); unattended
-    // autonomous turns and workers keep finite round caps.
+    // event-started turns and workers keep finite round caps.
     assert_eq!(fg.max_provider_rounds, None);
     assert_eq!(fg.max_tool_calls, None);
     assert_eq!(fg.max_accumulated_tool_result_bytes, None);
-    assert_eq!(auto.max_provider_rounds, Some(24));
-    assert_eq!(auto.max_tool_calls, Some(96));
+    assert_eq!(event.max_provider_rounds, Some(24));
+    assert_eq!(event.max_tool_calls, Some(96));
     assert_eq!(worker.max_provider_rounds, Some(64));
-    for budget in [&fg, &auto, &worker] {
+    for budget in [&fg, &event, &worker] {
         assert_eq!(budget.max_elapsed, None);
     }
     assert!(fg.max_context_tokens.is_none() && fg.max_cost_usd.is_none());

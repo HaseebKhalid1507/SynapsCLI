@@ -6,7 +6,7 @@ crates/
 ├── agent-engine/    # provider transports, runtime, session daemon, worker lifecycle, tools, extensions
 │                   # MCP, events, skills, sidecar, cloud and OpenAI-compatible routing
 ├── agent-tui/       # ratatui UI, model/effort settings, themes, plugin modals
-└── (root)           # the `synaps` binary crate: CLI dispatch, login, watcher, broker
+└── (root)           # the `synaps` binary crate: CLI dispatch, login, broker
 ```
 
 The session daemon hosts one `EngineHost` (extensions, MCP, and providers shared
