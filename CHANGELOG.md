@@ -14,13 +14,22 @@ All notable changes to this project will be documented in this file.
   pinned daemon session instead: `synaps daemon` runs the sessions,
   `synaps --attach --keep-warm` (or `synaps daemon pin <ID|NAME>`) pins one
   so it is never parked and survives a daemon restart, `turn_budget.*`
-  bounds each turn, and `synaps send` starts event turns in it (see
-  `docs/daemon-mode.md`, *Pinning a session*). For this
-  release both commands are hidden stubs: with any arguments they print one
-  line to stderr ("`synaps agent` was removed in 0.12.0: run long-lived
-  headless work as a pinned daemon session …") and exit 2, on every
-  platform. The release after this one removes the stubs. Nothing under
-  `~/.synaps-cli/watcher/` is read or deleted; remove it by hand.
+  bounds each turn, and `synaps send --session <name>` starts event turns
+  in it (see `docs/daemon-mode.md`, *Pinning a session*). The watcher's
+  limits map to `turn_budget.event.max_tool_calls`,
+  `turn_budget.event.max_elapsed_secs` (per turn) and, for spend, the
+  session's `max_session_cost`: a hard USD ceiling checked after every
+  usage event that cancels the turn when crossed. It is set in the session
+  config a daemon client sends on create; no CLI flag or config key sets
+  it yet. `turn_budget.event.max_cost_usd` caps one turn. There is no
+  equivalent of `max_daily_cost_usd`, `max_session_tokens` or the
+  per-agent memory/CPU/nice limits. For this release both commands are
+  hidden stubs: with any arguments they print one line to stderr
+  ("`synaps agent` was removed in 0.12.0: pin a daemon session (synaps
+  --attach --keep-warm, or synaps daemon pin) and drive it with synaps
+  send --session <name>. See <docs/daemon-mode.md link>") and exit 2, on
+  every platform. The release after this one removes the stubs. Nothing
+  under `~/.synaps-cli/watcher/` is read or deleted; remove it by hand.
 - **Watcher-only config keys are ignored.** `turn_budget.autonomous.*`
   (read only by `synaps agent`) and `bridge.uds_path`,
   `bridge.heartbeat_mirror`, `bridge.heartbeat_timeout_ms` (watcher
@@ -30,6 +39,13 @@ All notable changes to this project will be documented in this file.
   their own `turn_budget.event.*` keys, with the same defaults the
   autonomous role had (24 rounds, no renewals, 96 tool calls, 8 MiB of
   tool results).
+- **Engine API: watcher-only surface removed.** `TurnBudget::max_total_tokens`
+  (only the watcher set it) is gone; `BudgetDimension::TotalTokens` stays,
+  reserved, because its label and capture tag are on the wire. The inbox
+  filter (`events::InboxFilter`, `accept_all`, `watch_inbox_filtered`) is
+  gone and `watch_inbox_gated` no longer takes a filter: every consumer
+  took every file. Also gone: `TurnRole::Autonomous`, `BridgeConfig`, the
+  `watcher_exit` tool and `ToolContext`/`Runtime` `watcher_exit_path`.
 
 ### Fixed
 
