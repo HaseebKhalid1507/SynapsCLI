@@ -707,6 +707,37 @@ fn spawn_env(opts: &DaemonOpts, env: &mut Vec<(std::ffi::OsString, std::ffi::OsS
     }
 }
 
+/// Write `buf` to this process's stderr without ever blocking: a parent
+/// that pipes stderr and never reads it must not stall us (nor, through a
+/// copied pipe, a private daemon). Chunks that do not fit right now are
+/// dropped. Returns whether everything was written.
+pub fn stderr_lossy(buf: &[u8]) -> bool {
+    static LOCK: Mutex<()> = Mutex::new(());
+    let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    #[cfg(unix)]
+    {
+        // ≤ PIPE_BUF per write: a pipe that polls writable takes it whole.
+        for chunk in buf.chunks(libc::PIPE_BUF) {
+            let mut pfd = libc::pollfd { fd: libc::STDERR_FILENO, events: libc::POLLOUT, revents: 0 };
+            // SAFETY: one valid pollfd, no wait.
+            let n = unsafe { libc::poll(&mut pfd, 1, 0) };
+            if n != 1 || pfd.revents & libc::POLLOUT == 0 || pfd.revents & (libc::POLLERR | libc::POLLHUP) != 0 {
+                return false;
+            }
+            // SAFETY: writing `chunk.len()` bytes from a live slice.
+            let w = unsafe { libc::write(libc::STDERR_FILENO, chunk.as_ptr().cast(), chunk.len()) };
+            if w != chunk.len() as isize {
+                return false;
+            }
+        }
+        true
+    }
+    #[cfg(not(unix))]
+    {
+        use std::io::Write;
+        std::io::stderr().write_all(buf).is_ok()
+    }
+}
 
 /// Whether nobody can read our stdout any more (a pipe whose read end is
 /// closed: `POLLERR`/`POLLHUP`). Never true for a file or a terminal, nor
@@ -724,6 +755,7 @@ pub fn stdout_peer_closed() -> bool {
         false
     }
 }
+
 /// Parent side: `current_exe daemon --foreground …` in its own session
 /// (`setsid`), stdout → null, stderr → pipe; waits ≤ [`SPAWN_READY_TIMEOUT`]
 /// (15 s: the daemon's ≤ 10 s extension wait plus margin) for `R` on the
@@ -834,11 +866,27 @@ pub fn spawn_detached(opts: &DaemonOpts) -> anyhow::Result<u32> {
     unsafe { libc::close(read_fd) };
 
     if ready {
-        // Keep draining stderr so the child never blocks on a full pipe.
+        // Keep draining stderr so the child never blocks on a full pipe. A
+        // private daemon's stderr is its spawner's diagnostics: copied to
+        // ours (lossy, never blocking); a shared daemon's is discarded.
         if let Some(mut err) = child.stderr.take() {
-            std::thread::spawn(move || {
-                let mut sink = Vec::new();
-                let _ = err.read_to_end(&mut sink);
+            let private = opts.private;
+            let _ = std::thread::Builder::new().name("daemon-stderr".into()).spawn(move || {
+                if !private {
+                    let _ = std::io::copy(&mut err, &mut std::io::sink());
+                    return;
+                }
+                let mut buf = [0u8; 8192];
+                loop {
+                    match err.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            stderr_lossy(&buf[..n]);
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                        Err(_) => break,
+                    }
+                }
             });
         }
         drop(child);

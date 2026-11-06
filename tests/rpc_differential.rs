@@ -1094,6 +1094,29 @@ async fn late_reader_after_eof_gets_every_frame() {
     assert_eq!(tokio::time::timeout(WAIT, child.wait()).await.unwrap().unwrap().code(), Some(0));
 }
 
+/// The private daemon's stderr is copied to rpc's (diagnostics such as
+/// config warnings, which the in-process engine printed itself); stdout
+/// stays protocol frames only.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn daemon_stderr_reaches_rpc_stderr() {
+    let env = Env::new(Script::Sse(ANTHROPIC_SSE)).await;
+    std::fs::write(env.base().join("config"), "cache_ttl = bogus\n").unwrap();
+    let errlog = env.home.path().join("rpc.stderr");
+    let out = env
+        .cmd(&["rpc", "-m", MODEL])
+        .stdin(Stdio::null())
+        .stderr(std::fs::File::create(&errlog).unwrap())
+        .output()
+        .await
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.starts_with("{\"type\":\"ready\""), "{stdout}");
+    assert!(stdout.lines().all(|l| serde_json::from_str::<Value>(l).is_ok()), "{stdout}");
+    let stderr = std::fs::read_to_string(&errlog).unwrap();
+    assert!(stderr.contains("config warning: cache_ttl = bogus"), "{stderr}");
+}
+
 /// A parent that closes stdout is gone: rpc does not wait out the drain cap.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn closed_stdout_exits_promptly() {

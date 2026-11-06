@@ -81,6 +81,34 @@ const PRIVATE_IDLE_EXIT_MAX: Duration = Duration::from_secs(10);
 /// Exit code after SIGTERM (128 + 15).
 const EXIT_TERM: i32 = 143;
 
+// ─── stderr ──────────────────────────────────────────────────────────────────
+
+/// One diagnostic line on stderr, never blocking (a parent may pipe stderr
+/// and never read it): see [`daemon::stderr_lossy`].
+fn diag(message: impl std::fmt::Display) {
+    daemon::stderr_lossy(format!("synaps rpc: {message}\n").as_bytes());
+}
+
+/// `tracing` for this process: warnings and errors on stderr, lossy like
+/// [`diag`] (stdout is protocol frames only). The engine logs in the daemon.
+fn init_diagnostics() {
+    struct Lossy;
+    impl std::io::Write for Lossy {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            daemon::stderr_lossy(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::WARN)
+        .with_writer(|| Lossy)
+        .with_ansi(false)
+        .try_init();
+}
+
 // ─── stdout ──────────────────────────────────────────────────────────────────
 
 /// Serialise an [`RpcEvent`] (no trailing newline). Never fails silently.
@@ -174,7 +202,7 @@ async fn drain_writer(out: Out, mut done: oneshot::Receiver<()>) {
 /// Before `Ready`: say why there is no session (stderr, plus one error frame
 /// so a parent reading only stdout sees it) and exit `code`.
 fn refuse(code: i32, message: String) -> ! {
-    eprintln!("synaps rpc: {message}");
+    diag(&message);
     println!("{}", encode_event(&RpcEvent::Error { id: None, message }));
     std::process::exit(code);
 }
@@ -987,6 +1015,7 @@ pub async fn run(
     model: Option<String>,
     profile: Option<String>,
 ) -> anyhow::Result<()> {
+    init_diagnostics();
     // 1. Profile: the daemon socket is chosen by it.
     if profile.is_some() {
         synaps_cli::config::set_profile(profile.clone());
@@ -1041,7 +1070,7 @@ pub async fn run(
         ..Default::default()
     };
     if let Err(e) = agent_engine::session::client_args::resolve_client_session_args(&mut config, &cwd) {
-        eprintln!("synaps rpc: {e}");
+        diag(e);
         private.remove(&paths).await;
         std::process::exit(1);
     }
@@ -1065,7 +1094,7 @@ pub async fn run(
         // `--continue` of a session another process has live, or one that
         // does not resolve: refused as before (exit 1, no Ready).
         Err(TransportError::Refused(m)) => {
-            eprintln!("synaps rpc: cannot continue this session: {m}");
+            diag(format!("cannot continue this session: {m}"));
             private.remove(&paths).await;
             std::process::exit(1);
         }
@@ -1197,7 +1226,7 @@ pub async fn run(
             EXIT_TERM
         }
         Exit::Lost(message) => {
-            eprintln!("synaps rpc: {message}");
+            diag(&message);
             if !b.cut(&message).await {
                 b.error(None, message).await;
             }
@@ -1205,7 +1234,7 @@ pub async fn run(
         }
         Exit::Ended(reason) => {
             let message = format!("session ended by the daemon ({reason:?})");
-            eprintln!("synaps rpc: {message}");
+            diag(&message);
             if !b.cut(&message).await {
                 b.error(None, message).await;
             }
