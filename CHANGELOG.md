@@ -4,6 +4,33 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Removed
+
+- **Breaking: `synaps agent` and `synaps watcher` are gone.** The watcher
+  supervisor and the headless agents it started (`~/.synaps-cli/watcher/<name>/`
+  with `config.toml`, `soul.md`, `handoff.json`; `manual`/`always`/`watch`
+  triggers, `wake_if`, per-agent limits, the `watcher_exit` tool, heartbeat
+  mirroring to the bridge) are removed. Run long-lived headless work as a
+  pinned daemon session instead: `synaps daemon` runs the sessions,
+  `synaps --attach --keep-warm` (or `synaps daemon pin <ID|NAME>`) pins one
+  so it is never parked and survives a daemon restart, `turn_budget.*`
+  bounds each turn, and `synaps send` starts event turns in it (see
+  `docs/daemon-mode.md`, *Pinning a session*). For this
+  release both commands are hidden stubs: with any arguments they print one
+  line to stderr ("`synaps agent` was removed in 0.12.0: run long-lived
+  headless work as a pinned daemon session …") and exit 2, on every
+  platform. The release after this one removes the stubs. Nothing under
+  `~/.synaps-cli/watcher/` is read or deleted; remove it by hand.
+- **Watcher-only config keys are ignored.** `turn_budget.autonomous.*`
+  (read only by `synaps agent`) and `bridge.uds_path`,
+  `bridge.heartbeat_mirror`, `bridge.heartbeat_timeout_ms` (watcher
+  heartbeat mirroring) no longer do anything. A config that sets them
+  still loads, with one startup warning per group saying to remove the
+  lines; their `/settings` rows are gone. Turns started by events keep
+  their own `turn_budget.event.*` keys, with the same defaults the
+  autonomous role had (24 rounds, no renewals, 96 tool calls, 8 MiB of
+  tool results).
+
 ### Fixed
 
 - **Windows: the `grep`, `find` and `ls` tools work.** They ran the bare
