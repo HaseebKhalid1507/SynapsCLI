@@ -729,6 +729,7 @@ pub(super) async fn handle_session_event_arm(
             chains_advanced,
             queued_restored,
             msg_count,
+            ..
         } => {
             // The successor's messages/header arrive in the `Conversation`
             // that follows; the lines are pushed once it has been applied.

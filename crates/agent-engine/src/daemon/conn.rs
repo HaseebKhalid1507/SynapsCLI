@@ -913,6 +913,12 @@ async fn adopt_live_continue_target(state: &DaemonState, live: &SessionHandle) -
 /// cannot decode ([`client_decodes`]: an older client fails the whole frame).
 fn forwarded(history: HistoryMode, caps: ClientCapabilities, env: &Envelope) -> bool {
     !(matches!(env.event, SessionEventWire::Attached { .. })
+        // Actor-internal (its receipt is the actor's to complete): the wire
+        // has no such event. The actor filters it too; skip it explicitly.
+        || matches!(
+            env.event,
+            SessionEventWire::Stream(StreamEvent::Session(SessionEvent::ContextHeadCheckpoint { .. }))
+        )
         || (history == HistoryMode::Digest
             && matches!(
                 env.event,

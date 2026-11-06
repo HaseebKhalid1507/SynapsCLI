@@ -202,6 +202,22 @@ abort by killing their `synaps` child (Pria's guest agent, Harbor and
 synaps-bench timeouts) need the in-process semantics back. An **owned**
 session gives them: it is bound to the connection that created it.
 
+`synaps rpc` is built on it: every rpc process spawns a **private** daemon in
+a run dir of its own (`<run>/rpc/<pid>-<random>`, 0700; `SYNAPS_DAEMON_DIR`
+points a `synaps daemon …` command at it) and creates an owned session there
+with `forward_secrets` on. The private daemon has the rpc process's env,
+config, mount namespace and cgroup (the old per-process isolation), skips
+pin restore and process scopes, never serves anyone else, and exits ≤ 10 s
+after its session ends; a run dir whose rpc and daemon locks are both free
+is swept by the next `synaps rpc`. It runs 2 tokio workers and one
+jemalloc background thread unless the caller set `SYNAPS_WORKER_THREADS` /
+`_RJEM_MALLOC_CONF`; its stderr is copied to the rpc's stderr. `main` takes
+`SYNAPS_DAEMON_DIR` out of the process env at start (it still applies to
+that process), so nothing the daemon spawns inherits it. No daemon → exit 3, no in-process
+fallback. Its stdin/stdout protocol is unchanged
+([rpc-protocol.md](rpc-protocol.md)). A shared, env-keyed rpc daemon is a
+possible follow-up.
+
 - **Opt-in at create**: `Attach::Create{config, mode, owned: {forward_secrets?}}`.
   Old clients never send `owned`, so they get today's session, byte for byte.
 - **Capability**: a daemon that honours it lists `"owned_sessions"` in
@@ -854,11 +870,12 @@ reload-state are the same; the operating-system pieces differ:
   saved, then the draft is removed (if that save fails, the draft stays for the next holder). A leftover
   draft of a turn that actually concluded (history already ends with the model's final reply or an
   interruption marker) is just removed; a stale one (its round already committed) contributes no text.
-  Recovery only ever appends, so the cached prefix is untouched. rpc and `synaps server` save every
-  round but keep no draft; they DO take the session lock (`setup::lock_session`): continuing a
-  session another process has live (a TUI, the daemon, another rpc), or one already compacted into a
+  Recovery only ever appends, so the cached prefix is untouched. `synaps rpc` is a daemon client
+  (an owned session, below), so the daemon's rules are its rules. `synaps server` saves every
+  round but keeps no draft; it DOES take the session lock (`setup::lock_session`): continuing a
+  session another process has live (a TUI, the daemon, an rpc), or one already compacted into a
   successor, is refused with the reason named, instead of running a second writer on the same
-  history — and, as lock holders, they recover a draft their predecessor left. Legacy chat takes no
+  history — and, as lock holder, it recovers a draft its predecessor left. Legacy chat takes no
   lock. Deleting a session (and retention) removes its draft.
 - Refuse-to-start (exit 3): flag unset; another daemon holds the lock.
 - Daemon lost (exit 4, `EXIT_DAEMON_LOST`): the daemon was killed/crashed, the client could not reconnect

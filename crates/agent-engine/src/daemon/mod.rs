@@ -172,8 +172,13 @@ pub struct DaemonOpts {
     /// per-session MCP leases). Still forwarded so an older client can spawn
     /// a newer daemon.
     pub allow_legacy_mcp: bool,
-    /// Test seam: `registry_dir()` replacement.
+    /// `registry_dir()` replacement for the daemon's own files (a spawned
+    /// daemon gets it as `SYNAPS_DAEMON_DIR`).
     pub runtime_dir: Option<PathBuf>,
+    /// A private daemon (`synaps rpc`): spawned without pin restore (pins
+    /// belong to the profile daemon) and without a process scope, so it
+    /// stays in its spawner's cgroup like the in-process engine did.
+    pub private: bool,
     /// Test seam / A1 hook: how `Attach::Create` builds a session.
     pub factory: Option<SessionFactory>,
 }
@@ -666,6 +671,107 @@ fn daemon_launch(
     }
 }
 
+/// Session event buffer of a private daemon: its one owner must never lag
+/// (that ends the session), and a burst (a fast stream, a chatty tool) can
+/// outrun the socket hop by more than the shared default.
+pub const PRIVATE_EVENTS_CAP: usize = 8 * 1024;
+
+/// Tokio workers of a private daemon: it serves one session. Units with a
+/// task cap (`TasksMax`) run one rpc process + daemon per conversation.
+pub const PRIVATE_WORKER_THREADS: usize = 2;
+
+/// jemalloc background threads of a private daemon (default: one per CPU
+/// up to the arenas in use).
+const PRIVATE_MALLOC_CONF: &str = "max_background_threads:1";
+
+/// What a spawned daemon must know beyond argv: its files dir, and for a
+/// private daemon, no pin restore, a deeper event buffer, fewer workers and
+/// allocator threads (an explicit `SYNAPS_SESSION_EVENTS_CAP`,
+/// `SYNAPS_WORKER_THREADS` or `_RJEM_MALLOC_CONF` wins).
+fn spawn_env(opts: &DaemonOpts, env: &mut Vec<(std::ffi::OsString, std::ffi::OsString)>) {
+    if let Some(dir) = &opts.runtime_dir {
+        crate::process_scope::set_env(env, registry::DAEMON_DIR_ENV, dir.clone().into_os_string());
+    }
+    if opts.private {
+        crate::process_scope::set_env(env, pins::RESTORE_ENV, "0");
+        let defaults = [
+            ("SYNAPS_SESSION_EVENTS_CAP", PRIVATE_EVENTS_CAP.to_string()),
+            ("SYNAPS_WORKER_THREADS", PRIVATE_WORKER_THREADS.to_string()),
+            ("_RJEM_MALLOC_CONF", PRIVATE_MALLOC_CONF.to_string()),
+        ];
+        for (key, value) in defaults {
+            if !env.iter().any(|(k, _)| k == key) {
+                crate::process_scope::set_env(env, key, value);
+            }
+        }
+    }
+}
+
+/// The threads copying private daemons' stderr to ours.
+static STDERR_COPIERS: Mutex<Vec<std::thread::JoinHandle<()>>> = Mutex::new(Vec::new());
+
+/// After a private daemon exited: give its stderr copier up to `wait` to
+/// reach EOF, so what the daemon printed (a startup warning, a panic) is
+/// not lost when this process exits right after. A descendant still
+/// holding the pipe only costs the wait.
+pub fn flush_private_stderr(wait: Duration) {
+    let deadline = Instant::now() + wait;
+    let mut copiers = std::mem::take(&mut *STDERR_COPIERS.lock().unwrap_or_else(|e| e.into_inner()));
+    while !copiers.is_empty() && Instant::now() < deadline {
+        copiers.retain(|h| !h.is_finished());
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Write `buf` to this process's stderr without ever blocking: a parent
+/// that pipes stderr and never reads it must not stall us (nor, through a
+/// copied pipe, a private daemon). Chunks that do not fit right now are
+/// dropped. Returns whether everything was written.
+pub fn stderr_lossy(buf: &[u8]) -> bool {
+    static LOCK: Mutex<()> = Mutex::new(());
+    let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    #[cfg(unix)]
+    {
+        // ≤ PIPE_BUF per write: a pipe that polls writable takes it whole.
+        for chunk in buf.chunks(libc::PIPE_BUF) {
+            let mut pfd = libc::pollfd { fd: libc::STDERR_FILENO, events: libc::POLLOUT, revents: 0 };
+            // SAFETY: one valid pollfd, no wait.
+            let n = unsafe { libc::poll(&mut pfd, 1, 0) };
+            if n != 1 || pfd.revents & libc::POLLOUT == 0 || pfd.revents & (libc::POLLERR | libc::POLLHUP) != 0 {
+                return false;
+            }
+            // SAFETY: writing `chunk.len()` bytes from a live slice.
+            let w = unsafe { libc::write(libc::STDERR_FILENO, chunk.as_ptr().cast(), chunk.len()) };
+            if w != chunk.len() as isize {
+                return false;
+            }
+        }
+        true
+    }
+    #[cfg(not(unix))]
+    {
+        use std::io::Write;
+        std::io::stderr().write_all(buf).is_ok()
+    }
+}
+
+/// Whether nobody can read our stdout any more (a pipe whose read end is
+/// closed: `POLLERR`/`POLLHUP`). Never true for a file or a terminal, nor
+/// where it cannot be told.
+pub fn stdout_peer_closed() -> bool {
+    #[cfg(unix)]
+    {
+        let mut pfd = libc::pollfd { fd: libc::STDOUT_FILENO, events: 0, revents: 0 };
+        // SAFETY: one valid pollfd, no wait.
+        let n = unsafe { libc::poll(&mut pfd, 1, 0) };
+        n == 1 && pfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
 /// Parent side: `current_exe daemon --foreground …` in its own session
 /// (`setsid`), stdout → null, stderr → pipe; waits ≤ [`SPAWN_READY_TIMEOUT`]
 /// (15 s: the daemon's ≤ 10 s extension wait plus margin) for `R` on the
@@ -696,7 +802,12 @@ pub fn spawn_detached(opts: &DaemonOpts) -> anyhow::Result<u32> {
     let mut effective_env = crate::process_scope::inherited_env();
     crate::process_scope::set_env(&mut effective_env, "SYNAPS_DAEMON", "1");
     effective_env.retain(|(k, _)| k != READY_FD_ENV);
-    let (program, cmd_args) = daemon_launch(&effective_env, exe, cmd_args);
+    spawn_env(opts, &mut effective_env);
+    let (program, cmd_args) = if opts.private {
+        (exe.into_os_string(), cmd_args)
+    } else {
+        daemon_launch(&effective_env, exe, cmd_args)
+    };
     let mut fds = [0i32; 2];
     // SAFETY: plain pipe(2) on a valid 2-slot array.
     if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
@@ -771,12 +882,31 @@ pub fn spawn_detached(opts: &DaemonOpts) -> anyhow::Result<u32> {
     unsafe { libc::close(read_fd) };
 
     if ready {
-        // Keep draining stderr so the child never blocks on a full pipe.
+        // Keep draining stderr so the child never blocks on a full pipe. A
+        // private daemon's stderr is its spawner's diagnostics: copied to
+        // ours (lossy, never blocking); a shared daemon's is discarded.
         if let Some(mut err) = child.stderr.take() {
-            std::thread::spawn(move || {
-                let mut sink = Vec::new();
-                let _ = err.read_to_end(&mut sink);
+            let private = opts.private;
+            let copier = std::thread::Builder::new().name("daemon-stderr".into()).spawn(move || {
+                if !private {
+                    let _ = std::io::copy(&mut err, &mut std::io::sink());
+                    return;
+                }
+                let mut buf = [0u8; 8192];
+                loop {
+                    match err.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            stderr_lossy(&buf[..n]);
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                        Err(_) => break,
+                    }
+                }
             });
+            if let (true, Ok(handle)) = (private, copier) {
+                STDERR_COPIERS.lock().unwrap_or_else(|e| e.into_inner()).push(handle);
+            }
         }
         drop(child);
         return Ok(pid);
@@ -837,6 +967,7 @@ pub fn spawn_detached(opts: &DaemonOpts) -> anyhow::Result<u32> {
     let mut effective_env = crate::process_scope::inherited_env();
     crate::process_scope::set_env(&mut effective_env, "SYNAPS_DAEMON", "1");
     effective_env.retain(|(k, _)| k != READY_FD_ENV && k != READY_EVENT_ENV);
+    spawn_env(opts, &mut effective_env);
     let ready = win::Event::create_unique("ready")?;
     crate::process_scope::set_env(&mut effective_env, READY_EVENT_ENV, ready.name());
     let mut child = win::spawn_detached(&exe, &cmd_args, &effective_env)?;
@@ -1115,6 +1246,31 @@ mod flag_tests {
         assert!(m.contains("synaps --profile axon daemon stop"), "{m}");
         // sanitised socket stems collide; the profile names do not
         assert!(profile_mismatch(Some("a.b"), Some("a_b")).is_some());
+    }
+
+    #[test]
+    fn private_daemon_event_buffer_stays_small() {
+        // A tokio broadcast allocates every slot up front: one private
+        // daemon's session buffer must stay ~10 MiB (an Envelope is ~1.2 KB
+        // inline).
+        let slot = std::mem::size_of::<crate::session::types::Envelope>() + 32;
+        let bytes = slot * PRIVATE_EVENTS_CAP;
+        assert!(bytes <= 12 << 20, "{bytes} bytes ({slot} per slot)");
+    }
+
+    #[test]
+    fn private_daemon_env_defaults_yield_to_explicit_values() {
+        let opts = DaemonOpts { private: true, runtime_dir: Some("/r/p".into()), ..Default::default() };
+        let mut env = vec![("SYNAPS_WORKER_THREADS".into(), "6".into())];
+        spawn_env(&opts, &mut env);
+        let get = |k: &str| env.iter().find(|(key, _)| key == k).map(|(_, v)| v.to_string_lossy().into_owned());
+        assert_eq!(get("SYNAPS_WORKER_THREADS").as_deref(), Some("6"));
+        assert_eq!(get("_RJEM_MALLOC_CONF").as_deref(), Some(PRIVATE_MALLOC_CONF));
+        assert_eq!(get("SYNAPS_SESSION_EVENTS_CAP"), Some(PRIVATE_EVENTS_CAP.to_string()));
+        assert_eq!(get(registry::DAEMON_DIR_ENV).as_deref(), Some("/r/p"));
+        let mut shared = Vec::new();
+        spawn_env(&DaemonOpts::default(), &mut shared);
+        assert!(shared.is_empty(), "{shared:?}");
     }
 
     #[test]

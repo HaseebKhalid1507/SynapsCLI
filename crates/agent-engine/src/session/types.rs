@@ -1483,14 +1483,19 @@ pub enum SessionEventWire {
     Aborted { context_saved: bool },
     /// `/clear`. TUI: transcript.clear, counters=0, "new session started".
     Cleared { session_id: String },
-    /// (B2) `disclosure` = preview_compaction_disclosure().render_line().
-    CompactionStarted { source: String, disclosure: String },
+    /// (B2) `disclosure` = preview_compaction_disclosure().render_line();
+    /// `detail` = the same disclosure, structured (`synaps rpc` answers
+    /// `compact.disclosure` with it).
+    CompactionStarted { source: String, disclosure: String, detail: Option<serde_json::Value> },
     CompactionApplied {
         previous_session_id: String,
         session_id: String,
         chains_advanced: Vec<String>,
         queued_restored: Option<String>,
         msg_count: usize,
+        /// The summary the history was compacted into (`synaps rpc`'s
+        /// `compact` response).
+        summary: Option<String>,
     },
     /// "compaction failed: {e}" vs "compaction task panicked: {e}".
     CompactionFailed { message: String, panicked: bool },

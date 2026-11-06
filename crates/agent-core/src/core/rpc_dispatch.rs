@@ -135,8 +135,8 @@ pub fn map_stream_event(ev: &StreamEvent) -> Option<RpcEvent> {
         // Drop — internal hook signal, not part of wire format
         StreamEvent::Agent(AgentEvent::SteeringDelivered { .. }) => None,
 
-        // Session bookkeeping events are handled by the streaming loop in cmd::rpc
-        // with direct mutable access to RpcState; they are never forwarded as-is.
+        // Session bookkeeping events (usage, done, error, history) are turned
+        // into turn-terminal frames by `cmd::rpc`; never forwarded as-is.
         StreamEvent::Session(_) => None,
     }
 }

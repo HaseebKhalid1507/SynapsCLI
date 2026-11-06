@@ -1,0 +1,7 @@
+{"model":"claude-sonnet-4-5","protocol_version":1,"session_id":"<SID0>","type":"ready"}
+{"id":"p1","message":"Bad request (HTTP 400 [invalid_request_error]). Provider error details withheld — they can echo request content.","type":"error"}
+{"type":"agent_end","usage":{"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"input_tokens":0,"output_tokens":0}}
+{"command":"prompt","error":"Bad request (HTTP 400 [invalid_request_error]). Provider error details withheld — they can echo request content.","id":"p1","ok":false,"outcome":{"code":"api_status","correlation_id":"<CORR>","kind":"provider_failed"},"type":"response"}
+{"command":"get_state","id":"g1","message_count":1,"model":"claude-sonnet-4-5","session_id":"<SID0>","streaming":false,"type":"response"}
+{"command":"get_messages","id":"m1","messages":[{"content":"hello","role":"user"}],"type":"response"}
+{"_exit":0}

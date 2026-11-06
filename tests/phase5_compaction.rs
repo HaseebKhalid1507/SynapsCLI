@@ -26,7 +26,6 @@ fn every_compacting_frontend_uses_the_engine_transition() {
 
     for rel in [
         "src/cmd/chat.rs",
-        "src/cmd/rpc.rs",
         "src/cmd/server.rs",
         // The TUI compacts on the SessionActor since phase 3 (A2); the
         // actor is the frontend's transition site.
@@ -45,6 +44,14 @@ fn every_compacting_frontend_uses_the_engine_transition() {
             !src.contains("new_from_compaction"),
             "{rel} must not construct successor sessions locally"
         );
+    }
+
+    // `synaps rpc` is a daemon client: it compacts on the SessionActor
+    // (checked above) and must not do any of it locally.
+    let rpc = read("src/cmd/rpc.rs");
+    assert!(rpc.contains("SessionCommand::Compact"), "rpc must compact on the session actor");
+    for forbidden in ["apply_compaction", "<context-summary>", "new_from_compaction"] {
+        assert!(!rpc.contains(forbidden), "rpc compacts locally again ({forbidden})");
     }
 
     // The frontends must not re-implement transition responsibilities that

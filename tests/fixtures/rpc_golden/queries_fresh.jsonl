@@ -1,0 +1,6 @@
+{"model":"claude-sonnet-4-5","protocol_version":1,"session_id":"<SID0>","type":"ready"}
+{"command":"get_messages","id":"m1","messages":[],"type":"response"}
+{"command":"get_state","id":"g1","message_count":0,"model":"claude-sonnet-4-5","session_id":"<SID0>","streaming":false,"type":"response"}
+{"command":"get_session_stats","cost":0.0,"id":"s1","input_tokens":0,"message_count":0,"model":"claude-sonnet-4-5","output_tokens":0,"session_id":"<SID0>","type":"response"}
+{"message":"unknown variant `no_such_command`, expected one of `prompt`, `follow_up`, `compact`, `new_session`, `get_messages`, `set_model`, `get_available_models`, `abort`, `get_session_stats`, `get_state`, `tools_list`, `shutdown` at line 1 column 35","type":"error"}
+{"_exit":0}

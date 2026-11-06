@@ -823,13 +823,21 @@ pub enum WireSessionEvent {
     Ended { reason: EndReason },
     Aborted { context_saved: bool },
     Cleared { session_id: String },
-    CompactionStarted { source: String, disclosure: String },
+    CompactionStarted {
+        source: String,
+        disclosure: String,
+        /// Absent from older daemons (and ignored by older clients).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<serde_json::Value>,
+    },
     CompactionApplied {
         previous_session_id: String,
         session_id: String,
         chains_advanced: Vec<String>,
         queued_restored: Option<String>,
         msg_count: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        summary: Option<String>,
     },
     CompactionFailed { message: String, panicked: bool },
     CompactionCancelled,
@@ -1043,9 +1051,13 @@ impl From<StreamEvent> for WireStreamEvent {
                 SessionEvent::Error(TurnError { message, outcome }) => WireSessionStreamEvent::Error { message, outcome },
                 SessionEvent::Notice(text) => WireSessionStreamEvent::Notice { text, retry: false },
                 SessionEvent::Retry(text) => WireSessionStreamEvent::Notice { text, retry: true },
-                // merge(112): ContextHeadCheckpoint is actor-internal (Wall 1); never crosses the wire.
-                // Drop it silently — the actor handles persistence before forwarding.
-                SessionEvent::ContextHeadCheckpoint { .. } => WireSessionStreamEvent::Done,
+                // merge(112): ContextHeadCheckpoint is actor-internal (Wall 1); never crosses the wire:
+                // the actor does not emit it and `daemon/conn.rs::forwarded` skips it. Should one
+                // ever get here it must not read as `Done` (that ends a socket client's turn).
+                SessionEvent::ContextHeadCheckpoint { .. } => {
+                    tracing::error!("BUG: a context-head checkpoint reached the session wire");
+                    WireSessionStreamEvent::Notice { text: "internal checkpoint (ignored)".into(), retry: false }
+                }
             }),
             StreamEvent::Agent(a) => Self::Agent(match a {
                 AgentEvent::SubagentStart { subagent_id, agent_name, task_preview } => {
@@ -1148,9 +1160,9 @@ impl From<SessionEventWire> for WireSessionEvent {
             S::Ended { reason } => Self::Ended { reason },
             S::Aborted { context_saved } => Self::Aborted { context_saved },
             S::Cleared { session_id } => Self::Cleared { session_id },
-            S::CompactionStarted { source, disclosure } => Self::CompactionStarted { source, disclosure },
-            S::CompactionApplied { previous_session_id, session_id, chains_advanced, queued_restored, msg_count } => {
-                Self::CompactionApplied { previous_session_id, session_id, chains_advanced, queued_restored, msg_count }
+            S::CompactionStarted { source, disclosure, detail } => Self::CompactionStarted { source, disclosure, detail },
+            S::CompactionApplied { previous_session_id, session_id, chains_advanced, queued_restored, msg_count, summary } => {
+                Self::CompactionApplied { previous_session_id, session_id, chains_advanced, queued_restored, msg_count, summary }
             }
             S::CompactionFailed { message, panicked } => Self::CompactionFailed { message, panicked },
             S::CompactionCancelled => Self::CompactionCancelled,
@@ -1215,9 +1227,9 @@ impl From<WireSessionEvent> for SessionEventWire {
             W::Ended { reason } => Self::Ended { reason },
             W::Aborted { context_saved } => Self::Aborted { context_saved },
             W::Cleared { session_id } => Self::Cleared { session_id },
-            W::CompactionStarted { source, disclosure } => Self::CompactionStarted { source, disclosure },
-            W::CompactionApplied { previous_session_id, session_id, chains_advanced, queued_restored, msg_count } => {
-                Self::CompactionApplied { previous_session_id, session_id, chains_advanced, queued_restored, msg_count }
+            W::CompactionStarted { source, disclosure, detail } => Self::CompactionStarted { source, disclosure, detail },
+            W::CompactionApplied { previous_session_id, session_id, chains_advanced, queued_restored, msg_count, summary } => {
+                Self::CompactionApplied { previous_session_id, session_id, chains_advanced, queued_restored, msg_count, summary }
             }
             W::CompactionFailed { message, panicked } => Self::CompactionFailed { message, panicked },
             W::CompactionCancelled => Self::CompactionCancelled,
@@ -1572,13 +1584,14 @@ mod tests {
             S::Ended { reason: EndReason::HostShutdown },
             S::Aborted { context_saved: true },
             S::Cleared { session_id: "new-1".into() },
-            S::CompactionStarted { source: "manual".into(), disclosure: "disc".into() },
+            S::CompactionStarted { source: "manual".into(), disclosure: "disc".into(), detail: Some(serde_json::json!({"mode": "remote"})) },
             S::CompactionApplied {
                 previous_session_id: "old".into(),
                 session_id: "new".into(),
                 chains_advanced: vec!["c1".into()],
                 queued_restored: Some("q".into()),
                 msg_count: 12,
+                summary: Some("sum".into()),
             },
             S::CompactionFailed { message: "boom".into(), panicked: false },
             S::CompactionCancelled,

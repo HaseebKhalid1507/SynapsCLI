@@ -620,6 +620,10 @@ fn exec_self(exe: &Path, rs_path: &Path, state: &DaemonState) -> String {
         .env(LOCK_FD_ENV, lock_fd.to_string())
         .env(RELOAD_STATE_ENV, rs_path)
         .env(SUBAGENT_ID_FLOOR_ENV, crate::tools::peek_next_subagent_id().to_string());
+    // A private daemon's files dir is scoped out of its env (`main`).
+    if let Some(dir) = registry::daemon_dir_override() {
+        cmd.env(registry::DAEMON_DIR_ENV, dir);
+    }
     let e = cmd.exec();
     // Only reached on failure: restore CLOEXEC.
     // SAFETY: as above.

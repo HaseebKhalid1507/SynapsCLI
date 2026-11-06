@@ -81,7 +81,7 @@ async fn compaction_does_not_block_attach_and_submit_is_queued_and_restored() {
     let seen = until(&mut a, |e| matches!(e, SessionEventWire::CompactionStarted { .. })).await;
     assert!(matches!(
         &seen.last().unwrap().event,
-        SessionEventWire::CompactionStarted { source, disclosure } if source == "manual" && !disclosure.is_empty()
+        SessionEventWire::CompactionStarted { source, disclosure, .. } if source == "manual" && !disclosure.is_empty()
     ));
 
     // Serviced during compaction: Attach (with snapshot), Query, Detach.

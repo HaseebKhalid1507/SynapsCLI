@@ -160,6 +160,7 @@ fn opts_from(profile: Option<String>, a: &StartArgs) -> DaemonOpts {
         idle_exit: a.idle_exit.map(Duration::from_secs),
         allow_legacy_mcp: a.allow_legacy_mcp,
         runtime_dir: None,
+        private: false,
         factory: None,
     }
 }

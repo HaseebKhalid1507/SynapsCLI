@@ -41,6 +41,30 @@ All notable changes to this project will be documented in this file.
   session itself, together with the close: a client that attaches between
   the daemon's check and the close is no longer closed under.
 
+### Changed
+
+- **`synaps rpc` runs on a session daemon.** It no longer boots its own
+  engine: each rpc process spawns a private daemon in its own run dir
+  (`<run>/rpc/<pid>-<random>`, with this process's env, config, mount
+  namespace and cgroup; never the profile's shared daemon), creates an owned
+  session there (its cwd and env, secrets forwarded to the tools) and
+  translates the stdin/stdout protocol to it. Frame types and fields are
+  unchanged; a golden-fixture differential test holds the frames of 14
+  scenarios to the old loop's. Differences: `get_session_stats.cost` reports
+  the real session cost instead of 0; `get_messages` drops internal
+  `_synaps_*` keys; some texts the session actor owns differ (a refused
+  confirm, a context-head refusal); a turn cut by SIGTERM, stdin EOF or a
+  lost daemon now ends with `agent_end` (usage so far) and a `response`
+  (SIGTERM exits 143); everything else in flight gets an `error` frame with
+  its id; a refused `set_model` is an `error`, not a success. Killing the
+  process cancels the turn and ends the session. With no daemon possible
+  (`SYNAPS_DAEMON=0`, `SYNAPS_DAEMON_AUTOSPAWN=0`, spawn failure) it exits 3
+  with an `error` frame instead of running in-process; a lost daemon exits 4.
+  On exit, queued frames are written while the parent can still read stdout
+  (≤ 60 s). rpc runs single-threaded; its private daemon runs 2 workers
+  (`SYNAPS_WORKER_THREADS` overrides); warnings and the daemon's stderr go
+  to rpc's stderr (lossy, never blocking).
+
 ### Fixed
 
 - **Windows: the `grep`, `find` and `ls` tools work.** They ran the bare

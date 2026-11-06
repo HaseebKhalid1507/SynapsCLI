@@ -1,0 +1,9 @@
+{"model":"claude-sonnet-4-5","protocol_version":1,"session_id":"<SID0>","type":"ready"}
+{"event":{"type":"response_start"},"type":"message_update"}
+{"event":{"delta":"partial","type":"text_delta"},"type":"message_update"}
+{"type":"agent_end","usage":{"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"input_tokens":10,"output_tokens":0}}
+{"cancelled":true,"command":"prompt","id":"p1","ok":true,"type":"response"}
+{"command":"abort","id":"a1","ok":true,"type":"response"}
+{"command":"get_messages","id":"m1","messages":[{"content":"go","role":"user"},{"content":[{"text":"partial","type":"text"}],"role":"assistant"},{"content":"[Request interrupted by user]","role":"user"}],"type":"response"}
+{"command":"abort","id":"a2","ok":true,"type":"response"}
+{"_exit":0}

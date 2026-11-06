@@ -296,108 +296,6 @@ pub fn idle_should_wait(children_running: bool, queue_len: usize) -> bool {
     children_running || queue_len > 0
 }
 
-// ─── terminal_flush seam for integration testing ─────────────────────────────
-
-/// Pure decision logic mirroring `terminal_flush` from `cmd/rpc.rs` for use in
-/// integration tests.
-///
-/// This seam allows tests to verify the `allow_chain` contract on the mutable
-/// state fields that `terminal_flush` operates on, **without** requiring a live
-/// `Runtime`, `Session`, or `Mutex<RpcState>`.
-///
-/// Rules (identical to `terminal_flush`):
-/// * Always: clear `auto_turn_pending`; take `pending_events` → inject into `api_messages`.
-/// * `allow_chain = false`: never reserve; return `None`; leave `counter` unchanged.
-/// * `allow_chain = true`: if all conditions met, increment `counter`, set
-///   `auto_turn_pending = true`, return `Some("auto:seam")`.
-pub fn terminal_flush_seam(
-    allow_chain: bool,
-    auto_turn_pending: &mut bool,
-    pending_events: &mut Vec<String>,
-    api_messages: &mut Vec<crate::SharedMessage>,
-    events_auto_turn: bool,
-    consecutive_auto_turns: &mut u32,
-) -> Option<String> {
-    terminal_flush_seam_with_cap(
-        allow_chain,
-        auto_turn_pending,
-        pending_events,
-        api_messages,
-        events_auto_turn,
-        consecutive_auto_turns,
-        AUTO_TURN_CAP,
-    )
-}
-
-/// [`terminal_flush_seam`] with an explicit cap; `cap == 0` means unlimited.
-pub fn terminal_flush_seam_with_cap(
-    allow_chain: bool,
-    auto_turn_pending: &mut bool,
-    pending_events: &mut Vec<String>,
-    api_messages: &mut Vec<crate::SharedMessage>,
-    events_auto_turn: bool,
-    consecutive_auto_turns: &mut u32,
-    cap: u32,
-) -> Option<String> {
-    *auto_turn_pending = false;
-    let to_inject = std::mem::take(pending_events);
-    let had_buffered = !to_inject.is_empty();
-    for formatted in to_inject {
-        api_messages.push(std::sync::Arc::new(
-            serde_json::json!({"role": "user", "content": formatted}),
-        ));
-    }
-    if allow_chain
-        && had_buffered
-        && events_auto_turn
-        && !auto_turn_cap_reached(*consecutive_auto_turns, cap)
-        && api_messages
-            .last()
-            .map(|m| m["role"].as_str() == Some("user"))
-            .unwrap_or(false)
-        && claim_auto_turn_with_cap(consecutive_auto_turns, cap)
-    {
-        *auto_turn_pending = true;
-        return Some("auto:seam".to_string());
-    }
-    None
-}
-
-// ─── spawn_prompt registration seam ─────────────────────────────────────────
-
-/// Pure decision logic for the `spawn_prompt` registration re-check (Bug 1 fix).
-///
-/// Models the guard that runs **inside** the registration lock just before
-/// `in_flight` is written. Returns `true` if it is safe to proceed with
-/// registration (caller should write `in_flight` and clear `auto_turn_pending`);
-/// returns `false` if the reservation was revoked by an intervening Abort and
-/// the caller must abort the spawned task (drop `start_tx`).
-///
-/// Rules (identical to the re-check in `spawn_prompt`):
-/// * Non-auto prompts (`!is_auto`) always return `true` — they are validated
-///   by `handle_prompt`'s `is_busy()` check before reaching here.
-/// * Auto prompts: `true` iff `auto_turn_pending && !in_flight_live`.
-/// * If returning `false`, the helper also defensively clears `auto_turn_pending`.
-///
-/// Used by `spawn_prompt` and by integration tests (not the replica scheduler).
-pub fn spawn_prompt_registration_check(
-    is_auto: bool,
-    auto_turn_pending: &mut bool,
-    in_flight_live: bool,
-) -> bool {
-    if !is_auto {
-        // A client prompt was checked before spawning, but an auto-turn or
-        // another prompt may have reserved/registered in the meantime.
-        return !*auto_turn_pending && !in_flight_live;
-    }
-    if *auto_turn_pending && !in_flight_live {
-        return true;
-    }
-    // Reservation revoked — clear pending defensively before returning false.
-    *auto_turn_pending = false;
-    false
-}
-
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -853,20 +751,6 @@ mod tests {
             wake_action(&drained, &messages, false, true, AUTO_TURN_CAP),
             wake_action_with_cap(&drained, &messages, false, true, AUTO_TURN_CAP, AUTO_TURN_CAP)
         );
-    }
-
-    #[test]
-    fn terminal_flush_seam_with_cap_zero_reserves_at_high_counter() {
-        let mut pending = false;
-        let mut events = vec!["<event>x</event>".to_string()];
-        let mut msgs: Vec<SharedMessage> = Vec::new();
-        let mut counter: u32 = 1_000;
-        let r = terminal_flush_seam_with_cap(
-            true, &mut pending, &mut events, &mut msgs, true, &mut counter, 0,
-        );
-        assert_eq!(r.as_deref(), Some("auto:seam"));
-        assert!(pending);
-        assert_eq!(counter, 1_001);
     }
 
     #[test]

@@ -1,0 +1,10 @@
+{"model":"claude-sonnet-4-5","protocol_version":1,"session_id":"<SID0>","type":"ready"}
+{"event":{"type":"response_start"},"type":"message_update"}
+{"event":{"delta":"hi","type":"text_delta"},"type":"message_update"}
+{"type":"agent_end","usage":{"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"input_tokens":10,"output_tokens":1}}
+{"command":"prompt","id":"p1","ok":true,"type":"response"}
+{"command":"new_session","id":"n1","session_id":"<SID1>","type":"response"}
+{"command":"get_state","id":"g1","message_count":0,"model":"claude-sonnet-4-5","session_id":"<SID1>","streaming":false,"type":"response"}
+{"command":"get_messages","id":"m1","messages":[],"type":"response"}
+{"command":"get_session_stats","cost":0.0,"id":"s1","input_tokens":0,"message_count":0,"model":"claude-sonnet-4-5","output_tokens":0,"session_id":"<SID1>","type":"response"}
+{"_exit":0}

@@ -615,6 +615,23 @@ fn thin_client_from<I: IntoIterator<Item = String>>(
     }
 }
 
+/// `synaps rpc …` (`rpc` the first positional, after any top-level
+/// options): runs on a current-thread runtime.
+fn is_rpc<I: IntoIterator<Item = String>>(args: I) -> bool {
+    let mut skip = false;
+    for a in args {
+        if std::mem::take(&mut skip) {
+            continue;
+        }
+        if a == "--profile" || VALUE_OPTS.contains(&a.as_str()) {
+            skip = true;
+        } else if !a.starts_with('-') {
+            return a == "rpc";
+        }
+    }
+    false
+}
+
 /// Set by `main` when a plain `synaps` found a running daemon: the clap
 /// branch runs the socket client with `--attach --new` semantics.
 static ADOPTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -759,6 +776,8 @@ fn main() -> anyhow::Result<()> {
     }
     // Before anything can report it (daemon `Welcome`, the client's skew check).
     agent_engine::session::wire::set_build_id(env!("SYNAPS_BUILD_ID"));
+    // Single-threaded here: nothing we spawn inherits a private daemon's dir.
+    agent_engine::daemon::registry::scope_daemon_dir_env();
     let mut thin = false;
     if let Some(mut kind) = thin_client() {
         // Before `ensure_daemon`: it reads config (idle-exit, process scopes).
@@ -789,7 +808,12 @@ fn main() -> anyhow::Result<()> {
         agent_core::core::memstat::ladder("main", &"");
         tui::client_diet::tune_allocator();
     }
-    let rt = if thin {
+    // `synaps rpc` is a daemon client too: one thread, no allocator threads.
+    let rpc = is_rpc(std::env::args().skip(1));
+    if rpc {
+        let _ = agent_core::core::memstat::set_background_threads(false);
+    }
+    let rt = if thin || rpc {
         tokio::runtime::Builder::new_current_thread().enable_all().thread_name("synaps-rt").build()?
     } else {
         let mut builder = tokio::runtime::Builder::new_multi_thread();
@@ -1092,7 +1116,7 @@ async fn async_main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod worker_threads_tests {
-    use super::{thin_client_from, worker_threads_from};
+    use super::{is_rpc, thin_client_from, worker_threads_from};
 
     fn v(a: &[&str]) -> Vec<String> {
         a.iter().map(|s| s.to_string()).collect()
@@ -1291,6 +1315,18 @@ mod worker_threads_tests {
             };
             assert_eq!(profile.as_deref(), Some("pinned"));
         }
+    }
+
+    #[test]
+    fn is_rpc_matrix() {
+        let v = |s: &str| s.split_whitespace().map(String::from).collect::<Vec<_>>();
+        assert!(is_rpc(v("rpc")));
+        assert!(is_rpc(v("rpc -m x --system f")));
+        assert!(is_rpc(v("--profile p rpc")));
+        assert!(!is_rpc(v("--profile rpc")));
+        assert!(!is_rpc(v("--system rpc")));
+        assert!(!is_rpc(v("attach rpc")));
+        assert!(!is_rpc(v("")));
     }
 
     #[test]

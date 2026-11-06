@@ -4206,11 +4206,11 @@ impl SessionActor {
             ));
             return;
         }
-        let disclosure =
-            preview_compaction_disclosure(&self.runtime, &self.conv.api_messages).render_line();
+        let disclosure = preview_compaction_disclosure(&self.runtime, &self.conv.api_messages);
         self.emit(SessionEventWire::CompactionStarted {
             source: source.to_string(),
-            disclosure,
+            disclosure: disclosure.render_line(),
+            detail: serde_json::to_value(&disclosure).ok(),
         });
         let msgs = self.conv.api_messages.clone();
         let rt: Runtime = (*self.runtime).clone();
@@ -4310,6 +4310,7 @@ impl SessionActor {
                             chains_advanced: applied.chains_advanced,
                             queued_restored: queued,
                             msg_count,
+                            summary: Some(outcome.summary_text.clone()),
                         });
                     }
                     Err(e) => self.emit(SessionEventWire::CompactionFailed {
@@ -4703,7 +4704,11 @@ impl SessionActor {
             SessionQuery::PromptInspection => {
                 serde_json::to_value(self.runtime.prompt_inspection_json()).unwrap_or_default()
             }
-            SessionQuery::ToolsSchema => serde_json::json!({ "unsupported": "tools_schema" }),
+            SessionQuery::ToolsSchema => {
+                let registry = self.runtime.tools_shared();
+                let guard = registry.read().await;
+                serde_json::Value::Array(guard.tools_schema().as_ref().clone())
+            }
             SessionQuery::View => serde_json::to_value(&**self.view.load()).unwrap_or_default(),
             SessionQuery::ContextAssessment => {
                 let a = self.runtime.assess_context(&self.conv.api_messages).await;
@@ -5393,9 +5398,28 @@ impl SessionActor {
             }
             SessionCommand::Answer { prompt_id, value } => self.answer(from, prompt_id, value),
             SessionCommand::Set { id, setting } => self.apply_setting(id, setting).await,
-            // `CompactionStarted` is the contract; no notice before it.
+            // `CompactionStarted` is the contract; no notice before it. An
+            // rpc client's compaction that cannot start is refused to it
+            // (it waits for exactly one answer); others get the notice.
             SessionCommand::Compact { instructions } => {
-                self.compact(instructions, "manual").await;
+                let busy = if self.compact.is_some() {
+                    Some("compaction already in progress")
+                } else if self.streaming {
+                    Some("cannot compact while a turn is running")
+                } else {
+                    None
+                };
+                let rpc = from.filter(|c| self.attached.get(c).is_some_and(|a| a.meta.kind == ClientKind::Rpc));
+                match (busy, rpc) {
+                    (Some(reason), Some(client)) if !Self::compact_inline_env() => {
+                        self.emit(SessionEventWire::Refused {
+                            client,
+                            command: "compact".into(),
+                            reason: reason.into(),
+                        });
+                    }
+                    _ => self.compact(instructions, "manual").await,
+                }
             }
             SessionCommand::NewSession => {
                 if self.driver.is_some() {
