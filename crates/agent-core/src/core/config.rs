@@ -462,7 +462,7 @@ pub struct ServerConfig {
     /// Pre-shared authentication token. If set, clients must provide it on WebSocket upgrade
     /// via `?token=X` query param or `Authorization: Bearer X` header. If None, auto-generated on boot.
     pub token: Option<String>,
-    /// When true, `HookResult::Confirm` is auto-approved without prompting (useful for headless/agent mode).
+    /// When true, `HookResult::Confirm` is auto-approved without prompting (useful for headless clients).
     pub auto_approve_confirms: bool,
     /// Maximum inbound message size in bytes. Defaults to context_window * 4 (rough token→byte estimate).
     /// None means no artificial cap.

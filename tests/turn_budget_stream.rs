@@ -250,11 +250,8 @@ async fn tool_call_budget_synthesizes_results_beyond_exact_allowance() {
     assert_eq!(results[0].0, "toolu_c1");
     assert_eq!(results[1].0, "toolu_c2");
     assert_eq!(results[2].0, "toolu_c3");
-    assert!(
-        results[2].1.contains("budget"),
-        "synthetic result names the budget: {}",
-        results[2].1
-    );
+    assert_eq!(results[2].1, synaps_cli::runtime::budget::TOOL_CALL_BUDGET_REFUSAL);
+    assert!(!results[2].1.contains("Canceled by user"));
     assert!(!results[0].1.contains("budget"));
 }
 

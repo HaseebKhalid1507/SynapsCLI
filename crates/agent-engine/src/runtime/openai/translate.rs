@@ -134,10 +134,7 @@ pub fn tools_to_oai(schema: &[Value]) -> (Vec<ToolDefinition>, ToolNameMap) {
         .filter_map(|t| {
             let name = t.get("name")?.as_str()?.to_string();
             // Skip empty names and internal-only tools
-            if name.is_empty()
-                || name == "respond"
-                || name == "send_channel"
-            {
+            if name.is_empty() || name == "respond" || name == "send_channel" {
                 return None;
             }
             let mut oai_name = sanitize_oai_tool_name(&name);
