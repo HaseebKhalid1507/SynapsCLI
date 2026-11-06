@@ -964,8 +964,8 @@ impl PingTask {
 /// - Test clients never do.
 /// - Nothing does for an owned session (`KeepWarmState::owned`).
 ///
-/// `synaps rpc` (stdin/stdout JSON) is a daemon client (`ClientKind::Rpc`):
-/// the headless rule applies to it.
+/// `synaps rpc` (stdin/stdout JSON) is a daemon client on an owned
+/// session: the owned rule applies to it.
 pub(crate) fn client_qualifies(kind: ClientKind, mode: AttachMode, headless: bool) -> bool {
     if mode == AttachMode::Observe {
         return false;
