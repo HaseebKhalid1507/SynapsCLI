@@ -253,6 +253,11 @@ session gives them: it is bound to the connection that created it.
 - **Never parked, idle-ended or pinned**: `synaps daemon pin` and `/pin`
   (`KeepWarm{on}`) are refused ("owned by the client that created it … cannot be
   pinned or kept warm"); `synaps attach --owned --keep-warm` is a usage error.
+- **Never cache keep-warm**: no keep-warm period starts for an owned session,
+  whatever `cache_keepwarm`, `cache_keepwarm_headless` or its clients say, and
+  `/keepwarm <mode>` is refused (`/keepwarm status` still answers). Those pings
+  would be spend the owning client (rpc, chat) never sees in its usage
+  frames.
 - **Afterwards**: the journal is an ordinary one. `--continue` loads it as a
   normal (unowned) session.
 - **Idle exit**: a live owner counts as a client like any other. Once it leaves,

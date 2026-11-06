@@ -15,7 +15,9 @@ All notable changes to this project will be documented in this file.
   headless callers abort and time out by. Only the owner drives an owned
   session (others watch); an owner that lags is disconnected
   (`Bye{owner_lagged}`) rather than losing frames. Owned sessions never
-  park, idle-end or pin. After `synaps daemon reload` the owner re-binds
+  park, idle-end or pin, and never keep the prompt cache warm
+  (`cache_keepwarm_headless` does not apply to them). After `synaps daemon
+  reload` the owner re-binds
   with a token within `SYNAPS_DAEMON_OWNER_REBIND_SECS` (30 s, counted from
   when the new daemon accepts connections; never later than
   `SYNAPS_DAEMON_OWNER_RESTORE_CAP_SECS`, 300 s, plus the grace), else the

@@ -464,7 +464,10 @@ time, so the owner opts in). `Observe` attaches and test clients never do.
 `synaps rpc` (stdin/stdout JSON) runs its own runtime without the session
 actor, so keep-warm cannot reach it either way; drive the daemon instead
 (`synaps chat`, or an rpc/server client attached to a daemon session) and
-turn on `cache_keepwarm_headless`.
+turn on `cache_keepwarm_headless`. An **owned** session (bound to the client
+that created it, `docs/daemon-mode.md`) never keeps warm, opt-in or not, and
+refuses `/keepwarm <mode>`: its pings would be spend its owning client never
+sees in its usage frames.
 
 Per session: `/keepwarm [status|off|auto|<N>h]`. `auto` stops by the cost
 bound below or `cache_keepwarm_auto_max_hours` after the session went idle
