@@ -987,6 +987,7 @@ impl PrivateDir {
                 return;
             }
         }
+        daemon::flush_private_stderr(Duration::from_millis(300));
         if let Err(e) = std::fs::remove_dir_all(&self.dir) {
             tracing::debug!(dir = %self.dir.display(), error = %e, "rpc: private run dir not removed");
         }

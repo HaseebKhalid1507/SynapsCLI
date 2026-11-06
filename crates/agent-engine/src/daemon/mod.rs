@@ -707,6 +707,22 @@ fn spawn_env(opts: &DaemonOpts, env: &mut Vec<(std::ffi::OsString, std::ffi::OsS
     }
 }
 
+/// The threads copying private daemons' stderr to ours.
+static STDERR_COPIERS: Mutex<Vec<std::thread::JoinHandle<()>>> = Mutex::new(Vec::new());
+
+/// After a private daemon exited: give its stderr copier up to `wait` to
+/// reach EOF, so what the daemon printed (a startup warning, a panic) is
+/// not lost when this process exits right after. A descendant still
+/// holding the pipe only costs the wait.
+pub fn flush_private_stderr(wait: Duration) {
+    let deadline = Instant::now() + wait;
+    let mut copiers = std::mem::take(&mut *STDERR_COPIERS.lock().unwrap_or_else(|e| e.into_inner()));
+    while !copiers.is_empty() && Instant::now() < deadline {
+        copiers.retain(|h| !h.is_finished());
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 /// Write `buf` to this process's stderr without ever blocking: a parent
 /// that pipes stderr and never reads it must not stall us (nor, through a
 /// copied pipe, a private daemon). Chunks that do not fit right now are
@@ -871,7 +887,7 @@ pub fn spawn_detached(opts: &DaemonOpts) -> anyhow::Result<u32> {
         // ours (lossy, never blocking); a shared daemon's is discarded.
         if let Some(mut err) = child.stderr.take() {
             let private = opts.private;
-            let _ = std::thread::Builder::new().name("daemon-stderr".into()).spawn(move || {
+            let copier = std::thread::Builder::new().name("daemon-stderr".into()).spawn(move || {
                 if !private {
                     let _ = std::io::copy(&mut err, &mut std::io::sink());
                     return;
@@ -888,6 +904,9 @@ pub fn spawn_detached(opts: &DaemonOpts) -> anyhow::Result<u32> {
                     }
                 }
             });
+            if let (true, Ok(handle)) = (private, copier) {
+                STDERR_COPIERS.lock().unwrap_or_else(|e| e.into_inner()).push(handle);
+            }
         }
         drop(child);
         return Ok(pid);
