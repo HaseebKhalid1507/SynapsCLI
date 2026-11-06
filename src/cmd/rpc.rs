@@ -337,6 +337,15 @@ enum PendingQuery {
     Tools(Option<String>),
 }
 
+impl PendingQuery {
+    fn into_id(self) -> Option<String> {
+        match self {
+            Self::Messages(i) | Self::State(i) | Self::Stats(i) => Some(i),
+            Self::Tools(i) => i,
+        }
+    }
+}
+
 struct PendingCompact {
     id: String,
     disclosure: Option<serde_json::Value>,
@@ -413,13 +422,7 @@ impl Bridge {
             Ok(()) => {
                 self.queries.insert(id, pending);
             }
-            Err(e) => {
-                let rid = match pending {
-                    PendingQuery::Messages(i) | PendingQuery::State(i) | PendingQuery::Stats(i) => Some(i),
-                    PendingQuery::Tools(i) => i,
-                };
-                self.error(rid, e).await;
-            }
+            Err(e) => self.error(pending.into_id(), e).await,
         }
     }
 
@@ -707,7 +710,17 @@ impl Bridge {
                         return Ok(());
                     }
                 }
-                self.error(None, format!("{command} refused: {reason}")).await;
+                // The actor answers in order: the oldest request of that kind.
+                let id = match command.as_str() {
+                    "set" => self.settings.keys().min().copied().and_then(|k| self.settings.remove(&k)).map(|(id, _)| Some(id)),
+                    "new_session" => self.new_sessions.pop_front().map(Some),
+                    "query" => self.queries.keys().min().copied().and_then(|k| self.queries.remove(&k)).map(PendingQuery::into_id),
+                    _ => None,
+                };
+                match id {
+                    Some(id) => self.error(id, reason).await,
+                    None => self.error(None, format!("{command} refused: {reason}")).await,
+                }
             }
             // Headless: nobody can answer a confirm/secret prompt — deny it,
             // fail-closed, so the turn never waits on it.
@@ -773,11 +786,7 @@ impl Bridge {
 
     async fn on_query_result(&self, pending: PendingQuery, value: serde_json::Value) {
         if let Some(err) = value.get("error").and_then(|e| e.as_str()) {
-            let id = match pending {
-                PendingQuery::Messages(i) | PendingQuery::State(i) | PendingQuery::Stats(i) => Some(i),
-                PendingQuery::Tools(i) => i,
-            };
-            self.error(id, err.to_string()).await;
+            self.error(pending.into_id(), err.to_string()).await;
             return;
         }
         let messages = || value.get("messages").cloned().unwrap_or_else(|| self.t.messages().len().into());
@@ -841,11 +850,7 @@ impl Bridge {
         let queries: Vec<PendingQuery> = self.queries.drain().map(|(_, q)| q).collect();
         for q in queries {
             answered = true;
-            let id = match q {
-                PendingQuery::Messages(i) | PendingQuery::State(i) | PendingQuery::Stats(i) => Some(i),
-                PendingQuery::Tools(i) => i,
-            };
-            self.error(id, why).await;
+            self.error(q.into_id(), why).await;
         }
         let settings: Vec<String> = self.settings.drain().map(|(_, (id, _))| id).collect();
         let news: Vec<String> = self.new_sessions.drain(..).collect();
