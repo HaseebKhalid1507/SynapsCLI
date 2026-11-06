@@ -42,7 +42,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::sync::{mpsc, oneshot, Notify};
+use tokio::sync::{mpsc, oneshot, watch, Notify};
 use tokio::time::Instant;
 
 use agent_engine::daemon::{self, registry, EnsureError, EXIT_DAEMON_LOST, EXIT_REFUSED, EXIT_VERSION};
@@ -127,6 +127,8 @@ struct Out {
     tx: mpsc::UnboundedSender<String>,
     queued: Arc<AtomicUsize>,
     drained: Arc<Notify>,
+    /// SIGTERM: never park at the cap any more (the exit path must run).
+    term: watch::Receiver<bool>,
 }
 
 impl Out {
@@ -135,10 +137,14 @@ impl Out {
         let n = line.len() + 1;
         loop {
             let drained = self.drained.notified();
-            if self.queued.load(Ordering::Acquire) < OUT_QUEUE_CAP || self.tx.is_closed() {
+            if self.queued.load(Ordering::Acquire) < OUT_QUEUE_CAP || self.tx.is_closed() || *self.term.borrow() {
                 break;
             }
-            drained.await;
+            let mut term = self.term.clone();
+            tokio::select! {
+                _ = drained => {}
+                _ = term.wait_for(|t| *t) => {}
+            }
         }
         self.queued.fetch_add(n, Ordering::AcqRel);
         if self.tx.send(line).is_err() {
@@ -150,10 +156,10 @@ impl Out {
 /// The one thread that owns stdout (blocking writes never hold up the
 /// runtime). A closed stdout ends it (the parent is gone). `done` fires
 /// when every frame is written or stdout closed.
-fn spawn_writer() -> (Out, oneshot::Receiver<()>) {
+fn spawn_writer(term: watch::Receiver<bool>) -> (Out, oneshot::Receiver<()>) {
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
     let (queued, drained) = (Arc::new(AtomicUsize::new(0)), Arc::new(Notify::new()));
-    let out = Out { tx, queued: Arc::clone(&queued), drained: Arc::clone(&drained) };
+    let out = Out { tx, queued: Arc::clone(&queued), drained: Arc::clone(&drained), term };
     let (done_tx, done) = oneshot::channel();
     // A thread, not the (current-thread) runtime: a blocking stdout write
     // must never hold up reading the daemon socket.
@@ -1115,7 +1121,8 @@ pub async fn run(
     };
 
     // 5. Writer, then Ready — the first byte on stdout.
-    let (out, writer) = spawn_writer();
+    let mut term = term_watch();
+    let (out, writer) = spawn_writer(term.clone());
     out.send(&RpcEvent::Ready {
         session_id: snap.conversation.header.id.clone(),
         model: snap.view.model.clone(),
@@ -1143,7 +1150,7 @@ pub async fn run(
     // 6. Translate. stdin is not read while reconnecting, compacting or
     //    shutting down: the pipe buffers it. The daemon socket is always
     //    read: frames queue for stdout (see `Out`).
-    let mut sigterm = term_signal();
+    let mut term_rebind = term.clone();
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     let mut shutdown: Option<Instant> = None;
     let far = || Instant::now() + Duration::from_secs(3600);
@@ -1173,7 +1180,11 @@ pub async fn run(
                         b.cut("interrupted by a session daemon reload").await;
                         // Terminal on any error, including the daemon
                         // refusing a re-bind to a session that ended.
-                        if let Err(e) = b.t.reconnect(AttachMode::Mirror).await {
+                        let rebound = tokio::select! {
+                            r = b.t.reconnect(AttachMode::Mirror) => r,
+                            _ = term_rebind.wait_for(|t| *t) => break Exit::Term,
+                        };
+                        if let Err(e) = rebound {
                             break Exit::Lost(format!("could not reconnect after a daemon reload: {e}"));
                         }
                         continue;
@@ -1219,7 +1230,7 @@ pub async fn run(
                     b.error(Some(c.id), "compaction timed out").await;
                 }
             }
-            _ = sigterm.recv() => break Exit::Term,
+            _ = term.wait_for(|t| *t) => break Exit::Term,
             _ = tokio::time::sleep_until(deadline), if shutdown.is_some() => {
                 tracing::warn!("shutdown: in-flight turn did not finish within 30 s; ending anyway");
                 break Exit::Shutdown;
@@ -1280,6 +1291,20 @@ impl TermSignal {
         }
         std::future::pending::<()>().await
     }
+}
+
+/// SIGTERM as a latch every waiter can see (the main loop, a reconnect, a
+/// send parked at the stdout cap).
+fn term_watch() -> watch::Receiver<bool> {
+    let (tx, rx) = watch::channel(false);
+    let mut sig = term_signal();
+    tokio::spawn(async move {
+        sig.recv().await;
+        let _ = tx.send(true);
+        // Keep the sender: a closed channel would read as "never".
+        std::future::pending::<()>().await
+    });
+    rx
 }
 
 fn term_signal() -> TermSignal {
