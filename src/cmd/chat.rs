@@ -307,14 +307,17 @@ async fn rebind_or_lost(t: &mut SocketTransport, r: &mut Render) {
                 r.streaming = snap.streaming;
                 r.idle = !snap.streaming;
             }
-            Err(e) => lost(&format!("the daemon reloaded and the session could not be re-bound: {e}")),
+            Err(e) => lost(&format!("the daemon reloaded and the session could not be re-bound: {e}"), &r.current_id),
         },
-        Some(TransportError::OwnerLagged { dropped }) => lost(&format!(
-            "chat fell behind the session's event stream ({dropped} event(s) dropped; is stdout blocked?) \
-             and the daemon disconnected it rather than drop output"
-        )),
-        Some(e) => lost(&e.to_string()),
-        None => lost("the daemon closed the connection"),
+        Some(TransportError::OwnerLagged { dropped }) => lost(
+            &format!(
+                "chat fell behind the session's event stream ({dropped} event(s) dropped; is stdout blocked?) \
+                 and the daemon disconnected it rather than drop output"
+            ),
+            &r.current_id,
+        ),
+        Some(e) => lost(&e.to_string(), &r.current_id),
+        None => lost("the daemon closed the connection", &r.current_id),
     }
 }
 
@@ -337,11 +340,11 @@ fn ended_under_us(reason: EndReason, session_id: &str) -> ! {
     pump::exit(EXIT_DAEMON_LOST);
 }
 
-fn lost(why: &str) -> ! {
+fn lost(why: &str, session_id: &str) -> ! {
     r_end_thinking_raw();
     errln!(
         "synaps chat: lost the session: {why}\n  the session ended with this connection (its journal is kept); \
-         resume it with `synaps chat --continue <id>`"
+         resume it with `synaps chat --continue {session_id}`"
     );
     pump::exit(EXIT_DAEMON_LOST);
 }
@@ -364,8 +367,9 @@ fn no_daemon(profile: Option<&str>, no_extensions: bool, error: Option<&str>) ->
 }
 
 /// Entry point: connect to (or start) the profile's daemon and run an owned
-/// session over its socket. Everything printed is written out before this
-/// returns.
+/// session over its socket. `profile` is the one in effect (`--profile`,
+/// else `SYNAPS_PROFILE`, pinned by `main`): it picks the daemon socket.
+/// Everything printed is written out before this returns.
 pub async fn run(
     continue_session: Option<String>,
     system: Option<String>,
@@ -422,30 +426,6 @@ async fn run_session(
             no_daemon(profile.as_deref(), no_extensions, Some(&format!("could not start it: {reason}")))
         }
     }
-    let conn = match SocketTransport::connect(&paths.sock, Hello::new(ClientKind::Chat)).await {
-        Ok(c) => c,
-        Err(TransportError::Version { client, daemon }) => {
-            errln!(
-                "synaps chat: protocol version mismatch (client {client}, daemon {daemon}); \
-                 run `synaps daemon reload` to restart the daemon on this binary"
-            );
-            pump::exit(EXIT_VERSION);
-        }
-        Err(e) => no_daemon(profile.as_deref(), no_extensions, Some(&format!("{}: {e}", paths.sock.display()))),
-    };
-    if let Some(msg) = daemon::profile_mismatch(conn.welcome.profile.as_deref(), profile.as_deref()) {
-        errln!("synaps chat: {msg}");
-        pump::exit(EXIT_REFUSED);
-    }
-    if conn.welcome.supports(FEATURE_NO_EXTENSIONS) != no_extensions {
-        errln!(
-            "synaps chat: the daemon at {} {} extensions; refusing to run this session there",
-            paths.sock.display(),
-            if no_extensions { "runs" } else { "does not run" }
-        );
-        pump::exit(EXIT_REFUSED);
-    }
-
     // The session runs where chat runs. `--system` keeps its in-process
     // meaning: an existing file (relative to this cwd) is read here, any
     // other value is the prompt text itself.
@@ -462,16 +442,62 @@ async fn run_session(
         cwd: Some(cwd),
         ..SessionConfig::default()
     };
-    let (mut t, snap) = match SocketTransport::attach(
-        conn,
-        Attach::create_owned(session_cfg, AttachMode::Mirror, true),
-    )
-    .await
-    {
-        Ok(x) => x,
-        Err(e) => {
-            errln!("synaps chat: could not create the session in the daemon: {e}");
-            pump::exit(EXIT_REFUSED);
+    // A daemon that is idle-exiting (or being stopped) has stopped
+    // accepting but holds its flock for a few seconds more, so
+    // `ensure_running` saw it alive: once it is gone, ensure again and
+    // retry, once.
+    let mut retried = false;
+    let (mut t, snap) = loop {
+        let gone = match SocketTransport::connect(&paths.sock, Hello::new(ClientKind::Chat)).await {
+            Ok(conn) => {
+                if let Some(msg) = daemon::profile_mismatch(conn.welcome.profile.as_deref(), profile.as_deref()) {
+                    errln!("synaps chat: {msg}");
+                    pump::exit(EXIT_REFUSED);
+                }
+                if conn.welcome.supports(FEATURE_NO_EXTENSIONS) != no_extensions {
+                    errln!(
+                        "synaps chat: the daemon at {} {} extensions; refusing to run this session there",
+                        paths.sock.display(),
+                        if no_extensions { "runs" } else { "does not run" }
+                    );
+                    pump::exit(EXIT_REFUSED);
+                }
+                match SocketTransport::attach(conn, Attach::create_owned(session_cfg.clone(), AttachMode::Mirror, true))
+                    .await
+                {
+                    Ok(x) => break x,
+                    // `Bye` (or EOF) before `Attached`: the daemon is going.
+                    Err(e @ (TransportError::Closed | TransportError::Io(_))) => {
+                        format!("{}: the daemon closed the connection before the session was created ({e})", paths.sock.display())
+                    }
+                    Err(e) => {
+                        errln!("synaps chat: could not create the session in the daemon: {e}");
+                        pump::exit(EXIT_REFUSED);
+                    }
+                }
+            }
+            Err(TransportError::Version { client, daemon }) => {
+                errln!(
+                    "synaps chat: protocol version mismatch (client {client}, daemon {daemon}); \
+                     run `synaps daemon reload` to restart the daemon on this binary"
+                );
+                pump::exit(EXIT_VERSION);
+            }
+            Err(e) => format!("{}: {e}", paths.sock.display()),
+        };
+        if retried {
+            no_daemon(profile.as_deref(), no_extensions, Some(&gone));
+        }
+        retried = true;
+        let again = opts.clone();
+        match tokio::task::spawn_blocking(move || daemon::ensure_after_exit(&again)).await {
+            Ok(Ok(Some(_))) => continue,
+            Ok(Ok(None)) => no_daemon(profile.as_deref(), no_extensions, Some(&gone)),
+            Ok(Err(EnsureError::AutospawnDisabled)) => no_daemon(profile.as_deref(), no_extensions, None),
+            Ok(Err(EnsureError::Spawn(reason))) => {
+                no_daemon(profile.as_deref(), no_extensions, Some(&format!("could not start it: {reason}")))
+            }
+            Err(e) => no_daemon(profile.as_deref(), no_extensions, Some(&format!("daemon start: {e}"))),
         }
     };
     if let Some(p) = agent_prompt {
@@ -840,7 +866,7 @@ async fn end_session(t: &mut SocketTransport, r: &mut Render) {
         }
     };
     if tokio::time::timeout(budget, wait).await.is_err() {
-        lost(&format!("the session did not confirm its end within {} s", budget.as_secs()));
+        lost(&format!("the session did not confirm its end within {} s", budget.as_secs()), &r.current_id);
     }
 }
 
@@ -855,9 +881,9 @@ const END_MARGIN_SECS: u64 = 10;
 /// pipe) must not do that, so nothing chat prints is written on the reader's
 /// path: stdout and stderr chunks go, in order, through one queue that a
 /// writer thread drains (flushing each, as the old `flush_stdout` calls did).
-/// A blocked stdout only grows the queue; past [`QUEUE_CAP`] bytes output is
-/// dropped and counted instead, and the count is reported on stderr once the
-/// queue drains. A stdout write error (the reader went away) ends chat
+/// A blocked stdout only grows the queue; past `QUEUE_CAP` (memory: text
+/// allocation plus per-chunk overhead) new output is dropped and counted
+/// instead, and the count is reported on stderr once the queue drains. A stdout write error (the reader went away) ends chat
 /// (exit 1), as a failed `print!` did; the owned session ends with it.
 mod pump {
     use std::io::Write;
@@ -865,13 +891,23 @@ mod pump {
     use std::sync::mpsc::{channel, sync_channel, Receiver, Sender, SyncSender};
     use std::sync::OnceLock;
 
-    /// Bytes queued (not yet written) before output is dropped.
+    /// Memory the queue may hold before output is dropped: each chunk is
+    /// charged its heap allocation plus [`CHUNK_OVERHEAD`], so a stream of
+    /// tiny deltas cannot hold far more than this in node overhead.
     const QUEUE_CAP: usize = 64 << 20;
+    /// The queue node and `String` header a chunk costs beyond its text
+    /// (`Chunk` plus the channel's slot, rounded up).
+    const CHUNK_OVERHEAD: usize = 64;
 
+    /// A chunk of text and what it is charged against [`QUEUE_CAP`].
     enum Chunk {
-        Out(String),
-        Err(String),
+        Out(String, usize),
+        Err(String, usize),
         Barrier(SyncSender<()>),
+    }
+
+    fn cost(s: &str, capacity: usize) -> usize {
+        capacity.max(s.len()) + CHUNK_OVERHEAD
     }
 
     struct Pump {
@@ -893,27 +929,30 @@ mod pump {
         })
     }
 
-    fn push(chunk: Chunk, len: usize) {
+    /// Queue a chunk, or past the cap drop it: its text is lost (counted,
+    /// and reported on stderr once the queue drains), later chunks queue
+    /// again as soon as there is room. The session is never affected.
+    fn push(chunk: Chunk, text_len: usize, cost: usize) {
         let p = pump();
-        if p.queued.load(Ordering::SeqCst) + len > QUEUE_CAP {
-            p.dropped.fetch_add(len, Ordering::SeqCst);
+        if p.queued.load(Ordering::SeqCst) + cost > QUEUE_CAP {
+            p.dropped.fetch_add(text_len, Ordering::SeqCst);
             return;
         }
-        p.queued.fetch_add(len, Ordering::SeqCst);
+        p.queued.fetch_add(cost, Ordering::SeqCst);
         let _ = p.tx.send(chunk);
     }
 
     pub(super) fn out(s: String) {
         if !s.is_empty() {
-            let n = s.len();
-            push(Chunk::Out(s), n);
+            let (n, c) = (s.len(), cost(&s, s.capacity()));
+            push(Chunk::Out(s, c), n, c);
         }
     }
 
     pub(super) fn err(s: String) {
         if !s.is_empty() {
-            let n = s.len();
-            push(Chunk::Err(s), n);
+            let (n, c) = (s.len(), cost(&s, s.capacity()));
+            push(Chunk::Err(s, c), n, c);
         }
     }
 
@@ -936,21 +975,21 @@ mod pump {
         for chunk in rx {
             let p = PUMP.get().expect("the pump is set before its first chunk");
             match chunk {
-                Chunk::Out(s) => {
+                Chunk::Out(s, cost) => {
                     let mut o = std::io::stdout().lock();
                     let r = o.write_all(s.as_bytes()).and_then(|()| o.flush());
                     drop(o);
-                    p.queued.fetch_sub(s.len(), Ordering::SeqCst);
+                    p.queued.fetch_sub(cost, Ordering::SeqCst);
                     if let Err(e) = r {
                         let _ = writeln!(std::io::stderr(), "synaps chat: stdout: {e}");
                         std::process::exit(1);
                     }
                 }
-                Chunk::Err(s) => {
+                Chunk::Err(s, cost) => {
                     let mut e = std::io::stderr().lock();
                     let _ = e.write_all(s.as_bytes()).and_then(|()| e.flush());
                     drop(e);
-                    p.queued.fetch_sub(s.len(), Ordering::SeqCst);
+                    p.queued.fetch_sub(cost, Ordering::SeqCst);
                 }
                 Chunk::Barrier(done) => {
                     let _ = done.send(());

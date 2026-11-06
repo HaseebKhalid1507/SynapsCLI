@@ -3,9 +3,10 @@
 //! lifecycle (PLAN-phase2 §2.11). Lives in `agent-engine`
 //! (S289 D-1 amended) — `agent-tui` must never appear in this graph.
 //!
-//! On by default: the first `--attach`/`attach` client auto-spawns the
-//! daemon ([`ensure_running`]); `SYNAPS_DAEMON=0` disables every daemon
-//! feature (exit 3 with a one-line reason). Safety properties that are
+//! The only mode: every session runs here, and the first client (`synaps`,
+//! `--attach`, `attach`, `chat`) auto-spawns the daemon
+//! ([`ensure_running`]); `SYNAPS_DAEMON=0` is ignored with a warning
+//! ([`legacy_env_warning`]). Safety properties that are
 //! NEVER stubbed: the flock liveness oracle, the ready-fd pipe, socket
 //! perms 0700/0600, the spawn lock (one spawner per registry dir). On
 //! Windows the same properties hold with native mechanisms ([`win`]): the
@@ -662,6 +663,19 @@ pub fn signal_ready() {
             let _ = libc::write(fd, b"R".as_ptr() as *const libc::c_void, 1);
             libc::close(fd);
         }
+        // The spawner drains our stderr pipe only while it lives (a chat
+        // exits long before its daemon): point stdout/stderr at /dev/null
+        // so a later `eprintln!` never hits EPIPE, which panics. As
+        // `win::detach_stdio` does on Windows.
+        // SAFETY: plain fd calls on a fresh descriptor and fds 1/2.
+        unsafe {
+            let null = libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC);
+            if null >= 0 {
+                libc::dup2(null, 1);
+                libc::dup2(null, 2);
+                libc::close(null);
+            }
+        }
     }
     #[cfg(windows)]
     {
@@ -949,6 +963,66 @@ pub fn ensure_running(opts: &DaemonOpts) -> Result<Ensured, EnsureError> {
     ensure_running_with(opts, autospawn_enabled(), spawn_detached, || {})
 }
 
+/// A Unix socket path longer than `sun_path` can neither be bound nor
+/// dialled (`SYNAPS_BASE_DIR` on a deep mount, EFS): name the fix instead
+/// of a bare bind error. `None` when it fits (and on Windows: named pipes).
+pub fn socket_path_too_long(sock: &std::path::Path) -> Option<String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        // SAFETY: `sockaddr_un` is plain data; all-zero is a valid value.
+        let max = unsafe { std::mem::zeroed::<libc::sockaddr_un>() }.sun_path.len() - 1;
+        let len = sock.as_os_str().as_bytes().len();
+        if len > max {
+            return Some(format!(
+                "the daemon socket path {} is {len} bytes, over the {max}-byte Unix socket limit; \
+                 set SYNAPS_RUNTIME_DIR to a short directory (e.g. $XDG_RUNTIME_DIR/synaps or /tmp/synaps-$USER)",
+                sock.display()
+            ));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = sock;
+    None
+}
+
+/// [`ensure_running`] once more, for a client whose daemon answered
+/// `Running` but then would not serve it (connect refused, or `Bye` before
+/// `Attached`). An exiting daemon (idle exit, `daemon stop`) stops accepting
+/// before its teardown (sessions saved, extensions shut down: seconds)
+/// releases the flock, and in that window `ensure_running` still sees it
+/// alive. Waits, at most [`SPAWN_LOCK_WAIT`], for the flock to go — probing
+/// under the spawn lock, as `ensure_running` does, so the probe never takes
+/// the flock from a daemon being spawned — then ensures again (a fresh
+/// daemon). `Ok(None)`: the daemon never went (alive, refusing for another
+/// reason); the caller's error stands.
+pub fn ensure_after_exit(opts: &DaemonOpts) -> Result<Option<Ensured>, EnsureError> {
+    ensure_after_exit_with(opts, SPAWN_LOCK_WAIT, ensure_running)
+}
+
+fn ensure_after_exit_with(
+    opts: &DaemonOpts,
+    wait: Duration,
+    ensure: impl FnOnce(&DaemonOpts) -> Result<Ensured, EnsureError>,
+) -> Result<Option<Ensured>, EnsureError> {
+    let paths = opts.paths();
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        let alive = {
+            let _spawn = registry::SpawnLock::acquire(&paths, wait)
+                .map_err(|e| EnsureError::Spawn(format!("spawn lock {}: {e}", paths.spawn_lock().display())))?;
+            registry::is_alive(&paths)
+        };
+        if !alive {
+            return ensure(opts).map(Some);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Ok(None);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 // Keep the real cleanup/probe/locking path testable without spawning the unit
 // test executable. The hook marks entry to the lock attempt, not readiness.
 fn ensure_running_with(
@@ -958,6 +1032,9 @@ fn ensure_running_with(
     before_spawn_lock: impl FnOnce(),
 ) -> Result<Ensured, EnsureError> {
     let paths = opts.paths();
+    if let Some(why) = socket_path_too_long(&paths.sock) {
+        return Err(EnsureError::Spawn(why));
+    }
     if !auto {
         // Preserve the disabled path: no spawn-lock dependency, even warm.
         registry::reap_stale(&paths);
@@ -1337,6 +1414,46 @@ mod ensure_tests {
     #[test]
     fn ensure_serializes_before_probe_with_stale_metadata() {
         serialization_case(true);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_socket_path_over_sun_path_names_synaps_runtime_dir() {
+        let deep = std::path::PathBuf::from(format!("/{}/daemon.sock", "d".repeat(120)));
+        let why = socket_path_too_long(&deep).expect("too long");
+        assert!(why.contains("SYNAPS_RUNTIME_DIR"), "{why}");
+        assert_eq!(socket_path_too_long(std::path::Path::new("/tmp/synaps/daemon.sock")), None);
+        let opts = DaemonOpts { runtime_dir: Some(deep.parent().unwrap().to_path_buf()), ..Default::default() };
+        let got = ensure_running_with(&opts, true, |_| panic!("never spawned"), || panic!("no spawn lock"));
+        assert!(matches!(got, Err(EnsureError::Spawn(ref w)) if w.contains("SYNAPS_RUNTIME_DIR")), "{got:?}");
+    }
+
+    /// A daemon past its accept loop but still holding the flock (idle exit
+    /// tearing down): the retry waits for the flock, then ensures again.
+    #[test]
+    fn ensure_after_exit_waits_for_the_exiting_daemon() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = DaemonOpts { runtime_dir: Some(dir.path().to_path_buf()), ..Default::default() };
+        let paths = opts.paths();
+        let dying = DaemonLock::try_acquire(&paths).unwrap().unwrap();
+        let t0 = std::time::Instant::now();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            drop(dying);
+        });
+        let got = ensure_after_exit_with(&opts, WAIT, |o| {
+            assert!(!registry::is_alive(&o.paths()), "ensured only once the flock is free");
+            Ok(Ensured::Spawned(7))
+        });
+        assert_eq!(got, Ok(Some(Ensured::Spawned(7))));
+        assert!(t0.elapsed() >= Duration::from_millis(300), "waited for the flock");
+        release.join().unwrap();
+
+        // Never released: give up at the bound, ensure nothing.
+        let alive = DaemonLock::try_acquire(&paths).unwrap().unwrap();
+        let got = ensure_after_exit_with(&opts, BLOCKED, |_| panic!("a live daemon is not re-ensured"));
+        assert_eq!(got, Ok(None));
+        drop(alive);
     }
 
     #[test]
