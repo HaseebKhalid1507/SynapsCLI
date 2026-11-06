@@ -12,7 +12,7 @@
 mod phase2;
 
 use std::io::{BufRead, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
@@ -117,15 +117,6 @@ async fn create_owned(sock: &Path, cwd: &Path, forward_secrets: bool) -> (Socket
     assert!(t.is_session_owner());
     let sid = t.session_id().clone();
     (t, sid, snap)
-}
-
-async fn create_plain(sock: &Path, cwd: &Path) -> SocketTransport {
-    let conn = SocketTransport::connect(sock, Hello::new(ClientKind::Test)).await.unwrap();
-    let (t, _) = SocketTransport::attach(conn, Attach::Create { config: config(cwd), mode: AttachMode::Mirror, owned: None })
-        .await
-        .expect("create plain");
-    assert!(!t.is_session_owner());
-    t
 }
 
 async fn observe(sock: &Path, sid: &SessionId) -> SocketTransport {
@@ -365,154 +356,170 @@ async fn idle_exit_fires_once_the_owned_session_ends() {
 
 // ── forward_secrets ─────────────────────────────────────────────────────────
 
-const DUMMY_SECRET: &str = "sdo3-dummy-secret-7f2c91ab5e";
+/// Needs the `bash` tool (`command-exec`).
+#[cfg(feature = "command-exec")]
+mod forward_secrets {
+    use super::*;
+    use std::path::PathBuf;
 
-/// Sets `GH_TOKEN` to the dummy secret; restores the previous value on
-/// drop, even if the test fails.
-struct SecretVar(Option<String>);
-impl SecretVar {
-    fn set() -> Self {
-        let prev = std::env::var("GH_TOKEN").ok();
-        std::env::set_var("GH_TOKEN", DUMMY_SECRET);
-        Self(prev)
+    async fn create_plain(sock: &Path, cwd: &Path) -> SocketTransport {
+        let conn = SocketTransport::connect(sock, Hello::new(ClientKind::Test)).await.unwrap();
+        let (t, _) = SocketTransport::attach(conn, Attach::Create { config: config(cwd), mode: AttachMode::Mirror, owned: None })
+            .await
+            .expect("create plain");
+        assert!(!t.is_session_owner());
+        t
     }
-}
-impl Drop for SecretVar {
-    fn drop(&mut self) {
-        match self.0.take() {
-            Some(v) => std::env::set_var("GH_TOKEN", v),
-            None => std::env::remove_var("GH_TOKEN"),
+
+    const DUMMY_SECRET: &str = "sdo3-dummy-secret-7f2c91ab5e";
+
+    /// Sets `GH_TOKEN` to the dummy secret; restores the previous value on
+    /// drop, even if the test fails.
+    struct SecretVar(Option<String>);
+    impl SecretVar {
+        fn set() -> Self {
+            let prev = std::env::var("GH_TOKEN").ok();
+            std::env::set_var("GH_TOKEN", DUMMY_SECRET);
+            Self(prev)
         }
     }
-}
-
-fn hex(s: &str) -> String {
-    s.bytes().map(|b| format!("{b:02x}")).collect()
-}
-
-fn sse_frames(blocks: &str, stop: &str) -> String {
-    format!(
-        concat!(
-            "data: {{\"type\":\"message_start\",\"message\":{{\"id\":\"msg_ow\",\"type\":\"message\",",
-            "\"role\":\"assistant\",\"content\":[],\"model\":\"claude-sonnet-4-5\",\"stop_reason\":null,",
-            "\"stop_sequence\":null,\"usage\":{{\"input_tokens\":10,\"output_tokens\":0,",
-            "\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0}}}}}}\n\n",
-            "{blocks}",
-            "data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"{stop}\",",
-            "\"stop_sequence\":null}},\"usage\":{{\"input_tokens\":10,\"output_tokens\":5,",
-            "\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0}}}}\n\n",
-            "data: {{\"type\":\"message_stop\"}}\n\n",
-        ),
-        blocks = blocks,
-        stop = stop,
-    )
-}
-
-/// `bash` printing `$GH_TOKEN` hex-encoded: the tool proves it saw the
-/// value without the value itself ever entering history.
-fn sse_bash_secret_hex() -> String {
-    let input = serde_json::json!({"command": "printf '%s' \"$GH_TOKEN\" | od -An -tx1 | tr -d ' \\n'; echo"});
-    let start = serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_sec","name":"bash","input":{}}});
-    let delta = serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":input.to_string()}});
-    let stop = serde_json::json!({"type":"content_block_stop","index":0});
-    sse_frames(&format!("data: {start}\n\ndata: {delta}\n\ndata: {stop}\n\n"), "tool_use")
-}
-
-fn sse_done() -> String {
-    let start = serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}});
-    let delta = serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"done"}});
-    let stop = serde_json::json!({"type":"content_block_stop","index":0});
-    sse_frames(&format!("data: {start}\n\ndata: {delta}\n\ndata: {stop}\n\n"), "end_turn")
-}
-
-/// One turn running the hex tool; returns the tool's output.
-async fn secret_turn(t: &mut SocketTransport) -> String {
-    t.send_from_self(SessionCommand::Submit { text: "show the token".into(), attachments: vec![] }).await.unwrap();
-    let mut result = None;
-    for e in until(t, |e| matches!(e, SessionEventWire::Idle)).await {
-        if let SessionEventWire::Stream(StreamEvent::Llm(LlmEvent::ToolResult { result: r, .. })) = e.event {
-            result = Some(r);
+    impl Drop for SecretVar {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(v) => std::env::set_var("GH_TOKEN", v),
+                None => std::env::remove_var("GH_TOKEN"),
+            }
         }
     }
-    result.expect("the bash tool ran")
-}
 
-/// Every file under `dir` whose bytes contain `needle`.
-fn files_containing(dir: &Path, needle: &str) -> Vec<PathBuf> {
-    let mut hits = Vec::new();
-    let mut stack = vec![dir.to_path_buf()];
-    while let Some(d) = stack.pop() {
-        let Ok(rd) = std::fs::read_dir(&d) else { continue };
-        for entry in rd.flatten() {
-            let p = entry.path();
-            let Ok(ft) = entry.file_type() else { continue };
-            if ft.is_dir() {
-                stack.push(p);
-            } else if ft.is_file() {
-                if let Ok(bytes) = std::fs::read(&p) {
-                    if bytes.windows(needle.len()).any(|w| w == needle.as_bytes()) {
-                        hits.push(p);
+    fn hex(s: &str) -> String {
+        s.bytes().map(|b| format!("{b:02x}")).collect()
+    }
+
+    fn sse_frames(blocks: &str, stop: &str) -> String {
+        format!(
+            concat!(
+                "data: {{\"type\":\"message_start\",\"message\":{{\"id\":\"msg_ow\",\"type\":\"message\",",
+                "\"role\":\"assistant\",\"content\":[],\"model\":\"claude-sonnet-4-5\",\"stop_reason\":null,",
+                "\"stop_sequence\":null,\"usage\":{{\"input_tokens\":10,\"output_tokens\":0,",
+                "\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0}}}}}}\n\n",
+                "{blocks}",
+                "data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"{stop}\",",
+                "\"stop_sequence\":null}},\"usage\":{{\"input_tokens\":10,\"output_tokens\":5,",
+                "\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0}}}}\n\n",
+                "data: {{\"type\":\"message_stop\"}}\n\n",
+            ),
+            blocks = blocks,
+            stop = stop,
+        )
+    }
+
+    /// `bash` printing `$GH_TOKEN` hex-encoded: the tool proves it saw the
+    /// value without the value itself ever entering history.
+    fn sse_bash_secret_hex() -> String {
+        let input = serde_json::json!({"command": "printf '%s' \"$GH_TOKEN\" | od -An -tx1 | tr -d ' \\n'; echo"});
+        let start = serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_sec","name":"bash","input":{}}});
+        let delta = serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":input.to_string()}});
+        let stop = serde_json::json!({"type":"content_block_stop","index":0});
+        sse_frames(&format!("data: {start}\n\ndata: {delta}\n\ndata: {stop}\n\n"), "tool_use")
+    }
+
+    fn sse_done() -> String {
+        let start = serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}});
+        let delta = serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"done"}});
+        let stop = serde_json::json!({"type":"content_block_stop","index":0});
+        sse_frames(&format!("data: {start}\n\ndata: {delta}\n\ndata: {stop}\n\n"), "end_turn")
+    }
+
+    /// One turn running the hex tool; returns the tool's output.
+    async fn secret_turn(t: &mut SocketTransport) -> String {
+        t.send_from_self(SessionCommand::Submit { text: "show the token".into(), attachments: vec![] }).await.unwrap();
+        let mut result = None;
+        for e in until(t, |e| matches!(e, SessionEventWire::Idle)).await {
+            if let SessionEventWire::Stream(StreamEvent::Llm(LlmEvent::ToolResult { result: r, .. })) = e.event {
+                result = Some(r);
+            }
+        }
+        result.expect("the bash tool ran")
+    }
+
+    /// Every file under `dir` whose bytes contain `needle`.
+    fn files_containing(dir: &Path, needle: &str) -> Vec<PathBuf> {
+        let mut hits = Vec::new();
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(d) = stack.pop() {
+            let Ok(rd) = std::fs::read_dir(&d) else { continue };
+            for entry in rd.flatten() {
+                let p = entry.path();
+                let Ok(ft) = entry.file_type() else { continue };
+                if ft.is_dir() {
+                    stack.push(p);
+                } else if ft.is_file() {
+                    if let Ok(bytes) = std::fs::read(&p) {
+                        if bytes.windows(needle.len()).any(|w| w == needle.as_bytes()) {
+                            hits.push(p);
+                        }
                     }
                 }
             }
         }
-    }
-    hits
-}
-
-/// `forward_secrets` on an owned session: the tool sees the client's
-/// `GH_TOKEN` (the daemon process has none). An unowned session from the
-/// same client still gets it stripped. Nothing under HOME — journals,
-/// session index, reload/run files, the daemon's debug log and stderr —
-/// ever holds the value.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[serial]
-async fn forwarded_secrets_reach_the_tools_and_never_the_disk() {
-    let guard = HomeGuard::new();
-    let bodies: &'static [&'static str] = Box::leak(
-        vec![sse_bash_secret_hex(), sse_done(), sse_bash_secret_hex(), sse_done()]
-            .into_iter()
-            .map(|s| &*Box::leak(s.into_boxed_str()))
-            .collect::<Vec<&'static str>>()
-            .into_boxed_slice(),
-    );
-    let (url, _hits, _bodies) = spawn_stub(Script::SeqSse(bodies)).await;
-    let d = spawn_daemon(&guard, &url, &[("RUST_LOG", "trace")]).await;
-    let sock = d.paths.sock.clone();
-
-    let _secret = SecretVar::set();
-    assert!(Hello::new(ClientKind::Test).env.unwrap().iter().all(|(k, _)| k != "GH_TOKEN"), "Hello strips it as ever");
-
-    let (mut owner, sid, snap) = create_owned(&sock, guard.home.path(), true).await;
-    let seen = secret_turn(&mut owner).await;
-    assert_eq!(seen.trim(), hex(DUMMY_SECRET), "the owned session's tool saw the forwarded secret");
-
-    let mut plain = create_plain(&sock, guard.home.path()).await;
-    let seen = secret_turn(&mut plain).await;
-    assert_eq!(seen.trim(), "", "an unowned session's tool never sees it");
-    plain.detach().await;
-
-    owner.detach().await;
-    wait_gone(&sock, &sid, Duration::from_secs(5)).await;
-    SocketTransport::shutdown(&sock, false).await.unwrap();
-    let t0 = std::time::Instant::now();
-    while registry::is_alive(&d.paths) && t0.elapsed() < Duration::from_secs(20) {
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        hits
     }
 
-    // The journal is where we look: it holds the tool's (hex) output…
-    assert!(journal(&guard, &snap.meta.journal_id).contains(&hex(DUMMY_SECRET)));
-    // …and nothing anywhere holds the secret.
-    let logs: Vec<PathBuf> = std::fs::read_dir(guard.base_dir())
-        .unwrap()
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("synaps.log")))
-        .filter(|p| std::fs::metadata(p).is_ok_and(|m| m.len() > 0))
-        .collect();
-    assert!(!logs.is_empty(), "the daemon's trace log is under HOME, so the grep covers it");
-    let hits = files_containing(guard.home.path(), DUMMY_SECRET);
-    assert!(hits.is_empty(), "the forwarded secret reached disk: {hits:?}");
+    /// `forward_secrets` on an owned session: the tool sees the client's
+    /// `GH_TOKEN` (the daemon process has none). An unowned session from the
+    /// same client still gets it stripped. Nothing under HOME — journals,
+    /// session index, reload/run files, the daemon's debug log and stderr —
+    /// ever holds the value.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn forwarded_secrets_reach_the_tools_and_never_the_disk() {
+        let guard = HomeGuard::new();
+        let bodies: &'static [&'static str] = Box::leak(
+            vec![sse_bash_secret_hex(), sse_done(), sse_bash_secret_hex(), sse_done()]
+                .into_iter()
+                .map(|s| &*Box::leak(s.into_boxed_str()))
+                .collect::<Vec<&'static str>>()
+                .into_boxed_slice(),
+        );
+        let (url, _hits, _bodies) = spawn_stub(Script::SeqSse(bodies)).await;
+        let d = spawn_daemon(&guard, &url, &[("RUST_LOG", "trace")]).await;
+        let sock = d.paths.sock.clone();
+
+        let _secret = SecretVar::set();
+        assert!(Hello::new(ClientKind::Test).env.unwrap().iter().all(|(k, _)| k != "GH_TOKEN"), "Hello strips it as ever");
+
+        let (mut owner, sid, snap) = create_owned(&sock, guard.home.path(), true).await;
+        let seen = secret_turn(&mut owner).await;
+        assert_eq!(seen.trim(), hex(DUMMY_SECRET), "the owned session's tool saw the forwarded secret");
+
+        let mut plain = create_plain(&sock, guard.home.path()).await;
+        let seen = secret_turn(&mut plain).await;
+        assert_eq!(seen.trim(), "", "an unowned session's tool never sees it");
+        plain.detach().await;
+
+        owner.detach().await;
+        wait_gone(&sock, &sid, Duration::from_secs(5)).await;
+        SocketTransport::shutdown(&sock, false).await.unwrap();
+        let t0 = std::time::Instant::now();
+        while registry::is_alive(&d.paths) && t0.elapsed() < Duration::from_secs(20) {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        // The journal is where we look: it holds the tool's (hex) output…
+        assert!(journal(&guard, &snap.meta.journal_id).contains(&hex(DUMMY_SECRET)));
+        // …and nothing anywhere holds the secret.
+        let logs: Vec<PathBuf> = std::fs::read_dir(guard.base_dir())
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("synaps.log")))
+            .filter(|p| std::fs::metadata(p).is_ok_and(|m| m.len() > 0))
+            .collect();
+        assert!(!logs.is_empty(), "the daemon's trace log is under HOME, so the grep covers it");
+        let hits = files_containing(guard.home.path(), DUMMY_SECRET);
+        assert!(hits.is_empty(), "the forwarded secret reached disk: {hits:?}");
+    }
 }
 
 // ── reload ──────────────────────────────────────────────────────────────────
