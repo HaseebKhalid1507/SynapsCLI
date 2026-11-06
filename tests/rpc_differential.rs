@@ -984,25 +984,7 @@ async fn private_daemon_per_process() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn slow_consumer_loses_nothing() {
     const N: usize = 3000;
-    let mut body = String::from(concat!(
-        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_flood\",\"type\":\"message\",",
-        "\"role\":\"assistant\",\"content\":[],\"model\":\"claude-sonnet-4-5\",\"stop_reason\":null,",
-        "\"stop_sequence\":null,\"usage\":{\"input_tokens\":10,\"output_tokens\":0,",
-        "\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0}}}\n\n",
-        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
-    ));
-    for i in 0..N {
-        body.push_str(&format!(
-            "data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"<{i:04}> padding padding padding padding padding\"}}}}\n\n"
-        ));
-    }
-    body.push_str(concat!(
-        "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
-        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},",
-        "\"usage\":{\"output_tokens\":3000}}\n\n",
-        "data: {\"type\":\"message_stop\"}\n\n",
-    ));
-    let env = Env::new(Script::Sse(Box::leak(body.into_boxed_str()))).await;
+    let env = Env::new(Script::Sse(flood_body(N))).await;
 
     let errlog = env.home.path().join("rpc.stderr");
     let mut child = env
@@ -1055,6 +1037,87 @@ async fn slow_consumer_loses_nothing() {
     drop(stdin);
     while let Ok(Some(_)) = lines.next_line().await {}
     assert_eq!(tokio::time::timeout(WAIT, child.wait()).await.unwrap().unwrap().code(), Some(0));
+}
+
+/// The flood turn of [`slow_consumer_loses_nothing`]: `n` deltas, ~80 B each.
+fn flood_body(n: usize) -> &'static str {
+    let mut body = String::from(concat!(
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_flood\",\"type\":\"message\",",
+        "\"role\":\"assistant\",\"content\":[],\"model\":\"claude-sonnet-4-5\",\"stop_reason\":null,",
+        "\"stop_sequence\":null,\"usage\":{\"input_tokens\":10,\"output_tokens\":0,",
+        "\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0}}}\n\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+    ));
+    for i in 0..n {
+        body.push_str(&format!(
+            "data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"<{i:04}> padding padding padding padding padding\"}}}}\n\n"
+        ));
+    }
+    body.push_str(concat!(
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},",
+        "\"usage\":{\"output_tokens\":3000}}\n\n",
+        "data: {\"type\":\"message_stop\"}\n\n",
+    ));
+    Box::leak(body.into_boxed_str())
+}
+
+/// On exit, frames still queued wait for a parent that reads stdout late
+/// (past the old 2 s give-up): the turn's `agent_end` and response arrive.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn late_reader_after_eof_gets_every_frame() {
+    let env = Env::new(Script::Sse(flood_body(3000))).await;
+    let mut child = env
+        .cmd(&["rpc", "-m", MODEL])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+    let ready: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+    assert_eq!(ready["type"], "ready");
+    stdin.write_all(b"{\"type\":\"prompt\",\"id\":\"p1\",\"message\":\"flood\"}\n").await.unwrap();
+    stdin.flush().await.unwrap();
+    // The pipe fills; then EOF, and nothing is read for 5 s.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    drop(stdin);
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let mut frames = Vec::new();
+    while let Ok(Ok(Some(line))) = tokio::time::timeout(WAIT, lines.next_line()).await {
+        frames.push(serde_json::from_str::<Value>(&line).unwrap());
+    }
+    assert!(frames.iter().any(|f| f["type"] == "agent_end"), "no agent_end in {} frames", frames.len());
+    assert!(frames.iter().any(|f| f["type"] == "response" && f["id"] == "p1"), "no response in {} frames", frames.len());
+    assert_eq!(tokio::time::timeout(WAIT, child.wait()).await.unwrap().unwrap().code(), Some(0));
+}
+
+/// A parent that closes stdout is gone: rpc does not wait out the drain cap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn closed_stdout_exits_promptly() {
+    let env = Env::new(Script::Sse(flood_body(3000))).await;
+    let mut child = env
+        .cmd(&["rpc", "-m", MODEL])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+    let ready: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+    assert_eq!(ready["type"], "ready");
+    stdin.write_all(b"{\"type\":\"prompt\",\"id\":\"p1\",\"message\":\"flood\"}\n").await.unwrap();
+    stdin.flush().await.unwrap();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    drop(lines);
+    drop(stdin);
+    let t0 = std::time::Instant::now();
+    let st = tokio::time::timeout(Duration::from_secs(20), child.wait()).await.expect("rpc exits").unwrap();
+    assert!(t0.elapsed() < Duration::from_secs(15), "took {:?} ({st})", t0.elapsed());
 }
 
 /// stdin EOF mid-turn: the turn is cancelled and still closed out — its

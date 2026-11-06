@@ -68,8 +68,9 @@ const END_WAIT: Duration = Duration::from_secs(10);
 /// SIGTERM: how long a cancelled turn gets to end (`Aborted`), and then the
 /// session, before this process writes the terminal frames itself.
 const TERM_WAIT: Duration = Duration::from_secs(2);
-/// On exit, give up on stdout once the parent read nothing for this long.
-const WRITER_STALL: Duration = Duration::from_secs(2);
+/// On exit, frames still queued are written as long as the parent can read
+/// stdout (its read end open), for at most this long.
+const WRITER_DRAIN_MAX: Duration = Duration::from_secs(60);
 /// `compact`: the actor answers (`CompactionStarted` or a refusal) at once;
 /// the summarisation itself may take minutes.
 const COMPACT_START_WAIT: Duration = Duration::from_secs(30);
@@ -148,21 +149,23 @@ fn spawn_writer() -> (Out, oneshot::Receiver<()>) {
 }
 
 /// Let the writer finish once every sender is gone: as long as the parent
-/// keeps reading, however long that takes; give up after it read nothing
-/// for [`WRITER_STALL`].
+/// can still read stdout (a slow reader gets the cut turn's `agent_end`),
+/// at most [`WRITER_DRAIN_MAX`].
 async fn drain_writer(out: Out, mut done: oneshot::Receiver<()>) {
     let queued = Arc::clone(&out.queued);
     drop(out);
-    let (mut last, mut since) = (usize::MAX, Instant::now());
+    let t0 = Instant::now();
     loop {
         if tokio::time::timeout(Duration::from_millis(100), &mut done).await.is_ok() {
             return;
         }
-        let now = queued.load(Ordering::Acquire);
-        if now < last {
-            (last, since) = (now, Instant::now());
-        } else if since.elapsed() >= WRITER_STALL {
-            tracing::warn!(queued_bytes = now, "rpc: stdout not read for 2 s; exiting with frames unwritten");
+        let left = queued.load(Ordering::Acquire);
+        if daemon::stdout_peer_closed() {
+            tracing::warn!(queued_bytes = left, "stdout closed by the parent; exiting with frames unwritten");
+            return;
+        }
+        if t0.elapsed() >= WRITER_DRAIN_MAX {
+            tracing::warn!(queued_bytes = left, "stdout not drained within 60 s; exiting with frames unwritten");
             return;
         }
     }

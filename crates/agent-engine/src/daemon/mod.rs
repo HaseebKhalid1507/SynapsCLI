@@ -707,6 +707,23 @@ fn spawn_env(opts: &DaemonOpts, env: &mut Vec<(std::ffi::OsString, std::ffi::OsS
     }
 }
 
+
+/// Whether nobody can read our stdout any more (a pipe whose read end is
+/// closed: `POLLERR`/`POLLHUP`). Never true for a file or a terminal, nor
+/// where it cannot be told.
+pub fn stdout_peer_closed() -> bool {
+    #[cfg(unix)]
+    {
+        let mut pfd = libc::pollfd { fd: libc::STDOUT_FILENO, events: 0, revents: 0 };
+        // SAFETY: one valid pollfd, no wait.
+        let n = unsafe { libc::poll(&mut pfd, 1, 0) };
+        n == 1 && pfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
 /// Parent side: `current_exe daemon --foreground …` in its own session
 /// (`setsid`), stdout → null, stderr → pipe; waits ≤ [`SPAWN_READY_TIMEOUT`]
 /// (15 s: the daemon's ≤ 10 s extension wait plus margin) for `R` on the
