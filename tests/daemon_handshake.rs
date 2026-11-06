@@ -167,11 +167,10 @@ async fn create_refuses_relative_or_missing_cwd() {
     let mut c = Raw::connect(&sock).await;
     c.send(&ClientFrame::Hello(Hello::new(ClientKind::Test))).await;
     assert!(matches!(c.recv().await, Some(DaemonFrame::Welcome(_))));
-    c.send(&ClientFrame::Attach(Attach::Create {
-        config: SessionConfig { cwd: Some("/definitely/not/here".into()), ..Default::default() },
-        mode: AttachMode::Mirror,
-        owned: None,
-    }))
+    c.send(&ClientFrame::Attach(Attach::create(
+        SessionConfig { cwd: Some("/definitely/not/here".into()), ..Default::default() },
+        AttachMode::Mirror,
+    )))
     .await;
     assert!(matches!(c.recv().await, Some(DaemonFrame::Error { message, .. }) if message.contains("cwd")));
     assert!(d.state.live_sessions().is_empty());

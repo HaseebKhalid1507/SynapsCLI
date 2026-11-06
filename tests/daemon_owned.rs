@@ -237,7 +237,7 @@ async fn owner_detach_ends_the_session_and_the_journal_continues_unowned() {
     // `--continue` it: a normal session now, pinnable, outliving its client.
     let conn = SocketTransport::connect(&sock, Hello::new(ClientKind::Test)).await.unwrap();
     let cfg = SessionConfig { continue_session: Some(Some(snap.meta.journal_id.clone())), ..config(guard.home.path()) };
-    let (t, snap2) = SocketTransport::attach(conn, Attach::Create { config: cfg, mode: AttachMode::Mirror, owned: None })
+    let (t, snap2) = SocketTransport::attach(conn, Attach::create(cfg, AttachMode::Mirror))
         .await
         .expect("continue the owned session's journal");
     assert!(!t.is_session_owner());
@@ -364,7 +364,7 @@ mod forward_secrets {
 
     async fn create_plain(sock: &Path, cwd: &Path) -> SocketTransport {
         let conn = SocketTransport::connect(sock, Hello::new(ClientKind::Test)).await.unwrap();
-        let (t, _) = SocketTransport::attach(conn, Attach::Create { config: config(cwd), mode: AttachMode::Mirror, owned: None })
+        let (t, _) = SocketTransport::attach(conn, Attach::create(config(cwd), AttachMode::Mirror))
             .await
             .expect("create plain");
         assert!(!t.is_session_owner());

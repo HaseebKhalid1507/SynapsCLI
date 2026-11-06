@@ -93,8 +93,8 @@ async fn continue_old_follows_compacted_into() {
         .unwrap();
     let (mut t, snap) = SocketTransport::attach(
         conn,
-        Attach::Create {
-            config: SessionConfig {
+        Attach::create(
+            SessionConfig {
                 cwd: Some(cwd.clone()),
                 model_override: Some("claude-sonnet-4-5".into()),
                 persist: true,
@@ -102,9 +102,8 @@ async fn continue_old_follows_compacted_into() {
                 compaction_policy: CompactionPolicyWire::LinkedSuccessor,
                 ..Default::default()
             },
-            mode: AttachMode::Mirror,
-            owned: None,
-        },
+            AttachMode::Mirror,
+        ),
     )
     .await
     .expect("daemon attach");

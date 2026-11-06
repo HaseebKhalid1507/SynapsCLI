@@ -84,15 +84,14 @@ async fn attach_create_with_env(
     let conn = SocketTransport::connect(&paths.sock, hello).await.unwrap();
     SocketTransport::attach(
         conn,
-        Attach::Create {
-            config: SessionConfig {
+        Attach::create(
+            SessionConfig {
                 cwd: Some(cwd.to_path_buf()),
                 model_override: Some("claude-sonnet-4-5".into()),
                 ..Default::default()
             },
-            mode: AttachMode::Mirror,
-            owned: None,
-        },
+            AttachMode::Mirror,
+        ),
     )
     .await
     .unwrap()
@@ -110,15 +109,14 @@ async fn attach_continue_no_env(
     let conn = SocketTransport::connect(&paths.sock, hello).await.unwrap();
     SocketTransport::attach(
         conn,
-        Attach::Create {
-            config: SessionConfig {
+        Attach::create(
+            SessionConfig {
                 continue_session: Some(Some(session_id.to_string())),
                 model_override: Some("claude-sonnet-4-5".into()),
                 ..Default::default()
             },
-            mode: AttachMode::Mirror,
-            owned: None,
-        },
+            AttachMode::Mirror,
+        ),
     )
     .await
     .unwrap()

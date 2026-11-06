@@ -308,16 +308,15 @@ async fn reload_stops_running_workers_resumably_and_never_reuses_their_ids() {
     let conn = SocketTransport::connect(&d.paths.sock, Hello::new(ClientKind::Test)).await.unwrap();
     let (mut t, _snap) = SocketTransport::attach(
         conn,
-        Attach::Create {
-            config: SessionConfig {
+        Attach::create(
+            SessionConfig {
                 cwd: Some(guard.home.path().to_path_buf()),
                 env: None,
                 model_override: Some("claude-sonnet-4-5".into()),
                 ..Default::default()
             },
-            mode: AttachMode::Mirror,
-            owned: None,
-        },
+            AttachMode::Mirror,
+        ),
     )
     .await
     .unwrap();

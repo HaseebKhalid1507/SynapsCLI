@@ -362,6 +362,11 @@ pub enum Attach {
 }
 
 impl Attach {
+    /// A plain (unowned) create: what `Attach::Create` always was.
+    pub fn create(config: SessionConfig, mode: AttachMode) -> Self {
+        Self::Create { config, mode, owned: None }
+    }
+
     /// An owned create: the session ends when this connection goes away.
     /// `forward_secrets` also sends this process's secret env vars (the
     /// ones `Hello.env` strips) so the session's tools see them.
@@ -1963,7 +1968,7 @@ mod tests {
             ClientFrame::Sessions,
             ClientFrame::Shutdown { force: true },
             ClientFrame::Attach(Attach::Existing { session_id: "s".into(), mode: AttachMode::Mirror }),
-            ClientFrame::Attach(Attach::Create { config: SessionConfig::default(), mode: AttachMode::Takeover, owned: None }),
+            ClientFrame::Attach(Attach::create(SessionConfig::default(), AttachMode::Takeover)),
             ClientFrame::Cmd { session_id: "s".into(), cmd: SessionCommand::Submit { text: "hi".into(), attachments: vec![] } },
             ClientFrame::Cmd { session_id: "s".into(), cmd: SessionCommand::Answer { prompt_id: 1, value: Some("pw".into()) } },
             ClientFrame::Cmd { session_id: "s".into(), cmd: SessionCommand::EngineCommand { id: 4, name: "model".into(), arg: "x".into() } },
@@ -2283,11 +2288,10 @@ mod tests {
     /// an older daemon's `Welcome` (no `features`) supports nothing.
     #[test]
     fn owned_sessions_are_additive_on_the_wire() {
-        let plain = encode_line(&ClientFrame::Attach(Attach::Create {
-            config: SessionConfig::default(),
-            mode: AttachMode::Mirror,
-            owned: None,
-        }))
+        let plain = encode_line(&ClientFrame::Attach(Attach::create(
+            SessionConfig::default(),
+            AttachMode::Mirror,
+        )))
         .unwrap();
         assert!(!plain.contains("owned"), "{plain}");
         let secrets = SecretEnv(vec![("GH_TOKEN".into(), "v".into())]);

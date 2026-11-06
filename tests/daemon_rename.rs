@@ -66,7 +66,7 @@ async fn until(t: &mut SocketTransport, pred: impl Fn(&SessionEventWire) -> bool
 
 async fn create_with(sock: &Path, config: SessionConfig) -> (SocketTransport, SessionId) {
     let conn = SocketTransport::connect(sock, Hello::new(ClientKind::Test)).await.unwrap();
-    let (t, _snap) = SocketTransport::attach(conn, Attach::Create { config, mode: AttachMode::Mirror, owned: None })
+    let (t, _snap) = SocketTransport::attach(conn, Attach::create(config, AttachMode::Mirror))
         .await
         .expect("attach create");
     let sid = t.session_id().clone();
@@ -623,7 +623,7 @@ async fn rename_from_an_attached_connection_or_as_plain_text_is_refused() {
     write_frame(&mut w, &ClientFrame::Hello(Hello::new(ClientKind::Test))).await;
     read_until(&mut lines, |f| matches!(f, DaemonFrame::Welcome(_)).then_some(())).await;
     let config = SessionConfig { cwd: Some(guard.home.path().to_path_buf()), ..Default::default() };
-    write_frame(&mut w, &ClientFrame::Attach(Attach::Create { config, mode: AttachMode::Mirror, owned: None })).await;
+    write_frame(&mut w, &ClientFrame::Attach(Attach::create(config, AttachMode::Mirror))).await;
     let sid = read_until(&mut lines, |f| match f {
         DaemonFrame::Attached(a) => Some(a.meta.id),
         _ => None,

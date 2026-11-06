@@ -53,15 +53,14 @@ async fn session_with_turn(sock: &Path, cwd: &Path) -> (SocketTransport, Session
     let conn = SocketTransport::connect(sock, Hello::new(ClientKind::Test)).await.unwrap();
     let (mut t, _snap) = SocketTransport::attach(
         conn,
-        Attach::Create {
-            config: SessionConfig {
+        Attach::create(
+            SessionConfig {
                 cwd: Some(cwd.to_path_buf()),
                 model_override: Some("claude-sonnet-4-5".into()),
                 ..Default::default()
             },
-            mode: AttachMode::Mirror,
-            owned: None,
-        },
+            AttachMode::Mirror,
+        ),
     )
     .await
     .expect("attach create");

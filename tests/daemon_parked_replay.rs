@@ -91,17 +91,16 @@ async fn attach_to_parked_session_replays_conversation() {
     let conn = SocketTransport::connect(&sock, Hello::new(ClientKind::Test)).await.unwrap();
     let (mut t, snap_create) = SocketTransport::attach(
         conn,
-        Attach::Create {
-            config: SessionConfig {
+        Attach::create(
+            SessionConfig {
                 cwd: Some(cwd.clone()),
                 env: None,
                 model_override: Some("claude-sonnet-4-5".into()),
                 persist: true,
                 ..Default::default()
             },
-            mode: AttachMode::Mirror,
-            owned: None,
-        },
+            AttachMode::Mirror,
+        ),
     )
     .await
     .expect("attach create");

@@ -117,16 +117,15 @@ async fn reload_reconnects_digest_client_with_display_tail_only() {
     let conn = SocketTransport::connect(&d.paths.sock, hello).await.unwrap();
     let (mut t, snap) = SocketTransport::attach(
         conn,
-        Attach::Create {
-            config: SessionConfig {
+        Attach::create(
+            SessionConfig {
                 cwd: Some(Path::new(guard.home.path()).to_path_buf()),
                 env: None,
                 model_override: Some("claude-sonnet-4-5".into()),
                 ..Default::default()
             },
-            mode: AttachMode::Mirror,
-            owned: None,
-        },
+            AttachMode::Mirror,
+        ),
     )
     .await
     .unwrap();
