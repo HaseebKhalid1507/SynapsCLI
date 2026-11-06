@@ -41,6 +41,18 @@ All notable changes to this project will be documented in this file.
   session itself, together with the close: a client that attaches between
   the daemon's check and the close is no longer closed under.
 
+### Changed
+
+- **`synaps rpc` runs on the session daemon.** It no longer boots its own
+  engine: it connects to (or auto-spawns) the profile's daemon, creates an
+  owned session there (its cwd and env, secrets forwarded to the tools) and
+  translates the unchanged stdin/stdout protocol to it. Same frames, fields
+  and order (golden-fixture differential test); `get_session_stats.cost` now
+  reports the real session cost instead of 0. Killing the process cancels the
+  turn and ends the session. With no daemon available (`SYNAPS_DAEMON=0`,
+  autospawn off, spawn failure) it exits 3 with an `error` frame instead of
+  running in-process.
+
 ### Fixed
 
 - **Windows: the `grep`, `find` and `ls` tools work.** They ran the bare

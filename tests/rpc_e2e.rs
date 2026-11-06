@@ -83,8 +83,12 @@ impl RpcChild {
         for a in args {
             cmd.arg(a);
         }
+        // `synaps rpc` auto-spawns a session daemon: pin its run dir under
+        // the temp HOME so it can never meet the user's daemon.
         cmd.env("HOME", home.path())
-            .env("SYNAPS_BASE_DIR", cfg_path)
+            .env("SYNAPS_BASE_DIR", &cfg_path)
+            .env("SYNAPS_RUNTIME_DIR", home.path().join("run"))
+            .env("SYNAPS_DAEMON_IDLE_EXIT_SECS", "2")
             // Suppress any real API calls — no key means the engine uses the
             // extension provider path when an extension is present, and fails
             // gracefully otherwise.
@@ -163,6 +167,8 @@ impl RpcChild {
         }
         cmd.env("HOME", home_path)
             .env("SYNAPS_BASE_DIR", &cfg_path)
+            .env("SYNAPS_RUNTIME_DIR", home_path.join("run"))
+            .env("SYNAPS_DAEMON_IDLE_EXIT_SECS", "2")
             .env_remove("ANTHROPIC_API_KEY")
             .env_remove("OPENAI_API_KEY")
             .env_remove("GROQ_API_KEY")

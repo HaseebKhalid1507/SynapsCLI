@@ -165,11 +165,15 @@ struct Turn {
     /// `abort` ids, answered after the turn's own terminal frames.
     aborts: Vec<String>,
     cancel_sent: bool,
+    /// The prompt text (a pending prompt is matched by it).
+    text: String,
+    /// Pending only: the actor took the text as a steer of another turn.
+    steered: bool,
 }
 
 impl Turn {
     fn new(id: String) -> Self {
-        Self { id, usage: empty_usage(), aborts: Vec::new(), cancel_sent: false }
+        Self { id, usage: empty_usage(), aborts: Vec::new(), cancel_sent: false, text: String::new(), steered: false }
     }
 
     fn command(&self) -> &'static str {
@@ -185,6 +189,8 @@ impl Turn {
 enum TurnEnd {
     Done,
     Aborted,
+    /// Cancelled by the daemon, not by an `abort` (cost cap, close, reload).
+    Interrupted(String),
     Failed(TurnError),
     /// `Idle` with no `Done`/`Error`: the stream ended early.
     NoDone,
@@ -216,6 +222,12 @@ struct Bridge {
     t: SocketTransport,
     out: mpsc::Sender<RpcEvent>,
     turn: Option<Turn>,
+    /// A prompt sent to the actor whose turn has not started. Normally the
+    /// next `TurnStarted{User}`; when it crossed an event auto-turn starting
+    /// (the actor then takes it as a steer), it waits for that turn: queued
+    /// → it starts as `QueuedAuto`; consumed → answered at `Idle`; dropped
+    /// (`Dequeued`) → an error.
+    pending: Option<Turn>,
     queries: HashMap<u64, PendingQuery>,
     /// `Set` id → (parent id, requested model).
     settings: HashMap<u64, (String, String)>,
@@ -225,6 +237,8 @@ struct Bridge {
     /// First event that arrived while idle since the last turn: names the
     /// auto-turn it starts (`auto:<id>`).
     idle_event: Option<String>,
+    /// Why the daemon may cancel the turn on its own (`CostCapReached`).
+    interrupt_note: Option<String>,
 }
 
 impl Bridge {
@@ -238,6 +252,10 @@ impl Bridge {
 
     async fn respond(&self, id: String, command: &str, body: serde_json::Value) {
         self.emit(RpcEvent::Response { id, command: command.to_string(), body }).await;
+    }
+
+    fn busy(&self) -> bool {
+        self.turn.is_some() || self.pending.is_some()
     }
 
     fn next(&mut self) -> u64 {
@@ -274,7 +292,7 @@ impl Bridge {
             RpcCommand::FollowUp { id, message } => self.prompt(id, message, Vec::new()).await,
             RpcCommand::Compact { id } => self.compact(id).await,
             RpcCommand::NewSession { id } => {
-                if self.turn.is_some() {
+                if self.busy() {
                     self.error(Some(id), "another prompt is in flight; abort first").await;
                 } else if let Err(e) = self.send(SessionCommand::NewSession).await {
                     self.error(Some(id), e).await;
@@ -294,7 +312,7 @@ impl Bridge {
             }
             RpcCommand::GetAvailableModels { id } => self.available_models(id).await,
             RpcCommand::Abort { id } => {
-                let cancel = match self.turn.as_mut() {
+                let cancel = match self.turn.as_mut().or(self.pending.as_mut()) {
                     Some(turn) => {
                         turn.aborts.push(id);
                         !std::mem::replace(&mut turn.cancel_sent, true)
@@ -319,7 +337,7 @@ impl Bridge {
     }
 
     async fn prompt(&mut self, id: String, message: String, attachments: Vec<RpcAttachment>) {
-        if self.turn.is_some() {
+        if self.busy() {
             tracing::warn!(id, "rejected concurrent prompt — session busy");
             self.error(Some(id), "another prompt is in flight; abort first").await;
             return;
@@ -347,7 +365,7 @@ impl Bridge {
                 }
             }
         };
-        let cmd = SessionCommand::Submit { text: message, attachments: blocks };
+        let cmd = SessionCommand::Submit { text: message.clone(), attachments: blocks };
         // The daemon closes a connection that sends an oversize frame (and
         // with it this owned session): refuse it here instead.
         let bytes = serde_json::to_vec(&cmd).map(|v| v.len()).unwrap_or(usize::MAX);
@@ -356,13 +374,17 @@ impl Bridge {
             return;
         }
         match self.send(cmd).await {
-            Ok(()) => self.turn = Some(Turn::new(id)),
+            Ok(()) => {
+                let mut turn = Turn::new(id);
+                turn.text = message;
+                self.pending = Some(turn);
+            }
             Err(e) => self.error(Some(id), e).await,
         }
     }
 
     async fn compact(&mut self, id: String) {
-        if self.turn.is_some() {
+        if self.busy() {
             self.error(Some(id), "cannot compact while a turn is running").await;
         } else if self.compact.is_some() {
             self.error(Some(id), "compaction already in progress").await;
@@ -394,9 +416,18 @@ impl Bridge {
     async fn on_event(&mut self, ev: SessionEventWire) -> Result<(), Exit> {
         match ev {
             SessionEventWire::Stream(se) => self.on_stream(se).await,
-            SessionEventWire::TurnStarted { trigger, .. } => {
+            SessionEventWire::TurnStarted { trigger, user_text, .. } => {
                 let idle_event = self.idle_event.take();
-                if self.turn.is_none() {
+                let ours = match trigger {
+                    TurnTrigger::User => self.pending.is_some(),
+                    TurnTrigger::QueuedAuto => {
+                        self.pending.as_ref().is_some_and(|p| user_text.as_deref() == Some(p.text.as_str()))
+                    }
+                    _ => false,
+                };
+                if ours {
+                    self.turn = self.pending.take();
+                } else if self.turn.is_none() {
                     let id = match (trigger, idle_event) {
                         (TurnTrigger::EventAuto, Some(event)) => format!("auto:{event}"),
                         (TurnTrigger::EventAuto, None) => {
@@ -405,6 +436,22 @@ impl Bridge {
                         (other, _) => format!("auto:{other:?}-{}", chrono::Utc::now().timestamp_millis()).to_lowercase(),
                     };
                     self.turn = Some(Turn::new(id));
+                }
+            }
+            // Our prompt crossed another turn starting: the actor steers it
+            // into that turn (or queues it behind).
+            SessionEventWire::Steered { text, .. } => {
+                if let Some(p) = self.pending.as_mut().filter(|p| p.text == text) {
+                    p.steered = true;
+                }
+            }
+            // ...and that turn was cancelled before taking it.
+            SessionEventWire::Dequeued { text } => {
+                if let Some(p) = self.pending.take_if(|p| p.steered && p.text == text) {
+                    self.error(Some(p.id), "prompt not delivered: the turn it was queued behind was cancelled").await;
+                    for a in p.aborts {
+                        self.respond(a, "abort", serde_json::json!({ "ok": true })).await;
+                    }
                 }
             }
             SessionEventWire::External(event) => {
@@ -420,8 +467,31 @@ impl Bridge {
                 let payload = agent_engine::engine::reactor::event_payload_from_drained(&drained);
                 self.emit(RpcEvent::Event { payload: Box::new(payload) }).await;
             }
-            SessionEventWire::Aborted { .. } => self.finish(TurnEnd::Aborted).await,
-            SessionEventWire::Idle => self.finish(TurnEnd::NoDone).await,
+            SessionEventWire::Aborted { .. } => {
+                let ours = self.turn.as_ref().is_none_or(|t| t.cancel_sent);
+                let end = if ours {
+                    TurnEnd::Aborted
+                } else {
+                    let why = self.interrupt_note.take().unwrap_or_else(|| "turn cancelled by the session daemon".into());
+                    TurnEnd::Interrupted(why)
+                };
+                self.finish(end).await;
+            }
+            SessionEventWire::CostCapReached { scope, cost, cap } => {
+                self.interrupt_note = Some(format!("{scope} cost cap reached (${cost:.4} ≥ ${cap:.4})"));
+            }
+            // A started turn ending without Done/Error. An `Idle` racing
+            // ahead of our prompt's `TurnStarted` belongs to what came before.
+            SessionEventWire::Idle => {
+                if self.turn.is_some() {
+                    self.finish(TurnEnd::NoDone).await;
+                } else if self.pending.as_ref().is_some_and(|p| p.steered) {
+                    // Steered into the turn that just ended, which answered
+                    // it (its frames went out under that turn's id).
+                    self.turn = self.pending.take();
+                    self.finish(TurnEnd::Done).await;
+                }
+            }
             SessionEventWire::QueryResult { id, value } => {
                 if let Some(pending) = self.queries.remove(&id) {
                     self.on_query_result(pending, value).await;
@@ -482,11 +552,17 @@ impl Bridge {
             }
             SessionEventWire::Refused { client, command, reason } if client == self.t.client_id() => {
                 if command == "submit" {
-                    if let Some(turn) = self.turn.take() {
+                    if let Some(turn) = self.pending.take() {
                         self.error(Some(turn.id), reason).await;
                         for a in turn.aborts {
                             self.respond(a, "abort", serde_json::json!({ "ok": true })).await;
                         }
+                        return Ok(());
+                    }
+                }
+                if command == "compact" {
+                    if let Some(c) = self.compact.take() {
+                        self.error(Some(c.id), reason).await;
                         return Ok(());
                     }
                 }
@@ -533,6 +609,10 @@ impl Bridge {
             TurnEnd::Failed(e) => {
                 self.error(Some(turn.id.clone()), e.message.clone()).await;
                 serde_json::json!({ "ok": false, "error": e.message, "outcome": e.outcome })
+            }
+            TurnEnd::Interrupted(why) => {
+                self.error(Some(turn.id.clone()), why.clone()).await;
+                serde_json::json!({ "ok": false, "error": why })
             }
             TurnEnd::NoDone => serde_json::json!({ "ok": false, "error": "stream ended without Done" }),
             TurnEnd::Done | TurnEnd::Aborted => serde_json::json!({ "ok": true }),
@@ -585,16 +665,23 @@ impl Bridge {
         }
     }
 
-    /// A daemon reload cut the connection: whatever was in flight is gone
-    /// (the checkpoint cancelled the turn). Close each request out so the
-    /// parent never waits on it.
-    async fn cut_by_reload(&mut self) {
-        const CUT: &str = "interrupted by a session daemon reload";
+    /// The connection was cut (a daemon reload, or the daemon lost):
+    /// whatever was in flight is gone. Close each request out so the parent
+    /// never waits on it; a running turn still gets its `agent_end` with
+    /// the usage seen so far (what Pria meters).
+    async fn cut(&mut self, why: &str) {
+        // A prompt cut off before it started never ran.
+        if let Some(p) = self.pending.take() {
+            self.error(Some(p.id), why).await;
+            for a in p.aborts {
+                self.respond(a, "abort", serde_json::json!({ "ok": true })).await;
+            }
+        }
         if let Some(mut turn) = self.turn.take() {
             let aborts = std::mem::take(&mut turn.aborts);
-            self.error(Some(turn.id.clone()), CUT).await;
+            self.error(Some(turn.id.clone()), why).await;
             self.emit(RpcEvent::AgentEnd { usage: turn.usage.clone() }).await;
-            self.respond(turn.id.clone(), turn.command(), serde_json::json!({ "ok": false, "error": CUT })).await;
+            self.respond(turn.id.clone(), turn.command(), serde_json::json!({ "ok": false, "error": why })).await;
             for a in aborts {
                 self.respond(a, "abort", serde_json::json!({ "ok": true })).await;
             }
@@ -605,15 +692,15 @@ impl Bridge {
                 PendingQuery::Messages(i) | PendingQuery::State(i) | PendingQuery::Stats(i) => Some(i),
                 PendingQuery::Tools(i) => i,
             };
-            self.error(id, CUT).await;
+            self.error(id, why).await;
         }
         let settings: Vec<String> = self.settings.drain().map(|(_, (id, _))| id).collect();
         let news: Vec<String> = self.new_sessions.drain(..).collect();
         for id in settings.into_iter().chain(news) {
-            self.error(Some(id), CUT).await;
+            self.error(Some(id), why).await;
         }
         if let Some(c) = self.compact.take() {
-            self.error(Some(c.id), CUT).await;
+            self.error(Some(c.id), why).await;
         }
     }
 
@@ -737,21 +824,23 @@ pub async fn run(
         t,
         out: out.clone(),
         turn: None,
+        pending: None,
         queries: HashMap::new(),
         settings: HashMap::new(),
         new_sessions: VecDeque::new(),
         compact: None,
         next_id: 0,
         idle_event: None,
+        interrupt_note: None,
     };
     drop(snap);
 
-    // 6. Translate. stdin is not read while reconnecting or shutting down:
-    //    the pipe buffers it.
+    // 6. Translate. stdin is not read while reconnecting, compacting or
+    //    shutting down: the pipe buffers it.
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     let mut shutdown: Option<tokio::time::Instant> = None;
     let exit = loop {
-        if shutdown.is_some() && b.turn.is_none() {
+        if shutdown.is_some() && !b.busy() {
             break None;
         }
         let deadline = shutdown.unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(3600));
@@ -764,7 +853,7 @@ pub async fn run(
                 }
                 None => {
                     if matches!(b.t.last_error(), Some(TransportError::Reloading { .. })) {
-                        b.cut_by_reload().await;
+                        b.cut("interrupted by a session daemon reload").await;
                         if let Err(e) = b.t.reconnect(AttachMode::Mirror).await {
                             break Some(Exit::Lost(format!("could not reconnect after a daemon reload: {e}")));
                         }
@@ -774,7 +863,10 @@ pub async fn run(
                     break Some(Exit::Lost(format!("lost the session daemon ({why})")));
                 }
             },
-            line = lines.next_line(), if shutdown.is_none() => match line {
+            // Not while our `compact` runs: the old loop ran it inline, so
+            // what the parent sent meanwhile waited for it (and a prompt
+            // sent mid-compaction would be queued, then handed back unsent).
+            line = lines.next_line(), if shutdown.is_none() && b.compact.is_none() => match line {
                 Ok(Some(line)) => {
                     let line = line.trim_end_matches('\r');
                     if line.trim().is_empty() {
@@ -815,18 +907,24 @@ pub async fn run(
             std::process::exit(0);
         }
         Some(Exit::Lost(message)) => {
-            let id = b.turn.as_ref().map(|t| t.id.clone());
             eprintln!("synaps rpc: {message}");
-            b.error(id, message).await;
+            if b.busy() {
+                b.cut(&message).await;
+            } else {
+                b.error(None, message).await;
+            }
             drop(b);
             drain_writer(out, writer).await;
             std::process::exit(EXIT_DAEMON_LOST);
         }
         Some(Exit::Ended(reason)) => {
             let message = format!("session ended by the daemon ({reason:?})");
-            let id = b.turn.as_ref().map(|t| t.id.clone());
             eprintln!("synaps rpc: {message}");
-            b.error(id, message).await;
+            if b.busy() {
+                b.cut(&message).await;
+            } else {
+                b.error(None, message).await;
+            }
             drop(b);
             drain_writer(out, writer).await;
             std::process::exit(EXIT_DAEMON_LOST);

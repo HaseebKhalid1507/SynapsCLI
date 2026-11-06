@@ -202,6 +202,12 @@ abort by killing their `synaps` child (Pria's guest agent, Harbor and
 synaps-bench timeouts) need the in-process semantics back. An **owned**
 session gives them: it is bound to the connection that created it.
 
+`synaps rpc` is built on it: every rpc process creates an owned session with
+`forward_secrets` on, in its profile's daemon (auto-spawned like `synaps
+attach`; no daemon → exit 3, no in-process fallback). Its stdin/stdout
+protocol is unchanged ([rpc-protocol.md](rpc-protocol.md)); in `synaps daemon
+sessions` it shows as an `rpc` client.
+
 - **Opt-in at create**: `Attach::Create{config, mode, owned: {forward_secrets?}}`.
   Old clients never send `owned`, so they get today's session, byte for byte.
 - **Capability**: a daemon that honours it lists `"owned_sessions"` in
@@ -854,11 +860,12 @@ reload-state are the same; the operating-system pieces differ:
   saved, then the draft is removed (if that save fails, the draft stays for the next holder). A leftover
   draft of a turn that actually concluded (history already ends with the model's final reply or an
   interruption marker) is just removed; a stale one (its round already committed) contributes no text.
-  Recovery only ever appends, so the cached prefix is untouched. rpc and `synaps server` save every
-  round but keep no draft; they DO take the session lock (`setup::lock_session`): continuing a
-  session another process has live (a TUI, the daemon, another rpc), or one already compacted into a
+  Recovery only ever appends, so the cached prefix is untouched. `synaps rpc` is a daemon client
+  (an owned session, below), so the daemon's rules are its rules. `synaps server` saves every
+  round but keeps no draft; it DOES take the session lock (`setup::lock_session`): continuing a
+  session another process has live (a TUI, the daemon, an rpc), or one already compacted into a
   successor, is refused with the reason named, instead of running a second writer on the same
-  history — and, as lock holders, they recover a draft their predecessor left. Legacy chat takes no
+  history — and, as lock holder, it recovers a draft its predecessor left. Legacy chat takes no
   lock. Deleting a session (and retention) removes its draft.
 - Refuse-to-start (exit 3): flag unset; another daemon holds the lock.
 - Daemon lost (exit 4, `EXIT_DAEMON_LOST`): the daemon was killed/crashed, the client could not reconnect

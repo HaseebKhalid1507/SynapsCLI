@@ -8,9 +8,37 @@
 child process per Slack thread and communicates with it over the child's
 `stdin` / `stdout` pipes.
 
-**One process = one synaps session.**  The child reuses the same `Runtime`,
-`Session`, and streaming engine that `synaps server` uses, so tool execution,
-MCP, skills, and session persistence all work identically.
+**One process = one synaps session.**
+
+### Architecture: a daemon client
+
+`synaps rpc` runs no engine of its own. It connects to the session daemon for
+its profile (`--profile` / `SYNAPS_PROFILE`), auto-spawning it exactly as
+`synaps attach` does (run dir `$SYNAPS_RUNTIME_DIR`, else
+`$SYNAPS_BASE_DIR/run`), and creates an **owned** session there: the
+session's cwd and environment are this process's, and the secret env vars
+the daemon normally strips are forwarded to the session's tools (in memory
+only). It then translates each command below into a session command and
+each session event back into the frames below. The turn loop, tools,
+saves, context-head checkpoints, event auto-turns and turn budgets are the
+session actor's — the same code a TUI or `synaps attach` session runs.
+
+**The protocol is unchanged**: same frames, fields and order (a golden-
+fixture differential test, `tests/rpc_differential.rs`, holds it to the
+pre-daemon output). What follows from the new architecture:
+
+- The session is owned by the process: when it exits or is killed, the
+  daemon cancels any running turn, saves, and ends the session.
+- No daemon, no rpc: with `SYNAPS_DAEMON=0`, or autospawn off
+  (`SYNAPS_DAEMON_AUTOSPAWN=0`) and no daemon running, or a failed spawn,
+  the child writes one `error` frame (no `ready`), says why on stderr and
+  exits **3**. There is no in-process fallback.
+- Losing the daemon (crash, or a lagging event stream the daemon cut off,
+  which would otherwise drop events and usage) is an `error` frame (with the
+  in-flight prompt's id, if any) and exit **4**.
+- A `synaps daemon reload` cancels an in-flight turn at its checkpoint: the
+  turn ends with `error` + `agent_end` + `response {ok: false}`; the child
+  re-binds to its session and carries on (stdin is buffered meanwhile).
 
 ---
 
@@ -146,7 +174,11 @@ never reported; otherwise it is the sum of the reported values.
 | Malformed JSON                   | Emit `error` with `id: null`; **stay alive**                 |
 | Runtime error during `prompt`    | Emit `error` with `id: <prompt-id>`, then `agent_end`, then `response {ok: false}` |
 | `prompt` while one is in flight  | Emit `error` with the new command's `id`; **do not cancel** the running stream |
-| stdin EOF                        | Save session and exit 0 (same as `shutdown`)                 |
+| stdin EOF                        | End the session (an in-flight turn is cancelled, the session saved) and exit 0 |
+| `shutdown`                       | Let an in-flight turn finish (≤ 30 s), end the session, exit 0 |
+| No session daemon                | Emit `error` with `id: null` (no `ready`), exit 3            |
+| Session daemon lost              | Emit `error` (in-flight prompt's `id`, else null), exit 4    |
+| `--continue` of a live session   | Refused: reason on stderr, exit 1, no `ready`                |
 
 ---
 
@@ -157,7 +189,7 @@ background streaming task; the reader loop continues to accept commands while
 the stream runs.  The **only** commands that should be sent while a prompt is in
 flight are:
 
-- `abort` — cancels the stream via a `CancellationToken`
+- `abort` — cancels the turn (the session's `Cancel`)
 - `get_state` — non-mutating snapshot
 - `get_session_stats` — non-mutating snapshot
 

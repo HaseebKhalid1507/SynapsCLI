@@ -766,3 +766,31 @@ async fn concurrent_continue_refused() {
     assert_eq!(r["ok"], true, "{r}");
     a.shutdown().await;
 }
+
+/// `synaps daemon reload --now` mid-turn: the checkpoint cuts the turn, which
+/// ends with its terminal frames (error, agent_end, response ok:false); the
+/// rpc re-binds to its session and keeps serving; shutdown still exits 0.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reload_mid_turn_rebinds() {
+    let env = Env::new(Script::Endless(ANTHROPIC_SSE_PREFIX)).await;
+    let mut rpc = env.rpc(&[]).await;
+    let sid = rpc.ready().await;
+    rpc.send(json!({"type": "prompt", "id": "p1", "message": "go"})).await;
+    rpc.until("text", |v| v["event"]["type"] == "text_delta").await;
+
+    let out = env.cmd(&["daemon", "reload", "--now"]).stdin(Stdio::null()).output().await.unwrap();
+    assert!(out.status.success(), "reload: {}", String::from_utf8_lossy(&out.stderr));
+
+    let r = rpc.response("p1").await;
+    assert_eq!(r["ok"], false, "{r}");
+    let n = rpc.frames.len();
+    assert_eq!(rpc.frames[n - 2]["type"], "agent_end", "{:#?}", rpc.frames);
+    assert!(rpc.frames.iter().any(|f| f["type"] == "error" && f["id"] == "p1"), "{:#?}", rpc.frames);
+
+    // Re-bound: the same session answers.
+    rpc.send(json!({"type": "get_state", "id": "g1"})).await;
+    let g = rpc.response("g1").await;
+    assert_eq!(g["session_id"], sid.as_str(), "{g}");
+    let frames = rpc.shutdown().await;
+    assert_eq!(frames.last().unwrap()["_exit"], 0, "{frames:#?}");
+}
