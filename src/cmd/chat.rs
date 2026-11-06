@@ -555,10 +555,13 @@ async fn run_session(
             err!("❯ ");
             prompt_shown = true;
         }
-        // stdin only while idle: a piped line is always a Submit.
+        // stdin only while idle: a piped line is always a Submit. Only the
+        // read is raced against stdin; a re-bind after a daemon reload runs
+        // in the arm body, so a line arriving mid-reconnect waits for it
+        // instead of cancelling it and going out on the dead connection.
         let line = tokio::select! {
             biased;
-            ev = next(&mut t, &mut r) => match ev {
+            ev = t.next_event() => match ev {
                 Some(env) => {
                     r.on_event(&t, env).await;
                     if r.ended { break; }
@@ -568,7 +571,11 @@ async fn run_session(
                     if r.idle && r.fatal.is_some() { r.fatal = None; }
                     continue;
                 }
-                None => break,
+                None if r.ended => break,
+                None => {
+                    rebind_or_lost(&mut t, &mut r).await;
+                    continue;
+                }
             },
             line = stdin_lines.next_line(), if r.idle || r.pending_confirm.is_some() => match line {
                 Ok(Some(l)) => l,
