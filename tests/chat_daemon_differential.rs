@@ -365,12 +365,13 @@ fn render(case: &str, runs: &[Run]) -> String {
     s
 }
 
-/// The goldens are default-feature runs. Without `command-exec` the
-/// `bash`/`shell_*` tool schemas are not sent, so the context estimates
-/// (`[compacted → ~N tokens]`, `/status`'s `context: ~N of …`) are smaller
-/// for in-process and daemon chat alike: mask just those numbers there.
+/// The goldens are default-feature Linux runs. Without `command-exec` the
+/// `bash`/`shell_*` tool schemas are not sent, and on Windows the tool set
+/// and schemas differ, so the context estimates (`[compacted → ~N tokens]`,
+/// `/status`'s `context: ~N of …`) differ for in-process and daemon chat
+/// alike: mask just those numbers there.
 fn feature_mask(s: String) -> String {
-    if cfg!(feature = "command-exec") {
+    if cfg!(feature = "command-exec") && !cfg!(windows) {
         return s;
     }
     let re = regex::Regex::new(r"~\d+( tokens| of )").unwrap();
