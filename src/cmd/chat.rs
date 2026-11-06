@@ -257,9 +257,11 @@ impl Render {
 }
 
 /// The next session event. A daemon reload (`Reloading`) re-binds this
-/// owned session within the owner grace; any other loss of the connection
-/// is fatal: the owned session is gone with it, so chat says why and exits
-/// [`EXIT_DAEMON_LOST`]. `None` = the session ended (`Ended` was seen).
+/// owned session within the owner grace (`reconnect` caps its budget at
+/// it); any other loss of the connection — the daemon gone, or this owner
+/// disconnected for lagging (`OwnerLagged`) — is fatal: the owned session
+/// is gone with it, so chat says why and exits [`EXIT_DAEMON_LOST`].
+/// `None` = the session ended (`Ended` was seen).
 async fn next(t: &mut SocketTransport, r: &mut Render) -> Option<Envelope> {
     loop {
         if let Some(env) = t.next_event().await {
@@ -277,6 +279,10 @@ async fn next(t: &mut SocketTransport, r: &mut Render) -> Option<Envelope> {
                 }
                 Err(e) => lost(&format!("the daemon reloaded and the session could not be re-bound: {e}")),
             },
+            Some(TransportError::OwnerLagged { dropped }) => lost(&format!(
+                "chat fell behind the session's event stream ({dropped} event(s) dropped; is stdout blocked?) \
+                 and the daemon disconnected it rather than drop output"
+            )),
             Some(e) => lost(&e.to_string()),
             None => lost("the daemon closed the connection"),
         }
