@@ -101,6 +101,9 @@ pub(crate) enum WorkBlock {
     /// This session's `on_session_start` has not run yet: a request sent
     /// now would lack its injection.
     SessionStartPending,
+    /// An owned session a reload restored, its owner not back yet: no turn
+    /// may run without the owner (and the secrets it forwards again).
+    AwaitingOwner,
 }
 
 /// A source of autonomous work in the actor's loop: work nobody asked for
@@ -510,6 +513,7 @@ pub(crate) fn command_name(cmd: &SessionCommand) -> &'static str {
         SessionCommand::TakeInput => "take_input",
         SessionCommand::Park => "park",
         SessionCommand::AdoptWorkers { .. } => "adopt_workers",
+        SessionCommand::ArmOwnerRebind => "arm_owner_rebind",
         SessionCommand::RestoreToolActivations { .. } => "restore_tool_activations",
         SessionCommand::ReloadAborted => "reload_aborted",
         SessionCommand::ArmPark => "arm_park",
@@ -921,7 +925,7 @@ impl SessionActor {
                 memory_mode,
             },
         ) = SessionHandle::new(meta.clone(), view);
-        let handle = handle.with_owner_token(cfg.owned.clone());
+        let handle = handle.with_owner_token(cfg.owned.as_ref().map(|o| o.token.clone()));
         let owned = cfg.owned.clone().map(super::owned::OwnedState::new);
         // The mode is fixed for the session: seed the listing with it now.
         // Otherwise only a presence publish (attach, detach, input) carries
@@ -1807,6 +1811,8 @@ impl SessionActor {
     pub(crate) fn autonomous_work_blocked(&self) -> Option<WorkBlock> {
         if self.reload_fence.is_some() {
             Some(WorkBlock::Fenced)
+        } else if self.owned.as_ref().is_some_and(|o| o.awaiting_owner) {
+            Some(WorkBlock::AwaitingOwner)
         } else if !self.session_start.is_done() {
             Some(WorkBlock::SessionStartPending)
         } else {
@@ -1819,7 +1825,7 @@ impl SessionActor {
     pub(crate) fn holds(&self, source: WorkSource) -> bool {
         match self.autonomous_work_blocked() {
             None => false,
-            Some(WorkBlock::Fenced) => true,
+            Some(WorkBlock::Fenced | WorkBlock::AwaitingOwner) => true,
             Some(WorkBlock::SessionStartPending) => matches!(source, WorkSource::KeepWarmTimer),
         }
     }
@@ -1837,6 +1843,7 @@ impl SessionActor {
         }
         match self.autonomous_work_blocked() {
             Some(WorkBlock::Fenced) => return Some("daemon reloading"),
+            Some(WorkBlock::AwaitingOwner) => return Some("waiting for the session's owner to reconnect"),
             Some(WorkBlock::SessionStartPending) => return Some("extensions loading or reloading"),
             None => {}
         }
@@ -3510,7 +3517,7 @@ impl SessionActor {
     /// token is: its canceled tool results say so ("Canceled by user" only
     /// for the user). First cause wins, so a teardown that revokes a driver
     /// and then cancels notes its own cause first.
-    fn note_cancel_cause(&self, reason: crate::engine::interrupt::InterruptReason) {
+    pub(crate) fn note_cancel_cause(&self, reason: crate::engine::interrupt::InterruptReason) {
         if !self.streaming {
             return;
         }
@@ -4756,7 +4763,7 @@ impl SessionActor {
     /// (else read-only + notice); `Takeover` steals with
     /// `InputOwnerChanged{reason: Takeover}` to everyone (the old owner's
     /// client renders the toast).
-    async fn attach(&mut self, client: ClientMeta, mode: AttachMode, owner: Option<super::types::OwnerClaim>) {
+    async fn attach(&mut self, client: ClientMeta, mode: AttachMode, owner: Option<super::types::OwnerBind>) {
         if let Err(e) = self.ensure_live().await {
             self.emit(SessionEventWire::AttachRefused { message: e });
             return;
@@ -4778,9 +4785,12 @@ impl SessionActor {
         );
         // Before the presence publish below: the daemon reads the binding
         // from it once `Attached` arrives.
-        if let Some(claim) = owner {
-            self.bind_owner(cid, claim);
+        let awaiting_owner = self.owned.as_ref().is_some_and(|o| o.awaiting_owner);
+        if let Some(bind) = owner {
+            self.bind_owner(cid, bind);
         }
+        // A restored owned session's owner is back: what it held may run.
+        let resumed = awaiting_owner && self.owned.as_ref().is_some_and(|o| !o.awaiting_owner);
         self.update_attach_state();
         let mut owner_change: Option<(Option<ClientId>, OwnerChangeReason)> = None;
         match mode {
@@ -4802,6 +4812,11 @@ impl SessionActor {
                 owner_change = Some((self.input_owner, reason));
             }
         }
+        // An owned session's input is its owner's alone (the daemon refuses
+        // a non-owner's takeover attach before it gets here).
+        if self.watches_owned(cid) {
+            owner_change = None;
+        }
         if let Some((from, reason)) = owner_change {
             self.input_owner = Some(cid);
             self.emit(SessionEventWire::InputOwnerChanged {
@@ -4817,6 +4832,9 @@ impl SessionActor {
             snapshot,
         });
         self.emit(SessionEventWire::ClientJoined { client: cid, kind, name, mode });
+        if resumed && !self.event_queue.is_empty() {
+            self.on_queue_wake().await;
+        }
     }
 
     /// B1 `/takeover`: the sending client takes input in place, as an
@@ -4855,7 +4873,7 @@ impl SessionActor {
     /// Never touches `stream`/`cancel`: the turn keeps running and its
     /// events buffer in the broadcast (§8 detach-without-abort). The owner
     /// leaving passes input to the oldest attached non-`Observe` client.
-    fn detach(&mut self, client: ClientId) {
+    pub(crate) fn detach(&mut self, client: ClientId) {
         if self.attached.remove(&client).is_none() {
             return;
         }
@@ -4865,11 +4883,12 @@ impl SessionActor {
             // `shared`: back to whoever typed last (a script that sent one
             // prompt and left hands input back to the tab in use);
             // `exclusive`: the lowest id, as before. Ties: the lowest id.
+            // An owned session: nobody (only its owner ever holds input).
             let shared = self.client_input == ClientInput::Shared;
             let next = self
                 .attached
                 .iter()
-                .filter(|(_, a)| a.mode != AttachMode::Observe)
+                .filter(|(_, a)| a.mode != AttachMode::Observe && self.owned.is_none())
                 .max_by_key(|(c, a)| (if shared { a.last_input } else { 0 }, std::cmp::Reverse(c.0)))
                 .map(|(c, _)| *c);
             self.input_owner = next;
@@ -5215,6 +5234,15 @@ impl SessionActor {
                 });
                 return ControlFlow::Continue(());
             }
+            // An owned session: only its owner drives it.
+            if let Some(reason) = self.owned_refusal(c, &cmd) {
+                self.emit(SessionEventWire::Refused {
+                    client: c,
+                    command: command_name(&cmd).to_string(),
+                    reason,
+                });
+                return ControlFlow::Continue(());
+            }
             if let Some(reason) = is_input_command(&cmd).then(|| self.input_refusal(c)).flatten() {
                 self.emit(SessionEventWire::Refused {
                     client: c,
@@ -5399,18 +5427,9 @@ impl SessionActor {
             }
             SessionCommand::Attach { client, mode, owner } => self.attach(client, mode, owner).await,
             SessionCommand::Detach { client } => {
-                let owner_left = self.is_session_owner(client);
-                self.detach(client);
-                // An owned session ends with its owner, its turn cancelled
-                // as `Cancel` would (the user's interruption).
-                if owner_left {
-                    if let Some(reason) = self.owner_left() {
-                        self.note_cancel_cause(crate::engine::interrupt::InterruptReason::User);
-                        if self.driver.is_some() {
-                            self.driver_revoke("session ending");
-                        }
-                        return ControlFlow::Break(reason);
-                    }
+                // An owned session ends with its owner.
+                if let Some(reason) = self.detach_client(client) {
+                    return ControlFlow::Break(reason);
                 }
                 // Nobody left to notice a stale period: confirm the prefix
                 // now rather than at the next ping, so a session whose next
@@ -5464,6 +5483,7 @@ impl SessionActor {
             }
             SessionCommand::TakeInput => self.take_input(from),
             SessionCommand::KeepWarm { on: true } if self.owned.is_some() => self.refuse_owned_pin(from),
+            SessionCommand::ArmOwnerRebind => self.arm_owner_rebind(),
             SessionCommand::KeepWarm { on } => {
                 self.keep_warm = on;
                 self.meta.pinned = on; // the attach snapshot's copy
@@ -5827,6 +5847,11 @@ impl SessionTask {
                 }
                 _ = super::owned::rebind_timer(actor.owned.as_ref().and_then(|o| o.rebind_deadline)) => {
                     if let Some(reason) = actor.owner_rebind_expired() {
+                        break reason;
+                    }
+                }
+                _ = super::owned::lease_closed(actor.owned.as_ref().and_then(|o| o.lease())) => {
+                    if let Some(reason) = actor.owner_lease_closed() {
                         break reason;
                     }
                 }

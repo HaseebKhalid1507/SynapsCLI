@@ -885,7 +885,11 @@ pub async fn rehydrate(state: &Arc<DaemonState>, rs: &ReloadState) {
     // stopped, so `sa_1` never names two different workers.
     crate::tools::seed_next_subagent_id(rs.subagent_id_floor());
     for s in &rs.sessions {
-        let config = SessionConfig { owned: s.owner_token.clone(), ..restore_config(&s.config, s.lifecycle) };
+        // Owned: restored unbound, its grace armed only once this image
+        // accepts connections (`Daemon::start`), its autonomous work held
+        // until the owner re-binds.
+        let owned = s.owner_token.clone().map(|token| crate::session::OwnedConfig { token, restored: true });
+        let config = SessionConfig { owned, ..restore_config(&s.config, s.lifecycle) };
         let created = match state.create(config.clone()).await {
             Ok(h) => Ok(h),
             // F23: journal locked by another process — register a Parked
@@ -897,9 +901,10 @@ pub async fn rehydrate(state: &Arc<DaemonState>, rs: &ReloadState) {
                     "daemon: journal locked by another process; registering Parked placeholder"
                 );
                 let sid = crate::session::SessionId::from(s.id.as_str());
+                // `config`, not `s.config`: an owned session stays owned.
                 let (handle, _task) = crate::session::handle::locked_placeholder::spawn(
                     sid,
-                    s.config.clone(),
+                    config.clone(),
                     holder,
                 );
                 state.insert(handle);

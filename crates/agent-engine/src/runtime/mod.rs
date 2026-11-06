@@ -839,7 +839,7 @@ pub struct Runtime {
     /// Per-session environment snapshot (session-identity T1). `None` =
     /// inherit process env (in-process hosts). Daemon sessions carry the
     /// creator client's env; tools apply `env_clear().envs()` when `Some`.
-    env: Option<crate::session::types::SessionEnv>,
+    env: Option<crate::session::types::ToolEnv>,
     /// Names of env vars stripped as secrets (T5).
     env_stripped: Vec<String>,
     /// Shared per-session "already warned" set for env-stripped notices (T5).
@@ -1988,6 +1988,12 @@ impl Runtime {
     /// Per-session environment snapshot handed to tools via
     /// `ToolCapabilities.env`. `None` = inherit process env.
     pub fn set_env(&mut self, env: Option<crate::session::types::SessionEnv>) {
+        self.env = env.map(Into::into);
+    }
+
+    /// [`Self::set_env`] with the forwarded secrets an owned session's tools
+    /// also see (kept apart, merged at spawn).
+    pub fn set_tool_env(&mut self, env: Option<crate::session::types::ToolEnv>) {
         self.env = env;
     }
 
@@ -1995,8 +2001,9 @@ impl Runtime {
         self.env_stripped = stripped;
     }
 
+    /// The session env snapshot (without any forwarded secrets).
     pub fn env(&self) -> Option<&crate::session::types::SessionEnv> {
-        self.env.as_ref()
+        self.env.as_ref().map(|e| &e.vars)
     }
 
     pub fn env_stripped(&self) -> &[String] {

@@ -478,6 +478,11 @@ pub enum ByeReason {
     Reloading { generation: u64, retry_after_ms: u64 },
     Shutdown,
     Detached,
+    /// Owned sessions: the owner's connection fell behind the session's
+    /// event stream (`dropped` events lost), so the daemon closed it rather
+    /// than drop frames silently; the session ended with its owner. Only
+    /// ever sent to an owner, which by construction knows this variant.
+    OwnerLagged { dropped: u64 },
 }
 
 /// `Option<Option<T>>` where a present `null` is `Some(None)` (absent stays

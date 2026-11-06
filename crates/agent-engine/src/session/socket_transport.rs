@@ -662,6 +662,18 @@ impl SocketTransport {
             .unwrap_or(Duration::from_secs(60))
     }
 
+    /// [`Self::reconnect_budget`] for this connection: an owned session's
+    /// owner retries no longer than the daemon's re-bind grace (past it the
+    /// session has ended).
+    pub fn reconnect_budget_here(&self) -> Duration {
+        let budget = Self::reconnect_budget();
+        if self.owner.is_some() {
+            budget.min(crate::session::owned::owner_rebind_grace())
+        } else {
+            budget
+        }
+    }
+
     /// One attempt at reconnecting (Hello + Attach). On success replaces
     /// `self` and returns the snapshot. On `Refused` / `Version` the error is
     /// terminal (caller should stop retrying). Other errors are transient.
@@ -946,6 +958,9 @@ impl ClientTransport for SocketTransport {
                     if let Some(ByeReason::Reloading { generation, .. }) = reason {
                         self.reload_pending = Some(generation);
                     }
+                    if let Some(ByeReason::OwnerLagged { dropped }) = reason {
+                        self.last_error = Some(TransportError::OwnerLagged { dropped });
+                    }
                     self.ended = true;
                     if let Some(generation) = self.reload_pending {
                         self.last_error = Some(TransportError::Reloading { generation });
@@ -1014,11 +1029,7 @@ impl ClientTransport for SocketTransport {
             owner: self.owner.clone(),
         });
         let mode = if was_owner { AttachMode::Takeover } else { mode };
-        let total = std::env::var("SYNAPS_TUI_ATTACH_RECONNECT_SECS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .map(Duration::from_secs)
-            .unwrap_or(Duration::from_secs(60));
+        let total = self.reconnect_budget_here();
         let deadline = tokio::time::Instant::now() + total;
         let mut backoff = Duration::from_millis(100);
         let mut last;

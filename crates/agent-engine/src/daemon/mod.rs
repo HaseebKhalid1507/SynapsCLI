@@ -346,6 +346,10 @@ impl DaemonState {
             Ok(real) if real.id == placeholder.id || real.journal_id() == placeholder.id.as_str() => {
                 tracing::info!(session = %placeholder.id, "daemon: locked journal released — placeholder replaced by the real session");
                 self.insert(real.clone());
+                // A restored owned session: the daemon accepts connections.
+                if real.is_owned() {
+                    let _ = real.send(crate::session::SessionCommand::ArmOwnerRebind).await;
+                }
                 real
             }
             Ok(other) => {
@@ -468,6 +472,14 @@ impl Daemon {
         }
 
         let accept = tokio::spawn(listener::accept_loop(Arc::clone(&state), listener, state.shutdown.clone()));
+        // Owned sessions the rehydrate restored start their owner's re-bind
+        // grace now that the owner can actually connect (never during the
+        // restore, which can take longer than the grace).
+        if reload_state.is_some() {
+            for h in state.live_sessions().into_iter().filter(|h| h.is_owned()) {
+                let _ = h.send(crate::session::SessionCommand::ArmOwnerRebind).await;
+            }
+        }
         if let Some(idle) = opts.idle_exit {
             tokio::spawn(idle_monitor(Arc::clone(&state), idle));
         }

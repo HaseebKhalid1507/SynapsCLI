@@ -89,9 +89,17 @@ impl Tool for ShellStartTool {
             })
             .unwrap_or_default();
 
+        // The session's env (an owned session's forwarded secrets merged in
+        // here, at spawn), not the daemon's.
+        let base_env = ctx
+            .capabilities
+            .env
+            .as_ref()
+            .map(|e| e.spawn_vars().map(|(k, v)| (k.to_string(), v.to_string())).collect());
         let opts = super::SessionOpts {
             command,
             working_directory,
+            base_env,
             env,
             rows,
             cols,

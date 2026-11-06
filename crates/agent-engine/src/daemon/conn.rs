@@ -68,6 +68,7 @@ fn client_may_send(cmd: &SessionCommand, own: ClientId) -> Result<(), &'static s
         C::Resync { .. } => Err("resync: not a client command"),
         C::Park => Err("park: not a client command"),
         C::AdoptWorkers { .. } => Err("adopt_workers: not a client command"),
+        C::ArmOwnerRebind => Err("arm_owner_rebind: not a client command"),
         C::RestoreToolActivations { .. } => Err("restore_tool_activations: not a client command"),
         C::ReloadAborted => Err("reload_aborted: not a client command"),
         C::ArmPark => Err("arm_park: not a client command"),
@@ -387,9 +388,9 @@ pub async fn serve(state: Arc<DaemonState>, stream: ServerStream, shutdown: Canc
     let mut owner_claim: Option<OwnerClaim> = None;
     let (handle, mode) = match attach {
         Attach::Existing { session_id, mode } => match state.attach(&session_id) {
-            Some(h) if h.meta().locked_by.is_some() => (state.retry_locked_placeholder(h).await, mode),
             Some(h) => {
                 owner_claim = hello.reconnect_of.as_ref().and_then(|r| r.owner.clone());
+                let h = if h.meta().locked_by.is_some() { state.retry_locked_placeholder(h).await } else { h };
                 (h, mode)
             }
             None => {
@@ -415,7 +416,7 @@ pub async fn serve(state: Arc<DaemonState>, stream: ServerStream, shutdown: Canc
             }
             if let Some(owned) = owned {
                 let token = OwnerToken::mint();
-                config.owned = Some(token.clone());
+                config.owned = Some(OwnedConfig { token: token.clone(), restored: false });
                 owner_claim = Some(OwnerClaim { token, forward_secrets: owned.forward_secrets });
             }
             // Recorded by the actor from `/memory` (and carried by reload's
@@ -453,24 +454,27 @@ pub async fn serve(state: Arc<DaemonState>, stream: ServerStream, shutdown: Canc
             } else {
                 Vec::new()
             };
-            match state.create(config).await {
-                // An owned session is a new one: never someone else's live
-                // session handed back by attach-if-live.
-                Ok(h) if before.contains(&h.id) && owner_claim.is_some() => {
-                    let _ = tx
-                        .send(DaemonFrame::Error {
-                            session_id: Some(h.id.clone()),
-                            message: format!(
-                                "create owned session: {} is already running in this daemon; an owned session \
-                                 cannot take over a live one (attach to it instead)",
-                                h.id
-                            ),
-                        })
-                        .await;
-                    let _ = tx.send(DaemonFrame::Bye { reason: None }).await;
-                    let _ = writer.await;
-                    return;
+            let retry = owner_claim.is_some().then(|| config.clone());
+            let mut created = state.create(config).await;
+            // An owned session is never someone else's live session handed
+            // back by attach-if-live. A continue target nobody is attached
+            // to (parked, or idle) is ended (saved) and its journal adopted
+            // as owned; one with clients attached is refused.
+            if let (Some(cfg), Ok(h)) = (retry, &created) {
+                if before.contains(&h.id) {
+                    created = match adopt_live_continue_target(&state, h).await {
+                        // Attach-if-live again (it came back meanwhile) is
+                        // a session someone else runs: refused.
+                        Ok(()) => match state.create(cfg).await {
+                            Ok(h2) if !h2.is_owned() => Err(format!("{} is running in this daemon again", h2.id)),
+                            other => other,
+                        },
+                        Err(why) => Err(why),
+                    }
+                    .map_err(|why| format!("owned: {why}"));
                 }
+            }
+            match created {
                 Ok(h) if before.contains(&h.id) => {
                     tracing::info!(session = %h.id, "daemon: continue target is live — attaching, not creating");
                     attached_to_live = true;
@@ -478,7 +482,11 @@ pub async fn serve(state: Arc<DaemonState>, stream: ServerStream, shutdown: Canc
                 }
                 Ok(h) => (h, mode),
                 Err(e) => {
-                    let _ = tx.send(DaemonFrame::Error { session_id: None, message: format!("create session: {e}") }).await;
+                    let message = match e.strip_prefix("owned: ") {
+                        Some(why) => format!("create owned session: {why}"),
+                        None => format!("create session: {e}"),
+                    };
+                    let _ = tx.send(DaemonFrame::Error { session_id: None, message }).await;
                     let _ = tx.send(DaemonFrame::Bye { reason: None }).await;
                     let _ = writer.await;
                     return;
@@ -490,7 +498,7 @@ pub async fn serve(state: Arc<DaemonState>, stream: ServerStream, shutdown: Canc
     // A re-bind must name this session's owner token: anything else fails
     // loudly rather than attaching as a plain client the owner thinks owns.
     if let Some(claim) = &owner_claim {
-        if handle.owner_token() != Some(&claim.token) {
+        if !handle.owner_token().is_some_and(|t| t.matches(&claim.token)) {
             let _ = tx
                 .send(DaemonFrame::Error {
                     session_id: Some(handle.id.clone()),
@@ -502,10 +510,29 @@ pub async fn serve(state: Arc<DaemonState>, stream: ServerStream, shutdown: Canc
             return;
         }
     }
+    // Only its owner drives an owned session: nobody takes it over.
+    if owner_claim.is_none() && handle.is_owned() && mode == AttachMode::Takeover {
+        let _ = tx
+            .send(DaemonFrame::Error {
+                session_id: Some(handle.id.clone()),
+                message: format!("session {}: {}", handle.id, crate::session::owned::OWNED_TAKEOVER_REFUSAL),
+            })
+            .await;
+        let _ = tx.send(DaemonFrame::Bye { reason: None }).await;
+        let _ = writer.await;
+        return;
+    }
     let owner = owner_claim.is_some();
+    // The owner's liveness lease: cancelled when this task ends, however it
+    // ends (EOF, error, panic, an attach that times out below after the
+    // actor already queued the claim). The `Detach` this task sends on the
+    // way out is the fast path; this is what the session relies on.
+    let owner_alive = CancellationToken::new();
+    let _owner_alive_guard = owner.then(|| owner_alive.clone().drop_guard());
+    let owner_bind = owner_claim.map(|claim| OwnerBind { claim, alive: owner_alive.clone() });
 
     let mut rx = handle.subscribe();
-    if let Err(e) = handle.send(SessionCommand::Attach { client: hello.client.clone(), mode, owner: owner_claim }).await {
+    if let Err(e) = handle.send(SessionCommand::Attach { client: hello.client.clone(), mode, owner: owner_bind }).await {
         let _ = tx.send(DaemonFrame::Error { session_id: Some(handle.id.clone()), message: format!("attach: {e}") }).await;
         let _ = tx.send(DaemonFrame::Bye { reason: None }).await;
         let _ = writer.await;
@@ -588,6 +615,12 @@ pub async fn serve(state: Arc<DaemonState>, stream: ServerStream, shutdown: Canc
     let skip = move |env: &Envelope| -> bool {
         !forwarded(history, caps, env) || (legacy && matches!(env.event, SessionEventWire::InputOwnerChanged { .. }))
     };
+    // The owner of an owned session must never miss a frame silently (a
+    // headless client keys on `Usage`/`Done`/tool results): its lag closes
+    // its connection with `Bye{owner_lagged}` (and so ends the session).
+    let owner_lag = CancellationToken::new();
+    let owner_lag_dropped = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let (fwd_lag, fwd_lag_dropped) = (owner_lag.clone(), Arc::clone(&owner_lag_dropped));
     // Not tied to `shutdown`: on daemon stop the client must still see `Ended`.
     let mut forward = tokio::spawn(async move {
         loop {
@@ -623,6 +656,12 @@ pub async fn serve(state: Arc<DaemonState>, stream: ServerStream, shutdown: Canc
                         break;
                     }
                 }
+                Err(broadcast::error::RecvError::Lagged(n)) if owner => {
+                    tracing::warn!(session = %fwd_handle.id, dropped = n, "daemon: the owner lagged; closing its connection");
+                    fwd_lag_dropped.store(n, Ordering::SeqCst);
+                    fwd_lag.cancel();
+                    break;
+                }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
                     tracing::warn!(session = %fwd_handle.id, dropped = n, "daemon: client lagged");
                     let env = Envelope {
@@ -643,10 +682,12 @@ pub async fn serve(state: Arc<DaemonState>, stream: ServerStream, shutdown: Canc
     let mut ended = false;
     let mut stopping = false;
     let mut reloading = false;
+    let mut lagged = false;
     let announce = state.announce();
     loop {
         let frame = tokio::select! {
             _ = shutdown.cancelled() => { stopping = true; break; }
+            _ = owner_lag.cancelled() => { lagged = true; break; }
             _ = announce.cancelled() => { reloading = true; break; }
             _ = handle.closed() => { ended = true; break; }
             r = read_frame(&mut reader, &mut line) => r,
@@ -787,10 +828,55 @@ pub async fn serve(state: Arc<DaemonState>, stream: ServerStream, shutdown: Canc
     if !handle.is_alive() {
         state.remove(&sid);
     }
-    let _ = tx.send(DaemonFrame::Bye { reason: None }).await;
+    let reason = if lagged {
+        let dropped = owner_lag_dropped.load(Ordering::SeqCst);
+        let _ = tx
+            .send(DaemonFrame::Error {
+                session_id: Some(sid.clone()),
+                message: format!(
+                    "owned session: this connection (the owner) fell behind the session's event stream and \
+                     {dropped} event(s) were dropped; the connection is closed, ending the session, rather than \
+                     lose them silently"
+                ),
+            })
+            .await;
+        Some(ByeReason::OwnerLagged { dropped })
+    } else {
+        None
+    };
+    let _ = tx.send(DaemonFrame::Bye { reason }).await;
     drop(tx);
     let _ = tokio::time::timeout(Duration::from_millis(500), writer).await;
     tracing::debug!(session = %sid, client = client.0, "daemon: client detached");
+}
+
+/// An owned create's `continue_session` names `live`, running in this
+/// daemon. Nobody attached (parked, or idle between clients): end it the
+/// way `synaps daemon close` would (saved, never mid-turn) so the create
+/// adopts its journal. Clients attached, another owner's session, or a
+/// session that will not close: refused, with why.
+async fn adopt_live_continue_target(state: &DaemonState, live: &SessionHandle) -> Result<(), String> {
+    let sid = live.id.clone();
+    if live.is_owned() {
+        return Err(format!("{sid} is another client's owned session"));
+    }
+    let clients = live.presence().clients;
+    if clients > 0 {
+        return Err(format!(
+            "{sid} is running in this daemon, attached by {clients} client(s); an owned session cannot take over a \
+             session others use (attach to it instead, or detach them first)"
+        ));
+    }
+    match super::close::close_session(state, &sid, false, false).await {
+        DaemonFrame::Closed { .. } => {
+            tracing::info!(session = %sid, "daemon: owned create adopts a client-less live session's journal");
+            Ok(())
+        }
+        DaemonFrame::Refused { message, .. } | DaemonFrame::Error { message, .. } => {
+            Err(format!("{sid} is running in this daemon and could not be ended to adopt it: {message}"))
+        }
+        other => Err(format!("{sid} is running in this daemon; ending it returned {other:?}")),
+    }
 }
 
 /// Whether the pump forwards `env` to this connection's client. Never the

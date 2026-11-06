@@ -638,7 +638,9 @@ pub mod locked_placeholder {
         *ep.memory_mode
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = config.memory_mode;
-        let handle = handle.with_placeholder_config(config.clone());
+        let handle = handle
+            .with_placeholder_config(config.clone())
+            .with_owner_token(config.owned.as_ref().map(|o| o.token.clone()));
         // Start as Parked.
         ep.lifecycle.store(SessionLifecycle::Parked as u8, Ordering::Release);
         let task = tokio::spawn(run(id, ep, config, holder_desc));
@@ -648,9 +650,14 @@ pub mod locked_placeholder {
     async fn run(
         id: SessionId,
         mut ep: SessionEndpoints,
-        _config: SessionConfig,
+        config: SessionConfig,
         holder_desc: String,
     ) {
+        // An owned session's placeholder ends like the session would: its
+        // owner gets the re-bind grace (armed once the daemon accepts
+        // connections), then it is gone. Only a re-bind that finds the
+        // journal released replaces it with the real session.
+        let mut rebind_deadline: Option<tokio::time::Instant> = None;
         let mut seq: u64 = 0;
         let emit = |seq: &mut u64, events: &broadcast::Sender<Envelope>, event: SessionEventWire| {
             let env = Envelope {
@@ -663,8 +670,20 @@ pub mod locked_placeholder {
             let _ = events.send(env);
         };
 
-        while let Some(Addressed { cmd, .. }) = ep.cmd_rx.recv().await {
+        loop {
+            let next = tokio::select! {
+                c = ep.cmd_rx.recv() => c,
+                _ = crate::session::owned::rebind_timer(rebind_deadline) => {
+                    tracing::info!(session = %id, "owned session placeholder: the owner never re-bound; ending it");
+                    emit(&mut seq, &ep.events, SessionEventWire::Ended { reason: EndReason::OwnerGone });
+                    break;
+                }
+            };
+            let Some(Addressed { cmd, .. }) = next else { break };
             match cmd {
+                SessionCommand::ArmOwnerRebind if config.owned.is_some() && rebind_deadline.is_none() => {
+                    rebind_deadline = Some(tokio::time::Instant::now() + crate::session::owned::owner_rebind_grace());
+                }
                 SessionCommand::Attach { .. } => {
                     let msg = format!(
                         "session {}: journal locked by {} \

@@ -36,7 +36,7 @@ pub(crate) fn unix_tool_command(name: &str, ctx: &ToolContext) -> Result<Command
     #[cfg(windows)]
     let program = {
         let path_var = match env {
-            Some(env) => env_lookup(env, "PATH").map(OsString::from),
+            Some(env) => env_lookup(&env.vars, "PATH").map(OsString::from),
             None => std::env::var_os("PATH"),
         };
         let system_root = std::env::var_os("SystemRoot").map(PathBuf::from);
@@ -49,12 +49,12 @@ pub(crate) fn unix_tool_command(name: &str, ctx: &ToolContext) -> Result<Command
 
     let mut cmd = Command::new(program);
     if let Some(env) = env {
-        cmd.env_clear().envs(env.iter().map(|(k, v)| (k, v)));
+        cmd.env_clear().envs(env.spawn_vars());
     }
     #[cfg(windows)]
     {
         let current = match env {
-            Some(env) => env_lookup(env, "MSYS").map(OsString::from),
+            Some(env) => env_lookup(&env.vars, "MSYS").map(OsString::from),
             None => std::env::var_os("MSYS"),
         };
         cmd.env("MSYS", msys_with_noglob(current.as_deref()));

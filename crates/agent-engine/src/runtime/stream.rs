@@ -192,7 +192,7 @@ pub(super) struct StreamSession {
     pub(super) cwd: Option<PathBuf>,
     /// Per-session environment snapshot forwarded as `ToolCapabilities.env`.
     /// `None` = inherit process env (in-process hosts).
-    pub(super) env: Option<crate::session::types::SessionEnv>,
+    pub(super) env: Option<crate::session::types::ToolEnv>,
     /// Names of env vars stripped as secrets (T5).
     pub(super) env_stripped: Vec<String>,
     /// Shared per-session "already warned" set (T5 dedup fix).

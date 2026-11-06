@@ -61,6 +61,59 @@ impl std::fmt::Debug for SecretEnv {
     }
 }
 
+/// What a session's tools spawn with: the session env snapshot, plus (owned
+/// sessions with `forward_secrets` only) the forwarded secrets, kept apart
+/// so no `Debug` of the runtime, the tool capabilities or a worker's
+/// workspace can print them. Merged into a child's env only at spawn
+/// ([`ToolEnv::spawn_vars`]).
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct ToolEnv {
+    pub vars: SessionEnv,
+    secrets: Option<std::sync::Arc<SecretEnv>>,
+}
+
+impl ToolEnv {
+    pub fn with_secrets(vars: SessionEnv, secrets: SecretEnv) -> Self {
+        Self { vars, secrets: (!secrets.0.is_empty()).then(|| std::sync::Arc::new(secrets)) }
+    }
+
+    fn secret_vars(&self) -> &[(String, String)] {
+        self.secrets.as_deref().map(|s| s.0.as_slice()).unwrap_or(&[])
+    }
+
+    /// One var as a child would see it.
+    pub fn get(&self, key: &str) -> Option<&str> {
+        self.secret_vars()
+            .iter()
+            .chain(self.vars.iter())
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+    }
+
+    /// The child's env, at spawn only: the session vars, each forwarded
+    /// secret in place of a var of the same name.
+    pub fn spawn_vars(&self) -> impl Iterator<Item = (&str, &str)> + '_ {
+        let secrets = self.secret_vars();
+        self.vars
+            .iter()
+            .filter(move |(k, _)| !secrets.iter().any(|(s, _)| s == k))
+            .chain(secrets.iter())
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+    }
+}
+
+impl From<SessionEnv> for ToolEnv {
+    fn from(vars: SessionEnv) -> Self {
+        Self { vars, secrets: None }
+    }
+}
+
+impl std::fmt::Debug for ToolEnv {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ToolEnv").field("vars", &self.vars).field("secrets", &self.secrets).finish()
+    }
+}
+
 /// The capability that binds an owned session to its owner: minted by the
 /// daemon at create, returned only to the creating connection, presented
 /// again to re-bind after a daemon reload. `Debug` is redacted.
@@ -78,6 +131,38 @@ impl std::fmt::Debug for OwnerToken {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("OwnerToken(<redacted>)")
     }
+}
+
+impl OwnerToken {
+    /// Constant-time: how long a wrong token takes to refuse says nothing
+    /// about how much of it was right.
+    pub fn matches(&self, other: &OwnerToken) -> bool {
+        let (a, b) = (self.0.as_bytes(), other.0.as_bytes());
+        a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+    }
+}
+
+/// Daemon-set (`SessionConfig::owned`): the session is owned, bound to the
+/// connection that presents `token`.
+#[derive(Clone, Debug)]
+pub struct OwnedConfig {
+    pub token: OwnerToken,
+    /// Restored by a reload's rehydrate: the session waits, unbound and
+    /// holding its autonomous work, until the host arms the re-bind grace
+    /// (`SessionCommand::ArmOwnerRebind`, once the new image accepts
+    /// connections) and its owner re-binds. A fresh create arms the grace
+    /// at once: its creator is attaching right now.
+    pub restored: bool,
+}
+
+/// Host-side (never wire): an owner claim plus the claiming connection's
+/// liveness. The connection task holds a drop guard on `alive` for as long
+/// as it serves, so the actor learns its owner is gone when the task ends
+/// for ANY reason (EOF, error, panic, an attach that timed out after this
+/// was queued), even if no `Detach` ever arrives.
+pub struct OwnerBind {
+    pub claim: OwnerClaim,
+    pub alive: tokio_util::sync::CancellationToken,
 }
 
 /// A connection's claim to be an owned session's owner: the token, plus the
@@ -274,9 +359,9 @@ pub struct SessionConfig {
     pub message_clock: Option<crate::runtime::message_time::MessageClock>,
     /// Set by the daemon (never on the wire, never in the reload record's
     /// config): this session is OWNED, bound to the connection that
-    /// presents this token (see `docs/daemon-mode.md`, "Owned sessions").
+    /// presents its token (see `docs/daemon-mode.md`, "Owned sessions").
     #[serde(skip)]
-    pub owned: Option<OwnerToken>,
+    pub owned: Option<OwnedConfig>,
 }
 
 /// A durable `/memory` mode the user chose for a session
@@ -972,7 +1057,7 @@ pub enum SessionCommand {
         /// Host-set (never wire): the connection claims to own the session
         /// (an owned create, or a re-bind after a reload).
         #[serde(skip)]
-        owner: Option<OwnerClaim>,
+        owner: Option<OwnerBind>,
     },
     Detach { client: ClientId },
     /// Host shutdown of this session: save → on_session_end → leases → Ended.
@@ -1020,6 +1105,11 @@ pub enum SessionCommand {
     /// against their archives and wakes the parent once per worker.
     #[serde(skip)]
     AdoptWorkers { workers: Vec<crate::runtime::subagent::CarriedWorker> },
+    /// Host-only (never wire): the daemon accepts connections again after a
+    /// reload; a restored owned session that still waits for its owner
+    /// starts the re-bind grace now (a no-op for any other session).
+    #[serde(skip)]
+    ArmOwnerRebind,
     /// Host-only (never wire): reload's rehydrate hands the new image the
     /// exact tool activations the session held in the previous image
     /// (`SessionReloadRecord::tool_activations`). The runtime re-validates
@@ -1162,6 +1252,7 @@ impl std::fmt::Debug for SessionCommand {
             Self::Save => f.write_str("Save"),
             Self::TakeInput => f.write_str("TakeInput"),
             Self::Park => f.write_str("Park"),
+            Self::ArmOwnerRebind => f.write_str("ArmOwnerRebind"),
             Self::AdoptWorkers { workers } => f
                 .debug_struct("AdoptWorkers")
                 .field("workers", &workers.iter().map(|w| w.id.as_str()).collect::<Vec<_>>())
@@ -1868,11 +1959,38 @@ mod tests {
         assert!(dbg.contains("GH_TOKEN"), "{dbg}");
     }
 
+    /// Forwarded secrets stay apart in a `ToolEnv`: a child gets them (in
+    /// place of a same-named session var), a `Debug` never prints them.
+    #[test]
+    fn tool_env_merges_secrets_at_spawn_and_never_debugs_them() {
+        let vars = vec![("GH_TOKEN".to_string(), "session-old".to_string()), ("PATH".into(), "/bin".into())];
+        let env = ToolEnv::with_secrets(vars, SecretEnv(vec![("GH_TOKEN".into(), "s3cr3t-value".into())]));
+        let spawn: Vec<(&str, &str)> = env.spawn_vars().collect();
+        assert_eq!(spawn, [("PATH", "/bin"), ("GH_TOKEN", "s3cr3t-value")]);
+        assert_eq!(env.get("GH_TOKEN"), Some("s3cr3t-value"));
+        let dbg = format!("{env:?}");
+        assert!(!dbg.contains("s3cr3t-value") && dbg.contains("GH_TOKEN"), "{dbg}");
+        let plain: ToolEnv = vec![("PATH".to_string(), "/bin".to_string())].into();
+        assert_eq!(plain.spawn_vars().collect::<Vec<_>>(), [("PATH", "/bin")]);
+    }
+
+    #[test]
+    fn owner_tokens_compare_whole() {
+        let t = OwnerToken("abcdef".into());
+        assert!(t.matches(&OwnerToken("abcdef".into())));
+        assert!(!t.matches(&OwnerToken("abcdeg".into())));
+        assert!(!t.matches(&OwnerToken("abcde".into())));
+        assert!(!t.matches(&OwnerToken(String::new())));
+    }
+
     /// `owned` is daemon-set and never rides the wire or the reload
     /// record's config.
     #[test]
     fn session_config_owned_never_serializes() {
-        let cfg = SessionConfig { owned: Some(OwnerToken::mint()), ..Default::default() };
+        let cfg = SessionConfig {
+            owned: Some(OwnedConfig { token: OwnerToken::mint(), restored: false }),
+            ..Default::default()
+        };
         let v = serde_json::to_value(&cfg).unwrap();
         assert!(v.get("owned").is_none(), "{v}");
         let back: SessionConfig = serde_json::from_value(v).unwrap();

@@ -194,7 +194,7 @@ pub struct ToolCapabilities {
     /// Per-session environment snapshot (session-identity T1). `None` =
     /// inherit process env. When `Some`, tools call `env_clear().envs()`
     /// so no daemon env leaks into session subprocesses.
-    pub env: Option<crate::session::types::SessionEnv>,
+    pub env: Option<crate::session::types::ToolEnv>,
     /// Names of env vars stripped as secrets (T5). Tools use this for
     /// loud notices when a command fails referencing a stripped var.
     pub env_stripped: Vec<String>,
