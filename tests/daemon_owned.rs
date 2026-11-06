@@ -669,6 +669,15 @@ async fn only_the_owner_drives_an_owned_session() {
 
     owner.send_from_self(SessionCommand::Submit { text: "hello".into(), attachments: vec![] }).await.unwrap();
     until(&mut owner, |e| matches!(e, SessionEventWire::Idle)).await;
+    // Not even the owner turns on cache keep-warm: spend it never sees.
+    owner
+        .send_from_self(SessionCommand::EngineCommand { id: 8, name: "keepwarm".into(), arg: "auto".into() })
+        .await
+        .unwrap();
+    let seen = until(&mut owner, |e| matches!(e, SessionEventWire::QueryResult { id: 8, .. })).await;
+    let SessionEventWire::QueryResult { value, .. } = &seen.last().unwrap().event else { unreachable!() };
+    assert_eq!(value["kind"], "error", "{value}");
+    assert!(value["text"].as_str().unwrap().contains("never keeps the cache warm"), "{value}");
     mirror.detach().await;
     owner.detach().await;
     wait_gone(&sock, &sid, Duration::from_secs(5)).await;
