@@ -462,7 +462,9 @@ fn check(name: &str, env: &Env, frames: &[Value]) {
     let got: Vec<String> = frames.iter().map(|f| serde_json::to_string(&norm.value(f)).unwrap()).collect();
     let path = golden_dir().join(format!("{name}.jsonl"));
     if std::env::var("SYNAPS_RPC_GOLDEN_UPDATE").as_deref() == Ok("1") {
-        assert!(cfg!(feature = "command-exec"), "write fixtures from a default (command-exec) build");
+        if !cfg!(feature = "command-exec") {
+            panic!("write fixtures from a default (command-exec) build");
+        }
         std::fs::create_dir_all(golden_dir()).unwrap();
         std::fs::write(&path, got.join("\n") + "\n").unwrap();
         return;
