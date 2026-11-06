@@ -1,0 +1,11 @@
+[package]
+name = "mcp-sse-bridge"
+version = "0.1.0"
+edition = "2021"
+
+[profile.release]
+opt-level = "s"
+strip = true
+
+# Standalone: not part of the Synaps workspace.
+[workspace]
