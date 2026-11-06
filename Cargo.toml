@@ -42,7 +42,6 @@ serde_json = "1.0"
 clap = { version = "4.0", features = ["derive"] }
 uuid = { version = "1.0", features = ["v4"] }
 anyhow = "1.0"
-thiserror = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
@@ -58,7 +57,6 @@ rand = "0.9"
 base64 = "0.22"
 urlencoding = "2"
 url = "2"
-toml = "0.8"
 
 
 # Server deps
