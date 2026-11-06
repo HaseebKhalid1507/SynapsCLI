@@ -788,13 +788,20 @@ async fn async_main() -> anyhow::Result<()> {
         }
         unreachable!();
     }
-    if let Some(ref prof) = cli.profile {
+    // `synaps chat --profile X` is chat's own flag (it shadows the global
+    // one, which then stays unset); either pins the process profile.
+    let chat_profile = match &cli.command {
+        Some(Command::Chat { profile, .. }) => profile.clone(),
+        _ => None,
+    };
+    let requested_profile = chat_profile.or_else(|| cli.profile.clone());
+    if let Some(ref prof) = requested_profile {
         synaps_cli::config::set_profile(Some(prof.clone()));
     }
     // Flag, else `SYNAPS_PROFILE`: daemon sockets are chosen by this, so an
     // env-profiled client never lands on the default profile's daemon.
     let active_profile = synaps_cli::config::get_profile();
-    check_profile_applied(cli.profile.as_deref(), active_profile.as_deref())?;
+    check_profile_applied(requested_profile.as_deref(), active_profile.as_deref())?;
 
     match cli.command {
         None if cli.attach.is_some() => {
@@ -826,10 +833,10 @@ async fn async_main() -> anyhow::Result<()> {
             continue_session,
             system,
             agent,
-            profile,
+            profile: _, // pinned above: `active_profile` is the one in effect
             no_extensions,
         }) => {
-            cmd::chat::run(continue_session, system, agent, profile, no_extensions).await?;
+            cmd::chat::run(continue_session, system, agent, active_profile, no_extensions).await?;
         }
         Some(Command::Server {
             port,

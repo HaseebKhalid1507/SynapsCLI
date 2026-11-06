@@ -118,6 +118,32 @@ impl Env {
         tokio::process::Command::from(self.std_cmd(args))
     }
 
+    fn daemon_alive(&self, profile: Option<&str>) -> bool {
+        agent_engine::daemon::registry::is_alive(&agent_engine::daemon::registry::daemon_paths_in(&self.run_dir(), profile))
+    }
+
+    /// Session journals under `profile` (`<base>/<profile>/sessions`).
+    fn journals(&self, profile: Option<&str>) -> usize {
+        let dir = match profile {
+            Some(p) => self.base().join(p).join("sessions"),
+            None => self.base().join("sessions"),
+        };
+        std::fs::read_dir(dir)
+            .map(|rd| rd.flatten().filter(|e| e.path().extension().is_some_and(|x| x == "json")).count())
+            .unwrap_or(0)
+    }
+
+    /// The chat that just ran was served by `profile`'s daemon: it is up (it
+    /// idle-exits seconds after its last client) and the profile journaled
+    /// the session; the other profile has neither.
+    fn assert_served_by(&self, profile: Option<&str>) {
+        let other = if profile.is_some() { None } else { Some("tprof") };
+        assert!(self.daemon_alive(profile), "{profile:?}'s daemon served the chat");
+        assert!(!self.daemon_alive(other), "{other:?}'s daemon was not started");
+        assert!(self.journals(profile) >= 1, "journaled under {profile:?}");
+        assert_eq!(self.journals(other), 0, "nothing journaled under {other:?}");
+    }
+
     fn sessions_text(&self) -> String {
         let mut all = String::new();
         if let Ok(rd) = std::fs::read_dir(self.base().join("sessions")) {
@@ -202,10 +228,15 @@ fn session_prefix(stderr: &[u8]) -> Option<String> {
 }
 
 async fn run_chat(env: &Env, args: &[&str], steps: &[Step]) -> Run {
+    run_chat_with(env, args, &[], steps).await
+}
+
+async fn run_chat_with(env: &Env, args: &[&str], vars: &[(&str, &str)], steps: &[Step]) -> Run {
     let mut full = vec!["chat"];
     full.extend_from_slice(args);
     let mut child = env
         .cmd(&full)
+        .envs(vars.iter().copied())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -516,8 +547,31 @@ async fn profile_and_no_extensions() {
     let (url, _hits, _bodies) = phase2::spawn_stub(Script::Sse(phase2::ANTHROPIC_SSE)).await;
     let env = Env::new(url);
     let p = run_chat(&env, &["--profile", "tprof"], &[Step::Write("hello\n"), Step::Close]).await;
+    env.assert_served_by(Some("tprof"));
     let n = run_chat(&env, &["--no-extensions"], &[Step::Write("hello\n"), Step::Close]).await;
     check_golden("profile_and_no_extensions", &[p, n]);
+}
+
+/// `SYNAPS_PROFILE=tprof` with no flag is the tprof profile, as for every
+/// other client: its daemon serves the session (and journals it under the
+/// profile), also when the default profile's daemon is already up. Same
+/// output as the in-process `plain_turn` golden.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn profile_from_env_uses_its_daemon() {
+    let (url, _hits, _bodies) = phase2::spawn_stub(Script::Sse(phase2::ANTHROPIC_SSE)).await;
+    let env = Env::new(url);
+    let steps = [Step::Write("hello\n"), Step::Close];
+    // No daemon at all: the tprof one is started and dialled.
+    let run = run_chat_with(&env, &[], &[("SYNAPS_PROFILE", "tprof")], &steps).await;
+    env.assert_served_by(Some("tprof"));
+    check_golden("plain_turn", &[run]);
+    // The default daemon up (a plain chat): SYNAPS_PROFILE still wins.
+    let _ = run_chat(&env, &[], &steps).await;
+    assert!(env.daemon_alive(None), "the default chat started the default daemon");
+    let run = run_chat_with(&env, &[], &[("SYNAPS_PROFILE", "tprof")], &steps).await;
+    check_golden("plain_turn", &[run]);
+    assert_eq!(env.journals(Some("tprof")), 2, "both tprof chats journaled under tprof");
+    assert_eq!(env.journals(None), 1, "only the plain chat journaled under the default profile");
 }
 
 // ── daemon-only behaviour (no in-process golden: these did not exist) ──────
