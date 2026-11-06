@@ -12,6 +12,9 @@
 //! connection. stdin EOF and `/quit` end it cleanly first (`End` → `Ended`),
 //! so an immediate `--continue` never races the dying session.
 //! `--no-extensions` uses a private daemon booted without extensions.
+//! Output goes through an ordered in-process queue ([`pump`]): a blocked
+//! terminal never stops chat reading the session, so the daemon never ends
+//! it for owner lag.
 //!
 //! C4a: chat continues turns when pending runtime events are injected at
 //! turn end (AutoTriggerEvents, the actor's wake path), bounded by
@@ -22,8 +25,6 @@
 //! idle, so a piped line is always a `Submit`. Piped stdin, EOF, and CRLF
 //! behaviour are preserved.
 
-use std::io::{self, Write};
-
 use agent_engine::daemon::{self, DaemonOpts, EnsureError, EXIT_DAEMON_LOST, EXIT_REFUSED, EXIT_VERSION};
 use agent_engine::session::socket_transport::SocketTransport;
 use agent_engine::session::wire::{Attach, Hello, FEATURE_NO_EXTENSIONS, MAX_FRAME_BYTES};
@@ -32,9 +33,24 @@ use agent_engine::session::{
     SessionEventWire, SessionQuery, SessionSetting, TransportError,
 };
 use synaps_cli::engine::commands;
-use synaps_cli::flush_stdout;
 use synaps_cli::{AgentEvent, LlmEvent, SessionEvent, StreamEvent};
 use tokio::io::{AsyncBufReadExt, BufReader as TokioBufReader};
+
+/// chat's `print!`/`eprint!`: through [`pump`], never straight to the fds.
+macro_rules! out {
+    ($($t:tt)*) => { pump::out(format!($($t)*)) };
+}
+macro_rules! outln {
+    () => { pump::out(String::from("\n")) };
+    ($($t:tt)*) => { pump::out(format!("{}\n", format_args!($($t)*))) };
+}
+macro_rules! err {
+    ($($t:tt)*) => { pump::err(format!($($t)*)) };
+}
+macro_rules! errln {
+    () => { pump::err(String::from("\n")) };
+    ($($t:tt)*) => { pump::err(format!("{}\n", format_args!($($t)*))) };
+}
 
 /// Query id for the post-compaction token readout (user queries start at 1
 /// and count up). Below `wire::RESERVED_QUERY_ID_BASE`: the socket
@@ -61,7 +77,7 @@ struct Render {
 impl Render {
     fn end_thinking(&mut self) {
         if self.in_thinking {
-            eprintln!("\x1b[0m");
+            errln!("\x1b[0m");
             self.in_thinking = false;
         }
     }
@@ -84,12 +100,11 @@ impl Render {
                     // and take one y/n line. Anything but y/yes denies.
                     self.end_thinking();
                     // Sanitized (prA I-R4-3): no cursor moves or bidi tricks.
-                    eprint!(
+                    err!(
                         "\n[confirm] {}\n{}\n(y/n): ",
                         agent_engine::session::sanitize_prompt_text(&pr.title),
                         agent_engine::session::sanitize_prompt_text(&pr.prompt)
                     );
-                    io::stderr().flush().ok();
                     self.pending_confirm = Some(pr);
                     return;
                 }
@@ -107,19 +122,19 @@ impl Render {
                 }
             }
             SessionEventWire::External(event) => {
-                eprintln!(
+                errln!(
                     "\x1b[36m⚡ [event] {}\x1b[0m",
                     synaps_cli::events::format_event_for_agent(&event)
                 );
             }
             SessionEventWire::AutoTurnCapReached { cap } => {
-                eprintln!(
+                errln!(
                     "\x1b[2m[auto-turn cap ({}) reached — waiting for user input]\x1b[0m",
                     cap
                 );
             }
-            SessionEventWire::SystemNotice(text) => eprintln!("\x1b[2m{}\x1b[0m", text),
-            SessionEventWire::Aborted { context_saved } => eprintln!(
+            SessionEventWire::SystemNotice(text) => errln!("\x1b[2m{}\x1b[0m", text),
+            SessionEventWire::Aborted { context_saved } => errln!(
                 "\x1b[2m{}\x1b[0m",
                 if context_saved {
                     "aborted — partial work kept"
@@ -127,15 +142,15 @@ impl Render {
                     "aborted"
                 }
             ),
-            SessionEventWire::Cleared { session_id } => eprintln!(
+            SessionEventWire::Cleared { session_id } => errln!(
                 "session cleared → {}",
                 &session_id[..8.min(session_id.len())]
             ),
             // B2: spawned compaction reports through typed events — each
             // rendered exactly once.
             SessionEventWire::CompactionStarted { disclosure, .. } => {
-                eprintln!("compacting...");
-                eprintln!("{}", disclosure);
+                errln!("compacting...");
+                errln!("{}", disclosure);
             }
             SessionEventWire::CompactionApplied { .. } => {
                 // `compacted → ~N tokens` needs the post-apply assessment.
@@ -147,16 +162,16 @@ impl Render {
                     .await;
             }
             SessionEventWire::QueryResult { id, value } if id == COMPACT_TOKENS_QUERY => {
-                eprintln!(
+                errln!(
                     "\x1b[2m[compacted → ~{} tokens]\x1b[0m",
                     value["used_tokens"].as_u64().unwrap_or(0)
                 )
             }
             SessionEventWire::CompactionFailed { message, .. } => {
-                eprintln!("\x1b[2m[compaction failed: {}]\x1b[0m", message)
+                errln!("\x1b[2m[compaction failed: {}]\x1b[0m", message)
             }
             SessionEventWire::CompactionCancelled => {
-                eprintln!("\x1b[2m[compaction cancelled]\x1b[0m")
+                errln!("\x1b[2m[compaction cancelled]\x1b[0m")
             }
             SessionEventWire::Ended { .. } => self.ended = true,
             _ => {}
@@ -167,38 +182,35 @@ impl Render {
         match ev {
             StreamEvent::Llm(LlmEvent::Thinking(text)) => {
                 if !self.in_thinking {
-                    eprint!("\x1b[2m");
+                    err!("\x1b[2m");
                     self.in_thinking = true;
                 }
-                eprint!("{}", text);
-                io::stderr().flush().ok();
+                err!("{}", text);
             }
             StreamEvent::Llm(LlmEvent::Text(text)) => {
                 self.end_thinking();
-                print!("{}", text);
-                flush_stdout();
+                out!("{}", text);
             }
             StreamEvent::Llm(LlmEvent::ToolUseStart { tool_name, .. }) => {
                 self.end_thinking();
-                eprint!("\x1b[33m⚙ {}\x1b[0m", tool_name);
-                io::stderr().flush().ok();
+                err!("\x1b[33m⚙ {}\x1b[0m", tool_name);
             }
             StreamEvent::Llm(LlmEvent::ToolUse {
                 tool_name, input, ..
             }) => {
                 let input_preview = serde_json::to_string(&input).unwrap_or_default();
                 let preview: String = input_preview.chars().take(60).collect();
-                eprintln!("\x1b[33m ⚙ {} ({})\x1b[0m", tool_name, preview);
+                errln!("\x1b[33m ⚙ {} ({})\x1b[0m", tool_name, preview);
             }
             StreamEvent::Llm(LlmEvent::ToolResult { result, .. }) => {
                 let preview: String = result.chars().take(80).collect();
-                eprintln!("\x1b[32m  → {}\x1b[0m", preview);
+                errln!("\x1b[32m  → {}\x1b[0m", preview);
             }
             StreamEvent::Agent(AgentEvent::SubagentStart {
                 agent_name,
                 task_preview,
                 ..
-            }) => eprintln!("\x1b[35m🎭 [{}] {}\x1b[0m", agent_name, task_preview),
+            }) => errln!("\x1b[35m🎭 [{}] {}\x1b[0m", agent_name, task_preview),
             StreamEvent::Agent(AgentEvent::SubagentDone {
                 result_preview,
                 duration_secs,
@@ -213,24 +225,24 @@ impl Render {
                     let preview: String = result_preview.chars().take(40).collect();
                     format!("\u{2714} {}", preview)
                 };
-                eprintln!("\x1b[32m✔ {} ({:.1}s)\x1b[0m", status, duration_secs);
+                errln!("\x1b[32m✔ {} ({:.1}s)\x1b[0m", status, duration_secs);
             }
             StreamEvent::Agent(AgentEvent::SteeringDelivered { message }) => {
-                eprintln!("\x1b[33m→ [steering] {}\x1b[0m", message);
+                errln!("\x1b[33m→ [steering] {}\x1b[0m", message);
             }
             StreamEvent::Session(SessionEvent::Notice(text) | SessionEvent::Retry(text)) => {
-                eprintln!("\x1b[2m{}\x1b[0m", text);
+                errln!("\x1b[2m{}\x1b[0m", text);
             }
             StreamEvent::Session(SessionEvent::Done) => {
                 self.end_thinking();
-                println!();
+                outln!();
                 self.streaming = false;
             }
             StreamEvent::Session(SessionEvent::Error(err)) => {
-                eprintln!("\x1b[31m❌ {}\x1b[0m", err.message);
+                errln!("\x1b[31m❌ {}\x1b[0m", err.message);
                 self.end_thinking();
-                println!();
-                eprintln!("\x1b[31m❌ turn failed [{}]\x1b[0m", err.category_label());
+                outln!();
+                errln!("\x1b[31m❌ turn failed [{}]\x1b[0m", err.category_label());
                 self.fatal = Some(err);
                 self.streaming = false;
             }
@@ -291,16 +303,16 @@ async fn next(t: &mut SocketTransport, r: &mut Render) -> Option<Envelope> {
 
 fn lost(why: &str) -> ! {
     r_end_thinking_raw();
-    eprintln!(
+    errln!(
         "synaps chat: lost the session: {why}\n  the session ended with this connection (its journal is kept); \
          resume it with `synaps chat --continue <id>`"
     );
-    std::process::exit(EXIT_DAEMON_LOST);
+    pump::exit(EXIT_DAEMON_LOST);
 }
 
 /// Reset any open dim (thinking) attribute before a fatal line.
 fn r_end_thinking_raw() {
-    eprint!("\x1b[0m");
+    err!("\x1b[0m");
 }
 
 /// `cmd` fits in one daemon frame (the daemon drops a connection that sends
@@ -311,13 +323,26 @@ fn fits_frame(cmd: &SessionCommand) -> bool {
 
 /// What chat prints when no daemon can be had, and how to fix it.
 fn no_daemon(profile: Option<&str>, no_extensions: bool, error: Option<&str>) -> ! {
-    eprintln!("synaps chat: {}", super::attach::daemon_unavailable_message(profile, no_extensions, error));
-    std::process::exit(EXIT_REFUSED);
+    errln!("synaps chat: {}", super::attach::daemon_unavailable_message(profile, no_extensions, error));
+    pump::exit(EXIT_REFUSED);
 }
 
 /// Entry point: connect to (or start) the profile's daemon and run an owned
-/// session over its socket.
+/// session over its socket. Everything printed is written out before this
+/// returns.
 pub async fn run(
+    continue_session: Option<String>,
+    system: Option<String>,
+    agent: Option<String>,
+    profile: Option<String>,
+    no_extensions: bool,
+) -> synaps_cli::Result<()> {
+    let result = run_session(continue_session, system, agent, profile, no_extensions).await;
+    pump::drain();
+    result
+}
+
+async fn run_session(
     continue_session: Option<String>,
     system: Option<String>,
     agent: Option<String>,
@@ -328,20 +353,21 @@ pub async fn run(
     let agent_prompt = match agent {
         Some(ref agent_name) => match synaps_cli::tools::resolve_agent_prompt(agent_name) {
             Ok(p) => {
-                eprintln!("🎭 Agent: {}", agent_name);
+                errln!("🎭 Agent: {}", agent_name);
                 Some(p)
             }
             Err(e) => {
-                eprintln!("❌ {}", e);
-                std::process::exit(1);
+                errln!("❌ {}", e);
+                pump::exit(1);
             }
         },
         None => None,
     };
     if let Some(w) = daemon::legacy_env_warning() {
-        eprintln!("synaps chat: {w}");
+        errln!("synaps chat: {w}");
     }
     let config = synaps_cli::load_config();
+    pump::drain(); // the warnings below write to stderr directly
     agent_engine::host::report_config_warnings(&config);
 
     // ── the daemon: running, or started now (`--attach`'s autospawn) ──
@@ -363,25 +389,25 @@ pub async fn run(
     let conn = match SocketTransport::connect(&paths.sock, Hello::new(ClientKind::Chat)).await {
         Ok(c) => c,
         Err(TransportError::Version { client, daemon }) => {
-            eprintln!(
+            errln!(
                 "synaps chat: protocol version mismatch (client {client}, daemon {daemon}); \
                  run `synaps daemon reload` to restart the daemon on this binary"
             );
-            std::process::exit(EXIT_VERSION);
+            pump::exit(EXIT_VERSION);
         }
         Err(e) => no_daemon(profile.as_deref(), no_extensions, Some(&format!("{}: {e}", paths.sock.display()))),
     };
     if let Some(msg) = daemon::profile_mismatch(conn.welcome.profile.as_deref(), profile.as_deref()) {
-        eprintln!("synaps chat: {msg}");
-        std::process::exit(EXIT_REFUSED);
+        errln!("synaps chat: {msg}");
+        pump::exit(EXIT_REFUSED);
     }
     if conn.welcome.supports(FEATURE_NO_EXTENSIONS) != no_extensions {
-        eprintln!(
+        errln!(
             "synaps chat: the daemon at {} {} extensions; refusing to run this session there",
             paths.sock.display(),
             if no_extensions { "runs" } else { "does not run" }
         );
-        std::process::exit(EXIT_REFUSED);
+        pump::exit(EXIT_REFUSED);
     }
 
     // The session runs where chat runs. `--system` keeps its in-process
@@ -408,8 +434,8 @@ pub async fn run(
     {
         Ok(x) => x,
         Err(e) => {
-            eprintln!("synaps chat: could not create the session in the daemon: {e}");
-            std::process::exit(EXIT_REFUSED);
+            errln!("synaps chat: could not create the session in the daemon: {e}");
+            pump::exit(EXIT_REFUSED);
         }
     };
     if let Some(p) = agent_prompt {
@@ -419,23 +445,23 @@ pub async fn run(
     }
 
     let session_id = snap.meta.id.as_str().to_string();
-    eprintln!(
+    errln!(
         "synaps {} | {} | session {}",
         env!("CARGO_PKG_VERSION"),
         snap.view.model,
         &session_id[..8.min(session_id.len())]
     );
     if snap.meta.continued {
-        eprintln!(
+        errln!(
             "↳ resumed session ({} messages)",
             snap.conversation.api_messages.len()
         );
     }
     let mcp_tools = agent_engine::mcp::cached_tool_count();
     if mcp_tools > 0 {
-        eprintln!("↳ {} MCP servers available", mcp_tools);
+        errln!("↳ {} MCP servers available", mcp_tools);
     }
-    eprintln!();
+    errln!();
 
     let mut r = Render {
         is_tty: std::io::IsTerminal::is_terminal(&std::io::stdin()),
@@ -454,8 +480,7 @@ pub async fn run(
 
     loop {
         if r.idle && r.is_tty && !prompt_shown {
-            eprint!("❯ ");
-            io::stderr().flush().ok();
+            err!("❯ ");
             prompt_shown = true;
         }
         // stdin only while idle: a piped line is always a Submit.
@@ -476,7 +501,7 @@ pub async fn run(
             line = stdin_lines.next_line(), if r.idle || r.pending_confirm.is_some() => match line {
                 Ok(Some(l)) => l,
                 Ok(None) => break,
-                Err(e) => { eprintln!("input error: {}", e); break; }
+                Err(e) => { errln!("input error: {}", e); break; }
             },
         };
         prompt_shown = false;
@@ -498,7 +523,7 @@ pub async fn run(
             if !pending_attachments.is_empty() {
                 let summaries = pending_attachments.summaries();
                 for s in &summaries {
-                    eprintln!("📎 {s}");
+                    errln!("📎 {s}");
                 }
                 let cmd = SessionCommand::Submit {
                     text: String::new(),
@@ -521,7 +546,7 @@ pub async fn run(
             match cmd {
                 "attach" => {
                     if arg.is_empty() {
-                        eprintln!("usage: /attach <path>");
+                        errln!("usage: /attach <path>");
                         continue;
                     }
                     let path_str = arg.trim_matches(|c| c == '"' || c == '\'');
@@ -530,12 +555,12 @@ pub async fn run(
                         Ok(loaded) => match pending_attachments.add(loaded) {
                             Ok(()) => {
                                 let s = pending_attachments.summaries();
-                                eprintln!("📎 staged: {}", s.last().unwrap_or(&String::new()));
+                                errln!("📎 staged: {}", s.last().unwrap_or(&String::new()));
                             }
-                            Err(e) => eprintln!("error: {e}"),
+                            Err(e) => errln!("error: {e}"),
                         },
                         Err(e) => {
-                            eprintln!("error: {path_str}: {e}");
+                            errln!("error: {path_str}: {e}");
                             if !r.is_tty {
                                 // Piped: fail-stop (the session still ends cleanly).
                                 end_session(&mut t, &mut r).await;
@@ -550,10 +575,10 @@ pub async fn run(
                 "attachments" => {
                     let summaries = pending_attachments.summaries();
                     if summaries.is_empty() {
-                        eprintln!("no pending attachments");
+                        errln!("no pending attachments");
                     } else {
                         for (i, s) in summaries.iter().enumerate() {
-                            eprintln!("  [{i}] {s}");
+                            errln!("  [{i}] {s}");
                         }
                     }
                     continue;
@@ -563,19 +588,19 @@ pub async fn run(
                     if arg.is_empty() || arg == "all" || arg == "clear" {
                         pending_attachments.clear();
                         if n > 0 {
-                            eprintln!("detached {n} file(s)");
+                            errln!("detached {n} file(s)");
                         } else {
-                            eprintln!("no pending attachments");
+                            errln!("no pending attachments");
                         }
                     } else if let Ok(idx) = arg.parse::<usize>() {
                         if idx < n {
                             pending_attachments.remove(idx);
-                            eprintln!("detached [{idx}]");
+                            errln!("detached [{idx}]");
                         } else {
-                            eprintln!("no attachment at index {idx}");
+                            errln!("no attachment at index {idx}");
                         }
                     } else {
-                        eprintln!("usage: /detach [n|all]");
+                        errln!("usage: /detach [n|all]");
                     }
                     continue;
                 }
@@ -597,9 +622,9 @@ pub async fn run(
             }
             match reply["kind"].as_str().unwrap_or("none") {
                 "quit" => break,
-                "notice" => eprintln!("{}", reply["text"].as_str().unwrap_or("")),
-                "error" => eprintln!("error: {}", reply["text"].as_str().unwrap_or("")),
-                "output" => println!("{}", reply["text"].as_str().unwrap_or("")),
+                "notice" => errln!("{}", reply["text"].as_str().unwrap_or("")),
+                "error" => errln!("error: {}", reply["text"].as_str().unwrap_or("")),
+                "output" => outln!("{}", reply["text"].as_str().unwrap_or("")),
                 "unhandled" => match cmd {
                     "clear" => {
                         let _ = t.send(SessionCommand::NewSession).await;
@@ -619,7 +644,7 @@ pub async fn run(
                             Ok(sessions) => {
                                 for s in sessions.iter().take(20) {
                                     let marker = if s.id == current { "→ " } else { "  " };
-                                    eprintln!(
+                                    errln!(
                                         "{}{} {} ({}, ${:.4})",
                                         marker,
                                         &s.id[..8],
@@ -629,7 +654,7 @@ pub async fn run(
                                     );
                                 }
                             }
-                            Err(e) => eprintln!("error: {}", e),
+                            Err(e) => errln!("error: {}", e),
                         }
                     }
                     "status" => {
@@ -652,16 +677,16 @@ pub async fn run(
                             .await;
                         let ctx = r.reply(&mut t, id2).await;
                         let sid = st["session"].as_str().unwrap_or("");
-                        eprintln!("session: {}", &sid[..8.min(sid.len())]);
-                        eprintln!("model: {}", st["model"].as_str().unwrap_or(""));
-                        eprintln!(
+                        errln!("session: {}", &sid[..8.min(sid.len())]);
+                        errln!("model: {}", st["model"].as_str().unwrap_or(""));
+                        errln!(
                             "tokens: {}↑ {}↓",
                             st["tokens"]["input"].as_u64().unwrap_or(0),
                             st["tokens"]["output"].as_u64().unwrap_or(0)
                         );
-                        eprintln!("cost: ${:.4}", st["cost"].as_f64().unwrap_or(0.0));
-                        eprintln!("messages: {}", st["messages"].as_u64().unwrap_or(0));
-                        eprintln!(
+                        errln!("cost: ${:.4}", st["cost"].as_f64().unwrap_or(0.0));
+                        errln!("messages: {}", st["messages"].as_u64().unwrap_or(0));
+                        errln!(
                             "context: ~{} of {} budget tokens ({} window)",
                             ctx["used_tokens"].as_u64().unwrap_or(0),
                             ctx["budget_tokens"].as_u64().unwrap_or(0),
@@ -669,10 +694,10 @@ pub async fn run(
                         );
                     }
                     "help" => {
-                        eprintln!("commands: /model /thinking /compact /clear /sessions /status /attach /attachments /detach /quit");
-                        eprintln!("quitting (or EOF) mid-turn cancels the turn; its partial work is kept in history for the next --continue");
+                        errln!("commands: /model /thinking /compact /clear /sessions /status /attach /attachments /detach /quit");
+                        errln!("quitting (or EOF) mid-turn cancels the turn; its partial work is kept in history for the next --continue");
                     }
-                    _ => eprintln!("unknown command: /{} (try /help)", cmd),
+                    _ => errln!("unknown command: /{} (try /help)", cmd),
                 },
                 _ => {}
             }
@@ -685,7 +710,7 @@ pub async fn run(
         } else {
             let summaries = pending_attachments.summaries();
             for s in &summaries {
-                eprintln!("📎 {s}");
+                errln!("📎 {s}");
             }
             pending_attachments.take_blocks()
         };
@@ -713,13 +738,13 @@ pub async fn run(
     end_session(&mut t, &mut r).await;
 
     if !pending_attachments.is_empty() {
-        eprintln!(
+        errln!(
             "warning: {} unsent attachment(s) discarded",
             pending_attachments.len()
         );
     }
 
-    eprintln!(
+    errln!(
         "session saved: {} (${:.4})",
         &session_id[..8.min(session_id.len())],
         r.cost
@@ -736,7 +761,7 @@ pub async fn run(
 }
 
 fn oversize() {
-    eprintln!(
+    errln!(
         "error: message too large for one daemon frame ({} MiB limit); not sent",
         MAX_FRAME_BYTES / (1024 * 1024)
     );
@@ -758,6 +783,128 @@ async fn end_session(t: &mut SocketTransport, r: &mut Render) {
         match t.next_event().await {
             Some(env) => r.on_event(t, env).await,
             None => break,
+        }
+    }
+}
+
+/// chat's output: ordered, and never blocking the session reader.
+///
+/// chat's session is owned, and the daemon ends an owned session whose
+/// owner stops reading its events (PR 3: lag → `Bye{owner_lagged}`). A
+/// terminal that stops taking output (a paused terminal, `| less`, a slow
+/// pipe) must not do that, so nothing chat prints is written on the reader's
+/// path: stdout and stderr chunks go, in order, through one queue that a
+/// writer thread drains (flushing each, as the old `flush_stdout` calls did).
+/// A blocked stdout only grows the queue; past [`QUEUE_CAP`] bytes output is
+/// dropped and counted instead, and the count is reported on stderr once the
+/// queue drains. A stdout write error (the reader went away) ends chat
+/// (exit 1), as a failed `print!` did; the owned session ends with it.
+mod pump {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc::{channel, sync_channel, Receiver, Sender, SyncSender};
+    use std::sync::OnceLock;
+
+    /// Bytes queued (not yet written) before output is dropped.
+    const QUEUE_CAP: usize = 64 << 20;
+
+    enum Chunk {
+        Out(String),
+        Err(String),
+        Barrier(SyncSender<()>),
+    }
+
+    struct Pump {
+        tx: Sender<Chunk>,
+        queued: AtomicUsize,
+        dropped: AtomicUsize,
+    }
+
+    static PUMP: OnceLock<Pump> = OnceLock::new();
+
+    fn pump() -> &'static Pump {
+        PUMP.get_or_init(|| {
+            let (tx, rx) = channel();
+            std::thread::Builder::new()
+                .name("chat-output".into())
+                .spawn(move || writer(rx))
+                .expect("spawn the chat output thread");
+            Pump { tx, queued: AtomicUsize::new(0), dropped: AtomicUsize::new(0) }
+        })
+    }
+
+    fn push(chunk: Chunk, len: usize) {
+        let p = pump();
+        if p.queued.load(Ordering::SeqCst) + len > QUEUE_CAP {
+            p.dropped.fetch_add(len, Ordering::SeqCst);
+            return;
+        }
+        p.queued.fetch_add(len, Ordering::SeqCst);
+        let _ = p.tx.send(chunk);
+    }
+
+    pub(super) fn out(s: String) {
+        if !s.is_empty() {
+            let n = s.len();
+            push(Chunk::Out(s), n);
+        }
+    }
+
+    pub(super) fn err(s: String) {
+        if !s.is_empty() {
+            let n = s.len();
+            push(Chunk::Err(s), n);
+        }
+    }
+
+    /// Wait until everything queued so far is written.
+    pub(super) fn drain() {
+        let Some(p) = PUMP.get() else { return };
+        let (done_tx, done_rx) = sync_channel(1);
+        if p.tx.send(Chunk::Barrier(done_tx)).is_ok() {
+            let _ = done_rx.recv();
+        }
+    }
+
+    /// `std::process::exit` after the queued output is written.
+    pub(super) fn exit(code: i32) -> ! {
+        drain();
+        std::process::exit(code)
+    }
+
+    fn writer(rx: Receiver<Chunk>) {
+        for chunk in rx {
+            let p = PUMP.get().expect("the pump is set before its first chunk");
+            match chunk {
+                Chunk::Out(s) => {
+                    let mut o = std::io::stdout().lock();
+                    let r = o.write_all(s.as_bytes()).and_then(|()| o.flush());
+                    drop(o);
+                    p.queued.fetch_sub(s.len(), Ordering::SeqCst);
+                    if let Err(e) = r {
+                        let _ = writeln!(std::io::stderr(), "synaps chat: stdout: {e}");
+                        std::process::exit(1);
+                    }
+                }
+                Chunk::Err(s) => {
+                    let mut e = std::io::stderr().lock();
+                    let _ = e.write_all(s.as_bytes()).and_then(|()| e.flush());
+                    drop(e);
+                    p.queued.fetch_sub(s.len(), Ordering::SeqCst);
+                }
+                Chunk::Barrier(done) => {
+                    let _ = done.send(());
+                }
+            }
+            if p.queued.load(Ordering::SeqCst) == 0 {
+                let dropped = p.dropped.swap(0, Ordering::SeqCst);
+                if dropped > 0 {
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "\x1b[2m[synaps chat: {dropped} bytes of output dropped while the output was blocked]\x1b[0m"
+                    );
+                }
+            }
         }
     }
 }

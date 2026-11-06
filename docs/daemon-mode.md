@@ -296,6 +296,12 @@ session gives them: it is bound to the connection that created it.
   so it never re-binds across the gap. Its session, fenced for the exec, ends
   when the re-bind grace passes. Other clients keep the usual "event stream
   lagged" notice.
+  `synaps chat` is an owner that a slow terminal cannot lag: it never writes
+  to stdout/stderr on its socket-reading path (an ordered in-process output
+  queue drained by a writer thread; past 64 MiB queued, output is dropped
+  with a stderr note instead), so a paused terminal or `| less` grows chat's
+  queue, not the daemon's. The TUI is never an owner: a human's session
+  outlives its window, and a lagging TUI gets the notice.
 - **Never parked, idle-ended or pinned**: `synaps daemon pin` and `/pin`
   (`KeepWarm{on}`) are refused ("owned by the client that created it … cannot be
   pinned or kept warm"); `synaps attach --owned --keep-warm` is a usage error.

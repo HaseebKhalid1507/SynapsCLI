@@ -665,3 +665,66 @@ async fn no_extensions_runs_no_extension_hooks() {
     let body = String::from_utf8_lossy(b.last().unwrap());
     assert!(body.contains("CHATDIFF-NOEXT two") && body.contains(sentinel), "control injected: {body}");
 }
+
+/// `phase2::ANTHROPIC_SSE` with its one text delta replaced by `deltas`
+/// deltas of `text` each.
+fn flood_sse(deltas: usize, text: &str) -> String {
+    let frames: Vec<&str> = phase2::ANTHROPIC_SSE.split_inclusive("\n\n").collect();
+    assert!(frames[2].contains("text_delta"), "fixture shape changed");
+    let delta = format!(
+        "data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"{text}\"}}}}\n\n"
+    );
+    let mut body = frames[..2].concat();
+    body.push_str(&delta.repeat(deltas));
+    body.push_str(&frames[3..].concat());
+    body
+}
+
+/// A blocked stdout must not cost the session. The daemon ends an owned
+/// session whose owner stops reading (PR 3: lag → `Bye{owner_lagged}`), so
+/// chat drains the socket into its own output queue and never makes the
+/// daemon wait on the terminal (a paused terminal, `| less`). Here nobody
+/// reads chat's stdout while a reply far larger than the pipe and socket
+/// buffers streams, at a provider-like pace, through a 16-event session
+/// buffer; once read, all of it is there and chat exits 0. (A chat that
+/// writes on its reading path blocks on the full pipe and is disconnected:
+/// `lost the session`, exit 4.)
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn blocked_stdout_does_not_lag_the_owner_off() {
+    const DELTAS: usize = 1500;
+    const WIDTH: usize = 1000;
+    let body: &'static str = Box::leak(flood_sse(DELTAS, &"x".repeat(WIDTH)).into_boxed_str());
+    let (url, _hits, _b) =
+        phase2::spawn_stub(Script::Paced { body, frame_delay: Duration::from_millis(1) }).await;
+    let env = Env::new(url);
+    let mut child = env
+        .cmd(&["chat"])
+        .env("SYNAPS_SESSION_EVENTS_CAP", "16")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(b"flood\n").await.unwrap();
+    drop(stdin);
+    let mut err = child.stderr.take().unwrap();
+    let err_task = tokio::spawn(async move {
+        let mut s = Vec::new();
+        let _ = err.read_to_end(&mut s).await;
+        s
+    });
+    // Nobody reads stdout while the reply streams (~1.5-3 s at 1 ms/frame).
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    let mut out = child.stdout.take().unwrap();
+    let mut stdout = Vec::new();
+    tokio::time::timeout(EXIT_TIMEOUT, out.read_to_end(&mut stdout)).await.expect("stdout closes").unwrap();
+    let status = tokio::time::timeout(EXIT_TIMEOUT, child.wait()).await.expect("chat exits").unwrap();
+    let stderr = String::from_utf8_lossy(&err_task.await.unwrap()).into_owned();
+    assert!(status.success(), "exit {status:?}\nstderr: {stderr}");
+    assert!(!stderr.contains("lost the session") && !stderr.contains("dropped"), "{stderr}");
+    let text = String::from_utf8_lossy(&stdout);
+    assert_eq!(text.matches('x').count(), DELTAS * WIDTH, "every delta reached stdout");
+}
