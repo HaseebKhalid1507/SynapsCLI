@@ -263,17 +263,23 @@ The shipped protocol is line-JSON over a UDS / named pipe (`docs/daemon-mode.md`
   `takeover` attach and anything a non-owner sends that drives the session
   (input, cancel, answers, settings, commands) are refused. Only the owner's
   departure ends it. Pin/keep-warm is refused. Clients without the
-  `owner_gone` capability are told `client_quit`.
+  `owner_gone` capability are told `client_quit`. A claim whose connection is
+  already gone when the session reads it never binds: a fresh create ends
+  (`owner_gone`), a re-bind is ignored and the grace runs on.
 - **Owner lag**: an owner whose event stream lags gets `Error` +
   `{"type":"bye","bye":"owner_lagged","dropped":n}` and its connection is
-  closed (ending the session) instead of losing frames silently.
+  closed (ending the session) instead of losing frames silently. It wins over a
+  reload: an owner that lost events gets `owner_lagged`, never `reloading`, and a
+  client treats `owner_lagged` as final even after a `Reloading` event.
 - **Continue**: an owned create whose `continue_session` names a session live
   in the daemon with no clients ends it (saved) and adopts its journal; with
-  clients attached it is refused.
+  clients attached it is refused. The session decides that, atomically with
+  the close (host-only `close unattached`).
 - **Reload**: the token rides the reload-state file; the next image restores the
   session unbound, starts the `SYNAPS_DAEMON_OWNER_REBIND_SECS` (30 s) grace once
-  it accepts connections, and holds the session's own work until the owner
-  re-binds with `Hello.reconnect_of.owner = {token, forward_secrets?}` on an
+  it accepts connections (bounded anyway by a fallback deadline,
+  `SYNAPS_DAEMON_OWNER_RESTORE_CAP_SECS` (300 s) plus the grace), and holds the
+  session's own work until the owner re-binds with `Hello.reconnect_of.owner = {token, forward_secrets?}` on an
   `attach existing`. A wrong token is refused. No re-bind → `owner_gone`.
 - **`forward_secrets`** (owned only): secret env vars the daemon otherwise strips,
   held in memory apart from the session env and merged into a tool's child env
