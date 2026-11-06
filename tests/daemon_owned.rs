@@ -449,7 +449,8 @@ impl Drop for EnvVar {
     }
 }
 
-struct GraceVar(EnvVar);
+/// Held for its `Drop` (unsets the var).
+struct GraceVar(#[allow(dead_code)] EnvVar);
 impl GraceVar {
     fn set(secs: &str) -> Self {
         Self(EnvVar::set("SYNAPS_DAEMON_OWNER_REBIND_SECS", secs))
@@ -596,7 +597,7 @@ async fn a_failed_reload_holds_the_work_until_the_owner_rebinds() {
     let (d, hits) = start_counted(&guard, Script::Sse(ANTHROPIC_SSE), None).await;
     let sock = d.paths.sock.clone();
     let (h, token) = owned_via_host(&d, guard.home.path(), false).await;
-    let mut owner = rebind(&sock, &h.id, &token).await;
+    let owner = rebind(&sock, &h.id, &token).await;
     let mut obs = observe(&sock, &h.id).await;
     let mut rx = h.subscribe();
     h.send(SessionCommand::Checkpoint { reason: CheckpointReason::Reload }).await.unwrap();
