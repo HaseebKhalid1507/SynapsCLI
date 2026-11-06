@@ -43,6 +43,16 @@ pub(crate) struct AttachArgs {
     /// at once). With --create / --continue.
     #[arg(long = "name", value_name = "NAME")]
     pub name: Option<String>,
+    /// Create an OWNED session, bound to this client: it ends (any running
+    /// turn cancelled, the journal kept) when this client exits or
+    /// disconnects. Implies --create.
+    #[arg(long, conflicts_with_all = ["id", "keep_warm"])]
+    pub owned: bool,
+    /// With --owned: also forward this shell's secret env vars (GH_TOKEN,
+    /// AWS_* …, normally stripped) so the session's tools see them. Held in
+    /// the daemon's memory only, never written to disk.
+    #[arg(long = "forward-secrets", requires = "owned")]
+    pub forward_secrets: bool,
 }
 
 impl AttachArgs {
@@ -326,7 +336,7 @@ pub(crate) async fn run(profile: Option<String>, mut args: AttachArgs, client_na
     }
 
     let mode = args.attach_mode();
-    let attach = if args.create || args.continue_session.is_some() {
+    let attach = if args.create || args.continue_session.is_some() || args.owned {
         Attach::Create {
             config: SessionConfig {
                 continue_session: args.continue_session.clone().map(Some),
@@ -338,6 +348,7 @@ pub(crate) async fn run(profile: Option<String>, mut args: AttachArgs, client_na
                 ..Default::default()
             },
             mode,
+            owned: args.owned.then(|| OwnedCreate { forward_secrets: args.forward_secrets.then(capture_client_secrets) }),
         }
     } else if let Some(id) = &args.id {
         let id = resolve_id(&conn.welcome.sessions, id).unwrap_or_else(|| SessionId::from(id.as_str()));
@@ -348,6 +359,7 @@ pub(crate) async fn run(profile: Option<String>, mut args: AttachArgs, client_na
         Attach::Create {
             config: SessionConfig { cwd: Some(client_cwd), keep_warm: args.keep_warm, ..Default::default() },
             mode,
+            owned: None,
         }
     } else {
         eprintln!("several sessions; pick one:");
@@ -390,7 +402,11 @@ pub(crate) async fn run(profile: Option<String>, mut args: AttachArgs, client_na
             _ = tokio::signal::ctrl_c() => {
                 if c.streaming {
                     if c.quit_guard.press(std::time::Instant::now()) {
-                        c.out("\n[detaching; the session keeps running]\n");
+                        c.out(if c.t.is_session_owner() {
+                            "\n[leaving; this owned session ends with its turn cancelled]\n"
+                        } else {
+                            "\n[detaching; the session keeps running]\n"
+                        });
                         break;
                     } else {
                         eprintln!("\n{}", agent_tui::tui::quit_guard::NOTICE_LINE);
@@ -543,6 +559,11 @@ mod tests {
         let a = Cli::parse_from(["attach", "--create", "--name", "ambient"]).args;
         assert!(a.create);
         assert_eq!(a.name.as_deref(), Some("ambient"));
+        let a = Cli::parse_from(["attach", "--owned", "--forward-secrets"]).args;
+        assert!(a.owned && a.forward_secrets && !a.create);
+        assert!(Cli::try_parse_from(["attach", "--forward-secrets"]).is_err(), "--forward-secrets needs --owned");
+        assert!(Cli::try_parse_from(["attach", "--owned", "--keep-warm"]).is_err(), "an owned session cannot be pinned");
+        assert!(Cli::try_parse_from(["attach", "abc", "--owned"]).is_err(), "--owned creates");
     }
 
     #[test]

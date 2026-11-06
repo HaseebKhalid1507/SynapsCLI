@@ -4,6 +4,43 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Owned daemon sessions.** A client can create a session bound to its
+  connection (`Attach::Create{owned}`; `SocketTransport::create_owned`;
+  `synaps attach --owned`). When the owner disconnects for any reason
+  (clean detach, EOF, socket error, the process killed), the daemon
+  cancels a running turn as `Cancel` does, saves the journal and ends the
+  session (`Ended{owner_gone}` to observers): the in-process lifetime that
+  headless callers abort and time out by. Only the owner drives an owned
+  session (others watch); an owner that lags is disconnected
+  (`Bye{owner_lagged}`) rather than losing frames. Owned sessions never
+  park, idle-end or pin, and never keep the prompt cache warm
+  (`cache_keepwarm_headless` does not apply to them). After `synaps daemon
+  reload` the owner re-binds
+  with a token within `SYNAPS_DAEMON_OWNER_REBIND_SECS` (30 s, counted from
+  when the new daemon accepts connections; never later than
+  `SYNAPS_DAEMON_OWNER_RESTORE_CAP_SECS`, 300 s, plus the grace), else the
+  session ends.
+  Daemons advertise the capability in `Welcome.features`; a client asking an
+  older daemon fails loudly. Opt-in `forward_secrets` (owned only) passes
+  the secret env vars the daemon normally strips to the session's tools
+  (`bash`, `grep`/`find`/`ls`, the interactive shell), in memory only.
+  Plain sessions are unchanged, except for the interactive shell below.
+
+### Changed
+
+- **Daemon sessions: the interactive shell (`shell_start`) starts from the
+  session's env**, like `bash`, instead of the daemon's own. It no longer
+  sees the env the daemon inherited, nor the secrets the daemon strips from
+  a client's env; it says which secrets the session lacks, as `bash` does
+  when a failed command references one. As with `bash`, a pinned session
+  created over SSH keeps that login's `SSH_AUTH_SOCK`, which is dead once
+  you log out.
+- **`synaps daemon close` without `--attached`** is now decided by the
+  session itself, together with the close: a client that attaches between
+  the daemon's check and the close is no longer closed under.
+
 ### Fixed
 
 - **Windows: the `grep`, `find` and `ls` tools work.** They ran the bare

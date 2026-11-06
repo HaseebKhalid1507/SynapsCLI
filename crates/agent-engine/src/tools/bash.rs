@@ -460,7 +460,7 @@ pub(crate) async fn run_shell_command(
 
         let (program, args) = spec.invocation(script);
         let effective_env = ctx.capabilities.env.as_ref()
-            .map(|env| env.iter().map(|(k, v)| (k.into(), v.into())).collect())
+            .map(|env| env.spawn_vars().map(|(k, v)| (k.into(), v.into())).collect())
             .unwrap_or_else(crate::process_scope::inherited_env);
         let probe_env = effective_env.clone();
         let probe_cwd = ctx.capabilities.cwd.clone();
@@ -637,28 +637,11 @@ pub(crate) async fn run_shell_command(
                 if status.success() || was_truncated {
                     Ok(output)
                 } else {
-                    let mut notice = String::new();
                     // T5: when a command fails and references a stripped secret,
-                    // append a notice (once per name per session).
-                    if !ctx.capabilities.env_stripped.is_empty() {
-                        let mut warned = ctx.capabilities.env_warned.lock().unwrap_or_else(|p| p.into_inner());
-                        for name in &ctx.capabilities.env_stripped {
-                            if warned.contains(name) {
-                                continue;
-                            }
-                            // Word-boundary match: covers $NAME, ${NAME},
-                            // ${NAME:?}, ${NAME:-x}, $env:NAME and NAME=…
-                            if references_env_name(script, name) {
-                                notice.push_str(&format!(
-                                    "\nnote: ${name} was stripped from the session env as a secret; \
-                                     reattach from a shell that has it \
-                                     (synaps --system … from that shell) \
-                                     — the daemon never receives credentials."
-                                ));
-                                warned.insert(name.clone());
-                            }
-                        }
-                    }
+                    // append a notice (once per name per session). Word-boundary
+                    // match: covers $NAME, ${NAME}, ${NAME:?}, ${NAME:-x},
+                    // $env:NAME and NAME=…
+                    let notice = ctx.capabilities.stripped_env_notices(|name| references_env_name(script, name));
                     Err(RuntimeError::Tool(format!(
                         "Command failed (exit {}):\n{}{notice}",
                         status.code().unwrap_or(-1),
@@ -802,7 +785,7 @@ mod tests {
         let mut env = fake_env(&fake);
         env.push(("PATH".to_string(), std::env::var("PATH").unwrap_or_default()));
         let mut ctx = create_tool_context();
-        ctx.capabilities.env = Some(env);
+        ctx.capabilities.env = Some(env.into());
         let out = BashTool
             .execute(json!({ "command": "echo scoped-run", "timeout": 30 }), ctx)
             .await
@@ -820,10 +803,9 @@ mod tests {
     #[tokio::test]
     async fn bash_command_with_a_rebuilt_env_lacking_the_user_bus_runs_unwrapped() {
         let mut ctx = create_tool_context();
-        ctx.capabilities.env = Some(vec![(
-            "PATH".to_string(),
-            std::env::var("PATH").unwrap_or_default(),
-        )]);
+        ctx.capabilities.env = Some(
+            vec![("PATH".to_string(), std::env::var("PATH").unwrap_or_default())].into(),
+        );
         let out = BashTool
             .execute(
                 json!({ "command": "cat /proc/self/cgroup", "timeout": 30 }),

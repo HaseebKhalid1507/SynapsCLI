@@ -97,7 +97,7 @@ fn sanitize_label(raw: &str) -> Option<String> {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct WorkerWorkspace {
     pub cwd: Option<std::path::PathBuf>,
-    pub env: Option<crate::session::types::SessionEnv>,
+    pub env: Option<crate::session::types::ToolEnv>,
     pub env_stripped: Vec<String>,
 }
 
@@ -137,7 +137,7 @@ pub(crate) fn apply_subagent_runtime_policy(
     // directory. Set before the memory fallback below so it scopes to the
     // session's project too.
     runtime.set_cwd(workspace.cwd.clone());
-    runtime.set_env(workspace.env.clone());
+    runtime.set_tool_env(workspace.env.clone());
     runtime.set_env_stripped(workspace.env_stripped.clone());
 
     runtime.inherit_session_allow_all(session_allow_all);
@@ -1740,11 +1740,14 @@ mod worker_workspace_tests {
         let mut ctx = create_tool_context();
         ctx.capabilities.subagent_registry = Some(registry.clone());
         ctx.capabilities.cwd = Some(dir.to_path_buf());
-        ctx.capabilities.env = Some(vec![
-            ("PATH".into(), std::env::var("PATH").unwrap_or_default()),
-            ("HOME".into(), std::env::var("HOME").unwrap_or_default()),
-            (PROBE.into(), "from-session".into()),
-        ]);
+        ctx.capabilities.env = Some(
+            vec![
+                ("PATH".into(), std::env::var("PATH").unwrap_or_default()),
+                ("HOME".into(), std::env::var("HOME").unwrap_or_default()),
+                (PROBE.into(), "from-session".into()),
+            ]
+            .into(),
+        );
         ctx
     }
 

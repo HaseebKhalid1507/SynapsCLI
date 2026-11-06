@@ -194,6 +194,148 @@ To avoid accidental headless turns:
 The line client (`synaps attach`) follows the same double-press rule. The notice
 is printed to stderr so scripts piping stdout are not affected.
 
+## Owned sessions (headless clients)
+
+A session normally outlives its client: a client dying only detaches (F27),
+and the daemon strips secret env vars from `Hello.env`. Headless callers that
+abort by killing their `synaps` child (Pria's guest agent, Harbor and
+synaps-bench timeouts) need the in-process semantics back. An **owned**
+session gives them: it is bound to the connection that created it.
+
+- **Opt-in at create**: `Attach::Create{config, mode, owned: {forward_secrets?}}`.
+  Old clients never send `owned`, so they get today's session, byte for byte.
+- **Capability**: a daemon that honours it lists `"owned_sessions"` in
+  `Welcome.features` (absent on older daemons → empty). `PROTOCOL_VERSION` stays
+  exact-match and is not bumped, so older TUIs still reconnect after a reload.
+  A client asking for an owned session checks the feature **before** sending
+  the attach and fails with `DaemonTooOld` ("… predates owned sessions; run
+  `synaps daemon reload`") instead of getting an unowned session. It also
+  refuses an `Attached` reply without an owner token.
+- **Lifetime**: when the owner's connection goes away for any reason (`Detach`,
+  `Bye`, EOF, socket error, its process SIGKILLed), the daemon cancels a running
+  turn as `Cancel` does (partial reply kept, `InterruptReason::User` marker),
+  saves the journal and **ends** the session: no park grace, no keep-warm, it
+  leaves the map, and every other attached client gets
+  `Ended{reason: owner_gone}`. The connection's `Detach` is only the fast path:
+  the connection task hands the session a liveness lease with its claim and
+  holds it until it ends, however it ends (a full command queue that lost the
+  `Detach`, a panic), so the session never stays bound to nobody. A claim
+  whose lease is already closed when the session reads it (the connection
+  gave up on the attach first) never binds and attaches nobody: on a fresh
+  create, where nobody else ever had the token, the session ends right away
+  (`owner_gone`); on a re-bind it is ignored and the grace keeps running, so a
+  stale attempt cannot end a session the owner's next retry is about to
+  re-bind.
+- **Only the owner drives it**: other clients may attach with `mirror` or
+  `observe` and watch. A `takeover` attach by anyone but the owner is refused
+  ("… cannot be taken over"), and so is anything they send that would drive the
+  session: input (`Submit`, `Steer`), `Cancel`, prompt answers, settings,
+  engine/plugin commands such as `/close`, `/takeover`
+  ("… only that client can drive it"). They may still `Query`, `Resync`, `Save`
+  and detach. Input never passes to a watcher (the tools run with the owner's
+  env, and with `forward_secrets` its tokens). `synaps daemon close` from a
+  control connection keeps its host authority (refused while clients are
+  attached unless `--attached`, as for any session; the session itself makes
+  that check, together with the close, so an attach that gets there first is
+  never closed under).
+- **Owner lag is fatal for the owner**: a headless owner keys on every
+  `Usage`/`Done`/tool-result frame, so when its event stream lags the daemon
+  does not drop events silently: it sends an `Error` and
+  `Bye{bye: "owner_lagged", dropped}` (`TransportError::OwnerLagged` on
+  `SocketTransport`) and closes the owner's connection, which ends the session
+  as above. Lag wins over a reload: an owner that lost events (before the
+  reload announce or while its stream drained for it) gets `owner_lagged`, not
+  `Bye{reloading}`, and `SocketTransport` keeps `OwnerLagged` as its
+  `last_error()` whatever came first (no reload pending; `reconnect` refuses),
+  so it never re-binds across the gap. Its session, fenced for the exec, ends
+  when the re-bind grace passes. Other clients keep the usual "event stream
+  lagged" notice.
+- **Never parked, idle-ended or pinned**: `synaps daemon pin` and `/pin`
+  (`KeepWarm{on}`) are refused ("owned by the client that created it … cannot be
+  pinned or kept warm"); `synaps attach --owned --keep-warm` is a usage error.
+- **Never cache keep-warm**: no keep-warm period starts for an owned session,
+  whatever `cache_keepwarm`, `cache_keepwarm_headless` or its clients say, and
+  `/keepwarm <mode>` is refused (`/keepwarm status` still answers). Those pings
+  would be spend the owning client (rpc, chat) never sees in its usage
+  frames.
+- **Afterwards**: the journal is an ordinary one. `--continue` loads it as a
+  normal (unowned) session.
+- **Idle exit**: a live owner counts as a client like any other. Once it leaves,
+  the session is gone, so an auto-spawned daemon idle-exits as usual.
+- **Continuing a live session**: `config.continue_session` naming a session
+  that is live in this daemon with **no** clients attached (parked, or idle
+  between clients) ends it the way `synaps daemon close` does (saved, never
+  mid-turn) and adopts its journal as the new owned session. With clients
+  attached it is refused ("… attached by N client(s) …"), and so is another
+  client's owned session. Whether anyone is attached is decided by the
+  session, atomically with the close (a host-only `close unattached`), so a
+  client attaching meanwhile is never closed under: the create is refused.
+
+### Reload
+
+`synaps daemon reload` re-execs the daemon, which drops every connection,
+owners included. The owner gets a token for this: `Attached.owner_token`
+(sent to the owner only, never listed or logged). On a reload-initiated
+disconnect the session is checkpointed as usual and its token is recorded in
+the reload-state file (0600, deleted after the exec); the next image restores
+the session **unbound** (also when its journal is held by another process: the
+lock placeholder keeps the token). The grace, `SYNAPS_DAEMON_OWNER_REBIND_SECS`
+(default 30 s), starts once the new image accepts connections (the restore
+itself, extension rediscovery included, can take longer than the grace): the
+daemon then sends each restored owned session `ArmOwnerRebind`, retried while
+its command queue is full. A restored session is never unbounded, though: it
+starts with a fallback deadline of `SYNAPS_DAEMON_OWNER_RESTORE_CAP_SECS`
+(default 300 s) plus the grace, which the arm only ever shortens, so a lost arm
+still ends it. Until the owner is back the session starts no work of its own:
+carried worker wakes and queued events wait, then run once the owner
+re-binds. `SocketTransport::reconnect` sends the token in
+`Hello.reconnect_of.owner` and attaches to the same session, with the usual
+reconnect budget (`SYNAPS_TUI_ATTACH_RECONNECT_SECS`, 60 s): a re-bind after
+the session ended is refused ("unknown session"), which stops the retries.
+Tokens are compared in constant time. A wrong token is refused loudly
+(`owner token rejected`) and binds nothing. No re-bind within the grace → the
+session ends `OwnerGone` as above. If the exec fails, the old image keeps the
+session under the same rule, holding its work until the owner re-binds. Only a
+reload gives a grace: any other disconnect ends the session (its turn
+cancelled, the journal saved) as soon as the session sees the connection
+gone.
+
+### Forwarding secrets (`forward_secrets`)
+
+`owned.forward_secrets` (only honoured on an owned create; `synaps attach --owned
+--forward-secrets`, `SocketTransport::create_owned(.., forward_secrets: true)`)
+sends the variables `Hello.env` strips as secrets (the `is_secret_env` rule:
+name denylist or credential-shaped value), names and values, so the session's
+tools see the env an in-process run would: `bash`, `grep`/`find`/`ls` and the
+interactive shell (`shell_start`, which starts from the session's env, not the
+daemon's, and names the secrets the session lacks, as `bash` does when a
+failed command references one). Daemon side they are held in memory for the session's lifetime,
+kept apart from the session env (a `SecretEnv` whose `Debug` prints names
+only, inside the runtime's and the workers' tool env) and merged into a
+child's environment only when it is spawned; the forwarded names leave the
+`env_stripped` notice list. They are **never written by Synaps**: not copied
+into `SessionConfig` (the journal's env and the reload record come from it),
+not into the session files, the reload-state file, logs, traces or status
+output. What a tool does with them is the tool's business, as in-process: a
+command that prints a secret puts it in the conversation (and so the
+journal). A re-binding owner sends them again (they do not survive the exec).
+Unowned sessions are unchanged: secrets are stripped as before.
+`tests/daemon_owned.rs::forwarded_secrets_reach_the_tools_and_never_the_disk`
+has a tool print the dummy secret hex-encoded (so the conversation never holds
+it), then greps the whole test HOME (journals, session index, run dir, the
+daemon's `trace`-level log and stderr, and its `TMPDIR`, pointed under HOME)
+for the value. This widens the security model: **DECISION NEEDED** (see the
+PR).
+
+### Knobs
+
+| Knob | Default | Meaning |
+|---|---|---|
+| `Attach::Create.owned` / `synaps attach --owned` | off | Create an owned session. |
+| `owned.forward_secrets` / `--forward-secrets` | off | Also forward secret env vars (owned only). |
+| `SYNAPS_DAEMON_OWNER_REBIND_SECS` | 30 | Re-bind grace after a daemon reload (from when the new image accepts connections). |
+| `SYNAPS_DAEMON_OWNER_RESTORE_CAP_SECS` | 300 | A restored owned session's longest wait for the arm: its fallback deadline is this plus the grace. |
+
 ## Closing a session (`/close`)
 
 Detaching leaves the session loaded in the daemon. It parks after the grace
@@ -224,7 +366,9 @@ session you are done with should be **closed**:
   input) unless `--attached` is given: closing it exits their TUIs and drops
   unsent input. `--force` only overrides work in flight, not attached
   clients; an attached session that is mid-turn needs both. The
-  daemon sends the session `close` (`force` with `--force`) with host authority
+  daemon sends the session `close` (`force` with `--force`; without
+  `--attached`, also the host-only `unattached`, so the session itself
+  refuses if a client attached after the daemon looked) with host authority
   under a fresh reserved id per request (from `CLOSE_QUERY_ID_BASE`), waits for that reply and for the actor to
   end, and answers `Closed`; the attached TUIs exit as above. Exit codes: 0
   closed; 3 refused (work in flight: the reply names it, `--force` closes
@@ -475,15 +619,15 @@ first's turns (last-writer-wins).
 
 ```
 C: {"type":"hello", protocol_version, client:{kind,terminal,instance}, cwd, client_version}   ← MUST be first
-D: {"type":"welcome", protocol_version, daemon_version, pid, profile, sessions:[SessionMeta], progressive_tool_disclosure, generation, daemon_build}
+D: {"type":"welcome", protocol_version, daemon_version, pid, profile, sessions:[SessionMeta], progressive_tool_disclosure, generation, daemon_build, features?:["owned_sessions"]}
    | {"type":"refused", reason:{reason:"version",daemon_version,min,max}|"protocol"|…, message}   → daemon closes
 C: ping | sessions | shutdown{force}          → D: pong{pid,uptime_s,sessions} | session_list{sessions} | bye   (no session allocated)
 C: close{session_id, force, attached}         → D: closed{session_id, text} | refused{busy|unknown_session} (→ daemon closes) | error
 C: pin{session_id, on}                        → D: pinned{session_id, on} | refused{busy|unknown_session} (→ daemon closes) | error
 C: rename{session_id, name?, expect?}         → D: renamed{session_id, name, in_memory_only?} | rename_failed{session_id, reason, message, taken_by?, current_name?} | refused{unknown_session} (→ daemon closes)
 C: reload_extension{extension}                → D: extension_reloaded{report} | extension_reload_failed{extension, message, unloaded} | refused{busy} (→ daemon closes)
-C: {"type":"attach", attach:"existing", session_id, mode} | {"type":"attach", attach:"create", config:SessionConfig, mode}
-D: {"type":"attached", client, meta, view, conversation, streaming, replay:[WireEnvelope], pending_prompts, clients} | error
+C: {"type":"attach", attach:"existing", session_id, mode} | {"type":"attach", attach:"create", config:SessionConfig, mode, owned?:{forward_secrets?:[[k,v]]}}
+D: {"type":"attached", client, meta, view, conversation, streaming, replay:[WireEnvelope], pending_prompts, clients, owner_token?} | error
 C: {"type":"cmd", session_id, cmd:SessionCommand} …      → D: {"type":"event", session_id, seq, ts, event:WireSessionEvent} …
 C: bye | socket close = Detach (turn keeps running)
 ```
@@ -556,6 +700,15 @@ C: bye | socket close = Detach (turn keeps running)
   `synaps daemon stop` ends them all. This is a footgun guard on a same-uid 0600 socket, not an auth boundary
   (`client_commands_are_whitelisted`).
 - `Attach::Create` fills `cwd` from `Hello.cwd`; it must be absolute and exist.
+- Owned sessions (see "Owned sessions") are additive, without a protocol bump: `Welcome.features`
+  (`#[serde(default)]`) advertises `owned_sessions`; `Attach::Create.owned`, `Attached.owner_token`
+  and `Hello.reconnect_of.owner` (`{token, forward_secrets?}`) are omitted when unused, so a plain
+  create/attach/reconnect encodes exactly as before. A client must not send `owned` to a daemon
+  without the feature (an older daemon ignores the unknown field). `Ended.reason` gains `owner_gone`;
+  `EndReason` has no catch-all, so an older client would fail the whole frame: the daemon sends
+  `owner_gone` only to clients that declare the `owner_gone` capability and tells the others
+  `client_quit` (`ended_for`). `Bye` gains `owner_lagged`, sent only to an owner (a client that
+  knows the feature).
 
 ## Security posture
 

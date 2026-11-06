@@ -264,19 +264,29 @@ impl SessionActor {
     ///
     /// Owner-only, like every engine command. Replies on the `QueryResult`
     /// (`output` / `error`) before the `Ended`. `Some(reason)` = end now.
-    pub(crate) fn close_command(&mut self, id: u64, arg: &str) -> Option<EndReason> {
+    /// The host (`host`) may add [`super::actor::CLOSE_UNATTACHED_ARG`]:
+    /// refused while any client is attached.
+    pub(crate) fn close_command(&mut self, id: u64, arg: &str, host: bool) -> Option<EndReason> {
         let reply = |text: String, kind: &str| SessionEventWire::QueryResult {
             id,
             value: serde_json::json!({ "kind": kind, "text": text }),
         };
-        let force = match arg.trim() {
-            "" => false,
-            "force" => true,
-            _ => {
-                self.emit(reply("usage: /close [force]".into(), "error"));
-                return None;
+        let (mut force, mut unattached) = (false, false);
+        for word in arg.split_whitespace() {
+            match word {
+                "force" if !force => force = true,
+                w if host && w == super::actor::CLOSE_UNATTACHED_ARG && !unattached => unattached = true,
+                _ => {
+                    self.emit(reply("usage: /close [force]".into(), "error"));
+                    return None;
+                }
             }
-        };
+        }
+        if unattached && !self.attached.is_empty() {
+            let n = self.attached.len();
+            self.emit(reply(format!("not closed: attached by {n} client(s)"), "error"));
+            return None;
+        }
         let live = self.runtime.is_live();
         let workers: Vec<(String, String)> = if live {
             let mut running: Vec<(String, String)> = self

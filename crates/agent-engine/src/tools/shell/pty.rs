@@ -183,14 +183,20 @@ impl PtyHandle {
         rows: u16,
         cols: u16,
     ) -> Result<Self> {
-        let prepared = Self::prepare_scope(working_dir, &env);
+        let prepared = Self::prepare_scope(working_dir, None, &env);
         Self::spawn_prepared(command, working_dir, rows, cols, prepared)
     }
 
-    pub(crate) fn prepare_scope(working_dir: Option<&str>, env: &HashMap<String, String>) -> PreparedScope {
+    /// `base`: the session's env (`None` = this process's).
+    pub(crate) fn prepare_scope(
+        working_dir: Option<&str>, base: Option<&[(String, String)]>, env: &HashMap<String, String>,
+    ) -> PreparedScope {
         // Snapshot after TERM and user overrides; probe and child see exactly
         // the same environment. This synchronous API may probe for up to 3 s.
-        let mut effective_env = crate::process_scope::inherited_env();
+        let mut effective_env = match base {
+            Some(base) => base.iter().map(|(k, v)| (k.into(), v.into())).collect(),
+            None => crate::process_scope::inherited_env(),
+        };
         crate::process_scope::set_env(&mut effective_env, "TERM", "xterm-256color");
         for (k, v) in env { crate::process_scope::set_env(&mut effective_env, k, v); }
         let scope_cwd = working_dir.map(std::path::PathBuf::from)
@@ -461,6 +467,20 @@ mod tests {
     use serial_test::serial;
     use std::collections::HashMap;
 
+    /// Given the session's env, a PTY shell starts from it, not from this
+    /// process's (a daemon's), with TERM and the call's overrides on top.
+    #[test]
+    fn a_pty_shell_starts_from_the_session_env() {
+        let base = [("SDO3_SESSION_ONLY".to_string(), "from-session".to_string()), ("PATH".into(), "/bin".into())];
+        let extra = HashMap::from([("EXTRA".to_string(), "x".to_string())]);
+        let (env, _, _) = PtyHandle::prepare_scope(None, Some(&base), &extra);
+        let get = |k: &str| env.iter().find(|(n, _)| n == k).map(|(_, v)| v.to_string_lossy().into_owned());
+        assert_eq!(get("SDO3_SESSION_ONLY").as_deref(), Some("from-session"));
+        assert_eq!(get("TERM").as_deref(), Some("xterm-256color"));
+        assert_eq!(get("EXTRA").as_deref(), Some("x"));
+        assert_eq!(env.len(), 4, "nothing inherited from the process: {env:?}");
+    }
+
     /// A PTY shell's scope goes in `tool_scope_slice`, never in the daemon's
     /// slice; neither key set, no `--slice`.
     #[cfg(target_os = "linux")]
@@ -475,7 +495,7 @@ mod tests {
         let env: HashMap<String, String> = fake_env(&fake).into_iter().collect();
         let cwd = dir.path().to_str().unwrap();
         let slices = || {
-            let (_, _, launcher) = PtyHandle::prepare_scope(Some(cwd), &env);
+            let (_, _, launcher) = PtyHandle::prepare_scope(Some(cwd), None, &env);
             let (_, args) = launcher.expect("the fake probe succeeds").wrap("synaps tool: shell", "/bin/sh", []);
             args.iter()
                 .map(|a| a.to_string_lossy().into_owned())
