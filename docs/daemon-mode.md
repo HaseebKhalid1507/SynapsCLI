@@ -1,21 +1,27 @@
 # Daemon mode (`synaps daemon` / `synaps attach`) — phase 2, package B
 
-**Status:** on by default. The first `synaps --attach` / `synaps attach` starts the daemon itself
-(jcode model: `setsid` + ready-fd, the daemon holds the flock; on Windows see [Windows](#windows)); once one is running, a plain
-`synaps` **adopts** it, spawning the daemon first if needed (thin client, fresh session — `SYNAPS_DAEMON_ADOPT=0` opts out);
-`SYNAPS_DAEMON=0` turns every daemon feature off. Protocol v3 (`crates/agent-engine/src/session/wire.rs`), daemon in `agent-engine::daemon`
+**Status:** the only mode. Every Synaps session runs in the session daemon:
+the TUI (`synaps`, `synaps --attach`), `synaps attach` and `synaps chat` are
+clients of it, and the first one starts the daemon itself (jcode model:
+`setsid` + ready-fd, the daemon holds the flock; on Windows see
+[Windows](#windows)). A plain `synaps` **adopts** the daemon (thin client,
+fresh session); `synaps chat` runs an [owned session](#owned-sessions-headless-clients)
+in it. There is no in-process mode any more: if the daemon cannot be had,
+the client says why and how to fix it and exits 3 (see
+[No daemon](#no-daemon-no-session)). Protocol v3
+(`crates/agent-engine/src/session/wire.rs`), daemon in `agent-engine::daemon`
 (no `agent-tui` in its graph — `tests/daemon_no_tui_dep.rs`).
 
 ## Flags and kill-switches
 
 | Env | Effect |
 |---|---|
-| `SYNAPS_DAEMON=0` (also `false`/`off`/`no`) | Disable daemon features: `synaps daemon` and `synaps attach` exit 3 with `daemon disabled by SYNAPS_DAEMON=0`; `--attach` prints `--attach ignored: …` and runs the normal in-process TUI. Unset or `1` = on (`=1` is a no-op kept for older scripts). |
-| `SYNAPS_DAEMON_AUTOSPAWN=0` | Disable auto-spawn only: an attach with no live daemon exits 3 with `no daemon running — start it with \`synaps daemon --detach\``. Default: the first client spawns the daemon (`current_exe daemon --foreground`, same profile, inherits env), waits ≤ 15 s (`SPAWN_READY_TIMEOUT`: the daemon's ≤ 10 s extension-discovery wait plus margin) on the ready-fd, prints `starting daemon (pid N) — synaps daemon stop to end it` on stderr, then attaches. A **spawn lock** (`daemon.spawn.lock`) serialises concurrent first-clients: the loser waits, re-probes the flock, attaches to the winner's daemon. If the spawned daemon refuses/dies before it is ready (e.g. the legacy-MCP refusal, exit 3) `--attach` falls back to the in-process TUI with a `daemon unavailable: <reason> — running in-process` notice (exit 0); `synaps attach` prints the reason and exits 3. |
+| `SYNAPS_DAEMON=0` (also `false`/`off`/`no`) | **No longer turns the daemon off** — there is nothing to fall back to. Every client (`synaps`, `--attach`, `synaps chat`, `synaps attach`) prints one line on stderr, `warning: SYNAPS_DAEMON=0 is ignored: sessions always run in the session daemon now (the in-process mode was removed); unset it (docs/daemon-mode.md)`, and carries on through the daemon; `synaps daemon …` runs as usual. Unset or `1` = no line. Before: daemon features off, `--attach` ignored, the TUI and chat in-process. |
+| `SYNAPS_DAEMON_AUTOSPAWN=0` | Disable auto-spawn only: a client with no live daemon exits 3 with `no daemon running (SYNAPS_DAEMON_AUTOSPAWN=0 stops this client from starting one)` and the command that starts one (`synaps daemon --detach`, with `--profile P` / `--no-extensions` when those are in effect). Default: the first client spawns the daemon (`current_exe daemon --foreground`, same profile, inherits env), waits ≤ 15 s (`SPAWN_READY_TIMEOUT`: the daemon's ≤ 10 s extension-discovery wait plus margin) on the ready-fd, prints `starting daemon (pid N) — synaps daemon stop to end it` on stderr, then attaches. A **spawn lock** (`daemon.spawn.lock`) serialises concurrent first-clients: the loser waits, re-probes the flock, attaches to the winner's daemon. If the spawned daemon refuses or dies before it is ready, every client (the TUI, `--attach`, `chat`, `attach`) prints `daemon unavailable: could not start it: <reason>` and how to see why (`synaps daemon --foreground`), and exits 3. Nothing boots in-process. |
 | `SYNAPS_DAEMON_IDLE_EXIT_SECS` | Auto-spawned daemons (from plain `synaps` or `--attach`) exit on their own after this long with **zero clients, no turn running and no pinned session** — default **10 s** (the clock starts at the last disconnect; parked/idle sessions do not hold it, a [pinned](#pinning-a-session-pin) one does); `0`/`never` keeps them up. Parked sessions are journaled and `--continue` brings them back; nothing is lost, only the warm extensions. A daemon started by hand (`synaps daemon`) uses its own `--idle-exit`. |
 | `SYNAPS_DAEMON_IDLE_END_GRACE_SECS` | A **zero-turn** session with no clients ends after this long (F18) — default **5 s**. It has nothing to keep warm, so it does not wait the full park grace. |
 | `SYNAPS_DAEMON_PARKED_EVICT_SECS` | A **parked** session stays in the daemon's map (so `--attach <ID>`/the adopt banner find it) for this long, then is evicted (`Ended(Evicted)`). Default **1 h**; `never` keeps rows forever. Nothing is lost — the journal stays and `--continue <ID>` rebuilds it, exactly as after a daemon restart. A zero-turn session never parks: it ends (`Idle`) at the park deadline (F18). |
-| `SYNAPS_DAEMON_ADOPT=0` | Disable **adopt**: by default a plain `synaps` (no subcommand, no `--attach`; only `--system`/`-s`, `--continue`, `--prompt-manifest`, `--profile` allowed) runs as the thin socket client with `--attach --new` semantics (fresh session; `--continue` still continues) against the daemon for that profile — **spawning it first if none is running**, exactly like `--attach` (jcode model). A failed spawn, or `SYNAPS_DAEMON_AUTOSPAWN=0` with no daemon, falls back to the ordinary in-process boot with a notice. `SYNAPS_DAEMON_ADOPT=0`, or any other flag (`--no-extensions`, `--help`, attach modifiers) → in-process, untouched. |
+| `SYNAPS_DAEMON_ADOPT=0` | **Ignored**, with the same one-line warning as `SYNAPS_DAEMON=0` (it used to run plain `synaps` in-process). A plain `synaps` (no subcommand, no `--attach`) always **adopts**: the thin socket client with `--attach --new` semantics (fresh session; `--continue` still continues) against the daemon for that profile, spawning it first if none is running, exactly like `--attach`. Every TUI flag works there: `--system`/`-s`, `--continue`, `--prompt-manifest`, `--profile`, and `--no-extensions` (the [no-extensions daemon](#no-extensions-a-private-daemon)). `--help`/`--version` and subcommands never start a daemon. |
 | `SYNAPS_DAEMON_ALLOW_LEGACY_MCP=1` | Deprecated, ignored. Legacy MCP was removed: every mode uses per-session MCP leases, so the daemon no longer refuses to start with `progressive_tool_disclosure=false` and MCP servers configured. (`--allow-legacy-mcp` is likewise accepted and ignored.) |
 | `tools.activation_confirm = auto \| prompt \| deny` (config key, default `auto`) | Host policy for MODEL-INITIATED `activate_tools` under progressive disclosure. `auto`: granted without asking. `prompt`: the session raises a `Prompt{kind: Confirm}` ("Confirm tool activation" — the TUI shows a y/n dialog listing the exact ids; `synaps attach` prints `[confirm #id] …\n(y/n):`); only `y`/`yes` allows, anything else/Esc denies (fail-closed). `deny`: always refused, no prompt is raised (locked-down hosts). `server.auto_approve_confirms = true` / `--auto-approve-confirms` still grants regardless. The mode is logged once at boot (`tools.activation_confirm: …`). |
 | `SYNAPS_RUNTIME_DIR` | Where the socket/lock/json/pid live (default `~/.synaps-cli/run`, 0700). |
@@ -37,6 +43,46 @@
 | `synaps --attach --no-confirm-answers` | TUI only, any attach mode: this client never answers a `Confirm` prompt (tool-call and tool-activation approvals). It never opens the approval pane for one, so no key typed into it can approve; it lists the waiting confirms in a toast until another client's answer resolves them (`PromptResolved`). `Secret` prompts are unchanged. Client-side only: no wire or daemon change, so it works against any daemon. For a TUI embedded where keystrokes may not come from the person approving (a terminal pane in another app). An `--observe` attach still can answer prompts without this flag: `Answer` is not an input command. |
 | `SYNAPS_SESSION_COMPACT_INLINE=1` | One-release kill-switch: run `/compact` and auto-compaction inline on the actor task (the #107 body — `Attach`/`Cancel` wait behind it) instead of the spawned job. Deleted in phase 4. |
 | `synaps daemon reload` / `stop` / `purge` / `close` / `pin` / `rename` / `reload-extension` from **any** same-uid client | Not a privilege boundary (0600 socket): a stray `synaps daemon reload` from any shell checkpoints every session and closes everyone's PTYs, `daemon close --attached` ends one session whoever owns its input (without `--attached` it refuses a session that has clients attached), `daemon pin` pins one session whoever owns its input (host authority, like `stop`), `daemon rename` names one session whoever owns its input (metadata only), and `daemon reload-extension` restarts an extension every session shares. `Checkpoint` over the wire is owner-only. |
+
+## No daemon, no session
+
+There is no in-process fallback. When a client cannot get a daemon it prints
+the reason and the fix on stderr and exits **3** before anything boots (no
+terminal setup, no session journal):
+
+```text
+synaps: no daemon running (SYNAPS_DAEMON_AUTOSPAWN=0 stops this client from starting one)
+  every session runs in the session daemon (there is no in-process mode): start it with `synaps daemon --detach` (`synaps daemon --foreground` shows why it fails), or unset SYNAPS_DAEMON_AUTOSPAWN, then re-run (docs/daemon-mode.md)
+```
+
+or, when the auto-start itself failed, `daemon unavailable: could not start it:
+<reason>` with the same fix line. `--profile P` and `--no-extensions` are
+carried into the suggested command. Tests: `tests/attach_no_daemon.rs`,
+`tests/chat_daemon_differential.rs` (`daemon_unavailable_is_a_clear_error`).
+
+## `--no-extensions`: a private daemon
+
+`synaps --no-extensions`, `synaps --attach --no-extensions` and `synaps chat
+--no-extensions` run on the profile's **no-extensions daemon**, a second
+daemon with its own files (`daemon+noext.*`, `daemon-<P>+noext.*` under
+`registry_dir()`), started with `synaps daemon --no-extensions` (auto-spawned
+like the default one). It boots with no extension discovery, so no extension
+process runs and no hook (`on_session_start`, tool hooks, …) fires for any
+of its sessions; MCP, skills and the journal are as usual. Its `Welcome`
+advertises `features: ["no_extensions"]`, and a client refuses a daemon
+whose extension mode is not the one it asked for (a stale socket, a
+hand-started daemon on the wrong path) instead of silently running with or
+without extensions. `synaps daemon --no-extensions stop|status|…` addresses
+it. It does not restore pinned sessions (they belong to the profile's
+default daemon) and idle-exits like any auto-spawned daemon.
+
+Why a separate daemon rather than a per-session flag: extensions are
+process-wide in the daemon (one `ExtensionManager`, one process per
+extension, shared hooks and registered tools/providers across sessions), so
+"no hooks for this session" would have to be enforced at every hook, tool
+and provider dispatch site. A daemon that never loads them is correct by
+construction and reuses the per-profile machinery (paths, spawn lock,
+autospawn, idle exit) unchanged.
 
 ## Capping tool commands with a slice
 
@@ -188,8 +234,8 @@ To avoid accidental headless turns:
   as in-process.
 - **Ctrl+C while idle** (not streaming) detaches immediately — no double-press
   needed.
-- **In-process** (`TransportMode::Local`, i.e. `SYNAPS_DAEMON=0` or no daemon)
-  is unchanged: quit ends the session.
+- There is no in-process TUI any more (`TransportMode::Local` is gone);
+  `synaps chat` ends its owned session on quit / EOF instead.
 
 The line client (`synaps attach`) follows the same double-press rule. The notice
 is printed to stderr so scripts piping stdout are not affected.
@@ -1112,13 +1158,14 @@ thing: the daemon itself.
      Consequence: the session's tools do not see them. A command that fails while
      referencing one gets the notice below; an authenticated `HTTPS_PROXY` is used
      implicitly by curl/git, so it fails without one. For a workflow that needs a secret
-     in the agent's shell, run in-process (`SYNAPS_DAEMON=0`).
+     in the agent's shell, use an [owned session](#owned-sessions-headless-clients) with
+     `forward_secrets` (what `synaps chat` does); `SYNAPS_DAEMON=0` no longer runs in-process.
 2. **Daemon copies `hello.env` → `config.env` on `Attach::Create` only.**
    Attaching to an existing session never changes its env (creator's env is final).
 3. **`SessionConfig.env` → `Runtime.env` → `ToolCapabilities.env`** — same pipe as cwd.
 4. **Tools apply `env_clear().envs(session_env)`** when `env` is `Some`:
    `bash.rs`, `find.rs`, `grep.rs`, `ls.rs`. No daemon env var leaks through.
-5. **In-process hosts pass `env: None`** — inherit the process env, byte-identical to before.
+5. **Hosts that pass `env: None`** (the test harness's in-process `LocalTransport`) inherit the process env.
 
 ### `SYNAPS_*` split (stub — T11 will formalize)
 
@@ -1198,6 +1245,10 @@ note: $GH_TOKEN was stripped from the session env as a secret; reattach from a s
 ```
 
 ## What changes on the default (in-process) path — read before merging
+
+*Historical (phase 2). Since PR 5 ("daemon is the only mode") there is no
+in-process path for users: the TUI, `--attach` and `synaps chat` all run in
+the daemon; `LocalTransport` is a test harness only.*
 
 Honest list of behaviour changes on this branch on the plain in-process path (`synaps`, `synaps chat` — no `--attach`):
 

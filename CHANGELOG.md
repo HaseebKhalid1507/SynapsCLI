@@ -41,6 +41,35 @@ All notable changes to this project will be documented in this file.
   session itself, together with the close: a client that attaches between
   the daemon's check and the close is no longer closed under.
 
+### Changed
+
+- **Breaking: the session daemon is the only mode.** Every session runs in
+  the daemon; nothing user-facing boots the engine in-process any more.
+  - `synaps chat` is a daemon client: it connects to the profile's daemon
+    (auto-started like `--attach`), runs an owned session with this
+    process's cwd and env (secrets forwarded in memory), and keeps its
+    stdin/stdout behaviour, slash commands, auto-turns, `--continue`,
+    `--system`, `--agent`, `--profile` and exit codes (differential:
+    `tests/chat_daemon_differential.rs`). Killing it cancels the turn and
+    ends the session. A lost daemon, or an owner disconnected for lagging,
+    exits non-zero.
+  - `synaps` and `synaps --attach` never fall back to an in-process TUI.
+    With no daemon to be had (auto-start failed, or
+    `SYNAPS_DAEMON_AUTOSPAWN=0` with none running) they print the reason
+    and the fix and exit 3.
+  - `--no-extensions` (TUI, `--attach`, `chat`) runs on the profile's
+    private no-extensions daemon (`synaps daemon --no-extensions`), which
+    loads no extensions, so no hook runs for its sessions.
+  - `SYNAPS_DAEMON=0` and `SYNAPS_DAEMON_ADOPT=0` no longer select an
+    in-process mode: they are ignored with a one-line warning.
+  - Migration: [docs/daemon-mode.md](docs/daemon-mode.md#no-daemon-no-session).
+
+### Removed
+
+- The in-process TUI (`TransportMode::Local`, `tui::run`) and the
+  in-process `synaps chat` engine. `LocalTransport` remains as a test
+  harness only.
+
 ### Fixed
 
 - **Windows: the `grep`, `find` and `ls` tools work.** They ran the bare
