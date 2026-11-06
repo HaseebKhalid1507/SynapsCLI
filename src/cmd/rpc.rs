@@ -1113,19 +1113,22 @@ pub async fn run(
                     }
                 }
                 None => {
-                    if matches!(b.t.last_error(), Some(TransportError::Reloading { .. })) {
-                        b.cut("interrupted by a session daemon reload").await;
-                        if let Err(e) = b.t.reconnect(AttachMode::Mirror).await {
-                            break Exit::Lost(format!("could not reconnect after a daemon reload: {e}"));
-                        }
-                        continue;
-                    }
                     // A lagging owner is cut by the daemon: its events are
-                    // gone (billing), so never reconnect.
+                    // gone (billing), so never reconnect (the transport
+                    // reports this over a pending reload).
                     if let Some(TransportError::OwnerLagged { dropped }) = b.t.last_error() {
                         break Exit::Lost(format!(
                             "lost {dropped} session events: the daemon disconnected this client for lagging"
                         ));
+                    }
+                    if matches!(b.t.last_error(), Some(TransportError::Reloading { .. })) {
+                        b.cut("interrupted by a session daemon reload").await;
+                        // Terminal on any error, including the daemon
+                        // refusing a re-bind to a session that ended.
+                        if let Err(e) = b.t.reconnect(AttachMode::Mirror).await {
+                            break Exit::Lost(format!("could not reconnect after a daemon reload: {e}"));
+                        }
+                        continue;
                     }
                     let why = b.t.last_error().map(|e| e.to_string()).unwrap_or_else(|| "connection closed".into());
                     break Exit::Lost(format!("lost the session daemon ({why})"));

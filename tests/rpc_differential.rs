@@ -773,6 +773,49 @@ async fn system_file() {
 
 // ── daemon client behaviour (new in PR 4; not differential) ────────────────
 
+/// An idle rpc session never keeps the prompt cache warm (PR 3: owned
+/// sessions never do), even with `cache_keepwarm = auto` and headless
+/// clients opted in: a ping's spend would never reach an `agent_end`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn idle_rpc_session_never_keeps_warm() {
+    use agent_engine::session::socket_transport::SocketTransport;
+    use agent_engine::session::wire::{Attach, Hello};
+    use agent_engine::session::{
+        AttachMode, ClientKind, ClientTransport, SessionCommand, SessionEventWire, SessionId, SessionQuery,
+    };
+
+    let env = Env::new(Script::Sse(SSE_USAGE_CACHE)).await;
+    std::fs::write(env.base().join("config"), "cache_keepwarm = auto\ncache_keepwarm_headless = true\n").unwrap();
+    let mut rpc = env.rpc(&[]).await;
+    let sid = rpc.ready().await;
+    rpc.turn("p1", "hello").await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    let paths = Env::private_paths(&env.live_private_dir());
+    let conn = SocketTransport::connect(&paths.sock, Hello::new(ClientKind::Test)).await.unwrap();
+    let (mut t, _) = SocketTransport::attach(
+        conn,
+        Attach::Existing { session_id: SessionId::from(sid.clone()), mode: AttachMode::Observe },
+    )
+    .await
+    .expect("observe the rpc session");
+    t.send_from_self(SessionCommand::Query { id: 77, query: SessionQuery::Status }).await.unwrap();
+    let status = loop {
+        let e = tokio::time::timeout(Duration::from_secs(10), t.next_event()).await.unwrap().expect("event");
+        if let SessionEventWire::QueryResult { id: 77, value } = e.event {
+            break value;
+        }
+    };
+    let kw = &status["keepwarm"];
+    assert_eq!(kw["active"], false, "{kw}");
+    assert!(kw["period"].is_null(), "no keep-warm period: {kw}");
+    assert_eq!(kw["session_pings"], 0, "{kw}");
+    assert_eq!(status["keepwarm_cost"], 0.0, "{status}");
+    assert_eq!(env.hits.load(Ordering::SeqCst), 1, "only the turn reached the provider");
+    drop(t);
+    rpc.shutdown().await;
+}
+
 /// The session is OWNED by the rpc process: killing it mid-turn cancels the
 /// turn and ends the session in the daemon, so it can be `--continue`d.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
