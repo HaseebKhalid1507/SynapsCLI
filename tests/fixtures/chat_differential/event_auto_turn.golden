@@ -1,0 +1,12 @@
+# chat differential: event_auto_turn
+## run 0
+exit: Some(0)
+--- stdout
+hi
+hi
+
+--- stderr
+synaps <VER> | claude-sonnet-4-6 | session <SID>
+
+⚡ [event] <event id="<UUID>" type="message" severity="medium" source="cli">ping from the differential</event>
+session saved: <SID> ($0.0001)

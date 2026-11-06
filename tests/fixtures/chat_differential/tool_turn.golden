@@ -1,0 +1,13 @@
+# chat differential: tool_turn
+## run 0
+exit: Some(0)
+--- stdout
+hi
+
+--- stderr
+synaps <VER> | claude-sonnet-4-6 | session <SID>
+
+⚙ read ⚙ read ({"path":"alpha.txt"})
+  → 1	a
+
+session saved: <SID> ($0.0002)

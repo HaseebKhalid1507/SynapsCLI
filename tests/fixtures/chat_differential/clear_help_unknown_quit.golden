@@ -1,0 +1,14 @@
+# chat differential: clear_help_unknown_quit
+## run 0
+exit: Some(0)
+--- stdout
+hi
+
+--- stderr
+synaps <VER> | claude-sonnet-4-6 | session <SID>
+
+session cleared → <SID>
+commands: /model /thinking /compact /clear /sessions /status /attach /attachments /detach /quit
+quitting (or EOF) mid-turn cancels the turn; its partial work is kept in history for the next --continue
+unknown command: /nonsense (try /help)
+session saved: <SID> ($0.0000)

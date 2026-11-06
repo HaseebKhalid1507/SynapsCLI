@@ -1,0 +1,17 @@
+# chat differential: piped_lines_then_eof
+## run 0
+exit: Some(0)
+--- stdout
+hi
+hi
+
+--- stderr
+synaps <VER> | claude-sonnet-4-6 | session <SID>
+
+session: <SID>
+model: claude-sonnet-4-6
+tokens: 20↑ 2↓
+cost: $0.0001
+messages: 4
+context: ~11270 of 139520 budget tokens (200000 window)
+session saved: <SID> ($0.0001)

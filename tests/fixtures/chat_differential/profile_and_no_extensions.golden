@@ -1,0 +1,19 @@
+# chat differential: profile_and_no_extensions
+## run 0
+exit: Some(0)
+--- stdout
+hi
+
+--- stderr
+synaps <VER> | claude-sonnet-4-6 | session <SID>
+
+session saved: <SID> ($0.0000)
+## run 1
+exit: Some(0)
+--- stdout
+hi
+
+--- stderr
+synaps <VER> | claude-sonnet-4-6 | session <SID>
+
+session saved: <SID> ($0.0000)
