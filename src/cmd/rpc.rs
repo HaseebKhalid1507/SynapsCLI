@@ -213,6 +213,13 @@ fn refuse(code: i32, message: String) -> ! {
     std::process::exit(code);
 }
 
+/// [`refuse`] once the private daemon may exist: stop it and remove its dir
+/// first.
+async fn refuse_private(private: PrivateDir, paths: &registry::DaemonPaths, code: i32, message: String) -> ! {
+    private.remove(paths).await;
+    refuse(code, message)
+}
+
 // ─── attachments ─────────────────────────────────────────────────────────────
 
 /// Validate RPC attachment paths: must be absolute, no `..` components.
@@ -1072,11 +1079,14 @@ pub async fn run(
         ..Default::default()
     };
     let paths = opts.paths();
-    match tokio::task::spawn_blocking(move || daemon::ensure_running(&opts)).await {
-        Ok(Ok(_)) => {}
-        Ok(Err(EnsureError::AutospawnDisabled)) => refuse(EXIT_REFUSED, "daemon autospawn is disabled".into()),
-        Ok(Err(EnsureError::Spawn(reason))) => refuse(EXIT_REFUSED, format!("daemon unavailable: {reason}")),
-        Err(e) => refuse(EXIT_REFUSED, format!("daemon unavailable: {e}")),
+    let spawned = match tokio::task::spawn_blocking(move || daemon::ensure_running(&opts)).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(EnsureError::AutospawnDisabled)) => Err("daemon autospawn is disabled".to_string()),
+        Ok(Err(EnsureError::Spawn(reason))) => Err(format!("daemon unavailable: {reason}")),
+        Err(e) => Err(format!("daemon unavailable: {e}")),
+    };
+    if let Err(message) = spawned {
+        refuse_private(private, &paths, EXIT_REFUSED, message).await;
     }
 
     // 3. Session config: this process's cwd (and, via Hello, its env).
@@ -1098,18 +1108,18 @@ pub async fn run(
     let hello = Hello::new(ClientKind::Rpc).with_history(HistoryMode::Full);
     let conn = match SocketTransport::connect(&paths.sock, hello).await {
         Ok(c) => c,
-        Err(TransportError::Version { client, daemon }) => refuse(
-            EXIT_VERSION,
-            format!("protocol version mismatch (client {client}, daemon {daemon}); restart the daemon with this binary"),
-        ),
-        Err(e) => refuse(EXIT_REFUSED, format!("daemon unavailable: {e}")),
+        Err(TransportError::Version { client, daemon }) => {
+            let why = format!("protocol version mismatch (client {client}, daemon {daemon}); restart the daemon with this binary");
+            refuse_private(private, &paths, EXIT_VERSION, why).await
+        }
+        Err(e) => refuse_private(private, &paths, EXIT_REFUSED, format!("daemon unavailable: {e}")).await,
     };
     if let Some(msg) = daemon::profile_mismatch(conn.welcome.profile.as_deref(), active.as_deref()) {
-        refuse(EXIT_REFUSED, msg);
+        refuse_private(private, &paths, EXIT_REFUSED, msg).await;
     }
     let (t, snap) = match SocketTransport::attach(conn, Attach::create_owned(config, AttachMode::Mirror, true)).await {
         Ok(v) => v,
-        Err(e @ TransportError::DaemonTooOld { .. }) => refuse(EXIT_REFUSED, e.to_string()),
+        Err(e @ TransportError::DaemonTooOld { .. }) => refuse_private(private, &paths, EXIT_REFUSED, e.to_string()).await,
         // `--continue` of a session another process has live, or one that
         // does not resolve: refused as before (exit 1, no Ready).
         Err(TransportError::Refused(m)) => {
@@ -1117,7 +1127,7 @@ pub async fn run(
             private.remove(&paths).await;
             std::process::exit(1);
         }
-        Err(e) => refuse(EXIT_REFUSED, format!("session create failed: {e}")),
+        Err(e) => refuse_private(private, &paths, EXIT_REFUSED, format!("session create failed: {e}")).await,
     };
 
     // 5. Writer, then Ready — the first byte on stdout.
