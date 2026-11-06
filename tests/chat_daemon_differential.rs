@@ -681,7 +681,6 @@ async fn no_extensions_runs_no_extension_hooks() {
 
 /// `phase2::ANTHROPIC_SSE` with its one text delta replaced by `deltas`
 /// deltas of `text` each.
-#[cfg(unix)]
 fn flood_sse(deltas: usize, text: &str) -> String {
     let frames: Vec<&str> = phase2::ANTHROPIC_SSE.split_inclusive("\n\n").collect();
     assert!(frames[2].contains("text_delta"), "fixture shape changed");
@@ -743,4 +742,93 @@ async fn blocked_stdout_does_not_lag_the_owner_off() {
     assert!(!stderr.contains("lost the session") && !stderr.contains("dropped"), "{stderr}");
     let text = String::from_utf8_lossy(&stdout);
     assert_eq!(text.matches('x').count(), DELTAS * WIDTH, "every delta reached stdout");
+}
+
+/// stdin EOF right behind a line whose reply streams slowly: chat finishes
+/// the turn, prints all of it, ends the session cleanly (`End` → `Ended`)
+/// and exits 0. EOF is read only while the session is idle, so it never
+/// cancels a turn in flight, and nothing the session sends is dropped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn eof_behind_a_slow_turn_prints_all_of_it() {
+    const DELTAS: usize = 30;
+    let body: &'static str = Box::leak(flood_sse(DELTAS, "y").into_boxed_str());
+    let (url, _hits, _b) =
+        phase2::spawn_stub(Script::Paced { body, frame_delay: Duration::from_millis(50) }).await;
+    let env = Env::new(url);
+    let run = run_chat(&env, &[], &[Step::Write("go\n"), Step::Close]).await;
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    assert_eq!(run.stdout.matches('y').count(), DELTAS, "stdout: {}\nstderr: {}", run.stdout, run.stderr);
+    assert!(run.stderr.contains("session saved"), "{}", run.stderr);
+    let journal = env.sessions_text();
+    assert!(journal.contains(&"y".repeat(DELTAS)), "the whole reply was journaled: {journal}");
+}
+
+/// A chat whose session the daemon ends while it sits idle at the prompt
+/// (`daemon stop` → `Ended{HostShutdown}`), or whose daemon dies outright,
+/// says so and exits 4; it never hangs and never reports a clean exit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn daemon_gone_under_an_idle_chat_exits_4() {
+    let (url, _hits, _b) = phase2::spawn_stub(Script::Sse(phase2::ANTHROPIC_SSE)).await;
+    let env = Env::new(url);
+    for kill in [false, true] {
+        if kill && !cfg!(unix) {
+            continue;
+        }
+        let mut child = env
+            .cmd(&["chat"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        stdin.write_all(b"hello\n").await.unwrap();
+        stdin.flush().await.unwrap();
+        let mut err = child.stderr.take().unwrap();
+        let err_task = tokio::spawn(async move {
+            let mut s = Vec::new();
+            let _ = err.read_to_end(&mut s).await;
+            s
+        });
+        let mut out = child.stdout.take().unwrap();
+        let mut got = Vec::new();
+        tokio::time::timeout(STEP_TIMEOUT, async {
+            let mut buf = [0u8; 256];
+            while !String::from_utf8_lossy(&got).contains("hi") {
+                let n = out.read(&mut buf).await.unwrap();
+                assert!(n > 0, "stdout closed before the reply");
+                got.extend_from_slice(&buf[..n]);
+            }
+        })
+        .await
+        .expect("the reply");
+        tokio::time::sleep(Duration::from_millis(300)).await; // idle at the prompt
+        let paths = agent_engine::daemon::registry::daemon_paths_in(&env.run_dir(), None);
+        if kill {
+            let pid = agent_engine::daemon::registry::read_daemon_json(&paths).expect("daemon.json").pid;
+            let st = std::process::Command::new("kill").args(["-9", &pid.to_string()]).status().unwrap();
+            assert!(st.success());
+        } else {
+            let st = env.cmd(&["daemon", "stop"]).stdout(Stdio::null()).stderr(Stdio::null()).status().await.unwrap();
+            assert!(st.success(), "daemon stop");
+        }
+        let status = tokio::time::timeout(EXIT_TIMEOUT, child.wait()).await.expect("chat exits, never hangs").unwrap();
+        let stderr = String::from_utf8_lossy(&err_task.await.unwrap()).into_owned();
+        assert_eq!(status.code(), Some(4), "kill={kill}: {stderr}");
+        if kill {
+            assert!(stderr.contains("synaps chat: lost the session"), "{stderr}");
+        } else {
+            assert!(stderr.contains("synaps chat: the session ended under chat: the daemon is shutting down"), "{stderr}");
+        }
+        assert!(stderr.contains("synaps chat --continue"), "{stderr}");
+        assert!(!stderr.contains("session saved"), "not a clean exit: {stderr}");
+        drop(stdin);
+        // The next chat starts a fresh daemon.
+        let t0 = std::time::Instant::now();
+        while agent_engine::daemon::registry::is_alive(&paths) {
+            assert!(t0.elapsed() < Duration::from_secs(10), "daemon still alive");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
 }

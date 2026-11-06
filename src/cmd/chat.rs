@@ -34,6 +34,7 @@ use agent_engine::session::{
 };
 use synaps_cli::engine::commands;
 use synaps_cli::{AgentEvent, LlmEvent, SessionEvent, StreamEvent};
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader as TokioBufReader};
 
 /// chat's `print!`/`eprint!`: through [`pump`], never straight to the fds.
@@ -68,6 +69,11 @@ struct Render {
     fatal: Option<synaps_cli::TurnError>,
     cost: f64,
     ended: bool,
+    /// Why the session ended. `ClientQuit` is ours (`End` from EOF, `/quit`,
+    /// `/close`); anything else ended it under chat.
+    end_reason: Option<EndReason>,
+    /// The session's current id (`/clear` and compaction move it on).
+    current_id: String,
     /// A `Confirm` prompt waiting for a y/n line from a TTY user (the
     /// next stdin line answers it). Secret prompts are never held here:
     /// the line client has no masked input and cancels them.
@@ -142,17 +148,18 @@ impl Render {
                     "aborted"
                 }
             ),
-            SessionEventWire::Cleared { session_id } => errln!(
-                "session cleared → {}",
-                &session_id[..8.min(session_id.len())]
-            ),
+            SessionEventWire::Cleared { session_id } => {
+                errln!("session cleared → {}", &session_id[..8.min(session_id.len())]);
+                self.current_id = session_id;
+            }
             // B2: spawned compaction reports through typed events — each
             // rendered exactly once.
             SessionEventWire::CompactionStarted { disclosure, .. } => {
                 errln!("compacting...");
                 errln!("{}", disclosure);
             }
-            SessionEventWire::CompactionApplied { .. } => {
+            SessionEventWire::CompactionApplied { session_id, .. } => {
+                self.current_id = session_id;
                 // `compacted → ~N tokens` needs the post-apply assessment.
                 let _ = transport
                     .send(SessionCommand::Query {
@@ -173,7 +180,10 @@ impl Render {
             SessionEventWire::CompactionCancelled => {
                 errln!("\x1b[2m[compaction cancelled]\x1b[0m")
             }
-            SessionEventWire::Ended { .. } => self.ended = true,
+            SessionEventWire::Ended { reason } => {
+                self.ended = true;
+                self.end_reason = Some(reason);
+            }
             _ => {}
         }
     }
@@ -282,23 +292,48 @@ async fn next(t: &mut SocketTransport, r: &mut Render) -> Option<Envelope> {
         if r.ended {
             return None;
         }
-        match t.last_error() {
-            Some(TransportError::Reloading { .. }) => match t.reconnect(AttachMode::Mirror).await {
-                Ok(snap) => {
-                    r.streaming = snap.streaming;
-                    r.idle = !snap.streaming;
-                    continue;
-                }
-                Err(e) => lost(&format!("the daemon reloaded and the session could not be re-bound: {e}")),
-            },
-            Some(TransportError::OwnerLagged { dropped }) => lost(&format!(
-                "chat fell behind the session's event stream ({dropped} event(s) dropped; is stdout blocked?) \
-                 and the daemon disconnected it rather than drop output"
-            )),
-            Some(e) => lost(&e.to_string()),
-            None => lost("the daemon closed the connection"),
-        }
+        rebind_or_lost(t, r).await;
     }
+}
+
+/// The connection is gone and the session has not ended: re-bind after a
+/// daemon reload, or say why the session is lost and exit
+/// [`EXIT_DAEMON_LOST`]. Never waits past the reconnect budget.
+async fn rebind_or_lost(t: &mut SocketTransport, r: &mut Render) {
+    match t.last_error() {
+        Some(TransportError::Reloading { .. }) => match t.reconnect(AttachMode::Mirror).await {
+            Ok(snap) => {
+                r.streaming = snap.streaming;
+                r.idle = !snap.streaming;
+            }
+            Err(e) => lost(&format!("the daemon reloaded and the session could not be re-bound: {e}")),
+        },
+        Some(TransportError::OwnerLagged { dropped }) => lost(&format!(
+            "chat fell behind the session's event stream ({dropped} event(s) dropped; is stdout blocked?) \
+             and the daemon disconnected it rather than drop output"
+        )),
+        Some(e) => lost(&e.to_string()),
+        None => lost("the daemon closed the connection"),
+    }
+}
+
+/// The daemon ended the session under chat (`daemon stop`, an eviction, an
+/// error): not a clean quit, so say so and exit [`EXIT_DAEMON_LOST`].
+fn ended_under_us(reason: EndReason, session_id: &str) -> ! {
+    r_end_thinking_raw();
+    let why = match reason {
+        EndReason::HostShutdown => "the daemon is shutting down",
+        EndReason::Evicted => "the daemon evicted it",
+        EndReason::Error => "it failed",
+        EndReason::Idle => "it was idle",
+        EndReason::OwnerGone => "its owner connection was lost",
+        EndReason::ClientQuit => "it was closed",
+    };
+    errln!(
+        "synaps chat: the session ended under chat: {why}; its journal is kept: \
+         resume it with `synaps chat --continue {session_id}`"
+    );
+    pump::exit(EXIT_DAEMON_LOST);
 }
 
 fn lost(why: &str) -> ! {
@@ -457,6 +492,14 @@ async fn run_session(
             snap.conversation.api_messages.len()
         );
     }
+    // chat adopts the long-lived profile daemon, which may be an older
+    // build: the same skew notice the TUI shows.
+    if let Some(daemon_bin) = t.daemon_binary() {
+        let this = agent_engine::session::transport::BinaryId::this();
+        if let Some(n) = agent_engine::session::transport::version_skew_notice(&this, &daemon_bin, &session_id) {
+            errln!("⚠ {n}");
+        }
+    }
     let mcp_tools = agent_engine::mcp::cached_tool_count();
     if mcp_tools > 0 {
         errln!("↳ {} MCP servers available", mcp_tools);
@@ -471,6 +514,8 @@ async fn run_session(
         fatal: None,
         cost: snap.conversation.cost,
         ended: false,
+        end_reason: None,
+        current_id: session_id.clone(),
         pending_confirm: None,
     };
     let mut pending_attachments = agent_engine::attachments::PendingAttachments::default();
@@ -736,6 +781,9 @@ async fn run_session(
 
     // ── Shutdown: End → the session saves, fires on_session_end, ends ──
     end_session(&mut t, &mut r).await;
+    if let Some(reason) = r.end_reason.filter(|r| *r != EndReason::ClientQuit) {
+        ended_under_us(reason, &r.current_id);
+    }
 
     if !pending_attachments.is_empty() {
         errln!(
@@ -767,25 +815,36 @@ fn oversize() {
     );
 }
 
-/// `End{ClientQuit}` and wait for `Ended`: the session is saved (and its
-/// `on_session_end` ran) before chat prints "session saved" and exits, so
-/// an immediate `--continue` never races the dying session.
+/// `End{ClientQuit}` and wait for `Ended`, rendering everything the session
+/// still sends (a cancelled turn's tail, `Aborted`, compaction results): the
+/// session is saved (and its `on_session_end` ran) before chat prints
+/// "session saved" and exits, so an immediate `--continue` never races the
+/// dying session. A daemon reload meanwhile re-binds and asks again; a lost
+/// daemon, or no `Ended` within the session's own end budget plus a margin,
+/// exits [`EXIT_DAEMON_LOST`] instead of hanging.
 async fn end_session(t: &mut SocketTransport, r: &mut Render) {
-    if r.ended {
-        return;
-    }
-    let _ = t
-        .send(SessionCommand::End {
-            reason: EndReason::ClientQuit,
-        })
-        .await;
-    while !r.ended {
-        match t.next_event().await {
-            Some(env) => r.on_event(t, env).await,
-            None => break,
+    let budget = Duration::from_secs(agent_engine::session::budgets::SESSION_END_TIMEOUT_SECS + END_MARGIN_SECS);
+    let wait = async {
+        while !r.ended {
+            let _ = t.send(SessionCommand::End { reason: EndReason::ClientQuit }).await;
+            while !r.ended {
+                match t.next_event().await {
+                    Some(env) => r.on_event(t, env).await,
+                    None => break,
+                }
+            }
+            if !r.ended {
+                rebind_or_lost(t, r).await;
+            }
         }
+    };
+    if tokio::time::timeout(budget, wait).await.is_err() {
+        lost(&format!("the session did not confirm its end within {} s", budget.as_secs()));
     }
 }
+
+/// Slack over `SESSION_END_TIMEOUT_SECS` for the daemon round trip.
+const END_MARGIN_SECS: u64 = 10;
 
 /// chat's output: ordered, and never blocking the session reader.
 ///
