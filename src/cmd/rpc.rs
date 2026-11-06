@@ -42,7 +42,7 @@ use agent_engine::session::{
     AttachMode, ClientKind, ClientTransport, EndReason, HistoryMode, SessionCommand, SessionConfig,
     SessionEventWire, SessionQuery, SessionSetting, TransportError, TurnTrigger,
 };
-use agent_engine::{SessionEvent, StreamEvent, TurnError};
+use agent_engine::{AgentEvent, SessionEvent, StreamEvent, TurnError};
 use synaps_cli::core::rpc_dispatch::{accumulate_usage, build_tools_list_body, map_stream_event, parse_frame, MAX_FRAME_BYTES};
 use synaps_cli::core::rpc_protocol::{RpcAttachment, RpcCommand, RpcEvent, TurnUsage, RPC_PROTOCOL_VERSION};
 use synaps_cli::runtime::openai::registry::{list_models, list_providers};
@@ -167,13 +167,15 @@ struct Turn {
     cancel_sent: bool,
     /// The prompt text (a pending prompt is matched by it).
     text: String,
-    /// Pending only: the actor took the text as a steer of another turn.
+    /// Pending only: the actor took the text as a steer of another turn...
     steered: bool,
+    /// ...and that turn's engine took it into the history.
+    consumed: bool,
 }
 
 impl Turn {
     fn new(id: String) -> Self {
-        Self { id, usage: empty_usage(), aborts: Vec::new(), cancel_sent: false, text: String::new(), steered: false }
+        Self { id, usage: empty_usage(), aborts: Vec::new(), cancel_sent: false, text: String::new(), steered: false, consumed: false }
     }
 
     fn command(&self) -> &'static str {
@@ -485,11 +487,18 @@ impl Bridge {
             SessionEventWire::Idle => {
                 if self.turn.is_some() {
                     self.finish(TurnEnd::NoDone).await;
-                } else if self.pending.as_ref().is_some_and(|p| p.steered) {
+                }
+                if let Some(p) = self.pending.take_if(|p| p.steered && p.consumed) {
                     // Steered into the turn that just ended, which answered
                     // it (its frames went out under that turn's id).
-                    self.turn = self.pending.take();
+                    self.turn = Some(p);
                     self.finish(TurnEnd::Done).await;
+                } else if let Some(p) = self.pending.take_if(|p| p.steered) {
+                    // That turn ended (failed) without taking it.
+                    self.error(Some(p.id), "prompt not delivered: the turn it was steered into ended first").await;
+                    for a in p.aborts {
+                        self.respond(a, "abort", serde_json::json!({ "ok": true })).await;
+                    }
                 }
             }
             SessionEventWire::QueryResult { id, value } => {
@@ -580,6 +589,12 @@ impl Bridge {
     }
 
     async fn on_stream(&mut self, se: StreamEvent) {
+        // Our steered prompt went into the running turn's history.
+        if let StreamEvent::Agent(AgentEvent::SteeringDelivered { message }) = &se {
+            if let Some(p) = self.pending.as_mut().filter(|p| p.steered && &p.text == message) {
+                p.consumed = true;
+            }
+        }
         let Some(turn) = self.turn.as_mut() else { return };
         match se {
             StreamEvent::Session(SessionEvent::Usage { .. }) => {
