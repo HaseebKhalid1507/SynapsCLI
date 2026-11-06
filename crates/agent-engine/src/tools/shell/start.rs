@@ -120,6 +120,8 @@ impl Tool for ShellStartTool {
         if !output.is_empty() {
             result.push_str(&output);
         }
+        // The shell starts from the session env: say which secrets it lacks.
+        result.push_str(&ctx.capabilities.stripped_env_notices(|_| true));
         Ok(result)
     }
 }

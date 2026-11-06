@@ -637,28 +637,11 @@ pub(crate) async fn run_shell_command(
                 if status.success() || was_truncated {
                     Ok(output)
                 } else {
-                    let mut notice = String::new();
                     // T5: when a command fails and references a stripped secret,
-                    // append a notice (once per name per session).
-                    if !ctx.capabilities.env_stripped.is_empty() {
-                        let mut warned = ctx.capabilities.env_warned.lock().unwrap_or_else(|p| p.into_inner());
-                        for name in &ctx.capabilities.env_stripped {
-                            if warned.contains(name) {
-                                continue;
-                            }
-                            // Word-boundary match: covers $NAME, ${NAME},
-                            // ${NAME:?}, ${NAME:-x}, $env:NAME and NAME=…
-                            if references_env_name(script, name) {
-                                notice.push_str(&format!(
-                                    "\nnote: ${name} was stripped from the session env as a secret; \
-                                     reattach from a shell that has it \
-                                     (synaps --system … from that shell) \
-                                     — the daemon never receives credentials."
-                                ));
-                                warned.insert(name.clone());
-                            }
-                        }
-                    }
+                    // append a notice (once per name per session). Word-boundary
+                    // match: covers $NAME, ${NAME}, ${NAME:?}, ${NAME:-x},
+                    // $env:NAME and NAME=…
+                    let notice = ctx.capabilities.stripped_env_notices(|name| references_env_name(script, name));
                     Err(RuntimeError::Tool(format!(
                         "Command failed (exit {}):\n{}{notice}",
                         status.code().unwrap_or(-1),
