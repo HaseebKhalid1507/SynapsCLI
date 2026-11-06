@@ -316,6 +316,7 @@ async fn reload_stops_running_workers_resumably_and_never_reuses_their_ids() {
                 ..Default::default()
             },
             mode: AttachMode::Mirror,
+            owned: None,
         },
     )
     .await

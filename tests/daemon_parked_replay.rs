@@ -100,6 +100,7 @@ async fn attach_to_parked_session_replays_conversation() {
                 ..Default::default()
             },
             mode: AttachMode::Mirror,
+            owned: None,
         },
     )
     .await

@@ -153,6 +153,12 @@ pub struct ReloadSession {
     /// Empty from an older image or a checkpoint that did not confirm.
     #[serde(default)]
     pub tool_activations: Vec<crate::tools::activation::CarriedActivation>,
+    /// An owned session's owner token (`SessionConfig::owned` never rides
+    /// the config): the next image restores it owned and unbound, waiting
+    /// the re-bind grace for its owner. Never the forwarded secrets: the
+    /// owner sends them again when it re-binds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_token: Option<crate::session::OwnerToken>,
 }
 
 /// `registry_dir()/daemon[-P].reload.json` body.
@@ -407,6 +413,7 @@ fn record(handle: &SessionHandle, rec: Option<SessionReloadRecord>) -> ReloadSes
         input_owner_kind: None,
         workers,
         tool_activations,
+        owner_token: handle.owner_token().cloned(),
     }
 }
 
@@ -878,7 +885,7 @@ pub async fn rehydrate(state: &Arc<DaemonState>, rs: &ReloadState) {
     // stopped, so `sa_1` never names two different workers.
     crate::tools::seed_next_subagent_id(rs.subagent_id_floor());
     for s in &rs.sessions {
-        let config = restore_config(&s.config, s.lifecycle);
+        let config = SessionConfig { owned: s.owner_token.clone(), ..restore_config(&s.config, s.lifecycle) };
         let created = match state.create(config.clone()).await {
             Ok(h) => Ok(h),
             // F23: journal locked by another process — register a Parked
@@ -1000,6 +1007,7 @@ mod tests {
             input_owner_kind: None,
             workers: Vec::new(),
             tool_activations: carried.clone(),
+            owner_token: None,
         };
         let v = serde_json::to_value(&s).unwrap();
         let back: ReloadSession = serde_json::from_value(v.clone()).unwrap();
@@ -1055,6 +1063,7 @@ mod tests {
             input_owner_kind: None,
             workers,
             tool_activations: Vec::new(),
+            owner_token: None,
         };
         let mut rs = ReloadState {
             generation: 10,

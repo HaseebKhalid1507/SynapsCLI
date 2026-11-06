@@ -76,6 +76,7 @@ async fn daemon_sigkill_line_client_exits_nonzero() {
                 ..Default::default()
             },
             mode: AttachMode::Mirror,
+            owned: None,
         },
     )
     .await
@@ -175,6 +176,7 @@ async fn daemon_sigkill_socket_transport_reports_crash() {
                 ..Default::default()
             },
             mode: AttachMode::Mirror,
+            owned: None,
         },
     )
     .await

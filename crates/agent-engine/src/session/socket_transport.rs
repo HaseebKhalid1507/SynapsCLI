@@ -503,6 +503,10 @@ pub struct SocketTransport {
     /// What we asked for in `Hello` (phase 4 §2.3).
     history: HistoryMode,
     buf: FrameBuf,
+    /// Owned sessions: this connection is the owner. The token the daemon
+    /// minted, plus the secrets forwarded at create, sent again on a
+    /// re-bind after a reload (`reconnect`).
+    owner: Option<OwnerClaim>,
 }
 
 impl SocketTransport {
@@ -525,6 +529,22 @@ impl SocketTransport {
             ),
             Attach::Create { mode, .. } => (*mode, false),
         };
+        // Owned: an older daemon would ignore the request and hand back a
+        // session that outlives us. Never ask one that does not say it can.
+        let owned_create = match &attach {
+            Attach::Create { owned: Some(o), .. } => Some(o.forward_secrets.clone()),
+            _ => None,
+        };
+        if owned_create.is_some() && !conn.welcome.supports(FEATURE_OWNED_SESSIONS) {
+            let daemon_version = conn.welcome.daemon_version.clone();
+            conn.bye().await;
+            return Err(TransportError::DaemonTooOld { daemon_version, request: "owned sessions" });
+        }
+        // The owner re-binding after a reload (`reconnect`).
+        let rebind = match &attach {
+            Attach::Existing { .. } => conn.hello.reconnect_of.as_ref().and_then(|r| r.owner.clone()),
+            Attach::Create { .. } => None,
+        };
         conn.writer
             .send(ClientFrame::Attach(attach))
             .await
@@ -546,6 +566,15 @@ impl SocketTransport {
                 Some(DaemonFrame::Bye { .. }) | None => return Err(TransportError::Closed),
                 Some(other) => return Err(TransportError::Protocol(format!("expected attached, got {other:?}"))),
             }
+        };
+        let owner = match (owned_create, rebind) {
+            (None, None) => None,
+            (Some(forward_secrets), _) => match attached.owner_token.clone() {
+                Some(token) => Some(OwnerClaim { token, forward_secrets }),
+                None => return Err(TransportError::Refused("daemon did not grant an owned session".into())),
+            },
+            (None, Some(claim)) if attached.owner_token.as_ref() == Some(&claim.token) => Some(claim),
+            (None, Some(_)) => return Err(TransportError::Refused("daemon did not re-bind the owned session".into())),
         };
         let (client, snapshot) = attached.into_snapshot();
         let meta = snapshot.meta.clone();
@@ -578,9 +607,34 @@ impl SocketTransport {
                 pending_digest: None,
                 history,
                 buf: conn.buf,
+                owner,
             },
             snapshot,
         ))
+    }
+
+    /// Whether this connection owns its session (an owned create, or a
+    /// re-bind): the session ends when this connection goes away.
+    pub fn is_session_owner(&self) -> bool {
+        self.owner.is_some()
+    }
+
+    /// Connect and create an OWNED session in one call (headless clients:
+    /// `synaps rpc`, `synaps chat`): the session ends, its turn cancelled,
+    /// when this transport is dropped, detaches, or its process dies.
+    /// `forward_secrets` also hands the daemon this process's secret env
+    /// vars (the ones `Hello` strips) for the session's tools, in memory
+    /// only. Fails with `DaemonTooOld` against a daemon without the
+    /// feature; never falls back to an unowned session.
+    pub async fn create_owned(
+        path: &Path,
+        hello: Hello,
+        config: SessionConfig,
+        mode: AttachMode,
+        forward_secrets: bool,
+    ) -> Result<(Self, AttachSnapshot), TransportError> {
+        let conn = Connected::connect(path, hello).await?;
+        Self::attach(conn, Attach::create_owned(config, mode, forward_secrets)).await
     }
 
     /// Why the last `next_event` returned `None` (if it was not a plain end).
@@ -620,6 +674,7 @@ impl SocketTransport {
             session_id: self.session.clone(),
             was_owner,
             generation,
+            owner: self.owner.clone(),
         });
         let mode = if was_owner { AttachMode::Takeover } else { mode };
         match Connected::connect(&self.path, hello).await {
@@ -956,6 +1011,7 @@ impl ClientTransport for SocketTransport {
             session_id: self.session.clone(),
             was_owner,
             generation,
+            owner: self.owner.clone(),
         });
         let mode = if was_owner { AttachMode::Takeover } else { mode };
         let total = std::env::var("SYNAPS_TUI_ATTACH_RECONNECT_SECS")
@@ -1053,6 +1109,7 @@ mod tests {
                         progressive_tool_disclosure: true,
                         generation: 1,
                         daemon_build: String::new(),
+                        features: Vec::new(),
                     })
                 }
                 ClientFrame::Ping => DaemonFrame::Pong { pid: 1, uptime_s: 0, sessions: 0 },
@@ -1375,6 +1432,7 @@ mod tests {
                 progressive_tool_disclosure: true,
                 generation: 1,
                 daemon_build: String::new(),
+                features: Vec::new(),
             });
             w.write_all(encode_line(&welcome).unwrap().as_bytes()).await.unwrap();
             line.clear();
@@ -1389,6 +1447,96 @@ mod tests {
             .unwrap();
         assert!(matches!(err, TransportError::Refused(ref m) if m == "unknown session"), "{err}");
         srv.await.unwrap();
+    }
+
+    /// A daemon welcoming with `features` and answering the Attach with an
+    /// `Attached` that carries no owner token; returns the frame types the
+    /// client sent after `Hello`.
+    async fn owned_fake_daemon(mut l: Listener, features: Vec<String>) -> Vec<String> {
+        let stream = l.accept().await.unwrap();
+        let (r, mut w) = crate::ipc::split_server(stream);
+        let mut reader = BufReader::new(r);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        let welcome = DaemonFrame::Welcome(Welcome {
+            protocol_version: PROTOCOL_VERSION,
+            daemon_version: "0.0.1-old".into(),
+            pid: 1,
+            profile: None,
+            sessions: vec![],
+            progressive_tool_disclosure: true,
+            generation: 1,
+            daemon_build: String::new(),
+            features,
+        });
+        w.write_all(encode_line(&welcome).unwrap().as_bytes()).await.unwrap();
+        let mut sent = Vec::new();
+        loop {
+            line.clear();
+            if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                return sent;
+            }
+            let frame: ClientFrame = decode_line(line.trim_end()).unwrap();
+            sent.push(format!("{frame:?}").split(['(', ' ', '{']).next().unwrap().to_string());
+            if let ClientFrame::Attach(_) = frame {
+                let sid = SessionId::from("fake-1");
+                let reply = DaemonFrame::Attached(AttachedWire::new(
+                    ClientId(7),
+                    AttachSnapshot {
+                        meta: crate::session::handle::echo::meta_for(&sid),
+                        view: crate::session::handle::echo::view_for(),
+                        conversation: ConversationSnapshot::default(),
+                        streaming: false,
+                        replay: vec![],
+                        pending_prompts: vec![],
+                        clients: vec![],
+                        roster: Vec::new(),
+                        client_input: ClientInput::wire_default(),
+                        input_owner: Some(ClientId(7)),
+                        display_tail: None,
+                    },
+                ));
+                w.write_all(encode_line(&reply).unwrap().as_bytes()).await.unwrap();
+            }
+        }
+    }
+
+    /// An older daemon would ignore `owned` and hand back a session that
+    /// outlives the client: the client never sends the request to a daemon
+    /// that does not advertise the feature, and says why.
+    #[tokio::test]
+    async fn owned_create_against_a_daemon_without_the_feature_fails_loudly() {
+        let (_d, path) = sock();
+        let l = Listener::bind(&path).unwrap();
+        let srv = tokio::spawn(owned_fake_daemon(l, Vec::new()));
+        let conn = SocketTransport::connect(&path, Hello::new(ClientKind::Test)).await.unwrap();
+        assert!(!conn.welcome.supports(FEATURE_OWNED_SESSIONS));
+        let err = SocketTransport::attach(conn, Attach::create_owned(SessionConfig::default(), AttachMode::Mirror, false))
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            matches!(err, TransportError::DaemonTooOld { request: "owned sessions", ref daemon_version } if daemon_version == "0.0.1-old"),
+            "{err}"
+        );
+        assert!(err.to_string().contains("daemon reload"), "{err}");
+        assert_eq!(srv.await.unwrap(), vec!["Bye".to_string()], "no Attach ever reached the daemon");
+    }
+
+    /// A daemon that advertises the feature but grants no owner token: the
+    /// client refuses the session rather than run unowned.
+    #[tokio::test]
+    async fn owned_create_without_a_token_in_the_reply_is_refused() {
+        let (_d, path) = sock();
+        let l = Listener::bind(&path).unwrap();
+        let srv = tokio::spawn(owned_fake_daemon(l, vec![FEATURE_OWNED_SESSIONS.into()]));
+        let conn = SocketTransport::connect(&path, Hello::new(ClientKind::Test)).await.unwrap();
+        let err = SocketTransport::attach(conn, Attach::create_owned(SessionConfig::default(), AttachMode::Mirror, false))
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(err, TransportError::Refused(ref m) if m.contains("did not grant an owned session")), "{err}");
+        drop(srv);
     }
 
     #[tokio::test]

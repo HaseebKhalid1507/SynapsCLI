@@ -55,6 +55,7 @@ async fn mirror_is_read_only_takeover_steals_owner_may_end() {
         Attach::Create {
             config: SessionConfig { cwd: Some(guard.home.path().to_path_buf()), model_override: Some("claude-sonnet-4-5".into()), persist: false, client_input: Some(ClientInput::Exclusive), ..Default::default() },
             mode: AttachMode::Mirror,
+            owned: None,
         },
     )
     .await;
@@ -143,6 +144,7 @@ async fn clients_are_named_in_the_roster_listing_and_refusals() {
         Attach::Create {
             config: SessionConfig { cwd: Some(guard.home.path().to_path_buf()), model_override: Some("claude-sonnet-4-5".into()), persist: false, client_input: Some(ClientInput::Exclusive), ..Default::default() },
             mode: AttachMode::Mirror,
+            owned: None,
         },
     )
     .await
@@ -218,6 +220,7 @@ async fn shared_input_over_the_wire_and_older_clients_are_presented_owners() {
         Attach::Create {
             config: SessionConfig { cwd: Some(guard.home.path().to_path_buf()), model_override: Some("claude-sonnet-4-5".into()), persist: false, client_input: Some(ClientInput::Shared), ..Default::default() },
             mode: AttachMode::Mirror,
+            owned: None,
         },
     )
     .await;

@@ -189,6 +189,7 @@ async fn session_env_differential_in_process_vs_daemon() {
                 ..Default::default()
             },
             mode: AttachMode::Mirror,
+            owned: None,
         },
     )
     .await
@@ -352,6 +353,7 @@ async fn attach_existing_does_not_change_env() {
                 ..Default::default()
             },
             mode: AttachMode::Mirror,
+            owned: None,
         },
     )
     .await

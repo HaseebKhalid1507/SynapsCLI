@@ -67,6 +67,7 @@ async fn in_process_continue_of_live_daemon_session_refused() {
                 ..Default::default()
             },
             mode: AttachMode::Mirror,
+            owned: None,
         },
     )
     .await

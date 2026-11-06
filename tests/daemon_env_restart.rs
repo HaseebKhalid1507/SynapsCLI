@@ -91,6 +91,7 @@ async fn attach_create_with_env(
                 ..Default::default()
             },
             mode: AttachMode::Mirror,
+            owned: None,
         },
     )
     .await
@@ -116,6 +117,7 @@ async fn attach_continue_no_env(
                 ..Default::default()
             },
             mode: AttachMode::Mirror,
+            owned: None,
         },
     )
     .await

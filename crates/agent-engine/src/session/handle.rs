@@ -37,6 +37,10 @@ pub struct Presence {
     pub title: Option<String>,
     pub cost_usd: f64,
     pub messages: usize,
+    /// Owned sessions: the client bound as the owner (`None` while the
+    /// session waits for its owner to bind or re-bind). Always `None` for a
+    /// session that is not owned (`SessionHandle::is_owned`).
+    pub owning_client: Option<ClientId>,
 }
 
 /// The coarse state `Presence::state_since` dates.
@@ -94,6 +98,10 @@ pub struct SessionHandle {
     /// F23: only on a lock-held placeholder — the config to retry the real
     /// `create` with on the next attach. `None` for real actors.
     placeholder_config: Option<Arc<SessionConfig>>,
+    /// Owned sessions only: the owner token, fixed at create. Here so a
+    /// reload whose checkpoint did not confirm still records the session
+    /// as owned (it would otherwise come back unowned and never end).
+    owner_token: Option<super::types::OwnerToken>,
 }
 
 impl std::fmt::Debug for SessionHandle {
@@ -150,6 +158,7 @@ impl SessionHandle {
             cache_keepwarm: Arc::clone(&cache_keepwarm),
             memory_mode: Arc::clone(&memory_mode),
             placeholder_config: None,
+            owner_token: None,
         };
         (
             handle,
@@ -270,6 +279,22 @@ impl SessionHandle {
     pub(crate) fn with_placeholder_config(mut self, cfg: SessionConfig) -> Self {
         self.placeholder_config = Some(Arc::new(cfg));
         self
+    }
+
+    pub(crate) fn with_owner_token(mut self, token: Option<super::types::OwnerToken>) -> Self {
+        self.owner_token = token;
+        self
+    }
+
+    /// Whether this is an owned session (bound to its creating connection).
+    pub fn is_owned(&self) -> bool {
+        self.owner_token.is_some()
+    }
+
+    /// The owner token of an owned session (daemon-internal: the conn hands
+    /// it to the owner only, the reload record carries it).
+    pub fn owner_token(&self) -> Option<&super::types::OwnerToken> {
+        self.owner_token.as_ref()
     }
 
     pub fn meta(&self) -> &SessionMeta {
@@ -423,7 +448,7 @@ pub mod echo {
 
         fn handle(&mut self, cmd: SessionCommand) -> bool {
             match cmd {
-                SessionCommand::Attach { client, mode } => {
+                SessionCommand::Attach { client, mode, .. } => {
                     let cid = ClientId(self.next_client);
                     self.next_client += 1;
                     let kind = client.kind;

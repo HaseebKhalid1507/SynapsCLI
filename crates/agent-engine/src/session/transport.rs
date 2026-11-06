@@ -229,6 +229,7 @@ impl LocalTransport {
             .send(SessionCommand::Attach {
                 client: meta,
                 mode,
+                owner: None,
             })
             .await?;
 

@@ -170,6 +170,7 @@ async fn create_refuses_relative_or_missing_cwd() {
     c.send(&ClientFrame::Attach(Attach::Create {
         config: SessionConfig { cwd: Some("/definitely/not/here".into()), ..Default::default() },
         mode: AttachMode::Mirror,
+        owned: None,
     }))
     .await;
     assert!(matches!(c.recv().await, Some(DaemonFrame::Error { message, .. }) if message.contains("cwd")));

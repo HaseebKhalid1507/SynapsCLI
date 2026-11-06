@@ -103,6 +103,7 @@ async fn continue_old_follows_compacted_into() {
                 ..Default::default()
             },
             mode: AttachMode::Mirror,
+            owned: None,
         },
     )
     .await

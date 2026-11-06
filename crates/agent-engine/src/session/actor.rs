@@ -483,7 +483,7 @@ fn is_rename_command(cmd: &SessionCommand) -> bool {
     matches!(cmd, SessionCommand::EngineCommand { name, .. } if name == RENAME_COMMAND)
 }
 
-fn command_name(cmd: &SessionCommand) -> &'static str {
+pub(crate) fn command_name(cmd: &SessionCommand) -> &'static str {
     match cmd {
         SessionCommand::Submit { .. } => "submit",
         SessionCommand::SubmitPrepared { .. } => "submit_prepared",
@@ -660,6 +660,8 @@ pub struct SessionActor {
     /// Set by a reload checkpoint until the `execv` (or until the daemon
     /// reports it failed): see [`ReloadFence`].
     pub(crate) reload_fence: Option<ReloadFence>,
+    /// Owned sessions only (`SessionConfig::owned`): see `session::owned`.
+    pub(crate) owned: Option<super::owned::OwnedState>,
     /// Shared with the handle: `config.memory_mode`, readable by a reload
     /// that gets no checkpoint reply.
     pub(crate) memory_mode_slot: super::handle::MemoryModeSlot,
@@ -919,6 +921,8 @@ impl SessionActor {
                 memory_mode,
             },
         ) = SessionHandle::new(meta.clone(), view);
+        let handle = handle.with_owner_token(cfg.owned.clone());
+        let owned = cfg.owned.clone().map(super::owned::OwnedState::new);
         // The mode is fixed for the session: seed the listing with it now.
         // Otherwise only a presence publish (attach, detach, input) carries
         // it, so a session restored at reload, with no client back yet,
@@ -1017,6 +1021,7 @@ impl SessionActor {
                 interval
             },
             reload_fence: None,
+            owned,
             memory_mode_slot: memory_mode,
             memory_seen_active: false,
             parked_tool_activations: Vec::new(),
@@ -1385,6 +1390,7 @@ impl SessionActor {
             title,
             cost_usd,
             messages,
+            owning_client: self.owned.as_ref().and_then(|o| o.client),
         }));
     }
 
@@ -1513,6 +1519,8 @@ impl SessionActor {
             && !self.keep_warm
             && self.config.persist
             && !self.is_parked()
+            // Ends with its owner instead.
+            && self.owned.is_none()
             && self.driver.is_none()
     }
 
@@ -2386,6 +2394,8 @@ impl SessionActor {
             // detaches, killing the run mid-arm). `can_park` already guards.
             && self.driver.is_none()
             && self.driver_pending.is_none()
+            // Ends with its owner (or its re-bind grace) instead.
+            && self.owned.is_none()
     }
 
     pub(crate) fn rearm_park(&mut self) {
@@ -4746,7 +4756,7 @@ impl SessionActor {
     /// (else read-only + notice); `Takeover` steals with
     /// `InputOwnerChanged{reason: Takeover}` to everyone (the old owner's
     /// client renders the toast).
-    async fn attach(&mut self, client: ClientMeta, mode: AttachMode) {
+    async fn attach(&mut self, client: ClientMeta, mode: AttachMode, owner: Option<super::types::OwnerClaim>) {
         if let Err(e) = self.ensure_live().await {
             self.emit(SessionEventWire::AttachRefused { message: e });
             return;
@@ -4766,6 +4776,11 @@ impl SessionActor {
             cid,
             AttachedClient { meta: client, mode, name: name.clone(), attached_at_ms, last_input: 0 },
         );
+        // Before the presence publish below: the daemon reads the binding
+        // from it once `Attached` arrives.
+        if let Some(claim) = owner {
+            self.bind_owner(cid, claim);
+        }
         self.update_attach_state();
         let mut owner_change: Option<(Option<ClientId>, OwnerChangeReason)> = None;
         match mode {
@@ -5382,9 +5397,21 @@ impl SessionActor {
             SessionCommand::EngineCommand { id, name, arg } => {
                 self.engine_command(id, name, arg).await
             }
-            SessionCommand::Attach { client, mode } => self.attach(client, mode).await,
+            SessionCommand::Attach { client, mode, owner } => self.attach(client, mode, owner).await,
             SessionCommand::Detach { client } => {
+                let owner_left = self.is_session_owner(client);
                 self.detach(client);
+                // An owned session ends with its owner, its turn cancelled
+                // as `Cancel` would (the user's interruption).
+                if owner_left {
+                    if let Some(reason) = self.owner_left() {
+                        self.note_cancel_cause(crate::engine::interrupt::InterruptReason::User);
+                        if self.driver.is_some() {
+                            self.driver_revoke("session ending");
+                        }
+                        return ControlFlow::Break(reason);
+                    }
+                }
                 // Nobody left to notice a stale period: confirm the prefix
                 // now rather than at the next ping, so a session whose next
                 // request already changed is free to park.
@@ -5396,7 +5423,7 @@ impl SessionActor {
                 // `finish` cancels a running turn for this reason; note it
                 // before the revoke below cancels a driver turn first.
                 self.note_cancel_cause(match reason {
-                    EndReason::ClientQuit => crate::engine::interrupt::InterruptReason::User,
+                    EndReason::ClientQuit | EndReason::OwnerGone => crate::engine::interrupt::InterruptReason::User,
                     _ => crate::engine::interrupt::InterruptReason::Host,
                 });
                 if self.driver.is_some() {
@@ -5436,6 +5463,7 @@ impl SessionActor {
                 }
             }
             SessionCommand::TakeInput => self.take_input(from),
+            SessionCommand::KeepWarm { on: true } if self.owned.is_some() => self.refuse_owned_pin(from),
             SessionCommand::KeepWarm { on } => {
                 self.keep_warm = on;
                 self.meta.pinned = on; // the attach snapshot's copy
@@ -5490,10 +5518,11 @@ impl SessionActor {
             SessionLifecycle::Ending as u8,
             std::sync::atomic::Ordering::Release,
         );
-        // Quitting the client mid-turn is the user's interruption; every
+        // Quitting the client mid-turn is the user's interruption (so is
+        // an owned session's owner going away: `Cancel`'s marker); every
         // other end reason is the host's.
         let interrupt = match reason {
-            EndReason::ClientQuit => crate::engine::interrupt::InterruptReason::User,
+            EndReason::ClientQuit | EndReason::OwnerGone => crate::engine::interrupt::InterruptReason::User,
             _ => crate::engine::interrupt::InterruptReason::Host,
         };
         // Before the revoke below cancels a driver turn.
@@ -5795,6 +5824,11 @@ impl SessionTask {
                 }
                 _ = reload_fence_timer(actor.reload_fence.as_ref().map(|f| f.deadline)) => {
                     actor.reload_fence_expired().await;
+                }
+                _ = super::owned::rebind_timer(actor.owned.as_ref().and_then(|o| o.rebind_deadline)) => {
+                    if let Some(reason) = actor.owner_rebind_expired() {
+                        break reason;
+                    }
                 }
                 _ = revoked_turn_timer(actor.revoked_turn_deadline) => {
                     actor.finish_revoked_turn(false).await;

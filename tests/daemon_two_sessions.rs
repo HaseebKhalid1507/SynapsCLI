@@ -73,6 +73,7 @@ async fn two_sessions_one_daemon_isolated() {
                     ..Default::default()
                 },
                 mode: AttachMode::Mirror,
+                owned: None,
             },
         )
         .await
@@ -193,6 +194,7 @@ async fn continue_of_live_journal_attaches_instead_of_second_actor() {
                 ..Default::default()
             },
             mode: AttachMode::Mirror,
+            owned: None,
         },
     )
     .await
@@ -215,6 +217,7 @@ async fn continue_of_live_journal_attaches_instead_of_second_actor() {
                     ..Default::default()
                 },
                 mode: AttachMode::Mirror,
+                owned: None,
             },
         )
         .await

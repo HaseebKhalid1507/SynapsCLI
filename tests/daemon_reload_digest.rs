@@ -125,6 +125,7 @@ async fn reload_reconnects_digest_client_with_display_tail_only() {
                 ..Default::default()
             },
             mode: AttachMode::Mirror,
+            owned: None,
         },
     )
     .await

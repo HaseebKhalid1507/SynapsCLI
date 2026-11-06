@@ -60,6 +60,7 @@ async fn session_with_turn(sock: &Path, cwd: &Path) -> (SocketTransport, Session
                 ..Default::default()
             },
             mode: AttachMode::Mirror,
+            owned: None,
         },
     )
     .await

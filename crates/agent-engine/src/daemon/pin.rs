@@ -59,6 +59,12 @@ pub async fn pin_session(state: &Arc<DaemonState>, id: &SessionId, on: bool) -> 
     }
 
     let budget = if on && handle.lifecycle() == SessionLifecycle::Parked { PIN_UNPARK_BUDGET } else { PIN_BUDGET };
+    if on && handle.is_owned() {
+        return DaemonFrame::Refused {
+            reason: RefuseReason::Config,
+            message: format!("session {sid}: {}", crate::session::owned::OWNED_PIN_REFUSAL),
+        };
+    }
     let deadline = tokio::time::Instant::now() + budget;
     loop {
         match handle.send(SessionCommand::KeepWarm { on }).await {

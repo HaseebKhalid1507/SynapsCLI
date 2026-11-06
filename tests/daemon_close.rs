@@ -69,6 +69,7 @@ async fn create(sock: &Path, cwd: &Path) -> (SocketTransport, SessionId) {
                 ..Default::default()
             },
             mode: AttachMode::Mirror,
+            owned: None,
         },
     )
     .await
@@ -355,7 +356,7 @@ async fn close_on_an_attached_connection_is_refused_as_a_control_frame() {
     write_frame(&mut w, &ClientFrame::Hello(Hello::new(ClientKind::Test))).await;
     read_until(&mut lines, |f| matches!(f, DaemonFrame::Welcome(_)).then_some(())).await;
     let config = SessionConfig { cwd: Some(guard.home.path().to_path_buf()), ..Default::default() };
-    write_frame(&mut w, &ClientFrame::Attach(Attach::Create { config, mode: AttachMode::Mirror })).await;
+    write_frame(&mut w, &ClientFrame::Attach(Attach::Create { config, mode: AttachMode::Mirror, owned: None })).await;
     let sid = read_until(&mut lines, |f| match f {
         DaemonFrame::Attached(a) => Some(a.meta.id),
         _ => None,
@@ -423,7 +424,7 @@ async fn an_owner_whose_socket_is_backed_up_still_gets_ended_before_eof() {
         model_override: Some("claude-sonnet-4-5".into()),
         ..Default::default()
     };
-    write_frame(&mut w, &ClientFrame::Attach(Attach::Create { config, mode: AttachMode::Mirror })).await;
+    write_frame(&mut w, &ClientFrame::Attach(Attach::Create { config, mode: AttachMode::Mirror, owned: None })).await;
     let sid = read_until(&mut lines, |f| match f {
         DaemonFrame::Attached(a) => Some(a.meta.id),
         _ => None,

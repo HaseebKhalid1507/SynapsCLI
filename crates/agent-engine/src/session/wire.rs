@@ -44,7 +44,22 @@ use crate::{AgentEvent, LlmEvent, SessionEvent, StreamEvent, TurnError, TurnOutc
 /// `SessionMeta.pinned` (`#[serde(default)]`: an older daemon omits it).
 /// `ReloadExtension` and its two replies (`ExtensionReloaded`,
 /// `ExtensionReloadFailed`) follow it too.
+/// Owned sessions (`Attach::Create{owned}`) are additive as well, but an
+/// older daemon would IGNORE the unknown field and hand back an unowned
+/// session, so they are gated on [`FEATURE_OWNED_SESSIONS`] in
+/// `Welcome.features` instead: the client refuses to ask a daemon that
+/// does not list it.
 pub const PROTOCOL_VERSION: u32 = 3;
+
+/// `Welcome.features` entry: this daemon honours `Attach::Create{owned}`,
+/// the owner re-bind after a reload (`ClientReconnect.owner`) and
+/// `EndReason::OwnerGone`.
+pub const FEATURE_OWNED_SESSIONS: &str = "owned_sessions";
+
+/// What this daemon build advertises in `Welcome.features`.
+pub fn daemon_features() -> Vec<String> {
+    vec![FEATURE_OWNED_SESSIONS.to_string()]
+}
 /// Exact-match policy today (`min == max == PROTOCOL_VERSION`).
 pub const PROTOCOL_MIN: u32 = PROTOCOL_VERSION;
 pub const PROTOCOL_MAX: u32 = PROTOCOL_VERSION;
@@ -261,6 +276,20 @@ pub struct Hello {
     pub reconnect_of: Option<ClientReconnect>,
 }
 
+/// `Attach::Create{owned}`: create an OWNED session, bound to this
+/// connection. Its departure for any reason ends the session
+/// (`EndReason::OwnerGone`); only a daemon reload gives the owner a grace
+/// to re-bind (`ClientReconnect.owner`). Ask only a daemon that lists
+/// [`FEATURE_OWNED_SESSIONS`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OwnedCreate {
+    /// The secret env vars the daemon otherwise never sees, so the
+    /// session's tools run with this client's full environment. Memory
+    /// only: never journaled, logged or listed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forward_secrets: Option<SecretEnv>,
+}
+
 /// Who this connection used to be, so the daemon can restore ownership by
 /// reconnect order + `was_owner`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -269,6 +298,10 @@ pub struct ClientReconnect {
     pub session_id: SessionId,
     pub was_owner: bool,
     pub generation: u64,
+    /// The owner of an owned session re-binding after a reload: its token
+    /// (and the secrets it forwards again). Absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<OwnerClaim>,
 }
 
 impl Hello {
@@ -321,7 +354,26 @@ pub enum Attach {
         config: SessionConfig,
         #[serde(default = "mirror")]
         mode: AttachMode,
+        /// `Some` = an owned session ([`OwnedCreate`]). Omitted when `None`,
+        /// so an unowned create is byte-for-byte what it always was.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owned: Option<OwnedCreate>,
     },
+}
+
+impl Attach {
+    /// An owned create: the session ends when this connection goes away.
+    /// `forward_secrets` also sends this process's secret env vars (the
+    /// ones `Hello.env` strips) so the session's tools see them.
+    pub fn create_owned(config: SessionConfig, mode: AttachMode, forward_secrets: bool) -> Self {
+        Self::Create {
+            config,
+            mode,
+            owned: Some(OwnedCreate {
+                forward_secrets: forward_secrets.then(capture_client_secrets),
+            }),
+        }
+    }
 }
 
 fn mirror() -> AttachMode {
@@ -523,6 +575,18 @@ pub struct Welcome {
     /// semver the reload gate parses.
     #[serde(default)]
     pub daemon_build: String,
+    /// Optional features this daemon honours ([`daemon_features`]), for
+    /// requests an older daemon would silently ignore rather than refuse.
+    /// Empty from an older daemon.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub features: Vec<String>,
+}
+
+impl Welcome {
+    /// Whether this daemon advertises `feature` (e.g. [`FEATURE_OWNED_SESSIONS`]).
+    pub fn supports(&self, feature: &str) -> bool {
+        self.features.iter().any(|f| f == feature)
+    }
 }
 
 fn one() -> u64 {
@@ -580,11 +644,16 @@ pub struct AttachedWire {
     pub input_owner: Option<ClientId>,
     #[serde(default)]
     pub display_tail: Option<crate::session::display::DisplayTail>,
+    /// Owned sessions: sent to the owner only (create or re-bind), never
+    /// to another client. `None` otherwise and from an older daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_token: Option<OwnerToken>,
 }
 
 impl AttachedWire {
     pub fn new(client: ClientId, s: AttachSnapshot) -> Self {
         Self {
+            owner_token: None,
             client,
             meta: s.meta,
             view: s.view,
@@ -1199,6 +1268,19 @@ pub fn client_decodes(caps: ClientCapabilities, event: &SessionEventWire) -> boo
     }
 }
 
+/// `env` as a client that declared `caps` can decode it: `EndReason` has no
+/// `#[serde(other)]`, so a client without `owner_gone` hears an owned
+/// session's end as `ClientQuit` (its creator quit) instead of failing the
+/// frame and reconnecting to a session that is gone.
+pub fn ended_for(caps: ClientCapabilities, mut env: Envelope) -> Envelope {
+    if let SessionEventWire::Ended { reason } = &mut env.event {
+        if *reason == EndReason::OwnerGone && !caps.owner_gone {
+            *reason = EndReason::ClientQuit;
+        }
+    }
+    env
+}
+
 // ── framing helpers ───────────────────────────────────────────────────────────
 
 /// Human-readable form of the cap for error frames.
@@ -1647,7 +1729,7 @@ mod tests {
         let h = Hello::new(ClientKind::Tui);
         assert!(h.client.capabilities.tool_queue);
         let line = encode_line(&ClientFrame::Hello(h)).unwrap();
-        assert!(line.contains(r#""capabilities":{"tool_queue":true,"owner_reason_input":true}"#), "{line}");
+        assert!(line.contains(r#""capabilities":{"tool_queue":true,"owner_reason_input":true,"owner_gone":true}"#), "{line}");
         match decode_line::<ClientFrame>(line.trim_end()).unwrap() {
             ClientFrame::Hello(h) => assert!(h.client.capabilities.tool_queue),
             other => panic!("{other:?}"),
@@ -1881,7 +1963,7 @@ mod tests {
             ClientFrame::Sessions,
             ClientFrame::Shutdown { force: true },
             ClientFrame::Attach(Attach::Existing { session_id: "s".into(), mode: AttachMode::Mirror }),
-            ClientFrame::Attach(Attach::Create { config: SessionConfig::default(), mode: AttachMode::Takeover }),
+            ClientFrame::Attach(Attach::Create { config: SessionConfig::default(), mode: AttachMode::Takeover, owned: None }),
             ClientFrame::Cmd { session_id: "s".into(), cmd: SessionCommand::Submit { text: "hi".into(), attachments: vec![] } },
             ClientFrame::Cmd { session_id: "s".into(), cmd: SessionCommand::Answer { prompt_id: 1, value: Some("pw".into()) } },
             ClientFrame::Cmd { session_id: "s".into(), cmd: SessionCommand::EngineCommand { id: 4, name: "model".into(), arg: "x".into() } },
@@ -1925,6 +2007,7 @@ mod tests {
                 progressive_tool_disclosure: true,
                 generation: 1,
                 daemon_build: "abc1234".into(),
+                features: Vec::new(),
             }),
             DaemonFrame::Refused { reason: RefuseReason::Version { daemon_version: 2, min: 2, max: 2 }, message: "no".into() },
             DaemonFrame::Refused { reason: RefuseReason::ReloadRefused { why: "older".into() }, message: "no".into() },
@@ -2166,12 +2249,79 @@ mod tests {
             progressive_tool_disclosure: false,
             generation: 1,
             daemon_build: String::new(),
+            features: daemon_features(),
         })
         .unwrap()
         .to_lowercase();
         for bad in ["token", "secret", "api_key", "apikey", "password", "credential"] {
             assert!(!w.contains(bad), "{bad} in Welcome");
         }
+    }
+
+    /// An older client (no `owner_gone`) hears `OwnerGone` as `ClientQuit`;
+    /// a current one, and every other end reason, pass unchanged.
+    #[test]
+    fn owner_gone_downgrades_for_older_clients() {
+        let env = |reason| Envelope {
+            session_id: "s".into(),
+            seq: 1,
+            ts: chrono::Utc::now(),
+            event: SessionEventWire::Ended { reason },
+        };
+        let reason = |e: Envelope| match e.event {
+            SessionEventWire::Ended { reason } => reason,
+            other => panic!("{other:?}"),
+        };
+        let old = ClientCapabilities::default();
+        assert_eq!(reason(ended_for(old, env(EndReason::OwnerGone))), EndReason::ClientQuit);
+        assert_eq!(reason(ended_for(ClientCapabilities::current(), env(EndReason::OwnerGone))), EndReason::OwnerGone);
+        assert_eq!(reason(ended_for(old, env(EndReason::Evicted))), EndReason::Evicted);
+    }
+
+    /// Owned sessions are additive: an unowned create, an `Attached` for a
+    /// non-owner and a reconnect without a claim encode exactly as before;
+    /// an older daemon's `Welcome` (no `features`) supports nothing.
+    #[test]
+    fn owned_sessions_are_additive_on_the_wire() {
+        let plain = encode_line(&ClientFrame::Attach(Attach::Create {
+            config: SessionConfig::default(),
+            mode: AttachMode::Mirror,
+            owned: None,
+        }))
+        .unwrap();
+        assert!(!plain.contains("owned"), "{plain}");
+        let secrets = SecretEnv(vec![("GH_TOKEN".into(), "v".into())]);
+        let owned = ClientFrame::Attach(Attach::Create {
+            config: SessionConfig::default(),
+            mode: AttachMode::Mirror,
+            owned: Some(OwnedCreate { forward_secrets: Some(secrets.clone()) }),
+        });
+        match decode_line::<ClientFrame>(encode_line(&owned).unwrap().trim_end()).unwrap() {
+            ClientFrame::Attach(Attach::Create { owned: Some(o), .. }) => assert_eq!(o.forward_secrets, Some(secrets)),
+            other => panic!("{other:?}"),
+        }
+        match Attach::create_owned(SessionConfig::default(), AttachMode::Mirror, false) {
+            Attach::Create { owned: Some(o), .. } => assert!(o.forward_secrets.is_none(), "no secret unless asked"),
+            other => panic!("{other:?}"),
+        }
+        let rc = ClientReconnect { previous_client: ClientId(1), session_id: "s".into(), was_owner: true, generation: 2, owner: None };
+        assert!(!serde_json::to_string(&rc).unwrap().contains("\"owner\""));
+        let mut w = Welcome {
+            protocol_version: PROTOCOL_VERSION,
+            daemon_version: "v".into(),
+            pid: 1,
+            profile: None,
+            sessions: vec![],
+            progressive_tool_disclosure: false,
+            generation: 1,
+            daemon_build: String::new(),
+            features: Vec::new(),
+        };
+        let old: Welcome = serde_json::from_str(&serde_json::to_string(&w).unwrap()).unwrap();
+        assert!(!old.supports(FEATURE_OWNED_SESSIONS));
+        w.features = daemon_features();
+        let new: Welcome = serde_json::from_str(&serde_json::to_string(&w).unwrap()).unwrap();
+        assert!(new.supports(FEATURE_OWNED_SESSIONS));
     }
 }
 

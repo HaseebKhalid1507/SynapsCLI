@@ -108,6 +108,7 @@ async fn attach_create(paths: &registry::DaemonPaths, cwd: &Path) -> (SocketTran
                 ..Default::default()
             },
             mode: AttachMode::Mirror,
+            owned: None,
         },
     )
     .await
