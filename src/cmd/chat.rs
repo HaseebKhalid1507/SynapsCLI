@@ -279,10 +279,11 @@ impl Render {
 }
 
 /// The next session event. A daemon reload (`Reloading`) re-binds this
-/// owned session within the owner grace (`reconnect` caps its budget at
-/// it); any other loss of the connection — the daemon gone, or this owner
-/// disconnected for lagging (`OwnerLagged`) — is fatal: the owned session
-/// is gone with it, so chat says why and exits [`EXIT_DAEMON_LOST`].
+/// owned session; a re-bind the daemon refuses (the session ended during
+/// the reload: "unknown session") and any other loss of the connection —
+/// the daemon gone, or this owner disconnected for lagging (`OwnerLagged`,
+/// final even after a reload announce) — is fatal: the owned session is
+/// gone with it, so chat says why and exits [`EXIT_DAEMON_LOST`].
 /// `None` = the session ended (`Ended` was seen).
 async fn next(t: &mut SocketTransport, r: &mut Render) -> Option<Envelope> {
     loop {

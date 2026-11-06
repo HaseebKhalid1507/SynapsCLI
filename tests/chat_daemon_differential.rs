@@ -832,3 +832,67 @@ async fn daemon_gone_under_an_idle_chat_exits_4() {
         }
     }
 }
+
+/// `synaps daemon reload` under an idle chat: chat re-binds its owned
+/// session with its token (PR 3), the next line is answered in the same
+/// conversation, and EOF still ends it cleanly (exit 0). Unix: the
+/// Windows reload hands off to a new pid (daemon_owned is Unix-only too).
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn daemon_reload_under_an_idle_chat_rebinds() {
+    let (url, _hits, bodies) = phase2::spawn_stub(Script::Sse(phase2::ANTHROPIC_SSE)).await;
+    let env = Env::new(url);
+    let mut child = env
+        .cmd(&["chat"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut out = child.stdout.take().unwrap();
+    let mut err = child.stderr.take().unwrap();
+    let err_task = tokio::spawn(async move {
+        let mut s = Vec::new();
+        let _ = err.read_to_end(&mut s).await;
+        s
+    });
+    let mut got = Vec::new();
+    async fn replies(out: &mut tokio::process::ChildStdout, got: &mut Vec<u8>, n: usize) {
+        let mut buf = [0u8; 256];
+        while String::from_utf8_lossy(got).matches("hi").count() < n {
+            let k = out.read(&mut buf).await.unwrap();
+            assert!(k > 0, "stdout closed before reply {n}");
+            got.extend_from_slice(&buf[..k]);
+        }
+    }
+    stdin.write_all(b"CHATDIFF-RELOAD-1\n").await.unwrap();
+    stdin.flush().await.unwrap();
+    tokio::time::timeout(STEP_TIMEOUT, replies(&mut out, &mut got, 1)).await.expect("first reply");
+    tokio::time::sleep(Duration::from_millis(300)).await; // idle at the prompt
+
+    let st = env.cmd(&["daemon", "reload", "--now"]).stdout(Stdio::null()).stderr(Stdio::null()).status().await.unwrap();
+    assert!(st.success(), "daemon reload");
+    stdin.write_all(b"CHATDIFF-RELOAD-2\n").await.unwrap();
+    stdin.flush().await.unwrap();
+    tokio::time::timeout(STEP_TIMEOUT, replies(&mut out, &mut got, 2)).await.expect("reply after the reload");
+    drop(stdin);
+    let status = tokio::time::timeout(EXIT_TIMEOUT, child.wait()).await.expect("chat exits").unwrap();
+    let stderr = String::from_utf8_lossy(&err_task.await.unwrap()).into_owned();
+    assert_eq!(status.code(), Some(0), "{stderr}");
+    assert!(stderr.contains("session saved"), "{stderr}");
+    assert!(!stderr.contains("lost the session"), "{stderr}");
+    let second: Vec<String> = bodies
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|x| String::from_utf8_lossy(x).into_owned())
+        .filter(|b| b.contains("CHATDIFF-RELOAD-2"))
+        .collect();
+    assert!(
+        !second.is_empty() && second.iter().all(|b| b.contains("CHATDIFF-RELOAD-1")),
+        "the turn after the reload carries the conversation: {}",
+        bodies_text(&bodies)
+    );
+}
