@@ -53,31 +53,8 @@
 //   SAVE_TIMEOUT_SECS  — budget for save_session() + append_record()
 //   HOOKS_TIMEOUT_SECS — budget for concurrent on_session_end hook emit
 //   TEARDOWN_TIMEOUT_SECS — sum of the above; total teardown budget for mod.rs
-pub(crate) use agent_engine::session::budgets::{
-    CANCEL_DRAIN_TIMEOUT_SECS, HOOKS_TIMEOUT_SECS, SAVE_TIMEOUT_SECS, TEARDOWN_TIMEOUT_SECS,
-};
+pub(crate) use agent_engine::session::budgets::{SAVE_TIMEOUT_SECS, TEARDOWN_TIMEOUT_SECS};
 
-/// Bounded observability flush inside `SessionActor::finish` (STEP 3).
-pub(crate) const FLUSH_TIMEOUT_SECS: u64 =
-    agent_engine::runtime::telemetry::DEFAULT_SHUTDOWN_FLUSH_TIMEOUT.as_secs();
-
-/// Slack for `background.shutdown()` + channel delivery of `Ended`.
-pub(crate) const SESSION_END_MARGIN_SECS: u64 = 2;
-
-/// How long the TUI waits for `Ended` after sending `End` (in-process).
-/// `SessionActor::finish` runs, sequentially and each under its own
-/// budget: the cancel-turn drain (`CANCEL_DRAIN_TIMEOUT`) and save
-/// (streaming quit) + the final save (`SAVE_TIMEOUT` each),
-/// `on_session_end` (`HOOKS_TIMEOUT`), the observability flush
-/// (`FLUSH_TIMEOUT`); then `background.shutdown()`. The wait covers the
-/// worst case plus margin so a slow-but-in-budget teardown never turns into
-/// `emergency_exit()` (exit 1).
-pub(crate) const SESSION_END_TIMEOUT_SECS: u64 = CANCEL_DRAIN_TIMEOUT_SECS
-    + SAVE_TIMEOUT_SECS
-    + SAVE_TIMEOUT_SECS
-    + HOOKS_TIMEOUT_SECS
-    + FLUSH_TIMEOUT_SECS
-    + SESSION_END_MARGIN_SECS;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(not(unix), allow(dead_code))] // SIGTERM / SIGHUP exist only on Unix
@@ -346,29 +323,7 @@ mod tests {
     fn teardown_budget_is_sum_of_parts() {
         assert_eq!(
             TEARDOWN_TIMEOUT_SECS,
-            SAVE_TIMEOUT_SECS + HOOKS_TIMEOUT_SECS
+            SAVE_TIMEOUT_SECS + agent_engine::session::budgets::HOOKS_TIMEOUT_SECS
         );
-    }
-}
-
-#[cfg(test)]
-mod budget_tests {
-    use super::*;
-
-    /// M5: the TUI's wait for `Ended` must cover `SessionActor::finish`'s
-    /// worst case (cancel drain + cancel save + save + hooks + flush ≈ 12 s)
-    /// with margin; the old 7 s wait turned a slow-but-in-budget teardown
-    /// into exit 1.
-    #[test]
-    fn session_end_wait_covers_actor_finish_worst_case() {
-        let actor_worst_case = CANCEL_DRAIN_TIMEOUT_SECS
-            + SAVE_TIMEOUT_SECS
-            + SAVE_TIMEOUT_SECS
-            + HOOKS_TIMEOUT_SECS
-            + FLUSH_TIMEOUT_SECS;
-        assert_eq!(actor_worst_case, 12);
-        assert!(SESSION_END_TIMEOUT_SECS > actor_worst_case);
-        assert!(SESSION_END_TIMEOUT_SECS >= actor_worst_case + SESSION_END_MARGIN_SECS);
-        const { assert!(SESSION_END_TIMEOUT_SECS > TEARDOWN_TIMEOUT_SECS) };
     }
 }

@@ -55,6 +55,10 @@ impl ChatChild {
             .stderr(std::process::Stdio::piped())
             .env("HOME", home.path())
             .env("SYNAPS_BASE_DIR", &cfg_path)
+            // chat runs in a daemon it auto-spawns: pin its run dir to the
+            // temp base too, never an inherited one (the live daemon's).
+            .env("SYNAPS_RUNTIME_DIR", cfg_path.join("run"))
+            .env_remove("SYNAPS_PROFILE")
             .env_remove("ANTHROPIC_API_KEY")
             .env_remove("OPENAI_API_KEY")
             .env_remove("GROQ_API_KEY")
@@ -205,6 +209,10 @@ async fn eof_exits_cleanly() -> anyhow::Result<()> {
             .stderr(std::process::Stdio::piped())
             .env("HOME", home.path())
             .env("SYNAPS_BASE_DIR", &cfg_path)
+            // chat runs in a daemon it auto-spawns: pin its run dir to the
+            // temp base too, never an inherited one (the live daemon's).
+            .env("SYNAPS_RUNTIME_DIR", cfg_path.join("run"))
+            .env_remove("SYNAPS_PROFILE")
             .env_remove("ANTHROPIC_API_KEY")
             .env_remove("OPENAI_API_KEY")
             .output(),

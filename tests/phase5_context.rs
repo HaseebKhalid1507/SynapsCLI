@@ -459,8 +459,9 @@ fn frontend_trigger_paths_contain_no_local_token_math() {
             "src/cmd/chat.rs still carries local trigger math ({forbidden})"
         );
     }
+    // A daemon client (PR 5): the engine's assessment, asked of the session.
     assert!(
-        chat.contains("assess_context"),
+        chat.contains("SessionQuery::ContextAssessment"),
         "src/cmd/chat.rs must consume the engine context assessment"
     );
 

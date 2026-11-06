@@ -1364,7 +1364,14 @@ async fn forward_unhandled_command(
     app: &mut App,
     link: &mut super::session_link::SessionLink,
 ) -> CommandAction {
-    let unknown = || ChatMessage::Error(format!("unknown command: /{}", cmd));
+    // Plugin commands that run in this window (interactive ones, session
+    // drivers such as `/auto`) need the extension host, which only the
+    // daemon has: an unknown command may be one of them.
+    let unknown = || {
+        ChatMessage::Error(format!(
+            "unknown command: /{cmd} (interactive plugin commands and session drivers are not available in daemon mode yet)"
+        ))
+    };
     let value = match link.engine_command(cmd, arg).await {
         Ok(v) => v,
         Err(_) => {

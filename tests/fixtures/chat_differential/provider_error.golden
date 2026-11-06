@@ -1,0 +1,13 @@
+# chat differential: provider_error
+## run 0
+exit: Some(1)
+--- stdout
+
+
+--- stderr
+synaps <VER> | claude-sonnet-4-6 | session <SID>
+
+❌ Context window exceeded (HTTP 400). Run /compact to shrink the conversation.
+❌ turn failed [provider_failed code=api_status correlation=turn-<PID>-0]
+session saved: <SID> ($0.0000)
+Error: Session error: turn failed: Context window exceeded (HTTP 400). Run /compact to shrink the conversation. [provider_failed code=api_status correlation=turn-<PID>-0]

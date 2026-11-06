@@ -27,6 +27,13 @@ pub async fn reload_extension(state: &Arc<DaemonState>, extension: &str) -> Daem
     if state.reloading.load(Ordering::SeqCst) {
         return DaemonFrame::Refused { reason: RefuseReason::Busy, message: "daemon reloading; retry in a moment".into() };
     }
+    if state.no_extensions {
+        return DaemonFrame::ExtensionReloadFailed {
+            extension: extension.to_string(),
+            message: "this is the --no-extensions daemon: it loads no extensions".into(),
+            unloaded: false,
+        };
+    }
     // Write lock for the whole stop-and-start: two reloads of one extension
     // cannot interleave, and discovery (which holds it for its walk) has
     // finished before this runs.

@@ -22,7 +22,7 @@ use synaps_cli::Result;
 use agent_core::core::memstat::ladder;
 
 use super::app::ChatMessage;
-use super::run_setup::{app_from_snapshot, finish_setup, LazyHttp, TransportMode};
+use super::run_setup::{app_from_snapshot, finish_setup, LazyHttp};
 
 /// What to attach to.
 pub struct AttachOpts {
@@ -57,6 +57,9 @@ pub struct AttachOpts {
     /// after attaching, show what else lives in this daemon so parked
     /// work stays discoverable (F1).
     pub adopted: bool,
+    /// `--no-extensions`: attach to the profile's private no-extensions
+    /// daemon ([`agent_engine::daemon::DaemonOpts::no_extensions`]).
+    pub no_extensions: bool,
 }
 
 /// Toast id for the routine attach notes ([`attach_notices`]).
@@ -97,7 +100,6 @@ fn attach_notices(i: AttachNoticeInputs<'_>) -> AttachNotices {
     if let Some(continued) = i.adopted {
         let how = if continued { "continued session" } else { "fresh session" };
         out.toast.push(format!("adopted the running daemon ({how})"));
-        out.toast.push("SYNAPS_DAEMON_ADOPT=0 for in-process".to_string());
         out.transcript.extend(i.others_banner);
     }
     for w in i.config_warnings {
@@ -377,7 +379,7 @@ fn not_running_message(profile: Option<&str>, detail: Option<&str>, autospawn: b
 
 pub async fn run_attached(mut opts: AttachOpts) -> Result<()> {
     ladder("attach:enter", &"");
-    let paths = agent_engine::daemon::registry::daemon_paths(opts.profile.as_deref());
+    let paths = agent_engine::daemon::registry::daemon_paths_for(opts.profile.as_deref(), opts.no_extensions);
     if !agent_engine::daemon::registry::is_alive(&paths) {
         return Err(cfg_err(daemon_not_running_message(
             opts.profile.as_deref(),
@@ -412,6 +414,14 @@ pub async fn run_attached(mut opts: AttachOpts) -> Result<()> {
         agent_engine::daemon::profile_mismatch(conn.welcome.profile.as_deref(), opts.profile.as_deref())
     {
         return Err(cfg_err(msg));
+    }
+    if conn.welcome.supports(agent_engine::session::wire::FEATURE_NO_EXTENSIONS) != opts.no_extensions {
+        return Err(cfg_err(format!(
+            "the daemon at {} {} extensions, but this TUI was started {} --no-extensions",
+            paths.sock.display(),
+            if opts.no_extensions { "runs" } else { "does not run" },
+            if opts.no_extensions { "with" } else { "without" },
+        )));
     }
     ladder(
         "connect",
@@ -499,13 +509,9 @@ pub async fn run_attached(mut opts: AttachOpts) -> Result<()> {
     let mut app = app_from_snapshot(&snapshot);
     app.observing = transport.mode() == AttachMode::Observe;
     app.attached_clients = transport.roster().clients().len();
-    let (msgs, bytes) = super::app::scrollback_from_env(&TransportMode::Socket);
+    let (msgs, bytes) = super::app::scrollback_from_env();
     app.transcript.set_scrollback(msgs, bytes);
     ladder("app", &"");
-    // Notices queued before boot go first.
-    for n in super::run_setup::take_boot_notices() {
-        app.push_msg(ChatMessage::System(n));
-    }
     let notices = attach_notices(AttachNoticeInputs {
         session_id: &snapshot.meta.id,
         client_id: transport.client_id().0,
@@ -527,8 +533,7 @@ pub async fn run_attached(mut opts: AttachOpts) -> Result<()> {
     for n in notices.transcript {
         app.push_msg(ChatMessage::System(n));
     }
-    // Same first-run guidance as the in-process boot: a new user's first
-    // `synaps` lands here (daemon mode is the default), and without it the
+    // First-run guidance: every `synaps` lands here, and without it the
     // first message fails with a token-refresh error.
     if let Some(n) = super::run_setup::no_credentials_notice() {
         app.push_msg(ChatMessage::System(n));
@@ -551,12 +556,10 @@ pub async fn run_attached(mut opts: AttachOpts) -> Result<()> {
         app,
         Box::new(transport),
         http,
-        TransportMode::Socket,
         config,
         registry,
         keybind_registry,
         system_prompt_path,
-        None,
     )
     .await?;
     // No extension host in this process: the loader arm never runs.
@@ -640,7 +643,7 @@ mod tests {
         assert!(n.transcript.is_empty(), "a fresh session's transcript stays empty: {n:?}");
         assert_eq!(n.toast[0], "attached to 20261001-000000-ours as client #1 (Mirror)");
         assert_eq!(n.toast[1], "adopted the running daemon (fresh session)");
-        assert!(n.toast[2].contains("SYNAPS_DAEMON_ADOPT=0"), "{n:?}");
+        assert_eq!(n.toast.len(), 2, "no in-process hint any more: {n:?}");
         // `--continue` says so
         let n = attach_notices(AttachNoticeInputs { adopted: Some(true), ..notice_inputs(&id, &[]) });
         assert_eq!(n.toast[1], "adopted the running daemon (continued session)");
@@ -757,6 +760,7 @@ mod tests {
             name: None,
             client_name: None,
             adopted: false,
+            no_extensions: false,
         }
     }
 

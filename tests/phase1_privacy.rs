@@ -162,7 +162,11 @@ async fn run_chat(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .env("HOME", home.path())
-        .env("SYNAPS_BASE_DIR", &base_dir);
+        .env("SYNAPS_BASE_DIR", &base_dir)
+        // chat runs in a daemon it auto-spawns: its run dir stays in the
+        // temp base, never an inherited one (the live daemon's).
+        .env("SYNAPS_RUNTIME_DIR", base_dir.join("run"))
+        .env_remove("SYNAPS_PROFILE");
     for (k, v) in extra_env {
         cmd.env(k, v);
     }

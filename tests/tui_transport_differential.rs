@@ -4,8 +4,11 @@
 //!
 //! For each scenario, two tmux panes run identical `send-keys` scripts
 //! against the same scripted provider stub: (R) the reference binary and
-//! (L) this binary in-process. After each step the pane is captured,
-//! normalised and diffed. The journals are diffed too.
+//! (L) this binary's plain `synaps`. After each step the pane is captured,
+//! normalised and diffed. The journals are diffed too. Since PR 5 ("daemon
+//! is the only mode") there is no in-process TUI: L adopts a daemon it
+//! auto-starts in the pane's private HOME (run dir pinned there), so R≡L
+//! is now "reference in-process TUI ≡ this daemon-backed TUI".
 //!
 //! Phase 4 (B8): with `SYNAPS_TUI_E2E_SOCKET=1` a third pane (S) runs
 //! `synaps --attach` against a private daemon spawned in the pane's HOME
@@ -398,7 +401,7 @@ fn keep_sessions(out_dir: &Path, scenario: &str, tag: &str, home: &Path) {
 
 fn pane_env(home: &Path, base: &Path, base_url: &str) -> String {
     format!(
-        "HOME={h} SYNAPS_BASE_DIR={b} SYNAPS_ANTHROPIC_BASE_URL={u} SYNAPS_NO_BOOT_FX=1 TERM=xterm-256color COLUMNS={c} LINES={r}",
+        "HOME={h} SYNAPS_BASE_DIR={b} SYNAPS_RUNTIME_DIR={b}/run SYNAPS_ANTHROPIC_BASE_URL={u} SYNAPS_NO_BOOT_FX=1 TERM=xterm-256color COLUMNS={c} LINES={r}",
         h = home.display(),
         b = base.display(),
         u = base_url,

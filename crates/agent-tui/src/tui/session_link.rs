@@ -306,20 +306,6 @@ impl SessionLink {
         .await?
     }
 
-    /// Wait for `Ended` (teardown). Buffered/late envelopes are dropped —
-    /// nothing renders past this point.
-    pub(crate) async fn wait_ended(&mut self) -> bool {
-        loop {
-            match self.transport.next_event().await {
-                Some(env) => {
-                    if matches!(env.event, SessionEventWire::Ended { .. }) {
-                        return true;
-                    }
-                }
-                None => return false,
-            }
-        }
-    }
 }
 
 // ── PromptBridge ─────────────────────────────────────────────────────────
@@ -708,28 +694,6 @@ mod tests {
         }
         // Nothing leaked into the loop's buffer.
         assert!(link.buffered.is_empty());
-    }
-
-    /// After `End`, a channel that closes without `Ended` is a clean close
-    /// (`false`, not a hang): `run()` exits 0 on it.
-    #[tokio::test]
-    async fn wait_ended_distinguishes_ended_from_clean_close() {
-        let mut t = ScriptedTransport::new(Runtime::new_headless());
-        t.push_event(SessionEventWire::Idle);
-        t.push_event(SessionEventWire::Ended {
-            reason: agent_engine::session::EndReason::ClientQuit,
-        });
-        let mut link = SessionLink::new(Box::new(t));
-        assert!(link.wait_ended().await);
-
-        let t = ScriptedTransport::new(Runtime::new_headless());
-        let mut link = SessionLink::new(Box::new(t));
-        assert!(!tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            link.wait_ended()
-        )
-        .await
-        .expect("closed channel returns at once"));
     }
 
     /// A `Refused` addressed to ANOTHER client is not our reply: buffered

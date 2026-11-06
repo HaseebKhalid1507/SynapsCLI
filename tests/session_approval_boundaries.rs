@@ -46,7 +46,8 @@ fn session_approval_new_session_and_resume_use_explicit_boundary() {
 
 #[test]
 fn session_approval_live_headless_clear_uses_explicit_boundary() {
-    // Feature-gated legacy_inline remains reachable; default chat uses actor.
+    // chat is a daemon client: its `/clear` is the session's `NewSession`,
+    // and the actor's `NewSession` arm opens the explicit boundary.
     let chat = include_str!("../src/cmd/chat.rs");
     let clear = chat
         .split("\"clear\" => {")
@@ -55,5 +56,15 @@ fn session_approval_live_headless_clear_uses_explicit_boundary() {
         .split("\"sessions\" =>")
         .next()
         .unwrap();
-    assert!(clear.contains("runtime.begin_conversation(Some(conv.session.id.clone()))"));
+    assert!(clear.contains("SessionCommand::NewSession"), "{clear}");
+    let actor = include_str!("../crates/agent-engine/src/session/actor.rs");
+    let new_session = actor
+        .split("SessionCommand::NewSession => {")
+        .nth(1)
+        .unwrap()
+        .split("SessionCommand::Save =>")
+        .next()
+        .unwrap();
+    assert!(new_session.contains("self.conv.clear(&self.runtime).await;"));
+    assert!(new_session.contains(".begin_conversation(Some(self.conv.session.id.clone()))"));
 }

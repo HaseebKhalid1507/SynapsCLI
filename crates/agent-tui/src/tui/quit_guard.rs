@@ -5,8 +5,8 @@
 //! provides a two-press state machine: the first press shows a notice; the
 //! second press within [`WINDOW`] detaches as today.
 //!
-//! In-process (`TransportMode::Local`) and idle (not streaming) quit paths
-//! are unchanged — they bypass this guard entirely.
+//! Idle (not streaming) quit paths are unchanged — they bypass this guard
+//! entirely.
 
 use std::time::{Duration, Instant};
 

@@ -38,18 +38,14 @@ pub(crate) struct DaemonLostInfo {
 }
 
 /// Scrollback cap for [`super::transcript::TranscriptStore::set_scrollback`]
-/// by transport (PLAN-phase4 §2.3): Socket → 400 msgs / 2 MiB, Local → 0/0
-/// (unbounded — today's behaviour, so the R-vs-L differential cannot move).
+/// (PLAN-phase4 §2.3): 400 msgs / 2 MiB by default.
 /// `SYNAPS_TUI_SCROLLBACK` / `SYNAPS_TUI_SCROLLBACK_BYTES` (aliases
 /// `SYNAPS_CLIENT_SCROLLBACK_MSGS` / `_BYTES`) override either (0 =
 /// unbounded); unparsable values fall back to the mode default.
-pub(crate) fn scrollback_from_env(mode: &super::run_setup::TransportMode) -> (usize, usize) {
-    let (msgs, bytes) = match mode {
-        // 2 MiB ≈ 70 × `max_tool_output` (30 000 B) of tool scrollback;
-        // `client_bounded` (G6) runs 80 turns so the cap engages in-window.
-        super::run_setup::TransportMode::Socket => (400, 2 * 1024 * 1024),
-        super::run_setup::TransportMode::Local { .. } => (0, 0),
-    };
+pub(crate) fn scrollback_from_env() -> (usize, usize) {
+    // 2 MiB ≈ 70 × `max_tool_output` (30 000 B) of tool scrollback;
+    // `client_bounded` (G6) runs 80 turns so the cap engages in-window.
+    let (msgs, bytes) = (400, 2 * 1024 * 1024);
     let env = |keys: [&str; 2], default: usize| {
         keys.iter()
             .find_map(|k| std::env::var(k).ok())
@@ -332,11 +328,6 @@ pub(crate) struct App {
     pub(crate) active_tasks: std::sync::Arc<synaps_cli::extensions::active_tasks::ActiveTasks>,
     /// Overlay toast provider used by core and extension-adjacent features.
     pub(crate) toasts: super::toast::ToastProvider,
-    /// Channel for async extension loader progress events.
-    pub(crate) extension_loader_rx:
-        tokio::sync::mpsc::UnboundedReceiver<synaps_cli::extensions::loader::ExtensionLoaderEvent>,
-    pub(crate) extension_loader_tx:
-        tokio::sync::mpsc::UnboundedSender<synaps_cli::extensions::loader::ExtensionLoaderEvent>,
     pub(crate) extension_loader_running: bool,
     /// Channel for receiving widget events from background extension notification watchers.
     ///
@@ -438,8 +429,6 @@ impl App {
         let (ping_tx_init, ping_rx_init) = tokio::sync::mpsc::unbounded_channel();
         let (model_list_tx_init, model_list_rx_init) = tokio::sync::mpsc::unbounded_channel();
         let (sessions_tx_init, sessions_rx_init) = tokio::sync::mpsc::unbounded_channel();
-        let (extension_loader_tx_init, extension_loader_rx_init) =
-            tokio::sync::mpsc::unbounded_channel();
         let (widget_tx_init, widget_rx_init) =
             tokio::sync::mpsc::channel(WIDGET_EVENT_QUEUE_CAPACITY);
         let (myx_theme_tx_init, myx_theme_rx_init) = tokio::sync::mpsc::unbounded_channel();
@@ -557,8 +546,6 @@ impl App {
                 synaps_cli::extensions::active_tasks::ActiveTasks::new(),
             ),
             toasts: super::toast::ToastProvider::new(clock.clone()),
-            extension_loader_rx: extension_loader_rx_init,
-            extension_loader_tx: extension_loader_tx_init,
             extension_loader_running: false,
             widget_rx: widget_rx_init,
             widget_tx: widget_tx_init,

@@ -3,9 +3,10 @@
 //! lifecycle (PLAN-phase2 §2.11). Lives in `agent-engine`
 //! (S289 D-1 amended) — `agent-tui` must never appear in this graph.
 //!
-//! On by default: the first `--attach`/`attach` client auto-spawns the
-//! daemon ([`ensure_running`]); `SYNAPS_DAEMON=0` disables every daemon
-//! feature (exit 3 with a one-line reason). Safety properties that are
+//! The only mode: every session runs here, and the first client (`synaps`,
+//! `--attach`, `attach`, `chat`) auto-spawns the daemon
+//! ([`ensure_running`]); `SYNAPS_DAEMON=0` is ignored with a warning
+//! ([`legacy_env_warning`]). Safety properties that are
 //! NEVER stubbed: the flock liveness oracle, the ready-fd pipe, socket
 //! perms 0700/0600, the spawn lock (one spawner per registry dir). On
 //! Windows the same properties hold with native mechanisms ([`win`]): the
@@ -71,18 +72,36 @@ const _: () = assert!(
     "SPAWN_READY_TIMEOUT must exceed EXTENSION_DISCOVERY_WAIT"
 );
 
-/// `SYNAPS_DAEMON` feature flag: ON unless set to `0`/`false`/`off`/`no`.
-/// `SYNAPS_DAEMON=1` is accepted (no-op, kept for older scripts).
-pub fn enabled() -> bool {
-    enabled_from(std::env::var("SYNAPS_DAEMON").ok().as_deref())
-}
-
 fn env_is_off(v: Option<&str>) -> bool {
     matches!(v.map(|s| s.trim().to_ascii_lowercase()).as_deref(), Some("0" | "false" | "off" | "no"))
 }
 
-fn enabled_from(v: Option<&str>) -> bool {
-    !env_is_off(v)
+/// `SYNAPS_DAEMON=0` and `SYNAPS_DAEMON_ADOPT=0` used to run sessions
+/// in-process. There is no in-process mode any more: every session runs in
+/// the session daemon, so both are ignored. Returns the one-line warning
+/// that says so when either is set to an "off" value, else `None`.
+pub fn legacy_env_warning() -> Option<String> {
+    legacy_env_warning_from(
+        std::env::var("SYNAPS_DAEMON").ok().as_deref(),
+        std::env::var("SYNAPS_DAEMON_ADOPT").ok().as_deref(),
+    )
+}
+
+fn legacy_env_warning_from(daemon: Option<&str>, adopt: Option<&str>) -> Option<String> {
+    let set: Vec<&str> = [("SYNAPS_DAEMON", daemon), ("SYNAPS_DAEMON_ADOPT", adopt)]
+        .into_iter()
+        .filter(|(_, v)| env_is_off(*v))
+        .map(|(k, _)| k)
+        .collect();
+    if set.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "warning: {}=0 {} ignored: sessions always run in the session daemon now (the in-process mode was removed); unset {} (docs/daemon-mode.md)",
+        set.join("=0 and "),
+        if set.len() > 1 { "are" } else { "is" },
+        if set.len() > 1 { "them" } else { "it" },
+    ))
 }
 
 /// `SYNAPS_DAEMON_AUTOSPAWN`: ON unless `0`/`false`/`off`/`no`. Off means
@@ -91,9 +110,6 @@ fn enabled_from(v: Option<&str>) -> bool {
 pub fn autospawn_enabled() -> bool {
     !env_is_off(std::env::var("SYNAPS_DAEMON_AUTOSPAWN").ok().as_deref())
 }
-
-/// One-line reason used by every attach path when the flag is off.
-pub const DISABLED_NOTICE: &str = "daemon disabled by SYNAPS_DAEMON=0";
 
 /// A client running `client` profile must never drive a daemon that serves
 /// another one: its sessions, model and config writes would land in the
@@ -176,13 +192,20 @@ pub struct DaemonOpts {
     pub runtime_dir: Option<PathBuf>,
     /// Test seam / A1 hook: how `Attach::Create` builds a session.
     pub factory: Option<SessionFactory>,
+    /// The profile's private no-extensions daemon (`--no-extensions`): its
+    /// own socket/lock/json ([`registry::daemon_paths_for`]), booted without
+    /// extension discovery, never restoring or taking pins, and saying so
+    /// in `Welcome.features` ([`crate::session::wire::FEATURE_NO_EXTENSIONS`]).
+    /// Extensions are daemon-wide (one sidecar each, shared hooks and
+    /// tools), so a session without them needs a daemon without them.
+    pub no_extensions: bool,
 }
 
 impl DaemonOpts {
     pub fn paths(&self) -> DaemonPaths {
         let mut p = match &self.runtime_dir {
-            Some(d) => registry::daemon_paths_in(d, self.profile.as_deref()),
-            None => registry::daemon_paths(self.profile.as_deref()),
+            Some(d) => registry::daemon_paths_in_for(d, self.profile.as_deref(), self.no_extensions),
+            None => registry::daemon_paths_for(self.profile.as_deref(), self.no_extensions),
         };
         if let Some(s) = &self.socket {
             p.sock = s.clone();
@@ -226,6 +249,8 @@ pub struct DaemonState {
     pub pins: Arc<pins::PinBook>,
     /// A cold start's pin restore is running (holds the idle exit).
     pub restoring: AtomicBool,
+    /// The private no-extensions daemon ([`DaemonOpts::no_extensions`]).
+    pub no_extensions: bool,
 }
 
 impl DaemonState {
@@ -450,6 +475,7 @@ impl Daemon {
             meta,
             pins: Arc::new(pins::PinBook::for_active_profile()),
             restoring: AtomicBool::new(false),
+            no_extensions: opts.no_extensions,
         });
         state.host.set_pin_sink(Arc::clone(&state.pins) as Arc<dyn crate::session::PinSink>);
 
@@ -485,7 +511,9 @@ impl Daemon {
         }
         signal_ready();
         // Cold start only: a reload hands its live sessions over already.
-        if reload_state.is_none() && pins::restore_enabled() {
+        // The no-extensions daemon never restores the profile's pins: they
+        // belong to the profile's daemon (which has the extensions).
+        if reload_state.is_none() && !opts.no_extensions && pins::restore_enabled() {
             tokio::spawn(pins::restore_all(Arc::clone(&state)));
         }
         tracing::info!(sock = %paths.sock.display(), pid = info.pid, generation, "daemon: listening");
@@ -635,6 +663,19 @@ pub fn signal_ready() {
             let _ = libc::write(fd, b"R".as_ptr() as *const libc::c_void, 1);
             libc::close(fd);
         }
+        // The spawner drains our stderr pipe only while it lives (a chat
+        // exits long before its daemon): point stdout/stderr at /dev/null
+        // so a later `eprintln!` never hits EPIPE, which panics. As
+        // `win::detach_stdio` does on Windows.
+        // SAFETY: plain fd calls on a fresh descriptor and fds 1/2.
+        unsafe {
+            let null = libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC);
+            if null >= 0 {
+                libc::dup2(null, 1);
+                libc::dup2(null, 2);
+                libc::close(null);
+            }
+        }
     }
     #[cfg(windows)]
     {
@@ -679,6 +720,9 @@ pub fn spawn_detached(opts: &DaemonOpts) -> anyhow::Result<u32> {
 
 
     let mut cmd_args: Vec<std::ffi::OsString> = vec!["daemon".into(), "--foreground".into()];
+    if opts.no_extensions {
+        cmd_args.push("--no-extensions".into());
+    }
     if let Some(p) = &opts.profile {
         cmd_args.extend(["--profile".into(), p.into()]);
     }
@@ -822,6 +866,9 @@ pub fn spawn_detached(opts: &DaemonOpts) -> anyhow::Result<u32> {
 pub fn spawn_detached(opts: &DaemonOpts) -> anyhow::Result<u32> {
     let exe = std::env::current_exe()?;
     let mut cmd_args: Vec<std::ffi::OsString> = vec!["daemon".into(), "--foreground".into()];
+    if opts.no_extensions {
+        cmd_args.push("--no-extensions".into());
+    }
     if let Some(p) = &opts.profile {
         cmd_args.extend(["--profile".into(), p.into()]);
     }
@@ -916,6 +963,66 @@ pub fn ensure_running(opts: &DaemonOpts) -> Result<Ensured, EnsureError> {
     ensure_running_with(opts, autospawn_enabled(), spawn_detached, || {})
 }
 
+/// A Unix socket path longer than `sun_path` can neither be bound nor
+/// dialled (`SYNAPS_BASE_DIR` on a deep mount, EFS): name the fix instead
+/// of a bare bind error. `None` when it fits (and on Windows: named pipes).
+pub fn socket_path_too_long(sock: &std::path::Path) -> Option<String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        // SAFETY: `sockaddr_un` is plain data; all-zero is a valid value.
+        let max = unsafe { std::mem::zeroed::<libc::sockaddr_un>() }.sun_path.len() - 1;
+        let len = sock.as_os_str().as_bytes().len();
+        if len > max {
+            return Some(format!(
+                "the daemon socket path {} is {len} bytes, over the {max}-byte Unix socket limit; \
+                 set SYNAPS_RUNTIME_DIR to a short directory (e.g. $XDG_RUNTIME_DIR/synaps or /tmp/synaps-$USER)",
+                sock.display()
+            ));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = sock;
+    None
+}
+
+/// [`ensure_running`] once more, for a client whose daemon answered
+/// `Running` but then would not serve it (connect refused, or `Bye` before
+/// `Attached`). An exiting daemon (idle exit, `daemon stop`) stops accepting
+/// before its teardown (sessions saved, extensions shut down: seconds)
+/// releases the flock, and in that window `ensure_running` still sees it
+/// alive. Waits, at most [`SPAWN_LOCK_WAIT`], for the flock to go — probing
+/// under the spawn lock, as `ensure_running` does, so the probe never takes
+/// the flock from a daemon being spawned — then ensures again (a fresh
+/// daemon). `Ok(None)`: the daemon never went (alive, refusing for another
+/// reason); the caller's error stands.
+pub fn ensure_after_exit(opts: &DaemonOpts) -> Result<Option<Ensured>, EnsureError> {
+    ensure_after_exit_with(opts, SPAWN_LOCK_WAIT, ensure_running)
+}
+
+fn ensure_after_exit_with(
+    opts: &DaemonOpts,
+    wait: Duration,
+    ensure: impl FnOnce(&DaemonOpts) -> Result<Ensured, EnsureError>,
+) -> Result<Option<Ensured>, EnsureError> {
+    let paths = opts.paths();
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        let alive = {
+            let _spawn = registry::SpawnLock::acquire(&paths, wait)
+                .map_err(|e| EnsureError::Spawn(format!("spawn lock {}: {e}", paths.spawn_lock().display())))?;
+            registry::is_alive(&paths)
+        };
+        if !alive {
+            return ensure(opts).map(Some);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Ok(None);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 // Keep the real cleanup/probe/locking path testable without spawning the unit
 // test executable. The hook marks entry to the lock attempt, not readiness.
 fn ensure_running_with(
@@ -925,6 +1032,9 @@ fn ensure_running_with(
     before_spawn_lock: impl FnOnce(),
 ) -> Result<Ensured, EnsureError> {
     let paths = opts.paths();
+    if let Some(why) = socket_path_too_long(&paths.sock) {
+        return Err(EnsureError::Spawn(why));
+    }
     if !auto {
         // Preserve the disabled path: no spawn-lock dependency, even warm.
         registry::reap_stale(&paths);
@@ -989,9 +1099,6 @@ pub const AUTOSPAWN_IDLE_EXIT: Duration = Duration::from_secs(10);
 /// descriptors only) → extension discovery once → start → background MCP
 /// discovery → wait for SIGTERM/SIGINT/Shutdown frame/idle.
 pub async fn run_foreground(opts: DaemonOpts) -> anyhow::Result<()> {
-    if !enabled() {
-        anyhow::bail!("{DISABLED_NOTICE} (exit {EXIT_REFUSED})");
-    }
     // Windows reload: take `daemon.lock` over from the previous image before
     // booting anything. It exits on our signal, as `execv` would have
     // replaced it, so nothing below ever runs beside it.
@@ -1001,15 +1108,17 @@ pub async fn run_foreground(opts: DaemonOpts) -> anyhow::Result<()> {
     // ready byte (the spawner waits only SPAWN_READY_TIMEOUT).
     let host = EngineHost::boot_and_install(crate::HostOpts {
         profile: opts.profile.clone(),
-        no_extensions: false,
+        no_extensions: opts.no_extensions,
         mcp_discovery: crate::McpDiscovery::Background,
     })
     .await?;
     host.report_config_warnings();
     // Sidecars spawn once per daemon: discover before accepting (bounded by
-    // EXTENSION_DISCOVERY_WAIT, which SPAWN_READY_TIMEOUT outwaits).
+    // EXTENSION_DISCOVERY_WAIT, which SPAWN_READY_TIMEOUT outwaits). The
+    // no-extensions daemon never discovers any.
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    let _loader = crate::extensions::loader::spawn_discover_and_load(Arc::clone(host.ext_manager()), tx, None);
+    let _loader = (!opts.no_extensions)
+        .then(|| crate::extensions::loader::spawn_discover_and_load(Arc::clone(host.ext_manager()), tx, None));
     let wait = async {
         while let Some(ev) = rx.recv().await {
             if let crate::extensions::loader::ExtensionLoaderEvent::Finished { loaded, failed } = ev {
@@ -1018,7 +1127,9 @@ pub async fn run_foreground(opts: DaemonOpts) -> anyhow::Result<()> {
             }
         }
     };
-    if tokio::time::timeout(EXTENSION_DISCOVERY_WAIT, wait).await.is_err() {
+    if opts.no_extensions {
+        tracing::info!("daemon: --no-extensions: extension discovery skipped");
+    } else if tokio::time::timeout(EXTENSION_DISCOVERY_WAIT, wait).await.is_err() {
         tracing::warn!(
             wait = ?EXTENSION_DISCOVERY_WAIT,
             "daemon: extension discovery still running; accepting anyway"
@@ -1090,14 +1201,20 @@ mod flag_tests {
     }
 
     #[test]
-    fn enabled_env_matrix() {
-        assert!(enabled_from(None), "unset → on");
+    fn legacy_env_is_ignored_with_one_warning() {
+        assert_eq!(legacy_env_warning_from(None, None), None);
         for on in ["1", "true", "yes", "on", "", "anything"] {
-            assert!(enabled_from(Some(on)), "{on:?} → on");
+            assert_eq!(legacy_env_warning_from(Some(on), Some(on)), None, "{on:?}");
         }
         for off in ["0", "false", "off", "no", "FALSE", " 0 ", "Off"] {
-            assert!(!enabled_from(Some(off)), "{off:?} → off");
+            let w = legacy_env_warning_from(Some(off), None).expect(off);
+            assert!(w.contains("SYNAPS_DAEMON=0 is ignored") && w.contains("in-process mode was removed"), "{w}");
+            assert_eq!(w.lines().count(), 1);
+            let w = legacy_env_warning_from(None, Some(off)).expect(off);
+            assert!(w.contains("SYNAPS_DAEMON_ADOPT=0 is ignored"), "{w}");
         }
+        let w = legacy_env_warning_from(Some("0"), Some("0")).unwrap();
+        assert!(w.contains("SYNAPS_DAEMON=0 and SYNAPS_DAEMON_ADOPT=0 are ignored"), "{w}");
     }
 
     #[test]
@@ -1297,6 +1414,46 @@ mod ensure_tests {
     #[test]
     fn ensure_serializes_before_probe_with_stale_metadata() {
         serialization_case(true);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_socket_path_over_sun_path_names_synaps_runtime_dir() {
+        let deep = std::path::PathBuf::from(format!("/{}/daemon.sock", "d".repeat(120)));
+        let why = socket_path_too_long(&deep).expect("too long");
+        assert!(why.contains("SYNAPS_RUNTIME_DIR"), "{why}");
+        assert_eq!(socket_path_too_long(std::path::Path::new("/tmp/synaps/daemon.sock")), None);
+        let opts = DaemonOpts { runtime_dir: Some(deep.parent().unwrap().to_path_buf()), ..Default::default() };
+        let got = ensure_running_with(&opts, true, |_| panic!("never spawned"), || panic!("no spawn lock"));
+        assert!(matches!(got, Err(EnsureError::Spawn(ref w)) if w.contains("SYNAPS_RUNTIME_DIR")), "{got:?}");
+    }
+
+    /// A daemon past its accept loop but still holding the flock (idle exit
+    /// tearing down): the retry waits for the flock, then ensures again.
+    #[test]
+    fn ensure_after_exit_waits_for_the_exiting_daemon() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = DaemonOpts { runtime_dir: Some(dir.path().to_path_buf()), ..Default::default() };
+        let paths = opts.paths();
+        let dying = DaemonLock::try_acquire(&paths).unwrap().unwrap();
+        let t0 = std::time::Instant::now();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            drop(dying);
+        });
+        let got = ensure_after_exit_with(&opts, WAIT, |o| {
+            assert!(!registry::is_alive(&o.paths()), "ensured only once the flock is free");
+            Ok(Ensured::Spawned(7))
+        });
+        assert_eq!(got, Ok(Some(Ensured::Spawned(7))));
+        assert!(t0.elapsed() >= Duration::from_millis(300), "waited for the flock");
+        release.join().unwrap();
+
+        // Never released: give up at the bound, ensure nothing.
+        let alive = DaemonLock::try_acquire(&paths).unwrap().unwrap();
+        let got = ensure_after_exit_with(&opts, BLOCKED, |_| panic!("a live daemon is not re-ensured"));
+        assert_eq!(got, Ok(None));
+        drop(alive);
     }
 
     #[test]

@@ -563,12 +563,11 @@ pub async fn exec(state: &Arc<DaemonState>, p: Prepared) -> ReloadError {
     state.reset_announce();
     // Sidecars were shut down for the exec: bring them back (bounded like
     // `run_foreground`'s first discovery) so the surviving image has hooks.
+    // The no-extensions daemon had none to bring back.
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    let _loader = crate::extensions::loader::spawn_discover_and_load(
-        Arc::clone(state.host.ext_manager()),
-        tx,
-        None,
-    );
+    let _loader = (!state.no_extensions).then(|| {
+        crate::extensions::loader::spawn_discover_and_load(Arc::clone(state.host.ext_manager()), tx, None)
+    });
     let wait = async {
         while let Some(ev) = rx.recv().await {
             if let crate::extensions::loader::ExtensionLoaderEvent::Finished { loaded, failed } = ev {
@@ -577,7 +576,7 @@ pub async fn exec(state: &Arc<DaemonState>, p: Prepared) -> ReloadError {
             }
         }
     };
-    if tokio::time::timeout(
+    if !state.no_extensions && tokio::time::timeout(
         Duration::from_secs(crate::session::budgets::RELOAD_EXT_REDISCOVERY_SECS),
         wait,
     )

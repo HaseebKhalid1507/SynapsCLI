@@ -113,7 +113,8 @@ jobs:
   # Clippy builds and lints every target (libs, bins, tests) in both
   # feature sets, as the Linux jobs do. The daemon suites drive the
   # Windows-native daemon (named pipes, detached spawn, reload lock
-  # hand-off) with real processes; the TUI's unit tests run in full. The
+  # hand-off) with real processes, as do `synaps chat` and the no-daemon
+  # error; the TUI's unit tests run in full. The
   # rest of the suite isn't run here yet: dozens of tests outside the daemon
   # and the TUI still fail on Windows.
   #
@@ -133,6 +134,9 @@ jobs:
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo clippy --workspace --all-targets --no-default-features --locked -- -D warnings
       - run: cargo test --locked --no-fail-fast --test "daemon_*"
+      # The daemon is the only mode: chat and the no-daemon error run over
+      # named pipes here (Unix-only cases — signals, reload — are cfg-skipped).
+      - run: cargo test --locked --no-fail-fast --test chat_daemon_differential --test attach_no_daemon
       - run: cargo test --locked --no-fail-fast -p synaps-tui --lib
       - run: 'cargo test --locked --no-fail-fast -p synaps-engine --lib -- events::socket ipc:: tools::unix_programs tools::grep tools::find tools::ls'
 

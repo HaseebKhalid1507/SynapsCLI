@@ -95,15 +95,6 @@ pub(super) fn emergency_teardown_terminal() {
     execute!(stdout, cursor::Show).ok();
 }
 
-/// Emergency exit (the session did not report `Ended` within the teardown
-/// budget): terminal restore and `process::exit(1)`. The actor owns the
-/// save/hooks/observability flush; the host flushes logs at process exit.
-pub(super) fn emergency_exit() -> ! {
-    agent_engine::host::EngineHost::flush_installed_logs();
-    emergency_teardown_terminal();
-    std::process::exit(1);
-}
-
 // `teardown_terminal` was removed in the #116 render-thread work — the render
 // thread now owns the Terminal and performs its own teardown (see render_thread.rs).
 

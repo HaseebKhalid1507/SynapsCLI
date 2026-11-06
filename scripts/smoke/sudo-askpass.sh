@@ -58,8 +58,8 @@ fi
 
 cat <<'STEPS'
 
-3. Inside Synaps (run each twice: the in-process TUI with SYNAPS_DAEMON=0,
-   and attached to the daemon), ask the agent to run these with the bash tool:
+3. Inside Synaps (the TUI, a daemon client), ask the agent to run these
+   with the bash tool:
 
    a. sudo -k; sudo true && echo SUDO_OK
       Expect a password box titled "sudo password required", reading

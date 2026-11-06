@@ -30,6 +30,14 @@ pub async fn pin_session(state: &Arc<DaemonState>, id: &SessionId, on: bool) -> 
     if state.reloading.load(std::sync::atomic::Ordering::SeqCst) {
         return DaemonFrame::Refused { reason: RefuseReason::Busy, message: "daemon reloading; retry in a moment".into() };
     }
+    // Pins belong to the profile's daemon, which restores them with its
+    // extensions; the no-extensions daemon neither restores nor takes them.
+    if state.no_extensions {
+        return DaemonFrame::Error {
+            session_id: Some(id.clone()),
+            message: "the --no-extensions daemon does not pin sessions".into(),
+        };
+    }
     // A pin that is not live here (waiting, failed, not restored yet, or a
     // lock placeholder): `--off` clears its entry, on restores it now.
     let live = state.attach(id);

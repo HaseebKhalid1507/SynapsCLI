@@ -5186,15 +5186,14 @@ mod scrollback_cap_tests {
         assert!(matches!(&s.messages()[n - 2].msg, ChatMessage::ToolResult { .. }));
     }
 
-    /// `scrollback_from_env`: Socket defaults 400 / 2 MiB, Local 0 / 0.
+    /// `scrollback_from_env`: defaults 400 / 2 MiB.
     #[test]
     fn scrollback_defaults_by_transport() {
         use super::super::app::scrollback_from_env;
-        use super::super::run_setup::TransportMode;
         for k in ["SYNAPS_TUI_SCROLLBACK", "SYNAPS_TUI_SCROLLBACK_BYTES", "SYNAPS_CLIENT_SCROLLBACK_MSGS", "SYNAPS_CLIENT_SCROLLBACK_BYTES"] {
             std::env::remove_var(k);
         }
-        assert_eq!(scrollback_from_env(&TransportMode::Socket), (400, 2 * 1024 * 1024));
+        assert_eq!(scrollback_from_env(), (400, 2 * 1024 * 1024));
     }
 }
 

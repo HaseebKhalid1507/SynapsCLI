@@ -188,7 +188,9 @@ async fn s9_1_transition_entry_is_typed_counted_and_sole_producer() {
 fn s9_1_no_frontend_splices_summaries_locally() {
     let root = env!("CARGO_MANIFEST_DIR");
     for rel in [
-        "src/cmd/chat.rs",
+        // `synaps chat` is a daemon client with no compaction of its own:
+        // it compacts on the daemon's SessionActor, listed here; checked by
+        // `phase5_compaction.rs` (`chat_compacts_in_the_daemon`).
         "src/cmd/rpc.rs",
         "src/cmd/server.rs",
         // The TUI compacts on the SessionActor since phase 3 (A2).

@@ -505,11 +505,12 @@ fn pid_is_alive(pid: u32) -> bool {
 }
 
 /// Files in the run dir that are never session registrations, whatever
-/// their contents: the daemon's own `daemon.json` / `daemon-<profile>.json`.
+/// their contents: the daemon's own `daemon.json` / `daemon-<profile>.json`
+/// (and the no-extensions daemon's `daemon+noext.json`).
 fn is_reserved_json(path: &std::path::Path) -> bool {
     path.file_stem()
         .and_then(|s| s.to_str())
-        .is_some_and(|stem| stem == "daemon" || stem.starts_with("daemon-"))
+        .is_some_and(|stem| stem == "daemon" || stem.starts_with("daemon-") || stem.starts_with("daemon+"))
 }
 
 /// Read all registration files, prune stale ones (dead PID), return live set.
@@ -1224,10 +1225,25 @@ pub fn daemon_paths(profile: Option<&str>) -> DaemonPaths {
 
 /// Same, rooted at an explicit dir (tests; `--socket` overrides only `.sock`).
 pub fn daemon_paths_in(dir: &std::path::Path, profile: Option<&str>) -> DaemonPaths {
-    let stem = match profile.map(sanitize_session_id).filter(|p| !p.is_empty()) {
+    daemon_paths_in_for(dir, profile, false)
+}
+
+/// The profile's daemon, or (`no_extensions`) its private no-extensions
+/// daemon: `daemon+noext.{…}` / `daemon-<P>+noext.{…}`. `+` never appears
+/// in a sanitised profile, so no profile name can collide with it.
+pub fn daemon_paths_for(profile: Option<&str>, no_extensions: bool) -> DaemonPaths {
+    daemon_paths_in_for(&registry_dir(), profile, no_extensions)
+}
+
+/// [`daemon_paths_for`] rooted at an explicit dir.
+pub fn daemon_paths_in_for(dir: &std::path::Path, profile: Option<&str>, no_extensions: bool) -> DaemonPaths {
+    let mut stem = match profile.map(sanitize_session_id).filter(|p| !p.is_empty()) {
         Some(p) => format!("daemon-{p}"),
         None => "daemon".to_string(),
     };
+    if no_extensions {
+        stem.push_str("+noext");
+    }
     DaemonPaths {
         dir: dir.to_path_buf(),
         sock: dir.join(format!("{stem}.sock")),
@@ -1251,5 +1267,12 @@ mod daemon_paths_tests {
         assert_eq!(p.pid, d.join("daemon.pid"));
         let p = daemon_paths_in(d, Some("work/../evil"));
         assert_eq!(p.sock, d.join("daemon-work____evil.sock"));
+        // The private no-extensions daemon never shares a profile's files.
+        assert_eq!(daemon_paths_in_for(d, None, true).sock, d.join("daemon+noext.sock"));
+        assert_eq!(daemon_paths_in_for(d, Some("noext"), false).sock, d.join("daemon-noext.sock"));
+        assert_eq!(daemon_paths_in_for(d, Some("a+noext"), false).sock, d.join("daemon-a_noext.sock"));
+        assert_eq!(daemon_paths_in_for(d, Some("a"), true).json, d.join("daemon-a+noext.json"));
+        assert!(is_reserved_json(&daemon_paths_in_for(d, Some("a"), true).json));
+        assert!(is_reserved_json(&daemon_paths_in_for(d, None, true).json));
     }
 }

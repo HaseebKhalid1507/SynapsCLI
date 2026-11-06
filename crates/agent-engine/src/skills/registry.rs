@@ -106,6 +106,48 @@ pub struct LifecycleClaim {
     pub importance: i32,
 }
 
+/// Phase 8 slice 8A.8: when a plugin has staked a lifecycle claim and
+/// declared a `settings_category`, copy the legacy global
+/// `sidecar_toggle_key` value into the plugin-namespaced equivalent
+/// (`plugins.{plugin}.{cat}._lifecycle_toggle_key`) so the user's
+/// toggle-key choice follows them across the rename. Idempotent: any
+/// claim whose new key is already set is skipped, and a missing legacy
+/// value is a no-op. Runs at engine boot (the daemon), where the plugins'
+/// claims are known.
+pub fn migrate_sidecar_toggle_key_to_claimed_plugins(claims: &[LifecycleClaim]) {
+    const LEGACY: &str = "sidecar_toggle_key";
+    let Some(legacy_value) = crate::config::read_config_value(LEGACY) else {
+        return;
+    };
+    let trimmed = legacy_value.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    for claim in claims {
+        let Some(ref cat) = claim.settings_category else {
+            continue;
+        };
+        let new_key = format!("plugins.{}.{}._lifecycle_toggle_key", claim.plugin, cat);
+        if crate::config::read_config_value(&new_key).is_some() {
+            continue;
+        }
+        match crate::config::write_config_value(&new_key, trimmed) {
+            Ok(()) => tracing::info!(
+                "sidecar migration: copied global `{}` → `{}` for plugin `{}`",
+                LEGACY,
+                new_key,
+                claim.plugin,
+            ),
+            Err(err) => tracing::warn!(
+                "sidecar migration: failed to copy `{}` → `{}`: {}",
+                LEGACY,
+                new_key,
+                err,
+            ),
+        }
+    }
+}
+
 pub enum Resolution {
     /// A built-in command (dispatched via existing handle_command).
     Builtin,
@@ -1523,5 +1565,126 @@ mod tests {
         let ocr = cats.iter().find(|c| c.plugin == "ocr-plugin").unwrap();
         assert_eq!(capture.fields[0].key, "_lifecycle_toggle_key");
         assert_eq!(ocr.fields[0].key, "_lifecycle_toggle_key");
+    }
+}
+
+#[cfg(test)]
+mod sidecar_toggle_migration_tests {
+    use super::*;
+
+    /// The engine's base-dir guard, with `initial_config` as `config`.
+    struct BaseDir(crate::test_env::BaseDirGuard);
+
+    impl BaseDir {
+        fn new(initial_config: &str) -> Self {
+            let g = crate::test_env::BaseDirGuard::new();
+            std::fs::write(g.path().join("config"), initial_config).expect("write test config");
+            Self(g)
+        }
+
+        fn config_path(&self) -> std::path::PathBuf {
+            self.0.path().join("config")
+        }
+    }
+
+    fn claim(plugin: &str, command: &str, cat: Option<&str>) -> LifecycleClaim {
+        LifecycleClaim {
+            plugin: plugin.to_string(),
+            command: command.to_string(),
+            settings_category: cat.map(str::to_string),
+            display_name: command.to_string(),
+            importance: 0,
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(synaps_base_dir)]
+    fn migrate_copies_legacy_into_namespaced_key() {
+        let _base = BaseDir::new("sidecar_toggle_key = F2\n");
+
+        migrate_sidecar_toggle_key_to_claimed_plugins(&[claim(
+            "sample-sidecar",
+            "capture",
+            Some("capture"),
+        )]);
+        let v = crate::config::read_config_value(
+            "plugins.sample-sidecar.capture._lifecycle_toggle_key",
+        );
+        assert_eq!(v.as_deref(), Some("F2"));
+    }
+
+    #[test]
+    #[serial_test::serial(synaps_base_dir)]
+    fn migrate_skips_when_new_key_already_set() {
+        let _base = BaseDir::new(
+            "sidecar_toggle_key = F2\nplugins.sample-sidecar.capture._lifecycle_toggle_key = F12\n",
+        );
+
+        migrate_sidecar_toggle_key_to_claimed_plugins(&[claim(
+            "sample-sidecar",
+            "capture",
+            Some("capture"),
+        )]);
+        let v = crate::config::read_config_value(
+            "plugins.sample-sidecar.capture._lifecycle_toggle_key",
+        );
+        assert_eq!(
+            v.as_deref(),
+            Some("F12"),
+            "must not overwrite a user-set value"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(synaps_base_dir)]
+    fn migrate_is_noop_when_legacy_unset() {
+        let _base = BaseDir::new("model = claude-sonnet-4-6\n");
+
+        migrate_sidecar_toggle_key_to_claimed_plugins(&[claim(
+            "sample-sidecar",
+            "capture",
+            Some("capture"),
+        )]);
+        assert!(crate::config::read_config_value(
+            "plugins.sample-sidecar.capture._lifecycle_toggle_key"
+        )
+        .is_none());
+    }
+
+    #[test]
+    #[serial_test::serial(synaps_base_dir)]
+    fn migrate_skips_claim_without_settings_category() {
+        let base = BaseDir::new("sidecar_toggle_key = F8\n");
+
+        migrate_sidecar_toggle_key_to_claimed_plugins(&[claim("p", "ocr", None)]);
+        // No namespaced key written for a claim with no category.
+        let contents = std::fs::read_to_string(base.config_path()).unwrap();
+        assert!(
+            !contents.contains("_lifecycle_toggle_key"),
+            "no namespaced key should be written when settings_category is None: {contents}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(synaps_base_dir)]
+    fn migrate_handles_multiple_claims_in_one_pass() {
+        let _base = BaseDir::new("sidecar_toggle_key = C-V\n");
+
+        migrate_sidecar_toggle_key_to_claimed_plugins(&[
+            claim("sample-sidecar", "capture", Some("capture")),
+            claim("ocr-plugin", "ocr", Some("ocr")),
+        ]);
+        assert_eq!(
+            crate::config::read_config_value(
+                "plugins.sample-sidecar.capture._lifecycle_toggle_key"
+            )
+            .as_deref(),
+            Some("C-V")
+        );
+        assert_eq!(
+            crate::config::read_config_value("plugins.ocr-plugin.ocr._lifecycle_toggle_key")
+                .as_deref(),
+            Some("C-V")
+        );
     }
 }

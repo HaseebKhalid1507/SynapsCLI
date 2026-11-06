@@ -116,6 +116,17 @@ pub(crate) struct LoopState<'a> {
     pub is_socket: bool,
 }
 
+/// What the TUI says for a feature only the in-process extension host had:
+/// extensions run in the session daemon, and this window has no way to
+/// reach them yet (`/extensions`, plugin settings editors, interactive
+/// plugin commands, session drivers, `/sidecar toggle`).
+pub(crate) fn not_in_daemon_mode(what: &str) -> String {
+    format!(
+        "{what} is not available in daemon mode yet: extensions run in the session daemon, \
+         which this window cannot reach for it (docs/daemon-mode.md)"
+    )
+}
+
 /// Stand-in extension manager for the socket client (no extension host in
 /// this process).
 fn empty_ext_manager(
@@ -181,6 +192,9 @@ pub(crate) async fn handle_input_action(
         exit_fx_sent,
         is_socket,
     } = state;
+    // No extension host in this process (every user-facing TUI is a socket
+    // client): what needs one says so instead of "nothing loaded".
+    let no_ext_host = ext_mgr_shared.is_none();
     let ext_mgr_shared: &std::sync::Arc<
         tokio::sync::RwLock<synaps_cli::extensions::manager::ExtensionManager>,
     > = match ext_mgr_shared {
@@ -446,7 +460,12 @@ pub(crate) async fn handle_input_action(
                             let manager = ext_mgr_shared.read().await;
                             manager.has_session_drive(plugin_extension_id)
                         };
-                        if is_driver {
+                        if no_ext_host {
+                            app.push_msg(ChatMessage::Error(not_in_daemon_mode(&format!(
+                                "/{} (an interactive plugin command or session driver)",
+                                command.name
+                            ))));
+                        } else if is_driver {
                             let _ = link
                                 .send(agent_engine::session::SessionCommand::DriverStart {
                                     plugin: plugin_extension_id.clone(),
@@ -630,6 +649,9 @@ pub(crate) async fn handle_input_action(
                         }
                     }
                 }
+                CommandAction::ExtensionsStatus if no_ext_host => {
+                    app.push_msg(ChatMessage::System(not_in_daemon_mode("/extensions")));
+                }
                 CommandAction::ExtensionsStatus => {
                     let manager = ext_mgr_shared.read().await;
                     let snapshots = manager.capability_snapshots().await;
@@ -783,6 +805,9 @@ pub(crate) async fn handle_input_action(
                         }
                     }
                 }
+                CommandAction::ExtensionsConfig { .. } if no_ext_host => {
+                    app.push_msg(ChatMessage::System(not_in_daemon_mode("/extensions config")));
+                }
                 CommandAction::ExtensionsConfig { id } => {
                     let manager = ext_mgr_shared.read().await;
                     let diags: Vec<synaps_cli::extensions::config::ExtensionConfigDiagnostics> =
@@ -857,6 +882,9 @@ pub(crate) async fn handle_input_action(
                     }
                 }
 
+                CommandAction::ExtensionsTrust(_) if no_ext_host => {
+                    app.push_msg(ChatMessage::System(not_in_daemon_mode("/extensions trust")));
+                }
                 CommandAction::ExtensionsTrust(action) => {
                     use crate::tui::commands::ExtensionsTrustAction;
                     match action {
@@ -1108,11 +1136,9 @@ pub(crate) async fn handle_input_action(
                 CommandAction::SidecarToggle { plugin_id } => {
                     // G3b: non-blocking path via sidecar::toggle().
                     // Under socket transport the extension manager is a
-                    // stand-in empty — toggle requires in-process hosting.
-                    if is_socket {
-                        app.push_msg(ChatMessage::System(
-                            "sidecars are managed in-process only for now — see G §Q1".into(),
-                        ));
+                    // stand-in empty — toggle needs the extension host.
+                    if is_socket || no_ext_host {
+                        app.push_msg(ChatMessage::System(not_in_daemon_mode("/sidecar toggle")));
                     } else {
                         self::sidecar::toggle(app, plugin_id, registry, ext_mgr_shared).await;
                     }
@@ -1488,6 +1514,16 @@ pub(crate) async fn handle_input_action(
                 .set(agent_engine::session::SessionSetting::GrantWorkerModel { model })
                 .await;
         }
+        InputAction::PluginEditorOpen { plugin_id, field, .. } if no_ext_host => {
+            if let Some(state) = app.settings.as_mut() {
+                state.row_error = Some((
+                    format!("plugin.{}.{}", plugin_id, field),
+                    not_in_daemon_mode("the plugin settings editor"),
+                ));
+            } else {
+                app.push_msg(ChatMessage::System(not_in_daemon_mode("the plugin settings editor")));
+            }
+        }
         InputAction::PluginEditorOpen {
             plugin_id,
             category,
@@ -1851,10 +1887,10 @@ mod tests {
         let found = app.transcript.messages().iter().any(|m| {
             matches!(
                 &m.msg,
-                ChatMessage::System(s) if s.contains("sidecars are managed in-process only")
+                ChatMessage::System(s) if s.contains("/sidecar toggle is not available in daemon mode yet")
             )
         });
-        assert!(found, "expected in-process-only notice under Socket mode");
+        assert!(found, "expected the daemon-mode notice under Socket mode");
     }
 
     /// A client that may not drive (`--observe`; not the owner under

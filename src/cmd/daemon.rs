@@ -38,6 +38,12 @@ pub(crate) struct StartArgs {
     /// clients can still spawn this daemon.
     #[arg(long, hide = true)]
     pub allow_legacy_mcp: bool,
+    /// The profile's private no-extensions daemon (what `--no-extensions`
+    /// sessions run in): its own socket, no extensions loaded, no pins.
+    /// Every action (`status`, `stop`, …) then targets that daemon:
+    /// `synaps daemon --no-extensions stop`.
+    #[arg(long)]
+    pub no_extensions: bool,
     /// Print `{"binary_version","protocol_version"}` and exit 0 (the reload
     /// version gate probes the NEW binary with this).
     #[arg(long, hide = true)]
@@ -161,19 +167,52 @@ fn opts_from(profile: Option<String>, a: &StartArgs) -> DaemonOpts {
         allow_legacy_mcp: a.allow_legacy_mcp,
         runtime_dir: None,
         factory: None,
+        no_extensions: a.no_extensions || no_extensions(),
     }
 }
 
-/// Exit code 3 + one-line reason when `SYNAPS_DAEMON=0`.
-pub(crate) fn require_enabled(what: &str) -> Result<(), i32> {
-    if daemon::enabled() {
-        return Ok(());
-    }
-    eprintln!("{what}: {}", daemon::DISABLED_NOTICE);
-    Err(EXIT_REFUSED)
+/// `--no-extensions` on `synaps daemon` (or before it): this process's
+/// actions target the profile's private no-extensions daemon. Set once,
+/// first thing in [`run`].
+static NO_EXTENSIONS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+fn no_extensions() -> bool {
+    NO_EXTENSIONS.get().copied().unwrap_or(false)
 }
 
-pub(crate) async fn run(profile: Option<String>, args: DaemonArgs) -> anyhow::Result<()> {
+/// The daemon this invocation addresses (see [`NO_EXTENSIONS`]).
+fn daemon_paths(profile: Option<&str>) -> registry::DaemonPaths {
+    registry::daemon_paths_for(profile, no_extensions())
+}
+
+/// The other daemon of this profile (`--no-extensions` sessions run in a
+/// private `+noext` one), if it is running: `status` and `reload` address
+/// one of them only, so say the other is there.
+fn sibling_note(profile: Option<&str>, what: &str) -> Option<String> {
+    let other = !no_extensions();
+    if !registry::is_alive(&registry::daemon_paths_for(profile, other)) {
+        return None;
+    }
+    let mut cmd = String::from("synaps");
+    if let Some(p) = profile {
+        cmd.push_str(&format!(" --profile {p}"));
+    }
+    cmd.push_str(if other { " daemon --no-extensions" } else { " daemon" });
+    let which = if other { "the no-extensions daemon (`--no-extensions` sessions)" } else { "the profile's main daemon" };
+    Some(format!("note: {which} is also running and is not covered here: `{cmd} {what}`"))
+}
+
+/// `SYNAPS_DAEMON=0` / `SYNAPS_DAEMON_ADOPT=0` no longer switch anything
+/// off: one warning line naming the change.
+pub(crate) fn warn_legacy_env(what: &str) {
+    if let Some(w) = daemon::legacy_env_warning() {
+        eprintln!("{what}: {w}");
+    }
+}
+
+pub(crate) async fn run(profile: Option<String>, no_extensions: bool, args: DaemonArgs) -> anyhow::Result<()> {
+    let start_no_ext = matches!(&args.action, Some(DaemonAction::Start(a)) if a.no_extensions);
+    let _ = NO_EXTENSIONS.set(no_extensions || args.start.no_extensions || start_no_ext);
     match args.action {
         None => start(profile, args.start).await,
         Some(DaemonAction::Start(a)) => start(profile, a).await,
@@ -196,7 +235,7 @@ pub(crate) async fn run(profile: Option<String>, args: DaemonArgs) -> anyhow::Re
 /// protocol mismatch; 1 otherwise (not installed, bad manifest, failed to
 /// start, no daemon, timeout).
 async fn reload_extension(profile: Option<String>, name: String, json: bool) -> anyhow::Result<()> {
-    let paths = registry::daemon_paths(profile.as_deref());
+    let paths = daemon_paths(profile.as_deref());
     if !registry::is_alive(&paths) {
         reload_extension_exit(json, 1, &name, "no_daemon", None, false, "daemon not running");
     }
@@ -280,7 +319,7 @@ fn reload_extension_exit(
 /// protocol mismatch; 1 otherwise (not found, ambiguous, prefix too
 /// short, no daemon, timeout).
 async fn pin(profile: Option<String>, target: String, on: bool, json: bool) -> anyhow::Result<()> {
-    let paths = registry::daemon_paths(profile.as_deref());
+    let paths = daemon_paths(profile.as_deref());
     let book = pins::PinBook::for_active_profile();
     if !registry::is_alive(&paths) {
         // A pin that will come back on the next start can be cleared now.
@@ -366,7 +405,7 @@ async fn rename(
     json: bool,
 ) -> anyhow::Result<()> {
     use agent_engine::session::wire::RenameRefusal;
-    let paths = registry::daemon_paths(profile.as_deref());
+    let paths = daemon_paths(profile.as_deref());
     if !registry::is_alive(&paths) {
         rename_exit(json, 1, None, "no_daemon", None, None, "daemon not running");
     }
@@ -500,7 +539,7 @@ fn pin_exit(json: bool, code: i32, session_id: Option<&str>, outcome: &str, on: 
 /// attached, daemon reloading); 2 daemon too old or protocol mismatch; 1
 /// otherwise (not found, ambiguous, prefix too short, no daemon, timeout).
 async fn close(profile: Option<String>, target: String, force: bool, attached: bool, json: bool) -> anyhow::Result<()> {
-    let paths = registry::daemon_paths(profile.as_deref());
+    let paths = daemon_paths(profile.as_deref());
     if !registry::is_alive(&paths) {
         close_exit(json, 1, None, "no_daemon", "daemon not running");
     }
@@ -575,7 +614,7 @@ async fn reload(
     exe: Option<PathBuf>,
     json: bool,
 ) -> anyhow::Result<()> {
-    let paths = registry::daemon_paths(profile.as_deref());
+    let paths = daemon_paths(profile.as_deref());
     if !registry::is_alive(&paths) {
         anyhow::bail!("daemon not running");
     }
@@ -618,6 +657,9 @@ async fn reload(
                     after.as_ref().map_or(gen, |i| i.generation),
                     p.sessions
                 );
+                if let Some(n) = sibling_note(profile.as_deref(), "reload") {
+                    println!("{n}");
+                }
             } else {
                 anyhow::bail!("reload announced (generation {gen}) but the daemon did not answer within 15 s");
             }
@@ -638,7 +680,7 @@ async fn reload(
 }
 
 async fn purge(profile: Option<String>) -> anyhow::Result<()> {
-    let paths = registry::daemon_paths(profile.as_deref());
+    let paths = daemon_paths(profile.as_deref());
     if !registry::is_alive(&paths) {
         anyhow::bail!("daemon not running");
     }
@@ -652,8 +694,10 @@ async fn start(profile: Option<String>, a: StartArgs) -> anyhow::Result<()> {
         println!("{}", serde_json::to_string(&daemon::reload::PrintVersion::current())?);
         return Ok(());
     }
-    if let Err(code) = require_enabled("synaps daemon") {
-        std::process::exit(code);
+    // Only the user's own invocation warns: a spawned daemon's stderr is
+    // its log.
+    if !a.foreground || a.detach {
+        warn_legacy_env("synaps daemon");
     }
     let opts = opts_from(profile, &a);
     if a.detach {
@@ -678,7 +722,7 @@ async fn start(profile: Option<String>, a: StartArgs) -> anyhow::Result<()> {
 }
 
 async fn status(profile: Option<String>, json: bool) -> anyhow::Result<()> {
-    let paths = registry::daemon_paths(profile.as_deref());
+    let paths = daemon_paths(profile.as_deref());
     let alive = registry::is_alive(&paths);
     let pong = if alive { SocketTransport::ping(&paths.sock).await.ok() } else { None };
     // After the Ping: the daemon puts a lost daemon.json back first.
@@ -713,6 +757,9 @@ async fn status(profile: Option<String>, json: bool) -> anyhow::Result<()> {
         if let Some(p) = &pong {
             println!("uptime: {}s  sessions: {}", p.uptime_s, p.sessions);
         }
+        if let Some(n) = sibling_note(profile.as_deref(), "status") {
+            println!("{n}");
+        }
     }
     if pong.is_none() {
         std::process::exit(1);
@@ -721,7 +768,7 @@ async fn status(profile: Option<String>, json: bool) -> anyhow::Result<()> {
 }
 
 async fn stop(profile: Option<String>, force: bool) -> anyhow::Result<()> {
-    let paths = registry::daemon_paths(profile.as_deref());
+    let paths = daemon_paths(profile.as_deref());
     if !registry::is_alive(&paths) {
         println!("daemon not running");
         registry::reap_stale(&paths);
@@ -864,7 +911,7 @@ fn title_part(m: &SessionMeta) -> String {
 }
 
 async fn sessions(profile: Option<String>, json: bool) -> anyhow::Result<()> {
-    let paths = registry::daemon_paths(profile.as_deref());
+    let paths = daemon_paths(profile.as_deref());
     let book = pins::PinBook::for_active_profile();
     if !registry::is_alive(&paths) {
         if !json {

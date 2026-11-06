@@ -173,6 +173,11 @@ impl EngineHost {
 
         // Discover plugins/skills, build command registry, register load_skill tool.
         let (command_registry, keybind_registry) = crate::skills::register(&tools, &config).await;
+        // Legacy `sidecar_toggle_key` → per-plugin key (phase 8A.8). This
+        // ran in the in-process TUI's boot; the TUI is a daemon client now.
+        crate::skills::registry::migrate_sidecar_toggle_key_to_claimed_plugins(
+            &command_registry.lifecycle_claims(),
+        );
 
         // MCP (if configured): descriptor-backed tools, executed through
         // per-session leases in every mode. With progressive disclosure they

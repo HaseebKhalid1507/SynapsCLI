@@ -387,19 +387,26 @@ fn autospawn_disabled_prints_no_daemon_message() {
     assert!(!paths.json.exists() && !paths.sock.exists());
 }
 
+/// `SYNAPS_DAEMON=0` used to turn daemon features off (attach exit 3). There
+/// is no in-process mode any more: one warning line, then the daemon as
+/// usual (spawned, attached).
 #[test]
-fn daemon_flag_off_refuses_attach() {
+fn daemon_flag_off_is_ignored_with_a_warning() {
     let env = Env::new();
-    let out = env
-        .cmd(&["attach", "--create"])
-        .env("SYNAPS_DAEMON", "0")
-        .stdin(Stdio::null())
-        .output()
-        .unwrap();
-    assert_eq!(out.status.code(), Some(3));
-    let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("daemon disabled by SYNAPS_DAEMON=0"), "{err}");
-    assert!(!registry::is_alive(&env.paths()));
+    let paths = env.paths();
+    let mut cmd = env.cmd(&["attach", "--create"]);
+    cmd.env("SYNAPS_DAEMON", "0");
+    let mut a = Client::spawn(cmd);
+    a.wait_stdout("○ ready", 30);
+    std::thread::sleep(Duration::from_millis(200));
+    a.drain();
+    assert!(a.err.contains("SYNAPS_DAEMON=0 is ignored"), "{}", a.err);
+    assert!(!a.err.contains("daemon disabled"), "{}", a.err);
+    assert!(registry::is_alive(&paths), "the daemon was started anyway");
+    a.detach();
+    let st = env.cmd(&["daemon", "stop"]).stdin(Stdio::null()).output().unwrap();
+    assert!(st.status.success(), "{}", String::from_utf8_lossy(&st.stderr));
+    wait_alive(&paths, false, 10);
 }
 
 /// Legacy MCP was removed: with progressive disclosure off and an MCP server

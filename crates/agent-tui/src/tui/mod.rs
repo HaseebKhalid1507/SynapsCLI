@@ -61,8 +61,6 @@ mod win_keys;
 #[cfg(test)]
 pub(crate) static CONFIG_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-pub use run_setup::push_boot_notice;
-
 use app::{App, ChatMessage};
 use commands::CommandAction;
 use draw::{boot_effect, build_render_model, quit_effect};
@@ -78,40 +76,15 @@ use std::sync::atomic::Ordering;
 use std::time::Instant;
 use synaps_cli::Result;
 
-use agent_engine::session::{EndReason, SessionCommand};
+use agent_engine::session::SessionCommand;
 
-pub async fn run(
-    continue_session: Option<Option<String>>,
-    system: Option<String>,
-    prompt_manifest: Option<std::path::PathBuf>,
-    profile: Option<String>,
-    no_extensions: bool,
-) -> Result<()> {
-    // ── Boot prologue (P12.1: extracted to run_setup.rs) ──
-    // run_setup performs engine-boot unpack, App construction (incl. the
-    // resumed-session branch), channel/handle setup, render-thread spawn,
-    // and tick-throttle init. Behavior byte-identical; the loop below owns
-    // every field by value exactly as it did when they were locals.
-    let ctx = run_setup::run_setup(
-        continue_session,
-        system,
-        prompt_manifest,
-        profile,
-        no_extensions,
-    )
-    .await?;
-    run_loop(ctx).await
-}
-
-/// The event loop + teardown, shared by the in-process boot and the socket
-/// attach (`run_attached`).
+/// The event loop + teardown of the socket attach (`run_attached`).
 pub(crate) async fn run_loop(ctx: run_setup::RunContext) -> Result<()> {
     let run_setup::RunContext {
         mut app,
         mut link,
         http,
         mut prompt_bridge,
-        mode,
         mut config,
         registry,
         keybind_registry,
@@ -124,7 +97,6 @@ pub(crate) async fn run_loop(ctx: run_setup::RunContext) -> Result<()> {
         mut shutdown_signal_rx,
         shutdown_signal_task,
         secret_prompt_rx,
-        ext_mgr_shared,
         mut boot_fx_sent,
         mut exit_fx_sent,
         mut last_draw,
@@ -144,7 +116,7 @@ pub(crate) async fn run_loop(ctx: run_setup::RunContext) -> Result<()> {
     // Throttle state for idle subagent reconcile (~1s cadence in the tick arm).
     let mut last_subagent_reconcile: Option<std::time::Instant> = None;
     let mut first_frame_done = false;
-    let mut idle_purge = client_diet::IdlePurge::new(matches!(mode, run_setup::TransportMode::Socket));
+    let mut idle_purge = client_diet::IdlePurge::new(true);
     loop {
         // Only draw when something actually changed. During streaming, coalesce
         // redraws to the configured frame budget (`max_fps`, default 60fps =
@@ -247,11 +219,6 @@ pub(crate) async fn run_loop(ctx: run_setup::RunContext) -> Result<()> {
                 loop_arms::handle_sessions_arm(&mut app, &link, msg);
             }
 
-            // ── Async extension loader progress ──
-            event = app.extension_loader_rx.recv(), if app.extension_loader_running => {
-                loop_arms::handle_extension_loader_arm(&mut app, link.view(), event, ext_mgr_shared.as_ref()).await;
-            }
-
             // ── Widget events from background extension notification watchers ──
             Some(widget_event) = app.widget_rx.recv() => {
                 loop_arms::handle_widget_arm(&mut app, widget_event);
@@ -340,9 +307,9 @@ pub(crate) async fn run_loop(ctx: run_setup::RunContext) -> Result<()> {
                             system_prompt_path: &system_prompt_path,
                             render_handle: &render_handle,
                             event_reader: &mut event_reader,
-                            ext_mgr_shared: ext_mgr_shared.as_ref(),
+                            ext_mgr_shared: None,
                             exit_fx_sent: &mut exit_fx_sent,
-                            is_socket: matches!(mode, run_setup::TransportMode::Socket),
+                            is_socket: true,
                         };
                         if dispatch::handle_input_action(action, state).await.is_break() {
                             break;
@@ -361,20 +328,20 @@ pub(crate) async fn run_loop(ctx: run_setup::RunContext) -> Result<()> {
             }
 
             // ── Session envelopes: stream events + every actor notification
-            // (PLAN-phase3 §2.4). `None` = the actor is gone (in-process) or
-            // the socket closed (reconnect flow, A4).
+            // (PLAN-phase3 §2.4). `None` = the socket closed (reconnect
+            // flow, A4).
             maybe_env = link.next_event() => {
                 match maybe_env {
                     Some(env) => {
                         if let stream_handler::ArmFlow::Ended = stream_handler::handle_session_event_arm(
                             env, &mut app, &mut link, &registry, &render_handle,
-                            &mut prompt_bridge, ext_mgr_shared.as_ref(),
+                            &mut prompt_bridge, None,
                         ).await {
                             break;
                         }
                     }
                     None => {
-                        if !run_setup::try_reconnect(&mut app, &mut link, &mode, &render_handle, &registry).await {
+                        if !run_setup::try_reconnect(&mut app, &mut link, &render_handle, &registry).await {
                             break;
                         }
                     }
@@ -386,49 +353,12 @@ pub(crate) async fn run_loop(ctx: run_setup::RunContext) -> Result<()> {
     // Stop the live-MXC subscriber FIRST — no background task writes past here.
     loop_arms::abort_myx_live(&mut app);
 
-    // ── PART 2: Bounded teardown — the actor saves, fires on_session_end
-    // and flushes observability under its own budgets (`SessionActor::
-    // finish`); we ask for it and wait for `Ended` within the sum of those
-    // budgets plus margin (`SESSION_END_TIMEOUT_SECS`). The channel closing
-    // cleanly before `Ended` is observed is a clean exit too (exit 0); only
-    // an actor still running past its whole budget is an emergency exit.
-    // Over the socket the session lives on: Detach.
-    let teardown = std::time::Duration::from_secs(signals::SESSION_END_TIMEOUT_SECS);
+    // ── PART 2: teardown — the session lives on in the daemon: Detach.
     if !link.is_closed() {
-        let cmd = match mode {
-            run_setup::TransportMode::Local { .. } => SessionCommand::End {
-                reason: EndReason::ClientQuit,
-            },
-            run_setup::TransportMode::Socket => SessionCommand::Detach {
-                client: link.client_id(),
-            },
-        };
-        let _ = link.send(cmd).await;
+        let _ = link.send(SessionCommand::Detach { client: link.client_id() }).await;
         agent_core::core::memstat::ladder("detach", &"");
-        if let run_setup::TransportMode::Local { .. } = mode {
-            match tokio::time::timeout(teardown, link.wait_ended()).await {
-                Ok(true) => tracing::debug!("clean teardown completed"),
-                Ok(false) => {
-                    tracing::debug!("session channel closed before Ended — clean exit")
-                }
-                Err(_elapsed) => {
-                    tracing::warn!(
-                        budget_secs = signals::SESSION_END_TIMEOUT_SECS,
-                        "session end timed out — data may be incomplete"
-                    );
-                    lifecycle::emergency_exit();
-                }
-            }
-        }
     }
 
-    // Let extension shutdown continue in the background; exit should not hang on
-    // extension post/session-end cleanup or slow child-process teardown.
-    let _extension_shutdown = ext_mgr_shared.as_ref().map(|m| {
-        synaps_cli::extensions::manager::ExtensionManager::shutdown_all_detached(
-            std::sync::Arc::clone(m),
-        )
-    });
     // Stop the signal-listener thread (signal-hook handle, not a JoinHandle).
     shutdown_signal_task.close();
 
@@ -468,8 +398,7 @@ pub(crate) async fn run_loop(ctx: run_setup::RunContext) -> Result<()> {
     }
     // A daemon session that ended under this client (`/close` here or on
     // another client, `daemon stop`): which one, and how to bring it back.
-    // In-process, quitting always ends the session; nothing to say.
-    if let (run_setup::TransportMode::Socket, Some(reason)) = (&mode, app.session_ended) {
+    if let Some(reason) = app.session_ended {
         if let Some(line) = attach::session_ended_line(reason, &app.session.id, app.api_messages_len > 0) {
             eprintln!("{line}");
         }

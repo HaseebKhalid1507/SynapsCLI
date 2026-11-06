@@ -1,43 +1,21 @@
-//! P12.1: boot/setup prologue extracted from `run()` — PURE CODE MOTION.
-//!
-//! The body of [`run_setup`] below is byte-identical to `run()`'s former
-//! prologue (previously `mod.rs` lines 68-207): engine boot unpack, `App`
-//! construction (incl. the resumed-session branch), channel/handle setup,
-//! render-thread spawn, and the tick-throttle state init. `run()` now calls
-//! this, destructures the returned [`RunContext`], and enters the (unchanged)
-//! `tokio::select!` loop. No logic changed.
+//! The TUI's setup shared by every boot: `App` from the attach snapshot,
+//! terminal + render thread, channels, and the reconnect flow. The TUI is
+//! always a daemon client (`attach::run_attached`); there is no in-process
+//! boot (PR 5, "daemon is the only mode").
 
 use super::*;
 
-use std::sync::Arc;
 use std::time::Instant;
 use synaps_cli::Result;
 
-use agent_engine::host::{EngineHost, HostOpts};
-use agent_engine::session::{
-    AttachMode, AttachSnapshot, ClientKind, ClientMeta, ClientTransport, CompactionPolicyWire,
-    LocalTransport, SessionConfig,
-};
+use agent_engine::session::{AttachSnapshot, ClientTransport};
 use helpers::apply_display_tail;
 use session_link::{PromptBridge, SessionLink};
 
-/// How this TUI reaches its session (PLAN-phase3 §3.2).
-pub(crate) enum TransportMode {
-    /// In-process: the `EngineHost` + `SessionActor` live in this process
-    /// (the host is kept alive for the loop's lifetime).
-    Local {
-        #[allow(dead_code)]
-        host: Arc<EngineHost>,
-    },
-    /// Over the daemon socket (A4): no host, no runtime, no extension host.
-    Socket,
-}
-
-/// Client-local HTTP client, built on first use (P4-0). The in-process TUI
-/// seeds it with the host's client (`LazyHttp::from`), so nothing changes
-/// there; the socket client (`--attach`) pays for reqwest + rustls + the
-/// native root store only when `/models`, `/settings` or a catalog expand
-/// actually asks (`SYNAPS_CLIENT_HTTP=eager` builds it at boot — bisect aid).
+/// Client-local HTTP client, built on first use (P4-0): the TUI pays for
+/// reqwest + rustls + the native root store only when `/models`,
+/// `/settings` or a catalog expand actually asks (`SYNAPS_CLIENT_HTTP=eager`
+/// builds it at boot — bisect aid).
 pub(crate) struct LazyHttp(std::cell::OnceCell<reqwest::Client>);
 
 use agent_core::core::memstat::ladder as ladder_stage;
@@ -69,25 +47,17 @@ impl LazyHttp {
     }
 }
 
-impl From<reqwest::Client> for LazyHttp {
-    fn from(client: reqwest::Client) -> Self {
-        Self(std::cell::OnceCell::from(client))
-    }
-}
-
 /// Everything `run()`'s event loop and teardown consume from the boot
 /// prologue. Fields are handed back by value so `run()` owns them exactly as
 /// it did when they were locals — the loop's `&mut` borrows are unchanged.
 pub(crate) struct RunContext {
     pub app: App,
-    /// The session, behind a transport (in-process `LocalTransport` today;
-    /// `SocketTransport` for `--attach`).
+    /// The session, behind its `SocketTransport`.
     pub link: SessionLink,
     /// Client-local HTTP client for catalog/model-list fetches (the same
     /// builder the host uses; lazy on the socket path).
     pub http: LazyHttp,
     pub prompt_bridge: PromptBridge,
-    pub mode: TransportMode,
     pub config: synaps_cli::SynapsConfig,
     pub registry: std::sync::Arc<synaps_cli::skills::registry::CommandRegistry>,
     pub keybind_registry:
@@ -107,34 +77,14 @@ pub(crate) struct RunContext {
             tokio::sync::mpsc::UnboundedReceiver<synaps_cli::tools::SecretPromptRequest>,
         >,
     >,
-    /// In-process only (`Some` under `TransportMode::Local`): the host's
-    /// extension manager, for `/extensions` and interactive plugin commands.
-    pub ext_mgr_shared: Option<
-        std::sync::Arc<tokio::sync::RwLock<synaps_cli::extensions::manager::ExtensionManager>>,
-    >,
     pub boot_fx_sent: bool,
     pub exit_fx_sent: bool,
     pub last_draw: Instant,
 }
 
-/// Boot prologue for [`super::run`]. Same inputs / error type as `run()`.
-static BOOT_NOTICES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
-
-/// Queue a `SystemNotice` shown at the top of the in-process TUI (called
-/// before the runtime exists — e.g. `--attach` falling back after the daemon
-/// refused to start).
-pub fn push_boot_notice(text: impl Into<String>) {
-    BOOT_NOTICES.lock().unwrap_or_else(|e| e.into_inner()).push(text.into());
-}
-
-pub(crate) fn take_boot_notices() -> Vec<String> {
-    std::mem::take(&mut *BOOT_NOTICES.lock().unwrap_or_else(|e| e.into_inner()))
-}
-
 /// First-run guidance: no Anthropic credentials and no provider keys means
-/// the first message will fail, so say so up front. Shared by the in-process
-/// boot and the daemon attach (the default since 0.11.0), so a new user sees
-/// it either way instead of a token-refresh error on their first message.
+/// the first message will fail, so say so up front, instead of a
+/// token-refresh error on the first message.
 pub(crate) fn no_credentials_notice() -> Option<String> {
     // Capability queries via the broker boundary — no credential file or
     // credential env reads here, and answers are booleans only.
@@ -147,118 +97,6 @@ fn credentials_notice_for(has_anthropic: bool, has_provider_key: bool) -> Option
     (!has_anthropic && !has_provider_key).then(|| {
         "👋 No credentials found. To get started:\n   • `synaps login` — sign in with Claude Pro/Max (OAuth)\n   • or `synaps login --provider <name>` — store a provider API key with the credential broker (groq, openrouter, …), then pick with /model".to_string()
     })
-}
-
-pub(crate) async fn run_setup(
-    continue_session: Option<Option<String>>,
-    system: Option<String>,
-    prompt_manifest: Option<std::path::PathBuf>,
-    profile: Option<String>,
-    no_extensions: bool,
-) -> Result<RunContext> {
-    // ── Engine boot: host + one session on the actor, attached in-process ──
-    let host = EngineHost::boot_and_install(HostOpts {
-        profile,
-        no_extensions,
-        mcp_discovery: agent_engine::McpDiscovery::Inline,
-    })
-    .await?;
-    let handle = host
-        .create_session(SessionConfig {
-            continue_session,
-            system,
-            prompt_manifest,
-            cwd: None,
-            env: None,
-            env_stripped: Vec::new(),
-            auto_approve_confirms: false,
-            model_override: None,
-            persist: true,
-            auto_compact: false,
-            compaction_policy: CompactionPolicyWire::LinkedSuccessor,
-            await_extensions: false,
-            keep_warm: false,
-            client_input: None,
-            name: None,
-            max_session_cost: None,
-            memory_mode: None,
-            restore_parked: false,
-            message_clock: None,
-            owned: None,
-        })
-        .await?;
-    let (transport, snapshot) =
-        LocalTransport::attach_with(handle, ClientMeta::new(ClientKind::Tui), AttachMode::Mirror)
-            .await
-            .map_err(|e| synaps_cli::RuntimeError::Config(format!("attach: {e}")))?;
-
-    let config: synaps_cli::SynapsConfig = (**host.config()).clone();
-    let registry = Arc::clone(host.command_registry());
-    let keybind_registry = Arc::clone(host.keybind_registry());
-    let mcp_server_count = host.mcp_server_count();
-    let system_prompt_path = synaps_cli::config::resolve_read_path("system.md");
-    let http = LazyHttp::from(host.parts().client.clone());
-    let ext_mgr_shared = Arc::clone(host.ext_manager());
-
-    let mut app = app_from_snapshot(&snapshot);
-    app.keybinds = Some(keybind_registry.clone());
-
-    // Notices queued before boot (daemon auto-spawn fallback) go first.
-    for n in take_boot_notices() {
-        app.push_msg(ChatMessage::System(n));
-    }
-    // Surface config parse warnings once at startup (unknown keys, bad values).
-    for w in &config.warnings {
-        app.push_msg(ChatMessage::System(format!("⚠ config: {}", w)));
-    }
-
-    if let Some(n) = no_credentials_notice() {
-        app.push_msg(ChatMessage::System(n));
-    }
-
-    if mcp_server_count > 0 {
-        tracing::info!(
-            "{} MCP tools available from configured servers",
-            mcp_server_count
-        );
-    }
-
-    let mut ctx = finish_setup(
-        app,
-        Box::new(transport),
-        http,
-        TransportMode::Local { host },
-        config,
-        registry,
-        keybind_registry,
-        system_prompt_path,
-        Some(ext_mgr_shared),
-    )
-    .await?;
-
-    // Legacy sidecar key migration
-    loop_arms::migrate_sidecar_toggle_key_to_claimed_plugins(&ctx.registry.lifecycle_claims());
-
-    if !no_extensions {
-        let session_id_for_hook = ctx.app.session.id.clone();
-        ctx.app.extension_loader_running = true;
-        ctx.app.toasts.upsert(
-            toast::Toast::new("extension-loader", "Discovering extensions…")
-                .titled("Extensions")
-                .at(toast::ToastPosition::TOP_CENTER)
-                .ttl(None),
-        );
-        // on_session_start is emitted by the extension loader once
-        // subscribers exist — same moment, same bus as before the port.
-        // (When the actor's `await_extensions=false` waiter lands (B1) this
-        // becomes `None` — the actor emits it.)
-        synaps_cli::extensions::loader::spawn_discover_and_load(
-            std::sync::Arc::clone(ctx.ext_mgr_shared.as_ref().expect("local mode")),
-            ctx.app.extension_loader_tx.clone(),
-            Some(session_id_for_hook),
-        );
-    }
-    Ok(ctx)
 }
 
 /// Build `App` from the attach snapshot — the same lines and texts the
@@ -301,23 +139,19 @@ pub(crate) fn app_from_snapshot(snapshot: &AttachSnapshot) -> App {
     app
 }
 
-/// Terminal + render thread + channels — shared by the in-process boot and
-/// the socket attach (`run_attached`).
+/// Terminal + render thread + channels for the socket attach
+/// (`run_attached`).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn finish_setup(
     mut app: App,
     transport: Box<dyn ClientTransport>,
     http: LazyHttp,
-    mode: TransportMode,
     config: synaps_cli::SynapsConfig,
     registry: std::sync::Arc<synaps_cli::skills::registry::CommandRegistry>,
     keybind_registry: std::sync::Arc<
         std::sync::RwLock<synaps_cli::skills::keybinds::KeybindRegistry>,
     >,
     system_prompt_path: std::path::PathBuf,
-    ext_mgr_shared: Option<
-        std::sync::Arc<tokio::sync::RwLock<synaps_cli::extensions::manager::ExtensionManager>>,
-    >,
 ) -> Result<RunContext> {
     let link = SessionLink::new(transport);
     app.keybinds = Some(keybind_registry.clone());
@@ -382,7 +216,7 @@ pub(crate) async fn finish_setup(
     let (shutdown_signal_tx, shutdown_signal_rx) = tokio::sync::mpsc::unbounded_channel();
     let shutdown_signal_task = signals::spawn_shutdown_signal_task_with(
         shutdown_signal_tx,
-        signals::SignalBackend::for_socket(matches!(mode, TransportMode::Socket)),
+        signals::SignalBackend::for_socket(true),
     );
     ladder_stage("event_stream", &"");
     let (secret_prompt_tx, secret_prompt_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -404,7 +238,6 @@ pub(crate) async fn finish_setup(
         link,
         http,
         prompt_bridge,
-        mode,
         config,
         registry,
         keybind_registry,
@@ -417,15 +250,14 @@ pub(crate) async fn finish_setup(
         shutdown_signal_rx,
         shutdown_signal_task,
         secret_prompt_rx,
-        ext_mgr_shared,
         boot_fx_sent,
         exit_fx_sent,
         last_draw,
     })
 }
 
-/// The session envelope stream ended. In-process: the actor is gone — leave.
-/// Socket (A4): reconnect with backoff and re-mirror; `false` = give up.
+/// The session envelope stream ended (A4): reconnect with backoff and
+/// re-mirror; `false` = give up.
 ///
 /// F9: when the daemon died (not a reload), show "daemon connection lost"
 /// immediately, clear streaming state, and update the line on each retry.
@@ -434,121 +266,115 @@ pub(crate) async fn finish_setup(
 pub(crate) async fn try_reconnect(
     app: &mut App,
     link: &mut SessionLink,
-    mode: &TransportMode,
     render_handle: &super::render_thread::RenderHandle,
     registry: &std::sync::Arc<synaps_cli::skills::registry::CommandRegistry>,
 ) -> bool {
-    match mode {
-        TransportMode::Local { .. } => false,
-        TransportMode::Socket => {
-            use agent_engine::session::socket_transport::SocketTransport;
-            use std::time::Duration;
+    use agent_engine::session::socket_transport::SocketTransport;
+    use std::time::Duration;
 
-            let attach_mode = link.mode();
-            // Snapshot transport state before entering the loop (avoids
-            // holding a `&mut` on link across force_publish / refresh_view).
-            let is_reload = link.transport_mut().is_reload_pending();
-            let daemon_pid = link.transport_mut().daemon_pid();
-            let session_id = link.transport_mut().session_id().clone();
-            let budget = SocketTransport::reconnect_budget();
-            let budget_secs = budget.as_secs();
+    let attach_mode = link.mode();
+    // Snapshot transport state before entering the loop (avoids
+    // holding a `&mut` on link across force_publish / refresh_view).
+    let is_reload = link.transport_mut().is_reload_pending();
+    let daemon_pid = link.transport_mut().daemon_pid();
+    let session_id = link.transport_mut().session_id().clone();
+    let budget = SocketTransport::reconnect_budget();
+    let budget_secs = budget.as_secs();
 
-            // F9: clear streaming state — a turn cannot be streaming without a daemon.
-            if app.streaming {
-                app.header_turn_ended(None);
-                app.streaming = false;
-            }
-            app.compacting = false;
-
-            // Show the initial message (reload = existing text, crash = F9 notice).
-            if !is_reload {
-                app.push_msg(ChatMessage::System(format!(
-                    "daemon connection lost — reconnecting ({budget_secs}s left)…"
-                )));
-                app.request_redraw();
-                force_publish(app, link, registry, render_handle);
-            }
-
-            let deadline = tokio::time::Instant::now() + budget;
-            let mut backoff = Duration::from_millis(100);
-            let mut attempts = 0u32;
-
-            loop {
-                match link.transport_mut().reconnect_once(attach_mode).await {
-                    Ok(snapshot) => {
-                        link.refresh_view();
-                        let new_pid = link.transport_mut().daemon_pid();
-                        let lifecycle = &snapshot.meta.lifecycle;
-                        let status = format!("{lifecycle:?}");
-                        remirror(app, &snapshot);
-                        // The new attach has its own roster (every client
-                        // re-attached under a new id, or hasn't yet).
-                        app.attached_clients = link.transport().roster().clients().len();
-                        super::watch::on_reconnect(app, std::time::Instant::now());
-                        app.push_msg(ChatMessage::System(format!(
-                            "reconnected to daemon (pid {new_pid}) — session {} {status}",
-                            session_id
-                        )));
-                        // `daemon reload` re-execs only the daemon: after an
-                        // upgrade this client is still the old binary.
-                        // Once per daemon build, not on every reconnect.
-                        let skew = link.transport_mut().daemon_binary().and_then(|d| {
-                            super::attach::skew_notice_once(app, d, snapshot.meta.id.as_str())
-                        });
-                        if let Some(skew) = skew {
-                            app.push_msg(ChatMessage::System(format!("⚠ {skew}")));
-                        }
-                        app.toasts.upsert(
-                            toast::Toast::new("reload", "reconnected").titled("Daemon"),
-                        );
-                        app.request_redraw();
-                        return true;
-                    }
-                    Err(agent_engine::session::TransportError::Refused(_))
-                    | Err(agent_engine::session::TransportError::Version { .. }) => {
-                        // Terminal errors — stop retrying.
-                        break;
-                    }
-                    Err(_e) => {
-                        attempts += 1;
-                    }
-                }
-
-                if tokio::time::Instant::now() + backoff > deadline {
-                    break;
-                }
-
-                // Update the countdown message (at least on each retry).
-                if !is_reload {
-                    let left = deadline.duration_since(tokio::time::Instant::now());
-                    let secs_left = left.as_secs();
-                    app.status_text = Some(format!(
-                        "reconnecting… ({secs_left}s left, attempt {attempts})"
-                    ));
-                    app.request_redraw();
-                    force_publish(app, link, registry, render_handle);
-                }
-
-                tokio::time::sleep(backoff).await;
-                backoff = (backoff * 2).min(Duration::from_secs(5));
-            }
-
-            // Reconnect failed.
-            app.status_text = None;
-            if !is_reload {
-                app.daemon_lost = Some(super::app::DaemonLostInfo {
-                    pid: daemon_pid,
-                    session_id: session_id.to_string(),
-                    budget_secs,
-                });
-            }
-            app.push_msg(ChatMessage::Error(format!(
-                "lost the daemon (pid {daemon_pid}) — could not reconnect within {budget_secs}s"
-            )));
-            app.request_redraw();
-            false
-        }
+    // F9: clear streaming state — a turn cannot be streaming without a daemon.
+    if app.streaming {
+        app.header_turn_ended(None);
+        app.streaming = false;
     }
+    app.compacting = false;
+
+    // Show the initial message (reload = existing text, crash = F9 notice).
+    if !is_reload {
+        app.push_msg(ChatMessage::System(format!(
+            "daemon connection lost — reconnecting ({budget_secs}s left)…"
+        )));
+        app.request_redraw();
+        force_publish(app, link, registry, render_handle);
+    }
+
+    let deadline = tokio::time::Instant::now() + budget;
+    let mut backoff = Duration::from_millis(100);
+    let mut attempts = 0u32;
+
+    loop {
+        match link.transport_mut().reconnect_once(attach_mode).await {
+            Ok(snapshot) => {
+                link.refresh_view();
+                let new_pid = link.transport_mut().daemon_pid();
+                let lifecycle = &snapshot.meta.lifecycle;
+                let status = format!("{lifecycle:?}");
+                remirror(app, &snapshot);
+                // The new attach has its own roster (every client
+                // re-attached under a new id, or hasn't yet).
+                app.attached_clients = link.transport().roster().clients().len();
+                super::watch::on_reconnect(app, std::time::Instant::now());
+                app.push_msg(ChatMessage::System(format!(
+                    "reconnected to daemon (pid {new_pid}) — session {} {status}",
+                    session_id
+                )));
+                // `daemon reload` re-execs only the daemon: after an
+                // upgrade this client is still the old binary.
+                // Once per daemon build, not on every reconnect.
+                let skew = link.transport_mut().daemon_binary().and_then(|d| {
+                    super::attach::skew_notice_once(app, d, snapshot.meta.id.as_str())
+                });
+                if let Some(skew) = skew {
+                    app.push_msg(ChatMessage::System(format!("⚠ {skew}")));
+                }
+                app.toasts.upsert(
+                    toast::Toast::new("reload", "reconnected").titled("Daemon"),
+                );
+                app.request_redraw();
+                return true;
+            }
+            Err(agent_engine::session::TransportError::Refused(_))
+            | Err(agent_engine::session::TransportError::Version { .. }) => {
+                // Terminal errors — stop retrying.
+                break;
+            }
+            Err(_e) => {
+                attempts += 1;
+            }
+        }
+
+        if tokio::time::Instant::now() + backoff > deadline {
+            break;
+        }
+
+        // Update the countdown message (at least on each retry).
+        if !is_reload {
+            let left = deadline.duration_since(tokio::time::Instant::now());
+            let secs_left = left.as_secs();
+            app.status_text = Some(format!(
+                "reconnecting… ({secs_left}s left, attempt {attempts})"
+            ));
+            app.request_redraw();
+            force_publish(app, link, registry, render_handle);
+        }
+
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(Duration::from_secs(5));
+    }
+
+    // Reconnect failed.
+    app.status_text = None;
+    if !is_reload {
+        app.daemon_lost = Some(super::app::DaemonLostInfo {
+            pid: daemon_pid,
+            session_id: session_id.to_string(),
+            budget_secs,
+        });
+    }
+    app.push_msg(ChatMessage::Error(format!(
+        "lost the daemon (pid {daemon_pid}) — could not reconnect within {budget_secs}s"
+    )));
+    app.request_redraw();
+    false
 }
 
 /// Push one render frame from inside `try_reconnect` (the main event loop is

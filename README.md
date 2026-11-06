@@ -158,7 +158,7 @@ Method, tool versions, latency numbers, caveats and how to reproduce: [BENCHMARK
 | `synaps attach` | A line client attached to a daemon session |
 | `synaps daemon` | `status`, `sessions`, `pin`, `rename`, `close`, `stop`, `reload` (swap the binary, sessions intact), `reload-extension` |
 | `synaps send` | Send a message to a running session from a script |
-| `synaps chat` | The same engine on stdin/stdout, for pipes, scripts and CI |
+| `synaps chat` | A daemon session on stdin/stdout, for pipes, scripts and CI (ends with the process) |
 | `synaps rpc` | JSON-RPC over stdio, to embed the engine in other software |
 | `synaps server` | WebSocket API with token auth and streaming |
 | `synaps login` · `auth` · `status` | Sign in, manage several accounts per provider, see usage and reset windows |

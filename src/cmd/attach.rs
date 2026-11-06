@@ -286,9 +286,7 @@ fn set_echo(on: bool) {
 /// `client_name`: the global `--as` (see `main.rs`); `None` =
 /// `SYNAPS_CLIENT_NAME`, else the daemon's default (`attach`, `attach-2`, …).
 pub(crate) async fn run(profile: Option<String>, mut args: AttachArgs, client_name: Option<String>) -> anyhow::Result<()> {
-    if let Err(code) = super::daemon::require_enabled("synaps attach") {
-        std::process::exit(code);
-    }
+    super::daemon::warn_legacy_env("synaps attach");
     let paths = registry::daemon_paths(profile.as_deref());
     // `main` already auto-spawned (or exited 3); this is the safety net.
     if !registry::is_alive(&paths) {
@@ -499,11 +497,30 @@ pub(crate) async fn run(profile: Option<String>, mut args: AttachArgs, client_na
 
 /// `SYNAPS_DAEMON_AUTOSPAWN=0` and nobody running: say how to start one.
 pub(crate) fn no_daemon_message(profile: Option<&str>) -> String {
-    let start = match profile {
-        Some(p) => format!("synaps --profile {p} daemon --detach"),
-        None => "synaps daemon --detach".to_string(),
+    daemon_unavailable_message(profile, false, None)
+}
+
+/// Why a client has no daemon, and how to get one: `error` = why it could
+/// not be started or reached (else autospawn is off and none is running). Every
+/// session runs in the daemon, so this is where the client stops (exit 3).
+pub(crate) fn daemon_unavailable_message(profile: Option<&str>, no_extensions: bool, error: Option<&str>) -> String {
+    let mut start = String::from("synaps");
+    if let Some(p) = profile {
+        start.push_str(&format!(" --profile {p}"));
+    }
+    start.push_str(" daemon");
+    if no_extensions {
+        start.push_str(" --no-extensions");
+    }
+    let why = match error {
+        Some(e) => format!("daemon unavailable: {e}"),
+        None => "no daemon running (SYNAPS_DAEMON_AUTOSPAWN=0 stops this client from starting one)".to_string(),
     };
-    format!("no daemon running — start it with `{start}` (or unset SYNAPS_DAEMON_AUTOSPAWN=0 to auto-start)")
+    let unset = if error.is_none() { ", or unset SYNAPS_DAEMON_AUTOSPAWN" } else { "" };
+    format!(
+        "{why}\n  every session runs in the session daemon (there is no in-process mode): start it with \
+         `{start} --detach` (`{start} --foreground` shows why it fails){unset}, then re-run (docs/daemon-mode.md)"
+    )
 }
 
 fn resolve_id(sessions: &[SessionMeta], q: &str) -> Option<SessionId> {
