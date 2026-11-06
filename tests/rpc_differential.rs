@@ -27,6 +27,11 @@
 //!   table. Compared as "a number ≥ 0" (`<COST>`). Token counts, which
 //!   billing reads, are compared exactly.
 //!
+//! Build note: the fixtures are from the default build. Without
+//! `command-exec` the binary has no `bash`/`powershell`/`shell_*` tools, so
+//! `tools_list` drops those from the fixture before comparing (and the tool
+//! scenario does not run). Fixtures are only written from a default build.
+//!
 //! Every test spawns real processes under one temp HOME with its own
 //! `SYNAPS_BASE_DIR` and `SYNAPS_RUNTIME_DIR`; an auto-spawned daemon is
 //! private to that HOME and stopped on drop. Nothing here can reach the
@@ -408,6 +413,7 @@ fn check(name: &str, env: &Env, frames: &[Value]) {
     let got: Vec<String> = frames.iter().map(|f| serde_json::to_string(&norm.value(f)).unwrap()).collect();
     let path = golden_dir().join(format!("{name}.jsonl"));
     if std::env::var("SYNAPS_RPC_GOLDEN_UPDATE").as_deref() == Ok("1") {
+        assert!(cfg!(feature = "command-exec"), "write fixtures from a default (command-exec) build");
         std::fs::create_dir_all(golden_dir()).unwrap();
         std::fs::write(&path, got.join("\n") + "\n").unwrap();
         return;
@@ -435,6 +441,15 @@ fn intentional(line: &str) -> String {
         let cost = v["cost"].as_f64().unwrap_or_else(|| panic!("get_session_stats.cost is not a number: {line}"));
         assert!(cost >= 0.0, "negative cost: {line}");
         v["cost"] = json!("<COST>");
+    }
+    // Build note (module docs): no command tools without `command-exec`.
+    if !cfg!(feature = "command-exec") && v["type"] == "response" && v["command"] == "tools_list" {
+        if let Some(tools) = v["tools"].as_array_mut() {
+            tools.retain(|t| {
+                let name = t["name"].as_str().unwrap_or_default();
+                !(name == "bash" || name == "powershell" || name.starts_with("shell_"))
+            });
+        }
     }
     serde_json::to_string(&v).unwrap()
 }
