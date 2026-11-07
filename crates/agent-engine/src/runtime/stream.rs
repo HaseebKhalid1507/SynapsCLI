@@ -239,6 +239,10 @@ pub(super) struct StreamSession {
         Option<Arc<crate::extensions::lease::ExtensionSessionEndGuard>>,
     /// Per-turn budget (Task 23, spec §8.1).
     pub(super) turn_budget: crate::runtime::budget::TurnBudget,
+    /// Continuations this turn may add after a response stops at the
+    /// output-token limit with nothing to execute (`0` = end the turn, as
+    /// before). See `runtime::output_limit`.
+    pub(super) output_limit_continuations: u32,
     /// Event-started turns only: the owner's steer moves the turn onto the
     /// session budget it carries.
     pub(super) owner_steer_budget: Option<Arc<crate::runtime::budget::OwnerSteerBudget>>,
@@ -728,6 +732,7 @@ impl StreamMethods {
             extension_runtime,
             extension_session_scope,
             turn_budget,
+            output_limit_continuations,
             owner_steer_budget,
             message_clock,
         } = session;
@@ -998,6 +1003,25 @@ impl StreamMethods {
         // Muse dangling-preamble continuation: at most once per user turn
         // (this run), so a model that keeps stopping on a preamble cannot loop.
         let mut preamble_nudged = false;
+        // Output-limit continuation: at most `output_limit_continuations`
+        // host notes per user turn (this run). Append-only: the cut-off
+        // response stays as sent; the note follows it.
+        let mut output_limit =
+            super::output_limit::OutputLimitContinuation::new(output_limit_continuations);
+        macro_rules! continue_after_output_limit {
+            () => {{
+                let notice = output_limit.take();
+                tracing::info!(
+                    event = "output_limit_continuation",
+                    used = output_limit.used(),
+                    cap = output_limit.cap(),
+                    "continuing turn after a response hit the output-token limit"
+                );
+                let _ = tx.send(StreamEvent::Session(SessionEvent::Notice(notice)));
+                messages.push(super::output_limit::continuation_message());
+                continue;
+            }};
+        }
         loop {
             // Check for cancellation before each API call
             if cancel.is_cancelled() {
@@ -1712,7 +1736,7 @@ impl StreamMethods {
             };
 
             let round_mark = super::tool_keepwarm::RoundMark::new(&usage_counters);
-            let response = match await_provider_call(&cancel, ApiMethods::call_api_stream_inner(
+            let mut response = match await_provider_call(&cancel, ApiMethods::call_api_stream_inner(
                 &auth,
                 &client,
                 &model,
@@ -1743,6 +1767,19 @@ impl StreamMethods {
             // response that asks for nothing more is then the turn's
             // normal end (`TurnCompletion`).
             let response_cancelled = cancel.is_cancelled();
+
+            // A response cut off at the output-token limit: what the provider
+            // never finished (a tool call cut off mid-input, thinking without
+            // a signature) never reaches history or runs when complete calls
+            // remain or a continuation follows. Untouched otherwise.
+            let (output_limit_step, unfinished_tool_ids) = output_limit
+                .inspect(&mut response, response_cancelled || cancel.is_cancelled());
+            for tool_id in unfinished_tool_ids {
+                let _ = tx.send(StreamEvent::Llm(LlmEvent::ToolResult {
+                    tool_id,
+                    result: super::output_limit::UNFINISHED_TOOL_CALL.to_string(),
+                }));
+            }
 
             // A round that asks for tools: keep its prefix warm while they
             // run (`runtime::tool_keepwarm`). Stopped once their results are
@@ -1830,6 +1867,13 @@ impl StreamMethods {
                 if content.is_empty() {
                     if let Some(dimension) = usage_exhausted {
                         finish_budget_exceeded!(dimension);
+                    }
+                    // Cut off before anything replayable (unsigned thinking,
+                    // a half-written call): no assistant message, just the note.
+                    if output_limit_step == super::output_limit::OutputLimitStep::Continue
+                        && !cancel.is_cancelled()
+                    {
+                        continue_after_output_limit!();
                     }
                     let after_tool_result = budget_meter.rounds_used() > 1;
                     if after_tool_result && !cancel.is_cancelled() {
@@ -1948,6 +1992,27 @@ impl StreamMethods {
                     // instead of entering history after the cancel.
                     let steered = !cancel.is_cancelled()
                         && drain_steering!();
+                    // Cut off at the output-token limit with nothing to run:
+                    // continue (bounded) instead of silently ending the turn.
+                    // Steering wins; a cancel always stops.
+                    if !steered && !cancel.is_cancelled() {
+                        match output_limit_step {
+                            super::output_limit::OutputLimitStep::Continue => {
+                                continue_after_output_limit!();
+                            }
+                            super::output_limit::OutputLimitStep::Exhausted => {
+                                tracing::info!(
+                                    event = "output_limit_continuations_exhausted",
+                                    cap = output_limit.cap(),
+                                    "response hit the output-token limit; no continuations left"
+                                );
+                                let _ = tx.send(StreamEvent::Session(SessionEvent::Notice(
+                                    output_limit.exhausted_notice(),
+                                )));
+                            }
+                            _ => {}
+                        }
+                    }
                     // Muse ended on an announced-but-unperformed action ("Blocking
                     // question before I build anything:"). Continue ONCE with a
                     // visible harness note instead of silently ending the turn.
@@ -4402,6 +4467,7 @@ mod rich_output_tests {
             turn_budget: crate::runtime::budget::TurnBudget::for_role(
                 crate::runtime::budget::TurnRole::Foreground,
             ),
+            output_limit_continuations: agent_core::config::DEFAULT_OUTPUT_LIMIT_CONTINUATIONS,
             owner_steer_budget: None,
             message_clock: Default::default(),
         }
@@ -6321,6 +6387,7 @@ mod rich_output_tests {
             turn_budget: crate::runtime::budget::TurnBudget::for_role(
                 crate::runtime::budget::TurnRole::Foreground,
             ),
+            output_limit_continuations: agent_core::config::DEFAULT_OUTPUT_LIMIT_CONTINUATIONS,
             owner_steer_budget: None,
             message_clock: Default::default(),
         };
@@ -8343,6 +8410,354 @@ mod rich_output_tests {
             expected[2] = worst_case(prefix);
             assert_eq!(run.usage, expected, "the aborted ping is booked at its worst case");
             run.assert_quiet().await;
+        }
+    }
+
+    // ── Output-limit continuation (`output_limit_continuations`), through
+    // the real stream loop against a scripted Anthropic stand-in.
+    mod output_limit_stream {
+        use super::*;
+        use crate::runtime::output_limit::{CONTINUATION_PROMPT, UNFINISHED_TOOL_CALL};
+
+        const CONTINUING: &str = "↻ response hit the output limit — continuing";
+
+        fn text_block(i: usize, text: &str) -> Vec<Value> {
+            vec![
+                json!({"type":"content_block_start","index":i,"content_block":{"type":"text","text":""}}),
+                json!({"type":"content_block_delta","index":i,"delta":{"type":"text_delta","text":text}}),
+                json!({"type":"content_block_stop","index":i}),
+            ]
+        }
+
+        /// A thinking block; `None` = cut off before its signature arrived.
+        fn thinking_block(i: usize, thinking: &str, signature: Option<&str>) -> Vec<Value> {
+            let mut events = vec![
+                json!({"type":"content_block_start","index":i,"content_block":{"type":"thinking","thinking":"","signature":""}}),
+                json!({"type":"content_block_delta","index":i,"delta":{"type":"thinking_delta","thinking":thinking}}),
+            ];
+            if let Some(signature) = signature {
+                events.push(json!({"type":"content_block_delta","index":i,"delta":{"type":"signature_delta","signature":signature}}));
+            }
+            events.push(json!({"type":"content_block_stop","index":i}));
+            events
+        }
+
+        fn tool_block(i: usize, id: &str, partial_json: &str) -> Vec<Value> {
+            vec![
+                json!({"type":"content_block_start","index":i,"content_block":{"type":"tool_use","id":id,"name":"count_stub"}}),
+                json!({"type":"content_block_delta","index":i,"delta":{"type":"input_json_delta","partial_json":partial_json}}),
+                json!({"type":"content_block_stop","index":i}),
+            ]
+        }
+
+        /// One Anthropic SSE response of `blocks`, stopping on `stop_reason`.
+        fn response(blocks: Vec<Vec<Value>>, stop_reason: &str) -> String {
+            let mut events = vec![json!({"type":"message_start","message":{"id":"msg_ol","type":"message","role":"assistant","content":[],"model":"claude-sonnet-4-6","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}})];
+            events.extend(blocks.into_iter().flatten());
+            events.push(json!({"type":"message_delta","delta":{"stop_reason":stop_reason,"stop_sequence":null},"usage":{"input_tokens":10,"output_tokens":5,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}));
+            events.push(json!({"type":"message_stop"}));
+            events.into_iter().map(|e| format!("data: {e}\n\n")).collect()
+        }
+
+        fn cut_text(text: &str) -> String {
+            response(vec![text_block(0, text)], "max_tokens")
+        }
+
+        /// Counts its executions: a call that must never run shows up here.
+        struct CountingTool(Arc<AtomicUsize>);
+        #[async_trait::async_trait]
+        impl Tool for CountingTool {
+            fn name(&self) -> &str {
+                "count_stub"
+            }
+            fn description(&self) -> &str {
+                "counts calls"
+            }
+            fn parameters(&self) -> Value {
+                json!({"type":"object","properties":{}})
+            }
+            fn origin(&self) -> crate::tools::ToolOrigin {
+                crate::tools::ToolOrigin::Builtin
+            }
+            fn effect(&self) -> crate::tools::catalog::ToolEffect {
+                crate::tools::catalog::ToolEffect::ReadOnly
+            }
+            async fn execute(&self, _params: Value, _ctx: ToolContext) -> Result<String> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok("counted".to_string())
+            }
+        }
+
+        #[derive(Clone)]
+        struct Script {
+            rounds: Arc<Vec<String>>,
+            calls: Arc<AtomicUsize>,
+            bodies: Arc<Mutex<Vec<Value>>>,
+            /// When request `n` arrives: cancel the turn, then hold the reply.
+            cancel_on: Option<(usize, CancellationToken)>,
+        }
+
+        /// Serves `rounds` in order, then `end_turn`.
+        async fn spawn_script(script: Script) -> String {
+            let app = Router::new()
+                .route(
+                    "/v1/messages",
+                    post(|State(st): State<Script>, body: String| async move {
+                        let n = st.calls.fetch_add(1, Ordering::SeqCst);
+                        if let Ok(v) = serde_json::from_str::<Value>(&body) {
+                            st.bodies.lock().unwrap().push(v);
+                        }
+                        if let Some((at, token)) = &st.cancel_on {
+                            if *at == n {
+                                token.cancel();
+                                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                            }
+                        }
+                        let sse = st.rounds.get(n).cloned().unwrap_or_else(|| SSE_END_TURN.to_string());
+                        (StatusCode::OK, [("content-type", "text/event-stream")], sse).into_response()
+                    }),
+                )
+                .with_state(script);
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            format!("http://{addr}")
+        }
+
+        struct Run {
+            history: Vec<SharedMessage>,
+            bodies: Vec<Value>,
+            /// Output-limit notices, in order.
+            notices: Vec<String>,
+            /// `(tool_id, result)` of every UI tool result.
+            ui_results: Vec<(String, String)>,
+            executed: usize,
+            calls: usize,
+        }
+
+        impl Run {
+            fn notes_in_history(&self) -> usize {
+                self.history
+                    .iter()
+                    .filter(|m| m["role"] == "user" && m["content"] == CONTINUATION_PROMPT)
+                    .count()
+            }
+        }
+
+        async fn run(rounds: Vec<String>, cap: u32, cancel_on: Option<usize>) -> Run {
+            let executed = Arc::new(AtomicUsize::new(0));
+            let mut registry = ToolRegistry::new();
+            registry.register(Arc::new(CountingTool(Arc::clone(&executed))));
+            let cancel = CancellationToken::new();
+            let script = Script {
+                rounds: Arc::new(rounds),
+                calls: Arc::new(AtomicUsize::new(0)),
+                bodies: Arc::new(Mutex::new(Vec::new())),
+                cancel_on: cancel_on.map(|n| (n, cancel.clone())),
+            };
+            let (calls, bodies) = (Arc::clone(&script.calls), Arc::clone(&script.bodies));
+            let base_url = spawn_script(script).await;
+            let (tx, mut rx) = mpsc::unbounded_channel::<StreamEvent>();
+            let mut session = harness_session(
+                base_url,
+                Arc::new(RwLock::new(registry)),
+                tx,
+                crate::tools::shell::SessionManager::new(crate::tools::shell::ShellConfig::default()),
+                Arc::new(crate::extensions::hooks::HookBus::new()),
+                crate::tools::activation::SessionId::parse(&format!(
+                    "test-{}-{}",
+                    std::process::id(),
+                    uuid::Uuid::new_v4()
+                ))
+                .unwrap(),
+                Default::default(),
+                false,
+                "claude-sonnet-4-6",
+            );
+            session.output_limit_continuations = cap;
+            session.cancel = cancel;
+            let initial = vec![Arc::new(json!({"role":"user","content":"go"})) as SharedMessage];
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(20),
+                StreamMethods::run_stream_internal(session, initial),
+            )
+            .await
+            .expect("stream loop finishes");
+            // A cancelled request is held by the mock: give a stray retry
+            // time to show up before counting.
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let mut run = Run {
+                history: Vec::new(),
+                bodies: bodies.lock().unwrap().clone(),
+                notices: Vec::new(),
+                ui_results: Vec::new(),
+                executed: executed.load(Ordering::SeqCst),
+                calls: calls.load(Ordering::SeqCst),
+            };
+            while let Ok(ev) = rx.try_recv() {
+                match ev {
+                    StreamEvent::Session(SessionEvent::MessageHistory(m)) => run.history = m,
+                    StreamEvent::Session(SessionEvent::Notice(n)) if n.contains("output limit") => {
+                        run.notices.push(n)
+                    }
+                    StreamEvent::Llm(LlmEvent::ToolResult { tool_id, result }) => {
+                        run.ui_results.push((tool_id, result))
+                    }
+                    _ => {}
+                }
+            }
+            run
+        }
+
+        #[tokio::test]
+        async fn a_cut_off_text_response_continues_up_to_the_cap_then_ends() {
+            let rounds = vec![cut_text("part one"), cut_text("part two"), cut_text("part three")];
+            let run = run(rounds, 2, None).await;
+            assert_eq!(run.calls, 3, "the response, two continuations, then the turn ends");
+            assert_eq!(
+                run.notices,
+                vec![
+                    format!("{CONTINUING} (1/2)"),
+                    format!("{CONTINUING} (2/2)"),
+                    "response hit the output limit — automatic continuations used up (2/2); the turn ends here. Send a message to continue.".to_string(),
+                ]
+            );
+            // Append-only: each cut-off response stays as sent, the note after it.
+            let history: Vec<Value> = run.history.iter().map(|m| (**m).clone()).collect();
+            let note = json!({"role":"user","content":CONTINUATION_PROMPT});
+            let said = |t: &str| json!({"role":"assistant","content":[{"type":"text","text":t}]});
+            assert_eq!(history.len(), 6, "{history:#?}");
+            assert_eq!(history[0]["content"], "go");
+            assert_eq!(strip_time(&history[1]), said("part one"));
+            assert_eq!(strip_time(&history[2]), note);
+            assert_eq!(strip_time(&history[3]), said("part two"));
+            assert_eq!(strip_time(&history[4]), note);
+            assert_eq!(strip_time(&history[5]), said("part three"));
+            // The continuation request carries the note last.
+            let wire = run.bodies[1]["messages"].as_array().unwrap();
+            assert!(wire.last().unwrap().to_string().contains("Continue from where it stopped"));
+        }
+
+        #[tokio::test]
+        async fn zero_continuations_ends_the_turn_on_the_cut_off_response_as_before() {
+            let run = run(vec![cut_text("part one")], 0, None).await;
+            assert_eq!(run.calls, 1);
+            assert!(run.notices.is_empty(), "{:?}", run.notices);
+            assert_eq!(run.notes_in_history(), 0);
+            assert_eq!(run.history.len(), 2);
+            assert_eq!(run.history[1]["content"], json!([{"type":"text","text":"part one"}]));
+        }
+
+        #[tokio::test]
+        async fn a_cut_off_response_with_complete_calls_runs_them_and_adds_no_note() {
+            let round = response(
+                vec![
+                    text_block(0, "Running it."),
+                    tool_block(1, "toolu_ok", "{}"),
+                    tool_block(2, "toolu_cut", r#"{"path": "/tmp/x", "content": "hal"#),
+                ],
+                "max_tokens",
+            );
+            let run = run(vec![round], 2, None).await;
+            assert_eq!(run.executed, 1, "only the complete call ran");
+            assert_eq!(run.calls, 2, "the tool round, then end_turn");
+            assert!(run.notices.is_empty(), "{:?}", run.notices);
+            assert_eq!(run.notes_in_history(), 0);
+            assert!(run
+                .ui_results
+                .contains(&("toolu_cut".to_string(), UNFINISHED_TOOL_CALL.to_string())));
+            let history = run.history.iter().map(|m| m.to_string()).collect::<String>();
+            assert!(history.contains("toolu_ok"));
+            assert!(!history.contains("toolu_cut"), "the cut-off call never reaches history");
+            assert!(run.bodies.iter().all(|b| !b.to_string().contains("toolu_cut")));
+            assert_eq!(
+                run.history[1]["content"],
+                json!([
+                    {"type":"text","text":"Running it."},
+                    {"type":"tool_use","id":"toolu_ok","name":"count_stub","input":{}},
+                ])
+            );
+        }
+
+        #[tokio::test]
+        async fn cut_off_calls_and_unsigned_thinking_never_reach_history_or_run() {
+            let rounds = vec![
+                // Signed thinking, text, then a call cut off mid-input.
+                response(
+                    vec![
+                        thinking_block(0, "plan", Some("sig-plan")),
+                        text_block(1, "Writing the file."),
+                        tool_block(2, "toolu_cut", r#"{"path": "/tmp/x", "content": "hal"#),
+                    ],
+                    "max_tokens",
+                ),
+                // Cut off mid-thought: nothing replayable at all.
+                response(vec![thinking_block(0, "still thinki", None)], "max_tokens"),
+            ];
+            let run = run(rounds, 2, None).await;
+            assert_eq!(run.executed, 0, "the cut-off call never runs");
+            assert_eq!(run.calls, 3, "two continuations, then end_turn");
+            assert_eq!(run.notices.len(), 2, "{:?}", run.notices);
+            assert!(run
+                .ui_results
+                .contains(&("toolu_cut".to_string(), UNFINISHED_TOOL_CALL.to_string())));
+
+            assert_eq!(
+                run.history[1]["content"],
+                json!([
+                    {"type":"thinking","thinking":"plan","signature":"sig-plan"},
+                    {"type":"text","text":"Writing the file."},
+                ]),
+                "signed thinking and text kept, the cut-off call dropped"
+            );
+            // The thinking-only response left no assistant message: two
+            // notes in a row (the request builder merges adjacent user turns).
+            assert_eq!(run.notes_in_history(), 2);
+            assert_eq!(run.history.len(), 5, "{:#?}", run.history);
+
+            for (where_, text) in run
+                .bodies
+                .iter()
+                .map(|b| ("request", b.to_string()))
+                .chain(run.history.iter().map(|m| ("history", m.to_string())))
+            {
+                assert!(!text.contains("toolu_cut"), "{where_}: {text}");
+                assert!(!text.contains("still thinki"), "{where_}: {text}");
+                assert!(!text.contains("__parse_error"), "{where_}: {text}");
+            }
+            let wire_messages = run
+                .bodies
+                .iter()
+                .flat_map(|b| b["messages"].as_array().into_iter().flatten());
+            for message in run.history.iter().map(|m| &**m).chain(wire_messages) {
+                for block in message["content"].as_array().into_iter().flatten() {
+                    if block["type"] == "thinking" {
+                        assert!(
+                            block["signature"].as_str().is_some_and(|s| !s.is_empty()),
+                            "unsigned thinking: {block}"
+                        );
+                    }
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn a_cancel_during_the_continuation_stops_it() {
+            let rounds = vec![cut_text("part one"), cut_text("part two"), cut_text("part three")];
+            // The cancel lands while the continuation request is in flight.
+            let run = run(rounds, 2, Some(1)).await;
+            assert_eq!(run.calls, 2, "nothing after the cancelled continuation");
+            assert_eq!(run.notices, vec![format!("{CONTINUING} (1/2)")]);
+            assert_eq!(run.notes_in_history(), 1);
+            assert!(run
+                .history
+                .iter()
+                .all(|m| !m.to_string().contains("part two")));
+        }
+
+        /// History messages carry host timestamps; compare content only.
+        fn strip_time(message: &Value) -> Value {
+            json!({"role": message["role"], "content": message["content"]})
         }
     }
 }

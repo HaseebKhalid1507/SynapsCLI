@@ -1468,6 +1468,12 @@ pub struct SynapsConfig {
     pub subagent_thinking: crate::core::reasoning::ReasoningLevel,
     pub api_retries: u32,        // default 3
     pub refusal_retries: u32,    // default 2 — retries on stop_reason=refusal
+    /// Automatic continuations per user turn when a response stops at the
+    /// output-token limit and leaves nothing to execute
+    /// (`output_limit_continuations`, 0–[`MAX_OUTPUT_LIMIT_CONTINUATIONS`],
+    /// default [`DEFAULT_OUTPUT_LIMIT_CONTINUATIONS`]; `0` = the turn ends
+    /// there, as before).
+    pub output_limit_continuations: u32,
     pub telemetry: String,       // off | basic | full (default off)
     /// Rotated generations kept for `api-log.jsonl` and
     /// `request-trace.jsonl` (`telemetry_log_generations`, 1–
@@ -1632,6 +1638,7 @@ impl Default for SynapsConfig {
             telemetry: "off".to_string(),
             telemetry_log_generations: 1,
             cache_diagnostics: false,
+            output_limit_continuations: DEFAULT_OUTPUT_LIMIT_CONTINUATIONS,
             cache_ttl: CacheTtlSetting::default(),
             cache_keepwarm: CacheKeepWarm::Off,
             cache_keepwarm_auto_max_hours: DEFAULT_CACHE_KEEPWARM_AUTO_MAX_HOURS,
@@ -1718,6 +1725,15 @@ pub fn scope_slice_problem(name: &str) -> Option<&'static str> {
 /// is up to 50 MB).
 pub const MAX_TELEMETRY_LOG_GENERATIONS: u32 = 100;
 
+/// Default `output_limit_continuations`: a cut-off response is almost never
+/// where the work should stop, and two bounds the extra output a model
+/// that keeps hitting the limit can spend in one turn.
+pub const DEFAULT_OUTPUT_LIMIT_CONTINUATIONS: u32 = 2;
+
+/// Upper bound for `output_limit_continuations` (each continuation can cost
+/// a full output budget).
+pub const MAX_OUTPUT_LIMIT_CONTINUATIONS: u32 = 10;
+
 /// Known top-level config keys — used for unknown-key warnings + did-you-mean.
 /// Public so the /settings coverage test can require a settings row (or an
 /// explicit exclusion) for every key here.
@@ -1760,6 +1776,7 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "subagent_max_total",
     "api_retries",
     "refusal_retries",
+    "output_limit_continuations",
     "telemetry",
     "telemetry_log_generations",
     "cache_diagnostics",
@@ -2371,6 +2388,14 @@ fn apply_config_content_with(
                     config.refusal_retries = retries;
                 }
             }
+            "output_limit_continuations" => match val.parse::<u32>() {
+                Ok(n) if n <= MAX_OUTPUT_LIMIT_CONTINUATIONS => {
+                    config.output_limit_continuations = n;
+                }
+                _ => config.warnings.push(format!(
+                    "output_limit_continuations = {val} — expected 0–{MAX_OUTPUT_LIMIT_CONTINUATIONS}; line ignored"
+                )),
+            },
             "telemetry" => config.telemetry = val.to_string(),
             "telemetry_log_generations" => match val.parse::<u32>() {
                 Ok(n) if (1..=MAX_TELEMETRY_LOG_GENERATIONS).contains(&n) => {
@@ -4188,6 +4213,34 @@ mod tests {
         }
         for mode in [CacheKeepWarm::Off, CacheKeepWarm::Auto, CacheKeepWarm::Hours(6)] {
             assert_eq!(CacheKeepWarm::parse(&mode.to_string()), Some(mode));
+        }
+    }
+
+    #[test]
+    fn test_output_limit_continuations_config_key() {
+        assert_eq!(
+            SynapsConfig::default().output_limit_continuations,
+            DEFAULT_OUTPUT_LIMIT_CONTINUATIONS
+        );
+        let c = load_config_from_str("telemetry = basic\n");
+        assert_eq!(c.output_limit_continuations, 2, "default: two continuations");
+
+        for (raw, want) in [("0", 0), ("1", 1), ("10", 10)] {
+            let c = load_config_from_str(&format!("output_limit_continuations = {raw}\n"));
+            assert_eq!(c.output_limit_continuations, want, "{raw}");
+            assert!(c.warnings.is_empty(), "{raw}: {:?}", c.warnings);
+        }
+
+        for bad in ["11", "-1", "lots", ""] {
+            let c = load_config_from_str(&format!("output_limit_continuations = {bad}\n"));
+            assert_eq!(c.output_limit_continuations, 2, "{bad}");
+            assert!(
+                c.warnings
+                    .iter()
+                    .any(|w| w.contains("output_limit_continuations")),
+                "{bad}: {:?}",
+                c.warnings
+            );
         }
     }
 

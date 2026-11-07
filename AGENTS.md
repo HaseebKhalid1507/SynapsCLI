@@ -206,7 +206,7 @@ This is the single most important flow to understand.
    - **Retries** — transient errors (429/5xx/529) retry with backoff up to `api_retries` (default 3).
 5. **SSE parse** → line-by-line in `api.rs`. Before the body is consumed, response headers (request-id, rate-limits) are captured for telemetry when `telemetry != off`. Emits `StreamEvent`s — a two-level enum: `StreamEvent::{Llm, Session, Agent}` wrapping `LlmEvent::{Thinking, Text, ToolUseStart, ToolUseDelta, ToolUse, ToolResult, Usage, ...}` (see `runtime/types.rs` for the full shape).
 6. **Tool dispatch** → `runtime/stream.rs` collects `ToolUse` blocks, executes them in parallel via `tokio::spawn`, feeds `tool_result` blocks back into the next turn. Extension hooks (`before_tool_call` / `after_tool_call`) fire around each execution — a slow extension stalls dispatch.
-7. **Loop** → steps 4–6 repeat until `stop_reason != "tool_use"` (typically `"end_turn"`).
+7. **Loop** → steps 4–6 repeat until `stop_reason != "tool_use"` (typically `"end_turn"`). A response cut off at the output-token limit with nothing to run continues up to `output_limit_continuations` times (`runtime/output_limit.rs`): transports mark the envelope `"stop_reason": "max_tokens"`, the loop drops the blocks the provider never finished (a cut-off tool call, unsigned thinking) and appends one host note.
 8. **UI update** → `crates/agent-tui/src/tui/stream_handler.rs` consumes `StreamEvent`s and mutates `App`. Headless mode has its own consumer in `crates/agent-engine/src/engine/stream.rs` — **new event variants must be handled in BOTH** or headless silently drops them.
 
 `StreamEvent` (in `crates/agent-engine/src/runtime/types.rs`) is the wire format between Runtime and any UI. Add new event variants here if you need to surface something new — then update both consumers (`crates/agent-tui/src/tui/stream_handler.rs` AND `crates/agent-engine/src/engine/stream.rs`).
@@ -494,6 +494,7 @@ Mapping (`crates/agent-core/src/core/models.rs::thinking_level_for_budget`):
 | `subagent.max_total` | int | 64 | Dispatched workers not yet reconciled |
 | `subagent.max_depth` | int | 4 | Maximum nesting depth; 1 means foreground-only delegation |
 | `api_retries` | int | 3 | Max API retries on transient errors |
+| `output_limit_continuations` | int | 2 | Automatic continuations per user turn when a response stops at the output-token limit with no complete tool call to run (0–10; `0` = the turn ends there, as before). Each one appends a host note and shows `↻ response hit the output limit — continuing (n/N)`; see `runtime/output_limit.rs` |
 | `favorite_models` | comma list | — | Pinned models in model picker |
 | `disabled_plugins` | comma list | — | Plugins to skip on boot |
 | `disabled_skills` | comma list | — | Skills to skip on boot |

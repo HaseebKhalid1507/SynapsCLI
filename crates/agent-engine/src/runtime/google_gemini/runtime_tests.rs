@@ -112,6 +112,34 @@ async fn forwards_text_deltas_and_returns_content_blocks() {
     assert_eq!(collected, "Hi there");
 }
 
+/// `finishReason: MAX_TOKENS` is the output-token limit: the envelope's
+/// `stop_reason` is the one the turn loop's bounded continuation reads.
+#[tokio::test]
+async fn max_tokens_finish_is_the_output_limit_stop_reason() {
+    let broker: Arc<dyn CredentialBroker> = Arc::new(StubBroker::new(vec![chunk(
+        "data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"cut\"}]},\"finishReason\":\"MAX_TOKENS\"}]}}\n",
+    )]));
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let msgs: Vec<crate::SharedMessage> = vec![Arc::new(json!({"role":"user","content":"hi"}))];
+    let out = call_google_gemini_stream_inner(
+        &cfg(),
+        &broker,
+        &[],
+        &None,
+        &msgs,
+        &tx,
+        &cancel,
+        &test_trace(),
+        true,
+    )
+    .await
+    .unwrap();
+    assert_eq!(out["stop_reason"], "max_tokens");
+    assert!(crate::runtime::output_limit::hit_output_limit(&out));
+    assert_eq!(out["content"][0]["text"], "cut");
+}
+
 #[tokio::test]
 async fn forwards_tool_calls_and_maps_to_tool_use_content_block() {
     let broker: Arc<dyn CredentialBroker> = Arc::new(StubBroker::new(vec![

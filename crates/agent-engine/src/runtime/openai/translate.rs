@@ -637,6 +637,27 @@ pub fn tool_calls_to_content_blocks(calls: &[ToolCall], name_map: &ToolNameMap) 
         .collect()
 }
 
+/// [`tool_calls_to_content_blocks`] for calls flushed by an output-limit stop
+/// (`finish_reason: "length"`): arguments that do not parse were still being
+/// written when the limit hit. Such a call gets the `__parse_error` input the
+/// Anthropic transport uses for the same case, so it never runs on a
+/// fabricated `{}` and the turn loop can tell it from a complete call.
+pub fn truncated_tool_calls_to_content_blocks(
+    calls: &[ToolCall],
+    name_map: &ToolNameMap,
+) -> Vec<Value> {
+    calls
+        .iter()
+        .zip(tool_calls_to_content_blocks(calls, name_map))
+        .map(|(call, mut block)| {
+            if let Err(e) = serde_json::from_str::<Value>(&call.function.arguments) {
+                block["input"] = json!({ "__parse_error": format!("invalid tool input JSON: {e}") });
+            }
+            block
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1007,5 +1028,45 @@ mod tests {
             "ext__lsrf-manager__managerApi.cloudfrontInvalidate",
             "sanitized wire name must map back to the executable tool name"
         );
+    }
+
+    fn call(id: &str, arguments: &str) -> ToolCall {
+        ToolCall {
+            id: id.to_string(),
+            kind: "function".to_string(),
+            function: FunctionCall {
+                name: "write".to_string(),
+                arguments: arguments.to_string(),
+            },
+        }
+    }
+
+    /// `finish_reason: "length"` flushes calls whose arguments may be cut
+    /// off: those never get a fabricated `{}` input (which would run the
+    /// tool); they carry `__parse_error` like the Anthropic transport's.
+    #[test]
+    fn truncated_flush_marks_unfinished_calls_instead_of_inventing_empty_input() {
+        let calls = [
+            call("call_done", r#"{"path":"a.txt","content":"x"}"#),
+            call("call_cut", r#"{"path":"b.txt","content":"half"#),
+            call("call_none", ""),
+        ];
+        let map = ToolNameMap::default();
+        let blocks = truncated_tool_calls_to_content_blocks(&calls, &map);
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(blocks[0], tool_calls_to_content_blocks(&calls[..1], &map)[0]);
+        assert_eq!(blocks[0]["input"], json!({"path":"a.txt","content":"x"}));
+        for (block, id) in blocks[1..].iter().zip(["call_cut", "call_none"]) {
+            assert_eq!(block["id"], id);
+            assert_eq!(block["type"], "tool_use");
+            assert!(
+                block["input"]["__parse_error"]
+                    .as_str()
+                    .is_some_and(|e| e.starts_with("invalid tool input JSON")),
+                "{block}"
+            );
+        }
+        // The untruncated flush keeps its old (lenient) shape.
+        assert_eq!(tool_calls_to_content_blocks(&calls[1..2], &map)[0]["input"], json!({}));
     }
 }
