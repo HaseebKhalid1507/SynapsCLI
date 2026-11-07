@@ -73,7 +73,7 @@ fn is_unfinished_tool_use(block: &Value) -> bool {
 /// cancellation path drops it for the same reason).
 fn is_unsigned_thinking(block: &Value) -> bool {
     block["type"].as_str() == Some("thinking")
-        && !block["signature"].as_str().is_some_and(|s| !s.is_empty())
+        && block["signature"].as_str().is_none_or(|s| s.is_empty())
 }
 
 /// What the turn loop does with one finished response.
